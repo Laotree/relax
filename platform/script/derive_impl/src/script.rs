@@ -73,42 +73,28 @@ pub fn script_impl(input: TokenStream) -> TokenStream {
     if let Some(span) = parser.span() {
         let (s, values) = token_parser_to_whitespace_matching_string(&mut parser, span);
 
-        tb.add("ScriptMod {");
-        tb.add("    cargo_manifest_path: env!(")
-            .string("CARGO_MANIFEST_DIR")
-            .add(").trim_start_matches(")
-            .string("\\\\?\\")
-            .add(").to_string(),");
-        tb.add("    module_path :")
-            .ident_with_span("module_path", span)
-            .add("!().to_string(),");
-        tb.add("    file:")
-            .ident_with_span("file", span)
-            .add("!().to_string().replace(")
-            .string("\\")
-            .add(",")
-            .string("/")
-            .add("),");
+        // One non-generic constructor call, not a struct literal: under `makepad run` ScriptMod
+        // is laid out by rustc inside the loader (loader-core.md section 8).
+        tb.add("ScriptMod::from_parts(");
+        tb.add("env!(").string("CARGO_MANIFEST_DIR").add("),");
+        tb.ident_with_span("module_path", span).add("!(),");
+        tb.ident_with_span("file", span).add("!(),");
         // The line of the script's FIRST token, not `line!()` (the macro's own
         // line): the reconstructed code's row 0 is that first token's line,
         // and `ip_to_loc` reports `row + line` — with `line!()` every
         // location in a `script_mod!` body came out one line early.
-        tb.add("    line:").unsuf_usize(span.start().line()).add(",");
-        tb.add("    column:column!() as usize,");
-
-        tb.add("    code:").string(&s).add(".to_string(),");
-        tb.add("    values:{");
+        tb.unsuf_usize(span.start().line()).add(",");
+        tb.add("column!() as usize,");
+        tb.string(&s).add(",");
         // Deliberately obscure name: `#(expr)` interpolations are spliced in
-        // here verbatim, so a user variable named like ours (it was `v`)
-        // would resolve to the half-built Vec instead of their value.
-        tb.add("        let mut __script_interp_vals = Vec::new();");
+        // here verbatim, so a user variable named like ours would resolve to
+        // the half-built values instead of theirs.
+        tb.add("&[");
         for value in &values {
-            tb.add("__script_interp_vals.push( {")
-                .stream(Some(value.clone()))
-                .add("}.script_to_value(vm) );");
+            tb.add("{").stream(Some(value.clone())).add("}.script_to_value(vm),");
         }
-        tb.add("    __script_interp_vals}");
-        tb.add("}");
+        tb.add("]");
+        tb.add(")");
     } else {
         tb.add("ScriptMod::default()");
     }

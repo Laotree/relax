@@ -186,44 +186,75 @@ impl LiveId {
         Self::from_bytes(seed, &num.to_be_bytes(), 0, 8, 0)
     }
 
+    // The name table is one per process: the functions below are non-generic with C-shaped
+    // signatures, so under `makepad run` (this crate provided by the loader, loader-core.md
+    // section 8) every caller reaches the loader's copy.
+
+    /// Records `id_str` as the name of `id`. `replace`: overwrite an existing name; otherwise an
+    /// existing different name is kept and false returned.
+    pub fn lut_insert(id: LiveId, id_str: &str, replace: bool) -> bool {
+        LiveIdInterner::with(|idmap| {
+            if !replace {
+                if let Some(stored) = idmap.id_to_string.get(&id) {
+                    return stored == id_str;
+                }
+            }
+            idmap.id_to_string.insert(id, id_str.to_string());
+            true
+        })
+    }
+
+    /// The byte length of `id`'s recorded name; usize::MAX when it has none.
+    pub fn lut_name_len(id: LiveId) -> usize {
+        LiveIdInterner::with(|idmap| idmap.id_to_string.get(&id).map_or(usize::MAX, |s| s.len()))
+    }
+
+    /// Copies `id`'s recorded name into `out` (as much as fits); returns the bytes copied.
+    pub fn lut_name_copy(id: LiveId, out: &mut [u8]) -> usize {
+        LiveIdInterner::with(|idmap| match idmap.id_to_string.get(&id) {
+            Some(s) => {
+                let n = s.len().min(out.len());
+                out[..n].copy_from_slice(&s.as_bytes()[..n]);
+                n
+            }
+            None => 0,
+        })
+    }
+
     pub fn from_str_with_lut(id_str: &str) -> Result<Self, String> {
         let id = Self::from_str(id_str);
-        LiveIdInterner::with(|idmap| {
-            if let Some(stored) = idmap.id_to_string.get(&id) {
-                if stored != id_str {
-                    return Err(stored.clone());
-                }
-            } else {
-                idmap.id_to_string.insert(id, id_str.to_string());
-            }
+        if Self::lut_insert(id, id_str, false) {
             Ok(id)
-        })
+        } else {
+            Err(id.as_string(|s| s.unwrap_or("").to_string()))
+        }
     }
 
     pub fn from_str_with_intern(id_str: &str, intern: InternLiveId) -> Self {
         let id = Self::from_str(id_str);
         if let InternLiveId::Yes = intern {
-            LiveIdInterner::with(|idmap| idmap.id_to_string.insert(id, id_str.to_string()));
+            Self::lut_insert(id, id_str, true);
         }
         id
     }
 
     pub fn from_str_num_with_lut(id_str: &str, num: u64) -> Result<Self, String> {
         let id = Self::from_str_num(id_str, num);
-        LiveIdInterner::with(|idmap| {
-            idmap.id_to_string.insert(id, format!("{}{}", id_str, num));
-            Ok(id)
-        })
+        Self::lut_insert(id, &format!("{}{}", id_str, num), true);
+        Ok(id)
     }
 
     pub fn as_string<F, R>(&self, f: F) -> R
     where
         F: FnOnce(Option<&str>) -> R,
     {
-        LiveIdInterner::with(|idmap| match idmap.id_to_string.get(self) {
-            Some(v) => f(Some(v)),
-            None => f(None),
-        })
+        let n = Self::lut_name_len(*self);
+        if n == usize::MAX {
+            return f(None);
+        }
+        let mut buf = vec![0u8; n];
+        let m = Self::lut_name_copy(*self, &mut buf);
+        f(Some(std::str::from_utf8(&buf[..m]).unwrap_or("")))
     }
 
     pub fn not_empty(&self) -> bool {

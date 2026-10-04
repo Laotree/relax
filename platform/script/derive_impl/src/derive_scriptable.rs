@@ -664,7 +664,7 @@ fn derive_script_impl_inner(
                             .add(", value);");
                     }
                     tb.add("}");
-                    tb.add("let ty_check = ScriptTypeCheck{props, object: None, is_repr_u32_enum: false};");
+                    tb.add("let ty_check = ScriptTypeCheck::from_props(&mut props);");
                     tb.add("let ty_index = vm.heap_mut().register_type(None, ty_check);");
                     // Set hidden metadata before attaching the restricted property type.
                     tb.add("vm.set_value_trap(named, ").live_id_lut("__enum").add(", ")
@@ -984,7 +984,7 @@ impl ScriptNew for EnumTest{
 
         }
 
-        let ty_check = ScriptTypeCheck{props, object: None, is_repr_u32_enum: false};
+        let ty_check = ScriptTypeCheck::from_props(&mut props);
         let ty_index = vm.bx.heap.register_type(None, ty_check);
         vm.bx.heap.freeze_with_type(named, ty_index);
         vm.bx.heap.set_value(enum_object, id!(Named).into(), named.into(), vm.bx.threads.cur().trap.pass());
