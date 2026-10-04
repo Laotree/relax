@@ -120,7 +120,7 @@ fn derive_script_impl_inner(
                 tb.add("    if let Some(obj) = value.as_object() {");
                 tb.add("        self.")
                     .ident(&field.name)
-                    .add(" = vm.bx.heap.new_object_ref(obj);");
+                    .add(" = vm.new_object_ref(obj);");
                 tb.add("    }");
                 tb.add("}");
             } else if field
@@ -565,7 +565,7 @@ fn derive_script_impl_inner(
 
         tb.add("    fn script_reload_default(vm:&mut ScriptVm)->ScriptValue{");
         tb.add(
-            "        if vm.bx.heap.type_default_for_id(Self::script_type_id_static()).is_some(){",
+            "        if vm.heap().type_default_for_id(Self::script_type_id_static()).is_some(){",
         );
         tb.add("            Self::script_new_with_default(vm).script_to_value(vm)");
         tb.add("        } else {");
@@ -582,7 +582,7 @@ fn derive_script_impl_inner(
         tb.add("    }");
 
         tb.add("    fn script_proto_build(vm:&mut ScriptVm, _props:&mut ScriptTypeProps)->ScriptValue{");
-        tb.add("        let enum_object = vm.bx.heap.new_object();");
+        tb.add("        let enum_object = vm.new_object();");
 
         for item in &items {
             match &item.kind {
@@ -634,9 +634,9 @@ fn derive_script_impl_inner(
                     tb.add("let def =");
                     item.gen_new(tb)?;
                     tb.add(";");
-                    tb.add("let named = vm.bx.heap.new_with_proto(")
+                    tb.add("let named = vm.new_with_proto(")
                         .live_id_lut(&item.name)
-                        .add(".into());");
+                        .add(");");
                     tb.add("let mut props = ScriptTypeProps::default();");
                     tb.add("if let Self::").ident(&item.name).add("{");
                     for (i, field) in fields.iter().enumerate() {
@@ -659,22 +659,22 @@ fn derive_script_impl_inner(
                             .add(", <")
                             .stream(Some(field.ty.clone()))
                             .add(" as ScriptNew>::script_type_id_static());");
-                        tb.add(" vm.bx.heap.set_value(named, ")
+                        tb.add(" vm.set_value_trap(named, ")
                             .live_id(&field.name)
-                            .add(".into(), value, vm.bx.threads.cur().trap.pass());");
+                            .add(", value);");
                     }
                     tb.add("}");
                     tb.add("let ty_check = ScriptTypeCheck{props, object: None, is_repr_u32_enum: false};");
-                    tb.add("let ty_index = vm.bx.heap.register_type(None, ty_check);");
+                    tb.add("let ty_index = vm.heap_mut().register_type(None, ty_check);");
                     // Set hidden metadata before attaching the restricted property type.
-                    tb.add("vm.bx.heap.set_value(named, ").live_id_lut("__enum").add(".into(), ")
+                    tb.add("vm.set_value_trap(named, ").live_id_lut("__enum").add(", ")
                         .live_id_lut(&enum_name)
-                        .add(".into(), vm.bx.threads.cur().trap.pass());");
-                    tb.add("vm.bx.heap.set_type(named, ty_index);");
-                    tb.add("vm.bx.heap.freeze_component(named);");
-                    tb.add("vm.bx.heap.set_value(enum_object, ")
+                        .add(");");
+                    tb.add("vm.heap_mut().set_type(named, ty_index);");
+                    tb.add("vm.heap_mut().freeze_component(named);");
+                    tb.add("vm.set_value_trap(enum_object, ")
                         .live_id(&item.name)
-                        .add(".into(), named.into(), vm.bx.threads.cur().trap.pass());");
+                        .add(", named);");
                     // uh oh crap. we need to get the default value out of the unparsed defaults
                 }
             }
@@ -698,7 +698,7 @@ fn derive_script_impl_inner(
         tb.add("            return");
         tb.add("        }");
         tb.add("        if let Some(object) = value.as_object(){");
-        tb.add("            let root_proto = vm.bx.heap.root_proto(object);");
+        tb.add("            let root_proto = vm.heap().root_proto(object);");
         tb.add("            if let Some(id) = root_proto.as_id(){");
         tb.add("                match id{");
         for item in &items {
@@ -729,7 +729,7 @@ fn derive_script_impl_inner(
                     tb.add(") = self{");
                     for (i, arg) in args.iter().enumerate() {
                         tb.add(
-                            "            if let Some(v) = vm.bx.heap.vec_value_if_exist(object, ",
+                            "            if let Some(v) = vm.heap().vec_value_if_exist(object, ",
                         )
                         .unsuf_usize(i)
                         .add("){");
@@ -764,7 +764,7 @@ fn derive_script_impl_inner(
                     }
                     tb.add("} = self{");
                     for (i, field) in fields.iter().enumerate() {
-                        tb.add("if let Some(v) = vm.bx.heap.value_for_apply(value, ScriptValue::from_id(").live_id(&field.name).add("), apply){");
+                        tb.add("if let Some(v) = vm.heap_mut().value_for_apply(value, ScriptValue::from_id(").live_id(&field.name).add("), apply){");
                         tb.add("    <")
                             .stream(Some(field.ty.clone()))
                             .add(" as ScriptApply>::script_apply(")
@@ -819,19 +819,19 @@ fn derive_script_impl_inner(
                         tb.ident(&format!("v{i}")).add(",");
                     }
                     tb.add(")=>{");
-                    tb.add("    let tuple = vm.bx.heap.new_with_proto(")
+                    tb.add("    let tuple = vm.new_with_proto(")
                         .live_id(&item.name)
-                        .add(".into());");
-                    tb.add("vm.bx.heap.set_value(tuple, ").live_id_lut("__enum").add(".into(), ")
+                        .add(");");
+                    tb.add("vm.set_value_trap(tuple, ").live_id_lut("__enum").add(", ")
                         .live_id_lut(&enum_name)
-                        .add(".into(), vm.bx.threads.cur().trap.pass());");
+                        .add(");");
                     for (i, arg) in args.iter().enumerate() {
                         tb.add("let value = <")
                             .stream(Some(arg.clone()))
                             .add(" as ScriptApply>::script_to_value(")
                             .ident(&format!("v{i}"))
                             .add(",vm);");
-                        tb.add("vm.bx.heap.vec_push(tuple, NIL, value, vm.bx.threads.cur().trap.pass());");
+                        tb.add("vm.vec_push_trap(tuple, NIL, value);");
                     }
                     tb.add("    tuple.into()");
                     tb.add("}");
@@ -848,16 +848,16 @@ fn derive_script_impl_inner(
                     tb.add("    let proto = Self::script_enum_lookup_variant(vm,")
                         .live_id(&item.name)
                         .add(");");
-                    tb.add("    let named = vm.bx.heap.new_with_proto(proto);");
+                    tb.add("    let named = vm.new_with_proto(proto);");
                     for (i, field) in fields.iter().enumerate() {
                         tb.add("let value = <")
                             .stream(Some(field.ty.clone()))
                             .add(" as ScriptApply>::script_to_value(")
                             .ident(&format!("v{i}"))
                             .add(", vm);");
-                        tb.add("vm.bx.heap.set_value(named, ")
+                        tb.add("vm.set_value_trap(named, ")
                             .live_id(&field.name)
-                            .add(".into(), value, vm.bx.threads.cur().trap.pass());");
+                            .add(", value);");
                     }
                     tb.add("    named.into()");
                     tb.add("}");
