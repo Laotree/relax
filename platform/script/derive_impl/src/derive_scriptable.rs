@@ -307,7 +307,7 @@ fn derive_script_impl_inner(
 
         // The name goes to the registration as a value (no function of its
         // own per type).
-        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), Self::script_proto_build, Self::script_type_check, Some(")
+        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), script_proto_build_c::<Self>, script_type_check_c::<Self>, Some(")
             .string(&struct_name)
             .add("), false) }");
 
@@ -541,7 +541,7 @@ fn derive_script_impl_inner(
 
         // Any variant with a discriminant makes it a repr(u32) enum.
         let has_discriminant = items.iter().any(|item| item.discriminant.is_some());
-        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), Self::script_proto_build, Self::script_type_check, Some(")
+        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), script_proto_build_c::<Self>, script_type_check_c::<Self>, Some(")
             .string(&enum_name)
             .add("),")
             .add(if has_discriminant { "true" } else { "false" })
@@ -623,9 +623,9 @@ fn derive_script_impl_inner(
                         .string(&enum_name)
                         .add(", &[");
                     for arg in args.iter() {
-                        tb.add("<")
+                        tb.add("script_type_check_c::<")
                             .stream(Some(arg.clone()))
-                            .add(" as ScriptNew>::script_type_check,");
+                            .add(">,");
                     }
                     tb.add("], file!(), line!())");
                     tb.add("});");

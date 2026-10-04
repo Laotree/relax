@@ -56,6 +56,7 @@ impl LiveIdInterner {
 
 #[derive(Clone, Default, Eq, Hash, Copy, Ord, PartialOrd, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[repr(transparent)]
 pub struct LiveId(pub u64);
 
 impl LiveId {
