@@ -17,7 +17,7 @@ pub fn script_err_gen_impl(input: TokenStream) -> TokenStream {
         tb.add("        if let $crate::trap::ScriptTrap::Inner(trap) = $trap.pass(){");
         tb.add("            trap.push_err(ScriptValue::")
             .ident(&ident)
-            .add("(trap.ip), stringify!($trap).into(), file!().into(), line!())");
+            .add("(trap.cur_ip()), stringify!($trap), file!(), line!())");
         tb.add("        }else{");
         tb.add("            ScriptValue::")
             .ident(&ident)
@@ -28,7 +28,7 @@ pub fn script_err_gen_impl(input: TokenStream) -> TokenStream {
         tb.add("        if let $crate::trap::ScriptTrap::Inner(trap) = $trap.pass(){");
         tb.add("            trap.push_err(ScriptValue::")
             .ident(&ident)
-            .add("(trap.ip), format!($($arg)*), file!().into(), line!())");
+            .add("(trap.cur_ip()), &format!($($arg)*), file!(), line!())");
         tb.add("        }else{");
         tb.add("            ScriptValue::")
             .ident(&ident)
