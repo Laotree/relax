@@ -299,9 +299,11 @@ fn derive_script_impl_inner(
             .stream(where_clause.clone())
             .add("{");
 
-        tb.add("    fn script_type_name()->Option<LiveId>{ Some(")
-            .live_id_lut(&struct_name)
-            .add(") }");
+        // The name goes to the registration as a value (no function of its
+        // own per type).
+        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), Self::script_proto_build, Self::script_type_check, Some(")
+            .string(&struct_name)
+            .add("), false) }");
 
         tb.add("    fn script_new(vm: &mut ScriptVm) -> Self {");
         tb.add("        Self {");
@@ -526,8 +528,12 @@ fn derive_script_impl_inner(
             .stream(where_clause.clone())
             .add("{");
 
-        tb.add("    fn script_type_name()->Option<LiveId>{ Some(")
-            .live_id_lut(&enum_name)
+        // Any variant with a discriminant makes it a repr(u32) enum.
+        let has_discriminant = items.iter().any(|item| item.discriminant.is_some());
+        tb.add("    fn script_proto(vm:&mut ScriptVm)->ScriptValue{ script_proto_inner(vm, Self::script_type_id_static(), Self::script_proto_build, Self::script_type_check, Some(")
+            .string(&enum_name)
+            .add("),")
+            .add(if has_discriminant { "true" } else { "false" })
             .add(") }");
         tb.add("    fn script_new(vm:&mut ScriptVm)->Self{");
         tb.add("       ");
@@ -563,12 +569,6 @@ fn derive_script_impl_inner(
         }
         tb.add("])");
         tb.add("    }");
-
-        // Check if any variant has a discriminant (indicating repr(u32) enum)
-        let has_discriminant = items.iter().any(|item| item.discriminant.is_some());
-        if has_discriminant {
-            tb.add("    fn is_repr_u32_enum() -> bool { true }");
-        }
 
         tb.add("    fn script_proto_build(vm:&mut ScriptVm, _props:&mut ScriptTypeProps)->ScriptValue{");
         tb.add("        let enum_object = vm.bx.heap.new_object();");
