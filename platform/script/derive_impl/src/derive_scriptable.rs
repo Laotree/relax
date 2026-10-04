@@ -94,6 +94,7 @@ fn derive_script_impl_inner(
             .stream(generic.clone())
             .stream(where_clause.clone())
             .add("{");
+        tb.add("    fn script_type_id(&self)->ScriptTypeId{ <Self as ScriptNew>::script_type_id_static() }");
 
         tb.add("    fn script_apply(&mut self, vm:&mut ScriptVm, apply:&Apply, scope:&mut Scope, value:ScriptValue) {");
         tb.add("           if <Self as ScriptHook>::on_custom_apply(self, vm, apply, scope, value) || value.is_nil(){return};");
@@ -298,6 +299,11 @@ fn derive_script_impl_inner(
             .stream(generic.clone())
             .stream(where_clause.clone())
             .add("{");
+        // the id of a non-generic type is a constant (ScriptTypeId::of_path of its path, the same
+        // under every compiler); generic ones keep the trait's default
+        if generic.is_none() {
+            tb.add("    fn script_type_id_static()->ScriptTypeId{ const ID: ScriptTypeId = ScriptTypeId::of_path(concat!(module_path!(), \"::\", ").string(&struct_name).add(")); ID }");
+        }
 
         // The name goes to the registration as a value (no function of its
         // own per type).
@@ -527,6 +533,11 @@ fn derive_script_impl_inner(
             .stream(generic.clone())
             .stream(where_clause.clone())
             .add("{");
+        // the id of a non-generic type is a constant (ScriptTypeId::of_path of its path, the same
+        // under every compiler); generic ones keep the trait's default
+        if generic.is_none() {
+            tb.add("    fn script_type_id_static()->ScriptTypeId{ const ID: ScriptTypeId = ScriptTypeId::of_path(concat!(module_path!(), \"::\", ").string(&enum_name).add(")); ID }");
+        }
 
         // Any variant with a discriminant makes it a repr(u32) enum.
         let has_discriminant = items.iter().any(|item| item.discriminant.is_some());
@@ -680,6 +691,7 @@ fn derive_script_impl_inner(
             .stream(generic.clone())
             .stream(where_clause.clone())
             .add("{");
+        tb.add("    fn script_type_id(&self)->ScriptTypeId{ <Self as ScriptNew>::script_type_id_static() }");
 
         tb.add("    fn script_apply(&mut self, vm:&mut ScriptVm, apply:&Apply, scope:&mut Scope, value:ScriptValue){");
         tb.add("        if self.on_custom_apply(vm, apply, scope, value){");
