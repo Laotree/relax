@@ -13,10 +13,9 @@ metadata.makepad-auto-version = "Fjf_rJTOgvZXwyU7Yb-CZMF6Hmo="
 makepad-live-id-macros = { path = "id_macros", version = "1.0.0" }
 #makepad-error-log = { path = "../error_log", version = "0.4.0" }
 
-serde = { version = "1.0", optional = true, features = ["derive"] }
 
 [features]
+# the shims Rapid binds this crate through when it is built into the `makepad` loader
+# (src/host_shims.rs, `makepad host-gen`; its id interner must be the one copy in the process)
 host-shims = []
 default = []
-## Enables certain public-facing types to derive serde serialization traits.
-serde = ["dep:serde"]
