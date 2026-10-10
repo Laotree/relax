@@ -522,6 +522,18 @@ fn with_context<R>(op: impl FnOnce(Option<&RefCell<TaskDeps>>) -> R) -> R {
     op(Some(unsafe { &*ptr.cast::<RefCell<TaskDeps>>() }))
 }
 
+/// This thread's query context (null: none), to run work for this thread on another one.
+pub fn context_ptr() -> *const () {
+    CONTEXT.get()
+}
+
+/// Makes `ctx` (another thread's `context_ptr`) this thread's query context and returns the one
+/// it replaces. SAFETY: the thread owning `ctx` is blocked until this thread swaps it out again,
+/// so its task frame is used by one thread at a time.
+pub unsafe fn swap_context(ctx: *const ()) -> *const () {
+    CONTEXT.replace(ctx)
+}
+
 pub(super) fn in_context(engine: u64) -> bool {
     with_context(|frame| frame.is_some_and(|frame| frame.borrow().engine == engine))
 }

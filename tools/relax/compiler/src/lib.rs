@@ -13,6 +13,7 @@ pub mod reload;
 pub mod modules;
 pub mod sandbox;
 pub mod jit;
+pub mod owner;
 mod nounwind;
 pub mod os;
 pub mod lower;
