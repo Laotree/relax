@@ -282,9 +282,11 @@ impl Plan {
                 // Publish in source order, replaying macro lookups before using
                 // a speculative surface, just as the real preload parser does.
                 let base = table.clone();
+                // Each worker reads its scan in place and lets go of it before handing back the
+                // surface: publication then owns the scan alone (Arc::make_mut, no copy).
                 let inputs = scans.iter().filter_map(|(path, module, _, scan, ..)| scan.as_ref().map(|scan|
-                    (path.clone(), module.clone(), scan.src.to_vec(), scan.toks.to_vec()))).collect::<Vec<_>>();
-                let expected = inputs.iter().map(|(path, module, ..)| (path.clone(), module.clone())).collect::<BTreeSet<_>>();
+                    std::sync::Mutex::new(Some((path.clone(), module.clone(), scan.clone()))))).collect::<Vec<_>>();
+                let expected = scans.iter().filter(|entry| entry.3.is_some()).map(|(path, module, ..)| (path.clone(), module.clone())).collect::<BTreeSet<_>>();
                 let ready = (std::sync::Mutex::new(BTreeMap::new()), std::sync::Condvar::new());
                 let next_input = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|scope| {
@@ -292,17 +294,20 @@ impl Plan {
                         let (inputs, ready, next_input, base, context) = (&inputs, &ready, &next_input, &base, &contexts[*ci]);
                         scope.spawn(move || {
                             let _reads = context.bind_source_reads();
-                            while let Some((path, module, src, toks)) = inputs.get(next_input.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
-                                let _profile = crate::load_profile::span(profile, "rust-demand-outline-worker", path);
-                                let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, path, module, &c.cfg));
+                            while let Some(input) = inputs.get(next_input.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
+                                let (path, module, scan) = input.lock().unwrap().take().expect("each input is expanded once");
+                                let _profile = crate::load_profile::span(profile, "rust-demand-outline-worker", &path);
+                                let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, &path, &module, &c.cfg));
                                 let surface = {
-                                    let mut toks = toks.clone();
+                                    let src = &scan.src[..];
+                                    let mut toks = crate::parser::lazy_bodies::Toks::from(&scan.toks[..]);
                                     if !toks.last().is_some_and(|t| t.kind == T::Eof) {
                                         toks.push(Tok { kind: T::Eof, lo: src.len() as u32, hi: src.len() as u32 });
                                     }
                                     Some(crate::parser::rs_expand::expand(src, toks, c.edition, ctx, base.clone()))
                                 };
-                                let surface = surface.map(|surface| OutlineIndexes::new(surface, profile, path));
+                                drop(scan);
+                                let surface = surface.map(|surface| OutlineIndexes::new(surface, profile, &path));
                                 ready.0.lock().unwrap().insert((path.clone(), module.clone()), surface);
                                 ready.1.notify_all();
                             }
@@ -330,6 +335,8 @@ impl Plan {
                         let (path, module, _, scan, parameters, _) = &mut entry;
                         let Some(scan) = scan else { scans.push(entry); continue; };
                         let _file_profile = crate::load_profile::span(profile, "rust-demand-outline-publish", path);
+                        // the worker's surface (the worker has let go of the scan)
+                        let speculative = take((path.clone(), module.clone()));
                         let scan = Arc::make_mut(scan);
                         {
                             for def in std::mem::take(&mut scan.defs) {
@@ -340,12 +347,12 @@ impl Plan {
                             // As Program::load_file: a speculative surface whose lookups
                             // replay against the current table is kept; only a miss
                             // snapshots the table to expand again.
-                            let surface = take((path.clone(), module.clone()))
+                            let surface = speculative
                                 .filter(|surface| surface.replays(&table, &c.name, path, profile))
                                 .unwrap_or_else(|| {
                                     let _profile = crate::load_profile::span(profile, "rust-demand-outline-replay", path);
                                     let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, path, module, &c.cfg));
-                                    let surface = crate::parser::rs_expand::expand(&scan.src, scan.toks.to_vec(), c.edition, ctx, table.clone());
+                                    let surface = crate::parser::rs_expand::expand(&scan.src, &scan.toks[..], c.edition, ctx, table.clone());
                                     OutlineIndexes::new(surface, profile, path)
                                 });
                             let OutlineIndexes { surface, index, parameters: found_parameters } = surface;
@@ -778,9 +785,12 @@ impl Plan {
                 let cfg = &self.crates[*ci].cfg;
                 let outline = self.contexts[*ci].rust_outline(path, &source.src, self.crates[*ci].edition, cfg)
                     .ok_or_else(|| format!("{path}: Rust outline unavailable during verification"))?;
+                let mut tokens = Vec::new();
+                crate::lexer::lex(&source.src, self.crates[*ci].edition, &mut tokens).map_err(|e| format!("{path}: {}", e.msg))?;
+                let active = crate::preload::configured_tokens(&source.src, &tokens, cfg);
                 // Independent full token-tree indexing checks that skipping body
                 // groups did not erase a module, import, impl head or declaration.
-                let stream = crate::pm_tokens::from_toks(&source.src, &outline.active, &|lo, hi| crate::pm_tokens::Span {
+                let stream = crate::pm_tokens::from_toks(&source.src, &active, &|lo, hi| crate::pm_tokens::Span {
                     lo, hi, ..crate::pm_tokens::Span::DUMMY
                 }).map_err(|e| e.to_string())?;
                 let eager = crate::rs_index::of_tokens(&stream);

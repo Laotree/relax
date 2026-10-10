@@ -1,24 +1,21 @@
 //! Immutable Rust source snapshots, outline reuse and parse diagnostics.
 use crate::{builtins::FileCtx, source::{SourceRegistry, SourceSpan}};
 use std::{collections::BTreeMap, path::{Path, PathBuf}, rc::Rc, sync::{Arc, Mutex, OnceLock}};
-type Lexed = Option<Arc<Vec<crate::lexer::Tok>>>;
 
 pub struct Context {
     sources: Arc<SourceRegistry>,
     reads: Arc<crate::vfs::ReadSnapshot>,
     session: crate::Session,
-    lexed: Mutex<BTreeMap<(String, u16), Arc<OnceLock<Lexed>>>>,
     rust_outlines: Mutex<BTreeMap<(String, u16), Arc<OnceLock<Option<Arc<crate::rs_outline::Outline>>>>>>,
     outline_reuse: Mutex<BTreeMap<String, Arc<crate::parse_work::Reuse>>>,
-    outline_store: OnceLock<Arc<crate::rs_outline::Store>>,
     demand_identity: OnceLock<u128>,
     fingerprint: OnceLock<u128>,
 }
 impl Context {
     pub fn new(_root: &str, sources: Arc<SourceRegistry>, session: &crate::Session) -> Arc<Self> {
         Arc::new(Self { sources, reads: crate::vfs::ReadSnapshot::new(session.runtime.profile), session: crate::Session { options: session.options.clone(), runtime: session.runtime.clone() },
-            lexed: Default::default(), rust_outlines: Default::default(), outline_reuse: Default::default(),
-            outline_store: OnceLock::new(), demand_identity: OnceLock::new(), fingerprint: OnceLock::new() })
+            rust_outlines: Default::default(), outline_reuse: Default::default(),
+            demand_identity: OnceLock::new(), fingerprint: OnceLock::new() })
     }
     pub fn for_units(crates: &[crate::crates::CrateUnit], sources: Arc<SourceRegistry>, session: &crate::Session) -> Vec<Arc<Self>> {
         crates.iter().map(|c| Self::new(&c.src_path, sources.clone(), session)).collect()
@@ -29,7 +26,6 @@ impl Context {
     pub fn bind_source_reads(&self) -> crate::vfs::ReadScope { self.reads.bind() }
     pub fn finish_load(&mut self) { self.fingerprint(); self.release_prescan(); }
     pub fn release_prescan(&self) {
-        self.lexed.lock().unwrap().clear();
         self.rust_outlines.lock().unwrap().clear();
         self.outline_reuse.lock().unwrap().clear();
     }
@@ -46,20 +42,6 @@ impl Context {
     pub fn edited(&self, path: &str, src: Arc<[u8]>) -> Arc<Self> {
         Self::new(path, Arc::new(self.sources.overlay(path, src)), &self.session)
     }
-    /// Both demand discovery and ordinary preload use the same immutable lex.
-    pub fn source_tokens(&self, path: &str, src: &[u8], edition: u16) -> Lexed {
-        let key = (crate::vfs::normalize_path(path), edition);
-        let cell = self.lexed.lock().unwrap().entry(key).or_default().clone();
-        cell.get_or_init(|| {
-            let _profile = crate::load_profile::span(self.session.runtime.profile, "source-lex", path);
-            let mut toks = Vec::with_capacity(src.len() / 4);
-            crate::lexer::lex(src, edition, &mut toks).ok()?;
-            Some(Arc::new(toks))
-        }).clone()
-    }
-    pub fn set_outline_store(&self, store: Arc<crate::rs_outline::Store>) {
-        let _ = self.outline_store.set(store);
-    }
     pub(crate) fn set_outline_reuse(&self, path: &str, reuse: Arc<crate::parse_work::Reuse>) {
         self.outline_reuse.lock().unwrap().insert(path.into(), reuse);
     }
@@ -68,22 +50,25 @@ impl Context {
         let cell = self.rust_outlines.lock().unwrap().entry(key).or_default().clone();
         cell.get_or_init(|| {
             let _profile = crate::load_profile::span(self.session.runtime.profile, "rs-outline", path);
-            let disk = self.outline_store.get().map(|store| (store, store.key(src, edition, cfg)));
-            if let Some(outline) = disk.and_then(|(store, key)| store.read(key, src)) {
-                if self.session.runtime.lazy_verify {
-                    let fresh = crate::rs_outline::Outline::build(src, edition, cfg)?;
-                    assert_eq!(outline.index, fresh.index, "RELAX_LAZY_VERIFY: cached Rust outline differs: {path}");
-                    assert_eq!(*outline.tokens, *fresh.tokens, "RELAX_LAZY_VERIFY: cached Rust tokens differ: {path}");
-                    assert_eq!(outline.active, fresh.active, "RELAX_LAZY_VERIFY: cached cfg tokens differ: {path}");
-                }
-                crate::why::event("outline-hit", path, 0, "", None);
-                return Some(Arc::new(outline));
-            }
             let outline = crate::rs_outline::Outline::build(src, edition, cfg)?;
             crate::why::event("outline", path, 0, "", None);
-            if let Some((store, key)) = disk { store.write(key, &outline); }
             Some(Arc::new(outline))
         }).clone()
+    }
+    /// rust_outline from `tokens` (the file's lex), and the file's cfg-active tokens.
+    pub fn rust_outline_lexed(&self, path: &str, src: &[u8], edition: u16, cfg: &crate::cfg::CfgSet, tokens: &[crate::lexer::Tok]) -> Option<(Arc<crate::rs_outline::Outline>, Vec<crate::lexer::Tok>)> {
+        let key = (crate::vfs::normalize_path(path), edition);
+        let cell = self.rust_outlines.lock().unwrap().entry(key).or_default().clone();
+        let mut built = None;
+        let outline = cell.get_or_init(|| {
+            let _profile = crate::load_profile::span(self.session.runtime.profile, "rs-outline", path);
+            let (outline, active) = crate::rs_outline::Outline::of_tokens(src, tokens, cfg)?;
+            built = Some(active);
+            crate::why::event("outline", path, 0, "", None);
+            Some(Arc::new(outline))
+        }).clone()?;
+        let active = built.unwrap_or_else(|| crate::preload::configured_tokens(src, tokens, cfg));
+        Some((outline, active))
     }
     pub fn sources(&self) -> &Arc<SourceRegistry> {
         &self.sources

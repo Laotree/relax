@@ -3382,7 +3382,6 @@ pub fn front_graph_pending() -> bool {
 #[derive(Default)]
 pub struct FrontImages {
     dir: PathBuf,
-    outlines_writable: bool,
     hashes: std::sync::Mutex<Option<HashMap<String, Option<u128>>>>,
     /// inputs whose contents this handle read and hashed to validate (an unchanged warm start: 0)
     content_hashes: std::sync::atomic::AtomicU64,
@@ -3405,7 +3404,7 @@ impl FrontImages {
         pack::ensure_private_dir(&root).ok()?;
         let dir = root.join("cache");
         pack::ensure_private_dir(&dir).ok()?;
-        Some(Self { dir, outlines_writable: mode_from_env(options) != Some(Mode::ReadOnly), ..Default::default() })
+        Some(Self { dir, ..Default::default() })
     }
     fn input_current(&self, path: &str, expected: u128) -> bool {
         self.memo_input_hash(path) == Some(expected)
@@ -3657,9 +3656,6 @@ impl FrontImages {
     }
 }
 impl crate::crate_image::CrateImages for FrontImages {
-    fn rs_outlines(&self) -> Option<std::sync::Arc<crate::rs_outline::Store>> {
-        Some(std::sync::Arc::new(crate::rs_outline::Store::new(self.dir.join("rs-outlines"), crate::stable::build_id(), self.outlines_writable)))
-    }
     fn begin_load(&self, crates: &[crate::preload::PreCrate]) {
         let recipe = crate::crate_image::GraphRecipe::new(crates);
         if *self.begun.lock().unwrap() == Some(recipe.identity) { return; }

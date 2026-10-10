@@ -567,7 +567,6 @@ pub trait DemandWriter {
     fn definition(&mut self, def: &MacroDef) -> Option<(u128, usize)>;
 }
 pub trait CrateImages {
-    fn rs_outlines(&self) -> Option<Arc<crate::rs_outline::Store>> { None }
     /// Validation is shared only during this immutable preload, never across edits.
     fn begin_load(&self, _crates: &[crate::preload::PreCrate]) {}
     fn end_load(&self) {}

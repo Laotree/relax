@@ -106,11 +106,6 @@ impl FrontImages {
                     // computes the new selection. Nothing is retained or exposed
                     // to collection until that selection has been validated.
                     let contexts = crate::source_context::Context::for_crates(pre, Arc::default(), session);
-                    if session.options.rs_lazy {
-                        if let Some(store) = self.rs_outlines() {
-                            for context in &contexts { context.set_outline_store(store.clone()); }
-                        }
-                    }
                     let pending = Arc::new(crate::preload::DemandPlan::new(pre, contexts, Some(self), true));
                     *self.pending_plan.lock().unwrap() = Some((GraphRecipe::new(pre).identity, pending.clone()));
                     let worker = pending.clone();

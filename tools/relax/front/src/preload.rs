@@ -878,9 +878,19 @@ fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16,
     let src_len = src.len();
     let mut toks;
     if cfg.session.options.rs_lazy {
-        let outline = context.rust_outline(path, &src, edition, cfg)?;
-        toks = if declarations_only { outline.active.clone() } else { outline.tokens.as_ref().clone() };
-    } else { toks = context.source_tokens(path, &src, edition)?.as_ref().clone(); }
+        // the scan's lex: the parse's tokens, or (declarations only) the outline's input,
+        // whose cfg-active tokens the scan keeps; the outline keeps only its name index
+        toks = Vec::with_capacity(src.len() / 4);
+        crate::lexer::lex(&src, edition, &mut toks).ok()?;
+        let (_, active) = context.rust_outline_lexed(path, &src, edition, cfg, &toks)?;
+        if declarations_only { toks = active; }
+        toks.shrink_to_fit();
+    } else {
+        let _profile = crate::load_profile::span(cfg.session.runtime.profile, "source-lex", path);
+        toks = Vec::with_capacity(src.len() / 4);
+        crate::lexer::lex(&src, edition, &mut toks).ok()?;
+        toks.shrink_to_fit();
+    }
     if declarations_only && !cfg.session.options.rs_lazy {
         toks = lazy::demand::active_tokens(&src, &toks, cfg);
     }
@@ -1149,11 +1159,6 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         assert!(p.crates[plan_offset..].iter().zip(&crates).all(|(a, b)| a.name == b.name && a.root == b.root));
         p.contexts[plan_offset..].to_vec()
     }).or(contexts).unwrap_or_else(|| crate::source_context::Context::for_crates(&crates, sources, sess));
-    if sess.options.rs_lazy {
-        if let Some(store) = images.and_then(|images| images.rs_outlines()) {
-            for context in &contexts { context.set_outline_store(store.clone()); }
-        }
-    }
     let demand_plan = plan.or_else(|| (!sess.options.source_eager && sess.options.rs_lazy).then(|| Arc::new(DemandPlan::new(&crates, contexts.clone(), images, jobs >= 2))))
         .filter(|plan| plan.ready().map_or(true, |p| p.counts().1 != 0));
     let planning = demand_plan.as_ref().is_some_and(|p| p.ready().is_none());
