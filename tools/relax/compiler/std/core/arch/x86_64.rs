@@ -1279,72 +1279,27 @@ pub unsafe fn _mm_setzero_si128() -> __m128i {
     vx::vx_splat(0, 32)
 }
 
+#[inline(always)]
 pub unsafe fn _mm_sha1msg1_epu32(a: __m128i, b: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let b = lanes128_u32(b);
-    from128_u32([a[0] ^ b[2], a[1] ^ b[3], a[2] ^ a[0], a[3] ^ a[1]])
+    vx::vx_binary(a, b, 71, 32)
 }
 
+#[inline(always)]
 pub unsafe fn _mm_sha1msg2_epu32(a: __m128i, b: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let b = lanes128_u32(b);
-    let w0 = (a[3] ^ b[2]).rotate_left(1);
-    let w1 = (a[2] ^ b[1]).rotate_left(1);
-    let w2 = (a[1] ^ b[0]).rotate_left(1);
-    let w3 = (a[0] ^ w0).rotate_left(1);
-    from128_u32([w3, w2, w1, w0])
+    vx::vx_binary(a, b, 72, 32)
 }
 
+#[inline(always)]
 pub unsafe fn _mm_sha1nexte_epu32(a: __m128i, b: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let mut b = lanes128_u32(b);
-    b[3] = b[3].wrapping_add(a[3].rotate_right(2));
-    from128_u32(b)
+    vx::vx_binary(a, b, 70, 32)
 }
 
 // Intel stores [D, C, B, A] from low to high; b[3] includes the initial E.
 // SHA1RNDS4 adds the selected constant here (unlike Arm SHA1C/P/M).
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
+#[inline(always)]
 pub unsafe fn _mm_sha1rnds4_epu32<const FUNC: i32>(a: __m128i, b: __m128i) -> __m128i {
-    let state = lanes128_u32(a);
-    let wk = lanes128_u32(b);
-    let mut a = state[3];
-    let mut b = state[2];
-    let mut c = state[1];
-    let mut d = state[0];
-    let mut e = 0u32;
-    let k = if FUNC == 0 {
-        0x5a82_7999
-    } else if FUNC == 1 {
-        0x6ed9_eba1
-    } else if FUNC == 2 {
-        0x8f1b_bcdc
-    } else {
-        0xca62_c1d6
-    };
-    let mut i = 0;
-    while i < 4 {
-        let f = if FUNC == 0 {
-            (b & c) ^ (!b & d)
-        } else if FUNC == 2 {
-            (b & c) ^ (b & d) ^ (c & d)
-        } else {
-            b ^ c ^ d
-        };
-        let t = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(wk[3 - i])
-            .wrapping_add(k);
-        e = d;
-        d = c;
-        c = b.rotate_right(2);
-        b = a;
-        a = t;
-        i += 1;
-    }
-    from128_u32([d, c, b, a])
+    vx::vx_sha1rnds4(a, b, FUNC)
 }
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
@@ -1607,71 +1562,21 @@ pub unsafe fn _mm_setzero_ps() -> __m128 {
 }
 
 // Intel SDM SHA256MSG1: dst[i] = W[i] + sigma0(W[i + 1]) with W0..W3 = a, W4 = b[0].
+#[inline(always)]
 pub unsafe fn _mm_sha256msg1_epu32(a: __m128i, b: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let b = lanes128_u32(b);
-    let w = [a[0], a[1], a[2], a[3], b[0]];
-    let mut r = [0u32; 4];
-    let mut i = 0;
-    while i < 4 {
-        let x = w[i + 1];
-        let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
-        r[i] = w[i].wrapping_add(s0);
-        i += 1;
-    }
-    from128_u32(r)
+    vx::vx_binary(a, b, 73, 32)
 }
 
 // Intel SDM SHA256MSG2: W16..W19 from a (W16..W19 partial sums) and W14, W15 = b[2], b[3].
+#[inline(always)]
 pub unsafe fn _mm_sha256msg2_epu32(a: __m128i, b: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let b = lanes128_u32(b);
-    let mut w = [b[2], b[3], 0, 0, 0, 0];
-    let mut i = 0;
-    while i < 4 {
-        let x = w[i];
-        let s1 = x.rotate_right(17) ^ x.rotate_right(19) ^ (x >> 10);
-        w[i + 2] = a[i].wrapping_add(s1);
-        i += 1;
-    }
-    from128_u32([w[2], w[3], w[4], w[5]])
+    vx::vx_binary(a, b, 74, 32)
 }
 
 // Intel SDM SHA256RNDS2: a = CDGH, b = ABEF (each high to low), k[0..2] = WK0, WK1; result = ABEF.
+#[inline(always)]
 pub unsafe fn _mm_sha256rnds2_epu32(a: __m128i, b: __m128i, k: __m128i) -> __m128i {
-    let a = lanes128_u32(a);
-    let b = lanes128_u32(b);
-    let k = lanes128_u32(k);
-    let mut sa = b[3];
-    let mut sb = b[2];
-    let mut sc = a[3];
-    let mut sd = a[2];
-    let mut se = b[1];
-    let mut sf = b[0];
-    let mut sg = a[1];
-    let mut sh = a[0];
-    let mut i = 0;
-    while i < 2 {
-        let ch = (se & sf) ^ (!se & sg);
-        let maj = (sa & sb) ^ (sa & sc) ^ (sb & sc);
-        let s0 = sa.rotate_right(2) ^ sa.rotate_right(13) ^ sa.rotate_right(22);
-        let s1 = se.rotate_right(6) ^ se.rotate_right(11) ^ se.rotate_right(25);
-        let t1 = sh
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(k[i]);
-        let t2 = s0.wrapping_add(maj);
-        sh = sg;
-        sg = sf;
-        sf = se;
-        se = sd.wrapping_add(t1);
-        sd = sc;
-        sc = sb;
-        sb = sa;
-        sa = t1.wrapping_add(t2);
-        i += 1;
-    }
-    from128_u32([sf, se, sb, sa])
+    vx::vx_ternary(a, b, k, 0)
 }
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]

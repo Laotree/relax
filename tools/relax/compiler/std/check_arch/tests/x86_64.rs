@@ -1857,11 +1857,11 @@ fn _mm_setzero_si128() {
 fn _mm_sha1msg1_epu32() {
     let mut rng = Rng(0x9e3779b97f4a7c15);
     unsafe {
-        intel::_mm_sha1msg1_epu32();
         if !std::is_x86_feature_detected!("sha") {
-            eprintln!("_mm_sha1msg1_epu32: sha unavailable; 3 Intel fixtures passed");
+            eprintln!("_mm_sha1msg1_epu32: sha unavailable; hardware coverage skipped");
             return;
         }
+        intel::_mm_sha1msg1_epu32();
         for case in 0..RANDOM_CASES + 17 {
             let p0: hr::__m128i = sample(&mut rng, case, 0);
             let p1: hr::__m128i = sample(&mut rng, case, 1);
@@ -1876,11 +1876,11 @@ fn _mm_sha1msg1_epu32() {
 fn _mm_sha1msg2_epu32() {
     let mut rng = Rng(0x9e3779b97f4a7c15);
     unsafe {
-        intel::_mm_sha1msg2_epu32();
         if !std::is_x86_feature_detected!("sha") {
-            eprintln!("_mm_sha1msg2_epu32: sha unavailable; 3 Intel fixtures passed");
+            eprintln!("_mm_sha1msg2_epu32: sha unavailable; hardware coverage skipped");
             return;
         }
+        intel::_mm_sha1msg2_epu32();
         for case in 0..RANDOM_CASES + 17 {
             let p0: hr::__m128i = sample(&mut rng, case, 0);
             let p1: hr::__m128i = sample(&mut rng, case, 1);
@@ -1895,11 +1895,11 @@ fn _mm_sha1msg2_epu32() {
 fn _mm_sha1nexte_epu32() {
     let mut rng = Rng(0x9e3779b97f4a7c15);
     unsafe {
-        intel::_mm_sha1nexte_epu32();
         if !std::is_x86_feature_detected!("sha") {
-            eprintln!("_mm_sha1nexte_epu32: sha unavailable; 3 Intel fixtures passed");
+            eprintln!("_mm_sha1nexte_epu32: sha unavailable; hardware coverage skipped");
             return;
         }
+        intel::_mm_sha1nexte_epu32();
         for case in 0..RANDOM_CASES + 17 {
             let p0: hr::__m128i = sample(&mut rng, case, 0);
             let p1: hr::__m128i = sample(&mut rng, case, 1);
@@ -1919,11 +1919,11 @@ fn _mm_sha1rnds4_epu32() {
     }
     let mut rng = Rng(0x9e3779b97f4a7c15);
     unsafe {
-        intel::_mm_sha1rnds4_epu32();
         if !std::is_x86_feature_detected!("sha") {
-            eprintln!("_mm_sha1rnds4_epu32: sha unavailable; 3 Intel fixtures passed");
+            eprintln!("_mm_sha1rnds4_epu32: sha unavailable; hardware coverage skipped");
             return;
         }
+        intel::_mm_sha1rnds4_epu32();
         for case in 0..RANDOM_CASES + 17 {
             let p0: hr::__m128i = sample(&mut rng, case, 0);
             let p1: hr::__m128i = sample(&mut rng, case, 1);
@@ -2269,3 +2269,9 @@ fn _mm_store_si128() {
         }
     }
 }
+
+#[allow(dead_code)]
+mod sha256_oracle {
+    include!("common/sha256_oracle.rs");
+}
+include!("common/sha256_cases.rs");

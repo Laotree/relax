@@ -124,6 +124,26 @@ pub enum VX {
     PackUsS,
     /// d[i] = b[i] & 0x80 ? 0 : a[b[i] & 15] (pshufb)
     ByteShuffle,
+    // SHA instruction semantics are architecture-specific (not interchangeable lane orders).
+    X86Sha1Rnds4(u8),
+    X86Sha1NextE,
+    X86Sha1Msg1,
+    X86Sha1Msg2,
+    X86Sha256Msg1,
+    X86Sha256Msg2,
+    ArmSha1Su1,
+    ArmSha256Su0,
+    // Unary: SHA1H reads/writes lane 0, with the rest of the result zero.
+    ArmSha1H,
+    // Ternary: Inst::VX3, all operands/results V128; SHA1C/P/M read b.s[0].
+    X86Sha256Rnds2,
+    ArmSha1C,
+    ArmSha1P,
+    ArmSha1M,
+    ArmSha1Su0,
+    ArmSha256H,
+    ArmSha256H2,
+    ArmSha256Su1,
     // ---- unary, V128 -> V128
     Abs(VW),
     ShlI(VW, u8),
@@ -159,10 +179,12 @@ pub enum VX {
 }
 
 impl VX {
-    /// operands read: 1 (unary, scalar-from) or 2
+    /// Operands read: 1 (unary, scalar-from), 2, or 3 (Inst::VX3).
     pub fn arity(self) -> usize {
         match self {
-            VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 => 1,
+            VX::ArmSha1H | VX::Abs(_) | VX::ShlI(..) | VX::ShrUI(..) | VX::ShrSI(..) | VX::ShufS(_) | VX::BytesShrI(_) | VX::BytesShlI(_) | VX::WidenLoU(_) | VX::WidenHiU(_) | VX::WidenLoS(_) | VX::WidenHiS(_) | VX::PairAddLongU(_) | VX::Splat(_) | VX::Extract(..) | VX::MoveMaskB | VX::AddAcross(_) | VX::MaxAcrossU(_) | VX::FromLo64 => 1,
+            VX::X86Sha256Rnds2 | VX::ArmSha1C | VX::ArmSha1P | VX::ArmSha1M
+            | VX::ArmSha1Su0 | VX::ArmSha256H | VX::ArmSha256H2 | VX::ArmSha256Su1 => 3,
             _ => 2,
         }
     }
@@ -621,6 +643,8 @@ pub enum Inst {
     VGather(VReg, VReg, VReg), // d, base, idx
     /// lane-typed vector op (see `VX`): d, a, b (b repeats a for unary ops)
     VX(VX, VReg, VReg, VReg),
+    /// Pure ternary vector op; a is the destructive hardware input, c is explicit in RIR.
+    VX3(VX, VReg, VReg, VReg, VReg),
 }
 
 #[derive(Clone, Debug)]
@@ -683,7 +707,7 @@ impl Inst {
                 f(b);
                 f(c);
             }
-            Inst::Sel(d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) | Inst::FMulAdd(_, _, _, d, a, b, c) | Inst::AtomicCas(_, _, _, d, a, b, c) => {
+            Inst::Sel(d, a, b, c) | Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) | Inst::FMulAdd(_, _, _, d, a, b, c) | Inst::AtomicCas(_, _, _, d, a, b, c) => {
                 f(d);
                 f(a);
                 f(b);
@@ -952,7 +976,7 @@ impl Func {
                         regs.push(*a);
                         regs.push(*b);
                     }
-                    Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) => {
+                    Inst::VX3(_, d, a, b, c) | Inst::VSel(d, a, b, c) | Inst::VFma(_, _, d, a, b, c) => {
                         regs.push(*d);
                         regs.push(*a);
                         regs.push(*b);

@@ -1726,9 +1726,136 @@ impl<'a> Gen<'a> {
     }
 
 
+    /// Reverse four 32-bit words, without reversing bytes inside a word.
+    fn sha_reverse(&mut self, d: u8, a: u8) {
+        self.v2(0x4EA0_0800, d, a); // rev64 .4s
+        self.v3(0x6E00_4000, d, d, d); // ext #8
+    }
+
+    fn vx3(&mut self, op: VX, d: VReg, a: VReg, b: VReg, c: VReg) {
+        if op == VX::X86Sha256Rnds2 {
+            // Intel's [H,G,D,C], [F,E,B,A] -> Arm's [A,B,C,D], [E,F,G,H].
+            // After four Arm rounds, lanes 2/3 still contain the round-2/1 values.
+            let xa = self.use_f(a, FS0);
+            let xb = self.use_f(b, FS1);
+            let xc = self.use_f(c, FS2);
+            self.v3(0x4EC0_7800, 4, xa, xb); // zip2 .2d
+            self.sha_reverse(4, 4);
+            self.v3(0x4EC0_3800, 5, xa, xb); // zip1 .2d
+            self.sha_reverse(5, 5);
+            self.vmov(6, 4);
+            self.v3(0x5E00_4000, 6, 5, xc); // sha256h
+            self.v3(0x5E00_5000, 5, 4, xc); // sha256h2, original ABCD
+            self.v3(0x4EC0_7800, 4, 5, 6); // [E2,E1,A2,A1]
+            self.v2(0x4EA0_0800, 4, 4); // [E1,E2,A1,A2]
+            let xd = self.def_f(d, FS0);
+            self.vmov(xd, 4);
+            self.fin_f(d, xd);
+            return;
+        }
+        let encoding = match op {
+            VX::ArmSha1C => 0x5E00_0000,
+            VX::ArmSha1P => 0x5E00_1000,
+            VX::ArmSha1M => 0x5E00_2000,
+            VX::ArmSha1Su0 => 0x5E00_3000,
+            VX::ArmSha256H => 0x5E00_4000,
+            VX::ArmSha256H2 => 0x5E00_5000,
+            VX::ArmSha256Su1 => 0x5E00_6000,
+            _ => unreachable!("arm64 ternary vx {:?}", op),
+        };
+        let xa = self.use_f(a, FS0);
+        let xb = self.use_f(b, FS1);
+        // v4 is unallocated; leave FS2 available for an aliased/spilled result.
+        let xc = self.use_f(c, 4);
+        let xd = self.def_f(d, FS2);
+        let tmp = if xd == xb || xd == xc { FS2 } else { xd };
+        self.vmov(tmp, xa);
+        self.v3(encoding, tmp, xb, xc);
+        self.vmov(xd, tmp);
+        self.fin_f(d, xd);
+    }
+
     /// Lane-typed vector ops (core::arch intrinsics), NEON. Scratch: v29-v31 (FS*) and
     /// v4-v7 (argument registers, unallocated inside an instruction).
     fn vx(&mut self, op: VX, d: VReg, a: VReg, b: VReg) {
+        // core::arch exposes Intel semantics on Arm too (check_arch's cross-ISA
+        // fixtures exercise them). Keep these in hardware, with lane conversion.
+        if matches!(op, VX::X86Sha1Rnds4(_) | VX::X86Sha1NextE | VX::X86Sha1Msg1
+            | VX::X86Sha1Msg2 | VX::X86Sha256Msg1 | VX::X86Sha256Msg2) {
+            let xa = self.use_f(a, FS0);
+            let xb = self.use_f(b, FS1);
+            match op {
+                VX::X86Sha1Rnds4(k) => {
+                    self.sha_reverse(4, xa);
+                    self.sha_reverse(5, xb);
+                    let kword = [0x5a82_7999u64, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c1d6][k as usize];
+                    let pair = kword | kword << 32;
+                    self.const128(6, pair, pair);
+                    self.v3(0x4EA0_8400, 5, 5, 6); // add .4s, WK includes K on Arm
+                    self.movi16b(6, 0); // E is already included in Intel's first WK
+                    let enc = match k { 0 => 0x5E00_0000, 2 => 0x5E00_2000, _ => 0x5E00_1000 };
+                    self.v3(enc, 4, 6, 5);
+                    self.sha_reverse(4, 4);
+                }
+                VX::X86Sha1NextE => {
+                    self.sha_reverse(4, xa);
+                    self.v2(0x5E28_0800, 4, 4); // sha1h, zero upper lanes
+                    self.movi16b(5, 0);
+                    self.v3(0x6E00_2000, 4, 5, 4); // ext #4: move E to lane 3
+                    self.v3(0x4EA0_8400, 4, xb, 4);
+                }
+                VX::X86Sha1Msg1 | VX::X86Sha1Msg2 => {
+                    self.sha_reverse(4, xa);
+                    self.sha_reverse(5, xb);
+                    if op == VX::X86Sha1Msg1 {
+                        self.movi16b(6, 0);
+                        self.v3(0x5E00_3000, 4, 5, 6);
+                    } else {
+                        self.v2(0x5E28_1800, 4, 5);
+                    }
+                    self.sha_reverse(4, 4);
+                }
+                VX::X86Sha256Msg1 => {
+                    self.vmov(4, xa);
+                    self.v2(0x5E28_2800, 4, xb);
+                }
+                VX::X86Sha256Msg2 => {
+                    self.vmov(4, xa);
+                    self.movi16b(5, 0);
+                    self.vmov(6, xb);
+                    self.v2(0x4E04_1C00, 6, 31); // ins v6.s[0], wzr
+                    self.v3(0x5E00_6000, 4, 5, 6); // no middle-word additions
+                }
+                _ => unreachable!(),
+            }
+            let xd = self.def_f(d, FS0);
+            self.vmov(xd, 4);
+            self.fin_f(d, xd);
+            return;
+        }
+        if op == VX::ArmSha1H {
+            let xa = self.use_f(a, FS0);
+            let xd = self.def_f(d, FS2);
+            self.v2(0x5E28_0800, xd, xa);
+            self.fin_f(d, xd);
+            return;
+        }
+        let sha = match op {
+            VX::ArmSha1Su1 => Some(0x5E28_1800),
+            VX::ArmSha256Su0 => Some(0x5E28_2800),
+            _ => None,
+        };
+        if let Some(encoding) = sha {
+            let xa = self.use_f(a, FS0);
+            let xb = self.use_f(b, FS1);
+            let xd = self.def_f(d, FS2);
+            let tmp = if xd == xb && xd != xa { FS2 } else { xd };
+            self.vmov(tmp, xa);
+            self.v2(encoding, tmp, xb);
+            self.vmov(xd, tmp);
+            self.fin_f(d, xd);
+            return;
+        }
         // three-same (Q=1): u, opcode
         let ts = |u: u32, w: VW, opc: u32| -> u32 { 0x4E20_0400 | u << 29 | (w as u32) << 22 | opc << 11 };
         const AND: u32 = 0x4E20_1C00;
@@ -2816,6 +2943,7 @@ impl<'a> Gen<'a> {
             }
             Inst::VBin(..) | Inst::VUn(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) | Inst::VShift(..) => self.vinst(i),
             Inst::VX(op, d, a, b) => self.vx(*op, *d, *a, *b),
+            Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::Sel(d, c, a, b) => {
                 let rc = self.use_i(*c, S0);
                 self.cmp_imm(rc, 0);

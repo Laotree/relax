@@ -8277,3 +8277,9 @@ fn vzip_u8() {
         }
     }
 }
+
+#[allow(dead_code)]
+mod sha256_oracle {
+    include!("common/sha256_oracle.rs");
+}
+include!("common/sha256_cases.rs");

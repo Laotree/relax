@@ -849,6 +849,7 @@ fn map_inst(x: &Inst, m: &dyn Fn(VReg) -> VReg, slot_base: u32) -> Inst {
         Inst::VShift(o, d, a, k) => Inst::VShift(*o, m(*d), m(*a), *k),
         Inst::VGather(d, b, i) => Inst::VGather(m(*d), m(*b), m(*i)),
         Inst::VX(op, d, a, b) => Inst::VX(*op, m(*d), m(*a), m(*b)),
+        Inst::VX3(op, d, a, b, c) => Inst::VX3(*op, m(*d), m(*a), m(*b), m(*c)),
         Inst::FMulAdd(np, na, w, d, a, b, c) => Inst::FMulAdd(*np, *na, *w, m(*d), m(*a), m(*b), m(*c)),
     }
 }
@@ -1220,6 +1221,8 @@ fn swap_cond(c: Cond) -> Cond {
     }
 }
 
+// VX and VX3 (including SHA) only define their result. No scalar constant folding
+// or lane-wise algebra applies to the SHA operations.
 fn is_pure(i: &Inst) -> bool {
     !is_mem_effect(i)
 }
@@ -2975,6 +2978,7 @@ fn rename(i: &Inst, a: &dyn Fn(VReg) -> VReg) -> Inst {
         Inst::VAny(d, x) => Inst::VAny(*d, a(*x)),
         Inst::VGather(d, b, i) => Inst::VGather(*d, a(*b), a(*i)),
         Inst::VX(op, d, x, y) => Inst::VX(*op, *d, a(*x), a(*y)),
+        Inst::VX3(op, d, x, y, z) => Inst::VX3(*op, *d, a(*x), a(*y), a(*z)),
         Inst::VShift(o, d, x, k) => Inst::VShift(*o, *d, a(*x), *k),
         Inst::FMulAdd(np, na, w, d, x, y, z) => Inst::FMulAdd(*np, *na, *w, *d, a(*x), a(*y), a(*z)),
         Inst::FpEnv(true, x) => Inst::FpEnv(true, a(*x)),

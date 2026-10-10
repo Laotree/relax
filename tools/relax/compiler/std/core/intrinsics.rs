@@ -157,6 +157,7 @@ pub mod intrinsics_int {
 }
 
 /// Internal SIMD bridge. T/U are padding-free vector newtypes, exactly 16 bytes.
+/// vx_ternary's S is a vector except for SHA1C/P/M, where it is a u32.
 /// Selectors are compile-time constants, checked by lowering. Values use the normal
 /// aggregate ABI; the bridge uses V128 loads/stores so slot forwarding can remove copies.
 pub mod intrinsics_vx {
@@ -170,12 +171,21 @@ pub mod intrinsics_vx {
     // 40..45 f32 add/sub/mul/div/Intel min/max; 46..51 eq/ne/lt/le/gt/ge.
     // 52/53 f32 NEON min/max (NaN propagation and signed-zero ordering).
     // 60..63 NEON f32 add/sub/mul/div.
+    // SHA binary (width 32): 70 x86 sha1nexte, 71 sha1msg1, 72 sha1msg2,
+    // 73 sha256msg1, 74 sha256msg2; 80 Arm sha1su1, 81 sha256su0.
+    // Ternary: 0 x86 sha256rnds2; 1/2/3 Arm sha1c/p/m (b is u32),
+    // 4 Arm sha1su0, 5 sha256h, 6 sha256h2, 7 sha256su1 (b is a vector).
+    // vx_sha1rnds4: x86, immediate FUNC in 0..=3, checked at lowering.
+    // vx_sha1h: Arm, scalar u32 -> u32 through lane 0 of a V128.
     // Unary: 0 abs, 1 shl, 2 unsigned shr, 3 signed shr, 4 shuffle i32,
     // 5/6 byte shift right/left, 7 sqrt f32, 8 abs f32, 9 NEON sqrt f32. Narrow: 19/20/21 as above,
     // 30 unsigned u16->u8. Narrow results are 8 bytes, all other vectors 16.
 
     extern "relax-intrinsic" {
         pub fn vx_binary<T, U>(a: T, b: T, op: u32, width: u32) -> U;
+        pub fn vx_ternary<T, S>(a: T, b: S, c: T, op: u32) -> T;
+        pub fn vx_sha1rnds4<T>(a: T, b: T, func: i32) -> T;
+        pub fn vx_sha1h(a: u32) -> u32;
         pub fn vx_unary<T>(a: T, op: u32, width: u32, imm: i32) -> T;
         pub fn vx_splat<T>(a: u64, width: u32) -> T;
         pub fn vx_load<T>(p: *const u8) -> T;

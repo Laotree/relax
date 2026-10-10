@@ -9597,10 +9597,10 @@ impl<'a> Lcx<'a> {
 
     fn vx_intrinsic(&mut self, name: &str, vals: &[(Val, TyId)], t: TyId) -> Val {
         let arity = match name {
-            "vx_binary" | "vx_unary" => 4,
+            "vx_binary" | "vx_unary" | "vx_ternary" => 4,
             "vx_splat" | "vx_store" | "vx_narrow" | "vx_table" => 2,
-            "vx_load" | "vx_mask" => 1,
-            "vx_blend" => 3,
+            "vx_load" | "vx_mask" | "vx_sha1h" => 1,
+            "vx_blend" | "vx_sha1rnds4" => 3,
             _ => {
                 self.err(self.pos, "unknown SIMD intrinsic".into());
                 return self.dummy_val(t);
@@ -9629,7 +9629,55 @@ impl<'a> Lcx<'a> {
         };
         let vector = |s: &mut Self, k: usize| s.vx_operand(vals[k].0.clone(), vals[k].1);
         let d = self.f.vreg(Cls::V128);
-        if name == "vx_load" {
+        if name == "vx_sha1rnds4" {
+            let func = constant(self, 2);
+            if !(0..=3).contains(&func) {
+                self.err(self.pos, "SHA1RNDS4 selector must be in 0..=3".into());
+                return self.dummy_val(t);
+            }
+            let a = vector(self, 0);
+            let b = vector(self, 1);
+            self.emit(Inst::VX(VX::X86Sha1Rnds4(func as u8), d, a, b));
+        } else if name == "vx_sha1h" {
+            let x = scalar(self, 0);
+            let a = self.f.vreg(Cls::V128);
+            let r = self.f.vreg(Cls::I);
+            self.emit(Inst::VX(VX::FromLo64, a, x, x));
+            self.emit(Inst::VX(VX::ArmSha1H, d, a, a));
+            self.emit(Inst::VX(VX::Extract(VW::S, 0), r, d, d));
+            return Val::L(vec![r]);
+        } else if name == "vx_ternary" {
+            let selector = constant(self, 3);
+            let op = match selector {
+                0 => VX::X86Sha256Rnds2,
+                1 => VX::ArmSha1C,
+                2 => VX::ArmSha1P,
+                3 => VX::ArmSha1M,
+                4 => VX::ArmSha1Su0,
+                5 => VX::ArmSha256H,
+                6 => VX::ArmSha256H2,
+                7 => VX::ArmSha256Su1,
+                _ => {
+                    self.err(self.pos, "invalid SIMD ternary selector".into());
+                    return self.dummy_val(t);
+                }
+            };
+            let a = vector(self, 0);
+            let b = if (1..=3).contains(&selector) {
+                if self.layout(vals[1].1).size != 4 {
+                    self.err(self.pos, "SHA1C/P/M hash_e must be a u32 scalar".into());
+                    return self.dummy_val(t);
+                }
+                let x = scalar(self, 1);
+                let v = self.f.vreg(Cls::V128);
+                self.emit(Inst::VX(VX::FromLo64, v, x, x));
+                v
+            } else {
+                vector(self, 1)
+            };
+            let c = vector(self, 2);
+            self.emit(Inst::VX3(op, d, a, b, c));
+        } else if name == "vx_load" {
             let p = scalar(self, 0);
             self.emit(Inst::VLoad(d, p, 0));
         } else if name == "vx_store" {
@@ -9725,7 +9773,7 @@ impl<'a> Lcx<'a> {
                         21 | 22 => w == VW::S,
                         24 | 25 | 27 => w == VW::B,
                         26 => matches!(w, VW::H | VW::S),
-                        40..=53 | 60..=63 => w == VW::S,
+                        40..=53 | 60..=63 | 70..=74 | 80 | 81 => w == VW::S,
                         _ => false,
                     }
                 } else {
@@ -9772,6 +9820,13 @@ impl<'a> Lcx<'a> {
                         25 => VX::ByteShuffle,
                         26 => VX::MulLo(w),
                         27 => VX::MaddUbs,
+                        70 => VX::X86Sha1NextE,
+                        71 => VX::X86Sha1Msg1,
+                        72 => VX::X86Sha1Msg2,
+                        73 => VX::X86Sha256Msg1,
+                        74 => VX::X86Sha256Msg2,
+                        80 => VX::ArmSha1Su1,
+                        81 => VX::ArmSha256Su0,
                         29 => {
                             // Unsigned comparison = signed comparison after sign-bit bias.
                             let k = self.iconst((1u64 << (w.bits() - 1)) as i64);

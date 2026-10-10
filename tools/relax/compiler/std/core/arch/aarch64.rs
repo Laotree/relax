@@ -599,99 +599,34 @@ pub unsafe fn vsetq_lane_u32<const LANE: i32>(a: u32, b: uint32x4_t) -> uint32x4
 }
 
 // Hash state is [A, B, C, D]; wk already includes the SHA round constant.
+#[inline(always)]
 pub unsafe fn vsha1cq_u32(hash_abcd: uint32x4_t, hash_e: u32, wk: uint32x4_t) -> uint32x4_t {
-    let mut a = hash_abcd.0[0];
-    let mut b = hash_abcd.0[1];
-    let mut c = hash_abcd.0[2];
-    let mut d = hash_abcd.0[3];
-    let mut e = hash_e;
-    let mut i = 0;
-    while i < 4 {
-        let f = (b & c) ^ (!b & d);
-        let t = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(wk.0[i]);
-        e = d;
-        d = c;
-        c = b.rotate_right(2);
-        b = a;
-        a = t;
-        i += 1;
-    }
-    uint32x4_t([a, b, c, d])
+    vx::vx_ternary(hash_abcd, hash_e, wk, 1)
 }
 
+#[inline(always)]
 pub unsafe fn vsha1h_u32(hash_e: u32) -> u32 {
-    hash_e.rotate_right(2)
+    vx::vx_sha1h(hash_e)
 }
 
+#[inline(always)]
 pub unsafe fn vsha1mq_u32(hash_abcd: uint32x4_t, hash_e: u32, wk: uint32x4_t) -> uint32x4_t {
-    let mut a = hash_abcd.0[0];
-    let mut b = hash_abcd.0[1];
-    let mut c = hash_abcd.0[2];
-    let mut d = hash_abcd.0[3];
-    let mut e = hash_e;
-    let mut i = 0;
-    while i < 4 {
-        let f = (b & c) ^ (b & d) ^ (c & d);
-        let t = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(wk.0[i]);
-        e = d;
-        d = c;
-        c = b.rotate_right(2);
-        b = a;
-        a = t;
-        i += 1;
-    }
-    uint32x4_t([a, b, c, d])
+    vx::vx_ternary(hash_abcd, hash_e, wk, 3)
 }
 
+#[inline(always)]
 pub unsafe fn vsha1pq_u32(hash_abcd: uint32x4_t, hash_e: u32, wk: uint32x4_t) -> uint32x4_t {
-    let mut a = hash_abcd.0[0];
-    let mut b = hash_abcd.0[1];
-    let mut c = hash_abcd.0[2];
-    let mut d = hash_abcd.0[3];
-    let mut e = hash_e;
-    let mut i = 0;
-    while i < 4 {
-        let f = b ^ c ^ d;
-        let t = a
-            .rotate_left(5)
-            .wrapping_add(f)
-            .wrapping_add(e)
-            .wrapping_add(wk.0[i]);
-        e = d;
-        d = c;
-        c = b.rotate_right(2);
-        b = a;
-        a = t;
-        i += 1;
-    }
-    uint32x4_t([a, b, c, d])
+    vx::vx_ternary(hash_abcd, hash_e, wk, 2)
 }
 
+#[inline(always)]
 pub unsafe fn vsha1su0q_u32(w0_3: uint32x4_t, w4_7: uint32x4_t, w8_11: uint32x4_t) -> uint32x4_t {
-    uint32x4_t([
-        w0_3.0[0] ^ w0_3.0[2] ^ w8_11.0[0],
-        w0_3.0[1] ^ w0_3.0[3] ^ w8_11.0[1],
-        w0_3.0[2] ^ w4_7.0[0] ^ w8_11.0[2],
-        w0_3.0[3] ^ w4_7.0[1] ^ w8_11.0[3],
-    ])
+    vx::vx_ternary(w0_3, w4_7, w8_11, 4)
 }
 
+#[inline(always)]
 pub unsafe fn vsha1su1q_u32(tw0_3: uint32x4_t, w12_15: uint32x4_t) -> uint32x4_t {
-    let r0 = (tw0_3.0[0] ^ w12_15.0[1]).rotate_left(1);
-    uint32x4_t([
-        r0,
-        (tw0_3.0[1] ^ w12_15.0[2]).rotate_left(1),
-        (tw0_3.0[2] ^ w12_15.0[3]).rotate_left(1),
-        (tw0_3.0[3] ^ r0).rotate_left(1),
-    ])
+    vx::vx_binary(tw0_3, w12_15, 80, 32)
 }
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
@@ -794,64 +729,28 @@ pub unsafe fn vzip2q_s16(a: int16x8_t, b: int16x8_t) -> int16x8_t {
 // ---- SHA-256 (FEAT_SHA256), as the Arm ARM pseudocode defines SHA256H / SHA256H2 / SHA256SU0 /
 // SHA256SU1 (shared/functions/crypto SHA256hash, SHAchoose, SHAmajority, SHAhashSIGMA0/1).
 
-fn sha256_hash(x: [u32; 4], y: [u32; 4], w: [u32; 4], part1: bool) -> [u32; 4] {
-    let (mut x, mut y) = (x, y);
-    let mut e = 0;
-    while e < 4 {
-        let chs = (y[0] & y[1]) ^ (!y[0] & y[2]);
-        let maj = (x[0] & x[1]) | ((x[0] | x[1]) & x[2]);
-        let sigma1 = y[0].rotate_right(6) ^ y[0].rotate_right(11) ^ y[0].rotate_right(25);
-        let sigma0 = x[0].rotate_right(2) ^ x[0].rotate_right(13) ^ x[0].rotate_right(22);
-        let t1 = y[3].wrapping_add(sigma1).wrapping_add(chs).wrapping_add(w[e]);
-        let new_e = t1.wrapping_add(x[3]);
-        let new_a = t1.wrapping_add(sigma0).wrapping_add(maj);
-        // ROL(Y:X, 32): X's top element moves into Y's bottom, Y's top into X's bottom
-        x = [new_a, x[0], x[1], x[2]];
-        y = [new_e, y[0], y[1], y[2]];
-        e += 1;
-    }
-    if part1 { x } else { y }
-}
-
 /// SHA256H: hash_abcd updated by four rounds.
+#[inline(always)]
 pub unsafe fn vsha256hq_u32(hash_abcd: uint32x4_t, hash_efgh: uint32x4_t, wk: uint32x4_t) -> uint32x4_t {
-    uint32x4_t(sha256_hash(hash_abcd.0, hash_efgh.0, wk.0, true))
+    vx::vx_ternary(hash_abcd, hash_efgh, wk, 5)
 }
 
 /// SHA256H2: hash_efgh updated by the same four rounds (hash_abcd = the pre-round abcd).
+#[inline(always)]
 pub unsafe fn vsha256h2q_u32(hash_efgh: uint32x4_t, hash_abcd: uint32x4_t, wk: uint32x4_t) -> uint32x4_t {
-    uint32x4_t(sha256_hash(hash_abcd.0, hash_efgh.0, wk.0, false))
+    vx::vx_ternary(hash_efgh, hash_abcd, wk, 6)
 }
 
 /// SHA256SU0: message schedule, first part.
+#[inline(always)]
 pub unsafe fn vsha256su0q_u32(w0_3: uint32x4_t, w4_7: uint32x4_t) -> uint32x4_t {
-    let t = [w0_3.0[1], w0_3.0[2], w0_3.0[3], w4_7.0[0]];
-    let mut r = [0u32; 4];
-    let mut e = 0;
-    while e < 4 {
-        let elt = t[e].rotate_right(7) ^ t[e].rotate_right(18) ^ (t[e] >> 3);
-        r[e] = elt.wrapping_add(w0_3.0[e]);
-        e += 1;
-    }
-    uint32x4_t(r)
+    vx::vx_binary(w0_3, w4_7, 81, 32)
 }
 
 /// SHA256SU1: message schedule, second part.
+#[inline(always)]
 pub unsafe fn vsha256su1q_u32(tw0_3: uint32x4_t, w8_11: uint32x4_t, w12_15: uint32x4_t) -> uint32x4_t {
-    let t0 = [w8_11.0[1], w8_11.0[2], w8_11.0[3], w12_15.0[0]];
-    let sig = |v: u32| v.rotate_right(17) ^ v.rotate_right(19) ^ (v >> 10);
-    let mut r = [0u32; 4];
-    let t1 = [w12_15.0[2], w12_15.0[3]];
-    let mut e = 0;
-    while e < 2 {
-        r[e] = sig(t1[e]).wrapping_add(tw0_3.0[e]).wrapping_add(t0[e]);
-        e += 1;
-    }
-    while e < 4 {
-        r[e] = sig(r[e - 2]).wrapping_add(tw0_3.0[e]).wrapping_add(t0[e]);
-        e += 1;
-    }
-    uint32x4_t(r)
+    vx::vx_ternary(tw0_3, w8_11, w12_15, 7)
 }
 
 #[derive(Copy, Clone)]

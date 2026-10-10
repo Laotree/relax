@@ -2050,6 +2050,7 @@ impl<'a> Gen<'a> {
             Inst::Sel(d, c, a, b) => self.sel(options, *d, *c, *a, *b),
             Inst::VBin(..) | Inst::VUn(..) | Inst::VSel(..) | Inst::VFma(..) | Inst::VSplat(..) | Inst::VExtract(..) | Inst::VInsert(..) | Inst::VLoad(..) | Inst::VStore(..) | Inst::VAny(..) | Inst::VGather(..) | Inst::VConst(..) | Inst::VShift(..) => self.vinst(options, i),
             Inst::VX(op, d, a, b) => self.vx(options, *op, *d, *a, *b),
+            Inst::VX3(op, d, a, b, c) => self.vx3(*op, *d, *a, *b, *c),
             Inst::FMulAdd(np, na, w, d, a, b, c) => self.fma(*np, *na, *w, *d, *a, *b, *c),
             Inst::AtomicLoad(..) | Inst::AtomicStore(..) | Inst::AtomicRmw(..) | Inst::AtomicCas(..) | Inst::Fence(..) => self.atomic(options, i),
             Inst::TlsAddr(d, off) => self.tls_addr(*d, *off),
@@ -2540,8 +2541,44 @@ impl<'a> Gen<'a> {
     }
 
 
+    fn vx3(&mut self, op: VX, d: VReg, a: VReg, b: VReg, c: VReg) {
+        assert_eq!(op, VX::X86Sha256Rnds2);
+        // xmm0 is the implicit WK input; save it before writing an aliased d.
+        // xmm0/xmm1 are never allocated. Use xmm1 when d aliases the source b.
+        let xc = self.use_f(c, 0);
+        self.a.movf_rr(true, 0, xc);
+        let xa = self.use_f(a, XS);
+        let xb = self.use_f(b, XS2);
+        let xd = self.def_f(d, XS);
+        let tmp = if xd == xb && xd != xa { 1 } else { xd };
+        self.a.movf_rr(true, tmp, xa);
+        self.a.sse_ext(0, 0x38, 0xcb, tmp, xb);
+        self.a.movf_rr(true, xd, tmp);
+        self.fin_f(d, xd);
+    }
+
     /// Lane-typed vector ops (core::arch intrinsics): SSE2 .. SSE4.1, xmm0/xmm1 as scratch.
     fn vx(&mut self, options: &relax_session::Options, op: VX, d: VReg, a: VReg, b: VReg) {
+        // SHA-NI has legacy SSE encodings only, with NO mandatory 66 prefix.
+        // Do not route these through v3: AVX hosts must still get legacy SHA.
+        let sha = match op {
+            VX::X86Sha1Rnds4(k) => Some((0x3a, 0xcc, Some(k))),
+            VX::X86Sha1NextE => Some((0x38, 0xc8, None)),
+            VX::X86Sha1Msg1 => Some((0x38, 0xc9, None)),
+            VX::X86Sha1Msg2 => Some((0x38, 0xca, None)),
+            VX::X86Sha256Msg1 => Some((0x38, 0xcc, None)),
+            VX::X86Sha256Msg2 => Some((0x38, 0xcd, None)),
+            _ => None,
+        };
+        if let Some((map, opcode, imm)) = sha {
+            self.v2(d, a, b, &move |m, x, y| {
+                m.sse_ext(0, map, opcode, x, y);
+                if let Some(k) = imm {
+                    m.byte(k);
+                }
+            });
+            return;
+        }
         // binary op through the SSE two-address / VEX three-address form: (map, opcode)
         let bin = |op: VX| -> Option<(u8, u8)> {
             Some(match op {
