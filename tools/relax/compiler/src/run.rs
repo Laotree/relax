@@ -309,6 +309,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // the re-run is silent: its stderr is the program's (rustc's binary prints nothing else)
         if pre.len() > 1 && !pre.iter().any(|a| a == "--silent") {
             pre.insert(2, "--silent".to_string());
+            // an exec replacing this process (makepad-cef's re-exec into its app bundle) is this
+            // session going on, not a re-run: it drops the added flag and stays live
+            unsafe { std::env::set_var("RELAX_SELF_EXEC_SILENT_ADDED", "1") };
         }
         for j in 1..pre.len() {
             if pre[j - 1] == "--units" && !std::path::Path::new(&pre[j]).is_absolute() {

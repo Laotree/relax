@@ -3713,7 +3713,14 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
             let runtime = &session.runtime;
             let p = p;
             jit::lower_this_thread_priority(runtime);
-            unsafe { watch(p.0, inputs) }
+            // a panic here (the ICE hook is silent while the unit lock is held) would end live
+            // editing without a word: say so, and give the lock back
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs) }));
+            if let Err(e) = r {
+                jit::unlock_to(0);
+                let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
+                eprintln!("relax-live: the watcher stopped: {why}{}; saves are no longer applied -- restart `relax run`", jit::take_ice_location());
+            }
         })
         .ok();
 }

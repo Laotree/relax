@@ -511,7 +511,14 @@ impl Command {
     }
 
     fn spawn_now(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
-        let self_exec = self.self_exec_args();
+        let mut self_exec = self.self_exec_args();
+        // replacing this process with the program again (an exec, not a spawn) continues the
+        // live session: the `--silent` Relax added for re-runs (it ends live editing) goes
+        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::var_os("RELAX_SELF_EXEC_SILENT_ADDED").is_some()) {
+            if v.get(2).is_some_and(|a| a.as_encoded_bytes() == b"--silent") {
+                v.remove(2);
+            }
+        }
         let prog = match &self_exec {
             Some(v) => cstring(v[0].as_encoded_bytes().to_vec())?,
             None => cstring(self.program.as_encoded_bytes().to_vec())?,
