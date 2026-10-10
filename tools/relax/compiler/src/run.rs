@@ -405,7 +405,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if !l.is_empty() && !SILENT.load(Ordering::Relaxed) {
             l.sort();
             let names: Vec<String> = l.iter().map(|(p, src)| format!("{} ({})", p, src)).collect();
-            verbose!("relax-run: build scripts to remove ({}; only CEF, CUDA and system_speech keep one): {}", l.len(), names.join(", "));
+            verbose!("relax-run: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
         }
     }
 

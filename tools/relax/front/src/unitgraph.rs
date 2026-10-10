@@ -264,15 +264,13 @@ fn host_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
 /// `<target>/relax` (OUT_DIR = <target>/relax/build/<crate>-<hash>/out: as deep as cargo's
 /// <target>/release/build/<crate>-<hash>/out, since scripts look 5 ancestors up for the
 /// workspace root).
-/// What Relax does with a package's build script. The user's rule (2026-10-05): only CEF, CUDA
-/// and system_speech keep build scripts -- their outputs (a downloaded browser dist + helper,
-/// compiled GPU kernels, the Swift SpeechAnalyzer bridge for speech-to-text: a Swift-only API
-/// with no objc surface) are artefacts, built with rustc once and kept. Probe scripts of third-party crates
-/// Relax answers itself. Every other script is to be removed from the source (makepad's own
-/// generators: the Codex cleanup); until that lands they still run, and `relax run` / `check`
-/// list them (`to_remove`). The cleanup's integration turns that list into an error.
+/// What Relax does with a package's build script. The user's rule (2026-10-10): only
+/// makepad-platform keeps a build script; the GPU kernel crates (ai-cuda/ai-metal and the ai crates
+/// that read their outputs) keep theirs until their replacement is decided. Probe scripts of
+/// third-party crates Relax answers itself. Every other script is to be removed from the source;
+/// until it is, it still runs and `relax run` / `check` list it (`to_remove`).
 pub enum ScriptRole {
-    /// compiled and run with rustc, its output kept (rerun rules as cargo's)
+    /// kept: runs (as a Relax program), its output cached by the rerun rules as cargo does
     Artefact,
     /// the script's `cargo:` lines as Relax knows them, without running it
     Answered(Vec<String>),
@@ -283,9 +281,9 @@ pub enum ScriptRole {
 pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
     let has = |f: &str| features.iter().any(|x| x == f);
     match pkg {
-        "makepad-cef" | "makepad-ai-cuda" | "makepad-system-speech" => ScriptRole::Artefact,
-        // check-cfg lines only
-        "wayland-backend" | "wayland-client" => ScriptRole::Answered(Vec::new()),
+        "makepad-platform" => ScriptRole::Artefact,
+        // pending the GPU-kernel decision (no build scripts proposal)
+        "makepad-ai-cuda" | "makepad-ai-metal" | "makepad-ai-llm" | "makepad-ai-common" | "makepad-ai-speech" => ScriptRole::Artefact,
         // pkg-config probes: the libraries of the enabled features (none with dlopen)
         "wayland-sys" => {
             if has("dlopen") {
@@ -299,8 +297,6 @@ pub fn script_role(pkg: &str, features: &[String]) -> ScriptRole {
             }
             ScriptRole::Answered(lines)
         }
-        // generates spec tests with the gen-tests feature only
-        "pulldown-cmark" if !has("gen-tests") => ScriptRole::Answered(Vec::new()),
         _ => ScriptRole::ToRemove,
     }
 }
