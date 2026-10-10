@@ -173,6 +173,9 @@ pub struct GenEnv {
     pub impl_params: Vec<(u32, u32)>,
     /// trait bounds on generic params (param index, file, trait path): `T::Assoc` lookups
     pub bounds: Vec<(u32, u32, ast::Path)>,
+    /// how many leading `bounds` an associated item inherits from its impl or trait: those
+    /// resolve their lifetimes in the parent's bound-variable table
+    pub parent_bounds: usize,
     /// const generic params: (param index, file, declared type)
     pub consts: Vec<(u32, u32, ast::TyId)>,
     /// lowering this fn's return type: `impl Trait` there is its opaque type
@@ -1080,6 +1083,7 @@ impl Tcx {
                 }
             }
         }
+        env.parent_bounds = env.bounds.len();
         let ast = &prog.files[def.file as usize].ast;
         let it = ast.item(def.item);
         match &it.kind {
@@ -1560,6 +1564,7 @@ impl Tcx {
         // Associated items inherit their parent's predicates, including callable
         // Output equalities (rustc_middle/src/ty/generics.rs:431-441 @8d1a764).
         let parent = prog.def(def.parent);
+        let mut parent_env = None;
         if matches!(parent.kind, DefKind::Impl | DefKind::Trait) {
             let parent_ast = &prog.files[parent.file as usize].ast;
             let (generics, offset) = match &parent_ast.item(parent.item).kind {
@@ -1567,17 +1572,24 @@ impl Tcx {
                 ItemKind::Trait { generics, .. } => (generics, 1),
                 _ => unreachable!(),
             };
-            let mut parent_env = env.clone();
-            parent_env.impl_params.clear();
+            let mut penv = env.clone();
+            penv.impl_params.clear();
             // The parent's bounds resolve their lifetimes and object lifetime defaults in the
             // parent's own resolve_bound_vars table (rustc lowers predicates_of(parent) in the
             // parent's ItemCtxt): the method's table has no entry for the parent's nodes, which
             // left `F: Fn() -> Box<dyn Tr>` on an impl indeterminate (E0228).
-            parent_env.regions = self.bound_region_env(prog, def.parent);
-            self.collect_callable_signatures(cx, prog, parent.file, module, &parent_env, generics, offset, &mut callable_signatures);
+            penv.regions = self.bound_region_env(prog, def.parent);
+            self.collect_callable_signatures(cx, prog, parent.file, module, &penv, generics, offset, &mut callable_signatures);
+            parent_env = Some(penv);
         }
         let mut tb = Vec::new();
-        for (pi, bfile, path) in env.bounds.clone() {
+        for (bi, (pi, bfile, path)) in env.bounds.clone().into_iter().enumerate() {
+            // the parent's own bounds lower in the parent's table too (same reason as above:
+            // `F: Fn(usize, &(dyn Fn(usize) + Sync))` on an impl was E0228 in `FnExecutor::new`)
+            let env = match &parent_env {
+                Some(penv) if bi < env.parent_bounds => penv,
+                _ => &env,
+            };
             if let Some(td) = self.resolve_type_path_def(prog, bfile, module, &path) {
                 if pi == 0 && n_parent > 0 && prog.name(td) == "Sized" && prog.def(def.parent).kind == DefKind::Trait {
                     parts.self_sized = true;

@@ -15,7 +15,7 @@ crate::collected_fields!(AdtT, region_contract, generic_indices, flags, region_p
 crate::collected_id!(AdtFlags);
 crate::collected_fields!(Destructor, did);
 crate::collected_fields!(GenEnv, sized_params, regions, names, self_ty, trait_def, impl_def,
-    impl_params, bounds, consts, opaque_owner);
+    impl_params, bounds, parent_bounds, consts, opaque_owner);
 crate::collected_fields!(OpaqueDecl, region_contract, bounds);
 crate::collected_fields!(ConstDecl, ty, region_contract, errors, misses);
 // Derived variance is rebuilt after declaration publication.
