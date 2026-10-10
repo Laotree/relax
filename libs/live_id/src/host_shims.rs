@@ -32,16 +32,8 @@ unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
 unsafe extern "C" fn s4(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::unique() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s5(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdInterner>::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s6(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdInterner>::contains(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn d0(p: *mut u8) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { std::ptr::drop_in_place(p as *mut crate::live_id::LiveIdInterner) })); }
 
 pub static TYPES: &[(&str, u64, u64, Option<unsafe extern "C" fn(*mut u8)>)] = &[
-    ("makepad_live_id::live_id::LiveIdInterner", std::mem::size_of::<crate::live_id::LiveIdInterner>() as u64, std::mem::align_of::<crate::live_id::LiveIdInterner>() as u64, if std::mem::needs_drop::<crate::live_id::LiveIdInterner>() { Some(d0) } else { None }),
 ];
 
 pub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[
@@ -57,6 +49,4 @@ pub static SHIMS: &[(&str, u64, unsafe extern "C" fn(*const *mut u8, *mut u8) ->
     ("<LiveId>::lut_name_copy", 0x276cdb7597c63c4a, s2),
     ("<LiveId>::lut_name_len", 0x036c692a4896c595, s3),
     ("<LiveId>::unique", 0x26b73ad84b8c84c5, s4),
-    ("<LiveIdInterner>::add", 0x01e9a8e42b676e10, s5),
-    ("<LiveIdInterner>::contains", 0x49d95c1f5b9b78cf, s6),
 ];

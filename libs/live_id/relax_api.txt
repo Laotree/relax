@@ -14,3 +14,12 @@ op <LiveId>::lut_name_len
 op <LiveId>::lut_name_copy
 op <LiveId>::from_str_with_intern
 op <LiveId>::unique
+
+# ---- the crate's ops: everything else is `internal` (no shim; JIT code that reaches it
+# compiles it from source, and a body that then reads the crate's rustc-laid-out state fails
+# naming this file). Seeded 2026-10-10 from what Calculator, Stage, Amp, Scope, sandbox and
+# counter reach (boundary audit); maintained by hand from here: shrink by merging into
+# coarser ops, grow only by review.
+internal makepad_live_id
+
+# the crate's operations (5)

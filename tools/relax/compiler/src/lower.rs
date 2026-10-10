@@ -415,7 +415,21 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    fn err(&mut self, pos: u32, msg: String) {
+    fn err(&mut self, pos: u32, mut msg: String) {
+        // A provided crate's own fn compiled here (it has no shim): say which manifest decides.
+        if msg.contains("lives in a provided crate") {
+            if let crate::jit::FnKey::Inst(d, args) = self.u.fns[self.cur_fn as usize].key.clone() {
+                let krate = self.u.prog.def(d).krate;
+                if args.is_empty() && self.u.provided.iter().any(|(k, _)| *k == krate) {
+                    let name = self.u.prog.syms.str(self.u.prog.crates[krate as usize].name).replace('_', "-");
+                    msg.push_str(&format!(
+                        " (`{}` of {} runs here because it is not an `op` in that crate's relax_api.txt: add it there, or call one of the listed ops)",
+                        crate::provided::key(&self.u.prog, &self.u.tcx, d),
+                        name
+                    ));
+                }
+            }
+        }
         let prog = &self.u.prog;
         self.errors.push(prog.record_error(self.b.file, pos, "lower", msg));
     }

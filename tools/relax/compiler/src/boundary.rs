@@ -3,7 +3,7 @@
 //!
 //! `relax check --boundary <crate>[,<crate>..] <package>` lowers every non-generic fn of the
 //! crates that depend on them, then every generic instance those reach (to a fixpoint), and
-//! records, from each body Relax would compile:
+//! records, from each body Relax would compile (drop glue included: a Drop impl runs from it):
 //! - calls to non-generic fns of the provided crates (the C shims), with their signatures;
 //! - generic fns of the provided crates instantiated on this side (compiled from source);
 //! - field projections into types of the provided crates (layout knowledge needed);
@@ -268,7 +268,10 @@ pub fn run(up: *mut Unit) -> String {
                 }
                 // closures are lowered from their parent's body (made while lowering it)
                 FnKey::Closure(..) => true,
-                FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => false,
+                // drop glue: a provided type's Drop impl (and what it calls) runs from here
+                // when Relax-compiled code drops a value of it (a handle's release, a guard)
+                FnKey::Glue(..) => true,
+                FnKey::Shim(_) | FnKey::Sandbox(_) => false,
             };
             if !lower_it {
                 continue;
