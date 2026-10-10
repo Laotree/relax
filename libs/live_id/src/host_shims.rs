@@ -18,18 +18,15 @@ pub unsafe extern "C" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize)
 }
 
 unsafe extern "C" fn s0(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_str_with_intern(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s1(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_insert(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s2(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s1(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_name_copy(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s2(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_name_len(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s4(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::unique() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 
@@ -44,9 +41,8 @@ pub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[
 ];
 
 pub static SHIMS: &[(&str, u64, unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32)] = &[
-    ("<LiveId>::from_str_with_intern", 0x774c4354cae2289d, s0),
-    ("<LiveId>::lut_insert", 0xe5c432919f9a828c, s1),
-    ("<LiveId>::lut_name_copy", 0x276cdb7597c63c4a, s2),
-    ("<LiveId>::lut_name_len", 0x036c692a4896c595, s3),
-    ("<LiveId>::unique", 0x26b73ad84b8c84c5, s4),
+    ("<LiveId>::lut_insert", 0xe5c432919f9a828c, s0),
+    ("<LiveId>::lut_name_copy", 0x276cdb7597c63c4a, s1),
+    ("<LiveId>::lut_name_len", 0x036c692a4896c595, s2),
+    ("<LiveId>::unique", 0x26b73ad84b8c84c5, s3),
 ];
