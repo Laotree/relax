@@ -26,12 +26,32 @@ impl Inputs {
         self.paths.insert(path, (stamp, kind));
     }
 
+    fn protected(&mut self, path: &Path, root: &Path, kind: Kind) {
+        self.insert(path, kind.clone());
+        // Directory identities catch additions and atomic replacements of files that
+        // did not exist at boot. Native events, not a periodic tree walk, drive them.
+        let mut parent = path.parent();
+        while let Some(dir) = parent.filter(|p| p.starts_with(root)) {
+            self.insert(dir, if kind == Kind::Manifest { Kind::Provided } else { kind.clone() });
+            parent = dir.parent();
+        }
+    }
+
     pub fn collect(graph: &crate::unitgraph::Graph, std_dir: &str, workspace: &str) -> Self {
         let mut inputs = Self::default();
         let mut dirs = BTreeSet::new();
-        for (dir, name, _) in &graph.pkg {
+        // A provided crate's source identity includes its compiled dependencies too.
+        let mut provided = BTreeSet::new();
+        let mut pending: Vec<_> = graph.pkg.iter().enumerate().filter(|(_, (_, name, _))| crate::provided::registered(name)).map(|(i, _)| i).collect();
+        let mut seen = BTreeSet::new();
+        while let Some(i) = pending.pop() {
+            if !seen.insert(i) { continue; }
+            if let Some((dir, _, _)) = graph.pkg.get(i) { provided.insert(dir.clone()); }
+            if let Some(krate) = graph.crates.get(i) { pending.extend(krate.deps.iter().map(|d| d.0)); }
+        }
+        for (dir, _, _) in graph.pkg.iter().chain(graph.raw.iter().map(|u| &u.pkg)) {
             if dir.is_empty() || dir.contains("/.cargo/registry/") || dir.contains("/.cargo/git/") || !dirs.insert(dir) { continue; }
-            let provided = crate::provided::registered(name);
+            let provided = provided.contains(dir);
             let mut files = Vec::new();
             crate::srchash::files(Path::new(dir), "", &mut files);
             for (rel, path) in files {
@@ -42,7 +62,8 @@ impl Inputs {
                 } else if path.extension().is_some_and(|x| x == "rs") {
                     Kind::Source(dir.clone())
                 } else { continue };
-                inputs.insert(&path, kind);
+                if provided { inputs.protected(&path, Path::new(dir), kind); }
+                else { inputs.insert(&path, kind); }
             }
             // Include an absent lockfile too: creating it changes the resolved graph.
             inputs.insert(&Path::new(dir).join("Cargo.lock"), Kind::Manifest);
@@ -55,7 +76,7 @@ impl Inputs {
         }
         let mut files = Vec::new();
         crate::srchash::files(Path::new(std_dir), "", &mut files);
-        for (_, path) in files { inputs.insert(&path, Kind::Std); }
+        for (_, path) in files { inputs.protected(&path, Path::new(std_dir), Kind::Std); }
         inputs
     }
 

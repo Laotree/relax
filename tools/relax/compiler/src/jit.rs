@@ -4481,6 +4481,7 @@ pub static COMPILED_FNS: AtomicU64 = AtomicU64::new(0);
 
 /// Display-only snapshot. Never wait for a compiler or take the unit lock to draw
 /// progress: a busy queue is reported as busy and sampled again on the next tick.
+#[cfg(unix)]
 pub(crate) fn compile_progress() -> (Option<usize>, u64) {
     let queued = (|| {
         let spec = SPEC_Q.try_lock().ok()?.len();

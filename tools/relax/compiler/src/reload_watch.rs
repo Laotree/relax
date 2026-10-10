@@ -13,16 +13,18 @@ mod native {
     pub struct Watch {
         fd: OwnedFd,
         names: HashMap<(i32, Vec<u8>), usize>,
+        directories: HashMap<i32, usize>,
     }
     impl Watch {
         pub fn new<'a>(paths: impl Iterator<Item = &'a str>) -> Option<Self> {
+            let paths: Vec<_> = paths.collect();
             // Linux O_NONBLOCK | O_CLOEXEC; no descriptor escapes to app children.
             let fd = unsafe { inotify_init1(0x800 | 0x80000) };
             if fd < 0 { return None; }
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
             let mut dirs = HashMap::new();
             let mut names = HashMap::new();
-            for (i, path) in paths.enumerate() {
+            for (i, path) in paths.iter().enumerate() {
                 let path = Path::new(path);
                 let dir = path.parent()?;
                 let wd = if let Some(&wd) = dirs.get(dir) { wd } else {
@@ -36,7 +38,11 @@ mod native {
                 };
                 names.insert((wd, path.file_name()?.as_bytes().to_vec()), i);
             }
-            Some(Self { fd, names })
+            let directories = paths.iter().enumerate().filter_map(|(i, p)| {
+                let p = Path::new(p);
+                p.is_dir().then(|| dirs.get(p).map(|&wd| (wd, i))).flatten()
+            }).collect();
+            Some(Self { fd, names, directories })
         }
         /// None means events may have been lost: stat every source this round.
         pub fn changed(&mut self) -> Option<Vec<usize>> {
@@ -65,6 +71,7 @@ mod native {
                     let bytes = &buf[pos + 16..pos + 16 + len];
                     let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
                     if let Some(&i) = self.names.get(&(wd, bytes[..end].to_vec())) { changed.push(i); }
+                    if let Some(&i) = self.directories.get(&wd) { changed.push(i); }
                     pos += 16 + len;
                 }
             }
@@ -128,6 +135,9 @@ mod native {
             // itself (moved or removed): the caller stats everything and rebuilds the watch.
             pending.1 |= flags & (0x1 | 0x2 | 0x4) != 0 || shared.roots.contains(path.to_bytes());
             if let Some(&i) = shared.names.get(path.to_bytes()) { pending.0.push(i); }
+            if let Some(slash) = path.to_bytes().iter().rposition(|&b| b == b'/') {
+                if let Some(&i) = shared.names.get(&path.to_bytes()[..slash]) { pending.0.push(i); }
+            }
         }
     }
     extern "C" fn barrier(_: *mut c_void) {}
@@ -228,6 +238,7 @@ mod native {
         buf: [u32; 16384],
         /// lowercase file name -> watched source index (names compare case-insensitively)
         names: HashMap<String, usize>,
+        own_index: Option<usize>,
     }
     impl Dir {
         fn arm(&mut self) -> bool {
@@ -253,7 +264,8 @@ mod native {
         pub fn new<'a>(paths: impl Iterator<Item = &'a str>) -> Option<Self> {
             let mut index: HashMap<String, usize> = HashMap::new();
             let mut dirs: Vec<Box<Dir>> = Vec::new();
-            for (i, path) in paths.enumerate() {
+            let paths: Vec<_> = paths.collect();
+            for (i, path) in paths.iter().enumerate() {
                 let path = Path::new(path);
                 let dir = path.parent()?;
                 let key = dir.to_string_lossy().to_lowercase();
@@ -263,13 +275,18 @@ mod native {
                     // OPEN_EXISTING; BACKUP_SEMANTICS (a directory) | OVERLAPPED
                     let handle = unsafe { CreateFileW(wide.as_ptr(), 0x1, 0x7, std::ptr::null_mut(), 3, 0x0200_0000 | 0x4000_0000, std::ptr::null_mut()) };
                     if handle as isize == -1 { return None; }
-                    let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() }, buf: [0; 16384], names: HashMap::new() });
+                    let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() }, buf: [0; 16384], names: HashMap::new(), own_index: None });
                     if !entry.arm() { return None; }
                     dirs.push(entry);
                     index.insert(key, dirs.len() - 1);
                     dirs.len() - 1
                 };
                 dirs[d].names.insert(path.file_name()?.to_string_lossy().to_lowercase(), i);
+            }
+            for (i, path) in paths.iter().enumerate() {
+                if Path::new(path).is_dir() {
+                    if let Some(&d) = index.get(&path.to_lowercase()) { dirs[d].own_index = Some(i); }
+                }
             }
             Some(Self { dirs })
         }
@@ -283,6 +300,7 @@ mod native {
                 // a failed read (directory removed, notify-enum overflow) or an empty one
                 // (buffer overflow) loses events
                 if unsafe { GetOverlappedResult(dir.handle, &mut dir.overlapped, &mut bytes, 0) } == 0 || bytes == 0 { return None; }
+                if let Some(i) = dir.own_index { changed.push(i); }
                 let buf: &[u8] = unsafe { std::slice::from_raw_parts(dir.buf.as_ptr().cast(), bytes as usize) };
                 let mut pos = 0usize;
                 loop {
@@ -333,6 +351,27 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
+    #[test]
+    fn directory_inputs_observe_new_sources() {
+        let dir = std::env::temp_dir().join(format!("relax-notify-add-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("existing.rs");
+        let added = dir.join("added.rs");
+        std::fs::write(&source, "old").unwrap();
+        let mut watch = super::Watch::new([dir.to_str().unwrap(), source.to_str().unwrap()].into_iter()).unwrap();
+        if !cfg!(target_os = "linux") {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            watch.changed();
+        }
+        std::fs::write(&added, "new").unwrap();
+        // A lost-event rescan is also sufficient: the directory's stamp changed.
+        assert!(next(&mut watch).is_none_or(|ids| ids.contains(&0)));
+        drop(watch);
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(added).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn notifications_survive_atomic_save_and_filter_unrelated_names() {
         let dir = std::env::temp_dir().join(format!("relax-notify-{}", std::process::id()));

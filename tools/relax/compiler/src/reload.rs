@@ -3905,9 +3905,14 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
                 break;
             }
         }
-        if let Some(reason) = inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())) {
+        let reason = inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())).or_else(|| {
+            changed.iter().any(|&k| files[k].1 == u32::MAX && !crate::native_macros::owns_path(&files[k].0))
+                .then_some("sources outside the loaded program changed")
+        });
+        if let Some(reason) = reason {
             let package = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
-            let message = format!("{} files changed: {reason}; restart `relax run {package}` to pick them up; keeping the running code", changed.len());
+            let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
+            let message = format!("{} {what} changed: {reason}; restart `relax run {package}` to pick them up; keeping the running code", changed.len());
             eprintln!("relax-live: {message}");
             live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
             restart_required = true;
