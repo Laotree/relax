@@ -145,6 +145,15 @@ const ALL_CRATES: u32 = u32::MAX;
 const FILE_BODIES: u16 = 21;
 
 impl QueryCx {
+    /// memory report (RELAX_MEM_REPORT): the solver cache and the bound-vars tables
+    pub fn mem_lines(&self) -> Vec<(String, u64)> {
+        let mut out = Vec::new();
+        let mut p = |name: &str, (n, b): (usize, usize)| out.push((format!("qt {} ({})", name, n), b as u64));
+        p("resolved_bound_vars", self.resolved_bound_vars.mem_stats(&|_, v| { let (a, b) = v.1.heap_bytes_split(); if std::sync::Arc::strong_count(&v.1) > 1 { 8 } else { 16 + std::mem::size_of::<crate::tcx::resolve_bound_vars::ResolveBoundVars>() + a + b } }));
+        p("lifetime_names Arc<LifetimeResolution>", self.lifetime_names.mem_stats(&|_, v| if std::sync::Arc::strong_count(&v.1) > 2 { 8 } else { 16 + v.1.heap_bytes() }));
+        out.extend(self.solver.mem_lines());
+        out
+    }
     pub(crate) fn read_declarations(&self) -> Result<Fingerprint, QueryError> {
         self.engine.input(DECLARATIONS.kind, DECLARATIONS.key)
     }
@@ -392,7 +401,7 @@ impl Providers<'_> {
             let parent = self.prog.def(def).parent;
             let parent = if parent != crate::program::NO_DEF && matches!(self.prog.def(parent).kind, crate::program::DefKind::Trait | crate::program::DefKind::Impl) { Some(self.resolve_lifetime_names(parent)?) } else { None };
             let names = crate::tcx::lifetime_resolve::resolve_lifetimes(self.tcx, self.prog, def, parent.as_deref());
-            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), std::sync::Arc::new(names)))
+            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), names.share()))
         }, &|id| self.force(id))?;
         Ok(names)
     }
@@ -404,7 +413,7 @@ impl Providers<'_> {
             let parent = self.prog.def(def).parent;
             let parent = if parent != crate::program::NO_DEF && matches!(self.prog.def(parent).kind, crate::program::DefKind::Trait | crate::program::DefKind::Impl) { Some(self.resolve_bound_vars(parent)?) } else { None };
             let vars = crate::tcx::resolve_bound_vars::resolve_bound_vars(self.tcx, self.prog, def, parent.as_deref());
-            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), std::sync::Arc::new(vars)))
+            Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), vars.share()))
         }, &|id| self.force(id))?;
         Ok(vars)
     }

@@ -184,11 +184,23 @@ impl NestedGoals {
             .and_modify(|p| p.union(paths))
             .or_insert(paths);
     }
-    fn extend_child(&mut self, step: PathKind, nested: &Self) {
-        for (&input, &paths) in &nested.0 {
-            self.insert(input, paths.extend(step));
+    fn extend_child(&mut self, step: PathKind, nested: NestedRef<'_>) {
+        match nested {
+            NestedRef::Map(n) => for (&input, &paths) in &n.0 { self.insert(input, paths.extend(step)); },
+            NestedRef::Slice(n) => for &(input, paths) in n { self.insert(input, paths.extend(step)); },
         }
     }
+    fn compact(&self) -> Box<[(u32, PathsToNested)]> {
+        let mut v: Vec<(u32, PathsToNested)> = self.0.iter().map(|(&k, &p)| (k, p)).collect();
+        v.sort_unstable_by_key(|e| e.0);
+        v.into_boxed_slice()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NestedRef<'a> { Map(&'a NestedGoals), Slice(&'a [(u32, PathsToNested)]) }
+impl NestedRef<'_> {
+    fn is_empty(&self) -> bool { match self { NestedRef::Map(n) => n.0.is_empty(), NestedRef::Slice(n) => n.is_empty() } }
 }
 
 /// rustc_type_ir/src/search_graph/stack.rs:19: only the top entry is mutated;
@@ -243,7 +255,9 @@ struct Tracked { result: u32, dep_node: DepNodeIndex }
 
 struct CachedResult {
     required_depth: RequiredDepth,
-    nested_goals: NestedGoals,
+    // the nested goals as a sorted slice: a cached entry is only ever scanned, never extended
+    // (a hash table here cost ~2x the elements plus its header on every entry)
+    nested_goals: Box<[(u32, PathsToNested)]>,
     result: Tracked,
     misses: std::sync::Arc<Vec<(u32, String)>>,
 }
@@ -251,7 +265,8 @@ struct CachedResult {
 #[derive(Default)]
 struct CacheEntry {
     success: Option<CachedResult>,
-    with_overflow: HashMap<RequiredDepth, CachedResult>,
+    // overflow results are rare: allocated only when one exists
+    with_overflow: Option<Box<Vec<(RequiredDepth, CachedResult)>>>,
 }
 
 /// rustc_type_ir/src/search_graph/global_cache.rs:19,80: success requires enough
@@ -262,14 +277,28 @@ pub(in crate::next_solver) struct GlobalCache {
 }
 
 impl GlobalCache {
+    pub(super) fn mem_stats(&self) -> (usize, usize) {
+        fn hm<K, V, S>(m: &std::collections::HashMap<K, V, S>) -> usize { m.capacity() * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7 }
+        let mut b = hm(&self.entries);
+        let mut n = 0;
+        for e in self.entries.values() {
+            if let Some(o) = &e.with_overflow { b += std::mem::size_of::<Vec<(RequiredDepth, CachedResult)>>() + o.capacity() * std::mem::size_of::<(RequiredDepth, CachedResult)>(); }
+            let all = e.success.iter().chain(e.with_overflow.iter().flat_map(|o| o.iter().map(|x| &x.1)));
+            for s in all { n += 1; b += s.nested_goals.len() * std::mem::size_of::<(u32, PathsToNested)>(); }
+        }
+        (n, b)
+    }
     pub(super) fn len(&self) -> usize {
         self.entries.len()
     }
     pub(super) fn remove_misses(&mut self) {
         self.entries.retain(|_, e| {
             if e.success.as_ref().is_some_and(|v| !v.misses.is_empty()) { e.success = None; }
-            e.with_overflow.retain(|_, v| v.misses.is_empty());
-            e.success.is_some() || !e.with_overflow.is_empty()
+            if let Some(o) = &mut e.with_overflow {
+                o.retain(|(_, v)| v.misses.is_empty());
+                if o.is_empty() { e.with_overflow = None; }
+            }
+            e.success.is_some() || e.with_overflow.is_some()
         });
     }
 }
@@ -281,7 +310,7 @@ pub struct SearchGraph {
 }
 
 enum UpdateParent<'a> {
-    Ordinary(&'a NestedGoals),
+    Ordinary(NestedRef<'a>),
     CycleOnStack(u32),
     ProvisionalCacheHit,
 }
@@ -357,7 +386,7 @@ impl SearchGraph {
         let depends_on_cycle = match context {
             UpdateParent::Ordinary(nested) => {
                 parent.nested_goals.extend_child(step, nested);
-                !nested.0.is_empty()
+                !nested.is_empty()
             }
             UpdateParent::CycleOnStack(head) => {
                 parent.nested_goals.insert(head, PathsToNested::from_path(step));
@@ -472,7 +501,7 @@ impl SearchGraph {
             available_depth.checked_sub(evaluation.required_depth.0).unwrap(),
             &evaluation.heads,
             evaluation.encountered_overflow,
-            UpdateParent::Ordinary(&evaluation.nested_goals),
+            UpdateParent::Ordinary(NestedRef::Map(&evaluation.nested_goals)),
         );
         let result = evaluation.result;
         if evaluation.heads.0.is_empty() {
@@ -483,10 +512,14 @@ impl SearchGraph {
                 result: delegate.mk_tracked(result, dep_node),
                 misses,
                 required_depth: evaluation.required_depth,
-                nested_goals: evaluation.nested_goals,
+                nested_goals: evaluation.nested_goals.compact(),
             };
             let previous = if evaluation.encountered_overflow {
-                entry.with_overflow.insert(evaluation.required_depth, cached)
+                let o = entry.with_overflow.get_or_insert_with(Default::default);
+                match o.iter_mut().find(|(d, _)| *d == evaluation.required_depth) {
+                    Some((_, slot)) => Some(std::mem::replace(slot, cached)),
+                    None => { o.push((evaluation.required_depth, cached)); None }
+                }
             } else {
                 entry.success.replace(cached)
             };
@@ -571,16 +604,16 @@ impl SearchGraph {
 
     /// rustc_type_ir/src/search_graph/mod.rs:1135: replaying a global entry must
     /// neither encounter a stack cycle nor use an applicable provisional entry.
-    fn candidate_is_applicable(&self, step: PathKind, nested: &NestedGoals) -> bool {
-        if nested.0.is_empty() {
+    fn candidate_is_applicable(&self, step: PathKind, nested: &[(u32, PathsToNested)]) -> bool {
+        if nested.is_empty() {
             return true;
         }
         for entry in &self.stack {
-            if nested.0.contains_key(&entry.input) {
+            if nested.binary_search_by_key(&entry.input, |e| e.0).is_ok() {
                 return false;
             }
         }
-        for (&input, &paths) in &nested.0 {
+        for &(input, paths) in nested {
             if let Some(entries) = self.provisional_cache.get(&input) {
                 for entry in entries {
                     if entry.encountered_overflow {
@@ -606,7 +639,7 @@ impl SearchGraph {
             }
         }
         if selected.is_none() {
-            if let Some(overflow) = entry.with_overflow.get(&RequiredDepth(depth)) {
+            if let Some(overflow) = entry.with_overflow.as_ref().and_then(|o| o.iter().find(|(d, _)| *d == RequiredDepth(depth)).map(|e| &e.1)) {
                 if self.candidate_is_applicable(step, &overflow.nested_goals) {
                     selected = Some((overflow, true));
                 }
@@ -620,7 +653,7 @@ impl SearchGraph {
             depth.checked_sub(cached.required_depth.0).unwrap(),
             &CycleHeads::default(),
             overflow,
-            UpdateParent::Ordinary(&cached.nested_goals),
+            UpdateParent::Ordinary(NestedRef::Slice(&cached.nested_goals)),
         );
         Some(delegate.get_tracked(&cached.result))
     }

@@ -35,12 +35,36 @@ impl ResolvedArg {
 
 #[derive(Debug)]
 pub struct ResolveBoundVars {
-    pub(super) names: LifetimeResolution,
+    // shared with the lifetime_names query result; copied only when an opaque adds declarations
+    pub(super) names: std::sync::Arc<LifetimeResolution>,
     pub(super) named_variable_map: HashMap<LifetimeKey, ResolvedArg>,
     pub(super) late_bound_vars_map: HashMap<BinderId, Vec<BoundVariableKind>>,
     pub(crate) opaque_captured_lifetimes: HashMap<DefId, Vec<(ResolvedArg, LifetimeId)>>,
     pub(super) early_indices: HashMap<LifetimeId, u32>,
     pub(crate) generic_indices: GenericIndices,
+}
+
+impl ResolveBoundVars {
+    /// An item without lifetimes: its answer depends only on its generic indices, so equal
+    /// ones are one shared value (most items; each distinct index set is stored once).
+    pub(crate) fn share(self) -> std::sync::Arc<ResolveBoundVars> {
+        static TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = std::sync::Mutex::new(None);
+        let trivial = self.names.declarations.is_empty() && self.names.inherited.is_empty() && self.names.uses.is_empty() && self.names.binders.is_empty()
+            && self.named_variable_map.is_empty() && self.opaque_captured_lifetimes.is_empty() && self.early_indices.is_empty()
+            && self.late_bound_vars_map.len() == 1 && self.late_bound_vars_map.get(&BinderId::Item).is_some_and(|v| v.is_empty());
+        if !trivial { return std::sync::Arc::new(self); }
+        let mut table = TRIVIAL.lock().unwrap_or_else(|e| e.into_inner());
+        table.get_or_insert_with(Default::default).entry(self.generic_indices.clone()).or_insert_with(|| std::sync::Arc::new(self)).clone()
+    }
+    /// memory report: (names owned here, other maps) heap bytes; shared names count as 0
+    pub(crate) fn heap_bytes_split(&self) -> (usize, usize) {
+        fn hm<K, V, S>(m: &std::collections::HashMap<K, V, S>) -> usize { m.capacity() * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7 }
+        let names = if std::sync::Arc::strong_count(&self.names) > 1 { 0 } else { self.names.heap_bytes() };
+        let rest = hm(&self.named_variable_map) + hm(&self.late_bound_vars_map) + self.late_bound_vars_map.values().map(|v| v.capacity() * std::mem::size_of::<crate::next_solver::BoundVariableKind>()).sum::<usize>()
+            + hm(&self.opaque_captured_lifetimes) + self.opaque_captured_lifetimes.values().map(|v| v.capacity() * std::mem::size_of::<(ResolvedArg, LifetimeId)>()).sum::<usize>()
+            + hm(&self.early_indices) + (self.generic_indices.lifetimes.capacity() + self.generic_indices.types_consts.capacity() + self.generic_indices.consts.capacity()) * 4;
+        (names, rest)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,7 +122,7 @@ impl BoundVarContext<'_> {
                     ResolvedArg::EarlyBound(id) | ResolvedArg::LateBound(_, _, id) | ResolvedArg::Free(_, id) => self.declaration(id).name.clone(),
                     _ => None,
                 };
-                self.rbv.names.declarations.push(LifetimeDecl { id, binder: BinderId::Opaque(opaque), name, span });
+                std::sync::Arc::make_mut(&mut self.rbv.names).declarations.push(LifetimeDecl { id, binder: BinderId::Opaque(opaque), name, span });
                 self.rbv.opaque_captured_lifetimes.get_mut(&opaque).unwrap().push((lifetime, id));
                 id
             };
@@ -479,7 +503,7 @@ pub(crate) fn owner_generics(prog: &Program, owner: DefId) -> ast::Generics {
 pub(crate) fn resolve_bound_vars(tcx: &Tcx, prog: &Program, owner: DefId, parent: Option<&ResolveBoundVars>) -> ResolveBoundVars {
     let def = prog.def(owner);
     let ast = &prog.files[def.file as usize].ast;
-    let names = (*tcx.resolve_lifetime_names(prog, owner)).clone();
+    let names = tcx.resolve_lifetime_names(prog, owner);
     let generics = owner_generics(prog, owner);
     let function = match ast.item(def.item).kind { ItemKind::Fn(sig, _, _) => Some(ast.fn_sig(sig)), _ => None };
     let mut late = Vec::new();

@@ -131,7 +131,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
             Ok(r) => Ok(r), Err(NoSolutionOrRerunNonErased::NoSolution) => Err(NoSolution),
             Err(NoSolutionOrRerunNonErased::RerunNonErased) => { assert!(ecx.opaque_accesses.should_bail().is_err()); Err(NoSolution) }
         };
-        ecx.inspect.probe_kind(super::inspect::ProbeKind::Root { result: result.clone() });
+        ecx.inspect.probe_kind(super::inspect::ProbeKind::Root { result: super::inspect::ProbeResult::new(&result) });
         ecx.inspect.probe_final_state(&infcx, ecx.max_input_universe);
         proof_tree.finish_evaluation_step(ecx.inspect);
         (result, ecx.opaque_accesses)

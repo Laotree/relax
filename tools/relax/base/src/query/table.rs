@@ -80,6 +80,18 @@ impl<K: Hash + Eq + Clone, V: Clone> QueryTable<K, V> {
         }
     }
 
+    /// memory report: (slots, bytes) with `deep` per completed value
+    pub fn mem_stats(&self, deep: &dyn Fn(&K, &V) -> usize) -> (usize, usize) {
+        let (mut n, mut b) = (0usize, 0usize);
+        for shard in self.shards() {
+            let shard = shard.read().unwrap_or_else(|e| e.into_inner());
+            n += shard.slots.len();
+            b += shard.slots.capacity() * std::mem::size_of::<Slot<K, V>>() + shard.keys.capacity() * (std::mem::size_of::<(K, u32)>() + 1) * 8 / 7;
+            for s in &shard.slots { b += s.value.as_ref().map_or(0, |v| deep(&s.key, v)); }
+        }
+        (n, b)
+    }
+
     /// Recover an interned key for the context's kind-dispatching force function.
     pub fn key(&self, index: u32) -> Option<K> {
         let shard = &self.shards()[index as usize % SHARDS];

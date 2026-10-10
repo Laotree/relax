@@ -21,6 +21,22 @@ pub(crate) struct LifetimeResolution {
     pub(super) binders: HashMap<BinderId, Vec<LifetimeId>>,
 }
 
+impl LifetimeResolution {
+    /// No lifetime declared, inherited or used anywhere in the owner (most items).
+    fn is_empty(&self) -> bool { self.inherited.is_empty() && self.declarations.is_empty() && self.uses.is_empty() && self.binders.is_empty() }
+    /// The answer to share: every empty resolution is the same value, kept once.
+    pub(crate) fn share(self) -> std::sync::Arc<LifetimeResolution> {
+        static EMPTY: std::sync::OnceLock<std::sync::Arc<LifetimeResolution>> = std::sync::OnceLock::new();
+        if self.is_empty() { EMPTY.get_or_init(Default::default).clone() } else { std::sync::Arc::new(self) }
+    }
+    /// memory report: heap bytes owned (excluding the struct)
+    pub(crate) fn heap_bytes(&self) -> usize {
+        fn hm<K, V, S>(m: &std::collections::HashMap<K, V, S>) -> usize { m.capacity() * (std::mem::size_of::<(K, V)>() + 1) * 8 / 7 }
+        self.inherited.capacity() * std::mem::size_of::<LifetimeDecl>() + self.declarations.capacity() * std::mem::size_of::<LifetimeDecl>()
+            + hm(&self.uses) + hm(&self.binders) + self.binders.values().map(|v| v.capacity() * 4).sum::<usize>()
+    }
+}
+
 pub(crate) fn resolve_lifetimes(tcx: &Tcx, prog: &Program, owner: DefId, parent: Option<&LifetimeResolution>) -> LifetimeResolution {
     let def = prog.def(owner);
     let mut resolver = LifetimeResolver {

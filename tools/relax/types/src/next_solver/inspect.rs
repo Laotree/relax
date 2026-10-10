@@ -13,18 +13,79 @@ pub struct State { pub var_values: Vec<GenericArg>, pub data: StateData }
 pub type CanonicalState = canonical::Canonical<State>;
 #[derive(Clone)]
 pub enum ProbeKind {
-    Root { result: QueryResult },
-    TraitCandidate { source: CandidateSource, result: QueryResult },
+    Root { result: ProbeResult },
+    TraitCandidate { source: CandidateSource, result: ProbeResult },
     NormalizedSelfTyAssembly, UnsizeAssembly, ProjectionCompatibility, ShadowedEnvProbing,
-    OpaqueTypeStorageLookup { result: QueryResult }, RigidAlias { result: QueryResult },
+    OpaqueTypeStorageLookup { result: ProbeResult }, RigidAlias { result: ProbeResult },
 }
+/// A probe's query result as its readers see it: the certainty, or no solution (the full
+/// response of a `QueryResult` is 136 bytes inline plus its vectors; no reader looks at it).
+#[derive(Clone, Copy)]
+pub enum ProbeResult { NoSolution, Ok(Certainty) }
+impl ProbeResult {
+    pub fn new<E>(r: &Result<canonical::Canonical<Response>, E>) -> Self {
+        match r { Ok(c) => ProbeResult::Ok(c.value.certainty), Err(_) => ProbeResult::NoSolution }
+    }
+    pub fn certainty(&self) -> Result<Certainty, NoSolution> {
+        match self { ProbeResult::Ok(c) => Ok(*c), ProbeResult::NoSolution => Err(NoSolution) }
+    }
+}
+// Steps are small: states and nested probes live behind boxes (an inline nested probe made
+// every step as large as a whole probe, 296 bytes, for the many steps that are not one).
 #[derive(Clone)]
 pub enum ProbeStep {
-    AddGoal(GoalSource, CanonicalState), NestedProbe(Probe),
-    RecordImplArgs { impl_args: CanonicalState }, MakeCanonicalResponse { shallow_certainty: Certainty },
+    AddGoal(GoalSource, Box<CanonicalState>), NestedProbe(Box<Probe>),
+    RecordImplArgs { impl_args: Box<CanonicalState> }, MakeCanonicalResponse { shallow_certainty: Certainty },
 }
+/// `final_state` is None for the pruned leaf of a failed candidate (see `prune_unreachable`).
 #[derive(Clone)]
-pub struct Probe { pub steps: Vec<ProbeStep>, pub kind: ProbeKind, pub final_state: CanonicalState }
+pub struct Probe { pub steps: Box<[ProbeStep]>, pub kind: ProbeKind, pub final_state: Option<Box<CanonicalState>> }
+use crate::infer::opaque_types::OpaqueTypeKey;
+use super::canonical::{Canonical, CanonicalVarKind};
+pub fn canonical_state_bytes<T>(c: &Canonical<T>) -> usize { c.var_kinds.capacity() * std::mem::size_of::<CanonicalVarKind>() }
+pub fn query_result_bytes(r: &QueryResult) -> usize {
+    match r {
+        Ok(c) => c.var_kinds.capacity() * std::mem::size_of::<CanonicalVarKind>() + c.value.var_values.capacity() * std::mem::size_of::<GenericArg>()
+            + c.value.external_constraints.region_constraints.capacity() * std::mem::size_of::<(RegionConstraint, bool)>()
+            + c.value.external_constraints.opaque_types.capacity() * std::mem::size_of::<(OpaqueTypeKey, TyId)>()
+            + c.value.external_constraints.normalization_nested_goals.capacity() * std::mem::size_of::<(GoalSource, Goal)>(),
+        Err(_) => 0,
+    }
+}
+fn state_bytes(c: &CanonicalState) -> usize {
+    16 + std::mem::size_of::<CanonicalState>() + canonical_state_bytes(c) + c.value.var_values.capacity() * std::mem::size_of::<GenericArg>() + match &c.value.data { StateData::Args(v) => v.capacity() * std::mem::size_of::<GenericArg>(), _ => 0 }
+}
+/// memory report: heap bytes of a proof tree below its root (step slices, boxed nested probes
+/// and states, results; the allocator's 16-byte block header counted per box)
+pub fn probe_bytes(p: &Probe) -> usize {
+    let mut n = p.steps.len() * std::mem::size_of::<ProbeStep>() + p.final_state.as_ref().map_or(0, |s| state_bytes(s));
+    for s in p.steps.iter() {
+        n += match s { ProbeStep::AddGoal(_, c) => state_bytes(c), ProbeStep::NestedProbe(q) => 16 + std::mem::size_of::<Probe>() + probe_bytes(q), ProbeStep::RecordImplArgs { impl_args } => state_bytes(impl_args), _ => 0 };
+    }
+    n
+}
+impl Probe {
+    /// Drops what no reader of `InspectGoal::candidates` can reach, for the cached copy of a
+    /// proof tree: probes `candidates_recur` skips outright (projection compatibility and
+    /// shadowed-env probes), and the goals / impl arguments of a failed candidate with no nested
+    /// probes, and the final state of every probe that is not an applicable candidate (only an
+    /// applicable candidate is ever instantiated).
+    pub(super) fn prune_unreachable(&mut self) {
+        let mut steps = std::mem::take(&mut self.steps).into_vec();
+        steps.retain(|s| !matches!(s, ProbeStep::NestedProbe(p) if matches!(p.kind, ProbeKind::ProjectionCompatibility | ProbeKind::ShadowedEnvProbing)));
+        let mut leaf = true;
+        for s in &mut steps { if let ProbeStep::NestedProbe(p) = s { leaf = false; p.prune_unreachable(); } }
+        let failed = matches!(&self.kind, ProbeKind::Root { result: ProbeResult::NoSolution } | ProbeKind::TraitCandidate { result: ProbeResult::NoSolution, .. } | ProbeKind::OpaqueTypeStorageLookup { result: ProbeResult::NoSolution } | ProbeKind::RigidAlias { result: ProbeResult::NoSolution });
+        if leaf && failed {
+            steps.retain(|s| matches!(s, ProbeStep::MakeCanonicalResponse { .. }));
+        }
+        // the final state is read only to instantiate an applicable candidate
+        if !matches!(&self.kind, ProbeKind::Root { result: ProbeResult::Ok(_) } | ProbeKind::TraitCandidate { result: ProbeResult::Ok(_), .. } | ProbeKind::OpaqueTypeStorageLookup { result: ProbeResult::Ok(_) } | ProbeKind::RigidAlias { result: ProbeResult::Ok(_) }) {
+            self.final_state = None;
+        }
+        self.steps = steps.into_boxed_slice();
+    }
+}
 pub struct GoalEvaluation {
     pub uncanonicalized_goal: Goal, pub orig_values: Vec<GenericArg>, pub final_revision: Probe, pub result: QueryResult, pub required_depth: super::search_graph::RequiredDepth,
 }
@@ -52,8 +113,8 @@ impl WipProbe {
     fn new(initial_num_var_values: usize) -> Self { Self { initial_num_var_values, steps: Vec::new(), kind: None, final_state: None } }
     fn finalize(self) -> Probe {
         let mut steps = Vec::new();
-        for step in self.steps { steps.push(match step { WipProbeStep::Step(s) => s, WipProbeStep::NestedProbe(p) => ProbeStep::NestedProbe(p.finalize()) }); }
-        Probe { steps, kind: self.kind.expect("probe kind"), final_state: self.final_state.expect("probe final state") }
+        for step in self.steps { steps.push(match step { WipProbeStep::Step(s) => s, WipProbeStep::NestedProbe(p) => ProbeStep::NestedProbe(Box::new(p.finalize())) }); }
+        Probe { steps: steps.into_boxed_slice(), kind: self.kind.expect("probe kind"), final_state: Some(Box::new(self.final_state.expect("probe final state"))) }
     }
 }
 impl WipEvaluationStep {
@@ -92,13 +153,13 @@ impl EvaluationStepBuilder {
     pub fn add_goal(&mut self, infcx: &InferCtxt<'_>, universe: UniverseIndex, source: GoalSource, goal: Goal) {
         if let Some(s) = &mut self.state {
             let state = canonical::make_canonical_state(infcx, &s.var_values, universe, StateData::Goal(goal));
-            s.current_evaluation_scope().steps.push(WipProbeStep::Step(ProbeStep::AddGoal(source, state)));
+            s.current_evaluation_scope().steps.push(WipProbeStep::Step(ProbeStep::AddGoal(source, Box::new(state))));
         }
     }
     pub fn record_impl_args(&mut self, infcx: &InferCtxt<'_>, universe: UniverseIndex, args: Vec<GenericArg>) {
         if let Some(s) = &mut self.state {
             let impl_args = canonical::make_canonical_state(infcx, &s.var_values, universe, StateData::Args(args));
-            s.current_evaluation_scope().steps.push(WipProbeStep::Step(ProbeStep::RecordImplArgs { impl_args }));
+            s.current_evaluation_scope().steps.push(WipProbeStep::Step(ProbeStep::RecordImplArgs { impl_args: Box::new(impl_args) }));
         }
     }
     pub fn make_canonical_response(&mut self, shallow_certainty: Certainty) {
@@ -119,7 +180,7 @@ pub struct InspectGoal<'a, 'tcx> {
 }
 pub struct InspectCandidate<'a, 'tcx> {
     pub goal: &'a InspectGoal<'a, 'tcx>, pub kind: &'a ProbeKind, steps: Vec<&'a ProbeStep>,
-    final_state: &'a CanonicalState, pub shallow_certainty: Certainty, pub result: Result<Certainty, NoSolution>,
+    final_state: Option<&'a CanonicalState>, pub shallow_certainty: Certainty, pub result: Result<Certainty, NoSolution>,
 }
 impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
     pub fn new(infcx: &'a InferCtxt<'tcx>, prog: &'a crate::program::Program, root: GoalEvaluation) -> Self {
@@ -144,8 +205,8 @@ impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
             ProbeKind::ProjectionCompatibility | ProbeKind::ShadowedEnvProbing => panic!("non-candidate probe"),
         };
         if let Some(shallow_certainty) = shallow_certainty { candidates.push(InspectCandidate {
-            goal: self, kind: &probe.kind, steps: steps.clone(), final_state: &probe.final_state,
-            shallow_certainty, result: result.as_ref().map(|r| r.value.certainty).map_err(|e| *e),
+            goal: self, kind: &probe.kind, steps: steps.clone(), final_state: probe.final_state.as_deref(),
+            shallow_certainty, result: result.certainty(),
         }); }
     }
     /// rustc_trait_selection/src/solve/inspect/analyse.rs:325-331.
@@ -168,7 +229,7 @@ impl InspectCandidate<'_, '_> {
                 goals.push(goal);
             }
         }
-        canonical::instantiate_canonical_state(self.goal.infcx, self.goal.prog, self.goal.prev_universe, &mut values, self.final_state);
+        canonical::instantiate_canonical_state(self.goal.infcx, self.goal.prog, self.goal.prev_universe, &mut values, self.final_state.expect("final state of an applicable candidate"));
         goals
     }
     pub fn instantiate_impl_args(&self) -> Vec<GenericArg> {
@@ -176,7 +237,7 @@ impl InspectCandidate<'_, '_> {
         for step in &self.steps {
             if let ProbeStep::RecordImplArgs { impl_args } = step {
                 let StateData::Args(args) = canonical::instantiate_canonical_state(infcx, self.goal.prog, self.goal.prev_universe, &mut values, impl_args) else { unreachable!() };
-                canonical::instantiate_canonical_state(infcx, self.goal.prog, self.goal.prev_universe, &mut values, self.final_state);
+                canonical::instantiate_canonical_state(infcx, self.goal.prog, self.goal.prev_universe, &mut values, self.final_state.expect("final state of an applicable candidate"));
                 let mut resolver = crate::infer::resolve::DeepVariableResolver::new(infcx);
                 let mut resolved = Vec::with_capacity(args.len());
                 for arg in args { resolved.push(fold::fold_arg(&infcx.tcx.tys, arg, &mut resolver, 0)); }

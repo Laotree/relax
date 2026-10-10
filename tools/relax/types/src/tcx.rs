@@ -368,6 +368,7 @@ impl Tcx {
         push("param envs", self.envs.mem_stats());
         push("alias_tys", self.alias_tys.mem_stats(|_, _| 0));
         push("core_path_items", self.core_path_items.mem_stats(|k, _| k.capacity()));
+        out.extend(self.queries.mem_lines());
         out
     }
 

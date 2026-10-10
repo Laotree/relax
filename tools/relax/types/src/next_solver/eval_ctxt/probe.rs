@@ -15,7 +15,7 @@ impl ProbeCtxt<'_, '_, '_> {
             let result = f(ecx);
             usages = ecx.search_graph.finish_single_candidate();
             ecx.inspect.probe_kind(super::super::inspect::ProbeKind::TraitCandidate {
-                source, result: result.clone().map_err(|_| NoSolution),
+                source, result: super::super::inspect::ProbeResult::new(&result),
             });
             result
         });
