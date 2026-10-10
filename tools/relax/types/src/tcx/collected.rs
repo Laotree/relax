@@ -90,7 +90,11 @@ impl Tcx {
     }
 
     pub fn collect_collected_suffix(&mut self, prog: &Program, first: usize) {
-        let defs: Vec<_> = (first..prog.defs.len()).map(|d| DefId(d as u32)).collect();
+        // The retained methods and traits that lost a dropped item come first: their signature
+        // cells are empty again and their region contracts follow the recreated items.
+        let mut defs: Vec<_> = prog.collected_recollect.iter().copied()
+            .filter(|d| matches!(prog.def(*d).kind, DefKind::AssocFn | DefKind::Trait)).collect();
+        defs.extend((first..prog.defs.len()).map(|d| DefId(d as u32)));
         self.collect_added(prog, &defs, true);
         for d in defs {
             if prog.def(d).kind == DefKind::Trait {
@@ -151,9 +155,34 @@ impl Tcx {
                     "collected constant differs: {}", prog.def_path(d));
             }
         }
-        assert_eq!(self.tys.with_semantic_ids(|| crate::crate_image::encode(&self.const_tys.fed_types())),
-            rebuilt.tys.with_semantic_ids(|| crate::crate_image::encode(&rebuilt.const_tys.fed_types())),
-            "collected anonymous constant types differ");
+        {
+            // A fed type is a query side effect (lowering an anonymous constant's expected type
+            // feeds it on demand), so the set depends on what was demanded before the image was
+            // recorded: the rebuild at boot has the entries its boot demanded, the image any the
+            // recording run demanded later (also without any edit: the complete restore of an
+            // unchanged program has them). What must hold: every entry of the rebuild is in the
+            // image with the same type, and every other entry of the image names the same
+            // definition on both sides (a prefix restore keeps no entry of a dropped definition).
+            let (fa, fb) = (self.const_tys.fed_types(), rebuilt.const_tys.fed_types());
+            let mut extra: Vec<DefId> = fa.keys().filter(|d| !fb.contains_key(d)).copied().collect();
+            extra.sort_by_key(|d| d.0);
+            let identity = |p: &Program, d: DefId| (p.def(d).kind, p.def(d).sub, p.def_path(d));
+            let moved: Vec<_> = extra.iter().filter(|d| {
+                (d.0 as usize) >= prog.defs.len() || identity(saved_prog, **d) != identity(prog, **d)
+            }).take(8).map(|d| format!("{}={}", d.0, saved_prog.def_path(*d))).collect();
+            let missing: Vec<_> = fb.keys().filter(|d| !fa.contains_key(d)).take(8).map(|d| format!("{}={}", d.0, prog.def_path(*d))).collect();
+            assert!(moved.is_empty() && missing.is_empty(),
+                "collected anonymous constant types differ: image has {} entries, rebuild {}; not the same definition in the rebuild {:?}; missing from the image {:?}",
+                fa.len(), fb.len(), moved, missing);
+            let common = |m: &crate::fxhash::HashMap<DefId, TyId>| {
+                let mut v: Vec<_> = m.iter().filter(|(d, _)| fb.contains_key(d)).map(|(d, t)| (*d, *t)).collect();
+                v.sort_by_key(|(d, _)| d.0); v
+            };
+            let (ca, cb) = (common(&fa), common(&fb));
+            assert_eq!(self.tys.with_semantic_ids(|| crate::crate_image::encode(&ca)),
+                rebuilt.tys.with_semantic_ids(|| crate::crate_image::encode(&cb)),
+                "collected anonymous constant types differ");
+        }
         compare!(ctor_sigs, adts, lang_items, adt_destructors, destructor_impls,
             nominal_region_contracts, contracts_waiting, impl_self, impl_trait,
             impl_generics, inherent, trait_impls, impls_by_key, impl_trait_args,

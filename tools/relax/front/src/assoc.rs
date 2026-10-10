@@ -63,9 +63,17 @@ pub fn collect_in(prog: &mut Program, visible: Option<&[bool]>) {
 /// (into the module just loaded), or an item without a trait item (its E0407/E0437/E0438 is
 /// recorded again; prog.errors holds it once).
 pub fn collect_loaded(prog: &mut Program, first_def: usize, visible: &[bool]) {
+    collect_loaded_with(prog, first_def, visible, &[], &[])
+}
+
+/// collect_loaded that also links again `extra_traits` and `extra_impls` (indices into
+/// `prog.traits` / `prog.impls`, ascending): the traits and impls of a retained collected
+/// prefix whose synthesized items were dropped with the definitions after the suffix start
+/// (Program::retain_collected_prefix). They come first, as the whole pass links them in order.
+pub fn collect_loaded_with(prog: &mut Program, first_def: usize, visible: &[bool], extra_traits: &[usize], extra_impls: &[usize]) {
     if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: assoc added=1"); }
-    let mut traits: Vec<usize> = Vec::new();
-    let mut impls: Vec<usize> = Vec::new();
+    let mut traits: Vec<usize> = extra_traits.to_vec();
+    let mut impls: Vec<usize> = extra_impls.to_vec();
     for di in first_def..prog.defs.len() {
         let def = &prog.defs[di];
         match def.kind {
@@ -80,7 +88,7 @@ pub fn collect_loaded(prog: &mut Program, first_def: usize, visible: &[bool]) {
         let def = prog.def(imp);
         if !matches!(prog.files[def.file as usize].ast.item(def.item).kind, ItemKind::Impl { trait_: Some(_), .. }) { continue; }
         let unlinked = prog.impls[ii].items.iter().any(|d| !prog.trait_item_def_id.contains_key(d));
-        if unlinked { impls.push(ii); }
+        if unlinked && !extra_impls.contains(&ii) { impls.push(ii); }
     }
     // the synthesized items of the traits and impls linked again (the scoped pass's `previous`)
     let mut previous = crate::fxhash::HashMap::default();

@@ -108,6 +108,14 @@ pub fn lower_legacy_const_generics_in(prog: &mut Program, visible: Option<&[bool
 /// lower_legacy_const_generics_in. (A full pass per load re-walked every body of those crates:
 /// ~0.6 s per completion load in Calculator, the main thread waiting on the front lock.)
 pub fn lower_legacy_const_generics_added(prog: &mut Program, first_def: usize, visible: &[bool]) -> usize {
+    lower_legacy_const_generics_relinked(prog, first_def, visible, &[])
+}
+
+/// lower_legacy_const_generics_added that also lowers `relinked` (ascending): the owners of a
+/// retained collected prefix that lost their on-demand const arguments with the definitions
+/// after the suffix start (Program::retain_collected_prefix). They lower first, as the whole
+/// pass lowers its owners in definition order, so the definitions come out with the same ids.
+pub fn lower_legacy_const_generics_relinked(prog: &mut Program, first_def: usize, visible: &[bool], relinked: &[DefId]) -> usize {
     if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: legacy added=1"); }
     let mut owners: Vec<DefId> = Vec::new();
     for &owner in &prog.collected_definitions {
@@ -115,9 +123,15 @@ pub fn lower_legacy_const_generics_added(prog: &mut Program, first_def: usize, v
     }
     owners.sort_unstable_by_key(|d| d.0);
     for &owner in &owners {
-        if legacy_const_generic_args(prog, owner).is_some() { return lower_legacy_const_generics_in(prog, Some(visible)); }
+        if legacy_const_generic_args(prog, owner).is_some() {
+            // the relinked owners call functions of their own (retained) crates: those attributes stand
+            let first = lower_legacy_const_owners(prog, relinked);
+            return first + lower_legacy_const_generics_in(prog, Some(visible));
+        }
     }
-    lower_legacy_const_owners(prog, &owners)
+    let mut all = relinked.to_vec();
+    all.extend(owners);
+    lower_legacy_const_owners(prog, &all)
 }
 
 /// The caller has classified the entire transaction as body-only. The cached

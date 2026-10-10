@@ -24,6 +24,20 @@ pub(super) struct Start {
 }
 crate::collected_fields!(Start, defs, mods, variants, impls, traits, imports, files, lines);
 
+/// What a retained prefix loses to its dropped on-demand definitions and gets back when the
+/// suffix resolves: the traits and impls (indices) whose RPITIT items are synthesized again,
+/// the owners whose legacy const arguments are lowered again, each parent's first dropped
+/// AnonConst ordinal, and the retained definitions the declaration tables must collect again.
+#[derive(Default)]
+pub(crate) struct Relink {
+    pub traits: Vec<usize>,
+    pub impls: Vec<usize>,
+    pub owners: Vec<DefId>,
+    ordinals: Vec<(DefId, u32)>,
+    fns: Vec<DefId>,
+    defs: Vec<DefId>,
+}
+
 impl Program {
     pub(super) fn mark_collected_start(&mut self) {
         self.collected_starts.push(Start { defs: self.defs.len(), mods: self.mods.len(),
@@ -39,30 +53,93 @@ impl Program {
         for s in &saved.syms.late.lock().unwrap_or_else(|e| e.into_inner()).1 { self.syms.intern_late(s); }
     }
 
+    /// The on-demand definitions of the retained crates that sit after the suffix start
+    /// (Program::retain_collected_prefix drops them with the suffix): which are they, and what
+    /// must be linked or lowered again so the suffix's resolve recreates them. None: a
+    /// definition of a retained crate after the start that is not one of them.
+    fn on_demand_tail(&self, crates: usize, start: usize) -> Option<Relink> {
+        let mut relink = Relink::default();
+        for (i, d) in self.defs.get(start..)?.iter().enumerate() {
+            if (d.krate as usize) >= crates { continue; }
+            let id = DefId((start + i) as u32);
+            match d.kind {
+                // a legacy const generic argument (def_collector::lower_legacy_const_owners), created
+                // for an owner of the crate once all crates are loaded
+                DefKind::AnonConst => {
+                    if !matches!(self.def_id_to_node_id.get(&id), Some((_, crate::def_collector::NodeId::AnonConst(_)))) { return None; }
+                    let mut owner = d.parent;
+                    while owner != NO_DEF && !self.legacy_const_args.contains_key(&owner) { owner = self.def(owner).parent; }
+                    if owner == NO_DEF || (owner.0 as usize) >= start
+                        || !self.legacy_const_args.get(&owner)?.children.iter().any(|(_, c)| *c == id) { return None; }
+                    relink.owners.push(owner);
+                    // the parent's ordinal counter goes back to its first dropped child
+                    match relink.ordinals.iter_mut().find(|(p, _)| *p == d.parent) {
+                        Some((_, first)) => *first = (*first).min(d.sub),
+                        None => relink.ordinals.push((d.parent, d.sub)),
+                    }
+                }
+                // a return-position `impl Trait` in a trait or impl method (assoc.rs), synthesized
+                // after resolve for the traits and impls of the crate
+                DefKind::AssocTy => {
+                    let fn_def = match self.impl_trait_in_trait_data.get(&id)? {
+                        crate::assoc::ImplTraitInTraitData::Trait { fn_def_id, .. }
+                        | crate::assoc::ImplTraitInTraitData::Impl { fn_def_id } => *fn_def_id,
+                    };
+                    let parent = self.def(d.parent);
+                    if (d.parent.0 as usize) >= start || (fn_def.0 as usize) >= start { return None; }
+                    match parent.kind {
+                        DefKind::Trait => relink.traits.push(parent.sub as usize),
+                        DefKind::Impl => relink.impls.push(parent.sub as usize),
+                        _ => return None,
+                    }
+                    relink.fns.push(fn_def);
+                    relink.defs.push(d.parent);
+                }
+                _ => return None,
+            }
+        }
+        for v in [&mut relink.traits, &mut relink.impls] { v.sort_unstable(); v.dedup(); }
+        for v in [&mut relink.owners, &mut relink.fns, &mut relink.defs] { v.sort_unstable_by_key(|d| d.0); v.dedup(); }
+        Some(relink)
+    }
+
     /// Reuse a certified dependency prefix after a leaf (or dependent suffix) changes.
     /// Its IDs remain stable; only new crates pass through the ordinary loader/collector.
+    /// The definitions of the retained crates that the whole build creates after all crates
+    /// (legacy const generic arguments, RPITIT items) go with the suffix and are created
+    /// again by its resolve in the same order (Relink), with the ids a fresh build gives them.
     pub fn retain_collected_prefix(&mut self, crates: usize) -> Option<usize> {
         let s = *self.collected_starts.get(crates)?;
-        if self.defs.get(s.defs..)?.iter().any(|d| (d.krate as usize) < crates)
-            || s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates)
+        if s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates)
             || self.file_crate.get(s.files..)?.iter().any(|k| (*k as usize) < crates) { return None; }
+        let relink = self.on_demand_tail(crates, s.defs)?;
         let names: crate::fxhash::HashSet<String> = self.crates[..crates].iter().map(|c| self.syms.str(c.name).to_string()).collect();
         // A library and its binary can share a name; their macro-table shadowing requires
         // the ordinary loader if either changes.
         if self.crates[crates..].iter().any(|c| names.contains(self.syms.str(c.name))) { return None; }
         self.node_id_to_def_id.retain(|(f, _), d| (*f as usize) < s.files && (d.0 as usize) < s.defs);
         self.legacy_const_args.retain(|d, _| (d.0 as usize) < s.defs);
+        for owner in &relink.owners { self.legacy_const_args.remove(owner); }
         Arc::make_mut(&mut self.legacy_const_attrs).retain(|d, _| (d.0 as usize) < s.defs);
         self.def_id_to_node_id.retain(|d, _| (d.0 as usize) < s.defs);
-        self.impl_trait_in_trait_data.retain(|d, _| (d.0 as usize) < s.defs);
-        self.associated_types_for_impl_traits.retain(|d, _| (d.0 as usize) < s.defs);
-        self.opaque_to_rpitit.retain(|d, _| (d.0 as usize) < s.defs);
-        self.opaque_types_defined_by.retain(|d, _| (d.0 as usize) < s.defs);
-        self.trait_item_def_id.retain(|d, _| (d.0 as usize) < s.defs);
+        let kept = |d: &DefId| (d.0 as usize) < s.defs;
+        self.impl_trait_in_trait_data.retain(|d, _| kept(d));
+        self.associated_types_for_impl_traits.retain(|d, v| kept(d) && v.iter().all(kept));
+        self.opaque_to_rpitit.retain(|d, v| kept(d) && kept(v));
+        self.opaque_types_defined_by.retain(|d, v| { v.retain(kept); kept(d) });
+        self.trait_item_def_id.retain(|d, v| kept(d) && kept(v));
+        // the dropped items leave their trait's and impl's lists; the resolve of the suffix
+        // synthesizes them again
+        for &ti in &relink.traits { self.traits.get_mut(ti)?.retain(kept); }
+        for &ii in &relink.impls { self.impls.get_mut(ii)?.items.retain(kept); }
         self.repeat_expr_counts.retain(|d| (d.0 as usize) < s.defs);
         self.collected_definitions.retain(|d| (d.0 as usize) < s.defs);
         self.legacy_call_names.retain(|d, _| (d.0 as usize) < s.defs);
         self.def_disambiguators.retain(|(d, _, _), _| (d.0 as usize) < s.defs);
+        for &(parent, first) in &relink.ordinals {
+            let key = (parent, DefKind::AnonConst, None);
+            if first == 0 { self.def_disambiguators.remove(&key); } else { self.def_disambiguators.insert(key, first); }
+        }
         self.child_definitions.retain(|(d, _, _, _), child| (d.0 as usize) < s.defs && (child.0 as usize) < s.defs);
         self.crates.truncate(crates);
         self.load_recipe.truncate(crates);
@@ -103,7 +180,17 @@ impl Program {
         // scope_cache, each clear retiring a 512 KB table until a quiescent point -- an app-edit
         // relaunch (48 crates collected again under lazy) grew to 16 GB and was OOM-killed
         self.imports_done = false;
+        self.collected_relink = Some(relink);
         Some(s.defs)
+    }
+
+    /// The suffix's resolve is about to link and lower the dropped definitions again: what is
+    /// left is what the declaration tables must collect again (`collected_recollect`).
+    pub(crate) fn take_collected_relink(&mut self) -> Relink {
+        let relink = self.collected_relink.take().unwrap_or_default();
+        self.collected_recollect = relink.fns.iter().chain(&relink.defs).copied().collect();
+        self.collected_recollect.sort_unstable_by_key(|d| d.0);
+        relink
     }
 
     pub fn verify_collected(&self, rebuilt: &Self) {

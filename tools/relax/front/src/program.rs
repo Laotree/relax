@@ -650,6 +650,12 @@ pub struct Program {
     pub(crate) legacy_call_names: HashMap<DefId, Vec<Sym>>,
     pub(crate) def_disambiguators: crate::collected::ImageMap<(DefId, DefKind, Option<Sym>), u32>,
     pub(crate) child_definitions: crate::collected::ImageMap<(DefId, DefKind, Option<Sym>, u32), DefId>,
+    /// What a retained collected prefix lost to the on-demand definitions it dropped
+    /// (retain_collected_prefix): the suffix's resolve links and lowers it again. Not part of the image.
+    pub(crate) collected_relink: Option<collected::Relink>,
+    /// The retained definitions the declaration tables collect again after such a resolve:
+    /// the methods whose signatures named a dropped item, and their traits.
+    pub collected_recollect: Vec<DefId>,
     pub prim_defs: Vec<DefId>,
     /// index of the crate whose `prelude` module supplies the std prelude
     pub prelude_crate: Option<u32>,
@@ -773,6 +779,8 @@ impl Program {
             legacy_call_names: Default::default(),
             def_disambiguators: Default::default(),
             child_definitions: Default::default(),
+            collected_relink: None,
+            collected_recollect: Vec::new(),
             prim_defs: Vec::new(),
             prelude_crate: None,
             trait_scope: Default::default(),
@@ -2814,8 +2822,11 @@ impl Program {
         self.resolve_imports_fixpoint(i0);
         self.imports_done = true;
         let visible = self.crates_seeing_files(self.defs[first_def..].iter().map(|d| d.file));
-        crate::assoc::collect_loaded(self, first_def, &visible);
-        crate::def_collector::lower_legacy_const_generics_added(self, first_def, &visible);
+        // a retained prefix's owners that lost their on-demand definitions are linked and lowered
+        // again first, as the whole pass does them in definition order
+        let relink = self.take_collected_relink();
+        crate::assoc::collect_loaded_with(self, first_def, &visible, &relink.traits, &relink.impls);
+        crate::def_collector::lower_legacy_const_generics_relinked(self, first_def, &visible, &relink.owners);
     }
 
     fn resolve_imports_fixpoint(&mut self, i0: usize) {
