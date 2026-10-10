@@ -712,6 +712,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
             let handles: Vec<_> = (0..jobs.max(1).min(batches.len())).map(|_| {
                 let (work, next, batches, evaluations) = (&work, &next, &batches, &evaluations);
                 scope.spawn(move || {
+                    let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
                     let cpu = std::time::Instant::now();
                     let mut out = Vec::new();
                     let mut counts = [0usize; 4];

@@ -80,13 +80,15 @@ pub enum Tag {
     FrontRecord,
     ProgramItems,
     MacroOutput,
+    /// the demand planner: names, bindings, closure, recorded parts (front/src/lazy.rs, demand*.rs, rs_items.rs)
+    Planner,
 }
 
-pub const N_TAGS: usize = 35;
+pub const N_TAGS: usize = 36;
 pub const TAG_NAMES: [&str; N_TAGS] = [
     "other", "boot", "parse", "parse-body", "derive", "macro_rules", "fmt", "mac-other", "load", "resolve", "syms", "sigs", "types",
     "typeck", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
-    "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output",
+    "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output", "planner",
 ];
 
 /// 0 undecided, 1 off, 2 on (decided at the first allocation, never changed)

@@ -123,6 +123,7 @@ pub struct Plan {
 
 impl Plan {
     fn build(crates: &[PreCrate], contexts: Vec<Arc<crate::source_context::Context>>, image: Option<Arc<DemandImage>>, early: &EarlyCrates, stored: Option<&crate::crate_image::DemandParts>) -> Self {
+        let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
         let rust_lazy = crates.first().is_some_and(|c| c.cfg.session.options.rs_lazy);
         let profile = crate::why::enabled() || crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
         let _profile = crate::load_profile::span(profile, "rust-demand", "load");
@@ -185,6 +186,7 @@ impl Plan {
                 let template = &names;
                 let next_crate = &next_crate;
                 scope.spawn(move || {
+                    let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
                     let mut output = Vec::new();
                     loop {
                         let ci = next_crate.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -439,10 +441,10 @@ impl Plan {
                     let chunk = files.len().div_ceil(jobs().max(1)).max(1);
                     let (names, contexts, expanded_indexes, sources) = (&names, &contexts, &expanded_indexes, &sources);
                     let mut flags = std::thread::scope(|scope| {
-                        let workers = files.chunks_mut(chunk).map(|files| scope.spawn(move || files.iter_mut().map(|file| {
+                        let workers = files.chunks_mut(chunk).map(|files| scope.spawn(move || { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter_mut().map(|file| {
                             let source = sources.get(&(file.path.as_str(), file.module.as_str())).copied();
                             macro_surface(names, crates, contexts, expanded_indexes, profile, file, source.map(|(src, toks, _)| (src, toks)), source.map(|(_, _, parameters)| parameters))
-                        }).collect::<Vec<_>>())).collect::<Vec<_>>();
+                        }).collect::<Vec<_>>() })).collect::<Vec<_>>();
                         workers.into_iter().flat_map(|w| w.join().expect("context macro surface worker")).collect::<Vec<_>>()
                     });
                     unindexed_files.append(&mut flags);
@@ -573,12 +575,12 @@ impl Plan {
             let handles = rust.chunks(chunk).map(|files| {
                 let names = &names;
                 let relevant = &relevant;
-                scope.spawn(move || files.iter().filter(|(ci, ..)| relevant.contains(ci)).map(|(ci, path, module, scan)| {
+                scope.spawn(move || { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter().filter(|(ci, ..)| relevant.contains(ci)).map(|(ci, path, module, scan)| {
                     let (src, toks) = (&scan.src, &scan.toks);
                     let opaque = names.opaque_scopes(*ci, src, toks, module);
                     let references = BTreeSet::<String>::new();
                     (path, opaque, references)
-                }).collect::<Vec<_>>())
+                }).collect::<Vec<_>>() })
             }).collect::<Vec<_>>();
             handles.into_iter().flat_map(|h| h.join().expect("context reference worker")).collect::<Vec<_>>()
         });

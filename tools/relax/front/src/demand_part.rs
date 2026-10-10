@@ -95,6 +95,7 @@ fn get_surface(r: &mut Decode<'_>, store: &str, images: &mut Resolve<'_>) -> Opt
 }
 impl DemandPart {
     pub fn encode_body(&self, images: &mut dyn DemandWriter, profile: bool, name: &str) -> Option<(u128, Vec<u8>)> {
+        let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
         let mut w = Vec::new();
         PART_VERSION.put(&mut w);
         self.inputs.put(&mut w);
@@ -391,6 +392,7 @@ impl Recording {
 }
 impl DemandImage {
     pub fn recorded_parts(&self) -> Vec<Arc<DemandPart>> {
+        let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
         let Some(recording) = &self.recording else { return self.parts.clone(); };
         // held while recording: a writer that comes while the load's prepare thread records
         // waits for its parts instead of finding neither pending nor ready ones

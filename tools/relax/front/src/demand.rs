@@ -1353,14 +1353,14 @@ impl Names {
         let out: Vec<std::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
         std::thread::scope(|scope| {
             for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
-                scope.spawn(|| loop {
+                scope.spawn(|| { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(cell) = work.get(k) else { break };
                     let (mut image, entries) = cell.lock().unwrap().take().unwrap();
                     let input = self.input_identity(cis[k], &image);
                     image.bindings = BindingImage::capture(self, entries);
                     *out[k].lock().unwrap() = (strings::encode(&image), input);
-                });
+                } });
             }
         });
         out.into_iter().map(|o| o.into_inner().unwrap()).collect()
