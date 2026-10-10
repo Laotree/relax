@@ -331,7 +331,7 @@ impl Fcx<'_> {
     }
 
     pub(super) fn closure_signatures(&mut self, e: ExprId, params: &[ClosureParam], ret: Option<crate::ast::TyId>, expected: Option<TyId>) -> ClosureSignatures {
-        let is_async = matches!(self.ast().expr(e).kind, ExprKind::Closure { is_async: true, .. });
+        let is_async = matches!(self.ast().expr(e).kind, ExprKind::Closure(row) if self.ast().row(row).is_async);
         let expected = expected.and_then(|t| {
             let (sig, kind) = self.deduce_closure_signature(t, is_async);
             // The same direct Fn-family bound supplies the signature and the

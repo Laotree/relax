@@ -2252,7 +2252,7 @@ impl<'a> Fcx<'a> {
     /// The assignee of a destructuring assignment against the assigned type `t`.
     fn check_assignee(&mut self, a: ExprId, t: TyId, lo: u32) {
         let ast = self.ast();
-        let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(None, None, false));
+        let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false));
         match ast.expr(a).kind.clone() {
             ExprKind::Paren(x) if is_rest(x) => {}
             ExprKind::Paren(x) => {
@@ -2340,7 +2340,8 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
-            ExprKind::Struct(path, fields, _, _) => {
+            ExprKind::Struct(row) => {
+                let crate::ast::StructRow { path, fields, .. } = *self.ast().row(row);
                 let r = self.resolve_struct_path(&path);
                 self.b.res.insert(a.0, r);
                 if let Res::Def(d) = r {
@@ -4137,7 +4138,7 @@ impl<'a> Fcx<'a> {
                 let then_div = self.diverges;
                 self.scopes.truncate(saved);
                 self.diverges = false;
-                match els {
+                match &els.get() {
                     None => {
                         self.diverges = false;
                         if !then_div {
@@ -4246,7 +4247,10 @@ impl<'a> Fcx<'a> {
                     _ => self.tcx.tys.never,
                 }
             }
-            ExprKind::While(c, b, label) => {
+            ExprKind::While(row) => {
+                let crate::ast::WhileRow { cond: c, body: b, label } = &self.ast().row(*row).clone();
+                let (c, b) = (c, b);
+                let label = &crate::ast::OptIdent::from(*label);
                 let bool_ = self.tcx.tys.bool_;
                 let saved = self.scopes.len();
                 let l = label.map(|x| self.sym_lifetime(x));
@@ -4296,7 +4300,8 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
-            ExprKind::For(p, it, b, label) => {
+            ExprKind::For(row) => {
+                let crate::ast::ForRow { pat: p, iter: it, body: b, label } = self.ast().row(*row);
                 let saved = self.scopes.len();
                 let item = self.check_for_iter(*it, lo);
                 self.check_pat(*p, item);
@@ -4320,7 +4325,7 @@ impl<'a> Fcx<'a> {
                     self.err(lo, "unlabeled `break` in the condition of a `while` loop".to_string());
                 }
                 let l = label.map(|x| self.sym_lifetime(x));
-                let t = match x {
+                let t = match &x.get() {
                     Some(v) => {
                         let target = self.loop_index(l);
                         let exp = match target {
@@ -4358,7 +4363,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Return(x) => {
                 let rt = *self.ret_stack.last().unwrap();
-                match x {
+                match &x.get() {
                     Some(v) => {
                         let t = self.check_expr(*v, Some(rt));
                         self.coerce_or_unify(t, rt, Some(*v), lo);
@@ -4687,11 +4692,13 @@ impl<'a> Fcx<'a> {
                 }
             }
             ExprKind::Call(f, args) => self.check_call(e, *f, self.ast().list(*args), expected, lo),
-            ExprKind::MethodCall { recv, name, turbofish, args } => {
+            ExprKind::MethodCall(recv, row) => {
+                let crate::ast::MethodCallRow { name, turbofish, args } = self.ast().row(*row);
                 self.method_expected = expected;
                 self.check_method(e, *recv, *name, *turbofish, self.ast().list(*args), lo)
             }
-            ExprKind::Struct(path, fields, base, rest) => {
+            ExprKind::Struct(row) => {
+                let crate::ast::StructRow { path, fields, base, rest } = self.ast().row(*row);
                 let r = self.resolve_struct_path(path);
                 self.b.res.insert(e.0, r);
                 let d = match r {
@@ -4743,12 +4750,12 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Range(a, b, incl) => {
                 let elem = self.fresh(0);
-                if let Some(a) = a {
-                    let t = self.check_expr(*a, Some(elem));
+                if let Some(a) = a.get() {
+                    let t = self.check_expr(a, Some(elem));
                     self.eq(t, elem);
                 }
-                if let Some(b) = b {
-                    let t = self.check_expr(*b, Some(elem));
+                if let Some(b) = b.get() {
+                    let t = self.check_expr(b, Some(elem));
                     self.eq(t, elem);
                 }
                 let name = match (a.is_some(), b.is_some(), *incl) {
@@ -4771,8 +4778,8 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
-            ExprKind::Closure { params, ret, body, .. } => self.check_closure(e, self.ast().list(*params), *ret, *body, expected),
-            ExprKind::Mac(m) => self.check_mac(e, m, expected, lo),
+            ExprKind::Closure(row) => { let crate::ast::ClosureRow { params, ret, body, .. } = self.ast().row(*row); self.check_closure(e, self.ast().list(*params), *ret, *body, expected) }
+            ExprKind::Mac(m) => self.check_mac(e, self.ast().row(*m), expected, lo),
             ExprKind::Try(x) => self.check_try(e, *x, lo),
             ExprKind::Async(mode, b) => self.check_async_block(e, *mode, *b),
             ExprKind::Await(x) => self.check_await(*x, lo),
@@ -4832,13 +4839,15 @@ impl<'a> Fcx<'a> {
         let ast = self.ast();
         match &ast.expr(e).kind {
             ExprKind::Break(l, x) => {
-                let target_ok = match l {
+                let target_ok = match &l.get() {
                     None => depth == 0,
                     Some(li) => label.map_or(false, |l| self.sym_lifetime(*li).0 == l.0),
                 };
                 target_ok || x.map_or(false, |v| self.expr_has_break(v, depth, label))
             }
-            ExprKind::Loop(b, _) | ExprKind::While(_, b, _) | ExprKind::For(_, _, b, _) => self.block_has_break(*b, depth + 1, label),
+            ExprKind::Loop(b, _) => self.block_has_break(*b, depth + 1, label),
+            ExprKind::While(row) => self.block_has_break(self.ast().row(*row).body, depth + 1, label),
+            ExprKind::For(row) => self.block_has_break(self.ast().row(*row).body, depth + 1, label),
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.block_has_break(*b, depth, label),
             ExprKind::If(c, t, el) => {
                 self.expr_has_break(*c, depth, label) || self.block_has_break(*t, depth, label) || el.map_or(false, |x| self.expr_has_break(x, depth, label))
@@ -5444,7 +5453,8 @@ impl<'a> Fcx<'a> {
         let mut is_move = is_move;
         if mode == crate::ast::ASYNC_CLOSURE_BODY {
             if let Some(&(parent, _)) = self.closure_depth.last() {
-                if let ExprKind::Closure { is_move: parent_move, .. } = self.ast().expr(ExprId(parent)).kind {
+                if let ExprKind::Closure(prow) = self.ast().expr(ExprId(parent)).kind {
+                    let parent_move = self.ast().row(prow).is_move;
                     force_move_if_consumes = parent_move;
                     is_move |= parent_move && self.expected_closure_kinds.get(&parent) == Some(&crate::upvar::ClosureKind::FnOnce);
                 }
@@ -5569,7 +5579,7 @@ impl<'a> Fcx<'a> {
         self.diverges = false;
         self.b.closures.push(e.0);
         let sig = self.b.closure_sigs[&e.0].bound;
-        let is_move = matches!(self.ast().expr(e).kind, ExprKind::Closure { is_move: true, .. });
+        let is_move = matches!(self.ast().expr(e).kind, ExprKind::Closure(row) if self.ast().row(row).is_move);
         let up = self.fresh(0);
         let kind = match self.expected_closure_kinds.get(&e.0).copied() {
             Some(kind) => self.tcx.tys.from_closure_kind(kind),

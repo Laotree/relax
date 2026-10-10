@@ -55,6 +55,12 @@ unsafe impl Pod for crate::ast::FieldDef {}
 unsafe impl Pod for crate::ast::Variant {}
 unsafe impl Pod for crate::ast::UseTree {}
 unsafe impl Pod for crate::ast::WherePred {}
+unsafe impl Pod for crate::ast::MethodCallRow {}
+unsafe impl Pod for crate::ast::ForRow {}
+unsafe impl Pod for crate::ast::ClosureRow {}
+unsafe impl Pod for crate::ast::StructRow {}
+unsafe impl Pod for crate::ast::MacCall {}
+unsafe impl Pod for crate::ast::WhileRow {}
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"RFI1");
 /// bump when a section's meaning changes (layouts are covered by the build id)

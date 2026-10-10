@@ -323,12 +323,10 @@ pub(crate) fn coroutine_closure_views(prog: &Program, tcx: &Tcx, body: &mut Body
         if ce & crate::tcx::ASYNC_FN_BODY != 0 {
             continue;
         }
-        let ExprKind::Closure {
-            is_async: true,
-            body: child,
-            ..
-        } = ast.expr(ExprId(ce)).kind
-        else {
+        let ExprKind::Closure(row) = ast.expr(ExprId(ce)).kind else {
+            continue;
+        };
+        let crate::ast::ClosureRow { is_async: true, body: child, .. } = *ast.row(row) else {
             continue;
         };
         let (Some(parent), Some(inner)) =

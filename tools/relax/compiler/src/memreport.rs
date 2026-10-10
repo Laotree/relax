@@ -180,7 +180,7 @@ fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
                 arms, closure_params, field_pats, qselfs, generic_args, fn_ptrs,
                 generic_arg_lists, bounds, generic_params, ident_lists, attrs,
                 asm_ops, items, fn_sigs, params, field_defs, variants, use_trees,
-                item_lists, where_preds);
+                item_lists, where_preds, method_calls, for_exprs, closure_exprs, struct_exprs, mac_calls, while_exprs);
             a = ast.part.get().map(|a| &**a);
             prefix = "part.ast.";
         }
@@ -231,8 +231,9 @@ pub fn ast_nested(p: &crate::program::Program) -> Vec<(String, u64)> {
     let visit = |a: &Ast, add: &mut dyn FnMut(&'static str, u64)| {
         for e in &a.exprs {
             match &e.kind {
-                ExprKind::Path(p) | ExprKind::Struct(p, ..) => add("expr Path/Struct qself", path(p)),
-                ExprKind::Mac(m) => add("expr Mac qself", path(&m.path)),
+                ExprKind::Path(p) => add("expr Path/Struct qself", path(p)),
+                ExprKind::Struct(r) => add("expr Path/Struct qself", path(&a.row(*r).path)),
+                ExprKind::Mac(m) => add("expr Mac qself", path(&a.row(*m).path)),
                 _ => add("expr (no nested)", 0),
             }
         }

@@ -264,7 +264,7 @@ fn parse_spec(s: &str) -> FmtSpec {
 pub fn is_assignee_pattern(ast: &crate::ast::Ast, a: ExprId) -> bool {
     match &ast.expr(a).kind {
         // `(..) = e` (a parenthesized rest is the empty tuple pattern with a rest)
-        ExprKind::Paren(x) if matches!(ast.expr(*x).kind, ExprKind::Range(None, None, false)) => true,
+        ExprKind::Paren(x) if matches!(ast.expr(*x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false)) => true,
         ExprKind::Paren(x) => is_assignee_pattern(ast, *x),
         ExprKind::Tuple(_) | ExprKind::Array(_) | ExprKind::Struct(..) | ExprKind::Underscore => true,
         // a tuple-struct / variant constructor (`S(a, b) = v`), as rustc's assignee grammar

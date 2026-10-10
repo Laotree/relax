@@ -753,7 +753,8 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.expr(*a);
                 }
             }
-            ExprKind::MethodCall { recv, name, turbofish, args } => {
+            ExprKind::MethodCall(recv, row) => {
+                let MethodCallRow { name, turbofish, args } = p.ast.row(*row);
                 let n = self.text(*name);
                 if turbofish.is_none() && contains(INFER_METHODS, n) && args.is_empty() {
                     self.cen.c[C_INFER] += 1;
@@ -801,8 +802,8 @@ impl<'p, 'a> Walker<'p, 'a> {
             ExprKind::If(c, t, el) => {
                 self.expr(*c);
                 self.block(*t);
-                if let Some(x) = el {
-                    self.expr(*x);
+                if let Some(x) = el.get() {
+                    self.expr(x);
                 }
             }
             ExprKind::Let(pt, x) => {
@@ -823,12 +824,14 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.expr(a.body);
                 }
             }
-            ExprKind::While(c, b, _) => {
+            ExprKind::While(row) => {
+                let WhileRow { cond: c, body: b, .. } = p.ast.row(*row);
                 self.expr(*c);
                 self.block(*b);
             }
             ExprKind::Loop(b, _) => self.block(*b),
-            ExprKind::For(pt, it, b, _) => {
+            ExprKind::For(row) => {
+                let ForRow { pat: pt, iter: it, body: b, .. } = p.ast.row(*row);
                 self.pat(*pt);
                 let save = self.in_for_head;
                 self.in_for_head = true;
@@ -837,11 +840,12 @@ impl<'p, 'a> Walker<'p, 'a> {
                 self.block(*b);
             }
             ExprKind::Break(_, x) | ExprKind::Return(x) | ExprKind::Yield(x) => {
-                if let Some(x) = x {
-                    self.expr(*x);
+                if let Some(x) = x.get() {
+                    self.expr(x);
                 }
             }
-            ExprKind::Closure { is_async, params, ret, body, .. } => {
+            ExprKind::Closure(row) => {
+                let ClosureRow { is_async, params, ret, body, .. } = p.ast.row(*row);
                 self.cen.c[C_CLOSURES] += 1;
                 if *is_async {
                     self.cen.c[C_ASYNC] += 1;
@@ -865,7 +869,8 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.expr(*x);
                 }
             }
-            ExprKind::Struct(path, fields, base, _) => {
+            ExprKind::Struct(row) => {
+                let StructRow { path, fields, base, .. } = p.ast.row(*row);
                 self.path(path);
                 for f in p.ast.list(*fields) {
                     self.expr(f.expr);
@@ -875,14 +880,14 @@ impl<'p, 'a> Walker<'p, 'a> {
                 }
             }
             ExprKind::Range(a, b, _) => {
-                if let Some(a) = a {
-                    self.expr(*a);
+                if let Some(a) = a.get() {
+                    self.expr(a);
                 }
-                if let Some(b) = b {
-                    self.expr(*b);
+                if let Some(b) = b.get() {
+                    self.expr(b);
                 }
             }
-            ExprKind::Mac(m) => self.mac(m),
+            ExprKind::Mac(m) => self.mac(p.ast.row(*m)),
         }
     }
 }

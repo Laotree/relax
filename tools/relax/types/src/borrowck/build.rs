@@ -575,7 +575,8 @@ impl<'a> Build<'a> {
         });
         self.out.closure_expr = Some(ce);
         let (params, body) = match &self.ast.expr(ExprId(ce)).kind {
-            ExprKind::Closure { params, body, is_async, .. } => {
+            ExprKind::Closure(row) => {
+                let crate::ast::ClosureRow { params, body, is_async, .. } = self.ast.row(*row);
                 if *is_async {
                     unsup!(self, "async closure");
                     return;
@@ -598,9 +599,11 @@ impl<'a> Build<'a> {
         self.span = { let x = self.ast.expr(ExprId(ce)); Span { lo: x.lo, hi: x.hi } };
         let r0 = self.new_local(ret, LocalKind::Ret, true, None);
         debug_assert_eq!(r0, 0);
-        if let ExprKind::Closure { ret: Some(rt), .. } = &self.ast.expr(ExprId(ce)).kind {
-            if ast_ty_has_ref(self.ast, *rt, 0) {
-                self.ascribe_local(0, *rt);
+        if let ExprKind::Closure(row) = &self.ast.expr(ExprId(ce)).kind {
+            if let Some(rt) = &self.ast.row(*row).ret {
+                if ast_ty_has_ref(self.ast, *rt, 0) {
+                    self.ascribe_local(0, *rt);
+                }
             }
         }
         let env_ty = match kind {
@@ -617,7 +620,7 @@ impl<'a> Build<'a> {
         let mut binds = Vec::new();
         let ret_has_ref = match &self.ast.expr(ExprId(ce)).kind {
             // an elided reference in the return type ties it to a parameter's (elision)
-            ExprKind::Closure { ret: Some(r), .. } => ast_ty_has_elided_ref(self.ast, *r, 0),
+            ExprKind::Closure(row) => self.ast.row(*row).ret.is_some_and(|r| ast_ty_has_elided_ref(self.ast, r, 0)),
             _ => false,
         };
         let hr_bound = if ret_has_ref { Vec::new() } else { self.hr_closures.get(&ce).cloned().unwrap_or_default() };
@@ -647,7 +650,7 @@ impl<'a> Build<'a> {
             }
             if !ret_has_ref && (annotated_hr || (unannotated && hr_bound.get(k).copied().unwrap_or(false))) && matches!(self.tx.kind(t), TyKind::Ref(..)) {
                 self.out.hr_args.push(a);
-                let unwritten_ret = matches!(&self.ast.expr(ExprId(ce)).kind, ExprKind::Closure { ret: None, .. });
+                let unwritten_ret = matches!(&self.ast.expr(ExprId(ce)).kind, ExprKind::Closure(row) if self.ast.row(*row).ret.is_none());
                 if unwritten_ret && self.hr_ret_ties.get(&ce) == Some(&k) {
                     self.out.hr_ret = Some(a);
                 }
@@ -876,8 +879,8 @@ impl<'a> Build<'a> {
                     self.collect_extending(*x, out);
                 }
             }
-            ExprKind::Struct(_, fields, _, _) => {
-                for f in self.ast.list(*fields) {
+            ExprKind::Struct(row) => {
+                for f in self.ast.list(self.ast.row(*row).fields) {
                     self.collect_extending(f.expr, out);
                 }
             }
@@ -900,8 +903,8 @@ impl<'a> Build<'a> {
                 if let Some(Stmt::Expr(x, false)) = ast.stmts(*then).last() {
                     self.collect_extending(*x, out);
                 }
-                if let Some(e2) = els {
-                    self.collect_extending(*e2, out);
+                if let Some(e2) = els.get() {
+                    self.collect_extending(e2, out);
                 }
             }
             ExprKind::Match(_, arms) => {
@@ -1181,7 +1184,8 @@ impl<'a> Build<'a> {
     /// (or through `Self`): its user type (rustc AggregateKind::Adt's user_ty).
     fn note_agg_targs(&mut self, e: ExprId) {
         let p = match &self.ast.expr(strip_paren(self.ast, e)).kind {
-            ExprKind::Path(p) | ExprKind::Struct(p, _, _, _) => p,
+            ExprKind::Path(p) => p,
+            ExprKind::Struct(row) => &self.ast.row(*row).path,
             _ => return,
         };
         let v = Self::path_args(self.ast, p);
@@ -2003,7 +2007,7 @@ impl<'a> Build<'a> {
             }
             ExprKind::Unsafe(b) => self.block_into(dest, *b, None),
             ExprKind::ConstBlock(_) => self.assign(dest, Rvalue::Use(self.expr_constant(e))),
-            ExprKind::If(c, then, els) => self.if_expr(dest, *c, *then, *els),
+            ExprKind::If(c, then, els) => self.if_expr(dest, *c, *then, els.get()),
             ExprKind::Let(p, x) => {
                 // a bare `let` condition outside if/while (rare): test into a bool
                 let yes = self.new_block();
@@ -2019,7 +2023,8 @@ impl<'a> Build<'a> {
                 self.switch_to(join);
             }
             ExprKind::Match(x, arms) => self.match_expr(dest, *x, ast.list(*arms)),
-            ExprKind::While(c, body, label) => {
+            ExprKind::While(row) => {
+                let crate::ast::WhileRow { cond: c, body, label } = ast.row(*row);
                 let head = self.new_block();
                 let bodyb = self.new_block();
                 let exit = self.new_block();
@@ -2067,7 +2072,8 @@ impl<'a> Build<'a> {
                 self.goto(head);
                 self.switch_to(exit);
             }
-            ExprKind::For(p, it, body, label) => {
+            ExprKind::For(row) => {
+                let crate::ast::ForRow { pat: p, iter: it, body, label } = ast.row(*row);
                 self.for_loop(*p, *it, *body, label.map(|l| self.pf.text(l).as_bytes().to_vec()));
                 self.assign_unit(dest);
             }
@@ -2075,16 +2081,16 @@ impl<'a> Build<'a> {
                 let idx = self.loop_index(label.map(|l| self.pf.text(l).as_bytes().to_vec()));
                 match idx {
                     Some(i) => {
-                        if let Some(v) = x {
+                        if let Some(v) = x.get() {
                             match self.loops[i].dest.clone() {
                                 Some(d) => {
                                     let dt = self.place_ty(&d);
-                                    self.into_coerced(d, *v, dt)
+                                    self.into_coerced(d, v, dt)
                                 }
                                 None => {
-                                    let vt = self.ty(*v);
+                                    let vt = self.ty(v);
                                     let tmp = self.temp(vt);
-                                    self.into(Place::local(tmp), *v);
+                                    self.into(Place::local(tmp), v);
                                 }
                             }
                         } else if let Some(d) = self.loops[i].dest.clone() {
@@ -2115,7 +2121,7 @@ impl<'a> Build<'a> {
             }
             ExprKind::Return(x) => {
                 let rt = self.ret_ty;
-                match x {
+                match &x.get() {
                     Some(v) => self.into_coerced(Place::local(0), *v, rt),
                     None => self.assign_unit(Place::local(0)),
                 }
@@ -2156,14 +2162,14 @@ impl<'a> Build<'a> {
                 let op = self.as_operand_coerced(*x, et, false);
                 self.assign(dest, Rvalue::Repeat(op));
             }
-            ExprKind::Struct(_, fields, base, _) => self.struct_lit(dest, e, ast.list(*fields), base.get(), t),
+            ExprKind::Struct(row) => { let crate::ast::StructRow { fields, base, .. } = ast.row(*row); self.struct_lit(dest, e, ast.list(*fields), base.get(), t) }
             ExprKind::Range(a, b2, _) => {
                 let mut ops = Vec::new();
-                if let Some(a) = a {
-                    ops.push(self.as_operand(*a));
+                if let Some(a) = a.get() {
+                    ops.push(self.as_operand(a));
                 }
-                if let Some(b2) = b2 {
-                    ops.push(self.as_operand(*b2));
+                if let Some(b2) = b2.get() {
+                    ops.push(self.as_operand(b2));
                 }
                 self.assign(dest, Rvalue::Aggregate(AggKind::Adt(t, 0), ops));
             }
@@ -2179,13 +2185,13 @@ impl<'a> Build<'a> {
                 }
             }
             ExprKind::Call(f, args) => self.call_expr(dest, e, *f, ast.list(*args)),
-            ExprKind::MethodCall { recv, args, .. } => self.method_call(dest, e, *recv, ast.list(*args)),
-            ExprKind::Closure { .. } => self.closure_expr(dest, e),
+            ExprKind::MethodCall(recv, row) => self.method_call(dest, e, *recv, ast.list(ast.row(*row).args)),
+            ExprKind::Closure(_) => self.closure_expr(dest, e),
             ExprKind::Async(..) | ExprKind::Await(_) | ExprKind::Yield(_) => {
                 unsup!(self, "async / await");
                 self.assign(dest, Rvalue::Use(self.expr_constant(e)));
             }
-            ExprKind::Mac(m) => self.mac(dest, e, m),
+            ExprKind::Mac(m) => self.mac(dest, e, ast.row(*m)),
             ExprKind::Box(x) => {
                 let op = self.as_operand(*x);
                 self.assign(dest, Rvalue::Aggregate(AggKind::Tuple, vec![op]));
@@ -2782,7 +2788,8 @@ impl<'a> Build<'a> {
         // the call's span: the method name onwards (rustc: the method call span)
         self.arg_spans = std::iter::once(self.espan(recv)).chain(args.iter().map(|a| self.espan(*a))).collect();
         if !virt {
-            if let ExprKind::MethodCall { turbofish, .. } = &self.ast.expr(e).kind {
+            if let ExprKind::MethodCall(_, row) = &self.ast.expr(e).kind {
+                let turbofish = &self.ast.row(*row).turbofish;
                 self.call_user_ty = PathUserTy { self_ann: None, trait_lts: Vec::new(), trait_targs: Vec::new(), targs: Self::turbofish(self.ast, self.ast.gargs(*turbofish)) };
             }
         }
@@ -3102,7 +3109,7 @@ impl<'a> Build<'a> {
                     TyKind::Tuple(x) => self.tx.tcx.tys.list(x).to_vec(),
                     _ => Vec::new(),
                 };
-                let rest = ast.list(*v).iter().position(|x| matches!(ast.expr(*x).kind, ExprKind::Range(None, None, false)));
+                let rest = ast.list(*v).iter().position(|x| matches!(ast.expr(*x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false)));
                 let n = tys.len();
                 for (i, x) in ast.list(*v).iter().enumerate() {
                     if Some(i) == rest {
@@ -3136,7 +3143,8 @@ impl<'a> Build<'a> {
                     self.destructure_assign(*x, base.project(Proj::Field(i as u32, ft)), ft);
                 }
             }
-            ExprKind::Struct(_, fields, _, _) => {
+            ExprKind::Struct(row) => {
+                let fields = &ast.row(*row).fields;
                 let vi = match self.b.res.get(&a.0) {
                     Some(Res::Def(d)) if self.tx.prog.def(*d).kind == DefKind::Variant => self.tx.prog.def(*d).sub,
                     _ => 0,

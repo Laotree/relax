@@ -374,7 +374,7 @@ impl<'a> Ctx<'a> {
         let file = b.file as usize;
         let kind = self.u.prog.files[file].ast.expr(e).kind.clone();
         match kind {
-            ExprKind::Closure { .. } => match self.kind(t) {
+            ExprKind::Closure(_) => match self.kind(t) {
                 TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) if matches!(self.kind(captures), TyKind::Tuple(ref ts) if ts.is_empty()) => Some(Vec::new()),
                 _ => None,
             },
@@ -514,7 +514,8 @@ impl<'a> Ctx<'a> {
                 }
                 Some(v.repeat(n))
             }
-            ExprKind::Struct(_, fields, base, false) => {
+            ExprKind::Struct(row) if !self.u.prog.files[file].ast.row(row).rest => {
+                let crate::ast::StructRow { fields, base, .. } = *self.u.prog.files[file].ast.row(row);
                 let d = match b.res.get(&e.0) {
                     Some(Res::Def(d)) => *d,
                     _ => return None,
@@ -590,7 +591,8 @@ impl<'a> Ctx<'a> {
                 }
                 _ => None,
             },
-            ExprKind::MethodCall { recv, args, .. } => {
+            ExprKind::MethodCall(recv, row) => {
+                let args = self.u.prog.files[file].ast.row(row).args;
                 let m = b.methods.get(&e.0)?;
                 let (mut rv, rt) = match (m.derefs, m.autoref) {
                     (0, 0) => (self.eval(b, env, recv)?, b.ty(recv)),
@@ -678,13 +680,14 @@ impl<'a> Ctx<'a> {
                 Some(a.to_le_bytes().to_vec())
             }
             ExprKind::ConstBlock(bl) => self.offset_of(b, e, bl).or_else(|| self.block(b, env, bl)),
-            ExprKind::Block(bl, None) | ExprKind::Unsafe(bl) => self.block(b, env, bl),
+            ExprKind::Block(bl, l) if l.is_none() => self.block(b, env, bl),
+            ExprKind::Unsafe(bl) => self.block(b, env, bl),
             ExprKind::If(c, then, els) => {
                 let cv = self.eval(b, env, c)?;
                 if *cv.first()? & 1 == 1 {
                     self.block(b, env, then)
                 } else {
-                    match els {
+                    match els.get() {
                         Some(x) => self.eval(b, env, x),
                         None => Some(Vec::new()),
                     }
@@ -924,7 +927,8 @@ impl<'a> Ctx<'a> {
         let ExprKind::Call(f, args) = ast.expr(*ui).kind else { return None };
         let TyKind::FnDef(d, _, _) = self.kind(b.ty(f)) else { return None };
         if !args.is_empty() || self.u.prog.def(d).krate != self.u.core_crate || self.u.prog.name(d) != "uninit" { return None; }
-        let ExprKind::MethodCall { recv, args, .. } = ast.expr(*bi).kind else { return None };
+        let ExprKind::MethodCall(recv, mrow) = ast.expr(*bi).kind else { return None };
+        let args = ast.row(mrow).args;
         let m = b.methods.get(&bi.0)?;
         if !args.is_empty() || b.res.get(&recv.0) != Some(&Res::Local(ul)) || m.derefs != 0 || m.autoref != 1
             || self.u.prog.def(m.def).krate != self.u.core_crate || self.u.prog.name(m.def) != "as_ptr" { return None; }

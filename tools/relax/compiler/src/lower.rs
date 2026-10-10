@@ -1395,7 +1395,7 @@ impl<'a> Lcx<'a> {
         let b = self.b;
         for (k, m) in &b.methods {
             if m.autoref != 0 {
-                if let ExprKind::MethodCall { recv, .. } = &ast.expr(ExprId(*k)).kind {
+                if let ExprKind::MethodCall(recv, _) = &ast.expr(ExprId(*k)).kind {
                     self.mark_root(*recv);
                 }
             }
@@ -1686,7 +1686,7 @@ impl<'a> Lcx<'a> {
         }
         self.scan_addr_taken();
         let (params, body) = match &ast.expr(ExprId(ce)).kind {
-            ExprKind::Closure { params, body, .. } => (params.clone(), *body),
+            ExprKind::Closure(row) => { let r = ast.row(*row); (r.params.clone(), r.body) }
             // a closure slot whose expression id names something else in this parse (a code
             // cache entry made from another numbering of the file): an error, never empty code
             _ => {
@@ -3617,8 +3617,8 @@ impl<'a> Lcx<'a> {
                     self.collect_extending(*x, out);
                 }
             }
-            ExprKind::Struct(_, fields, _, _) => {
-                for f in ast.list(*fields) {
+            ExprKind::Struct(row) => {
+                for f in ast.list(ast.row(*row).fields) {
                     self.collect_extending(f.expr, out);
                 }
             }
@@ -5020,7 +5020,7 @@ impl<'a> Lcx<'a> {
                 _ => false,
             },
             // braced struct literals of promotable fields (no `..base`)
-            ExprKind::Struct(_, fields, crate::ast::OptExprId::NONE, false) => ast.list(fields).iter().all(|f| self.promotable(f.expr)),
+            ExprKind::Struct(row) if ast.row(row).base == crate::ast::OptExprId::NONE && !ast.row(row).rest => ast.list(ast.row(row).fields).iter().all(|f| self.promotable(f.expr)),
             ExprKind::Cast(x, _) => self.promotable(x),
             // an inline const (`const { .. }`, `offset_of!`'s expansion) is a constant: rustc
             // promotes it (lowered here as code; promote_rvalue stores its value statically)
@@ -5240,9 +5240,9 @@ impl<'a> Lcx<'a> {
     /// struct literal, `_`, `..` in a destructuring assignment; a place expression otherwise).
     fn assign_parts(&mut self, a: ExprId, pl: &Place, t: TyId) {
         let ast = self.ast();
-        let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(None, None, false));
+        let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(crate::ast::OptExprId::NONE, crate::ast::OptExprId::NONE, false));
         match &ast.expr(a).kind {
-            ExprKind::Paren(x) if matches!(ast.expr(*x).kind, ExprKind::Range(None, None, false)) => {
+            ExprKind::Paren(x) if matches!(ast.expr(*x).kind, ExprKind::Range(crate::ast::OptExprId::NONE, crate::ast::OptExprId::NONE, false)) => {
                 if self.needs_drop_glue(t) {
                     let ad = self.place_addr(pl, t);
                     self.drop_at(ad, t);
@@ -5363,8 +5363,8 @@ impl<'a> Lcx<'a> {
                     }
                 }
             }
-            ExprKind::Struct(_, fields, _, _) => {
-                let fields = ast.list(*fields).to_vec();
+            ExprKind::Struct(row) => {
+                let fields = ast.list(ast.row(*row).fields).to_vec();
                 let vi = match self.b.res.get(&a.0) {
                     Some(Res::Def(d)) if self.u.prog.def(*d).kind == DefKind::Variant => self.u.prog.def(*d).sub,
                     _ => 0,
@@ -5898,7 +5898,7 @@ impl<'a> Lcx<'a> {
                 self.overflow_checks = previous;
                 value
             },
-            ExprKind::If(c, then, els) => self.lower_if(*c, *then, *els, t),
+            ExprKind::If(c, then, els) => self.lower_if(*c, *then, els.get(), t),
             ExprKind::Let(p, x) => {
                 // only reached as a bare condition (`if let` handles its own); evaluate as a test
                 let xt = self.body_ty(*x);
@@ -5918,7 +5918,8 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![res])
             }
             ExprKind::Match(x, arms) => self.lower_match(*x, ast.list(*arms), t),
-            ExprKind::While(c, b, label) => {
+            ExprKind::While(row) => {
+                let crate::ast::WhileRow { cond: c, body: b, label } = ast.row(*row);
                 // `while let p = e { body }` is `loop { match e { p => body, _ => break } }`
                 // (rustc desugaring): the bindings and the scrutinee temporary live for one
                 // iteration and are dropped at its end, on `continue`/`break`, and when the
@@ -5978,7 +5979,8 @@ impl<'a> Lcx<'a> {
                 }
                 self.read_place(&res, t)
             }
-            ExprKind::For(p, it, b, label) => {
+            ExprKind::For(row) => {
+                let crate::ast::ForRow { pat: p, iter: it, body: b, label } = ast.row(*row);
                 self.lower_for(*p, *it, *b, *label);
                 self.unit()
             }
@@ -5986,7 +5988,7 @@ impl<'a> Lcx<'a> {
                 let l = label.map(|y| self.lifetime_sym(y));
                 let idx = self.loop_index(l);
                 if let Some(i) = idx {
-                    if let Some(v) = x {
+                    if let Some(v) = &x.get() {
                         let val = self.lower_expr(*v);
                         if let Some((pl, pt)) = self.loops[i].result.clone() {
                             self.write_place(&pl, pt, val);
@@ -6016,7 +6018,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Try(x) => self.lower_try(e, *x, t),
             ExprKind::Return(x) => {
                 let rt = self.ret_ty;
-                let v = match x {
+                let v = match &x.get() {
                     Some(v) => self.lower_expr_coerced(*v, rt),
                     None => self.unit(),
                 };
@@ -6179,16 +6181,16 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![a])
             }
             ExprKind::Call(f, args) => self.lower_call(e, *f, ast.list(*args), t),
-            ExprKind::MethodCall { recv, args, .. } => self.lower_method(e, *recv, ast.list(*args), t),
-            ExprKind::Struct(_, fields, base, rest) => self.lower_struct_lit(e, ast.list(*fields), base.get(), *rest, t),
+            ExprKind::MethodCall(recv, row) => self.lower_method(e, *recv, ast.list(ast.row(*row).args), t),
+            ExprKind::Struct(row) => { let crate::ast::StructRow { fields, base, rest, .. } = ast.row(*row); self.lower_struct_lit(e, ast.list(*fields), base.get(), *rest, t) }
             ExprKind::Range(a, b, _) => {
                 // Range { start, end } as a plain struct value
                 let mut vals = Vec::new();
                 let tys = self.range_field_tys(t);
-                if let Some(a) = a {
+                if let Some(a) = &a.get() {
                     vals.push((self.lower_expr(*a), tys[0]));
                 }
-                if let Some(b) = b {
+                if let Some(b) = &b.get() {
                     let ft = if tys.len() > 1 { tys[1] } else { tys[0] };
                     vals.push((self.lower_expr(*b), ft));
                 }
@@ -6202,9 +6204,9 @@ impl<'a> Lcx<'a> {
                 }
                 self.build_record(t, 0, vals)
             }
-            ExprKind::Closure { is_move, .. } => {
+            ExprKind::Closure(row) => {
                 // the closure value is its captured state; its code is a function of its own
-                let is_move = *is_move;
+                let is_move = ast.row(*row).is_move;
                 self.closure_fn(e);
                 let caps = self.storage_for_closure(e.0).roots.clone();
                 if caps.is_empty() {
@@ -6262,7 +6264,7 @@ impl<'a> Lcx<'a> {
                 self.build_coroutine(e.0, t)
             }
             ExprKind::Await(x) => self.lower_await(e, *x, t),
-            ExprKind::Mac(m) => self.lower_mac(e, m, t),
+            ExprKind::Mac(m) => self.lower_mac(e, ast.row(*m), t),
             _ => {
                 self.err(ex.lo, "unsupported expression in lowering".to_string());
                 self.unit()
@@ -8993,7 +8995,7 @@ impl<'a> Lcx<'a> {
     /// The position of a method call's name (`f` in `a.f(x)`).
     fn method_name_pos(&self, e: ExprId) -> u32 {
         match &self.ast().expr(e).kind {
-            ExprKind::MethodCall { name, .. } => name.lo,
+            ExprKind::MethodCall(_, row) => self.ast().row(*row).name.lo,
             _ => self.pos,
         }
     }

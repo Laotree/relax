@@ -94,6 +94,37 @@ impl<T> std::fmt::Debug for List<T> {
     }
 }
 
+/// One entry of one of its tree's row arrays (Ast::row): the big, rare payload of a node kept
+/// out of the node so the hot nodes stay small.
+pub struct Row<T> {
+    pub id: u32,
+    _t: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> Row<T> {
+    #[inline]
+    pub fn new(id: u32) -> Row<T> {
+        Row { id, _t: std::marker::PhantomData }
+    }
+}
+impl<T> Clone for Row<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Row<T> {}
+impl<T> PartialEq for Row<T> {
+    fn eq(&self, o: &Self) -> bool {
+        self.id == o.id
+    }
+}
+impl<T> Eq for Row<T> {}
+impl<T> std::fmt::Debug for Row<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Row({})", self.id)
+    }
+}
+
 /// The flat arrays a tree's lists live in (index into Ast::base).
 pub trait FlatArray<T> {
     const BASE: usize;
@@ -291,6 +322,66 @@ impl FlatArray<ItemId> for Ast {
     }
 }
 
+impl FlatArray<MethodCallRow> for Ast {
+    const BASE: usize = 31;
+    fn array(a: &Ast) -> &[MethodCallRow] {
+        &a.method_calls
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<MethodCallRow> {
+        a.method_calls.vec_mut()
+    }
+}
+
+impl FlatArray<ForRow> for Ast {
+    const BASE: usize = 32;
+    fn array(a: &Ast) -> &[ForRow] {
+        &a.for_exprs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ForRow> {
+        a.for_exprs.vec_mut()
+    }
+}
+
+impl FlatArray<ClosureRow> for Ast {
+    const BASE: usize = 33;
+    fn array(a: &Ast) -> &[ClosureRow] {
+        &a.closure_exprs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ClosureRow> {
+        a.closure_exprs.vec_mut()
+    }
+}
+
+impl FlatArray<StructRow> for Ast {
+    const BASE: usize = 34;
+    fn array(a: &Ast) -> &[StructRow] {
+        &a.struct_exprs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<StructRow> {
+        a.struct_exprs.vec_mut()
+    }
+}
+
+impl FlatArray<MacCall> for Ast {
+    const BASE: usize = 35;
+    fn array(a: &Ast) -> &[MacCall] {
+        &a.mac_calls
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<MacCall> {
+        a.mac_calls.vec_mut()
+    }
+}
+
+impl FlatArray<WhileRow> for Ast {
+    const BASE: usize = 36;
+    fn array(a: &Ast) -> &[WhileRow] {
+        &a.while_exprs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<WhileRow> {
+        a.while_exprs.vec_mut()
+    }
+}
+
 impl FlatArray<WherePred> for Ast {
     const BASE: usize = 30;
     fn array(a: &Ast) -> &[WherePred] {
@@ -373,6 +464,54 @@ impl OptExprId {
     #[inline]
     pub fn from(e: Option<ExprId>) -> OptExprId {
         e.map_or(OptExprId::NONE, |e| OptExprId(e.0))
+    }
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0 != u32::MAX
+    }
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+    #[inline]
+    pub fn map<U>(self, f: impl FnOnce(ExprId) -> U) -> Option<U> {
+        self.get().map(f)
+    }
+    #[inline]
+    pub fn map_or<U>(self, d: U, f: impl FnOnce(ExprId) -> U) -> U {
+        self.get().map_or(d, f)
+    }
+}
+
+/// An optional name (a label) in 8 bytes (lo == u32::MAX: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptIdent(Ident);
+
+impl OptIdent {
+    pub const NONE: OptIdent = OptIdent(Ident { lo: u32::MAX, hi: u32::MAX });
+    #[inline]
+    pub fn get(self) -> Option<Ident> {
+        if self.0.lo == u32::MAX {
+            None
+        } else {
+            Some(self.0)
+        }
+    }
+    #[inline]
+    pub fn from(i: Option<Ident>) -> OptIdent {
+        i.map_or(OptIdent::NONE, OptIdent)
+    }
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.0.lo == u32::MAX
+    }
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0.lo != u32::MAX
+    }
+    #[inline]
+    pub fn map<U>(self, f: impl FnOnce(Ident) -> U) -> Option<U> {
+        self.get().map(f)
     }
 }
 
@@ -731,6 +870,50 @@ pub struct ClosureParam {
     pub ty: Option<TyId>,
 }
 
+/// `recv.name::<turbofish>(args)` without the receiver.
+#[derive(Debug, Clone, Copy)]
+pub struct MethodCallRow {
+    pub name: Ident,
+    pub turbofish: GenericArgsId,
+    pub args: List<ExprId>,
+}
+
+/// `'label: while cond body`
+#[derive(Debug, Clone, Copy)]
+pub struct WhileRow {
+    pub cond: ExprId,
+    pub body: BlockId,
+    pub label: Option<Ident>,
+}
+
+/// `'label: for pat in iter body`
+#[derive(Debug, Clone, Copy)]
+pub struct ForRow {
+    pub pat: PatId,
+    pub iter: ExprId,
+    pub body: BlockId,
+    pub label: Option<Ident>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClosureRow {
+    pub is_move: bool,
+    pub is_async: bool,
+    pub params: List<ClosureParam>,
+    pub ret: Option<TyId>,
+    pub body: ExprId,
+}
+
+/// `S { fields, ..base }`; `rest`: a bare `..` (rustc default_field_values: the omitted fields
+/// take their declared defaults)
+#[derive(Debug, Clone, Copy)]
+pub struct StructRow {
+    pub path: Path,
+    pub fields: List<FieldExpr>,
+    pub base: OptExprId,
+    pub rest: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ExprKind {
     Lit(LitKind),
@@ -740,51 +923,39 @@ pub enum ExprKind {
     Assign(ExprId, ExprId),
     AssignOp(BinOp, ExprId, ExprId),
     Call(ExprId, List<ExprId>),
-    MethodCall {
-        recv: ExprId,
-        name: Ident,
-        turbofish: GenericArgsId,
-        args: List<ExprId>,
-    },
+    /// the receiver and the call's row (name, turbofish, arguments)
+    MethodCall(ExprId, Row<MethodCallRow>),
     Field(ExprId, Ident),
     TupleField(ExprId, u32),
     Index(ExprId, ExprId),
     AddrOf(bool, bool, ExprId), // (raw, mut, expr)
     Cast(ExprId, TyId),
-    Block(BlockId, Option<Ident>),
+    Block(BlockId, OptIdent),
     Unsafe(BlockId),
     /// `async { }` / `async move { }` / an async closure's body (ASYNC_*)
     Async(u8, BlockId),
     ConstBlock(BlockId),
-    If(ExprId, BlockId, Option<ExprId>),
+    If(ExprId, BlockId, OptExprId),
     Let(PatId, ExprId),
     Match(ExprId, List<Arm>),
-    While(ExprId, BlockId, Option<Ident>),
-    Loop(BlockId, Option<Ident>),
-    For(PatId, ExprId, BlockId, Option<Ident>),
-    Break(Option<Ident>, Option<ExprId>),
-    Continue(Option<Ident>),
-    Return(Option<ExprId>),
-    Closure {
-        is_move: bool,
-        is_async: bool,
-        params: List<ClosureParam>,
-        ret: Option<TyId>,
-        body: ExprId,
-    },
+    While(Row<WhileRow>),
+    Loop(BlockId, OptIdent),
+    For(Row<ForRow>),
+    Break(OptIdent, OptExprId),
+    Continue(OptIdent),
+    Return(OptExprId),
+    Closure(Row<ClosureRow>),
     Tuple(List<ExprId>),
     Array(List<ExprId>),
     Repeat(ExprId, ExprId),
-    /// `S { fields, ..base }`; the bool: a bare `..` (rustc default_field_values: the omitted
-    /// fields take their declared defaults)
-    Struct(Path, List<FieldExpr>, OptExprId, bool),
-    Range(Option<ExprId>, Option<ExprId>, bool),
+    Struct(Row<StructRow>),
+    Range(OptExprId, OptExprId, bool),
     Try(ExprId),
     Await(ExprId),
-    Mac(MacCall),
+    Mac(Row<MacCall>),
     Paren(ExprId),
     Underscore,
-    Yield(Option<ExprId>),
+    Yield(OptExprId),
     Box(ExprId),
 }
 
@@ -794,6 +965,10 @@ pub struct Expr {
     pub lo: u32,
     pub hi: u32,
 }
+
+// Expr used to be 44 bytes (ExprKind 36); the big, rare payloads live in rows, labels and optional ids are 8 / 4 bytes.
+const _: () = assert!(std::mem::size_of::<ExprKind>() == 16);
+const _: () = assert!(std::mem::size_of::<Expr>() == 24);
 
 #[derive(Debug, Clone, Copy)]
 pub enum Stmt {
@@ -942,7 +1117,35 @@ pub enum ItemKind {
 }
 
 /// Number of id ranges a tree has (Ast::base / Ast::ends).
-pub const ARENAS: usize = 31;
+pub const ARENAS: usize = 37;
+
+/// Ast::base (an array of more than 32 entries has no Default).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bases(pub [u32; ARENAS]);
+
+impl Default for Bases {
+    fn default() -> Self {
+        Bases([0; ARENAS])
+    }
+}
+impl std::ops::Deref for Bases {
+    type Target = [u32; ARENAS];
+    #[inline]
+    fn deref(&self) -> &[u32; ARENAS] {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Bases {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut [u32; ARENAS] {
+        &mut self.0
+    }
+}
+impl From<[u32; ARENAS]> for Bases {
+    fn from(b: [u32; ARENAS]) -> Bases {
+        Bases(b)
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Ast {
@@ -990,9 +1193,17 @@ pub struct Ast {
     pub use_trees: crate::arena::Arena<UseTree>,
     pub item_lists: crate::arena::Arena<ItemId>,
     pub where_preds: crate::arena::Arena<WherePred>,
+    /// the big, rare payloads of expression nodes (ExprKind::MethodCall / For / Closure / Struct
+    /// / Mac): Row<T> indexes them
+    pub method_calls: crate::arena::Arena<MethodCallRow>,
+    pub for_exprs: crate::arena::Arena<ForRow>,
+    pub closure_exprs: crate::arena::Arena<ClosureRow>,
+    pub struct_exprs: crate::arena::Arena<StructRow>,
+    pub mac_calls: crate::arena::Arena<MacCall>,
+    pub while_exprs: crate::arena::Arena<WhileRow>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
-    pub base: [u32; ARENAS],
+    pub base: Bases,
     /// the fn bodies the file's parse skipped (FnSig::lazy_body), parsed on the first need of
     /// any of them (parser::ParsedFile::part): their nodes, ids after this tree's
     pub part: std::sync::OnceLock<Box<Ast>>,
@@ -1138,6 +1349,28 @@ impl Ast {
             None => self.part_or_panic("list", l.lo).list(l),
         }
     }
+    /// A row (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn row<T>(&self, r: Row<T>) -> &T
+    where
+        Ast: FlatArray<T>,
+    {
+        match <Ast as FlatArray<T>>::array(self).get(r.id.wrapping_sub(self.base[<Ast as FlatArray<T>>::BASE]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("row", r.id).row(r),
+        }
+    }
+    /// Stores a row (a tree being built).
+    pub fn push_row<T>(&mut self, x: T) -> Row<T>
+    where
+        Ast: FlatArray<T>,
+    {
+        let b = self.base[<Ast as FlatArray<T>>::BASE];
+        let a = <Ast as FlatArray<T>>::array_mut(self);
+        let id = b + a.len() as u32;
+        a.push(x);
+        Row::new(id)
+    }
     /// Stores a list's entries (a tree being built).
     pub fn push_list<T>(&mut self, v: Vec<T>) -> List<T>
     where
@@ -1196,6 +1429,12 @@ impl Ast {
             self.base[28] + self.use_trees.len() as u32,
             self.base[29] + self.item_lists.len() as u32,
             self.base[30] + self.where_preds.len() as u32,
+            self.base[31] + self.method_calls.len() as u32,
+            self.base[32] + self.for_exprs.len() as u32,
+            self.base[33] + self.closure_exprs.len() as u32,
+            self.base[34] + self.struct_exprs.len() as u32,
+            self.base[35] + self.mac_calls.len() as u32,
+            self.base[36] + self.while_exprs.len() as u32,
         ]
     }
     #[cold]
@@ -1241,6 +1480,12 @@ impl Ast {
         self.use_trees.shrink_to_fit();
         self.item_lists.shrink_to_fit();
         self.where_preds.shrink_to_fit();
+        self.method_calls.shrink_to_fit();
+        self.for_exprs.shrink_to_fit();
+        self.closure_exprs.shrink_to_fit();
+        self.struct_exprs.shrink_to_fit();
+        self.mac_calls.shrink_to_fit();
+        self.while_exprs.shrink_to_fit();
     }
     /// Mutable block (cfg stripping of a tree being built).
     pub fn block_mut(&mut self, id: BlockId) -> &mut Block {

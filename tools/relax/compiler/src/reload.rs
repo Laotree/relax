@@ -407,8 +407,10 @@ fn literal_initializer(pf: &crate::parser::ParsedFile, e: crate::ast::ExprId, de
         ExprKind::Paren(x) | ExprKind::Unary(UnOp::Neg, x) | ExprKind::AddrOf(false, false, x) => literal_initializer(pf, x, depth + 1),
         ExprKind::Tuple(xs) | ExprKind::Array(xs) => pf.ast.list(xs).iter().all(|&x| literal_initializer(pf, x, depth + 1)),
         ExprKind::Repeat(x, n) => matches!(pf.ast.expr(n).kind, ExprKind::Lit(_)) && literal_initializer(pf, x, depth + 1),
-        ExprKind::Struct(_, fields, base, defaults) => base.get().is_none() && !defaults
-            && pf.ast.list(fields).iter().all(|f| literal_initializer(pf, f.expr, depth + 1)),
+        ExprKind::Struct(row) => {
+            let crate::ast::StructRow { fields, base, rest: defaults, .. } = *pf.ast.row(row);
+            base.get().is_none() && !defaults && pf.ast.list(fields).iter().all(|f| literal_initializer(pf, f.expr, depth + 1))
+        }
         _ => false,
     }
 }

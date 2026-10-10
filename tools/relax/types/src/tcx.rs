@@ -2092,7 +2092,7 @@ impl Tcx {
         // rustc_ast_lowering/src/lib.rs:3005-3013: one block unwrap,
         // not recursive evaluation of arbitrary generic const expressions.
         let unwrapped = match expr.kind {
-            ast::ExprKind::Block(block, None) => match pf.ast.stmts(block) {
+            ast::ExprKind::Block(block, l) if l.is_none() => match pf.ast.stmts(block) {
                 [ast::Stmt::Expr(inner, false)] => *inner,
                 _ => e,
             },

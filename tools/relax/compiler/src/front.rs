@@ -28,7 +28,7 @@ const S_AST: u32 = 100;
 /// The tree's arrays (every Ast arena), in section order.
 macro_rules! ast_arrays {
     ($m:ident) => {
-        $m!(exprs: Expr, pats: Pat, tys: Ty, blocks: Block, root_attrs: Attr, root_items: ItemId, mac_args: MacArgs, path_segs: PathSeg, stmts: Stmt, expr_lists: ExprId, pat_lists: PatId, ty_lists: TyId, field_exprs: FieldExpr, arms: Arm, closure_params: ClosureParam, field_pats: FieldPat, qselfs: QSelf, generic_args: GenericArgs, fn_ptrs: FnPtr, generic_arg_lists: GenericArg, bounds: Bound, generic_params: GenericParam, ident_lists: Ident, attrs: Attr, asm_ops: AsmOp, items: Item, fn_sigs: FnSig, params: Param, field_defs: FieldDef, variants: Variant, use_trees: UseTree, item_lists: ItemId, where_preds: WherePred)
+        $m!(exprs: Expr, pats: Pat, tys: Ty, blocks: Block, root_attrs: Attr, root_items: ItemId, mac_args: MacArgs, path_segs: PathSeg, stmts: Stmt, expr_lists: ExprId, pat_lists: PatId, ty_lists: TyId, field_exprs: FieldExpr, arms: Arm, closure_params: ClosureParam, field_pats: FieldPat, qselfs: QSelf, generic_args: GenericArgs, fn_ptrs: FnPtr, generic_arg_lists: GenericArg, bounds: Bound, generic_params: GenericParam, ident_lists: Ident, attrs: Attr, asm_ops: AsmOp, items: Item, fn_sigs: FnSig, params: Param, field_defs: FieldDef, variants: Variant, use_trees: UseTree, item_lists: ItemId, where_preds: WherePred, method_calls: MethodCallRow, for_exprs: ForRow, closure_exprs: ClosureRow, struct_exprs: StructRow, mac_calls: MacCall, while_exprs: WhileRow)
     };
 }
 

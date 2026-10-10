@@ -1321,6 +1321,12 @@ impl<'a> Parser<'a> {
         self.ast.use_trees.truncate((ends[28] - self.ast.base[28]) as usize);
         self.ast.item_lists.truncate((ends[29] - self.ast.base[29]) as usize);
         self.ast.where_preds.truncate((ends[30] - self.ast.base[30]) as usize);
+        self.ast.method_calls.truncate((ends[31] - self.ast.base[31]) as usize);
+        self.ast.for_exprs.truncate((ends[32] - self.ast.base[32]) as usize);
+        self.ast.closure_exprs.truncate((ends[33] - self.ast.base[33]) as usize);
+        self.ast.struct_exprs.truncate((ends[34] - self.ast.base[34]) as usize);
+        self.ast.mac_calls.truncate((ends[35] - self.ast.base[35]) as usize);
+        self.ast.while_exprs.truncate((ends[36] - self.ast.base[36]) as usize);
         self.extra_items.truncate(lens.6);
         match r? {
             Some(_) => Ok(()),
@@ -2388,7 +2394,7 @@ impl<'a> Parser<'a> {
         match self.kind() {
             T::OpenBrace => {
                 let b = self.block()?;
-                Ok(self.mk_expr(ExprKind::Block(b, None), lo))
+                Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
             }
             T::Minus => {
                 self.pos += 1;
@@ -2913,7 +2919,7 @@ impl<'a> Parser<'a> {
                     Some(e) => e,
                     None => {
                         let args = self.mac_args(&path, toks);
-                        self.mk_expr(ExprKind::Mac(MacCall { path, delim, toks, args }), lo)
+                        { let m = self.ast.push_row(MacCall { path, delim, toks, args }); self.mk_expr(ExprKind::Mac(m), lo) }
                     }
                 };
                 if matches!(self.kind(), T::Dot | T::Question) {
@@ -2994,7 +3000,7 @@ impl<'a> Parser<'a> {
         let lhs = if matches!(self.kind(), T::DotDot | T::DotDotEq) {
             let incl = self.bump().kind == T::DotDotEq;
             let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
-            self.mk_expr(ExprKind::Range(None, rhs, incl), lo)
+            self.mk_expr(ExprKind::Range(OptExprId::NONE, OptExprId::from(rhs), incl), lo)
         } else {
             self.unary(r)?
         };
@@ -3051,7 +3057,7 @@ impl<'a> Parser<'a> {
             } else if prec == P_RANGE {
                 let incl = k == T::DotDotEq;
                 let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
-                lhs = self.mk_expr(ExprKind::Range(Some(lhs), rhs, incl), lo);
+                lhs = self.mk_expr(ExprKind::Range(OptExprId::from(Some(lhs)), OptExprId::from(rhs), incl), lo);
             } else if prec == P_AS {
                 let ty = self.ty()?;
                 lhs = self.mk_expr(ExprKind::Cast(lhs, ty), lo);
@@ -3132,7 +3138,8 @@ impl<'a> Parser<'a> {
                             if self.kind() == T::OpenParen {
                                 let args = self.call_args()?;
                                 let args = self.ast.push_list(args);
-                                e = self.mk_expr(ExprKind::MethodCall { recv: e, name, turbofish, args }, lo);
+                                let row = self.ast.push_row(MethodCallRow { name, turbofish, args });
+                                e = self.mk_expr(ExprKind::MethodCall(e, row), lo);
                             } else {
                                 e = self.mk_expr(ExprKind::Field(e, name), lo);
                             }
@@ -3280,7 +3287,7 @@ impl<'a> Parser<'a> {
             }
             T::OpenBrace => {
                 let b = self.block()?;
-                Ok(self.mk_expr(ExprKind::Block(b, None), lo))
+                Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
             }
             T::KwUnsafe => {
                 self.pos += 1;
@@ -3303,7 +3310,7 @@ impl<'a> Parser<'a> {
                     T::KwFor => self.for_expr(label, lo),
                     T::OpenBrace => {
                         let b = self.block()?;
-                        Ok(self.mk_expr(ExprKind::Block(b, label), lo))
+                        Ok(self.mk_expr(ExprKind::Block(b, OptIdent::from(label)), lo))
                     }
                     _ => self.err("expected loop or block after label"),
                 }
@@ -3361,12 +3368,12 @@ impl<'a> Parser<'a> {
             T::KwReturn => {
                 self.pos += 1;
                 let e = if self.can_begin_expr(r) { Some(self.expr_bp(0, r)?) } else { None };
-                Ok(self.mk_expr(ExprKind::Return(e), lo))
+                Ok(self.mk_expr(ExprKind::Return(OptExprId::from(e)), lo))
             }
             T::KwYield => {
                 self.pos += 1;
                 let e = if self.can_begin_expr(r) { Some(self.expr_bp(0, r)?) } else { None };
-                Ok(self.mk_expr(ExprKind::Yield(e), lo))
+                Ok(self.mk_expr(ExprKind::Yield(OptExprId::from(e)), lo))
             }
             T::KwBreak => {
                 self.pos += 1;
@@ -3377,7 +3384,7 @@ impl<'a> Parser<'a> {
                     None
                 };
                 let e = if self.can_begin_expr(r) && !(self.kind() == T::Lifetime) { Some(self.expr_bp(0, r)?) } else { None };
-                Ok(self.mk_expr(ExprKind::Break(label, e), lo))
+                Ok(self.mk_expr(ExprKind::Break(OptIdent::from(label), OptExprId::from(e)), lo))
             }
             T::KwContinue => {
                 self.pos += 1;
@@ -3387,7 +3394,7 @@ impl<'a> Parser<'a> {
                 } else {
                     None
                 };
-                Ok(self.mk_expr(ExprKind::Continue(label), lo))
+                Ok(self.mk_expr(ExprKind::Continue(OptIdent::from(label)), lo))
             }
             T::Or | T::OrOr | T::KwMove => self.closure(false, r, lo),
             T::KwStatic if matches!(self.nth(1), T::Or | T::OrOr | T::KwMove) => {
@@ -3428,7 +3435,7 @@ impl<'a> Parser<'a> {
                         return Ok(e);
                     }
                     let args = self.mac_args(&path, toks);
-                    return Ok(self.mk_expr(ExprKind::Mac(MacCall { path, delim, toks, args }), lo));
+                    return Ok({ let m = self.ast.push_row(MacCall { path, delim, toks, args }); self.mk_expr(ExprKind::Mac(m), lo) });
                 }
                 if self.kind() == T::OpenBrace && r & NO_STRUCT == 0 {
                     return self.struct_expr(path, lo);
@@ -3476,7 +3483,8 @@ impl<'a> Parser<'a> {
         }
         self.expect(T::CloseBrace)?;
         let fields = self.ast.push_list(fields);
-        Ok(self.mk_expr(ExprKind::Struct(path, fields, OptExprId::from(base), rest), lo))
+        let row = self.ast.push_row(StructRow { path, fields, base: OptExprId::from(base), rest });
+        Ok(self.mk_expr(ExprKind::Struct(row), lo))
     }
 
     fn closure(&mut self, is_async: bool, r: u8, lo: u32) -> PResult<ExprId> {
@@ -3504,7 +3512,7 @@ impl<'a> Parser<'a> {
             let ty = self.ty()?;
             let blo = self.lo();
             let b = self.block()?;
-            (Some(ty), self.mk_expr(ExprKind::Block(b, None), blo))
+            (Some(ty), self.mk_expr(ExprKind::Block(b, OptIdent::NONE), blo))
         } else {
             (None, self.expr_bp(0, r)?)
         };
@@ -3530,10 +3538,12 @@ impl<'a> Parser<'a> {
             let b = BlockId(self.ast.base[3] + self.ast.blocks.len() as u32 - 1);
             let fut = self.mk_expr(ExprKind::Async(crate::ast::ASYNC_CLOSURE_BODY, b), blo);
             let params = self.ast.push_list(params);
-            return Ok(self.mk_expr(ExprKind::Closure { is_move, is_async, params, ret: None, body: fut }, lo));
+            let row = self.ast.push_row(ClosureRow { is_move, is_async, params, ret: None, body: fut });
+            return Ok(self.mk_expr(ExprKind::Closure(row), lo));
         }
         let params = self.ast.push_list(params);
-        Ok(self.mk_expr(ExprKind::Closure { is_move, is_async, params, ret, body }, lo))
+        let row = self.ast.push_row(ClosureRow { is_move, is_async, params, ret, body });
+        Ok(self.mk_expr(ExprKind::Closure(row), lo))
     }
 
     fn if_expr(&mut self, lo: u32) -> PResult<ExprId> {
@@ -3546,24 +3556,25 @@ impl<'a> Parser<'a> {
                 Some(self.if_expr(elo)?)
             } else {
                 let b = self.block()?;
-                Some(self.mk_expr(ExprKind::Block(b, None), elo))
+                Some(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), elo))
             }
         } else {
             None
         };
-        Ok(self.mk_expr(ExprKind::If(cond, then, els), lo))
+        Ok(self.mk_expr(ExprKind::If(cond, then, OptExprId::from(els)), lo))
     }
 
     fn loop_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwLoop)?;
         let b = self.block()?;
-        Ok(self.mk_expr(ExprKind::Loop(b, label), lo))
+        Ok(self.mk_expr(ExprKind::Loop(b, OptIdent::from(label)), lo))
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
         let c = self.expr_ns()?;
         let b = self.block()?;
-        Ok(self.mk_expr(ExprKind::While(c, b, label), lo))
+        let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
+        Ok(self.mk_expr(ExprKind::While(row), lo))
     }
     fn for_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwFor)?;
@@ -3571,7 +3582,8 @@ impl<'a> Parser<'a> {
         self.expect(T::KwIn)?;
         let it = self.expr_ns()?;
         let b = self.block()?;
-        Ok(self.mk_expr(ExprKind::For(p, it, b, label), lo))
+        let row = self.ast.push_row(ForRow { pat: p, iter: it, body: b, label });
+        Ok(self.mk_expr(ExprKind::For(row), lo))
     }
 }
 
@@ -4347,7 +4359,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     p.sources = pf.sources.clone();
     let mut ast_tail = &pf.ast;
     while let Some(next) = ast_tail.part.get() { ast_tail = next; }
-    p.ast.base = ast_tail.ends();
+    p.ast.base = ast_tail.ends().into();
     let (n_ext, n_toks, n_rules) = (pf.src.len() - n_src, pf.toks.len(), pf.rules_exp.len());
     p.krate = ctx.krate.clone();
     p.bctx = Some(std::rc::Rc::new(crate::builtins::FileCtx::new(&ctx.krate, &ctx.path, &ctx.module_path, cfg)));

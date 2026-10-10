@@ -219,7 +219,8 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 } else { self.consume_expr(x); self.consume_expr(y); }
             }
             ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Box(x) | ExprKind::Try(x) => self.consume_expr(x),
-            ExprKind::MethodCall { recv, args, .. } => {
+            ExprKind::MethodCall(recv, row) => {
+                let args = self.ast().row(row).args;
                 if let Some(m) = self.body.methods.get(&e.0) { self.receiver(recv, e.0, m.derefs as usize, m.autoref); }
                 else { self.errors.push((e.0, "missing method callee")); }
                 for x in self.ast().list(args).to_vec() { self.consume_expr(x); }
@@ -243,9 +244,9 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 for x in self.ast().list(args).to_vec() { self.consume_expr(x); }
             }
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) | ExprKind::Loop(b, _) => self.walk_block(b),
-            ExprKind::If(c, b, el) => { self.consume_expr(c); self.walk_block(b); if let Some(x) = el { self.consume_expr(x); } }
-            ExprKind::While(c, b, _) => { self.consume_expr(c); self.walk_block(b); }
-            ExprKind::For(_, x, b, _) => { self.consume_expr(x); self.walk_block(b); }
+            ExprKind::If(c, b, el) => { self.consume_expr(c); self.walk_block(b); if let Some(x) = el.get() { self.consume_expr(x); } }
+            ExprKind::While(row) => { let crate::ast::WhileRow { cond: c, body: b, .. } = *self.ast().row(row); self.consume_expr(c); self.walk_block(b); }
+            ExprKind::For(row) => { let crate::ast::ForRow { iter: x, body: b, .. } = *self.ast().row(row); self.consume_expr(x); self.walk_block(b); }
             ExprKind::Let(pat, x) => {
                 if let Some(p) = self.adjusted_place(x, false) {
                     self.delegate.borrow(p.clone(), BorrowKind::Imm);
@@ -262,7 +263,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                     self.consume_expr(a.body);
                 }
             }
-            ExprKind::Closure { .. } | ExprKind::Async(..) => {
+            ExprKind::Closure(_) | ExprKind::Async(..) => {
                 if let Some(caps) = self.body.min_captures.get(&e.0).cloned() {
                     for (p, cause) in caps.fake_reads { self.delegate.fake_read(p, cause); }
                     for c in caps.captures {
@@ -273,7 +274,8 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
             }
             ExprKind::Tuple(v) | ExprKind::Array(v) => for x in self.ast().list(v).to_vec() { self.consume_expr(x); },
             ExprKind::Repeat(x, _) => self.consume_expr(x),
-            ExprKind::Struct(_, fs, base, _) => {
+            ExprKind::Struct(row) => {
+                let crate::ast::StructRow { fields: fs, base, .. } = *self.ast().row(row);
                 let fs = self.ast().list(fs).to_vec();
                 for f in &fs { self.consume_expr(f.expr); }
                 if let Some(x) = base.get() {
@@ -288,9 +290,9 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                     }
                 }
             }
-            ExprKind::Range(a, b, _) => for x in [a, b].into_iter().flatten() { self.consume_expr(x); },
-            ExprKind::Return(x) | ExprKind::Break(_, x) | ExprKind::Yield(x) => if let Some(x) = x { self.consume_expr(x); },
-            ExprKind::Mac(m) => self.walk_macro(e, m),
+            ExprKind::Range(a, b, _) => for x in [a.get(), b.get()].into_iter().flatten() { self.consume_expr(x); },
+            ExprKind::Return(x) | ExprKind::Break(_, x) | ExprKind::Yield(x) => if let Some(x) = x.get() { self.consume_expr(x); },
+            ExprKind::Mac(m) => { let m = *self.ast().row(m); self.walk_macro(e, m) }
             ExprKind::Await(x) => self.consume_expr(x),
             ExprKind::Lit(_) | ExprKind::Continue(_) | ExprKind::ConstBlock(_) | ExprKind::Underscore => (),
         }
@@ -301,12 +303,12 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
     fn walk_assignee(&mut self, e: ExprId, source: Option<Place>, ty: Type) {
         match self.ast().expr(e).kind {
             ExprKind::Paren(x) => self.walk_assignee(x, source, ty),
-            ExprKind::Underscore | ExprKind::Range(None, None, false) => (),
+            ExprKind::Underscore | ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false) => (),
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
                 let xs = self.ast().list(xs).to_vec();
                 let array = matches!(self.tx.kind(ty), TyKind::Array(..));
                 let n = match self.tx.kind(ty) { TyKind::Array(_, n) => n.try_to_target_usize(&self.tx.tcx.tys).expect("array length in expression use") as usize, _ => self.tx.n_fields(ty, 0) };
-                let rest = xs.iter().position(|x| matches!(self.ast().expr(*x).kind, ExprKind::Range(None, None, false)));
+                let rest = xs.iter().position(|x| matches!(self.ast().expr(*x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false)));
                 for (i, x) in xs.iter().enumerate() {
                     if Some(i) == rest { continue; }
                     let fi = if rest.is_some_and(|r| i > r) { n - (xs.len() - i) } else { i } as u32;
@@ -314,7 +316,8 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                     if let Some(ft) = ft { self.walk_assignee(*x, source.clone().map(|p| p.project(if array { Projection::Index } else { Projection::Field(0, fi) }, ft)), ft); }
                 }
             }
-            ExprKind::Struct(_, fs, _, _) => {
+            ExprKind::Struct(row) => {
+                let fs = self.ast().row(row).fields;
                 for f in self.ast().list(fs).to_vec() {
                     let name = self.tx.prog.files[self.body.file as usize].text(f.name);
                     for fi in 0..self.tx.n_fields(ty, 0) as u32 {
@@ -329,7 +332,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 let vi = match self.body.res.get(&f.0) { Some(Res::Def(d)) if self.tx.prog.def(*d).kind == DefKind::Variant => self.tx.prog.def(*d).sub, _ => 0 };
                 let xs = self.ast().list(xs).to_vec();
                 let n = self.tx.n_fields(ty, vi);
-                let rest = xs.iter().position(|x| matches!(self.ast().expr(*x).kind, ExprKind::Range(None, None, false)));
+                let rest = xs.iter().position(|x| matches!(self.ast().expr(*x).kind, ExprKind::Range(OptExprId::NONE, OptExprId::NONE, false)));
                 for (i, x) in xs.iter().enumerate() {
                     if Some(i) == rest { continue; }
                     let fi = if rest.is_some_and(|r| i > r) { n - (xs.len() - i) } else { i } as u32;

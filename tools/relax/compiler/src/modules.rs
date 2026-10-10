@@ -108,7 +108,7 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
         for e in &ast.exprs {
             match &e.kind {
                 ExprKind::Unsafe(_) => out.push(format!("{}: `unsafe` is not allowed in a sandboxed module -- use safe code and the host's API", at(f, e.lo))),
-                ExprKind::Mac(m) if m.args != crate::ast::NO_MAC_ARGS && ast.mac_args.get(m.args as usize).map_or(false, |a| a.asm.is_some()) => {
+                ExprKind::Mac(m) if ast.row(*m).args != crate::ast::NO_MAC_ARGS && ast.mac_args.get(ast.row(*m).args as usize).map_or(false, |a| a.asm.is_some()) => {
                     out.push(format!("{}: `asm!` is not allowed in a sandboxed module", at(f, e.lo)))
                 }
                 _ => {}

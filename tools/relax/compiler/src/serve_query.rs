@@ -247,7 +247,7 @@ pub fn position(s: &mut Session,path: &str,params: &Json,only: bool) -> Result<S
         for i in 0..body.expr_ty.len() {
             let id = body.expr_at(i); let e = pf.ast.expr(id);
             match e.kind {
-                ExprKind::MethodCall { name:n,.. } if hit(p,body.file,n.lo,query_path,at) => {
+                ExprKind::MethodCall(_, row) if hit(p,body.file,pf.ast.row(row).name.lo,query_path,at) => {
                     if let Some(m) = body.methods.get(&id.0) { return Ok(answer(hover_args(s,m.def,s.unit.tcx.tys.list(m.args)),definition(p,m.def),only)); }
                 }
                 ExprKind::Field(recv,n) if hit(p,body.file,n.lo,query_path,at) => {

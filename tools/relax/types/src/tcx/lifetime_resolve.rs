@@ -623,7 +623,8 @@ impl LifetimeResolver<'_> {
             ast::ExprKind::ConstBlock(b) => {
                 self.visit_block(b);
             }
-            ast::ExprKind::Closure { params, ret, body, .. } => {
+            ast::ExprKind::Closure(row) => {
+                let ast::ClosureRow { params, ret, body, .. } = *self.prog.files[self.file as usize].ast.row(row);
                 let outer = self.candidates.take();
                 // late.rs:1197-1212 + resolve_params :4067-4077: parameter patterns under
                 // Elided(Infer), then the parameter types under AnonymousCreateParameter.
@@ -646,26 +647,28 @@ impl LifetimeResolver<'_> {
             ast::ExprKind::AddrOf(_, _, x) | ast::ExprKind::Try(x) | ast::ExprKind::Await(x) | ast::ExprKind::Paren(x) | ast::ExprKind::Box(x) => self.visit_expr(x),
             ast::ExprKind::Binary(_, a, b) | ast::ExprKind::Assign(a, b) | ast::ExprKind::AssignOp(_, a, b) | ast::ExprKind::Index(a, b) => { self.visit_expr(a); self.visit_expr(b); }
             ast::ExprKind::Call(f, args) => { self.visit_expr(f); for e in self.prog.files[self.file as usize].ast.list(args) { self.visit_expr(*e); } }
-            ast::ExprKind::MethodCall { recv, turbofish, args, .. } => {
+            ast::ExprKind::MethodCall(recv, row) => {
+                let ast::MethodCallRow { turbofish, args, .. } = *self.prog.files[self.file as usize].ast.row(row);
                 self.visit_expr(recv); self.visit_generic_args(turbofish); for e in self.prog.files[self.file as usize].ast.list(args) { self.visit_expr(*e); }
             }
             ast::ExprKind::Cast(e, t) => { self.visit_expr(e); self.visit_ty(t); }
             ast::ExprKind::Block(b, _) | ast::ExprKind::Unsafe(b) | ast::ExprKind::Loop(b, _) => self.visit_block(b),
-            ast::ExprKind::If(e, b, other) => { self.visit_expr(e); self.visit_block(b); if let Some(e) = other { self.visit_expr(e); } }
+            ast::ExprKind::If(e, b, other) => { self.visit_expr(e); self.visit_block(b); if let Some(e) = other.get() { self.visit_expr(e); } }
             ast::ExprKind::Let(p, e) => { self.visit_pat(p); self.visit_expr(e); }
             ast::ExprKind::Match(e, arms) => {
                 self.visit_expr(e); for a in self.prog.files[self.file as usize].ast.list(arms) { self.visit_pat(a.pat); if let Some(e) = a.guard { self.visit_expr(e); } self.visit_expr(a.body); }
             }
-            ast::ExprKind::While(e, b, _) => { self.visit_expr(e); self.visit_block(b); }
-            ast::ExprKind::For(p, e, b, _) => { self.visit_pat(p); self.visit_expr(e); self.visit_block(b); }
-            ast::ExprKind::Break(_, v) | ast::ExprKind::Return(v) | ast::ExprKind::Yield(v) => if let Some(e) = v { self.visit_expr(e); },
+            ast::ExprKind::While(row) => { let ast::WhileRow { cond: e, body: b, .. } = *self.prog.files[self.file as usize].ast.row(row); self.visit_expr(e); self.visit_block(b); }
+            ast::ExprKind::For(row) => { let ast::ForRow { pat: p, iter: e, body: b, .. } = *self.prog.files[self.file as usize].ast.row(row); self.visit_pat(p); self.visit_expr(e); self.visit_block(b); }
+            ast::ExprKind::Break(_, v) | ast::ExprKind::Return(v) | ast::ExprKind::Yield(v) => if let Some(e) = v.get() { self.visit_expr(e); },
             ast::ExprKind::Tuple(es) | ast::ExprKind::Array(es) => for e in self.prog.files[self.file as usize].ast.list(es) { self.visit_expr(*e); },
-            ast::ExprKind::Struct(p, fs, base, _) => {
+            ast::ExprKind::Struct(row) => {
+                let ast::StructRow { path: p, fields: fs, base, .. } = *self.prog.files[self.file as usize].ast.row(row);
                 self.visit_path(&p, true); for f in self.prog.files[self.file as usize].ast.list(fs) { self.visit_expr(f.expr); }
                 if let Some(e) = base.get() { self.visit_expr(e); }
             }
-            ast::ExprKind::Range(a, b, _) => { if let Some(e) = a { self.visit_expr(e); } if let Some(e) = b { self.visit_expr(e); } }
-            ast::ExprKind::Mac(m) => self.visit_mac(m),
+            ast::ExprKind::Range(a, b, _) => { if let Some(e) = a.get() { self.visit_expr(e); } if let Some(e) = b.get() { self.visit_expr(e); } }
+            ast::ExprKind::Mac(m) => { let m = *self.prog.files[self.file as usize].ast.row(m); self.visit_mac(m) }
             ast::ExprKind::Lit(_) | ast::ExprKind::Continue(_) | ast::ExprKind::Underscore => {}
         }
     }

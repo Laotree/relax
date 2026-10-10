@@ -265,21 +265,23 @@ impl Resolve<'_> {
             ExprKind::Unary(_, x) | ExprKind::AddrOf(_, _, x) | ExprKind::Cast(x, _) | ExprKind::Field(x, _) |
             ExprKind::TupleField(x, _) | ExprKind::Paren(x) | ExprKind::Box(x) | ExprKind::Try(x) => self.expr(x, false),
             ExprKind::Call(f, args) => { self.expr(f, false); for x in ast.list(args) { self.expr(*x, false); } }
-            ExprKind::MethodCall { recv, args, .. } => { self.expr(recv, false); for x in ast.list(args) { self.expr(*x, false); } }
+            ExprKind::MethodCall(recv, row) => { self.expr(recv, false); for x in ast.list(ast.row(row).args) { self.expr(*x, false); } }
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.block(b, false),
             ExprKind::If(cond, then, els) => {
                 let cx = self.cx;
                 self.if_then(e, cond, then);
                 self.cx = cx;
-                if let Some(x) = els { self.expr(x, true); }
+                if let Some(x) = els.get() { self.expr(x, true); }
             }
-            ExprKind::While(cond, b, _) => {
+            ExprKind::While(row) => {
+                let crate::ast::WhileRow { cond, body: b, .. } = *ast.row(row);
                 // rustc_ast_lowering/src/expr.rs:659: loop { if cond { body } else { break } }.
                 self.node(Node::Synthetic(e.0, Synthetic::Iteration), true);
                 self.if_then(e, cond, b);
             }
             ExprKind::Loop(b, _) => self.block(b, true),
-            ExprKind::For(p, head, b, _) => {
+            ExprKind::For(row) => {
+                let crate::ast::ForRow { pat: p, iter: head, body: b, .. } = *ast.row(row);
                 // rustc_ast_lowering/src/expr.rs:1726,1875: DropTemps(match into_iter(head) { .. }).
                 self.node(Node::Synthetic(e.0, Synthetic::ForMatch), true);
                 self.expr(head, false);
@@ -306,7 +308,8 @@ impl Resolve<'_> {
                     self.cx = cx;
                 }
             }
-            ExprKind::Closure { params, body, .. } => {
+            ExprKind::Closure(row) => {
+                let crate::ast::ClosureRow { params, body, .. } = *ast.row(row);
                 let cx = self.cx;
                 self.enter_body(Node::Expr(body.0), BodyKind::Closure);
                 for p in ast.list(params) { self.pat(p.pat); }
@@ -326,7 +329,7 @@ impl Resolve<'_> {
                 self.node(Node::Synthetic(e.0, Synthetic::AwaitLoop), true);
                 self.suspension(e, YieldKind::Await { operand: x, future_scope });
             }
-            ExprKind::Yield(x) => { if let Some(x) = x { self.expr(x, false); } self.suspension(e, YieldKind::Yield); }
+            ExprKind::Yield(x) => { if let Some(x) = x.get() { self.expr(x, false); } self.suspension(e, YieldKind::Yield); }
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => for x in ast.list(xs) { self.expr(*x, false); },
             ExprKind::Repeat(x, count) => {
                 self.expr(x, false);
@@ -334,13 +337,14 @@ impl Resolve<'_> {
                 self.enter_body(Node::Expr(count.0), BodyKind::Constant);
                 self.expr(count, true); self.cx = cx;
             }
-            ExprKind::Struct(_, fields, base, _) => {
+            ExprKind::Struct(row) => {
+                let crate::ast::StructRow { fields, base, .. } = *ast.row(row);
                 for f in ast.list(fields) { self.expr(f.expr, false); }
                 if let Some(x) = base.get() { self.expr(x, false); }
             }
-            ExprKind::Range(a, b, _) => { if let Some(x) = a { self.expr(x, false); } if let Some(x) = b { self.expr(x, false); } }
-            ExprKind::Return(x) | ExprKind::Break(_, x) => if let Some(x) = x { self.expr(x, false); },
-            ExprKind::Mac(m) => self.mac(e, m),
+            ExprKind::Range(a, b, _) => { if let Some(x) = a.get() { self.expr(x, false); } if let Some(x) = b.get() { self.expr(x, false); } }
+            ExprKind::Return(x) | ExprKind::Break(_, x) => if let Some(x) = x.get() { self.expr(x, false); },
+            ExprKind::Mac(m) => self.mac(e, *ast.row(m)),
             ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Continue(_) | ExprKind::Underscore => (),
         }
         if !matches!(ast.expr(e).kind, ExprKind::Await(_) | ExprKind::Yield(_)) { self.position(e); }
@@ -369,7 +373,7 @@ impl Resolve<'_> {
                     self.cx = cx;
                     for x in ast.list(xs) { self.assignee(*x); }
                 }
-                ExprKind::Struct(_, fs, _, _) => for f in ast.list(fs) { self.assignee(f.expr); },
+                ExprKind::Struct(row) => for f in ast.list(ast.row(row).fields) { self.assignee(f.expr); },
                 ExprKind::Paren(x) => self.assignee(x),
                 _ => (),
             }
@@ -451,12 +455,12 @@ impl Resolve<'_> {
             ExprKind::AddrOf(_, _, x) => { self.extend_borrows(x, scope); self.extend_place(x, scope); }
             ExprKind::Paren(x) | ExprKind::Cast(x, _) => self.extend_borrows(x, scope),
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => for x in ast.list(xs) { self.extend_borrows(*x, scope); },
-            ExprKind::Struct(_, fields, _, _) => for f in ast.list(fields) { self.extend_borrows(f.expr, scope); },
+            ExprKind::Struct(row) => for f in ast.list(ast.row(row).fields) { self.extend_borrows(f.expr, scope); },
             ExprKind::Call(f, args) if self.constructor(f) => for x in ast.list(args) { self.extend_borrows(*x, scope); },
             ExprKind::Block(b, _) | ExprKind::Unsafe(b) => if let Some(t) = self.block_tail(b) { self.extend_borrows(t, scope); },
             ExprKind::If(_, b, els) => {
                 if let Some(t) = self.block_tail(b) { self.extend_borrows(t, scope); }
-                if let Some(x) = els { self.extend_borrows(x, scope); }
+                if let Some(x) = els.get() { self.extend_borrows(x, scope); }
             }
             ExprKind::Match(_, arms) => for a in ast.list(arms) { self.extend_borrows(a.body, scope); },
             _ => (),

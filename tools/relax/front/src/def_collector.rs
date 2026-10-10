@@ -631,7 +631,7 @@ impl DefCollector<'_> {
     fn is_potential_trivial_const_arg(&self, e: ExprId) -> bool {
         // rustc_ast/src/ast.rs:1420-1442: exactly one brace layer.
         let e = match self.ast.expr(e).kind {
-            ExprKind::Block(b, None) => match self.ast.stmts(b) { [Stmt::Expr(e, false)] => *e, _ => e },
+            ExprKind::Block(b, l) if l.is_none() => match self.ast.stmts(b) { [Stmt::Expr(e, false)] => *e, _ => e },
             _ => e,
         };
         match self.ast.expr(e).kind {
@@ -708,7 +708,8 @@ impl DefCollector<'_> {
                 let def = self.create_def(NodeId::InlineConst(e), None, DefKind::AnonConst);
                 let saved = self.with_parent(def); self.visit_block(b); self.parent_def = saved;
             }
-            ExprKind::Closure { params, ret, body, .. } => {
+            ExprKind::Closure(row) => {
+                let ClosureRow { params, ret, body, .. } = *self.ast.row(row);
                 let def = self.create_def(NodeId::Closure(e), None, DefKind::Closure);
                 let saved = self.with_parent(def);
                 let bindings = self.bindings.len();
@@ -730,7 +731,8 @@ impl DefCollector<'_> {
                 if !self.checking_defs && self.call_names.is_some() { self.note_call_name(f); }
                 self.visit_expr(f); for e in self.ast.list(args) { self.visit_expr(*e); }
             }
-            ExprKind::MethodCall { recv, turbofish, args, .. } => {
+            ExprKind::MethodCall(recv, row) => {
+                let MethodCallRow { turbofish, args, .. } = *self.ast.row(row);
                 self.visit_expr(recv); self.visit_args(turbofish, false); for e in self.ast.list(args) { self.visit_expr(*e); }
             }
             ExprKind::Cast(e, t) => { self.visit_expr(e); self.visit_ty(t, false); }
@@ -740,7 +742,7 @@ impl DefCollector<'_> {
             ExprKind::If(e, b, other) => {
                 let bindings = self.bindings.len();
                 self.visit_expr(e); self.visit_block(b); self.bindings.truncate(bindings);
-                if let Some(e) = other { self.visit_expr(e); }
+                if let Some(e) = other.get() { self.visit_expr(e); }
             }
             ExprKind::Let(p, e) if !self.legacy => { self.visit_pat(p); self.visit_expr(e); }
             ExprKind::Let(p, e) => { self.visit_expr(e); self.visit_pat(p); self.bind_pat(p); }
@@ -753,22 +755,25 @@ impl DefCollector<'_> {
                     self.bindings.truncate(bindings);
                 }
             }
-            ExprKind::While(e, b, _) => {
+            ExprKind::While(row) => {
+                let WhileRow { cond: e, body: b, .. } = *self.ast.row(row);
                 let bindings = self.bindings.len(); self.visit_expr(e); self.visit_block(b); self.bindings.truncate(bindings);
             }
-            ExprKind::For(p, e, b, _) if !self.legacy => { self.visit_pat(p); self.visit_expr(e); self.visit_block(b); }
-            ExprKind::For(p, e, b, _) => {
+            ExprKind::For(row) if !self.legacy => { let ForRow { pat: p, iter: e, body: b, .. } = *self.ast.row(row); self.visit_pat(p); self.visit_expr(e); self.visit_block(b); }
+            ExprKind::For(row) => {
+                let ForRow { pat: p, iter: e, body: b, .. } = *self.ast.row(row);
                 self.visit_expr(e); let bindings = self.bindings.len();
                 self.visit_pat(p); self.bind_pat(p); self.visit_block(b); self.bindings.truncate(bindings);
             }
-            ExprKind::Break(_, v) | ExprKind::Return(v) | ExprKind::Yield(v) => if let Some(e) = v { self.visit_expr(e); },
+            ExprKind::Break(_, v) | ExprKind::Return(v) | ExprKind::Yield(v) => if let Some(e) = v.get() { self.visit_expr(e); },
             ExprKind::Tuple(es) | ExprKind::Array(es) => for e in self.ast.list(es) { self.visit_expr(*e); },
-            ExprKind::Struct(p, fs, base, _) => {
+            ExprKind::Struct(row) => {
+                let StructRow { path: p, fields: fs, base, .. } = *self.ast.row(row);
                 self.visit_path(p, false); for f in self.ast.list(fs) { self.visit_expr(f.expr); }
                 if let Some(e) = base.get() { self.visit_expr(e); }
             }
-            ExprKind::Range(a, b, _) => { if let Some(e) = a { self.visit_expr(e); } if let Some(e) = b { self.visit_expr(e); } }
-            ExprKind::Mac(m) => self.visit_mac(m),
+            ExprKind::Range(a, b, _) => { if let Some(e) = a.get() { self.visit_expr(e); } if let Some(e) = b.get() { self.visit_expr(e); } }
+            ExprKind::Mac(m) => { let m = *self.ast.row(m); self.visit_mac(m) }
             ExprKind::Lit(_) | ExprKind::Continue(_) | ExprKind::Underscore => {}
         }
     }

@@ -4342,17 +4342,19 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
         ExprKind::If(c, t, el) => {
             blocks_in_expr(ast, *c, out);
             out.push(*t);
-            if let Some(x) = el {
-                blocks_in_expr(ast, *x, out);
+            if let Some(x) = el.get() {
+                blocks_in_expr(ast, x, out);
             }
         }
-        ExprKind::While(c, b, _) => {
-            blocks_in_expr(ast, *c, out);
-            out.push(*b);
+        ExprKind::While(row) => {
+            let WhileRow { cond, body, .. } = ast.row(*row);
+            blocks_in_expr(ast, *cond, out);
+            out.push(*body);
         }
-        ExprKind::For(_, it, b, _) => {
-            blocks_in_expr(ast, *it, out);
-            out.push(*b);
+        ExprKind::For(row) => {
+            let ForRow { iter, body, .. } = ast.row(*row);
+            blocks_in_expr(ast, *iter, out);
+            out.push(*body);
         }
         ExprKind::Match(x, arms) => {
             blocks_in_expr(ast, *x, out);
@@ -4360,16 +4362,16 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
                 blocks_in_expr(ast, a.body, out);
             }
         }
-        ExprKind::Closure { body, .. } => blocks_in_expr(ast, *body, out),
+        ExprKind::Closure(row) => blocks_in_expr(ast, ast.row(*row).body, out),
         ExprKind::Call(f, args) => {
             blocks_in_expr(ast, *f, out);
             for a in ast.list(*args) {
                 blocks_in_expr(ast, *a, out);
             }
         }
-        ExprKind::MethodCall { recv, args, .. } => {
+        ExprKind::MethodCall(recv, row) => {
             blocks_in_expr(ast, *recv, out);
-            for a in ast.list(*args) {
+            for a in ast.list(ast.row(*row).args) {
                 blocks_in_expr(ast, *a, out);
             }
         }
@@ -4381,13 +4383,18 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
             blocks_in_expr(ast, *a, out);
             blocks_in_expr(ast, *b, out);
         }
-        ExprKind::Return(Some(x)) | ExprKind::Break(_, Some(x)) => blocks_in_expr(ast, *x, out),
+        ExprKind::Return(x) | ExprKind::Break(_, x) => {
+            if let Some(x) = x.get() {
+                blocks_in_expr(ast, x, out)
+            }
+        }
         ExprKind::Tuple(v) | ExprKind::Array(v) => {
             for x in ast.list(*v) {
                 blocks_in_expr(ast, *x, out);
             }
         }
-        ExprKind::Struct(_, fields, base, _) => {
+        ExprKind::Struct(row) => {
+            let StructRow { fields, base, .. } = ast.row(*row);
             for f in ast.list(*fields) {
                 blocks_in_expr(ast, f.expr, out);
             }
@@ -4471,10 +4478,14 @@ pub fn strip_cfg_nodes(ast: &mut Ast, src: Src, cfg: &CfgSet) {
         // match arms and closure params (flat_map_arm / flat_map_param)
         match &mut x.kind {
             ExprKind::Match(_, arms) => strip_attrs_list(src, cfg, ast.arms.vec_mut(), ast.base[11], (&ast.attrs, ast.base[21]), arms, |a| a.attrs),
-            ExprKind::Closure { params, .. } => strip_attrs_list(src, cfg, ast.closure_params.vec_mut(), ast.base[12], (&ast.attrs, ast.base[21]), params, |p| p.attrs),
-            ExprKind::Struct(_, fields, _, _) => strip_attrs_list(src, cfg, ast.field_exprs.vec_mut(), ast.base[10], (&ast.attrs, ast.base[21]), fields, |f| f.attrs),
             _ => {}
         }
+    }
+    for row in ast.closure_exprs.iter_mut() {
+        strip_attrs_list(src, cfg, ast.closure_params.vec_mut(), ast.base[12], (&ast.attrs, ast.base[21]), &mut row.params, |p| p.attrs);
+    }
+    for row in ast.struct_exprs.iter_mut() {
+        strip_attrs_list(src, cfg, ast.field_exprs.vec_mut(), ast.base[10], (&ast.attrs, ast.base[21]), &mut row.fields, |f| f.attrs);
     }
     for x in ast.pats.iter_mut() {
         if let Pat::Struct(_, fields, _) = x {
