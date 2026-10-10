@@ -121,6 +121,7 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     let bs = std::mem::size_of::<crate::typeck::Body>();
     out.push((format!("checked bodies kept for closures ({}; {} B each + heap)", u.bodies.len(), bs), u.bodies.values().map(|b| bs + b.heap_bytes()).sum::<usize>() as u64));
     out.push((format!("old-version bodies ({})", u.old_bodies.len()), u.old_bodies.values().map(|b| bs + b.heap_bytes()).sum::<usize>() as u64));
+    out.extend(file_arrays(&u.prog));
     out.extend(u.front.mem_lines());
     out.extend(u.prog.memo_mem_lines());
     out.extend(u.tcx.mem_lines());
@@ -129,6 +130,53 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
         out.extend(ast_nested(&u.prog));
     }
     out
+}
+
+/// Per-array heap and logical bytes, including immutable body segments. Mapped
+/// arrays have logical bytes but no heap capacity. Only called by memory reports.
+fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
+    let mut totals = std::collections::BTreeMap::<String, (u64, u64)>::new();
+    fn add<T>(totals: &mut std::collections::BTreeMap<String, (u64, u64)>, name: String, a: &crate::arena::Arena<T>) {
+        let n = totals.entry(name).or_default();
+        n.0 += a.heap_bytes() as u64;
+        n.1 += std::mem::size_of_val(&**a) as u64;
+    }
+    for f in &p.files {
+        macro_rules! arrays {
+            ($prefix:expr, $value:expr, $($field:ident),*) => {
+                $(add(&mut totals, format!("{}{}", $prefix, stringify!($field)), &$value.$field);)*
+            };
+        }
+        arrays!("main.", f, src, toks, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+        for part in f.parts() {
+            arrays!("part.", part, ext, toks, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+        }
+        let mut a = Some(&f.ast);
+        let mut prefix = "main.ast.";
+        while let Some(ast) = a {
+            arrays!(prefix, ast, exprs, pats, tys, blocks, root_attrs, root_items,
+                mac_args, path_segs, stmts, expr_lists, pat_lists, ty_lists, field_exprs,
+                arms, closure_params, field_pats, qselfs, generic_args, fn_ptrs,
+                generic_arg_lists, bounds, generic_params, ident_lists, attrs,
+                asm_ops, items, fn_sigs, params, field_defs, variants, use_trees,
+                item_lists, where_preds);
+            a = ast.part.get().map(|a| &**a);
+            prefix = "part.ast.";
+        }
+        // A report must not wait for a body parser to release its publication lock.
+        if let Ok(scratch) = f.body_publish.try_lock() {
+            if let Some(scratch) = scratch.as_ref() {
+                for (name, heap, used) in scratch.mem_sizes() {
+                    let n = totals.entry(format!("scratch.{name}")).or_default();
+                    n.0 += heap as u64;
+                    n.1 += used as u64;
+                }
+            }
+        }
+    }
+    totals.into_iter().map(|(name, (heap, used))| {
+        (format!("files: {name} heap ({} logical bytes)", used), heap)
+    }).collect()
 }
 
 /// Shallow bytes of one RIR function (blocks, insts, positions, vregs, slots).

@@ -17,6 +17,16 @@ pub struct BodyScratch {
 }
 
 impl BodyScratch {
+    /// Retained parser input, for opt-in memory accounting only.
+    pub fn mem_sizes(&self) -> [(&'static str, usize, usize); 7] {
+        fn size<T>(name: &'static str, v: &Vec<T>) -> (&'static str, usize, usize) {
+            (name, v.capacity() * std::mem::size_of::<T>(), std::mem::size_of_val(v.as_slice()))
+        }
+        [size("toks", &self.toks), size("ext", &self.ext), size("exp_map", &self.exp_map),
+            size("tok_origin", &self.tok_origin), size("token_origins", &self.token_origins),
+            size("rules_exp", &self.rules_exp), size("body_origin", &self.body_origin)]
+    }
+
     pub(super) fn parser<'a>(pf: &'a ParsedFile, sess: &'a Arc<crate::Session>, saved: Option<Self>) -> Parser<'a> {
         let state = saved.unwrap_or_else(|| {
             let mut state = Self {

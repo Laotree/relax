@@ -856,6 +856,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // `relax run`): the next check (or run) of the package maps them instead of parsing
         // every file again (Stage: 6 s of a warm check was parsing)
         if !selftest { record_check_front(&mut u, options); }
+        if crate::memstat::enabled() {
+            crate::memstat::print("check complete", &crate::memreport::unit_sizes(&u));
+        }
         std::mem::forget(u);
         return code;
     }
