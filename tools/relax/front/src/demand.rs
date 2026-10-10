@@ -1213,22 +1213,25 @@ use crate::crate_image::strings::{self, Pack};
 // fanout repeats sets, not their contents, and never emits process binding IDs.
 #[derive(Clone, Default)]
 struct BindingImage {
-    strings: Vec<Arc<str>>,
+    strings: Vec<String>,
     sets: Vec<Vec<usize>>,
     entries: Vec<(usize, bool, usize, usize)>,
 }
 strings::fields!(BindingImage, strings, sets, entries);
 impl BindingImage {
     fn capture(names: &Names, mut entries: Vec<usize>) -> Self {
-        entries.sort_by_key(|&id| names.bindings.spelling(id));
         let mut referenced = entries.iter().copied().collect::<HashSet<_>>();
         for &id in &entries {
             let value = &names.bindings.values[id];
             referenced.extend(value.targets.iter().chain(value.via.iter()));
         }
-        let mut strings = referenced.into_iter().collect::<Vec<_>>();
-        strings.sort_by_key(|&id| names.bindings.spelling(id));
+        // Spellings rendered for this capture only (not cached in the bindings), in spelling order.
+        let mut rendered = referenced.into_iter().map(|id| (names.bindings.spelling_string(id), id)).collect::<Vec<_>>();
+        rendered.sort_unstable();
+        let strings = rendered.iter().map(|&(_, id)| id).collect::<Vec<_>>();
         let ids = strings.iter().enumerate().map(|(local, &id)| (id, local)).collect::<HashMap<_, _>>();
+        // entries in spelling order = in local order (a binding is its own spelling's only owner)
+        entries.sort_by_key(|id| ids[id]);
         // each distinct set once, as the key of its id (no second copy in a list)
         let mut set_ids = HashMap::<Vec<usize>, usize>::default();
         let mut intern = |set: &bindings::Names| {
@@ -1245,7 +1248,7 @@ impl BindingImage {
         }).collect();
         let mut sets = vec![Vec::new(); set_ids.len()];
         for (set, id) in set_ids { sets[id] = set; }
-        Self { strings: strings.into_iter().map(|id| names.bindings.spelling_arc(id)).collect(), sets, entries }
+        Self { strings: rendered.into_iter().map(|(text, _)| text).collect(), sets, entries }
     }
     fn valid(&self) -> bool {
         self.sets.iter().all(|set| set.iter().all(|&id| id < self.strings.len()) && set.windows(2).all(|w| w[0] < w[1]))

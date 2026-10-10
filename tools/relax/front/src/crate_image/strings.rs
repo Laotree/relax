@@ -97,11 +97,6 @@ pub(crate) fn decode<T: Pack>(bytes: &[u8]) -> Option<T> {
     let value = T::unpack(&mut r, &strings)?;
     r.bytes.is_empty().then_some(value)
 }
-impl Pack for Arc<str> {
-    fn pack(&self, w: &mut Vec<u8>, strings: &mut Strings) { strings.put(self, w); }
-    fn unpack(r: &mut Decode<'_>, strings: &[String]) -> Option<Self> { strings.get(usize::get(r)?).map(|s| Arc::from(s.as_str())) }
-    fn plain_size(&self) -> usize { 4 + self.len() }
-}
 impl Pack for String {
     fn pack(&self, w: &mut Vec<u8>, strings: &mut Strings) { strings.put(self, w); }
     fn unpack(r: &mut Decode<'_>, strings: &[String]) -> Option<Self> { strings.get(usize::get(r)?).cloned() }

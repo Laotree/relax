@@ -129,7 +129,7 @@ impl Binding {
 
 enum Spelling {
     Segment(Arc<str>),
-    Qualified { module: u32, name: u32, text: OnceLock<Arc<str>> },
+    Qualified { module: u32, name: u32, text: OnceLock<Box<str>> },
 }
 
 #[derive(Default)]
@@ -207,19 +207,25 @@ impl Bindings {
     pub fn spelling(&self, id: usize) -> &str {
         match &self.text[id] {
             Spelling::Segment(text) => text,
-            Spelling::Qualified { .. } => self.shared_spelling(id),
+            Spelling::Qualified { module, name, text } => text.get_or_init(||
+                format!("{}::{}", self.spelling(*module as usize), self.spelling(*name as usize)).into_boxed_str()),
         }
     }
-    /// The spelling as a shared string: a segment's own, or the qualified one rendered once and kept.
-    pub fn spelling_arc(&self, id: usize) -> Arc<str> {
+    /// The spelling as an owned string, without keeping it: a snapshot renders every binding of a
+    /// crate once (1.4 M on a cold Stage) and would otherwise leave all of them cached in `text`.
+    pub fn spelling_string(&self, id: usize) -> String {
+        let mut out = String::new();
+        self.render(id, &mut out);
+        out
+    }
+    fn render(&self, id: usize, out: &mut String) {
         match &self.text[id] {
-            Spelling::Segment(text) => text.clone(),
-            Spelling::Qualified { .. } => self.shared_spelling(id).clone(),
+            Spelling::Segment(text) => out.push_str(text),
+            Spelling::Qualified { module, name, text } => match text.get() {
+                Some(text) => out.push_str(text),
+                None => { self.render(*module as usize, out); out.push_str("::"); self.render(*name as usize, out); }
+            },
         }
-    }
-    fn shared_spelling(&self, id: usize) -> &Arc<str> {
-        let Spelling::Qualified { module, name, text } = &self.text[id] else { unreachable!("segments carry their own text") };
-        text.get_or_init(|| Arc::from(format!("{}::{}", self.spelling(*module as usize), self.spelling(*name as usize))))
     }
     pub fn entry(&mut self, module: usize, name: usize) -> usize {
         if let Some(&id) = self.modules.get(&module).and_then(|names| names.get(&name)) { return id; }
