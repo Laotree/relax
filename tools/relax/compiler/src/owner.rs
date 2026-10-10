@@ -39,6 +39,12 @@ pub const CLASS_NAMES: [&str; CLASSES] = ["job", "finish", "main", "app", "backg
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
 const DONE: u8 = 2;
+/// the owner touches the request no more: the requester may return (and free it)
+const RELEASED: u8 = 3;
+/// How long a requester spins for its answer, and the idle owner for the next request, before
+/// sleeping (a sleep/wake pair costs tens of microseconds; warm launches make thousands of
+/// short requests in a row)
+const SPIN: std::time::Duration = std::time::Duration::from_micros(60);
 
 struct Req {
     run: *mut dyn FnMut(),
@@ -72,6 +78,10 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 static FOREGROUND: AtomicU32 = AtomicU32::new(0);
 /// Main requests queued
 static MAIN_QUEUED: AtomicU32 = AtomicU32::new(0);
+/// requests queued (any class): the idle owner spins on it
+static QUEUED_N: AtomicU32 = AtomicU32::new(0);
+/// the owner sleeps on WAKE (a push then notifies it; otherwise it is spinning or busy)
+static OWNER_ASLEEP: AtomicBool = AtomicBool::new(false);
 
 /// os thread id of the owner thread
 static OWNER_TID: AtomicU64 = AtomicU64::new(0);
@@ -313,10 +323,14 @@ fn push(r: usize, class: Class) {
     if class == Class::Main {
         MAIN_QUEUED.fetch_add(1, Ordering::Relaxed);
     }
-    WAKE.notify_all();
+    QUEUED_N.fetch_add(1, Ordering::SeqCst);
+    if OWNER_ASLEEP.load(Ordering::SeqCst) {
+        WAKE.notify_all();
+    }
 }
 
 fn dequeued(class: usize) {
+    QUEUED_N.fetch_sub(1, Ordering::SeqCst);
     if class == Class::Main as usize || class == Class::App as usize {
         FOREGROUND.fetch_sub(1, Ordering::Relaxed);
     }
@@ -327,6 +341,13 @@ fn dequeued(class: usize) {
 
 /// Waits for `req` to be done; true: withdrawn at the deadline before it started.
 fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < SPIN {
+        if req.state.load(Ordering::Acquire) == RELEASED {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
     let mut done = req.done.lock().unwrap_or_else(|e| e.into_inner());
     while !*done {
         match deadline {
@@ -351,6 +372,11 @@ fn wait(req: &Req, deadline: Option<std::time::Instant>) -> bool {
             }
             _ => done = req.wake.wait(done).unwrap_or_else(|e| e.into_inner()),
         }
+    }
+    drop(done);
+    // the owner's last touch follows its unlock
+    while req.state.load(Ordering::Acquire) != RELEASED {
+        std::hint::spin_loop();
     }
     false
 }
@@ -446,10 +472,13 @@ fn serve(r: usize) {
                 req.panic.set(Some(p));
             }
             req.state.store(DONE, Ordering::Release);
-            // once the requester sees `done` it returns: `req` is gone after this unlock
-            let mut done = req.done.lock().unwrap_or_else(|e| e.into_inner());
-            *done = true;
-            req.wake.notify_one();
+            {
+                let mut done = req.done.lock().unwrap_or_else(|e| e.into_inner());
+                *done = true;
+                req.wake.notify_one();
+            }
+            // the last touch: after this store the requester may return and `req` is gone
+            req.state.store(RELEASED, Ordering::Release);
         }
         false => unsafe {
             drop(Box::from_raw(req.run));
@@ -466,6 +495,11 @@ fn serve(r: usize) {
 
 fn owner_loop() -> ! {
     loop {
+        // idle: a short spin catches the next request of a burst without a sleep and wake
+        let t0 = std::time::Instant::now();
+        while QUEUED_N.load(Ordering::Relaxed) == 0 && FORK.load(Ordering::Relaxed) != 1 && t0.elapsed() < SPIN {
+            std::hint::spin_loop();
+        }
         let r = {
             let mut q = Q.lock().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -482,7 +516,9 @@ fn owner_loop() -> ! {
                 if let Some(r) = pick(&mut q, Mode::Top) {
                     break r;
                 }
+                OWNER_ASLEEP.store(true, Ordering::SeqCst);
                 q = WAKE.wait(q).unwrap_or_else(|e| e.into_inner());
+                OWNER_ASLEEP.store(false, Ordering::SeqCst);
             }
         };
         serve(r);
@@ -515,7 +551,9 @@ pub fn pump_wait(done: &dyn Fn() -> bool) {
                 None => {
                     // a latch completing or a request arriving wakes it; the timeout bounds a
                     // condition nothing announces (an in-flight flag cleared by a Finish)
+                    OWNER_ASLEEP.store(true, Ordering::SeqCst);
                     let _ = WAKE.wait_timeout(q, std::time::Duration::from_millis(1));
+                    OWNER_ASLEEP.store(false, Ordering::SeqCst);
                     None
                 }
             }
