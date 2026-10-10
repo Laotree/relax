@@ -706,9 +706,9 @@ impl<'a> Rty<'a> {
             }
         }
         // a type param / Self
-        if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+        if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
             let seg = &self.tx.prog.files[file as usize].ast.segs(p.segs)[0];
-            if seg.kind == SegKind::SelfType {
+            if seg.kind() == SegKind::SelfType {
                 match env.self_slots.clone() {
                     Some(v) => out.extend(v),
                     None => {
@@ -750,7 +750,7 @@ impl<'a> Rty<'a> {
             }
         }
         // `Self::X` in an impl: the impl's assoc type
-        if p.no_qself() && p.segs.len() == 2 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::SelfType {
+        if p.no_qself() && p.segs.len() == 2 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].kind() == SegKind::SelfType {
             if let Some(imp) = env.impl_def {
                 let name = self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[1].name);
                 if let Some(x) = self.impl_assoc_ty(imp, name) {
@@ -760,7 +760,7 @@ impl<'a> Rty<'a> {
                     // output is the elided input region), not lifetimes of their own
                     let gat_lts = self.impl_assoc_lifetimes(imp, name);
                     let fast = &self.tx.prog.files[file as usize].ast;
-                    let written: Vec<ast::Ident> = match fast.gargs(fast.segs(p.segs)[1].args) {
+                    let written: Vec<ast::Ident> = match fast.gargs(fast.segs(p.segs)[1].args()) {
                         Some(GenericArgs::Angle(v)) => fast.list(*v).iter().filter_map(|g| match g {
                             GenericArg::Lifetime(l) => Some(*l),
                             _ => None,
@@ -794,7 +794,7 @@ impl<'a> Rty<'a> {
                 let last = self.tx.prog.files[file as usize].ast.segs(p.segs).last();
                 let mut lt_args: Vec<ast::Ident> = Vec::new();
                 let mut ty_args: Vec<Option<ast::TyId>> = Vec::new();
-                if let Some(GenericArgs::Angle(v)) = last.and_then(|s| self.tx.prog.files[file as usize].ast.gargs(s.args)) {
+                if let Some(GenericArgs::Angle(v)) = last.and_then(|s| self.tx.prog.files[file as usize].ast.gargs(s.args())) {
                     for g in self.tx.prog.files[file as usize].ast.list(*v) {
                         match g {
                             GenericArg::Lifetime(l) => lt_args.push(*l),
@@ -1016,7 +1016,7 @@ impl<'a> Rty<'a> {
         }
         let prog = self.tx.prog;
         let tcx = self.tx.tcx;
-        if self.tx.prog.files[env.file as usize].ast.segs(tp.segs).last().map_or(true, |s| s.args.is_some()) {
+        if self.tx.prog.files[env.file as usize].ast.segs(tp.segs).last().map_or(true, |s| s.args().is_some()) {
             return false;
         }
         let ge = tcx.item_env(prog, owner);
@@ -1164,7 +1164,7 @@ impl<'a> Rty<'a> {
         let mut lt_args: Vec<ast::Ident> = Vec::new();
         let mut ty_args: Vec<ast::TyId> = Vec::new();
         let uast = &self.tx.prog.files[env.file as usize].ast;
-        if let Some(GenericArgs::Angle(v)) = uast.segs(p.segs).last().and_then(|s| uast.gargs(s.args)) {
+        if let Some(GenericArgs::Angle(v)) = uast.segs(p.segs).last().and_then(|s| uast.gargs(s.args())) {
             for g in uast.list(*v) {
                 match g {
                     GenericArg::Lifetime(l) => lt_args.push(*l),
@@ -1232,11 +1232,11 @@ impl<'a> Rty<'a> {
         let ast_ = &self.tx.prog.files[file as usize].ast;
         match (ast_.ty(at), self.tx.kind(t)) {
             (AstTy::Paren(x), _) => self.alias_param_ty(file, *x, t, name, depth + 1),
-            (AstTy::Path(p), _) if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() && self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[0].name).as_bytes() == name => Some(t),
+            (AstTy::Path(p), _) if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() && self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[0].name).as_bytes() == name => Some(t),
             (AstTy::Ref(_, _, x), TyKind::Ref(_, i, _)) | (AstTy::Ptr(_, x), TyKind::Ptr(_, i)) | (AstTy::Slice(x), TyKind::Slice(i)) | (AstTy::Array(x, _), TyKind::Array(i, _)) => self.alias_param_ty(file, *x, i, name, depth + 1),
             (AstTy::Tuple(v), TyKind::Tuple(ts)) if v.len() == self.tx.tcx.tys.list(ts).len() => ast_.list(*v).iter().zip(self.tx.tcx.tys.list(ts).iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1)),
             (AstTy::Path(p), TyKind::Adt(_, args, _)) => {
-                let tys: Vec<ast::TyId> = match ast_.segs(p.segs).last().and_then(|s| ast_.gargs(s.args)) {
+                let tys: Vec<ast::TyId> = match ast_.segs(p.segs).last().and_then(|s| ast_.gargs(s.args())) {
                     Some(GenericArgs::Angle(v)) => ast_.list(*v).iter().filter_map(|g| match g {
                         GenericArg::Type(x) => Some(*x),
                         _ => None,

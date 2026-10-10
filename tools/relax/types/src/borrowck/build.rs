@@ -684,7 +684,7 @@ impl<'a> Build<'a> {
         let mut tail = None;
         for (i, s) in ast.list(blk.stmts).iter().enumerate() {
             let s = match *s {
-                Stmt::Attrs(_, e, semi) => Stmt::Expr(e, semi),
+                Stmt::Attrs(r) => { let a = ast.row(r); Stmt::Expr(a.expr, a.semi) }
                 s => s,
             };
             if i + 1 == n {
@@ -748,7 +748,8 @@ impl<'a> Build<'a> {
     pub(super) fn stmt(&mut self, s: &Stmt, block_scope: usize) {
         crate::preempt::point();
         match s {
-            Stmt::Let { pat, init, else_, ty, .. } => {
+            Stmt::Let(r) => {
+                let crate::ast::LetStmt { pat, init, else_, ty, .. } = self.ast.row(*r);
                 let sp = match init {
                     Some(e) => self.set_span(*e),
                     None => self.span,
@@ -782,7 +783,7 @@ impl<'a> Build<'a> {
                 self.span = sp;
             }
             Stmt::Item(_) | Stmt::Empty => {}
-            Stmt::Attrs(_, e, semi) => self.stmt(&Stmt::Expr(*e, *semi), block_scope),
+            Stmt::Attrs(r) => { let a = *self.ast.row(*r); self.stmt(&Stmt::Expr(a.expr, a.semi), block_scope) }
         }
     }
 
@@ -1195,7 +1196,7 @@ impl<'a> Build<'a> {
             StmtKind::Assign(_, Rvalue::Aggregate(AggKind::Adt(t, _), _)) => *t,
             _ => return,
         };
-        let src = if p.no_qself() && p.segs.len() == 1 && self.ast.segs(p.segs)[0].kind == crate::ast::SegKind::SelfType {
+        let src = if p.no_qself() && p.segs.len() == 1 && self.ast.segs(p.segs)[0].kind() == crate::ast::SegKind::SelfType {
             UserAnn::SelfTy
         } else if !v.is_empty() {
             UserAnn::Path(v)
@@ -1231,9 +1232,9 @@ impl<'a> Build<'a> {
         };
         let n = p.segs.len();
         let segs = ast.segs(p.segs);
-        let mut v = conv(segs.last().and_then(|s| ast.gargs(s.args)));
+        let mut v = conv(segs.last().and_then(|s| ast.gargs(s.args())));
         if v.is_empty() && n >= 2 {
-            v = conv(ast.gargs(segs[n - 2].args));
+            v = conv(ast.gargs(segs[n - 2].args()));
         }
         v
     }
@@ -1252,14 +1253,14 @@ impl<'a> Build<'a> {
             None
         };
         let trait_targs = match ast.qself(p).and_then(|q| q.trait_path.as_ref()) {
-            Some(tp) => Self::turbofish(ast, ast.segs(tp.segs).last().and_then(|s| ast.gargs(s.args))),
+            Some(tp) => Self::turbofish(ast, ast.segs(tp.segs).last().and_then(|s| ast.gargs(s.args()))),
             None => Vec::new(),
         };
-        let trait_lts: Vec<crate::ast::Ident> = match ast.qself(p).and_then(|q| q.trait_path.as_ref()).and_then(|tp| ast.segs(tp.segs).last().and_then(|s| ast.gargs(s.args))) {
+        let trait_lts: Vec<crate::ast::Ident> = match ast.qself(p).and_then(|q| q.trait_path.as_ref()).and_then(|tp| ast.segs(tp.segs).last().and_then(|s| ast.gargs(s.args()))) {
             Some(crate::ast::GenericArgs::Angle(v)) => ast.list(*v).iter().filter_map(|a| if let crate::ast::GenericArg::Lifetime(l) = a { Some(*l) } else { None }).collect(),
             _ => Vec::new(),
         };
-        PathUserTy { self_ann, trait_lts, trait_targs, targs: Self::turbofish(ast, ast.segs(p.segs).last().and_then(|s| ast.gargs(s.args))) }
+        PathUserTy { self_ann, trait_lts, trait_targs, targs: Self::turbofish(ast, ast.segs(p.segs).last().and_then(|s| ast.gargs(s.args()))) }
     }
 
     fn turbofish(ast: &Ast, ga: Option<&crate::ast::GenericArgs>) -> Vec<crate::ast::TyId> {
@@ -3331,7 +3332,7 @@ impl<'a> Build<'a> {
             let mut hr_names: Vec<&str> = Vec::new();
             match dast.ty(pt) {
                 crate::ast::Ty::ImplTrait(bs) | crate::ast::Ty::DynTrait(bs, _) => bounds.extend(dast.list(*bs).iter()),
-                crate::ast::Ty::Path(p) if p.segs.len() == 1 && dast.segs(p.segs)[0].args.is_none() => {
+                crate::ast::Ty::Path(p) if p.segs.len() == 1 && dast.segs(p.segs)[0].args().is_none() => {
                     let n = dfile.text(dast.segs(p.segs)[0].name);
                     for g in dast.list(fsig.generics.params) {
                         if let crate::ast::GenericParamKind::Type(bs, _) = &g.kind {
@@ -3373,7 +3374,7 @@ impl<'a> Build<'a> {
                     if cur.map_or(true, |c| rank(ek) < rank(c)) {
                         self.expected_kinds.insert(ce.0, ek);
                     }
-                    if let Some(crate::ast::GenericArgs::Paren(tys, ret)) = dast.gargs(last.args) {
+                    if let Some(crate::ast::GenericArgs::Paren(tys, ret)) = dast.gargs(last.args()) {
                         let tys = dast.list(*tys);
                         // `Fn(&T) -> &U`: elision ties the output to the input's region when
                         // the inputs have exactly one lifetime, a plain `&T`, and the output is a
@@ -3445,7 +3446,7 @@ fn ty_first_span(ast: &Ast, t: crate::ast::TyId, depth: u32) -> Option<Span> {
 /// Whether an AST path type has lifetime arguments (`Foo<'a>`); elided ones are not seen.
 fn ast_ty_has_lifetime_args(ast: &Ast, t: crate::ast::TyId) -> bool {
     match ast.ty(t) {
-        crate::ast::Ty::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args) {
+        crate::ast::Ty::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args()) {
             Some(crate::ast::GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| matches!(a, crate::ast::GenericArg::Lifetime(_))),
             _ => false,
         }),
@@ -3464,7 +3465,7 @@ fn ast_ty_has_elided_ref(ast: &Ast, t: crate::ast::TyId, depth: u32) -> bool {
         A::Ref(None, _, _) => true,
         A::Ref(Some(_), _, x) | A::Ptr(_, x) | A::Slice(x) | A::Array(x, _) | A::Paren(x) => ast_ty_has_elided_ref(ast, *x, depth + 1),
         A::Tuple(v) => ast.list(*v).iter().any(|x| ast_ty_has_elided_ref(ast, *x, depth + 1)),
-        A::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args) {
+        A::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args()) {
             Some(crate::ast::GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| match a {
                 crate::ast::GenericArg::Type(x) | crate::ast::GenericArg::Binding(_, _, x) => ast_ty_has_elided_ref(ast, *x, depth + 1),
                 _ => false,
@@ -3487,7 +3488,7 @@ fn ast_ty_has_ref(ast: &Ast, t: crate::ast::TyId, depth: u32) -> bool {
         A::Ref(..) => true,
         A::Ptr(_, x) | A::Slice(x) | A::Array(x, _) | A::Paren(x) => ast_ty_has_ref(ast, *x, depth + 1),
         A::Tuple(v) => ast.list(*v).iter().any(|x| ast_ty_has_ref(ast, *x, depth + 1)),
-        A::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args) {
+        A::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args()) {
             Some(crate::ast::GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| match a {
                 crate::ast::GenericArg::Lifetime(_) => true,
                 crate::ast::GenericArg::Type(x) | crate::ast::GenericArg::Binding(_, _, x) => ast_ty_has_ref(ast, *x, depth + 1),
@@ -3504,7 +3505,7 @@ fn ast_ty_has_ref(ast: &Ast, t: crate::ast::TyId, depth: u32) -> bool {
 /// A single-segment path with type arguments (`PairCoupled<u32>` may be an alias
 /// `type PairCoupled<'a, T> = (&'a T, &'a T)` whose expansion holds references).
 fn ast_ty_is_local_alias_use(_ast: &Ast, p: &crate::ast::Path) -> bool {
-    p.no_qself() && p.segs.len() == 1 && matches!(_ast.gargs(_ast.segs(p.segs)[0].args), Some(crate::ast::GenericArgs::Angle(v)) if _ast.list(*v).iter().any(|a| matches!(a, crate::ast::GenericArg::Type(_))))
+    p.no_qself() && p.segs.len() == 1 && matches!(_ast.gargs(_ast.segs(p.segs)[0].args()), Some(crate::ast::GenericArgs::Angle(v)) if _ast.list(*v).iter().any(|a| matches!(a, crate::ast::GenericArg::Type(_))))
 }
 
 pub fn unit_ty(tx: &Tx) -> TyId {

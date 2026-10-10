@@ -86,7 +86,7 @@ impl Tcx {
             let name = prog.syms.get(prog.files[file as usize].text(first.name))?;
             return self.trait_assoc(prog, td, name);
         }
-        if !path.global() && first.kind == SegKind::Ident {
+        if !path.global() && first.kind() == SegKind::Ident {
             let name = prog.syms.get(prog.files[file as usize].text(first.name));
             if name.is_some_and(|name| self.lifetime_path_is_parameter(prog, owner, name)) { return None; }
         }
@@ -145,7 +145,7 @@ impl Tcx {
         if !env.regions.enabled { return RegionArgsId::EMPTY; }
         let ast = &prog.files[file as usize].ast;
         let mut out = Vec::new();
-        if let Some(GenericArgs::Angle(v)) = ast.segs(p.segs).last().and_then(|s| ast.gargs(s.args)) {
+        if let Some(GenericArgs::Angle(v)) = ast.segs(p.segs).last().and_then(|s| ast.gargs(s.args())) {
             for a in ast.list(*v) {
                 if let GenericArg::Lifetime(lt) = a { out.push(env.regions.resolve(infcx, &self.tys, prog, file, Some(*lt))); }
             }
@@ -200,7 +200,7 @@ impl Tcx {
             let mut all = f.ast.list(*supers).to_vec();
             for w in f.ast.list(generics.where_) {
                 if let ast::WherePred::Bound { hrtb, ty, bounds } = w {
-                    if hrtb.is_empty() && matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind == SegKind::SelfType) {
+                    if hrtb.is_empty() && matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind() == SegKind::SelfType) {
                         all.extend_from_slice(f.ast.list(*bounds));
                     }
                 }

@@ -61,6 +61,8 @@ unsafe impl Pod for crate::ast::ClosureRow {}
 unsafe impl Pod for crate::ast::StructRow {}
 unsafe impl Pod for crate::ast::MacCall {}
 unsafe impl Pod for crate::ast::WhileRow {}
+unsafe impl Pod for crate::ast::LetStmt {}
+unsafe impl Pod for crate::ast::AttrsStmt {}
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"RFI1");
 /// bump when a section's meaning changes (layouts are covered by the build id)

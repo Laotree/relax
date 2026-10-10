@@ -2426,7 +2426,7 @@ impl<'a> Fcx<'a> {
             return None;
         }
         let s0 = self.ast().segs(path.segs)[0].clone();
-        if s0.kind != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name)) {
+        if s0.kind() != SegKind::SelfType && !self.env.names.contains(&self.sym(s0.name)) {
             return None;
         }
         if let Some(d) = self.tcx.resolve_type_path_def(self.prog, self.file, self.module, path) {
@@ -2891,7 +2891,7 @@ impl<'a> Fcx<'a> {
         // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
         // lifetime arguments (last segment).
         self.value_path_lifetimes.clear();
-        if let Some(GenericArgs::Angle(v)) = self.ast().segs(path.segs).last().and_then(|s| self.ast().gargs(s.args)) {
+        if let Some(GenericArgs::Angle(v)) = self.ast().segs(path.segs).last().and_then(|s| self.ast().gargs(s.args())) {
             for a in self.ast().list(*v) {
                 if let GenericArg::Lifetime(lt) = a {
                     let r = self.env.regions.resolve(Some(&self.infcx), &self.tcx.tys, prog, self.file, Some(*lt));
@@ -2943,7 +2943,7 @@ impl<'a> Fcx<'a> {
             let env = self.env.clone();
             let explicit = self.tcx.lower_generic_args(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, tp);
             // `<T as Trait<_>>`: an inferred trait argument is an inference variable
-            let written: Vec<crate::ast::TyId> = match self.ast().segs(tp.segs).last().and_then(|s| self.ast().gargs(s.args)) {
+            let written: Vec<crate::ast::TyId> = match self.ast().segs(tp.segs).last().and_then(|s| self.ast().gargs(s.args())) {
                 Some(GenericArgs::Angle(v)) => self.ast().list(*v).iter().filter_map(|g| match g {
                     GenericArg::Type(t) => Some(*t),
                     _ => None,
@@ -3115,7 +3115,7 @@ impl<'a> Fcx<'a> {
         // rustc_hir_analysis hir_ty_lowering lower_assoc_path / probe_single_bound_for_assoc_item
         let prefix_is_param = n == 2
             && path.no_qself()
-            && match self.ast().segs(path.segs)[0].kind {
+            && match self.ast().segs(path.segs)[0].kind() {
                 SegKind::SelfType => self.env.trait_def.is_some(),
                 _ => {
                     let s0 = self.sym(self.ast().segs(path.segs)[0].name);
@@ -3649,7 +3649,7 @@ impl<'a> Fcx<'a> {
 
     fn seg_args(&mut self, path: &Path, i: usize, def: DefId, offset: usize) -> Option<Vec<TyId>> {
         let seg = self.ast().segs(path.segs).get(i)?;
-        let a = self.ast().gargs(seg.args)?;
+        let a = self.ast().gargs(seg.args())?;
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
             for g in self.ast().list(*v) {
@@ -3725,7 +3725,7 @@ impl<'a> Fcx<'a> {
     /// Type named by the first `n` segments of a path (for `Type::item`).
     fn type_of_prefix(&mut self, path: &Path, n: usize) -> Option<TyId> {
         let prog = self.prog;
-        if n == 1 && self.ast().segs(path.segs)[0].kind == SegKind::SelfType {
+        if n == 1 && self.ast().segs(path.segs)[0].kind() == SegKind::SelfType {
             let st = self.env.self_ty?;
             return Some(st);
         }
@@ -3741,7 +3741,7 @@ impl<'a> Fcx<'a> {
         let sub = Path { segs: path.segs.prefix(n).without_qself(), lo: path.lo };
         // `Self::Bits::EMPTY` / `T::Assoc::f`: the prefix is an associated-type projection,
         // lowered as a type path and normalized for this instance
-        if n >= 2 && (self.ast().segs(path.segs)[0].kind == SegKind::SelfType || self.env.names.contains(&self.sym(self.ast().segs(path.segs)[0].name))) {
+        if n >= 2 && (self.ast().segs(path.segs)[0].kind() == SegKind::SelfType || self.env.names.contains(&self.sym(self.ast().segs(path.segs)[0].name))) {
             let env = self.env.clone();
             // (an expression path may elide a generic associated type's lifetimes: rustc
             // reports E0107 only in types)
@@ -3840,7 +3840,8 @@ impl<'a> Fcx<'a> {
                 self.retry_goals(false);
             }
             match s {
-                Stmt::Let { attrs, pat, ty, init, else_ } => {
+                Stmt::Let(r) => {
+                    let crate::ast::LetStmt { attrs, pat, ty, init, else_ } = self.ast().row(*r);
                     if !self.active(*attrs) {
                         continue;
                     }
@@ -4828,7 +4829,7 @@ impl<'a> Fcx<'a> {
         for s in ast.list(blk.stmts) {
             match s {
                 Stmt::Expr(e, _) => found = found || self.expr_has_break(*e, 0, label),
-                Stmt::Let { init: Some(e), .. } => found = found || self.expr_has_break(*e, 0, label),
+                Stmt::Let(r) => if let Some(e) = &ast.row(*r).init { found = found || self.expr_has_break(*e, 0, label) },
                 _ => {}
             }
         }
@@ -4869,7 +4870,7 @@ impl<'a> Fcx<'a> {
         for s in ast.stmts(b) {
             let r = match s {
                 Stmt::Expr(e, _) => self.expr_has_break(*e, depth, label),
-                Stmt::Let { init: Some(e), .. } => self.expr_has_break(*e, depth, label),
+                Stmt::Let(r) => ast.row(*r).init.map_or(false, |e| self.expr_has_break(e, depth, label)),
                 _ => false,
             };
             if r {

@@ -350,7 +350,7 @@ impl LifetimeCollector<'_> {
             if path.segs.len() > 1 {
                 let root = ast.segs(path.segs)[0];
                 let symbol = self.prog.syms.get(self.prog.files[file as usize].text(root.name));
-                if root.kind == SegKind::SelfType || symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name)) { return; }
+                if root.kind() == SegKind::SelfType || symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name)) { return; }
             }
             let resolved = self.tcx.lifetime_path_def(self.prog, self.owner, file, self.tcx.item_module(self.prog, self.owner), path);
             if let Some(def) = resolved {
@@ -361,7 +361,7 @@ impl LifetimeCollector<'_> {
                 }
             }
             if let Some(last) = ast.segs(path.segs).last() {
-                self.args(last.args);
+                self.args(last.args());
                 let segment = path.segs.lo + path.segs.len() as u32 - 1;
                 self.implicit_args(segment);
             }
@@ -371,7 +371,7 @@ impl LifetimeCollector<'_> {
                 if let Some(path) = qself.trait_path { self.path(&path); }
             }
             for (i, segment) in ast.segs(path.segs).iter().enumerate() {
-                self.args(segment.args);
+                self.args(segment.args());
                 self.implicit_args(path.segs.lo + i as u32);
             }
         }
@@ -420,7 +420,7 @@ impl LifetimeCollector<'_> {
             if walker.constrained.get(i as usize) == Some(&true) { self.lifetime(LifetimeKey::Path(segment, i)); }
             i += 1;
         }
-        if let Some(GenericArgs::Angle(arguments)) = ast.gargs(last.args) {
+        if let Some(GenericArgs::Angle(arguments)) = ast.gargs(last.args()) {
             for &arg in ast.list(*arguments) {
                 if matches!(arg, GenericArg::Binding(..) | GenericArg::Constraint(..)) { continue; }
                 match walker.constrained.get(i as usize) {
@@ -743,8 +743,8 @@ impl BoundVarContext<'_> {
         let segments = ast.segs(path.segs);
         let Some(segment) = segments.first() else { return; };
         let symbol = self.prog.syms.get(self.prog.files[self.file as usize].text(segment.name));
-        let parameter = path.no_qself() && segments.len() == 1 && segment.args.is_none() && symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name));
-        if segment.kind == SegKind::SelfType && !parameter {
+        let parameter = path.no_qself() && segments.len() == 1 && segment.args().is_none() && symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name));
+        if segment.kind() == SegKind::SelfType && !parameter {
             self.tcx.dcx.report(self.cause(segment.name.lo), "precise capture cannot name the Self alias of an impl".into());
         } else if !parameter {
             self.tcx.dcx.report(self.cause(segment.name.lo), "precise capture must name a type or const parameter".into());
@@ -830,13 +830,15 @@ impl BoundVarContext<'_> {
         let ast = &self.prog.files[self.file as usize].ast;
         for stmt in ast.list(ast.block(block).stmts) {
             match *stmt {
-                ast::Stmt::Let { pat, ty, init, else_, .. } => {
+                ast::Stmt::Let(r) => {
+                    let ast::LetStmt { pat, ty, init, else_, .. } = *ast.row(r);
                     self.visit_pat(pat);
                     if let Some(ty) = ty { self.visit_ty(ty); }
                     if let Some(expr) = init { self.visit_expr(expr); }
                     if let Some(block) = else_ { self.visit_block(block); }
                 }
-                ast::Stmt::Expr(expr, _) | ast::Stmt::Attrs(_, expr, _) => self.visit_expr(expr),
+                ast::Stmt::Expr(expr, _) => self.visit_expr(expr),
+                ast::Stmt::Attrs(r) => self.visit_expr(ast.row(r).expr),
                 ast::Stmt::Item(_) | ast::Stmt::Empty => {}
             }
         }
@@ -938,7 +940,7 @@ impl BoundVarContext<'_> {
         if let Some(qself) = ast.qself(path) { return if qself.trait_path.is_none() { 0 } else { segs.len() }; }
         if segs.len() < 2 || path.global() { return segs.len(); }
         let first = &segs[0];
-        let first_is_param = first.kind == SegKind::SelfType || (first.kind == SegKind::Ident
+        let first_is_param = first.kind() == SegKind::SelfType || (first.kind() == SegKind::Ident
             && self.prog.syms.get(self.prog.files[self.file as usize].text(first.name)).is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name)));
         if first_is_param { return 1; }
         if self.tcx.lifetime_path_def(self.prog, self.owner, self.file, self.module, path).is_some() { return segs.len(); }
@@ -959,7 +961,7 @@ impl BoundVarContext<'_> {
             if let Some(trait_path) = qself.trait_path { self.visit_path(&trait_path); }
         }
         for (i, segment) in ast.segs(path.segs).iter().enumerate() {
-            if let Some(GenericArgs::Paren(inputs, output)) = ast.gargs(segment.args) {
+            if let Some(GenericArgs::Paren(inputs, output)) = ast.gargs(segment.args()) {
                 self.scopes.push(Scope::ObjectLifetimeDefault(Some(ResolvedArg::StaticLifetime)));
                 for &ty in ast.list(*inputs) { self.visit_ty(ty); }
                 if let Some(ty) = output { self.visit_ty(*ty); }
@@ -967,7 +969,7 @@ impl BoundVarContext<'_> {
                 continue;
             }
             let segment_id = path.segs.lo + i as u32;
-            let arguments = match ast.gargs(segment.args) { Some(GenericArgs::Angle(arguments)) => ast.list(*arguments), _ => &[] };
+            let arguments = match ast.gargs(segment.args()) { Some(GenericArgs::Angle(arguments)) => ast.list(*arguments), _ => &[] };
             let mut lifetimes = Vec::new();
             for argument in arguments {
                 if let GenericArg::Lifetime(name) = *argument {
@@ -1138,7 +1140,7 @@ impl BoundVarContext<'_> {
                     };
                     let index = segments.len().checked_sub(reverse_index + 1)?;
                     let segment = ast.segs(segments)[index];
-                    if let Some(GenericArgs::Angle(args)) = ast.gargs(segment.args) {
+                    if let Some(GenericArgs::Angle(args)) = ast.gargs(segment.args()) {
                         let mut ordinal = 0;
                         for arg in ast.list(*args) {
                             if let GenericArg::Lifetime(lt) = arg {

@@ -2754,7 +2754,7 @@ impl Program {
         match t {
             UseTree::Path(seg, rest) => {
                 let s = self.ident(file, seg.name);
-                prefix.push((seg.kind, s));
+                prefix.push((seg.kind(), s));
                 let rest = *self.files[file as usize].ast.use_tree(*rest);
                 self.flatten_use(file, module, global, &rest, prefix, is_pub, pos);
                 prefix.pop();
@@ -2764,13 +2764,13 @@ impl Program {
                 let mut segs = prefix.clone();
                 // `use foo::{self}` imports `foo` itself
                 let bind;
-                if seg.kind == SegKind::SelfValue && !segs.is_empty() {
+                if seg.kind() == SegKind::SelfValue && !segs.is_empty() {
                     bind = match rename {
                         Some(r) => self.ident(file, *r),
                         None => segs[segs.len() - 1].1,
                     };
                 } else {
-                    segs.push((seg.kind, s));
+                    segs.push((seg.kind(), s));
                     bind = match rename {
                         Some(r) => self.ident(file, *r),
                         None => s,
@@ -4774,7 +4774,8 @@ fn walk_body_block(ast_m: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId, out: &mu
             match s {
                 Stmt::Item(i) => items.push(*i),
                 Stmt::Expr(e, _) => blocks_in_expr(ast, *e, &mut sub_blocks),
-                Stmt::Let { init, else_, .. } => {
+                Stmt::Let(r) => {
+                    let LetStmt { init, else_, .. } = ast.row(*r);
                     if let Some(e) = init {
                         blocks_in_expr(ast, *e, &mut sub_blocks);
                     }
@@ -4802,19 +4803,20 @@ fn walk_body_block(ast_m: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId, out: &mu
 /// cfg-strips the statements of a fn-body block.
 fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
     let blk = ast.block(b);
-    let needs = ast.list(blk.stmts).iter().any(|s| matches!(s, Stmt::Attrs(..)) || matches!(s, Stmt::Let { attrs, .. } if !attrs.is_empty()));
+    let needs = ast.list(blk.stmts).iter().any(|s| matches!(s, Stmt::Attrs(..)) || matches!(s, Stmt::Let(r) if !ast.row(*r).attrs.is_empty()));
     if !needs {
         return;
     }
     let mut out = Vec::with_capacity(blk.stmts.len());
     for s in ast.list(blk.stmts) {
         match s {
-            Stmt::Attrs(attrs, e, semi) => {
+            Stmt::Attrs(r) => {
+                let AttrsStmt { attrs, expr, semi } = ast.row(*r);
                 if crate::cfg::active(src, ast.list(*attrs), cfg) {
-                    out.push(Stmt::Expr(*e, *semi));
+                    out.push(Stmt::Expr(*expr, *semi));
                 }
             }
-            Stmt::Let { attrs, .. } if !attrs.is_empty() && !crate::cfg::active(src, ast.list(*attrs), cfg) => {}
+            Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
             s => out.push(*s),
         }
     }
@@ -4919,7 +4921,7 @@ fn path_segs_uncached(prog: &Program, file: u32, p: &Path) -> Vec<(SegKind, Sym)
             Some(x) => x,
             None => t,
         };
-        v.push((s.kind, prog.syms.get(t).unwrap_or(u32::MAX)));
+        v.push((s.kind(), prog.syms.get(t).unwrap_or(u32::MAX)));
     }
     v
 }

@@ -741,7 +741,7 @@ impl<'a> Parser<'a> {
     }
 
     fn seg_text(&self, sg: &PathSeg) -> String {
-        match sg.kind {
+        match sg.kind() {
             SegKind::Crate => "crate".to_string(),
             SegKind::Super => "super".to_string(),
             SegKind::SelfValue => "self".to_string(),
@@ -807,7 +807,7 @@ impl<'a> Parser<'a> {
             mpath.push(String::new());
         }
         for f in &self.ast.segs(path.segs)[..path.segs.len() - 1] {
-            mpath.push(match f.kind {
+            mpath.push(match f.kind() {
                 SegKind::Crate => "crate".to_string(),
                 SegKind::Super => "super".to_string(),
                 SegKind::SelfValue => "self".to_string(),
@@ -1327,6 +1327,8 @@ impl<'a> Parser<'a> {
         self.ast.struct_exprs.truncate((ends[34] - self.ast.base[34]) as usize);
         self.ast.mac_calls.truncate((ends[35] - self.ast.base[35]) as usize);
         self.ast.while_exprs.truncate((ends[36] - self.ast.base[36]) as usize);
+        // let_stmts / attrs_stmts stay: the statement lists (never truncated here) keep the
+        // cfg'd-out bodies' statements, which point at them
         self.extra_items.truncate(lens.6);
         match r? {
             Some(_) => Ok(()),
@@ -1973,7 +1975,7 @@ impl<'a> Parser<'a> {
         let mut more = Vec::new();
         for w in self.ast.list(generics.where_) {
             if let WherePred::Bound { ty, bounds, hrtb } = w {
-                if hrtb.is_empty() && matches!(self.ast.ty(*ty), Ty::Path(p) if p.no_qself() && matches!(self.ast.segs(p.segs), [s] if s.kind == SegKind::SelfType && s.args.is_none())) {
+                if hrtb.is_empty() && matches!(self.ast.ty(*ty), Ty::Path(p) if p.no_qself() && matches!(self.ast.segs(p.segs), [s] if s.kind() == SegKind::SelfType && s.args().is_none())) {
                     more.extend_from_slice(self.ast.list(*bounds));
                 }
             }
@@ -2095,7 +2097,7 @@ impl<'a> Parser<'a> {
             _ => return self.err("expected path segment"),
         };
         self.pos += 1;
-        Ok(PathSeg { kind, name: Ident { lo: t.lo, hi: t.hi }, args: GenericArgsId::NONE })
+        Ok(PathSeg::new(kind, Ident { lo: t.lo, hi: t.hi }, GenericArgsId::NONE))
     }
 
     // ------------------------------------------------------------ generics
@@ -2268,15 +2270,15 @@ impl<'a> Parser<'a> {
             if expr {
                 if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
                     self.pos += 1;
-                    seg.args = self.generic_args_angle()?;
+                    seg.set_args(self.generic_args_angle()?);
                 }
             } else {
                 if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
                     self.pos += 1;
                 }
                 if matches!(self.kind(), T::Lt | T::Shl | T::LArrow) {
-                    seg.args = self.generic_args_angle()?;
-                } else if self.kind() == T::OpenParen && seg.kind == SegKind::Ident {
+                    seg.set_args(self.generic_args_angle()?);
+                } else if self.kind() == T::OpenParen && seg.kind() == SegKind::Ident {
                     // Fn(A, B) -> C sugar
                     self.pos += 1;
                     let mut tys = Vec::new();
@@ -2289,7 +2291,7 @@ impl<'a> Parser<'a> {
                     self.expect(T::CloseParen)?;
                     let ret = if self.eat(T::RArrow) { Some(self.ty()?) } else { None };
                     let tys = self.ast.push_list(tys);
-                    seg.args = self.ast.push_gargs(GenericArgs::Paren(tys, ret));
+                    seg.set_args(self.ast.push_gargs(GenericArgs::Paren(tys, ret)));
                 }
             }
             segs.push(seg);
@@ -2312,7 +2314,7 @@ impl<'a> Parser<'a> {
     /// just before them (Ast::qself).
     pub fn mk_segs_q(&mut self, v: Vec<PathSeg>, global: bool, qself: QSelfId) -> SegList {
         if qself.is_some() {
-            self.ast.path_segs.push(PathSeg { kind: SegKind::Ident, name: Ident::default(), args: GenericArgsId(qself.0) });
+            self.ast.path_segs.push(PathSeg::new(SegKind::Ident, Ident::default(), GenericArgsId(qself.0)));
         }
         let lo = self.ast.base[5] + self.ast.path_segs.len() as u32;
         let len = v.len() as u32;
@@ -2877,7 +2879,9 @@ impl<'a> Parser<'a> {
         if let Stmt::Expr(e, semi) = s {
             if !attrs.is_empty() {
                 // kept for cfg stripping at load
-                return Ok(Stmt::Attrs(self.ast.push_list(attrs), e, semi));
+                let attrs = self.ast.push_list(attrs);
+                let r = self.ast.push_row(AttrsStmt { attrs, expr: e, semi });
+                return Ok(Stmt::Attrs(r));
             }
         }
         Ok(s)
@@ -2897,7 +2901,8 @@ impl<'a> Parser<'a> {
             };
             self.expect(T::Semi)?;
             let attrs = self.ast.push_list(attrs);
-            return Ok(Stmt::Let { attrs, pat, ty, init, else_ });
+            let r = self.ast.push_row(LetStmt { attrs, pat, ty, init, else_ });
+            return Ok(Stmt::Let(r));
         }
         if self.at_item_start() {
             if let Some(id) = self.item(attrs.clone())? {
@@ -3472,7 +3477,7 @@ impl<'a> Parser<'a> {
                 let e = self.expr()?;
                 fields.push(FieldExpr { attrs, name, expr: e, shorthand: false });
             } else {
-                let segs = self.mk_segs(vec![PathSeg { kind: SegKind::Ident, name, args: GenericArgsId::NONE }], false);
+                let segs = self.mk_segs(vec![PathSeg::new(SegKind::Ident, name, GenericArgsId::NONE)], false);
                 let p = Path { segs, lo: t.lo };
                 let e = self.mk_expr(ExprKind::Path(p), t.lo);
                 fields.push(FieldExpr { attrs, name, expr: e, shorthand: true });
@@ -3526,10 +3531,11 @@ impl<'a> Parser<'a> {
             let stmts = match ret {
                 Some(t) => {
                     let pat = self.mk_pat(Pat::Ident { by_ref: false, mutbl: false, name, sub: None });
-                    let segs = self.mk_segs(vec![PathSeg { kind: SegKind::Ident, name, args: GenericArgsId::NONE }], false);
+                    let segs = self.mk_segs(vec![PathSeg::new(SegKind::Ident, name, GenericArgsId::NONE)], false);
                     let path = Path { segs, lo: blo };
                     let tail = self.mk_expr(ExprKind::Path(path), blo);
-                    vec![Stmt::Let { attrs: List::EMPTY, pat, ty: Some(t), init: Some(body), else_: None }, Stmt::Expr(tail, false)]
+                    let r = self.ast.push_row(LetStmt { attrs: List::EMPTY, pat, ty: Some(t), init: Some(body), else_: None });
+                    vec![Stmt::Let(r), Stmt::Expr(tail, false)]
                 }
                 None => vec![Stmt::Expr(body, false)],
             };

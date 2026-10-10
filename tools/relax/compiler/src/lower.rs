@@ -2452,7 +2452,8 @@ impl<'a> Lcx<'a> {
                 }
             }
             match s {
-                Stmt::Let { attrs, pat, init, else_, .. } => {
+                Stmt::Let(r) => {
+                    let crate::ast::LetStmt { attrs, pat, init, else_, .. } = ast.row(*r);
                     if !self.active(*attrs) {
                         continue;
                     }

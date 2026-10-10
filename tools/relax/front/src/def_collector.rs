@@ -579,7 +579,7 @@ impl DefCollector<'_> {
             self.visit_ty(q.ty, opaque);
             if let Some(path) = q.trait_path { self.visit_path(path, opaque); }
         }
-        for s in self.ast.segs(p.segs) { self.visit_args(s.args, opaque); }
+        for s in self.ast.segs(p.segs) { self.visit_args(s.args(), opaque); }
     }
     fn visit_args(&mut self, args: GenericArgsId, opaque: bool) {
         match self.ast.gargs(args) {
@@ -635,7 +635,7 @@ impl DefCollector<'_> {
             _ => e,
         };
         match self.ast.expr(e).kind {
-            ExprKind::Path(p) => p.no_qself() && !p.global() && p.segs.len() == 1 && self.ast.gargs(self.ast.segs(p.segs)[0].args).is_none(),
+            ExprKind::Path(p) => p.no_qself() && !p.global() && p.segs.len() == 1 && self.ast.gargs(self.ast.segs(p.segs)[0].args()).is_none(),
             _ => false,
         }
     }
@@ -663,12 +663,14 @@ impl DefCollector<'_> {
         }
         for s in self.ast.list(self.ast.block(b).stmts) {
             match *s {
-                Stmt::Let { pat, ty, init, else_, .. } => {
+                Stmt::Let(r) => {
+                    let LetStmt { pat, ty, init, else_, .. } = *self.ast.row(r);
                     self.visit_pat(pat); if let Some(t) = ty { self.visit_ty(t, false); }
                     if let Some(e) = init { self.visit_expr(e); } if let Some(b) = else_ { self.visit_block(b); }
                     self.bind_pat(pat);
                 }
-                Stmt::Expr(e, _) | Stmt::Attrs(_, e, _) => self.visit_expr(e),
+                Stmt::Expr(e, _) => self.visit_expr(e),
+                Stmt::Attrs(r) => self.visit_expr(self.ast.row(r).expr),
                 Stmt::Item(i) => {
                     if self.checking_defs { self.creates_defs = true; continue; }
                     if !self.legacy {
@@ -798,7 +800,7 @@ impl DefCollector<'_> {
         let ExprKind::Path(path) = self.ast.expr(callee).kind else { return; };
         if !path.no_qself() { return; }
         let Some(last) = self.ast.segs(path.segs).last() else { return; };
-        if self.ast.gargs(last.args).is_some() { return; }
+        if self.ast.gargs(last.args()).is_some() { return; }
         let text = self.prog.files[self.file as usize].text(last.name);
         let text = text.strip_prefix("r#").unwrap_or(text).to_string();
         let name = self.prog.syms.intern(&text);
@@ -811,7 +813,7 @@ impl DefCollector<'_> {
         if !path.no_qself() { return; }
         let segments = self.ast.segs(path.segs);
         let Some(last) = segments.last() else { return; };
-        if self.ast.gargs(last.args).is_some() { return; }
+        if self.ast.gargs(last.args()).is_some() { return; }
         {
             let pf = &self.prog.files[self.file as usize];
             let text = pf.text(last.name);

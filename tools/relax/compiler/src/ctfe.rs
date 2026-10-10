@@ -762,7 +762,9 @@ impl<'a> Ctx<'a> {
         let n = stmts.len();
         for (k, s) in stmts.iter().enumerate() {
             match s {
-                Stmt::Let { pat, init: Some(x), else_: None, .. } => {
+                Stmt::Let(r) if { let l = self.u.prog.files[file].ast.row(*r); l.init.is_some() && l.else_.is_none() } => {
+                    let crate::ast::LetStmt { pat, init, .. } = self.u.prog.files[file].ast.row(*r).clone();
+                    let (pat, x) = (&pat, init.as_ref().unwrap());
                     if matches!(self.u.prog.files[file].ast.pat(*pat), crate::ast::Pat::Wild) {
                         self.eval(b, env, *x)?;
                         continue;
@@ -914,10 +916,10 @@ impl<'a> Ctx<'a> {
         let invocation = file.bytes(call, u32::MAX);
         let bang = invocation.iter().position(|c| *c == b'!')?;
         if std::str::from_utf8(&invocation[..bang]).ok()?.rsplit("::").next()?.trim() != "offset_of" { return None; }
-        let [Stmt::Let { pat: up, init: Some(ui), else_: None, .. },
-             Stmt::Let { pat: bp, init: Some(bi), else_: None, .. },
-             Stmt::Let { pat: fp, init: Some(fi), else_: None, .. },
-             Stmt::Expr(tail, false)] = ast.stmts(bl) else { return None };
+        let [Stmt::Let(r1), Stmt::Let(r2), Stmt::Let(r3), Stmt::Expr(tail, false)] = ast.stmts(bl) else { return None };
+        let (crate::ast::LetStmt { pat: up, init: Some(ui), else_: None, .. },
+             crate::ast::LetStmt { pat: bp, init: Some(bi), else_: None, .. },
+             crate::ast::LetStmt { pat: fp, init: Some(fi), else_: None, .. }) = (ast.row(*r1), ast.row(*r2), ast.row(*r3)) else { return None };
         for pat in [up, bp, fp] {
             if !matches!(ast.pat(*pat), crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }) { return None; }
         }

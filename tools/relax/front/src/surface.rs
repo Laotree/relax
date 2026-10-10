@@ -52,7 +52,7 @@ fn returns_impl_trait(ast: &Ast, t: Option<crate::ast::TyId>) -> bool {
             Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Paren(x) => walk(ast, *x, depth + 1),
             Ty::Array(x, _) => walk(ast, *x, depth + 1),
             Ty::Tuple(v) => ast.list(*v).iter().any(|x| walk(ast, *x, depth + 1)),
-            Ty::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args) {
+            Ty::Path(p) => ast.segs(p.segs).iter().any(|s| match ast.gargs(s.args()) {
                 Some(crate::ast::GenericArgs::Angle(a)) => ast.list(*a).iter().any(|g| matches!(g, crate::ast::GenericArg::Type(x) if walk(ast, *x, depth + 1))),
                 _ => false,
             }),

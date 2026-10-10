@@ -3307,7 +3307,7 @@ impl<'a> Nll<'a> {
                     for b in ast.list(*bs) {
                         if let crate::ast::Bound::Trait { path, .. } = b {
                             if let Some(seg) = ast.segs(path.segs).last() {
-                                if let Some(crate::ast::GenericArgs::Paren(v, _)) = ast.gargs(seg.args) {
+                                if let Some(crate::ast::GenericArgs::Paren(v, _)) = ast.gargs(seg.args()) {
                                     ps = Some(ast.list(*v).to_vec());
                                 }
                             }

@@ -219,7 +219,7 @@ impl RPITVisitor<'_> {
             Ty::Tuple(ts) => for &t in ast.list(ts) { self.visit_ty(t); },
             Ty::Path(p) => {
                 if let Some(q) = ast.qself(&p) { self.visit_ty(q.ty); }
-                for seg in ast.segs(p.segs) { self.visit_args(seg.args); }
+                for seg in ast.segs(p.segs) { self.visit_args(seg.args()); }
             }
             Ty::Fn(sig) => {
                 let sig = ast.fn_ptr(sig);
@@ -234,7 +234,7 @@ impl RPITVisitor<'_> {
         let ast = &self.prog.files[self.file as usize].ast;
         for bound in ast.list(bounds) {
             if let crate::ast::Bound::Trait { path, .. } = bound {
-                for seg in ast.segs(path.segs) { self.visit_args(seg.args); }
+                for seg in ast.segs(path.segs) { self.visit_args(seg.args()); }
             }
         }
     }

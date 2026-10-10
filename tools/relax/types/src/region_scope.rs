@@ -127,7 +127,7 @@ impl Resolve<'_> {
         self.cx.var_parent = if kind == BodyKind::Constant { None } else { Some(arguments) };
     }
     fn block_tail(&self, b: BlockId) -> Option<ExprId> {
-        match self.file.ast.stmts(b).last() { Some(Stmt::Expr(e, false) | Stmt::Attrs(_, e, false)) => Some(*e), _ => None }
+        match self.file.ast.stmts(b).last().and_then(|s| self.file.ast.stmt_expr(s)) { Some((e, false)) => Some(e), _ => None }
     }
     /// Remainders are nested in declaration order; let-else exits to the preceding context.
     /// rustc_hir_analysis/src/check/region.rs:56-167.
@@ -139,21 +139,22 @@ impl Resolve<'_> {
         let statements = ast.block(b).stmts;
         for (i, stmt) in ast.list(statements).iter().enumerate() {
             if i + 1 == statements.len() {
-                if let Stmt::Expr(e, false) | Stmt::Attrs(_, e, false) = *stmt {
+                if let Some((e, false)) = ast.stmt_expr(stmt) {
                     self.expr(e, node_edition(self.file, Node::Block(b.0)) >= 2024);
                     break;
                 }
             }
             if matches!(stmt, Stmt::Item(_)) { continue; }
             let before = self.cx;
-            if matches!(stmt, Stmt::Let { .. }) {
+            if matches!(stmt, Stmt::Let(_)) {
                 self.enter(Node::Block(b.0), ScopeData::Remainder(i as u32));
                 self.cx.var_parent = self.cx.parent;
             }
             let remainder = self.cx;
             self.node(Node::Statement(statements.lo + i as u32), true);
             match *stmt {
-                Stmt::Let { pat, init, .. } => {
+                Stmt::Let(r) => {
+                    let crate::ast::LetStmt { pat, init, .. } = *ast.row(r);
                     if let Some(e) = init {
                         self.extend_borrows(e, self.cx.var_parent);
                         if self.explicit_ref(pat) { self.extend_place(e, self.cx.var_parent); }
@@ -161,10 +162,11 @@ impl Resolve<'_> {
                     }
                     self.pat(pat);
                 }
-                Stmt::Expr(e, _) | Stmt::Attrs(_, e, _) => self.expr(e, false),
+                Stmt::Expr(e, _) => self.expr(e, false),
+                Stmt::Attrs(r) => self.expr(ast.row(r).expr, false),
                 Stmt::Item(_) | Stmt::Empty => (),
             }
-            if let Stmt::Let { else_: Some(els), .. } = *stmt {
+            if let Some(els) = if let Stmt::Let(r) = *stmt { ast.row(r).else_ } else { None } {
                 self.cx = before;
                 self.block(els, true);
             }

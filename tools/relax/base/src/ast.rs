@@ -382,6 +382,26 @@ impl FlatArray<WhileRow> for Ast {
     }
 }
 
+impl FlatArray<LetStmt> for Ast {
+    const BASE: usize = 37;
+    fn array(a: &Ast) -> &[LetStmt] {
+        &a.let_stmts
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<LetStmt> {
+        a.let_stmts.vec_mut()
+    }
+}
+
+impl FlatArray<AttrsStmt> for Ast {
+    const BASE: usize = 38;
+    fn array(a: &Ast) -> &[AttrsStmt] {
+        &a.attrs_stmts
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<AttrsStmt> {
+        a.attrs_stmts.vec_mut()
+    }
+}
+
 impl FlatArray<WherePred> for Ast {
     const BASE: usize = 30;
     fn array(a: &Ast) -> &[WherePred] {
@@ -566,6 +586,7 @@ pub struct QSelf {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum SegKind {
     Ident,
     SelfValue,
@@ -603,12 +624,53 @@ pub struct FnSigId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UseTreeId(pub u32);
 
-#[derive(Debug, Clone, Copy)]
+/// One path segment in 12 bytes: the name and, in one word, the segment kind (top 3 bits) and
+/// the generic arguments id (low 29 bits, all ones: none). A qualified path's placeholder
+/// segment (SegList::has_qself) keeps its QSelf id in the id bits.
+#[derive(Clone, Copy)]
 pub struct PathSeg {
-    pub kind: SegKind,
     pub name: Ident,
-    pub args: GenericArgsId,
+    kind_args: u32,
 }
+
+const SEG_ID_BITS: u32 = 29;
+const SEG_ID_NONE: u32 = (1 << SEG_ID_BITS) - 1;
+
+impl PathSeg {
+    #[inline]
+    pub fn new(kind: SegKind, name: Ident, args: GenericArgsId) -> PathSeg {
+        let id = if args.0 == u32::MAX { SEG_ID_NONE } else { args.0 };
+        assert!(id < SEG_ID_NONE || args.0 == u32::MAX, "path segment: generic args id out of range");
+        PathSeg { name, kind_args: (kind as u32) << SEG_ID_BITS | id }
+    }
+    #[inline]
+    pub fn kind(&self) -> SegKind {
+        match self.kind_args >> SEG_ID_BITS {
+            0 => SegKind::Ident,
+            1 => SegKind::SelfValue,
+            2 => SegKind::SelfType,
+            3 => SegKind::Super,
+            _ => SegKind::Crate,
+        }
+    }
+    #[inline]
+    pub fn args(&self) -> GenericArgsId {
+        let id = self.kind_args & SEG_ID_NONE;
+        GenericArgsId(if id == SEG_ID_NONE { u32::MAX } else { id })
+    }
+    #[inline]
+    pub fn set_args(&mut self, args: GenericArgsId) {
+        *self = PathSeg::new(self.kind(), self.name, args);
+    }
+}
+
+impl std::fmt::Debug for PathSeg {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("PathSeg").field("kind", &self.kind()).field("name", &self.name).field("args", &self.args()).finish()
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<PathSeg>() == 12);
 
 #[derive(Debug, Clone, Copy)]
 pub enum GenericArgs {
@@ -974,23 +1036,38 @@ pub struct Expr {
 const _: () = assert!(std::mem::size_of::<ExprKind>() == 16);
 const _: () = assert!(std::mem::size_of::<Expr>() == 24);
 
+/// `let pat: ty = init else { else_ };`
+#[derive(Debug, Clone, Copy)]
+pub struct LetStmt {
+    pub attrs: List<Attr>,
+    pub pat: PatId,
+    pub ty: Option<TyId>,
+    pub init: Option<ExprId>,
+    pub else_: Option<BlockId>,
+}
+
+/// An expression statement with outer attributes (`Stmt::Attrs`).
+#[derive(Debug, Clone, Copy)]
+pub struct AttrsStmt {
+    pub attrs: List<Attr>,
+    pub expr: ExprId,
+    pub semi: bool,
+}
+
+/// 8 bytes: a `let` and an attributed expression statement are rows (Stmt used to be 36).
 #[derive(Debug, Clone, Copy)]
 pub enum Stmt {
-    Let {
-        attrs: List<Attr>,
-        pat: PatId,
-        ty: Option<TyId>,
-        init: Option<ExprId>,
-        else_: Option<BlockId>,
-    },
+    Let(Row<LetStmt>),
     Item(ItemId),
     Expr(ExprId, bool),
     /// an expression statement (`Stmt::Expr(expr, semi)`) with outer attributes; program
     /// loading strips it by its `#[cfg]` (keeping the statement or dropping it), so later
     /// passes never see it
-    Attrs(List<Attr>, ExprId, bool),
+    Attrs(Row<AttrsStmt>),
     Empty,
 }
+
+const _: () = assert!(std::mem::size_of::<Stmt>() == 8);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Block {
@@ -1121,7 +1198,7 @@ pub enum ItemKind {
 }
 
 /// Number of id ranges a tree has (Ast::base / Ast::ends).
-pub const ARENAS: usize = 37;
+pub const ARENAS: usize = 39;
 
 /// Ast::base (an array of more than 32 entries has no Default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1205,6 +1282,8 @@ pub struct Ast {
     pub struct_exprs: crate::arena::Arena<StructRow>,
     pub mac_calls: crate::arena::Arena<MacCall>,
     pub while_exprs: crate::arena::Arena<WhileRow>,
+    pub let_stmts: crate::arena::Arena<LetStmt>,
+    pub attrs_stmts: crate::arena::Arena<AttrsStmt>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
     pub base: Bases,
@@ -1275,7 +1354,7 @@ impl Ast {
         if p.no_qself() {
             return None;
         }
-        let q = self.segs(SegList::new(p.segs.lo - 1, 1, false))[0].args.0;
+        let q = self.segs(SegList::new(p.segs.lo - 1, 1, false))[0].args().0;
         match self.qselfs.get(q.wrapping_sub(self.base[14]) as usize) {
             Some(q) => Some(q),
             None => self.part_or_panic("qself", q).qself(p),
@@ -1387,6 +1466,19 @@ impl Ast {
         a.extend(v);
         List::new(lo, len)
     }
+    /// The expression of an expression statement, with or without outer attributes, and its
+    /// trailing `;`.
+    #[inline]
+    pub fn stmt_expr(&self, s: &Stmt) -> Option<(ExprId, bool)> {
+        match s {
+            Stmt::Expr(e, semi) => Some((*e, *semi)),
+            Stmt::Attrs(r) => {
+                let a = self.row(*r);
+                Some((a.expr, a.semi))
+            }
+            _ => None,
+        }
+    }
     /// A block's statements.
     #[inline]
     pub fn stmts(&self, b: BlockId) -> &[Stmt] {
@@ -1439,6 +1531,8 @@ impl Ast {
             self.base[34] + self.struct_exprs.len() as u32,
             self.base[35] + self.mac_calls.len() as u32,
             self.base[36] + self.while_exprs.len() as u32,
+            self.base[37] + self.let_stmts.len() as u32,
+            self.base[38] + self.attrs_stmts.len() as u32,
         ]
     }
     #[cold]
@@ -1490,6 +1584,8 @@ impl Ast {
         self.struct_exprs.shrink_to_fit();
         self.mac_calls.shrink_to_fit();
         self.while_exprs.shrink_to_fit();
+        self.let_stmts.shrink_to_fit();
+        self.attrs_stmts.shrink_to_fit();
     }
     /// Mutable block (cfg stripping of a tree being built).
     pub fn block_mut(&mut self, id: BlockId) -> &mut Block {

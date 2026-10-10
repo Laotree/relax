@@ -295,13 +295,15 @@ impl LifetimeResolver<'_> {
         let ast = &self.prog.files[self.file as usize].ast;
         for stmt in ast.list(ast.block(block).stmts) {
             match *stmt {
-                ast::Stmt::Let { pat, ty, init, else_, .. } => {
+                ast::Stmt::Let(r) => {
+                    let ast::LetStmt { pat, ty, init, else_, .. } = *ast.row(r);
                     self.visit_pat(pat);
                     if let Some(ty) = ty { self.visit_ty(ty); }
                     if let Some(expr) = init { self.visit_expr(expr); }
                     if let Some(block) = else_ { self.visit_block(block); }
                 }
-                ast::Stmt::Expr(expr, _) | ast::Stmt::Attrs(_, expr, _) => self.visit_expr(expr),
+                ast::Stmt::Expr(expr, _) => self.visit_expr(expr),
+                ast::Stmt::Attrs(r) => self.visit_expr(ast.row(r).expr),
                 ast::Stmt::Item(_) | ast::Stmt::Empty => {}
             }
         }
@@ -315,7 +317,7 @@ impl LifetimeResolver<'_> {
         // names one type constructor: a struct, union, enum or primitive type.
         let primitive = |file: u32, path: &ast::Path| -> Option<&'static str> {
             let a = &self.prog.files[file as usize].ast;
-            if !path.no_qself() || path.global() || path.segs.len() != 1 || a.gargs(a.segs(path.segs)[0].args).is_some() { return None; }
+            if !path.no_qself() || path.global() || path.segs.len() != 1 || a.gargs(a.segs(path.segs)[0].args()).is_some() { return None; }
             let text = self.prog.files[file as usize].text(a.segs(path.segs)[0].name);
             crate::program::PRIMS.iter().find(|(name, _)| *name == text).map(|(name, _)| *name)
         };
@@ -341,7 +343,7 @@ impl LifetimeResolver<'_> {
                     match *ast.ty(child) {
                         ast::Ty::ImplicitSelf => { contains_self = true; break; }
                         ast::Ty::Path(path) if path.no_qself() => {
-                            if (path.segs.len() == 1 && ast.segs(path.segs)[0].kind == SegKind::SelfType) ||
+                            if (path.segs.len() == 1 && ast.segs(path.segs)[0].kind() == SegKind::SelfType) ||
                                 impl_self.is_some_and(|(d, prim)| match d {
                                     Some(d) => self.tcx.resolve_type_path_def(self.prog, self.file, self.module, &path) == Some(d),
                                     None => self.tcx.resolve_type_path_def(self.prog, self.file, self.module, &path).is_none() && primitive(self.file, &path) == prim,
@@ -462,7 +464,7 @@ impl LifetimeResolver<'_> {
         }
         self.resolve_elided_lifetimes_in_path(path, inferred);
         for segment in ast.segs(path.segs) {
-            if let Some(GenericArgs::Paren(params, ret)) = ast.gargs(segment.args) {
+            if let Some(GenericArgs::Paren(params, ret)) = ast.gargs(segment.args()) {
                 // Probe the lifetime ribs: the nearest poly-trait binder introduces the
                 // sugar's lifetimes; with no binder in between, walk the arguments normally.
                 for i in (0..self.ribs.len()).rev() {
@@ -482,7 +484,7 @@ impl LifetimeResolver<'_> {
                     }
                 }
             } else {
-                self.visit_generic_args(segment.args);
+                self.visit_generic_args(segment.args());
             }
         }
     }
@@ -499,9 +501,9 @@ impl LifetimeResolver<'_> {
             if let Some(def) = self.tcx.lifetime_path_def(self.prog, self.owner, self.file, self.module, &prefix) { break def; }
             proj_start -= 1;
         };
-        let has_generic_args = |i: usize| ast.gargs(segs[i].args).is_some();
+        let has_generic_args = |i: usize| ast.gargs(segs[i].args()).is_some();
         for (i, segment) in segs.iter().enumerate() {
-            if matches!(ast.gargs(segment.args), Some(GenericArgs::Angle(args)) if ast.list(*args).iter().any(|a| matches!(a, GenericArg::Lifetime(_)))) { continue; }
+            if matches!(ast.gargs(segment.args()), Some(GenericArgs::Angle(args)) if ast.list(*args).iter().any(|a| matches!(a, GenericArg::Lifetime(_)))) { continue; }
             let type_def = match self.prog.def(base).kind {
                 DefKind::AssocTy if i + 2 == proj_start => self.prog.def(base).parent,
                 DefKind::Variant if i + 2 == proj_start && has_generic_args(i) => self.prog.def(base).parent,
@@ -705,7 +707,7 @@ fn path_types(ast: &ast::Ast, path: &ast::Path, out: &mut Vec<ast::TyId>) {
         out.push(qself.ty);
         if let Some(path) = qself.trait_path { path_types(ast, &path, out); }
     }
-    for segment in ast.segs(path.segs) { argument_types(ast, segment.args, out); }
+    for segment in ast.segs(path.segs) { argument_types(ast, segment.args(), out); }
 }
 fn argument_types(ast: &ast::Ast, args: ast::GenericArgsId, out: &mut Vec<ast::TyId>) {
     match ast.gargs(args) {

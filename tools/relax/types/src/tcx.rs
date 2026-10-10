@@ -1663,7 +1663,7 @@ impl Tcx {
                 // `I: IntoIterator<Item = D>`: the binding's type is lowered for its
                 // diagnostics; the projection clause itself is native (clauses_of)
                 let bast = &prog.files[bfile as usize].ast;
-                if let Some(GenericArgs::Angle(v)) = bast.segs(path.segs).last().and_then(|l| bast.gargs(l.args)) {
+                if let Some(GenericArgs::Angle(v)) = bast.segs(path.segs).last().and_then(|l| bast.gargs(l.args())) {
                     for g in bast.list(*v) {
                         if let GenericArg::Binding(n, _, ty) = g {
                             let sym = prog.syms.get(prog.files[bfile as usize].text(*n)).unwrap_or(u32::MAX);
@@ -1704,7 +1704,7 @@ impl Tcx {
         for w in f.ast.list(sig.generics.where_).iter().chain(impl_where.iter()) {
             if let ast::WherePred::Bound { ty, bounds, .. } = w {
                 let simple = match f.ast.ty(*ty) {
-                    ast::Ty::Path(p) => p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].args.is_none(),
+                    ast::Ty::Path(p) => p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].args().is_none(),
                     _ => false,
                 };
                 if simple {
@@ -1859,7 +1859,7 @@ impl Tcx {
         for w in ast.list(generics.where_) {
             if let ast::WherePred::Bound { ty, bounds, .. } = w {
                 if let ast::Ty::Path(p) = ast.ty(*ty) {
-                    if p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+                    if p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
                         let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX - 1);
                         if let Some(i) = env.names.iter().rposition(|n| *n == name) {
                             if i as u32 >= n_parent {
@@ -1885,7 +1885,7 @@ impl Tcx {
                     let n = f.text(last.name);
                     let is_async = matches!(n, "AsyncFn" | "AsyncFnMut" | "AsyncFnOnce");
                     if n == "Fn" || n == "FnMut" || n == "FnOnce" || is_async {
-                        if let Some(a) = ast.gargs(last.args) {
+                        if let Some(a) = ast.gargs(last.args()) {
                             if let GenericArgs::Paren(ps, r) = a {
                                 let fp = ast::FnPtr { hrtb: *hrtb, unsafe_: false, abi: None, params: *ps, ret: *r, variadic: false };
                                 let bound = self.lower_fn_pointer(cx, prog, file, module, env, &fp, resolve_bound_vars::BinderId::Trait(path.segs.lo));
@@ -2177,7 +2177,7 @@ impl Tcx {
                 _ => continue,
             };
             let last = f.ast.segs(path.segs).last();
-            if let Some(GenericArgs::Paren(ps, r)) = last.and_then(|l| f.ast.gargs(l.args)) {
+            if let Some(GenericArgs::Paren(ps, r)) = last.and_then(|l| f.ast.gargs(l.args())) {
                 let pts: Vec<TyId> = f.ast.list(*ps).iter().map(|x| self.lower_ty(cx, prog, file, module, env, *x)).collect();
                 // the output is lowered for its diagnostics and nested opaques; the
                 // declaration's clauses come from native collection (item_bounds)
@@ -2187,7 +2187,7 @@ impl Tcx {
             } else {
                 let explicit = self.lower_generic_args(cx, prog, file, module, env, path);
                 let targs = self.fill_trait_defaults(cx, prog, td, me, explicit);
-                if let Some(GenericArgs::Angle(v)) = last.and_then(|l| f.ast.gargs(l.args)) {
+                if let Some(GenericArgs::Angle(v)) = last.and_then(|l| f.ast.gargs(l.args())) {
                     for g in f.ast.list(*v) {
                         if let GenericArg::Binding(n, _, ty) = g {
                             let sym = prog.syms.get(f.text(*n)).unwrap_or(u32::MAX);
@@ -2299,7 +2299,7 @@ impl Tcx {
             let mut args = Vec::new();
             let mut binds = Vec::new();
             let mut predicate_bound = env.regions.bound_count();
-            match f.ast.gargs(last.args) {
+            match f.ast.gargs(last.args()) {
                 Some(GenericArgs::Paren(ps, r)) => {
                     let sig = ast::FnPtr { hrtb, unsafe_: false, abi: None, params: *ps, ret: *r, variadic: false };
                     // rustc_ast_lowering/src/path.rs:517-573 and
@@ -2405,11 +2405,11 @@ impl Tcx {
             return self.tys.error;
         }
         // `Self::Name`: inside an impl the impl's own associated type, inside a trait a projection
-        if p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::SelfType {
+        if p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind() == SegKind::SelfType {
             let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[1].name)).unwrap_or(u32::MAX);
             // `Self::Assoc` of a generic associated type without its args (rustc E0107; elided
             // lifetimes are not allowed there either)
-            if prog.files[file as usize].ast.segs(p.segs)[1].args.is_none() {
+            if prog.files[file as usize].ast.segs(p.segs)[1].args().is_none() {
                 let td = env.impl_def.and_then(|imp| self.impl_trait.get(&imp).copied()).or(env.trait_def);
                 if let Some(td) = td {
                     let gat = prog.traits[prog.def(td).sub as usize].iter().copied().find(|&it| prog.def(it).name == name && prog.def(it).kind == DefKind::AssocTy).map_or(false, |it| {
@@ -2440,7 +2440,7 @@ impl Tcx {
             }
         }
         // `T::Name` on a generic param: the associated type of one of its bounds
-        if p.no_qself() && p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::Ident && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+        if p.no_qself() && p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind() == SegKind::Ident && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
             let pn = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX - 1);
             if let Some(pi) = env.names.iter().rposition(|n| *n == pn) {
                 let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[1].name)).unwrap_or(u32::MAX);
@@ -2453,7 +2453,7 @@ impl Tcx {
         }
         if p.no_qself() && p.segs.len() == 1 {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
-            if seg.kind == SegKind::SelfType {
+            if seg.kind() == SegKind::SelfType {
                 return env.self_ty.unwrap_or(self.tys.error);
             }
             let name = f.text(seg.name);
@@ -2672,12 +2672,12 @@ impl Tcx {
         let mut out = Vec::new();
         let ast = &prog.files[file as usize].ast;
         if let Some(last) = ast.segs(p.segs).last() {
-            if let Some(GenericArgs::Paren(ps, _)) = ast.gargs(last.args) {
+            if let Some(GenericArgs::Paren(ps, _)) = ast.gargs(last.args()) {
                 let mut args = Vec::new();
                 for t in ast.list(*ps) { args.push(self.lower_ty(cx, prog, file, module, env, *t)); }
                 return vec![self.tys.intern(TyKind::Tuple(self.tys.mk_list(&args)))];
             }
-            if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args) {
+            if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args()) {
                 for g in ast.list(*v) {
                     let index = out.len() + usize::from(declaration.as_ref().is_some_and(|(d, _)| prog.def(*d).kind == DefKind::Trait));
                     match g {
@@ -2719,7 +2719,7 @@ impl Tcx {
     pub fn type_or_const_arg(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, t: ast::TyId) -> TyId {
         let ast = &prog.files[file as usize].ast;
         if let ast::Ty::Path(p) = ast.ty(t) {
-            if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+            if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
                 let name = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX);
                 for &(index, _, _) in &env.consts {
                     if env.names.get(index as usize) == Some(&name) {
@@ -2890,7 +2890,7 @@ pub fn push_generics(prog: &Program, file: u32, g: &ast::Generics, env: &mut Gen
     for w in f.ast.list(g.where_) {
         if let ast::WherePred::Bound { ty, bounds, .. } = w {
             if let ast::Ty::Path(p) = f.ast.ty(*ty) {
-                if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+                if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args().is_none() {
                     let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX - 1);
                     if let Some(i) = env.names.iter().rposition(|n| *n == name) {
                         for b in f.ast.list(*bounds) {
@@ -3087,7 +3087,7 @@ impl Tcx {
                     // `where Self: Tr1<..>` with `trait Tr1: Sized`)
                     let self_sized = f.ast.list(sig.generics.where_).iter().any(|w| match w {
                         ast::WherePred::Bound { ty, bounds, .. } => {
-                            matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind == SegKind::SelfType)
+                            matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind() == SegKind::SelfType)
                                 && f.ast.list(*bounds).iter().any(|b| match b {
                                     ast::Bound::Trait { path, maybe: false, .. } => self.resolve_type_path_def(prog, d.file, d.scope, path).map_or(false, |bd| prog.def(bd).kind == DefKind::Trait && self.trait_entails_sized(prog, bd)),
                                     _ => false,
@@ -3164,7 +3164,7 @@ impl Tcx {
         sub.extend(targs.iter().copied());
         let mut out = Vec::new();
         for path in paths {
-            if let Some(GenericArgs::Paren(_, ret)) = ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args)) {
+            if let Some(GenericArgs::Paren(_, ret)) = ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args())) {
                 if let Some(d) = self.resolve_type_path_def(prog, pd.file, pd.scope, &path) {
                     if let Some(output) = self.callable_output(d) {
                         let written = self.lower_generic_args(cx, prog, pd.file, module, &env, &path);
@@ -3177,7 +3177,7 @@ impl Tcx {
                 }
                 continue;
             }
-            let binds: Vec<(ast::Ident, AstTy)> = match ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args)) {
+            let binds: Vec<(ast::Ident, AstTy)> = match ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args())) {
                 Some(GenericArgs::Angle(v)) => ast.list(*v).iter().filter_map(|g| match g {
                     GenericArg::Binding(n, _, t) => Some((*n, *t)),
                     _ => None,
@@ -3333,7 +3333,7 @@ impl Tcx {
             let explicit = self.lower_generic_args(cx, prog, d.file, module, &env, &path);
             let explicit: Vec<TyId> = explicit.iter().map(|x| self.tys.subst(*x, args)).collect();
             let ba = self.fill_trait_defaults(cx, prog, bd, proj, explicit);
-            if let Some(GenericArgs::Angle(v)) = ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args)) {
+            if let Some(GenericArgs::Angle(v)) = ast.segs(path.segs).last().and_then(|l| ast.gargs(l.args())) {
                 for g in ast.list(*v) {
                     if let GenericArg::Binding(n, _, ty) = g {
                         let sym = prog.syms.get(prog.files[d.file as usize].text(*n)).unwrap_or(u32::MAX);
@@ -3502,7 +3502,7 @@ fn collect_argument_impl_traits(ast: &ast::Ast, t: ast::TyId, out: &mut Vec<ast:
             for b in ast.list(*bs) {
                 if let ast::Bound::Trait { path, .. } = b {
                     for seg in ast.segs(path.segs) {
-                        if let Some(a) = ast.gargs(seg.args) {
+                        if let Some(a) = ast.gargs(seg.args()) {
                             if let GenericArgs::Angle(v) = a {
                                 for g in ast.list(*v) {
                                     if let GenericArg::Type(x) | GenericArg::Binding(_, _, x) = g {
@@ -3517,7 +3517,7 @@ fn collect_argument_impl_traits(ast: &ast::Ast, t: ast::TyId, out: &mut Vec<ast:
         }
         ast::Ty::Path(p) => {
             for seg in ast.segs(p.segs) {
-                if let Some(a) = ast.gargs(seg.args) {
+                if let Some(a) = ast.gargs(seg.args()) {
                     if let GenericArgs::Angle(v) = a {
                         for g in ast.list(*v) {
                             match g {

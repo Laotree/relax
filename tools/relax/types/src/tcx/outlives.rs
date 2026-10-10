@@ -348,7 +348,7 @@ impl Tcx {
         let mut bounds = f.ast.list(bs).to_vec();
         for w in f.ast.list(g.where_) {
             if let ast::WherePred::Bound { ty, bounds: bs, .. } = w {
-                if matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind == SegKind::SelfType)
+                if matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind() == SegKind::SelfType)
                 {
                     bounds.extend_from_slice(f.ast.list(*bs));
                 }

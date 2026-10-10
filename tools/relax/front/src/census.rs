@@ -340,7 +340,7 @@ impl<'p, 'a> Walker<'p, 'a> {
         }
         let pp = self.p;
         for s in pp.ast.segs(p.segs) {
-            if let Some(a) = pp.ast.gargs(s.args) {
+            if let Some(a) = pp.ast.gargs(s.args()) {
                 match a {
                     GenericArgs::Angle(v) => {
                         for g in pp.ast.list(*v) {
@@ -600,10 +600,10 @@ impl<'p, 'a> Walker<'p, 'a> {
             match self.p.ast.ty(t) {
                 Ty::Ref(_, _, inner) => t = *inner,
                 Ty::Path(path) => {
-                    if path.has_qself() || path.segs.len() != 1 || self.p.ast.segs(path.segs)[0].args.is_some() {
+                    if path.has_qself() || path.segs.len() != 1 || self.p.ast.segs(path.segs)[0].args().is_some() {
                         // Box<T>
                         if path.segs.len() == 1 && self.text(self.p.ast.segs(path.segs)[0].name) == "Box" {
-                            if let Some(a) = self.p.ast.gargs(self.p.ast.segs(path.segs)[0].args) {
+                            if let Some(a) = self.p.ast.gargs(self.p.ast.segs(path.segs)[0].args()) {
                                 if let GenericArgs::Angle(v) = a {
                                     if v.len() == 1 {
                                         if let GenericArg::Type(inner) = self.p.ast.list(*v)[0] {
@@ -667,7 +667,8 @@ impl<'p, 'a> Walker<'p, 'a> {
         let blk = p.ast.block(b);
         for s in p.ast.list(blk.stmts) {
             match s {
-                Stmt::Let { attrs, pat, ty, init, else_ } => {
+                Stmt::Let(r) => {
+                    let LetStmt { attrs, pat, ty, init, else_ } = p.ast.row(*r);
                     if !crate::cfg::active(crate::cfg::Src { src: p.src, plain: p.toks.as_slice(), ext: &[], parts: None }, p.ast.list(*attrs), self.cfg) {
                         continue;
                     }
@@ -688,7 +689,7 @@ impl<'p, 'a> Walker<'p, 'a> {
                 }
                 Stmt::Item(i) => self.item(*i, false),
                 Stmt::Expr(e, _) => self.expr(*e),
-                Stmt::Attrs(_, e, _) => self.expr(*e),
+                Stmt::Attrs(r) => self.expr(p.ast.row(*r).expr),
                 Stmt::Empty => {}
             }
         }

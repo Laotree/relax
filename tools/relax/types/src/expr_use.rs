@@ -351,11 +351,13 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
     pub(crate) fn walk_block(&mut self, b: BlockId) {
         for st in self.ast().stmts(b).to_vec() {
             match st {
-                Stmt::Let { pat, init, else_, .. } => {
+                Stmt::Let(r) => {
+                    let crate::ast::LetStmt { pat, init, else_, .. } = *self.ast().row(r);
                     if let Some(x) = init { self.walk_local(pat, x, if else_.is_some() { FakeReadCause::Matched } else { FakeReadCause::Let }, false); }
                     if let Some(b) = else_ { self.walk_block(b); }
                 }
-                Stmt::Expr(x, _) | Stmt::Attrs(_, x, _) => self.consume_expr(x),
+                Stmt::Expr(x, _) => self.consume_expr(x),
+                Stmt::Attrs(r) => self.consume_expr(self.ast().row(r).expr),
                 Stmt::Item(_) | Stmt::Empty => (),
             }
         }
