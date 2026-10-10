@@ -37,7 +37,7 @@ impl Hash for DepNodeIndex {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // Mix the page into the slot bits: otherwise key zero in every kind
         // lands in the same small FxHashMap bucket in the sparse job table.
-        state.write_u32(self.0 ^ (self.0 >> 8));
+        state.write_u32(self.0 ^ (self.0 >> PAGE.trailing_zeros()));
     }
 }
 
@@ -50,7 +50,9 @@ pub enum DepNodeColor {
 
 // Fixed-capacity chunks never reallocate their elements. Only the small directory
 // moves; a memo hit in QueryTable still bypasses the graph entirely.
-const CHUNK: usize = 1024;
+const CHUNK: usize = 64;
+// Slack before compact() sweeps stale fingerprints (independent of the chunk size).
+const COMPACT_SLACK: usize = 1024;
 
 pub(super) struct Chunks<T> {
     chunks: Vec<Vec<T>>,
@@ -145,9 +147,9 @@ impl Fingerprints {
 }
 
 // Query keys include QueryTable's shard bits and are dense within a kind.
-// A page supplies the kind, key prefix and input flag once for 256 nodes. The
+// A page supplies the kind, key prefix and input flag once for PAGE nodes (small: each compiled function's nounwind engine touches ~5 kinds, a 256-node page was 5 KB each, 280 MB gross on Calculator cold). The
 // node index addresses that page/slot directly, so no reverse QueryId is stored.
-const PAGE: usize = 256;
+const PAGE: usize = 32;
 struct NodePage {
     query: Option<QueryId>,
     eval_always: bool,
@@ -414,7 +416,7 @@ impl DepGraph {
     pub fn compact(&mut self) {
         // Old result fingerprints can become unreachable after edits. Rebuild
         // only after enough garbage accumulates to pay for a linear sweep.
-        if self.fingerprints.values.len() > self.nodes.len().saturating_mul(2) + CHUNK {
+        if self.fingerprints.values.len() > self.nodes.len().saturating_mul(2) + COMPACT_SLACK {
             let mut fingerprints = Fingerprints::default();
             for i in 0..self.nodes.capacity() {
                 let node = &mut self.nodes[i];

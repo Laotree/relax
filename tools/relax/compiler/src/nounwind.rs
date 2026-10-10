@@ -60,12 +60,16 @@ impl QueryCx {
         for (slot, body, _) in candidates {
             // The inliner's snapshot lookup selects the first body for a slot.
             if bodies.iter().any(|b: &(u32, Arc<Func>)| b.0 == *slot) { continue; }
+            // Input keys are the candidate's position, not its slot: the graph allocates a
+            // 256-node page per key/256, and slots are sparse (one 5 KB page per candidate
+            // and kind, per compiled function). The stable identity is still the slot.
+            let key = bodies.len() as u32;
             bodies.push((*slot, body.clone()));
             available.u32(*slot);
-            engine.register_input(1, *slot, slot_fp(slot)).unwrap();
-            engine.set_input(1, *slot, body_fp(body)).unwrap();
-            engine.register_input(2, *slot, slot_fp(slot)).unwrap();
-            engine.set_input(2, *slot, facts_fp(&body.nounwind_inputs)).unwrap();
+            engine.register_input(1, key, slot_fp(slot)).unwrap();
+            engine.set_input(1, key, body_fp(body)).unwrap();
+            engine.register_input(2, key, slot_fp(slot)).unwrap();
+            engine.set_input(2, key, facts_fp(&body.nounwind_inputs)).unwrap();
         }
         engine.register_input(0, 0, Fingerprint::from_bytes(b"candidate snapshot")).unwrap();
         engine.set_input(0, 0, Fingerprint(available.finish128())).unwrap();
@@ -82,9 +86,10 @@ impl QueryCx {
     fn get(&self, slot: u32) -> Result<bool, QueryError> {
         self.engine.enter_context(|| self.nounwind.get(&self.engine, slot, &mut |slot| {
             self.engine.input(0, 0)?;
-            let Some((_, body)) = self.bodies.iter().find(|b| b.0 == slot) else { return Ok(false) };
-            self.engine.input(1, slot)?;
-            self.engine.input(2, slot)?;
+            let Some(key) = self.bodies.iter().position(|b| b.0 == slot) else { return Ok(false) };
+            let body = &self.bodies[key].1;
+            self.engine.input(1, key as u32)?;
+            self.engine.input(2, key as u32)?;
             // Use this body's own build answers, never answers derived from its caller's
             // snapshot. Unbuilt/recursive callees were recorded as false in that build.
             // Rust's unwind ABI defaults to may-unwind without rustc_nounwind:
@@ -152,8 +157,8 @@ mod tests {
         let callee = q.nounwind.query_id(&1).unwrap();
         let absent = q.nounwind.query_id(&99).unwrap();
         assert_eq!(q.engine.dependencies(root), vec![QueryId { kind: 0, key: 2 }, callee, absent]);
-        assert!(q.engine.dependencies(callee).contains(&QueryId { kind: 1, key: 1 }));
-        assert!(q.engine.dependencies(callee).contains(&QueryId { kind: 2, key: 1 }));
+        assert!(q.engine.dependencies(callee).contains(&QueryId { kind: 1, key: 0 }));
+        assert!(q.engine.dependencies(callee).contains(&QueryId { kind: 2, key: 0 }));
         assert!(q.engine.dependencies(absent).contains(&QueryId { kind: 0, key: 0 }));
     }
 
@@ -168,7 +173,7 @@ mod tests {
         let first = Arc::new(body(&[]));
         let duplicate = QueryCx::new(&[(1, first.clone(), 0), (1, Arc::new(body(&[99])), 0)]);
         assert!(duplicate.get(1).unwrap());
-        assert_eq!(duplicate.engine.input(1, 1).unwrap(), body_fp(&first));
+        assert_eq!(duplicate.engine.input(1, 0).unwrap(), body_fp(&first));
     }
 
     #[test]
