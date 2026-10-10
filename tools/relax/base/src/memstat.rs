@@ -457,6 +457,20 @@ pub fn process_rss() -> (u64, u64, String) {
             fn mallinfo2() -> Mallinfo2;
         }
         let m = unsafe { mallinfo2() };
+        // RELAX_MEM_ARENAS_OUT=<file>: each report appends glibc's malloc_info XML (per arena:
+        // heap size and free bytes), to see which threads' arenas hold the free-held bytes
+        if let Ok(path) = std::env::var("RELAX_MEM_ARENAS_OUT") {
+            extern "C" {
+                fn fopen(path: *const i8, mode: *const i8) -> *mut u8;
+                fn fclose(f: *mut u8) -> i32;
+                fn malloc_info(options: i32, f: *mut u8) -> i32;
+            }
+            let c = format!("{path}\0");
+            unsafe {
+                let f = fopen(c.as_ptr() as *const i8, b"a\0".as_ptr() as *const i8);
+                if !f.is_null() { malloc_info(0, f); fclose(f); }
+            }
+        }
         let extra = format!(
             "anon {} MB, file {} MB; malloc: sbrk/arenas {} MB, mmapped {} MB, in use {} MB, free held {} MB",
             mb(kb("RssAnon:")),
@@ -895,7 +909,7 @@ mod sites {
             let mut rows: Vec<(i64, i64, i64, usize)> = Vec::new();
             for i in 1..N {
                 let (l, p) = (LIVE[i].load(Relaxed), PEAK[i].load(Relaxed));
-                if l >= 1 << 20 || p >= 1 << 20 { rows.push((l, p, COUNT[i].load(Relaxed), i)); }
+                if l >= 1 << 20 || p >= 1 << 20 || COUNT[i].load(Relaxed) * iv() >= 1 << 20 { rows.push((l, p, COUNT[i].load(Relaxed), i)); }
             }
             rows.sort_by_key(|r| std::cmp::Reverse(r.0.max(r.1 / 2)));
             let mut out = format!("== {} t_ms={:.0} interval={} sites_used={} base={:#x}\n", label, crate::clock::ms_since_start(), iv(), USED.load(Relaxed), b);
