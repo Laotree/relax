@@ -5007,7 +5007,9 @@ impl<'a> Fcx<'a> {
                 let sa0 = self.shallow(ta);
                 let ta = self.peel_prim_refs(sa0);
                 let sa = self.shallow(ta);
-                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..)) {
+                // parameters and aliases are operator trait calls (rustc op.rs is_builtin_binop:
+                // only primitive operands are built in), as for `a op= b` below
+                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa, b, lo, false);
                 }
@@ -5032,7 +5034,10 @@ impl<'a> Fcx<'a> {
                 // forward-ref operator impls, without dispatch)
                 let ta = self.peel_prim_refs(sa0);
                 let sa0 = self.shallow(ta);
-                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..)) {
+                // a parameter or alias left operand is an operator trait call even when an
+                // instance is primitive (rustc op.rs is_builtin_binop): `p * 2.0` with
+                // `P: Mul<f32, Output = P>` is `<P as Mul<f32>>::mul`, not `P == f32`
+                if matches!(self.tcx.tys.kind(sa0), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
                     self.cur_binop = e.0;
                     return self.check_op_trait(op, sa0, b, lo, false);
                 }
