@@ -6,12 +6,30 @@ use crate::types::{BoundVar, LateParamKind, RegionId, RegionKind, RegionScope};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ClosureSignatures {
+    /// The closure's one signature (rustc bound_sig): the expected signature
+    /// when the supplied one merged with it, otherwise the supplied one.
     pub bound: TyId,
     /// FnSig encoded as a FnPtr with a dummy binder (no variables of its own).
+    /// The body's inputs and output (rustc liberated_sig): after a merge, the
+    /// resolved supplied types (closure.rs:857-865).
     pub liberated: TyId,
     /// S' = E' from the successful, whole supplied/expected merge. Both sides
-    /// have dummy binders. A4 must relate these types, including their regions.
+    /// have dummy binders. S' is the user-provided signature with its own
+    /// binder instantiated; E' is `bound` liberated.
     pub annotation_eq: Option<(TyId, TyId)>,
+}
+
+impl ClosureSignatures {
+    /// `bound` liberated: the signature the closure's universal regions come
+    /// from (rustc_borrowck universal_regions.rs compute_inputs_and_output
+    /// reads `args.as_closure().sig()`, the bound signature). Without a merge
+    /// it is `liberated`; with one it is E', and the annotation is only an
+    /// ascription of S' onto it (type_check/input_output.rs
+    /// check_signature_annotation), so no region of the expected signature
+    /// exists apart from the closure's inputs.
+    pub fn liberated_bound(&self) -> TyId {
+        self.annotation_eq.map_or(self.liberated, |(_, expected)| expected)
+    }
 }
 
 impl Fcx<'_> {

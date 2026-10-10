@@ -407,6 +407,9 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
     }
     let inputs = u.inputs.iter().map(|t| p.ty(*t)).collect();
     let output = p.ty(u.output);
+    // The annotation ascribed onto the closure's signature (rustc
+    // type_check/input_output.rs check_signature_annotation): S', its own
+    // binder instantiated with fresh variables, equals E', the inputs above.
     let mut equality = Vec::new();
     if let Some((a, b)) = sig.annotation_eq {
         let tys = &rty.tx.tcx.tys;

@@ -161,6 +161,10 @@ impl UniversalRegionsBuilder<'_> {
         if let DefiningTy::Closure { bound, annotation_eq, owner, .. } = self.defining_ty {
             // Free regions of a nested signature belong to its creator. Bound
             // regions have already been liberated by Relax's typeck metadata.
+            // The closure type's free regions are `bound`'s (universal_regions.rs
+            // defining_ty: replace_free_regions_with_nll_infer_vars over the
+            // closure type); after a merge, region variables that only the
+            // liberated signature's normalization introduced stay existential.
             for (t, expected) in inputs.iter().copied().chain([output]).map(|t| (t,false)).chain([(bound,true)]) {
                 let found = std::cell::RefCell::new(vec![]);
                 tcx.tys.map_regions(t,&|r,_| {
@@ -207,12 +211,15 @@ impl SignatureRegions {
     }
     pub fn closure(rty: &Rty<'_>, owner: DefId, expr: u32) -> Option<Self> {
         let sig = *rty.closure_signatures.borrow().get(&expr)?;
-        if !matches!(rty.tx.tcx.tys.kind(sig.liberated),TyKind::FnPtr(..)) { return None; }
+        // compute_inputs_and_output: the closure's one (bound) signature, not
+        // the body's supplied types; the annotation is ascribed onto it.
+        let signature = sig.liberated_bound();
+        if !matches!(rty.tx.tcx.tys.kind(signature),TyKind::FnPtr(..)) { return None; }
         let parent = match rty.closure_parents.borrow().get(&expr).copied().flatten() {
             Some(p) => Self::closure(rty,owner,p)?, None => Self::function(rty.tx.tcx,rty.tx.prog,owner)?,
         };
         Some(UniversalRegionsBuilder { tcx:rty.tx.tcx,prog:rty.tx.prog,
-            defining_ty:DefiningTy::Closure { owner,expr,signature:sig.liberated,bound:sig.bound,annotation_eq:sig.annotation_eq.is_some() },
+            defining_ty:DefiningTy::Closure { owner,expr,signature,bound:sig.bound,annotation_eq:sig.annotation_eq.is_some() },
             contract:parent.contract.clone(),parent:Some(parent) }.build())
     }
 }

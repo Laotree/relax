@@ -489,11 +489,13 @@ impl<'a> Nll<'a> {
                     }
                 } else if let Some(input) = li.checked_sub(if is_closure { 2 } else { 1 })
                     .filter(|_| l.kind == LocalKind::Arg).and_then(|i| t.inputs.get(i)).filter(|input| input.len() == n) {
-                    // An inferred closure parameter's regions are the closure type's (external)
+                    // A closure parameter's unnumbered regions are the closure type's (external)
                     // only at its external coordinates (external_closure_input_slots): a position
                     // bound by a binder inside the parameter's type (`&dyn for<'a> Fn(&'a T)`) is
-                    // local to that type, never a free region of the closure, so it is existential.
-                    let external_slots = if is_closure && bir.infer_params.contains(&(li as Local)) {
+                    // local to that type, never a free region of the closure, so it is existential,
+                    // whether the parameter is annotated or inferred (the signature's free regions
+                    // are numbered by the template).
+                    let external_slots = if is_closure {
                         bir.closure_expr.and_then(|ce| self.rty.closures.borrow().get(&(bir.file, ce))
                             .and_then(|cs| cs.params.iter().find(|(k, _, _)| k + 2 == li).map(|(_, _, slots)| slots.clone())))
                             .unwrap_or_default()
@@ -502,10 +504,7 @@ impl<'a> Nll<'a> {
                         match map_sr(&tmpl_map, *sr) {
                             Some(r) => v.push(r),
                             None => {
-                                let kind = if !is_closure { Kind::Var }
-                                    else if !bir.infer_params.contains(&(li as Local)) { Kind::Placeholder }
-                                    else if external_slots.contains(&slot) { Kind::External }
-                                    else { Kind::Var };
+                                let kind = if is_closure && external_slots.contains(&slot) { Kind::External } else { Kind::Var };
                                 let r = self.new_rv(kind, "'_");
                                 v.push(r);
                             }
