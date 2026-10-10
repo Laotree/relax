@@ -4143,7 +4143,7 @@ impl<'a> Lcx<'a> {
                 self.goto(join);
                 self.switch(join);
             }
-            TyKind::Adt(d, args, _) => {
+            TyKind::Adt(d, _, _) => {
                 let adt = match self.u.tcx.adts.get(&d) {
                     Some(a) if !a.is_enum && !a.is_union => a,
                     _ => return,
@@ -4165,15 +4165,17 @@ impl<'a> Lcx<'a> {
                         self.emit(Inst::Call(Callee::Fn(id), vec![p, len], Vec::new()));
                     }
                 }
-                let l = self.layout(t);
                 let n = adt.variants[0].fields.len();
+                let place = Place::Regs(vec![p, len]);
                 for fi in 0..n {
-                    let ft = self.u.tcx.tys.subst_erasing_regions(adt.variants[0].fields[fi].ty, &args);
-                    let a = self.addr_add(p, l.fields.get(fi).copied().unwrap_or(0) as i32);
+                    // Project through the fat pointer: a dyn tail's offset must
+                    // be rounded to its vtable alignment, just like a field read.
+                    let (field, ft) = self.project(&place, t, 0, fi as u32);
+                    let ptr = self.ref_to_place(&field, ft);
                     if fi + 1 == n && self.unsized_ty(ft) {
-                        self.drop_unsized(a, len, ft);
+                        self.drop_unsized(ptr[0], ptr[1], ft);
                     } else {
-                        self.drop_at(a, ft);
+                        self.drop_at(ptr[0], ft);
                     }
                 }
             }
