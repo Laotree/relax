@@ -1489,6 +1489,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut reclaim_requested = false;
         let mut present_bytes = Vec::new();
         let (mut quiet, mut seen, mut trimmed) = (0u32, 0u64, 0u64);
+        // growth relief (below): the resident size after the last trim and when it ran
+        let (mut grown_from, mut grown_at) = (0u64, std::time::Instant::now().checked_sub(std::time::Duration::from_millis(500)).unwrap_or_else(std::time::Instant::now));
         // mid-run cache writes once main ran 3 s and something new was compiled: after 2 s without
         // compiles (5 s after the last write), or every 10 s while compiles go on
         // (RELAX_CACHE_MID=0: off)
@@ -1632,6 +1634,30 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // register allocation of a big fn holds 100s of MB for a moment) otherwise stay
             // resident as free-but-held heap (counter warm, x64: 10 s RSS 1,050 -> 892 MB;
             // 2-5 ms on this thread). RELAX_MEM_TRIM=0: off.
+            // Growth relief while compiles go on (cold main -> first present never goes quiet for
+            // the trim below): the loader's freed parse memory and earlier compile working sets
+            // stay in the malloc arenas of the threads that freed them, where other threads'
+            // allocations cannot reuse them, so a cold run's footprint adds them up. Whenever the
+            // resident size grew RELAX_MEM_TRIM_GROWTH_MB (256) since the last trim -- the first
+            // check is at main start, right after the load -- and at most every 500 ms, the free
+            // pages go back to the system (Calculator cold, 165: 350 MB at main start in 23 ms).
+            if runtime.mem_trim && grown_at.elapsed() >= std::time::Duration::from_millis(500) {
+                static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let step = *STEP.get_or_init(|| std::env::var("RELAX_MEM_TRIM_GROWTH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256u64)) << 20;
+                let rss = crate::memstat::process_rss().0;
+                if step > 0 && rss >= grown_from + step {
+                    let t = Instant::now();
+                    crate::memstat::trim();
+                    let after = crate::memstat::process_rss().0;
+                    if crate::memstat::enabled() || crate::preload::trace() {
+                        eprintln!("relax-mem: growth trim at t={:.0} ms: rss {} -> {} MB in {:.1} ms", crate::clock::ms_since_start(), rss >> 20, after >> 20, t.elapsed().as_secs_f64() * 1e3);
+                    }
+                    grown_from = after;
+                    grown_at = std::time::Instant::now();
+                } else if rss < grown_from {
+                    grown_from = rss;
+                }
+            }
             if runtime.mem_trim {
                 let n = if FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 {
                     jit::reclaim_generation()
