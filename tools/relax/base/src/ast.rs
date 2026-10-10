@@ -1433,7 +1433,7 @@ pub struct Ast {
     pub arms: crate::arena::Arena<Arm>,
     pub closure_params: crate::arena::Arena<ClosureParam>,
     pub field_pats: crate::arena::Arena<FieldPat>,
-    /// the `<T as Trait>` parts of paths (Path::qself)
+    /// the `<T as Trait>` parts of paths (Ast::qself: the id sits in the placeholder segment before the path's segments)
     pub qselfs: crate::arena::Arena<QSelf>,
     /// generic arguments of path segments and method calls (PathSeg::args, GenericArgsId)
     pub generic_args: crate::arena::Arena<GenericArgs>,

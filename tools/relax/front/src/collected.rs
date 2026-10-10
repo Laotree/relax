@@ -155,7 +155,7 @@ impl<K: Codec + Ord + std::hash::Hash + Clone, V: Codec + Clone> Codec for crate
     }
 }
 
-crate::collected_id!(crate::program::DefId, crate::ast::TyId, crate::ast::QSelfId, crate::ast::ExprId);
+crate::collected_id!(crate::program::DefId, crate::ast::TyId, crate::ast::ExprId);
 crate::collected_enum!(crate::program::Prim;
     0 => Bool, 1 => Char, 2 => Str, 3 => I8, 4 => I16, 5 => I32, 6 => I64,
     7 => I128, 8 => Isize, 9 => U8, 10 => U16, 11 => U32, 12 => U64,
