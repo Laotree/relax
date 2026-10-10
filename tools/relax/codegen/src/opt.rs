@@ -7049,8 +7049,18 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
         let SlotScan { vs, esc, writes, rd_end, whole, .. } = slot_scan(f);
         let sl = |v: VReg| vs[v.0 as usize].0;
         const NONE: u32 = u32::MAX;
+        // slots read at runtime offsets too (an array iterator's `data[start]`): only loads /
+        // copies out through `slot + i`; their reads are events like the others
+        let dynr = dyn_read_slots(f, &vs);
         // reads / writes of each slot in program order: (block, inst, write)
         let mut ev: Vec<Vec<(u32, u32, bool)>> = vec![Vec::new(); ns];
+        for (s2, reads) in dynr.iter().enumerate() {
+            if let Some(reads) = reads {
+                for &(bi, ii) in reads {
+                    ev[s2].push((bi, ii, false));
+                }
+            }
+        }
         for (bi, blk) in f.blocks.iter().enumerate() {
             for (ii, i) in blk.insts.iter().enumerate() {
                 let (r, w) = match i {
@@ -7075,15 +7085,18 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
         let mut seen = vec![0u32; nb];
         let mut stamp = 0u32;
         for b in 0..ns {
+            // a destination read at runtime offsets qualifies when the copy fills all of it (a
+            // read outside the slot is undefined behaviour, so every read sees copied bytes)
+            let dyn_ok = |n: u32| dynr[b].is_some() && n >= f.slots[b].size;
             let (cb, ci, a) = match whole[b] {
-                Some(w) if writes[b] == 1 && !esc[b] => w,
+                Some(w) if writes[b] == 1 && (!esc[b] || matches!(f.blocks[w.0].insts[w.1], Inst::Copy(_, _, n) if dyn_ok(n))) => w,
                 _ => continue,
             };
             if esc[a as usize] || used[a as usize] || used[b] {
                 continue;
             }
             if let Inst::Copy(_, _, n) = f.blocks[cb].insts[ci] {
-                if rd_end[b] > n as i64 {
+                if rd_end[b] > n as i64 && !dyn_ok(n) {
                     continue;
                 }
             }
@@ -11322,6 +11335,378 @@ pub fn min_max_non_nan(f: &mut Func) -> bool {
                     *i = Inst::FBin(lt, w, d, b2, a);
                     any = true;
                 }
+            }
+        }
+    }
+    any
+}
+
+
+/// Slots whose addresses are used only as (a) bases of loads / stores / vector accesses at
+/// constant offsets, copy operands and constant derivations -- what `slot_scan` follows -- and
+/// (b) `slot + i` with a runtime `i` (one IBin add of a slot address and a non-address, then
+/// constant adds) used only as the base of loads and as copy sources: Some(the instructions
+/// making such runtime-offset reads), else None (the slot escapes, or none such reads).
+fn dyn_read_slots(f: &Func, vs: &[(u32, i64)]) -> Vec<Option<Vec<(u32, u32)>>> {
+    const NONE: u32 = u32::MAX;
+    let ns = f.slots.len();
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let sl = |v: VReg| vs[v.0 as usize].0;
+    // runtime-offset addresses: vreg -> slot
+    let mut dynv = vec![NONE; nv];
+    for _ in 0..3 {
+        for b in &f.blocks {
+            for i in &b.insts {
+                match *i {
+                    Inst::IBin(IOp::Add, it, d, x, y) if it.bits == 64 && ndef[d.0 as usize] == 1 => {
+                        let (sx, sy) = (sl(x), sl(y));
+                        let (dx, dy) = (dynv[x.0 as usize], dynv[y.0 as usize]);
+                        let other_plain = |o: VReg| sl(o) == NONE && dynv[o.0 as usize] == NONE;
+                        if sx != NONE && other_plain(y) {
+                            dynv[d.0 as usize] = sx;
+                        } else if sy != NONE && other_plain(x) {
+                            dynv[d.0 as usize] = sy;
+                        } else if dx != NONE && other_plain(y) {
+                            dynv[d.0 as usize] = dx;
+                        } else if dy != NONE && other_plain(x) {
+                            dynv[d.0 as usize] = dy;
+                        }
+                    }
+                    Inst::IBinI(IOp::Add, it, d, x, _) if it.bits == 64 && ndef[d.0 as usize] == 1 && dynv[x.0 as usize] != NONE => {
+                        dynv[d.0 as usize] = dynv[x.0 as usize];
+                    }
+                    Inst::Mov(d, x) if ndef[d.0 as usize] == 1 && dynv[x.0 as usize] != NONE => {
+                        dynv[d.0 as usize] = dynv[x.0 as usize];
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut bad = vec![false; ns];
+    let mut reads: Vec<Vec<(u32, u32)>> = vec![Vec::new(); ns];
+    let mut tu = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, i) in b.insts.iter().enumerate() {
+            match *i {
+                Inst::Load(_, _, base, _) if dynv[base.0 as usize] != NONE => {
+                    reads[dynv[base.0 as usize] as usize].push((bi as u32, ii as u32));
+                    continue;
+                }
+                Inst::Copy(d, s2, _) if dynv[s2.0 as usize] != NONE && dynv[d.0 as usize] == NONE => {
+                    reads[dynv[s2.0 as usize] as usize].push((bi as u32, ii as u32));
+                    if sl(d) != NONE || true {
+                        // the destination is checked below like any operand
+                    }
+                }
+                _ => {}
+            }
+            // every other use of a runtime-offset address escapes its slot; uses of constant
+            // addresses are judged by slot_scan (its `esc`); the derivations above are fine
+            let deriv = matches!(*i, Inst::IBin(IOp::Add, _, d, ..) | Inst::IBinI(IOp::Add, _, d, ..) | Inst::Mov(d, _) if dynv[d.0 as usize] != NONE);
+            let copy_src = matches!(*i, Inst::Copy(d, s2, _) if dynv[s2.0 as usize] != NONE && dynv[d.0 as usize] == NONE);
+            if deriv {
+                continue;
+            }
+            for_uses(i, |v| {
+                let dv = dynv[v.0 as usize];
+                if dv != NONE && !(copy_src && matches!(*i, Inst::Copy(_, s2, _) if s2 == v)) {
+                    bad[dv as usize] = true;
+                }
+            });
+        }
+        term_uses(&b.term, &mut tu);
+        for v in &tu {
+            if dynv[v.0 as usize] != NONE {
+                bad[dynv[v.0 as usize] as usize] = true;
+            }
+        }
+    }
+    // the slot's constant-address uses must be what slot_scan follows, plus the IBin adds
+    let mut const_ok = vec![true; ns];
+    for b in &f.blocks {
+        for i in &b.insts {
+            match *i {
+                Inst::Load(_, _, base, _) | Inst::VLoad(_, base, _) => {
+                    let _ = base;
+                }
+                Inst::Store(_, base, _, v) | Inst::VStore(base, _, v) => {
+                    let _ = base;
+                    if sl(v) != NONE {
+                        const_ok[sl(v) as usize] = false;
+                    }
+                    if dynv[v.0 as usize] != NONE {
+                        bad[dynv[v.0 as usize] as usize] = true;
+                    }
+                }
+                Inst::Copy(..) | Inst::SlotAddr(..) => {}
+                Inst::Mov(d, x) | Inst::IBinI(IOp::Add, _, d, x, _) if sl(x) != NONE && sl(d) == sl(x) => {}
+                Inst::IBin(IOp::Add, _, d, x, y) if dynv[d.0 as usize] != NONE && (sl(x) != NONE || sl(y) != NONE) => {}
+                _ => for_uses(i, |v| {
+                    if sl(v) != NONE {
+                        const_ok[sl(v) as usize] = false;
+                    }
+                }),
+            }
+        }
+        term_uses(&b.term, &mut tu);
+        for v in &tu {
+            if sl(*v) != NONE {
+                const_ok[sl(*v) as usize] = false;
+            }
+        }
+    }
+    (0..ns).map(|s2| (!bad[s2] && const_ok[s2] && !reads[s2].is_empty()).then(|| std::mem::take(&mut reads[s2]))).collect()
+}
+
+/// Write-through promotion of a slot that is also read at runtime offsets (an array iterator:
+/// `IntoIter { data, start, end }` reads `data[start]`): its constant-offset cells live in
+/// vregs -- loads of them read the vreg, stores also set the vreg, a copy into the slot reloads
+/// the cells it covers -- while memory stays exact for the runtime-offset reads (every store is
+/// kept). The loop counter `start` then is a register, so the loop can be fully unrolled, after
+/// which the reads have constant offsets and ordinary SROA removes the slot. Slots qualify per
+/// `dyn_read_slots`; their constant accesses must be loads / stores of one kind and size per
+/// offset, not overlapping, and copies into them must not cut a cell. Returns whether anything
+/// changed.
+pub fn promote_dyn_read_slots(f: &mut Func) -> bool {
+    let ns = f.slots.len();
+    if ns == 0 || !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Add, ..)))) {
+        return false;
+    }
+    let SlotScan { vs, .. } = slot_scan(f);
+    let dynr = dyn_read_slots(f, &vs);
+    if dynr.iter().all(|x| x.is_none()) {
+        return false;
+    }
+    const NONE: u32 = u32::MAX;
+    let sl = |v: VReg| vs[v.0 as usize].0;
+    let at = |v: VReg| vs[v.0 as usize].1;
+    // cells per slot: (offset, kind)
+    let mut cells: Vec<Vec<(i64, Mem)>> = vec![Vec::new(); ns];
+    let mut ok: Vec<bool> = dynr.iter().map(|x| x.is_some()).collect();
+    let mut copies_in: Vec<Vec<(i64, i64)>> = vec![Vec::new(); ns];
+    for b in &f.blocks {
+        for i in &b.insts {
+            match *i {
+                Inst::Load(m, _, base, off) | Inst::Store(m, base, off, _) if sl(base) != NONE => {
+                    cells[sl(base) as usize].push((at(base) + off as i64, m));
+                }
+                Inst::VLoad(_, base, _) | Inst::VStore(base, ..) if sl(base) != NONE => ok[sl(base) as usize] = false,
+                Inst::Copy(d, _, n) if sl(d) != NONE => copies_in[sl(d) as usize].push((at(d), at(d) + n as i64)),
+                _ => {}
+            }
+        }
+    }
+    for s2 in 0..ns {
+        if !ok[s2] {
+            continue;
+        }
+        let c = &mut cells[s2];
+        c.sort_unstable_by_key(|x| (x.0, mem_size(x.1)));
+        c.dedup_by(|b2, a| a.0 == b2.0 && a.1 == b2.1);
+        for w in c.windows(2) {
+            // one kind per offset, no overlaps
+            if w[0].0 + mem_size(w[0].1) as i64 > w[1].0 {
+                ok[s2] = false;
+            }
+        }
+        if c.is_empty() || c.iter().any(|x| x.0 < 0 || x.0 + mem_size(x.1) as i64 > f.slots[s2].size as i64) {
+            ok[s2] = false;
+        }
+        for &(lo, hi) in &copies_in[s2] {
+            for x in c.iter() {
+                let end = x.0 + mem_size(x.1) as i64;
+                if (x.0 < lo && end > lo) || (x.0 < hi && end > hi) {
+                    ok[s2] = false;
+                }
+            }
+        }
+    }
+    if !ok.iter().any(|x| *x) {
+        return false;
+    }
+    // one vreg per cell
+    let mut cell_vreg: Vec<Vec<VReg>> = vec![Vec::new(); ns];
+    for s2 in 0..ns {
+        if ok[s2] {
+            for &(_, m) in &cells[s2] {
+                let cls = match m {
+                    Mem::F32 => Cls::F32,
+                    Mem::F64 => Cls::F64,
+                    Mem::Int(..) => Cls::I,
+                };
+                let v = f.vreg(cls);
+                cell_vreg[s2].push(v);
+            }
+        }
+    }
+    let find = |s2: usize, off: i64| -> Option<usize> { cells[s2].iter().position(|x| x.0 == off) };
+    // the cells start as zeros at entry (read before any write only in undefined programs)
+    let mut init = Vec::new();
+    for s2 in 0..ns {
+        if ok[s2] {
+            for (k, &(_, m)) in cells[s2].iter().enumerate() {
+                let v = cell_vreg[s2][k];
+                init.push(match m {
+                    Mem::F32 => Inst::Fconst(v, 0, false),
+                    Mem::F64 => Inst::Fconst(v, 0, true),
+                    Mem::Int(..) => Inst::Iconst(v, 0),
+                });
+            }
+        }
+    }
+    let p0 = f.blocks[0].pos.first().copied().unwrap_or(f.blocks[0].term_pos);
+    let ninit = init.len();
+    f.blocks[0].insts.splice(0..0, init);
+    f.blocks[0].pos.splice(0..0, std::iter::repeat(p0).take(ninit));
+    for bi in 0..f.blocks.len() {
+        if !f.blocks[bi].insts.iter().any(|i| matches!(*i, Inst::Load(_, _, base, _) | Inst::Store(_, base, _, _) | Inst::Copy(base, _, _) if sl(base) != NONE && ok[sl(base) as usize])) {
+            continue;
+        }
+        let old = std::mem::take(&mut f.blocks[bi].insts);
+        let oldp = std::mem::take(&mut f.blocks[bi].pos);
+        let mut ins = Vec::with_capacity(old.len() + 4);
+        let mut pos = Vec::with_capacity(old.len() + 4);
+        for (i, p) in old.into_iter().zip(oldp) {
+            match i {
+                Inst::Load(_, d, base, off) if sl(base) != NONE && ok[sl(base) as usize] => {
+                    let s2 = sl(base) as usize;
+                    let k = find(s2, at(base) + off as i64).unwrap();
+                    ins.push(Inst::Mov(d, cell_vreg[s2][k]));
+                    pos.push(p);
+                }
+                Inst::Store(m, base, off, v) if sl(base) != NONE && ok[sl(base) as usize] => {
+                    let s2 = sl(base) as usize;
+                    let k = find(s2, at(base) + off as i64).unwrap();
+                    ins.push(Inst::Store(m, base, off, v));
+                    pos.push(p);
+                    // the cell holds what a load of it gives: a narrow integer re-extended
+                    ins.push(match m {
+                        Mem::Int(n, signed) if n < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: n * 8, signed }), cell_vreg[s2][k], v),
+                        _ => Inst::Mov(cell_vreg[s2][k], v),
+                    });
+                    pos.push(p);
+                }
+                Inst::Copy(d, s3, n) if sl(d) != NONE && ok[sl(d) as usize] => {
+                    let s2 = sl(d) as usize;
+                    let (lo, hi) = (at(d), at(d) + n as i64);
+                    let copy_at = ins.len();
+                    ins.push(Inst::Copy(d, s3, n));
+                    pos.push(p);
+                    for (k, &(off, m)) in cells[s2].iter().enumerate() {
+                        if off >= lo && off + mem_size(m) as i64 <= hi {
+                            // the copied bytes' value when this block stored them into the source
+                            // slot itself (an iterator built in a temporary, then moved): that
+                            // value, so the cell is a known constant where it was one
+                            let stored = (sl(s3) != NONE).then(|| {
+                                let want = at(s3) + (off - lo);
+                                let mut found = None;
+                                for j in (0..copy_at).rev() {
+                                    match ins[j] {
+                                        Inst::Store(m2, b2, o2, v) if sl(b2) == sl(s3) && at(b2) + o2 as i64 == want && m2 == m => {
+                                            found = Some(v);
+                                            break;
+                                        }
+                                        // another field of the source: no overlap, keep looking
+                                        Inst::Store(m2, b2, o2, _) if sl(b2) == sl(s3) && {
+                                            let o = at(b2) + o2 as i64;
+                                            o + mem_size(m2) as i64 <= want || want + mem_size(m) as i64 <= o
+                                        } => {}
+                                        // a store into another known slot cannot touch the source
+                                        Inst::Store(_, b2, ..) if sl(b2) != NONE && sl(b2) != sl(s3) => {}
+                                        Inst::Store(..) | Inst::Copy(..) | Inst::Call(..) | Inst::StoreX(..) | Inst::VStore(..) => break,
+                                        _ => {}
+                                    }
+                                }
+                                found
+                            }).flatten();
+                            match stored {
+                                Some(v) => ins.push(match m {
+                                    Mem::Int(sz, signed) if sz < 8 => Inst::Conv(Conv::IntToInt(IntTy { bits: sz * 8, signed }), cell_vreg[s2][k], v),
+                                    _ => Inst::Mov(cell_vreg[s2][k], v),
+                                }),
+                                None => ins.push(Inst::Load(m, cell_vreg[s2][k], d, (off - lo) as i32)),
+                            }
+                            pos.push(p);
+                        }
+                    }
+                }
+                other => {
+                    ins.push(other);
+                    pos.push(p);
+                }
+            }
+        }
+        f.blocks[bi].insts = ins;
+        f.blocks[bi].pos = pos;
+    }
+    true
+}
+
+/// Stores into a slot that nothing ever reads back at those bytes (no load, no copy out of the
+/// slot overlaps them) go: after full unrolling, a write-through counter's memory copy
+/// (`start` of an array iterator) is written every iteration and read by nobody, and it keeps
+/// the slot from being forwarded or scalar-replaced. Only slots `slot_scan` follows completely
+/// (not escaping). Returns whether any store went.
+pub fn drop_unread_slot_stores(f: &mut Func) -> bool {
+    let ns = f.slots.len();
+    if ns == 0 {
+        return false;
+    }
+    let SlotScan { vs, esc, .. } = slot_scan(f);
+    const NONE: u32 = u32::MAX;
+    let sl = |v: VReg| vs[v.0 as usize].0;
+    let at = |v: VReg| vs[v.0 as usize].1;
+    let mut reads: Vec<Vec<(i64, i64)>> = vec![Vec::new(); ns];
+    for b in &f.blocks {
+        for i in &b.insts {
+            match *i {
+                Inst::Load(m, _, base, off) if sl(base) != NONE => {
+                    let o = at(base) + off as i64;
+                    reads[sl(base) as usize].push((o, o + mem_size(m) as i64));
+                }
+                Inst::VLoad(_, base, off) if sl(base) != NONE => {
+                    let o = at(base) + off as i64;
+                    reads[sl(base) as usize].push((o, o + 16));
+                }
+                Inst::LoadX(_, _, base, ..) if sl(base) != NONE => reads[sl(base) as usize].push((i64::MIN, i64::MAX)),
+                Inst::Copy(_, s2, n) if sl(s2) != NONE => {
+                    let o = at(s2);
+                    reads[sl(s2) as usize].push((o, o + n as i64));
+                }
+                _ => {}
+            }
+        }
+    }
+    let unread = |s2: usize, lo: i64, hi: i64| -> bool { !esc[s2] && reads[s2].iter().all(|&(a, b2)| b2 <= lo || hi <= a) };
+    let mut any = false;
+    for b in &mut f.blocks {
+        let mut k = 0;
+        while k < b.insts.len() {
+            let drop = match b.insts[k] {
+                Inst::Store(m, base, off, _) if sl(base) != NONE => {
+                    let o = at(base) + off as i64;
+                    unread(sl(base) as usize, o, o + mem_size(m) as i64)
+                }
+                _ => false,
+            };
+            if drop {
+                b.insts.remove(k);
+                if k < b.pos.len() {
+                    b.pos.remove(k);
+                }
+                any = true;
+            } else {
+                k += 1;
             }
         }
     }

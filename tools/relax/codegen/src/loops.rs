@@ -994,7 +994,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         }
     }
     let mut changed = false;
-    let mut budget = 600usize;
+    let mut budget = 800usize;
     // innermost first (natural_loops sorts by size); loops nested in a changed one are skipped
     let mut touched = vec![false; f.blocks.len()];
     'next: for (h, m) in &loops {
@@ -1011,7 +1011,8 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         if tr {
             eprintln!("full-unroll {}: loop b{} {} blocks {} insts", f.name, h, members.len(), size);
         }
-        if size > 120 {
+        // (the function's budget below bounds the total growth)
+        if size > 160 {
             continue;
         }
         if members.iter().any(|b| f.blocks[*b as usize].insts.iter().any(|i| matches!(i, Inst::Call(..))) || matches!(f.blocks[*b as usize].term, Term::Invoke(..) | Term::Resume)) {
@@ -1039,32 +1040,65 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         if outside.is_empty() {
             continue;
         }
-        // the latch steps the counter: c = c + s
+        // the counter step c = c + s: in the latch, or (with the test in the header) in a block
+        // that dominates the latch -- an iterator's `start += 1` right after its test
         let lb = &f.blocks[l as usize];
         let mut found = None;
-        // (k, type, counter, step, the step's value made at k is a constant in each copy)
-        for (k, i) in lb.insts.iter().enumerate() {
-            if let Inst::IBinI(IOp::Add, it, d, a, s) = *i {
-                if d == a && ndef[d.0 as usize] == 2 {
-                    found = Some((k, it, d, s, false));
-                }
+        // (block, k, type, counter, step, the step's value made at k is a constant in each copy)
+        for &sb in std::iter::once(&l).chain(members.iter().filter(|b| **b != l)) {
+            if found.is_some() {
+                break;
             }
-            // a narrow counter steps through a normalizing chain: `c = conv(conv(c) + s)` (an
-            // i32 `for i in 0..8`: zero-extend, add, sign-extend), the last link a move into c
-            if let Inst::Mov(d, x) = *i {
-                if ndef[d.0 as usize] == 2 {
-                    if let Some((it, s)) = narrow_step(lb, k, d, x, &ndef) {
-                        found = Some((k, it, d, s, true));
+            for (k, i) in f.blocks[sb as usize].insts.iter().enumerate() {
+                if let Inst::IBinI(IOp::Add, it, d, a, s) = *i {
+                    if d == a && ndef[d.0 as usize] == 2 {
+                        found = Some((sb, k, it, d, s, false));
+                    }
+                }
+                // a narrow counter steps through a normalizing chain: `c = conv(conv(c) + s)`
+                // (an i32 `for i in 0..8`), or a copy of `c + s` (a register-promoted field),
+                // the last link a move into c
+                if let Inst::Mov(d, x) = *i {
+                    if ndef[d.0 as usize] == 2 {
+                        if let Some((it, s)) = narrow_step(&f.blocks[sb as usize], k, d, x, &ndef) {
+                            found = Some((sb, k, it, d, s, true));
+                        }
                     }
                 }
             }
         }
-        let Some((ak, it, c, step, step_const)) = found else {
+        let Some((sb, ak, it, c, step, step_const)) = found else {
             if tr {
                 eprintln!("  no counter step c = c + s in latch b{}", l);
             }
             continue;
         };
+        // a step outside the latch: it must dominate the latch, and blocks it dominates read the
+        // stepped counter in the copies
+        let idom = if sb != l { crate::opt::idoms(f) } else { Vec::new() };
+        let dominated = |b: u32| -> bool {
+            if sb == l {
+                return false;
+            }
+            let mut x = b;
+            for _ in 0..100_000 {
+                if x == sb {
+                    return true;
+                }
+                let p = idom[x as usize];
+                if p == u32::MAX || p == x {
+                    return false;
+                }
+                x = p;
+            }
+            false
+        };
+        if sb != l && (sb == h || !dominated(l)) {
+            if tr {
+                eprintln!("  step in b{} does not dominate the latch b{}", sb, l);
+            }
+            continue;
+        }
         if !f.vregs.get(c.0 as usize).map_or(false, |x| *x == Cls::I) {
             continue;
         }
@@ -1089,7 +1123,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             }
             cmp
         };
-        let latch_cmp = if matches!(lb.term, Term::Branch(_, a, b) if a == h || b == h) { find_cmp(lb, ak + 1) } else { None };
+        let latch_cmp = if sb == l && matches!(lb.term, Term::Branch(_, a, b) if a == h || b == h) { find_cmp(lb, ak + 1) } else { None };
         let header_cmp = if latch_cmp.is_none() && h != l {
             let hb = &f.blocks[h as usize];
             if hb.insts.iter().any(|i| { let mut r = false; for_defs(i, |d| r |= d == c); r }) { None } else { find_cmp(hb, 0) }
@@ -1201,9 +1235,13 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             for (q, &b) in idx.iter().enumerate() {
                 let mut blk = f.blocks[b as usize].clone();
                 let latch = b == l;
+                // the block holding the step: after it, the copy's next counter; blocks the step
+                // dominates: the next counter throughout
+                let step_blk = b == sb;
+                let past = b != sb && dominated(b);
                 for (ii, ins) in blk.insts.iter_mut().enumerate() {
-                    let after = latch && ii > ak;
-                    if latch && ii == ak {
+                    let after = past || (step_blk && ii > ak);
+                    if step_blk && ii == ak {
                         // the normalizing chain's value is this copy's next counter: a constant
                         *ins = if step_const { Inst::Iconst(rj2, extend_const(v.wrapping_add(step), it)) } else { Inst::IBinI(IOp::Add, it, rj2, rj, step) };
                         continue;
@@ -1218,7 +1256,7 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
                 }
                 crate::regalloc::term_vregs_mut(&mut blk.term, |r| {
                     if *r == c {
-                        *r = if latch { rj2 } else { rj };
+                        *r = if step_blk || past { rj2 } else { rj };
                     } else if let Some(x) = fresh.get(&r.0) {
                         *r = *x;
                     }
@@ -1276,17 +1314,23 @@ fn narrow_step(b: &Block, k: usize, c: VReg, x: VReg, ndef: &[u32]) -> Option<(I
             d
         })
     };
-    let Some(&Inst::Conv(Conv::IntToInt(it), _, y)) = def_of(x) else { return None };
-    let Some(&Inst::IBinI(IOp::Add, _, _, z, s)) = def_of(y) else { return None };
+    // optional final normalisation, then the add
+    let (it, y) = match def_of(x) {
+        Some(&Inst::Conv(Conv::IntToInt(it), _, y)) => (Some(it), y),
+        _ => (None, x),
+    };
+    let Some(&Inst::IBinI(IOp::Add, add_ty, _, z, s)) = def_of(y) else { return None };
+    // the add reads the counter: directly, through a copy, or through a conversion
     let src = if z == c {
         z
     } else {
         match def_of(z) {
-            Some(&Inst::Conv(Conv::IntToInt(_), _, w)) if w == c => w,
+            Some(&Inst::Conv(Conv::IntToInt(_), _, w)) | Some(&Inst::Mov(_, w)) if w == c => w,
             _ => return None,
         }
     };
-    (src == c && it.bits <= 32).then_some((it, s))
+    let it = it.unwrap_or(add_ty);
+    (src == c && (it.bits <= 32 || it.bits == 64)).then_some((it, s))
 }
 
 /// Vregs defined once (`ndef`), inside the loop (`m`), whose every use is inside the loop and
@@ -1344,4 +1388,21 @@ fn iteration_locals(f: &Func, members: &[u32], m: &[bool], ndef: &[u32], c: VReg
         }
     }
     (0..nv as u32).filter(|v| ok[*v as usize]).collect()
+}
+
+/// Empties the blocks the entry no longer reaches (a fully unrolled loop's original body, which
+/// only its last copy's folded back edge entered): passes that scan every block (slot
+/// promotion, SROA) would otherwise still see their accesses. Returns whether any block emptied.
+pub fn clear_unreachable(f: &mut Func) -> bool {
+    let reach = crate::regalloc::reachable(f);
+    let mut any = false;
+    for (bi, b) in f.blocks.iter_mut().enumerate() {
+        if !reach[bi] && (!b.insts.is_empty() || !matches!(b.term, Term::Unreachable)) {
+            b.insts.clear();
+            b.pos.clear();
+            b.term = Term::Unreachable;
+            any = true;
+        }
+    }
+    any
 }

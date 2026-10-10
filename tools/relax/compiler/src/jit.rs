@@ -7901,9 +7901,31 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
             crate::opt::simplify(options, func, ro, cfg.imm, false);
         }
     }
-    // loops with a small constant trip count: fully unrolled (each copy's counter a constant)
-    if cfg.fold && relax_codegen::loops::unroll_const_loops(options, func) {
+    // array iterators (a slot read at runtime offsets): their scalar fields in registers, so
+    // the iteration counter can drive full unrolling below
+    if cfg.fold && cfg.sroa && crate::opt::promote_dyn_read_slots(func) {
+        // the cells' entry zeros that a write always precedes are dead by liveness only
+        crate::opt::live_dce(func);
         crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+    }
+    // loops with a small constant trip count: fully unrolled (each copy's counter a constant);
+    // a second round reaches the loop around an unrolled inner one
+    for _ in 0..2 {
+        if !(cfg.fold && relax_codegen::loops::unroll_const_loops(options, func)) {
+            break;
+        }
+        crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        // the original loops the copies replaced: unreachable now, emptied for the passes below
+        relax_codegen::loops::clear_unreachable(func);
+        // unrolled reads at constant offsets: the slots they read can now go to registers (a
+        // write-through counter's stores nobody reads go first, then the copy chains)
+        if cfg.sroa && crate::opt::drop_unread_slot_stores(func) {
+            crate::opt::forward_slot_copies(func);
+        }
+        if cfg.sroa && crate::opt::sroa(func) {
+            crate::opt::live_dce(func);
+            crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
+        }
     }
     // Rust min/max with an operand that is never NaN: one minss/maxss (bounding boxes)
     if cfg.fold {
