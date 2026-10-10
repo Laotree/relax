@@ -310,6 +310,10 @@ fn provided() {
         relax_compiler::provided::register("makepad-script-audio-aot", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_audio_aot"));
     }
 
+    // Splash VM registry -> relax inspect (vm list, script error events)
+    relax_compiler::inspect::set_vm_provider(makepad_script::inspect_registry::summaries);
+    makepad_script::inspect_registry::set_error_hook(relax_compiler::inspect::script_error_event);
+
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("host-gen") {
         std::process::exit(if args.get(2).map(String::as_str) == Some("--worker") { host_gen::worker(&args[3..]) } else { host_gen::main(&args[2..]) });

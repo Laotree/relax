@@ -304,6 +304,17 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     if let Some(live) = host {
         s.add("malloc/in use/relax + compiled-in crates (tracked stacks, est.)", live.max(0) as u64);
     }
+    // Splash VMs (their registry's estimates, as of their last evaluation / collection)
+    for v in super::vm_summaries() {
+        if let Ok(j) = crate::json::parse(v.as_bytes()) {
+            let b = j.get("heap_bytes_est").map_or(0.0, |x| x.num()) as u64;
+            if b > 0 {
+                let id = j.get("vm").map(|x| x.str().to_string()).unwrap_or_default();
+                let label = j.get("label").map(|x| x.str().to_string()).unwrap_or_default();
+                s.add(&format!("splash/{} {}", label, id), b);
+            }
+        }
+    }
     let (committed, live, _) = crate::zone_alloc::burst_stats();
     s.add("relax/burst arena committed", committed as u64);
     s.add("relax/burst arena live", live as u64);

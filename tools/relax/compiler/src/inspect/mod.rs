@@ -306,6 +306,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
+    ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -341,6 +342,7 @@ fn dispatch(req: &Req, out: &mut Out) {
         "mem" => mem::cmd_mem(req, out),
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
+        "vms" => cmd_vms(out),
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
@@ -721,6 +723,35 @@ fn cmd_waits(out: &mut Out) {
 fn cmd_owner(out: &mut Out) {
     out.measured("owner thread", "owner counters (no owner)", &[]);
     out.line(&format!("{{\"serving\":{},\"queued\":{}}}", json_str(&crate::owner::serving_note()), crate::owner::queued_note()));
+}
+
+// ------------------------------------------------------------------ Splash VMs
+
+/// The Splash VM registry's summaries (makepad-script, compiled into the relax binary: its
+/// main.rs sets the provider; relax-compiler cannot depend on the script crate).
+static VM_PROVIDER: std::sync::Mutex<Option<fn() -> Vec<String>>> = std::sync::Mutex::new(None);
+
+pub fn set_vm_provider(f: fn() -> Vec<String>) {
+    *VM_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// One JSON object per live Splash VM (empty when the script crate is not in this binary).
+pub fn vm_summaries() -> Vec<String> {
+    let f = *VM_PROVIDER.lock().unwrap_or_else(|e| e.into_inner());
+    f.map(|f| f()).unwrap_or_default()
+}
+
+/// A Splash script error (makepad-script's error hook): an agent's `scripterr` event.
+pub fn script_error_event(line: &str) {
+    events::emit("scripterr", line, &format!("\"error\":{},\"more\":[\"vms\"]", json_str(&short(line, 400))));
+}
+
+fn cmd_vms(out: &mut Out) {
+    let v = vm_summaries();
+    out.measured(&format!("{} live Splash VM(s): heap counts and GC as of their last evaluation / collection", v.len()), "script VM registry (atomics)", &[]);
+    for l in v {
+        out.line(&l);
+    }
 }
 
 // ------------------------------------------------------------------ program wait entries

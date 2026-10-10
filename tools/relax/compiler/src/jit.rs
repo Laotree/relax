@@ -11061,6 +11061,11 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_exit" => Some(__relax_exit as *const () as usize),
         // relax inspect's timeline: makepad's UI phases (platform thread/ui_hang.rs), Relax std's
         // futex wakes and the recording flag they check
+        // relax inspect's retry boundaries (makepad's event dispatch)
+        b"relax_retry_on" => Some(&crate::inspect::events::RELAX_RETRY_ON as *const _ as usize),
+        b"relax_retry_enter" => Some(crate::inspect::events::relax_retry_enter as *const () as usize),
+        b"relax_retry_leave" => Some(crate::inspect::events::relax_retry_leave as *const () as usize),
+        b"relax_retry_take" => Some(crate::inspect::events::relax_retry_take as *const () as usize),
         b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
         b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),
         b"__relax_wake" => Some(crate::inspect::timeline::relax_wake as *const () as usize),

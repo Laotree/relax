@@ -70,6 +70,11 @@ pub fn watched() -> bool {
     WATCHERS.load(Relaxed) > 0 || super::AGENT.load(Relaxed)
 }
 
+/// Retry boundaries are worth setting while someone may resume a panic with `retry`.
+fn retry_update() {
+    RELAX_RETRY_ON.store(watched(), Relaxed);
+}
+
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
     on.as_ref().map_or(true, |v| v.iter().any(|k| k == kind))
 }
@@ -88,6 +93,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
     let t0 = std::time::Instant::now();
     WATCHERS.fetch_add(1, SeqCst);
     super::timeline::set_frame_watch(true);
+    retry_update();
     let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     let found = loop {
         if let Some(e) = q.iter().find(|e| e.seq > since && wanted(&on, e.kind)) {
@@ -102,6 +108,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
     if WATCHERS.fetch_sub(1, SeqCst) == 1 && !super::AGENT.load(Relaxed) {
         super::timeline::set_frame_watch(false);
     }
+    retry_update();
     match found {
         Some((seq, json)) => out.line(&format!("{},\"rearm\":\"watch since={}\"}}", &json[..json.len() - 1], seq)),
         None => out.line(&format!("{{\"event\":\"none\",\"waited_s\":{},\"rearm\":\"watch since={}\"}}", timeout, since)),
@@ -120,6 +127,7 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
         out.limit = usize::MAX;
         WATCHERS.fetch_add(1, SeqCst);
         super::timeline::set_frame_watch(true);
+        retry_update();
     }
     loop {
         let batch: Vec<(u64, String)> = {
@@ -142,6 +150,7 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
     if follow && WATCHERS.fetch_sub(1, SeqCst) == 1 && !super::AGENT.load(Relaxed) {
         super::timeline::set_frame_watch(false);
     }
+    retry_update();
 }
 
 // ------------------------------------------------------------------ parked panics
@@ -149,8 +158,42 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
 struct Parked {
     id: u64,
     seq: u64,
-    /// 0 waiting, 1 resume as a panic
+    /// 0 waiting, 1 resume as a panic, 2 retry the boundary's unit
     decision: AtomicU32,
+}
+
+// ---- retry boundaries (DESIGN.md §10b): makepad's event dispatch runs inside one while an agent
+// watches; a parked panic resumed with `retry` unwinds to it and the dispatch runs again with the
+// code as it is now (after the agent's hot patch).
+
+/// boundaries may be set (makepad checks it through `relax_retry_on`): on while watched
+#[no_mangle]
+pub static RELAX_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    /// retry boundaries open on this thread (their unit names, innermost last)
+    static BOUNDARIES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the panic unwinding now was resumed with `retry`
+    static RETRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// makepad: a retry boundary begins (`name`: what re-runs, e.g. the event's name).
+pub extern "C" fn relax_retry_enter(name: *const u8, len: usize) {
+    let n = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) }.to_string();
+    let _ = BOUNDARIES.try_with(|b| b.borrow_mut().push(n));
+}
+
+pub extern "C" fn relax_retry_leave() {
+    let _ = BOUNDARIES.try_with(|b| b.borrow_mut().pop());
+}
+
+/// makepad, after catching a panic at its boundary: run the unit again? (clears the request)
+pub extern "C" fn relax_retry_take() -> bool {
+    RETRY.try_with(|r| r.replace(false)).unwrap_or(false)
+}
+
+fn innermost_boundary() -> Option<String> {
+    BOUNDARIES.try_with(|b| b.borrow().last().cloned()).ok().flatten()
 }
 
 static PARKED: Mutex<Vec<std::sync::Arc<Parked>>> = Mutex::new(Vec::new());
@@ -190,8 +233,9 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
     let me = crate::os::thread::current();
     let thread = if me == crate::jit::MAIN_TID.load(Relaxed) { "main".to_string() } else { crate::os::thread::name(me) };
     let wait_s = if watched { 600 } else { park_secs_unwatched() };
+    let boundary = innermost_boundary();
     let fields = format!(
-        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":{},\"more\":[\"stacks\",\"why-hung\",\"resume P{} panic\"]",
+        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":{},\"retry\":{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} panic\"]",
         id,
         json_str(&info.kind),
         json_str(&super::short(&info.message, 400)),
@@ -199,6 +243,11 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
         json_str(&thread),
         fr.join(","),
         wait_s,
+        match &boundary {
+            Some(b) => format!("{{\"reruns\":{},\"note\":\"side effects since it began may repeat\"}}", json_str(b)),
+            None => "null".into(),
+        },
+        if boundary.is_some() { format!("\"resume P{} retry\",", id) } else { String::new() },
         id
     );
     let mut list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
@@ -221,6 +270,9 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
         list = RESUME.wait_timeout(list, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
+    if p.decision.load(SeqCst) == 2 && boundary.is_some() {
+        let _ = RETRY.try_with(|r| r.set(true));
+    }
 }
 
 /// "file:line:col" of a compiler-known panic site.
@@ -257,16 +309,20 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
         return;
     };
     let how = req.pos.get(1).map(String::as_str).unwrap_or("panic");
-    if how != "panic" {
-        out.err("only `panic` is available yet (retry / restart / return come with instrumented builds)");
-        return;
-    }
+    let decision = match how {
+        "panic" => 1,
+        "retry" => 2,
+        _ => {
+            out.err("resume <P<n>> panic | retry (restart / return come with probes)");
+            return;
+        }
+    };
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     match list.iter().find(|p| p.id == id) {
         Some(p) => {
-            p.decision.store(1, SeqCst);
+            p.decision.store(decision, SeqCst);
             RESUME.notify_all();
-            out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"panic\"}}", id));
+            out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"{}\"}}", id, how));
         }
         None => out.err(&format!("no parked panic P{}", id)),
     }
@@ -278,6 +334,7 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
 /// deadlocks (a wait cycle seen twice in a row), memory growth (RSS). Four checks a second, each
 /// a registry scan and one resident-size read: nothing the program pays for.
 pub fn start() {
+    retry_update();
     let _ = std::thread::Builder::new().name("relax-inspect-watch".into()).spawn(|| {
         super::heap::exclude_this_thread();
         let hang_ms: u64 = std::env::var("RELAX_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
