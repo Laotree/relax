@@ -374,6 +374,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         .zip(g.pkg.iter())
         .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
         .collect();
+    let live_inputs = options.live.then(|| crate::reload::Inputs::collect(&g, &std_dir, &workspace));
     // Validate native macros before any overlapping provided-crate identity error.
     if let Err(e) = crate::crates::apply_substitutes(sess, &mut g.crates, &std_dir) {
         eprintln!("relax-run: crate substitution: {}", e);
@@ -1075,7 +1076,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     // a live session: hot reload of the program's own sources (reload.rs); none for store sources
     if crate::layout::LIVE_SESSION.load(Ordering::Relaxed) {
-        crate::reload::start_watcher(up);
+        crate::reload::start_watcher(up, live_inputs.unwrap_or_default());
     }
     jit::start_completion(up, runtime);
     jit::live_needs_present(u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform"));

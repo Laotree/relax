@@ -3698,7 +3698,11 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
 /// Body-class patches are type-safe to install while the program runs (hotreload.md §9.2), so
 /// they apply at once; other edits print their rung and reason. Every outcome is one line on
 /// stderr ("relax-live: ...").
-pub fn start_watcher(up: *mut Unit) {
+#[path = "reload_inputs.rs"]
+mod inputs;
+pub use inputs::Inputs;
+
+pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     struct P(*mut Unit);
     unsafe impl Send for P {}
@@ -3709,7 +3713,7 @@ pub fn start_watcher(up: *mut Unit) {
             let runtime = &session.runtime;
             let p = p;
             jit::lower_this_thread_priority(runtime);
-            unsafe { watch(p.0) }
+            unsafe { watch(p.0, inputs) }
         })
         .ok();
 }
@@ -3719,7 +3723,7 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
-unsafe fn watch(up: *mut Unit) {
+unsafe fn watch(up: *mut Unit, inputs: Inputs) {
     let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -3732,22 +3736,23 @@ unsafe fn watch(up: *mut Unit) {
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
         jit::lock_unit_quick();
-        let v = own_files(&*up).into_iter().map(|(p, i)| (p, i, None)).collect();
+        let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
+        let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
+        for (p, i) in loaded {
+            if !inputs.paths.contains_key(&p) { let s = stamp(&p); v.push((p, i, s)); }
+        }
         jit::unlock_unit();
         v
     };
     // Proc-macro source crates are stripped from the app graph. Their inputs and
     // directories still participate in the existing watcher's changed-path batch.
     for path in crate::native_macros::paths() {
-        if !files.iter().any(|f| f.0 == path) { files.push((path, u32::MAX, None)); }
+        if !files.iter().any(|f| f.0 == path) { let s = stamp(&path); files.push((path, u32::MAX, s)); }
     }
     // the post-boot loader adds files after boot; each is watched from its load (an
     // edit made before it is simply what the load read)
     let mut loads_seen = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
     let mut events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
-    for f in files.iter_mut() {
-        f.2 = stamp(&f.0);
-    }
     eprintln!("relax-live: watching {} source files; session log {}", files.len(), live_log_path());
     let mut undos: Vec<Undo> = Vec::new();
     // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
@@ -3768,21 +3773,32 @@ unsafe fn watch(up: *mut Unit) {
     };
     let mut stalled: std::collections::HashMap<usize, (Instant, Vec<u8>)> = std::collections::HashMap::new();
     let mut tick: u32 = 0;
+    let mut startup_scan = true;
+    let mut restart_required = false;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
         // Keep the original stamps and queued OS notifications intact until startup
         // finishes. In particular, do not acquire Reloading or drain streamed edits:
         // either can compete with the cold compiler before the first frame.
         if !jit::live_startup_done() { continue; }
+        // Once the tree no longer matches this session, later saves must not patch a
+        // mixture of revisions into the old process. A fresh run restores live editing.
+        if restart_required { continue; }
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
         // while the post-boot loader loads was never seen): stat every file once instead
-        let mut rewatched = false;
-        if loads != loads_seen {
+        let mut rewatched = std::mem::take(&mut startup_scan);
+        if loads != loads_seen || rewatched {
             loads_seen = loads;
             jit::lock_unit_quick();
-            let added: Vec<(String, u32)> = own_files(&*up).into_iter().filter(|(p, _)| !files.iter().any(|f| &f.0 == p)).collect();
+            let loaded = own_files(&*up);
             jit::unlock_unit();
+            let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
+            let mut added = Vec::new();
+            for (path, file) in loaded {
+                if let Some(&i) = known.get(&path) { files[i].1 = file; }
+                else { added.push((path, file)); }
+            }
             if !added.is_empty() {
                 if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() { eprintln!("relax-live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
@@ -3852,17 +3868,17 @@ unsafe fn watch(up: *mut Unit) {
         let seen = std::time::Instant::now();
         // from the save on, the post-boot loader keeps off the unit lock (the read below
         // compares with the running text under it)
-        let _reloading = jit::Reloading::begin();
         for &k in &changed {
             if !hot.contains(&k) {
                 hot.push(k);
             }
         }
         // let the save settle (editors write in steps; a branch switch touches many files): until
-        // the changed files keep their stamps for one 3 ms step and nothing else changed
+        // the changed files keep their stamps for a full filesystem polling window. A
+        // checkout spanning several writes must not be split into individual patches.
         let mut last: Vec<Option<(std::time::SystemTime, u64)>> = changed.iter().map(|&k| stamp(&files[k].0)).collect();
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(3));
+            std::thread::sleep(std::time::Duration::from_millis(100));
             let now: Vec<_> = changed.iter().map(|&k| stamp(&files[k].0)).collect();
             let mut more = false;
             let candidates = match events.as_mut().map(|w| w.changed()) {
@@ -3888,6 +3904,16 @@ unsafe fn watch(up: *mut Unit) {
                 break;
             }
         }
+        if let Some(reason) = inputs.restart_reason(changed.iter().map(|&k| files[k].0.as_str())) {
+            let package = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
+            let message = format!("{} files changed: {reason}; restart `relax run {package}` to pick them up; keeping the running code", changed.len());
+            eprintln!("relax-live: {message}");
+            live_log(&format!("{{\"restart_required\":true,\"message\":{}}}", json_str(&message)));
+            restart_required = true;
+            stalled.clear();
+            continue;
+        }
+        let _reloading = jit::Reloading::begin();
         let macro_changes: Vec<_> = changed.iter().map(|&k| (files[k].0.as_str(), None)).collect();
         if let Err(error) = crate::native_macros::reload(&macro_changes, (&(*up).prog.session).runtime.profile) {
             for &k in &changed { files[k].2 = stamp(&files[k].0); }

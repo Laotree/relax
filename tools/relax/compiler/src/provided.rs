@@ -50,6 +50,11 @@ pub struct ProvidedCrate {
 
 static REGISTRY: Mutex<Vec<ProvidedCrate>> = Mutex::new(Vec::new());
 
+pub(crate) fn registered(name: &str) -> bool {
+    let name = name.replace('-', "_");
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.name == name)
+}
+
 /// Registers a provided crate (before `cli_main`): its generated shim table
 /// (`<crate>::__host_shims::SHIMS`) and panic-text accessor.
 pub fn register(
