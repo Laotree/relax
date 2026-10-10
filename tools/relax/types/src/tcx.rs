@@ -2067,6 +2067,7 @@ impl Tcx {
             }
             ast::Ty::ImplTrait(bs) if env.opaque_owner.is_some() => self.lower_opaque(cx, prog, file, module, env, t, *bs),
             ast::Ty::Mac(m) => {
+                let m = prog.files[file as usize].ast.row(*m);
                 let lo = m.path.lo;
                 let name = prog.files[file as usize].ast.segs(m.path.segs).last().map(|sg| prog.files[file as usize].text(sg.name).to_string()).unwrap_or_default();
                 self.err(cx, prog, file, lo, format!("type macro `{}!` is not expanded here", name));

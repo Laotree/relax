@@ -420,7 +420,7 @@ impl<'p, 'a> Walker<'p, 'a> {
                 self.cen.c[C_DYN] += 1;
                 self.bounds(p.ast.list(*b));
             }
-            Ty::Mac(m) => self.mac(m),
+            Ty::Mac(m) => self.mac(p.ast.row(*m)),
             _ => {}
         }
     }
@@ -709,7 +709,7 @@ impl<'p, 'a> Walker<'p, 'a> {
                 }
             }
             Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.pat(*x),
-            Pat::Mac(m) => self.mac(m),
+            Pat::Mac(m) => self.mac(p.ast.row(*m)),
             _ => {}
         }
     }

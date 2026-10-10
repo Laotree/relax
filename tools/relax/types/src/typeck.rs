@@ -2245,7 +2245,7 @@ impl<'a> Fcx<'a> {
                 }
             }
             Pat::Box(x) => self.check_pat(*x, expected),
-            Pat::Mac(m) => self.err(m.path.lo, "macro in pattern position".to_string()),
+            Pat::Mac(m) => self.err(self.ast().row(*m).path.lo, "macro in pattern position".to_string()),
         }
     }
 

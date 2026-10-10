@@ -852,7 +852,7 @@ impl BoundVarContext<'_> {
             ast::Pat::TupleStruct(p, ps) => { self.visit_path(&p); for p in self.prog.files[self.file as usize].ast.list(ps) { self.visit_pat(*p); } }
             ast::Pat::Struct(p, fs, _) => { self.visit_path(&p); for f in self.prog.files[self.file as usize].ast.list(fs) { self.visit_pat(f.pat); } }
             ast::Pat::Tuple(ps) | ast::Pat::Slice(ps) | ast::Pat::Or(ps) => for p in self.prog.files[self.file as usize].ast.list(ps) { self.visit_pat(*p); },
-            ast::Pat::Mac(m) => self.visit_mac(m),
+            ast::Pat::Mac(m) => { let m = *self.prog.files[self.file as usize].ast.row(m); self.visit_mac(m) }
             ast::Pat::Wild | ast::Pat::Rest | ast::Pat::Ident { sub: None, .. } => {}
         }
     }

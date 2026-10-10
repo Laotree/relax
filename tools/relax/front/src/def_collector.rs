@@ -624,7 +624,7 @@ impl DefCollector<'_> {
                 if let Some(t) = f.ret { self.visit_ty(t, opaque); }
             }
             Ty::DynTrait(bs, _) => self.visit_bounds(bs, opaque),
-            Ty::Mac(m) => self.visit_mac(m),
+            Ty::Mac(m) => { let m = *self.ast.row(m); self.visit_mac(m) }
             Ty::Never | Ty::Infer | Ty::ImplicitSelf | Ty::CVarArgs => {}
         }
     }
@@ -692,7 +692,7 @@ impl DefCollector<'_> {
             Pat::TupleStruct(p, ps) => { self.visit_path(p, false); for p in self.ast.list(ps) { self.visit_pat(*p); } }
             Pat::Struct(p, fs, _) => { self.visit_path(p, false); for f in self.ast.list(fs) { self.visit_pat(f.pat); } }
             Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) => for p in self.ast.list(ps) { self.visit_pat(*p); },
-            Pat::Mac(m) => self.visit_mac(m),
+            Pat::Mac(m) => { let m = *self.ast.row(m); self.visit_mac(m) }
             Pat::Wild | Pat::Rest | Pat::Ident { sub: None, .. } => {}
         }
     }

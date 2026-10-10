@@ -2552,7 +2552,7 @@ impl<'a> Parser<'a> {
                         return self.in_expansion(start, |p| p.ty());
                     }
                     let args = self.mac_args(&path, toks);
-                    Ty::Mac(MacCall { path, delim, toks, args })
+                    { let m = self.ast.push_row(MacCall { path, delim, toks, args }); Ty::Mac(m) }
                 } else {
                     let path = self.path(false)?;
                     if plus && self.kind() == T::Plus && matches!(self.nth(1), T::Lifetime | T::Ident | T::PathSep | T::Question) {
@@ -2747,7 +2747,7 @@ impl<'a> Parser<'a> {
                         return self.in_expansion(start, |p| p.pat_top());
                     }
                     let args = self.mac_args(&path, toks);
-                    Pat::Mac(MacCall { path, delim, toks, args })
+                    { let m = self.ast.push_row(MacCall { path, delim, toks, args }); Pat::Mac(m) }
                 } else {
                     let lo = self.lo();
                     let simple = matches!(self.kind(), T::Ident | T::RawIdent) && !matches!(self.nth(1), T::PathSep | T::OpenParen | T::OpenBrace);

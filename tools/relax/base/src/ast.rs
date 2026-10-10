@@ -687,11 +687,15 @@ pub enum Ty {
     ImplTrait(List<Bound>),
     DynTrait(List<Bound>, bool),
     Paren(TyId),
-    Mac(MacCall),
+    Mac(Row<MacCall>),
     /// `Self` inside impls is a path; this is the implicit `self` type of `&self`
     ImplicitSelf,
     CVarArgs,
 }
+
+// Ty was 36 bytes, Pat 36: their macro calls (32 bytes inline) are rows.
+const _: () = assert!(std::mem::size_of::<Ty>() == 20);
+const _: () = assert!(std::mem::size_of::<Pat>() == 24);
 
 #[derive(Debug, Clone, Copy)]
 pub struct FnPtr {
@@ -727,7 +731,7 @@ pub enum Pat {
     Or(List<PatId>),
     Paren(PatId),
     Box(PatId),
-    Mac(MacCall),
+    Mac(Row<MacCall>),
 }
 
 #[derive(Debug, Clone, Copy)]
