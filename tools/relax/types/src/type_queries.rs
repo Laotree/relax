@@ -1054,6 +1054,11 @@ impl Tcx {
     /// rustc_hir_analysis/src/coherence/mod.rs: coherence is checked after the
     /// complete impl index has been published, independently of body reachability.
     pub fn coherence_check(&self, prog: &Program) {
+        self.coherence_check_of(prog, None);
+    }
+
+    /// `coherence_check` for the traits/inherent impls of `crates` only (None: every crate).
+    pub fn coherence_check_of(&self, prog: &Program, crates: Option<&[u32]>) {
         let providers=Providers { tcx:self,prog };
         // The collected per-trait index supplies impls; this pass preserves each crate's
         // traits in the order of its first impl of them (what a per-crate scan finds).
@@ -1066,6 +1071,7 @@ impl Tcx {
         }
         for krate in 0..prog.crates.len() as u32 {
             if matches!(prog.syms.str(prog.crates[krate as usize].name),"core"|"alloc"|"std"|"proc_macro") { continue; }
+            if crates.is_some_and(|c| !c.contains(&krate)) { continue; }
             for &td in &traits_of[krate as usize] { providers.specialization_graph_with((krate,td), Some(&self.trait_impls_of[&td])).expect("coherence query"); }
             providers.crate_inherent_impls_overlap_check(DefId(krate)).expect("inherent coherence query");
         }

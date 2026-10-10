@@ -730,10 +730,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::jit::compile_watch(Some(("check: own errors", 0)));
         let mut pre = crate::macro_reg::derive_failures();
         pre.extend(watch_load_errors);
-        // A run checks coherence in the background; a check needs its errors now.
-        tcx.check_coherence(&prog);
         // the watch session reports its root crate's; a one-shot check every workspace crate's
         let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
+        // A run checks coherence in the background; a check needs its errors now: the app
+        // check its own crates' impls (cargo check), every other check all of them.
+        let t = Instant::now();
+        if selftest || watch || root_only || session.is_some() { tcx.check_coherence(&prog); }
+        else { tcx.check_coherence_of(&prog, Some(&checked)); }
+        phase("coherence", t);
         for k in checked {
             pre.extend(crate::check::own_errors(&prog, k, &prog.errors, "resolve"));
             pre.extend(crate::check::own_errors(&prog, k, &tcx.errors, "typeck"));
@@ -760,7 +764,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return 0;
         }
         crate::jit::compile_watch(Some(("check: unit", 0)));
+        let t = Instant::now();
         let mut u = Unit::new(prog, tcx, core);
+        phase("unit", t);
         // every body is checked, so the files the selection skipped load first: all of them for
         // selftest, a watch session or --root-only; the checked (app) crates' for the app check
         let t = Instant::now();
@@ -1806,7 +1812,16 @@ pub(crate) extern "C" fn relax_quit_requested() {
 /// boot does (`push_front_images` + `record_front_crates` + the front graph), so the next check
 /// maps them. Only when the cache is on and some file was parsed (nothing new otherwise).
 fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
-    if !front_recordable() || u.prog.front_restored.iter().all(|r| *r) { return; }
+    if !front_recordable() { return; }
+    // the loader's front graph write runs on its own thread from load finish: a check ends
+    // sooner than a run's first present, so it waits for that write here (else the process
+    // exited under it, no graph certificate was ever recorded, and every check validated each
+    // crate image again -- or re-parsed, when a selection could not be proven without it)
+    if u.prog.front_restored.iter().all(|r| *r) {
+        let r = crate::cache::Cache::flush_front_graphs();
+        verbose!("relax-check: front graph {:?}", r.err());
+        return;
+    }
     let Some(mode) = crate::cache::mode_from_env(options) else { return };
     let t = Instant::now();
     let mut c = match crate::cache::Cache::open_collected(u, mode, None) {

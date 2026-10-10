@@ -438,10 +438,15 @@ impl Tcx {
     /// (Tcx::check_coherence into the collected errors, the background coherence check of a
     /// run into the diagnostics context).
     pub fn orphan_errors(&self, prog: &Program) -> Vec<(DefId, u32, String)> {
+        self.orphan_errors_of(prog, None)
+    }
+
+    pub fn orphan_errors_of(&self, prog: &Program, crates: Option<&[u32]>) -> Vec<(DefId, u32, String)> {
         let typing_env = TypingEnv::fully_monomorphized(prog);
         let mut errors = Vec::new();
         for im in &prog.impls {
             let krate = prog.def(im.def).krate;
+            if crates.is_some_and(|c| !c.contains(&krate)) { continue; }
             let kname = prog.syms.str(prog.crates[krate as usize].name);
             if matches!(kname, "core" | "alloc" | "std" | "proc_macro") {
                 continue;
@@ -505,12 +510,18 @@ impl Tcx {
     /// (`collect`) here. Selection never reads its verdicts (nightly reports coherence errors
     /// and selection proceeds), so where it runs changes no other answer.
     pub fn check_coherence(&mut self, prog: &Program) {
-        for (imp, pos, message) in self.orphan_errors(prog) {
+        self.check_coherence_of(prog, None);
+    }
+
+    /// `check_coherence` for the impls of `crates` only (None: every crate) -- the app check,
+    /// like `cargo check`, checks its own crates; their dependencies were checked as their own.
+    pub fn check_coherence_of(&mut self, prog: &Program, crates: Option<&[u32]>) {
+        for (imp, pos, message) in self.orphan_errors_of(prog, crates) {
             let m = prog.record_error(prog.def(imp).file, pos, "typeck", message);
             self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).push(m);
         }
         self.flush_errs();
-        self.coherence_check(prog);
+        self.coherence_check_of(prog, crates);
     }
 
     /// check_coherence for a run's background check: every error goes to the diagnostics
