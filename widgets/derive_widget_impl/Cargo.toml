@@ -11,6 +11,3 @@ repository = "https://github.com/makepad/makepad/"
 [dependencies]
 makepad-micro-proc-macro = { path = "../../libs/micro_proc_macro", version = "1.0.0" }
 
-[features]
-## Build against Rapid's token model (the library linked into Rapid's loader).
-rapid = ["makepad-micro-proc-macro/rapid"]

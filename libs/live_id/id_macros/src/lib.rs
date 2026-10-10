@@ -1,4 +1,4 @@
-// The expansion logic lives in the library crate makepad-live-id-macros-impl (Rapid links it
+// The expansion logic lives in the library crate makepad-live-id-macros-impl (relax links it
 // directly); these are the rustc proc-macro entry points.
 use proc_macro::TokenStream;
 

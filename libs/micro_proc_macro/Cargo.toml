@@ -10,9 +10,7 @@ repository = "https://github.com/makepad/makepad/"
 metadata.makepad-auto-version = "2tKeN-afCtZGYbB_BxPOVxkh0W4="
 
 [features]
-## Back the token types with a plain-data proc_macro-compatible model (Rapid's loader) instead of rustc's proc_macro.
-rapid = []
-
+## Back the token types with Relax's token model (relax-lex; the libraries linked into relax) instead of rustc's proc_macro.
 relax-tokens = ["dep:relax-lex"]
 
 [dependencies]

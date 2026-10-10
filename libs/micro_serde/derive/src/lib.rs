@@ -1,7 +1,7 @@
 extern crate proc_macro;
 use proc_macro::TokenStream;
 
-// The expansion logic lives in the library crate makepad-micro-serde-derive-impl (Rapid links
+// The expansion logic lives in the library crate makepad-micro-serde-derive-impl (relax links
 // it directly); these are the rustc proc-macro entry points.
 use makepad_micro_serde_derive_impl::*;
 
