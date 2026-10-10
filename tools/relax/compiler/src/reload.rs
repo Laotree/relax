@@ -3770,6 +3770,10 @@ unsafe fn watch(up: *mut Unit) {
     let mut tick: u32 = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
+        // Keep the original stamps and queued OS notifications intact until startup
+        // finishes. In particular, do not acquire Reloading or drain streamed edits:
+        // either can compete with the cold compiler before the first frame.
+        if !jit::live_startup_done() { continue; }
         let loads = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
         // a new watch set drops the events the old one had not delivered yet (a save made
         // while the post-boot loader loads was never seen): stat every file once instead

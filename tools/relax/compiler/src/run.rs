@@ -1078,6 +1078,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::reload::start_watcher(up);
     }
     jit::start_completion(up, runtime);
+    jit::live_needs_present(u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_platform"));
     jit::startup_main(runtime);
     crate::fncost::mark("boot done, calling main");
     let main_ms = crate::clock::ms_since_start();

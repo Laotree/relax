@@ -10365,6 +10365,18 @@ static STARTUP_CACHED: std::sync::Mutex<Vec<(usize, Vec<u32>, u8)>> =
     std::sync::Mutex::new(Vec::new());
 pub static FIRST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FIRST_PRESENT: AtomicBool = AtomicBool::new(false);
+// Live edits have their own admission gate: disabling speculative startup scheduling
+// must not allow the watcher to mutate a program while it is booting.
+static LIVE_STARTUP_DONE: AtomicBool = AtomicBool::new(false);
+static LIVE_NEEDS_PRESENT: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn live_needs_present(needs_present: bool) {
+    LIVE_NEEDS_PRESENT.store(needs_present, Ordering::Release);
+}
+
+pub(crate) fn live_startup_done() -> bool {
+    FIRST_PRESENT.load(Ordering::Acquire) || LIVE_STARTUP_DONE.load(Ordering::Acquire)
+}
 /// A program that has not presented and made no demand compile for this long is headless:
 /// its startup phase ends (startup_main).
 const STARTUP_QUIET_NS: u64 = 2_000_000_000;
@@ -10431,9 +10443,6 @@ extern "C" fn relax_first_present() {
 /// for STARTUP_QUIET_NS. No unit pointer is retained: an exiting program can retire its unit
 /// while this thread sleeps.
 pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
-    if !startup_phase() {
-        return;
-    }
     let main_at = wall_ns();
     let runtime = runtime.clone();
     let release = move || {
@@ -10445,11 +10454,13 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             } else {
                 0
             };
-            if quiet >= STARTUP_QUIET_NS {
+            if quiet >= STARTUP_QUIET_NS && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire) {
                 break;
             }
-            std::thread::park_timeout(std::time::Duration::from_nanos(STARTUP_QUIET_NS - quiet));
+            std::thread::park_timeout(std::time::Duration::from_nanos(STARTUP_QUIET_NS.saturating_sub(quiet).max(50_000_000)));
         }
+        LIVE_STARTUP_DONE.store(true, Ordering::Release);
+        if !startup_phase() { return; }
         crate::fncost::mark(if FIRST_PRESENT.load(Ordering::Acquire) {
             "startup released: present"
         } else {
