@@ -583,12 +583,21 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     let build_dir = dir_of_path(&out_dir);
     let output_path = format!("{}/output", build_dir);
     let key_path = format!("{}/relax-rerun", build_dir);
-    if let (Ok(old), Ok(key)) = (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
-        if rerun_key(&old, dir, &env_key).as_deref() == Some(key.as_str()) {
-            if sess.runtime.profile { eprintln!("relax-build-script: {} cached", pname); }
-            return (Ok(old), out_dir);
+    let env_path = format!("{}/relax-rerun-env", build_dir);
+    let why = match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
+        (Ok(old), Ok(key)) => {
+            let now = rerun_key(&old, dir, &env_key).unwrap_or_default();
+            if now == key {
+                if sess.runtime.profile { eprintln!("relax-build-script: {} cached", pname); }
+                return (Ok(old), out_dir);
+            }
+            rerun_reason(&key, &now, &std::fs::read_to_string(&env_path).unwrap_or_default(), &env_key)
         }
-    }
+        _ => "no previous output".to_string(),
+    };
+    // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with RELAX_PROFILE
+    if sess.runtime.profile { eprintln!("relax-build-script: {} runs: {}", pname, why); }
+    note_rerun(&build_dir, &why);
     let _slot = script_slot();
     let started = std::time::Instant::now();
     let output = cmd.output();
@@ -601,6 +610,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
             if let Some(key) = rerun_key(&stdout, dir, &env_key) {
                 let _ = std::fs::write(&output_path, &stdout);
                 let _ = std::fs::write(&key_path, key);
+                let _ = std::fs::write(&env_path, &env_key);
             } else {
                 let _ = std::fs::remove_file(&key_path);
             }
@@ -621,6 +631,44 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
+}
+
+/// Why a stored rerun key no longer matches: the first differing line, and for the environment
+/// line the variables that differ from the environment the script last ran with.
+fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> String {
+    let (sl, nl): (Vec<&str>, Vec<&str>) = (stored.lines().collect(), now.lines().collect());
+    if sl.first() != nl.first() {
+        let old: Vec<&str> = stored_env.lines().skip(1).collect();
+        let new: Vec<&str> = env_key.lines().skip(1).collect();
+        let mut d: Vec<String> = Vec::new();
+        if stored_env.lines().next() != env_key.lines().next() {
+            d.push("the script's units changed".to_string());
+        }
+        for l in &new {
+            if !old.contains(l) { d.push(format!("+{}", l)); }
+        }
+        for l in &old {
+            if !new.contains(l) { d.push(format!("-{}", l)); }
+        }
+        if stored_env.is_empty() { d.push("(no stored environment)".to_string()); }
+        return format!("environment changed: {}", d.join(" "));
+    }
+    for (i, l) in nl.iter().enumerate() {
+        if sl.get(i) != Some(l) {
+            return format!("input changed: {} (was {})", l, sl.get(i).unwrap_or(&"-"));
+        }
+    }
+    format!("input removed: {}", sl.get(nl.len()).unwrap_or(&"-"))
+}
+
+/// Appends `why` to <build dir>/relax-rerun-why, keeping the last 20 lines.
+fn note_rerun(build_dir: &str, why: &str) {
+    let path = format!("{}/relax-rerun-why", build_dir);
+    let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    lines.push(format!("{} pid {} {}", t, std::process::id(), why));
+    let skip = lines.len().saturating_sub(20);
+    let _ = std::fs::write(&path, lines[skip..].join("\n") + "\n");
 }
 
 fn dir_of_path(p: &str) -> String {
