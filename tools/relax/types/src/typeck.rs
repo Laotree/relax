@@ -1239,7 +1239,11 @@ impl<'a> Fcx<'a> {
         };
         let src = self.shallow(src);
         let dy = self.shallow(dy);
-        if !matches!(self.tcx.tys.kind(dy), TyKind::Dyn(..)) || matches!(self.tcx.tys.kind(src), TyKind::Dyn(..)) { return None; }
+        // An unresolved pointee may itself become `dyn Tr` (for example the `_`
+        // in `object_ref as *const _`). Let the deferred coercion decide after
+        // the cast resolves it; selecting Unsize now can unify it with `dy` and
+        // incorrectly record a thin-to-fat conversion for an already-fat value.
+        if !matches!(self.tcx.tys.kind(dy), TyKind::Dyn(..)) || matches!(self.tcx.tys.kind(src), TyKind::Dyn(..) | TyKind::Infer(_)) { return None; }
         // coercion.rs:683-698: Unsize selection retains the object's binders,
         // associated-type equalities and outlives obligations together.
         let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
