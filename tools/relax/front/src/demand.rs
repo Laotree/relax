@@ -455,7 +455,7 @@ impl Names {
                                 forwarded[id].clear();
                                 routes[id] = Some(binding.clone());
                             }
-                            for &module in &binding.targets {
+                            for module in &binding.targets {
                                 watched.insert((module, None));
                                 // A child can glob its parent's private imports
                                 // (`use super::*`); outsiders see public names.
@@ -477,9 +477,9 @@ impl Names {
                                 for (name, source) in sources {
                                     let value = &self.bindings.values[source];
                                     if !value.public && !private { continue; }
-                                    if strong.contains(&(*scope, name)) && value.targets.iter().all(|target| modules.contains(target)) { continue; }
+                                    if strong.contains(&(*scope, name)) && value.targets.iter().all(|target| modules.contains(&target)) { continue; }
                                     if type_names.contains(&(*scope, name)) && value.targets.iter().all(|target|
-                                        types.contains(target) && !values.contains(target) && !macros.contains(target)) { continue; }
+                                        types.contains(&target) && !values.contains(&target) && !macros.contains(&target)) { continue; }
                                     // A new wave revisits existing globs with fresh revision
                                     // counters. Most destinations already contain this exact
                                     // contribution: avoid cloning its target/provenance sets
@@ -508,7 +508,7 @@ impl Names {
                         visits += 1;
                         full_visits += 1;
                         let value = &self.bindings.values[source];
-                        if (*external && !value.public) || !value.targets.iter().any(|target| macros.contains(target)) { continue; }
+                        if (*external && !value.public) || !value.targets.iter().any(|target| macros.contains(&target)) { continue; }
                         let mut value = value.clone();
                         value.public = false;
                         additions.push((name, value));
@@ -701,7 +701,7 @@ impl Names {
             let mut scope = module;
             loop {
                 let value = self.binding(&format!("{scope}::{}", path[0]));
-                if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(*target))) {
+                if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
                     result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string())); result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
                 }
                 let Some((parent, _)) = scope.rsplit_once("::") else { break; };
@@ -711,7 +711,7 @@ impl Names {
             if result.is_empty() && self.crates[ci].cfg.session.options.rs_lazy {
                 for krate in ["std", "core", "alloc"] {
                     let value = self.binding(&format!("{krate}::{}", path[0]));
-                    if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(*target))) {
+                    if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
                         result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string()));
                         result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
                         break;
@@ -738,7 +738,7 @@ impl Names {
         if let Some(prelude) = self.bindings.id("core::prelude") {
             for (_, &id) in self.bindings.modules.get(&prelude).into_iter().flatten() {
                 let binding = &self.bindings.values[id];
-                out.extend(binding.targets.iter().chain(&binding.via).map(|&id| self.bindings.spelling(id).to_string()));
+                out.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
             }
         }
         // Operators, comparisons, formatting, iteration, conversions, hashing
@@ -954,7 +954,7 @@ impl Names {
                                 if !binding.public && !private { continue; }
                                 shared.glob_bindings += 1;
                                 let targets = local.entry(self.bindings.spelling(name).to_string()).or_default();
-                                targets.extend(binding.targets.iter().chain(&binding.via).map(|&id| self.bindings.spelling(id).to_string()));
+                                targets.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
                             }
                         }
                     }
@@ -1058,8 +1058,8 @@ impl Names {
                         // inside its lexical block. Other namespaces survive.
                         resolved.retain(|name| {
                             let targets = self.binding(name).targets;
-                            targets.is_empty() || !targets.iter().all(|target| self.modules.contains(self.bindings.spelling(*target))
-                                || self.type_symbols.contains(self.bindings.spelling(*target)) && !self.value_symbols.contains(self.bindings.spelling(*target)) && !self.macros.contains(self.bindings.spelling(*target)))
+                            targets.is_empty() || !targets.iter().all(|target| self.modules.contains(self.bindings.spelling(target))
+                                || self.type_symbols.contains(self.bindings.spelling(target)) && !self.value_symbols.contains(self.bindings.spelling(target)) && !self.macros.contains(self.bindings.spelling(target)))
                         });
                     }
                     if let Some(targets) = local.get(&path[0]) {
@@ -1076,7 +1076,7 @@ impl Names {
                     if path.len() == 1 && !invocation {
                         resolved.retain(|name| {
                             let binding = self.binding(name);
-                            binding.targets.is_empty() || !binding.targets.iter().all(|target| self.modules.contains(self.bindings.spelling(*target)))
+                            binding.targets.is_empty() || !binding.targets.iter().all(|target| self.modules.contains(self.bindings.spelling(target)))
                         });
                     }
                     if !resolved.is_empty() {
@@ -1204,7 +1204,7 @@ impl BindingImage {
         let mut referenced = entries.iter().copied().collect::<HashSet<_>>();
         for &id in &entries {
             let value = &names.bindings.values[id];
-            referenced.extend(value.targets.iter().chain(value.via.iter()).copied());
+            referenced.extend(value.targets.iter().chain(value.via.iter()));
         }
         let mut strings = referenced.into_iter().collect::<Vec<_>>();
         strings.sort_by_key(|&id| names.bindings.spelling(id));
@@ -1212,7 +1212,7 @@ impl BindingImage {
         let mut sets = Vec::new();
         let mut set_ids = HashMap::<Vec<usize>, usize>::default();
         let mut intern = |set: &bindings::Names| {
-            let mut local = set.iter().map(|id| ids[id]).collect::<Vec<_>>();
+            let mut local = set.iter().map(|id| ids[&id]).collect::<Vec<_>>();
             local.sort_unstable();
             if let Some(&id) = set_ids.get(&local) { return id; }
             let id = sets.len();
@@ -1531,7 +1531,7 @@ impl Names {
             for &id in entries.values() {
                 let value = &self.bindings.values[id];
                 let same_set = |new: &bindings::Names, old: &bindings::Names| {
-                    new.iter().len() == old.iter().len() && new.iter().all(|&id|
+                    new.iter().len() == old.iter().len() && new.iter().all(|id|
                         map[id].is_some_and(|id| old.contains(id)))
                 };
                 let unchanged = map[id].is_some_and(|id| {

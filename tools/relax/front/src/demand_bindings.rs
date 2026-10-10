@@ -3,16 +3,22 @@
 use crate::fxhash::HashMap;
 use std::sync::{Arc, OnceLock};
 
+/// A sorted set of binding ids. Ids are 32-bit (a graph has far fewer than 2^32 names): a
+/// set is half the bytes it was with `usize`, and a grown set holds exactly its elements
+/// (the planner keeps millions of them until the graph is recorded).
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum Names {
     #[default]
     Empty,
-    One([usize; 1]),
-    Many(Vec<usize>),
+    One(u32),
+    Many(Vec<u32>),
+}
+fn id32(value: usize) -> u32 {
+    u32::try_from(value).expect("binding ids fit 32 bits")
 }
 impl Names {
-    fn slice(&self) -> &[usize] {
-        match self { Self::Empty => &[], Self::One(value) => value, Self::Many(values) => values }
+    fn slice(&self) -> &[u32] {
+        match self { Self::Empty => &[], Self::One(value) => std::slice::from_ref(value), Self::Many(values) => values }
     }
     /// `values` sorted ascending without duplicates.
     pub fn from_sorted(mut values: Vec<usize>) -> Self {
@@ -21,16 +27,19 @@ impl Names {
     pub fn is_empty(&self) -> bool {
         self.slice().is_empty()
     }
-    pub fn iter(&self) -> std::slice::Iter<'_, usize> {
-        self.slice().iter()
+    pub fn len(&self) -> usize {
+        self.slice().len()
+    }
+    pub fn iter(&self) -> std::iter::Map<std::slice::Iter<'_, u32>, fn(&u32) -> usize> {
+        self.slice().iter().map(|&id| id as usize)
     }
     pub fn contains(&self, value: usize) -> bool {
-        self.slice().binary_search(&value).is_ok()
+        u32::try_from(value).is_ok_and(|value| self.slice().binary_search(&value).is_ok())
     }
     pub fn contains_all(&self, values: &Self) -> bool {
         let mut remaining = self.slice();
         if values.slice().len() > remaining.len() { return false; }
-        for &value in values {
+        for &value in values.slice() {
             let at = remaining.partition_point(|&v| v < value);
             remaining = &remaining[at..];
             if remaining.first() != Some(&value) { return false; }
@@ -39,12 +48,16 @@ impl Names {
         true
     }
     pub fn insert(&mut self, value: usize) {
+        let value = id32(value);
         match self {
-            Self::Empty => *self = Self::One([value]),
-            Self::One([first]) if *first != value => {
+            Self::Empty => *self = Self::One(value),
+            Self::One(first) if *first != value => {
                 *self = Self::Many(vec![(*first).min(value), (*first).max(value)]);
             }
-            Self::Many(values) => if let Err(at) = values.binary_search(&value) { values.insert(at, value); },
+            Self::Many(values) => if let Err(at) = values.binary_search(&value) {
+                values.reserve_exact(1);
+                values.insert(at, value);
+            },
             _ => {},
         }
     }
@@ -56,8 +69,8 @@ impl Names {
             self.clone_from(values);
             return;
         }
-        if let Self::One([value]) = values {
-            self.insert(*value);
+        if let Self::One(value) = values {
+            self.insert(*value as usize);
             return;
         }
         // Repeated import waves commonly offer an already included subset.
@@ -76,24 +89,25 @@ impl Names {
         }
         merged.extend_from_slice(&left[a..]);
         merged.extend_from_slice(&right[b..]);
+        merged.shrink_to_fit();
         *self = Self::Many(merged);
     }
 }
 impl IntoIterator for Names {
     type Item = usize;
-    type IntoIter = std::iter::Chain<std::option::IntoIter<usize>, std::vec::IntoIter<usize>>;
+    type IntoIter = std::iter::Map<std::iter::Chain<std::option::IntoIter<u32>, std::vec::IntoIter<u32>>, fn(u32) -> usize>;
     fn into_iter(self) -> Self::IntoIter {
         let (one, many) = match self {
             Self::Empty => (None, Vec::new()),
-            Self::One([value]) => (Some(value), Vec::new()),
+            Self::One(value) => (Some(value), Vec::new()),
             Self::Many(values) => (None, values),
         };
-        one.into_iter().chain(many)
+        one.into_iter().chain(many).map(|id| id as usize)
     }
 }
 impl<'a> IntoIterator for &'a Names {
-    type Item = &'a usize;
-    type IntoIter = std::slice::Iter<'a, usize>;
+    type Item = usize;
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, u32>, fn(&u32) -> usize>;
     fn into_iter(self) -> Self::IntoIter { self.iter() }
 }
 
@@ -115,13 +129,13 @@ impl Binding {
 
 enum Spelling {
     Segment(Arc<str>),
-    Qualified { module: usize, name: usize, text: OnceLock<Box<str>> },
+    Qualified { module: u32, name: u32, text: OnceLock<Box<str>> },
 }
 
 #[derive(Default)]
 pub struct Bindings {
     ids: HashMap<Arc<str>, usize>,
-    qualified: HashMap<(usize, usize), usize>,
+    qualified: HashMap<(u32, u32), u32>,
     text: Vec<Spelling>,
     pub values: Vec<Binding>,
     pub modules: HashMap<usize, HashMap<usize, usize>>,
@@ -130,7 +144,7 @@ impl Bindings {
     pub fn id(&self, name: &str) -> Option<usize> {
         let mut parts = name.split("::");
         let mut id = *self.ids.get(parts.next()?)?;
-        for part in parts { id = *self.qualified.get(&(id, *self.ids.get(part)?))?; }
+        for part in parts { id = *self.qualified.get(&(id32(id), id32(*self.ids.get(part)?)))? as usize; }
         Some(id)
     }
     pub fn intern(&mut self, name: &str) -> usize {
@@ -163,10 +177,11 @@ impl Bindings {
         id
     }
     fn qualify(&mut self, module: usize, name: usize) -> usize {
-        if let Some(&id) = self.qualified.get(&(module, name)) { return id; }
+        let key = (id32(module), id32(name));
+        if let Some(&id) = self.qualified.get(&key) { return id as usize; }
         let id = self.text.len();
-        self.qualified.insert((module, name), id);
-        self.text.push(Spelling::Qualified { module, name, text: OnceLock::new() });
+        self.qualified.insert(key, id32(id));
+        self.text.push(Spelling::Qualified { module: key.0, name: key.1, text: OnceLock::new() });
         self.values.push(Binding::default());
         id
     }
@@ -175,15 +190,15 @@ impl Bindings {
     pub fn ids_in(&self, other: &Bindings) -> Vec<Option<usize>> {
         fn fold(this: &Bindings, other: &Bindings, acc: usize, id: usize) -> Option<usize> {
             match &this.text[id] {
-                Spelling::Segment(text) => other.qualified.get(&(acc, *other.ids.get(text)?)).copied(),
-                Spelling::Qualified { module, name, .. } => fold(this, other, fold(this, other, acc, *module)?, *name),
+                Spelling::Segment(text) => other.qualified.get(&(id32(acc), id32(*other.ids.get(text)?))).map(|&id| id as usize),
+                Spelling::Qualified { module, name, .. } => fold(this, other, fold(this, other, acc, *module as usize)?, *name as usize),
             }
         }
         let mut map: Vec<Option<usize>> = Vec::with_capacity(self.text.len());
         for id in 0..self.text.len() {
             let mapped = match &self.text[id] {
                 Spelling::Segment(text) => other.ids.get(text).copied(),
-                Spelling::Qualified { module, name, .. } => map[*module].and_then(|m| fold(self, other, m, *name)),
+                Spelling::Qualified { module, name, .. } => map[*module as usize].and_then(|m| fold(self, other, m, *name as usize)),
             };
             map.push(mapped);
         }
@@ -193,7 +208,7 @@ impl Bindings {
         match &self.text[id] {
             Spelling::Segment(text) => text,
             Spelling::Qualified { module, name, text } => text.get_or_init(||
-                format!("{}::{}", self.spelling(*module), self.spelling(*name)).into_boxed_str()),
+                format!("{}::{}", self.spelling(*module as usize), self.spelling(*name as usize)).into_boxed_str()),
         }
     }
     pub fn entry(&mut self, module: usize, name: usize) -> usize {
@@ -213,10 +228,10 @@ impl Bindings {
     }
     pub fn watched(&self, path: &[usize], mut watch: impl FnMut(usize, usize)) -> Binding {
         let Some((&root, parts)) = path.split_first() else { return Binding::default(); };
-        let mut value = Binding { targets: Names::One([root]), public: true, ..Binding::default() };
+        let mut value = Binding { targets: Names::One(id32(root)), public: true, ..Binding::default() };
         for &part in parts {
             let mut next = Binding::default();
-            for &module in &value.targets {
+            for module in &value.targets {
                 watch(module, part);
                 if let Some(&id) = self.modules.get(&module).and_then(|names| names.get(&part)) {
                     next.extend(&self.values[id]);
