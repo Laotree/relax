@@ -14,12 +14,12 @@ impl Fcx<'_> {
     pub(super) fn defer_fn_item_sized_obligations(&mut self, ty: TyId, lo: u32) {
         let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() else { return };
         let Some(sig) = self.tcx.fn_item_sig(self.prog, def).cloned() else { return };
-        let args = self.tcx.complete_args(self.prog, def, &args, regions);
+        let args = self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions);
         let unsized_fn_params = self.prog.crates[self.prog.def(self.b.def).krate as usize].unsized_fn_params(self.prog);
         for i in 0..sig.params.len() + 1 {
             if i < sig.params.len() && unsized_fn_params { continue; }
             let ty = if i < sig.params.len() { sig.params[i] } else { sig.ret };
-            let poly = self.tcx.tys.intern(TyKind::FnPtr(Vec::new(), ty, sig.header, sig.bound_regions));
+            let poly = self.tcx.tys.intern(TyKind::FnPtr(crate::types::List::EMPTY, ty, sig.header, sig.bound_regions));
             let poly = self.tcx.instantiate_ty(self.prog, def, &args, poly);
             let opened = self.infcx.instantiate_binder_with_infer(poly);
             let TyKind::FnPtr(_, ty, _, _) = self.tcx.tys.kind(opened) else { unreachable!() };
@@ -59,11 +59,11 @@ impl Fcx<'_> {
             ocx.register_obligations(goals);
             for &ty in inputs { ocx.register_obligation(Goal { param_env: self.param_env, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }); }
             if !ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::next_solver::NoSolution); }
-            Ok(self.tcx.tys.intern(TyKind::Tuple(inputs.to_vec())))
+            Ok(self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(inputs))))
         }).ok()?;
         let TyKind::Tuple(inputs) = self.tcx.tys.kind(tuple) else { unreachable!() };
-        let mut result = Vec::with_capacity(inputs.len());
-        for (&expected, &formal) in inputs.iter().zip(formal_inputs) {
+        let mut result = Vec::with_capacity(self.tcx.tys.list(*inputs).len());
+        for (&expected, &formal) in self.tcx.tys.list(*inputs).iter().zip(formal_inputs) {
             result.push(Some(if same_type_modulo_vars(self.tcx, self.prog, expected, formal) { formal } else { expected }));
         }
         Some(result)

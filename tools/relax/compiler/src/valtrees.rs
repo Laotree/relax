@@ -52,8 +52,8 @@ fn const_to_valtree_inner(u: &Unit, place: Place, nodes: &mut usize, visited: &m
         }
         TyKind::Tuple(fields) => {
             let layout = u.layout_of(ty);
-            let mut branches = Vec::with_capacity(fields.len());
-            for (i, &field) in fields.iter().enumerate() {
+            let mut branches = Vec::with_capacity(tys.list(fields).len());
+            for (i, &field) in tys.list(fields).iter().enumerate() {
                 let tree = const_to_valtree_inner(u, (addr + layout.fields[i] as u64, field, None), nodes, visited, settled)?;
                 branches.push(Const::new_value(tys, tree, field));
             }
@@ -80,7 +80,7 @@ fn const_to_valtree_inner(u: &Unit, place: Place, nodes: &mut usize, visited: &m
                 branches.push(Const::new_value(tys, tree, tys.u32_));
             }
             for i in 0..adt.variants[variant].fields.len() {
-                let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), def, variant as u32, i as u32, &args);
+                let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), def, variant as u32, i as u32, tys.list(args));
                 let off = if adt.is_enum { layout.variant_fields[variant][i] } else { layout.fields[i] };
                 let tree = const_to_valtree_inner(u, (addr + off as u64, field, None), nodes, visited, settled)?;
                 branches.push(Const::new_value(tys, tree, field));

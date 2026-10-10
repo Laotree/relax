@@ -91,7 +91,7 @@ impl DefiningTy {
                     bound_regions += 1;
                     let va_list = tcx.lang_items.get(crate::lang_items::LangItem::VaList)
                         .expect("C-variadic signature requires the va_list language item");
-                    inputs.push(tcx.tys.intern(TyKind::Adt(va_list, vec![], tcx.tys.intern_region_args(&[region]))));
+                    inputs.push(tcx.tys.intern(TyKind::Adt(va_list, tcx.tys.mk_list(&[]), tcx.tys.intern_region_args(&[region]))));
                 }
                 (inputs, sig.ret, bound_regions)
             }
@@ -99,7 +99,7 @@ impl DefiningTy {
             Self::Closure { signature, bound, .. } => {
                 let TyKind::FnPtr(ins,out,_,_) = tcx.tys.kind(signature) else { unreachable!() };
                 let TyKind::FnPtr(_,_,_,n) = tcx.tys.kind(bound) else { unreachable!() };
-                (ins.clone(),*out,*n)
+                (tcx.tys.list(*ins).to_vec(),*out,*n)
             }
         }
     }

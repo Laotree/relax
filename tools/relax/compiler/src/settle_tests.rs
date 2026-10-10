@@ -461,8 +461,8 @@ fn unrelated(x: u32) -> u32 { x + 1 }
 fn round23_fnptr_keys_preserve_receiver_abi() {
     use relax_types::instance::ShimKind;
     let tcx = Tcx::new();
-    let pointer = tcx.tys.intern(TyKind::FnPtr(vec![tcx.tys.u32_], tcx.tys.u32_, crate::types::FnHeader::RUST, 0));
-    let tuple = tcx.tys.intern(TyKind::Tuple(vec![tcx.tys.u32_]));
+    let pointer = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[tcx.tys.u32_]), tcx.tys.u32_, crate::types::FnHeader::RUST, 0));
+    let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[tcx.tys.u32_])));
     let key = |method| FnKey::Shim(ShimInstance { kind: ShimKind::FnPtr(DefId(method), pointer), args: vec![pointer, tuple] });
     let mut map = std::collections::HashMap::new();
     for method in 0..3 { assert!(map.insert(key(method), method).is_none()); }

@@ -79,10 +79,10 @@ impl Fcx<'_> {
         // Most item signatures need no writeback. Keep the existing normalization
         // scope when they do, including its projection-depth limit.
         if ps.iter().chain(std::iter::once(&ret)).any(|t| self.tcx.tys.has_infer(*t) || self.tcx.tys.may_project(*t)) {
-            let opened = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, sig.header, 0));
+            let opened = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), ret, sig.header, 0));
             let opened = self.normalize_signature(opened);
-            let TyKind::FnPtr(ps, ret, _, _) = self.tcx.tys.kind(opened).clone() else { unreachable!() };
-            (ps, ret)
+            let TyKind::FnPtr(ps, ret, _, _) = *self.tcx.tys.kind(opened) else { unreachable!() };
+            (self.tcx.tys.list(ps).to_vec(), ret)
         } else {
             (ps, ret)
         }
@@ -112,7 +112,7 @@ impl Fcx<'_> {
             }
             _ => r,
         };
-        let ps = ps.iter().map(|t| self.tcx.tys.map_regions(*t, &rename, 0)).collect();
+        let ps = self.tcx.tys.mk_list(&self.tcx.tys.list(*ps).iter().map(|t| self.tcx.tys.map_regions(*t, &rename, 0)).collect::<Vec<_>>());
         let ret = self.tcx.tys.map_regions(*ret, &rename, 0);
         let count = vars.borrow().len() as u32;
         self.tcx.tys.intern(TyKind::FnPtr(ps, ret, *c, count))
@@ -123,19 +123,19 @@ impl Fcx<'_> {
     /// parameters stay bound. Register the projections before checking arguments
     /// so deduction also works through blocks, borrows, and pending Self vars.
     pub(super) fn instantiate_call_signature(&mut self, d: DefId, args: &[crate::consts::GenericArg], sig: &FnSigT) -> (Vec<TyId>, TyId) {
-        let poly = self.tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, sig.bound_regions));
+        let poly = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
         let poly = self.tcx.instantiate_ty(self.prog, d, args, poly);
         let opened = self.infcx.instantiate_binder_with_infer(poly);
-        let TyKind::FnPtr(ps, ret, _, _) = self.tcx.tys.kind(opened).clone() else { unreachable!() };
-        (ps, ret)
+        let TyKind::FnPtr(ps, ret, _, _) = *self.tcx.tys.kind(opened) else { unreachable!() };
+        (self.tcx.tys.list(ps).to_vec(), ret)
     }
 
     /// Remove exactly one binder. Nested binders protect their own variables;
     /// escaping variables shift down, as in rustc's BoundVarReplacer.
     pub(super) fn instantiate_signature(&self, sig: TyId, regions: &[RegionId]) -> TyId {
         let TyKind::FnPtr(ps, ret, c, _) = self.tcx.tys.kind(sig) else { unreachable!() };
-        let (ps, ret) = self.instantiate_signature_parts(ps, *ret, regions);
-        self.tcx.tys.intern(TyKind::FnPtr(ps, ret, *c, 0))
+        let (ps, ret) = self.instantiate_signature_parts(self.tcx.tys.list(*ps), *ret, regions);
+        self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), ret, *c, 0))
     }
 
     /// Item calls/bodies only need the payload; closure typeck results also
@@ -175,7 +175,7 @@ impl Fcx<'_> {
         self.env.regions.enter_body();
         let ret = match ret { Some(t) => self.lower_ty(t), None => self.fresh(0) };
         self.env.regions = outer;
-        let sig = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, bound));
+        let sig = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), ret, FnHeader::RUST, bound));
         self.normalize_signature(sig)
     }
 
@@ -233,7 +233,7 @@ impl Fcx<'_> {
                 PredicateKind::Clause(ClauseKind::Projection(p)) => {
                     let AliasTerm::Ty(alias) = p.projection_term else { continue };
                     match self.tcx.tys.kind(alias) {
-                        TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { .. }, args, .. }) => match args.first() { Some(t) => *t, None => continue },
+                        TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { .. }, args, .. }) => match self.tcx.tys.list(*args).first() { Some(t) => *t, None => continue },
                         _ => continue,
                     }
                 }
@@ -279,7 +279,7 @@ impl Fcx<'_> {
                     let AliasTerm::Ty(alias) = p.projection_term else { continue };
                     let TyKind::Alias(_, alias) = self.tcx.tys.kind(alias).clone() else { continue };
                     let trait_def = self.prog.def(alias.kind.def_id()).parent;
-                    let Some(&self_ty) = alias.args.first() else { continue };
+                    let Some(&self_ty) = self.tcx.tys.list(alias.args).first() else { continue };
                     if !self.same_self_ty(self_ty, expected_ty) { continue; }
                     let projection = self.tcx.lang_items.by_def.get(&alias.kind.def_id()).copied();
                     let deduces = match projection {
@@ -292,7 +292,7 @@ impl Fcx<'_> {
                             (Some(crate::lang_items::LangItem::AsyncFnOnceOutput), _) => Term::Ty(self.fresh(0)),
                             (_, term) => term,
                         };
-                        if let (Some(&inputs), Term::Ty(ret)) = (alias.args.get(1), term) {
+                        if let (Some(&inputs), Term::Ty(ret)) = (self.tcx.tys.list(alias.args).get(1), term) {
                             if let TyKind::Tuple(ps) = self.tcx.tys.kind(inputs).clone() {
                                 let sig = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, bound_regions));
                                 let sig = self.normalize_signature(sig);
@@ -342,8 +342,8 @@ impl Fcx<'_> {
         let supplied = self.supplied_closure_signature(e, params, ret);
         let Some(expected) = expected else { return self.closure_sigs(e, supplied) };
         let TyKind::FnPtr(ps, r, _, n) = self.tcx.tys.kind(expected).clone() else { unreachable!() };
-        if ps.len() != params.len() {
-            self.err(self.ast().expr(e).lo, format!("E0593: closure is expected to take {} arguments, but it takes {} arguments", ps.len(), params.len()));
+        if self.tcx.tys.list(ps).len() != params.len() {
+            self.err(self.ast().expr(e).lo, format!("E0593: closure is expected to take {} arguments, but it takes {} arguments", self.tcx.tys.list(ps).len(), params.len()));
             return self.closure_sigs(e, supplied);
         }
         // This signature uses the safe Rust header of a reified closure pointer

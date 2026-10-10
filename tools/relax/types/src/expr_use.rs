@@ -70,7 +70,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
             TyKind::Ref(true, _, _) => Some(false),
             TyKind::Tuple(ts) => {
                 let mut copy = true;
-                for t in ts { copy &= self.copy_type(t)?; }
+                for t in self.tx.tcx.tys.list(ts).iter().copied() { copy &= self.copy_type(t)?; }
                 Some(copy)
             }
             TyKind::Array(t, _) => self.copy_type(t),
@@ -486,7 +486,7 @@ mod tests {
         let base = ExprId(pf.ast.exprs.iter().position(|e| matches!(e.kind, ExprKind::Path(_))).unwrap() as u32);
         let id = ExprId(pf.ast.exprs.iter().position(|e| matches!(e.kind, ExprKind::TupleField(..))).unwrap() as u32);
         let n = pf.ast.exprs.len(); prog.files.push(std::sync::Arc::new(pf));
-        let t = tcx.tys.intern(TyKind::Tuple(vec![tcx.tys.bool_]));
+        let t = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[tcx.tys.bool_])));
         let mut b = Body::empty(crate::program::NO_DEF, vec![], 0, tcx.tys.unit);
         b.expr_ty = vec![tcx.tys.bool_; n]; b.expr_ty[base.0 as usize] = t;
         b.locals.push(crate::typeck::Local { name: 0, ty: t, mutable: false, pat: 0 });

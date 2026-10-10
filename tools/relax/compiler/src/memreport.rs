@@ -81,7 +81,6 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     out.push((format!("modules ({})", p.mods.len()), mods));
     out.push((format!("imports ({})", p.imports.len()), vbytes(&p.imports)));
     out.push((format!("item_defs map ({})", p.item_defs.len()), (p.item_defs.capacity() * 13) as u64));
-    out.push((format!("types interned ({})", u.tcx.tys.len()), (u.tcx.tys.len() * 48) as u64));
     out.push((format!("fn sigs ({})", u.tcx.signature_count()), u.tcx.signature_bytes() as u64));
     let (mut n_rir, mut rir, mut spec, mut pcm, mut names) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut n_fns = 0u64;

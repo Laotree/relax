@@ -67,7 +67,7 @@ fn named(prog: &Program, name: &str) -> DefId {
     for i in 0..prog.defs.len() { let def = DefId(i as u32); if prog.name(def) == name { return def; } }
     panic!("missing definition {name}")
 }
-fn adt(prog: &Program, tcx: &Tcx, name: &str, args: Vec<TyId>) -> TyId { tcx.tys.intern(TyKind::Adt(named(prog, name), args, crate::types::RegionArgsId::EMPTY)) }
+fn adt(prog: &Program, tcx: &Tcx, name: &str, args: Vec<TyId>) -> TyId { tcx.tys.intern(TyKind::Adt(named(prog, name), tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY)) }
 
 #[test]
 fn move_reinit_loop_and_storage_dead_history() {
@@ -246,7 +246,7 @@ fn enum_discriminant_edges_and_otherwise_options() {
 #[test]
 fn mutable_and_raw_borrows_restore_maybe_init_children() {
     let sess = &std::sync::Arc::new(crate::Session::default());
-    let prog = Program::new(sess); let tcx = Tcx::new(); let t = tcx.tys.u8_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let prog = Program::new(sess); let tcx = Tcx::new(); let t = tcx.tys.u8_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     for kind in 0..3 {
         let value = match kind {
             0 => Rvalue::Ref(Region::ERASED, BorrowKind::Mut { kind: MutBorrowKind::Default }, place(1)),
@@ -284,7 +284,7 @@ fn dead_drop_unwind_does_not_generate_from_unreachable_cleanup() {
 #[test]
 fn deref_temporaries_recover_the_original_move_path() {
     let (prog, tcx) = collect("#[lang = \"owned_box\"] struct Heap<T>(*mut T);"); let t = tcx.tys.u8_;
-    let heap = adt(&prog, &tcx, "Heap", vec![t]); let tuple = tcx.tys.intern(TyKind::Tuple(vec![heap]));
+    let heap = adt(&prog, &tcx, "Heap", vec![t]); let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[heap])));
     let mut b = body(&[tcx.tys.unit, tuple, heap, t], 1, vec![block(vec![
         StatementKind::Assign(place(2), Rvalue::CopyForDeref(field(1, 0, heap))),
         assign(3, Operand::Move(project(2, vec![PlaceElem::Deref]))), StatementKind::StorageDead(Local(2)),

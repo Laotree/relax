@@ -79,7 +79,7 @@ fn round10_clauses_keep_higher_ranked_gat_bindings_and_nested_bounds() {
         let PredicateKind::Clause(ClauseKind::Projection(proj)) = &proj.kind else { unreachable!() };
         let AliasTerm::Ty(alias) = proj.projection_term else { panic!() };
         let TyKind::Alias(_, alias) = t.tys.kind(alias) else { panic!() };
-        assert_eq!(alias.args.len(), 2);
+        assert_eq!(t.tys.list(alias.args).len(), 2);
         let rs = t.tys.region_args(alias.regions);
         assert_eq!(rs.len(), 2);
         assert_eq!(rs[0], rs[1]);
@@ -120,7 +120,7 @@ fn round10_rpitit_lifetime_capture_generics_and_clauses() {
             let TyKind::Alias(_, alias) = t.tys.kind(sig.ret) else { panic!() };
             assert_eq!(alias.kind, crate::types::AliasTyKind::Projection { def_id: assoc });
             let generics = t.generic_indices_of(&p, assoc);
-            let full = t.complete_args(&p, assoc, &alias.args, alias.regions);
+            let full = t.complete_args(&p, assoc, t.tys.list(alias.args), alias.regions);
             assert_eq!(full.len(), generics.lifetimes.len() + generics.types_consts.len());
             let data = t.opaque_generics(&p, opaque_def_id);
             if p.name(fn_def_id) == "get" {

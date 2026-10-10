@@ -111,7 +111,7 @@ fn predicate_references_self(tcx: &Tcx, prog: &Program, td: DefId, p: &Predicate
     let args = match &p.kind {
         PredicateKind::Clause(ClauseKind::Trait(t)) => t.trait_ref.args[1..].to_vec(),
         PredicateKind::Clause(ClauseKind::Projection(p)) => match &p.projection_term {
-            AliasTerm::Ty(t) => { let TyKind::Alias(_, a) = tcx.tys.kind(*t) else { unreachable!() }; tcx.complete_args(prog, a.kind.def_id(), &a.args, a.regions)[1..].to_vec() }
+            AliasTerm::Ty(t) => { let TyKind::Alias(_, a) = tcx.tys.kind(*t) else { unreachable!() }; tcx.complete_args(prog, a.kind.def_id(), tcx.tys.list(a.args), a.regions)[1..].to_vec() }
             AliasTerm::Const(a) => a.args[1..].to_vec(),
         },
         PredicateKind::Clause(ClauseKind::ConstArgHasType(_, t)) => vec![GenericArg::Type(*t)],
@@ -129,7 +129,7 @@ fn contains_illegal_self_type_reference(tcx: &Tcx, prog: &Program, td: DefId, ty
                 if self.prog.impl_trait_in_trait_data.contains_key(&def_id) { return t; }
                 if self.allow {
                     let parent = self.prog.def(def_id).parent;
-                    let mut args = self.tcx.complete_args(self.prog, def_id, &a.args, a.regions);
+                    let mut args = self.tcx.complete_args(self.prog, def_id, tys.list(a.args), a.regions);
                     let n = self.tcx.generic_indices_of(self.prog, parent); args.truncate(n.types_consts.len() + n.lifetimes.len());
                     erase_args(tys, &mut args);
                     if self.supers.contains(&TraitRef { def_id: parent, args }) { return t; }

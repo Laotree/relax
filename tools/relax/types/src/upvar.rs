@@ -14,7 +14,7 @@ pub enum ClosureKind { Fn, FnMut, FnOnce }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureKind { ByRef(BorrowKind), ByValue }
 pub(crate) fn is_capture_owner(tcx: &Tcx, body: &Body, file: u32, owner: TyId) -> bool {
-    file == body.file && matches!(tcx.tys.kind(owner), TyKind::FnDef(def, args, _) if *def == body.def && *args == body.args)
+    file == body.file && matches!(tcx.tys.kind(owner), TyKind::FnDef(def, args, _) if *def == body.def && tcx.tys.list(*args) == &body.args[..])
 }
 
 /// ClosureArgs::kind_ty (rustc_type_ir/src/ty_kind/closure.rs:173-190): the owner's upvar
@@ -442,7 +442,7 @@ mod tests {
     fn coroutine_by_move_merges_child_fields_and_preserves_arguments() {
         let tcx = Tcx::new();
         let t = tcx.tys.bool_;
-        let pair = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+        let pair = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
         let parent = result(vec![capture(pair, vec![], CaptureKind::ByValue, 1)]);
         let mut arg = capture(t, vec![], CaptureKind::ByValue, 2);
         arg.place.root = 1;
@@ -538,7 +538,7 @@ mod tests {
     #[test]
     fn disjoint_fields_and_same_place_kind_origin() {
         let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
-        let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+        let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
         let a = capture(tuple, vec![(Projection::Field(0, 0), t)], CaptureKind::ByRef(BorrowKind::Imm), 1);
         let b = capture(tuple, vec![(Projection::Field(0, 1), t)], CaptureKind::ByValue, 2);
         let c = capture(tuple, vec![(Projection::Field(0, 0), t)], CaptureKind::ByRef(BorrowKind::Mut), 3);
@@ -551,7 +551,7 @@ mod tests {
     #[test]
     fn optimization_only_truncates_after_last_deref_when_shared() {
         let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
-        let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t]));
+        let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t])));
         let m = tcx.tys.intern(TyKind::Ref(true, tuple, crate::types::RegionId::ERASED)); let r = tcx.tys.intern(TyKind::Ref(false, m, crate::types::RegionId::ERASED));
         let mut c = capture(r, vec![(Projection::Deref, m), (Projection::Deref, tuple), (Projection::Field(0, 0), t)], CaptureKind::ByRef(BorrowKind::Imm), 1);
         optimize(&tx, &mut c);

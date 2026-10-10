@@ -117,7 +117,8 @@ pub fn schema(s: &mut Session,path: &str) -> Result<String,String> {
     }
     let mut methods = Vec::new(); let mut traits = Vec::new();
     let mut method_args = std::collections::HashMap::<DefId, Vec<TyId>>::new();
-    let target = tcx.adts.get(&d).map(|a|tcx.tys.intern(TyKind::Adt(d,(0..a.n_generics).map(|i|tcx.tys.intern(TyKind::Param(i))).collect(), crate::types::RegionArgsId::EMPTY)));
+    let target = tcx.adts.get(&d).map(|a|tcx.tys.intern(TyKind::Adt(d,tcx.tys.mk_list(&(0..a.n_generics).map(|i|tcx.tys.intern(TyKind::Param(i))).collect::<Vec<_>>()), crate::types::RegionArgsId::EMPTY))
+);
     for imp in &p.impls {
         let idef = p.def(imp.def);
         if matches!(p.files[idef.file as usize].ast.item(idef.item).kind,ItemKind::Impl { negative:true,.. }) { continue; }

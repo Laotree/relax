@@ -46,7 +46,7 @@ pub trait TypeFolder {
 }
 
 pub fn super_fold_ty<F: TypeFolder + ?Sized>(tys: &Types, t: TyId, f: &mut F, depth: DebruijnIndex) -> TyId {
-    let mut list = |v: &[TyId], depth| v.iter().map(|t| f.fold_ty(tys, *t, depth)).collect::<Vec<_>>();
+    let mut list = |v: &TyList, depth| tys.mk_list(&tys.list(*v).iter().map(|t| f.fold_ty(tys, *t, depth)).collect::<Vec<_>>());
     let k = match tys.kind(t) {
         TyKind::Tuple(v) => TyKind::Tuple(list(v, depth)),
         TyKind::Const(ct) => TyKind::Const(f.fold_const(tys, *ct, depth)),
@@ -54,15 +54,15 @@ pub fn super_fold_ty<F: TypeFolder + ?Sized>(tys: &Types, t: TyId, f: &mut F, de
         TyKind::Slice(t) => TyKind::Slice(f.fold_ty(tys, *t, depth)),
         TyKind::Ptr(m, t) => TyKind::Ptr(*m, f.fold_ty(tys, *t, depth)),
         TyKind::Ref(m, t, r) => TyKind::Ref(*m, f.fold_ty(tys, *t, depth), f.fold_region(tys, *r, depth)),
-        TyKind::Adt(d, v, rs) => TyKind::Adt(*d, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
-        TyKind::FnDef(d, v, rs) => TyKind::FnDef(*d, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
+        TyKind::Adt(d, v, rs) => TyKind::Adt(*d, tys.mk_list(&f.fold_args(tys, *d, tys.list(*v), 0, depth)), fold_regions(tys, *rs, f, depth)),
+        TyKind::FnDef(d, v, rs) => TyKind::FnDef(*d, tys.mk_list(&f.fold_args(tys, *d, tys.list(*v), 0, depth)), fold_regions(tys, *rs, f, depth)),
         TyKind::Alias(rigid, alias) => TyKind::Alias(*rigid, AliasTy { kind: alias.kind,
-            args: f.fold_args(tys, alias.kind.def_id(), &alias.args, 0, depth), regions: fold_regions(tys, alias.regions, f, depth) }),
+            args: tys.mk_list(&f.fold_args(tys, alias.kind.def_id(), tys.list(alias.args), 0, depth)), regions: fold_regions(tys, alias.regions, f, depth) }),
         TyKind::FnPtr(ps, r, c, n) => TyKind::FnPtr(list(ps, depth + 1), f.fold_ty(tys, *r, depth + 1), *c, *n),
         TyKind::Dyn(d, v, bs, rs, r, n, autos) => {
-            let v = f.fold_args(tys, *d, v, 1, depth + 1);
-            let bs: Vec<_> = bs.iter().map(|(d, t, n)| (*d, f.fold_ty(tys, *t, depth + 1), *n)).collect();
-            TyKind::Dyn(*d, v.into(), bs.into(), fold_regions(tys, *rs, f, depth + 1), f.fold_region(tys, *r, depth), *n, autos.clone().into())
+            let v = tys.mk_list(&f.fold_args(tys, *d, tys.list(*v), 1, depth + 1));
+            let bs: Vec<_> = tys.list(*bs).iter().map(|(d, t, n)| (*d, f.fold_ty(tys, *t, depth + 1), *n)).collect();
+            TyKind::Dyn(*d, v, tys.mk_list(&bs), fold_regions(tys, *rs, f, depth + 1), f.fold_region(tys, *r, depth), *n, *autos)
         }
         TyKind::Closure(fi, e, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => TyKind::Closure(*fi, *e, crate::types::ClosureArgs { parent_args: f.fold_ty(tys, *o, depth), closure_kind_ty: f.fold_ty(tys, *closure_kind_ty, depth), closure_sig_as_fn_ptr_ty: f.fold_ty(tys, *s, depth), tupled_upvars_ty: f.fold_ty(tys, *u, depth) }),
         TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) |

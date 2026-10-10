@@ -248,19 +248,19 @@ impl QueryCx {
             if todo.len() > 256 { return all(self); }
             let known = match tcx.tys.kind(t) {
                 TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never | TyKind::Error | TyKind::Param(_) => true,
-                TyKind::Tuple(ts) => { todo.extend_from_slice(ts); true }
+                TyKind::Tuple(ts) => { todo.extend_from_slice(tcx.tys.list(*ts)); true }
                 TyKind::Slice(x) | TyKind::Ptr(_, x) | TyKind::Ref(_, x, _) => { todo.push(*x); true }
                 TyKind::Array(x, c) => { todo.push(*x); match tcx.tys.const_kind(*c) { ConstKind::Value(v) => { todo.push(v.ty); true } _ => false } }
                 TyKind::Const(c) => match tcx.tys.const_kind(*c) { ConstKind::Value(v) => { todo.push(v.ty); true } _ => false },
-                TyKind::Adt(d, args, _) | TyKind::FnDef(d, args, _) => { todo.extend_from_slice(args); add(*d, &mut crates) }
+                TyKind::Adt(d, args, _) | TyKind::FnDef(d, args, _) => { todo.extend_from_slice(tcx.tys.list(*args)); add(*d, &mut crates) }
                 TyKind::Foreign(d) => add(*d, &mut crates),
-                TyKind::FnPtr(ps, r, _, _) => { todo.extend_from_slice(ps); todo.push(*r); true }
-                TyKind::Alias(_, a) => { todo.extend_from_slice(&a.args); add(a.kind.def_id(), &mut crates) }
+                TyKind::FnPtr(ps, r, _, _) => { todo.extend_from_slice(tcx.tys.list(*ps)); todo.push(*r); true }
+                TyKind::Alias(_, a) => { todo.extend_from_slice(tcx.tys.list(a.args)); add(a.kind.def_id(), &mut crates) }
                 TyKind::Dyn(p, args, bindings, _, _, _, autos) => {
                     let mut ok = *p == crate::program::NO_DEF || add(*p, &mut crates);
-                    todo.extend(args.iter().copied());
-                    for &(d, x, _) in bindings.iter() { ok &= add(d, &mut crates); todo.push(x); }
-                    for &d in autos.iter() { ok &= add(d, &mut crates); }
+                    todo.extend(tcx.tys.list(*args).iter().copied());
+                    for &(d, x, _) in tcx.tys.list(*bindings).iter() { ok &= add(d, &mut crates); todo.push(x); }
+                    for &d in tcx.tys.list(*autos).iter() { ok &= add(d, &mut crates); }
                     ok
                 }
                 _ => false,
@@ -566,10 +566,10 @@ impl Providers<'_> {
                         if adt.is_box() || tcx.adt_destructor(*d).is_some() { return Ok(true); }
                         if adt.is_union() { continue; }
                         for v in &adt.variants {
-                            for f in &v.fields { todo.push(tcx.tys.subst(f.ty, args)); }
+                            for f in &v.fields { todo.push(tcx.tys.subst(f.ty, tcx.tys.list(*args))); }
                         }
                     }
-                    TyKind::Tuple(fields) => todo.extend_from_slice(fields),
+                    TyKind::Tuple(fields) => todo.extend_from_slice(tcx.tys.list(*fields)),
                     TyKind::Array(elem, len) => { if len.try_to_target_usize(&self.tcx.tys) != Some(0) { todo.push(*elem); } }
                     TyKind::Slice(elem) | TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: elem, .. }) => todo.push(*elem),
                     TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
@@ -606,10 +606,10 @@ impl Providers<'_> {
                         if adt.is_unsafe_cell() { return Ok(false); }
                         if adt.is_phantom_data() { continue; }
                         for v in &adt.variants {
-                            for f in &v.fields { todo.push(tcx.tys.subst(f.ty, args)); }
+                            for f in &v.fields { todo.push(tcx.tys.subst(f.ty, tcx.tys.list(*args))); }
                         }
                     }
-                    TyKind::Tuple(fields) => todo.extend_from_slice(fields),
+                    TyKind::Tuple(fields) => todo.extend_from_slice(tcx.tys.list(*fields)),
                     TyKind::Array(elem, _) | TyKind::Slice(elem) => todo.push(*elem),
                     TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => {
                         if tcx.is_coroutine(ty) { return Ok(false); }
@@ -732,7 +732,7 @@ mod tests {
         panic!("missing {name}")
     }
     fn adt(prog: &Program, tcx: &Tcx, name: &str, args: Vec<TyId>) -> TyId {
-        tcx.tys.intern(TyKind::Adt(named(prog, name), args, RegionArgsId::EMPTY))
+        tcx.tys.intern(TyKind::Adt(named(prog, name), tcx.tys.mk_list(&args), RegionArgsId::EMPTY))
     }
     #[test]
     fn round31_normalization_query_separates_limit_values() {
@@ -883,9 +883,9 @@ mod tests {
         assert!(tcx.is_freeze(&prog, env, adt(&prog, &tcx, "Phantom", vec![cell])));
         assert!(tcx.is_freeze(&prog, env, tcx.tys.intern(TyKind::Ptr(false, cell))));
         assert!(tcx.is_freeze(&prog, env, adt(&prog, &tcx, "Node", vec![])));
-        let sig = tcx.tys.intern(TyKind::FnPtr(vec![], tcx.tys.unit, crate::types::FnHeader::RUST, 0));
-        let owner = tcx.tys.intern(TyKind::FnDef(named(&prog, "drop"), vec![], RegionArgsId::EMPTY));
-        let up = tcx.tys.intern(TyKind::Tuple(vec![d, cell]));
+        let sig = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+        let owner = tcx.tys.intern(TyKind::FnDef(named(&prog, "drop"), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
+        let up = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[d, cell])));
         let closure = tcx.tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }));
         assert!(tcx.needs_drop(&prog, env, closure));
         assert!(!tcx.is_freeze(&prog, env, closure));
@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(tcx.field_ty(&prog, env, sid, 0, 0, &[reference]), erased);
         assert!(tcx.queries.normalize.query_id(&TypeKey { env, ty: erased }).is_none());
 
-        let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: named(&prog, "A") }, args: vec![reference], regions: RegionArgsId::EMPTY }));
+        let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: named(&prog, "A") }, args: tcx.tys.mk_list(&[reference]), regions: RegionArgsId::EMPTY }));
         let erased_projection = tcx.tys.erase_regions(projection);
         let predicates = ParamEnv { clauses: vec![
             crate::next_solver::collect::trait_predicate(named(&prog, "Tr"), vec![GenericArg::Type(erased)]),
@@ -990,7 +990,7 @@ mod tests {
         let id = tcx.queries.normalize.query_id(&TypeKey { env, ty: erased_projection }).unwrap();
         assert_eq!(tcx.queries.engine.dependencies(id), vec![DECLARATIONS]);
         // has_assoc excludes closure captures; the normalization fast path must not.
-        let sig = tcx.tys.intern(TyKind::FnPtr(vec![], tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+        let sig = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, crate::types::FnHeader::RUST, 0));
         let closure = tcx.tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: projection }));
         let normalized = tcx.normalize_erasing_regions(&prog, env, closure);
         assert!(matches!(tcx.tys.kind(normalized), TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) if *up == tcx.tys.char_));
@@ -1008,7 +1008,7 @@ mod tests {
         "#);
         let env = TypingEnv::fully_monomorphized(&prog);
         let param = tcx.tys.intern(TyKind::Param(0));
-        let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: named(&prog, "A") }, args: vec![param], regions: RegionArgsId::EMPTY }));
+        let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: named(&prog, "A") }, args: tcx.tys.mk_list(&[param]), regions: RegionArgsId::EMPTY }));
         for ty in [param, projection] {
             assert!(tcx.needs_drop(&prog, env, ty));
             assert!(!tcx.is_freeze(&prog, env, ty));
@@ -1022,8 +1022,8 @@ mod tests {
         assert!(tcx.needs_drop(&prog, env, tcx.tys.intern(TyKind::Array(param, len))));
         let phantom = adt(&prog, &tcx, "Phantom", vec![param]);
         assert!(!tcx.needs_drop(&prog, env, tcx.tys.intern(TyKind::Array(phantom, len))));
-        let sig = tcx.tys.intern(TyKind::FnPtr(vec![], tcx.tys.unit, crate::types::FnHeader::RUST, 0));
-        let owner = tcx.tys.intern(TyKind::FnDef(named(&prog, "owner"), vec![], RegionArgsId::EMPTY));
+        let sig = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+        let owner = tcx.tys.intern(TyKind::FnDef(named(&prog, "owner"), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
         tcx.coroutines.insert((0, 1), ());
         let coroutine = tcx.tys.intern(TyKind::Closure(0, 1, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tcx.tys.unit }));
         assert!(tcx.needs_drop(&prog, env, coroutine));

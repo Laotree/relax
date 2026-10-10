@@ -111,14 +111,14 @@ fn erased_signature_occurrences_get_distinct_query_placeholders() {
     let b = tcx.tys.intern(crate::types::TyKind::Bool);
     let erased = tcx.tys.intern(crate::types::TyKind::Ref(false,b,RegionId::ERASED));
     let bound = tcx.tys.intern_region(RegionKind::ReBound(0,BoundVar(0)));
-    let nested = tcx.tys.intern(crate::types::TyKind::FnPtr(vec![tcx.tys.intern(crate::types::TyKind::Ref(false,b,bound))],erased,crate::types::FnHeader::RUST,1));
+    let nested = tcx.tys.intern(crate::types::TyKind::FnPtr(tcx.tys.mk_list(&[tcx.tys.intern(crate::types::TyKind::Ref(false,b,bound))]),erased,crate::types::FnHeader::RUST,1));
     let query = crate::borrowck::implied_bounds::replace_erased_regions_with_placeholders(&tcx,&[erased,erased,nested]);
     assert_ne!(query[0],query[1]);
     let regions = crate::borrowck::implied_bounds::implied_bounds_query_var_values(&tcx,&query,|r| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { .. }));
     assert_eq!(regions.len(),3);
     assert!(regions.iter().enumerate().all(|(i,&r)| matches!(tcx.tys.region_kind(r),RegionKind::RePlaceholder { universe:UniverseIndex::ROOT,var } if var.0 == i as u32)));
     let crate::types::TyKind::FnPtr(ps,_,_,_) = tcx.tys.kind(query[2]) else { panic!() };
-    assert!(matches!(tcx.tys.kind(ps[0]),crate::types::TyKind::Ref(_,_,r) if *r == bound));
+    assert!(matches!(tcx.tys.kind(tcx.tys.list(*ps)[0]),crate::types::TyKind::Ref(_,_,r) if *r == bound));
 }
 
 #[test]
@@ -134,8 +134,8 @@ fn conditional_type_tests_match_binders_and_scc_representatives() {
     let tests = vec![
         TypeTest { generic_kind:subject,lower_bound:1,span,verify_bound:VerifyBound::IfEq { ty:pattern,bound } },
         TypeTest { generic_kind:subject,lower_bound:1,span,verify_bound:VerifyBound::IfEq { ty:tys.intern(TyKind::Ref(false,b,region(1))),bound:region(2) } },
-        TypeTest { generic_kind:tys.intern(TyKind::Tuple(vec![subject,tys.intern(TyKind::Ref(false,b,region(0)))])),lower_bound:1,span,
-            verify_bound:VerifyBound::IfEq { ty:tys.intern(TyKind::Tuple(vec![pattern,pattern])),bound } },
+        TypeTest { generic_kind:tys.intern(TyKind::Tuple(tys.mk_list(&[subject,tys.intern(TyKind::Ref(false,b,region(0)))]))),lower_bound:1,span,
+            verify_bound:VerifyBound::IfEq { ty:tys.intern(TyKind::Tuple(tys.mk_list(&[pattern,pattern]))),bound } },
     ];
     let defs = vec![definition(NllRegionVariableOrigin::FreeRegion,0);3];
     let relations = UniversalRegionRelations::create(UniversalRegions::new(0,None,vec![(0,Class::Global),(1,Class::Local),(2,Class::Local)]),3,&[(1,2),(2,1)]);
@@ -181,10 +181,10 @@ fn opaque_members_exclude_parent_closure_arguments() {
     defs[0] = definition(NllRegionVariableOrigin::FreeRegion,0); defs[0].external_name = Some(tys.intern_region(RegionKind::ReStatic));
     defs[1] = definition(NllRegionVariableOrigin::FreeRegion,0); defs[1].external_name = Some(named);
     let relations = UniversalRegionRelations::create(UniversalRegions::new(0,None,vec![(0,Class::Global),(1,Class::Local)]),4,&[]);
-    let unit = tys.intern(TyKind::Tuple(vec![]));
+    let unit = tys.intern(TyKind::Tuple(tys.mk_list(&[])));
     let member = tys.intern(TyKind::Ref(false,unit,tys.intern_region(RegionKind::ReVar(2))));
-    let owner = tys.intern(TyKind::FnDef(crate::program::DefId(2),vec![],tys.intern_region_args(&[tys.intern_region(RegionKind::ReVar(3))])));
-    let signature = tys.intern(TyKind::FnPtr(vec![],unit,crate::types::FnHeader::RUST,0));
+    let owner = tys.intern(TyKind::FnDef(crate::program::DefId(2),tys.mk_list(&[]),tys.intern_region_args(&[tys.intern_region(RegionKind::ReVar(3))])));
+    let signature = tys.intern(TyKind::FnPtr(tys.mk_list(&[]),unit,crate::types::FnHeader::RUST,0));
     let hidden_type = tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: signature, tupled_upvars_ty: member }));
     let uses = vec![opaque_types::DefiningUse { def_id:crate::program::DefId(0),hidden_type,arg_regions:vec![0,1] }];
     let (hidden,errors) = opaque_types::compute_definition_site_hidden_types(&tcx,&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())),defs,&relations,constraints(&[(1,2)]),&uses);
@@ -203,7 +203,7 @@ fn v1_if_eq_ignores_bivariant_opaque_arguments() {
     // the bivariant parent lifetime may differ, the invariant captured one may not.
     let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
     let var = |r| tcx.tys.intern_region(RegionKind::ReVar(r));
-    let opaque = |parent, captured| tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[var(parent), var(captured)]) }));
+    let opaque = |parent, captured| tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: tcx.tys.mk_list(&[]), regions: tcx.tys.intern_region_args(&[var(parent), var(captured)]) }));
     let run = |generic, pattern| {
         let tests = [TypeTest { generic_kind:generic, lower_bound:1,span:Span::default(),
             verify_bound:VerifyBound::IfEq { ty:pattern,bound:tcx.tys.intern_region(RegionKind::ReStatic) } }];
@@ -231,7 +231,7 @@ fn v2_nonmember_opaque_argument_is_skipped_and_erased() {
     // argument is no member and is erased; the captured one is mapped.
     let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
     let x = tcx.tys.intern_region(RegionKind::ReVar(2));
-    let hidden = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[x, tcx.tys.intern_region(RegionKind::ReVar(1))]) }));
+    let hidden = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: tcx.tys.mk_list(&[]), regions: tcx.tys.intern_region_args(&[x, tcx.tys.intern_region(RegionKind::ReVar(1))]) }));
     let (types,errors) = opaque_witness(&tcx,&prog,hidden,3,&[]);
     assert!(errors.is_empty(),"{errors:?}");
     let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, regions: rs, .. }) = tcx.tys.kind(types[0].1) else { panic!() };
@@ -240,7 +240,7 @@ fn v2_nonmember_opaque_argument_is_skipped_and_erased() {
     assert_ne!(rs[1], RegionId::ERASED);
     // A captured occurrence of the same region must still fail.
     let member = tcx.tys.intern(TyKind::Ref(false,tcx.tys.unit,x));
-    let tuple = tcx.tys.intern(TyKind::Tuple(vec![hidden,member]));
+    let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[hidden,member])));
     assert!(matches!(opaque_witness(&tcx,&prog,tuple,3,&[]).1.as_slice(),
         [opaque_types::DeferredOpaqueTypeError::UnexpectedHiddenRegion { member_region:2,.. }]));
 }
@@ -248,13 +248,13 @@ fn v2_nonmember_opaque_argument_is_skipped_and_erased() {
 fn v3_opaque_substitution_fails_on_first_unknown_region() {
     let tcx = crate::tcx::Tcx::new();
     let reference = |r| tcx.tys.intern(TyKind::Ref(false,tcx.tys.unit,tcx.tys.intern_region(RegionKind::ReVar(r))));
-    let hidden = tcx.tys.intern(TyKind::Tuple(vec![reference(2),reference(3)]));
+    let hidden = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[reference(2),reference(3)])));
     let (types,errors) = opaque_witness(&tcx,&test_prog(),hidden,4,&[]);
     assert!(types.is_empty());
     assert!(matches!(errors.as_slice(),[opaque_types::DeferredOpaqueTypeError::UnexpectedHiddenRegion { member_region:2,.. }]));
     // A later invalid (non-renumbered) region would panic if folding continued.
     let invalid = tcx.tys.intern(TyKind::Ref(false,tcx.tys.unit,tcx.tys.intern_region(RegionKind::ReEarlyParam(99))));
-    let hidden = tcx.tys.intern(TyKind::Tuple(vec![reference(2),invalid]));
+    let hidden = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[reference(2),invalid])));
     // Test substitution directly: collection intentionally requires all members renumbered.
     opaque_types::test_fail_fast(&tcx,hidden);
 }
@@ -271,8 +271,8 @@ fn reaudit_implicit_unsizing_to_trait_object_adt_is_blamed_for_static() {
     // coercion to an ADT over a trait object, only when blaming `'static` and only
     // without a type annotation on the path.
     let tcx = crate::tcx::Tcx::new();
-    let object = tcx.tys.intern(TyKind::Dyn(crate::program::DefId(1),vec![].into(),vec![].into(),tcx.tys.intern_region_args(&[]),RegionId::ERASED,0,vec![].into()));
-    let boxed = tcx.tys.intern(TyKind::Adt(crate::program::DefId(2),vec![object],tcx.tys.intern_region_args(&[])));
+    let object = tcx.tys.intern(TyKind::Dyn(crate::program::DefId(1),crate::types::List::EMPTY,crate::types::List::EMPTY,tcx.tys.intern_region_args(&[]),RegionId::ERASED,0,crate::types::List::EMPTY));
+    let boxed = tcx.tys.intern(TyKind::Adt(crate::program::DefId(2),tcx.tys.mk_list(&[object]),tcx.tys.intern_region_args(&[])));
     let unsize = ConstraintCategory::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: true, unsize_to: Some(boxed) };
     let defs = vec![definition(NllRegionVariableOrigin::FreeRegion,0),definition(NllRegionVariableOrigin::FreeRegion,0),
         definition(NllRegionVariableOrigin::Existential,0),definition(NllRegionVariableOrigin::Existential,0)];

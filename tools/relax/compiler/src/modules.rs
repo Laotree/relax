@@ -365,10 +365,10 @@ fn mentions_crate(u: &Unit, t: crate::types::TyId, krate: u32, depth: u32) -> bo
         return false;
     }
     match u.tcx.tys.kind(t).clone() {
-        TyKind::Adt(d, args, _) => u.prog.def(d).krate == krate || args.iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
-        TyKind::Dyn(d, args, _, _, _, _, _) => u.prog.def(d).krate == krate || args.iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
+        TyKind::Adt(d, args, _) => u.prog.def(d).krate == krate || u.tcx.tys.list(args).iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
+        TyKind::Dyn(d, args, _, _, _, _, _) => u.prog.def(d).krate == krate || u.tcx.tys.list(args).iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => mentions_crate(u, x, krate, depth + 1),
-        TyKind::Tuple(v) => v.iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
+        TyKind::Tuple(v) => u.tcx.tys.list(v).iter().any(|a| mentions_crate(u, *a, krate, depth + 1)),
         _ => false,
     }
 }
@@ -407,9 +407,9 @@ fn plain_data_d(u: &Unit, t: crate::types::TyId, depth: u32) -> bool {
     match u.tcx.tys.kind(t).clone() {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) => true,
         TyKind::Array(e, _) => plain_data_d(u, e, depth + 1),
-        TyKind::Tuple(v) => v.iter().all(|x| plain_data_d(u, *x, depth + 1)),
+        TyKind::Tuple(v) => u.tcx.tys.list(v).iter().all(|x| plain_data_d(u, *x, depth + 1)),
         TyKind::Adt(d, args, _) => match u.tcx.adts.get(&d) {
-            Some(a) if !a.is_union => a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| plain_data_d(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))),
+            Some(a) if !a.is_union => a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| plain_data_d(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args)), depth + 1))),
             _ => false,
         },
         _ => false,
@@ -424,11 +424,11 @@ pub(crate) fn plain_result(u: &Unit, t: crate::types::TyId) -> bool {
         match u.tcx.tys.kind(t).clone() {
             TyKind::Adt(d, args, _) => {
                 !crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(d, Vec::new()))
-                    && args.iter().all(|a| host_types(u, *a, depth + 1))
-                    && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))))
+                    && u.tcx.tys.list(args).iter().all(|a| host_types(u, *a, depth + 1))
+                    && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args)), depth + 1))))
             }
             TyKind::Array(e, _) => host_types(u, e, depth + 1),
-            TyKind::Tuple(v) => v.iter().all(|x| host_types(u, *x, depth + 1)),
+            TyKind::Tuple(v) => u.tcx.tys.list(v).iter().all(|x| host_types(u, *x, depth + 1)),
             _ => is_scalar(u, t),
         }
     }
@@ -446,8 +446,8 @@ pub(crate) fn boundary_result(u: &Unit, t: crate::types::TyId) -> bool {
 fn string_result(u: &Unit, t: crate::types::TyId) -> u8 {
     if named_type(u, t, "core::string::String") { return 1; }
     if let TyKind::Adt(d, args, _) = u.tcx.tys.kind(t) {
-        if u.prog.def_path(*d) == "core::result::Result" && args.len() == 2
-            && plain_result(u, args[0]) && named_type(u, args[1], "core::string::String") { return 2; }
+        if u.prog.def_path(*d) == "core::result::Result" && u.tcx.tys.list(*args).len() == 2
+            && plain_result(u, u.tcx.tys.list(*args)[0]) && named_type(u, u.tcx.tys.list(*args)[1], "core::string::String") { return 2; }
     }
     0
 }
@@ -546,7 +546,7 @@ fn wrapper_source(u: &Unit, krate: u32, modname: &str, idx: u32, defs: &[DefId])
         } else {
             let n = ty_src(u, rt);
             let boxed = match u.tcx.tys.kind(rt) {
-                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() => match u.tcx.tys.kind(a[0]) {
+                TyKind::Adt(d, a, _) if u.tcx.adts.get(d).is_some_and(|adt| adt.is_box()) && !a.is_empty() => match u.tcx.tys.kind(u.tcx.tys.list(*a)[0]) {
                     TyKind::Adt(d, _, _) => u.prog.def(*d).krate == krate,
                     _ => false,
                 },
@@ -673,7 +673,7 @@ fn export(u: &mut Unit, m: &Module, name: &str) -> Result<(DefId, String), Strin
     if sig.n_generics != 0 {
         return Err(format!("`{}` of module `{}` is generic: exports are concrete fns", name, m.name));
     }
-    let t = u.tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, 0));
+    let t = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, 0));
     Ok((d, crate::typeck::type_name(&u.prog, &u.tcx, t)))
 }
 

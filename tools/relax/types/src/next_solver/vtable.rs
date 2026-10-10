@@ -95,7 +95,7 @@ impl Tcx {
     pub(crate) fn first_method_vtable_slot_uncached(&self, prog: &Program, key: &TraitRef) -> usize {
         let GenericArg::Type(self_ty) = key.args[0] else { unreachable!() };
         let TyKind::Dyn(def, args, _, regions, _, _, _) = self.tys.kind(self_ty) else { panic!("virtual receiver") };
-        let mut compact = vec![self_ty]; compact.extend_from_slice(args);
+        let mut compact = vec![self_ty]; compact.extend_from_slice(self.tys.list(*args));
         // vtable.rs:319-321: open the principal's binder before slot lookup.
         let source = self.instantiate_bound_regions_with_erased(TraitRef { def_id: *def, args: self.complete_args(prog, *def, &compact, *regions) });
         if self.instantiate_and_check_impossible_clauses(prog, source.def_id, &source.args) { return 0; }
@@ -118,10 +118,10 @@ impl Tcx {
         let TyKind::Dyn(td, ta, _, tr, _, _, _) = self.tys.kind(target) else { panic!("upcast target") };
         if *td == crate::program::NO_DEF || super::eval_ctxt::trait_is_auto(prog, *td) { return None; }
         let TyKind::Dyn(sd, sa, _, sr, _, _, _) = self.tys.kind(source) else { panic!("upcast source") };
-        let mut args = vec![source]; args.extend_from_slice(sa);
+        let mut args = vec![source]; args.extend_from_slice(self.tys.list(*sa));
         let principal = self.instantiate_bound_regions_with_erased(TraitRef { def_id: *sd, args: self.complete_args(prog, *sd, &args, *sr) });
         if self.instantiate_and_check_impossible_clauses(prog, principal.def_id, &principal.args) { return None; }
-        let mut args = vec![source]; args.extend_from_slice(ta);
+        let mut args = vec![source]; args.extend_from_slice(self.tys.list(*ta));
         let target = self.instantiate_bound_regions_with_erased(TraitRef { def_id: *td, args: self.complete_args(prog, *td, &args, *tr) });
         let mut offset = 0;
         for segment in self.prepare_vtable_segments(prog, principal) {

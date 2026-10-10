@@ -32,8 +32,9 @@ impl<'a> TypeRelation<'a> for MatchAgainstHigherRankedOutlives<'a> {
         if matches!(self.tcx.tys.kind(pattern), TyKind::Error | TyKind::Bound(..)) { return Err(TypeError::Mismatch); }
         if pattern == value { return Ok(pattern); }
         if let (TyKind::Alias(ar, a), TyKind::Alias(br, b)) = (self.tcx.tys.kind(pattern), self.tcx.tys.kind(value)) {
-            if ar != br || a.kind != b.kind || a.args.len() != b.args.len() { return Err(TypeError::Mismatch); }
-            for i in 0..a.args.len() { self.tys(a.args[i], b.args[i])?; }
+            if ar != br || a.kind != b.kind || self.tcx.tys.list(a.args).len() != self.tcx.tys.list(b.args).len() { return Err(TypeError::Mismatch); }
+            let tcx = self.tcx;
+            for (&x, &y) in tcx.tys.list(a.args).iter().zip(tcx.tys.list(b.args)) { self.tys(x, y)?; }
             let ars = self.tcx.tys.region_args(a.regions); let brs = self.tcx.tys.region_args(b.regions);
             if ars.len() != brs.len() { return Err(TypeError::Mismatch); }
             for i in 0..ars.len() { if !super::components::alias_region_is_bivariant(self.tcx, self.prog, a, i) { self.regions(ars[i], brs[i])?; } }

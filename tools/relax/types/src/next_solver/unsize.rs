@@ -59,10 +59,10 @@ impl EvalCtxt<'_, '_> {
                         if params.is_empty() { return Err(NoSolution.into()); }
                         let fields = &tcx.adts[ad].variants[0].fields;
                         let tail = fields.last().unwrap().ty;
-                        let a_full = tcx.complete_args(ecx.solver.prog,*ad,aa,*ar); let b_full = tcx.complete_args(ecx.solver.prog,*bd,ba,*br);
+                        let a_full = tcx.complete_args(ecx.solver.prog,*ad,tcx.tys.list(*aa),*ar); let b_full = tcx.complete_args(ecx.solver.prog,*bd,tcx.tys.list(*ba),*br);
                         let at = tcx.instantiate_ty(ecx.solver.prog,*ad,&a_full,tail); let bt = tcx.instantiate_ty(ecx.solver.prog,*bd,&b_full,tail);
-                        let mut new_args = aa.clone(); for &i in &params { new_args[i as usize] = ba[i as usize]; }
-                        let changed = tcx.tys.intern(TyKind::Adt(*ad,new_args,*ar));
+                        let mut new_args = tcx.tys.list(*aa).to_vec(); for &i in &params { new_args[i as usize] = tcx.tys.list(*ba)[i as usize]; }
+                        let changed = tcx.tys.intern(TyKind::Adt(*ad,tcx.tys.mk_list(&new_args),*ar));
                         ecx.eq(env,Term::Ty(changed),Term::Ty(b))?;
                         ecx.add_goal(GoalSource::ImplWhereBound,Goal { param_env:env.clone(),predicate:collect::trait_predicate(tr.def_id,vec![GenericArg::Type(at),GenericArg::Type(bt)]) })?;
                     }

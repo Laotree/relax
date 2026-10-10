@@ -793,7 +793,7 @@ impl<'a> Lcx<'a> {
                 };
                 let mut a = 1;
                 for i in 0..nf {
-                    let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, &args);
+                    let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, self.u.tcx.tys.list(args));
                     let fa = if i + 1 == nf && self.unsized_ty(ft) { self.sized_prefix_align(ft) } else { self.layout(ft).align };
                     a = a.max(fa);
                 }
@@ -1121,7 +1121,7 @@ impl<'a> Lcx<'a> {
             self.switch(init);
             // a retyped scalar: the old value from its dead base slot, widened
             let conv = match self.kind(t) {
-                TyKind::Adt(d, args, _) => self.u.tcx.adts.get(&d).and_then(|a| a.ext_conv.iter().find(|c| c.0 == fields[k].0).map(|c| (c.1, self.u.tcx.tys.subst_erasing_regions(a.variants[0].fields[c.1 as usize].ty, &args)))),
+                TyKind::Adt(d, args, _) => self.u.tcx.adts.get(&d).and_then(|a| a.ext_conv.iter().find(|c| c.0 == fields[k].0).map(|c| (c.1, self.u.tcx.tys.subst_erasing_regions(a.variants[0].fields[c.1 as usize].ty, self.u.tcx.tys.list(args))))),
                 _ => None,
             };
             let lt = self.layout(t);
@@ -1171,9 +1171,9 @@ impl<'a> Lcx<'a> {
         // each field of a large struct must not instantiate all its fields each time.
         let u = self.u;
         let field_ty = |i: usize| match k {
-            TyKind::Tuple(v) => v[i],
+            TyKind::Tuple(v) => u.tcx.tys.list(*v)[i],
             TyKind::Closure(..) => u.closure_storage(t).fields[i],
-            TyKind::Adt(d, args, _) => u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi, i as u32, args),
+            TyKind::Adt(d, args, _) => u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi, i as u32, self.u.tcx.tys.list(*args)),
             _ => u.tcx.tys.error,
         };
         let (fty, off, nfields): (TyId, u32, usize) = match k {
@@ -1181,7 +1181,7 @@ impl<'a> Lcx<'a> {
                 let storage = u.closure_storage(t);
                 (storage.fields[fi as usize], l.fields[fi as usize], storage.fields.len())
             }
-            TyKind::Tuple(v) if (fi as usize) < v.len() => (v[fi as usize], l.fields.get(fi as usize).copied().unwrap_or(0), v.len()),
+            TyKind::Tuple(v) if (fi as usize) < u.tcx.tys.list(*v).len() => (u.tcx.tys.list(*v)[fi as usize], l.fields.get(fi as usize).copied().unwrap_or(0), u.tcx.tys.list(*v).len()),
             TyKind::Adt(d, args, _) => {
                 // an opaque type of a provided crate (rustc's layout, size only): every way of
                 // reaching a field -- `x.f`, a struct pattern, a derived or written impl body --
@@ -1191,7 +1191,7 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, format!("a field of `{}` is reached from Relax-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and its layout is rustc's alone: call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, ts));
                     // the fn fails with the error above; lowering goes on over a scratch place of
                     // the field's type so nothing after it trips over a shapeless one
-                    let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, args)).unwrap_or(self.u.tcx.tys.unit);
+                    let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, self.u.tcx.tys.list(*args))).unwrap_or(self.u.tcx.tys.unit);
                     let a = self.new_slot_for(ft);
                     return (Place::Mem(a, 0), ft);
                 }
@@ -1563,7 +1563,7 @@ impl<'a> Lcx<'a> {
             let t = match self.kind(ct) {
                 TyKind::Closure(file, e2, crate::types::ClosureArgs { parent_args: owner, .. }) => {
                     let parent = match self.kind(owner) {
-                        TyKind::FnDef(d, args, _) => self.u.fn_id(FnKey::Inst(d, args)),
+                        TyKind::FnDef(d, args, _) => self.u.fn_id(FnKey::Inst(d, self.u.tcx.tys.list(args).to_vec())),
                         _ => self.cur_fn,
                     };
                     let id = self.u.fn_id(FnKey::Closure(file, e2, parent));
@@ -1775,7 +1775,7 @@ impl<'a> Lcx<'a> {
     /// `Poll<t>`.
     fn poll_of(&mut self, t: TyId) -> TyId {
         match self.u.tcx.lang_items.get(LangItem::Poll) {
-            Some(d) => self.u.tcx.tys.intern(TyKind::Adt(d, vec![t], crate::types::RegionArgsId::EMPTY)),
+            Some(d) => self.u.tcx.tys.intern(TyKind::Adt(d, self.u.tcx.tys.mk_list(&[t]), crate::types::RegionArgsId::EMPTY)),
             None => self.u.tcx.tys.error,
         }
     }
@@ -1992,7 +1992,7 @@ impl<'a> Lcx<'a> {
             let at = u.tcx.trait_assoc(&u.prog, td, sym_t);
             let ft = match at {
                 Some(ad) => {
-                    let p = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![xt], regions: crate::types::RegionArgsId::EMPTY }));
+                    let p = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: u.tcx.tys.mk_list(&[xt]), regions: crate::types::RegionArgsId::EMPTY }));
                     let n = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), p);
                     u.tcx.try_normalize_after_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), n).expect("codegen normalization")
                 }
@@ -2138,7 +2138,7 @@ impl<'a> Lcx<'a> {
         let TyKind::Tuple(inputs) = self.kind(tuple) else { panic!("RustCall final tuple") };
         let address = self.new_slot_for(tuple);
         let layout = self.layout(tuple);
-        for (index, ty) in inputs.into_iter().enumerate() {
+        for (index, ty) in self.u.tcx.tys.list(inputs).iter().copied().enumerate() {
             let (regs, indirect) = self.abi_param(ty);
             let value = if indirect { Val::M(regs[0], 0) } else { Val::L(regs) };
             self.store_val(address, layout.fields[index] as i32, ty, value);
@@ -2150,7 +2150,7 @@ impl<'a> Lcx<'a> {
         let (value, tuple) = values.pop().expect("RustCall argument");
         let TyKind::Tuple(inputs) = self.kind(tuple) else { panic!("RustCall final tuple") };
         let place = self.val_to_place(value);
-        for i in 0..inputs.len() {
+        for i in 0..self.u.tcx.tys.list(inputs).len() {
             let (field, ty) = self.project(&place, tuple, 0, i as u32);
             values.push((self.read_place(&field, ty), ty));
         }
@@ -2206,7 +2206,7 @@ impl<'a> Lcx<'a> {
         };
         if let Some(up) = tuple {
             let n = match self.kind(up) {
-                TyKind::Tuple(v) => v.len(),
+                TyKind::Tuple(v) => self.u.tcx.tys.list(v).len(),
                 TyKind::Closure(..) => self.u.closure_storage(up).fields.len(),
                 _ => 0,
             };
@@ -2750,7 +2750,7 @@ impl<'a> Lcx<'a> {
             let tsym = u.prog.syms.get("Target").unwrap_or(u32::MAX);
             match u.tcx.trait_assoc(&u.prog, td, tsym) {
                 Some(ad) => {
-                    let proj = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![pt], regions: crate::types::RegionArgsId::EMPTY }));
+                    let proj = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: u.tcx.tys.mk_list(&[pt]), regions: crate::types::RegionArgsId::EMPTY }));
                     u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), proj)
                 }
                 None => u.tcx.tys.error,
@@ -3082,7 +3082,7 @@ impl<'a> Lcx<'a> {
     /// T of `Box<T>`; rustc_middle/src/ty/adt.rs:374 identifies the owning ADT by flag.
     fn box_inner(&self, t: TyId) -> Option<TyId> {
         match self.kind(t) {
-            TyKind::Adt(d, a, _) if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_box()) && !a.is_empty() => Some(a[0]),
+            TyKind::Adt(d, a, _) if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_box()) && !a.is_empty() => Some(self.u.tcx.tys.list(a)[0]),
             _ => None,
         }
     }
@@ -3344,7 +3344,7 @@ impl<'a> Lcx<'a> {
                     // out of, so its own drop never applies here)
                     let n = match (&adt, self.kind(t)) {
                         (Some(a), _) => a.variants.first().map_or(0, |v| v.fields.len()),
-                        (None, TyKind::Tuple(v)) => v.len(),
+                        (None, TyKind::Tuple(v)) => self.u.tcx.tys.list(v).len(),
                         _ => 0,
                     };
                     let saved = self.drop_misaligned;
@@ -3773,7 +3773,7 @@ impl<'a> Lcx<'a> {
             }
             Pat::Tuple(v) => {
                 let n = match self.kind(t) {
-                    TyKind::Tuple(x) => x.len(),
+                    TyKind::Tuple(x) => self.u.tcx.tys.list(x).len(),
                     _ => 0,
                 };
                 let idx = seq_indices(ast, ast.list(*v), n);
@@ -4011,8 +4011,8 @@ impl<'a> Lcx<'a> {
         match self.kind(t) {
             TyKind::Tuple(v) => {
                 let mut out = Vec::new();
-                for i in 0..v.len() {
-                    if !is_prim(&self.kind(v[i])) {
+                for i in 0..self.u.tcx.tys.list(v).len() {
+                    if !is_prim(&self.kind(self.u.tcx.tys.list(v)[i])) {
                         return None;
                     }
                     out.push(self.project(pl, t, 0, i as u32));
@@ -4485,7 +4485,7 @@ impl<'a> Lcx<'a> {
             }
             Pat::Tuple(v) => {
                 let n = match self.kind(t) {
-                    TyKind::Tuple(x) => x.len(),
+                    TyKind::Tuple(x) => self.u.tcx.tys.list(x).len(),
                     _ => 0,
                 };
                 let idx = seq_indices(ast, ast.list(*v), n);
@@ -4688,7 +4688,7 @@ impl<'a> Lcx<'a> {
             }
             TyKind::Tuple(v) => {
                 let l = self.layout(t);
-                for i in 0..v.len() {
+                for i in 0..self.u.tcx.tys.list(v).len() {
                     let (fp, ft) = self.project(place, t, 0, i as u32);
                     self.test_const_value(&fp, ft, c + l.fields[i] as u64, cs.map(|s| s.plus(l.fields[i] as i64)), fail, depth + 1);
                 }
@@ -5207,7 +5207,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Tuple(elems) => {
                 let elems = ast.list(*elems).to_vec();
                 let m = match self.kind(t) {
-                    TyKind::Tuple(v) => v.len(),
+                    TyKind::Tuple(v) => self.u.tcx.tys.list(v).len(),
                     _ => return,
                 };
                 let r = elems.iter().position(|x| is_rest(*x));
@@ -5320,7 +5320,7 @@ impl<'a> Lcx<'a> {
                 };
                 let nf = match self.kind(t) {
                     TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |x| x.variants.get(vi as usize).map_or(0, |v| v.fields.len())),
-                    TyKind::Tuple(v) => v.len(),
+                    TyKind::Tuple(v) => self.u.tcx.tys.list(v).len(),
                     _ => 0,
                 };
                 let mut used = vec![false; nf];
@@ -5364,7 +5364,7 @@ impl<'a> Lcx<'a> {
         match self.kind(t) {
             TyKind::Array(_, n) => n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length"),
             TyKind::Ref(_, a, _) | TyKind::Ptr(_, a) => self.array_len_in(a, depth + 1),
-            TyKind::Adt(_, xs, _) => xs.iter().map(|x| self.array_len_in(*x, depth + 1)).find(|n| *n != 0).unwrap_or(0),
+            TyKind::Adt(_, xs, _) => self.u.tcx.tys.list(xs).iter().map(|x| self.array_len_in(*x, depth + 1)).find(|n| *n != 0).unwrap_or(0),
             _ => 0,
         }
     }
@@ -5374,7 +5374,7 @@ impl<'a> Lcx<'a> {
         match (self.kind(a), self.kind(b)) {
             (TyKind::Array(_, n), TyKind::Slice(_)) => n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length"),
             (TyKind::Adt(_, xs, _), TyKind::Adt(_, ys, _)) => {
-                for (x, y) in xs.iter().zip(ys.iter()) {
+                for (x, y) in self.u.tcx.tys.list(xs).iter().zip(self.u.tcx.tys.list(ys).iter()) {
                     if x != y {
                         return self.unsize_len(*x, *y);
                     }
@@ -5550,7 +5550,7 @@ impl<'a> Lcx<'a> {
                 let t = self.body_ty(e);
                 if let TyKind::FnDef(d, args, _) = self.kind(t) {
                     // `<T as Trait>::method` as a value: the impl's method (or the default body)
-                    let r = self.fn_item_addr(d, args);
+                    let r = self.fn_item_addr(d, self.u.tcx.tys.list(args).to_vec());
                     return Val::L(vec![r]);
                 }
                 v
@@ -5587,7 +5587,7 @@ impl<'a> Lcx<'a> {
             _ => return 0,
         };
         let parent = match self.kind(owner) {
-            TyKind::FnDef(d, args, _) => self.u.fn_id(FnKey::Inst(d, args)),
+            TyKind::FnDef(d, args, _) => self.u.fn_id(FnKey::Inst(d, self.u.tcx.tys.list(args).to_vec())),
             _ => self.cur_fn,
         };
         let id = self.u.fn_id(FnKey::Closure(file, ce, parent));
@@ -5981,7 +5981,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Tuple(v) => {
                 let tys = match self.kind(t) {
-                    TyKind::Tuple(x) => x,
+                    TyKind::Tuple(x) => self.u.tcx.tys.list(x).to_vec(),
                     _ => Vec::new(),
                 };
                 let mut vals = Vec::new();
@@ -6227,7 +6227,7 @@ impl<'a> Lcx<'a> {
             if let Some(a) = self.u.tcx.adts.get(&d) {
                 let mut v = Vec::new();
                 for i in 0..a.variants[0].fields.len() {
-                    v.push(self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, &args));
+                    v.push(self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, self.u.tcx.tys.list(args)));
                 }
                 return v;
             }
@@ -6960,7 +6960,7 @@ impl<'a> Lcx<'a> {
         matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
             && !matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..))
             && !match self.kind(t) {
-                TyKind::Tuple(v) => v.iter().all(|e| prim(&self.kind(*e))),
+                TyKind::Tuple(v) => self.u.tcx.tys.list(v).iter().all(|e| prim(&self.kind(*e))),
                 TyKind::Array(e, n) => prim(&self.kind(e)) && n.try_to_target_usize(&self.u.tcx.tys).is_some_and(|n| n <= 64),
                 _ => false,
             }
@@ -7914,7 +7914,7 @@ impl<'a> Lcx<'a> {
         };
         if let Some(fa) = reify {
             let r = match fa {
-                Ok((d, args)) => self.fn_item_addr(d, args),
+                Ok((d, args)) => self.fn_item_addr(d, self.u.tcx.tys.list(args).to_vec()),
                 Err(id) => {
                     let r = self.f.vreg(Cls::I);
                     self.emit(Inst::FnAddr(r, id));
@@ -8739,7 +8739,7 @@ impl<'a> Lcx<'a> {
                 let tuple = vals.pop().unwrap();
                 let TyKind::Tuple(inputs) = self.kind(tuple.1) else { panic!("closure input tuple") };
                 let place = self.val_to_place(tuple.0);
-                for i in 0..inputs.len() {
+                for i in 0..self.u.tcx.tys.list(inputs).len() {
                     let (field, ty) = self.project(&place, tuple.1, 0, i as u32);
                     vals.push((self.read_place(&field, ty), ty));
                 }
@@ -8796,6 +8796,7 @@ impl<'a> Lcx<'a> {
             matches!(self.u.tcx.lang_items.by_def.get(&s.trait_def), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce | LangItem::AsyncFn | LangItem::AsyncFnMut | LangItem::AsyncFnOnce))) {
             let tuple = self.monomorphize(selected.tupled_args);
             let TyKind::Tuple(params) = self.kind(tuple) else { panic!("call arguments are not a tuple") };
+            let params = self.u.tcx.tys.list(params);
             let method = self.u.prog.traits[self.u.prog.def(selected.trait_def).sub as usize].iter().copied()
                 .find(|d| self.u.prog.def(*d).kind == DefKind::AssocFn).expect("call trait method");
             let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), method, &[self.monomorphize(selected.self_ty), tuple]);
@@ -8850,13 +8851,13 @@ impl<'a> Lcx<'a> {
                         let mut vals = Vec::new();
                         let mut guards = Vec::new();
                         for (i, a) in args.iter().enumerate() {
-                            let p = ps.get(i).copied().unwrap_or_else(|| self.body_ty(*a));
+                            let p = self.u.tcx.tys.list(ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                             let v = self.lower_expr_coerced(*a, p);
                             let v = self.guard_operand(&args[i + 1..], v, p, &mut guards);
                             vals.push((v, p));
                         }
                         self.unguard(&guards);
-                        let callee = self.fn_ptr_callee(fv[0], &ps, t, c, &mut vals);
+                        let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(ps), t, c, &mut vals);
                         self.emit_call(callee, vals, t)
                     }
                     _ => {
@@ -8874,7 +8875,7 @@ impl<'a> Lcx<'a> {
                 // FnSig of a ctor = its field types, normalized at the call): a field declared
                 // through a projection (`struct W<P: Pattern>(P::Searcher)`) is its concrete type
                 let ps: Vec<TyId> = match self.u.tcx.ctor_sigs.get(&d0) {
-                    Some(s) => s.params.iter().map(|p| self.u.tcx.normalize_erasing_late_bound_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.u.tcx.tys.subst(*p, &gargs0))).collect(),
+                    Some(s) => s.params.iter().map(|p| self.u.tcx.normalize_erasing_late_bound_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.u.tcx.tys.subst(*p, self.u.tcx.tys.list(*gargs0)))).collect(),
                     None => Vec::new(),
                 };
                 // (the callee value is zero-sized; an expression producing it still runs)
@@ -8894,8 +8895,8 @@ impl<'a> Lcx<'a> {
                 self.build_enum(t, vi, vals)
             }
             TyKind::FnDef(d0, gargs0, _) => {
-                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d0, &gargs0);
-                let gargs = gargs0;
+                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d0, self.u.tcx.tys.list(*gargs0));
+                let gargs = self.u.tcx.tys.list(*gargs0);
                 let sig = self.u.tcx.fn_item_sig(&self.u.prog, *d0).cloned();
                 let sig = match sig {
                     Some(s) => s,
@@ -8905,7 +8906,7 @@ impl<'a> Lcx<'a> {
                 let mut guards = Vec::new();
                 for (i, a) in args.iter().enumerate() {
                     let pt = if i < sig.params.len() {
-                        { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i], &gargs); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
+                        { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i], gargs); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
                     } else {
                         self.body_ty(*a)
                     };
@@ -8924,13 +8925,13 @@ impl<'a> Lcx<'a> {
                 let mut vals = Vec::new();
                 let mut guards = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let pt = ps.get(i).copied().unwrap_or_else(|| self.body_ty(*a));
+                    let pt = self.u.tcx.tys.list(*ps).get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                     let v = self.lower_expr_coerced(*a, pt);
                     let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
                     vals.push((v, pt));
                 }
                 self.unguard(&guards);
-                let callee = self.fn_ptr_callee(fv[0], &ps, t, *c, &mut vals);
+                let callee = self.fn_ptr_callee(fv[0], self.u.tcx.tys.list(*ps), t, *c, &mut vals);
                 self.emit_call(callee, vals, t)
             }
             _ => {
@@ -9332,7 +9333,7 @@ impl<'a> Lcx<'a> {
                                         if let Some(adt) = self.u.tcx.adts.get(&d) {
                                             let fs = adt.variants[0].fields.clone();
                                             for j in 0..fs.len().saturating_sub(1) {
-                                                let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, j as u32, &args);
+                                                let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, j as u32, self.u.tcx.tys.list(args));
                                                 let sz = self.layout(ft).size;
                                                 m = m.max(l.fields.get(j).copied().unwrap_or(0) + sz);
                                             }
@@ -10617,7 +10618,7 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
     let loc = u.tcx.lang_items.get(LangItem::PanicLocation);
     let lay = match loc {
         Some(d) => {
-            let t = u.tcx.tys.intern(TyKind::Adt(d, Vec::new(), crate::types::RegionArgsId::EMPTY));
+            let t = u.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
             u.layout_of(t)
         }
         None => return 0,
@@ -10874,7 +10875,7 @@ fn ctor_fn(u: &mut Unit, vi: u32, t: TyId) -> Func {
     let mut f = Func::new(name, 0);
     let b = f.block();
     let (ps, ret) = match u.tcx.tys.kind(t).clone() {
-        TyKind::FnPtr(ps, r, _, _) => (ps, r),
+        TyKind::FnPtr(ps, r, _, _) => (u.tcx.tys.list(ps).to_vec(), r),
         _ => (Vec::new(), u.tcx.tys.unit),
     };
     let rl = u.layout_of(ret);
@@ -11117,7 +11118,7 @@ pub(crate) fn ext_fields(u: &Unit, t: TyId) -> Option<(u32, Vec<(u32, TyId, u32)
         if l.fields.get(fi) != Some(&u32::MAX) {
             continue;
         }
-        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, &args);
+        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, u.tcx.tys.list(args));
         let fl = u.layout_of(ft);
         off = crate::layout::round_up(off, fl.align.max(1));
         align = align.max(fl.align);
@@ -11156,7 +11157,7 @@ fn ext_drop_fn(u: &mut Unit, t: TyId) -> Func {
     // dead slots (removed / retyped fields) of a value built before they died: dropped here
     if let (Some(ext_off), TyKind::Adt(d, args, _)) = (u.layout_of(t).ext, u.tcx.tys.kind(t).clone()) {
         let l = u.layout_of(t);
-        let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, &args))).collect()).unwrap_or_default();
+        let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, u.tcx.tys.list(args)))).collect()).unwrap_or_default();
         let dead: Vec<(u32, TyId)> = dead.into_iter().filter(|(_, ft)| u.needs_drop_glue(*ft)).collect();
         if !dead.is_empty() {
             let one = f.vreg(Cls::I);
@@ -11361,7 +11362,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                     items.push((c, p, may));
                 }
                 for (fi, fd) in adt.variants[0].fields.iter().enumerate() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, u.tcx.tys.list(args));
                     // fields in the extension block (M10) drop with it, below; so do dead slots
                     // (a value built before their field went holds them, ext_drop_fn)
                     if l.fields.get(fi) == Some(&u32::MAX) || (l.ext.is_some() && is_dead_field(u, fd.name)) {
@@ -11402,7 +11403,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             for (vi, v) in adt.variants.iter().enumerate() {
                 let mut any = false;
                 for fi in 0..v.fields.len() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args));
                     if u.needs_drop_glue(ft) {
                         any = true;
                     }
@@ -11422,7 +11423,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                 let no = f.block();
                 f.blocks[*cur as usize].term = Term::Branch(c, yes, no);
                 for fi in 0..v.fields.len() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args));
                     if u.needs_drop_glue(ft) {
                         let a = addr_off(f, yes, p, l.variant_fields[vi][fi]);
                         call_drop(u, f, yes, a, ft);
@@ -11438,7 +11439,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             let unwind = options.unwind;
             let l = u.layout_of(t);
             let mut items = Vec::new();
-            for (i, ft) in v.iter().enumerate() {
+            for (i, ft) in u.tcx.tys.list(v).iter().enumerate() {
                 if u.needs_drop_glue(*ft) {
                     let a = addr_off(f, *cur, p, l.fields[i]);
                     let id = u.fn_id(FnKey::Glue(crate::jit::GLUE_DROP, *ft));
@@ -11476,7 +11477,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                         _ => u.tcx.tys.unit,
                     };
                     let pr = match u.tcx.lang_items.get(LangItem::Poll) {
-                        Some(d) => u.tcx.tys.intern(TyKind::Adt(d, vec![out], crate::types::RegionArgsId::EMPTY)),
+                        Some(d) => u.tcx.tys.intern(TyKind::Adt(d, u.tcx.tys.mk_list(&[out]), crate::types::RegionArgsId::EMPTY)),
                         None => u.tcx.tys.unit,
                     };
                     let pl = u.layout_of(pr);
@@ -11518,7 +11519,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                     Some(fs) => {
                         let sl = u.layout_of(ft);
                         let fts: Vec<TyId> = match u.tcx.tys.kind(ft).clone() {
-                            TyKind::Adt(d, args, _) => u.tcx.adts.get(&d).and_then(|ad| ad.variants.first().map(|v| v.fields.iter().map(|x| u.tcx.tys.subst_erasing_regions(x.ty, &args)).collect())).unwrap_or_default(),
+                            TyKind::Adt(d, args, _) => u.tcx.adts.get(&d).and_then(|ad| ad.variants.first().map(|v| v.fields.iter().map(|x| u.tcx.tys.subst_erasing_regions(x.ty, u.tcx.tys.list(args))).collect())).unwrap_or_default(),
                             _ => Vec::new(),
                         };
                         fs.iter().filter_map(|&fi| {
@@ -13076,8 +13077,8 @@ mod query_drop_tests {
             let d = DefId(i as u32);
             if prog.def(d).krate == krate && prog.name(d) == "Plain" { plain = Some(d); }
         }
-        let plain = tcx.tys.intern(TyKind::Adt(plain.unwrap(), vec![], crate::types::RegionArgsId::EMPTY));
-        let aggregate = tcx.tys.intern(TyKind::Tuple(vec![plain, plain]));
+        let plain = tcx.tys.intern(TyKind::Adt(plain.unwrap(), tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
+        let aggregate = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[plain, plain])));
         let env = crate::tcx::TypingEnv::fully_monomorphized(&prog);
         for ty in [plain, aggregate] { assert!(!tcx.needs_drop(&prog, env, ty)); }
         let _live = LiveGuard {
@@ -13210,17 +13211,17 @@ pub fn shim_func(u: &Unit, shim: &ShimInstance, id: u32) -> Result<Func, String>
             let TyKind::Tuple(inputs) = l.kind(tuple) else { panic!("FnPtr shim tuple argument") };
             let address = l.place_addr(&match vals[1].0.clone() { Val::L(r) => Place::Regs(r), Val::M(a, o) => Place::Mem(a, o) }, tuple);
             let mut call_args = Vec::new();
-            for i in 0..inputs.len() {
+            for i in 0..u.tcx.tys.list(inputs).len() {
                 let (place, ty) = l.project(&Place::Mem(address, 0), tuple, 0, i as u32);
                 call_args.push((l.read_place(&place, ty), ty));
             }
             let callee = match l.kind(callable) {
                 TyKind::FnPtr(inputs, _, header, _) => {
                     let ptr = l.to_leaves(receiver, callable)[0];
-                    l.fn_ptr_callee(ptr, &inputs, ret, header, &mut call_args)
+                    l.fn_ptr_callee(ptr, u.tcx.tys.list(inputs), ret, header, &mut call_args)
                 }
                 TyKind::FnDef(d, args, _) => {
-                    let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &args).map_err(|e| format!("shim callee: {e:?}"))?;
+                    let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, u.tcx.tys.list(args)).map_err(|e| format!("shim callee: {e:?}"))?;
                     let result = l.emit_instance(instance, call_args, ret);
                     l.ret_val(result, ret);
                     l.finish();
@@ -13241,7 +13242,7 @@ pub fn shim_func(u: &Unit, shim: &ShimInstance, id: u32) -> Result<Func, String>
             let TyKind::Tuple(inputs) = l.kind(tuple) else { panic!("ClosureOnce shim tuple argument") };
             let mut call_args = Vec::new();
             call_args.push((Val::L(vec![address]), u.tcx.tys.usize_));
-            for i in 0..inputs.len() {
+            for i in 0..u.tcx.tys.list(inputs).len() {
                 let (place, ty) = l.project(&Place::Mem(tuple_address, 0), tuple, 0, i as u32);
                 call_args.push((l.read_place(&place, ty), ty));
             }

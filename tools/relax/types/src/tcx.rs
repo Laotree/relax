@@ -546,7 +546,7 @@ impl Tcx {
                 if prog.def(*d).krate == krate {
                     return true;
                 }
-                self.fundamental(prog, *d) && args.first().map_or(false, |a| self.orphan_local(prog, *a, krate))
+                self.fundamental(prog, *d) && self.tys.list(*args).first().map_or(false, |a| self.orphan_local(prog, *a, krate))
             }
             TyKind::Dyn(td, ..) => prog.def(*td).krate == krate,
             TyKind::Ref(_, x, _) => self.orphan_local(prog, *x, krate),
@@ -1170,7 +1170,7 @@ impl Tcx {
                 // instantiated with its identity arguments, also in field consts.
                 let indices = crate::types::variance::GenericIndices::from_env(&env);
                 let regions: Vec<_> = indices.lifetimes.iter().map(|&i| self.tys.intern_region(crate::types::RegionKind::ReEarlyParam(i))).collect();
-                env.self_ty = Some(self.tys.intern(TyKind::Adt(d, indices.identity_types_consts(&self.tys), self.tys.intern_region_args(&regions))));
+                env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
             ItemKind::TypeAlias { generics, .. } => push_generics(prog, def.file, generics, &mut env),
             ItemKind::Impl { generics, .. } => {
@@ -1262,7 +1262,7 @@ impl Tcx {
             if !adt.is_union {
                 let n = adt.n_generics;
                 let pargs = adt.generic_indices.identity_types_consts(&self.tys);
-                let ret = self.tys.intern(TyKind::Adt(d, pargs, adt.region_params));
+                let ret = self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&pargs), adt.region_params));
                 for v in adt.variants.iter().filter(|v| v.shape == 1) {
                     self.ctor_sigs.insert(v.def, FnSigT {
                         region_contract: adt.region_contract.clone(),
@@ -1294,7 +1294,7 @@ impl Tcx {
         env.regions.enabled = true;
         let n_generics = env.names.len() as u32;
         let self_args = crate::types::variance::GenericIndices::from_env(&env).identity_types_consts(&self.tys);
-        env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self_args, env.regions.identity_args(&self.tys))));
+        env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&self_args), env.regions.identity_args(&self.tys))));
         let ast = &prog.files[file as usize].ast;
         let it = ast.item(def.item);
         let mut repr_c = false;
@@ -1906,7 +1906,7 @@ impl Tcx {
                                     if let Some(TyKind::Tuple(ps)) = sa.first().map(|t| self.tys.kind(*t)) {
                                         if let Some(output) = self.callable_output(sd) {
                                             let mut args = vec![p]; args.extend_from_slice(&sa);
-                                            let projection = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args, regions: RegionArgsId::EMPTY }));
+                                            let projection = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: self.tys.mk_list(&args), regions: RegionArgsId::EMPTY }));
                                             for (lhs, ret) in self.trait_super_bindings(cx, prog, td, p, &targs) {
                                                 if lhs == projection {
                                                     let sig = self.tys.intern(TyKind::FnPtr(ps.clone(), ret, FnHeader::RUST, 0));
@@ -2013,7 +2013,7 @@ impl Tcx {
                 for x in ast.list(*v) {
                     out.push(self.lower_ty(cx, prog, file, module, env, *x));
                 }
-                self.tys.intern(TyKind::Tuple(out))
+                self.tys.intern(TyKind::Tuple(self.tys.mk_list(&out)))
             }
             ast::Ty::Paren(x) => self.lower_ty(cx, prog, file, module, env, *x),
             ast::Ty::Never => self.tys.never,
@@ -2181,7 +2181,7 @@ impl Tcx {
                 // the output is lowered for its diagnostics and nested opaques; the
                 // declaration's clauses come from native collection (item_bounds)
                 if let Some(r) = r { self.lower_ty(cx, prog, file, module, env, *r); }
-                let args = vec![self.tys.intern(TyKind::Tuple(pts))];
+                let args = vec![self.tys.intern(TyKind::Tuple(self.tys.mk_list(&pts)))];
                 decl.bounds.push((td, args));
             } else {
                 let explicit = self.lower_generic_args(cx, prog, file, module, env, path);
@@ -2228,7 +2228,7 @@ impl Tcx {
         let opaque_def = prog.node_id_to_def_id[&(prog.def(d).file, relax_front::def_collector::NodeId::AsyncReturn(prog.def(d).item))];
         let me = self.lower_opaque_ty(prog, opaque_def);
         let TyKind::Alias(_, alias) = self.tys.kind(me) else { unreachable!() };
-        let args = self.complete_args(prog, opaque_def, &alias.args, alias.regions);
+        let args = self.complete_args(prog, opaque_def, self.tys.list(alias.args), alias.regions);
         self.async_fns.insert(d, self.instantiate_ty(prog, opaque_def, &args, out));
         if let Some((fd, _)) = self.future_defs(prog) {
             let mut decl = OpaqueDecl::default();
@@ -2256,7 +2256,7 @@ impl Tcx {
     /// `dyn Tr` implements Tr and its supertraits (rustc object candidates; the vtable has them).
     pub fn dyn_implements(&self, td: DefId, t: TyId) -> bool {
         match self.tys.kind(t) {
-            TyKind::Dyn(p, _, _, _, _, _, autos) => autos.contains(&td) || self.trait_closure.get(p).map_or(*p == td, |v| v.contains(&td)),
+            TyKind::Dyn(p, _, _, _, _, _, autos) => self.tys.list(*autos).contains(&td) || self.trait_closure.get(p).map_or(*p == td, |v| v.contains(&td)),
             _ => false,
         }
     }
@@ -2352,14 +2352,15 @@ impl Tcx {
                     args = filled;
                 }
             }
-            return self.tys.intern(TyKind::Dyn(td, args.into(), binds.into(), regions, region, bound, autos.into()));
+            let bound = u16::try_from(bound).expect("dyn principal bound-region count");
+            return self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
         }
         // only auto traits (`dyn Send`, `dyn Send + Sync`): a trait object without a principal
         // (rustc: its vtable is drop, size and align alone); the first auto trait stands for it
         if let Some(&td) = autos.first() {
             let region = self.object_region(cx.infcx, prog, file, env, bounds, source_ty);
             self.report_indeterminate_object_default(cx, prog, file, env, region, source_ty, lo);
-            return self.tys.intern(TyKind::Dyn(td, Vec::new().into(), Vec::new().into(), RegionArgsId::EMPTY, region, 0, autos.into()));
+            return self.tys.intern(TyKind::Dyn(td, crate::types::List::EMPTY, crate::types::List::EMPTY, RegionArgsId::EMPTY, region, 0, self.tys.mk_list(&autos)));
         }
         self.err(cx, prog, file, lo, "trait object without a principal trait".to_string());
         self.tys.error
@@ -2395,7 +2396,7 @@ impl Tcx {
                         let own = self.lower_region_args(cx.infcx, prog, file, module, env, p);
                         let mut rs = self.tys.region_args(tr).to_vec();
                         rs.extend_from_slice(&self.tys.region_args(own));
-                        return self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args, regions: self.tys.intern_region_args(&rs) }));
+                        return self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&rs) }));
                     }
                 }
             }
@@ -2509,7 +2510,7 @@ impl Tcx {
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 // `HashMap<K, V>` with `S = RandomState` defaulted
                 self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions));
-                self.tys.intern(TyKind::Adt(d, args, regions))
+                self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&args), regions))
             }
             DefKind::TypeAlias => {
                 let a = self.alias_ty(cx, prog, d);
@@ -2673,7 +2674,7 @@ impl Tcx {
             if let Some(GenericArgs::Paren(ps, _)) = ast.gargs(last.args) {
                 let mut args = Vec::new();
                 for t in ast.list(*ps) { args.push(self.lower_ty(cx, prog, file, module, env, *t)); }
-                return vec![self.tys.intern(TyKind::Tuple(args))];
+                return vec![self.tys.intern(TyKind::Tuple(self.tys.mk_list(&args)))];
             }
             if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args) {
                 for g in ast.list(*v) {
@@ -3002,11 +3003,11 @@ impl Tcx {
     /// arguments to the selected parent trait's arguments, including lifetimes.
     fn lower_generic_args_of_assoc_item(&self, cx: &EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, path: &ast::Path, parent: TyId) -> TyId {
         let TyKind::Alias(rigid, alias) = self.tys.kind(parent) else { return parent; };
-        let mut args = alias.args.clone();
+        let mut args = self.tys.list(alias.args).to_vec();
         args.extend(self.lower_generic_args(cx, prog, file, module, env, path));
         let mut regions = self.tys.region_args(alias.regions).to_vec();
         regions.extend_from_slice(&self.tys.region_args(self.lower_region_args(cx.infcx, prog, file, module, env, path)));
-        self.tys.intern(TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args, regions: self.tys.intern_region_args(&regions) }))
+        self.tys.intern(TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&regions) }))
     }
 
     /// rustc_hir_analysis/src/hir_ty_lowering/bounds.rs:416-425: search
@@ -3168,7 +3169,7 @@ impl Tcx {
                         let written = self.lower_generic_args(cx, prog, pd.file, module, &env, &path);
                         let mut args = vec![self_t];
                         for t in written { args.push(self.tys.subst(t, &sub)); }
-                        let projection = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args, regions: RegionArgsId::EMPTY }));
+                        let projection = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: self.tys.mk_list(&args), regions: RegionArgsId::EMPTY }));
                         let ret = match ret { Some(t) => self.lower_ty(cx, prog, pd.file, module, &env, *t), None => self.tys.unit };
                         out.push((projection, self.tys.subst(ret, &sub)));
                     }
@@ -3200,7 +3201,7 @@ impl Tcx {
                 if let Some(ad) = self.trait_assoc(prog, d, sym) {
                     let mut pa = vec![self_t];
                     pa.extend(args.iter().copied());
-                    let proj = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: pa, regions: crate::types::RegionArgsId::EMPTY }));
+                    let proj = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&pa), regions: crate::types::RegionArgsId::EMPTY }));
                     let v = self.lower_ty(cx, prog, pd.file, module, &env, t);
                     out.push((proj, self.tys.subst(v, &sub)));
                 }
@@ -3308,7 +3309,7 @@ impl Tcx {
             ItemKind::TypeAlias { bounds, .. } => ast.list(bounds).iter().any(|b| matches!(b, ast::Bound::Trait { maybe: true, .. })),
             _ => false,
         };
-        let proj = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: args.to_vec(), regions: crate::types::RegionArgsId::EMPTY }));
+        let proj = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(args), regions: crate::types::RegionArgsId::EMPTY }));
         let mut eqs = Vec::new();
         let pd = prog.def(td);
         let tast = &prog.files[pd.file as usize].ast;
@@ -3339,7 +3340,7 @@ impl Tcx {
                             let v = self.lower_ty(cx, prog, d.file, module, &env, *ty);
                             let mut pa = vec![proj];
                             pa.extend(ba.iter().copied());
-                            eqs.push((self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: bad }, args: pa, regions: crate::types::RegionArgsId::EMPTY })), self.tys.subst(v, args)));
+                            eqs.push((self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: bad }, args: self.tys.mk_list(&pa), regions: crate::types::RegionArgsId::EMPTY })), self.tys.subst(v, args)));
                         }
                     }
                 }

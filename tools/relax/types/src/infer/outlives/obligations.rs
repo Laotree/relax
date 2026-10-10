@@ -50,7 +50,7 @@ impl<'a> TypeOutlives<'a> {
         let env_bounds = self.verify_bound.approx_declared_bounds_from_env(ty);
         let has_infer_regions = tcx.tys.flags(ty).contains(crate::types::TypeFlags::HAS_RE_INFER);
         if env_bounds.is_empty() && trait_bounds.is_empty() && (has_infer_regions || matches!(alias.kind, AliasTyKind::Opaque { .. })) {
-            for &ty in &alias.args { if !matches!(tcx.tys.kind(ty), TyKind::Const(_)) { self.type_must_outlive(ty, region, category); } }
+            for &ty in tcx.tys.list(alias.args) { if !matches!(tcx.tys.kind(ty), TyKind::Const(_)) { self.type_must_outlive(ty, region, category); } }
             for (i, &r) in tcx.tys.region_args(alias.regions).iter().enumerate() {
                 if !components::alias_region_is_bivariant(tcx, self.verify_bound.prog, alias, i) { self.delegate.push_sub_region_constraint(region, r, category); }
             }

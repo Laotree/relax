@@ -145,7 +145,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
     let (rs, r, bound) = match tcx.tys.kind(t) {
         TyKind::Ref(_, _, r) => (RegionArgsId::EMPTY, *r, 0),
         TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Alias(_, AliasTy { regions: rs, .. }) => (*rs, RegionId::ERASED, 0),
-        TyKind::Dyn(_, _, _, rs, r, bound, _) => (*rs, *r, *bound),
+        TyKind::Dyn(_, _, _, rs, r, bound, _) => (*rs, *r, *bound as u32),
         TyKind::FnPtr(_, _, _, n) => (RegionArgsId::EMPTY, RegionId::ERASED, *n),
         _ => (RegionArgsId::EMPTY, RegionId::ERASED, 0),
     };
@@ -177,7 +177,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
         TyKind::Never => h.u8(6),
         TyKind::Tuple(v) => {
             h.u8(7);
-            list(v, h);
+            list(tcx.tys.list(*v), h);
         }
         TyKind::Array(e, n) => {
             h.u8(8);
@@ -201,11 +201,11 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
         TyKind::Adt(d, args, _) => {
             h.u8(12);
             def_ident(prog, *d, h);
-            list(args, h);
+            list(tcx.tys.list(*args), h);
         }
         TyKind::FnPtr(ps, r, c, _) => {
             h.u8(13);
-            list(ps, h);
+            list(tcx.tys.list(*ps), h);
             type_into(prog, tcx, *r, h, depth + 1);
             h.u8(c.safety as u8);
             h.u8(c.abi as u8);
@@ -214,7 +214,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
         TyKind::FnDef(d, args, _) => {
             h.u8(14);
             def_ident(prog, *d, h);
-            list(args, h);
+            list(tcx.tys.list(*args), h);
         }
         TyKind::Param(i) => {
             h.u8(15);
@@ -246,20 +246,20 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
                 AliasTyKind::Opaque { def_id } => { h.u8(2); def_ident(prog, def_id, h); }
                 AliasTyKind::Free { def_id } => { h.u8(3); def_ident(prog, def_id, h); }
             }
-            list(&alias.args, h);
+            list(tcx.tys.list(alias.args), h);
         }
         TyKind::Dyn(d, args, binds, _, _, _, autos) => {
             h.u8(19);
             def_ident(prog, *d, h);
-            list(args, h);
-            h.u32(binds.len() as u32);
-            for (bd, bt, n) in binds {
+            list(tcx.tys.list(*args), h);
+            h.u32(tcx.tys.list(*binds).len() as u32);
+            for (bd, bt, n) in tcx.tys.list(*binds) {
                 if *n != 0 { h.u8(0xfe); h.u32(*n); }
                 def_ident(prog, *bd, h);
                 type_into(prog, tcx, *bt, h, depth + 1);
             }
             let mut auto_ids = Vec::new();
-            for ad in autos { let mut id = Sip128::new(); def_ident(prog, *ad, &mut id); auto_ids.push(id.finish128()); }
+            for ad in tcx.tys.list(*autos) { let mut id = Sip128::new(); def_ident(prog, *ad, &mut id); auto_ids.push(id.finish128()); }
             auto_ids.sort();
             h.u32(auto_ids.len() as u32);
             for id in auto_ids { h.u128(id); }

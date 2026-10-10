@@ -187,7 +187,7 @@ fn shape(u: &mut Unit, a: &Audit, t: TyId) -> String {
                 format!("vm-{}{}:{}", if k == DefKind::Enum { "enum" } else { "struct" }, if copy { "" } else { "(non-Copy)" }, n)
             } else if u.tcx.lang_items.get(LangItem::Option) == Some(d) || u.tcx.adts.get(&d).is_some_and(|adt| adt.is_box()) || matches!(n.as_str(), "Result" | "Vec" | "Rc" | "Arc") {
                 let n = if u.tcx.lang_items.get(LangItem::Option) == Some(d) { "Option" } else if u.tcx.adts.get(&d).is_some_and(|adt| adt.is_box()) { "Box" } else { &n };
-                let inner: Vec<String> = args.iter().map(|x| shape(u, a, *x)).collect();
+                let inner: Vec<String> = u.tcx.tys.list(args).to_vec().into_iter().map(|x| shape(u, a, x)).collect();
                 format!("{}<{}>", n, inner.join(","))
             } else {
                 n

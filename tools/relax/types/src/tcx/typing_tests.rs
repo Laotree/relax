@@ -65,7 +65,7 @@ fn projection_fields_do_not_cross_environments() {
     let (prog, tcx) = program(b"#![no_std]\ntrait Tr { type A; } struct S<T: Tr> { value: T::A }");
     let assoc = named(&prog, "A");
     let param = tcx.tys.intern(TyKind::Param(0));
-    let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: assoc }, args: vec![param], regions: crate::types::RegionArgsId::EMPTY }));
+    let projection = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: assoc }, args: tcx.tys.mk_list(&[param]), regions: crate::types::RegionArgsId::EMPTY }));
     let tr = named(&prog, "Tr");
     // the environment proves the projection's trait goal, as an elaborated one does
     let env = |self_ty: TyId, alias: TyId, value: TyId| ParamEnv { clauses: vec![
@@ -83,7 +83,7 @@ fn projection_fields_do_not_cross_environments() {
         assert_eq!(tcx.field_ty(&prog, b.typing_env, named(&prog, "S"), 0, 0, &[param]), tcx.tys.char_);
     }
     // Concrete projections are memoized too; a predicate environment remains an input.
-    let concrete = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: assoc }, args: vec![tcx.tys.bool_], regions: crate::types::RegionArgsId::EMPTY }));
+    let concrete = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: assoc }, args: tcx.tys.mk_list(&[tcx.tys.bool_]), regions: crate::types::RegionArgsId::EMPTY }));
     let aenv = env(tcx.tys.bool_, concrete, tcx.tys.bool_);
     let benv = env(tcx.tys.bool_, concrete, tcx.tys.char_);
     let a_state = crate::tcx::EvalState::new();
@@ -101,7 +101,7 @@ fn selection_cycles_leave_other_roots_usable() {
     let (prog, tcx) = program(b"#![no_std]\ntrait Tr {} trait Good {} struct S; impl<T: Tr> Tr for T {} impl Good for S {}");
     let tr = named(&prog, "Tr");
     let good = named(&prog, "Good");
-    let s = tcx.tys.intern(TyKind::Adt(named(&prog, "S"), Vec::new(), crate::types::RegionArgsId::EMPTY));
+    let s = tcx.tys.intern(TyKind::Adt(named(&prog, "S"), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
     let a = TypingEnv::fully_monomorphized(&prog);
     let b = TypingEnv { limit: Default::default(), param_env: Default::default(), mode: TypingMode::Typeck { defining_opaque_types_and_generators: Default::default() } };
     // a cycle through an ordinary impl is ambiguous (rustc_next_trait_solver
@@ -230,7 +230,7 @@ fn native_definition_aliases_keep_owner_and_arguments() {
     let TyKind::Alias(_, opaque) = tcx.tys.kind(tcx.fn_sig(&prog, f).unwrap().ret) else { panic!() };
     assert_eq!(prog.def(opaque.kind.def_id()).kind, DefKind::OpaqueTy);
     assert_eq!(prog.opaque_owner(opaque.kind.def_id()), f);
-    assert!(matches!(tcx.tys.kind(opaque.args[0]), TyKind::Const(_)));
+    assert!(matches!(tcx.tys.kind(tcx.tys.list(opaque.args)[0]), TyKind::Const(_)));
     let g = named(&prog, "g");
     let TyKind::Alias(_, future) = tcx.tys.kind(tcx.fn_sig(&prog, g).unwrap().ret) else { panic!() };
     assert_eq!(prog.opaque_owner(future.kind.def_id()), g);
@@ -301,7 +301,7 @@ fn round29_borrowck_opaque_list_and_rigid_skeleton() {
     let tx = crate::borrowck::tyx::Tx::new(&prog, &tcx, TypingEnv { limit: Default::default(), param_env: Default::default(), mode }, &state);
     let rty = crate::borrowck::rty::Rty::new(&tx);
     let arg = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u8_, tcx.tys.intern_region(crate::types::RegionKind::ReStatic)));
-    let alias = AliasTy { kind: AliasTyKind::Opaque { def_id: opaque }, args: vec![arg], regions: crate::types::RegionArgsId::EMPTY };
+    let alias = AliasTy { kind: AliasTyKind::Opaque { def_id: opaque }, args: tcx.tys.mk_list(&[arg]), regions: crate::types::RegionArgsId::EMPTY };
     let rigid = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, alias.clone()));
     let nonrigid = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, alias));
     assert_eq!(rty.skel(rigid), rty.skel(nonrigid));

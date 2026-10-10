@@ -1127,7 +1127,7 @@ impl<'a> Build<'a> {
                 let tsym = tx.prog.syms.get("Target").unwrap_or(u32::MAX);
                 return match tx.tcx.trait_assoc(tx.prog, td, tsym) {
                     Some(ad) => {
-                        let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![t], regions: crate::types::RegionArgsId::EMPTY }));
+                        let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: tx.tcx.tys.mk_list(&[t]), regions: crate::types::RegionArgsId::EMPTY }));
                         tx.normalize(proj)
                     }
                     None => t,
@@ -1158,7 +1158,7 @@ impl<'a> Build<'a> {
             let tsym = tx.prog.syms.get("Target").unwrap_or(u32::MAX);
             match tx.tcx.trait_assoc(tx.prog, td, tsym) {
                 Some(ad) => {
-                    let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![bt], regions: crate::types::RegionArgsId::EMPTY }));
+                    let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: tx.tcx.tys.mk_list(&[bt]), regions: crate::types::RegionArgsId::EMPTY }));
                     tx.normalize(proj)
                 }
                 None => tx.tcx.tys.error,
@@ -2126,7 +2126,7 @@ impl<'a> Build<'a> {
             ExprKind::Try(x) => self.try_expr(dest, e, *x),
             ExprKind::Tuple(v) => {
                 let tys = match self.tx.kind(t) {
-                    TyKind::Tuple(x) => x,
+                    TyKind::Tuple(x) => self.tx.tcx.tys.list(x).to_vec(),
                     _ => Vec::new(),
                 };
                 let mut ops = Vec::new();
@@ -2506,7 +2506,7 @@ impl<'a> Build<'a> {
             if let TyKind::FnDef(d0, g0, _) = self.tx.kind(pt) {
                 if selection.is_none() && !matches!(self.tx.prog.def(d0).kind, DefKind::Variant | DefKind::Struct) {
                     // `(&path)(x)`, a promoted fn item reference: the callee is the value behind
-                    self.fn_def_call(dest, f, args, d0, g0, Some(pl), diverges);
+                    self.fn_def_call(dest, f, args, d0, self.tx.tcx.tys.list(g0).to_vec(), Some(pl), diverges);
                     return;
                 }
             }
@@ -2549,7 +2549,7 @@ impl<'a> Build<'a> {
             TyKind::FnDef(d, gargs, _) if matches!(self.tx.prog.def(d).kind, DefKind::Variant | DefKind::Struct) => {
                 let k = self.tx.prog.def(d).kind;
                 let ps: Vec<TyId> = match self.tx.tcx.ctor_sigs.get(&d) {
-                    Some(sg) => sg.params.iter().map(|p| self.tx.tcx.tys.subst(*p, &gargs)).collect(),
+                    Some(sg) => sg.params.iter().map(|p| self.tx.tcx.tys.subst(*p, self.tx.tcx.tys.list(gargs))).collect(),
                     None => Vec::new(),
                 };
                 let mut ops = Vec::new();
@@ -2589,14 +2589,14 @@ impl<'a> Build<'a> {
                 // callee's generic arguments' regions
                 let direct = matches!(ast.expr(strip_paren(ast, f)).kind, ExprKind::Path(_)) && matches!(self.b.res.get(&strip_paren(ast, f).0), Some(Res::Def(_)));
                 let cp = if direct { None } else { Some(self.as_place(f, false)) };
-                self.fn_def_call(dest, f, args, d0, gargs0, cp, diverges);
+                self.fn_def_call(dest, f, args, d0, self.tx.tcx.tys.list(gargs0).to_vec(), cp, diverges);
             }
             TyKind::FnPtr(ps, _, _, _) => {
                 let fop = self.as_operand(f);
                 let mut ops = vec![fop];
                 let saved = std::mem::replace(&mut self.args_two_phase, true);
                 for (i, a) in args.iter().enumerate() {
-                    let pt = ps.get(i).copied().unwrap_or(self.ty(*a));
+                    let pt = self.tx.tcx.tys.list(ps).get(i).copied().unwrap_or(self.ty(*a));
                     ops.push(self.as_operand_coerced(*a, pt, true));
                 }
                 self.args_two_phase = saved;
@@ -2655,19 +2655,19 @@ impl<'a> Build<'a> {
     pub(super) fn callable_params(&self, t: TyId) -> Vec<TyId> {
         match self.tx.kind(t) {
             TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => match self.tx.kind(sig) {
-                TyKind::FnPtr(ps, _, _, _) => ps,
+                TyKind::FnPtr(ps, _, _, _) => self.tx.tcx.tys.list(ps).to_vec(),
                 _ => Vec::new(),
             },
-            TyKind::Dyn(_, targs, _, _, _, _, _) => match targs.first().map(|x| self.tx.kind(*x)) {
-                Some(TyKind::Tuple(ps)) => ps,
+            TyKind::Dyn(_, targs, _, _, _, _, _) => match self.tx.tcx.tys.list(targs).first().map(|x| self.tx.kind(*x)) {
+                Some(TyKind::Tuple(ps)) => self.tx.tcx.tys.list(ps).to_vec(),
                 _ => Vec::new(),
             },
-            TyKind::FnPtr(ps, _, _, _) => ps,
+            TyKind::FnPtr(ps, _, _, _) => self.tx.tcx.tys.list(ps).to_vec(),
             // a generic param: its Fn* bound's signature
             TyKind::Param(k) => {
                 let sig = self.tx.tcx.callable_signatures(self.tx.prog, self.def).iter().find(|b| b.param == k).map(|b| b.signature);
                 match sig.map(|sg| self.tx.kind(sg)) {
-                    Some(TyKind::FnPtr(ps, _, _, _)) => ps,
+                    Some(TyKind::FnPtr(ps, _, _, _)) => self.tx.tcx.tys.list(ps).to_vec(),
                     _ => Vec::new(),
                 }
             }
@@ -3097,7 +3097,7 @@ impl<'a> Build<'a> {
             ExprKind::Underscore => {}
             ExprKind::Tuple(v) => {
                 let tys = match self.tx.kind(t) {
-                    TyKind::Tuple(x) => x,
+                    TyKind::Tuple(x) => self.tx.tcx.tys.list(x).to_vec(),
                     _ => Vec::new(),
                 };
                 let rest = ast.list(*v).iter().position(|x| matches!(ast.expr(*x).kind, ExprKind::Range(None, None, false)));

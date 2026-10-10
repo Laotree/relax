@@ -230,7 +230,7 @@ impl<'a> Tx<'a> {
 
     pub fn box_inner(&self, t: TyId) -> Option<TyId> {
         match self.tcx.tys.kind(t) {
-            TyKind::Adt(d, a, _) if Some(*d) == self.box_def && !a.is_empty() => Some(a[0]),
+            TyKind::Adt(d, a, _) if Some(*d) == self.box_def && !a.is_empty() => Some(self.tcx.tys.list(*a)[0]),
             _ => None,
         }
     }
@@ -250,11 +250,11 @@ impl<'a> Tx<'a> {
     /// Field `fi` of variant `vi` of an ADT (or tuple element `fi`), substituted.
     pub fn field_ty(&self, t: TyId, vi: u32, fi: u32) -> Option<TyId> {
         match self.tcx.tys.kind(t) {
-            TyKind::Tuple(v) => v.get(fi as usize).copied(),
+            TyKind::Tuple(v) => self.tcx.tys.list(*v).get(fi as usize).copied(),
             TyKind::Adt(d, args, _) => {
                 let adt = self.tcx.adts.get(d)?;
                 adt.variants.get(vi as usize)?.fields.get(fi as usize)?;
-                Some(self.tcx.field_ty(self.prog, self.cx.typing_env, *d, vi, fi, args))
+                Some(self.tcx.field_ty(self.prog, self.cx.typing_env, *d, vi, fi, self.tcx.tys.list(*args)))
             }
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.field_ty(*up, 0, fi),
             _ => None,
@@ -284,12 +284,12 @@ impl<'a> Tx<'a> {
             return true;
         }
         match self.tcx.tys.kind(t) {
-            TyKind::Adt(d, args, _) if self.is_std_def(*d) => args.iter().all(|a| self.owning_d(*a, depth + 1)),
+            TyKind::Adt(d, args, _) if self.is_std_def(*d) => self.tcx.tys.list(*args).iter().all(|a| self.owning_d(*a, depth + 1)),
             TyKind::Adt(d, _, _) => {
                 let nv = self.tcx.adts.get(d).map_or(0, |a| a.variants.len());
                 (0..nv as u32).all(|vi| (0..self.n_fields(t, vi) as u32).all(|fi| self.field_ty(t, vi, fi).map_or(true, |ft| self.owning_d(ft, depth + 1))))
             }
-            TyKind::Tuple(v) => v.iter().all(|a| self.owning_d(*a, depth + 1)),
+            TyKind::Tuple(v) => self.tcx.tys.list(*v).iter().all(|a| self.owning_d(*a, depth + 1)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.owning_d(*e, depth + 1),
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.owning_d(*up, depth + 1),
             _ => false,
@@ -307,7 +307,7 @@ impl<'a> Tx<'a> {
         self.rawptr_memo.borrow_mut().insert(t, false);
         let r = match self.tcx.tys.kind(t) {
             TyKind::Ptr(..) => true,
-            TyKind::Tuple(v) => v.iter().any(|x| self.holds_raw_ptr_d(*x, depth + 1)),
+            TyKind::Tuple(v) => self.tcx.tys.list(*v).iter().any(|x| self.holds_raw_ptr_d(*x, depth + 1)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.holds_raw_ptr_d(*e, depth + 1),
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.holds_raw_ptr_d(*up, depth + 1),
             TyKind::Adt(d, _, _) => {
@@ -326,7 +326,7 @@ impl<'a> Tx<'a> {
 
     pub fn n_fields(&self, t: TyId, vi: u32) -> usize {
         match self.tcx.tys.kind(t) {
-            TyKind::Tuple(v) => v.len(),
+            TyKind::Tuple(v) => self.tcx.tys.list(*v).len(),
             TyKind::Adt(d, _, _) => self.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).map_or(0, |v| v.fields.len()),
             _ => 0,
         }
@@ -450,7 +450,7 @@ impl<'a> Tx<'a> {
     pub fn is_unsized(&self, t: TyId) -> bool {
         match self.kind(t) {
             TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
-            TyKind::Tuple(v) => v.last().map_or(false, |x| self.is_unsized(*x)),
+            TyKind::Tuple(v) => self.tcx.tys.list(v).last().map_or(false, |x| self.is_unsized(*x)),
             TyKind::Adt(d, _, _) => match self.tcx.adts.get(&d) {
                 Some(a) if !a.is_enum && !a.is_union => {
                     let n = self.n_fields(t, 0);
@@ -514,6 +514,6 @@ pub fn in_signature_binder(tys: &crate::types::Types, ty: TyId, f: impl FnOnce(T
     }, 0);
     // Escaping bound types/consts or regions of an outer binder: not a signature's own binder.
     if outer.get() || bound.get() == 0 { return None; }
-    let wrapped = tys.intern(TyKind::FnPtr(vec![ty], tys.unit, crate::types::FnHeader::RUST, bound.get()));
-    match tys.kind(f(wrapped)?) { TyKind::FnPtr(ps, ..) => ps.first().copied(), _ => None }
+    let wrapped = tys.intern(TyKind::FnPtr(tys.mk_list(&[ty]), tys.unit, crate::types::FnHeader::RUST, bound.get()));
+    match tys.kind(f(wrapped)?) { TyKind::FnPtr(ps, ..) => tys.list(*ps).first().copied(), _ => None }
 }

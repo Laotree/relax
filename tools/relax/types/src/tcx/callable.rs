@@ -38,7 +38,7 @@ impl Tcx {
                 let future = self.lang_items.get(LangItem::CallOnceFuture)?;
                 let TyKind::FnPtr(ps, _, header, n) = self.tys.kind(bound.signature) else { return None; };
                 let args = vec![self.tys.intern(TyKind::Param(bound.param)), self.tys.intern(TyKind::Tuple(ps.clone()))];
-                let ret = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: future }, args, regions: RegionArgsId::EMPTY }));
+                let ret = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: future }, args: self.tys.mk_list(&args), regions: RegionArgsId::EMPTY }));
                 bound.signature = self.tys.intern(TyKind::FnPtr(ps.clone(), ret, *header, *n));
             }
             Some(bound)

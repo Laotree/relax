@@ -96,10 +96,10 @@ impl<'a, 'tcx> Provider<'a, 'tcx> {
                     let adt = self.tx.tcx.adts.get(&d).ok_or(Blocked("ADT definition is unavailable for qualification"))?;
                     if q == Qualif::NeedsDrop && adt.is_union { return Ok(false); }
                     for variant in &adt.variants {
-                        for field in &variant.fields { children.push(self.tx.tcx.tys.subst(field.ty, &args)); }
+                        for field in &variant.fields { children.push(self.tx.tcx.tys.subst(field.ty, self.tx.tcx.tys.list(args))); }
                     }
                 }
-                TyKind::Tuple(fields) => children = fields,
+                TyKind::Tuple(fields) => children = self.tx.tcx.tys.list(fields).to_vec(),
                 TyKind::Array(t, n) => {
                     // Freeze applies even to [T; 0]; needs_drop does not.
                     let zero = n.try_to_target_usize(&self.tx.tcx.tys) == Some(0);

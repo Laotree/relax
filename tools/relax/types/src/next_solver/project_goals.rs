@@ -166,9 +166,9 @@ impl crate::infer::InferCtxt<'_> {
             let next = match self.tcx.tys.kind(ty) {
                 TyKind::Adt(def, args, regions) if prog.def(*def).kind == crate::program::DefKind::Struct => {
                     let Some(field) = self.tcx.adts[def].variants[0].fields.last() else { break; };
-                    self.tcx.instantiate_ty(prog, *def, &self.tcx.complete_args(prog, *def, args, *regions), field.ty)
+                    self.tcx.instantiate_ty(prog, *def, &self.tcx.complete_args(prog, *def, self.tcx.tys.list(*args), *regions), field.ty)
                 }
-                TyKind::Tuple(types) if !types.is_empty() => *types.last().unwrap(),
+                TyKind::Tuple(types) if !types.is_empty() => *self.tcx.tys.list(*types).last().unwrap(),
                 _ => break,
             };
             ty = ocx.normalize_ty(&env, next);

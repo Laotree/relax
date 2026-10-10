@@ -92,8 +92,8 @@ impl OrphanChecker<'_> {
             TyKind::Adt(def,args,_)=>{
                 if self.def_id_is_local(*def) { ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)) }
                 else if fundamental(self.prog,*def) {
-                    if tcx.lang_items.get(crate::lang_items::LangItem::OwnedBox)==Some(*def) { self.visit_ty(args[0]) }
-                    else { for &t in args { if !matches!(tcx.tys.kind(t),TyKind::Const(_)) { self.visit_ty(t)?; } } ControlFlow::Continue(()) }
+                    if tcx.lang_items.get(crate::lang_items::LangItem::OwnedBox)==Some(*def) { self.visit_ty(tcx.tys.list(*args)[0]) }
+                    else { for &t in tcx.tys.list(*args) { if !matches!(tcx.tys.kind(t),TyKind::Const(_)) { self.visit_ty(t)?; } } ControlFlow::Continue(()) }
                 } else { self.found_non_local_ty(ty) }
             }
             TyKind::Dyn(principal,..) if *principal!=NO_DEF && self.def_id_is_local(*principal)=>ControlFlow::Break(OrphanCheckEarlyExit::LocalTy(ty)),

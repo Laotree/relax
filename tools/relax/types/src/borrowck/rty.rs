@@ -254,7 +254,7 @@ impl<'a> Rty<'a> {
             TyKind::Ptr(m, inner) => self.pointee_skel(inner, ctx, m, out, depth),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.skel_into(e, ctx, out, depth + 1),
             TyKind::Tuple(v) => {
-                for x in v {
+                for x in self.tx.tcx.tys.list(v).iter().copied() {
                     self.skel_into(x, ctx, out, depth + 1);
                 }
             }
@@ -263,17 +263,17 @@ impl<'a> Rty<'a> {
                 for v in &info.var_lt {
                     out.push(xform(ctx, *v));
                 }
-                for (i, a) in args.iter().enumerate() {
+                for (i, a) in self.tx.tcx.tys.list(args).iter().enumerate() {
                     let v = info.var_ty.get(i).copied().unwrap_or(V::Inv);
                     self.skel_into(*a, xform(ctx, v), out, depth + 1);
                 }
             }
             TyKind::Dyn(_, args, binds, _, _, _, _) => {
                 out.push(xform(ctx, V::Co));
-                for a in args {
+                for a in self.tx.tcx.tys.list(args).iter().copied() {
                     self.skel_into(a, xform(ctx, V::Inv), out, depth + 1);
                 }
-                for (_, b, _) in binds {
+                for (_, b, _) in self.tx.tcx.tys.list(binds).iter().copied() {
                     self.skel_into(b, xform(ctx, V::Inv), out, depth + 1);
                 }
             }
@@ -295,7 +295,7 @@ impl<'a> Rty<'a> {
                 }
             }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args, regions: _ }) => {
-                for a in args {
+                for a in self.tx.tcx.tys.list(args).iter().copied() {
                     self.skel_into(a, xform(ctx, V::Inv), out, depth + 1);
                 }
             }
@@ -308,7 +308,7 @@ impl<'a> Rty<'a> {
             }
             // a fn item: the regions of its generic arguments (SigTmpl::layout), invariant
             TyKind::FnDef(d, args, _) if matches!(self.tx.prog.def(d).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) => {
-                let n = self.fn_value_slots(d, &args);
+                let n = self.fn_value_slots(d, self.tx.tcx.tys.list(args));
                 for _ in 0..n {
                     out.push(xform(ctx, V::Inv));
                 }
@@ -331,10 +331,10 @@ impl<'a> Rty<'a> {
     fn pointee_skel(&self, inner: TyId, ctx: V, m: bool, out: &mut Vec<V>, depth: u32) {
         if let TyKind::Dyn(_, args, binds, _, _, _, _) = self.tx.kind(inner) {
             out.push(xform(ctx, V::Co));
-            for a in args {
+            for a in self.tx.tcx.tys.list(args).iter().copied() {
                 self.skel_into(a, xform(ctx, V::Inv), out, depth + 1);
             }
-            for (_, b, _) in binds {
+            for (_, b, _) in self.tx.tcx.tys.list(binds).iter().copied() {
                 self.skel_into(b, xform(ctx, V::Inv), out, depth + 1);
             }
             return;
@@ -363,7 +363,7 @@ impl<'a> Rty<'a> {
             TyKind::Dyn(..) => out.push(base),
             TyKind::Adt(d, args, _) => {
                 let mut off = base + self.adt_info(d).var_lt.len();
-                for a in args {
+                for a in self.tx.tcx.tys.list(args).iter().copied() {
                     self.dyn_obj_slots(a, off, out, depth + 1);
                     off += self.n_slots(a);
                 }
@@ -437,7 +437,7 @@ impl<'a> Rty<'a> {
         match self.tx.kind(t) {
             TyKind::Tuple(v) => {
                 let mut off = 0;
-                for x in v.iter().take(fi as usize) {
+                for x in self.tx.tcx.tys.list(v).iter().take(fi as usize) {
                     off += self.n_slots(*x);
                 }
                 (0..n).map(|i| SR::Sym((off + i) as u32)).collect()
@@ -474,7 +474,7 @@ impl<'a> Rty<'a> {
                             li += 1;
                         }
                         _ => {
-                            let a = args.get(ai).copied();
+                            let a = self.tx.tcx.tys.list(args).get(ai).copied();
                             ai += 1;
                             let k = a.map_or(0, |a| self.n_slots(a));
                             tparams.push((self.text(gfile, p.name).as_bytes().to_vec(), TP::Slots((0..k).map(|i| SR::Sym((off + i) as u32)).collect())));
@@ -614,8 +614,8 @@ impl<'a> Rty<'a> {
             }
             (AstTy::Ptr(_, x), TyKind::Ptr(_, inner)) => self.inst(env, x, inner, SR::Static, out, depth + 1),
             (AstTy::Slice(x), TyKind::Slice(e)) | (AstTy::Array(x, _), TyKind::Array(e, _)) => self.inst(env, x, e, obj, out, depth + 1),
-            (AstTy::Tuple(v), TyKind::Tuple(es)) if v.len() == es.len() => {
-                for (x, e) in ast_.list(v).iter().zip(es.iter()) {
+            (AstTy::Tuple(v), TyKind::Tuple(es)) if v.len() == self.tx.tcx.tys.list(es).len() => {
+                for (x, e) in ast_.list(v).iter().zip(self.tx.tcx.tys.list(es).iter()) {
                     self.inst(env, *x, *e, obj, out, depth + 1);
                 }
             }
@@ -631,10 +631,10 @@ impl<'a> Rty<'a> {
                 let bound = bound.or_else(|| if self.trait_static_bound(td) { Some(SR::Static) } else { None });
                 let obj = if env.expr_mode && obj == SR::Static { self.new_sym(env, "'_".to_string(), SK_FRESH) } else { obj };
                 out.push(bound.unwrap_or(obj));
-                for a in args {
+                for a in self.tx.tcx.tys.list(args).iter().copied() {
                     self.fill_fresh(env, a, out);
                 }
-                for (_, b, _) in binds {
+                for (_, b, _) in self.tx.tcx.tys.list(binds).iter().copied() {
                     self.fill_fresh(env, b, out);
                 }
             }
@@ -813,7 +813,7 @@ impl<'a> Rty<'a> {
                     out.push(r);
                 }
                 let mut arg_ranges = Vec::new();
-                for (i, a) in args.iter().enumerate() {
+                for (i, a) in self.tx.tcx.tys.list(args).iter().enumerate() {
                     let s0 = out.len();
                     match ty_args.get(i).copied().flatten() {
                         Some(x) => {
@@ -849,10 +849,10 @@ impl<'a> Rty<'a> {
             (Some((_, DefKind::Trait)), TyKind::Dyn(td, args, binds, _, _, _, _)) => {
                 // bare trait object (2015)
                 out.push(if self.trait_static_bound(td) { SR::Static } else { obj });
-                for a in args {
+                for a in self.tx.tcx.tys.list(args).iter().copied() {
                     self.fill_fresh(env, a, out);
                 }
-                for (_, b, _) in binds {
+                for (_, b, _) in self.tx.tcx.tys.list(binds).iter().copied() {
                     self.fill_fresh(env, b, out);
                 }
             }
@@ -1234,7 +1234,7 @@ impl<'a> Rty<'a> {
             (AstTy::Paren(x), _) => self.alias_param_ty(file, *x, t, name, depth + 1),
             (AstTy::Path(p), _) if p.qself.is_none() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() && self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[0].name).as_bytes() == name => Some(t),
             (AstTy::Ref(_, _, x), TyKind::Ref(_, i, _)) | (AstTy::Ptr(_, x), TyKind::Ptr(_, i)) | (AstTy::Slice(x), TyKind::Slice(i)) | (AstTy::Array(x, _), TyKind::Array(i, _)) => self.alias_param_ty(file, *x, i, name, depth + 1),
-            (AstTy::Tuple(v), TyKind::Tuple(ts)) if v.len() == ts.len() => ast_.list(*v).iter().zip(ts.iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1)),
+            (AstTy::Tuple(v), TyKind::Tuple(ts)) if v.len() == self.tx.tcx.tys.list(ts).len() => ast_.list(*v).iter().zip(self.tx.tcx.tys.list(ts).iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1)),
             (AstTy::Path(p), TyKind::Adt(_, args, _)) => {
                 let tys: Vec<ast::TyId> = match ast_.segs(p.segs).last().and_then(|s| ast_.gargs(s.args)) {
                     Some(GenericArgs::Angle(v)) => ast_.list(*v).iter().filter_map(|g| match g {
@@ -1243,10 +1243,10 @@ impl<'a> Rty<'a> {
                     }).collect(),
                     _ => Vec::new(),
                 };
-                if tys.len() != args.len() {
+                if tys.len() != self.tx.tcx.tys.list(args).len() {
                     return None;
                 }
-                tys.iter().zip(args.iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1))
+                tys.iter().zip(self.tx.tcx.tys.list(args).iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1))
             }
             _ => None,
         }
@@ -1441,7 +1441,7 @@ impl<'a> Rty<'a> {
                             out.push(base + i);
                         }
                         let mut off = base + info.var_lt.len();
-                        for a in args {
+                        for a in self.tx.tcx.tys.list(args).iter().copied() {
                             self.drop_slots(a, out, off, depth + 1);
                             off += self.n_slots(a);
                         }
@@ -1473,7 +1473,7 @@ impl<'a> Rty<'a> {
             }
             TyKind::Tuple(v) => {
                 let mut off = base;
-                for x in v {
+                for x in self.tx.tcx.tys.list(v).iter().copied() {
                     self.drop_slots(x, out, off, depth + 1);
                     off += self.n_slots(x);
                 }

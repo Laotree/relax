@@ -1277,7 +1277,7 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
     }
     let t = {
         let args: Vec<TyId> = (0..old.n_generics).map(|_| u.tcx.tys.unit).collect();
-        u.tcx.tys.intern(crate::types::TyKind::Adt(d, args, crate::types::RegionArgsId::EMPTY))
+        u.tcx.tys.intern(crate::types::TyKind::Adt(d, u.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
     };
     if !u.lay.live_editable(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, d, old, t) {
         return Err(format!("struct `{}` keeps its first layout in a live session only when it is in the app scope, has named fields, Rust's repr and no Copy impl -- restart the app", name));
@@ -1463,9 +1463,9 @@ fn ty_in_crates(u: &Unit, t: TyId, crates: &[u32], depth: u32) -> bool {
         return true;
     }
     match u.tcx.tys.kind(t).clone() {
-        Adt(d, args, _) => crates.contains(&u.prog.def(d).krate) || args.iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
+        Adt(d, args, _) => crates.contains(&u.prog.def(d).krate) || u.tcx.tys.list(args).iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
         Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => ty_in_crates(u, x, crates, depth + 1),
-        Tuple(v) => v.iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
+        Tuple(v) => u.tcx.tys.list(v).iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
         Closure(..) | FnDef(..) | Dyn(..) | Alias(..) => true,
         _ => false,
     }
@@ -1478,9 +1478,9 @@ fn ty_mentions(u: &Unit, t: TyId, ds: &[DefId], depth: u32) -> bool {
         return false;
     }
     match u.tcx.tys.kind(t).clone() {
-        Adt(d, args, _) => ds.contains(&d) || args.iter().any(|a| ty_mentions(u, *a, ds, depth + 1)),
+        Adt(d, args, _) => ds.contains(&d) || u.tcx.tys.list(args).iter().any(|a| ty_mentions(u, *a, ds, depth + 1)),
         Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => ty_mentions(u, x, ds, depth + 1),
-        Tuple(v) => v.iter().any(|a| ty_mentions(u, *a, ds, depth + 1)),
+        Tuple(v) => u.tcx.tys.list(v).iter().any(|a| ty_mentions(u, *a, ds, depth + 1)),
         _ => false,
     }
 }
@@ -1499,10 +1499,10 @@ fn outside_value_embedding(u: &Unit, edited: DefId) -> Option<TyId> {
         match u.tcx.tys.kind(t) {
             TyKind::Adt(d, args, _) => *d == edited || u.tcx.adts.get(d).is_some_and(|a|
                 a.variants.iter().enumerate().any(|(vi, v)| v.fields.iter().enumerate().any(|(fi, _)| {
-                    let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi as u32, fi as u32, args);
+                    let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi as u32, fi as u32, u.tcx.tys.list(*args));
                     embeds(u, field, edited, seen)
                 }))),
-            TyKind::Tuple(ts) => ts.iter().any(|t| embeds(u, *t, edited, seen)),
+            TyKind::Tuple(ts) => u.tcx.tys.list(*ts).iter().any(|t| embeds(u, *t, edited, seen)),
             TyKind::Array(t, n) => n.try_to_target_usize(&u.tcx.tys) != Some(0) && embeds(u, *t, edited, seen),
             _ => false,
         }
@@ -1523,16 +1523,16 @@ fn outside_value_embedding(u: &Unit, edited: DefId) -> Option<TyId> {
         if depth > 16 { return true; }
         match u.tcx.tys.kind(t) {
             Adt(d, args, _) => h.adts.contains(d) || (h.projecting.contains(d) && ty_in_crates(u, t, &h.seeing, 0))
-                || args.iter().any(|a| may_hold(u, *a, h, depth + 1)),
+                || u.tcx.tys.list(*args).iter().any(|a| may_hold(u, *a, h, depth + 1)),
             // (as embeds(): by value through arrays and tuples only)
             Array(x, _) => may_hold(u, *x, h, depth + 1),
-            Tuple(v) => v.iter().any(|a| may_hold(u, *a, h, depth + 1)),
+            Tuple(v) => u.tcx.tys.list(*v).iter().any(|a| may_hold(u, *a, h, depth + 1)),
             // an alias normalizes through an impl of its trait's crate or of a crate of a type
             // in its arguments (orphan rules), to a type made of those crates' items and parts
             // of its arguments: a holder only if a seeing crate is among them or an argument
             // may hold one
             Alias(_, a) => h.seeing.contains(&u.prog.def(a.kind.def_id()).krate)
-                || a.args.iter().any(|x| ty_in_crates(u, *x, &h.seeing, 0) || may_hold(u, *x, h, depth + 1)),
+                || u.tcx.tys.list(a.args).iter().any(|x| ty_in_crates(u, *x, &h.seeing, 0) || may_hold(u, *x, h, depth + 1)),
             _ => false,
         }
     }
@@ -1541,9 +1541,9 @@ fn outside_value_embedding(u: &Unit, edited: DefId) -> Option<TyId> {
         if depth > 16 { return true; }
         match u.tcx.tys.kind(t) {
             Alias(..) | Closure(..) | Dyn(..) => true,
-            Adt(_, args, _) => args.iter().any(|a| projects(u, *a, depth + 1)),
+            Adt(_, args, _) => u.tcx.tys.list(*args).iter().any(|a| projects(u, *a, depth + 1)),
             Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => projects(u, *x, depth + 1),
-            Tuple(v) => v.iter().any(|a| projects(u, *a, depth + 1)),
+            Tuple(v) => u.tcx.tys.list(*v).iter().any(|a| projects(u, *a, depth + 1)),
             _ => false,
         }
     }
@@ -2458,7 +2458,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for &ed in &layout_defs {
             if let Some(a) = u.tcx.adts.get(&ed) {
                 if a.is_enum && a.n_generics == 0 {
-                    let t = u.tcx.tys.intern(crate::types::TyKind::Adt(ed, Vec::new(), crate::types::RegionArgsId::EMPTY));
+                    let t = u.tcx.tys.intern(crate::types::TyKind::Adt(ed, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
                     if !v.iter().any(|x| x.1 == t) {
                         v.push((ed, t, u.layout_of(t).clone()));
                     }
@@ -4085,7 +4085,7 @@ mod round32_tests {
         if executable { assert!(unit.stats.ctfe_code > 0, "the initializer must have run through JIT"); }
         let runs = unit.stats.ctfe_code;
         assert_eq!(before, if case == "larger" { vec![0, 1] } else { vec![1, 2] });
-        let ty = unit.tcx.tys.intern(crate::types::TyKind::Adt(def, Vec::new(), crate::types::RegionArgsId::EMPTY));
+        let ty = unit.tcx.tys.intern(crate::types::TyKind::Adt(def, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
         let layout = unit.layout_of(ty).clone();
         let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
         assert_eq!(outcome.rung, if accept { Rung::Patch } else { Rung::Restart },

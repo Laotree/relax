@@ -49,7 +49,7 @@ impl TypeFolder for CollectMemberConstraintsVisitor<'_, '_> {
         } {
             // member_constraints.rs:179-189: arguments of an alias with declared variances
             // (opaques, RPITITs) get member constraints unless bivariant (uncaptured).
-            for (i,&t) in args.iter().enumerate() {
+            for (i,&t) in tys.list(*args).iter().enumerate() {
                 if !super::bivariant(&variance,false,i) { self.fold_ty(tys,t,depth); }
             }
             for (i,&r) in tys.region_args(rs).iter().enumerate() {

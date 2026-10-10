@@ -149,8 +149,8 @@ fn branch_frontiers_stop_dead_paths_reset_visited_and_join_live_paths() {
 fn assignment_prefix_and_storage_dead_kill_only_their_loans() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let pair = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
-    let nested = tcx.tys.intern(TyKind::Tuple(vec![pair, t]));
+    let pair = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
+    let nested = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[pair, t])));
     let field = |n, ty| PlaceElem::Field(FieldIdx(n), ty);
     let b = body(&[tcx.tys.unit, nested, reference(&tcx, t), reference(&tcx, t), pair], vec![block(vec![
         borrow(2, 0, place(1, vec![field(0, pair), field(1, t)])),

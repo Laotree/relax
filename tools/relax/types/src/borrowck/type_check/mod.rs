@@ -371,7 +371,7 @@ impl<'a> TypeChecker<'a> {
                 let lhs = self.operand_ty(&ops.0);
                 match op {
                     BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt => tys.bool_,
-                    BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => tys.intern(TyKind::Tuple(vec![lhs, tys.bool_])),
+                    BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow => tys.intern(TyKind::Tuple(tys.mk_list(&[lhs, tys.bool_]))),
                     BinOp::Cmp => self.infcx.rvalue_query_ty(self.body, rv),
                     _ => lhs,
                 }
@@ -379,7 +379,7 @@ impl<'a> TypeChecker<'a> {
             Rvalue::CopyForDeref(place) => self.place_ty(place).ty,
             Rvalue::Aggregate(kind, ops) => match &**kind {
                 AggregateKind::Array(ty) => tys.intern(TyKind::Array(*ty, tys.const_usize(ops.len() as u64))),
-                AggregateKind::Tuple => tys.intern(TyKind::Tuple(ops.iter().map(|op| self.operand_ty(op)).collect())),
+                AggregateKind::Tuple => tys.intern(TyKind::Tuple(tys.mk_list(&ops.iter().map(|op| self.operand_ty(op)).collect::<Vec<_>>()))),
                 _ => self.infcx.rvalue_query_ty(self.body, rv),
             },
             Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::UnaryOp(UnOp::PtrMetadata, _)
@@ -755,8 +755,8 @@ impl<'a> TypeChecker<'a> {
     /// `func_ty.fn_sig(tcx)` for FnDef and FnPtr.
     fn fn_sig(&self, func_ty: TyId) -> Option<PolyFnSig> {
         match self.tcx.tys.kind(func_ty) {
-            TyKind::FnPtr(inputs, output, header, n) => Some(PolyFnSig { sig: FnSig { inputs: inputs.clone(), output: *output, header: *header }, bound_regions: *n }),
-            TyKind::FnDef(def, args, regions) => Some(self.infcx.fn_def_sig(*def, args, *regions)),
+            TyKind::FnPtr(inputs, output, header, n) => Some(PolyFnSig { sig: FnSig { inputs: self.tcx.tys.list(*inputs).to_vec(), output: *output, header: *header }, bound_regions: *n }),
+            TyKind::FnDef(def, args, regions) => Some(self.infcx.fn_def_sig(*def, self.tcx.tys.list(*args), *regions)),
             _ => None,
         }
     }
@@ -1054,8 +1054,8 @@ impl<'a> TypeChecker<'a> {
             // Const generic parameters (`Const::Ty(Param)`) are ascribed TypeOf(param) by
             // nightly; Relax MIR has no const-parameter operand form (they are TyIds).
             if let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() {
-                self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &self.tcx.complete_args(self.prog, def, &args, regions), locations);
-                for t in args {
+                self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions), locations);
+                for t in self.tcx.tys.list(args).iter().copied() {
                     self.infcx.prove_wf(&mut self.constraints, t, locations, ConstraintCategory::Boring);
                 }
             }
@@ -1153,11 +1153,11 @@ fn try_to_target_usize(c: &Const) -> Option<u64> {
     }
 }
 fn mk_fn_ptr(tcx: &Tcx, sig: &FnSig, bound_regions: u32) -> TyId {
-    tcx.tys.intern(TyKind::FnPtr(sig.inputs.clone(), sig.output, sig.header, bound_regions))
+    tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&sig.inputs), sig.output, sig.header, bound_regions))
 }
 fn without_auto_traits(tcx: &Tcx, t: TyId) -> TyId {
     match tcx.tys.kind(t).clone() {
-        TyKind::Dyn(d, args, bindings, rs, r, n, _) => tcx.tys.intern(TyKind::Dyn(d, args.into(), bindings.into(), rs, r, n, crate::types::DynList::new().into())),
+        TyKind::Dyn(d, args, bindings, rs, r, n, _) => tcx.tys.intern(TyKind::Dyn(d, args, bindings, rs, r, n, crate::types::List::EMPTY)),
         _ => t,
     }
 }

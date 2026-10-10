@@ -69,19 +69,19 @@ impl ImpliedBounds {
                 for a in tcx.tys.region_args(*rs).iter() {
                     self.assume(tcx, OutlivesPredicate::Region(*a, r));
                 }
-                for t in ts {
+                for t in tcx.tys.list(*ts) {
                     self.components(tcx, *t, r);
                 }
             }
             TyKind::FnDef(_, ts, _) => {
                 // #70917: shallow lifetime arguments of function items do not count.
-                for t in ts { self.components(tcx,*t,r); }
+                for t in tcx.tys.list(*ts) { self.components(tcx,*t,r); }
             }
             TyKind::FnPtr(ts,out,_,_) => {
-                for t in ts.iter().chain([out]) { self.components(tcx,*t,r); }
+                for t in tcx.tys.list(*ts).iter().chain([out]) { self.components(tcx,*t,r); }
             }
             TyKind::Tuple(ts) => {
-                for t in ts {
+                for t in tcx.tys.list(*ts) {
                     self.components(tcx, *t, r);
                 }
             }
@@ -90,8 +90,8 @@ impl ImpliedBounds {
             }
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) => self.components(tcx, *upvars, r),
             TyKind::Dyn(_, ts, bindings, rs, a, _, _) => {
-                for t in ts { self.components(tcx,*t,r); }
-                for (_,t,_) in bindings { self.components(tcx,*t,r); }
+                for t in tcx.tys.list(*ts) { self.components(tcx,*t,r); }
+                for (_,t,_) in tcx.tys.list(*bindings) { self.components(tcx,*t,r); }
                 for a in tcx.tys.region_args(*rs).iter().chain([a]) {
                     self.assume(tcx,OutlivesPredicate::Region(*a,r));
                 }
@@ -122,49 +122,49 @@ impl ImpliedBounds {
             }
             TyKind::Adt(d, args, rs) => {
                 if let Some(adt) = tcx.adts.get(d) {
-                    self.nominal(tcx,&adt.region_contract,args,&tcx.tys.region_args(adt.region_params),*rs);
+                    self.nominal(tcx,&adt.region_contract,tcx.tys.list(*args),&tcx.tys.region_args(adt.region_params),*rs);
                 }
-                for t in args {
+                for t in tcx.tys.list(*args) {
                     wf_args.push(*t);
                 }
             }
             TyKind::Tuple(ts) => {
-                for t in ts {
+                for t in tcx.tys.list(*ts) {
                     wf_args.push(*t);
                 }
             }
             TyKind::Array(t, _) | TyKind::Slice(t) | TyKind::Ptr(_, t) => wf_args.push(*t),
-            TyKind::FnPtr(ts,out,_,_) => wf_args.extend(ts.iter().chain([out]).copied()),
+            TyKind::FnPtr(ts,out,_,_) => wf_args.extend(tcx.tys.list(*ts).iter().chain([out]).copied()),
             TyKind::FnDef(d,args,rs) => {
                 if let Some(sig) = tcx.fn_item_sig(prog, *d) {
                     let params: Vec<_> = sig.generic_indices.lifetimes.iter()
                         .map(|&i| tcx.tys.intern_region(RegionKind::ReEarlyParam(i))).collect();
-                    self.nominal(tcx,&sig.region_contract,args,&params,*rs);
-                    let OutlivesPredicate::Type(output,_) = instantiate(tcx,OutlivesPredicate::Type(sig.ret,RegionId::ERASED),args,&params,&tcx.tys.region_args(*rs)) else { unreachable!() };
+                    self.nominal(tcx,&sig.region_contract,tcx.tys.list(*args),&params,*rs);
+                    let OutlivesPredicate::Type(output,_) = instantiate(tcx,OutlivesPredicate::Type(sig.ret,RegionId::ERASED),tcx.tys.list(*args),&params,&tcx.tys.region_args(*rs)) else { unreachable!() };
                     wf_args.push(output);
                 }
-                wf_args.extend(args);
+                wf_args.extend(tcx.tys.list(*args));
             }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: rs }) => {
                 if let Some(contract) = tcx.nominal_region_contracts.get(d) {
                     let params: Vec<_> = contract.regions.iter().map(|p| p.1).collect();
-                    self.nominal(tcx,contract,args,&params,*rs);
+                    self.nominal(tcx,contract,tcx.tys.list(*args),&params,*rs);
                 }
-                wf_args.extend(args);
+                wf_args.extend(tcx.tys.list(*args));
             }
             TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args, regions: rs }) => {
                 if let Some(decl) = tcx.opaques.get(d) {
                     let params: Vec<_> = decl.region_contract.regions.iter().map(|p| p.1).collect();
-                    self.nominal(tcx,&decl.region_contract,args,&params,*rs);
+                    self.nominal(tcx,&decl.region_contract,tcx.tys.list(*args),&params,*rs);
                 }
-                wf_args.extend(args);
+                wf_args.extend(tcx.tys.list(*args));
             }
             TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, tupled_upvars_ty: upvars, .. }) => {
                 if let TyKind::FnDef(d,args,rs) = tcx.tys.kind(*owner) {
                     if let Some(sig) = tcx.fn_item_sig(prog, *d) {
                         let params: Vec<_> = sig.generic_indices.lifetimes.iter()
                             .map(|&i| tcx.tys.intern_region(RegionKind::ReEarlyParam(i))).collect();
-                        self.nominal(tcx,&sig.region_contract,args,&params,*rs);
+                        self.nominal(tcx,&sig.region_contract,tcx.tys.list(*args),&params,*rs);
                     }
                 }
                 wf_args.push(*upvars);
@@ -175,7 +175,7 @@ impl ImpliedBounds {
                 if !tcx.tys.has_vars_bound_at_or_above(t,0) {
                     if let Some(contract) = tcx.nominal_region_contracts.get(d) {
                         let params: Vec<_> = contract.regions.iter().map(|p| p.1).collect();
-                        let mut types = vec![t]; types.extend(args);
+                        let mut types = vec![t]; types.extend(tcx.tys.list(*args));
                         for &p in &contract.predicates {
                             if let OutlivesPredicate::Type(subject,_) = p {
                                 if tcx.tys.kind(subject) != &TyKind::Param(0) { continue; }

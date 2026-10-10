@@ -1113,14 +1113,14 @@ impl<'a> Nll<'a> {
             TyKind::Adt(d, a, _) => (d, a),
             _ => return None,
         };
-        if args.iter().any(|a| matches!(self.tx.kind(*a), TyKind::Const(..))) {
+        if self.tcx.tys.list(args).iter().any(|a| matches!(self.tx.kind(*a), TyKind::Const(..))) {
             return None;
         }
         let lts: Vec<crate::ast::Ident> = pargs.iter().filter_map(|a| match a { PathArg::Lifetime(l) => Some(*l), _ => None }).collect();
         let tys: Vec<crate::ast::TyId> = pargs.iter().filter_map(|a| match a { PathArg::Type(x) => Some(*x), _ => None }).collect();
         let info = self.rty.adt_info(d);
         let n_lt = info.var_lt.len();
-        if (!lts.is_empty() && lts.len() != n_lt) || (!tys.is_empty() && tys.len() != args.len()) {
+        if (!lts.is_empty() && lts.len() != n_lt) || (!tys.is_empty() && tys.len() != self.tcx.tys.list(args).len()) {
             return None;
         }
         let n = self.rty.n_slots(t);
@@ -1144,7 +1144,7 @@ impl<'a> Nll<'a> {
         }
         if !tys.is_empty() {
             let mut off = n_lt;
-            for (k, a) in args.iter().enumerate() {
+            for (k, a) in self.tcx.tys.list(args).iter().enumerate() {
                 let m = self.rty.n_slots(*a);
                 let ann = self.rty.annotation(file, self.bir.module, tys[k], *a, &self.named_lts);
                 if ann.len() == m && off + m <= n {
@@ -1192,7 +1192,7 @@ impl<'a> Nll<'a> {
             TyKind::Array(e, _) | TyKind::Slice(e) => self.wf_constraints(e, ann, p, depth + 1),
             TyKind::Tuple(v) => {
                 let mut off = 0;
-                for x in v {
+                for x in self.tcx.tys.list(v).iter().copied() {
                     let n = self.rty.n_slots(x);
                     if off + n > ann.len() {
                         return;
@@ -1210,7 +1210,7 @@ impl<'a> Nll<'a> {
                     }
                 }
                 let mut off = self.rty.adt_info(d).var_lt.len();
-                for x in args {
+                for x in self.tcx.tys.list(args).iter().copied() {
                     let n = self.rty.n_slots(x);
                     if off + n > ann.len() {
                         return;
@@ -1246,7 +1246,7 @@ impl<'a> Nll<'a> {
             if let Some((_, u)) = self.bir.fn_anns.iter().find(|x| x.0 == (bb as Bb, si as u32)).cloned() {
                 let (dt0, dr0) = self.place_regions(dest);
                 if let TyKind::FnDef(fd, fargs, _) = self.tx.kind(dt0) {
-                    let t = self.rty.sig_template(fd, &fargs);
+                    let t = self.rty.sig_template(fd, self.tcx.tys.list(fargs));
                     let live = self.reachable.get(bb).copied().unwrap_or(true);
                     let ann = self.user_ty_slots(&t, &u, live);
                     if ann.len() == dr0.len() {
@@ -2709,12 +2709,12 @@ impl<'a> Nll<'a> {
             }
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => self.params_in(x, out, depth + 1),
             TyKind::Tuple(v) => {
-                for x in v {
+                for x in self.tcx.tys.list(v).iter().copied() {
                     self.params_in(x, out, depth + 1);
                 }
             }
             TyKind::Adt(_, args, _) => {
-                for x in args {
+                for x in self.tcx.tys.list(args).iter().copied() {
                     self.params_in(x, out, depth + 1);
                 }
             }
@@ -2724,7 +2724,7 @@ impl<'a> Nll<'a> {
                 if self.proj_bounds || self.rty.assoc_has_lifetime_bound(ad) {
                     return;
                 }
-                for x in args {
+                for x in self.tcx.tys.list(args).iter().copied() {
                     self.params_in(x, out, depth + 1);
                 }
             }
@@ -2740,8 +2740,8 @@ impl<'a> Nll<'a> {
         match self.tx.kind(t) {
             TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) | TyKind::Infer(_) | TyKind::Error => true,
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => self.has_unknown(x, depth + 1),
-            TyKind::Tuple(v) => v.iter().any(|x| self.has_unknown(*x, depth + 1)),
-            TyKind::Adt(_, a, _) => a.iter().any(|x| self.has_unknown(*x, depth + 1)),
+            TyKind::Tuple(v) => self.tcx.tys.list(v).iter().any(|x| self.has_unknown(*x, depth + 1)),
+            TyKind::Adt(_, a, _) => self.tcx.tys.list(a).iter().any(|x| self.has_unknown(*x, depth + 1)),
             _ => false,
         }
     }
@@ -2753,8 +2753,8 @@ impl<'a> Nll<'a> {
         match self.tx.kind(t) {
             TyKind::FnPtr(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => true,
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => self.has_fn_ptr(x, depth + 1),
-            TyKind::Tuple(v) => v.iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
-            TyKind::Adt(_, a, _) => a.iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
+            TyKind::Tuple(v) => self.tcx.tys.list(v).iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
+            TyKind::Adt(_, a, _) => self.tcx.tys.list(a).iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
             _ => false,
         }
     }

@@ -112,7 +112,7 @@ impl Tcx {
         for &ty in prog.files[file as usize].ast.list(fp.params) { params.push(self.lower_ty(cx, prog, file, module, &env, ty)); }
         let ret = fp.ret.map_or(self.tys.unit, |ty| self.lower_ty(cx, prog, file, module, &env, ty));
         let header = self.lower_fn_header(cx, prog, file, fp.unsafe_, fp.abi, fp.variadic);
-        self.tys.intern(TyKind::FnPtr(params, ret, header, env.regions.bound_count()))
+        self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&params), ret, header, env.regions.bound_count()))
     }
     pub(crate) fn lower_fn_trait_bound_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &mut GenEnv, params: ast::List<ast::TyId>, output: Option<ast::TyId>) -> (Vec<TyId>, TyId) {
         let mut inputs = Vec::new();
@@ -354,11 +354,11 @@ mod tests {
         let nested = sig("nested");
         let TyKind::FnPtr(ps, _, _, n) = tcx.tys.kind(nested.params[1]) else { panic!("expected fn pointer") };
         assert_eq!(*n, 0);
-        assert_eq!(region(ps[0]), RegionKind::ReBound(1, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(1, BoundVar(0)));
         let objects = sig("objects");
         let TyKind::Adt(_, args, rs) = tcx.tys.kind(objects.params[1]) else { panic!("expected ADT") };
         let r = tcx.tys.region_args(*rs)[0];
-        let TyKind::Dyn(_, _, _, _, object_r, _, _) = tcx.tys.kind(args[0]) else { panic!("expected dyn") };
+        let TyKind::Dyn(_, _, _, _, object_r, _, _) = tcx.tys.kind(tcx.tys.list(*args)[0]) else { panic!("expected dyn") };
         assert_eq!(r, *object_r);
         let elided = sig("elided_object");
         assert_eq!(elided.bound_regions, 1);
@@ -373,30 +373,30 @@ mod tests {
         let TyKind::Dyn(_, args, bindings, regions, _, n, _) = tcx.tys.kind(*object) else { panic!("dyn") };
         assert_eq!(*n, 1);
         assert_eq!(tcx.tys.region_kind(tcx.tys.region_args(*regions)[0]), RegionKind::ReBound(0, BoundVar(0)));
-        assert_eq!(region(args[0]), RegionKind::ReBound(1, BoundVar(0)));
-        assert_eq!(bindings[0].2, 1);
-        assert_eq!(region(bindings[0].1), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*args)[0]), RegionKind::ReBound(1, BoundVar(0)));
+        assert_eq!(tcx.tys.list(*bindings)[0].2, 1);
+        assert_eq!(region(tcx.tys.list(*bindings)[0].1), RegionKind::ReBound(0, BoundVar(0)));
         let TyKind::Dyn(_, _, erased_bindings, _, _, erased_n, _) = tcx.tys.kind(tcx.tys.erase_all_regions(*object)) else { panic!("dyn") };
         assert_eq!(*erased_n, 0);
-        assert_eq!(erased_bindings[0].2, 0);
+        assert_eq!(tcx.tys.list(*erased_bindings)[0].2, 0);
         let TyKind::Ref(_, object, _) = tcx.tys.kind(sig("callable").params[0]) else { panic!("ref") };
         let TyKind::Dyn(_, args, bindings, _, _, n, _) = tcx.tys.kind(*object) else { panic!("dyn") };
         assert_eq!(*n, 1);
-        let TyKind::Tuple(ps) = tcx.tys.kind(args[0]) else { panic!("Args tuple") };
-        assert_eq!(region(ps[0]), RegionKind::ReBound(0, BoundVar(0)));
-        assert_eq!(bindings[0].2, 1);
-        assert_eq!(region(bindings[0].1), RegionKind::ReBound(0, BoundVar(0)));
+        let TyKind::Tuple(ps) = tcx.tys.kind(tcx.tys.list(*args)[0]) else { panic!("Args tuple") };
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(tcx.tys.list(*bindings)[0].2, 1);
+        assert_eq!(region(tcx.tys.list(*bindings)[0].1), RegionKind::ReBound(0, BoundVar(0)));
         let TyKind::Ref(_, object, _) = tcx.tys.kind(sig("substituted").params[1]) else { panic!("ref") };
         let TyKind::Dyn(_, args, bindings, _, _, n, _) = tcx.tys.kind(*object) else { panic!("dyn") };
         assert_eq!(*n, 1);
-        assert_eq!(region(args[0]), RegionKind::ReBound(1, BoundVar(0)));
-        assert_eq!(region(bindings[0].1), RegionKind::ReBound(0, BoundVar(0)));
-        let TyKind::Ref(_, inner, _) = tcx.tys.kind(bindings[0].1) else { panic!("ref") };
+        assert_eq!(region(tcx.tys.list(*args)[0]), RegionKind::ReBound(1, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*bindings)[0].1), RegionKind::ReBound(0, BoundVar(0)));
+        let TyKind::Ref(_, inner, _) = tcx.tys.kind(tcx.tys.list(*bindings)[0].1) else { panic!("ref") };
         assert_eq!(region(*inner), RegionKind::ReBound(1, BoundVar(0)));
         let def = named("takes");
         let TyKind::FnPtr(ps, r, _, n) = tcx.tys.kind(tcx.callable_signatures(&prog, def)[0].signature) else { panic!("fn") };
         assert_eq!(*n, 1);
-        assert_eq!(region(ps[0]), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(0, BoundVar(0)));
         assert_eq!(region(*r), RegionKind::ReBound(0, BoundVar(0)));
 
         // Borrowck still reconstructs closure regions in A3. Assert the typeck
@@ -412,24 +412,24 @@ mod tests {
         let first = body.closure_sigs[&body.closures[0]];
         let TyKind::FnPtr(ps, _, _, n) = tcx.tys.kind(first.bound) else { panic!("fn") };
         assert_eq!(*n, 2);
-        assert_eq!(region(ps[0]), RegionKind::ReBound(0, BoundVar(0)));
-        assert_eq!(region(ps[1]), RegionKind::ReBound(0, BoundVar(1)));
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*ps)[1]), RegionKind::ReBound(0, BoundVar(1)));
         let TyKind::FnPtr(ps, _, _, n) = tcx.tys.kind(first.liberated) else { panic!("fn") };
         assert_eq!(*n, 0);
-        assert_eq!(region(ps[0]), RegionKind::ReLateParam(
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReLateParam(
             crate::types::RegionScope::Closure { owner: body.def, expr: body.closures[0] },
             crate::types::LateParamKind::Anon(0)));
         let second = body.closure_sigs[&body.closures[1]];
         let TyKind::FnPtr(ps, _, _, n) = tcx.tys.kind(second.bound) else { panic!("fn") };
         assert_eq!(*n, 0);
-        assert!(matches!(region(ps[1]), RegionKind::ReLateParam(crate::types::RegionScope::Item(_), _)));
-        let TyKind::FnPtr(inner, _, _, n) = tcx.tys.kind(ps[0]) else { panic!("fn") };
+        assert!(matches!(region(tcx.tys.list(*ps)[1]), RegionKind::ReLateParam(crate::types::RegionScope::Item(_), _)));
+        let TyKind::FnPtr(inner, _, _, n) = tcx.tys.kind(tcx.tys.list(*ps)[0]) else { panic!("fn") };
         assert_eq!(*n, 1);
-        assert_eq!(region(inner[0]), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*inner)[0]), RegionKind::ReBound(0, BoundVar(0)));
         let explicit_output = body.closure_sigs[&body.closures[2]];
         let TyKind::FnPtr(ps, r, _, n) = tcx.tys.kind(explicit_output.bound) else { panic!("fn") };
         assert_eq!(*n, 1);
-        assert_eq!(region(ps[0]), RegionKind::ReBound(0, BoundVar(0)));
+        assert_eq!(region(tcx.tys.list(*ps)[0]), RegionKind::ReBound(0, BoundVar(0)));
         assert!(matches!(region(*r), RegionKind::ReVar(_)));
         // rustc rejects this deferred closure as not general enough; it does
         // not acquire a higher-ranked signature from a previous use of `g`.
@@ -442,12 +442,12 @@ mod tests {
                 let TyKind::FnPtr(ps, r, _, n) = tcx.tys.kind(sig.bound) else { panic!("fn") };
                 assert_eq!(*n, 1);
                 let expected_region = RegionKind::ReBound(0, BoundVar(0));
-                assert_eq!(region(ps[0]), expected_region);
+                assert_eq!(region(tcx.tys.list(*ps)[0]), expected_region);
                 assert_eq!(region(*r), expected_region);
                 assert!(!tcx.tys.has_infer(sig.bound));
                 let (supplied, expected) = sig.annotation_eq.unwrap();
                 let TyKind::FnPtr(ps, _, _, _) = tcx.tys.kind(supplied) else { panic!("fn") };
-                assert!(matches!(region(ps[0]), RegionKind::ReVar(_) | RegionKind::ReLateParam(..)));
+                assert!(matches!(region(tcx.tys.list(*ps)[0]), RegionKind::ReVar(_) | RegionKind::ReLateParam(..)));
                 assert!(tcx.tys.eq_mod_regions(supplied, expected));
             }
         }

@@ -87,25 +87,26 @@ impl Tcx {
             DefKind::AssocFn => {
                 let imp_sig = self.fn_item_sig(prog, method).ok_or(NoSolution)?;
                 let trait_sig = self.fn_item_sig(prog, trait_method).ok_or(NoSolution)?;
-                let raw_impl = self.tys.intern(TyKind::FnPtr(imp_sig.params.clone(), imp_sig.ret, imp_sig.header, imp_sig.bound_regions));
+                let raw_impl = self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&imp_sig.params), imp_sig.ret, imp_sig.header, imp_sig.bound_regions));
                 let raw_impl = infcx.instantiate_binder_with_infer(raw_impl);
                 let impl_fn = ocx.normalize_ty(&env, raw_impl);
                 let mut trait_types = trait_sig.params.clone(); trait_types.push(trait_sig.ret);
-                let raw_trait = self.instantiate_ty(prog, trait_method, &trait_args, self.tys.intern(TyKind::Tuple(trait_types)));
+                let raw_trait = self.instantiate_ty(prog, trait_method, &trait_args, self.tys.intern(TyKind::Tuple(self.tys.mk_list(&trait_types))));
                 let raw_trait = dyn_compatibility::liberate_late_bound_regions(self, method, raw_trait);
                 let TyKind::Tuple(trait_types) = self.tys.kind(raw_trait) else { unreachable!() };
-                let raw_trait = self.tys.intern(TyKind::FnPtr(trait_types[..trait_types.len() - 1].to_vec(), *trait_types.last().unwrap(), trait_sig.header, 0));
+                let trait_types = self.tys.list(*trait_types);
+                let raw_trait = self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&trait_types[..trait_types.len() - 1]), *trait_types.last().unwrap(), trait_sig.header, 0));
                 let trait_fn = ocx.normalize_ty(&env, raw_trait);
                 for ty in [raw_trait, trait_fn] {
                     let TyKind::FnPtr(inputs, output, _, _) = self.tys.kind(ty) else { unreachable!() };
-                    for &ty in inputs { if !wf_tys.contains(&ty) { wf_tys.push(ty); } }
+                    for &ty in self.tys.list(*inputs) { if !wf_tys.contains(&ty) { wf_tys.push(ty); } }
                     if !wf_tys.contains(output) { wf_tys.push(*output); }
                 }
                 let goals = infcx.at(prog, env.clone()).sub(impl_fn, trait_fn).map_err(|_| NoSolution)?;
                 ocx.register_obligations(goals);
                 if !self.tys.has_error(impl_fn) && !self.tys.has_error(trait_fn) {
                     let TyKind::FnPtr(inputs, output, _, _) = self.tys.kind(raw_impl) else { unreachable!() };
-                    let mut inputs = inputs.clone(); inputs.push(*output);
+                    let mut inputs = self.tys.list(*inputs).to_vec(); inputs.push(*output);
                     for ty in inputs { ocx.register_obligation(Goal { param_env: env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }); }
                 }
             }
@@ -268,12 +269,12 @@ impl Tcx {
         let limit = infcx.recursion_limit(prog);
         for _ in 0..=limit {
             match self.tys.kind(ty) {
-                TyKind::Tuple(fields) => match fields.last() { Some(&tail) => ty = tail, None => return Ok(false) },
+                TyKind::Tuple(fields) => match self.tys.list(*fields).last() { Some(&tail) => ty = tail, None => return Ok(false) },
                 TyKind::Adt(def, args, regions) => {
                     let adt = &self.adts[def];
                     if adt.is_enum || adt.is_union { return Ok(false); }
                     let Some(field) = adt.variants[0].fields.last() else { return Ok(false); };
-                    let args = self.complete_args(prog, *def, args, *regions);
+                    let args = self.complete_args(prog, *def, self.tys.list(*args), *regions);
                     ty = ocx.normalize_ty(&env, self.instantiate_ty(prog, *def, &args, field.ty));
                 }
                 TyKind::Dyn(..) | TyKind::Slice(_) | TyKind::Str => return Ok(true),

@@ -131,9 +131,9 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
             let es = u.layout_of(et).size as u64;
             (0..n.min(1 << 24)).all(|i| same_value(u, et, a + i * es, b + i * es, depth + 1))
         }
-        TyKind::Tuple(ts) => ts.iter().enumerate().all(|(i, ft)| {
+        TyKind::Tuple(ts) => u.tcx.tys.list(ts).to_vec().into_iter().enumerate().all(|(i, ft)| {
             let off = l.fields.get(i).copied().unwrap_or(0) as u64;
-            same_value(u, *ft, a + off, b + off, depth + 1)
+            same_value(u, ft, a + off, b + off, depth + 1)
         }),
         TyKind::Adt(d, args, _) => {
             let adt = match u.tcx.adts.get(&d).cloned() {
@@ -167,7 +167,7 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
                 None => return true,
             };
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args));
                 let off = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 let off = match off {
                     Some(o) => o as u64,
@@ -209,9 +209,9 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
             }
         }
         TyKind::Tuple(ts) => {
-            for (i, ft) in ts.iter().enumerate() {
+            for (i, ft) in u.tcx.tys.list(ts).to_vec().into_iter().enumerate() {
                 let fo = l.fields.get(i).copied().unwrap_or(0) as usize;
-                defined_mask(u, *ft, a + fo as u64, mask, off + fo, depth + 1);
+                defined_mask(u, ft, a + fo as u64, mask, off + fo, depth + 1);
             }
         }
         TyKind::Adt(d, args, _) => {
@@ -244,7 +244,7 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
                 None => return all(mask),
             };
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args));
                 let fo = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 if let Some(fo) = fo {
                     defined_mask(u, ft, a + fo as u64, mask, off + fo as usize, depth + 1);
@@ -546,7 +546,7 @@ impl<'a> Ctx<'a> {
                     let nf = a.variants.first()?.fields.len();
                     for fi in 0..nf as u32 {
                         if vals.iter().any(|(i, _)| *i == fi) { continue; }
-                        let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), adt, 0, fi, &args);
+                        let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), adt, 0, fi, self.u.tcx.tys.list(args));
                         let off = self.struct_field_off(t, fi)? as usize;
                         let size = self.size(ft) as usize;
                         vals.push((fi, v.get(off..off + size)?.to_vec()));
@@ -642,7 +642,7 @@ impl<'a> Ctx<'a> {
                         for a in &self.u.prog.files[file].ast.list(args).to_vec() {
                             vals.push(self.eval(b, env, *a)?);
                         }
-                        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d0, &gargs0).expect("established instance dispatch");
+                        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d0, self.u.tcx.tys.list(gargs0)).expect("established instance dispatch");
                         let relax_types::instance::InstanceKind::Item(d) = instance.def else { return None };
                         if self.u.prog.def(d).kind == DefKind::Closure { return None; }
                         self.call_const_fn(d, instance.compact_args(&self.u.tcx), vals, t)
@@ -973,7 +973,7 @@ impl<'a> Ctx<'a> {
 
     fn fn_pointer(&mut self, t: TyId) -> Option<Vec<u8>> {
         let TyKind::FnDef(d, args, _) = self.kind(t) else { return None };
-        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, &args).ok()?;
+        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, self.u.tcx.tys.list(args)).ok()?;
         let crate::instance::InstanceKind::Item(d) = instance.def else { return None; };
         let args = instance.compact_args(&self.u.tcx);
         // Foreign symbols and track_caller shims have different entry conventions.

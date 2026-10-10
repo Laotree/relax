@@ -365,7 +365,7 @@ impl Layouts {
         if let Some(storage) = self.closure_storage.get(&ty) { return storage; }
         let TyKind::Closure(_, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = tcx.tys.kind(ty) else { panic!("closure storage for non-closure") };
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
-        let body = crate::typeck::codegen_body(prog, tcx, *def, args);
+        let body = crate::typeck::codegen_body(prog, tcx, *def, tcx.tys.list(*args));
         let storage = ClosureStorage::for_codegen(prog, tcx, &body, *ce);
         self.closure_storage.insert(ty, storage.clone());
         storage
@@ -595,7 +595,7 @@ impl Layouts {
             // a tuple's last element may be unsized: it stays last (rustc StructKind::MaybeUnsized)
             TyKind::Tuple(v) => {
                 let kind = if v.is_empty() { Kind::AlwaysSized } else { Kind::MaybeUnsized };
-                self.struct_layout(lcx, tcx, &v, Repr { pack: 0, align: 0, reorder: true }, kind)
+                self.struct_layout(lcx, tcx, tcx.tys.list(v), Repr { pack: 0, align: 0, reorder: true }, kind)
             }
             // a length that is still a const param / variable has no layout (never instantiated)
             TyKind::Array(_, n) if n.try_to_target_usize(&tcx.tys).is_none() => plain(0, 1, None),
@@ -630,7 +630,7 @@ impl Layouts {
                 if !adt.is_enum {
                     let mut fts = Vec::new();
                     for fi in 0..adt.variants[0].fields.len() {
-                        fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, fi as u32, &args));
+                        fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, fi as u32, tcx.tys.list(args)));
                     }
                     // a live-editable struct (M10): its first version's fields, then the hidden
                     // extension word; the fields edits added live in the extension block
@@ -688,11 +688,11 @@ impl Layouts {
                 // a live-editable enum (M10): always tagged, no niche given to outer types, so a
                 // variant added at the end keeps every value's representation
                 if self.live_editable_enum(lcx, d, &adt) {
-                    let mut l = self.enum_layout(lcx, tcx, d, &adt, &args, repr, true);
+                    let mut l = self.enum_layout(lcx, tcx, d, &adt, tcx.tys.list(args), repr, true);
                     l.niche = None;
                     return l;
                 }
-                self.enum_layout(lcx, tcx, d, &adt, &args, repr, false)
+                self.enum_layout(lcx, tcx, d, &adt, tcx.tys.list(args), repr, false)
             }
             TyKind::Foreign(_) => plain(0, 1, None),
             TyKind::Str => plain(0, 1, None),
@@ -1100,7 +1100,7 @@ impl Layouts {
         match tcx.tys.kind(t).clone() {
             TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
             TyKind::Param(i) => params.get(i as usize).copied().unwrap_or(false),
-            TyKind::Tuple(v) => match v.last() {
+            TyKind::Tuple(v) => match tcx.tys.list(v).last() {
                 Some(l) => self.ty_maybe_unsized(lcx, tcx, *l, params, depth + 1),
                 None => false,
             },
@@ -1116,13 +1116,13 @@ impl Layouts {
                 match tcx.tys.kind(lt).clone() {
                     TyKind::Param(j) => {
                         adt2.param_maybe_unsized.get(j as usize).copied().unwrap_or(false)
-                            && a2.get(j as usize).map_or(false, |x| self.ty_maybe_unsized(lcx, tcx, *x, params, depth + 1))
+                            && tcx.tys.list(a2).get(j as usize).map_or(false, |x| self.ty_maybe_unsized(lcx, tcx, *x, params, depth + 1))
                     }
                     _ => {
                         if !self.decl_maybe_unsized(lcx, tcx, d2, depth + 1) {
                             return false;
                         }
-                        let s = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d2, 0, adt2.variants[0].fields.len() as u32 - 1, &a2);
+                        let s = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d2, 0, adt2.variants[0].fields.len() as u32 - 1, tcx.tys.list(a2));
                         self.ty_maybe_unsized(lcx, tcx, s, params, depth + 1)
                     }
                 }
@@ -1144,7 +1144,7 @@ impl Layouts {
         // by type structure only (no layouts: pointee layouts may be recursive)
         let r = match tcx.tys.kind(t) {
             TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
-            TyKind::Tuple(v) => match v.last() {
+            TyKind::Tuple(v) => match tcx.tys.list(*v).last() {
                 Some(l) => self.is_unsized(lcx, tcx, *l),
                 None => false,
             },
@@ -1153,7 +1153,7 @@ impl Layouts {
                 Some(adt) if !adt.is_enum && (!adt.is_union || adt.variants[0].fields.len() == 1) => match adt.variants[0].fields.last() {
                     Some(_) => {
                         // a projection tail (`A::Dyn` with `type Dyn = DynRef`) normalized first
-                        let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *d, 0, adt.variants[0].fields.len() as u32 - 1, args);
+                        let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args));
                         self.is_unsized(lcx, tcx, ft)
                     }
                     None => false,
@@ -1171,11 +1171,11 @@ impl Layouts {
     pub fn struct_tail_for_codegen(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, mut ty: TyId) -> TyId {
         for _ in 0..crate::next_solver::search_graph::SearchGraphConfig::default().recursion_limit {
             ty = match tcx.tys.kind(ty) {
-                TyKind::Tuple(fields) => match fields.last() { Some(&last) => last, None => return ty },
+                TyKind::Tuple(fields) => match tcx.tys.list(*fields).last() { Some(&last) => last, None => return ty },
                 TyKind::Adt(def, args, _) => {
                     let Some(adt) = tcx.adts.get(def) else { return ty };
                     if adt.is_enum || adt.is_union || adt.variants[0].fields.is_empty() { return ty; }
-                    tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *def, 0, adt.variants[0].fields.len() as u32 - 1, args)
+                    tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *def, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(*args))
                 }
                 _ => return ty,
             };
@@ -1192,10 +1192,10 @@ impl Layouts {
         match tcx.tys.kind(t).clone() {
             TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => Some((0, t)),
             TyKind::Tuple(v) => {
-                let last = *v.last()?;
+                let last = *tcx.tys.list(v).last()?;
                 let (o, tail) = self.unsized_tail(lcx, tcx, last)?;
                 let l = self.of(lcx, tcx, t);
-                Some((l.fields[v.len() - 1] + o, tail))
+                Some((l.fields[tcx.tys.list(v).len() - 1] + o, tail))
             }
             TyKind::Adt(d, args, _) => {
                 let adt = tcx.adts.get(&d)?.clone();
@@ -1203,7 +1203,7 @@ impl Layouts {
                     return None;
                 }
                 adt.variants[0].fields.last()?;
-                let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, adt.variants[0].fields.len() as u32 - 1, &args);
+                let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, adt.variants[0].fields.len() as u32 - 1, tcx.tys.list(args));
                 let (o, tail) = self.unsized_tail(lcx, tcx, ft)?;
                 let l = self.of(lcx, tcx, t);
                 Some((l.fields[adt.variants[0].fields.len() - 1] + o, tail))

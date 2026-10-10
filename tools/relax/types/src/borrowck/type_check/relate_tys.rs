@@ -313,19 +313,19 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
         let tys = &tcx.tys;
         match (tys.kind(a).clone(), tys.kind(b).clone()) {
             (TyKind::Bound(..), _) | (_, TyKind::Bound(..)) => Err(NoSolution),
-            (TyKind::Adt(ad, ats, ars), TyKind::Adt(bd, bts, brs)) if ad == bd => self.relate_ty_args(a, b, ad, (&ats, ars), (&bts, brs)),
-            (TyKind::FnDef(ad, ats, ars), TyKind::FnDef(bd, bts, brs)) if ad == bd => self.relate_ty_args(a, b, ad, (&ats, ars), (&bts, brs)),
+            (TyKind::Adt(ad, ats, ars), TyKind::Adt(bd, bts, brs)) if ad == bd => self.relate_ty_args(a, b, ad, (tys.list(ats), ars), (tys.list(bts), brs)),
+            (TyKind::FnDef(ad, ats, ars), TyKind::FnDef(bd, bts, brs)) if ad == bd => self.relate_ty_args(a, b, ad, (tys.list(ats), ars), (tys.list(bts), brs)),
             (TyKind::Dyn(ad, aargs, abind, ars, ar, _, aautos), TyKind::Dyn(bd, bargs, bbind, brs, br, _, bautos)) => {
                 // Existential predicates: same principal, projections and auto traits, each under its binder.
-                if ad != bd || abind.len() != bbind.len() || aautos != bautos || aargs.len() != bargs.len() { return Err(NoSolution); }
-                let a_principal = Bound { tys: aargs.to_vec(), regions: tys.region_args(ars).to_vec() };
-                let b_principal = Bound { tys: bargs.to_vec(), regions: tys.region_args(brs).to_vec() };
+                if ad != bd || tys.list(abind).len() != tys.list(bbind).len() || aautos != bautos || tys.list(aargs).len() != tys.list(bargs).len() { return Err(NoSolution); }
+                let a_principal = Bound { tys: tys.list(aargs).to_vec(), regions: tys.region_args(ars).to_vec() };
+                let b_principal = Bound { tys: tys.list(bargs).to_vec(), regions: tys.region_args(brs).to_vec() };
                 self.binders(&a_principal, &b_principal, &mut |this, a, b| {
                     for (&a, &b) in a.tys.iter().zip(&b.tys) { this.relate_with_variance(V::Inv, a, b)?; }
                     for (&a, &b) in a.regions.iter().zip(&b.regions) { this.relate_regions_with_variance(V::Inv, a, b); }
                     Ok(())
                 })?;
-                for (&(a_item, a_term, _), &(b_item, b_term, _)) in abind.iter().zip(&bbind) {
+                for (&(a_item, a_term, _), &(b_item, b_term, _)) in tys.list(abind).iter().zip(tys.list(bbind)) {
                     if a_item != b_item { return Err(NoSolution); }
                     self.binders(&Bound { tys: vec![a_term], regions: vec![] }, &Bound { tys: vec![b_term], regions: vec![] },
                         &mut |this, a, b| this.relate_with_variance(V::Inv, a.tys[0], b.tys[0]))?;
@@ -354,21 +354,21 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
             }
             (TyKind::Slice(at), TyKind::Slice(bt)) => self.relate(at, bt),
             (TyKind::Tuple(as_), TyKind::Tuple(bs)) => {
-                if as_.len() != bs.len() { return Err(NoSolution); }
-                for (a, b) in as_.into_iter().zip(bs) { self.relate(a, b)?; }
+                if tys.list(as_).len() != tys.list(bs).len() { return Err(NoSolution); }
+                for (&a, &b) in tys.list(as_).iter().zip(tys.list(bs)) { self.relate(a, b)?; }
                 Ok(())
             }
             (TyKind::FnPtr(ai, ao, ah, _), TyKind::FnPtr(bi, bo, bh, _)) => {
-                let a_sig = Bound { tys: ai.into_iter().chain([ao]).collect(), regions: vec![] };
-                let b_sig = Bound { tys: bi.into_iter().chain([bo]).collect(), regions: vec![] };
+                let a_sig = Bound { tys: tys.list(ai).iter().copied().chain([ao]).collect(), regions: vec![] };
+                let b_sig = Bound { tys: tys.list(bi).iter().copied().chain([bo]).collect(), regions: vec![] };
                 self.binders(&a_sig, &b_sig, &mut |this, a, b| this.fn_sigs(a, ah, b, bh))
             }
             // Rigid projections (normalization already failed to make progress).
             (TyKind::Const(a), TyKind::Const(b)) => self.consts(a, b),
             (TyKind::Alias(ar, aa), TyKind::Alias(br, ba)) if ar == br && aa.kind == ba.kind => {
                 let (ats, ars, bts, brs) = (aa.args, aa.regions, ba.args, ba.regions);
-                if ats.len() != bts.len() || tys.region_args(ars).len() != tys.region_args(brs).len() { return Err(NoSolution); }
-                for (a, b) in ats.into_iter().zip(bts) { self.relate_with_variance(V::Inv, a, b)?; }
+                if tys.list(ats).len() != tys.list(bts).len() || tys.region_args(ars).len() != tys.region_args(brs).len() { return Err(NoSolution); }
+                for (&a, &b) in tys.list(ats).iter().zip(tys.list(bts)) { self.relate_with_variance(V::Inv, a, b)?; }
                 for (&a, &b) in tys.region_args(ars).iter().zip(tys.region_args(brs).iter()) { self.relate_regions_with_variance(V::Inv, a, b); }
                 Ok(())
             }

@@ -63,12 +63,12 @@ impl TypeFolder for WfPredicates<'_, '_> {
         match tys.kind(t) {
             TyKind::Slice(e) => self.require_sized(*e),
             TyKind::Array(e, n) => { self.require_sized(*e); self.push(PredicateKind::Clause(ClauseKind::ConstArgHasType(*n, tys.usize_))); }
-            TyKind::Tuple(ts) => { if !ts.is_empty() { for &t in &ts[..ts.len()-1] { self.require_sized(t); } } }
+            TyKind::Tuple(ts) => { let ts = tys.list(*ts); if !ts.is_empty() { for &t in &ts[..ts.len()-1] { self.require_sized(t); } } }
             TyKind::Ref(_, ty, region) => {
                 if !tys.has_vars_bound_at_or_above(*ty, 0) && !matches!(tys.region_kind(*region), RegionKind::ReBound(..)) { self.push(PredicateKind::Clause(ClauseKind::TypeOutlives(*ty, *region))); }
             }
             TyKind::Adt(d, args, rs) | TyKind::FnDef(d, args, rs) => {
-                let args = tcx.complete_args(self.prog, *d, args, *rs);
+                let args = tcx.complete_args(self.prog, *d, tys.list(*args), *rs);
                 if matches!(tys.kind(t), TyKind::FnDef(..)) {
                     let sig = tcx.fn_item_sig(self.prog, *d).expect("function signature");
                     let ret = tcx.instantiate_ty(self.prog, *d, &args, sig.ret);
@@ -77,12 +77,12 @@ impl TypeFolder for WfPredicates<'_, '_> {
                 self.nominal_obligations(*d, &args);
             }
             TyKind::Alias(_, a) => {
-                let args = tcx.complete_args(self.prog, a.kind.def_id(), &a.args, a.regions);
+                let args = tcx.complete_args(self.prog, a.kind.def_id(), tys.list(a.args), a.regions);
                 if matches!(a.kind, AliasTyKind::Inherent { .. }) { self.add_wf_preds_for_inherent_projection(a.kind.def_id(), &args, false); return t; }
                 self.nominal_obligations(a.kind.def_id(), &args);
             }
             TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, tupled_upvars_ty: upvars, .. }) => {
-                if let TyKind::FnDef(d, args, rs) = tys.kind(*owner) { self.nominal_obligations(*d, &tcx.complete_args(self.prog, *d, args, *rs)); }
+                if let TyKind::FnDef(d, args, rs) = tys.kind(*owner) { self.nominal_obligations(*d, &tcx.complete_args(self.prog, *d, tys.list(*args), *rs)); }
                 if !tcx.is_coroutine(t) { self.fold_ty(tys, *upvars, depth); return t; }
             }
             TyKind::Dyn(principal, ..) => {

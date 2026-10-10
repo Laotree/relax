@@ -45,7 +45,7 @@ impl TypeFolder for ImplTraitInTraitFinder<'_> {
                     let shifted = shift.fold_ty(tys, ty, 0);
                     self.failed |= shift.failed;
                     let TyKind::Alias(_, shifted_alias) = tys.kind(shifted) else { unreachable!() };
-                    let args = self.tcx.complete_args(self.prog, def_id, &shifted_alias.args, shifted_alias.regions);
+                    let args = self.tcx.complete_args(self.prog, def_id, tys.list(shifted_alias.args), shifted_alias.regions);
                     let default = match self.tcx.type_of(self.prog, def_id) {
                         Ok(default) => self.tcx.instantiate_ty(self.prog, def_id, &args, default),
                         Err(_) => { self.failed = true; tys.error },
@@ -56,7 +56,7 @@ impl TypeFolder for ImplTraitInTraitFinder<'_> {
                         })),
                         bound_vars: self.bound_vars.clone().into(),
                     });
-                    let args = self.tcx.complete_args(self.prog, def_id, &alias.args, alias.regions);
+                    let args = self.tcx.complete_args(self.prog, def_id, tys.list(alias.args), alias.regions);
                     for bound in self.tcx.item_bounds(self.prog, def_id) {
                         let bound = self.tcx.instantiate_predicate(self.prog, def_id, &args, &bound);
                         crate::next_solver::fold::fold_predicate_kind(tys, &bound.kind, self, depth + 1);

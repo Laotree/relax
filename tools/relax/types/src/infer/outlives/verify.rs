@@ -62,7 +62,7 @@ impl VerifyBoundCx<'_> {
     pub fn declared_bounds_from_definition(&self, ty: TyId) -> Vec<RegionId> {
         let TyKind::Alias(_, alias) = self.tcx.tys.kind(ty) else { unreachable!() };
         let def = alias.kind.def_id();
-        let args = self.tcx.complete_args(self.prog, def, &alias.args, alias.regions);
+        let args = self.tcx.complete_args(self.prog, def, self.tcx.tys.list(alias.args), alias.regions);
         let mut out = Vec::new();
         for p in self.tcx.item_bounds(self.prog, def) {
             let p = self.tcx.instantiate_predicate(self.prog, def, &args, &p);

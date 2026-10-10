@@ -130,7 +130,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
             let mut offset = layout.caps.iter().map(|t| rty.n_slots(*t)).sum::<usize>();
             for (i, _, slots) in &layout.params {
                 let n = slots.len();
-                if let Some(t) = ps.get(*i) {
+                if let Some(t) = tcx.tys.list(*ps).get(*i) {
                     let all = p.callable_ty(*t, &mut cons);
                     let input: Vec<_> = slots.iter().filter_map(|&i| all.get(i).copied()).collect();
                     if input.len() == n && offset + n <= closure.len() {
@@ -317,16 +317,16 @@ impl Projection<'_, '_> {
                     TyKind::Ref(m, t, r) => { let r = region(r); TyKind::Ref(m, self.argument(t, slots, depth), r) }
                     TyKind::Adt(d, ts, rs) => {
                         let rs = tys.intern_region_args(&tys.region_args(rs).iter().map(|r| region(*r)).collect::<Vec<_>>());
-                        TyKind::Adt(d, ts.into_iter().map(|t| self.argument(t, slots, depth)).collect(), rs)
+                        TyKind::Adt(d, tys.mk_list(&tys.list(ts).iter().map(|t| self.argument(*t, slots, depth)).collect::<Vec<_>>()), rs)
                     }
                     TyKind::Dyn(d, ts, bs, rs, r, n, autos) => {
                         let r = region(r);
-                        let ts = ts.iter().map(|t| self.argument(*t, slots, depth + 1)).collect::<Vec<_>>();
-                        let bs = bs.iter().map(|(d, t, n)| (*d, self.argument(*t, slots, depth + 1), *n)).collect::<Vec<_>>();
+                        let ts = tys.list(ts).iter().map(|t| self.argument(*t, slots, depth + 1)).collect::<Vec<_>>();
+                        let bs = tys.list(bs).iter().map(|(d, t, n)| (*d, self.argument(*t, slots, depth + 1), *n)).collect::<Vec<_>>();
                         let rs = tys.intern_region_args(&tys.region_args(rs).iter().map(|r| self.unnumbered_region(*r, depth + 1)).collect::<Vec<_>>());
-                        TyKind::Dyn(d, ts.into(), bs.into(), rs, r, n, autos)
+                        TyKind::Dyn(d, tys.mk_list(&ts), tys.mk_list(&bs), rs, r, n, autos)
                     }
-                    TyKind::Tuple(ts) => TyKind::Tuple(ts.into_iter().map(|t| self.argument(t, slots, depth)).collect()),
+                    TyKind::Tuple(ts) => TyKind::Tuple(tys.mk_list(&tys.list(ts).iter().map(|t| self.argument(*t, slots, depth)).collect::<Vec<_>>())),
                     TyKind::Slice(t) => TyKind::Slice(self.argument(t, slots, depth)),
                     TyKind::Array(t, n) => TyKind::Array(self.argument(t, slots, depth), n),
                     TyKind::Ptr(m, t) => TyKind::Ptr(m, self.argument(t, slots, depth)),
@@ -408,7 +408,7 @@ impl Projection<'_, '_> {
                 s
             }
             TyKind::Ptr(_, t) | TyKind::Array(t, _) | TyKind::Slice(t) => self.ty(t),
-            TyKind::Tuple(ts) => ts.into_iter().flat_map(|t| self.ty(t)).collect(),
+            TyKind::Tuple(ts) => tcx.tys.list(ts).iter().flat_map(|t| self.ty(*t)).collect(),
             TyKind::Adt(_, ts, rs) => {
                 let mut s = tcx
                     .tys
@@ -416,17 +416,17 @@ impl Projection<'_, '_> {
                     .iter()
                     .map(|r| self.region(*r, None))
                     .collect::<Vec<_>>();
-                for t in ts {
+                for t in tcx.tys.list(ts).iter().copied() {
                     s.extend(self.ty(t));
                 }
                 s
             }
             TyKind::Dyn(_, ts, bs, _, r, _, _) => {
                 let mut s = vec![self.region(r, None)];
-                for t in ts {
+                for t in tcx.tys.list(ts).iter().copied() {
                     s.extend(self.ty(t));
                 }
-                for (_, t, _) in bs {
+                for (_, t, _) in tcx.tys.list(bs).iter().copied() {
                     s.extend(self.ty(t));
                 }
                 s
@@ -439,7 +439,7 @@ impl Projection<'_, '_> {
                     Vec::new()
                 }
             }
-            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: ts, .. }) => ts.into_iter().flat_map(|t| self.ty(t)).collect(),
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: ts, .. }) => tcx.tys.list(ts).iter().flat_map(|t| self.ty(*t)).collect(),
             // Nested function binders have no slots in the legacy body layout.
             TyKind::FnPtr(..) => Vec::new(),
             _ => Vec::new(),
@@ -532,7 +532,7 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
         if let (TyKind::FnPtr(ap, ar, _, _), TyKind::FnPtr(bp, br, _, _)) =
             (tys.kind(a), tys.kind(b))
         {
-            for (a, b) in ap.iter().chain([ar]).zip(bp.iter().chain([br])) {
+            for (a, b) in tys.list(*ap).iter().chain([ar]).zip(tys.list(*bp).iter().chain([br])) {
                 let a = p.ty(*a);
                 let b = p.ty(*b);
                 if a.len() == b.len() {
@@ -640,6 +640,7 @@ mod tests {
         let TyKind::FnPtr(ps, _, _, 1) = tcx.tys.kind(u.inputs[1]) else {
             panic!()
         };
+        let ps = tcx.tys.list(*ps);
         assert!(matches!(tcx.tys.kind(ps[0]),TyKind::Ref(_,_,r) if r==a));
         assert!(
             matches!(tcx.tys.kind(ps[1]),TyKind::Ref(_,_,r) if matches!(tcx.tys.region_kind(*r),RegionKind::ReBound(0,_)))
@@ -674,7 +675,7 @@ mod tests {
         let isolated = ImpliedBounds::create(&tcx,&prog, &[], &[], &[], obligations.clone());
         assert_eq!(isolated.obligations, obligations);
         assert!(isolated.outlives.is_empty());
-        let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: def("output") }, args: vec![tcx.tys.intern(TyKind::Param(0))], regions: crate::types::RegionArgsId::EMPTY }));
+        let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: def("output") }, args: tcx.tys.mk_list(&[tcx.tys.intern(TyKind::Param(0))]), regions: crate::types::RegionArgsId::EMPTY }));
         let alias_rel = ImpliedBounds::create(
             &tcx, &prog,
             &[OutlivesPredicate::Type(alias, *a)],
@@ -779,7 +780,7 @@ pub fn external_closure_input_slots(rty: &Rty<'_>, expr: u32, input: usize) -> V
     let sigs = rty.closure_signatures.borrow();
     let Some(sig) = sigs.get(&expr) else { return vec![]; };
     let TyKind::FnPtr(ps, _, _, _) = rty.tx.tcx.tys.kind(sig.bound) else { return vec![]; };
-    let Some(&ty) = ps.get(input) else { return vec![]; };
+    let Some(&ty) = rty.tx.tcx.tys.list(*ps).get(input) else { return vec![]; };
     let mut projection = Projection { rty,param_env:rty.tx.param_env_id.get(),args:&[],regions:vec![],params:vec![],names:vec![],kinds:vec![] };
     let tys = &rty.tx.tcx.tys;
     let ty = crate::borrowck::universal_regions::with_erased_adt_regions(rty.tx.tcx, ty);

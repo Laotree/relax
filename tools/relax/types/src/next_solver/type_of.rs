@@ -63,11 +63,11 @@ impl Tcx {
         let env = self.intern_param_env(env);
         let mut ocx = ObligationCtxt::new(&infcx, prog);
         for p in self.own_clauses_of(prog, method) { let p = ocx.normalize_predicate(&env, &p); ocx.register_obligation(Goal { param_env: env.clone(), predicate: p }); }
-        let impl_fn = self.tys.intern(TyKind::FnPtr(impl_sig.params.clone(), impl_sig.ret, impl_sig.header, impl_sig.bound_regions));
+        let impl_fn = self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&impl_sig.params), impl_sig.ret, impl_sig.header, impl_sig.bound_regions));
         let impl_fn = infcx.instantiate_binder_with_infer(impl_fn);
         let impl_fn = ocx.normalize_ty(&env, impl_fn);
         let mut trait_types = trait_sig.params.clone(); trait_types.push(trait_sig.ret);
-        let trait_types = self.instantiate_ty(prog, trait_method, &trait_to_impl_args, self.tys.intern(TyKind::Tuple(trait_types)));
+        let trait_types = self.instantiate_ty(prog, trait_method, &trait_to_impl_args, self.tys.intern(TyKind::Tuple(self.tys.mk_list(&trait_types))));
         let trait_types = super::dyn_compatibility::liberate_late_bound_regions(self, method, trait_types);
         let mut collector = ImplTraitInTraitCollector { ocx: &mut ocx, env: &env, types: Vec::new() };
         let raw = collector.fold_ty(&self.tys, trait_types, 0);
@@ -81,11 +81,12 @@ impl Tcx {
             substitutions.push((*ty, placeholder));
         }
         let mut wf_tys = Vec::new();
-        for ty in [raw, normalized] { let TyKind::Tuple(ts) = self.tys.kind(ty) else { unreachable!() }; for &ty in ts { let mapped = self.tys.replace(ty, &substitutions); if !wf_tys.contains(&mapped) { wf_tys.push(mapped); } } }
+        for ty in [raw, normalized] { let TyKind::Tuple(ts) = self.tys.kind(ty) else { unreachable!() }; for &ty in self.tys.list(*ts) { let mapped = self.tys.replace(ty, &substitutions); if !wf_tys.contains(&mapped) { wf_tys.push(mapped); } } }
         let TyKind::FnPtr(_, impl_ret, _, _) = self.tys.kind(impl_fn) else { unreachable!() };
         let TyKind::Tuple(trait_types) = self.tys.kind(normalized) else { unreachable!() };
+        let trait_types = self.tys.list(*trait_types);
         ocx.eq(&env, *trait_types.last().unwrap(), *impl_ret)?;
-        let trait_fn = self.tys.intern(TyKind::FnPtr(trait_types[..trait_types.len() - 1].to_vec(), *trait_types.last().unwrap(), trait_sig.header, 0));
+        let trait_fn = self.tys.intern(TyKind::FnPtr(self.tys.mk_list(&trait_types[..trait_types.len() - 1]), *trait_types.last().unwrap(), trait_sig.header, 0));
         ocx.eq(&env, trait_fn, impl_fn)?;
         for (_, ty, _) in &collected { ocx.register_obligation(Goal { param_env: env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(*ty)))) }); }
         ocx.evaluate_obligations_error_on_ambiguity()?;
@@ -123,7 +124,7 @@ impl TypeFolder for ImplTraitInTraitCollector<'_, '_, '_> {
             if self.ocx.prog.impl_trait_in_trait_data.contains_key(&def_id) {
                 if let Some((_, ty, _)) = self.types.iter().find(|(d,_,_)| *d == def_id) { return *ty; }
                 assert!(!tys.has_vars_bound_at_or_above(ty, 0));
-                let args = tcx.complete_args(self.ocx.prog, def_id, &a.args, a.regions); let var = self.ocx.infcx.next_ty_var();
+                let args = tcx.complete_args(self.ocx.prog, def_id, tys.list(a.args), a.regions); let var = self.ocx.infcx.next_ty_var();
                 self.types.push((def_id, var, args.clone()));
                 for p in tcx.item_bounds(self.ocx.prog, def_id) {
                     let p = tcx.instantiate_predicate(self.ocx.prog, def_id, &args, &p);

@@ -52,7 +52,7 @@ impl EvalCtxt<'_, '_> {
                                 if t.trait_ref.def_id == tr.def_id && matches!(t.trait_ref.args.first(),Some(GenericArg::Type(t)) if matches!(tcx.tys.kind(*t),TyKind::Alias(_,a) if a.kind.def_id()==def_id)) { return Err(NoSolution.into()); }
                             }
                         }
-                        let args = tcx.complete_args(ecx.solver.prog,def_id,&alias.args,alias.regions);
+                        let args = tcx.complete_args(ecx.solver.prog,def_id,tcx.tys.list(alias.args),alias.regions);
                         let hidden = ecx.type_of(def_id,&args)?;
                         ecx.add_trait_goal(env,tr.def_id,hidden)?;
                         let response = ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)?;
@@ -156,7 +156,7 @@ impl EvalCtxt<'_, '_> {
             TyKind::Str | TyKind::Slice(_) => tcx.tys.usize_,
             TyKind::Dyn(..) => {
                 let def = tcx.lang_items.get(LangItem::DynMetadata).ok_or(NoSolution)?;
-                tcx.tys.intern(TyKind::Adt(def, vec![ty], crate::types::RegionArgsId::EMPTY))
+                tcx.tys.intern(TyKind::Adt(def, tcx.tys.mk_list(&[ty]), crate::types::RegionArgsId::EMPTY))
             }
             TyKind::Alias(IsRigid::Yes, _) | TyKind::Param(_) | TyKind::Placeholder(_) => {
                 let result = self.probe().enter(|ecx| {
@@ -177,10 +177,10 @@ impl EvalCtxt<'_, '_> {
                 let adt = &tcx.adts[def];
                 if adt.is_enum || adt.is_union { tcx.tys.unit }
                 else if let Some(field) = adt.variants[0].fields.last() {
-                    projection(tcx.instantiate_ty(self.solver.prog, *def, &tcx.complete_args(self.solver.prog, *def, args, *rs), field.ty))
+                    projection(tcx.instantiate_ty(self.solver.prog, *def, &tcx.complete_args(self.solver.prog, *def, tcx.tys.list(*args), *rs), field.ty))
                 } else { tcx.tys.unit }
             }
-            TyKind::Tuple(ts) => ts.last().map_or(tcx.tys.unit, |&tail| projection(tail)),
+            TyKind::Tuple(ts) => tcx.tys.list(*ts).last().map_or(tcx.tys.unit, |&tail| projection(tail)),
             TyKind::Infer(_) | TyKind::Alias(IsRigid::No, _) | TyKind::Bound(..) => panic!("non-rigid metadata self type"),
             _ => tcx.tys.unit,
         };

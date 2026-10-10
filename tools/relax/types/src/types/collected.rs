@@ -37,8 +37,7 @@ impl Codec for TyId {
             let types = unsafe { &*types };
             let mut bytes = Vec::new();
             types.kind(*self).put(&mut bytes);
-            let e = types.entry(*self);
-            e.flags.put(&mut bytes); e.outer_exclusive_binder.put(&mut bytes); e.depth.put(&mut bytes);
+            types.fl(*self).put(&mut bytes); types.outer_exclusive_binder(*self).put(&mut bytes); types.depth(*self).put(&mut bytes);
             let mut h = crate::sip::Sip128::new(); h.write(&bytes); let hash = h.finish128();
             SEMANTIC.with(|s| s.borrow_mut().as_mut().unwrap().hashes[self.0 as usize] = Some(hash));
             hash
@@ -46,6 +45,14 @@ impl Codec for TyId {
         hash.put(w);
     }
     fn get(r: &mut Decode<'_>) -> Option<Self> { Some(Self(u32::get(r)?)) }
+}
+/// A list's id; under `with_semantic_ids` its elements (as the Vec it was).
+impl<T: ListElem + Codec> Codec for List<T> {
+    fn put(&self, w: &mut Vec<u8>) {
+        let types = SEMANTIC.try_with(|s| s.borrow().as_ref().map(|s| s.types)).ok().flatten();
+        if let Some(types) = types { unsafe { &*types }.list(*self).to_vec().put(w); } else { self.raw().put(w); }
+    }
+    fn get(r: &mut Decode<'_>) -> Option<Self> { Some(Self::from_raw(u32::get(r)?)) }
 }
 impl Codec for RegionId {
     fn put(&self, w: &mut Vec<u8>) {
@@ -139,45 +146,17 @@ impl Codec for RegionKind {
         })
     }
 }
-crate::collected_fields!(Entry, kind, hash, next, flags, outer_exclusive_binder, depth, erased);
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct TypeRow {
-    hash: u64,
-    offset: u32,
-    bytes: u32,
-    next: u32,
-    flags: u32,
-    binder: u32,
-    erased: u32,
-    reserved: u32,
-    depth: u16,
-    padding: u16,
-}
-// Same-build, position-independent metadata; the kind uses the checked tagged codec.
-unsafe impl crate::image::Pod for TypeRow {}
-
+/// The image's interner rows, mapped as they are (Entry is plain data; same build only):
+/// a warm boot reads a type without decoding or allocating it.
 pub(super) struct MappedTypes {
-    rows: &'static [TypeRow],
-    kinds: &'static [u8],
-    /// decoded on first use: a warm boot touches a few thousand of the image's types
-    ready: crate::collected::LazySlots<Entry>,
+    rows: &'static [Entry],
 }
 impl MappedTypes {
+    #[inline(always)]
     pub(super) fn len(&self) -> usize { self.rows.len() }
-    pub(super) fn entry(&self, i: usize) -> &Entry {
-        self.ready.get_or_init(i, || {
-            let r = &self.rows[i];
-            let bytes = &self.kinds[r.offset as usize..r.offset as usize + r.bytes as usize];
-            Entry {
-                kind: crate::crate_image::decode(bytes).expect("checksummed collected type"),
-                hash: r.hash, next: r.next, flags: r.flags,
-                outer_exclusive_binder: r.binder, depth: r.depth,
-                erased: TyId(r.erased),
-            }
-        })
-    }
+    #[inline(always)]
+    pub(super) fn entry(&self, i: usize) -> &Entry { unsafe { self.rows.get_unchecked(i) } }
 }
 
 impl Types {
@@ -195,38 +174,33 @@ impl Types {
         for t in [self.unit, self.bool_, self.char_, self.str_, self.never, self.error,
             self.i32_, self.i64_, self.u8_, self.u32_, self.u64_, self.usize_, self.isize_,
             self.f32_, self.f64_, self.str_ref] { t.put(&mut meta); }
-        let (mapped_rows, mapped_kinds) = self.image.as_ref().map_or((&[][..], &[][..]), |image| (image.rows, image.kinds));
-        let mut rows = Vec::with_capacity(self.len() - mapped_rows.len());
-        let mut kinds = Vec::new();
-        for i in mapped_rows.len()..self.len() {
-            let e = self.entry(TyId(i as u32));
-            let offset = mapped_kinds.len() + kinds.len();
-            e.kind.put(&mut kinds);
-            rows.push(TypeRow { hash: e.hash, offset: u32::try_from(offset).expect("type image offset"),
-                bytes: u32::try_from(mapped_kinds.len() + kinds.len() - offset).expect("type image length"),
-                next: e.next, flags: e.flags, binder: e.outer_exclusive_binder,
-                erased: e.erased.0, reserved: 0, depth: e.depth, padding: 0 });
-        }
+        let mapped_rows = self.image.as_ref().map_or(&[][..], |image| image.rows);
+        let rows: Vec<Entry> = (mapped_rows.len()..self.len()).map(|i| *self.entry(TyId(i as u32))).collect();
         let n = mapped_rows.len() + rows.len();
-        if !mapped_rows.iter().chain(&rows).all(|r|
-            (r.offset as usize).checked_add(r.bytes as usize).is_some_and(|end| end <= mapped_kinds.len() + kinds.len())
-            && r.next as usize <= n && (r.erased as usize) < n) { return None; }
+        if !rows.iter().all(|r| r.next as usize <= n && (r.erased.0 as usize) < n) { return None; }
         let buckets: Vec<u32> = self.buckets.iter().enumerate().filter_map(|(i, head)| {
             let head = head.load(Ordering::Relaxed);
             (head != 0).then_some([i as u32, head])
         }).flatten().collect();
+        // list bucket heads before the words: every head (and the rows taken above) names a list
+        // published before the words are copied, so the image never holds a head past its words
+        let list_buckets = self.lists.bucket_pairs();
+        let mapped_words = self.lists.mapped;
+        let words = self.lists.tail_words(mapped_words.len());
         let mut image = crate::image::Writer::default();
         image.add_bytes(0, meta); image.add_mapped_prefix(1, mapped_rows, &rows);
-        image.add_chunks(2, vec![crate::image::Chunk::Mapped(mapped_kinds), crate::image::Chunk::Owned(kinds)]);
+        image.add_mapped_prefix(2, mapped_words, &words);
         image.add_owned(3, &buckets);
+        image.add_owned(4, &list_buckets);
         Some(image)
     }
 
     pub fn restore_collected(bytes: &'static [u8]) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
-        let rows: &'static [TypeRow] = image.slice(1, 1)?;
-        let kinds = image.bytes(2, 2)?;
+        let rows: &'static [Entry] = image.slice(1, 1)?;
+        let words: &'static [u32] = image.slice(2, 2)?;
         let buckets: &'static [u32] = image.slice(3, 3)?;
+        let list_buckets: &'static [u32] = image.slice(4, 4)?;
         let n = rows.len();
         // The checksummed, same-build snapshot is constructed from valid interner entries.
         // Row relationships were certified at publication; demand decoding still uses
@@ -255,22 +229,18 @@ impl Types {
             if pair[0] as usize >= t.buckets.len() || pair[1] as usize > n { return None; }
             *t.buckets[pair[0] as usize].get_mut() = pair[1];
         }
-        // Retire new()'s primitive arena. Mapped IDs need no Entry allocations until used;
+        t.lists = list::Lists::restored(words, list_buckets)?;
+        // Retire new()'s primitive arena. Mapped IDs need no Entry allocations;
         // subsequent interning starts after the image and retains the same append-only IDs.
         let first = *t.chunks[0].get_mut();
-        for i in 0..t.len() { unsafe { std::ptr::drop_in_place(first.add(i)); } }
         unsafe { std::alloc::dealloc(first.cast(), std::alloc::Layout::array::<Entry>(CHUNK).ok()?); }
         *t.chunks[0].get_mut() = std::ptr::null_mut();
-        t.image = Some(MappedTypes { rows, kinds, ready: crate::collected::LazySlots::new(n) });
+        t.image = Some(MappedTypes { rows });
         *t.len.get_mut() = n as u32;
         Some(t)
     }
 }
 
-impl<T: Codec> Codec for DynList<T> {
-    fn put(&self, w: &mut Vec<u8>) { self.len().put(w); for v in self.iter() { v.put(w); } }
-    fn get(r: &mut Decode<'_>) -> Option<Self> { Some(Vec::<T>::get(r)?.into()) }
-}
 
 #[cfg(test)]
 mod tests {
@@ -281,13 +251,13 @@ mod tests {
         let tys = Types::new();
         let region = tys.intern_region(RegionKind::ReBound(1, BoundVar(2)));
         let reference = tys.intern(TyKind::Ref(false, tys.u8_, region));
-        let signature = tys.intern(TyKind::FnPtr(vec![reference], reference, FnHeader::RUST, 3));
+        let signature = tys.intern(TyKind::FnPtr(tys.mk_list(&[reference]), reference, FnHeader::RUST, 3));
         let scalar = tys.const_usize(37);
         let array = tys.mk_array(reference, scalar);
-        let tuple = tys.intern(TyKind::Tuple(vec![array, signature]));
+        let tuple = tys.intern(TyKind::Tuple(tys.mk_list(&[array, signature])));
         let regions = tys.intern_region_args(&[region]);
         let alias = tys.intern(TyKind::Alias(crate::consts::IsRigid::No,
-            AliasTy { kind: AliasTyKind::Opaque { def_id: crate::program::DefId(42) }, args: vec![tuple], regions }));
+            AliasTy { kind: AliasTyKind::Opaque { def_id: crate::program::DefId(42) }, args: tys.mk_list(&[tuple]), regions }));
         let closure = tys.intern(TyKind::Closure(0, 7, ClosureArgs {
             parent_args: alias, closure_kind_ty: tys.i32_, closure_sig_as_fn_ptr_ty: signature, tupled_upvars_ty: tuple,
         }));
@@ -295,7 +265,7 @@ mod tests {
         let restored = Types::restore_collected(Box::leak(image.into_boxed_slice())).unwrap();
         for ty in [reference, signature, array, tuple, alias, closure] {
             assert!(restored.kind(ty) == tys.kind(ty));
-            assert_eq!(restored.intern(tys.kind(ty).clone()), ty);
+            assert_eq!(restored.intern(*tys.kind(ty)), ty);
             assert_eq!(restored.with_semantic_ids(|| crate::crate_image::encode(&ty)),
                 tys.with_semantic_ids(|| crate::crate_image::encode(&ty)));
         }

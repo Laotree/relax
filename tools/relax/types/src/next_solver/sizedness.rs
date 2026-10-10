@@ -60,7 +60,7 @@ impl Providers<'_> {
         match self.tcx.tys.kind(ty) {
             TyKind::Adt(..) => self.check_representability_adt_ty(ty)?,
             TyKind::Array(ty, _) => self.check_representability_ty(*ty)?,
-            TyKind::Tuple(tys) => { for &ty in tys { self.check_representability_ty(ty)?; } }
+            TyKind::Tuple(tys) => { for &ty in self.tcx.tys.list(*tys) { self.check_representability_ty(ty)?; } }
             _ => {}
         }
         Ok(())
@@ -74,7 +74,7 @@ impl Providers<'_> {
             let TyKind::Adt(def, args, _) = self.tcx.tys.kind(ty) else { unreachable!() };
             self.check_representability(*def)?;
             let params = self.params_in_repr(*def)?;
-            for &index in &params { self.check_representability_ty(args[index as usize])?; }
+            for &index in &params { self.check_representability_ty(self.tcx.tys.list(*args)[index as usize])?; }
             Ok(())
         }, &|id| self.force(id))
     }
@@ -89,9 +89,9 @@ impl Providers<'_> {
     }
     fn params_in_repr_ty(&self, ty: TyId, params: &mut Vec<u32>) -> Result<(), QueryError> {
         match self.tcx.tys.kind(ty) {
-            TyKind::Adt(def, args, _) => { for index in self.params_in_repr(*def)? { self.params_in_repr_ty(args[index as usize], params)?; } }
+            TyKind::Adt(def, args, _) => { for index in self.params_in_repr(*def)? { self.params_in_repr_ty(self.tcx.tys.list(*args)[index as usize], params)?; } }
             TyKind::Array(ty, _) => self.params_in_repr_ty(*ty, params)?,
-            TyKind::Tuple(tys) => { for &ty in tys { self.params_in_repr_ty(ty, params)?; } }
+            TyKind::Tuple(tys) => { for &ty in self.tcx.tys.list(*tys) { self.params_in_repr_ty(ty, params)?; } }
             TyKind::Param(index) => { if !params.contains(index) { params.push(*index); } }
             _ => {}
         }
@@ -103,10 +103,10 @@ impl Providers<'_> {
             | TyKind::FnPtr(..) | TyKind::Array(..) | TyKind::Closure(..) | TyKind::Never => None,
             TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => if kind == SizedTraitKind::Sized { Some(ty) } else { None },
             TyKind::Foreign(_) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Error => Some(ty),
-            TyKind::Tuple(tys) => match tys.last() { Some(&ty) => self.sizedness_constraint_for_ty(kind, ty)?, None => None },
+            TyKind::Tuple(tys) => match self.tcx.tys.list(*tys).last() { Some(&ty) => self.sizedness_constraint_for_ty(kind, ty)?, None => None },
             TyKind::Adt(def, args, regions) => match self.adt_sizedness_constraint(SizednessKey { def: *def, kind })? {
                 Some(ty) => {
-                    let full = self.tcx.complete_args(self.prog, *def, args, *regions);
+                    let full = self.tcx.complete_args(self.prog, *def, self.tcx.tys.list(*args), *regions);
                     let ty = self.tcx.instantiate_ty(self.prog, *def, &full, ty);
                     self.sizedness_constraint_for_ty(kind, ty)?
                 }

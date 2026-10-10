@@ -32,7 +32,7 @@ impl DropProvider for Provider {
                 }
                 Ok(false)
             }
-            TyKind::Tuple(fields) => { for &field in fields { if self.needs_drop(field)? { return Ok(true); } } Ok(false) }
+            TyKind::Tuple(fields) => { for &field in self.tcx.tys.list(*fields) { if self.needs_drop(field)? { return Ok(true); } } Ok(false) }
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) => self.needs_drop(*captures),
             TyKind::Array(elem, len) => {
                 let zero = len.try_to_target_usize(&self.tcx.tys) == Some(0);
@@ -81,7 +81,7 @@ impl Provider {
         for i in 0..self.prog.defs.len() { let d = DefId(i as u32); if self.prog.name(d) == name { return d; } }
         panic!("missing test definition {name}")
     }
-    fn adt(&self, name: &str, args: Vec<TyId>) -> TyId { self.tcx.tys.intern(TyKind::Adt(self.def(name), args, crate::types::RegionArgsId::EMPTY)) }
+    fn adt(&self, name: &str, args: Vec<TyId>) -> TyId { self.tcx.tys.intern(TyKind::Adt(self.def(name), self.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY)) }
     fn d(&self) -> TyId { self.adt("D", vec![]) }
     fn e(&self) -> TyId { self.adt("E", vec![]) }
     fn shim(&self, ty: TyId) -> Body {
@@ -247,6 +247,7 @@ impl<'a> Walker<'a> {
                     let Operand::Constant(c) = func else { panic!() };
                     let Const::Val(_, ty) = c.const_ else { panic!() };
                     let TyKind::FnDef(def, tys, _) = self.p.tcx.tys.kind(ty) else { panic!() };
+                    let tys = self.p.tcx.tys.list(*tys);
                     let result = if *def == self.p.def("produce") {
                         if self.produce_panics { Exit::Panic } else {
                             locals[destination.local.0 as usize] = Value::Object(Address::new("produced", 0)); Exit::Return
@@ -437,9 +438,9 @@ fn box_slice_dyn_and_unsized_tail_keep_metadata_and_cleanup() {
 #[test]
 fn tuple_box_and_vec_shim_and_closure_capture_storage() {
     let p = Provider::new(); let heap = p.adt("Heap", vec![p.d()]); let vec_ty = p.adt("VecLike", vec![]);
-    let tuple = p.tcx.tys.intern(TyKind::Tuple(vec![heap, vec_ty]));
-    let sig = p.tcx.tys.intern(TyKind::FnPtr(vec![], p.tcx.tys.unit, crate::types::FnHeader::RUST, 0));
-    let owner = p.tcx.tys.intern(TyKind::FnDef(p.def("produce"), vec![], crate::types::RegionArgsId::EMPTY));
+    let tuple = p.tcx.tys.intern(TyKind::Tuple(p.tcx.tys.mk_list(&[heap, vec_ty])));
+    let sig = p.tcx.tys.intern(TyKind::FnPtr(p.tcx.tys.mk_list(&[]), p.tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+    let owner = p.tcx.tys.intern(TyKind::FnDef(p.def("produce"), p.tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY));
     let closure = p.tcx.tys.intern(TyKind::Closure(0, 123, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: p.tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tuple }));
     for ty in [tuple, closure] {
         let mut w = Walker::new(&p); w.heap("t.0", "p", 0);

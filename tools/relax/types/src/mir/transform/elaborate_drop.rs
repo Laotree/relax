@@ -49,7 +49,7 @@ pub(crate) fn integer(ty: TyId, bits: u128, size: u8, span: Span) -> Operand {
 }
 pub(crate) fn function(provider: &dyn DropProvider, def: DefId, args: Vec<TyId>, span: Span) -> Operand {
     Operand::Constant(Box::new(ConstOperand { span, user_ty: None,
-        const_: Const::Val(ConstValue::ZeroSized, provider.tcx().tys.intern(TyKind::FnDef(def, args, crate::types::RegionArgsId::EMPTY))) }))
+        const_: Const::Val(ConstValue::ZeroSized, provider.tcx().tys.intern(TyKind::FnDef(def, provider.tcx().tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))) }))
 }
 impl DropCtxt<'_> {
     fn ty(&self, place: &Place) -> Result<TyId, DropError> {
@@ -328,13 +328,13 @@ impl DropCtxt<'_> {
     fn open(&mut self, site: &DropSite) -> Result<BasicBlock, DropError> {
         let ty = self.ty(&site.place)?;
         match self.provider.tcx().tys.kind(ty) {
-            TyKind::Tuple(fields) => self.tuple(site, ty, fields.len()),
+            TyKind::Tuple(fields) => self.tuple(site, ty, self.provider.tcx().tys.list(*fields).len()),
             TyKind::Closure(file, expr, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) => {
                 if self.provider.tcx().coroutines.contains_key(&(*file, *expr)) { return Err(DropError::Unsupported("coroutine drop")); }
                 let TyKind::Tuple(fields) = self.provider.tcx().tys.kind(*captures) else { return Err(DropError::InvalidMir("closure capture storage")); };
-                self.tuple(site, ty, fields.len())
+                self.tuple(site, ty, self.provider.tcx().tys.list(*fields).len())
             }
-            TyKind::Adt(def, args, _) => self.adt(site, ty, *def, args),
+            TyKind::Adt(def, args, _) => self.adt(site, ty, *def, self.provider.tcx().tys.list(*args)),
             // Dyn Drop remains a virtual glue call; M6a resolves it via the vtable,
             // carrying the same wide pointer. rustc elaborate_drop.rs:1309;
             // rustc_codegen_ssa/src/mir/block.rs:594,625 (optional vtable slot).

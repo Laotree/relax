@@ -152,7 +152,7 @@ fn invalid_reservation_does_not_report_activation_again() {
 }
 #[test]
 fn partial_move_field_reinitialization_and_full_move_rejection() {
-    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let f = |n| Place { local: Local(1), projection: vec![PlaceElem::Field(FieldIdx(n), t)] };
     let mut b = body(&[tcx.tys.unit, tuple, t], vec![block(vec![assign(2, Operand::Move(f(0))),
         StatementKind::Assign(f(0), Rvalue::Use(val(t))), assign(2, Operand::Copy(f(1)))], TerminatorKind::Return)]);
@@ -390,7 +390,7 @@ fn destructor_prefix_borrow_and_illegal_field_move() {
     std::fs::remove_file(file).unwrap(); prog.resolve_imports(); let mut tcx = Tcx::new(); tcx.collect(&prog); assert!(tcx.errors.is_empty());
     let def = (0..prog.defs.len()).map(|i|DefId(i as u32)).find(|&d|prog.name(d)=="S").unwrap();
     assert!(tcx.adt_destructor(def).is_some());
-    let ty = tcx.tys.intern(TyKind::Adt(def,vec![],crate::types::RegionArgsId::EMPTY)); let t=tcx.tys.i32_;
+    let ty = tcx.tys.intern(TyKind::Adt(def,tcx.tys.mk_list(&[]),crate::types::RegionArgsId::EMPTY)); let t=tcx.tys.i32_;
     let field = Place {local:Local(1),projection:vec![PlaceElem::Field(FieldIdx(0),t)]};
     let mut b = body(&[tcx.tys.unit,ty,reference(&tcx,t,false),t],vec![block(vec![borrow(2,field.clone(),1,BorrowKind::Shared)],
         TerminatorKind::Drop {place:p(1),target:BasicBlock(1),unwind:UnwindAction::Continue,replace:false}),block(vec![],TerminatorKind::Return)]);
@@ -494,7 +494,7 @@ fn call(unit: TyId, args: Vec<Operand>, arg_spans: Vec<Span>, destination: Place
 fn reaudit_moved_error_suppressed_for_prefix_of_reported_place() {
     // nll/issue-21232-partial-init-and-use.rs test_0011: `drop(t); t.0 = ..; t.1 = ..;`
     // reports one E0382: the second use (`t`, prefix of the reported `t`) is suppressed.
-    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let f = |n| Place { local: Local(1), projection: vec![PlaceElem::Field(FieldIdx(n), t)] };
     let b = body(&[tcx.tys.unit, tuple, tuple], vec![block(vec![assign(2, Operand::Move(p(1))),
         StatementKind::Assign(f(0), Rvalue::Use(val(t))), StatementKind::Assign(f(1), Rvalue::Use(val(t)))], TerminatorKind::Return)]);
@@ -506,7 +506,7 @@ fn reaudit_descendant_search_visits_siblings_before_grandchildren() {
     // move_paths/mod.rs:106 find_descendant: the stack takes a path's first child, then
     // its next sibling, so a sibling is found before the first child's own children.
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
-    let inner = tcx.tys.intern(TyKind::Tuple(vec![t, t])); let outer = tcx.tys.intern(TyKind::Tuple(vec![t, inner]));
+    let inner = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t]))); let outer = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, inner])));
     let f0 = Place { local: Local(1), projection: vec![PlaceElem::Field(FieldIdx(0), t)] };
     let f10 = Place { local: Local(1), projection: vec![PlaceElem::Field(FieldIdx(1), inner), PlaceElem::Field(FieldIdx(0), t)] };
     let b = body(&[tcx.tys.unit, outer, t, t], vec![block(vec![assign(2, Operand::Move(f0)), assign(3, Operand::Move(f10))], TerminatorKind::Return)]);
@@ -523,7 +523,7 @@ fn reaudit_descendant_search_visits_siblings_before_grandchildren() {
 fn reaudit_illegal_moves_of_one_match_are_grouped_at_the_match() {
     // diagnostics/move_errors.rs:118-232: `match *r { (a, b) => .. }` is one E0507 at the
     // matched place; a simple `let` points at the statement; other moves at the location.
-    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let tcx = Tcx::new(); let t = tcx.tys.i32_; let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let r = reference(&tcx, tuple, false);
     let deref = Place { local: Local(1), projection: vec![PlaceElem::Deref] };
     let field = |n| Place { local: Local(1), projection: vec![PlaceElem::Deref, PlaceElem::Field(FieldIdx(n), t)] };

@@ -128,7 +128,7 @@ impl Instance {
                 // Synthetic closure args are the parent args followed by kind,
                 // signature and tupled upvars, as ClosureArgs::split in nightly.
                 let TyKind::FnDef(parent, args, regions) = tcx.tys.kind(closure_args.parent_args) else { panic!("closure parent args") };
-                let mut args = tcx.complete_args(prog, *parent, args, *regions);
+                let mut args = tcx.complete_args(prog, *parent, tcx.tys.list(*args), *regions);
                 args.push(GenericArg::Type(closure_args.kind_ty()));
                 args.push(GenericArg::Type(closure_args.sig_as_fn_ptr_ty()));
                 args.push(GenericArg::Type(closure_args.tupled_upvars_ty));

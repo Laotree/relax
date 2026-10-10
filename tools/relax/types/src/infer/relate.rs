@@ -97,10 +97,11 @@ pub fn structurally_relate_tys(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -
     let ak = tys.kind(a).clone();
     let bk = tys.kind(b).clone();
     let k = match (ak, bk) {
-        (TyKind::Tuple(a), TyKind::Tuple(b)) if a.len() == b.len() => {
+        (TyKind::Tuple(a), TyKind::Tuple(b)) if tys.list(a).len() == tys.list(b).len() => {
+            let (a, b) = (tys.list(a), tys.list(b));
             let mut ts = Vec::with_capacity(a.len());
             for i in 0..a.len() { ts.push(relate_with_variance(r, V::Co, a[i], b[i])?); }
-            TyKind::Tuple(ts)
+            TyKind::Tuple(tys.mk_list(&ts))
         }
         (TyKind::Slice(a), TyKind::Slice(b)) => TyKind::Slice(relate_with_variance(r, V::Co, a, b)?),
         (TyKind::Const(a), TyKind::Const(b)) => TyKind::Const(r.consts(a, b)?),
@@ -112,17 +113,18 @@ pub fn structurally_relate_tys(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -
         (TyKind::Ptr(am, a), TyKind::Ptr(bm, b)) if am == bm =>
             TyKind::Ptr(am, relate_with_variance(r, if am { V::Inv } else { V::Co }, a, b)?),
         (TyKind::Adt(ad, aa, ar), TyKind::Adt(bd, ba, br)) if ad == bd => {
-            let (args, regions) = relate_ty_args(r, ad, a, b, &aa, &ba, ar, br)?;
-            TyKind::Adt(ad, args, regions)
+            let (args, regions) = relate_ty_args(r, ad, a, b, tys.list(aa), tys.list(ba), ar, br)?;
+            TyKind::Adt(ad, tys.mk_list(&args), regions)
         }
         (TyKind::FnDef(ad, aa, ar), TyKind::FnDef(bd, ba, br)) if ad == bd => {
-            let (args, regions) = relate_ty_args(r, ad, a, b, &aa, &ba, ar, br)?;
-            TyKind::FnDef(ad, args, regions)
+            let (args, regions) = relate_ty_args(r, ad, a, b, tys.list(aa), tys.list(ba), ar, br)?;
+            TyKind::FnDef(ad, tys.mk_list(&args), regions)
         }
         (TyKind::Alias(ar, aa), TyKind::Alias(br, ba)) if ar == br && aa.kind == ba.kind => {
-            if aa.args.len() != ba.args.len() { return Err(TypeError::Mismatch); }
-            let mut args = Vec::with_capacity(aa.args.len());
-            for i in 0..aa.args.len() { args.push(relate_with_variance(r, V::Inv, aa.args[i], ba.args[i])?); }
+            if tys.list(aa.args).len() != tys.list(ba.args).len() { return Err(TypeError::Mismatch); }
+            let (aargs, bargs) = (tys.list(aa.args), tys.list(ba.args));
+            let mut args = Vec::with_capacity(aargs.len());
+            for i in 0..aargs.len() { args.push(relate_with_variance(r, V::Inv, aargs[i], bargs[i])?); }
             let ars = tys.region_args(aa.regions);
             let brs = tys.region_args(ba.regions);
             if ars.len() != brs.len() { return Err(TypeError::Mismatch); }
@@ -131,14 +133,14 @@ pub fn structurally_relate_tys(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -
                 let variance = alias_region_variance(r.tcx(), r.prog(), &aa, i);
                 regions.push(relate_region_with_variance(r, variance, ars[i], brs[i])?);
             }
-            TyKind::Alias(ar, crate::types::AliasTy { kind: aa.kind, args, regions: tys.intern_region_args(&regions) })
+            TyKind::Alias(ar, crate::types::AliasTy { kind: aa.kind, args: tys.mk_list(&args), regions: tys.intern_region_args(&regions) })
         }
-        (TyKind::Dyn(ad, aa, ab, ar, al, an, autos), TyKind::Dyn(bd, ba, bb, br, bl, _, bautos)) if ad == bd && autos == bautos && ab.len() == bb.len() => {
+        (TyKind::Dyn(ad, aa, ab, ar, al, an, autos), TyKind::Dyn(bd, ba, bb, br, bl, _, bautos)) if ad == bd && autos == bautos && tys.list(ab).len() == tys.list(bb).len() => {
             let mut args = Vec::new();
             let mut other = Vec::new();
-            for &ty in &aa { args.push(GenericArg::Type(ty)); }
+            for &ty in tys.list(aa) { args.push(GenericArg::Type(ty)); }
             for &region in &*tys.region_args(ar) { args.push(GenericArg::Lifetime(region)); }
-            for &ty in &ba { other.push(GenericArg::Type(ty)); }
+            for &ty in tys.list(ba) { other.push(GenericArg::Type(ty)); }
             for &region in &*tys.region_args(br) { other.push(GenericArg::Lifetime(region)); }
             let related = r.binders_args(&args, &other)?;
             let mut args = Vec::new();
@@ -146,6 +148,7 @@ pub fn structurally_relate_tys(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -
             for arg in related {
                 match arg { GenericArg::Type(ty) => args.push(ty), GenericArg::Lifetime(region) => regions.push(region), GenericArg::Const(_) => unreachable!() }
             }
+            let (ab, bb) = (tys.list(ab), tys.list(bb));
             let mut bindings = Vec::with_capacity(ab.len());
             for i in 0..ab.len() {
                 let (ad, a, n) = ab[i];
@@ -156,7 +159,7 @@ pub fn structurally_relate_tys(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -
                 bindings.push((ad, ty, n));
             }
             let region = r.regions(al, bl)?;
-            TyKind::Dyn(ad, args.into(), bindings.into(), tys.intern_region_args(&regions), region, an, autos.into())
+            TyKind::Dyn(ad, tys.mk_list(&args), tys.mk_list(&bindings), tys.intern_region_args(&regions), region, an, autos)
         }
         (TyKind::FnPtr(..), TyKind::FnPtr(..)) => return r.binders(a, b),
         (TyKind::Closure(af, ae, crate::types::ClosureArgs { parent_args: ao, closure_kind_ty: ak, closure_sig_as_fn_ptr_ty: asig, tupled_upvars_ty: au }), TyKind::Closure(bf, be, crate::types::ClosureArgs { parent_args: bo, closure_kind_ty: bk, closure_sig_as_fn_ptr_ty: bsig, tupled_upvars_ty: bu })) if af == bf && ae == be =>
@@ -171,11 +174,12 @@ pub fn relate_fn_sig(r: &mut dyn TypeRelation<'_>, a: TyId, b: TyId) -> Result<T
     let tys = &r.tcx().tys;
     let TyKind::FnPtr(ap, ar, ah, an) = tys.kind(a).clone() else { panic!("expected fn binder") };
     let TyKind::FnPtr(bp, br, bh, _) = tys.kind(b).clone() else { panic!("expected fn binder") };
-    if ap.len() != bp.len() || ah != bh { return Err(TypeError::Mismatch); }
+    if tys.list(ap).len() != tys.list(bp).len() || ah != bh { return Err(TypeError::Mismatch); }
+    let (ap, bp) = (tys.list(ap), tys.list(bp));
     let mut params = Vec::with_capacity(ap.len());
     for i in 0..ap.len() { params.push(relate_with_variance(r, V::Contra, ap[i], bp[i])?); }
     let ret = relate_with_variance(r, V::Co, ar, br)?;
-    Ok(tys.intern(TyKind::FnPtr(params, ret, ah, an)))
+    Ok(tys.intern(TyKind::FnPtr(tys.mk_list(&params), ret, ah, an)))
 }
 
 pub fn structurally_relate_consts(r: &mut dyn TypeRelation<'_>, a: Const, b: Const) -> Result<Const, TypeError> {

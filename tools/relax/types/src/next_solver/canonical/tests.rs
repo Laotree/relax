@@ -81,7 +81,7 @@ fn input_round_trip_keeps_lifetime_type_const_and_nested_binder_identity() {
     let local = tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
     let ty = infcx.next_ty_var();
     let ct = infcx.next_const_var();
-    let sig = tys.intern(TyKind::FnPtr(vec![tys.intern(TyKind::Ref(false, ty, local))], tys.intern(TyKind::Ref(false, ty, outer)), FnHeader::RUST, 1));
+    let sig = tys.intern(TyKind::FnPtr(tys.mk_list(&[tys.intern(TyKind::Ref(false, ty, local))]), tys.intern(TyKind::Ref(false, ty, outer)), FnHeader::RUST, 1));
     let alias = AliasConst { kind: AliasConstKind::Anon { def_id: DefId(9) }, args: vec![GenericArg::Lifetime(outer), GenericArg::Type(sig), GenericArg::Const(ct)].into() };
     let alias = tys.intern_const(ConstKind::Alias(IsRigid::No, alias));
     let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(sig), GenericArg::Const(alias)] }, polarity: ClausePolarity::Positive }))) };
@@ -216,7 +216,7 @@ fn native_array_lengths_and_nominal_const_slots_round_trip() {
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let ct = infcx.next_const_var();
     let array = tys.mk_array(tys.u8_, ct);
-    let nominal = tys.intern(TyKind::Adt(DefId(1), vec![tys.intern(TyKind::Const(ct)), array], crate::types::RegionArgsId::EMPTY));
+    let nominal = tys.intern(TyKind::Adt(DefId(1), tys.mk_list(&[tys.intern(TyKind::Const(ct)), array]), crate::types::RegionArgsId::EMPTY));
     let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(nominal)))) };
     let (values, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence);
     assert_eq!(values, vec![GenericArg::Const(ct)]);

@@ -342,7 +342,7 @@ impl Tcx {
         let written = if let Some(GenericArgs::Paren(ps, output)) = ast.segs(path.segs).last().and_then(|s| ast.gargs(s.args)) {
             let (ps, output) = self.lower_fn_trait_bound_args(cx, prog, def.file, def.scope, &mut env, *ps, *output);
             callable_output = Some(output);
-            vec![self.tys.intern(TyKind::Tuple(ps))]
+            vec![self.tys.intern(TyKind::Tuple(self.tys.mk_list(&ps)))]
         } else { self.lower_generic_args(cx, prog, def.file, def.scope, &env, &path) };
         let ta = self.fill_trait_defaults(cx, prog, td, ty, written);
         let regions = self.lower_region_args(cx.infcx, prog, def.file, def.scope, &env, &path);
@@ -360,7 +360,7 @@ impl Tcx {
             GenericArgs::Paren(..) => {
                 if let Some(ad) = self.callable_output(td) {
                     let value = callable_output.expect("parenthesized callable output");
-                    let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: compact, regions }));
+                    let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&compact), regions }));
                     out.push(Predicate { kind: PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(value) })), bound_vars: vars });
                 }
             }
@@ -398,7 +398,7 @@ impl Tcx {
                             }
                         }
                     }
-                    let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args, regions: self.tys.intern_region_args(&rs) }));
+                    let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&rs) }));
                     match *arg {
                         ast::GenericArg::Binding(_, _, value) => {
                             let value = self.lower_ty(cx, prog, def.file, def.scope, &env, value);

@@ -271,20 +271,20 @@ fn app_scope_live_layout_edits() {
     let mut tcx = crate::tcx::Tcx::new();
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
-    let ty = tcx.tys.intern(TyKind::Adt(state, vec![], RegionArgsId::EMPTY));
+    let ty = tcx.tys.intern(TyKind::Adt(state, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
     if case.starts_with("bound_template") {
         use crate::consts::GenericArg;
         use crate::types::{AliasTyKind, BoundVar, RegionKind};
         let region = tcx.tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
         let projection = tcx.alias_ty_with_args(AliasTyKind::Projection { def_id: def("Out", framework) },
             &[GenericArg::Type(tcx.tys.u8_), GenericArg::Lifetime(region)]);
-        let template = tcx.tys.intern(TyKind::Adt(holder, vec![projection], RegionArgsId::EMPTY));
+        let template = tcx.tys.intern(TyKind::Adt(holder, tcx.tys.mk_list(&[projection]), RegionArgsId::EMPTY));
         assert!(tcx.tys.is_concrete(template));
         assert!(tcx.tys.has_escaping_bound_vars(template));
     }
     if matches!(case.as_str(), "embedded" | "generic_embedded" | "pointer" | "bound_template_embedded") {
         let args = if matches!(case.as_str(), "generic_embedded" | "bound_template_embedded") { vec![ty] } else { vec![] };
-        tcx.tys.intern(TyKind::Adt(holder, args, RegionArgsId::EMPTY));
+        tcx.tys.intern(TyKind::Adt(holder, tcx.tys.mk_list(&args), RegionArgsId::EMPTY));
     }
     let mut u = jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut jit::Unit;

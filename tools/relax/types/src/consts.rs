@@ -222,7 +222,7 @@ mod tests {
         let byte = scalar(&tys, tys.u8_, 7, 1);
         let boolean = scalar(&tys, tys.bool_, 1, 1);
         let fields = ValTree::from_branches(&tys, &[byte, boolean]);
-        let value = Const::new_value(&tys, fields.clone(), tys.intern(TyKind::Tuple(vec![tys.u8_, tys.bool_])));
+        let value = Const::new_value(&tys, fields.clone(), tys.intern(TyKind::Tuple(tys.mk_list(&[tys.u8_, tys.bool_]))));
         assert_eq!(value.try_to_value(&tys).unwrap().valtree, fields);
         assert_eq!(fields.try_to_branch(), Some(&[byte, boolean][..]));
         assert_eq!(boolean.try_to_value(&tys).unwrap().ty, tys.bool_);
@@ -350,11 +350,12 @@ mod array_tests {
         assert_eq!(n.try_to_target_usize(&tys), Some(u64::MAX));
         let param = tys.intern_const(ConstKind::Param(ParamConst { index: 0 }));
         let arr = tys.mk_array(tys.u32_, param);
-        let nominal = tys.intern(TyKind::Adt(DefId(1), vec![tys.intern(TyKind::Const(param)), arr], crate::types::RegionArgsId::EMPTY));
+        let nominal = tys.intern(TyKind::Adt(DefId(1), tys.mk_list(&[tys.intern(TyKind::Const(param)), arr]), crate::types::RegionArgsId::EMPTY));
         assert!(tys.flags(nominal).contains(TypeFlags::HAS_TY_PARAM));
         let arg = tys.intern(TyKind::Const(tys.const_usize(7)));
         let instantiated = tys.subst(nominal, &[arg]);
         let TyKind::Adt(_, args, _) = tys.kind(instantiated) else { panic!() };
+        let args = tys.list(*args);
         assert_eq!(args[0], arg);
         assert_eq!(args[1], tys.mk_array(tys.u32_, tys.const_usize(7)));
     }

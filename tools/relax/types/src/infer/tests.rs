@@ -196,7 +196,7 @@ fn solver_relating_preserves_alias_obligations_and_subtype_direction() {
     let tcx = Tcx::new();
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let var = infcx.next_ty_var();
-    let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(55) }, args: vec![var], regions: RegionArgsId::EMPTY }));
+    let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(55) }, args: tcx.tys.mk_list(&[var]), regions: RegionArgsId::EMPTY }));
     let goals = infcx.at(&prog, Default::default()).eq(var, alias).unwrap();
     assert_eq!(goals.len(), 1);
     let PredicateKind::Clause(ClauseKind::Projection(projection)) = &goals[0].predicate.kind else { panic!() };
@@ -218,11 +218,11 @@ fn generalization_rejects_cycles_and_rolls_back_partial_bindings() {
     let tcx = Tcx::new();
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let var = infcx.next_ty_var();
-    let recursive = tcx.tys.intern(TyKind::Tuple(vec![var]));
+    let recursive = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[var])));
     assert!(infcx.at(&prog, Default::default()).eq(var, recursive).is_err());
     assert_eq!(infcx.shallow_resolve(var), var);
-    let lhs = tcx.tys.intern(TyKind::Tuple(vec![var, tcx.tys.bool_]));
-    let rhs = tcx.tys.intern(TyKind::Tuple(vec![tcx.tys.u8_, tcx.tys.usize_]));
+    let lhs = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[var, tcx.tys.bool_])));
+    let rhs = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[tcx.tys.u8_, tcx.tys.usize_])));
     // rustc_infer/src/infer/at.rs:131-230 (round-28 D2): At does not roll back; the caller's
     // commit_if_ok boundary does.
     assert!(infcx.commit_if_ok(|_| infcx.at(&prog, Default::default()).eq(lhs, rhs)).is_err());
@@ -239,8 +239,8 @@ fn higher_ranked_relation_leak_check_distinguishes_static_and_general_pointer() 
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let bound = tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
     let static_ = tys.intern_region(RegionKind::ReStatic);
-    let general = tys.intern(TyKind::FnPtr(vec![tys.intern(TyKind::Ref(false, tys.u8_, bound))], tys.unit, FnHeader::RUST, 1));
-    let specific = tys.intern(TyKind::FnPtr(vec![tys.intern(TyKind::Ref(false, tys.u8_, static_))], tys.unit, FnHeader::RUST, 0));
+    let general = tys.intern(TyKind::FnPtr(tys.mk_list(&[tys.intern(TyKind::Ref(false, tys.u8_, bound))]), tys.unit, FnHeader::RUST, 1));
+    let specific = tys.intern(TyKind::FnPtr(tys.mk_list(&[tys.intern(TyKind::Ref(false, tys.u8_, static_))]), tys.unit, FnHeader::RUST, 0));
     let outer = infcx.universe();
     infcx.probe(|snapshot| {
         assert!(infcx.at(&prog, Default::default()).eq(general, specific).is_ok());
@@ -358,8 +358,8 @@ fn dynamic_projection_binders_preserve_region_constraints() {
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let bound = tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
     let static_ = tys.intern_region(RegionKind::ReStatic);
-    let general = tys.intern(TyKind::Dyn(DefId(1), vec![].into(), vec![(DefId(2), tys.intern(TyKind::Ref(false, tys.u8_, bound)), 1)].into(), RegionArgsId::EMPTY, static_, 0, vec![].into()));
-    let specific = tys.intern(TyKind::Dyn(DefId(1), vec![].into(), vec![(DefId(2), tys.intern(TyKind::Ref(false, tys.u8_, static_)), 0)].into(), RegionArgsId::EMPTY, static_, 0, vec![].into()));
+    let general = tys.intern(TyKind::Dyn(DefId(1), crate::types::List::EMPTY, tys.mk_list(&[(DefId(2), tys.intern(TyKind::Ref(false, tys.u8_, bound)), 1)]), RegionArgsId::EMPTY, static_, 0, crate::types::List::EMPTY));
+    let specific = tys.intern(TyKind::Dyn(DefId(1), crate::types::List::EMPTY, tys.mk_list(&[(DefId(2), tys.intern(TyKind::Ref(false, tys.u8_, static_)), 0)]), RegionArgsId::EMPTY, static_, 0, crate::types::List::EMPTY));
     let outer = infcx.universe();
     infcx.probe(|snapshot| {
         infcx.at(&prog, Default::default()).eq(general, specific).unwrap();
@@ -456,11 +456,12 @@ fn fudge_resolves_expectations_and_replaces_popped_variables_of_each_kind() {
         let array = tys.mk_array(infcx.next_ty_var(), infcx.next_const_var());
         let reference = tys.intern(TyKind::Ref(false, array, region));
         infcx.at(&prog, Default::default()).eq(outer, reference).unwrap();
-        Ok(tys.intern(TyKind::Tuple(vec![outer, infcx.next_int_var(), infcx.next_float_var()])))
+        Ok(tys.intern(TyKind::Tuple(tys.mk_list(&[outer, infcx.next_int_var(), infcx.next_float_var()]))))
     });
     assert_eq!(infcx.shallow_resolve(outer), outer);
     let result = result.unwrap();
     let TyKind::Tuple(fields) = tys.kind(result) else { panic!() };
+    let fields = tys.list(*fields);
     let reference = fields[0];
     let TyKind::Ref(_, array, region) = tys.kind(reference) else { panic!() };
     let TyKind::Array(element, length) = tys.kind(*array) else { panic!() };
@@ -483,11 +484,11 @@ fn rigid_aliases_relate_structurally_while_all_nonrigid_kinds_emit_goals() {
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     for kind in [AliasTyKind::Projection { def_id: DefId(1) }, AliasTyKind::Inherent { def_id: DefId(2) }, AliasTyKind::Free { def_id: DefId(3) }] {
         let var = infcx.next_ty_var();
-        let rigid = tys.intern(TyKind::Alias(IsRigid::Yes, AliasTy { kind, args: vec![var], regions: RegionArgsId::EMPTY }));
-        let other = tys.intern(TyKind::Alias(IsRigid::Yes, AliasTy { kind, args: vec![tys.u8_], regions: RegionArgsId::EMPTY }));
+        let rigid = tys.intern(TyKind::Alias(IsRigid::Yes, AliasTy { kind, args: tys.mk_list(&[var]), regions: RegionArgsId::EMPTY }));
+        let other = tys.intern(TyKind::Alias(IsRigid::Yes, AliasTy { kind, args: tys.mk_list(&[tys.u8_]), regions: RegionArgsId::EMPTY }));
         assert!(infcx.at(&prog, Default::default()).eq(rigid, other).unwrap().is_empty());
         assert_eq!(infcx.shallow_resolve(var), tys.u8_);
-        let alias = tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args: vec![tys.u8_], regions: RegionArgsId::EMPTY }));
+        let alias = tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args: tys.mk_list(&[tys.u8_]), regions: RegionArgsId::EMPTY }));
         let result = infcx.at(&prog, Default::default()).eq(alias, tys.bool_).unwrap();
         assert_eq!(result.len(), 1);
     }
@@ -573,9 +574,9 @@ fn round29_lattice_variable_order_and_higher_ranked_binders() {
     assert_eq!(infcx.shallow_resolve(var), tcx.tys.u32_);
     let region = tcx.tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
     let arg = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, region));
-    let hr = tcx.tys.intern(TyKind::FnPtr(vec![arg], tcx.tys.unit, crate::types::FnHeader::RUST, 1));
+    let hr = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[arg]), tcx.tys.unit, crate::types::FnHeader::RUST, 1));
     let static_arg = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, tcx.tys.intern_region(RegionKind::ReStatic)));
-    let mono = tcx.tys.intern(TyKind::FnPtr(vec![static_arg], tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+    let mono = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[static_arg]), tcx.tys.unit, crate::types::FnHeader::RUST, 0));
     let snapshot = infcx.start_snapshot();
     infcx.at(&prog, Default::default()).lub(hr, mono).unwrap();
     assert!(infcx.leak_check(UniverseIndex::ROOT, Some(&snapshot)).is_err());

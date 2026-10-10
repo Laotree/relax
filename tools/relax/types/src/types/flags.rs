@@ -41,6 +41,12 @@ impl TypeFlags {
     pub const HAS_BOUND_VARS: Self = Self(Self::HAS_TY_BOUND.0 | Self::HAS_RE_BOUND.0 | Self::HAS_CT_BOUND.0);
     pub const HAS_REGIONS: Self = Self(Self::HAS_FREE_REGIONS.0 | Self::HAS_RE_BOUND.0 | Self::HAS_RE_ERASED.0);
 
+    /// Every bit a type's flags can hold (types.rs packs them below bit 21).
+    pub(crate) const ALL_BITS: u32 = F_INFER | F_ERROR | F_OPAQUE | F_PROJ | F_PARAM | F_NONCONC | F_ASSOC | F_STUCK
+        | Self::HAS_CT_BOUND.0 | Self::HAS_CT_PLACEHOLDER.0 | Self::HAS_ALIAS.0 | Self::HAS_NON_REGION_INFER.0
+        | Self::HAS_TY_BOUND.0 | Self::HAS_TY_PLACEHOLDER.0 | Self::HAS_RE_BOUND.0 | Self::HAS_RE_PLACEHOLDER.0
+        | Self::HAS_RE_PARAM.0 | Self::HAS_RE_INFER.0 | Self::HAS_RE_ERROR.0 | Self::HAS_RE_ERASED.0 | Self::HAS_FREE_REGIONS.0;
+
     pub fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
     pub fn intersects(self, other: Self) -> bool { self.0 & other.0 != 0 }
     pub fn bits(self) -> u32 { self.0 }
@@ -64,8 +70,7 @@ impl Computation {
     }
 
     fn ty(&mut self, tys: &Types, ty: TyId, binders: u32) {
-        let e = tys.entry(ty);
-        self.add(e.flags & !0xff, e.outer_exclusive_binder, binders);
+        self.add(tys.fl(ty) & !0xff, tys.outer_exclusive_binder(ty), binders);
     }
 
     fn region(&mut self, tys: &Types, r: RegionId, binders: u32) {
@@ -137,13 +142,13 @@ impl Types {
         match self.const_kind(ct) {
             ConstKind::Alias(_, alias) => for arg in &*alias.args {
                 depth = depth.max(match *arg {
-                    GenericArg::Type(ty) => self.entry(ty).depth,
+                    GenericArg::Type(ty) => self.depth(ty) as u16,
                     GenericArg::Const(ct) => self.const_depth(ct),
                     GenericArg::Lifetime(_) => 0,
                 });
             },
             ConstKind::Value(value) => {
-                depth = self.entry(value.ty).depth;
+                depth = self.depth(value.ty) as u16;
                 if let Some(branches) = value.valtree.try_to_branch() {
                     for &ct in branches { depth = depth.max(self.const_depth(ct)); }
                 }
@@ -158,7 +163,8 @@ impl Types {
     /// One past the greatest escaping de Bruijn index, or zero when all bound
     /// variables are captured internally. Even an empty FnPtr/dyn binder counts.
     pub fn outer_exclusive_binder(&self, t: TyId) -> DebruijnIndex {
-        self.entry(t).outer_exclusive_binder
+        let b = self.entry(t).meta >> META_BINDER_SHIFT;
+        if b < BINDER_SAT { b } else { self.binder_flags_of(self.kind(t)).1 }
     }
 
     pub fn has_vars_bound_at_or_above(&self, t: TyId, depth: DebruijnIndex) -> bool {
@@ -178,7 +184,7 @@ impl Types {
         match k {
             TyKind::Bound(d, _) => c.add(TypeFlags::HAS_TY_BOUND.0, d.checked_add(1).expect("bound type index overflow"), 0),
             TyKind::Placeholder(_) => c.flags |= TypeFlags::HAS_TY_PLACEHOLDER.0,
-            TyKind::Tuple(v) => for t in v { c.ty(self, *t, 0); },
+            TyKind::Tuple(v) => for t in self.list(*v) { c.ty(self, *t, 0); },
             TyKind::Array(t, n) => {
                 c.ty(self, *t, 0);
                 c.ct(self, *n, 0);
@@ -187,16 +193,16 @@ impl Types {
             TyKind::Ref(_, t, r) => { c.ty(self, *t, 0); c.region(self, *r, 0); }
             TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
                 if matches!(k, TyKind::Alias(..)) { c.flags |= TypeFlags::HAS_ALIAS.0; }
-                for t in v { c.ty(self, *t, 0); }
+                for t in self.list(*v) { c.ty(self, *t, 0); }
                 c.regions(self, *rs, 0);
             }
             TyKind::FnPtr(ps, r, _, _) => {
-                for t in ps { c.ty(self, *t, 1); }
+                for t in self.list(*ps) { c.ty(self, *t, 1); }
                 c.ty(self, *r, 1);
             }
             TyKind::Dyn(_, v, bs, rs, r, _, _) => {
-                for t in v { c.ty(self, *t, 1); }
-                for (_, t, _) in bs { c.ty(self, *t, 1); }
+                for t in self.list(*v) { c.ty(self, *t, 1); }
+                for (_, t, _) in self.list(*bs) { c.ty(self, *t, 1); }
                 c.regions(self, *rs, 1);
                 c.region(self, *r, 0);
             }

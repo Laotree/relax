@@ -94,7 +94,7 @@ fn collect(source: &str) -> (Program, Tcx) {
 }
 fn adt(prog: &Program, tcx: &Tcx, name: &str, args: Vec<TyId>) -> TyId {
     let def = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == name).unwrap();
-    tcx.tys.intern(TyKind::Adt(def, args, RegionArgsId::EMPTY))
+    tcx.tys.intern(TyKind::Adt(def, tcx.tys.mk_list(&args), RegionArgsId::EMPTY))
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn two_phase_call_activates_multiple_borrows() {
                 func: Operand::Constant(Box::new(ConstOperand {
                     span: Span::default(),
                     user_ty: None,
-                    const_: Const::Val(ConstValue::ZeroSized, tcx.tys.intern(TyKind::FnDef(DefId(0), vec![], RegionArgsId::EMPTY))),
+                    const_: Const::Val(ConstValue::ZeroSized, tcx.tys.intern(TyKind::FnDef(DefId(0), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY))),
                 })),
                 args: vec![Operand::Move(local(3)), Operand::Move(local(4))],
                 destination: local(0),
@@ -229,7 +229,7 @@ fn ignore_shared_raw_and_thread_local_exception() {
     assert_eq!(set.iter().map(|d| d.borrowed_place.local).collect::<Vec<_>>(), vec![Local(3), Local(4)]);
     b.local_decls[4].local_info = LocalInfo::StaticRef { def_id: DefId(0), is_thread_local: false };
     assert_eq!(gather(&tcx, &b, true).len(), 1);
-    let nested = tcx.tys.intern(TyKind::Tuple(vec![shared]));
+    let nested = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[shared])));
     b.local_decls[4].ty = nested;
     b.local_decls[4].local_info = LocalInfo::StaticRef { def_id: DefId(0), is_thread_local: true };
     assert!(ignore_borrow(
@@ -302,7 +302,7 @@ fn fields_variants_union_and_prefixes_conflict() {
     let pair = adt(&prog, &tcx, "Pair", vec![]);
     let u = adt(&prog, &tcx, "U", vec![]);
     let e = adt(&prog, &tcx, "E", vec![]);
-    let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let tuple = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let b = empty_body(&[tcx.tys.unit, pair, u, e]);
     let f = |i, n| place(i, vec![PlaceElem::Field(FieldIdx(n), t)]);
     assert!(conflict(&tcx, &b, &local(1), &local(1)));
@@ -437,7 +437,7 @@ fn constant_indices_and_subslice_boundaries() {
 fn runtime_index_bias_and_later_disjoint_fields() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let pair = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let pair = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let b = empty_body(&[tcx.tys.unit, tcx.tys.intern(TyKind::Array(pair, tcx.tys.const_usize(4))), tcx.tys.usize_]);
     let p = place(1, vec![PlaceElem::Index(Local(2))]);
     for elem in [PlaceElem::Index(Local(2)), index(0, 4, false), slice(1, 3, false)] {
@@ -485,7 +485,7 @@ fn prefixes_skip_indices_casts_and_downcasts_stop_at_deref() {
 fn each_borrow_filters_candidates_conflicts_and_breaks() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let pair = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
+    let pair = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t, t])));
     let f = |n| place(1, vec![PlaceElem::Field(FieldIdx(n), t)]);
     let b = body(
         &[tcx.tys.unit, pair, t, reference(&tcx, true, t)],
@@ -613,7 +613,7 @@ fn two_phase_destination_must_be_a_local() {
     let t = tcx.tys.i32_;
     let r = reference(&tcx, true, t);
     let b = body(
-        &[tcx.tys.unit, t, tcx.tys.intern(TyKind::Tuple(vec![r]))],
+        &[tcx.tys.unit, t, tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[r])))],
         vec![block(
             vec![StatementKind::Assign(place(2, vec![PlaceElem::Field(FieldIdx(0), r)]), Rvalue::Ref(Region(7), TWO_PHASE, local(1)))],
             TerminatorKind::Return,

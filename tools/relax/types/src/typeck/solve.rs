@@ -14,8 +14,8 @@ fn arch_t2b1_callable_general_pointer_is_not_static_pointer() {
     let static_ = tcx.tys.intern_region(RegionKind::ReStatic);
     let a = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, bound));
     let b = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, static_));
-    let general = tcx.tys.intern(TyKind::FnPtr(vec![a], tcx.tys.unit, crate::types::FnHeader::RUST, 1));
-    let specific = tcx.tys.intern(TyKind::FnPtr(vec![b], tcx.tys.unit, crate::types::FnHeader::RUST, 0));
+    let general = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[a]), tcx.tys.unit, crate::types::FnHeader::RUST, 1));
+    let specific = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[b]), tcx.tys.unit, crate::types::FnHeader::RUST, 0));
     assert_ne!(general, specific);
     assert!(!fcx.eq(general, specific) || fcx.infcx.leak_check(crate::types::UniverseIndex::ROOT, None).is_err(), "higher-ranked equality must fail the leak check");
 }
@@ -31,8 +31,8 @@ fn arch_t2b1_callable_placeholder_relation_is_not_proof() {
     let static_ = tcx.tys.intern_region(RegionKind::ReStatic);
     let a = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, placeholder));
     let b = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, static_));
-    let a = tcx.tys.intern(TyKind::Tuple(vec![a]));
-    let b = tcx.tys.intern(TyKind::Tuple(vec![b]));
+    let a = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[a])));
+    let b = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[b])));
     let mark = fcx.start_snapshot();
     let accepted = fcx.eq(a, b);
     let recorded_effects = fcx.infcx.region_constraints_added_in_snapshot(&mark.inference);
@@ -49,7 +49,7 @@ fn arch_t2b1_callable_same_binder_control() {
     let mut fcx = context(&prog, &tcx, &state);
     let bound = tcx.tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
     let a = tcx.tys.intern(TyKind::Ref(false, tcx.tys.u32_, bound));
-    let general = tcx.tys.intern(TyKind::FnPtr(vec![a], tcx.tys.unit, crate::types::FnHeader::RUST, 1));
+    let general = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[a]), tcx.tys.unit, crate::types::FnHeader::RUST, 1));
     assert!(fcx.eq(general, general));
 }
 
@@ -173,7 +173,7 @@ fn native_fcx_normalization_preserves_body_lifetime() {
     let state = crate::tcx::EvalState::new(); let mut fcx = context(&prog, &tcx, &state);
     fcx.b.def = def;
     let (params, ret) = fcx.body_signature(tcx.fn_sig(&prog, def).unwrap(), &[]);
-    let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: vec![params[0]], regions: crate::types::RegionArgsId::EMPTY }));
+    let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: tcx.tys.mk_list(&[params[0]]), regions: crate::types::RegionArgsId::EMPTY }));
     let ty = fcx.normalize_body_type(alias); fcx.retry_goals(true);
     let ty = fcx.infcx.deeply_resolve_ignoring_regions(ty);
     assert_eq!(ty, ret);
@@ -258,7 +258,7 @@ fn round28_closure_pointer_kind_and_async_expectation() {
     let prog = Program::new(&std::sync::Arc::new(crate::Session::default()));
     let tcx = Tcx::new(); let state = crate::tcx::EvalState::new();
     let mut fcx = context(&prog, &tcx, &state);
-    let pointer = tcx.tys.intern(TyKind::FnPtr(vec![], tcx.tys.unit, FnHeader::RUST, 0));
+    let pointer = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, FnHeader::RUST, 0));
     assert_eq!(fcx.deduce_closure_signature(pointer, false), (Some(pointer), Some(crate::upvar::ClosureKind::Fn)));
     assert_eq!(fcx.deduce_closure_signature(pointer, true), (None, None));
 }
@@ -308,7 +308,7 @@ fn round28_writeback_normalizes_resolved_projections() {
     let (prog, tcx) = program("#![no_std] trait Project { type Output; } impl Project for bool { type Output = u8; }");
     let output = prog.defs.iter().enumerate().find(|(_, d)| prog.syms.str(d.name) == "Output" && prog.def(d.parent).kind == DefKind::Trait).map(|(i, _)| DefId(i as u32)).unwrap();
     let state = crate::tcx::EvalState::new(); let mut fcx = context(&prog, &tcx, &state);
-    let ty = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: vec![tcx.tys.bool_], regions: crate::types::RegionArgsId::EMPTY }));
+    let ty = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: tcx.tys.mk_list(&[tcx.tys.bool_]), regions: crate::types::RegionArgsId::EMPTY }));
     fcx.b.ret = ty;
     fcx.resolve_type_vars_in_body();
     assert!(fcx.b.errors.is_empty(), "{:?}", fcx.b.errors);
@@ -320,8 +320,8 @@ fn round28_rigid_projection_identity_and_dependencies() {
     let (prog, tcx) = program("#![no_std] trait Project { type Output; } struct Payload;");
     let named = |name: &str| prog.defs.iter().enumerate().find(|(_, d)| prog.syms.str(d.name) == name).map(|(i, _)| DefId(i as u32)).unwrap();
     let payload = named("Payload");
-    let args = vec![tcx.tys.intern(TyKind::Adt(payload, vec![], crate::types::RegionArgsId::EMPTY))];
-    let alias = AliasTy { kind: AliasTyKind::Projection { def_id: named("Output") }, args, regions: crate::types::RegionArgsId::EMPTY };
+    let args = vec![tcx.tys.intern(TyKind::Adt(payload, tcx.tys.mk_list(&[]), crate::types::RegionArgsId::EMPTY))];
+    let alias = AliasTy { kind: AliasTyKind::Projection { def_id: named("Output") }, args: tcx.tys.mk_list(&args), regions: crate::types::RegionArgsId::EMPTY };
     let rigid = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, alias.clone()));
     let nonrigid = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, alias));
     assert_eq!(ty_to_string(true, &prog, &tcx, rigid), ty_to_string(true, &prog, &tcx, nonrigid));

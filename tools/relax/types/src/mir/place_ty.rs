@@ -23,12 +23,12 @@ impl PlaceTy {
                 let variant = if adt.is_enum() { self.variant_index?.0 as usize }
                     else { if self.variant_index.is_some() { return None; } 0 };
                 adt.variants.get(variant)?.fields.get(field.0 as usize)?;
-                Some(tcx.field_ty(prog, env, *def, variant as u32, field.0, args))
+                Some(tcx.field_ty(prog, env, *def, variant as u32, field.0, tcx.tys.list(*args)))
             }
-            TyKind::Tuple(fields) if self.variant_index.is_none() => fields.get(field.0 as usize).copied(),
+            TyKind::Tuple(fields) if self.variant_index.is_none() => tcx.tys.list(*fields).get(field.0 as usize).copied(),
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) if self.variant_index.is_none() => {
                 let TyKind::Tuple(fields) = tcx.tys.kind(*captures) else { return None; };
-                fields.get(field.0 as usize).copied()
+                tcx.tys.list(*fields).get(field.0 as usize).copied()
             }
             _ => None,
         }
@@ -50,7 +50,7 @@ impl PlaceTy {
         let ty = match elem {
             PlaceElem::Deref => match tcx.tys.kind(self.ty) {
                 TyKind::Ref(_, ty, _) | TyKind::Ptr(_, ty) => *ty,
-                TyKind::Adt(def, args, _) if tcx.adts.get(def)?.is_box() => *args.first()?,
+                TyKind::Adt(def, args, _) if tcx.adts.get(def)?.is_box() => *tcx.tys.list(*args).first()?,
                 _ => return None,
             },
             PlaceElem::Field(_, ty) | PlaceElem::OpaqueCast(ty) | PlaceElem::Subtype(ty) => *ty,

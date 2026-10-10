@@ -2189,7 +2189,7 @@ impl Unit {
             let probe = crate::layout::Layouts::new();
             let mut demoted = Vec::new();
             for (d, size, align, path, offs) in check_layouts {
-                let t = u.tcx.tys.intern(TyKind::Adt(d, Vec::new(), crate::types::RegionArgsId::EMPTY));
+                let t = u.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
                 let l = probe.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t);
                 let offs_ok = offs.is_empty() || (offs.len() == l.fields.len() && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64));
                 if l.size != size || l.align != align || !offs_ok {
@@ -2517,7 +2517,7 @@ impl Unit {
         let r = match self.tcx.tys.kind(t).clone() {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Str => true,
             TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => true,
-            TyKind::Tuple(v) => v.iter().all(|x| self.is_unpin(*x)),
+            TyKind::Tuple(v) => self.tcx.tys.list(v).iter().all(|x| self.is_unpin(*x)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.is_unpin(e),
             // an async block / fn body is !Unpin (rustc: it may hold references into itself)
             TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin(up),
@@ -2531,7 +2531,7 @@ impl Unit {
                     };
                     let mut ok = true;
                     for f in fields {
-                        let ft = self.tcx.tys.subst_erasing_regions(f, &args);
+                        let ft = self.tcx.tys.subst_erasing_regions(f, self.tcx.tys.list(args));
                         if !self.is_unpin(ft) {
                             ok = false;
                             break;
@@ -2678,11 +2678,11 @@ impl Unit {
                     if self.tcx.tys.is_concrete(t) && self.layout_of(t).ext.is_some() { return true; }
                     for (vi, v) in adt.variants.iter().enumerate() {
                         for fi in 0..v.fields.len() {
-                            todo.push(self.tcx.field_ty(&self.prog, env, *d, vi as u32, fi as u32, args));
+                            todo.push(self.tcx.field_ty(&self.prog, env, *d, vi as u32, fi as u32, self.tcx.tys.list(*args)));
                         }
                     }
                 }
-                TyKind::Tuple(fields) => todo.extend_from_slice(fields),
+                TyKind::Tuple(fields) => todo.extend_from_slice(self.tcx.tys.list(*fields)),
                 TyKind::Array(elem, n) => { if n.try_to_target_usize(&self.tcx.tys) != Some(0) { todo.push(*elem); } }
                 TyKind::Slice(elem) | TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: elem, .. }) => todo.push(*elem),
                 _ => {}
@@ -2732,7 +2732,7 @@ impl Unit {
                     let mut any = false;
                     if imp.is_some() {
                         // a std Drop impl drops what its type arguments own
-                        for a in args.clone() {
+                        for a in self.tcx.tys.list(args.clone()).iter().copied() {
                             if self.drop_may_unwind(a) {
                                 any = true;
                             }
@@ -2742,7 +2742,7 @@ impl Unit {
                         if !adt.is_union {
                             for (vi, v) in adt.variants.iter().enumerate() {
                                 for fi in 0..v.fields.len() {
-                                    let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, vi as u32, fi as u32, &args);
+                                    let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, vi as u32, fi as u32, self.tcx.tys.list(args));
                                     if self.drop_may_unwind(ft) {
                                         any = true;
                                     }
@@ -2755,7 +2755,7 @@ impl Unit {
             }
             TyKind::Tuple(v) => {
                 let mut any = false;
-                for x in v {
+                for x in self.tcx.tys.list(v).iter().copied() {
                     if self.drop_may_unwind(x) {
                         any = true;
                     }
@@ -2777,7 +2777,7 @@ impl Unit {
     pub fn closure_fn_id(&self, t: TyId) -> Option<u32> {
         if let TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = self.tcx.tys.kind(t).clone() {
             if let TyKind::FnDef(d, args, _) = self.tcx.tys.kind(owner).clone() {
-                let parent = self.fn_id(FnKey::Inst(d, args));
+                let parent = self.fn_id(FnKey::Inst(d, self.tcx.tys.list(args).to_vec()));
                 return Some(self.fn_id(FnKey::Closure(file, ce, parent)));
             }
         }
@@ -2813,7 +2813,7 @@ impl Unit {
         wsyms.push(None);
         // rustc_trait_selection/src/traits/vtable.rs:199-298.
         use relax_types::next_solver::vtable::VtblSegment;
-        let mut compact = vec![src]; compact.extend_from_slice(&targs);
+        let mut compact = vec![src]; compact.extend_from_slice(self.tcx.tys.list(targs));
         let regions = self.tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; self.tcx.generic_indices_of(&self.prog, td).lifetimes.len()]);
         // rustc_middle/src/ty/fold.rs:321-326 @8d1a764: the object's
         // principal binder is instantiated before requesting vtable entries.
@@ -2840,7 +2840,8 @@ impl Unit {
             }
             if emit_vptr {
                 let args = Instance::new_raw(trait_ref.def_id, trait_ref.args).compact_args(&self.tcx);
-                let super_dyn = self.tcx.tys.intern(TyKind::Dyn(trait_ref.def_id, args[1..].to_vec().into(), Vec::new().into(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, Vec::new().into()));
+                let super_dyn = self.tcx.tys.intern(TyKind::Dyn(trait_ref.def_id, self.tcx.tys.mk_list(&args[1..]), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, crate::types::List::EMPTY)
+);
                 let address = self.vtable(src, super_dyn)?;
                 words.push(address); wsyms.push(Some(self.data_sym(address)));
             }
@@ -2958,7 +2959,7 @@ impl Unit {
                     // through projections are their concrete types)
                     let ps: Vec<TyId> = sig.params.iter().map(|p| self.tcx.normalize_erasing_late_bound_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), self.tcx.tys.subst(*p, args))).collect();
                     let r = self.tcx.normalize_erasing_late_bound_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), self.tcx.tys.subst(sig.ret, args));
-                    let fp = self.tcx.tys.intern(TyKind::FnPtr(ps, r, sig.header, 0));
+                    let fp = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), r, sig.header, 0));
                     let vi = if k == crate::program::DefKind::Variant { self.prog.def(*d).sub } else { 0 };
                     let id = self.fn_id(FnKey::Glue(GLUE_CTOR + vi as u8, fp));
                     self.fn_map.insert(key, id);
@@ -5100,7 +5101,7 @@ fn has_closure(tcx: &crate::tcx::Tcx, t: TyId, depth: u32) -> bool {
     }
     match tcx.tys.kind(t) {
         TyKind::Closure(..) | TyKind::FnDef(..) => true,
-        TyKind::Adt(_, args, _) | TyKind::Tuple(args) => args.iter().any(|a| has_closure(tcx, *a, depth + 1)),
+        TyKind::Adt(_, args, _) | TyKind::Tuple(args) => tcx.tys.list(*args).iter().any(|a| has_closure(tcx, *a, depth + 1)),
         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => has_closure(tcx, *x, depth + 1),
         _ => false,
     }

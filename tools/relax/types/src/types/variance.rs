@@ -244,16 +244,16 @@ impl Walk<'_> {
                 self.ct(len, xform(v, V::Inv));
             }
             TyKind::Const(ct) => self.ct(ct, V::Inv),
-            TyKind::Tuple(ts) => { for t in ts { self.ty(t, v); } }
+            TyKind::Tuple(ts) => { for &t in self.tys.list(ts) { self.ty(t, v); } }
             TyKind::FnPtr(ps, ret, _, _) => {
-                for p in ps { self.ty(p, xform(v, V::Contra)); }
+                for &p in self.tys.list(ps) { self.ty(p, xform(v, V::Contra)); }
                 self.ty(ret, v);
             }
             TyKind::Adt(d, ts, rs) | TyKind::FnDef(d, ts, rs) => {
                 self.deps.insert(d);
                 let target = self.tcx.adts.get(&d).map(|a| &a.generic_indices)
                     .or_else(|| self.tcx.ctor_sigs.get(&d).map(|s| &s.generic_indices));
-                for (i, t) in ts.into_iter().enumerate() {
+                for (i, &t) in self.tys.list(ts).iter().enumerate() {
                     let arg_v = target.and_then(|decl| decl.types_consts.get(i))
                         .map_or(V::Inv, |&full| self.values[&d][full as usize]);
                     self.ty(t, xform(v, arg_v));
@@ -266,15 +266,15 @@ impl Walk<'_> {
             }
             TyKind::Alias(_, AliasTy { args: ts, regions: rs, .. }) => {
                 let inv = xform(v, V::Inv);
-                for t in ts { self.ty(t, inv); }
+                for &t in self.tys.list(ts) { self.ty(t, inv); }
                 for &r in self.tys.region_args(rs).iter() { self.region(r, inv); }
             }
             TyKind::Dyn(_, ts, bindings, rs, r, _, _) => {
                 self.region(r, v);
                 let inv = xform(v, V::Inv);
-                for t in ts { self.ty(t, inv); }
+                for &t in self.tys.list(ts) { self.ty(t, inv); }
                 for &r in self.tys.region_args(rs).iter() { self.region(r, inv); }
-                for (_, t, _) in bindings { self.ty(t, V::Inv); }
+                for &(_, t, _) in self.tys.list(bindings) { self.ty(t, V::Inv); }
             }
             TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: captures }) => {
                 for t in [sig, captures, owner, closure_kind_ty] { self.ty(t, xform(v, V::Inv)); }

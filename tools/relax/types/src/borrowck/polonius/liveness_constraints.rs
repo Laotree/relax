@@ -67,13 +67,13 @@ impl VarianceExtractor<'_> {
             TyKind::Ptr(m, t) => self.ty(t, xform(v, if m { V::Inv } else { V::Co })),
             TyKind::Slice(t) => self.ty(t, v),
             TyKind::Array(t, n) => { self.ty(t, v); self.constant(n, xform(v, V::Inv)); }
-            TyKind::Tuple(ts) => { for t in ts { self.ty(t, v); } }
-            TyKind::FnPtr(ps, ret, _, _) => { for t in ps { self.ty(t, xform(v, V::Contra)); } self.ty(ret, v); }
+            TyKind::Tuple(ts) => { for t in self.tcx.tys.list(ts).iter().copied() { self.ty(t, v); } }
+            TyKind::FnPtr(ps, ret, _, _) => { for t in self.tcx.tys.list(ps).iter().copied() { self.ty(t, xform(v, V::Contra)); } self.ty(ret, v); }
             TyKind::Adt(d, ts, rs) | TyKind::FnDef(d, ts, rs) => {
                 let indices = self.tcx.adts.get(&d).map(|a| &a.generic_indices)
                     .or_else(|| self.tcx.fn_item_sig(self.prog, d).map(|s| &s.generic_indices));
                 let variances = self.tcx.variances_of(self.prog, d);
-                for (i, t) in ts.into_iter().enumerate() {
+                for (i, t) in self.tcx.tys.list(ts).iter().copied().enumerate() {
                     let arg = indices.and_then(|ix| ix.types_consts.get(i)).and_then(|&i| variances.get(i as usize)).copied().unwrap_or(V::Inv);
                     self.ty(t, xform(v, arg));
                 }
@@ -91,14 +91,14 @@ impl VarianceExtractor<'_> {
                     let indices = if region { &indices.lifetimes } else { &indices.types_consts };
                     indices.get(k).and_then(|&j| vs.get(j as usize)).copied()
                 }).unwrap_or(V::Inv);
-                for (k, t) in ts.into_iter().enumerate() { self.ty(t, xform(v, arg(false, k))); }
+                for (k, t) in self.tcx.tys.list(ts).iter().copied().enumerate() { self.ty(t, xform(v, arg(false, k))); }
                 for (k, &r) in self.tcx.tys.region_args(rs).iter().enumerate() { self.region(r, xform(v, arg(true, k))); }
             }
             TyKind::Dyn(_, ts, bindings, rs, r, _, _) => {
                 self.region(r, v);
-                for t in ts { self.ty(t, xform(v, V::Inv)); }
+                for t in self.tcx.tys.list(ts).iter().copied() { self.ty(t, xform(v, V::Inv)); }
                 for &r in self.tcx.tys.region_args(rs).iter() { self.region(r, xform(v, V::Inv)); }
-                for (_, t, _) in bindings { self.ty(t, xform(v, V::Inv)); }
+                for (_, t, _) in self.tcx.tys.list(bindings).iter().copied() { self.ty(t, xform(v, V::Inv)); }
             }
             TyKind::Closure(_, _, args) => {
                 for t in [args.parent_args, args.closure_kind_ty, args.closure_sig_as_fn_ptr_ty, args.tupled_upvars_ty] { self.ty(t, xform(v, V::Inv)); }

@@ -861,7 +861,8 @@ impl<'a> Fcx<'a> {
         let save = self.start_snapshot();
         let ok = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && xs.len() == ys.len() => {
+            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
+                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 let mut found = None;
                 for i in 0..xs.len() {
                     let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i]));
@@ -890,7 +891,8 @@ impl<'a> Fcx<'a> {
         let (a, d) = (self.shallow(a), self.shallow(d));
         match (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) {
             (TyKind::Array(ea, _), TyKind::Slice(es)) => self.eq(ea, es),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(d1).kind == DefKind::Struct && xs.len() == ys.len() && !xs.is_empty() => {
+            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(d1).kind == DefKind::Struct && self.tcx.tys.list(xs).len() == self.tcx.tys.list(ys).len() && !xs.is_empty() => {
+                let (xs, ys) = (self.tcx.tys.list(xs), self.tcx.tys.list(ys));
                 let i = match (0..xs.len()).find(|&i| {
                     let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i]));
                     x != y && !matches!(self.tcx.tys.kind(y), TyKind::Infer(_))
@@ -908,7 +910,8 @@ impl<'a> Fcx<'a> {
     fn pointee_pair_open_to_dyn(&mut self, ka: &TyKind, kx: &TyKind) -> bool {
         let (a, d) = match (ka, kx) {
             (TyKind::Ref(_, a, _), TyKind::Ref(_, d, _)) | (TyKind::Ptr(_, a), TyKind::Ptr(_, d)) => (*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && xs.len() == ys.len() && !xs.is_empty() => {
+            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() && !xs.is_empty() => {
+                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 match (0..xs.len()).find(|&i| {
                     let y = self.shallow(ys[i]);
                     matches!(self.tcx.tys.kind(y), TyKind::Dyn(..))
@@ -1007,8 +1010,8 @@ impl<'a> Fcx<'a> {
                 let sig = self.tcx.fn_item_sig(self.prog, d).cloned()?;
                 // coercion.rs:1259-1264: intrinsics have no addressable body.
                 if sig.header.abi == Abi::RelaxIntrinsic { return None; }
-                let poly = self.tcx.tys.intern(TyKind::FnPtr(sig.params, sig.ret, sig.header, sig.bound_regions));
-                let args = self.tcx.complete_args(self.prog, d, &args, regions);
+                let poly = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
+                let args = self.tcx.complete_args(self.prog, d, self.tcx.tys.list(args), regions);
                 Some(self.tcx.instantiate_ty(self.prog, d, &args, poly))
             }
             TyKind::Closure(file, ce, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => {
@@ -1104,7 +1107,8 @@ impl<'a> Fcx<'a> {
     fn dyn_upcast(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
         let (a, d) = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && xs.len() == ys.len() => {
+            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
+                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 let i = (0..xs.len()).find(|&i| {
                     let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i]));
                     matches!(self.tcx.tys.kind(x), TyKind::Dyn(..)) && matches!(self.tcx.tys.kind(y), TyKind::Dyn(..)) && x != y
@@ -1127,15 +1131,15 @@ impl<'a> Fcx<'a> {
             TyKind::Dyn(t, v, _, _, _, _, autos) => (t, v, autos),
             _ => return None,
         };
-        if !tautos.iter().all(|t| sautos.contains(t)) { return None; }
+        if !self.tcx.tys.list(tautos).iter().all(|t| self.tcx.tys.list(sautos).contains(t)) { return None; }
         if sd == td {
-            let TyKind::Dyn(td, args, bindings, rs, region, bound, _) = self.tcx.tys.kind(a).clone() else { unreachable!() };
-            let erased = self.tcx.tys.intern(TyKind::Dyn(td, args.into(), bindings.into(), rs, region, bound, tautos.into()));
+            let TyKind::Dyn(td, args, bindings, rs, region, bound, _) = *self.tcx.tys.kind(a) else { unreachable!() };
+            let erased = self.tcx.tys.intern(TyKind::Dyn(td, args, bindings, rs, region, bound, tautos));
             return if self.eq(erased, d) { Some((a, d)) } else { None };
         }
         // Fn -> FnMut -> FnOnce: the same call entry
         if self.is_fn_trait(sd) && self.is_fn_trait(td) {
-            if let (Some(x), Some(y)) = (sargs.first(), targs.first()) {
+            if let (Some(x), Some(y)) = (self.tcx.tys.list(sargs).first(), self.tcx.tys.list(targs).first()) {
                 if self.eq(*x, *y) {
                     return Some((a, d));
                 }
@@ -1144,7 +1148,8 @@ impl<'a> Fcx<'a> {
         }
         // the supertrait instantiations of `sd<sargs>` (rustc: upcasting to a supertrait trait
         // ref; `dyn Foo<bool>` -> `dyn Bar<bool>` where `Foo<T>: Bar<i32> + Bar<T>`)
-        let sargs: Vec<TyId> = sargs.iter().map(|x| self.infcx.deeply_resolve_ignoring_regions(*x)).collect();
+        let sargs: Vec<TyId> = self.tcx.tys.list(sargs).iter().map(|x| self.infcx.deeply_resolve_ignoring_regions(*x)).collect();
+        let targs = self.tcx.tys.list(targs);
         let mut todo = vec![(sd, sargs)];
         let mut seen: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let mut hits: Vec<Vec<TyId>> = Vec::new();
@@ -1183,7 +1188,8 @@ impl<'a> Fcx<'a> {
     fn dyn_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
         let (src, dy) = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && xs.len() == ys.len() => {
+            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
+                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 let mut found = None;
                 for i in 0..xs.len() {
                     let y = self.shallow(ys[i]);
@@ -1219,7 +1225,8 @@ impl<'a> Fcx<'a> {
                         break (x, y);
                     }
                     match (self.tcx.tys.kind(x).clone(), self.tcx.tys.kind(y).clone()) {
-                        (TyKind::Adt(a1, xa, _), TyKind::Adt(a2, ya, _)) if a1 == a2 && xa.len() == ya.len() && self.tcx.adts.get(&a1).map_or(false, |ad| !ad.is_enum && !ad.is_union) => {
+                        (TyKind::Adt(a1, xa, _), TyKind::Adt(a2, ya, _)) if a1 == a2 && self.tcx.tys.list(xa).len() == self.tcx.tys.list(ya).len() && self.tcx.adts.get(&a1).map_or(false, |ad| !ad.is_enum && !ad.is_union) => {
+                            let (xa, ya) = (self.tcx.tys.list(xa), self.tcx.tys.list(ya));
                             let mut k = None;
                             for j in 0..xa.len() {
                                 let yj = self.shallow(ya[j]);
@@ -1291,7 +1298,7 @@ impl<'a> Fcx<'a> {
                 };
                 match last {
                     Some(ft) => {
-                        let ft = self.tcx.tys.subst(ft, &args);
+                        let ft = self.tcx.tys.subst(ft, self.tcx.tys.list(args));
                         self.is_unsized_ty(ft)
                     }
                     None => false,
@@ -1306,7 +1313,7 @@ impl<'a> Fcx<'a> {
         let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
             TyKind::Dyn(..) => true,
-            TyKind::Adt(_, v, _) => v.iter().any(|x| self.has_dyn(*x)),
+            TyKind::Adt(_, v, _) => self.tcx.tys.list(v).iter().any(|x| self.has_dyn(*x)),
             _ => false,
         }
     }
@@ -1315,7 +1322,7 @@ impl<'a> Fcx<'a> {
         let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
             TyKind::Slice(..) => true,
-            TyKind::Adt(_, v, _) => v.iter().any(|x| self.has_slice(*x)),
+            TyKind::Adt(_, v, _) => self.tcx.tys.list(v).iter().any(|x| self.has_slice(*x)),
             _ => false,
         }
     }
@@ -1576,7 +1583,7 @@ impl<'a> Fcx<'a> {
     fn alias_bound_clauses(&self, t: TyId) -> Vec<Predicate> {
         let TyKind::Alias(_, alias) = self.tcx.tys.kind(t) else { return Vec::new(); };
         let def = alias.kind.def_id();
-        let args = self.tcx.complete_args(self.prog, def, &alias.args, alias.regions);
+        let args = self.tcx.complete_args(self.prog, def, self.tcx.tys.list(alias.args), alias.regions);
         let mut result = Vec::new();
         for p in self.tcx.item_bounds(self.prog, def) {
             let p = self.tcx.instantiate_predicate(self.prog, def, &args, &p);
@@ -1594,7 +1601,7 @@ impl<'a> Fcx<'a> {
         for item in [LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::AsyncFn, LangItem::AsyncFnMut, LangItem::AsyncFnOnce] {
             let Some(td) = self.tcx.lang_items.get(item) else { continue };
             let tuple = match nargs {
-                Some(n) => self.tcx.tys.intern(TyKind::Tuple((0..n).map(|_| self.infcx.next_ty_var()).collect())),
+                Some(n) => self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&(0..n).map(|_| self.infcx.next_ty_var()).collect::<Vec<_>>()))),
                 None => self.infcx.next_ty_var(),
             };
             let goal = self.trait_goal(td, callee, &[tuple]);
@@ -1612,7 +1619,7 @@ impl<'a> Fcx<'a> {
                     PredicateKind::Clause(crate::next_solver::ClauseKind::WellFormed(crate::next_solver::Term::Ty(ty)))) }, self.last_lo);
             }
             let tuple = self.infcx.shallow_resolve(params[1]);
-            let inputs = match self.tcx.tys.kind(tuple) { TyKind::Tuple(ps) => ps.clone(), TyKind::Error => Vec::new(), _ => {
+            let inputs = match self.tcx.tys.kind(tuple) { TyKind::Tuple(ps) => self.tcx.tys.list(*ps).to_vec(), TyKind::Error => Vec::new(), _ => {
                 self.err(self.last_lo, "call trait arguments must be a tuple".into());
                 Vec::new()
             } };
@@ -1688,7 +1695,7 @@ impl<'a> Fcx<'a> {
                         kind != crate::expr_use::BorrowKind::Imm, ty, crate::types::RegionId::ERASED)),
                 });
             }
-            let up = self.tcx.tys.intern(TyKind::Tuple(fields));
+            let up = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&fields)));
             self.eq(pending.upvars, up);
             if matches!(self.tcx.tys.kind(self.infcx.shallow_resolve(pending.kind)), TyKind::Infer(_)) { self.eq(pending.kind, kind); }
         }
@@ -2016,14 +2023,14 @@ impl<'a> Fcx<'a> {
             }
             Pat::Tuple(v) => {
                 let et = self.shallow(expected);
-                let elems = match self.tcx.tys.kind(et).clone() {
-                    TyKind::Tuple(x) => x,
+                let elems = match *self.tcx.tys.kind(et) {
+                    TyKind::Tuple(x) => self.tcx.tys.list(x).to_vec(),
                     _ => {
                         let mut x = Vec::new();
                         for _ in 0..v.len() {
                             x.push(self.fresh(0));
                         }
-                        let tt = self.tcx.tys.intern(TyKind::Tuple(x.clone()));
+                        let tt = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&x)));
                         self.eq(tt, et);
                         x
                     }
@@ -2182,15 +2189,15 @@ impl<'a> Fcx<'a> {
             ExprKind::Underscore => {}
             ExprKind::Tuple(elems) => {
                 let st = self.shallow(t);
-                let tys = match self.tcx.tys.kind(st).clone() {
-                    TyKind::Tuple(v) => v,
+                let tys = match *self.tcx.tys.kind(st) {
+                    TyKind::Tuple(v) => self.tcx.tys.list(v).to_vec(),
                     _ => {
                         if self.ast().list(elems).iter().any(|x| is_rest(*x)) {
                             self.err(lo, "destructuring assignment with `..` needs a tuple of known length".to_string());
                             return;
                         }
                         let v: Vec<TyId> = self.ast().list(elems).iter().map(|_| self.fresh(0)).collect();
-                        let tt = self.tcx.tys.intern(TyKind::Tuple(v.clone()));
+                        let tt = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&v)));
                         self.eq(st, tt);
                         v
                     }
@@ -2331,7 +2338,7 @@ impl<'a> Fcx<'a> {
             _ => (d, 0),
         };
         let args = self.tcx.generic_indices_of(self.prog, adt_def).identity_types_consts(&self.tcx.tys);
-        (self.tcx.tys.intern(TyKind::Adt(adt_def, args, self.tcx.adts.get(&adt_def).map_or(crate::types::RegionArgsId::EMPTY, |a| a.region_params))), vi)
+        (self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), self.tcx.adts.get(&adt_def).map_or(crate::types::RegionArgsId::EMPTY, |a| a.region_params))), vi)
     }
 
     /// Replace Param args of an ADT type by fresh variables.
@@ -2400,10 +2407,10 @@ impl<'a> Fcx<'a> {
         }
         if let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() {
             let Some(a) = self.explicit_args(path, d, 0) else { return fresh_adt; };
-            if !a.is_empty() && a.len() <= fa.len() {
+            if !a.is_empty() && a.len() <= self.tcx.tys.list(fa).len() {
                 let mut args = a;
-                args.extend_from_slice(&fa[args.len()..]);
-                return self.tcx.tys.intern(TyKind::Adt(d, args, regions));
+                args.extend_from_slice(&self.tcx.tys.list(fa)[args.len()..]);
+                return self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&args), regions));
             }
         }
         fresh_adt
@@ -2418,7 +2425,7 @@ impl<'a> Fcx<'a> {
                 crate::consts::GenericArg::Const(c) => args.push(self.tcx.tys.intern(TyKind::Const(c))),
                 crate::consts::GenericArg::Lifetime(r) => regions.push(r),
             } }
-            return self.tcx.tys.intern(TyKind::Adt(d, args, self.tcx.tys.intern_region_args(&regions)));
+            return self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&args), self.tcx.tys.intern_region_args(&regions)));
         }
         t
     }
@@ -2461,7 +2468,7 @@ impl<'a> Fcx<'a> {
             let v = adt.variants.get(vi as usize)?;
             for (i, f) in v.fields.iter().enumerate() {
                 if f.name == name {
-                    let ft = self.instantiate_field_type(f.ty, adt.region_params, regions, &args);
+                    let ft = self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                     if !adt.is_enum && !self.b.field_uses.contains(&(d, i as u32)) {
                         self.b.field_uses.push((d, i as u32));
                         self.b.dependencies.push(d);
@@ -2481,7 +2488,7 @@ impl<'a> Fcx<'a> {
             let given = key.and_then(|k| self.b.res_args.get(&k).cloned());
             let adt_ty = self.instantiate_adt(adt_ty);
             let adt_ty = match (self.tcx.tys.kind(adt_ty).clone(), given) {
-                (TyKind::Adt(ad, gen, regions), Some(a)) if a.len() == gen.len() => self.tcx.tys.intern(TyKind::Adt(ad, a, regions)),
+                (TyKind::Adt(ad, gen, regions), Some(a)) if a.len() == self.tcx.tys.list(gen).len() => self.tcx.tys.intern(TyKind::Adt(ad, self.tcx.tys.mk_list(&a), regions)),
                 _ => adt_ty,
             };
             self.coerce_or_unify(adt_ty, expected, None, pos);
@@ -2491,7 +2498,7 @@ impl<'a> Fcx<'a> {
                     if let Some(v) = adt.variants.get(vi as usize) {
                         let mut out = Vec::new();
                         for f in &v.fields {
-                            out.push(self.instantiate_field_type(f.ty, adt.region_params, regions, &args));
+                            out.push(self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args)));
                         }
                         return out;
                     }
@@ -2612,7 +2619,7 @@ impl<'a> Fcx<'a> {
                 // and its predicates registered with exactly those args.
                 let full = self.tcx.complete_args(self.prog, d, &args, regions);
                 self.apply_fn_bounds(d, &full, self.last_lo);
-                self.tcx.tys.intern(TyKind::FnDef(d, args, regions))
+                self.tcx.tys.intern(TyKind::FnDef(d, self.tcx.tys.mk_list(&args), regions))
             }
             DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
                 let t = self.tcx.const_ty(self.prog, d).unwrap_or(self.tcx.tys.error);
@@ -2660,12 +2667,12 @@ impl<'a> Fcx<'a> {
                 let regions = self.tcx.tys.intern_region_args(&regions);
                 let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
                 self.apply_fn_bounds(adt_def, &full, self.last_lo);
-                let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, args.clone(), regions));
+                let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), regions));
                 let v = &adt.variants[vi as usize];
                 if v.shape == 1 && !adt.is_union {
                     // tuple ctor: a fn item of its own (rustc: FnDef with the ADT's args, which
                     // keeps the written lifetimes; it reifies to `fn(fields..) -> Adt` on demand)
-                    self.tcx.tys.intern(TyKind::FnDef(d, args, regions))
+                    self.tcx.tys.intern(TyKind::FnDef(d, self.tcx.tys.mk_list(&args), regions))
                 } else {
                     inst
                 }
@@ -2690,8 +2697,8 @@ impl<'a> Fcx<'a> {
                 let mut args = vec![st];
                 let parent = self.prog.def(item).parent;
                 if parent == td {
-                    args.extend(targs);
-                } else if let Some(sa) = self.dyn_super_args(td, &targs, st, parent) {
+                    args.extend(self.tcx.tys.list(targs).iter().copied());
+                } else if let Some(sa) = self.dyn_super_args(td, self.tcx.tys.list(targs), st, parent) {
                     args.extend(sa);
                 }
                 let sig = self.tcx.fn_sig(self.prog, item).cloned();
@@ -2739,7 +2746,7 @@ impl<'a> Fcx<'a> {
             if self.prog.def(ad).kind == DefKind::Enum {
                 if let Some(v) = self.prog.lookup_in_container(ad, name, false) {
                     if self.prog.def(v).kind == DefKind::Variant {
-                        let t = self.value_def_ty(v, Some(aargs), key);
+                        let t = self.value_def_ty(v, Some(self.tcx.tys.list(aargs).to_vec()), key);
                         return (Res::Def(v), t);
                     }
                 }
@@ -2924,7 +2931,7 @@ impl<'a> Fcx<'a> {
                 // `Self` as a unit/tuple struct ctor
                 if let Some(st) = self.env.self_ty {
                     if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
-                        let t = self.value_def_ty(d, Some(args), key);
+                        let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
                         return (Res::Def(d), t);
                     }
                 }
@@ -3023,7 +3030,7 @@ impl<'a> Fcx<'a> {
         if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(self_ty).clone() {
             if prog.def(ad).kind == DefKind::Enum {
                 if let Some(v) = prog.lookup_in_container(ad, name, false) {
-                    let t = self.value_def_ty(v, Some(aargs), key);
+                    let t = self.value_def_ty(v, Some(self.tcx.tys.list(aargs).to_vec()), key);
                     return (Res::Def(v), t);
                 }
             }
@@ -3306,8 +3313,8 @@ impl<'a> Fcx<'a> {
             if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(t).clone() {
                 let parent = self.prog.def(item).parent;
                 if parent == td {
-                    args.extend(targs);
-                } else if let Some(sa) = self.dyn_super_args(td, &targs, t, parent) {
+                    args.extend(self.tcx.tys.list(targs).iter().copied());
+                } else if let Some(sa) = self.dyn_super_args(td, self.tcx.tys.list(targs), t, parent) {
                     args.extend(sa);
                 }
             }
@@ -3361,7 +3368,7 @@ impl<'a> Fcx<'a> {
                     Ok(Some(_)) | Ok(None) => {},
                 };
                 let target = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Target")?)?;
-                let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: vec![dt], regions: crate::types::RegionArgsId::EMPTY }));
+                let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: self.tcx.tys.mk_list(&[dt]), regions: crate::types::RegionArgsId::EMPTY }));
                 let r = self.norm(proj);
                 let m = self.trait_fn(td, "deref")?;
                 self.b.ov_derefs.insert((e, step), (m, vec![dt]));
@@ -3704,7 +3711,7 @@ impl<'a> Fcx<'a> {
                 }
                 let mut regions = Vec::new();
                 for _ in &self.tcx.generic_indices_of(prog, d).lifetimes { regions.push(self.fresh_region()); }
-                Some(self.tcx.tys.intern(TyKind::Adt(d, a, self.tcx.tys.intern_region_args(&regions))))
+                Some(self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&a), self.tcx.tys.intern_region_args(&regions))))
             }
             DefKind::TypeAlias => {
                 let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
@@ -4295,7 +4302,7 @@ impl<'a> Fcx<'a> {
                     Some(t) => {
                         let s = self.shallow(t);
                         match self.tcx.tys.kind(s).clone() {
-                            TyKind::Tuple(x) if x.len() == v.len() => Some(x),
+                            TyKind::Tuple(x) if self.tcx.tys.list(x).len() == v.len() => Some(x),
                             _ => None,
                         }
                     }
@@ -4304,7 +4311,7 @@ impl<'a> Fcx<'a> {
                 let mut ts = Vec::new();
                 for (i, x) in self.ast().list(*v).iter().enumerate() {
                     let ex = match &exp_elems {
-                        Some(es) => Some(es[i]),
+                        Some(es) => Some(self.tcx.tys.list(*es)[i]),
                         None => None,
                     };
                     let t = self.check_expr(*x, ex);
@@ -4315,7 +4322,7 @@ impl<'a> Fcx<'a> {
                         ts.push(t);
                     }
                 }
-                self.tcx.tys.intern(TyKind::Tuple(ts))
+                self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&ts)))
             }
             ExprKind::Array(v) => {
                 let elem_exp = match expected {
@@ -4418,7 +4425,7 @@ impl<'a> Fcx<'a> {
                     match self.tcx.tys.kind(cur).clone() {
                         TyKind::Tuple(v) => {
                             self.b.field_idx.insert(e.0, (derefs, *idx));
-                            return v.get(*idx as usize).copied().unwrap_or(error);
+                            return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
                         }
                         TyKind::Adt(d, args, regions) => {
                             let adt = self.tcx.adts.get(&d).cloned();
@@ -4427,7 +4434,7 @@ impl<'a> Fcx<'a> {
                                     if let Some(f) = adt.variants[0].fields.get(*idx as usize) {
                                         if self.field_visible(d, f) {
                                             self.b.field_idx.insert(e.0, (derefs, *idx));
-                                            return self.instantiate_field_type(f.ty, adt.region_params, regions, &args);
+                                            return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                                         }
                                     }
                                 }
@@ -4497,7 +4504,7 @@ impl<'a> Fcx<'a> {
                                             let m = self.trait_fn(td, "index").unwrap();
                                             self.b.ov_index.insert(e.0, (m, vec![ds, ti2]));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
-                                            let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: vec![ds, ti2], regions: crate::types::RegionArgsId::EMPTY }));
+                                            let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: self.tcx.tys.mk_list(&[ds, ti2]), regions: crate::types::RegionArgsId::EMPTY }));
                                             return self.norm_keep(r);
                                         }
                                     }
@@ -4553,7 +4560,7 @@ impl<'a> Fcx<'a> {
                                     let index = coerced_idx.unwrap_or(ti2);
                                     self.b.ov_index.insert(e.0, (m, vec![dc, index]));
                                     let output = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
-                                    let projection = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: vec![dc, index], regions: crate::types::RegionArgsId::EMPTY }));
+                                    let projection = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: self.tcx.tys.mk_list(&[dc, index]), regions: crate::types::RegionArgsId::EMPTY }));
                                     return self.norm_keep(projection);
                                 }
                             }
@@ -4684,7 +4691,7 @@ impl<'a> Fcx<'a> {
                     Some(d) => {
                         let n = self.tcx.adts.get(&d).map_or(0, |a| a.n_generics);
                         let args = if n == 0 { Vec::new() } else { vec![elem] };
-                        self.tcx.tys.intern(TyKind::Adt(d, args, crate::types::RegionArgsId::EMPTY))
+                        self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
                     }
                     None => {
                         self.err(lo, format!("core::ops::{} not found", name));
@@ -4816,7 +4823,7 @@ impl<'a> Fcx<'a> {
         let break_def = self.tcx.lang_items.get(LangItem::ControlFlowBreak);
         let output = adt.variants.iter().find(|v| Some(v.def) == continue_def).unwrap().fields[0].ty;
         let residual = adt.variants.iter().find(|v| Some(v.def) == break_def).unwrap().fields[0].ty;
-        let flow_full = self.tcx.complete_args(self.prog, def, &flow_args, regions);
+        let flow_full = self.tcx.complete_args(self.prog, def, self.tcx.tys.list(flow_args), regions);
         let output = self.tcx.instantiate_ty(self.prog, def, &flow_full, output);
         let residual = self.tcx.instantiate_ty(self.prog, def, &flow_full, residual);
         let ret = *self.ret_stack.last().unwrap_or(&self.tcx.tys.error);
@@ -4914,7 +4921,7 @@ impl<'a> Fcx<'a> {
             // `c"..."`: &'static core::ffi::CStr (nul-terminated)
             LitKind::CStr => match self.lang_item(&["ffi", "CStr"]) {
                 Some(d) => {
-                    let t = self.tcx.tys.intern(TyKind::Adt(d, Vec::new(), crate::types::RegionArgsId::EMPTY));
+                    let t = self.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
                     self.tcx.tys.intern(TyKind::Ref(false, t, crate::types::RegionId::ERASED))
                 }
                 None => self.tcx.tys.error,
@@ -5083,7 +5090,7 @@ impl<'a> Fcx<'a> {
         let TyKind::Adt(def, args, regions) = self.tcx.tys.kind(option).clone() else { return None; };
         let some = self.tcx.lang_items.get(LangItem::OptionSome)?;
         let variant = self.tcx.adts.get(&def)?.variants.iter().find(|v| v.def == some)?;
-        let item = self.tcx.instantiate_ty(self.prog, def, &self.tcx.complete_args(self.prog, def, &args, regions), variant.fields[0].ty);
+        let item = self.tcx.instantiate_ty(self.prog, def, &self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions), variant.fields[0].ty);
         self.b.dependencies.push(next);
         self.b.for_next.insert(key, (next, vec![t]));
         Some(item)
@@ -5118,7 +5125,7 @@ impl<'a> Fcx<'a> {
                                     self.b.field_uses.push((d, i as u32));
                                     self.b.dependencies.push(d);
                                 }
-                                return self.instantiate_field_type(f.ty, adt.region_params, regions, &args);
+                                return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                             }
                         }
                     }
@@ -5185,7 +5192,7 @@ impl<'a> Fcx<'a> {
                 let np = self.tcx.fn_item_sig(self.prog, d).map_or(0, |s| s.n_parent_generics) as usize;
                 let env = self.env.clone();
                 for (j, &a) in split.const_args.iter().enumerate() {
-                    if let Some(&g) = gargs.get(np + j) {
+                    if let Some(&g) = self.tcx.tys.list(gargs).get(np + j) {
                         let expected = declaration.consts.iter().find(|c| c.0 as usize == np + j)
                             .map(|&(_, cf, ct)| self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), self.prog, cf, self.prog.def(d).scope, &declaration, ct))
                             .unwrap_or(self.tcx.tys.error);
@@ -5238,7 +5245,7 @@ impl<'a> Fcx<'a> {
                     return error;
                 }
                 Some(sig) => {
-                    let full = self.tcx.complete_args(self.prog, d, &gargs, regions);
+                    let full = self.tcx.complete_args(self.prog, d, self.tcx.tys.list(gargs), regions);
                     let (ps, r) = self.instantiate_call_signature(d, &full, &sig);
                     variadic = sig.header.c_variadic;
                     (ps, r)
@@ -5249,15 +5256,15 @@ impl<'a> Fcx<'a> {
                 variadic = header.c_variadic;
                 let vars: Vec<_> = (0..n).map(|_| self.fresh_region()).collect();
                 let sig = self.instantiate_signature(fs, &vars);
-                let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() else { unreachable!() };
-                (ps, r)
+                let TyKind::FnPtr(ps, r, _, _) = *self.tcx.tys.kind(sig) else { unreachable!() };
+                (self.tcx.tys.list(ps).to_vec(), r)
             },
             TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => {
                 let TyKind::FnPtr(_, _, _, n) = self.tcx.tys.kind(sig) else { unreachable!() };
                 let vars: Vec<_> = (0..*n).map(|_| self.fresh_region()).collect();
                 let sig = self.instantiate_signature(sig, &vars);
-                let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() else { unreachable!() };
-                (ps, r)
+                let TyKind::FnPtr(ps, r, _, _) = *self.tcx.tys.kind(sig) else { unreachable!() };
+                (self.tcx.tys.list(ps).to_vec(), r)
             },
             _ if overloaded.is_some() => { let (_, _, ps, ret) = overloaded.unwrap(); (ps, ret) },
             TyKind::Error => {
@@ -5275,7 +5282,7 @@ impl<'a> Fcx<'a> {
         // callee.rs:254,1214-1278: deferring also known kinds preserves the
         // same signature equality and receiver adjustment after capture analysis.
         if matches!(self.tcx.tys.kind(fs), TyKind::Closure(..)) {
-            let tuple = self.tcx.tys.intern(TyKind::Tuple(params.clone()));
+            let tuple = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&params)));
             self.deferred_call_resolutions.push(call::DeferredCallResolution { call_expr: e, closure_ty: fs, derefs: steps, tuple, output: ret });
         }
         if params.len() != args.len() && !(variadic && args.len() >= params.len()) {
@@ -5389,8 +5396,8 @@ impl<'a> Fcx<'a> {
             is_move, force_args, force_move_if_consumes, points: Some(points),
         });
         self.tcx.coroutines.insert((self.file, ce), ());
-        let sig = self.tcx.tys.intern(TyKind::FnPtr(Vec::new(), out, FnHeader::RUST, 0));
-        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), self.env.regions.identity_args(&self.tcx.tys)));
+        let sig = self.tcx.tys.intern(TyKind::FnPtr(crate::types::List::EMPTY, out, FnHeader::RUST, 0));
+        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.tcx.tys.mk_list(&self.b.args), self.env.regions.identity_args(&self.tcx.tys)));
         self.tcx.tys.intern(TyKind::Closure(self.file, ce, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
     }
 
@@ -5429,7 +5436,7 @@ impl<'a> Fcx<'a> {
                 return self.tcx.tys.error;
             }
         };
-        let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![ft], regions: crate::types::RegionArgsId::EMPTY }));
+        let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tcx.tys.mk_list(&[ft]), regions: crate::types::RegionArgsId::EMPTY }));
         let n = self.norm(proj);
         // rustc_ast_lowering/src/expr.rs:1179-1197 lowers await through
         // IntoFuture::into_future. Its output may remain a rigid projection in
@@ -5468,7 +5475,7 @@ impl<'a> Fcx<'a> {
         self.closure_depth.push((e.0, saved));
         let save_async = std::mem::take(&mut self.async_depth);
         let save_awaits = std::mem::take(&mut self.await_count);
-        for (p, t) in params.iter().zip(ps) {
+        for (p, t) in params.iter().zip(self.tcx.tys.list(ps).iter().copied()) {
             self.check_pat(p.pat, t);
         }
         self.ret_stack.push(rt);
@@ -5500,7 +5507,7 @@ impl<'a> Fcx<'a> {
             closure: e.0, upvars: up, kind, source: crate::upvar::CaptureSource::Expr(body),
             is_move, force_args: Vec::new(), force_move_if_consumes: false, points: None,
         });
-        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), self.env.regions.identity_args(&self.tcx.tys)));
+        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.tcx.tys.mk_list(&self.b.args), self.env.regions.identity_args(&self.tcx.tys)));
         self.tcx.tys.intern(TyKind::Closure(self.file, e.0, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
     }
 
@@ -6214,7 +6221,7 @@ pub fn ty_to_string_paths(prog: &Program, tcx: &Tcx, t: TyId) -> String {
             let krate = prog.syms.str(prog.crates[prog.def(*d).krate as usize].name);
             let mut s = format!("{}::{} (crate {}, def {})", krate, prog.def_path(*d), prog.def(*d).krate, d.0);
             if !args.is_empty() {
-                let a: Vec<String> = args.iter().map(|x| ty_to_string_paths(prog, tcx, *x)).collect();
+                let a: Vec<String> = tcx.tys.list(*args).iter().map(|x| ty_to_string_paths(prog, tcx, *x)).collect();
                 s.push_str(&format!("<{}>", a.join(", ")));
             }
             s
@@ -6258,15 +6265,15 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
         TyKind::Adt(d, args, _) => {
             let mut s = item_path(prog, tcx, *d);
             if !args.is_empty() {
-                s.push_str(&format!("<{}>", list(args)));
+                s.push_str(&format!("<{}>", list(tcx.tys.list(*args))));
             }
             s
         }
         TyKind::Tuple(v) => {
-            if v.len() == 1 {
-                format!("({},)", list(v))
+            if tcx.tys.list(*v).len() == 1 {
+                format!("({},)", list(tcx.tys.list(*v)))
             } else {
-                format!("({})", list(v))
+                format!("({})", list(tcx.tys.list(*v)))
             }
         }
         TyKind::Array(e, n) => format!("[{}; {}]", type_name(prog, tcx, *e), tcx.tys.const_to_string(*n)),
@@ -6276,7 +6283,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
         TyKind::FnPtr(ps, r, header, _) => {
             let safety = if header.safety == Safety::Unsafe { "unsafe " } else { "" };
             let abi = if header.abi == Abi::Rust { String::new() } else { format!("extern \"{}\" ", header.abi.name()) };
-            let mut params = list(ps);
+            let mut params = list(tcx.tys.list(*ps));
             if header.c_variadic {
                 if !params.is_empty() { params.push_str(", "); }
                 params.push_str("...");
@@ -6291,7 +6298,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
         TyKind::FnDef(d, args, _) => {
             let mut s = item_path(prog, tcx, *d);
             if !args.is_empty() {
-                s.push_str(&format!("<{}>", list(args)));
+                s.push_str(&format!("<{}>", list(tcx.tys.list(*args))));
             }
             s
         }
@@ -6333,20 +6340,20 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
             s
         }
         TyKind::Dyn(d, args, bindings, _, _, _, autos) => {
-            let (head, autos) = dyn_trait_names(*d, autos, |a| item_path(prog, tcx, a));
+            let (head, autos) = dyn_trait_names(*d, tcx.tys.list(*autos), |a| item_path(prog, tcx, a));
             let mut s = format!("dyn {}", head);
             // the Fn family as rustc prints it: `Fn(u32) -> u32`
             let fn_family = matches!(prog.name(*d), "Fn" | "FnMut" | "FnOnce") && Some(prog.def(*d).krate) == prog.prelude_crate;
-            match (fn_family, args.first().map(|a| tcx.tys.kind(*a))) {
+            match (fn_family, tcx.tys.list(*args).first().map(|a| tcx.tys.kind(*a))) {
                 (true, Some(TyKind::FnPtr(ps, r, _, _))) => {
-                    s.push_str(&format!("({})", list(ps)));
+                    s.push_str(&format!("({})", list(tcx.tys.list(*ps))));
                     if !matches!(tcx.tys.kind(*r), TyKind::Tuple(v) if v.is_empty()) {
                         s.push_str(&format!(" -> {}", type_name(prog, tcx, *r)));
                     }
                 }
                 (true, Some(TyKind::Tuple(ps))) => {
-                    s.push_str(&format!("({})", list(ps)));
-                    if let Some((_, r, _)) = bindings.first() {
+                    s.push_str(&format!("({})", list(tcx.tys.list(*ps))));
+                    if let Some((_, r, _)) = tcx.tys.list(*bindings).first() {
                         if !matches!(tcx.tys.kind(*r), TyKind::Tuple(v) if v.is_empty()) {
                             s.push_str(&format!(" -> {}", type_name(prog, tcx, *r)));
                         }
@@ -6354,7 +6361,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
                 }
                 _ => {
                     if !args.is_empty() {
-                        s.push_str(&format!("<{}>", list(args)));
+                        s.push_str(&format!("<{}>", list(tcx.tys.list(*args))));
                     }
                 }
             }
@@ -6397,7 +6404,7 @@ pub fn item_path(prog: &Program, tcx: &Tcx, d: DefId) -> String {
             if let TyKind::Adt(sd, args, _) = tcx.tys.kind(st) {
                 let mut s = item_path(prog, tcx, *sd);
                 if !args.is_empty() {
-                    s.push_str(&format!("<{}>", vec!["_"; args.len()].join(", ")));
+                    s.push_str(&format!("<{}>", vec!["_"; tcx.tys.list(*args).len()].join(", ")));
                 }
                 return format!("{}::{}", s, name);
             }
@@ -6421,13 +6428,13 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         TyKind::Never => "!".to_string(),
         TyKind::Tuple(v) => {
             let mut s = "(".to_string();
-            for (i, x) in v.iter().enumerate() {
+            for (i, x) in tcx.tys.list(*v).iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
                 s.push_str(&ty_to_string(stable_closures, prog, tcx, *x));
             }
-            if v.len() == 1 {
+            if tcx.tys.list(*v).len() == 1 {
                 s.push(',');
             }
             s.push(')');
@@ -6442,7 +6449,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             let mut s = prog.name(*d).to_string();
             if !args.is_empty() {
                 s.push('<');
-                for (i, x) in args.iter().enumerate() {
+                for (i, x) in tcx.tys.list(*args).iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
@@ -6454,7 +6461,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         }
         TyKind::FnPtr(ps, r, _, _) => {
             let mut s = "fn(".to_string();
-            for (i, x) in ps.iter().enumerate() {
+            for (i, x) in tcx.tys.list(*ps).iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
@@ -6483,11 +6490,11 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
         }
         TyKind::Dyn(d, args, _, _, _, _, autos) => {
-            let (head, autos) = dyn_trait_names(*d, autos, |a| prog.def_path(a));
+            let (head, autos) = dyn_trait_names(*d, tcx.tys.list(*autos), |a| prog.def_path(a));
             let mut s = format!("dyn {}", head);
             if !args.is_empty() {
                 s.push('<');
-                for (i, a) in args.iter().enumerate() {
+                for (i, a) in tcx.tys.list(*args).iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
@@ -6502,7 +6509,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             s
         }
         TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: _ }) => {
-            let st = match args.first() {
+            let st = match tcx.tys.list(*args).first() {
                 Some(t) => ty_to_string(stable_closures, prog, tcx, *t),
                 None => "?".to_string(),
             };
@@ -6520,7 +6527,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
             s
         }
-        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), alias.args.iter().map(|ty| ty_to_string(stable_closures, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
+        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), tcx.tys.list(alias.args).iter().map(|ty| ty_to_string(stable_closures, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
         TyKind::Error => "{error}".to_string(),
     }
 }
@@ -6554,12 +6561,12 @@ pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>) {
         match tcx.tys.kind(ty) {
             TyKind::Adt(d, a, _) | TyKind::FnDef(d, a, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args: a, regions: _ }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: a, regions: _ }) => {
                 out.push(*d);
-                for t in a { walk(tcx, *t, out, depth + 1); }
+                for t in tcx.tys.list(*a) { walk(tcx, *t, out, depth + 1); }
             }
             TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => walk(tcx, *t, out, depth + 1),
-            TyKind::Tuple(a) => for t in a { walk(tcx, *t, out, depth + 1); },
+            TyKind::Tuple(a) => for t in tcx.tys.list(*a) { walk(tcx, *t, out, depth + 1); },
             TyKind::FnPtr(a, t, _, _) => {
-                for x in a { walk(tcx, *x, out, depth + 1); }
+                for x in tcx.tys.list(*a) { walk(tcx, *x, out, depth + 1); }
                 walk(tcx, *t, out, depth + 1);
             }
             _ => {}

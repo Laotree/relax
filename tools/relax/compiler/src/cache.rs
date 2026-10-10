@@ -1143,8 +1143,8 @@ impl Cache {
             TyKind::Never => e.u8(6),
             TyKind::Tuple(v) => {
                 e.u8(7);
-                e.u32(v.len() as u32);
-                for x in v {
+                e.u32(u.tcx.tys.list(v).len() as u32);
+                for x in u.tcx.tys.list(v).iter().copied() {
                     self.enc_ty(u, x, e, crates, depth + 1)?;
                 }
             }
@@ -1172,11 +1172,11 @@ impl Cache {
                 e.u8(12);
                 self.enc_def(u, d, e, crates);
                 self.enc_regions(u, regions, e)?;
-                return self.enc_tys(u, &args, e, crates, depth);
+                return self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth);
             }
             TyKind::FnPtr(ps, r, c, n) => {
                 e.u8(13);
-                self.enc_tys(u, &ps, e, crates, depth)?;
+                self.enc_tys(u, u.tcx.tys.list(ps), e, crates, depth)?;
                 self.enc_ty(u, r, e, crates, depth + 1)?;
                 e.u8(c.safety as u8);
                 e.u8(c.abi as u8);
@@ -1187,7 +1187,7 @@ impl Cache {
                 e.u8(14);
                 self.enc_def(u, d, e, crates);
                 self.enc_regions(u, regions, e)?;
-                return self.enc_tys(u, &args, e, crates, depth);
+                return self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth);
             }
             TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
                 e.u8(17);
@@ -1205,23 +1205,23 @@ impl Cache {
                     AliasTyKind::Opaque { .. } => 2, AliasTyKind::Free { .. } => 3 };
                 e.u8(tag); self.enc_def(u, alias.kind.def_id(), e, crates);
                 self.enc_regions(u, alias.regions, e)?;
-                return self.enc_tys(u, &alias.args, e, crates, depth);
+                return self.enc_tys(u, u.tcx.tys.list(alias.args), e, crates, depth);
             }
             TyKind::Dyn(d, args, binds, regions, r, bound, autos) => {
                 e.u8(19);
                 self.enc_def(u, d, e, crates);
                 self.enc_regions(u, regions, e)?;
                 self.enc_region(u, r, e)?;
-                e.u32(bound);
-                self.enc_tys(u, &args, e, crates, depth)?;
-                e.u32(binds.len() as u32);
-                for (bd, bt, n) in binds {
+                e.u32(bound as u32);
+                self.enc_tys(u, u.tcx.tys.list(args), e, crates, depth)?;
+                e.u32(u.tcx.tys.list(binds).len() as u32);
+                for (bd, bt, n) in u.tcx.tys.list(binds).iter().copied() {
                     e.u32(n);
                     self.enc_def(u, bd, e, crates);
                     self.enc_ty(u, bt, e, crates, depth + 1)?;
                 }
-                e.u32(autos.len() as u32);
-                for ad in autos { self.enc_def(u, ad, e, crates); }
+                e.u32(u.tcx.tys.list(autos).len() as u32);
+                for ad in u.tcx.tys.list(autos).iter().copied() { self.enc_def(u, ad, e, crates); }
             }
             TyKind::Const(v) => {
                 e.u8(20);
@@ -1373,7 +1373,7 @@ impl Cache {
             4 => TyKind::Int(prim_of(d.u8()?)?),
             5 => TyKind::Float(prim_of(d.u8()?)?),
             6 => TyKind::Never,
-            7 => TyKind::Tuple(self.dec_tys(u, d, depth)?),
+            7 => TyKind::Tuple(u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?)),
             8 => {
                 let el = self.dec_ty(u, d, depth + 1)?;
                 let n = self.dec_const(u, d, depth + 1)?;
@@ -1392,12 +1392,12 @@ impl Cache {
             12 => {
                 let def = self.dec_def(u, d)?;
                 let regions = self.dec_regions(u, d)?;
-                TyKind::Adt(def, self.dec_tys(u, d, depth)?, regions)
+                TyKind::Adt(def, u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions)
             }
             13 => {
                 let ps = self.dec_tys(u, d, depth)?;
                 let r = self.dec_ty(u, d, depth + 1)?;
-                TyKind::FnPtr(ps, r, crate::types::FnHeader {
+                TyKind::FnPtr(tys.mk_list(&ps), r, crate::types::FnHeader {
                     safety: match d.u8()? { 0 => crate::types::Safety::Safe, 1 => crate::types::Safety::Unsafe, _ => return None },
                     abi: crate::types::Abi::from_byte(d.u8()?)?,
                     c_variadic: match d.u8()? { 0 => false, 1 => true, _ => return None },
@@ -1406,7 +1406,7 @@ impl Cache {
             14 => {
                 let def = self.dec_def(u, d)?;
                 let regions = self.dec_regions(u, d)?;
-                TyKind::FnDef(def, self.dec_tys(u, d, depth)?, regions)
+                TyKind::FnDef(def, u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions)
             }
             17 => {
                 let file = self.dec_file(u, d)?;
@@ -1429,7 +1429,7 @@ impl Cache {
                 };
                 {
                     let regions = self.dec_regions(u, d)?;
-                    TyKind::Alias(rigid, AliasTy { kind, args: self.dec_tys(u, d, depth)?, regions })
+                    TyKind::Alias(rigid, AliasTy { kind, args: u.tcx.tys.mk_list(&self.dec_tys(u, d, depth)?), regions })
                 }
             }
             19 => {
@@ -1449,7 +1449,7 @@ impl Cache {
                 let mut autos = Vec::with_capacity(n);
                 for _ in 0..n { autos.push(self.dec_def(u, d)?); }
                 autos.sort_by_key(|d| d.0);
-                TyKind::Dyn(def, args.into(), binds.into(), regions, r, bound, autos.into())
+                TyKind::Dyn(def, u.tcx.tys.mk_list(&args), u.tcx.tys.mk_list(&binds), regions, r, u16::try_from(bound).ok()?, u.tcx.tys.mk_list(&autos))
             }
             20 => TyKind::Const(self.dec_const(u, d, depth + 1)?),
             27 => TyKind::Foreign(self.dec_def(u, d)?),
@@ -4400,7 +4400,7 @@ mod cold_tests {
             assert!(unit.tcx.collect_added(&unit.prog, &defs, true).is_empty());
             assert!(unit.prog.errors.is_empty(), "{:?}", unit.prog.errors);
             let frame = defs.iter().copied().find(|d| unit.prog.syms.str(unit.prog.def(*d).name) == "frame").unwrap();
-            unit.tcx.tys.intern(TyKind::FnDef(frame, vec![], crate::types::RegionArgsId::EMPTY));
+            unit.tcx.tys.intern(TyKind::FnDef(frame, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
             krate
         };
         assert_eq!(append(&mut unit, "fx_a"), 1);
@@ -4825,7 +4825,7 @@ mod data_tests {
         let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
         let mut u = Unit::new(prog, tcx, 0);
         let mut cache = open_test_cache(&u, &root.join("cache"));
-        let callable = u.tcx.tys.intern(TyKind::FnPtr(vec![u.tcx.tys.usize_], u.tcx.tys.usize_, crate::types::FnHeader::RUST, 0));
+        let callable = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(&[u.tcx.tys.usize_]), u.tcx.tys.usize_, crate::types::FnHeader::RUST, 0));
         let mut kinds = vec![ShimKind::VTable(method), ShimKind::FnPtr(method, callable), ShimKind::FnPtrAsPtr(method, callable), ShimKind::FnPtrFromPtr(method, callable)];
         for reason in [None, Some(ReifyReason::FnPtr), Some(ReifyReason::Vtable)] { kinds.push(ShimKind::Reify(method, reason)); }
         for closure in closures { for track_caller in [false, true] { kinds.push(ShimKind::ClosureOnce { call_once: method, closure, track_caller }); } }
@@ -4833,10 +4833,10 @@ mod data_tests {
         let pointer = u.tcx.tys.intern(TyKind::Ptr(false, foreign));
         let named = |name| u.prog.defs.iter().enumerate().find_map(|(i, _)| (u.prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
         let regions = u.tcx.tys.intern_region_args(&[crate::types::RegionId::ERASED]);
-        let borrowed = u.tcx.tys.intern(TyKind::Adt(named("Borrowed"), vec![], regions));
-        let early = u.tcx.tys.intern(TyKind::FnDef(named("early"), vec![], regions));
-        let alias = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: vec![], regions }));
-        let object = u.tcx.tys.intern(TyKind::Dyn(named("View"), vec![].into(), vec![].into(), regions, crate::types::RegionId::ERASED, 0, vec![].into()));
+        let borrowed = u.tcx.tys.intern(TyKind::Adt(named("Borrowed"), u.tcx.tys.mk_list(&[]), regions));
+        let early = u.tcx.tys.intern(TyKind::FnDef(named("early"), u.tcx.tys.mk_list(&[]), regions));
+        let alias = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: u.tcx.tys.mk_list(&[]), regions }));
+        let object = u.tcx.tys.intern(TyKind::Dyn(named("View"), crate::types::List::EMPTY, crate::types::List::EMPTY, regions, crate::types::RegionId::ERASED, 0, crate::types::List::EMPTY));
         let mut encoded = Vec::new();
         for kind in kinds {
             let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object] });
@@ -4914,26 +4914,26 @@ mod data_tests {
         let reference = tys.intern(TyKind::Ref(false, tys.u32_, bound));
         let erased = tys.intern(TyKind::Ref(false, tys.u32_, RegionId::ERASED));
         let static_ref = tys.intern(TyKind::Ref(false, tys.u32_, tys.intern_region(RegionKind::ReStatic)));
-        let hr = tys.intern(TyKind::FnPtr(vec![reference], tys.unit, FnHeader::RUST, 1));
-        let plain = tys.intern(TyKind::FnPtr(vec![erased], tys.unit, FnHeader::RUST, 0));
-        let static_fn = tys.intern(TyKind::FnPtr(vec![static_ref], tys.unit, FnHeader::RUST, 0));
+        let hr = tys.intern(TyKind::FnPtr(tys.mk_list(&[reference]), tys.unit, FnHeader::RUST, 1));
+        let plain = tys.intern(TyKind::FnPtr(tys.mk_list(&[erased]), tys.unit, FnHeader::RUST, 0));
+        let static_fn = tys.intern(TyKind::FnPtr(tys.mk_list(&[static_ref]), tys.unit, FnHeader::RUST, 0));
         assert_eq!(tys.erase_regions(static_fn), plain);
         // Source fn(&u32) has the same late-bound region as for<'a> fn(&'a u32).
         // An already-erased, unbound signature is instead `plain`.
-        let vacuous = tys.intern(TyKind::FnPtr(vec![erased], tys.unit, FnHeader::RUST, 1));
+        let vacuous = tys.intern(TyKind::FnPtr(tys.mk_list(&[erased]), tys.unit, FnHeader::RUST, 1));
         let outer_ref = tys.intern(TyKind::Ref(false, tys.u32_, outer));
-        let inner = tys.intern(TyKind::FnPtr(vec![reference, outer_ref], outer_ref, FnHeader::RUST, 1));
-        let nested = tys.intern(TyKind::FnPtr(vec![], inner, FnHeader::RUST, 2));
+        let inner = tys.intern(TyKind::FnPtr(tys.mk_list(&[reference, outer_ref]), outer_ref, FnHeader::RUST, 1));
+        let nested = tys.intern(TyKind::FnPtr(tys.mk_list(&[]), inner, FnHeader::RUST, 2));
         let regions = tys.intern_region_args(&[bound]);
-        let object = tys.intern(TyKind::Dyn(named("View"), vec![reference].into(), vec![(named("Output"), outer_ref, 1)].into(), regions, outer, 1, vec![].into()));
-        let fn_object = tys.intern(TyKind::Dyn(named("Fn"), vec![tys.intern(TyKind::Tuple(vec![reference]))].into(), vec![(named("FnOutput"), tys.unit, 0)].into(), crate::types::RegionArgsId::EMPTY, RegionId::ERASED, 1, vec![].into()));
+        let object = tys.intern(TyKind::Dyn(named("View"), tys.mk_list(&[reference]), tys.mk_list(&[(named("Output"), outer_ref, 1)]), regions, outer, 1, crate::types::List::EMPTY));
+        let fn_object = tys.intern(TyKind::Dyn(named("Fn"), tys.mk_list(&[tys.intern(TyKind::Tuple(tys.mk_list(&[reference])))]), tys.mk_list(&[(named("FnOutput"), tys.unit, 0)]), crate::types::RegionArgsId::EMPTY, RegionId::ERASED, 1, crate::types::List::EMPTY));
         let owner = named("owner");
         let closure = tys.intern(TyKind::Closure(u.prog.def(owner).file, crate::program::closure_exprs(&u.prog, owner)[0], ClosureArgs {
             parent_args: tys.unit, closure_kind_ty: tys.u8_, closure_sig_as_fn_ptr_ty: hr, tupled_upvars_ty: tys.unit,
         }));
-        let borrowed = tys.intern(TyKind::Adt(named("Borrowed"), vec![], regions));
-        let fndef = tys.intern(TyKind::FnDef(method, vec![hr], regions));
-        let alias = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: vec![], regions }));
+        let borrowed = tys.intern(TyKind::Adt(named("Borrowed"), tys.mk_list(&[]), regions));
+        let fndef = tys.intern(TyKind::FnDef(method, tys.mk_list(&[hr]), regions));
+        let alias = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: tys.mk_list(&[]), regions }));
         let ct = tys.intern_const(crate::consts::ConstKind::Alias(crate::consts::IsRigid::No, crate::consts::AliasConst {
             kind: crate::consts::AliasConstKind::Anon { def_id: method }, args: vec![crate::consts::GenericArg::Lifetime(outer)].into(),
         }));
@@ -4999,7 +4999,7 @@ mod data_tests {
         let byte = Const::new_value(tys, ValTree::from_scalar_int(tys,
             ScalarInt::try_from_uint(17, 1).unwrap()), tys.u8_);
         let aggregate = Const::new_value(tys, ValTree::from_branches(tys, &[wide, byte]),
-            tys.intern(TyKind::Tuple(vec![wide_ty, tys.u8_])));
+            tys.intern(TyKind::Tuple(tys.mk_list(&[wide_ty, tys.u8_]))));
         let array = tys.mk_array(tys.u8_, tys.const_usize(u64::MAX));
         let types = [array, tys.intern(TyKind::Const(aggregate))];
         let expected = [crate::stable::type_hash(&u.prog, &u.tcx, array),
@@ -5053,7 +5053,7 @@ mod data_tests {
         let mut hashes = Vec::new();
         for def_id in definitions {
             let ty = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No,
-                AliasTy { kind: AliasTyKind::Opaque { def_id }, args: vec![], regions: crate::types::RegionArgsId::EMPTY }));
+                AliasTy { kind: AliasTyKind::Opaque { def_id }, args: u.tcx.tys.mk_list(&[]), regions: crate::types::RegionArgsId::EMPTY }));
             let hash = crate::stable::type_hash(&u.prog, &u.tcx, ty);
             assert!(!hashes.contains(&hash)); hashes.push(hash);
             let mut e = E(Vec::new());
@@ -5086,7 +5086,7 @@ mod data_tests {
             for safety in [Safety::Safe, Safety::Unsafe] {
                 for c_variadic in [false, true] {
                     let header = FnHeader { safety, abi, c_variadic };
-                    let ty = u.tcx.tys.intern(TyKind::FnPtr(vec![u.tcx.tys.bool_], u.tcx.tys.unit, header, 0));
+                    let ty = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(&[u.tcx.tys.bool_]), u.tcx.tys.unit, header, 0));
                     let mut e = E(Vec::new());
                     assert!(cache.enc_ty(&u, ty, &mut e, &mut Vec::new(), 0).is_some());
                     assert!(!encodings.contains(&e.0));
@@ -5118,7 +5118,7 @@ mod data_tests {
         let mut cache = open_test_cache(&u, &root);
         let mut encodings = Vec::new();
         for autos in [vec![], vec![first], vec![first, second]] {
-            let ty = u.tcx.tys.intern(TyKind::Dyn(principal, Default::default(), Default::default(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, autos.into()));
+            let ty = u.tcx.tys.intern(TyKind::Dyn(principal, Default::default(), Default::default(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, u.tcx.tys.mk_list(&autos)));
             let mut e = E(Vec::new());
             assert!(cache.enc_ty(&u, ty, &mut e, &mut Vec::new(), 0).is_some());
             assert!(!encodings.contains(&e.0));
@@ -5154,7 +5154,7 @@ mod data_tests {
         // `fn(&u8)`, `fn(&u8, &u8)` with one and with two bound regions, `fn(&dyn Principal)`,
         // `fn(Holder<'_>) -> &u8`, and the same shapes unbound (`fn(&'static u8)` erased)
         let dyn_bound = tys.intern(TyKind::Dyn(principal, Default::default(), Default::default(), RegionArgsId::EMPTY, b0, 0, Default::default()));
-        let holder_bound = tys.intern(TyKind::Adt(holder, Vec::new(), tys.intern_region_args(&[b0])));
+        let holder_bound = tys.intern(TyKind::Adt(holder, crate::types::List::EMPTY, tys.intern_region_args(&[b0])));
         let shapes = [
             (vec![r(false, tys.u8_, b0)], tys.unit, 1),
             (vec![r(false, tys.u8_, b0), r(true, tys.u8_, b0)], tys.unit, 1),
@@ -5165,9 +5165,9 @@ mod data_tests {
         ];
         let mut encodings = Vec::new();
         for (ps, ret, n) in shapes {
-            let ty = u.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, n));
+            let ty = u.tcx.tys.intern(TyKind::FnPtr(u.tcx.tys.mk_list(&ps), ret, FnHeader::RUST, n));
             // inside another type too (`Vec<fn(&mut Cx)>`'s glue keys)
-            let outer = u.tcx.tys.intern(TyKind::Tuple(vec![ty, u.tcx.tys.bool_]));
+            let outer = u.tcx.tys.intern(TyKind::Tuple(u.tcx.tys.mk_list(&[ty, u.tcx.tys.bool_])));
             for t in [ty, outer] {
                 let mut e = E(Vec::new());
                 assert!(cache.enc_ty(&u, t, &mut e, &mut Vec::new(), 0).is_some());

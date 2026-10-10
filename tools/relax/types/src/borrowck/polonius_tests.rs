@@ -110,7 +110,7 @@ fn variance_records_covariant_contravariant_invariant_and_missing_regions() {
     let r = |n| tcx.tys.intern(TyKind::Ref(false, tcx.tys.i32_, region(n)));
     let mut dirs = vec![];
     record_live_region_variance(&tcx, &test_prog(), &mut dirs, &u, r(1));
-    let fp = tcx.tys.intern(TyKind::FnPtr(vec![r(2)], r(3), crate::types::FnHeader::RUST, 0));
+    let fp = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[r(2)]), r(3), crate::types::FnHeader::RUST, 0));
     record_live_region_variance(&tcx, &test_prog(), &mut dirs, &u, fp);
     let inv = tcx.tys.intern(TyKind::Ref(true, r(4), region(5)));
     record_live_region_variance(&tcx, &test_prog(), &mut dirs, &u, inv);
@@ -258,11 +258,11 @@ fn reaudit_opaque_variance_follows_declared_captures() {
     let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
     let u = UniversalRegions::new(0, None, vec![(0, Class::Global)]);
     let region = |r| tcx.tys.intern_region(RegionKind::ReVar(r));
-    let opaque = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[region(1), region(2)]) }));
+    let opaque = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { def_id: d }, args: tcx.tys.mk_list(&[]), regions: tcx.tys.intern_region_args(&[region(1), region(2)]) }));
     let mut dirs = vec![];
     record_live_region_variance(&tcx, &prog, &mut dirs, &u, opaque);
     assert_eq!(dirs, [None, None, Some(D::Bidirectional)]);
-    let assoc = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[region(1)]) }));
+    let assoc = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { def_id: d }, args: tcx.tys.mk_list(&[]), regions: tcx.tys.intern_region_args(&[region(1)]) }));
     let mut dirs = vec![];
     record_live_region_variance(&tcx, &prog, &mut dirs, &u, assoc);
     assert_eq!(dirs, [None, Some(D::Bidirectional)]);

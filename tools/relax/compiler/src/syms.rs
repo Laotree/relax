@@ -627,7 +627,7 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
         }
         TyKind::Tuple(ts) => {
             let l = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t);
-            for (i, ft) in ts.iter().enumerate() {
+            for (i, ft) in u.tcx.tys.list(ts).iter().enumerate() {
                 let fo = *l.fields.get(i)?;
                 walk(u, *ft, base, off + fo, out, depth + 1)?;
             }
@@ -658,7 +658,7 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
             };
             let fields = adt.variants.get(vi)?.fields.clone();
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args));
                 let fo = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 walk(u, ft, base, off + fo?, out, depth + 1)?;
             }
@@ -677,10 +677,10 @@ fn has_enum(u: &Unit, t: TyId, depth: u32) -> bool {
     match u.tcx.tys.kind(t).clone() {
         TyKind::Adt(d, args, _) => match u.tcx.adts.get(&d) {
             Some(a) if a.is_enum => true,
-            Some(a) => a.variants.iter().enumerate().any(|(vi, v)| (0..v.fields.len()).any(|fi| has_enum(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))),
+            Some(a) => a.variants.iter().enumerate().any(|(vi, v)| (0..v.fields.len()).any(|fi| has_enum(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, u.tcx.tys.list(args)), depth + 1))),
             None => true,
         },
-        TyKind::Tuple(ts) => ts.iter().any(|x| has_enum(u, *x, depth + 1)),
+        TyKind::Tuple(ts) => u.tcx.tys.list(ts).iter().any(|x| has_enum(u, *x, depth + 1)),
         TyKind::Array(e, _) => has_enum(u, e, depth + 1),
         _ => false,
     }

@@ -108,7 +108,7 @@ fn body(tys: &[TyId], blocks: Vec<BasicBlockData>) -> Body {
 fn re(tcx: &Tcx, v: u32) -> RegionId { tcx.tys.intern_region(RegionKind::ReVar(v)) }
 fn bound(tcx: &Tcx, v: u32) -> RegionId { tcx.tys.intern_region(RegionKind::ReBound(0, BoundVar(v))) }
 fn rf(tcx: &Tcx, r: RegionId, t: TyId, m: bool) -> TyId { tcx.tys.intern(TyKind::Ref(m, t, r)) }
-fn fn_ptr(tcx: &Tcx, inputs: Vec<TyId>, output: TyId, n: u32) -> TyId { tcx.tys.intern(TyKind::FnPtr(inputs, output, FnHeader::RUST, n)) }
+fn fn_ptr(tcx: &Tcx, inputs: Vec<TyId>, output: TyId, n: u32) -> TyId { tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&inputs), output, FnHeader::RUST, n)) }
 fn val(ty: TyId) -> Operand { Operand::Constant(Box::new(ConstOperand { span: Span::default(), user_ty: None, const_: Const::Val(ConstValue::ZeroSized, ty) })) }
 fn assign(dst: u32, rv: Rvalue) -> StatementKind { StatementKind::Assign(p(dst), rv) }
 fn copy(src: u32) -> Rvalue { Rvalue::Use(Operand::Copy(p(src))) }
@@ -186,7 +186,7 @@ fn mutable_references_are_invariant_in_their_referent() {
 fn call_arguments_destination_and_late_bound_regions() {
     let (prog, tcx) = collect("fn f<'a>(x: &'a i32) -> &'a i32 { x }"); let t = tcx.tys.i32_;
     // fn f<'x>(&'x i32) -> &'x i32, called as `_3 = f(copy _2)`.
-    let f = tcx.tys.intern(TyKind::FnDef(named(&prog, "f"), vec![], RegionArgsId::EMPTY));
+    let f = tcx.tys.intern(TyKind::FnDef(named(&prog, "f"), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
     let late = rf(&tcx, bound(&tcx, 0), t, false);
     let call = |source| TerminatorKind::Call { func: val(f), args: vec![Operand::Copy(p(2))], destination: p(3), target: Some(BasicBlock(1)),
         unwind: UnwindAction::Continue, call_source: source, fn_span: span(80), arg_spans: vec![] };
@@ -241,7 +241,7 @@ fn cast_categories() {
     let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert_eq!(edges(&r)[0], (1, 2, Some(0), implicit(true)));
     // fn(&'1 i32) as unsafe fn(&'2 i32): the source becomes unsafe, arguments are contravariant.
-    let f = |v, safety| tcx.tys.intern(TyKind::FnPtr(vec![rf(&tcx, re(&tcx, v), t, false)], tcx.tys.unit, FnHeader { safety, ..FnHeader::RUST }, 0));
+    let f = |v, safety| tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[rf(&tcx, re(&tcx, v), t, false)]), tcx.tys.unit, FnHeader { safety, ..FnHeader::RUST }, 0));
     let b = body(&[tcx.tys.unit, f(1, Safety::Safe), f(2, Safety::Unsafe)], vec![block(vec![cast(CastKind::PointerCoercion(PointerCoercion::UnsafeFnPointer, CoercionSource::AsCast), f(2, Safety::Unsafe))], TerminatorKind::Return)]);
     let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert_eq!(edges(&r)[0], (2, 1, Some(0), implicit(false)));
@@ -264,7 +264,7 @@ fn cast_categories() {
 fn reify_and_closure_fn_pointer_casts() {
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
     // A higher-ranked fn item reified to `fn(&'2 i32)`: the instantiated signature is proven WF.
-    let item = tcx.tys.intern(TyKind::FnDef(DefId(9), vec![], RegionArgsId::EMPTY));
+    let item = tcx.tys.intern(TyKind::FnDef(DefId(9), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
     let target = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 2), t, false)], tcx.tys.unit, 0);
     let b = body(&[tcx.tys.unit, item, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, CoercionSource::Implicit), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
@@ -315,7 +315,7 @@ pub(crate) fn opaque_fixture() -> (Program, Tcx, DefId) {
 #[test]
 fn adt_lifetime_arguments_follow_declared_variance() {
     let (prog, tcx) = collect("struct Co<'a>(&'a i32); struct Contra<'a>(fn(&'a i32)); struct Inv<'a>(fn(&'a i32) -> &'a i32); struct Bi<'a, T>(T);");
-    let adt = |name, v| tcx.tys.intern(TyKind::Adt(named(&prog, name), vec![], tcx.tys.intern_region_args(&[re(&tcx, v)])));
+    let adt = |name, v| tcx.tys.intern(TyKind::Adt(named(&prog, name), tcx.tys.mk_list(&[]), tcx.tys.intern_region_args(&[re(&tcx, v)])));
     for (name, expected) in [("Co", vec![(1, 2)]), ("Contra", vec![(2, 1)]), ("Inv", vec![(1, 2), (2, 1)])] {
         let b = body(&[tcx.tys.unit, adt(name, 1), adt(name, 2)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
         let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 3), &b); clean(&r);
@@ -323,7 +323,7 @@ fn adt_lifetime_arguments_follow_declared_variance() {
         assert_eq!(e, expected, "{name}");
     }
     // An unused (bivariant) lifetime parameter relates nothing.
-    let bi = |v| tcx.tys.intern(TyKind::Adt(named(&prog, "Bi"), vec![tcx.tys.i32_], tcx.tys.intern_region_args(&[re(&tcx, v)])));
+    let bi = |v| tcx.tys.intern(TyKind::Adt(named(&prog, "Bi"), tcx.tys.mk_list(&[tcx.tys.i32_]), tcx.tys.intern_region_args(&[re(&tcx, v)])));
     let b = body(&[tcx.tys.unit, bi(1), bi(2)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
     let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert!(edges(&r).is_empty());
@@ -338,7 +338,7 @@ fn fn_pointer_arguments_are_contravariant() {
     let mut e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect(); e.sort();
     assert_eq!(e, [(2, 1), (3, 4)]);
     // Headers must agree.
-    let unsafe_f = tcx.tys.intern(TyKind::FnPtr(vec![rf(&tcx, re(&tcx, 2), t, false)], rf(&tcx, re(&tcx, 4), t, false), FnHeader { safety: Safety::Unsafe, ..FnHeader::RUST }, 0));
+    let unsafe_f = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[rf(&tcx, re(&tcx, 2), t, false)]), rf(&tcx, re(&tcx, 4), t, false), FnHeader { safety: Safety::Unsafe, ..FnHeader::RUST }, 0));
     let b = body(&[tcx.tys.unit, f(1, 3), unsafe_f], vec![block(vec![assign(2, copy(1))], TerminatorKind::Return)]);
     assert!(check(&tcx, &mut Fake::new(&tcx, 5), &b).mir_bugs[0].message.contains("bad assignment"));
 }
@@ -451,7 +451,7 @@ fn promoted_constraints_move_to_the_use_location() {
 fn closure_aggregates_defer_requirements_and_prove_bounds() {
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
     let id = ClosureId { file: 7, expr: 3 };
-    let closure = tcx.tys.intern(TyKind::Closure(7, 3, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: fn_ptr(&tcx, vec![], tcx.tys.unit, 0), tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(vec![])) }));
+    let closure = tcx.tys.intern(TyKind::Closure(7, 3, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: fn_ptr(&tcx, vec![], tcx.tys.unit, 0), tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[]))) }));
     let b = body(&[tcx.tys.unit, t, closure], vec![block(vec![StatementKind::Nop, assign(2, Rvalue::Aggregate(Box::new(AggregateKind::Closure(id, vec![GenericArg::Type(t)])), vec![]))], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.query_ty = Some(closure);
@@ -511,7 +511,7 @@ fn reaudit_generic_arguments_are_related_in_declaration_order() {
     // `'a` (declared first) is related before the type argument `T`.
     let (prog, tcx) = collect("struct P<'a, T>(&'a T);");
     let t = tcx.tys.i32_;
-    let adt = |a, r| tcx.tys.intern(TyKind::Adt(named(&prog, "P"), vec![rf(&tcx, re(&tcx, r), t, false)], tcx.tys.intern_region_args(&[re(&tcx, a)])));
+    let adt = |a, r| tcx.tys.intern(TyKind::Adt(named(&prog, "P"), tcx.tys.mk_list(&[rf(&tcx, re(&tcx, r), t, false)]), tcx.tys.intern_region_args(&[re(&tcx, a)])));
     let b = body(&[tcx.tys.unit, adt(1, 3), adt(2, 4)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
     let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 5), &b); clean(&r);
     let e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect();
@@ -528,9 +528,9 @@ fn reaudit_closure_parent_arguments_are_related_first() {
     // ClosureArgs are [parent args.., kind, signature, upvars]: the owner's regions first.
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
     let closure = |o, s, c| {
-        let owner = tcx.tys.intern(TyKind::FnDef(DefId(3), vec![], tcx.tys.intern_region_args(&[re(&tcx, o)])));
+        let owner = tcx.tys.intern(TyKind::FnDef(DefId(3), tcx.tys.mk_list(&[]), tcx.tys.intern_region_args(&[re(&tcx, o)])));
         let sig = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, s), t, false)], tcx.tys.unit, 0);
-        let captures = tcx.tys.intern(TyKind::Tuple(vec![rf(&tcx, re(&tcx, c), t, false)]));
+        let captures = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[rf(&tcx, re(&tcx, c), t, false)])));
         tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: captures }))
     };
     let b = body(&[tcx.tys.unit, closure(1, 3, 5), closure(2, 4, 6)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);

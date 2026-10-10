@@ -182,7 +182,7 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
     match tcx.tys.kind(t) {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never => true,
         // tuples: rustc's size checked through LAYOUTS (layout_deps)
-        TyKind::Tuple(v) => v.iter().all(|x| tr(*x)),
+        TyKind::Tuple(v) => tcx.tys.list(*v).iter().all(|x| tr(*x)),
         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => pointee(*x),
         TyKind::FnPtr(_, _, header, _) => header.abi.is_c_like(),
         TyKind::Array(e, _) => tr(*e),
@@ -195,8 +195,8 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             // free). Such a box is no handle: the type holding it stays opaque (TYPES), dropped
             // and cloned by the crate.
             if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
-                return a.len() <= 2
-                    && a.first().is_some_and(|x| match tcx.tys.kind(*x) {
+                return tcx.tys.list(*a).len() <= 2
+                    && tcx.tys.list(*a).first().is_some_and(|x| match tcx.tys.kind(*x) {
                         TyKind::Str => true,
                         TyKind::Slice(e) => tr(*e) || own_pub(*e),
                         TyKind::Dyn(..) => false,
@@ -210,8 +210,8 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
             if tcx.adts.get(d).is_some_and(|a| a.is_phantom_data()) {
                 return true;
             }
-            if tcx.lang_items.get(LangItem::Option) == Some(*d) && a.len() == 1 {
-                return tr(a[0]);
+            if tcx.lang_items.get(LangItem::Option) == Some(*d) && tcx.tys.list(*a).len() == 1 {
+                return tr(tcx.tys.list(*a)[0]);
             }
             if !a.is_empty() {
                 return false;
@@ -272,7 +272,7 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
             if !out.contains(&t) {
                 out.push(t);
             }
-            for x in v {
+            for x in tcx.tys.list(*v) {
                 layout_deps(prog, tcx, krate, *x, out);
             }
         }
@@ -285,7 +285,7 @@ pub fn layout_deps(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, out: &mut Vec
                     out.push(t);
                 }
             }
-            for x in a {
+            for x in tcx.tys.list(*a) {
                 layout_deps(prog, tcx, krate, *x, out);
             }
         }
@@ -398,7 +398,7 @@ pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool
         Some(a) if a.n_generics == 0 && !a.is_union => {}
         _ => return false,
     }
-    let t = tcx.tys.intern(TyKind::Adt(d, Vec::new(), crate::types::RegionArgsId::EMPTY));
+    let t = tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
     !trusted(prog, tcx, krate, t, 0)
 }
 
@@ -435,11 +435,11 @@ fn type_cfg(prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Adt(d, args, _) => {
             let mut out = item_cfg(prog, *d);
-            for a in args { out.push_str(&type_cfg(prog, tcx, *a)); }
+            for a in tcx.tys.list(*args) { out.push_str(&type_cfg(prog, tcx, *a)); }
             out
         }
         TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => type_cfg(prog, tcx, *t),
-        TyKind::Tuple(ts) => ts.iter().map(|t| type_cfg(prog, tcx, *t)).collect(),
+        TyKind::Tuple(ts) => tcx.tys.list(*ts).iter().map(|t| type_cfg(prog, tcx, *t)).collect(),
         _ => String::new(),
     }
 }
@@ -537,8 +537,8 @@ fn rust_ty(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> Option<String> {
     match tcx.tys.kind(t) {
         // the crate's own public types only (other crates' paths may differ under rustc)
         TyKind::Adt(d, a, _) if a.is_empty() && prog.def(*d).krate == krate && prog.def(*d).is_pub => item_path(prog, krate, *d),
-        TyKind::Adt(d, a, _) if a.len() == 1 && tcx.lang_items.get(LangItem::Option) == Some(*d) => {
-            Some(format!("::core::option::Option<{}>", rust_ty(prog, tcx, krate, a[0])?))
+        TyKind::Adt(d, a, _) if tcx.tys.list(*a).len() == 1 && tcx.lang_items.get(LangItem::Option) == Some(*d) => {
+            Some(format!("::core::option::Option<{}>", rust_ty(prog, tcx, krate, tcx.tys.list(*a)[0])?))
         }
         TyKind::Adt(d, a, _) if a.is_empty() && tcx.lang_items.get(LangItem::OrderingEnum) == Some(*d) => {
             Some("::core::cmp::Ordering".to_string())
@@ -551,7 +551,7 @@ fn rust_ty(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> Option<String> {
         TyKind::Array(x, n) => Some(format!("[{}; {}]", rust_ty(prog, tcx, krate, *x)?, n.try_to_target_usize(&tcx.tys)?)),
         TyKind::Tuple(v) if v.is_empty() => Some("()".to_string()),
         TyKind::Tuple(v) => {
-            let a: Option<Vec<String>> = v.iter().map(|x| rust_ty(prog, tcx, krate, *x)).collect();
+            let a: Option<Vec<String>> = tcx.tys.list(*v).iter().map(|x| rust_ty(prog, tcx, krate, *x)).collect();
             Some(format!("({},)", a?.join(", ")))
         }
         _ => None,
@@ -1093,17 +1093,17 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
                     if let Some(adt) = tcx.adts.get(d) {
                         for (vi, v) in adt.variants.iter().enumerate() {
                             for fi in 0..v.fields.len() {
-                                stack.push(tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), *d, vi as u32, fi as u32, a));
+                                stack.push(tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), *d, vi as u32, fi as u32, tcx.tys.list(*a)));
                             }
                         }
                     }
-                    stack.extend(a.iter().copied());
+                    stack.extend(tcx.tys.list(*a).iter().copied());
                 } else if tcx.lang_items.get(LangItem::Option) == Some(*d) || tcx.adts.get(d).is_some_and(|a| a.is_box() || a.is_phantom_data()) {
-                    stack.extend(a.iter().copied());
+                    stack.extend(tcx.tys.list(*a).iter().copied());
                 }
             }
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Slice(x) | TyKind::Array(x, _) => stack.push(*x),
-            TyKind::Tuple(v) => stack.extend(v.iter().copied()),
+            TyKind::Tuple(v) => stack.extend(tcx.tys.list(*v).iter().copied()),
             _ => {}
         }
     }

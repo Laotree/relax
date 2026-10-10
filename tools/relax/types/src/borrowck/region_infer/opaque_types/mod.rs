@@ -165,12 +165,12 @@ impl ToArgRegionsFolder<'_, '_> {
                 };
                 TyKind::Const(tys.intern_const(kind))
             }
-            TyKind::Tuple(ts) => TyKind::Tuple(self.list(ts)?),
+            TyKind::Tuple(ts) => TyKind::Tuple(tys.mk_list(&self.list(tys.list(*ts))?)),
             TyKind::Adt(d,ts,rs) | TyKind::FnDef(d,ts,rs) => {
-                let (ts,rs) = self.args(*d,ts,*rs,None)?;
+                let (ts,rs) = self.args(*d,tys.list(*ts),*rs,None)?;
                 match tys.kind(ty) {
-                    TyKind::Adt(..) => TyKind::Adt(*d,ts,rs),
-                    TyKind::FnDef(..) => TyKind::FnDef(*d,ts,rs),
+                    TyKind::Adt(..) => TyKind::Adt(*d,tys.mk_list(&ts),rs),
+                    TyKind::FnDef(..) => TyKind::FnDef(*d,tys.mk_list(&ts),rs),
                     _ => unreachable!(),
                 }
             }
@@ -178,14 +178,14 @@ impl ToArgRegionsFolder<'_, '_> {
                 let d = alias.kind.def_id();
                 // mod.rs:502-514: opt_alias_variances (opaques and RPITITs).
                 let variance = self.tcx.alias_declared_variances(self.prog, alias.kind);
-                let (args,regions) = self.args(d,&alias.args,alias.regions,variance)?;
-                TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args, regions })
+                let (args,regions) = self.args(d,tys.list(alias.args),alias.regions,variance)?;
+                TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args: tys.mk_list(&args), regions })
             }
-            TyKind::FnPtr(ts,r,h,n) => TyKind::FnPtr(self.list(ts)?,self.fold_ty(*r)?,*h,*n),
+            TyKind::FnPtr(ts,r,h,n) => TyKind::FnPtr(tys.mk_list(&self.list(tys.list(*ts))?),self.fold_ty(*r)?,*h,*n),
             TyKind::Dyn(d,ts,bs,rs,r,n,autos) => {
-                let (ts,rs) = self.args(*d,ts,*rs,None)?;
-                let bs: Vec<_> = bs.iter().map(|&(d,t,n)| Ok((d,self.fold_ty(t)?,n))).collect::<Result<_,usize>>()?;
-                TyKind::Dyn(*d,ts.into(),bs.into(),rs,self.fold_region(*r)?,*n,autos.clone().into())
+                let (ts,rs) = self.args(*d,tys.list(*ts),*rs,None)?;
+                let bs: Vec<_> = tys.list(*bs).iter().map(|&(d,t,n)| Ok((d,self.fold_ty(t)?,n))).collect::<Result<_,usize>>()?;
+                TyKind::Dyn(*d,tys.mk_list(&ts),tys.mk_list(&bs),rs,self.fold_region(*r)?,*n,*autos)
             }
             TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => {
                 let previous = self.erase_unknown_regions;

@@ -12,19 +12,19 @@ impl Tcx {
     pub fn alias_ty_with_args(&self, kind: AliasTyKind, args: &[GenericArg]) -> TyId {
         let mut types = Vec::new(); let mut regions = Vec::new();
         for &a in args { match a { GenericArg::Lifetime(r) => regions.push(r), GenericArg::Type(t) => types.push(t), GenericArg::Const(c) => types.push(self.tys.intern(TyKind::Const(c))) } }
-        self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args: types, regions: self.tys.intern_region_args(&regions) }))
+        self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args: self.tys.mk_list(&types), regions: self.tys.intern_region_args(&regions) }))
     }
     pub fn object_predicates(&self, prog: &Program, ty: TyId) -> Vec<Predicate> {
         let TyKind::Dyn(principal, args, bounds, rs, _, n, autos) = self.tys.kind(ty) else { unreachable!() };
         let mut predicates = Vec::new();
         if *principal != NO_DEF {
-            let mut compact = vec![ty]; compact.extend_from_slice(args);
+            let mut compact = vec![ty]; compact.extend_from_slice(self.tys.list(*args));
             let args = self.complete_args(prog, *principal, &compact, *rs);
             let mut p = collect::trait_predicate(*principal, args); p.bound_vars = vec![BoundVariableKind::Region(crate::types::BoundRegionKind::Anon); *n as usize].into();
             predicates.push(p);
         }
-        for &auto in autos { predicates.push(collect::trait_predicate(auto, vec![GenericArg::Type(ty)])); }
-        for &(def, term, n) in bounds {
+        for &auto in self.tys.list(*autos) { predicates.push(collect::trait_predicate(auto, vec![GenericArg::Type(ty)])); }
+        for &(def, term, n) in self.tys.list(*bounds) {
             let owner = prog.def(def).parent;
             let mut tr = None;
             if *principal != NO_DEF { for p in self.supertraits(prog, predicates[0].clone()) {
@@ -93,7 +93,7 @@ struct ReplaceProjectionWith<'a, 'b, 'tcx> { ecx: &'a mut EvalCtxt<'b, 'tcx>, en
 impl TypeFolder for ReplaceProjectionWith<'_, '_, '_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         if let TyKind::Alias(_, a) = tys.kind(ty) {
-            if matches!(a.kind, AliasTyKind::Projection { .. }) && a.args[0] == self.self_ty {
+            if matches!(a.kind, AliasTyKind::Projection { .. }) && tys.list(a.args)[0] == self.self_ty {
                 let mut matching = None; let target = self.ecx.alias_args(&AliasTerm::Ty(ty)); let mut found_def = false;
                 for p in self.mapping {
                     let PredicateKind::Clause(ClauseKind::Projection(source)) = &p.kind else { continue; };

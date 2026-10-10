@@ -40,7 +40,7 @@ impl Tcx {
         let mut regions = Vec::new();
         for &index in &declaration.parent.lifetimes { regions.push(self.tys.intern_region(RegionKind::ReEarlyParam(index))); }
         regions.extend_from_slice(&declaration.captured_lifetimes);
-        self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args, regions: self.tys.intern_region_args(&regions) }))
+        self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&regions) }))
     }
 
     pub(crate) fn rpitit_generic_indices(&self, prog: &Program, def_id: DefId) -> Option<GenericIndices> {
@@ -137,7 +137,7 @@ impl Tcx {
         let indices = self.generic_indices_of(prog, def_id);
         let mut regions = Vec::new();
         for &i in &indices.lifetimes { regions.push(self.tys.intern_region(RegionKind::ReEarlyParam(i))); }
-        let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id }, args: indices.identity_types_consts(&self.tys), regions: self.tys.intern_region_args(&regions) }));
+        let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id }, args: self.tys.mk_list(&indices.identity_types_consts(&self.tys)), regions: self.tys.intern_region_args(&regions) }));
         env.regions = env.regions.with_binder(None);
         let state = crate::tcx::EvalState::new();
         let cx = EvalCx::new(prog, self, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
@@ -168,7 +168,7 @@ impl Tcx {
                         if def_id != self.root && ancestor == self.root {
                             let indices = self.tcx.generic_indices_of(self.prog, def_id);
                             let variances = self.tcx.variances_of(self.prog, def_id);
-                            for &t in &a.args { self.fold_ty(tys, t, depth); }
+                            for &t in tys.list(a.args) { self.fold_ty(tys, t, depth); }
                             for (i, &r) in tys.region_args(a.regions).iter().enumerate() { if variances[indices.lifetimes[i] as usize] != crate::types::variance::V::Bi { self.fold_region(tys, r, depth); } }
                             return t;
                         }
@@ -183,7 +183,7 @@ impl Tcx {
                 PredicateKind::Clause(ClauseKind::Trait(t)) => { for &a in &t.trait_ref.args[1..] { fold::fold_arg(&self.tys, a, &mut collector, 1); } }
                 PredicateKind::Clause(ClauseKind::Projection(p)) => {
                     let args = match &p.projection_term {
-                        AliasTerm::Ty(t) => { let TyKind::Alias(_, a) = self.tys.kind(*t) else { unreachable!() }; self.complete_args(prog, a.kind.def_id(), &a.args, a.regions) }
+                        AliasTerm::Ty(t) => { let TyKind::Alias(_, a) = self.tys.kind(*t) else { unreachable!() }; self.complete_args(prog, a.kind.def_id(), self.tys.list(a.args), a.regions) }
                         AliasTerm::Const(a) => a.args.to_vec(),
                     };
                     for &a in &args[1..] { fold::fold_arg(&self.tys, a, &mut collector, 1); }
@@ -213,7 +213,7 @@ impl TypeFolder for AssocTyToOpaque<'_> {
             if let AliasTyKind::Projection { def_id } = alias.kind {
                 if let Some(ImplTraitInTraitData::Trait { fn_def_id, .. }) = self.prog.impl_trait_in_trait_data.get(&def_id) {
                     if *fn_def_id == self.fn_def_id {
-                        let args = self.tcx.complete_args(self.prog, def_id, &alias.args, alias.regions);
+                        let args = self.tcx.complete_args(self.prog, def_id, tys.list(alias.args), alias.regions);
                         return self.tcx.instantiate_ty(self.prog, def_id, &args, self.tcx.type_of(self.prog, def_id).expect("trait RPITIT type"));
                     }
                 }
@@ -255,7 +255,7 @@ impl Tcx {
                 let output = ast.fn_sig(sig).ret.map_or(self.tys.unit, |ty| self.lower_ty(&cx, prog, def.file, self.item_module(prog, owner), &env, ty));
                 if let (Some(future), Some(output_def)) = (self.lang_items.get(crate::lang_items::LangItem::Future), self.lang_items.get(crate::lang_items::LangItem::FutureOutput)) {
                     result.push(collect::trait_predicate(future, vec![GenericArg::Type(target)]));
-                    let projection = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output_def }, args: vec![target], regions: crate::types::RegionArgsId::EMPTY }));
+                    let projection = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output_def }, args: self.tys.mk_list(&[target]), regions: crate::types::RegionArgsId::EMPTY }));
                     result.push(Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(projection), term: Term::Ty(self.tys.shift_in(output, 1)) }))));
                 }
             }

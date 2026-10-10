@@ -190,11 +190,11 @@ mod tests {
     fn round28_reverse_mapper_reports_only_unmapped_position() {
         let tys = Types::new();
         let param = tys.intern(TyKind::Param(0));
-        let tuple = tys.intern(TyKind::Tuple(vec![param, tys.u32_]));
+        let tuple = tys.intern(TyKind::Tuple(tys.mk_list(&[param, tys.u32_])));
         let mut mapper = ReverseMapper { map: Vec::new(), failed: false };
         let mapped = mapper.fold_ty(&tys, tuple, 0);
         assert!(mapper.failed);
-        assert!(tys.kind(mapped) == &TyKind::Tuple(vec![tys.error, tys.u32_]));
+        assert!(tys.kind(mapped) == &TyKind::Tuple(tys.mk_list(&[tys.error, tys.u32_])));
         let param = tys.intern_const(ConstKind::Param(crate::consts::ParamConst { index: 0 }));
         assert_eq!(mapper.fold_const(&tys, param, 0), tys.intern_const(ConstKind::Error));
         let value = tys.const_usize(3);

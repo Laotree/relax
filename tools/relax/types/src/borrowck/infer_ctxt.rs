@@ -145,7 +145,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for arg in args { match *arg {
             GenericArg::Type(ty) => compact.push(ty), GenericArg::Const(c) => compact.push(self.tcx.tys.intern(TyKind::Const(c))), GenericArg::Lifetime(r) => regions.push(r),
         } }
-        self.tcx.tys.intern(TyKind::Adt(def, compact, self.tcx.tys.intern_region_args(&regions)))
+        self.tcx.tys.intern(TyKind::Adt(def, self.tcx.tys.mk_list(&compact), self.tcx.tys.intern_region_args(&regions)))
     }
 
     /// ty_kind/closure.rs: ClosureArgs consists of its parent's args and the
@@ -157,7 +157,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for arg in &args[..n] { match *arg { GenericArg::Type(t) => parent.push(t), GenericArg::Const(c) => parent.push(self.tcx.tys.intern(TyKind::Const(c))), GenericArg::Lifetime(r) => regions.push(r) } }
         let mut root = self.clause_owner(ClauseOwner::Closure(id));
         while matches!(self.prog.def(root).kind, crate::program::DefKind::Closure | crate::program::DefKind::OpaqueTy) || BorrowckTypeOps::is_inline_const(self, root) { root = self.prog.def(root).parent; }
-        let owner = self.tcx.tys.intern(TyKind::FnDef(root, parent, self.tcx.tys.intern_region_args(&regions)));
+        let owner = self.tcx.tys.intern(TyKind::FnDef(root, self.tcx.tys.mk_list(&parent), self.tcx.tys.intern_region_args(&regions)));
         let closure_args = crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: type_arg(n), closure_sig_as_fn_ptr_ty: type_arg(n + 1), tupled_upvars_ty: type_arg(n + 2) };
         self.tcx.tys.intern(TyKind::Closure(id.file, id.expr, closure_args))
     }
@@ -220,10 +220,10 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value: ty } }).unwrap_or(ty)
     }
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, at: Location) -> Result<FnSig, ()> {
-        let value = self.tcx.tys.intern(TyKind::FnPtr(sig.inputs.clone(), sig.output, sig.header, 0));
+        let value = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.inputs), sig.output, sig.header, 0));
         let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value } }).map_err(|_| ())?;
         let TyKind::FnPtr(inputs, output, header, _) = self.tcx.tys.kind(ty) else { unreachable!() };
-        Ok(FnSig { inputs: inputs.clone(), output: *output, header: *header })
+        Ok(FnSig { inputs: self.tcx.tys.list(*inputs).to_vec(), output: *output, header: *header })
     }
     /// rustc_middle/src/ty/util.rs:256-311 struct_tail_raw (pattern types are feature-gated):
     /// the crate's recursion limit, and its error when reached.
@@ -234,11 +234,11 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             match self.tcx.tys.kind(ty) {
                 TyKind::Adt(def, args, rs) if self.prog.def(*def).kind == crate::program::DefKind::Struct => {
                     let Some(field) = self.tcx.adts[def].variants[0].fields.last() else { return ty; };
-                    let args = self.tcx.complete_args(self.prog, *def, args, *rs);
+                    let args = self.tcx.complete_args(self.prog, *def, self.tcx.tys.list(*args), *rs);
                     let tail = self.tcx.instantiate_ty(self.prog, *def, &args, field.ty);
                     ty = BorrowckTypeOps::normalize(self, out, tail, Locations::Single(at));
                 }
-                TyKind::Tuple(ts) if !ts.is_empty() => ty = *ts.last().unwrap(),
+                TyKind::Tuple(ts) if !ts.is_empty() => ty = *self.tcx.tys.list(*ts).last().unwrap(),
                 _ => return ty,
             }
         }
@@ -259,10 +259,10 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     fn fn_def_sig(&self, def: DefId, args: &[TyId], regions: crate::types::RegionArgsId) -> PolyFnSig {
         let args = self.tcx.complete_args(self.prog, def, args, regions);
         let sig = self.tcx.fn_item_sig(self.prog, def).expect("FnDef signature");
-        let ty = self.tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, sig.bound_regions));
+        let ty = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
         let ty = self.tcx.instantiate_ty(self.prog, def, &args, ty);
         let TyKind::FnPtr(inputs, output, header, bound_regions) = self.tcx.tys.kind(ty) else { unreachable!() };
-        PolyFnSig { sig: FnSig { inputs: inputs.clone(), output: *output, header: *header }, bound_regions: *bound_regions }
+        PolyFnSig { sig: FnSig { inputs: self.tcx.tys.list(*inputs).to_vec(), output: *output, header: *header }, bound_regions: *bound_regions }
     }
     fn field_ty(&self, base: PlaceTy, field: FieldIdx) -> Option<TyId> {
         match self.tcx.tys.kind(base.ty) {
@@ -270,10 +270,10 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                 let adt = self.tcx.adts.get(def)?;
                 let v = if adt.is_enum() { base.variant_index?.0 as usize } else { 0 };
                 let field = adt.variants.get(v)?.fields.get(field.0 as usize)?;
-                Some(self.tcx.instantiate_ty(self.prog, *def, &self.tcx.complete_args(self.prog, *def, args, *rs), field.ty))
+                Some(self.tcx.instantiate_ty(self.prog, *def, &self.tcx.complete_args(self.prog, *def, self.tcx.tys.list(*args), *rs), field.ty))
             }
-            TyKind::Tuple(ts) => ts.get(field.0 as usize).copied(),
-            TyKind::Closure(_, _, args) => match self.tcx.tys.kind(args.tupled_upvars_ty) { TyKind::Tuple(ts) => ts.get(field.0 as usize).copied(), _ => None },
+            TyKind::Tuple(ts) => self.tcx.tys.list(*ts).get(field.0 as usize).copied(),
+            TyKind::Closure(_, _, args) => match self.tcx.tys.kind(args.tupled_upvars_ty) { TyKind::Tuple(ts) => self.tcx.tys.list(*ts).get(field.0 as usize).copied(), _ => None },
             _ => None,
         }
     }
@@ -289,7 +289,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                 let ty = self.closure_ty(*id, args);
                 let TyKind::Closure(_, _, args) = self.tcx.tys.kind(ty) else { unreachable!() };
                 let TyKind::Tuple(ts) = self.tcx.tys.kind(args.tupled_upvars_ty) else { panic!("resolved upvars") };
-                ts.get(field.0 as usize).copied().ok_or(ts.len())
+                self.tcx.tys.list(*ts).get(field.0 as usize).copied().ok_or(self.tcx.tys.list(*ts).len())
             }
             AggregateKind::Array(ty) => Ok(*ty),
             AggregateKind::Tuple | AggregateKind::RawPtr(..) => unreachable!("checked without an aggregate-field query"),
@@ -340,9 +340,9 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                     match tys.kind(tail) {
                         TyKind::Adt(def, args, rs) if self.prog.def(*def).kind == crate::program::DefKind::Struct => {
                             let Some(field) = self.tcx.adts[def].variants[0].fields.last() else { break; };
-                            tail = self.tcx.instantiate_ty(self.prog, *def, &self.tcx.complete_args(self.prog, *def, args, *rs), field.ty);
+                            tail = self.tcx.instantiate_ty(self.prog, *def, &self.tcx.complete_args(self.prog, *def, tys.list(*args), *rs), field.ty);
                         }
-                        TyKind::Tuple(ts) if !ts.is_empty() => tail = *ts.last().unwrap(),
+                        TyKind::Tuple(ts) if !ts.is_empty() => tail = *tys.list(*ts).last().unwrap(),
                         _ => break,
                     }
                 }
@@ -360,7 +360,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                 let state = crate::tcx::EvalState::new();
                 let cx = crate::tcx::EvalCx::new(self.prog, &self.tcx, crate::tcx::TypingEnv::fully_monomorphized(self.prog), &state);
                 self.tcx.fill_type_defaults(&cx, self.prog, def, &mut args, None);
-                tys.intern(TyKind::Adt(def, args, crate::types::RegionArgsId::EMPTY))
+                tys.intern(TyKind::Adt(def, tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
             }
             Rvalue::Repeat(op, count) => {
                 let ct = match count {
@@ -452,7 +452,7 @@ mod round33_tests {
         let f = def("f");
         let slice = tcx.tys.intern(TyKind::Slice(tcx.tys.u8_));
         // tuple layers: the walk is the same, without the (MIR-located) field normalization
-        let nest = |n: usize| (0..n).fold(slice, |t, _| tcx.tys.intern(TyKind::Tuple(vec![tcx.tys.u8_, t])));
+        let nest = |n: usize| (0..n).fold(slice, |t, _| tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[tcx.tys.u8_, t]))));
         let at = crate::mir::Location { block: crate::mir::BasicBlock(0), statement_index: 0 };
         let mut infcx = BorrowckInferCtxt::new(&tcx, &prog, f, f, &[]);
         let mut out = MirTypeckRegionConstraints::new(0);

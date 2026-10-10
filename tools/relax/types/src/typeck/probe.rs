@@ -137,7 +137,7 @@ impl Fcx<'_> {
                     self.assemble_candidates_for_bounds(clauses, name, 0, &mut inherent);
                 }
                 TyKind::Dyn(td, args, _, regions, _, bound, _) if *td != NO_DEF => {
-                    let mut compact = vec![ty]; compact.extend_from_slice(args);
+                    let mut compact = vec![ty]; compact.extend_from_slice(self.tcx.tys.list(*args));
                     let mut p = crate::next_solver::collect::trait_predicate(*td, self.tcx.complete_args(self.prog, *td, &compact, *regions));
                     p.bound_vars = vec![crate::next_solver::BoundVariableKind::Region(crate::types::BoundRegionKind::Anon); *bound as usize].into();
                     self.assemble_candidates_for_bounds(self.tcx.supertraits(self.prog, p), name, 1, &mut inherent);
@@ -164,7 +164,7 @@ impl Fcx<'_> {
         let ed = self.prog.crates[self.prog.mods[self.module as usize].krate as usize].edition;
         let array = matches!(self.tcx.tys.kind(receiver), TyKind::Array(..)) && ed < 2021;
         let boxed_slice = match self.tcx.tys.kind(receiver) {
-            TyKind::Adt(d, args, _) if self.tcx.lang_items.get(crate::lang_items::LangItem::OwnedBox) == Some(*d) => ed < 2024 && args.first().is_some_and(|t| matches!(self.tcx.tys.kind(*t), TyKind::Slice(_))),
+            TyKind::Adt(d, args, _) if self.tcx.lang_items.get(crate::lang_items::LangItem::OwnedBox) == Some(*d) => ed < 2024 && self.tcx.tys.list(*args).first().is_some_and(|t| matches!(self.tcx.tys.kind(*t), TyKind::Slice(_))),
             _ => false,
         };
         if !array && !boxed_slice { return false; }
@@ -219,19 +219,20 @@ impl Fcx<'_> {
             }
         }
         let sig = self.tcx.fn_sig(self.prog, candidate.item)?;
-        let raw = self.tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, sig.bound_regions));
+        let raw = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
         let raw = self.tcx.instantiate_ty(self.prog, candidate.item, &full, raw);
         let raw = if probing {
             let TyKind::FnPtr(ps, ret, header, _) = self.tcx.tys.kind(raw) else { unreachable!() };
             let header = *header;
-            let mut tys = ps.clone(); tys.push(*ret);
-            let payload = self.tcx.tys.intern(TyKind::Tuple(tys));
+            let mut tys = self.tcx.tys.list(*ps).to_vec(); tys.push(*ret);
+            let payload = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&tys)));
             let payload = self.tcx.tys.instantiate_bound_regions(payload, |_| crate::types::RegionId::ERASED);
             let TyKind::Tuple(tys) = self.tcx.tys.kind(payload) else { unreachable!() };
-            self.tcx.tys.intern(TyKind::FnPtr(tys[..tys.len() - 1].to_vec(), *tys.last().unwrap(), header, 0))
+            let tys = self.tcx.tys.list(*tys);
+            self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&tys[..tys.len() - 1]), *tys.last().unwrap(), header, 0))
         } else { self.infcx.instantiate_binder_with_infer(raw) };
         let TyKind::FnPtr(ps, ret, _, _) = self.tcx.tys.kind(raw) else { unreachable!() };
-        let xform_self_ty = ocx.normalize_ty(&self.param_env, ps[0]);
+        let xform_self_ty = ocx.normalize_ty(&self.param_env, self.tcx.tys.list(*ps)[0]);
         let goals = self.infcx.at(self.prog, self.param_env).sub(receiver, xform_self_ty).ok()?;
         ocx.register_obligations(goals);
         let mut trait_goal = None;
@@ -301,7 +302,7 @@ impl Fcx<'_> {
             ty = self.infcx.deeply_resolve_ignoring_regions(ty);
             match self.tcx.tys.kind(ty) {
                 TyKind::Dyn(td, args, _, regions, _, bound, _) => {
-                    let mut compact = vec![ty]; compact.extend_from_slice(args);
+                    let mut compact = vec![ty]; compact.extend_from_slice(self.tcx.tys.list(*args));
                     let mut p = crate::next_solver::collect::trait_predicate(*td, self.tcx.complete_args(self.prog, *td, &compact, *regions));
                     p.bound_vars = vec![crate::next_solver::BoundVariableKind::Region(crate::types::BoundRegionKind::Anon); *bound as usize].into();
                     return self.tcx.supertraits(self.prog, p).into_iter().find(|p| matches!(&p.kind, PredicateKind::Clause(ClauseKind::Trait(tr)) if tr.trait_ref.def_id == parent)).expect("object supertrait");

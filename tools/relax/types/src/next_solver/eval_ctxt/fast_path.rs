@@ -133,7 +133,7 @@ fn has_trivial_sizedness(infcx: &InferCtxt<'_>, prog: &crate::program::Program, 
     match tcx.tys.kind(ty) {
         TyKind::Foreign(_) | TyKind::Alias(..) | TyKind::Param(_) | TyKind::Placeholder(_) | TyKind::Bound(..) | TyKind::Infer(_) => false,
         TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => meta,
-        TyKind::Tuple(ts) => ts.last().is_none_or(|t| has_trivial_sizedness(infcx,prog,*t,meta)),
+        TyKind::Tuple(ts) => tcx.tys.list(*ts).last().is_none_or(|t| has_trivial_sizedness(infcx,prog,*t,meta)),
         TyKind::Adt(def,args,rs) => {
             let adt = &tcx.adts[def];
             if adt.is_enum || adt.is_union { return true; }
@@ -141,7 +141,7 @@ fn has_trivial_sizedness(infcx: &InferCtxt<'_>, prog: &crate::program::Program, 
             match tcx.adt_sizedness_constraint(prog, *def, kind) {
                 Ok(None) => true,
                 Ok(Some(tail)) => {
-                    let full = tcx.complete_args(prog, *def, args, *rs);
+                    let full = tcx.complete_args(prog, *def, tcx.tys.list(*args), *rs);
                     has_trivial_sizedness(infcx, prog, tcx.instantiate_ty(prog, *def, &full, tail), meta)
                 }
                 Err(_) => false,
@@ -154,7 +154,7 @@ fn trivially_copy(tys: &Types, t: TyId) -> bool {
     match tys.kind(t) {
         TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::Int(_) | TyKind::Float(_) | TyKind::FnDef(..) | TyKind::Ptr(..) | TyKind::Ref(false,..) => true,
         TyKind::Array(t,_) => trivially_copy(tys,*t),
-        TyKind::Tuple(ts) if ts.len() <= 3 => { for &t in ts { if !trivially_copy(tys,t) { return false; } } true }
+        TyKind::Tuple(ts) if tys.list(*ts).len() <= 3 => { for &t in tys.list(*ts) { if !trivially_copy(tys,t) { return false; } } true }
         _ => false,
     }
 }
@@ -164,7 +164,7 @@ fn trivially_wf(infcx: &InferCtxt<'_>, prog: &crate::program::Program, t: TyId) 
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Str | TyKind::Never | TyKind::Param(_) | TyKind::Placeholder(_) | TyKind::Bound(..) | TyKind::IntVar(_) | TyKind::FloatVar(_) => true,
         TyKind::Slice(t) => trivially_wf(infcx,prog,*t) && has_trivial_sizedness(infcx,prog,*t,false),
         TyKind::Ptr(_,t) => trivially_wf(infcx,prog,*t),
-        TyKind::FnPtr(ts,r,..) => { for &t in ts { if !trivially_wf(infcx,prog,t) { return false; } } trivially_wf(infcx,prog,*r) }
+        TyKind::FnPtr(ts,r,..) => { for &t in tys.list(*ts) { if !trivially_wf(infcx,prog,t) { return false; } } trivially_wf(infcx,prog,*r) }
         TyKind::Ref(_,t,_) if !tys.flags(*t).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS) && !tys.has_infer(*t) && !tys.flags(*t).intersects(crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_PLACEHOLDER) => trivially_wf(infcx,prog,*t),
         _ => false,
     }

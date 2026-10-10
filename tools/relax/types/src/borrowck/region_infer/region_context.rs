@@ -252,7 +252,7 @@ impl RegionInferenceContext {
         let interest = |c: &OutlivesConstraint| match c.category {
             Category::Cast { unsize_to: Some(unsize_ty), is_implicit_coercion: true, .. }
                 if to == fr_static
-                    && matches!(tcx.tys.kind(unsize_ty), TyKind::Adt(_, args, _) if args.iter().any(|&a| matches!(tcx.tys.kind(a), TyKind::Dyn(..))))
+                    && matches!(tcx.tys.kind(unsize_ty), TyKind::Adt(_, args, _) if tcx.tys.list(*args).iter().any(|&a| matches!(tcx.tys.kind(a), TyKind::Dyn(..))))
                     && !annotated => 1,
             category => category.interest(),
         };
@@ -348,11 +348,11 @@ impl MatchAgainstHigherRankedOutlives<'_> {
             (TyKind::Ref(am,a,ar),TyKind::Ref(bm,b,br)) => am == bm && self.regions(*ar,*br,depth) && self.tys(*a,*b,depth),
             (TyKind::Ptr(am,a),TyKind::Ptr(bm,b)) => am == bm && self.tys(*a,*b,depth),
             (TyKind::Slice(a),TyKind::Slice(b)) => self.tys(*a,*b,depth),
-            (TyKind::Tuple(a),TyKind::Tuple(b)) => self.list(a,b,depth),
+            (TyKind::Tuple(a),TyKind::Tuple(b)) => self.list(tys.list(*a),tys.list(*b),depth),
             (TyKind::Const(a),TyKind::Const(b)) => self.consts(*a,*b,depth),
             (TyKind::Array(a,an),TyKind::Array(b,bn)) => self.tys(*a,*b,depth) && self.consts(*an,*bn,depth),
             (TyKind::Adt(ad,a,ar),TyKind::Adt(bd,b,br)) | (TyKind::FnDef(ad,a,ar),TyKind::FnDef(bd,b,br)) =>
-                ad == bd && self.args(*ad,a,b,*ar,*br,depth,true),
+                ad == bd && self.args(*ad,tys.list(*a),tys.list(*b),*ar,*br,depth,true),
             (TyKind::Alias(_, AliasTy { kind: ak, args: a, regions: ar }),TyKind::Alias(_, AliasTy { kind: bk, args: b, regions: br }))
                 if matches!(ak, AliasTyKind::Projection { .. } | AliasTyKind::Opaque { .. }) => ak == bk && {
                     // Relate<AliasTy> (rustc_type_ir/src/relate.rs:224-240): opaques and RPITIT
@@ -365,16 +365,16 @@ impl MatchAgainstHigherRankedOutlives<'_> {
                         indices.get(i).is_some_and(|&i| vs.get(i as usize) == Some(&crate::types::variance::V::Bi))
                     });
                     let ar = tys.region_args(*ar); let br = tys.region_args(*br);
-                    a.len() == b.len() && ar.len() == br.len()
-                        && a.iter().zip(b).enumerate().all(|(i,(&a,&b))| bi(false,i) || self.tys(a,b,depth))
+                    tys.list(*a).len() == tys.list(*b).len() && ar.len() == br.len()
+                        && tys.list(*a).iter().zip(tys.list(*b)).enumerate().all(|(i,(&a,&b))| bi(false,i) || self.tys(a,b,depth))
                         && ar.iter().zip(br.iter()).enumerate().all(|(i,(&a,&b))| bi(true,i) || self.regions(a,b,depth))
                 },
-            (TyKind::FnPtr(a,ao,ah,_),TyKind::FnPtr(b,bo,bh,_)) => ah == bh && self.list(a,b,depth+1) && self.tys(*ao,*bo,depth+1),
+            (TyKind::FnPtr(a,ao,ah,_),TyKind::FnPtr(b,bo,bh,_)) => ah == bh && self.list(tys.list(*a),tys.list(*b),depth+1) && self.tys(*ao,*bo,depth+1),
             (TyKind::Closure(af, ae, crate::types::ClosureArgs { parent_args: ao, closure_kind_ty: ak, closure_sig_as_fn_ptr_ty: a, tupled_upvars_ty: au }),TyKind::Closure(bf, be, crate::types::ClosureArgs { parent_args: bo, closure_kind_ty: bk, closure_sig_as_fn_ptr_ty: b, tupled_upvars_ty: bu })) => af == bf && ae == be
                 && self.tys(*ak,*bk,depth) && self.tys(*a,*b,depth) && self.tys(*au,*bu,depth) && self.tys(*ao,*bo,depth),
             (TyKind::Dyn(ad,a,ab,ar,al,_,aa),TyKind::Dyn(bd,b,bb,br,bl,_,ba)) => ad == bd && aa == ba
-                && self.args(*ad,a,b,*ar,*br,depth+1,false) && self.regions(*al,*bl,depth)
-                && ab.len() == bb.len() && ab.iter().zip(bb).all(|((ad,a,_),(bd,b,_))| ad == bd && self.tys(*a,*b,depth+1)),
+                && self.args(*ad,tys.list(*a),tys.list(*b),*ar,*br,depth+1,false) && self.regions(*al,*bl,depth)
+                && tys.list(*ab).len() == tys.list(*bb).len() && tys.list(*ab).iter().zip(tys.list(*bb)).all(|((ad,a,_),(bd,b,_))| ad == bd && self.tys(*a,*b,depth+1)),
             _ => false,
         }
     }

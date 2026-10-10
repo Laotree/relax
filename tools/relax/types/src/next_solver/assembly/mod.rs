@@ -30,7 +30,7 @@ impl GoalKind {
         match self {
             Self::Trait(p) => p.trait_ref.args[0] = GenericArg::Type(ty),
             Self::NormalizesTo(p) => match &mut p.alias {
-                AliasTerm::Ty(t) => { let TyKind::Alias(r, mut a) = ecx.delegate.tcx.tys.kind(*t).clone() else { unreachable!() }; a.args[0] = ty; *t = ecx.delegate.tcx.tys.intern(TyKind::Alias(r, a)); }
+                AliasTerm::Ty(t) => { let tys = &ecx.delegate.tcx.tys; let TyKind::Alias(r, mut a) = *tys.kind(*t) else { unreachable!() }; let mut args = tys.list(a.args).to_vec(); args[0] = ty; a.args = tys.mk_list(&args); *t = tys.intern(TyKind::Alias(r, a)); }
                 AliasTerm::Const(a) => { let mut args = a.args.to_vec(); args[0] = GenericArg::Type(ty); a.args = args.into(); }
             }
         }
@@ -39,7 +39,7 @@ impl GoalKind {
 impl EvalCtxt<'_, '_> {
     pub(super) fn alias_args(&self, alias: &AliasTerm) -> (DefId, Vec<GenericArg>) {
         match alias {
-            AliasTerm::Ty(ty) => { let TyKind::Alias(_, a) = self.delegate.tcx.tys.kind(*ty) else { panic!("alias term") }; (a.kind.def_id(), self.delegate.tcx.complete_args(self.solver.prog, a.kind.def_id(), &a.args, a.regions)) }
+            AliasTerm::Ty(ty) => { let TyKind::Alias(_, a) = self.delegate.tcx.tys.kind(*ty) else { panic!("alias term") }; (a.kind.def_id(), self.delegate.tcx.complete_args(self.solver.prog, a.kind.def_id(), self.delegate.tcx.tys.list(a.args), a.regions)) }
             AliasTerm::Const(a) => (a.kind.def_id(), a.args.to_vec()),
         }
     }
@@ -145,7 +145,7 @@ impl EvalCtxt<'_, '_> {
             candidates.push(self.forced_ambiguity(MaybeInfo::AMBIGUOUS)?); return Ok(());
         }
         let TyKind::Alias(IsRigid::Yes, a) = tcx.tys.kind(ty) else { return Ok(()); };
-        let def = a.kind.def_id(); let args = tcx.complete_args(self.solver.prog, def, &a.args, a.regions);
+        let def = a.kind.def_id(); let args = tcx.complete_args(self.solver.prog, def, tcx.tys.list(a.args), a.regions);
         for bound in tcx.item_bounds(self.solver.prog, def) {
             let bound = tcx.instantiate_predicate(self.solver.prog, def, &args, &bound);
             for p in tcx.supertraits(self.solver.prog, bound) {
@@ -159,7 +159,7 @@ impl EvalCtxt<'_, '_> {
             }
         }
         if matches!(a.kind, AliasTyKind::Projection { .. }) {
-            if let Ok(Term::Ty(t)) = map_err_to_rerun(self.structurally_normalize_term(env, Term::Ty(a.args[0])))? { self.assemble_alias_bound_candidates_recur(env, goal, t, false, candidates)?; }
+            if let Ok(Term::Ty(t)) = map_err_to_rerun(self.structurally_normalize_term(env, Term::Ty(self.delegate.tcx.tys.list(a.args)[0])))? { self.assemble_alias_bound_candidates_recur(env, goal, t, false, candidates)?; }
         }
         Ok(())
     }

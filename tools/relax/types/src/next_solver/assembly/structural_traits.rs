@@ -9,7 +9,7 @@ pub fn instantiate_constituent_tys_for_auto_trait(ecx: &EvalCtxt<'_, '_>, ty: Ty
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Error | TyKind::Never | TyKind::Foreign(_) => vec![],
         TyKind::Str => vec![tcx.tys.intern(TyKind::Slice(tcx.tys.u8_))],
         TyKind::Ptr(_, t) | TyKind::Ref(_, t, _) | TyKind::Array(t, _) | TyKind::Slice(t) => vec![*t],
-        TyKind::Tuple(ts) => ts.clone(),
+        TyKind::Tuple(ts) => tcx.tys.list(*ts).to_vec(),
         TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) => {
             // EXCEPTION(M7): user decision 2026-10-07
             // The coroutine witness is empty until MIR witness publication.
@@ -17,8 +17,8 @@ pub fn instantiate_constituent_tys_for_auto_trait(ecx: &EvalCtxt<'_, '_>, ty: Ty
         }
         TyKind::Adt(def, args, rs) => {
             let adt = &tcx.adts[def];
-            if adt.is_phantom_data() { vec![args[0]] } else {
-                let full = tcx.complete_args(ecx.solver.prog, *def, args, *rs); let mut result = Vec::new();
+            if adt.is_phantom_data() { vec![tcx.tys.list(*args)[0]] } else {
+                let full = tcx.complete_args(ecx.solver.prog, *def, tcx.tys.list(*args), *rs); let mut result = Vec::new();
                 for v in &adt.variants { for f in &v.fields { result.push(tcx.instantiate_ty(ecx.solver.prog, *def, &full, f.ty)); } }
                 result
             }
@@ -30,11 +30,11 @@ pub fn instantiate_constituent_tys_for_sizedness_trait(ecx: &EvalCtxt<'_, '_>, s
     let tcx = ecx.delegate.tcx;
     Ok(match tcx.tys.kind(ty) {
         TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) | TyKind::Alias(..) | TyKind::Placeholder(_) | TyKind::Param(_) => return Err(NoSolution),
-        TyKind::Tuple(ts) => match ts.last() { Some(&t) => vec![t], None => vec![] },
+        TyKind::Tuple(ts) => match tcx.tys.list(*ts).last() { Some(&t) => vec![t], None => vec![] },
         TyKind::Adt(def, args, rs) => {
             match tcx.adt_sizedness_constraint(ecx.solver.prog, *def, sizedness).map_err(|_| NoSolution)? {
                 Some(ty) => {
-                    let full = tcx.complete_args(ecx.solver.prog, *def, args, *rs);
+                    let full = tcx.complete_args(ecx.solver.prog, *def, tcx.tys.list(*args), *rs);
                     vec![tcx.instantiate_ty(ecx.solver.prog, *def, &full, ty)]
                 }
                 None => vec![],
@@ -48,7 +48,7 @@ pub fn instantiate_constituent_tys_for_copy_clone_trait(ecx: &EvalCtxt<'_, '_>, 
     let tcx = ecx.delegate.tcx;
     match tcx.tys.kind(ty) {
         TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Error => Ok(vec![]),
-        TyKind::Tuple(ts) => Ok(ts.clone()),
+        TyKind::Tuple(ts) => Ok(tcx.tys.list(*ts).to_vec()),
         TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) if !tcx.is_coroutine(ty) => Ok(vec![*upvars]),
         _ => Err(NoSolution),
     }
@@ -61,8 +61,8 @@ pub fn extract_tupled_inputs_and_output_from_callable(ecx: &EvalCtxt<'_, '_>, ty
             let sig = tcx.fn_item_sig(ecx.solver.prog, *def).ok_or(NoSolution)?;
             let d = ecx.solver.prog.def(*def); let ast = &ecx.solver.prog.files[d.file as usize].ast;
             if !sig.header.is_fn_trait_compatible() || crate::lang_items::has_attr(ecx.solver.prog, d.file, ast.list(ast.item(d.item).attrs), "target_feature") { return Err(NoSolution); }
-            let full = tcx.complete_args(ecx.solver.prog, *def, args, *rs);
-            tcx.instantiate_ty(ecx.solver.prog, *def, &full, tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, sig.bound_regions)))
+            let full = tcx.complete_args(ecx.solver.prog, *def, tcx.tys.list(*args), *rs);
+            tcx.instantiate_ty(ecx.solver.prog, *def, &full, tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions)))
         }
         TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, .. }) if !tcx.is_coroutine(ty) => {
             let kind = ecx.delegate.shallow_resolve(*closure_kind_ty);
@@ -122,6 +122,6 @@ pub fn async_callable_relevant_types(ecx: &EvalCtxt<'_, '_>, sig: TyId) -> Resul
     let tcx = ecx.delegate.tcx;
     let TyKind::FnPtr(params, output, _, _) = tcx.tys.kind(sig) else { unreachable!() };
     let future_output = tcx.lang_items.get(crate::lang_items::LangItem::FutureOutput).ok_or(NoSolution)?;
-    let coroutine_return_ty = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { def_id: future_output }, args: vec![*output], regions: crate::types::RegionArgsId::EMPTY }));
+    let coroutine_return_ty = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { def_id: future_output }, args: tcx.tys.mk_list(&[*output]), regions: crate::types::RegionArgsId::EMPTY }));
     Ok(AsyncCallableRelevantTypes { tupled_inputs_ty: tcx.tys.intern(TyKind::Tuple(params.clone())), output_coroutine_ty: *output, coroutine_return_ty })
 }

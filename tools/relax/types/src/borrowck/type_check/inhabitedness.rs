@@ -38,7 +38,7 @@ pub(crate) fn inhabited_predicate(cx: &BorrowckInferCtxt<'_>, ty: TyId, stack: &
         TyKind::Adt(def, args, rs) => {
             let adt = &cx.tcx.adts[def];
             if adt.is_union() || (adt.is_variant_list_non_exhaustive() && cx.prog.def(*def).krate != cx.prog.def(cx.root_def_id).krate) { return P::True; }
-            let args = cx.tcx.complete_args(cx.prog, *def, args, *rs);
+            let args = cx.tcx.complete_args(cx.prog, *def, tys.list(*args), *rs);
             stack.push(ty);
             let mut variants = Vec::new();
             for variant in &adt.variants {
@@ -48,7 +48,7 @@ pub(crate) fn inhabited_predicate(cx: &BorrowckInferCtxt<'_>, ty: TyId, stack: &
             }
             stack.pop(); P::Or(variants)
         }
-        TyKind::Tuple(ts) => { let mut ps = Vec::new(); for &t in ts { ps.push(inhabited_predicate(cx, t, stack)); } P::And(ps) }
+        TyKind::Tuple(ts) => { let mut ps = Vec::new(); for &t in tys.list(*ts) { ps.push(inhabited_predicate(cx, t, stack)); } P::And(ps) }
         TyKind::Array(t, n) => match n.try_to_target_usize(tys) {
             Some(0) => P::True,
             Some(_) => inhabited_predicate(cx, *t, stack),

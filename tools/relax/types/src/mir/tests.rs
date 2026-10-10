@@ -63,7 +63,7 @@ fn bad(body: &Body, tcx: &Tcx, expected: &str) {
     assert!(errors.iter().any(|e| e.message.contains(expected)), "expected {expected}, got {errors:?}");
 }
 fn call(tcx: &Tcx, unwind: UnwindAction) -> TerminatorKind {
-    let ty = tcx.tys.intern(TyKind::FnDef(DefId(0), Vec::new(), crate::types::RegionArgsId::EMPTY));
+    let ty = tcx.tys.intern(TyKind::FnDef(DefId(0), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
     TerminatorKind::Call {
         func: val(ty, ConstValue::ZeroSized),
         args: vec![copy(1)],

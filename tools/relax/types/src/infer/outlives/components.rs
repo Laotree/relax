@@ -15,7 +15,7 @@ impl TypeFolder for OutlivesCollector<'_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         if !self.visited.insert(ty) { return ty; }
         match tys.kind(ty) {
-            TyKind::FnDef(_, args, _) => { for &t in args { self.fold_ty(tys, t, depth); } }
+            TyKind::FnDef(_, args, _) => { for &t in tys.list(*args) { self.fold_ty(tys, t, depth); } }
             TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) => { self.fold_ty(tys, *upvars, depth); }
             TyKind::Param(_) => self.out.push(Component::Param(ty)),
             TyKind::Placeholder(_) => self.out.push(Component::Placeholder(ty)),
@@ -36,7 +36,7 @@ impl TypeFolder for OutlivesCollector<'_> {
 
 pub fn compute_alias_components_recursive(tcx: &Tcx, prog: &Program, alias: &AliasTy, out: &mut Vec<Component>) {
     let mut collector = OutlivesCollector { tcx, prog, out, visited: HashSet::new() };
-    for &ty in &alias.args { collector.fold_ty(&tcx.tys, ty, 0); }
+    for &ty in tcx.tys.list(alias.args) { collector.fold_ty(&tcx.tys, ty, 0); }
     for (index, &r) in tcx.tys.region_args(alias.regions).iter().enumerate() {
         if alias_region_is_bivariant(tcx, prog, alias, index) { continue; }
         collector.fold_region(&tcx.tys, r, 0);

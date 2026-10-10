@@ -8,7 +8,7 @@ use crate::infer::snapshot::CombinedSnapshot;
 impl InferCtxt<'_> {
     pub(crate) fn fn_has_bound_vars(&self, ty: TyId) -> bool {
         let TyKind::FnPtr(params, ret, _, _) = self.tcx.tys.kind(ty) else { panic!("expected fn binder") };
-        for &ty in params { if self.tcx.tys.has_vars_bound_at_or_above(ty, 0) { return true; } }
+        for &ty in self.tcx.tys.list(*params) { if self.tcx.tys.has_vars_bound_at_or_above(ty, 0) { return true; } }
         self.tcx.tys.has_vars_bound_at_or_above(*ret, 0)
     }
     /// higher_ranked.rs:24: only escaping variables allocate a new universe.
@@ -22,10 +22,10 @@ impl InferCtxt<'_> {
         let tys = &self.tcx.tys;
         let TyKind::FnPtr(params, ret, header, _) = tys.kind(ty) else { panic!("expected fn binder") };
         let mut replacer = BinderInstantiator { infcx: self, universe, values: Default::default() };
-        let mut inputs = Vec::with_capacity(params.len());
-        for &ty in params { inputs.push(replacer.fold_ty(tys, ty, 0)); }
+        let mut inputs = Vec::with_capacity(tys.list(*params).len());
+        for &ty in tys.list(*params) { inputs.push(replacer.fold_ty(tys, ty, 0)); }
         let output = replacer.fold_ty(tys, *ret, 0);
-        tys.intern(TyKind::FnPtr(inputs, output, *header, 0))
+        tys.intern(TyKind::FnPtr(tys.mk_list(&inputs), output, *header, 0))
     }
     pub fn leak_check(&self, outer_universe: UniverseIndex, snapshot: Option<&CombinedSnapshot>) -> Result<(), TypeError> {
         if self.skip_leak_check { return Ok(()); }
