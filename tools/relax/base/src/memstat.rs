@@ -338,6 +338,40 @@ pub fn live_total() -> i64 {
     TOTAL.live.load(Relaxed)
 }
 
+/// The process's resident size in bytes, cheaply: no allocator statistics (process_rss's
+/// mallinfo2 walks every malloc arena -- Linux, the monitor thread's 500 ms growth check spent
+/// ~0.4 of a core in it under the sandbox game leap; macOS's malloc_zone_statistics walks the
+/// zones likewise). For checks that only compare sizes.
+pub fn resident() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn sysconf(name: i32) -> i64;
+        }
+        // statm: size resident shared text lib data dt, in pages
+        let s = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+        let pages = s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let page = unsafe { sysconf(30) }; // _SC_PAGESIZE
+        pages * if page > 0 { page as u64 } else { 4096 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+        }
+        // TASK_VM_INFO (22): resident_size @16
+        let mut buf = [0u64; 24];
+        let mut count: u32 = 38;
+        let r = unsafe { task_info(mach_task_self_, 22, buf.as_mut_ptr(), &mut count) };
+        if r != 0 { 0 } else { buf[2] }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        process_rss().0
+    }
+}
+
 /// Process memory: (rss, peak rss, extra description) in bytes.
 pub fn process_rss() -> (u64, u64, String) {
     #[cfg(target_os = "linux")]

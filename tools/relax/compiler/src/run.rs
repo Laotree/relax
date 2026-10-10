@@ -625,10 +625,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // between the program's allocations: ~70 MB on counter), off the boot path
         let trace = crate::preload::trace();
         std::thread::spawn(move || {
-            let (r0, t) = (if trace { crate::memstat::process_rss().0 } else { 0 }, Instant::now());
+            let (r0, t) = (if trace { crate::memstat::resident() } else { 0 }, Instant::now());
             crate::memstat::trim();
             if trace {
-                eprintln!("boot-trace: macro world heap trimmed: rss {} -> {} MB in {:.1} ms", r0 >> 20, crate::memstat::process_rss().0 >> 20, t.elapsed().as_secs_f64() * 1e3);
+                eprintln!("boot-trace: macro world heap trimmed: rss {} -> {} MB in {:.1} ms", r0 >> 20, crate::memstat::resident() >> 20, t.elapsed().as_secs_f64() * 1e3);
             }
         });
     }
@@ -1693,11 +1693,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             if runtime.mem_trim && grown_at.elapsed() >= std::time::Duration::from_millis(500) {
                 static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
                 let step = *STEP.get_or_init(|| std::env::var("RELAX_MEM_TRIM_GROWTH_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(256u64)) << 20;
-                let rss = crate::memstat::process_rss().0;
+                let rss = crate::memstat::resident();
                 if step > 0 && rss >= grown_from + step {
                     let t = Instant::now();
                     crate::memstat::trim();
-                    let after = crate::memstat::process_rss().0;
+                    let after = crate::memstat::resident();
                     if crate::memstat::enabled() || crate::preload::trace() {
                         eprintln!("relax-mem: growth trim at t={:.0} ms: rss {} -> {} MB in {:.1} ms", crate::clock::ms_since_start(), rss >> 20, after >> 20, t.elapsed().as_secs_f64() * 1e3);
                     }
@@ -1721,11 +1721,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     if quiet == 10 && n != trimmed {
                         trimmed = n;
                         let show = crate::memstat::enabled() || crate::preload::trace();
-                        let r0 = if show { crate::memstat::process_rss().0 } else { 0 };
+                        let r0 = if show { crate::memstat::resident() } else { 0 };
                         let t = Instant::now();
                         crate::memstat::trim();
                         if show {
-                            let r1 = crate::memstat::process_rss().0;
+                            let r1 = crate::memstat::resident();
                             eprintln!("relax-mem: trim at t={:.0} ms: rss {} -> {} MB in {:.1} ms", crate::clock::ms_since_start(), r0 >> 20, r1 >> 20, t.elapsed().as_secs_f64() * 1e3);
                         }
                     }

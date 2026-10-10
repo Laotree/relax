@@ -399,7 +399,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     const SETTLE_GROWTH: u64 = 3 << 30;
     let compiled = AtomicUsize::new(0);
     let settled_at = AtomicUsize::new(0);
-    let settled_rss = std::sync::atomic::AtomicU64::new(crate::memstat::process_rss().0 as u64);
+    let settled_rss = std::sync::atomic::AtomicU64::new(crate::memstat::resident() as u64);
     let next = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
     let panics: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
@@ -456,14 +456,14 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     let n = compiled.fetch_add(1, Ordering::Relaxed) + 1;
                     let at = settled_at.load(Ordering::Relaxed);
                     if n >= at + 2_000 && settled_at.compare_exchange(at, n, Ordering::AcqRel, Ordering::Relaxed).is_ok()
-                        && crate::memstat::process_rss().0 as u64 > settled_rss.load(Ordering::Relaxed) + SETTLE_GROWTH {
+                        && crate::memstat::resident() as u64 > settled_rss.load(Ordering::Relaxed) + SETTLE_GROWTH {
                         let _job = jit::compile_job();
                         jit::lock_unit();
                         let mut d = jit::settle_drop(up);
                         jit::unlock_unit();
                         d.release_rir();
                         crate::memstat::trim();
-                        settled_rss.store(crate::memstat::process_rss().0 as u64, Ordering::Relaxed);
+                        settled_rss.store(crate::memstat::resident() as u64, Ordering::Relaxed);
                     }
                 }
             }).expect("check worker");

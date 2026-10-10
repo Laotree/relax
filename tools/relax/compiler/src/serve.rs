@@ -591,7 +591,7 @@ impl Session {
 
     fn trim(&mut self) {
         let sess = &self.unit.prog.session.clone();
-        self.rss_before_trim_mb = crate::memstat::process_rss().0 as f64 / 1048576.0;
+        self.rss_before_trim_mb = crate::memstat::resident() as f64 / 1048576.0;
         // Constants may have used the JIT, and --deep certainly did. Recreate only the
         // execution shell so all code/data allocations and function slots are released;
         // the Program, interner and collected types remain warm at stable IDs.
@@ -612,7 +612,7 @@ impl Session {
             self.unit.prog.reclaim_caches();
         }
         if self.rss_mb == 0.0 || self.rechecked > 8 { crate::memstat::trim(); }
-        self.rss_mb = crate::memstat::process_rss().0 as f64 / 1048576.0;
+        self.rss_mb = crate::memstat::resident() as f64 / 1048576.0;
     }
 
     pub fn watch(&mut self, deep: bool) -> i32 {
