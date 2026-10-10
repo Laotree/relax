@@ -93,7 +93,7 @@ pub fn install() {
 
 
 /// Built once per process (`world`) and called from any thread at once: parse workers expand
-/// their files' macros themselves. Its code compiles under the unit lock like any JIT code; the
+/// their files' macros themselves. Its code compiles on the owner thread like any JIT code; the
 /// tables below are behind their own locks.
 struct World {
     /// leaked: the world lives for the process (program threads share a unit the same way)
@@ -393,8 +393,8 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     // no O3 in the proc-macro world: tier-up state is process-wide (TIER_UNIT, the tier
     // queue, the sampler map slot ids to ONE unit), so this unit's hot slots were queued and
     // built against the program's unit -- other functions' code installed in its slots, or an
-    // index past its table ("AppendVec index out of bounds" in O3 builds, a dead O3
-    // thread holding the unit lock: `relax check` hangs)
+    // index past its table ("AppendVec index out of bounds" in O3 builds, an O3
+    // thread waiting on the owner: `relax check` hangs)
     u.tier1 = None;
     // its compiled code in the disk cache like the program's (keyed by the macro crates'
     // fingerprints): a warm start compiles none of it
@@ -521,7 +521,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
         Some(Err(e)) => return Err(format!("proc-macro host: {}", e)),
         None => return Err("a proc macro used while the macro world itself is being built".to_string()),
     };
-    // Reload's lexer/parser now run off the unit lock, but the JIT macro world still uses
+    // Reload's lexer/parser now run off the unit, but the JIT macro world still uses
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
     let wait = crate::load_profile::span(sess.runtime.profile, "wait-macro-unit", &entry.fname);

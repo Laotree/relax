@@ -1169,7 +1169,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         std::process::exit(0);
     }
     for (k, d) in entry_defs.iter().enumerate() {
-        // speculative workers may be compiling (they add slots): the unit lock around fn_id
+        // speculative workers may be compiling (they add slots): the owner thread around fn_id
         let en = crate::owner::call(crate::owner::Class::App, || {
             let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
             u.entry(id)
@@ -1224,7 +1224,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         Err(p) => {
             // The message now, on this thread (it needs no compiler state): a panic is
             // never silent, whatever the exit's cleanup gets to. Its report (backtrace
-            // under the unit lock) is the cleanup worker's, after the compilers stopped.
+            // on the owner thread) is the cleanup worker's, after the compilers stopped.
             eprintln!("relax-run: main {}: {}", p.kind, p.message);
             let _ = RUN_PANIC.set(p);
             101
@@ -1341,7 +1341,7 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
 }
 
 /// Ahead-of-call compilation on a worker: the previous run's startup functions, in order.
-/// Compiles serialize with lazy compiles on the unit lock, so the worker overlaps with the
+/// Compiles serialize with lazy compiles on the owner thread, so the worker overlaps with the
 /// program's own execution, not with its compiles.
 fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
     let upn = up as usize;
@@ -1381,7 +1381,7 @@ fn flush_errors(block: bool) {
                 eprintln!("relax-run: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
             }
         }
-        // the report file may be a FIFO a slow reader drains: written after the unit lock is free
+        // the report file may be a FIFO a slow reader drains: written after the owner thread releases it
         let to_report: Vec<String> = if u.errors.len() > seen && reporting() { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
         ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
         to_report
@@ -1401,8 +1401,8 @@ fn flush_errors(block: bool) {
 }
 
 /// Writes the disk cache's recorded entries once RELAX_CACHE_SPILL_MB (default 16; 0 = only at
-/// exit) of them are pending: taken under the unit lock (only if it is free now), written
-/// without it. A cold Stage run held ~200 MB of recorded code until the exit flush.
+/// exit) of them are pending: taken on the owner thread (only if free now), written
+/// off the unit. A cold Stage run held ~200 MB of recorded code until the exit flush.
 fn spill_cache() {
     static LIM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let lim = *LIM.get_or_init(|| std::env::var("RELAX_CACHE_SPILL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 20);
@@ -1608,7 +1608,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // as its pieces are ready after the first present, not after seconds of quiet
                 // (a cold run compiles O2 code for long after it): users close apps quickly, and
                 // a killed run that wrote nothing left every relaunch unrestored. At most once a
-                // second; the collected program's encode takes the unit lock only when free.
+                // second; the collected program's encode makes a unit call only when free.
                 let record = left && jit::FIRST_PRESENT.load(Ordering::Acquire) && since >= 1_000;
                 let due = n != mid_flushed && ((mid_quiet >= 20 && since >= 5_000) || since >= 10_000) || left && mid_quiet >= 20 && since >= 5_000;
                 if start != 0 && (record || main_ms >= 3000 && due) && !mid_busy.swap(true, Ordering::SeqCst) {
@@ -1739,7 +1739,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     }
                 }
             }
-            // compile progress, read without the unit lock (it may be held for a while)
+            // compile progress, read off the unit (the owner thread may be busy)
             let n = jit::COMPILED_FNS.load(Ordering::Relaxed);
             if n != last && reporting() {
                 last = n;
@@ -1764,11 +1764,11 @@ static EXIT_SUMMARY: std::sync::OnceLock<ExitSummary> = std::sync::OnceLock::new
 static RUN_PANIC: std::sync::OnceLock<jit::PanicInfo> = std::sync::OnceLock::new();
 /// The exit worker has not finished the cache write yet (finish_run waits for it).
 static EXIT_PERSIST: AtomicBool = AtomicBool::new(false);
-/// How long the exit waits for background compiles to release the unit (they are abandoned
+/// How long the exit waits for background compiles to finish (they are abandoned
 /// at their next safe point). Not getting it means no cache write at all.
 const EXIT_QUIESCE_MS: u64 = 200;
-/// The thread ending the process holds the unit lock itself (a program error in a build or
-/// a link called exit): its compile is half done, the exit worker can never get the lock, and
+/// The thread ending the process runs a unit call itself (a program error in a build or
+/// a link called exit): its compile is half done, the exit worker can never intervene, and
 /// waiting for it would only delay the exit.
 static EXIT_CALLER_HOLDS: AtomicBool = AtomicBool::new(false);
 fn exit_quiesce_ms() -> u64 {
@@ -1869,7 +1869,7 @@ fn exit_report() {
 static COLLECTED_CURRENT: AtomicBool = AtomicBool::new(false);
 
 /// Run-time crates must not become part of the next boot's collected image. The caller
-/// holds both front-end and unit locks, before appending the first such crate. Publication
+/// holds the front-end write lock on the owner thread, before appending the first such crate. Publication
 /// still belongs to the post-present writer; an already-restored/written boot needs no copy.
 pub(crate) fn preserve_collected_boot(u: &mut jit::Unit) {
     if !COLLECTED_CURRENT.load(Ordering::Relaxed) && front_recordable() {
@@ -1910,7 +1910,7 @@ pub(crate) extern "C" fn relax_quit_requested() {
     let _ = std::thread::Builder::new().name("relax-quit-write".to_string()).spawn(|| {
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let t = Instant::now();
-        // the unit lock is busy while the app's shutdown compiles: retry for a bounded time
+        // the owner thread is busy while the app's shutdown compiles: retry for a bounded time
         let mut r = None;
         while t.elapsed().as_millis() < 4000 {
             r = mid_flush(true, true).or(r);
@@ -1924,8 +1924,8 @@ pub(crate) extern "C" fn relax_quit_requested() {
 
 /// A write of the disk cache while the program runs (front images, code, borrowck verdicts):
 /// programs that never reach Relax's exit summary (killed, or a framework ends the process
-/// with _exit) keep what they compiled. The unit lock is held only to take things out of the
-/// cache; images are encoded and stores written without it. Ok(None): the unit was busy.
+/// with _exit) keep what they compiled. The owner thread is called only to take things out of the
+/// cache; images are encoded and stores written off the unit. Ok(None): the owner thread was busy.
 /// The front images of the program's files the store does not have yet (front.rs), queued
 /// for the next spill; the count.
 /// `relax check`: this load's files written as front images and its crate records, as a run's
@@ -1974,9 +1974,8 @@ fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache
     n
 }
 
-/// `wait`: the warm record's writes (after first present, at a quit) wait for the unit lock,
-/// which a cold run's compiles hold nearly all the time (lock_unit announces the waiter, so
-/// background compilers yield between steps); other writes skip a busy unit.
+/// `wait`: the warm record's writes (after first present, at a quit) wait for the owner thread to
+/// complete its work (which a cold run's compiles fill nearly all the time); other writes skip a busy unit.
 fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the first write comes after the start: the mapped front images are checksummed now
     crate::cache::verify_front_images();
@@ -2047,9 +2046,9 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // not when a file was loaded since this write took its front images (its restore maps
         // every file from them); a later quiet flush or the exit tries again. Files the lazy
         // selection still skips travel in the image (skipped_files, deferred imports).
-        // Encoded under the locks, but never in the main thread's way: the encode stops when
-        // the main thread waits for the unit lock (a frame's lazy compile) and a later pass
-        // tries again; the store write runs after the locks are released.
+        // Encoded on the owner thread, but never in the main thread's way: the encode stops when
+        // the main thread waits for the owner thread (a frame's lazy compile) and a later pass
+        // tries again; the store write runs after the owner thread releases it.
         if let Some((ready, retired_boot, t)) = unit_call(wait, || {
             let mut ready = None;
             let mut retired_boot = None;
@@ -2108,7 +2107,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 let mut done = false;
                 if let Some(c) = u.cache.as_mut() {
                     if !installed { c.install_front_stores(std::mem::take(&mut stores)); installed = true; }
-                    // Lowering is excluded by the unit lock; ahead type checking and borrowck
+                    // Lowering is excluded by the owner thread; ahead type checking and borrowck
                     // use FRONT_RW (raw Program pointers, not file Arcs), so exclude them too.
                     // Other users owning another Arc keep their heap arrays. The encoder's
                     // Arcs were dropped by the writer before attempting exclusive access here.
@@ -2166,7 +2165,7 @@ pub(crate) fn summary(why: &'static str) {
 
 fn summary_inner(why: &str) {
     crate::fncost::mark("summary");
-    // Independent of the Unit lock: still emit when exit quiescence times out.
+    // Independent of owner thread state: still emit when exit quiescence times out.
     if why != "stats" { crate::exec_profile::report(false); }
     if why != "stats" {
         // the run is ending: background borrow checks stop at their next preemption point
@@ -2189,8 +2188,8 @@ fn summary_inner(why: &str) {
     }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
-    // at the end of the run the background compilers stop and release the unit (a mid-run
-    // "stats" summary keeps them going); the summary reads it under the lock
+    // at the end of the run the background compilers stop (a mid-run
+    // "stats" summary keeps them going); the summary reads the owner thread
     let holder = crate::owner::serving_note();
     let t_wait = std::time::Instant::now();
     // the end of the run never waits on compiles: other threads' builds are abandoned at their next
@@ -2222,7 +2221,7 @@ fn summary_inner(why: &str) {
             verbose!("{}", line);
         }
         if why != "stats" { exit_mark("reports"); }
-        // the disk cache: this run's new entries become a pack (unit lock held: no compiles)
+        // the disk cache: this run's new entries become a pack (on the owner thread: no compiles)
         if why != "stats" {
             let u = unsafe { &mut *up };
             let order = std::mem::take(&mut u.start_order);

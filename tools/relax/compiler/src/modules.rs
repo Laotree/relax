@@ -167,7 +167,7 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
     out
 }
 
-/// Parses, resolves, collects and type-checks a crate loaded at run time (unit lock held);
+/// Parses, resolves, collects and type-checks a crate loaded at run time (on the owner thread);
 /// `sandbox`: the compile-time refusal applies. On an error nothing of it stays reachable.
 unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
@@ -214,7 +214,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         };
         u.prog.resolve_imports_added(i0, d0);
         marks.push(("resolve", std::time::Instant::now()));
-        // the caches resolve_imports cleared (front-end write lock held: no reader)
+        // the caches resolve_imports cleared (front-end write lock on owner thread: no reader)
         unsafe {
             u.prog.reclaim_caches();
         }
@@ -320,7 +320,7 @@ fn root_fns(u: &Unit, defs: &[DefId]) -> Vec<DefId> {
     defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.n_generics == 0)).collect()
 }
 
-/// Loads a trusted module (RELAX_MODULES_TRUSTED=1; unit lock held): it runs as host code.
+/// Loads a trusted module (RELAX_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
 unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let (krate, root_file, defs) = front(up, name, path, deps, sandbox)?;
     let u = &mut *up;
@@ -579,7 +579,7 @@ fn wrapper_source(u: &Unit, krate: u32, modname: &str, idx: u32, defs: &[DefId])
     (src, skipped)
 }
 
-/// Loads a sandboxed module (unit lock held): its code runs only as twins in its own arena;
+/// Loads a sandboxed module (on the owner thread): its code runs only as twins in its own arena;
 /// the host calls it through a generated wrapper crate. Ok: (module crate, root file, its
 /// defs and the wrapper's, wrapper crate, arena, unsupported exports).
 #[allow(clippy::type_complexity)]

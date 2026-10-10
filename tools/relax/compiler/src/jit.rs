@@ -73,10 +73,10 @@ pub struct FnEntry {
     pub compiled: bool,
     pub patch_gen: u32,
     /// optimised RIR (input to inlining into callers, tier-up, recompiles)
-    /// shared: O3 builds snapshot callees' RIR and optimise without the unit lock
+    /// shared: O3 builds snapshot callees' RIR and optimise off the unit
     pub rir: Option<std::sync::Arc<crate::rir::Func>>,
     /// Referencing Call(Fn) / FnAddr sites in every built O1 body, plus one
-    /// permanent reference for an escaping entry address. Updated under the unit lock.
+    /// permanent reference for an escaping entry address. Updated on the owner thread.
     pub refs: u32,
     /// One slot per site (duplicates matter). Kept when RIR is evicted/invalidated so
     /// a rebuild subtracts the old body's contributions before adding its new ones.
@@ -99,7 +99,7 @@ pub struct FnEntry {
     pub version: u32,
     /// code replaced by O3 code (frames may still run in it): for PC lookups only
     pub retired: Vec<(u64, u32, PcMap)>,
-    /// a pipelined build is optimising / generating this slot off the lock (compile_split)
+    /// a pipelined build is optimising / generating this slot off the unit (compile_split)
     pub inflight: bool,
     /// code a speculative build made ahead of the first call, installed by that call
     /// (unlinked code, pc map, its relocations, whether the disk cache records it: false for
@@ -246,7 +246,7 @@ pub struct Unit {
     /// types whose values cross the provided-crate boundary (provided::crossing_types)
     pub provided_shared: std::collections::HashSet<TyId>,
     pub lay: crate::layout::Layouts,
-    /// slots: created on any thread (fn_id from lowering), build state changed under the unit lock
+    /// slots: created on any thread (fn_id from lowering), build state changed on the owner thread
     pub fns: crate::conc::AppendVec<FnEntry>,
     pub fn_map: crate::conc::MemoMap<FnKey, u32>,
     /// the reload index of slots by definition / parent / file: built from the slots on the
@@ -291,7 +291,7 @@ pub struct Unit {
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
     /// the slot takes this RIR, so the layout callers saw and the code agree
     pub coro_rir: crate::conc::MemoMap<u32, crate::rir::Func>,
-    /// coroutine types whose body is being lowered for its layout (under the unit lock)
+    /// coroutine types whose body is being lowered for its layout (on the owner thread)
     pub coro_busy: std::sync::Mutex<Vec<TyId>>,
     /// slots queued for speculation whose code the disk cache has: their worker links it and
     /// skips the type check ahead (a warm run checked ~11k bodies ahead it never used)
@@ -354,13 +354,13 @@ pub struct Unit {
     frequency_profiles: HashMap<u32, FrequencyProfile>,
     tier_base: u64,
     hot_entry: u64,
-    /// state the type checks ahead share with this unit (no unit lock needed to reach it)
+    /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
     /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.
     pub ctfe_fn_bodies: std::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
 
     /// this unit's own address (boxed): shared lowering reaches the unit-changing paths
-    /// (constant evaluation) through it, under the unit lock, as the runtime does through UNIT
+    /// (constant evaluation) through it on the owner thread, as the runtime does through UNIT
     self_ptr: UnitPtr,
 }
 
@@ -374,14 +374,14 @@ pub struct Stats {
     pub lower_ns: u64,
     pub codegen_ns: u64,
     pub code_bytes: u64,
-    /// wall time spent inside outermost compile_slot calls (lock held), and when the last one
+    /// wall time spent inside outermost compile_slot calls (on the owner thread), and when the last one
     /// ended (ns since the unit's first compile request epoch, see COMPILE_EPOCH)
     pub compile_wall_ns: u64,
     pub last_compile_end_ns: u64,
     /// per 100 ms of wall time: (compiles ended, compile wall ns) -- the startup timeline
     pub timeline: Vec<(u32, u64)>,
     /// O3 (queued: TIER_QUEUED): functions installed, dropped (failed or outdated); cpu
-    /// time the O3 thread held the unit lock and spent outside it (optimise + codegen)
+    /// time the O3 thread spent on and off the unit (optimise + codegen)
     pub tier1_installed: u32,
     /// O3 rebuilds after a never-run callee ran
     pub tier1_retier: u32,
@@ -586,7 +586,7 @@ pub fn main_post_present_wait() -> (f64, String) {
     (owner::MAIN_WAIT_MAX.load(Ordering::Relaxed) as f64 / 1e6, format!("behind {} work", owner::main_wait_behind()))
 }
 
-/// O3 drops by reason (unit lock held).
+/// O3 drops by reason (on the owner thread).
 unsafe fn drop_why(up: *mut Unit, why: &'static str) {
     *(&mut *up).stats.tier1_drop_why.entry(why).or_insert(0) += 1;
 }
@@ -606,7 +606,7 @@ pub static ORDER_PRESENT_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic
 
 /// Queues the previous run's startup manifest (disk cache) for the speculative workers, in the
 /// order that run installed the slots: they link the cached code ahead of the main thread.
-/// The keys are decoded on a thread of their own, a chunk per unit lock hold.
+/// The keys are decoded on a thread of their own, a chunk per unit call.
 pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     // after the first present: what the earlier run installed after its first present (the
@@ -642,7 +642,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     });
 }
 
-/// Installs one slot of the startup image (unit lock held): as install_compiled does for code
+/// Installs one slot of the startup image (on the owner thread): as install_compiled does for code
 /// from the disk cache, with the borrowck note collected in `notes` (sent after the start).
 unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, gandalf: bool, notes: &mut Vec<u32>, arm: &mut Vec<(u32, u64)>) {
     let u = &mut *up;
@@ -964,7 +964,7 @@ pub fn poisoned_note() -> Option<String> {
     POISONED.lock().ok().and_then(|g| g.clone())
 }
 
-/// A hardware fault in JIT code with a recovery point (from the signal handler, unit locked).
+/// A hardware fault in JIT code with a recovery point (from the signal handler, on the owner thread).
 /// Returns true when the process must end: the report is printed and the caller restores the
 /// signal's default action and returns, so the faulting instruction faults again and the
 /// process dies by the signal (exit status 128 + signal, as a rustc build's would). Otherwise
@@ -3117,7 +3117,7 @@ impl Unit {
         first
     }
 
-    /// Names slot `id` (made by `new_slots`) `key` (unit lock held): its name, file, the map.
+    /// Names slot `id` (made by `new_slots`) `key` (on the owner thread): its name, file, the map.
     /// False when another slot has that key already: this one keeps it as a second slot of the
     /// function (its code and callers stay; the reload index finds both), the map the first.
     pub(crate) fn name_slot(&mut self, id: u32, key: FnKey) -> bool {
@@ -4060,7 +4060,7 @@ fn exec_metadata(prog: &Program, d: DefId, name: String) -> crate::exec_census::
     }
 }
 
-/// Diagnostic metadata is read only while the unit lock protects the slot table.
+/// Diagnostic metadata is read only while the owner thread is active.
 unsafe fn cost_name(up: *mut Unit, id: u32) {
     if !crate::fncost::enabled() && !crate::warm::enabled() { return; }
     let f = &(&*up).fns[id as usize];
@@ -4080,14 +4080,14 @@ pub unsafe fn compile_slot(up: *mut Unit, id: u32) -> u64 {
     ensure_sufficient_stack(|| compile_slot_on_stack(up, id))
 }
 
-/// The thread that runs the program's main (run.rs), and its compile intervals (wall ns, lock
-/// waits included) for RELAX_MAIN_COMPILE_LOG: app time vs compile time on the main thread.
+/// The thread that runs the program's main (run.rs), and its compile intervals (wall ns, owner
+/// thread waits included) for RELAX_MAIN_COMPILE_LOG: app time vs compile time on the main thread.
 pub static MAIN_TID: AtomicU64 = AtomicU64::new(0);
-/// Functions compiled so far (= Stats::compiled), readable without the unit lock: progress
-/// reports (run.rs `--report-to`) poll it while the unit lock is busy.
+/// Functions compiled so far (= Stats::compiled), readable off the unit: progress
+/// reports (run.rs `--report-to`) poll it while the owner thread is busy.
 pub static COMPILED_FNS: AtomicU64 = AtomicU64::new(0);
 
-/// Display-only snapshot. Never wait for a compiler or take the unit lock to draw
+/// Display-only snapshot. Never wait for a compiler or call the owner thread to draw
 /// progress: a busy queue is reported as busy and sampled again on the next tick.
 #[cfg(unix)]
 pub(crate) fn compile_progress() -> (Option<usize>, u64) {
@@ -4099,7 +4099,7 @@ pub(crate) fn compile_progress() -> (Option<usize>, u64) {
     })();
     (queued, STARTUP_COMPILES.load(Ordering::Relaxed))
 }
-/// O3 installs (read without the unit lock: run.rs's monitor)
+/// O3 installs (read off the unit: run.rs's monitor)
 pub static TIER1_INSTALLS: AtomicU64 = AtomicU64::new(0);
 static TIER1_FINISHED: AtomicU64 = AtomicU64::new(0);
 
@@ -4120,8 +4120,8 @@ pub struct MainCompile {
     pub slot: u32,
     /// MAIN_HOW_*: the first way the slot was satisfied
     pub how: u8,
-    /// typeck ahead before the lock, waiting for the unit lock, front (typeck + lower, locked),
-    /// back (opt + codegen, unlocked), relock after the back end, waiting for another thread's build
+    /// typeck ahead off the unit, waiting for owner thread, front (typeck + lower on owner thread),
+    /// back (opt + codegen off the unit), on owner thread after back end, waiting for another thread's build
     pub ns: [u64; 6],
     /// thread CPU of the front, the optimisation and the code generation (wall vs CPU: work vs
     /// waiting / descheduling)
@@ -4310,7 +4310,7 @@ unsafe fn compile_note(up: *mut Unit, id: u32, w0: u64) {
     compile_wall_add(up, w0);
 }
 
-/// Compile-wall statistics for one outer locked compile that began at `w0` (unit lock held).
+/// Compile-wall statistics for one outer compile that began at `w0` (on the owner thread).
 unsafe fn compile_wall_add(up: *mut Unit, w0: u64) {
     {
         let w1 = wall_ns();
@@ -4331,7 +4331,7 @@ unsafe fn compile_wall_add(up: *mut Unit, w0: u64) {
 
 /// Monotonic wall clock in ns.
 
-/// Slot `id` gets O3 code from the disk cache (unit lock held, before its install): no
+/// Slot `id` gets O3 code from the disk cache (on the owner thread, before its install): no
 /// call counter (it is O3 already), and the slots its body inlined know it (a live patch of
 /// one rebuilds it).
 unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
@@ -4350,7 +4350,7 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     u.stats.tier1_cached += 1;
 }
 
-/// Code that needs no compile (unit lock held): already compiled, linked ahead from the disk
+/// Code that needs no compile (on the owner thread): already compiled, linked ahead from the disk
 /// cache, found in the disk cache, or built ahead by a speculative worker. None: compile it.
 unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
     let u = &mut *up;
@@ -4503,7 +4503,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     })
 }
 
-/// Installs a slot's compiled code (unit lock held): perf map, O3 counter, and the
+/// Installs a slot's compiled code (on the owner thread): perf map, O3 counter, and the
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
 /// stores it -- false for code that came from the cache).
@@ -5216,7 +5216,7 @@ fn o3_first() -> bool {
 }
 
 /// `#[relax(O3, always)]`: the first call of slot `id` builds its O3 code on the calling thread
-/// (unit lock held) and runs nothing lower; the wait is logged. None: the O3 build failed (the
+/// (on the owner thread) and runs nothing lower; the wait is logged. None: the O3 build failed (the
 /// caller compiles it as usual). The code is the slot's cache entry (record_o3), so the wait
 /// happens cold or after an edit only.
 unsafe fn compile_o3_always(up: *mut Unit, id: u32) -> Option<u64> {
@@ -5282,7 +5282,7 @@ pub(crate) unsafe fn o2_cached(up: *mut Unit, id: u32) {
 
 /// Slot `id` ran hot (an O3 build queued by its calls or samples): it gets an O2 build too, the
 /// slot's cache entry, so later launches link optimised code for it from the first call instead
-/// of the O1 code their start runs until O3 replaces it (O3 code is not cached). Unit lock held.
+/// of the O1 code their start runs until O3 replaces it (O3 code is not cached). On the owner thread.
 unsafe fn o2_hot(up: *mut Unit, id: u32) {
     let u = &*up;
     if (id as usize) >= u.fns.len() || matches!(u.fns[id as usize].key, FnKey::Glue(..) | FnKey::Sandbox(_)) || u.cache.is_none() {

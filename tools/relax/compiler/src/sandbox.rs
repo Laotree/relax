@@ -129,7 +129,7 @@ static QUIESCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 static RECYCLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static SB: Mutex<Option<Sb>> = Mutex::new(None);
-/// The TLS block offset of the sandbox words + 1 (0: no sandbox yet), read without the lock.
+/// The TLS block offset of the sandbox words + 1 (0: no sandbox yet), read off the unit.
 static TLS_OFF: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Module index -> its arena (a lock-free lookup for every wrapper call).
 const MAX_MODULES: usize = 1 << 16;
@@ -166,7 +166,7 @@ fn map_rw(addr: u64, len: u64) -> bool {
     unsafe { mprotect(addr as *mut u8, len as usize, 3) == 0 }
 }
 
-/// Sets up the sandbox state on first use (unit lock held).
+/// Sets up the sandbox state on first use (on the owner thread).
 unsafe fn sb_init(up: *mut Unit) -> Result<(), String> {
     if SB.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
         return Ok(());
@@ -313,7 +313,7 @@ pub fn maybe_recycle(up: *mut Unit) {
         .ok();
 }
 
-/// Rebuilds every live twin into the other sandbox code space and swaps (unit lock taken
+/// Rebuilds every live twin into the other sandbox code space and swaps (a unit call
 /// here): dead twins (unloaded modules, replaced versions) are left behind, and the space they
 /// were in is reused by the next recycle. Returns (twins moved, bytes now used).
 pub unsafe fn recycle(up: *mut Unit) -> Result<(usize, u64), String> {
@@ -1243,7 +1243,7 @@ fn c_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
 
 // ------------------------------------------------------------------ the transform
 
-/// Rewrites a twin's RIR for sandboxed execution (unit lock held). Errors name what a module
+/// Rewrites a twin's RIR for sandboxed execution (on the owner thread). Errors name what a module
 /// cannot do (a C function, data it cannot reach), never a crash.
 pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(), String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
@@ -1602,7 +1602,7 @@ fn add_fuel(f: &mut Func, arena: VReg, site: Sym, panic_site: Sym, pos0: u64, co
     }
 }
 
-/// The code of a twin (unit lock held): the base slot's RIR, transformed.
+/// The code of a twin (on the owner thread): the base slot's RIR, transformed.
 pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String> {
     if base == u32::MAX {
         return Err("a sandboxed module called an invalid function pointer".to_string());

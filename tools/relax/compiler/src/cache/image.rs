@@ -12,8 +12,8 @@
 //! The slots the image's keys name are made in one go, in image order, with their identities
 //! still encoded (`ImageIds`): relocations between image slots go by image key index, and a key
 //! is decoded (`complete_identities`) after main started, on a background thread, or at once by
-//! the first thread that takes the unit lock for anything else (jit.rs `ids_after_lock`), so every
-//! holder of the lock sees every slot's key. A lookup by encoded bytes finds an image slot through
+//! the first thread to make a unit call for anything else (jit.rs `ids_after_lock`), so every
+//! caller on the owner thread sees every slot's key. A lookup by encoded bytes finds an image slot through
 //! the image's sorted key index, with or without its identity decoded.
 
 use super::*;
@@ -1346,7 +1346,7 @@ impl Linker {
     /// are unchanged, whose identities resolve and that has no code yet, and hands those slots to
     /// `install` (jit.rs) -- in two blocks: the slots that name no static first, then, once the
     /// statics are initialized (their initializers run code: it finds the first block
-    /// installed), the rest. Returns the slots installed (unit lock held).
+    /// installed), the rest. Returns the slots installed (on the owner thread).
     fn prelink(&mut self, u: &mut Unit, eager: bool, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
         let t0 = crate::jit::wall_ns();
         let Some((img, store)) = self.cache().image.as_ref().map(|i| (i.bytes(), i._store.clone())) else { return 0 };
@@ -1459,7 +1459,7 @@ impl Linker {
     }
 
     /// Decodes up to `budget` of the startup image slots' identities still encoded, in image
-    /// order (unit lock held); true when none is left. A key that does not decode leaves its
+    /// order (on the owner thread); true when none is left. A key that does not decode leaves its
     /// slot unnamed (no lookup finds it); a key an earlier slot has already leaves the image's
     /// slot a second slot of that function (it keeps its code; the map names the first).
     fn complete_identities(&mut self, u: &mut Unit, budget: usize, bg: bool) -> bool {
@@ -1524,7 +1524,7 @@ impl Linker {
     }
 
     /// Slot `id`'s identity, if it is a startup image slot whose key is still encoded: decoded
-    /// now (before it is built). Unit lock held.
+    /// now (before it is built). On the owner thread.
     fn name_unnamed(&mut self, u: &mut Unit, id: u32) {
         if !is_unnamed(u, id) {
             return;
@@ -1573,26 +1573,26 @@ impl Linker {
     }
 }
 
-/// See `Linker::name_unnamed` (unit lock held).
+/// See `Linker::name_unnamed` (on the owner thread).
 pub(crate) unsafe fn name_unnamed_unit(up: *mut Unit, id: u32) {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return };
     Linker::new(cache).name_unnamed(&mut *up, id)
 }
 
-/// See `Linker::image_slot_by_key` (unit lock held).
+/// See `Linker::image_slot_by_key` (on the owner thread).
 pub(crate) unsafe fn image_slot_by_key_unit(up: *mut Unit, key: &crate::jit::FnKey) -> Option<u32> {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return None };
     Linker::new(cache).image_slot_by_key(&mut *up, key)
 }
 
-/// Prelinks the startup image (see `Linker::prelink`); the caller holds the unit lock.
+/// Prelinks the startup image (see `Linker::prelink`); the caller is on the owner thread.
 pub(crate) unsafe fn prelink_unit(up: *mut Unit, eager: bool, install: &mut dyn FnMut(&mut Unit, Vec<PrelinkedSlot>)) -> usize {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return 0 };
     Linker::new(cache).prelink(&mut *up, eager, install)
 }
 
 /// Decodes up to `budget` of the startup image's identities still encoded (see
-/// `Linker::complete_identities`); true when none is left. Unit lock held.
+/// `Linker::complete_identities`); true when none is left. On the owner thread.
 pub(crate) unsafe fn complete_identities_unit(up: *mut Unit, budget: usize, bg: bool) -> bool {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return true };
     Linker::new(cache).complete_identities(&mut *up, budget, bg)

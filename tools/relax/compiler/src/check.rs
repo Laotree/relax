@@ -366,12 +366,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
 
 /// Compiles every seed fn, then every slot the compiled code creates (callees, closures, glue,
 /// vtable methods), each through the run's own per-fn compile (`jit::compile_slot`: front end
-/// under the unit lock, optimisation and code generation off it), on RELAX_JOBS threads until
+/// on the owner thread, optimisation and code generation off it), on RELAX_JOBS threads until
 /// no slot is left. Returns every failed build: (slot, error).
 unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u32, String)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     *jit::CHECK_FAILURES.lock().unwrap_or_else(|p| p.into_inner()) = Some(Vec::new());
-    // as a run: the front end under the unit lock, optimisation and code generation off it
+    // as a run: the front end on the owner thread, optimisation and code generation off it
     // (and the run's speculative callee builds)
     jit::enable_pipelining(&(*up).prog.session.clone().options);
     // (slots made before the seeds -- the root's main, constants' readers -- are compiled too)

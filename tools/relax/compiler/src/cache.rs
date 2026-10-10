@@ -286,11 +286,11 @@ impl crate::store::Entry for PendingEntry {
     }
 }
 
-/// Interior storage for the cache installed in a Unit. The unit lock protects
+/// Interior storage for the cache installed in a Unit. The owner thread protects
 /// every access. Linker borrows one operation at a time and holds only this cell's
 /// raw pointer across callbacks, which may recursively access the same cell.
 pub struct CacheCell(std::cell::UnsafeCell<Cache>);
-// All cache reads and writes are serialized by the unit lock. Off-lock compiler
+// All cache reads and writes are serialized by the owner thread. Off-unit compiler
 // work can share a Unit, but does not access its cache.
 unsafe impl Sync for CacheCell {}
 impl CacheCell {
@@ -905,7 +905,7 @@ impl Cache {
     }
 
     /// Reserves the keys of file `path`'s front images that are neither stored nor pending:
-    /// (main, part) -- `push_front` retains the parse for encoding without the unit lock.
+    /// (main, part) -- `push_front` retains the parse for encoding off the unit.
     pub fn reserve_front(&mut self, krate: u32, path: &str, source_hash: u128, main: bool, part: bool) -> (bool, bool) {
         // only the program's crates as the cache opened: run-time modules (sandboxed or not)
         // never write into the program's stores
@@ -957,8 +957,8 @@ impl Cache {
         self.pending_bytes
     }
 
-    /// The entries recorded so far, taken out for writing during the run (under the unit lock;
-    /// the write itself, `Spill::write`, runs without it). Memory: a cold Stage run held ~200 MB
+    /// The entries recorded so far, taken out for writing during the run (on the owner thread;
+    /// the write itself, `Spill::write`, runs off the unit). Memory: a cold Stage run held ~200 MB
     /// of recorded code until the exit flush. The keys stay in `pending_keys` (nothing is
     /// recorded twice); the late-input ledger written with them is this run's so far (a later
     /// write or the exit flush replaces it: newest wins per key).
@@ -1967,7 +1967,7 @@ impl Cache {
         r
     }
 
-    /// Records slot `id`'s freshly compiled O1 code (unit lock held).
+    /// Records slot `id`'s freshly compiled O1 code (on the owner thread).
     /// `code` is the backend's output (relocated fields zeroed), `relocs` its relocations.
     pub fn record(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) {
         self.record_entry(u, id, code, relocs, pc_map, None, false)
@@ -2344,8 +2344,8 @@ impl Cache {
     /// Records this run's startup manifest (the slots installed in the first seconds after main,
     /// in order, the first `present` of them before the first present; per slot its stable key
     /// encoding and the code entry it maps to, 0 when its code has none) unless the loaded one
-    /// already covers it (unit lock held).
-    /// `stop` (a mid-run write: the main thread waits for the unit lock) is asked every 256
+    /// already covers it (on the owner thread).
+    /// `stop` (a mid-run write: the main thread waits for the owner thread) is asked every 256
     /// slots; yes drops this record (false comes back) and a later write makes it again.
     pub fn record_manifest(&mut self, u: &Unit, root: u32, order: &[u32], present: usize, stop: &dyn Fn() -> bool) -> bool {
         if !crate::preempt::is_stopped() && crate::warm::enabled() {
@@ -2492,7 +2492,7 @@ impl Cache {
     }
 }
 
-/// Entries taken out of a running cache (Cache::spill_take), written without the unit lock.
+/// Entries taken out of a running cache (Cache::spill_take), written off the unit.
 pub struct Spill {
     dir: PathBuf,
     files: Vec<(PathBuf, bool, Vec<PendingEntry>)>,
@@ -2515,7 +2515,7 @@ fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<(
 }
 
 impl Spill {
-    /// Open the new committed files outside the unit lock. Old mappings stay pinned.
+    /// Open the new committed files off the unit. Old mappings stay pinned.
     pub fn write_mapped(self) -> Result<(usize, Vec<std::sync::Arc<Store>>), String> {
         let paths: Vec<_> = self.files.iter().filter(|(_, _, es)| es.iter().any(|e| e.kind == KIND_FRONT))
             .map(|(p, _, _)| p.clone()).collect();
@@ -5675,7 +5675,7 @@ mod nounwind_tests {
     }
 }
 
-/// A link operation holds no cache borrow across calls into the Unit. The unit lock
+/// A link operation holds no cache borrow across calls into the Unit. The owner thread
 /// serializes each cache access, while initializer evaluation may re-enter with a
 /// separate Linker. The boxed cache remains installed (and at a stable address).
 struct Linker {
@@ -5683,7 +5683,7 @@ struct Linker {
 }
 
 impl Linker {
-    /// The caller holds the unit lock, and keeps the cache alive for this operation.
+    /// The caller is on the owner thread and keeps the cache alive for this operation.
     unsafe fn new(cache: *mut Cache) -> Self { Self { cache } }
 
     /// Only borrow for an individual map/codec operation, never across Unit callbacks.
@@ -6057,7 +6057,7 @@ impl Linker {
     }
 }
 
-/// Re-entrant cache lookup; the caller holds the unit lock.
+/// Re-entrant cache lookup; the caller is on the owner thread.
 pub(crate) unsafe fn lookup_unit(up: *mut Unit, id: u32) -> Option<LinkedCode> {
     let Some(cache) = (&*up).cache.as_ref().map(|c| c.get()) else { return None };
     Linker::new(cache).lookup(&mut *up, id)
@@ -6066,14 +6066,14 @@ pub(crate) unsafe fn lookup_unit(up: *mut Unit, id: u32) -> Option<LinkedCode> {
 struct LinkGuard { cache: *mut Cache, key: u128, data: bool }
 impl Drop for LinkGuard {
     fn drop(&mut self) {
-        // Same unit lock and cache lifetime as the owning Linker, including unwinding.
+        // Same owner thread call and cache lifetime as the owning Linker, including unwinding.
         let c = unsafe { &mut *self.cache };
         if self.data { c.linking_data.remove(&self.key); }
         else { c.linking.remove(&(self.key as u32)); }
     }
 }
 
-/// Whether a cache entry is being linked (unit lock held: by this thread).
+/// Whether a cache entry is being linked (on the owner thread: by this thread).
 pub(crate) fn linking(u: &Unit) -> bool {
     u.cache.as_ref().is_some_and(|c| { let c = unsafe { &*c.get() }; !c.linking.is_empty() || !c.linking_data.is_empty() })
 }

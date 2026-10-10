@@ -19,7 +19,7 @@
 //!    queued after install and can still compile lazily on first call.
 //! 6. Only if all of that succeeded: install, one patch group. Otherwise nothing is installed,
 //!    the versions are reverted, and the errors are returned.
-//! The unit lock is held for the whole transaction (compiling off the lock is the next step).
+//! The owner thread holds for the whole transaction (compiling off the unit is the next step).
 
 use crate::lang_items::LangItem;
 use crate::jit::{self, FnKey, Unit};
@@ -426,7 +426,7 @@ fn publish_reload(u: &mut Unit, versions: &[(u32, u32)], full: bool, scope: Opti
 
 /// Rolls back an installed patch group (a panic or fault in its code, M7): the slots return
 /// to their previous code, the files to their previous versions, the consts to their previous
-/// values. Returns the rolled-back functions' names. The caller must not hold the unit lock.
+/// values. Returns the rolled-back functions' names. The caller makes a unit call.
 pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
     crate::owner::call(crate::owner::Class::App, || {
         let u = &mut *up;
@@ -1418,7 +1418,7 @@ pub(crate) fn crates_seeing_edit(prog: &crate::program::Program, files: impl Ite
 /// A scope-preserving edit moved the program from collect epoch `from` to `from + 1`: Gandalf
 /// keeps the verdicts (and queued checks) of owners in crates that cannot see the edited files
 /// instead of re-checking the whole program (borrowck::lazy::carry_epoch). Front-end write
-/// lock held.
+/// lock held (on the owner thread).
 fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>) {
     let src = std::sync::Arc::as_ptr(&u.front) as usize;
     let prog = &u.prog;
@@ -1764,8 +1764,7 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
 /// beyond those compile as they always do (lazily, or already built): following them, or the
 /// slots other threads create meanwhile, made a load during a cold start compile the starting
 /// app's whole graph (17,317 slots, 1.6 s seen). Err: errors in functions `mine` claims; errors
-/// in others are returned with them as their first call would report them. The unit lock must be
-/// held.
+/// in others are returned with them as their first call would report them. Called on the owner thread.
 /// `own`: the module's functions (its twins and wrappers, or a trusted module's own code), whose
 /// callees are followed.
 pub(crate) unsafe fn compile_reachable(up: *mut Unit, roots: Vec<u32>, mine: &dyn Fn(&Unit, u32) -> bool, own: &dyn Fn(&Unit, u32) -> bool) -> Result<Vec<(u32, Result<Code, String>)>, Vec<String>> {
@@ -1777,8 +1776,8 @@ pub(crate) unsafe fn compile_reachable_from(up: *mut Unit, roots: Vec<u32>, seed
 }
 
 /// As compile_reachable, also following the relocations of code built already (`seeds`), and
-/// compiling at most `cap` functions. Works in waves: each wave's host functions build with the
-/// unit lock released for their back ends (jit::compile_batch_off_lock); twins build under it.
+/// compiling at most `cap` functions. Works in waves: each wave's host functions build off the unit
+/// for their back ends (jit::compile_batch_off_lock); twins build on it.
 /// Reload supplies `n0` to follow only newly created slots; module loads have no such limit.
 unsafe fn compile_reachable_in(up: *mut Unit, roots: Vec<u32>, seeds: Vec<u32>, mine: &dyn Fn(&Unit, u32) -> bool, cap: usize, module: Option<&dyn Fn(&Unit, u32) -> bool>, n0: Option<usize>) -> Result<Vec<(u32, Result<Code, String>)>, Vec<String>> {
     let mut out: Vec<(u32, Result<Code, String>)> = Vec::new();
@@ -1881,7 +1880,7 @@ pub(crate) fn module_own(u: &Unit, id: u32) -> bool {
     under_lock(u, id)
 }
 
-/// Slots whose build must stay under the unit lock: sandbox twins and module wrappers.
+/// Slots whose build must stay on the owner thread: sandbox twins and module wrappers.
 fn under_lock(u: &Unit, id: u32) -> bool {
     match &u.fns[id as usize].key {
         FnKey::Sandbox(_) => true,
@@ -1895,7 +1894,7 @@ const PRECOMPILE_MAX: usize = 4000;
 /// Of those, compiled before an edit's install; the rest go to the background compilers
 const PRECOMPILE_SYNC: usize = 300;
 
-/// Applies `edits` as one transaction. The caller must not hold the unit lock.
+/// Applies `edits` as one transaction. The caller makes a unit call.
 pub unsafe fn apply(up: *mut Unit, edits: Vec<Edit>) -> Outcome {
     apply_mode(up, edits, 1, false)
 }
@@ -1906,7 +1905,7 @@ pub(crate) unsafe fn apply_full(up: *mut Unit, edits: Vec<Edit>) -> Outcome {
 }
 
 unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool) -> Outcome {
-    // one transaction at a time (its back ends run with the unit lock released)
+    // one transaction at a time (its back ends run off the unit)
     static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let transaction = TraceTransaction::begin(edits.len());
     let _p = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
@@ -1928,7 +1927,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
         let snap = |edits: &[Edit]| {
             let macro_table = (*up).prog.macros.clone();
             let epoch = (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire);
-            // Whole-file candidates parse off the lock; partial Rust retries stay under it.
+            // Whole-file candidates parse off the unit; partial Rust retries stay on it.
             let off_lock = partial != 2;
             let snapshots: Vec<_> = if off_lock {
                 let prog = &(*up).prog;
@@ -1977,7 +1976,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
             let step = call_traced("relock", || {
                 trace_stage("relock");
                 // Runtime module loads publish macro tables; rollback also changes the collection
-                // epoch. Neither may make this snapshot stale while the parser runs off the lock.
+                // epoch. Neither may make this snapshot stale while the parser runs off the unit.
                 if std::sync::Arc::ptr_eq(&macro_table, &(*up).prog.macros) && epoch == (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire) {
                     drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
                     return Ok(apply_locked(up, edits, pre, t0, partial, 8, module));
@@ -2492,7 +2491,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     trace_sub("gp_ctfe_scan");
     jit::open_patch();
     // Record only RIR first materialized during this attempt, including concurrent
-    // lazy compilation while the transaction releases the unit lock.
+    // lazy compilation while the transaction releases the owner thread.
     let journal_start = u.fns.len();
     u.reload_rir = Some(Default::default());
     let file_fns: Vec<(DefId, Vec<TyId>)> = if crate::borrowck::enabled(options) {
@@ -3308,7 +3307,7 @@ pub extern "C" fn __relax_live_edit_enabled() -> bool {
 }
 
 /// The program's wake for its event loop (std::relax::on_patch): called from the watcher
-/// thread after a patch is installed, outside the unit lock, so an idle app polls the new
+/// thread after a patch is installed, off the unit, so an idle app polls the new
 /// generation at once instead of at its next idle tick.
 static PATCH_WAKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -3883,8 +3882,8 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
             continue;
         }
         let seen = std::time::Instant::now();
-        // from the save on, the post-boot loader keeps off the unit lock (the read below
-        // compares with the running text under it)
+        // from the save on, the post-boot loader keeps off the unit (the read below
+        // compares with the running text on it)
         for &k in &changed {
             if !hot.contains(&k) {
                 hot.push(k);
