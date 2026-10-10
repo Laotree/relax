@@ -305,6 +305,7 @@ impl MacroPart {
         table.macro_use.insert(krate.to_owned(), self.uses.clone());
         if let Some(modules) = &self.modules { table.add_crate(krate.to_owned(), modules.clone()); }
         table.exp_uses.insert(krate.to_owned(), self.expansions.clone());
+        table.forget_expansion_index(krate);
         table.s2_fmt = self.s2_fmt;
     }
 }

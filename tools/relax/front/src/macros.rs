@@ -314,13 +314,19 @@ impl Drop for LookupInputs {
 fn import_modules<'a>(owners: impl Iterator<Item = &'a String>) -> crate::fxhash::HashSet<String> {
     let mut modules = crate::fxhash::HashSet::default();
     for owner in owners {
-        let mut module = owner.as_str();
-        while modules.insert(module.to_string()) {
-            let Some((parent, _)) = module.rsplit_once("::") else { break; };
-            module = parent;
-        }
+        add_import_module(&mut modules, owner);
     }
     modules
+}
+
+/// `owner` and its parent modules join `modules` (stops at the first one already there: its
+/// parents are too).
+fn add_import_module(modules: &mut crate::fxhash::HashSet<String>, owner: &str) {
+    let mut module = owner;
+    while modules.insert(module.to_string()) {
+        let Some((parent, _)) = module.rsplit_once("::") else { break; };
+        module = parent;
+    }
 }
 
 /// Macros by name, in definition order across the crates loaded so far (dependencies load
@@ -382,7 +388,12 @@ impl MacroTable {
 
     /// Adds crate `name`'s module tree and imports.
     pub fn add_crate(&mut self, name: String, cm: std::sync::Arc<CrateMods>) {
+        // the expansion indexes and alias answers depend on exp_uses only, which a crate's
+        // module tree does not change: they stay (clearing them rebuilt every crate's index
+        // after each crate load)
+        let expansion = std::mem::take(&mut self.expansion_snapshot);
         self.clear_lookup_cache();
+        self.expansion_snapshot = expansion;
         if cm.renames.iter().any(|r| !self.renames.contains(r)) {
             let set = std::sync::Arc::make_mut(&mut self.renames);
             for r in &cm.renames {
@@ -454,11 +465,21 @@ impl MacroTable {
     /// entries merge).
     pub fn add_exp_uses(&mut self, k: &str, uses: impl IntoIterator<Item = ((String, String), Vec<String>)>) {
         self.replay_snapshot.0.get_mut().unwrap().clear();
-        self.expansion_snapshot.crates.get_mut().unwrap().remove(k);
-        self.expansion_snapshot.aliases.get_mut().unwrap().clear();
         self.import_snapshot.0.get_mut().unwrap().clear();
         let t = std::sync::Arc::make_mut(self.exp_uses.entry(k.to_string()).or_default());
+        // Imports are only added here, so crate k's expansion index (its binding names and
+        // their modules) and the alias answers grow in place instead of being rebuilt from all
+        // of k's imports on the next lookup (one rebuild per parsed file: 1.3 GB of copies on
+        // a cold Stage).
+        let crates = self.expansion_snapshot.crates.get_mut().unwrap();
+        let mut index = crates.get_mut(k).map(std::sync::Arc::make_mut);
+        let aliases = self.expansion_snapshot.aliases.get_mut().unwrap();
         for (key, path) in uses {
+            if let Some(index) = index.as_mut() {
+                if !index.names.contains(&key.1) { index.names.insert(key.1.clone()); }
+                add_import_module(&mut index.modules, &key.0);
+            }
+            if let Some(found) = aliases.get_mut(&key.1) { *found = true; }
             if key.1 == GLOB {
                 let e = t.entry(key).or_default();
                 for g in split_globs(&path) {
@@ -468,6 +489,13 @@ impl MacroTable {
                 t.insert(key, path);
             }
         }
+    }
+
+    /// Crate `k`'s expansion imports were replaced or removed (not through add_exp_uses): its
+    /// cached expansion index and every alias answer go.
+    pub(crate) fn forget_expansion_index(&mut self, k: &str) {
+        self.expansion_snapshot.crates.get_mut().unwrap().remove(k);
+        self.expansion_snapshot.aliases.get_mut().unwrap().clear();
     }
 
     /// Crate `k` is loaded: the imports its macro expansions wrote (`exp_uses`: derive output's
@@ -1043,6 +1071,7 @@ struct LocalImports {
 }
 
 #[derive(Default)]
+#[derive(Clone)]
 struct LocalImportIndex {
     names: crate::fxhash::HashSet<String>,
     modules: crate::fxhash::HashSet<String>,

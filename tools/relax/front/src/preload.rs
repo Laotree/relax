@@ -1289,7 +1289,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
     }
     let table = std::sync::Arc::make_mut(&mut prog.macros);
     for defs in table.defs.values_mut() { defs.retain(|d| d.krate != name); }
-    table.aliases.remove(&name); table.macro_use.remove(&name); table.exp_uses.remove(&name); table.sealed.remove(&name);
+    table.aliases.remove(&name); table.macro_use.remove(&name); table.exp_uses.remove(&name); table.forget_expansion_index(&name); table.sealed.remove(&name);
     table.crates.remove(&name); table.crates.remove(&format!("{}\u{1}lib", name));
     let mut reached = Vec::new();
     for (k, reachable, mut mods, scans) in contexts {
