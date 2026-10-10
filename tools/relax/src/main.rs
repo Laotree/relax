@@ -12,6 +12,7 @@ mod lexer {
 mod cef;
 mod fetch;
 mod help;
+mod host_gen;
 mod macros;
 
 /// What this loader was built from (build.rs; the linked compiler's own stamp is
@@ -255,7 +256,7 @@ fn src(name: &str) -> u64 {
 }
 
 /// The crates built into this binary that Relax binds instead of compiling (provided.rs), and
-/// `makepad host-gen <package> <crate> <out.rs>`, which writes such a crate's shim file.
+/// `relax host-gen`, which writes their shim files (host_gen.rs).
 /// Each binds only while the program's source of it is the one built here (check_sources).
 fn provided() {
     use relax_provided_fixture::__host_shims as fx;
@@ -309,14 +310,6 @@ fn provided() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("host-gen") {
-        if args.len() != 5 {
-            eprintln!("usage: makepad host-gen <package> <crate> <out.rs>");
-            std::process::exit(2);
-        }
-        let a = ["--check".to_string(), "--host-gen".to_string(), args[3].clone(), args[4].clone(), args[2].clone()];
-        let mut sess = relax_compiler::session_from_env(&args);
-        // A shim table describes the whole crate, including modules no program calls yet.
-        std::sync::Arc::get_mut(&mut sess).expect("new host-gen session").options.source_eager = true;
-        std::process::exit(relax_compiler::run::cmd_run(&sess, &a));
+        std::process::exit(if args.get(2).map(String::as_str) == Some("--worker") { host_gen::worker(&args[3..]) } else { host_gen::main(&args[2..]) });
     }
 }

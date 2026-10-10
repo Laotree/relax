@@ -16,8 +16,13 @@ impl CfgSet {
     pub fn host(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
         // RELAX_CHECK_TARGET=x86_64-pc-windows-gnu: type-check (`relax check` / `relax run
         // --check`, with cargo's `--target` of the same triple) another platform's code from here
-        if sess.options.check_target == crate::options::CheckTarget::WindowsX64 {
-            return CfgSet::windows_x64(sess, features);
+        // and RELAX_CHECK_TARGET=aarch64-apple-darwin / x86_64-unknown-linux-gnu (`relax host-gen`
+        // reads the provided crates as each target sees them)
+        match sess.options.check_target {
+            crate::options::CheckTarget::WindowsX64 => return CfgSet::windows_x64(sess, features),
+            crate::options::CheckTarget::MacosArm64 => return CfgSet::macos_arm64(sess, features),
+            crate::options::CheckTarget::LinuxX64 => return CfgSet::linux_x64(sess, features),
+            crate::options::CheckTarget::Host => {}
         }
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             CfgSet::macos_arm64(sess, features)

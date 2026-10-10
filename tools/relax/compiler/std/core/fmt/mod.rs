@@ -870,7 +870,7 @@ pub fn __relax_opaque_display<T>(x: &T, f: &mut Formatter<'_>) -> Result {
 /// `mode`: 0 `{:?}`, 1 `{:#?}`, 2 `{}`.
 #[doc(hidden)]
 pub unsafe fn __relax_opaque_fmt_into<T>(_x: &T, _mode: u8, _out: *mut u8, _push: unsafe extern "C-unwind" fn(*mut u8, *const u8, usize)) {
-    panic!("a provided type's Debug / Display is reached without its loader shim (run makepad host-gen)")
+    panic!("a provided type's Debug / Display is reached without its loader shim (run relax host-gen)")
 }
 
 #[doc(hidden)]

@@ -124,6 +124,8 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
     let mut session = crate::Session { options, runtime: crate::options::RuntimeOptions::from_env() };
     session.options.target = match session.options.check_target {
         crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",
+        crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
+        crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
         _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
         _ if cfg!(windows) => "x86_64-pc-windows-gnu",
         _ => "x86_64-unknown-linux-gnu",

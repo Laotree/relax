@@ -226,8 +226,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 i += 1;
                 boundary = args.get(i).map(|s| s.split(',').map(|x| x.to_string()).collect());
             }
-            // `--host-gen <crate> <out.rs>`: with --check, write provided crate <crate>'s shim
-            // file (provided.rs; `makepad host-gen`)
+            // `--host-gen <crate> <rows>`: with --check, write provided crate <crate>'s shim rows
+            // as this run's target sees it (provided.rs; a `relax host-gen` worker)
             "--host-gen" if i + 2 < args.len() => {
                 host_gen = Some((args[i + 1].replace('-', "_"), args[i + 2].clone()));
                 i += 2;
@@ -748,7 +748,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 return 2;
             };
             let errors = tcx.dcx.clone();
-            let (text, rep) = crate::provided::host_gen(&prog, &tcx, k as u32);
+            let (rows, rep) = crate::provided::host_gen(&prog, &tcx, k as u32);
+            let text = crate::provided::rows_to_text(&rows);
             errors.flush_delayed();
             let (errors, warnings) = errors.drain_reported();
             for warning in warnings { eprintln!("warning: {}", warning.message); }

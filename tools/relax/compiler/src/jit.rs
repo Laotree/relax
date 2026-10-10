@@ -7571,7 +7571,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
         let krate = u.prog.def(ad).krate;
         let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
         let Some((_, shim)) = pc.shims.get(key.as_str()) else {
-            return Err(format!("host shims are stale: no `{}` (run makepad host-gen)", key));
+            return Err(format!("host shims are stale: no `{}` (run relax host-gen)", key));
         };
         let sig = u.tcx.fn_sig(&u.prog, d).cloned().ok_or("no signature")?;
         let ps: Vec<TyId> = sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)).collect();
@@ -7597,7 +7597,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
         let key = crate::provided::opaque_method_key(&u.prog, ad, &mname);
         let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
         let Some((_, shim)) = pc.shims.get(key.as_str()) else {
-            return Err(format!("host shims are stale: no `{}` (run makepad host-gen)", key));
+            return Err(format!("host shims are stale: no `{}` (run relax host-gen)", key));
         };
         let r = u.tcx.tys.intern(TyKind::Ref(false, st, crate::types::RegionId::ERASED));
         let (ps, ret) = if is_eq { (vec![r, r], u.tcx.tys.bool_) } else { (vec![r], st) };
@@ -7650,7 +7650,7 @@ fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<crate::rir::Func>, Strin
                     Some((size, align, _)) => {
                         return Err(format!("`{}` passes `{}`, which rustc lays out in {} bytes (align {}) and Relax in {} (align {})", key, tk, size, align, l.size, l.align));
                     }
-                    None => return Err(format!("host shims are stale: no layout of `{}` for `{}` (run makepad host-gen)", tk, key)),
+                    None => return Err(format!("host shims are stale: no layout of `{}` for `{}` (run relax host-gen)", tk, key)),
                 }
             }
             let name = format!("{} (provided)", key);
@@ -7658,7 +7658,7 @@ fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<crate::rir::Func>, Strin
             let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
             Ok(crate::lower::bridge_func(u, d, name, shim, last))
         }
-        Some(_) => Err(format!("host shims are stale: `{}` changed its signature (run makepad host-gen)", key)),
+        Some(_) => Err(format!("host shims are stale: `{}` changed its signature (run relax host-gen)", key)),
         // not nameable from the crate root (host-gen skipped it): compiled from source
         None => Ok(None),
     }

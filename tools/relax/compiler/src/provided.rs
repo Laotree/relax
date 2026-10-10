@@ -3,7 +3,7 @@
 //! its source (types, signatures, generic and inline bodies) but binds its non-generic,
 //! C-shaped fns to the compiled code: each such fn gets a bridge body (lower::bridge_func) with
 //! Relax's own ABI that packs its arguments into one uniform C call,
-//! `extern "C" fn(args: *const *mut u8, ret: *mut u8) -> u32`, of a shim `makepad host-gen`
+//! `extern "C" fn(args: *const *mut u8, ret: *mut u8) -> u32`, of a shim `relax host-gen`
 //! generated into the crate (host_gen below). Callers, fn pointers and vtables need nothing
 //! else: the slot is an ordinary Relax fn.
 //!
@@ -14,7 +14,7 @@
 //!
 //! Each shim is registered under the fn's key (its path as Relax names it) with a hash of its
 //! signature as Relax sees it; a key whose hash differs is a boot error ("host shims are
-//! stale: run makepad host-gen"), never a wrong call.
+//! stale: run relax host-gen"), never a wrong call.
 
 use crate::lang_items::LangItem;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
@@ -540,9 +540,154 @@ fn rust_ty(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> Option<String> {
     }
 }
 
-/// `makepad host-gen`: the shim file of provided crate `krate` (included by the crate under
-/// `#[cfg(feature = "host-shims")]`, see the crate's lib.rs). Returns (file text, report).
-pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
+/// One item of a shim file, as one target sees the crate (`host_gen`); `host_gen_file` merges
+/// the targets' rows into the file. `def` (one item: a gate covers one) and `row` (its table entry) name their index
+/// as `IX`, numbered per section after the merge.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ShimRow {
+    pub sect: Sect,
+    pub key: String,
+    /// the item's own `#[cfg]`s (enclosing modules and items, types of its signature)
+    pub cfg: String,
+    pub def: String,
+    pub row: String,
+}
+
+/// The sections of a shim file, in file order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Sect {
+    /// `s<i>`: a bound fn's shim (SHIMS)
+    Fn,
+    /// the Hasher adapter `__RelaxHasher` (Hash shims)
+    Prelude,
+    /// `v<i>`: Clone / PartialEq / Hash / Debug / Display of an opaque type (SHIMS)
+    Trait,
+    /// `d<i>`: an opaque type's drop (TYPES)
+    Type,
+    /// a trusted type's layout (LAYOUTS)
+    Layout,
+}
+
+const IX: &str = "\u{1}";
+
+/// The targets a shim file serves (relax runs on them), each with the `cfg` predicate that
+/// gates the rows only it has. `relax host-gen` reads the crate once per target.
+pub const HOST_GEN_TARGETS: [(&str, &str); 3] = [
+    ("aarch64-apple-darwin", "all(target_os = \"macos\", target_arch = \"aarch64\")"),
+    ("x86_64-unknown-linux-gnu", "all(target_os = \"linux\", target_arch = \"x86_64\")"),
+    ("x86_64-pc-windows-gnu", "all(target_os = \"windows\", target_arch = \"x86_64\")"),
+];
+
+fn esc(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
+}
+
+fn unesc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(c) => out.push(c),
+            None => {}
+        }
+    }
+    out
+}
+
+/// One target's rows as text (a `relax host-gen` worker to its driver): a line per row.
+pub fn rows_to_text(rows: &[ShimRow]) -> String {
+    let mut out = String::new();
+    for r in rows {
+        out.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", r.sect as u8, esc(&r.key), esc(&r.cfg), esc(&r.def), esc(&r.row)));
+    }
+    out
+}
+
+pub fn rows_from_text(text: &str) -> Result<Vec<ShimRow>, String> {
+    const SECTS: [Sect; 5] = [Sect::Fn, Sect::Prelude, Sect::Trait, Sect::Type, Sect::Layout];
+    let mut rows = Vec::new();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let sect = f.first().and_then(|x| x.parse::<usize>().ok()).and_then(|i| SECTS.get(i).copied());
+        let (Some(sect), 5) = (sect, f.len()) else { return Err(format!("bad shim row: {line}")) };
+        rows.push(ShimRow { sect, key: unesc(f[1]), cfg: unesc(f[2]), def: unesc(f[3]), row: unesc(f[4]) });
+    }
+    Ok(rows)
+}
+
+/// The shim file of a provided crate from each target's rows (`targets[i]` belongs to
+/// HOST_GEN_TARGETS[i]): one file for every target, a row that only some targets have gated to
+/// them. Ordered by section and key, numbered after the merge: the same text on every machine.
+pub fn host_gen_file(targets: &[Vec<ShimRow>]) -> String {
+    let all = (1u32 << targets.len()) - 1;
+    let mut merged: std::collections::BTreeMap<ShimRow, u32> = Default::default();
+    for (t, rows) in targets.iter().enumerate() {
+        for r in rows {
+            *merged.entry(r.clone()).or_default() |= 1 << t;
+        }
+    }
+    let gate = |mask: u32| -> String {
+        if mask == all {
+            return String::new();
+        }
+        let preds: Vec<&str> = (0..targets.len()).filter(|t| mask & (1 << t) != 0).map(|t| HOST_GEN_TARGETS[t].1).collect();
+        format!("#[cfg(any({}))]\n", preds.join(", "))
+    };
+    // (section, def, table row), numbered
+    let mut items: Vec<(Sect, String, String)> = Vec::new();
+    let mut next = [0usize; 5];
+    for (r, mask) in &merged {
+        let i = next[r.sect as usize];
+        next[r.sect as usize] += 1;
+        let pre = format!("{}{}", gate(*mask), r.cfg);
+        let def = if r.def.is_empty() { String::new() } else { format!("{pre}{}", r.def.replace(IX, &i.to_string())) };
+        let row = if r.row.is_empty() { String::new() } else { format!("{pre}{}", r.row.replace(IX, &i.to_string())) };
+        items.push((r.sect, def, row));
+    }
+    let mut out = String::new();
+    out.push_str("// @generated by `relax host-gen` (Relax provided crates, loader-core.md section 8). Do not edit.\n");
+    out.push_str("// One file for every target relax runs on (aarch64-apple-darwin, x86_64-unknown-linux-gnu,\n");
+    out.push_str("// x86_64-pc-windows-gnu): a row only some targets have is cfg-gated to them.\n");
+    out.push_str("// One C shim per bound fn: arguments moved out of args[i] (types inferred from the call),\n");
+    out.push_str("// the result written to ret; 0 = returned, 1 = panicked (text: __host_last_panic).\n");
+    out.push_str("#![allow(unused_unsafe, unused_variables, clippy::all)]\n\n");
+    out.push_str("thread_local! { static LAST_PANIC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }\n\n");
+    out.push_str("fn caught(p: Box<dyn std::any::Any + Send>) -> u32 {\n");
+    out.push_str("    let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| \"panic\".to_string());\n");
+    out.push_str("    LAST_PANIC.with(|l| *l.borrow_mut() = msg);\n    1\n}\n\n");
+    out.push_str("pub unsafe extern \"C\" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize) {\n");
+    out.push_str("    LAST_PANIC.with(|l| { let l = l.borrow(); *ptr = l.as_ptr(); *len = l.len(); });\n}\n\n");
+    let section = |out: &mut String, sects: &[Sect], defs: bool| {
+        for (sect, def, row) in &items {
+            if sects.contains(sect) {
+                out.push_str(if defs { def } else { row });
+            }
+        }
+    };
+    section(&mut out, &[Sect::Fn, Sect::Prelude, Sect::Trait, Sect::Type], true);
+    out.push_str("\npub static TYPES: &[(&str, u64, u64, Option<unsafe extern \"C\" fn(*mut u8)>)] = &[\n");
+    section(&mut out, &[Sect::Type], false);
+    out.push_str("];\n");
+    out.push_str("\npub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[\n");
+    section(&mut out, &[Sect::Layout], false);
+    out.push_str("];\n");
+    out.push_str("\npub static SHIMS: &[(&str, u64, unsafe extern \"C\" fn(*const *mut u8, *mut u8) -> u32)] = &[\n");
+    section(&mut out, &[Sect::Fn, Sect::Trait], false);
+    out.push_str("];\n");
+    out
+}
+
+/// `relax host-gen`: provided crate `krate`'s shim rows as this run's target sees the crate
+/// (the file is `host_gen_file` of every target's rows, included by the crate under
+/// `#[cfg(feature = "host-shims")]`, see the crate's lib.rs). Returns (rows, report). Which fns
+/// get a shim is decided in the first loop (`unbound_reason`, then nameability).
+pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (Vec<ShimRow>, String) {
     let mut fns: Vec<(String, u64, String, usize, bool, String)> = Vec::new();
     let mut why: HashMap<&'static str, usize> = HashMap::new();
     let mut unshaped: Vec<String> = Vec::new();
@@ -607,35 +752,23 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     }
     fns.sort();
     fns.dedup_by(|a, b| a.0 == b.0);
-    let mut out = String::new();
-    out.push_str("// @generated by `makepad host-gen` (Relax provided crates, loader-core.md section 8). Do not edit.\n");
-    out.push_str("// One C shim per bound fn: arguments moved out of args[i] (types inferred from the call),\n");
-    out.push_str("// the result written to ret; 0 = returned, 1 = panicked (text: __host_last_panic).\n");
-    out.push_str("#![allow(unused_unsafe, unused_variables, clippy::all)]\n\n");
-    out.push_str("thread_local! { static LAST_PANIC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }\n\n");
-    out.push_str("fn caught(p: Box<dyn std::any::Any + Send>) -> u32 {\n");
-    out.push_str("    let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| \"panic\".to_string());\n");
-    out.push_str("    LAST_PANIC.with(|l| *l.borrow_mut() = msg);\n    1\n}\n\n");
-    out.push_str("pub unsafe extern \"C\" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize) {\n");
-    out.push_str("    LAST_PANIC.with(|l| { let l = l.borrow(); *ptr = l.as_ptr(); *len = l.len(); });\n}\n\n");
-    for (i, (_, _, path, n, never, cfg)) in fns.iter().enumerate() {
-        out.push_str(cfg);
-        out.push_str(&format!("unsafe extern \"C\" fn s{}(a: *const *mut u8, r: *mut u8) -> u32 {{\n", i));
+    let mut rows: Vec<ShimRow> = Vec::new();
+    for (key, hash, path, n, never, cfg) in &fns {
         let args: Vec<String> = (0..*n).map(|k| format!("std::ptr::read(*a.add({}) as *const _)", k)).collect();
-        if *never {
+        let call = format!("{}({})", path, args.join(", "));
+        let body = if *never {
             // diverges: returns only by panicking
-            out.push_str(&format!(
-                "    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> () {{ unsafe {{ {}({}) }} }})) {{ Ok(()) => 0, Err(p) => caught(p) }}\n}}\n",
-                path,
-                args.join(", ")
-            ));
-            continue;
-        }
-        out.push_str(&format!(
-            "    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {}({}) }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n",
-            path,
-            args.join(", ")
-        ));
+            format!("    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> () {{ unsafe {{ {call} }} }})) {{ Ok(()) => 0, Err(p) => caught(p) }}\n}}\n")
+        } else {
+            format!("    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n")
+        };
+        rows.push(ShimRow {
+            sect: Sect::Fn,
+            key: key.clone(),
+            cfg: cfg.clone(),
+            def: format!("unsafe extern \"C\" fn s{IX}(a: *const *mut u8, r: *mut u8) -> u32 {{\n{body}"),
+            row: format!("    ({:?}, 0x{:016x}, s{IX}),\n", key, hash),
+        });
     }
     // opaque types: rustc's size/align and drop
     // opaque only what crosses (a type no bound fn reaches is Relax's alone)
@@ -699,33 +832,32 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
         }
     }
     if hasher_used {
-        out.push_str("struct __RelaxHasher(*mut u8, unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize));\n");
-        out.push_str("impl ::core::hash::Hasher for __RelaxHasher {\n    fn write(&mut self, b: &[u8]) { unsafe { (self.1)(self.0, b.as_ptr(), b.len()) } }\n    fn finish(&self) -> u64 { 0 }\n}\n\n");
+        // two items, two rows: a target gate covers one item
+        for (key, def) in [
+            ("__RelaxHasher", "struct __RelaxHasher(*mut u8, unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize));\n"),
+            ("__RelaxHasher::Hasher", "impl ::core::hash::Hasher for __RelaxHasher {\n    fn write(&mut self, b: &[u8]) { unsafe { (self.1)(self.0, b.as_ptr(), b.len()) } }\n    fn finish(&self) -> u64 { 0 }\n}\n"),
+        ] {
+            rows.push(ShimRow { sect: Sect::Prelude, key: key.to_string(), cfg: String::new(), def: def.to_string(), row: String::new() });
+        }
     }
-    opaque_trait_shims.sort();
-    for (i, (_, call, cfg)) in opaque_trait_shims.iter().enumerate() {
-        out.push_str(cfg);
-        out.push_str(&format!(
-            "unsafe extern \"C\" fn v{}(a: *const *mut u8, r: *mut u8) -> u32 {{\n    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {} }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n",
-            i, call
-        ));
+    for (key, call, cfg) in &opaque_trait_shims {
+        rows.push(ShimRow {
+            sect: Sect::Trait,
+            key: key.clone(),
+            cfg: cfg.clone(),
+            def: format!("unsafe extern \"C\" fn v{IX}(a: *const *mut u8, r: *mut u8) -> u32 {{\n    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {call} }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n"),
+            row: format!("    ({:?}, 0, v{IX}),\n", key),
+        });
     }
-    for (i, (_, p, d)) in tys.iter().enumerate() {
-        out.push_str(&item_cfg(prog, *d));
-        out.push_str(&format!(
-            "unsafe extern \"C\" fn d{}(p: *mut u8) {{ let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ std::ptr::drop_in_place(p as *mut {}) }})); }}\n",
-            i, p
-        ));
+    for (k, p, d) in &tys {
+        rows.push(ShimRow {
+            sect: Sect::Type,
+            key: k.clone(),
+            cfg: item_cfg(prog, *d),
+            def: format!("unsafe extern \"C\" fn d{IX}(p: *mut u8) {{ let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ std::ptr::drop_in_place(p as *mut {p}) }})); }}\n"),
+            row: format!("    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, if std::mem::needs_drop::<{p}>() {{ Some(d{IX}) }} else {{ None }}),\n", k),
+        });
     }
-    out.push_str("\npub static TYPES: &[(&str, u64, u64, Option<unsafe extern \"C\" fn(*mut u8)>)] = &[\n");
-    for (i, (k, p, d)) in tys.iter().enumerate() {
-        out.push_str(&item_cfg(prog, *d));
-        out.push_str(&format!(
-            "    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, if std::mem::needs_drop::<{p}>() {{ Some(d{i}) }} else {{ None }}),\n",
-            k
-        ));
-    }
-    out.push_str("];\n");
     // trusted types: rustc's size/align, checked by Relax at unit creation
     // (key, rust path, field names for offset_of! -- empty: size/align only)
     let mut lays: Vec<(String, String, Vec<String>, String)> = Vec::new();
@@ -765,24 +897,17 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     lays.extend(dep_lays.into_iter().map(|(k, p, cfg)| (k, p, Vec::new(), cfg)));
     lays.sort();
     lays.dedup_by(|a, b| a.0 == b.0);
-    out.push_str("\npub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[\n");
     for (k, p, names, cfg) in &lays {
-        out.push_str(cfg);
         let offs: Vec<String> = names.iter().map(|n| format!("std::mem::offset_of!({p}, {n}) as u64")).collect();
-        out.push_str(&format!("    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, &[{}]),\n", k, offs.join(", ")));
+        rows.push(ShimRow {
+            sect: Sect::Layout,
+            key: k.clone(),
+            cfg: cfg.clone(),
+            def: String::new(),
+            row: format!("    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, &[{}]),\n", k, offs.join(", ")),
+        });
     }
-    out.push_str("];\n");
     let _ = unchecked_offsets;
-    out.push_str("\npub static SHIMS: &[(&str, u64, unsafe extern \"C\" fn(*const *mut u8, *mut u8) -> u32)] = &[\n");
-    for (i, (k, h, _, _, _, cfg)) in fns.iter().enumerate() {
-        out.push_str(cfg);
-        out.push_str(&format!("    ({:?}, 0x{:016x}, s{}),\n", k, h, i));
-    }
-    for (i, (k, _, cfg)) in opaque_trait_shims.iter().enumerate() {
-        out.push_str(cfg);
-        out.push_str(&format!("    ({:?}, 0, v{}),\n", k, i));
-    }
-    out.push_str("];\n");
     let mut rep = format!("host-gen {}: {} fns bound, {} opaque types", prog.syms.str(prog.crates[krate as usize].name), fns.len(), tys.len());
     let mut w: Vec<_> = why.into_iter().collect();
     w.sort_by(|a, b| b.1.cmp(&a.1));
@@ -798,7 +923,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     for k in unshaped {
         rep.push_str(&format!("\n  not C-shaped (compiled from source; may not read the crate's opaque fields): {}", k));
     }
-    (out, rep)
+    (rows, rep)
 }
 
 /// The types whose values cross between the provided crates' rustc code and Relax-compiled code:

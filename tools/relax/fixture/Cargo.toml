@@ -8,7 +8,7 @@ publish = false
 default-run = "relax-provided-fixture"
 
 [features]
-# the generated shims (src/host_shims.rs, `makepad host-gen`); only the loader enables it
+# the generated shims (src/host_shims.rs, `relax host-gen`); only the loader enables it
 host-shims = []
 
 [lib]

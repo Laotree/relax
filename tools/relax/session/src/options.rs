@@ -8,7 +8,18 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, WindowsX64 }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64 }
+impl CheckTarget {
+    /// The targets Relax runs on (and checks for), by triple: `RELAX_CHECK_TARGET` and `relax host-gen`.
+    pub const TRIPLES: [(&'static str, CheckTarget); 3] = [
+        ("aarch64-apple-darwin", CheckTarget::MacosArm64),
+        ("x86_64-unknown-linux-gnu", CheckTarget::LinuxX64),
+        ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
+    ];
+    pub fn from_triple(triple: &str) -> Option<CheckTarget> {
+        Self::TRIPLES.iter().find(|(t, _)| *t == triple).map(|(_, c)| *c)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ctfe { Off, Check, On }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,7 +395,7 @@ impl Options {
             a64: { let os = get("RELAX_A64"); let v = os.and_then(|v| v.into_string().ok()); split(v) },
             borrowck: { let os = get("RELAX_BORROWCK"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("off") => Borrowck::Off, Some("moves") => Borrowck::Moves, _ => Borrowck::Full } },
             borrowck_all: { let os = get("RELAX_BORROWCK_ALL"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("nongeneric") => BorrowckAll::Nongeneric, None => BorrowckAll::Default, Some("std") => BorrowckAll::Std, _ => BorrowckAll::All } },
-            check_target: { let os = get("RELAX_CHECK_TARGET"); let v = os.and_then(|v| v.into_string().ok()); if v.as_deref() == Some("x86_64-pc-windows-gnu") { CheckTarget::WindowsX64 } else { CheckTarget::Host } },
+            check_target: { let os = get("RELAX_CHECK_TARGET"); let v = os.and_then(|v| v.into_string().ok()); CheckTarget::from_triple(v.as_deref().unwrap_or("")).unwrap_or(CheckTarget::Host) },
             ctfe: { let os = get("RELAX_CTFE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Ctfe::Off, Some("check") => Ctfe::Check, _ => Ctfe::On } },
             freq_mode: { let os = get("RELAX_FREQ_MODE"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("sampled") => Frequency::Sampled, Some("static") => Frequency::Static, _ => Frequency::Blend } },
             ra_prio: { let os = get("RELAX_RA_PRIO"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("len") => Priority::Length, Some("sqrt") => Priority::Sqrt, _ => Priority::References } },

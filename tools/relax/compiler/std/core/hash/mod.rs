@@ -524,7 +524,7 @@ pub fn __relax_opaque_hash<T, H: Hasher>(x: &T, state: &mut H) {
 
 #[doc(hidden)]
 pub unsafe fn __relax_opaque_hash_into<T>(_x: &T, _state: *mut u8, _write: unsafe extern "C-unwind" fn(*mut u8, *const u8, usize)) {
-    panic!("a provided type's Hash is reached without its loader shim (run makepad host-gen)")
+    panic!("a provided type's Hash is reached without its loader shim (run relax host-gen)")
 }
 
 #[doc(hidden)]
