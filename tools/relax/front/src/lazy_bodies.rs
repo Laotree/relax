@@ -6,8 +6,9 @@
 //! base tokens the parse changes in place (`>>` split by eat_gt, restored by a macro fragment
 //! match). Every read sees exactly what one contiguous copy of base + suffix would hold.
 use super::*;
+use crate::packed::PackedToks;
 use std::cmp::Ordering;
-use std::ops::{Index, IndexMut, Range};
+use std::ops::{Index, Range};
 
 /// slice::binary_search_by over the array `at(0)..at(len)`, step for step as std does it: an
 /// array read in two parts (or with changed elements) answers exactly as one contiguous copy
@@ -188,9 +189,10 @@ impl<T> Index<usize> for SegRef<'_, T> {
 }
 
 /// Token sequences the parser's helpers read: a slice, or the parser's `Toks`.
-pub trait TokSeq: Index<usize, Output = Tok> {
+pub trait TokSeq {
     fn len(&self) -> usize;
-    fn get(&self, i: usize) -> Option<&Tok>;
+    fn at(&self, i: usize) -> Tok;
+    fn get(&self, i: usize) -> Option<Tok>;
     /// Tokens [lo, hi) (None: out of range, as slice::get)
     fn slice(&self, lo: usize, hi: usize) -> Option<std::borrow::Cow<'_, [Tok]>>;
 }
@@ -199,7 +201,9 @@ impl TokSeq for [Tok] {
     #[inline]
     fn len(&self) -> usize { <[Tok]>::len(self) }
     #[inline]
-    fn get(&self, i: usize) -> Option<&Tok> { <[Tok]>::get(self, i) }
+    fn at(&self, i: usize) -> Tok { self[i] }
+    #[inline]
+    fn get(&self, i: usize) -> Option<Tok> { <[Tok]>::get(self, i).copied() }
     fn slice(&self, lo: usize, hi: usize) -> Option<std::borrow::Cow<'_, [Tok]>> { <[Tok]>::get(self, lo..hi).map(std::borrow::Cow::Borrowed) }
 }
 
@@ -207,61 +211,147 @@ impl TokSeq for Vec<Tok> {
     #[inline]
     fn len(&self) -> usize { Vec::len(self) }
     #[inline]
-    fn get(&self, i: usize) -> Option<&Tok> { <[Tok]>::get(self, i) }
+    fn at(&self, i: usize) -> Tok { self[i] }
+    #[inline]
+    fn get(&self, i: usize) -> Option<Tok> { <[Tok]>::get(self, i).copied() }
     fn slice(&self, lo: usize, hi: usize) -> Option<std::borrow::Cow<'_, [Tok]>> { <[Tok]>::get(self, lo..hi).map(std::borrow::Cow::Borrowed) }
 }
 
-/// The parser's token array: a `Seg` of tokens, plus the base tokens this parse changed in
-/// place (index -> token; `patched` marks them, one bit per base token).
+impl TokSeq for PackedToks {
+    #[inline]
+    fn len(&self) -> usize { PackedToks::len(self) }
+    #[inline]
+    fn at(&self, i: usize) -> Tok { PackedToks::at(self, i) }
+    #[inline]
+    fn get(&self, i: usize) -> Option<Tok> { PackedToks::get(self, i) }
+    fn slice(&self, lo: usize, hi: usize) -> Option<std::borrow::Cow<'_, [Tok]>> { (lo <= hi && hi <= self.len()).then(|| std::borrow::Cow::Owned(self.range(lo, hi))) }
+}
+
+/// What a parse's token array continues: nothing, tokens of a working array, or a published
+/// file's packed tokens (read in place).
+#[derive(Clone, Copy, Default)]
+enum TokBase<'a> {
+    #[default]
+    None,
+    Slice(&'a [Tok]),
+    Packed(&'a PackedToks),
+}
+
+impl TokBase<'_> {
+    #[inline]
+    fn len(&self) -> usize {
+        match self {
+            TokBase::None => 0,
+            TokBase::Slice(s) => s.len(),
+            TokBase::Packed(p) => p.len(),
+        }
+    }
+    #[inline]
+    fn at(&self, i: usize) -> Tok {
+        match self {
+            TokBase::None => unreachable!(),
+            TokBase::Slice(s) => s[i],
+            TokBase::Packed(p) => p.at(i),
+        }
+    }
+}
+
+/// The parser's token array: the tokens of a published file (or of a working array) it
+/// continues, then the tokens this parse appended, plus the base tokens this parse changed in
+/// place (index -> token; `patched` marks them, one bit per base token). Tokens are read by
+/// value: a packed base has no `Tok` to lend.
 #[derive(Default)]
 pub struct Toks<'a> {
-    seg: Seg<'a, Tok>,
+    base: TokBase<'a>,
+    own: Vec<Tok>,
     patched: Vec<u64>,
     patches: crate::fxhash::HashMap<u32, Tok>,
 }
 
 impl From<Vec<Tok>> for Toks<'_> {
-    fn from(v: Vec<Tok>) -> Self { Self { seg: v.into(), ..Default::default() } }
+    fn from(v: Vec<Tok>) -> Self { Self { own: v, ..Default::default() } }
 }
 
 impl<'a> From<&'a [Tok]> for Toks<'a> {
-    fn from(base: &'a [Tok]) -> Self { Self { seg: Seg::on(base), ..Default::default() } }
+    fn from(base: &'a [Tok]) -> Self { Self { base: TokBase::Slice(base), ..Default::default() } }
+}
+
+impl<'a> From<&'a PackedToks> for Toks<'a> {
+    fn from(base: &'a PackedToks) -> Self { Self { base: TokBase::Packed(base), ..Default::default() } }
 }
 
 impl<'a> Toks<'a> {
     #[inline]
-    pub fn len(&self) -> usize { self.seg.len() }
+    pub fn len(&self) -> usize { self.base.len() + self.own.len() }
     #[inline]
-    pub fn is_empty(&self) -> bool { self.seg.is_empty() }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
     #[inline]
-    pub fn get(&self, i: usize) -> Option<&Tok> { (i < self.len()).then(|| &self[i]) }
-    pub fn last(&self) -> Option<&Tok> { self.len().checked_sub(1).map(|i| &self[i]) }
+    pub fn get(&self, i: usize) -> Option<Tok> { (i < self.len()).then(|| self.at(i)) }
+    pub fn last(&self) -> Option<Tok> { self.len().checked_sub(1).map(|i| self.at(i)) }
     #[inline]
-    pub fn push(&mut self, t: Tok) { self.seg.push(t) }
-    pub fn base_len(&self) -> usize { self.seg.base.len() }
+    pub fn push(&mut self, t: Tok) { self.own.push(t) }
+    pub fn base_len(&self) -> usize { self.base.len() }
     /// The tokens this parse appended (the whole array when it continues nothing).
-    pub fn into_own(self) -> Vec<Tok> { self.seg.into_own() }
+    pub fn into_own(self) -> Vec<Tok> { self.own }
     /// The whole array as one slice: only a parse that continues no published file has it.
     pub fn as_slice(&self) -> &[Tok] {
-        assert!(self.seg.base.is_empty(), "Toks::as_slice on a parse continuing a published file");
-        &self.seg.own
+        assert!(self.base.len() == 0, "Toks::as_slice on a parse continuing a published file");
+        &self.own
     }
-    /// Tokens [lo, hi) (borrowed unless they include a changed base token).
+    /// Token `i`.
+    #[inline]
+    pub fn at(&self, i: usize) -> Tok {
+        let nb = self.base.len();
+        if i >= nb {
+            return self.own[i - nb];
+        }
+        if !self.patches.is_empty() && self.is_patched(i) {
+            return self.patches[&(i as u32)];
+        }
+        self.base.at(i)
+    }
+    /// Changes token `i` in place (a base token's original stays in the base).
+    #[inline]
+    pub fn edit(&mut self, i: usize, f: impl FnOnce(&mut Tok)) {
+        let nb = self.base.len();
+        if i >= nb {
+            return f(&mut self.own[i - nb]);
+        }
+        if self.patched.is_empty() {
+            self.patched = vec![0; nb.div_ceil(64)];
+        }
+        self.patched[i / 64] |= 1 << (i % 64);
+        let base = self.base.at(i);
+        f(self.patches.entry(i as u32).or_insert(base))
+    }
+    /// Tokens [lo, hi) (borrowed unless they include a base token or a changed base token).
     pub fn range(&self, lo: usize, hi: usize) -> std::borrow::Cow<'_, [Tok]> {
-        let nb = self.seg.base.len();
+        let nb = self.base.len();
         if lo >= nb {
-            return std::borrow::Cow::Borrowed(&self.seg.own[lo - nb..hi - nb]);
+            return std::borrow::Cow::Borrowed(&self.own[lo - nb..hi - nb]);
         }
-        if hi <= nb && (self.patches.is_empty() || !(lo..hi).any(|i| self.is_patched(i))) {
-            return std::borrow::Cow::Borrowed(&self.seg.base[lo..hi]);
+        if let TokBase::Slice(s) = self.base {
+            if hi <= nb && (self.patches.is_empty() || !(lo..hi).any(|i| self.is_patched(i))) {
+                return std::borrow::Cow::Borrowed(&s[lo..hi]);
+            }
         }
-        std::borrow::Cow::Owned((lo..hi).map(|i| self[i]).collect())
+        std::borrow::Cow::Owned((lo..hi).map(|i| self.at(i)).collect())
     }
-    pub fn iter(&self) -> impl Iterator<Item = &Tok> + '_ { (0..self.len()).map(move |i| &self[i]) }
+    pub fn iter(&self) -> impl Iterator<Item = Tok> + '_ { (0..self.len()).map(move |i| self.at(i)) }
     /// slice::partition_point over the tokens
-    pub fn partition_point(&self, pred: impl FnMut(&Tok) -> bool) -> usize {
-        if self.seg.base.is_empty() { return self.seg.own.partition_point(pred); }
-        partition_at(self.len(), |i| &self[i], pred)
+    pub fn partition_point(&self, mut pred: impl FnMut(&Tok) -> bool) -> usize {
+        if self.base.len() == 0 { return self.own.partition_point(pred); }
+        // std's search, step for step, over the tokens as they read now
+        let mut size = self.len();
+        if size == 0 { return 0; }
+        let mut base = 0usize;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            if pred(&self.at(mid)) { base = mid; }
+            size -= half;
+        }
+        base + pred(&self.at(base)) as usize
     }
     #[inline]
     fn is_patched(&self, i: usize) -> bool { self.patched.get(i / 64).is_some_and(|w| w >> (i % 64) & 1 != 0) }
@@ -271,39 +361,10 @@ impl TokSeq for Toks<'_> {
     #[inline]
     fn len(&self) -> usize { Toks::len(self) }
     #[inline]
-    fn get(&self, i: usize) -> Option<&Tok> { Toks::get(self, i) }
+    fn at(&self, i: usize) -> Tok { Toks::at(self, i) }
+    #[inline]
+    fn get(&self, i: usize) -> Option<Tok> { Toks::get(self, i) }
     fn slice(&self, lo: usize, hi: usize) -> Option<std::borrow::Cow<'_, [Tok]>> { (lo <= hi && hi <= self.len()).then(|| self.range(lo, hi)) }
-}
-
-impl Index<usize> for Toks<'_> {
-    type Output = Tok;
-    #[inline]
-    fn index(&self, i: usize) -> &Tok {
-        let nb = self.seg.base.len();
-        if i >= nb {
-            return &self.seg.own[i - nb];
-        }
-        if !self.patches.is_empty() && self.is_patched(i) {
-            return &self.patches[&(i as u32)];
-        }
-        &self.seg.base[i]
-    }
-}
-
-impl IndexMut<usize> for Toks<'_> {
-    #[inline]
-    fn index_mut(&mut self, i: usize) -> &mut Tok {
-        let nb = self.seg.base.len();
-        if i >= nb {
-            return &mut self.seg.own[i - nb];
-        }
-        if self.patched.is_empty() {
-            self.patched = vec![0; nb.div_ceil(64)];
-        }
-        self.patched[i / 64] |= 1 << (i % 64);
-        let base = self.seg.base[i];
-        self.patches.entry(i as u32).or_insert(base)
-    }
 }
 
 /// The parser's tokens and text as cfg evaluation reads them (cfg::Src): plain slices while
@@ -321,15 +382,15 @@ impl<'b> TokView<'b> {
         Self { src, toks, ext: ext.view() }
     }
     pub fn src(&self) -> crate::cfg::Src<'_> {
-        if self.toks.seg.base.is_empty() && self.ext.base.is_empty() {
-            return crate::cfg::Src { src: self.src, toks: &self.toks.seg.own, ext: self.ext.own, ptoks: &[], parts: None };
+        if self.toks.base.len() == 0 && self.ext.base.is_empty() {
+            return crate::cfg::Src { src: self.src, plain: &self.toks.own, ext: self.ext.own, parts: None };
         }
-        crate::cfg::Src { src: self.src, toks: &[], ext: &[], ptoks: &[], parts: Some(self) }
+        crate::cfg::Src { src: self.src, plain: &[], ext: &[], parts: Some(self) }
     }
 }
 
 impl crate::cfg::SourceTokens for TokView<'_> {
-    fn token(&self, i: u32) -> Tok { self.toks[i as usize] }
+    fn token(&self, i: u32) -> Tok { self.toks.at(i as usize) }
     /// As cfg::tok_str reads a plain view: clamped, text past the source in `ext`.
     fn bytes(&self, lo: u32, hi: u32) -> &[u8] {
         let (lo, hi, b, n) = (lo as usize, hi as usize, self.src.len(), self.ext.len());
@@ -378,19 +439,23 @@ mod tests {
                 }
                 let toks: Vec<Tok> = v.iter().map(|x| Tok { kind: crate::lexer::T::Ident, lo: x.0, hi: x.0 + 1 }).collect();
                 for cut in 0..=len {
-                    let mut t = Toks::from(&toks[..cut]);
-                    for &x in &toks[cut..] { t.push(x); }
-                    let mut whole = toks.clone();
-                    if cut > 1 {
-                        // a changed base token (eat_gt) is read back as changed
-                        t[cut / 2].lo += 3;
-                        whole[cut / 2].lo += 3;
+                    // the base is a working slice, or the file's packed tokens
+                    let packed = PackedToks::encode(&toks[..cut]);
+                    for use_packed in [false, true] {
+                        let mut t = if use_packed { Toks::from(&packed) } else { Toks::from(&toks[..cut]) };
+                        for &x in &toks[cut..] { t.push(x); }
+                        let mut whole = toks.clone();
+                        if cut > 1 {
+                            // a changed base token (eat_gt) is read back as changed
+                            t.edit(cut / 2, |x| x.lo += 3);
+                            whole[cut / 2].lo += 3;
+                        }
+                        for key in 0..12 {
+                            assert_eq!(t.partition_point(|x| x.lo <= key), whole.partition_point(|x| x.lo <= key));
+                        }
+                        assert_eq!(&t.range(0, len)[..], &whole[..]);
+                        assert_eq!(t.into_own(), toks[cut..].to_vec());
                     }
-                    for key in 0..12 {
-                        assert_eq!(t.partition_point(|x| x.lo <= key), whole.partition_point(|x| x.lo <= key));
-                    }
-                    assert_eq!(&t.range(0, len)[..], &whole[..]);
-                    assert_eq!(t.into_own(), toks[cut..].to_vec());
                 }
             }
         }

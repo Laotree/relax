@@ -254,7 +254,7 @@ fn str_lit(src: &[u8], lo: u32, hi: u32) -> String {
 
 /// `#[path = "x"]` and `#[cfg_attr(.., path = "x")]` values of an attribute list.
 fn path_attrs(p: &ParsedFile, attrs: &[Attr], cfg: &crate::cfg::CfgSet, out: &mut Vec<String>) {
-    path_attrs_cfg(crate::cfg::Src { src: &p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, attrs, cfg, out)
+    path_attrs_cfg(p.src_view(), attrs, cfg, out)
 }
 
 /// The `#[path = ".."]` of an item after cfg_attr expansion for `cfg` (libc picks its per-arch
@@ -277,10 +277,10 @@ pub fn path_attrs_src(p: crate::cfg::Src, attrs: &[Attr], out: &mut Vec<String>)
         let hi = a.toks.hi as usize;
         let mut i = lo;
         while i + 2 < hi {
-            let t = p.toks[i];
+            let t = p.tok(i);
             if t.kind == T::Ident && &p.src[t.lo as usize..t.hi as usize] == b"path" {
-                if p.toks[i + 1].kind == T::Eq && p.toks[i + 2].kind == T::Str {
-                    let s = p.toks[i + 2];
+                if p.tok(i + 1).kind == T::Eq && p.tok(i + 2).kind == T::Str {
+                    let s = p.tok(i + 2);
                     out.push(str_lit(p.src, s.lo, s.hi));
                 }
             }
@@ -365,7 +365,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
                         };
                         let base_dir = dir_of(&job.path).to_string();
                         let cfg = &cfgs[job.crate_idx as usize];
-                        let act = job.active && crate::cfg::active(crate::cfg::Src { src: &p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, &p.ast.root_attrs, cfg);
+                        let act = job.active && crate::cfg::active(p.src_view(), &p.ast.root_attrs, cfg);
                         collect_mods(&p, cfg, act, &p.ast.root_items, &job.path, &child_dir, &base_dir, true, &mut found);
                     }
                     Err(message) => err = Some(message),
@@ -419,7 +419,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
 fn collect_mods(p: &ParsedFile, cfg: &crate::cfg::CfgSet, active: bool, items: &[ItemId], file: &str, child_dir: &str, base_dir: &str, top: bool, out: &mut Vec<(Vec<String>, bool, bool)>) {
     for &id in items {
         let it = p.ast.item(id);
-        let act = active && crate::cfg::active(crate::cfg::Src { src: &p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, p.ast.list(it.attrs), cfg);
+        let act = active && crate::cfg::active(p.src_view(), p.ast.list(it.attrs), cfg);
         if let ItemKind::Mod(body) = &it.kind {
             let name = String::from_utf8_lossy(&p.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
             let name = match name.strip_prefix("r#") {

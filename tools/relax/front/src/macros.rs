@@ -1814,7 +1814,7 @@ fn tvars_of(nodes: &[TNode], out: &mut Vec<String>) {
 
 impl<'a> Parser<'a> {
     fn mtok_eq(&self, i: usize, m: &MTok) -> bool {
-        let t = self.toks[i];
+        let t = self.toks.at(i);
         if t.kind != m.kind {
             return false;
         }
@@ -1829,7 +1829,7 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         let mut j = i;
         while j < end {
-            let k = self.toks[j].kind;
+            let k = self.toks.at(j).kind;
             if is_open(k) {
                 depth += 1;
             } else if is_close(k) {
@@ -1848,10 +1848,10 @@ impl<'a> Parser<'a> {
         if i > end {
             return None;
         }
-        let k = if i < end { self.toks[i].kind } else { T::Eof };
+        let k = if i < end { self.toks.at(i).kind } else { T::Eof };
         match f {
             Frag::Ident => {
-                if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks[i]) != b"_" {
+                if i < end && (matches!(k, T::Ident | T::RawIdent) || (T::KwAs as u8..=T::KwTry as u8).contains(&(k as u8))) && self.tok_text(self.toks.at(i)) != b"_" {
                     Some(i + 1)
                 } else {
                     None
@@ -1860,10 +1860,10 @@ impl<'a> Parser<'a> {
             Frag::Lifetime => (i < end && k == T::Lifetime).then_some(i + 1),
             Frag::Literal => {
                 let mut j = i;
-                if j < end && self.toks[j].kind == T::Minus {
+                if j < end && self.toks.at(j).kind == T::Minus {
                     j += 1;
                 }
-                if j < end && matches!(self.toks[j].kind, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse) {
+                if j < end && matches!(self.toks.at(j).kind, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse) {
                     Some(j + 1)
                 } else {
                     None
@@ -1890,7 +1890,7 @@ impl<'a> Parser<'a> {
             }
             Frag::Vis => {
                 if i < end && k == T::KwPub {
-                    if i + 1 < end && self.toks[i + 1].kind == T::OpenParen {
+                    if i + 1 < end && self.toks.at(i + 1).kind == T::OpenParen {
                         return self.tok_close_of(i + 1, end).map(|c| c + 1);
                     }
                     return Some(i + 1);
@@ -1923,7 +1923,7 @@ impl<'a> Parser<'a> {
                 while self.tok_undo.len() > undo {
                     let (k, t) = self.tok_undo.pop().unwrap();
                     if (k as usize) < e {
-                        self.toks[k as usize] = t;
+                        self.toks.edit(k as usize, |x| *x = t);
                     }
                 }
                 match r {
@@ -1944,7 +1944,7 @@ impl<'a> Parser<'a> {
                     *i += 1;
                 }
                 MNode::Group(open, _, inner) => {
-                    if *i >= end || self.toks[*i].kind != open.kind {
+                    if *i >= end || self.toks.at(*i).kind != open.kind {
                         return false;
                     }
                     let c = match self.tok_close_of(*i, end) {
@@ -2030,7 +2030,7 @@ impl<'a> Parser<'a> {
                             out.push("(", None, u32::MAX);
                         }
                         for k in *lo..*hi {
-                            let t = self.toks[k];
+                            let t = self.toks.at(k);
                             out.push(&String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
                         }
                         if wrap {

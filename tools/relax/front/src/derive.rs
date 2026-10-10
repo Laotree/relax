@@ -111,11 +111,11 @@ impl<'a> Parser<'a> {
     fn rust_attr_expr(&self, attrs: &[Attr]) -> Option<String> {
         for a in attrs {
             let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            if hi < lo + 3 || self.tok_text(self.toks[lo]) != b"rust" || self.tok_text(self.toks[lo + 1]) != b"(" {
+            if hi < lo + 3 || self.tok_text(self.toks.at(lo)) != b"rust" || self.tok_text(self.toks.at(lo + 1)) != b"(" {
                 continue;
             }
-            let (s, e) = (self.toks[lo + 2].lo, self.toks[hi - 2].hi);
-            if self.tok_text(self.toks[hi - 1]) != b")" || e <= s {
+            let (s, e) = (self.toks.at(lo + 2).lo, self.toks.at(hi - 2).hi);
+            if self.tok_text(self.toks.at(hi - 1)) != b")" || e <= s {
                 continue;
             }
             return Some(String::from_utf8_lossy(self.bytes(s, e)).into_owned());
@@ -140,16 +140,16 @@ impl<'a> Parser<'a> {
         let mut wanted: Vec<&'static str> = Vec::new();
         for a in self.ast.list(it.attrs) {
             let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            if hi <= lo || self.tok_text(self.toks[lo]) != b"derive" {
+            if hi <= lo || self.tok_text(self.toks.at(lo)) != b"derive" {
                 continue;
             }
             for i in lo + 1..hi {
-                let t = self.toks[i];
+                let t = self.toks.at(i);
                 if t.kind != T::Ident {
                     continue;
                 }
                 // last segment of a path (`fmt::Debug`): followed by `,` or `)`
-                if i + 1 < hi && self.toks[i + 1].kind == T::PathSep {
+                if i + 1 < hi && self.toks.at(i + 1).kind == T::PathSep {
                     continue;
                 }
                 let n = self.tok_text(t);
@@ -176,7 +176,7 @@ impl<'a> Parser<'a> {
         wanted.retain(|tr| !matches!(*tr, "Clone" | "Copy" | "Eq" | "PartialEq"));
         if wanted.is_empty() { return Ok(()); }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "derive-builtin", &wanted.join(","));
-        let lo = self.ast.list(it.attrs).iter().map(|a| self.toks[a.toks.lo as usize].lo).min().unwrap_or(it.lo).min(it.lo);
+        let lo = self.ast.list(it.attrs).iter().map(|a| self.toks.at(a.toks.lo as usize).lo).min().unwrap_or(it.lo).min(it.lo);
         let key = crate::parse_work::key(self, "native-derive", lo, it.hi, false);
         if let Some(x) = crate::parse_work::get(&key) {
             return self.install_derive_text(x.text, it.name.lo);
@@ -189,20 +189,20 @@ impl<'a> Parser<'a> {
         {
             let tparams: Vec<&str> = gparams.iter().filter(|g| g.0 == 1).map(|g| g.1.as_str()).collect();
             let mut i = tok_lo;
-            while i < self.toks.len() && self.toks[i].hi <= it.hi {
-                let t = self.toks[i];
-                if t.kind == T::Ident && t.lo > it.name.hi && i + 2 < self.toks.len() && self.toks[i + 1].kind == T::PathSep && self.toks[i + 2].kind == T::Ident && (i == 0 || self.toks[i - 1].kind != T::PathSep) {
+            while i < self.toks.len() && self.toks.at(i).hi <= it.hi {
+                let t = self.toks.at(i);
+                if t.kind == T::Ident && t.lo > it.name.hi && i + 2 < self.toks.len() && self.toks.at(i + 1).kind == T::PathSep && self.toks.at(i + 2).kind == T::Ident && (i == 0 || self.toks.at(i - 1).kind != T::PathSep) {
                     let n = String::from_utf8_lossy(self.tok_text(t)).into_owned();
                     if tparams.contains(&n.as_str()) {
                         let mut path = n;
                         let mut j = i + 1;
-                        while j + 1 < self.toks.len() && self.toks[j].kind == T::PathSep && self.toks[j + 1].kind == T::Ident {
+                        while j + 1 < self.toks.len() && self.toks.at(j).kind == T::PathSep && self.toks.at(j + 1).kind == T::Ident {
                             path.push_str("::");
-                            path.push_str(&String::from_utf8_lossy(self.tok_text(self.toks[j + 1])));
+                            path.push_str(&String::from_utf8_lossy(self.tok_text(self.toks.at(j + 1))));
                             j += 2;
                         }
                         // (a path call `T::new(..)` is no type)
-                        if !(j < self.toks.len() && self.toks[j].kind == T::OpenParen) && !assoc_tys.contains(&path) {
+                        if !(j < self.toks.len() && self.toks.at(j).kind == T::OpenParen) && !assoc_tys.contains(&path) {
                             assoc_tys.push(path);
                         }
                         i = j;
@@ -219,11 +219,11 @@ impl<'a> Parser<'a> {
         let mut disc_ty = "isize".to_string();
         for a in self.ast.list(it.attrs) {
             let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            if hi <= lo || self.tok_text(self.toks[lo]) != b"repr" {
+            if hi <= lo || self.tok_text(self.toks.at(lo)) != b"repr" {
                 continue;
             }
             for i in lo + 1..hi {
-                let n = self.tok_text(self.toks[i]);
+                let n = self.tok_text(self.toks.at(i));
                 if [&b"u8"[..], b"u16", b"u32", b"u64", b"u128", b"usize", b"i8", b"i16", b"i32", b"i64", b"i128", b"isize"].contains(&n) {
                     disc_ty = String::from_utf8_lossy(n).into_owned();
                 }
@@ -303,19 +303,19 @@ impl<'a> Parser<'a> {
         let mut out = Vec::new();
         // the name token, then `<`
         let mut i = tok_lo;
-        while i < self.toks.len() && !(self.toks[i].lo == it.name.lo && self.toks[i].hi == it.name.hi) {
+        while i < self.toks.len() && !(self.toks.at(i).lo == it.name.lo && self.toks.at(i).hi == it.name.hi) {
             i += 1;
         }
         i += 1;
         let mut end_generics = i;
-        if i < self.toks.len() && self.toks[i].kind == T::Lt {
+        if i < self.toks.len() && self.toks.at(i).kind == T::Lt {
             // split params at top-level commas up to the matching `>`
             let mut depth = 1i32;
             let mut j = i + 1;
             let mut cur: Vec<usize> = Vec::new();
             let mut params: Vec<Vec<usize>> = Vec::new();
             while j < self.toks.len() {
-                let k = self.toks[j].kind;
+                let k = self.toks.at(j).kind;
                 let before = depth;
                 match k {
                     T::Lt => depth += 1,
@@ -355,7 +355,7 @@ impl<'a> Parser<'a> {
                         k += 1;
                         continue;
                     }
-                    let t = self.toks[p[k]];
+                    let t = self.toks.at(p[k]);
                     match t.kind {
                         T::Lt => ad += 1,
                         T::Gt | T::Shr => ad -= self.closes(p[k]),
@@ -367,7 +367,7 @@ impl<'a> Parser<'a> {
                         let mut d = 0;
                         k += 1;
                         while k < p.len() {
-                            match self.toks[p[k]].kind {
+                            match self.toks.at(p[k]).kind {
                                 T::OpenBracket => d += 1,
                                 T::CloseBracket => {
                                     d -= 1;
@@ -394,7 +394,7 @@ impl<'a> Parser<'a> {
                 if toks[0] == GT {
                     continue;
                 }
-                let first = self.toks[toks[0]];
+                let first = self.toks.at(toks[0]);
                 let txt = |s: &Self, v: &[usize]| -> String {
                     let mut r = String::new();
                     for (n, &x) in v.iter().enumerate() {
@@ -403,10 +403,10 @@ impl<'a> Parser<'a> {
                         }
                         if x == GT {
                             r.push('>');
-                        } else if s.toks[x].kind == T::Gt && s.closes(x) == 2 {
+                        } else if s.toks.at(x).kind == T::Gt && s.closes(x) == 2 {
                             r.push_str("> >");
                         } else {
-                            r.push_str(&String::from_utf8_lossy(s.tok_text(s.toks[x])));
+                            r.push_str(&String::from_utf8_lossy(s.tok_text(s.toks.at(x))));
                         }
                     }
                     r
@@ -431,12 +431,12 @@ impl<'a> Parser<'a> {
         let mut j = end_generics;
         let mut depth = 0i32;
         while j < self.toks.len() {
-            let k = self.toks[j].kind;
+            let k = self.toks.at(j).kind;
             if depth == 0 && k == T::KwWhere {
                 let mut e = j;
                 let mut d2 = 0i32;
                 while e < self.toks.len() {
-                    let ke = self.toks[e].kind;
+                    let ke = self.toks.at(e).kind;
                     match ke {
                         T::Lt => d2 += 1,
                         T::Gt | T::Shr => d2 -= self.closes(e),
@@ -451,7 +451,7 @@ impl<'a> Parser<'a> {
                     if !w.is_empty() {
                         w.push(' ');
                     }
-                    w.push_str(&String::from_utf8_lossy(self.tok_text(self.toks[e])));
+                    w.push_str(&String::from_utf8_lossy(self.tok_text(self.toks.at(e))));
                     e += 1;
                 }
                 break;
@@ -470,11 +470,11 @@ impl<'a> Parser<'a> {
     /// How many `>` token `i` closes: the parser splits `>>` in place (the token becomes the
     /// second `>`), so a `>` right after a `>` byte no token covers counts twice.
     fn closes(&self, i: usize) -> i32 {
-        let t = self.toks[i];
+        let t = self.toks.at(i);
         if t.kind == T::Shr {
             return 2;
         }
-        let prev_hi = if i > 0 { self.toks[i - 1].hi } else { 0 };
+        let prev_hi = if i > 0 { self.toks.at(i - 1).hi } else { 0 };
         if t.lo > prev_hi && self.bytes(t.lo - 1, t.lo) == b">" {
             2
         } else {
@@ -497,7 +497,7 @@ impl<'a> Parser<'a> {
         for a in attrs {
             let lo = toks.len() as u32;
             for i in a.toks.lo..a.toks.hi {
-                let t = self.toks[i as usize];
+                let t = self.toks.at(i as usize);
                 let b = self.tok_text(t);
                 let p = src.len() as u32;
                 src.extend_from_slice(b);
@@ -508,12 +508,12 @@ impl<'a> Parser<'a> {
             na.toks = TokRange { lo, hi: toks.len() as u32 };
             local.push(na);
         }
-        crate::cfg::active(crate::cfg::Src { src: &src, toks: &toks, ext: &[], ptoks: &[], parts: None }, &local, &c.cfg)
+        crate::cfg::active(crate::cfg::Src { src: &src, plain: &toks, ext: &[], parts: None }, &local, &c.cfg)
     }
 
     fn derive_shapes(&self, it: &Item) -> Vec<Shape> {
         let shape_of = |s: &Self, d: &VariantData, name: Option<String>, attrs: &[Attr]| -> Shape {
-            let default_attr = attrs.iter().any(|a| a.toks.hi > a.toks.lo && s.tok_text(s.toks[a.toks.lo as usize]) == b"default");
+            let default_attr = attrs.iter().any(|a| a.toks.hi > a.toks.lo && s.tok_text(s.toks.at(a.toks.lo as usize)) == b"default");
             match d {
                 VariantData::Unit => Shape { name, fields: Vec::new(), kind: 0, default_attr },
                 VariantData::Tuple(f) => Shape { name, fields: s.ast.list(*f).iter().filter(|x| s.cfg_present(s.ast.list(x.attrs))).map(|_| None).collect(), kind: 1, default_attr },
@@ -702,9 +702,9 @@ impl Parser<'_> {
 
     fn is_packed(&self, it: &Item) -> bool {
         for a in self.ast.list(it.attrs) {
-            if a.toks.lo == a.toks.hi || self.tok_text(self.toks[a.toks.lo as usize]) != b"repr" { continue; }
+            if a.toks.lo == a.toks.hi || self.tok_text(self.toks.at(a.toks.lo as usize)) != b"repr" { continue; }
             for i in a.toks.lo..a.toks.hi {
-                if self.tok_text(self.toks[i as usize]) == b"packed" { return true; }
+                if self.tok_text(self.toks.at(i as usize)) == b"packed" { return true; }
             }
         }
         false

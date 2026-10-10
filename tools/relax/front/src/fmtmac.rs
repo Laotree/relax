@@ -421,9 +421,9 @@ impl<'a> Parser<'a> {
     fn tokens_text(&self, lo: usize, hi: usize) -> String {
         let mut s = String::new();
         for i in lo..hi.min(self.toks.len()) {
-            let t = self.toks[i];
+            let t = self.toks.at(i);
             if i > lo {
-                let prev = self.toks[i - 1];
+                let prev = self.toks.at(i - 1);
                 if prev.hi != t.lo {
                     s.push(' ');
                 }
@@ -442,7 +442,7 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         let mut end = hi;
         for i in self.pos..hi {
-            match self.toks[i].kind {
+            match self.toks.at(i).kind {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
                 T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
                 T::Comma if depth == 0 => {

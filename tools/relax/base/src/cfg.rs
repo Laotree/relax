@@ -208,15 +208,29 @@ pub trait SourceTokens {
     fn bytes(&self, lo: u32, hi: u32) -> &[u8];
 }
 
+/// A file's source and its packed tokens as cfg evaluation reads them, where the caller also
+/// changes the file's tree (so cannot lend the whole file).
+pub struct PackedSrc<'a> {
+    pub src: &'a [u8],
+    pub toks: &'a crate::packed::PackedToks,
+}
+
+impl SourceTokens for PackedSrc<'_> {
+    fn token(&self, i: u32) -> Tok { self.toks.at(i as usize) }
+    fn bytes(&self, lo: u32, hi: u32) -> &[u8] {
+        let n = self.src.len();
+        &self.src[(lo as usize).min(n)..(hi as usize).min(n)]
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Src<'a> {
     pub src: &'a [u8],
-    pub toks: &'a [Tok],
+    /// tokens of a working array (not a published file's: those go through `parts`)
+    pub plain: &'a [Tok],
     /// expansion text past the end of `src` (while parsing; empty afterwards: then `src`
     /// already holds it)
     pub ext: &'a [u8],
-    /// tokens past the end of `toks` (a file's lazily parsed fn bodies' expansions)
-    pub ptoks: &'a [Tok],
     /// Immutable body segments published after the file was parsed.
     pub parts: Option<&'a dyn SourceTokens>,
 }
@@ -225,10 +239,7 @@ impl<'a> Src<'a> {
     #[inline]
     pub fn tok(&self, i: usize) -> Tok {
         if let Some(parts) = self.parts { return parts.token(i as u32); }
-        match self.toks.get(i) {
-            Some(t) => *t,
-            None => self.ptoks[i - self.toks.len()],
-        }
+        self.plain[i]
     }
 }
 

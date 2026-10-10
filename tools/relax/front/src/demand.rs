@@ -76,7 +76,7 @@ fn active_tokens_inner(src: &[u8], toks: &[Tok], cfg: &CfgSet, out: &mut Vec<Tok
                 i = end + 1;
             }
             if attrs.is_empty() { out.push(toks[i]); i += 1; continue; }
-            let view = Src { src, toks, ext: &[], ptoks: &[], parts: None };
+            let view = Src { src, plain: toks, ext: &[], parts: None };
             if !crate::cfg::active(view, &attrs, cfg) {
                 if attrs.iter().any(|a| a.inner) { out.truncate(output_start); return; }
                 // The attributed item/statement/field is removed as one unit.

@@ -16,6 +16,7 @@ pub mod arena;
 pub mod json;
 pub mod diag;
 pub use relax_lex::lexer;
+pub use relax_lex::packed;
 pub mod ast;
 pub mod toml;
 pub mod inflate;

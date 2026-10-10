@@ -8,6 +8,7 @@
 
 use crate::arena::Arena;
 use crate::image::{Reader, Writer};
+use crate::packed::PackedToks;
 use crate::parser::ParsedFile;
 use crate::source::SourceRegistry;
 use crate::origin_table::{Table, Regions, Maps, Origins};
@@ -65,7 +66,7 @@ pub fn encode(pf: &ParsedFile) -> Vec<u8> {
 pub fn image(pf: &ParsedFile) -> Writer<'_> {
     let mut w = Writer::default();
     w.add(S_SRC, &pf.src);
-    w.add(S_TOKS, &pf.toks);
+    w.add(S_TOKS, pf.toks.words());
     w.add(S_EXP_MAP, pf.exp_map.bytes());
     w.add(S_TOK_ORIGIN, pf.tok_origin.bytes());
     w.add(S_RULES_EXP, pf.rules_exp.bytes());
@@ -107,7 +108,7 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
         };
     }
     let src = read!(u8, 0, S_SRC, "src");
-    let toks = read!(crate::lexer::Tok, 1, S_TOKS, "toks");
+    let Some(toks) = PackedToks::mapped(read!(u32, 1, S_TOKS, "toks")) else { return mismatch(path, "toks") };
     let Some(em) = Table::<Regions>::mapped(read!(u8, 2, S_EXP_MAP, "exp_map")) else { return mismatch(path, "exp_map") };
     let Some(to) = Table::<Maps>::mapped(read!(u8, 3, S_TOK_ORIGIN, "tok_origin")) else { return mismatch(path, "tok_origin") };
     let Some(re) = Table::<Regions>::mapped(read!(u8, 4, S_RULES_EXP, "rules_exp")) else { return mismatch(path, "rules_exp") };
@@ -125,7 +126,7 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
             if v && !$same { return mismatch(path, $section); }
         };
     }
-    check!(toks, pf.toks, tok_bytes(toks) == tok_bytes(&pf.toks), "toks");
+    check!(toks, pf.toks, toks.words() == pf.toks.words(), "toks");
     check!(em, pf.exp_map, em == pf.exp_map, "exp_map");
     check!(to, pf.tok_origin, to == pf.tok_origin, "tok_origin");
     check!(re, pf.rules_exp, re == pf.rules_exp, "rules_exp");
@@ -149,7 +150,7 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     let _ = k;
     let mut before = pf.src.heap_bytes() + pf.toks.heap_bytes() + pf.exp_map.heap_bytes() + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes();
     pf.src = Arena::Mapped(src);
-    pf.toks = Arena::Mapped(toks);
+    pf.toks = toks;
     pf.exp_map = em;
     pf.tok_origin = to;
     pf.rules_exp = re;
@@ -206,7 +207,7 @@ pub fn part_image<'a>(pf: &'a ParsedFile, fp: &'a crate::parser::FilePart, a: &'
     }
     let mut w = Writer::default();
     w.add(P_EXT, &fp.ext);
-    w.add(P_TOKS, &fp.toks);
+    w.add(P_TOKS, fp.toks.words());
     w.add(P_EXP_MAP, fp.exp_map.bytes());
     w.add(P_TOK_ORIGIN, fp.tok_origin.bytes());
     w.add_owned(P_BODIES, &bodies);
@@ -234,7 +235,7 @@ fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rule
     let Some(r) = Reader::new(img) else { return None };
     let (Some(ext), Some(ptoks), Some(em), Some(to), Some(bodies), Some(base), Some(origins), Some(srcs)) = (
         r.slice::<u8>(0, P_EXT),
-        r.slice::<crate::lexer::Tok>(1, P_TOKS),
+        r.slice::<u32>(1, P_TOKS).and_then(PackedToks::mapped),
         r.slice::<u8>(2, P_EXP_MAP).and_then(Table::<Regions>::mapped),
         r.slice::<u8>(3, P_TOK_ORIGIN).and_then(Table::<Maps>::mapped),
         r.slice::<u32>(4, P_BODIES),
@@ -266,7 +267,7 @@ fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rule
         src_base: src as u32, tok_base: toks as u32, rules_base: rules as u32,
         rules_exp, body_origin, next: Default::default(),
         ext: Arena::Mapped(ext),
-        toks: Arena::Mapped(ptoks),
+        toks: ptoks,
         exp_map: em,
         tok_origin: to,
         token_origins: origins,
@@ -284,7 +285,7 @@ fn same_part(a: &crate::parser::FilePart, aa: &crate::ast::Ast, b: &crate::parse
         && a.exp_map.len() == b.exp_map.len() && a.tok_origin.len() == b.tok_origin.len() && a.token_origins.len() == b.token_origins.len()
         && a.rules_exp.len() == b.rules_exp.len() && a.body_origin.len() == b.body_origin.len();
     if v {
-        s = s && a.ext[..] == b.ext[..] && tok_bytes(&a.toks) == tok_bytes(&b.toks) && a.exp_map == b.exp_map && a.tok_origin == b.tok_origin && a.token_origins == b.token_origins
+        s = s && a.ext[..] == b.ext[..] && a.toks.words() == b.toks.words() && a.exp_map == b.exp_map && a.tok_origin == b.tok_origin && a.token_origins == b.token_origins
             && a.rules_exp == b.rules_exp && a.body_origin == b.body_origin;
     }
     macro_rules! cmp {
@@ -337,10 +338,6 @@ pub fn apply_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &cra
     let _ = pf.part.set(Box::new(fp));
     PARTS_MAPPED.fetch_add(1, Ordering::Relaxed);
     true
-}
-
-fn tok_bytes(t: &[crate::lexer::Tok]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(t.as_ptr() as *const u8, std::mem::size_of_val(t)) }
 }
 
 /// Store source identities and immutable snapshots next to the arena. Numeric IDs in an
@@ -488,7 +485,7 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
     }
     Some(ParsedFile {
         src: Arena::Mapped(src),
-        toks: Arena::Mapped(r.slice(1, S_TOKS)?),
+        toks: PackedToks::mapped(r.slice(1, S_TOKS)?)?,
         ast,
         edition: meta.edition,
         src_len: meta.src_len,
@@ -515,7 +512,7 @@ pub fn verify_file(image: &ParsedFile, fresh: &ParsedFile) {
     macro_rules! cmp { ($($f:ident: $t:ident),*) => { $(assert_eq!(format!("{:?}",&a.$f[..]),format!("{:?}",&b.$f[..]),"front AST {}",stringify!($f));)* }; }
     ast_arrays!(cmp);
     assert_eq!(&image.src[..], &fresh.src[..], "front source");
-    assert_eq!(tok_bytes(&image.toks), tok_bytes(&fresh.toks), "front tokens");
+    assert_eq!(image.toks.words(), fresh.toks.words(), "front tokens");
     assert_eq!(image.exp_map, fresh.exp_map);
     assert_eq!(image.tok_origin, fresh.tok_origin);
     assert!(same_origins(image, &image.token_origins, fresh, &fresh.token_origins), "front token origins");

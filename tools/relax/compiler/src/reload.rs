@@ -563,7 +563,7 @@ fn same_toks(a: &crate::parser::ParsedFile, alo: u32, ahi: u32, ha: &[(u32, u32)
         let i0 = pf.toks.partition_point(|t| t.lo < lo);
         // expansion text (no token inside the range): toks() reads its bytes instead
         if !pf.toks.get(i0).is_some_and(|t| t.hi <= hi) { return None; }
-        Some(pf.toks[i0..].iter().take_while(move |t| t.hi <= hi)
+        Some(pf.toks.iter_from(i0).take_while(move |t| t.hi <= hi)
             .filter(move |t| !holes.iter().any(|&(x, y)| t.lo >= x && t.hi <= y))
             .filter_map(move |t| pf.src.get(t.lo as usize..t.hi as usize)))
     }
@@ -602,18 +602,18 @@ fn norm_generated(b: &[u8]) -> Vec<u8> {
 /// (a widget's generated shader items then compared as text against the running version's
 /// tokens, and every button.rx body edit took the restart rung). Interp tokens take the
 /// position of the next ordinary token, which keeps the search key monotonic.
-fn first_tok_at(toks: &[crate::lexer::Tok], lo: u32) -> usize {
+fn first_tok_at(toks: &(impl crate::parser::lazy_bodies::TokSeq + ?Sized), lo: u32) -> usize {
     let key = |i: usize| -> u32 {
         let mut j = i;
-        while j < toks.len() && toks[j].kind == crate::lexer::T::Interp { j += 1; }
-        if j < toks.len() { toks[j].lo } else { u32::MAX }
+        while j < toks.len() && toks.at(j).kind == crate::lexer::T::Interp { j += 1; }
+        if j < toks.len() { toks.at(j).lo } else { u32::MAX }
     };
     let (mut a, mut b) = (0usize, toks.len());
     while a < b {
         let m = a + (b - a) / 2;
         if key(m) < lo { a = m + 1; } else { b = m; }
     }
-    while a < toks.len() && toks[a].kind == crate::lexer::T::Interp { a += 1; }
+    while a < toks.len() && toks.at(a).kind == crate::lexer::T::Interp { a += 1; }
     a
 }
 
@@ -622,7 +622,7 @@ fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, 
     let i0 = first_tok_at(&pf.toks, lo);
     let mut covered = false;
     let mut prev_hi = lo;
-    for t in &pf.toks[i0..] {
+    for t in pf.toks.iter_from(i0) {
         if t.hi > hi {
             break;
         }
@@ -978,7 +978,7 @@ fn added_expanded_derives(old: &crate::parser::ParsedFile, a: &crate::ast::Item,
         let mut kept = Vec::new();
         let mut expanded = Vec::new();
         for attr in pf.ast.list(it.attrs) {
-            let ts = &pf.toks[attr.toks.lo as usize..attr.toks.hi as usize];
+            let ts = pf.toks.range(attr.toks.lo as usize, attr.toks.hi as usize);
             let text: Vec<Vec<u8>> = ts.iter().map(|t| pf.bytes(t.lo, t.hi).to_vec()).collect();
             if text.first().map(Vec::as_slice) == Some(b"derive") && ts.iter().all(|t| matches!(t.kind, crate::lexer::T::Ident | crate::lexer::T::OpenParen | crate::lexer::T::CloseParen | crate::lexer::T::Comma)) {
                 let mut markers = Vec::new();

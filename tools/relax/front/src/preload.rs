@@ -810,7 +810,7 @@ struct DeclAttrs {
 }
 
 fn decl_attrs(src: &[u8], toks: &[Tok], i: usize, cfg: &CfgSet) -> DeclAttrs {
-    let p = Src { src, toks, ext: &[], ptoks: &[], parts: None };
+    let p = Src { src, plain: toks, ext: &[], parts: None };
     let attrs = crate::cfg::attrs_before(p, i, cfg);
     let mut out = DeclAttrs {
         active: crate::cfg::active(p, &attrs, cfg),
@@ -861,7 +861,7 @@ pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
         attrs.push(Attr { inner: true, toks: TokRange { lo: (i + 3) as u32, hi: j as u32 } });
         i = j + 1;
     }
-    attrs.is_empty() || crate::cfg::active(Src { src, toks, ext: &[], ptoks: &[], parts: None }, &attrs, cfg)
+    attrs.is_empty() || crate::cfg::active(Src { src, plain: toks, ext: &[], parts: None }, &attrs, cfg)
 }
 
 fn scan_file(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context) -> Option<Scanned> {

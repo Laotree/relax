@@ -1022,7 +1022,7 @@ fn index_cfg_active(stream: Option<&crate::pm_tokens::TokenStream>, cfg: &CfgSet
         attrs.push(Attr { inner, toks: TokRange { lo: (open + 1) as u32, hi: end as u32 } });
         at = end + 1;
     }
-    crate::cfg::active(Src { src: input.text.as_bytes(), toks, ext: &[], ptoks: &[], parts: None }, &attrs, cfg)
+    crate::cfg::active(Src { src: input.text.as_bytes(), plain: toks, ext: &[], parts: None }, &attrs, cfg)
 }
 
 fn index_names(index: &crate::rs_index::NameIndex, parameters: &BTreeSet<String>, file: &mut FileIndex, cfg: &CfgSet) {
@@ -1230,7 +1230,7 @@ fn builtin_derive_list(src: &[u8], tokens: &[Tok]) -> Option<Vec<&'static str>> 
 }
 
 fn index_builtin_derives(file: &mut FileIndex, index: &crate::rs_index::NameIndex, module: &str, src: &[u8], tokens: &[Tok], cfg: &CfgSet) {
-    let view = Src { src, toks: tokens, ext: &[], ptoks: &[], parts: None };
+    let view = Src { src, plain: tokens, ext: &[], parts: None };
     for item in &index.items {
         if !matches!(item.kind, crate::rs_index::ItemKind::Struct | crate::rs_index::ItemKind::Enum | crate::rs_index::ItemKind::Union) { continue; }
         let Some(at) = tokens.iter().position(|t| t.lo == item.span.lo) else { continue; };

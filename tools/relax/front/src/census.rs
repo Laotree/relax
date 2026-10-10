@@ -187,7 +187,7 @@ impl<'p, 'a> Walker<'p, 'a> {
     }
 
     fn tok_text(&self, i: u32) -> &'a str {
-        let t = self.p.toks[i as usize];
+        let t = self.p.toks.at(i as usize);
         std::str::from_utf8(&self.p.src[t.lo as usize..t.hi as usize]).unwrap_or("?")
     }
 
@@ -195,13 +195,13 @@ impl<'p, 'a> Walker<'p, 'a> {
         let p = self.p;
         self.cen.c[C_FILES] += 1;
         self.cen.c[C_LINES] += self.line_starts.len() as u64;
-        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, &p.ast.root_attrs, self.cfg) {
+        if !crate::cfg::active(crate::cfg::Src { src: p.src, plain: p.toks.as_slice(), ext: &[], parts: None }, &p.ast.root_attrs, self.cfg) {
             return;
         }
         self.attrs(&p.ast.root_attrs, true);
         // token-level checks
         for i in 0..p.toks.len() {
-            let t = p.toks[i];
+            let t = p.toks.at(i);
             if t.kind == T::Ident {
                 let s = &p.src[t.lo as usize..t.hi as usize];
                 if s == b"catch_unwind" || s == b"resume_unwind" {
@@ -228,10 +228,10 @@ impl<'p, 'a> Walker<'p, 'a> {
                 // derive(A, B, path::C)
                 let mut i = a.toks.lo + 1;
                 while i < a.toks.hi {
-                    let t = self.p.toks[i as usize];
+                    let t = self.p.toks.at(i as usize);
                     if t.kind == T::Ident {
                         // last segment only
-                        let next = if i + 1 < a.toks.hi { self.p.toks[i as usize + 1].kind } else { T::Comma };
+                        let next = if i + 1 < a.toks.hi { self.p.toks.at(i as usize + 1).kind } else { T::Comma };
                         if next != T::PathSep {
                             let n = self.tok_text(i);
                             if contains(STD_DERIVES, n) {
@@ -247,14 +247,14 @@ impl<'p, 'a> Walker<'p, 'a> {
                     }
                     i += 1;
                 }
-            } else if name == "cfg_attr" && crate::cfg::cfg_attr_holds(crate::cfg::Src { src: self.p.src, toks: self.p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, a, self.cfg) {
+            } else if name == "cfg_attr" && crate::cfg::cfg_attr_holds(crate::cfg::Src { src: self.p.src, plain: self.p.toks.as_slice(), ext: &[], parts: None }, a, self.cfg) {
                 // look for derive inside
                 let mut i = a.toks.lo + 1;
                 while i < a.toks.hi {
-                    if self.p.toks[i as usize].kind == T::Ident && self.tok_text(i) == "derive" {
+                    if self.p.toks.at(i as usize).kind == T::Ident && self.tok_text(i) == "derive" {
                         let mut j = i + 1;
-                        while j < a.toks.hi && self.p.toks[j as usize].kind != T::CloseParen {
-                            if self.p.toks[j as usize].kind == T::Ident {
+                        while j < a.toks.hi && self.p.toks.at(j as usize).kind != T::CloseParen {
+                            if self.p.toks.at(j as usize).kind == T::Ident {
                                 let n = self.tok_text(j);
                                 if !contains(STD_DERIVES, n) && !contains(OUR_DERIVES, n) {
                                     self.cen.c[C_DERIVE_OTHER] += 1;
@@ -454,7 +454,7 @@ impl<'p, 'a> Walker<'p, 'a> {
     fn item(&mut self, id: ItemId, in_generic_impl: bool) {
         let p = self.p;
         let it = p.ast.item(id);
-        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(it.attrs), self.cfg) {
+        if !crate::cfg::active(crate::cfg::Src { src: p.src, plain: p.toks.as_slice(), ext: &[], parts: None }, p.ast.list(it.attrs), self.cfg) {
             return;
         }
         self.attrs(p.ast.list(it.attrs), true);
@@ -668,7 +668,7 @@ impl<'p, 'a> Walker<'p, 'a> {
         for s in p.ast.list(blk.stmts) {
             match s {
                 Stmt::Let { attrs, pat, ty, init, else_ } => {
-                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(*attrs), self.cfg) {
+                    if !crate::cfg::active(crate::cfg::Src { src: p.src, plain: p.toks.as_slice(), ext: &[], parts: None }, p.ast.list(*attrs), self.cfg) {
                         continue;
                     }
                     self.attrs(p.ast.list(*attrs), false);
@@ -812,7 +812,7 @@ impl<'p, 'a> Walker<'p, 'a> {
             ExprKind::Match(x, arms) => {
                 self.expr(*x);
                 for a in p.ast.list(*arms) {
-                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(a.attrs), self.cfg) {
+                    if !crate::cfg::active(crate::cfg::Src { src: p.src, plain: p.toks.as_slice(), ext: &[], parts: None }, p.ast.list(a.attrs), self.cfg) {
                         continue;
                     }
                     self.attrs(p.ast.list(a.attrs), false);

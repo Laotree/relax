@@ -544,10 +544,10 @@ fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, or
     let mut out = String::new();
     let mut i = lo;
     while i < hi {
-        let t = toks[i];
+        let t = toks.at(i);
         out.push_str(std::str::from_utf8(buf.get(t.lo, t.hi)).unwrap_or("?"));
         if i + 1 < hi {
-            let n = toks[i + 1];
+            let n = toks.at(i + 1);
             // tokens that stand for source tokens: the source's spacing
             let ws = match (orig(t.lo), orig(n.lo)) {
                 (Some(a), Some(b)) if b >= a => b > a + (t.hi - t.lo),
@@ -818,7 +818,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
         Builtin::ThreadLocal => {
             let mut v: Vec<(T, &[u8])> = Vec::new();
             for i in lo..hi {
-                let t = p.toks[i];
+                let t = p.toks.at(i);
                 v.push((t.kind, p.tok_text(t)));
             }
             return crate::thread_local_mac::expand(&v);
@@ -1084,7 +1084,7 @@ fn split_commas(toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize) -> Vec<(usi
     let mut depth = 0i32;
     let mut s = lo;
     for i in lo..hi {
-        match toks[i].kind {
+        match toks.at(i).kind {
             T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
             T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
             T::Comma if depth == 0 => {
@@ -1107,9 +1107,9 @@ fn split_commas(toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize) -> Vec<(usi
 fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bool), String> {
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
-    let text = |i: usize| String::from_utf8_lossy(buf.get(toks[i].lo, toks[i].hi)).into_owned();
+    let text = |i: usize| String::from_utf8_lossy(buf.get(toks.at(i).lo, toks.at(i).hi)).into_owned();
     if z == a + 1 {
-        let t = toks[a];
+        let t = toks.at(a);
         let s = text(a);
         return match t.kind {
             T::Str | T::RawStr => Ok((lit_str_value(&s).unwrap_or_default(), true)),
@@ -1119,19 +1119,19 @@ fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bo
             _ => Err(format!("expected a literal, found `{}`", s)),
         };
     }
-    if z == a + 2 && toks[a].kind == T::Minus && matches!(toks[a + 1].kind, T::Int | T::Float) {
-        return Ok((format!("-{}", num_lit_value(&text(a + 1), toks[a + 1].kind == T::Int)), false));
+    if z == a + 2 && toks.at(a).kind == T::Minus && matches!(toks.at(a + 1).kind, T::Int | T::Float) {
+        return Ok((format!("-{}", num_lit_value(&text(a + 1), toks.at(a + 1).kind == T::Int)), false));
     }
     // nested macro call: path ! ( .. )
     let mut i = a;
-    while i < z && matches!(toks[i].kind, T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
+    while i < z && matches!(toks.at(i).kind, T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
         i += 1;
     }
-    if i > a && i + 2 < z + 1 && toks[i].kind == T::Not && matches!(toks[i + 1].kind, T::OpenParen | T::OpenBracket | T::OpenBrace) {
+    if i > a && i + 2 < z + 1 && toks.at(i).kind == T::Not && matches!(toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) {
         let name = text(i - 1);
         let b = lookup(&name);
         if b != Builtin::None && z >= i + 3 {
-            let out = expand_text(p, b as u8, i + 2, z - 1, toks[a].lo, toks[z - 1].hi)?;
+            let out = expand_text(p, b as u8, i + 2, z - 1, toks.at(a).lo, toks.at(z - 1).hi)?;
             let mut lt = Vec::new();
             crate::lexer::lex(out.as_bytes(), 2021, &mut lt).map_err(|_| "nested macro output does not lex".to_string())?;
             if lt.len() >= 1 {
@@ -1459,8 +1459,8 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     }
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
-    let item_lo = toks[lo].lo;
-    let item_hi = toks[hi.saturating_sub(1)].hi;
+    let item_lo = toks.at(lo).lo;
+    let item_hi = toks.at(hi.saturating_sub(1)).hi;
     // computed ahead on the worker threads?
     if let Some(c) = p.bctx.as_ref().filter(|_| !crate::macro_reg::declaring()) {
         if let Some(r) = PRE.with(|m| m.borrow_mut().remove(&(c.path.clone(), item_lo, item_hi))) {
@@ -1476,13 +1476,13 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
         if ahi <= alo {
             continue;
         }
-        let first = buf.get(toks[alo].lo, toks[alo].hi);
+        let first = buf.get(toks.at(alo).lo, toks.at(alo).hi);
         if first != b"derive" && first != b"cfg_attr" {
             continue;
         }
         for i in alo..ahi {
-            if toks[i].kind == T::Ident {
-                let w = buf.get(toks[i].lo, toks[i].hi);
+            if toks.at(i).kind == T::Ident {
+                let w = buf.get(toks.at(i).lo, toks.at(i).hi);
                 if std::str::from_utf8(w).map_or(false, is_derive) {
                     any = true;
                     reusable &= crate::macro_reg::reusable_derive(std::str::from_utf8(w).unwrap());
@@ -1522,7 +1522,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
 pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<usize> {
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
-    let text = |i: usize| std::str::from_utf8(buf.get(toks[i].lo, toks[i].hi)).unwrap_or("").trim_start_matches("r#").to_string();
+    let text = |i: usize| std::str::from_utf8(buf.get(toks.at(i).lo, toks.at(i).hi)).unwrap_or("").trim_start_matches("r#").to_string();
     let mut derives: Vec<String> = Vec::new();
     let mut cand: Option<(usize, String)> = None;
     for (k, a) in attrs.iter().enumerate() {
@@ -1533,20 +1533,20 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
         let first = text(lo);
         if first == "derive" {
             for i in lo + 1..hi {
-                if toks[i].kind == T::Ident {
+                if toks.at(i).kind == T::Ident {
                     derives.push(text(i));
                 }
             }
             continue;
         }
-        if cand.is_some() || lo < 2 || toks[lo - 2].kind != T::Pound || toks[lo - 1].kind != T::OpenBracket || toks.get(hi).map(|t| t.kind) != Some(T::CloseBracket) {
+        if cand.is_some() || lo < 2 || toks.at(lo - 2).kind != T::Pound || toks.at(lo - 1).kind != T::OpenBracket || toks.get(hi).map(|t| t.kind) != Some(T::CloseBracket) {
             continue;
         }
         // the path: idents joined by `::`
         let mut i = lo;
         let mut last = String::new();
         while i < hi {
-            match toks[i].kind {
+            match toks.at(i).kind {
                 T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper => last = text(i),
                 T::PathSep => {}
                 _ => break,
@@ -1573,7 +1573,7 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
 /// Optimisation level of a `relax(..)` attribute's arguments at tokens [i, hi) (i at the `(`):
 /// 2 = `(O2)`, 3 = `(O3)`, 4 = `(O3, always)`; None for anything else.
 pub fn relax_level_toks(text: &dyn Fn(usize) -> String, toks: &(impl TokSeq + ?Sized), i: usize, hi: usize) -> Option<u8> {
-    if i >= hi || toks[i].kind != T::OpenParen {
+    if i >= hi || toks.at(i).kind != T::OpenParen {
         return None;
     }
     let args: Vec<String> = (i + 1..hi).map(|k| text(k)).collect();
@@ -1594,22 +1594,22 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
     let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let (alo, ahi) = (attr.toks.lo as usize, attr.toks.hi as usize);
-    let item_lo = toks[lo].lo;
-    let item_hi = toks[hi.saturating_sub(1)].hi;
-    let cut_lo = toks[alo - 2].lo;
-    let cut_hi = toks[ahi].hi;
+    let item_lo = toks.at(lo).lo;
+    let item_hi = toks.at(hi.saturating_sub(1)).hi;
+    let cut_lo = toks.at(alo - 2).lo;
+    let cut_hi = toks.at(ahi).hi;
     let path = p.bctx.as_ref().map_or("", |c| c.path.as_str());
     // the attribute's name and arguments
     let mut i = alo;
     let mut name = String::new();
-    while i < ahi && matches!(toks[i].kind, T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper | T::PathSep) {
-        if toks[i].kind != T::PathSep {
-            name = String::from_utf8_lossy(buf.get(toks[i].lo, toks[i].hi)).trim_start_matches("r#").to_string();
+    while i < ahi && matches!(toks.at(i).kind, T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSuper | T::PathSep) {
+        if toks.at(i).kind != T::PathSep {
+            name = String::from_utf8_lossy(buf.get(toks.at(i).lo, toks.at(i).hi)).trim_start_matches("r#").to_string();
         }
         i += 1;
     }
-    let args: Vec<u8> = if i < ahi && matches!(toks[i].kind, T::OpenParen | T::OpenBracket | T::OpenBrace) && ahi >= i + 2 {
-        buf.get(toks[i + 1].lo.min(toks[ahi - 1].lo), toks[ahi - 1].lo).to_vec()
+    let args: Vec<u8> = if i < ahi && matches!(toks.at(i).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) && ahi >= i + 2 {
+        buf.get(toks.at(i + 1).lo.min(toks.at(ahi - 1).lo), toks.at(ahi - 1).lo).to_vec()
     } else {
         Vec::new()
     };
@@ -1633,7 +1633,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
         }
         to_stream_buf(Buf::plain(text), &t, 0, t.len(), &|a, z| span_of(offset(a), offset(z))).ok_or_else(|| (item_lo, format!("unbalanced delimiters in #[{}] input", name)))
     };
-    let args_lo = if i + 1 < ahi { toks[i + 1].lo.min(toks[ahi - 1].lo) } else { item_lo };
+    let args_lo = if i + 1 < ahi { toks.at(i + 1).lo.min(toks.at(ahi - 1).lo) } else { item_lo };
     let attr_ts = stream(&args, &|a| args_lo + a)?;
     let before = cut_lo - item_lo;
     let item_ts = stream(&item, &|a| if a <= before { item_lo + a } else { cut_hi + a - before - 1 })?;
@@ -2120,7 +2120,7 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
         return v;
     }
     let tx = |i: usize| &tb[t2[i].lo as usize..t2[i].hi as usize];
-    let source = crate::cfg::Src { src: tb, toks: &t2, ext: &[], ptoks: &[], parts: None };
+    let source = crate::cfg::Src { src: tb, plain: &t2, ext: &[], parts: None };
     let mut modules = vec![(0u32, crate::preload::file_cfg_active(tb, &t2, cfg))];
     let mut depth = 0u32;
     let mut i = 0;
@@ -2278,7 +2278,7 @@ mod pm_input_tests {
         p.sources = Some(sources);
         p.bctx = Some(std::rc::Rc::new(FileCtx::new("test", "/fake/module.rs", "test", &CfgSet::host(&sess, &[]))));
         let start = p.expand_text("forward", "r#type", base).unwrap_or_else(|e| panic!("{}", e.msg));
-        let nested = p.toks[start].lo;
+        let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested, base, 6));
         for needed in [false, true] {
             expand_pm_ts(&p, needed, start, start + 1, nested, nested + 6, |tokens, call| {
@@ -2330,12 +2330,12 @@ mod pm_input_tests {
         p.ext.extend(std::iter::repeat_n(b' ', 2_000_000 - p.ext.len()));
         compare(&p, 0, p.toks.len(), 0, src.len() as u32);
         let start = p.expand_text("test", "(forwarded >>= 2)", 0).unwrap_or_else(|e| panic!("{}", e.msg));
-        let base = p.toks[start].lo;
+        let base = p.toks.at(start).lo;
         p.tok_origin.push((base + 1, 0, 2));
         compare(&p, start, p.toks.len(), base, p.toks.last().unwrap().hi);
         // Nested substitution, resolving a fragment through the preceding expansion.
         let start = p.expand_text("test", "[forwarded]", base).unwrap_or_else(|e| panic!("{}", e.msg));
-        let nested = p.toks[start].lo;
+        let nested = p.toks.at(start).lo;
         p.tok_origin.push((nested + 1, base + 1, 2));
         compare(&p, start, p.toks.len(), nested, p.toks.last().unwrap().hi);
         // No call-site mapping: exercise the lazy expansion index, Unicode and EOF.
@@ -2343,6 +2343,6 @@ mod pm_input_tests {
         p.tok_origin.clear();
         let start = p.expand_text("test", "\n(\"é中🦀\", x)", u32::MAX).unwrap_or_else(|e| panic!("{}", e.msg));
         p.exp_map.clear();
-        compare(&p, start, p.toks.len(), p.toks[start].lo, p.toks.last().unwrap().hi);
+        compare(&p, start, p.toks.len(), p.toks.at(start).lo, p.toks.last().unwrap().hi);
     }
 }

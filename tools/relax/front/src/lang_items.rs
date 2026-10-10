@@ -538,10 +538,10 @@ impl LangItems {
             for attr in attrs {
                 let lo = attr.toks.lo as usize;
                 if crate::cfg::tok_str(src, lo) != b"lang" { continue; }
-                let (line, col) = prog.files[def.file as usize].line_col(src.toks[lo].lo);
+                let (line, col) = prog.files[def.file as usize].line_col(src.tok(lo).lo);
                 let location = format!("{}:{}:{}", prog.file_paths[def.file as usize], line, col);
                 if attr.toks.hi as usize != lo + 3 || crate::cfg::tok_str(src, lo + 1) != b"="
-                    || !matches!(src.toks[lo + 2].kind, crate::lexer::T::Str | crate::lexer::T::RawStr) {
+                    || !matches!(src.tok(lo + 2).kind, crate::lexer::T::Str | crate::lexer::T::RawStr) {
                     errors.push(format!("{location}: malformed `lang` attribute"));
                     break;
                 }

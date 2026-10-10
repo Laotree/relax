@@ -1213,7 +1213,7 @@ fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for (fi, f) in prog.files.iter().enumerate() {
         let Some(cfg) = prog.file_crate.get(fi).and_then(|&k| prog.crates.get(k as usize)).map(|c| &c.cfg) else { continue };
-        let src = crate::cfg::Src { src: &f.src, toks: &f.toks, ext: &[], ptoks: &[], parts: None };
+        let src = f.src_view();
         // Every item of the file's arena, as before: it also holds the items of macro expansions
         // the collector dropped (libc's cfg_if! branches for other targets carry no #[cfg] of
         // their own), so an empty `#[link] extern "C" {}` of another target's branch still

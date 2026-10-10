@@ -22,9 +22,8 @@ impl FileDigest {
 }
 
 fn text_range(pf: &ParsedFile) -> (u32, u32) {
-    let toks: &[crate::lexer::Tok] = &pf.toks;
-    let lo = toks.first().filter(|t| t.kind != T::Eof).map_or(0, |t| t.lo);
-    let hi = toks.iter().find(|t| t.kind == T::Eof).map_or(pf.src_len, |t| t.lo).min(pf.src.len() as u32);
+    let lo = pf.toks.get(0).filter(|t| t.kind != T::Eof).map_or(0, |t| t.lo);
+    let hi = pf.toks.iter().find(|t| t.kind == T::Eof).map_or(pf.src_len, |t| t.lo).min(pf.src.len() as u32);
     (lo.min(hi), hi)
 }
 
@@ -97,7 +96,7 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
             if blo < lo || bhi > hi || blo < it.lo || blo >= bhi || bhi > it.hi { continue; }
             // `impl Trait` in the signature: callers' types are the body's
             let t0 = pf.toks.partition_point(|t| t.lo < it.lo);
-            if pf.toks[t0..].iter().take_while(|t| t.lo < blo).any(|t| t.kind == T::KwImpl) { continue; }
+            if pf.toks.iter_from(t0).take_while(|t| t.lo < blo).any(|t| t.kind == T::KwImpl) { continue; }
             // the items the body defines (written there or expanded from there)
             let Some(v) = (if eager { in_body(blo, bhi) } else { Some(Vec::new()) }) else { continue };
             nested_in.extend(v.into_iter().map(|x| (x, i as u32)));

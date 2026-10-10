@@ -974,7 +974,8 @@ impl Program {
             if part.toks.is_empty() { continue; }
             let mut interned = self.part_interned.lock().unwrap_or_else(|e| e.into_inner());
             if !interned.insert((file, part.tok_base)) { continue; }
-            for t in &part.toks {
+            for t in part.toks.iter() {
+                let t = &t;
                 if matches!(t.kind, crate::lexer::T::Ident | crate::lexer::T::RawIdent | crate::lexer::T::Lifetime) {
                     let b = pf.bytes(t.lo, t.hi);
                     let b = if t.kind == crate::lexer::T::Lifetime { &b[1.min(b.len())..] } else { b.strip_prefix(b"r#").unwrap_or(b) };
@@ -4422,7 +4423,8 @@ pub fn stem_of(path: &str) -> &str {
 /// lists, struct literals and struct patterns.
 /// (Layouts, field indices, derives and literal checks then all see the target's real fields.)
 pub fn strip_cfg_fields(pf: &mut ParsedFile, cfg: &CfgSet) {
-    let src = Src { src: &pf.src, toks: &pf.toks, ext: &[], ptoks: &[], parts: None };
+    let view = crate::cfg::PackedSrc { src: &pf.src, toks: &pf.toks };
+    let src = Src { src: &pf.src, plain: &[], ext: &[], parts: Some(&view) };
     let ast = &mut pf.ast;
     let mut items = std::mem::take(&mut ast.items);
     for it in items.iter_mut() {
@@ -4457,7 +4459,8 @@ pub fn strip_cfg_fields(pf: &mut ParsedFile, cfg: &CfgSet) {
     }
     ast.items = items;
     let ParsedFile { src, toks, ast, .. } = pf;
-    strip_cfg_nodes(ast, Src { src: &src[..], toks: &toks[..], ext: &[], ptoks: &[], parts: None }, cfg);
+    let view = crate::cfg::PackedSrc { src: &src[..], toks };
+    strip_cfg_nodes(ast, Src { src: &src[..], plain: &[], ext: &[], parts: Some(&view) }, cfg);
 }
 
 /// cfg-strips the attribute-bearing parts of expressions and patterns (match arms, closure
@@ -4699,7 +4702,7 @@ pub fn prepare_file(pf: &mut ParsedFile, cfg: &CfgSet) -> FilePrep {
 fn ident_ranges(pf: &ParsedFile) -> Vec<(u32, u32)> {
     let mut seen: crate::fxhash::HashSet<&[u8]> = Default::default();
     let mut out = Vec::new();
-    for t in &pf.toks {
+    for t in pf.toks.iter() {
         let (lo, hi) = match t.kind {
             crate::lexer::T::Lifetime => (t.lo + 1, t.hi),
             crate::lexer::T::Ident | crate::lexer::T::RawIdent => {
@@ -4729,14 +4732,15 @@ fn body_blocks(pf: &mut ParsedFile, cfg: &CfgSet) -> BodyBlocks {
         match &it.kind {
             // a #[test] fn outside a test build is not compiled: the items and imports in its
             // body do not exist (rustc removes it before resolution)
-            ItemKind::Fn(..) if !testing && crate::cfg::is_test(Src { src: &pf.src, toks: &pf.toks, ext: &[], ptoks: &[], parts: None }, pf.ast.list(it.attrs)) => {}
+            ItemKind::Fn(..) if !testing && crate::cfg::is_test(pf.src_view(), pf.ast.list(it.attrs)) => {}
             ItemKind::Fn(_, Some(b), _) => roots.push(*b),
             ItemKind::Const(_, Some(e)) | ItemKind::Static(_, _, Some(e)) => blocks_in_expr(&pf.ast, *e, &mut roots),
             _ => {}
         }
     }
     let ParsedFile { src, toks, ast, .. } = pf;
-    let src = Src { src: &src[..], toks: &toks[..], ext: &[], ptoks: &[], parts: None };
+    let view = crate::cfg::PackedSrc { src: &src[..], toks };
+    let src = Src { src: &src[..], plain: &[], ext: &[], parts: Some(&view) };
     for b in roots {
         walk_body_block(ast, src, cfg, b, &mut out);
     }
