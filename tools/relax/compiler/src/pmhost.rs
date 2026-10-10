@@ -424,19 +424,19 @@ fn entry_of(w: &World, unit: usize, fname: &str) -> Result<u64, String> {
         return Ok(*a);
     }
     let k = w.crate_of[unit];
-    crate::jit::lock_unit();
-    let u = unsafe { &mut *w.u };
-    let prog = &u.prog;
-    let root = prog.mods[prog.crates[k as usize].root_mod as usize].def;
-    let d = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| {
-        let def = prog.def(d);
-        def.krate == k && def.parent == root && def.kind == DefKind::Fn && prog.syms.str(def.name) == fname
+    let a = crate::owner::call(crate::owner::Class::App, || {
+        let u = unsafe { &mut *w.u };
+        let prog = &u.prog;
+        let root = prog.mods[prog.crates[k as usize].root_mod as usize].def;
+        let d = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| {
+            let def = prog.def(d);
+            def.krate == k && def.parent == root && def.kind == DefKind::Fn && prog.syms.str(def.name) == fname
+        });
+        d.map(|d| {
+            let id = u.fn_id(crate::jit::FnKey::Inst(d, Vec::new()));
+            u.entry(id)
+        })
     });
-    let a = d.map(|d| {
-        let id = u.fn_id(crate::jit::FnKey::Inst(d, Vec::new()));
-        u.entry(id)
-    });
-    crate::jit::unlock_unit();
     let a = a.ok_or_else(|| format!("macro fn `{}` not found", fname))?;
     w.entries.lock().unwrap().push(((unit, fname.to_string()), a));
     Ok(a)
@@ -524,15 +524,9 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     // Reload's lexer/parser now run off the unit lock, but the JIT macro world still uses
     // the runtime's process-wide UNIT and TLS machinery. Preserve the original reload
     // serialization for this step. Cached script expansions never enter the host.
-    let depth = crate::jit::lock_depth();
     let wait = crate::load_profile::span(sess.runtime.profile, "wait-macro-unit", &entry.fname);
-    crate::jit::lock_unit();
+    crate::owner::call(crate::owner::Class::App, || -> Result<TokenStream, String> {
     drop(wait);
-    struct Unlock(u32);
-    impl Drop for Unlock {
-        fn drop(&mut self) { crate::jit::unlock_to(self.0); }
-    }
-    let _lock = Unlock(depth);
     let _held = crate::load_profile::span(sess.runtime.profile, "macro-unit-held", &entry.fname);
     if let Some(Some(e)) = w.refused.get(entry.unit) {
         return Err(format!("sandbox: {}", e));
@@ -570,16 +564,17 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
                 x.call_ns += t0.elapsed().as_nanos() as u64;
                 s.set(x);
             });
-            crate::jit::lock_unit();
-            let u = unsafe { &mut *w.u };
-            let errs = std::mem::take(&mut u.errors);
-            if trace() {
-                eprintln!("pmhost: report {}", u.report(&p));
-                for e in &errs {
-                    eprintln!("pmhost:   {}", e);
+            let errs = crate::owner::call(crate::owner::Class::App, || {
+                let u = unsafe { &mut *w.u };
+                let errs = std::mem::take(&mut u.errors);
+                if trace() {
+                    eprintln!("pmhost: report {}", u.report(&p));
+                    for e in &errs {
+                        eprintln!("pmhost:   {}", e);
+                    }
                 }
-            }
-            crate::jit::unlock_unit();
+                errs
+            });
             let first = errs.first().cloned().unwrap_or_default();
             let msg = format!("`{}` {}: {}", entry.fname, p.kind, if first.is_empty() { p.message.clone() } else { first });
             if p.message.starts_with("compile error in") {
@@ -598,12 +593,10 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     let dec_ns = td.elapsed().as_nanos() as u64;
     let tz = std::time::Instant::now();
     // Macro calls can run while lazy/spec compilers update this unit's counters.
-    crate::jit::lock_unit();
-    let (cns, cnt) = {
+    let (cns, cnt) = crate::owner::call(crate::owner::Class::App, || {
         let st = unsafe { &(*w.u).stats };
         (st.typeck_ns + st.lower_ns + st.opt_ns + st.codegen_ns, st.compiled as u64)
-    };
-    crate::jit::unlock_unit();
+    });
     STATS.with(|s| {
         let mut x = s.get();
         x.calls += 1;
@@ -617,6 +610,7 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
     });
     PH[2].fetch_add(tz.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     Ok(ts)
+    })
 }
 
 
@@ -624,12 +618,12 @@ fn call(sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: Option<&Toke
 /// goes to the disk cache.
 pub fn flush_cache() {
     if let Some(Ok(w)) = world_now().as_deref() {
-        crate::jit::lock_unit();
-        let u = unsafe { &mut *w.u };
-        if let Some(c) = u.cache.as_mut() {
-            let _ = c.flush();
-        }
-        crate::jit::unlock_unit();
+        crate::owner::call(crate::owner::Class::App, || {
+            let u = unsafe { &mut *w.u };
+            if let Some(c) = u.cache.as_mut() {
+                let _ = c.flush();
+            }
+        });
     }
 }
 

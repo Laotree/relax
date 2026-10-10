@@ -260,9 +260,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // of malloc free pages held after it)
     if compile { unsafe {
         let _job = jit::compile_job();
-        jit::lock_unit();
-        let mut d = jit::settle_drop(up);
-        jit::unlock_unit();
+        let mut d = crate::owner::call(crate::owner::Class::App, || jit::settle_drop(up));
         d.release_rir();
     } crate::memstat::trim(); }
     if crate::memstat::enabled() {
@@ -383,11 +381,11 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     // (and the run's speculative callee builds)
     jit::enable_pipelining(&(*up).prog.session.clone().options);
     // (slots made before the seeds -- the root's main, constants' readers -- are compiled too)
-    jit::lock_unit();
-    for &d in seeds {
-        (&mut *up).fn_id(FnKey::Inst(d, Vec::new()));
-    }
-    jit::unlock_unit();
+    crate::owner::call(crate::owner::Class::App, || {
+        for &d in seeds {
+            (&mut *up).fn_id(FnKey::Inst(d, Vec::new()));
+        }
+    });
     // every in-flight build holds its front end's and back end's state: at most 8 by default
     let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(8));
@@ -415,26 +413,26 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     active.fetch_add(1, Ordering::SeqCst);
                     let pick = {
                         let _job = jit::compile_job();
-                        jit::lock_unit();
-                        let n = (&(*up).fns).len();
-                        let mut pick = None;
-                        loop {
-                            let i = next.load(Ordering::SeqCst);
-                            if i >= n { break; }
-                            if next.compare_exchange(i, i + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-                                let f = &(&(*up).fns)[i];
-                                if !f.compiled {
-                                    pick = Some(i as u32);
-                                    break;
+                        crate::owner::call(crate::owner::Class::App, || {
+                            let n = (&(*up).fns).len();
+                            let mut pick = None;
+                            loop {
+                                let i = next.load(Ordering::SeqCst);
+                                if i >= n { break; }
+                                if next.compare_exchange(i, i + 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+                                    let f = &(&(*up).fns)[i];
+                                    if !f.compiled {
+                                        pick = Some(i as u32);
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        jit::unlock_unit();
-                        pick
+                            pick
+                        })
                     };
                     let Some(id) = pick else {
                         active.fetch_sub(1, Ordering::SeqCst);
-                        if active.load(Ordering::SeqCst) == 0 && next.load(Ordering::SeqCst) >= { jit::lock_unit(); let n = (&(*up).fns).len(); jit::unlock_unit(); n } {
+                        if active.load(Ordering::SeqCst) == 0 && next.load(Ordering::SeqCst) >= crate::owner::call(crate::owner::Class::App, || (&(*up).fns).len()) {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -458,9 +456,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                     if n >= at + 2_000 && settled_at.compare_exchange(at, n, Ordering::AcqRel, Ordering::Relaxed).is_ok()
                         && crate::memstat::resident() as u64 > settled_rss.load(Ordering::Relaxed) + SETTLE_GROWTH {
                         let _job = jit::compile_job();
-                        jit::lock_unit();
-                        let mut d = jit::settle_drop(up);
-                        jit::unlock_unit();
+                        let mut d = crate::owner::call(crate::owner::Class::App, || jit::settle_drop(up));
                         d.release_rir();
                         crate::memstat::trim();
                         settled_rss.store(crate::memstat::resident() as u64, Ordering::Relaxed);

@@ -147,26 +147,26 @@ fn round42_quiesce_front_snapshot_completes() {
         }
     }
     // A contending reader must withdraw unit-lock waiter bookkeeping on live preemption.
-    lock_unit();
-    let waiter = std::thread::spawn(|| {
-        let result = std::panic::catch_unwind(|| {
-            let _reader = front_read("unit-wait-test");
-            let _p = crate::preempt::Preemptible::on();
-            lock_unit();
+    crate::owner::call(crate::owner::Class::App, || {
+        let waiter = std::thread::spawn(|| {
+            let result = std::panic::catch_unwind(|| {
+                let _reader = front_read("unit-wait-test");
+                let _p = crate::preempt::Preemptible::on();
+                crate::owner::call(crate::owner::Class::App, || {});
+            });
+            assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
+            assert_eq!(lock_depth(), 0);
         });
-        assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-        assert_eq!(lock_depth(), 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while LOCK_WAITERS.load(Ordering::SeqCst) == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let writer = crate::preempt::WriterWaiting::new();
+        waiter.join().unwrap();
+        assert_eq!(LOCK_WAITERS.load(Ordering::SeqCst), 0);
+        drop(writer);
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while LOCK_WAITERS.load(Ordering::SeqCst) == 0 {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::yield_now();
-    }
-    let writer = crate::preempt::WriterWaiting::new();
-    waiter.join().unwrap();
-    assert_eq!(LOCK_WAITERS.load(Ordering::SeqCst), 0);
-    drop(writer);
-    unlock_unit();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -175,8 +175,7 @@ fn round42_quiesce_front_snapshot_completes() {
             let _p = crate::preempt::Preemptible::on();
             ready_tx.send(()).unwrap();
             go_rx.recv().unwrap();
-            lock_unit();
-            unlock_unit();
+            crate::owner::call(crate::owner::Class::App, || {});
         });
         assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
         assert_eq!(lock_depth(), 0);
@@ -192,6 +191,7 @@ fn round42_quiesce_front_snapshot_completes() {
     std::fs::remove_file(path).unwrap();
     reader.join().unwrap();
     assert_eq!(LOCK_WAITERS.load(Ordering::SeqCst), 0);
+    // releases the hold `quiesce` above returned with
     unlock_unit();
 }
 
@@ -237,58 +237,68 @@ fn main() {}
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
-    lock_unit();
-    let id = u.fn_id(FnKey::Inst(def, Vec::new()));
-    assert!(relax_level(&u, id) < 3, "the fixture must be unmarked");
-    let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
-    cache.mode = crate::cache::Mode::On;
-    u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
-    let entry;
+    let mut entry = None;
+    let mut first_slot = None;
+    let mut initial_slot = None;
+    let id = crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(FnKey::Inst(def, Vec::new()));
+        assert!(relax_level(&u, id) < 3, "the fixture must be unmarked");
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::ReadOnly).unwrap();
+        cache.mode = crate::cache::Mode::On;
+        u.cache = Some(Box::new(crate::cache::CacheCell::new(cache)));
+        if phase == "cold" {
+            let first = unsafe { compile_fn(up, id) }.unwrap();
+            let initial = u.install(id, &first.0, &first.2, first.1.clone(), 0).unwrap();
+            let mut cache = u.cache.take().unwrap();
+            cache.record_o2(&u, id, &first.0, &first.2, &first.1);
+            assert!(cache.pending_bytes() > 0);
+            u.cache = Some(cache);
+            first_slot = Some(first);
+            initial_slot = Some(initial);
+        } else {
+            entry = Some(unsafe { ready_code_locked(up, id) }.expect("hot O3 must link on the second launch"));
+            assert!(u.fns[id as usize].o3.load(Ordering::Relaxed));
+            assert_eq!(u.stats.tier1_cached, 1);
+            assert_eq!(u.stats.tier1_installed, 0, "warm linking must not rebuild O3");
+            assert!(u.fns[id as usize].rir.is_none());
+            assert_eq!(unsafe { (*tier_rec(u.tier_base, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
+            assert!(u.frequency_profiles.contains_key(&id), "cached O3 keeps its training opportunity");
+            assert!(TIER_QUEUE.lock().unwrap().is_empty());
+            assert!(O2_QUEUE.lock().unwrap().is_empty());
+        }
+        id
+    });
     if phase == "cold" {
-        let first = unsafe { compile_fn(up, id) }.unwrap();
-        let initial = u.install(id, &first.0, &first.2, first.1.clone(), 0).unwrap();
-        let mut cache = u.cache.take().unwrap();
-        cache.record_o2(&u, id, &first.0, &first.2, &first.1);
-        assert!(cache.pending_bytes() > 0);
-        u.cache = Some(cache);
-        unlock_unit();
+        let (first, initial) = (first_slot.unwrap(), initial_slot.unwrap());
         let mut result = 0u32;
         unsafe { call_jit(up, initial, &mut result as *mut u32 as u64) }
             .unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
         assert_eq!(result, 19900);
         assert!(unsafe { compile_tier1(up, id) });
-        lock_unit();
-        let recorded = u.cache.as_ref().unwrap().stats.recorded;
-        // A frequency retier replaces the first O3 entry too.
-        u.frequency_profiles.get_mut(&id).unwrap().samples = FREQUENCY_SAMPLES;
-        unlock_unit();
+        let recorded = crate::owner::call(crate::owner::Class::App, || {
+            let recorded = u.cache.as_ref().unwrap().stats.recorded;
+            // A frequency retier replaces the first O3 entry too.
+            u.frequency_profiles.get_mut(&id).unwrap().samples = FREQUENCY_SAMPLES;
+            recorded
+        });
         assert!(unsafe { compile_tier1(up, id) });
-        lock_unit();
-        assert_eq!(u.cache.as_ref().unwrap().stats.recorded, recorded + 1);
-        let mut cache = u.cache.take().unwrap();
-        let recorded = cache.stats.recorded;
-        let bytes = cache.pending_bytes();
-        // Simulate an O2 build finishing after O3 has installed.
-        cache.record_o2(&u, id, &first.0, &first.2, &first.1);
-        assert_eq!(cache.stats.recorded, recorded);
-        assert_eq!(cache.pending_bytes(), bytes);
-        let spill = cache.spill_take().unwrap();
-        u.cache = Some(cache);
-        entry = u.fns[id as usize].code;
-        unlock_unit();
+        let spill = crate::owner::call(crate::owner::Class::App, || {
+            assert_eq!(u.cache.as_ref().unwrap().stats.recorded, recorded + 1);
+            let mut cache = u.cache.take().unwrap();
+            let recorded = cache.stats.recorded;
+            let bytes = cache.pending_bytes();
+            // Simulate an O2 build finishing after O3 has installed.
+            cache.record_o2(&u, id, &first.0, &first.2, &first.1);
+            assert_eq!(cache.stats.recorded, recorded);
+            assert_eq!(cache.pending_bytes(), bytes);
+            let spill = cache.spill_take().unwrap();
+            u.cache = Some(cache);
+            entry = Some(u.fns[id as usize].code);
+            spill
+        });
         assert!(spill.write().unwrap() > 0);
-    } else {
-        entry = unsafe { ready_code_locked(up, id) }.expect("hot O3 must link on the second launch");
-        assert!(u.fns[id as usize].o3.load(Ordering::Relaxed));
-        assert_eq!(u.stats.tier1_cached, 1);
-        assert_eq!(u.stats.tier1_installed, 0, "warm linking must not rebuild O3");
-        assert!(u.fns[id as usize].rir.is_none());
-        assert_eq!(unsafe { (*tier_rec(u.tier_base, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
-        assert!(u.frequency_profiles.contains_key(&id), "cached O3 keeps its training opportunity");
-        assert!(TIER_QUEUE.lock().unwrap().is_empty());
-        assert!(O2_QUEUE.lock().unwrap().is_empty());
-        unlock_unit();
     }
+    let entry = entry.unwrap();
     let mut result = 0u32;
     unsafe { call_jit(up, entry, &mut result as *mut u32 as u64) }
         .unwrap_or_else(|p| panic!("JIT call panicked: {}", p.message));
@@ -339,152 +349,154 @@ fn unrelated(x: u32) -> u32 { x + 1 }
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let mut u = Unit::new(prog, tcx, core);
     let up = &mut *u as *mut Unit;
-    lock_unit();
-    let id = u.fn_id(FnKey::Inst(def, Vec::new()));
-    let file = u.prog.def(def).file;
-    let first = unsafe { compile_fn(up, id) }.unwrap();
-    u.install(id, &first.0, &first.2, first.1.clone(), 0).unwrap();
-    let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::On).unwrap();
-    cache.record(&u, id, &first.0, &first.2, &first.1);
-    if cache.pending_bytes() == 0 {
-        use crate::types::fold::{TypeFolder, super_fold_ty};
-        struct KeyAudit(std::collections::HashSet<TyId>);
-        impl TypeFolder for KeyAudit {
-            fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
-                if !self.0.insert(ty) { return ty; }
-                if !tys.is_concrete(ty) || matches!(tys.kind(ty), TyKind::FnPtr(..)) {
-                    eprintln!("settle cache type: {ty:?} {:?}, flags {:?}, binder depth {depth}", std::mem::discriminant(tys.kind(ty)), tys.flags(ty));
-                    if let TyKind::FnPtr(inputs, output, _, count) = tys.kind(ty) { eprintln!("settle cache signature: {inputs:?} -> {output:?}, {count} bound regions"); }
+    let (id, file, first, spill) = crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(FnKey::Inst(def, Vec::new()));
+        let file = u.prog.def(def).file;
+        let first = unsafe { compile_fn(up, id) }.unwrap();
+        u.install(id, &first.0, &first.2, first.1.clone(), 0).unwrap();
+        let mut cache = crate::cache::Cache::open(&u, crate::cache::Mode::On).unwrap();
+        cache.record(&u, id, &first.0, &first.2, &first.1);
+        if cache.pending_bytes() == 0 {
+            use crate::types::fold::{TypeFolder, super_fold_ty};
+            struct KeyAudit(std::collections::HashSet<TyId>);
+            impl TypeFolder for KeyAudit {
+                fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+                    if !self.0.insert(ty) { return ty; }
+                    if !tys.is_concrete(ty) || matches!(tys.kind(ty), TyKind::FnPtr(..)) {
+                        eprintln!("settle cache type: {ty:?} {:?}, flags {:?}, binder depth {depth}", std::mem::discriminant(tys.kind(ty)), tys.flags(ty));
+                        if let TyKind::FnPtr(inputs, output, _, count) = tys.kind(ty) { eprintln!("settle cache signature: {inputs:?} -> {output:?}, {count} bound regions"); }
+                    }
+                    match tys.kind(ty) {
+                        TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Alias(_, crate::types::AliasTy { regions: rs, .. }) if *rs != crate::types::RegionArgsId::EMPTY => eprintln!("settle cache region args: {ty:?} {:?}", tys.region_args(*rs)),
+                        _ => {}
+                    }
+                    super_fold_ty(tys, ty, self, depth)
                 }
-                match tys.kind(ty) {
-                    TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Alias(_, crate::types::AliasTy { regions: rs, .. }) if *rs != crate::types::RegionArgsId::EMPTY => eprintln!("settle cache region args: {ty:?} {:?}", tys.region_args(*rs)),
-                    _ => {}
+                fn fold_region(&mut self, tys: &crate::types::Types, region: crate::types::RegionId, depth: u32) -> crate::types::RegionId {
+                    if region != crate::types::RegionId::ERASED { eprintln!("settle cache region: {:?}, binder depth {depth}", tys.region_kind(region)); }
+                    region
                 }
-                super_fold_ty(tys, ty, self, depth)
             }
-            fn fold_region(&mut self, tys: &crate::types::Types, region: crate::types::RegionId, depth: u32) -> crate::types::RegionId {
-                if region != crate::types::RegionId::ERASED { eprintln!("settle cache region: {:?}, binder depth {depth}", tys.region_kind(region)); }
-                region
+            for &(callee, _) in &u.fns[id as usize].rir.as_ref().unwrap().nounwind_inputs {
+                let entry = &u.fns[callee as usize];
+                let types = match &entry.key { FnKey::Inst(_, args) => args.iter().map(|t| crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t)).collect::<Vec<_>>(), _ => Vec::new() };
+                eprintln!("settle cache input: {} {:?} {:?}", entry.name, entry.key, types);
+                if let FnKey::Inst(_, args) = &entry.key {
+                    let mut audit = KeyAudit(Default::default());
+                    for &ty in args {
+                        eprintln!("settle cache arg: {ty:?}, monomorphic {}, erased {}, flags {:?}", u.tcx.tys.is_concrete(ty), u.tcx.tys.erase_regions(ty) == ty, u.tcx.tys.flags(ty));
+                        audit.fold_ty(&u.tcx.tys, ty, 0);
+                    }
+                }
             }
         }
-        for &(callee, _) in &u.fns[id as usize].rir.as_ref().unwrap().nounwind_inputs {
-            let entry = &u.fns[callee as usize];
-            let types = match &entry.key { FnKey::Inst(_, args) => args.iter().map(|t| crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t)).collect::<Vec<_>>(), _ => Vec::new() };
-            eprintln!("settle cache input: {} {:?} {:?}", entry.name, entry.key, types);
-            if let FnKey::Inst(_, args) = &entry.key {
-                let mut audit = KeyAudit(Default::default());
-                for &ty in args {
-                    eprintln!("settle cache arg: {ty:?}, monomorphic {}, erased {}, flags {:?}", u.tcx.tys.is_concrete(ty), u.tcx.tys.erase_regions(ty) == ty, u.tcx.tys.flags(ty));
-                    audit.fold_ty(&u.tcx.tys, ty, 0);
-                }
-            }
-        }
-    }
-    assert!(cache.pending_bytes() > 0, "cache rejected fixture: {:?}", cache.why_unencodable);
-    let spill = cache.spill_take().unwrap();
-    assert_eq!(cache.pending_bytes(), 0);
-    unlock_unit();
+        assert!(cache.pending_bytes() > 0, "cache rejected fixture: {:?}", cache.why_unencodable);
+        let spill = cache.spill_take().unwrap();
+        assert_eq!(cache.pending_bytes(), 0);
+        (id, file, first, spill)
+    });
     assert!(spill.write().unwrap() > 0);
-    lock_unit();
-    let mut verify = crate::cache::Cache::open(&u, crate::cache::Mode::Verify).unwrap();
-    assert!(matches!(verify.lookup(&mut u, id), Some(_)), "verification must have a real disk entry");
-    let rir = u.fns[id as usize].rir.as_ref().unwrap().dump();
-    let calls = u.fns[id as usize].calls.clone();
-    let definition_body = u.tcx.typeck(&u.prog, def);
-    let closure = u.fns.iter().enumerate().find_map(|(i, f)| {
-        matches!(f.key, FnKey::Closure(_, _, p) if p == id).then_some(i as u32)
-    }).unwrap();
-    unsafe { build_rir(up, closure) }.unwrap();
-    let closure_rir = u.fns[closure as usize].rir.as_ref().unwrap().dump();
-    let c = unsafe { compile_fn(up, closure) }.unwrap();
-    u.install(closure, &c.0, &c.2, c.1, 0).unwrap();
-    assert!(u.fns[id as usize].rir.is_none(), "last closure reader releases its installed owner");
-    assert!(!u.has_body(id, file));
-    unsafe { build_rir(up, id) }.unwrap();
-    assert!(std::sync::Arc::ptr_eq(&definition_body, &u.tcx.typeck(&u.prog, def)), "settling instance storage preserves the definition query");
-    let unrelated_def = u.prog.defs.iter().enumerate().find_map(|(i, d)| {
-        let id = DefId(i as u32);
-        (d.krate == krate && u.prog.name(id) == "unrelated").then_some(id)
-    }).unwrap();
-    let unrelated = u.fn_id(FnKey::Inst(unrelated_def, Vec::new()));
-    let code = unsafe { compile_fn(up, unrelated) }.unwrap();
-    u.install(unrelated, &code.0, &code.2, code.1, 0).unwrap();
-    let saved_refs = std::mem::replace(&mut u.fns[id as usize].rir_refs, vec![unrelated].into_boxed_slice());
-    // Pending and popped/in-flight O3 jobs both pin their input slots.
-    TIER_QUEUE.lock().unwrap().push((id, Q_CALLS, wall_ns(), 0));
-    TIER_ACTIVE.lock().unwrap().push(closure);
-    let active = TierActive(closure);
-    let generation = reclaim_generation();
-    drop_completed_body(&mut u, id);
-    drop_completed_body(&mut u, closure);
-    unsafe { settle_drop(up) };
-    assert!(u.fns[id as usize].rir.is_some());
-    assert!(u.fns[closure as usize].rir.is_some());
-    assert!(u.fns[unrelated as usize].rir.is_some(), "queued readers pin their known callee inputs too");
-    u.fns[id as usize].rir_refs = saved_refs;
-    TIER_QUEUE.lock().unwrap().clear();
-    drop(active);
-    assert!(reclaim_generation() > generation, "finishing the last reader must wake reclamation without a new install");
-    // A suspended O1 front must keep all of its not-yet-snapshotted candidates.
-    u.fns[id as usize].building = true;
-    let saved_calls = std::mem::replace(&mut u.fns[id as usize].calls, vec![closure].into_boxed_slice());
-    let checking = FRONT_RW.read().unwrap();
-    let partial = unsafe { settle_drop(up) };
-    assert!(partial.front_pending, "a busy ahead checker postpones only shared memo removal");
-    assert!(u.fns[id as usize].rir.is_some());
-    assert!(u.fns[closure as usize].rir.is_some(), "a suspended front pins its inline candidate");
-    assert!(u.fns[unrelated as usize].rir.is_none(), "an unrelated completed body need not wait for that front");
-    drop(checking);
-    u.fns[id as usize].calls = saved_calls;
-    u.fns[id as usize].building = false;
-    u.fns[id as usize].inflight = true;
-    unsafe { settle_drop(up) };
-    assert!(u.fns[id as usize].rir.is_some());
-    u.fns[id as usize].inflight = false;
-    drop_completed_body(&mut u, id);
-    assert!(u.fns[id as usize].rir.is_none(), "installation releases the completed slot immediately");
-    assert!(!u.has_body(id, file));
-    unsafe { build_rir(up, closure) }.unwrap();
-    let retired = std::sync::Arc::downgrade(u.fns[closure as usize].rir.as_ref().unwrap());
-    let mut dropped = unsafe { settle_drop(up) };
-    assert!(dropped.fns >= 1);
-    assert!(u.fns[id as usize].rir.is_none());
-    assert!(u.fns[closure as usize].rir.is_none());
-    assert!(retired.upgrade().is_some(), "unlinking must defer destruction until after unlocking");
-    unlock_unit();
+    let (mut verify, rir, calls, closure, closure_rir, mut dropped, retired) = crate::owner::call(crate::owner::Class::App, || {
+        let mut verify = crate::cache::Cache::open(&u, crate::cache::Mode::Verify).unwrap();
+        assert!(matches!(verify.lookup(&mut u, id), Some(_)), "verification must have a real disk entry");
+        let rir = u.fns[id as usize].rir.as_ref().unwrap().dump();
+        let calls = u.fns[id as usize].calls.clone();
+        let definition_body = u.tcx.typeck(&u.prog, def);
+        let closure = u.fns.iter().enumerate().find_map(|(i, f)| {
+            matches!(f.key, FnKey::Closure(_, _, p) if p == id).then_some(i as u32)
+        }).unwrap();
+        unsafe { build_rir(up, closure) }.unwrap();
+        let closure_rir = u.fns[closure as usize].rir.as_ref().unwrap().dump();
+        let c = unsafe { compile_fn(up, closure) }.unwrap();
+        u.install(closure, &c.0, &c.2, c.1, 0).unwrap();
+        assert!(u.fns[id as usize].rir.is_none(), "last closure reader releases its installed owner");
+        assert!(!u.has_body(id, file));
+        unsafe { build_rir(up, id) }.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&definition_body, &u.tcx.typeck(&u.prog, def)), "settling instance storage preserves the definition query");
+        let unrelated_def = u.prog.defs.iter().enumerate().find_map(|(i, d)| {
+            let id = DefId(i as u32);
+            (d.krate == krate && u.prog.name(id) == "unrelated").then_some(id)
+        }).unwrap();
+        let unrelated = u.fn_id(FnKey::Inst(unrelated_def, Vec::new()));
+        let code = unsafe { compile_fn(up, unrelated) }.unwrap();
+        u.install(unrelated, &code.0, &code.2, code.1, 0).unwrap();
+        let saved_refs = std::mem::replace(&mut u.fns[id as usize].rir_refs, vec![unrelated].into_boxed_slice());
+        // Pending and popped/in-flight O3 jobs both pin their input slots.
+        TIER_QUEUE.lock().unwrap().push((id, Q_CALLS, wall_ns(), 0));
+        TIER_ACTIVE.lock().unwrap().push(closure);
+        let active = TierActive(closure);
+        let generation = reclaim_generation();
+        drop_completed_body(&mut u, id);
+        drop_completed_body(&mut u, closure);
+        unsafe { settle_drop(up) };
+        assert!(u.fns[id as usize].rir.is_some());
+        assert!(u.fns[closure as usize].rir.is_some());
+        assert!(u.fns[unrelated as usize].rir.is_some(), "queued readers pin their known callee inputs too");
+        u.fns[id as usize].rir_refs = saved_refs;
+        TIER_QUEUE.lock().unwrap().clear();
+        drop(active);
+        assert!(reclaim_generation() > generation, "finishing the last reader must wake reclamation without a new install");
+        // A suspended O1 front must keep all of its not-yet-snapshotted candidates.
+        u.fns[id as usize].building = true;
+        let saved_calls = std::mem::replace(&mut u.fns[id as usize].calls, vec![closure].into_boxed_slice());
+        let checking = FRONT_RW.read().unwrap();
+        let partial = unsafe { settle_drop(up) };
+        assert!(partial.front_pending, "a busy ahead checker postpones only shared memo removal");
+        assert!(u.fns[id as usize].rir.is_some());
+        assert!(u.fns[closure as usize].rir.is_some(), "a suspended front pins its inline candidate");
+        assert!(u.fns[unrelated as usize].rir.is_none(), "an unrelated completed body need not wait for that front");
+        drop(checking);
+        u.fns[id as usize].calls = saved_calls;
+        u.fns[id as usize].building = false;
+        u.fns[id as usize].inflight = true;
+        unsafe { settle_drop(up) };
+        assert!(u.fns[id as usize].rir.is_some());
+        u.fns[id as usize].inflight = false;
+        drop_completed_body(&mut u, id);
+        assert!(u.fns[id as usize].rir.is_none(), "installation releases the completed slot immediately");
+        assert!(!u.has_body(id, file));
+        unsafe { build_rir(up, closure) }.unwrap();
+        let retired = std::sync::Arc::downgrade(u.fns[closure as usize].rir.as_ref().unwrap());
+        let dropped = unsafe { settle_drop(up) };
+        assert!(dropped.fns >= 1);
+        assert!(u.fns[id as usize].rir.is_none());
+        assert!(u.fns[closure as usize].rir.is_none());
+        assert!(retired.upgrade().is_some(), "unlinking must defer destruction until after unlocking");
+        (verify, rir, calls, closure, closure_rir, dropped, retired)
+    });
     dropped.release_rir();
-    lock_unit();
-    assert!(retired.upgrade().is_none(), "retired RIR must actually be released off the unit lock");
-    assert_eq!(u.fns[id as usize].calls, calls);
-    assert!(!u.has_body(id, file));
-    // Rebuild the closure FIRST: its compiled parent no longer has a checked body or RIR.
-    unsafe { build_rir(up, closure) }.unwrap();
-    assert_eq!(u.fns[closure as usize].rir.as_ref().unwrap().dump(), closure_rir);
-    let rebuilt = unsafe { compile_fn(up, id) }.unwrap();
-    assert_eq!(u.fns[id as usize].rir.as_ref().unwrap().dump(), rir);
-    assert_eq!(rebuilt.0, first.0, "O1 machine code changed after settle");
-    assert!(verify.verify_entry(&u, id, &rebuilt.0, &rebuilt.2), "cache verify after settle");
-    unsafe { settle_drop(up) };
-    unlock_unit();
+    crate::owner::call(crate::owner::Class::App, || {
+        assert!(retired.upgrade().is_none(), "retired RIR must actually be released off the unit lock");
+        assert_eq!(u.fns[id as usize].calls, calls);
+        assert!(!u.has_body(id, file));
+        // Rebuild the closure FIRST: its compiled parent no longer has a checked body or RIR.
+        unsafe { build_rir(up, closure) }.unwrap();
+        assert_eq!(u.fns[closure as usize].rir.as_ref().unwrap().dump(), closure_rir);
+        let rebuilt = unsafe { compile_fn(up, id) }.unwrap();
+        assert_eq!(u.fns[id as usize].rir.as_ref().unwrap().dump(), rir);
+        assert_eq!(rebuilt.0, first.0, "O1 machine code changed after settle");
+        assert!(verify.verify_entry(&u, id, &rebuilt.0, &rebuilt.2), "cache verify after settle");
+        unsafe { settle_drop(up) };
+    });
     assert!(unsafe { compile_tier1(up, id) }, "O3 must rebuild settled RIR");
-    lock_unit();
-    unsafe { settle_drop(up) };
-    assert!(!u.has_body(id, file));
-    unlock_unit();
+    crate::owner::call(crate::owner::Class::App, || {
+        unsafe { settle_drop(up) };
+        assert!(!u.has_body(id, file));
+    });
     // Apply a real edit after eviction; old compiled closures still rebuild from old text.
     let outcome = unsafe { crate::reload::apply(up, vec![crate::reload::Edit {
         file, path: path.to_str().unwrap().to_string(), src: source.replace("*v + 7", "*v + 9").into_bytes(),
     }]) };
     assert_eq!(outcome.rung, crate::reload::Rung::Patch, "{:?}", outcome.lines);
-    lock_unit();
-    assert!(u.has_body(id, file), "reload must preserve the old closure owner");
-    u.fns[closure as usize].rir = None;
-    unsafe { build_rir(up, closure) }.unwrap();
-    assert_eq!(u.fns[closure as usize].rir.as_ref().unwrap().dump(), closure_rir);
-    // Unit normally lives to process exit; leak it here to avoid tearing down process-global
-    // JIT workers from this test. The test process releases its executable reservation.
-    std::mem::forget(u);
-    unlock_unit();
+    crate::owner::call(crate::owner::Class::App, || {
+        assert!(u.has_body(id, file), "reload must preserve the old closure owner");
+        u.fns[closure as usize].rir = None;
+        unsafe { build_rir(up, closure) }.unwrap();
+        assert_eq!(u.fns[closure as usize].rir.as_ref().unwrap().dump(), closure_rir);
+        // Unit normally lives to process exit; leak it here to avoid tearing down process-global
+        // JIT workers from this test. The test process releases its executable reservation.
+        std::mem::forget(u);
+    });
     std::fs::remove_file(path).unwrap();
     // Keep the isolated cache for inspection; it lives under the OS temporary directory.
 }
@@ -535,39 +547,41 @@ fn round42_const_and_build_cancellation_are_retryable() {
     let original = u.tcx.const_eval_provider.unwrap();
     u.tcx.const_eval_provider.as_mut().unwrap().evaluate = cancel_provider;
     for depth in [0, 2] {
-        while lock_depth() < depth { lock_unit(); }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, value, &[])));
-        assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-        assert_eq!(lock_depth(), depth);
-        assert!(!u.tcx.const_was_evaluated(value));
-        assert!(!u.consts.contains_key(&(value, vec![])));
-        assert!(!u.const_failed.contains(&(value, vec![])));
-        assert_eq!(u.tcx.dcx.err_count(), 0);
-        assert!(u.errors.is_empty());
-        unlock_to(0);
+        let body = || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, value, &[])));
+            assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
+            assert_eq!(lock_depth(), depth);
+            assert!(!u.tcx.const_was_evaluated(value));
+            assert!(!u.consts.contains_key(&(value, vec![])));
+            assert!(!u.const_failed.contains(&(value, vec![])));
+            assert_eq!(u.tcx.dcx.err_count(), 0);
+            assert!(u.errors.is_empty());
+        };
+        // depth 0: no unit call; depth 2: two nested ones
+        if depth == 0 { body() } else { crate::owner::call(crate::owner::Class::App, || crate::owner::call(crate::owner::Class::App, body)) }
     }
     u.tcx.const_eval_provider = Some(original);
     let value = u.tcx.const_eval_resolve(&u.prog, env, value, &[]).unwrap();
     assert_eq!(value.try_to_leaf().unwrap().to_bits(4), 3);
     assert_eq!(lock_depth(), 0);
-    lock_unit();
-    let id = u.fn_id(FnKey::Inst(target, vec![]));
-    let depth = lock_depth();
-    let writer = crate::preempt::WriterWaiting::new();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _p = crate::preempt::Preemptible::on();
-        unsafe { build_rir_mode(up, id, RirMode::Tier0) }
-    }));
-    assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-    assert_eq!(lock_depth(), depth);
-    assert!(!u.fns[id as usize].building);
-    assert!(u.fns[id as usize].build_err.is_none());
-    assert!(u.fns[id as usize].rir.is_none());
-    assert!(BUILD_STACK.with(|s| s.borrow().is_empty()));
-    drop(writer);
-    unsafe { build_rir_mode(up, id, RirMode::Tier0) }.unwrap();
-    assert!(u.fns[id as usize].rir.is_some());
-    unlock_to(0);
+    crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(FnKey::Inst(target, vec![]));
+        let depth = lock_depth();
+        let writer = crate::preempt::WriterWaiting::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _p = crate::preempt::Preemptible::on();
+            unsafe { build_rir_mode(up, id, RirMode::Tier0) }
+        }));
+        assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
+        assert_eq!(lock_depth(), depth);
+        assert!(!u.fns[id as usize].building);
+        assert!(u.fns[id as usize].build_err.is_none());
+        assert!(u.fns[id as usize].rir.is_none());
+        assert!(BUILD_STACK.with(|s| s.borrow().is_empty()));
+        drop(writer);
+        unsafe { build_rir_mode(up, id, RirMode::Tier0) }.unwrap();
+        assert!(u.fns[id as usize].rir.is_some());
+    });
 }
 
 #[test]

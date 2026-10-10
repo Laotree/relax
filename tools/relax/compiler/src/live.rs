@@ -10,19 +10,17 @@ fn run_tests(u: &mut Unit, tests: &[DefId]) -> Option<jit::PanicInfo> {
     for d in tests {
         let name = u.prog.def_path(*d);
         // speculative workers compile concurrently: unit access under the lock
-        jit::lock_unit();
-        let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
-        let entry = u.entry(id);
-        jit::unlock_unit();
+        let entry = crate::owner::call(crate::owner::Class::App, || {
+            let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
+            u.entry(id)
+        });
         let t0 = Instant::now();
         jit::watchdog(10_000);
         let up: *mut Unit = u;
         let r = unsafe { jit::call_jit(up, entry, 0) };
         jit::watchdog_done();
         let dt = t0.elapsed().as_secs_f64() * 1e3;
-        jit::lock_unit();
-        let errs = std::mem::take(&mut u.errors);
-        jit::unlock_unit();
+        let errs = crate::owner::call(crate::owner::Class::App, || std::mem::take(&mut u.errors));
         for e in errs {
             println!("  {}", e);
         }
@@ -171,16 +169,17 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             undos.push(undo);
         }
         if let Some(p) = run_tests(&mut u, &tests) {
-            jit::lock_unit();
-            println!("  crash report: {}", u.report(&p));
-            // roll back the most recent patch group that has code on the stack
-            let mut best_gen = 0;
-            for pc in &p.frames {
-                if let Some(id) = u.find_fn(*pc) {
-                    best_gen = best_gen.max(u.fns[id as usize].patch_gen);
+            let best_gen = crate::owner::call(crate::owner::Class::App, || {
+                println!("  crash report: {}", u.report(&p));
+                // roll back the most recent patch group that has code on the stack
+                let mut best_gen = 0;
+                for pc in &p.frames {
+                    if let Some(id) = u.find_fn(*pc) {
+                        best_gen = best_gen.max(u.fns[id as usize].patch_gen);
+                    }
                 }
-            }
-            jit::unlock_unit();
+                best_gen
+            });
             match undos.iter().position(|x| x.group == best_gen) {
                 Some(i) if best_gen > 0 => {
                     let undo = undos.remove(i);

@@ -135,10 +135,10 @@ fn gandalf_live_edit_guard_and_reporting() {
     crate::borrowck::event::set_app_scope(roots);
     let mut u = crate::jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
-    crate::jit::lock_unit();
-    let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
-    let entry = u.entry(id);
-    crate::jit::unlock_unit();
+    let entry = crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
+        u.entry(id)
+    });
     let run = |expected| {
         let mut result = 0u32;
         // call_jit returns a recovery status, so observe the function's output via its arg.
@@ -289,11 +289,10 @@ fn app_scope_live_layout_edits() {
     let mut u = jit::Unit::new(prog, tcx, core);
     let up = &mut *u as *mut jit::Unit;
     let entry = |u: &mut jit::Unit, d| {
-        jit::lock_unit();
-        let id = u.fn_id(FnKey::Inst(d, vec![]));
-        let entry = u.entry(id);
-        jit::unlock_unit();
-        entry
+        crate::owner::call(crate::owner::Class::App, || {
+            let id = u.fn_id(FnKey::Inst(d, vec![]));
+            u.entry(id)
+        })
     };
     let init = entry(&mut u, init);
     let value = entry(&mut u, value);
@@ -305,10 +304,10 @@ fn app_scope_live_layout_edits() {
     call(init, old_value.as_mut_ptr() as u64);
     call(value, old_value.as_mut_ptr() as u64);
     assert_eq!(old_value[layout.fields[0] as usize / 8], 42);
-    jit::lock_unit();
-    let drop_id = u.fn_id(FnKey::Glue(crate::jit::GLUE_DROP, ty));
-    let drop_entry = u.entry(drop_id);
-    jit::unlock_unit();
+    let (drop_id, drop_entry) = crate::owner::call(crate::owner::Class::App, || {
+        let drop_id = u.fn_id(FnKey::Glue(crate::jit::GLUE_DROP, ty));
+        (drop_id, u.entry(drop_id))
+    });
     let mut empty = vec![0u64; old_value.len()];
     call(drop_entry, empty.as_mut_ptr() as u64);
     let mut actual_name = [0usize; 2];
@@ -438,10 +437,10 @@ fn restored_images_take_live_edits() {
     drop(prog);
     let mut u = crate::jit::Unit::new(restored, restored_tcx, core);
     let up = &mut *u as *mut crate::jit::Unit;
-    crate::jit::lock_unit();
-    let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
-    let entry = u.entry(id);
-    crate::jit::unlock_unit();
+    let entry = crate::owner::call(crate::owner::Class::App, || {
+        let id = u.fn_id(crate::jit::FnKey::Inst(def, vec![]));
+        u.entry(id)
+    });
     let run = |expected| {
         let mut result = 0u32;
         unsafe { crate::jit::call_jit(up, entry, &mut result as *mut u32 as u64) }

@@ -760,11 +760,9 @@ pub extern "C" fn __relax_module_load(name: *const u8, nlen: usize, path: *const
 /// module in errors and positions (embedded presets, user and AI edits held in memory).
 pub extern "C" fn __relax_module_load_src(name: *const u8, nlen: usize, path: *const u8, plen: usize, src: *const u8, slen: usize, deps: *const u8, dlen: usize) -> u64 {
     // an internal error of Relax's never unwinds into the program (this is an extern "C" entry)
-    let depth = jit::lock_depth();
     match std::panic::catch_unwind(|| load_src_inner(name, nlen, path, plen, src, slen, deps, dlen)) {
         Ok(h) => h,
         Err(p) => {
-            jit::unlock_to(depth);
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
             set_error(format!("internal compiler error loading a module: {}{} -- Relax bug, report it", msg, jit::take_ice_location()));
             0
@@ -818,19 +816,20 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
         ms.push(Module { name: name.clone(), krate: u32::MAX, file: 0, path: shown.clone(), defs: Vec::new(), gen: 0, alive: false, arena: None, wrapper: None, extra_exports: Vec::new(), skipped: Vec::new() });
         ms.len() - 1
     };
-    jit::lock_unit();
-    let r = if trusted {
-        unsafe { load(up, &name, &path, &deps, false) }.map(|(k, f, d)| (k, f, d, None, None, Vec::new()))
-    } else {
-        unsafe { load_sandboxed(up, idx as u32, &name, &path, &deps) }.map(|(k, f, d, w, a, sk)| (k, f, d, Some(w), Some(a), sk))
-    };
-    if r.is_ok() && temp.is_some() {
-        let u = unsafe { &mut *up };
-        if let Ok((_, file, _, _, _, _)) = &r {
-            u.prog.file_paths[*file as usize] = shown.clone();
+    let r = crate::owner::call(crate::owner::program_class(), || {
+        let r = if trusted {
+            unsafe { load(up, &name, &path, &deps, false) }.map(|(k, f, d)| (k, f, d, None, None, Vec::new()))
+        } else {
+            unsafe { load_sandboxed(up, idx as u32, &name, &path, &deps) }.map(|(k, f, d, w, a, sk)| (k, f, d, Some(w), Some(a), sk))
+        };
+        if r.is_ok() && temp.is_some() {
+            let u = unsafe { &mut *up };
+            if let Ok((_, file, _, _, _, _)) = &r {
+                u.prog.file_paths[*file as usize] = shown.clone();
+            }
         }
-    }
-    jit::unlock_unit();
+        r
+    });
     match r {
         Ok((krate, file, defs, wrapper, arena, skipped)) => {
             let mut ms = MODULES.lock().unwrap_or_else(|e| e.into_inner());
@@ -857,17 +856,17 @@ pub extern "C" fn __relax_module_get(h: u64, name: *const u8, nlen: usize, ty: *
         }
     };
     let up = jit::current_unit();
-    jit::lock_unit();
-    let ready = unsafe { ensure_export(up, idx, m, &name) };
-    let u = unsafe { &mut *up };
-    let r = ready.and_then(|_| export(u, m, &name)).and_then(|(d, t)| {
-        if t != ty {
-            return Err(format!("export `{}` of module `{}` is `{}`, not `{}`", name, m.name, t, ty));
-        }
-        let id = u.fn_id(FnKey::Inst(d, Vec::new()));
-        Ok(u.entry(id))
+    let r = crate::owner::call(crate::owner::program_class(), || {
+        let ready = unsafe { ensure_export(up, idx, m, &name) };
+        let u = unsafe { &mut *up };
+        ready.and_then(|_| export(u, m, &name)).and_then(|(d, t)| {
+            if t != ty {
+                return Err(format!("export `{}` of module `{}` is `{}`, not `{}`", name, m.name, t, ty));
+            }
+            let id = u.fn_id(FnKey::Inst(d, Vec::new()));
+            Ok(u.entry(id))
+        })
     });
-    jit::unlock_unit();
     match r {
         Ok(a) => a,
         Err(e) => {
@@ -927,24 +926,24 @@ pub extern "C" fn __relax_module_unload(h: u64) {
         }
     };
     let up = jit::current_unit();
-    jit::lock_unit();
-    let u = unsafe { &mut *up };
-    defs.extend((0..u.prog.defs.len()).filter(|&i| u.prog.defs[i].krate == module_crate).map(|i| DefId(i as u32)));
-    defs.sort_unstable_by_key(|d| d.0);
-    defs.dedup();
-    {
-        let _fw = jit::front_write();
-        let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
-        u.prog.unbind_defs(&defs);
-        u.tcx.uncollect_impls(&impls);
-        unsafe {
-            u.prog.reclaim_caches();
+    crate::owner::call(crate::owner::program_class(), || {
+        let u = unsafe { &mut *up };
+        defs.extend((0..u.prog.defs.len()).filter(|&i| u.prog.defs[i].krate == module_crate).map(|i| DefId(i as u32)));
+        defs.sort_unstable_by_key(|d| d.0);
+        defs.dedup();
+        {
+            let _fw = jit::front_write();
+            let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
+            u.prog.unbind_defs(&defs);
+            u.tcx.uncollect_impls(&impls);
+            unsafe {
+                u.prog.reclaim_caches();
+            }
         }
-    }
-    if let Some(k) = krate {
-        unsafe { crate::sandbox::retire_crate(up, k) };
-    }
-    jit::unlock_unit();
+        if let Some(k) = krate {
+            unsafe { crate::sandbox::retire_crate(up, k) };
+        }
+    });
     crate::sandbox::maybe_recycle(up);
 }
 

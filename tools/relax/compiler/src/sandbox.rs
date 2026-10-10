@@ -317,10 +317,7 @@ pub fn maybe_recycle(up: *mut Unit) {
 /// here): dead twins (unloaded modules, replaced versions) are left behind, and the space they
 /// were in is reused by the next recycle. Returns (twins moved, bytes now used).
 pub unsafe fn recycle(up: *mut Unit) -> Result<(usize, u64), String> {
-    jit::lock_unit();
-    let r = recycle_locked(up);
-    jit::unlock_unit();
-    r
+    crate::owner::call(crate::owner::Class::App, || recycle_locked(up))
 }
 
 unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {

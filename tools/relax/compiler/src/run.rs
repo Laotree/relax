@@ -1051,18 +1051,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 if up.is_null() || !crate::memstat::enabled() {
                     continue;
                 }
-                jit::lock_unit();
-                crate::memstat::print(&format!("at {} ms", ms), &crate::memreport::unit_sizes(unsafe { &*up }));
-                jit::unlock_unit();
+                crate::owner::call(crate::owner::Class::App, || {
+                    crate::memstat::print(&format!("at {} ms", ms), &crate::memreport::unit_sizes(unsafe { &*up }));
+                });
                 // RELAX_MEM_AT_TRIM=1: the allocator's free pages back to the system, then the report
                 // again (how much of the footprint is freed-but-held memory a trim can return)
                 if mem_at_trim {
                     let t = std::time::Instant::now();
                     crate::memstat::trim();
                     let ns = t.elapsed().as_secs_f64() * 1e3;
-                    jit::lock_unit();
-                    crate::memstat::print(&format!("at {} ms after a {:.1} ms trim", ms, ns), &crate::memreport::unit_sizes(unsafe { &*up }));
-                    jit::unlock_unit();
+                    crate::owner::call(crate::owner::Class::App, || {
+                        crate::memstat::print(&format!("at {} ms after a {:.1} ms trim", ms, ns), &crate::memreport::unit_sizes(unsafe { &*up }));
+                    });
                 }
             }
         });
@@ -1072,9 +1072,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Some(ms) = std::env::var("RELAX_STATS_AFTER_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(ms));
-            jit::lock_unit();
-            summary("stats");
-            jit::unlock_unit();
+            crate::owner::call(crate::owner::Class::App, || summary("stats"));
         });
     }
     jit::enable_pipelining(options);
@@ -1172,18 +1170,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     for (k, d) in entry_defs.iter().enumerate() {
         // speculative workers may be compiling (they add slots): the unit lock around fn_id
-        jit::lock_unit();
-        let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
-        let en = u.entry(id);
-        jit::unlock_unit();
+        let en = crate::owner::call(crate::owner::Class::App, || {
+            let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
+            u.entry(id)
+        });
         let r = unsafe { jit::call_jit(up, en, 0) };
         flush_errors(true);
         match r {
             Ok(v) => verbose!("relax-run: entry {} returned {:#x} (t={:.0} ms)", entries[k], v, crate::clock::ms_since_start()),
             Err(p) => {
-                jit::lock_unit();
-                let rep = u.report(&p);
-                jit::unlock_unit();
+                let rep = crate::owner::call(crate::owner::Class::App, || u.report(&p));
                 eprintln!("relax-run: entry {} {}: {}\n  report: {}", entries[k], p.kind, p.message, rep);
             }
         }
@@ -1355,10 +1351,11 @@ fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
         let mut n = 0;
         for d in defs {
             let _job = jit::compile_job();
-            jit::lock_unit();
-            let id = unsafe { (&mut *up).fn_id(FnKey::Inst(d, Vec::new())) };
-            let done = unsafe { (&*up).fns[id as usize].compiled };
-            jit::unlock_unit();
+            let (id, done) = crate::owner::call(crate::owner::Class::App, || {
+                let id = unsafe { (&mut *up).fn_id(FnKey::Inst(d, Vec::new())) };
+                let done = unsafe { (&*up).fns[id as usize].compiled };
+                (id, done)
+            });
             if !done {
                 let _origin = crate::clock::origin("fncost-ahead");
                 unsafe { jit::compile_slot(up, id) };
@@ -1375,23 +1372,28 @@ fn flush_errors(block: bool) {
     if up.is_null() {
         return;
     }
-    if block {
-        jit::lock_unit();
-    } else if !jit::try_lock_unit() {
-        return;
-    }
-    let u = unsafe { &mut *up };
-    u.flush_query_errors(false);
-    let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
-    if !QUIET.load(Ordering::Relaxed) {
-        for e in u.errors.iter().skip(seen) {
-            eprintln!("relax-run: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
+    let body = || {
+        let u = unsafe { &mut *up };
+        u.flush_query_errors(false);
+        let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
+        if !QUIET.load(Ordering::Relaxed) {
+            for e in u.errors.iter().skip(seen) {
+                eprintln!("relax-run: [t={:.0} ms] {}", crate::clock::ms_since_start(), e);
+            }
         }
-    }
-    // the report file may be a FIFO a slow reader drains: written after the unit lock is free
-    let to_report: Vec<String> = if u.errors.len() > seen && reporting() { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
-    ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
-    jit::unlock_unit();
+        // the report file may be a FIFO a slow reader drains: written after the unit lock is free
+        let to_report: Vec<String> = if u.errors.len() > seen && reporting() { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
+        ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
+        to_report
+    };
+    let to_report = if block {
+        crate::owner::call(crate::owner::program_class(), body)
+    } else {
+        match crate::owner::call_within(crate::owner::Class::Background, 0, body) {
+            Some(r) => r,
+            None => return,
+        }
+    };
     for e in to_report {
         report("error", &e);
     }
@@ -1405,15 +1407,16 @@ fn spill_cache() {
     static LIM: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     let lim = *LIM.get_or_init(|| std::env::var("RELAX_CACHE_SPILL_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(16) << 20);
     let up = unsafe { RUN_UNIT };
-    if lim == 0 || up.is_null() || !jit::try_lock_unit() {
+    if lim == 0 || up.is_null() {
         return;
     }
-    let u = unsafe { &mut *up };
-    let spill = match u.cache.as_mut() {
-        Some(c) if c.pending_bytes() >= lim => c.spill_take(),
-        _ => None,
-    };
-    jit::unlock_unit();
+    let Some(spill) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+        let u = unsafe { &mut *up };
+        match u.cache.as_mut() {
+            Some(c) if c.pending_bytes() >= lim => c.spill_take(),
+            _ => None,
+        }
+    }) else { return };
     if let Some(s) = spill {
         // its own thread: the monitor loop's other duties (errors, trims) do not wait for the disk
         std::thread::spawn(move || {
@@ -1480,26 +1483,27 @@ impl SettleWatch {
 /// Disk IO and allocator relief run off the monitor and never hold the unit/front locks.
 fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
-    if up.is_null() || !jit::try_lock_unit() { return false; }
-    if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
-        jit::unlock_unit();
-        return false;
-    }
-    // Immediate releases must be reported even when an ahead checker kept FRONT_RW busy.
-    let completed = jit::take_completed_drops();
-    drops.fns += completed.fns;
-    drops.rir += completed.rir;
-    drops.typeck += completed.typeck;
-    let drops = std::mem::take(drops);
-    let u = unsafe { &mut *up };
-    let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
-    let spill = u.cache.as_mut().and_then(|c| c.spill_take());
-    let at = crate::clock::ms_since_start();
-    let present = FIRST_PRESENT_WALL.load(Ordering::Acquire);
-    let landmark = if present == 0 { "before first present".to_owned() } else {
-        format!("first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
-    };
-    jit::unlock_unit();
+    if up.is_null() { return false; }
+    let Some(Some((drops, pending, spill, at, landmark))) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+        if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
+            return None;
+        }
+        // Immediate releases must be reported even when an ahead checker kept FRONT_RW busy.
+        let completed = jit::take_completed_drops();
+        drops.fns += completed.fns;
+        drops.rir += completed.rir;
+        drops.typeck += completed.typeck;
+        let drops = std::mem::take(drops);
+        let u = unsafe { &mut *up };
+        let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
+        let spill = u.cache.as_mut().and_then(|c| c.spill_take());
+        let at = crate::clock::ms_since_start();
+        let present = FIRST_PRESENT_WALL.load(Ordering::Acquire);
+        let landmark = if present == 0 { "before first present".to_owned() } else {
+            format!("first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
+        };
+        Some((drops, pending, spill, at, landmark))
+    }) else { return false };
     std::thread::spawn(move || {
         let result = spill.map(|s| s.write());
         // Borrowck already releases its body-owned queries at each completed check.
@@ -1575,11 +1579,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     // structure sizes too (who holds the tags' bytes), when accounting is on
                     let up = unsafe { RUN_UNIT };
                     if crate::memstat::enabled() && !up.is_null() {
-                        jit::lock_unit();
-                        for (k, v) in crate::memreport::unit_sizes(unsafe { &*up }) {
-                            report.push_str(&format!("relax-mem: harness snapshot:   size {:<40} {:>9.1} MB\n", k, v as f64 / 1048576.0));
-                        }
-                        jit::unlock_unit();
+                        crate::owner::call(crate::owner::Class::App, || {
+                            for (k, v) in crate::memreport::unit_sizes(unsafe { &*up }) {
+                                report.push_str(&format!("relax-mem: harness snapshot:   size {:<40} {:>9.1} MB\n", k, v as f64 / 1048576.0));
+                            }
+                        });
                     }
                     let _ = std::fs::write(path.with_extension("report"), report);
                     mem_snapshot = None;
@@ -1645,10 +1649,11 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // inputs stay through the startup frame: evicting them earlier just makes
                 // subsequent startup callers rebuild them. After present, retry shared
                 // reclamation as compilation progresses, without a global quiet gate.
-                if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
-                    && (reclaimed != Some(n) || reclaim_requested) && jit::try_lock_unit() {
-                    let mut d = unsafe { jit::settle_drop(RUN_UNIT) };
-                    jit::unlock_unit();
+                let settled_d = if (FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 || reclaim_requested)
+                    && (reclaimed != Some(n) || reclaim_requested) {
+                    crate::owner::call_within(crate::owner::Class::Background, 0, || unsafe { jit::settle_drop(RUN_UNIT) })
+                } else { None };
+                if let Some(mut d) = settled_d {
                     d.release_rir();
                     drops.fns += d.fns;
                     drops.rir += d.rir;
@@ -1972,11 +1977,13 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the first write comes after the start: the mapped front images are checksummed now
     crate::cache::verify_front_images();
     let up = unsafe { RUN_UNIT };
-    let lock = |wait: bool| if wait { jit::lock_unit(); true } else { jit::try_lock_unit() };
-    if up.is_null() || !lock(wait) {
+    // one unit call: waits for the unit when `wait`, else only if it is free now
+    fn unit_call<R>(wait: bool, f: impl FnOnce() -> R) -> Option<R> {
+        if wait { Some(crate::owner::call(crate::owner::Class::App, f)) } else { crate::owner::call_within(crate::owner::Class::Background, 0, f) }
+    }
+    if up.is_null() {
         return None;
     }
-    let held = Instant::now();
     let mut parts = [0f64; 3];
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
@@ -1984,6 +1991,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
     let mut imaged_files = usize::MAX;
+    let Some(Some((held, spill))) = unit_call(wait, || {
+    let held = Instant::now();
     let spill = {
         let u = unsafe { &mut *up };
         // the startup manifest, once its window has closed (first present + 5 s after main):
@@ -2004,7 +2013,6 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         }
         parts[0] = held.elapsed().as_secs_f64() * 1e3;
         let Some(c) = u.cache.as_mut() else {
-            jit::unlock_unit();
             return None;
         };
         for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
@@ -2019,7 +2027,8 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         }
         c.spill_take()
     };
-    jit::unlock_unit();
+    Some((held, spill))
+    }) else { return None };
     let held1 = held.elapsed().as_secs_f64() * 1e3;
     let (n, mut stores) = match spill {
         Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().ok()?,
@@ -2030,53 +2039,54 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         && crate::cache::Cache::flush_front_graphs().is_ok();
     // the collected program, once per run and only when the program is quiet (it is encoded
     // under the unit and front-end locks): not at the exit
-    if graph_ready && quiet && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) && lock(wait) {
+    if graph_ready && quiet && !COLLECTED_CURRENT.load(Ordering::Relaxed) && !MID_COLLECTED_TRIED.load(Ordering::Relaxed) {
         // not when a file was loaded since this write took its front images (its restore maps
         // every file from them); a later quiet flush or the exit tries again. Files the lazy
         // selection still skips travel in the image (skipped_files, deferred imports).
         // Encoded under the locks, but never in the main thread's way: the encode stops when
         // the main thread waits for the unit lock (a frame's lazy compile) and a later pass
         // tries again; the store write runs after the locks are released.
-        let mut ready = None;
-        let mut retired_boot = None;
-        let t = Instant::now();
-        if let Some(_front) = jit::front_write_within(if jit::QUIT_SEEN.load(Ordering::Relaxed) { 1000 } else { 50 }) {
-            let u = unsafe { &mut *up };
-            // files the post-boot loader loaded since this write took its front images (a
-            // run that did not restore loads for seconds after present): their images are
-            // written now, under the locks, so the record can be made in this pass
-            if wait && u.prog.files.len() != imaged_files && front_recordable() {
-                if let Some(c) = u.cache.as_mut() {
-                    push_front_images(&u.prog, c);
-                    c.record_front_crates(&u.prog);
-                    let written = match c.spill_take() {
-                        Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().map(|(_, more)| stores.extend(more)).is_ok(),
-                        Some(s) => s.write().is_ok(),
-                        None => true,
-                    };
-                    if written { imaged_files = u.prog.files.len(); }
+        if let Some((ready, retired_boot, t)) = unit_call(wait, || {
+            let mut ready = None;
+            let mut retired_boot = None;
+            let t = Instant::now();
+            if let Some(_front) = jit::front_write_within(if jit::QUIT_SEEN.load(Ordering::Relaxed) { 1000 } else { 50 }) {
+                let u = unsafe { &mut *up };
+                // files the post-boot loader loaded since this write took its front images (a
+                // run that did not restore loads for seconds after present): their images are
+                // written now, under the locks, so the record can be made in this pass
+                if wait && u.prog.files.len() != imaged_files && front_recordable() {
+                    if let Some(c) = u.cache.as_mut() {
+                        push_front_images(&u.prog, c);
+                        c.record_front_crates(&u.prog);
+                        let written = match c.spill_take() {
+                            Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().map(|(_, more)| stores.extend(more)).is_ok(),
+                            Some(s) => s.write().is_ok(),
+                            None => true,
+                        };
+                        if written { imaged_files = u.prog.files.len(); }
+                    }
+                }
+                if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
+                    let stop = || jit::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
+                    match c.encode_collected(&u.prog, &u.tcx, &stop) {
+                        crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
+                        crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
+                        crate::cache::CollectedRecord::Yielded => verbose!("relax-collected: record yielded to the main thread after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
+                        crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
+                    }
                 }
             }
-            if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                let stop = || jit::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
-                match c.encode_collected(&u.prog, &u.tcx, &stop) {
-                    crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
-                    crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
-                    crate::cache::CollectedRecord::Yielded => verbose!("relax-collected: record yielded to the main thread after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
-                    crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
+            (ready, retired_boot, t)
+        }) {
+            if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: collected record held the unit lock {:.1} ms", t.elapsed().as_secs_f64() * 1e3); }
+            drop(retired_boot);
+            if let Some((report, dest, payload)) = ready {
+                if crate::cache::Cache::commit_collected(report, dest, payload).is_some() {
+                    COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+                    let retired_boot = crate::owner::call(crate::owner::Class::App, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
+                    drop(retired_boot);
                 }
-            }
-        }
-        jit::unlock_unit();
-        if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: collected record held the unit lock {:.1} ms", t.elapsed().as_secs_f64() * 1e3); }
-        drop(retired_boot);
-        if let Some((report, dest, payload)) = ready {
-            if crate::cache::Cache::commit_collected(report, dest, payload).is_some() {
-                COLLECTED_CURRENT.store(true, Ordering::Relaxed);
-                jit::lock_unit();
-                let retired_boot = unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected());
-                jit::unlock_unit();
-                drop(retired_boot);
             }
         }
     }
@@ -2087,44 +2097,45 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // them 65-170 ms right after the first present: a frame's lazy compile waited).
         let (mut installed, mut next, mut tries, mut max_held) = (false, 0usize, 0, 0f64);
         loop {
-            jit::lock_unit();
+            let (done, held) = crate::owner::call(crate::owner::Class::App, || {
             let held = Instant::now();
-            let front_guard = jit::front_write();
-            let u = unsafe { &mut *up };
-            let mut done = false;
-            if let Some(c) = u.cache.as_mut() {
-                if !installed { c.install_front_stores(std::mem::take(&mut stores)); installed = true; }
-                // Lowering is excluded by the unit lock; ahead type checking and borrowck
-                // use FRONT_RW (raw Program pointers, not file Arcs), so exclude them too.
-                // Other users owning another Arc keep their heap arrays. The encoder's
-                // Arcs were dropped by the writer before attempting exclusive access here.
-                let prog = &mut u.prog;
-                let end = (next + 128).min(prog.files.len());
-                crate::program::without_std_shares(&mut prog.files, &prog.file_paths, |files| {
-                    for i in next..end.min(files.len()) {
-                        let file = &mut files[i];
-                        let Some(path) = prog.file_paths.get(i) else { continue };
-                        let source_hash = file.source_hash(path);
-                        let main = (!file.src.is_mapped()).then(|| c.front_image(path, source_hash)).flatten();
-                        let part = file.part.get().filter(|p| !p.toks.is_mapped()).and_then(|_| c.front_part_image(path, source_hash));
-                        if main.is_none() && part.is_none() { continue; }
-                        let Some(pf) = std::sync::Arc::get_mut(file) else {
-                            crate::front::SHARED.fetch_add(1, Ordering::Relaxed);
-                            continue;
-                        };
-                        if let Some(img) = main { crate::front::apply(path, pf, img); }
-                        if let (Some(img), Some(&k)) = (part, prog.file_crate.get(i)) {
-                            crate::front::swap_part(path, pf, img, &prog.crates[k as usize].cfg);
+                let front_guard = jit::front_write();
+                let u = unsafe { &mut *up };
+                let mut done = false;
+                if let Some(c) = u.cache.as_mut() {
+                    if !installed { c.install_front_stores(std::mem::take(&mut stores)); installed = true; }
+                    // Lowering is excluded by the unit lock; ahead type checking and borrowck
+                    // use FRONT_RW (raw Program pointers, not file Arcs), so exclude them too.
+                    // Other users owning another Arc keep their heap arrays. The encoder's
+                    // Arcs were dropped by the writer before attempting exclusive access here.
+                    let prog = &mut u.prog;
+                    let end = (next + 128).min(prog.files.len());
+                    crate::program::without_std_shares(&mut prog.files, &prog.file_paths, |files| {
+                        for i in next..end.min(files.len()) {
+                            let file = &mut files[i];
+                            let Some(path) = prog.file_paths.get(i) else { continue };
+                            let source_hash = file.source_hash(path);
+                            let main = (!file.src.is_mapped()).then(|| c.front_image(path, source_hash)).flatten();
+                            let part = file.part.get().filter(|p| !p.toks.is_mapped()).and_then(|_| c.front_part_image(path, source_hash));
+                            if main.is_none() && part.is_none() { continue; }
+                            let Some(pf) = std::sync::Arc::get_mut(file) else {
+                                crate::front::SHARED.fetch_add(1, Ordering::Relaxed);
+                                continue;
+                            };
+                            if let Some(img) = main { crate::front::apply(path, pf, img); }
+                            if let (Some(img), Some(&k)) = (part, prog.file_crate.get(i)) {
+                                crate::front::swap_part(path, pf, img, &prog.crates[k as usize].cfg);
+                            }
                         }
-                    }
-                });
-                next = end;
-                done = next >= prog.files.len();
-            } else if installed {
-                done = true;
-            }
-            drop(front_guard);
-            jit::unlock_unit();
+                    });
+                    next = end;
+                    done = next >= prog.files.len();
+                } else if installed {
+                    done = true;
+                }
+                drop(front_guard);
+            (done, held)
+            });
             max_held = max_held.max(held.elapsed().as_secs_f64() * 1e3);
             if done { break; }
             if !installed {
@@ -2181,336 +2192,350 @@ fn summary_inner(why: &str) {
     // the end of the run never waits on compiles: other threads' builds are abandoned at their next
     // safe point (jit::quiesce); a holder still busy after EXIT_QUIESCE_MS costs this run's
     // summary + cache pack
-    let got = if why == "stats" { jit::try_lock_unit() } else { jit::quiesce(exit_quiesce_ms()) };
-    if got && holder != "nobody" && t_wait.elapsed().as_micros() > 100 && !SILENT.load(Ordering::Relaxed) {
-        verbose!("relax-run: {}: waited {:.1} ms for the unit lock (held by `{}`)", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
-    }
-    if why != "stats" { exit_mark("quiesce"); jit::tier1_stats_report(); }
-    if !got {
-        verbose!("relax-run: {}: no summary -- the unit lock is still held by thread `{}`", why, jit::lock_holder());
-        return;
-    }
-    if why != "stats" {
-        let (ms, site) = jit::main_post_present_wait();
-        verbose!("relax-run: main thread's longest unit-lock wait after first present: {:.1} ms (holder locked at {})", ms, site);
-    }
-    verbose!("relax-run: startup seeds skipped: {} initializers (demand evaluation required), {} recursive builds", jit::SEED_INITIALIZERS_SKIPPED.load(Ordering::Relaxed), jit::SEED_RECURSIVE_SKIPPED.load(Ordering::Relaxed));
-    // borrowck lane: the background checker's summary, with or without the disk cache; checker
-    // panics are counted and named, never silent
-    if why != "stats" {
-        crate::borrowck::lazy::print_summary(options);
-    }
-    if let Some(line) = crate::reload::session_summary() {
-        verbose!("{}", line);
-    }
-    if why != "stats" { exit_mark("reports"); }
-    // the disk cache: this run's new entries become a pack (unit lock held: no compiles)
-    if why != "stats" {
-        let u = unsafe { &mut *up };
-        let order = std::mem::take(&mut u.start_order);
-        let mut cache = u.cache.take();
-        if let Some(c) = cache.as_mut() {
-            c.record_manifest(u, crate::layout::root_crate(), &order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed), &|| false);
+    let preamble = |got: bool| -> bool {
+        if got && holder != "nobody" && t_wait.elapsed().as_micros() > 100 && !SILENT.load(Ordering::Relaxed) {
+            verbose!("relax-run: {}: waited {:.1} ms for the unit lock (held by `{}`)", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
         }
-        u.cache = cache;
-        exit_mark("manifest");
-        if let Some(c) = u.cache.as_mut() {
-            // borrowck lane: clean verdicts found in the background are remembered
-            for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
-                c.record_borrowck(k, v);
+        if why != "stats" { exit_mark("quiesce"); jit::tier1_stats_report(); }
+        if !got {
+            verbose!("relax-run: {}: no summary -- the unit lock is still held by thread `{}`", why, jit::lock_holder());
+            return false;
+        }
+        true
+    };
+    let rest = || {
+        if why != "stats" {
+            let (ms, site) = jit::main_post_present_wait();
+            verbose!("relax-run: main thread's longest unit-lock wait after first present: {:.1} ms (holder locked at {})", ms, site);
+        }
+        verbose!("relax-run: startup seeds skipped: {} initializers (demand evaluation required), {} recursive builds", jit::SEED_INITIALIZERS_SKIPPED.load(Ordering::Relaxed), jit::SEED_RECURSIVE_SKIPPED.load(Ordering::Relaxed));
+        // borrowck lane: the background checker's summary, with or without the disk cache; checker
+        // panics are counted and named, never silent
+        if why != "stats" {
+            crate::borrowck::lazy::print_summary(options);
+        }
+        if let Some(line) = crate::reload::session_summary() {
+            verbose!("{}", line);
+        }
+        if why != "stats" { exit_mark("reports"); }
+        // the disk cache: this run's new entries become a pack (unit lock held: no compiles)
+        if why != "stats" {
+            let u = unsafe { &mut *up };
+            let order = std::mem::take(&mut u.start_order);
+            let mut cache = u.cache.take();
+            if let Some(c) = cache.as_mut() {
+                c.record_manifest(u, crate::layout::root_crate(), &order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed), &|| false);
             }
+            u.cache = cache;
+            exit_mark("manifest");
+            if let Some(c) = u.cache.as_mut() {
+                // borrowck lane: clean verdicts found in the background are remembered
+                for (k, v) in crate::borrowck::lazy::take_verdict_keys() {
+                    c.record_borrowck(k, v);
+                }
 
-            // front images of the files the store does not have yet (front.rs) and the crate
-            // records: a run quit before its first mid-run write has all of them left
-            if front_recordable() {
-                for i in 0..u.prog.files.len() {
-                    let f = &u.prog.files[i];
-                    let (Some(path), Some(&krate)) = (u.prog.file_paths.get(i), u.prog.file_crate.get(i)) else { continue };
-                    let want_part = f.lazy.is_some() && crate::front::has_part_image(f) && !f.part.get().map_or(false, |p| p.toks.is_mapped());
-                    let source_hash = f.source_hash(path);
-                    let (m, p) = c.reserve_front(krate, path, source_hash, !f.src.is_mapped(), want_part);
-                    if m { c.push_front(krate, path, source_hash, false, f.clone()); }
-                    if p { c.push_front(krate, path, source_hash, true, f.clone()); }
+                // front images of the files the store does not have yet (front.rs) and the crate
+                // records: a run quit before its first mid-run write has all of them left
+                if front_recordable() {
+                    for i in 0..u.prog.files.len() {
+                        let f = &u.prog.files[i];
+                        let (Some(path), Some(&krate)) = (u.prog.file_paths.get(i), u.prog.file_crate.get(i)) else { continue };
+                        let want_part = f.lazy.is_some() && crate::front::has_part_image(f) && !f.part.get().map_or(false, |p| p.toks.is_mapped());
+                        let source_hash = f.source_hash(path);
+                        let (m, p) = c.reserve_front(krate, path, source_hash, !f.src.is_mapped(), want_part);
+                        if m { c.push_front(krate, path, source_hash, false, f.clone()); }
+                        if p { c.push_front(krate, path, source_hash, true, f.clone()); }
+                    }
+                    c.record_front_crates(&u.prog);
                 }
-                c.record_front_crates(&u.prog);
-            }
-            exit_mark("front images");
-            let t = std::time::Instant::now();
-            // The graph writer opens the crate records just queued above.
-            // Flush them first, as the mid-run writer does, then publish the
-            // demand parts/graph and finally its collected image. Trying the
-            // graph first can fail on a missing crate store and skip the very
-            // flush that would make it recordable (also on boot-only exits).
-            let r = c.flush().and_then(|written| {
-                crate::cache::Cache::flush_front_graphs()?;
-                Ok(written)
-            });
-            exit_mark("flush");
-            // the collected program, unless restored whole or written mid-run; never waits long
-            // for a reader: an app thread parked for good (EXITING) may hold one
-            if r.is_ok() && front_recordable() && !COLLECTED_CURRENT.load(Ordering::Relaxed) {
-                if let Some(_front) = jit::front_write_within(2000) {
-                    exit_mark("front lock");
-                    if c.record_collected(&u.prog, &u.tcx).is_some() { COLLECTED_CURRENT.store(true, Ordering::Relaxed); }
-                    exit_mark("collected");
-                } else {
-                    verbose!("relax-collected: not recorded at exit: the front end is still read by another thread");
+                exit_mark("front images");
+                let t = std::time::Instant::now();
+                // The graph writer opens the crate records just queued above.
+                // Flush them first, as the mid-run writer does, then publish the
+                // demand parts/graph and finally its collected image. Trying the
+                // graph first can fail on a missing crate store and skip the very
+                // flush that would make it recordable (also on boot-only exits).
+                let r = c.flush().and_then(|written| {
+                    crate::cache::Cache::flush_front_graphs()?;
+                    Ok(written)
+                });
+                exit_mark("flush");
+                // the collected program, unless restored whole or written mid-run; never waits long
+                // for a reader: an app thread parked for good (EXITING) may hold one
+                if r.is_ok() && front_recordable() && !COLLECTED_CURRENT.load(Ordering::Relaxed) {
+                    if let Some(_front) = jit::front_write_within(2000) {
+                        exit_mark("front lock");
+                        if c.record_collected(&u.prog, &u.tcx).is_some() { COLLECTED_CURRENT.store(true, Ordering::Relaxed); }
+                        exit_mark("collected");
+                    } else {
+                        verbose!("relax-collected: not recorded at exit: the front end is still read by another thread");
+                    }
                 }
-            }
-            if !options.verbose {
-                if let Err(e) = &r { eprintln!("relax-cache: write: {}", e); }
-            }
-            let st = &c.stats;
-            verbose!(
-                "relax-cache: {} hits, {} misses, {} link failures, {} refused by their dependency certificate (per-item cpu: body digests {:.1} ms, certificates written {:.1} ms, checked {:.1} ms) (link {:.1} ms wall with the lock; by speculative workers {} hits {:.1} ms), {} recorded, {} not storable {:?}; written {:?} in {:.1} ms",
-                st.hits, st.misses, st.link_fail, st.cert_rejects, st.body_ns as f64 / 1e6, st.cert_write_ns as f64 / 1e6, st.cert_check_ns as f64 / 1e6, st.link_ns as f64 / 1e6, st.spec_hits, st.spec_link_ns as f64 / 1e6, st.recorded, st.unencodable, c.why_unencodable, r, t.elapsed().as_secs_f64() * 1e3
-            );
-            if let Some(s) = crate::front::summary() {
-                verbose!("{}", s);
-            }
-            if c.mode == crate::cache::Mode::Verify {
+                if !options.verbose {
+                    if let Err(e) = &r { eprintln!("relax-cache: write: {}", e); }
+                }
                 let st = &c.stats;
-                verbose!("relax-cache: verify: {} same, {} DIFFERENT", st.verify_same, st.verify_diff);
+                verbose!(
+                    "relax-cache: {} hits, {} misses, {} link failures, {} refused by their dependency certificate (per-item cpu: body digests {:.1} ms, certificates written {:.1} ms, checked {:.1} ms) (link {:.1} ms wall with the lock; by speculative workers {} hits {:.1} ms), {} recorded, {} not storable {:?}; written {:?} in {:.1} ms",
+                    st.hits, st.misses, st.link_fail, st.cert_rejects, st.body_ns as f64 / 1e6, st.cert_write_ns as f64 / 1e6, st.cert_check_ns as f64 / 1e6, st.link_ns as f64 / 1e6, st.spec_hits, st.spec_link_ns as f64 / 1e6, st.recorded, st.unencodable, c.why_unencodable, r, t.elapsed().as_secs_f64() * 1e3
+                );
+                if let Some(s) = crate::front::summary() {
+                    verbose!("{}", s);
+                }
+                if c.mode == crate::cache::Mode::Verify {
+                    let st = &c.stats;
+                    verbose!("relax-cache: verify: {} same, {} DIFFERENT", st.verify_same, st.verify_diff);
+                }
             }
         }
-    }
-    if why != "stats" {
-        crate::mainprof::write(unsafe { &*up });
-        crate::cache::write_trace();
-        exit_mark("profiles");
-    }
-    let u = unsafe { &*up };
-    if crate::memstat::enabled() {
-        crate::memstat::print(why, &crate::memreport::unit_sizes(u));
-        let lp = |i: usize| crate::parser::LAZY_PARSED[i].load(Ordering::Relaxed);
-        eprintln!("relax-mem: lazy fn bodies: {} files parsed their skipped bodies ({} bodies)", lp(0), lp(1));
-        let w = crate::parser::LAZY_WHY_PARSED.lock().unwrap();
-        if !w.is_empty() {
-            eprintln!("relax-mem: lazy parts parsed by: {}", w.iter().map(|(k, v)| format!("{} {}", k, v)).collect::<Vec<_>>().join(", "));
+        if why != "stats" {
+            crate::mainprof::write(unsafe { &*up });
+            crate::cache::write_trace();
+            exit_mark("profiles");
         }
-        if let Some(set) = crate::typeck::CHECKED_DEFS.lock().unwrap().as_ref() {
-            // a lazy parse by item parses the checked defs' bodies; by file, every body of the files they are in
-            let mut files = std::collections::HashSet::new();
-            let mut item_exprs = 0usize;
-            for &d in set {
-                let df = u.prog.def(crate::program::DefId(d));
-                files.insert(df.file);
-                let it = u.prog.files[df.file as usize].ast.item(df.item);
-                item_exprs += (it.ranges[1] - it.ranges[0]) as usize;
+        let u = unsafe { &*up };
+        if crate::memstat::enabled() {
+            crate::memstat::print(why, &crate::memreport::unit_sizes(u));
+            let lp = |i: usize| crate::parser::LAZY_PARSED[i].load(Ordering::Relaxed);
+            eprintln!("relax-mem: lazy fn bodies: {} files parsed their skipped bodies ({} bodies)", lp(0), lp(1));
+            let w = crate::parser::LAZY_WHY_PARSED.lock().unwrap();
+            if !w.is_empty() {
+                eprintln!("relax-mem: lazy parts parsed by: {}", w.iter().map(|(k, v)| format!("{} {}", k, v)).collect::<Vec<_>>().join(", "));
             }
-            let all: usize = u.prog.files.iter().map(|f| f.ast.exprs.len()).sum();
-            let touched: usize = files.iter().map(|f| u.prog.files[*f as usize].ast.exprs.len()).sum();
-            eprintln!("relax-mem: lazy-body need: {} defs checked ({} exprs of {} = {:.0}%); {} of {} files touched ({:.0}% of exprs)", set.len(), item_exprs, all, 100.0 * item_exprs as f64 / all as f64, files.len(), u.prog.files.len(), 100.0 * touched as f64 / all as f64);
-        }
-    }
-    let s = &u.stats;
-    let now = crate::clock::ms_since_start();
-    if !SILENT.load(Ordering::Relaxed) {
-    verbose!(
-        "relax-run: {} at t={:.0} ms (main from t={} ms): compiled {} fns, {} KB code, {} compile errors; cpu typeck {:.0} ms, lower {:.0} ms, opt {:.0} ms, codegen {:.0} ms",
-        why,
-        now,
-        MAIN_START_MS.load(Ordering::Relaxed),
-        s.compiled,
-        s.code_bytes / 1024,
-        u.errors.len(),
-        s.typeck_ns as f64 / 1e6,
-        s.lower_ns as f64 / 1e6,
-        s.opt_ns as f64 / 1e6,
-        s.codegen_ns as f64 / 1e6
-    );
-    }
-    crate::tui::print_slowest();
-    // wall clocks are jit::wall_ns() (started at the first call of it, at boot)
-    verbose!(
-        "relax-run: compile wall {:.0} ms (lock held); last compile ended at {:.0} ms after the clock start",
-        s.compile_wall_ns as f64 / 1e6,
-        s.last_compile_end_ns as f64 / 1e6
-    );
-    let rt = jit::RT_LAZY.load(Ordering::Relaxed);
-    if rt > 0 {
-        verbose!("relax-run: real-time threads compiled {} fns lazily, stalled {:.1} ms in all", rt, jit::RT_LAZY_NS.load(Ordering::Relaxed) as f64 / 1e6);
-    }
-    {
-        let n: Vec<f64> = jit::SPLIT_NS.iter().map(|x| x.load(Ordering::Relaxed) as f64 / 1e6).collect();
-        let (mut built, mut used) = (0, 0);
-        for f in u.fns.iter() {
-            if f.spec_state > 0 {
-                built += 1;
-            }
-            if f.spec_state == 2 {
-                used += 1;
+            if let Some(set) = crate::typeck::CHECKED_DEFS.lock().unwrap().as_ref() {
+                // a lazy parse by item parses the checked defs' bodies; by file, every body of the files they are in
+                let mut files = std::collections::HashSet::new();
+                let mut item_exprs = 0usize;
+                for &d in set {
+                    let df = u.prog.def(crate::program::DefId(d));
+                    files.insert(df.file);
+                    let it = u.prog.files[df.file as usize].ast.item(df.item);
+                    item_exprs += (it.ranges[1] - it.ranges[0]) as usize;
+                }
+                let all: usize = u.prog.files.iter().map(|f| f.ast.exprs.len()).sum();
+                let touched: usize = files.iter().map(|f| u.prog.files[*f as usize].ast.exprs.len()).sum();
+                eprintln!("relax-mem: lazy-body need: {} defs checked ({} exprs of {} = {:.0}%); {} of {} files touched ({:.0}% of exprs)", set.len(), item_exprs, all, 100.0 * item_exprs as f64 / all as f64, files.len(), u.prog.files.len(), 100.0 * touched as f64 / all as f64);
             }
         }
-        if built > 0 || n[0] > 0.0 {
-            verbose!(
-                "relax-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after RELAX_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} yields, {} cold calls skipped, {} priority relocks{}",
-                n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_YIELDS.load(Ordering::Relaxed), jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), jit::SPEC_PRIORITY.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
-            );
-        }
-    }
-    if !SILENT.load(Ordering::Relaxed) {
-        let h = |i: usize| jit::LOCK_HELD_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
-        verbose!("relax-run: unit lock held: main {:.0} ms, workers {:.0} ms, other threads {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), crate::clock::ms_since_start());
-    }
-    let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
-    if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
-        verbose!("relax-run: type checks ahead (off the lock): {} bodies ({} taken by builds, {} with errors), cpu callers {:.0} ms, workers {:.0} ms", ah(0), ah(1), ah(2), ah(3) as f64 / 1e6, ah(4) as f64 / 1e6);
-    }
-    if s.ctfe_data + s.ctfe_code > 0 && !SILENT.load(Ordering::Relaxed) {
-        verbose!("relax-run: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, s.ctfe_ns as f64 / 1e6);
-    }
-    // RELAX_MAIN_COMPILE_LOG=<path>: the main thread's compiles, ms since main started: app
-    // execution vs compile on the critical path. Per line: start end slot how typeck_ahead
-    // lock_wait front back relock inflight_wait (ms) slot-key name (spaces as `~`), then `cpu` front opt codegen (thread cpu ms) `insts` entering opt / codegen; `slot` indexes RELAX_COMPILE_REPORT's rows
-    if let Ok(path) = std::env::var("RELAX_MAIN_COMPILE_LOG") {
-        let base = MAIN_START_WALL.load(Ordering::Relaxed);
-        let mut out = format!("# package {}\n", ROOT_DIR.lock().unwrap());
-        let ms = |ns: u64| ns as f64 / 1e6;
-        for r in jit::MAIN_COMPILES.lock().unwrap().iter() {
-            let how = jit::MAIN_HOW_NAMES.get(r.how as usize).copied().unwrap_or("?");
-            let (name, hint) = if (r.slot as usize) < u.fns.len() {
-                let f = &u.fns[r.slot as usize];
-                let hint = jit::slot_key(u, r.slot);
-                (f.name.as_str(), hint)
-            } else {
-                ("-", "-".to_string())
-            };
-            out.push_str(&format!(
-                "{:.3} {:.3} {} {} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {} {}  cpu {:.3} {:.3} {:.3} insts {} {}\n",
-                ms(r.start.saturating_sub(base)), ms(r.end.saturating_sub(base)), r.slot, how, ms(r.ns[0]), ms(r.ns[1]), ms(r.ns[2]), ms(r.ns[3]), ms(r.ns[4]), ms(r.ns[5]), hint.replace(' ', "~"), name.replace(' ', "~"), ms(r.cpu[0]), ms(r.cpu[1]), ms(r.cpu[2]), r.insts[0], r.insts[1]
-            ));
-        }
-        let _ = std::fs::write(path, out);
-    }
-    let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
-    if q > 0 {
+        let s = &u.stats;
+        let now = crate::clock::ms_since_start();
+        if !SILENT.load(Ordering::Relaxed) {
         verbose!(
-            "relax-run: O3: {} hot, {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms with the lock, {:.0} ms without{}",
-            q,
-            s.tier1_installed,
-            s.tier1_retier,
-            s.tier1_dropped,
-            s.tier1_drop_why,
-            jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
-            jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
-            s.tier1_locked_ns as f64 / 1e6,
-            s.tier1_free_ns as f64 / 1e6,
-            {
-                let n = jit::NESTED_AT_YIELD.load(Ordering::Relaxed);
-                if n == 0 { String::new() } else { format!("; UNBALANCED unit lock: {} nested at a yield, {} left held by a O3 job", n & 0xffff_ffff, n >> 32) }
-            }
-        );
-    }
-    let mut tl = String::new();
-    for (i, (n, w)) in s.timeline.iter().enumerate() {
-        if *n > 0 {
-            tl.push_str(&format!(" {}s:{}fns/{}ms", i as f64 / 10.0, n, w / 1_000_000));
-        }
-    }
-if !SILENT.load(Ordering::Relaxed) {     verbose!("relax-run: compile timeline (100 ms buckets):{}", tl); }
-    if std::env::var("RELAX_PASS_TIMES").is_ok() {
-        let mut passes = String::new();
-        for i in 0..crate::opt::PASS_NAMES.len() {
-            passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(Ordering::Relaxed) as f64 / 1e6));
-        }
-if !SILENT.load(Ordering::Relaxed) {         verbose!("relax-run: opt passes (cpu ms): {}", passes); }
-        verbose!("relax-run: invokes {} seen, {} made plain calls", crate::opt::INVOKES_SEEN.load(Ordering::Relaxed), crate::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
-    }
-    if crate::rir::unwind_stats_on() {
-        let st = &crate::rir::UNWIND_STATS;
-        verbose!("relax-run: unwind bytes: pads {} KB, landing stubs {} KB, trailers {} KB; invokes emitted {}", st[0].load(Ordering::Relaxed) / 1024, st[1].load(Ordering::Relaxed) / 1024, st[2].load(Ordering::Relaxed) / 1024, st[3].load(Ordering::Relaxed));
-    }
-    // startup list: non-generic fns compiled during this run, in slot order (first-call order)
-    let mut list = String::new();
-    for f in u.fns.iter() {
-        if let FnKey::Inst(d, args) = &f.key {
-            if f.compiled && args.is_empty() {
-                list.push_str(&u.prog.def_path(*d));
-                list.push('\n');
-            }
-        }
-    }
-    let path = STARTUP_PATH.lock().unwrap().clone();
-    if !path.is_empty() {
-        if let Some(dir) = std::path::Path::new(&path).parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(&path, list);
-    }
-    // per-slot compile report: kind, crate, generic, compiled (= entered: compiles happen on
-    // the first call through the lazy stub), RIR built, times inlined, cpu ns; last column
-    // `spec`: 0 not built ahead, 1 built ahead and never called (wasted), 2 built ahead and
-    // installed by its first call; `spec_depth`: speculation depth it was queued at (-1 none)
-    if let Ok(p) = std::env::var("RELAX_COMPILE_REPORT") {
-        let mut out = format!("# build: {}\n", crate::jit::PROVENANCE);
-        out.push_str("kind\tcrate\tgeneric\tcompiled\trir\tinlined_into\tbuild_ns\tcg_ns\tsrc\tname\tspec\tspec_depth\torigin\ttrait\tself\thint\tcode_bytes\tO3\tframe0\tframe1\tslots0\tslots1\n");
-        let frames = jit::FRAMES.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let fslots = jit::FRAME_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        for (idx, f) in u.fns.iter().enumerate() {
-            let (kind, krate, generic) = match &f.key {
-                FnKey::Inst(d, args) => ("inst", u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name).to_string(), !args.is_empty()),
-                FnKey::Closure(..) => ("closure", "-".to_string(), false),
-                FnKey::Shim(_) => ("shim", "-".to_string(), true),
-                FnKey::Glue(g, _) => (if *g == jit::GLUE_DROP { "drop" } else { "glue" }, "-".to_string(), true),
-                FnKey::Sandbox(_) => ("sandbox", "-".to_string(), false),
-            };
-            let src = jit::src_size(u, idx as u32);
-            let (origin, tr, selfty) = report_origin(u, &f.key);
-            // def path of a non-generic fn instance (jit::slot_key has every slot's full key)
-            let hint = match &f.key {
-                FnKey::Inst(d, args) if args.is_empty() => crate::program::hint_path(&u.prog.defs, &u.prog.syms, &u.prog.files, *d),
-                _ => "-".to_string(),
-            };
-            out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", kind, krate, generic as u8, f.compiled as u8, (f.rir.is_some() || f.build_ns > 0) as u8, f.inlined_into.len(), f.build_ns, f.cg_ns, src as i64, f.name, f.spec_state, if f.spec_depth == u8::MAX { -1 } else { f.spec_depth as i32 }, origin, tr, selfty, hint, if f.compiled { f.code_len } else { 0 }, !f.retired.is_empty() as u8, frames.get(idx).map_or(0, |x| x.0), frames.get(idx).map_or(0, |x| x.1), fslots.get(idx).map_or(0, |x| x.0), fslots.get(idx).map_or(0, |x| x.1)));
-        }
-        let _ = std::fs::write(&p, out);
-        // code-size sanity: the largest O3 functions (an inliner gone wild shows here first;
-        // R13's parser function was 1.9 MB)
-        let mut t1: Vec<(u32, &str)> = u.fns.iter().filter(|f| f.compiled && !f.retired.is_empty()).map(|f| (f.code_len, f.name.as_str())).collect();
-        t1.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
-        let top: Vec<String> = t1.iter().take(5).map(|(n, name)| format!("{} {} KB", name, n / 1024)).collect();
-        verbose!("relax-run: largest O3 functions: {}", if top.is_empty() { "none".to_string() } else { top.join(", ") });
-        // stack sanity: the largest frames (O1 and O3)
-        let mut fr: Vec<(u32, &str, &str)> = Vec::new();
-        for (idx, f) in u.fns.iter().enumerate() {
-            if let Some(&(a, b)) = frames.get(idx) {
-                if a > 0 {
-                    fr.push((a, "t0", f.name.as_str()));
-                }
-                if b > 0 {
-                    fr.push((b, "t1", f.name.as_str()));
-                }
-            }
-        }
-        fr.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
-        let top: Vec<String> = fr.iter().take(8).map(|(n, t, name)| format!("{} ({}) {} KB", name, t, n / 1024)).collect();
-        verbose!("relax-run: largest frames: {}", top.join(", "));
-    }
-    let rp = REPORT_PATH.lock().unwrap().clone();
-    if !rp.is_empty() {
-        let mut j = String::from("{\"phases\":{");
-        for (i, (n, ms)) in PHASES.lock().unwrap().iter().enumerate() {
-            if i > 0 {
-                j.push(',');
-            }
-            j.push_str(&format!("\"{}\":{:.1}", n.replace('"', ""), ms));
-        }
-        j.push_str(&format!(
-            "}},\"main_ms\":{},\"end_ms\":{:.0},\"end\":\"{}\",\"compiled\":{},\"compile_errors\":{},\"typeck_ms\":{:.1},\"lower_ms\":{:.1},\"opt_ms\":{:.1},\"codegen_ms\":{:.1}}}\n",
-            MAIN_START_MS.load(Ordering::Relaxed),
-            now,
+            "relax-run: {} at t={:.0} ms (main from t={} ms): compiled {} fns, {} KB code, {} compile errors; cpu typeck {:.0} ms, lower {:.0} ms, opt {:.0} ms, codegen {:.0} ms",
             why,
+            now,
+            MAIN_START_MS.load(Ordering::Relaxed),
             s.compiled,
+            s.code_bytes / 1024,
             u.errors.len(),
             s.typeck_ns as f64 / 1e6,
             s.lower_ns as f64 / 1e6,
             s.opt_ns as f64 / 1e6,
             s.codegen_ns as f64 / 1e6
-        ));
-        let _ = std::fs::write(&rp, j);
+        );
+        }
+        crate::tui::print_slowest();
+        // wall clocks are jit::wall_ns() (started at the first call of it, at boot)
+        verbose!(
+            "relax-run: compile wall {:.0} ms (lock held); last compile ended at {:.0} ms after the clock start",
+            s.compile_wall_ns as f64 / 1e6,
+            s.last_compile_end_ns as f64 / 1e6
+        );
+        let rt = jit::RT_LAZY.load(Ordering::Relaxed);
+        if rt > 0 {
+            verbose!("relax-run: real-time threads compiled {} fns lazily, stalled {:.1} ms in all", rt, jit::RT_LAZY_NS.load(Ordering::Relaxed) as f64 / 1e6);
+        }
+        {
+            let n: Vec<f64> = jit::SPLIT_NS.iter().map(|x| x.load(Ordering::Relaxed) as f64 / 1e6).collect();
+            let (mut built, mut used) = (0, 0);
+            for f in u.fns.iter() {
+                if f.spec_state > 0 {
+                    built += 1;
+                }
+                if f.spec_state == 2 {
+                    used += 1;
+                }
+            }
+            if built > 0 || n[0] > 0.0 {
+                verbose!(
+                    "relax-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after RELAX_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} yields, {} cold calls skipped, {} priority relocks{}",
+                    n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_YIELDS.load(Ordering::Relaxed), jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), jit::SPEC_PRIORITY.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
+                );
+            }
+        }
+        if !SILENT.load(Ordering::Relaxed) {
+            let h = |i: usize| jit::LOCK_HELD_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
+            verbose!("relax-run: unit lock held: main {:.0} ms, workers {:.0} ms, other threads {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), crate::clock::ms_since_start());
+        }
+        let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
+        if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
+            verbose!("relax-run: type checks ahead (off the lock): {} bodies ({} taken by builds, {} with errors), cpu callers {:.0} ms, workers {:.0} ms", ah(0), ah(1), ah(2), ah(3) as f64 / 1e6, ah(4) as f64 / 1e6);
+        }
+        if s.ctfe_data + s.ctfe_code > 0 && !SILENT.load(Ordering::Relaxed) {
+            verbose!("relax-run: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", s.ctfe_data, s.ctfe_code, s.ctfe_ns as f64 / 1e6);
+        }
+        // RELAX_MAIN_COMPILE_LOG=<path>: the main thread's compiles, ms since main started: app
+        // execution vs compile on the critical path. Per line: start end slot how typeck_ahead
+        // lock_wait front back relock inflight_wait (ms) slot-key name (spaces as `~`), then `cpu` front opt codegen (thread cpu ms) `insts` entering opt / codegen; `slot` indexes RELAX_COMPILE_REPORT's rows
+        if let Ok(path) = std::env::var("RELAX_MAIN_COMPILE_LOG") {
+            let base = MAIN_START_WALL.load(Ordering::Relaxed);
+            let mut out = format!("# package {}\n", ROOT_DIR.lock().unwrap());
+            let ms = |ns: u64| ns as f64 / 1e6;
+            for r in jit::MAIN_COMPILES.lock().unwrap().iter() {
+                let how = jit::MAIN_HOW_NAMES.get(r.how as usize).copied().unwrap_or("?");
+                let (name, hint) = if (r.slot as usize) < u.fns.len() {
+                    let f = &u.fns[r.slot as usize];
+                    let hint = jit::slot_key(u, r.slot);
+                    (f.name.as_str(), hint)
+                } else {
+                    ("-", "-".to_string())
+                };
+                out.push_str(&format!(
+                    "{:.3} {:.3} {} {} {:.3} {:.3} {:.3} {:.3} {:.3} {:.3} {} {}  cpu {:.3} {:.3} {:.3} insts {} {}\n",
+                    ms(r.start.saturating_sub(base)), ms(r.end.saturating_sub(base)), r.slot, how, ms(r.ns[0]), ms(r.ns[1]), ms(r.ns[2]), ms(r.ns[3]), ms(r.ns[4]), ms(r.ns[5]), hint.replace(' ', "~"), name.replace(' ', "~"), ms(r.cpu[0]), ms(r.cpu[1]), ms(r.cpu[2]), r.insts[0], r.insts[1]
+                ));
+            }
+            let _ = std::fs::write(path, out);
+        }
+        let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
+        if q > 0 {
+            verbose!(
+                "relax-run: O3: {} hot, {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms with the lock, {:.0} ms without{}",
+                q,
+                s.tier1_installed,
+                s.tier1_retier,
+                s.tier1_dropped,
+                s.tier1_drop_why,
+                jit::TIER1_RIR_REBUILT[0].load(Ordering::Relaxed),
+                jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
+                s.tier1_locked_ns as f64 / 1e6,
+                s.tier1_free_ns as f64 / 1e6,
+                {
+                    let n = jit::NESTED_AT_YIELD.load(Ordering::Relaxed);
+                    if n == 0 { String::new() } else { format!("; UNBALANCED unit lock: {} nested at a yield, {} left held by a O3 job", n & 0xffff_ffff, n >> 32) }
+                }
+            );
+        }
+        let mut tl = String::new();
+        for (i, (n, w)) in s.timeline.iter().enumerate() {
+            if *n > 0 {
+                tl.push_str(&format!(" {}s:{}fns/{}ms", i as f64 / 10.0, n, w / 1_000_000));
+            }
+        }
+    if !SILENT.load(Ordering::Relaxed) {     verbose!("relax-run: compile timeline (100 ms buckets):{}", tl); }
+        if std::env::var("RELAX_PASS_TIMES").is_ok() {
+            let mut passes = String::new();
+            for i in 0..crate::opt::PASS_NAMES.len() {
+                passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(Ordering::Relaxed) as f64 / 1e6));
+            }
+    if !SILENT.load(Ordering::Relaxed) {         verbose!("relax-run: opt passes (cpu ms): {}", passes); }
+            verbose!("relax-run: invokes {} seen, {} made plain calls", crate::opt::INVOKES_SEEN.load(Ordering::Relaxed), crate::opt::INVOKES_DEMOTED.load(Ordering::Relaxed));
+        }
+        if crate::rir::unwind_stats_on() {
+            let st = &crate::rir::UNWIND_STATS;
+            verbose!("relax-run: unwind bytes: pads {} KB, landing stubs {} KB, trailers {} KB; invokes emitted {}", st[0].load(Ordering::Relaxed) / 1024, st[1].load(Ordering::Relaxed) / 1024, st[2].load(Ordering::Relaxed) / 1024, st[3].load(Ordering::Relaxed));
+        }
+        // startup list: non-generic fns compiled during this run, in slot order (first-call order)
+        let mut list = String::new();
+        for f in u.fns.iter() {
+            if let FnKey::Inst(d, args) = &f.key {
+                if f.compiled && args.is_empty() {
+                    list.push_str(&u.prog.def_path(*d));
+                    list.push('\n');
+                }
+            }
+        }
+        let path = STARTUP_PATH.lock().unwrap().clone();
+        if !path.is_empty() {
+            if let Some(dir) = std::path::Path::new(&path).parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, list);
+        }
+        // per-slot compile report: kind, crate, generic, compiled (= entered: compiles happen on
+        // the first call through the lazy stub), RIR built, times inlined, cpu ns; last column
+        // `spec`: 0 not built ahead, 1 built ahead and never called (wasted), 2 built ahead and
+        // installed by its first call; `spec_depth`: speculation depth it was queued at (-1 none)
+        if let Ok(p) = std::env::var("RELAX_COMPILE_REPORT") {
+            let mut out = format!("# build: {}\n", crate::jit::PROVENANCE);
+            out.push_str("kind\tcrate\tgeneric\tcompiled\trir\tinlined_into\tbuild_ns\tcg_ns\tsrc\tname\tspec\tspec_depth\torigin\ttrait\tself\thint\tcode_bytes\tO3\tframe0\tframe1\tslots0\tslots1\n");
+            let frames = jit::FRAMES.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let fslots = jit::FRAME_SLOTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            for (idx, f) in u.fns.iter().enumerate() {
+                let (kind, krate, generic) = match &f.key {
+                    FnKey::Inst(d, args) => ("inst", u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name).to_string(), !args.is_empty()),
+                    FnKey::Closure(..) => ("closure", "-".to_string(), false),
+                    FnKey::Shim(_) => ("shim", "-".to_string(), true),
+                    FnKey::Glue(g, _) => (if *g == jit::GLUE_DROP { "drop" } else { "glue" }, "-".to_string(), true),
+                    FnKey::Sandbox(_) => ("sandbox", "-".to_string(), false),
+                };
+                let src = jit::src_size(u, idx as u32);
+                let (origin, tr, selfty) = report_origin(u, &f.key);
+                // def path of a non-generic fn instance (jit::slot_key has every slot's full key)
+                let hint = match &f.key {
+                    FnKey::Inst(d, args) if args.is_empty() => crate::program::hint_path(&u.prog.defs, &u.prog.syms, &u.prog.files, *d),
+                    _ => "-".to_string(),
+                };
+                out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", kind, krate, generic as u8, f.compiled as u8, (f.rir.is_some() || f.build_ns > 0) as u8, f.inlined_into.len(), f.build_ns, f.cg_ns, src as i64, f.name, f.spec_state, if f.spec_depth == u8::MAX { -1 } else { f.spec_depth as i32 }, origin, tr, selfty, hint, if f.compiled { f.code_len } else { 0 }, !f.retired.is_empty() as u8, frames.get(idx).map_or(0, |x| x.0), frames.get(idx).map_or(0, |x| x.1), fslots.get(idx).map_or(0, |x| x.0), fslots.get(idx).map_or(0, |x| x.1)));
+            }
+            let _ = std::fs::write(&p, out);
+            // code-size sanity: the largest O3 functions (an inliner gone wild shows here first;
+            // R13's parser function was 1.9 MB)
+            let mut t1: Vec<(u32, &str)> = u.fns.iter().filter(|f| f.compiled && !f.retired.is_empty()).map(|f| (f.code_len, f.name.as_str())).collect();
+            t1.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
+            let top: Vec<String> = t1.iter().take(5).map(|(n, name)| format!("{} {} KB", name, n / 1024)).collect();
+            verbose!("relax-run: largest O3 functions: {}", if top.is_empty() { "none".to_string() } else { top.join(", ") });
+            // stack sanity: the largest frames (O1 and O3)
+            let mut fr: Vec<(u32, &str, &str)> = Vec::new();
+            for (idx, f) in u.fns.iter().enumerate() {
+                if let Some(&(a, b)) = frames.get(idx) {
+                    if a > 0 {
+                        fr.push((a, "t0", f.name.as_str()));
+                    }
+                    if b > 0 {
+                        fr.push((b, "t1", f.name.as_str()));
+                    }
+                }
+            }
+            fr.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(b.2)));
+            let top: Vec<String> = fr.iter().take(8).map(|(n, t, name)| format!("{} ({}) {} KB", name, t, n / 1024)).collect();
+            verbose!("relax-run: largest frames: {}", top.join(", "));
+        }
+        let rp = REPORT_PATH.lock().unwrap().clone();
+        if !rp.is_empty() {
+            let mut j = String::from("{\"phases\":{");
+            for (i, (n, ms)) in PHASES.lock().unwrap().iter().enumerate() {
+                if i > 0 {
+                    j.push(',');
+                }
+                j.push_str(&format!("\"{}\":{:.1}", n.replace('"', ""), ms));
+            }
+            j.push_str(&format!(
+                "}},\"main_ms\":{},\"end_ms\":{:.0},\"end\":\"{}\",\"compiled\":{},\"compile_errors\":{},\"typeck_ms\":{:.1},\"lower_ms\":{:.1},\"opt_ms\":{:.1},\"codegen_ms\":{:.1}}}\n",
+                MAIN_START_MS.load(Ordering::Relaxed),
+                now,
+                why,
+                s.compiled,
+                u.errors.len(),
+                s.typeck_ns as f64 / 1e6,
+                s.lower_ns as f64 / 1e6,
+                s.opt_ns as f64 / 1e6,
+                s.codegen_ns as f64 / 1e6
+            ));
+            let _ = std::fs::write(&rp, j);
+        }
+    };
+    if why == "stats" {
+        if crate::owner::call_within(crate::owner::Class::App, 0, || { if preamble(true) { rest(); } }).is_none() {
+            preamble(false);
+        }
+    } else if jit::quiesce(exit_quiesce_ms()) {
+        // quiesce returns holding the unit lock; the summary is one unit call within that hold
+        crate::owner::call(crate::owner::Class::App, || { if preamble(true) { rest(); } });
+        jit::unlock_unit();
+    } else {
+        preamble(false);
     }
-    jit::unlock_unit();
 }
 
 /// Compile report columns `origin`, `trait`, `self` of a slot: where its body's source is

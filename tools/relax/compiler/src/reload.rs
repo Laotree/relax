@@ -78,17 +78,19 @@ fn trace_sub(name: &'static str) {
         }
     });
 }
-/// lock_unit for the reload transaction; RELAX_RELOAD_TRACE reports a wait over 5 ms with
+/// A unit call for the reload transaction; RELAX_RELOAD_TRACE reports a wait over 5 ms with
 /// the holder seen when the wait began (whose hold delayed the edit).
-fn lock_traced(at: &'static str) {
+fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
     let traced = TRACE.with(|s| s.borrow().started.is_some());
     let holder = if traced { jit::unit_lock_holder() } else { None };
     let t = Instant::now();
-    jit::lock_unit();
-    let waited = t.elapsed().as_secs_f64() * 1e3;
-    if let Some(h) = holder.filter(|_| waited > 5.0) {
-        eprintln!("reload-trace: unit lock wait {waited:.1} ms before {at}: held by {h}");
-    }
+    crate::owner::call(crate::owner::Class::App, || {
+        let waited = t.elapsed().as_secs_f64() * 1e3;
+        if let Some(h) = holder.filter(|_| waited > 5.0) {
+            eprintln!("reload-trace: unit lock wait {waited:.1} ms before {at}: held by {h}");
+        }
+        f()
+    })
 }
 fn trace_count(name: &'static str, n: usize) {
     TRACE.with(|s| {
@@ -426,55 +428,55 @@ fn publish_reload(u: &mut Unit, versions: &[(u32, u32)], full: bool, scope: Opti
 /// to their previous code, the files to their previous versions, the consts to their previous
 /// values. Returns the rolled-back functions' names. The caller must not hold the unit lock.
 pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
-    jit::lock_unit();
-    let u = &mut *up;
-    jit::bump_patch_epoch();
-    let ids = u.rollback_gen(undo.group);
-    let names = ids.iter().map(|id| u.fns[*id as usize].name.clone()).collect();
-    {
-        let fw = jit::front_write();
-        u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let impls: Vec<DefId> = undo.added.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
-        u.prog.unbind_defs(&undo.added);
-        if !impls.is_empty() { u.tcx.uncollect_impls(&impls); }
-        u.prog.rebind_defs(&undo.removed);
-        for (k, &(o, n)) in undo.versions.iter().enumerate().rev() {
-            u.prog.revert_version(o, n, &undo.pairs[k]);
+    crate::owner::call(crate::owner::Class::App, || {
+        let u = &mut *up;
+        jit::bump_patch_epoch();
+        let ids = u.rollback_gen(undo.group);
+        let names = ids.iter().map(|id| u.fns[*id as usize].name.clone()).collect();
+        {
+            let fw = jit::front_write();
+            u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let impls: Vec<DefId> = undo.added.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
+            u.prog.unbind_defs(&undo.added);
+            if !impls.is_empty() { u.tcx.uncollect_impls(&impls); }
+            u.prog.rebind_defs(&undo.removed);
+            for (k, &(o, n)) in undo.versions.iter().enumerate().rev() {
+                u.prog.revert_version(o, n, &undo.pairs[k]);
+            }
+            for (d, n) in &undo.variants { u.prog.truncate_variants(*d, *n); }
+            for (d, adt) in &undo.adts { u.tcx.adts.insert(*d, adt.clone()); }
+            publish_reload(u, &undo.versions, undo.full_inputs, undo.scope.as_deref());
+            u.lay.clear();
+            u.prog.reclaim_caches();
+            drop(fw);
         }
-        for (d, n) in &undo.variants { u.prog.truncate_variants(*d, *n); }
-        for (d, adt) in &undo.adts { u.tcx.adts.insert(*d, adt.clone()); }
-        publish_reload(u, &undo.versions, undo.full_inputs, undo.scope.as_deref());
-        u.lay.clear();
-        u.prog.reclaim_caches();
-        drop(fw);
-    }
-    if undo.full_inputs {
-        let (prog, scope) = (&u.prog, undo.scope.as_deref());
-        u.consts.retain(|(d, _), _| !in_scope(prog, scope, *d));
-        u.const_failed.retain(|(d, _)| !in_scope(prog, scope, *d));
-    }
-    for k in &undo.consts_hit {
-        let ks: Vec<(DefId, Vec<TyId>)> = u.consts.keys().filter(|(d, _)| d == k).cloned().collect();
-        for x in ks {
-            u.consts.remove(&x);
+        if undo.full_inputs {
+            let (prog, scope) = (&u.prog, undo.scope.as_deref());
+            u.consts.retain(|(d, _), _| !in_scope(prog, scope, *d));
+            u.const_failed.retain(|(d, _)| !in_scope(prog, scope, *d));
         }
-    }
-    for (k, v) in undo.consts { u.consts.insert(k, v); }
-    u.const_failed.retain(|(d, _)| !undo.consts_hit.contains(d));
-    u.const_failed.extend(undo.const_failed);
-    // RIR built from the rolled-back text (inlining sources) is dropped
-    for id in std::mem::take(&mut u.reload_specs) {
-        u.fns[id as usize].spec = None;
-    }
-    for &(_, n) in &undo.versions {
-        for f in u.fns.iter_mut() {
-            if f.rir.as_ref().map_or(false, |r| r.file == n) {
-                f.rir = None;
+        for k in &undo.consts_hit {
+            let ks: Vec<(DefId, Vec<TyId>)> = u.consts.keys().filter(|(d, _)| d == k).cloned().collect();
+            for x in ks {
+                u.consts.remove(&x);
             }
         }
-    }
-    jit::unlock_unit();
-    names
+        for (k, v) in undo.consts { u.consts.insert(k, v); }
+        u.const_failed.retain(|(d, _)| !undo.consts_hit.contains(d));
+        u.const_failed.extend(undo.const_failed);
+        // RIR built from the rolled-back text (inlining sources) is dropped
+        for id in std::mem::take(&mut u.reload_specs) {
+            u.fns[id as usize].spec = None;
+        }
+        for &(_, n) in &undo.versions {
+            for f in u.fns.iter_mut() {
+                if f.rir.as_ref().map_or(false, |r| r.file == n) {
+                    f.rir = None;
+                }
+            }
+        }
+        names
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1922,35 +1924,16 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
     // keeps running the code it had; a half-applied state is not installed)
     let files: Vec<u32> = edits.iter().map(|e| e.file).collect();
     let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-
-
-        lock_traced("lock");
-        trace_stage("lock");
-        trace_count("program_defs", (&(*up).prog.defs).len());
-        trace_count("program_slots", (*up).fns.len());
-        trace_count("program_files", (*up).prog.files.len());
-        // A stream and the disk watcher may edit the same file. Resolve stale watcher indices
-        // under the lock, before the parse snapshot and the pairing against the running version.
-        let edits: Vec<Edit> = {
-            let prog = &(*up).prog;
-            edits.into_iter().map(|mut e| {
-                if !module {
-                    let path = &prog.file_paths[e.file as usize];
-                    if let Some(file) = prog.mods.iter().map(|m| m.file).find(|&f| prog.file_paths[f as usize] == *path) { e.file = file; }
-                }
-                e
-            }).collect()
-        };
-        // Whole-file candidates parse off the lock; partial Rust retries stay under it.
-        let off_lock = partial != 2;
-        let mut stale = 0;
-        let pre = loop {
+        // takes the parse snapshots of the edits (under the unit call)
+        let snap = |edits: &[Edit]| {
             let macro_table = (*up).prog.macros.clone();
             let epoch = (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire);
+            // Whole-file candidates parse off the lock; partial Rust retries stay under it.
+            let off_lock = partial != 2;
             let snapshots: Vec<_> = if off_lock {
                 let prog = &(*up).prog;
                 let mut contexts = std::collections::BTreeMap::new();
-                for e in &edits {
+                for e in edits {
                     let krate = prog.file_crate[e.file as usize];
                     let context = contexts.entry(krate).or_insert_with(|| prog.crates[krate as usize].context.clone());
                     *context = context.edited(&e.path, e.src.clone().into());
@@ -1961,38 +1944,67 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
                     Some(snapshot)
                 }).collect()
             } else { Vec::new() };
-            jit::unlock_unit();
+            (macro_table, epoch, snapshots)
+        };
+        let (mut edits, mut cur) = call_traced("lock", || {
+            trace_stage("lock");
+            trace_count("program_defs", (&(*up).prog.defs).len());
+            trace_count("program_slots", (*up).fns.len());
+            trace_count("program_files", (*up).prog.files.len());
+            // A stream and the disk watcher may edit the same file. Resolve stale watcher indices
+            // under the lock, before the parse snapshot and the pairing against the running version.
+            let edits: Vec<Edit> = {
+                let prog = &(*up).prog;
+                edits.into_iter().map(|mut e| {
+                    if !module {
+                        let path = &prog.file_paths[e.file as usize];
+                        if let Some(file) = prog.mods.iter().map(|m| m.file).find(|&f| prog.file_paths[f as usize] == *path) { e.file = file; }
+                    }
+                    e
+                }).collect()
+            };
+            let cur = snap(&edits);
+            (edits, cur)
+        });
+        let mut stale = 0;
+        loop {
+            let (macro_table, epoch, snapshots) = cur;
             // Only owned snapshots are reachable here; never retain a Unit/Program reference
             // across the unlock. Lazy stubs and background/spec workers can compile meanwhile.
             trace_stage("snapshot");
             let pre: Vec<Option<Result<crate::program::FileVersion, String>>> = edits.iter().zip(snapshots).map(|(e, s)| s.map(|s| s.parse(e.src.clone()))).collect();
             trace_stage("reparse");
-            lock_traced("relock");
-            trace_stage("relock");
-            // Runtime module loads publish macro tables; rollback also changes the collection
-            // epoch. Neither may make this snapshot stale while the parser runs off the lock.
-            if std::sync::Arc::ptr_eq(&macro_table, &(*up).prog.macros) && epoch == (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire) {
-                drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
-                break pre;
+            let step = call_traced("relock", || {
+                trace_stage("relock");
+                // Runtime module loads publish macro tables; rollback also changes the collection
+                // epoch. Neither may make this snapshot stale while the parser runs off the lock.
+                if std::sync::Arc::ptr_eq(&macro_table, &(*up).prog.macros) && epoch == (*up).tcx.collect_epoch.load(std::sync::atomic::Ordering::Acquire) {
+                    drop(macro_table); // allow commit's Arc::make_mut to update an unshared table
+                    return Ok(apply_locked(up, edits, pre, t0, partial, 8, module));
+                }
+                stale += 1;
+                if stale == 3 {
+                    return Ok(Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] });
+                }
+                let cur = snap(&edits);
+                Err((edits, cur))
+            });
+            match step {
+                Ok(outcome) => break outcome,
+                Err((e, c)) => { edits = e; cur = c; }
             }
-            stale += 1;
-            if stale == 3 {
-                return Outcome { kept: 0, pending: false, rung: Rung::Refuse, files: files.clone(), lines: vec!["program context changed while parsing -- retry the edit; running code is unchanged".into()], names: Vec::new(), changed: 0, group: 0, ms: [ms(t0), 0.0, 0.0, 0.0], undo: None, work: [0; 5] };
-            }
-        };
-        apply_locked(up, edits, pre, t0, partial, 8, module)
+        }
     })) {
         Ok(r) => r,
         Err(p) => {
-            jit::unlock_to(depth);
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
             Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- Relax bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
-    jit::lock_unit();
-    (*up).reload_rir = None;
-    jit::close_patch();
-    jit::unlock_to(depth);
+    crate::owner::call(crate::owner::Class::App, || {
+        (*up).reload_rir = None;
+        jit::close_patch();
+    });
     transaction.finish(&r);
     r
 }
@@ -3546,11 +3558,10 @@ fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
 }
 
 unsafe fn stream_file(up: *mut Unit, path: &str) -> Option<u32> {
-    jit::lock_unit();
-    let prog = &(&*up).prog;
-    let result = prog.mods.iter().map(|m| m.file).find(|&f| prog.file_paths[f as usize] == path);
-    jit::unlock_unit();
-    result
+    crate::owner::call(crate::owner::Class::App, || {
+        let prog = &(&*up).prog;
+        prog.mods.iter().map(|m| m.file).find(|&f| prog.file_paths[f as usize] == path)
+    })
 }
 
 unsafe fn target_file(up: *mut Unit, target: &StreamTarget) -> Option<(u32, String)> {
@@ -3650,13 +3661,14 @@ unsafe fn drain_streams(up: *mut Unit) {
             s.reported = true;
             if let Some((file, path)) = target_file(up, target) {
                 let seen = Instant::now();
-                jit::lock_unit();
-                let parsed = (&*up).prog.parse_version(file, &path, s.text.clone());
-                // A stall is diagnostic, not an instruction to delete the unstreamed tail.
-                let composed = if parsed.is_ok() && (path.ends_with(".rs") || matches!(target, StreamTarget::Module(_))) {
-                    compose_partial(&(&*up).prog, file, &s.text).map(|r| r.0)
-                } else { Some(s.text.clone()) };
-                jit::unlock_unit();
+                let (parsed, composed) = crate::owner::call(crate::owner::Class::App, || {
+                    let parsed = (&*up).prog.parse_version(file, &path, s.text.clone());
+                    // A stall is diagnostic, not an instruction to delete the unstreamed tail.
+                    let composed = if parsed.is_ok() && (path.ends_with(".rs") || matches!(target, StreamTarget::Module(_))) {
+                        compose_partial(&(&*up).prog, file, &s.text).map(|r| r.0)
+                    } else { Some(s.text.clone()) };
+                    (parsed, composed)
+                });
                 if let Err(error) = parsed {
                     let mut o = idle_outcome(Some(file), &error);
                     o.rung = Rung::Refuse;
@@ -3742,14 +3754,14 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
     };
     // (the watcher's holds read the program's files only: lock_unit_quick)
     let mut files: Vec<(String, u32, Option<(std::time::SystemTime, u64)>)> = {
-        jit::lock_unit_quick();
-        let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
-        let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
-        for (p, i) in loaded {
-            if !inputs.paths.contains_key(&p) { let s = stamp(&p); v.push((p, i, s)); }
-        }
-        jit::unlock_unit();
-        v
+        crate::owner::call_quick(crate::owner::Class::App, || {
+            let loaded: std::collections::HashMap<_, _> = own_files(&*up).into_iter().collect();
+            let mut v: Vec<_> = inputs.paths.iter().map(|(p, (stamp, _))| (p.clone(), loaded.get(p).copied().unwrap_or(u32::MAX), *stamp)).collect();
+            for (p, i) in loaded {
+                if !inputs.paths.contains_key(&p) { let s = stamp(&p); v.push((p, i, s)); }
+            }
+            v
+        })
     };
     // Proc-macro source crates are stripped from the app graph. Their inputs and
     // directories still participate in the existing watcher's changed-path batch.
@@ -3768,11 +3780,11 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
-        jit::lock_unit_quick();
-        let u = &*up;
-        let root = crate::layout::root_crate() as usize;
-        let dir = u.prog.crates.get(root).and_then(|c| u.prog.mods.get(c.root_mod as usize)).and_then(|m| u.prog.file_paths.get(m.file as usize)).and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()));
-        jit::unlock_unit();
+        let dir = crate::owner::call_quick(crate::owner::Class::App, || {
+            let u = &*up;
+            let root = crate::layout::root_crate() as usize;
+            u.prog.crates.get(root).and_then(|c| u.prog.mods.get(c.root_mod as usize)).and_then(|m| u.prog.file_paths.get(m.file as usize)).and_then(|p| std::path::Path::new(p).parent().map(|d| d.to_string_lossy().into_owned()))
+        });
         match dir {
             Some(d) => files.iter().enumerate().filter(|(_, f)| crate::vfs::relative_path(&f.0, &d).is_some()).map(|(k, _)| k).take(64).collect(),
             None => Vec::new(),
@@ -3797,9 +3809,7 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
         let mut rewatched = std::mem::take(&mut startup_scan);
         if loads != loads_seen || rewatched {
             loads_seen = loads;
-            jit::lock_unit_quick();
-            let loaded = own_files(&*up);
-            jit::unlock_unit();
+            let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
             let known: std::collections::HashMap<_, _> = files.iter().enumerate().map(|(i, f)| (f.0.clone(), i)).collect();
             let mut added = Vec::new();
             for (path, file) in loaded {
@@ -3950,12 +3960,11 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
             };
             // unchanged text (touched, or saved back to the running version)
             let same = {
-                jit::lock_unit();
-                let u = &*up;
-                let pf = &u.prog.files[f.1 as usize];
-                let r = pf.src[..pf.src_len as usize] == src[..];
-                jit::unlock_unit();
-                r
+                crate::owner::call(crate::owner::Class::App, || {
+                    let u = &*up;
+                    let pf = &u.prog.files[f.1 as usize];
+                    pf.src[..pf.src_len as usize] == src[..]
+                })
             };
             if !same {
                 edits.push(Edit { file: f.1, path: f.0.clone(), src });

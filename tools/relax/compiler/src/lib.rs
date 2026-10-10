@@ -650,10 +650,10 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             continue;
         }
         // speculative workers compile concurrently: unit access under the lock
-        jit::lock_unit();
-        let id = u.fn_id(jit::FnKey::Inst(d, Vec::new()));
-        let entry = u.entry(id);
-        jit::unlock_unit();
+        let entry = crate::owner::call(crate::owner::Class::App, || {
+            let id = u.fn_id(jit::FnKey::Inst(d, Vec::new()));
+            u.entry(id)
+        });
         let ts = Instant::now();
         jit::watchdog(runtime.watchdog_ms);
         let up: *mut jit::Unit = &mut *u;
@@ -663,58 +663,59 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         if !last_round {
             continue;
         }
-        jit::lock_unit();
-        match r {
-            Ok(_) => {
-                println!("test {} ... ok ({:.2} ms)", name, dt);
-                passed += 1;
+        crate::owner::call(crate::owner::Class::App, || {
+            match r {
+                Ok(_) => {
+                    println!("test {} ... ok ({:.2} ms)", name, dt);
+                    passed += 1;
+                }
+                Err(p) => {
+                    println!("test {} ... FAILED ({:.2} ms)", name, dt);
+                    println!("  report: {}", u.report(&p));
+                    failed += 1;
+                }
             }
-            Err(p) => {
-                println!("test {} ... FAILED ({:.2} ms)", name, dt);
-                println!("  report: {}", u.report(&p));
-                failed += 1;
+            for e in std::mem::take(&mut u.errors) {
+                println!("  {}", e);
             }
+        });
+    }
+    crate::owner::call(crate::owner::Class::App, || {
+        println!(
+            "test result: {} passed; {} failed. compiled {} fns ({} bytes, {} RIR insts): typeck {:.2} ms, lower {:.2} ms, opt {:.2} ms, codegen {:.2} ms",
+            passed,
+            failed,
+            u.stats.compiled,
+            u.stats.code_bytes,
+            u.stats.rir_insts,
+            u.stats.typeck_ns as f64 / 1e6,
+            u.stats.lower_ns as f64 / 1e6,
+            u.stats.opt_ns as f64 / 1e6,
+            u.stats.codegen_ns as f64 / 1e6
+        );
+        let mut rules = String::new();
+        for (i, n) in opt::RULE_NAMES.iter().enumerate() {
+            rules.push_str(&format!("{} {}  ", n, u.stats.inline_rules[i]));
         }
-        for e in std::mem::take(&mut u.errors) {
-            println!("  {}", e);
+        println!("inlined call sites by rule: {}", rules);
+        if std::env::var("RELAX_PASS_TIMES").is_ok() {
+            let mut passes = String::new();
+            for i in 0..crate::opt::PASS_NAMES.len() {
+                passes.push_str(&format!("{} {:.2}  ", opt::PASS_NAMES[i], opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
+            }
+            println!("opt passes (ms): {}", passes);
         }
-        jit::unlock_unit();
-    }
-    jit::lock_unit();
-    println!(
-        "test result: {} passed; {} failed. compiled {} fns ({} bytes, {} RIR insts): typeck {:.2} ms, lower {:.2} ms, opt {:.2} ms, codegen {:.2} ms",
-        passed,
-        failed,
-        u.stats.compiled,
-        u.stats.code_bytes,
-        u.stats.rir_insts,
-        u.stats.typeck_ns as f64 / 1e6,
-        u.stats.lower_ns as f64 / 1e6,
-        u.stats.opt_ns as f64 / 1e6,
-        u.stats.codegen_ns as f64 / 1e6
-    );
-    let mut rules = String::new();
-    for (i, n) in opt::RULE_NAMES.iter().enumerate() {
-        rules.push_str(&format!("{} {}  ", n, u.stats.inline_rules[i]));
-    }
-    println!("inlined call sites by rule: {}", rules);
-    if std::env::var("RELAX_PASS_TIMES").is_ok() {
-        let mut passes = String::new();
-        for i in 0..crate::opt::PASS_NAMES.len() {
-            passes.push_str(&format!("{} {:.2}  ", opt::PASS_NAMES[i], opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
+        u.flush_query_errors(true);
+        if !u.errors.is_empty() {
+            for error in &u.errors { eprintln!("error: {error}"); }
+            return 1;
         }
-        println!("opt passes (ms): {}", passes);
-    }
-    u.flush_query_errors(true);
-    if !u.errors.is_empty() {
-        for error in &u.errors { eprintln!("error: {error}"); }
-        return 1;
-    }
-    if failed > 0 {
-        1
-    } else {
-        0
-    }
+        if failed > 0 {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// M2: loads every crate of the unit graph with Relax's core/std and resolves all imports.
