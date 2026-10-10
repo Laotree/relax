@@ -585,44 +585,38 @@ fn stringify_o(buf: Buf, toks: &[Tok], lo: usize, hi: usize, origins: &[(u32, u3
 
 // ---------------------------------------------------------------- expansion entry points
 
-/// The original (outermost call site) position of `pos`.
-/// Source position of the expansion token at `pos`: its fragment origin while there is one,
-/// else the outermost call site (orig_pos).
+/// Authored position of a proc-macro input token. Substitutions retain their
+/// fragment spans; literal tokens retain the recorded definition-body spans.
+/// This does not change identifier hygiene or the call-site position of line!().
 fn src_origin(p: &crate::parser::Parser, mut pos: u32) -> u32 {
     let base = p.src.len() as u32;
     for _ in 0..64 {
         if pos < base {
             return pos;
         }
-        // the substituted token containing `pos` (a multi-character punctuation token is split
-        // into single-character puncts at lo, lo + 1, ..)
-        let i = match p.tok_origin.binary_search_by_key(&pos, |x| x.0) {
-            Ok(i) => i + 1,
-            Err(i) => i,
-        };
-        match i.checked_sub(1).map(|k| p.tok_origin[k]) {
-            Some((t, o, n)) if pos < t + n => pos = o + (pos - t),
+        match proc_token_origin(p, pos) {
+            Some(origin) if origin != pos => pos = origin,
             _ => break,
         }
     }
     orig_pos(p, pos)
 }
 
-/// Source position just past the expansion text ending at `z`: the last fragment token that
-/// starts before `z`, mapped to its source and advanced by its length.
+fn proc_token_origin(p: &crate::parser::Parser, pos: u32) -> Option<u32> {
+    for origins in [&p.tok_origin, &p.body_origin] {
+        let i = origins.partition_point(|x| x.0 <= pos);
+        if let Some((t, o, n)) = i.checked_sub(1).map(|i| origins[i]) {
+            if pos < t + n { return Some(o + (pos - t)); }
+        }
+    }
+    None
+}
+
+/// Map the final byte of this token, rather than extending an unrelated earlier
+/// fragment across intervening literal tokens in the expansion.
 fn src_origin_end(p: &crate::parser::Parser, z: u32) -> Option<u32> {
-    let i = match p.tok_origin.binary_search_by_key(&z, |x| x.0) {
-        Ok(i) | Err(i) => i,
-    };
-    if i == 0 {
-        return None;
-    }
-    let (t, ot, _) = p.tok_origin[i - 1];
-    let o = src_origin(p, ot);
-    if o >= p.src.len() as u32 {
-        return None;
-    }
-    Some(o + z.saturating_sub(t))
+    let o = src_origin(p, proc_token_origin(p, z.checked_sub(1)?)?);
+    (o < p.src.len() as u32).then_some(o + 1)
 }
 
 fn orig_pos(p: &crate::parser::Parser, mut pos: u32) -> u32 {
