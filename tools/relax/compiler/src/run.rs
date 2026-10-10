@@ -536,7 +536,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                     deps.push((prog.syms.intern(n), crate_of[*d]));
                 }
             }
-            match prog.load_crate(&c.name, &c.src_path, c.edition, cfgs[ci].clone(), deps) {
+            match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cfgs[ci].clone(), deps) {
                 Ok(kk) => {
                     prog.crates[kk as usize].proc_macro = c.proc_macro;
                     crate_of[ci] = kk;
@@ -660,7 +660,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Resolve);
     // ---- resolve
     let t = Instant::now();
-    if let Some((_, imports)) = collected_suffix { prog.resolve_imports_from(imports); }
+    if let Some((first, imports)) = collected_suffix { prog.resolve_imports_added(imports, first); }
     else if !collected_restored { prog.resolve_imports(); }
     if runtime.lazy_verify {
         if let Err(error) = prog.verify_lazy(crate::front::verify_file) {

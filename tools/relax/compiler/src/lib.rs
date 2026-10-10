@@ -544,16 +544,16 @@ pub(crate) fn load_std_crates_with(sess: &std::sync::Arc<crate::Session>, prog: 
 
 fn load_std_crates_inner(sess: &std::sync::Arc<crate::Session>, prog: &mut program::Program, loaded: &mut impl FnMut(&mut program::Program, u32)) -> Result<(u32, Vec<(program::Sym, u32)>), String> {
     let pre = std_pre_crates(sess);
-    let core = prog.load_crate("core", &pre[0].root, 2021, cfg::CfgSet::host(sess, &[]), Vec::new())?;
+    let core = prog.load_crate_deferred("core", &pre[0].root, 2021, cfg::CfgSet::host(sess, &[]), Vec::new())?;
     loaded(prog, core);
     let core_sym = prog.syms.intern("core");
     let mut deps = vec![(core_sym, core)];
     if pre.len() == 3 {
-        let alloc = prog.load_crate("alloc", &pre[1].root, 2021, cfg::CfgSet::host(sess, &[]), deps.clone())?;
+        let alloc = prog.load_crate_deferred("alloc", &pre[1].root, 2021, cfg::CfgSet::host(sess, &[]), deps.clone())?;
         loaded(prog, alloc);
         deps.push((prog.syms.intern("alloc"), alloc));
     }
-    let std = prog.load_crate("std", &pre[pre.len() - 1].root, 2021, cfg::CfgSet::host(sess, &[]), deps.clone())?;
+    let std = prog.load_crate_deferred("std", &pre[pre.len() - 1].root, 2021, cfg::CfgSet::host(sess, &[]), deps.clone())?;
     loaded(prog, std);
     deps.push((prog.syms.intern("std"), std));
     Ok((core, deps))
@@ -573,7 +573,7 @@ pub fn load_with_std(sess: &std::sync::Arc<crate::Session>, root: &str, name: &s
     let edition = std::fs::read_to_string(root).ok().and_then(|src| {
         src.lines().take_while(|l| l.starts_with("//")).find_map(|l| l.strip_prefix("//@ edition:").and_then(|e| e.trim().parse::<u16>().ok()))
     });
-    let krate = match prog.load_crate(name, root, edition.unwrap_or(2021), cfgset, deps) {
+    let krate = match prog.load_crate_deferred(name, root, edition.unwrap_or(2021), cfgset, deps) {
         Ok(c) => c,
         Err(e) => return Err(vec![e]),
     };
@@ -742,7 +742,7 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
         }
         let mut cs = cfg::CfgSet::host(sess, &c.features);
         cs.set.push("relax".to_string());
-        match prog.load_crate(&c.name, &c.src_path, c.edition, cs, deps) {
+        match prog.load_crate_deferred(&c.name, &c.src_path, c.edition, cs, deps) {
             Ok(k) => {
                 prog.crates[k as usize].proc_macro = c.proc_macro;
                 crate_of[ci] = k;

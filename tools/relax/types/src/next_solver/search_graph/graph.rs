@@ -245,6 +245,7 @@ struct CachedResult {
     required_depth: RequiredDepth,
     nested_goals: NestedGoals,
     result: Tracked,
+    misses: std::sync::Arc<Vec<(u32, String)>>,
 }
 
 #[derive(Default)]
@@ -258,6 +259,19 @@ struct CacheEntry {
 #[derive(Default)]
 pub(in crate::next_solver) struct GlobalCache {
     entries: HashMap<u32, CacheEntry>,
+}
+
+impl GlobalCache {
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub(super) fn remove_misses(&mut self) {
+        self.entries.retain(|_, e| {
+            if e.success.as_ref().is_some_and(|v| !v.misses.is_empty()) { e.success = None; }
+            e.with_overflow.retain(|_, v| v.misses.is_empty());
+            e.success.is_some() || !e.with_overflow.is_empty()
+        });
+    }
 }
 
 pub struct SearchGraph {
@@ -450,7 +464,7 @@ impl SearchGraph {
             nested_goals: NestedGoals::default(),
         });
         let engine = &delegate.tcx.queries.engine;
-        let (evaluation, dep_node) = engine.with_anon_task(&mut || self.evaluate_goal_in_task(delegate, input, inspect));
+        let ((evaluation, misses), dep_node) = engine.with_anon_task(&mut || crate::type_queries::with_misses(|| self.evaluate_goal_in_task(delegate, input, inspect)));
         Self::update_parent_goal(
             &mut self.stack,
             step,
@@ -466,6 +480,7 @@ impl SearchGraph {
             let entry = cache.entries.entry(input).or_default();
             let cached = CachedResult {
                 result: delegate.mk_tracked(result, dep_node),
+                misses,
                 required_depth: evaluation.required_depth,
                 nested_goals: evaluation.nested_goals,
             };
@@ -597,6 +612,7 @@ impl SearchGraph {
             }
         }
         let (cached, overflow) = selected?;
+        crate::program::note_misses(&cached.misses);
         Self::update_parent_goal(
             &mut self.stack,
             step,

@@ -36,12 +36,20 @@ impl Default for SolverCache {
 pub(super) struct ProofTreeCacheEntry {
     pub result: QueryResult, pub final_revision: super::inspect::Probe,
     pub required_depth: graph::RequiredDepth, pub dep_node: crate::query::DepNodeIndex,
+    pub misses: std::sync::Arc<Vec<(u32, String)>>,
 }
 impl SolverCache {
     pub(crate) fn len(&self) -> usize { self.inputs.len() + self.proof_trees.len() }
     /// The global cache shard holding `input`'s entries.
-    pub(super) fn global(&self, input: u32) -> std::sync::MutexGuard<'_, graph::GlobalCache> {
+    fn global(&self, input: u32) -> std::sync::MutexGuard<'_, graph::GlobalCache> {
         self.global_cache[input as usize % GLOBAL_SHARDS].lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn cached_len(&self) -> usize {
+        self.global_cache.iter().map(|g| g.lock().unwrap_or_else(|e| e.into_inner()).len()).sum::<usize>() + self.proof_trees.len()
+    }
+    pub(crate) fn remove_misses(&mut self) {
+        for g in self.global_cache.iter_mut() { g.get_mut().unwrap_or_else(|e| e.into_inner()).remove_misses(); }
+        self.proof_trees.retain(|_, entry| entry.misses.is_empty());
     }
 }
 pub struct SolverDelegate<'a> { pub limit: crate::tcx::RecursionLimit, pub tcx: &'a Tcx, pub prog: &'a Program, pub cause: super::fulfill::ObligationCause }
@@ -104,10 +112,8 @@ impl SolverDelegate<'_> {
     }
     fn compute(&mut self, graph: &mut SearchGraph, input: u32, inspect: &mut super::inspect::ProofTreeBuilder) -> u32 {
         let input = self.query_input(input);
-        // No declaration input is read here (lead decision 52 R1): every query provider
-        // reads its key's declaration inputs before it can reach the solver, and
-        // QueryCx::collected drops this global cache on every declaration change, so an
-        // entry only ever serves the declarations it was computed on.
+        // Append-only publication preserves this cache only when no existing impl set
+        // changes. Entries with deferred misses (including nested hits) are evicted.
         let result = EvalCtxt::enter_canonical(self, graph, &input, inspect);
         self.result_id(result)
     }
@@ -116,15 +122,15 @@ impl SolverDelegate<'_> {
 impl SolverDelegate<'_> {
     pub(super) fn evaluate_root_goal_for_proof_tree_raw_provider(&mut self, input: u32, root_depth: usize) -> ProofTreeCacheEntry {
         let cached = self.tcx.queries.solver.proof_trees.get(&(input, root_depth));
-        if let Some(cached) = cached { self.tcx.queries.engine.read_index(cached.dep_node); return cached; }
+        if let Some(cached) = cached { crate::program::note_misses(&cached.misses); self.tcx.queries.engine.read_index(cached.dep_node); return cached; }
         let engine = &self.tcx.queries.engine;
-        let ((result, final_revision, required_depth), dep_node) = engine.with_anon_task(&mut || {
+        let (((result, final_revision, required_depth), misses), dep_node) = engine.with_anon_task(&mut || crate::type_queries::with_misses(|| {
             let mut inspect = super::inspect::ProofTreeBuilder::new();
             let (id, required_depth) = SearchGraph::evaluate_root_goal_for_proof_tree(self, root_depth, input, &mut inspect);
             let (result, accessed_opaques) = self.result(id); assert!(!accessed_opaques.might_rerun());
             (result, inspect.unwrap(), required_depth)
-        });
-        let entry = ProofTreeCacheEntry { result, final_revision, required_depth, dep_node };
+        }));
+        let entry = ProofTreeCacheEntry { result, final_revision, required_depth, dep_node, misses };
         self.tcx.queries.solver.proof_trees.insert((input, root_depth), entry.clone()); entry
     }
 }

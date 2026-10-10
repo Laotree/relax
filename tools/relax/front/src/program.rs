@@ -1063,6 +1063,17 @@ impl Program {
 
     /// Loads a crate from its root file: parses every active module file.
     pub fn load_crate(&mut self, name: &str, root: &str, edition: u16, cfg: CfgSet, deps: Vec<(Sym, u32)>) -> Result<u32, String> {
+        // Standalone callers may consume declarations without resolving imports later.
+        let first = self.defs.len();
+        let krate = self.load_crate_deferred(name, root, edition, cfg, deps)?;
+        let mut own = vec![false; self.crates.len()];
+        own[krate as usize] = true;
+        crate::assoc::collect_loaded(self, first, &own);
+        Ok(krate)
+    }
+
+    /// A batch loader finishes associated declarations once, after resolving imports.
+    pub fn load_crate_deferred(&mut self, name: &str, root: &str, edition: u16, cfg: CfgSet, deps: Vec<(Sym, u32)>) -> Result<u32, String> {
         self.mark_collected_start();
         let _mem = crate::memstat::tag(crate::memstat::Tag::ProgramItems);
         let krate = self.crates.len() as u32;
@@ -1204,14 +1215,6 @@ impl Program {
         // The image contract covers this boot load only. Later generated files and live
         // module loads must not inherit the last boot crate's no-parse assertion.
         self.cur_image = false;
-        // RPITIT synthesis and trait-item links of the crate just loaded (assoc::collect_in
-        // scoped to it, lead decision 52 R1): no crate loaded before it can see it, so their
-        // traits and impls keep what their own loads gave them -- a pass over every crate here
-        // redid all of them at each of a program's ~90 loads. resolve_imports links the whole
-        // program again once the imports are resolved.
-        let mut only = vec![false; self.crates.len()];
-        only[krate as usize] = true;
-        crate::assoc::collect_in(self, Some(&only));
         Ok(krate)
     }
 
@@ -2082,8 +2085,8 @@ impl Program {
         self.expand_pending(krate, self.crates[krate as usize].edition);
         let kname = self.syms.str(self.crates[krate as usize].name).to_string();
         std::sync::Arc::make_mut(&mut self.macros).seal_crate(&kname);
-        self.resolve_imports();
-        crate::assoc::collect(self);
+        let visible = self.crates_seeing_files([file].into_iter());
+        self.resolve_imports_in(Some(&visible));
         Ok((first as u32..self.defs.len() as u32).map(DefId).collect())
     }
 
@@ -2754,14 +2757,18 @@ impl Program {
 
     /// Resolves all imports to a fixpoint. Unresolved imports are reported.
     pub fn resolve_imports(&mut self) {
+        self.resolve_imports_in(None);
+    }
+
+    fn resolve_imports_in(&mut self, visible: Option<&[bool]>) {
         self.imports_done = false;
         self.glob_cache.clear();
         self.trait_bind_cache.clear();
         self.scope_cache.clear();
         self.resolve_imports_fixpoint(0);
         self.imports_done = true;
-        crate::assoc::collect(self);
-        crate::def_collector::lower_legacy_const_generics(self);
+        crate::assoc::collect_in(self, visible);
+        crate::def_collector::lower_legacy_const_generics_in(self, visible);
     }
 
     /// A synthetic wrapper file of `krate` added to `module` (its items
@@ -2788,11 +2795,27 @@ impl Program {
     /// are resolved and reported. The program's own imports and the scope caches stay as they
     /// are -- no existing module can see the new crate.
     pub fn resolve_imports_from(&mut self, i0: usize) {
+        let visible = self.crates_seeing_files(self.imports.iter().skip(i0).map(|i| i.file));
+        self.resolve_imports_from_in(i0, &visible);
+        crate::def_collector::lower_legacy_const_generics_in(self, Some(&visible));
+    }
+
+    /// Reload already lowers legacy owners after the import transaction.
+    pub fn resolve_imports_from_in(&mut self, i0: usize, visible: &[bool]) {
         self.imports_done = false;
         self.resolve_imports_fixpoint(i0);
         self.imports_done = true;
-        crate::assoc::collect(self);
-        crate::def_collector::lower_legacy_const_generics(self);
+        crate::assoc::collect_in(self, Some(visible));
+    }
+
+    /// Append-only own-crate or restored-suffix load. Existing resolved links stay valid.
+    pub fn resolve_imports_added(&mut self, i0: usize, first_def: usize) {
+        self.imports_done = false;
+        self.resolve_imports_fixpoint(i0);
+        self.imports_done = true;
+        let visible = self.crates_seeing_files(self.defs[first_def..].iter().map(|d| d.file));
+        crate::assoc::collect_loaded(self, first_def, &visible);
+        crate::def_collector::lower_legacy_const_generics_added(self, first_def, &visible);
     }
 
     fn resolve_imports_fixpoint(&mut self, i0: usize) {

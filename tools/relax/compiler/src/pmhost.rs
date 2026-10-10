@@ -335,18 +335,18 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     // core/alloc/std: the program's own parses (program::SharedParse), not a second copy
     prog.std_from_shared = true;
     let host = |f: &[String]| crate::cfg::CfgSet::host(sess, f);
-    let core = prog.load_crate("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
+    let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
     let mut std_deps = vec![(prog.syms.intern("core"), core)];
     let alloc_root = format!("{}/alloc/lib.rs", std_dir);
     if crate::vfs::exists(&alloc_root) {
-        let a = prog.load_crate("alloc", &alloc_root, 2021, host(&[]), std_deps.clone())?;
+        let a = prog.load_crate_deferred("alloc", &alloc_root, 2021, host(&[]), std_deps.clone())?;
         std_deps.push((prog.syms.intern("alloc"), a));
     }
-    let st = prog.load_crate("std", &format!("{}/std/lib.rs", std_dir), 2021, host(&[]), std_deps.clone())?;
+    let st = prog.load_crate_deferred("std", &format!("{}/std/lib.rs", std_dir), 2021, host(&[]), std_deps.clone())?;
     std_deps.push((prog.syms.intern("std"), st));
     let t_std = t0.elapsed().as_secs_f64() * 1e3;
     let m_std = crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20;
-    let pm = prog.load_crate("proc_macro", &format!("{}/proc_macro/lib.rs", std_dir), 2021, host(&[]), std_deps.clone())?;
+    let pm = prog.load_crate_deferred("proc_macro", &format!("{}/proc_macro/lib.rs", std_dir), 2021, host(&[]), std_deps.clone())?;
     let mut deps0 = std_deps.clone();
     deps0.push((prog.syms.intern("proc_macro"), pm));
     // dependencies first
@@ -368,7 +368,7 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
             }
             let mut cs = host(&u.features);
             cs.set.push("relax".to_string());
-            let k = prog.load_crate(&u.name, &u.src_path, u.edition, cs, deps).map_err(|e| format!("macro crate {}: {}", u.name, e))?;
+            let k = prog.load_crate_deferred(&u.name, &u.src_path, u.edition, cs, deps).map_err(|e| format!("macro crate {}: {}", u.name, e))?;
             crate_of[i] = k;
             done[i] = true;
             progress = true;

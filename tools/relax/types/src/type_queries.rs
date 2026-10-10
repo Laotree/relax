@@ -99,20 +99,24 @@ pub struct QueryCx {
     /// rustc_middle/src/query/mod.rs own_existential_vtable_entries (per trait)
     own_vtable_entries: QueryTable<DefId, Vec<DefId>>,
     /// rustc_middle/src/query/mod.rs first_method_vtable_slot (per trait ref)
-    first_vtable_slot: QueryTable<crate::next_solver::TraitRef, usize>,
+    first_vtable_slot: QueryTable<crate::next_solver::TraitRef, (usize, Misses)>,
 }
 
 type Misses = std::sync::Arc<Vec<(u32, String)>>;
 
 /// `f` with this thread's miss notes started clean; returns its value and its misses, and
 /// leaves the enclosing notes plus these.
-fn with_misses<R>(f: impl FnOnce() -> R) -> (R, Misses) {
+pub(crate) fn with_misses<R>(f: impl FnOnce() -> R) -> (R, Misses) {
     let enclosing = crate::program::missing_save();
     let r = f();
     let misses = crate::program::take_missing();
     crate::program::missing_restore(enclosing);
     crate::program::note_misses(&misses);
-    (r, std::sync::Arc::new(misses))
+    // Most solver goals have no misses; share that immutable empty payload.
+    static EMPTY: std::sync::OnceLock<Misses> = std::sync::OnceLock::new();
+    let misses = if misses.is_empty() { EMPTY.get_or_init(|| std::sync::Arc::new(Vec::new())).clone() }
+        else { std::sync::Arc::new(misses) };
+    (r, misses)
 }
 
 fn hash_fp<T: Hash>(value: &T) -> Fingerprint {
@@ -156,10 +160,12 @@ impl QueryCx {
     }
 
     /// Publish only under the same exclusive Tcx borrow that edits the tables.
-    /// `visible`: the crates that can see the change (None: all of them). The solver's
-    /// global cache is dropped whole: its anonymous entries record no declaration input
-    /// (search_graph.rs compute), they are valid only for the declarations they ran on.
+    /// `visible`: the crates that can see the change (None: all of them).
     pub(crate) fn collected(&mut self, epoch: u64, visible: Option<&[bool]>) {
+        self.collected_with_solver(epoch, visible, false);
+    }
+
+    pub(crate) fn collected_with_solver(&mut self, epoch: u64, visible: Option<&[bool]>, keep_solver: bool) {
         let fp = Fingerprint::from_bytes(&epoch.to_le_bytes());
         self.engine.set_input(DECLARATIONS.kind, DECLARATIONS.key, fp).unwrap();
         if let Some(visible) = visible { self.register_crates(visible.len()); }
@@ -168,7 +174,15 @@ impl QueryCx {
                 self.engine.set_input(DECLARATIONS.kind, krate, fp).unwrap();
             }
         }
-        let retired = std::mem::take(&mut self.solver);
+        let solver = &mut self.solver;
+        if keep_solver {
+            let before = solver.cached_len();
+            solver.remove_misses();
+            if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept={}", before - solver.cached_len(), solver.cached_len()); }
+            return;
+        }
+        let retired = std::mem::take(solver);
+        if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept=0", retired.cached_len()); }
         // Freeing a session's worth of solver entries took ~0.4 s of every declaration edit
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)
@@ -201,9 +215,13 @@ impl QueryCx {
     /// crate's input covers its dependencies. Any other key (a generic environment, opaque
     /// types being defined, a closure, an unevaluated constant, ...) reads every crate.
     fn read_type_declarations(&self, tcx: &Tcx, prog: &Program, key: &TypeKey) -> Result<(), QueryError> {
+        self.read_key_declarations(tcx, prog, key.env, &[key.ty], &[])
+    }
+
+    fn read_key_declarations(&self, tcx: &Tcx, prog: &Program, env: TypingEnv, types: &[TyId], defs: &[DefId]) -> Result<(), QueryError> {
         use crate::consts::ConstKind;
         let all = |q: &Self| q.read_declarations().map(|_| ());
-        if key.env.param_env != crate::tcx::ParamEnvId::EMPTY || !matches!(key.env.mode, crate::tcx::TypingMode::PostAnalysis | crate::tcx::TypingMode::Codegen) {
+        if env.param_env != crate::tcx::ParamEnvId::EMPTY || !matches!(env.mode, crate::tcx::TypingMode::PostAnalysis | crate::tcx::TypingMode::Codegen) {
             return all(self);
         }
         let mut crates: Vec<u32> = Vec::new();
@@ -213,7 +231,8 @@ impl QueryCx {
             if !crates.contains(&k) { crates.push(k); }
             true
         };
-        let mut todo = vec![key.ty];
+        for &d in defs { if !add(d, &mut crates) { return all(self); } }
+        let mut todo = types.to_vec();
         while let Some(t) = todo.pop() {
             if todo.len() > 256 { return all(self); }
             let known = match tcx.tys.kind(t) {
@@ -240,6 +259,18 @@ impl QueryCx {
         if crates.is_empty() { return all(self); }
         for k in crates { self.read_crate_declarations(k)?; }
         Ok(())
+    }
+
+    fn read_trait_ref_declarations(&self, tcx: &Tcx, prog: &Program, env: TypingEnv, tr: &crate::next_solver::TraitRef) -> Result<(), QueryError> {
+        let mut types = Vec::new();
+        for arg in &tr.args {
+            match arg {
+                GenericArg::Type(ty) => types.push(*ty),
+                GenericArg::Const(c) => types.push(tcx.tys.intern(TyKind::Const(*c))),
+                GenericArg::Lifetime(_) => {},
+            }
+        }
+        self.read_key_declarations(tcx, prog, env, &types, &[tr.def_id])
     }
 
     pub(crate) fn read_def_declarations(&self, prog: &Program, def: DefId) -> Result<Fingerprint, QueryError> {
@@ -384,15 +415,16 @@ impl Providers<'_> {
         }, &|id| self.force(id))
     }
 
-    /// Selection reads the impl tables and every declaration (the solver's inputs): it reads
-    /// every crate's declarations, as the solver's global cache is dropped with any of them.
+    /// Selection observes the crates named by its trait and arguments (including dependencies).
     fn codegen_select_candidate(&self, key: (TypingEnv, crate::next_solver::TraitRef)) -> Result<Result<crate::next_solver::select::ImplSource, crate::next_solver::codegen::CodegenObligationError>, QueryError> {
         let q = &self.tcx.queries;
         let mut computed = false;
         let (r, misses) = q.codegen_select.get(&q.engine, key, &mut |(typing_env, trait_ref)| {
-            q.read_declarations()?;
+            q.read_trait_ref_declarations(self.tcx, self.prog, typing_env, &trait_ref)?;
             computed = true;
-            Ok(with_misses(|| self.tcx.codegen_select_candidate_uncached(self.prog, typing_env, trait_ref)))
+            let value = with_misses(|| self.tcx.codegen_select_candidate_uncached(self.prog, typing_env, trait_ref));
+            if !value.1.is_empty() { q.read_declarations()?; }
+            Ok(value)
         }, &|id| self.force(id))?;
         if !computed && !misses.is_empty() { crate::program::note_misses(&misses); }
         Ok(r)
@@ -402,9 +434,11 @@ impl Providers<'_> {
         let q = &self.tcx.queries;
         let mut computed = false;
         let (r, misses) = q.resolve_instance.get(&q.engine, key, &mut |(typing_env, def, args)| {
-            q.read_declarations()?;
+            q.read_key_declarations(self.tcx, self.prog, typing_env, &args, &[def])?;
             computed = true;
-            Ok(with_misses(|| self.tcx.resolve_instance_raw_uncached(self.prog, typing_env, def, &args)))
+            let value = with_misses(|| self.tcx.resolve_instance_raw_uncached(self.prog, typing_env, def, &args));
+            if !value.1.is_empty() { q.read_declarations()?; }
+            Ok(value)
         }, &|id| self.force(id))?;
         if !computed && !misses.is_empty() { crate::program::note_misses(&misses); }
         Ok(r)
@@ -426,10 +460,16 @@ impl Providers<'_> {
     }
     fn first_method_vtable_slot(&self, key: crate::next_solver::TraitRef) -> Result<usize, QueryError> {
         let q = &self.tcx.queries;
-        q.first_vtable_slot.get(&q.engine, key, &mut |key| {
-            q.read_declarations()?;
-            Ok(self.tcx.first_method_vtable_slot_uncached(self.prog, &key))
-        }, &|id| self.force(id))
+        let mut computed = false;
+        let (value, misses) = q.first_vtable_slot.get(&q.engine, key, &mut |key| {
+            q.read_trait_ref_declarations(self.tcx, self.prog, TypingEnv::fully_monomorphized(self.prog), &key)?;
+            computed = true;
+            let value = with_misses(|| self.tcx.first_method_vtable_slot_uncached(self.prog, &key));
+            if !value.1.is_empty() { q.read_declarations()?; }
+            Ok(value)
+        }, &|id| self.force(id))?;
+        if !computed && !misses.is_empty() { crate::program::note_misses(&misses); }
+        Ok(value)
     }
 
     fn param_env(&self, def: DefId) -> Result<crate::tcx::ParamEnvId, QueryError> {

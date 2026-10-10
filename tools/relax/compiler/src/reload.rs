@@ -2583,7 +2583,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         // imports the added items brought (`use`, an inline `mod`'s): resolved now, only theirs
         if u.prog.imports.len() > imports0 {
-            u.prog.resolve_imports_from(imports0);
+            u.prog.resolve_imports_from_in(imports0, &visible_crates);
             let new_errs: Vec<String> = u.prog.errors[errors0..].to_vec();
             u.prog.errors.truncate(errors0);
             add_errs.extend(new_errs);

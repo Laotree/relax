@@ -200,7 +200,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // parsed on this thread (no parse workers for one small crate)
         crate::preload::SINGLE.with(|s| s.set(true));
-        let r = u.prog.load_crate(name, path, 2021, cfg, dep_list);
+        let r = u.prog.load_crate_deferred(name, path, 2021, cfg, dep_list);
         crate::preload::SINGLE.with(|s| s.set(false));
         marks.push(("parse", std::time::Instant::now()));
         let k = match r {
@@ -212,7 +212,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
                 return Err(vec![e]);
             }
         };
-        u.prog.resolve_imports_from(i0);
+        u.prog.resolve_imports_added(i0, d0);
         marks.push(("resolve", std::time::Instant::now()));
         // the caches resolve_imports cleared (front-end write lock held: no reader)
         unsafe {

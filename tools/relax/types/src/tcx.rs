@@ -649,6 +649,10 @@ impl Tcx {
     // Collection already reset declaration cells before lowering. In particular, a
     // deferred load preserves successful cells even though solver inputs change.
     fn publish_declaration_inputs(&mut self, visible: Option<&[bool]>) {
+        self.publish_declaration_inputs_with_solver(visible, false);
+    }
+
+    fn publish_declaration_inputs_with_solver(&mut self, visible: Option<&[bool]>, keep_solver: bool) {
         self.variances.take();
         for cell in self.sigs.decoded_values_mut() {
             if let Some(p) = cell.get_mut() {
@@ -656,7 +660,8 @@ impl Tcx {
             }
         }
         let epoch = self.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        self.queries.collected(epoch, visible);
+        if keep_solver { self.queries.collected_with_solver(epoch, visible, true); }
+        else { self.queries.collected(epoch, visible); }
     }
 
     /// Round-47 file input publication. Both version ids are invalidated so old
@@ -831,10 +836,20 @@ impl Tcx {
         self.queries.register_crates(prog.crates.len());
         let cx_state = crate::tcx::EvalState::new();
         let cx = &EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &cx_state);
-        // (new impls and associated types: projection answers may change; publication
-        // resets the solver's global cache)
+        let lang_items = self.lang_items.items.clone();
         let r = self.collect_added_inner(cx, prog, defs, own_crate, false, visible);
-        self.publish_declaration_inputs(visible);
+        if self.lang_items.items != lang_items {
+            // Language items are process-wide inputs, even when supplied by a new crate.
+            self.publish_declaration_inputs(None);
+        } else if own_crate {
+            let mut own = vec![false; prog.crates.len()];
+            for &d in defs { own[prog.def(d).krate as usize] = true; }
+            // Concrete selection queries keep their upstream crate inputs. Anonymous
+            // inference goals can still observe a new impl of an existing trait.
+            self.publish_declaration_inputs_with_solver(Some(&own), self.additions_preserve_solver(prog, defs));
+        } else {
+            self.publish_declaration_inputs(visible);
+        }
         r
     }
 
@@ -849,9 +864,34 @@ impl Tcx {
         self.queries.register_crates(prog.crates.len());
         let cx_state = crate::tcx::EvalState::new();
         let cx = &EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &cx_state);
+        let lang_items = self.lang_items.items.clone();
         let r = self.collect_added_inner(cx, prog, defs, false, true, Some(visible));
-        self.publish_declaration_inputs(Some(visible));
+        let keep_solver = self.additions_preserve_solver(prog, defs);
+        if self.lang_items.items != lang_items {
+            self.publish_declaration_inputs(None);
+        } else {
+            self.publish_declaration_inputs_with_solver(Some(visible), keep_solver);
+        }
         r
+    }
+
+    fn additions_preserve_solver(&self, prog: &Program, defs: &[DefId]) -> bool {
+        // rustc's solver reads trait_impls_of: a new impl of an existing trait can
+        // change even a successful answer. New traits and inherent impls of new types
+        // cannot be named by old goals except through a deferred miss.
+        let added: crate::fxhash::HashSet<DefId> = defs.iter().copied().collect();
+        if defs.iter().any(|&d| {
+            let def = prog.def(d);
+            matches!(def.kind, DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst | DefKind::Field | DefKind::Variant)
+                && !added.contains(&def.parent)
+        }) { return false; }
+        defs.iter().filter(|&&d| prog.def(d).kind == DefKind::Impl).all(|d| {
+            if let Some(td) = self.impl_trait.get(d) { return added.contains(td); }
+            // An unresolved trait path must not be mistaken for an inherent impl.
+            let def = prog.def(*d);
+            if !matches!(prog.files[def.file as usize].ast.item(def.item).kind, crate::ast::ItemKind::Impl { trait_: None, .. }) { return false; }
+            self.impl_self.get(d).is_some_and(|ty| matches!(self.tys.kind(*ty), TyKind::Adt(td, ..) if added.contains(td)))
+        })
     }
 
     fn collect_added_inner(&mut self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, defs: &[DefId], own_crate: bool, loaded: bool, visible: Option<&[bool]>) -> Vec<String> {

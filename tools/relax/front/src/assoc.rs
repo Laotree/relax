@@ -20,6 +20,7 @@ pub fn collect(prog: &mut Program) {
 /// that crate's dependencies, none of which changed, so its synthesized RPITIT items and
 /// trait-item links are exactly what a full pass recomputes; they are kept.
 pub fn collect_in(prog: &mut Program, visible: Option<&[bool]>) {
+    if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: assoc whole={} scoped={}", usize::from(visible.is_none()), usize::from(visible.is_some())); }
     let sees = |prog: &Program, d: DefId| visible.map_or(true, |v| v.get(prog.def(d).krate as usize).copied().unwrap_or(true));
     let previous = match visible {
         None => {
@@ -62,6 +63,7 @@ pub fn collect_in(prog: &mut Program, visible: Option<&[bool]>) {
 /// (into the module just loaded), or an item without a trait item (its E0407/E0437/E0438 is
 /// recorded again; prog.errors holds it once).
 pub fn collect_loaded(prog: &mut Program, first_def: usize, visible: &[bool]) {
+    if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: assoc added=1"); }
     let mut traits: Vec<usize> = Vec::new();
     let mut impls: Vec<usize> = Vec::new();
     for di in first_def..prog.defs.len() {
