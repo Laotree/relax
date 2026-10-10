@@ -1,6 +1,20 @@
 use makepad_micro_proc_macro::proc_macro::TokenStream;
 
-use makepad_micro_proc_macro::{error_result, Attribute, StructField, TokenBuilder, TokenParser};
+use makepad_micro_proc_macro::{error_result, Attribute, LiveId, StructField, TokenBuilder, TokenParser};
+
+/// The one resolve call of a derived apply: `__slots[i]` gets the value of the i-th of `names`
+/// (declaration order) along `value`'s prototype chain (ScriptVm::script_derive_resolve); the id
+/// table is sorted here, at expansion time, for the VM's binary search.
+fn emit_resolve(tb: &mut TokenBuilder, names: &[&str]) {
+    let mut sorted: Vec<(u64, usize, &str)> = names.iter().enumerate().map(|(i, n)| (LiveId::from_str(n).0, i, *n)).collect();
+    sorted.sort();
+    tb.add("let mut __slots = [ScriptValue::NIL;").unsuf_usize(names.len()).add("];");
+    tb.add("vm.script_derive_resolve(apply, value, &[");
+    for (_, i, n) in &sorted {
+        tb.add("(").live_id(n).add(",").suf_u32(*i as u32).add("),");
+    }
+    tb.add("], &mut __slots);");
+}
 
 /// A field's name in script: a raw identifier (`r#in`, a keyword as a
 /// field name) is the keyword itself.
@@ -110,7 +124,20 @@ fn derive_script_impl_inner(
             }
         });
 
-        // Declare variables for apply_default fields to store their dirty values
+        // The `#[live]` / `#[apply_default]` fields, resolved in one VM call; each field's code
+        // below applies its slot.
+        let resolved: Vec<&str> = fields
+            .iter()
+            .filter(|field| {
+                !field.attrs.iter().any(|a| a.name == "source")
+                    && field.attrs.iter().any(|a| a.name == "live" || a.name == "apply_default")
+            })
+            .map(|field| script_name(&field.name))
+            .collect();
+        if !resolved.is_empty() {
+            emit_resolve(tb, &resolved);
+        }
+        let mut slot = 0usize;
 
         for field in &fields {
             // Handle #[source] field specially - only update during New/Reload, NOT during Eval
@@ -143,14 +170,14 @@ fn derive_script_impl_inner(
                     tb.add("if !apply.preserves_runtime_state() {");
                 }
                 // One call into a helper generic over the field type: it
-                // looks the field up in `value` (prototype chain included),
-                // falls back to the type's registered default on a reload,
-                // and applies what it found to the field.
-                tb.add("vm.script_derive_apply_field(apply, scope, value, ")
-                    .live_id(script_name(&field.name))
-                    .add(", &mut self.")
+                // applies the field's resolved slot, or on a reload the
+                // type's registered default when the field is set nowhere.
+                tb.add("vm.script_derive_apply_slot(apply, scope, __slots[")
+                    .unsuf_usize(slot)
+                    .add("], &mut self.")
                     .ident(&field.name)
                     .add(");");
+                slot += 1;
                 if preserve_state || imperative {
                     tb.add("}");
                 }
@@ -225,7 +252,30 @@ fn derive_script_impl_inner(
 
         tb.add("    fn script_to_value_props(&self, vm: &mut ScriptVm, obj:ScriptObject) {");
 
+        // Consecutive `#[live]` / `#[apply_default]` fields are set in one VM call
+        // (script_derive_set_props); a deref / walk / layout / splat cascade between them
+        // flushes the batch first, so the object's keys keep their insertion order.
+        let mut batch: Vec<&StructField> = Vec::new();
+        fn flush(tb: &mut TokenBuilder, batch: &mut Vec<&StructField>) {
+            if batch.is_empty() {
+                return;
+            }
+            tb.add("{let __values = [");
+            for field in batch.iter() {
+                tb.add("<").stream(Some(field.ty.clone())).add(" as ScriptApply>::script_to_value(&self.").ident(&field.name).add(", vm),");
+            }
+            tb.add("]; vm.script_derive_set_props(obj, &[");
+            for field in batch.iter() {
+                tb.live_id(script_name(&field.name)).add(",");
+            }
+            tb.add("], &__values);}");
+            batch.clear();
+        }
         for field in &fields {
+            let cascade = field.attrs.iter().any(|a| a.name == "deref" || a.name == "walk" || a.name == "layout" || a.name == "script_splat");
+            if cascade {
+                flush(tb, &mut batch);
+            }
             if field.attrs.iter().find(|a| a.name == "deref").is_some() {
                 tb.add("self.")
                     .ident(&field.name)
@@ -242,18 +292,11 @@ fn derive_script_impl_inner(
                     .ident(&field.name)
                     .add(".script_to_value_props(vm, obj);");
             }
-            if let Some(_) = field
-                .attrs
-                .iter()
-                .find(|a| a.name == "live" || a.name == "apply_default")
-            {
-                tb.add("vm.script_derive_field_to_value(obj,")
-                    .string(script_name(&field.name))
-                    .add(", &self.")
-                    .ident(&field.name)
-                    .add(");");
+            if field.attrs.iter().any(|a| a.name == "live" || a.name == "apply_default") {
+                batch.push(field);
             }
         }
+        flush(tb, &mut batch);
 
         tb.add("    }");
 
@@ -763,8 +806,13 @@ fn derive_script_impl_inner(
                             .add(",");
                     }
                     tb.add("} = self{");
+                    let names: Vec<&str> = fields.iter().map(|f| f.name.as_str()).collect();
+                    if !names.is_empty() {
+                        emit_resolve(tb, &names);
+                    }
                     for (i, field) in fields.iter().enumerate() {
-                        tb.add("if let Some(v) = vm.heap_mut().value_for_apply(value, ScriptValue::from_id(").live_id(&field.name).add("), apply){");
+                        tb.add("let v = __slots[").unsuf_usize(i).add("];");
+                        tb.add("if v != ScriptValue::NOT_FOUND {");
                         tb.add("    <")
                             .stream(Some(field.ty.clone()))
                             .add(" as ScriptApply>::script_apply(")
