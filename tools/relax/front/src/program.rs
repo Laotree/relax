@@ -1,3 +1,5 @@
+// ported from N:rustc_expand/src/config.rs @8d1a764 (crate feature selection)
+// Relax's program table; the item-lowering parts follow N:rustc_ast_lowering/src/item.rs @8d1a764 (cited per function)
 //! The whole program: crates, parsed files, interned names, definitions and
 //! module scopes. Item collection, `use` resolution (fixpoint) and path lookup.
 
@@ -213,7 +215,7 @@ pub const PRIMS: [(&str, Prim); 17] = [
     ("f64", Prim::F64),
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum DefKind {
     Mod,
     Fn,
@@ -231,6 +233,11 @@ pub enum DefKind {
     AssocTy,
     ForeignFn,
     ForeignStatic,
+    ForeignTy,
+    AnonConst,
+    OpaqueTy,
+    Closure,
+    Field,
     MacroRules,
     Prim(Prim),
 }
@@ -389,6 +396,24 @@ pub struct CrateInfo {
 }
 
 impl CrateInfo {
+    /// rustc_expand/src/config.rs:47 and rustc_hir_typeck/src/expr.rs:660:
+    /// this feature changes sizedness checking inside core/alloc as well as
+    /// user crates; it cannot be discarded with the feature-gate diagnostics.
+    pub fn unsized_fn_params(&self, prog: &Program) -> bool {
+        let root_file = prog.mods[self.root_mod as usize].file;
+        let file = &prog.files[root_file as usize];
+        let attrs = crate::cfg::expand_cfg_attr_list(prog.src(root_file), &file.ast.root_attrs, &self.cfg);
+        for attr in &attrs {
+            let lo = attr.toks.lo;
+            let hi = attr.toks.hi;
+            if !attr.inner || hi < lo + 4 || file.tok_text(lo) != "feature" || file.tok_text(lo + 1) != "(" || file.tok_text(hi - 1) != ")" { continue; }
+            for tok in (lo + 2..hi - 1).step_by(2) {
+                if file.tok_text(tok) == "unsized_fn_params" { return true; }
+            }
+        }
+        false
+    }
+
     /// the crate's root source file
     pub fn root_path(&self) -> &str {
         &self.root_path
@@ -594,6 +619,24 @@ pub struct Program {
     // Current ownership; old versions keep only entities not paired into the new file.
     /// Entities by file, for reloads. A restored program builds it on first use.
     reload: std::sync::OnceLock<ReloadFiles>,
+    pub node_id_to_def_id: crate::collected::ImageMap<(u32, crate::def_collector::NodeId), DefId>,
+    pub legacy_const_args: crate::collected::ImageMap<DefId, std::sync::Arc<crate::def_collector::LegacyOwner>>,
+    pub(crate) legacy_const_attrs: std::sync::Arc<HashMap<DefId, Vec<u32>>>,
+    declaration_versions: HashMap<u32, DeclarationState>,
+    pub def_id_to_node_id: crate::collected::ImageMap<DefId, (u32, crate::def_collector::NodeId)>,
+    pub impl_trait_in_trait_data: crate::collected::ImageMap<DefId, crate::assoc::ImplTraitInTraitData>,
+    pub associated_types_for_impl_traits: crate::collected::ImageMap<DefId, Vec<DefId>>,
+    pub opaque_to_rpitit: crate::collected::ImageMap<DefId, DefId>,
+    pub opaque_types_defined_by: crate::collected::ImageMap<DefId, Vec<DefId>>,
+    pub trait_item_def_id: crate::collected::ImageMap<DefId, DefId>,
+    pub repeat_expr_counts: crate::collected::ImageSet<DefId>,
+    pub(crate) collected_definitions: crate::collected::ImageSet<DefId>,
+    /// Per collected owner: the call-path names its legacy const generic lowering would look
+    /// up (def_collector::collect_definitions records them; an owner restored without them is
+    /// walked). Not part of the collected image.
+    pub(crate) legacy_call_names: HashMap<DefId, Vec<Sym>>,
+    pub(crate) def_disambiguators: crate::collected::ImageMap<(DefId, DefKind, Option<Sym>), u32>,
+    pub(crate) child_definitions: crate::collected::ImageMap<(DefId, DefKind, Option<Sym>, u32), DefId>,
     pub prim_defs: Vec<DefId>,
     /// index of the crate whose `prelude` module supplies the std prelude
     pub prelude_crate: Option<u32>,
@@ -607,6 +650,61 @@ struct ReloadFiles {
     defs: HashMap<u32, Vec<u32>>,
     impls: HashMap<u32, Vec<u32>>,
     mods: HashMap<u32, Vec<u32>>,
+}
+
+/// Declaration results are version state, including signature-owned RPITITs.
+/// The front writer is the sole publisher; readers cannot observe a half commit.
+struct DeclarationState {
+    legacy: HashMap<DefId, std::sync::Arc<crate::def_collector::LegacyOwner>>,
+    // Lead decision 52 (R1): the crates whose owners a scoped declaration pass re-lowers
+    // (lower_legacy_const_generics_in); None: every crate.
+    visible: Option<Vec<bool>>,
+    environment: Option<(std::sync::Arc<HashMap<DefId, Vec<u32>>>, AssocState)>,
+    errors: Vec<String>,
+}
+struct AssocState {
+    rpitit: HashMap<DefId, crate::assoc::ImplTraitInTraitData>,
+    associated: HashMap<DefId, Vec<DefId>>,
+    opaque: HashMap<DefId, DefId>,
+    trait_items: HashMap<DefId, DefId>,
+    traits: Vec<Vec<DefId>>,
+    impl_items: Vec<Vec<DefId>>,
+}
+impl DeclarationState {
+    fn save(prog: &Program, file: u32, body_only: bool, visible: Option<&[bool]>) -> Self {
+        let sees = |d: DefId| visible.map_or(true, |v| v.get(prog.def(d).krate as usize).copied().unwrap_or(true));
+        let mut legacy = HashMap::default();
+        for (&owner, result) in &prog.legacy_const_args {
+            if if body_only { prog.def(owner).file == file } else { sees(owner) } { legacy.insert(owner, result.clone()); }
+        }
+        let environment = if body_only { None } else { Some((prog.legacy_const_attrs.clone(), AssocState {
+            rpitit: prog.impl_trait_in_trait_data.iter().map(|(k, v)| (*k, v.clone())).collect(), associated: prog.associated_types_for_impl_traits.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            opaque: prog.opaque_to_rpitit.iter().map(|(k, v)| (*k, v.clone())).collect(), trait_items: prog.trait_item_def_id.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            traits: prog.traits.iter().cloned().collect(), impl_items: prog.impls.iter().map(|i| i.items.clone()).collect(),
+        })) };
+        Self { legacy, visible: visible.map(|v| v.to_vec()), environment, errors: prog.errors.clone() }
+    }
+    fn restore(self, prog: &mut Program) {
+        for result in self.legacy.values() { crate::def_collector::restore_legacy_children(prog, result); }
+        if let Some((attrs, assoc)) = self.environment {
+            match &self.visible {
+                Some(visible) => {
+                    let defs = &prog.defs;
+                    prog.legacy_const_args.retain(|d, _| !visible.get(defs[d.0 as usize].krate as usize).copied().unwrap_or(true));
+                }
+                None => prog.legacy_const_args.clear(),
+            }
+            prog.legacy_const_attrs = attrs;
+            prog.impl_trait_in_trait_data = assoc.rpitit.into_iter().collect();
+            prog.associated_types_for_impl_traits = assoc.associated.into_iter().collect();
+            prog.opaque_to_rpitit = assoc.opaque.into_iter().collect();
+            prog.trait_item_def_id = assoc.trait_items.into_iter().collect();
+            for (i, items) in assoc.traits.into_iter().enumerate() { prog.traits[i] = items; }
+            for (i, items) in assoc.impl_items.into_iter().enumerate() { prog.impls[i].items = items; }
+        }
+        prog.legacy_const_args.extend(self.legacy);
+        prog.errors = self.errors;
+    }
 }
 
 impl Drop for Program {
@@ -647,6 +745,21 @@ impl Program {
             block_owner: Default::default(),
             item_defs: Default::default(),
             reload: std::sync::OnceLock::from(ReloadFiles::default()),
+            node_id_to_def_id: Default::default(),
+            legacy_const_args: Default::default(),
+            legacy_const_attrs: Default::default(),
+            declaration_versions: Default::default(),
+            def_id_to_node_id: Default::default(),
+            impl_trait_in_trait_data: Default::default(),
+            associated_types_for_impl_traits: Default::default(),
+            opaque_to_rpitit: Default::default(),
+            opaque_types_defined_by: Default::default(),
+            trait_item_def_id: Default::default(),
+            repeat_expr_counts: Default::default(),
+            collected_definitions: Default::default(),
+            legacy_call_names: Default::default(),
+            def_disambiguators: Default::default(),
+            child_definitions: Default::default(),
             prim_defs: Vec::new(),
             prelude_crate: None,
             trait_scope: Default::default(),
@@ -713,6 +826,10 @@ impl Program {
         self.reload_files();
         self.reload.get_mut().unwrap()
     }
+    pub fn defs_in_file(&self, file: u32) -> &[u32] {
+        self.reload_files().defs.get(&file).map_or(&[], Vec::as_slice)
+    }
+
     pub fn set_def_file(&mut self, def: DefId, file: u32) {
         let old = self.defs[def.0 as usize].file;
         if old == file { return; }
@@ -735,6 +852,12 @@ impl Program {
         if let Some(r) = self.reload.get_mut() { r.defs.entry(d.file).or_default().push(self.defs.len() as u32); }
         self.defs.push(d);
         DefId(self.defs.len() as u32 - 1)
+    }
+
+    /// The enclosing type-checking owner, through nested opaque definitions.
+    pub fn opaque_owner(&self, mut d: DefId) -> DefId {
+        while self.def(d).kind == DefKind::OpaqueTy { d = self.def(d).parent; }
+        d
     }
 
     #[inline]
@@ -847,6 +970,16 @@ impl Program {
                 vec![(r[0], r[1])]
             }
         }
+    }
+
+    pub fn legacy_const_call(&self, mut owner: DefId, file: u32, expr: ExprId) -> Option<&crate::def_collector::LegacyConstArgs> {
+        while owner != NO_DEF {
+            if let Some(result) = self.legacy_const_args.get(&owner) {
+                return if result.file == file { result.calls.get(&expr) } else { None };
+            }
+            owner = self.def(owner).parent;
+        }
+        None
     }
 
     pub fn ident(&mut self, file: u32, id: Ident) -> Sym {
@@ -1054,6 +1187,14 @@ impl Program {
         // The image contract covers this boot load only. Later generated files and live
         // module loads must not inherit the last boot crate's no-parse assertion.
         self.cur_image = false;
+        // RPITIT synthesis and trait-item links of the crate just loaded (assoc::collect_in
+        // scoped to it, lead decision 52 R1): no crate loaded before it can see it, so their
+        // traits and impls keep what their own loads gave them -- a pass over every crate here
+        // redid all of them at each of a program's ~90 loads. resolve_imports links the whole
+        // program again once the imports are resolved.
+        let mut only = vec![false; self.crates.len()];
+        only[krate as usize] = true;
+        crate::assoc::collect_in(self, Some(&only));
         Ok(krate)
     }
 
@@ -1626,26 +1767,40 @@ impl Program {
     }
 
     pub fn commit_version(&mut self, v: FileVersion, pairs: &[(u32, u32)]) -> Result<u32, String> {
-        self.commit_version_inner(v, pairs, false)
+        self.commit_version_inner(v, pairs, false, None)
     }
 
-    /// Checking-only body edit, after classification proved scopes/items unchanged.
+    /// commit_version for a transaction whose declaration pass is scoped to the crates that
+    /// can see it (def_collector::lower_legacy_const_generics_in, lead decision 52 R1).
+    pub fn commit_version_in(&mut self, v: FileVersion, pairs: &[(u32, u32)], visible: &[bool]) -> Result<u32, String> {
+        self.commit_version_inner(v, pairs, false, Some(visible))
+    }
+
+    /// Body edit, after classification proved scopes/items unchanged. Finish the
+    /// transaction with lower_body_declarations before publishing to readers.
     pub fn commit_body_version(&mut self, v: FileVersion, pairs: &[(u32, u32)]) -> Result<u32, String> {
-        self.commit_version_inner(v, pairs, true)
+        self.commit_version_inner(v, pairs, true, None)
     }
 
-    fn commit_version_inner(&mut self, v: FileVersion, pairs: &[(u32, u32)], same_scopes: bool) -> Result<u32, String> {
+    fn commit_version_inner(&mut self, v: FileVersion, pairs: &[(u32, u32)], same_scopes: bool, visible: Option<&[bool]>) -> Result<u32, String> {
         let old = v.old;
+        let declarations = DeclarationState::save(self, old, same_scopes, visible);
         // Old ASTs stay alive for running frames, but old reuse entries do not.
         self.parse_reuse.remove(&old);
         self.parse_reuse.insert(self.files.len() as u32, v.reuse);
         if !same_scopes {
-            self.path_seg_cache.clear();
             self.scope_cache.clear();
         }
         for &(lo, hi) in &v.idents {
             let s = std::str::from_utf8(&v.pf.src[lo as usize..hi as usize]).unwrap_or("?").to_string();
             self.syms.intern(&s);
+        }
+        // A path's segments depend only on its file's text (a file version never changes) and
+        // on whether each name is interned yet; path_segs recomputes an entry that met a name
+        // not interned, so the memo stays valid across a scoped item edit. Clearing (and freeing)
+        // it cost ~0.7 s per item edit once boot filled it (lead decision 52 R1).
+        if !same_scopes && visible.is_none() {
+            self.path_seg_cache.clear();
         }
         let table = std::sync::Arc::make_mut(&mut self.macros);
         for d in v.macros {
@@ -1683,7 +1838,74 @@ impl Program {
         self.file_crate.push(krate);
         self.file_blocks.push(v.blocks);
         self.retarget_file(old, new, pairs);
+        self.declaration_versions.insert(new, declarations);
+        if let Err(error) = self.collect_version_definitions(new, !same_scopes, true, visible) {
+            self.revert_version(old, new, pairs);
+            return Err(error);
+        }
         Ok(new)
+    }
+
+    /// `fresh`: `file` is a version index commit_version just made, so no node is keyed by it
+    /// yet. `visible`: the crates RPITIT synthesis covers (assoc::collect_in; None: all).
+    fn collect_version_definitions(&mut self, file: u32, synthesize: bool, fresh: bool, visible: Option<&[bool]>) -> Result<(), String> {
+        if !fresh {
+            self.node_id_to_def_id.retain(|(f, _), _| *f != file);
+            self.def_id_to_node_id.retain(|_, (f, _)| *f != file);
+        }
+        self.collected_definitions.retain(|d| self.defs[d.0 as usize].file != file);
+        self.legacy_call_names.retain(|d, _| self.defs[d.0 as usize].file != file);
+        self.repeat_expr_counts.retain(|d| self.defs[d.0 as usize].file != file);
+        self.def_disambiguators.retain(|(d, _, _), _| self.defs[d.0 as usize].file != file);
+        let mut owners = Vec::new();
+        for (&(f, item), &def) in &self.item_defs { if f == file { owners.push((item, def)); } }
+        owners.sort_unstable_by_key(|(item, _)| *item);
+        for (_, def) in owners {
+            // Variant owners must exist before collecting their fields/discriminants.
+            if self.def(def).kind == DefKind::Enum { self.add_variants(def); }
+            crate::def_collector::collect_definitions(self, def)?;
+        }
+        if synthesize { crate::assoc::collect_in(self, visible); }
+        Ok(())
+    }
+
+    /// The crates that can see an edit of `files`: theirs and their transitive dependents
+    /// (a crate names only its own items and its dependencies').
+    pub fn crates_seeing_files(&self, files: impl Iterator<Item = u32>) -> Vec<bool> {
+        let mut dependents = vec![Vec::new(); self.crates.len()];
+        for (c, krate) in self.crates.iter().enumerate() {
+            for &(_, dep) in &krate.deps {
+                dependents[dep as usize].push(c);
+            }
+        }
+        let mut visible = vec![false; self.crates.len()];
+        let mut todo = Vec::new();
+        for file in files {
+            let c = self.file_crate[file as usize] as usize;
+            if !visible[c] {
+                visible[c] = true;
+                todo.push(c);
+            }
+        }
+        while let Some(c) = todo.pop() {
+            for &dep in &dependents[c] {
+                if !visible[dep] {
+                    visible[dep] = true;
+                    todo.push(dep);
+                }
+            }
+        }
+        visible
+    }
+
+    /// Called once after all body-only versions have been committed under the
+    /// front write lock. Unchanged owners retain their resolution results.
+    pub fn lower_body_declarations(&mut self, changed: &[DefId]) -> usize {
+        let owners: Vec<DefId> = self.legacy_const_args.keys().copied().collect();
+        for owner in owners {
+            if !changed.contains(&owner) { crate::def_collector::retarget_legacy_owner(self, owner); }
+        }
+        crate::def_collector::lower_legacy_const_owners(self, changed)
     }
 
     /// Hot reload: a refused patch (or a rolled-back one) points every def of `new` back at
@@ -1697,6 +1919,8 @@ impl Program {
         self.scope_cache.clear();
         let back: Vec<(u32, u32)> = pairs.iter().map(|&(a, b)| (b, a)).collect();
         self.retarget_file(new, old, &back);
+        self.collect_version_definitions(old, false, false, None).expect("previously collected definition body");
+        if let Some(saved) = self.declaration_versions.remove(&new) { saved.restore(self); }
     }
 
     /// Hot reload: collects items a new file version added. `items`: (item, where it goes):
@@ -1716,6 +1940,13 @@ impl Program {
             _ => return had,
         };
         let (krate, scope) = self.variants.get(li).and_then(|v| v.first()).map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
+        // The definition table describes the published source, including renamed
+        // or reordered variants. Reload compares it with its running AdtT snapshot.
+        for vi in 0..had.min(names.len()) {
+            let name = self.ident(file, names[vi]);
+            let vd = self.variants[li][vi];
+            self.defs[vd.0 as usize].name = name;
+        }
         for vi in had..names.len() {
             let vname = self.ident(file, names[vi]);
             let vd = self.add_def(Def { kind: DefKind::Variant, name: vname, parent: d, file, item, sub: vi as u32, is_pub: true, krate, scope });
@@ -1747,6 +1978,7 @@ impl Program {
                         let ii = self.defs[imp.0 as usize].sub as usize;
                         self.impls[ii].items.push(ad);
                         self.collect_body_items(file, iid, module, Some(ad))?;
+                        crate::def_collector::collect_definitions(self, ad)?;
                     }
                 }
             }
@@ -1755,6 +1987,9 @@ impl Program {
             self.scope_cache.clear();
             self.glob_cache.clear();
         }
+        // only the crates that can see `file` can see what it added (lead decision 52 R1)
+        let visible = self.crates_seeing_files([file].into_iter());
+        crate::assoc::collect_in(self, Some(&visible));
         Ok((first as u32..self.defs.len() as u32).map(DefId).collect())
     }
 
@@ -1787,6 +2022,18 @@ impl Program {
             }
         }
         self.item_defs.retain(|_, d| self.defs[d.0 as usize].krate != krate);
+        self.node_id_to_def_id.retain(|_, d| self.defs[d.0 as usize].krate != krate);
+        self.def_id_to_node_id.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.collected_definitions.retain(|d| self.defs[d.0 as usize].krate != krate);
+        self.legacy_call_names.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.repeat_expr_counts.retain(|d| self.defs[d.0 as usize].krate != krate);
+        self.def_disambiguators.retain(|(d, _, _), _| self.defs[d.0 as usize].krate != krate);
+        self.child_definitions.retain(|_, d| self.defs[d.0 as usize].krate != krate);
+        self.impl_trait_in_trait_data.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.associated_types_for_impl_traits.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.opaque_types_defined_by.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.opaque_to_rpitit.retain(|d, _| self.defs[d.0 as usize].krate != krate);
+        self.trait_item_def_id.retain(|d, t| self.defs[d.0 as usize].krate != krate && self.defs[t.0 as usize].krate != krate);
         self.block_mods.retain(|_, m| self.mods[*m as usize].krate != krate);
         self.block_owner.retain(|_, d| self.defs[d.0 as usize].krate != krate);
         self.pending_macs.retain(|(f, _, _)| self.file_crate[*f as usize] != krate);
@@ -1819,6 +2066,7 @@ impl Program {
         let kname = self.syms.str(self.crates[krate as usize].name).to_string();
         std::sync::Arc::make_mut(&mut self.macros).seal_crate(&kname);
         self.resolve_imports();
+        crate::assoc::collect(self);
         Ok((first as u32..self.defs.len() as u32).map(DefId).collect())
     }
 
@@ -2072,6 +2320,7 @@ impl Program {
             if !attrs_active {
                 continue;
             }
+            self.reject_specialization(file, iid, None, false);
             let it_name = self.files[file as usize].ast.item(iid).name;
             let is_pub = !matches!(self.files[file as usize].ast.item(iid).vis, Vis::Private);
             let name = self.ident(file, it_name);
@@ -2153,6 +2402,7 @@ impl Program {
                             list.push(ad);
                         }
                         self.collect_body_items(file, si, module, ad)?;
+                        if let Some(d) = ad { crate::def_collector::collect_definitions(self, d)?; }
                     }
                     let ti = self.traits.len() as u32;
                     self.traits.push(list);
@@ -2172,6 +2422,7 @@ impl Program {
                             list.push(ad);
                         }
                         self.collect_body_items(file, si, module, ad)?;
+                        if let Some(d) = ad { crate::def_collector::collect_definitions(self, d)?; }
                     }
                     let ii = self.impls.len() as u32;
                     if let Some(r) = self.reload.get_mut() { r.impls.entry(file).or_default().push(ii); }
@@ -2253,17 +2504,21 @@ impl Program {
                         if !self.active(file, self.files[file as usize].ast.list(self.files[file as usize].ast.item(si).attrs)) {
                             continue;
                         }
-                        let n = self.files[file as usize].ast.item(si).name;
+                        self.reject_specialization(file, si, None, true);
+        let n = self.files[file as usize].ast.item(si).name;
                         let sn = self.ident(file, n);
                         let ip = !matches!(self.files[file as usize].ast.item(si).vis, Vis::Private);
                         let k = match &self.files[file as usize].ast.item(si).kind {
                             ItemKind::Fn(..) => DefKind::ForeignFn,
                             ItemKind::Static(..) => DefKind::ForeignStatic,
+                            // rustc_ast_lowering/src/item.rs:672: foreign type declarations.
+                            ItemKind::TypeAlias { .. } => DefKind::ForeignTy,
                             _ => continue,
                         };
                         let d = self.add_def(Def { kind: k, name: sn, parent: mod_def, file, item: si, sub: 0, is_pub: ip, krate, scope: module });
                         self.item_defs.insert((file, si.0), d);
                         self.define(module, k != DefKind::ForeignFn && k != DefKind::ForeignStatic, sn, d);
+                        crate::def_collector::collect_definitions(self, d)?;
                     }
                 }
                 Tag::Use => {
@@ -2331,14 +2586,60 @@ impl Program {
                     }
                 }
             }
+            if let Some(&def) = self.item_defs.get(&(file, iid.0)) {
+                crate::def_collector::collect_definitions(self, def)?;
+            }
         }
         Ok(())
+    }
+
+    /// rustc_ast_passes/src/feature_gate.rs:168,374 @8d1a764. The stable
+    /// configuration rejects specialization before any solver sees an impl.
+    /// `owner`: the trait/impl of an associated item; `foreign`: an extern block item. A free or
+    /// foreign fn/const/type alias (foreign static) and a trait item get ForbiddenDefault
+    /// (ast_validation.rs:766-777,1518,1681,1720,1750,1779,2069-2078); another free item never
+    /// consumes `default` (rustc_parse item.rs:229-247); a `default impl` and an impl item are
+    /// the specialization gate (feature_gate.rs:168-176,374-383).
+    fn reject_specialization(&mut self, file: u32, item: ItemId, owner: Option<DefId>, foreign: bool) {
+        let ast = &self.files[file as usize].ast;
+        let it = ast.item(item);
+        if !it.default_ { return; }
+        const FORBIDDEN: &str = "`default` is only allowed on items in trait impls";
+        let message = match owner {
+            None if matches!(it.kind, ItemKind::Impl { .. }) => "E0658: specialization is experimental".to_string(),
+            None if matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..) | ItemKind::TypeAlias { .. })
+                || (foreign && matches!(it.kind, ItemKind::Static(..))) => FORBIDDEN.to_string(),
+            None => {
+                let descr = match &it.kind {
+                    ItemKind::Use { .. } => "`use` import", ItemKind::ExternCrate(_) => "extern crate",
+                    ItemKind::Fn(..) => "function", ItemKind::Struct(..) => "struct", ItemKind::Union(..) => "union",
+                    ItemKind::Enum(..) => "enum", ItemKind::TypeAlias { .. } => "type alias",
+                    ItemKind::Const(..) => "constant item", ItemKind::Static(..) => "static item",
+                    ItemKind::Trait { .. } => "trait", ItemKind::TraitAlias(..) => "trait alias",
+                    ItemKind::Impl { .. } => "implementation", ItemKind::Mod(_) => "module",
+                    ItemKind::ForeignMod(..) => "extern block", ItemKind::MacroRules(_) => "macro definition",
+                    ItemKind::Mac(_) => "item macro invocation",
+                };
+                let article = if matches!(it.kind, ItemKind::ExternCrate(_) | ItemKind::Enum(..) | ItemKind::Impl { .. } | ItemKind::ForeignMod(..) | ItemKind::Mac(_)) { "an" } else { "a" };
+                format!("{article} {descr} cannot be `default`")
+            }
+            // a trait item: ForbiddenDefault, and the gate as for every associated item
+            Some(owner) if self.def(owner).kind == DefKind::Trait => {
+                let lo = it.lo;
+                self.errors.push(self.record_error(file, lo, "collect", FORBIDDEN.to_string()));
+                "E0658: specialization is experimental".to_string()
+            }
+            Some(_) => "E0658: specialization is experimental".to_string(),
+        };
+        let lo = it.lo;
+        self.errors.push(self.record_error(file, lo, "collect", message));
     }
 
     fn collect_assoc(&mut self, file: u32, si: ItemId, owner: DefId, krate: u32, module: u32) -> Result<Option<DefId>, String> {
         if !self.active(file, self.files[file as usize].ast.list(self.files[file as usize].ast.item(si).attrs)) {
             return Ok(None);
         }
+        self.reject_specialization(file, si, Some(owner), false);
         let n = self.files[file as usize].ast.item(si).name;
         let name = self.ident(file, n);
         let is_pub = !matches!(self.files[file as usize].ast.item(si).vis, Vis::Private);
@@ -2443,6 +2744,8 @@ impl Program {
         self.scope_cache.clear();
         self.resolve_imports_fixpoint(0);
         self.imports_done = true;
+        crate::assoc::collect(self);
+        crate::def_collector::lower_legacy_const_generics(self);
     }
 
     /// A synthetic wrapper file of `krate` added to `module` (its items
@@ -2472,6 +2775,8 @@ impl Program {
         self.imports_done = false;
         self.resolve_imports_fixpoint(i0);
         self.imports_done = true;
+        crate::assoc::collect(self);
+        crate::def_collector::lower_legacy_const_generics(self);
     }
 
     fn resolve_imports_fixpoint(&mut self, i0: usize) {
@@ -2967,6 +3272,20 @@ impl Program {
                 scope, glob, path_seg, trait_bind, trait_scope, indexed);
         }
         Ok((d0, bindings_changed))
+    }
+
+    /// After a batch of load_deferred_module calls: the crates that see the new files get
+    /// what resolve_imports gives a loaded program -- trait-item links and synthesized RPITIT
+    /// items and legacy const generic owners -- for what the batch can change: the definitions
+    /// it added (assoc::collect_loaded, def_collector::lower_legacy_const_generics_added), as a
+    /// declaration edit's reload scopes them (lead decision 52 R1). Without the links an impl
+    /// item of a loaded module never answers its trait's projection (`<T as Deref>::Target` was
+    /// {error}). `first_def`: the first definition the batch added.
+    pub fn link_deferred_modules(&mut self, first_file: u32, first_def: usize) {
+        if first_file as usize >= self.files.len() { return; }
+        let visible = self.crates_seeing_files(first_file..self.files.len() as u32);
+        crate::assoc::collect_loaded(self, first_def, &visible);
+        crate::def_collector::lower_legacy_const_generics_added(self, first_def, &visible);
     }
 
     /// Unresolved imports (from `i0`) become errors.
@@ -3978,7 +4297,8 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
         ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::AddrOf(_, _, x) | ExprKind::Try(x) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Cast(x, _) => {
             blocks_in_expr(ast, *x, out)
         }
-        ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::AssignOp(_, a, b) | ExprKind::Index(a, b) => {
+        // rustc_ast/src/visit.rs walk_expr: repeat counts contain lexical blocks too.
+        ExprKind::Repeat(a, b) | ExprKind::Binary(_, a, b) | ExprKind::Assign(a, b) | ExprKind::AssignOp(_, a, b) | ExprKind::Index(a, b) => {
             blocks_in_expr(ast, *a, out);
             blocks_in_expr(ast, *b, out);
         }
@@ -4523,11 +4843,14 @@ pub fn path_segs(prog: &Program, file: u32, p: &Path) -> std::sync::Arc<[(SegKin
     }
     let lo = prog.files[file as usize].ast.segs(p.segs).first().map_or(0, |s| s.name.lo);
     let key = (file, p.segs.len() as u32, lo, h);
-    if let Some(v) = prog.path_seg_cache.get(&key) {
-        return v;
-    }
+    let stale = match prog.path_seg_cache.get(&key) {
+        // (a name not interned when the entry was made may be now: Program::commit_version_in)
+        Some(v) if v.iter().any(|&(_, sym)| sym == u32::MAX) => Some(v),
+        Some(v) => return v,
+        None => None,
+    };
     let v: std::sync::Arc<[(SegKind, Sym)]> = path_segs_uncached(prog, file, p).into();
-    prog.path_seg_cache.insert(key, v.clone());
+    if stale.as_deref() != Some(&*v) { prog.path_seg_cache.insert(key, v.clone()); }
     v
 }
 
@@ -4568,9 +4891,15 @@ struct TraitQuery {
 thread_local! {
     /// (skipped module, name) pairs a lookup on this thread missed since the last take_missing.
     static MISSING: std::cell::RefCell<Vec<(u32, String)>> = const { std::cell::RefCell::new(Vec::new()) };
-    /// The latest missing_mark: notes are deduplicated from here on only, so a miss noted
-    /// before a mark is noted again inside it and its missing_confirm sees it.
-    static MISSING_MARK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The latest missing_mark: a note is deduplicated only against the notes from there on,
+    /// so the notes since any open mark hold every miss of its lookups, also one this thread
+    /// noted before the mark (an earlier lookup of the same name).
+    static MISSING_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn push_missing(m: &mut Vec<(u32, String)>, w: u32, name: &str) {
+    let from = MISSING_FROM.try_with(|f| f.get()).unwrap_or(0).min(m.len());
+    if !m[from..].iter().any(|(x, n)| *x == w && n == name) { m.push((w, name.to_owned())); }
 }
 
 /// Signature collection runs on several threads: while it runs, misses are also gathered here.
@@ -4589,11 +4918,11 @@ pub fn collect_misses_take() -> Vec<(u32, String)> {
     std::mem::take(&mut *COLLECT_MISSES.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// This thread's miss notes so far (missing_confirm's mark).
+/// This thread's miss notes so far (missing_confirm's / missing_since's mark).
 pub fn missing_mark() -> usize {
-    let mark = MISSING.try_with(|m| m.borrow().len()).unwrap_or(0);
-    let _ = MISSING_MARK.try_with(|x| x.set(mark));
-    mark
+    let n = MISSING.try_with(|m| m.borrow().len()).unwrap_or(0);
+    let _ = MISSING_FROM.try_with(|f| f.set(n));
+    n
 }
 
 /// A resolution that began at `mark` failed for good (a signature's type not found): its misses
@@ -4608,18 +4937,68 @@ pub fn missing_confirm(mark: usize) {
 fn note_missing(waits: &[u32], name: &str) {
     if matches!(name, "crate" | "self" | "super" | "Self") { return; }
     // try_with: a thread's TLS destructors can run compiled code (and lookups)
-    let from = MISSING_MARK.try_with(|x| x.get()).unwrap_or(0);
     let _ = MISSING.try_with(|m| {
         let mut m = m.borrow_mut();
-        let from = from.min(m.len());
-        for &w in waits { if !m[from..].iter().any(|(x, n)| *x == w && n == name) { m.push((w, name.to_owned())); } }
+        for &w in waits { push_missing(&mut m, w, name); }
     });
+}
+
+/// This thread's miss notes since `mark` (missing_mark), left in place.
+pub fn missing_since(mark: usize) -> Vec<(u32, String)> {
+    MISSING.try_with(|m| m.borrow().get(mark..).map(<[_]>::to_vec).unwrap_or_default()).unwrap_or_default()
+}
+
+/// Notes misses recorded earlier (a cached result's) as this thread's own: a build reading a
+/// cached type-check failure fails for the same skipped modules as the run that computed it.
+pub fn note_misses(misses: &[(u32, String)]) {
+    let _ = MISSING.try_with(|m| {
+        let mut m = m.borrow_mut();
+        for (w, name) in misses { push_missing(&mut m, *w, name); }
+    });
+}
+
+/// This thread's miss notes and dedup window, taken (cleared) for a nested build to start
+/// clean; missing_restore puts them back when it ends, so the enclosing work keeps its notes.
+pub fn missing_save() -> (Vec<(u32, String)>, usize) {
+    let from = MISSING_FROM.try_with(|f| f.replace(0)).unwrap_or(0);
+    (MISSING.try_with(|m| std::mem::take(&mut *m.borrow_mut())).unwrap_or_default(), from)
+}
+
+pub fn missing_restore(saved: (Vec<(u32, String)>, usize)) {
+    let _ = MISSING_FROM.try_with(|f| f.set(saved.1));
+    let _ = MISSING.try_with(|m| *m.borrow_mut() = saved.0);
 }
 
 /// The (skipped module, name) misses of this thread's lookups (cleared).
 pub fn take_missing() -> Vec<(u32, String)> {
-    let _ = MISSING_MARK.try_with(|x| x.set(0));
+    let _ = MISSING_FROM.try_with(|f| f.set(0));
     MISSING.try_with(|m| std::mem::take(&mut *m.borrow_mut())).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod missing_tests {
+    use super::*;
+
+    /// A lookup after a mark that misses a name this thread already missed before the mark
+    /// still shows in the notes since the mark (missing_confirm / a failed type check's
+    /// Body::deferred_misses); a nested build's save/restore keeps the enclosing notes.
+    #[test]
+    fn notes_since_a_mark_hold_repeated_misses_and_survive_a_nested_build() {
+        let _ = take_missing();
+        note_missing(&[3], "Foo");
+        let mark = missing_mark();
+        note_missing(&[3], "Foo");
+        note_missing(&[3], "Foo");
+        assert_eq!(missing_since(mark), vec![(3, "Foo".to_string())]);
+        let saved = missing_save();
+        assert!(missing_since(0).is_empty());
+        note_missing(&[4], "Bar");
+        assert_eq!(take_missing(), vec![(4, "Bar".to_string())]);
+        missing_restore(saved);
+        note_misses(&[(3, "Foo".to_string())]);
+        assert_eq!(missing_since(mark), vec![(3, "Foo".to_string())]);
+        assert_eq!(take_missing().len(), 2);
+    }
 }
 
 #[cfg(test)]

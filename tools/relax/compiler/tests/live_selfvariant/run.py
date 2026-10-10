@@ -10,7 +10,9 @@ animator.rx Ease::map has the same shape, and a Calculator layout edit was refus
   1. body edit of value()                               -> patched, new output (4)
   2. a field added to Pad and a fn added (in place)     -> patched, output 4 (the running Pad's
      new field reads its default)
-  3. value() returns 999                               -> the program sees it and exits
+  3. the field and helper are removed                 -> patched, output 5
+  4. an invalid body edit is refused, then reverted   -> patched notification, output 5
+  5. value() returns 999                              -> the program sees it and exits
 No step may report E0412. Prints PASS/FAIL per step; exit 1 on any FAIL.
 """
 import os, shutil, subprocess, sys, tempfile, threading, time
@@ -78,7 +80,19 @@ try:
     time.sleep(0.5)
     step("layout edit next to a Self::Variant match: applied, no E0412 (%s)" % (last_value(),), ok and last_value() == 4 and no_e0412(n))
     n = len(err)
-    save(layout.replace("    p.a + p.b + extra() + ease(&Ease::Pow { begin: 2, end: 1 }, 1u32) as u64\n", "    999\n"))
+    save(body)
+    ok = wait(lambda: last_value() == 5 and any("main.rs: patched" in l for l in err[n:]))
+    step("field and helper removal applies in the same process", ok and p.poll() is None and no_e0412(n))
+    n = len(err)
+    save(body.replace("p.a + 1 + ease(", 'p.a + "invalid" + ease('))
+    ok = wait(lambda: any("NOT applied" in l for l in err[n:]))
+    step("invalid body is refused", ok and last_value() == 5)
+    n = len(err)
+    save(body)
+    ok = wait(lambda: any("main.rs: patched" in l for l in err[n:]))
+    step("restoring the running source reports a completed patch", ok and last_value() == 5)
+    n = len(err)
+    save(body.replace("    p.a + 1 + ease(&Ease::Pow { begin: 2, end: 1 }, 1u32) as u64\n", "    999\n"))
     ok = wait(lambda: p.poll() is not None)
     step("final edit applies, program exits", ok and last_value() == 999 and no_e0412(n))
 finally:

@@ -1,7 +1,8 @@
 //! Callable sugar is a trait reference plus an Output projection, as in
-//! rustc_type_ir/src/predicate.rs:128,906. Regions remain erased until T-infer.
+//! rustc_type_ir/src/predicate.rs:128,906.
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::*;
-use crate::solve::goal::{AliasKind, AliasTerm, Clause, ProjectionPredicate, PredicatePolarity, Term, TraitPredicate, TraitRef};
 
 /// Declaration signature collected alongside its selection predicates.
 #[derive(Clone, Debug)]
@@ -29,19 +30,7 @@ impl Tcx {
         self.lang_items.get(item)
     }
 
-    pub(super) fn push_callable_clauses(&self, out: &mut Vec<Clause>, param: u32, def: DefId, signature: TyId) {
-        let signature = self.tys.erase_all_regions(signature);
-        let TyKind::FnPtr(ps, ret, _, _) = self.tys.kind(signature) else { return; };
-        let args = vec![self.tys.intern(TyKind::Param(param)), self.tys.intern(TyKind::Tuple(ps.clone()))];
-        out.push(Clause::Trait(TraitPredicate { trait_ref: TraitRef { def, args: args.clone() }, polarity: PredicatePolarity::Positive }));
-        if let Some(output) = self.callable_output(def) {
-            out.push(Clause::Projection(ProjectionPredicate {
-                alias: AliasTerm { kind: AliasKind::Projection, def: output, args }, term: Term::Ty(*ret),
-            }));
-        }
-    }
-
-    pub fn callable_signatures(&self, prog: &Program, item: DefId) -> Vec<CallableSignature> {
+    pub fn callable_signatures(&self, prog: &crate::program::Program, item: DefId) -> Vec<CallableSignature> {
         let Some(sig) = self.fn_item_sig(prog, item) else { return vec![]; };
         sig.region_contract.callable_signatures.iter().filter_map(|bound| {
             let mut bound = bound.clone();
@@ -49,19 +38,11 @@ impl Tcx {
                 let future = self.lang_items.get(LangItem::CallOnceFuture)?;
                 let TyKind::FnPtr(ps, _, header, n) = self.tys.kind(bound.signature) else { return None; };
                 let args = vec![self.tys.intern(TyKind::Param(bound.param)), self.tys.intern(TyKind::Tuple(ps.clone()))];
-                let ret = self.tys.intern(TyKind::Assoc(future, args, RegionArgsId::EMPTY));
+                let ret = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: future }, args, regions: RegionArgsId::EMPTY }));
                 bound.signature = self.tys.intern(TyKind::FnPtr(ps.clone(), ret, *header, *n));
             }
             Some(bound)
         }).collect()
     }
 
-    pub fn callable_sig(&self, cx: &EvalCx<'_>, ty: TyId, def: DefId, args: &[TyId]) -> Option<(Vec<TyId>, TyId)> {
-        if !self.callable_trait(def) { return None; }
-        let TyKind::Tuple(ps) = self.tys.kind(*args.first()?) else { return None; };
-        let output = if self.async_callable_trait(def) { self.lang_items.get(LangItem::CallOnceFuture)? } else { self.callable_output(def)? };
-        let mut pa = vec![ty]; pa.extend_from_slice(args);
-        let projection = self.tys.intern(TyKind::Assoc(output, pa, RegionArgsId::EMPTY));
-        Some((ps.clone(), self.normalize(cx, cx.prog, projection)))
-    }
 }

@@ -31,6 +31,7 @@ fn flatten(u: &crate::jit::Unit, t: TyId, base: u32, out: &mut Vec<(u32, Mem)>) 
     let k = u.tcx.tys.kind(t).clone();
     match k {
         TyKind::Array(e, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys).expect("normalized array length");
             let el = u.layout_of(e);
             let stride = round_up(el.size, el.align);
             for i in 0..n as u32 {
@@ -58,7 +59,7 @@ fn flatten(u: &crate::jit::Unit, t: TyId, base: u32, out: &mut Vec<(u32, Mem)>) 
                 // nullable pointer to C)
                 if let (crate::layout::TagEnc::Niche { untagged: dvi, .. }, Some(_)) = (l.enc, &l.leaves) {
                     for i in 0..adt.variants[dvi as usize].fields.len() {
-                        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, dvi, i as u32, &args);
+                        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, dvi, i as u32, &args);
                         let off = l.variant_fields[dvi as usize].get(i).copied().unwrap_or(0);
                         if !flatten(u, ft, base + off, out) {
                             return false;
@@ -79,7 +80,7 @@ fn flatten(u: &crate::jit::Unit, t: TyId, base: u32, out: &mut Vec<(u32, Mem)>) 
                 return false;
             }
             for i in 0..adt.variants[0].fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, i as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, &args);
                 if !flatten(u, ft, base + l.fields[i], out) {
                     return false;
                 }

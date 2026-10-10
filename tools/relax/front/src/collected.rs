@@ -155,7 +155,7 @@ impl<K: Codec + Ord + std::hash::Hash + Clone, V: Codec + Clone> Codec for crate
     }
 }
 
-crate::collected_id!(crate::program::DefId, crate::ast::TyId, crate::ast::QSelfId);
+crate::collected_id!(crate::program::DefId, crate::ast::TyId, crate::ast::QSelfId, crate::ast::ExprId);
 crate::collected_enum!(crate::program::Prim;
     0 => Bool, 1 => Char, 2 => Str, 3 => I8, 4 => I16, 5 => I32, 6 => I64,
     7 => I128, 8 => Isize, 9 => U8, 10 => U16, 11 => U32, 12 => U64,
@@ -164,7 +164,7 @@ crate::collected_enum!(crate::program::DefKind;
     0 => Mod, 1 => Fn, 2 => Struct, 3 => Union, 4 => Enum, 5 => Variant,
     6 => Const, 7 => Static, 8 => Trait, 9 => Impl, 10 => TypeAlias,
     11 => AssocFn, 12 => AssocConst, 13 => AssocTy, 14 => ForeignFn,
-    15 => ForeignStatic, 16 => MacroRules, 17 => Prim(p));
+    15 => ForeignStatic, 16 => MacroRules, 17 => Prim(p), 18 => AnonConst, 19 => OpaqueTy, 20 => Closure, 21 => ForeignTy, 22 => Field);
 crate::collected_enum!(crate::ast::SegKind; 0 => Ident, 1 => SelfValue, 2 => SelfType, 3 => Super, 4 => Crate);
 crate::collected_fields!(crate::ast::Path, qself, segs, lo);
 impl Codec for crate::ast::SegList {
@@ -672,3 +672,31 @@ mod image_table_tests {
         assert_eq!((restored.str(late), restored.get("late one")), ("late one", Some(late)));
     }
 }
+
+impl<K: Codec + ImageKey + Clone + std::hash::Hash + Eq, V: Codec + Clone> Clone for ImageMap<K, V> {
+    fn clone(&self) -> Self { self.iter().map(|(k, v)| (k.clone(), v.clone())).collect() }
+}
+
+/// A declaration set with the same demand-decoded representation as declaration maps.
+pub struct ImageSet<K>(ImageMap<K, ()>);
+impl<K: Codec + ImageKey + std::hash::Hash + Eq> ImageSet<K> {
+    pub fn len(&self) -> usize { self.0.len() }
+    pub fn insert(&mut self, key: K) -> bool { self.0.insert(key, ()).is_none() }
+    pub fn remove(&mut self, key: &K) -> bool { self.0.remove(key).is_some() }
+    pub fn contains(&self, key: &K) -> bool { self.0.contains_key(key) }
+    pub fn retain(&mut self, mut f: impl FnMut(&K) -> bool) { self.0.retain(|k, _| f(k)); }
+    pub fn iter(&self) -> impl Iterator<Item = &K> { self.0.keys() }
+    pub fn write_image(&self, image: &mut crate::image::Writer<'_>, id: &mut u32) { self.0.write_image(image, id); }
+    pub fn read_image(image: &crate::image::Reader, k: &mut usize, id: &mut u32) -> Option<Self> { Some(Self(ImageMap::read_image(image, k, id)?)) }
+}
+impl<'a, K: Codec + ImageKey + std::hash::Hash + Eq> IntoIterator for &'a ImageSet<K> {
+    type Item = &'a K;
+    type IntoIter = std::iter::Map<ImageMapIter<'a, K, ()>, fn((&'a K, &'a ())) -> &'a K>;
+    fn into_iter(self) -> Self::IntoIter { self.0.iter().map(|(k, _)| k) }
+}
+impl<K: Codec + ImageKey + Ord + std::hash::Hash + Eq> Codec for ImageSet<K> {
+    fn put(&self, w: &mut Vec<u8>) { self.0.put(w); }
+    fn get(r: &mut Decode<'_>) -> Option<Self> { Some(Self(Codec::get(r)?)) }
+}
+
+impl<K> Default for ImageSet<K> { fn default() -> Self { Self(ImageMap::default()) } }

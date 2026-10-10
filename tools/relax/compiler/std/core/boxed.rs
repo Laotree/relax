@@ -9,10 +9,17 @@ use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::heap::{self, Layout};
 use crate::intrinsics_mem as im;
-use crate::ops::{Deref, DerefMut};
+use crate::ops::{Deref, DerefMut, DispatchFromDyn};
+use crate::marker::Unsize;
+use crate::pin::PinSafePointer;
+
+// library/alloc/src/boxed.rs:2384,2390 @8d1a764
+unsafe impl<T: ?Sized> PinSafePointer for Box<T> {}
+impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Box<U>> for Box<T> {}
 use crate::string::String;
 use crate::vec::Vec;
 
+#[fundamental]
 #[cfg_attr(not(relax_check), lang = "owned_box")]
 pub struct Box<T: ?Sized> {
     ptr: crate::ptr::NonNull<T>,

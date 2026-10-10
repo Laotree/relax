@@ -1,7 +1,8 @@
 //! Type queries the borrow checker needs, over `&Program` + `&Tcx` only (usable from a
 //! background thread under FRONT_RW.read(); no Unit).
 
-use crate::solve::SelectionResult;
+use crate::next_solver::evaluate_obligation::EvaluationResult;
+use crate::next_solver::select::ImplSource;
 use crate::fxhash::HashMap;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
@@ -9,11 +10,12 @@ use crate::types::{TyId, TyKind};
 use std::cell::RefCell;
 
 pub struct Tx<'a> {
+    pub errors: crate::infer::diagnostics::DiagCtxt,
     pub cx: crate::tcx::EvalCx<'a>,
     pub fv: std::rc::Rc<super::fv::SummaryCx>,
     pub prog: &'a Program,
     pub tcx: &'a Tcx,
-    pub pending_traits: RefCell<Vec<(crate::solve::goal::Goal, DefId, crate::solve::goal::Certainty)>>,
+    pub pending_traits: RefCell<Vec<(crate::next_solver::Goal, DefId)>>,
     pub obligation_owner: std::cell::Cell<DefId>,
     copy_memo: RefCell<HashMap<TyId, bool>>,
     rawptr_memo: RefCell<HashMap<TyId, bool>>,
@@ -29,9 +31,18 @@ pub struct Tx<'a> {
     /// closures built by the checker: Copy when every capture is (by value Copy, or a shared
     /// borrow) -- rustc's rule; Relax's own upvar types hide `&mut` captures as pointers
     pub closure_copy: RefCell<HashMap<(u32, u32), bool>>,
+    /// The body's clauses for the native solver.
+    pub param_env: RefCell<crate::next_solver::ParamEnv>,
 }
 
 impl<'a> Tx<'a> {
+    fn infer_ctxt(&self) -> crate::infer::InferCtxt<'a> {
+        let infcx = crate::infer::InferCtxt::for_item(
+            self.tcx, self.prog, self.cx.typing_env.mode, self.obligation_owner.get());
+
+        infcx
+    }
+
     pub fn new(prog: &'a Program, tcx: &'a Tcx, env: crate::tcx::TypingEnv, state: &'a crate::tcx::EvalState) -> Tx<'a> {
         let mut std_crates = Vec::new();
         for (i, c) in prog.crates.iter().enumerate() {
@@ -39,8 +50,10 @@ impl<'a> Tx<'a> {
                 std_crates.push(i as u32);
             }
         }
+        let errors = tcx.dcx.clone();
         let mut t = Tx {
-            cx: crate::tcx::EvalCx::new(prog, env, state),
+            cx: crate::tcx::EvalCx::new(prog, &tcx, env, state),
+            errors,
             fv: Default::default(),
             prog,
             tcx,
@@ -55,6 +68,9 @@ impl<'a> Tx<'a> {
             param_copy: RefCell::new(Vec::new()),
             polymorphic: std::cell::Cell::new(false),
             closure_copy: RefCell::new(HashMap::default()),
+            // N:rustc_ty_utils/src/ty.rs:150-156 and solve/mod.rs:280-319:
+            // const-only bodies need their ConstArgHasType clauses too.
+            param_env: RefCell::new(tcx.param_env_by_id(env.param_env).clone()),
         };
         t.box_def = t.lang("boxed::Box");
         if t.copy_trait.is_none() {
@@ -75,10 +91,13 @@ impl<'a> Tx<'a> {
             self.polymorphic.set(false);
             self.param_copy.borrow_mut().clear();
             self.copy_memo.borrow_mut().clear();
+            *self.param_env.borrow_mut() = self.tcx.param_env_by_id(self.cx.typing_env.param_env).clone();
         }
     }
 
     pub fn set_generic_env(&self, def: DefId, n: usize) {
+        let result = self.tcx.param_env(self.prog, def);
+        *self.param_env.borrow_mut() = result;
         let mut v = vec![false; n];
         let ct = match self.copy_trait {
             Some(c) => c,
@@ -121,7 +140,31 @@ impl<'a> Tx<'a> {
         self.copy_memo.borrow_mut().clear();
     }
 
+    /// BIR adapter, deleted with the BIR (C-NLL5): the normalized shape of a type the BIR
+    /// builder and the region-slot templates lay out, through the native solver's
+    /// Normalize type operation (type_op/normalize.rs, rustc_traits type_op.rs:41).
+    /// This layout query has no region numbering: the body's region constraints from
+    /// normalization are produced where its regions are numbered (nll.rs, through
+    /// fully_perform_op). A failed operation keeps the unnormalized type, as
+    /// type_check/canonical.rs:205 normalize_with_category; a region variable the
+    /// operation leaves unresolved is a fresh slot (erased) to the layout.
+    pub fn normalize(&self, ty: TyId) -> TyId {
+        self.normalize_in_env(ty, &self.param_env.borrow())
+    }
+
+    pub(super) fn normalize_in_env(&self, ty: TyId, param_env: &crate::next_solver::ParamEnv) -> TyId {
+        let tys = &self.tcx.tys;
+        if !tys.may_project(ty) && !tys.has_opaque(ty) { return ty; }
+        let infcx = self.infer_ctxt();
+        let param_env = param_env.clone();
+        with_foreign_region_vars(&infcx, ty, |ty| in_signature_binder(tys, ty, |value| {
+            let op = crate::next_solver::type_op::ParamEnvAnd { param_env, value: crate::next_solver::type_op::Normalize { value } };
+            crate::next_solver::type_op::TypeOp::fully_perform(op, &infcx, self.prog).map(|out| out.output).ok()
+        })).unwrap_or(ty)
+    }
+
     pub fn kind(&self, t: TyId) -> TyKind {
+        let t = self.cx.infcx.map_or(t, |infcx| infcx.shallow_resolve(t));
         self.tcx.tys.kind(t).clone()
     }
 
@@ -195,7 +238,7 @@ impl<'a> Tx<'a> {
                 adt.variants.get(vi as usize)?.fields.get(fi as usize)?;
                 Some(self.tcx.field_ty(self.prog, self.cx.typing_env, *d, vi, fi, args))
             }
-            TyKind::Closure(_, _, _, up, _) => self.field_ty(*up, 0, fi),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.field_ty(*up, 0, fi),
             _ => None,
         }
     }
@@ -230,7 +273,7 @@ impl<'a> Tx<'a> {
             }
             TyKind::Tuple(v) => v.iter().all(|a| self.owning_d(*a, depth + 1)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.owning_d(*e, depth + 1),
-            TyKind::Closure(_, _, _, up, _) => self.owning_d(*up, depth + 1),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.owning_d(*up, depth + 1),
             _ => false,
         }
     }
@@ -248,7 +291,7 @@ impl<'a> Tx<'a> {
             TyKind::Ptr(..) => true,
             TyKind::Tuple(v) => v.iter().any(|x| self.holds_raw_ptr_d(*x, depth + 1)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.holds_raw_ptr_d(*e, depth + 1),
-            TyKind::Closure(_, _, _, up, _) => self.holds_raw_ptr_d(*up, depth + 1),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.holds_raw_ptr_d(*up, depth + 1),
             TyKind::Adt(d, _, _) => {
                 if let Some(inner) = self.box_inner(t) {
                     self.holds_raw_ptr_d(inner, depth + 1)
@@ -293,27 +336,68 @@ impl<'a> Tx<'a> {
         matches!(self.tcx.tys.kind(t), TyKind::Adt(d, _, _) if self.tcx.adts.get(d).map_or(false, |a| a.repr_packed != 0))
     }
 
+    /// `ty: td<args>` in the body's environment, lifetimes erased: borrowck proves trait
+    /// properties modulo regions (rustc type_is_copy_modulo_regions).
+    fn trait_goal(&self, td: DefId, ty: TyId, args: &[TyId]) -> crate::next_solver::Goal {
+        let tys = &self.tcx.tys;
+        let mut compact = Vec::with_capacity(args.len() + 1);
+        compact.push(tys.erase_regions(ty));
+        for &a in args { compact.push(tys.erase_regions(a)); }
+        let lifetimes = self.tcx.generic_indices_of(self.prog, td).lifetimes.len();
+        let regions = tys.intern_region_args(&vec![crate::types::RegionId::ERASED; lifetimes]);
+        let args = self.tcx.complete_args(self.prog, td, &compact, regions);
+        crate::next_solver::Goal { param_env: self.param_env.borrow().clone(), predicate: crate::next_solver::collect::trait_predicate(td, args) }
+    }
+
     /// Borrowck retains undecided properties as obligations in its explicit environment.
-    pub fn select_trait(&self, td: crate::program::DefId, ty: TyId, args: &[TyId]) -> SelectionResult {
-        let result = self.tcx.select_trait(&self.cx, td, ty, args);
-        if let SelectionResult::Ambiguous(cause) = result {
-            let goal = crate::solve::select::trait_goal(&self.cx, td, ty, args);
-            let mut pending = self.pending_traits.borrow_mut();
-            let owner = self.obligation_owner.get();
-            if !pending.iter().any(|(g, d, _)| *g == goal && *d == owner) { pending.push((goal, owner, crate::solve::goal::Certainty::Maybe(cause))); }
-        }
+    fn retain_ambiguous(&self, goal: crate::next_solver::Goal) {
+        let owner = self.obligation_owner.get();
+        let mut pending = self.pending_traits.borrow_mut();
+        if !pending.iter().any(|(g, d)| *g == goal && *d == owner) { pending.push((goal, owner)); }
+    }
+
+    /// rustc_trait_selection/src/traits/query/evaluate_obligation.rs:95-114.
+    pub fn evaluate_trait(&self, td: DefId, ty: TyId, args: &[TyId]) -> EvaluationResult {
+        let goal = self.trait_goal(td, ty, args);
+        let result = match self.cx.infcx {
+            Some(infcx) => infcx.evaluate_obligation(self.prog, goal.clone()),
+            None => self.infer_ctxt().evaluate_obligation(self.prog, goal.clone()),
+        };
+        if result == EvaluationResult::EvaluatedToAmbig { self.retain_ambiguous(goal); }
         result
     }
 
+    /// The user-written impl proving `ty: td<args>` (rustc_traits/src/codegen.rs:26-50
+    /// selection in the body's environment); None for builtin, object and where-clause
+    /// sources, ambiguity and failure.
+    pub fn select_impl(&self, td: DefId, ty: TyId, args: &[TyId]) -> Option<DefId> {
+        let goal = self.trait_goal(td, ty, args);
+        let infcx = self.infer_ctxt();
+        match infcx.select_in_new_trait_solver(self.prog, goal.clone()) {
+            Ok(Some(ImplSource::UserDefined { impl_def_id, .. })) => Some(impl_def_id),
+            Ok(Some(_)) | Err(_) => None,
+            Ok(None) => { self.retain_ambiguous(goal); None }
+        }
+    }
+
+    /// rustc_ty_utils/src/instance.rs:108-131: an unresolvable call (a where-clause
+    /// source, ambiguity) stays on the trait item, as generic MIR keeps it.
     pub fn resolve_trait_method(&self, def: DefId, args: &[TyId]) -> (DefId, Vec<TyId>) {
-        match self.tcx.resolve_trait_method(&self.cx, self.prog, def, args) {
-            crate::tcx::MethodResolution::Resolved(def, args) => (def, args),
-            crate::tcx::MethodResolution::Ambiguous(goal, cause) => {
-                self.pending_traits.borrow_mut().push((goal, self.obligation_owner.get(), crate::solve::goal::Certainty::Maybe(cause)));
-                // Generic MIR keeps the trait call; the verdict retains its unresolved goal.
+        let typing_env = crate::tcx::TypingEnv { limit: self.cx.typing_env.limit, param_env: self.tcx.intern_param_env(self.param_env.borrow().clone()), mode: self.cx.typing_env.mode };
+        match self.tcx.resolve_instance_raw(self.prog, typing_env, def, args) {
+            Ok(instance) => match instance.def {
+                crate::instance::InstanceKind::Item(d) if self.prog.def(d).kind != crate::program::DefKind::Closure => (d, instance.compact_args(self.tcx)),
+                _ => (def, args.to_vec()),
+            },
+            // ty_utils/instance.rs resolve_associated_item: an ambiguous selection is
+            // Ok(None) (too generic: the trait item stays); Unimplemented/UnconstrainedParam
+            // are a delayed bug (typeck reported the unsatisfied obligation)
+            Err(crate::next_solver::codegen::CodegenObligationError::Ambiguity) => (def, args.to_vec()),
+            Err(e) => {
+                self.errors.delayed_bug(crate::next_solver::fulfill::ObligationCause { span: 0, body_id: self.obligation_owner.get() },
+                    format!("resolving {} failed: {:?}", self.prog.def_path(def), e));
                 (def, args.to_vec())
             }
-            crate::tcx::MethodResolution::NoSolution(goal) => panic!("borrowck method has no solution: {goal:?}"),
         }
     }
 
@@ -321,14 +405,11 @@ impl<'a> Tx<'a> {
     pub fn is_copy(&self, t: TyId) -> bool {
         if let Some(value) = self.copy_memo.borrow().get(&t) { return *value; }
         let result = match self.copy_trait {
-            Some(td) => self.select_trait(td, t, &[]),
+            Some(td) => self.evaluate_trait(td, t, &[]),
             None => return matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ref(false, _, _) | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..)),
         };
-        let value = match result {
-            SelectionResult::Ok(_) => true,
-            SelectionResult::NoSolution => false,
-            SelectionResult::Ambiguous(_) => return false,
-        };
+        if result == EvaluationResult::EvaluatedToAmbig { return false; }
+        let value = result.must_apply_modulo_regions();
         self.copy_memo.borrow_mut().insert(t, value);
         value
     }
@@ -369,4 +450,47 @@ impl<'a> Tx<'a> {
     pub fn crate_of(&self, d: DefId) -> u32 {
         self.prog.def(d).krate
     }
+}
+
+/// Region variables of another inference context (typeck's, which writeback keeps) cannot
+/// enter `infcx`: each is replaced by a variable of `infcx` for the operation and restored
+/// in its result. A variable the operation itself created is erased (a fresh slot).
+pub fn with_foreign_region_vars(infcx: &crate::infer::InferCtxt<'_>, ty: TyId, f: impl FnOnce(TyId) -> Option<TyId>) -> Option<TyId> {
+    use crate::types::{RegionId, RegionKind};
+    let tys = &infcx.tcx.tys;
+    let map = RefCell::new(Vec::<(RegionId, RegionId)>::new());
+    let local = if tys.flags(ty).contains(crate::types::TypeFlags::HAS_RE_INFER) {
+        tys.map_regions(ty, &|r, _| {
+            if !matches!(tys.region_kind(r), RegionKind::ReVar(_)) { return r; }
+            if let Some(&(_, l)) = map.borrow().iter().find(|(f, _)| *f == r) { return l; }
+            let l = infcx.next_region_var();
+            map.borrow_mut().push((r, l));
+            l
+        }, 0)
+    } else { ty };
+    let out = f(local)?;
+    let map = map.into_inner();
+    Some(tys.map_regions(out, &|r, _| match tys.region_kind(r) {
+        RegionKind::ReVar(_) => map.iter().find(|(_, l)| *l == r).map_or(RegionId::ERASED, |(f, _)| *f),
+        _ => r,
+    }, 0))
+}
+
+/// A type taken out of a signature can still mention the signature's late-bound regions.
+/// It is normalized under that binder (nightly normalizes the whole `PolyFnSig`): wrapped
+/// as the single input of a function-pointer binder and unwrapped afterwards.
+pub fn in_signature_binder(tys: &crate::types::Types, ty: TyId, f: impl FnOnce(TyId) -> Option<TyId>) -> Option<TyId> {
+    if !tys.has_vars_bound_at_or_above(ty, 0) { return f(ty); }
+    let bound = std::cell::Cell::new(0u32);
+    let outer = std::cell::Cell::new(false);
+    tys.map_regions(ty, &|r, depth| {
+        if let crate::types::RegionKind::ReBound(d, v) = tys.region_kind(r) {
+            if d == depth { bound.set(bound.get().max(v.0 + 1)); } else if d > depth { outer.set(true); }
+        }
+        r
+    }, 0);
+    // Escaping bound types/consts or regions of an outer binder: not a signature's own binder.
+    if outer.get() || bound.get() == 0 { return None; }
+    let wrapped = tys.intern(TyKind::FnPtr(vec![ty], tys.unit, crate::types::FnHeader::RUST, bound.get()));
+    match tys.kind(f(wrapped)?) { TyKind::FnPtr(ps, ..) => ps.first().copied(), _ => None }
 }

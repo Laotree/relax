@@ -1,6 +1,6 @@
 //! rustc_mir_dataflow/src/move_paths/builder.rs:24,107,363,379,423,448,539,565.
 use super::*;
-use crate::types::{len_ty, TyKind};
+use crate::types::{TyKind};
 
 struct Builder<'a> {
     body: &'a Body, prog: &'a Program, tcx: &'a Tcx, filter: &'a dyn Fn(TyId) -> bool,
@@ -79,10 +79,7 @@ impl Builder<'_> {
                 SubPath::Subslice { from, to } => {
                     for (_, trailing) in &projections[i + 1..] { assert!(MoveSubPath::of(trailing) == SubPath::Skip); }
                     let TyKind::Array(inner, len) = self.tcx.tys.kind(ty.ty) else { panic!("fixed subslice requires array"); };
-                    let len = match len_ty(*len) {
-                        None => *len,
-                        Some(t) => match self.tcx.tys.kind(t) { TyKind::ConstVal(n) => *n, _ => panic!("subslice requires fixed array length") },
-                    };
+                    let len = len.try_to_target_usize(&self.tcx.tys).expect("subslice requires fixed array length");
                     if !(self.filter)(*inner) { return; }
                     for offset in from..to {
                         let mut element = prefix.clone();

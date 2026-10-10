@@ -1,13 +1,20 @@
+// ported from N:rustc_mir_build/src/builder/expr/as_rvalue.rs @8d1a764 (arithmetic checks; round-30 RIR design)
+// ported from N:rustc_mir_transform/src/shim.rs @8d1a764
+// ported from N:rustc_ty_utils/src/abi.rs @8d1a764
 //! Lowering of one type-checked function instance (typeck::Body) to RIR.
 //! Small aggregates live in registers as their scalar leaves; everything else
 //! lives in stack slots. Locals whose address is taken live in slots.
 
 include!("rt_abi.rs");
-use relax_types::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
+use relax_types::next_solver::TraitRef;
+use relax_types::consts::GenericArg;
 use crate::lang_items::LangItem;
 use crate::lit::{unescape_str, unescape_bytes, strip_paren, is_assignee_pattern, parse_fmt, FmtPiece, FmtSpec};
 use crate::ast::*;
-use crate::jit::{FnKey, Unit};
+use crate::jit::{FnKey, Unit, ShimInstance};
+use relax_types::instance::{Instance, InstanceKind, ShimKind};
 use crate::layout::{Layout, Leaf};
 use crate::program::{DefId, DefKind, Prim};
 use crate::rir::*;
@@ -151,12 +158,15 @@ pub struct Lcx<'a> {
     /// lowering a const/static initializer: borrowed temporaries live in static memory
     /// (rustc's constant promotion), not on the initializer's stack
     const_init: bool,
+    // N:rustc_mir_build/src/builder/mod.rs:777-785: const owners always check overflow.
+    overflow_checks: bool,
     /// a #[track_caller] fn: its implicit `&'static Location` parameter
     caller_loc: Option<VReg>,
     pub u: &'a Unit,
     /// the slot being built (closures created here are its children)
     cur_fn: u32,
     pub b: &'a Body,
+    closure_storage: HashMap<u32, crate::layout::ClosureStorage>,
     pub f: Func,
     cur: u32,
     pos: u32,
@@ -177,7 +187,7 @@ pub struct Lcx<'a> {
     /// extension allocations.
     drop_types: HashMap<TyId, bool>,
     /// Trait dispatch is fully monomorphized here; repeated calls in this body share it.
-    trait_methods: HashMap<DefId, HashMap<Vec<TyId>, (DefId, Vec<TyId>)>>,
+    trait_methods: HashMap<DefId, HashMap<Vec<TyId>, crate::instance::Instance>>,
     /// drop scopes: locals (index) that own a value needing drop, innermost last
     scopes: Vec<Vec<u32>>,
     /// per local: its drop flag (1 = holds a live value)
@@ -272,6 +282,7 @@ pub fn fn_name(u: &Unit, key: &FnKey) -> String {
     match key {
         FnKey::Inst(d, _) => u.prog.def_path(*d),
         FnKey::Closure(_, e, p) => format!("{{closure#{}}}@{}", e, p),
+        FnKey::Shim(shim) => shim_name(&u.prog, &u.tcx, shim),
         FnKey::Glue(k, t) => format!("glue{}<{}>", k, crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t)),
         FnKey::Sandbox(b) if *b == u32::MAX => "sandbox:invalid-fn-pointer".to_string(),
         FnKey::Sandbox(b) => format!("sandbox:{}", u.fns[*b as usize].name),
@@ -290,7 +301,10 @@ impl<'a> Lcx<'a> {
         let entry = f.block();
         let n = b.locals.len();
         let ret = b.ret;
+        let mut closure_storage = HashMap::default();
+        for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::new(&u.tcx, b, ce)); }
         Lcx {
+            closure_storage,
             u,
             cur_fn,
             b,
@@ -333,6 +347,8 @@ impl<'a> Lcx<'a> {
             field_moved: HashMap::default(),
             want_mut: false,
             const_init: false,
+            // Relax currently has only the release session policy (checks off).
+            overflow_checks: false,
             foreign: vec![false; n],
             dead_blk: None,
             nounwind: 0,
@@ -402,16 +418,6 @@ impl<'a> Lcx<'a> {
     fn err(&mut self, pos: u32, msg: String) {
         let prog = &self.u.prog;
         self.errors.push(prog.record_error(self.b.file, pos, "lower", msg));
-    }
-
-    fn derived_error(&mut self, ty: TyId, msg: String) {
-        // Built-in derives have no expression position. Their ADT is the user's item;
-        // byte zero (and the synthetic derive method's file) is not an origin.
-        if let TyKind::Adt(d, _, _) = self.u.tcx.tys.kind(ty) {
-            let d = self.u.prog.def(*d);
-            let pos = self.u.prog.files[d.file as usize].ast.item(d.item).lo;
-            self.errors.push(self.u.prog.record_error(d.file, pos, "lower", msg));
-        } else { self.err(self.pos, msg); }
     }
 
     fn ast(&self) -> &'a Ast {
@@ -722,15 +728,11 @@ impl<'a> Lcx<'a> {
         self.drop_types.insert(t, drop);
         drop
     }
-    fn resolve_trait_method(&mut self, d: DefId, args: &[TyId]) -> (DefId, Vec<TyId>) {
-        if args.is_empty() || self.u.prog.def(self.u.prog.def(d).parent).kind != DefKind::Trait {
-            return (d, args.to_vec());
-        }
+    fn resolve_instance(&mut self, d: DefId, args: &[TyId]) -> crate::instance::Instance {
         self.refresh_queries();
-        if let Some(found) = self.trait_methods.get(&d).and_then(|m| m.get(args)) {
-            return found.clone();
-        }
-        let found = self.u.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.u.prog, d, args).expect_dispatch();
+        if let Some(found) = self.trait_methods.get(&d).and_then(|m| m.get(args)) { return found.clone(); }
+        let found = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog,
+            crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, args);
         self.trait_methods.entry(d).or_default().insert(args.to_vec(), found.clone());
         found
     }
@@ -767,7 +769,7 @@ impl<'a> Lcx<'a> {
                 };
                 let mut a = 1;
                 for i in 0..nf {
-                    let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, i as u32, &args);
+                    let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, &args);
                     let fa = if i + 1 == nf && self.unsized_ty(ft) { self.sized_prefix_align(ft) } else { self.layout(ft).align };
                     a = a.max(fa);
                 }
@@ -877,6 +879,10 @@ impl<'a> Lcx<'a> {
 
     fn store_val(&mut self, base: VReg, off: i32, t: TyId, v: Val) {
         let l = self.layout(t);
+        self.store_val_with_layout(base, off, l, v);
+    }
+
+    fn store_val_with_layout(&mut self, base: VReg, off: i32, l: &crate::layout::Layout, v: Val) {
         match v {
             Val::L(regs) => {
                 if let Some(leaves) = &l.leaves {
@@ -1112,10 +1118,10 @@ impl<'a> Lcx<'a> {
                     let v = self.const_val(dconst.unwrap(), Vec::new(), ft);
                     self.write_place(&Place::Mem(blk, off as i32), ft, v);
                 }
-                (Some(td), Some(m)) if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, ft, &[]), SelectionResult::Ok(_)) => {
-                    let (d, args) = self.resolve_trait_method(m, &[ft]);
-                    let id = self.u.fn_id(FnKey::Inst(d, args));
-                    let v = self.emit_call(Callee::Fn(id), Vec::new(), ft);
+                (Some(td), Some(m)) if self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(ft)] }).must_apply_modulo_regions() => {
+                    let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m, &[ft]);
+
+                    let v = self.emit_instance(instance, Vec::new(), ft);
                     self.write_place(&Place::Mem(blk, off as i32), ft, v);
                 }
                 _ => {
@@ -1142,10 +1148,15 @@ impl<'a> Lcx<'a> {
         let u = self.u;
         let field_ty = |i: usize| match k {
             TyKind::Tuple(v) => v[i],
-            TyKind::Adt(d, args, _) => u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), *d, vi, i as u32, args),
+            TyKind::Closure(..) => u.closure_storage(t).fields[i],
+            TyKind::Adt(d, args, _) => u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi, i as u32, args),
             _ => u.tcx.tys.error,
         };
         let (fty, off, nfields): (TyId, u32, usize) = match k {
+            TyKind::Closure(..) => {
+                let storage = u.closure_storage(t);
+                (storage.fields[fi as usize], l.fields[fi as usize], storage.fields.len())
+            }
             TyKind::Tuple(v) if (fi as usize) < v.len() => (v[fi as usize], l.fields.get(fi as usize).copied().unwrap_or(0), v.len()),
             TyKind::Adt(d, args, _) => {
                 // an opaque type of a provided crate (rustc's layout, size only): every way of
@@ -1156,7 +1167,7 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, format!("a field of `{}` is reached from Relax-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and its layout is rustc's alone: call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, ts));
                     // the fn fails with the error above; lowering goes on over a scratch place of
                     // the field's type so nothing after it trips over a shapeless one
-                    let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), *d, vi, fi, args)).unwrap_or(self.u.tcx.tys.unit);
+                    let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, args)).unwrap_or(self.u.tcx.tys.unit);
                     let a = self.new_slot_for(ft);
                     return (Place::Mem(a, 0), ft);
                 }
@@ -1331,7 +1342,8 @@ impl<'a> Lcx<'a> {
             }
         }
         // locals captured by reference live in memory
-        for (ce, caps) in &b.closure_locals {
+        for ce in &b.closures {
+            let caps = self.storage_for_closure(*ce).roots.clone();
             for (i, li) in caps.iter().enumerate() {
                 if !self.capture_by_value(*ce, i, *li) {
                     self.addr_taken[*li as usize] = true;
@@ -1402,9 +1414,22 @@ impl<'a> Lcx<'a> {
     }
 
     pub fn lower_fn_body(&mut self, def: DefId) {
+        self.overflow_checks |= matches!(self.u.prog.def(def).kind, DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst);
         self.scan_addr_taken();
         let ast = self.ast();
         let prog_def_item = self.u.prog.def(def).item;
+        if self.u.prog.def(def).kind == DefKind::AnonConst {
+            let e = relax_types::const_eval::const_body(&self.u.prog, def).expect("anonymous const body");
+            let out = self.f.vreg(Cls::I);
+            self.f.params.push(out);
+            self.pos = ast.expr(e).lo;
+            self.const_init = true;
+            let t = self.b.ret;
+            let v = self.lower_expr_coerced(e, t);
+            self.store_val(out, 0, t, v);
+            self.term(Term::Ret(Vec::new()));
+            return;
+        }
         let (fsig, body) = match &ast.item(prog_def_item).kind {
             ItemKind::Fn(s, b, _) => (*ast.fn_sig(*s), b.or_else(|| self.u.prog.fn_body(self.u.prog.def(def).file, prog_def_item).ok().flatten())),
             ItemKind::Const(_, Some(e)) | ItemKind::Static(_, _, Some(e)) => {
@@ -1415,8 +1440,8 @@ impl<'a> Lcx<'a> {
                 self.pos = ast.expr(e).lo;
                 self.const_init = true;
                 // stored at the item's declared type (`const P: &[u32] = &[1, 2, 3];` unsizes)
-                let t = match self.u.tcx.const_tys.get(&def).copied() {
-                    Some(ct) => self.u.tcx.tys.subst_erasing_regions(ct, &self.b.args),
+                let t = match self.u.tcx.const_tys.get(&def) {
+                    Some(ct) => self.u.tcx.tys.subst_erasing_regions(ct, &self.b.args.clone()),
                     None => self.b.ty(e),
                 };
                 let v = self.lower_expr_coerced(e, t);
@@ -1475,9 +1500,11 @@ impl<'a> Lcx<'a> {
             let (regs, by_ptr) = self.abi_param_c(t, c_abi);
             param_vals.push((Some(li), None, t, regs, by_ptr));
         }
-        for p in &self.b.param_pats {
+        let rust_call = self.u.tcx.fn_sig(&self.u.prog, def).is_some_and(|s| s.header.abi == crate::types::Abi::RustCall);
+        let patterns = self.b.param_pats.clone();
+        for (index, p) in patterns.iter().enumerate() {
             let t = self.b.pty(*p);
-            let (regs, by_ptr) = self.abi_param_c(t, c_abi);
+            let (regs, by_ptr) = if rust_call && index + 1 == patterns.len() { self.abi_tuple_param(t) } else { self.abi_param_c(t, c_abi) };
             param_vals.push((None, Some(*p), t, regs, by_ptr));
         }
         // #[track_caller]: the caller's location arrives as an implicit last argument
@@ -1510,7 +1537,7 @@ impl<'a> Lcx<'a> {
             let ce = crate::tcx::ASYNC_FN_BODY | bid.0;
             let ct = self.coroutine_ty(ce);
             let t = match self.kind(ct) {
-                TyKind::Closure(file, e2, _, _, owner) => {
+                TyKind::Closure(file, e2, crate::types::ClosureArgs { parent_args: owner, .. }) => {
                     let parent = match self.kind(owner) {
                         TyKind::FnDef(d, args, _) => self.u.fn_id(FnKey::Inst(d, args)),
                         _ => self.cur_fn,
@@ -1575,7 +1602,7 @@ impl<'a> Lcx<'a> {
         matches!(self.u.tcx.tys.kind(t), TyKind::Tuple(v) if v.is_empty())
     }
 
-    /// Lowers a non-capturing closure as a function of its own.
+    /// rustc_ty_utils/src/abi.rs:61-73: the closure receiver precedes its inputs.
     pub fn lower_closure_body(&mut self, ce: u32) {
         let ast = self.ast();
         if ce & crate::tcx::ASYNC_FN_BODY != 0 || matches!(ast.expr(ExprId(ce)).kind, ExprKind::Async(..)) {
@@ -1594,7 +1621,7 @@ impl<'a> Lcx<'a> {
         };
         // the signature's return type (the body may have a type of its own that coerces to it)
         let ret = match self.kind(self.b.ty(ExprId(ce))) {
-            TyKind::Closure(_, _, sig, _, _) => match self.kind(sig) {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => match self.kind(sig) {
                 TyKind::FnPtr(_, r, _, _) => r,
                 _ => self.b.ty(body),
             },
@@ -1619,20 +1646,28 @@ impl<'a> Lcx<'a> {
         }
         // captured state: by-value captures live in the state, by-reference ones point at
         // the owner's locals
-        let caps = self.b.closure_locals.get(&ce).cloned().unwrap_or_default();
-        if !caps.is_empty() {
-            let env = self.f.vreg(Cls::I);
-            self.f.params.push(env);
+        let caps = self.storage_for_closure(ce).roots.clone();
+        {
             let ct = self.b.ty(ExprId(ce));
+            let TyKind::Closure(_, _, ca) = self.kind(ct) else { panic!("closure type") };
+
+            let env = if self.u.tcx.tys.to_opt_closure_kind(ca.kind_ty()) == Some(relax_types::upvar::ClosureKind::FnOnce) {
+                let (regs, by_ptr) = self.abi_param(ct);
+                if by_ptr { regs[0] } else { self.place_addr(&Place::Regs(regs), ct) }
+            } else {
+                let env = self.f.vreg(Cls::I);
+                self.f.params.push(env);
+                env
+            };
             let up = match self.kind(ct) {
-                TyKind::Closure(_, _, _, up, _) => up,
+                TyKind::Closure(..) => ct,
                 _ => self.u.tcx.tys.unit,
             };
-            let ul = self.layout(up);
-            let once = self.closure_once(ce);
+            let ul = self.u.closure_storage_layout(up);
+            let once = self.u.tcx.tys.to_opt_closure_kind(ca.kind_ty()) == Some(relax_types::upvar::ClosureKind::FnOnce);
             for (i, li) in caps.iter().enumerate() {
                 let off = ul.fields.get(i).copied().unwrap_or(0) as i32;
-                if once && self.capture_by_value(ce, i, *li) {
+                if self.storage_for_closure(ce).drop_flags && self.capture_by_value(ce, i, *li) {
                     if let Some(&foff) = ul.fields.get(caps.len() + i) {
                         self.capture_flag.insert(*li, (env, foff as i32));
                     }
@@ -1656,20 +1691,20 @@ impl<'a> Lcx<'a> {
                         let z = self.iconst(0);
                         self.emit(Inst::Store(Mem::Int(1, false), fenv, foff, z));
                         self.capture_flag.remove(li);
-                        self.foreign[*li as usize] = false;
-                        self.own_local(*li);
-                        // a precise capture owns only its fields: the others are not this
-                        // body's to drop
-                        if let Some(fs) = self.capture_fields(ce, i) {
-                            let lt = self.b.locals[*li as usize].ty;
-                            let n = match self.kind(lt) {
-                                TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |a| a.variants.first().map_or(0, |v| v.fields.len())),
-                                _ => 0,
-                            };
-                            for j in 0..n as u32 {
-                                if !fs.contains(&j) {
-                                    self.moved_field(*li, &[(0, j)]);
-                                }
+                    }
+                    self.foreign[*li as usize] = false;
+                    self.own_local(*li);
+                    // a precise capture owns only its fields: the others are not this
+                    // body's to drop
+                    if let Some(fs) = self.capture_fields(ce, i) {
+                        let lt = self.b.locals[*li as usize].ty;
+                        let n = match self.kind(lt) {
+                            TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |a| a.variants.first().map_or(0, |v| v.fields.len())),
+                            _ => 0,
+                        };
+                        for j in 0..n as u32 {
+                            if !fs.contains(&j) {
+                                self.moved_field(*li, &[(0, j)]);
                             }
                         }
                     }
@@ -1707,7 +1742,7 @@ impl<'a> Lcx<'a> {
     fn coroutine_ty(&mut self, ce: u32) -> TyId {
         if ce & crate::tcx::ASYNC_FN_BODY != 0 {
             let r = self.b.ret;
-            crate::typeck::reveal(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.u.prog, &self.u.tcx, r)
+            self.u.tcx.try_normalize_after_erasing_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), r).expect("codegen normalization")
         } else {
             self.b.ty(ExprId(ce))
         }
@@ -1725,10 +1760,10 @@ impl<'a> Lcx<'a> {
     /// drop flags set, the frame word 0 (not started); in memory.
     fn build_coroutine(&mut self, ce: u32, t: TyId) -> Val {
         let up = match self.kind(t) {
-            TyKind::Closure(_, _, _, up, _) => up,
+            TyKind::Closure(..) => t,
             _ => return self.unit(),
         };
-        let caps = self.b.closure_locals.get(&ce).cloned().unwrap_or_default();
+        let caps = self.storage_for_closure(ce).roots.clone();
         let mut vals = Vec::new();
         for (i, li) in caps.iter().enumerate() {
             let lt = self.b.locals[*li as usize].ty;
@@ -1743,7 +1778,7 @@ impl<'a> Lcx<'a> {
                 vals.push((Val::L(vec![a]), pt));
             }
         }
-        if self.closure_once(ce) {
+        if self.storage_for_closure(ce).drop_flags {
             let u8_ = self.u.tcx.tys.prim(Prim::U8);
             for _ in 0..caps.len() {
                 let one = self.iconst(1);
@@ -1751,14 +1786,11 @@ impl<'a> Lcx<'a> {
             }
         }
         let z = self.iconst(0);
-        let tag_t = match self.kind(up) {
-            TyKind::Tuple(v) => v.last().copied().unwrap_or(self.u.tcx.tys.usize_),
-            _ => self.u.tcx.tys.usize_,
-        };
+        let tag_t = *self.u.closure_storage(up).fields.last().unwrap();
         vals.push((Val::L(vec![z]), tag_t));
         let v = self.build_record(up, 0, vals);
         let slot = self.new_slot_for(t);
-        self.store_val(slot, 0, up, v);
+        self.store_val_with_layout(slot, 0, &self.u.closure_storage_layout(up), v);
         Val::M(slot, 0)
     }
 
@@ -1777,7 +1809,7 @@ impl<'a> Lcx<'a> {
         };
         let ct = self.coroutine_ty(ce);
         let (sig, up) = match self.kind(ct) {
-            TyKind::Closure(_, _, sig, up, _) => (sig, up),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => (sig, ct),
             _ => {
                 self.err(self.pos, "coroutine type not found".to_string());
                 self.term(Term::Unreachable);
@@ -1811,18 +1843,13 @@ impl<'a> Lcx<'a> {
         self.f.params.push(env);
         let cx = self.f.vreg(Cls::I);
         self.f.params.push(cx);
-        let ul = self.layout(up);
-        let caps = self.b.closure_locals.get(&ce).cloned().unwrap_or_default();
-        let nfields = match self.kind(up) {
-            TyKind::Tuple(v) => v.len(),
-            _ => 0,
-        };
-        let frame_off = ul.fields.get(nfields.saturating_sub(1)).copied().unwrap_or(0) as i32;
-        let tag = match self.kind(up) {
-            TyKind::Tuple(v) if !v.is_empty() => Mem::Int(self.layout(v[v.len() - 1]).size as u8, false),
-            _ => Mem::Int(8, false),
-        };
-        let once = self.closure_once(ce);
+        let ul = self.u.closure_storage_layout(up);
+        let caps = self.storage_for_closure(ce).roots.clone();
+        let storage = self.u.closure_storage(up);
+        let nfields = storage.fields.len();
+        let frame_off = ul.fields[nfields - 1] as i32;
+        let tag = Mem::Int(self.layout(storage.fields[nfields - 1]).size as u8, false);
+        let once = self.storage_for_closure(ce).drop_flags;
         for (i, li) in caps.iter().enumerate() {
             let off = ul.fields.get(i).copied().unwrap_or(0) as i32;
             if once && self.capture_by_value(ce, i, *li) {
@@ -1941,9 +1968,9 @@ impl<'a> Lcx<'a> {
             let at = u.tcx.trait_assoc(&u.prog, td, sym_t);
             let ft = match at {
                 Some(ad) => {
-                    let p = u.tcx.tys.intern(TyKind::Assoc(ad, vec![xt], crate::types::RegionArgsId::EMPTY));
-                    let n = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), p);
-                    crate::typeck::reveal(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, n)
+                    let p = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![xt], regions: crate::types::RegionArgsId::EMPTY }));
+                    let n = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), p);
+                    u.tcx.try_normalize_after_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), n).expect("codegen normalization")
                 }
                 None => xt,
             };
@@ -1951,9 +1978,9 @@ impl<'a> Lcx<'a> {
         };
         let fut = match itf {
             Some(m) => {
-                let (d, a) = self.resolve_trait_method(m, &[xt]);
-                let id = self.u.fn_id(FnKey::Inst(d, a));
-                self.emit_call(Callee::Fn(id), vec![(v, xt)], fut_t)
+                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m, &[xt]);
+
+                self.emit_instance(instance, vec![(v, xt)], fut_t)
             }
             None => v,
         };
@@ -1982,15 +2009,15 @@ impl<'a> Lcx<'a> {
             Some(p) => p,
             None => return self.unit(),
         };
-        let (pd, pa) = self.resolve_trait_method(poll, &[fut_t]);
-        let pid = self.u.fn_id(FnKey::Inst(pd, pa));
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), poll, &[fut_t]);
+
         let out_poll = self.poll_of(t);
         let head = self.f.block();
         self.goto(head);
         self.switch(head);
         let usize_ = self.u.tcx.tys.usize_;
         let scratch0 = self.f.slots.len() as u32;
-        let r = self.emit_call(Callee::Fn(pid), vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll);
+        let r = self.emit_instance(instance, vec![(Val::L(vec![slot]), usize_), (Val::L(vec![cx]), usize_)], out_poll);
         let rp = self.val_to_place(r);
         let pending = self.f.block();
         let vi_ready = self.variant_index(out_poll, LangItem::PollReady);
@@ -2068,7 +2095,8 @@ impl<'a> Lcx<'a> {
 
     /// C-family pointers use the existing C ABI classifier, including the fixed
     /// parameter count of a variadic call (rustc_ty_utils/src/abi.rs:597).
-    fn fn_ptr_callee(&mut self, f: VReg, ps: &[TyId], ret: TyId, header: crate::types::FnHeader, args: &[(Val, TyId)]) -> Callee {
+    fn fn_ptr_callee(&mut self, f: VReg, ps: &[TyId], ret: TyId, header: crate::types::FnHeader, args: &mut Vec<(Val, TyId)>) -> Callee {
+        if header.abi == crate::types::Abi::RustCall { self.spread_tuple_argument(args); }
         if header.abi.is_c_like() {
             let fixed = if header.c_variadic { Some(ps.len()) } else { None };
             let mut params = Vec::new();
@@ -2077,6 +2105,30 @@ impl<'a> Lcx<'a> {
             Callee::CIndirect(f, Box::new(cs))
         } else {
             Callee::Indirect(f)
+        }
+    }
+
+    /// rustc_ty_utils/src/abi.rs: RustCall spreads the final tuple argument.
+    /// Reconstitute its place for the source body's parameter pattern.
+    fn abi_tuple_param(&mut self, tuple: TyId) -> (Vec<VReg>, bool) {
+        let TyKind::Tuple(inputs) = self.kind(tuple) else { panic!("RustCall final tuple") };
+        let address = self.new_slot_for(tuple);
+        let layout = self.layout(tuple);
+        for (index, ty) in inputs.into_iter().enumerate() {
+            let (regs, indirect) = self.abi_param(ty);
+            let value = if indirect { Val::M(regs[0], 0) } else { Val::L(regs) };
+            self.store_val(address, layout.fields[index] as i32, ty, value);
+        }
+        (vec![address], true)
+    }
+
+    fn spread_tuple_argument(&mut self, values: &mut Vec<(Val, TyId)>) {
+        let (value, tuple) = values.pop().expect("RustCall argument");
+        let TyKind::Tuple(inputs) = self.kind(tuple) else { panic!("RustCall final tuple") };
+        let place = self.val_to_place(value);
+        for i in 0..inputs.len() {
+            let (field, ty) = self.project(&place, tuple, 0, i as u32);
+            values.push((self.read_place(&field, ty), ty));
         }
     }
 
@@ -2092,75 +2144,6 @@ impl<'a> Lcx<'a> {
         self.abi_param(t)
     }
 
-    /// `#[derive(PartialEq)]`'s `eq(&self, other: &Self) -> bool` for ADT `t`.
-    pub fn lower_derived_eq(&mut self, t: TyId) {
-        let bool_t = self.u.tcx.tys.bool_;
-        self.f.rets.push(Cls::I);
-        let a = self.f.vreg(Cls::I);
-        let b = self.f.vreg(Cls::I);
-        self.f.params.push(a);
-        self.f.params.push(b);
-        let fail = self.f.block();
-        let (adt, nv) = match self.kind(t) {
-            TyKind::Adt(d, _, _) => {
-                let adt = self.u.tcx.adts.get(&d);
-                let nv = adt.as_ref().map_or(0, |x| x.variants.len());
-                (adt, nv)
-            }
-            _ => (None, 0),
-        };
-        let adt = match adt {
-            Some(x) => x,
-            None => {
-                let one = self.iconst(1);
-                self.term(Term::Ret(vec![one]));
-                return;
-            }
-        };
-        let pa = Place::Mem(a, 0);
-        let pb = Place::Mem(b, 0);
-        if adt.is_enum && nv > 1 {
-            let l = self.layout(t);
-            let _ = &l;
-            if let (Some(ta), Some(tb)) = (self.load_disc(a, 0, t), self.load_disc(b, 0, t)) {
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmp(Cond::Eq, false, c, ta, tb));
-                let same = self.f.block();
-                self.term(Term::Branch(c, same, fail));
-                self.switch(same);
-                for vi in 0..nv {
-                    let nf = adt.variants[vi].fields.len();
-                    if nf == 0 {
-                        continue;
-                    }
-                    let k = self.iconst(adt.variants[vi].disc as i64);
-                    let is = self.f.vreg(Cls::I);
-                    self.emit(Inst::ICmp(Cond::Eq, false, is, ta, k));
-                    let yes = self.f.block();
-                    let next = self.f.block();
-                    self.term(Term::Branch(is, yes, next));
-                    self.switch(yes);
-                    for fi in 0..nf {
-                        self.derived_field_eq(&pa, &pb, t, vi as u32, fi as u32, fail);
-                    }
-                    let one = self.iconst(1);
-                    self.term(Term::Ret(vec![one]));
-                    self.switch(next);
-                }
-            }
-        } else if nv > 0 {
-            for fi in 0..adt.variants[0].fields.len() {
-                self.derived_field_eq(&pa, &pb, t, 0, fi as u32, fail);
-            }
-        }
-        let one = self.iconst(1);
-        self.term(Term::Ret(vec![one]));
-        self.switch(fail);
-        let zero = self.iconst(0);
-        self.term(Term::Ret(vec![zero]));
-        let _ = bool_t;
-    }
-
     fn is_packed(&self, t: TyId) -> bool {
         match self.kind(t) {
             TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(false, |a| a.repr_packed != 0),
@@ -2168,73 +2151,8 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// Compares field `fi` of variant `vi` of two places; jumps to `fail` when they differ.
-    fn derived_field_eq(&mut self, pa: &Place, pb: &Place, t: TyId, vi: u32, fi: u32, fail: u32) {
-        let (fa, ft) = self.project(pa, t, vi, fi);
-        let (fb, _) = self.project(pb, t, vi, fi);
-        let c = match self.kind(ft) {
-            TyKind::Int(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) => {
-                let x = self.read_place(&fa, ft);
-                let x = self.to_leaves(x, ft);
-                let y = self.read_place(&fb, ft);
-                let y = self.to_leaves(y, ft);
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmp(Cond::Eq, false, c, x[0], y[0]));
-                c
-            }
-            TyKind::Float(_) => {
-                let f64_ = self.is_f64(ft);
-                let x = self.read_place(&fa, ft);
-                let x = self.to_leaves(x, ft);
-                let y = self.read_place(&fb, ft);
-                let y = self.to_leaves(y, ft);
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::FCmp(Cond::Eq, f64_, c, x[0], y[0]));
-                c
-            }
-            TyKind::Tuple(v) if v.is_empty() => return,
-            _ => {
-                // the field's own PartialEq::eq(&a.f, &b.f)
-                let td = match self.u.tcx.lang_items.get(LangItem::PartialEq) {
-                    Some(d) => d,
-                    None => return,
-                };
-                let eq = match self.u.prog.traits[self.u.prog.def(td).sub as usize].iter().copied().find(|it| self.u.prog.name(*it) == "eq") {
-                    Some(m) => m,
-                    None => return,
-                };
-                if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, ft, &[ft]), SelectionResult::NoSolution) {
-                    let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft);
-                    self.derived_error(t, format!("derive(PartialEq): field type `{}` has no PartialEq impl -- derive or impl it", ts));
-                    return;
-                }
-                let (d, args) = self.resolve_trait_method(eq, &[ft, ft]);
-                let id = self.u.fn_id(FnKey::Inst(d, args));
-                let mut xa = self.place_addr(&fa, ft);
-                let mut xb = self.place_addr(&fb, ft);
-                if self.is_packed(t) {
-                    // derives on a packed struct compare copies (`{ self.0 } == { other.0 }`, the
-                    // fields are Copy): a reference to a misaligned field is never made
-                    let fl = self.layout(ft);
-                    let (ca, cb) = (self.new_slot_for(ft), self.new_slot_for(ft));
-                    self.emit(Inst::Copy(ca, xa, fl.size));
-                    self.emit(Inst::Copy(cb, xb, fl.size));
-                    xa = ca;
-                    xb = cb;
-                }
-                let rt = self.u.tcx.tys.intern(TyKind::Ref(false, ft, crate::types::RegionId::ERASED));
-                let bt = self.u.tcx.tys.bool_;
-                let r = self.emit_call(Callee::Fn(id), vec![(Val::L(vec![xa]), rt), (Val::L(vec![xb]), rt)], bt);
-                self.to_leaves(r, bt)[0]
-            }
-        };
-        let ok = self.f.block();
-        self.term(Term::Branch(c, ok, fail));
-        self.switch(ok);
-    }
-
-    /// `#[derive(Clone)]`'s `clone(&self) -> Self` for ADT `t`.
-    pub fn lower_derived_clone(&mut self, t: TyId) {
+    /// rustc_mir_transform/src/shim.rs:539: builtin Clone for tuples and closures.
+    pub fn lower_clone_shim(&mut self, t: TyId) {
         let rl = self.layout(t);
         let ret_regs = match &rl.leaves {
             Some(l) if ret_fits(l) => {
@@ -2258,16 +2176,17 @@ impl<'a> Lcx<'a> {
         // rustc_mir_transform/src/shim.rs:539-553: tuple and closure Clone
         // shims clone each field, including fields which are not Copy.
         let tuple = match self.kind(t) {
-            TyKind::Closure(_, _, _, up, _) => Some(up),
+            TyKind::Closure(..) => Some(t),
             TyKind::Tuple(_) => Some(t),
             _ => None,
         };
         if let Some(up) = tuple {
             let n = match self.kind(up) {
                 TyKind::Tuple(v) => v.len(),
+                TyKind::Closure(..) => self.u.closure_storage(up).fields.len(),
                 _ => 0,
             };
-            let vals = self.derived_clone_fields(&pa, up, 0, n);
+            let vals = self.clone_shim_fields(&pa, up, 0, n);
             let v = if self.layout(t).leaves.is_none() {
                 let s = self.new_slot_for(t);
                 let place = Place::Mem(s, 0);
@@ -2282,142 +2201,19 @@ impl<'a> Lcx<'a> {
             self.ret_val(v, t);
             return;
         }
-        let adt = match self.kind_ref(t) {
-            TyKind::Adt(d, _, _) => self.u.tcx.adts.get(d),
-            _ => None,
-        };
-        let adt = match adt {
-            Some(x) => x,
-            None => {
-                let v = self.read_place(&pa, t);
-                self.ret_val(v, t);
-                return;
-            }
-        };
-        // a Copy type's derived Clone is `*self` only when the type has no generic TYPE
-        // parameters (rustc_builtin_macros deriving/clone.rs `is_simple`: derive(Copy) and no
-        // type params; const params allowed); a generic one clones field by field for every
-        // instantiation (Option<(u8, Vec<u32>)> is not Copy, and the Copy impl's `T: Copy`
-        // bound is not checked by impl selection, so a bitwise copy shared the Vec)
-        let has_type_args = match self.kind(t) {
-            TyKind::Adt(_, args, _) => args.iter().any(|a| !matches!(self.kind_ref(*a), TyKind::ConstVal(_))),
-            _ => false,
-        };
-        let is_copy = !has_type_args
-            && match self.u.tcx.lang_items.get(LangItem::Copy) {
-                Some(td) => matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, t, &[]), SelectionResult::Ok(_)),
-                None => false,
-            };
-        if is_copy {
-            let v = self.read_place(&pa, t);
-            self.ret_val(v, t);
-            return;
-        }
-        let nv = adt.variants.len();
-        let l = self.layout(t);
-        let _ = &l;
-        let disc = if adt.is_enum && nv > 1 { self.load_disc(a, 0, t) } else { None };
-        // a result returned in memory is built in place: tag and field clones go straight into
-        // the caller's result (a field returned in memory gets its own address as result), so a
-        // deep derived-Clone recursion keeps no per-variant or per-field copies in its frames
-        // (rustc builds the value in the return place too). A clone that panics part-way leaves
-        // the fields already cloned unreleased (leaked, never dropped twice).
-        let in_place = self.sret;
-        match disc {
-            Some(tg) => {
-                for vi in 0..nv {
-                    let k = self.iconst(adt.variants[vi].disc as i64);
-                    let is = self.f.vreg(Cls::I);
-                    self.emit(Inst::ICmp(Cond::Eq, false, is, tg, k));
-                    let yes = self.f.block();
-                    let next = self.f.block();
-                    self.term(Term::Branch(is, yes, next));
-                    self.switch(yes);
-                    let nf = adt.variants[vi].fields.len();
-                    if let Some(out) = in_place {
-                        self.store_disc(out, 0, t, vi as u32);
-                        self.derived_clone_into(&pa, out, t, vi as u32, nf);
-                        self.term(Term::Ret(Vec::new()));
-                    } else {
-                        let vals = self.derived_clone_fields(&pa, t, vi as u32, nf);
-                        let v = self.build_enum(t, vi as u32, vals);
-                        self.ret_val(v, t);
-                    }
-                    self.switch(next);
-                }
-                self.term(Term::Unreachable);
-            }
-            _ => {
-                let n = adt.variants.first().map_or(0, |v| v.fields.len());
-                if let Some(out) = in_place {
-                    if adt.is_enum {
-                        self.store_disc(out, 0, t, 0);
-                    }
-                    self.derived_clone_into(&pa, out, t, 0, n);
-                    self.term(Term::Ret(Vec::new()));
-                    return;
-                }
-                let vals = self.derived_clone_fields(&pa, t, 0, n);
-                // a single-variant enum still has its enum layout (a fieldless one is its tag)
-                let v = if adt.is_enum { self.build_enum(t, 0, vals) } else { self.build_record(t, 0, vals) };
-                self.ret_val(v, t);
-            }
-        }
+        let v = self.read_place(&pa, t);
+        self.ret_val(v, t);
     }
 
-    /// The fields of variant `vi` of `*pa` cloned into the same fields at `out` (derived Clone
-    /// building its memory result in place).
-    fn derived_clone_into(&mut self, pa: &Place, out: VReg, t: TyId, vi: u32, n: usize) {
-        // the result place is the caller's: a live-editable struct's ext word starts empty (M10)
-        self.zero_ext(out, 0, t);
-        let dst = Place::Mem(out, 0);
-        for fi in 0..n {
-            let (fa, ft) = self.project(pa, t, vi, fi as u32);
-            let (fd, _) = self.project(&dst, t, vi, fi as u32);
-            let mem_result = self.layout(ft).leaves.is_none() || !self.layout(ft).leaves.as_ref().is_some_and(|l| ret_fits(l));
-            let callee = match self.kind(ft) {
-                TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(false, _, _) => None,
-                _ => {
-                    let td = self.u.tcx.lang_items.get(LangItem::Clone);
-                    let m = self.u.tcx.lang_items.get(LangItem::CloneFn);
-                    match (td, m) {
-                        (Some(td), Some(m)) if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, ft, &[]), SelectionResult::Ok(_)) => {
-                            let (d, args) = self.resolve_trait_method(m, &[ft]);
-                            Some(self.u.fn_id(FnKey::Inst(d, args)))
-                        }
-                        _ => {
-                            let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft);
-                            self.derived_error(t, format!("derive(Clone): field type `{}` has no Clone impl -- derive or impl it", ts));
-                            continue;
-                        }
-                    }
-                }
-            };
-            match callee {
-                None => {
-                    let v = self.read_place(&fa, ft);
-                    self.write_place(&fd, ft, v);
-                }
-                Some(id) if mem_result => {
-                    // the field's address is the clone's result place (`clone(&self) -> Self`)
-                    let xa = self.place_addr(&fa, ft);
-                    let da = self.place_addr(&fd, ft);
-                    crate::boundary::note_call(self.u, self.b.def, &self.b.args, id);
-                    self.emit(Inst::Call(Callee::Fn(id), vec![da, xa], Vec::new()));
-                }
-                Some(id) => {
-                    let xa = self.place_addr(&fa, ft);
-                    let rt = self.u.tcx.tys.intern(TyKind::Ref(false, ft, crate::types::RegionId::ERASED));
-                    let v = self.emit_call(Callee::Fn(id), vec![(Val::L(vec![xa]), rt)], ft);
-                    self.write_place(&fd, ft, v);
-                }
-            }
-        }
-    }
-
-    fn derived_clone_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
+    fn clone_shim_fields(&mut self, pa: &Place, t: TyId, vi: u32, n: usize) -> Vec<(Val, TyId)> {
+        // rustc_mir_transform/src/shim.rs:662-702: only initialized clones
+        // participate in the unwind chain, in reverse initialization order.
         let mut vals = Vec::new();
+        let mut initialized = Vec::new();
+        let saved_pad = self.pad_fixed;
         for fi in 0..n {
+            let pad = self.pad_for(&initialized);
+            self.pad_fixed = Some(Some(pad));
             let (fa, ft) = self.project(pa, t, vi, fi as u32);
             let v = match self.kind(ft) {
                 TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::Ref(false, _, _) => self.read_place(&fa, ft),
@@ -2425,23 +2221,30 @@ impl<'a> Lcx<'a> {
                     let td = self.u.tcx.lang_items.get(LangItem::Clone);
                     let m = self.u.tcx.lang_items.get(LangItem::CloneFn);
                     match (td, m) {
-                        (Some(td), Some(m)) if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, ft, &[]), SelectionResult::Ok(_)) => {
-                            let (d, args) = self.resolve_trait_method(m, &[ft]);
-                            let id = self.u.fn_id(FnKey::Inst(d, args));
+                        (Some(td), Some(m)) if self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(ft)] }).must_apply_modulo_regions() => {
+                            let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m, &[ft]);
+
                             let xa = self.place_addr(&fa, ft);
                             let rt = self.u.tcx.tys.intern(TyKind::Ref(false, ft, crate::types::RegionId::ERASED));
-                            self.emit_call(Callee::Fn(id), vec![(Val::L(vec![xa]), rt)], ft)
+                            self.emit_instance(instance, vec![(Val::L(vec![xa]), rt)], ft)
                         }
                         _ => {
                             let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft);
-                            self.derived_error(t, format!("derive(Clone): field type `{}` has no Clone impl -- derive or impl it", ts));
+                            self.err(self.pos, format!("Clone shim: field type `{}` has no Clone impl", ts));
                             self.dummy_val(ft)
                         }
                     }
                 }
             };
+            let v = if self.u.needs_drop_glue(ft) {
+                let addr = self.new_slot_for(ft);
+                self.write_place(&Place::Mem(addr, 0), ft, v);
+                initialized.insert(0, DropAct::Temp(addr, ft, None));
+                self.read_place(&Place::Mem(addr, 0), ft)
+            } else { v };
             vals.push((v, ft));
         }
+        self.pad_fixed = saved_pad;
         vals
     }
 
@@ -2884,7 +2687,7 @@ impl<'a> Lcx<'a> {
     /// One deref step of the place `pl: pt` for expression `e`, step `k`: built-in for
     /// references/pointers, a `Deref::deref` (or `deref_mut` in a mutable context) call
     /// for overloaded steps.
-    fn deref_place(&mut self, e: u32, k: u8, pl: Place, pt: TyId) -> (Place, TyId) {
+    fn deref_place(&mut self, e: u32, k: usize, pl: Place, pt: TyId) -> (Place, TyId) {
         if let Some((m, args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
             return self.overloaded_deref(m, args, pl, pt);
         }
@@ -2906,7 +2709,7 @@ impl<'a> Lcx<'a> {
         let mut mutbl = false;
         if self.want_mut {
             if let Some(td) = self.u.tcx.lang_items.get(LangItem::DerefMut) {
-                if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, pt, &[]), SelectionResult::Ok(_)) {
+                if self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(pt)] }).must_apply_modulo_regions() {
                     for &it in &self.u.prog.traits[self.u.prog.def(td).sub as usize] {
                         if self.u.prog.name(it) == "deref_mut" {
                             def = it;
@@ -2922,18 +2725,18 @@ impl<'a> Lcx<'a> {
             let tsym = u.prog.syms.get("Target").unwrap_or(u32::MAX);
             match u.tcx.trait_assoc(&u.prog, td, tsym) {
                 Some(ad) => {
-                    let proj = u.tcx.tys.intern(TyKind::Assoc(ad, vec![pt], crate::types::RegionArgsId::EMPTY));
-                    u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), proj)
+                    let proj = u.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![pt], regions: crate::types::RegionArgsId::EMPTY }));
+                    u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), proj)
                 }
                 None => u.tcx.tys.error,
             }
         };
-        let (d, a) = self.resolve_trait_method(def, &args);
-        let id = self.u.fn_id(FnKey::Inst(d, a));
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), def, &args);
+
         let addr = self.place_addr(&pl, pt);
         let self_t = self.u.tcx.tys.intern(TyKind::Ref(mutbl, pt, crate::types::RegionId::ERASED));
         let ret_t = self.u.tcx.tys.intern(TyKind::Ref(mutbl, target, crate::types::RegionId::ERASED));
-        let r = self.emit_call(Callee::Fn(id), vec![(Val::L(vec![addr]), self_t)], ret_t);
+        let r = self.emit_instance(instance, vec![(Val::L(vec![addr]), self_t)], ret_t);
         let r = self.to_leaves(r, ret_t);
         if self.unsized_ty(target) {
             (Place::Regs(r), target)
@@ -2948,22 +2751,21 @@ impl<'a> Lcx<'a> {
         let (into, iargs, iter_t) = self.b.for_into[&it.0].clone();
         let head_t = self.b.ty(it);
         let head_v = self.lower_expr(it);
-        let (d, a) = self.resolve_trait_method(into, &iargs);
-        let id = self.u.fn_id(FnKey::Inst(d, a));
-        let iter_v = self.emit_call(Callee::Fn(id), vec![(head_v, head_t)], iter_t);
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), into, &iargs);
+
+        let iter_v = self.emit_instance(instance, vec![(head_v, head_t)], iter_t);
         // the iterator lives in memory for the loop (next takes &mut self)
         let pl = self.val_to_place(iter_v);
         let iter_addr = self.place_addr(&pl, iter_t);
-        let (d, a) = self.resolve_trait_method(next, &nargs);
-        let next_id = self.u.fn_id(FnKey::Inst(d, a));
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), next, &nargs);
+
         let opt_t = {
-            let ret = self.u.tcx.fn_sig(&self.u.prog, d).map(|s| s.ret);
-            match ret {
-                Some(ret) => {
-                    let args2 = self.resolve_trait_method(next, &nargs).1;
-                    let x = self.u.tcx.tys.subst_erasing_regions(ret, &args2);
+            let sig = self.u.tcx.fn_sig(&self.u.prog, next).cloned();
+            match sig {
+                Some(sig) => {
+                    let x = self.u.tcx.tys.subst_erasing_regions(sig.ret, &nargs);
                     let u = self.u;
-                    u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x)
+                    u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x)
                 }
                 None => self.u.tcx.tys.error,
             }
@@ -2988,7 +2790,7 @@ impl<'a> Lcx<'a> {
         self.goto(head);
         self.switch(head);
         let self_t = self.u.tcx.tys.intern(TyKind::Ref(true, iter_t, crate::types::RegionId::ERASED));
-        let r = self.emit_call(Callee::Fn(next_id), vec![(Val::L(vec![iter_addr]), self_t)], opt_t);
+        let r = self.emit_instance(instance, vec![(Val::L(vec![iter_addr]), self_t)], opt_t);
         let rpl = self.val_to_place(r);
         let ra = self.place_addr(&rpl, opt_t);
         let opl = Place::Mem(ra, 0);
@@ -3027,7 +2829,7 @@ impl<'a> Lcx<'a> {
         let mut mutbl = false;
         if self.want_mut {
             if let Some(td) = self.u.tcx.lang_items.get(LangItem::IndexMut) {
-                if matches!(self.u.tcx.select_trait(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, args[0], &args[1..]), SelectionResult::Ok(_)) {
+                if self.u.tcx.type_implements_trait(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), TraitRef { def_id: td, args: self.u.tcx.complete_args(&self.u.prog, td, &args, relax_types::types::RegionArgsId::EMPTY) }).must_apply_modulo_regions() {
                     for &it in &self.u.prog.traits[self.u.prog.def(td).sub as usize] {
                         if self.u.prog.name(it) == "index_mut" {
                             def = it;
@@ -3037,8 +2839,8 @@ impl<'a> Lcx<'a> {
                 }
             }
         }
-        let (d, a) = self.resolve_trait_method(def, &args);
-        let id = self.u.fn_id(FnKey::Inst(d, a));
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), def, &args);
+
         let saved = self.want_mut;
         self.want_mut = false;
         // (an index coerced to the impl's index type -- `S[bar]` with `impl Index<fn()>`,
@@ -3053,13 +2855,17 @@ impl<'a> Lcx<'a> {
         // an array indexed through its slice's impl: `&[T; N]` unsizes to `&[T]`
         let (self_v, self_t) = match (self.kind(pt), self.kind(args[0])) {
             (TyKind::Array(_, n), TyKind::Slice(_)) => {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 let l = self.iconst(n as i64);
                 (Val::L(vec![addr, l]), self.u.tcx.tys.intern(TyKind::Ref(mutbl, args[0], crate::types::RegionId::ERASED)))
             }
+            // rustc_codegen_ssa/src/mir/rvalue.rs: a reference to an unsized
+            // place carries the place's metadata as well as its data address.
+            _ if self.unsized_ty(pt) => (match &pl { Place::Regs(regs) => Val::L(regs.clone()), _ => panic!("unsized index receiver without metadata") }, self.u.tcx.tys.intern(TyKind::Ref(mutbl, pt, crate::types::RegionId::ERASED))),
             _ => (Val::L(vec![addr]), self.u.tcx.tys.intern(TyKind::Ref(mutbl, pt, crate::types::RegionId::ERASED))),
         };
         let ret_t = self.u.tcx.tys.intern(TyKind::Ref(mutbl, t, crate::types::RegionId::ERASED));
-        let r = self.emit_call(Callee::Fn(id), vec![(self_v, self_t), (iv, it)], ret_t);
+        let r = self.emit_instance(instance, vec![(self_v, self_t), (iv, it)], ret_t);
         let r = self.to_leaves(r, ret_t);
         if self.unsized_ty(t) {
             (Place::Regs(r), t)
@@ -3394,6 +3200,7 @@ impl<'a> Lcx<'a> {
         }
         if deeper {
             if let TyKind::Array(el, n) = self.kind(t) {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 // an array some elements were moved out of (`let [a, _] = arr;`): element by
                 // element
                 // rustc elaborate_drops open_drop_for_array: the elements with move paths
@@ -4184,7 +3991,8 @@ impl<'a> Lcx<'a> {
                 }
                 Some(out)
             }
-            TyKind::Array(e, n) if is_prim(&self.kind(e)) && n <= 64 => {
+            TyKind::Array(e, n) if is_prim(&self.kind(e)) && n.try_to_target_usize(&self.u.tcx.tys).is_some_and(|n| n <= 64) => {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 let l = self.layout(e);
                 let stride = crate::layout::round_up(l.size, l.align);
                 let base = self.place_addr(pl, t);
@@ -4329,8 +4137,15 @@ impl<'a> Lcx<'a> {
                 // the type's own Drop first, then the fields (the tail last)
                 if let (Some(dtor), Some(td)) = (self.u.tcx.adt_destructor(d), self.u.tcx.lang_items.get(LangItem::Drop)) {
                     {
-                    let selected = self.u.tcx.select_dispatch(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, t, &[]);
-                    let iargs = selected.args;
+                        let trait_ref = relax_types::next_solver::TraitRef { def_id: td, args: vec![relax_types::consts::GenericArg::Type(t)] };
+                        let selected = self.u.tcx.codegen_select_candidate(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), trait_ref.clone()).unwrap_or_else(|error| panic!("established destructor dispatch failed for {trait_ref:?}: {error:?}"));
+                        let relax_types::next_solver::select::ImplSource::UserDefined { args, .. } = selected else { panic!("destructor without impl") };
+                        let mut iargs = Vec::new();
+                        for arg in args { match arg {
+                            relax_types::consts::GenericArg::Type(t) => iargs.push(t),
+                            relax_types::consts::GenericArg::Const(c) => iargs.push(self.u.tcx.tys.intern(TyKind::Const(c))),
+                            relax_types::consts::GenericArg::Lifetime(_) => {},
+                        } }
                         let id = self.u.fn_id(FnKey::Inst(dtor.did, iargs));
                         // `&mut self` of an unsized type: (data, metadata)
                         self.emit(Inst::Call(Callee::Fn(id), vec![p, len], Vec::new()));
@@ -4447,6 +4262,7 @@ impl<'a> Lcx<'a> {
         let fixed = v.len() - rest.is_some() as usize;
         let (elem, base, len, n) = match self.kind(t) {
             TyKind::Array(e, n) => {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 let a = self.place_addr(place, t);
                 (e, a, None, n)
             }
@@ -4496,7 +4312,7 @@ impl<'a> Lcx<'a> {
         match sp.len {
             None => {
                 let m = sp.n.saturating_sub(sp.fixed as u64);
-                let t = self.u.tcx.tys.intern(TyKind::Array(sp.elem, m));
+                let t = self.u.tcx.tys.intern(TyKind::Array(sp.elem, self.u.tcx.tys.const_usize(m)));
                 (Place::Mem(sp.base, off), t)
             }
             Some(len) => {
@@ -4847,6 +4663,7 @@ impl<'a> Lcx<'a> {
                 }
             }
             TyKind::Array(el, n) => {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 let es = {
                     let l = self.layout(el);
                     crate::layout::round_up(l.size, l.align)
@@ -4877,8 +4694,8 @@ impl<'a> Lcx<'a> {
                         }
                         None => 0,
                     };
-                    let disc = decode_tag_const(raw, &l, &adt);
-                    match adt.variants.iter().position(|v| v.disc == disc) {
+                    let disc = decode_tag_const(self.u, raw, &l, &adt);
+                    match adt.discriminants(&self.u.tcx, &self.u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                         Some(i) => i as u32,
                         None => return,
                     }
@@ -4914,64 +4731,36 @@ impl<'a> Lcx<'a> {
         0
     }
 
-    /// `x?`: continue with the Some/Ok payload, return None / Err(From::from(e)) otherwise.
+    /// rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764.
     fn lower_try(&mut self, e: ExprId, x: ExprId, t: TyId) -> Val {
         let xt = self.b.ty(x);
-        let is_result = matches!(self.kind_ref(xt), TyKind::Adt(d, _, _) if self.u.prog.name(*d) == "Result");
         let v = self.lower_expr(x);
+        let (branch, args, flow) = self.b.try_branch[&e.0].clone();
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog);
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env.clone(), branch, &args);
+        let v = self.emit_instance(instance, vec![(v, xt)], flow);
         let place = match v {
             Val::M(b, o) => Place::Mem(b, o),
             Val::L(r) => {
-                let a = self.new_slot_for(xt);
-                self.store_val(a, 0, xt, Val::L(r));
+                let a = self.new_slot_for(flow);
+                self.store_val(a, 0, flow, Val::L(r));
                 Place::Mem(a, 0)
             }
         };
         let fail = self.f.block();
-        let (ok_item, err_item) = if is_result { (LangItem::ResultOk, LangItem::ResultErr) } else { (LangItem::OptionSome, LangItem::OptionNone) };
-        let vi_ok = self.variant_index(xt, ok_item);
-        self.test_tag(&place, xt, vi_ok, fail);
+        let vi_ok = self.variant_index(flow, LangItem::ControlFlowContinue);
+        self.test_tag(&place, flow, vi_ok, fail);
         let ok_blk = self.cur;
-        // failure path
         self.switch(fail);
-        let rt0 = self.ret_ty;
-        // `Poll<Result<T, F>>`: the Err is built as the inner Result, then Poll::Ready(..)
-        let poll_inner = match self.kind(rt0) {
-            TyKind::Adt(d, a, _) if is_result && self.u.tcx.lang_items.get(LangItem::Poll) == Some(d) && a.first().map_or(false, |x| matches!(self.kind_ref(*x), TyKind::Adt(rd, _, _) if self.u.prog.name(*rd) == "Result")) => Some(a[0]),
-            _ => None,
-        };
-        let rt = poll_inner.unwrap_or(rt0);
-        let vi_ret = self.variant_index(rt, err_item);
-        let r = if is_result {
-            let vi_err = self.variant_index(xt, LangItem::ResultErr);
-            let (ep, et) = self.project(&place, xt, vi_err, 0);
-            let ev = self.read_place(&ep, et);
-            let (ev, et2) = match self.b.try_conv.get(&e.0).cloned().flatten() {
-                Some((fd, args)) => {
-                    let (d, a) = self.resolve_trait_method(fd, &args);
-                    let id = self.u.fn_id(FnKey::Inst(d, a));
-                    let target = args[0];
-                    (self.emit_call(Callee::Fn(id), vec![(ev, et)], target), target)
-                }
-                None => (ev, et),
-            };
-            self.build_enum(rt, vi_ret, vec![(ev, et2)])
-        } else {
-            self.build_enum(rt, vi_ret, Vec::new())
-        };
-        let (r, rt) = match poll_inner {
-            Some(it) => {
-                let vi_ready = self.variant_index(rt0, LangItem::PollReady);
-                (self.build_enum(rt0, vi_ready, vec![(r, it)]), rt0)
-            }
-            None => (r, rt),
-        };
-        // `?`'s early return leaves every enclosing statement: their temporaries are dropped
-        self.ret_val_early(r, rt);
-        // success path
+        let vi_err = self.variant_index(flow, LangItem::ControlFlowBreak);
+        let (ep, et) = self.project(&place, flow, vi_err, 0);
+        let ev = self.read_place(&ep, et);
+        let (fd, args) = self.b.try_from_residual[&e.0].clone();
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env, fd, &args);
+        let r = self.emit_instance(instance, vec![(ev, et)], self.ret_ty);
+        self.ret_val_early(r, self.ret_ty);
         self.switch(ok_blk);
-        let (pp, pt) = self.project(&place, xt, vi_ok, 0);
-        let _ = pt;
+        let (pp, _) = self.project(&place, flow, vi_ok, 0);
         self.read_place(&pp, t)
     }
 
@@ -4997,10 +4786,7 @@ impl<'a> Lcx<'a> {
         if adt.variants.len() <= 1 {
             return;
         }
-        let disc128 = adt.variants[vi as usize].disc;
-        if disc128 > u64::MAX as i128 || disc128 < i64::MIN as i128 {
-            self.err(self.pos, format!("enum discriminant {} needs more than 64 bits, which Relax does not lay out yet", disc128));
-        }
+        let disc128 = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value();
         let disc = disc128 as i64;
         let tag = match place {
             Place::Mem(b, o) => match self.load_disc(*b, *o, t) {
@@ -5008,10 +4794,12 @@ impl<'a> Lcx<'a> {
                 None => return,
             },
             Place::Regs(r) if !r.is_empty() => {
-                // the tag field's leaf, decoded
                 let raw = match (l.tag, &l.leaves) {
-                    (Some((toff, _)), Some(lv)) => r[lv.iter().position(|x| x.off == toff).unwrap_or(0)],
-                    _ => r[0],
+                    (Some((toff, Mem::Int(bytes, _))), Some(lv)) => {
+                        let first = lv.iter().position(|x| x.off == toff).unwrap();
+                        r[first..first + if bytes == 16 { 2 } else { 1 }].to_vec()
+                    }
+                    _ => vec![r[0]],
                 };
                 let adt = match self.kind(t) {
                     TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d),
@@ -5021,7 +4809,7 @@ impl<'a> Lcx<'a> {
                     Some(adt) => {
                         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
                         let cur = self.cur;
-                        emit_decode_tag(&mut self.f, cur, pos, raw, &l, &adt)
+                        emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt)
                     }
                     None => raw,
                 }
@@ -5029,8 +4817,10 @@ impl<'a> Lcx<'a> {
             _ => return,
         };
         let k = self.iconst(disc);
-        let c = self.f.vreg(Cls::I);
-        self.emit(Inst::ICmp(Cond::Eq, true, c, tag, k));
+        let c = if tag.len() == 2 {
+            let hi = self.iconst((disc128 as u128 >> 64) as i64);
+            self.wide_cmp(BinOp::Eq, false, (tag[0], tag[1]), (k, hi))
+        } else { self.icmp(Cond::Eq, true, tag[0], k) };
         let ok = self.f.block();
         self.term(Term::Branch(c, ok, fail));
         self.switch(ok);
@@ -5121,7 +4911,7 @@ impl<'a> Lcx<'a> {
     /// drop glue)?
     fn promotable(&mut self, e: ExprId) -> bool {
         let t = self.b.ty(e);
-        if self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), t) || self.unsized_ty(t) {
+        if self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t) || self.unsized_ty(t) {
             return false;
         }
         let ast = self.ast();
@@ -5133,10 +4923,11 @@ impl<'a> Lcx<'a> {
             ExprKind::Path(_) => match self.b.res.get(&e.0) {
                 // constants, unit constructors, fn items (`&VTable { f: g::<T> }`)
                 Some(Res::Def(d)) => matches!(self.u.prog.def(*d).kind, DefKind::Const | DefKind::AssocConst | DefKind::Variant | DefKind::Struct | DefKind::Fn | DefKind::AssocFn),
-                // A monomorphized const parameter is a literal too. Without this,
+                // rustc_mir_transform/src/promote_consts.rs:379-397: a substituted
+                // const parameter is a constant operand. Without this,
                 // `&VTable { tag: N, .. }` returns a stack temporary unless inlining
                 // happens to keep the borrowed value inside the caller's frame.
-                Some(Res::ConstParam(i)) => self.b.args.get(*i as usize).is_some_and(|a| matches!(self.kind_ref(*a), TyKind::ConstVal(_))),
+                Some(Res::ConstParam(i)) => self.b.args.get(*i as usize).is_some_and(|a| matches!(self.kind(*a), TyKind::Const(c) if matches!(self.u.tcx.tys.const_kind(c), relax_types::consts::ConstKind::Value(_)))),
                 _ => false,
             },
             // braced struct literals of promotable fields (no `..base`)
@@ -5175,7 +4966,7 @@ impl<'a> Lcx<'a> {
         // a value of constants only, borrowed shared and without interior mutability: one
         // read-only allocation per content (rustc interns constant allocations; `&0u8` twice is
         // one address), written at compile time
-        if shared && l.size > 0 && self.cur == blk0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), xt) {
+        if shared && l.size > 0 && self.cur == blk0 && self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
             if let Some(buf) = self.const_bytes(&v, l, blk0, at0) {
                 let addr = self.u.data_dedup(&buf, l.align.max(1) as u64);
                 let addr = self.u.data_sym(addr);
@@ -5412,7 +5203,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Array(elems) => {
                 let elems = ast.list(*elems).to_vec();
                 let (et, m) = match self.kind(t) {
-                    TyKind::Array(e, n) => (e, n as usize),
+                    TyKind::Array(e, n) => (e, n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length") as usize),
                     _ => return,
                 };
                 let stride = {
@@ -5533,7 +5324,7 @@ impl<'a> Lcx<'a> {
             return 0;
         }
         match self.kind(t) {
-            TyKind::Array(_, n) => n,
+            TyKind::Array(_, n) => n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length"),
             TyKind::Ref(_, a, _) | TyKind::Ptr(_, a) => self.array_len_in(a, depth + 1),
             TyKind::Adt(_, xs, _) => xs.iter().map(|x| self.array_len_in(*x, depth + 1)).find(|n| *n != 0).unwrap_or(0),
             _ => 0,
@@ -5543,7 +5334,7 @@ impl<'a> Lcx<'a> {
     /// N of the `[T; N]` -> `[T]` unsizing from pointee `a` to `b` (directly or in a struct tail).
     fn unsize_len(&self, a: TyId, b: TyId) -> u64 {
         match (self.kind(a), self.kind(b)) {
-            (TyKind::Array(_, n), TyKind::Slice(_)) => n,
+            (TyKind::Array(_, n), TyKind::Slice(_)) => n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length"),
             (TyKind::Adt(_, xs, _), TyKind::Adt(_, ys, _)) => {
                 for (x, y) in xs.iter().zip(ys.iter()) {
                     if x != y {
@@ -5571,7 +5362,7 @@ impl<'a> Lcx<'a> {
 
     /// Discriminant of the enum value of type `t` at `base + off` (tag decoded, a single
     /// variant's constant).
-    fn load_disc(&mut self, base: VReg, off: i32, t: TyId) -> Option<VReg> {
+    fn load_disc(&mut self, base: VReg, off: i32, t: TyId) -> Option<Vec<VReg>> {
         self.check_provided_opaque_enum(t, "matched on");
         let l = self.layout(t);
         let adt = match self.kind(t) {
@@ -5583,7 +5374,7 @@ impl<'a> Lcx<'a> {
         }
         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
         let cur = self.cur;
-        Some(emit_load_disc(&mut self.f, cur, pos, base, off, &l, &adt))
+        Some(emit_load_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt))
     }
 
     /// Writes variant `vi`'s discriminant of an enum of type `t` at `base + off`.
@@ -5599,7 +5390,7 @@ impl<'a> Lcx<'a> {
         };
         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
         let cur = self.cur;
-        emit_store_disc(&mut self.f, cur, pos, base, off, &l, &adt, vi);
+        emit_store_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt, vi);
     }
 
     fn lower_expr_coerced(&mut self, e: ExprId, target: TyId) -> Val {
@@ -5679,27 +5470,7 @@ impl<'a> Lcx<'a> {
                     self.err(self.pos, "internal: trait object upcast of a value without a vtable -- Relax bug, report it".to_string());
                     return self.unit();
                 }
-                let (s_tr, s_args, d_tr, d_args) = match (self.kind(sd), self.kind(dd)) {
-                    (TyKind::Dyn(a, aa, _, _, _, _, _), TyKind::Dyn(b, ba, _, _, _, _, _)) => (a, aa, b, ba),
-                    _ => return Val::L(p),
-                };
-                // Removing auto traits preserves the principal and its vtable.
-                // rustc_codegen_ssa/src/base.rs:112-122.
-                if s_tr == d_tr && s_args == d_args { return Val::L(p); }
-                let fns = |u: &Unit, t: DefId| {
-                    matches!(u.tcx.lang_items.by_def.get(&t), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce))
-                };
-                if fns(self.u, s_tr) && fns(self.u, d_tr) {
-                    // the Fn family shares the call entry
-                    return Val::L(p);
-                }
-                let slot = match self.u.upcast_slot(s_tr, &s_args, d_tr, &d_args) {
-                    Some(k) => k,
-                    None => {
-                        self.err(self.pos, "trait object upcast to a trait that is not a supertrait -- Relax bug, report it".to_string());
-                        return self.unit();
-                    }
-                };
+                let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return Val::L(p) };
                 let vt = self.f.vreg(Cls::I);
                 self.emit(Inst::Load(Mem::Int(8, false), vt, p[1], (slot * 8) as i32));
                 let _ = target;
@@ -5737,7 +5508,6 @@ impl<'a> Lcx<'a> {
                 let t = self.b.ty(e);
                 if let TyKind::FnDef(d, args, _) = self.kind(t) {
                     // `<T as Trait>::method` as a value: the impl's method (or the default body)
-                    let (d, args) = self.resolve_trait_method(d, &args);
                     let r = self.fn_item_addr(d, args);
                     return Val::L(vec![r]);
                 }
@@ -5745,7 +5515,9 @@ impl<'a> Lcx<'a> {
             }
             Some(Coerce::UnsafeFn) => v,
             Some(Coerce::ClosureFn) => {
-                let id = self.closure_fn(e);
+                // rustc_codegen_ssa/src/mir/rvalue.rs:536-550.
+                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, self.b.ty(e), relax_types::upvar::ClosureKind::FnOnce);
+                let id = self.u.instance_fn_id(instance);
                 let r = self.f.vreg(Cls::I);
                 self.emit(Inst::FnAddr(r, id));
                 Val::L(vec![r])
@@ -5769,7 +5541,7 @@ impl<'a> Lcx<'a> {
     /// The function of a closure type (lowered from its owner's body).
     fn closure_fn_of(&mut self, t: TyId) -> u32 {
         let (file, ce, owner) = match self.kind(t) {
-            TyKind::Closure(file, ce, _, _, owner) => (file, ce, owner),
+            TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) => (file, ce, owner),
             _ => return 0,
         };
         let parent = match self.kind(owner) {
@@ -5803,7 +5575,7 @@ impl<'a> Lcx<'a> {
     fn lower_expr_inner(&mut self, e: ExprId, t: TyId) -> Val {
         let ast = self.ast();
         let ex = ast.expr(e);
-        // 128-bit integers are memory-only so far: no arithmetic on them
+        // Two-word integer operations need both halves of every operand.
         let wide = match &ex.kind {
             ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.b.ty(*a)) || self.is_wide(self.b.ty(*b)),
             ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.b.ty(*x)) || self.is_wide(t),
@@ -5826,7 +5598,13 @@ impl<'a> Lcx<'a> {
                 Some(Res::Def(d)) => self.lower_def_value(e, d, t),
                 // a const generic param's value in this instance
                 Some(Res::ConstParam(i)) => match self.b.args.get(i as usize).map(|a| self.kind(*a)) {
-                    Some(TyKind::ConstVal(v)) => Val::L(vec![self.iconst(v as i64)]),
+                    Some(TyKind::Const(v)) => {
+                        // Scalar constants retain their declared width (bool and
+                        // char arguments are not target-usize array lengths).
+                        let value = v.try_to_value(&self.u.tcx.tys).expect("normalized const argument");
+                        let scalar = value.valtree.try_to_leaf().expect("scalar const argument");
+                        Val::L(vec![self.iconst(scalar.to_bits(scalar.size()) as i64)])
+                    }
                     _ => {
                         self.err(self.pos, "internal: const generic param without a value in this instance".to_string());
                         self.dummy_val(t)
@@ -5839,9 +5617,9 @@ impl<'a> Lcx<'a> {
                 let m = self.b.binops[&e.0].clone();
                 let xt = self.b.ty(*x);
                 let v = self.lower_expr(*x);
-                let (d, args) = self.resolve_trait_method(m.def, &m.args);
-                let id = self.u.fn_id(FnKey::Inst(d, args));
-                self.emit_call(Callee::Fn(id), vec![(v, xt)], t)
+                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
+
+                self.emit_instance(instance, vec![(v, xt)], t)
             }
             ExprKind::Unary(op, x) => {
                 let xt = self.b.ty(*x);
@@ -5897,6 +5675,11 @@ impl<'a> Lcx<'a> {
                             _ => {
                                 let it = self.int_ty(t);
                                 let d = self.f.vreg(Cls::I);
+                                if self.overflow_checks && it.signed && !self.negated_literal(*x) {
+                                    let min = self.iconst(extend_const(1i64 << (it.bits - 1), it));
+                                    let overflow = self.icmp(Cond::Eq, false, v[0], min);
+                                    self.overflow_assert(overflow, "attempt to negate with overflow");
+                                }
                                 self.emit(Inst::INeg(it, d, v[0]));
                                 Val::L(vec![d])
                             }
@@ -5930,9 +5713,9 @@ impl<'a> Lcx<'a> {
                     // the right operand coerced to the impl's Rhs (`s + &string`)
                     let bt = m.args.get(1).copied().unwrap_or(bt);
                     let bv = self.lower_expr_coerced(*b, bt);
-                    let (d, args) = self.resolve_trait_method(m.def, &m.args);
-                    let id = self.u.fn_id(FnKey::Inst(d, args));
-                    return self.emit_call(Callee::Fn(id), vec![(av, at), (bv, bt)], t);
+                    let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
+
+                    return self.emit_instance(instance, vec![(av, at), (bv, bt)], t);
                 }
                 self.lower_binary(*op, *a, *b, t)
             }
@@ -5962,39 +5745,21 @@ impl<'a> Lcx<'a> {
                 let bt = self.b.ty(*b);
                 let bt = m.args.get(1).copied().unwrap_or(bt);
                 let bv = self.lower_expr_coerced(*b, bt);
-                let (d, args) = self.resolve_trait_method(m.def, &m.args);
-                let id = self.u.fn_id(FnKey::Inst(d, args));
+                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
+
                 let rt = self.u.tcx.tys.intern(TyKind::Ref(true, pt, crate::types::RegionId::ERASED));
-                self.emit_call(Callee::Fn(id), vec![(Val::L(vec![addr]), rt), (bv, bt)], t);
+                self.emit_instance(instance, vec![(Val::L(vec![addr]), rt), (bv, bt)], t);
                 self.unit()
             }
             ExprKind::AssignOp(op, a, b) => {
                 // primitive `place op= v`: v first, then the place (rustc: right-to-left for
                 // built-in compound assignment; the overloaded form above is left-to-right).
-                // In a generic fn whose generic body sees an overloaded operator here (the
-                // operand's type is a param), rustc keeps the call's left-to-right order in
-                // every instance; only observable when an operand has effects
-                let lhs_first = !self.b.args.is_empty() && !(self.pure_expr(*a) && self.pure_expr(*b)) && self.u.assignop_overloaded_generically(self.b.def, e.0);
-                let early = if lhs_first {
-                    self.want_mut = true;
-                    let x = self.lower_place(*a);
-                    self.want_mut = false;
-                    Some(x)
-                } else {
-                    None
-                };
                 let bt = self.b.ty(*b);
                 let rv = self.lower_expr(*b);
                 let (rv, bt) = self.prim_leaves(rv, bt);
-                let (pl, pt) = match early {
-                    Some(x) => x,
-                    None => {
-                        self.want_mut = true;
-                        let x = self.lower_place(*a);
-                        self.want_mut = false;
-                        x
-                    }
-                };
+                self.want_mut = true;
+                let (pl, pt) = self.lower_place(*a);
+                self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
                 let cur = self.to_leaves(cur, pt);
                 let r = self.arith(*op, pt, cur[0], rv[0], bt);
@@ -6030,7 +5795,14 @@ impl<'a> Lcx<'a> {
                 }
                 self.lower_block(*b)
             }
-            ExprKind::Unsafe(b) | ExprKind::ConstBlock(b) => self.lower_block(*b),
+            ExprKind::Unsafe(b) => self.lower_block(*b),
+            ExprKind::ConstBlock(b) => {
+                let previous = self.overflow_checks;
+                self.overflow_checks = true;
+                let value = self.lower_block(*b);
+                self.overflow_checks = previous;
+                value
+            },
             ExprKind::If(c, then, els) => self.lower_if(*c, *then, *els, t),
             ExprKind::Let(p, x) => {
                 // only reached as a bare condition (`if let` handles its own); evaluate as a test
@@ -6097,7 +5869,7 @@ impl<'a> Lcx<'a> {
                 let res = self.result_place(t);
                 self.goto(head);
                 self.switch(head);
-                
+
                 let l = label.map(|x| self.lifetime_sym(x));
                 self.loops.push(LoopCx { label: l, brk: exit, cont: head, result: Some((res.clone(), t)), scope_depth: self.scopes.len(), temps_depth: self.stmt_temps.len() });
                 self.lower_block_tscope(*b);
@@ -6204,7 +5976,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Repeat(x, _) => {
                 let (et, n) = match self.kind(t) {
-                    TyKind::Array(e, n) => (e, n),
+                    TyKind::Array(e, n) => (e, n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length")),
                     _ => (self.u.tcx.tys.error, 0),
                 };
                 let el = self.layout(et);
@@ -6339,12 +6111,12 @@ impl<'a> Lcx<'a> {
                 // the closure value is its captured state; its code is a function of its own
                 let is_move = *is_move;
                 self.closure_fn(e);
-                let caps = self.b.closure_locals.get(&e.0).cloned().unwrap_or_default();
+                let caps = self.storage_for_closure(e.0).roots.clone();
                 if caps.is_empty() {
                     return self.unit();
                 }
                 let up = match self.kind(t) {
-                    TyKind::Closure(_, _, _, up, _) => up,
+                    TyKind::Closure(..) => t,
                     _ => return self.unit(),
                 };
                 let mut vals = Vec::new();
@@ -6375,7 +6147,7 @@ impl<'a> Lcx<'a> {
                 }
                 // FnOnce closures: every capture starts owned (drop flags = 1), and the state
                 // lives in memory (the closure type has no register leaves)
-                if self.closure_once(e.0) {
+                if self.storage_for_closure(e.0).drop_flags {
                     let u8_ = self.u.tcx.tys.prim(Prim::U8);
                     let n = vals.len();
                     for _ in 0..n {
@@ -6384,7 +6156,7 @@ impl<'a> Lcx<'a> {
                     }
                     let v = self.build_record(up, 0, vals);
                     let slot = self.new_slot_for(t);
-                    self.store_val(slot, 0, up, v);
+                    self.store_val_with_layout(slot, 0, &self.u.closure_storage_layout(up), v);
                     return Val::M(slot, 0);
                 }
                 self.build_record(up, 0, vals)
@@ -6408,7 +6180,7 @@ impl<'a> Lcx<'a> {
             if let Some(a) = self.u.tcx.adts.get(&d) {
                 let mut v = Vec::new();
                 for i in 0..a.variants[0].fields.len() {
-                    v.push(self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, i as u32, &args));
+                    v.push(self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, i as u32, &args));
                 }
                 return v;
             }
@@ -6462,7 +6234,8 @@ impl<'a> Lcx<'a> {
 
     /// Builds a struct/tuple value from field values (registers when it fits).
     fn build_record(&mut self, t: TyId, vi: u32, vals: Vec<(Val, TyId)>) -> Val {
-        let l = self.layout(t);
+        let storage = matches!(self.kind(t), TyKind::Closure(..));
+        let l = if storage { self.u.closure_storage_layout(t) } else { self.layout(t).clone() };
         match l.leaves {
             Some(ref leaves) => {
                 let mut out = Vec::with_capacity(leaves.len());
@@ -6473,8 +6246,16 @@ impl<'a> Lcx<'a> {
                 Val::L(out)
             }
             None => {
-                let a = self.new_slot_for(t);
-                self.zero_ext(a, 0, t);
+                let a = if storage {
+                    let slot = self.f.slot(l.size, l.align);
+                    let address = self.f.vreg(Cls::I);
+                    self.emit(Inst::SlotAddr(address, slot));
+                    address
+                } else {
+                    let a = self.new_slot_for(t);
+                    self.zero_ext(a, 0, t);
+                    a
+                };
                 let place = Place::Mem(a, 0);
                 for (i, (v, _)) in vals.into_iter().enumerate() {
                     let (fp, ft) = self.project(&place, t, vi, i as u32);
@@ -6505,13 +6286,13 @@ impl<'a> Lcx<'a> {
                     }
                 }
                 _ if self.is_wide(t) => {
-                    let v = crate::consteval::parse_int_lit(&text).unwrap_or(0);
+                    let v = crate::const_fold::parse_int_lit(&text).unwrap_or(0);
                     let lo = self.iconst(v as u64 as i64);
                     let hi = self.iconst((v >> 64) as u64 as i64);
                     Val::L(vec![lo, hi])
                 }
                 _ => {
-                    let v = crate::consteval::parse_int_lit(&text).unwrap_or(0) as i64;
+                    let v = crate::const_fold::parse_int_lit(&text).unwrap_or(0) as i64;
                     let it = self.int_ty(t);
                     let v = extend_const(v, it);
                     Val::L(vec![self.iconst(v)])
@@ -6567,7 +6348,7 @@ impl<'a> Lcx<'a> {
                 if !self.u.provided.is_empty() {
                     self.check_provided_static(d, t);
                 }
-                let addr = self.u.static_addr_shared(d);
+                let addr = self.static_addr(d);
                 let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
                 let p = self.f.vreg(Cls::I);
                 self.emit(Inst::Addr(p, addr));
@@ -6599,6 +6380,16 @@ impl<'a> Lcx<'a> {
             // fn items are zero-sized values; calls resolve them directly
             _ => self.unit(),
         }
+    }
+
+    /// Static `d`'s storage. Its initializer failed (address 0, reported as its own error):
+    /// this build fails too, as for a constant, rather than running code through a null address.
+    fn static_addr(&mut self, d: DefId) -> u64 {
+        let addr = self.u.static_addr_shared(d);
+        if addr == 0 {
+            self.err(self.pos, format!("could not evaluate static {} -- see its own error", self.u.prog.def_path(d)));
+        }
+        addr
     }
 
     fn const_val(&mut self, d: DefId, args: Vec<TyId>, t: TyId) -> Val {
@@ -6671,10 +6462,7 @@ impl<'a> Lcx<'a> {
             return self.build_record(t, 0, vals);
         }
         let l = self.layout(t);
-        let disc128 = adt.variants[vi as usize].disc;
-        if disc128 > u64::MAX as i128 || disc128 < i64::MIN as i128 {
-            self.err(self.pos, format!("enum discriminant {} needs more than 64 bits, which Relax does not lay out yet", disc128));
-        }
+        let disc128 = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value();
         let disc = disc128 as i64;
         if l.tag == Some((0, l.leaves.as_ref().and_then(|v| v.first()).map_or(Mem::Int(0, false), |x| x.mem))) && l.enc == crate::layout::TagEnc::Direct && l.leaves.as_ref().map_or(false, |v| v.len() == 1) {
             // fieldless enum: the tag itself
@@ -6853,7 +6641,7 @@ impl<'a> Lcx<'a> {
                     if !self.u.provided.is_empty() {
                         self.check_provided_static(d, t);
                     }
-                    let addr = self.u.static_addr_shared(d);
+                    let addr = self.static_addr(d);
                     let addr = self.u.syms.intern(crate::syms::SymKind::Static(d), addr);
                     let p = self.f.vreg(Cls::I);
                     self.emit(Inst::Addr(p, addr));
@@ -6938,6 +6726,7 @@ impl<'a> Lcx<'a> {
                 let iv = self.to_leaves(iv, it);
                 let (elem, base, len) = match self.kind(pt) {
                     TyKind::Array(el, n) => {
+                        let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                         let a = self.place_addr(&pl, pt);
                         let l = self.iconst(n as i64);
                         (el, a, l)
@@ -7040,6 +6829,7 @@ impl<'a> Lcx<'a> {
         let _ = at;
         let (elem_size, base, len) = match self.kind(pt) {
             TyKind::Array(el, n) => {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 let l = self.layout(el);
                 let a = self.place_addr(&pl, pt);
                 (crate::layout::round_up(l.size, l.align), a, self.iconst(n as i64))
@@ -7121,7 +6911,7 @@ impl<'a> Lcx<'a> {
             && !matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..))
             && !match self.kind(t) {
                 TyKind::Tuple(v) => v.iter().all(|e| prim(&self.kind(*e))),
-                TyKind::Array(e, n) => prim(&self.kind(e)) && n <= 64,
+                TyKind::Array(e, n) => prim(&self.kind(e)) && n.try_to_target_usize(&self.u.tcx.tys).is_some_and(|n| n <= 64),
                 _ => false,
             }
     }
@@ -7134,11 +6924,10 @@ impl<'a> Lcx<'a> {
         let ra = self.ref_to_place(&pa, ta);
         let (pb, tb) = self.lower_place(b);
         let rb = self.ref_to_place(&pb, tb);
-        let (d, args) = self.resolve_trait_method(method, args);
-        let id = self.u.fn_id(FnKey::Inst(d, args));
+        let instance = self.resolve_instance(method, args);
         let rta = self.u.tcx.tys.intern(TyKind::Ref(false, at, crate::types::RegionId::ERASED));
         let rtb = self.u.tcx.tys.intern(TyKind::Ref(false, bt, crate::types::RegionId::ERASED));
-        self.emit_call(Callee::Fn(id), vec![(Val::L(ra), rta), (Val::L(rb), rtb)], t)
+        self.emit_instance(instance, vec![(Val::L(ra), rta), (Val::L(rb), rtb)], t)
     }
 
     fn lower_binary(&mut self, op: BinOp, a: ExprId, b: ExprId, t: TyId) -> Val {
@@ -7327,13 +7116,8 @@ impl<'a> Lcx<'a> {
                 return r;
             }
         }
-        let tc = self.u.tcx.fn_sig(&self.u.prog, d).map_or(false, |s| s.track_caller);
-        let id = if tc {
-            let ft = self.u.tcx.tys.intern(TyKind::FnDef(d, args, crate::types::RegionArgsId::EMPTY));
-            self.u.fn_id(FnKey::Glue(crate::jit::GLUE_TRACK_SHIM, ft))
-        } else {
-            self.u.fn_id(FnKey::Inst(d, args))
-        };
+        let instance = Instance::resolve_for_fn_ptr(&self.u.tcx, &self.u.prog, d, &args).expect("fn pointer instance");
+        let id = self.u.instance_fn_id(instance);
         self.emit(Inst::FnAddr(r, id));
         r
     }
@@ -7440,6 +7224,60 @@ impl<'a> Lcx<'a> {
         let h0 = self.ibin(IOp::Add, false, p11, p01h);
         let h1 = self.ibin(IOp::Add, false, h0, p10h);
         self.ibin(IOp::Add, false, h1, midh)
+    }
+
+    // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:457-541; round-30 RIR design.
+    fn checked_wide_arith(&mut self, op: BinOp, ty: TyId, a: (VReg, VReg), b: (VReg, VReg)) -> Option<(VReg, VReg)> {
+        let signed = self.wide_signed(ty);
+        if self.overflow_checks && matches!(op, BinOp::Shl | BinOp::Shr) {
+            self.shift_check(op, 128, (b.0, Some(b.1)));
+        }
+        let result = self.wide_arith(op, signed, a, b)?;
+        if self.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+            let overflow = if op == BinOp::Mul {
+                self.wide_mul_overflow(signed, a, b, result)
+            } else if signed {
+                self.signed_overflow(op, a.1, b.1, result.1)
+            } else if op == BinOp::Add {
+                self.wide_cmp(BinOp::Lt, false, result, a)
+            } else {
+                self.wide_cmp(BinOp::Lt, false, a, b)
+            };
+            self.overflow_assert(overflow, arithmetic_overflow_message(op));
+        }
+        Some(result)
+    }
+
+    fn wide_mul_overflow(&mut self, signed: bool, a: (VReg, VReg), b: (VReg, VReg), result: (VReg, VReg)) -> VReg {
+        // Widen the product to four u64 limbs, then compare its upper half with
+        // the result's sign extension (zero extension for unsigned multiplication).
+        let p00h = self.ibin(IOp::MulHi, false, a.0, b.0);
+        let p01l = self.ibin(IOp::Mul, false, a.0, b.1);
+        let p01h = self.ibin(IOp::MulHi, false, a.0, b.1);
+        let p10l = self.ibin(IOp::Mul, false, a.1, b.0);
+        let p10h = self.ibin(IOp::MulHi, false, a.1, b.0);
+        let p11l = self.ibin(IOp::Mul, false, a.1, b.1);
+        let p11h = self.ibin(IOp::MulHi, false, a.1, b.1);
+        let mid = self.ibin(IOp::Add, false, p00h, p01l);
+        let c1 = self.icmp(Cond::Lt, false, mid, p00h);
+        let mid2 = self.ibin(IOp::Add, false, mid, p10l);
+        let c2 = self.icmp(Cond::Lt, false, mid2, mid);
+        let zero = self.iconst(0);
+        let mut high = (p11l, p11h);
+        for limb in [p01h, p10h, c1, c2] {
+            high = self.wide_arith(BinOp::Add, false, high, (limb, zero)).unwrap();
+        }
+        let expected = if signed {
+            let shift = self.iconst(63);
+            let sa = self.ibin(IOp::Shr, true, a.1, shift);
+            let sb = self.ibin(IOp::Shr, true, b.1, shift);
+            let ac = (self.ibin(IOp::And, false, a.0, sb), self.ibin(IOp::And, false, a.1, sb));
+            let bc = (self.ibin(IOp::And, false, b.0, sa), self.ibin(IOp::And, false, b.1, sa));
+            high = self.wide_arith(BinOp::Sub, false, high, ac).unwrap();
+            high = self.wide_arith(BinOp::Sub, false, high, bc).unwrap();
+            self.ibin(IOp::Shr, true, result.1, shift)
+        } else { zero };
+        self.wide_cmp(BinOp::Ne, false, high, (expected, expected))
     }
 
     /// Arithmetic / bit ops on (lo, hi) pairs.
@@ -7643,7 +7481,11 @@ impl<'a> Lcx<'a> {
                 let x = self.wide_parts(av, at);
                 let bv = self.lower_expr(*b);
                 let y = self.wide_parts(bv, bt);
-                match self.wide_arith(*op, self.wide_signed(t), x, y) {
+                if !self.is_wide(t) && matches!(op, BinOp::Shl | BinOp::Shr) {
+                    if self.overflow_checks { self.shift_check(*op, self.int_ty(t).bits as u32, (y.0, Some(y.1))); }
+                    return Val::L(vec![self.arith(*op, t, x.0, y.0, bt)]);
+                }
+                match self.checked_wide_arith(*op, t, x, y) {
                     Some((lo, hi)) => Val::L(vec![lo, hi]),
                     None => {
                         self.err(ex.lo, "128-bit division/remainder is not supported yet -- divide u64 halves".to_string());
@@ -7661,7 +7503,13 @@ impl<'a> Lcx<'a> {
                 self.want_mut = false;
                 let cur = self.read_place(&pl, pt);
                 let x = self.wide_parts(cur, pt);
-                match self.wide_arith(*op, self.wide_signed(pt), x, y) {
+                if !self.is_wide(pt) && matches!(op, BinOp::Shl | BinOp::Shr) {
+                    if self.overflow_checks { self.shift_check(*op, self.int_ty(pt).bits as u32, (y.0, Some(y.1))); }
+                    let value = self.arith(*op, pt, x.0, y.0, bt);
+                    self.write_place(&pl, pt, Val::L(vec![value]));
+                    return self.unit();
+                }
+                match self.checked_wide_arith(*op, pt, x, y) {
                     Some((lo, hi)) => self.write_place(&pl, pt, Val::L(vec![lo, hi])),
                     None => self.err(ex.lo, "128-bit division/remainder is not supported yet -- divide u64 halves".to_string()),
                 }
@@ -7672,6 +7520,11 @@ impl<'a> Lcx<'a> {
                 let v = self.lower_expr(*x);
                 let p = self.wide_parts(v, xt);
                 let z = (self.iconst(0), self.iconst(0));
+                if self.overflow_checks && self.wide_signed(t) && !self.negated_literal(*x) {
+                    let min = (self.iconst(0), self.iconst(i64::MIN));
+                    let overflow = self.wide_cmp(BinOp::Eq, false, p, min);
+                    self.overflow_assert(overflow, "attempt to negate with overflow");
+                }
                 let (lo, hi) = self.wide_arith(BinOp::Sub, true, z, p).unwrap();
                 Val::L(vec![lo, hi])
             }
@@ -7685,6 +7538,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Cast(x, _) => {
                 let xt = self.b.ty(*x);
                 let v = self.lower_expr(*x);
+                if matches!(self.kind(xt), TyKind::Adt(..)) { return self.cast(v, xt, t); }
                 match (self.is_wide(xt), self.kind(t)) {
                     (true, TyKind::Int(_)) if !self.is_wide(t) => {
                         let p = self.wide_parts(v, xt);
@@ -7886,10 +7740,10 @@ impl<'a> Lcx<'a> {
                     _ => IOp::Add,
                 };
                 if iop == IOp::Div || iop == IOp::Rem {
-                    self.div_check(b, it, a);
+                    self.div_check(b, it, a, op == BinOp::Rem);
                 }
                 let b = if iop == IOp::Shl || iop == IOp::Shr {
-                    // release semantics: shift amount masked to the bit width
+                    if self.overflow_checks { self.shift_check(op, it.bits as u32, (b, None)); }
                     let _ = bt;
                     let m = self.iconst(it.bits as i64 - 1);
                     let mb = self.f.vreg(Cls::I);
@@ -7899,12 +7753,76 @@ impl<'a> Lcx<'a> {
                     b
                 };
                 self.emit(Inst::IBin(iop, it, d, a, b));
+                if self.overflow_checks && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                    let overflow = if op == BinOp::Mul {
+                        if it.bits < 64 {
+                            let full = self.ibin(IOp::Mul, it.signed, a, b);
+                            self.icmp(Cond::Ne, false, full, d)
+                        } else {
+                            let high = self.ibin(IOp::MulHi, it.signed, a, b);
+                            let expected = if it.signed {
+                                let shift = self.iconst(63);
+                                self.ibin(IOp::Shr, true, d, shift)
+                            } else { self.iconst(0) };
+                            self.icmp(Cond::Ne, false, high, expected)
+                        }
+                    } else if it.signed {
+                        self.signed_overflow(op, a, b, d)
+                    } else if op == BinOp::Add {
+                        self.icmp(Cond::Lt, false, d, a)
+                    } else {
+                        self.icmp(Cond::Lt, false, a, b)
+                    };
+                    self.overflow_assert(overflow, arithmetic_overflow_message(op));
+                }
                 d
             }
         }
     }
 
-    fn div_check(&mut self, b: VReg, it: IntTy, a: VReg) {
+    // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:103-123,457-541.
+    // Round-30 design: checked arithmetic's flag is computed with existing RIR ops.
+    // N:rustc_mir_build/src/thir/cx/expr.rs:676-683 lowers -literal as a literal.
+    fn negated_literal(&self, mut expr: ExprId) -> bool {
+        loop {
+            match self.ast().expr(expr).kind {
+                ExprKind::Paren(inner) => expr = inner,
+                ExprKind::Lit(LitKind::Int) => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    fn overflow_assert(&mut self, overflow: VReg, message: &str) {
+        let bad = self.f.block();
+        let ok = self.f.block();
+        self.term(Term::Branch(overflow, bad, ok));
+        self.switch(bad);
+        self.panic_here(message);
+        self.switch(ok);
+    }
+
+    fn signed_overflow(&mut self, op: BinOp, a: VReg, b: VReg, result: VReg) -> VReg {
+        let lhs = self.ibin(IOp::Xor, false, a, result);
+        let rhs = self.ibin(IOp::Xor, false, if op == BinOp::Add { b } else { a },
+            if op == BinOp::Add { result } else { b });
+        let signs = self.ibin(IOp::And, false, lhs, rhs);
+        let zero = self.iconst(0);
+        self.icmp(Cond::Lt, true, signs, zero)
+    }
+
+    fn shift_check(&mut self, op: BinOp, bits: u32, rhs: (VReg, Option<VReg>)) {
+        let width = self.iconst(bits as i64);
+        let mut overflow = self.icmp(Cond::Ge, false, rhs.0, width);
+        if let Some(high) = rhs.1 {
+            let zero = self.iconst(0);
+            let high = self.icmp(Cond::Ne, false, high, zero);
+            overflow = self.ibin(IOp::Or, false, overflow, high);
+        }
+        self.overflow_assert(overflow, arithmetic_overflow_message(op));
+    }
+
+    fn div_check(&mut self, b: VReg, it: IntTy, a: VReg, rem: bool) {
         let z = self.iconst(0);
         let c = self.f.vreg(Cls::I);
         self.emit(Inst::ICmp(Cond::Ne, false, c, b, z));
@@ -7912,7 +7830,7 @@ impl<'a> Lcx<'a> {
         let bad = self.f.block();
         self.term(Term::Branch(c, ok, bad));
         self.switch(bad);
-        let site = self.u.site_sym(self.b.file, self.pos, "attempt to divide by zero");
+        let site = self.u.site_sym(self.b.file, self.pos, if rem { "attempt to calculate the remainder with a divisor of zero" } else { "attempt to divide by zero" });
         let s = self.sym_val(site);
         let rt = self.u.rs.panic_site;
         self.emit(Inst::Call(Callee::Host(rt), vec![s], Vec::new()));
@@ -7932,7 +7850,7 @@ impl<'a> Lcx<'a> {
             let bad2 = self.f.block();
             self.term(Term::Branch(both, bad2, ok2));
             self.switch(bad2);
-            let site = self.u.site_sym(self.b.file, self.pos, "attempt to divide with overflow");
+            let site = self.u.site_sym(self.b.file, self.pos, if rem { "attempt to calculate the remainder with overflow" } else { "attempt to divide with overflow" });
             let s = self.sym_val(site);
             let rt = self.u.rs.panic_site;
             self.emit(Inst::Call(Callee::Host(rt), vec![s], Vec::new()));
@@ -7948,7 +7866,10 @@ impl<'a> Lcx<'a> {
         // non-capturing closure (both zero-sized): the function's address
         let reify = match &fk {
             TyKind::FnDef(d, args, _) if matches!(tk, TyKind::FnPtr(..) | TyKind::Int(_) | TyKind::Ptr(..)) => Some(Ok((*d, args.clone()))),
-            TyKind::Closure(..) if matches!(tk, TyKind::FnPtr(..)) => Some(Err(self.closure_fn_of(from))),
+            TyKind::Closure(..) if matches!(tk, TyKind::FnPtr(..)) => {
+                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, from, relax_types::upvar::ClosureKind::FnOnce);
+                Some(Err(self.u.instance_fn_id(instance)))
+            },
             _ => None,
         };
         if let Some(fa) = reify {
@@ -7968,38 +7889,23 @@ impl<'a> Lcx<'a> {
             }
             return Val::L(vec![r]);
         }
-        // a fieldless enum: its discriminant (a single-variant one has no tag: the constant; a
-        // padded one, `#[repr(align(8))]`, lives in memory: its tag is read there)
         if let TyKind::Adt(d, _, _) = fk {
-            let l = self.layout(from);
-            let in_mem = l.tag.is_some() && l.leaves.as_ref().map_or(true, |lv| lv.len() != 1);
-            if in_mem && self.u.tcx.adts.get(&d).map_or(false, |a| a.is_enum) {
+            if self.u.tcx.adts.get(&d).is_some_and(|a| a.is_enum) {
                 let place = self.val_to_place(v);
-                let a = self.place_addr(&place, from);
-                if let Some(disc) = self.load_disc(a, 0, from) {
-                    if let TyKind::Int(_) = tk {
-                        let it = self.int_ty(to);
-                        let r = self.f.vreg(Cls::I);
-                        self.emit(Inst::Conv(Conv::IntToInt(it), r, disc));
-                        return Val::L(vec![r]);
+                let addr = self.place_addr(&place, from);
+                let Some(mut words) = self.load_disc(addr, 0, from) else { return self.unit(); };
+                let repr = self.u.tcx.adts[&d].repr_int.unwrap_or(Prim::Isize);
+                let signed = crate::types::Types::int_info(repr).1;
+                if self.is_wide(to) {
+                    if words.len() == 1 {
+                        let hi = if signed { { let shift = self.iconst(63); self.ibin(IOp::Shr, true, words[0], shift) } } else { self.iconst(0) };
+                        words.push(hi);
                     }
-                    return Val::L(vec![disc]);
+                    return Val::L(words);
                 }
-                return self.unit();
-            }
-            if let crate::layout::TagEnc::Single(vi) = l.enc {
-                if let Some(adt) = self.u.tcx.adts.get(&d) {
-                    if adt.is_enum {
-                        let k = self.iconst(variant_disc(&adt, vi));
-                        let it = match tk {
-                            TyKind::Int(_) => self.int_ty(to),
-                            _ => return Val::L(vec![k]),
-                        };
-                        let r = self.f.vreg(Cls::I);
-                        self.emit(Inst::Conv(Conv::IntToInt(it), r, k));
-                        return Val::L(vec![r]);
-                    }
-                }
+                let result = self.f.vreg(Cls::I);
+                self.emit(Inst::Conv(Conv::IntToInt(self.int_ty(to)), result, words[0]));
+                return Val::L(vec![result]);
             }
         }
         let v = self.to_leaves(v, from);
@@ -8305,18 +8211,16 @@ impl<'a> Lcx<'a> {
 
     /// Whether capture `i` (local `li`) of closure `ce` is by value (typeck's decision).
     /// The fields a precise by-value capture owns (None: the whole local).
-    fn capture_fields(&self, ce: u32, i: usize) -> Option<Vec<u32>> {
-        self.b.capture_fields.get(&ce).and_then(|v| v.get(i).cloned()).flatten()
+    fn storage_for_closure(&self, ce: u32) -> &crate::layout::ClosureStorage {
+        &self.closure_storage[&ce]
     }
 
-    /// Whether closure `ce` of this body (its owner instance's) is FnOnce (tcx.closure_once).
-    fn closure_once(&self, ce: u32) -> bool {
-        let owner = self.u.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), crate::types::RegionArgsId::EMPTY));
-        self.u.tcx.closure_once.contains(&(self.b.file, ce, owner))
+    fn capture_fields(&self, ce: u32, i: usize) -> Option<Vec<u32>> {
+        self.storage_for_closure(ce).owned_fields.get(i).cloned().flatten()
     }
 
     fn capture_by_value(&self, ce: u32, i: usize, _li: u32) -> bool {
-        self.b.capture_by_value.get(&ce).and_then(|v| v.get(i).copied()).unwrap_or(false)
+        self.storage_for_closure(ce).by_value.get(i).copied().unwrap_or(false)
     }
 
     /// The field path of a scrutinee in its owner (for partial moves by its patterns).
@@ -8462,17 +8366,6 @@ impl<'a> Lcx<'a> {
             acc = nxt;
         }
         Some(acc)
-    }
-
-    /// An expression without effects (its evaluation order is unobservable).
-    fn pure_expr(&self, e: ExprId) -> bool {
-        match &self.ast().expr(e).kind {
-            ExprKind::Lit(_) | ExprKind::Path(_) => true,
-            ExprKind::Paren(x) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Cast(x, _) | ExprKind::AddrOf(_, _, x) => self.pure_expr(*x),
-            ExprKind::Unary(_, x) => !self.b.binops.contains_key(&e.0) && self.pure_expr(*x),
-            ExprKind::Binary(op, a, b) => !self.b.binops.contains_key(&e.0) && !self.trait_ordering(*op, self.b.ty(*a)) && self.pure_expr(*a) && self.pure_expr(*b),
-            _ => false,
-        }
     }
 
     fn lower_match(&mut self, x: ExprId, arms: &[Arm], t: TyId) -> Val {
@@ -8658,7 +8551,21 @@ impl<'a> Lcx<'a> {
     }
 
     /// Emits a call with Relax's ABI. Returns the result value.
-    fn emit_call(&mut self, callee: Callee, args: Vec<(Val, TyId)>, ret: TyId) -> Val {
+    fn emit_call(&mut self, callee: Callee, mut args: Vec<(Val, TyId)>, ret: TyId) -> Val {
+        let def = match &callee {
+            Callee::Fn(id) | Callee::CFn(id, _) => {
+                let ahead = crate::jit::lower_ahead_fn_key(*id);
+                match ahead.as_ref().unwrap_or_else(|| &self.u.fns[*id as usize].key) {
+                    FnKey::Inst(d, _) => Some(*d),
+                    FnKey::Shim(shim) => Some(shim.kind.def_id()),
+                    _ => None,
+                }
+            },
+            _ => None,
+        };
+        if def.is_some_and(|d| self.u.tcx.fn_item_sig(&self.u.prog, d).is_some_and(|s| s.header.abi == crate::types::Abi::RustCall)) {
+            self.spread_tuple_argument(&mut args);
+        }
         // C ABI calls: every aggregate goes by pointer to a private copy, an aggregate
         // result through a result slot; the backend does the C placement (CSig)
         let csig = match &callee {
@@ -8763,6 +8670,75 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// rustc_codegen_ssa/src/mir/block.rs: native instance dispatch. Closure
+    /// bodies receive their environment and untupled inputs (abi.rs:61-73).
+    fn emit_instance(&mut self, instance: Instance, mut vals: Vec<(Val, TyId)>, ret: TyId) -> Val {
+        let args = instance.compact_args(&self.u.tcx);
+        match instance.def {
+            InstanceKind::Virtual(d, index) => {
+                let receiver = self.to_leaves(vals[0].0.clone(), vals[0].1);
+                assert_eq!(receiver.len(), 2, "virtual receiver metadata");
+                let ptr = self.f.vreg(Cls::I);
+                self.emit(Inst::Load(Mem::Int(8, false), ptr, receiver[1], (index * 8) as i32));
+                vals[0] = (Val::L(vec![receiver[0]]), self.u.tcx.tys.usize_);
+                self.indirect_tracked = self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.track_caller);
+                if self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.header.abi == crate::types::Abi::RustCall) { self.spread_tuple_argument(&mut vals); }
+                self.emit_call(Callee::Indirect(ptr), vals, ret)
+            }
+            InstanceKind::Intrinsic(d) => self.intrinsic(d, &args, &vals, ret).expect("intrinsic lowering"),
+            InstanceKind::Item(d) if self.u.prog.def(d).kind == DefKind::Closure => {
+                let (file, node) = self.u.prog.def_id_to_node_id[&d];
+                let coroutine = match node {
+                    crate::def_collector::NodeId::AsyncBody(_) => true,
+                    crate::def_collector::NodeId::Closure(expr) => self.u.tcx.coroutines.contains(&(file, expr.0)),
+                    _ => unreachable!(),
+                };
+                // EXCEPTION(M7): Future::poll uses the existing coroutine slot ABI.
+                if coroutine { return self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret); }
+                assert_eq!(vals.len(), 2, "closure call receiver and tuple");
+                let tuple = vals.pop().unwrap();
+                let TyKind::Tuple(inputs) = self.kind(tuple.1) else { panic!("closure input tuple") };
+                let place = self.val_to_place(tuple.0);
+                for i in 0..inputs.len() {
+                    let (field, ty) = self.project(&place, tuple.1, 0, i as u32);
+                    vals.push((self.read_place(&field, ty), ty));
+                }
+                self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret)
+            }
+            InstanceKind::Item(d) => {
+                let sig = self.u.tcx.fn_item_sig(&self.u.prog, d).expect("item signature");
+                let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
+                let mut types = Vec::new();
+                for value in &vals { types.push(value.1); }
+                let callee = if foreign {
+                    let Some(address) = self.u.foreign_sym(d) else {
+                        self.err(self.pos, format!("unknown foreign function `{}` -- link its library (#[link])", self.u.prog.name(d)));
+                        return self.dummy_val(ret);
+                    };
+                    let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
+                    Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed)))
+                } else if sig.header.abi.is_c_like() {
+                    Callee::CFn(self.u.instance_fn_id(instance), Box::new(crate::cabi::c_sig(self.u, &types, ret, None)))
+                } else { Callee::Fn(self.u.instance_fn_id(instance)) };
+                let result = self.emit_call(callee, vals, ret);
+                if foreign && matches!(self.kind(ret), TyKind::Int(_) | TyKind::Bool | TyKind::Char) {
+                    let integer = self.int_ty(ret);
+                    if integer.bits < 64 {
+                        if let Val::L(ref regs) = result {
+                            if regs.len() == 1 {
+                                let extended = self.f.vreg(Cls::I);
+                                self.emit(Inst::Conv(Conv::IntToInt(integer), extended, regs[0]));
+                                return Val::L(vec![extended]);
+                            }
+                        }
+                    }
+                }
+                result
+            }
+            InstanceKind::Shim(_) => self.emit_call(Callee::Fn(self.u.instance_fn_id(instance)), vals, ret),
+        }
+    }
+
     fn lower_call(&mut self, e: ExprId, f: ExprId, args: &[ExprId], t: TyId) -> Val {
         let mut ft = self.b.ty(f);
         // `#[rustc_legacy_const_generics]` arguments are const generic args, not values
@@ -8774,6 +8750,42 @@ impl<'a> Lcx<'a> {
             }
             None => args,
         };
+        // rustc_mir_build/src/thir/cx/expr.rs:349-373: overloaded calls use
+        // the generic body's selected trait, resolved with the instance's args.
+        if let Some(selected) = self.b.call_traits.get(&e.0).copied().filter(|s|
+            matches!(self.u.tcx.lang_items.by_def.get(&s.trait_def), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce | LangItem::AsyncFn | LangItem::AsyncFnMut | LangItem::AsyncFnOnce))) {
+            let tuple = selected.tupled_args;
+            let TyKind::Tuple(params) = self.kind(tuple) else { panic!("call arguments are not a tuple") };
+            let method = self.u.prog.traits[self.u.prog.def(selected.trait_def).sub as usize].iter().copied()
+                .find(|d| self.u.prog.def(*d).kind == DefKind::AssocFn).expect("call trait method");
+            let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), method, &[selected.self_ty, tuple]);
+            {
+                let once = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnOnce | LangItem::AsyncFnOnce));
+                let mutable = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnMut | LangItem::AsyncFnMut));
+                let (recv, recv_ty) = if once && selected.derefs == 0 { (self.lower_expr(f), ft) } else {
+                    let (mut place, mut pt) = self.lower_place(f);
+                    for k in 0..selected.derefs { (place, pt) = self.deref_place(e.0, k, place, pt); }
+                    if once { (self.read_place(&place, pt), pt) } else {
+                        let receiver = if self.unsized_ty(pt) {
+                            match place { Place::Regs(regs) => Val::L(regs), _ => panic!("unsized callable metadata") }
+                        } else { let address = self.place_addr(&place, pt); Val::L(vec![address]) };
+                        (receiver, self.u.tcx.tys.intern(TyKind::Ref(mutable, pt, crate::types::RegionId::ERASED)))
+                    }
+                };
+                let mut guards = Vec::new();
+                let recv = self.guard_operand(args, recv, recv_ty, &mut guards);
+                let tuple_addr = self.new_slot_for(tuple);
+                let layout = self.layout(tuple);
+                for (i, &arg) in args.iter().enumerate() {
+                    let ty = params[i];
+                    let value = self.lower_expr_coerced(arg, ty);
+                    let value = self.guard_operand(&args[i + 1..], value, ty, &mut guards);
+                    self.store_val(tuple_addr, layout.fields[i] as i32, ty, value);
+                }
+                self.unguard(&guards);
+                return self.emit_instance(instance, vec![(recv, recv_ty), (Val::M(tuple_addr, 0), tuple)], t);
+            }
+        }
         // a callable reached as a place (behind references / smart pointers, or a `dyn Fn`
         // place however it was reached: `(*raw_ptr)(..)`, `(*boxed)(..)`) is called through
         // the place (rustc: the overloaded call takes the callee place by reference)
@@ -8792,43 +8804,6 @@ impl<'a> Lcx<'a> {
                 ft = pt;
             } else {
                 return match self.kind(pt) {
-                    TyKind::Closure(..) => {
-                        let env = self.place_addr(&pl, pt);
-                        self.call_closure_at(env, pt, args, t)
-                    }
-                    TyKind::Dyn(_, targs, _, _, _, _, _) => {
-                        let r = match pl {
-                            Place::Regs(r) => r,
-                            _ => return self.unit(),
-                        };
-                        let ps = match targs.first().map(|x| self.kind(*x)) {
-                            Some(TyKind::Tuple(ps)) => ps,
-                            _ => Vec::new(),
-                        };
-                        let fp = self.f.vreg(Cls::I);
-                        self.emit(Inst::Load(Mem::Int(8, false), fp, r[1], (VT_METHODS * 8) as i32));
-                        let mut vals = vec![(Val::L(vec![r[0]]), self.u.tcx.tys.usize_)];
-                        let mut guards = Vec::new();
-                        for (i, a) in args.iter().enumerate() {
-                            let pt = ps.get(i).copied().unwrap_or_else(|| self.b.ty(*a));
-                            let v = self.lower_expr_coerced(*a, pt);
-                            let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
-                            vals.push((v, pt));
-                        }
-                        self.unguard(&guards);
-                        let r = self.emit_call(Callee::Indirect(fp), vals, t);
-                        // `b()` on a `Box<dyn FnOnce>` local consumes the box (rustc: FnOnce for
-                        // Box<F> moves the closure out and frees the box): it is dropped right here
-                        let once = self.u.tcx.lang_items.get(LangItem::FnOnce).map_or(false, |fo| matches!(self.kind_ref(pt), TyKind::Dyn(td, ..) if *td == fo));
-                        if once {
-                            if let ExprKind::Path(_) = &self.ast().expr(strip_paren(self.ast(), f)).kind {
-                                if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), f).0).copied() {
-                                    self.drop_local_if_live(li);
-                                }
-                            }
-                        }
-                        r
-                    }
                     TyKind::FnPtr(ps, _, c, _) => {
                         let fv = self.read_place(&pl, pt);
                         let fv = self.to_leaves(fv, pt);
@@ -8841,7 +8816,7 @@ impl<'a> Lcx<'a> {
                             vals.push((v, p));
                         }
                         self.unguard(&guards);
-                        let callee = self.fn_ptr_callee(fv[0], &ps, t, c, &vals);
+                        let callee = self.fn_ptr_callee(fv[0], &ps, t, c, &mut vals);
                         self.emit_call(callee, vals, t)
                     }
                     _ => {
@@ -8858,8 +8833,8 @@ impl<'a> Lcx<'a> {
                 // the constructor's signature instantiated and normalized like any fn's (rustc
                 // FnSig of a ctor = its field types, normalized at the call): a field declared
                 // through a projection (`struct W<P: Pattern>(P::Searcher)`) is its concrete type
-                let ps: Vec<TyId> = match self.u.tcx.ctor_sigs.get(d0) {
-                    Some(s) => s.params.iter().map(|p| self.u.tcx.normalize_erasing_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), self.u.tcx.tys.subst(*p, &gargs0))).collect(),
+                let ps: Vec<TyId> = match self.u.tcx.ctor_sigs.get(&d0) {
+                    Some(s) => s.params.iter().map(|p| self.u.tcx.normalize_erasing_late_bound_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), self.u.tcx.tys.subst(*p, &gargs0))).collect(),
                     None => Vec::new(),
                 };
                 // (the callee value is zero-sized; an expression producing it still runs)
@@ -8879,18 +8854,18 @@ impl<'a> Lcx<'a> {
                 self.build_enum(t, vi, vals)
             }
             TyKind::FnDef(d0, gargs0, _) => {
-                let (d, gargs) = self.resolve_trait_method(*d0, gargs0);
-                let (params, header) = match self.u.tcx.fn_item_sig(&self.u.prog, d) {
-                    // Only the parameter types and ABI are used below. Keep this small
-                    // snapshot: lowering operands may re-collect a const-blocked signature.
-                    Some(s) => (s.params.clone(), s.header),
+                let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d0, &gargs0);
+                let gargs = gargs0;
+                let sig = self.u.tcx.fn_item_sig(&self.u.prog, *d0).cloned();
+                let sig = match sig {
+                    Some(s) => s,
                     None => return self.unit(),
                 };
                 let mut vals = Vec::new();
                 let mut guards = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let pt = if i < params.len() {
-                        { let x = self.u.tcx.tys.subst_erasing_regions(params[i], &gargs); let u = self.u; u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x) }
+                    let pt = if i < sig.params.len() {
+                        { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i], &gargs); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
                     } else {
                         self.b.ty(*a)
                     };
@@ -8900,83 +8875,9 @@ impl<'a> Lcx<'a> {
                 }
                 // (the operands are consumed by the call below: no exit can drop them again)
                 self.unguard(&guards);
-                // `Trait::m(x)` / `<dyn Trait>::m(x)` with Self = a trait object: a virtual call
-                // (the trait's declaration has no body to call)
-                let is_trait_fn = self.u.prog.def(self.u.prog.def(d).parent).kind == DefKind::Trait;
-                if let (true, Some(&st)) = (is_trait_fn, gargs.first()) {
-                    if let TyKind::Dyn(td, dargs, _, _, _, _, _) = self.kind(st) {
-                        let np = self.u.tcx.fn_sig(&self.u.prog, d).map_or(1, |s| s.n_parent_generics as usize).max(1);
-                        let margs: Vec<TyId> = gargs.get(1..np.min(gargs.len())).map(|x| x.to_vec()).unwrap_or_default();
-                        let idx = match self.u.dyn_method_index(td, &dargs, d, &margs) {
-                            Some(i) => i as u32,
-                            None => {
-                                self.err(self.pos, "method is not in the trait object's vtable".to_string());
-                                return self.dummy_val(t);
-                            }
-                        };
-                        // a `self: Box<Self>` / `Rc<Self>` / `Pin<&mut Self>` receiver is the fat
-                        // pointer too: the callee takes it without the metadata (rustc
-                        // DispatchFromDyn)
-                        if vals.is_empty() {
-                            self.err(self.pos, "internal: trait object call without a receiver -- Relax bug, report it".to_string());
-                            return self.dummy_val(t);
-                        }
-                        let r = self.to_leaves(vals[0].0.clone(), vals[0].1);
-                        if r.len() != 2 {
-                            self.err(self.pos, "internal: trait object receiver is not a fat pointer".to_string());
-                            return self.dummy_val(t);
-                        }
-                        let fp = self.f.vreg(Cls::I);
-                        self.emit(Inst::Load(Mem::Int(8, false), fp, r[1], ((VT_METHODS + idx) * 8) as i32));
-                        vals[0] = (Val::L(vec![r[0]]), self.u.tcx.tys.usize_);
-                        return self.emit_call(Callee::Indirect(fp), vals, t);
-                    }
-                }
-                if let Some(v) = self.intrinsic(d, &gargs, &vals, t) {
-                    return v;
-                }
-                let foreign = self.u.prog.def(d).kind == DefKind::ForeignFn;
-                let mut ptys = Vec::new();
-                for (_, pt) in &vals {
-                    ptys.push(*pt);
-                }
-                let callee = if foreign {
-                    match self.u.foreign_sym(d) {
-                        Some(a) => {
-                            let n_fixed = if header.c_variadic { Some(params.len()) } else { None };
-                            let cs = crate::cabi::c_sig(self.u, &ptys, t, n_fixed);
-                            Callee::CHost(a, Box::new(cs))
-                        }
-                        None => {
-                            let n = self.u.prog.name(d).to_string();
-                            self.err(self.pos, format!("unknown foreign function `{}` -- link its library (#[link])", n));
-                            return self.dummy_val(t);
-                        }
-                    }
-                } else if header.abi.is_c_like() {
-                    let cs = crate::cabi::c_sig(self.u, &ptys, t, None);
-                    Callee::CFn(self.u.fn_id(FnKey::Inst(d, gargs)), Box::new(cs))
-                } else {
-                    Callee::Fn(self.u.fn_id(FnKey::Inst(d, gargs)))
-                };
-                let r = self.emit_call(callee, vals, t);
-                // C returns narrow integers with undefined upper bits: re-extend by type
-                if foreign {
-                    if let TyKind::Int(_) | TyKind::Bool | TyKind::Char = self.kind(t) {
-                        let it = self.int_ty(t);
-                        if it.bits < 64 {
-                            if let Val::L(v) = &r {
-                                if v.len() == 1 {
-                                    let d2 = self.f.vreg(Cls::I);
-                                    self.emit(Inst::Conv(Conv::IntToInt(it), d2, v[0]));
-                                    return Val::L(vec![d2]);
-                                }
-                            }
-                        }
-                    }
-                }
-                r
+                self.emit_instance(instance, vals, t)
             }
+
             TyKind::FnPtr(ps, _, c, _) => {
                 let fv = self.lower_expr(f);
                 let fv = self.to_leaves(fv, ft);
@@ -8989,58 +8890,14 @@ impl<'a> Lcx<'a> {
                     vals.push((v, pt));
                 }
                 self.unguard(&guards);
-                let callee = self.fn_ptr_callee(fv[0], ps, t, *c, &vals);
+                let callee = self.fn_ptr_callee(fv[0], &ps, t, *c, &mut vals);
                 self.emit_call(callee, vals, t)
             }
-            TyKind::Closure(cfile, ce, _, _, owner) => {
-                let (pl, _) = self.lower_place(f);
-                let env = self.place_addr(&pl, ft);
-                let r = self.call_closure_at(env, ft, args, t);
-                // an FnOnce closure is called by value (call_once consumes it): the captures its
-                // body left are dropped at the end of the call, as in rustc
-                if self.u.tcx.closure_once.contains(&(*cfile, *ce, *owner)) {
-                    let fx = strip_paren(self.ast(), f);
-                    if let ExprKind::Path(_) = &self.ast().expr(fx).kind {
-                        if let Some(Res::Local(li)) = self.b.res.get(&fx.0).copied() {
-                            self.drop_local_if_live(li);
-                        }
-                    }
-                }
-                r
-            }
             _ => {
-                self.err(self.pos, "unsupported call".to_string());
+                self.err(self.pos, format!("unsupported call of {} (selected {:?})", crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, ft), self.b.call_traits.get(&e.0).map(|s| s.trait_def)));
                 self.unit()
             }
         }
-    }
-
-    /// Calls the closure whose state is at `env` (closures with captured state take a
-    /// pointer to it as their first argument).
-    fn call_closure_at(&mut self, env: VReg, ct: TyId, args: &[ExprId], t: TyId) -> Val {
-        let id = self.closure_fn_of(ct);
-        let (sig, up) = match self.kind(ct) {
-            TyKind::Closure(_, _, sig, up, _) => (sig, up),
-            _ => return self.unit(),
-        };
-        let ps = match self.kind(sig) {
-            TyKind::FnPtr(ps, _, _, _) => ps,
-            _ => Vec::new(),
-        };
-        let mut vals = Vec::new();
-        if !matches!(self.kind_ref(up), TyKind::Tuple(v) if v.is_empty()) {
-            let pt = self.u.tcx.tys.intern(TyKind::Ptr(true, up));
-            vals.push((Val::L(vec![env]), pt));
-        }
-        let mut guards = Vec::new();
-        for (i, a) in args.iter().enumerate() {
-            let pt = ps.get(i).copied().unwrap_or_else(|| self.b.ty(*a));
-            let v = self.lower_expr_coerced(*a, pt);
-            let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
-            vals.push((v, pt));
-        }
-        self.unguard(&guards);
-        self.emit_call(Callee::Fn(id), vals, t)
     }
 
     /// The position of a method call's name (`f` in `a.f(x)`).
@@ -9052,31 +8909,17 @@ impl<'a> Lcx<'a> {
     }
 
     fn lower_method(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], t: TyId) -> Val {
-        let mut m = match self.b.methods.get(&e.0) {
+        let m = match self.b.methods.get(&e.0) {
             Some(m) => m.clone(),
             None => return self.unit(),
         };
-        // trait object receiver: dispatched through the vtable
-        // virtual only for a trait's method with Self = a trait object: for an inherent method of
-        // a generic impl, args[0] is the impl's first param (`Mutex<dyn Fn()>::lock`)
-        let is_trait_fn = self.u.prog.def(self.u.prog.def(m.def).parent).kind == DefKind::Trait;
-        let virt = match m.args.first().map(|t| self.kind(*t)) {
-            // only the object's own traits (principal + supertraits) are in its vtable; another
-            // trait's method on `dyn Tr` is an impl's (`to_string` through `impl<T: Display +
-            // ?Sized> ToString for T`; rustc object vs impl candidates)
-            Some(TyKind::Dyn(td, dargs, _, _, _, _, _)) if is_trait_fn && self.u.tcx.dyn_implements(self.u.prog.def(m.def).parent, m.args[0]) => Some((td, dargs, m.def, m.args.clone())),
-            _ => None,
-        };
-        if virt.is_none() {
-            let (rd, ra) = self.resolve_trait_method(m.def, &m.args);
-            m.def = rd;
-            m.args = ra;
-        }
-        let params = match self.u.tcx.fn_sig(&self.u.prog, m.def) {
-            Some(s) => s.params.clone(),
+        let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
+        let virt = matches!(instance.def, InstanceKind::Virtual(..));
+        let sig = match self.u.tcx.fn_sig(&self.u.prog, m.def).cloned() {
+            Some(s) => s,
             None => return self.unit(),
         };
-        let self_pt = { let x = self.u.tcx.tys.subst_erasing_regions(params[0], &m.args); let u = self.u; u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x) };
+        let self_pt = { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[0], &m.args); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) };
         // receiver with derefs, then autoref
         let rt = self.b.ty(recv);
         let recv_val = if m.autoref != 0 {
@@ -9105,6 +8948,7 @@ impl<'a> Lcx<'a> {
                     _ => self.unit(),
                 }
             } else if let TyKind::Array(_, n) = self.kind(pt) {
+                let n = n.try_to_target_usize(&self.u.tcx.tys).expect("normalized array length");
                 // array receiver for a slice method: unsize
                 let a = self.place_addr(&pl, pt);
                 let is_slice_self = matches!(self.kind_ref(self_pt), TyKind::Ref(_, x, _) if matches!(self.kind_ref(*x), TyKind::Slice(_)));
@@ -9124,7 +8968,7 @@ impl<'a> Lcx<'a> {
             // (rustc: the receiver type Box<dyn Tr> matches `Box<Self>` at the first step)
             // (the probe also matches it at the pointer step itself, `Box<Box<dyn Tr>>` with
             // derefs = 1 when the receiver is the inner box: then the steps go to the pointer)
-            let ptr_self = virt.is_some() && m.derefs == 1 && matches!(self.kind_ref(self_pt), TyKind::Adt(..)) && rt == self_pt;
+            let ptr_self = virt && m.derefs == 1 && matches!(self.kind(self_pt), TyKind::Adt(..)) && rt == self_pt;
             if m.derefs == 0 || ptr_self {
                 self.lower_expr(recv)
             } else {
@@ -9156,8 +9000,8 @@ impl<'a> Lcx<'a> {
         let recv_val = self.guard_operand(args, recv_val, self_pt, &mut guards);
         let mut vals = vec![(recv_val, self_pt)];
         for (i, a) in args.iter().enumerate() {
-            let pt = if i + 1 < params.len() {
-                { let x = self.u.tcx.tys.subst_erasing_regions(params[i + 1], &m.args); let u = self.u; u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x) }
+            let pt = if i + 1 < sig.params.len() {
+                { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i + 1], &m.args); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
             } else {
                 self.b.ty(*a)
             };
@@ -9166,39 +9010,8 @@ impl<'a> Lcx<'a> {
             vals.push((v, pt));
         }
         self.unguard(&guards);
-        if let Some((td, dargs, md, mfull)) = virt {
-            // the method's trait instance: its args after Self (`<dyn Foo<bool> as Bar<bool>>`)
-            let np = self.u.tcx.fn_sig(&self.u.prog, md).map_or(1, |s| s.n_parent_generics as usize).max(1);
-            let margs: Vec<TyId> = mfull.get(1..np.min(mfull.len())).map(|x| x.to_vec()).unwrap_or_default();
-            let idx = match self.u.dyn_method_index(td, &dargs, md, &margs) {
-                Some(i) => i as u32,
-                None => {
-                    self.err(self.pos, "method is not in the trait object's vtable".to_string());
-                    return self.unit();
-                }
-            };
-            // `self: Box<Self>` etc.: the fat receiver without its metadata (DispatchFromDyn)
-            let r = self.to_leaves(vals[0].0.clone(), vals[0].1);
-            if r.len() != 2 {
-                self.err(self.pos, "internal: trait object receiver is not a fat pointer -- Relax bug, report it".to_string());
-                return self.unit();
-            }
-            let fp = self.f.vreg(Cls::I);
-            self.emit(Inst::Load(Mem::Int(8, false), fp, r[1], ((VT_METHODS + idx) * 8) as i32));
-            vals[0] = (Val::L(vec![r[0]]), self.u.tcx.tys.usize_);
-            // a #[track_caller] trait method: its vtable entry takes the caller location
-            self.indirect_tracked = self.u.tcx.fn_sig(&self.u.prog, md).map_or(false, |s| s.track_caller);
-            self.pos = self.method_name_pos(e);
-            return self.emit_call(Callee::Indirect(fp), vals, t);
-        }
-        if let Some(v) = self.intrinsic(m.def, &m.args, &vals, t) {
-            return v;
-        }
-        // the call's location (a #[track_caller] callee's `Location::caller()`, the call's line
-        // info) is the method name, as rustc's method call span (`a.\n    f()` is at `f`)
         self.pos = self.method_name_pos(e);
-        let id = self.u.fn_id(FnKey::Inst(m.def, m.args.clone()));
-        self.emit_call(Callee::Fn(id), vals, t)
+        self.emit_instance(instance, vals, t)
     }
 
     /// Calls to `extern "relax-intrinsic"` functions in Relax's core become instructions.
@@ -9345,14 +9158,14 @@ impl<'a> Lcx<'a> {
             // `T: Freeze` of this instance (no UnsafeCell inline: std's sort keeps copies)
             "is_freeze" => {
                 let c = match g0 {
-                    Some(g) => self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), g),
+                    Some(g) => self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), g),
                     None => false,
                 };
                 Val::L(vec![self.iconst(c as i64)])
             }
             "needs_drop" => {
                 let nd = match g0 {
-                    Some(g) => self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), g),
+                    Some(g) => self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), g),
                     None => false,
                 };
                 Val::L(vec![self.iconst(nd as i64)])
@@ -9478,7 +9291,7 @@ impl<'a> Lcx<'a> {
                                         if let Some(adt) = self.u.tcx.adts.get(&d) {
                                             let fs = adt.variants[0].fields.clone();
                                             for j in 0..fs.len().saturating_sub(1) {
-                                                let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, j as u32, &args);
+                                                let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, 0, j as u32, &args);
                                                 let sz = self.layout(ft).size;
                                                 m = m.max(l.fields.get(j).copied().unwrap_or(0) + sz);
                                             }
@@ -9717,7 +9530,7 @@ impl<'a> Lcx<'a> {
                 // the tag holds the discriminant itself
                 let _ = &l;
                 match self.load_disc(p[0], 0, g) {
-                    Some(d) if matches!(self.kind_ref(g), TyKind::Adt(..)) => Val::L(vec![d]),
+                    Some(d) if matches!(self.kind(g), TyKind::Adt(..)) => Val::L(d),
                     _ => Val::L(vec![self.iconst(0)]),
                 }
             }
@@ -10578,7 +10391,7 @@ impl<'a> Lcx<'a> {
                                     (self.read_place(&pl, lt), lt)
                                 }
                                 Some(Res::Def(d)) => {
-                                    let ct = self.u.tcx.const_tys.get(&d).copied().unwrap_or(self.u.tcx.tys.error);
+                                    let ct = self.u.tcx.const_tys.get(&d).unwrap_or(self.u.tcx.tys.error);
                                     (self.const_val(d, Vec::new(), ct), ct)
                                 }
                                 _ => continue,
@@ -10747,155 +10560,10 @@ pub fn takes_caller_loc(u: &Unit, id: u32) -> bool {
     let ahead = crate::jit::lower_ahead_fn_key(id);
     match ahead.as_ref().unwrap_or_else(|| &u.fns[id as usize].key) {
         FnKey::Inst(d, _) => u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.track_caller),
+        FnKey::Shim(ShimInstance { kind: ShimKind::ClosureOnce { track_caller, .. }, .. }) => *track_caller,
+        FnKey::Shim(ShimInstance { kind: ShimKind::VTable(d), .. }) => u.tcx.fn_sig(&u.prog, *d).is_some_and(|s| s.track_caller),
         _ => false,
     }
-}
-
-/// A #[track_caller] fn used as a value (fn pointer, vtable entry, `dyn Fn` shim): rustc's
-/// ReifyShim -- the plain signature, passing the fn's own definition site as the location.
-fn track_caller_shim(u: &mut Unit, t: TyId) -> Func {
-    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_TRACK_SHIM, t));
-    let mut f = Func::new(name, 0);
-    let b = f.block();
-    let (d, args) = match u.tcx.tys.kind(t).clone() {
-        TyKind::FnDef(d, a, _) => (d, a),
-        _ => {
-            f.blocks[b as usize].term = Term::Ret(Vec::new());
-            return f;
-        }
-    };
-    let sig = u.tcx.fn_sig(&u.prog, d).cloned();
-    let (ps, ret) = match sig {
-        Some(s) => {
-            let ps: Vec<TyId> = s.params.iter().map(|p| { let x = u.tcx.tys.subst_erasing_regions(*p, &args); u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x) }).collect();
-            let r = u.tcx.tys.subst_erasing_regions(s.ret, &args);
-            (ps, u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), r))
-        }
-        None => (Vec::new(), u.tcx.tys.unit),
-    };
-    let mut fwd = Vec::new();
-    let mut rets = Vec::new();
-    let rl = u.layout_of(ret);
-    match &rl.leaves {
-        Some(l) if ret_fits(l) => {
-            for lf in l {
-                f.rets.push(lf.cls);
-                rets.push(f.vreg(lf.cls));
-            }
-        }
-        _ => {
-            let p = f.vreg(Cls::I);
-            f.params.push(p);
-            fwd.push(p);
-        }
-    }
-    for p in ps {
-        let l = u.layout_of(p);
-        match &l.leaves {
-            Some(leaves) => {
-                for lf in leaves {
-                    let r = f.vreg(lf.cls);
-                    f.params.push(r);
-                    fwd.push(r);
-                }
-            }
-            None => {
-                let r = f.vreg(Cls::I);
-                f.params.push(r);
-                fwd.push(r);
-            }
-        }
-    }
-    let file = u.prog.def(d).file;
-    let lo = u.prog.files[file as usize].ast.item(u.prog.def(d).item).lo;
-    let (l, c) = u.prog.files[file as usize].line_col(lo);
-    let path = u.prog.file_paths[file as usize].clone();
-    let la = location_const(u, &path, l as u32, c as u32);
-    let lr = f.vreg(Cls::I);
-    push(&mut f, b, Inst::Addr(lr, la));
-    fwd.push(lr);
-    let id = u.fn_id(FnKey::Inst(d, args));
-    push(&mut f, b, Inst::Call(Callee::Fn(id), fwd, rets.clone()));
-    f.blocks[b as usize].term = Term::Ret(rets);
-    f
-}
-
-/// A trait method instance whose Self is a trait object of that trait (a static call:
-/// `*a == 3` with a: dyn Foo where Foo: PartialEq<i32>, a generic body instantiated with
-/// T = dyn Tr): rustc's InstanceKind::Virtual -- the vtable entry of the receiver, called with
-/// the same arguments minus the receiver's metadata. None when the method has no vtable slot.
-pub fn virtual_shim(u: &mut Unit, d: DefId, args: &[TyId], name: String) -> Option<Func> {
-    let (td, dargs) = match u.tcx.tys.kind(args[0]).clone() {
-        TyKind::Dyn(td, a, _, _, _, _, _) => (td, a),
-        _ => return None,
-    };
-    let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
-    if s.self_kind == 0 || s.n_generics > s.n_parent_generics {
-        return None;
-    }
-    let np = (s.n_parent_generics as usize).max(1);
-    let margs: Vec<TyId> = args.get(1..np.min(args.len())).map(|x| x.to_vec()).unwrap_or_default();
-    let idx = u.dyn_method_index(td, &dargs, d, &margs)?;
-    let mut f = Func::new(name, 0);
-    let b = f.block();
-    let ps: Vec<TyId> = s.params.iter().map(|p| { let x = u.tcx.tys.subst_erasing_regions(*p, args); u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), x) }).collect();
-    let r = u.tcx.tys.subst_erasing_regions(s.ret, args);
-    let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), r);
-    let mut fwd = Vec::new();
-    let mut rets = Vec::new();
-    let rl = u.layout_of(ret);
-    match &rl.leaves {
-        Some(l) if ret_fits(l) => {
-            for lf in l {
-                f.rets.push(lf.cls);
-                rets.push(f.vreg(lf.cls));
-            }
-        }
-        _ => {
-            let p = f.vreg(Cls::I);
-            f.params.push(p);
-            fwd.push(p);
-        }
-    }
-    let mut vt = None;
-    for (i, p) in ps.into_iter().enumerate() {
-        let l = u.layout_of(p);
-        match &l.leaves {
-            Some(leaves) => {
-                let mut regs = Vec::new();
-                for lf in leaves {
-                    let r = f.vreg(lf.cls);
-                    f.params.push(r);
-                    regs.push(r);
-                }
-                if i == 0 {
-                    // the receiver (&self, &mut self, Box<Self>, ..): a fat pointer whose
-                    // metadata is the vtable; the callee takes the data pointer only
-                    if regs.len() != 2 {
-                        return None;
-                    }
-                    fwd.push(regs[0]);
-                    vt = Some(regs[1]);
-                } else {
-                    fwd.extend(regs);
-                }
-            }
-            None => {
-                if i == 0 {
-                    return None;
-                }
-                let r = f.vreg(Cls::I);
-                f.params.push(r);
-                fwd.push(r);
-            }
-        }
-    }
-    let vt = vt?;
-    let fp = f.vreg(Cls::I);
-    push(&mut f, b, Inst::Load(Mem::Int(8, false), fp, vt, ((VT_METHODS + idx as u32) * 8) as i32));
-    push(&mut f, b, Inst::Call(Callee::Indirect(fp), fwd, rets.clone()));
-    f.blocks[b as usize].term = Term::Ret(rets);
-    Some(f)
 }
 
 /// The body of a provided crate's bound fn (provided.rs): Relax's own ABI on the outside, one
@@ -10906,8 +10574,8 @@ pub fn virtual_shim(u: &mut Unit, d: DefId, args: &[TyId], name: String) -> Opti
 /// `__host_last_panic` and raised here as a Relax panic.
 pub fn bridge_func(u: &Unit, d: DefId, name: String, shim: crate::rir::Sym, last_panic: crate::rir::Sym) -> Option<Func> {
     let s = u.tcx.fn_sig(&u.prog, d).cloned()?;
-    let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), *p)).collect();
-    let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), s.ret);
+    let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *p)).collect();
+    let ret = u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), s.ret);
     Some(bridge_func_sig(u, &ps, ret, name, shim, last_panic))
 }
 
@@ -11041,12 +10709,6 @@ pub fn forward_func(u: &Unit, ps: &[TyId], ret: TyId, name: String, callee: u32)
 }
 
 pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
-    if kind == crate::jit::GLUE_CALL_SHIM {
-        return call_shim(u, t);
-    }
-    if kind == crate::jit::GLUE_TRACK_SHIM {
-        return track_caller_shim(u, t);
-    }
     if kind >= crate::jit::GLUE_CTOR {
         return ctor_fn(u, (kind - crate::jit::GLUE_CTOR) as u32, t);
     }
@@ -11088,91 +10750,6 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
     f
 }
 
-/// `dyn Fn` entry for a stateless callable: `fn([sret,] env, args..)` calling it with the
-/// same arguments (the ABI of the arguments is the same on both sides, so they pass through).
-fn call_shim(u: &mut Unit, t: TyId) -> Func {
-    let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CALL_SHIM, t));
-    let mut f = Func::new(name, 0);
-    let b = f.block();
-    let (callee_sig, target) = match u.tcx.tys.kind(t).clone() {
-        TyKind::Closure(_, _, sig, _, _) => (sig, u.closure_fn_id(t).map(Callee::Fn)),
-        TyKind::FnDef(d, args, _) => {
-            let (d2, a2) = u.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, d, &args).expect_dispatch();
-            let sig = match u.tcx.fn_item_sig(&u.prog, d).cloned() {
-                Some(s) => {
-                    let ps: Vec<TyId> = s.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, &args)).collect();
-                    let r = u.tcx.tys.subst_erasing_regions(s.ret, &args);
-                    let r = crate::typeck::reveal(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, r);
-                    u.tcx.tys.intern(TyKind::FnPtr(ps, r, s.header, 0))
-                }
-                None => u.tcx.tys.error,
-            };
-            // a #[track_caller] fn called through `dyn Fn`: its reify shim
-            let tc = u.tcx.fn_sig(&u.prog, d2).map_or(false, |s| s.track_caller);
-            let id = if tc {
-                let ft = u.tcx.tys.intern(TyKind::FnDef(d2, a2, crate::types::RegionArgsId::EMPTY));
-                u.fn_id(FnKey::Glue(crate::jit::GLUE_TRACK_SHIM, ft))
-            } else {
-                u.fn_id(FnKey::Inst(d2, a2))
-            };
-            (sig, Some(Callee::Fn(id)))
-        }
-        TyKind::FnPtr(..) => (t, None),
-        _ => (u.tcx.tys.error, None),
-    };
-    let (ps, ret) = match u.tcx.tys.kind(callee_sig).clone() {
-        TyKind::FnPtr(ps, r, _, _) => (ps, r),
-        _ => (Vec::new(), u.tcx.tys.unit),
-    };
-    let mut fwd = Vec::new();
-    let mut rets = Vec::new();
-    let rl = u.layout_of(ret);
-    match &rl.leaves {
-        Some(l) if ret_fits(l) => {
-            for lf in l {
-                f.rets.push(lf.cls);
-                rets.push(f.vreg(lf.cls));
-            }
-        }
-        _ => {
-            let p = f.vreg(Cls::I);
-            f.params.push(p);
-            fwd.push(p);
-        }
-    }
-    let env = f.vreg(Cls::I);
-    f.params.push(env);
-    for p in ps {
-        let l = u.layout_of(p);
-        match &l.leaves {
-            Some(leaves) => {
-                for lf in leaves {
-                    let r = f.vreg(lf.cls);
-                    f.params.push(r);
-                    fwd.push(r);
-                }
-            }
-            None => {
-                let r = f.vreg(Cls::I);
-                f.params.push(r);
-                fwd.push(r);
-            }
-        }
-    }
-    let callee = match target {
-        Some(c) => c,
-        None => {
-            // fn pointer: env points at it
-            let fp = f.vreg(Cls::I);
-            push(&mut f, b, Inst::Load(Mem::Int(8, false), fp, env, 0));
-            Callee::Indirect(fp)
-        }
-    };
-    push(&mut f, b, Inst::Call(callee, fwd, rets.clone()));
-    f.blocks[b as usize].term = Term::Ret(rets);
-    f
-}
-
 /// `fn(fields..) -> Adt` building variant `vi` (tuple structs: 0) of the fn type's return ADT.
 fn ctor_fn(u: &mut Unit, vi: u32, t: TyId) -> Func {
     let name = fn_name(u, &FnKey::Glue(crate::jit::GLUE_CTOR + vi as u8, t));
@@ -11199,7 +10776,7 @@ fn ctor_fn(u: &mut Unit, vi: u32, t: TyId) -> Func {
     if let TyKind::Adt(d, _, _) = u.tcx.tys.kind(ret).clone() {
         if let Some(adt) = u.tcx.adts.get(&d) {
             if adt.is_enum {
-                emit_store_disc(&mut f, b, 0, base, 0, &rl, &adt, vi);
+                emit_store_disc(u, &mut f, b, 0, base, 0, &rl, &adt, vi);
             }
         }
     }
@@ -11255,21 +10832,26 @@ fn push_at(f: &mut Func, b: u32, pos: u64, i: Inst) {
 }
 
 /// Variant `vi`'s discriminant value.
-pub fn variant_disc(adt: &crate::tcx::AdtT, vi: u32) -> i64 {
-    adt.variants.get(vi as usize).map_or(0, |v| v.disc as i64)
+pub fn variant_disc(u: &Unit, adt: &crate::tcx::AdtT, vi: u32) -> i64 {
+    adt.discriminant_for_variant(&u.tcx, &u.prog, vi).signed_value() as i64
 }
 
 /// The discriminant from the tag field's value `raw` (loaded with the tag's Mem): Direct tags
 /// hold it; a niche encoding maps tag values to variants (rustc_codegen_ssa codegen_get_discr:
 /// relative = tag - niche_start, in the niche variants' range when relative <= hi - lo).
-pub fn emit_decode_tag(f: &mut Func, b: u32, pos: u64, raw: VReg, l: &Layout, adt: &crate::tcx::AdtT) -> VReg {
+pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT) -> Vec<VReg> {
     use crate::layout::TagEnc;
     match l.enc {
         TagEnc::Direct => raw,
         TagEnc::Single(v) => {
             let d = f.vreg(Cls::I);
-            push_at(f, b, pos, Inst::Iconst(d, variant_disc(adt, v)));
-            d
+            let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v);
+            push_at(f, b, pos, Inst::Iconst(d, discr.signed_value() as i64));
+            if crate::types::Types::int_info(discr.ty).0 == 16 {
+                let hi = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(hi, (discr.val >> 64) as i64));
+                vec![d, hi]
+            } else { vec![d] }
         }
         TagEnc::Niche { untagged, lo, hi, start } => {
             let bytes = match l.tag {
@@ -11279,7 +10861,7 @@ pub fn emit_decode_tag(f: &mut Func, b: u32, pos: u64, raw: VReg, l: &Layout, ad
             let ks = f.vreg(Cls::I);
             push_at(f, b, pos, Inst::Iconst(ks, start as u64 as i64));
             let rel = f.vreg(Cls::I);
-            push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rel, raw, ks));
+            push_at(f, b, pos, Inst::IBin(IOp::Sub, U64, rel, raw[0], ks));
             let rel = if bytes < 8 {
                 let m = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::IBinI(IOp::And, U64, m, rel, ((1u64 << (bytes * 8)) - 1) as i64));
@@ -11296,13 +10878,13 @@ pub fn emit_decode_tag(f: &mut Func, b: u32, pos: u64, raw: VReg, l: &Layout, ad
             } else {
                 push_at(f, b, pos, Inst::IBinI(IOp::Add, U64, vidx, rel, lo as i64));
             }
-            let by_index = (0..adt.variants.len() as u32).all(|v| variant_disc(adt, v) == v as i64);
+            let by_index = (0..adt.variants.len() as u32).all(|v| variant_disc(u, adt, v) == v as i64);
             let ud = f.vreg(Cls::I);
-            push_at(f, b, pos, Inst::Iconst(ud, if by_index { untagged as i64 } else { variant_disc(adt, untagged) }));
+            push_at(f, b, pos, Inst::Iconst(ud, if by_index { untagged as i64 } else { variant_disc(u, adt, untagged) }));
             if by_index {
                 let d = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Sel(d, inr, vidx, ud));
-                return d;
+                return vec![d];
             }
             // general discriminants: the niche variant's, else the untagged one's
             let mut d = ud;
@@ -11315,59 +10897,69 @@ pub fn emit_decode_tag(f: &mut Func, b: u32, pos: u64, raw: VReg, l: &Layout, ad
                 let c2 = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::IBin(IOp::And, U64, c2, c, inr));
                 let k = f.vreg(Cls::I);
-                push_at(f, b, pos, Inst::Iconst(k, variant_disc(adt, v)));
+                push_at(f, b, pos, Inst::Iconst(k, variant_disc(u, adt, v)));
                 let nd = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Sel(nd, c2, k, d));
                 d = nd;
             }
-            d
+            vec![d]
         }
     }
 }
 
 /// The discriminant of the enum at `p + off` (layout `l`).
-pub fn emit_load_disc(f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT) -> VReg {
-    let raw = match l.tag {
-        Some((toff, tmem)) => {
-            let r = f.vreg(Cls::I);
+pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT) -> Vec<VReg> {
+    let mut raw = Vec::new();
+    if let Some((toff, tmem)) = l.tag {
+        let r = f.vreg(Cls::I);
+        if matches!(tmem, Mem::Int(16, _)) {
+            let hi = f.vreg(Cls::I);
+            push_at(f, b, pos, Inst::Load(Mem::Int(8, false), r, p, off + toff as i32));
+            push_at(f, b, pos, Inst::Load(Mem::Int(8, false), hi, p, off + toff as i32 + 8));
+            raw.extend([r, hi]);
+        } else {
             push_at(f, b, pos, Inst::Load(tmem, r, p, off + toff as i32));
-            r
+            raw.push(r);
         }
-        None => f.vreg(Cls::I),
-    };
-    emit_decode_tag(f, b, pos, raw, l, adt)
+    }
+    emit_decode_tag(u, f, b, pos, raw, l, adt)
 }
 
 /// The tag store that marks the enum at `p + off` as variant `vi` (none for the untagged
 /// variant of a niche encoding and for single-variant layouts).
-pub fn emit_store_disc(f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT, vi: u32) {
+pub fn emit_store_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT, vi: u32) {
     use crate::layout::TagEnc;
     let (toff, tmem) = match l.tag {
         Some(t) => t,
         None => return,
     };
     let v = match l.enc {
-        TagEnc::Direct => variant_disc(adt, vi),
+        TagEnc::Direct => adt.discriminant_for_variant(&u.tcx, &u.prog, vi).val,
         TagEnc::Single(_) => return,
         TagEnc::Niche { untagged, lo, start, .. } => {
             if vi == untagged {
                 return;
             }
-            (start as u64).wrapping_add((vi - lo) as u64) as i64
+            start.wrapping_add((vi - lo) as u128)
         }
     };
     let k = f.vreg(Cls::I);
-    push_at(f, b, pos, Inst::Iconst(k, v));
-    push_at(f, b, pos, Inst::Store(tmem, p, off + toff as i32, k));
+    push_at(f, b, pos, Inst::Iconst(k, v as i64));
+    if matches!(tmem, Mem::Int(16, _)) {
+        let hi = f.vreg(Cls::I);
+        push_at(f, b, pos, Inst::Iconst(hi, (v >> 64) as i64));
+        push_at(f, b, pos, Inst::Store(Mem::Int(8, false), p, off + toff as i32, k));
+        push_at(f, b, pos, Inst::Store(Mem::Int(8, false), p, off + toff as i32 + 8, hi));
+    } else { push_at(f, b, pos, Inst::Store(tmem, p, off + toff as i32, k)); }
 }
 
 /// The discriminant of a constant's enum value whose tag field reads `raw` (sign-extended
 /// per the tag's Mem).
-pub fn decode_tag_const(raw: i128, l: &Layout, adt: &crate::tcx::AdtT) -> i128 {
+pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT) -> i128 {
     use crate::layout::TagEnc;
     match l.enc {
-        TagEnc::Direct => raw,
-        TagEnc::Single(v) => variant_disc(adt, v) as i128,
+        TagEnc::Direct => crate::tcx::Discr { val: raw as u128, ty: adt.repr_int.unwrap_or(Prim::Isize) }.signed_value(),
+        TagEnc::Single(v) => adt.discriminant_for_variant(&u.tcx, &u.prog, v).signed_value(),
         TagEnc::Niche { untagged, lo, hi, start } => {
             let bytes = match l.tag {
                 Some((_, Mem::Int(n, _))) => n as u32,
@@ -11376,7 +10968,7 @@ pub fn decode_tag_const(raw: i128, l: &Layout, adt: &crate::tcx::AdtT) -> i128 {
             let m: u128 = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
             let rel = (raw as u128).wrapping_sub(start) & m;
             let v = if rel <= (hi - lo) as u128 { lo + rel as u32 } else { untagged };
-            variant_disc(adt, v) as i128
+            adt.discriminant_for_variant(&u.tcx, &u.prog, v).signed_value()
         }
     }
 }
@@ -11400,7 +10992,7 @@ pub(crate) fn ext_fields(u: &Unit, t: TyId) -> Option<(u32, Vec<(u32, TyId, u32)
         if l.fields.get(fi) != Some(&u32::MAX) {
             continue;
         }
-        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, fi as u32, &args);
+        let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, &args);
         let fl = u.layout_of(ft);
         off = crate::layout::round_up(off, fl.align.max(1));
         align = align.max(fl.align);
@@ -11439,7 +11031,7 @@ fn ext_drop_fn(u: &mut Unit, t: TyId) -> Func {
     // dead slots (removed / retyped fields) of a value built before they died: dropped here
     if let (Some(ext_off), TyKind::Adt(d, args, _)) = (u.layout_of(t).ext, u.tcx.tys.kind(t).clone()) {
         let l = u.layout_of(t);
-        let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, i as u32, &args))).collect()).unwrap_or_default();
+        let dead: Vec<(u32, TyId)> = u.tcx.adts.get(&d).map(|a| a.variants[0].fields.iter().enumerate().filter(|(i, fd)| is_dead_field(u, fd.name) && l.fields.get(*i).map_or(false, |o| *o != u32::MAX)).map(|(i, _)| (l.fields[i], u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, i as u32, &args))).collect()).unwrap_or_default();
         let dead: Vec<(u32, TyId)> = dead.into_iter().filter(|(_, ft)| u.needs_drop_glue(*ft)).collect();
         if !dead.is_empty() {
             let one = f.vreg(Cls::I);
@@ -11610,8 +11202,15 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             if let (Some(dtor), Some(td)) = (u.tcx.adt_destructor(d), u.tcx.lang_items.get(LangItem::Drop)) {
                 // Selection supplies the impl's substitutions; identity comes from adt_destructor.
                 {
-                    let selected = u.tcx.select_dispatch(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, t, &[]);
-                    let iargs = selected.args;
+                    let trait_ref = relax_types::next_solver::TraitRef { def_id: td, args: vec![relax_types::consts::GenericArg::Type(t)] };
+                    let selected = u.tcx.codegen_select_candidate(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), trait_ref.clone()).unwrap_or_else(|error| panic!("established destructor dispatch failed for {trait_ref:?}: {error:?}"));
+                    let relax_types::next_solver::select::ImplSource::UserDefined { args, .. } = selected else { panic!("destructor without impl") };
+                    let mut iargs = Vec::new();
+                    for arg in args { match arg {
+                        relax_types::consts::GenericArg::Type(t) => iargs.push(t),
+                        relax_types::consts::GenericArg::Const(c) => iargs.push(u.tcx.tys.intern(TyKind::Const(c))),
+                        relax_types::consts::GenericArg::Lifetime(_) => {},
+                    } }
                     let id = u.fn_id(FnKey::Inst(dtor.did, iargs));
                     // (a std impl unwinds only through what its type arguments own)
                     let may = unwind && u.drop_may_unwind(t);
@@ -11637,7 +11236,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                     items.push((c, p, may));
                 }
                 for (fi, fd) in adt.variants[0].fields.iter().enumerate() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, &args);
                     // fields in the extension block (M10) drop with it, below; so do dead slots
                     // (a value built before their field went holds them, ext_drop_fn)
                     if l.fields.get(fi) == Some(&u32::MAX) || (l.ext.is_some() && is_dead_field(u, fd.name)) {
@@ -11673,12 +11272,12 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             if l.tag.is_none() && !matches!(l.enc, crate::layout::TagEnc::Single(_)) {
                 return;
             }
-            let tag = emit_load_disc(f, *cur, 0, p, 0, &l, &adt);
+            let tag = emit_load_disc(u, f, *cur, 0, p, 0, &l, &adt);
             let join = f.block();
             for (vi, v) in adt.variants.iter().enumerate() {
                 let mut any = false;
                 for fi in 0..v.fields.len() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
                     if u.needs_drop_glue(ft) {
                         any = true;
                     }
@@ -11687,12 +11286,18 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                     continue;
                 }
                 let c = f.vreg(Cls::I);
-                push(f, *cur, Inst::ICmpI(Cond::Eq, true, c, tag, v.disc as i64));
+                let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, vi as u32).signed_value() as u128;
+                push(f, *cur, Inst::ICmpI(Cond::Eq, false, c, tag[0], discr as i64));
+                let c = if tag.len() == 2 {
+                    let hi = f.vreg(Cls::I); let both = f.vreg(Cls::I);
+                    push(f, *cur, Inst::ICmpI(Cond::Eq, false, hi, tag[1], (discr >> 64) as i64));
+                    push(f, *cur, Inst::IBin(IOp::And, U64, both, c, hi)); both
+                } else { c };
                 let yes = f.block();
                 let no = f.block();
                 f.blocks[*cur as usize].term = Term::Branch(c, yes, no);
                 for fi in 0..v.fields.len() {
-                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                    let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
                     if u.needs_drop_glue(ft) {
                         let a = addr_off(f, yes, p, l.variant_fields[vi][fi]);
                         call_drop(u, f, yes, a, ft);
@@ -11720,13 +11325,11 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
         }
         // a closure's state: its by-value captures (rustc: a closure is a struct of its upvars);
         // an FnOnce closure's captures only while their drop flag is set
-        TyKind::Closure(file, ce, sig, up, owner) => {
-            let once = u.tcx.closure_once.contains(&(file, ce, owner));
-            let fields = match u.tcx.tys.kind(up).clone() {
-                TyKind::Tuple(v) => v,
-                _ => Vec::new(),
-            };
-            let l = u.layout_of(up);
+        TyKind::Closure(file, ce, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => {
+            let storage = u.closure_storage(t);
+            let once = storage.drop_flags;
+            let fields = &storage.fields;
+            let l = u.layout_of(t);
             let coro = u.tcx.coroutines.contains(&(file, ce));
             let nf = if coro { fields.len().saturating_sub(1) } else { fields.len() };
             if coro {
@@ -11777,7 +11380,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                 *cur = join;
             }
             let n = if once { nf / 2 } else { nf };
-            let precise = u.tcx.closure_cap_fields.get(&(file, ce));
+            let precise = &storage.owned_fields;
             for i in 0..n {
                 let ft = fields[i];
                 if !u.needs_drop_glue(ft) {
@@ -11786,7 +11389,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                 let a = addr_off(f, *cur, p, l.fields[i]);
                 // a precise capture owns only the fields it took (the rest stayed with the
                 // enclosing body): (address, type) of what this state drops
-                let parts: Vec<(VReg, TyId)> = match precise.as_ref().and_then(|v| v.get(i).cloned()).flatten() {
+                let parts: Vec<(VReg, TyId)> = match precise.get(i).cloned().flatten() {
                     Some(fs) => {
                         let sl = u.layout_of(ft);
                         let fts: Vec<TyId> = match u.tcx.tys.kind(ft).clone() {
@@ -11824,6 +11427,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             }
         }
         TyKind::Array(e, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys).expect("normalized array length");
             let el = u.layout_of(e);
             let stride = crate::layout::round_up(el.size, el.align);
             let unwind = options.unwind;
@@ -13328,7 +12932,7 @@ mod query_drop_tests {
         }
         let plain = tcx.tys.intern(TyKind::Adt(plain.unwrap(), vec![], crate::types::RegionArgsId::EMPTY));
         let aggregate = tcx.tys.intern(TyKind::Tuple(vec![plain, plain]));
-        let env = crate::tcx::TypingEnv::fully_monomorphized();
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&prog);
         for ty in [plain, aggregate] { assert!(!tcx.needs_drop(&prog, env, ty)); }
         let _live = LiveGuard {
             live: crate::layout::LIVE_SESSION.swap(true, Ordering::Relaxed),
@@ -13372,7 +12976,7 @@ mod query_drop_tests {
             fn drop(&mut self) {
                 let (prog, tcx) = &*self.input;
                 let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    assert!(!tcx.needs_drop(prog, crate::tcx::TypingEnv::fully_monomorphized(), tcx.tys.bool_));
+                    assert!(!tcx.needs_drop(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), tcx.tys.bool_));
                 })).is_ok();
                 self.success.store(ok, Ordering::Relaxed);
             }
@@ -13384,9 +12988,154 @@ mod query_drop_tests {
         std::thread::spawn(move || {
             CLEANUP.with(|slot| *slot.borrow_mut() = Some(OnDrop { input: input.clone(), success }));
             let (prog, tcx) = &*input;
-            assert!(!tcx.needs_drop(prog, crate::tcx::TypingEnv::fully_monomorphized(), tcx.tys.bool_));
+            assert!(!tcx.needs_drop(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), tcx.tys.bool_));
         }).join().unwrap();
         assert!(result.load(Ordering::Relaxed), "query must remain callable from a TLS destructor");
     }
 
+}
+
+/// rustc_middle/src/ty/instance.rs: Display; identities include the method and args.
+pub fn shim_name(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, shim: &ShimInstance) -> String {
+    let ty = |ty| crate::typeck::ty_to_string(true, prog, tcx, ty);
+    let mut name = prog.def_path(shim.kind.def_id());
+    name.push('<');
+    for (i, &arg) in shim.args.iter().enumerate() {
+        if i != 0 { name.push_str(", "); }
+        name.push_str(&ty(arg));
+    }
+    name.push_str("> - ");
+    name.push_str(&match shim.kind {
+        ShimKind::FnPtr(_, t) => format!("shim({})", ty(t)),
+        ShimKind::ClosureOnce { closure, track_caller, .. } => format!("once shim({}, track_caller={track_caller})", prog.def_path(closure)),
+        ShimKind::FnPtrAsPtr(_, t) => format!("as_ptr shim({})", ty(t)),
+        ShimKind::FnPtrFromPtr(_, t) => format!("from_ptr shim({})", ty(t)),
+        ShimKind::Reify(_, reason) => format!("reify shim({reason:?})"),
+        ShimKind::VTable(_) => "vtable shim".to_string(),
+        ShimKind::Clone(..) | ShimKind::DropGlue(..) => unreachable!("type glue has its own key"),
+    });
+    name
+}
+
+/// ported from N:rustc_mir_transform/src/shim.rs @8d1a764
+/// build_call_shim:813-987; build_fn_ptr_{as,from}_ptr_shim:1096-1194.
+/// Round 23 maps these bodies onto RIR; closure storage is EXCEPTION(N4).
+pub fn shim_func(u: &Unit, shim: &ShimInstance, id: u32) -> Result<Func, String> {
+    let def = shim.kind.def_id();
+    let signature = u.tcx.fn_item_sig(&u.prog, def).ok_or_else(|| "shim has no signature".to_string())?;
+    let norm = |t| u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), u.tcx.tys.subst_erasing_regions(t, &shim.args));
+    let mut ps = Vec::new();
+    for &p in &signature.params { ps.push(norm(p)); }
+    let ret = norm(signature.ret);
+    if matches!(shim.kind, ShimKind::VTable(_)) { ps[0] = u.tcx.tys.intern(TyKind::Ptr(true, ps[0])); }
+    let body = Body::empty(def, shim.args.clone(), u.prog.def(def).file, ret);
+    let mut l = Lcx::new(u, &body, shim_name(&u.prog, &u.tcx, shim), id);
+    // shim.rs:773-785: synthesized calls use the shim definition span.
+    let definition = u.prog.def(def);
+    l.pos = u.prog.files[definition.file as usize].ast.item(definition.item).lo;
+    let layout = l.layout(ret);
+    match &layout.leaves {
+        Some(leaves) if ret_fits(leaves) => { for leaf in leaves { l.f.rets.push(leaf.cls); } }
+        _ => { let p = l.f.vreg(Cls::I); l.f.params.push(p); l.f.sret = Some(p); l.sret = Some(p); }
+    }
+    let mut vals = Vec::new();
+    for (index, &p) in ps.iter().enumerate() {
+        let (regs, by_ptr) = if signature.header.abi == crate::types::Abi::RustCall && index + 1 == ps.len() { l.abi_tuple_param(p) } else { l.abi_param(p) };
+        vals.push((if by_ptr { Val::M(regs[0], 0) } else { Val::L(regs) }, p));
+    }
+    if matches!(shim.kind, ShimKind::ClosureOnce { track_caller: true, .. })
+        || matches!(shim.kind, ShimKind::VTable(_)) && signature.track_caller {
+        let p = l.f.vreg(Cls::I); l.f.params.push(p); l.caller_loc = Some(p);
+    }
+    let result = match shim.kind {
+        ShimKind::FnPtrAsPtr(_, ty) | ShimKind::FnPtrFromPtr(_, ty) => {
+            assert!(matches!(u.tcx.tys.kind(ty), TyKind::FnPtr(..)));
+            // The raw pointer cast and NonNull transmute preserve the pointer bits.
+            Val::L(l.to_leaves(vals[0].0.clone(), vals[0].1))
+        }
+        ShimKind::FnPtr(method, callable) => {
+            assert_eq!(vals.len(), 2);
+            let once = matches!(u.tcx.lang_items.by_def.get(&u.prog.def(method).parent), Some(LangItem::FnOnce | LangItem::AsyncFnOnce));
+            let receiver = if once { vals[0].0.clone() } else {
+                let address = l.to_leaves(vals[0].0.clone(), vals[0].1)[0];
+                l.read_place(&Place::Mem(address, 0), callable)
+            };
+            let tuple = vals[1].1;
+            let TyKind::Tuple(inputs) = l.kind(tuple) else { panic!("FnPtr shim tuple argument") };
+            let address = l.place_addr(&match vals[1].0.clone() { Val::L(r) => Place::Regs(r), Val::M(a, o) => Place::Mem(a, o) }, tuple);
+            let mut call_args = Vec::new();
+            for i in 0..inputs.len() {
+                let (place, ty) = l.project(&Place::Mem(address, 0), tuple, 0, i as u32);
+                call_args.push((l.read_place(&place, ty), ty));
+            }
+            let callee = match l.kind(callable) {
+                TyKind::FnPtr(inputs, _, header, _) => {
+                    let ptr = l.to_leaves(receiver, callable)[0];
+                    l.fn_ptr_callee(ptr, &inputs, ret, header, &mut call_args)
+                }
+                TyKind::FnDef(d, args, _) => {
+                    let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &args).map_err(|e| format!("shim callee: {e:?}"))?;
+                    let result = l.emit_instance(instance, call_args, ret);
+                    l.ret_val(result, ret);
+                    l.finish();
+                    l.f.verify().map_err(|e| format!("shim RIR: {e}"))?;
+                    return if let Some(error) = l.errors.first() { Err(error.clone()) } else { Ok(l.f) };
+                }
+                _ => panic!("FnPtr shim callable type"),
+            };
+            l.emit_call(callee, call_args, ret)
+        }
+        ShimKind::ClosureOnce { .. } => {
+            assert_eq!(vals.len(), 2);
+            let ct = vals[0].1;
+
+            let address = l.place_addr(&match vals[0].0.clone() { Val::L(r) => Place::Regs(r), Val::M(a, o) => Place::Mem(a, o) }, ct);
+            let tuple = vals[1].1;
+            let tuple_address = l.place_addr(&match vals[1].0.clone() { Val::L(r) => Place::Regs(r), Val::M(a, o) => Place::Mem(a, o) }, tuple);
+            let TyKind::Tuple(inputs) = l.kind(tuple) else { panic!("ClosureOnce shim tuple argument") };
+            let mut call_args = Vec::new();
+            call_args.push((Val::L(vec![address]), u.tcx.tys.usize_));
+            for i in 0..inputs.len() {
+                let (place, ty) = l.project(&Place::Mem(tuple_address, 0), tuple, 0, i as u32);
+                call_args.push((l.read_place(&place, ty), ty));
+            }
+            // shim.rs:947-987: own Self across the call, drop on return and unwind.
+            let pad = if u.needs_drop_glue(ct) { Some(l.pad_for(&[DropAct::Temp(address, ct, None)])) } else { None };
+            l.pad_fixed = Some(pad);
+            let target = u.closure_fn_id(ct).expect("ClosureOnce closure slot");
+            let result = l.emit_call(Callee::Fn(target), call_args, ret);
+            l.pad_fixed = None;
+            l.drop_at(address, ct);
+            result
+        }
+        ShimKind::VTable(d) => {
+            let address = l.to_leaves(vals[0].0.clone(), vals[0].1)[0];
+            let self_ty = shim.args[0];
+            vals[0] = (l.read_place(&Place::Mem(address, 0), self_ty), self_ty);
+            let instance = crate::instance::Instance::expect_resolve(&u.tcx, &u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &shim.args);
+            l.emit_instance(instance, vals, ret)
+        }
+        ShimKind::Reify(d, _) => {
+            let instance = crate::instance::Instance::expect_resolve(&u.tcx, &u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &shim.args);
+            l.emit_instance(instance, vals, ret)
+        },
+        ShimKind::Clone(..) | ShimKind::DropGlue(..) => unreachable!("type glue has its own key"),
+    };
+    l.ret_val(result, ret);
+    l.finish();
+    if let Some(error) = l.errors.first() { return Err(error.clone()); }
+    l.f.verify().map_err(|e| format!("shim RIR: {e}"))?;
+    Ok(l.f)
+}
+
+// N:rustc_middle/src/mir/terminator.rs: AssertKind::description.
+fn arithmetic_overflow_message(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "attempt to add with overflow",
+        BinOp::Sub => "attempt to subtract with overflow",
+        BinOp::Mul => "attempt to multiply with overflow",
+        BinOp::Shl => "attempt to shift left with overflow",
+        BinOp::Shr => "attempt to shift right with overflow",
+        _ => unreachable!(),
+    }
 }

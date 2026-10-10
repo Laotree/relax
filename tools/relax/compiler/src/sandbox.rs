@@ -541,7 +541,7 @@ unsafe fn place(up: *mut Unit, sym: u32, depth: u32) -> Result<u32, String> {
             }
         }
         SymKind::Static(d) => {
-            let t = *u.tcx.const_tys.get(&d).ok_or("static without a type")?;
+            let t = u.tcx.const_tys.get(&d).ok_or("static without a type")?;
             let align = u.layout_of(t).align.max(1) as u64;
             let b = initial_bytes(u, sym)?;
             let words = provenance_words(u, &b);
@@ -604,7 +604,7 @@ pub(crate) fn capture_initial_data(u: &Unit, root: Sym) {
         }
         let size = match u.syms.kind(sym.id) {
             Some(SymKind::Static(d)) => match u.tcx.const_tys.get(&d) {
-                Some(t) => u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, *t).size.max(1) as usize,
+                Some(t) => u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t).size.max(1) as usize,
                 None => continue,
             },
             Some(SymKind::Data(i)) => match u.syms.obj_info(i) {

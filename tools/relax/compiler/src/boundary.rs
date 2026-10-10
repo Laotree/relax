@@ -11,6 +11,8 @@
 //! A body is on the provided side when its fn is a non-generic fn of a provided crate (closures
 //! count as their owner fn).
 
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use crate::lang_items::LangItem;
 use crate::jit::{FnKey, Unit};
 use crate::program::{DefId, DefKind};
@@ -176,7 +178,7 @@ fn shape(u: &mut Unit, a: &Audit, t: TyId) -> String {
         TyKind::FnPtr(_, _, c, _) => if c.abi.is_c_like() { "extern-C-fn".into() } else { "rust-fn-ptr".into() },
         TyKind::Dyn(..) => "dyn".into(),
         TyKind::Closure(..) | TyKind::FnDef(..) => "fn-item".into(),
-        TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Assoc(..) => "generic".into(),
+        TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => "generic".into(),
         _ => "other".into(),
     }
 }
@@ -248,7 +250,7 @@ pub fn run(up: *mut Unit) -> String {
                 }
                 // closures are lowered from their parent's body (made while lowering it)
                 FnKey::Closure(..) => true,
-                FnKey::Glue(..) | FnKey::Sandbox(_) => false,
+                FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => false,
             };
             if !lower_it {
                 continue;

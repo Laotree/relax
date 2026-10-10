@@ -6,7 +6,8 @@
 //! Constraints are recorded with the point where they arise (location-sensitive facts); this
 //! solver collapses them NLL-style (a region is a set of points, constraints hold everywhere).
 
-use crate::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::bir::*;
 use super::diag::{describe_place, Diag};
 use super::moves::{bit_get, bit_set, bits_new, bits_union, place_ty, predecessors, successors, Bits};
@@ -18,6 +19,11 @@ use super::region_infer::{RegionInferenceContext, RegionDefinition, NllRegionVar
 use super::region_infer::values::LivenessValues;
 use super::handle_placeholders::{LoweredConstraints, compute_sccs_applying_placeholder_outlives_constraints};
 use super::universal_regions::{UniversalRegions, RegionClassification};
+use super::infer_ctxt::BorrowckInferCtxt;
+use super::renumber::RegionCtxt;
+use super::type_check::{Locations, MirTypeckRegionConstraints};
+use super::type_check::canonical::fully_perform_op_raw;
+use crate::next_solver::type_op::{Normalize, ParamEnvAnd};
 use super::type_check::free_region_relations::UniversalRegionRelations;
 use crate::types::UniverseIndex;
 use crate::fxhash::HashMap;
@@ -153,6 +159,11 @@ pub struct Nll<'a> {
     pub fv_records: Vec<(Span, String, bool, Span, Option<Vec<Span>>)>,
     prog: &'a crate::program::Program,
     tcx: &'a crate::tcx::Tcx,
+    /// The body's inference context: every region variable here (`Rv`) is one of its
+    /// region variables, including those type operations create.
+    infcx: std::rc::Rc<BorrowckInferCtxt<'a>>,
+    /// Constraints from type operations (fully_perform_op), in `Rv` numbering.
+    typeck_constraints: MirTypeckRegionConstraints,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,7 +188,11 @@ pub fn run<'a>(tx: &'a Tx, rty: &'a Rty, bir: &'a Bir, closure_reqs: &'a HashMap
 /// They must not be passed to `run` independently.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_promoted<'a>(tx: &'a Tx, rty: &'a Rty, bir: &'a Bir, promoteds: &'a [Bir], closure_reqs: &'a HashMap<u32, Vec<ClosureOutlivesRequirement>>, md: &super::moves::MoveData, relaxed: bool, closure_fv: &'a HashMap<u32, Vec<super::fv::Summary>>, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> NllOut {
-    let mut n = Nll::new(tx, rty, bir, promoteds, closure_reqs, relaxed, closure_fv, prog, tcx);
+    let def = bir.def.or(bir.owner).unwrap_or(crate::program::NO_DEF);
+    let infcx = BorrowckInferCtxt::new(tcx, prog, def, bir.owner.unwrap_or(def), &bir.args);
+
+    let infcx = std::rc::Rc::new(infcx);
+    let mut n = Nll::new(tx, rty, bir, promoteds, closure_reqs, relaxed, closure_fv, prog, tcx, infcx);
     n.find_feeds();
     let t0 = crate::clock::cpu_ns();
     n.points();
@@ -185,6 +200,7 @@ pub fn run_with_promoted<'a>(tx: &'a Tx, rty: &'a Rty, bir: &'a Bir, promoteds: 
     *rty.cur_self.borrow_mut() = None;
     n.renumber();
     n.constraints();
+    n.sync_region_vars();
     let rel = n.prepare_regions();
     let t1 = crate::clock::cpu_ns();
     let (live, drop_live) = n.liveness(md, &rel);
@@ -209,7 +225,7 @@ pub static PHASE_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::ato
 
 impl<'a> Nll<'a> {
     #[allow(clippy::too_many_arguments)]
-    fn new(tx: &'a Tx, rty: &'a Rty, bir: &'a Bir, promoteds: &'a [Bir], closure_reqs: &'a HashMap<u32, Vec<ClosureOutlivesRequirement>>, relaxed: bool, closure_fv: &'a HashMap<u32, Vec<super::fv::Summary>>, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx) -> Self {
+    fn new(tx: &'a Tx, rty: &'a Rty, bir: &'a Bir, promoteds: &'a [Bir], closure_reqs: &'a HashMap<u32, Vec<ClosureOutlivesRequirement>>, relaxed: bool, closure_fv: &'a HashMap<u32, Vec<super::fv::Summary>>, prog: &'a crate::program::Program, tcx: &'a crate::tcx::Tcx, infcx: std::rc::Rc<BorrowckInferCtxt<'a>>) -> Self {
         Self {
             tx,
             rty,
@@ -262,14 +278,34 @@ impl<'a> Nll<'a> {
             fv_records: Vec::new(),
             prog,
             tcx,
+            infcx,
+            typeck_constraints: MirTypeckRegionConstraints::new(0),
         }
     }
 
     fn new_rv(&mut self, k: Kind, name: &str) -> Rv {
+        self.sync_region_vars();
+        let origin = if k == Kind::Var { NllRegionVariableOrigin::Existential } else { NllRegionVariableOrigin::FreeRegion };
+        let region = self.infcx.next_nll_region_var(origin, || RegionCtxt::Unknown);
+        assert_eq!(self.tcx.tys.region_kind(region), crate::types::RegionKind::ReVar(self.kinds.len() as u32));
         self.kinds.push(k);
         self.region_ids.push(None);
         self.names.push(name.to_string());
         (self.kinds.len() - 1) as Rv
+    }
+
+    /// Region variables that type operations created in the body's inference context
+    /// become existential variables here (placeholders keep their placeholder).
+    fn sync_region_vars(&mut self) {
+        for vid in self.kinds.len()..self.infcx.num_region_vars() {
+            let placeholder = match self.infcx.region_var_origin(vid as u32) {
+                crate::infer::region_constraints::RegionVariableOrigin::Nll(NllRegionVariableOrigin::Placeholder(p)) => Some(p),
+                _ => None,
+            };
+            self.kinds.push(Kind::Var);
+            self.region_ids.push(placeholder);
+            self.names.push("'_".into());
+        }
     }
 
     /// rustc_borrowck/type_check/mod.rs:510: collect in a separate body, but
@@ -295,7 +331,8 @@ impl<'a> Nll<'a> {
         for l in &mut body.locals { for r in &mut l.regions { remap(r); } }
         for (a, b) in &mut body.known { remap(a); remap(b); }
         for (a, b, _, _) in &mut body.outlives { remap(a); remap(b); }
-        let mut n = Nll::new(self.tx, self.rty, &body, self.promoteds, self.closure_reqs, self.relaxed, self.closure_fv, self.prog, self.tcx);
+        self.sync_region_vars();
+        let mut n = Nll::new(self.tx, self.rty, &body, self.promoteds, self.closure_reqs, self.relaxed, self.closure_fv, self.prog, self.tcx, self.infcx.clone());
         n.is_promoted = true;
         n.kinds = std::mem::take(&mut self.kinds);
         n.region_ids = std::mem::take(&mut self.region_ids);
@@ -310,6 +347,7 @@ impl<'a> Nll<'a> {
         n.points();
         n.renumber();
         n.constraints();
+        n.sync_region_vars();
         let rel = vec![true; n.kinds.len()];
         let md = super::moves::MoveData::new(self.tx, &body);
         let (live, drop_live) = n.liveness(&md, &rel);
@@ -552,9 +590,8 @@ impl<'a> Nll<'a> {
         // need without the owner's other regions)
         if is_closure {
             if let Some(o) = bir.owner {
-                if let Some(n) = self.tcx.fn_sig(self.prog, o).map(|s|s.n_generics as usize)
-                    .or_else(||self.tcx.const_region_contracts.get(&o).map(|c|c.type_names.len())) {
-                    let args: Vec<_> = (0..n).map(|i|self.tcx.tys.intern(TyKind::Param(i as u32))).collect();
+                if self.tcx.fn_sig(self.prog, o).is_some() || self.tcx.const_region_contracts.contains_key(&o) {
+                    let args = self.tcx.generic_indices_of(self.prog, o).identity_types_consts(&self.tcx.tys);
                     let t = self.rty.sig_template(o, &args);
                     if t.ok {
                         // the owner's named lifetimes are universal in the closure too (free in
@@ -698,6 +735,54 @@ impl<'a> Nll<'a> {
                     self.known.extend([(r,r),(STATIC,r),(r,body)]);
                 }
             }
+            if !is_closure { if let Some(t) = &tmpl { self.normalize_signature(t); } }
+        }
+    }
+
+    /// rustc_borrowck type_check/free_region_relations.rs:405-433 (create): the inputs and
+    /// output are normalized through `fully_perform_op`; the region constraints of that
+    /// normalization hold at every point of the body (Locations::All, Internal).
+    /// BIR adapter: the signature's regions are mapped to this body's universal region
+    /// variables first, as nightly's universal regions are; a type with a free region the
+    /// template did not number is left to the template.
+    fn normalize_signature(&mut self, t: &SigTmpl) {
+        use crate::types::RegionKind;
+        let Some(u) = &t.universal else { return };
+        let mut regions = Vec::new();
+        let mut indices = Vec::new();
+        for (r, k) in self.kinds.iter().enumerate() {
+            if *k == Kind::Var || self.is_placeholder(r) { continue; }
+            let class = if r == STATIC as usize { RegionClassification::Global }
+                else if *k == Kind::External || self.outer_named.iter().any(|x| x.1 as usize == r) { RegionClassification::External }
+                else { RegionClassification::Local };
+            regions.push((r, class));
+            if let Some(id) = self.region_ids[r] { indices.push((id, r)); }
+        }
+        let fr_fn_body = self.names.iter().position(|n| n == "'fn_body");
+        let mut universal_regions = UniversalRegions::new(STATIC as usize, fr_fn_body, regions);
+        universal_regions.indices = indices;
+        let known: Vec<_> = self.infcx.param_env.clauses.iter()
+            .filter(|p| matches!(p.kind, crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::TypeOutlives(..)))).cloned().collect();
+        // def_span of the defining item.
+        let span = self.bir.def.map_or(Span::default(), |d| {
+            let pd = self.prog.def(d);
+            let item = self.prog.files[pd.file as usize].ast.item(pd.item);
+            Span { lo: item.lo, hi: item.hi }
+        });
+        let tys = &self.tcx.tys;
+        for &ty in u.inputs.iter().chain([&u.output]) {
+            let unmapped = std::cell::Cell::new(false);
+            let ty = tys.map_regions(tys.subst(ty, &self.bir.args), &|r, depth| match tys.region_kind(r) {
+                RegionKind::ReBound(debruijn, _) if debruijn < depth => r,
+                _ => match universal_regions.indices.iter().find(|(o, _)| *o == r) {
+                    Some(&(_, v)) => tys.intern_region(RegionKind::ReVar(v as u32)),
+                    None => { unmapped.set(true); r }
+                },
+            }, 0);
+            if unmapped.get() { continue; }
+            let op = ParamEnvAnd { param_env: self.infcx.param_env.clone(), value: Normalize { value: ty } };
+            let _ = fully_perform_op_raw(&self.infcx, &universal_regions, &t.assumptions.type_outlives, &known,
+                &mut self.typeck_constraints, Locations::All(crate::mir::Span { file: self.bir.file, lo: span.lo, hi: span.hi }), crate::mir::Span { file: self.bir.file, lo: span.lo, hi: span.hi }, ConstraintCategory::Internal, op);
         }
     }
 
@@ -1016,7 +1101,7 @@ impl<'a> Nll<'a> {
             TyKind::Adt(d, a, _) => (d, a),
             _ => return None,
         };
-        if args.iter().any(|a| matches!(self.tx.kind(*a), TyKind::ConstVal(..))) {
+        if args.iter().any(|a| matches!(self.tx.kind(*a), TyKind::Const(..))) {
             return None;
         }
         let lts: Vec<crate::ast::Ident> = pargs.iter().filter_map(|a| match a { PathArg::Lifetime(l) => Some(*l), _ => None }).collect();
@@ -2021,12 +2106,16 @@ impl<'a> Nll<'a> {
             constraints.push(OutlivesConstraint { sup: self.region_map[sup as usize], sub: self.region_map[sub as usize], location: Some(p), span: { let s = self.span_at(p); crate::mir::Span { file: self.bir.file, lo: s.lo, hi: s.hi } }, from_closure: false,
                 category: self.constraint_categories.get(&p).copied().unwrap_or_else(|| if self.ret_points.contains(&p) { ConstraintCategory::Return(super::constraints::ReturnConstraint::Normal) } else { ConstraintCategory::Assignment }) });
         }
+        for c in &self.typeck_constraints.outlives_constraints.outlives {
+            constraints.push(OutlivesConstraint { sup: self.region_map[c.sup], sub: self.region_map[c.sub], ..*c });
+        }
         let lowered = compute_sccs_applying_placeholder_outlives_constraints(definitions, constraints, STATIC as usize);
         // Only loan-reachable points are needed by today's loan-scope consumer.
         let sccs = &lowered.constraint_sccs;
         let mut relevant = vec![false; sccs.num_sccs()];
         let mut stack: Vec<_> = self.loans.iter().map(|l| sccs.scc(self.region_map[l.region as usize])).collect();
         stack.extend(self.type_tests.iter().map(|(_,r,_)| sccs.scc(self.region_map[*r as usize])));
+        stack.extend(self.typeck_constraints.type_tests.iter().map(|t| sccs.scc(self.region_map[t.lower_bound])));
         while let Some(s) = stack.pop() {
             crate::preempt::point();
             if relevant[s] { continue; } relevant[s] = true;
@@ -2071,7 +2160,7 @@ impl<'a> Nll<'a> {
         let universal_regions = UniversalRegions::new(STATIC as usize, fr_fn_body, universals);
         let known: Vec<_> = self.known.iter().map(|&(a,b)| (self.region_map[a as usize],self.region_map[b as usize])).collect();
         let relations = UniversalRegionRelations::create(universal_regions, self.kinds.len(), &known);
-        let tests: Vec<_> = self.type_tests.iter().map(|&(pi,r,span)| TypeTest {
+        let mut tests: Vec<_> = self.type_tests.iter().map(|&(pi,r,span)| TypeTest {
             generic_kind: self.tcx.tys.intern(TyKind::Param(pi)), span,
             lower_bound: self.region_map[r as usize],
             verify_bound: VerifyBound::AnyBound(std::iter::once(VerifyBound::IsEmpty)
@@ -2079,8 +2168,33 @@ impl<'a> Nll<'a> {
                 .chain(self.tparam_bounds.iter().filter(|(p,_)| *p == pi)
                     .map(|(_,b)| VerifyBound::OutlivedBy(self.region_map[*b as usize]))).collect()),
         }).collect();
-        self.regioncx = Some(RegionInferenceContext::solve(self.tcx,self.prog, self.lowered.take().unwrap(), relations,
+        for t in &self.typeck_constraints.type_tests {
+            tests.push(TypeTest { generic_kind: self.remap_vids(t.generic_kind), lower_bound: self.region_map[t.lower_bound], span: t.span,
+                verify_bound: self.remap_verify_bound(&t.verify_bound) });
+        }
+        self.regioncx = Some(RegionInferenceContext::solve(self.tcx, self.prog, self.lowered.take().unwrap(), relations,
             liveness, self.n_points, &tests, self.bir.closure_kind.is_some()));
+    }
+    /// Type-operation results use `Rv` numbering; the core numbers regions in nightly's
+    /// allocation order (`region_map`).
+    fn remap_vids(&self, ty: TyId) -> TyId {
+        let tys = &self.tcx.tys;
+        tys.map_regions(ty, &|r, _| match tys.region_kind(r) {
+            crate::types::RegionKind::ReVar(v) => tys.intern_region(crate::types::RegionKind::ReVar(self.region_map[v as usize] as u32)),
+            _ => r,
+        }, 0)
+    }
+    fn remap_verify_bound(&self, bound: &VerifyBound) -> VerifyBound {
+        match bound {
+            VerifyBound::IfEq { ty, bound } => VerifyBound::IfEq { ty: self.remap_vids(*ty), bound: match self.tcx.tys.region_kind(*bound) {
+                crate::types::RegionKind::ReVar(v) => self.tcx.tys.intern_region(crate::types::RegionKind::ReVar(self.region_map[v as usize] as u32)),
+                _ => *bound,
+            } },
+            VerifyBound::IsEmpty => VerifyBound::IsEmpty,
+            VerifyBound::OutlivedBy(r) => VerifyBound::OutlivedBy(self.region_map[*r]),
+            VerifyBound::AnyBound(bs) => VerifyBound::AnyBound(bs.iter().map(|b| self.remap_verify_bound(b)).collect()),
+            VerifyBound::AllBounds(bs) => VerifyBound::AllBounds(bs.iter().map(|b| self.remap_verify_bound(b)).collect()),
+        }
     }
     fn is_placeholder(&self, r: usize) -> bool {
         self.region_ids[r].is_some_and(|r| matches!(self.tcx.tys.region_kind(r),crate::types::RegionKind::RePlaceholder { .. }))
@@ -2543,7 +2657,7 @@ impl<'a> Nll<'a> {
                     let (fspan, fplace) = if self.loans[li].place.proj.iter().any(|x| matches!(x, Proj::Field(..))) { (self.loans[li].span, self.loans[li].place.clone()) } else { (span, place.clone()) };
                     let ftxt = describe_place(self.tx, self.bir, &fplace).unwrap_or_default();
                     let fty = super::moves::place_ty(self.tx, self.bir, &fplace);
-                    let dflt = self.tx.lang("default::Default").map_or(false, |td| matches!(self.tx.select_trait(td, fty, &[]), SelectionResult::Ok(_)));
+                    let dflt = self.tx.lang("default::Default").map_or(false, |td| self.tx.evaluate_trait(td, fty, &[]).must_apply_modulo_regions());
                     self.fv_records.push((fspan, ftxt, dflt, span, None));
                     if self.relaxed {
                         self.fv_only.push(d);
@@ -2594,7 +2708,7 @@ impl<'a> Nll<'a> {
             }
             // a projection outlives 'r when its trait's input types do (rustc's projection
             // outlives rule without a where-clause on the projection itself)
-            TyKind::Assoc(ad, args, _) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args, regions: _ }) => {
                 if self.proj_bounds || self.rty.assoc_has_lifetime_bound(ad) {
                     return;
                 }
@@ -2612,7 +2726,7 @@ impl<'a> Nll<'a> {
             return true;
         }
         match self.tx.kind(t) {
-            TyKind::Param(_) | TyKind::Assoc(..) | TyKind::Opaque(..) | TyKind::Infer(_) | TyKind::Error => true,
+            TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) | TyKind::Infer(_) | TyKind::Error => true,
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => self.has_unknown(x, depth + 1),
             TyKind::Tuple(v) => v.iter().any(|x| self.has_unknown(*x, depth + 1)),
             TyKind::Adt(_, a, _) => a.iter().any(|x| self.has_unknown(*x, depth + 1)),
@@ -2625,7 +2739,7 @@ impl<'a> Nll<'a> {
             return true;
         }
         match self.tx.kind(t) {
-            TyKind::FnPtr(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::Opaque(..) => true,
+            TyKind::FnPtr(..) | TyKind::Dyn(..) | TyKind::Closure(..) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => true,
             TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) | TyKind::Array(x, _) | TyKind::Slice(x) => self.has_fn_ptr(x, depth + 1),
             TyKind::Tuple(v) => v.iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
             TyKind::Adt(_, a, _) => a.iter().any(|x| self.has_fn_ptr(*x, depth + 1)),
@@ -2898,7 +3012,7 @@ impl<'a> Nll<'a> {
             Rw::WriteStorageDead if matches!(self.loan_feed[li], Some(Feed::Closure(..))) && (self.region_contains_univ_end(self.loans[li].region).is_some() || later.is_some())
                 // a closure escaping as the fn's `impl Trait` result: rustc keeps E0597
                 && !self.via_closure_static(self.loans[li].region)
-                && !self.bir.def.and_then(|d| self.tcx.fn_sig(self.prog, d)).map_or(false, |sg| matches!(self.tx.kind(sg.ret), TyKind::Opaque(..))) => {
+                && !self.bir.def.and_then(|d| self.tcx.fn_sig(self.prog, d)).map_or(false, |sg| matches!(self.tx.kind(sg.ret), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }))) => {
                 // a capture of a closure that outlives the fn / the block whose local it
                 // borrows (rustc report_escaping_closure_capture, E0373)
                 let what_scope = if self.region_contains_univ_end(self.loans[li].region).is_some() { "function" } else { "block" };
@@ -3056,7 +3170,7 @@ impl<'a> Nll<'a> {
                 let names = all.entry(ce).or_default();
                 let k = names.iter().position(|n| n == name).unwrap_or_else(|| { names.push(name.clone()); names.len()-1 });
                 NAMED_REQ + k as u32
-            } else { *self.ext_slot.get(&(r as Rv)).expect("external region missing its closure coordinate") }
+            } else { *self.ext_slot.get(&(r as Rv)).unwrap_or_else(|| panic!("external region missing its closure coordinate: def {:?}, typeck root {:?}, closure {:?}, BIR region {}, external slots {:?}, outer names {:?}", self.bir.def, self.bir.owner, self.bir.closure_expr, r, self.ext_slot, self.outer_named)) }
         };
         let mut requirements: Vec<_> = self.regioncx().propagated_outlives_requirements.iter().map(|c|
             ClosureOutlivesRequirement { subject:ClosureOutlivesSubject::Region(encode(c.sup)),outlived_free_region:encode(c.sub),blame_span:Span { lo: c.span.lo, hi: c.span.hi },category:c.category }).collect();
@@ -3073,6 +3187,20 @@ impl<'a> Nll<'a> {
                     if !is_reported { continue; } (longer_fr,shorter_fr)
                 }
                 RegionErrorKind::PlaceholderOutlivesIllegalRegion { longer_fr, illegally_outlived_r } => (longer_fr,illegally_outlived_r),
+                RegionErrorKind::TypeTest { test } if test >= self.type_tests.len() => {
+                    // A type-operation test (`T: 'r` from normalization): nightly's
+                    // generic "may not live long enough" report.
+                    let t = &self.typeck_constraints.type_tests[test - self.type_tests.len()];
+                    let code = if self.regioncx().constraint_sccs.scc(self.region_map[t.lower_bound]) == self.regioncx().constraint_sccs.scc(self.region_map[STATIC as usize]) { "E0310" } else { "E0309" };
+                    let what = match self.tcx.tys.kind(t.generic_kind) {
+                        TyKind::Param(pi) if (*pi as usize) < self.tparam_names.len() => format!("the parameter type `{}`", self.tparam_names[*pi as usize]),
+                        _ => format!("the type `{}`", self.tx.ty_str(self.tcx.tys.erase_all_regions(t.generic_kind))),
+                    };
+                    let mut d = Diag::new(code, format!("{what} may not live long enough"), t.span);
+                    d.label(t.span, "...so that the type will meet its required lifetime bounds".into(), true);
+                    self.diags.push(d);
+                    continue;
+                }
                 RegionErrorKind::TypeTest { test } => {
                     let (pi,r,span) = self.type_tests[test];
                     let Some(name) = self.tparam_names.get(pi as usize) else { continue; };

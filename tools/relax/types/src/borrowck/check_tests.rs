@@ -45,7 +45,7 @@ fn input(body: &Body, scopes: &[Vec<Location>]) -> RegionInput {
 }
 fn gather(tcx: &Tcx, body: &Body) -> MoveData {
     let session = std::sync::Arc::new(crate::Session::default());
-    MoveData::gather_moves(body, &Program::new(&session), tcx, TypingEnv::fully_monomorphized(), &|_| true)
+    MoveData::gather_moves(body, &Program::new(&session), tcx, TypingEnv::fully_monomorphized(&Program::new(&session)), &|_| true)
 }
 fn check(tcx: &Tcx, body: &Body, scopes: &[Vec<Location>]) -> MirBorrowckResult {
     let mut regions = compute_regions(tcx, &test_prog(), body, input(body, scopes), false);
@@ -259,7 +259,7 @@ fn projected_and_promoted_illegal_moves() {
     let deref = Place { local: Local(1), projection: vec![PlaceElem::Deref] };
     let b = body(&[tcx.tys.unit, reference(&tcx,t,true), t], vec![block(vec![assign(2, Operand::Move(deref))], TerminatorKind::Return)]);
     assert_eq!(codes(&check(&tcx, &b, &[])), ["E0507"]);
-    let array = tcx.tys.intern(TyKind::Array(t, 3));
+    let array = tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(3)));
     let mut promoted = body(&[tcx.tys.unit, array, t, t], vec![block(vec![assign(3, Operand::Move(Place { local: Local(1), projection: vec![PlaceElem::Index(Local(2))] }))], TerminatorKind::Return)]);
     promoted.source.kind = BodyKind::Promoted(DefId(0), PromotedId(0));
     let mut parent = body(&[tcx.tys.unit], vec![block(vec![], TerminatorKind::Return)]); parent.arg_count = 0;
@@ -337,7 +337,7 @@ fn opaque_root_and_yield_are_explicit_stops() {
 }
 #[test]
 fn subslice_reads_only_overlapping_moved_elements() {
-    let tcx = Tcx::new(); let t = tcx.tys.i32_; let array = tcx.tys.intern(TyKind::Array(t, 3));
+    let tcx = Tcx::new(); let t = tcx.tys.i32_; let array = tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(3)));
     let elem = |offset| Place { local: Local(1), projection: vec![PlaceElem::ConstantIndex { offset, min_length: 3, from_end: false }] };
     let slice = |from, to| Place { local: Local(1), projection: vec![PlaceElem::Subslice { from, to, from_end: false }] };
     let mut b = body(&[tcx.tys.unit, array, t, array], vec![block(vec![assign(2, Operand::Move(elem(0))), assign(3, Operand::Move(slice(1, 3)))], TerminatorKind::Return)]);
@@ -394,11 +394,11 @@ fn destructor_prefix_borrow_and_illegal_field_move() {
     let field = Place {local:Local(1),projection:vec![PlaceElem::Field(FieldIdx(0),t)]};
     let mut b = body(&[tcx.tys.unit,ty,reference(&tcx,t,false),t],vec![block(vec![borrow(2,field.clone(),1,BorrowKind::Shared)],
         TerminatorKind::Drop {place:p(1),target:BasicBlock(1),unwind:UnwindAction::Continue,replace:false}),block(vec![],TerminatorKind::Return)]);
-    let moves=MoveData::gather_moves(&b,&prog,&tcx,TypingEnv::fully_monomorphized(),&|_|true);
+    let moves=MoveData::gather_moves(&b,&prog,&tcx,TypingEnv::fully_monomorphized(&prog),&|_|true);
     let mut regions=compute_regions(&tcx, &test_prog(), &b,input(&b,&[points(2)]),false);
     assert_eq!(codes(&mir_borrowck(&tcx, &test_prog(), &b,&mut regions,&moves)),["E0713"]);
     b.basic_blocks[0].statements[0].kind=assign(3,Operand::Move(field));
-    let moves=MoveData::gather_moves(&b,&prog,&tcx,TypingEnv::fully_monomorphized(),&|_|true);
+    let moves=MoveData::gather_moves(&b,&prog,&tcx,TypingEnv::fully_monomorphized(&prog),&|_|true);
     let mut regions=compute_regions(&tcx, &test_prog(), &b,input(&b,&[]),false);
     assert_eq!(codes(&mir_borrowck(&tcx, &test_prog(), &b,&mut regions,&moves)),["E0509"]);
 }

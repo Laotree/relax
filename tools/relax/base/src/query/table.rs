@@ -69,6 +69,17 @@ impl<K: Hash + Eq + Clone, V: Clone> QueryTable<K, V> {
         (hash.finish() >> 40) as usize % SHARDS
     }
 
+    /// rustc_middle/src/query/caches.rs:31: inspect completed query entries.
+    /// The callback must not enter this table while its shard is read-locked.
+    pub fn for_each(&self, f: &mut dyn FnMut(&K, &V, DepNodeIndex)) {
+        for shard in self.shards() {
+            let shard = shard.read().unwrap_or_else(|e| e.into_inner());
+            for slot in &shard.slots {
+                if let Some(value) = &slot.value { f(&slot.key, value, slot.node); }
+            }
+        }
+    }
+
     /// Recover an interned key for the context's kind-dispatching force function.
     pub fn key(&self, index: u32) -> Option<K> {
         let shard = &self.shards()[index as usize % SHARDS];

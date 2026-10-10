@@ -20,6 +20,8 @@
 //! what the run uses, at least 4096; prune_root).
 
 use crate::borrowck::lazy::StoredVerdict;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use crate::jit::{FnKey, Unit};
 use crate::pack::{self, NewEntry};
 use crate::store::Store;
@@ -43,7 +45,7 @@ const KIND_CODE: u32 = 1;
 const KIND_DATA: u32 = 2;
 const KIND_LEDGER: u32 = 3;
 /// part of the codegen configuration hash (store format changes invalidate entries)
-const STORE_FORMAT: u32 = 3;
+const STORE_FORMAT: u32 = 4;
 /// borrowck lane: a clean borrow-check verdict (empty payload)
 const KIND_BORROWCK: u32 = 4;
 /// the checker's own version: bump when its rules change (old verdicts are then ignored)
@@ -156,7 +158,8 @@ pub fn verify_front_images() {
     });
 }
 const LEDGER_KEY: u128 = 0;
-const ENTRY_VERSION: u32 = 20;
+// N01 types and closure arguments with baseline tiers and closure fingerprints.
+const ENTRY_VERSION: u32 = 24;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -411,7 +414,7 @@ pub struct Cache {
     /// image, or one this run could not use
     image_rewrite: bool,
     /// record_manifest ran this run (the mid-run write): the exit writes the manifest again only
-    /// if `image_rewrite` was set since (an O2 entry replaced code the image may hold)
+    /// if `image_rewrite` was set since (an O2/O3 entry replaced code the image may hold)
     manifest_done: bool,
     /// the loaded image's slots, and how many of them this run found stale (left lazy: a crate
     /// changed, an identity did not resolve) -- past 2% (as for the manifest) the next manifest
@@ -423,14 +426,10 @@ pub struct Cache {
     linked_key: HashMap<u32, u128>,
     /// slot keys by slot (fixed for a run)
     slot_keys: HashMap<u32, Option<u128>>,
+    /// An unnamed image slot must not cache a failed key before its identity is decoded.
+    key_waits: bool,
     /// a slot's encoded key (None: not encodable), and encoded keys already decoded to slots
     fnkey_bytes: HashMap<u32, Option<Vec<u8>>>,
-    capture_queries: HashSet<(u32, u32, TyId, u64)>,
-    /// a key being encoded named a closure whose captures wait for constants: the slot's
-    /// missing key is not remembered (it is known once they are evaluated)
-    key_waits: bool,
-    /// closure owners whose code entry's capture facts were read (restore_captures)
-    capture_owners: HashSet<TyId>,
     /// borrow-check verdicts recorded by this run (not flushed yet)
     pending_verdicts: HashMap<u128, StoredVerdict>,
     slot_by_bytes: crate::fxhash::HashMap<Box<[u8]>, u32>,
@@ -632,15 +631,13 @@ impl Cache {
             image_stale: 0,
             linked_key: HashMap::new(),
             slot_keys: HashMap::new(),
+            key_waits: false,
             last_callees: Vec::new(),
             last_tier1: None,
             last_o2: false,
             last_base: false,
             base_linked: HashSet::new(),
             fnkey_bytes: HashMap::new(),
-            capture_queries: HashSet::new(),
-            key_waits: false,
-            capture_owners: HashSet::new(),
             pending_verdicts: HashMap::new(),
             slot_by_bytes: Default::default(),
             closure_fps: HashMap::new(),
@@ -1192,172 +1189,12 @@ impl Cache {
         self.def_maps.get(&c)?.get(&k).copied()
     }
 
-    /// Runtime-created closure slots (not decoded from a caller's code entry) also need capture
-    /// facts before their first key lookup. They are metadata of the owner instance's code entry
-    /// (encode_entry's capture section; that entry's key covers the owner's body, which holds
-    /// the closure, and its crates' interfaces), so a closure whose owner was compiled in an
-    /// earlier run needs no typed owner body.
-    fn capture_query(&mut self, u: &Unit, file: u32, expr: u32, owner: TyId, depth: u32) -> Option<crate::upvar::ClosureCaptureTypes> {
-        let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed);
-        let q = (file, expr, owner, epoch);
-        // Once per query and run: later encodings read the published result (the owner's
-        // check, or its code entry, publishes all of its closures at once).
-        if depth > 64 || !self.capture_queries.insert(q) {
-            return u.tcx.closure_capture_types.get(&q);
-        }
-        if let Some(r) = u.tcx.closure_capture_types.get(&q) {
-            return Some(r);
-        }
-        self.restore_captures(u, file, owner, depth);
-        if let Some(r) = u.tcx.closure_capture_types.get(&q) {
-            return Some(r);
-        }
-        let state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-        let result = crate::upvar::ensure_closure_captures(&cx, &u.tcx, file, expr, owner);
-        if result.is_none() { self.capture_queries.remove(&q); }
-        result
-    }
-
-    /// Publishes the capture facts of the closures of `owner` (a fn instance) that its code
-    /// entry holds (once per owner and run).
-    fn restore_captures(&mut self, u: &Unit, file: u32, owner: TyId, depth: u32) -> Option<()> {
-        if !crate::reload::edited_crates().is_empty() || !self.capture_owners.insert(owner) { return None; }
-        let TyKind::FnDef(d, args, _) = u.tcx.tys.kind(owner).clone() else { return None };
-        let args: Vec<TyId> = args.iter().map(|t| u.tcx.tys.erase_regions(*t)).collect();
-        let key = self.fnkey_code_key(u, &FnKey::Inst(d, args))?;
-        let payload = match self.get(key)? { (KIND_CODE, p) => p.to_vec(), _ => return None };
-        let mut d = D { b: &payload, p: 0 };
-        if d.u32()? != ENTRY_VERSION { return None; }
-        d.str()?;
-        let n = d.u32()?;
-        if n == 0 || self.dec_file(u, &mut d)? != file { return None; }
-        for _ in 0..n {
-            let ce = d.u32()?;
-            if !self.closure_fp_agrees(u, file, ce, d.u64()?) { return None; }
-            let kind = match d.u8()? { 0 => crate::upvar::ClosureKind::Fn, 1 => crate::upvar::ClosureKind::FnMut, 2 => crate::upvar::ClosureKind::FnOnce, _ => return None };
-            let is_copy = match d.u8()? { 0 => false, 1 => true, _ => return None };
-            let once = match d.u8()? { 0 => false, 1 => true, _ => return None };
-            let upvars = self.dec_ty(u, &mut D { b: d.bytes()?, p: 0 }, depth + 1)?;
-            if once { u.tcx.closure_once.insert((file, ce, owner), ()); }
-            crate::upvar::publish_restored(&u.tcx, file, ce, owner, crate::upvar::ClosureCaptureTypes { kind, is_copy, upvars });
-        }
-        Some(())
-    }
-
-    /// A code entry's capture section: the capture facts of the closures of slot `id`'s checked
-    /// body (an instance owns them), each with its upvar types by structure. Empty: not an
-    /// instance, no body, or no closures.
-    fn capture_section(&mut self, u: &Unit, id: u32, e: &mut E) {
-        let body = match (&u.fns[id as usize].key, u.bodies.get(&id)) {
-            (FnKey::Inst(..), Some(b)) if !b.min_captures.is_empty() => b,
-            _ => { e.u32(0); return; }
-        };
-        // a live edit's version: its closure ids are not a boot parse's (enc_file)
-        if u.prog.is_edit_version(body.file) { e.u32(0); return; }
-        let owner = u.tcx.tys.intern(TyKind::FnDef(body.def, body.args.clone(), crate::types::RegionArgsId::EMPTY));
-        let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed);
-        let mut ces: Vec<u32> = body.min_captures.keys().copied().collect();
-        ces.sort_unstable();
-        let mut items = E::default();
-        let mut n = 0u32;
-        for ce in ces {
-            let Some(r) = u.tcx.closure_capture_types.get(&(body.file, ce, owner, epoch)) else { continue };
-            let mut ty = E::default();
-            if self.enc_ty(u, r.upvars, &mut ty, &mut Vec::new(), 1).is_none() { continue; }
-            let Some(fp) = self.closure_fp(u, body.file, ce) else { continue };
-            items.u32(ce);
-            items.u64(fp);
-            items.u8(r.kind as u8);
-            items.u8(r.is_copy as u8);
-            items.u8(u.tcx.closure_once.contains(&(body.file, ce, owner)) as u8);
-            items.bytes(&ty.0);
-            n += 1;
-        }
-        e.u32(n);
-        if n != 0 {
-            let _ = Self::enc_file(u, body.file, e);
-            e.0.extend_from_slice(&items.0);
-        }
-    }
-
-    /// A monomorphic type by structure. Inference variables, params, etc. cannot be stored,
-    /// nor a closure whose owner's captures wait for constants.
+    /// A monomorphic type by structure. Inference variables, params, etc. cannot be stored.
     fn enc_ty(&mut self, u: &Unit, t: TyId, e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
-        let t = u.tcx.tys.erase_regions(t);
         if depth > 64 {
             return None;
         }
         let k = u.tcx.tys.kind(t).clone();
-        // Erased types keep only bound regions (a higher-ranked `fn(&T)`, `dyn for<'a> Fn(&'a T)`):
-        // such a type is written as tag 22, its region-free structure, then its binder counts and
-        // bound regions, so it decodes to the same type, never to its unbound signature.
-        use crate::types::{RegionArgsId, RegionId};
-        let bound = match &k {
-            TyKind::Ref(_, _, r) => *r != RegionId::ERASED,
-            TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Assoc(_, _, rs) | TyKind::Opaque(_, _, _, rs) => *rs != RegionArgsId::EMPTY,
-            TyKind::Dyn(_, _, binds, rs, r, bound, _) => *rs != RegionArgsId::EMPTY || *r != RegionId::ERASED || *bound != 0 || binds.iter().any(|b| b.2 != 0),
-            TyKind::FnPtr(_, _, _, n) => *n != 0,
-            _ => false,
-        };
-        if bound {
-            e.u8(22);
-            self.enc_ty_kind(u, &k, e, crates, depth)?;
-            return self.enc_bound_regions(u, &k, e);
-        }
-        self.enc_ty_kind(u, &k, e, crates, depth)
-    }
-
-    /// The bound regions of an erased type `k` (enc_ty's tag 22): binder counts and each region
-    /// as erased (0) or bound (1, de Bruijn index, variable).
-    fn enc_bound_regions(&mut self, u: &Unit, k: &TyKind, e: &mut E) -> Option<()> {
-        use crate::types::{RegionArgsId, RegionId, RegionKind};
-        let tys = &u.tcx.tys;
-        let region = |r: RegionId, e: &mut E| -> Option<()> {
-            if r == RegionId::ERASED {
-                e.u8(0);
-                return Some(());
-            }
-            match tys.region_kind(r) {
-                RegionKind::ReBound(db, v) => {
-                    e.u8(1);
-                    e.u32(db);
-                    e.u32(v.0);
-                    Some(())
-                }
-                _ => None,
-            }
-        };
-        let regions = |rs: RegionArgsId, e: &mut E| -> Option<()> {
-            if rs == RegionArgsId::EMPTY {
-                e.u32(0);
-                return Some(());
-            }
-            let v = tys.region_args(rs);
-            e.u32(v.len() as u32);
-            v.iter().try_for_each(|r| region(*r, e))
-        };
-        match k {
-            TyKind::Ref(_, _, r) => region(*r, e),
-            TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Assoc(_, _, rs) | TyKind::Opaque(_, _, _, rs) => regions(*rs, e),
-            TyKind::Dyn(_, _, binds, rs, r, n, _) => {
-                regions(*rs, e)?;
-                region(*r, e)?;
-                e.u32(*n);
-                binds.iter().for_each(|b| e.u32(b.2));
-                Some(())
-            }
-            TyKind::FnPtr(_, _, _, n) => {
-                e.u32(*n);
-                Some(())
-            }
-            _ => None,
-        }
-    }
-
-    /// enc_ty without the bound regions: the type's structure.
-    fn enc_ty_kind(&mut self, u: &Unit, k: &TyKind, e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
-        let k = k.clone();
         match k {
             TyKind::Bool => e.u8(1),
             TyKind::Char => e.u8(2),
@@ -1370,6 +1207,7 @@ impl Cache {
                 e.u8(5);
                 e.u8(prim_code(p));
             }
+            TyKind::Foreign(d) => { e.u8(27); self.enc_def(u, d, e, crates); }
             TyKind::Never => e.u8(6),
             TyKind::Tuple(v) => {
                 e.u8(7);
@@ -1381,24 +1219,16 @@ impl Cache {
             TyKind::Array(el, n) => {
                 e.u8(8);
                 self.enc_ty(u, el, e, crates, depth + 1)?;
-                match crate::types::len_ty(n) {
-                    Some(l) => {
-                        e.u8(1);
-                        self.enc_ty(u, l, e, crates, depth + 1)?;
-                    }
-                    None => {
-                        e.u8(0);
-                        e.u64(n);
-                    }
-                }
+                self.enc_const(u, n, e, crates, depth + 1)?;
             }
             TyKind::Slice(x) => {
                 e.u8(9);
                 return self.enc_ty(u, x, e, crates, depth + 1);
             }
-            TyKind::Ref(m, x, _) => {
+            TyKind::Ref(m, x, r) => {
                 e.u8(10);
                 e.u8(m as u8);
+                self.enc_region(u, r, e)?;
                 return self.enc_ty(u, x, e, crates, depth + 1);
             }
             TyKind::Ptr(m, x) => {
@@ -1406,101 +1236,197 @@ impl Cache {
                 e.u8(m as u8);
                 return self.enc_ty(u, x, e, crates, depth + 1);
             }
-            TyKind::Adt(d, args, _) => {
+            TyKind::Adt(d, args, regions) => {
                 e.u8(12);
                 self.enc_def(u, d, e, crates);
+                self.enc_regions(u, regions, e)?;
                 return self.enc_tys(u, &args, e, crates, depth);
             }
-            TyKind::FnPtr(ps, r, c, _) => {
+            TyKind::FnPtr(ps, r, c, n) => {
                 e.u8(13);
                 self.enc_tys(u, &ps, e, crates, depth)?;
                 self.enc_ty(u, r, e, crates, depth + 1)?;
                 e.u8(c.safety as u8);
                 e.u8(c.abi as u8);
                 e.u8(c.c_variadic as u8);
+                e.u32(n);
             }
-            TyKind::FnDef(d, args, _) => {
+            TyKind::FnDef(d, args, regions) => {
                 e.u8(14);
                 self.enc_def(u, d, e, crates);
+                self.enc_regions(u, regions, e)?;
                 return self.enc_tys(u, &args, e, crates, depth);
             }
-            TyKind::Closure(file, expr, sig, state, owner) => {
-                let captures = self.capture_query(u, file, expr, owner, depth + 1);
+            TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
                 e.u8(17);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
                 Self::enc_file(u, file, e)?;
                 e.u32(expr);
                 e.u64(self.closure_fp(u, file, expr)?);
-                // FnOnce (its state carries drop flags the drop glue reads): a side table the
-                // owner's type check fills, so a run that links the owner from the cache learns
-                // it here -- glue built without it dropped moved-out captures (double free)
-                e.u8(u.tcx.closure_once.contains(&(file, expr, owner)) as u8);
-                self.enc_ty(u, sig, e, crates, depth + 1)?;
-                self.enc_ty(u, state, e, crates, depth + 1)?;
-                self.enc_ty(u, owner, e, crates, depth + 1)?;
-                // the environment's real layout: the owner's minimum captures (kind, Copy, the
-                // captured field types by value / by reference), which `state` (the root-slot
-                // tuple) does not show. Code that builds or reads the environment is keyed by it,
-                // so an entry built against another capture result never links (a by-value `k`
-                // read through a by-ref slot crashed warm runs). A foreign owner is type-checked
-                // on demand (as the solver does), so the key does not depend on what this run
-                // happened to check first; absent only while the owner is being checked.
-                return match captures {
-                    Some(r) => {
-                        e.u8(1 + r.kind as u8);
-                        e.u8(r.is_copy as u8);
-                        self.enc_ty(u, r.upvars, e, crates, depth + 1)
-                    }
-                    // the owner's check read a signature whose array length waits for a
-                    // constant (evaluated by running it, outside this type check): the
-                    // captures -- and so the key -- are not known yet. Encoded as "no
-                    // captures" the key would differ from the one the owner's completed check
-                    // gives: no key now, and none remembered (key_waits)
-                    None if u.tcx.has_blocked_consts() || !u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty() => {
-                        self.key_waits = true;
-                        None
-                    }
-                    None => {
-                        e.u8(0);
-                        Some(())
-                    }
-                };
+                self.enc_ty(u, closure_kind_ty, e, crates, depth + 1)?; self.enc_ty(u, sig, e, crates, depth + 1)?; self.enc_ty(u, state, e, crates, depth + 1)?;
+                // The kind and tupled upvars are the type's own args (ClosureArgs).
+                return self.enc_ty(u, owner, e, crates, depth + 1);
             }
-            TyKind::Assoc(d, args, _) => {
-                e.u8(18);
-                self.enc_def(u, d, e, crates);
-                return self.enc_tys(u, &args, e, crates, depth);
+            TyKind::Alias(rigid, alias) => {
+                e.u8(18); e.u8(rigid as u8);
+                let tag = match alias.kind { AliasTyKind::Projection { .. } => 0, AliasTyKind::Inherent { .. } => 1,
+                    AliasTyKind::Opaque { .. } => 2, AliasTyKind::Free { .. } => 3 };
+                e.u8(tag); self.enc_def(u, alias.kind.def_id(), e, crates);
+                self.enc_regions(u, alias.regions, e)?;
+                return self.enc_tys(u, &alias.args, e, crates, depth);
             }
-            TyKind::Dyn(d, args, binds, _, _, _, autos) => {
+            TyKind::Dyn(d, args, binds, regions, r, bound, autos) => {
                 e.u8(19);
                 self.enc_def(u, d, e, crates);
+                self.enc_regions(u, regions, e)?;
+                self.enc_region(u, r, e)?;
+                e.u32(bound);
                 self.enc_tys(u, &args, e, crates, depth)?;
                 e.u32(binds.len() as u32);
-                for (bd, bt, _) in binds {
+                for (bd, bt, n) in binds {
+                    e.u32(n);
                     self.enc_def(u, bd, e, crates);
                     self.enc_ty(u, bt, e, crates, depth + 1)?;
                 }
                 e.u32(autos.len() as u32);
                 for ad in autos { self.enc_def(u, ad, e, crates); }
             }
-            TyKind::ConstVal(v) => {
+            TyKind::Const(v) => {
                 e.u8(20);
-                e.u64(v);
+                return self.enc_const(u, v, e, crates, depth + 1);
             }
-            TyKind::Opaque(d, ast, args, _) => {
-                e.u8(21);
-                self.enc_def(u, d, e, crates);
-                e.u32(ast);
-                return self.enc_tys(u, &args, e, crates, depth);
-            }
-            TyKind::Param(_) | TyKind::Infer(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => return None,
+            TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => return None,
         }
         Some(())
+    }
+
+    // rustc_type_ir/src/const_kind.rs:21: persist const structure and stable defs.
+    fn enc_const(&mut self, u: &Unit, ct: relax_types::consts::Const, e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
+        use relax_types::consts::{ConstKind, AliasConstKind, GenericArg, ValTreeKind};
+        if depth > 64 { return None; }
+        match u.tcx.tys.const_kind(ct) {
+            ConstKind::Value(value) => {
+                e.u8(0);
+                self.enc_ty(u, value.ty, e, crates, depth + 1)?;
+                match value.valtree.kind() {
+                    ValTreeKind::Leaf(scalar) => { e.u8(0); e.u8(scalar.size()); e.u128(scalar.to_bits(scalar.size())); }
+                    ValTreeKind::Branch(fields) => {
+                        e.u8(1); e.u32(fields.len() as u32);
+                        for &ct in &**fields { self.enc_const(u, ct, e, crates, depth + 1)?; }
+                    }
+                }
+            }
+            ConstKind::Alias(rigid, alias) => {
+                e.u8(1); e.u8(rigid as u8);
+                e.u8(match alias.kind { AliasConstKind::Projection { .. } => 0, AliasConstKind::InherentSelf { .. } => 1,
+                    AliasConstKind::InherentImpl { .. } => 2, AliasConstKind::Free { .. } => 3, AliasConstKind::Anon { .. } => 4 });
+                self.enc_def(u, alias.kind.def_id(), e, crates);
+                e.u32(alias.args.len() as u32);
+                for arg in &*alias.args {
+                    match *arg {
+                        GenericArg::Type(ty) => { e.u8(0); self.enc_ty(u, ty, e, crates, depth + 1)?; }
+                        GenericArg::Const(ct) => { e.u8(1); self.enc_const(u, ct, e, crates, depth + 1)?; }
+                        GenericArg::Lifetime(r) => {
+                            e.u8(2);
+                            self.enc_region(u, r, e)?;
+                        }
+                    }
+                }
+            }
+            ConstKind::Param(p) => { e.u8(2); e.u32(p.index); }
+            ConstKind::Bound(d, b) => { e.u8(3); e.u32(d); e.u32(b.var.0); }
+            ConstKind::Infer(_) | ConstKind::Placeholder(_) | ConstKind::Error => return None,
+        }
+        Some(())
+    }
+
+    fn dec_const(&mut self, u: &Unit, d: &mut D, depth: u32) -> Option<relax_types::consts::Const> {
+        use relax_types::consts::{ConstKind, AliasConstKind, AliasConst, GenericArg, IsRigid, ValTree, ScalarInt, Value, ParamConst, BoundConst};
+        if depth > 64 { return None; }
+        let tys = &u.tcx.tys;
+        let kind = match d.u8()? {
+            0 => {
+                let ty = self.dec_ty(u, d, depth + 1)?;
+                let valtree = match d.u8()? {
+                    0 => { let size = d.u8()?; if size == 0 || size > 16 { return None; }
+                        ValTree::from_scalar_int(tys, ScalarInt::try_from_uint(d.u128()?, size)?) }
+                    1 => {
+                        let count = d.u32()? as usize;
+                        if count > d.b.len().saturating_sub(d.p) { return None; }
+                        let mut fields = Vec::with_capacity(count);
+                        for _ in 0..count { fields.push(self.dec_const(u, d, depth + 1)?); }
+                        ValTree::from_branches(tys, &fields)
+                    }
+                    _ => return None,
+                };
+                ConstKind::Value(Value { ty, valtree })
+            }
+            1 => {
+                let rigid = match d.u8()? { 0 => IsRigid::Yes, 1 => IsRigid::No, _ => return None };
+                let tag = d.u8()?;
+                let def_id = self.dec_def(u, d)?;
+                let kind = match tag { 0 => AliasConstKind::Projection { def_id }, 1 => AliasConstKind::InherentSelf { def_id },
+                    2 => AliasConstKind::InherentImpl { def_id }, 3 => AliasConstKind::Free { def_id }, 4 => AliasConstKind::Anon { def_id }, _ => return None };
+                let count = d.u32()? as usize;
+                        if count > d.b.len().saturating_sub(d.p) { return None; }
+                let mut args = Vec::with_capacity(count);
+                for _ in 0..count {
+                    args.push(match d.u8()? {
+                        0 => GenericArg::Type(self.dec_ty(u, d, depth + 1)?),
+                        1 => GenericArg::Const(self.dec_const(u, d, depth + 1)?),
+                        2 => GenericArg::Lifetime(self.dec_region(u, d)?),
+                        _ => return None,
+                    });
+                }
+                ConstKind::Alias(rigid, AliasConst { kind, args: args.into() })
+            }
+            2 => ConstKind::Param(ParamConst { index: d.u32()? }),
+            3 => ConstKind::Bound(d.u32()?, BoundConst { var: crate::types::BoundVar(d.u32()?) }),
+            _ => return None,
+        };
+        Some(tys.intern_const(kind))
     }
 
     fn enc_tys(&mut self, u: &Unit, v: &[TyId], e: &mut E, crates: &mut Vec<u32>, depth: u32) -> Option<()> {
         e.u32(v.len() as u32);
         v.iter().try_for_each(|x| self.enc_ty(u, *x, e, crates, depth + 1))
+    }
+
+    // Lead round-27 design: preserve Binder arity and ReBound identity, as
+    // rustc_type_ir/src/binder.rs:31-60 and region_kind.rs:149-158 @8d1a764.
+    // erase_regions keeps these regions because they affect selection and TypeId.
+    fn enc_region(&self, u: &Unit, r: crate::types::RegionId, e: &mut E) -> Option<()> {
+        match u.tcx.tys.region_kind(r) {
+            crate::types::RegionKind::ReErased => e.u8(0),
+            crate::types::RegionKind::ReBound(db, var) => { e.u8(1); e.u32(db); e.u32(var.0); }
+            _ => return None,
+        }
+        Some(())
+    }
+
+    fn dec_region(&self, u: &Unit, d: &mut D) -> Option<crate::types::RegionId> {
+        match d.u8()? {
+            0 => Some(crate::types::RegionId::ERASED),
+            1 => Some(u.tcx.tys.intern_region(crate::types::RegionKind::ReBound(d.u32()?, crate::types::BoundVar(d.u32()?)))),
+            _ => None,
+        }
+    }
+
+    fn enc_regions(&self, u: &Unit, regions: crate::types::RegionArgsId, e: &mut E) -> Option<()> {
+        let regions = u.tcx.tys.region_args(regions);
+        e.u32(regions.len() as u32);
+        for &r in &*regions {
+            self.enc_region(u, r, e)?;
+        }
+        Some(())
+    }
+
+    fn dec_regions(&self, u: &Unit, d: &mut D) -> Option<crate::types::RegionArgsId> {
+        let count = d.u32()? as usize;
+        if count > d.b.len().saturating_sub(d.p) { return None; }
+        let mut regions = Vec::with_capacity(count);
+        for _ in 0..count { regions.push(self.dec_region(u, d)?); }
+        Some(u.tcx.tys.intern_region_args(&regions))
     }
 
     fn dec_ty(&mut self, u: &Unit, d: &mut D, depth: u32) -> Option<TyId> {
@@ -1518,13 +1444,14 @@ impl Cache {
             7 => TyKind::Tuple(self.dec_tys(u, d, depth)?),
             8 => {
                 let el = self.dec_ty(u, d, depth + 1)?;
-                let n = if d.u8()? == 1 { crate::types::LEN_TY | self.dec_ty(u, d, depth + 1)?.0 as u64 } else { d.u64()? };
+                let n = self.dec_const(u, d, depth + 1)?;
                 TyKind::Array(el, n)
             }
             9 => TyKind::Slice(self.dec_ty(u, d, depth + 1)?),
             10 => {
                 let m = d.u8()? != 0;
-                TyKind::Ref(m, self.dec_ty(u, d, depth + 1)?, crate::types::RegionId::ERASED)
+                let r = self.dec_region(u, d)?;
+                TyKind::Ref(m, self.dec_ty(u, d, depth + 1)?, r)
             }
             11 => {
                 let m = d.u8()? != 0;
@@ -1532,7 +1459,8 @@ impl Cache {
             }
             12 => {
                 let def = self.dec_def(u, d)?;
-                TyKind::Adt(def, self.dec_tys(u, d, depth)?, crate::types::RegionArgsId::EMPTY)
+                let regions = self.dec_regions(u, d)?;
+                TyKind::Adt(def, self.dec_tys(u, d, depth)?, regions)
             }
             13 => {
                 let ps = self.dec_tys(u, d, depth)?;
@@ -1541,118 +1469,58 @@ impl Cache {
                     safety: match d.u8()? { 0 => crate::types::Safety::Safe, 1 => crate::types::Safety::Unsafe, _ => return None },
                     abi: crate::types::Abi::from_byte(d.u8()?)?,
                     c_variadic: match d.u8()? { 0 => false, 1 => true, _ => return None },
-                }, 0)
+                }, d.u32()?)
             }
             14 => {
                 let def = self.dec_def(u, d)?;
-                TyKind::FnDef(def, self.dec_tys(u, d, depth)?, crate::types::RegionArgsId::EMPTY)
+                let regions = self.dec_regions(u, d)?;
+                TyKind::FnDef(def, self.dec_tys(u, d, depth)?, regions)
             }
             17 => {
                 let file = self.dec_file(u, d)?;
                 let expr = d.u32()?;
                 if !self.closure_fp_agrees(u, file, expr, d.u64()?) { return None; }
-                let once = d.u8()? != 0;
+                let kind = self.dec_ty(u, d, depth + 1)?;
                 let sig = self.dec_ty(u, d, depth + 1)?;
                 let state = self.dec_ty(u, d, depth + 1)?;
                 let owner = self.dec_ty(u, d, depth + 1)?;
-                if once {
-                    u.tcx.closure_once.insert((file, expr, owner), ());
-                }
-                // The accepted entry already declares the owner's capture query result.
-                // Publish it before any nested callee key asks for it; checking the owner
-                // here defeats a code-cache hit. Crate fingerprints validate this payload.
-                let capture_kind = d.u8()?;
-                if capture_kind != 0 {
-                    let kind = match capture_kind {
-                        1 => crate::upvar::ClosureKind::Fn,
-                        2 => crate::upvar::ClosureKind::FnMut,
-                        3 => crate::upvar::ClosureKind::FnOnce,
-                        _ => return None,
-                    };
-                    let is_copy = match d.u8()? { 0 => false, 1 => true, _ => return None };
-                    let upvars = self.dec_ty(u, d, depth + 1)?;
-                        crate::upvar::publish_restored(&u.tcx, file, expr, owner,
-                        crate::upvar::ClosureCaptureTypes { kind, is_copy, upvars });
-                }
-                TyKind::Closure(file, expr, sig, state, owner)
+                TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state })
             }
             18 => {
-                let def = self.dec_def(u, d)?;
-                TyKind::Assoc(def, self.dec_tys(u, d, depth)?, crate::types::RegionArgsId::EMPTY)
+                let rigid = match d.u8()? { 0 => crate::consts::IsRigid::Yes, 1 => crate::consts::IsRigid::No, _ => return None };
+                let tag = d.u8()?;
+                let def_id = self.dec_def(u, d)?;
+                let kind = match tag {
+                    0 => AliasTyKind::Projection { def_id }, 1 => AliasTyKind::Inherent { def_id },
+                    2 => AliasTyKind::Opaque { def_id: def_id },
+                    3 => AliasTyKind::Free { def_id }, _ => return None,
+                };
+                {
+                    let regions = self.dec_regions(u, d)?;
+                    TyKind::Alias(rigid, AliasTy { kind, args: self.dec_tys(u, d, depth)?, regions })
+                }
             }
             19 => {
                 let def = self.dec_def(u, d)?;
+                let regions = self.dec_regions(u, d)?;
+                let r = self.dec_region(u, d)?;
+                let bound = d.u32()?;
                 let args = self.dec_tys(u, d, depth)?;
                 let n = d.u32()? as usize;
                 let mut binds = Vec::with_capacity(n);
                 for _ in 0..n {
+                    let bound = d.u32()?;
                     let bd = self.dec_def(u, d)?;
-                    binds.push((bd, self.dec_ty(u, d, depth + 1)?, 0));
+                    binds.push((bd, self.dec_ty(u, d, depth + 1)?, bound));
                 }
                 let n = d.u32()? as usize;
                 let mut autos = Vec::with_capacity(n);
                 for _ in 0..n { autos.push(self.dec_def(u, d)?); }
                 autos.sort_by_key(|d| d.0);
-                TyKind::Dyn(def, args.into(), binds.into(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, autos.into())
+                TyKind::Dyn(def, args.into(), binds.into(), regions, r, bound, autos.into())
             }
-            20 => TyKind::ConstVal(d.u64()?),
-            21 => {
-                let def = self.dec_def(u, d)?;
-                let ast = d.u32()?;
-                TyKind::Opaque(def, ast, self.dec_tys(u, d, depth)?, crate::types::RegionArgsId::EMPTY)
-            }
-            22 => {
-                let base = self.dec_ty(u, d, depth + 1)?;
-                return Self::dec_bound_regions(u, base, d);
-            }
-            _ => return None,
-        };
-        Some(tys.intern(k))
-    }
-
-    /// `base` (a region-free structure) with the bound regions enc_bound_regions wrote.
-    fn dec_bound_regions(u: &Unit, base: TyId, d: &mut D) -> Option<TyId> {
-        use crate::types::{BoundVar, RegionArgsId, RegionId, RegionKind};
-        let tys = &u.tcx.tys;
-        let region = |d: &mut D| -> Option<RegionId> {
-            match d.u8()? {
-                0 => Some(RegionId::ERASED),
-                1 => {
-                    let db = d.u32()?;
-                    let v = d.u32()?;
-                    Some(tys.intern_region(RegionKind::ReBound(db, BoundVar(v))))
-                }
-                _ => None,
-            }
-        };
-        let regions = |d: &mut D| -> Option<RegionArgsId> {
-            let n = d.u32()? as usize;
-            if n == 0 {
-                return Some(RegionArgsId::EMPTY);
-            }
-            let mut v = Vec::with_capacity(n.min(16));
-            for _ in 0..n {
-                v.push(region(d)?);
-            }
-            Some(tys.intern_region_args(&v))
-        };
-        let k = match tys.kind(base).clone() {
-            TyKind::Ref(m, x, _) => TyKind::Ref(m, x, region(d)?),
-            TyKind::Adt(def, a, _) => TyKind::Adt(def, a, regions(d)?),
-            TyKind::FnDef(def, a, _) => TyKind::FnDef(def, a, regions(d)?),
-            TyKind::Assoc(def, a, _) => TyKind::Assoc(def, a, regions(d)?),
-            TyKind::Opaque(def, ast, a, _) => TyKind::Opaque(def, ast, a, regions(d)?),
-            TyKind::Dyn(def, a, binds, _, _, _, autos) => {
-                let rs = regions(d)?;
-                let r = region(d)?;
-                let n = d.u32()?;
-                let mut b: Vec<_> = binds.iter().copied().collect();
-                for x in b.iter_mut() {
-                    x.2 = d.u32()?;
-                }
-                TyKind::Dyn(def, a, b.into(), rs, r, n, autos)
-            }
-            TyKind::FnPtr(ps, r, h, _) => TyKind::FnPtr(ps, r, h, d.u32()?),
+            20 => TyKind::Const(self.dec_const(u, d, depth + 1)?),
+            27 => TyKind::Foreign(self.dec_def(u, d)?),
             _ => return None,
         };
         Some(tys.intern(k))
@@ -1673,6 +1541,32 @@ impl Cache {
         }
         match key.clone() {
             // twins are never cached (their code depends on the sandbox layout of this run)
+            FnKey::Shim(shim) => {
+                use relax_types::instance::{ShimKind, ReifyReason};
+                e.u8(3);
+                let def = shim.kind.def_id();
+                let (tag, ty) = match shim.kind {
+                    ShimKind::VTable(_) => (0, None),
+                    ShimKind::Reify(_, _) => (1, None),
+                    ShimKind::FnPtr(_, ty) => (2, Some(ty)),
+                    ShimKind::ClosureOnce { .. } => (3, None),
+                    ShimKind::FnPtrAsPtr(_, ty) => (4, Some(ty)),
+                    ShimKind::FnPtrFromPtr(_, ty) => (5, Some(ty)),
+                    ShimKind::Clone(..) | ShimKind::DropGlue(..) => unreachable!("type glue has its own key"),
+                };
+                e.u8(tag);
+                self.enc_def(u, def, e, crates);
+                if let Some(ty) = ty { self.enc_ty(u, ty, e, crates, 0)?; }
+                match shim.kind {
+                    ShimKind::ClosureOnce { closure, track_caller, .. } => {
+                        self.enc_def(u, closure, e, crates);
+                        e.u8(u8::from(track_caller));
+                    }
+                    ShimKind::Reify(_, reason) => e.u8(match reason { None => 0, Some(ReifyReason::FnPtr) => 1, Some(ReifyReason::Vtable) => 2 }),
+                    _ => {}
+                }
+                self.enc_tys(u, &shim.args, e, crates, 0)
+            }
             FnKey::Sandbox(_) => None,
             FnKey::Inst(d, args) => {
                 e.u8(0);
@@ -1778,15 +1672,6 @@ impl Cache {
         let (k, crates, bytes) = self.code_key_bytes(u, &key)?;
         self.slot_crates.insert(id, crates);
         Some((k, bytes))
-    }
-
-    /// The code key of fn key `key` (slot_key without a slot): with the crates it names.
-    fn fnkey_code_key(&mut self, u: &Unit, key: &FnKey) -> Option<u128> {
-        self.code_key(u, key).map(|(k, _)| k)
-    }
-
-    fn code_key(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>)> {
-        self.code_key_bytes(u, key).map(|(k, crates, _)| (k, crates))
     }
 
     fn code_key_bytes(&mut self, u: &Unit, key: &FnKey) -> Option<(u128, Vec<u32>, Vec<u8>)> {
@@ -2086,13 +1971,17 @@ impl Cache {
     /// launch links O2 code at the first call. A replaced entry's code may be in the startup
     /// image: the manifest is written again.
     pub fn record_o2(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) {
+        // The O2 worker can finish after O3 installed (or linked from the cache). Never
+        // downgrade its entry, even when that O3 build itself was too large to cache.
+        if u.fns[id as usize].o3.load(std::sync::atomic::Ordering::Relaxed) { return; }
         self.record_entry(u, id, code, relocs, pc_map, None, true)
     }
 
-    /// Records the O3 code of a `#[relax(O3)]` slot as the slot's ordinary entry (its O1 key,
-    /// replacing an O1/O2 entry), with its inlined slots and nounwind inputs, so a warm launch
-    /// links O3 code at the first call. Not a deferred (big-frame) build: that one must not run
-    /// from the first call (jit.rs keeps it out).
+    /// Records installed O3 code (marked or hot) as the slot's ordinary entry (its O1 key,
+    /// replacing O1/O2 or an earlier O3 build), with its inlined slots and nounwind inputs.
+    /// A warm launch links O3 code at the first call. Not a deferred (big-frame) build: it must not run
+    /// from the first call (jit.rs keeps it out). Like O2, it rewrites the startup image and
+    /// buffers the entry for the monitor's spill / exit flush; no store write on this thread.
     pub fn record_o3(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], inlined: &[u32], nounwind: &[(u32, bool)]) {
         self.record_entry(u, id, code, relocs, pc_map, Some((inlined, nounwind)), false)
     }
@@ -2102,7 +1991,8 @@ impl Cache {
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         // O3 and O2 code replace the slot's entry; O1 code is recorded once
         let replace = o3.is_some() || o2;
-        if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || (!replace && self.linked.contains(&id)) {
+        let f = &u.fns[id as usize];
+        if self.mode == Mode::ReadOnly || f.patch_gen != 0 || u.prog.is_edit_version(f.file) || (!replace && self.linked.contains(&id)) {
             return;
         }
         // a foreign fn's slot holds a jump to the C address (no relocation): never stored
@@ -2134,7 +2024,7 @@ impl Cache {
             return;
         };
         self.pending_keys.insert(key);
-        if o2 && (existing || self.linked.contains(&id)) {
+        if replace && (existing || self.linked.contains(&id)) {
             self.image_rewrite = true;
         }
         let kc = self.cur_crate;
@@ -2181,6 +2071,10 @@ impl Cache {
             if !seen.insert(c) || c as usize >= u.fns.len() {
                 continue;
             }
+            // A new caller can inline an edited body without itself being a patch. Its
+            // cached/memoized key must not certify code built from that live file version.
+            let f = &u.fns[c as usize];
+            if f.patch_gen != 0 || u.prog.is_edit_version(f.file) { return None; }
             if let Some(v) = u.body_deps.get(&c) {
                 stack.extend(v.iter().copied());
             }
@@ -2252,8 +2146,6 @@ impl Cache {
         let mut e = E::default();
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
-        // the entry's metadata: its closures' capture facts (capture_query)
-        if o3.is_none() { self.capture_section(u, id, &mut e) } else { e.u32(0) }
         // the code's level (TIER_O1 / TIER_O3 / TIER_O2 / TIER_BASE); O3: the inlined slots (by key)
         let base = o3.is_none() && !o2 && u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline);
         e.u8(if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if base { TIER_BASE } else { TIER_O1 });
@@ -2493,7 +2385,7 @@ impl Cache {
         } else { None };
         self.manifest_done = true;
         // at exit no key can be made any more (slot_key): slots no lookup or record keyed this
-        // run fall out of the image. A rewrite then (O2 code replaced startup code since the
+        // run fall out of the image. A rewrite then (O2/O3 code replaced startup code since the
         // mid-run write) must not replace the loaded image with one covering fewer slots: the
         // next start would prelink a fraction of it (Calculator: 16,000 -> 2 slots)
         let n_img = img.as_ref().map_or(0, |i| i.1 as usize);
@@ -2573,7 +2465,9 @@ impl Cache {
 /// front store, everything else to its code store.
 fn by_store(pending: Vec<(u32, PendingEntry)>) -> HashMap<(u32, bool), Vec<PendingEntry>> {
     let mut by: HashMap<(u32, bool), Vec<PendingEntry>> = HashMap::new();
-    for (c, e) in pending {
+    // Records arrive oldest first; store::append keeps the first entry for a duplicate key.
+    // A later O3/retier must win over O1/O2 recorded in the same spill or exit flush.
+    for (c, e) in pending.into_iter().rev() {
         let front = e.kind == KIND_FRONT || e.kind == KIND_FRONT_CRATE;
         by.entry((c, front)).or_default().push(e);
     }
@@ -2977,7 +2871,12 @@ fn def_kind_code(k: &DefKind) -> u32 {
         DefKind::AssocTy => 14,
         DefKind::ForeignFn => 15,
         DefKind::ForeignStatic => 16,
+        DefKind::ForeignTy => 22,
         DefKind::MacroRules => 17,
+        DefKind::AnonConst => 18,
+        DefKind::OpaqueTy => 19,
+        DefKind::Closure => 20,
+        DefKind::Field => 21,
         DefKind::Prim(p) => 100 + prim_code(*p) as u32,
     }
 }
@@ -2998,7 +2897,7 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
     let krate = match &u.fns[id as usize].key {
         FnKey::Inst(d, _) => u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name).to_string(),
         FnKey::Closure(f, _, _) => u.prog.file_crate.get(*f as usize).map_or("-".to_string(), |c| u.prog.syms.str(u.prog.crates[*c as usize].name).to_string()),
-        FnKey::Glue(..) | FnKey::Sandbox(_) => "-".to_string(),
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => "-".to_string(),
     };
     let on_main = crate::jit::MAIN_TID.load(std::sync::atomic::Ordering::Relaxed) == crate::jit::current_thread_id();
     let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id));
@@ -3047,7 +2946,7 @@ impl Cache {
             _ => return true,
         };
         let mut d = D { b: &cached, p: 0 };
-        if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() || skip_captures(&mut d).is_none() { return false; }
+        if d.u32() != Some(ENTRY_VERSION) || d.str().is_none() { return false; }
         let Some((start, end)) = skip_build_inputs(&mut d) else { return false };
         let facts = u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice());
         let Some(encoded) = self.nounwind_bytes(u, facts) else { return false };
@@ -3211,22 +3110,6 @@ pub(crate) fn closure_identity_ok(u: &Unit, file: u32, expr: u32) -> bool {
     }
 }
 
-fn skip_captures(d: &mut D) -> Option<()> {
-    let n = d.u32()?;
-    if n != 0 {
-        d.str()?;
-        d.u128()?;
-    }
-    for _ in 0..n {
-        d.u32()?;
-        d.u64()?;
-        d.u8()?;
-        d.u8()?;
-        d.u8()?;
-        d.bytes()?;
-    }
-    Some(())
-}
 
 /// Reads the nounwind inputs and the dependency certificate; returns the nounwind section (for
 /// verification).
@@ -4963,10 +4846,274 @@ mod cold_tests {
 mod data_tests {
     use super::*;
 
+    static CACHE_UNIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     std::thread_local! {
         // Run a nested lookup while an outer lookup owns its link guard, without
         // requiring process-global JIT execution of a static initializer.
         pub(super) static BEFORE_LINK: std::cell::RefCell<Option<Box<dyn FnOnce(&mut Unit)>>> = Default::default();
+    }
+
+    #[test]
+    fn round23_shim_keys_roundtrip() {
+        use relax_types::instance::{ShimKind, ReifyReason};
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-shim-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "#![no_std] fn method() {} fn owner() { let _ = || 1; let _ = || 2; } extern \"C\" { type Code; } struct Borrowed<'a>(&'a u32); type Alias<'a> = Borrowed<'a>; trait View<'a> {} fn early<'a>(_: &'a u32) where 'a: 'a {}").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("shim_keys", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let method = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "method").then_some(DefId(i as u32))).unwrap();
+        let code = prog.defs.iter().enumerate().find_map(|(i, d)| (d.kind == DefKind::ForeignTy).then_some(DefId(i as u32))).unwrap();
+        let closures: Vec<_> = prog.defs.iter().enumerate().filter_map(|(i, d)| (d.kind == DefKind::Closure).then_some(DefId(i as u32))).collect();
+        assert_eq!(closures.len(), 2);
+        let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let callable = u.tcx.tys.intern(TyKind::FnPtr(vec![u.tcx.tys.usize_], u.tcx.tys.usize_, crate::types::FnHeader::RUST, 0));
+        let mut kinds = vec![ShimKind::VTable(method), ShimKind::FnPtr(method, callable), ShimKind::FnPtrAsPtr(method, callable), ShimKind::FnPtrFromPtr(method, callable)];
+        for reason in [None, Some(ReifyReason::FnPtr), Some(ReifyReason::Vtable)] { kinds.push(ShimKind::Reify(method, reason)); }
+        for closure in closures { for track_caller in [false, true] { kinds.push(ShimKind::ClosureOnce { call_once: method, closure, track_caller }); } }
+        let foreign = u.tcx.tys.intern(TyKind::Foreign(code));
+        let pointer = u.tcx.tys.intern(TyKind::Ptr(false, foreign));
+        let named = |name| u.prog.defs.iter().enumerate().find_map(|(i, _)| (u.prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+        let regions = u.tcx.tys.intern_region_args(&[crate::types::RegionId::ERASED]);
+        let borrowed = u.tcx.tys.intern(TyKind::Adt(named("Borrowed"), vec![], regions));
+        let early = u.tcx.tys.intern(TyKind::FnDef(named("early"), vec![], regions));
+        let alias = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: vec![], regions }));
+        let object = u.tcx.tys.intern(TyKind::Dyn(named("View"), vec![].into(), vec![].into(), regions, crate::types::RegionId::ERASED, 0, vec![].into()));
+        let mut encoded = Vec::new();
+        for kind in kinds {
+            let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object] });
+            let mut bytes = E::default();
+            assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut vec![], 0).is_some());
+            assert!(!encoded.contains(&bytes.0), "colliding shim key");
+            encoded.push(bytes.0);
+        }
+        u.tcx = crate::tcx::Tcx::new();
+        for n in 0..23 { u.tcx.tys.const_usize(n); }
+        for bytes in encoded {
+            let mut decoder = D { b: &bytes, p: 0 };
+            let key = unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut decoder, 0) }.unwrap();
+            assert_eq!(decoder.p, bytes.len());
+            let mut again = E::default();
+            assert!(cache.enc_fnkey(&u, &key, &mut again, &mut vec![], 0).is_some());
+            assert_eq!(bytes, again.0);
+            for end in 0..bytes.len() {
+                assert!(unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut D { b: &bytes[..end], p: 0 }, 0) }.is_none());
+            }
+        }
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn round27_cached_native_const_array_pointer_words() {
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-array-pointers-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "#![no_std] const N: usize = 2; fn array() -> [*const u8; N] { loop {} }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("array_pointers", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let def = DefId(prog.defs.iter().position(|d| prog.syms.str(d.name) == "array").unwrap() as u32);
+        let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+        let u = Unit::new(prog, tcx, 0);
+        let ty = u.tcx.fn_sig(&u.prog, def).unwrap().ret;
+        let TyKind::Array(_, n) = u.tcx.tys.kind(ty) else { panic!("array return type") };
+        assert!(n.try_to_target_usize(&u.tcx.tys).is_none(), "fixture must retain the declared alias");
+        let target = u.data(b"target", 1, DataKind::Bytes);
+        let sym = u.data_sym(target);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&target.to_ne_bytes());
+        bytes.extend_from_slice(&target.to_ne_bytes());
+        let address = u.data(&bytes, 8, DataKind::Typed(ty));
+        let Some(SymKind::Data(index)) = u.syms.kind(u.data_sym(address).id) else { panic!("data symbol") };
+        assert_eq!(crate::syms::obj_pointer_words(&u, index), Some(vec![(0, sym), (8, sym)]));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn round27_bound_regions_cache_roundtrip_and_reuse() {
+        use crate::types::{RegionId, RegionKind, BoundVar, FnHeader, ClosureArgs};
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session = crate::Session::default();
+        session.options.tier1 = false; session.options.tyck_ahead = false;
+        let session = std::sync::Arc::new(session);
+        let root = std::env::temp_dir().join(format!("relax-bound-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, "#![no_std] fn method<T>() {} fn owner() { let _ = || 1; } struct Borrowed<'a>(&'a u32); type Alias<'a> = Borrowed<'a>; trait View<'a> { type Output; } trait Fn<Args> { type FnOutput; }").unwrap();
+        let mut prog = crate::program::Program::new(&session);
+        prog.load_crate("bound_keys", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+        let mut u = Unit::new(prog, tcx, 0);
+        let named = |name| u.prog.defs.iter().enumerate().find_map(|(i, _)| (u.prog.name(DefId(i as u32)) == name).then_some(DefId(i as u32))).unwrap();
+        let method = named("method");
+        let tys = &u.tcx.tys;
+        let bound = tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
+        let outer = tys.intern_region(RegionKind::ReBound(1, BoundVar(1)));
+        let reference = tys.intern(TyKind::Ref(false, tys.u32_, bound));
+        let erased = tys.intern(TyKind::Ref(false, tys.u32_, RegionId::ERASED));
+        let static_ref = tys.intern(TyKind::Ref(false, tys.u32_, tys.intern_region(RegionKind::ReStatic)));
+        let hr = tys.intern(TyKind::FnPtr(vec![reference], tys.unit, FnHeader::RUST, 1));
+        let plain = tys.intern(TyKind::FnPtr(vec![erased], tys.unit, FnHeader::RUST, 0));
+        let static_fn = tys.intern(TyKind::FnPtr(vec![static_ref], tys.unit, FnHeader::RUST, 0));
+        assert_eq!(tys.erase_regions(static_fn), plain);
+        // Source fn(&u32) has the same late-bound region as for<'a> fn(&'a u32).
+        // An already-erased, unbound signature is instead `plain`.
+        let vacuous = tys.intern(TyKind::FnPtr(vec![erased], tys.unit, FnHeader::RUST, 1));
+        let outer_ref = tys.intern(TyKind::Ref(false, tys.u32_, outer));
+        let inner = tys.intern(TyKind::FnPtr(vec![reference, outer_ref], outer_ref, FnHeader::RUST, 1));
+        let nested = tys.intern(TyKind::FnPtr(vec![], inner, FnHeader::RUST, 2));
+        let regions = tys.intern_region_args(&[bound]);
+        let object = tys.intern(TyKind::Dyn(named("View"), vec![reference].into(), vec![(named("Output"), outer_ref, 1)].into(), regions, outer, 1, vec![].into()));
+        let fn_object = tys.intern(TyKind::Dyn(named("Fn"), vec![tys.intern(TyKind::Tuple(vec![reference]))].into(), vec![(named("FnOutput"), tys.unit, 0)].into(), crate::types::RegionArgsId::EMPTY, RegionId::ERASED, 1, vec![].into()));
+        let owner = named("owner");
+        let closure = tys.intern(TyKind::Closure(u.prog.def(owner).file, crate::program::closure_exprs(&u.prog, owner)[0], ClosureArgs {
+            parent_args: tys.unit, closure_kind_ty: tys.u8_, closure_sig_as_fn_ptr_ty: hr, tupled_upvars_ty: tys.unit,
+        }));
+        let borrowed = tys.intern(TyKind::Adt(named("Borrowed"), vec![], regions));
+        let fndef = tys.intern(TyKind::FnDef(method, vec![hr], regions));
+        let alias = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: vec![], regions }));
+        let ct = tys.intern_const(crate::consts::ConstKind::Alias(crate::consts::IsRigid::No, crate::consts::AliasConst {
+            kind: crate::consts::AliasConstKind::Anon { def_id: method }, args: vec![crate::consts::GenericArg::Lifetime(outer)].into(),
+        }));
+        let constant = tys.intern(TyKind::Const(ct));
+        let fixtures = [hr, plain, vacuous, nested, object, fn_object, closure, borrowed, fndef, alias, constant];
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        for kind in [RegionKind::ReStatic, RegionKind::ReEarlyParam(0), RegionKind::ReVar(0),
+            RegionKind::RePlaceholder { universe: crate::types::UniverseIndex(1), var: BoundVar(0) }, RegionKind::ReError] {
+            assert!(cache.enc_region(&u, tys.intern_region(kind), &mut E::default()).is_none());
+        }
+        assert!(cache.dec_region(&u, &mut D { b: &[2], p: 0 }).is_none());
+        let mut encodings = Vec::new();
+        let mut slots = Vec::new();
+        for ty in fixtures {
+            let mut e = E::default();
+            assert!(cache.enc_ty(&u, ty, &mut e, &mut vec![], 0).is_some());
+            assert!(!encodings.contains(&e.0), "colliding binder keys");
+            let mut d = D { b: &e.0, p: 0 };
+            assert_eq!(cache.dec_ty(&u, &mut d, 0), Some(ty));
+            assert_eq!(d.p, e.0.len());
+            for end in 0..e.0.len() {
+                assert!(cache.dec_ty(&u, &mut D { b: &e.0[..end], p: 0 }, 0).is_none());
+            }
+            encodings.push(e.0);
+            let id = u.fn_id(FnKey::Inst(method, vec![ty]));
+            assert!(cache.lookup(&mut u, id).is_none());
+            cache.record(&u, id, &[0xc3], &[], &[]);
+            slots.push(id);
+        }
+        assert_eq!(cache.stats.recorded, fixtures.len() as u64);
+        assert_eq!(cache.flush().unwrap(), fixtures.len());
+        drop(cache);
+        let mut warm = open_test_cache(&u, &root.join("cache"));
+        for id in slots {
+            let Some((code, _, _)) = warm.lookup(&mut u, id) else {
+                panic!("cold entry must hit after reopening the disk cache");
+            };
+            assert_eq!(code, [0xc3]);
+        }
+        assert_eq!(warm.stats.hits, fixtures.len() as u64);
+        assert_eq!(warm.stats.link_fail, 0);
+        drop(warm);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_const_cache_roundtrip() {
+        use relax_types::consts::{Const, ConstKind, ScalarInt, ValTree};
+        let mut session = crate::Session::default();
+        // These fixtures serialize types without executing code. Unit::drop's
+        // tier-1 shutdown retains a process-wide lock until process exit.
+        session.options.tier1 = false;
+        session.options.tyck_ahead = false;
+        let sess = &std::sync::Arc::new(session);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("relax-native-const-cache-{}", std::process::id()));
+        let mut u = Unit::new(crate::program::Program::new(sess), crate::tcx::Tcx::new(), 0);
+        let mut cache = open_test_cache(&u, &root);
+        let tys = &u.tcx.tys;
+        let wide_ty = tys.intern(TyKind::Int(crate::program::Prim::U128));
+        let wide = Const::new_value(tys, ValTree::from_scalar_int(tys,
+            ScalarInt::try_from_uint((1u128 << 127) + 23, 16).unwrap()), wide_ty);
+        let byte = Const::new_value(tys, ValTree::from_scalar_int(tys,
+            ScalarInt::try_from_uint(17, 1).unwrap()), tys.u8_);
+        let aggregate = Const::new_value(tys, ValTree::from_branches(tys, &[wide, byte]),
+            tys.intern(TyKind::Tuple(vec![wide_ty, tys.u8_])));
+        let array = tys.mk_array(tys.u8_, tys.const_usize(u64::MAX));
+        let types = [array, tys.intern(TyKind::Const(aggregate))];
+        let expected = [crate::stable::type_hash(&u.prog, &u.tcx, array),
+            crate::stable::type_hash(&u.prog, &u.tcx, types[1])];
+        let mut encodings = Vec::new();
+        for ty in types {
+            let mut e = E(Vec::new());
+            assert!(cache.enc_ty(&u, ty, &mut e, &mut Vec::new(), 0).is_some());
+            encodings.push(e.0);
+        }
+        // Arena indices must not be the persisted representation.
+        u.tcx = crate::tcx::Tcx::new();
+        for n in 0..19 { u.tcx.tys.const_usize(n); }
+        for (i, bytes) in encodings.iter().enumerate() {
+            let mut d = D { b: bytes, p: 0 };
+            let decoded = cache.dec_ty(&mut u, &mut d, 0).unwrap();
+            assert_eq!(d.p, bytes.len());
+            assert_eq!(crate::stable::type_hash(&u.prog, &u.tcx, decoded), expected[i]);
+            for end in 0..bytes.len() {
+                let mut truncated = D { b: &bytes[..end], p: 0 };
+                assert!(cache.dec_ty(&mut u, &mut truncated, 0).is_none());
+            }
+        }
+        let error = u.tcx.tys.intern_const(ConstKind::Error);
+        assert!(cache.enc_const(&u, error, &mut E(Vec::new()), &mut Vec::new(), 0).is_none());
+        drop(cache);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn native_opaque_def_cache_roundtrip() {
+        let mut session = crate::Session::default();
+        // These fixtures serialize types without executing code. Unit::drop's
+        // tier-1 shutdown retains a process-wide lock until process exit.
+        session.options.tier1 = false;
+        session.options.tyck_ahead = false;
+        let sess = &std::sync::Arc::new(session);
+        let _unit = CACHE_UNIT.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("relax-opaque-def-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("lib.rs");
+        std::fs::write(&source, b"#![no_std] trait Tr {} fn owner() -> (impl Tr, impl Tr) { loop {} }").unwrap();
+        let mut prog = crate::program::Program::new(sess);
+        prog.load_crate("opaque_defs", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![]).unwrap();
+        let mut definitions = Vec::new();
+        for (i, d) in prog.defs.iter().enumerate() { if d.kind == DefKind::OpaqueTy { definitions.push(DefId(i as u32)); } }
+        assert_eq!(definitions.len(), 2);
+        let mut u = Unit::new(prog, crate::tcx::Tcx::new(), 0);
+        let mut cache = open_test_cache(&u, &root.join("cache"));
+        let mut encodings = Vec::new();
+        let mut hashes = Vec::new();
+        for def_id in definitions {
+            let ty = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No,
+                AliasTy { kind: AliasTyKind::Opaque { def_id }, args: vec![], regions: crate::types::RegionArgsId::EMPTY }));
+            let hash = crate::stable::type_hash(&u.prog, &u.tcx, ty);
+            assert!(!hashes.contains(&hash)); hashes.push(hash);
+            let mut e = E(Vec::new());
+            assert!(cache.enc_ty(&u, ty, &mut e, &mut vec![], 0).is_some());
+            assert!(!encodings.contains(&e.0));
+            let mut d = D { b: &e.0, p: 0 };
+            assert_eq!(cache.dec_ty(&mut u, &mut d, 0), Some(ty));
+            assert_eq!(d.p, e.0.len());
+            encodings.push(e.0);
+        }
+        drop(cache); std::fs::remove_dir_all(root).unwrap();
     }
 
     fn open_test_cache(u: &Unit, root: &std::path::Path) -> Cache {
@@ -5420,7 +5567,7 @@ mod data_tests {
 
         // a shared pointer into a promoted block an initializer's code wrote: the block's bytes
         // (pointers relocated) by its type; a `*mut` to it, and an untyped block, stay unattributed
-        let block_ty = u.tcx.tys.intern(TyKind::Array(ptr_ty, 2));
+        let block_ty = u.tcx.tys.intern(TyKind::Array(ptr_ty, u.tcx.tys.const_usize(2)));
         let block = u.rw_sym(16, 8, Some(block_ty));
         let b = u.syms.value(block);
         unsafe {
@@ -5551,6 +5698,21 @@ impl Linker {
             2 => {
                 let g = d.u8()?;
                 FnKey::Glue(g, self.cache().dec_ty(u, d, 0)?)
+            }
+            3 => {
+                use relax_types::instance::{ShimKind, ReifyReason};
+                let tag = d.u8()?;
+                let def = self.cache().dec_def(u, d)?;
+                let kind = match tag {
+                    0 => ShimKind::VTable(def),
+                    1 => ShimKind::Reify(def, match d.u8()? { 0 => None, 1 => Some(ReifyReason::FnPtr), 2 => Some(ReifyReason::Vtable), _ => return None }),
+                    2 => ShimKind::FnPtr(def, self.cache().dec_ty(u, d, 0)?),
+                    3 => ShimKind::ClosureOnce { call_once: def, closure: self.cache().dec_def(u, d)?, track_caller: match d.u8()? { 0 => false, 1 => true, _ => return None } },
+                    4 => ShimKind::FnPtrAsPtr(def, self.cache().dec_ty(u, d, 0)?),
+                    5 => ShimKind::FnPtrFromPtr(def, self.cache().dec_ty(u, d, 0)?),
+                    _ => return None,
+                };
+                FnKey::Shim(crate::jit::ShimInstance { kind, args: self.cache().dec_tys(u, d, 0)? })
             }
             _ => return None,
         })
@@ -5762,7 +5924,6 @@ impl Linker {
             return None;
         }
         d.str()?;
-        skip_captures(&mut d)?;
         let (_, nounwind_end) = skip_build_inputs(&mut d)?;
         let mut d = D { b: payload, p: nounwind_end };
         let nc = d.u32()? as usize;
@@ -5797,7 +5958,6 @@ impl Linker {
             return None;
         }
         let _name = d.str()?;
-        skip_captures(&mut d)?;
         let tier = d.u8()?;
         let is_o3 = tier == TIER_O3;
         let ni = d.u32()? as usize;

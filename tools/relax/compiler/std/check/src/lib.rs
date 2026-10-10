@@ -8,6 +8,8 @@
 #![allow(dead_code, unused_imports, unused_unsafe, unused_mut, unused_variables)]
 #![allow(clippy::all)]
 #![allow(dangerous_implicit_autorefs)]
+// Relax core's fmt traits are `: PointeeSized` as nightly's (library/core/src/fmt/mod.rs:1053-1593).
+#![feature(sized_hierarchy)]
 
 extern crate alloc;
 
@@ -119,7 +121,7 @@ pub mod panicking {
         panic!("{}", msg)
     }
     #[track_caller]
-    pub fn panic_display<T: ?Sized + core::fmt::Display>(x: &T) -> ! {
+    pub fn panic_display<T: core::fmt::Display>(x: &T) -> ! {
         panic!("{}", x)
     }
     #[track_caller]

@@ -7,7 +7,8 @@
 //! lower.rs is the reference for how each Body fact is read (autoderef counts, overloaded
 //! deref/index with the mutable variants in mutable place contexts, binding modes).
 
-use crate::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::bir::*;
 use super::tyx::Tx;
 use crate::ast::*;
@@ -587,7 +588,7 @@ impl<'a> Build<'a> {
             }
         };
         let ret = match self.tx.kind(closure_ty) {
-            TyKind::Closure(_, _, sig, _, _) => match self.tx.kind(sig) {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => match self.tx.kind(sig) {
                 TyKind::FnPtr(_, r, _, _) => r,
                 _ => self.ty(body),
             },
@@ -1106,7 +1107,7 @@ impl<'a> Build<'a> {
 
     /// The deref of `base` (type `bt`) at autoderef step (key, k): overloaded through
     /// Deref::deref / DerefMut::deref_mut (in a mutable context), else builtin.
-    pub(super) fn deref_step(&mut self, key: u32, k: u8, base: Place, bt: TyId, mutbl: bool) -> Place {
+    pub(super) fn deref_step(&mut self, key: u32, k: usize, base: Place, bt: TyId, mutbl: bool) -> Place {
         if self.tx.box_inner(bt).is_some() {
             // Box derefs are builtin (a place of its own, movable)
             return base.deref();
@@ -1118,7 +1119,7 @@ impl<'a> Build<'a> {
     }
 
     /// The type after autoderef step (key, k) of a value of type `t` (no code).
-    pub(super) fn deref_target_ty(&self, key: u32, k: u8, t: TyId) -> TyId {
+    pub(super) fn deref_target_ty(&self, key: u32, k: usize, t: TyId) -> TyId {
         if self.tx.box_inner(t).is_none() {
             if let Some((m, _)) = self.b.ov_derefs.get(&(key, k)) {
                 let tx = self.tx;
@@ -1126,8 +1127,8 @@ impl<'a> Build<'a> {
                 let tsym = tx.prog.syms.get("Target").unwrap_or(u32::MAX);
                 return match tx.tcx.trait_assoc(tx.prog, td, tsym) {
                     Some(ad) => {
-                        let proj = tx.tcx.tys.intern(TyKind::Assoc(ad, vec![t], crate::types::RegionArgsId::EMPTY));
-                        tx.tcx.normalize(&tx.cx, tx.prog, proj)
+                        let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![t], regions: crate::types::RegionArgsId::EMPTY }));
+                        tx.normalize(proj)
                     }
                     None => t,
                 };
@@ -1141,7 +1142,7 @@ impl<'a> Build<'a> {
         let mut is_mut = false;
         if mutbl {
             if let Some(td) = self.tx.lang("ops::DerefMut") {
-                if matches!(self.tx.select_trait(td, bt, &[]), SelectionResult::Ok(_)) {
+                if self.tx.evaluate_trait(td, bt, &[]).must_apply_modulo_regions() {
                     for &it in &self.tx.prog.traits[self.tx.prog.def(td).sub as usize] {
                         if self.tx.prog.name(it) == "deref_mut" {
                             def = it;
@@ -1157,8 +1158,8 @@ impl<'a> Build<'a> {
             let tsym = tx.prog.syms.get("Target").unwrap_or(u32::MAX);
             match tx.tcx.trait_assoc(tx.prog, td, tsym) {
                 Some(ad) => {
-                    let proj = tx.tcx.tys.intern(TyKind::Assoc(ad, vec![bt], crate::types::RegionArgsId::EMPTY));
-                    tx.tcx.normalize(&tx.cx, tx.prog, proj)
+                    let proj = tx.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![bt], regions: crate::types::RegionArgsId::EMPTY }));
+                    tx.normalize(proj)
                 }
                 None => tx.tcx.tys.error,
             }
@@ -1509,7 +1510,7 @@ impl<'a> Build<'a> {
         let mut is_mut = false;
         if mutbl {
             if let Some(td) = self.tx.lang("ops::IndexMut") {
-                if matches!(self.tx.select_trait(td, args[0], &args[1..]), SelectionResult::Ok(_)) {
+                if self.tx.evaluate_trait(td, args[0], &args[1..]).must_apply_modulo_regions() {
                     for &it in &self.tx.prog.traits[self.tx.prog.def(td).sub as usize] {
                         if self.tx.prog.name(it) == "index_mut" {
                             def = it;
@@ -1578,7 +1579,7 @@ impl<'a> Build<'a> {
                             };
                             bits.map(ConstantKind::Float).unwrap_or(ConstantKind::Unknown)
                         }
-                        _ => crate::consteval::parse_int_lit(&text).map(ConstantKind::Scalar).unwrap_or(ConstantKind::Unknown),
+                        _ => crate::const_fold::parse_int_lit(&text).map(ConstantKind::Scalar).unwrap_or(ConstantKind::Unknown),
                     },
                     LitKind::Char => crate::lit::unescape_str(&text).chars().next()
                         .map(|c| ConstantKind::Scalar(c as u128)).unwrap_or(ConstantKind::Unknown),
@@ -2451,7 +2452,7 @@ impl<'a> Build<'a> {
             let pt = match &sig {
                 Some(s) if i < s.params.len() => {
                     let x = self.tx.tcx.tys.subst(s.params[i], &gargs);
-                    self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, x)
+                    self.tx.normalize(x)
                 }
                 _ => self.ty(*a),
             };
@@ -2653,7 +2654,7 @@ impl<'a> Build<'a> {
 
     pub(super) fn callable_params(&self, t: TyId) -> Vec<TyId> {
         match self.tx.kind(t) {
-            TyKind::Closure(_, _, sig, _, _) => match self.tx.kind(sig) {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => match self.tx.kind(sig) {
                 TyKind::FnPtr(ps, _, _, _) => ps,
                 _ => Vec::new(),
             },
@@ -2726,7 +2727,7 @@ impl<'a> Build<'a> {
         } else if m.derefs == 0 {
             let self_pt = sig.as_ref().and_then(|s| s.params.first().copied()).map(|p| {
                 let x = self.tx.tcx.tys.subst(p, &m.args);
-                self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, x)
+                self.tx.normalize(x)
             });
             // a `&mut self` receiver passed by value: reborrowed (rustc: the receiver adjusts
             // with a reborrow)
@@ -2766,7 +2767,7 @@ impl<'a> Build<'a> {
             let pt = match &sig {
                 Some(s) if i + 1 < s.params.len() => {
                     let x = self.tx.tcx.tys.subst(s.params[i + 1], &m.args);
-                    self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, x)
+                    self.tx.normalize(x)
                 }
                 _ => self.ty(*a),
             };
@@ -2882,59 +2883,39 @@ impl<'a> Build<'a> {
         std::str::from_utf8(self.tx.prog.syms.str(name).as_bytes()).ok().and_then(|s| s.parse::<u32>().ok())
     }
 
+    // rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764: consume the typed
+    // desugaring, including both calls, so borrowck sees the same moves as codegen.
     pub(super) fn try_expr(&mut self, dest: Place, e: ExprId, x: ExprId) {
+        use crate::lang_items::LangItem;
         let xt = self.ty(x);
-        let tmp = self.temp(xt);
-        self.into(Place::local(tmp), x);
-        let is_result = matches!(self.tx.kind(xt), TyKind::Adt(d, _, _) if self.tx.prog.name(d) == "Result");
-        let (ok_name, err_name) = if is_result { ("Ok", "Err") } else { ("Some", "None") };
-        let vi_ok = self.variant_index(xt, ok_name);
+        let input = self.temp(xt);
+        self.into(Place::local(input), x);
+        let (branch, args, flow) = self.b.try_branch[&e.0].clone();
+        let tmp = self.temp(flow);
+        let op = self.operand_of(Place::local(input));
+        let (dd, aa) = self.tx.resolve_trait_method(branch, &args);
+        self.call(Callee::Fn(dd, aa), vec![op], Place::local(tmp));
+        let TyKind::Adt(def, _, _) = self.tx.kind(flow) else { return; };
+        let variants = &self.tx.tcx.adts[&def].variants;
+        let vi_ok = variants.iter().position(|v| Some(v.def) == self.tx.tcx.lang_items.get(LangItem::ControlFlowContinue)).unwrap() as u32;
+        let vi_err = variants.iter().position(|v| Some(v.def) == self.tx.tcx.lang_items.get(LangItem::ControlFlowBreak)).unwrap() as u32;
         let okb = self.new_block();
         let errb = self.new_block();
         let d = self.temp(self.tx.tcx.tys.prim(crate::program::Prim::Isize));
         self.assign(Place::local(d), Rvalue::Discriminant(Place::local(tmp)));
-        self.term(TermKind::Switch(Operand::Copy(Place::local(d)), vec![okb, errb]));
+        let targets = if vi_ok == 0 { vec![okb, errb] } else { vec![errb, okb] };
+        self.term(TermKind::Switch(Operand::Copy(Place::local(d)), targets));
         self.switch_to(errb);
-        let rt0 = self.ret_ty;
-        // `Poll<Result<T, F>>`: Poll::Ready(Err(..)) (lowering builds the same)
-        let poll_inner = match self.tx.kind(rt0) {
-            TyKind::Adt(d, a, _) if is_result && self.tx.prog.name(d) == "Poll" && !a.is_empty() => Some(a[0]),
-            _ => None,
-        };
-        let rt = poll_inner.unwrap_or(rt0);
-        let vi_ret = self.variant_index(rt, err_name);
-        if is_result {
-            let vi_err = self.variant_index(xt, "Err");
-            let et = self.tx.field_ty(xt, vi_err, 0).unwrap_or(xt);
-            let ep = Place::local(tmp).project(Proj::Downcast(vi_err)).project(Proj::Field(0, et));
-            let eop = self.operand_of(ep);
-            let conv = match self.b.try_conv.get(&e.0).cloned().flatten() {
-                Some((fd, args)) => {
-                    let (dd, aa) = self.tx.resolve_trait_method(fd, &args);
-                    let target = args[0];
-                    let ct = self.temp(target);
-                    self.call(Callee::Fn(dd, aa), vec![eop], Place::local(ct));
-                    self.operand_of(Place::local(ct))
-                }
-                None => eop,
-            };
-            match poll_inner {
-                Some(_) => {
-                    let inner = self.temp(rt);
-                    self.assign(Place::local(inner), Rvalue::Aggregate(AggKind::Adt(rt, vi_ret), vec![conv]));
-                    let vi_ready = self.variant_index(rt0, "Ready");
-                    let iop = self.operand_of(Place::local(inner));
-                    self.assign(Place::local(0), Rvalue::Aggregate(AggKind::Adt(rt0, vi_ready), vec![iop]));
-                }
-                None => self.assign(Place::local(0), Rvalue::Aggregate(AggKind::Adt(rt, vi_ret), vec![conv])),
-            }
-        } else {
-            self.assign(Place::local(0), Rvalue::Aggregate(AggKind::Adt(rt, vi_ret), Vec::new()));
-        }
+        let et = self.tx.field_ty(flow, vi_err, 0).unwrap();
+        let ep = Place::local(tmp).project(Proj::Downcast(vi_err)).project(Proj::Field(0, et));
+        let eop = self.operand_of(ep);
+        let (fd, args) = self.b.try_from_residual[&e.0].clone();
+        let (dd, aa) = self.tx.resolve_trait_method(fd, &args);
+        self.call(Callee::Fn(dd, aa), vec![eop], Place::local(0));
         self.exit_to(0);
         self.term(TermKind::Return);
         self.switch_to(okb);
-        let ot = self.tx.field_ty(xt, vi_ok, 0).unwrap_or(xt);
+        let ot = self.tx.field_ty(flow, vi_ok, 0).unwrap();
         let op = Place::local(tmp).project(Proj::Downcast(vi_ok)).project(Proj::Field(0, ot));
         let o = self.operand_of(op);
         self.assign(dest, Rvalue::Use(o));
@@ -2978,7 +2959,7 @@ impl<'a> Build<'a> {
         let (dd, aa) = self.tx.resolve_trait_method(nd, &nargs);
         let sig = self.tx.tcx.fn_sig(self.tx.prog, dd).unwrap().clone();
         let ot = self.tx.tcx.tys.subst(sig.ret, &aa);
-        let ot = self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, ot);
+        let ot = self.tx.normalize(ot);
         let r = self.rv();
         let rt = self.tx.ref_ty(true, itt);
         let tmp = self.temp(rt);

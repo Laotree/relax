@@ -5,6 +5,9 @@ edition = "2021"
 description = "Relax: live compiler and runtime for a strict, safe Rust dialect"
 license = "MIT OR Apache-2.0"
 publish = false
+# tests/ holds Relax compiler fixtures, including intentional compile-fail programs.
+# The native library tests are in src/; fixtures run through the compiler test runners.
+autotests = false
 
 [lib]
 name = "relax_compiler"

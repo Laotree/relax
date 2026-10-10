@@ -208,7 +208,6 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
             Err(e) => {
                 unsafe {
             u.prog.reclaim_caches();
-            u.tcx.reclaim_caches();
         }
                 return Err(vec![e]);
             }
@@ -218,7 +217,6 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         // the caches resolve_imports cleared (front-end write lock held: no reader)
         unsafe {
             u.prog.reclaim_caches();
-            u.tcx.reclaim_caches();
         }
         marks.push(("reclaim", std::time::Instant::now()));
         k
@@ -243,7 +241,6 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         // collect_added also drains diagnostics queued by background checks of the host.
         // As for resolve_imports above, only errors in this module's files refuse its load.
         errs.extend(u.tcx.collect_added(&u.prog, &defs, true).into_iter().filter(|e| mine.iter().any(|p| e.starts_with(p.as_str()))));
-        unsafe { u.tcx.reclaim_caches() };
         errs.extend(check_orphans(u, krate, &defs));
     }
     marks.push(("collect", std::time::Instant::now()));
@@ -256,7 +253,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
                 continue;
             }
             if let Some(a) = crate::borrowck::identity_args(&u.tcx, &u.prog, d) {
-                let b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
+                let b = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
                 match b {
                     Ok(b) => {
                         for e in &b.errors {
@@ -298,9 +295,8 @@ unsafe fn drop_defs(up: *mut Unit, defs: &[DefId]) {
     let _fw = jit::front_write();
     let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
     u.prog.unbind_defs(defs);
-    u.tcx.uncollect_impls(&impls, true);
+    u.tcx.uncollect_impls(&impls);
     u.prog.reclaim_caches();
-    u.tcx.reclaim_caches();
 }
 
 /// Compiles `roots` and everything they reach, then installs it (nothing installs on an error
@@ -413,7 +409,7 @@ fn plain_data_d(u: &Unit, t: crate::types::TyId, depth: u32) -> bool {
         TyKind::Array(e, _) => plain_data_d(u, e, depth + 1),
         TyKind::Tuple(v) => v.iter().all(|x| plain_data_d(u, *x, depth + 1)),
         TyKind::Adt(d, args, _) => match u.tcx.adts.get(&d) {
-            Some(a) if !a.is_union => a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| plain_data_d(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args), depth + 1))),
+            Some(a) if !a.is_union => a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| plain_data_d(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))),
             _ => false,
         },
         _ => false,
@@ -429,7 +425,7 @@ pub(crate) fn plain_result(u: &Unit, t: crate::types::TyId) -> bool {
             TyKind::Adt(d, args, _) => {
                 !crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(d, Vec::new()))
                     && args.iter().all(|a| host_types(u, *a, depth + 1))
-                    && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args), depth + 1))))
+                    && u.tcx.adts.get(&d).map_or(false, |a| a.variants.iter().enumerate().all(|(vi, v)| (0..v.fields.len()).all(|fi| host_types(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))))
             }
             TyKind::Array(e, _) => host_types(u, e, depth + 1),
             TyKind::Tuple(v) => v.iter().all(|x| host_types(u, *x, depth + 1)),
@@ -940,10 +936,9 @@ pub extern "C" fn __relax_module_unload(h: u64) {
         let _fw = jit::front_write();
         let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
         u.prog.unbind_defs(&defs);
-        u.tcx.uncollect_impls(&impls, true);
+        u.tcx.uncollect_impls(&impls);
         unsafe {
             u.prog.reclaim_caches();
-            u.tcx.reclaim_caches();
         }
     }
     if let Some(k) = krate {

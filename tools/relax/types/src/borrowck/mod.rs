@@ -43,6 +43,8 @@ pub mod constraints;
 pub mod handle_placeholders;
 pub mod implied_bounds;
 pub mod type_check;
+pub mod infer_ctxt;
+pub mod renumber;
 
 use crate::program::Program;
 use crate::tcx::Tcx;
@@ -67,8 +69,7 @@ pub fn enabled(options: &crate::options::Options) -> bool {
 
 /// The identity args of a generic fn (its own params): a polymorphic check.
 pub fn identity_args(tcx: &Tcx, prog: &Program, def: crate::program::DefId) -> Option<Vec<crate::types::TyId>> {
-    let n = tcx.fn_sig(prog, def)?.n_generics;
-    Some((0..n).map(|i| tcx.tys.intern(crate::types::TyKind::Param(i))).collect())
+    Some(tcx.fn_sig(prog, def)?.generic_indices.identity_types_consts(&tcx.tys))
 }
 
 /// Completed checks release their body-owned caches before acknowledging settlement.
@@ -85,11 +86,21 @@ pub fn check_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: 
 pub fn check_body_in(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &Body, fv_cx: Option<&std::rc::Rc<fv::SummaryCx>>) -> Verdict {
     crate::preempt::point();
     let _cost_borrowck = crate::fncost::phase(2);
-    let env = crate::tcx::TypingEnv { param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::Borrowck };
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
+    let checkpoint = tcx.dcx.checkpoint();
     let mut tx = tyx::Tx::new(prog, tcx, env, cx.state);
     if let Some(fv_cx) = fv_cx { tx.fv = fv_cx.clone(); }
     let rty = rty::Rty::new(&tx);
-    check_body_with(prog, tcx, &tx, &rty, body)
+    let mut result = check_body_with(prog, tcx, &tx, &rty, body);
+    if !result.errors.is_empty() || !body.errors.is_empty() { tx.errors.note_reported_error(); }
+    let (errors, warnings) = tx.errors.take_since(checkpoint);
+    for error in errors {
+        let owner = if error.cause.body_id == crate::program::NO_DEF { body.def } else { error.cause.body_id };
+        let diagnostic = diag::Diag::new("", error.message, bir::Span { lo: error.cause.span, hi: error.cause.span });
+        result.errors.push(diag::to_error(prog, prog.def(owner).file, owner, &diagnostic));
+    }
+    for warning in warnings { eprintln!("warning: {}", warning.message); }
+    result
 }
 
 fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body: &Body) -> Verdict {
@@ -123,8 +134,8 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
     }));
     let mut all = match r {
         Ok(a) => a,
-        Err(p) if crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
-        Err(_) => {
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
             v.unchecked.push(format!("{}: internal error in the borrowck builder", prog.def_path(body.def)));
             return v;
         }
@@ -240,12 +251,14 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
                     v.errors.push(diag::to_error(prog, bir.file, body.def, &d));
                 }
             }
-            Err(p) if crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
-            Err(_) => v.unchecked.push(format!("{}: internal error in the borrow checker", bir.name)),
+            Err(p) => {
+                if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+                v.unchecked.push(format!("{}: internal error in the borrow checker", bir.name));
+            }
         }
     }
-    for (goal, owner, cause) in tx.pending_traits.borrow().iter() {
-        v.unchecked.push(format!("{}: unresolved trait property {goal:?}: {cause:?}", prog.def_path(*owner)));
+    for (goal, owner) in tx.pending_traits.borrow().iter() {
+        v.unchecked.push(format!("{}: unresolved trait property {:?}", prog.def_path(*owner), goal.predicate));
     }
     v
 }
@@ -328,7 +341,7 @@ pub fn bir_dump(tx: &tyx::Tx, bir: &bir::Bir) -> String {
 /// `RELAX_BORROWCK_ALL=1 relax check <pkg>`: type-check and borrow-check every fn with a body
 /// in every crate of the graph except Relax's std (generic ones polymorphically); prints the
 /// diagnostics and a summary. The makepad false-positive gate.
-pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool, resolve_consts: &mut dyn FnMut() -> bool) -> usize {
+pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     let options = &prog.session.clone().options;
     let skip_generic = options.borrowck_all == crate::options::BorrowckAll::Nongeneric;
     use crate::program::DefKind;
@@ -356,17 +369,10 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool, resolve_consts: &mut
         if skip_generic && (!args.is_empty() || prog.def(d.parent).kind == DefKind::Trait) {
             continue;
         }
-        let mut body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), prog, tcx, def, &args)));
-        // a body waiting for a constant (`[0u8; size_of::<T>()]` in a non-generic fn): the
-        // driver evaluates the queued constants and the body is checked again (as the run does)
-        let mut tries = 0;
-        while tries < 4 && (tcx.has_blocked_consts() || matches!(&body, Ok(b) if b.errors.iter().any(|e| e.contains("waits for a constant")))) {
-            tries += 1;
-            if !resolve_consts() && tries > 1 {
-                break;
-            }
-            body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), prog, tcx, def, &args)));
-        }
+        // rustc_borrowck/src/lib.rs:115 and root_cx.rs: bodies are checked with
+        // identity arguments and their analysis predicates, before codegen's
+        // instantiate_mir_and_normalize_erasing_regions.
+        let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tcx.typeck(prog, def)));
         let body = match body {
             Ok(b) if b.errors.is_empty() => b,
             r => {
@@ -381,7 +387,7 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool, resolve_consts: &mut
             }
         };
         let c0 = crate::clock::cpu_ns();
-        let v = check_body(&crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), prog, tcx, &body);
+        let v = check_body(&crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
         note_verdict(&v);
         bck_ns += crate::clock::cpu_ns() - c0;
         n_bodies += v.bodies;
@@ -455,7 +461,7 @@ pub fn summaries_of(prog: &Program, tcx: &Tcx, insts: &[(crate::program::DefId, 
 /// `summaries_of` in a caller's summary context (the live edit session's, `fv::SummaryCx`).
 pub fn summaries_with(prog: &Program, tcx: &Tcx, insts: &[(crate::program::DefId, Vec<crate::types::TyId>)], fv_cx: Option<&std::rc::Rc<fv::SummaryCx>>) -> Vec<Vec<fv::Summary>> {
     let state = crate::tcx::EvalState::new();
-    let mut tx = tyx::Tx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+    let mut tx = tyx::Tx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
     if let Some(fv_cx) = fv_cx { tx.fv = fv_cx.clone(); }
     let tx = &tx;
     insts.iter().map(|(d, a)| fv::summaries(prog, tcx, tx, *d, a, 0).as_ref().clone()).collect()
@@ -466,7 +472,7 @@ pub fn describe_summary(prog: &Program, tcx: &Tcx, d: crate::program::DefId, k: 
     let pname = if k == 0 && tcx.fn_sig(prog, d).map_or(false, |x| x.self_kind != 0) { "self".to_string() } else { format!("arg{}", k) };
     let pt = tcx.fn_sig(prog, d).and_then(|x| x.params.get(k).copied());
     let state = crate::tcx::EvalState::new();
-    let tx = &tyx::Tx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+    let tx = &tyx::Tx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     {
         let t = match pt.map(|p| tx.kind(p)) {
             Some(crate::types::TyKind::Ref(_, i, _)) => i,

@@ -1,3 +1,5 @@
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::*;
 use super::fold::BoundVarReplacer;
 
@@ -91,27 +93,27 @@ fn flags_and_shifts_cover_all_structural_positions() {
         tys.intern(TyKind::Slice(b)),
         tys.intern(TyKind::Ptr(true, b)),
         tys.intern(TyKind::Ref(true, b, RegionId::ERASED)),
-        tys.intern(TyKind::Array(b, 3)),
-        tys.mk_array(tys.u32_, b),
+        tys.intern(TyKind::Array(b, tys.const_usize(3))),
+        tys.mk_array(b, tys.intern_const(crate::consts::ConstKind::Bound(1, crate::consts::BoundConst { var: BoundVar(0) }))),
         tys.intern(TyKind::Adt(DefId(0), vec![b], empty)),
         tys.intern(TyKind::FnDef(DefId(0), vec![b], empty)),
-        tys.intern(TyKind::Assoc(DefId(0), vec![b], empty)),
-        tys.intern(TyKind::Opaque(DefId(0), 0, vec![b], empty)),
+        tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(0) }, args: vec![b], regions: empty })),
+        tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(0) }, args: vec![b], regions: empty })),
         tys.intern(TyKind::FnPtr(vec![b], b, FnHeader::RUST, 0)),
-        tys.intern(TyKind::Closure(0, 0, tys.unit, tys.unit, b)),
-        tys.intern(TyKind::Closure(0, 0, b, tys.unit, tys.unit)),
-        tys.intern(TyKind::Closure(0, 0, tys.unit, b, tys.unit)),
-        tys.intern(TyKind::Dyn(DefId(0), DynList::from(vec![b]), Default::default(), empty, RegionId::ERASED, 0, Default::default())),
-        tys.intern(TyKind::Dyn(DefId(0), Default::default(), DynList::from(vec![(DefId(1), b, 0)]), empty, RegionId::ERASED, 0, Default::default())),
+        tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: b, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: tys.unit, tupled_upvars_ty: tys.unit })),
+        tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: tys.unit, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: b, tupled_upvars_ty: tys.unit })),
+        tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: tys.unit, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: tys.unit, tupled_upvars_ty: b })),
+        tys.intern(TyKind::Dyn(DefId(0), vec![b].into(), vec![].into(), empty, RegionId::ERASED, 0, Vec::new().into())),
+        tys.intern(TyKind::Dyn(DefId(0), vec![].into(), vec![(DefId(1), b, 0)].into(), empty, RegionId::ERASED, 0, Vec::new().into())),
     ];
     for t in &shapes { assert!(tys.flags(*t).contains(TypeFlags::HAS_TY_BOUND)); }
     shapes.extend([
         tys.intern(TyKind::Adt(DefId(0), vec![], rs)),
         tys.intern(TyKind::FnDef(DefId(0), vec![], rs)),
-        tys.intern(TyKind::Assoc(DefId(0), vec![], rs)),
-        tys.intern(TyKind::Opaque(DefId(0), 0, vec![], rs)),
-        tys.intern(TyKind::Dyn(DefId(0), Default::default(), Default::default(), rs, RegionId::ERASED, 0, Default::default())),
-        tys.intern(TyKind::Dyn(DefId(0), Default::default(), Default::default(), empty, region(&tys, 1, 2), 0, Default::default())),
+        tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(0) }, args: vec![], regions: rs })),
+        tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(0) }, args: vec![], regions: rs })),
+        tys.intern(TyKind::Dyn(DefId(0), vec![].into(), vec![].into(), rs, RegionId::ERASED, 0, Vec::new().into())),
+        tys.intern(TyKind::Dyn(DefId(0), vec![].into(), vec![].into(), empty, region(&tys, 1, 2), 0, Vec::new().into())),
     ]);
     for t in shapes {
         assert!(tys.has_escaping_bound_vars(t));
@@ -122,7 +124,7 @@ fn flags_and_shifts_cover_all_structural_positions() {
         assert_eq!(tys.shift_vars(t, 0), t);
     }
     // New flags must propagate where some legacy query bits deliberately stop.
-    for t in [tys.mk_array(tys.u32_, p), tys.intern(TyKind::Closure(0, 0, tys.unit, tys.unit, p))] {
+    for t in [tys.mk_array(p, tys.intern_const(crate::consts::ConstKind::Placeholder(crate::consts::PlaceholderConst { universe: UniverseIndex(1), bound: crate::consts::BoundConst { var: BoundVar(1) } }))), tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: p, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: tys.unit, tupled_upvars_ty: tys.unit }))] {
         assert!(tys.has_placeholders(t));
         assert_eq!(tys.shift_in(t, 2), t);
     }

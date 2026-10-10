@@ -1,3 +1,4 @@
+use crate::types::{AliasTy, AliasTyKind};
 use super::implied_bounds::ImpliedBounds;
 use crate::tcx::{Tcx, FnSigT, outlives::{OutlivesPredicate as P,RegionContract}};
 use crate::types::*;
@@ -8,7 +9,7 @@ fn bounds(tcx: &Tcx, raw: &[TyId], ps: &[P]) -> ImpliedBounds { ImpliedBounds::c
 fn signature(_tcx: &Tcx, ret: TyId) -> FnSigT {
     FnSigT { region_contract:Default::default(),generic_indices:Default::default(),bound_regions:0,
         params:vec![],ret,self_kind:0,n_generics:0,n_parent_generics:0,is_const:false,rustc_promotable:false,
-        header:FnHeader::RUST,track_caller:false,legacy_const:vec![] }
+        header:FnHeader::RUST,track_caller:false,target_features:vec![],safe_target_features:false }
 }
 #[test]
 fn v4_function_pointer_components_include_free_but_not_bound_regions() {
@@ -51,15 +52,15 @@ fn v7_concrete_wf_walk_covers_functions_aliases_closures_and_objects() {
     tcx.insert_test_signature(d,signature(&tcx,nested));
     let item = tcx.tys.intern(TyKind::FnDef(d,vec![],RegionArgsId::EMPTY));
     assert_eq!(bounds(&tcx,&[item],&[]).outlives,[(b,a)]);
-    let closure = tcx.tys.intern(TyKind::Closure(0,0,f,tcx.tys.intern(TyKind::Tuple(vec![nested])),tcx.tys.unit));
+    let closure = tcx.tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: f, tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(vec![nested])) }));
     assert_eq!(bounds(&tcx,&[closure],&[]).outlives,[(b,a)]);
-    let closure = tcx.tys.intern(TyKind::Closure(0,1,f,tcx.tys.unit,tcx.tys.unit));
+    let closure = tcx.tys.intern(TyKind::Closure(0, 1, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: f, tupled_upvars_ty: tcx.tys.unit }));
     assert!(bounds(&tcx,&[closure],&[]).outlives.is_empty(),"closure signature is not an upvar");
     let contract = RegionContract { regions:vec![("'a".into(),a)],predicates:vec![P::Type(tcx.tys.intern(TyKind::Param(0)),a)],..Default::default() };
     tcx.nominal_region_contracts.insert(d,contract.clone());
-    tcx.opaques.insert((d,0),crate::tcx::OpaqueDecl {region_contract:contract.clone(),..Default::default()});
+    tcx.opaques.insert(d,crate::tcx::OpaqueDecl {region_contract:contract.clone(),..Default::default()});
     let rs = tcx.tys.intern_region_args(&[a]);
-    for alias in [TyKind::Assoc(d,vec![inner],rs),TyKind::Opaque(d,0,vec![inner],rs)] {
+    for alias in [TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args: vec![inner], regions: rs }),TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: vec![inner], regions: rs })] {
         let t = tcx.tys.intern(alias);
         assert_eq!(bounds(&tcx,&[t],&[]).outlives,[(b,a)]);
     }
@@ -78,7 +79,7 @@ fn p4_filter_residual_placeholders_after_external_instantiation() {
     let p = |u,i| tcx.tys.intern_region(RegionKind::RePlaceholder {universe:UniverseIndex(u),var:BoundVar(i)});
     let external = p(0,0); let residual = p(1,0); let root_residual = p(0,1);
     let t = tcx.tys.intern(TyKind::Param(0));
-    let alias = tcx.tys.intern(TyKind::Assoc(DefId(1),vec![reference(&tcx,residual,t)],RegionArgsId::EMPTY));
+    let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(1) }, args: vec![reference(&tcx,residual,t)], regions: RegionArgsId::EMPTY }));
     let mut result = bounds(&tcx,&[],&[P::Type(t,external),P::Type(t,residual),P::Type(alias,a),P::Region(residual,a),P::Region(root_residual,a),P::Region(external,a)]);
     result.instantiate_query_bounds(&tcx,&[(external,b)]);
     assert_eq!(result.outlives,[(b,a)]);

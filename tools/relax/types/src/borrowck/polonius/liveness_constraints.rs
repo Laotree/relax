@@ -44,12 +44,29 @@ impl VarianceExtractor<'_> {
         record_region_variance(self.directions, region, variance);
     }
 
+    // rustc_type_ir/src/relate.rs: AliasConst arguments are invariant; value
+    // valtrees recurse through their typed constants.
+    fn constant(&mut self, ct: crate::consts::Const, v: V) {
+        use crate::consts::{ConstKind, GenericArg, ValTreeKind};
+        match self.tcx.tys.const_kind(ct) {
+            ConstKind::Alias(_, a) => for arg in a.args.iter() { match *arg {
+                GenericArg::Type(t) => self.ty(t, xform(v, V::Inv)),
+                GenericArg::Lifetime(r) => self.region(r, xform(v, V::Inv)),
+                GenericArg::Const(c) => self.constant(c, xform(v, V::Inv)),
+            } },
+            ConstKind::Value(value) => if let ValTreeKind::Branch(cs) = value.valtree.kind() {
+                for &c in cs.iter() { self.constant(c, v); }
+            },
+            ConstKind::Param(_) | ConstKind::Infer(_) | ConstKind::Bound(..) | ConstKind::Placeholder(_) | ConstKind::Error => {}
+        }
+    }
+
     fn ty(&mut self, ty: TyId, v: V) {
         match self.tcx.tys.kind(ty).clone() {
             TyKind::Ref(m, t, r) => { self.region(r, v); self.ty(t, xform(v, if m { V::Inv } else { V::Co })); }
             TyKind::Ptr(m, t) => self.ty(t, xform(v, if m { V::Inv } else { V::Co })),
             TyKind::Slice(t) => self.ty(t, v),
-            TyKind::Array(t, n) => { self.ty(t, v); if let Some(t) = crate::types::len_ty(n) { self.ty(t, xform(v, V::Inv)); } }
+            TyKind::Array(t, n) => { self.ty(t, v); self.constant(n, xform(v, V::Inv)); }
             TyKind::Tuple(ts) => { for t in ts { self.ty(t, v); } }
             TyKind::FnPtr(ps, ret, _, _) => { for t in ps { self.ty(t, xform(v, V::Contra)); } self.ty(ret, v); }
             TyKind::Adt(d, ts, rs) | TyKind::FnDef(d, ts, rs) => {
@@ -65,15 +82,11 @@ impl VarianceExtractor<'_> {
                     self.region(r, xform(v, arg));
                 }
             }
-            // Relate<AliasTy> (rustc_type_ir relate.rs:224): projections relate their
-            // arguments invariantly; opaques use their declared variances, so uncaptured
-            // (bivariant) lifetimes record no direction (opt_alias_variances).
-            TyKind::Assoc(_, ts, rs) => {
-                for t in ts { self.ty(t, xform(v, V::Inv)); }
-                for &r in self.tcx.tys.region_args(rs).iter() { self.region(r, xform(v, V::Inv)); }
-            }
-            TyKind::Opaque(d, i, ts, rs) => {
-                let variances = self.tcx.opaques.get(&(d, i)).and_then(|o| o.variances.clone());
+            // Relate<AliasTy> (rustc_type_ir relate.rs:224): opaques and RPITIT projections use
+            // their declared variances (opt_alias_variances, rustc_middle/src/ty/util.rs:954-974),
+            // so uncaptured (bivariant) lifetimes record no direction; other aliases are invariant.
+            TyKind::Alias(_, crate::types::AliasTy { kind, args: ts, regions: rs }) => {
+                let variances = self.tcx.alias_declared_variances(self.prog, kind);
                 let arg = |region: bool, k: usize| variances.as_ref().and_then(|(indices, vs)| {
                     let indices = if region { &indices.lifetimes } else { &indices.types_consts };
                     indices.get(k).and_then(|&j| vs.get(j as usize)).copied()
@@ -87,11 +100,12 @@ impl VarianceExtractor<'_> {
                 for &r in self.tcx.tys.region_args(rs).iter() { self.region(r, xform(v, V::Inv)); }
                 for (_, t, _) in bindings { self.ty(t, xform(v, V::Inv)); }
             }
-            TyKind::Closure(_, _, sig, captures, owner) => {
-                for t in [sig, captures, owner] { self.ty(t, xform(v, V::Inv)); }
+            TyKind::Closure(_, _, args) => {
+                for t in [args.parent_args, args.closure_kind_ty, args.closure_sig_as_fn_ptr_ty, args.tupled_upvars_ty] { self.ty(t, xform(v, V::Inv)); }
             }
+            TyKind::Const(c) => self.constant(c, v),
             TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_)
-            | TyKind::Never | TyKind::ConstVal(_) | TyKind::Error | TyKind::Infer(_)
+            | TyKind::Never | TyKind::Foreign(_) | TyKind::Error | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)
             | TyKind::Bound(..) | TyKind::Placeholder(_) | TyKind::Param(_) => {}
         }
     }

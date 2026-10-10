@@ -57,7 +57,7 @@ unsafe impl Pod for crate::ast::WherePred {}
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"RFI1");
 /// bump when a section's meaning changes (layouts are covered by the build id)
-pub const VERSION: u32 = 5;
+pub const VERSION: u32 = 6;
 
 const HEAD: usize = 16;
 const ENTRY: usize = 24;

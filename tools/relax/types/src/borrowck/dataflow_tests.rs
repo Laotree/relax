@@ -44,7 +44,7 @@ fn switch(a: u32, b: u32) -> TerminatorKind {
 fn gather(tcx: &Tcx, body: &Body, invalidated: bool) -> (MoveData, BorrowSet) {
     let session = std::sync::Arc::new(crate::Session::default());
     let prog = Program::new(&session);
-    let moves = MoveData::gather_moves(body, &prog, tcx, TypingEnv::fully_monomorphized(), &|_| true);
+    let moves = MoveData::gather_moves(body, &prog, tcx, TypingEnv::fully_monomorphized(&prog), &|_| true);
     let borrows = BorrowSet::build(tcx, body, invalidated, &moves);
     (moves, borrows)
 }
@@ -173,7 +173,7 @@ fn assignment_prefix_and_storage_dead_kill_only_their_loans() {
 fn runtime_indices_do_not_definitely_conflict_but_constant_indices_do() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let arr = tcx.tys.intern(TyKind::Array(t, 4));
+    let arr = tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(4)));
     let index = |offset| PlaceElem::ConstantIndex { offset, min_length: 4, from_end: false };
     let b = body(&[tcx.tys.unit, arr, reference(&tcx, t), tcx.tys.usize_, t], vec![block(vec![
         borrow(2, 0, place(1, vec![index(1)])),
@@ -279,7 +279,8 @@ fn combined_results_keep_init_history_moves_and_call_edges_separate() {
     let arg_init = moves.init_path_map[path][0];
     let call_init = moves.init_loc_map[at(0, 1)][0];
     let borrow_init = moves.init_loc_map[at(0, 0)][0];
-    let analysis = Borrowck::new(&tcx, &b, &RegionValues::all(&b, 1), &set, &moves);
+    let prog = crate::program::Program::new(&std::sync::Arc::new(crate::Session::default()));
+    let analysis = Borrowck::new(&prog, &tcx, &b, &RegionValues::all(&b, 1), &set, &moves);
     let results = analysis.iterate_to_fixpoint();
     let mut cursor = results.cursor();
     cursor.seek_before_primary_effect(at(0, 0));

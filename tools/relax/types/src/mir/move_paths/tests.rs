@@ -37,7 +37,7 @@ fn call(func: Operand, args: Vec<Operand>, destination: Place, target: Option<u3
         target: target.map(BasicBlock), unwind: UnwindAction::Cleanup(BasicBlock(cleanup)), call_source: CallSource::Normal, fn_span: Span::default() }
 }
 fn at(block: u32, statement_index: usize) -> Location { Location { block: BasicBlock(block), statement_index } }
-fn gather(b: &Body, prog: &Program, tcx: &Tcx) -> MoveData { MoveData::gather_moves(b, prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(), &|_| true) }
+fn gather(b: &Body, prog: &Program, tcx: &Tcx) -> MoveData { MoveData::gather_moves(b, prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &|_| true) }
 fn exact(data: &MoveData, place: &Place) -> usize {
     let LookupResult::Exact(index) = data.rev_lookup.find(place) else { panic!("untracked {place:?}"); };
     index
@@ -81,9 +81,9 @@ fn move_reinit_loop_and_storage_dead_history() {
     let data = gather(&b, &prog, &tcx);
     assert_eq!(data.inits.len(), 3); assert_eq!(data.moves.len(), 2);
     assert_eq!(data.loc_map[at(1, 0)], vec![0]); assert_eq!(data.init_loc_map[at(1, 1)], vec![2]);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(1)), &[1]); after(&i, at(1, 0), &[2]); after(&i, at(1, 1), &[1, 2]); after(&i, at(1, 2), &[1]);
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
     bits(u.entry_state(BasicBlock(1)), &[0, 2]); after(&u, at(1, 0), &[0, 1]); after(&u, at(1, 1), &[0]);
     let ever = EverInitializedPlaces::new(&b, &data); let e = iterate_to_fixpoint(&b, &ever);
     bits(e.entry_state(BasicBlock(1)), &[0, 2]); after(&e, at(1, 0), &[0, 1, 2]); after(&e, at(1, 2), &[0, 2]);
@@ -99,14 +99,14 @@ fn partial_struct_move_and_whole_drop_children() {
         block(vec![], TerminatorKind::Return), block(vec![], TerminatorKind::UnwindResume),
     ]);
     let data = gather(&b, &prog, &tcx); let pa = exact(&data, &a); let pc = exact(&data, &c);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(0)), &[1, pa, pc]); after(&i, at(0, 1), &[1, 2, pc]);
     bits(i.entry_state(BasicBlock(1)), &[2]); bits(i.entry_state(BasicBlock(2)), &[2]);
     let mut children = Vec::new(); on_all_children_bits(&data, 1, &mut |p| children.push(p));
     assert_eq!(children, vec![1, pa, pc]);
     assert_eq!(move_path_children_matching(&data, 1, &mut |e| matches!(e, PlaceElem::Field(FieldIdx(1), _))), Some(pc));
     assert_eq!(data.moves.len(), 1, "Drop is an effect, not MoveOut");
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
     bits(u.entry_state(BasicBlock(1)), &[0, 1, pa, pc]);
 }
 
@@ -117,8 +117,8 @@ fn maybe_join_of_moved_and_unmoved_branch() {
     let b = body(&[t, t, t], 1, vec![block(vec![], switch(constant(t), 1, 2)),
         block(vec![assign(2, moved(1))], goto(3)), block(vec![], goto(3)), block(vec![], TerminatorKind::Return)]);
     let data = gather(&b, &prog, &tcx);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init); bits(i.entry_state(BasicBlock(3)), &[1, 2]);
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit); bits(u.entry_state(BasicBlock(3)), &[0, 1, 2]);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init); bits(i.entry_state(BasicBlock(3)), &[1, 2]);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit); bits(u.entry_state(BasicBlock(3)), &[0, 1, 2]);
     let ever = EverInitializedPlaces::new(&b, &data); let e = iterate_to_fixpoint(&b, &ever); bits(e.entry_state(BasicBlock(3)), &[0, 1]);
 }
 
@@ -129,9 +129,9 @@ fn call_moves_before_cleanup_and_inits_only_on_return() {
     let b = body(&[t, t, t, t], 2, vec![block(vec![], call(moved(1), vec![moved(2)], place(3), Some(1), 2)),
         block(vec![], TerminatorKind::Return), block(vec![], TerminatorKind::UnwindResume)]);
     let data = gather(&b, &prog, &tcx); assert_eq!(data.inits[2].kind, InitKind::NonPanicPathOnly);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     after(&i, at(0, 0), &[]); bits(i.entry_state(BasicBlock(1)), &[3]); bits(i.entry_state(BasicBlock(2)), &[]);
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
     bits(u.entry_state(BasicBlock(1)), &[0, 1, 2]); bits(u.entry_state(BasicBlock(2)), &[0, 1, 2, 3]);
     let ever = EverInitializedPlaces::new(&b, &data); let e = iterate_to_fixpoint(&b, &ever);
     bits(e.entry_state(BasicBlock(1)), &[0, 1, 2]); bits(e.entry_state(BasicBlock(2)), &[0, 1]);
@@ -179,7 +179,7 @@ fn unions_coalesce_but_check_later_dereferences() {
     let data = gather(&b, &prog, &tcx); assert_eq!(data.move_paths.len(), 3); assert_eq!(data.moves.len(), 1); assert_eq!(data.moves[0].path, 1);
     assert_eq!(data.inits[data.init_loc_map[at(0, 1)][0]].path, 1);
     assert_eq!(data.rev_lookup.find(&field(1, 0, t)), LookupResult::Parent(Some(1)));
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     after(&i, at(0, 0), &[2]); after(&i, at(0, 1), &[1, 2]); after(&i, at(0, 2), &[1, 2]);
 }
 
@@ -187,7 +187,7 @@ fn unions_coalesce_but_check_later_dereferences() {
 fn arrays_subslice_paths_are_disjoint_and_slices_stop() {
     let sess = &std::sync::Arc::new(crate::Session::default());
     let prog = Program::new(sess); let tcx = Tcx::new(); let t = tcx.tys.u8_;
-    let array = tcx.tys.intern(TyKind::Array(t, 4)); let slice = tcx.tys.intern(TyKind::Slice(t));
+    let array = tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(4))); let slice = tcx.tys.intern(TyKind::Slice(t));
     let ci = |offset| PlaceElem::ConstantIndex { offset, min_length: 4, from_end: false };
     let sub = project(1, vec![PlaceElem::Subslice { from: 1, to: 3, from_end: false }]);
     let b = body(&[tcx.tys.unit, array, slice, t, tcx.tys.usize_], 2, vec![block(vec![
@@ -201,7 +201,7 @@ fn arrays_subslice_paths_are_disjoint_and_slices_stop() {
     assert_eq!(data.move_paths.len(), 7); assert_eq!(data.moves.len(), 3);
     assert_eq!(data.moves[0].path, a); assert_eq!(data.moves[1].path, c); assert_eq!(data.moves[2].path, a);
     assert_eq!(data.rev_lookup.find(&sub), LookupResult::Parent(Some(1)));
-    assert_eq!(sub.ty(&b, &tcx).unwrap().ty, tcx.tys.intern(TyKind::Array(t, 2)));
+    assert_eq!(sub.ty(&b, &tcx).unwrap().ty, tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(2))));
     let end = project(1, vec![PlaceElem::Subslice { from: 1, to: 1, from_end: true }]);
     assert_eq!(end.ty(&b, &tcx).unwrap().ty, sub.ty(&b, &tcx).unwrap().ty);
 }
@@ -224,12 +224,12 @@ fn enum_discriminant_edges_and_otherwise_options() {
     let a = exact(&data, &variant(0)); let af = exact(&data, &vf(0));
     let d = exact(&data, &variant(1)); let df = exact(&data, &vf(1));
     let c = exact(&data, &variant(2)); let cf = exact(&data, &vf(2));
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(1)), &[1, 2, a, af]); bits(i.entry_state(BasicBlock(2)), &[1, 2, c, cf]);
     bits(i.entry_state(BasicBlock(3)), &[1, 2, a, af, d, df, c, cf]);
     let init = init.exclude_inactive_in_otherwise(); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(3)), &[1, 2, d, df]);
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
     bits(u.entry_state(BasicBlock(1)), &[0, 3]);
     let uninit = uninit.mark_inactive_variants_as_uninit(); let u = iterate_to_fixpoint(&b, &uninit);
     bits(u.entry_state(BasicBlock(1)), &[0, 3, d, df, c, cf]); bits(u.entry_state(BasicBlock(2)), &[0, 3, a, af, d, df]);
@@ -239,7 +239,7 @@ fn enum_discriminant_edges_and_otherwise_options() {
     let init = init.precise_enum_drop_elaboration(false); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(1)), &[1, 2, a, af, d, df, c, cf]);
     let mut separated = b.clone(); separated.basic_blocks[0].statements.push(Statement { source_info: SourceInfo::default(), kind: StatementKind::Nop });
-    let init = MaybeInitializedPlaces::new(&tcx, &separated, &data);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &separated, &data);
     assert!(!init.has_switch_int_edge_effect(BasicBlock(0), &SwitchTargets { values: vec![255], targets: vec![BasicBlock(1)], otherwise: BasicBlock(2) }, &copy(2)));
 }
 
@@ -257,9 +257,9 @@ fn mutable_and_raw_borrows_restore_maybe_init_children() {
             assign(2, Operand::Move(field(1, 0, t))), StatementKind::Assign(place(3), value),
         ], TerminatorKind::Return)]);
         let data = gather(&b, &prog, &tcx); let f = exact(&data, &field(1, 0, t));
-        let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+        let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
         if kind < 2 { after(&i, at(0, 1), &[1, 2, 3, f]); } else { after(&i, at(0, 1), &[1, 2, 3]); }
-        let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit); after(&u, at(0, 1), &[0, f]);
+        let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit); after(&u, at(0, 1), &[0, f]);
     }
 }
 
@@ -271,13 +271,13 @@ fn dead_drop_unwind_does_not_generate_from_unreachable_cleanup() {
         unwind: UnwindAction::Cleanup(BasicBlock(2)), replace: false }),
         block(vec![], goto(3)), block(vec![assign(2, constant(t))], goto(3)), block(vec![], TerminatorKind::Return)]);
     let data = gather(&b, &prog, &tcx);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data).skipping_unreachable_unwind(); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data).skipping_unreachable_unwind(); let i = iterate_to_fixpoint(&b, &init);
     assert!(!i.is_reachable(BasicBlock(2))); assert!(i.is_reachable(BasicBlock(1))); bits(i.entry_state(BasicBlock(3)), &[]);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     assert!(i.is_reachable(BasicBlock(2))); bits(i.entry_state(BasicBlock(3)), &[2]);
     let mut alive = b.clone(); alive.arg_count = 1; alive.local_decls[1].kind = LocalKind::Arg;
     let data = gather(&alive, &prog, &tcx);
-    let init = MaybeInitializedPlaces::new(&tcx, &alive, &data).skipping_unreachable_unwind(); let i = iterate_to_fixpoint(&alive, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &alive, &data).skipping_unreachable_unwind(); let i = iterate_to_fixpoint(&alive, &init);
     assert!(i.is_reachable(BasicBlock(2)), "unwind decision must precede Drop's kill");
 }
 
@@ -316,7 +316,7 @@ fn normalized_field_type_drives_box_projection() {
         let p = project(1, vec![PlaceElem::Field(FieldIdx(0), heap), PlaceElem::Deref]);
         let b = body(&[tcx.tys.unit, root, t], 1, vec![block(vec![assign(2, Operand::Move(p.clone()))], TerminatorKind::Return)]);
         let data = gather(&b, &prog, &tcx); assert_eq!(data.moves.len(), 1); assert_eq!(data.moves[0].path, exact(&data, &p));
-        assert_eq!(PlaceTy::from_ty(root).field_ty(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), FieldIdx(0)), Some(heap));
+        assert_eq!(PlaceTy::from_ty(root).field_ty(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), FieldIdx(0)), Some(heap));
     }
 }
 
@@ -331,9 +331,9 @@ fn shallow_box_init_does_not_initialize_pointee() {
     ], TerminatorKind::Return)]);
     let data = gather(&b, &prog, &tcx); let pointee = exact(&data, &p);
     assert_eq!(data.inits[0].kind, InitKind::Shallow);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     after(&i, at(0, 1), &[1]); after(&i, at(0, 2), &[1, pointee]);
-    let uninit = MaybeUninitializedPlaces::new(&tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
+    let uninit = MaybeUninitializedPlaces::new(&prog, &tcx, &b, &data); let u = iterate_to_fixpoint(&b, &uninit);
     after(&u, at(0, 1), &[0, 2, pointee]); after(&u, at(0, 2), &[0, 2]);
 }
 
@@ -344,12 +344,12 @@ fn filtered_arguments_and_untracked_writes() {
     let b = body(&[tcx.tys.unit, t, r], 2, vec![block(vec![
         StatementKind::Assign(project(2, vec![PlaceElem::Deref]), Rvalue::Use(constant(t))),
     ], TerminatorKind::Return)]);
-    let data = MoveData::gather_moves(&b, &prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &|ty| ty == r);
+    let data = MoveData::gather_moves(&b, &prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &|ty| ty == r);
     assert_eq!(data.move_paths.len(), 1); assert_eq!(data.inits.len(), 1);
     assert_eq!(data.rev_lookup.find(&place(1)), LookupResult::Parent(None));
     assert!(data.init_loc_map[at(0, 0)].is_empty());
     let ever = EverInitializedPlaces::new(&b, &data); let e = iterate_to_fixpoint(&b, &ever); bits(e.entry_state(BasicBlock(0)), &[0]);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init); after(&i, at(0, 0), &[0]);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init); after(&i, at(0, 0), &[0]);
 }
 
 #[test]
@@ -369,6 +369,6 @@ fn yield_initializations_match_reference_deep_init() {
     let b = body(&[t, t, t], 1, vec![block(vec![], TerminatorKind::Yield { value: moved(1), resume: BasicBlock(1),
         resume_arg: place(2), drop: Some(BasicBlock(2)) }), block(vec![], TerminatorKind::Return), block(vec![], TerminatorKind::CoroutineDrop)]);
     let data = gather(&b, &prog, &tcx); assert_eq!(data.inits[1].kind, InitKind::Deep);
-    let init = MaybeInitializedPlaces::new(&tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
+    let init = MaybeInitializedPlaces::new(&prog, &tcx, &b, &data); let i = iterate_to_fixpoint(&b, &init);
     bits(i.entry_state(BasicBlock(1)), &[2]); bits(i.entry_state(BasicBlock(2)), &[2]);
 }

@@ -1,7 +1,6 @@
-//! Closure signature construction (rustc_hir_typeck::closure). Bound signatures
-//! survive typeck; the body is checked with their liberated counterpart. The
-//! existing region-insensitive type inference still defers region equalities to
-//! borrowck, which will consume these results in A4.
+// ported from N:rustc_hir_typeck/src/closure.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/fn_ctxt/_impl.rs @8d1a764
+//! Bound signatures survive typeck; bodies use their liberated counterparts.
 use super::*;
 use crate::types::{BoundVar, LateParamKind, RegionId, RegionKind, RegionScope};
 
@@ -17,27 +16,21 @@ pub struct ClosureSignatures {
 
 impl Fcx<'_> {
     pub(super) fn normalize_signature(&mut self, t: TyId) -> TyId {
-        let t = self.resolve_region_vars(t);
+        let t = self.infcx.deeply_resolve_ignoring_regions(t);
         self.normalize_body_type(t)
     }
 
     pub(super) fn init_body_regions(&mut self) {
-        let d = self.prog.def(self.b.def);
-        if let ItemKind::Fn(sig, _, _) = &self.ast().item(d.item).kind {
-            self.tcx.fn_region_env(&self.cx, self.prog, self.file, self.module, &mut self.env,
-                self.prog.files[self.file as usize].ast.fn_sig(*sig), self.b.def);
-        }
         for (_, r) in &mut self.env.regions.names {
             if let RegionKind::ReBound(0, var) = *r {
                 *r = RegionKind::ReLateParam(RegionScope::Item(self.b.def), LateParamKind::Anon(var.0));
             }
         }
-        self.env.regions.enter_body(self.region_vars.clone());
+        self.env.regions.enter_body();
     }
 
     pub(super) fn fresh_region(&self) -> RegionId {
-        let var = self.region_vars.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.tcx.tys.intern_region(RegionKind::ReVar(var))
+        self.infcx.next_region_var()
     }
 
     /// Field substitution preserves bound FnPtr types in both the declaration
@@ -77,6 +70,16 @@ impl Fcx<'_> {
         }
     }
 
+    /// One more type under an item signature's binder (an async fn's declared output),
+    /// instantiated and normalized exactly as `body_signature` treats the signature.
+    pub(super) fn liberated_signature_output(&mut self, sig: &FnSigT, ty: TyId, args: &[TyId]) -> TyId {
+        let ty = self.tcx.tys.subst_at_depth(ty, args, 1);
+        let vars: Vec<_> = (0..sig.bound_regions).map(|v| self.tcx.tys.intern_region(
+            RegionKind::ReLateParam(RegionScope::Item(self.b.def), LateParamKind::Anon(v)))).collect();
+        let (_, ty) = self.instantiate_signature_parts(&[], ty, &vars);
+        self.normalize_body_type(ty)
+    }
+
     // rustc anonymize_bound_vars: number used variables in encounter order,
     // dropping unused names. Nested binders retain their own variable indices.
     fn anonymize_signature(&self, sig: TyId) -> TyId {
@@ -101,41 +104,12 @@ impl Fcx<'_> {
     /// together. Early parameters belong to this call; the Fn bound's own late
     /// parameters stay bound. Register the projections before checking arguments
     /// so deduction also works through blocks, borrows, and pending Self vars.
-    pub(super) fn instantiate_call_signature(&mut self, d: DefId, args: &[TyId], sig: &FnSigT) -> (Vec<TyId>, TyId) {
-        let early = std::cell::RefCell::new(HashMap::default());
-        let instantiate_early = |t| self.tcx.tys.map_regions(t, &|r, _| {
-            if let RegionKind::ReEarlyParam(i) = self.tcx.tys.region_kind(r) {
-                *early.borrow_mut().entry(i).or_insert_with(|| self.fresh_region())
-            } else { r }
-        }, 0);
-        // A call consumes the inputs/output, not a FnPtr type. Interning whole
-        // signatures here retains every temporary early/substituted/opened
-        // signature for the lifetime of the interner. Substitute under the
-        // skipped binder, then open its payload directly.
-        let ps: Vec<_> = sig.params.iter().map(|t| instantiate_early(*t)).collect();
-        let ret = instantiate_early(sig.ret);
-        let ps: Vec<_> = ps.iter().map(|t| self.tcx.tys.subst_at_depth(*t, args, 1)).collect();
-        let ret = self.tcx.tys.subst_at_depth(ret, args, 1);
-        let vars: Vec<_> = (0..sig.bound_regions).map(|_| self.fresh_region()).collect();
-        let opened = self.instantiate_signature_parts(&ps, ret, &vars);
-        let mut expectations = Vec::new();
-        {
-            let bounds = self.tcx.callable_signatures(self.prog, d);
-            for bound in bounds {
-                if let Some(self_ty) = args.get(bound.param as usize) {
-                    let sig = instantiate_early(bound.signature);
-                    let sig = self.tcx.tys.subst(sig, args);
-                    let kind = match self.prog.name(bound.trait_def) {
-                        "Fn" | "AsyncFn" => crate::upvar::ClosureKind::Fn,
-                        "FnMut" | "AsyncFnMut" => crate::upvar::ClosureKind::FnMut,
-                        _ => crate::upvar::ClosureKind::FnOnce,
-                    };
-                    expectations.push((*self_ty, sig, kind));
-                }
-            }
-        }
-        self.fn_expectations.extend(expectations);
-        opened
+    pub(super) fn instantiate_call_signature(&mut self, d: DefId, args: &[crate::consts::GenericArg], sig: &FnSigT) -> (Vec<TyId>, TyId) {
+        let poly = self.tcx.tys.intern(TyKind::FnPtr(sig.params.clone(), sig.ret, sig.header, sig.bound_regions));
+        let poly = self.tcx.instantiate_ty(self.prog, d, args, poly);
+        let opened = self.infcx.instantiate_binder_with_infer(poly);
+        let TyKind::FnPtr(ps, ret, _, _) = self.tcx.tys.kind(opened).clone() else { unreachable!() };
+        (ps, ret)
     }
 
     /// Remove exactly one binder. Nested binders protect their own variables;
@@ -148,7 +122,7 @@ impl Fcx<'_> {
 
     /// Item calls/bodies only need the payload; closure typeck results also
     /// retain the FnPtr constructed by `instantiate_signature` above.
-    fn instantiate_signature_parts(&self, ps: &[TyId], ret: TyId, regions: &[RegionId]) -> (Vec<TyId>, TyId) {
+    pub(super) fn instantiate_signature_parts(&self, ps: &[TyId], ret: TyId, regions: &[RegionId]) -> (Vec<TyId>, TyId) {
         let replace = |r, depth| match self.tcx.tys.region_kind(r) {
             RegionKind::ReBound(d, var) if d == depth => regions[var.0 as usize],
             RegionKind::ReBound(d, var) if d > depth => self.tcx.tys.intern_region(RegionKind::ReBound(d - 1, var)),
@@ -170,9 +144,9 @@ impl Fcx<'_> {
 
     /// rustc closure.rs:876: annotations share one binder; absent types create
     /// inference variables. Elided references in separate inputs are distinct.
-    fn supplied_closure_signature(&mut self, params: &[ClosureParam], ret: Option<crate::ast::TyId>) -> TyId {
+    fn supplied_closure_signature(&mut self, e: ExprId, params: &[ClosureParam], ret: Option<crate::ast::TyId>) -> TyId {
         let outer = self.env.regions.clone();
-        self.env.regions = outer.binder(&self.tcx.tys, self.prog, self.file, List::new(0, 0));
+        self.env.regions = outer.with_binder(Some(crate::tcx::resolve_bound_vars::BinderId::Closure(e.0)));
         let mut ps = Vec::new();
         for p in params {
             ps.push(match p.ty { Some(t) => self.lower_ty(t), None => self.fresh(0) });
@@ -180,7 +154,7 @@ impl Fcx<'_> {
         let bound = self.env.regions.bound_count();
         // rustc_resolve/late.rs:1186-1196: closure output elision is Infer,
         // not the function signature's single-input elision rule.
-        self.env.regions.enter_body(self.region_vars.clone());
+        self.env.regions.enter_body();
         let ret = match ret { Some(t) => self.lower_ty(t), None => self.fresh(0) };
         self.env.regions = outer;
         let sig = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, bound));
@@ -190,48 +164,170 @@ impl Fcx<'_> {
     /// rustc closure.rs:300-520: a function pointer or Fn-family Output
     /// projection determines the expected signature from ordinary callable clauses.
     /// Declaration region contracts retain binders alongside selection clauses.
-    pub(super) fn deduce_closure_signature(&mut self, expected: TyId) -> Option<(TyId, Option<crate::upvar::ClosureKind>)> {
-        let expected = self.shallow_region_vars(expected);
+    pub(super) fn deduce_closure_signature(&mut self, expected: TyId, is_async: bool) -> (Option<TyId>, Option<crate::upvar::ClosureKind>) {
+        let expected = self.infcx.shallow_resolve(expected);
         match self.tcx.tys.kind(expected).clone() {
-            TyKind::FnPtr(..) => Some((expected, None)),
-            TyKind::Dyn(td, args, ..) if self.is_fn_trait(td) => {
-                let (ps, ret) = self.tcx.callable_sig(&self.cx, expected, td, &args)?;
-                Some((self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, 0)), None))
+            TyKind::FnPtr(..) if !is_async => (Some(expected), Some(crate::upvar::ClosureKind::Fn)),
+            TyKind::Dyn(principal, ..) => {
+                // closure.rs:305-316: only projection bounds supply the signature;
+                // the principal itself, not its supertraits, supplies the kind.
+                let mut clauses = self.tcx.object_predicates(self.prog, expected);
+                clauses.retain(|p| matches!(p.kind, PredicateKind::Clause(ClauseKind::Projection(_))));
+                let (sig, _) = self.deduce_closure_signature_from_predicates(expected, is_async, clauses);
+                let kind = match self.tcx.lang_items.by_def.get(&principal) {
+                    Some(crate::lang_items::LangItem::Fn) => Some(crate::upvar::ClosureKind::Fn),
+                    Some(crate::lang_items::LangItem::FnMut) => Some(crate::upvar::ClosureKind::FnMut),
+                    Some(crate::lang_items::LangItem::FnOnce) => Some(crate::upvar::ClosureKind::FnOnce),
+                    _ => None,
+                };
+                (sig, kind)
             }
             TyKind::Infer(v) => {
-                for i in 0..self.fn_expectations.len() {
-                    let (self_ty, sig, kind) = self.fn_expectations[i];
-                    if self.shallow_region_vars(self_ty) == expected && !self.occurs(v, sig, 0) {
-                        return Some((sig, Some(kind)));
-                    }
-                }
-                // Keep the existing opaque-bound inference. Its declaration
-                // table has no predicate binder yet (arch's solver work).
-                let opaque = self.opaque_vars.iter().find(|x| self.shallow_vars(x.1) == expected).map(|x| x.0)?;
-                let (ps, r) = self.opaque_fn_sig(opaque)?;
-                Some((self.tcx.tys.intern(TyKind::FnPtr(ps, r, FnHeader::RUST, 0)), None))
+                let clauses = self.obligations_for_self_ty(v);
+                let (sig, kind) = self.deduce_closure_signature_from_predicates(expected, is_async, clauses);
+                if sig.is_some() { return (sig, kind); }
+                // N2 owns inspect_obligations.rs:108-140's nested proof visitor.
+                // Until that port, a defining opaque's item bounds provide its
+                // nested obligations; retain a kind even without a signature.
+                let values = self.infcx.inner.borrow_mut().opaque_types().iter_lookup_table().to_vec();
+                let Some((key, _)) = values.iter().find(|(_, h)| self.infcx.shallow_resolve(h.ty) == expected) else { return (None, kind) };
+                let opaque = self.tcx.alias_ty_with_args(crate::types::AliasTyKind::Opaque { def_id: key.def_id }, &key.args);
+                let clauses = self.alias_bound_clauses(opaque);
+                let (sig, opaque_kind) = self.deduce_closure_signature_from_predicates(opaque, is_async, clauses);
+                (sig, kind.or(opaque_kind))
             }
-            TyKind::Dyn(td, args, ..) => {
-                // Likewise preserve today's supertrait inference until the
-                // trait predicate representation carries its binders.
-                let (ps, r) = self.dyn_super_fn_sig(td, expected, &args)?;
-                Some((self.tcx.tys.intern(TyKind::FnPtr(ps, r, FnHeader::RUST, 0)), None))
+            TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { .. }, .. }) => {
+                let clauses = self.alias_bound_clauses(expected);
+                self.deduce_closure_signature_from_predicates(expected, is_async, clauses)
             }
-            _ => None,
+            _ => (None, None),
         }
     }
 
+    /// fn_ctxt/inspect_obligations.rs:35-104 (predicate_has_self_ty,
+    /// type_matches_expected_vid with UseSubtyping::No): pending obligations
+    /// whose trait or trait-projection self type is unified with `vid`.
+    fn obligations_for_self_ty(&mut self, vid: u32) -> Vec<Predicate> {
+        let mut out = Vec::new();
+        for obligation in self.fulfillment_cx.pending_obligations() {
+            let self_ty = match &obligation.goal.predicate.kind {
+                PredicateKind::Clause(ClauseKind::Trait(c)) => match c.trait_ref.args.first() { Some(crate::consts::GenericArg::Type(t)) => *t, _ => continue },
+                PredicateKind::Clause(ClauseKind::Projection(p)) => {
+                    let AliasTerm::Ty(alias) = p.projection_term else { continue };
+                    match self.tcx.tys.kind(alias) {
+                        TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { .. }, args, .. }) => match args.first() { Some(t) => *t, None => continue },
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let expected = self.tcx.tys.intern(TyKind::Infer(vid));
+            if !self.same_self_ty(self_ty, expected) { continue; }
+            let mut resolver = crate::infer::resolve::DeepResolverIgnoringRegions::new(&self.infcx);
+            out.push(crate::next_solver::fold::fold_predicate(&self.tcx.tys, &obligation.goal.predicate, &mut resolver));
+        }
+        out
+    }
+
+    /// Equal types, or type variables with the same unification root.
+    fn same_self_ty(&mut self, a: TyId, b: TyId) -> bool {
+        let (a, b) = (self.infcx.shallow_resolve(a), self.infcx.shallow_resolve(b));
+        if a == b { return true; }
+        match (self.tcx.tys.kind(a), self.tcx.tys.kind(b)) {
+            (TyKind::Infer(x), TyKind::Infer(y)) => { let (x, y) = (*x, *y); let mut inner = self.infcx.inner.borrow_mut(); let mut table = inner.type_variables(); table.root_var(x) == table.root_var(y) }
+            _ => false,
+        }
+    }
+
+    /// closure.rs:335-444 and deduce_sig_from_projection :446-475: elaborated self
+    /// clauses; an FnOnce::Output (async closure: AsyncFnOnce::Output, or FnOnce::Output
+    /// of a two-part bound) projection gives the whole signature unless it mentions the
+    /// expected type, and the most permissive Fn-family (async closure: AsyncFn-family
+    /// first) trait gives the kind. An async closure is a closure returning its
+    /// coroutine here (TyKind::CoroutineClosure is M7's), so its signature's output is
+    /// that future: from AsyncFnOnce::Output it is left to inference, the projection's
+    /// obligation relates the future's Output through the async callable candidate;
+    /// from a two-part `FnOnce(..) -> Fut` bound it is `Fut` itself.
+    fn deduce_closure_signature_from_predicates(&mut self, expected_ty: TyId, is_async: bool, clauses: Vec<Predicate>) -> (Option<TyId>, Option<crate::upvar::ClosureKind>) {
+        use crate::upvar::ClosureKind;
+        let mut expected_sig = None;
+        let mut expected_kind = None;
+        let mut elaborated = Vec::new();
+        for clause in clauses { for p in self.tcx.supertraits(self.prog, clause) { if !elaborated.contains(&p) { elaborated.push(p); } } }
+        for clause in elaborated {
+            let bound_regions = clause.bound_vars.len() as u32;
+            let (trait_def, self_ty) = match &clause.kind {
+                PredicateKind::Clause(ClauseKind::Projection(p)) => {
+                    let AliasTerm::Ty(alias) = p.projection_term else { continue };
+                    let TyKind::Alias(_, alias) = self.tcx.tys.kind(alias).clone() else { continue };
+                    let trait_def = self.prog.def(alias.kind.def_id()).parent;
+                    let Some(&self_ty) = alias.args.first() else { continue };
+                    if !self.same_self_ty(self_ty, expected_ty) { continue; }
+                    let projection = self.tcx.lang_items.by_def.get(&alias.kind.def_id()).copied();
+                    let deduces = match projection {
+                        Some(crate::lang_items::LangItem::FnOnceOutput) => true,
+                        Some(crate::lang_items::LangItem::AsyncFnOnceOutput) => is_async,
+                        _ => false,
+                    };
+                    if expected_sig.is_none() && deduces {
+                        let term = match (projection, p.term) {
+                            (Some(crate::lang_items::LangItem::AsyncFnOnceOutput), _) => Term::Ty(self.fresh(0)),
+                            (_, term) => term,
+                        };
+                        if let (Some(&inputs), Term::Ty(ret)) = (alias.args.get(1), term) {
+                            if let TyKind::Tuple(ps) = self.tcx.tys.kind(inputs).clone() {
+                                let sig = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader::RUST, bound_regions));
+                                let sig = self.normalize_signature(sig);
+                                let mut mentions = MentionsTy { expected_ty, found: false };
+                                crate::types::fold::TypeFolder::fold_ty(&mut mentions, &self.tcx.tys, sig, 0);
+                                if !mentions.found { expected_sig = Some(sig); }
+                            }
+                        }
+                    }
+                    (trait_def, self_ty)
+                }
+                PredicateKind::Clause(ClauseKind::Trait(c)) => {
+                    let Some(crate::consts::GenericArg::Type(self_ty)) = c.trait_ref.args.first().copied() else { continue };
+                    (c.trait_ref.def_id, self_ty)
+                }
+                _ => continue,
+            };
+            if !self.same_self_ty(self_ty, expected_ty) { continue; }
+            let found_kind = match self.tcx.lang_items.by_def.get(&trait_def) {
+                Some(crate::lang_items::LangItem::Fn) => ClosureKind::Fn,
+                Some(crate::lang_items::LangItem::FnMut) => ClosureKind::FnMut,
+                Some(crate::lang_items::LangItem::FnOnce) => ClosureKind::FnOnce,
+                Some(crate::lang_items::LangItem::AsyncFn) if is_async => ClosureKind::Fn,
+                Some(crate::lang_items::LangItem::AsyncFnMut) if is_async => ClosureKind::FnMut,
+                Some(crate::lang_items::LangItem::AsyncFnOnce) if is_async => ClosureKind::FnOnce,
+                _ => continue,
+            };
+            match (expected_kind, found_kind) {
+                (None, _) => expected_kind = Some(found_kind),
+                (Some(ClosureKind::FnMut), ClosureKind::Fn) => expected_kind = Some(ClosureKind::Fn),
+                (Some(ClosureKind::FnOnce), ClosureKind::Fn | ClosureKind::FnMut) => expected_kind = Some(found_kind),
+                _ => {}
+            }
+        }
+        (expected_sig, expected_kind)
+    }
+
     pub(super) fn closure_signatures(&mut self, e: ExprId, params: &[ClosureParam], ret: Option<crate::ast::TyId>, expected: Option<TyId>) -> ClosureSignatures {
-        let expected = expected.and_then(|t| self.deduce_closure_signature(t)).map(|(sig, kind)| {
+        let is_async = matches!(self.ast().expr(e).kind, ExprKind::Closure { is_async: true, .. });
+        let expected = expected.and_then(|t| {
+            let (sig, kind) = self.deduce_closure_signature(t, is_async);
             // The same direct Fn-family bound supplies the signature and the
             // kind that can force a move async closure's coroutine captures.
             if let Some(kind) = kind { self.expected_closure_kinds.insert(e.0, kind); }
-            self.normalize_signature(sig)
+            sig.map(|sig| self.normalize_signature(sig))
         });
-        let supplied = self.supplied_closure_signature(params, ret);
+        let supplied = self.supplied_closure_signature(e, params, ret);
         let Some(expected) = expected else { return self.closure_sigs(e, supplied) };
         let TyKind::FnPtr(ps, r, _, n) = self.tcx.tys.kind(expected).clone() else { unreachable!() };
-        if ps.len() != params.len() { return self.closure_sigs(e, supplied); }
+        if ps.len() != params.len() {
+            self.err(self.ast().expr(e).lo, format!("E0593: closure is expected to take {} arguments, but it takes {} arguments", ps.len(), params.len()));
+            return self.closure_sigs(e, supplied);
+        }
         // This signature uses the safe Rust header of a reified closure pointer
         // (rustc_hir_typeck/src/coercion.rs:1083).
         // Bound regions already use anonymous variable indices.
@@ -245,15 +341,16 @@ impl Fcx<'_> {
         let instantiated = self.instantiate_signature(supplied, &vars);
         // rustc closure.rs:822 commit_if_ok: rollback the *whole* merge if
         // either an input or the output fails, then use the supplied signature.
-        let mark = self.snapshot();
-        if self.unify(sigs.liberated, instantiated) {
+        let mark = self.start_snapshot();
+        if self.eq(sigs.liberated, instantiated) {
             sigs.annotation_eq = Some((instantiated, sigs.liberated));
             // rustc closure.rs:856-865 checks the body using the resolved
             // supplied inputs and supplied output, after equating S' and E'.
-            sigs.liberated = self.resolve_region_vars(instantiated);
+            self.commit_from(mark);
+            sigs.liberated = self.infcx.deeply_resolve_ignoring_regions(instantiated);
             sigs
         } else {
-            self.rollback(mark);
+            self.rollback_to(mark);
             self.closure_sigs(e, supplied)
         }
     }
@@ -292,5 +389,14 @@ impl Fcx<'_> {
             let t = self.normalize_signature(t);
             self.b.inline_const_types.insert(e, t);
         }
+    }
+}
+
+/// closure.rs:375-389: a deduced signature must not mention the expected type.
+struct MentionsTy { expected_ty: TyId, found: bool }
+impl crate::types::fold::TypeFolder for MentionsTy {
+    fn fold_ty(&mut self, tys: &crate::types::Types, t: TyId, depth: u32) -> TyId {
+        if t == self.expected_ty { self.found = true; return t; }
+        crate::types::fold::super_fold_ty(tys, t, self, depth)
     }
 }

@@ -1,12 +1,16 @@
+// ported from N:rustc_middle/src/ty/instance.rs @8d1a764
+// ported from N:rustc_trait_selection/src/traits/vtable.rs @8d1a764
 //! The live image: executable memory, the per-function patch table with lazy
 //! stubs, the host runtime (formatting, panics, faults, hang watchdog) and the
 //! compile-on-first-call path.
 
 include!("rt_abi.rs");
-use relax_types::solve::SelectionResult;
+use relax_types::next_solver::TraitRef;
+use relax_types::instance::{Instance, InstanceKind, ShimKind};
+use relax_types::consts::GenericArg;
 use crate::lang_items::LangItem;
 use crate::lower::{fn_name, Lcx};
-use crate::program::{DefId, DefKind, Program, NO_DEF};
+use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::typeck::{Body, Res};
 use crate::types::{TyId, TyKind};
@@ -22,6 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum FnKey {
+    Shim(ShimInstance),
     Inst(DefId, Vec<TyId>),
     /// (file, closure expr, parent fn slot)
     Closure(u32, u32, u32),
@@ -32,12 +37,20 @@ pub enum FnKey {
     Sandbox(u32),
 }
 
+/// Round 23: the erased nightly Instance identity survives slot interning and caching.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct ShimInstance {
+    pub kind: ShimKind,
+    pub args: Vec<TyId>,
+}
+
 pub const GLUE_DROP: u8 = 0;
+pub const GLUE_CLONE: u8 = 4;
 /// `dyn Fn` entry for a callable without state (fn item, fn pointer, capture-free closure):
 /// `fn(env, args..) -> R` forwarding to it
-pub const GLUE_CALL_SHIM: u8 = 1;
+
 /// a #[track_caller] fn as a value: forwards with its definition site as the location
-pub const GLUE_TRACK_SHIM: u8 = 2;
+
 /// a live-editable struct's extension block (M10): drops the fields it holds and frees it
 pub const GLUE_EXT_DROP: u8 = 3;
 /// a tuple-struct / tuple-variant constructor used as a fn value: GLUE_CTOR + variant index,
@@ -216,6 +229,7 @@ impl ReloadSlots {
 }
 
 pub struct Unit {
+    pub query_errors: relax_types::infer::diagnostics::DiagCtxt,
     /// retired (retire_unit): an auxiliary unit going away mid-run (the proc-macro world);
     /// dropping it leaves the process-wide machinery (background borrowck, O3) alone
     pub retired: bool,
@@ -307,8 +321,6 @@ pub struct Unit {
     pub core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
     /// `T: Unpin` answers (noalias on `&mut T` params needs it)
     unpin_cache: crate::conc::MemoMap<TyId, bool>,
-    /// per generic fn: the compound assignments that are overloaded in its generic body
-    assignop_poly: crate::conc::MemoMap<DefId, std::sync::Arc<std::collections::HashSet<u32>>>,
     pub errors: Vec<String>,
     pub core_crate: u32,
     // memory
@@ -353,8 +365,9 @@ pub struct Unit {
     hot_entry: u64,
     /// state the type checks ahead share with this unit (no unit lock needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
-    /// const fn bodies checked for constant evaluation (ctfe.rs), with the collect epoch
+    /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.
     pub ctfe_fn_bodies: std::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
+
     /// this unit's own address (boxed): shared lowering reaches the unit-changing paths
     /// (constant evaluation) through it, under the unit lock, as the runtime does through UNIT
     self_ptr: UnitPtr,
@@ -516,9 +529,11 @@ static EXITING: AtomicU64 = AtomicU64::new(0);
 
 /// Parks this thread for good when another thread is ending the process (it holds no unit lock).
 fn park_if_exiting(me: u64) {
+    crate::preempt::point();
     let e = EXITING.load(Ordering::Acquire);
     if e != 0 && e != me {
         loop {
+            crate::preempt::point();
             std::thread::park();
         }
     }
@@ -553,6 +568,7 @@ pub fn unlock_to(depth: u32) {
 #[track_caller]
 pub fn lock_unit() {
     lower_ahead_needs_unit();
+    crate::preempt::point();
     let _cost_wait = crate::fncost::phase(7);
     let me = os::thread::current();
     if LOCK_OWNER.load(Ordering::Acquire) == me {
@@ -566,6 +582,7 @@ pub fn lock_unit() {
     if worker {
         let mut n = 0u32;
         while MAIN_WAITING.load(Ordering::Relaxed) && n < 20_000 {
+            crate::preempt::point();
             n += 1;
             std::thread::yield_now();
         }
@@ -581,6 +598,16 @@ pub fn lock_unit() {
         if main {
             MAIN_WAITING.store(true, Ordering::Relaxed);
         }
+        // A preemption must withdraw the waiter just as successful acquisition does.
+        struct Waiting { main: bool, watched: bool, counted: bool }
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                if self.main { MAIN_WAITING.store(false, Ordering::Relaxed); }
+                if self.counted { LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst); }
+                if self.watched { wait_note(None); }
+            }
+        }
+        let mut waiting = Waiting { main, watched, counted: true };
         let mut spins = 0u32;
         let mut since: Option<std::time::Instant> = None;
         let mut reported = false;
@@ -599,10 +626,13 @@ pub fn lock_unit() {
                 }
                 o2_last = now;
             }
+            crate::preempt::point();
             if EXITING.load(Ordering::Relaxed) != 0 {
+                waiting.counted = false;
                 LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
                 park_if_exiting(me);
                 LOCK_WAITERS.fetch_add(1, Ordering::SeqCst);
+                waiting.counted = true;
             }
             spins += 1;
             if spins > 64 && FORK_CHILD.load(Ordering::Relaxed) {
@@ -645,10 +675,6 @@ pub fn lock_unit() {
         if o2_wait > 0 {
             O2_STATS[3].fetch_add(o2_wait, Ordering::Relaxed);
             O2_STATS[4].fetch_add(1, Ordering::Relaxed);
-        }
-        LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
-        if watched {
-            wait_note(None);
         }
     }
     LOCK_SITE.store(std::panic::Location::caller() as *const _ as *mut _, Ordering::Relaxed);
@@ -794,7 +820,8 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     u.install_prelinked(s.id, s.at, s.len, s.trailer, s.pc);
     // (perf maps and the cache trace name the slot: prelink_startup decoded the identities first)
     if perf_map_on() {
-        perf_map(s.at, s.len as usize, &perf_name(u, s.id));
+        let tier = if tier1 { " [O3]" } else if s.base { " [B]" } else if s.o2 { " [O2]" } else { " [O1]" };
+        perf_map(s.at, s.len as usize, &format!("{}{}", perf_name(u, s.id), tier));
     }
     // an instance or a closure (image slots are never foreign fns: their code is not stored):
     // its call counter, armed with the others of the block (arm_counters)
@@ -2210,8 +2237,65 @@ fn cyc_leave(depth: usize) -> bool {
 const UNIT_DATA_SIZE: u64 = 768 << 20;
 const UNIT_RW_SIZE: u64 = 256 << 20;
 
+// queries.rs:58-108: evaluate the resolved instance through the registered
+// compiler provider; the final result is independent of its executable storage.
+fn const_eval_to_valtree(context: usize, _env: crate::tcx::TypingEnv, def: DefId,
+    args: &[relax_types::consts::GenericArg],
+) -> relax_types::const_eval::EvalToValTreeResult {
+    use relax_types::consts::GenericArg;
+    use relax_types::const_eval::{ErrorHandled, evaluation_error};
+    let u = unsafe { &*(context as *const Unit) };
+    let mut compact = Vec::new();
+    for arg in args {
+        let ty = match *arg {
+            GenericArg::Lifetime(_) => continue,
+            GenericArg::Type(t) => t,
+            GenericArg::Const(c) => u.tcx.tys.intern(TyKind::Const(c)),
+        };
+        if u.tcx.tys.flags(ty).contains(crate::types::TypeFlags::HAS_TY_PARAM) { return Err(ErrorHandled::TooGeneric); }
+        compact.push(ty);
+    }
+    let ty = u.tcx.type_of(&u.prog, def).map_err(|_| evaluation_error())?;
+    let ty = u.tcx.instantiate_ty(&u.prog, def, args, ty);
+    let depth = lock_depth();
+    // whether this evaluation (not an earlier one of the same build) deferred
+    let prev = DEFERRED_ABORT.with(|a| a.replace(false));
+    let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let addr = u.const_addr_shared(def, compact).ok_or_else(evaluation_error)?;
+        crate::valtrees::const_to_valtree(u, addr, ty)
+    }));
+    unlock_to(depth);
+    let deferred = DEFERRED_ABORT.with(|a| a.get());
+    DEFERRED_ABORT.with(|a| a.set(prev || deferred));
+    match value {
+        // The initializer needs a module the post-boot loader has not loaded yet: that is no
+        // value and no evaluation error of the program. Nothing may cache or report it, so it
+        // leaves this query (and every query above it) as a cancellation, and the build that
+        // asked fails with DEFERRED_RETRY (build_rir); its outer compile loads and rebuilds.
+        Ok(Err(_)) if deferred && BUILD_DEPTH.with(|d| d.get()) > 0 => std::panic::resume_unwind(Box::new(crate::preempt::NeedsLoad)),
+        Ok(value) => value,
+        Err(payload) => {
+            if crate::preempt::is_cancelled(&*payload) { std::panic::resume_unwind(payload); }
+            Err(evaluation_error())
+        }
+    }
+}
+
 impl Unit {
+    pub(crate) fn flush_query_errors(&mut self, finished: bool) {
+        if !self.errors.is_empty() { self.query_errors.note_reported_error(); }
+        if finished { self.query_errors.flush_delayed(); }
+        let (errors, warnings) = self.query_errors.drain_reported();
+        for error in errors {
+            let message = if error.cause.body_id == crate::program::NO_DEF { error.message }
+                else { self.prog.record_error(self.prog.def(error.cause.body_id).file, error.cause.span, "typeck", error.message) };
+            self.errors.push(message);
+        }
+        for warning in warnings { eprintln!("warning: {}", warning.message); }
+    }
+
     pub fn new(prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
+        let query_errors = tcx.dcx.clone();
         let sess = prog.session.clone();
         // Restored files bypass load_file; seed their diagnostic identities too.
         if sess.runtime.profile {
@@ -2311,7 +2395,7 @@ impl Unit {
             const_failed: std::collections::HashSet::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
             unpin_cache: Default::default(),
-            assignop_poly: crate::conc::MemoMap::with_bits(10),
+            query_errors,
             errors: Vec::new(),
             core_crate,
             exec_base,
@@ -2465,10 +2549,12 @@ impl Unit {
             }
         }
         u.self_ptr = UnitPtr(&mut *u as *mut Unit);
+        u.tcx.const_eval_provider = Some(relax_types::const_eval::ConstEvalProvider {
+            context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,
+        });
         crate::syms::set_unit(&mut *u as *mut Unit);
         set_shared_front(&mut u, core_crate);
         u.prog.body_memos.store(true, Ordering::Relaxed);
-        u.tcx.impl_projection_ready = true;
         u.tcx.publish_collected();
         install_ice_hook();
         ensure_altstack();
@@ -2752,18 +2838,14 @@ impl Unit {
     /// Whether `t` has a `Default` impl (a field added live takes it in running values, M10).
     pub fn has_default(&self, t: TyId) -> bool {
         match self.core_path(&["default", "Default"]) {
-            Some(td) => matches!(self.tcx.select_trait(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, t, &[]), SelectionResult::Ok(_)),
+            Some(td) => self.tcx.type_implements_trait(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions(),
             None => false,
         }
     }
 
     pub fn is_copy(&self, t: TyId) -> bool {
         let Some(td) = self.tcx.lang_items.get(LangItem::Copy) else { return false; };
-        match self.tcx.select_trait(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), td, t, &[]) {
-            SelectionResult::Ok(_) => true,
-            SelectionResult::NoSolution => false,
-            SelectionResult::Ambiguous(_) => false, // No Copy-based optimization without proof.
-        }
+        self.tcx.type_implements_trait(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), TraitRef { def_id: td, args: vec![GenericArg::Type(t)] }).must_apply_modulo_regions()
     }
 
     /// Whether the monomorphic type `t` is Unpin (an auto trait: every component is, and
@@ -2788,7 +2870,7 @@ impl Unit {
             TyKind::Tuple(v) => v.iter().all(|x| self.is_unpin(*x)),
             TyKind::Array(e, _) | TyKind::Slice(e) => self.is_unpin(e),
             // an async block / fn body is !Unpin (rustc: it may hold references into itself)
-            TyKind::Closure(file, ce, _, up, _) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin(up),
+            TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => !self.tcx.coroutines.contains(&(file, ce)) && self.is_unpin(up),
             TyKind::Adt(d, args, _) => {
                 if self.prog.name(d) == "PhantomPinned" {
                     false
@@ -2800,7 +2882,6 @@ impl Unit {
                     let mut ok = true;
                     for f in fields {
                         let ft = self.tcx.tys.subst_erasing_regions(f, &args);
-                        let ft = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), ft);
                         if !self.is_unpin(ft) {
                             ok = false;
                             break;
@@ -2816,34 +2897,6 @@ impl Unit {
             self.unpin_cache.insert(t, r);
         }
         r
-    }
-
-    /// Whether compound assignment `e` of generic fn `d` is overloaded in its generic body
-    /// (rustc type-checks the body once, with its params: `x.0 += y` where x.0: T is a call to
-    /// AddAssign::add_assign -- left operand first -- even in the i32 instance, while Relax
-    /// checks per instance). Found by type-checking the body over its own params, once.
-    pub fn assignop_overloaded_generically(&self, d: DefId, e: u32) -> bool {
-        if !self.assignop_poly.contains_key(&d) {
-            let n = self.tcx.fn_sig(&self.prog, d).map_or(0, |s| s.n_generics);
-            let params: Vec<TyId> = (0..n).map(|i| self.tcx.tys.intern(TyKind::Param(i))).collect();
-            let _o = crate::clock::origin("assignop");
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.prog, &self.tcx, d, &params)));
-            let mut set = std::collections::HashSet::new();
-            if let Ok(body) = r {
-                let file = &self.prog.files[body.file as usize].ast;
-                for i in 0..body.expr_ty.len() {
-                    let x = body.expr_at(i);
-                    if let crate::ast::ExprKind::AssignOp(_, a, _) = &file.expr(x).kind {
-                        let ta = body.ty(*a);
-                        if !matches!(self.tcx.tys.kind(ta), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char) {
-                            set.insert(x.0);
-                        }
-                    }
-                }
-            }
-            self.assignop_poly.insert(d, std::sync::Arc::new(set));
-        }
-        self.assignop_poly.get(&d).map_or(false, |s| s.contains(&e))
     }
 
     /// Deferred diagnostic items and Relax runtime helpers, not language-item identities.
@@ -2867,10 +2920,32 @@ impl Unit {
         cur
     }
 
+    pub fn closure_storage_layout(&self, ty: TyId) -> crate::layout::Layout {
+        loop {
+            let lcx = crate::layout::LayoutCx::new(&self.prog);
+            let layout = self.lay.closure_storage_layout(&lcx, &self.tcx, ty);
+            if lcx.missing.borrow().is_empty() { return layout; }
+            for ct in lcx.missing.into_inner() {
+                if self.tcx.coro_frames.get(&ct).is_none() {
+                    lock_unit();
+                    unsafe { (&mut *self.self_ptr.0).coro_frame(ct) };
+                    unlock_unit();
+                }
+            }
+        }
+    }
+
+    pub fn closure_storage(&self, ty: TyId) -> crate::layout::ClosureStorage {
+        self.lay.closure_storage(&self.prog, &self.tcx, ty)
+    }
+
     /// The layout of `t`. A coroutine's state area comes from its lowered poll function: the
     /// coroutines `t` contains whose body was not lowered yet are lowered first (rustc computes
     /// a coroutine's layout from its optimized MIR the same way, on demand).
     pub fn layout_of(&self, t: TyId) -> &'static crate::layout::Layout {
+        // rustc_ty_utils/src/layout.rs:63-75 @8d1a764: codegen layouts use
+        // normalized types, including const aliases in static array lengths.
+        let t = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t);
         loop {
             let lcx = crate::layout::LayoutCx::new(&self.prog);
             let l = self.lay.of(&lcx, &self.tcx, t);
@@ -2912,9 +2987,8 @@ impl Unit {
         if let FnKey::Closure(cfile, _, parent) = self.fns[id as usize].key.clone() {
             if !self.has_body(parent, cfile) {
                 if let FnKey::Inst(d, args) = self.fns[parent as usize].key.clone() {
-                    self.resolve_const_requests();
                     let _o = crate::clock::origin("coro-owner");
-                    let body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.prog, &self.tcx, d, &args);
+                    let body = crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&self.prog, &self.tcx, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), &crate::tcx::EvalState::new()), &self.prog, &self.tcx, d, &args);
                     if body.errors.is_empty() {
                         self.put_body(parent, body);
                     }
@@ -2944,7 +3018,7 @@ impl Unit {
     /// language needs_drop query is false. Walk owned fields so enclosing aggregates
     /// schedule the glue that emits GLUE_EXT_DROP / rt_ext_free in lower.rs.
     pub fn needs_drop_glue(&self, t: TyId) -> bool {
-        let env = crate::tcx::TypingEnv::fully_monomorphized();
+        let env = crate::tcx::TypingEnv::fully_monomorphized(&self.prog);
         if self.tcx.needs_drop(&self.prog, env, t) { return true; }
         if !crate::layout::LIVE_SESSION.load(Ordering::Relaxed) { return false; }
         let mut todo = vec![t];
@@ -2963,8 +3037,8 @@ impl Unit {
                     }
                 }
                 TyKind::Tuple(fields) => todo.extend_from_slice(fields),
-                TyKind::Array(elem, n) => { if *n != 0 { todo.push(*elem); } }
-                TyKind::Slice(elem) | TyKind::Closure(_, _, _, elem, _) => todo.push(*elem),
+                TyKind::Array(elem, n) => { if n.try_to_target_usize(&self.tcx.tys) != Some(0) { todo.push(*elem); } }
+                TyKind::Slice(elem) | TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: elem, .. }) => todo.push(*elem),
                 _ => {}
             }
         }
@@ -2981,7 +3055,7 @@ impl Unit {
         if let Some(b) = self.unwind_drop_cache.get(&t) {
             return b;
         }
-        if !self.tcx.needs_drop(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), t) {
+        if !self.tcx.needs_drop(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), t) {
             return false;
         }
         // recursive types: assume no while computing (a cycle only goes through pointers); answers
@@ -3022,7 +3096,7 @@ impl Unit {
                         if !adt.is_union {
                             for (vi, v) in adt.variants.iter().enumerate() {
                                 for fi in 0..v.fields.len() {
-                                    let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                                    let ft = self.tcx.field_ty(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, vi as u32, fi as u32, &args);
                                     if self.drop_may_unwind(ft) {
                                         any = true;
                                     }
@@ -3042,8 +3116,8 @@ impl Unit {
                 }
                 any
             }
-            TyKind::Array(e, n) => n > 0 && self.drop_may_unwind(e),
-            TyKind::Closure(_, _, _, up, _) => self.drop_may_unwind(up),
+            TyKind::Array(e, n) => n.try_to_target_usize(&self.tcx.tys) != Some(0) && self.drop_may_unwind(e),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => self.drop_may_unwind(up),
             _ => true,
         };
         self.cycle_inprog.remove(&ik);
@@ -3053,73 +3127,9 @@ impl Unit {
         r
     }
 
-    /// Methods of a trait object's vtable in slot order: the trait's methods with a `self`
-    /// receiver in declaration order, then each supertrait's.
-    /// The methods in a `dyn td<targs>` vtable (rustc vtable_entries): (method, the args of
-    /// its trait without Self), the trait's own first, then each distinct supertrait
-    /// instantiation's (`Bar<i32>` and `Bar<bool>` are two), depth first.
-    pub fn dyn_methods(&self, td: DefId, targs: &[TyId]) -> Vec<(DefId, Vec<TyId>)> {
-        let mut out = Vec::new();
-        let mut seen = Vec::new();
-        self.dyn_methods_into(td, targs.to_vec(), &mut out, &mut seen);
-        out
-    }
-
-    fn dyn_methods_into(&self, td: DefId, targs: Vec<TyId>, out: &mut Vec<(DefId, Vec<TyId>)>, seen: &mut Vec<(DefId, Vec<TyId>)>) {
-        if seen.iter().any(|x| x.0 == td && x.1 == targs) {
-            return;
-        }
-        seen.push((td, targs.clone()));
-        for &it in &self.prog.traits[self.prog.def(td).sub as usize] {
-            if let Some(sig) = self.tcx.fn_sig(&self.prog, it) {
-                if sig.self_kind != 0 {
-                    out.push((it, targs.clone()));
-                }
-            }
-        }
-        let prog: *const Program = &self.prog;
-        for (sup, sargs) in self.tcx.trait_super_refs(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), unsafe { &*prog }, td, &targs) {
-            self.dyn_methods_into(sup, sargs, out, seen);
-        }
-    }
-
-    /// The vtable slot of method `m` of trait instance `margs` in a `dyn td<targs>` vtable:
-    /// the entry of that instantiation, else (args not fully known) the first of that method.
-    pub fn dyn_method_index(&self, td: DefId, targs: &[TyId], m: DefId, margs: &[TyId]) -> Option<usize> {
-        let ms = self.dyn_methods(td, targs);
-        ms.iter().position(|x| x.0 == m && x.1[..] == margs[..]).or_else(|| ms.iter().position(|x| x.0 == m))
-    }
-
-    /// Supertrait instantiations of `td<targs>` whose vtables a `dyn td` vtable carries for
-    /// upcasting, in a fixed order (depth first, each once, `td<targs>` itself excluded).
-    pub fn dyn_supers(&self, td: DefId, targs: &[TyId]) -> Vec<(DefId, Vec<TyId>)> {
-        let prog: *const Program = &self.prog;
-        let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
-        let mut todo = self.tcx.trait_super_refs(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), unsafe { &*prog }, td, targs);
-        todo.reverse();
-        while let Some(t) = todo.pop() {
-            if (t.0 == td && t.1[..] == targs[..]) || out.contains(&t) {
-                continue;
-            }
-            let mut more = self.tcx.trait_super_refs(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), unsafe { &*prog }, t.0, &t.1);
-            more.reverse();
-            out.push(t);
-            todo.extend(more);
-        }
-        out
-    }
-
-    /// vtable word index holding `dyn sup<sargs>`'s vtable inside a `dyn sub<args>` vtable
-    /// (rustc vtable_trait_upcasting_coercion_new_vptr_slot): after the header and the methods.
-    pub fn upcast_slot(&self, sub: DefId, args: &[TyId], sup: DefId, sargs: &[TyId]) -> Option<usize> {
-        let sups = self.dyn_supers(sub, args);
-        let k = sups.iter().position(|t| t.0 == sup && t.1[..] == sargs[..]).or_else(|| sups.iter().position(|t| t.0 == sup))?;
-        Some(3 + self.dyn_methods(sub, args).len() + k)
-    }
-
     /// The function of a closure type (its body is lowered from the owner instance's).
     pub fn closure_fn_id(&self, t: TyId) -> Option<u32> {
-        if let TyKind::Closure(file, ce, _, _, owner) = self.tcx.tys.kind(t).clone() {
+        if let TyKind::Closure(file, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = self.tcx.tys.kind(t).clone() {
             if let TyKind::FnDef(d, args, _) = self.tcx.tys.kind(owner).clone() {
                 let parent = self.fn_id(FnKey::Inst(d, args));
                 return Some(self.fn_id(FnKey::Closure(file, ce, parent)));
@@ -3155,79 +3165,38 @@ impl Unit {
         words.push(l.align as u64);
         wsyms.push(None);
         wsyms.push(None);
-        // rustc_middle/src/middle/lang_items.rs:37 classifies Fn traits by lang identity.
-        let is_fn = matches!(self.tcx.lang_items.by_def.get(&td), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce));
-        if is_fn {
-            let captures = match self.tcx.tys.kind(src).clone() {
-                TyKind::Closure(_, _, _, up, _) => !matches!(self.tcx.tys.kind(up), TyKind::Tuple(v) if v.is_empty()),
-                _ => false,
-            };
-            let id = if captures {
-                self.closure_fn_id(src).unwrap()
-            } else {
-                self.fn_id(FnKey::Glue(GLUE_CALL_SHIM, src))
-            };
-            words.push(self.entry(id));
-            wsyms.push(Some(self.syms.intern(crate::syms::SymKind::Thunk(id), self.entry(id))));
-        } else {
-            for (m, mtargs) in self.dyn_methods(td, &targs) {
-                // an Fn-family supertrait's method of a closure / fn source (`dyn Foo` with
-                // `trait Foo: Fn(i32) -> i32`): the closure's own entry, as for `dyn Fn`
-                let pt = self.prog.def(m).parent;
-                if matches!(self.tcx.lang_items.by_def.get(&pt), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce)) && matches!(self.tcx.tys.kind(src), TyKind::Closure(..) | TyKind::FnDef(..) | TyKind::FnPtr(..)) {
-                    let captures = match self.tcx.tys.kind(src).clone() {
-                        TyKind::Closure(_, _, _, up, _) => !matches!(self.tcx.tys.kind(up), TyKind::Tuple(v) if v.is_empty()),
-                        _ => false,
-                    };
-                    let id = if captures { self.closure_fn_id(src).unwrap() } else { self.fn_id(FnKey::Glue(GLUE_CALL_SHIM, src)) };
-                    words.push(self.entry(id));
-                    wsyms.push(Some(self.syms.intern(crate::syms::SymKind::Thunk(id), self.entry(id))));
-                    continue;
+        // rustc_trait_selection/src/traits/vtable.rs:199-298.
+        use relax_types::next_solver::vtable::VtblSegment;
+        let mut compact = vec![src]; compact.extend_from_slice(&targs);
+        let regions = self.tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; self.tcx.generic_indices_of(&self.prog, td).lifetimes.len()]);
+        // rustc_middle/src/ty/fold.rs:321-326 @8d1a764: the object's
+        // principal binder is instantiated before requesting vtable entries.
+        let tr = self.tcx.instantiate_bound_regions_with_erased(relax_types::next_solver::TraitRef { def_id: td, args: self.tcx.complete_args(&self.prog, td, &compact, regions) });
+        for segment in self.tcx.prepare_vtable_segments(&self.prog, tr) {
+            let VtblSegment::TraitOwnEntries { trait_ref, emit_vptr } = segment else { continue };
+            for method in self.tcx.own_existential_vtable_entries(&self.prog, trait_ref.def_id) {
+                let indices = self.tcx.generic_indices_of(&self.prog, method);
+                let mut args = trait_ref.args.clone();
+                for arg in &indices.identity_args(&self.tcx.tys)[args.len()..] {
+                    match arg {
+                        relax_types::consts::GenericArg::Lifetime(_) => args.push(relax_types::consts::GenericArg::Lifetime(crate::types::RegionId::ERASED)),
+                        _ => panic!("generic vtable method"),
+                    }
                 }
-                // a method of a supertrait instantiation takes that instantiation's args
-                let mut margs = vec![src];
-                margs.extend(mtargs.iter().copied());
-                let n = self.tcx.fn_sig(&self.prog, m).map_or(0, |s| s.n_parent_generics) as usize;
-                // a method with type params of its own or `where Self: Sized` has no vtable
-                // entry (rustc vtable_entries: not vtable-safe, Vacant / left out; it is not
-                // callable on the trait object)
-                if self.tcx.fn_sig(&self.prog, m).map_or(false, |s| s.n_generics as usize > n) || self.tcx.self_sized_method(&self.prog, m) {
-                    words.push(0);
-                    wsyms.push(None);
-                    continue;
+                if self.tcx.instantiate_and_check_impossible_clauses(&self.prog, method, &args) {
+                    words.push(0); wsyms.push(None); continue;
                 }
-                let mut a = margs.clone();
-                a.truncate(n.max(1));
-                while a.len() < n {
-                    a.push(self.tcx.tys.error);
-                }
-                let (d, a) = self.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.prog, m, &a).expect_dispatch();
-                // a #[track_caller] method in a vtable: its reify shim (no implicit argument),
-                // unless the trait's declaration tracks too -- then virtual calls pass the caller
-                // location and the entry is the tracked fn itself (rustc: the vtable shim of a
-                // track_caller trait method forwards the caller's location)
-                let tracked_decl = self.tcx.fn_sig(&self.prog, m).map_or(false, |s| s.track_caller);
-                let id = if self.tcx.fn_sig(&self.prog, d).map_or(false, |s| s.track_caller) && !tracked_decl {
-                    let ft = self.tcx.tys.intern(TyKind::FnDef(d, a, crate::types::RegionArgsId::EMPTY));
-                    self.fn_id(FnKey::Glue(GLUE_TRACK_SHIM, ft))
-                } else {
-                    self.fn_id(FnKey::Inst(d, a))
-                };
+                let args = Instance::new_raw(method, args).compact_args(&self.tcx);
+                let instance = Instance::expect_resolve_for_vtable(&self.tcx, &self.prog, method, &args);
+                let id = self.instance_fn_id(instance);
                 words.push(self.entry(id));
                 wsyms.push(Some(self.syms.intern(crate::syms::SymKind::Thunk(id), self.entry(id))));
             }
-            // the vtables of the supertrait instantiations, for upcasting (`upcast_slot`); one
-            // whose args mention Self cannot be a trait object's: 0
-            for (sup, sargs) in self.dyn_supers(td, &targs) {
-                if sargs.iter().any(|a| self.tcx.tys.has_error(*a)) {
-                    words.push(0);
-                    wsyms.push(None);
-                    continue;
-                }
-                let sdy = self.tcx.tys.intern(TyKind::Dyn(sup, sargs.into(), Default::default(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, Default::default()));
-                let v = self.vtable(src, sdy)?;
-                words.push(v);
-                wsyms.push(Some(self.data_sym(v)));
+            if emit_vptr {
+                let args = Instance::new_raw(trait_ref.def_id, trait_ref.args).compact_args(&self.tcx);
+                let super_dyn = self.tcx.tys.intern(TyKind::Dyn(trait_ref.def_id, args[1..].to_vec().into(), Vec::new().into(), crate::types::RegionArgsId::EMPTY, crate::types::RegionId::ERASED, 0, Vec::new().into()));
+                let address = self.vtable(src, super_dyn)?;
+                words.push(address); wsyms.push(Some(self.data_sym(address)));
             }
         }
         let mut bytes = Vec::with_capacity(words.len() * 8);
@@ -3256,6 +3225,34 @@ impl Unit {
         g
     }
 
+    /// Round 23: the instance kind determines the permanent slot identity.
+    pub fn instance_fn_id(&self, instance: Instance) -> u32 {
+        let args = instance.compact_args(&self.tcx);
+        match instance.def {
+            InstanceKind::Item(d) if self.prog.def(d).kind == DefKind::Closure => {
+                let (file, node) = self.prog.def_id_to_node_id[&d];
+                let expr = match node {
+                    crate::def_collector::NodeId::Closure(e) => e.0,
+                    crate::def_collector::NodeId::AsyncBody(item) => {
+                        let block = self.prog.fn_body(file, item).expect("coroutine body").expect("coroutine block");
+                        crate::tcx::ASYNC_FN_BODY | block.0
+                    }
+                    _ => panic!("closure definition node"),
+                };
+                let mut owner = self.prog.def(d).parent;
+                while self.prog.def(owner).kind == DefKind::Closure { owner = self.prog.def(owner).parent; }
+                let parent_count = self.tcx.generic_indices_of(&self.prog, owner).types_consts.len();
+                let parent = self.fn_id(FnKey::Inst(owner, args[..parent_count].to_vec()));
+                self.fn_id(FnKey::Closure(file, expr, parent))
+            }
+            InstanceKind::Item(d) => self.fn_id(FnKey::Inst(d, args)),
+            InstanceKind::Intrinsic(_) | InstanceKind::Virtual(..) => panic!("instance is lowered at its call site"),
+            InstanceKind::Shim(ShimKind::DropGlue(_, _)) => self.fn_id(FnKey::Glue(GLUE_DROP, args[0])),
+            InstanceKind::Shim(ShimKind::Clone(_, ty)) => self.fn_id(FnKey::Glue(GLUE_CLONE, ty)),
+            InstanceKind::Shim(kind) => self.fn_id(FnKey::Shim(ShimInstance { kind, args })),
+        }
+    }
+
     /// Slot of a function instance (created with a lazy stub on first use).
     pub(crate) fn slots_of_defs(&self, defs: impl IntoIterator<Item = DefId>) -> Vec<u32> {
         let g = self.reload_index();
@@ -3282,6 +3279,13 @@ impl Unit {
     /// A key as slots are keyed: all instance/glue identities (including O3 keys) use codegen types.
     fn slot_key_form(&self, mut key: FnKey) -> FnKey {
         match &mut key {
+            FnKey::Shim(shim) => {
+                for ty in &mut shim.args { *ty = self.tcx.tys.erase_regions(*ty); }
+                match &mut shim.kind {
+                    ShimKind::FnPtr(_, ty) | ShimKind::FnPtrAsPtr(_, ty) | ShimKind::FnPtrFromPtr(_, ty) => *ty = self.tcx.tys.erase_regions(*ty),
+                    _ => {}
+                }
+            }
             FnKey::Inst(_, args) => args.iter_mut().for_each(|t| *t = self.tcx.tys.erase_regions(*t)),
             FnKey::Glue(_, t) => *t = self.tcx.tys.erase_regions(*t),
             FnKey::Closure(..) | FnKey::Sandbox(_) => {}
@@ -3306,31 +3310,13 @@ impl Unit {
                 if let Some(sig) = self.tcx.ctor_sigs.get(d) {
                     // (instantiated and normalized like any fn signature: field types declared
                     // through projections are their concrete types)
-                    let ps: Vec<TyId> = sig.params.iter().map(|p| self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), self.tcx.tys.subst(*p, args))).collect();
-                    let r = self.tcx.normalize_erasing_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), self.tcx.tys.subst(sig.ret, args));
+                    let ps: Vec<TyId> = sig.params.iter().map(|p| self.tcx.normalize_erasing_late_bound_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), self.tcx.tys.subst(*p, args))).collect();
+                    let r = self.tcx.normalize_erasing_late_bound_regions(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), self.tcx.tys.subst(sig.ret, args));
                     let fp = self.tcx.tys.intern(TyKind::FnPtr(ps, r, sig.header, 0));
                     let vi = if k == crate::program::DefKind::Variant { self.prog.def(*d).sub } else { 0 };
                     let id = self.fn_id(FnKey::Glue(GLUE_CTOR + vi as u8, fp));
                     self.fn_map.insert(key, id);
                     return id;
-                }
-            }
-        }
-        // `Future::poll` of a coroutine: its poll function (the coroutine's closure fn); before
-        // fn_create is taken (closure_fn_id creates slots itself)
-        if let FnKey::Inst(d, args) = &key {
-            if let Some(&st) = args.first() {
-                if self.tcx.is_coroutine(st) {
-                    let poll = self.tcx.future_defs(&self.prog).and_then(|(fd, _)| {
-                        let sym = self.prog.syms.get("poll")?;
-                        self.prog.traits[self.prog.def(fd).sub as usize].iter().copied().find(|it| self.prog.def(*it).name == sym)
-                    });
-                    if poll == Some(*d) {
-                        if let Some(id) = self.closure_fn_id(st) {
-                            self.fn_map.insert(key, id);
-                            return id;
-                        }
-                    }
                 }
             }
         }
@@ -3400,7 +3386,7 @@ impl Unit {
         match key {
             FnKey::Inst(d, _) => self.prog.def(*d).file,
             FnKey::Closure(f, _, _) => *f,
-            FnKey::Glue(..) => 0,
+            FnKey::Shim(_) | FnKey::Glue(..) => 0,
             FnKey::Sandbox(b) if *b == u32::MAX => 0,
             FnKey::Sandbox(b) => self.fns[*b as usize].file,
         }
@@ -3411,7 +3397,7 @@ impl Unit {
         // Generated glue and sandbox entries are conservatively not local-linkage. A
         // definition's own entry/export markers are read only by single_ref (declared_entry):
         // most slots (the startup image's thousands) are never asked.
-        let entry_ref = matches!(key, FnKey::Glue(..) | FnKey::Sandbox(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
+        let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
         FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, prev: Vec::new(), compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, inlined_into: Vec::new(), build_ns: 0, cg_ns: 0, version: 0, retired: Vec::new(), inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), builder: 0, calls: Box::default() }
     }
 
@@ -3784,80 +3770,6 @@ impl Unit {
         a
     }
 
-    /// Address of a constant's value (evaluated by running its initializer once).
-    /// Evaluates the integer consts that array lengths / repeat counts asked for (rustc CTFE:
-    /// the const's initializer runs, here through the JIT) and re-collects the signatures that
-    /// waited for them. Returns whether anything was evaluated.
-    pub fn resolve_const_requests(&mut self) -> bool {
-        let mut any = false;
-        loop {
-            let d = match self.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-                Some(d) => d,
-                None => break,
-            };
-            if self.tcx.const_values.contains_key(&d) || self.tcx.const_failed.contains(&d) {
-                continue;
-            }
-            if self.tcx.const_in_progress.contains(&d) {
-                // requested again while it is evaluated (a nested resolve): the outer one
-                // finishes it; a true cycle fails there
-                continue;
-            }
-            self.tcx.const_in_progress.insert(d, ());
-            let t = self.tcx.const_tys.get(&d).copied();
-            let v = match (t, self.const_addr(d, Vec::new())) {
-                (Some(t), Some(a)) => {
-                    let (size, signed) = match self.tcx.tys.kind(t) {
-                        TyKind::Int(p) => crate::types::Types::int_info(*p),
-                        TyKind::Bool => (1, false),
-                        _ => (0, false),
-                    };
-                    let mut b = [0u8; 16];
-                    if size > 0 {
-                        unsafe { std::ptr::copy_nonoverlapping(a as *const u8, b.as_mut_ptr(), size as usize) };
-                    }
-                    let raw = u128::from_le_bytes(b);
-                    match size {
-                        0 => None,
-                        _ if signed && size < 16 && (raw >> (size * 8 - 1)) & 1 == 1 => None,
-                        _ => Some(raw),
-                    }
-                }
-                _ => None,
-            };
-            self.tcx.const_in_progress.remove(&d);
-            match v {
-                Some(v) => {
-                    self.tcx.const_values.insert(d, v);
-                    any = true;
-                }
-                None => {
-                    self.tcx.const_failed.insert(d, ());
-                }
-            }
-        }
-        if any && self.tcx.has_blocked_consts() {
-            // re-collection changes signatures / ADTs: no type check may run beside it
-            let _w = front_write();
-            let before = self.tcx.collect_epoch.load(Ordering::SeqCst);
-            // a re-collected type definition keeps its TyIds: cached layouts are recomputed
-            if self.tcx.recollect_blocked(&self.prog) {
-                self.lay.clear();
-            }
-            // Ahead bodies are admitted only after a check with no constant requests and
-            // no blocked declarations. Thus none read a declaration still waiting for a
-            // constant: demanding such a signature sets pending_signature_consts, and ADTs
-            // are already in const_blocked. Resolving those declarations changes no input
-            // of these bodies. This does NOT apply to added defs/impls or live edits.
-            let after = self.tcx.collect_epoch.load(Ordering::SeqCst);
-            self.front.ahead.retain(|_, (epoch, _)| {
-                if *epoch == before { *epoch = after; }
-                true
-            });
-        }
-        any
-    }
-
     /// const_addr from shared lowering: constant evaluation runs code and changes the unit,
     /// so it takes the unit lock (re-entrant) first.
     pub fn const_addr_shared(&self, d: DefId, args: Vec<TyId>) -> Option<u64> {
@@ -3883,7 +3795,11 @@ impl Unit {
         }
         // a trait's associated const: the impl's (or the trait's default) for these args
         let (d, mut args) = if self.prog.def(d).kind == DefKind::AssocConst && self.prog.def(self.prog.def(d).parent).kind == DefKind::Trait {
-            self.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.prog, d, &args).expect_dispatch()
+            {
+                let instance = crate::instance::Instance::expect_resolve(&self.tcx, &self.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), d, &args);
+                let InstanceKind::Item(def) = instance.def else { panic!("non-item associated const") };
+                (def, instance.compact_args(&self.tcx))
+            }
         } else {
             (d, args)
         };
@@ -3946,7 +3862,7 @@ impl Unit {
         // the initializer, so `static A: &T = &B; static B: &T = &A;` and `static mut S = &S as ..`
         // see the final addresses instead of recursing.
         let t = match self.tcx.const_tys.get(&d) {
-            Some(t) => *t,
+            Some(t) => t,
             None => {
                 self.statics.insert(d, 0);
                 return 0;
@@ -3980,7 +3896,7 @@ impl Unit {
     }
 
     fn eval_init(&mut self, d: DefId, args: Vec<TyId>, mutable: bool) -> Option<u64> {
-        let t = *self.tcx.const_tys.get(&d)?;
+        let t = self.tcx.type_of(&self.prog, d).ok()?;
         let t = self.tcx.tys.subst_erasing_regions(t, &args);
         let l = self.layout_of(t);
         let buf = if mutable {
@@ -3999,6 +3915,17 @@ impl Unit {
             crate::sandbox::capture_initial_data(self, self.data_sym(buf));
         }
         r
+    }
+
+    /// ctfe::eval_into. A constant it reads that waits for the post-boot loader (NeedsLoad,
+    /// const_eval_to_valtree) means no CTFE value: the initializer's code is built instead,
+    /// and that build defers (DEFERRED_RETRY) with the caller's storage kept (static_addr).
+    fn ctfe_eval_into(&mut self, d: DefId, args: &[TyId], buf: u64) -> bool {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::ctfe::eval_into(self, d, args, buf))) {
+            Ok(ok) => ok,
+            Err(p) if p.is::<crate::preempt::NeedsLoad>() => false,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 
     /// Runs the initializer of const/static `d` into `buf`.
@@ -4023,11 +3950,11 @@ impl Unit {
         // tables and other plain-data initializers: evaluated to bytes, no code (ctfe.rs)
         let t0 = cpu_ns();
         if crate::ctfe::check_mode(options) {
-            let t = self.tcx.const_tys.get(&d).map(|t| self.tcx.tys.subst_erasing_regions(*t, &args));
+            let t = self.tcx.const_tys.get(&d).map(|t| self.tcx.tys.subst_erasing_regions(t, &args));
             if let Some(t) = t {
                 let l = self.layout_of(t);
                 let tmp = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
-                let ok = crate::ctfe::eval_into(self, d, &args, tmp);
+                let ok = self.ctfe_eval_into(d, &args, tmp);
                 self.stats.ctfe_ns += cpu_ns() - t0;
                 if ok {
                     self.stats.ctfe_data += 1;
@@ -4035,22 +3962,20 @@ impl Unit {
                     let entry = self.entry(id);
                     self.exec_note(id, crate::exec_profile::CALL);
                     self.exec_event(id, "call");
-                    if unsafe { call_jit(self as *mut Unit, entry, buf) }.is_err() {
-                        // Preserve the normal error/deferred-initialization handling; a
-                        // failed verification run must not return a successful constant.
-                        return self.run_init_code(d, args, buf);
+                    match unsafe { call_jit(self as *mut Unit, entry, buf) } {
+                        Ok(_) if crate::ctfe::same_value(self, t, tmp, buf, 0) => return Some(buf),
+                        Ok(_) => self.errors.push(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
+                        // Use the normal deferred-initialization retry and error path.
+                        Err(_) => return self.run_init_code(d, args, buf),
                     }
-                    if !crate::ctfe::same_value(self, t, tmp, buf, 0) {
-                        eprintln!("relax: CTFE MISMATCH in {}", self.prog.def_path(d));
-                    }
-                    return Some(buf);
+                    return None;
                 }
                 // A failed check-mode evaluation already checked this initializer. Do not
                 // repeat the same evaluation before falling back to its executable body.
                 return self.run_init_code(d, args, buf);
             }
         }
-        let ok = crate::ctfe::eval_into(self, d, &args, buf);
+        let ok = self.ctfe_eval_into(d, &args, buf);
         self.stats.ctfe_ns += cpu_ns() - t0;
         if ok {
             self.stats.ctfe_data += 1;
@@ -4109,15 +4034,16 @@ impl Unit {
                 None
             }
             Err(p) => {
-                let m = format!("constant {} panicked: {}", self.prog.def_path(d), p.message);
-                // rustc rejects a program whose constant or static cannot be evaluated
-                // (E0080 "could not evaluate static initializer"); `relax run` ends it here instead
-                // of running on with zeroed data (`relax test` / `live` keep it a recoverable
-                // failure, as for compile errors)
-                if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) {
+                let m = format!("E0080: constant {} panicked: {}", self.prog.def_path(d), p.message);
+                // rustc rejects a program whose constant or static cannot be evaluated (E0080);
+                // `relax run` ends here instead of running on with a zeroed or null value
+                // (`relax test` / `live` keep it recoverable, as for compile errors)
+                if COMPILE_ERRORS_FATAL.load(Ordering::Relaxed) {
                     eprintln!("relax-run: {} -- the program cannot run past it (rustc rejects it)", m);
                     std::process::exit(101);
                 }
+                // queries.rs:58-108: evaluation errors return to the caller;
+                // const_eval_resolve turns this into Reported.
                 self.errors.push(m);
                 None
             }
@@ -4891,7 +4817,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32) -> u64 {
                 u.fns[id as usize].building = false;
                 u.fns[id as usize].builder = 0;
             }
-            Err(format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
         }
     };
     match r {
@@ -4958,7 +4884,17 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                 Err(e) => return install_error(up, id, &format!("link: {}", e)),
             };
             if perf_map_on() {
-                perf_map(a, code.len(), &perf_name(u, id));
+                // the code's level: cached O3 / baseline / O2 (cached or marked) / O1
+                let tier = if u.fns[id as usize].o3.load(Ordering::Relaxed) {
+                    " [O3]"
+                } else if base {
+                    " [B]"
+                } else if O2_SEEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(&(up as usize, id))) {
+                    " [O2]"
+                } else {
+                    " [O1]"
+                };
+                perf_map(a, code.len(), &format!("{}{}", perf_name(u, id), tier));
             }
             u.arm_counter(id, a);
             if base {
@@ -5083,7 +5019,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
     }
 }
 
-/// RELAX_PERF_MAP=1: append `addr size name` to /tmp/perf-<pid>.map so `perf report` names
+/// RELAX_PERF_MAP=1: append `addr size name [tier]` (tier: B / O1 / O2 / O3) to /tmp/perf-<pid>.map so `perf report` names
 /// JIT code (Linux perf's JIT symbol convention).
 fn perf_map_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5417,7 +5353,7 @@ pub fn src_size(u: &Unit, id: u32) -> u32 {
             let e = u.prog.files[*file as usize].ast.expr(crate::ast::ExprId(*ce));
             (*file, e.lo, e.hi)
         }
-        FnKey::Glue(..) => return u32::MAX,
+        FnKey::Shim(_) | FnKey::Glue(..) => return u32::MAX,
     };
     let toks = &u.prog.files[file as usize].toks;
     let a = toks.partition_point(|t| t.lo < lo);
@@ -5458,7 +5394,7 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
         // a closure body is usually called from the one adapter instance made for it; with
         // the core hint (O3) it inlines like #[inline]
         FnKey::Closure(..) if core_hint => crate::opt::ATTR_HINT,
-        FnKey::Glue(..) | FnKey::Closure(..) => 0,
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Closure(..) => 0,
         // twins are never inlined into anything (their callers are twins built from RIR)
         FnKey::Sandbox(_) => return None,
     })
@@ -5865,9 +5801,6 @@ unsafe fn build_o2(up: *mut Unit, id: u32) {
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
     O2_BUILD.with(|c| c.set(true));
     O2_SNAPSHOT.with(|c| c.set(snapshot));
-    if lowered.is_none() {
-        resolve_consts_before_build(up, id);
-    }
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, lowered, RirMode::Normal)));
     O2_BUILD.with(|c| c.set(false));
     O2_SNAPSHOT.with(|c| c.set(false));
@@ -6112,18 +6045,6 @@ pub fn current_thread_id() -> u64 {
 
 /// Starts building slot `id` on this thread. Err: this thread is building it already
 /// (recursion). A build another thread suspended is taken over (it abandons its own).
-/// Evaluates the queued constant requests (CTFE: runs their initializers) BEFORE slot `id`'s
-/// build opens: the queue is global (array lengths collected anywhere), and an initializer may
-/// call `id` itself (`LATIN_PACKAGE_MANIFEST_LEN` -> .. -> `bytes_equal` while a worker builds
-/// `bytes_equal`), which inside the open build was a "recursive build". Out here that call
-/// builds `id` as its own complete build first.
-unsafe fn resolve_consts_before_build(up: *mut Unit, id: u32) {
-    let u = &mut *up;
-    if matches!(u.fns[id as usize].key, FnKey::Inst(..)) && !u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-        u.resolve_const_requests();
-    }
-}
-
 unsafe fn begin_build(up: *mut Unit, id: u32) -> Result<(), String> {
     let f = &mut (&mut *up).fns[id as usize];
     if f.building && f.builder == me() {
@@ -6323,9 +6244,7 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
         !(f.compiled && !f.inflight && f.rir.is_none() && !pinned.contains(id) && prog.def(b.def).file == b.file)
     });
     u.bodies.shrink_to_fit();
-    u.front.ahead.retain(|(d, args), _| {
-        u.fn_map.get(&FnKey::Inst(*d, args.clone())).map_or(true, |id| !eligible(id))
-    });
+    *u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
     drops.typeck += freed_since(before);
     // RIR and checked body ownership belong to the unit, not the off-lock front.
     // A busy checker only postpones shared memo-node reclamation.
@@ -6335,16 +6254,8 @@ pub unsafe fn settle_drop(up: *mut Unit) -> SettleDrops {
         return drops;
     };
     let before = crate::memstat::live_total();
-    u.tcx.templates.retain_exclusive(|(d, _), _| !defs.contains(d));
-    u.tcx.poly_bodies.retain_exclusive(|(d, _), _| !defs.contains(d));
-    // The interpreter owns Arc snapshots while evaluating; evaluated values/addresses and
-    // const dependency edges stay. A later CTFE call rechecks via Ctx::call_const_fn.
-    *u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
-    drops.typeck += freed_since(before);
-    let before = crate::memstat::live_total();
     // Lcx itself is stack-scoped and already gone. These are its retained memo results.
     u.coro_rir.retain_exclusive(|id, _| !eligible(*id));
-    u.assignop_poly.retain_exclusive(|d, _| !defs.contains(d));
     u.unwind_drop_cache.retain_exclusive(|_, _| false);
     u.unpin_cache.retain_exclusive(|_, _| false);
     drops.lower = freed_since(before);
@@ -6413,6 +6324,9 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
     match r {
         Ok(r) => r,
         Err(p) => {
+            if crate::preempt::is_preempted(&*p) { std::panic::resume_unwind(p); }
+            // a constant it evaluated needs a module not loaded yet (const_eval_to_valtree)
+            if p.is::<crate::preempt::NeedsLoad>() { return Err(DEFERRED_RETRY.to_string()); }
             let msg = if let Some(s) = p.downcast_ref::<&str>() {
                 s.to_string()
             } else if let Some(s) = p.downcast_ref::<String>() {
@@ -6422,7 +6336,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
             };
             let u = &mut *up;
             let at = ICE_AT.lock().map(|g| g.clone()).unwrap_or_default();
-            Err(format!("internal compiler error in {} (relax {}): {} -- Relax bug, report it", u.fns[id as usize].name, at, msg))
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {} (relax {}): {} -- Relax bug, report it", u.fns[id as usize].name, at, msg) })
         }
     }
 }
@@ -6449,7 +6363,6 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         (&mut *up).set_rir(id, f);
         return Ok(());
     }
-    resolve_consts_before_build(up, id);
     // open on another program thread that gave the lock up mid-build: its build, not a takeover
     wait_program_build(up, id);
     if lowered.is_none() && (&*up).fns[id as usize].rir.is_some() {
@@ -6620,7 +6533,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                 FnKey::Inst(d, _) => u.prog.def(*d).krate == u.core_crate,
                 // a closure body is lowered from its parent's checked body: only once that exists
                 FnKey::Closure(cf, _, parent) => u.has_body(*parent, *cf),
-                FnKey::Glue(..) => true,
+                FnKey::Shim(_) | FnKey::Glue(..) => true,
                 FnKey::Sandbox(_) => continue,
             };
             if !builtin && (!cfg.inline_all || matches!(u.fns[*c as usize].key, FnKey::Closure(..))) {
@@ -7277,7 +7190,6 @@ pub unsafe fn lower_for_audit(up: *mut Unit, id: u32) -> Result<(), String> {
 /// Canonical, uninlined RIR for deterministic sandbox metering. Never take the
 /// tier-dependent optimized base-slot RIR as the meter's input.
 pub(crate) unsafe fn sandbox_source_rir(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
-    resolve_consts_before_build(up, id);
     build_rir_inner(up, id)
 }
 
@@ -7314,13 +7226,29 @@ thread_local! {
     static BUILD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// One build on this thread (build_rir_inner): it starts with no miss notes of its own;
+/// BUILD_DEPTH, the enclosing work's miss notes (a nested build runs inside another build's
+/// lowering or type check) and its DEFERRED_ABORT come back when the build ends, also when it
+/// unwinds (an internal error, NeedsLoad).
+struct BuildFrame { prev_abort: bool, outer_missing: Option<(Vec<(u32, String)>, usize)> }
+impl BuildFrame {
+    fn enter() -> Self {
+        BUILD_DEPTH.with(|d| d.set(d.get() + 1));
+        BuildFrame { prev_abort: DEFERRED_ABORT.with(|a| a.replace(false)), outer_missing: Some(crate::program::missing_save()) }
+    }
+}
+impl Drop for BuildFrame {
+    fn drop(&mut self) {
+        if let Some(outer) = self.outer_missing.take() { crate::program::missing_restore(outer); }
+        let _ = DEFERRED_ABORT.try_with(|a| a.set(self.prev_abort || a.get()));
+        let _ = BUILD_DEPTH.try_with(|d| d.set(d.get() - 1));
+    }
+}
+
 unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
-    let _ = crate::program::take_missing();
-    let prev = DEFERRED_ABORT.with(|a| a.replace(false));
-    BUILD_DEPTH.with(|d| d.set(d.get() + 1));
+    let frame = BuildFrame::enter();
     let r = build_rir_inner_body(up, id);
     let mine = DEFERRED_ABORT.with(|a| a.get());
-    DEFERRED_ABORT.with(|a| a.set(prev || mine));
     let r = if mine { r.and(Err(DEFERRED_RETRY.to_string())) } else { r };
     let r = match r {
         Err(e) => {
@@ -7335,7 +7263,7 @@ unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<crate::rir::Func, St
         }
         ok => ok,
     };
-    BUILD_DEPTH.with(|d| d.set(d.get() - 1));
+    drop(frame);
     r
 }
 
@@ -7391,7 +7319,9 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
     let mut bindings_changed = false;
     let mut paths = Vec::new();
     let mut loaded = 0;
+    let first_file = u.prog.files.len() as u32;
     let defs = loop {
+        let f0 = u.prog.files.len() as u32;
         for m in &mods {
             if let Some((path, ..)) = u.prog.skipped_files.get(m) { paths.push(path.clone()); }
             match u.prog.load_deferred_module_changes(*m) {
@@ -7402,18 +7332,23 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
                 }
             }
         }
+        u.prog.link_deferred_modules(f0, d0);
         loaded += mods.len();
         u.prog.reclaim_caches();
         let defs: Vec<DefId> = (d0 as u32..u.prog.defs.len() as u32).map(DefId).collect();
         if defs.is_empty() && !bindings_changed { break defs; }
         crate::program::collect_misses_begin();
-        let errors = u.tcx.collect_added(&u.prog, &defs, false);
+        // the transaction's files are seen by their crates and those crates' dependents only
+        // (lead decision 52 R1, as a declaration edit's reload): every other crate's
+        // declarations and query results stay
+        let visible = u.prog.crates_seeing_files(first_file..u.prog.files.len() as u32);
+        let errors = u.tcx.collect_loaded(&u.prog, &defs, &visible);
         // a loaded item's signature, field or impl header names a type in another skipped
         // file: load that too and collect the transaction's items again
         mods = u.prog.misses_to_load(&crate::program::collect_misses_take());
         if !mods.is_empty() {
             let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
-            u.tcx.uncollect_impls(&impls, false);
+            u.tcx.uncollect_impls(&impls);
             continue;
         }
         // collect_added also drains diagnostics of background checks: report the loaded files'
@@ -7422,8 +7357,6 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
         }
         break defs;
     };
-    u.tcx.reclaim_caches();
-    // signatures that missed a type in a module skipped until now are computed again
     let resigned = u.tcx.forget_error_signatures();
     // builds that failed for want of these names (here or on a speculative worker) run again
     for f in u.fns.iter_mut() {
@@ -7527,8 +7460,22 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
     let mut consts = Vec::new();
     if let FnKey::Inst(_, args) = &u.fns[id as usize].key {
         for t in args {
-            if let TyKind::ConstVal(v) = u.tcx.tys.kind(*t) {
-                consts.push(*v as i64);
+            if let TyKind::Const(v) = u.tcx.tys.kind(*t) {
+                // rustc_middle/src/ty/consts/valtree.rs:114-121 and int.rs:384:
+                // typed scalar extraction is
+                // independent of the const parameter's integer type (e.g. i32 IMM8).
+                let value = v.try_to_value(&u.tcx.tys).ok_or("intrinsic const argument did not evaluate")?;
+                let scalar = value.valtree.try_to_leaf().ok_or("intrinsic const argument is not scalar")?;
+                let (size, signed) = match u.tcx.tys.kind(value.ty) {
+                    TyKind::Int(p) => crate::types::Types::int_info(*p),
+                    TyKind::Bool => (1, false),
+                    TyKind::Char => (4, false),
+                    _ => return Err("intrinsic const argument has a non-scalar type".into()),
+                };
+                let bits = scalar.to_bits(size as u8);
+                let shift = 128 - size * 8;
+                let value = if signed { ((bits << shift) as i128) >> shift } else { bits as i128 };
+                consts.push(value as i64);
             }
         }
     }
@@ -7576,6 +7523,23 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
     let Some(&st) = u.tcx.impl_self.get(&def.parent) else { return Ok(None) };
     let Some(_ad) = opaque(u, st) else { return Ok(None) };
     let mname = u.prog.name(d).to_string();
+    let is_eq = Some(tr) == u.tcx.lang_items.get(LangItem::PartialEq) && mname == "eq"
+        && u.tcx.impl_trait_args.get(&def.parent).is_some_and(|a| a.as_slice() == [st]);
+    let is_clone = Some(tr) == u.tcx.lang_items.get(LangItem::Clone) && mname == "clone";
+    if is_eq || is_clone {
+        let ad = _ad;
+        let krate = u.prog.def(ad).krate;
+        let key = crate::provided::opaque_method_key(&u.prog, ad, &mname);
+        let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
+        let Some((_, shim)) = pc.shims.get(key.as_str()) else {
+            return Err(format!("host shims are stale: no `{}` (run makepad host-gen)", key));
+        };
+        let r = u.tcx.tys.intern(TyKind::Ref(false, st, crate::types::RegionId::ERASED));
+        let (ps, ret) = if is_eq { (vec![r, r], u.tcx.tys.bool_) } else { (vec![r], st) };
+        let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), *shim as usize as u64);
+        let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
+        return Ok(Some(crate::lower::bridge_func_sig(u, &ps, ret, format!("{} (provided)", key), shim, last)));
+    }
     let (helper, hargs) = if Some(tr) == u.core_path(&["hash", "Hash"]) && mname == "hash" {
         let Some(h) = args.last() else { return Ok(None) };
         (u.core_path(&["hash", "__relax_opaque_hash"]), vec![st, *h])
@@ -7638,8 +7602,6 @@ fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<crate::rir::Func>, Strin
 unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, String> {
     let _why = why_function(&*up, id, "lower-fn");
     let _cost_lower = crate::fncost::phase(3);
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let options = &session.options;
     let _mem = crate::memstat::tag(crate::memstat::Tag::Lower);
     if let Some(f) = (&*up).coro_rir.get(&id) {
         return Ok(f.clone());
@@ -7658,36 +7620,29 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
         n
     };
     trace("typeck", &fname);
-    if let FnKey::Glue(kind, t) = key {
-        if kind == GLUE_UNNAMED {
-            return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
-        }
-        let u = &mut *up;
+    if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
+        return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
+    }
+    if let FnKey::Shim(ref shim) = key {
         let t0 = cpu_ns();
-        let f = crate::lower::glue_func(u, kind, t);
-        u.stats.lower_ns += cpu_ns() - t0;
-        return Ok(f);
+        let result = crate::lower::shim_func(&*up, shim, id);
+        (&mut *up).stats.lower_ns += cpu_ns() - t0;
+        return result;
+    }
+    if let FnKey::Glue(kind, t) = key {
+        if kind != GLUE_CLONE {
+            let u = &mut *up;
+            let t0 = cpu_ns();
+            let f = crate::lower::glue_func(u, kind, t);
+            u.stats.lower_ns += cpu_ns() - t0;
+            return Ok(f);
+        }
     }
     // a provided crate's bound fn (provided.rs): a bridge to its rustc-built code
     if let FnKey::Inst(d, args) = &key {
         if args.is_empty() {
             if let Some(f) = provided_bridge(&*up, *d)? {
                 return Ok(f);
-            }
-        }
-    }
-    // a trait method with Self = a trait object of that trait: the vtable's entry (rustc
-    // InstanceKind::Virtual), never the trait's own declaration or default body
-    if let FnKey::Inst(d, args) = &key {
-        let u = &mut *up;
-        let td = u.prog.def(*d).parent;
-        if td != NO_DEF && u.prog.def(td).kind == DefKind::Trait && !args.is_empty() {
-            let is_fn = matches!(u.tcx.lang_items.by_def.get(&td), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce));
-            if !is_fn && matches!(u.tcx.tys.kind(args[0]), TyKind::Dyn(..)) && u.tcx.dyn_implements(td, args[0]) {
-                let name = u.fns[id as usize].name.clone();
-                if let Some(f) = crate::lower::virtual_shim(u, *d, args, name) {
-                    return Ok(f);
-                }
             }
         }
     }
@@ -7701,66 +7656,25 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
             }
         }
     }
-    // `#[derive(PartialEq / Clone)]` methods are generated, not type-checked from source
-    if let FnKey::Inst(d, args) = &key {
+    // Builtin Clone shims. ADT derives have ordinary impl bodies.
+    if let FnKey::Glue(GLUE_CLONE, ty) = &key {
         let u = &mut *up;
-        let td = u.prog.def(*d).parent;
-        if td != NO_DEF && u.prog.def(td).kind == DefKind::Trait && !args.is_empty() {
-            let derived = match u.tcx.tys.kind(args[0]).clone() {
-                TyKind::Adt(ad, _, _) => u.tcx.derived.contains_key(&(ad, td)),
-                // closures' Clone is compiler-provided
-                TyKind::Tuple(..) | TyKind::Closure(..) | TyKind::FnPtr(..) | TyKind::FnDef(..) => Some(td) == u.tcx.lang_items.get(LangItem::Clone),
-                _ => false,
+        let d = u.tcx.lang_items.get(LangItem::CloneFn).expect("clone lang item");
+        let args = vec![*ty];
+        {
+            let t0 = cpu_ns();
+            let body = Body::empty(d, args.clone(), u.prog.def(d).file, u.tcx.tys.unit);
+            let name = u.fns[id as usize].name.clone();
+            let (func, errors) = {
+                let mut lcx = Lcx::new(u, &body, name, id);
+                lcx.lower_clone_shim(args[0]);
+                lcx.finish();
+                (lcx.f, lcx.errors)
             };
-            {
-                let is_eq = u.tcx.lang_items.get(LangItem::PartialEq) == Some(td) && u.prog.name(*d) == "eq";
-                let is_clone = u.tcx.lang_items.get(LangItem::CloneFn) == Some(*d);
-                // a provided crate's opaque type: rustc's derived impl, through its shim
-                if derived && (is_eq || is_clone) {
-                    if let TyKind::Adt(ad, aa, _) = u.tcx.tys.kind(args[0]).clone() {
-                        if aa.is_empty() && u.provided_types.contains_key(&ad) {
-                            let krate = u.prog.def(ad).krate;
-                            let key = crate::provided::derived_key(&u.prog, ad, if is_eq { "eq" } else { "clone" });
-                            let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
-                            let Some((_, shim)) = pc.shims.get(key.as_str()) else {
-                                return Err(format!("host shims are stale: no `{}` (run makepad host-gen)", key));
-                            };
-                            let r = u.tcx.tys.intern(TyKind::Ref(false, args[0], crate::types::RegionId::ERASED));
-                            let (ps, ret) = if is_eq { (vec![r, r], u.tcx.tys.bool_) } else { (vec![r], args[0]) };
-                            let name = format!("{} (provided)", key);
-                            let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), *shim as usize as u64);
-                            let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
-                            return Ok(crate::lower::bridge_func_sig(u, &ps, ret, name, shim, last));
-                        }
-                    }
-                    let t0 = cpu_ns();
-                    let unit = u.tcx.tys.unit;
-                    let file = u.prog.def(*d).file;
-                    let body = Body::empty(*d, args.clone(), file, unit);
-                    let body_ref: &Body = &*(&body as *const Body);
-                    let name = u.fns[id as usize].name.clone();
-                    let st = args[0];
-                    let (func, errors) = {
-                        let mut lcx = Lcx::new(u, body_ref, name, id);
-                        if is_eq {
-                            lcx.lower_derived_eq(st);
-                        } else {
-                            lcx.lower_derived_clone(st);
-                        }
-                        lcx.finish();
-                        let e = std::mem::take(&mut lcx.errors);
-                        (lcx.f, e)
-                    };
-                    (&mut *up).stats.lower_ns += cpu_ns() - t0;
-                    if !errors.is_empty() {
-                        return Err(errors[0].clone());
-                    }
-                    if let Err(e) = func.verify() {
-                        return Err(format!("RIR verify: {}\n{}", e, func.dump()));
-                    }
-                    return Ok(func);
-                }
-            }
+            (&mut *up).stats.lower_ns += cpu_ns() - t0;
+            if !errors.is_empty() { return Err(errors[0].clone()); }
+            if let Err(e) = func.verify() { return Err(format!("RIR verify: {}\n{}", e, func.dump())); }
+            return Ok(func);
         }
     }
     // Bridge, virtual and derived bodies above always keep their usual selection. Ahead
@@ -7770,14 +7684,13 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
     }
     let t0 = cpu_ns();
     let n0 = nested_build_ns();
-    let mut body = match &key {
+    let body = match &key {
         FnKey::Inst(d, args) => {
             // consts that lengths wait for are evaluated first (CTFE by running them), and a body
             // that requested more is checked again once they are
-            (&mut *up).resolve_const_requests();
             // checked ahead (off the unit lock) when it could be; else here
             let again = (&*up).front.built.contains(&(*d, args.clone()));
-            let mut body = match take_ahead(options, &(&*up).front, &(&*up).tcx, *d, args) {
+            let body = match take_ahead(&(&*up).prog.session.options, &(&*up).front, &(&*up).tcx, *d, args) {
                 Ok(b) => { ahead_check_diag(&*up, id, "hit", 0); b }
                 Err(reason) => {
                     let u = &mut *up;
@@ -7787,18 +7700,12 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
                     } else {
                         let _o = crate::clock::origin(if again { "build-again" } else { "build" });
                         let start = cpu_ns();
-                        let b = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *d, args);
+                        let b = crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *d, args);
                         ahead_check_diag(u, id, reason, cpu_ns() - start);
                         b
                     }
                 }
             };
-            for _ in 0..4 {
-                if (body.errors.is_empty() && !(&*up).tcx.has_blocked_consts()) || !(&mut *up).resolve_const_requests() {
-                    break;
-                }
-                body = { let u = &mut *up; crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &mut u.tcx, *d, args) };
-            }
             body
         }
         FnKey::Closure(cfile, _, parent) => {
@@ -7823,7 +7730,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
                 None => return Err("closure parent body missing".to_string()),
             }
         }
-        FnKey::Glue(..) => return Err("glue".to_string()),
+        FnKey::Shim(_) | FnKey::Glue(..) => return Err("glue".to_string()),
         FnKey::Sandbox(_) => return Err("sandbox twins are built from their base slot's RIR".to_string()),
     };
     if !body.errors.is_empty() {
@@ -7840,7 +7747,6 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
     }
     // This is a codegen-owned body, after type checking. Borrowck/typeck results
     // retain their regions; lowering, constants and the closure codegen cache do not.
-    body.erase_regions(&(&*up).tcx.tys);
     // evaluate constants used by the body before lowering (may run JIT code)
     let mut const_uses = Vec::new();
     for (k, r) in &body.res {
@@ -7910,7 +7816,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
     match key {
         FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
         FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
-        FnKey::Glue(..) | FnKey::Sandbox(_) => {}
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
     }
     lcx.finish();
     if let Some(e) = lcx.errors.first() {
@@ -7922,66 +7828,7 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
     Ok((lcx.f, !lcx.new_closures.is_empty()))
 }
 
-fn clone_body(b: &Body) -> Body {
-    Body {
-        def: b.def,
-        args: b.args.clone(),
-        file: b.file,
-        expr_lo: b.expr_lo,
-        expr_ty: b.expr_ty.clone(),
-        pat_lo: b.pat_lo,
-        pat_ty: b.pat_ty.clone(),
-        expr_lo2: b.expr_lo2,
-        expr_n1: b.expr_n1,
-        pat_lo2: b.pat_lo2,
-        pat_n1: b.pat_n1,
-        res: b.res.clone(),
-        res_args: b.res_args.clone(),
-        pat_res: b.pat_res.clone(),
-        pat_local: b.pat_local.clone(),
-        methods: b.methods.clone(),
-        binops: b.binops.clone(),
-        coerce: b.coerce.clone(),
-        reborrows: b.reborrows.clone(),
-        min_captures: b.min_captures.clone(),
-        field_idx: b.field_idx.clone(),
-        field_uses: b.field_uses.clone(),
-        dependencies: b.dependencies.clone(),
-        ov_derefs: b.ov_derefs.clone(),
-        ov_index: b.ov_index.clone(),
-        for_next: b.for_next.clone(),
-        for_into: b.for_into.clone(),
-        index_derefs: b.index_derefs.clone(),
-        legacy_args: b.legacy_args.clone(),
-        call_derefs: b.call_derefs.clone(),
-        call_traits: b.call_traits.clone(),
-        try_conv: b.try_conv.clone(),
-        pat_derefs: b.pat_derefs.clone(),
-        pat_bind_ref: b.pat_bind_ref.clone(),
-        pat_discriminant_reads: b.pat_discriminant_reads.clone(),
-        locals: {
-            let mut v = Vec::new();
-            for l in &b.locals {
-                v.push(crate::typeck::Local { name: l.name, ty: l.ty, mutable: l.mutable, pat: l.pat });
-            }
-            v
-        },
-        param_pats: b.param_pats.clone(),
-        ret: b.ret,
-        body: b.body,
-        fmt_named: b.fmt_named.clone(),
-        closures: b.closures.clone(),
-        closure_locals: b.closure_locals.clone(),
-        closure_expected_kinds: b.closure_expected_kinds.clone(),
-        closure_sigs: b.closure_sigs.clone(),
-        inline_const_types: b.inline_const_types.clone(),
-        capture_by_value: b.capture_by_value.clone(),
-        capture_fields: b.capture_fields.clone(),
-        struct_defaults: b.struct_defaults.clone(),
-        errors: Vec::new(),
-        param_env: b.param_env,
-    }
-}
+fn clone_body(b: &Body) -> Body { b.clone() }
 
 /// Finds `#[test]` functions of a crate.
 pub fn find_tests(prog: &Program, krate: u32) -> Vec<DefId> {
@@ -8776,6 +8623,7 @@ impl Drop for Unit {
         }
         // a retired unit's code and data go with it (nothing calls into it any more); the
         // program's own unit lives to process exit
+        if !std::thread::panicking() { self.flush_query_errors(true); }
         if self.retired {
             let rest = (table_cap(options) * 8 + crate::syms::SYM_CAP * 8) as u64 + UNIT_DATA_SIZE + UNIT_RW_SIZE;
             os::mem::release(self.exec_base, self.exec_size as usize, rest as usize);
@@ -9154,7 +9002,7 @@ impl Unit {
             FnKey::Inst(d, _) => self.prog.def(*d).kind != DefKind::ForeignFn,
             FnKey::Closure(..) => true,
             FnKey::Sandbox(base) => *base != u32::MAX,
-            FnKey::Glue(..) => false,
+            FnKey::Shim(_) | FnKey::Glue(..) => false,
         };
         self.arm_counter_as(id, code, counted);
     }
@@ -9512,6 +9360,7 @@ unsafe fn t1_key(up: *const Unit, id: u32) -> String {
             s
         }
         FnKey::Closure(file, e, parent) => format!("closure:{}:{}:{}", file, e, t1_key(up, *parent)),
+        FnKey::Shim(shim) => crate::lower::shim_name(&u.prog, &u.tcx, shim),
         FnKey::Glue(g, t) => format!("glue{}:{}", g, ty(*t)),
         FnKey::Sandbox(b) if (*b as usize) < u.fns.len() => format!("sandbox:{}", t1_key(up, *b)),
         FnKey::Sandbox(b) => format!("sandbox:{}", b),
@@ -9880,7 +9729,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         let f = &u.fns[c as usize];
         let attr = match &f.key {
             FnKey::Inst(d, _) if u.prog.def(*d).kind != DefKind::ForeignFn => inline_attrs(&u.prog, *d),
-            FnKey::Glue(..) => 0,
+            FnKey::Shim(_) | FnKey::Glue(..) => 0,
             FnKey::Closure(cf, _, parent) if u.has_body(*parent, *cf) => 0,
             _ => return,
         };
@@ -10255,21 +10104,19 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             if std::env::var_os("RELAX_RELOC_SIG").is_some() {
                 crate::syms::reloc_sig(u, || format!("O3:{}", sig_name(u, id)), &code, &relocs, &map);
             }
-            // marked O3 code (#[relax(O3)]) is kept in the disk cache as the slot's ordinary
+            // Installed O3 code (marked or hot, including retier) is kept as the slot's ordinary
             // entry: the next run starts with it -- not a huge frame (inlining into a recursive
             // fn: makepad_script_compute::lower::expr reached 68 KB per level and overflowed a
             // kernel worker's stack when installed at start). Recursive: it calls itself,
             // directly or through code it inlined. The entry is the code WITH its unwind
             // trailer, as O1's are: a cached install splits it off in Unit::install; without
             // it a panic through the frame skipped its cleanups.
-            if relax_level(u, id) >= 3 {
-                let recursive = self_call || inlined.contains(&id);
-                let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
-                if frame_size <= frame_max {
-                    if let Some(mut c) = u.cache.take() {
-                        c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
-                        u.cache = Some(c);
-                    }
+            let recursive = self_call || inlined.contains(&id);
+            let frame_max = if recursive { TIER1_CACHE_FRAME_MAX } else { TIER1_CACHE_FRAME_MAX_FLAT };
+            if frame_size <= frame_max {
+                if let Some(mut c) = u.cache.take() {
+                    c.record_o3(u, id, &code, &relocs, &map, &inlined, &nounwind_used);
+                    u.cache = Some(c);
                 }
             }
             u.fns[id as usize].o3.store(true, Ordering::Relaxed);
@@ -10767,6 +10614,7 @@ fn slot_key_inner(u: &Unit, id: u32) -> String {
             let tail = name.rsplit("::").next().unwrap_or(&name).to_string();
             format!("{}::{}", slot_key_inner(u, *parent), tail)
         }
+        FnKey::Shim(shim) => crate::lower::shim_name(&u.prog, &u.tcx, shim),
         FnKey::Glue(g, t) => format!("glue{}<{}>", g, crate::typeck::ty_to_string(true, &u.prog, &u.tcx, *t)),
         FnKey::Sandbox(b) if *b == u32::MAX => "sandbox<invalid>".to_string(),
         FnKey::Sandbox(b) => format!("sandbox<{}>", slot_key(u, *b)),
@@ -10851,7 +10699,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
                 let ok = match &f.key {
                     FnKey::Inst(d, _) => u.prog.def(*d).kind != DefKind::ForeignFn,
                     FnKey::Closure(cf, _, parent) => u.has_body(*parent, *cf),
-                    FnKey::Glue(..) | FnKey::Sandbox(_) => false,
+                    FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => false,
                 };
                 if !ok {
                     continue;
@@ -10901,7 +10749,8 @@ pub static SEED_PROBE_NS: AtomicU64 = AtomicU64::new(0);
 pub static SEED_QUEUED: AtomicU64 = AtomicU64::new(0);
 
 fn skip_initializer_seed(u: &Unit, id: u32) -> bool {
-    if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if matches!(u.prog.def(d).kind, DefKind::Static | DefKind::Const | DefKind::AssocConst)) {
+    // Native anonymous const bodies have the same demand-evaluation boundary.
+    if matches!(u.fns[id as usize].key, FnKey::Inst(d, _) if matches!(u.prog.def(d).kind, DefKind::Static | DefKind::Const | DefKind::AssocConst | DefKind::AnonConst)) {
         SEED_INITIALIZERS_SKIPPED.fetch_add(1, Ordering::Relaxed);
         true
     } else { false }
@@ -11217,6 +11066,7 @@ pub static SPEC_PANICS: AtomicU64 = AtomicU64::new(0);
 /// their next safe point) and takes the unit lock for the caller, waiting up to `ms` for the
 /// holder to reach one. False: still held; `lock_holder()` names the thread.
 pub fn quiesce(ms: u64) -> bool {
+    crate::preempt::stop_all();
     let _ = EXITING.compare_exchange(0, me(), Ordering::AcqRel, Ordering::Acquire);
     SPEC_STOP.store(true, Ordering::SeqCst);
     TIER_STOP.store(true, Ordering::SeqCst);
@@ -11554,7 +11404,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         Ok(r) => r,
                         Err(p) => {
                             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-                            Err(format!("internal compiler error in {}: {} -- Relax bug, report it", name, msg))
+                            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {} -- Relax bug, report it", name, msg) })
                         }
                     };
                     results.lock().unwrap().push((id, r, done));
@@ -11615,7 +11465,6 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
             return Err(e.clone());
         }
     }
-    resolve_consts_before_build(up, id);
     // open on another program thread that gave the lock up mid-build: its build, not a takeover
     wait_program_build(up, id);
     if let Some(r) = &(&*up).fns[id as usize].rir {
@@ -11648,7 +11497,7 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
         Ok(Err(e)) => Err(e),
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            Err(format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()))
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {}{}", u.fns[id as usize].name, msg, take_ice_location()) })
         }
     }
 }
@@ -11839,7 +11688,7 @@ unsafe fn compile_split(up: *mut Unit, id: u32, spec: bool) -> Split {
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            Err(format!("internal compiler error in {}: {}", (&*up).fns[id as usize].name, msg))
+            Err(if let Some(fatal) = p.downcast_ref::<crate::infer::diagnostics::FatalError>() { fatal.0.clone() } else { format!("internal compiler error in {}: {}", (&*up).fns[id as usize].name, msg) })
         }
     };
     match built {
@@ -11900,13 +11749,11 @@ unsafe fn compile_split(up: *mut Unit, id: u32, spec: bool) -> Split {
 // Sync): a thread about to build a slot type-checks its body -- and the bodies of the small core
 // callees O1 will build as inline candidates -- before it takes the unit lock, so the lock
 // is held for lowering only and other threads' type checks run in parallel. The bodies wait in
-// the unit's FrontShared until the build under the lock takes them (build_rir_inner). Changes
-// to signatures or sources (re-collection after const evaluation, live patches, dropping the
-// unit) take FRONT_RW for writing; type checks ahead hold it for reading. A body with errors is
-// not kept (the build checks it again under the lock, after evaluating the constants it may
-// wait for). RELAX_TYCK_AHEAD=0: off.
-// Until first present, helpers also lower checked bodies. They never acquire the unit lock
-// or create slots: new callee references are resolved by the consuming build in source order.
+// definition-keyed typeck query until lowering instantiates them. Changes
+// to signatures or sources (live patches, dropping the unit) take FRONT_RW for writing;
+// type checks ahead hold it for reading. Declaration changes
+// invalidates query results, including diagnostics. RELAX_TYCK_AHEAD=0: off.
+// Helpers also lower instantiated bodies until first present.
 
 /// Readers: type checks and lowering off the unit lock. Writers (unit lock held too): changes to the program
 /// or to collected signatures / types.
@@ -11962,7 +11809,6 @@ pub fn front_read(site: &'static str) -> FrontRead {
     let g = FRONT_RW.read().unwrap_or_else(|e| e.into_inner());
     FrontRead { _g: g, traced: front_trace().then(|| (site, std::time::Instant::now())) }
 }
-
 /// What type checks ahead need of a unit, reachable without its lock: the program and type
 /// context (shared, Sync), slot keys, and the checked bodies waiting for their builds.
 pub struct FrontShared {
@@ -11997,13 +11843,12 @@ pub struct FrontShared {
 }
 
 impl FrontShared {
-    /// Memory report: bodies checked ahead and not yet taken, the dedup sets.
+    /// Memory report for the shared slot index and pending ahead-work queue.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
-        let bs = std::mem::size_of::<Body>();
-        let (n, b) = self.ahead.mem_stats(|k, (_, body)| k.1.capacity() * 4 + bs + body.heap_bytes());
-        let (bn, bb) = self.built.mem_stats(|k, _| k.1.capacity() * 4);
         let (sn, sb) = self.slot_keys.mem_stats(|_, _| 0);
-        vec![(format!("front: bodies checked ahead ({})", n), b as u64), (format!("front: built set ({})", bn), bb as u64), (format!("front: slot keys ({})", sn), sb as u64)]
+        let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        vec![(format!("front: slot keys ({})", sn), sb as u64),
+             (format!("front: queued slots ({})", queue.len()), (queue.capacity() * std::mem::size_of::<u32>()) as u64)]
     }
 
     fn new(sess: &std::sync::Arc<crate::Session>) -> Self {
@@ -12036,7 +11881,7 @@ static LAST_FRONT: std::sync::Mutex<Option<std::sync::Arc<FrontShared>>> = std::
 
 /// RELAX_CODE_SIG_CANON=1: `Fn(slot)` in a RIR dump becomes the slot's instance (path and
 /// argument types as text), so signatures compare across runs whose slot numbering differs
-/// (bodies checked ahead request constants at other moments).
+/// (ahead type checking can evaluate constants in a different order).
 fn canon_slots(d: String) -> String {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if !*ON.get_or_init(|| std::env::var("RELAX_CODE_SIG_CANON").is_ok()) {
@@ -12059,6 +11904,7 @@ fn canon_slots(d: String) -> String {
                 s
             }
             FnKey::Closure(file, e, _) => format!("closure:{}:{}", file, e),
+            FnKey::Shim(shim) => crate::lower::shim_name(prog, tcx, &shim),
             FnKey::Glue(g, t) => format!("glue{}:{}", g, crate::typeck::ty_to_string(false, prog, tcx, t)),
             FnKey::Sandbox(b) => format!("sandbox:{}", b),
         })
@@ -12195,7 +12041,6 @@ struct AheadFnIds {
     ids: HashMap<FnKey, u32>,
 }
 
-struct LowerAheadNeedsUnit;
 struct LowerAheadGuard;
 impl Drop for LowerAheadGuard {
     fn drop(&mut self) {
@@ -12229,7 +12074,7 @@ fn lower_ahead_fn_id(u: &Unit, key: &FnKey) -> Option<u32> {
     }))
 }
 
-/// The only slot metadata lowering reads for a callee is whether it tracks its caller.
+/// Resolve temporary callee metadata for caller tracking and RustCall argument spreading.
 pub(crate) fn lower_ahead_fn_key(id: u32) -> Option<FnKey> {
     if !LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) { return None; }
     LOWER_AHEAD_IDS.with(|a| a.borrow().keys.get((u32::MAX - id) as usize).cloned())
@@ -12238,10 +12083,12 @@ pub(crate) fn lower_ahead_fn_key(id: u32) -> Option<FnKey> {
 /// FRONT_RW readers must never acquire the unit lock: its owner may be waiting for their
 /// read guard to re-collect types. Abort *before* acquiring it, including when uncontended.
 /// resume_unwind avoids the panic hook; the helper leaves the checked body for a normal build.
+/// NeedsUnit is a cancellation: a constant evaluation it crosses (the solver normalizing an
+/// array length) is not cached as that constant's failure.
 #[inline]
 pub(crate) fn lower_ahead_needs_unit() {
     if LOWERING_AHEAD.try_with(|a| a.get()).unwrap_or(false) {
-        std::panic::resume_unwind(Box::new(LowerAheadNeedsUnit));
+        std::panic::resume_unwind(Box::new(crate::preempt::NeedsUnit));
     }
 }
 
@@ -12261,11 +12108,9 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     // Trait declarations may lower as virtual/derived shims rather than from their body.
     // Provided functions likewise use the locked path's bridge selection.
     if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn)
-        || (def.parent != NO_DEF && u.prog.def(def.parent).kind == DefKind::Trait)
+        || (def.parent != crate::program::NO_DEF && u.prog.def(def.parent).kind == DefKind::Trait)
         || crate::sandbox::is_wrapper_crate(def.krate)
         || !u.provided.is_empty() && u.provided.iter().any(|(kr, _)| *kr == def.krate)
-        || u.tcx.has_blocked_consts()
-        || !u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     { return; }
     // These are evaluated before ordinary lowering, including uses on unreachable paths.
     // Do not skip that preparation or inspect the unit-lock-owned constant/static maps.
@@ -12284,18 +12129,16 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
-        let mut body = clone_body(&body);
-        body.erase_regions(&u.tcx.tys);
+        let body = clone_body(&body);
         let (func, closures) = lower_checked_body(u, id, &fn_key, &body)?;
         let callees = LOWER_AHEAD_IDS.with(|a| std::mem::take(&mut a.borrow_mut().keys));
         Ok::<_, String>(LoweredAhead { epoch, file: body.file, func, body: closures.then_some(body), callees })
     }));
     let missing = !crate::program::take_missing().is_empty();
     let ready = match r {
-        Ok(Ok(r)) if !missing && !u.tcx.has_blocked_consts()
-            && u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty() => Some(r),
+        Ok(Ok(r)) if !missing => Some(r),
         Err(p) => {
-            if !p.is::<LowerAheadNeedsUnit>() && std::env::var_os("RELAX_AHEAD_TRACE").is_some() {
+            if !p.is::<crate::preempt::NeedsUnit>() && std::env::var_os("RELAX_AHEAD_TRACE").is_some() {
                 eprintln!("ahead-lower panic: {}", u.prog.def_path(d));
             }
             None
@@ -12320,8 +12163,6 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<crate::rir::Func> {
     if crate::boundary::on()
         || lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst)
         || lowered.file != u.fns[id as usize].file
-        || u.tcx.has_blocked_consts()
-        || !u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     { return None; }
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
         let key = (*d, args.clone());
@@ -12425,7 +12266,7 @@ pub(crate) fn ctfe_ahead_body(u: &Unit, d: DefId, args: &[TyId]) -> Option<Body>
 /// fallback. Keep the check's original epoch: evaluation may have re-collected signatures.
 pub(crate) fn ctfe_fallback_body(u: &Unit, epoch: Option<u64>, b: Body) {
     let Some(epoch) = epoch else { return };
-    if ahead_on(&u.prog.session.options) && !u.tcx.has_blocked_consts() {
+    if ahead_on(&u.prog.session.options) && b.deferred_misses.is_empty() {
         publish_ahead(&u.front, (b.def, b.args.clone()), epoch, b);
     }
 }
@@ -12522,21 +12363,23 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             inprog_end(f, &key);
             continue;
         }
-        // constants still to evaluate (or items waiting for them): a check now could cache
-        // types with unknown lengths (opaque hidden types); the build checks under the lock,
-        // after evaluating them, as before
-        if tcx.has_blocked_consts() || !tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-            inprog_end(f, &key);
-            return;
-        }
         let epoch = tcx.collect_epoch.load(Ordering::SeqCst);
         let cx_state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &cx_state);
-        let asked = cx.state.const_asked.get();
+        let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &cx_state);
         let _o = crate::clock::origin("ahead");
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&cx, prog, tcx, key.0, &key.1)));
-        // a body that asked for a constant may have typed a length as unknown: the build
-        // checks it again after evaluating the constant
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _p = crate::preempt::Preemptible::on();
+            crate::preempt::point();
+            crate::typeck::instantiate_body(&cx, prog, tcx, key.0, &key.1)
+        }));
+        if r.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
+            inprog_end(f, &key);
+            if crate::preempt::is_stopped() { return; }
+            todo.push((key.0, key.1, depth, normal));
+            drop(_r);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        }
         if std::env::var_os("RELAX_AHEAD_TRACE").is_some() {
             match &r {
                 Err(p) => eprintln!("ahead-panic {} : {}", prog.def_path(key.0), p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_default()),
@@ -12545,7 +12388,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             }
         }
         let b = match r {
-            Ok(b) if b.errors.is_empty() && cx.state.const_asked.get() == asked && !tcx.has_blocked_consts() => b,
+            Ok(b) if b.errors.is_empty() && b.deferred_misses.is_empty() => b,
             _ => {
                 AHEAD_STATS[2].fetch_add(1, Ordering::Relaxed);
                 inprog_end(f, &key);
@@ -12602,26 +12445,22 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
 pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body) -> Vec<(DefId, Vec<TyId>)> {
     let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
     let mut add = |d: DefId, args: &[TyId]| {
+        // rustc_ty_utils/src/instance.rs:187-198 @8d1a764: instance
+        // discovery is a codegen boundary, including non-trait callees.
+        let mut erased = Vec::with_capacity(args.len());
+        for &ty in args {
+            let Ok(ty) = tcx.try_normalize_after_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), ty) else { return };
+            erased.push(ty);
+        }
+        let args = erased.as_slice();
         if !args.iter().all(|t| tcx.tys.is_concrete(*t)) {
             return;
         }
-        let (rd, ra) = if prog.def(prog.def(d).parent).kind == DefKind::Trait {
-            if matches!(args.first().map(|t| tcx.tys.kind(*t)), Some(TyKind::Dyn(..))) {
-                return;
-            }
-            // a guess: a call this check cannot dispatch yet is left to the build
-            match tcx.resolve_trait_method(&crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), prog, d, args) {
-                crate::tcx::MethodResolution::Resolved(rd, ra) => (rd, ra),
-                other => {
-                    if std::env::var_os("RELAX_AHEAD_TRACE").is_some() {
-                        eprintln!("ahead-skip {} : {other:?}", prog.def_path(d));
-                    }
-                    return;
-                }
-            }
-        } else {
-            (d, args.to_vec())
-        };
+        let Ok(instance) = tcx.resolve_instance_raw(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), d, args) else { return };
+        // Ahead checking handles source bodies only; generated bodies are built at their slots.
+        let InstanceKind::Item(rd) = instance.def else { return };
+        if prog.def(rd).kind == DefKind::Closure { return; }
+        let ra = instance.compact_args(tcx);
         if !out.iter().any(|x| x.0 == rd && x.1 == ra) {
             out.push((rd, ra));
         }
@@ -12737,7 +12576,7 @@ unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth: u32) -> R
             let _o = crate::clock::origin("closure-owner");
             match take_ahead(&u.prog.session.options, &u.front, &u.tcx, d, &args) {
                 Ok(b) => b,
-                Err(_) => ctfe_checked_body(u, d, &args).unwrap_or_else(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &args)),
+                Err(_) => ctfe_checked_body(u, d, &args).unwrap_or_else(|| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &args)),
             }
         }
         FnKey::Sandbox(_) => return Err("closure parent is a sandbox twin".to_string()),
@@ -12748,7 +12587,7 @@ unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth: u32) -> R
                 None => return Err("closure parent body missing".to_string()),
             }
         }
-        FnKey::Glue(..) => return Err("closure parent is glue".to_string()),
+        FnKey::Shim(_) | FnKey::Glue(..) => return Err("closure parent is glue".to_string()),
     };
     if !body.errors.is_empty() {
         return Err(body.errors[0].clone());
@@ -12856,15 +12695,10 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
             return false;
         }
         let (prog, tcx) = unsafe { (&*self.0.prog.load(Ordering::Relaxed), &*self.0.tcx.load(Ordering::Relaxed)) };
-        // constants still to evaluate: try again later (as typeck_ahead)
-        if tcx.has_blocked_consts() || !tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
-            return false;
-        }
         let cx_state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &cx_state);
-        let asked = cx.state.const_asked.get();
+        let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &cx_state);
         f(prog, tcx, &cx);
-        cx.state.const_asked.get() == asked && !tcx.has_blocked_consts()
+        true
     }
     fn quiet_ns(&self) -> u64 {
         wall_ns().saturating_sub(COMPILE_LAST.load(Ordering::Relaxed))

@@ -47,8 +47,6 @@ pub enum Tag {
     Types,
     /// type checking of bodies (typeck::check_fn)
     Typeck,
-    /// polymorphic body templates (tytemplate.rs)
-    Template,
     /// Gandalf, the lazy borrow checker (background borrow checking)
     Borrowck,
     /// lowering to RIR
@@ -84,10 +82,10 @@ pub enum Tag {
     MacroOutput,
 }
 
-pub const N_TAGS: usize = 36;
+pub const N_TAGS: usize = 35;
 pub const TAG_NAMES: [&str; N_TAGS] = [
     "other", "boot", "parse", "parse-body", "derive", "macro_rules", "fmt", "mac-other", "load", "resolve", "syms", "sigs", "types",
-    "typeck", "template", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
+    "typeck", "gandalf", "lower", "opt", "codegen", "layout", "unit", "cache-load", "cache-store", "ctfe", "O3", "pmhost", "parse-lazy",
     "rx-sources", "rx-schema", "rx-lower", "rx-input", "source", "front-image", "front-record", "program-items", "macro-output",
 ];
 

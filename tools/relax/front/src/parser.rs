@@ -302,6 +302,12 @@ impl<'a> Parser<'a> {
                 self.toks[self.pos].lo += 1;
                 true
             }
+            // rustc_parse break_and_eat: `<-` splits into `<` `-` (`f::<-1>()`)
+            T::LArrow => {
+                self.toks[self.pos].kind = T::Minus;
+                self.toks[self.pos].lo += 1;
+                true
+            }
             _ => false,
         }
     }
@@ -391,15 +397,6 @@ impl<'a> Parser<'a> {
                             Some(pos) => BodyOutline::Mismatched(pos),
                             None => BodyOutline::Deferred(TokRange { lo: self.pos as u32 + 1, hi: i as u32 }),
                         };
-                    }
-                }
-                T::Semi if matches!(stack.last(), Some(T::OpenBracket)) => {
-                    // `[x; N]` / `[T; N]`: N must be one literal or name (anything more may become
-                    // a hidden const item: anon_const_len)
-                    let n = self.toks.get(i + 1).map(|t| t.kind);
-                    let close = self.toks.get(i + 2).map(|t| t.kind);
-                    if !(matches!(n, Some(T::Int) | Some(T::Ident)) && close == Some(T::CloseBracket)) {
-                        return BodyOutline::Eager(4);
                     }
                 }
                 T::KwFn | T::KwImpl | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwUse | T::KwStatic | T::KwExtern | T::KwType | T::Interp | T::Pound if k != T::Pound || self.toks.get(i + 1).map(|t| t.kind) == Some(T::Not) => return BodyOutline::Eager(if k == T::Interp { 5 } else { 2 }),
@@ -1056,50 +1053,7 @@ impl<'a> Parser<'a> {
         Ok(start)
     }
 
-    /// Parses an expansion that starts at token `start` with `f`; it must consume it all.
-    /// An array length / repeat count is an anonymous constant (rustc AnonConst): one that is more
-    /// than literals, paths and arithmetic on them (`TABLE.len() + 1`, `size_of::<T>() >> 2`)
-    /// becomes a hidden `const __relax_len_N: usize = <expr>;` next to the enclosing item, and the
-    /// length a path to it -- evaluated by running it, like every const.
-    fn anon_const_len(&mut self, n: ExprId) -> PResult<ExprId> {
-        fn simple(p: &Parser, e: ExprId) -> bool {
-            match &p.ast.expr(e).kind {
-                // `[x; _]` (an inferred length, rustc generic_arg_infer) stays as written
-                ExprKind::Lit(_) | ExprKind::Path(_) | ExprKind::Underscore => true,
-                ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => simple(p, *x),
-                ExprKind::Binary(_, a, b) => simple(p, *a) && simple(p, *b),
-                ExprKind::Block(b, None) => match p.ast.stmts(*b) {
-                    [Stmt::Expr(x, false)] => simple(p, *x),
-                    _ => false,
-                },
-                _ => false,
-            }
-        }
-        if simple(self, n) || self.macros.is_none() {
-            return Ok(n);
-        }
-        let lo = self.ast.expr(n).lo;
-        let name = format!("__relax_len_{}_{}", lo, self.toks.len());
-        // the expression's text (an item owns the expressions it parses itself: a spliced
-        // expression from before the item would lie outside its range)
-        let ex = self.ast.expr(n);
-        let src = String::from_utf8_lossy(self.bytes(ex.lo, ex.hi)).into_owned();
-        let mut length_tokens = Vec::new();
-        let associated = self.in_assoc != 0 && crate::lexer::lex(src.as_bytes(), self.edition, &mut length_tokens).is_ok()
-            && length_tokens.iter().any(|token| token.kind == T::KwSelfType);
-        let g = fmtmac::Gen::from_text(format!("#[allow(non_upper_case_globals)] const {}: usize = {};", name, src));
-        let start = self.splice_expansion("array length", &g, lo)?;
-        let pending = std::mem::take(&mut self.extra_assoc_items);
-        let items = self.in_expansion(start, |p| p.items_until(T::Eof));
-        self.extra_assoc_items = pending;
-        let items = items?;
-        if associated { self.extra_assoc_items.extend(items); }
-        else { self.extra_items.extend(items); }
-        let g2 = fmtmac::Gen::from_text(if associated { format!("Self::{name}") } else { name });
-        let start = self.splice_expansion("array length", &g2, lo)?;
-        self.in_expansion(start, |p| p.expr())
-    }
-
+    /// Parses an expansion that starts at token `start`; it must consume it all.
     fn in_expansion<X>(&mut self, start: usize, f: impl FnOnce(&mut Self) -> PResult<X>) -> PResult<X> {
         let rules = self.session.runtime.profile && self.rules_exp.last().map_or(false, |(lo, hi, _)| *lo <= self.toks[start].lo && self.toks[start].lo < *hi);
         let _profile = crate::load_profile::span(rules, "macro-rules-parse", self.bctx.as_ref().map_or("", |c| c.path.as_str()));
@@ -1456,9 +1410,6 @@ impl<'a> Parser<'a> {
             if !self.ast.item(*id).attrs.is_empty() {
                 self.derive_after(*id, tok_lo)?;
             }
-            if self.cfg_out == 0 && matches!(self.ast.item(*id).kind, ItemKind::Enum(..)) {
-                self.enum_disc_consts(*id)?;
-            }
             if self.cfg_out == 0 && matches!(self.ast.item(*id).kind, ItemKind::Struct(..) | ItemKind::Enum(..)) {
                 self.default_consts(*id)?;
             }
@@ -1666,7 +1617,7 @@ impl<'a> Parser<'a> {
                     attrs.extend(inner);
                     let attrs = self.ast.push_list(attrs);
                     let items = self.ast.push_list(items);
-                    return Ok(Some(self.push_item(Item { ranges: [0; 4], attrs, vis, name, kind: ItemKind::Mod(Some(items)), lo, hi: self.prev_hi() })));
+                    return Ok(Some(self.push_item(Item { ranges: [0; 4], default_, attrs, vis, name, kind: ItemKind::Mod(Some(items)), lo, hi: self.prev_hi() })));
                 }
             }
             T::Ident if self.is_word(0, b"macro_rules") && self.nth(1) == T::Not => {
@@ -1705,7 +1656,7 @@ impl<'a> Parser<'a> {
         let mut attrs = attrs;
         attrs.extend(std::mem::take(&mut self.pending_inner));
         let attrs = self.ast.push_list(attrs);
-        Ok(Some(self.push_item(Item { ranges: [0; 4], attrs, vis, name, kind, lo, hi })))
+        Ok(Some(self.push_item(Item { ranges: [0; 4], default_, attrs, vis, name, kind, lo, hi })))
     }
 
     fn push_item(&mut self, mut it: Item) -> ItemId {
@@ -2316,15 +2267,15 @@ impl<'a> Parser<'a> {
             let mut seg = self.path_seg_name()?;
             // generic args
             if expr {
-                if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl) {
+                if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
                     self.pos += 1;
                     seg.args = self.generic_args_angle()?;
                 }
             } else {
-                if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl) {
+                if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
                     self.pos += 1;
                 }
-                if matches!(self.kind(), T::Lt | T::Shl) {
+                if matches!(self.kind(), T::Lt | T::Shl | T::LArrow) {
                     seg.args = self.generic_args_angle()?;
                 } else if self.kind() == T::OpenParen && seg.kind == SegKind::Ident {
                     // Fn(A, B) -> C sugar
@@ -2532,7 +2483,6 @@ impl<'a> Parser<'a> {
                 let elem = self.ty_plus()?;
                 if self.eat(T::Semi) {
                     let n = self.expr()?;
-                    let n = self.anon_const_len(n)?;
                     self.expect(T::CloseBracket)?;
                     Ty::Array(elem, n)
                 } else {
@@ -3170,7 +3120,7 @@ impl<'a> Parser<'a> {
                         }
                         T::Ident | T::RawIdent => {
                             let name = self.ident_tok()?;
-                            let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl) {
+                            let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
                                 self.pos += 1;
                                 self.generic_args_angle()?
                             } else {
@@ -3308,7 +3258,6 @@ impl<'a> Parser<'a> {
                 if let Some(f) = first {
                     if self.eat(T::Semi) {
                         let n = self.expr()?;
-                        let n = self.anon_const_len(n)?;
                         self.expect(T::CloseBracket)?;
                         return Ok(self.mk_expr(ExprKind::Repeat(f, n), lo));
                     }

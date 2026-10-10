@@ -1,6 +1,9 @@
-//! `#[derive(Debug, Default, Hash, PartialOrd, Ord)]` expanded by the parser into ordinary
-//! `impl` items (S2 std), the way rustc's built-in derives work. PartialEq / Clone stay
-//! compiler glue (lower.rs: lower_derived_eq / lower_derived_clone); Copy / Eq are markers.
+// ported from N:rustc_builtin_macros/src/deriving/clone.rs @8d1a764
+// ported from N:rustc_builtin_macros/src/deriving/copy.rs @8d1a764
+// ported from N:rustc_builtin_macros/src/deriving/eq.rs @8d1a764
+// ported from N:rustc_builtin_macros/src/deriving/partial_eq.rs @8d1a764
+// ported from N:rustc_builtin_macros/src/deriving/generic/mod.rs @8d1a764
+//! Builtin derives expand into ordinary impls before definition collection.
 //!
 //! Child module of `parser`.
 
@@ -12,8 +15,8 @@ const CORE: &str = "::__relax_crate_core";
 /// a `>` without a token of its own (see Parser::closes)
 const GT: usize = usize::MAX;
 
-/// Derives this module expands (the rest stay `tcx.derived` markers / glue).
-pub const EXPANDED: &[&str] = &["Debug", "Default", "Hash", "PartialOrd", "Ord"];
+/// Derives this module expands.
+pub const EXPANDED: &[&str] = &["Debug", "Default", "Hash", "PartialOrd", "Ord", "Clone", "Copy", "Eq", "PartialEq"];
 
 /// The trait surface of compiler-owned derives, including marker/glue derives.
 /// Hosted derives with the same spelling must still use their actual output.
@@ -44,67 +47,13 @@ pub fn default_const_name(ty: &str, variant: Option<&str>, field: &str) -> Strin
     }
 }
 
-/// Name of the anonymous const holding variant `vi`'s discriminant of enum `name`.
-pub fn disc_const_name(name: &str, vi: usize) -> String {
-    format!("__relax_disc_{}_{}", name, vi)
-}
-
 /// Only plain structs take `#[rust(expr)]` defaults (enum variants' fields never grow live).
 fn variant_is_none_live(groups: &[(Option<String>, Vec<FieldDef>)]) -> bool {
     groups.len() == 1 && groups[0].0.is_none()
 }
 
 impl<'a> Parser<'a> {
-    /// After an enum: every discriminant expression that is more than a literal also becomes a
-    /// const item of the repr type (rustc: discriminants are anonymous consts), so one the
-    /// signature-time evaluator cannot read (`= four_char("dev#")`) is evaluated like any const
-    /// (CTFE through the JIT, tcx re-collects the enum).
-    pub(super) fn enum_disc_consts(&mut self, id: ItemId) -> PResult<()> {
-        let it = self.ast.item(id).clone();
-        let vars = match &it.kind {
-            ItemKind::Enum(_, v) => v.clone(),
-            _ => return Ok(()),
-        };
-        let mut repr = "isize".to_string();
-        for a in self.ast.list(it.attrs) {
-            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            if hi <= lo || self.tok_text(self.toks[lo]) != b"repr" {
-                continue;
-            }
-            for i in lo + 1..hi {
-                let n = self.tok_text(self.toks[i]);
-                if [&b"u8"[..], b"u16", b"u32", b"u64", b"u128", b"usize", b"i8", b"i16", b"i32", b"i64", b"i128", b"isize"].contains(&n) {
-                    repr = String::from_utf8_lossy(n).into_owned();
-                }
-            }
-        }
-        let name = String::from_utf8_lossy(self.bytes(it.name.lo, it.name.hi)).into_owned();
-        let mut text = String::new();
-        for (vi, v) in self.ast.list(vars).iter().enumerate() {
-            let e = match v.disc {
-                Some(e) => e,
-                None => continue,
-            };
-            let mut x = e;
-            while let ExprKind::Paren(y) | ExprKind::Unary(UnOp::Neg, y) = &self.ast.expr(x).kind {
-                x = *y;
-            }
-            if matches!(self.ast.expr(x).kind, ExprKind::Lit(_)) {
-                continue;
-            }
-            let ex = self.ast.expr(e);
-            let src = String::from_utf8_lossy(self.bytes(ex.lo, ex.hi)).into_owned();
-            text.push_str(&format!("#[allow(non_upper_case_globals)] const {}: {} = {};\n", disc_const_name(&name, vi), repr, src));
-        }
-        if text.is_empty() {
-            return Ok(());
-        }
-        let g = super::fmtmac::Gen::from_text(text);
-        let start = self.splice_expansion("discriminant", &g, it.name.lo)?;
-        let items = self.in_expansion(start, |p| p.items_until(T::Eof))?;
-        self.extra_items.extend(items);
-        Ok(())
-    }
+
 
     /// After a struct or enum: every field default value (`field: T = expr`) becomes an
     /// anonymous const of the field's type (rustc: default field values are anonymous consts),
@@ -185,7 +134,7 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let it = self.ast.item(id).clone();
-        if !matches!(it.kind, ItemKind::Struct(..) | ItemKind::Enum(..)) {
+        if !matches!(it.kind, ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..)) {
             return Ok(());
         }
         let mut wanted: Vec<&'static str> = Vec::new();
@@ -214,6 +163,18 @@ impl<'a> Parser<'a> {
         if wanted.is_empty() {
             return Ok(());
         }
+        let has_copy = wanted.contains(&"Copy");
+        for &tr in &wanted {
+            match tr {
+                "Clone" => self.expand_deriving_clone(&it, tok_lo, has_copy)?,
+                "Copy" => self.expand_deriving_copy(&it, tok_lo)?,
+                "Eq" => self.expand_deriving_eq(&it, tok_lo)?,
+                "PartialEq" => self.expand_deriving_partial_eq(&it, tok_lo)?,
+                _ => {}
+            }
+        }
+        wanted.retain(|tr| !matches!(*tr, "Clone" | "Copy" | "Eq" | "PartialEq"));
+        if wanted.is_empty() { return Ok(()); }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "derive-builtin", &wanted.join(","));
         let lo = self.ast.list(it.attrs).iter().map(|a| self.toks[a.toks.lo as usize].lo).min().unwrap_or(it.lo).min(it.lo);
         let key = crate::parse_work::key(self, "native-derive", lo, it.hi, false);
@@ -709,4 +670,345 @@ fn gen_ord(_ty: &str, is_enum: bool, shapes: &[Shape], partial: bool, disc_ty: &
     }
     body.push_str(&format!("match (self, other) {{ {} }}", arms));
     format!("fn {m}(&self, other: &Self) -> {r} {{ {b} }}", m = m, r = ret, b = body)
+}
+
+struct TypeParameter { ty: TyId, bound_generic_params: Vec<GenericParam> }
+
+impl Parser<'_> {
+    fn deriving_fields(&self, it: &Item) -> Vec<(Option<String>, VariantData, Vec<FieldDef>)> {
+        let mut out = Vec::new();
+        let mut data = Vec::new();
+        match it.kind {
+            ItemKind::Struct(_, d) => data.push((None, d)),
+            ItemKind::Union(_, f) => data.push((None, VariantData::Struct(f))),
+            ItemKind::Enum(_, vs) => for v in self.ast.list(vs) {
+                if self.cfg_present(self.ast.list(v.attrs)) {
+                    data.push((Some(String::from_utf8_lossy(self.bytes(v.name.lo, v.name.hi)).into_owned()), v.data));
+                }
+            },
+            _ => unreachable!(),
+        }
+        for (name, d) in data {
+            let mut fields = Vec::new();
+            if let VariantData::Tuple(fs) | VariantData::Struct(fs) = d {
+                for f in self.ast.list(fs) {
+                    if self.cfg_present(self.ast.list(f.attrs)) { fields.push(*f); }
+                }
+            }
+            out.push((name, d, fields));
+        }
+        out
+    }
+
+    fn is_packed(&self, it: &Item) -> bool {
+        for a in self.ast.list(it.attrs) {
+            if a.toks.lo == a.toks.hi || self.tok_text(self.toks[a.toks.lo as usize]) != b"repr" { continue; }
+            for i in a.toks.lo..a.toks.hi {
+                if self.tok_text(self.toks[i as usize]) == b"packed" { return true; }
+            }
+        }
+        false
+    }
+
+    /// deriving/generic/mod.rs:379: visit field types, retaining binder scopes.
+    fn find_type_parameters(&self, ty: TyId, names: &[String], bound: &mut Vec<GenericParam>, out: &mut Vec<TypeParameter>) {
+        match *self.ast.ty(ty) {
+            Ty::Path(path) => {
+                let segments = self.ast.segs(path.segs);
+                if let Some(first) = segments.first() {
+                    let name = String::from_utf8_lossy(self.bytes(first.name.lo, first.name.hi));
+                    if names.contains(&name.to_string()) && segments.len() > 1 {
+                        out.push(TypeParameter { ty, bound_generic_params: bound.clone() });
+                    }
+                }
+                if path.qself.is_some() { self.find_type_parameters(self.ast.qself(&path).unwrap().ty, names, bound, out); }
+                for seg in segments { self.find_args_type_parameters(seg.args, names, bound, out); }
+            }
+            Ty::Ref(_, _, t) | Ty::Ptr(_, t) | Ty::Slice(t) | Ty::Array(t, _) | Ty::Paren(t) => self.find_type_parameters(t, names, bound, out),
+            Ty::Tuple(ts) => for &t in self.ast.list(ts) { self.find_type_parameters(t, names, bound, out); },
+            Ty::Fn(f) => {
+                let f = self.ast.fn_ptr(f);
+                let len = bound.len(); bound.extend_from_slice(self.ast.list(f.hrtb));
+                for &t in self.ast.list(f.params) { self.find_type_parameters(t, names, bound, out); }
+                if let Some(t) = f.ret { self.find_type_parameters(t, names, bound, out); }
+                bound.truncate(len);
+            }
+            Ty::ImplTrait(bs) | Ty::DynTrait(bs, _) => self.find_bounds_type_parameters(bs, names, bound, out),
+            _ => {}
+        }
+    }
+    fn find_args_type_parameters(&self, args: GenericArgsId, names: &[String], bound: &mut Vec<GenericParam>, out: &mut Vec<TypeParameter>) {
+        match self.ast.gargs(args) {
+            Some(GenericArgs::Angle(args)) => for &arg in self.ast.list(*args) {
+                match arg {
+                    GenericArg::Type(t) => self.find_type_parameters(t, names, bound, out),
+                    GenericArg::Binding(_, args, t) => { self.find_args_type_parameters(args, names, bound, out); self.find_type_parameters(t, names, bound, out); }
+                    GenericArg::Constraint(_, bs) => self.find_bounds_type_parameters(bs, names, bound, out),
+                    _ => {}
+                }
+            },
+            Some(GenericArgs::Paren(ts, ret)) => {
+                for &t in self.ast.list(*ts) { self.find_type_parameters(t, names, bound, out); }
+                if let Some(t) = ret { self.find_type_parameters(*t, names, bound, out); }
+            }
+            None => {}
+        }
+    }
+    fn find_bounds_type_parameters(&self, bs: List<Bound>, names: &[String], bound: &mut Vec<GenericParam>, out: &mut Vec<TypeParameter>) {
+        for &b in self.ast.list(bs) {
+            if let Bound::Trait { hrtb, path, .. } = b {
+                let len = bound.len(); bound.extend_from_slice(self.ast.list(hrtb));
+                for seg in self.ast.segs(path.segs) { self.find_args_type_parameters(seg.args, names, bound, out); }
+                bound.truncate(len);
+            }
+        }
+    }
+
+    /// deriving/generic/mod.rs:565: declaration bounds plus the derive's bounds
+    /// on each type parameter and each field projection, with original binders.
+    fn create_derived_impl(&mut self, it: &Item, tok_lo: usize, trait_path: &str, bound_path: &str, copy_bound: bool, unsafe_: bool, body: &str) -> PResult<()> {
+        // deriving/generic/mod.rs:486-493: a `repr(packed)` enum gets no derived impl (its repr
+        // is an error of its own)
+        if matches!(it.kind, ItemKind::Enum(..)) && self.is_packed(it) { return Ok(()); }
+        let (params, where_text) = self.derive_generics(tok_lo, it);
+        let mut names = Vec::new();
+        let mut ig = Vec::new(); let mut args = Vec::new();
+        let bound_path = if copy_bound { format!("{bound_path} + {CORE}::marker::Copy") } else { bound_path.to_string() };
+        for (kind, n, b) in &params {
+            args.push(n.clone());
+            ig.push(match kind {
+                0 => if b.is_empty() { n.clone() } else { format!("{n}: {b}") },
+                1 => {
+                    names.push(n.clone());
+                    if b.is_empty() { format!("{n}: {bound_path}") } else { format!("{n}: {bound_path} + {b}") }
+                }
+                _ => format!("const {n}: {b}"),
+            });
+        }
+        let name = String::from_utf8_lossy(self.bytes(it.name.lo, it.name.hi));
+        let g = if ig.is_empty() { String::new() } else { format!("<{}>", ig.join(", ")) };
+        let a = if args.is_empty() { String::new() } else { format!("<{}>", args.join(", ")) };
+        let mut field_params = Vec::new();
+        if !names.is_empty() {
+            for (_, _, fields) in self.deriving_fields(it) {
+                for f in fields { self.find_type_parameters(f.ty, &names, &mut Vec::new(), &mut field_params); }
+            }
+        }
+        let text = format!("{}impl{g} {trait_path} for {name}{a} {where_text} {{ {body} }}", if unsafe_ { "unsafe " } else { "" });
+        let first = self.extra_items.len();
+        self.install_derive_text(text, it.name.lo)?;
+        let iid = self.extra_items[first];
+        let mut generics = match self.ast.item(iid).kind { ItemKind::Impl { generics, .. } => generics, _ => unreachable!() };
+        if !field_params.is_empty() {
+            // The generated type parameter has exactly the additional derive bounds
+            // before its declared bounds. Reuse those paths without source scanning.
+            let bounds_len = if copy_bound { 2 } else { 1 };
+            let mut bounds = Vec::new();
+            for p in self.ast.list(generics.params) {
+                if let GenericParamKind::Type(bs, _) = p.kind {
+                    bounds.extend_from_slice(&self.ast.list(bs)[..bounds_len]); break;
+                }
+            }
+            let bs = self.ast.push_list(bounds);
+            let mut predicates = self.ast.list(generics.where_).to_vec();
+            for p in field_params {
+                let hrtb = self.ast.push_list(p.bound_generic_params);
+                predicates.push(WherePred::Bound { hrtb, ty: p.ty, bounds: bs });
+            }
+            generics.where_ = self.ast.push_list(predicates);
+            if let ItemKind::Impl { generics: g, .. } = &mut self.ast.items[iid.0.wrapping_sub(self.ast.base[23]) as usize].kind { *g = generics; }
+        }
+        Ok(())
+    }
+
+    fn expand_deriving_copy(&mut self, it: &Item, lo: usize) -> PResult<()> {
+        self.create_derived_impl(it, lo, &format!("{CORE}::marker::Copy"), &format!("{CORE}::marker::Copy"), false, false, "")
+    }
+    fn expand_deriving_clone(&mut self, it: &Item, lo: usize, has_copy: bool) -> PResult<()> {
+        let (params, _) = self.derive_generics(lo, it);
+        let union = matches!(it.kind, ItemKind::Union(..));
+        let simple = union || (has_copy && !params.iter().any(|p| p.0 == 1));
+        let copy = union || self.is_packed(it);
+        if simple {
+            self.create_derived_impl(it, lo, &format!("{CORE}::clone::TrivialClone"), &format!("{CORE}::clone::TrivialClone"), copy, true, "")?;
+        }
+        let body = if simple { self.cs_clone_simple(it, union) } else { self.cs_clone(it) };
+        self.create_derived_impl(it, lo, &format!("{CORE}::clone::Clone"), &format!("{CORE}::clone::Clone"), copy, false, &format!("#[inline] fn clone(&self) -> Self {{ {body} }}"))
+    }
+    fn assert_ty_bounds(&self, it: &Item, path: &str) -> String {
+        let mut seen = Vec::new(); let mut out = String::new();
+        for (_, _, fields) in self.deriving_fields(it) {
+            for f in fields {
+                if let Ty::Path(p) = *self.ast.ty(f.ty) {
+                    let segs = self.ast.segs(p.segs);
+                    if p.qself.is_none() && segs.len() == 1 && segs[0].args.is_none() {
+                        let n = String::from_utf8_lossy(self.bytes(segs[0].name.lo, segs[0].name.hi)).into_owned();
+                        if seen.contains(&n) { continue; } seen.push(n);
+                    }
+                }
+                let ty = String::from_utf8_lossy(self.bytes(f.ty_span.0, f.ty_span.1));
+                out.push_str(&format!("let _: {CORE}::{path}<{ty}>; "));
+            }
+        }
+        out
+    }
+    fn cs_clone_simple(&self, it: &Item, union: bool) -> String {
+        let assertions = if union { format!("let _: {CORE}::clone::AssertParamIsCopy<Self>; ") }
+            else { self.assert_ty_bounds(it, "clone::AssertParamIsClone") };
+        format!("{assertions} *self")
+    }
+    fn cs_clone(&self, it: &Item) -> String {
+        let is_enum = matches!(it.kind, ItemKind::Enum(..));
+        let packed = self.is_packed(it);
+        let mut arms = String::new();
+        for (name, data, fields) in self.deriving_fields(it) {
+            let path = name.as_ref().map_or("Self".to_string(), |v| format!("Self::{v}"));
+            let mut values = Vec::new(); let mut pattern = Vec::new();
+            for (i, f) in fields.iter().enumerate() {
+                let n = f.name.map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
+                let arg = if is_enum { format!("__self_{i}") } else if packed { format!("&{{ self.{n} }}") } else { format!("&self.{n}") };
+                let value = format!("{CORE}::clone::Clone::clone({arg})");
+                match data {
+                    VariantData::Struct(_) => { values.push(format!("{n}: {value}")); pattern.push(format!("{n}: __self_{i}")); }
+                    _ => { values.push(value); pattern.push(format!("__self_{i}")); }
+                }
+            }
+            let value = construct(&path, data, &values);
+            if !is_enum { return value; }
+            arms.push_str(&format!("{} => {value},", construct(&path, data, &pattern)));
+        }
+        if arms.is_empty() { "match *self {}".into() } else { format!("match self {{ {arms} }}") }
+    }
+    fn expand_deriving_eq(&mut self, it: &Item, lo: usize) -> PResult<()> {
+        let assertions = self.cs_total_eq_assert(it);
+        self.create_derived_impl(it, lo, &format!("{CORE}::cmp::Eq"), &format!("{CORE}::cmp::Eq"), self.is_packed(it), false,
+            &format!("#[inline] fn assert_fields_are_eq(&self) {{ {assertions} }}"))
+    }
+    fn cs_total_eq_assert(&self, it: &Item) -> String { self.assert_ty_bounds(it, "cmp::AssertParamIsEq") }
+    fn expand_deriving_partial_eq(&mut self, it: &Item, lo: usize) -> PResult<()> {
+        if matches!(it.kind, ItemKind::Union(..)) {
+            return Err(PErr { pos: it.lo, msg: "this trait cannot be derived for unions".into() });
+        }
+        self.create_derived_impl(it, lo, &format!("{CORE}::marker::StructuralPartialEq"), &format!("{CORE}::cmp::PartialEq"), false, false, "")?;
+        let body = self.get_substructure_equality_expr(it);
+        self.create_derived_impl(it, lo, &format!("{CORE}::cmp::PartialEq"), &format!("{CORE}::cmp::PartialEq"), self.is_packed(it), false,
+            &format!("#[inline] fn eq(&self, other: &Self) -> bool {{ {body} }}"))
+    }
+    fn maybe_scalar(&self, mut t: TyId) -> bool {
+        // rustc_ast ast.rs:2463-2469 Ty::peel_refs: references and raw pointers
+        loop { match *self.ast.ty(t) { Ty::Ref(_, _, inner) | Ty::Ptr(_, inner) => t = inner, _ => break } }
+        match *self.ast.ty(t) {
+            Ty::Tuple(ts) => ts.is_empty(),
+            Ty::Path(p) if p.qself.is_none() && p.segs.len() == 1 => {
+                let seg = self.ast.segs(p.segs)[0];
+                seg.args.is_none() && matches!(self.bytes(seg.name.lo, seg.name.hi), b"i8" | b"i16" | b"i32" | b"i64" | b"i128" | b"u8" | b"u16" | b"u32" | b"u64" | b"u128" | b"f16" | b"f32" | b"f64" | b"f128" | b"char" | b"bool")
+            }
+            _ => false,
+        }
+    }
+    fn get_substructure_equality_expr(&self, it: &Item) -> String {
+        let is_enum = matches!(it.kind, ItemKind::Enum(..));
+        let packed = self.is_packed(it);
+        let variants = self.deriving_fields(it);
+        let mut arms = String::new();
+        for (name, data, fields) in &variants {
+            let path = name.as_ref().map_or("Self".to_string(), |v| format!("Self::{v}"));
+            let mut checks = Vec::new();
+            for scalar in [true, false] {
+                for (i, f) in fields.iter().enumerate() {
+                    if self.maybe_scalar(f.ty) != scalar { continue; }
+                    let n = f.name.map_or(i.to_string(), |n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
+                    checks.push(if is_enum { format!("*__self_{i} == *__other_{i}") }
+                        else if packed { format!("({{ self.{n} }}) == ({{ other.{n} }})") }
+                        else { format!("self.{n} == other.{n}") });
+                }
+            }
+            let check = if checks.is_empty() { "true".into() } else { checks.join(" && ") };
+            if !is_enum { return check; }
+            let mut left = Vec::new(); let mut right = Vec::new();
+            for (i, f) in fields.iter().enumerate() {
+                let n = f.name.map(|n| String::from_utf8_lossy(self.bytes(n.lo, n.hi)).into_owned());
+                left.push(n.as_ref().map_or(format!("__self_{i}"), |n| format!("{n}: __self_{i}")));
+                right.push(n.as_ref().map_or(format!("__other_{i}"), |n| format!("{n}: __other_{i}")));
+            }
+            arms.push_str(&format!("({}, {}) => {check},", construct(&path, *data, &left), construct(&path, *data, &right)));
+        }
+        if variants.is_empty() { return "match *self {}".into(); }
+        if variants.len() == 1 { return format!("match (self, other) {{ {arms} }}"); }
+        let discr = format!("unsafe {{ {CORE}::intrinsics_mem::discriminant_value(self) == {CORE}::intrinsics_mem::discriminant_value(other) }}");
+        if variants.iter().all(|v| v.2.is_empty()) { return discr; }
+        format!("({discr}) && match (self, other) {{ {arms} _ => true }}")
+    }
+}
+
+fn construct(path: &str, data: VariantData, fields: &[String]) -> String {
+    match data {
+        VariantData::Unit => path.to_string(),
+        VariantData::Tuple(_) => format!("{path}({})", fields.join(", ")),
+        VariantData::Struct(_) => format!("{path} {{ {} }}", fields.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ast::*;
+    use crate::program::{DefKind, Program};
+
+    fn program(source: &str, label: &str) -> Program {
+        let dir = std::env::temp_dir().join(format!("relax-round9-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs");
+        std::fs::write(&path, source).unwrap();
+        let mut p = Program::new(&std::sync::Arc::new(crate::Session::default()));
+        std::sync::Arc::make_mut(&mut p.macros).s2_fmt = true;
+        let cfg = crate::cfg::CfgSet::host(&p.session, &[]);
+        p.load_crate(label, path.to_str().unwrap(), 2021, cfg, vec![]).unwrap();
+        std::fs::remove_file(path).unwrap(); std::fs::remove_dir(dir).unwrap();
+        p
+    }
+
+    #[test]
+    fn round9_specialization_rejected_during_collection() {
+        let p = program("trait Tr { type Out; const C: u8; fn f(); } struct S; default impl Tr for S { default type Out = u8; default const C: u8 = 1; default fn f() {} }", "specialization");
+        assert_eq!(p.errors.len(), 4, "{:?}", p.errors);
+        // rustc_ast_passes/src/feature_gate.rs:174,382 @8d1a764: "specialization is experimental"
+        for e in &p.errors { assert!(e.contains("E0658") && e.contains("specialization is experimental"), "{e}"); }
+        let p = program("trait Tr { type Out; const C: u8 = 1; fn f() {} } struct S; impl Tr for S { type Out = u8; } #[cfg(any())] default impl Tr for u8 {}", "final");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+    }
+
+    #[test]
+    fn round9_derive_emits_impls_and_distinguishes_clone_forms() {
+        let p = program("#[derive(Clone, Copy, Eq, PartialEq)] struct S { value: u32 } #[derive(Clone, Copy)] struct G<T>(T); #[derive(Clone, Copy)] union U<T: Copy> { value: T }", "impls");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        assert_eq!(p.impls.len(), 11); // S: 6, G: 2, U: 3
+        let mut clone_bodies = Vec::new();
+        for d in &p.defs {
+            if d.kind != DefKind::AssocFn || p.syms.str(d.name) != "clone" { continue; }
+            let f = &p.files[d.file as usize];
+            let ItemKind::Fn(_, Some(b), _) = f.ast.item(d.item).kind else { panic!("derive body absent") };
+            let block = f.ast.block(b);
+            clone_bodies.push(String::from_utf8_lossy(f.bytes(block.lo, block.hi)).into_owned());
+        }
+        assert_eq!(clone_bodies.len(), 3);
+        assert!(clone_bodies[0].contains("AssertParamIsClone<u32>"));
+        assert!(!clone_bodies[0].contains("AssertParamIsCopy"));
+        assert!(clone_bodies[1].contains("Clone::clone(&self.0)"));
+        assert!(clone_bodies[2].contains("AssertParamIsCopy<Self>"));
+    }
+
+    #[test]
+    fn round9_derive_keeps_field_projection_binders() {
+        let p = program("trait Tr<'a> { type Out; } #[derive(Clone)] struct G<T: for<'a> Tr<'a>> { f: for<'a> fn(T::Out) }", "binders");
+        assert!(p.errors.is_empty(), "{:?}", p.errors);
+        assert_eq!(p.impls.len(), 1);
+        let imp = &p.impls[0]; let f = &p.files[imp.file as usize];
+        let ItemKind::Impl { generics, .. } = f.ast.item(imp.item).kind else { unreachable!() };
+        let predicates = f.ast.list(generics.where_);
+        assert_eq!(predicates.len(), 1);
+        let WherePred::Bound { hrtb, ty, .. } = predicates[0] else { unreachable!() };
+        assert_eq!(hrtb.len(), 1);
+        let Ty::Path(path) = f.ast.ty(ty) else { unreachable!() };
+        assert_eq!(path.segs.len(), 2);
+    }
 }

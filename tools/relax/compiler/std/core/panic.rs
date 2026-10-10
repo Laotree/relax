@@ -1,3 +1,4 @@
+// ported from library/core/src/panic/unwind_safe.rs @8d1a764
 //! Panic locations and info (core part). Hooks and catch_unwind live in std::panic (std-os).
 
 use crate::fmt;
@@ -91,7 +92,8 @@ impl<T> crate::ops::DerefMut for AssertUnwindSafe<T> {
 /// learns its result type R from this impl's Output.
 impl<R, F: FnOnce() -> R> crate::ops::FnOnce<()> for AssertUnwindSafe<F> {
     type Output = R;
-    fn call_once(self, _args: ()) -> R {
+    // library/core/src/panic/unwind_safe.rs:270-277 @8d1a764.
+    extern "rust-call" fn call_once(self, _args: ()) -> R {
         (self.0)()
     }
 }

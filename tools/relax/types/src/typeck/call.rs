@@ -1,3 +1,4 @@
+// ported from N:rustc_hir_typeck/src/callee.rs @8d1a764
 //! Call receiver adjustments belong to the generic body, not its instances.
 use super::*;
 use crate::{borrowck::tyx::Tx, lang_items::LangItem, upvar::ClosureKind};
@@ -5,7 +6,9 @@ use crate::{borrowck::tyx::Tx, lang_items::LangItem, upvar::ClosureKind};
 #[derive(Clone, Copy)]
 pub struct CallTrait {
     pub trait_def: DefId,
-    pub derefs: u8,
+    pub tupled_args: TyId,
+    pub self_ty: TyId,
+    pub derefs: usize,
     pub from_param: bool,
     /// FnOnce consumes a non-Copy generic receiver even if its instance is Copy.
     pub by_move: bool,
@@ -20,52 +23,11 @@ fn trait_order(tcx: &Tcx, td: DefId) -> Option<u8> {
 }
 
 impl Fcx<'_> {
-    pub(super) fn record_call_trait(&mut self, e: ExprId, t: TyId, derefs: u8) {
-        // Reuse the generic body's expression types: this covers destructuring,
-        // fields, returned values and autoderef without reverse-substituting a
-        // concrete type (two different parameters can have the same instance).
-        let identity = self.b.args.iter().enumerate().all(|(i, a)| matches!(self.tcx.tys.kind(*a), TyKind::Param(k) if *k == i as u32));
-        if !identity {
-            if let Some(body) = self.polymorphic_body() {
-                if let Some(selection) = body.call_traits.get(&e.0).filter(|s| s.from_param) {
-                    self.b.call_traits.insert(e.0, *selection);
-                    return;
-                }
-            }
-        }
+    pub(super) fn record_call_trait(&mut self, e: ExprId, td: DefId, t: TyId, derefs: usize, tupled_args: TyId) {
         let from_param = matches!(self.tcx.tys.kind(t), TyKind::Param(_));
-        let mut candidates = match self.tcx.tys.kind(t).clone() {
-            TyKind::Param(k) => {
-                let mut defs: Vec<_> = self.tcx.callable_signatures(self.prog, self.b.def).into_iter()
-                    .filter(|b| b.param == k).map(|b| b.trait_def).collect();
-                defs.extend(self.param_bounds(t).into_iter().map(|(d, _)| d));
-                // Callable sugar on an enclosing impl is in its item environment.
-                for (param, file, path) in &self.env.bounds {
-                    if *param == k {
-                        if let Some(td) = self.tcx.resolve_type_path_def(self.prog, *file, self.module, path) { defs.push(td); }
-                    }
-                }
-                defs
-            }
-            TyKind::Dyn(td, args, ..) => {
-                let mut defs = vec![td];
-                let mut todo = self.tcx.trait_super_refs_of(&self.cx, self.prog, td, t, &args);
-                while let Some((td, args)) = todo.pop() {
-                    if defs.contains(&td) { continue; }
-                    defs.push(td);
-                    todo.extend(self.tcx.trait_super_refs_of(&self.cx, self.prog, td, t, &args));
-                }
-                defs
-            }
-            _ => return,
-        };
-        // rustc_hir_typeck::callee::try_overloaded_call_traits: first Fn,
-        // then FnMut, then FnOnce (and the AsyncFn family for ordinary types).
-        candidates.retain(|td| trait_order(self.tcx, *td).is_some());
-        let Some(td) = candidates.into_iter().min_by_key(|td| trait_order(self.tcx, *td)) else { return };
         let tx = Tx::new(self.prog, self.tcx, self.cx.typing_env, self.cx.state);
         let by_move = from_param && !tx.is_copy(t);
-        self.b.call_traits.insert(e.0, CallTrait { trait_def: td, derefs, from_param, by_move });
+        self.b.call_traits.insert(e.0, CallTrait { trait_def: td, self_ty: t, tupled_args, derefs, from_param, by_move });
     }
 }
 
@@ -79,9 +41,35 @@ impl Body {
             });
         }
         match tx.kind(t) {
-            TyKind::Closure(file, ce, _, _, owner) => crate::upvar::closure_properties(&tx.cx, tx.prog, tx.tcx, self, file, ce, owner).map(|(k, _)| k),
+            TyKind::Closure(file, ce, args) => crate::upvar::closure_kind(tx.tcx, self, file, ce, args),
             TyKind::FnDef(..) | TyKind::FnPtr(..) => Some(ClosureKind::FnOnce),
             _ => None,
         }
+    }
+}
+
+/// rustc_hir_typeck/src/callee.rs:1214-1278. Closure kind is inferred by
+/// capture analysis before selecting and confirming the overloaded call.
+pub(super) struct DeferredCallResolution {
+    pub call_expr: ExprId,
+    pub closure_ty: TyId,
+    pub derefs: usize,
+    pub tuple: TyId,
+    pub output: TyId,
+}
+impl DeferredCallResolution {
+    pub(super) fn resolve(self, fcx: &mut Fcx<'_>) {
+        if !fcx.b.errors.is_empty() { return; }
+        let ct = fcx.infcx.deeply_resolve_ignoring_regions(self.closure_ty);
+        let Some((td, tuple, _, output)) = fcx.try_overloaded_call_traits(ct, None) else {
+            fcx.err(fcx.ast().expr(self.call_expr).lo, "closure does not implement a call trait".into());
+            return;
+        };
+        // callee.rs:1267-1278: demand equality; do not discard a mismatch.
+        let lo = fcx.ast().expr(self.call_expr).lo;
+        if !fcx.eq(tuple, self.tuple) || !fcx.eq(output, self.output) {
+            fcx.err(lo, "E0308: closure call signature mismatch".into());
+        }
+        fcx.record_call_trait(self.call_expr, td, ct, self.derefs, tuple);
     }
 }

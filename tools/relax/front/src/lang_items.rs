@@ -8,7 +8,7 @@ use crate::fxhash::HashMap;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Target {
     Trait, Struct, Union, Enum, Fn, Static, Variant, AssocConst, AssocTy,
-    Method(MethodKind), Other,
+    Method(MethodKind), ForeignTy, Other,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl Target {
             Self::AssocTy => "associated type", Self::Method(MethodKind::Inherent) => "inherent method",
             Self::Method(MethodKind::Trait { body: false }) => "required trait method",
             Self::Method(MethodKind::Trait { body: true }) => "provided trait method",
-            Self::Method(MethodKind::TraitImpl) => "trait implementation method", Self::Other => "item",
+            Self::Method(MethodKind::TraitImpl) => "trait implementation method", Self::ForeignTy => "foreign type", Self::Other => "item",
         }
     }
 }
@@ -55,7 +55,10 @@ pub enum LangItem {
     Freeze,
     UnsafeUnpin,
     FnPtrTrait,
-    FnPtrAddr,
+    FnPtrAsPtr,
+    FnPtrFromPtr,
+    Code,
+    NonNull,
     Drop,
     Destruct,
     AsyncDrop,
@@ -280,7 +283,10 @@ static LANG_ITEM_DATA: &[LangItemData] = &[
     LangItemData { item: LangItem::Freeze, name: "freeze", target: Target::Trait, generics: GenericRequirement::Exact(0) },
     LangItemData { item: LangItem::UnsafeUnpin, name: "unsafe_unpin", target: Target::Trait, generics: GenericRequirement::Exact(0) },
     LangItemData { item: LangItem::FnPtrTrait, name: "fn_ptr_trait", target: Target::Trait, generics: GenericRequirement::Exact(0) },
-    LangItemData { item: LangItem::FnPtrAddr, name: "fn_ptr_addr", target: Target::Method(MethodKind::Trait { body: false }), generics: GenericRequirement::None },
+    LangItemData { item: LangItem::FnPtrAsPtr, name: "fn_ptr_as_ptr", target: Target::Method(MethodKind::Trait { body: false }), generics: GenericRequirement::None },
+    LangItemData { item: LangItem::FnPtrFromPtr, name: "fn_ptr_from_ptr", target: Target::Method(MethodKind::Trait { body: false }), generics: GenericRequirement::None },
+    LangItemData { item: LangItem::Code, name: "code", target: Target::ForeignTy, generics: GenericRequirement::None },
+    LangItemData { item: LangItem::NonNull, name: "non_null", target: Target::Struct, generics: GenericRequirement::Exact(1) },
     LangItemData { item: LangItem::Drop, name: "drop", target: Target::Trait, generics: GenericRequirement::None },
     LangItemData { item: LangItem::Destruct, name: "destruct", target: Target::Trait, generics: GenericRequirement::None },
     LangItemData { item: LangItem::AsyncDrop, name: "async_drop", target: Target::Trait, generics: GenericRequirement::None },
@@ -518,7 +524,7 @@ impl LangItems {
     pub fn collect(&mut self, prog: &Program, defs: &[DefId], errors: &mut Vec<String>) {
         for &did in defs {
             let def = prog.def(did);
-            if def.parent == NO_DEF || matches!(def.kind, DefKind::Prim(_)) { continue; }
+            if def.parent == NO_DEF || matches!(def.kind, DefKind::Prim(_) | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Closure | DefKind::Field) { continue; }
             let ast = &prog.files[def.file as usize].ast;
             let item = ast.item(def.item);
             let attrs = if def.kind == DefKind::Variant {
@@ -610,6 +616,7 @@ fn target(prog: &Program, did: DefId) -> Target {
         DefKind::Variant => Target::Variant,
         DefKind::Fn | DefKind::ForeignFn => Target::Fn,
         DefKind::Static | DefKind::ForeignStatic => Target::Static,
+        DefKind::ForeignTy => Target::ForeignTy,
         DefKind::AssocTy => Target::AssocTy,
         DefKind::AssocConst => Target::AssocConst,
         DefKind::AssocFn => {
@@ -655,7 +662,9 @@ mod tests {
 
     #[test]
     fn lang_items_table() {
-        assert_eq!(LANG_ITEM_DATA.len(), 214);
+        // rustc_attr_ir/src/lang_items.rs @8d1a764: N01 replaced FnPtrAddr with FnPtrAsPtr,
+        // FnPtrFromPtr and Code, and added NonNull (all nightly items).
+        assert_eq!(LANG_ITEM_DATA.len(), 217);
         for (i, entry) in LANG_ITEM_DATA.iter().enumerate() {
             assert_eq!(entry.item as usize, i);
             assert_eq!(LangItem::from_name(entry.name), Some(entry.item));

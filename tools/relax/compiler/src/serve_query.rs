@@ -58,8 +58,8 @@ fn signature_args(s: &Session,d: DefId,args: &[TyId]) -> String {
     if let Some(sig) = s.unit.tcx.fn_sig(&s.unit.prog, d) {
         let params = sig.params.iter().map(|t|ty(s,s.unit.tcx.tys.subst(*t,args))).collect::<Vec<_>>().join(", ");
         format!("{}fn {}({}) -> {}",if sig.header.safety == crate::types::Safety::Unsafe { "unsafe " } else { "" },p.name(d),params,ty(s,s.unit.tcx.tys.subst(sig.ret,args)))
-    } else if let Some(t) = s.unit.tcx.const_tys.get(&d) { ty(s,*t) }
-    else if p.def(d).kind == DefKind::TypeAlias { ty(s,s.unit.tcx.alias_ty(&crate::tcx::EvalCx::new(p, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), p,d)) }
+    } else if let Some(t) = s.unit.tcx.const_tys.get(&d) { ty(s,t) }
+    else if p.def(d).kind == DefKind::TypeAlias { ty(s,s.unit.tcx.alias_ty(&crate::tcx::EvalCx::new(p, &s.unit.tcx, crate::tcx::TypingEnv::fully_monomorphized(&p), &crate::tcx::EvalState::new()), p,d)) }
     else { p.def_path(d) }
 }
 fn resolve(p: &Program, scope: u32, path: &str) -> Option<DefId> {
@@ -122,14 +122,28 @@ pub fn schema(s: &mut Session,path: &str) -> Result<String,String> {
         let idef = p.def(imp.def);
         if matches!(p.files[idef.file as usize].ast.item(idef.item).kind,ItemKind::Impl { negative:true,.. }) { continue; }
         let Some(&pattern) = tcx.impl_self.get(&imp.def) else { continue; };
-        let mut binds = vec![None; tcx.impl_generics.get(&imp.def).map_or(0,|env|env.names.len())];
-        let matched = target.is_some_and(|target|tcx.match_ty(&crate::tcx::EvalCx::new(p, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), pattern,target,&mut binds));
-        // The checker deliberately defers Fn-bound obligations and unbound trait arguments
-        // to body inference. A schema has no call-site inference: do not claim these impls.
-        let blanket = matches!(tcx.tys.kind(pattern),TyKind::Param(_)) && matched
-            && binds.iter().all(Option::is_some)
-            && matches!(tcx.evaluate_impl(&crate::tcx::EvalCx::new(p, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), imp.def,&binds), Ok(relax_types::solve::goal::Certainty::Yes));
-        let direct = matches!(tcx.tys.kind(pattern),TyKind::Adt(target,_, _) if *target == d);
+        // rustc_hir_typeck/src/method/probe.rs:2034-2085: instantiate the
+        // impl header, relate Self, and evaluate its predicates in native inference.
+        let env = tcx.param_env(p, d);
+        let infcx = crate::infer::InferCtxt::new(tcx, crate::tcx::TypingMode::PostAnalysis, crate::tcx::TypingEnv::fully_monomorphized(p).limit);
+        let full = infcx.fresh_args_for_item(p, imp.def);
+        let instantiated = tcx.instantiate_ty(p, imp.def, &full, pattern);
+        let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&infcx, p);
+        let matched = target.is_some_and(|target| ocx.eq(&env, instantiated, target).is_ok());
+        for clause in tcx.clauses_of(p, imp.def) {
+            ocx.register_obligation(crate::next_solver::Goal { param_env: env.clone(), predicate: tcx.instantiate_predicate(p, imp.def, &full, &clause) });
+        }
+        let matched = matched && ocx.evaluate_obligations_error_on_ambiguity().is_ok();
+        let mut binds = Vec::new();
+        for arg in &full {
+            match *arg {
+                crate::consts::GenericArg::Type(t) => { let t = infcx.deeply_resolve_ignoring_regions(t); binds.push((!tcx.tys.has_infer(t)).then_some(t)); }
+                crate::consts::GenericArg::Const(c) => { let t = infcx.deeply_resolve_ignoring_regions(tcx.tys.intern(TyKind::Const(c))); binds.push((!tcx.tys.has_infer(t)).then_some(t)); }
+                crate::consts::GenericArg::Lifetime(_) => {}
+            }
+        }
+        let blanket = matches!(tcx.tys.kind(pattern), TyKind::Param(_)) && matched && binds.iter().all(Option::is_some) && tcx.impl_trait.contains_key(&imp.def);
+        let direct = matches!(tcx.tys.kind(pattern),TyKind::Adt(target,_, _) if *target == d) && matched;
         if direct || blanket {
             let args: Vec<_> = binds.into_iter().enumerate().map(|(i,t)|t.unwrap_or_else(||tcx.tys.intern(TyKind::Param(i as u32)))).collect();
             if let Some(tr) = tcx.impl_trait.get(&imp.def) { traits.push(p.def_path(*tr)); }
@@ -214,8 +228,8 @@ pub fn position(s: &mut Session,path: &str,params: &Json,only: bool) -> Result<S
         // J2 intentionally trims body tables. Recheck exactly the enclosing function, with
         // its generic identity arguments; speculative query diagnostics stay private.
         let state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(p, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-        let body = s.unit.tcx.with_errors(&cx, ||crate::typeck::check_fn(&cx,p,&s.unit.tcx,*owner,&args)).0;
+        let cx = crate::tcx::EvalCx::new(p, &s.unit.tcx, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
+        let body = s.unit.tcx.with_errors(&cx, ||crate::typeck::instantiate_body(&cx,p,&s.unit.tcx,*owner,&args)).0;
         let pf = &p.files[body.file as usize];
         let local = |index: u32| -> String {
             let l = &body.locals[index as usize];
@@ -245,7 +259,7 @@ pub fn position(s: &mut Session,path: &str,params: &Json,only: bool) -> Result<S
                                     let Some((method,args)) = body.ov_derefs.get(&(id.0,step)) else { break; };
                                     let Some(sig) = s.unit.tcx.fn_sig(&s.unit.prog, *method) else { break; };
                                     let ret = s.unit.tcx.tys.subst(sig.ret,args);
-                                    match s.unit.tcx.tys.kind(ret) { TyKind::Ref(_,inner, _) => s.unit.tcx.normalize(&cx,p,*inner), _ => break }
+                                    match s.unit.tcx.tys.kind(ret) { TyKind::Ref(_,inner, _) => s.unit.tcx.try_normalize_erasing_regions(p,cx.typing_env,*inner).unwrap_or(*inner), _ => break }
                                 }
                             };
                         }

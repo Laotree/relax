@@ -1,18 +1,29 @@
+// ported from N:rustc_hir_typeck/src/callee.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/method/mod.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/fn_ctxt/_impl.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/lib.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/upvar.rs @8d1a764
+// ported from N:rustc_hir_typeck/src/closure.rs @8d1a764
 // ported from compiler/rustc_trait_selection/src/traits/project.rs @8d1a764
-//! Type checking of one function instance. Generic functions are checked per
-//! instance with concrete type arguments (rustc already proved the bounds; the
-//! dialect is valid Rust), so every body Relax lowers is fully monomorphic.
-//! Inference is forward with local unification variables (dialect rule R4).
+//! Definition-owned type checking under the declared parameter environment.
 
-use crate::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
+use crate::next_solver::{Goal, Predicate, PredicateKind, ClauseKind, AliasTerm, Term};
+use crate::next_solver::select::ImplSource;
 use crate::ast::*;
 use crate::program::{DefId, DefKind, Prim, Program, Sym, NO_DEF};
 use crate::tcx::{ty_key, FnSigT, GenEnv, Tcx, TyKey};
-use crate::types::{Abi, FnHeader, Safety, TyId, TyKind, UniverseIndex};
+use crate::types::{Abi, FnHeader, Safety, TyId, TyKind};
 use crate::fxhash::HashMap;
 
+mod probe;
 mod closure;
+mod writeback;
+mod opaque_types;
 mod call;
+mod checks;
+mod instantiate;
 pub use call::CallTrait;
 pub use closure::ClosureSignatures;
 
@@ -29,7 +40,7 @@ pub enum Res {
 pub struct MethodRes {
     pub def: DefId,
     /// number of derefs applied to the receiver before the call
-    pub derefs: u8,
+    pub derefs: usize,
     /// 0 none, 1 `&`, 2 `&mut`
     pub autoref: u8,
     /// full generic args (impl params then method params)
@@ -57,7 +68,7 @@ pub enum Coerce {
     ToDyn(TyId, TyId),
     /// `&A -> &B` through n autoderef steps (`&String -> &str`, `&Vec<T> -> &[T]`); overloaded
     /// steps are recorded in ov_derefs under (expr | DEREF_COERCE_KEY, step)
-    DerefRef(u8),
+    DerefRef(usize),
     /// trait object upcasting `&dyn Sub -> &dyn Super` (also Box/Rc/raw pointers): the vtable
     /// pointer becomes Sub's stored vtable for Super (rustc vtable_trait_upcasting_coercion_new_vptr_slot):
     /// (source dyn type, target dyn type)
@@ -69,6 +80,7 @@ pub const DEREF_COERCE_KEY: u32 = 0x8000_0000;
 /// ids are separate arenas (`<i32 as Foo>::NUM =>` needs Self = i32 to pick the impl's const)
 pub const PAT_KEY: u32 = 0x4000_0000;
 
+#[derive(Clone)]
 pub struct Local {
     pub name: Sym,
     pub ty: TyId,
@@ -83,15 +95,19 @@ pub enum ExpectedClosureKind {
     FnOnce,
 }
 
-/// Results of type checking one function instance.
+/// Results of type checking a definition, including its nested closures.
+#[derive(Clone)]
 pub struct Body {
     pub def: DefId,
     pub args: Vec<TyId>,
     pub file: u32,
     pub expr_lo: u32,
     pub expr_ty: Vec<TyId>,
+    /// Presence in nightly TypeckResults::node_types: arena holes are not error types.
+    pub expr_typed: Vec<bool>,
     pub pat_lo: u32,
     pub pat_ty: Vec<TyId>,
+    pub pat_typed: Vec<bool>,
     /// a lazily parsed body's nodes (ParsedFile::part) follow the item's own range in
     /// expr_ty / pat_ty: their first ids (u32::MAX: none) and the item range's lengths
     pub expr_lo2: u32,
@@ -109,14 +125,15 @@ pub struct Body {
     /// Reference coercions, including equal-type reborrows (rustc coerce_to_ref).
     pub reborrows: HashMap<u32, bool>,
     pub min_captures: HashMap<u32, crate::upvar::ClosureCaptures>,
-    pub field_idx: HashMap<u32, (u8, u32)>,
+    pub hidden_types: HashMap<DefId, TyId>,
+    pub field_idx: HashMap<u32, (usize, u32)>,
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
     pub field_uses: Vec<(DefId, u32)>,
     /// Resolved definitions read while checking; deduplicated by the warm session.
     pub dependencies: Vec<DefId>,
     /// overloaded deref steps: (expr, step index) -> `Deref::deref` with [Self]
-    pub ov_derefs: HashMap<(u32, u8), (DefId, Vec<TyId>)>,
+    pub ov_derefs: HashMap<(u32, usize), (DefId, Vec<TyId>)>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
     pub ov_index: HashMap<u32, (DefId, Vec<TyId>)>,
     /// Every checked `for` head -> `Iterator::next` with [Iter].
@@ -124,24 +141,25 @@ pub struct Body {
     /// Every checked `for` head -> (`IntoIterator::into_iter`, [Self], iterator type).
     /// The head is passed by value with identity adjustment (no method receiver coercion).
     pub for_into: HashMap<u32, (DefId, Vec<TyId>, TyId)>,
-    pub index_derefs: HashMap<u32, u8>,
+    pub index_derefs: HashMap<u32, usize>,
     /// call expr -> deref steps from the callee expression to the callable
-    pub call_derefs: HashMap<u32, u8>,
+    pub call_derefs: HashMap<u32, usize>,
     /// Fn-family selection in the generic body, before instance substitution.
     pub call_traits: HashMap<u32, CallTrait>,
     /// calls of `#[rustc_legacy_const_generics]` fns: the argument positions that are const
     /// generic args (not passed as values)
     pub legacy_args: HashMap<u32, Vec<u32>>,
     /// match ergonomics: pattern -> references peeled before matching it
-    pub pat_derefs: HashMap<u32, u8>,
+    pub pat_derefs: HashMap<u32, usize>,
     /// identifier patterns bound by reference through the default binding mode (1 ref, 2 ref mut)
     pub pat_bind_ref: HashMap<u32, u8>,
     /// Semantic discriminant reads of constructor patterns, including irrefutable
     /// patterns of enums with uninhabited variants (ExprUseVisitor::walk_pat).
     /// These are capture uses even when runtime lowering needs no discriminant test.
     pub pat_discriminant_reads: HashMap<u32, ()>,
-    /// `x?` expr -> the error conversion (`From::from` def, [target, source]) when needed
-    pub try_conv: HashMap<u32, Option<(DefId, Vec<TyId>)>>,
+    /// The two lang-item calls of the `?` desugaring, with their inferred types.
+    pub try_branch: HashMap<u32, (DefId, Vec<TyId>, TyId)>,
+    pub try_from_residual: HashMap<u32, (DefId, Vec<TyId>)>,
     pub locals: Vec<Local>,
     pub param_pats: Vec<PatId>,
     pub ret: TyId,
@@ -156,15 +174,15 @@ pub struct Body {
     /// PolyFnSig and the signature used inside each closure body.
     pub closure_sigs: HashMap<u32, ClosureSignatures>,
     pub inline_const_types: HashMap<u32, TyId>,
-    /// Derived root-slot lowering view of `min_captures`: ownership per `closure_locals`.
-    pub capture_by_value: HashMap<u32, Vec<bool>>,
-    /// Derived root-slot lowering view: top-level fields owned by each root slot.
-    /// None means the whole root; precise places remain in `min_captures`.
-    pub capture_fields: HashMap<u32, Vec<Option<Vec<u32>>>>,
     /// `S { a: 1, .. }` (bare `..`): struct literal expr -> (field index, the const holding the
     /// field's declared default) for every omitted field (rustc default_field_values)
     pub struct_defaults: HashMap<u32, Vec<(u32, DefId)>>,
     pub errors: Vec<String>,
+    /// A failed check's lookups that missed in modules the lazy Rust selection skipped
+    /// (program.rs note_deferred_miss): every reader of the cached result notes them again, so
+    /// the build that fails on it defers to the post-boot loader (jit.rs DEFERRED_RETRY) like
+    /// the run that computed it. Loading a module republishes declarations, which recomputes it.
+    pub deferred_misses: Vec<(u32, String)>,
     /// the where-clauses of a body checked polymorphically (its ParamEnv): the borrow checker
     /// answers impl queries on its params with it too (`DerefMut` of `D: DerefMut<Target = X>`)
     pub param_env: Option<crate::tcx::ParamEnvId>,
@@ -179,8 +197,10 @@ impl Body {
             file,
             expr_lo: 0,
             expr_ty: Vec::new(),
+            expr_typed: Vec::new(),
             pat_lo: 0,
             pat_ty: Vec::new(),
+            pat_typed: Vec::new(),
             expr_lo2: u32::MAX,
             expr_n1: 0,
             pat_lo2: u32::MAX,
@@ -194,6 +214,7 @@ impl Body {
             coerce: HashMap::default(),
             reborrows: HashMap::default(),
             min_captures: HashMap::default(),
+            hidden_types: HashMap::default(),
             field_idx: HashMap::default(),
             field_uses: Vec::new(),
             dependencies: Vec::new(),
@@ -208,7 +229,8 @@ impl Body {
             pat_derefs: HashMap::default(),
             pat_bind_ref: HashMap::default(),
             pat_discriminant_reads: HashMap::default(),
-            try_conv: HashMap::default(),
+            try_branch: HashMap::default(),
+            try_from_residual: HashMap::default(),
             locals: Vec::new(),
             param_pats: Vec::new(),
             ret: unit,
@@ -219,10 +241,9 @@ impl Body {
             closure_expected_kinds: HashMap::default(),
             closure_sigs: HashMap::default(),
             inline_const_types: HashMap::default(),
-            capture_by_value: HashMap::default(),
-            capture_fields: HashMap::default(),
             struct_defaults: HashMap::default(),
             errors: Vec::new(),
+            deferred_misses: Vec::new(),
             param_env: None,
         }
     }
@@ -281,22 +302,16 @@ impl Body {
             let buckets = if c < 4 { 4 } else if c < 8 { 8 } else { (c * 8 / 7).next_power_of_two() };
             buckets * (std::mem::size_of::<(K, V)>() + 1) + 16
         }
-        let mut n = v(&self.args) + v(&self.expr_ty) + v(&self.pat_ty) + m(&self.res) + m(&self.res_args) + m(&self.pat_res) + m(&self.pat_local) + m(&self.methods) + m(&self.binops) + m(&self.coerce) + m(&self.reborrows) + m(&self.min_captures) + m(&self.field_idx) + v(&self.field_uses) + v(&self.dependencies) + m(&self.ov_derefs) + m(&self.ov_index) + m(&self.for_next) + m(&self.for_into) + m(&self.index_derefs) + m(&self.call_derefs) + m(&self.call_traits) + m(&self.legacy_args) + m(&self.pat_derefs) + m(&self.pat_bind_ref) + m(&self.pat_discriminant_reads) + m(&self.try_conv) + v(&self.locals) + v(&self.param_pats) + m(&self.fmt_named) + v(&self.closures) + m(&self.closure_locals) + m(&self.closure_expected_kinds) + m(&self.closure_sigs) + m(&self.inline_const_types) + m(&self.capture_by_value) + m(&self.capture_fields) + m(&self.struct_defaults) + v(&self.errors);
+        let mut n = v(&self.args) + v(&self.expr_ty) + v(&self.pat_ty) + m(&self.res) + m(&self.res_args) + m(&self.pat_res) + m(&self.pat_local) + m(&self.methods) + m(&self.binops) + m(&self.coerce) + m(&self.reborrows) + m(&self.min_captures) + m(&self.field_idx) + v(&self.field_uses) + v(&self.dependencies) + m(&self.ov_derefs) + m(&self.ov_index) + m(&self.for_next) + m(&self.for_into) + m(&self.index_derefs) + m(&self.call_derefs) + m(&self.call_traits) + m(&self.legacy_args) + m(&self.pat_derefs) + m(&self.pat_bind_ref) + m(&self.pat_discriminant_reads) + m(&self.try_branch) + m(&self.try_from_residual) + v(&self.locals) + v(&self.param_pats) + m(&self.fmt_named) + v(&self.closures) + m(&self.closure_locals) + m(&self.closure_expected_kinds) + m(&self.closure_sigs) + m(&self.inline_const_types) + m(&self.struct_defaults) + v(&self.errors);
         n += self.res_args.values().map(v).sum::<usize>() + self.methods.values().chain(self.binops.values()).map(|x| v(&x.args)).sum::<usize>();
         n += self.ov_derefs.values().chain(self.ov_index.values()).chain(self.for_next.values()).map(|x| v(&x.1)).sum::<usize>() + self.for_into.values().map(|x| v(&x.1)).sum::<usize>();
-        n += self.legacy_args.values().map(v).sum::<usize>() + self.try_conv.values().map(|x| x.as_ref().map_or(0, |x| v(&x.1))).sum::<usize>();
-        n += self.closure_locals.values().map(v).sum::<usize>() + self.capture_by_value.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
-        n += self.capture_fields.values().map(|x| v(x) + x.iter().map(|y| y.as_ref().map_or(0, v)).sum::<usize>()).sum::<usize>();
+        n += self.legacy_args.values().map(v).sum::<usize>();
+        n += self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
+        n += self.try_branch.values().map(|x| v(&x.1)).sum::<usize>() + self.try_from_residual.values().map(|x| v(&x.1)).sum::<usize>();
         n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors)).sum::<usize>();
         n += self.errors.iter().map(|e| e.capacity()).sum::<usize>();
         n
     }
-}
-
-#[derive(Clone, Copy)]
-enum VarSt {
-    Free(u8), // 0 general, 1 int, 2 float
-    Bound(TyId),
 }
 
 struct Loop {
@@ -306,21 +321,9 @@ struct Loop {
     is_loop: bool,
 }
 
-#[derive(Clone)]
-struct PendingGoal {
-    goal: crate::solve::goal::Goal,
-    lo: u32,
-    certainty: crate::solve::goal::Certainty,
-    // rustc_trait_selection/src/traits/fulfill.rs:327-365 retries stalled goals
-    // only when their inputs change. Captures and hidden types are published separately
-    // from inference variables here, so publication must also wake these goals.
-    stalled: Option<(crate::solve::goal::Goal, u64)>,
-}
-
-impl PendingGoal {
-    fn is_stalled(&self, goal: &crate::solve::goal::Goal, revision: u64) -> bool {
-        matches!(&self.stalled, Some((previous, seen)) if previous == goal && *seen == revision)
-    }
+struct FcxSnapshot {
+    inference: crate::infer::snapshot::CombinedSnapshot,
+    fulfillment: crate::next_solver::fulfill::FulfillmentCtxt,
 }
 
 pub struct Fcx<'a> {
@@ -330,22 +333,14 @@ pub struct Fcx<'a> {
     file: u32,
     module: u32,
     env: GenEnv,
-    inst_args: Vec<TyId>,
     b: Body,
     scopes: Vec<(Sym, u32)>,
     /// per local (by index): its hygiene context and the source position of its binding
     /// (u32::MAX context: `self`, matched by any use)
     local_hyg: Vec<(Option<crate::parser::HygCtxt>, u32)>,
-    vars: Vec<VarSt>,
-    /// Root metadata, restored with bindings; rustc_infer/src/infer/type_variable.rs:389.
-    var_universes: Vec<UniverseIndex>,
-    /// Monotonic while allocations survive rollback, like this context's vars.
-    /// T-infer owns full snapshot rollback of allocations and universes together.
-    universe: UniverseIndex,
-    /// Existing shared-allocator region variables are ROOT; only explicit
-    /// canonical allocations need an entry. Resolution/constraints belong to T-infer.
-    region_universes: HashMap<u32, UniverseIndex>,
-    region_vars: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    infcx: crate::infer::InferCtxt<'a>,
+    fulfillment_cx: crate::next_solver::fulfill::FulfillmentCtxt,
+    param_env: crate::next_solver::ParamEnv,
     loops: Vec<Loop>,
     in_loop_condition: bool,
     diverges: bool,
@@ -368,53 +363,49 @@ pub struct Fcx<'a> {
     /// calls whose Fn-bounded argument's type was still open when the call was checked
     /// (`parallel_for(tasks)` with `tasks` collected later): their Fn bounds are applied again
     /// at the end (rustc keeps the `F: FnOnce() -> R` obligation pending)
-    pending_goals: Vec<PendingGoal>,
-    /// Registered direct Fn-family projections, in obligation order: (Self, PolyFnSig).
-    fn_expectations: Vec<(TyId, TyId, crate::upvar::ClosureKind)>,
-    /// `?` in a closure / async block whose return type was open: (the `?` expr, its error type,
-    /// the return type's error type) -- converted through From once the body fixed the latter
-    pending_tries: Vec<(u32, TyId, TyId, TyId)>,
     /// type of a synthesized trailing method argument (consumed by the next method check)
     extra_arg: Option<TyId>,
     /// Postorder closure analysis, after body inference and before upvar tuples are fixed.
     pending_captures: Vec<crate::upvar::PendingCapture>,
+    deferred_call_resolutions: Vec<call::DeferredCallResolution>,
+    deferred_sized_obligations: Vec<(TyId, u32)>,
+    checked_opaque_types_storage_entries: Option<crate::infer::opaque_types::OpaqueTypeStorageEntries>,
     expected_closure_kinds: HashMap<u32, crate::upvar::ClosureKind>,
     /// position of the expression checked last (patterns have no spans of their own)
     last_lo: u32,
     /// traits of the body's generic bounds (and its trait), with supertraits: in scope for
     /// method calls (computed on first use)
-    bound_traits: Option<crate::fxhash::HashSet<DefId>>,
     /// trait args of the next trait method call, fixed by a generic bound
-    known_targs: Option<Vec<TyId>>,
-    /// this body's own return-position `impl Trait` types and the inference variables standing
-    /// for their hidden types while it is checked (rustc replace_opaque_types_with_inference_vars)
-    opaque_vars: Vec<(TyId, TyId)>,
+    known_method_args: Option<Vec<crate::consts::GenericArg>>,
+    /// The written lifetime arguments of the value path being resolved.
+    value_path_lifetimes: Vec<crate::types::RegionId>,
+    /// The impl's lifetime args of an inherent associated value path (confirm.rs
+    /// fresh_receiver_args): the item's FnDef carries them, not fresh ones.
+    value_path_parent_regions: Vec<crate::types::RegionId>,
     /// `[x; N]` expressions whose `Copy` check waits for the end of the body (rustc
     /// deferred_repeat_expr_checks): (element, element type, the array type)
     deferred_repeats: Vec<(ExprId, TyId, TyId)>,
     /// the probe picked a by-value method of `&U` for receiver U: autoref it
     forced_autoref: Option<u8>,
-    /// every variable binding with the previous state (snapshots roll back through it)
-    undo: Vec<(u32, VarSt, UniverseIndex)>,
-    /// Alias equations emitted by the shared relation, with their source offset.
-    /// Candidate confirmation reads equations since its snapshot as nested goals;
-    /// body checking transfers them to pending_goals. MAX undo entries pop them.
-    projection_relations: Vec<(TyId, TyId, u32)>,
     /// the expected type of the method call being checked (check_method's expectation)
     method_expected: Option<TyId>,
-    /// finishing: opaque types are revealed to their hidden types (codegen's view)
-    revealing: bool,
     /// coercions to a `dyn` pointer whose source pointee was still open: (expr, actual,
     /// expected, pos), decided in `finish`
     deferred_dyn: Vec<(ExprId, TyId, TyId, u32)>,
-    /// pointer casts whose target pointee was open: (operand, its type, target type)
+    /// Reference-to-pointer casts and casts whose target pointee was open.
     deferred_casts: Vec<(ExprId, TyId, TyId)>,
     /// inference variables a `!` value was coerced to (rustc diverging type variables): left
     /// unconstrained, they fall back to `()` (`!` from edition 2024) at the end
     diverging: Vec<TyId>,
 }
 
-pub fn check_fn(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
+pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
+    try_instantiate_body(cx, prog, tcx, def, args).expect("failed to normalize body for codegen")
+}
+
+/// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
+/// is a result for consumers that cannot require a fully monomorphic instance.
+pub(crate) fn try_instantiate_body(_cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -442,18 +433,22 @@ pub fn check_fn(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: Def
     let _cost_typeck = crate::fncost::phase(1);
     let cost_start = if crate::fncost::enabled() { (crate::fncost::mono(), crate::clock::cpu_ns()) } else { (0, 0) };
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
-    let b = match crate::tytemplate::instance(cx, prog, tcx, def, args) {
-        Some(b) => b,
-        None => check_fn_uncached(cx, prog, tcx, def, args),
-    };
+    let body = tcx.typeck(prog, def);
+    // rustc_middle/src/ty/instance.rs:955-990: every codegen consumer crosses
+    // the PostAnalysis boundary, including non-generic and identity instances.
+    let b = instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, &body, args)?;
     if crate::fncost::enabled() {
         crate::fncost::type_detail(def.0, &args.iter().map(|a| a.0).collect::<Vec<_>>(), b.expr_ty.len(), &prog.def_path(def), cost_start.0, cost_start.1);
     }
-    b
+    Ok(b)
 }
 
-/// check_fn without templates (the template itself is checked this way).
-pub fn check_fn_uncached(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
+/// rustc_hir_typeck/src/lib.rs:110-148: one inference context for the root body.
+pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
+    let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
+    let args = tcx.generic_indices_of(prog, def).identity_types_consts(&tcx.tys);
+    let state = crate::tcx::EvalState::new();
+    let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
     static ST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let st = *ST.get_or_init(|| std::env::var("RELAX_TYSTATS").is_ok());
     let t0 = if st { crate::clock::cpu_ns() } else { 0 };
@@ -461,9 +456,7 @@ pub fn check_fn_uncached(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx,
         let args: Vec<_> = args.iter().map(|t| ty_to_string(false, prog, tcx, *t)).collect();
         if args.is_empty() { prog.def_path(def) } else { format!("{}<{}>", prog.def_path(def), args.join(", ")) }
     }));
-    cx.state.typeck_inprog.borrow_mut().push(def);
-    let b = check_fn_body(cx, prog, tcx, def, args);
-    cx.state.typeck_inprog.borrow_mut().pop();
+    let b = check_fn_body(&cx, prog, tcx, def, &args);
     if st {
         eprintln!("TYS\t{}\t{}\t{}\t{}\t{}\t{:?}\t{}", def.0, args.len(), crate::clock::cpu_ns() - t0, b.expr_ty.len(), prog.def_path(def), args.iter().map(|a| a.0).collect::<Vec<u32>>(), crate::clock::TYS_ORIGIN.with(|o| o.get()));
     }
@@ -506,7 +499,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             rustc_promotable: false,
             header: FnHeader::RUST,
             track_caller: false,
-            legacy_const: Vec::new(),
+            target_features: Vec::new(),
+            safe_target_features: false,
         },
     };
     let n_expr1 = ranges[1] - ranges[0];
@@ -514,6 +508,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     let n_expr = (n_expr1 + ranges2.map_or(0, |r| r[1] - r[0])) as usize;
     let n_pat = (n_pat1 + ranges2.map_or(0, |r| r[3] - r[2])) as usize;
     let error = tcx.tys.error;
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) }, def);
+
     let mut fcx = Fcx {
         cx: cx.body(),
         prog,
@@ -521,15 +517,16 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         file,
         module: d.scope,
         env,
-        inst_args: args.to_vec(),
         b: Body {
             def,
             args: args.to_vec(),
             file,
             expr_lo: ranges[0],
             expr_ty: vec![error; n_expr],
+            expr_typed: vec![false; n_expr],
             pat_lo: ranges[2],
             pat_ty: vec![error; n_pat],
+            pat_typed: vec![false; n_pat],
             expr_lo2: ranges2.map_or(u32::MAX, |r| r[0]),
             expr_n1: n_expr1,
             pat_lo2: ranges2.map_or(u32::MAX, |r| r[2]),
@@ -543,6 +540,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             coerce: HashMap::default(),
             reborrows: HashMap::default(),
             min_captures: HashMap::default(),
+            hidden_types: HashMap::default(),
             field_idx: HashMap::default(),
             field_uses: Vec::new(),
             dependencies: Vec::new(),
@@ -554,7 +552,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             call_derefs: HashMap::default(),
             call_traits: HashMap::default(),
             legacy_args: HashMap::default(),
-            try_conv: HashMap::default(),
+            try_branch: HashMap::default(),
+            try_from_residual: HashMap::default(),
             pat_derefs: HashMap::default(),
             pat_bind_ref: HashMap::default(),
             pat_discriminant_reads: HashMap::default(),
@@ -568,19 +567,16 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             closure_expected_kinds: HashMap::default(),
             closure_sigs: HashMap::default(),
             inline_const_types: HashMap::default(),
-            capture_by_value: HashMap::default(),
-            capture_fields: HashMap::default(),
             struct_defaults: HashMap::default(),
             errors: tcx.signature_errors(prog, def).to_vec(),
+            deferred_misses: Vec::new(),
             param_env: None,
         },
         scopes: Vec::new(),
         local_hyg: Vec::new(),
-        vars: Vec::new(),
-        var_universes: Vec::new(),
-        universe: UniverseIndex::ROOT,
-        region_universes: HashMap::default(),
-        region_vars: Default::default(),
+        fulfillment_cx: crate::next_solver::fulfill::FulfillmentCtxt::new(&infcx),
+        infcx,
+        param_env: Default::default(),
         loops: Vec::new(),
         in_loop_condition: false,
         diverges: false,
@@ -595,29 +591,26 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         deferred_casts: Vec::new(),
         bind_mode: 0,
         pat_path_pre: None,
-        pending_goals: Vec::new(),
-        fn_expectations: Vec::new(),
-        pending_tries: Vec::new(),
         extra_arg: None,
         pending_captures: Vec::new(),
+        deferred_call_resolutions: Vec::new(),
+        deferred_sized_obligations: Vec::new(),
+        checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
         last_lo: 0,
-        bound_traits: None,
-        known_targs: None,
-        opaque_vars: Vec::new(),
+        known_method_args: None,
+        value_path_lifetimes: Vec::new(),
+        value_path_parent_regions: Vec::new(),
         deferred_repeats: Vec::new(),
         forced_autoref: None,
-        undo: Vec::new(),
-        projection_relations: Vec::new(),
         method_expected: None,
-        revealing: false,
     };
     fcx.init_body_regions();
-    // a body checked polymorphically (its own params as args): its where-clauses answer impl
-    // queries on params and projections (trait selection), for the body's duration
-    let penv = tcx.intern_param_env(if args.iter().any(|a| matches!(tcx.tys.kind(*a), TyKind::Param(_))) || (args.is_empty() && tcx.fn_ty_bounds(prog, def).is_some()) { fcx.param_env_entries() } else { Default::default() });
+    let declaration_env = tcx.param_env(prog, def);
+    fcx.param_env = declaration_env;
     // (also an empty one: a body checked inside another's check never sees the outer's env)
-    fcx.cx.typing_env = crate::tcx::TypingEnv { param_env: penv, mode: crate::tcx::TypingMode::Analysis { defining_opaques: tcx.intern_defining_opaques(vec![def]) } };
+    let penv = tcx.intern_param_env(fcx.param_env.clone());
+    fcx.cx.typing_env = crate::tcx::TypingEnv { limit: fcx.infcx.recursion_limit, param_env: penv, mode: crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) } };
     if penv != crate::tcx::ParamEnvId::EMPTY {
         fcx.b.param_env = Some(penv);
     }
@@ -626,29 +619,50 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         // the signature's own error is the root cause; checking the body would only cascade
         let lo = prog.files[file as usize].ast.item(d.item).lo;
         fcx.err(lo, "signature has unresolved types -- fix the signature errors first".to_string());
-        return fcx.b;
+        return fcx.into_body();
     }
     // the body defines its own opaque return types: checked against inference variables
     // whose values become the hidden types (rustc check_fn / replace_opaque_types_with_inference_vars)
-    let ret = fcx.define_opaques(def, ret);
+    let ret = fcx.norm(ret);
     fcx.b.ret = ret;
     fcx.ret_stack.push(ret);
     let ast = &prog.files[file as usize].ast;
+    if d.kind == DefKind::AnonConst {
+        // rustc_hir_typeck/src/lib.rs: check the anonymous constant's own body.
+        let init = crate::const_eval::const_body(prog, def).expect("anonymous const body");
+        let ct = tcx.tys.subst(tcx.type_of(prog, def).expect("anonymous const type"), args);
+        // hir_typeck lib.rs:194-206: normalized, well formed and Sized (SizedConstOrStatic)
+        let ct = fcx.norm(ct);
+        fcx.register_wf(ct, ast.expr(init).lo);
+        if let Some(sized) = fcx.tcx.lang_items.get(crate::lang_items::LangItem::Sized) {
+            let goal = fcx.trait_goal(sized, ct, &[]);
+            fcx.register_goal(goal, ast.expr(init).lo);
+        }
+        fcx.b.ret = ct;
+        fcx.ret_stack.push(ct);
+        let t = fcx.check_expr(init, Some(ct));
+        fcx.coerce_or_unify(t, ct, Some(init), ast.expr(init).lo);
+        fcx.finish();
+        return fcx.into_body();
+    }
     let (fsig, body) = match &ast.item(d.item).kind {
         ItemKind::Fn(s, b, _) => (ast.fn_sig(*s), b.or_else(|| prog.fn_body(file, d.item).ok().flatten())),
         ItemKind::Const(_, Some(init)) | ItemKind::Static(_, _, Some(init)) => {
             let init = &prog.const_body(file, d.item).expect("body_ranges validated initializer").unwrap_or(*init);
             // const/static initializer: checked against the declared type
-            let ct = fcx.tcx.const_tys.get(&def).copied().unwrap_or(error);
-            let ct = fcx.tcx.tys.subst_for_inference(ct, args);
+            let ct = fcx.tcx.const_tys.get(&def).unwrap_or(error);
+            let ct = fcx.tcx.tys.subst(ct, args);
+            // hir_typeck lib.rs:194-198: the normalized expected type is well formed
+            let ct = fcx.norm(ct);
+            fcx.register_wf(ct, ast.expr(*init).lo);
             fcx.b.ret = ct;
             fcx.ret_stack.push(ct);
             let t = fcx.check_expr(*init, Some(ct));
             fcx.coerce_or_unify(t, ct, Some(*init), ast.expr(*init).lo);
             fcx.finish();
-            return fcx.b;
+            return fcx.into_body();
         }
-        _ => return fcx.b,
+        _ => return fcx.into_body(),
     };
     let mut pi = 0;
     if fsig.self_param.is_some() {
@@ -672,15 +686,14 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         // the future); the declared return type is its output, the opaque's hidden type the
         // coroutine
         fcx.b.body = Some(bid);
+        // The declared output is under the signature's binder: liberate its late-bound
+        // regions as the inputs are (closure.rs:201-231 liberated_sig), then normalize.
         let out = match fcx.tcx.async_fns.get(&def) {
-            Some(o) => {
-                let o = fcx.tcx.tys.subst_for_inference(o, args);
-                fcx.tcx.normalize_for_inference(&fcx.cx, prog, o)
-            }
+            Some(o) => fcx.liberated_signature_output(&sig, o, args),
             None => error,
         };
         // `async fn f() -> impl Tr`: the output's own opaque types are defined by this body too
-        let out = fcx.define_opaques(def, out);
+        let out = fcx.norm(out);
         let ce = crate::tcx::ASYNC_FN_BODY | bid.0;
         let caps: Vec<u32> = (0..fcx.b.locals.len() as u32).collect();
         let saved = fcx.scopes.len();
@@ -698,7 +711,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         let points = fcx.await_count;
         fcx.b.closure_locals.insert(ce, caps.clone());
         let ct = fcx.coroutine_type(ce, bid, caps, false, false, out, points);
-        fcx.unify(ret, ct);
+        fcx.eq(ret, ct);
     } else if let Some(bid) = body {
         fcx.b.body = Some(bid);
         let t = fcx.check_block(bid, Some(ret));
@@ -709,10 +722,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             // tail; `panic!(); MyStruct` defines `impl MyTrait` as MyStruct)
             let st = fcx.shallow(t);
             if !matches!(fcx.tcx.tys.kind(st), TyKind::Never) {
-                let save = fcx.snapshot();
-                if !fcx.try_coerce(t, ret, None) {
-                    fcx.rollback(save);
-                }
+                let save = fcx.start_snapshot();
+                if !fcx.try_coerce(t, ret, None) { fcx.rollback_to(save); } else { fcx.commit_from(save); }
             }
             // a body that only diverges (`fn f() -> impl Sized { todo!() }`): the return type's
             // still-open variable falls back like any variable a `!` flowed into
@@ -722,119 +733,33 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             }
         }
     }
-    fcx.opaque_item_bounds();
     fcx.finish();
-    fcx.b
-}
-
-/// `t` with every opaque type replaced by its hidden type (rustc Reveal::All, used by codegen):
-/// the hidden type of an instance comes from type checking the defining fn with its args, an
-/// RPITIT's from the impl method the call resolves to.
-pub fn reveal(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, t: TyId) -> TyId {
-    let mut t = t;
-    for _ in 0..8 {
-        if !tcx.tys.has_opaque(t) {
-            break;
-        }
-        let mut os = Vec::new();
-        tcx.tys.opaques_in(t, &mut os);
-        let mut pairs = Vec::new();
-        for o in os {
-            let h = hidden_of(cx, prog, tcx, o);
-            pairs.push((o, h));
-        }
-        let r = tcx.tys.replace(t, &pairs);
-        t = tcx.normalize_for_inference(cx, prog, r);
-    }
-    tcx.tys.erase_regions(t)
-}
-
-fn hidden_of(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, o: TyId) -> TyId {
-    if let Some(h) = tcx.opaque_hidden.get(&o) {
-        return h;
-    }
-    let ik = o;
-    let (d, args) = match tcx.tys.kind(o).clone() {
-        TyKind::Opaque(d, _, args, _) => (d, args),
-        _ => return o,
-    };
-    // rustc_trait_selection/select/mod.rs:2432-2437 queries type_of_opaque.
-    // An active defining body must publish its own hidden type; re-entering it
-    // here would turn an ordinary stalled auto-trait goal into a query cycle.
-    if cx.state.opaque_inprog.borrow().contains(&ik) || cx.state.typeck_inprog.borrow().contains(&d) {
-        return o;
-    }
-    let error = tcx.tys.error;
-    // an instance whose args are still being inferred (a caller's variables) or generic
-    // cannot be revealed; it stays opaque (the caller reports what it cannot infer)
-    if args.iter().any(|a| tcx.tys.has_infer(*a) || tcx.tys.has_error(*a)) {
-        return o;
-    }
-    cx.state.opaque_inprog.borrow_mut().insert(ik);
-    if prog.def(prog.def(d).parent).kind == DefKind::Trait {
-        // RPITIT: the impl's method returns the type at the same place of its signature
-        let (m, margs) = match tcx.resolve_trait_method(cx, prog, d, &args) {
-            crate::tcx::MethodResolution::Resolved(def, args) => (def, args),
-            crate::tcx::MethodResolution::Ambiguous(..) | crate::tcx::MethodResolution::NoSolution(_) => {
-                cx.state.opaque_inprog.borrow_mut().remove(&ik);
-                return o;
-            }
-        };
-        if m != d {
-            let (tr, ir) = match (tcx.fn_sig(prog, d), tcx.fn_sig(prog, m)) {
-                (Some(a), Some(b)) => (a.ret, b.ret),
-                _ => {
-                    cx.state.opaque_inprog.borrow_mut().remove(&ik);
-                    tcx.opaque_hidden.insert(o, error);
-                    return error;
-                }
-            };
-            let tr = tcx.tys.subst_for_inference(tr, &args);
-            let ir = tcx.tys.subst_for_inference(ir, &margs);
-            let ir = tcx.normalize_for_inference(cx, prog, ir);
-            let h = match type_at(tcx, tr, ir, o) {
-                Some(x) => reveal(cx, prog, tcx, x),
-                None => error,
-            };
-            cx.state.opaque_inprog.borrow_mut().remove(&ik);
-            tcx.opaque_hidden.insert(o, h);
-            tcx.trait_input_revision.fetch_add(1, std::sync::atomic::Ordering::Release);
-            return h;
-        }
-    }
-    // the defining body records the hidden type when it finishes
-    let _ = { let _o = crate::clock::origin("opaque"); check_fn(cx, prog, tcx, d, &args) };
-    cx.state.opaque_inprog.borrow_mut().remove(&ik);
-    match tcx.opaque_hidden.get(&o) {
-        Some(h) => h,
-        None => {
-            tcx.opaque_hidden.insert(o, error);
-            error
-        }
-    }
-}
-
-/// The part of `b` at the place where `a` (same shape) has `target`.
-fn type_at(tcx: &Tcx, a: TyId, b: TyId, target: TyId) -> Option<TyId> {
-    if a == target {
-        return Some(b);
-    }
-    let (ka, kb) = (tcx.tys.kind(a), tcx.tys.kind(b));
-    let pairs: Vec<(TyId, TyId)> = match (ka, kb) {
-        (TyKind::Tuple(x), TyKind::Tuple(y)) | (TyKind::Adt(_, x, _), TyKind::Adt(_, y, _)) if x.len() == y.len() => x.iter().copied().zip(y.iter().copied()).collect(),
-        (TyKind::Ref(_, x, _), TyKind::Ref(_, y, _)) | (TyKind::Ptr(_, x), TyKind::Ptr(_, y)) | (TyKind::Slice(x), TyKind::Slice(y)) | (TyKind::Array(x, _), TyKind::Array(y, _)) => vec![(*x, *y)],
-        _ => return None,
-    };
-    pairs.into_iter().find_map(|(x, y)| type_at(tcx, x, y, target))
+    fcx.into_body()
 }
 
 impl<'a> Fcx<'a> {
+    fn into_body(mut self) -> Body {
+        if !self.b.errors.is_empty() { self.infcx.errors.note_reported_error(); }
+        let (errors, warnings) = self.infcx.errors.take_since(self.infcx.diagnostic_checkpoint);
+        for error in errors {
+            let file = if error.cause.body_id == crate::program::NO_DEF { self.file } else { self.prog.def(error.cause.body_id).file };
+            self.b.errors.push(self.prog.record_error(file, error.cause.span, "typeck", error.message));
+        }
+        for warning in warnings { eprintln!("warning: {}", warning.message); }
+        if self.b.errors.is_empty() && self.infcx.tainted_by_errors() {
+            self.b.errors.push(self.prog.record_error(self.file, self.last_lo, "typeck", "type checking failed due to previous errors".into()));
+        }
+        self.b
+    }
     fn ast(&self) -> &'a Ast {
         &self.prog.files[self.file as usize].ast
     }
 
     fn err(&mut self, pos: u32, msg: String) {
-        self.b.errors.push(self.prog.record_error(self.file, pos, "typeck", msg));
+        self.infcx.set_tainted_by_errors();
+        if let Some(error) = self.infcx.errors.report_to_buffer(crate::next_solver::fulfill::ObligationCause { body_id: self.b.def, span: pos }, msg) {
+            self.b.errors.push(self.prog.record_error(self.file, pos, "typeck", error.message));
+        }
     }
 
     fn text(&self, id: Ident) -> &'a str {
@@ -852,308 +777,68 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ inference variables
 
+    // rustc_infer/src/infer/mod.rs commit_if_ok and InferOk obligations:
+    // speculative goals live with the snapshot; only commit publishes them.
+    fn start_snapshot(&mut self) -> FcxSnapshot {
+        let inference = self.infcx.start_snapshot();
+        let local = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
+        let fulfillment = std::mem::replace(&mut self.fulfillment_cx, local);
+        FcxSnapshot { inference, fulfillment }
+    }
+    fn rollback_to(&mut self, snapshot: FcxSnapshot) {
+        self.fulfillment_cx = snapshot.fulfillment;
+        self.infcx.rollback_to(snapshot.inference);
+    }
+    fn commit_from(&mut self, snapshot: FcxSnapshot) {
+        let obligations = self.fulfillment_cx.pending_obligations();
+        self.fulfillment_cx = snapshot.fulfillment;
+        self.infcx.commit_from(snapshot.inference);
+        for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); }
+    }
+
     fn fresh(&mut self, kind: u8) -> TyId {
-        self.fresh_in_universe(kind, UniverseIndex::ROOT)
-    }
-
-    fn fresh_in_universe(&mut self, kind: u8, universe: UniverseIndex) -> TyId {
-        assert!(kind == 0 || universe == UniverseIndex::ROOT);
-        let n = self.vars.len() as u32;
-        self.vars.push(VarSt::Free(kind));
-        self.var_universes.push(universe);
-        self.cx.lit_vars.borrow_mut().push(kind);
-        self.tcx.tys.intern(TyKind::Infer(n))
-    }
-
-    /// Undoes the bindings made since snapshot `save` (a speculative unification). Variables
-    /// created since stay allocated: types mentioning them may already be interned.
-    fn rollback(&mut self, mark: usize) {
-        while self.undo.len() > mark {
-            let (i, old, universe) = self.undo.pop().unwrap();
-            if i == u32::MAX {
-                self.projection_relations.pop();
-                continue;
-            }
-            if i == u32::MAX - 1 { self.pending_goals.pop(); continue; }
-            self.vars[i as usize] = old;
-            self.var_universes[i as usize] = universe;
-        }
-    }
-
-    /// A mark to roll speculative bindings back to (rustc's snapshot of the unification table's
-    /// undo log: O(bindings made since), not O(variables)).
-    fn snapshot(&self) -> usize {
-        self.undo.len()
-    }
-
-    fn set_var(&mut self, i: u32, st: VarSt) {
-        let old = self.vars[i as usize];
-        self.undo.push((i, old, self.var_universes[i as usize]));
-        self.vars[i as usize] = st;
-    }
-
-    fn merge_var_universes(&mut self, root: u32, other: u32) {
-        let universe = self.var_universes[root as usize].min(self.var_universes[other as usize]);
-        if universe != self.var_universes[root as usize] {
-            self.set_var(root, self.vars[root as usize]);
-            self.var_universes[root as usize] = universe;
-        }
+        match kind { 0 => self.infcx.next_ty_var(), 1 => self.infcx.next_int_var(), 2 => self.infcx.next_float_var(), _ => unreachable!() }
     }
 
     fn shallow(&mut self, t: TyId) -> TyId {
-        let t = self.shallow_vars(t);
-        // a projection whose Self became known normalizes to the impl's type
-        if let TyKind::Assoc(..) = self.tcx.tys.kind(t) {
-            let save = self.keep_literal_vars;
-            self.keep_literal_vars = true;
-            let d = self.deep(t);
-            self.keep_literal_vars = save;
-            let outer_overflow = self.cx.state.norm_overflow.replace(false);
-            let n = self.tcx.normalize_for_inference(&self.cx, self.prog, d);
-            self.record_normalization_overflow(d, outer_overflow);
-            if !matches!(self.tcx.tys.kind(n), TyKind::Assoc(..)) {
-                return self.shallow_vars(n);
-            }
-        }
-        t
+        let t = self.infcx.shallow_resolve(t);
+        if matches!(self.tcx.tys.kind(t), TyKind::Alias(_, _)) { self.normalize_body_type(t) } else { t }
     }
 
-    /// Preserve normalization overflow as a use-site obligation until final
-    /// fulfillment (rustc_trait_selection/src/traits/project.rs:419-439).
-    fn record_normalization_overflow(&mut self, projection: TyId, outer: bool) {
-        use crate::solve::goal::*;
-        let overflow = self.cx.state.norm_overflow.replace(outer);
-        if !overflow { return; }
-        for pending in &self.pending_goals {
-            if matches!(pending.goal.predicate, Predicate::AliasRelate(Term::Ty(a), _, _) if a == projection) { return; }
-        }
-        let value = self.fresh(0);
-        let goal = Goal { param_env: ParamEnvId(self.cx.typing_env.param_env.index()),
-            predicate: Predicate::AliasRelate(Term::Ty(projection), Term::Ty(value), AliasRelationDirection::Equate) };
-        let revision = self.tcx.trait_input_revision.load(std::sync::atomic::Ordering::Acquire);
-        self.push_pending(PendingGoal { goal: goal.clone(), lo: self.last_lo,
-            certainty: Certainty::overflow(true), stalled: Some((goal, revision)) });
-    }
-
-    fn shallow_vars(&self, t: TyId) -> TyId {
-        self.tcx.tys.erase_all_regions(self.shallow_region_vars(t))
-    }
-
-    fn shallow_region_vars(&self, mut t: TyId) -> TyId {
-        loop {
-            match self.tcx.tys.kind(t) {
-                TyKind::Infer(v) => match self.vars[*v as usize] {
-                    VarSt::Bound(b) => t = b,
-                    VarSt::Free(_) => return t,
-                },
-                _ => return t,
-            }
+    fn eq(&mut self, a: TyId, b: TyId) -> bool {
+        match self.infcx.at(self.prog, self.param_env.clone()).eq(a, b) {
+            Ok(goals) => { for goal in goals { self.register_goal(goal, self.last_lo); } true }
+            Err(_) => false,
         }
     }
 
-    fn deep(&mut self, t: TyId) -> TyId {
-        let t = self.tcx.tys.erase_all_regions(t);
-        let t = self.resolve_region_vars(t);
-        self.tcx.tys.erase_all_regions(t)
+    /// rustc_hir_typeck/src/coercion.rs:164-211: reject failed lazy
+    /// normalization before committing a coercion, and retain unresolved goals.
+    fn unify_raw(&mut self, a: TyId, b: TyId, force_leak_check: bool) -> bool {
+        self.unify_coercion(a, b, false, force_leak_check).is_some()
     }
 
-    fn resolve_region_vars(&mut self, t: TyId) -> TyId {
-        // nothing to resolve: the type is already itself (interning would find it again)
-        if !self.tcx.tys.has_infer(t) {
-            return t;
+    fn unify_coercion(&mut self, a: TyId, b: TyId, use_lub: bool, force_leak_check: bool) -> Option<TyId> {
+        let result = self.infcx.commit_if_ok(|snapshot| {
+            let outer_universe = self.infcx.universe();
+            let at = self.infcx.at(self.prog, self.param_env.clone());
+            let (ty, goals) = if use_lub { at.lub(b, a)? } else { (b, at.sub(a, b)?) };
+            let mut engine = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
+            for goal in goals { engine.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); }
+            if !engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::infer::relate::TypeError::Mismatch); }
+            // coercion.rs:164-211,1034-1055: only fn-item/pointer coercions
+            // force the extra leak check; other relations keep their own checks.
+            if force_leak_check { self.infcx.leak_check(outer_universe, Some(snapshot))?; }
+            Ok((ty, engine.pending_obligations()))
+        });
+        match result {
+            Ok((ty, obligations)) => { for obligation in obligations { self.fulfillment_cx.register_predicate_obligation(&self.infcx, obligation); } Some(ty) },
+            Err(_) => None,
         }
-        let t = self.shallow_region_vars(t);
-        let k = self.tcx.tys.kind(t).clone();
-        match k {
-            TyKind::Infer(v) => match self.vars[v as usize] {
-                VarSt::Free(1) if !self.keep_literal_vars => self.tcx.tys.i32_,
-                VarSt::Free(2) if !self.keep_literal_vars => self.tcx.tys.f64_,
-                _ => t,
-            },
-            TyKind::Tuple(v) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.resolve_region_vars(x));
-                }
-                self.tcx.tys.intern(TyKind::Tuple(n))
-            }
-            TyKind::Array(e, l) => {
-                let e = self.resolve_region_vars(e);
-                match crate::types::len_ty(l) {
-                    // a const length variable / param: its value once known
-                    Some(lt) => {
-                        let lt = self.resolve_region_vars(lt);
-                        self.tcx.tys.mk_array(e, lt)
-                    }
-                    None => self.tcx.tys.intern(TyKind::Array(e, l)),
-                }
-            }
-            TyKind::Slice(e) => {
-                let e = self.resolve_region_vars(e);
-                self.tcx.tys.intern(TyKind::Slice(e))
-            }
-            TyKind::Ref(m, e, region) => {
-                let e = self.resolve_region_vars(e);
-                self.tcx.tys.intern(TyKind::Ref(m, e, region))
-            }
-            TyKind::Ptr(m, e) => {
-                let e = self.resolve_region_vars(e);
-                self.tcx.tys.intern(TyKind::Ptr(m, e))
-            }
-            TyKind::Adt(d, v, regions) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.resolve_region_vars(x));
-                }
-                self.tcx.tys.intern(TyKind::Adt(d, n, regions))
-            }
-            TyKind::FnPtr(ps, r, c, bound) => {
-                let mut n = Vec::new();
-                for x in ps {
-                    n.push(self.resolve_region_vars(x));
-                }
-                let r = self.resolve_region_vars(r);
-                self.tcx.tys.intern(TyKind::FnPtr(n, r, c, bound))
-            }
-            TyKind::FnDef(d, v, regions) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.resolve_region_vars(x));
-                }
-                self.tcx.tys.intern(TyKind::FnDef(d, n, regions))
-            }
-            TyKind::Dyn(d, v, bs, regions, region, bound, autos) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.resolve_region_vars(x));
-                }
-                let mut nb = Vec::new();
-                for (a, x, n) in bs {
-                    nb.push((a, self.resolve_region_vars(x), n));
-                }
-                self.tcx.tys.intern(TyKind::Dyn(d, n.into(), nb.into(), regions, region, bound, autos.clone()))
-            }
-            TyKind::Assoc(d, v, regions) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.resolve_region_vars(x));
-                }
-                self.tcx.tys.intern(TyKind::Assoc(d, n, regions))
-            }
-            TyKind::Opaque(d, i, v, regions) => {
-                let n: Vec<TyId> = v.iter().map(|x| self.resolve_region_vars(*x)).collect();
-                self.tcx.tys.intern(TyKind::Opaque(d, i, n, regions))
-            }
-            TyKind::Closure(f, e, sig, up, owner) => {
-                let sig = self.resolve_region_vars(sig);
-                let up = self.resolve_region_vars(up);
-                self.tcx.tys.intern(TyKind::Closure(f, e, sig, up, owner))
-            }
-            _ => t,
-        }
-    }
-
-    /// The same projection normalization as shallow(), retaining the payload
-    /// while the unifier's equality/selection keys remain region-insensitive.
-    fn shallow_with_regions(&mut self, t: TyId) -> TyId {
-        let t = self.shallow_region_vars(t);
-        if let TyKind::Assoc(..) = self.tcx.tys.kind(t) {
-            let save = self.keep_literal_vars;
-            self.keep_literal_vars = true;
-            let d = self.resolve_region_vars(t);
-            self.keep_literal_vars = save;
-            let outer_overflow = self.cx.state.norm_overflow.replace(false);
-            let n = self.tcx.normalize(&self.cx, self.prog, d);
-            self.record_normalization_overflow(d, outer_overflow);
-            if !matches!(self.tcx.tys.kind(n), TyKind::Assoc(..)) {
-                return self.shallow_region_vars(n);
-            }
-        }
-        t
-    }
-
-    fn unify(&mut self, a: TyId, b: TyId) -> bool {
-        let a = self.shallow_with_regions(a);
-        let b = self.shallow_with_regions(b);
-        if self.tcx.tys.eq_mod_regions(a, b) {
-            return true;
-        }
-        if !matches!(self.tcx.tys.kind(a), TyKind::Infer(_) | TyKind::Error)
-            && !matches!(self.tcx.tys.kind(b), TyKind::Infer(_) | TyKind::Error)
-            && (self.defined_opaque_var(a).is_some() || self.defined_opaque_var(b).is_some()) {
-            let (opaque, other) = if self.defined_opaque_var(a).is_some() { (a, b) } else { (b, a) };
-            let variable = self.defined_opaque_var(opaque).unwrap();
-            return self.define_opaque_as(opaque, variable, other);
-        }
-        if let Some(result) = crate::solve::relate::relate_structural(&self.tcx.tys, self, a, b) {
-            return result;
-        }
-        let ka = self.tcx.tys.kind(a).clone();
-        let kb = self.tcx.tys.kind(b).clone();
-        match (&ka, &kb) {
-            (TyKind::Error, _) | (_, TyKind::Error) => true,
-            (TyKind::Infer(va), _) => self.bind(*va, b),
-            (_, TyKind::Infer(vb)) => self.bind(*vb, a),
-            // a projection whose Self is still open (`Cow::Owned(s)`: `<?B as ToOwned>::Owned`
-            // against String): rustc normalizes it to a fresh variable under a projection
-            // obligation; the equation is checked once the projection normalizes
-            // an opaque type and its hidden type (an instance whose args were revealed --
-            // `then::<closure, fn printer>` -- checks `f()` returning `impl FnMut`): the same
-            // type once revealed (rustc reveals opaques in monomorphic code)
-            (TyKind::Opaque(..), _) if self.tcx.opaque_hidden.get(&a) == Some(b) => true,
-            (_, TyKind::Opaque(..)) if self.tcx.opaque_hidden.get(&b) == Some(a) => true,
-            // a projection whose args are bound variables (`<?A as Arr>::Item` with ?A = A) is
-            // the same type as the one spelled with the args (one interned TyId once resolved)
-            (TyKind::Assoc(..), _) | (_, TyKind::Assoc(..)) if {
-                let (da, db) = (self.deep(a), self.deep(b));
-                da == db
-            } => true,
-            // a projection without inference variables that normalizes (`Self::Output` of the
-            // signature, lowered before the body's param env existed): its normal form
-            (TyKind::Assoc(..), _) if !self.has_open_infer(a) && self.tcx.normalize_for_inference(&self.cx, self.prog, a) != a => {
-                let n = self.tcx.normalize_for_inference(&self.cx, self.prog, a);
-                self.unify(n, b)
-            }
-            (_, TyKind::Assoc(..)) if !self.has_open_infer(b) && self.tcx.normalize_for_inference(&self.cx, self.prog, b) != b => {
-                let n = self.tcx.normalize_for_inference(&self.cx, self.prog, b);
-                self.unify(a, n)
-            }
-            (TyKind::Assoc(..), _) => self.defer_proj_eq(b, a),
-            (_, TyKind::Assoc(..)) => self.defer_proj_eq(a, b),
-            _ => false,
-        }
-    }
-
-    /// The hidden type variable of the opaque type `o` when this body defines it.
-    fn defined_opaque_var(&self, o: TyId) -> Option<TyId> {
-        self.opaque_vars.iter().find(|x| x.0 == o).map(|x| x.1)
-    }
-
-    /// `o` (defined by this body, hidden type variable `v`) related to `other`: `v = other`.
-    /// A `v` that an earlier use bound to `o` itself (a recursive call's result met the
-    /// declared return type) holds no information yet: it is replaced.
-    fn define_opaque_as(&mut self, o: TyId, v: TyId, other: TyId) -> bool {
-        let cur = self.shallow(v);
-        if cur == o {
-            if let TyKind::Infer(id) = self.tcx.tys.kind(v).clone() {
-                if let VarSt::Bound(_) = self.vars[id as usize] {
-                    self.set_var(id, VarSt::Bound(other));
-                    return true;
-                }
-            }
-        }
-        self.unify(v, other)
     }
 
     fn has_open_infer(&mut self, t: TyId) -> bool {
-        let d = self.deep(t);
-        self.tcx.tys.has_infer(d)
-    }
-
-    fn defer_proj_eq(&mut self, other: TyId, proj: TyId) -> bool {
-        self.projection_relations.push((other, proj, self.last_lo));
-        self.undo.push((u32::MAX, VarSt::Free(0), UniverseIndex::ROOT));
-        true
+        self.tcx.tys.has_infer(self.infcx.deeply_resolve_ignoring_regions(t))
     }
 
     /// `&T -> &dyn Tr`, `*T -> *dyn Tr`, `P<T> -> P<dyn Tr>` when T implements Tr.
@@ -1164,7 +849,7 @@ impl<'a> Fcx<'a> {
     /// ADT coercions and unsized tails require structs (rustc_hir_analysis/src/coherence/
     /// builtin.rs:870-871); enums/unions must relate their generic arguments normally.
     fn unsize_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> bool {
-        let save = self.snapshot();
+        let save = self.start_snapshot();
         let ok = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && xs.len() == ys.len() => {
@@ -1180,15 +865,13 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 match found {
-                    Some(i) => (0..xs.len()).all(|j| j == i || self.unify(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i]),
+                    Some(i) => (0..xs.len()).all(|j| j == i || self.eq(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i]),
                     None => false,
                 }
             }
             _ => false,
         };
-        if !ok {
-            self.rollback(save);
-        }
+        if !ok { self.rollback_to(save); } else { self.commit_from(save); }
         ok
     }
 
@@ -1197,7 +880,7 @@ impl<'a> Fcx<'a> {
     fn array_to_slice(&mut self, a: TyId, d: TyId) -> bool {
         let (a, d) = (self.shallow(a), self.shallow(d));
         match (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) {
-            (TyKind::Array(ea, _), TyKind::Slice(es)) => self.unify(ea, es),
+            (TyKind::Array(ea, _), TyKind::Slice(es)) => self.eq(ea, es),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(d1).kind == DefKind::Struct && xs.len() == ys.len() && !xs.is_empty() => {
                 let i = match (0..xs.len()).find(|&i| {
                     let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i]));
@@ -1206,7 +889,7 @@ impl<'a> Fcx<'a> {
                     Some(i) => i,
                     None => return false,
                 };
-                (0..xs.len()).all(|j| j == i || self.unify(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i])
+                (0..xs.len()).all(|j| j == i || self.eq(xs[j], ys[j])) && self.array_to_slice(xs[i], ys[i])
             }
             _ => false,
         }
@@ -1266,20 +949,27 @@ impl<'a> Fcx<'a> {
         false
     }
 
-    /// Coerces `a` to `x` if a coercion (or unification) applies; otherwise leaves no trace
-    /// (bindings, errors and the recorded coercion are rolled back).
+    /// rustc_hir_typeck/src/coercion.rs:1134-1164: a failed coercion returns
+    /// failure without reporting. Only the demanding caller emits a diagnostic.
     fn try_coerce(&mut self, a: TyId, x: TyId, e: Option<ExprId>) -> bool {
-        let snap = self.snapshot();
-        let n_err = self.b.errors.len();
+        self.try_coerce_inner(a, x, e, self.last_lo, false).is_some()
+    }
+    fn try_coerce_inner(&mut self, a: TyId, x: TyId, e: Option<ExprId>, pos: u32, use_lub: bool) -> Option<TyId> {
+        let snap = self.start_snapshot();
         let n_dd = self.deferred_dyn.len();
         let old = e.and_then(|e| self.b.coerce.get(&e.0).copied());
-        if self.coerce_or_unify(a, x, e, 0) {
-            return true;
+        let old_reborrow = e.and_then(|e| self.b.reborrows.get(&e.0).copied());
+        if let Some(target) = self.coerce(a, x, e, pos, use_lub) {
+            self.commit_from(snap);
+            return Some(target);
         }
-        self.rollback(snap);
-        self.b.errors.truncate(n_err);
+        self.rollback_to(snap);
         self.deferred_dyn.truncate(n_dd);
         if let Some(e) = e {
+            match old_reborrow {
+                Some(value) => { self.b.reborrows.insert(e.0, value); }
+                None => { self.b.reborrows.remove(&e.0); }
+            }
             match old {
                 Some(c) => {
                     self.b.coerce.insert(e.0, c);
@@ -1289,27 +979,30 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        false
+        None
     }
 
     fn is_literal_var(&self, t: TyId) -> bool {
         match self.tcx.tys.kind(t) {
-            TyKind::Infer(v) => matches!(self.vars[*v as usize], VarSt::Free(1) | VarSt::Free(2)),
+            TyKind::IntVar(_) | TyKind::FloatVar(_) => true,
             _ => false,
         }
     }
 
     /// The fn pointer type a fn item / capture-free closure / fn pointer coerces to.
     fn fn_ptr_of(&mut self, t: TyId) -> Option<TyId> {
-        let t = self.shallow_with_regions(t);
+        let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
             TyKind::FnPtr(..) => Some(t),
-            TyKind::FnDef(d, args, _) => {
+            TyKind::FnDef(d, args, regions) => {
                 let sig = self.tcx.fn_item_sig(self.prog, d).cloned()?;
+                // coercion.rs:1259-1264: intrinsics have no addressable body.
+                if sig.header.abi == Abi::RelaxIntrinsic { return None; }
                 let poly = self.tcx.tys.intern(TyKind::FnPtr(sig.params, sig.ret, sig.header, sig.bound_regions));
-                Some(self.tcx.tys.subst(poly, &args))
+                let args = self.tcx.complete_args(self.prog, d, &args, regions);
+                Some(self.tcx.instantiate_ty(self.prog, d, &args, poly))
             }
-            TyKind::Closure(_, _, sig, up, _) => {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up, .. }) => {
                 let captures = match self.tcx.tys.kind(up) {
                     TyKind::Tuple(v) => !v.is_empty(),
                     _ => true,
@@ -1324,48 +1017,69 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    /// rustc CoerceMany: a new branch value joins the branches seen so far -- the new value
-    /// coerces to their type, else (two different fn items / closures) all meet at a fn
-    /// pointer, else the earlier ones coerce to the new type (`&String` then `&str`).
+    /// rustc_hir_typeck/src/coercion.rs:1328-1493: all arms contribute to
+    /// the lattice result; callable items reify only if their own LUB fails.
     fn coerce_many(&mut self, prev: &[ExprId], prev_ty: TyId, new_e: ExprId, new_ty: TyId, lo: u32) -> TyId {
-        if self.try_coerce(new_ty, prev_ty, Some(new_e)) {
-            return prev_ty;
+        match self.try_find_coercion_lub(prev, prev_ty, new_e, new_ty) {
+            Some(ty) => ty,
+            None => {
+                let expected = self.ty_str(prev_ty);
+                let found = self.ty_str(new_ty);
+                self.err(lo, format!("mismatched types: expected `{expected}`, found `{found}`"));
+                self.tcx.tys.error
+            }
         }
-        if let (Some(mut fp), Some(other)) = (self.fn_ptr_of(prev_ty), self.fn_ptr_of(new_ty)) {
-            // rustc_hir_typeck/src/coercion.rs:1404: the common signature can be unsafe.
-            if let (TyKind::FnPtr(ps, r, header, bound), TyKind::FnPtr(_, _, other, _)) =
-                (self.tcx.tys.kind(fp).clone(), self.tcx.tys.kind(other).clone()) {
-                if other.safety == Safety::Unsafe {
-                    fp = self.tcx.tys.intern(TyKind::FnPtr(ps, r,
-                        FnHeader { safety: Safety::Unsafe, ..header }, bound));
+    }
+
+    fn try_find_coercion_lub(&mut self, prev: &[ExprId], prev_ty: TyId, new_e: ExprId, new_ty: TyId) -> Option<TyId> {
+        self.retry_goals(false);
+        let prev_ty = self.infcx.deeply_resolve_ignoring_regions(prev_ty);
+        let new_ty = self.infcx.deeply_resolve_ignoring_regions(new_ty);
+        if prev_ty == new_ty { return Some(prev_ty); }
+        let pair = (self.tcx.tys.kind(prev_ty).clone(), self.tcx.tys.kind(new_ty).clone());
+        let callable_pair = match pair {
+            (TyKind::FnDef(..), TyKind::FnDef(..)) | (TyKind::Closure(..), TyKind::Closure(..)) => {
+                if let Some(ty) = self.unify_coercion(prev_ty, new_ty, true, true) { return Some(ty); }
+                true
+            }
+            (TyKind::FnDef(..), TyKind::Closure(..)) | (TyKind::Closure(..), TyKind::FnDef(..)) => true,
+            _ => false,
+        };
+        if callable_pair {
+            let mut a = self.fn_ptr_of(prev_ty)?;
+            let mut b = self.fn_ptr_of(new_ty)?;
+            let unsafe_ = matches!(self.tcx.tys.kind(a), TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe)
+                || matches!(self.tcx.tys.kind(b), TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe);
+            if unsafe_ {
+                for ty in [&mut a, &mut b] {
+                    let TyKind::FnPtr(ps, ret, header, bound) = self.tcx.tys.kind(*ty).clone() else { unreachable!() };
+                    *ty = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, FnHeader { safety: Safety::Unsafe, ..header }, bound));
                 }
             }
-            let snap = self.snapshot();
-            let mut ok = true;
-            for &p in prev {
-                let pt = self.b.ty(p);
-                ok = ok && self.try_coerce(pt, fp, Some(p));
-            }
-            ok = ok && self.try_coerce(new_ty, fp, Some(new_e));
-            if ok {
-                return fp;
-            }
-            self.rollback(snap);
+            a = self.norm(a);
+            b = self.norm(b);
+            let ty = self.unify_coercion(a, b, true, false)?;
+            let adjustment = if matches!(self.tcx.tys.kind(prev_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn };
+            for e in prev { self.b.coerce.insert(e.0, adjustment); }
+            self.b.coerce.insert(new_e.0, if matches!(self.tcx.tys.kind(new_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn });
+            return Some(ty);
         }
-        if !prev.is_empty() {
-            let snap = self.snapshot();
-            let mut ok = true;
-            for &p in prev {
-                let pt = self.b.ty(p);
-                ok = ok && self.try_coerce(pt, new_ty, Some(p));
-            }
-            if ok {
-                return new_ty;
-            }
-            self.rollback(snap);
+        if !self.b.coerce.contains_key(&new_e.0) {
+            if let Some(ty) = self.try_coerce_inner(new_ty, prev_ty, Some(new_e), self.last_lo, true) { return Some(ty); }
         }
-        self.coerce_or_unify(new_ty, prev_ty, Some(new_e), lo);
-        prev_ty
+        // A single coercion determines the adjustments for all previous arms.
+        // The temporary slot retains an existing adjustment on the chosen arm.
+        let first = prev.first().copied();
+        let ty = self.try_coerce_inner(prev_ty, new_ty, first, self.last_lo, true)?;
+        if let Some(first) = first {
+            let adjustment = self.b.coerce.get(&first.0).copied();
+            let reborrow = self.b.reborrows.get(&first.0).copied();
+            for e in &prev[1..] {
+                if let Some(adjustment) = adjustment { self.b.coerce.insert(e.0, adjustment); }
+                if let Some(reborrow) = reborrow { self.b.reborrows.insert(e.0, reborrow); }
+            }
+        }
+        Some(ty)
     }
 
     /// Trait object upcasting (stable since 1.86): a pointer to `dyn Sub` as a pointer to
@@ -1380,7 +1094,7 @@ impl<'a> Fcx<'a> {
                     matches!(self.tcx.tys.kind(x), TyKind::Dyn(..)) && matches!(self.tcx.tys.kind(y), TyKind::Dyn(..)) && x != y
                 })?;
                 for j in 0..xs.len() {
-                    if j != i && !self.unify(xs[j], ys[j]) {
+                    if j != i && !self.eq(xs[j], ys[j]) {
                         return None;
                     }
                 }
@@ -1400,13 +1114,13 @@ impl<'a> Fcx<'a> {
         if !tautos.iter().all(|t| sautos.contains(t)) { return None; }
         if sd == td {
             let TyKind::Dyn(td, args, bindings, rs, region, bound, _) = self.tcx.tys.kind(a).clone() else { unreachable!() };
-            let erased = self.tcx.tys.intern(TyKind::Dyn(td, args, bindings, rs, region, bound, tautos));
-            return if self.unify(erased, d) { Some((a, d)) } else { None };
+            let erased = self.tcx.tys.intern(TyKind::Dyn(td, args.into(), bindings.into(), rs, region, bound, tautos.into()));
+            return if self.eq(erased, d) { Some((a, d)) } else { None };
         }
         // Fn -> FnMut -> FnOnce: the same call entry
         if self.is_fn_trait(sd) && self.is_fn_trait(td) {
             if let (Some(x), Some(y)) = (sargs.first(), targs.first()) {
-                if self.unify(*x, *y) {
+                if self.eq(*x, *y) {
                     return Some((a, d));
                 }
             }
@@ -1414,7 +1128,7 @@ impl<'a> Fcx<'a> {
         }
         // the supertrait instantiations of `sd<sargs>` (rustc: upcasting to a supertrait trait
         // ref; `dyn Foo<bool>` -> `dyn Bar<bool>` where `Foo<T>: Bar<i32> + Bar<T>`)
-        let sargs: Vec<TyId> = sargs.iter().map(|x| self.deep(*x)).collect();
+        let sargs: Vec<TyId> = sargs.iter().map(|x| self.infcx.deeply_resolve_ignoring_regions(*x)).collect();
         let mut todo = vec![(sd, sargs)];
         let mut seen: Vec<(DefId, Vec<TyId>)> = Vec::new();
         let mut hits: Vec<Vec<TyId>> = Vec::new();
@@ -1423,7 +1137,7 @@ impl<'a> Fcx<'a> {
                 continue;
             }
             seen.push(t.clone());
-            for (sup, supargs) in self.tcx.trait_super_refs(&self.cx, self.prog, t.0, &t.1) {
+            for (sup, supargs) in self.tcx.trait_super_refs(&self.cx.with_infcx(&self.infcx), self.prog, t.0, &t.1) {
                 if sup == td && !hits.contains(&supargs) {
                     hits.push(supargs.clone());
                 }
@@ -1433,9 +1147,9 @@ impl<'a> Fcx<'a> {
         // the one instantiation the target's args can be
         let mut fit = Vec::new();
         for h in hits {
-            let snap = self.snapshot();
-            let ok = h.len() == targs.len() && (0..h.len()).all(|i| self.unify(h[i], targs[i]));
-            self.rollback(snap);
+            let snap = self.start_snapshot();
+            let ok = h.len() == targs.len() && (0..h.len()).all(|i| self.eq(h[i], targs[i]));
+            self.rollback_to(snap);
             if ok {
                 fit.push(h);
             }
@@ -1443,7 +1157,7 @@ impl<'a> Fcx<'a> {
         if fit.len() == 1 {
             let h = fit.pop().unwrap();
             for i in 0..h.len() {
-                self.unify(h[i], targs[i]);
+                self.eq(h[i], targs[i]);
             }
             return Some((a, d));
         }
@@ -1461,7 +1175,7 @@ impl<'a> Fcx<'a> {
                     // a literal pointee (`Box::new(1)` as `Box<dyn Any>`) is decided below: the one
                     // numeric impl, or the literal fallback's
                     let open = match self.tcx.tys.kind(x) {
-                        TyKind::Infer(v) => !matches!(self.vars[*v as usize], VarSt::Free(1) | VarSt::Free(2)),
+                        TyKind::Infer(_) => true,
                         TyKind::Dyn(..) => true,
                         _ => false,
                     };
@@ -1471,7 +1185,7 @@ impl<'a> Fcx<'a> {
                 }
                 let i = found?;
                 for j in 0..xs.len() {
-                    if j != i && !self.unify(xs[j], ys[j]) {
+                    if j != i && !self.eq(xs[j], ys[j]) {
                         return None;
                     }
                 }
@@ -1495,7 +1209,7 @@ impl<'a> Fcx<'a> {
                                 let yj = self.shallow(ya[j]);
                                 if self.has_dyn(yj) && self.shallow(xa[j]) != yj {
                                     k = Some(j);
-                                } else if !self.unify(xa[j], ya[j]) {
+                                } else if !self.eq(xa[j], ya[j]) {
                                     return None;
                                 }
                             }
@@ -1509,254 +1223,40 @@ impl<'a> Fcx<'a> {
         };
         let src = self.shallow(src);
         let dy = self.shallow(dy);
-        let (td, targs, autos) = match self.tcx.tys.kind(dy).clone() {
-            TyKind::Dyn(td, targs, _, _, _, _, autos) => (td, targs, autos),
-            _ => return None,
-        };
-        if matches!(self.tcx.tys.kind(src), TyKind::Dyn(..)) { return None; }
-        for auto in autos {
-            if matches!(self.select_trait(auto, src, &[]), SelectionResult::NoSolution) { return None; }
-        }
-        // Selection relates the trait arguments and retains every unresolved goal.
-        // Object bindings are obligations even when the principal trait is ambiguous.
-        if matches!(self.select_trait(td, src, &targs), SelectionResult::NoSolution) { return None; }
-        let mut refs = vec![(td, targs.to_vec())];
-        let mut i = 0;
-        while i < refs.len() {
-            let (def, args) = refs[i].clone();
-            for bound in self.tcx.trait_super_refs_of(&self.cx, self.prog, def, src, &args) {
-                if !refs.contains(&bound) { refs.push(bound); }
-            }
-            i += 1;
-        }
-        let bindings = match self.tcx.tys.kind(dy).clone() {
-            TyKind::Dyn(_, _, bindings, ..) => bindings,
-            _ => unreachable!(),
-        };
-        for (ad, value, _) in bindings {
-            use crate::solve::goal::{AliasKind, AliasTerm, Clause, Goal, ParamEnvId, Predicate, ProjectionPredicate, Term};
-            let owner = self.prog.def(ad).parent;
-            let mut args = vec![src];
-            if let Some((_, trait_args)) = refs.iter().find(|(def, _)| *def == owner) { args.extend_from_slice(trait_args); }
-            let goal = Goal { param_env: ParamEnvId(self.cx.typing_env.param_env.index()),
-                predicate: Predicate::Clause(Clause::Projection(ProjectionPredicate {
-                    alias: AliasTerm { kind: AliasKind::Projection, def: ad, args }, term: Term::Ty(value),
-                })) };
-            self.register_goal(goal, self.last_lo);
-        }
+        if !matches!(self.tcx.tys.kind(dy), TyKind::Dyn(..)) || matches!(self.tcx.tys.kind(src), TyKind::Dyn(..)) { return None; }
+        // coercion.rs:683-698: Unsize selection retains the object's binders,
+        // associated-type equalities and outlives obligations together.
+        let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
+        if self.select_trait(unsize, src, &[dy]).is_err() { return None; }
         Some((src, dy))
     }
 
-    /// The where-clauses of this body on `t` (and the trait's implicit `Self: Trait<..>` in
-    /// its own bodies), elaborated through supertraits: rustc's param-env candidates, as
-    /// (trait, trait args) with the body's args substituted.
+    /// method/probe.rs:assemble_inherent_candidates_from_param: read the
+    /// native ParamEnv and an alias's instantiated item bounds, never re-lower AST bounds.
     fn param_bounds(&mut self, t: TyId) -> Vec<(DefId, Vec<TyId>)> {
-        let mut todo: Vec<(DefId, Vec<TyId>)> = Vec::new();
-        for (pi, bd, bargs) in self.tcx.fn_trait_bounds(self.prog, self.b.def).cloned().unwrap_or_default() {
-            if let Some(a) = self.b.args.get(pi as usize).copied() {
-                if self.shallow(a) != t {
-                    continue;
-                }
-                let ba: Vec<TyId> = bargs.iter().map(|x| self.tcx.tys.subst_for_inference(*x, &self.b.args)).collect();
-                todo.push((bd, ba));
-            }
-        }
-        // the enclosing impl's bounds on its params (`impl<R: BufRead> D<R>`: the fn's own bound
-        // tables hold only its own generics); Fn-family sugar is param_fn_sig's
-        if let TyKind::Param(pi) = self.tcx.tys.kind(t).clone() {
-            let parent = self.prog.def(self.b.def).parent;
-            if self.prog.def(parent).kind == DefKind::Impl {
-                let env = self.env.clone();
-                for (bi, bfile, path) in env.bounds.iter() {
-                    if *bi != pi || matches!(self.prog.files[*bfile as usize].ast.segs(path.segs).last().and_then(|l| self.prog.files[*bfile as usize].ast.gargs(l.args)), Some(GenericArgs::Paren(..))) {
-                        continue;
-                    }
-                    if let Some(td) = self.tcx.resolve_type_path_def(self.prog, *bfile, self.module, path) {
-                        if self.prog.def(td).kind != DefKind::Trait {
-                            continue;
-                        }
-                        let inst = self.inst_args.clone();
-                        let ta: Vec<TyId> = self.tcx.lower_generic_args(&self.cx, self.prog, *bfile, self.module, &env, path).into_iter().map(|x| self.tcx.tys.subst_for_inference(x, &inst)).collect();
-                        let ta = self.tcx.fill_trait_defaults(&self.cx, self.prog, td, t, ta);
-                        todo.push((td, ta));
-                    }
+        let mut clauses = self.param_env.clauses.to_vec();
+        clauses.extend(self.alias_bound_clauses(t));
+        self.trait_bounds_for_self(t, &clauses)
+    }
+
+    fn trait_bounds_for_self(&self, t: TyId, clauses: &[Predicate]) -> Vec<(DefId, Vec<TyId>)> {
+        let mut out = Vec::new();
+        for p in clauses {
+            let PredicateKind::Clause(ClauseKind::Trait(c)) = &p.kind else { continue };
+            let Some(crate::consts::GenericArg::Type(self_ty)) = c.trait_ref.args.first() else { continue };
+            if !self.tcx.tys.eq_mod_regions(*self_ty, t) { continue; }
+            let mut args = Vec::new();
+            for a in &c.trait_ref.args[1..] {
+                match a {
+                    crate::consts::GenericArg::Type(t) => args.push(*t),
+                    crate::consts::GenericArg::Const(c) => args.push(self.tcx.tys.intern(TyKind::Const(*c))),
+                    crate::consts::GenericArg::Lifetime(_) => {}
                 }
             }
-        }
-        // where-clauses naming this type itself (`where A::Item: Clone`, the fn's or its impl's)
-        if matches!(self.tcx.tys.kind(t), TyKind::Assoc(..) | TyKind::Param(_)) {
-            for (st, d, a) in self.tcx.fn_ty_bounds(self.prog, self.b.def).cloned().unwrap_or_default() {
-                let st = self.tcx.tys.subst_for_inference(st, &self.b.args);
-                let st = self.tcx.normalize_for_inference(&self.cx, self.prog, st);
-                if st == t {
-                    let a: Vec<TyId> = a.iter().map(|x| self.tcx.tys.subst_for_inference(*x, &self.b.args)).collect();
-                    todo.push((d, a));
-                }
-            }
-        }
-        // a projection (`A::Mem` with `type Mem: Default`): its declared bounds (rustc
-        // item_bounds, part of the param env of a generic body)
-        if let TyKind::Assoc(ad, pa, _) = self.tcx.tys.kind(t).clone() {
-            todo.extend(self.tcx.assoc_decl_bounds(&self.cx, self.prog, ad, &pa));
-        }
-        if let Some(trd) = self.env.trait_def {
-            let a0 = self.b.args.first().copied();
-            if self.prog.def(self.b.def).parent == trd && a0.map(|a| self.shallow(a)) == Some(t) {
-                let nt = self.tcx.trait_generic_count(self.prog, trd);
-                todo.push((trd, self.b.args.get(1..=nt).map_or(Vec::new(), |a| a.to_vec())));
-            }
-        }
-        let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
-        while let Some((d, a)) = todo.pop() {
-            if out.iter().any(|(x, xa)| *x == d && *xa == a) {
-                continue;
-            }
-            todo.extend(self.tcx.trait_super_refs_of(&self.cx, self.prog, d, t, &a));
-            out.push((d, a));
+            let entry = (c.trait_ref.def_id, args);
+            if !out.contains(&entry) { out.push(entry); }
         }
         out
-    }
-
-    /// The param env of a polymorphic body (TypingEnv::param_env): every param's bounds
-    /// (param_bounds, plus `Copy`, which the bound tables leave out), and the declared bounds of
-    /// the associated types of those traits on the param (`<I as IntoIterator>::IntoIter:
-    /// Iterator`), elaborated through supertraits.
-    fn param_env_entries(&mut self) -> crate::tcx::ParamEnv {
-        let mut params: Vec<TyId> = Vec::new();
-        for a in self.b.args.clone() {
-            if matches!(self.tcx.tys.kind(a), TyKind::Param(_)) && !params.contains(&a) {
-                params.push(a);
-            }
-        }
-        let mut out: Vec<(TyId, DefId, Vec<TyId>)> = Vec::new();
-        if let Some(sized) = self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) {
-            for &pi in &self.env.sized_params {
-                if let Some(&ty) = self.b.args.get(pi as usize) { out.push((ty, sized, Vec::new())); }
-            }
-        }
-        let mut eqs: Vec<(TyId, TyId)> = Vec::new();
-        // the where-clauses' bindings (`I: IntoIterator<Item = u32>`)
-        for (pi, ad, targs, v) in self.tcx.fn_bound_bindings(self.prog, self.b.def).cloned().unwrap_or_default() {
-            if let Some(&p) = self.b.args.get(pi as usize) {
-                let mut pa = vec![p];
-                pa.extend(targs.iter().map(|t| self.tcx.tys.subst_for_inference(*t, &self.b.args)));
-                let proj = self.tcx.tys.intern(TyKind::Assoc(ad, pa, crate::types::RegionArgsId::EMPTY));
-                eqs.push((proj, self.tcx.tys.subst_for_inference(v, &self.b.args)));
-            }
-        }
-        // where-clauses on other types than a param (`for<'x> &'x V: IntoIterator`,
-        // `Vec<T>: Debug`): the env proves them as written
-        for (st, d, a) in self.tcx.fn_ty_bounds(self.prog, self.b.def).cloned().unwrap_or_default() {
-            let st = self.tcx.tys.subst_for_inference(st, &self.b.args);
-            let a: Vec<TyId> = a.iter().map(|x| self.tcx.tys.subst_for_inference(*x, &self.b.args)).collect();
-            if !out.iter().any(|(t, x, xa)| *t == st && *x == d && *xa == a) {
-                out.push((st, d, a));
-            }
-        }
-        let copy = self.tcx.copy_trait;
-        let raw = self.tcx.item_env(self.prog, self.b.def).bounds;
-        for p in params {
-            let bs = self.param_bounds(p);
-            for (d, a) in &bs {
-                out.push((p, *d, a.clone()));
-                // the trait's associated types on this param, by their declared bounds
-                for it in self.prog.traits[self.prog.def(*d).sub as usize].clone() {
-                    if self.prog.def(it).kind != DefKind::AssocTy {
-                        continue;
-                    }
-                    let mut pa = vec![p];
-                    pa.extend(a.iter().copied());
-                    let proj = self.tcx.tys.intern(TyKind::Assoc(it, pa.clone(), crate::types::RegionArgsId::EMPTY));
-                    let (mut todo, peqs) = self.tcx.assoc_decl_bounds_eqs(&self.cx, self.prog, it, &pa);
-                    eqs.extend(peqs);
-                    let mut seen: Vec<(DefId, Vec<TyId>)> = Vec::new();
-                    while let Some((bd, ba)) = todo.pop() {
-                        if seen.contains(&(bd, ba.clone())) {
-                            continue;
-                        }
-                        todo.extend(self.tcx.trait_super_refs_of(&self.cx, self.prog, bd, proj, &ba));
-                        out.push((proj, bd, ba.clone()));
-                        seen.push((bd, ba));
-                    }
-                }
-            }
-            if let (Some(ct), TyKind::Param(k)) = (copy, self.tcx.tys.kind(p).clone()) {
-                let module = self.module;
-                let has_copy = bs.iter().any(|(d, _)| *d == ct)
-                    || raw.iter().any(|(pi, f, path)| *pi == k && self.tcx.resolve_type_path_def(self.prog, *f, module, path) == Some(ct))
-                    || bs.iter().any(|(d, _)| self.tcx.trait_closure.get(d).map_or(false, |c| c.contains(&ct)));
-                if has_copy {
-                    out.push((p, ct, Vec::new()));
-                }
-            }
-        }
-        use crate::solve::goal::{Clause, Term};
-        if let Some(clauses) = self.tcx.item_clauses(self.prog, self.b.def) {
-            for clause in clauses {
-                match clause {
-                    Clause::Trait(p) => {
-                        let mut args = Vec::new();
-                        for t in &p.trait_ref.args { args.push(self.tcx.tys.subst_for_inference(*t, &self.b.args)); }
-                        out.push((args[0], p.trait_ref.def, args[1..].to_vec()));
-                    }
-                    Clause::Projection(p) => {
-                        let mut args = Vec::new();
-                        for t in &p.alias.args { args.push(self.tcx.tys.subst_for_inference(*t, &self.b.args)); }
-                        let lhs = self.tcx.tys.intern(TyKind::Assoc(p.alias.def, args, crate::types::RegionArgsId::EMPTY));
-                        if let Term::Ty(t) = p.term { eqs.push((lhs, self.tcx.tys.subst_for_inference(t, &self.b.args))); }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        // the bound traits' supertrait bindings (`trait FloatNumber: Neg<Output = Self>` gives
-        // `<T as Neg>::Output == T` for T: FloatNumber, and so for a bounded projection)
-        for (st, d, a) in out.clone() {
-            for e in self.tcx.trait_super_bindings(&self.cx, self.prog, d, st, &a) {
-                if !eqs.contains(&e) {
-                    eqs.push(e);
-                }
-            }
-        }
-        crate::tcx::ParamEnv { preds: out, eqs }
-    }
-
-    /// A call of a value whose type is a generic param with an `Fn*` bound (`f(1)` with
-    /// `F: FnMut(u32) -> u32`): the bound's signature.
-    /// The Fn-family supertrait signature of a trait object's principal (transitively).
-    fn dyn_super_fn_sig(&mut self, td: DefId, t: TyId, targs: &[TyId]) -> Option<(Vec<TyId>, TyId)> {
-        let mut todo = self.tcx.trait_super_refs_of(&self.cx, self.prog, td, t, targs);
-        let mut seen = Vec::new();
-        while let Some((d, a)) = todo.pop() {
-            if self.is_fn_trait(d) {
-                if let Some(sig) = self.tcx.callable_sig(&self.cx, t, d, &a) { return Some(sig); }
-            }
-            if seen.contains(&d) {
-                continue;
-            }
-            seen.push(d);
-            todo.extend(self.tcx.trait_super_refs_of(&self.cx, self.prog, d, t, &a));
-        }
-        None
-    }
-
-    fn param_fn_sig(&mut self, t: TyId) -> Option<(Vec<TyId>, TyId)> {
-        for bound in self.tcx.callable_signatures(self.prog, self.b.def) {
-            let (pi, sig) = (bound.param, bound.signature);
-            if self.b.args.get(pi as usize).map_or(false, |a| *a == t) {
-                let sig = self.tcx.tys.subst_for_inference(sig, &self.b.args);
-                if let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() {
-                    return Some((ps, r));
-                }
-            }
-        }
-        for (d, a) in self.param_bounds(t) {
-            if self.is_fn_trait(d) {
-                if let Some(sig) = self.tcx.callable_sig(&self.cx, t, d, &a) { return Some(sig); }
-            }
-        }
-
-        None
     }
 
     /// Is `t` dynamically sized (str, slice, dyn, or a struct whose last field is)?
@@ -1771,7 +1271,7 @@ impl<'a> Fcx<'a> {
                 };
                 match last {
                     Some(ft) => {
-                        let ft = self.tcx.tys.subst_for_inference(ft, &args);
+                        let ft = self.tcx.tys.subst(ft, &args);
                         self.is_unsized_ty(ft)
                     }
                     None => false,
@@ -1800,22 +1300,6 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    fn occurs(&mut self, v: u32, t: TyId, depth: u32) -> bool {
-        if depth > 64 {
-            return true;
-        }
-        let t = self.shallow_vars(t);
-        match self.tcx.tys.kind(t).clone() {
-            TyKind::Infer(w) => w == v,
-            TyKind::Tuple(xs) | TyKind::Adt(_, xs, _) | TyKind::FnDef(_, xs, _) | TyKind::Assoc(_, xs, _) => xs.iter().any(|x| self.occurs(v, *x, depth + 1)),
-            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.occurs(v, e, depth + 1),
-            TyKind::FnPtr(ps, r, _, _) => ps.iter().any(|x| self.occurs(v, *x, depth + 1)) || self.occurs(v, r, depth + 1),
-            TyKind::Dyn(_, xs, bs, _, _, _, _) => xs.iter().any(|x| self.occurs(v, *x, depth + 1)) || bs.iter().any(|x| self.occurs(v, x.1, depth + 1)),
-            TyKind::Closure(_, _, s, u, _) => self.occurs(v, s, depth + 1) || self.occurs(v, u, depth + 1),
-            _ => false,
-        }
-    }
-
     /// `&&u8` -> `u8` when the referent is a primitive number/bool/char; other types unchanged.
     fn peel_prim_refs(&mut self, t: TyId) -> TyId {
         let mut cur = self.shallow(t);
@@ -1833,7 +1317,7 @@ impl<'a> Fcx<'a> {
 
 
     /// Autoderef steps from `a` to `x` (both pointees of references), if any.
-    fn deref_coercion(&mut self, e: ExprId, a: TyId, x: TyId) -> Option<u8> {
+    fn deref_coercion(&mut self, e: ExprId, a: TyId, x: TyId) -> Option<usize> {
         let xs = self.shallow(x);
         // an open target takes the source as is; an integer / float variable is no reference,
         // so `&&{integer}` to `&{integer}` derefs (rustc coerce_borrowed_pointer autoderefs
@@ -1843,13 +1327,14 @@ impl<'a> Fcx<'a> {
         }
         let mut cur = self.shallow(a);
         let key = e.0 | DEREF_COERCE_KEY;
-        for step in 0..8u8 {
+        for step in 0..8usize {
             cur = self.deref_step(key, step, cur)?;
-            let save = self.snapshot();
-            if self.unify(cur, xs) {
+            let save = self.start_snapshot();
+            if self.eq(cur, xs) {
+                self.commit_from(save);
                 return Some(step + 1);
             }
-            self.rollback(save);
+            self.rollback_to(save);
         }
         None
     }
@@ -1859,95 +1344,37 @@ impl<'a> Fcx<'a> {
         Some(d.krate) == self.prog.prelude_crate && matches!(self.prog.name(td), "Fn" | "FnMut" | "FnOnce")
     }
 
-    fn bind(&mut self, v: u32, t: TyId) -> bool {
-        let kind = match self.vars[v as usize] {
-            VarSt::Free(k) => k,
-            VarSt::Bound(b) => return self.unify(b, t),
-        };
-        let tk = self.tcx.tys.kind(t).clone();
-        // A projection mentioning this variable can normalize to the variable itself
-        // (`?I = <Range<?I> as Iterator>::Item`). Relate its normalized value before
-        // the occurs check (rustc_trait_selection/src/traits/project.rs:211-246;
-        // ambiguous projections remain obligations at 256-282).
-        if matches!(tk, TyKind::Assoc(..)) && self.occurs(v, t, 0) {
-            let tv = self.tcx.tys.intern(TyKind::Infer(v));
-            return self.defer_proj_eq(tv, t);
-        }
-        // occurs check: `?v = Option<?v>` would be an infinite type
-        if !matches!(tk, TyKind::Infer(_)) && self.occurs(v, t, 0) {
-            return false;
-        }
-        match tk {
-            TyKind::Infer(w) => {
-                let k2 = match self.vars[w as usize] {
-                    VarSt::Free(k) => k,
-                    _ => 0,
-                };
-                if kind != 0 && k2 != 0 && kind != k2 {
-                    return false;
-                }
-                if kind != 0 && k2 == 0 {
-                    // keep the more specific variable free
-                    let tv = self.tcx.tys.intern(TyKind::Infer(v));
-                    self.merge_var_universes(v, w);
-                    self.set_var(w, VarSt::Bound(tv));
-                    return true;
-                }
-                self.merge_var_universes(w, v);
-                self.set_var(v, VarSt::Bound(t));
-                true
-            }
-            TyKind::Int(_) if kind == 1 || kind == 0 => {
-                self.set_var(v, VarSt::Bound(t));
-                true
-            }
-            TyKind::Float(_) if kind == 2 || kind == 0 => {
-                self.set_var(v, VarSt::Bound(t));
-                true
-            }
-            _ if kind == 0 => {
-                self.set_var(v, VarSt::Bound(t));
-                true
-            }
-            TyKind::Error => true,
-            TyKind::Assoc(..) => {
-                let tv = self.tcx.tys.intern(TyKind::Infer(v));
-                self.projection_relations.push((tv, t, self.last_lo));
-                self.undo.push((u32::MAX, VarSt::Free(0), UniverseIndex::ROOT));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Transfer relation-produced projection equations to ordinary fulfillment.
-    /// A concrete alias may still depend on a closure kind; lack of free type
-    /// variables does not make a stuck projection a mismatch (project.rs:262).
-    fn flush_projection_relations(&mut self) {
-        use crate::solve::goal::*;
-        let relations = std::mem::take(&mut self.projection_relations);
-        self.undo.retain(|u| u.0 != u32::MAX);
-        for (a, b, lo) in relations {
-            let goal = Goal { param_env: ParamEnvId(self.cx.typing_env.param_env.index()),
-                predicate: Predicate::AliasRelate(Term::Ty(a), Term::Ty(b), AliasRelationDirection::Equate) };
-            self.register_goal(goal, lo);
-        }
-    }
-
     fn ty_str(&mut self, t: TyId) -> String {
-        let t = self.deep(t);
+        let t = self.infcx.deeply_resolve_ignoring_regions(t);
         ty_to_string(false, self.prog, self.tcx, t)
     }
 
-    /// Coercion site: `actual` flows into a place of type `expected`.
+    /// rustc_hir_typeck/src/demand.rs:230-270: report only after the coercion
+    /// is required and failed; speculative coercions never emit and retract errors.
     fn coerce_or_unify(&mut self, actual: TyId, expected: TyId, e: Option<ExprId>, pos: u32) -> bool {
+        if self.try_coerce_inner(actual, expected, e, pos, false).is_some() { return true; }
+        let (a, x) = (self.shallow(actual), self.shallow(expected));
+        let sa = self.ty_str(a);
+        let sx = self.ty_str(x);
+        // same printed name for different types: show where each is defined
+        let (sx, sa) = if sx == sa {
+            let (x, a2) = (self.infcx.deeply_resolve_ignoring_regions(expected), self.infcx.deeply_resolve_ignoring_regions(actual));
+            (ty_to_string_paths(self.prog, self.tcx, x), ty_to_string_paths(self.prog, self.tcx, a2))
+        } else {
+            (sx, sa)
+        };
+        self.err(pos, format!("mismatched types: expected `{}`, found `{}`", sx, sa));
+        false
+    }
+
+    fn coerce(&mut self, actual: TyId, expected: TyId, e: Option<ExprId>, pos: u32, use_lub: bool) -> Option<TyId> {
         let a = self.shallow(actual);
         let x = self.shallow(expected);
         if a == x {
             if let (Some(e), TyKind::Ref(true, _, _)) = (e, self.tcx.tys.kind(x)) {
                 self.b.reborrows.insert(e.0, true);
             }
-            return true;
+            return Some(x);
         }
         let ka = self.tcx.tys.kind(a).clone();
         let kx = self.tcx.tys.kind(x).clone();
@@ -1958,21 +1385,21 @@ impl<'a> Fcx<'a> {
             if matches!(kx, TyKind::Infer(_)) {
                 self.diverging.push(x);
             }
-            return true;
+            return Some(x);
         }
         if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
             if let Some(e) = e {
                 self.b.coerce.insert(e.0, Coerce::ToDyn(src, dy));
                 if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
             }
-            return true;
+            return Some(x);
         }
         if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
             if let Some(e) = e {
                 self.b.coerce.insert(e.0, Coerce::Upcast(sd, dd));
                 if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
             }
-            return true;
+            return Some(x);
         }
         // a pointer to a not yet known type as a pointer to `dyn Tr` (`let b: Box<dyn Tr> =
         // v.clone();`): decided at the end, once the pointee is known (rustc keeps the
@@ -1980,21 +1407,23 @@ impl<'a> Fcx<'a> {
         if let Some(ex) = e {
             if self.pointee_pair_open_to_dyn(&ka, &kx) {
                 self.deferred_dyn.push((ex, a, x, pos));
-                return true;
+                return Some(x);
             }
         }
-        if let (TyKind::Ref(m1, ia, _), TyKind::Ref(m2, ix, _), Some(ex)) = (&ka, &kx, e) {
+        if let (TyKind::Ref(m1, ia, region), TyKind::Ref(m2, ix, _), Some(ex)) = (&ka, &kx, e) {
             if *m1 || !*m2 {
-                let save = self.snapshot();
-                if self.unify(*ia, *ix) {
+                let save = self.start_snapshot();
+                let reborrow = self.tcx.tys.intern(TyKind::Ref(*m2, *ia, *region));
+                if let Some(target) = self.unify_coercion(reborrow, x, use_lub, false) {
+                    self.commit_from(save);
                     if *m1 { self.b.reborrows.insert(ex.0, *m2); }
-                    return true;
+                    return Some(target);
                 }
-                self.rollback(save);
+                self.rollback_to(save);
                 if let Some(n) = self.deref_coercion(ex, *ia, *ix) {
                     self.b.coerce.insert(ex.0, Coerce::DerefRef(n));
                     self.b.reborrows.insert(ex.0, *m2);
-                    return true;
+                    return Some(x);
                 }
             }
         }
@@ -2003,28 +1432,24 @@ impl<'a> Fcx<'a> {
                 self.b.coerce.insert(e.0, Coerce::Unsize);
                 if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
             }
-            return true;
+            return Some(x);
         }
         match (&ka, &kx) {
-            (TyKind::FnDef(d, args, _), TyKind::FnPtr(ps, r, c, _)) => {
-                if let Some(sig) = self.tcx.fn_item_sig(self.prog, *d).cloned() {
-                    let args = args.clone();
-                    // a fn item reifies to a pointer of its own ABI (`extern "C" fn` items to
-                    // `extern "C" fn(..)`)
-                    let mut ok = sig.params.len() == ps.len() && sig.header.can_coerce_to(*c);
-                    if ok {
-                        for i in 0..ps.len() {
-                            let p = self.tcx.tys.subst_for_inference(sig.params[i], &args);
-                            ok = ok && self.unify(p, ps[i]);
-                        }
-                        let rr = self.tcx.tys.subst_for_inference(sig.ret, &args);
-                        ok = ok && self.unify(rr, *r);
+            (TyKind::FnDef(d, _, _), TyKind::FnPtr(_, _, target, _)) => {
+                if let Some(pointer) = self.fn_ptr_of(a) {
+                    let TyKind::FnPtr(ps, ret, mut header, bound) = self.tcx.tys.kind(pointer).clone() else { unreachable!() };
+                    // coercion.rs:1270-1282: a safe #[target_feature] fn is a safe pointer only
+                    // where the body has its features (else TargetFeatureCast for a safe target)
+                    if self.tcx.fn_item_sig(self.prog, *d).is_some_and(|s| s.safe_target_features)
+                        && self.tcx.adjust_target_feature_sig(self.prog, *d, self.b.def) {
+                        header.safety = Safety::Safe;
                     }
-                    if ok {
-                        if let Some(e) = e {
-                            self.b.coerce.insert(e.0, Coerce::ReifyFn);
+                    if header.can_coerce_to(*target) {
+                        let pointer = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, *target, bound));
+                        if let Some(target) = self.unify_coercion(pointer, x, use_lub, true) {
+                            if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::ReifyFn); }
+                            return Some(target);
                         }
-                        return true;
                     }
                 }
             }
@@ -2032,12 +1457,12 @@ impl<'a> Fcx<'a> {
                 if header.safety == Safety::Safe && target.safety == Safety::Unsafe => {
                 let unsafe_ty = self.tcx.tys.intern(TyKind::FnPtr(ps.clone(), *r,
                     FnHeader { safety: Safety::Unsafe, ..*header }, *bound));
-                if self.unify(unsafe_ty, x) {
+                if let Some(target) = self.unify_coercion(unsafe_ty, x, use_lub, true) {
                     if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::UnsafeFn); }
-                    return true;
+                    return Some(target);
                 }
             }
-            (TyKind::Closure(file, ce, sig, _, _), TyKind::FnPtr(_, _, target, _)) => {
+            (TyKind::Closure(file, ce, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }), TyKind::FnPtr(_, _, target, _)) => {
                 // coercion.rs:1309: before capture inference, use mentioned
                 // roots to decide whether function-pointer coercion is possible.
                 let captures = *file != self.file || self.b.closure_locals.get(ce).is_some_and(|v| !v.is_empty());
@@ -2046,56 +1471,47 @@ impl<'a> Fcx<'a> {
                         self.tcx.tys.intern(TyKind::FnPtr(ps, r, *target, bound)),
                     _ => *sig,
                 };
-                if !captures && self.unify(pointer, x) {
+                if !captures { if let Some(target) = self.unify_coercion(pointer, x, use_lub, false) {
                     if let Some(e) = e {
                         self.b.coerce.insert(e.0, Coerce::ClosureFn);
                     }
-                    return true;
-                }
+                    return Some(target);
+                } }
             }
             (TyKind::Ref(m1, ia, _), TyKind::Ref(m2, ix, _)) => {
                 let ia = self.shallow(*ia);
                 let ix = self.shallow(*ix);
-                if *m1 && !*m2 && self.unify(ia, ix) {
+                if *m1 && !*m2 && self.unify_raw(ia, ix, false) {
                     if let Some(e) = e {
                         self.b.coerce.insert(e.0, Coerce::MutToConst);
                     }
-                    return true;
+                    return Some(x);
                 }
             }
             // `&mut T -> *mut T`, `&T -> *const T`, `&mut T -> *const T` (same bits)
-            (TyKind::Ref(m1, ia, _), TyKind::Ptr(m2, ix)) if *m1 || !*m2 => {
-                let (ia, ix) = (*ia, *ix);
-                if self.unify(ia, ix) {
+            (TyKind::Ref(m1, ia, _), TyKind::Ptr(m2, _)) if *m1 || !*m2 => {
+                let ia = *ia;
+                let source = self.tcx.tys.intern(TyKind::Ptr(*m2, ia));
+                if let Some(target) = self.unify_coercion(source, x, use_lub, false) {
                     if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::RefToRaw(*m2)); }
-                    return true;
+                    return Some(target);
                 }
             }
             (TyKind::Ptr(true, ia), TyKind::Ptr(false, ix)) => {
-                let (ia, ix) = (*ia, *ix);
-                if self.unify(ia, ix) {
+                let ia = *ia;
+                if self.unify_raw(ia, *ix, false) {
                     if let Some(e) = e {
                         self.b.coerce.insert(e.0, Coerce::MutToConst);
                     }
-                    return true;
+                    return Some(x);
                 }
             }
             _ => {}
         }
-        if self.unify(actual, expected) {
-            return true;
+        if let Some(target) = self.unify_coercion(actual, expected, use_lub, false) {
+            return Some(target);
         }
-        let sa = self.ty_str(a);
-        let sx = self.ty_str(x);
-        // same printed name for different types: show where each is defined
-        let (sx, sa) = if sx == sa {
-            let (x, a2) = (self.deep(expected), self.deep(actual));
-            (ty_to_string_paths(self.prog, self.tcx, x), ty_to_string_paths(self.prog, self.tcx, a2))
-        } else {
-            (sx, sa)
-        };
-        self.err(pos, format!("mismatched types: expected `{}`, found `{}`", sx, sa));
-        false
+        None
     }
 
     /// Casts use coercion adjustments too (rustc cast.rs: try_coercion_cast).
@@ -2112,19 +1528,21 @@ impl<'a> Fcx<'a> {
                 } else {
                     let pointee = self.shallow(pointee);
                     if matches!(self.tcx.tys.kind(pointee), TyKind::Infer(_)) { return; }
-                    let snap = self.snapshot();
-                    if self.unify(inner, pointee) {
+                    let snap = self.start_snapshot();
+                    if self.eq(inner, pointee) {
+                        self.commit_from(snap);
                         self.b.coerce.insert(e.0, Coerce::RefToRaw(tm));
                     } else {
-                        self.rollback(snap);
+                        self.rollback_to(snap);
                         // rustc check_ref_cast: &[T; N] -> *const T first coerces
                         // to a pointer to the array, using the source mutability.
                         let inner = self.shallow(inner);
                         if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
-                            let snap = self.snapshot();
-                            if self.unify(element, pointee) {
+                            let snap = self.start_snapshot();
+                            if self.eq(element, pointee) {
+                                self.commit_from(snap);
                                 self.b.coerce.insert(e.0, Coerce::RefToRaw(sm));
-                            } else { self.rollback(snap); }
+                            } else { self.rollback_to(snap); }
                         }
                     }
                 }
@@ -2135,168 +1553,52 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ writeback
 
-    /// Replaces this body's own opaque types in its return type `ret` (and those nested in their
-    /// bounds' bindings) by fresh inference variables.
-    fn define_opaques(&mut self, def: DefId, ret: TyId) -> TyId {
-        if !self.tcx.tys.has_opaque(ret) {
-            return ret;
-        }
-        let mut todo = Vec::new();
-        self.tcx.tys.opaques_in(ret, &mut todo);
-        let mut own: Vec<TyId> = Vec::new();
-        while let Some(o) = todo.pop() {
-            let (d, i, args) = match self.tcx.tys.kind(o).clone() {
-                TyKind::Opaque(d, i, a, _) => (d, i, a),
-                _ => continue,
-            };
-            if d != def || own.contains(&o) {
-                continue;
-            }
-            own.push(o);
-            let decl = self.tcx.opaques.get(&(d, i)).unwrap_or_default();
-            for (_, _, bt) in decl.bindings {
-                let x = self.tcx.tys.subst_for_inference(bt, &args);
-                self.tcx.tys.opaques_in(x, &mut todo);
+    fn alias_bound_clauses(&self, t: TyId) -> Vec<Predicate> {
+        let TyKind::Alias(_, alias) = self.tcx.tys.kind(t) else { return Vec::new(); };
+        let def = alias.kind.def_id();
+        let args = self.tcx.complete_args(self.prog, def, &alias.args, alias.regions);
+        let mut result = Vec::new();
+        for p in self.tcx.item_bounds(self.prog, def) {
+            let p = self.tcx.instantiate_predicate(self.prog, def, &args, &p);
+            for p in self.tcx.supertraits(self.prog, p) {
+                result.push(p);
             }
         }
-        for o in own {
-            // an opaque already defined here (an async fn's output opaque, reached again through
-            // its `impl Future<Output = ..>`) keeps its variable
-            if self.opaque_vars.iter().any(|x| x.0 == o) {
-                continue;
-            }
-            let v = self.fresh(0);
-            self.opaque_vars.push((o, v));
-        }
-        let pairs = self.opaque_vars.clone();
-        self.tcx.tys.replace(ret, &pairs)
+        result
     }
 
-    /// The hidden types meet their opaque type's bounds: `Assoc = T` bindings constrain them
-    /// (`-> impl Iterator<Item = u64>` types the body's literals as u64; rustc registers the
-    /// opaque's item bounds as obligations on the hidden type).
-    fn opaque_item_bounds(&mut self) {
-        let pairs = self.opaque_vars.clone();
-        for &(o, v) in &pairs {
-            let (d, i, args) = match self.tcx.tys.kind(o).clone() {
-                TyKind::Opaque(d, i, a, _) => (d, i, a),
-                _ => continue,
+    /// rustc_hir_typeck/src/callee.rs:368-452 and method/mod.rs:345-478.
+    /// M7 represents async closures as ordinary closures returning futures.
+    fn try_overloaded_call_traits(&mut self, callee: TyId, nargs: Option<usize>) -> Option<(DefId, TyId, Vec<TyId>, TyId)> {
+        use crate::lang_items::LangItem;
+        for item in [LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::AsyncFn, LangItem::AsyncFnMut, LangItem::AsyncFnOnce] {
+            let Some(td) = self.tcx.lang_items.get(item) else { continue };
+            let tuple = match nargs {
+                Some(n) => self.tcx.tys.intern(TyKind::Tuple((0..n).map(|_| self.infcx.next_ty_var()).collect())),
+                None => self.infcx.next_ty_var(),
             };
-            let decl = self.tcx.opaques.get(&(d, i)).unwrap_or_default();
-            for (ad, ta, bt) in decl.bindings {
-                let mut pa = vec![v];
-                for x in ta {
-                    let x = self.tcx.tys.subst_for_inference(x, &args);
-                    pa.push(self.tcx.tys.replace(x, &pairs));
-                }
-                let proj = self.tcx.tys.intern(TyKind::Assoc(ad, pa, crate::types::RegionArgsId::EMPTY));
-                let saved = self.keep_literal_vars;
-                self.keep_literal_vars = true;
-                let n = self.norm(proj);
-                self.keep_literal_vars = saved;
-                if matches!(self.tcx.tys.kind(n), TyKind::Assoc(..)) {
-                    continue;
-                }
-                let want = self.tcx.tys.subst_for_inference(bt, &args);
-                let want = self.tcx.tys.replace(want, &pairs);
-                self.unify(n, want);
+            let goal = self.trait_goal(td, callee, &[tuple]);
+            if !self.infcx.root_goal_may_hold_opaque_types_jank(self.prog, goal.clone()) { continue; }
+            let method = self.prog.traits[self.prog.def(td).sub as usize].iter().copied()
+                .find(|d| self.prog.def(*d).kind == DefKind::AssocFn).expect("call trait method");
+            let full = self.infer_item_args(method, &[callee, tuple]);
+            let sig = self.tcx.fn_sig(self.prog, method).expect("call trait signature").clone();
+            let (params, ret) = self.instantiate_call_signature(method, &full, &sig);
+            let params: Vec<_> = params.into_iter().map(|t| self.normalize_body_type(t)).collect();
+            let ret = self.normalize_body_type(ret);
+            self.apply_fn_bounds(method, &full, self.last_lo);
+            for &ty in params.iter().chain(std::iter::once(&ret)) {
+                self.register_goal(Goal { param_env: self.param_env.clone(), predicate: Predicate::dummy(
+                    PredicateKind::Clause(crate::next_solver::ClauseKind::WellFormed(crate::next_solver::Term::Ty(ty)))) }, self.last_lo);
             }
-        }
-        self.retry_goals(false);
-    }
-
-    /// A method of an opaque type's bounds: (method, its trait's args when the method is the
-    /// bound trait's own).
-    fn opaque_method(&mut self, t: TyId, s: Sym) -> Option<(DefId, Vec<TyId>)> {
-        let (d, i, args) = match self.tcx.tys.kind(t).clone() {
-            TyKind::Opaque(d, i, a, _) => (d, i, a),
-            _ => return None,
-        };
-        let decl = self.tcx.opaques.get(&(d, i))?;
-        for (td, targs) in &decl.bounds {
-            if let Some(m) = self.dyn_method(*td, s) {
-                let ta = if self.prog.def(m).parent == *td { targs.iter().map(|x| self.tcx.tys.subst_for_inference(*x, &args)).collect() } else { Vec::new() };
-                return Some((m, ta));
-            }
+            let tuple = self.infcx.shallow_resolve(params[1]);
+            let inputs = match self.tcx.tys.kind(tuple) { TyKind::Tuple(ps) => ps.clone(), TyKind::Error => Vec::new(), _ => {
+                self.err(self.last_lo, "call trait arguments must be a tuple".into());
+                Vec::new()
+            } };
+            return Some((td, tuple, inputs, ret));
         }
         None
-    }
-
-    /// `impl Fn(A) -> R`'s signature.
-    fn opaque_fn_sig(&mut self, t: TyId) -> Option<(Vec<TyId>, TyId)> {
-        let (d, i, owner_args) = match self.tcx.tys.kind(t).clone() {
-            TyKind::Opaque(d, i, a, _) => (d, i, a),
-            _ => return None,
-        };
-        let decl = self.tcx.opaques.get(&(d, i))?;
-        for (td, args) in decl.bounds {
-            if let Some(output) = self.tcx.callable_output(td) {
-                if let Some(TyKind::Tuple(ps)) = args.first().map(|t| self.tcx.tys.kind(*t)) {
-                    for (ad, _, ret) in &decl.bindings {
-                        if *ad == output {
-                            let mut params = Vec::new();
-                            for t in ps { params.push(self.tcx.tys.subst_for_inference(*t, &owner_args)); }
-                            return Some((params, self.tcx.tys.subst_for_inference(*ret, &owner_args)));
-                        }
-                    }
-                }
-            }
-        }
-        None
-    }
-
-
-    /// The unbound variables in `t` (already resolved by `deep`).
-    fn free_vars(&self, t: TyId, out: &mut Vec<u32>) {
-        match self.tcx.tys.kind(t) {
-            TyKind::Infer(v) => {
-                if !out.contains(v) {
-                    out.push(*v);
-                }
-            }
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Assoc(_, v, _) | TyKind::Opaque(_, _, v, _) => v.iter().for_each(|x| self.free_vars(*x, out)),
-            TyKind::Array(e, l) => {
-                self.free_vars(*e, out);
-                if let Some(x) = crate::types::len_ty(*l) {
-                    self.free_vars(x, out);
-                }
-            }
-            TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.free_vars(*e, out),
-            TyKind::FnPtr(ps, r, _, _) => {
-                ps.iter().for_each(|x| self.free_vars(*x, out));
-                self.free_vars(*r, out)
-            }
-            TyKind::Dyn(_, v, bs, _, _, _, _) => {
-                v.iter().for_each(|x| self.free_vars(*x, out));
-                bs.iter().for_each(|x| self.free_vars(x.1, out))
-            }
-            TyKind::Closure(_, _, sg, u, _) => {
-                self.free_vars(*sg, out);
-                self.free_vars(*u, out)
-            }
-            _ => {}
-        }
-    }
-
-    /// Retry trait predicates through selection before and after numeric fallback.
-    /// rustc_hir_typeck/src/fallback.rs:select_obligations_where_possible.
-    fn select_literal_obligations(&mut self, _after_fallback: bool) {
-        let mut uses = Vec::new();
-        for (key, args) in &self.b.res_args {
-            if let Some(Res::Def(def)) = self.b.res.get(key) { uses.push((*def, args.clone())); }
-        }
-        for method in self.b.methods.values().chain(self.b.binops.values()) { uses.push((method.def, method.args.clone())); }
-        for (def, args) in uses {
-            if let Some(bounds) = self.tcx.fn_trait_bounds(self.prog, def).cloned() { self.infer_from_bounds_inner(&args, bounds); }
-            let td = self.prog.def(def).parent;
-            if td == NO_DEF || self.prog.def(td).kind != DefKind::Trait || args.is_empty() { continue; }
-            let n = self.tcx.trait_generic_count(self.prog, td);
-            if args.len() > n {
-                let goal = crate::solve::select::trait_goal(&self.cx, td, args[0], &args[1..=n]);
-                self.register_goal(goal, self.last_lo);
-            }
-        }
-        self.retry_goals(false);
     }
 
     /// A diverging scrutinee (`match return 1 { 2 => .. }`): rustc types it against a fresh
@@ -2321,20 +1623,20 @@ impl<'a> Fcx<'a> {
             self.b.coerce.insert(ex.0, Coerce::ToDyn(src, dy));
         } else if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
             self.b.coerce.insert(ex.0, Coerce::Upcast(sd, dd));
-        } else if !self.unify(sa, sx) {
+        } else if !self.eq(sa, sx) {
             let (p, q) = (self.ty_str(sx), self.ty_str(sa));
             self.err(pos, format!("mismatched types: expected `{}`, found `{}`", p, q));
         }
     }
 
-    /// rustc upvar.rs:76, 157, 540: analyze nested bodies before their parents,
-    /// infer kind, equate upvars, then let deferred obligations see the result.
+    /// rustc_hir_typeck/src/upvar.rs:457-465,625-626: equate kind and minimum
+    /// capture types after processing nested bodies, before retrying obligations.
     fn analyze_closures(&mut self) {
         if self.pending_captures.is_empty() || !self.b.errors.is_empty() { return; }
         // The visitor's type queries must see this inference context's assignments.
         for i in 0..self.b.locals.len() { self.b.locals[i].ty = self.norm(self.b.locals[i].ty); }
-        for i in 0..self.b.expr_ty.len() { self.b.expr_ty[i] = self.norm(self.b.expr_ty[i]); }
-        for i in 0..self.b.pat_ty.len() { self.b.pat_ty[i] = self.norm(self.b.pat_ty[i]); }
+        for i in 0..self.b.expr_ty.len() { if self.b.expr_typed[i] { self.b.expr_ty[i] = self.norm(self.b.expr_ty[i]); } }
+        for i in 0..self.b.pat_ty.len() { if self.b.pat_typed[i] { self.b.pat_ty[i] = self.norm(self.b.pat_ty[i]); } }
         for k in self.b.methods.keys().copied().collect::<Vec<_>>() {
             let args = self.b.methods[&k].args.clone();
             self.b.methods.get_mut(&k).unwrap().args = args.into_iter().map(|t| self.norm(t)).collect();
@@ -2345,7 +1647,7 @@ impl<'a> Fcx<'a> {
             self.b.ov_derefs.insert(k, (method, args));
         }
         for pending in std::mem::take(&mut self.pending_captures) {
-            crate::upvar::analyze(&self.cx, self.prog, self.tcx, &mut self.b, &pending);
+            crate::upvar::analyze(&self.cx.with_infcx(&self.infcx), self.prog, self.tcx, &mut self.b, &pending);
             let ce = pending.closure;
             let result = &self.b.min_captures[&ce];
             if !result.errors.is_empty() {
@@ -2356,24 +1658,19 @@ impl<'a> Fcx<'a> {
                 }
                 continue;
             }
-            let once = result.kind == crate::upvar::ClosureKind::FnOnce;
-            let up = crate::upvar::derive_root_view(self.tcx, &mut self.b, ce);
-            let caps = &self.b.closure_locals[&ce];
-            let mut fields = up;
-            // Existing lowering ABI: coroutines need drop flags for owned state;
-            // ordinary closures need them only for the consuming call body.
-            let flags = if pending.points.is_some() { self.b.capture_by_value[&ce].iter().any(|v| *v) } else { once };
-            if flags {
-                fields.extend(std::iter::repeat(self.tcx.tys.prim(Prim::U8)).take(caps.len()));
-                let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), crate::types::RegionArgsId::EMPTY));
-                self.tcx.closure_once.insert((self.file, ce, owner), ());
-            }
-            if let Some(points) = pending.points {
-                let states = points as u64 + 3;
-                fields.push(self.tcx.tys.prim(if states <= 1 << 8 { Prim::U8 } else if states <= 1 << 16 { Prim::U16 } else { Prim::U32 }));
+            let kind = self.tcx.tys.from_closure_kind(result.kind);
+            let mut fields = Vec::new();
+            for capture in &result.captures {
+                let ty = capture.place.ty();
+                fields.push(match capture.info.kind {
+                    crate::upvar::CaptureKind::ByValue => ty,
+                    crate::upvar::CaptureKind::ByRef(kind) => self.tcx.tys.intern(TyKind::Ref(
+                        kind != crate::expr_use::BorrowKind::Imm, ty, crate::types::RegionId::ERASED)),
+                });
             }
             let up = self.tcx.tys.intern(TyKind::Tuple(fields));
-            self.unify(pending.upvars, up);
+            self.eq(pending.upvars, up);
+            if matches!(self.tcx.tys.kind(self.infcx.shallow_resolve(pending.kind)), TyKind::Infer(_)) { self.eq(pending.kind, kind); }
         }
     }
 
@@ -2391,47 +1688,11 @@ impl<'a> Fcx<'a> {
             }
         }
         self.retry_goals(false);
-        // closures' `?`s whose error type the whole body left open: Relax's fallback (the first
-        // `?`'s error; rustc asks for an annotation), the others through From
-        if !self.pending_tries.is_empty() {
-            self.finish_tries_at(None, true);
-        }
-        self.flush_projection_relations();
         self.check_repeat_exprs();
-        self.select_literal_obligations(false);
-        self.flush_projection_relations();
+        // rustc_hir_typeck/src/lib.rs:226-230: defining uses may guide inference
+        // before fallback.
+        self.try_handle_opaque_type_uses_next();
         self.retry_goals(false);
-        for (x, xt, target) in std::mem::take(&mut self.deferred_casts) {
-            let (sx, st) = (self.shallow(xt), self.shallow(target));
-            let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
-            // rustc cast.rs try_coercion_cast: a cast that is a coercion is one (`Arc::new(v) as _`
-            // whose `_` became `Arc<dyn Send + Sync>`, `&s as _` as `&dyn Tr`)
-            if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
-                self.b.coerce.insert(x.0, Coerce::ToDyn(src, dy));
-            } else if let Some((sd, dd)) = self.dyn_upcast(&kx, &kt) {
-                self.b.coerce.insert(x.0, Coerce::Upcast(sd, dd));
-            } else if self.unsize_coercion(&kx, &kt) {
-                self.b.coerce.insert(x.0, Coerce::Unsize);
-            } else if let (TyKind::Ref(_, a, _) | TyKind::Ptr(_, a), TyKind::Ptr(_, p)) = (&kx, &kt) {
-                // rustc cast.rs try_coercion_cast (casts are checked after inference): a cast
-                // that is a coercion is one, so `&() as *const _` has pointee `()`; a pointee
-                // already known to differ makes it a plain pointer cast
-                let sp = self.shallow(*p);
-                // (also an open source pointee against a known target: `&data as *const *const ()`
-                // with data: *const ?T is the coercion &*const ?T -> *const *const (), T = ())
-                if matches!(self.tcx.tys.kind(sp), TyKind::Infer(_)) || self.has_open_infer(*a) {
-                    let snap = self.snapshot();
-                    if !self.unify(*a, sp) {
-                        self.rollback(snap);
-                    }
-                }
-            }
-            self.record_cast_borrow(x, xt, target);
-        }
-        // pending pointer-to-dyn coercions, now that their pointees are known
-        for (ex, a, x, pos) in std::mem::take(&mut self.deferred_dyn) {
-            self.finish_dyn_coercion(ex, a, x, pos);
-        }
         // diverging fallback (rustc fallback.rs): a variable only a `!` value flowed into is `()`
         // before edition 2024 and `!` from 2024 (`f(|_| panic!())` instantiates R = ())
         if !self.diverging.is_empty() {
@@ -2440,255 +1701,64 @@ impl<'a> Fcx<'a> {
             for v in std::mem::take(&mut self.diverging) {
                 let s = self.shallow(v);
                 if matches!(self.tcx.tys.kind(s), TyKind::Infer(_)) {
-                    self.unify(s, fb);
+                    self.eq(s, fb);
                 }
             }
-            self.retry_goals(false);
         }
         // integer/float literal fallback happens once, at the end (rustc fallback.rs)
         self.keep_literal_vars = false;
-        self.select_literal_obligations(true);
+        let (ints, floats) = { let mut inner = self.infcx.inner.borrow_mut(); (inner.int_unification_table().len(), inner.float_unification_table().len()) };
+        for v in 0..ints as u32 {
+            let t = self.tcx.tys.intern(TyKind::IntVar(v));
+            if matches!(self.tcx.tys.kind(self.infcx.shallow_resolve(t)), TyKind::IntVar(_)) { self.eq(t, self.tcx.tys.i32_); }
+        }
+        for v in 0..floats as u32 {
+            let t = self.tcx.tys.intern(TyKind::FloatVar(v));
+            if matches!(self.tcx.tys.kind(self.infcx.shallow_resolve(t)), TyKind::FloatVar(_)) { self.eq(t, self.tcx.tys.f64_); }
+        }
         self.retry_goals(false);
+        for (x, xt, target) in std::mem::take(&mut self.deferred_casts) {
+            // cast.rs:check/try_coercion_cast and check_ref_cast:1215-1251:
+            // fallback precedes coercion, then the array-to-element exception.
+            if self.try_coerce(xt, target, Some(x)) { continue; }
+            let sx = self.shallow(xt);
+            let st = self.shallow(target);
+            if let (TyKind::Ref(source_mut, inner, _), TyKind::Ptr(target_mut, pointee)) =
+                (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone()) {
+                let mut array_cast = false;
+                if source_mut || !target_mut {
+                    if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
+                        let snapshot = self.start_snapshot();
+                        if self.eq(element, pointee) {
+                            self.commit_from(snapshot);
+                            self.b.coerce.insert(x.0, Coerce::RefToRaw(source_mut));
+                            array_cast = true;
+                        } else { self.rollback_to(snapshot); }
+                    }
+                }
+                if !array_cast { self.err(self.ast().expr(x).lo, "E0606: casting reference to an incompatible pointer is invalid".into()); }
+            }
+            self.record_cast_borrow(x, xt, target);
+        }
+        // pending pointer-to-dyn coercions, now that their pointees are known
+        for (ex, a, x, pos) in std::mem::take(&mut self.deferred_dyn) {
+            self.finish_dyn_coercion(ex, a, x, pos);
+        }
         self.analyze_closures();
-        crate::upvar::publish(self.prog, self.tcx, &self.b);
-        self.retry_goals(false);
-        // codegen sees through opaque types: the hidden types are recorded first (this body
-        // defines its own), then every type is revealed
-        self.revealing = true;
-        // the bounds' bindings constrain the hidden types first (rustc: the opaque's item bounds
-        // are obligations on the hidden type): `impl Iterator<Item = u8>` returning `Empty<?T>`
-        // makes T = u8, `impl Trait<Assoc = impl Send>` returning 42 makes the nested opaque's
-        // hidden type `<i32 as Trait>::Assoc`
-        for _ in 0..2 {
-            for (o, v) in self.opaque_vars.clone() {
-                let (d, i, args) = match self.tcx.tys.kind(o).clone() {
-                    TyKind::Opaque(d, i, a, _) => (d, i, a),
-                    _ => continue,
-                };
-                let hv = self.deep(v);
-                if matches!(self.tcx.tys.kind(hv), TyKind::Infer(_)) {
-                    continue;
-                }
-                let decl = self.tcx.opaques.get(&(d, i)).unwrap_or_default();
-                for (ad, ta, bt) in decl.bindings {
-                    let mut pa = vec![hv];
-                    for x in ta {
-                        let x = self.tcx.tys.subst_for_inference(x, &args);
-                        pa.push(self.deep(x));
-                    }
-                    let proj = self.tcx.tys.intern(TyKind::Assoc(ad, pa, crate::types::RegionArgsId::EMPTY));
-                    let have = self.norm_keep(proj);
-                    if matches!(self.tcx.tys.kind(have), TyKind::Assoc(..)) {
-                        continue;
-                    }
-                    let want = self.tcx.tys.subst_for_inference(bt, &args);
-                    // nested opaques in the binding: their hidden types' variables
-                    let pairs: Vec<(TyId, TyId)> = self.opaque_vars.clone();
-                    let want = if self.tcx.tys.has_opaque(want) { self.tcx.tys.replace(want, &pairs) } else { want };
-                    let save = self.snapshot();
-                    if !self.unify(have, want) {
-                        self.rollback(save);
-                    }
-                }
+        for call in std::mem::take(&mut self.deferred_call_resolutions) { call.resolve(self); }
+        // rustc_hir_typeck/src/lib.rs:244-247: closure analysis precedes
+        // normalization and registration of fn-item Sized obligations.
+        for (ty, lo) in std::mem::take(&mut self.deferred_sized_obligations) {
+            let ty = self.norm(ty);
+            if self.tcx.tys.has_error(ty) { continue; }
+            if let Some(sized) = self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) {
+                let goal = self.trait_goal(sized, ty, &[]);
+                self.register_goal(goal, lo);
             }
         }
-        for (o, v) in self.opaque_vars.clone() {
-            let h = self.norm(v);
-            // inference variables are this body's: a hidden type left open cannot leave it
-            let h = if self.tcx.tys.has_infer(h) {
-                if self.b.errors.is_empty() {
-                    let lo = self.ast().item(self.prog.def(self.b.def).item).lo;
-                    let ts = self.ty_str(h);
-                    self.err(lo, format!("the returned `impl Trait`'s type is not fully known (`{}`)", ts));
-                }
-                self.tcx.tys.error
-            } else {
-                h
-            };
-            self.tcx.opaque_hidden.insert(o, h);
-        }
-        if !self.opaque_vars.is_empty() {
-            self.tcx.trait_input_revision.fetch_add(1, std::sync::atomic::Ordering::Release);
-        }
         self.retry_goals(false);
-        // the hidden types must meet their bounds' bindings: callers were typed by them
-        for (o, _) in self.opaque_vars.clone() {
-            let (d, i, args) = match self.tcx.tys.kind(o).clone() {
-                TyKind::Opaque(d, i, a, _) => (d, i, a),
-                _ => continue,
-            };
-            let h = self.tcx.opaque_hidden.get(&o).unwrap_or(self.tcx.tys.error);
-            let decl = self.tcx.opaques.get(&(d, i)).unwrap_or_default();
-            for (ad, ta, bt) in decl.bindings {
-                let mut pa = vec![h];
-                for x in ta {
-                    let x = self.tcx.tys.subst_for_inference(x, &args);
-                    pa.push(self.norm(x));
-                }
-                let proj = self.tcx.tys.intern(TyKind::Assoc(ad, pa, crate::types::RegionArgsId::EMPTY));
-                let have = self.norm(proj);
-                let want = self.tcx.tys.subst_for_inference(bt, &args);
-                let want = self.norm(want);
-                if have != want && self.b.errors.is_empty() && !self.tcx.tys.has_error(have) && !self.tcx.tys.has_error(want) {
-                    let lo = self.ast().item(self.prog.def(self.b.def).item).lo;
-                    let (x, y, z) = (self.ty_str(h), self.ty_str(have), self.ty_str(want));
-                    let n = self.prog.syms.str(self.prog.def(ad).name).to_string();
-                    self.err(lo, format!("the returned `{}` has `{} = {}`, but the signature promises `{} = {}`", x, n, y, n, z));
-                }
-            }
-        }
+        self.handle_opaque_type_uses_next();
         self.finish_closure_signatures();
-        let mut err_at = None;
-        for i in 0..self.b.expr_ty.len() {
-            let t = self.b.expr_ty[i];
-            let n = self.norm(t);
-            self.b.expr_ty[i] = n;
-            if err_at.is_none() && n != self.tcx.tys.error && (self.tcx.tys.has_error(n) || self.tcx.tys.has_stuck_assoc(n) || self.tcx.tys.has_opaque(n)) {
-                err_at = Some(i);
-            }
-        }
-        // an expression whose type contains an unresolved type (e.g. a field of an unresolved
-        // type) cannot be lowered: report it unless an error already explains the function
-        if let (Some(i), true) = (err_at, self.b.errors.is_empty()) {
-            let e = self.b.expr_at(i);
-            let lo = self.ast().expr(e).lo;
-            let ts = self.ty_str(self.b.expr_ty[i]);
-            if self.tcx.tys.has_opaque(self.b.expr_ty[i]) {
-                self.err(lo, format!("cannot infer the `impl Trait` type `{}` -- annotate the generic arguments", ts));
-            } else if self.tcx.tys.has_stuck_assoc(self.b.expr_ty[i]) {
-                self.err(lo, format!("no impl resolves `{}` -- the trait is not implemented for these types", ts));
-            } else {
-                self.err(lo, format!("type `{}` contains an unresolved type -- fix that type's error first", ts));
-            }
-        }
-        for i in 0..self.b.pat_ty.len() {
-            let t = self.b.pat_ty[i];
-            self.b.pat_ty[i] = self.norm(t);
-        }
-        for i in 0..self.b.locals.len() {
-            let t = self.b.locals[i].ty;
-            let n = self.norm(t);
-            self.b.locals[i].ty = n;
-            // a local whose type inference left open cannot be laid out
-            if self.b.errors.is_empty() && self.tcx.tys.has_infer(n) {
-                let p = self.b.locals[i].pat;
-                let _ = p;
-                let lo = self.ast().item(self.prog.def(self.b.def).item).lo;
-                let name = self.prog.syms.str(self.b.locals[i].name).to_string();
-                let ts = self.ty_str(n);
-                self.err(lo, format!("type of `{}` is not fully known (`{}`) -- annotate: let {}: T", name, ts, name));
-            }
-        }
-        let r = self.b.ret;
-        self.b.ret = self.norm(r);
-        let keys: Vec<u32> = self.b.res_args.keys().copied().collect();
-        for k in keys {
-            let v = self.b.res_args[&k].clone();
-            let mut n = Vec::new();
-            for t in v {
-                n.push(self.norm(t));
-            }
-            self.b.res_args.insert(k, n);
-        }
-        let keys: Vec<u32> = self.b.methods.keys().copied().collect();
-        for k in keys {
-            let v = self.b.methods[&k].args.clone();
-            let mut n = Vec::new();
-            for t in v {
-                n.push(self.norm(t));
-            }
-            self.b.methods.get_mut(&k).unwrap().args = n;
-        }
-        // every recorded instantiation gets its projections resolved (layout and intrinsics
-        // of `A::Item` inside generic code, F-STD14)
-        let keys: Vec<(u32, u8)> = self.b.ov_derefs.keys().copied().collect();
-        for k in keys {
-            let (d, v) = self.b.ov_derefs[&k].clone();
-            let n: Vec<TyId> = v.iter().map(|t| self.norm(*t)).collect();
-            self.b.ov_derefs.insert(k, (d, n));
-        }
-        let keys: Vec<u32> = self.b.ov_index.keys().copied().collect();
-        for k in keys {
-            let (d, v) = self.b.ov_index[&k].clone();
-            let n: Vec<TyId> = v.iter().map(|t| self.norm(*t)).collect();
-            self.b.ov_index.insert(k, (d, n));
-        }
-        let keys: Vec<u32> = self.b.for_next.keys().copied().collect();
-        for k in keys {
-            let (d, v) = self.b.for_next[&k].clone();
-            let n: Vec<TyId> = v.iter().map(|t| self.norm(*t)).collect();
-            self.b.for_next.insert(k, (d, n));
-        }
-        let keys: Vec<u32> = self.b.for_into.keys().copied().collect();
-        for k in keys {
-            let (d, v, it) = self.b.for_into[&k].clone();
-            let n: Vec<TyId> = v.iter().map(|t| self.norm(*t)).collect();
-            let it = self.norm(it);
-            self.b.for_into.insert(k, (d, n, it));
-        }
-        let keys: Vec<u32> = self.b.try_conv.keys().copied().collect();
-        for k in keys {
-            if let Some((d, v)) = self.b.try_conv[&k].clone() {
-                let n: Vec<TyId> = v.iter().map(|t| self.norm(*t)).collect();
-                self.b.try_conv.insert(k, Some((d, n)));
-            }
-        }
-        // a call whose generic args are still unknown cannot be instantiated: diagnose it here
-        // (instead of an internal error when the instance is compiled)
-        // rustc_hir_typeck/src/writeback.rs:916: a body already tainted by errors does
-        // not emit another inference failure (its closure captures may be unresolved).
-        if self.b.errors.is_empty() {
-            let mut stuck: Vec<(u32, DefId)> = Vec::new();
-            let ast = self.ast();
-            for (k, v) in &self.b.res_args {
-                // res_args keys are expr or pat ids (shared number space): only path
-                // expressions of this body are calls' callees
-                let in_body = self.b.has_expr(ExprId(*k));
-                if !in_body || self.b.pat_res.contains_key(k) || !matches!(ast.expr(ExprId(*k)).kind, ExprKind::Path(_)) {
-                    continue;
-                }
-                if v.iter().any(|t| self.tcx.tys.has_infer(*t)) {
-                    if let Some(Res::Def(d)) = self.b.res.get(k) {
-                        if matches!(self.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
-                            stuck.push((*k, *d));
-                        }
-                    }
-                }
-            }
-            for (k, m) in &self.b.methods {
-                if m.args.iter().any(|t| self.tcx.tys.has_infer(*t)) {
-                    stuck.push((*k, m.def));
-                }
-            }
-            stuck.sort_by_key(|x| x.0);
-            if let Some(&(k, d)) = stuck.first() {
-                let lo = if self.b.has_expr(ExprId(k)) { ast.expr(ExprId(k)).lo } else { self.last_lo };
-                let n = self.prog.def_path(d);
-                self.err(lo, format!("cannot infer the generic arguments of `{}` -- annotate the types (e.g. `let x: T = ..` or `::<T>`)", n));
-            }
-        }
-        // unsize-to-dyn coercions recorded before inference finished (`&mut FmtAdapter<?W>`
-        // as `&mut dyn Write`): their vtable is built from these types
-        let keys: Vec<u32> = self.b.coerce.keys().copied().collect();
-        for k in keys {
-            if let Some(Coerce::ToDyn(src, dy)) = self.b.coerce.get(&k).copied() {
-                let (s2, d2) = (self.norm(src), self.norm(dy));
-                self.b.coerce.insert(k, Coerce::ToDyn(s2, d2));
-            }
-            if let Some(Coerce::Upcast(src, dy)) = self.b.coerce.get(&k).copied() {
-                let (s2, d2) = (self.norm(src), self.norm(dy));
-                self.b.coerce.insert(k, Coerce::Upcast(s2, d2));
-            }
-        }
-        let keys: Vec<u32> = self.b.binops.keys().copied().collect();
-        for k in keys {
-            let v = self.b.binops[&k].args.clone();
-            let mut n = Vec::new();
-            for t in v {
-                n.push(self.norm(t));
-            }
-            self.b.binops.get_mut(&k).unwrap().args = n;
-        }
         // Capture types may contain an inner closure's formerly open upvar
         // tuple. Resolve these through the same context as expression/local types.
         let mut captures = std::mem::take(&mut self.b.min_captures);
@@ -2698,8 +1768,26 @@ impl<'a> Fcx<'a> {
         }
         self.b.min_captures = captures;
         crate::upvar::coroutine_closure_views(self.prog, self.tcx, &mut self.b);
-        crate::upvar::publish(self.prog, self.tcx, &self.b);
+        crate::upvar::dump_captures(self.prog, &self.b);
         self.retry_goals(true);
+        self.resolve_type_vars_in_body();
+        for i in 0..self.b.expr_ty.len() {
+            let e = ExprId(if i < self.b.expr_n1 as usize { self.b.expr_lo + i as u32 } else { self.b.expr_lo2 + i as u32 - self.b.expr_n1 });
+            // rustc_hir_typeck/src/writeback.rs:152-165: scalar operators use
+            // builtin lowering after their trait obligations have been checked.
+            let scalar = |t: TyId| matches!(self.tcx.tys.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::FnPtr(..) | TyKind::FnDef(..));
+            match self.ast().expr(e).kind {
+                ExprKind::Unary(UnOp::Neg | UnOp::Not, inner) => {
+                    if scalar(self.b.ty(inner)) { self.b.binops.remove(&e.0); }
+                }
+                // writeback.rs:162-176: a comparison whose (formerly inferred) operands are scalars
+                ExprKind::Binary(op, l, r) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
+                    if scalar(self.b.ty(l)) && scalar(self.b.ty(r)) { self.b.binops.remove(&e.0); }
+                }
+                _ => {}
+            }
+        }
+        self.detect_opaque_types_added_during_writeback();
     }
 
     // ------------------------------------------------------------ scopes
@@ -2742,6 +1830,9 @@ impl<'a> Fcx<'a> {
         let i = self.b.expr_ix(e);
         if i < self.b.expr_ty.len() {
             self.b.expr_ty[i] = t;
+            self.b.expr_typed[i] = true;
+            // rustc_hir_typeck/src/fn_ctxt/_impl.rs:194: write_ty taints on error types.
+            if self.tcx.tys.flags(t).intersects(crate::types::TypeFlags::HAS_ERROR) { self.infcx.set_tainted_by_errors(); }
         }
     }
 
@@ -2753,6 +1844,8 @@ impl<'a> Fcx<'a> {
         let pi = self.b.pat_ix(p);
         if pi < self.b.pat_ty.len() {
             self.b.pat_ty[pi] = expected;
+            self.b.pat_typed[pi] = true;
+            if self.tcx.tys.flags(expected).intersects(crate::types::TypeFlags::HAS_ERROR) { self.infcx.set_tainted_by_errors(); }
         }
         // match ergonomics: a structural pattern against references matches through them and
         // switches the default binding mode to `ref` / `ref mut`
@@ -2781,9 +1874,9 @@ impl<'a> Fcx<'a> {
         let mut expected = expected;
         let saved_mode = self.bind_mode;
         if structural {
-            let mut n = 0u8;
+            let mut n = 0usize;
             loop {
-                let s = self.shallow_with_regions(expected);
+                let s = self.shallow(expected);
                 match self.tcx.tys.kind(s).clone() {
                     TyKind::Ref(m, inner, _) => {
                         n += 1;
@@ -2858,7 +1951,7 @@ impl<'a> Fcx<'a> {
                         let k = self.prog.def(d).kind;
                         if matches!(k, DefKind::Const | DefKind::Variant | DefKind::Struct | DefKind::AssocConst) {
                             self.b.pat_res.insert(p.0, Res::Def(d));
-                            let t = self.value_def_ty(d, None, p.0 | PAT_KEY, 0);
+                            let t = self.value_def_ty(d, None, p.0 | PAT_KEY);
                             self.coerce_or_unify(t, expected, None, name.lo);
                             return;
                         }
@@ -2894,15 +1987,15 @@ impl<'a> Fcx<'a> {
             Pat::Range(a, b, _) => {
                 if let Some(a) = a {
                     let t = self.check_expr(*a, Some(expected));
-                    self.unify(t, expected);
+                    self.eq(t, expected);
                 }
                 if let Some(b) = b {
                     let t = self.check_expr(*b, Some(expected));
-                    self.unify(t, expected);
+                    self.eq(t, expected);
                 }
             }
             Pat::Tuple(v) => {
-                let et = self.shallow_with_regions(expected);
+                let et = self.shallow(expected);
                 let elems = match self.tcx.tys.kind(et).clone() {
                     TyKind::Tuple(x) => x,
                     _ => {
@@ -2911,7 +2004,7 @@ impl<'a> Fcx<'a> {
                             x.push(self.fresh(0));
                         }
                         let tt = self.tcx.tys.intern(TyKind::Tuple(x.clone()));
-                        self.unify(tt, et);
+                        self.eq(tt, et);
                         x
                     }
                 };
@@ -2919,7 +2012,7 @@ impl<'a> Fcx<'a> {
             }
             Pat::Paren(x) => self.check_pat(*x, expected),
             Pat::Ref(_, x) => {
-                let et = self.shallow_with_regions(expected);
+                let et = self.shallow(expected);
                 let inner = match self.tcx.tys.kind(et).clone() {
                     TyKind::Ref(_, i, _) => i,
                     _ => self.tcx.tys.error,
@@ -2943,7 +2036,7 @@ impl<'a> Fcx<'a> {
                     for (s, li) in added {
                         if let Some(&(_, l0)) = first.iter().find(|b| b.0 == s) {
                             let (t0, t1) = (self.b.locals[l0 as usize].ty, self.b.locals[li as usize].ty);
-                            self.unify(t1, t0);
+                            self.eq(t1, t0);
                             let pp = self.b.locals[li as usize].pat;
                             self.b.pat_local.insert(pp, l0);
                         }
@@ -2951,9 +2044,9 @@ impl<'a> Fcx<'a> {
                 }
             }
             Pat::Slice(v) => {
-                let et = self.shallow_with_regions(expected);
+                let et = self.shallow(expected);
                 let (elem, n) = match self.tcx.tys.kind(et).clone() {
-                    TyKind::Array(e, n) => (e, Some(n)),
+                    TyKind::Array(e, n) => (e, n.try_to_target_usize(&self.tcx.tys)),
                     TyKind::Slice(e) => (e, None),
                     _ => {
                         if !matches!(self.tcx.tys.kind(et), TyKind::Error | TyKind::Infer(_)) {
@@ -2964,15 +2057,13 @@ impl<'a> Fcx<'a> {
                     }
                 };
                 let fixed = self.ast().list(*v).iter().filter(|x| !is_rest_pat(ast, **x)).count() as u64;
-                // an array whose length is still open (`let [a, b] = array::from_fn(..)`): a
-                // pattern without `..` gives it (rustc pat.rs check_array_pat_len)
-                let mut n = n;
-                if let Some(len) = n {
-                    let open = crate::types::len_ty(len).is_some_and(|lt| matches!(self.tcx.tys.kind(self.shallow(lt)), TyKind::Infer(_)));
-                    if open && fixed as usize == v.len() {
-                        let want = self.tcx.tys.intern(TyKind::Array(elem, fixed));
-                        self.unify(et, want);
-                        n = Some(fixed);
+                // rustc_hir_typeck/src/pat.rs: check_pat_slice: an array
+                // pattern without a rest fixes an inferred array length.
+                if !self.ast().list(*v).iter().any(|x| is_rest_pat(ast, *x)) {
+                    if let TyKind::Array(_, len) = self.tcx.tys.kind(et) {
+                        let actual = self.tcx.tys.intern(TyKind::Const(*len));
+                        let expected = self.tcx.tys.intern(TyKind::Const(self.tcx.tys.const_usize(fixed)));
+                        if !self.eq(actual, expected) { self.err(self.last_lo, "array pattern length mismatch".into()); }
                     }
                 }
                 for x in self.ast().list(*v) {
@@ -2983,7 +2074,7 @@ impl<'a> Fcx<'a> {
                         if let Pat::Rest = ast.pat(*s) {
                             // `name @ ..`: the subslice / subarray
                             let st = match n {
-                                Some(n) => self.tcx.tys.intern(TyKind::Array(elem, n.saturating_sub(fixed))),
+                                Some(n) => self.tcx.tys.intern(TyKind::Array(elem, self.tcx.tys.const_usize(n.saturating_sub(fixed)))),
                                 None => self.tcx.tys.intern(TyKind::Slice(elem)),
                             };
                             self.check_pat(*x, st);
@@ -3015,7 +2106,7 @@ impl<'a> Fcx<'a> {
                     let adt_ty = self.instantiate_adt(adt_ty);
                     let adt_ty = if self.prog.def(dd).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
                     self.coerce_or_unify(adt_ty, expected, None, path.lo);
-                    let et = self.shallow_with_regions(expected);
+                    let et = self.shallow(expected);
                     let mut mentioned: Vec<u32> = Vec::new();
                     let mut bad = false;
                     for fp in self.ast().list(*fields) {
@@ -3063,7 +2154,6 @@ impl<'a> Fcx<'a> {
     fn check_assignee(&mut self, a: ExprId, t: TyId, lo: u32) {
         let ast = self.ast();
         let is_rest = |x: ExprId| matches!(ast.expr(x).kind, ExprKind::Range(None, None, false));
-        let pi = self.b.expr_ix(a);
         match ast.expr(a).kind.clone() {
             ExprKind::Paren(x) if is_rest(x) => {}
             ExprKind::Paren(x) => {
@@ -3081,7 +2171,7 @@ impl<'a> Fcx<'a> {
                         }
                         let v: Vec<TyId> = self.ast().list(elems).iter().map(|_| self.fresh(0)).collect();
                         let tt = self.tcx.tys.intern(TyKind::Tuple(v.clone()));
-                        self.unify(st, tt);
+                        self.eq(st, tt);
                         v
                     }
                 };
@@ -3107,8 +2197,8 @@ impl<'a> Fcx<'a> {
                     TyKind::Array(e, _) | TyKind::Slice(e) => e,
                     _ => {
                         let e = self.fresh(0);
-                        let at = self.tcx.tys.intern(TyKind::Array(e, elems.len() as u64));
-                        self.unify(st, at);
+                        let at = self.tcx.tys.intern(TyKind::Array(e, self.tcx.tys.const_usize(elems.len() as u64)));
+                        self.eq(st, at);
                         e
                     }
                 };
@@ -3129,7 +2219,7 @@ impl<'a> Fcx<'a> {
                 if let Res::Def(d) = r {
                     let (adt_ty, vi) = self.adt_of_ctor(d);
                     let adt_ty = self.instantiate_adt(adt_ty);
-                    self.unify(adt_ty, t);
+                    self.eq(adt_ty, t);
                     let n = args.len();
                     let r = self.ast().list(args).iter().position(|x| is_rest(*x));
                     let sat = self.shallow(adt_ty);
@@ -3157,7 +2247,7 @@ impl<'a> Fcx<'a> {
                 if let Res::Def(d) = r {
                     let (adt_ty, vi) = self.adt_of_ctor(d);
                     let adt_ty = self.instantiate_adt(adt_ty);
-                    self.unify(adt_ty, t);
+                    self.eq(adt_ty, t);
                     for fe in self.ast().list(fields) {
                         let fname = self.sym(fe.name);
                         let fname = if fe.name.hi > fe.name.lo && self.text(fe.name).as_bytes()[0].is_ascii_digit() {
@@ -3178,9 +2268,7 @@ impl<'a> Fcx<'a> {
                 return;
             }
         }
-        if pi < self.b.expr_ty.len() {
-            self.b.expr_ty[pi] = t;
-        }
+        self.set_ty(a, t);
     }
 
     fn check_seq_pats(&mut self, v: &[PatId], elems: &[TyId]) {
@@ -3222,15 +2310,8 @@ impl<'a> Fcx<'a> {
             DefKind::Variant => (def.parent, def.sub),
             _ => (d, 0),
         };
-        let n = match self.tcx.adts.get(&adt_def) {
-            Some(a) => a.n_generics,
-            None => 0,
-        };
-        let mut args = Vec::new();
-        for i in 0..n {
-            args.push(self.tcx.tys.intern(TyKind::Param(i)));
-        }
-        (self.tcx.tys.intern(TyKind::Adt(adt_def, args, crate::types::RegionArgsId::EMPTY)), vi)
+        let args = self.tcx.generic_indices_of(self.prog, adt_def).identity_types_consts(&self.tcx.tys);
+        (self.tcx.tys.intern(TyKind::Adt(adt_def, args, self.tcx.adts.get(&adt_def).map_or(crate::types::RegionArgsId::EMPTY, |a| a.region_params))), vi)
     }
 
     /// Replace Param args of an ADT type by fresh variables.
@@ -3278,18 +2359,18 @@ impl<'a> Fcx<'a> {
             return t;
         }
         let segs = crate::program::path_segs(prog, self.file, path);
-        let explicit = self.explicit_args(path);
         if segs.len() == 1 {
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, true) {
                 if prog.def(d).kind == DefKind::TypeAlias {
-                    let at = self.tcx.alias_ty(&self.cx, prog, d);
+                    let at = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                     let n = self.tcx.item_env(prog, d).names.len();
-                    let mut args: Vec<TyId> = explicit.clone().unwrap_or_default();
+                    let mut args = self.explicit_args(path, d, 0).unwrap_or_default();
                     while args.len() < n {
-                        args.push(self.fresh(0));
+                        args.push(self.fresh_arg(d, args.len()));
                     }
                     args.truncate(n);
-                    let t = self.tcx.tys.subst_for_inference(at, &args);
+                    let args = self.infer_item_args(d, &args);
+                    let t = self.tcx.instantiate_ty(prog, d, &args, at);
                     if matches!(self.tcx.tys.kind(t), TyKind::Adt(..)) {
                         return t;
                     }
@@ -3297,26 +2378,27 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        if let (Some(a), TyKind::Adt(d, fa, _)) = (explicit, self.tcx.tys.kind(fresh_adt).clone()) {
+        if let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() {
+            let Some(a) = self.explicit_args(path, d, 0) else { return fresh_adt; };
             if !a.is_empty() && a.len() <= fa.len() {
                 let mut args = a;
                 args.extend_from_slice(&fa[args.len()..]);
-                return self.tcx.tys.intern(TyKind::Adt(d, args, crate::types::RegionArgsId::EMPTY));
+                return self.tcx.tys.intern(TyKind::Adt(d, args, regions));
             }
         }
         fresh_adt
     }
 
     fn instantiate_adt(&mut self, t: TyId) -> TyId {
-        if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(t).clone() {
-            if args.is_empty() {
-                return t;
-            }
-            let mut fresh = Vec::new();
-            for _ in 0..args.len() {
-                fresh.push(self.fresh(0));
-            }
-            return self.tcx.tys.intern(TyKind::Adt(d, fresh, crate::types::RegionArgsId::EMPTY));
+        if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(t).clone() {
+            let full = self.infcx.fresh_args_for_item(self.prog, d);
+            let mut args = Vec::new(); let mut regions = Vec::new();
+            for arg in full { match arg {
+                crate::consts::GenericArg::Type(t) => args.push(t),
+                crate::consts::GenericArg::Const(c) => args.push(self.tcx.tys.intern(TyKind::Const(c))),
+                crate::consts::GenericArg::Lifetime(r) => regions.push(r),
+            } }
+            return self.tcx.tys.intern(TyKind::Adt(d, args, self.tcx.tys.intern_region_args(&regions)));
         }
         t
     }
@@ -3353,7 +2435,7 @@ impl<'a> Fcx<'a> {
     }
 
     fn field_ty(&mut self, adt_ty: TyId, vi: u32, name: Sym) -> Option<(u32, TyId)> {
-        let t = self.shallow_with_regions(adt_ty);
+        let t = self.shallow(adt_ty);
         if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(t).clone() {
             let adt = self.tcx.adts.get(&d)?.clone();
             let v = adt.variants.get(vi as usize)?;
@@ -3377,12 +2459,13 @@ impl<'a> Fcx<'a> {
         if let Res::Def(d) = r {
             let (adt_ty, vi) = self.adt_of_ctor(d);
             let given = key.and_then(|k| self.b.res_args.get(&k).cloned());
+            let adt_ty = self.instantiate_adt(adt_ty);
             let adt_ty = match (self.tcx.tys.kind(adt_ty).clone(), given) {
-                (TyKind::Adt(ad, gen, _), Some(a)) if a.len() == gen.len() && !a.is_empty() => self.tcx.tys.intern(TyKind::Adt(ad, a, crate::types::RegionArgsId::EMPTY)),
-                _ => self.instantiate_adt(adt_ty),
+                (TyKind::Adt(ad, gen, regions), Some(a)) if a.len() == gen.len() => self.tcx.tys.intern(TyKind::Adt(ad, a, regions)),
+                _ => adt_ty,
             };
             self.coerce_or_unify(adt_ty, expected, None, pos);
-            let t = self.shallow_with_regions(adt_ty);
+            let t = self.shallow(adt_ty);
             if let TyKind::Adt(ad, args, regions) = self.tcx.tys.kind(t).clone() {
                 if let Some(adt) = self.tcx.adts.get(&ad).cloned() {
                     if let Some(v) = adt.variants.get(vi as usize) {
@@ -3405,7 +2488,6 @@ impl<'a> Fcx<'a> {
         let segs = crate::program::path_segs(prog, self.file, path);
         if segs.len() == 1 && segs[0].0 == SegKind::SelfType {
             if let Some(st) = self.env.self_ty {
-                let st = self.tcx.tys.subst_for_inference(st, &self.inst_args.clone());
                 if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(st) {
                     return Res::Def(*d);
                 }
@@ -3418,7 +2500,7 @@ impl<'a> Fcx<'a> {
                     return Res::Def(d);
                 }
                 if prog.def(d).kind == DefKind::TypeAlias {
-                    let t = self.tcx.alias_ty(&self.cx, prog, d);
+                    let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                     if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
                         return Res::Def(*ad);
                     }
@@ -3439,7 +2521,7 @@ impl<'a> Fcx<'a> {
             }
             // `module::Alias { .. }` (a type alias to a struct, as for a one-segment path)
             if prog.def(d).kind == DefKind::TypeAlias {
-                let t = self.tcx.alias_ty(&self.cx, prog, d);
+                let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                 if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t) {
                     return Res::Def(*ad);
                 }
@@ -3455,11 +2537,11 @@ impl<'a> Fcx<'a> {
     }
 
     /// Type of a value def used as an expression (fn items get fresh generic args).
-    fn value_def_ty(&mut self, d: DefId, explicit: Option<Vec<TyId>>, key: u32, impl_args_from: u8) -> TyId {
+    fn value_def_ty(&mut self, d: DefId, explicit: Option<Vec<TyId>>, key: u32) -> TyId {
         self.b.dependencies.push(d);
-        let _ = impl_args_from;
+        let parent_regions = std::mem::take(&mut self.value_path_parent_regions);
         let def = self.prog.def(d);
-        match def.kind {
+        let ty = match def.kind {
             DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                 let n = self.tcx.fn_sig(self.prog, d).map_or(0, |s| s.n_generics);
                 let mut args = Vec::new();
@@ -3469,26 +2551,66 @@ impl<'a> Fcx<'a> {
                             if i < v.len() {
                                 args.push(v[i]);
                             } else {
-                                args.push(self.fresh(0));
+                                args.push(self.fresh_arg(d, args.len()));
                             }
                         }
                     }
                     None => {
                         for _ in 0..n {
-                            args.push(self.fresh(0));
+                            args.push(self.fresh_arg(d, args.len()));
                         }
                     }
                 }
                 self.b.res_args.insert(key, args.clone());
-                self.tcx.tys.intern(TyKind::FnDef(d, args, crate::types::RegionArgsId::EMPTY))
+                // fn_ctxt/_impl.rs:1180-1205 (instantiate_value_path's lifetime
+                // args) with hir_ty_lowering/generics.rs:520-580: written lifetimes
+                // instantiate the fn's own early-bound lifetimes; with late-bound
+                // lifetimes present they are ignored (late_bound_lifetime_arguments)
+                // and inferred.
+                let written = std::mem::take(&mut self.value_path_lifetimes);
+                let indices = self.tcx.generic_indices_of(self.prog, d);
+                let parent = self.prog.def(d).parent;
+                let parent_lifetimes = if def.kind == DefKind::AssocFn { self.tcx.generic_indices_of(self.prog, parent).lifetimes.len() } else { 0 };
+                let own = indices.lifetimes.len() - parent_lifetimes;
+                let late_bound = self.tcx.fn_item_sig(self.prog, d).map_or(0, |s| s.bound_regions) > 0;
+                if !written.is_empty() && !late_bound && written.len() != own {
+                    self.err(self.last_lo, format!("E0107: function takes {} lifetime argument{} but {} lifetime argument{} supplied", own, if own == 1 { "" } else { "s" }, written.len(), if written.len() == 1 { " was" } else { "s were" }));
+                }
+                let use_written = !written.is_empty() && !late_bound && written.len() == own;
+                let parent_regions = parent_regions;
+                let mut regions = Vec::new();
+                for i in 0..indices.lifetimes.len() {
+                    regions.push(match parent_regions.get(i) {
+                        Some(&r) if i < parent_lifetimes => r,
+                        _ if use_written && i >= parent_lifetimes => written[i - parent_lifetimes],
+                        _ => self.fresh_region(),
+                    });
+                }
+                let regions = self.tcx.tys.intern_region_args(&regions);
+                // fn_ctxt/_impl.rs:1293-1301 (instantiate_value_path ->
+                // add_required_obligations_for_hir): the path's args are created once
+                // and its predicates registered with exactly those args.
+                let full = self.tcx.complete_args(self.prog, d, &args, regions);
+                self.apply_fn_bounds(d, &full, self.last_lo);
+                self.tcx.tys.intern(TyKind::FnDef(d, args, regions))
             }
             DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
-                let t = self.tcx.const_tys.get(&d).copied().unwrap_or(self.tcx.tys.error);
+                let t = self.tcx.const_tys.get(&d).unwrap_or(self.tcx.tys.error);
                 match explicit {
                     Some(v) => {
                         // the args pick the impl of a trait's const at evaluation (`T::ZERO`)
                         self.b.res_args.insert(key, v.clone());
-                        self.tcx.tys.subst_for_inference(t, &v)
+                        // typeck-audit 1.9 / fn_ctxt/_impl.rs:1293-1301: every value path
+                        // registers its item's predicates with the path's args
+                        // (`<T as Tr>::C` proves `T: Tr`)
+                        if def.kind == DefKind::AssocConst {
+                            let indices = self.tcx.generic_indices_of(self.prog, d);
+                            let regions: Vec<_> = indices.lifetimes.iter().map(|_| self.fresh_region()).collect();
+                            let regions = self.tcx.tys.intern_region_args(&regions);
+                            let full = self.tcx.complete_args(self.prog, d, &v, regions);
+                            self.apply_fn_bounds(d, &full, self.last_lo);
+                        }
+                        self.tcx.tys.subst(t, &v)
                     }
                     None => t,
                 }
@@ -3508,32 +2630,43 @@ impl<'a> Fcx<'a> {
                     Some(v) => args = v,
                     None => {
                         for _ in 0..adt.n_generics {
-                            args.push(self.fresh(0));
+                            args.push(self.fresh_arg(d, args.len()));
                         }
                     }
                 }
                 self.b.res_args.insert(key, args.clone());
-                let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, args.clone(), crate::types::RegionArgsId::EMPTY));
+                let mut regions = Vec::new();
+                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
+                let regions = self.tcx.tys.intern_region_args(&regions);
+                let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
+                self.apply_fn_bounds(adt_def, &full, self.last_lo);
+                let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, args.clone(), regions));
                 let v = &adt.variants[vi as usize];
                 if v.shape == 1 && !adt.is_union {
                     // tuple ctor: a fn item of its own (rustc: FnDef with the ADT's args, which
                     // keeps the written lifetimes; it reifies to `fn(fields..) -> Adt` on demand)
-                    self.tcx.tys.intern(TyKind::FnDef(d, args, crate::types::RegionArgsId::EMPTY))
+                    self.tcx.tys.intern(TyKind::FnDef(d, args, regions))
                 } else {
                     inst
                 }
             }
             _ => self.tcx.tys.error,
-        }
+        };
+        self.defer_fn_item_sized_obligations(ty, self.last_lo);
+        ty
     }
 
     /// `<T>::item` (no trait): on `dyn Trait`, the trait's (or a supertrait's) item with
     /// Self = the trait object (a virtual call); otherwise T's inherent item.
-    fn resolve_qself_no_trait(&mut self, self_t: TyId, name: Sym, key: u32, lo: u32, given: &[TyId]) -> (Res, TyId) {
+    fn resolve_qself_no_trait(&mut self, self_t: TyId, name: Sym, key: u32, lo: u32, path: &Path) -> (Res, TyId) {
         let error = self.tcx.tys.error;
         let st = self.shallow(self_t);
         if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(st).clone() {
-            if let Some(item) = self.dyn_method(td, name) {
+            let item = match self.dyn_method(td, name, lo) {
+                Ok(item) => item,
+                Err(()) => return (Res::Err, error),
+            };
+            if let Some(item) = item {
                 let mut args = vec![st];
                 let parent = self.prog.def(item).parent;
                 if parent == td {
@@ -3544,33 +2677,40 @@ impl<'a> Fcx<'a> {
                 let sig = self.tcx.fn_sig(self.prog, item).cloned();
                 let np = sig.as_ref().map_or(1, |s| s.n_parent_generics) as usize;
                 while args.len() < np {
-                    args.push(self.fresh(0));
+                    args.push(self.fresh_arg(item, args.len()));
                 }
                 let own = sig.map_or(0, |s| s.n_generics - s.n_parent_generics);
+                let given = self.explicit_args(path, item, args.len()).unwrap_or_default();
                 for i in 0..own as usize {
-                    args.push(given.get(i).copied().unwrap_or_else(|| self.fresh(0)));
+                    args.push(given.get(i).copied().unwrap_or_else(|| self.fresh_arg(item, args.len())));
                 }
-                let t = self.value_def_ty(item, Some(args), key, 1);
+                let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
         }
-        if let Some((item, imp)) = self.tcx.inherent_item(&self.cx, self.prog, st, name) {
-            let mut args = self.match_impl_args(imp, st);
+        if let Some((item, imp)) = self.assemble_inherent_impl_probe(st, name) {
+            let mut args = self.impl_args_for_value_path(imp, st);
             let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
+            let given = self.explicit_args(path, item, args.len()).unwrap_or_default();
             for i in 0..own as usize {
-                args.push(given.get(i).copied().unwrap_or_else(|| self.fresh(0)));
+                args.push(given.get(i).copied().unwrap_or_else(|| self.fresh_arg(item, args.len())));
             }
-            let t = self.value_def_ty(item, Some(args), key, 1);
+            let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
         }
         // `<*mut Object>::encode()`: like `T::item`, items of traits in scope count too
         // (rustc_hir_typeck method/mod.rs resolve_fully_qualified_call probes the traits in scope)
         let cands = self.scoped_trait_methods(st, name);
+        if cands.iter().any(|c| self.prog.def(c.0).parent != self.prog.def(cands[0].0).parent) {
+            self.err(lo, "E0034: multiple applicable items in scope".into()); return (Res::Err, error);
+        }
         if let Some(&(item, imp)) = cands.first() {
             let ambiguous = cands.iter().filter(|c| c.0 == item).count() > 1;
             let imp = if ambiguous { crate::program::NO_DEF } else { imp };
-            let args = self.trait_call_args(item, imp, st, given);
-            let t = self.value_def_ty(item, Some(args), key, 1);
+            let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
+            let given = self.explicit_args(path, item, offset).unwrap_or_default();
+            let args = self.trait_call_args(item, imp, st, &given);
+            let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
         }
         // `<Self>::Variant(..)`, `Alias::Variant`: an enum's variant (rustc
@@ -3579,7 +2719,7 @@ impl<'a> Fcx<'a> {
             if self.prog.def(ad).kind == DefKind::Enum {
                 if let Some(v) = self.prog.lookup_in_container(ad, name, false) {
                     if self.prog.def(v).kind == DefKind::Variant {
-                        let t = self.value_def_ty(v, Some(aargs), key, 0);
+                        let t = self.value_def_ty(v, Some(aargs), key);
                         return (Res::Def(v), t);
                     }
                 }
@@ -3587,15 +2727,16 @@ impl<'a> Fcx<'a> {
         }
         // a rigid projection or param of a generic body (`<A as Alloc<T>>::Mem::default()`):
         // through its bounds
-        if matches!(self.tcx.tys.kind(st), TyKind::Assoc(..) | TyKind::Param(_)) {
+        if matches!(self.tcx.tys.kind(st), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Param(_)) {
             if let Some((item, td_args)) = self.trait_item_for(st, name) {
                 let mut args = vec![st];
                 args.extend(td_args);
                 let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
+            let given = self.explicit_args(path, item, args.len()).unwrap_or_default();
                 for i in 0..own as usize {
-                    args.push(given.get(i).copied().unwrap_or_else(|| self.fresh(0)));
+                    args.push(given.get(i).copied().unwrap_or_else(|| self.fresh_arg(item, args.len())));
                 }
-                let t = self.value_def_ty(item, Some(args), key, 1);
+                let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
         }
@@ -3613,24 +2754,21 @@ impl<'a> Fcx<'a> {
     /// one impl that can apply to `st`.
     fn scoped_assoc_const(&mut self, st: TyId, name: Sym, key: u32) -> Option<(Res, TyId)> {
         if !matches!(self.tcx.tys.kind(st), TyKind::Infer(_) | TyKind::Error) {
-            let _ = self.scoped_trait_methods(st, name); // fills bound_traits
-            let mut traits: Vec<DefId> = self.prog.traits_in_scope(self.module).iter().copied().collect();
-            if let Some(b) = &self.bound_traits {
-                traits.extend(b.iter().copied());
-            }
+            let mut traits = self.traits_in_scope();
+            traits.extend(self.param_bound_traits(st));
             let mut seen = crate::fxhash::HashSet::default();
             traits.retain(|t| seen.insert(*t));
             let mut hits: Vec<(DefId, DefId)> = Vec::new();
             for td in traits {
                 let it = self.prog.traits[self.prog.def(td).sub as usize].iter().copied().find(|&it| self.prog.def(it).name == name && self.prog.def(it).kind == DefKind::AssocConst);
                 if let Some(it) = it {
-                    let mark = self.snapshot();
+                    let mark = self.start_snapshot();
                     let selected = self.select_unspecified_trait(td, st);
-                    self.rollback(mark);
+                    self.rollback_to(mark);
                     let imp = match selected {
-                        SelectionResult::Ok(selected) => selected.method_owner(),
-                        SelectionResult::Ambiguous(_) => crate::program::NO_DEF,
-                        SelectionResult::NoSolution => continue,
+                        Ok(Some(selected)) => match &selected { ImplSource::UserDefined { impl_def_id, .. } => *impl_def_id, _ => NO_DEF },
+                        Ok(None) => crate::program::NO_DEF,
+                        Err(_) => continue,
                     };
                     hits.push((it, imp));
                 }
@@ -3638,8 +2776,9 @@ impl<'a> Fcx<'a> {
             if hits.len() == 1 {
                 let (item, imp) = hits[0];
                 let args = self.trait_call_args(item, imp, st, &[]);
-                self.register_method_obligation(item, &args);
-                let t = self.value_def_ty(item, Some(args), key, 1);
+                let full = self.infer_item_args(item, &args);
+                self.register_method_obligation(item, &full);
+                let t = self.value_def_ty(item, Some(args), key);
                 return Some((Res::Def(item), t));
             }
         }
@@ -3649,6 +2788,17 @@ impl<'a> Fcx<'a> {
     /// Resolves a value path. `key`: expr or pat id for recording generic args.
     fn resolve_value_path(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
         let prog = self.prog;
+        // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
+        // lifetime arguments (last segment).
+        self.value_path_lifetimes.clear();
+        if let Some(GenericArgs::Angle(v)) = self.ast().segs(path.segs).last().and_then(|s| self.ast().gargs(s.args)) {
+            for a in self.ast().list(*v) {
+                if let GenericArg::Lifetime(lt) = a {
+                    let r = self.env.regions.resolve(Some(&self.infcx), &self.tcx.tys, prog, self.file, Some(*lt));
+                    self.value_path_lifetimes.push(r);
+                }
+            }
+        }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
         if let Some(q) = self.ast().qself(path) {
@@ -3656,7 +2806,7 @@ impl<'a> Fcx<'a> {
             let self_t = self.lower_ty(q.ty);
             let tp = match &q.trait_path {
                 Some(tp) => tp,
-                None => return { let given = self.explicit_args(path).unwrap_or_default(); self.resolve_qself_no_trait(self_t, segs[segs.len() - 1].1, key, path.lo, &given) },
+                None => return self.resolve_qself_no_trait(self_t, segs[segs.len() - 1].1, key, path.lo, path),
             };
             // `<T as Trait>::Assoc::item`: the qualified part names a type (a projection),
             // the last segment an item on it, resolved type-relatively as `<Ty>::item` (rustc
@@ -3665,15 +2815,12 @@ impl<'a> Fcx<'a> {
             if segs.len() >= 2 {
                 let sub = Path { qself: path.qself, segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
                 let env = self.env.clone();
-                let t = self.tcx.lower_path_ty(&self.cx, prog, self.file, self.module, &env, &sub);
-                let inst = self.inst_args.clone();
-                let t = self.tcx.tys.subst_for_inference(t, &inst);
+                let t = self.tcx.lower_path_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, &sub, None);
                 let t = self.norm(t);
                 if matches!(self.tcx.tys.kind(t), TyKind::Error) {
                     return (Res::Err, error);
                 }
-                let given = self.explicit_args(path).unwrap_or_default();
-                return self.resolve_qself_no_trait(t, segs[segs.len() - 1].1, key, path.lo, &given);
+                return self.resolve_qself_no_trait(t, segs[segs.len() - 1].1, key, path.lo, path);
             }
             let td = match self.tcx.resolve_type_path_def(prog, self.file, self.module, tp) {
                 Some(d) => d,
@@ -3694,8 +2841,7 @@ impl<'a> Fcx<'a> {
                 }
             };
             let env = self.env.clone();
-            let explicit = self.tcx.lower_generic_args(&self.cx, prog, self.file, self.module, &env, tp);
-            let inst = self.inst_args.clone();
+            let explicit = self.tcx.lower_generic_args(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, tp);
             // `<T as Trait<_>>`: an inferred trait argument is an inference variable
             let written: Vec<crate::ast::TyId> = match self.ast().segs(tp.segs).last().and_then(|s| self.ast().gargs(s.args)) {
                 Some(GenericArgs::Angle(v)) => self.ast().list(*v).iter().filter_map(|g| match g {
@@ -3708,25 +2854,24 @@ impl<'a> Fcx<'a> {
             for (i, e) in explicit.into_iter().enumerate() {
                 let infer = written.get(i).map_or(false, |w| matches!(self.ast().ty(*w), crate::ast::Ty::Infer));
                 if infer {
-                    let v = self.fresh(0);
+                    let v = self.fresh_arg(td, i + 1);
                     explicit2.push(v);
                 } else {
-                    explicit2.push(self.tcx.tys.subst_for_inference(e, &inst));
+                    explicit2.push(e);
                 }
             }
-            let targs = self.tcx.fill_trait_defaults(&self.cx, prog, td, self_t, explicit2);
+            let targs = self.tcx.fill_trait_defaults(&self.cx.with_infcx(&self.infcx), prog, td, self_t, explicit2);
             let mut args = vec![self_t];
             args.extend(targs);
             // the item's own args from the path (`<S as T<123>>::l::<true>()`)
-            let given = self.explicit_args(path).unwrap_or_default();
+            let given = self.explicit_args(path, item, args.len()).unwrap_or_default();
             let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
             for i in 0..own as usize {
-                args.push(if i < given.len() { given[i] } else { self.fresh(0) });
+                args.push(if i < given.len() { given[i] } else { self.fresh_arg(item, args.len()) });
             }
-            let t = self.value_def_ty(item, Some(args), key, 1);
+            let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
         }
-        let last_args = self.explicit_args(path);
         if segs.len() == 1 && !path.global() {
             let (k, s) = segs[0];
             if k == SegKind::SelfValue || k == SegKind::Ident {
@@ -3737,31 +2882,42 @@ impl<'a> Fcx<'a> {
                         return (Res::Local(li), t);
                     }
                 }
+                // rustc_resolve/src/late.rs value ribs: block items precede
+                // enclosing item parameters (normal module items follow them).
+                let mut scope = self.module;
+                while let Some(parent) = prog.mods[scope as usize].lexical_parent {
+                    if let Some(d) = prog.lookup_in_module(scope, s, false, &mut Vec::new()) {
+                        let explicit = self.explicit_args(path, d, 0);
+                        let t = self.value_def_ty(d, explicit, key);
+                        return (Res::Def(d), t);
+                    }
+                    scope = parent;
+                }
                 // a const generic param as a value: the instance's const arg, its declared type
                 if let Some(&(i, cfile, cty)) = self.env.consts.iter().find(|c| self.env.names.get(c.0 as usize) == Some(&s)) {
                     let env = self.env.clone();
-                    let t = self.tcx.lower_ty(&self.cx, prog, cfile, self.module, &env, cty);
-                    let t = self.tcx.tys.subst_for_inference(t, &self.inst_args.clone());
+                    let t = self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), prog, cfile, self.module, &env, cty);
                     return (Res::ConstParam(i), t);
                 }
             }
             if k == SegKind::SelfType {
                 // `Self` as a unit/tuple struct ctor
                 if let Some(st) = self.env.self_ty {
-                    let st = self.tcx.tys.subst_for_inference(st, &self.inst_args.clone());
                     if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
-                        let t = self.value_def_ty(d, Some(args), key, 0);
+                        let t = self.value_def_ty(d, Some(args), key);
                         return (Res::Def(d), t);
                     }
                 }
             }
             if let Some(d) = prog.lookup_in_scope(self.module, s, false) {
-                let t = self.value_def_ty(d, last_args, key, 0);
+                let explicit = self.explicit_args(path, d, 0);
+                let t = self.value_def_ty(d, explicit, key);
                 return (Res::Def(d), t);
             }
             if path.segs.len() == 1 && !path.global() {
                 if let Some(d) = prog.relaxed_import(self.module, s, false, self.file, path.lo) {
-                    let t = self.value_def_ty(d, last_args, key, 0);
+                    let explicit = self.explicit_args(path, d, 0);
+                    let t = self.value_def_ty(d, explicit, key);
                     return (Res::Def(d), t);
                 }
             }
@@ -3775,7 +2931,8 @@ impl<'a> Fcx<'a> {
             let krate = prog.mods[self.module as usize].krate;
             let root = prog.mods[prog.crates[krate as usize].root_mod as usize].def;
             if let Some(d) = prog.lookup_in_container(root, segs[0].1, false) {
-                let t = self.value_def_ty(d, last_args, key, 0);
+                let explicit = self.explicit_args(path, d, 0);
+                let t = self.value_def_ty(d, explicit, key);
                 return (Res::Def(d), t);
             }
         }
@@ -3789,16 +2946,18 @@ impl<'a> Fcx<'a> {
             let pk = prog.def(pd).kind;
             if matches!(pk, DefKind::Mod | DefKind::Enum | DefKind::Trait) {
                 if let Some(d) = prog.lookup_in_container(pd, segs[n - 1].1, false) {
+                    let offset = if pk == DefKind::Trait { self.tcx.fn_sig(self.prog, d).map_or(0, |s| s.n_parent_generics) as usize } else { 0 };
+                    let last_args = self.explicit_args(path, d, offset);
                     // enum variant: generic args may sit on the enum segment
                     let explicit = if pk == DefKind::Enum {
-                        self.seg_args(path, n - 2).or(last_args)
-                    } else if pk == DefKind::Trait && matches!(prog.def(d).kind, DefKind::AssocFn) && (last_args.is_some() || self.seg_args(path, n - 2).is_some()) {
+                        self.seg_args(path, n - 2, pd, if pk == DefKind::Trait { 1 } else { 0 }).or(last_args)
+                    } else if pk == DefKind::Trait && matches!(prog.def(d).kind, DefKind::AssocFn) && (last_args.is_some() || self.seg_args(path, n - 2, pd, if pk == DefKind::Trait { 1 } else { 0 }).is_some()) {
                         // `Trait::<A>::m::<B>`: [Self (open), the trait's args, the fn's own]
                         let nt = self.tcx.trait_generic_count(prog, pd);
-                        let ta = self.seg_args(path, n - 2).unwrap_or_default();
+                        let ta = self.seg_args(path, n - 2, pd, if pk == DefKind::Trait { 1 } else { 0 }).unwrap_or_default();
                         let mut v = vec![self.fresh(0)];
                         for i in 0..nt {
-                            v.push(if i < ta.len() { ta[i] } else { self.fresh(0) });
+                            v.push(if i < ta.len() { ta[i] } else { self.fresh_arg(pd, v.len()) });
                         }
                         v.extend(last_args.unwrap_or_default());
                         Some(v)
@@ -3806,16 +2965,16 @@ impl<'a> Fcx<'a> {
                         // `Trait::CONST`: [Self (open, inferred from the use), the trait's args];
                         // the impl's const is picked once Self is known (rustc: a projection)
                         let nt = self.tcx.trait_generic_count(prog, pd);
-                        let ta = self.seg_args(path, n - 2).unwrap_or_default();
+                        let ta = self.seg_args(path, n - 2, pd, if pk == DefKind::Trait { 1 } else { 0 }).unwrap_or_default();
                         let mut v = vec![self.fresh(0)];
                         for i in 0..nt {
-                            v.push(if i < ta.len() { ta[i] } else { self.fresh(0) });
+                            v.push(if i < ta.len() { ta[i] } else { self.fresh_arg(pd, v.len()) });
                         }
                         Some(v)
                     } else {
                         last_args
                     };
-                    let t = self.value_def_ty(d, explicit, key, 0);
+                    let t = self.value_def_ty(d, explicit, key);
                     return (Res::Def(d), t);
                 }
                 // `str::to_owned` with a module `str` in scope (a glob of std): a first segment
@@ -3844,7 +3003,7 @@ impl<'a> Fcx<'a> {
         if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(self_ty).clone() {
             if prog.def(ad).kind == DefKind::Enum {
                 if let Some(v) = prog.lookup_in_container(ad, name, false) {
-                    let t = self.value_def_ty(v, Some(aargs), key, 0);
+                    let t = self.value_def_ty(v, Some(aargs), key);
                     return (Res::Def(v), t);
                 }
             }
@@ -3860,51 +3019,57 @@ impl<'a> Fcx<'a> {
                 SegKind::SelfType => self.env.trait_def.is_some(),
                 _ => {
                     let s0 = self.sym(self.ast().segs(path.segs)[0].name);
-                    self.env.names.iter().take(self.inst_args.len()).any(|nm| *nm == s0)
+                    self.env.names.iter().take(self.b.args.len()).any(|nm| *nm == s0)
                 }
             };
         if prefix_is_param {
             if let Some((item, td_args)) = self.trait_item_for(self_ty, name) {
                 let mut args = vec![self_ty];
                 args.extend(td_args);
-                let la = last_args.clone().unwrap_or_default();
+                let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
+                let la = self.explicit_args(path, item, offset).unwrap_or_default();
                 let sig = self.tcx.fn_sig(self.prog, item).cloned();
                 let own = sig.map_or(0, |s| s.n_generics - s.n_parent_generics);
                 for i in 0..own as usize {
-                    args.push(if i < la.len() { la[i] } else { self.fresh(0) });
+                    args.push(if i < la.len() { la[i] } else { self.fresh_arg(item, args.len()) });
                 }
-                let t = self.value_def_ty(item, Some(args), key, 1);
+                let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
         }
-        match self.tcx.inherent_item(&self.cx, prog, self_ty, name) {
+        match self.assemble_inherent_impl_probe(self_ty, name) {
             Some((item, imp)) => {
                 // impl generic args from matching the impl self type against self_ty
-                let impl_args = self.match_impl_args(imp, self_ty);
+                let impl_args = self.impl_args_for_value_path(imp, self_ty);
                 let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
                 let mut args = impl_args;
-                let la = last_args.unwrap_or_default();
+                let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
+                let la = self.explicit_args(path, item, offset).unwrap_or_default();
                 for i in 0..own as usize {
                     if i < la.len() {
                         args.push(la[i]);
                     } else {
-                        args.push(self.fresh(0));
+                        args.push(self.fresh_arg(item, args.len()));
                     }
                 }
-                let t = self.value_def_ty(item, Some(args), key, 1);
+                let t = self.value_def_ty(item, Some(args), key);
                 (Res::Def(item), t)
             }
             None => {
                 // a trait method implemented for this type
-                let cands = self.tcx.trait_methods_for(&self.cx, prog, self_ty, name);
+                let cands = self.extension_candidates(self_ty, name, DefKind::AssocFn);
+                if cands.iter().any(|c| self.prog.def(c.0).parent != self.prog.def(cands[0].0).parent) {
+                    self.err(path.lo, "E0034: multiple applicable items in scope".into()); return (Res::Err, error);
+                }
                 if let Some(&(item, imp)) = cands.first() {
-                    let la = last_args.unwrap_or_default();
+                    let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
+                let la = self.explicit_args(path, item, offset).unwrap_or_default();
                     // several impls of the trait for this type (`Rc::from` from &str, String,
                     // Box..): leave the trait args open; the impl is chosen once they are known
                     let ambiguous = cands.iter().filter(|c| c.0 == item).count() > 1;
                     let imp = if ambiguous { crate::program::NO_DEF } else { imp };
                     let args = self.trait_call_args(item, imp, self_ty, &la);
-                    let t = self.value_def_ty(item, Some(args), key, 1);
+                    let t = self.value_def_ty(item, Some(args), key);
                     return (Res::Def(item), t);
                 }
                 // an associated const / fn of a trait: through the body's bounds (`T::ZERO` with
@@ -3913,13 +3078,14 @@ impl<'a> Fcx<'a> {
                 if let Some((item, td_args)) = self.trait_item_for(self_ty, name) {
                     let mut args = vec![self_ty];
                     args.extend(td_args);
-                    let la = last_args.unwrap_or_default();
+                    let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
+                let la = self.explicit_args(path, item, offset).unwrap_or_default();
                     let sig = self.tcx.fn_sig(self.prog, item).cloned();
                     let own = sig.map_or(0, |s| s.n_generics - s.n_parent_generics);
                     for i in 0..own as usize {
-                        args.push(if i < la.len() { la[i] } else { self.fresh(0) });
+                        args.push(if i < la.len() { la[i] } else { self.fresh_arg(item, args.len()) });
                     }
-                    let t = self.value_def_ty(item, Some(args), key, 1);
+                    let t = self.value_def_ty(item, Some(args), key);
                     return (Res::Def(item), t);
                 }
                 if let Some(r) = self.scoped_assoc_const(self_ty, name, key) {
@@ -3932,324 +3098,71 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    /// A trait item named `name` for type `t` and the trait's args: from a bound of this
-    /// body whose param is instantiated to `t` (with the bound's args), else from a trait in
-    /// scope with an impl for `t`.
+    /// rustc_hir_typeck/src/method/probe.rs:1772-1843,2371-2406:
+    /// collect applicable candidates and collapse only a shared trait container.
     fn trait_item_for(&mut self, t: TyId, name: Sym) -> Option<(DefId, Vec<TyId>)> {
-        let item_of = |prog: &Program, td: DefId| prog.traits[prog.def(td).sub as usize].iter().copied().find(|it| prog.def(*it).name == name);
-        // the bounds on `t` (with supertraits, and `Self: Trait` in the trait's own bodies)
-        for (d, ta) in self.param_bounds(t) {
-            if let Some(it) = item_of(self.prog, d) {
-                let ta = ta.into_iter().map(|x| self.norm(x)).collect();
-                return Some((it, ta));
-            }
-        }
-        let scope = self.prog.traits_in_scope(self.module);
-        let mut tds: Vec<DefId> = scope.iter().copied().collect();
-        tds.sort_by_key(|d| d.0);
-        for td in tds {
-            if let Some(it) = item_of(self.prog, td) {
-                if self.tcx.trait_generic_count(self.prog, td) == 0 && !matches!(self.select_trait(td, t, &[]), SelectionResult::NoSolution) {
-                    return Some((it, Vec::new()));
+        let mut candidates = Vec::new();
+        for (td, args) in self.param_bounds(t) {
+            for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
+                if self.prog.def(item).name == name {
+                    let c = (item, args.clone());
+                    if !candidates.contains(&c) { candidates.push(c); }
                 }
             }
         }
-        None
-    }
-
-    /// Generic args [Self, trait args.., own..] to call trait method `item` (found through
-    /// impl `imp`) on receiver type `t`.
-    /// Does `t` have a method named `s` taking `&self` / `&mut self` (inherent, trait object or
-    /// trait impl)?
-    /// A method call on a value whose type is a generic param of this body (checked per
-    /// instance, so it arrives here as the param's instance type): rustc resolves it from the
-    /// param's bounds alone, with the bound's trait args (`key.as_ref()` with
-    /// `K: AsRef<OsStr>`, K = &str, is `AsRef<OsStr>`, not the first `AsRef` impl of str).
-    fn bound_method(&mut self, e: ExprId, rt: TyId, s: Sym, turbofish: GenericArgsId, args: &[ExprId], lo: u32) -> Option<TyId> {
-        let mut bounds = self.tcx.fn_trait_bounds(self.prog, self.b.def).cloned().unwrap_or_default();
-        // a trait's own body has `Self: Trait<P..>` (rustc: the trait's implicit predicate,
-        // predicates_of); Self is param 0, the trait's params follow. `self.draw(..)` in a
-        // default method is the trait's `draw`, even when the instance's Self type has an
-        // inherent `draw` of its own
-        if let Some(td) = self.env.trait_def {
-            if self.prog.def(self.b.def).parent == td {
-                let nt = self.tcx.trait_generic_count(self.prog, td);
-                let targs: Vec<TyId> = (1..=nt as u32).map(|i| self.tcx.tys.intern(TyKind::Param(i))).collect();
-                // and its supertraits' (`Self: Widget` implies `Self: WidgetNode`: `self.visible()`
-                // in Widget's default body is WidgetNode's method even when the instance's Self type
-                // has an inherent `visible` of its own)
-                let mut todo = self.tcx.trait_super_refs(&self.cx, self.prog, td, &targs);
-                bounds.push((0, td, targs));
-                let mut seen = vec![td];
-                while let Some((sd, sargs)) = todo.pop() {
-                    if seen.contains(&sd) {
-                        continue;
-                    }
-                    seen.push(sd);
-                    todo.extend(self.tcx.trait_super_refs(&self.cx, self.prog, sd, &sargs));
-                    bounds.push((0, sd, sargs));
+        if candidates.is_empty() {
+            for td in self.traits_in_scope() {
+                for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
+                    if self.prog.def(item).name != name { continue; }
+                    let save = self.start_snapshot();
+                    let mut args = Vec::new();
+                    for i in 1..=self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh_arg(td, i as usize)); }
+                    let applicable = self.select_trait(td, t, &args).is_ok();
+                    self.rollback_to(save);
+                    if applicable && !candidates.iter().any(|c| c.0 == item) { candidates.push((item, Vec::new())); }
                 }
             }
         }
-        if bounds.is_empty() {
-            return None;
+        let first = candidates.first()?.0;
+        if candidates.iter().any(|c| self.prog.def(c.0).parent != self.prog.def(first).parent) {
+            self.err(self.last_lo, "E0034: multiple applicable items in scope".into()); return None;
         }
-        // a bound's supertraits are bounds of its param too (rustc elaborates the param env:
-        // `W: StyleWidget` with `StyleWidget: Styled` makes `value.apply(..)` Styled's method,
-        // even when the instance's W has an inherent `apply` of its own)
-        let mut i = 0;
-        while i < bounds.len() {
-            let (pi, td, targs) = bounds[i].clone();
-            let self_t = self.tcx.tys.intern(TyKind::Param(pi));
-            for (sd, sargs) in self.tcx.trait_super_refs_of(&self.cx, self.prog, td, self_t, &targs) {
-                if !bounds.iter().any(|b| b.0 == pi && b.1 == sd && b.2 == sargs) {
-                    bounds.push((pi, sd, sargs));
-                }
-            }
-            i += 1;
+        let (_, mut args) = candidates.pop().unwrap();
+        if !candidates.is_empty() || args.is_empty() {
+            args.clear();
+            let td = self.prog.def(first).parent;
+            for i in 1..=self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh_arg(td, i as usize)); }
         }
-        let rts = self.shallow(rt);
-        if matches!(self.tcx.tys.kind(rts), TyKind::Infer(_) | TyKind::Error) {
-            return None;
-        }
-        // rustc's probe takes a by-value match first: with `key: &Q` and bounds `Q: Ord` and
-        // `K: Ord` where K = &Q in this instance (BTreeMap<&[String], _>::search_key),
-        // `key.cmp(..)` is Q's `&self` method on `key` itself, not K's through an autoref; a
-        // bound reached through one dereference for a `&self` / `&mut self` method is taken
-        // before one that needs an autoref
-        let by_ref_self = |this: &Self, td: DefId| -> bool {
-            this.prog.traits[this.prog.def(td).sub as usize].iter().any(|it| this.prog.def(*it).name == s && this.tcx.fn_sig(this.prog, *it).map_or(false, |sg| sg.self_kind >= 2))
-        };
-        let mut ordered: Vec<(u32, DefId, Vec<TyId>)> = Vec::new();
-        let mut later: Vec<(u32, DefId, Vec<TyId>)> = Vec::new();
-        for b in bounds {
-            let pa = self.b.args.get(b.0 as usize).copied();
-            let deref_hit = matches!(self.tcx.tys.kind(rts).clone(), TyKind::Ref(_, inner, _) if pa == Some(self.shallow(inner)));
-            if deref_hit && pa != Some(rts) && by_ref_self(self, b.1) {
-                ordered.push(b);
-            } else {
-                later.push(b);
-            }
-        }
-        ordered.extend(later);
-        // several bounds whose params this instance makes the same type, through different
-        // trait args (`AllocU8: Allocator<u8>` and `AllocHC: Allocator<HuffmanCode>`, both
-        // StandardAlloc): rustc resolves the call once, on the generic body, through the bound
-        // of the receiver's declared param -- take the trait args the polymorphic body chose
-        let poly = if self.b.args.iter().all(|a| self.tcx.tys.is_concrete(*a)) && self.ambiguous_bounds(&ordered, rts, s) { self.poly_method_targs(e) } else { None };
-        if let Some((ptd, pta)) = poly {
-            ordered.retain(|(_, td, targs)| {
-                *td == ptd && targs.len() == pta.len() && targs.iter().zip(&pta).all(|(x, y)| self.tcx.tys.subst_for_inference(*x, &self.b.args) == *y)
-            });
-        }
-        for (pi, td, targs) in ordered {
-            // the receiver is the param's instance type, or a reference to it (`r.start_bound()` with
-            // r: &R): probing autoderefs `&R` to `R` (method/probe.rs), then autorefs for `&self`
-            let pa = self.b.args.get(pi as usize).copied();
-            let recv = rts;
-            let (rts, derefs) = if pa == Some(rts) {
-                (rts, 0u8)
-            } else {
-                match self.tcx.tys.kind(rts).clone() {
-                    TyKind::Ref(_, inner, _) if pa == Some(self.shallow(inner)) => (self.shallow(inner), 1u8),
-                    _ => continue,
-                }
-            };
-            // the trait's own method (a supertrait's has the supertrait's args)
-            let item = match self.prog.traits[self.prog.def(td).sub as usize]
-                .iter()
-                .copied()
-                .find(|it| self.prog.def(*it).name == s && self.prog.def(*it).kind == DefKind::AssocFn)
-            {
-                Some(i) => i,
-                None => continue,
-            };
-            let ta: Vec<TyId> = targs.iter().map(|t| self.tcx.tys.subst_for_inference(*t, &self.b.args)).collect();
-            let ta: Vec<TyId> = ta.into_iter().map(|t| self.norm(t)).collect();
-            // a by-value `self` method on a reference to the param: the where-clause candidate's
-            // xform self type is the param itself, which does not match step 0 (the reference) by
-            // value; the trait's candidate on the reference does when the reference implements
-            // the trait (rustc method/probe.rs pick_core l.1305 pick_by_value_method at the first
-            // step, before the autoderef step). `reader.take(n)` with `reader: &mut R`, `R: Read`
-            // is `<&mut R as Read>::take(reader)` -- never a bitwise move of `*reader`
-            if derefs == 1 && self.tcx.fn_sig(self.prog, item).map_or(false, |sg| sg.self_kind == 1) {
-                let imp = match self.select_trait(td, recv, &ta) {
-                    SelectionResult::Ok(selected) => Some(selected.method_owner()),
-                    SelectionResult::Ambiguous(_) => Some(crate::program::NO_DEF),
-                    SelectionResult::NoSolution => None,
-                };
-                if let Some(imp) = imp {
-                    self.known_targs = Some(ta);
-                    return Some(self.check_trait_method_call(e, item, imp, recv, 0, turbofish, args, lo, None));
-                }
-            }
-            // a param of a body checked polymorphically has no impl, only the bound (rustc's
-            // where-clause candidate): the trait's method, its impl left open
-            let imp = match self.select_trait(td, rts, &ta) {
-                SelectionResult::Ok(selected) => selected.method_owner(),
-                SelectionResult::Ambiguous(_) => crate::program::NO_DEF,
-                SelectionResult::NoSolution => return None,
-            };
-            self.known_targs = Some(ta);
-            return Some(self.check_trait_method_call(e, item, imp, rts, derefs, turbofish, args, lo, None));
-        }
-        None
-    }
-
-    /// A method call on a projection of a polymorphic body (`T::encs().as_ref()` with
-    /// `type Encs: AsRef<[u8]>`), or a reference to one: through the projection's declared
-    /// bounds in the param env (rustc: the projection's item bounds are its candidates).
-    fn projection_method(&mut self, e: ExprId, rt: TyId, s: Sym, turbofish: GenericArgsId, args: &[ExprId], lo: u32) -> Option<TyId> {
-        let r0 = self.shallow(rt);
-        let r0 = self.norm(r0);
-        let (rts, derefs) = match self.tcx.tys.kind(r0).clone() {
-            TyKind::Assoc(..) => (r0, 0u8),
-            TyKind::Ref(_, x, _) if matches!(self.tcx.tys.kind(self.shallow(x)), TyKind::Assoc(..)) => (self.shallow(x), 1u8),
-            _ => return None,
-        };
-        // the param env's predicates on it, else the associated type's item bounds with
-        // their supertraits (`<impl IntoIterator as IntoIterator>::IntoIter: Iterator`)
-        let mut cands = self.tcx.param_env_of(&self.cx, rts);
-        if let TyKind::Assoc(ad, pa, _) = self.tcx.tys.kind(rts).clone() {
-            let mut todo = self.tcx.assoc_decl_bounds(&self.cx, self.prog, ad, &pa);
-            while let Some((d, a)) = todo.pop() {
-                if cands.iter().any(|c| c.0 == d && c.1 == a) {
-                    continue;
-                }
-                todo.extend(self.tcx.trait_super_refs_of(&self.cx, self.prog, d, rts, &a));
-                cands.push((d, a));
-            }
-        }
-        for (td, ta) in cands {
-            let item = match self.prog.traits[self.prog.def(td).sub as usize].iter().copied().find(|it| self.prog.def(*it).name == s && self.prog.def(*it).kind == DefKind::AssocFn) {
-                Some(i) => i,
-                None => continue,
-            };
-            self.known_targs = Some(ta);
-            return Some(self.check_trait_method_call(e, item, crate::program::NO_DEF, rts, derefs, turbofish, args, lo, None));
-        }
-        None
-    }
-
-    /// Do two bounds of this body with a method named `s` apply to receiver `rts` (its param's
-    /// instance type, or a reference to it) through different trait args?
-    fn ambiguous_bounds(&mut self, bounds: &[(u32, DefId, Vec<TyId>)], rts: TyId, s: Sym) -> bool {
-        let inner = match self.tcx.tys.kind(rts).clone() {
-            TyKind::Ref(_, x, _) => Some(self.shallow(x)),
-            _ => None,
-        };
-        let mut seen: Vec<(DefId, Vec<TyId>)> = Vec::new();
-        for (pi, td, targs) in bounds {
-            let pa = self.b.args.get(*pi as usize).copied();
-            if pa != Some(rts) && pa != inner {
-                continue;
-            }
-            if !self.prog.traits[self.prog.def(*td).sub as usize].iter().any(|it| self.prog.def(*it).name == s) {
-                continue;
-            }
-            let ta: Vec<TyId> = targs.iter().map(|t| self.tcx.tys.subst_for_inference(*t, &self.b.args)).collect();
-            if !seen.iter().any(|(d, a)| d == td && *a == ta) {
-                seen.push((*td, ta));
-            }
-        }
-        seen.len() > 1
-    }
-
-    /// Definition-time typeck facts, shared by method and call-trait resolution.
-    fn polymorphic_body(&mut self) -> Option<std::sync::Arc<Body>> {
-        let def = self.b.def;
-        let epoch = self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
-        let body = match self.tcx.poly_bodies.get(&(def, epoch)) {
-            Some(b) => b,
-            None => {
-                let n = self.tcx.fn_sig(self.prog, def)?.n_generics;
-                let ids: Vec<TyId> = (0..n).map(|i| self.tcx.tys.intern(TyKind::Param(i))).collect();
-                let b = std::sync::Arc::new(check_fn_uncached(&self.cx, self.prog, self.tcx, def, &ids));
-                self.tcx.poly_bodies.insert((def, epoch), b.clone());
-                b
-            }
-        };
-        Some(body)
-    }
-
-    /// The trait arguments the generic body selected for method call `e`.
-    fn poly_method_targs(&mut self, e: ExprId) -> Option<(DefId, Vec<TyId>)> {
-        let body = self.polymorphic_body()?;
-        let m = body.methods.get(&e.0)?;
-        let td = self.prog.def(m.def).parent;
-        if self.prog.def(td).kind != DefKind::Trait {
-            return None;
-        }
-        let nt = self.tcx.trait_generic_count(self.prog, td);
-        let ta: Vec<TyId> = m.args.get(1..1 + nt)?.iter().map(|t| self.tcx.tys.subst_for_inference(*t, &self.b.args)).collect();
-        Some((td, ta))
+        Some((first, args))
     }
 
     /// rustc_ast_lowering/src/expr.rs:1774-1784,1826-1838: every head is the
     /// by-value argument of IntoIterator::into_iter, followed by next(&mut iter).
     /// UFCS does not autoderef or autoref the head; its adjustment is identity.
     fn for_into_iter_item(&mut self, it: u32, s: TyId) -> Option<TyId> {
+        // rustc_ast_lowering/src/expr.rs: IntoIterator::into_iter(head),
+        // then Iterator::next(&mut iter); read both results from their signatures.
         let into = self.tcx.lang_items.get(crate::lang_items::LangItem::IntoIterIntoIter)?;
-        let td = self.prog.def(into).parent;
-        let dt = self.deep(s);
-        match self.select_trait(td, dt, &[]) { SelectionResult::Ok(_) | SelectionResult::Ambiguous(_) => {}, SelectionResult::NoSolution => return None };
-        let ad = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("IntoIter")?)?;
-        let proj = self.tcx.tys.intern(TyKind::Assoc(ad, vec![dt], crate::types::RegionArgsId::EMPTY));
-        let iter_t = self.norm(proj);
+        let full = self.infer_item_args(into, &[s]);
+        let sig = self.tcx.fn_sig(self.prog, into)?.clone();
+        let (_, iter_t) = self.instantiate_call_signature(into, &full, &sig);
+        self.register_method_obligation(into, &full);
+        self.apply_fn_bounds(into, &full, self.last_lo);
+        let iter_t = self.normalize_signature(iter_t);
         let item = self.iterator_item(it, iter_t)?;
-        self.b.for_into.insert(it, (into, vec![dt], iter_t));
+        self.b.dependencies.push(into);
+        self.b.for_into.insert(it, (into, vec![s], iter_t));
         Some(item)
-    }
-
-    /// The pointee of a smart-pointer receiver type (`Box<X>`, `Rc<X>`, `Arc<X>`, `Pin<&mut X>`,
-    /// `Pin<&X>`, `Pin<Box<X>>`): where `self: Box<Self>`-style methods are declared.
-    fn receiver_pointee(&mut self, t: TyId) -> Option<TyId> {
-        let t = self.shallow(t);
-        let (d, args) = match self.tcx.tys.kind(t).clone() {
-            TyKind::Adt(d, a, _) => (d, a),
-            _ => return None,
-        };
-        let name = self.prog.name(d);
-        let a0 = self.shallow(*args.first()?);
-        match name {
-            "Box" | "Rc" | "Arc" => Some(a0),
-            "Pin" => match self.tcx.tys.kind(a0).clone() {
-                TyKind::Ref(_, x, _) => Some(self.shallow(x)),
-                TyKind::Adt(..) => self.receiver_pointee(a0),
-                _ => None,
-            },
-            _ => None,
-        }
-    }
-
-    /// Whether method `item` (of impl `imp`, Self = `x`) takes exactly the adjusted
-    /// receiver `u` (rustc probe.rs: xform_self_ty, checked speculatively).
-    fn method_receiver_matches(&mut self, item: DefId, imp: DefId, x: TyId, u: TyId, is_trait: bool) -> bool {
-        let sig = match self.tcx.fn_sig(self.prog, item).cloned() {
-            Some(s) => s,
-            None => return false,
-        };
-        if !(1..=3).contains(&sig.self_kind) || sig.params.is_empty() {
-            return false;
-        }
-        let save = self.snapshot();
-        let errors = self.b.errors.len();
-        let args = if is_trait { self.trait_call_args(item, imp, x, &[]) } else { self.match_impl_args(imp, x) };
-        let p0 = self.tcx.tys.subst_for_inference(sig.params[0], &args);
-        let ok = self.unify(p0, u);
-        self.rollback(save);
-        self.b.errors.truncate(errors);
-        ok
     }
 
     /// Trait methods `s` callable on `t` here: only traits in scope at the call (rustc's rule;
     /// `rc.borrow_mut()` is RefCell's through Deref unless BorrowMut is imported). Generic
     /// parameters and inference variables keep every candidate (bounds decide).
     fn scoped_trait_methods(&mut self, t: TyId, s: Sym) -> Vec<(DefId, DefId)> {
-        let mut tm = self.tcx.trait_methods_for(&self.cx, self.prog, t, s);
+        let mut tm = self.extension_candidates(t, s, DefKind::AssocFn);
         // a param / rigid projection of a generic body: its bounds' methods, supertraits
         // included (rustc assemble_inherent_candidates_from_param: where-clause candidates)
-        if matches!(self.tcx.tys.kind(t), TyKind::Param(_) | TyKind::Assoc(..)) {
+        if matches!(self.tcx.tys.kind(t), TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
             for (td, _) in self.param_bounds(t) {
                 for &it in &self.prog.traits[self.prog.def(td).sub as usize] {
                     if self.prog.def(it).name == s && self.prog.def(it).kind == DefKind::AssocFn && !tm.iter().any(|x| x.0 == it) {
@@ -4258,138 +3171,82 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        // a generic param of a polymorphic body has the methods of its bounds / env and of
-        // blanket impls only (`v.clone()` on `&T` without `T: Clone` is `<&T as Clone>`'s, not
-        // T's through a deref)
-        if let (false, TyKind::Param(_)) = (tm.is_empty(), self.tcx.tys.kind(t).clone()) {
-            if self.b.args.iter().any(|a| matches!(self.tcx.tys.kind(*a), TyKind::Param(_))) {
-                let mut env: Vec<DefId> = self.tcx.param_env_of(&self.cx, t).into_iter().map(|x| x.0).collect();
-                env.extend(self.param_bounds(t).into_iter().map(|x| x.0));
-                let keep: Vec<(DefId, DefId)> = tm
-                    .iter()
-                    .copied()
-                    .filter(|(item, imp)| {
-                        let td = self.prog.def(*item).parent;
-                        *imp == crate::program::NO_DEF || env.contains(&td) || self.tcx.impl_self.get(imp).map_or(false, |p| matches!(self.tcx.tys.kind(*p), TyKind::Param(_)))
-                    })
-                    .collect();
-                tm = keep;
-            }
-        }
-        if tm.is_empty() || matches!(self.tcx.tys.kind(t), TyKind::Param(_) | TyKind::Infer(_) | TyKind::Error | TyKind::Assoc(..)) {
-            return tm;
-        }
-        let scope = self.prog.traits_in_scope(self.module);
-        if self.bound_traits.is_none() {
-            // bodies are checked per instance: a receiver that was a generic param in the
-            // source gets its bound's methods (`range.start_bound()` with R: RangeBounds),
-            // and a trait's own default methods see the trait
-            let mut set = crate::fxhash::HashSet::default();
-            let mut todo: Vec<DefId> = Vec::new();
-            if let Some(v) = self.tcx.fn_trait_bounds(self.prog, self.b.def) {
-                todo.extend(v.iter().map(|x| x.1));
-            }
-            if let Some(td) = self.env.trait_def {
-                todo.push(td);
-            }
-            while let Some(td) = todo.pop() {
-                if set.insert(td) {
-                    todo.extend(self.tcx.trait_supers(self.prog, td));
-                }
-            }
-            // inside `impl Tr for X` the trait Tr itself is in scope (rustc resolve
-            // traits_in_scope: current_trait_ref), e.g. `self.0.fmt(f)` in `impl fmt::Debug`
-            let parent = self.prog.def(self.b.def).parent;
-            if self.prog.def(parent).kind == DefKind::Impl {
-                if let Some(&td) = self.tcx.impl_trait.get(&parent) {
-                    set.insert(td);
-                }
-            }
-            self.bound_traits = Some(set);
-        }
-        let bt = self.bound_traits.as_ref();
-        tm.into_iter()
-            .filter(|(item, _)| {
-                let td = self.prog.def(*item).parent;
-                scope.contains(&td) || bt.map_or(false, |b| b.contains(&td))
-            })
-            .collect()
+        tm
     }
 
-    /// For an integer / float inference variable `t`: per numeric type, the first trait
-    /// method `s` its impls in scope provide (type, method, impl). None for other types.
-    fn numeric_var_methods(&mut self, t: TyId, s: Sym) -> Option<Vec<(TyId, DefId, DefId)>> {
-        let TyKind::Infer(v) = self.tcx.tys.kind(t).clone() else { return None };
-        let kind = match self.vars[v as usize] {
-            VarSt::Free(k) => k,
-            _ => 0,
-        };
-        let prims: &[Prim] = match kind {
-            1 => &[Prim::I8, Prim::I16, Prim::I32, Prim::I64, Prim::I128, Prim::Isize, Prim::U8, Prim::U16, Prim::U32, Prim::U64, Prim::U128, Prim::Usize],
-            2 => &[Prim::F32, Prim::F64],
-            _ => return None,
-        };
-        let mut hits = Vec::new();
-        for &pr in prims {
-            let pt = self.tcx.tys.prim(pr);
-            let tm = self.scoped_trait_methods(pt, s);
-            if let Some(&(item, imp)) = tm.first() {
-                hits.push((pt, item, imp));
-            }
+    /// The traits a method probe considers: those in scope at the call (rustc
+    /// resolve's traits_in_scope, including the trait of the enclosing impl and
+    /// the body's bound traits).
+    /// method/probe.rs:926-928 + assemble_inherent_candidates_from_param: a type parameter's own
+    /// where-clauses (elaborated through supertraits; `Self` in a trait has `Self: Trait`) are
+    /// candidates for it; any other self type sees only the traits in scope (extension
+    /// candidates, probe.rs:1092-1175).
+    /// rustc_resolve/src/late.rs:5515-5522 + lib.rs:2111-2129 (traits_in_scope): inside a trait
+    /// impl the implemented trait itself is in scope, besides the module's imports.
+    fn traits_in_scope(&self) -> Vec<DefId> {
+        let mut traits: Vec<DefId> = self.prog.traits_in_scope(self.module).iter().copied().collect();
+        let parent = self.prog.def(self.b.def).parent;
+        if parent != NO_DEF && self.prog.def(parent).kind == DefKind::Impl {
+            if let Some(&td) = self.tcx.impl_trait.get(&parent) { traits.push(td); }
         }
-        Some(hits)
+        traits
     }
 
-    /// The by-value probe on a reference: only methods taking exactly `&t` / `&mut t`.
-    fn has_ref_self_method(&mut self, t: TyId, s: Sym, mutbl: bool) -> bool {
-        let receiver = self.tcx.tys.intern(TyKind::Ref(mutbl, t, crate::types::RegionId::ERASED));
-        // `r.cmp(..)` with r: &{integer}: the integer types' Ord::cmp takes `&self` (rustc's
-        // by-value step on `&{integer}` matches it with Self = {integer}, before the autoref'd
-        // `impl Ord for &A`)
-        if let Some(hits) = self.numeric_var_methods(t, s) {
-            return !hits.is_empty() && hits.iter().all(|h| h.1 == hits[0].1)
-                && self.tcx.fn_sig(self.prog, hits[0].1).map_or(false, |sg| sg.self_kind == if mutbl { 3 } else { 2 });
-        }
-        if let Some((item, imp)) = self.tcx.inherent_item(&self.cx, self.prog, t, s) {
-            if self.item_visible(item) && self.method_receiver_matches(item, imp, t, receiver, false) {
-                return true;
-            }
-        }
-        if let TyKind::Dyn(td, ..) = self.tcx.tys.kind(t).clone() {
-            if let Some(item) = self.dyn_method(td, s) {
-                if self.method_receiver_matches(item, crate::program::NO_DEF, t, receiver, true) {
-                    return true;
-                }
-            }
-        }
-        if let Some((item, _)) = self.opaque_method(t, s) {
-            if self.method_receiver_matches(item, crate::program::NO_DEF, t, receiver, true) {
-                return true;
-            }
-        }
-        if matches!(self.tcx.tys.kind(t), TyKind::Infer(_) | TyKind::Error) {
-            return false;
-        }
-        // any trait's `&self` method (`self.cmp(o)` with self: &Components, Components both
-        // Iterator and Ord: Ord::cmp's receiver is `&Components`, matched by value at that step;
-        // Iterator::cmp takes self and would need `&Components: Iterator`)
-        let tm = self.scoped_trait_methods(t, s);
-        tm.iter().any(|&(item, imp)| self.method_receiver_matches(item, imp, t, receiver, true))
+    fn param_bound_traits(&mut self, t: TyId) -> Vec<DefId> {
+        if !matches!(self.tcx.tys.kind(t), TyKind::Param(_)) { return Vec::new(); }
+        self.param_bounds(t).into_iter().map(|(td, _)| td).collect()
     }
 
-    /// A method named `s` of trait `td` or its supertraits (methods of a trait object).
-    fn dyn_method(&self, td: DefId, s: Sym) -> Option<DefId> {
-        for &it in &self.prog.traits[self.prog.def(td).sub as usize] {
-            if self.prog.def(it).name == s && self.prog.def(it).kind == DefKind::AssocFn {
-                return Some(it);
+    /// method/probe.rs:1092-1175 (assemble_extension_candidates_for_traits_in_scope)
+    /// and :2087-2161 (consider_probe, TraitCandidate): every trait in scope with an
+    /// item `name` of `kind` is a candidate when `t: Trait<fresh args>` may hold --
+    /// the obligation is evaluated in a probe and only a true error rejects it
+    /// (ambiguity is a match). A rigid opaque or param self type is proven through its
+    /// alias bounds / where-clauses by the solver like any other type.
+    fn extension_candidates(&mut self, t: TyId, name: Sym, kind: DefKind) -> Vec<(DefId, DefId)> {
+        if matches!(self.tcx.tys.kind(t), TyKind::Infer(_) | TyKind::Error) { return Vec::new(); }
+        let mut traits = self.traits_in_scope();
+        traits.extend(self.param_bound_traits(t));
+        traits.sort_by_key(|d| d.0);
+        traits.dedup();
+        let mut out = Vec::new();
+        for td in traits {
+            if self.prog.def(td).kind != DefKind::Trait { continue; }
+            let Some(item) = self.prog.traits[self.prog.def(td).sub as usize].iter().copied().find(|&it| self.prog.def(it).name == name && self.prog.def(it).kind == kind) else { continue };
+            let snapshot = self.start_snapshot();
+            let outer_universe = self.infcx.universe();
+            let mut args = Vec::new();
+            let indices = self.tcx.generic_indices_of(self.prog, td);
+            let full = self.infcx.fresh_args_for_item(self.prog, td);
+            for &i in &indices.types_consts[1..] {
+                args.push(match full[i as usize] { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() });
+            }
+            let goal = self.trait_goal(td, t, &args);
+            self.register_goal(goal, self.last_lo);
+            let mut matches = self.fulfillment_cx.try_evaluate_obligations(&self.infcx, self.prog).is_empty();
+            // probe.rs:2271-2275: the probe's leak check.
+            if matches && self.infcx.leak_check(outer_universe, Some(&snapshot.inference)).is_err() { matches = false; }
+            self.rollback_to(snapshot);
+            if matches { out.push((item, crate::program::NO_DEF)); }
+        }
+        out
+    }
+
+    /// method/probe.rs: object candidates include every elaborated supertrait;
+    /// a path through dyn Self must diagnose ambiguity just like a method call.
+    fn dyn_method(&mut self, td: DefId, name: Sym, lo: u32) -> Result<Option<DefId>, ()> {
+        if td == NO_DEF { return Ok(None); }
+        let args = self.tcx.generic_indices_of(self.prog, td).identity_args(&self.tcx.tys);
+        let p = crate::next_solver::collect::trait_predicate(td, args);
+        let mut candidates = Vec::new();
+        for p in self.tcx.supertraits(self.prog, p) {
+            let PredicateKind::Clause(ClauseKind::Trait(tr)) = p.kind else { continue; };
+            for &item in &self.prog.traits[self.prog.def(tr.trait_ref.def_id).sub as usize] {
+                if self.prog.def(item).name == name && self.prog.def(item).kind == DefKind::AssocFn && !candidates.contains(&item) { candidates.push(item); }
             }
         }
-        for sup in self.tcx.trait_supers(self.prog, td) {
-            if let Some(m) = self.dyn_method(sup, s) {
-                return Some(m);
-            }
-        }
-        None
+        if candidates.len() > 1 { self.err(lo, "E0034: multiple applicable items in scope".into()); return Err(()); }
+        Ok(candidates.pop())
     }
 
     /// The args of supertrait `target` reached from trait object principal `td<targs>` (Self =
@@ -4404,7 +3261,7 @@ impl<'a> Fcx<'a> {
             if seen > 64 || depth > 8 {
                 return None;
             }
-            for (sd, sa) in self.tcx.trait_super_refs_of(&self.cx, self.prog, d, dyn_t, &a) {
+            for (sd, sa) in self.tcx.trait_super_refs_of(&self.cx.with_infcx(&self.infcx), self.prog, d, dyn_t, &a) {
                 if sd == target {
                     if !found.contains(&sa) {
                         found.push(sa.clone());
@@ -4423,7 +3280,7 @@ impl<'a> Fcx<'a> {
 
     fn trait_call_args(&mut self, item: DefId, imp: DefId, t: TyId, explicit_own: &[TyId]) -> Vec<TyId> {
         // trait objects (NO_DEF) and #[derive]d impls have no impl item: trait args stay open
-        if imp == crate::program::NO_DEF || imp == crate::tcx::DERIVED_IMPL {
+        if imp == crate::program::NO_DEF {
             // trait object receiver: [dyn, the principal's args when the method is its own, own..]
             let mut args = vec![t];
             if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(t).clone() {
@@ -4437,31 +3294,30 @@ impl<'a> Fcx<'a> {
             let sig = self.tcx.fn_sig(self.prog, item).cloned();
             let np = sig.as_ref().map_or(1, |s| s.n_parent_generics) as usize;
             while args.len() < np {
-                args.push(self.fresh(0));
+                args.push(self.fresh_arg(item, args.len()));
             }
             let own = sig.map_or(0, |s| s.n_generics - s.n_parent_generics);
             for i in 0..own as usize {
                 if i < explicit_own.len() {
                     args.push(explicit_own[i]);
                 } else {
-                    args.push(self.fresh(0));
+                    args.push(self.fresh_arg(item, args.len()));
                 }
             }
             return args;
         }
-        let impl_args = self.match_impl_args(imp, t);
+        let impl_args = self.match_impl_full_args(imp, t);
         let targs = self.tcx.impl_trait_args.get(&imp).cloned().unwrap_or_default();
         let mut args = vec![t];
         for ta in targs {
-            let x = self.tcx.tys.subst_for_inference(ta, &impl_args);
-            args.push(x);
+            args.push(self.tcx.instantiate_ty(self.prog, imp, &impl_args, ta));
         }
         let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
         for i in 0..own as usize {
             if i < explicit_own.len() {
                 args.push(explicit_own[i]);
             } else {
-                args.push(self.fresh(0));
+                args.push(self.fresh_arg(item, args.len()));
             }
         }
         args
@@ -4469,25 +3325,23 @@ impl<'a> Fcx<'a> {
 
     /// One autoderef step from `t`: built-in for references and raw pointers, through
     /// `Deref` for other types. Records overloaded steps under (expr, step).
-    fn deref_step(&mut self, e: u32, step: u8, t: TyId) -> Option<TyId> {
-        let t = self.shallow_with_regions(t);
+    fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
+        let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
-            TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow_with_regions(i)),
+            TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow(i)),
             // (a param / rigid projection with a Deref bound derefs to its `Target` binding,
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
             // rustc autoderef.rs overloaded_deref_ty selects the bound's candidate)
-            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Assoc(..) | TyKind::Opaque(..) => {
-                let td = self.lang_item(&["ops", "Deref"])?;
-                let dt = self.deep(t);
-                if !self.tcx.opaque_implements(td, dt) {
-                    match self.select_trait(td, dt, &[]) {
-                        SelectionResult::Ambiguous(crate::solve::goal::MaybeCause::Overflow { .. }) | SelectionResult::NoSolution => return None,
-                        SelectionResult::Ok(_) | SelectionResult::Ambiguous(_) => {},
-                    };
-                }
+            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) => {
+                let td = self.tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
+                let dt = self.infcx.deeply_resolve_ignoring_regions(t);
+                match self.select_trait(td, dt, &[]) {
+                    Err(_) => return None,
+                    Ok(Some(_)) | Ok(None) => {},
+                };
                 let target = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Target")?)?;
-                let proj = self.tcx.tys.intern(TyKind::Assoc(target, vec![dt], crate::types::RegionArgsId::EMPTY));
+                let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: vec![dt], regions: crate::types::RegionArgsId::EMPTY }));
                 let r = self.norm(proj);
                 let m = self.trait_fn(td, "deref")?;
                 self.b.ov_derefs.insert((e, step), (m, vec![dt]));
@@ -4522,34 +3376,7 @@ impl<'a> Fcx<'a> {
         if args.len() > params.len() {
             return format!(" -- remove the extra argument{}", if args.len() - params.len() == 1 { "" } else { "s" });
         }
-        // the given arguments' types (no expectation: they are checked again by the caller)
-        let mut arg_tys = Vec::new();
-        for a in args {
-            let save = self.snapshot();
-            let nerr = self.b.errors.len();
-            let t = self.check_expr(*a, None);
-            let t = self.deep(t);
-            self.b.errors.truncate(nerr);
-            self.rollback(save);
-            arg_tys.push(t);
-        }
-        let mut used = vec![false; params.len()];
-        let mut pi = 0;
-        for at in &arg_tys {
-            while pi < params.len() {
-                let save = self.snapshot();
-                let ok = self.unify(params[pi], *at);
-                self.rollback(save);
-                pi += 1;
-                if ok {
-                    used[pi - 1] = true;
-                    break;
-                }
-            }
-        }
-        // a parameter list that the arguments do not follow in order: name them all
-        let matched = used.iter().filter(|u| **u).count();
-        let missing: Vec<usize> = if matched == args.len() { (0..params.len()).filter(|i| !used[*i]).collect() } else { (args.len()..params.len()).collect() };
+        let missing: Vec<usize> = (args.len()..params.len()).collect();
         let list: Vec<String> = missing.iter().map(|&i| format!("`{}: {}`", name_of(i), self.ty_str(params[i]))).collect();
         match list.len() {
             0 => String::new(),
@@ -4564,7 +3391,7 @@ impl<'a> Fcx<'a> {
     fn methods_of(&mut self, t: TyId) -> Vec<(Sym, Option<DefId>)> {
         let mut out: Vec<(Sym, Option<DefId>)> = Vec::new();
         let mut cur = self.shallow(t);
-        for step in 0..6u8 {
+        for step in 0..6usize {
             let key = crate::tcx::ty_key(&self.tcx.tys, cur);
             if let Some(list) = self.tcx.inherent.get(&key) {
                 for &imp in list {
@@ -4648,98 +3475,85 @@ impl<'a> Fcx<'a> {
 
     /// Normalizes associated-type projections whose Self is known.
     fn norm(&mut self, t: TyId) -> TyId {
-        let d = self.deep(t);
+        let d = self.infcx.deeply_resolve_ignoring_regions(t);
         let n = self.normalize_body_type(d);
-        if self.revealing && self.tcx.tys.has_opaque(n) {
-            return reveal(&self.cx, self.prog, self.tcx, n);
-        }
         n
     }
 
-    /// rustc traits/project.rs:262-282: ambiguity creates a fresh type and an
-    /// obligation in the same inference owner, including concrete ambiguity.
     fn normalize_body_type(&mut self, ty: TyId) -> TyId {
-        use crate::types::fold::{TypeFolder, super_fold_ty};
-        use crate::solve::goal::*;
-        struct Normalizer<'a, 'p> { fcx: &'a mut Fcx<'p>, active: Vec<TyId> }
-        impl TypeFolder for Normalizer<'_, '_> {
-            fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
-                if !tys.has_assoc(ty) { return ty; }
-                if self.active.contains(&ty) || self.active.len() >= 128 { return ty; }
-                self.active.push(ty);
-                let ty = super_fold_ty(tys, ty, self, depth);
-                let value = if let TyKind::Assoc(ad, args, _) = tys.kind(ty).clone() {
-                    let cx = self.fcx.cx.body();
-                    let mark = self.fcx.snapshot();
-                    match crate::solve::select::project(self.fcx.tcx, &cx, self.fcx, ty) {
-                        Ok((value, nested, Certainty::Yes)) if value != ty => {
-                            for goal in nested { self.fcx.register_goal(goal, self.fcx.last_lo); }
-                            let value = self.fcx.deep(value);
-                            self.fold_ty(tys, value, depth)
-                        }
-                        Ok((_, _, certainty)) if tys.has_infer(ty) || !self.fcx.tcx.has_param(ty) => {
-                            self.fcx.rollback(mark);
-                            let mut existing = None;
-                            for pending in &self.fcx.pending_goals {
-                                if let Predicate::Clause(Clause::Projection(p)) = &pending.goal.predicate {
-                                    if p.alias.def == ad && p.alias.args == args { if let Term::Ty(t) = p.term { existing = Some(t); break; } }
-                                }
-                            }
-                            match existing {
-                                Some(t) => self.fcx.shallow_vars(t),
-                                None => {
-                                    let value = self.fcx.fresh(0);
-                                    let goal = Goal { param_env: crate::solve::goal::ParamEnvId(cx.typing_env.param_env.index()), predicate: Predicate::Clause(Clause::Projection(ProjectionPredicate {
-                                        alias: AliasTerm { kind: AliasKind::Projection, def: ad, args }, term: Term::Ty(value),
-                                    })) };
-                                    self.fcx.push_pending_goal(goal, self.fcx.last_lo, certainty);
-                                    value
-                                }
-                            }
-                        }
-                        _ => { self.fcx.rollback(mark); ty }
-                    }
-                } else { ty };
-                self.active.pop();
-                value
-            }
-        }
-        let tcx = self.tcx;
-        tcx.tys.fold_with(ty, &mut Normalizer { fcx: self, active: Vec::new() })
+        let (ty, goals) = self.infcx.normalize_ty(self.prog, &self.param_env, ty);
+        for goal in goals { self.register_goal(goal, self.last_lo); }
+        ty
     }
 
-    /// Generic args of impl `imp` such that its self type equals `t`.
-    fn match_impl_args(&mut self, imp: DefId, t: TyId) -> Vec<TyId> {
-        let n = self.tcx.impl_generics.get(&imp).map_or(0, |e| e.names.len());
-        let mut args = Vec::new();
-        for _ in 0..n {
-            args.push(self.fresh(0));
+    /// rustc_hir_typeck/src/method/probe.rs:981,2034: instantiate an impl's
+    /// declaration arguments and test the relation in a rollback probe.
+    fn assemble_inherent_impl_probe(&mut self, ty: TyId, name: Sym) -> Option<(DefId, DefId)> {
+        self.cx.state.impl_read.set(true);
+        let key = ty_key(&self.tcx.tys, ty);
+        let mut found = None;
+        for &imp in self.tcx.inherent.get(&key)? {
+            if !self.prog.impls[self.prog.def(imp).sub as usize].items.iter().any(|&item| self.prog.def(item).name == name) { continue; }
+            let applicable = self.infcx.probe(|_| {
+                let full = self.infcx.fresh_args_for_item(self.prog, imp);
+                let self_ty = self.tcx.instantiate_ty(self.prog, imp, &full, self.tcx.impl_self[&imp]);
+                let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&self.infcx, self.prog);
+                if ocx.eq(&self.param_env, self_ty, ty).is_err() { return false; }
+                for clause in self.tcx.clauses_of(self.prog, imp) {
+                    ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: self.tcx.instantiate_predicate(self.prog, imp, &full, &clause) });
+                }
+                ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty()
+            });
+            if !applicable { continue; }
+            for &item in &self.prog.impls[self.prog.def(imp).sub as usize].items {
+                if self.prog.def(item).name == name {
+                    if found.is_some() { self.err(self.last_lo, "E0034: multiple applicable items in scope".into()); return None; }
+                    found = Some((item, imp));
+                }
+            }
         }
+        found
+    }
+
+    /// Full generic args of impl `imp` (lifetimes included) such that its self type equals `t`.
+    fn match_impl_full_args(&mut self, imp: DefId, t: TyId) -> Vec<crate::consts::GenericArg> {
+        let full = self.infcx.fresh_args_for_item(self.prog, imp);
         if let Some(&st) = self.tcx.impl_self.get(&imp) {
-            let inst = self.tcx.tys.subst_for_inference(st, &args);
-            self.unify(inst, t);
+            let inst = self.tcx.instantiate_ty(self.prog, imp, &full, st);
+            self.eq(inst, t);
         }
-        // the impl's where-clauses may fix args the caller only partly knows (an integer
-        // literal B in `Vec<u32> == vec![1, 2]` through `A: PartialEq<B>`): retried with the
-        // pending bounds once the trait args are unified
-        if self.tcx.impl_trait_bounds.contains_key(&imp) {
-            self.apply_impl_predicates(imp, &args);
+        full
+    }
+
+    /// An inherent associated value path's impl args (fn_ctxt/_impl.rs
+    /// instantiate_value_path with confirm.rs fresh_receiver_args): the type/const args
+    /// for the item's FnDef, its lifetime args kept for value_def_ty.
+    fn impl_args_for_value_path(&mut self, imp: DefId, t: TyId) -> Vec<TyId> {
+        let full = self.match_impl_full_args(imp, t);
+        let mut args = Vec::new();
+        self.value_path_parent_regions.clear();
+        for arg in full {
+            match arg {
+                crate::consts::GenericArg::Type(t) => args.push(t),
+                crate::consts::GenericArg::Const(c) => args.push(self.tcx.tys.intern(TyKind::Const(c))),
+                crate::consts::GenericArg::Lifetime(r) => self.value_path_parent_regions.push(r),
+            }
         }
         args
     }
 
-    fn explicit_args(&mut self, path: &Path) -> Option<Vec<TyId>> {
+    fn explicit_args(&mut self, path: &Path, def: DefId, offset: usize) -> Option<Vec<TyId>> {
         let n = path.segs.len();
-        self.seg_args(path, n - 1)
+        self.seg_args(path, n - 1, def, offset)
     }
 
-    fn seg_args(&mut self, path: &Path, i: usize) -> Option<Vec<TyId>> {
+    fn seg_args(&mut self, path: &Path, i: usize, def: DefId, offset: usize) -> Option<Vec<TyId>> {
         let seg = self.ast().segs(path.segs).get(i)?;
         let a = self.ast().gargs(seg.args)?;
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
             for g in self.ast().list(*v) {
-                if let Some(lt) = self.generic_arg(g) {
+                if let Some(lt) = self.generic_arg(g, def, offset + out.len()) {
                     out.push(lt);
                 }
             }
@@ -4747,192 +3561,65 @@ impl<'a> Fcx<'a> {
         Some(out)
     }
 
-    /// A type or const generic argument inside the body (instance args substituted).
-    fn generic_arg(&mut self, g: &GenericArg) -> Option<TyId> {
+    /// A type or const generic argument inside the definition body.
+    fn generic_arg(&mut self, g: &GenericArg, def: DefId, index: usize) -> Option<TyId> {
         let prog = self.prog;
         let env = self.env.clone();
-        let args = self.inst_args.clone();
         match g {
             GenericArg::Type(t) => {
                 if let Ty::Infer = prog.files[self.file as usize].ast.ty(*t) {
-                    return Some(self.fresh(0));
+                    return Some(self.fresh_arg(def, index));
                 }
-                let lt = self.tcx.type_or_const_arg(&self.cx, prog, self.file, self.module, &env, *t);
-                let lt = self.tcx.tys.subst(lt, &args);
-                Some(self.replace_errors_with_vars(lt, *t))
+                let (lt, errors) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), ||
+                    self.tcx.type_or_const_arg(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, *t));
+                for error in errors { if !self.b.errors.contains(&error) { self.b.errors.push(error); } }
+                // hir_ty_lowering/generics.rs:21-136,244-310: kind mismatch
+                // recovery keeps the parameter's kind, including unresolved args.
+                let declaration = self.tcx.declaration_env(prog, def);
+                let expected_const = declaration.consts.iter().any(|c| c.0 as usize == index);
+                if expected_const != matches!(self.tcx.tys.kind(lt), TyKind::Const(_)) {
+                    let message = if expected_const {
+                        if self.tcx.tys.has_error(lt) { "E0747: unresolved item provided when a constant was expected" }
+                        else { "E0747: type provided when a constant was expected" }
+                    } else { "E0747: constant provided when a type was expected" };
+                    self.err(self.last_lo, message.into());
+                    return Some(if expected_const { self.tcx.tys.intern(TyKind::Const(self.tcx.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tcx.tys.error });
+                }
+                Some(lt)
             }
             GenericArg::Const(e) => {
-                let lt = self.tcx.const_arg(&self.cx, prog, self.file, self.module, &env, *e);
-                Some(self.tcx.tys.subst(lt, &args))
+                let declaration = self.tcx.declaration_env(prog, def);
+                let Some(&(_, file, ty)) = declaration.consts.iter().find(|c| c.0 as usize == index) else {
+                    self.err(self.last_lo, "E0747: constant provided when a type was expected".into());
+                    return Some(self.tcx.tys.error);
+                };
+                let expected = self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), prog, file, prog.def(def).scope, &declaration, ty);
+                let ct = if crate::tcx::is_infer_len(self.ast(), *e) { self.infcx.next_const_var() }
+                    else { self.tcx.lower_const_arg(prog, self.file, &env, *e, expected) };
+                let lt = self.tcx.tys.intern(TyKind::Const(ct));
+                Some(lt)
             }
             _ => None,
         }
     }
 
-    /// Lowers a syntactic type inside the body (generic params map to the instance args).
+    /// Lowers a syntactic type inside the definition body.
     pub fn lower_ty(&mut self, t: crate::ast::TyId) -> TyId {
         let prog = self.prog;
         let env = self.env.clone();
         if let Ty::Infer = prog.files[self.file as usize].ast.ty(t) {
             return self.fresh(0);
         }
-        if let Some(x) = self.lower_alias_with_infer(t, 0) {
-            return x;
-        }
         // (errors of the annotation itself belong to this body: `let m: HashMap<..>` without the
         // import is E0412 here, not a later "type not fully known")
-        let (lt, errs) = self.tcx.with_errors(&self.cx, || self.tcx.lower_ty(&self.cx, prog, self.file, self.module, &env, t));
-        // (only a missing name: other lowering errors -- an array length the lowering cannot
-        // evaluate yet -- are recovered from the initializer, as before)
+        let (lt, errs) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), || self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, t));
         for e in errs {
-            if e.contains(": E0412: ") && !self.b.errors.contains(&e) {
+            if !self.b.errors.contains(&e) {
                 self.b.errors.push(e);
             }
         }
-        let args = self.inst_args.clone();
-        let lt = self.tcx.tys.subst(lt, &args);
         type_dependencies(self.tcx, lt, &mut self.b.dependencies);
-        self.replace_errors_with_vars(lt, t)
-    }
-
-    /// A type alias applied to `_` (`P<_>` with `type P<T> = (T, T)`): one variable for the
-    /// argument, used wherever the alias uses the param (lowering `_` to Error and replacing
-    /// each Error by its own variable would split it). Also inside tuples / references.
-    fn lower_alias_with_infer(&mut self, t: crate::ast::TyId, depth: u32) -> Option<TyId> {
-        if depth > 8 {
-            return None;
-        }
-        let prog = self.prog;
-        let f = &prog.files[self.file as usize];
-        fn has_infer_arg(ast: &crate::ast::Ast, t: crate::ast::TyId, depth: u32) -> bool {
-            if depth > 8 {
-                return false;
-            }
-            match ast.ty(t) {
-                Ty::Path(p) => p.qself.is_none() && p.segs.len() == 1 && matches!(ast.gargs(ast.segs(p.segs)[0].args), Some(GenericArgs::Angle(v)) if ast.list(*v).iter().any(|g| matches!(g, GenericArg::Type(x) if matches!(ast.ty(*x), Ty::Infer)))),
-                Ty::Tuple(v) => ast.list(*v).iter().any(|x| has_infer_arg(ast, *x, depth + 1)),
-                Ty::Ref(_, _, x) | Ty::Paren(x) => has_infer_arg(ast, *x, depth + 1),
-                _ => false,
-            }
-        }
-        if !has_infer_arg(&f.ast, t, depth) {
-            return None;
-        }
-        match f.ast.ty(t).clone() {
-            Ty::Tuple(v) => {
-                let mut out = Vec::new();
-                for x in f.ast.list(v).iter().copied() {
-                    let y = match self.lower_alias_with_infer(x, depth + 1) {
-                        Some(y) => y,
-                        None => self.lower_ty(x),
-                    };
-                    out.push(y);
-                }
-                Some(self.tcx.tys.intern(TyKind::Tuple(out)))
-            }
-            Ty::Ref(lt, m, x) => {
-                let region = self.env.regions.resolve(&self.tcx.tys, prog, self.file, lt);
-                let y = match self.lower_alias_with_infer(x, depth + 1) {
-                    Some(y) => y,
-                    None => self.lower_ty(x),
-                };
-                Some(self.tcx.tys.intern(TyKind::Ref(m, y, region)))
-            }
-            Ty::Paren(x) => self.lower_alias_with_infer(x, depth + 1),
-            Ty::Path(p) => {
-                let d = self.tcx.resolve_type_path_def(prog, self.file, self.module, &p)?;
-                if prog.def(d).kind != DefKind::TypeAlias {
-                    return None;
-                }
-                let pd = prog.def(d);
-                let pf = &prog.files[pd.file as usize];
-                let (generics, body) = match &pf.ast.item(pd.item).kind {
-                    ItemKind::TypeAlias { generics, ty: Some(b), .. } => (generics.clone(), *b),
-                    _ => return None,
-                };
-                let ntp = pf.ast.list(generics.params).iter().filter(|g| matches!(g.kind, GenericParamKind::Type(..))).count();
-                if pf.ast.list(generics.params).iter().any(|g| matches!(g.kind, GenericParamKind::Const(..))) {
-                    return None;
-                }
-                let written: Vec<crate::ast::TyId> = match f.ast.gargs(f.ast.segs(p.segs)[0].args) {
-                    Some(GenericArgs::Angle(v)) => f.ast.list(*v).iter().filter_map(|g| match g {
-                        GenericArg::Type(x) => Some(*x),
-                        _ => None,
-                    }).collect(),
-                    _ => Vec::new(),
-                };
-                if written.len() != ntp {
-                    return None;
-                }
-                let args: Vec<TyId> = written.iter().map(|x| self.lower_ty(*x)).collect();
-                let mut aenv = self.tcx.item_env(prog, d);
-                aenv.regions.enabled = self.env.regions.enabled;
-                let bt = self.tcx.lower_ty(&self.cx, prog, pd.file, pd.scope, &aenv, body);
-                if self.tcx.tys.has_error(bt) {
-                    return None;
-                }
-                let rs = self.tcx.lower_region_args(prog, self.file, self.module, &self.env, &p);
-                let bt = self.tcx.subst_decl_regions(bt, &aenv, rs);
-                Some(self.tcx.tys.subst(bt, &args))
-            }
-            _ => None,
-        }
-    }
-
-    /// `Vec<_>`: the `_` lowered to Error becomes a fresh variable.
-    fn replace_errors_with_vars(&mut self, t: TyId, _ast: crate::ast::TyId) -> TyId {
-        let k = self.tcx.tys.kind(t).clone();
-        match k {
-            TyKind::Error => self.fresh(0),
-            TyKind::Adt(d, v, regions) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.replace_errors_with_vars(x, _ast));
-                }
-                self.tcx.tys.intern(TyKind::Adt(d, n, regions))
-            }
-            TyKind::Ref(m, x, region) => {
-                let x = self.replace_errors_with_vars(x, _ast);
-                self.tcx.tys.intern(TyKind::Ref(m, x, region))
-            }
-            TyKind::Tuple(v) => {
-                let mut n = Vec::new();
-                for x in v {
-                    n.push(self.replace_errors_with_vars(x, _ast));
-                }
-                self.tcx.tys.intern(TyKind::Tuple(n))
-            }
-            TyKind::Array(x, l) => {
-                let x = self.replace_errors_with_vars(x, _ast);
-                // `[T; _]`: a length variable
-                if crate::types::len_ty(l) == Some(self.tcx.tys.error) {
-                    let v = self.fresh(0);
-                    return self.tcx.tys.mk_array(x, v);
-                }
-                self.tcx.tys.intern(TyKind::Array(x, l))
-            }
-            TyKind::Slice(x) => {
-                let x = self.replace_errors_with_vars(x, _ast);
-                self.tcx.tys.intern(TyKind::Slice(x))
-            }
-            // `*const _` (`0 as *const _`)
-            TyKind::Ptr(m, x) => {
-                let x = self.replace_errors_with_vars(x, _ast);
-                self.tcx.tys.intern(TyKind::Ptr(m, x))
-            }
-            // `fn(_) -> _`, `dyn Fn(isize) -> _`, `dyn Iterator<Item = _>`
-            TyKind::FnPtr(ps, r, c, bound) => {
-                let ps: Vec<TyId> = ps.into_iter().map(|x| self.replace_errors_with_vars(x, _ast)).collect();
-                let r = self.replace_errors_with_vars(r, _ast);
-                self.tcx.tys.intern(TyKind::FnPtr(ps, r, c, bound))
-            }
-            TyKind::Dyn(d, v, bs, regions, region, bound, autos) => {
-                let v: Vec<TyId> = v.into_iter().map(|x| self.replace_errors_with_vars(x, _ast)).collect();
-                let bs = bs.into_iter().map(|(a, x, n)| (a, self.replace_errors_with_vars(x, _ast), n)).collect();
-                self.tcx.tys.intern(TyKind::Dyn(d, v.into(), bs, regions, region, bound, autos.clone()))
-            }
-            _ => t,
-        }
+        lt
     }
 
     /// Type named by the first `n` segments of a path (for `Type::item`).
@@ -4940,15 +3627,14 @@ impl<'a> Fcx<'a> {
         let prog = self.prog;
         if n == 1 && self.ast().segs(path.segs)[0].kind == SegKind::SelfType {
             let st = self.env.self_ty?;
-            let args = self.inst_args.clone();
-            return Some(self.tcx.tys.subst_for_inference(st, &args));
+            return Some(st);
         }
         // generic param `T::item`
         if n == 1 {
             let s = self.sym(self.ast().segs(path.segs)[0].name);
             for (i, nm) in self.env.names.iter().enumerate() {
-                if *nm == s && i < self.inst_args.len() {
-                    return Some(self.inst_args[i]);
+                if *nm == s && i < self.b.args.len() {
+                    return Some(self.b.args[i]);
                 }
             }
         }
@@ -4959,18 +3645,16 @@ impl<'a> Fcx<'a> {
             let env = self.env.clone();
             // (an expression path may elide a generic associated type's lifetimes: rustc
             // reports E0107 only in types)
-            let (t, errs) = self.tcx.with_errors(&self.cx, || self.tcx.lower_path_ty(&self.cx, prog, self.file, self.module, &env, &sub));
+            let (t, errs) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), || self.tcx.lower_path_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, &sub, None));
             for e in errs {
                 if !e.contains("E0107: missing generics for associated type") {
-                    self.tcx.reraise_error(&self.cx, e);
+                    self.tcx.reraise_error(&self.cx.with_infcx(&self.infcx), e);
                 }
             }
-            let args = self.inst_args.clone();
-            let t = self.tcx.tys.subst_for_inference(t, &args);
-            let t = self.tcx.normalize_for_inference(&self.cx, prog, t);
+            let t = self.normalize_body_type(t);
             // (a projection that stays one is rigid in a generic body: `A::Mem::default()`
             // resolves through the associated type's bounds)
-            if !matches!(self.tcx.tys.kind(t), TyKind::Error) && (!matches!(self.tcx.tys.kind(t), TyKind::Assoc(..)) || !self.tcx.tys.has_infer(t)) {
+            if !matches!(self.tcx.tys.kind(t), TyKind::Error) && (!matches!(self.tcx.tys.kind(t), TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) || !self.tcx.tys.has_infer(t)) {
                 return Some(t);
             }
         }
@@ -4989,27 +3673,29 @@ impl<'a> Fcx<'a> {
             None if n == 1 && !path.global() => prog.relaxed_import(self.module, self.sym(self.ast().segs(path.segs)[0].name), true, self.file, path.lo)?,
             None => return None,
         };
-        let args = self.seg_args(path, n - 1);
+        let args = self.seg_args(path, n - 1, d, 0);
         match prog.def(d).kind {
             DefKind::Prim(p) => Some(self.tcx.tys.prim(p)),
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 let ng = self.tcx.adts.get(&d).map_or(0, |a| a.n_generics);
                 let mut a = args.unwrap_or_default();
                 while a.len() < ng as usize {
-                    a.push(self.fresh(0));
+                    a.push(self.fresh_arg(d, a.len()));
                 }
-                Some(self.tcx.tys.intern(TyKind::Adt(d, a, crate::types::RegionArgsId::EMPTY)))
+                let mut regions = Vec::new();
+                for _ in &self.tcx.generic_indices_of(prog, d).lifetimes { regions.push(self.fresh_region()); }
+                Some(self.tcx.tys.intern(TyKind::Adt(d, a, self.tcx.tys.intern_region_args(&regions))))
             }
             DefKind::TypeAlias => {
-                let t = self.tcx.alias_ty(&self.cx, prog, d);
+                let t = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, d);
                 let mut a = args.unwrap_or_default();
                 // `Alias::f` without generic args: the alias's parameters are inferred like a
                 // struct's (`FxHashSet::default()`)
                 let need = self.tcx.item_env(prog, d).names.len();
                 while a.len() < need {
-                    a.push(self.fresh(0));
+                    a.push(self.fresh_arg(d, a.len()));
                 }
-                Some(self.tcx.tys.subst_for_inference(t, &a))
+                Some(self.tcx.tys.subst(t, &a))
             }
             _ => None,
         }
@@ -5128,7 +3814,7 @@ impl<'a> Fcx<'a> {
                         let st = self.shallow(t);
                         if st != self.tcx.tys.unit && st != self.tcx.tys.never {
                             let unit = self.tcx.tys.unit;
-                            self.unify(st, unit);
+                            self.eq(st, unit);
                         }
                     }
                 }
@@ -5189,28 +3875,22 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Paren(x) => self.check_expr(*x, expected),
             ExprKind::Unary(op, x) => match op {
-                // `-&x` / `!&b`: std's `impl Neg for &i64`, `impl Not for &bool` (operand derefs)
-                UnOp::Neg => {
+                // rustc_hir_typeck/src/expr.rs check_expr_unary and op.rs:960-1080.
+                UnOp::Neg | UnOp::Not => {
                     let t = self.check_expr(*x, expected);
-                    let t = self.peel_prim_refs(t);
                     let st = self.shallow(t);
-                    if let Some(r) = self.check_unop_trait(e, st, "Neg", "neg") {
-                        return r;
+                    let builtin = match (op, self.tcx.tys.kind(st)) {
+                        (UnOp::Neg, TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_)) => true,
+                        (UnOp::Not, TyKind::Int(_) | TyKind::IntVar(_) | TyKind::Bool) => true,
+                        _ => false,
+                    };
+                    let (tr, method, symbol) = if *op == UnOp::Neg { ("Neg", "neg", "-") } else { ("Not", "not", "!") };
+                    let result = self.check_unop_trait(e, st, tr, method);
+                    if result.is_none() && !self.tcx.tys.has_error(st) {
+                        let name = self.ty_str(st);
+                        self.err(lo, format!("E0600: cannot apply unary operator `{symbol}` to type `{name}`"));
                     }
-                    if !self.is_numeric(st) {
-                        let s = self.ty_str(st);
-                        self.err(lo, format!("cannot negate `{}`", s));
-                    }
-                    t
-                }
-                UnOp::Not => {
-                    let t = self.check_expr(*x, expected);
-                    let t = self.peel_prim_refs(t);
-                    let st = self.shallow(t);
-                    if let Some(r) = self.check_unop_trait(e, st, "Not", "not") {
-                        return r;
-                    }
-                    t
+                    if builtin { t } else { result.unwrap_or(error) }
                 }
                 UnOp::Deref => {
                     let t = self.check_expr(*x, None);
@@ -5241,7 +3921,9 @@ impl<'a> Fcx<'a> {
             ExprKind::AssignOp(op, a, b) => {
                 let ta = self.check_expr(*a, None);
                 let sa = self.shallow(ta);
-                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..)) {
+                // rustc_hir_typeck/src/op.rs:29-44: parameters and aliases keep
+                // the overloaded decision, even when an instance is primitive.
+                if matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Param(_) | TyKind::Alias(..)) {
                     // `a op= b` on a non-primitive: core::ops::<Op>Assign
                     self.cur_binop = e.0;
                     self.check_op_trait(*op, sa, *b, lo, true);
@@ -5262,13 +3944,16 @@ impl<'a> Fcx<'a> {
                 unit
             }
             ExprKind::Cast(x, t) => {
+                let deferred_before = self.deferred_casts.len();
                 let target = self.lower_ty(*t);
                 let st = self.shallow(target);
                 let xt = self.check_expr(*x, None);
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
-                if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
+                if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
+                    self.deferred_casts.push((*x, xt, target));
+                } else if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
                     self.b.coerce.insert(x.0, Coerce::ToDyn(src, dy));
                 } else if let Some((sd, dd)) = self.dyn_upcast(&kx, &kt) {
                     self.b.coerce.insert(x.0, Coerce::Upcast(sd, dd));
@@ -5315,7 +4000,7 @@ impl<'a> Fcx<'a> {
                         }
                     }
                 }
-                self.record_cast_borrow(*x, xt, target);
+                if self.deferred_casts.len() == deferred_before { self.record_cast_borrow(*x, xt, target); }
                 target
             }
             ExprKind::Block(b, label) => {
@@ -5330,7 +4015,7 @@ impl<'a> Fcx<'a> {
                             self.diverges = false;
                             return bt;
                         }
-                        self.unify(bt, t);
+                        self.eq(bt, t);
                     }
                     self.diverges = false;
                     return t;
@@ -5359,7 +4044,7 @@ impl<'a> Fcx<'a> {
                         if !then_div {
                             let s = self.shallow(tt);
                             if s != unit && s != self.tcx.tys.never {
-                                self.unify(s, unit);
+                                self.eq(s, unit);
                             }
                         }
                         unit
@@ -5475,7 +4160,7 @@ impl<'a> Fcx<'a> {
                 let bt = self.check_block(*b, Some(unit));
                 let sb = self.shallow(bt);
                 if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.unify(sb, unit);
+                    self.eq(sb, unit);
                 }
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
@@ -5491,7 +4176,7 @@ impl<'a> Fcx<'a> {
                 let bt = self.check_block(*b, Some(unit));
                 let sb = self.shallow(bt);
                 if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.unify(sb, unit);
+                    self.eq(sb, unit);
                 }
                 let lp = self.loops.pop().unwrap();
                 self.in_loop_condition = was_in_condition;
@@ -5523,7 +4208,7 @@ impl<'a> Fcx<'a> {
                 let bt = self.check_block(*b, Some(unit));
                 let sb = self.shallow(bt);
                 if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.unify(sb, unit);
+                    self.eq(sb, unit);
                 }
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
@@ -5556,7 +4241,7 @@ impl<'a> Fcx<'a> {
                     if self.loops[i].is_loop {
                         match self.loops[i].break_ty {
                             Some(prev) => {
-                                self.unify(prev, bt);
+                                self.eq(prev, bt);
                             }
                             None => self.loops[i].break_ty = Some(bt),
                         }
@@ -5580,7 +4265,7 @@ impl<'a> Fcx<'a> {
                         self.coerce_or_unify(t, rt, Some(*v), lo);
                     }
                     None => {
-                        self.unify(rt, unit);
+                        self.eq(rt, unit);
                     }
                 }
                 self.tcx.tys.never
@@ -5588,7 +4273,7 @@ impl<'a> Fcx<'a> {
             ExprKind::Tuple(v) => {
                 let exp_elems = match expected {
                     Some(t) => {
-                        let s = self.shallow_with_regions(t);
+                        let s = self.shallow(t);
                         match self.tcx.tys.kind(s).clone() {
                             TyKind::Tuple(x) if x.len() == v.len() => Some(x),
                             _ => None,
@@ -5615,7 +4300,7 @@ impl<'a> Fcx<'a> {
             ExprKind::Array(v) => {
                 let elem_exp = match expected {
                     Some(t) => {
-                        let s = self.shallow_with_regions(t);
+                        let s = self.shallow(t);
                         match self.tcx.tys.kind(s).clone() {
                             TyKind::Array(e, _) | TyKind::Slice(e) => Some(e),
                             _ => None,
@@ -5652,21 +4337,21 @@ impl<'a> Fcx<'a> {
                         }
                         let e = res.unwrap_or_else(|| self.fresh(0));
                         if let Some(x) = elem_exp {
-                            self.unify(x, e);
+                            self.eq(x, e);
                         }
-                        return self.tcx.tys.intern(TyKind::Array(e, v.len() as u64));
+                        return self.tcx.tys.intern(TyKind::Array(e, self.tcx.tys.const_usize(v.len() as u64)));
                     }
                 };
                 for x in self.ast().list(*v) {
                     let t = self.check_expr(*x, Some(elem));
                     self.coerce_or_unify(t, elem, Some(*x), lo);
                 }
-                self.tcx.tys.intern(TyKind::Array(elem, v.len() as u64))
+                self.tcx.tys.intern(TyKind::Array(elem, self.tcx.tys.const_usize(v.len() as u64)))
             }
             ExprKind::Repeat(x, n) => {
                 let elem_exp = match expected {
                     Some(t) => {
-                        let s = self.shallow_with_regions(t);
+                        let s = self.shallow(t);
                         match self.tcx.tys.kind(s).clone() {
                             TyKind::Array(e, _) => Some(e),
                             _ => None,
@@ -5686,37 +4371,29 @@ impl<'a> Fcx<'a> {
                 }
                 // `[x; _]`: the length is inferred (rustc generic_arg_infer)
                 if crate::tcx::is_infer_len(self.ast(), *n) {
-                    let v = self.fresh(0);
-                    let arr = self.tcx.tys.mk_array(t, v);
+                    let arr = self.tcx.tys.mk_array(t, self.infcx.next_const_var());
+                    // expr.rs:1775: the array type is well formed
+                    self.register_wf(arr, lo);
                     self.deferred_repeats.push((*x, t, arr));
                     return arr;
                 }
                 let usize_ = self.tcx.tys.usize_;
                 self.check_expr(*n, Some(usize_));
-                // a constant or a const generic param of this instance (`[0; N]`)
-                let env = self.env.clone();
-                self.cx.state.const_wait.set(false);
-                let lt = self.tcx.const_arg(&self.cx, self.prog, self.file, self.module, &env, *n);
-                if lt == self.tcx.tys.error && self.cx.state.const_wait.get() {
-                    // the count is a const evaluated by running it: the body is checked again
-                    // once it has been (jit: resolve_const_requests)
-                    self.err(self.ast().expr(*n).lo, "array repeat count waits for a constant's evaluation".to_string());
-                    return self.tcx.tys.error;
-                }
-                if lt == self.tcx.tys.error {
-                    self.err(self.ast().expr(*n).lo, "array repeat count must be a constant -- use a const item or a const generic param".to_string());
-                    return self.tcx.tys.error;
-                }
-                let lt = self.tcx.tys.subst_for_inference(lt, &self.inst_args.clone());
-                let arr = self.tcx.tys.mk_array(t, lt);
+                // hir_ty_lowering/mod.rs:2390: retain the repeat body's identity;
+                // fulfillment evaluates it through the same query as array types.
+                let len = self.tcx.lower_const_arg(self.prog, self.file, &self.env, *n, usize_);
+                let len = self.tcx.tys.intern(TyKind::Const(len));
+                let len = self.normalize_body_type(len);
+                let arr = self.tcx.tys.mk_array(t, self.tcx.tys.expect_const(len));
+                self.register_wf(arr, lo);
                 self.deferred_repeats.push((*x, t, arr));
                 arr
             }
             ExprKind::Field(x, name) => self.check_field(e, *x, *name, lo),
             ExprKind::TupleField(x, idx) => {
                 let t = self.check_expr(*x, None);
-                let mut cur = self.shallow_with_regions(t);
-                let mut derefs = 0u8;
+                let mut cur = self.shallow(t);
+                let mut derefs = 0usize;
                 loop {
                     match self.tcx.tys.kind(cur).clone() {
                         TyKind::Tuple(v) => {
@@ -5759,8 +4436,8 @@ impl<'a> Fcx<'a> {
             ExprKind::Index(a, i) => {
                 let ta = self.check_expr(*a, None);
                 let ti = self.check_expr(*i, None);
-                let mut cur = self.shallow_with_regions(ta);
-                let mut derefs = 0u8;
+                let mut cur = self.shallow(ta);
+                let mut derefs = 0usize;
                 let tis = self.shallow(ti);
                 let idx_is_range = matches!(self.tcx.tys.kind(tis), TyKind::Adt(..));
                 // an integer literal index stays open until the indexing is known: `f[1]` with
@@ -5773,7 +4450,7 @@ impl<'a> Fcx<'a> {
                 let open_index = !lit_index && matches!(self.tcx.tys.kind(tis), TyKind::Infer(_));
                 if !idx_is_range && !lit_index && !open_index {
                     let usize_ = self.tcx.tys.usize_;
-                    self.unify(tis, usize_);
+                    self.eq(tis, usize_);
                 }
                 loop {
                     match self.tcx.tys.kind(cur).clone() {
@@ -5787,20 +4464,20 @@ impl<'a> Fcx<'a> {
                             // the result is `<I as SliceIndex<[T]>>::Output`)
                             let std_range = match self.tcx.tys.kind(tis) {
                                 TyKind::Adt(d, _, _) => matches!(self.prog.name(*d), "Range" | "RangeFrom" | "RangeTo" | "RangeFull" | "RangeInclusive" | "RangeToInclusive"),
-                                TyKind::Param(_) | TyKind::Assoc(..) => false,
+                                TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => false,
                                 _ => true,
                             };
                             if !std_range {
                                 if let Some(td) = self.lang_item(&["ops", "Index"]) {
-                                    let ti2 = self.deep(ti);
+                                    let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
                                     let slice = self.tcx.tys.intern(TyKind::Slice(el));
                                     for st in [cur, slice] {
-                                        let ds = self.deep(st);
-                                        if !matches!(self.select_trait(td, ds, &[ti2]), SelectionResult::NoSolution) {
+                                        let ds = self.infcx.deeply_resolve_ignoring_regions(st);
+                                        if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
                                             let m = self.trait_fn(td, "index").unwrap();
                                             self.b.ov_index.insert(e.0, (m, vec![ds, ti2]));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
-                                            let r = self.tcx.tys.intern(TyKind::Assoc(out, vec![ds, ti2], crate::types::RegionArgsId::EMPTY));
+                                            let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: vec![ds, ti2], regions: crate::types::RegionArgsId::EMPTY }));
                                             return self.norm_keep(r);
                                         }
                                     }
@@ -5811,7 +4488,7 @@ impl<'a> Fcx<'a> {
                             }
                             if lit_index || open_index {
                                 let usize_ = self.tcx.tys.usize_;
-                                self.unify(tis, usize_);
+                                self.eq(tis, usize_);
                             }
                             return el;
                         }
@@ -5820,42 +4497,43 @@ impl<'a> Fcx<'a> {
                             return self.tcx.tys.str_;
                         }
                         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {
-                            cur = self.shallow_with_regions(x);
+                            cur = self.shallow(x);
                             derefs += 1;
                         }
                         TyKind::Adt(..) => {
                             // `Index<Idx>` impl on the type, else autoderef through Deref
                             if let Some(td) = self.lang_item(&["ops", "Index"]) {
-                                let dc = self.deep(cur);
-                                let ti2 = self.deep(ti);
+                                let dc = self.infcx.deeply_resolve_ignoring_regions(cur);
+                                let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
                                 let mut found = self.select_trait(td, dc, &[ti2]);
                                 let mut coerced_idx: Option<TyId> = None;
-                                if matches!(found, SelectionResult::NoSolution) && !idx_is_range && !lit_index {
+                                if matches!(found, Err(_)) && !idx_is_range && !lit_index {
                                     // the index coerces to the impl's index type (`S[bar]` with
                                     // `impl Index<fn()> for S`: rustc coerces the index operand to
                                     // the input type of the selected impl)
                                     let wild = self.fresh(0);
-                                    if let SelectionResult::Ok(selected) = self.select_trait(td, dc, &[wild]) {
-                                        let (imp, iargs) = (selected.method_owner(), selected.args);
+                                    if let Ok(Some(selected)) = self.select_trait(td, dc, &[wild]) {
+                                        let (imp, iargs) = match selected { ImplSource::UserDefined { impl_def_id, args, .. } => (impl_def_id, args), _ => (NO_DEF, Vec::new()) };
                                         if let Some(&ia) = self.tcx.impl_trait_args.get(&imp).and_then(|v| v.first()) {
-                                            let want = self.tcx.tys.subst_for_inference(ia, &iargs);
-                                            let snap = self.snapshot();
+                                            let want = self.tcx.instantiate_ty(self.prog, imp, &iargs, ia);
+                                            let snap = self.start_snapshot();
                                             if !self.tcx.has_param(want) && self.try_coerce(ti, want, Some(*i)) {
+                                                self.commit_from(snap);
                                                 coerced_idx = Some(want);
                                                 found = self.select_trait(td, dc, &[want]);
                                             } else {
-                                                self.rollback(snap);
+                                                self.rollback_to(snap);
                                             }
                                         }
                                     }
                                 }
-                                if !matches!(found, SelectionResult::NoSolution) {
+                                if !matches!(found, Err(_)) {
                                     self.b.index_derefs.insert(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
                                     self.b.ov_index.insert(e.0, (m, vec![dc, index]));
                                     let output = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
-                                    let projection = self.tcx.tys.intern(TyKind::Assoc(output, vec![dc, index], crate::types::RegionArgsId::EMPTY));
+                                    let projection = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: vec![dc, index], regions: crate::types::RegionArgsId::EMPTY }));
                                     return self.norm_keep(projection);
                                 }
                             }
@@ -5877,7 +4555,7 @@ impl<'a> Fcx<'a> {
             ExprKind::AddrOf(raw, m, x) => {
                 let exp_inner = match expected {
                     Some(t) => {
-                        let s = self.shallow_region_vars(t);
+                        let s = self.infcx.shallow_resolve(t);
                         match self.tcx.tys.kind(s).clone() {
                             TyKind::Ref(_, i, _) => Some(i),
                             _ => None,
@@ -5924,11 +4602,14 @@ impl<'a> Fcx<'a> {
                 let (adt_ty, vi) = self.adt_of_ctor(d);
                 let adt_ty = self.instantiate_adt(adt_ty);
                 let adt_ty = if self.prog.def(d).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
+                // N:rustc_hir_typeck/src/expr.rs:1823 and fn_ctxt/_impl.rs:1293-1301:
+                // obligations belong to the instantiated path, including explicit args.
+                self.register_wf(adt_ty, lo);
                 // an unsized expectation (`Wrap<dyn Debug>` for `Box::new(Wrap { .. })`) is no
                 // type to check against (rustc only_has_type of ExpectRvalueLikeUnsized)
                 if let Some(x) = expected {
                     if !self.is_unsized_ty(x) {
-                        self.unify(adt_ty, x);
+                        self.eq(adt_ty, x);
                     }
                 }
                 let base = base.get();
@@ -5954,7 +4635,7 @@ impl<'a> Fcx<'a> {
                 }
                 if let Some(bx) = base {
                     let t = self.check_expr(bx, Some(adt_ty));
-                    self.unify(t, adt_ty);
+                    self.eq(t, adt_ty);
                 }
                 if *rest {
                     self.struct_defaults(e, d, adt_ty, vi, &given, lo);
@@ -5965,11 +4646,11 @@ impl<'a> Fcx<'a> {
                 let elem = self.fresh(0);
                 if let Some(a) = a {
                     let t = self.check_expr(*a, Some(elem));
-                    self.unify(t, elem);
+                    self.eq(t, elem);
                 }
                 if let Some(b) = b {
                     let t = self.check_expr(*b, Some(elem));
-                    self.unify(t, elem);
+                    self.eq(t, elem);
                 }
                 let name = match (a.is_some(), b.is_some(), *incl) {
                     (true, true, false) => "Range",
@@ -6090,144 +4771,43 @@ impl<'a> Fcx<'a> {
         false
     }
 
-    /// `x?` on Option / Result: the success payload; the failure returns early (Result errors
-    /// through `From::from` when the error types differ).
+    /// rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764: call Try::branch,
+    /// match the ControlFlow lang-item variants, and return FromResidual on Break.
+    /// The typed AST records the two desugared calls for its lowering consumers.
     fn check_try(&mut self, e: ExprId, x: ExprId, lo: u32) -> TyId {
-        let error = self.tcx.tys.error;
+        use crate::lang_items::LangItem;
         let t = self.check_expr(x, None);
-        let t = self.shallow(t);
-        let (d, args) = match self.tcx.tys.kind(t).clone() {
-            TyKind::Adt(d, args, _) if Some(self.prog.def(d).krate) == self.prog.prelude_crate && matches!(self.prog.name(d), "Option" | "Result") => (d, args),
-            TyKind::Error => return error,
-            _ => {
-                let s = self.ty_str(t);
-                self.err(lo, format!("`?` needs an Option or Result, found `{}`", s));
-                return error;
-            }
+        let Some(branch) = self.tcx.lang_items.get(LangItem::TryTraitBranch) else {
+            self.err(lo, "missing `branch` lang item".into()); return self.tcx.tys.error;
         };
-        let is_result = self.prog.name(d) == "Result";
-        let ret = match self.ret_stack.last() {
-            Some(r) => *r,
-            None => return error,
+        let Some(from_residual) = self.tcx.lang_items.get(LangItem::TryTraitFromResidual) else {
+            self.err(lo, "missing `from_residual` lang item".into()); return self.tcx.tys.error;
         };
-        let mut rs = self.shallow(ret);
-        // `Poll<Result<T, F>>` (std's `FromResidual<Result<!, E>> for Poll<Result<T, F>>`, a
-        // stream's poll): the error converts into F as for a Result return; lowering wraps the
-        // Err in Poll::Ready
-        if is_result {
-            if let TyKind::Adt(pd, pargs, _) = self.tcx.tys.kind(rs).clone() {
-                if self.prog.name(pd) == "Poll" && Some(self.prog.def(pd).krate) == self.prog.prelude_crate {
-                    if let Some(&inner) = pargs.first() {
-                        let inner = self.shallow(inner);
-                        if matches!(self.tcx.tys.kind(inner), TyKind::Adt(id, _, _) if *id == d) {
-                            rs = inner;
-                        }
-                    }
-                }
-            }
-        }
-        let mut conv = None;
-        match self.tcx.tys.kind(rs).clone() {
-            TyKind::Infer(_) => {
-                // closure without a declared return type: the same carrier; its error type is
-                // what the body makes it (the tail `encode(..)` returning Result<(), String>
-                // after a `?` on Result<_, &str>): the `?` converts through From once it is
-                // known (rustc: an `E: From<&str>` obligation, not E = &str)
-                let mut a = vec![self.fresh(0)];
-                if is_result {
-                    let ev = self.fresh(0);
-                    a.push(ev);
-                    self.pending_tries.push((e.0, args[1], ev, ret));
-                }
-                let rt = self.tcx.tys.intern(TyKind::Adt(d, a, crate::types::RegionArgsId::EMPTY));
-                self.unify(rs, rt);
-            }
-            TyKind::Adt(rd, rargs, _) if rd == d => {
-                if is_result && matches!(self.tcx.tys.kind(self.shallow(rargs[1])), TyKind::Infer(_)) {
-                    // the error type is still open (a closure whose first `?` made its return
-                    // type `Result<_, ?E>`): rustc adds `?E: From<have>`, it never equates them;
-                    // `.ok_or("..")?` after `eval()?` (String) must not fix ?E = &str
-                    self.pending_tries.push((e.0, args[1], rargs[1], ret));
-                } else if is_result {
-                    let (have, want) = (args[1], rargs[1]);
-                    let save = self.snapshot();
-                    if !self.unify(have, want) {
-                        self.rollback(save);
-                        let from = self.lang_item(&["convert", "From"]);
-                        let h = self.deep(have);
-                        let w = self.deep(want);
-                        let ok = match from {
-                            Some(fd) => !matches!(self.select_trait(fd, w, &[h]), SelectionResult::NoSolution),
-                            None => false,
-                        };
-                        if !ok {
-                            let (hs, ws) = (self.ty_str(h), self.ty_str(w));
-                            self.err(lo, format!("`?` cannot convert the error `{}` into `{}` (no From impl)", hs, ws));
-                        } else if let Some(fm) = from.and_then(|fd| self.trait_fn(fd, "from")) {
-                            conv = Some((fm, vec![w, h]));
-                        }
-                    }
-                }
-            }
-            _ => {
-                let s = self.ty_str(rs);
-                self.err(lo, format!("`?` in a function returning `{}`", s));
-            }
-        }
-        self.b.try_conv.insert(e.0, conv);
-        args.first().copied().unwrap_or(error)
-    }
-
-    /// The `?`s of a body whose return type was open: an error type the body left open is the
-    /// first `?`'s (Relax's fallback; rustc asks for an annotation), a different one is reached
-    /// through `From` (or is an error when no impl converts).
-    fn finish_tries(&mut self, ret: Option<TyId>) {
-        self.finish_tries_at(ret, false);
-    }
-
-    /// `outermost`: the item body's end (fcx.finish): open error types take their fallback here.
-    fn finish_tries_at(&mut self, ret: Option<TyId>, outermost: bool) {
-        let list = std::mem::take(&mut self.pending_tries);
-        let mut keep = Vec::new();
-        // the body a closure's still-open `?`s move to (rustc checks a closure with its enclosing
-        // body: the error type can come from code after the closure, `match f() { Err(e) => Some(e) .. }`)
-        let enclosing = if outermost { None } else { self.ret_stack.last().copied() };
-        for (e, have, want, r) in list {
-            // a `?` of an enclosing body (its closure not finished yet) stays pending
-            if !outermost && Some(r) != ret {
-                keep.push((e, have, want, r));
-                continue;
-            }
-            let ws = self.shallow(want);
-            if matches!(self.tcx.tys.kind(ws), TyKind::Infer(_)) {
-                if let Some(up) = enclosing {
-                    keep.push((e, have, want, up));
-                    continue;
-                }
-                self.unify(ws, have);
-                continue;
-            }
-            let save = self.snapshot();
-            if self.unify(have, want) {
-                continue;
-            }
-            self.rollback(save);
-            let from = self.lang_item(&["convert", "From"]);
-            let h = self.deep(have);
-            let w = self.deep(want);
-            let ok = match from {
-                Some(fd) => !matches!(self.select_trait(fd, w, &[h]), SelectionResult::NoSolution),
-                None => false,
-            };
-            let lo = self.ast().expr(ExprId(e)).lo;
-            if !ok {
-                let (hs, wstr) = (self.ty_str(h), self.ty_str(w));
-                self.err(lo, format!("`?` cannot convert the error `{}` into `{}` (no From impl)", hs, wstr));
-            } else if let Some(fm) = from.and_then(|fd| self.trait_fn(fd, "from")) {
-                self.b.try_conv.insert(e, Some((fm, vec![w, h])));
-            }
-        }
-        self.pending_tries.extend(keep);
+        let full = self.infer_item_args(branch, &[t]);
+        let sig = self.tcx.fn_sig(self.prog, branch).unwrap().clone();
+        let (ps, flow) = self.instantiate_call_signature(branch, &full, &sig);
+        self.coerce_or_unify(t, ps[0], Some(x), lo);
+        self.register_method_obligation(branch, &full);
+        self.apply_fn_bounds(branch, &full, lo);
+        let flow = self.normalize_signature(flow);
+        let TyKind::Adt(def, flow_args, regions) = self.tcx.tys.kind(flow).clone() else { return self.tcx.tys.error; };
+        let adt = &self.tcx.adts[&def];
+        let continue_def = self.tcx.lang_items.get(LangItem::ControlFlowContinue);
+        let break_def = self.tcx.lang_items.get(LangItem::ControlFlowBreak);
+        let output = adt.variants.iter().find(|v| Some(v.def) == continue_def).unwrap().fields[0].ty;
+        let residual = adt.variants.iter().find(|v| Some(v.def) == break_def).unwrap().fields[0].ty;
+        let flow_full = self.tcx.complete_args(self.prog, def, &flow_args, regions);
+        let output = self.tcx.instantiate_ty(self.prog, def, &flow_full, output);
+        let residual = self.tcx.instantiate_ty(self.prog, def, &flow_full, residual);
+        let ret = *self.ret_stack.last().unwrap_or(&self.tcx.tys.error);
+        let full = self.infer_item_args(from_residual, &[ret, residual]);
+        self.register_method_obligation(from_residual, &full);
+        self.apply_fn_bounds(from_residual, &full, lo);
+        self.b.dependencies.push(branch);
+        self.b.dependencies.push(from_residual);
+        self.b.try_branch.insert(e.0, (branch, vec![t], flow));
+        self.b.try_from_residual.insert(e.0, (from_residual, vec![ret, residual]));
+        output
     }
 
     pub fn lang_item(&self, path: &[&str]) -> Option<DefId> {
@@ -6268,7 +4848,7 @@ impl<'a> Fcx<'a> {
     fn is_numeric(&self, t: TyId) -> bool {
         match self.tcx.tys.kind(t) {
             TyKind::Int(_) | TyKind::Float(_) | TyKind::Error => true,
-            TyKind::Infer(v) => matches!(self.vars[*v as usize], VarSt::Free(1) | VarSt::Free(2)),
+            TyKind::IntVar(_) | TyKind::FloatVar(_) => true,
             _ => false,
         }
     }
@@ -6279,7 +4859,7 @@ impl<'a> Fcx<'a> {
         let text = std::str::from_utf8(f.bytes(ex.lo, ex.hi)).unwrap_or("");
         match k {
             LitKind::Int | LitKind::Float => {
-                if let Some(suf) = crate::consteval::int_suffix(text) {
+                if let Some(suf) = crate::const_fold::int_suffix(text) {
                     for (n, p) in crate::program::PRIMS {
                         if n == suf {
                             return self.tcx.tys.prim(p);
@@ -6292,11 +4872,8 @@ impl<'a> Fcx<'a> {
                     let ok = match self.tcx.tys.kind(s) {
                         TyKind::Int(_) => !want_float,
                         TyKind::Float(_) => true,
-                        TyKind::Infer(v) => match self.vars[*v as usize] {
-                            VarSt::Free(1) => !want_float,
-                            VarSt::Free(2) => true,
-                            _ => false,
-                        },
+                        TyKind::IntVar(_) => !want_float,
+                        TyKind::FloatVar(_) => true,
                         _ => false,
                     };
                     if ok {
@@ -6311,7 +4888,7 @@ impl<'a> Fcx<'a> {
             LitKind::Str | LitKind::RawStr => self.tcx.tys.str_ref,
             LitKind::ByteStr => {
                 let n = crate::lit::unescape_bytes(text).len() as u64;
-                let arr = self.tcx.tys.intern(TyKind::Array(self.tcx.tys.u8_, n));
+                let arr = self.tcx.tys.intern(TyKind::Array(self.tcx.tys.u8_, self.tcx.tys.const_usize(n)));
                 self.tcx.tys.intern(TyKind::Ref(false, arr, crate::types::RegionId::ERASED))
             }
             // `c"..."`: &'static core::ffi::CStr (nul-terminated)
@@ -6361,7 +4938,12 @@ impl<'a> Fcx<'a> {
                 // borrow it in an instance -- two closure layouts for one closure
                 // unsized places compare through their impls too (`*l == *r` with l: &[T] is
                 // `<[T] as PartialEq>::eq(&*l, &*r)`, rustc op.rs: only scalars are built in)
-                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Assoc(..)) {
+                // a type-variable left operand is an operator trait call too: rustc op.rs:41 takes the
+                // builtin path only when neither operand is a type variable, and check_overloaded_binop
+                // records the method for `?T: PartialEq<?R>` while it is ambiguous. Typing it as a
+                // built-in comparison unified both sides and made the capture analysis of
+                // `|p| *p == path` (p: &?T) consume `path` (a false E0382 in Scope's code_graph).
+                if !prim_ref && matches!(self.tcx.tys.kind(sa), TyKind::Adt(..) | TyKind::Ref(..) | TyKind::Tuple(..) | TyKind::Array(..) | TyKind::Slice(_) | TyKind::Str | TyKind::Dyn(..) | TyKind::Param(_) | TyKind::Infer(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
                     if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, None) {
                         return r;
                     }
@@ -6373,9 +4955,9 @@ impl<'a> Fcx<'a> {
                 if prim_ref {
                     let (x, y) = (self.shallow(ta), self.shallow(tb));
                     if x != y && !matches!(self.tcx.tys.kind(y), TyKind::Infer(_)) {
-                        let save = self.snapshot();
-                        let same = self.unify(x, y);
-                        self.rollback(save);
+                        let save = self.start_snapshot();
+                        let same = self.eq(x, y);
+                        self.rollback_to(save);
                         if !same {
                             if let Some(r) = self.check_cmp_trait(e, op, sa, b, lo, Some(tb)) {
                                 return r;
@@ -6388,14 +4970,14 @@ impl<'a> Fcx<'a> {
                 // coerces to it (`fn_ptr == fn_item`, `raw == &x`, `*const T == *mut T`)
                 let ptr_lhs = matches!(self.tcx.tys.kind(sa), TyKind::Ptr(..) | TyKind::FnPtr(..));
                 if ptr_lhs {
-                    let save = self.snapshot();
-                    if self.unify(ta, tb) {
-                        // already equal
+                    let save = self.start_snapshot();
+                    if self.eq(ta, tb) {
+                        self.commit_from(save);
                     } else {
-                        self.rollback(save);
+                        self.rollback_to(save);
                         self.coerce_or_unify(tb, ta, Some(b), self.ast().expr(b).lo);
                     }
-                } else if !self.unify(ta, tb) {
+                } else if !self.eq(ta, tb) {
                     let (sa, sb) = (self.ty_str(ta), self.ty_str(tb));
                     self.err(lo, format!("cannot compare `{}` with `{}`", sa, sb));
                 }
@@ -6453,7 +5035,7 @@ impl<'a> Fcx<'a> {
                 let sa = self.shallow(ta);
                 let sb = self.shallow(tb);
                 // primitive arithmetic: both sides the same type
-                if !self.unify(sa, sb) {
+                if !self.eq(sa, sb) {
                     let (x, y) = (self.ty_str(sa), self.ty_str(sb));
                     self.err(lo, format!("no binary operator for `{}` and `{}`", x, y));
                 }
@@ -6465,14 +5047,20 @@ impl<'a> Fcx<'a> {
     /// The normalized <Iter as Iterator>::Item of the desugared next call.
     /// rustc_ast_lowering/src/expr.rs:1774-1784.
     fn iterator_item(&mut self, key: u32, t: TyId) -> Option<TyId> {
-        let next = self.tcx.lang_items.get(crate::lang_items::LangItem::IteratorNext)?;
-        let td = self.prog.def(next).parent;
-        let dt = self.deep(t);
-        match self.select_trait(td, dt, &[]) { SelectionResult::Ok(_) | SelectionResult::Ambiguous(_) => {}, SelectionResult::NoSolution => return None };
-        let ad = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Item")?)?;
-        let proj = self.tcx.tys.intern(TyKind::Assoc(ad, vec![dt], crate::types::RegionArgsId::EMPTY));
-        let item = self.norm(proj);
-        self.b.for_next.insert(key, (next, vec![dt]));
+        use crate::lang_items::LangItem;
+        let next = self.tcx.lang_items.get(LangItem::IteratorNext)?;
+        let full = self.infer_item_args(next, &[t]);
+        let sig = self.tcx.fn_sig(self.prog, next)?.clone();
+        let (_, option) = self.instantiate_call_signature(next, &full, &sig);
+        self.register_method_obligation(next, &full);
+        self.apply_fn_bounds(next, &full, self.last_lo);
+        let option = self.normalize_signature(option);
+        let TyKind::Adt(def, args, regions) = self.tcx.tys.kind(option).clone() else { return None; };
+        let some = self.tcx.lang_items.get(LangItem::OptionSome)?;
+        let variant = self.tcx.adts.get(&def)?.variants.iter().find(|v| v.def == some)?;
+        let item = self.tcx.instantiate_ty(self.prog, def, &self.tcx.complete_args(self.prog, def, &args, regions), variant.fields[0].ty);
+        self.b.dependencies.push(next);
+        self.b.for_next.insert(key, (next, vec![t]));
         Some(item)
     }
 
@@ -6489,8 +5077,9 @@ impl<'a> Fcx<'a> {
     fn check_field(&mut self, e: ExprId, x: ExprId, name: Ident, lo: u32) -> TyId {
         let t = self.check_expr(x, None);
         let s = self.sym(name);
-        let mut cur = self.shallow_with_regions(t);
-        let mut derefs = 0u8;
+        let resolved = self.deeply_resolve_ignoring_regions_with_obligations(t);
+        let mut cur = self.shallow(resolved);
+        let mut derefs = 0usize;
         loop {
             if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(cur).clone() {
                 if let Some(adt) = self.tcx.adts.get(&d).cloned() {
@@ -6551,57 +5140,70 @@ impl<'a> Fcx<'a> {
     }
 
     fn check_call(&mut self, e: ExprId, f: ExprId, args: &[ExprId], expected: Option<TyId>, lo: u32) -> TyId {
-        let ft = self.check_expr(f, None);
-        let mut fs = self.shallow_region_vars(ft);
-        // `vqshlq_n_u32(v, 6)` is `vqshlq_n_u32::<6>(v)` (rustc_ast_lowering
-        // lower_legacy_const_generics): those arguments become the fn's own const args
-        let legacy_kept: Vec<ExprId>;
-        let args: &[ExprId] = match self.tcx.tys.kind(fs).clone() {
-            TyKind::FnDef(d, gargs, _) => match self.tcx.fn_item_sig(self.prog, d).map(|s| (s.legacy_const.clone(), s.n_parent_generics)) {
-                Some((lc, np)) if !lc.is_empty() => {
-                    let env = self.env.clone();
-                    for (j, &i) in lc.iter().enumerate() {
-                        if let (Some(&a), Some(&g)) = (args.get(i as usize), gargs.get(np as usize + j)) {
-                            let c = self.tcx.const_arg(&self.cx, self.prog, self.file, self.module, &env, a);
-                            self.unify(g, c);
-                        }
+        let legacy = self.prog.legacy_const_call(self.b.def, self.file, e).cloned();
+        let ft = if let Some(split) = &legacy {
+            let ty = self.value_def_ty(split.callee, None, f.0);
+            self.b.res.insert(f.0, Res::Def(split.callee));
+            self.set_ty(f, ty);
+            ty
+        } else { self.check_expr(f, None) };
+        let mut fs = self.deeply_resolve_ignoring_regions_with_obligations(ft);
+        // rustc_ast_lowering/src/expr.rs:594-679: collection already resolved
+        // the callee and published the const/value argument split.
+        let args = if let Some(split) = &legacy {
+            if split.invalid {
+                self.err(lo, "invalid legacy const generic argument".into());
+                return self.tcx.tys.error;
+            }
+            if let TyKind::FnDef(d, gargs, _) = self.tcx.tys.kind(fs).clone() {
+                let declaration = self.tcx.declaration_env(self.prog, d);
+                let np = self.tcx.fn_item_sig(self.prog, d).map_or(0, |s| s.n_parent_generics) as usize;
+                let env = self.env.clone();
+                for (j, &a) in split.const_args.iter().enumerate() {
+                    if let Some(&g) = gargs.get(np + j) {
+                        let expected = declaration.consts.iter().find(|c| c.0 as usize == np + j)
+                            .map(|&(_, cf, ct)| self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), self.prog, cf, self.prog.def(d).scope, &declaration, ct))
+                            .unwrap_or(self.tcx.tys.error);
+                        let c = self.tcx.tys.intern(TyKind::Const(self.tcx.lower_const_arg(self.prog, self.file, &env, a, expected)));
+                        self.eq(g, c);
                     }
-                    legacy_kept = args.iter().enumerate().filter(|(i, _)| !lc.contains(&(*i as u32))).map(|(_, a)| *a).collect();
-                    self.b.legacy_args.insert(e.0, lc);
-                    &legacy_kept
                 }
-                _ => args,
-            },
-            _ => args,
-        };
-        // calls through references / smart pointers to callables (`&F`, `Box<dyn Fn()>`)
-        let mut steps = 0u8;
+            }
+            self.b.legacy_args.insert(e.0, split.positions.clone());
+            split.value_args.as_slice()
+        } else { args };
+        // rustc_hir_typeck/src/callee.rs:113-120,253-366: probe at each
+        // autoderef step, retaining the chosen trait in the generic body.
+        let mut steps = 0usize;
+        let mut overloaded = None;
         loop {
+            fs = self.deeply_resolve_ignoring_regions_with_obligations(fs);
             match self.tcx.tys.kind(fs) {
-                TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Closure(..) | TyKind::Dyn(..) | TyKind::Opaque(..) | TyKind::Error | TyKind::Infer(_) => break,
-                _ => {}
+                TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Closure(..) | TyKind::Error => break,
+                TyKind::Ref(..) if steps == 0 => {},
+                TyKind::Infer(var) if !self.infcx.has_opaques_with_sub_unified_hidden_type(*var) => {
+                    self.err(lo, "type must be known at this call".into());
+                    break;
+                }
+                _ => {
+                    overloaded = self.try_overloaded_call_traits(fs, Some(args.len()))
+                        .or_else(|| self.try_overloaded_call_traits(fs, None));
+                    if overloaded.is_some() { break; }
+                }
             }
             match self.deref_step(e.0, steps, fs) {
-                Some(n) => {
-                    fs = n;
-                    steps += 1;
-                }
+                Some(n) => { fs = n; steps += 1; }
                 None => break,
             }
         }
-        if steps > 0 {
-            self.b.call_derefs.insert(e.0, steps);
+        if steps > 0 { self.b.call_derefs.insert(e.0, steps); }
+        if let Some((td, tuple, _, _)) = &overloaded {
+            self.record_call_trait(e, *td, fs, steps, *tuple);
         }
-        // A direct function/constructor path is already concrete in the generic
-        // body. Only value calls need its definition-time Fn-family selection.
-        let direct = matches!(self.tcx.tys.kind(fs), TyKind::FnDef(..))
-            && matches!(self.b.res.get(&crate::lit::strip_paren(self.ast(), f).0), Some(Res::Def(_)));
-        if !direct { self.record_call_trait(e, fs, steps); }
         let error = self.tcx.tys.error;
-        let mut bounded: Option<(DefId, Vec<TyId>, Vec<TyId>)> = None;
         let mut variadic = false;
         let (params, ret) = match self.tcx.tys.kind(fs).clone() {
-            TyKind::FnDef(d, gargs, _) => match self.tcx.fn_item_sig(self.prog, d).cloned() {
+            TyKind::FnDef(d, gargs, regions) => match self.tcx.fn_item_sig(self.prog, d).cloned() {
                 Some(sig) if sig.params.iter().any(|p| self.tcx.tys.has_error(*p)) || self.tcx.tys.has_error(sig.ret) => {
                     let n = self.prog.def_path(d);
                     self.err(lo, format!("`{}` has unresolved types in its signature -- fix its signature errors first", n));
@@ -6611,10 +5213,8 @@ impl<'a> Fcx<'a> {
                     return error;
                 }
                 Some(sig) => {
-                    let (ps, r) = self.instantiate_call_signature(d, &gargs, &sig);
-                    if self.tcx.item_clauses(self.prog, d).is_some() || self.tcx.fn_trait_bounds(self.prog, d).is_some() {
-                        bounded = Some((d, gargs.clone(), sig.params.clone()));
-                    }
+                    let full = self.tcx.complete_args(self.prog, d, &gargs, regions);
+                    let (ps, r) = self.instantiate_call_signature(d, &full, &sig);
                     variadic = sig.header.c_variadic;
                     (ps, r)
                 }
@@ -6627,29 +5227,14 @@ impl<'a> Fcx<'a> {
                 let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() else { unreachable!() };
                 (ps, r)
             },
-            TyKind::Closure(_, _, sig, _, _) => {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => {
                 let TyKind::FnPtr(_, _, _, n) = self.tcx.tys.kind(sig) else { unreachable!() };
                 let vars: Vec<_> = (0..*n).map(|_| self.fresh_region()).collect();
                 let sig = self.instantiate_signature(sig, &vars);
                 let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() else { unreachable!() };
                 (ps, r)
             },
-            TyKind::Dyn(td, ..) if self.is_fn_trait(td) => {
-                match self.deduce_closure_signature(fs) {
-                    Some((sig, _)) => {
-                        let TyKind::FnPtr(_, _, _, n) = self.tcx.tys.kind(sig) else { unreachable!() };
-                        let vars: Vec<_> = (0..*n).map(|_| self.fresh_region()).collect();
-                        let sig = self.instantiate_signature(sig, &vars);
-                        let TyKind::FnPtr(ps, r, _, _) = self.tcx.tys.kind(sig).clone() else { unreachable!() };
-                        (ps, r)
-                    }
-                    None => (Vec::new(), error),
-                }
-            },
-            // `dyn Cb<T>` with `trait Cb<T>: FnOnce(&mut T)`: the Fn supertrait's signature
-            TyKind::Dyn(td, targs, _, _, _, _, _) if self.dyn_super_fn_sig(td, fs, &targs).is_some() => self.dyn_super_fn_sig(td, fs, &targs).unwrap(),
-            TyKind::Opaque(..) if self.opaque_fn_sig(fs).is_some() => self.opaque_fn_sig(fs).unwrap(),
-            TyKind::Param(_) if self.param_fn_sig(fs).is_some() => self.param_fn_sig(fs).unwrap(),
+            _ if overloaded.is_some() => { let (_, _, ps, ret) = overloaded.unwrap(); (ps, ret) },
             TyKind::Error => {
                 for a in args {
                     self.check_expr(*a, None);
@@ -6662,6 +5247,12 @@ impl<'a> Fcx<'a> {
                 return error;
             }
         };
+        // callee.rs:254,1214-1278: deferring also known kinds preserves the
+        // same signature equality and receiver adjustment after capture analysis.
+        if matches!(self.tcx.tys.kind(fs), TyKind::Closure(..)) {
+            let tuple = self.tcx.tys.intern(TyKind::Tuple(params.clone()));
+            self.deferred_call_resolutions.push(call::DeferredCallResolution { call_expr: e, closure_ty: fs, derefs: steps, tuple, output: ret });
+        }
         if params.len() != args.len() && !(variadic && args.len() >= params.len()) {
             let callee = match self.tcx.tys.kind(fs).clone() {
                 TyKind::FnDef(d, _, _) => Some(d),
@@ -6670,88 +5261,15 @@ impl<'a> Fcx<'a> {
             let help = self.arg_count_help(callee, &params, args, 0);
             self.err(lo, format!("E0061: this function takes {} argument{} but {} {} supplied{}", params.len(), if params.len() == 1 { "" } else { "s" }, args.len(), if args.len() == 1 { "was" } else { "were" }, help));
         }
-        // the expected result can guide generic args (e.g. `Some(x)` into Option<T>)
-        let mut exp_inputs: Option<Vec<Option<TyId>>> = None;
-        if let Some(x) = expected {
-            let rs = self.shallow(ret);
-            if matches!(self.tcx.tys.kind(rs), TyKind::Adt(..)) {
-                let xs = self.shallow(x);
-                if matches!(self.tcx.tys.kind(xs), TyKind::Adt(..)) {
-                    // rustc fn_ctxt/checks.rs expected_inputs_for_expected_output: unify the formal
-                    // output with the expectation; when that makes a parameter itself unsized
-                    // (`Box::new(x)` into `Box<dyn Fn() -> u32>`), undo it and use the expected
-                    // inputs as hints only (a closure takes its signature from the `dyn Fn`, the
-                    // argument then coerces); otherwise the unification stands (`Err(Box::new(s))`
-                    // into `Result<_, Box<dyn Any>>`, `Mutex::new(b)` into `Mutex<Box<dyn Fn()>>`)
-                    let mut exp_vars = Vec::new();
-                    let xd = self.deep(xs);
-                    self.free_vars(xd, &mut exp_vars);
-                    let mut callee_vars = Vec::new();
-                    for p in &params {
-                        let p0 = self.deep(*p);
-                        self.free_vars(p0, &mut callee_vars);
-                    }
-                    let save = self.snapshot();
-                    if self.unify(ret, x) {
-                        let ins: Vec<TyId> = params.iter().map(|p| self.resolve_region_vars(*p)).collect();
-                        let unsized_param = ins.iter().any(|t| self.is_unsized_ty(*t));
-                        // the probe is never committed (fudge_inference_if_ok): an input
-                        // whose variables are the expectation's own is a hint; one holding
-                        // the callee's fresh variables says nothing (a fresh variable)
-                        let mut hints = Vec::new();
-                        for t in &ins {
-                            let mut fv = Vec::new();
-                            self.free_vars(*t, &mut fv);
-                            hints.push(if fv.iter().all(|v| exp_vars.contains(v) && !callee_vars.contains(v)) { Some(*t) } else { None });
-                        }
-                        self.rollback(save);
-                        if unsized_param {
-                            if hints.iter().all(|h| h.is_some()) {
-                                exp_inputs = Some(hints);
-                            }
-                        } else {
-                            exp_inputs = Some(hints);
-                        }
-                    } else {
-                        self.rollback(save);
-                    }
-                }
-            } else if matches!(self.tcx.tys.kind(rs), TyKind::Ref(..)) {
-                // a reference result (`Cell::from_mut(&mut v)` into `&Cell<[T]>`): rustc's
-                // expectation probe (fudged, never committed) gives the expected inputs
-                // (`&mut [T]`), and the argument coerces to them (deref of the Vec)
-                let xs = self.shallow(x);
-                if matches!(self.tcx.tys.kind(xs), TyKind::Ref(..)) {
-                    let mut exp_vars = Vec::new();
-                    let xd = self.deep(xs);
-                    self.free_vars(xd, &mut exp_vars);
-                    let mut callee_vars = Vec::new();
-                    for p in &params {
-                        let p0 = self.deep(*p);
-                        self.free_vars(p0, &mut callee_vars);
-                    }
-                    let save = self.snapshot();
-                    if self.unify(ret, x) {
-                        let ins: Vec<TyId> = params.iter().map(|p| self.resolve_region_vars(*p)).collect();
-                        let mut fv = Vec::new();
-                        for t in &ins {
-                            self.free_vars(*t, &mut fv);
-                        }
-                        self.rollback(save);
-                        if fv.iter().all(|v| exp_vars.contains(v) && !callee_vars.contains(v)) {
-                            exp_inputs = Some(ins.into_iter().map(Some).collect());
-                        }
-                    } else {
-                        self.rollback(save);
-                    }
-                }
-            }
+        for (&ty, &arg) in params.iter().zip(args) {
+            self.register_wf(ty, self.ast().expr(arg).lo);
         }
+        let exp_inputs = expected.and_then(|x| self.expected_inputs_for_expected_output(ret, x, &params));
         // rustc check_argument_types: non-closures first, then select their obligations
         // before deriving closure signatures from the call's Fn bounds.
         for check_closures in [false, true] {
             if check_closures {
-                self.select_before_closures(bounded.as_ref().map(|(d, gargs, _)| (*d, gargs.as_slice())));
+                self.select_before_closures();
             }
             for (i, a) in args.iter().enumerate() {
                 if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) != check_closures {
@@ -6768,26 +5286,22 @@ impl<'a> Fcx<'a> {
                     // the formal type must equal it (checks.rs demand_compatible)
                     let unsized_hint = self.is_unsized_ty(ei);
                     let t = self.check_expr(*a, Some(ei));
+                    let ei = self.deeply_resolve_ignoring_regions_with_obligations(ei);
+                    let pt = self.deeply_resolve_ignoring_regions_with_obligations(pt);
                     if unsized_hint {
                         self.coerce_or_unify(t, pt, Some(*a), self.ast().expr(*a).lo);
                     } else {
                         self.coerce_or_unify(t, ei, Some(*a), self.ast().expr(*a).lo);
-                        self.unify(pt, ei);
+                        self.eq(pt, ei);
                     }
                     continue;
                 }
                 let t = self.check_expr(*a, Some(pt));
-                if let Some((d, gargs, _)) = &bounded {
-                    let (d, gargs) = (*d, gargs.clone());
-                    self.select_before_coerce(d, &gargs, pt);
-                }
+                let pt = self.deeply_resolve_ignoring_regions_with_obligations(pt);
                 self.coerce_or_unify(t, pt, Some(*a), self.ast().expr(*a).lo);
             }
         }
-        if let Some((d, gargs, _)) = &bounded {
-            self.apply_fn_bounds(*d, gargs, lo);
-        }
-        let _ = e;
+        let _ = (e, lo);
         self.normalize_signature(ret)
     }
 
@@ -6813,8 +5327,7 @@ impl<'a> Fcx<'a> {
             self.coerce_or_unify(bt, out, None, self.ast().block(b).hi);
         }
         self.async_depth -= 1;
-        let r = self.ret_stack.pop();
-        self.finish_tries(r);
+        self.ret_stack.pop();
         self.closure_depth.pop();
         self.scopes.truncate(saved);
         self.diverges = false;
@@ -6841,14 +5354,15 @@ impl<'a> Fcx<'a> {
     fn coroutine_type(&mut self, ce: u32, block: BlockId, force_args: Vec<u32>, is_move: bool, force_move_if_consumes: bool, out: TyId, points: u32) -> TyId {
         self.b.closures.push(ce);
         let up = self.fresh(0);
+        let kind = self.fresh(0);
         self.pending_captures.push(crate::upvar::PendingCapture {
-            closure: ce, upvars: up, source: crate::upvar::CaptureSource::Block(block),
+            closure: ce, upvars: up, kind, source: crate::upvar::CaptureSource::Block(block),
             is_move, force_args, force_move_if_consumes, points: Some(points),
         });
         self.tcx.coroutines.insert((self.file, ce), ());
         let sig = self.tcx.tys.intern(TyKind::FnPtr(Vec::new(), out, FnHeader::RUST, 0));
-        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), crate::types::RegionArgsId::EMPTY));
-        self.tcx.tys.intern(TyKind::Closure(self.file, ce, sig, up, owner))
+        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), self.env.regions.identity_args(&self.tcx.tys)));
+        self.tcx.tys.intern(TyKind::Closure(self.file, ce, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
     }
 
     /// `x.await`: `IntoFuture::into_future(x)` polled to completion; its type is
@@ -6864,14 +5378,14 @@ impl<'a> Fcx<'a> {
         // without selection (rustc: the coroutine's Future::Output, so `A[async { 1 }.await]`
         // keeps the literal open for the index)
         let st = self.shallow(t);
-        if let TyKind::Closure(f, ce, sig, _, _) = self.tcx.tys.kind(st).clone() {
+        if let TyKind::Closure(f, ce, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) = self.tcx.tys.kind(st).clone() {
             if self.tcx.coroutines.contains(&(f, ce)) {
                 if let TyKind::FnPtr(_, out, _, _) = self.tcx.tys.kind(sig).clone() {
                     return out;
                 }
             }
         }
-        let ft = self.deep(t);
+        let ft = self.infcx.deeply_resolve_ignoring_regions(t);
         let ad = match self.lang_item(&["future", "IntoFuture"]) {
             Some(td) => {
                 let sym = self.prog.syms.get("Output").unwrap_or(u32::MAX);
@@ -6886,18 +5400,14 @@ impl<'a> Fcx<'a> {
                 return self.tcx.tys.error;
             }
         };
-        let proj = self.tcx.tys.intern(TyKind::Assoc(ad, vec![ft], crate::types::RegionArgsId::EMPTY));
+        let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: vec![ft], regions: crate::types::RegionArgsId::EMPTY }));
         let n = self.norm(proj);
-        if matches!(self.tcx.tys.kind(n), TyKind::Assoc(..)) {
-            if self.tcx.tys.has_infer(n) {
-                let v = self.fresh(0);
-                self.defer_proj_eq(v, n);
-                return v;
-            }
-            let ts = self.ty_str(ft);
-            self.err(lo, format!("`{}` is not a future (E0277): `.await` needs IntoFuture", ts));
-            return self.tcx.tys.error;
-        }
+        // rustc_ast_lowering/src/expr.rs:1179-1197 lowers await through
+        // IntoFuture::into_future. Its output may remain a rigid projection in
+        // a generic body; the trait obligation, not alias shape, proves validity.
+        let td = self.prog.def(ad).parent;
+        let goal = self.trait_goal(td, ft, &[]);
+        self.register_goal(goal, lo);
         n
     }
 
@@ -6943,8 +5453,7 @@ impl<'a> Fcx<'a> {
         if !self.b.coerce.contains_key(&body.0) {
             self.set_ty(body, rt);
         }
-        let r = self.ret_stack.pop();
-        self.finish_tries(r);
+        self.ret_stack.pop();
         self.closure_depth.pop();
         self.async_depth = save_async;
         self.await_count = save_awaits;
@@ -6954,12 +5463,16 @@ impl<'a> Fcx<'a> {
         let sig = self.b.closure_sigs[&e.0].bound;
         let is_move = matches!(self.ast().expr(e).kind, ExprKind::Closure { is_move: true, .. });
         let up = self.fresh(0);
+        let kind = match self.expected_closure_kinds.get(&e.0).copied() {
+            Some(kind) => self.tcx.tys.from_closure_kind(kind),
+            None => self.fresh(0),
+        };
         self.pending_captures.push(crate::upvar::PendingCapture {
-            closure: e.0, upvars: up, source: crate::upvar::CaptureSource::Expr(body),
+            closure: e.0, upvars: up, kind, source: crate::upvar::CaptureSource::Expr(body),
             is_move, force_args: Vec::new(), force_move_if_consumes: false, points: None,
         });
-        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), crate::types::RegionArgsId::EMPTY));
-        self.tcx.tys.intern(TyKind::Closure(self.file, e.0, sig, up, owner))
+        let owner = self.tcx.tys.intern(TyKind::FnDef(self.b.def, self.b.args.clone(), self.env.regions.identity_args(&self.tcx.tys)));
+        self.tcx.tys.intern(TyKind::Closure(self.file, e.0, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
     }
 
     /// The deferred `Copy` checks of `[x; N]` (rustc fn_ctxt/checks.rs check_repeat_exprs,
@@ -6979,34 +5492,36 @@ impl<'a> Fcx<'a> {
             if matches!(self.b.res.get(&y.0), Some(Res::Def(d)) if matches!(self.prog.def(*d).kind, DefKind::Const | DefKind::AssocConst)) {
                 continue;
             }
-            let arr = self.deep(arr);
+            let arr = self.infcx.deeply_resolve_ignoring_regions(arr);
             let n = match self.tcx.tys.kind(arr).clone() {
                 TyKind::Array(_, n) => n,
                 _ => continue,
             };
-            let count = match crate::types::len_ty(n) {
-                None => Some(n),
-                Some(c) => {
-                    let c = self.shallow(c);
-                    match self.tcx.tys.kind(c).clone() {
-                        TyKind::ConstVal(m) => Some(m),
-                        TyKind::Infer(_) => {
-                            let lo = self.ast().expr(x).lo;
-                            let s = self.ty_str(arr);
-                            self.err(lo, format!("E0282: type annotations needed for `{}`", s));
-                            continue;
-                        }
-                        TyKind::Error => continue,
-                        _ => None,
-                    }
-                }
-            };
+            // fn_ctxt/checks.rs:111-125 + _impl.rs:1510-1597 structurally_resolve_const: the
+            // normalized count with obligations; still inferred -> E0282; erroneous -> skipped
+            let count = self.tcx.tys.intern(TyKind::Const(n));
+            let count = self.normalize_body_type(count);
+            let count = self.deeply_resolve_ignoring_regions_with_obligations(count);
+            let count = self.tcx.tys.expect_const(count);
+            if matches!(self.tcx.tys.const_kind(count), crate::consts::ConstKind::Infer(_)) {
+                if self.b.errors.is_empty() { self.err(self.ast().expr(x).lo, "E0282: type annotations needed".into()); }
+                continue;
+            }
+            if matches!(self.tcx.tys.const_kind(count), crate::consts::ConstKind::Error) || self.tcx.tys.has_error(self.tcx.tys.intern(TyKind::Const(count))) { continue; }
             todo.push((et, count));
         }
         let Some(td) = self.lang_item(&["marker", "Copy"]) else { return };
+        // checks.rs:164-185: a value count of 0 or 1 copies nothing; a parameter or an
+        // unevaluated (rigid) count may be > 1 after monomorphization
         for (et, count) in todo {
-            if !matches!(count, Some(0) | Some(1)) {
-                self.infer_from_bounds_inner(&[et], vec![(0, td, Vec::new())]);
+            let enforce = match self.tcx.tys.const_kind(count) {
+                crate::consts::ConstKind::Value(_) => count.try_to_target_usize(&self.tcx.tys).map_or(true, |c| c > 1),
+                crate::consts::ConstKind::Param(_) | crate::consts::ConstKind::Placeholder(_) | crate::consts::ConstKind::Alias(..) => true,
+                k => unreachable!("repeat count {:?}", k),
+            };
+            if enforce {
+                let goal = self.trait_goal(td, et, &[]);
+                self.register_goal(goal, self.last_lo);
             }
         }
     }
@@ -7023,332 +5538,62 @@ impl<'a> Fcx<'a> {
     fn check_method_sym(&mut self, e: ExprId, recv: ExprId, s: Sym, turbofish: GenericArgsId, args: &[ExprId], extra: Option<TyId>, lo: u32, method_expected: Option<TyId>) -> TyId {
         self.extra_arg = extra;
         let rt = self.check_expr(recv, None);
-        if let Some(r) = self.bound_method(e, rt, s, turbofish, args, lo) {
-            return r;
-        }
-        if let Some(r) = self.projection_method(e, rt, s, turbofish, args, lo) {
-            return r;
-        }
         let error = self.tcx.tys.error;
-        // a receiver with open variables inside a known constructor (`x: Box<_> = 6.into()`):
-        // pending obligations are selected first where they now can be (rustc probe.rs
-        // structurally resolves the receiver, select_obligations_where_possible)
-        {
-            let d0 = self.deep(rt);
-            if self.tcx.tys.has_infer(d0) && !matches!(self.tcx.tys.kind(d0), TyKind::Infer(_)) {
-                self.select_literal_obligations(false);
-                self.retry_goals(false);
-            }
-        }
-        // resolved through (array lengths and nested args bound since: `&mut [i32; ?n]`)
-        let dr = self.deep(rt);
-        // projections inside the receiver type normalized first (rustc probe.rs works on the
-        // structurally resolved, normalized self type): `&mut <usize as SliceIndex<[Vec<T>]>>::Output`
-        // is `&mut Vec<T>`, so `list.last()` is the slice's method, not `Iterator for &mut I`'s
-        let dr = if self.tcx.tys.has_assoc(dr) { self.tcx.normalize_for_inference(&self.cx, self.prog, dr) } else { dr };
-        let mut cur = self.shallow(dr);
-        let mut derefs = 0u8;
-        let mut found = None;
-        let mut trait_found: Option<(DefId, DefId, TyId)> = None;
-        // Probe T, &T, then &mut T at each autoderef step; inherent priority applies
-        // only within one adjusted receiver type (rustc pick_all_method / pick_method).
-        let mut receiver_kind = 1;
-        loop {
-            if trait_found.is_some() {
-                break;
-            }
-            // an integer / float literal at this step (`3.meow()`, or `r.cmp(..)` with
-            // r: &{integer}): the numeric types whose trait impls in scope have the method
-            // (rustc probes all integral types for an int var); one type fixes the literal,
-            // several sharing one trait method leave it to the fallback
-            if let Some(hits) = self.numeric_var_methods(cur, s) {
-                if hits.len() == 1 {
-                    self.unify(cur, hits[0].0);
-                    cur = self.shallow(cur);
-                } else if hits.len() > 1 && hits.iter().all(|h| h.1 == hits[0].1)
-                    && self.tcx.fn_sig(self.prog, hits[0].1).map_or(false, |sg| sg.self_kind == receiver_kind) {
-                    trait_found = Some((hits[0].1, crate::program::NO_DEF, cur));
-                    break;
-                } else if hits.is_empty() && receiver_kind == 2 {
-                    // the autoref step: a by-value method of an impl for `&{integer}`'s one
-                    // numeric type (`impl get for &isize`, `x.get()` with x: Box<{integer}>)
-                    if let TyKind::Infer(v) = self.tcx.tys.kind(cur).clone() {
-                        let prims: Vec<Prim> = match self.vars[v as usize] {
-                            VarSt::Free(1) => vec![Prim::I8, Prim::I16, Prim::I32, Prim::I64, Prim::I128, Prim::Isize, Prim::U8, Prim::U16, Prim::U32, Prim::U64, Prim::U128, Prim::Usize],
-                            VarSt::Free(2) => vec![Prim::F32, Prim::F64],
-                            _ => Vec::new(),
-                        };
-                        let mut rh = Vec::new();
-                        for pr in prims {
-                            let pt = self.tcx.tys.prim(pr);
-                            let rpt = self.tcx.tys.intern(TyKind::Ref(false, pt, crate::types::RegionId::ERASED));
-                            let tm: Vec<(DefId, DefId)> = self.scoped_trait_methods(rpt, s).into_iter().filter(|(it, _)| self.tcx.fn_sig(self.prog, *it).map_or(false, |sg| sg.self_kind == 1)).collect();
-                            if let Some(&(item, imp)) = tm.first() {
-                                rh.push((pt, rpt, item, imp));
-                            }
-                        }
-                        if rh.len() == 1 {
-                            self.unify(cur, rh[0].0);
-                            self.forced_autoref = Some(1);
-                            trait_found = Some((rh[0].2, rh[0].3, rh[0].1));
-                            break;
-                        }
-                    }
-                }
-            }
-            let adjusted = match receiver_kind {
-                2 | 3 => self.tcx.tys.intern(TyKind::Ref(receiver_kind == 3, cur, crate::types::RegionId::ERASED)),
-                _ => cur,
-            };
-            // Inherent candidates for this adjusted receiver, including typed receivers
-            // declared on a smart pointer's pointee, precede extension candidates.
-            let mut px = Some(cur);
-            let mut depth = 0;
-            while let Some(x) = px {
-                if let Some((item, imp)) = self.tcx.inherent_item(&self.cx, self.prog, x, s) {
-                    // Associated functions and inaccessible methods are not candidates.
-                    if self.prog.def(item).kind == DefKind::AssocFn && self.item_visible(item)
-                        && self.method_receiver_matches(item, imp, x, adjusted, false) {
-                        found = Some((item, imp, x));
-                        break;
-                    }
-                }
-                depth += 1;
-                px = if depth <= 4 { self.receiver_pointee(x) } else { None };
-            }
-            if found.is_some() {
-                break;
-            }
-            // methods whose receiver type is this step's adjusted type (rustc method/probe.rs
-            // matches the receiver type at each autoderef step): `self: Box<Self>` /
-            // `self: Pin<&mut Self>` methods of the pointee (`b.into_string()` on Box<str>,
-            // `fut.poll(cx)` on Pin<&mut T> is T's poll, not Pin's own Future impl)
-            // (Self may sit several pointers deep: `self: &Box<Rc<Self>>`)
-            let mut px = self.receiver_pointee(cur);
-            let mut depth = 0;
-            while let Some(x) = px {
-                let tm = self.scoped_trait_methods(x, s);
-                if let Some(&(item, imp)) = tm.iter().find(|(item, imp)| self.method_receiver_matches(*item, *imp, x, adjusted, true)) {
-                    trait_found = Some((item, imp, x));
-                    break;
-                }
-                // an integer / float variable pointee (`Box<{integer}>` with `self: Box<Self>`
-                // in `impl Tr for usize`): the numeric types whose impl's receiver matches;
-                // exactly one fixes the variable
-                if let Some(hits) = self.numeric_var_methods(x, s) {
-                    let mut ok = Vec::new();
-                    for h in hits {
-                        if self.method_receiver_matches(h.1, h.2, h.0, adjusted, true) {
-                            ok.push(h);
-                        }
-                    }
-                    if ok.len() == 1 {
-                        self.unify(x, ok[0].0);
-                        trait_found = Some((ok[0].1, ok[0].2, ok[0].0));
-                        break;
-                    }
-                }
-                // a trait object pointee's methods (`Pin<&mut dyn Future>`.poll(cx) is the
-                // virtual poll, not Pin's own Future impl; rustc's probe matches the receiver
-                // type `Pin<&mut Self>` with Self = dyn Future at this step); only the step's
-                // own pointee: a deeper one (`Box<Box<dyn Tr>>` with `self: Box<Self>`) is
-                // reached by autoderef, which passes the inner box
-                if let (0, TyKind::Dyn(td, ..)) = (depth, self.tcx.tys.kind(x).clone()) {
-                    if let Some(item) = self.dyn_method(td, s) {
-                        if self.method_receiver_matches(item, crate::program::NO_DEF, x, adjusted, true) {
-                            trait_found = Some((item, crate::program::NO_DEF, x));
-                            break;
-                        }
-                    }
-                }
-                // an opaque pointee's bound methods (`Pin<&mut impl Future>`.poll(cx) is the
-                // future's poll, not Pin's own Future impl)
-                if let Some((item, ta)) = self.opaque_method(x, s) {
-                    if self.method_receiver_matches(item, crate::program::NO_DEF, x, adjusted, true) {
-                        if !ta.is_empty() {
-                            self.known_targs = Some(ta);
-                        }
-                        trait_found = Some((item, crate::program::NO_DEF, x));
-                        break;
-                    }
-                }
-                // a param / rigid projection pointee of a generic body: its bounds' methods
-                // (`w.wake()` on Arc<W> with `W: Wake`, `fn wake(self: Arc<Self>)`)
-                if matches!(self.tcx.tys.kind(x), TyKind::Param(_) | TyKind::Assoc(..)) {
-                    if let Some((item, _)) = self.trait_item_for(x, s) {
-                        if self.prog.def(item).kind == DefKind::AssocFn && self.method_receiver_matches(item, crate::program::NO_DEF, x, adjusted, true) {
-                            trait_found = Some((item, crate::program::NO_DEF, x));
-                            break;
-                        }
-                    }
-                }
-                depth += 1;
-                px = if depth < 4 { self.receiver_pointee(x) } else { None };
-            }
-            if trait_found.is_some() {
-                break;
-            }
-            if let TyKind::Dyn(td, ..) = self.tcx.tys.kind(cur).clone() {
-                if let Some(item) = self.dyn_method(td, s) {
-                    if self.method_receiver_matches(item, crate::program::NO_DEF, cur, adjusted, true) {
-                        // virtual call: no impl (NO_DEF), dispatched through the vtable
-                        trait_found = Some((item, crate::program::NO_DEF, cur));
-                        break;
-                    }
-                }
-            }
-            // an opaque type's methods are its bounds' (rustc probe.rs assemble_inherent_candidates
-            // for an alias: the item bounds act like a param's where-clauses); codegen resolves
-            // the call on the hidden type
-            if let Some((item, ta)) = self.opaque_method(cur, s) {
-                if self.method_receiver_matches(item, crate::program::NO_DEF, cur, adjusted, true) {
-                    if !ta.is_empty() {
-                        self.known_targs = Some(ta);
-                    }
-                    trait_found = Some((item, crate::program::NO_DEF, cur));
-                    break;
-                }
-            }
-            // by-value receiver first (rustc's probe order): on `&V`, a `&self` method of V
-            // matches before an autoref'd method of `&V` itself (`self.debug_fmt(f)` with
-            // self: &dyn Tr is Tr's method, not a blanket impl's for `&dyn Tr`)
-            // (only at the step itself: after taking it, the method is `inner`'s -- `(&&X).refm()`
-            // is `<&X as RefM>::refm`, not X's one more step down)
-            if receiver_kind == 1 {
-                if let TyKind::Ref(m, inner, _) = self.tcx.tys.kind(cur).clone() {
-                    let inner = self.shallow(inner);
-                    if self.has_ref_self_method(inner, s, m) {
-                        cur = inner;
-                        derefs += 1;
-                        receiver_kind = if m { 3 } else { 2 };
-                        continue;
-                    }
-                }
-            }
-            let mut tm = self.scoped_trait_methods(cur, s);
-            // `array.into_iter()` before edition 2021 (`Box<[T]>` before 2024): IntoIterator's
-            // by-value impl is skipped during method dispatch, so autoref picks the slice
-            // iterator (rustc #[rustc_skip_during_method_dispatch(array, boxed_slice)])
-            if self.prog.syms.str(s) == "into_iter" {
-                let ed = self.prog.crates[self.prog.mods[self.module as usize].krate as usize].edition;
-                let skip = match self.tcx.tys.kind(cur).clone() {
-                    TyKind::Array(..) => ed < 2021,
-                    TyKind::Adt(d, a, _) => ed < 2024 && self.lang_item(&["boxed", "Box"]) == Some(d) && a.first().map_or(false, |x| matches!(self.tcx.tys.kind(self.shallow(*x)), TyKind::Slice(_))),
-                    _ => false,
-                };
-                if skip {
-                    if let Some(ii) = self.lang_item(&["iter", "IntoIterator"]) {
-                        tm.retain(|(it, _)| self.prog.def(*it).parent != ii);
-                    }
-                }
-            }
-            // where-clauses on this step's type itself (`for<'x> &'x V: IntoIterator` makes
-            // `value.into_iter()` on `&V` that trait's method: rustc's param-env candidate)
-            if !matches!(self.tcx.tys.kind(cur), TyKind::Param(_) | TyKind::Infer(_) | TyKind::Error) {
-                for (td, _) in self.tcx.param_env_of(&self.cx, cur) {
-                    for &it in &self.prog.traits[self.prog.def(td).sub as usize] {
-                        if self.prog.def(it).name == s && self.prog.def(it).kind == DefKind::AssocFn && !tm.iter().any(|x| x.0 == it) {
-                            tm.insert(0, (it, crate::program::NO_DEF));
-                        }
-                    }
-                }
-            }
-            // an associated fn without `self` is no method candidate (`lease.from(b)` on an
-            // Arc<Lease> is Lease's inherent `from(&self, ..)` one step down, not From::from)
-            tm.retain(|(it, imp)| self.method_receiver_matches(*it, *imp, cur, adjusted, true));
-            if let Some(&(item, imp)) = tm.first() {
-                // several impls of the trait for this type (String: Extend<char>, Extend<&str>..):
-                // the trait's method with its args open; the impl follows from them (rustc probes the
-                // trait candidate, not an impl: method/probe.rs assemble_extension_candidates)
-                let ambiguous = tm.iter().filter(|c| c.0 == item).count() > 1;
-                let imp = if ambiguous { crate::program::NO_DEF } else { imp };
-                trait_found = Some((item, imp, cur));
-                break;
-            }
-            // autoref step (rustc probe.rs pick_autorefd_method): a by-value `self` method of
-            // an impl for `&U` called on U (`(&&A).m()` is `<&&&A as M>::m(&(&&A))`)
-            if receiver_kind != 1 && !matches!(self.tcx.tys.kind(cur), TyKind::Infer(_) | TyKind::Error | TyKind::Param(_)) {
-                let rt = adjusted;
-                let tm = self.scoped_trait_methods(rt, s);
-                let byval: Vec<(DefId, DefId)> = tm.into_iter().filter(|(it, imp)| self.method_receiver_matches(*it, *imp, rt, adjusted, true)).collect();
-                if let Some(&(item, imp)) = byval.first() {
-                    let ambiguous = byval.iter().filter(|c| c.0 == item).count() > 1;
-                    let imp = if ambiguous { crate::program::NO_DEF } else { imp };
-                    self.forced_autoref = Some(receiver_kind - 1);
-                    trait_found = Some((item, imp, rt));
-                    break;
-                }
-            }
-            if receiver_kind < 3 {
-                receiver_kind += 1;
-                continue;
-            }
-            receiver_kind = 1;
-            match self.tcx.tys.kind(cur).clone() {
-                TyKind::Ref(_, i, _) => {
-                    cur = self.shallow(i);
-                    derefs += 1;
-                }
-                // method lookup never autoderefs raw pointers (`p.add(1)` is the pointer's)
-                TyKind::Ptr(..) => break,
-                TyKind::Array(el, _) => {
-                    // arrays get slice methods by unsizing
-                    cur = self.tcx.tys.intern(TyKind::Slice(el));
-                }
-                _ => match self.deref_step(e.0, derefs, cur) {
-                    Some(i) => {
-                        cur = i;
-                        derefs += 1;
-                    }
-                    None => break,
-                },
-            }
-        }
-        if let (None, Some((item, imp, self_ty))) = (found, trait_found) {
-            return self.check_trait_method_call(e, item, imp, self_ty, derefs, turbofish, args, lo, method_expected);
-        }
-        let (item, imp, self_ty) = match found {
-            Some(x) => x,
-            None => {
+        self.retry_goals(false);
+        let pick = match self.pick_all_method(e, rt, s, lo) {
+            Ok(Some(pick)) => pick,
+            Ok(None) => {
                 let ts = self.ty_str(rt);
                 let help = self.method_help(rt, s);
                 self.err(lo, format!("E0599: no method named `{}` found for `{}` in the current scope{}", self.prog.syms.str(s), ts, help));
-                for a in args {
-                    self.check_expr(*a, None);
-                }
+                for a in args { self.check_expr(*a, None); }
                 return error;
             }
+            Err(()) => { for a in args { self.check_expr(*a, None); } return error; }
         };
+        let (item, imp, self_ty, derefs) = (pick.item, pick.imp, pick.self_ty, pick.autoderefs);
+        self.forced_autoref = Some(pick.autoref);
+        if imp == NO_DEF {
+            self.known_method_args = Some(pick.args);
+            return self.check_trait_method_call(e, item, imp, self_ty, derefs, turbofish, args, lo, method_expected);
+        }
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
-        let mut gargs = self.match_impl_args(imp, self_ty);
+        let indices = self.tcx.generic_indices_of(self.prog, imp);
+        let impl_full = pick.args[..indices.types_consts.len() + indices.lifetimes.len()].to_vec();
+        let mut gargs = Vec::new();
+        for arg in &impl_full { match *arg { crate::consts::GenericArg::Type(t) => gargs.push(t), crate::consts::GenericArg::Const(c) => gargs.push(self.tcx.tys.intern(TyKind::Const(c))), _ => {} } }
         let own = sig.n_generics - sig.n_parent_generics;
         let mut tf = Vec::new();
         if let Some(GenericArgs::Angle(v)) = self.ast().gargs(turbofish) {
             for g in self.ast().list(*v) {
-                if let Some(lt) = self.generic_arg(g) {
+                if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
                     tf.push(lt);
                 }
             }
         }
+        let item_indices = self.tcx.generic_indices_of(self.prog, item);
         for i in 0..own as usize {
-            if i < tf.len() {
-                gargs.push(tf[i]);
-            } else {
-                gargs.push(self.fresh(0));
-            }
+            let arg = pick.args[item_indices.types_consts[gargs.len()] as usize];
+            let ty = match arg { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() };
+            if let Some(&explicit) = tf.get(i) { self.eq(ty, explicit); }
+            gargs.push(ty);
         }
-        let autoref = match sig.self_kind {
-            2 => 1,
-            3 => 2,
-            _ => 0,
-        };
+        let autoref = self.forced_autoref.take().unwrap_or(match sig.self_kind { 2 => 1, 3 => 2, _ => 0 });
         self.b.dependencies.push(item);
         self.b.methods.insert(e.0, MethodRes { def: item, derefs, autoref, args: gargs.clone() });
         if sig.self_kind == 0 {
             self.err(lo, format!("`{}` is an associated function, not a method", self.prog.syms.str(s)));
             return error;
         }
-        let (ps, ret) = self.instantiate_call_signature(item, &gargs, &sig);
+        // method/confirm.rs:357-372 (fresh_receiver_args): the impl's args are the
+        // ones its self type was related with, lifetimes included; the method's own
+        // lifetimes are fresh.
+        let mut full = self.infer_item_args(item, &gargs);
+        full[..impl_full.len()].copy_from_slice(&impl_full);
+        let (ps, ret) = self.instantiate_call_signature(item, &full, &sig);
+        // method/confirm.rs:150-160 (add_obligations): registered once with the
+        // instantiated args, before the arguments are checked.
+        self.apply_fn_bounds(item, &full, lo);
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
         if ps.len() != args.len() + 1 + n_extra {
@@ -7369,8 +5614,7 @@ impl<'a> Fcx<'a> {
         // output may be the method's own parameter (`U` of map_or) when the expectation is a
         // known type.
         let exp_inputs = self.method_expected_inputs(ret, &ps, method_expected);
-        self.check_method_args(item, &gargs, &ps, args, exp_inputs);
-        self.apply_fn_bounds(item, &gargs, lo);
+        self.check_method_args(item, &ps, args, exp_inputs);
         // projections in the result normalize now that the call fixed the args (rustc
         // normalizes a method's output: `opt.as_deref()` is Option<&str>, not
         // Option<&<String as Deref>::Target>, so a pattern binding gets `&str`)
@@ -7396,7 +5640,7 @@ impl<'a> Fcx<'a> {
         // may still fix them)
         let save_keep = self.keep_literal_vars;
         self.keep_literal_vars = true;
-        let da = self.deep(ta);
+        let da = self.infcx.deeply_resolve_ignoring_regions(ta);
         // the right operand's expected type: the single impl's Rhs, else Self
         // (rustc checks the right operand against a fresh variable: the left type is only a
         // hint here, and none when it names a generic param -- `x == &Unicode(y.as_ref())`
@@ -7411,52 +5655,28 @@ impl<'a> Fcx<'a> {
             None
         } else {
             let rhs = self.fresh(0);
-            let mark = self.snapshot();
+            let mark = self.start_snapshot();
             let hint = match self.select_trait(td, da, &[rhs]) {
-                SelectionResult::Ok(_) => {
-                    let h = self.deep(rhs);
+                Ok(Some(_)) => {
+                    let h = self.infcx.deeply_resolve_ignoring_regions(rhs);
                     if self.tcx.tys.has_infer(h) { None } else { Some(h) }
                 }
-                SelectionResult::Ambiguous(_) => None,
-                SelectionResult::NoSolution => Some(ta),
+                Ok(None) => None,
+                Err(_) => Some(ta),
             };
-            self.rollback(mark);
+            self.rollback_to(mark);
             hint
         };
         let tb = match checked_b {
             Some(t) => t,
             None => self.check_expr(b, hint),
         };
-        let db = self.deep(tb);
+        let db = self.infcx.deeply_resolve_ignoring_regions(tb);
         self.keep_literal_vars = save_keep;
         let selection = self.select_trait(td, da, &[db]);
-        let rhs = if let SelectionResult::Ok(selected) = selection {
-                    let (imp, _) = (selected.method_owner(), selected.args);
-            // selecting the impl equates its trait ref with the obligation's and registers its
-            // where-clauses (rustc confirm_impl_candidate): `Option<u64> == Some(10)` makes the
-            // literal u64, `Vec<u16> == [5, 6]` needs `u16: PartialEq<?U>`, fixing U
-            if imp == crate::tcx::DERIVED_IMPL {
-                self.unify(db, da);
-            } else if imp != crate::program::NO_DEF && self.tcx.tys.has_infer(db) {
-                if trace_bounds() {
-                    let (x, y) = (self.ty_str(da), self.ty_str(db));
-                    eprintln!("bounds: cmp {} vs {} impl {}", x, y, self.prog.def_path(imp));
-                }
-                let save = self.snapshot();
-                match self.unify_impl_trait_ref(imp, td, da, &[db]) {
-                    Some(iargs) => {
-                        if self.tcx.impl_trait_bounds.contains_key(&imp) {
-                            self.apply_impl_predicates(imp, &iargs);
-                            self.infer_from_bounds(imp, &iargs);
-                        }
-                    }
-                    None => self.rollback(save),
-                }
-            }
+        let rhs = if selection.is_ok() {
             db
-        } else if matches!(selection, SelectionResult::Ambiguous(_)) {
-            db
-        } else if !matches!(self.select_trait(td, da, &[da]), SelectionResult::NoSolution) {
+        } else if !matches!(self.select_trait(td, da, &[da]), Err(_)) {
             self.coerce_or_unify(tb, ta, Some(b), lo);
             da
         } else {
@@ -7469,22 +5689,17 @@ impl<'a> Fcx<'a> {
     }
 
     /// `a op b` (or `a op= b` with `assign`) through core::ops::<Op>[Assign]
-    /// `!x` / `-x` on a type with a `Not` / `Neg` impl (not a primitive): the trait call,
+    /// `!x` / `-x` on a type with a `Not` / `Neg` impl: the trait call,
     /// recorded like a binary operator (`binops`, one argument).
     fn check_unop_trait(&mut self, e: ExprId, t: TyId, tr: &str, m: &str) -> Option<TyId> {
-        // (a param / rigid projection with a `Neg` / `Not` bound in a generic body too)
-        match self.tcx.tys.kind(t) {
-            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Assoc(..) => {}
-            _ => return None,
-        }
         let td = self.lang_item(&["ops", tr])?;
-        match self.select_trait(td, t, &[]) { SelectionResult::Ok(_) | SelectionResult::Ambiguous(_) => {}, SelectionResult::NoSolution => return None };
+        match self.select_trait(td, t, &[]) { Ok(Some(_)) | Ok(None) => {}, Err(_) => return None };
         let ms = self.prog.syms.get(m)?;
         let item = self.prog.traits[self.prog.def(td).sub as usize].iter().copied().find(|&it| self.prog.def(it).name == ms)?;
         let args = vec![t];
         self.b.binops.insert(e.0, MethodRes { def: item, derefs: 0, autoref: 0, args: args.clone() });
         let sig = self.tcx.fn_sig(self.prog, item).cloned()?;
-        let r = self.tcx.tys.subst_for_inference(sig.ret, &args);
+        let r = self.tcx.tys.subst(sig.ret, &args);
         Some(self.norm(r))
     }
 
@@ -7513,16 +5728,15 @@ impl<'a> Fcx<'a> {
                 return error;
             }
         };
-        let rhs = self.fresh(0);
-        let mark = self.snapshot();
-        let exp_b = match self.select_trait(td, ta, &[rhs]) {
-            SelectionResult::Ok(_) => {
-                let hint = self.deep(rhs);
-                if self.tcx.tys.has_infer(hint) { None } else { Some(hint) }
-            }
-            SelectionResult::Ambiguous(_) | SelectionResult::NoSolution => None,
-        };
-        self.rollback(mark);
+        let rhs = self.infcx.next_ty_var();
+        let goal = self.trait_goal(td, ta, &[rhs]);
+        let exp_b = self.infcx.fudge_inference_if_ok(|| {
+            let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&self.infcx, self.prog);
+            ocx.register_obligation(goal);
+            ocx.evaluate_obligations_error_on_ambiguity()?;
+            let hint = self.infcx.deeply_resolve_ignoring_regions(rhs);
+            if self.tcx.tys.has_infer(hint) { Err(crate::next_solver::NoSolution) } else { Ok(hint) }
+        }).ok();
         let mut tb = self.check_expr(b, exp_b);
         if let Some(x) = exp_b {
             // the right operand is a coercion site for the impl's Rhs (`s + &string`: &String
@@ -7538,7 +5752,7 @@ impl<'a> Fcx<'a> {
     fn op_trait_call(&mut self, td: DefId, m: &str, me: u32, ta: TyId, tb: TyId, lo: u32) -> TyId {
         let error = self.tcx.tys.error;
         let tr = self.prog.name(td).to_string();
-        let tb = self.deep(tb);
+        let tb = self.infcx.deeply_resolve_ignoring_regions(tb);
         let ms = self.prog.syms.get(m).unwrap_or(u32::MAX);
         let mut item = None;
         for &it in &self.prog.traits[self.prog.def(td).sub as usize] {
@@ -7550,8 +5764,8 @@ impl<'a> Fcx<'a> {
             Some(i) => i,
             None => return error,
         };
-        let ta = self.deep(ta);
-        if matches!(self.select_trait(td, ta, &[tb]), SelectionResult::NoSolution) {
+        let ta = self.infcx.deeply_resolve_ignoring_regions(ta);
+        if matches!(self.select_trait(td, ta, &[tb]), Err(_)) {
             let (x, y) = (self.ty_str(ta), self.ty_str(tb));
             self.err(lo, format!("no `{}` impl for `{}` and `{}`", tr, x, y));
             return error;
@@ -7559,7 +5773,7 @@ impl<'a> Fcx<'a> {
         let args = vec![ta, tb];
         self.b.binops.insert(me, MethodRes { def: item, derefs: 0, autoref: 0, args: args.clone() });
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
-        let r = self.tcx.tys.subst_for_inference(sig.ret, &args);
+        let r = self.tcx.tys.subst(sig.ret, &args);
         self.norm(r)
     }
 
@@ -7578,51 +5792,31 @@ impl<'a> Fcx<'a> {
             _ => return None,
         };
         let td = self.lang_item(&["ops", tr])?;
-        let db = self.deep(sb);
+        let db = self.infcx.deeply_resolve_ignoring_regions(sb);
         if !self.is_numeric(sa) && !matches!(self.tcx.tys.kind(sa), TyKind::Infer(_)) { return None; }
-        if matches!(self.select_trait(td, sa, &[db]), SelectionResult::NoSolution) { return None; }
+        if matches!(self.select_trait(td, sa, &[db]), Err(_)) { return None; }
         Some(self.op_trait_call(td, m, e.0, sa, db, lo))
     }
 
     #[allow(clippy::too_many_arguments)]
     /// rustc expected_inputs_for_expected_output for a method call: per input, the type the
     /// expected result gives it (None: no hint). See check_method_sym.
-    fn method_expected_inputs(&mut self, ret: TyId, ps: &[TyId], method_expected: Option<TyId>) -> Option<Vec<Option<TyId>>> {
-        let mut exp_inputs: Option<Vec<Option<TyId>>> = None;
-        if let Some(x) = method_expected {
-            let (rs, xs) = (self.shallow(ret), self.shallow(x));
-            let rs_open = matches!(self.tcx.tys.kind(rs), TyKind::Infer(_)) && !self.is_literal_var(rs);
-            let xs_known = !matches!(self.tcx.tys.kind(xs), TyKind::Infer(_) | TyKind::Error);
-            if (matches!(self.tcx.tys.kind(rs), TyKind::Adt(..)) && matches!(self.tcx.tys.kind(xs), TyKind::Adt(..))) || (rs_open && xs_known) {
-                let mut exp_vars = Vec::new();
-                let xd = self.deep(xs);
-                self.free_vars(xd, &mut exp_vars);
-                let save = self.snapshot();
-                if self.unify(ret, x) {
-                    let ins: Vec<TyId> = ps.iter().skip(1).map(|p| self.resolve_region_vars(*p)).collect();
-                    let mut v = Vec::with_capacity(ins.len());
-                    for t in &ins {
-                        let mut fv = Vec::new();
-                        self.free_vars(*t, &mut fv);
-                        v.push(if fv.iter().all(|x| exp_vars.contains(x)) && !self.is_unsized_ty(*t) { Some(*t) } else { None });
-                    }
-                    exp_inputs = Some(v);
-                }
-                self.rollback(save);
-            }
-        }
-        exp_inputs
+    fn method_expected_inputs(&mut self, ret: TyId, ps: &[TyId], expected: Option<TyId>) -> Option<Vec<Option<TyId>>> {
+        expected.and_then(|x| self.expected_inputs_for_expected_output(ret, x, &ps[1..]))
     }
 
     /// The arguments of a method call (receiver excluded), checked against their expected
     /// inputs when the expected result gave them, else against the formal types.
-    fn check_method_args(&mut self, item: DefId, gargs: &[TyId], ps: &[TyId], args: &[ExprId], exp_inputs: Option<Vec<Option<TyId>>>) {
+    fn check_method_args(&mut self, _item: DefId, ps: &[TyId], args: &[ExprId], exp_inputs: Option<Vec<Option<TyId>>>) {
+        for (&ty, &arg) in ps[1..].iter().zip(args) {
+            self.register_wf(ty, self.ast().expr(arg).lo);
+        }
         let error = self.tcx.tys.error;
         // rustc check_argument_types: non-closures first, then select their obligations
         // before deriving closure signatures from the call's Fn bounds.
         for check_closures in [false, true] {
             if check_closures {
-                self.select_before_closures(Some((item, gargs)));
+                self.select_before_closures();
             }
             for (i, a) in args.iter().enumerate() {
                 if matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) != check_closures {
@@ -7633,43 +5827,47 @@ impl<'a> Fcx<'a> {
                     // a closure takes its signature from the registered bound unless the
                     // expected input is a fn pointer: then from that, and it coerces to it
                     // (`.filter(|(_, c)| ..)` into `Filter<_, fn(&(usize, &str)) -> bool>`)
+                    let ei = self.deeply_resolve_ignoring_regions_with_obligations(ei);
                     let to_fn_ptr = matches!(self.tcx.tys.kind(self.shallow(ei)), TyKind::FnPtr(..));
                     if to_fn_ptr || !matches!(self.ast().expr(*a).kind, ExprKind::Closure { .. }) {
                         let t = self.check_expr(*a, Some(ei));
-                        let snap = self.snapshot();
-                        if self.try_coerce(t, ei, Some(*a)) && self.unify(pt, ei) {
+                        let ei = self.deeply_resolve_ignoring_regions_with_obligations(ei);
+                        let pt = self.deeply_resolve_ignoring_regions_with_obligations(pt);
+                        let snap = self.start_snapshot();
+                        if self.try_coerce(t, ei, Some(*a)) && self.eq(pt, ei) {
+                            self.commit_from(snap);
                             continue;
                         }
-                        self.rollback(snap);
+                        self.rollback_to(snap);
                         self.coerce_or_unify(t, pt, Some(*a), self.ast().expr(*a).lo);
                         continue;
                     }
                 }
                 let xt = self.normalize_signature(pt);
                 let t = self.check_expr(*a, Some(xt));
-                self.select_before_coerce(item, gargs, pt);
+                let pt = self.deeply_resolve_ignoring_regions_with_obligations(pt);
                 self.coerce_or_unify(t, pt, Some(*a), self.ast().expr(*a).lo);
             }
         }
     }
 
-    fn check_trait_method_call(&mut self, e: ExprId, item: DefId, imp: DefId, self_ty: TyId, derefs: u8, turbofish: GenericArgsId, args: &[ExprId], lo: u32, method_expected: Option<TyId>) -> TyId {
+    fn check_trait_method_call(&mut self, e: ExprId, item: DefId, imp: DefId, self_ty: TyId, derefs: usize, turbofish: GenericArgsId, args: &[ExprId], lo: u32, method_expected: Option<TyId>) -> TyId {
         let error = self.tcx.tys.error;
         let mut tf = Vec::new();
         if let Some(GenericArgs::Angle(v)) = self.ast().gargs(turbofish) {
             for g in self.ast().list(*v) {
-                if let Some(lt) = self.generic_arg(g) {
+                if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
                     tf.push(lt);
                 }
             }
         }
         let gargs = self.trait_call_args(item, imp, self_ty, &tf);
-        // trait args fixed by a generic bound (bound_method): `AsRef<OsStr>`
-        if let Some(ta) = self.known_targs.take() {
-            for (i, t) in ta.iter().enumerate() {
-                if let Some(&g) = gargs.get(1 + i) {
-                    self.unify(g, *t);
-                }
+        let known_full = self.known_method_args.take();
+        if let Some(full) = &known_full {
+            let indices = self.tcx.generic_indices_of(self.prog, item);
+            for (i, &idx) in indices.types_consts.iter().enumerate() {
+                let t = match full[idx as usize] { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() };
+                self.eq(gargs[i], t);
             }
         }
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
@@ -7683,7 +5881,19 @@ impl<'a> Fcx<'a> {
         };
         self.b.dependencies.push(item);
         self.b.methods.insert(e.0, MethodRes { def: item, derefs, autoref, args: gargs.clone() });
-        let (ps, r) = self.instantiate_call_signature(item, &gargs, &sig);
+        let mut full = self.infer_item_args(item, &gargs);
+        if let Some(known) = known_full {
+            for (arg, known) in full.iter_mut().zip(known) {
+                if matches!(known, crate::consts::GenericArg::Lifetime(_)) { *arg = known; }
+            }
+        }
+        let (ps, r) = self.instantiate_call_signature(item, &full, &sig);
+        // A probe only establishes that the trait may hold, even when it found
+        // one impl. Confirm the pick by retaining its trait obligation (nightly
+        // rustc_hir_typeck/src/method/probe.rs:2142-2144, confirm.rs:632-647),
+        // and the method's own predicates, once with these args (confirm.rs:150-160).
+        self.register_method_obligation(item, &full);
+        self.apply_fn_bounds(item, &full, lo);
         let ps: Vec<_> = ps.into_iter().map(|t| self.normalize_signature(t)).collect();
         let extra = self.extra_arg.take();
         let n_extra = extra.is_some() as usize;
@@ -7699,7 +5909,7 @@ impl<'a> Fcx<'a> {
         // checked would select an impl for a projection whose trait args are still open
         // (`allocs.index(heading_ix)` with several Index impls)
         let exp_inputs = if method_expected.is_some() { self.method_expected_inputs(r, &ps, method_expected) } else { None };
-        self.check_method_args(item, &gargs, &ps, args, exp_inputs);
+        self.check_method_args(item, &ps, args, exp_inputs);
         // several impls of the trait for the self type and its args still open (`v.extend(it)`
         // on Vec<String>: Extend<String> and Extend<&String>): the impls whose where-clauses
         // can hold (`T: Copy` rules out the second) -- one left fixes the args (rustc selects
@@ -7713,30 +5923,23 @@ impl<'a> Fcx<'a> {
                 let (rs, xs) = (self.shallow(r), self.shallow(x));
                 let plain = matches!(self.tcx.tys.kind(xs), TyKind::Adt(..) | TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Tuple(_) | TyKind::Array(..)) && !self.has_dyn(xs);
                 if plain && matches!(self.tcx.tys.kind(rs), TyKind::Infer(_)) && !self.is_literal_var(rs) && gargs[1..].contains(&rs) {
-                    let save = self.snapshot();
-                    if !self.unify(rs, xs) {
-                        self.rollback(save);
-                    }
+                    let save = self.start_snapshot();
+                    if !self.eq(rs, xs) { self.rollback_to(save); } else { self.commit_from(save); }
                 }
             }
         }
-        // A probe only establishes that the trait may hold, even when it found
-        // one impl. Confirm the pick by retaining its trait obligation (nightly
-        // rustc_hir_typeck/src/method/probe.rs:2142-2144, confirm.rs:632-647).
-        self.register_method_obligation(item, &gargs);
-        self.apply_fn_bounds(item, &gargs, lo);
         let _ = error;
         self.normalize_signature(r)
     }
 
-    fn register_method_obligation(&mut self, item: DefId, gargs: &[TyId]) {
+    /// The trait ref of a trait item's full args is their parent prefix.
+    fn register_method_obligation(&mut self, item: DefId, full: &[crate::consts::GenericArg]) {
         let td = self.prog.def(item).parent;
-        if self.prog.def(td).kind != DefKind::Trait || gargs.is_empty() { return; }
-        let n = self.tcx.trait_generic_count(self.prog, td);
-        if gargs.len() >= n + 1 {
-            let goal = crate::solve::select::trait_goal(&self.cx, td, gargs[0], &gargs[1..=n]);
-            self.register_goal(goal, self.last_lo);
-        }
+        if self.prog.def(td).kind != DefKind::Trait { return; }
+        let indices = self.tcx.generic_indices_of(self.prog, td);
+        let n = indices.types_consts.len() + indices.lifetimes.len();
+        let predicate = crate::next_solver::collect::trait_predicate(td, full[..n].to_vec());
+        self.register_goal(Goal { param_env: self.param_env.clone(), predicate }, self.last_lo);
     }
 
     /// `norm` that leaves unresolved literal variables open.
@@ -7748,315 +5951,98 @@ impl<'a> Fcx<'a> {
         r
     }
 
-    /// Impl-driven inference: a generic arg bounded by `T: Trait<Args>` whose type is partly
-    /// known (`Vec<?0>`) and has exactly one matching impl takes that impl's shape
-    /// (`collect::<Vec<_>>()` gets `?0 = Item` from `impl<T> FromIterator<T> for Vec<T>`).
-    fn infer_from_bounds(&mut self, d: DefId, gargs: &[TyId]) {
-        let options = &self.prog.session.options;
-        // measurement switch for the dialect re-evaluation (impl-driven / backward inference)
-            if options.no_bound_infer {
-            return;
-        }
-        // a fn's bounds, or a selected impl's where-clauses (its args are `gargs`)
-        let bounds = match self.tcx.fn_trait_bounds(self.prog, d) {
-            Some(b) => b.clone(),
-            None => self.tcx.impl_trait_bounds.get(&d).cloned().unwrap_or_default(),
-        };
-        // literal variables are still open here (`get(&5)` learns u32 from `K: Borrow<Q>`)
-        let save_keep = self.keep_literal_vars;
-        self.keep_literal_vars = true;
-        self.infer_from_bounds_inner(gargs, bounds);
-        // where-clauses on other types (`where [T]: Concat<Item>`): their self type as an
-        // extra argument
-        if let Some(tyb) = self.tcx.fn_ty_bounds(self.prog, d).cloned() {
-            for (st, td, targs) in tyb {
-                let mut g2 = gargs.to_vec();
-                let s2 = self.tcx.tys.subst_for_inference(st, gargs);
-                g2.push(s2);
-                self.infer_from_bounds_inner(&g2, vec![(gargs.len() as u32, td, targs)]);
-            }
-        }
-        // `I: IntoIterator<Item = D>` with I known: D = <I as IntoIterator>::Item
-        if let Some(binds) = self.tcx.fn_bound_bindings(self.prog, d).cloned() {
-            for (pi, ad, targs, pat) in binds {
-                let t = match gargs.get(pi as usize) {
-                    Some(t) => self.shallow(*t),
-                    None => continue,
-                };
-                if matches!(self.tcx.tys.kind(t), TyKind::Infer(_) | TyKind::Error) {
-                    continue;
-                }
-                let want = self.tcx.tys.subst_for_inference(pat, gargs);
-                let want = self.norm_keep(want);
-                // either side may learn: `D` from I, or I's open literals from D
-                // (`total::<I: Iterator<Item = u32>>(vec![1, 2].into_iter())` makes them u32)
-                let mut pargs = vec![self.deep(t)];
-                for x in &targs {
-                    let y = self.tcx.tys.subst_for_inference(*x, gargs);
-                    pargs.push(self.deep(y));
-                }
-                let proj = self.tcx.tys.intern(TyKind::Assoc(ad, pargs, crate::types::RegionArgsId::EMPTY));
-                let goal = crate::solve::goal::Goal {
-                    param_env: crate::solve::goal::ParamEnvId(self.cx.typing_env.param_env.index()),
-                    predicate: crate::solve::goal::Predicate::AliasRelate(crate::solve::goal::Term::Ty(proj), crate::solve::goal::Term::Ty(want), crate::solve::goal::AliasRelationDirection::Equate),
-                };
-                self.register_goal(goal, self.last_lo);
-            }
-        }
-        if self.prog.def(d).kind == DefKind::Impl { self.apply_impl_predicates(d, gargs); }
-        self.keep_literal_vars = save_keep;
-    }
-
-    fn infer_from_bounds_inner(&mut self, gargs: &[TyId], bounds: Vec<(u32, DefId, Vec<TyId>)>) {
-        for (index, td, args) in bounds {
-            let Some(&self_ty) = gargs.get(index as usize) else { continue; };
-            let mut inputs = Vec::new();
-            for arg in args { inputs.push(self.tcx.tys.subst_for_inference(arg, gargs)); }
-            let inputs = self.tcx.fill_trait_defaults(&self.cx, self.prog, td, self_ty, inputs);
-            let goal = crate::solve::select::trait_goal(&self.cx, td, self_ty, &inputs);
-            self.register_goal(goal, self.last_lo);
-        }
-    }
-
-    /// A selected impl's `F: Fn(A..) -> R` bounds: a closure (or fn item) bound to F has that
-    /// signature, which fixes impl params only the Fn bound mentions (rustc: the impl's
-    /// predicates become obligations; the closure's Fn impl unifies its signature).
-    fn apply_impl_predicates(&mut self, imp: DefId, iargs: &[TyId]) {
-        let cx = self.cx.body();
-        let goals = crate::solve::select::impl_goals(self.tcx, &cx, self, imp, iargs);
-        for goal in goals { self.register_goal(goal, self.last_lo); }
-    }
-
-    /// Unifies impl `imp`'s trait ref (self type `t`, trait args with defaults filled:
-    /// `impl PartialEq for u32` is PartialEq<u32>) with the wanted trait args.
-    fn unify_impl_trait_ref(&mut self, imp: DefId, td: DefId, t: TyId, wants: &[TyId]) -> Option<Vec<TyId>> {
-        let iargs = self.match_impl_args(imp, t);
-        let itargs = self.tcx.impl_trait_args.get(&imp).cloned().unwrap_or_default();
-        let st = self.tcx.impl_self.get(&imp).copied().unwrap_or(t);
-        let itargs = self.tcx.fill_trait_defaults(&self.cx, self.prog, td, st, itargs);
-        let mut ok = true;
-        for (j, ita) in itargs.iter().enumerate() {
-            if j >= wants.len() {
-                break;
-            }
-            let have = self.tcx.tys.subst_for_inference(*ita, &iargs);
-            let have = self.norm_keep(have);
-            if !self.unify(have, wants[j]) {
-                if trace_bounds() {
-                    let (x, y) = (self.ty_str(have), self.ty_str(wants[j]));
-                    eprintln!("bounds:   trait arg {} does not unify with {}", x, y);
-                }
-                ok = false;
-            }
-        }
-        if ok {
-            Some(iargs)
-        } else {
-            None
-        }
-    }
-
-    /// Select the call's bounds (including APIT associated-type bindings) and obligations
-    /// from already checked arguments before checking closure bodies. Unresolved obligations
-    /// stay pending; this is opportunistic selection, without literal fallback.
-    fn select_before_closures(&mut self, callee: Option<(DefId, &[TyId])>) {
-        if let Some((d, gargs)) = callee {
-            self.infer_from_bounds(d, gargs);
-        }
+    /// checks.rs:265-291: before closure arguments, the obligations registered
+    /// so far are selected where possible (no literal fallback).
+    fn select_before_closures(&mut self) {
         self.retry_goals(false);
-        self.flush_projection_relations();
     }
 
-    /// Before an argument coerces to a formal type that still has inference variables, the
-    /// call's bounds are selected where possible (rustc check_argument_types: the coercion
-    /// target goes through resolve_vars_with_obligations -> select_obligations_where_possible).
-    /// `set.contains(&k)` with k: &u64 and `T: Borrow<Q>`: the one impl `Borrow<T> for T` makes
-    /// Q = u64 first, so `&&u64` coerces to `&u64` by deref instead of fixing Q = &u64.
-    fn select_before_coerce(&mut self, d: DefId, gargs: &[TyId], pt: TyId) {
-        let x = self.deep(pt);
-        if self.tcx.tys.has_infer(x) && (self.tcx.fn_trait_bounds(self.prog, d).is_some() || self.tcx.fn_ty_bounds(self.prog, d).is_some()) {
-            self.infer_from_bounds(d, gargs);
+    /// Registers `d`'s predicates instantiated with its full args.
+    fn apply_fn_bounds(&mut self, d: DefId, args: &[crate::consts::GenericArg], lo: u32) {
+        for p in self.tcx.clauses_of(self.prog, d) {
+            let predicate = self.tcx.instantiate_predicate(self.prog, d, args, &p);
+            self.register_goal(Goal { param_env: self.param_env.clone(), predicate }, lo);
         }
     }
 
-    /// After the arguments are checked: callables bound to `F: Fn(A) -> R` params must
-    /// have that signature (infers `R`-like generic args from closures and fn items).
-    fn apply_fn_bounds(&mut self, d: DefId, gargs: &[TyId], lo: u32) {
-        self.infer_from_bounds(d, gargs);
-        use crate::solve::goal::{Clause, Predicate, Term};
-        let clauses = self.tcx.item_clauses(self.prog, d).cloned().unwrap_or_default();
-        for clause in clauses {
-            let predicate = match clause {
-                Clause::Trait(mut p) => {
-                    for t in &mut p.trait_ref.args { *t = self.tcx.tys.subst_for_inference(*t, gargs); }
-                    Predicate::Clause(Clause::Trait(p))
-                }
-                Clause::Projection(mut p) => {
-                    for t in &mut p.alias.args { *t = self.tcx.tys.subst_for_inference(*t, gargs); }
-                    if let Term::Ty(t) = &mut p.term { *t = self.tcx.tys.subst_for_inference(*t, gargs); }
-                    Predicate::Clause(Clause::Projection(p))
-                }
-                _ => continue,
+    fn fresh_arg(&self, def: DefId, compact: usize) -> TyId {
+        let indices = self.tcx.generic_indices_of(self.prog, def);
+        if indices.consts.contains(&indices.types_consts[compact]) {
+            self.tcx.tys.intern(TyKind::Const(self.infcx.next_const_var()))
+        } else { self.infcx.next_ty_var() }
+    }
+
+    fn infer_item_args(&self, def: DefId, compact: &[TyId]) -> Vec<crate::consts::GenericArg> {
+        let mut args = self.infcx.fresh_args_for_item(self.prog, def);
+        let indices = self.tcx.generic_indices_of(self.prog, def);
+        for (i, ty) in compact.iter().enumerate() {
+            args[indices.types_consts[i] as usize] = match self.tcx.tys.kind(*ty) {
+                TyKind::Const(ct) => crate::consts::GenericArg::Const(*ct),
+                _ => crate::consts::GenericArg::Type(*ty),
             };
-            let goal = crate::solve::goal::Goal { param_env: crate::solve::goal::ParamEnvId(self.cx.typing_env.param_env.index()), predicate };
-            self.register_goal(goal, lo);
         }
+        args
     }
 
-    fn select_unspecified_trait(&mut self, td: DefId, ty: TyId) -> SelectionResult {
+    fn trait_goal(&self, td: DefId, ty: TyId, args: &[TyId]) -> Goal {
+        let mut compact = vec![ty]; compact.extend_from_slice(args);
+        let args = self.infer_item_args(td, &compact);
+        Goal { param_env: self.param_env.clone(), predicate: crate::next_solver::collect::trait_predicate(td, args) }
+    }
+
+    fn select_unspecified_trait(&mut self, td: DefId, ty: TyId) -> Result<Option<ImplSource>, crate::next_solver::NoSolution> {
         let mut args = Vec::new();
-        for _ in 0..self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh(0)); }
+        let indices = self.tcx.generic_indices_of(self.prog, td);
+        let full = self.infcx.fresh_args_for_item(self.prog, td);
+        for &i in &indices.types_consts[1..] {
+            args.push(match full[i as usize] { crate::consts::GenericArg::Type(t) => t, crate::consts::GenericArg::Const(c) => self.tcx.tys.intern(TyKind::Const(c)), _ => unreachable!() });
+        }
         self.select_trait(td, ty, &args)
     }
 
-    fn select_trait(&mut self, td: DefId, ty: TyId, args: &[TyId]) -> SelectionResult {
-        use crate::solve::goal::{Clause, Predicate, Certainty};
-        let cx = self.cx.body();
-        let goal = crate::solve::select::trait_goal(&cx, td, ty, args);
-        let Predicate::Clause(Clause::Trait(predicate)) = goal.predicate.clone() else { unreachable!() };
-        let mark = self.snapshot();
-        let mut result = crate::solve::select::select(self.tcx, &cx, self, predicate);
-        if let SelectionResult::Ok(selected) = &result {
-            let mut pending = Vec::new();
-            let mut failed = false;
-            for goal in &selected.nested {
-                match crate::solve::evaluate(self.tcx, &cx, self, goal.clone()) {
-                    Ok(Certainty::Yes) => {}
-                    Ok(certainty) => pending.push((goal.clone(), certainty)),
-                    Err(_) => { failed = true; break; }
-                }
-            }
-            if failed { result = SelectionResult::NoSolution; }
-            else { for (goal, certainty) in pending { self.push_pending_goal(goal, self.last_lo, certainty); } }
-        }
+    fn select_trait(&mut self, td: DefId, ty: TyId, args: &[TyId]) -> Result<Option<ImplSource>, crate::next_solver::NoSolution> {
+        let goal = self.trait_goal(td, ty, args);
+        let result = self.infcx.select_in_new_trait_solver(self.prog, goal.clone());
         match &result {
-            SelectionResult::Ok(_) => {},
-            SelectionResult::NoSolution => self.rollback(mark),
-            SelectionResult::Ambiguous(cause) => {
-                self.rollback(mark);
-                if !self.pending_goals.iter().any(|p| p.goal == goal) {
-                    self.push_pending_goal(goal, self.last_lo, Certainty::Maybe(*cause));
-                }
+            Ok(Some(source)) => {
+                let nested = match source { ImplSource::UserDefined { nested, .. } | ImplSource::Builtin(_, nested) | ImplSource::Param(nested) => nested };
+                for goal in nested { self.register_goal(goal.clone(), self.last_lo); }
             }
+            Ok(None) => self.register_goal(goal, self.last_lo),
+            Err(_) => {}
         }
         result
     }
 
-    fn goal_string(&mut self, goal: &crate::solve::goal::Goal) -> String {
-        use crate::solve::goal::{Clause, Predicate, Term};
-        match &goal.predicate {
-            Predicate::Clause(Clause::Trait(p)) => {
-                let mut args = Vec::new();
-                for t in &p.trait_ref.args { args.push(self.ty_str(*t)); }
-                format!("{}<{}>", self.prog.def_path(p.trait_ref.def), args.join(", "))
-            }
-            Predicate::Clause(Clause::Projection(p)) => {
-                let projection = self.tcx.tys.intern(TyKind::Assoc(p.alias.def, p.alias.args.clone(), crate::types::RegionArgsId::EMPTY));
-                let Term::Ty(t) = p.term else { return format!("{:?}", goal); };
-                let a = self.ty_str(projection); let b = self.ty_str(t);
-                format!("{a} == {b}")
-            }
-            Predicate::AliasRelate(Term::Ty(a), Term::Ty(b), _) => {
-                let a = self.ty_str(*a); let b = self.ty_str(*b); format!("{a} == {b}")
-            }
-            _ => format!("{:?}", goal.predicate),
-        }
-    }
-
-    fn push_pending_goal(&mut self, goal: crate::solve::goal::Goal, lo: u32, certainty: crate::solve::goal::Certainty) {
-        self.push_pending(PendingGoal { goal, lo, certainty, stalled: None });
-    }
-
-    fn push_pending(&mut self, pending: PendingGoal) {
-        for p in &self.pending_goals { if p.goal == pending.goal { return; } }
-        self.pending_goals.push(pending);
-        self.undo.push((u32::MAX - 1, VarSt::Free(0), UniverseIndex::ROOT));
-    }
-
-    fn register_goal(&mut self, goal: crate::solve::goal::Goal, lo: u32) {
-        use crate::solve::goal::Certainty;
-        let cx = self.cx.body();
-        let goal = self.resolve_pending_goal(goal);
-        let revision = self.tcx.trait_input_revision.load(std::sync::atomic::Ordering::Acquire);
-        for p in &self.pending_goals { if p.is_stalled(&goal, revision) { return; } }
-        match crate::solve::evaluate(self.tcx, &cx, self, goal.clone()) {
-            Ok(Certainty::Yes) => {}
-            Ok(certainty) => {
-                self.push_pending(PendingGoal { goal: goal.clone(), lo, certainty, stalled: Some((goal, revision)) });
-            }
-            Err(_) => {
-                let message = self.goal_string(&goal); self.err(lo, format!("E0277: unsatisfied obligation {message}"));
-            },
-        }
-    }
-
-    fn resolve_pending_goal(&mut self, mut goal: crate::solve::goal::Goal) -> crate::solve::goal::Goal {
-        use crate::solve::goal::*;
-        match &mut goal.predicate {
-            Predicate::Clause(Clause::Trait(p)) => for t in &mut p.trait_ref.args { *t = self.deep(*t); },
-            Predicate::Clause(Clause::Projection(p)) => {
-                for t in &mut p.alias.args { *t = self.deep(*t); }
-                if let Term::Ty(t) = &mut p.term { *t = self.deep(*t); }
-            }
-            Predicate::AliasRelate(Term::Ty(a), Term::Ty(b), _) => { *a = self.deep(*a); *b = self.deep(*b); }
-            _ => {}
-        }
-        goal
-    }
-
-    /// Service type_of_opaque dependencies after selection has unwound its probes
-    /// (rustc_trait_selection/src/traits/select/mod.rs:2432-2437). Active bodies
-    /// remain stalled until their own publication advances trait_input_revision.
-    fn request_hidden_types(&self) {
-        let requests = std::mem::take(&mut *self.cx.state.opaque_requests.borrow_mut());
-        for opaque in requests { hidden_of(&self.cx, self.prog, self.tcx, opaque); }
+    fn register_goal(&mut self, goal: Goal, lo: u32) {
+        self.fulfillment_cx.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: lo, body_id: self.b.def } });
     }
 
     fn retry_goals(&mut self, final_: bool) {
-        use crate::solve::goal::Certainty;
-        let cx = self.cx.body();
-        self.request_hidden_types();
-        for _ in 0..128 {
-            let before = self.tcx.trait_input_revision.load(std::sync::atomic::Ordering::Acquire);
-            self.undo.retain(|u| u.0 != u32::MAX - 1);
-            let pending = std::mem::take(&mut self.pending_goals);
-            let mut progress = false;
-            for mut pending in pending {
-                let goal = self.resolve_pending_goal(pending.goal.clone());
-                let revision = self.tcx.trait_input_revision.load(std::sync::atomic::Ordering::Acquire);
-                if pending.is_stalled(&goal, revision) {
-                    pending.goal = goal;
-                    self.push_pending(pending);
-                    continue;
-                }
-                match crate::solve::evaluate(self.tcx, &cx, self, goal.clone()) {
-                    Ok(Certainty::Yes) => { progress = true; }
-                    Ok(certainty) => self.push_pending(PendingGoal { goal: goal.clone(), lo: pending.lo, certainty, stalled: Some((goal, revision)) }),
-                    Err(_) => { let message = self.goal_string(&goal); self.err(pending.lo, format!("E0277: unsatisfied obligation {message}")); progress = true; },
-                }
-            }
-            for pending in self.pending_goals.clone() {
-                progress |= self.resolve_pending_goal(pending.goal.clone()) != pending.goal;
-            }
-            self.request_hidden_types();
-            progress |= self.tcx.trait_input_revision.load(std::sync::atomic::Ordering::Acquire) != before;
-            if !progress || self.pending_goals.is_empty() { break; }
-        }
-        if final_ {
-            self.undo.retain(|u| u.0 != u32::MAX - 1);
-            let pending = std::mem::take(&mut self.pending_goals);
-            // rustc_trait_selection/src/error_reporting/traits/ambiguity.rs:228,
-            // 345, 576: do not report inference fallout in an already erroneous body.
-            if self.b.errors.is_empty() {
-                for pending in pending {
-                    let message = self.goal_string(&pending.goal);
-                    if matches!(pending.certainty, Certainty::Maybe(crate::solve::goal::MaybeCause::Overflow { .. })) {
-                        self.err(pending.lo, format!("E0275: overflow evaluating the requirement {message}"));
-                    } else {
-                        self.err(pending.lo, format!("E0283: ambiguous obligation {message} ({:?})", pending.certainty));
+        use crate::next_solver::fulfill::NextSolverError;
+        let errors = if final_ { self.fulfillment_cx.evaluate_obligations_error_on_ambiguity(&self.infcx, self.prog) }
+            else { self.fulfillment_cx.try_evaluate_obligations(&self.infcx, self.prog) };
+        for error in errors {
+            let (code, obligation) = match error {
+                NextSolverError::TrueError(o) => ("E0277", o),
+                NextSolverError::Ambiguity(o) => { if !self.b.errors.is_empty() { continue; } ("E0283", o) },
+                NextSolverError::Overflow(o) => ("E0275", o),
+            };
+            let predicate = &obligation.goal.predicate;
+            let detail = match &predicate.kind {
+                PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) => {
+                    let mut args = Vec::new();
+                    for arg in &p.trait_ref.args {
+                        args.push(match arg { crate::consts::GenericArg::Type(t) => self.ty_str(*t), crate::consts::GenericArg::Const(c) => self.tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
                     }
+                    format!("{}<{}>", self.prog.def_path(p.trait_ref.def_id), args.join(", "))
                 }
-            }
+                PredicateKind::Clause(crate::next_solver::ClauseKind::Projection(crate::next_solver::ProjectionClause { projection_term: crate::next_solver::AliasTerm::Ty(a), term: crate::next_solver::Term::Ty(t) })) => {
+                    format!("`{}` == `{}`", self.ty_str(*a), self.ty_str(*t))
+                }
+                _ => format!("{predicate:?}"),
+            };
+            self.err(obligation.cause.span, format!("{code}: unsatisfied obligation {detail}"));
         }
     }
 
@@ -8107,7 +6093,7 @@ impl<'a> Fcx<'a> {
                 if mexprs.len() >= 2 {
                     let ta = self.check_expr(mexprs[0], None);
                     let tb = self.check_expr(mexprs[1], Some(ta));
-                    if !self.unify(ta, tb) {
+                    if !self.eq(ta, tb) {
                         let (sa, sb) = (self.ty_str(ta), self.ty_str(tb));
                         self.err(lo, format!("assert_eq of `{}` and `{}`", sa, sb));
                     }
@@ -8252,10 +6238,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
                 format!("({})", list(v))
             }
         }
-        TyKind::Array(e, n) => match crate::types::len_ty(*n) {
-            Some(l) => format!("[{}; {}]", type_name(prog, tcx, *e), type_name(prog, tcx, l)),
-            None => format!("[{}; {}]", type_name(prog, tcx, *e), n),
-        },
+        TyKind::Array(e, n) => format!("[{}; {}]", type_name(prog, tcx, *e), tcx.tys.const_to_string(*n)),
         TyKind::Slice(e) => format!("[{}]", type_name(prog, tcx, *e)),
         TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, type_name(prog, tcx, *e)),
         TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, type_name(prog, tcx, *e)),
@@ -8281,7 +6264,7 @@ pub fn type_name(prog: &Program, tcx: &Tcx, t: TyId) -> String {
             }
             s
         }
-        TyKind::Closure(file, e, _, _, owner) => {
+        TyKind::Closure(file, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {
             // the enclosing fn's path, then one `{{closure}}` per closure / async block around
             // this one and itself (rustc: `krate::main::{{closure}}::{{closure}}` for an async
             // closure's future)
@@ -8401,6 +6384,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         TyKind::Char => "char".to_string(),
         TyKind::Str => "str".to_string(),
         TyKind::Int(p) | TyKind::Float(p) => crate::types::Types::prim_name(*p).to_string(),
+        TyKind::Foreign(d) => prog.def_path(*d),
         TyKind::Never => "!".to_string(),
         TyKind::Tuple(v) => {
             let mut s = "(".to_string();
@@ -8416,11 +6400,8 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             s.push(')');
             s
         }
-        TyKind::Array(e, n) => match crate::types::len_ty(*n) {
-            Some(l) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), ty_to_string(stable_closures, prog, tcx, l)),
-            None => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), n),
-        },
-        TyKind::ConstVal(v) => format!("{}", v),
+        TyKind::Array(e, n) => format!("[{}; {}]", ty_to_string(stable_closures, prog, tcx, *e), tcx.tys.const_to_string(*n)),
+        TyKind::Const(v) => tcx.tys.const_to_string(*v),
         TyKind::Slice(e) => format!("[{}]", ty_to_string(stable_closures, prog, tcx, *e)),
         TyKind::Ref(m, e, _) => format!("&{}{}", if *m { "mut " } else { "" }, ty_to_string(stable_closures, prog, tcx, *e)),
         TyKind::Ptr(m, e) => format!("*{} {}", if *m { "mut" } else { "const" }, ty_to_string(stable_closures, prog, tcx, *e)),
@@ -8453,9 +6434,11 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
         TyKind::FnDef(d, _, _) => format!("fn item {}", prog.def_path(*d)),
         TyKind::Param(i) => format!("T{}", i),
         TyKind::Infer(v) => format!("?{}", v),
+        TyKind::IntVar(v) => format!("?I{}", v),
+        TyKind::FloatVar(v) => format!("?F{}", v),
         TyKind::Bound(d, b) => format!("^{}.{}:{:?}", d, b.var.0, b.kind),
         TyKind::Placeholder(p) => format!("!U{}.{}", p.universe.0, p.bound.0),
-        TyKind::Closure(f, e, _, _, owner) => {
+        TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, .. }) => {
             if stable_closures {
                 let owner = match tcx.tys.kind(*owner) {
                     TyKind::FnDef(d, _, _) => Some(*d),
@@ -8485,16 +6468,16 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
             s
         }
-        TyKind::Assoc(d, args, _) => {
+        TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: _ }) => {
             let st = match args.first() {
                 Some(t) => ty_to_string(stable_closures, prog, tcx, *t),
                 None => "?".to_string(),
             };
             format!("<{} as {}>::{}", st, prog.name(prog.def(*d).parent), prog.name(*d))
         }
-        TyKind::Opaque(d, i, _, _) => {
+        TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, .. }) => {
             let mut s = "impl ".to_string();
-            if let Some(o) = tcx.opaques.get(&(*d, *i)) {
+            if let Some(o) = tcx.opaques.get(d) {
                 for (k, (td, _)) in o.bounds.iter().enumerate() {
                     if k > 0 {
                         s.push_str(" + ");
@@ -8504,6 +6487,7 @@ pub fn ty_to_string(stable_closures: bool, prog: &Program, tcx: &Tcx, t: TyId) -
             }
             s
         }
+        TyKind::Alias(_, alias) => format!("{}<{}>", prog.name(alias.kind.def_id()), alias.args.iter().map(|ty| ty_to_string(stable_closures, prog, tcx, *ty)).collect::<Vec<_>>().join(", ")),
         TyKind::Error => "{error}".to_string(),
     }
 }
@@ -8530,18 +6514,12 @@ pub fn is_rest_pat(ast: &Ast, p: PatId) -> bool {
     }
 }
 
-/// RELAX_TRACE=bounds (read once: bound inference runs per call)
-fn trace_bounds() -> bool {
-    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var("RELAX_TRACE").map_or(false, |v| v.split(',').any(|x| x == "bounds")))
-}
-
 /// Walk a resolved type without allocating a set in the type-checker's hot path.
 pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>) {
     fn walk(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>, depth: usize) {
         if depth > 64 { return; }
         match tcx.tys.kind(ty) {
-            TyKind::Adt(d, a, _) | TyKind::FnDef(d, a, _) | TyKind::Assoc(d, a, _) | TyKind::Opaque(d, _, a, _) => {
+            TyKind::Adt(d, a, _) | TyKind::FnDef(d, a, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args: a, regions: _ }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: a, regions: _ }) => {
                 out.push(*d);
                 for t in a { walk(tcx, *t, out, depth + 1); }
             }
@@ -8555,143 +6533,6 @@ pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>) {
         }
     }
     walk(tcx, ty, out, 0);
-}
-
-impl Body {
-    /// Erase the codegen-owned copy, after borrow checking. Keep the polymorphic
-    /// typeck body and its ParamEnv intact for type/region inference.
-    pub fn erase_regions(&mut self, tys: &crate::types::Types) {
-        if !tys.has_free_regions() { return; }
-        let ty = |t: &mut TyId| *t = tys.erase_regions(*t);
-        let list = |v: &mut Vec<TyId>| v.iter_mut().for_each(ty);
-        list(&mut self.args);
-        list(&mut self.expr_ty);
-        list(&mut self.pat_ty);
-        ty(&mut self.ret);
-        self.locals.iter_mut().for_each(|l| ty(&mut l.ty));
-        self.res_args.values_mut().for_each(list);
-        self.methods.values_mut().chain(self.binops.values_mut()).for_each(|m| list(&mut m.args));
-        self.ov_derefs.values_mut().chain(self.ov_index.values_mut()).chain(self.for_next.values_mut()).for_each(|(_, a)| list(a));
-        self.for_into.values_mut().for_each(|(_, a, t)| { list(a); ty(t); });
-        self.try_conv.values_mut().flatten().for_each(|(_, a)| list(a));
-        for c in self.coerce.values_mut() {
-            match c {
-                Coerce::ToDyn(a, b) | Coerce::Upcast(a, b) => { ty(a); ty(b); }
-                _ => {}
-            }
-        }
-        for sig in self.closure_sigs.values_mut() {
-            ty(&mut sig.bound);
-            ty(&mut sig.liberated);
-            if let Some((a, b)) = &mut sig.annotation_eq { ty(a); ty(b); }
-        }
-        self.inline_const_types.values_mut().for_each(ty);
-        self.param_env = None;
-    }
-}
-
-/// Allocation/metadata only. Response relations and subtype-root restoration
-/// belong to T-infer. rustc_type_ir/src/infer_ctxt.rs:338-378;
-/// rustc_infer/src/infer/canonical/mod.rs:86.
-impl crate::solve::relate::TypeRelation for Fcx<'_> {
-    fn relate(&mut self, a: TyId, b: TyId) -> bool { self.unify(a, b) }
-}
-impl crate::solve::canonical::InferDelegate for Fcx<'_> {
-    fn snapshot(&self) -> crate::solve::canonical::Snapshot {
-        crate::solve::canonical::Snapshot { bindings: self.snapshot(), relations: self.projection_relations.len() }
-    }
-    fn rollback(&mut self, mark: crate::solve::canonical::Snapshot) { self.rollback(mark.bindings); }
-    fn fresh_ty(&mut self, kind: crate::solve::canonical::TyVariableKind) -> TyId {
-        use crate::solve::canonical::TyVariableKind;
-        self.fresh(match kind { TyVariableKind::General => 0, TyVariableKind::Int => 1, TyVariableKind::Float => 2 })
-    }
-    fn resolve_deep(&mut self, ty: TyId) -> TyId { self.deep(ty) }
-    fn take_relations_since(&mut self, mark: crate::solve::canonical::Snapshot) -> Vec<(TyId, TyId)> {
-        let relations = self.projection_relations.split_off(mark.relations);
-        let mut write = mark.bindings;
-        for read in mark.bindings..self.undo.len() {
-            if self.undo[read].0 != u32::MAX {
-                self.undo[write] = self.undo[read];
-                write += 1;
-            }
-        }
-        self.undo.truncate(write);
-        let mut result = Vec::with_capacity(relations.len());
-        for (a, b, _) in relations { result.push((a, b)); }
-        result
-    }
-    fn is_const_arg(&self, def: DefId, index: u32) -> bool {
-        let env = if let ItemKind::Trait { generics, .. } =
-            &self.prog.files[self.prog.def(def).file as usize].ast.item(self.prog.def(def).item).kind
-        {
-            let mut env = GenEnv::default();
-            env.names.push(self.prog.syms.get("Self").unwrap_or(u32::MAX));
-            env.regions.next_param += 1;
-            crate::tcx::push_generics(self.prog, self.prog.def(def).file, generics, &mut env);
-            env
-        } else { self.tcx.item_env(self.prog, def) };
-        for (i, _, _) in env.consts { if i == index { return true; } }
-        false
-    }
-
-    fn resolve_ty(&mut self, ty: TyId) -> TyId { self.shallow_region_vars(ty) }
-    fn resolve_const(&mut self, value: TyId) -> TyId { self.shallow_region_vars(value) }
-    fn resolve_region(&mut self, region: crate::types::RegionId) -> crate::types::RegionId { region }
-
-    fn ty_variable(&self, mut var: u32) -> crate::solve::canonical::TyVariableInfo {
-        use crate::solve::canonical::{TyVariableInfo, TyVariableKind};
-        loop {
-            match self.vars[var as usize] {
-                VarSt::Bound(t) => match self.tcx.tys.kind(t) {
-                    TyKind::Infer(v) => var = *v,
-                    _ => panic!("metadata requested for resolved type variable"),
-                },
-                VarSt::Free(kind) => return TyVariableInfo {
-                    root: var, sub_root: var,
-                    universe: self.var_universes[var as usize],
-                    kind: match kind { 0 => TyVariableKind::General, 1 => TyVariableKind::Int,
-                        2 => TyVariableKind::Float, _ => unreachable!() },
-                },
-            }
-        }
-    }
-
-    fn const_variable_root(&self, var: u32) -> u32 { self.ty_variable(var).root }
-    fn const_variable_universe(&self, var: u32) -> UniverseIndex { self.ty_variable(var).universe }
-    fn region_variable_root(&self, var: u32) -> u32 { var }
-    fn region_variable_universe(&self, var: u32) -> UniverseIndex {
-        self.region_universes.get(&var).copied().unwrap_or(UniverseIndex::ROOT)
-    }
-    fn universe(&self) -> UniverseIndex { self.universe }
-    fn create_next_universe(&mut self) -> UniverseIndex {
-        self.universe = UniverseIndex(self.universe.0.checked_add(1).expect("universe overflow"));
-        self.universe
-    }
-
-    fn instantiate_var(&mut self, kind: crate::solve::canonical::CanonicalVarKind) -> crate::solve::canonical::GenericArg {
-        use crate::solve::canonical::{CanonicalVarKind, GenericArg, TyVariableKind};
-        use crate::types::{PlaceholderType, RegionKind};
-        assert!(self.universe.can_name(kind.universe()));
-        match kind {
-            CanonicalVarKind::Ty { universe, kind, .. } => {
-                let kind = match kind { TyVariableKind::General => 0, TyVariableKind::Int => 1, TyVariableKind::Float => 2 };
-                GenericArg::Ty(self.fresh_in_universe(kind, universe))
-            }
-            CanonicalVarKind::Const(universe) => GenericArg::Const(self.fresh_in_universe(0, universe)),
-            CanonicalVarKind::Region(universe) => {
-                let r = self.fresh_region();
-                let RegionKind::ReVar(var) = self.tcx.tys.region_kind(r) else { unreachable!() };
-                self.region_universes.insert(var, universe);
-                GenericArg::Region(r)
-            }
-            CanonicalVarKind::PlaceholderTy(p) => GenericArg::Ty(self.tcx.tys.intern(TyKind::Placeholder(
-                PlaceholderType { universe: p.universe, bound: p.var }))),
-            CanonicalVarKind::PlaceholderConst(p) => GenericArg::Const(self.tcx.tys.intern(TyKind::Placeholder(
-                PlaceholderType { universe: p.universe, bound: p.var }))),
-            CanonicalVarKind::PlaceholderRegion(p) => GenericArg::Region(self.tcx.tys.intern_region(
-                RegionKind::RePlaceholder { universe: p.universe, var: p.var })),
-        }
-    }
 }
 
 #[cfg(test)]

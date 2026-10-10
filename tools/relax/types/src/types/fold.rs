@@ -1,17 +1,37 @@
+// ported from N:rustc_type_ir/src/fold.rs @8d1a764
+// ported from N:rustc_type_ir/src/binder.rs @8d1a764
 //! Binder-aware type folding, shifting, and instantiation. FnPtr and each dyn
 //! predicate introduce a binder even when their bound-region count is zero.
+use crate::types::{AliasTy};
 use super::*;
+use crate::consts::{Const, ConstKind, GenericArg, Value, ValTree};
 use std::collections::HashMap;
+
+/// rustc_type_ir/src/binder.rs:345-349,650-668: declaration values lose
+/// context-local rigidness before substitution into a consumer environment.
+pub struct EarlyBinder { value: TyId }
+impl EarlyBinder {
+    pub fn bind(tys: &Types, value: TyId) -> Self {
+        Self { value: tys.set_aliases_to_non_rigid(value) }
+    }
+    pub fn instantiate(self, tys: &Types, indices: &crate::types::variance::GenericIndices, args: &[GenericArg]) -> TyId {
+        if args.is_empty() { assert!(!tys.flags(self.value).contains(TypeFlags::HAS_TY_PARAM)); return self.value; }
+        crate::infer::fresh_args::ArgFolder { indices, args }.fold_ty(tys, self.value, 0)
+    }
+}
 
 /// A structural folder. `depth` counts binders entered since the root value.
 /// Overridden type callbacks can recurse with `super_fold_ty`.
 pub trait TypeFolder {
+    fn fold_const(&mut self, tys: &Types, ct: crate::consts::Const, depth: DebruijnIndex) -> crate::consts::Const {
+        super_fold_const(tys, ct, self, depth)
+    }
     fn fold_ty(&mut self, tys: &Types, t: TyId, depth: DebruijnIndex) -> TyId {
         super_fold_ty(tys, t, self, depth)
     }
     /// Consts share TyId storage; callers identify them by argument position.
     /// rustc_type_ir/src/fold.rs:144 (TypeFolder::fold_const).
-    fn fold_const(&mut self, tys: &Types, t: TyId, depth: DebruijnIndex) -> TyId {
+    fn fold_const_arg(&mut self, tys: &Types, t: TyId, depth: DebruijnIndex) -> TyId {
         self.fold_ty(tys, t, depth)
     }
     fn fold_args(&mut self, tys: &Types, _def: DefId, args: &[TyId], _offset: u32, depth: DebruijnIndex) -> Vec<TyId> {
@@ -26,31 +46,25 @@ pub fn super_fold_ty<F: TypeFolder + ?Sized>(tys: &Types, t: TyId, f: &mut F, de
     let mut list = |v: &[TyId], depth| v.iter().map(|t| f.fold_ty(tys, *t, depth)).collect::<Vec<_>>();
     let k = match tys.kind(t) {
         TyKind::Tuple(v) => TyKind::Tuple(list(v, depth)),
-        TyKind::Array(t, n) => {
-            let t = f.fold_ty(tys, *t, depth);
-            return match len_ty(*n) {
-                Some(n) => tys.mk_array(t, f.fold_const(tys, n, depth)),
-                None => tys.intern(TyKind::Array(t, *n)),
-            };
-        }
+        TyKind::Const(ct) => TyKind::Const(f.fold_const(tys, *ct, depth)),
+        TyKind::Array(t, n) => TyKind::Array(f.fold_ty(tys, *t, depth), f.fold_const(tys, *n, depth)),
         TyKind::Slice(t) => TyKind::Slice(f.fold_ty(tys, *t, depth)),
         TyKind::Ptr(m, t) => TyKind::Ptr(*m, f.fold_ty(tys, *t, depth)),
         TyKind::Ref(m, t, r) => TyKind::Ref(*m, f.fold_ty(tys, *t, depth), f.fold_region(tys, *r, depth)),
         TyKind::Adt(d, v, rs) => TyKind::Adt(*d, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
         TyKind::FnDef(d, v, rs) => TyKind::FnDef(*d, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
-        TyKind::Assoc(d, v, rs) => TyKind::Assoc(*d, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
-        TyKind::Opaque(d, i, v, rs) => TyKind::Opaque(*d, *i, f.fold_args(tys, *d, v, 0, depth), fold_regions(tys, *rs, f, depth)),
+        TyKind::Alias(rigid, alias) => TyKind::Alias(*rigid, AliasTy { kind: alias.kind,
+            args: f.fold_args(tys, alias.kind.def_id(), &alias.args, 0, depth), regions: fold_regions(tys, alias.regions, f, depth) }),
         TyKind::FnPtr(ps, r, c, n) => TyKind::FnPtr(list(ps, depth + 1), f.fold_ty(tys, *r, depth + 1), *c, *n),
         TyKind::Dyn(d, v, bs, rs, r, n, autos) => {
             let v = f.fold_args(tys, *d, v, 1, depth + 1);
-            let bs = bs.iter().map(|(d, t, n)| (*d, f.fold_ty(tys, *t, depth + 1), *n)).collect();
-            TyKind::Dyn(*d, v.into(), bs, fold_regions(tys, *rs, f, depth + 1), f.fold_region(tys, *r, depth), *n, autos.clone())
+            let bs: Vec<_> = bs.iter().map(|(d, t, n)| (*d, f.fold_ty(tys, *t, depth + 1), *n)).collect();
+            TyKind::Dyn(*d, v.into(), bs.into(), fold_regions(tys, *rs, f, depth + 1), f.fold_region(tys, *r, depth), *n, autos.clone().into())
         }
-        TyKind::Closure(fi, e, s, u, o) => TyKind::Closure(*fi, *e,
-            f.fold_ty(tys, *s, depth), f.fold_ty(tys, *u, depth), f.fold_ty(tys, *o, depth)),
+        TyKind::Closure(fi, e, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => TyKind::Closure(*fi, *e, crate::types::ClosureArgs { parent_args: f.fold_ty(tys, *o, depth), closure_kind_ty: f.fold_ty(tys, *closure_kind_ty, depth), closure_sig_as_fn_ptr_ty: f.fold_ty(tys, *s, depth), tupled_upvars_ty: f.fold_ty(tys, *u, depth) }),
         TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) |
-        TyKind::Never | TyKind::Param(_) | TyKind::Infer(_) | TyKind::ConstVal(_) |
-        TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => return t,
+        TyKind::Never | TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) |
+        TyKind::Foreign(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => return t,
     };
     tys.intern(k)
 }
@@ -60,9 +74,9 @@ fn fold_regions<F: TypeFolder + ?Sized>(tys: &Types, rs: RegionArgsId, f: &mut F
     tys.intern_region_args(&tys.region_args(rs).iter().map(|r| f.fold_region(tys, *r, depth)).collect::<Vec<_>>())
 }
 
-struct Shifter {
-    amount: u32,
-    out: bool,
+pub(crate) struct Shifter {
+    pub(crate) amount: u32,
+    pub(crate) out: bool,
 }
 
 impl Shifter {
@@ -77,6 +91,12 @@ impl Shifter {
 }
 
 impl TypeFolder for Shifter {
+    fn fold_const(&mut self, tys: &Types, ct: Const, depth: u32) -> Const {
+        match tys.const_kind(ct) {
+            ConstKind::Bound(d, b) if d >= depth => tys.intern_const(ConstKind::Bound(self.index(d, depth), b)),
+            _ => super_fold_const(tys, ct, self, depth),
+        }
+    }
     fn fold_ty(&mut self, tys: &Types, t: TyId, depth: DebruijnIndex) -> TyId {
         if !tys.has_vars_bound_at_or_above(t, depth) { return t; }
         match tys.kind(t) {
@@ -187,5 +207,51 @@ impl Types {
         self.instantiate_bound_vars(value,
             |var| self.intern_region(RegionKind::RePlaceholder { universe, var }),
             |b| self.intern(TyKind::Placeholder(PlaceholderType { universe, bound: b.var })))
+    }
+}
+
+pub fn super_fold_const<F: TypeFolder + ?Sized>(tys: &Types, ct: Const, f: &mut F, depth: DebruijnIndex) -> Const {
+    let kind = match tys.const_kind(ct) {
+        ConstKind::Alias(rigid, mut alias) => {
+            let mut args = Vec::with_capacity(alias.args.len());
+            for arg in &*alias.args {
+                args.push(match *arg {
+                    GenericArg::Type(ty) => GenericArg::Type(f.fold_ty(tys, ty, depth)),
+                    GenericArg::Lifetime(region) => GenericArg::Lifetime(f.fold_region(tys, region, depth)),
+                    GenericArg::Const(ct) => GenericArg::Const(f.fold_const(tys, ct, depth)),
+                });
+            }
+            alias.args = args.into();
+            ConstKind::Alias(rigid, alias)
+        }
+        ConstKind::Value(value) => {
+            let ty = f.fold_ty(tys, value.ty, depth);
+            let valtree = if let Some(branches) = value.valtree.try_to_branch() {
+                let mut result = Vec::with_capacity(branches.len());
+                for &ct in branches { result.push(f.fold_const(tys, ct, depth)); }
+                ValTree::from_branches(tys, &result)
+            } else { value.valtree };
+            ConstKind::Value(Value { ty, valtree })
+        }
+        _ => return ct,
+    };
+    tys.intern_const(kind)
+}
+
+// ported from N:rustc_type_ir/src/fold.rs:594-722 @8d1a764
+impl Types {
+    pub fn set_aliases_to_non_rigid(&self, ty: TyId) -> TyId {
+        struct RigidnessFolder;
+        impl TypeFolder for RigidnessFolder {
+            fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
+                let ty = super_fold_ty(tys, ty, self, depth);
+                match tys.kind(ty) { TyKind::Alias(_, alias) => tys.intern(TyKind::Alias(crate::consts::IsRigid::No, alias.clone())), _ => ty }
+            }
+            fn fold_const(&mut self, tys: &Types, ct: crate::consts::Const, depth: u32) -> crate::consts::Const {
+                let ct = super_fold_const(tys, ct, self, depth);
+                match tys.const_kind(ct) { crate::consts::ConstKind::Alias(_, alias) => tys.intern_const(crate::consts::ConstKind::Alias(crate::consts::IsRigid::No, alias)), _ => ct }
+            }
+        }
+        RigidnessFolder.fold_ty(self, ty, 0)
     }
 }

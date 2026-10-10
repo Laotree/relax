@@ -1,3 +1,4 @@
+use crate::types::{AliasTy, AliasTyKind};
 use super::*;
 use crate::borrowck::constraints::*;
 use crate::borrowck::handle_placeholders::*;
@@ -184,11 +185,11 @@ fn opaque_members_exclude_parent_closure_arguments() {
     let member = tys.intern(TyKind::Ref(false,unit,tys.intern_region(RegionKind::ReVar(2))));
     let owner = tys.intern(TyKind::FnDef(crate::program::DefId(2),vec![],tys.intern_region_args(&[tys.intern_region(RegionKind::ReVar(3))])));
     let signature = tys.intern(TyKind::FnPtr(vec![],unit,crate::types::FnHeader::RUST,0));
-    let hidden_type = tys.intern(TyKind::Closure(0,0,signature,member,owner));
+    let hidden_type = tys.intern(TyKind::Closure(0, 0, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: signature, tupled_upvars_ty: member }));
     let uses = vec![opaque_types::DefiningUse { def_id:crate::program::DefId(0),hidden_type,arg_regions:vec![0,1] }];
     let (hidden,errors) = opaque_types::compute_definition_site_hidden_types(&tcx,&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())),defs,&relations,constraints(&[(1,2)]),&uses);
     assert!(errors.is_empty());
-    let TyKind::Closure(_,_,_,member,owner) = tys.kind(hidden[0].1) else { panic!() };
+    let TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, tupled_upvars_ty: member, .. }) = tys.kind(hidden[0].1) else { panic!() };
     assert!(matches!(tys.kind(*member),TyKind::Ref(_,_,r) if *r == named));
     let TyKind::FnDef(_,_,rs) = tys.kind(*owner) else { panic!() };
     assert_eq!(&*tys.region_args(*rs),&[RegionId::ERASED]);
@@ -198,53 +199,49 @@ fn opaque_members_exclude_parent_closure_arguments() {
 // the live BIR producer is not a substitute for MIR/solver integration.
 #[test]
 fn v1_if_eq_ignores_bivariant_opaque_arguments() {
-    use crate::types::variance::{GenericIndices, V};
-    let tcx = crate::tcx::Tcx::new();
-    let d = crate::program::DefId(40);
-    tcx.opaques.insert((d,0),crate::tcx::OpaqueDecl {
-        variances: Some((GenericIndices { lifetimes:vec![0], ..Default::default() },vec![V::Bi])),
-        ..Default::default()
-    });
-    let opaque = |r| tcx.tys.intern(TyKind::Opaque(d,0,vec![],tcx.tys.intern_region_args(&[tcx.tys.intern_region(RegionKind::ReVar(r))])));
-    let tests = [TypeTest { generic_kind:opaque(2), lower_bound:1,span:Span::default(),
-        verify_bound:VerifyBound::IfEq { ty:opaque(1),bound:tcx.tys.intern_region(RegionKind::ReStatic) } }];
-    let run = || {
+    // IfEq matching relates opaque arguments with the declared variances (opt_alias_variances):
+    // the bivariant parent lifetime may differ, the invariant captured one may not.
+    let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
+    let var = |r| tcx.tys.intern_region(RegionKind::ReVar(r));
+    let opaque = |parent, captured| tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[var(parent), var(captured)]) }));
+    let run = |generic, pattern| {
+        let tests = [TypeTest { generic_kind:generic, lower_bound:1,span:Span::default(),
+            verify_bound:VerifyBound::IfEq { ty:pattern,bound:tcx.tys.intern_region(RegionKind::ReStatic) } }];
         let defs = vec![definition(NllRegionVariableOrigin::FreeRegion,0);3];
         let relations = UniversalRegionRelations::create(UniversalRegions::new(0,None,vec![(0,Class::Global),(1,Class::Local),(2,Class::Local)]),3,&[]);
-        RegionInferenceContext::solve(&tcx,&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())),compute_sccs_applying_placeholder_outlives_constraints(defs,constraints(&[]),0),relations,LivenessValues::new(3,1),1,&tests,false)
+        RegionInferenceContext::solve(&tcx,&prog,compute_sccs_applying_placeholder_outlives_constraints(defs,constraints(&[]),0),relations,LivenessValues::new(3,1),1,&tests,false)
     };
-    assert!(run().errors.is_empty());
-    tcx.opaques.insert((d,0),crate::tcx::OpaqueDecl::default());
-    assert!(matches!(run().errors.as_slice(),[RegionErrorKind::TypeTest { test:0 }]));
+    assert!(run(opaque(2, 0), opaque(1, 0)).errors.is_empty());
+    assert!(matches!(run(opaque(0, 2), opaque(0, 1)).errors.as_slice(),[RegionErrorKind::TypeTest { test:0 }]));
 }
-fn opaque_witness(tcx: &crate::tcx::Tcx, ty: TyId, universals: usize, edges: &[(usize,usize)]) -> (Vec<(crate::program::DefId,TyId)>,Vec<opaque_types::DeferredOpaqueTypeError>) {
+fn opaque_witness(tcx: &crate::tcx::Tcx, prog: &crate::program::Program, ty: TyId, universals: usize, edges: &[(usize,usize)]) -> (Vec<(crate::program::DefId,TyId)>,Vec<opaque_types::DeferredOpaqueTypeError>) {
     let defs = (0..universals).map(|i| RegionDefinition {
         external_name:Some(tcx.tys.intern_region(if i == 0 { RegionKind::ReStatic } else { RegionKind::ReEarlyParam(i as u32) })),
         ..definition(NllRegionVariableOrigin::FreeRegion,0)
     }).collect();
     let regions = (0..universals).map(|i| (i,if i == 0 { Class::Global } else { Class::Local })).collect();
     let relations = UniversalRegionRelations::create(UniversalRegions::new(0,None,regions),universals,&[]);
-    opaque_types::compute_definition_site_hidden_types(tcx,&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())),defs,&relations,constraints(edges),&[
+    opaque_types::compute_definition_site_hidden_types(tcx,prog,defs,&relations,constraints(edges),&[
         opaque_types::DefiningUse { def_id:crate::program::DefId(0),hidden_type:ty,arg_regions:vec![0,1] }
     ])
 }
 #[test]
 fn v2_nonmember_opaque_argument_is_skipped_and_erased() {
-    use crate::types::variance::{GenericIndices,V};
-    let tcx = crate::tcx::Tcx::new(); let d = crate::program::DefId(40);
-    tcx.opaques.insert((d,0),crate::tcx::OpaqueDecl {
-        variances:Some((GenericIndices { lifetimes:vec![0],..Default::default() },vec![V::Bi])),..Default::default()
-    });
+    // opaque_types/mod.rs:502-514 + member_constraints.rs:179-189: the bivariant (uncaptured)
+    // argument is no member and is erased; the captured one is mapped.
+    let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
     let x = tcx.tys.intern_region(RegionKind::ReVar(2));
-    let hidden = tcx.tys.intern(TyKind::Opaque(d,0,vec![],tcx.tys.intern_region_args(&[x])));
-    let (types,errors) = opaque_witness(&tcx,hidden,3,&[]);
+    let hidden = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[x, tcx.tys.intern_region(RegionKind::ReVar(1))]) }));
+    let (types,errors) = opaque_witness(&tcx,&prog,hidden,3,&[]);
     assert!(errors.is_empty(),"{errors:?}");
-    let TyKind::Opaque(_,_,_,rs) = tcx.tys.kind(types[0].1) else { panic!() };
-    assert_eq!(&*tcx.tys.region_args(*rs),&[RegionId::ERASED]);
+    let TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, regions: rs, .. }) = tcx.tys.kind(types[0].1) else { panic!() };
+    let rs = tcx.tys.region_args(*rs);
+    assert_eq!(rs[0], RegionId::ERASED);
+    assert_ne!(rs[1], RegionId::ERASED);
     // A captured occurrence of the same region must still fail.
     let member = tcx.tys.intern(TyKind::Ref(false,tcx.tys.unit,x));
     let tuple = tcx.tys.intern(TyKind::Tuple(vec![hidden,member]));
-    assert!(matches!(opaque_witness(&tcx,tuple,3,&[]).1.as_slice(),
+    assert!(matches!(opaque_witness(&tcx,&prog,tuple,3,&[]).1.as_slice(),
         [opaque_types::DeferredOpaqueTypeError::UnexpectedHiddenRegion { member_region:2,.. }]));
 }
 #[test]
@@ -252,7 +249,7 @@ fn v3_opaque_substitution_fails_on_first_unknown_region() {
     let tcx = crate::tcx::Tcx::new();
     let reference = |r| tcx.tys.intern(TyKind::Ref(false,tcx.tys.unit,tcx.tys.intern_region(RegionKind::ReVar(r))));
     let hidden = tcx.tys.intern(TyKind::Tuple(vec![reference(2),reference(3)]));
-    let (types,errors) = opaque_witness(&tcx,hidden,4,&[]);
+    let (types,errors) = opaque_witness(&tcx,&test_prog(),hidden,4,&[]);
     assert!(types.is_empty());
     assert!(matches!(errors.as_slice(),[opaque_types::DeferredOpaqueTypeError::UnexpectedHiddenRegion { member_region:2,.. }]));
     // A later invalid (non-renumbered) region would panic if folding continued.
@@ -296,3 +293,26 @@ fn reaudit_implicit_unsizing_to_trait_object_adt_is_blamed_for_static() {
     let explicit = ConstraintCategory::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: false, unsize_to: Some(boxed) };
     assert_eq!(run(&[(1,2,explicit),(2,0,ConstraintCategory::Assignment)],0),ConstraintCategory::Assignment);
 }
+
+#[test]
+fn round13_native_const_aliases_retain_regions_in_matching_and_opaque_folding() {
+    use crate::consts::{AliasConst,AliasConstKind,ConstKind,GenericArg,IsRigid};
+    let tcx = crate::tcx::Tcx::new(); let tys = &tcx.tys;
+    let bound = tys.intern_region(RegionKind::ReBound(0,BoundVar(0)));
+    let actual = tys.intern_region(RegionKind::ReVar(1));
+    let alias = |r| tys.intern_const(ConstKind::Alias(IsRigid::No,AliasConst {
+        kind:AliasConstKind::Anon { def_id:crate::program::DefId(40) },
+        args:vec![GenericArg::Lifetime(r),GenericArg::Const(tys.const_usize(2))].into(),
+    }));
+    let array = |r| tys.intern(TyKind::Array(tys.u32_,alias(r)));
+    assert_eq!(region_context::extract_verify_if_eq(&tcx,&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())),array(bound),bound,array(actual)),Some(actual));
+    let (hidden,errors) = opaque_witness(&tcx,&test_prog(),array(actual),2,&[]);
+    assert!(errors.is_empty(),"{errors:?}");
+    let TyKind::Array(_,ct) = tys.kind(hidden[0].1) else { panic!() };
+    let ConstKind::Alias(_,a) = tys.const_kind(*ct) else { panic!() };
+    assert_eq!(a.args[0],GenericArg::Lifetime(tys.intern_region(RegionKind::ReEarlyParam(1))));
+    let nonmember = tys.intern_region(RegionKind::ReVar(2));
+    assert!(matches!(opaque_witness(&tcx,&test_prog(),array(nonmember),3,&[]).1.as_slice(),
+        [opaque_types::DeferredOpaqueTypeError::UnexpectedHiddenRegion { member_region:2,.. }]));
+}
+fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }

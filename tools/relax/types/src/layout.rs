@@ -1,7 +1,12 @@
+// ported from N:rustc_ty_utils/src/layout.rs @8d1a764
 //! Machine layout of types: size, alignment, field offsets and the scalar
 //! "leaves" a small aggregate is split into when it lives in registers.
 
-use crate::solve::SelectionResult;
+mod closure;
+pub use closure::ClosureStorage;
+
+use crate::next_solver::TraitRef;
+use crate::consts::GenericArg;
 use crate::program::Prim;
 use crate::rir::{Cls, Mem};
 use crate::tcx::Tcx;
@@ -231,6 +236,7 @@ impl<'p> LayoutCx<'p> {
 /// locks (`of` hands out references valid for the Layouts' life; `clear` retires the table
 /// instead of freeing it, since references into it may still be held).
 pub struct Layouts {
+    closure_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
     table: std::sync::atomic::AtomicPtr<LTable>,
     retired: std::sync::Mutex<Vec<Box<LTable>>>,
     /// provided crates' opaque types (provided.rs): rustc's size and align, no fields Relax
@@ -351,7 +357,26 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), opaque: Default::default() }
+        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), opaque: Default::default() }
+    }
+
+    pub fn closure_storage(&self, prog: &crate::program::Program, tcx: &Tcx, ty: TyId) -> ClosureStorage {
+        let ty = tcx.tys.erase_regions(ty);
+        if let Some(storage) = self.closure_storage.get(&ty) { return storage; }
+        let TyKind::Closure(_, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = tcx.tys.kind(ty) else { panic!("closure storage for non-closure") };
+        let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
+        let state = crate::tcx::EvalState::new();
+        let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
+        let body = crate::typeck::instantiate_body(&cx, prog, tcx, *def, args);
+        let storage = ClosureStorage::new(tcx, &body, *ce);
+        self.closure_storage.insert(ty, storage.clone());
+        storage
+    }
+
+    pub fn closure_storage_layout(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, ty: TyId) -> Layout {
+        let storage = self.closure_storage(lcx.prog, tcx, ty);
+        let kind = if storage.fields.is_empty() { Kind::AlwaysSized } else { Kind::MaybeUnsized };
+        self.struct_layout(lcx, tcx, &storage.fields, Repr { pack: 0, align: 0, reorder: true }, kind)
     }
 
     fn table(&self) -> &LTable {
@@ -361,9 +386,42 @@ impl Layouts {
     /// Forgets every cached layout (a type definition was re-collected). The old table stays
     /// allocated until the Layouts are dropped: references into it may still be held.
     pub fn clear(&self) {
+        self.closure_storage.clear();
         let fresh = Box::into_raw(LTable::new());
         let old = self.table.swap(fresh, std::sync::atomic::Ordering::AcqRel);
         self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(unsafe { Box::from_raw(old) });
+    }
+
+    /// `clear`, keeping (copied into the fresh table) the layouts of the types `keep` accepts:
+    /// a declaration edit that only some crates can see keeps the layouts of types made of
+    /// the other crates' items (lead decision 52 R1). The caller holds every lowering out.
+    pub fn clear_except(&self, keep: &dyn Fn(TyId) -> bool) {
+        use std::sync::atomic::Ordering;
+        self.closure_storage.clear();
+        let fresh = LTable::new();
+        let current = self.table.load(Ordering::Acquire);
+        if !current.is_null() {
+            let current = unsafe { &*current };
+            for (ci, c) in current.chunks.iter().enumerate() {
+                let p = c.load(Ordering::Acquire);
+                if p.is_null() { continue; }
+                for k in 0..LCHUNK {
+                    let s = unsafe { &*p.add(k) };
+                    let e = s.layout.load(Ordering::Acquire);
+                    if e.is_null() { continue; }
+                    let t = TyId(((ci << LCHUNK_BITS) | k) as u32);
+                    if !keep(t) { continue; }
+                    let e = unsafe { &*e };
+                    let slot = fresh.slot(t);
+                    slot.unsz.store(s.unsz.load(Ordering::Acquire), Ordering::Release);
+                    slot.layout.store(Box::into_raw(Box::new(LEntry { layout: e.layout.clone(), too_big: e.too_big })), Ordering::Release);
+                }
+            }
+        }
+        let old = self.table.swap(Box::into_raw(fresh), Ordering::AcqRel);
+        if !old.is_null() {
+            self.retired.lock().unwrap_or_else(|e| e.into_inner()).push(unsafe { Box::from_raw(old) });
+        }
     }
 
     /// The layout of `t`. 'static: entries are never freed before the Layouts (the unit) are
@@ -421,7 +479,7 @@ impl Layouts {
             return false;
         }
         match tcx.copy_trait {
-            Some(c) => matches!(tcx.select_trait(&crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), c, t, &[]), SelectionResult::NoSolution),
+            Some(c) => !tcx.type_implements_trait(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), TraitRef { def_id: c, args: vec![GenericArg::Type(t)] }).may_apply(),
             None => false,
         }
     }
@@ -486,7 +544,7 @@ impl Layouts {
             TyKind::Float(_) => scalar(8, Mem::F64, Cls::F64),
             TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => {
                 let is_ref = matches!(k, TyKind::Ref(..));
-                let mut l = if self.is_unsized(lcx, tcx, inner) {
+                let mut l = if self.is_unsized(lcx, tcx, inner) && !matches!(tcx.tys.kind(self.struct_tail_for_codegen(lcx, tcx, inner)), TyKind::Foreign(_)) {
                     let mut l = plain(16, 8, Some(vec![Leaf { off: 0, mem: ptr, cls: Cls::I }, Leaf { off: 8, mem: ptr, cls: Cls::I }]));
                     l.fields = vec![0, 8];
                     l
@@ -505,8 +563,9 @@ impl Layouts {
                 l.niche = nonnull(0);
                 l
             }
-            TyKind::Closure(file, ce, _, up, owner) => {
-                let mut l = (*self.of(lcx, tcx, up)).clone();
+            TyKind::Closure(file, ce, ..) => {
+                let storage = self.closure_storage(lcx.prog, tcx, t);
+                let mut l = self.closure_storage_layout(lcx, tcx, t);
                 // a coroutine: its upvars and state word, then the saved locals of its suspension
                 // points (rustc's coroutine layout: promoted fields, then the variants overlapping)
                 if tcx.coroutines.contains(&(file, ce)) {
@@ -524,7 +583,7 @@ impl Layouts {
                 }
                 // an FnOnce closure's state holds drop flags its body clears: it lives in memory
                 // (one copy), never in registers
-                if tcx.closure_once.contains(&(file, ce, owner)) {
+                if storage.drop_flags {
                     l.leaves = None;
                 }
                 l
@@ -541,8 +600,9 @@ impl Layouts {
                 self.struct_layout(lcx, tcx, &v, Repr { pack: 0, align: 0, reorder: true }, kind)
             }
             // a length that is still a const param / variable has no layout (never instantiated)
-            TyKind::Array(_, n) if crate::types::len_ty(n).is_some() => plain(0, 1, None),
+            TyKind::Array(_, n) if n.try_to_target_usize(&tcx.tys).is_none() => plain(0, 1, None),
             TyKind::Array(e, n) => {
+                let n = n.try_to_target_usize(&tcx.tys).unwrap();
                 let el = self.of(lcx, tcx, e);
                 let stride = self.rup(lcx, el.size, el.align);
                 let full = (stride as u64).saturating_mul(n);
@@ -572,7 +632,7 @@ impl Layouts {
                 if !adt.is_enum {
                     let mut fts = Vec::new();
                     for fi in 0..adt.variants[0].fields.len() {
-                        fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, fi as u32, &args));
+                        fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, fi as u32, &args));
                     }
                     // a live-editable struct (M10): its first version's fields, then the hidden
                     // extension word; the fields edits added live in the extension block
@@ -636,6 +696,7 @@ impl Layouts {
                 }
                 self.enum_layout(lcx, tcx, d, &adt, &args, repr, false)
             }
+            TyKind::Foreign(_) => plain(0, 1, None),
             TyKind::Str => plain(0, 1, None),
             TyKind::Slice(e) => {
                 let el = self.of(lcx, tcx, e);
@@ -647,8 +708,8 @@ impl Layouts {
             // rustc_ty_utils::layout bugs on an escaping bound type. Placeholders
             // are TooGeneric there; here they use the existing generic fallback.
             TyKind::Bound(..) => unreachable!("layout of an escaping bound type"),
-            TyKind::Param(_) | TyKind::Infer(_) | TyKind::Assoc(..) | TyKind::Opaque(..) |
-            TyKind::ConstVal(_) | TyKind::Error | TyKind::Placeholder(_) => plain(0, 1, Some(Vec::new())),
+            TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Alias(..) |
+            TyKind::Const(_) | TyKind::Error | TyKind::Placeholder(_) => plain(0, 1, Some(Vec::new())),
         }
     }
 
@@ -807,7 +868,7 @@ impl Layouts {
         for (vi, v) in adt.variants.iter().enumerate() {
             let mut fts = Vec::new();
             for fi in 0..v.fields.len() {
-                fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, args));
+                fts.push(tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, vi as u32, fi as u32, args));
             }
             let (fl, ls) = self.field_ls(lcx, tcx, &fts);
             vfl.push(fl);
@@ -833,7 +894,7 @@ impl Layouts {
             return Layout { size: u.size, align: u.align, fields: Vec::new(), tag: None, enc: TagEnc::Single(v as u32), variant_fields: vfs, leaves, niche: u.niche, uninhabited: u.uninhabited, ext: None };
         }
         let niche_l = if inhibit { None } else { self.niche_filling(lcx, &vfl, &vls, repr) };
-        let tagged = self.tagged(lcx, adt, &vfl, &vls, repr);
+        let tagged = self.tagged(lcx, tcx, adt, &vfl, &vls, repr);
         match niche_l {
             Some(nl) => {
                 let ns = |l: &Layout| l.niche.map_or(0, |n| n.available());
@@ -906,10 +967,10 @@ impl Layouts {
         })
     }
 
-    fn tagged(&self, lcx: &LayoutCx<'_>, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
+    fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
         // the discriminants of inhabited variants, and the largest gap between them (wrapping)
-        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.variants[i].disc).collect();
+        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).signed_value()).collect();
         ds.sort();
         ds.dedup();
         let discr_signed = match adt.repr_int {
@@ -954,7 +1015,6 @@ impl Layouts {
                 }
             }
         };
-        let min_bytes = min_bytes.min(8);
         let mut prefix_align = min_bytes;
         if adt.repr_c {
             for fl in vfl {
@@ -1002,7 +1062,10 @@ impl Layouts {
         let mask = if ity >= 16 { u128::MAX } else { (1u128 << (ity * 8)) - 1 };
         let tag_niche = Niche { off: 0, bytes: ity, start: (min as u128) & mask, end: (max as u128) & mask };
         let mem = Mem::Int(ity as u8, signed);
-        let leaves = if ity == size { Some(vec![Leaf { off: 0, mem, cls: Cls::I }]) } else { None };
+        let leaves = if ity != size { None } else if ity == 16 {
+            // The scalar tag uses the same two-word ABI as i128/u128.
+            Some(vec![Leaf { off: 0, mem: Mem::Int(8, false), cls: Cls::I }, Leaf { off: 8, mem: Mem::Int(8, signed), cls: Cls::I }])
+        } else { Some(vec![Leaf { off: 0, mem, cls: Cls::I }]) };
         let _ = vls;
         Layout {
             size,
@@ -1037,7 +1100,7 @@ impl Layouts {
 
     fn ty_maybe_unsized(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId, params: &[bool], depth: u32) -> bool {
         match tcx.tys.kind(t).clone() {
-            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
+            TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
             TyKind::Param(i) => params.get(i as usize).copied().unwrap_or(false),
             TyKind::Tuple(v) => match v.last() {
                 Some(l) => self.ty_maybe_unsized(lcx, tcx, *l, params, depth + 1),
@@ -1061,7 +1124,7 @@ impl Layouts {
                         if !self.decl_maybe_unsized(lcx, tcx, d2, depth + 1) {
                             return false;
                         }
-                        let s = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(), d2, 0, adt2.variants[0].fields.len() as u32 - 1, &a2);
+                        let s = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d2, 0, adt2.variants[0].fields.len() as u32 - 1, &a2);
                         self.ty_maybe_unsized(lcx, tcx, s, params, depth + 1)
                     }
                 }
@@ -1082,7 +1145,7 @@ impl Layouts {
         }
         // by type structure only (no layouts: pointee layouts may be recursive)
         let r = match tcx.tys.kind(t) {
-            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
+            TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => true,
             TyKind::Tuple(v) => match v.last() {
                 Some(l) => self.is_unsized(lcx, tcx, *l),
                 None => false,
@@ -1092,7 +1155,7 @@ impl Layouts {
                 Some(adt) if !adt.is_enum && (!adt.is_union || adt.variants[0].fields.len() == 1) => match adt.variants[0].fields.last() {
                     Some(_) => {
                         // a projection tail (`A::Dyn` with `type Dyn = DynRef`) normalized first
-                        let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(), *d, 0, adt.variants[0].fields.len() as u32 - 1, args);
+                        let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *d, 0, adt.variants[0].fields.len() as u32 - 1, args);
                         self.is_unsized(lcx, tcx, ft)
                     }
                     None => false,
@@ -1105,6 +1168,23 @@ impl Layouts {
         r
     }
 
+    /// rustc_middle/src/ty/util.rs:216-226,256-315: struct tails retain the metadata
+    /// kind of their last field, including the thin metadata of an extern type.
+    pub fn struct_tail_for_codegen(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, mut ty: TyId) -> TyId {
+        for _ in 0..crate::next_solver::search_graph::SearchGraphConfig::default().recursion_limit {
+            ty = match tcx.tys.kind(ty) {
+                TyKind::Tuple(fields) => match fields.last() { Some(&last) => last, None => return ty },
+                TyKind::Adt(def, args, _) => {
+                    let Some(adt) = tcx.adts.get(def) else { return ty };
+                    if adt.is_enum || adt.is_union || adt.variants[0].fields.is_empty() { return ty; }
+                    tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), *def, 0, adt.variants[0].fields.len() as u32 - 1, args)
+                }
+                _ => return ty,
+            };
+        }
+        panic!("recursion limit reached computing struct tail");
+    }
+
     /// The innermost dynamically sized tail of `t` and its offset from the start of `t`
     /// (`(0, t)` for str/slice/dyn themselves); None for sized types.
     pub fn unsized_tail(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, t: TyId) -> Option<(u32, TyId)> {
@@ -1112,7 +1192,7 @@ impl Layouts {
             return None;
         }
         match tcx.tys.kind(t).clone() {
-            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => Some((0, t)),
+            TyKind::Foreign(_) | TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) => Some((0, t)),
             TyKind::Tuple(v) => {
                 let last = *v.last()?;
                 let (o, tail) = self.unsized_tail(lcx, tcx, last)?;
@@ -1125,7 +1205,7 @@ impl Layouts {
                     return None;
                 }
                 adt.variants[0].fields.last()?;
-                let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, 0, adt.variants[0].fields.len() as u32 - 1, &args);
+                let ft = tcx.field_ty(lcx.prog, crate::tcx::TypingEnv::fully_monomorphized(lcx.prog), d, 0, adt.variants[0].fields.len() as u32 - 1, &args);
                 let (o, tail) = self.unsized_tail(lcx, tcx, ft)?;
                 let l = self.of(lcx, tcx, t);
                 Some((l.fields[adt.variants[0].fields.len() - 1] + o, tail))

@@ -22,11 +22,11 @@ pub trait TryInto<T>: Sized {
     fn try_into(self) -> Result<T, Self::Error>;
 }
 
-pub trait AsRef<T: ?Sized> {
+pub trait AsRef<T: crate::marker::PointeeSized>: crate::marker::PointeeSized {
     fn as_ref(&self) -> &T;
 }
 
-pub trait AsMut<T: ?Sized> {
+pub trait AsMut<T: crate::marker::PointeeSized>: crate::marker::PointeeSized {
     fn as_mut(&mut self) -> &mut T;
 }
 
@@ -56,7 +56,7 @@ impl<T, U: TryFrom<T>> TryInto<U> for T {
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> AsRef<U> for &'a T
+impl<'a, T: crate::marker::PointeeSized, U: crate::marker::PointeeSized> AsRef<U> for &'a T
 where
     T: AsRef<U>,
 {
@@ -65,7 +65,7 @@ where
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> AsRef<U> for &'a mut T
+impl<'a, T: crate::marker::PointeeSized, U: crate::marker::PointeeSized> AsRef<U> for &'a mut T
 where
     T: AsRef<U>,
 {
@@ -74,7 +74,7 @@ where
     }
 }
 
-impl<'a, T: ?Sized, U: ?Sized> AsMut<U> for &'a mut T
+impl<'a, T: crate::marker::PointeeSized, U: crate::marker::PointeeSized> AsMut<U> for &'a mut T
 where
     T: AsMut<U>,
 {

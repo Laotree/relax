@@ -1,4 +1,6 @@
+// ported from N:rustc_type_ir/src/flags.rs @8d1a764
 //! Cached flags and escaping-binder depth (rustc_type_ir::flags).
+use crate::types::{AliasTy};
 use super::*;
 
 /// The existing query bits retain their semantics; the new region/binder bits
@@ -12,6 +14,8 @@ impl TypeFlags {
     pub const HAS_TY_OPAQUE: Self = Self(F_OPAQUE);
     pub const HAS_TY_PROJECTION: Self = Self(F_PROJ);
     pub const HAS_TY_PARAM: Self = Self(F_PARAM);
+    pub const HAS_CT_BOUND: Self = Self(1 << 17);
+    pub const HAS_CT_PLACEHOLDER: Self = Self(1 << 18);
     pub const HAS_TY_BOUND: Self = Self(1 << 8);
     pub const HAS_TY_PLACEHOLDER: Self = Self(1 << 9);
     pub const HAS_RE_BOUND: Self = Self(1 << 10);
@@ -24,8 +28,8 @@ impl TypeFlags {
     pub const HAS_ERROR: Self = Self(Self::HAS_NON_REGION_ERROR.0 | Self::HAS_RE_ERROR.0);
     pub const HAS_INFER: Self = Self(Self::HAS_TY_INFER.0 | Self::HAS_RE_INFER.0);
     pub const HAS_PARAM: Self = Self(Self::HAS_TY_PARAM.0 | Self::HAS_RE_PARAM.0);
-    pub const HAS_PLACEHOLDER: Self = Self(Self::HAS_TY_PLACEHOLDER.0 | Self::HAS_RE_PLACEHOLDER.0);
-    pub const HAS_BOUND_VARS: Self = Self(Self::HAS_TY_BOUND.0 | Self::HAS_RE_BOUND.0);
+    pub const HAS_PLACEHOLDER: Self = Self(Self::HAS_TY_PLACEHOLDER.0 | Self::HAS_RE_PLACEHOLDER.0 | Self::HAS_CT_PLACEHOLDER.0);
+    pub const HAS_BOUND_VARS: Self = Self(Self::HAS_TY_BOUND.0 | Self::HAS_RE_BOUND.0 | Self::HAS_CT_BOUND.0);
     pub const HAS_REGIONS: Self = Self(Self::HAS_FREE_REGIONS.0 | Self::HAS_RE_BOUND.0 | Self::HAS_RE_ERASED.0);
 
     pub fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
@@ -69,6 +73,35 @@ impl Computation {
         self.add(flags.0, outer, binders);
     }
 
+    fn ct(&mut self, tys: &Types, ct: Const, binders: u32) {
+        use crate::consts::{ConstKind, GenericArg};
+        use TypeFlags as F;
+        match tys.const_kind(ct) {
+            ConstKind::Param(_) => self.flags |= F_PARAM | F_NONCONC,
+            ConstKind::Infer(_) => self.flags |= F_INFER | F_NONCONC,
+            ConstKind::Error => self.flags |= F_ERROR | F_NONCONC,
+            ConstKind::Bound(d, _) => self.add(F::HAS_CT_BOUND.0 | F_NONCONC, d + 1, binders),
+            ConstKind::Placeholder(_) => self.flags |= F::HAS_CT_PLACEHOLDER.0 | F_NONCONC,
+            ConstKind::Alias(_, alias) => {
+                self.flags |= F_PROJ;
+                for arg in &*alias.args {
+                    match *arg {
+                        GenericArg::Type(t) => { self.flags |= tys.fl(t); self.ty(tys, t, binders); }
+                        GenericArg::Const(ct) => self.ct(tys, ct, binders),
+                        GenericArg::Lifetime(r) => self.region(tys, r, binders),
+                    }
+                }
+            }
+            ConstKind::Value(value) => {
+                self.flags |= tys.fl(value.ty);
+                self.ty(tys, value.ty, binders);
+                if let Some(branches) = value.valtree.try_to_branch() {
+                    for &ct in branches { self.ct(tys, ct, binders); }
+                }
+            }
+        }
+    }
+
     fn regions(&mut self, tys: &Types, rs: RegionArgsId, binders: u32) {
         if rs != RegionArgsId::EMPTY {
             for r in tys.region_args(rs).iter() { self.region(tys, *r, binders); }
@@ -77,6 +110,34 @@ impl Computation {
 }
 
 impl Types {
+    pub(crate) fn const_flags(&self, ct: Const) -> (u32, DebruijnIndex) {
+        let mut c = Computation::default();
+        c.ct(self, ct, 0);
+        (c.flags, c.outer)
+    }
+
+    pub(crate) fn const_depth(&self, ct: Const) -> u16 {
+        use crate::consts::{ConstKind, GenericArg};
+        let mut depth = 0;
+        match self.const_kind(ct) {
+            ConstKind::Alias(_, alias) => for arg in &*alias.args {
+                depth = depth.max(match *arg {
+                    GenericArg::Type(ty) => self.entry(ty).depth,
+                    GenericArg::Const(ct) => self.const_depth(ct),
+                    GenericArg::Lifetime(_) => 0,
+                });
+            },
+            ConstKind::Value(value) => {
+                depth = self.entry(value.ty).depth;
+                if let Some(branches) = value.valtree.try_to_branch() {
+                    for &ct in branches { depth = depth.max(self.const_depth(ct)); }
+                }
+            }
+            _ => {}
+        }
+        depth.saturating_add(1)
+    }
+
     pub fn flags(&self, t: TyId) -> TypeFlags { TypeFlags(self.fl(t)) }
 
     /// One past the greatest escaping de Bruijn index, or zero when all bound
@@ -105,11 +166,11 @@ impl Types {
             TyKind::Tuple(v) => for t in v { c.ty(self, *t, 0); },
             TyKind::Array(t, n) => {
                 c.ty(self, *t, 0);
-                if let Some(t) = len_ty(*n) { c.ty(self, t, 0); }
+                c.ct(self, *n, 0);
             }
             TyKind::Slice(t) | TyKind::Ptr(_, t) => c.ty(self, *t, 0),
             TyKind::Ref(_, t, r) => { c.ty(self, *t, 0); c.region(self, *r, 0); }
-            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Assoc(_, v, rs) | TyKind::Opaque(_, _, v, rs) => {
+            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
                 for t in v { c.ty(self, *t, 0); }
                 c.regions(self, *rs, 0);
             }
@@ -123,9 +184,10 @@ impl Types {
                 c.regions(self, *rs, 1);
                 c.region(self, *r, 0);
             }
-            TyKind::Closure(_, _, s, u, o) => for t in [s, u, o] { c.ty(self, *t, 0); },
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => for t in [s, u, o, closure_kind_ty] { c.ty(self, *t, 0); },
+            TyKind::Const(ct) => c.ct(self, *ct, 0),
             TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) |
-            TyKind::Never | TyKind::Param(_) | TyKind::Infer(_) | TyKind::ConstVal(_) | TyKind::Error => {}
+            TyKind::Foreign(_) | TyKind::Never | TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error => {}
         }
         (c.flags, c.outer)
     }

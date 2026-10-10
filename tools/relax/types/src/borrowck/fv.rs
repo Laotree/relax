@@ -117,6 +117,11 @@ impl SummaryCx {
 
 /// Per argument of `d<args>`: its field-view summary.
 pub fn summaries(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], depth: u32) -> Rc<Vec<Summary>> {
+    // Field-view summaries describe places, not outlives relations. Their
+    // independent body check cannot inherit the caller's inference variables.
+    // ty/erase_regions.rs: retain generic arity and nested signature binders.
+    let erased: Vec<_> = args.iter().map(|&ty| tcx.tys.erase_regions(ty)).collect();
+    let args = erased.as_slice();
     let key = (tx.cx.typing_env, d, args.to_vec());
     if let Some((s, reach)) = tx.fv.cache.borrow().get(&key).cloned() {
         tx.fv.reached_by_callers(&reach);
@@ -153,12 +158,15 @@ fn compute(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], depth: u
     if !matches!(prog.def(d).kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) {
         return Vec::new();
     }
-    let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&tx.cx, prog, tcx, d, args))) {
-        Ok(b) if b.errors.is_empty() && b.body.is_some() => b,
-        Err(p) if crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
+    // T10 (conform): generic callers can leave projections unnormalizable here.
+    // normalize_erasing_regions.rs:172-186: failure means the existing unknown
+    // summary, which keeps the whole borrow; definition-body summaries belong to T10.
+    let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::try_instantiate_body(&tx.cx, prog, tcx, d, args))) {
+        Ok(Ok(b)) if b.errors.is_empty() && b.body.is_some() => b,
+        Err(p) if crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
         _ => return Vec::new(),
     };
-    let env = crate::tcx::TypingEnv { param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::Borrowck };
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
     let mut callee = Tx::new(prog, tcx, env, tx.cx.state);
     callee.fv = tx.fv.clone();
     if body.args.iter().any(|a| matches!(tcx.tys.kind(*a), TyKind::Param(_))) {
@@ -170,8 +178,8 @@ fn compute(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], depth: u
         b.build_fn();
     }));
     let ok = match built {
-        Err(p) if crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
-        r => r.is_ok(),
+        Err(p) if crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
+        result => result.is_ok(),
     };
     if !ok || b.out.unsupported.is_some() {
         return Vec::new();

@@ -736,6 +736,7 @@ pub trait FusedIterator: Iterator {}
 
 pub unsafe trait TrustedLen: Iterator {}
 
+#[rustc_skip_during_method_dispatch(array, boxed_slice)]
 pub trait IntoIterator {
     type Item;
     type IntoIter: Iterator<Item = Self::Item>;

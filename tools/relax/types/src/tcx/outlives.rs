@@ -31,6 +31,7 @@ impl Tcx {
         for d in defs {
             let def = prog.def(d);
             if !matches!(def.kind, DefKind::Trait | DefKind::AssocTy | DefKind::TypeAlias) { continue; }
+            let mark = crate::program::missing_mark();
             let mut env = self.item_env(prog,d);
             if def.kind == DefKind::Trait {
                 env.names.insert(0,prog.syms.get("Self").unwrap_or(u32::MAX));
@@ -56,6 +57,7 @@ impl Tcx {
                 }
             }
             self.nominal_region_contracts.insert(d,contract);
+            if crate::program::missing_since(mark).is_empty() { self.contracts_waiting.remove(&d); } else { self.contracts_waiting.insert(d); }
         }
     }
 
@@ -98,7 +100,17 @@ impl Tcx {
             let pp = prog.def(parent);
             if matches!(pp.kind, DefKind::Impl | DefKind::Trait) {
                 let caller = !self.impl_trait.contains_key(&parent);
-                self.contract_generics(cx, prog, parent, env, caller, &mut c);
+                // collect/predicates_of.rs:96-101 + gather_explicit_predicates_of: the
+                // parent's predicates are lowered in the parent's own item (its
+                // resolve_bound_vars table, resolve_bound_vars.rs:253-285); the child's
+                // table holds only the child's lifetime uses, so a lifetime written in the
+                // impl/trait header (`T: 'static`, `E: 'a`) must be resolved through the
+                // parent's. The parent's early parameters keep their indices in the child.
+                let mut parent_env = env.clone();
+                let enabled = env.regions.enabled;
+                parent_env.regions = self.bound_region_env(prog, parent);
+                parent_env.regions.enabled = enabled;
+                self.contract_generics(cx, prog, parent, &parent_env, caller, &mut c);
                 if pp.kind == DefKind::Impl {
                     if let Some(t) = self.impl_self.get(&parent) {
                         c.assumed_wf.push(*t);
@@ -212,7 +224,7 @@ impl Tcx {
             ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) => g,
             _ => return,
         };
-        let region = |n| env.regions.resolve(&self.tys, prog, pd.file, Some(n));
+        let region = |n| env.regions.resolve(cx.infcx, &self.tys, prog, pd.file, Some(n));
         for p in f.ast.list(g.params) {
             match p.kind {
                 GenericParamKind::Lifetime(bs) => {
@@ -288,7 +300,7 @@ impl Tcx {
 
     fn contract_type_bounds(
         &self,
-        _cx: &EvalCx<'_>,
+        cx: &EvalCx<'_>,
         prog: &Program,
         file: u32,
         module: u32,
@@ -300,7 +312,7 @@ impl Tcx {
     ) {
         for b in bounds {
             let r = match b {
-                ast::Bound::Lifetime(n) => env.regions.resolve(&self.tys, prog, file, Some(*n)),
+                ast::Bound::Lifetime(n) => env.regions.resolve(cx.infcx, &self.tys, prog, file, Some(*n)),
                 ast::Bound::Trait {
                     path, maybe: false, ..
                 } if self

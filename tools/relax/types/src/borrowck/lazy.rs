@@ -395,7 +395,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
     let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
     src.lower_priority(); src.wait_start();
     loop {
-        if STOP.load(Ordering::SeqCst) { return; }
+        if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
         let quiet = src.quiet_ns();
         if quiet < QUIET_NS {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
@@ -404,7 +404,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
         let (rank, item) = {
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if STOP.load(Ordering::SeqCst) { return; }
+                if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
                 settle_finished_check();
                 if let Some(item) = guard.as_mut().and_then(Queue::pop) { break item; }
                 if verbose && std::env::var_os("RELAX_GANDALF_STATS").is_some() && CHECKED.load(Ordering::Relaxed) > 0 && !IDLE_REPORTED.swap(true, Ordering::Relaxed) {
@@ -500,14 +500,15 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
                 checked_identity = Some(args.clone());
                 return;
             }
-            let asked = cx.state.const_asked.get();
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _p = crate::preempt::Preemptible::on();
+                crate::preempt::point();
                 let _origin = crate::clock::origin("gandalf");
                 phase.set("typeck");
                 // a live patch waiting for the front end's write lock stops this check
                 // (preempt): it is queued again below
                 let _p = crate::preempt::Preemptible::on();
-                let body = crate::typeck::check_fn(cx, prog, tcx, *def, args);
+                let body = tcx.typeck(prog, *def);
                 if !body.errors.is_empty() { phase.set("typeck (errors)"); return None; }
                 phase.set("borrowck");
                 Some(super::check_body(cx, prog, tcx, &body))
@@ -518,11 +519,6 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
                 return;
             }
             let result = result.map_err(|e| panic_message(&e));
-            // FrontSource defers this check if it requested a constant. Keep the
-            // instance Pending and publish only the eventual completed attempt.
-            if cx.state.const_asked.get() != asked || tcx.has_blocked_consts() {
-                return;
-            }
             if let Err(msg) = &result {
                 PANICS.fetch_add(1, Ordering::Relaxed);
                 let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
@@ -562,7 +558,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             continue;
         }
         if preempted {
-            if STOP.load(Ordering::SeqCst) { return; }
+            if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
             PREEMPTED.fetch_add(1, Ordering::Relaxed);
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             if crate::preempt::is_stopped() { return; }
@@ -639,14 +635,10 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
         done.push((def, args.clone()));
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let state = crate::tcx::EvalState::new();
-            let cx = crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-            let fresh;
-            let body = match req.checked.iter().find(|b| b.def == def && b.args == args) {
-                Some(b) => b,
-                None => { fresh = crate::typeck::check_fn(&cx, prog, tcx, def, &args); &fresh }
-            };
+            let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
+            let body = tcx.typeck(prog, def);
             if !body.errors.is_empty() { return None; }
-            Some(super::check_body_in(&cx, prog, tcx, body, req.fv))
+            Some(super::check_body_in(&cx, prog, tcx, &body, req.fv))
         })).map_err(|e| panic_message(&e));
         let errors = result.as_ref().ok().and_then(|v| v.as_ref()).map_or(0, |v| v.errors.len());
         let events = finish_verdict(prog, 0, req.epoch, def, &args, result, req.origin);
@@ -681,8 +673,8 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
         let Some(args) = super::identity_args(tcx, prog, d) else { continue; };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let state = crate::tcx::EvalState::new();
-            let cx = crate::tcx::EvalCx::new(prog, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-            let body = crate::typeck::check_fn(&cx, prog, tcx, d, &args);
+            let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
+            let body = tcx.typeck(prog, d);
             if !body.errors.is_empty() { return None; }
             let mut v = super::check_body(&cx, prog, tcx, &body);
             v.errors.retain_mut(|e| {

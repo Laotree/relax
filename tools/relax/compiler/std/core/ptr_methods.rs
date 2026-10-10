@@ -1,12 +1,13 @@
 //! Inherent methods of `*const T` and `*mut T` (Relax only: impls on primitive types).
 //! Address arithmetic is `wrapping`-exact like core's; methods that need `T: Sized` live in
-//! the `impl<T>` blocks, address-only ones in `impl<T: ?Sized>`.
+//! the `impl<T>` blocks, address-only ones in `impl<T: PointeeSized>` (library/core/src/ptr/
+//! const_ptr.rs:7, mut_ptr.rs:8).
 
 use crate::cmp::Ordering;
 use crate::intrinsics_mem as im;
 
 #[cfg(not(relax_check))]
-impl<T: ?Sized> *const T {
+impl<T: crate::marker::PointeeSized> *const T {
     pub fn is_null(self) -> bool {
         (self as *const u8 as usize) == 0
     }
@@ -134,7 +135,7 @@ impl<T> *const [T] {
 }
 
 #[cfg(not(relax_check))]
-impl<T: ?Sized> *mut T {
+impl<T: crate::marker::PointeeSized> *mut T {
     pub fn is_null(self) -> bool {
         (self as *const u8 as usize) == 0
     }
@@ -275,7 +276,7 @@ impl<T> *mut [T] {
 
 /// (address, metadata) of a possibly fat raw pointer (metadata 0 for thin pointers), so raw
 /// pointer comparisons see the length / vtable like core's.
-pub(crate) fn ptr_words<T: ?Sized>(p: *const T) -> (usize, usize) {
+pub(crate) fn ptr_words<T: crate::marker::PointeeSized>(p: *const T) -> (usize, usize) {
     let words = unsafe { im::size_of::<*const T>() } / unsafe { im::size_of::<usize>() };
     let base = &p as *const *const T as *const usize;
     unsafe {
@@ -289,47 +290,47 @@ pub(crate) fn ptr_words<T: ?Sized>(p: *const T) -> (usize, usize) {
 
 // Raw pointers compare by address (fat pointers: address, then metadata as core; Relax
 // compares the address part).
-impl<T: ?Sized> PartialEq for *const T {
+impl<T: crate::marker::PointeeSized> PartialEq for *const T {
     fn eq(&self, other: &*const T) -> bool {
         ptr_words(*self) == ptr_words(*other)
     }
 }
-impl<T: ?Sized> Eq for *const T {}
-impl<T: ?Sized> PartialEq for *mut T {
+impl<T: crate::marker::PointeeSized> Eq for *const T {}
+impl<T: crate::marker::PointeeSized> PartialEq for *mut T {
     fn eq(&self, other: &*mut T) -> bool {
         ptr_words(*self as *const T) == ptr_words(*other as *const T)
     }
 }
-impl<T: ?Sized> Eq for *mut T {}
-impl<T: ?Sized> PartialOrd for *const T {
+impl<T: crate::marker::PointeeSized> Eq for *mut T {}
+impl<T: crate::marker::PointeeSized> PartialOrd for *const T {
     fn partial_cmp(&self, other: &*const T) -> Option<Ordering> {
         ptr_words(*self as *const T).partial_cmp(&ptr_words(*other as *const T))
     }
 }
-impl<T: ?Sized> Ord for *const T {
+impl<T: crate::marker::PointeeSized> Ord for *const T {
     fn cmp(&self, other: &*const T) -> Ordering {
         ptr_words(*self as *const T).cmp(&ptr_words(*other as *const T))
     }
 }
-impl<T: ?Sized> PartialOrd for *mut T {
+impl<T: crate::marker::PointeeSized> PartialOrd for *mut T {
     fn partial_cmp(&self, other: &*mut T) -> Option<Ordering> {
         ptr_words(*self as *const T).partial_cmp(&ptr_words(*other as *const T))
     }
 }
-impl<T: ?Sized> Ord for *mut T {
+impl<T: crate::marker::PointeeSized> Ord for *mut T {
     fn cmp(&self, other: &*mut T) -> Ordering {
         ptr_words(*self as *const T).cmp(&ptr_words(*other as *const T))
     }
 }
-impl<T: ?Sized> Clone for *const T {
+impl<T: crate::marker::PointeeSized> Clone for *const T {
     fn clone(&self) -> *const T {
         *self
     }
 }
-impl<T: ?Sized> Copy for *const T {}
-impl<T: ?Sized> Clone for *mut T {
+impl<T: crate::marker::PointeeSized> Copy for *const T {}
+impl<T: crate::marker::PointeeSized> Clone for *mut T {
     fn clone(&self) -> *mut T {
         *self
     }
 }
-impl<T: ?Sized> Copy for *mut T {}
+impl<T: crate::marker::PointeeSized> Copy for *mut T {}

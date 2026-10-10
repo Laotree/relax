@@ -209,3 +209,9 @@ fn a05_many_points() {
     let f2 = many_points(7);
     println!("| {} {}", block_on(f2), block_on(f1));
 }
+
+async fn generic_await<F: Future>(future: F) -> F::Output { future.await }
+#[test]
+fn rigid_future_output_in_generic_body() {
+    assert_eq!(block_on(generic_await(std::future::ready(23u32))), 23);
+}

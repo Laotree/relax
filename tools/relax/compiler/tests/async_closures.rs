@@ -71,3 +71,20 @@ fn c02_async_fn_bounds() {
     let s = String::from("own");
     println!("| {}", block_on(apply4(async move |x| { Yield(false).await; format!("{s}{x}") })));
 }
+
+// rustc_ty_utils/src/instance.rs:320-409: fn items and fn pointers use
+// the FnPtr shim for both ordinary and async call traits.
+#[test]
+fn c03_function_items_and_pointers_returning_futures() {
+    fn ready(x: u32) -> std::future::Ready<u32> { std::future::ready(x + 1) }
+    async fn consume<F: AsyncFnOnce(u32) -> u32>(f: F) -> u32 { f(8).await }
+    let pointer: fn(u32) -> std::future::Ready<u32> = ready;
+    assert_eq!(block_on(apply(ready, 3)), 9);
+    assert_eq!(block_on(apply(pointer, 3)), 9);
+    assert_eq!(block_on(apply2(ready, 3)), 9);
+    assert_eq!(block_on(apply2(pointer, 3)), 9);
+    assert_eq!(block_on(apply3(ready)), 5);
+    assert_eq!(block_on(apply3(pointer)), 5);
+    assert_eq!(block_on(consume(ready)), 9);
+    assert_eq!(block_on(consume(pointer)), 9);
+}

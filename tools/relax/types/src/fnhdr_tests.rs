@@ -38,13 +38,13 @@ fn fnhdr_identity_relations_and_folding() {
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let ps = &tcx.fn_sig(&prog, named(&prog, "probe")).unwrap().params;
     let state = EvalState::new();
-    let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
     for i in 0..ps.len() {
         for j in 0..ps.len() {
             assert_eq!(ps[i] == ps[j], i == j);
             assert_eq!(crate::stable::type_hash(&prog, &tcx, ps[i]) == crate::stable::type_hash(&prog, &tcx, ps[j]), i == j);
-            assert_eq!(tcx.impl_matches(&cx, ps[i], ps[j]), i == j);
-            assert_eq!(tcx.match_ty(&cx, ps[i], ps[j], &mut Vec::new()), i == j);
+            let infcx = crate::infer::InferCtxt::new(&tcx, cx.typing_env.mode, cx.typing_env.limit);
+            assert_eq!(infcx.at(&prog, Default::default()).eq(ps[i], ps[j]).is_ok(), i == j);
         }
         let header = match tcx.tys.kind(ps[i]) { TyKind::FnPtr(_, _, h, _) => *h, _ => panic!() };
         let folded = tcx.tys.subst(ps[i], &[tcx.tys.unit]);
@@ -76,8 +76,8 @@ fn check(source: &str, reject: bool) {
     let (prog, tcx) = collect(source);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let state = EvalState::new();
-    let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
-    let body = crate::typeck::check_fn(&cx, &prog, &tcx, named(&prog, "probe"), &[]);
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
+    let body = crate::typeck::instantiate_body(&cx, &prog, &tcx, named(&prog, "probe"), &[]);
     assert_eq!(!body.errors.is_empty(), reject, "{:?}", body.errors);
     if reject {
         assert!(body.errors.iter().any(|e| e.contains("mismatched types") || e.contains("E0061")), "{:?}", body.errors);

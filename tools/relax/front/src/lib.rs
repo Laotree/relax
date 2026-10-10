@@ -7,6 +7,8 @@ pub use relax_base::*;
 pub mod lit;
 pub mod parser;
 pub mod program;
+pub mod def_collector;
+pub mod assoc;
 pub mod macros;
 pub mod preload;
 pub mod crate_image;
@@ -30,3 +32,4 @@ pub mod diagnostics;
 pub mod source;
 
 pub mod lang_items;
+pub mod target_features;

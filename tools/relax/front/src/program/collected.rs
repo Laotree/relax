@@ -13,7 +13,7 @@ crate::collected_fields!(ImplData, def, file, item, module, items);
 crate::collected_fields!(Import, module, global, segs, bind, glob, is_pub, done, file, pos);
 
 /// Binding tables read in place from the image (ImageMap).
-macro_rules! tables { ($op:ident) => { $op!(block_mods, block_owner, item_defs); }; }
+macro_rules! tables { ($op:ident) => { $op!(block_mods, block_owner, item_defs, node_id_to_def_id, legacy_const_args, def_id_to_node_id, impl_trait_in_trait_data, associated_types_for_impl_traits, opaque_to_rpitit, opaque_types_defined_by, trait_item_def_id, def_disambiguators, child_definitions); }; }
 /// Record lists read in place from the image (ImageVec).
 macro_rules! lists { ($op:ident) => { $op!(mods, impls, imports, variants, traits, file_blocks); }; }
 
@@ -50,6 +50,20 @@ impl Program {
         // A library and its binary can share a name; their macro-table shadowing requires
         // the ordinary loader if either changes.
         if self.crates[crates..].iter().any(|c| names.contains(self.syms.str(c.name))) { return None; }
+        self.node_id_to_def_id.retain(|(f, _), d| (*f as usize) < s.files && (d.0 as usize) < s.defs);
+        self.legacy_const_args.retain(|d, _| (d.0 as usize) < s.defs);
+        Arc::make_mut(&mut self.legacy_const_attrs).retain(|d, _| (d.0 as usize) < s.defs);
+        self.def_id_to_node_id.retain(|d, _| (d.0 as usize) < s.defs);
+        self.impl_trait_in_trait_data.retain(|d, _| (d.0 as usize) < s.defs);
+        self.associated_types_for_impl_traits.retain(|d, _| (d.0 as usize) < s.defs);
+        self.opaque_to_rpitit.retain(|d, _| (d.0 as usize) < s.defs);
+        self.opaque_types_defined_by.retain(|d, _| (d.0 as usize) < s.defs);
+        self.trait_item_def_id.retain(|d, _| (d.0 as usize) < s.defs);
+        self.repeat_expr_counts.retain(|d| (d.0 as usize) < s.defs);
+        self.collected_definitions.retain(|d| (d.0 as usize) < s.defs);
+        self.legacy_call_names.retain(|d, _| (d.0 as usize) < s.defs);
+        self.def_disambiguators.retain(|(d, _, _), _| (d.0 as usize) < s.defs);
+        self.child_definitions.retain(|(d, _, _, _), child| (d.0 as usize) < s.defs && (child.0 as usize) < s.defs);
         self.crates.truncate(crates);
         self.load_recipe.truncate(crates);
         self.collected_starts.truncate(crates);
@@ -99,7 +113,7 @@ impl Program {
         )+ }; }
         assert!(self.syms.names().eq(rebuilt.syms.names()), "collected symbols differ");
         compare!(file_paths, file_crate, defs, mods, variants, impls, traits, imports,
-            block_mods, block_owner, item_defs, prim_defs, prelude_crate, imports_of_module, file_blocks);
+            block_mods, block_owner, item_defs, prim_defs, prelude_crate, imports_of_module, file_blocks, node_id_to_def_id, legacy_const_args, legacy_const_attrs, def_id_to_node_id, impl_trait_in_trait_data, associated_types_for_impl_traits, opaque_to_rpitit, opaque_types_defined_by, trait_item_def_id, repeat_expr_counts, collected_definitions, def_disambiguators, child_definitions);
         assert_eq!(self.crates.len(), rebuilt.crates.len(), "collected crate count");
         for (a, b) in self.crates.iter().zip(&rebuilt.crates) {
             assert_eq!((a.name, a.root_mod, a.edition, &a.deps, &a.cfg.set, a.proc_macro, &a.root_path),
@@ -130,7 +144,7 @@ impl Program {
                 || d.scope as usize >= self.mods.len() || d.file as usize >= self.files.len()
                 || (d.parent != NO_DEF && d.parent.0 as usize >= self.defs.len())) { return None; }
         let mut w = Vec::new();
-        2u32.put(&mut w);
+        4u32.put(&mut w);
         let late = self.syms.late.lock().unwrap_or_else(|e| e.into_inner());
         late.1.len().put(&mut w);
         for s in &late.1 { s.to_string().put(&mut w); }
@@ -148,7 +162,7 @@ impl Program {
         self.boot_files.min(self.files.len()).put(&mut w);
         put!(file_paths, file_crate, prim_defs, prelude_crate,
             imports_of_module, front_dep_names, front_probes, front_macro_fragments,
-            part_interned, deferred_imports, deferred_waits, deferred_binds);
+            part_interned, deferred_imports, deferred_waits, deferred_binds, legacy_const_attrs);
         let skipped: Vec<(u32, (String, (String, bool)))> = self.skipped_files.iter()
             .map(|(m, (path, dir, mod_rs))| (*m, (path.clone(), (dir.clone(), *mod_rs)))).collect();
         skipped.put(&mut w);
@@ -173,6 +187,8 @@ impl Program {
         tables!(table);
         macro_rules! list { ($($f:ident),+) => { $(self.$f.write_image(&mut image, &mut id);)+ }; }
         lists!(list);
+        self.repeat_expr_counts.write_image(&mut image, &mut id);
+        self.collected_definitions.write_image(&mut image, &mut id);
         Some(image)
     }
 
@@ -186,7 +202,7 @@ impl Program {
         };
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
-        if u32::get(&mut r)? != 2 { return None; }
+        if u32::get(&mut r)? != 4 { return None; }
         let mut p = Program::new(session);
         p.syms = Interner::from_image(&image, 3, 3)?;
         for s in Vec::<String>::get(&mut r)? { p.syms.intern_late(&s); }
@@ -215,7 +231,7 @@ impl Program {
         p.macros = crate::collected::Deferred::mapped(image.bytes(2, 2)?);
         get!(collected_starts, lines_loaded, boot_files, file_paths, file_crate, prim_defs, prelude_crate,
             imports_of_module, front_dep_names, front_probes, front_macro_fragments,
-            part_interned, deferred_imports, deferred_waits, deferred_binds);
+            part_interned, deferred_imports, deferred_waits, deferred_binds, legacy_const_attrs);
         p.skipped_files = Vec::<(u32, (String, (String, bool)))>::get(&mut r)?.into_iter()
             .map(|(m, (path, (dir, mod_rs)))| (m, (path, dir, mod_rs))).collect();
         let (mut k, mut id) = (6, 6);
@@ -223,6 +239,8 @@ impl Program {
         tables!(table);
         macro_rules! list { ($($f:ident),+) => { $(p.$f = crate::collected::ImageVec::read_image(&image, &mut k, &mut id)?;)+ }; }
         lists!(list);
+        p.repeat_expr_counts = crate::collected::ImageSet::read_image(&image, &mut k, &mut id)?;
+        p.collected_definitions = crate::collected::ImageSet::read_image(&image, &mut k, &mut id)?;
         if k != image.len() { return None; }
         phase("bindings");
         let n = usize::get(&mut r)?;
@@ -248,5 +266,52 @@ impl Program {
         // the reload index is built from the restored tables by its first user
         p.reload = OnceLock::new();
         Some(p)
+    }
+}
+
+impl crate::collected::ImageKey for crate::def_collector::NodeId {
+    fn image_key(&self) -> u128 {
+        use crate::def_collector::NodeId::*;
+        let (tag, id) = match *self {
+            AnonConst(x) => (0u128, x.0), InlineConst(x) => (1, x.0), OpaqueTy(x) => (2, x.0),
+            AsyncReturn(x) => (3, x.0), AsyncBody(x) => (4, x.0), Closure(x) => (5, x.0), Field(x) => (6, x),
+        };
+        tag << 32 | id as u128
+    }
+}
+impl crate::collected::ImageKey for (DefId, DefKind, Option<Sym>) {
+    fn image_key(&self) -> u128 {
+        ((self.0.0 as u128) << 64) | (def_kind_key(self.1) << 33) | self.2.map_or(0, |s| s as u128 + 1)
+    }
+}
+impl crate::collected::ImageKey for (DefId, DefKind, Option<Sym>, u32) {
+    fn image_key(&self) -> u128 { (self.0, self.1, self.2).image_key() << 32 | self.3 as u128 }
+}
+
+fn def_kind_key(kind: DefKind) -> u128 {
+    match kind {
+        DefKind::Mod => 0,
+        DefKind::Fn => 1,
+        DefKind::Struct => 2,
+        DefKind::Union => 3,
+        DefKind::Enum => 4,
+        DefKind::Variant => 5,
+        DefKind::Const => 6,
+        DefKind::Static => 7,
+        DefKind::Trait => 8,
+        DefKind::Impl => 9,
+        DefKind::TypeAlias => 10,
+        DefKind::AssocFn => 11,
+        DefKind::AssocConst => 12,
+        DefKind::AssocTy => 13,
+        DefKind::ForeignFn => 14,
+        DefKind::ForeignStatic => 15,
+        DefKind::ForeignTy => 16,
+        DefKind::AnonConst => 17,
+        DefKind::OpaqueTy => 18,
+        DefKind::Closure => 19,
+        DefKind::Field => 20,
+        DefKind::MacroRules => 21,
+        DefKind::Prim(p) => 22 | ((p as u128) << 8),
     }
 }

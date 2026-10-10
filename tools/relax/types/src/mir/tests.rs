@@ -193,7 +193,7 @@ fn local_range_in_operands_and_projection_indices() {
     let tcx = Tcx::new();
     let mut b = body(&tcx);
     b.local_decls[1].ty = tcx.tys.usize_;
-    b.local_decls[2].ty = tcx.tys.intern(TyKind::Array(tcx.tys.i32_, 4));
+    b.local_decls[2].ty = tcx.tys.intern(TyKind::Array(tcx.tys.i32_, tcx.tys.const_usize(4)));
     let mut p = local(2);
     p.projection.push(PlaceElem::Index(Local(1)));
     b.basic_blocks[0].statements.push(stmt(StatementKind::PlaceMention(p.clone())));
@@ -255,7 +255,7 @@ fn place_mention_validated_in_all_runtime_phases() {
         let mut b = body(&tcx);
         b.phase = MirPhase::Runtime(phase);
         b.local_decls[1].ty = tcx.tys.usize_;
-        b.local_decls[2].ty = tcx.tys.intern(TyKind::Array(tcx.tys.i32_, 4));
+        b.local_decls[2].ty = tcx.tys.intern(TyKind::Array(tcx.tys.i32_, tcx.tys.const_usize(4)));
         let mut p = local(2);
         p.projection.push(PlaceElem::Index(Local(1)));
         b.basic_blocks[0].statements.push(stmt(StatementKind::PlaceMention(p.clone())));
@@ -398,7 +398,7 @@ fn promoted_body_has_independent_indices() {
         Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
             span: Span::default(),
             user_ty: Some(UserTypeAnnotationIndex(0)),
-            const_: Const::Unevaluated { def: DefId(0), args: vec![tcx.tys.i32_], promoted: Some(PromotedId(0)) },
+            const_: Const::Unevaluated { def: DefId(0), args: vec![crate::consts::GenericArg::Type(tcx.tys.i32_)], promoted: Some(PromotedId(0)) },
         }))),
     )));
     good(&b, &tcx);
@@ -585,7 +585,7 @@ fn visitor_finds_assert_payload_and_repeat_constant() {
     term(&mut b, TerminatorKind::Return);
     b.basic_blocks[0].statements.push(stmt(StatementKind::Assign(
         local(2),
-        Rvalue::Repeat(copy(1), Const::Unevaluated { def: DefId(1), args: vec![TyId(u32::MAX)], promoted: None }),
+        Rvalue::Repeat(copy(1), Const::Unevaluated { def: DefId(1), args: vec![crate::consts::GenericArg::Type(TyId(u32::MAX))], promoted: None }),
     )));
     bad(&b, &tcx, "type is out of range");
 }

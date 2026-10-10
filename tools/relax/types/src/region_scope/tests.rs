@@ -17,8 +17,8 @@ fn collect(source: &str, edition: u16) -> (Program, Tcx, Body) {
     let mut def = None;
     for i in 0..prog.defs.len() { if prog.name(DefId(i as u32)) == "probe" { def = Some(DefId(i as u32)); } }
     let state = EvalState::new();
-    let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
-    let body = crate::typeck::check_fn(&cx, &prog, &tcx, def.unwrap(), &[]);
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
+    let body = crate::typeck::instantiate_body(&cx, &prog, &tcx, def.unwrap(), &[]);
     assert!(body.errors.is_empty(), "{:?}", body.errors);
     (prog, tcx, body)
 }
@@ -178,7 +178,7 @@ fn cross_check(source: &str, edition: u16, extended: bool, tail: bool) -> bool {
     let (p, tcx, b) = collect(source, edition);
     let tree = region_scope_tree(&p, &b).unwrap();
     let state = EvalState::new();
-    let tx = crate::borrowck::tyx::Tx::new(&p, &tcx, TypingEnv::fully_monomorphized(), &state);
+    let tx = crate::borrowck::tyx::Tx::new(&p, &tcx, TypingEnv::fully_monomorphized(&p), &state);
     let mut builder = crate::borrowck::build::Build::new(&tx, &b, "probe".into());
     builder.build_body();
     let bir = &builder.out;
@@ -274,8 +274,8 @@ fn region_scope_cross_edition_macro_and_forwarded_fragment() {
         p.resolve_imports(); let mut tcx = Tcx::new(); tcx.collect(&p);
         let mut def = None;
         for i in 0..p.defs.len() { if p.name(DefId(i as u32)) == "probe" { def = Some(DefId(i as u32)); } }
-        let state = EvalState::new(); let cx = EvalCx::new(&p, TypingEnv::fully_monomorphized(), &state);
-        let b = crate::typeck::check_fn(&cx, &p, &tcx, def.unwrap(), &[]);
+        let state = EvalState::new(); let cx = EvalCx::new(&p, &tcx, TypingEnv::fully_monomorphized(&p), &state);
+        let b = crate::typeck::instantiate_body(&cx, &p, &tcx, def.unwrap(), &[]);
         assert!(b.errors.is_empty(), "{:?}", b.errors);
         let tree = region_scope_tree(&p, &b).unwrap();
         for (name, ed) in [("inner", definition), ("forwarded", caller)] {

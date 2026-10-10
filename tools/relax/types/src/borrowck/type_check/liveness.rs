@@ -13,12 +13,12 @@ struct LocalUses { defs: Vec<usize>, uses: Vec<usize>, drops: Vec<usize> }
 /// The local-use map covers both eager and deferred locals. Initialization
 /// dataflow is only solved if a drop-live query needs it.
 pub struct LivenessComputation<'a> {
-    tcx: &'a Tcx, body: &'a Body, locations: &'a LocationMap, moves: &'a MoveData,
+    prog: &'a Program, tcx: &'a Tcx, body: &'a Body, locations: &'a LocationMap, moves: &'a MoveData,
     uses: Vec<LocalUses>, predecessors: Vec<Vec<usize>>,
     init_states: Option<Vec<Option<(BitSet, BitSet)>>>,
 }
 impl<'a> LivenessComputation<'a> {
-    pub fn new(tcx: &'a Tcx, body: &'a Body, locations: &'a LocationMap, moves: &'a MoveData) -> Self {
+    pub fn new(prog: &'a Program, tcx: &'a Tcx, body: &'a Body, locations: &'a LocationMap, moves: &'a MoveData) -> Self {
         struct Uses<'a> { map: &'a LocationMap, locals: Vec<LocalUses> }
         impl Visitor for Uses<'_> {
             fn visit_local(&mut self, local: &Local, context: PlaceContext, at: Location) {
@@ -30,7 +30,7 @@ impl<'a> LivenessComputation<'a> {
         }
         let mut uses = Uses { map: locations, locals: (0..body.local_decls.len()).map(|_| LocalUses::default()).collect() };
         for (b, block) in body.basic_blocks.iter().enumerate() { uses.visit_basic_block_data(BasicBlock(b as u32), block); }
-        Self { tcx, body, locations, moves, uses: uses.locals, predecessors: locations.predecessors(body),
+        Self { prog, tcx, body, locations, moves, uses: uses.locals, predecessors: locations.predecessors(body),
             init_states: None }
     }
     pub fn compute(&mut self, local: Local) -> (BitSet, BitSet) {
@@ -63,7 +63,7 @@ impl<'a> LivenessComputation<'a> {
     }
     fn initialized_at(&mut self, point: usize, path: usize, after: bool) -> bool {
         let states = self.init_states.get_or_insert_with(|| {
-            let analysis = MaybeInitializedPlaces::new(self.tcx, self.body, self.moves);
+            let analysis = MaybeInitializedPlaces::new(self.prog, self.tcx, self.body, self.moves);
             let results = iterate_to_fixpoint(self.body, &analysis);
             let mut cursor = results.cursor();
             self.body.basic_blocks.iter().enumerate().map(|(b, block)| {
@@ -98,7 +98,7 @@ pub fn generate(tcx: &Tcx, prog: &Program, body: &Body, moves: &MoveData, input:
         for c in &input.outlives.outlives { if free.contains(c.sub) { changed |= free.insert(c.sup); } }
         if !changed { break; }
     }
-    let mut comp = LivenessComputation::new(tcx, body, &locations, moves);
+    let mut comp = LivenessComputation::new(prog, tcx, body, &locations, moves);
     for (i, decl) in body.local_decls.iter().enumerate() {
         let regions = polonius::regions_in(tcx, universals, decl.ty);
         if regions.iter().all(|&r| free.contains(r)) {
@@ -122,7 +122,7 @@ pub fn generate(tcx: &Tcx, prog: &Program, body: &Body, moves: &MoveData, input:
         fn visit_aggregate_kind(&mut self, kind: &AggregateKind) {
             match kind {
                 AggregateKind::Adt(_, _, args, _, _) | AggregateKind::Closure(_, args) | AggregateKind::Coroutine(_, args) => {
-                    for &ty in args { self.record(ty, V::Inv); }
+                    for &arg in args { self.record_arg(arg); }
                 }
                 AggregateKind::Array(ty) | AggregateKind::RawPtr(ty, _) => self.record(*ty, V::Co),
                 AggregateKind::Tuple => {}
@@ -131,7 +131,7 @@ pub fn generate(tcx: &Tcx, prog: &Program, body: &Body, moves: &MoveData, input:
         fn visit_const(&mut self, value: &Const, _: Location) {
             match value {
                 Const::Val(_, ty) => self.record(*ty, V::Co),
-                Const::Unevaluated { args, .. } => { for &ty in args { self.record(ty, V::Inv); } }
+                Const::Unevaluated { args, .. } => { for &arg in args { self.record_arg(arg); } }
             }
         }
         fn visit_region(&mut self, region: &Region) {
@@ -140,6 +140,19 @@ pub fn generate(tcx: &Tcx, prog: &Program, body: &Body, moves: &MoveData, input:
         }
     }
     impl Regular<'_> {
+        fn record_arg(&mut self, arg: crate::consts::GenericArg) {
+            use crate::consts::GenericArg;
+            match arg {
+                GenericArg::Type(ty) => self.record(ty, V::Inv),
+                GenericArg::Const(c) => self.record(self.tcx.tys.intern(crate::types::TyKind::Const(c)), V::Inv),
+                GenericArg::Lifetime(r) => {
+                    if let Some(r) = polonius::region_vid(self.tcx, &self.input.relations.universal_regions, r) {
+                        self.input.liveness.add_point(r, self.point);
+                        polonius::record_region_variance(&mut self.input.polonius.live_region_variances, r, V::Inv);
+                    }
+                }
+            }
+        }
         fn record(&mut self, ty: TyId, variance: V) {
             let universals = &self.input.relations.universal_regions;
             for r in polonius::regions_in(self.tcx, universals, ty) { self.input.liveness.add_point(r, self.point); }

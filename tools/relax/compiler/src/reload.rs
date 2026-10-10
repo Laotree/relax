@@ -247,6 +247,179 @@ pub struct Undo {
     removed: Vec<DefId>,
     consts: Vec<((DefId, Vec<TyId>), u64)>,
     consts_hit: Vec<DefId>,
+    adts: Vec<(DefId, crate::tcx::AdtT)>,
+    variants: Vec<(DefId, usize)>,
+    const_failed: Vec<(DefId, Vec<TyId>)>,
+    full_inputs: bool,
+    // Lead decision 52 (R1): the crates a declaration publication reached (None: all).
+    scope: Option<Vec<bool>>,
+}
+
+// Lead decision 51: classify both versions using the definition collector's
+// owners (rustc_resolve/src/def_collector.rs:423-448 @8d1a764). Even unchanged inline
+// constants in a changed body require full invalidation; do not compare tokens.
+fn ctfe_relevant_bodies(prog: &Program, file: u32, changed: &[DefId]) -> bool {
+    for &index in prog.defs_in_file(file) {
+        let def = DefId(index);
+        if !changed_body_owner(prog, def, changed) { continue; }
+        match prog.def(def).kind {
+            DefKind::Const | DefKind::AssocConst | DefKind::Static => return true,
+            DefKind::AnonConst | DefKind::OpaqueTy => {
+                if prog.def_id_to_node_id.get(&def).is_some_and(|(owner_file, _)| *owner_file == file) { return true; }
+            }
+            _ => {},
+        }
+    }
+    for &owner in changed {
+        if prog.opaque_types_defined_by.get(&owner).is_some_and(|defs| !defs.is_empty()) { return true; }
+    }
+    false
+}
+
+fn changed_body_owner(prog: &Program, mut def: DefId, changed: &[DefId]) -> bool {
+    while def != crate::program::NO_DEF {
+        if changed.contains(&def) { return true; }
+        def = prog.def(def).parent;
+    }
+    false
+}
+
+/// Whether const `d`'s cached values belong to a publication's `scope` (None: every crate).
+fn in_scope(prog: &Program, scope: Option<&[bool]>, d: DefId) -> bool {
+    scope.map_or(true, |v| v.get(prog.def(d).krate as usize).copied().unwrap_or(true))
+}
+
+/// Lead decision 52 (R2): whether a constant-evaluated context can read one of the changed
+/// const or static `items`: a const fn body, a const/associated-const initializer, an anon
+/// const (array length, repeat count, const argument) or inline const in a crate that can see
+/// them, and for a changed *const* also a static initializer (as the lead specified). A static
+/// initializer naming a changed *static* is not such a context: a static's storage is made
+/// once (jit::Unit::static_addr) by running its own initializer after installation, and no
+/// reload re-evaluates the storage of an existing static -- the full path changes nothing
+/// there. Conservative and by name: every identifier equal to an item's name or to a `use`
+/// alias renaming one, in the source of a file of those crates or in the text of a macro
+/// expansion or materialized generated body (ParsedFile::exp_map, followed to its call site),
+/// counts when it lies inside such a context (including the expressions of a materialized
+/// generated body). Text no definition holds (a cfg-disabled generated item) is never
+/// evaluated, and a generated body never materialized was never evaluated either.
+fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
+    use crate::def_collector::NodeId;
+    let visible = prog.crates_seeing_files(items.iter().map(|d| prog.def(*d).file));
+    let alias_closure = |mut names: Vec<Vec<u8>>| -> Vec<Vec<u8>> {
+        loop {
+            let mut grew = false;
+            for im in &prog.imports {
+                let (Some(bind), Some(&(_, last))) = (im.bind, im.segs.last()) else { continue };
+                if im.glob || bind == last { continue; }
+                let (b, l) = (prog.syms.str(bind).as_bytes().to_vec(), prog.syms.str(last).as_bytes().to_vec());
+                if names.contains(&l) && !names.contains(&b) { names.push(b); grew = true; }
+            }
+            if !grew { return names; }
+        }
+    };
+    let all = alias_closure(items.iter().map(|d| def_name(prog, *d).into_bytes()).collect());
+    let consts = alias_closure(items.iter().filter(|d| matches!(prog.def(**d).kind, DefKind::Const | DefKind::AssocConst)).map(|d| def_name(prog, *d).into_bytes()).collect());
+    // the constant-evaluated contexts, per file: (lo, hi, whether static names count); and the
+    // ranges of every other item of those files (text there is not a context's, unless a
+    // context range inside it holds it)
+    let mut contexts: crate::fxhash::HashMap<u32, Vec<(u32, u32, bool)>> = Default::default();
+    let mut others: crate::fxhash::HashMap<u32, Vec<(u32, u32)>> = Default::default();
+    for i in 0..prog.defs.len() {
+        let d = DefId(i as u32);
+        let def = prog.def(d);
+        if !visible.get(def.krate as usize).copied().unwrap_or(true) { continue; }
+        if items.contains(&d) || matches!(def.kind, DefKind::Static | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait
+            | DefKind::Impl | DefKind::TypeAlias | DefKind::Fn | DefKind::AssocFn | DefKind::AssocTy | DefKind::MacroRules) {
+            let it = prog.files[def.file as usize].ast.item(def.item);
+            others.entry(def.file).or_default().push((it.lo, it.hi));
+        }
+        if items.contains(&d) { continue; }
+        let statics_count = match def.kind {
+            DefKind::Const | DefKind::AssocConst | DefKind::AnonConst => true,
+            DefKind::Static => false,
+            DefKind::Fn | DefKind::AssocFn => match prog.files[def.file as usize].ast.item(def.item).kind {
+                crate::ast::ItemKind::Fn(sig, _, _) if prog.files[def.file as usize].ast.fn_sig(sig).konst => true,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if def.kind == DefKind::AnonConst {
+            match prog.def_id_to_node_id.get(&d) {
+                Some(&(file, NodeId::AnonConst(e) | NodeId::InlineConst(e))) => {
+                    let x = prog.files[file as usize].ast.expr(e);
+                    contexts.entry(file).or_default().push((x.lo, x.hi, true));
+                }
+                _ => return true,
+            }
+            continue;
+        }
+        let pf = &prog.files[def.file as usize];
+        let it = pf.ast.item(def.item);
+        contexts.entry(def.file).or_default().push((it.lo, it.hi, statics_count));
+    }
+    let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    for (&file, ranges) in &contexts {
+        let pf = &prog.files[file as usize];
+        let other: &[(u32, u32)] = others.get(&file).map_or(&[], |v| v.as_slice());
+        let src: &[u8] = &pf.src[..];
+        // (source text is UTF-8; text that is not counts as a mention)
+        let Ok(text) = std::str::from_utf8(src) else { return true };
+        let mut calls: Vec<(u32, u32, u32)> = pf.exp_map.iter().copied().collect();
+        calls.sort_unstable();
+        for name in &all {
+            let Ok(name) = std::str::from_utf8(name) else { return true };
+            let is_const = consts.iter().any(|n| n.as_slice() == name.as_bytes());
+            for (start, _) in text.match_indices(name) {
+                let end = start + name.len();
+                if (start > 0 && ident(src[start - 1])) || (end < src.len() && ident(src[end])) { continue; }
+                // a context holds it, or another item, or it is expansion text followed back to
+                // its call site; text no context, item or call site holds is no definition's
+                // (a cfg-disabled generated item, module-level text) and is never evaluated
+                let mut at = start as u32;
+                let mut steps = 0;
+                loop {
+                    if ranges.iter().any(|&(lo, hi, statics_count)| at >= lo && at < hi && (statics_count || is_const)) { return true; }
+                    if at < pf.src_len || other.iter().any(|&(lo, hi)| at >= lo && at < hi) { break; }
+                    let j = calls.partition_point(|c| c.0 <= at);
+                    match j.checked_sub(1).map(|j| calls[j]) {
+                        Some((x, y, call)) if at >= x && at < y && steps < 64 => { at = call; steps += 1; }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Lead decision 52 (R2 (a)): an initializer made only of literals -- arrays, repeats with a
+/// literal count, tuples, struct literals without a base or omitted fields, negation and
+/// shared borrows of such values -- folds without executing code: no call, no path to another
+/// value, no block. (fold_without_execution covers scalar results only; generated shader
+/// position tables are arrays of struct literals.)
+fn literal_initializer(pf: &crate::parser::ParsedFile, e: crate::ast::ExprId, depth: u32) -> bool {
+    use crate::ast::{ExprKind, UnOp};
+    if depth > 64 { return false; }
+    match pf.ast.expr(e).kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Paren(x) | ExprKind::Unary(UnOp::Neg, x) | ExprKind::AddrOf(false, false, x) => literal_initializer(pf, x, depth + 1),
+        ExprKind::Tuple(xs) | ExprKind::Array(xs) => pf.ast.list(xs).iter().all(|&x| literal_initializer(pf, x, depth + 1)),
+        ExprKind::Repeat(x, n) => matches!(pf.ast.expr(n).kind, ExprKind::Lit(_)) && literal_initializer(pf, x, depth + 1),
+        ExprKind::Struct(_, fields, base, defaults) => base.get().is_none() && !defaults
+            && pf.ast.list(fields).iter().all(|f| literal_initializer(pf, f.expr, depth + 1)),
+        _ => false,
+    }
+}
+
+fn publish_reload(u: &mut Unit, versions: &[(u32, u32)], full: bool, scope: Option<&[bool]>) {
+    u.tcx.queries.register_files(u.prog.files.len());
+    if full {
+        u.tcx.publish_declarations(scope);
+    } else {
+        let mut files = Vec::new();
+        for &(old, new) in versions { files.push(old); files.push(new); }
+        u.tcx.publish_file_bodies(&files);
+    }
 }
 
 /// Rolls back an installed patch group (a panic or fault in its code, M7): the slots return
@@ -263,15 +436,22 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
         u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let impls: Vec<DefId> = undo.added.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();
         u.prog.unbind_defs(&undo.added);
-        u.tcx.uncollect_impls(&impls, false);
+        if !impls.is_empty() { u.tcx.uncollect_impls(&impls); }
         u.prog.rebind_defs(&undo.removed);
         for (k, &(o, n)) in undo.versions.iter().enumerate().rev() {
             u.prog.revert_version(o, n, &undo.pairs[k]);
         }
-        u.tcx.publish_collected();
+        for (d, n) in &undo.variants { u.prog.truncate_variants(*d, *n); }
+        for (d, adt) in &undo.adts { u.tcx.adts.insert(*d, adt.clone()); }
+        publish_reload(u, &undo.versions, undo.full_inputs, undo.scope.as_deref());
+        u.lay.clear();
         u.prog.reclaim_caches();
-        u.tcx.reclaim_caches();
         drop(fw);
+    }
+    if undo.full_inputs {
+        let (prog, scope) = (&u.prog, undo.scope.as_deref());
+        u.consts.retain(|(d, _), _| !in_scope(prog, scope, *d));
+        u.const_failed.retain(|(d, _)| !in_scope(prog, scope, *d));
     }
     for k in &undo.consts_hit {
         let ks: Vec<(DefId, Vec<TyId>)> = u.consts.keys().filter(|(d, _)| d == k).cloned().collect();
@@ -279,9 +459,9 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
             u.consts.remove(&x);
         }
     }
-    for (k, v) in undo.consts {
-        u.consts.insert(k, v);
-    }
+    for (k, v) in undo.consts { u.consts.insert(k, v); }
+    u.const_failed.retain(|(d, _)| !undo.consts_hit.contains(d));
+    u.const_failed.extend(undo.const_failed);
     // RIR built from the rolled-back text (inlining sources) is dropped
     for id in std::mem::take(&mut u.reload_specs) {
         u.fns[id as usize].spec = None;
@@ -321,6 +501,7 @@ pub(crate) struct Plan {
     pub(crate) removed: Vec<DefId>,
     /// `use` items only the old version has (their position in the old file): their imports go
     pub(crate) removed_uses: Vec<u32>,
+    pub(crate) attributes_changed: bool,
 }
 
 /// Token texts of `pf` in [lo, hi) outside `holes` (comments are not tokens: comment-only
@@ -413,9 +594,30 @@ fn norm_generated(b: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Index of the first token at or after position `lo`. The token array is in position order
+/// except for `T::Interp` tokens, which carry the span of their spliced expression (earlier in
+/// the file); a plain binary search that lands on one of them skips the range it looks for
+/// (a widget's generated shader items then compared as text against the running version's
+/// tokens, and every button.rx body edit took the restart rung). Interp tokens take the
+/// position of the next ordinary token, which keeps the search key monotonic.
+fn first_tok_at(toks: &[crate::lexer::Tok], lo: u32) -> usize {
+    let key = |i: usize| -> u32 {
+        let mut j = i;
+        while j < toks.len() && toks[j].kind == crate::lexer::T::Interp { j += 1; }
+        if j < toks.len() { toks[j].lo } else { u32::MAX }
+    };
+    let (mut a, mut b) = (0usize, toks.len());
+    while a < b {
+        let m = a + (b - a) / 2;
+        if key(m) < lo { a = m + 1; } else { b = m; }
+    }
+    while a < toks.len() && toks[a].kind == crate::lexer::T::Interp { a += 1; }
+    a
+}
+
 fn toks<'a>(pf: &'a crate::parser::ParsedFile, lo: u32, hi: u32, holes: &[(u32, u32)]) -> Vec<&'a [u8]> {
     let mut out = Vec::new();
-    let i0 = pf.toks.partition_point(|t| t.lo < lo);
+    let i0 = first_tok_at(&pf.toks, lo);
     let mut covered = false;
     let mut prev_hi = lo;
     for t in &pf.toks[i0..] {
@@ -915,6 +1117,16 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             _ => why.push(format!("{}:1:1: {} `{}` removed -- removing this kind of item is not applied live yet: restart the app", path, kind_name(&it.kind), name)),
         }
     }
+    fn attr_text<'a>(pf: &'a crate::parser::ParsedFile, attrs: &[crate::ast::Attr]) -> Vec<&'a [u8]> {
+        let mut text = Vec::new();
+        for attr in attrs {
+            let lo = pf.toks.get(attr.toks.lo as usize).map_or(0, |t| t.lo);
+            let hi = pf.toks.get(attr.toks.hi.saturating_sub(1) as usize).map_or(0, |t| t.hi);
+            text.extend(toks(pf, lo, hi, &[]));
+        }
+        text
+    }
+    let mut attributes_changed = attr_text(old, &oa.root_attrs) != attr_text(new, &na.root_attrs);
     for &(i, j) in &pairs {
         let (a, b) = (&oa.items[i as usize], &na.items[j as usize]);
         let name = String::from_utf8_lossy(&new.src[b.name.lo as usize..b.name.hi as usize]).into_owned();
@@ -939,6 +1151,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             continue;
         }
         let def = prog.item_defs.get(&(old_file, i)).copied();
+        attributes_changed |= !attrs_same;
         match (&a.kind, &b.kind) {
             (ItemKind::Fn(..), ItemKind::Fn(..)) if body_span(old, &a.kind).is_some() && body_span(new, &b.kind).is_some() => {
                 let (body_a, body_b) = (body_span(old, &a.kind).unwrap().0, body_span(new, &b.kind).unwrap().0);
@@ -1017,7 +1230,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
         }
     }
     if why.is_empty() {
-        Ok(Plan { pairs, changes: out, added: plan_added, removed: plan_removed, removed_uses })
+        Ok(Plan { pairs, changes: out, added: plan_added, removed: plan_removed, removed_uses, attributes_changed })
     } else {
         if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
             // which items paired and which did not, with their keys (a restart that the
@@ -1054,11 +1267,11 @@ fn struct_head<'a>(pf: &'a crate::parser::ParsedFile, it: &crate::ast::Item) -> 
 /// its slot by name and type (a renamed one by type, when exactly one field went and one came
 /// with that type), an added one goes to the extension block, a removed one whose type needs no
 /// drop stays as a dead slot. Anything else: Err with the reason (restart rung).
-fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
+fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let old = u.tcx.adts.get(&d).ok_or("no running definition")?;
     let name = u.prog.def_path(d);
     if old.is_enum {
-        return enum_edit(u, d, old, fresh);
+        return enum_edit(u, d, old, fresh, running_discriminants, fresh_discriminants);
     }
     let t = {
         let args: Vec<TyId> = (0..old.n_generics).map(|_| u.tcx.tys.unit).collect();
@@ -1067,9 +1280,11 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT) -> Result<(crate::t
     if !u.lay.live_editable(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, d, old, t) {
         return Err(format!("struct `{}` keeps its first layout in a live session only when it is in the app scope, has named fields, Rust's repr and no Copy impl -- restart the app", name));
     }
+    trace_sub("layout_edit_live_editable");
     if let Some(outer) = outside_value_embedding(u, d) {
         return Err(format!("struct `{}` is embedded by value in `{}` outside the app scope -- restart the app", name, crate::typeck::type_name(&u.prog, &u.tcx, outer)));
     }
+    trace_sub("layout_edit_embedding");
     if fresh.n_generics != old.n_generics || fresh.variants.len() != 1 {
         return Err(format!("struct `{}`: its generics changed -- restart the app", name));
     }
@@ -1195,49 +1410,30 @@ fn note_edited_crates(u: &Unit, files: &[u32]) {
 /// Source bodies can see an edit only in its crate and its transitive dependents.
 /// Walk reverse edges once for the whole transaction, including companion files.
 pub(crate) fn crates_seeing_edit(prog: &crate::program::Program, files: impl Iterator<Item = u32>) -> Vec<bool> {
-    let mut dependents = vec![Vec::new(); prog.crates.len()];
-    for (c, krate) in prog.crates.iter().enumerate() {
-        for &(_, dep) in &krate.deps {
-            dependents[dep as usize].push(c);
-        }
-    }
-    let mut visible = vec![false; prog.crates.len()];
-    let mut todo = Vec::new();
-    for file in files {
-        let c = prog.file_crate[file as usize] as usize;
-        if !visible[c] {
-            visible[c] = true;
-            todo.push(c);
-        }
-    }
-    while let Some(c) = todo.pop() {
-        for &dep in &dependents[c] {
-            if !visible[dep] {
-                visible[dep] = true;
-                todo.push(dep);
-            }
-        }
-    }
-    visible
+    prog.crates_seeing_files(files)
 }
 
 /// A scope-preserving edit moved the program from collect epoch `from` to `from + 1`: Gandalf
 /// keeps the verdicts (and queued checks) of owners in crates that cannot see the edited files
 /// instead of re-checking the whole program (borrowck::lazy::carry_epoch). Front-end write
 /// lock held.
-fn carry_gandalf(u: &Unit, from: u64, visible: &[bool]) {
+fn carry_gandalf(u: &Unit, from: u64, visible: &[bool], files: Option<&[u32]>) {
     let src = std::sync::Arc::as_ptr(&u.front) as usize;
     let prog = &u.prog;
-    crate::borrowck::lazy::carry_epoch(src, from, from + 1, &|d: DefId| gandalf_keeps(prog, visible, d));
+    crate::borrowck::lazy::carry_epoch(src, from, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), &|d: DefId| {
+        if let Some(files) = files { !files.contains(&prog.def(d).file) }
+        else { gandalf_keeps(prog, visible, d) }
+    });
 }
 
 /// Whether an edit keeps what every owner outside the edited crates reads: bodies, const
 /// values and static initializers only -- no item or `use` came or went (a changed signature
 /// is a removed and an added fn), no field list (layout) and no macro changed. Otherwise the
 /// background borrow checker drops all its verdicts, as on any other collect epoch.
-pub(crate) fn gandalf_carries<'a>(changes: &[Change], mut plans: impl Iterator<Item = &'a Plan>) -> bool {
+pub(crate) fn gandalf_carries<'a>(changes: &[Change], _plans: impl Iterator<Item = &'a Plan>) -> bool {
+    // Lead decision 52 (R1): items or `use`s that came or went are seen only by the crates
+    // crates_seeing_edit returns, as with a body edit; owners of every other crate keep theirs.
     !changes.iter().any(|c| matches!(c, Change::Layout(_) | Change::Macro(_)))
-        && plans.all(|p| p.added.is_empty() && p.removed.is_empty() && p.removed_uses.is_empty())
 }
 
 /// An owner keeps its verdict over a carried edit when its crate cannot see the edited files
@@ -1268,7 +1464,7 @@ fn ty_in_crates(u: &Unit, t: TyId, crates: &[u32], depth: u32) -> bool {
         Adt(d, args, _) => crates.contains(&u.prog.def(d).krate) || args.iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
         Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => ty_in_crates(u, x, crates, depth + 1),
         Tuple(v) => v.iter().any(|a| ty_in_crates(u, *a, crates, depth + 1)),
-        Closure(..) | FnDef(..) | Dyn(..) | Opaque(..) | Assoc(..) => true,
+        Closure(..) | FnDef(..) | Dyn(..) | Alias(..) => true,
         _ => false,
     }
 }
@@ -1301,43 +1497,82 @@ fn outside_value_embedding(u: &Unit, edited: DefId) -> Option<TyId> {
         match u.tcx.tys.kind(t) {
             TyKind::Adt(d, args, _) => *d == edited || u.tcx.adts.get(d).is_some_and(|a|
                 a.variants.iter().enumerate().any(|(vi, v)| v.fields.iter().enumerate().any(|(fi, _)| {
-                    let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), *d, vi as u32, fi as u32, args);
+                    let field = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), *d, vi as u32, fi as u32, args);
                     embeds(u, field, edited, seen)
                 }))),
             TyKind::Tuple(ts) => ts.iter().any(|t| embeds(u, *t, edited, seen)),
-            TyKind::Array(t, n) => *n != 0 && embeds(u, *t, edited, seen),
+            TyKind::Array(t, n) => n.try_to_target_usize(&u.tcx.tys) != Some(0) && embeds(u, *t, edited, seen),
             _ => false,
         }
     }
-    // A type can hold an app type by value only through the shapes `embeds` follows (an
-    // Adt's fields, a tuple, an array). Ahead of computing a type's field types (the cost of
-    // this scan: every interned type of the program), a structural test over those shapes
-    // finds whether an app type occurs in it at all; a non-app type whose arguments and
-    // declared fields hold none cannot embed the edited one. (The scan took ~160 ms of every
-    // live struct edit on Calculator.)
-    fn mentions_app(u: &Unit, t: TyId, app: &[bool], memo: &mut std::collections::HashMap<TyId, bool>) -> bool {
-        if let Some(&known) = memo.get(&t) { return known; }
-        memo.insert(t, false);
-        let found = match u.tcx.tys.kind(t) {
-            TyKind::Adt(d, args, _) => app[u.prog.def(*d).krate as usize] || args.iter().any(|a| mentions_app(u, *a, app, memo)),
-            TyKind::Tuple(ts) => ts.iter().any(|t| mentions_app(u, *t, app, memo)),
-            TyKind::Array(t, _) => mentions_app(u, *t, app, memo),
+    // A type can embed `edited` only if it names `edited` or an ADT whose declared fields could
+    // hold it (`holders`), directly or through its type arguments: a declared field type names
+    // only items its crate can see -- `edited` only in the crates that can see `edited`'s crate --
+    // and anything else reaches the field through a substituted argument; like embeds(), only
+    // arrays and tuples carry a value further, and an alias may normalize to a holder. An ADT
+    // of another crate whose declared fields
+    // project (`T::Out`) may also reach it through an impl for an argument, so an instance of
+    // one naming any type of the seeing crates counts too. Skipping every other type leaves the
+    // answer unchanged (lead decision 52 R1: after a scoped publication, embeds() normalized
+    // ~40k unrelated instances' fields again, ~0.5 s per field-list edit).
+    struct Holders { adts: Vec<DefId>, projecting: std::collections::HashSet<DefId>, seeing: Vec<u32> }
+    fn may_hold(u: &Unit, t: TyId, h: &Holders, depth: u32) -> bool {
+        use crate::types::TyKind::*;
+        if depth > 16 { return true; }
+        match u.tcx.tys.kind(t) {
+            Adt(d, args, _) => h.adts.contains(d) || (h.projecting.contains(d) && ty_in_crates(u, t, &h.seeing, 0))
+                || args.iter().any(|a| may_hold(u, *a, h, depth + 1)),
+            // (as embeds(): by value through arrays and tuples only)
+            Array(x, _) => may_hold(u, *x, h, depth + 1),
+            Tuple(v) => v.iter().any(|a| may_hold(u, *a, h, depth + 1)),
+            // an alias normalizes through an impl of its trait's crate or of a crate of a type
+            // in its arguments (orphan rules), to a type made of those crates' items and parts
+            // of its arguments: a holder only if a seeing crate is among them or an argument
+            // may hold one
+            Alias(_, a) => h.seeing.contains(&u.prog.def(a.kind.def_id()).krate)
+                || a.args.iter().any(|x| ty_in_crates(u, *x, &h.seeing, 0) || may_hold(u, *x, h, depth + 1)),
             _ => false,
-        };
-        memo.insert(t, found);
-        found
+        }
     }
-    let mut memo = std::collections::HashMap::new();
-    let mut declared: std::collections::HashMap<DefId, bool> = std::collections::HashMap::new();
+    fn projects(u: &Unit, t: TyId, depth: u32) -> bool {
+        use crate::types::TyKind::*;
+        if depth > 16 { return true; }
+        match u.tcx.tys.kind(t) {
+            Alias(..) | Closure(..) | Dyn(..) => true,
+            Adt(_, args, _) => args.iter().any(|a| projects(u, *a, depth + 1)),
+            Ref(_, x, _) | Ptr(_, x) | Slice(x) | Array(x, _) => projects(u, *x, depth + 1),
+            Tuple(v) => v.iter().any(|a| projects(u, *a, depth + 1)),
+            _ => false,
+        }
+    }
+    let seeing = crates_seeing_edit(&u.prog, [u.prog.def(edited).file].into_iter());
+    let sees = |d: &DefId| seeing.get(u.prog.def(*d).krate as usize).copied().unwrap_or(true);
+    let mut h = Holders { adts: vec![edited], projecting: Default::default(), seeing: (0..seeing.len() as u32).filter(|&k| seeing[k as usize]).collect() };
+    for (d, a) in u.tcx.adts.iter() {
+        if !sees(d) && a.variants.iter().any(|v| v.fields.iter().any(|f| projects(u, f.ty, 0))) { h.projecting.insert(*d); }
+    }
+    loop {
+        let mut grew = false;
+        for (d, a) in u.tcx.adts.iter() {
+            if h.adts.contains(d) || !sees(d) { continue; }
+            if a.variants.iter().any(|v| v.fields.iter().any(|f| may_hold(u, f.ty, &h, 0))) {
+                h.adts.push(*d);
+                grew = true;
+            }
+        }
+        if !grew { break; }
+    }
     let mut seen = std::collections::HashSet::new();
     for i in 0..u.tcx.tys.len() {
         let t = TyId(i as u32);
-        if let TyKind::Adt(d, args, _) = u.tcx.tys.kind(t) {
-            if app[u.prog.def(*d).krate as usize] || !u.tcx.tys.is_concrete(t) { continue; }
-            let fields_hold = *declared.entry(*d).or_insert_with(|| u.tcx.adts.get(d).map_or(true, |a|
-                a.variants.iter().any(|v| v.fields.iter().any(|f| mentions_app(u, f.ty, &app, &mut memo)))));
-            if !fields_hold && !args.iter().any(|a| mentions_app(u, *a, &app, &mut memo)) { continue; }
-            if embeds(u, t, edited, &mut seen) {
+        if let TyKind::Adt(d, _, _) = u.tcx.tys.kind(t) {
+            if !app[u.prog.def(*d).krate as usize] && u.tcx.tys.is_concrete(t)
+                && may_hold(u, t, &h, 0)
+                // The interner also holds binder payloads, not running instances.
+                // Nightly rustc_middle/src/ty/instance.rs:519-524 rejects escaping
+                // bound vars; erase_regions.rs:65-72 deliberately preserves them.
+                && !u.tcx.tys.has_escaping_bound_vars(t)
+                && embeds(u, t, edited, &mut seen) {
                 return Some(t);
             }
         }
@@ -1353,7 +1588,7 @@ fn outside_value_embedding(u: &Unit, edited: DefId) -> Option<TyId> {
 /// their names, fields and discriminants) apply in place when every value keeps its
 /// representation -- live enums are always tagged and give outer types no niche (layout.rs),
 /// so the check is the size, alignment and every running variant's field offsets.
-fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
+fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::AdtT, running_discriminants: &[u128], fresh_discriminants: &[u128]) -> Result<(crate::tcx::AdtT, Vec<String>), String> {
     let name = u.prog.def_path(d);
     if !u.lay.live_editable_enum(&crate::layout::LayoutCx::new(&u.prog), d, old) || !fresh.is_enum || fresh.n_generics != old.n_generics {
         return Err(format!("enum `{}` keeps its first layout in a live session only when it is the program's own with Rust's repr -- restart the app", name));
@@ -1362,9 +1597,9 @@ fn enum_edit(u: &Unit, d: DefId, old: &crate::tcx::AdtT, fresh: &crate::tcx::Adt
     if fresh.variants.len() < n {
         return Err(format!("enum `{}`: a variant was removed; a running value may hold it -- restart the app", name));
     }
-    for (vo, vn) in old.variants.iter().zip(fresh.variants.iter()) {
+    for (i, (vo, vn)) in old.variants.iter().zip(fresh.variants.iter()).enumerate() {
         let same_fields = vo.fields.len() == vn.fields.len() && vo.fields.iter().zip(vn.fields.iter()).all(|(a, b)| a.name == b.name && a.ty == b.ty);
-        if vo.name != vn.name || vo.shape != vn.shape || vo.disc != vn.disc || !same_fields {
+        if vo.name != vn.name || vo.shape != vn.shape || running_discriminants[i] != fresh_discriminants[i] || !same_fields {
             return Err(format!("enum `{}`: variant `{}` changed, moved or was removed; running values would be read as another variant -- restart the app", name, u.prog.syms.str(vo.name)));
         }
     }
@@ -1399,6 +1634,63 @@ fn def_name(prog: &crate::program::Program, d: DefId) -> String {
     prog.syms.str(prog.def(d).name).to_string()
 }
 
+/// RELOAD' (lead design, round 33): whether the running value of executable discriminant
+/// `anon` may change with this transaction, decided without running it. Its dependencies are
+/// the transitive static callee set of its initializer slot -- each slot's direct calls before
+/// inlining and the calls, fn values and thunks of its built RIR -- plus the constants a slot's
+/// build read (their initializer slots, walked the same way), the statics it addresses and
+/// the type arguments of every instance (a field-list edit of one changes what size_of and
+/// field offsets fold to). Ok(true): one of them is in `changed`. Err: the set is not exactly
+/// computable (an indirect call, a trait's associated constant, a RIR build failure).
+unsafe fn discriminant_deps_changed(up: *mut Unit, anon: DefId, changed: &[DefId], layout_defs: &[DefId]) -> Result<bool, String> {
+    use crate::rir::{Callee, Inst};
+    let mut todo = vec![(&*up).fn_id(FnKey::Inst(anon, Vec::new()))];
+    let mut seen: Vec<u32> = Vec::new();
+    while let Some(s) = todo.pop() {
+        if seen.contains(&s) { continue; }
+        seen.push(s);
+        let u = &*up;
+        let mut k = s;
+        let hit = loop {
+            match &u.fns[k as usize].key {
+                FnKey::Inst(d, args) => break changed.contains(d) || args.iter().any(|t| ty_mentions(u, *t, layout_defs, 0)),
+                FnKey::Glue(_, t) => break ty_mentions(u, *t, layout_defs, 0),
+                FnKey::Shim(shim) => break shim.args.iter().any(|t| ty_mentions(u, *t, layout_defs, 0)),
+                FnKey::Closure(_, _, parent) | FnKey::Sandbox(parent) => k = *parent,
+            }
+        };
+        if hit { return Ok(true); }
+        if u.fns[s as usize].rir.is_none() {
+            jit::build_rir(up, s).map_err(|e| format!("`{}`: {}", (&*up).fns[s as usize].name, e))?;
+        }
+        let u = &*up;
+        let Some(rir) = u.fns[s as usize].rir.clone() else { return Err(format!("`{}` has no RIR", u.fns[s as usize].name)) };
+        todo.extend_from_slice(&u.fns[s as usize].calls);
+        for i in rir.blocks.iter().flat_map(|b| &b.insts) {
+            match i {
+                Inst::Call(Callee::Fn(c) | Callee::CFn(c, _), _, _) | Inst::FnAddr(_, c) | Inst::SlotAddr(_, c) => todo.push(*c),
+                Inst::Call(Callee::Indirect(_) | Callee::CIndirect(..), _, _) => return Err(format!("an indirect call in `{}`", u.fns[s as usize].name)),
+                Inst::Addr(_, sym) => match u.syms.kind(sym.id) {
+                    Some(crate::syms::SymKind::Thunk(c)) => todo.push(c),
+                    Some(crate::syms::SymKind::Static(d)) if changed.contains(&d) => return Ok(true),
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let read: Vec<DefId> = u.const_readers.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(_, v)| v.contains(&s)).map(|(c, _)| *c).collect();
+        for c in read {
+            if changed.contains(&c) { return Ok(true); }
+            if u.prog.def(c).kind == DefKind::AssocConst && u.prog.def(u.prog.def(c).parent).kind == DefKind::Trait {
+                return Err(format!("`{}` reads a trait's associated constant", u.fns[s as usize].name));
+            }
+            let keys: Vec<Vec<TyId>> = u.consts.keys().filter(|(x, _)| *x == c).map(|(_, a)| a.clone()).collect();
+            for args in keys { todo.push(u.fn_id(FnKey::Inst(c, args))); }
+        }
+    }
+    Ok(false)
+}
+
 /// Slots referenced by compiled code (calls and fn values: table words and thunks).
 fn referenced_slots(relocs: &[crate::rir::RelocAt], out: &mut Vec<u32>) {
     for r in relocs {
@@ -1415,7 +1707,7 @@ type Code = (Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>);
 /// expressions of the parent's item (source order), with its signature, captures and owner
 /// types. Coroutines (async blocks and bodies) are not matched: their suspended states keep
 /// the old poll code until coroutine versioning exists.
-fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, TyId, TyId)> {
+fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
     let (file, ce, parent) = match &u.fns[slot as usize].key {
         FnKey::Closure(f, e, p) => (*f, *e, *p),
         _ => return None,
@@ -1441,7 +1733,10 @@ fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, TyId, TyId)> {
         }
     }
     match u.tcx.tys.kind(body.ty(crate::ast::ExprId(ce))).clone() {
-        crate::types::TyKind::Closure(_, _, sig, up, owner) => Some((ord, sig, up, owner)),
+        crate::types::TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, closure_sig_as_fn_ptr_ty: sig, .. }) => {
+            let storage = crate::layout::ClosureStorage::new(&u.tcx, &body, ce);
+            Some((ord, sig, storage.fields, owner))
+        },
         _ => None,
     }
 }
@@ -1775,10 +2070,24 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         out.ms[0] = ms(t0);
         return out;
     }
+    // Lead decisions 49-50: checking a changed const fn must not execute
+    // candidate code. Nightly uses the candidate MIR (rustc_const_eval/src/
+    // const_eval/machine.rs:418-425 @8d1a764); this runtime needs a restart.
+    for change in &changes {
+        if let Change::Body(def) = *change {
+            let d = u.prog.def(def);
+            let pf = &u.prog.files[d.file as usize];
+            if let crate::ast::ItemKind::Fn(sig, _, _) = pf.ast.item(d.item).kind {
+                if pf.ast.fn_sig(sig).konst {
+                    restart.push(format!("const fn `{}` changed: checking its users requires the new code -- restart the app", def_name(&u.prog, def)));
+                }
+            }
+        }
+    }
     // a const that sized a type (array length, const generic argument) changes types
     for c in &changes {
         if let Change::Const(d) = c {
-            if u.tcx.const_values.contains_key(d) {
+            if u.tcx.const_was_evaluated(*d) {
                 restart.push(format!("const `{}` is used in a type (an array length or const generic argument): its users' types change -- restart the app", def_name(&u.prog, *d)));
             }
         }
@@ -1860,7 +2169,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         continue;
                     }
                     named += 1;
-                    let uses = crate::borrowck::identity_args(&u.tcx, &u.prog, *fd).map(|a| crate::typeck::check_fn_uncached(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *fd, &a).field_uses).unwrap_or_default();
+                    let uses = crate::borrowck::identity_args(&u.tcx, &u.prog, *fd).map(|a| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *fd, &a).field_uses).unwrap_or_default();
                     if uses.iter().any(|(ud, k)| *ud == d && gone.contains(k)) {
                         body_defs.push(*fd);
                         field_deps += 1;
@@ -1919,6 +2228,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     body_defs.retain(|d| !versions.iter().any(|(_, plan)| plan.removed.contains(d)));
     let const_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::Const(d) = c { Some(*d) } else { None }).collect();
     let static_defs: Vec<DefId> = changes.iter().filter_map(|c| if let Change::StaticInit(d) = c { Some(*d) } else { None }).collect();
+    trace_count("changed_consts", const_defs.len());
+    trace_count("changed_statics", static_defs.len());
     out.changed += changes.len();
     // consts whose value depends on a changed one: the readers' slots (consts compiled as
     // initializers) and, conservatively, every evaluated const whose initializer names one
@@ -1947,7 +2258,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             }
             let via_slot = readers.iter().any(|(d, v)| consts_hit.contains(d) && v.iter().any(|&s| matches!(&u.fns[s as usize].key, FnKey::Inst(x, _) if *x == c)));
             if via_slot || item_mentions(&u.prog, c, &names) {
-                if u.tcx.const_values.contains_key(&c) {
+                if u.tcx.const_was_evaluated(c) {
                     out.rung = Rung::Restart;
                     out.lines.push(format!("const `{}` depends on a changed const and is used in a type -- restart the app", def_name(&u.prog, c)));
                     out.ms[0] = ms(t0);
@@ -1972,27 +2283,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             trace_count("slot_visits", 1);
             if u.fns[id as usize].compiled { slots.push(id); } else { fresh.push(id); }
         }
-        // a struct whose field list changed (M10): its drop glue (the extension block's fields) and
-        // the trait impls the compiler derives for it (Clone, Debug, PartialEq, ..: built from
-        // the field list, not from text an edit changes)
+        // A changed field list invalidates drop glue. Expanded derive bodies
+        // are ordinary changed definitions above.
         if !layout_defs.is_empty() {
             let is_it = |t: TyId| matches!(u.tcx.tys.kind(t), crate::types::TyKind::Adt(d, _, _) if layout_defs.contains(d));
             for (i, f) in u.fns.iter().enumerate() {
             trace_count("slot_visits", 1);
                 let hit = match &f.key {
                     FnKey::Glue(k, t) => (*k == crate::jit::GLUE_DROP || *k == crate::jit::GLUE_EXT_DROP) && is_it(*t),
-                    // a trait method the compiler derives for the type (no source; built from the
-                    // field list): only traits in its derive list, not the trait's provided methods
-                    FnKey::Inst(m, args) => {
-                        let parent = u.prog.def(*m).parent;
-                        args.first().map_or(false, |a| is_it(*a))
-                            && parent != crate::program::NO_DEF
-                            && u.prog.def(parent).kind == DefKind::Trait
-                            && args.first().map_or(false, |a| match u.tcx.tys.kind(*a) {
-                                crate::types::TyKind::Adt(ad, _, _) => u.tcx.derived_by_adt.get(ad).map_or(false, |v| v.contains(&parent)),
-                                _ => false,
-                            })
-                    }
                     _ => false,
                 };
                 if hit && !slots.contains(&(i as u32)) && !fresh.contains(&(i as u32)) {
@@ -2060,10 +2358,117 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // made sure exists and put_body keeps in old_bodies once the new version is checked.
     // (They were compiled here eagerly: ~1.4 s on the first edit of Scope's handle_event.)
     let u = &mut *up;
-    trace_stage("preserve");
+    trace_stage("freeze");
+    // Round-32 lead design: DefIds are retargeted by commit_version. Values
+    // queried from an old AdtT after that point already belong to the new text.
+    // RELOAD' (round 33): no discriminant is evaluated by running code in a transaction.
+    // An edited enum is compared only when const folding gives all its old and new values;
+    // an unedited enum computed by code keeps its values when nothing they depend on changes.
+    let mut running_discriminants = Vec::new();
+    let mut discr_restart: Vec<String> = Vec::new();
+    for &d in &layout_defs {
+        if let Some(adt) = u.tcx.adts.get(&d) {
+            if adt.is_enum {
+                match adt.fold_discriminants(&u.tcx, &u.prog) {
+                    Some(values) => running_discriminants.push((d, values)),
+                    None => discr_restart.push(format!("enum `{}`: its declaration changed and a discriminant is computed by code -- restart the app", def_name(&u.prog, d))),
+                }
+                for variant in &adt.variants {
+                    if let crate::tcx::VariantDiscr::Explicit(def) = variant.discr {
+                        if !consts_hit.contains(&def) { consts_hit.push(def); }
+                    }
+                }
+            }
+        }
+    }
+    {
+        let mut changed: Vec<DefId> = body_defs.iter().chain(&consts_hit).chain(&static_defs).chain(&layout_defs).copied().collect();
+        for (_, plan) in &versions { changed.extend_from_slice(&plan.removed); }
+        let names: Vec<&[u8]> = set_names.iter().map(|n| n.as_slice()).collect();
+        let mut enums: Vec<DefId> = u.tcx.adts.iter().filter(|(d, a)| a.is_enum && visible_crates[u.prog.def(**d).krate as usize] && !layout_defs.contains(d) && !changed.contains(d)).map(|(d, _)| *d).collect();
+        enums.sort_unstable_by_key(|d| d.0);
+        for d in enums {
+            let u = &*up;
+            let adt = &u.tcx.adts[&d];
+            let mut code: Vec<DefId> = Vec::new();
+            for v in &adt.variants {
+                if let crate::tcx::VariantDiscr::Explicit(c) = v.discr {
+                    if relax_types::const_eval::fold_without_execution(&u.tcx, &u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), c).is_none() { code.push(c); }
+                }
+            }
+            if code.is_empty() { continue; }
+            if item_mentions(&u.prog, d, &names) {
+                discr_restart.push(format!("enum `{}`: a discriminant computed by code names an item this edit adds or removes -- restart the app", def_name(&u.prog, d)));
+                continue;
+            }
+            for c in code {
+                match discriminant_deps_changed(up, c, &changed, &layout_defs) {
+                    Ok(false) => {}
+                    Ok(true) => discr_restart.push(format!("enum `{}`: a discriminant is computed by code this edit changes -- restart the app", def_name(&(*up).prog, d))),
+                    Err(e) => discr_restart.push(format!("enum `{}`: a discriminant is computed by code whose dependencies are not known exactly ({}) -- restart the app", def_name(&(*up).prog, d), e)),
+                }
+            }
+        }
+    }
+    trace_sub("gp_discriminants");
+    if !discr_restart.is_empty() {
+        out.rung = Rung::Restart;
+        out.lines = discr_restart;
+        out.ms[0] = ms(t0);
+        return out;
+    }
+    let u = &mut *up;
+    let enum_before: Vec<(DefId, TyId, crate::layout::Layout)> = {
+        let mut v = Vec::new();
+        for f in u.fns.iter().take(if layout_defs.is_empty() { 0 } else { u.fns.len() }) {
+            trace_count("slot_visits", 1);
+            let ts: Vec<TyId> = match &f.key {
+                FnKey::Inst(_, a) => a.clone(),
+                FnKey::Glue(_, t) => vec![*t],
+                _ => Vec::new(),
+            };
+            for t in ts {
+                if let crate::types::TyKind::Adt(ed, _, _) = u.tcx.tys.kind(t).clone() {
+                    if layout_defs.contains(&ed) && u.tcx.adts.get(&ed).map_or(false, |a| a.is_enum) && u.tcx.tys.is_concrete(t) && !v.iter().any(|x: &(DefId, TyId, crate::layout::Layout)| x.1 == t) {
+                        v.push((ed, t, u.layout_of(t).clone()));
+                    }
+                }
+            }
+        }
+        for &ed in &layout_defs {
+            if let Some(a) = u.tcx.adts.get(&ed) {
+                if a.is_enum && a.n_generics == 0 {
+                    let t = u.tcx.tys.intern(crate::types::TyKind::Adt(ed, Vec::new(), crate::types::RegionArgsId::EMPTY));
+                    if !v.iter().any(|x| x.1 == t) {
+                        v.push((ed, t, u.layout_of(t).clone()));
+                    }
+                }
+            }
+        }
+        v
+    };
+    trace_sub("gp_enum_before");
+    let same_scopes = layout_defs.is_empty() && !changes.iter().any(|c| matches!(c, Change::Macro(_)));
+    // Round-45 lead design: a change to any resolution input invalidates every
+    // legacy owner. Body-only transactions leave signature-owned RPITITs alone.
+    let body_only = same_scopes && versions.iter().all(|(_, p)| p.added.is_empty()
+        && p.removed.is_empty() && p.removed_uses.is_empty() && !p.attributes_changed);
+    // Lead decision 52 (R2): a changed const or static initializer is classified after the
+    // commit (const_contexts_mention, then folding the new initializer); a transaction that
+    // is not body-only keeps the round-51 rule for them.
+    let ctfe_items: Vec<DefId> = const_defs.iter().chain(&static_defs).copied().collect();
+    let mut ctfe_relevant = !body_only && !ctfe_items.is_empty();
+    for (version, _) in &versions {
+        ctfe_relevant |= ctfe_relevant_bodies(&u.prog, version.old, &body_defs);
+    }
+    let mut full_inputs = !body_only || ctfe_relevant;
+    let mut scope: Option<Vec<bool>> = None;
+    let saved_consts: Vec<((DefId, Vec<TyId>), u64)>;
+    let saved_failed: Vec<(DefId, Vec<TyId>)>;
     // 4: commit the versions; check
     let t1 = Instant::now();
     out.ms[0] = (t1 - t0).as_secs_f64() * 1e3;
+    trace_sub("gp_ctfe_scan");
     jit::open_patch();
     // Record only RIR first materialized during this attempt, including concurrent
     // lazy compilation while the transaction releases the unit lock.
@@ -2074,6 +2479,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     } else {
         Vec::new()
     };
+    trace_sub("gp_file_fns");
     // One summary context for the edit's field-view work (the summaries before it here,
     // the changed bodies' checks and the summaries after it in the gate): callee summaries
     // the edit cannot reach are computed once, not three times. Not across layout or
@@ -2085,13 +2491,17 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let fv_cx = (crate::borrowck::enabled(options) && same_bodies_elsewhere).then(|| fv_session_take(transaction));
     let pre_summaries = if crate::borrowck::enabled(options) { crate::borrowck::summaries_with(&u.prog, &u.tcx, &file_fns, fv_cx.as_ref()) } else { Vec::new() };
     if let Some(fv_cx) = &fv_cx { fv_cx.invalidate(&body_defs); }
+    trace_sub("gp_summaries");
     let mut news: Vec<(u32, u32)> = Vec::new();
     let mut news_pairs: Vec<Vec<(u32, u32)>> = Vec::new();
     let mut added_defs: Vec<DefId> = Vec::new();
     let mut removed_defs: Vec<DefId> = Vec::new();
     let mut add_errs: Vec<String> = Vec::new();
     let mut saved_adts: Vec<(DefId, crate::tcx::AdtT)> = Vec::new();
-    let mut saved_variants: Vec<(DefId, usize)> = Vec::new();
+    let saved_variants: Vec<(DefId, usize)> = layout_defs.iter().filter_map(|&d| {
+        let def = u.prog.def(d);
+        (def.kind == DefKind::Enum).then(|| (d, u.prog.variants[def.sub as usize].len()))
+    }).collect();
     let mut layout_restart: Vec<String> = Vec::new();
     let retry_sources: Vec<_> = if kept.is_some() && retries > 0 {
         versions.iter().map(|(v, _)| (v.old, v.path.clone(), v.pf.src[..v.pf.src_len as usize].to_vec())).collect()
@@ -2100,7 +2510,14 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     // bodies, const values and static initializers only: no name binds or unbinds, so the
     // name-resolution memos (keyed by module and name, or by file version) stay valid --
     // clearing them retired program-sized tables and every later lookup filled them again
-    let same_scopes = layout_defs.is_empty() && !changes.iter().any(|c| matches!(c, Change::Macro(_)));
+    let mut legacy_owners = Vec::new();
+    if body_only {
+        for c in &changes {
+            if let Change::Body(d) | Change::Const(d) | Change::StaticInit(d) = *c {
+                if !legacy_owners.contains(&d) { legacy_owners.push(d); }
+            }
+        }
+    }
     let carry = gandalf_carries(&changes, versions.iter().map(|(_, p)| p));
     let mut use_undo: Vec<crate::program::UseUndo> = Vec::new();
     let errors0 = u.prog.errors.len();
@@ -2113,22 +2530,20 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
         trace_stage("front_write_wait");
-        let from = u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if carry {
-            carry_gandalf(u, from, &visible_crates);
-        }
+        let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
         trace_stage("gandalf_carry");
         for (v, plan) in versions {
             let old = v.old;
             // (the caches commit_version clears are freed below, under this write lock)
             let Plan { pairs, added, removed, removed_uses, .. } = plan;
-            let same_scopes = same_scopes && added.is_empty() && removed.is_empty() && removed_uses.is_empty();
             // removed or edited `use` items: their names go before the new ones bind (M13)
             for pos in removed_uses {
                 use_undo.extend(u.prog.unbind_use(old, pos));
             }
             trace_sub("unbind_use");
-            let committed = if same_scopes { u.prog.commit_body_version(v, &pairs) } else { u.prog.commit_version(v, &pairs) };
+            // (lead decision 52 R1: the declaration pass of an item edit covers the crates
+            // that can see it; DeclarationState saves exactly what that pass replaces)
+            let committed = if body_only { u.prog.commit_body_version(v, &pairs) } else { u.prog.commit_version_in(v, &pairs, &visible_crates) };
             match committed {
                 Ok(n) => {
                     trace_sub("commit_version");
@@ -2143,8 +2558,9 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     trace_sub("add_items");
                     u.prog.unbind_defs(&removed);
                     if !removed.is_empty() {
-                        // method answers that named a removed associated fn
-                        u.tcx.uncollect_impls(&[], false);
+                        // method answers that named a removed associated fn (only crates that
+                        // can see the edit name it: lead decision 52 R1)
+                        u.tcx.publish_declarations(Some(&visible_crates));
                     }
                     trace_count("removed_defs", removed.len());
                     trace_sub("unbind_defs");
@@ -2155,6 +2571,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                         u.prog.revert_version(o, n, &news_pairs[k]);
                     }
                     u.prog.rebind_use(std::mem::take(&mut use_undo));
+                    for &(d, n) in &saved_variants { u.prog.truncate_variants(d, n); }
+                    u.tcx.publish_collected();
                     drop(fw);
                     out.rung = Rung::Restart;
                     out.lines.push(e);
@@ -2170,49 +2588,92 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             add_errs.extend(new_errs);
         }
         trace_sub("imports");
-        // struct field-list edits (M10): reconciled with the running layout, or the restart rung
-        let enum_before: Vec<(DefId, TyId, crate::layout::Layout)> = {
-            let mut v = Vec::new();
-            for f in u.fns.iter().take(if layout_defs.is_empty() { 0 } else { u.fns.len() }) {
-            trace_count("slot_visits", 1);
-                let ts: Vec<TyId> = match &f.key {
-                    FnKey::Inst(_, a) => a.clone(),
-                    FnKey::Glue(_, t) => vec![*t],
-                    _ => Vec::new(),
-                };
-                for t in ts {
-                    if let crate::types::TyKind::Adt(ed, _, _) = u.tcx.tys.kind(t).clone() {
-                        if layout_defs.contains(&ed) && u.tcx.adts.get(&ed).map_or(false, |a| a.is_enum) && u.tcx.tys.is_concrete(t) && !v.iter().any(|x: &(DefId, TyId, crate::layout::Layout)| x.1 == t) {
-                            v.push((ed, t, u.layout_of(t).clone()));
-                        }
-                    }
-                }
-            }
-            for &ed in &layout_defs {
-                if let Some(a) = u.tcx.adts.get(&ed) {
-                    if a.is_enum && a.n_generics == 0 {
-                        let t = u.tcx.tys.intern(crate::types::TyKind::Adt(ed, Vec::new(), crate::types::RegionArgsId::EMPTY));
-                        if !v.iter().any(|x| x.1 == t) {
-                            v.push((ed, t, u.layout_of(t).clone()));
-                        }
-                    }
-                }
-            }
-            v
+        let lowered = if body_only {
+            u.prog.lower_body_declarations(&legacy_owners)
+        } else {
+            crate::def_collector::lower_legacy_const_generics_in(&mut u.prog, Some(&visible_crates))
         };
-        trace_sub("layout_enums");
-        for &d in &layout_defs {
-            if u.prog.def(d).kind == DefKind::Enum {
-                let had = u.prog.add_variants(d);
-                saved_variants.push((d, had));
+        add_errs.extend_from_slice(&u.prog.errors[errors0..]);
+        u.prog.errors.truncate(errors0);
+        trace_count("legacy_owners", lowered);
+        trace_count("body_only", usize::from(body_only));
+        trace_sub("legacy_const_generics");
+        // Collection records new inline/anonymous owners before publication.
+        for &(_, new) in &news {
+            ctfe_relevant |= ctfe_relevant_bodies(&u.prog, new, &body_defs);
+        }
+        if !ctfe_relevant && !ctfe_items.is_empty() {
+            // R2: (b) no constant-evaluated context can read them; (a) each new initializer
+            // folds without executing code (const_eval.rs fold_without_execution), read
+            // through the published per-file inputs of the new version.
+            ctfe_relevant = const_contexts_mention(&u.prog, &ctfe_items);
+            trace_sub("publish_r2_mentions");
+            if !ctfe_relevant {
+                let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
+                u.tcx.queries.register_files(u.prog.files.len());
+                u.tcx.publish_file_bodies(&files);
+                let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+                // A static whose storage exists is never initialized again (static_addr keeps
+                // its address and value), so no step of this transaction runs its new
+                // initializer; any other item must fold without execution.
+                ctfe_relevant = ctfe_items.iter().any(|&d| {
+                    let stored = u.prog.def(d).kind == DefKind::Static && u.statics.get(&d).is_some_and(|&a| a != 0);
+                    let literal = relax_types::const_eval::const_body(&u.prog, d).is_some_and(|e| literal_initializer(&u.prog.files[u.prog.def(d).file as usize], e, 0));
+                    !stored && !literal && !matches!(relax_types::const_eval::fold_without_execution(&u.tcx, &u.prog, env, d), Some(Ok(_)))
+                });
+                trace_sub("publish_r2_fold");
             }
-            let (fresh_adt, perrs) = u.tcx.adt_fresh(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, d);
+            trace_count("r2_ctfe_relevant", usize::from(ctfe_relevant));
+        }
+        full_inputs |= ctfe_relevant;
+        // Lead decision 52 (R1): an item/signature edit that is not CTFE-relevant reaches the
+        // crates that can see it (queries, const values, layouts); a CTFE-relevant one keeps
+        // the tip's full invalidation (round 51).
+        if !ctfe_relevant { scope = Some(visible_crates.clone()); }
+        trace_count("full_inputs", usize::from(full_inputs));
+        trace_sub("publish_ctfe_scan");
+        {
+            let (prog, sc) = (&u.prog, scope.as_deref());
+            let take = |d: &DefId| (full_inputs && in_scope(prog, sc, *d)) || consts_hit.contains(d);
+            saved_consts = u.consts.iter().take(if full_inputs || !consts_hit.is_empty() { u.consts.len() } else { 0 }).filter(|((d, _), _)| take(d)).map(|(k, v)| (k.clone(), *v)).collect();
+            saved_failed = u.const_failed.iter().take(if full_inputs || !consts_hit.is_empty() { u.const_failed.len() } else { 0 }).filter(|(d, _)| take(d)).cloned().collect();
+        }
+        for (key, _) in &saved_consts { u.consts.remove(key); }
+        for key in &saved_failed { u.const_failed.remove(key); }
+        trace_sub("publish_consts");
+        publish_reload(u, &news, full_inputs, scope.as_deref());
+        trace_sub("publish_inputs");
+        if carry && !ctfe_relevant {
+            let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
+            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
+        }
+        trace_sub("publish_collected");
+        // struct field-list edits (M10): reconciled with the running layout, or the restart rung
+
+        for &d in &layout_defs {
+            let (fresh_adt, perrs) = u.tcx.adt_fresh(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, d);
+            trace_sub("layout_adt_fresh");
             if !perrs.is_empty() {
                 add_errs.extend(perrs);
                 continue;
             }
             let Some(fresh_adt) = fresh_adt else { continue };
-            match layout_edit(u, d, &fresh_adt) {
+            let mut after = Vec::new();
+            if fresh_adt.is_enum {
+                // RELOAD': folded values only (every query below then folds as well)
+                let Some(values) = fresh_adt.fold_discriminants(&u.tcx, &u.prog) else {
+                    layout_restart.push(format!("enum `{}`: a discriminant is now computed by code -- restart the app", def_name(&u.prog, d)));
+                    continue;
+                };
+                after = values;
+                let errors = fresh_adt.check_discriminants(&u.tcx, &u.prog);
+                if !errors.is_empty() { add_errs.extend(errors); continue; }
+            }
+            let before = running_discriminants.iter().find(|(ed, _)| *ed == d).map_or(&[][..], |(_, v)| v.as_slice());
+            trace_sub("layout_discr");
+            let edited = layout_edit(u, d, &fresh_adt, before, &after);
+            trace_sub("layout_edit");
+            match edited {
                 Ok((adt, notes)) => {
                     if let Some(old) = u.tcx.adts.insert(d, adt) {
                         saved_adts.push((d, old));
@@ -2222,11 +2683,19 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 Err(r) => layout_restart.push(r),
             }
         }
-        trace_sub("layout_edit");
+        trace_sub("layout_fresh");
         if !saved_adts.is_empty() {
-            u.tcx.publish_collected();
+            u.tcx.publish_declarations(scope.as_deref());
             trace_sub("layout_publish");
-            u.lay.clear();
+            match scope.as_deref() {
+                // the layouts of types made only of items the edit cannot reach stay
+                Some(visible) => {
+                    let crates: Vec<u32> = (0..visible.len() as u32).filter(|&k| visible[k as usize]).collect();
+                    let uu = &*u;
+                    uu.lay.clear_except(&|t| !ty_in_crates(uu, t, &crates, 0));
+                }
+                None => u.lay.clear(),
+            }
             for &ed in &layout_defs {
                 let before: Vec<(TyId, crate::layout::Layout)> = enum_before.iter().filter(|x| x.0 == ed).map(|x| (x.1, x.2.clone())).collect();
                 if before.is_empty() {
@@ -2241,13 +2710,12 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // the added items' signatures, types and impl tables
         trace_count("added_defs", added_defs.len());
         if !added_defs.is_empty() {
-            let e = u.tcx.collect_added(&u.prog, &added_defs, false);
+            let e = u.tcx.collect_added_in(&u.prog, &added_defs, false, scope.as_deref());
             add_errs.extend(e);
         }
         trace_sub("collect_added");
         unsafe {
             u.prog.reclaim_caches();
-            u.tcx.reclaim_caches();
         }
         drop(fw);
         trace_sub("reclaim");
@@ -2295,15 +2763,6 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     trace_sub("drop_glue");
-    // the consts to evaluate again, saved for a refusal
-    let saved_consts: Vec<((DefId, Vec<TyId>), u64)> = u.consts.iter().take(if consts_hit.is_empty() { 0 } else { u.consts.len() }).filter(|((d, _), _)| consts_hit.contains(d)).map(|(k, v)| (k.clone(), *v)).collect();
-    for (k, _) in &saved_consts {
-        u.consts.remove(k);
-    }
-    let saved_failed: Vec<(DefId, Vec<TyId>)> = u.const_failed.iter().take(if consts_hit.is_empty() { 0 } else { u.const_failed.len() }).filter(|(d, _)| consts_hit.contains(d)).cloned().collect();
-    for k in &saved_failed {
-        u.const_failed.remove(k);
-    }
     // the added items' diagnostics: only those in the edited files are the edit's (collect_added
     // also flushes what background type checks of other crates queued meanwhile)
     let edited: Vec<String> = olds.iter().map(|&f| u.prog.file_paths[f as usize].clone()).collect();
@@ -2339,7 +2798,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
         trace_count("typecheck_items", uniq.len());
         for (d, a) in uniq {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &a)));
             match r {
                 Ok(b) => {
                     for e in &b.errors {
@@ -2525,7 +2984,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 else if f.compiled { olds_c.push(id); }
             }
         }
-        let new_ids: Vec<(u32, Option<(u32, TyId, TyId, TyId)>)> = news_c.iter().map(|&n| (n, closure_ident(u, n))).collect();
+        let new_ids: Vec<(u32, Option<(u32, TyId, Vec<TyId>, TyId)>)> = news_c.iter().map(|&n| (n, closure_ident(u, n))).collect();
         for o in olds_c {
             let oi = closure_ident(u, o);
             let parent = match &u.fns[o as usize].key {
@@ -2538,7 +2997,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             match hit {
                 Some((n, _)) => rebind.push((o, *n)),
                 None => {
-                    if oi.is_some() && new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.map(|x| x.0) == oi.map(|x| x.0)) {
+                    if oi.is_some() && new_ids.iter().any(|(n, ni)| matches!(&u.fns[*n as usize].key, FnKey::Closure(_, _, p) if *p == parent) && ni.as_ref().map(|x| x.0) == oi.as_ref().map(|x| x.0)) {
                         out.lines.push(format!("kept: stored values of closure {} keep its old code (its captures or signature changed)", u.fns[o as usize].name));
                     }
                 }
@@ -2611,22 +3070,21 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         // nothing installs: the running versions come back, and everything built from the
         // refused text is dropped (built again from the running text when needed)
         let fw = jit::front_write();
-        let from = u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if carry {
-            carry_gandalf(u, from, &visible_crates);
-        }
+        let from = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
         u.prog.unbind_defs(&added_defs);
         u.prog.unbind_imports_from(imports0);
         u.prog.rebind_use(std::mem::take(&mut use_undo));
-        u.tcx.uncollect_impls(&added_impls, false);
+        if !added_impls.is_empty() { u.tcx.uncollect_impls(&added_impls); }
         u.prog.rebind_defs(&removed_defs);
         for (k, &(o, n)) in news.iter().enumerate().rev() {
             u.prog.revert_version(o, n, &news_pairs[k]);
         }
-        unsafe {
-            u.prog.reclaim_caches();
-            u.tcx.reclaim_caches();
+        publish_reload(u, &news, full_inputs, scope.as_deref());
+        if carry && !ctfe_relevant {
+            let files: Vec<u32> = news.iter().flat_map(|&(a, b)| [a, b]).collect();
+            carry_gandalf(u, from, &visible_crates, if full_inputs { None } else { Some(&files) });
         }
+        unsafe { u.prog.reclaim_caches(); }
         drop(fw);
         jit::bump_patch_epoch();
         let mut invalidated = u.reload_rir.take().unwrap_or_default();
@@ -2640,6 +3098,11 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             u.reload_errors.remove(&id);
             u.reload_specs.remove(&id);
             u.bodies.remove(&id);
+        }
+        if full_inputs {
+            let (prog, sc) = (&u.prog, scope.as_deref());
+            u.consts.retain(|(d, _), _| !in_scope(prog, sc, *d));
+            u.const_failed.retain(|(d, _)| !in_scope(prog, sc, *d));
         }
         for k in consts_hit.iter() {
             let ks: Vec<(DefId, Vec<TyId>)> = u.consts.keys().filter(|(d, _)| d == k).cloned().collect();
@@ -2779,7 +3242,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         }
     }
     out.files = olds.iter().map(|o| news.iter().find(|(x, _)| x == o).map_or(*o, |(_, n)| *n)).collect();
-    out.undo = Some(Undo { group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone() });
+    out.undo = Some(Undo { group: gen, versions: news.clone(), pairs: news_pairs.clone(), added: added_defs.clone(), removed: removed_defs.clone(), consts: saved_consts, consts_hit: consts_hit.clone(), adts: saved_adts, variants: saved_variants, const_failed: saved_failed, full_inputs, scope: scope.clone() });
     out.rung = Rung::Patch;
     if let Some(fv_cx) = fv_cx { fv_session_keep(transaction, fv_cx); }
     trace_count("inlining_callers", inlining_callers.len());
@@ -3436,6 +3899,7 @@ unsafe fn watch(up: *mut Unit) {
             let o = Outcome { kept: 0, pending: false, rung: Rung::Patch, files: Vec::new(), lines: Vec::new(), names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] };
             let what: Vec<String> = changed.iter().map(|&k| files[k].0.rsplit('/').next().unwrap_or("").to_string()).collect();
             log_edit(&what.join(", "), &o, saved, seen);
+            eprintln!("relax-live: {}: patched (0 item(s) changed, 0 fn(s) installed) in 0.0 ms", what.join(", "));
             continue;
         }
         let names: Vec<String> = edits.iter().map(|e| e.path.rsplit('/').next().unwrap_or("").to_string()).collect();
@@ -3486,5 +3950,339 @@ unsafe fn watch(up: *mut Unit) {
                 undos.remove(0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod round32_tests {
+    use super::*;
+
+    #[test]
+    fn enum_reload_snapshots() {
+        const CHILD: &str = "RELAX_ENUM_RELOAD_CASE";
+        let Ok(case) = std::env::var(CHILD) else {
+            for case in ["same", "changed", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
+                    .env(CHILD, case).env("RELAX_CTFE", "0").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0")
+                    .output().unwrap();
+                assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            }
+            return;
+        };
+        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        crate::borrowck::lazy::disable_gandalf();
+        let (old, new, accept) = match case.as_str() {
+            "same" => ("enum E { A = 1, B }", "enum E { A = 1 + 0, B }", true),
+            "changed" => ("enum E { A = 1, B }", "enum E { A = 2, B }", false),
+            "removed" => ("enum E { A = 1, B }", "enum E { A = 1 }", false),
+            "reordered" => ("enum E { A = 1, B }", "enum E { B = 1, A }", false),
+            "added" => ("enum E { A = 1, B }", "enum E { A = 1, B, C }", true),
+            "larger" => ("enum E { A, B }", "enum E { A, B, C([u64; 4]) }", false),
+            "named" => ("const N: isize = 1; enum E { A = N, B }", "const N: isize = 2; enum E { A = N, B }", false),
+            "executable" => ("const fn d() -> isize { 1 } enum E { A = d(), B }", "const fn d() -> isize { 1 } enum E { A = d() + 1, B }", false),
+            "callee" => ("const fn d() -> isize { 1 } enum E { A = d(), B }", "const fn d() -> isize { 2 } enum E { A = d(), B }", false),
+            // RELOAD': a named const computed by code is a dependency of the discriminant
+            "named_code" => ("const fn d() -> isize { 1 } const N: isize = d(); enum E { A = N, B }", "const fn d() -> isize { 2 } const N: isize = d(); enum E { A = N, B }", false),
+            // RELOAD': an edit outside the discriminant's dependencies keeps its value, unevaluated
+            "unrelated" => ("const fn d() -> isize { 1 } fn g() -> isize { 5 } enum E { A = d(), B }", "const fn d() -> isize { 1 } fn g() -> isize { 6 } enum E { A = d(), B }", true),
+            _ => unreachable!(),
+        };
+        let path = std::env::temp_dir().join(format!("relax-enum-reload-{}.rs", std::process::id()));
+        std::fs::write(&path, old).unwrap();
+        let mut session = crate::Session::default();
+        session.options.ctfe = crate::options::Ctfe::Off;
+        let session = std::sync::Arc::new(session);
+        let (prog, core, krate) = crate::load_with_std(&session, path.to_str().unwrap(), "enum_reload", false).unwrap();
+        let def = prog.defs.iter().enumerate().find_map(|(i, d)| (d.krate == krate && d.kind == DefKind::Enum).then_some(DefId(i as u32))).unwrap();
+        let file = prog.def(def).file;
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        crate::layout::set_root_crate(krate);
+        crate::layout::LIVE_SESSION.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut unit = Unit::new(prog, tcx, core);
+        let up = &mut *unit as *mut Unit;
+        let values = |u: &Unit| u.tcx.adts[&def].discriminants(&u.tcx, &u.prog).into_iter().map(|(_, d)| d.val).collect::<Vec<_>>();
+        let before = values(&unit);
+        let executable = matches!(case.as_str(), "executable" | "callee" | "named_code" | "unrelated");
+        if executable { assert!(unit.stats.ctfe_code > 0, "the initializer must have run through JIT"); }
+        let runs = unit.stats.ctfe_code;
+        assert_eq!(before, if case == "larger" { vec![0, 1] } else { vec![1, 2] });
+        let ty = unit.tcx.tys.intern(crate::types::TyKind::Adt(def, Vec::new(), crate::types::RegionArgsId::EMPTY));
+        let layout = unit.layout_of(ty).clone();
+        let outcome = unsafe { apply(up, vec![Edit { file, path: path.to_string_lossy().into_owned(), src: new.as_bytes().to_vec() }]) };
+        assert_eq!(outcome.rung, if accept { Rung::Patch } else { Rung::Restart },
+            "{case}: {:?}; queried values after transaction: {:?}", outcome.lines, values(&unit));
+        assert_eq!(unit.stats.ctfe_code, runs, "{case}: the transaction must not run an initializer");
+        if accept {
+            assert_eq!(&values(&unit)[..2], before);
+            unsafe { rollback(up, outcome.undo.unwrap()); }
+        }
+        assert_eq!(values(&unit), before, "running values restored");
+        assert_eq!(unit.layout_of(ty).size, layout.size);
+        assert_eq!(unit.tcx.adts[&def].variants.len(), 2);
+        // A second edit after refusal/rollback must still compare to the original text.
+        let outcome = unsafe { apply(up, vec![Edit { file: unit.prog.def(def).file, path: path.to_string_lossy().into_owned(), src: old.as_bytes().to_vec() }]) };
+        assert_eq!(outcome.rung, Rung::Patch, "{:?}", outcome.lines);
+        std::mem::forget(unit);
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod round43_tests {
+    #[test]
+    fn generated_impl_identity_ignores_tokenization_whitespace() {
+        let session = std::sync::Arc::new(crate::Session::default());
+        let source = br#"
+            struct App;
+            trait AppMain { fn restart_state(); fn handle_event(); }
+            impl AppMain for App {
+                fn restart_state() {
+                    trait RestartFieldsFallback { fn restart_fields(); }
+                    impl RestartFieldsFallback for App { fn restart_fields() {} }
+                }
+                fn handle_event() {}
+            }
+            impl App { fn started() {} }
+            impl App { fn stopped() {} }
+        "#;
+        let old = crate::parser::parse_owned(&session, source.to_vec(), 2021).unwrap();
+        let mut new = crate::parser::parse_owned(&session, source.to_vec(), 2021).unwrap();
+        // A hosted expansion may still be stored as text, while the running
+        // version has tokens after its definition bodies have been collected.
+        new.toks = Default::default();
+        let (pairs, removed, added) = super::pair_items(&old, &new);
+        assert!(removed.is_empty(), "removed: {:?}", removed);
+        assert!(added.is_empty(), "added: {:?}", added);
+        assert_eq!(pairs.len(), old.ast.items.len());
+    }
+}
+
+#[cfg(test)]
+mod round51_tests {
+    use super::*;
+
+    #[test]
+    fn ctfe_relevance_uses_both_collected_versions() {
+        // rustc_resolve/src/def_collector.rs:423-448 @8d1a764: anonymous and
+        // inline constants are child owners, including those nested in closures.
+        let session = std::sync::Arc::new(crate::Session::default());
+        for body in ["let _x = const { 3u32 };", "let _x: [u8; 3];",
+            "let _x = [0u8; 3];", "let _x = || { const { 3u32 } };",
+            "const N: u32 = 3;", "static N: u32 = 3;"] {
+            let source = format!("#![no_std] fn owner() {{ {body} }} fn ordinary() {{ let _x = 1u32; }}");
+            let path = std::env::temp_dir().join(format!("relax-r51-classify-{}.rs", std::process::id()));
+            std::fs::write(&path, &source).unwrap();
+            let mut prog = Program::new(&session);
+            prog.load_crate("classify", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+            let owner = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "owner").then_some(DefId(i as u32))).unwrap();
+            let ordinary = prog.defs.iter().enumerate().find_map(|(i, _)| (prog.name(DefId(i as u32)) == "ordinary").then_some(DefId(i as u32))).unwrap();
+            let mut tcx = crate::tcx::Tcx::new(); tcx.collect(&prog);
+            let file = prog.def(owner).file;
+            assert!(ctfe_relevant_bodies(&prog, file, &[owner]), "before: {body}");
+            assert!(!ctfe_relevant_bodies(&prog, file, &[ordinary]), "unrelated owner: {body}");
+            // Named items change scopes; the body-only transition below tests
+            // inline/anonymous owners, whose presence must be checked on removal.
+            if !body.starts_with("const N") && !body.starts_with("static N") {
+                let edited = source.replace(body, "let _plain = 2u32;");
+                let version = prog.parse_version(file, "classify.rs", edited.into_bytes()).unwrap();
+                let pairs = pair_items(&prog.files[file as usize], &version.pf).0;
+                let new = prog.commit_body_version(version, &pairs).unwrap();
+                prog.lower_body_declarations(&[owner]);
+                assert!(!ctfe_relevant_bodies(&prog, new, &[owner]), "removed: {body}");
+                prog.revert_version(file, new, &pairs);
+                assert!(ctfe_relevant_bodies(&prog, file, &[owner]), "restored: {body}");
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod round51_token_lookup_tests {
+    use crate::lexer::{T, Tok};
+
+    #[test]
+    fn first_tok_at_steps_over_interp_tokens() {
+        // ordinary tokens in position order; Interp tokens carry an earlier expression span
+        let mut toks = Vec::new();
+        for i in 0..64u32 {
+            if i % 5 == 3 { toks.push(Tok { kind: T::Interp, lo: 2, hi: 4 }); }
+            toks.push(Tok { kind: T::Ident, lo: 100 + i * 10, hi: 105 + i * 10 });
+        }
+        for i in 0..64u32 {
+            let at = super::first_tok_at(&toks, 100 + i * 10);
+            assert_eq!({ toks[at].lo }, 100 + i * 10, "token {i}");
+            let at = super::first_tok_at(&toks, 101 + i * 10);
+            assert!(at == toks.len() || { toks[at].lo } == 110 + i * 10, "after token {i}");
+        }
+        assert_eq!(super::first_tok_at(&toks, 0), 0);
+        assert_eq!(super::first_tok_at(&toks, 10_000), toks.len());
+    }
+}
+
+#[cfg(test)]
+mod round52_scope_tests {
+    use super::*;
+
+    fn named(prog: &Program, name: &str) -> DefId {
+        (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|d| prog.name(*d) == name).unwrap()
+    }
+
+    /// One item edit through the declaration path apply_locked takes for a non-CTFE item
+    /// edit (lead decision 52 R1): commit, added items, the crate-scoped legacy pass and
+    /// scoped publication. Returns the new version, its pairs and the visible crates.
+    fn item_edit(prog: &mut Program, tcx: &mut crate::tcx::Tcx, file: u32, path: &str, src: String) -> (u32, Vec<(u32, u32)>, Vec<bool>, usize) {
+        let version = prog.parse_version(file, path, src.into_bytes()).unwrap();
+        let plan = classify(prog, file, &version.pf, path).unwrap();
+        assert!(!plan.added.is_empty(), "the edit adds an item");
+        let visible = crates_seeing_edit(prog, [file].into_iter());
+        let new = prog.commit_version_in(version, &plan.pairs, &visible).unwrap();
+        let items: Vec<(crate::ast::ItemId, Result<u32, DefId>)> = plan.added.iter().map(|&(j, at)| (crate::ast::ItemId(j), at)).collect();
+        let added = prog.add_items(new, &items).unwrap();
+        let lowered = crate::def_collector::lower_legacy_const_generics_in(prog, Some(&visible));
+        tcx.collect_added_in(prog, &added, false, Some(&visible));
+        (new, plan.pairs, visible, lowered)
+    }
+
+    #[test]
+    fn round52_item_edit_reaches_only_crates_that_see_it() {
+        let dir = std::env::temp_dir().join(format!("relax-r52-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, src: &str| { let p = dir.join(name); std::fs::write(&p, src).unwrap(); p.to_str().unwrap().to_string() };
+        let base_src = "#![no_std]\npub struct B(pub u32);\npub fn base_fn() -> u32 { B(1).0 }\n";
+        let lib_src = "#![no_std]\npub fn lib_fn() -> u32 { r52_base::base_fn() + 1 }\n";
+        let app_src = "#![no_std]\npub fn app_fn() -> u32 { r52_lib::lib_fn() + 2 }\n";
+        let (base_path, lib_path, app_path) = (write("base.rs", base_src), write("lib.rs", lib_src), write("app.rs", app_src));
+        let session = std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let mut prog = Program::new(&session);
+        let base = prog.load_crate("r52_base", &base_path, 2021, cfg.clone(), vec![]).unwrap();
+        let base_sym = prog.syms.intern("r52_base");
+        let lib = prog.load_crate("r52_lib", &lib_path, 2021, cfg.clone(), vec![(base_sym, base)]).unwrap();
+        let lib_sym = prog.syms.intern("r52_lib");
+        let app = prog.load_crate("r52_app", &app_path, 2021, cfg, vec![(lib_sym, lib)]).unwrap();
+        prog.resolve_imports();
+        assert!(prog.errors.is_empty(), "{:?}", prog.errors);
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let owners = [named(&prog, "base_fn"), named(&prog, "lib_fn"), named(&prog, "app_fn")];
+        let typeck = |prog: &Program, tcx: &crate::tcx::Tcx| owners.map(|d| tcx.typeck(prog, d));
+        let legacy = |prog: &Program| owners.map(|d| prog.legacy_const_args[&d].clone());
+        let owners_in = |prog: &Program, krate: u32| prog.legacy_const_args.keys().filter(|d| prog.def(**d).krate == krate).count();
+        let file_of = |prog: &Program, krate: u32| prog.mods[prog.crates[krate as usize].root_mod as usize].file;
+
+        // An item added in the app crate: only the app crate's owners are lowered again and
+        // only its queries recompute; base (std-like) and lib (widgets-like) keep everything.
+        let before = typeck(&prog, &tcx);
+        let legacy_before = legacy(&prog);
+        for b in &before { assert!(b.errors.is_empty(), "{:?}", b.errors); }
+        let app_file = file_of(&prog, app);
+        let (new, pairs, visible, lowered) = item_edit(&mut prog, &mut tcx, app_file, &app_path, format!("{app_src}pub fn app_added() -> u32 {{ 3 }}\n"));
+        assert_eq!(visible, vec![false, false, true]);
+        assert_eq!(lowered, owners_in(&prog, app), "the legacy pass covers the app crate's owners only");
+        let legacy_after = legacy(&prog);
+        assert!(std::sync::Arc::ptr_eq(&legacy_before[0], &legacy_after[0]) && std::sync::Arc::ptr_eq(&legacy_before[1], &legacy_after[1]));
+        assert!(!std::sync::Arc::ptr_eq(&legacy_before[2], &legacy_after[2]));
+        let after = typeck(&prog, &tcx);
+        let recomputed: Vec<bool> = (0..3).map(|i| !std::sync::Arc::ptr_eq(&before[i], &after[i])).collect();
+        assert_eq!(recomputed, vec![false, false, true], "only the app owner's typeck recomputes");
+        for b in &after { assert!(b.errors.is_empty(), "{:?}", b.errors); }
+        // the refused/rolled-back edit: the saved declaration state of the app crate returns
+        prog.revert_version(app_file, new, &pairs);
+        tcx.publish_declarations(Some(&visible));
+        assert!(std::sync::Arc::ptr_eq(&legacy_before[2], &prog.legacy_const_args[&owners[2]]), "revert restores the scoped legacy results");
+        assert!(std::sync::Arc::ptr_eq(&legacy_before[0], &prog.legacy_const_args[&owners[0]]));
+        let reverted = typeck(&prog, &tcx);
+        assert!(std::sync::Arc::ptr_eq(&before[0], &reverted[0]) && std::sync::Arc::ptr_eq(&before[1], &reverted[1]));
+
+        // An item added in the lib (widget) crate reaches the app crate that depends on it.
+        let before = reverted;
+        let lib_file = file_of(&prog, lib);
+        let (_, _, visible, lowered) = item_edit(&mut prog, &mut tcx, lib_file, &lib_path, format!("{lib_src}pub fn lib_added() -> u32 {{ 4 }}\n"));
+        assert_eq!(visible, vec![false, true, true]);
+        assert_eq!(lowered, owners_in(&prog, lib) + owners_in(&prog, app));
+        let after = typeck(&prog, &tcx);
+        let recomputed: Vec<bool> = (0..3).map(|i| !std::sync::Arc::ptr_eq(&before[i], &after[i])).collect();
+        assert_eq!(recomputed, vec![false, true, true], "lib and its dependent app recompute; base keeps its result");
+        for b in &after { assert!(b.errors.is_empty(), "{:?}", b.errors); }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod round52_r2_tests {
+    use super::*;
+
+    /// Lead decision 52 (R2): which changed constants and statics a constant-evaluated
+    /// context can read (const_contexts_mention), one item at a time.
+    #[test]
+    fn round52_const_context_mentions() {
+        let source = r#"#![no_std]
+pub const C_FN: u32 = 1;
+pub const C_CONST: u32 = 2; const D: u32 = C_CONST + 1;
+pub const C_LEN: usize = 3; fn uses_len() { let _a: [u8; C_LEN] = [0; 3]; }
+pub const C_REPEAT: usize = 4; fn uses_repeat() { let _a = [0u8; C_REPEAT]; }
+pub const C_BODY: u32 = 5; const fn cf() -> u32 { C_BODY }
+pub const C_STATIC: u32 = 6; static S_FROM_CONST: u32 = C_STATIC;
+pub const C_ALIAS: u32 = 7; mod m { pub use super::C_ALIAS as RENAMED; } const E: u32 = m::RENAMED;
+pub const C_INLINE: u32 = 8; fn uses_inline() -> u32 { const { C_INLINE } }
+macro_rules! get { () => { C_MACRO } }
+pub const C_MACRO: u32 = 9; const F: u32 = get!();
+pub static S_FN: [u32; 2] = [1, 2];
+pub static S_ADDR: [u32; 2] = [3, 4]; static HOLDER: &[u32; 2] = &S_ADDR;
+pub static S_READ: [u32; 2] = [5, 6]; const fn cf2() -> u32 { S_READ[0] }
+pub static S_SIZED: usize = 2; fn ss() { let _x: [u8; S_SIZED]; }
+fn ordinary() -> u32 { let _a = S_FN[0]; C_FN + S_FN[1] }
+"#;
+        let path = std::env::temp_dir().join(format!("relax-r52-mentions-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate("r52_mentions", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        prog.resolve_imports();
+        let named = |name: &str| (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|d| prog.name(*d) == name && matches!(prog.def(*d).kind, DefKind::Const | DefKind::Static)).unwrap();
+        for (name, expected) in [("C_FN", false), ("C_CONST", true), ("C_LEN", true), ("C_REPEAT", true), ("C_BODY", true),
+            ("C_STATIC", true), ("C_ALIAS", true), ("C_INLINE", true), ("C_MACRO", true),
+            ("S_FN", false), ("S_ADDR", false), ("S_READ", true), ("S_SIZED", true)] {
+            assert_eq!(const_contexts_mention(&prog, &[named(name)]), expected, "{name}");
+        }
+        assert!(const_contexts_mention(&prog, &[named("C_FN"), named("C_LEN")]), "any item of the transaction");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// R2 (a): literal initializers fold without executing code; anything else does not count.
+    #[test]
+    fn round52_literal_initializers() {
+        let source = r#"#![no_std]
+pub struct Origin { pub file: &'static str, pub offset: u32, pub line: i32 }
+pub struct WithDefault { pub a: u32 }
+const fn f() -> u32 { 1 }
+const K: u32 = 2;
+pub static L_FILES: [(&str, u64); 2] = [("a.rx", 1), ("b.rx", 2)];
+pub static L_ORIGINS: [Origin; 1] = [Origin { file: "a.rx", offset: 3, line: -4 }];
+pub static L_REPEAT: [u8; 4] = [0; 4];
+pub static L_REF: &[u32] = &[1, 2];
+pub const L_SCALAR: (u32, bool) = (1, true);
+pub static N_CALL: u32 = f();
+pub static N_PATH: u32 = K;
+pub static N_BLOCK: u32 = { 3 };
+pub static N_COUNT: [u8; K as usize] = [0; K as usize];
+pub static N_BINARY: u32 = 1 + 2;
+"#;
+        let path = std::env::temp_dir().join(format!("relax-r52-literal-{}.rs", std::process::id()));
+        std::fs::write(&path, source).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate("r52_literal", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), vec![]).unwrap();
+        for i in 0..prog.defs.len() {
+            let d = DefId(i as u32);
+            let name = prog.name(d).to_string();
+            if !(name.starts_with("L_") || name.starts_with("N_")) || !matches!(prog.def(d).kind, DefKind::Const | DefKind::Static) { continue; }
+            let e = relax_types::const_eval::const_body(&prog, d).unwrap();
+            assert_eq!(literal_initializer(&prog.files[prog.def(d).file as usize], e, 0), name.starts_with("L_"), "{name}");
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }

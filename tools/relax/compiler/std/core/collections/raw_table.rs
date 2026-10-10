@@ -169,7 +169,8 @@ mod group {
         }
         #[inline]
         pub(super) fn match_byte(&self, byte: u8) -> BitMask {
-            unsafe { BitMask(vget_lane_u64(vreinterpret_u64_u8(vceq_u8(self.0, vdup_n_u8(byte))), 0)) }
+            // rustc_resolve/src/lib.rs:2643 @8d1a764: same-crate calls use const syntax.
+            unsafe { BitMask(vget_lane_u64::<0>(vreinterpret_u64_u8(vceq_u8(self.0, vdup_n_u8(byte))))) }
         }
         #[inline]
         pub(super) fn match_empty(&self) -> BitMask {
@@ -177,11 +178,11 @@ mod group {
         }
         #[inline]
         pub(super) fn match_empty_or_deleted(&self) -> BitMask {
-            unsafe { BitMask(vget_lane_u64(vreinterpret_u64_u8(vcltz_s8(vreinterpret_s8_u8(self.0))), 0)) }
+            unsafe { BitMask(vget_lane_u64::<0>(vreinterpret_u64_u8(vcltz_s8(vreinterpret_s8_u8(self.0))))) }
         }
         #[inline]
         pub(super) fn match_full(&self) -> BitMask {
-            unsafe { BitMask(vget_lane_u64(vreinterpret_u64_u8(vcgez_s8(vreinterpret_s8_u8(self.0))), 0)) }
+            unsafe { BitMask(vget_lane_u64::<0>(vreinterpret_u64_u8(vcgez_s8(vreinterpret_s8_u8(self.0))))) }
         }
         #[inline]
         pub(super) fn prepare_rehash(&self) -> Group {

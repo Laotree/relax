@@ -220,7 +220,6 @@ impl Cache {
                 return None;
             }
             d.str()?;
-            skip_captures(&mut d)?;
             let (_, nounwind_end) = skip_build_inputs(&mut d)?;
             let mut d = D { b: payload, p: nounwind_end };
             let nc = d.u32()? as usize;
@@ -424,7 +423,6 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
         return None;
     }
     d.str()?;
-    skip_captures(&mut d)?;
     let tier = d.u8()?;
     let ni = d.u32()?;
     let mut inl = Vec::with_capacity(ni as usize);

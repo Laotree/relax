@@ -13,7 +13,7 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { if !crate::diag::enabled() { std::eprintln!($($arg)*); } };
 }
 
-use relax_types::solve::SelectionResult;
+use relax_types::next_solver::{Goal, ParamEnv};
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
 
@@ -76,14 +76,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
-        // constants the signatures wait for (`[u8; size_of::<T>()]`) are evaluated first, as
-        // the run does before it compiles a caller: their items are re-collected with the values
-        while u.resolve_const_requests() {}
-        let up: *mut Unit = u;
-        // SAFETY: as the instance loop below: the unit outlives the call, and constant
-        // evaluation (which re-collects waiting items) runs between body checks, never inside one
-        let mut resolve = || unsafe { (&mut *up).resolve_const_requests() };
-        let n = unsafe { crate::borrowck::check_all(&(*up).prog, &(*up).tcx, options.borrowck_all == crate::options::BorrowckAll::Std, &mut resolve) };
+        let n = crate::borrowck::check_all(&u.prog, &u.tcx, options.borrowck_all == crate::options::BorrowckAll::Std);
         return (if n == 0 { 0 } else { 1 }, Vec::new());
     }
     let console = crate::gandalf_out::Console::start(emit && crate::diag::enabled(), !emit);
@@ -97,12 +90,24 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let generic = u.tcx.fn_sig(&u.prog, owner.owner).map_or(true, |s| s.n_generics > 0);
         // a fn whose where-clauses on concrete types cannot hold (`where &'a mut (): Clone`) is
         // type-checked but never compiled (rustc: impossible predicates are not codegened)
-        let impossible = u.tcx.fn_ty_bounds(&u.prog, owner.owner).map_or(false, |bs| {
-            bs.iter().any(|(st, td, ta)| u.tcx.tys.is_concrete(*st) && ta.iter().all(|x| u.tcx.tys.is_concrete(*x)) && matches!(u.tcx.select_trait(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), *td, *st, ta), SelectionResult::NoSolution))
-        });
+        let impossible = if generic || in_trait { false } else {
+            let infcx = relax_types::infer::InferCtxt::new(&u.tcx, crate::tcx::TypingMode::PostAnalysis, crate::tcx::TypingEnv::fully_monomorphized(&u.prog).limit);
+
+            u.tcx.clauses_of(&u.prog, owner.owner).into_iter().any(|predicate| {
+                !infcx.evaluate_obligation(&u.prog, Goal { param_env: ParamEnv::default(), predicate }).may_apply()
+            })
+        };
         fns.push((owner, generic || in_trait || impossible));
     }
     let n_own = fns.len();
+    // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own
+    for anon in crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, root) {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.typeck(&u.prog, anon).errors.clone()));
+        match r {
+            Ok(e) => errors.extend(e),
+            Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(anon))),
+        }
+    }
     let mut checked = 0usize;
     // the non-generic fns whose bodies type-check: compiled below, in parallel
     let mut seeds = Vec::new();
@@ -110,25 +115,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let d = owner.owner;
         if owner.kind != crate::borrowck::body::BodyKind::Function {
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let args = owner.identity_args(&u.prog, &u.tcx);
-                // as for fn bodies: consts whose values the owner's types wait for (array lengths
-                // of foreign consts, `[u8; len(..)]`) are evaluated, then the owner is checked again
-                u.resolve_const_requests();
-                let mut body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &args);
-                for _ in 0..4 {
-                    if (body.errors.is_empty() && !u.tcx.has_blocked_consts()) || !u.resolve_const_requests() {
-                        break;
-                    }
-                    body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &args);
-                }
-                if !body.errors.is_empty() { return body.errors; }
+                let body = u.tcx.typeck(&u.prog, d);
+                if !body.errors.is_empty() { return body.errors.clone(); }
                 if !crate::borrowck::enabled(options) { return Vec::new(); }
-                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, &body);
+                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, &body);
                 crate::borrowck::note_verdict(&v);
                 if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
                     for x in &v.unchecked { eprintln!("relax-check: borrowck unchecked: {}", x); }
                 }
-                borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
+                borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                 Vec::<String>::new()
             }));
             match r {
@@ -137,57 +132,34 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             }
             continue;
         }
-        // generic bodies are checked through their instances (Relax type-checks per instance;
-        // a polymorphic check lacks bound-driven lookups); the borrow checker tries the
-        // polymorphic body (rustc borrow-checks generic bodies once) when it type-checks
         if generic {
-            if crate::borrowck::enabled(options) {
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                    let uu = &mut *up;
-                    let args = match crate::borrowck::identity_args(&uu.tcx, &uu.prog, d) {
-                        Some(a) => a,
-                        None => return Vec::new(),
-                    };
-                    let body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, d, &args);
-                    if !body.errors.is_empty() {
-                        return Vec::new();
-                    }
-                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                let uu = &mut *up;
+                let body = uu.tcx.typeck(&uu.prog, d);
+                let errors = body.errors.clone();
+                if errors.is_empty() && crate::borrowck::enabled(options) {
+                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
                     crate::borrowck::note_verdict(&v);
-                    borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
-                    Vec::<String>::new()
-                }));
-                match r {
-                    Ok(e) => errors.extend(e),
-                    // the polymorphic body's check panicked: a Relax bug, reported (never dropped)
-                    Err(_) => {
-                        let def = u.prog.def(d);
-                        let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
-                        errors.push(u.prog.record_error(def.file, pos, "borrowck", format!("internal compiler error while borrow-checking {} -- Relax bug, report it{}", u.prog.def_path(d), jit::take_ice_location())));
-                    }
+                    borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                 }
+                errors
+            }));
+            match r {
+                Ok(e) => errors.extend(e),
+                Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(d))),
             }
             continue;
         }
         let name = u.prog.def_path(d);
         jit::compile_watch(Some((&format!("check typeck {}", name), 0)));
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            // as a build does: consts that lengths wait for are evaluated (CTFE by running them)
-            // and the body is checked again once they are
-            (&mut *up).resolve_const_requests();
-            let mut errs = { let uu = &mut *up; crate::typeck::check_fn(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &mut uu.tcx, d, &[]).errors };
-            for _ in 0..4 {
-                if errs.is_empty() || !(&mut *up).resolve_const_requests() {
-                    break;
-                }
-                errs = { let uu = &mut *up; crate::typeck::check_fn(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &mut uu.tcx, d, &[]).errors };
-            }
+            let errs = { let uu = &mut *up; uu.tcx.typeck(&uu.prog, d).errors.clone() };
             // the borrow checker on the checked body (plans/relax-borrowck.md)
             if errs.is_empty() && crate::borrowck::enabled(options) {
                 let uu = &mut *up;
-                let body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, d, &[]);
+                let body = uu.tcx.typeck(&uu.prog, d);
                 if body.errors.is_empty() {
-                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
+                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
                     crate::borrowck::note_verdict(&v);
                     borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &[], v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
                     if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
@@ -260,16 +232,23 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             let FnKey::Inst(d, args) = key else { continue };
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                 let uu = &mut *up;
-                let body = crate::typeck::check_fn(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, d, &args);
+                let state = crate::tcx::EvalState::new();
+                let cx = crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &state);
+                let body = crate::typeck::instantiate_body(&cx, &uu.prog, &uu.tcx, d, &args);
                 if !body.errors.is_empty() {
                     return;
                 }
-                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
+                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
                 crate::borrowck::note_verdict(&v);
-                borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
+                borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
             }));
             let _ = r;
         }
+    }
+    unsafe {
+        if !errors.is_empty() { (*up).query_errors.note_reported_error(); }
+        (*up).flush_query_errors(true);
+        errors.extend_from_slice(&(*up).errors);
     }
     let t_compile = t_check.elapsed() - t_front;
     if crate::memstat::enabled() {
@@ -500,6 +479,7 @@ fn function_origin(u: &Unit, mut id: u32) -> Option<(u32,u32)> {
             FnKey::Inst(d,_) => { let d = u.prog.def(*d); return Some((d.file,u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Closure(f,e,_) => return Some((*f,u.prog.files[*f as usize].ast.expr(crate::ast::ExprId(*e)).lo)),
             FnKey::Sandbox(parent) => id = *parent,
+            FnKey::Shim(shim) => { let d = u.prog.def(shim.kind.def_id()); return Some((d.file, u.prog.files[d.file as usize].ast.item(d.item).lo)); }
             FnKey::Glue(_,t) => {
                 if let crate::types::TyKind::Adt(d,_, _) = u.tcx.tys.kind(*t) {
                     let d = u.prog.def(*d); return Some((d.file,u.prog.files[d.file as usize].ast.item(d.item).lo));

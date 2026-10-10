@@ -10,8 +10,14 @@ pub(super) struct QueryJob {
     pub latch: Option<Arc<QueryLatch>>,
 }
 
+#[derive(Clone)]
+pub(super) enum Completion {
+    Value(Result<(), QueryError>),
+    Retry,
+}
+
 pub(super) struct QueryLatch {
-    result: Mutex<Option<Result<(), QueryError>>>,
+    result: Mutex<Option<Completion>>,
     ready: Condvar,
 }
 
@@ -20,15 +26,20 @@ impl QueryLatch {
         Self { result: Mutex::new(None), ready: Condvar::new() }
     }
 
-    pub fn wait(&self) -> Result<(), QueryError> {
+    pub fn wait(&self) -> Completion {
         let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
         while result.is_none() {
-            result = self.ready.wait(result).unwrap_or_else(|e| e.into_inner());
+            drop(result);
+            crate::preempt::point();
+            result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+            if result.is_none() {
+                result = self.ready.wait_timeout(result, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
+            }
         }
         result.as_ref().unwrap().clone()
     }
 
-    pub fn complete(&self, result: Result<(), QueryError>) {
+    pub fn complete(&self, result: Completion) {
         *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         self.ready.notify_all();
     }
@@ -41,13 +52,13 @@ pub(super) fn check_cycle(state: &State, parent: DepNodeIndex, target: DepNodeIn
     let mut next = Some(target);
     while let Some(index) = next {
         if index == parent {
-            let mut stack = vec![state.graph.nodes[parent.0 as usize].query];
+            let mut stack = vec![state.graph.nodes[parent.0 as usize].query.unwrap()];
             let mut index = target;
             while index != parent {
-                stack.push(state.graph.nodes[index.0 as usize].query);
+                stack.push(state.graph.nodes[index.0 as usize].query.unwrap());
                 index = state.jobs[index.0 as usize].waiting_on.unwrap();
             }
-            stack.push(state.graph.nodes[parent.0 as usize].query);
+            stack.push(state.graph.nodes[parent.0 as usize].query.unwrap());
             return Err(QueryError::Cycle(Cycle { stack }));
         }
         let job = &state.jobs[index.0 as usize];
@@ -78,6 +89,21 @@ pub(super) struct ActiveJobGuard<'a> {
 }
 
 impl ActiveJobGuard<'_> {
+    // Lead design round 42 extends rustc_query_impl/src/execution.rs:108-159,
+    // 179-257 @8d1a764: cancellation removes the active job without publishing
+    // poison or a value. Waiters retry; ordinary panic still poisons in Drop.
+    pub fn cancel(&mut self) {
+        let latch = {
+            let mut state = self.engine.state.lock().unwrap_or_else(|e| e.into_inner());
+            let job = &mut state.jobs[self.index.0 as usize];
+            job.active = false;
+            job.waiting_on = None;
+            job.latch.take()
+        };
+        self.finished = true;
+        if let Some(latch) = latch { latch.complete(Completion::Retry); }
+    }
+
     pub fn complete(&mut self, result: Result<(), QueryError>) {
         let latch = {
             let mut state = self.engine.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -91,7 +117,7 @@ impl ActiveJobGuard<'_> {
         };
         self.finished = true;
         if let Some(latch) = latch {
-            latch.complete(result);
+            latch.complete(Completion::Value(result));
         }
     }
 }
@@ -99,7 +125,7 @@ impl ActiveJobGuard<'_> {
 impl Drop for ActiveJobGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            let query = self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).graph.nodes[self.index.0 as usize].query;
+            let query = self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).graph.nodes[self.index.0 as usize].query.unwrap();
             self.complete(Err(QueryError::Poisoned(query)));
         }
     }

@@ -1,17 +1,23 @@
+// ported from library/core/src/cmp.rs @8d1a764
 //! Comparison traits. Primitive impls are generated (num/prim_traits.rs); the std derives
 //! (PartialEq, Eq, PartialOrd, Ord) are native in Relax.
 
 use crate::option::Option::{self, None, Some};
 
 #[cfg_attr(not(relax_check), lang = "eq")]
-pub trait PartialEq<Rhs: ?Sized = Self> {
+pub trait PartialEq<Rhs: crate::marker::PointeeSized = Self>: crate::marker::PointeeSized {
     fn eq(&self, other: &Rhs) -> bool;
     fn ne(&self, other: &Rhs) -> bool {
         !self.eq(other)
     }
 }
 
-pub trait Eq: PartialEq<Self> {}
+pub trait Eq: PartialEq<Self> + crate::marker::PointeeSized {
+    #[doc(hidden)]
+    fn assert_fields_are_eq(&self) {}
+}
+// :395: field-bound assertions emitted by derive(Eq).
+pub struct AssertParamIsEq<T: Eq + crate::marker::PointeeSized> { _field: crate::marker::PhantomData<T> }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[repr(i8)]
@@ -77,7 +83,7 @@ impl Ord for Ordering {
 }
 
 #[cfg_attr(not(relax_check), lang = "partial_ord")]
-pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
+pub trait PartialOrd<Rhs: crate::marker::PointeeSized = Self>: PartialEq<Rhs> + crate::marker::PointeeSized {
     fn partial_cmp(&self, other: &Rhs) -> Option<Ordering>;
     fn lt(&self, other: &Rhs) -> bool {
         matches!(self.partial_cmp(other), Some(Less))
@@ -93,7 +99,7 @@ pub trait PartialOrd<Rhs: ?Sized = Self>: PartialEq<Rhs> {
     }
 }
 
-pub trait Ord: Eq + PartialOrd<Self> {
+pub trait Ord: Eq + PartialOrd<Self> + crate::marker::PointeeSized {
     fn cmp(&self, other: &Self) -> Ordering;
     fn max(self, other: Self) -> Self
     where
@@ -191,34 +197,34 @@ impl<T: Ord> Ord for Reverse<T> {
 }
 
 // References compare by value.
-impl<'a, 'b, A: ?Sized + PartialEq<B>, B: ?Sized> PartialEq<&'b B> for &'a A {
+impl<'a, 'b, A: crate::marker::PointeeSized + PartialEq<B>, B: crate::marker::PointeeSized> PartialEq<&'b B> for &'a A {
     fn eq(&self, other: &&'b B) -> bool {
         (**self).eq(*other)
     }
 }
-impl<'a, 'b, A: ?Sized + PartialEq<B>, B: ?Sized> PartialEq<&'b mut B> for &'a mut A {
+impl<'a, 'b, A: crate::marker::PointeeSized + PartialEq<B>, B: crate::marker::PointeeSized> PartialEq<&'b mut B> for &'a mut A {
     fn eq(&self, other: &&'b mut B) -> bool {
         (**self).eq(*other)
     }
 }
-impl<'a, 'b, A: ?Sized + PartialEq<B>, B: ?Sized> PartialEq<&'b mut B> for &'a A {
+impl<'a, 'b, A: crate::marker::PointeeSized + PartialEq<B>, B: crate::marker::PointeeSized> PartialEq<&'b mut B> for &'a A {
     fn eq(&self, other: &&'b mut B) -> bool {
         (**self).eq(&**other)
     }
 }
-impl<'a, 'b, A: ?Sized + PartialEq<B>, B: ?Sized> PartialEq<&'b B> for &'a mut A {
+impl<'a, 'b, A: crate::marker::PointeeSized + PartialEq<B>, B: crate::marker::PointeeSized> PartialEq<&'b B> for &'a mut A {
     fn eq(&self, other: &&'b B) -> bool {
         (**self).eq(*other)
     }
 }
-impl<'a, A: ?Sized + Eq> Eq for &'a A {}
-impl<'a, A: ?Sized + Eq> Eq for &'a mut A {}
-impl<'a, 'b, A: ?Sized + PartialOrd<B>, B: ?Sized> PartialOrd<&'b B> for &'a A {
+impl<'a, A: crate::marker::PointeeSized + Eq> Eq for &'a A {}
+impl<'a, A: crate::marker::PointeeSized + Eq> Eq for &'a mut A {}
+impl<'a, 'b, A: crate::marker::PointeeSized + PartialOrd<B>, B: crate::marker::PointeeSized> PartialOrd<&'b B> for &'a A {
     fn partial_cmp(&self, other: &&'b B) -> Option<Ordering> {
         (**self).partial_cmp(*other)
     }
 }
-impl<'a, A: ?Sized + Ord> Ord for &'a A {
+impl<'a, A: crate::marker::PointeeSized + Ord> Ord for &'a A {
     fn cmp(&self, other: &&'a A) -> Ordering {
         (**self).cmp(*other)
     }

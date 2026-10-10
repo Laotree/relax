@@ -555,10 +555,7 @@ impl<Q: Queries> Validator<'_, '_, Q> {
                 let Some(Rvalue::Use(Operand::Const(c))) = self.rvalue_at(loc) else { return Ok(false) };
                 let Some(idx) = self.scalar(c)? else { return Ok(false) };
                 let TyKind::Array(_, len) = self.tx.kind(place_ty(self.tx, self.body, &base)) else { return Ok(false) };
-                let len = match crate::types::len_ty(len) {
-                    None => len,
-                    Some(t) => match self.tx.kind(t) { TyKind::ConstVal(n) => n, _ => return Ok(false) },
-                };
+                let Some(len) = len.try_to_target_usize(&self.tx.tcx.tys) else { return Ok(false) };
                 if idx >= len as u128 || !self.validate_local(*l)? { return Ok(false); }
             }
             Proj::Field(..) => {
@@ -586,7 +583,7 @@ impl<Q: Queries> Validator<'_, '_, Q> {
     fn validate_ref(&self, kind: BorrowKind, p: &Place) -> Result<bool, Blocked> {
         match kind {
             BorrowKind::Shared => Ok(!self.qualif_local(Qualif::HasMutInterior, p.local)?),
-            BorrowKind::Mut { .. } => Ok(matches!(self.tx.kind(place_ty(self.tx, self.body, p)), TyKind::Array(_, 0))),
+            BorrowKind::Mut { .. } => Ok(matches!(self.tx.kind(place_ty(self.tx, self.body, p)), TyKind::Array(_, n) if n.try_to_target_usize(&self.tx.tcx.tys) == Some(0))),
             BorrowKind::Fake | BorrowKind::Shallow | BorrowKind::Unique => Ok(false),
         }
     }

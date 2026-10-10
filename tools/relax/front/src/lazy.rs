@@ -602,7 +602,7 @@ impl Plan {
                     old_seeds == &demands && old_forced == &forced && *prefix == eager_prefix);
             let local_result = if local_candidate {
                 let _local = crate::load_profile::span(profile, "rust-demand-local-selection", "edited crates");
-                if let Some(delta) = previous[0].as_ref().and_then(|p| p.closure_delta.as_ref()) {
+                if let Some(delta) = previous[0].as_ref().and_then(|p| p.closure_delta.as_deref()).and_then(demand::ClosureDelta::decoded) {
                     names.apply_closure_delta(delta);
                     let mut incoming = part::Boundary::default();
                     for (_, old) in previous.iter().enumerate().filter(|(ci, _)| !edited.contains(ci)) {

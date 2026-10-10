@@ -274,13 +274,22 @@ pub trait Visitor {
             }
         }
     }
+    fn visit_generic_arg(&mut self, arg: &crate::consts::GenericArg) {
+        match arg {
+            crate::consts::GenericArg::Type(ty) => self.visit_ty(ty),
+            crate::consts::GenericArg::Lifetime(r) => self.visit_type_region(r),
+            crate::consts::GenericArg::Const(ct) => self.visit_type_const(ct),
+        }
+    }
+    fn visit_type_region(&mut self, _region: &crate::types::RegionId) {}
+    fn visit_type_const(&mut self, _ct: &crate::consts::Const) {}
     fn visit_aggregate_kind(&mut self, kind: &AggregateKind) {
         match kind {
             AggregateKind::Array(ty) | AggregateKind::RawPtr(ty, _) => self.visit_ty(ty),
             AggregateKind::Adt(def, _, args, user, _) => {
                 self.visit_def(def);
                 for ty in args {
-                    self.visit_ty(ty);
+                    self.visit_generic_arg(ty);
                 }
                 if let Some(user) = user {
                     self.visit_user_type_index(user);
@@ -288,7 +297,7 @@ pub trait Visitor {
             }
             AggregateKind::Closure(_, args) | AggregateKind::Coroutine(_, args) => {
                 for ty in args {
-                    self.visit_ty(ty);
+                    self.visit_generic_arg(ty);
                 }
             }
             AggregateKind::Tuple => {}
@@ -323,8 +332,8 @@ pub trait Visitor {
             }
             Const::Unevaluated { def, args, .. } => {
                 self.visit_def(def);
-                for ty in args {
-                    self.visit_ty(ty);
+                for arg in args {
+                    self.visit_generic_arg(arg);
                 }
             }
         }
@@ -610,13 +619,22 @@ pub trait MutVisitor {
             }
         }
     }
+    fn visit_generic_arg(&mut self, arg: &mut crate::consts::GenericArg) {
+        match arg {
+            crate::consts::GenericArg::Type(ty) => self.visit_ty(ty),
+            crate::consts::GenericArg::Lifetime(r) => self.visit_type_region(r),
+            crate::consts::GenericArg::Const(ct) => self.visit_type_const(ct),
+        }
+    }
+    fn visit_type_region(&mut self, _region: &mut crate::types::RegionId) {}
+    fn visit_type_const(&mut self, _ct: &mut crate::consts::Const) {}
     fn visit_aggregate_kind(&mut self, kind: &mut AggregateKind) {
         match kind {
             AggregateKind::Array(ty) | AggregateKind::RawPtr(ty, _) => self.visit_ty(ty),
             AggregateKind::Adt(def, _, args, user, _) => {
                 self.visit_def(def);
                 for ty in args {
-                    self.visit_ty(ty);
+                    self.visit_generic_arg(ty);
                 }
                 if let Some(user) = user {
                     self.visit_user_type_index(user);
@@ -624,7 +642,7 @@ pub trait MutVisitor {
             }
             AggregateKind::Closure(_, args) | AggregateKind::Coroutine(_, args) => {
                 for ty in args {
-                    self.visit_ty(ty);
+                    self.visit_generic_arg(ty);
                 }
             }
             AggregateKind::Tuple => {}
@@ -659,8 +677,8 @@ pub trait MutVisitor {
             }
             Const::Unevaluated { def, args, .. } => {
                 self.visit_def(def);
-                for ty in args {
-                    self.visit_ty(ty);
+                for arg in args {
+                    self.visit_generic_arg(arg);
                 }
             }
         }

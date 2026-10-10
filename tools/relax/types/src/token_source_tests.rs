@@ -51,8 +51,8 @@ fn token_file_type_error_names_imported_source() {
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let def = (0..p.defs.len()).map(|i| DefId(i as u32)).find(|d| p.name(*d) == "broken").unwrap();
     let state = crate::tcx::EvalState::new();
-    let cx = crate::tcx::EvalCx::new(&p, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-    let body = crate::typeck::check_fn(&cx, &p, &tcx, def, &[]);
+    let cx = crate::tcx::EvalCx::new(&p, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
+    let body = crate::typeck::instantiate_body(&cx, &p, &tcx, def, &[]);
     assert_eq!(body.errors.len(), 1, "{:?}", body.errors);
     let d = crate::diag::from_legacy(&body.errors[0], "typeck");
     assert_eq!((d.file.as_str(), d.line, d.col), (other, 2, 6));

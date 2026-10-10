@@ -3,13 +3,14 @@ use super::*;
 use crate::mir::drop_flag_effects::*;
 use crate::mir::move_paths::{InitKind, InitLocation, LookupResult, MoveData};
 use crate::tcx::Tcx;
-use crate::types::{TyKind, Types};
+use crate::types::TyKind;
+use crate::program::Program;
 
 /// rustc initialized.rs:25. Recognize exactly the MIR discriminant assignment
 /// immediately preceding SwitchInt; do not infer enum facts from arbitrary integers.
 struct SwitchData { enum_place: Place, variants: Vec<VariantIdx> }
 impl SwitchData {
-    fn new(tcx: &Tcx, body: &Body, block: BasicBlock, targets: &SwitchTargets, discr: &Operand) -> Option<Self> {
+    fn new(prog: &Program, tcx: &Tcx, body: &Body, block: BasicBlock, targets: &SwitchTargets, discr: &Operand) -> Option<Self> {
         let (Operand::Copy(discr) | Operand::Move(discr)) = discr else { return None; };
         let stmt = body.basic_blocks[block.0 as usize].statements.last()?;
         let StatementKind::Assign(lhs, Rvalue::Discriminant(enum_place)) = &stmt.kind else { return None; };
@@ -22,14 +23,11 @@ impl SwitchData {
         };
         let adt = &tcx.adts[def];
         assert!(adt.is_enum());
-        // VariantT::disc is signed i128 storage. SwitchInt uses repr-width bits,
-        // as rustc ty/adt.rs:661 Discr::val (not sign-extended to u128).
-        let bytes = adt.repr_int.map(Types::int_info).map(|info| info.0).unwrap_or(8);
-        let mask = if bytes == 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
+        let discriminants = adt.discriminants(tcx, prog);
         let mut variants = Vec::new();
         let mut index = 0;
         for &value in &targets.values {
-            while (adt.variants[index].disc as u128 & mask) != value { index += 1; }
+            while discriminants[index].1.val != value { index += 1; }
             variants.push(VariantIdx(index as u32));
         }
         Some(Self { enum_place: enum_place.clone(), variants })
@@ -44,12 +42,12 @@ impl SwitchData {
 }
 
 pub struct MaybeInitializedPlaces<'a> {
-    tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData,
+    prog: &'a Program, tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData,
     precise_enum_drop_elaboration: bool, exclude_inactive_in_otherwise: bool, skip_unreachable_unwind: bool,
 }
 impl<'a> MaybeInitializedPlaces<'a> {
-    pub fn new(tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData) -> Self {
-        Self { tcx, body, move_data, precise_enum_drop_elaboration: true,
+    pub fn new(prog: &'a Program, tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData) -> Self {
+        Self { prog, tcx, body, move_data, precise_enum_drop_elaboration: true,
             exclude_inactive_in_otherwise: false, skip_unreachable_unwind: false }
     }
     /// Explicit analysis option replaces rustc's session option (default true).
@@ -97,10 +95,10 @@ impl Analysis for MaybeInitializedPlaces<'_> {
         on_lookup_result_bits(self.move_data, self.move_data.rev_lookup.find(place), &mut |path| { state.insert(path); });
     }
     fn has_switch_int_edge_effect(&self, block: BasicBlock, targets: &SwitchTargets, discr: &Operand) -> bool {
-        self.precise_enum_drop_elaboration && SwitchData::new(self.tcx, self.body, block, targets, discr).is_some()
+        self.precise_enum_drop_elaboration && SwitchData::new(self.prog, self.tcx, self.body, block, targets, discr).is_some()
     }
     fn apply_switch_int_edge_effect(&self, state: &mut BitSet, block: BasicBlock, targets: &SwitchTargets, discr: &Operand, index: SwitchTargetIndex) {
-        let data = SwitchData::new(self.tcx, self.body, block, targets, discr).unwrap();
+        let data = SwitchData::new(self.prog, self.tcx, self.body, block, targets, discr).unwrap();
         if let Some(inactive) = data.inactive(index, self.exclude_inactive_in_otherwise) {
             on_all_inactive_variants(self.move_data, &data.enum_place, inactive, &mut |path| { state.remove(path); });
         }
@@ -108,13 +106,13 @@ impl Analysis for MaybeInitializedPlaces<'_> {
 }
 
 pub struct MaybeUninitializedPlaces<'a> {
-    tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData,
+    prog: &'a Program, tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData,
     precise_enum_drop_elaboration: bool, mark_inactive_variants_as_uninit: bool,
     include_inactive_in_otherwise: bool, skip_unreachable_unwind: BitSet,
 }
 impl<'a> MaybeUninitializedPlaces<'a> {
-    pub fn new(tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData) -> Self {
-        Self { tcx, body, move_data, precise_enum_drop_elaboration: true,
+    pub fn new(prog: &'a Program, tcx: &'a Tcx, body: &'a Body, move_data: &'a MoveData) -> Self {
+        Self { prog, tcx, body, move_data, precise_enum_drop_elaboration: true,
             mark_inactive_variants_as_uninit: false, include_inactive_in_otherwise: false,
             skip_unreachable_unwind: BitSet::new_empty(body.basic_blocks.len()) }
     }
@@ -151,10 +149,10 @@ impl Analysis for MaybeUninitializedPlaces<'_> {
     }
     fn has_switch_int_edge_effect(&self, block: BasicBlock, targets: &SwitchTargets, discr: &Operand) -> bool {
         self.precise_enum_drop_elaboration && self.mark_inactive_variants_as_uninit
-            && SwitchData::new(self.tcx, self.body, block, targets, discr).is_some()
+            && SwitchData::new(self.prog, self.tcx, self.body, block, targets, discr).is_some()
     }
     fn apply_switch_int_edge_effect(&self, state: &mut BitSet, block: BasicBlock, targets: &SwitchTargets, discr: &Operand, index: SwitchTargetIndex) {
-        let data = SwitchData::new(self.tcx, self.body, block, targets, discr).unwrap();
+        let data = SwitchData::new(self.prog, self.tcx, self.body, block, targets, discr).unwrap();
         if let Some(inactive) = data.inactive(index, self.include_inactive_in_otherwise) {
             on_all_inactive_variants(self.move_data, &data.enum_place, inactive, &mut |path| { state.insert(path); });
         }

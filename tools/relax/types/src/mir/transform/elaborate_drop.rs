@@ -3,7 +3,7 @@
 use super::{DropError, DropProvider};
 use super::patch::MirPatch;
 use crate::mir::*;
-use crate::types::{len_ty, TyKind, Types};
+use crate::types::TyKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DropStyle { Dead, Static, Conditional, Open }
@@ -207,8 +207,6 @@ impl DropCtxt<'_> {
     }
     fn variants(&mut self, site: &DropSite, ty: TyId, def: DefId, succ: BasicBlock) -> Result<(BasicBlock, Unwind), DropError> {
         let adt = &self.provider.tcx().adts[&def];
-        let bytes = match adt.repr_int { Some(p) => Types::int_info(p).0, None => 8 };
-        let mask = if bytes == 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
         let mut values = Vec::new(); let mut normal = Vec::new(); let mut cleanup = Vec::new();
         let mut otherwise = false; let mut otherwise_drop = false;
         for (i, variant) in adt.variants.iter().enumerate() {
@@ -217,7 +215,7 @@ impl DropCtxt<'_> {
             if let Some(path) = self.elaborator.subpath(site.path, &elem) {
                 let base = project(&site.place, elem);
                 let fields = self.fields(ty, Some(v), &base, path, variant.fields.len())?;
-                values.push(variant.disc as u128 & mask);
+                values.push(adt.discriminant_for_variant(self.provider.tcx(), self.provider.program(), i as u32).val);
                 if let Unwind::To(bb) = site.unwind {
                     // Separate half-ladders preserve the MSVC funclet successor invariant.
                     let unwinds = vec![Unwind::InCleanup; fields.len() + 1];
@@ -295,11 +293,8 @@ impl DropCtxt<'_> {
         let reset = self.reset(site, DropFlagMode::Deep, entry, unwind);
         Ok(self.flag_test(site, reset, site.succ, unwind))
     }
-    fn array(&mut self, site: &DropSite, ty: TyId, elem: TyId, len: u64) -> Result<BasicBlock, DropError> {
-        let size = match len_ty(len) {
-            None => Some(len),
-            Some(t) => match self.provider.tcx().tys.kind(t) { TyKind::ConstVal(n) => Some(*n), _ => None },
-        };
+    fn array(&mut self, site: &DropSite, ty: TyId, elem: TyId, len: crate::consts::Const) -> Result<BasicBlock, DropError> {
+        let size = len.try_to_target_usize(&self.provider.tcx().tys);
         if let Some(size) = size {
             let mut fields = Vec::new(); let mut start = 0; let mut found = false;
             for offset in 0..size {
@@ -334,7 +329,7 @@ impl DropCtxt<'_> {
         let ty = self.ty(&site.place)?;
         match self.provider.tcx().tys.kind(ty) {
             TyKind::Tuple(fields) => self.tuple(site, ty, fields.len()),
-            TyKind::Closure(file, expr, _, captures, _) => {
+            TyKind::Closure(file, expr, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) => {
                 if self.provider.tcx().coroutines.contains_key(&(*file, *expr)) { return Err(DropError::Unsupported("coroutine drop")); }
                 let TyKind::Tuple(fields) = self.provider.tcx().tys.kind(*captures) else { return Err(DropError::InvalidMir("closure capture storage")); };
                 self.tuple(site, ty, fields.len())

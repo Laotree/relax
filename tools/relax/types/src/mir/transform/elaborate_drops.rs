@@ -83,7 +83,7 @@ pub fn elaborate_drops(body: &mut Body, provider: &dyn DropProvider) -> Result<(
         }
     });
     if let Some(e) = error.into_inner() { return Err(e); }
-    let init = MaybeInitializedPlaces::new(provider.tcx(), body, &data).exclude_inactive_in_otherwise().skipping_unreachable_unwind();
+    let init = MaybeInitializedPlaces::new(provider.program(), provider.tcx(), body, &data).exclude_inactive_in_otherwise().skipping_unreachable_unwind();
     let initial = iterate_to_fixpoint(body, &init);
     let mut cursor = initial.cursor();
     let mut dead_unwinds = BitSet::new_empty(body.basic_blocks.len());
@@ -96,7 +96,7 @@ pub fn elaborate_drops(body: &mut Body, provider: &dyn DropProvider) -> Result<(
         }
     }
     let inits = initial;
-    let uninit = MaybeUninitializedPlaces::new(provider.tcx(), body, &data)
+    let uninit = MaybeUninitializedPlaces::new(provider.program(), provider.tcx(), body, &data)
         .include_inactive_in_otherwise().mark_inactive_variants_as_uninit().skipping_unreachable_unwind(dead_unwinds);
     let uninits = iterate_to_fixpoint(body, &uninit);
     let mut ic = inits.cursor(); let mut uc = uninits.cursor();

@@ -1,5 +1,15 @@
+// ported from N:rustc_middle/src/ty/erase_regions.rs @8d1a764
+
+// ported from N:rustc_type_ir/src/ty_kind.rs @8d1a764
 //! Interned types and their machine layout.
 
+/// Immutable declaration identity for a lifetime in an owner query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LifetimeId { pub owner: crate::program::DefId, pub local: u32 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BoundRegionKind { Anon, Named(LifetimeId) }
+
+use crate::consts::Const;
 use crate::program::{DefId, Prim};
 
 mod collected;
@@ -11,6 +21,9 @@ pub mod variance;
 #[path = "types/flags.rs"]
 mod flags;
 pub use flags::TypeFlags;
+#[path = "types/closure.rs"]
+pub mod closure;
+pub use closure::ClosureArgs;
 
 /// Zero denotes the innermost binder, as in the existing region representation.
 pub type DebruijnIndex = u32;
@@ -253,6 +266,27 @@ impl<T: std::fmt::Debug> std::fmt::Debug for DynList<T> {
     }
 }
 
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AliasTyKind {
+    Projection { def_id: DefId },
+    Inherent { def_id: DefId },
+    Opaque { def_id: DefId },
+    Free { def_id: DefId },
+}
+
+impl AliasTyKind {
+    pub fn def_id(self) -> DefId {
+        match self {
+            Self::Projection { def_id } | Self::Inherent { def_id } | Self::Free { def_id } => def_id,
+            Self::Opaque { def_id } => def_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AliasTy { pub kind: AliasTyKind, pub args: Vec<TyId>, pub regions: RegionArgsId }
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum TyKind {
     Bool,
@@ -262,13 +296,13 @@ pub enum TyKind {
     Float(Prim),
     Never,
     Tuple(Vec<TyId>),
-    /// `[T; N]`: a literal length, or (with LEN_TY set) the TyId of a const generic param /
-    /// inference variable / ConstVal standing for it (rustc's ty::Const in Array)
-    Array(TyId, u64),
+    Array(TyId, Const),
     Slice(TyId),
     Ref(bool, TyId, RegionId),
     Ptr(bool, TyId),
     Adt(DefId, Vec<TyId>, RegionArgsId),
+    /// rustc_type_ir/src/ty_kind.rs:184: an opaque extern type has thin pointers.
+    Foreign(DefId),
     /// fn pointer: (params, return, header, bound region count).
     /// Written signatures populate this binder; A3 handles inferred closure binders.
     FnPtr(Vec<TyId>, TyId, FnHeader, u32),
@@ -277,12 +311,13 @@ pub enum TyKind {
     Param(u32),
     /// inference variable (only inside one body's type check)
     Infer(u32),
-    /// a closure expression: (file, expr id, signature as FnPtr, captured state as a Tuple
-    /// (by-reference captures are pointers), owner fn instance as FnDef). The owner names the
-    /// type-checked body the closure's code is lowered from.
-    Closure(u32, u32, TyId, TyId, TyId),
-    /// associated type projection: (trait's assoc type def, [Self, trait args...])
-    Assoc(DefId, Vec<TyId>, RegionArgsId),
+    IntVar(u32),
+    FloatVar(u32),
+    /// Closure identity and synthetic kind, signature and minimum-capture arguments.
+    Closure(u32, u32, ClosureArgs),
+    /// rustc_type_ir/src/ty_kind.rs:317: rigid and normalizable aliases share
+    /// their definition identity and arguments.
+    Alias(crate::consts::IsRigid, AliasTy),
     /// trait object `dyn Trait<Args, Assoc = T>`: (principal trait, its generic args without
     /// Self, associated type bindings, principal lifetime args, object region,
     /// principal bound-region count). Each binding is (associated item, term,
@@ -293,31 +328,12 @@ pub enum TyKind {
     /// Vecs made every interned type 40 bytes larger.
     Dyn(DefId, DynList<TyId>, DynList<(DefId, TyId, u32)>, RegionArgsId, RegionId, u32, DynList<DefId>),
     /// a const generic argument's value (`Foo<3>`, the N of `[T; N]` after substitution)
-    ConstVal(u64),
-    /// return-position `impl Trait` (rustc's ty::Alias(Opaque)): (defining fn, the `impl Trait`
-    /// type's ast id, the fn's generic args). Callers see only its bounds (Tcx::opaques);
-    /// the defining body infers the hidden type, which codegen uses (typeck::reveal)
-    Opaque(DefId, u32, Vec<TyId>, RegionArgsId),
+    Const(Const),
     Error,
     /// A type variable bound by the binder at this de Bruijn index.
     Bound(DebruijnIndex, BoundTy),
     /// A universally quantified type in a particular universe.
     Placeholder(PlaceholderType),
-}
-
-/// Array length tag: the length is a TyId (const param, inference variable). The tag is a whole
-/// high word no usable length has: literal lengths keep all 64 bits (`[(); usize::MAX]` is a
-/// valid zero-sized type; a single tag bit made it read as a TyId), and a non-zero-sized array
-/// this long is too big for the address space anyway.
-pub const LEN_TY: u64 = 0x7FFF_FFFE << 32;
-
-/// The TyId an array length refers to (None: a literal length).
-pub fn len_ty(len: u64) -> Option<TyId> {
-    if len >> 32 == LEN_TY >> 32 {
-        Some(TyId(len as u32))
-    } else {
-        None
-    }
 }
 
 const F_INFER: u32 = 1;
@@ -349,8 +365,6 @@ struct Entry {
     depth: u16,
     /// Canonical free-region-erased type (self for already erased types).
     erased: TyId,
-    /// Region-insensitive key for type inference, including signature binders.
-    inference_erased: TyId,
 }
 
 /// Entries per arena chunk (chunks never move: `kind` hands out references into them).
@@ -370,6 +384,7 @@ const LOCKS: usize = 64;
 /// before a bucket head publishes them, Release/Acquire); inserts take one of a few bucket locks.
 pub struct Types {
     image: Option<collected::MappedTypes>,
+    pub(crate) consts: std::sync::Mutex<crate::consts::ConstInterner>,
     regions: std::sync::Mutex<Regions>,
     free_regions: std::sync::atomic::AtomicBool,
     chunks: Box<[std::sync::atomic::AtomicPtr<Entry>]>,
@@ -426,6 +441,7 @@ impl Types {
     pub fn new() -> Types {
         let t = Types {
             image: None,
+            consts: std::sync::Mutex::new(crate::consts::ConstInterner::default()),
             regions: std::sync::Mutex::new(Regions::default()),
             free_regions: std::sync::atomic::AtomicBool::new(false),
             chunks: (0..MAX_CHUNKS).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect(),
@@ -532,13 +548,13 @@ impl Types {
         for i in 0..n {
             let e = self.entry(TyId(i as u32));
             let p = match &e.kind {
-                TyKind::Tuple(a) | TyKind::Adt(_, a, _) | TyKind::FnDef(_, a, _) | TyKind::Assoc(_, a, _) | TyKind::Opaque(_, _, a, _) => v(a),
+                TyKind::Tuple(a) | TyKind::Adt(_, a, _) | TyKind::FnDef(_, a, _) | TyKind::Alias(_, AliasTy { args: a, .. }) => v(a),
                 TyKind::FnPtr(a, ..) => v(a),
                 TyKind::Dyn(_, a, b, _, _, _, c) => 3 * 32 + a.len() * 4 + b.len() * std::mem::size_of::<(crate::program::DefId, TyId, u32)>() + c.len() * 4,
                 _ => 0,
             };
             let d = std::mem::discriminant(&e.kind);
-            let ix = [TyKind::Bool, TyKind::Tuple(Vec::new()), TyKind::Adt(crate::program::DefId(0), Vec::new(), RegionArgsId::EMPTY), TyKind::FnDef(crate::program::DefId(0), Vec::new(), RegionArgsId::EMPTY), TyKind::Assoc(crate::program::DefId(0), Vec::new(), RegionArgsId::EMPTY), TyKind::Infer(0), TyKind::Ref(false, TyId(0), RegionId::ERASED), TyKind::Closure(0, 0, TyId(0), TyId(0), TyId(0)), TyKind::FnPtr(Vec::new(), TyId(0), FnHeader::RUST, 0)]
+            let ix = [TyKind::Bool, TyKind::Tuple(Vec::new()), TyKind::Adt(crate::program::DefId(0), Vec::new(), RegionArgsId::EMPTY), TyKind::FnDef(crate::program::DefId(0), Vec::new(), RegionArgsId::EMPTY), TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: crate::program::DefId(0) }, args: Vec::new(), regions: RegionArgsId::EMPTY }), TyKind::Infer(0), TyKind::Ref(false, TyId(0), RegionId::ERASED), TyKind::Closure(0, 0, ClosureArgs { parent_args: TyId(0), closure_kind_ty: TyId(0), closure_sig_as_fn_ptr_ty: TyId(0), tupled_upvars_ty: TyId(0) }), TyKind::FnPtr(Vec::new(), TyId(0), FnHeader::RUST, 0)]
                 .iter()
                 .position(|x| std::mem::discriminant(x) == d)
                 .map_or(21, |x| x);
@@ -579,19 +595,11 @@ impl Types {
         if let Some(id) = self.find(self.buckets[b].load(Acquire), h, &k) {
             return id;
         }
-        // a literal array length also exists as a const value (impl matching binds const
-        // params to it without interning)
-        if let TyKind::Array(_, n) = &k {
-            if len_ty(*n).is_none() {
-                self.intern(TyKind::ConstVal(*n));
-            }
-        }
         let (binder_flags, outer_exclusive_binder) = self.binder_flags_of(&k);
         let f = self.flags_of(&k) | binder_flags;
         let dp = self.depth_of(&k);
         // Before taking either type-interner lock: erasure may intern a new type.
         let erased = self.erased_kind(&k).map(|k| self.intern(k));
-        let inference_erased = self.inference_erased_kind(&k).map(|k| self.intern(k));
         if erased.is_some() {
             self.free_regions.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -613,7 +621,7 @@ impl Types {
             }
             self.chunks[ci].store(c, Release);
         }
-        unsafe { c.add(i & (CHUNK - 1)).write(Entry { kind: k, hash: h, next: head, flags: f, outer_exclusive_binder, depth: dp, erased: erased.unwrap_or(TyId(i as u32)), inference_erased: inference_erased.unwrap_or(TyId(i as u32)) }) };
+        unsafe { c.add(i & (CHUNK - 1)).write(Entry { kind: k, hash: h, next: head, flags: f, outer_exclusive_binder, depth: dp, erased: erased.unwrap_or(TyId(i as u32)) }) };
         self.len.store(i as u32 + 1, Release);
         self.buckets[b].store(i as u32 + 1, Release);
         TyId(i as u32)
@@ -628,12 +636,13 @@ impl Types {
         let d = |t: &TyId| self.entry(*t).depth;
         let max = |v: &[TyId]| v.iter().map(|t| d(t)).max().unwrap_or(0);
         let inner = match k {
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Opaque(_, _, v, _) | TyKind::Assoc(_, v, _) => max(v),
-            TyKind::Array(e, l) => d(e).max(len_ty(*l).map_or(0, |lt| d(&lt))),
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(_, AliasTy { args: v, .. }) => max(v),
+            TyKind::Const(ct) => self.const_depth(*ct),
+            TyKind::Array(e, l) => d(e).max(self.const_depth(*l)),
             TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => d(e),
             TyKind::FnPtr(ps, r, _, _) => max(ps).max(d(r)),
             TyKind::Dyn(_, v, bs, _, _, _, _) => max(v).max(bs.iter().map(|x| d(&x.1)).max().unwrap_or(0)),
-            TyKind::Closure(_, _, s, u, o) => d(s).max(d(u)).max(d(o)),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => d(s).max(d(u)).max(d(o)).max(d(closure_kind_ty)),
             _ => 0,
         };
         inner.saturating_add(1)
@@ -650,22 +659,23 @@ impl Types {
         let all = |v: &[TyId]| v.iter().fold(0u32, |a, t| a | f(t));
         const W: u32 = F_PARAM | F_NONCONC | F_ASSOC | F_STUCK;
         match k {
+            TyKind::Const(ct) => self.const_flags(*ct).0,
             TyKind::Param(_) => F_PARAM | F_NONCONC,
-            TyKind::Infer(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => F_NONCONC,
-            TyKind::Assoc(_, v, _) => {
+            TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => F_NONCONC,
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. } | AliasTyKind::Free { .. }, args: v, .. }) => {
                 let a = all(v);
                 let stuck = if a & F_NONCONC == 0 { F_STUCK } else { 0 };
                 F_ASSOC | stuck | (a & W)
             }
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Opaque(_, _, v, _) => all(v) & W,
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: v, .. }) => all(v) & W,
             TyKind::Array(e, l) => {
-                let lt = len_ty(*l).map_or(0, |lt| f(&lt) & (F_PARAM | F_NONCONC));
+                let lt = self.const_flags(*l).0;
                 (f(e) & W) | lt
             }
             TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => f(e) & W,
             TyKind::FnPtr(ps, r, _, _) => (all(ps) | f(r)) & W,
             TyKind::Dyn(_, v, bs, _, _, _, _) => (all(v) | bs.iter().fold(0u32, |a, x| a | f(&x.1))) & (F_PARAM | F_NONCONC),
-            TyKind::Closure(_, _, s, u, o) => ((f(s) | f(u)) & (F_PARAM | F_NONCONC)) | (f(o) & F_PARAM),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => ((f(s) | f(u) | f(closure_kind_ty)) & (F_PARAM | F_NONCONC)) | (f(o) & F_PARAM),
             _ => 0,
         }
     }
@@ -674,18 +684,19 @@ impl Types {
         let f = |t: &TyId| self.fl(*t);
         let all = |v: &[TyId]| v.iter().fold(0u32, |a, t| a | f(t));
         (match k {
-            TyKind::Infer(_) => F_INFER,
+            TyKind::Const(ct) => self.const_flags(*ct).0,
+            TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) => F_INFER,
             TyKind::Error => F_ERROR,
             // has_opaque stops at the opaque; its args count for the others
-            TyKind::Opaque(_, _, v, _) => F_OPAQUE | (all(v) & !F_OPAQUE),
-            TyKind::Assoc(_, v, _) => F_PROJ | all(v),
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: v, .. }) => F_OPAQUE | (all(v) & !F_OPAQUE),
+            TyKind::Alias(_, alias) => F_PROJ | all(&alias.args),
             TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) => all(v),
             // only has_infer looks at a length that is a type
-            TyKind::Array(e, l) => f(e) | len_ty(*l).map_or(0, |lt| f(&lt) & (F_INFER | F_PROJ)),
+            TyKind::Array(e, l) => f(e) | self.const_flags(*l).0,
             TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => f(e),
             TyKind::FnPtr(ps, r, _, _) => all(ps) | f(r),
             TyKind::Dyn(_, v, bs, _, _, _, _) => all(v) | bs.iter().fold(0u32, |a, x| a | f(&x.1)),
-            TyKind::Closure(_, _, s, u, _) => f(s) | f(u),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u, .. }) => f(s) | f(u) | f(closure_kind_ty),
             _ => 0,
         }) & (F_INFER | F_ERROR | F_OPAQUE | F_PROJ)
     }
@@ -724,36 +735,12 @@ impl Types {
     }
 
     pub fn map_regions(&self, t: TyId, f: &impl Fn(RegionId, u32) -> RegionId, depth: u32) -> TyId {
-        if self.erase_all_regions(t) == t { return t; }
-        let child = |t| self.map_regions(t, f, depth);
-        let list = |v: &[TyId]| v.iter().copied().map(child).collect();
-        let regions = |rs| self.intern_region_args(&self.region_args(rs).iter().map(|r| f(*r, depth)).collect::<Vec<_>>());
-        let k = match self.kind(t) {
-            TyKind::Ref(m, x, r) => TyKind::Ref(*m, child(*x), f(*r, depth)),
-            TyKind::Tuple(v) => TyKind::Tuple(list(v)),
-            TyKind::Slice(x) => TyKind::Slice(child(*x)),
-            TyKind::Ptr(m, x) => TyKind::Ptr(*m, child(*x)),
-            TyKind::Array(x, n) => TyKind::Array(child(*x), *n),
-            TyKind::Adt(d, v, rs) => TyKind::Adt(*d, list(v), regions(*rs)),
-            TyKind::Assoc(d, v, rs) => TyKind::Assoc(*d, list(v), regions(*rs)),
-            TyKind::FnDef(d, v, rs) => TyKind::FnDef(*d, list(v), regions(*rs)),
-            TyKind::Opaque(d, i, v, rs) => TyKind::Opaque(*d, *i, list(v), regions(*rs)),
-            TyKind::FnPtr(ps, r, c, n) => TyKind::FnPtr(ps.iter().map(|t| self.map_regions(*t, f, depth + 1)).collect(), self.map_regions(*r, f, depth + 1), *c, *n),
-            TyKind::Dyn(d, v, bs, rs, r, bound, autos) => TyKind::Dyn(*d,
-                v.iter().map(|t| self.map_regions(*t, f, depth + 1)).collect(),
-                bs.iter().map(|(d, t, n)| (*d, self.map_regions(*t, f, depth + 1), *n)).collect(),
-                self.intern_region_args(&self.region_args(*rs).iter().map(|r| f(*r, depth + 1)).collect::<Vec<_>>()),
-                f(*r, depth), *bound, autos.clone()),
-            TyKind::Closure(fi, e, sig, up, owner) => TyKind::Closure(*fi, *e, child(*sig), child(*up), child(*owner)),
-            _ => return t,
-        };
-        self.intern(k)
-    }
-
-    /// Instantiate an item type for the current region-erased body inference engine.
-    /// The declaration remains region-bearing for borrowck's later renumbering.
-    pub fn subst_for_inference(&self, t: TyId, args: &[TyId]) -> TyId {
-        self.subst(self.erase_all_regions(t), args)
+        struct Regions<'a> { map: &'a dyn Fn(RegionId, u32) -> RegionId }
+        impl fold::TypeFolder for Regions<'_> {
+            fn fold_region(&mut self, _tys: &Types, r: RegionId, depth: u32) -> RegionId { (self.map)(r, depth) }
+        }
+        use fold::TypeFolder;
+        Regions { map: f }.fold_ty(self, t, depth)
     }
 
     /// Replaces `Param(i)` by `args[i]`.
@@ -777,16 +764,9 @@ impl Types {
                 }
             }
             TyKind::Tuple(v) => self.intern(TyKind::Tuple(sv(v))),
-            TyKind::Array(e, len) => {
-                let e2 = self.subst_at_depth(*e, args, depth);
-                match len_ty(*len) {
-                    Some(lt) => {
-                        let l2 = self.subst_at_depth(lt, args, depth);
-                        self.mk_array(e2, l2)
-                    }
-                    None => self.intern(TyKind::Array(e2, *len)),
-                }
-            }
+            TyKind::Const(ct) => self.intern(TyKind::Const(self.subst_const(*ct, args, depth))),
+            TyKind::Array(e, len) => self.intern(TyKind::Array(self.subst_at_depth(*e, args, depth), self.subst_const(*len, args, depth))),
+            TyKind::Alias(rigid, alias) => self.intern(TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args: sv(&alias.args), regions: alias.regions })),
             TyKind::Slice(e) => {
                 let e2 = self.subst_at_depth(*e, args, depth);
                 self.intern(TyKind::Slice(e2))
@@ -806,18 +786,17 @@ impl Types {
                 self.intern(TyKind::FnPtr(n, r2, *c, *bound))
             }
             TyKind::FnDef(d, v, regions) => self.intern(TyKind::FnDef(*d, sv(v), *regions)),
-            TyKind::Assoc(d, v, regions) => self.intern(TyKind::Assoc(*d, sv(v), *regions)),
-            TyKind::Opaque(d, i, v, regions) => self.intern(TyKind::Opaque(*d, *i, sv(v), *regions)),
             TyKind::Dyn(d, v, bs, regions, region, bound, autos) => {
-                let n = v.iter().map(|t| self.subst_at_depth(*t, args, depth + 1)).collect();
-                let nb = bs.iter().map(|(a, x, n)| (*a, self.subst_at_depth(*x, args, depth + 1), *n)).collect();
-                self.intern(TyKind::Dyn(*d, n, nb, *regions, *region, *bound, autos.clone()))
+                let n: Vec<_> = v.iter().map(|t| self.subst_at_depth(*t, args, depth + 1)).collect();
+                let nb: Vec<_> = bs.iter().map(|(a, x, n)| (*a, self.subst_at_depth(*x, args, depth + 1), *n)).collect();
+                self.intern(TyKind::Dyn(*d, n.into(), nb.into(), *regions, *region, *bound, autos.clone().into()))
             }
-            TyKind::Closure(f, e, sig, up, owner) => {
+            TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }) => {
+                let kind = self.subst_at_depth(*closure_kind_ty, args, depth);
                 let sig = self.subst_at_depth(*sig, args, depth);
                 let up = self.subst_at_depth(*up, args, depth);
                 let owner = self.subst_at_depth(*owner, args, depth);
-                self.intern(TyKind::Closure(*f, *e, sig, up, owner))
+                self.intern(TyKind::Closure(*f, *e, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
             }
             _ => t,
         }
@@ -851,12 +830,8 @@ impl Types {
 }
 
 impl Types {
-    /// `[e; n]` with a const-valued length type: literal when it is a value.
-    pub fn mk_array(&self, e: TyId, n: TyId) -> TyId {
-        match self.kind(n) {
-            TyKind::ConstVal(v) => self.intern(TyKind::Array(e, *v)),
-            _ => self.intern(TyKind::Array(e, LEN_TY | n.0 as u64)),
-        }
+    pub fn mk_array(&self, e: TyId, n: Const) -> TyId {
+        self.intern(TyKind::Array(e, n))
     }
 
     /// Does the type contain an unresolved (error) type?
@@ -873,8 +848,8 @@ impl Types {
     #[allow(dead_code)]
     fn has_stuck_assoc_walk(&self, t: TyId) -> bool {
         match self.kind(t) {
-            TyKind::Assoc(_, v, _) => v.iter().all(|x| self.is_concrete(*x)) || v.iter().any(|x| self.has_stuck_assoc(*x)),
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Opaque(_, _, v, _) => v.iter().any(|x| self.has_stuck_assoc(*x)),
+            TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { .. }, args: v, regions: _ }) => v.iter().all(|x| self.is_concrete(*x)) || v.iter().any(|x| self.has_stuck_assoc(*x)),
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: v, .. }) => v.iter().any(|x| self.has_stuck_assoc(*x)),
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.has_stuck_assoc(*e),
             TyKind::FnPtr(ps, r, _, _) => ps.iter().any(|x| self.has_stuck_assoc(*x)) || self.has_stuck_assoc(*r),
             _ => false,
@@ -889,8 +864,8 @@ impl Types {
     #[allow(dead_code)]
     fn has_assoc_walk(&self, t: TyId) -> bool {
         match self.kind(t) {
-            TyKind::Assoc(..) => true,
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Opaque(_, _, v, _) => v.iter().any(|x| self.has_assoc_walk(*x)),
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => true,
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: v, .. }) => v.iter().any(|x| self.has_assoc_walk(*x)),
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.has_assoc_walk(*e),
             TyKind::FnPtr(ps, r, _, _) => ps.iter().any(|x| self.has_assoc_walk(*x)) || self.has_assoc_walk(*r),
             _ => false,
@@ -915,8 +890,8 @@ impl Types {
     #[allow(dead_code)]
     fn is_concrete_walk(&self, t: TyId) -> bool {
         match self.kind(t) {
-            TyKind::Param(_) | TyKind::Infer(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => false,
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Assoc(_, v, _) | TyKind::Opaque(_, _, v, _) => {
+            TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error | TyKind::Bound(..) | TyKind::Placeholder(_) => false,
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(_, AliasTy { args: v, regions: _, .. }) => {
                 for x in v {
                     if !self.is_concrete(*x) {
                         return false;
@@ -924,9 +899,10 @@ impl Types {
                 }
                 true
             }
-            TyKind::Array(e, l) if len_ty(*l).is_some() => self.is_concrete(*e) && self.is_concrete(len_ty(*l).unwrap_or(*e)),
-            TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.is_concrete(*e),
-            TyKind::Closure(_, _, sig, up, _) => self.is_concrete(*sig) && self.is_concrete(*up),
+            TyKind::Const(ct) => self.const_flags(*ct).0 & F_NONCONC == 0,
+            TyKind::Array(e, l) => self.is_concrete(*e) && self.const_flags(*l).0 & F_NONCONC == 0,
+            TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.is_concrete(*e),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up, .. }) => self.is_concrete(*sig) && self.is_concrete(*up) && self.is_concrete(*closure_kind_ty),
             TyKind::Dyn(_, v, bs, _, _, _, _) => v.iter().all(|x| self.is_concrete(*x)) && bs.iter().all(|x| self.is_concrete(x.1)),
             TyKind::FnPtr(ps, r, _, _) => {
                 for x in ps {
@@ -948,7 +924,7 @@ impl Types {
     /// The opaque types inside `t` (outermost first).
     pub fn opaques_in(&self, t: TyId, out: &mut Vec<TyId>) {
         match self.kind(t) {
-            TyKind::Opaque(_, _, v, _) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: v, .. }) => {
                 if !out.contains(&t) {
                     out.push(t);
                 }
@@ -956,7 +932,7 @@ impl Types {
                     self.opaques_in(*x, out);
                 }
             }
-            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Assoc(_, v, _) => v.iter().for_each(|x| self.opaques_in(*x, out)),
+            TyKind::Tuple(v) | TyKind::Adt(_, v, _) | TyKind::FnDef(_, v, _) | TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { .. }, args: v, regions: _ }) => v.iter().for_each(|x| self.opaques_in(*x, out)),
             TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => self.opaques_in(*e, out),
             TyKind::FnPtr(ps, r, _, _) => {
                 ps.iter().for_each(|x| self.opaques_in(*x, out));
@@ -966,7 +942,8 @@ impl Types {
                 v.iter().for_each(|x| self.opaques_in(*x, out));
                 bs.iter().for_each(|x| self.opaques_in(x.1, out))
             }
-            TyKind::Closure(_, _, s, u, _) => {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u, .. }) => {
+                self.opaques_in(*closure_kind_ty, out);
                 self.opaques_in(*s, out);
                 self.opaques_in(*u, out)
             }
@@ -983,35 +960,23 @@ impl Types {
         let r = |s: &Types, x: TyId| s.replace(x, pairs);
         match k {
             TyKind::Tuple(v) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
+                let n: Vec<_> = v.iter().map(|x| r(self, *x)).collect();
                 self.intern(TyKind::Tuple(n))
             }
             TyKind::Adt(d, v, regions) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
+                let n: Vec<_> = v.iter().map(|x| r(self, *x)).collect();
                 self.intern(TyKind::Adt(d, n, regions))
             }
             TyKind::FnDef(d, v, regions) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
+                let n: Vec<_> = v.iter().map(|x| r(self, *x)).collect();
                 self.intern(TyKind::FnDef(d, n, regions))
             }
-            TyKind::Assoc(d, v, regions) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
-                self.intern(TyKind::Assoc(d, n, regions))
+            TyKind::Alias(rigid, mut alias) => {
+                for arg in &mut alias.args { *arg = r(self, *arg); }
+                self.intern(TyKind::Alias(rigid, alias))
             }
-            TyKind::Opaque(d, i, v, regions) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
-                self.intern(TyKind::Opaque(d, i, n, regions))
-            }
-            TyKind::Array(e, l) => {
-                let e = r(self, e);
-                match len_ty(l) {
-                    Some(lt) => {
-                        let lt = r(self, lt);
-                        self.mk_array(e, lt)
-                    }
-                    None => self.intern(TyKind::Array(e, l)),
-                }
-            }
+            TyKind::Const(ct) => self.intern(TyKind::Const(self.replace_const(ct, pairs))),
+            TyKind::Array(e, l) => self.intern(TyKind::Array(r(self, e), self.replace_const(l, pairs))),
             TyKind::Slice(e) => {
                 let e = r(self, e);
                 self.intern(TyKind::Slice(e))
@@ -1030,15 +995,16 @@ impl Types {
                 self.intern(TyKind::FnPtr(n, ret, c, bound))
             }
             TyKind::Dyn(d, v, bs, regions, region, bound, autos) => {
-                let n = v.iter().map(|x| r(self, *x)).collect();
-                let nb = bs.iter().map(|(a, x, n)| (*a, r(self, *x), *n)).collect();
-                self.intern(TyKind::Dyn(d, n, nb, regions, region, bound, autos.clone()))
+                let n: Vec<_> = v.iter().map(|x| r(self, *x)).collect();
+                let nb: Vec<_> = bs.iter().map(|(a, x, n)| (*a, r(self, *x), *n)).collect();
+                self.intern(TyKind::Dyn(d, n.into(), nb.into(), regions, region, bound, autos.clone().into()))
             }
-            TyKind::Closure(f, e, sig, up, owner) => {
+            TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }) => {
+                let kind = r(self, closure_kind_ty);
                 let sig = r(self, sig);
                 let up = r(self, up);
                 let owner = r(self, owner);
-                self.intern(TyKind::Closure(f, e, sig, up, owner))
+                self.intern(TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: kind, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up }))
             }
             _ => t,
         }
@@ -1052,6 +1018,7 @@ impl std::hash::Hash for TyKind {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
         std::mem::discriminant(self).hash(h);
         match self {
+            Self::Foreign(d) => d.hash(h),
             Self::Int(p) | Self::Float(p) => p.hash(h),
             Self::Tuple(v) => v.hash(h),
             Self::Array(t, n) => { t.hash(h); n.hash(h); }
@@ -1061,7 +1028,7 @@ impl std::hash::Hash for TyKind {
                 if *r != RegionId::ERASED { r.hash(h); }
             }
             Self::Ptr(m, t) => { m.hash(h); t.hash(h); }
-            Self::Adt(d, v, rs) | Self::FnDef(d, v, rs) | Self::Assoc(d, v, rs) => {
+            Self::Adt(d, v, rs) | Self::FnDef(d, v, rs) => {
                 d.hash(h); v.hash(h);
                 if *rs != RegionArgsId::EMPTY { rs.hash(h); }
             }
@@ -1069,11 +1036,11 @@ impl std::hash::Hash for TyKind {
                 ps.hash(h); r.hash(h); c.hash(h);
                 if *bound != 0 { bound.hash(h); }
             }
-            Self::Param(i) | Self::Infer(i) => i.hash(h),
+            Self::Param(i) | Self::Infer(i) | Self::IntVar(i) | Self::FloatVar(i) => i.hash(h),
             Self::Bound(d, b) => { d.hash(h); b.hash(h); }
             Self::Placeholder(p) => p.hash(h),
-            Self::Closure(f, e, s, u, o) => {
-                f.hash(h); e.hash(h); s.hash(h); u.hash(h); o.hash(h);
+            Self::Closure(f, e, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => {
+                f.hash(h); e.hash(h); s.hash(h); u.hash(h); o.hash(h); closure_kind_ty.hash(h);
             }
             Self::Dyn(d, v, bs, rs, r, bound, autos) => {
                 // as the Vecs these lists were (a slice hashes like its Vec)
@@ -1085,11 +1052,8 @@ impl std::hash::Hash for TyKind {
                 if *rs != RegionArgsId::EMPTY { rs.hash(h); }
                 if *r != RegionId::ERASED { r.hash(h); }
             }
-            Self::ConstVal(v) => v.hash(h),
-            Self::Opaque(d, i, v, rs) => {
-                d.hash(h); i.hash(h); v.hash(h);
-                if *rs != RegionArgsId::EMPTY { rs.hash(h); }
-            }
+            Self::Const(v) => v.hash(h),
+            Self::Alias(rigid, alias) => { rigid.hash(h); alias.hash(h); }
             Self::Bool | Self::Char | Self::Str | Self::Never | Self::Error => {}
         }
     }
@@ -1143,7 +1107,7 @@ impl Types {
         self.free_regions.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn erase_region(&self, r: RegionId) -> RegionId {
+    pub(crate) fn erase_region(&self, r: RegionId) -> RegionId {
         if r == RegionId::ERASED || matches!(self.region_kind(r), RegionKind::ReBound(..)) {
             r
         } else {
@@ -1155,13 +1119,9 @@ impl Types {
         if rs == RegionArgsId::EMPTY { return rs; }
         let args = self.region_args(rs);
         let args: Vec<_> = args.iter().map(|r| self.erase_region(*r)).collect();
-        // The declaration supplies lifetime arity; no free lifetime argument is
-        // part of a codegen identity. Canonicalize all-erased lists to A1's empty key.
-        if args.iter().all(|r| *r == RegionId::ERASED) {
-            RegionArgsId::EMPTY
-        } else {
-            self.intern_region_args(&args)
-        }
+        // rustc_middle/src/ty/erase_regions.rs: erasure changes region values,
+        // never the arity of the declaration's generic argument list.
+        self.intern_region_args(&args)
     }
 
     fn erased_kind(&self, k: &TyKind) -> Option<TyKind> {
@@ -1169,14 +1129,15 @@ impl Types {
         let list = |v: &[TyId]| v.iter().any(changed);
         let needs = match k {
             TyKind::Ref(_, t, r) => changed(t) || self.erase_region(*r) != *r,
-            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Assoc(_, v, rs) | TyKind::Opaque(_, _, v, rs) => {
+            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
                 list(v) || self.erase_region_args(*rs) != *rs
             }
             TyKind::Tuple(v) => list(v),
-            TyKind::Array(t, n) => changed(t) || len_ty(*n).is_some_and(|t| changed(&t)),
+            TyKind::Const(n) => self.erase_const_regions(*n, false) != *n,
+            TyKind::Array(t, n) => changed(t) || self.erase_const_regions(*n, false) != *n,
             TyKind::Slice(t) | TyKind::Ptr(_, t) => changed(t),
             TyKind::FnPtr(ps, r, _, _) => list(ps) || changed(r),
-            TyKind::Closure(_, _, s, u, o) => changed(s) || changed(u) || changed(o),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => changed(s) || changed(u) || changed(o) || changed(closure_kind_ty),
             TyKind::Dyn(_, v, bs, rs, r, _, _) => list(v) || bs.iter().any(|b| changed(&b.1)) || self.erase_region_args(*rs) != *rs || self.erase_region(*r) != *r,
             _ => false,
         };
@@ -1186,17 +1147,18 @@ impl Types {
         let list = |v: &mut [TyId]| v.iter_mut().for_each(ty);
         match &mut k {
             TyKind::Ref(_, t, r) => { ty(t); *r = self.erase_region(*r); }
-            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Assoc(_, v, rs) | TyKind::Opaque(_, _, v, rs) => {
+            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
                 list(v); *rs = self.erase_region_args(*rs);
             }
             TyKind::Tuple(v) => list(v),
             TyKind::Array(t, n) => {
                 ty(t);
-                if let Some(t) = len_ty(*n) { *n = LEN_TY | self.erase_regions(t).0 as u64; }
+                *n = self.erase_const_regions(*n, false);
             }
+            TyKind::Const(n) => *n = self.erase_const_regions(*n, false),
             TyKind::Slice(t) | TyKind::Ptr(_, t) => ty(t),
             TyKind::FnPtr(ps, r, _, _) => { list(ps); ty(r); }
-            TyKind::Closure(_, _, s, u, o) => { ty(s); ty(u); ty(o); }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => { ty(s); ty(u); ty(o); ty(closure_kind_ty); }
             TyKind::Dyn(_, v, bs, rs, r, _, _) => {
                 list(v); bs.iter_mut().for_each(|b| ty(&mut b.1));
                 *rs = self.erase_region_args(*rs); *r = self.erase_region(*r);
@@ -1206,55 +1168,41 @@ impl Types {
         Some(k)
     }
 
-    /// Type inference compares lifetime-insensitive keys; codegen uses erase_regions
-    /// instead, which must preserve bound regions.
-    pub fn erase_all_regions(&self, t: TyId) -> TyId { self.entry(t).inference_erased }
-
-    pub fn eq_mod_regions(&self, a: TyId, b: TyId) -> bool {
-        a == b || self.erase_all_regions(a) == self.erase_all_regions(b)
-    }
-
-    fn inference_erased_kind(&self, k: &TyKind) -> Option<TyKind> {
-        let changed = |t: &TyId| self.erase_all_regions(*t) != *t;
-        let list = |v: &[TyId]| v.iter().any(changed);
-        let needs = match k {
-            TyKind::Ref(_, t, r) => changed(t) || RegionId::ERASED != *r,
-            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Assoc(_, v, rs) | TyKind::Opaque(_, _, v, rs) => {
-                list(v) || RegionArgsId::EMPTY != *rs
-            }
-            TyKind::Tuple(v) => list(v),
-            TyKind::Array(t, n) => changed(t) || len_ty(*n).is_some_and(|t| changed(&t)),
-            TyKind::Slice(t) | TyKind::Ptr(_, t) => changed(t),
-            TyKind::FnPtr(ps, r, _, n) => list(ps) || changed(r) || *n != 0,
-            TyKind::Closure(_, _, s, u, o) => changed(s) || changed(u) || changed(o),
-            TyKind::Dyn(_, v, bs, rs, r, bound, _) => *bound != 0 || list(v) || bs.iter().any(|b| changed(&b.1) || b.2 != 0) || RegionArgsId::EMPTY != *rs || RegionId::ERASED != *r,
-            _ => false,
-        };
-        if !needs { return None; }
-        let mut k = k.clone();
+    /// A lifetime-insensitive key (every region erased, binders dropped) for the
+    /// pre-native structural matchers and diagnostics; codegen uses erase_regions,
+    /// which preserves bound regions.
+    pub fn erase_all_regions(&self, t: TyId) -> TyId {
+        let f = self.flags(t);
+        if !f.contains(TypeFlags::HAS_FREE_REGIONS) && !f.contains(TypeFlags::HAS_RE_BOUND) { return t; }
+        let mut k = self.kind(t).clone();
         let ty = |t: &mut TyId| *t = self.erase_all_regions(*t);
         let list = |v: &mut [TyId]| v.iter_mut().for_each(ty);
         match &mut k {
             TyKind::Ref(_, t, r) => { ty(t); *r = RegionId::ERASED; }
-            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Assoc(_, v, rs) | TyKind::Opaque(_, _, v, rs) => {
-                list(v); *rs = RegionArgsId::EMPTY;
+            TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
+                list(v); *rs = self.intern_region_args(&vec![RegionId::ERASED; self.region_args(*rs).len()]);
             }
             TyKind::Tuple(v) => list(v),
             TyKind::Array(t, n) => {
                 ty(t);
-                if let Some(t) = len_ty(*n) { *n = LEN_TY | self.erase_all_regions(t).0 as u64; }
+                *n = self.erase_const_regions(*n, true);
             }
+            TyKind::Const(n) => *n = self.erase_const_regions(*n, true),
             TyKind::Slice(t) | TyKind::Ptr(_, t) => ty(t),
             TyKind::FnPtr(ps, r, _, n) => { list(ps); ty(r); *n = 0; }
-            TyKind::Closure(_, _, s, u, o) => { ty(s); ty(u); ty(o); }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => { ty(s); ty(u); ty(o); ty(closure_kind_ty); }
             TyKind::Dyn(_, v, bs, rs, r, bound, _) => {
                 list(v); bs.iter_mut().for_each(|b| { ty(&mut b.1); b.2 = 0; });
                 *bound = 0;
-                *rs = RegionArgsId::EMPTY; *r = RegionId::ERASED;
+                *rs = self.intern_region_args(&vec![RegionId::ERASED; self.region_args(*rs).len()]); *r = RegionId::ERASED;
             }
             _ => {}
         }
-        Some(k)
+        self.intern(k)
+    }
+
+    pub fn eq_mod_regions(&self, a: TyId, b: TyId) -> bool {
+        a == b || self.erase_all_regions(a) == self.erase_all_regions(b)
     }
 }
 
@@ -1277,15 +1225,15 @@ mod region_tests {
         assert_ne!(r, er);
         assert_eq!(tys.erase_regions(r), er);
         assert_eq!(tys.erase_regions(er), er);
-        let empty = RegionArgsId::EMPTY;
+        let empty = tys.intern_region_args(&[RegionId::ERASED]);
         for (k, erased) in [
             (TyKind::Adt(DefId(1), vec![r], args), TyKind::Adt(DefId(1), vec![er], empty)),
-            (TyKind::Assoc(DefId(2), vec![r], args), TyKind::Assoc(DefId(2), vec![er], empty)),
-            (TyKind::Opaque(DefId(3), 4, vec![r], args), TyKind::Opaque(DefId(3), 4, vec![er], empty)),
+            (TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(2) }, args: vec![r], regions: args }), TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: DefId(2) }, args: vec![er], regions: empty })),
+            (TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(3) }, args: vec![r], regions: args }), TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Opaque { def_id: DefId(3) }, args: vec![er], regions: empty })),
             (TyKind::FnDef(DefId(5), vec![r], args), TyKind::FnDef(DefId(5), vec![er], empty)),
             (TyKind::Dyn(DefId(6), DynList::from(vec![r]), DynList::from(vec![(DefId(7), r, 0)]), args, free, 0, Default::default()), TyKind::Dyn(DefId(6), DynList::from(vec![er]), DynList::from(vec![(DefId(7), er, 0)]), empty, RegionId::ERASED, 0, Default::default())),
             (TyKind::Tuple(vec![r]), TyKind::Tuple(vec![er])),
-            (TyKind::Array(r, 3), TyKind::Array(er, 3)),
+            (TyKind::Array(r, tys.const_usize(3)), TyKind::Array(er, tys.const_usize(3))),
             (TyKind::Slice(r), TyKind::Slice(er)),
             (TyKind::Ptr(true, r), TyKind::Ptr(true, er)),
         ] {
@@ -1298,8 +1246,8 @@ mod region_tests {
         assert_eq!(tys.erase_regions(sig), esig);
         assert_ne!(esig, tys.intern(TyKind::FnPtr(vec![er, er], er, crate::types::FnHeader::RUST, 0)));
         let owner = tys.intern(TyKind::FnDef(DefId(5), vec![r], args));
-        let closure = tys.intern(TyKind::Closure(0, 1, sig, r, owner));
-        let eclosure = tys.intern(TyKind::Closure(0, 1, esig, er, tys.erase_regions(owner)));
+        let closure = tys.intern(TyKind::Closure(0, 1, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: r }));
+        let eclosure = tys.intern(TyKind::Closure(0, 1, crate::types::ClosureArgs { parent_args: tys.erase_regions(owner), closure_kind_ty: tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: esig, tupled_upvars_ty: er }));
         assert_eq!(tys.erase_regions(closure), eclosure);
         // Type substitution/structural replacement must not silently erase regions.
         let param = tys.intern(TyKind::Param(0));

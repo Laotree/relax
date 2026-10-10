@@ -10,6 +10,8 @@
 //!   and derive / proc-macro output), its name, edition, cfg set, and its dependencies'
 //!   fingerprints. Never timestamps.
 
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use crate::program::{DefId, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -142,7 +144,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
     use crate::types::{RegionArgsId, RegionId, RegionKind};
     let (rs, r, bound) = match tcx.tys.kind(t) {
         TyKind::Ref(_, _, r) => (RegionArgsId::EMPTY, *r, 0),
-        TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Assoc(_, _, rs) | TyKind::Opaque(_, _, _, rs) => (*rs, RegionId::ERASED, 0),
+        TyKind::Adt(_, _, rs) | TyKind::FnDef(_, _, rs) | TyKind::Alias(_, AliasTy { regions: rs, .. }) => (*rs, RegionId::ERASED, 0),
         TyKind::Dyn(_, _, _, rs, r, bound, _) => (*rs, *r, *bound),
         TyKind::FnPtr(_, _, _, n) => (RegionArgsId::EMPTY, RegionId::ERASED, *n),
         _ => (RegionArgsId::EMPTY, RegionId::ERASED, 0),
@@ -180,16 +182,7 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
         TyKind::Array(e, n) => {
             h.u8(8);
             type_into(prog, tcx, *e, h, depth + 1);
-            match crate::types::len_ty(*n) {
-                Some(l) => {
-                    h.u8(1);
-                    type_into(prog, tcx, l, h, depth + 1);
-                }
-                None => {
-                    h.u8(0);
-                    h.u64(*n);
-                }
-            }
+            const_into(prog, tcx, *n, h, depth + 1);
         }
         TyKind::Slice(e) => {
             h.u8(9);
@@ -227,25 +220,33 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
             h.u8(15);
             h.u32(*i);
         }
+        TyKind::IntVar(i) => { h.u8(25); h.u32(*i); }
+        TyKind::FloatVar(i) => { h.u8(26); h.u32(*i); }
         TyKind::Infer(i) => {
             h.u8(16);
             h.u32(*i);
         }
-        TyKind::Closure(file, expr, sig, state, owner) => {
+        TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
             h.u8(17);
             match prog.file_paths.get(*file as usize) {
                 Some(p) => h.str(p),
                 None => h.str(""),
             }
             h.u32(*expr);
+            type_into(prog, tcx, *closure_kind_ty, h, depth + 1);
             type_into(prog, tcx, *sig, h, depth + 1);
             type_into(prog, tcx, *state, h, depth + 1);
             type_into(prog, tcx, *owner, h, depth + 1);
         }
-        TyKind::Assoc(d, args, _) => {
-            h.u8(18);
-            def_ident(prog, *d, h);
-            list(args, h);
+        TyKind::Alias(rigid, alias) => {
+            h.u8(18); h.u8(*rigid as u8);
+            match alias.kind {
+                AliasTyKind::Projection { def_id } => { h.u8(0); def_ident(prog, def_id, h); }
+                AliasTyKind::Inherent { def_id } => { h.u8(1); def_ident(prog, def_id, h); }
+                AliasTyKind::Opaque { def_id } => { h.u8(2); def_ident(prog, def_id, h); }
+                AliasTyKind::Free { def_id } => { h.u8(3); def_ident(prog, def_id, h); }
+            }
+            list(&alias.args, h);
         }
         TyKind::Dyn(d, args, binds, _, _, _, autos) => {
             h.u8(19);
@@ -263,16 +264,11 @@ fn type_into(prog: &Program, tcx: &Tcx, t: TyId, h: &mut Sip128, depth: u32) {
             h.u32(auto_ids.len() as u32);
             for id in auto_ids { h.u128(id); }
         }
-        TyKind::ConstVal(v) => {
+        TyKind::Const(v) => {
             h.u8(20);
-            h.u64(*v);
+            const_into(prog, tcx, *v, h, depth + 1);
         }
-        TyKind::Opaque(d, ast, args, _) => {
-            h.u8(21);
-            def_ident(prog, *d, h);
-            h.u32(*ast);
-            list(args, h);
-        }
+        TyKind::Foreign(d) => { h.u8(27); def_ident(prog, *d, h); }
         TyKind::Error => h.u8(22),
         TyKind::Bound(d, b) => {
             h.u8(23);
@@ -593,5 +589,50 @@ pub fn report_fingerprints(prog: &Program) {
                 eprintln!("relax-cache: crate {:032x} {}", fp, prog.syms.str(ci.name));
             }
         }
+    }
+}
+
+
+// rustc_type_ir/src/const_kind.rs:21: hashes contain structure, never arena ids.
+fn const_into(prog: &Program, tcx: &Tcx, ct: crate::consts::Const, h: &mut Sip128, depth: u32) {
+    use crate::consts::{ConstKind, GenericArg, AliasConstKind, ValTreeKind};
+    if depth > 200 { h.u8(0xff); return; }
+    match tcx.tys.const_kind(ct) {
+        ConstKind::Param(p) => { h.u8(0); h.u32(p.index); }
+        ConstKind::Bound(d, b) => { h.u8(1); h.u32(d); h.u32(b.var.0); }
+        ConstKind::Placeholder(p) => { h.u8(2); h.u32(p.universe.0); h.u32(p.bound.var.0); }
+        ConstKind::Alias(rigid, alias) => {
+            h.u8(3); h.u8(rigid as u8);
+            h.u8(match alias.kind { AliasConstKind::Projection { .. } => 0, AliasConstKind::InherentSelf { .. } => 1,
+                AliasConstKind::InherentImpl { .. } => 2, AliasConstKind::Free { .. } => 3, AliasConstKind::Anon { .. } => 4 });
+            def_ident(prog, alias.kind.def_id(), h);
+            h.u32(alias.args.len() as u32);
+            for arg in &*alias.args {
+                match *arg {
+                    GenericArg::Type(ty) => { h.u8(0); type_into(prog, tcx, ty, h, depth + 1); }
+                    GenericArg::Const(ct) => { h.u8(1); const_into(prog, tcx, ct, h, depth + 1); }
+                    GenericArg::Lifetime(region) => {
+                        h.u8(2);
+                        match tcx.tys.region_kind(region) {
+                            crate::types::RegionKind::ReErased => h.u8(0),
+                            crate::types::RegionKind::ReBound(d, b) => { h.u8(1); h.u32(d); h.u32(b.0); }
+                            _ => panic!("free region in codegen constant hash"),
+                        }
+                    }
+                }
+            }
+        }
+        ConstKind::Value(value) => {
+            h.u8(4); type_into(prog, tcx, value.ty, h, depth + 1);
+            match value.valtree.kind() {
+                ValTreeKind::Leaf(scalar) => { h.u8(0); h.u8(scalar.size()); let bits = scalar.to_bits(scalar.size()); h.u64(bits as u64); h.u64((bits >> 64) as u64); }
+                ValTreeKind::Branch(fields) => {
+                    h.u8(1); h.u32(fields.len() as u32);
+                    for &ct in &**fields { const_into(prog, tcx, ct, h, depth + 1); }
+                }
+            }
+        }
+        ConstKind::Error => h.u8(5),
+        ConstKind::Infer(_) => panic!("unresolved const in stable hash"),
     }
 }

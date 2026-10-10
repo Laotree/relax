@@ -33,7 +33,7 @@ pub struct DemandPart {
     pub(super) contributions: Vec<(bool, items::References)>,
     pub(super) boundary: Boundary,
     pub(super) roots: Option<(BTreeSet<String>, BTreeSet<String>, usize)>,
-    pub(super) closure_delta: Option<Arc<demand::NamespaceDelta>>,
+    pub(super) closure_delta: Option<Arc<demand::ClosureDelta>>,
     pub(super) reached: BTreeSet<String>,
     pub(super) counts: (usize, usize),
 }
@@ -149,7 +149,7 @@ impl DemandPart {
         packed!(roots);
         let start = w.len();
         self.closure_delta.put(&mut w);
-        let old_delta = if profile { 1 + self.closure_delta.as_ref().map_or(0, |delta| delta.legacy_size(true)) } else { 0 };
+        let old_delta = if profile { 1 + self.closure_delta.as_ref().map_or(0, |delta| delta.legacy_size()) } else { 0 };
         sizes.insert("closure_delta", (old_delta, w.len() - start));
         packed!(reached);
         packed!(counts);
@@ -233,13 +233,15 @@ impl DemandPart {
     }
 }
 
+// The alias and expansion maps are the table's own per-crate maps, shared: a
+// deferred file's capture copied them once per file (0.17 GB on a cold Stage).
 #[derive(Clone, Default)]
 pub(super) struct MacroPart {
     definitions: Vec<Arc<crate::macros::MacroDef>>,
-    aliases: HashMap<String, (String, String)>,
+    aliases: Arc<HashMap<String, (String, String)>>,
     uses: Vec<String>,
     modules: Option<Arc<crate::macros::CrateMods>>,
-    expansions: HashMap<(String, String), Vec<String>>,
+    expansions: Arc<HashMap<(String, String), Vec<String>>>,
     s2_fmt: bool,
 }
 fields!(MacroPart, definitions, aliases, uses, modules, expansions, s2_fmt);
@@ -285,10 +287,10 @@ impl MacroPart {
         // Only the current crate's maps; definitions were already encountered
         // while publishing the outline, never rescan/sort the whole table.
         self.definitions.sort_by(|a, b| a.name.cmp(&b.name));
-        self.aliases = table.aliases.get(krate).map(|v| (**v).clone()).unwrap_or_default();
+        self.aliases = table.aliases.get(krate).cloned().unwrap_or_default();
         self.uses = table.macro_use.get(krate).cloned().unwrap_or_default();
         self.modules = table.crates.get(krate).cloned();
-        self.expansions = table.exp_uses.get(krate).map(|v| (**v).clone()).unwrap_or_default();
+        self.expansions = table.exp_uses.get(krate).cloned().unwrap_or_default();
         self.s2_fmt = table.s2_fmt;
     }
     pub(super) fn publish(&self, table: &mut crate::macros::MacroTable, krate: &str) {
@@ -299,10 +301,10 @@ impl MacroPart {
             let count = existing.entry(def.name.clone()).or_default();
             if *count > 0 { *count -= 1; } else { table.push(def.clone()); }
         }
-        table.aliases.insert(krate.to_owned(), Arc::new(self.aliases.clone()));
+        table.aliases.insert(krate.to_owned(), self.aliases.clone());
         table.macro_use.insert(krate.to_owned(), self.uses.clone());
         if let Some(modules) = &self.modules { table.add_crate(krate.to_owned(), modules.clone()); }
-        table.exp_uses.insert(krate.to_owned(), Arc::new(self.expansions.clone()));
+        table.exp_uses.insert(krate.to_owned(), self.expansions.clone());
         table.s2_fmt = self.s2_fmt;
     }
 }
@@ -405,13 +407,20 @@ impl DemandImage {
             part.finish_boundary();
         }
         if let Some(first) = parts.first_mut() {
-            let delta = final_names.closure_delta(&names);
+            let value = final_names.closure_delta(&names);
+            // Both namespaces end here (planner + rebuilt, ~1 GB on a cold Stage): not held
+            // through the delta's encode, its shrink copy and the parts' publication.
+            drop((final_names, names));
+            let legacy = if profile { value.legacy_size(true) } else { 0 };
+            let mut delta = crate::crate_image::encode(&value);
+            drop(value);
+            delta.shrink_to_fit();
             // The closure delta covers this graph, including other edited crates.
             // An equivalent local edit leaves this row untouched too.
-            if first.closure_delta.as_ref().is_none_or(|old| crate::crate_image::encode(old.as_ref()) != crate::crate_image::encode(&delta)) {
+            if first.closure_delta.as_ref().is_none_or(|old| crate::crate_image::encode(old.as_ref()) != delta) {
                 first.key = 0;
             }
-            first.closure_delta = Some(Arc::new(delta));
+            first.closure_delta = Some(Arc::new(demand::ClosureDelta::Encoded(delta, legacy)));
         }
         let parts = parts.into_iter().map(Arc::new).collect::<Vec<_>>();
         *recording.ready.lock().unwrap() = parts.clone();

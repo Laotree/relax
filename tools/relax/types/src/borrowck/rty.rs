@@ -8,7 +8,8 @@
 //! declaration types through Tcx::variances_of.
 
 pub mod signature;
-use crate::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::tyx::Tx;
 use crate::ast::{self, GenericArg, GenericArgs, GenericParamKind, ItemKind, SegKind, Ty as AstTy};
 use crate::fxhash::HashMap;
@@ -276,7 +277,7 @@ impl<'a> Rty<'a> {
                     self.skel_into(b, xform(ctx, V::Inv), out, depth + 1);
                 }
             }
-            TyKind::Closure(file, ce, _, up, _) => {
+            TyKind::Closure(file, ce, crate::types::ClosureArgs { tupled_upvars_ty: up, .. }) => {
                 let cs = self.closures.borrow().get(&(file, ce)).cloned();
                 match cs {
                     Some(cs) => {
@@ -293,7 +294,7 @@ impl<'a> Rty<'a> {
                     None => self.skel_into(up, xform(ctx, V::Inv), out, depth + 1),
                 }
             }
-            TyKind::Opaque(_, _, args, _) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args, regions: _ }) => {
                 for a in args {
                     self.skel_into(a, xform(ctx, V::Inv), out, depth + 1);
                 }
@@ -1019,21 +1020,15 @@ impl<'a> Rty<'a> {
             return false;
         }
         let ge = tcx.item_env(prog, owner);
-        let qt = tcx.normalize(&self.tx.cx, prog, tcx.lower_ty(&self.tx.cx, prog, env.file, env.module, &ge, qty));
-        if matches!(self.tx.kind(qt), TyKind::Error | TyKind::Infer(_) | TyKind::Param(_) | TyKind::Assoc(..)) {
+        let qt = self.tx.normalize(tcx.lower_ty(&self.tx.cx, prog, env.file, env.module, &ge, qty));
+        if matches!(self.tx.kind(qt), TyKind::Error | TyKind::Infer(_) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. })) {
             return false;
         }
         let td = match tcx.resolve_type_path_def(prog, env.file, env.module, tp) {
             Some(d) => d,
             None => return false,
         };
-        let imp = match self.tx.select_trait(td, qt, &[]) {
-            SelectionResult::Ok(selected) => selected.method_owner(),
-            SelectionResult::Ambiguous(_) | SelectionResult::NoSolution => return false,
-        };
-        if imp == crate::program::NO_DEF || imp == crate::tcx::DERIVED_IMPL || prog.def(imp).kind != DefKind::Impl {
-            return false;
-        }
+        let Some(imp) = self.tx.select_impl(td, qt, &[]) else { return false };
         let (ifile, aty) = match self.impl_assoc_ty(imp, name) {
             Some(x) => x,
             None => return false,
@@ -1105,19 +1100,14 @@ impl<'a> Rty<'a> {
         let prog = self.tx.prog;
         if let (Some(ct), TyKind::Adt(..)) = (self.tx.copy_trait, self.tx.kind(t)) {
             if self.n_slots(t) > 0 {
-                let selected = self.tx.select_trait(ct, t, &[]);
-                if matches!(selected, SelectionResult::Ambiguous(_)) { return Rc::new(out); }
-                if let SelectionResult::Ok(selected) = selected {
-                    let (imp, _) = (selected.method_owner(), selected.args);
-                    if imp != crate::program::NO_DEF && (imp.0 as usize) < prog.defs.len() && prog.def(imp).kind == DefKind::Impl {
-                        let pd = prog.def(imp);
-                        if let ItemKind::Impl { self_ty, .. } = &prog.files[pd.file as usize].ast.item(pd.item).kind {
-                            let ann = self.annotation(pd.file, pd.scope, *self_ty, t, &[]);
-                            if ann.len() == self.n_slots(t) {
-                                for (i, a) in ann.iter().enumerate() {
-                                    if *a == Ann::Static {
-                                        out.push(i);
-                                    }
+                if let Some(imp) = self.tx.select_impl(ct, t, &[]) {
+                    let pd = prog.def(imp);
+                    if let ItemKind::Impl { self_ty, .. } = &prog.files[pd.file as usize].ast.item(pd.item).kind {
+                        let ann = self.annotation(pd.file, pd.scope, *self_ty, t, &[]);
+                        if ann.len() == self.n_slots(t) {
+                            for (i, a) in ann.iter().enumerate() {
+                                if *a == Ann::Static {
+                                    out.push(i);
                                 }
                             }
                         }

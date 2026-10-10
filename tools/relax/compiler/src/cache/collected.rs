@@ -209,7 +209,7 @@ impl FrontImages {
         if prog.crates.len() != graph.crates.len() || prog.crates.iter().zip(&graph.crates)
             .any(|(c, ((name, root), _))| prog.syms.str(c.name) != name || c.root_path() != root) { return None; }
         why = "Tcx";
-        let mut tcx = Tcx::restore_collected(types)?;
+        let mut tcx = Tcx::restore_collected(types, prog.files.len(), prog.crates.len())?;
         phase("Tcx");
         if let Some(task) = plan_task {
             why = "demand selection";

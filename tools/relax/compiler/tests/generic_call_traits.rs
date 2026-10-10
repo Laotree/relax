@@ -6,18 +6,18 @@ fn check_fixture(file: &str, reject: bool) {
     let (prog, _, _) = relax_compiler::load_with_std(&session, &path, file, true).unwrap();
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
-    tcx.impl_projection_ready = true;
+
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let state = EvalState::new();
-    let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
     let main = (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == "main").unwrap();
-    let body = typeck::check_fn(&cx, &prog, &tcx, main, &[]);
+    let body = typeck::instantiate_body(&cx, &prog, &tcx, main, &[]);
     assert!(body.errors.is_empty(), "{:?}", body.errors);
     let mut checked = 0;
     for (e, args) in &body.res_args {
         let Some(typeck::Res::Def(d)) = body.res.get(e) else { continue };
         if !matches!(prog.name(*d), "once" | "field" | "deref" | "shared" | "bad") { continue; }
-        let instance = typeck::check_fn(&cx, &prog, &tcx, *d, args);
+        let instance = typeck::instantiate_body(&cx, &prog, &tcx, *d, args);
         assert!(instance.errors.is_empty(), "{}: {:?}", prog.name(*d), instance.errors);
         if prog.name(*d) == "field" {
             assert_eq!(instance.min_captures.values().next().unwrap().kind, relax_compiler::upvar::ClosureKind::FnOnce);
@@ -38,7 +38,7 @@ fn check_fixture(file: &str, reject: bool) {
         let parent = prog.def(method.def).parent;
         let initialize = (0..prog.defs.len()).map(|i| DefId(i as u32))
             .find(|&d| prog.def(d).parent == parent && prog.name(d) == "initialize").unwrap();
-        let instance = typeck::check_fn(&cx, &prog, &tcx, initialize, &method.args);
+        let instance = typeck::instantiate_body(&cx, &prog, &tcx, initialize, &method.args);
         assert!(instance.errors.is_empty(), "{:?}", instance.errors);
         let verdict = relax_compiler::borrowck::check_body(&cx, &prog, &tcx, &instance);
         assert!(verdict.unchecked.is_empty(), "{:?}", verdict.unchecked);

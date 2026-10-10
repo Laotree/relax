@@ -63,7 +63,7 @@ impl<'a> Build<'a> {
     /// (rustc's move paths of arrays use start offsets), slices from the end after a rest.
     fn slice_elem_proj(&self, t: TyId, rest: Option<usize>, n: usize, i: usize) -> Proj {
         let alen = match self.tx.kind(t) {
-            TyKind::Array(_, l) if crate::types::len_ty(l).is_none() => Some(l as u32),
+            TyKind::Array(_, l) => l.try_to_target_usize(&self.tx.tcx.tys).map(|n| n as u32),
             _ => None,
         };
         match rest {
@@ -592,7 +592,7 @@ impl<'a> Build<'a> {
                         if let Pat::Ident { sub: Some(_), .. } | Pat::Ident { .. } = ast.pat(*x) {
                             let after = v.len() - i - 1;
                             let sub = match self.tx.kind(t) {
-                                TyKind::Array(_, l) if crate::types::len_ty(l).is_none() => Proj::Subslice(i as u32, (l as u32).saturating_sub(after as u32), false),
+                                TyKind::Array(_, l) if l.try_to_target_usize(&self.tx.tcx.tys).is_some() => Proj::Subslice(i as u32, (l.try_to_target_usize(&self.tx.tcx.tys).unwrap() as u32).saturating_sub(after as u32), false),
                                 _ => Proj::Subslice(i as u32, after as u32, true),
                             };
                             let sp = place.project(sub);

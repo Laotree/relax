@@ -1,17 +1,19 @@
 //! Hand-built MIR plus an independent symbolic walker. Drop invokes the generated
 //! shim; only destructor calls and dyn's virtual dispatch are primitive events.
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::*;
 use super::elaborate_drops::elaborate_drops;
 use super::elaborate_drop::{integer, project};
 use crate::mir::shim::build_drop_shim;
-use crate::types::{len_ty, TyKind};
+use crate::types::{TyKind};
 use std::collections::{HashMap, HashSet};
 
 struct Provider { prog: Program, tcx: Tcx, fail: Option<TyId>, copy: HashSet<TyId> }
 impl DropProvider for Provider {
     fn tcx(&self) -> &Tcx { &self.tcx }
     fn program(&self) -> &Program { &self.prog }
-    fn typing_env(&self) -> crate::tcx::TypingEnv { crate::tcx::TypingEnv::fully_monomorphized() }
+    fn typing_env(&self) -> crate::tcx::TypingEnv { crate::tcx::TypingEnv::fully_monomorphized(&self.prog) }
     // rustc_ty_utils/src/needs_drop.rs:108,193; ty/util.rs:1493.
     // This is the authorized test query, not a new production needs_drop path.
     fn needs_drop(&self, ty: TyId) -> Result<bool, DropError> {
@@ -31,13 +33,13 @@ impl DropProvider for Provider {
                 Ok(false)
             }
             TyKind::Tuple(fields) => { for &field in fields { if self.needs_drop(field)? { return Ok(true); } } Ok(false) }
-            TyKind::Closure(_, _, _, captures, _) => self.needs_drop(*captures),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) => self.needs_drop(*captures),
             TyKind::Array(elem, len) => {
-                let zero = match len_ty(*len) { None => *len == 0, Some(t) => matches!(self.tcx.tys.kind(t), TyKind::ConstVal(0)) };
+                let zero = len.try_to_target_usize(&self.tcx.tys) == Some(0);
                 if zero { Ok(false) } else { self.needs_drop(*elem) }
             }
             TyKind::Slice(elem) => self.needs_drop(*elem),
-            TyKind::Param(_) | TyKind::Assoc(..) | TyKind::Opaque(..) | TyKind::Dyn(..) => Ok(true),
+            TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) | TyKind::Dyn(..) => Ok(true),
             _ => Ok(false),
         }
     }
@@ -205,7 +207,7 @@ impl<'a> Walker<'a> {
                             let t = p.ty(b, &self.p.tcx).unwrap().ty;
                             let (TyKind::Ptr(_, array) | TyKind::Ref(_, array, _)) = self.p.tcx.tys.kind(t) else { panic!() };
                             let TyKind::Array(_, len) = self.p.tcx.tys.kind(*array) else { panic!() };
-                            let Value::Ptr(ref mut a) = val else { panic!() }; a.meta = *len;
+                            let Value::Ptr(ref mut a) = val else { panic!() }; a.meta = len.try_to_target_usize(&self.p.tcx.tys).unwrap();
                         }
                         val
                     }
@@ -387,7 +389,7 @@ fn moved_box_pointee_retains_exactly_one_deallocation() {
 
 #[test]
 fn array_shim_delegates_to_slice_and_slice_cleanup_advances() {
-    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), 3));
+    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), p.tcx.tys.const_usize(3)));
     let b = p.shim(array);
     assert_eq!(b.basic_blocks.len(), 2);
     assert!(matches!(b.basic_blocks[0].terminator.as_ref().unwrap().kind, TerminatorKind::Call { .. }));
@@ -438,7 +440,7 @@ fn tuple_box_and_vec_shim_and_closure_capture_storage() {
     let tuple = p.tcx.tys.intern(TyKind::Tuple(vec![heap, vec_ty]));
     let sig = p.tcx.tys.intern(TyKind::FnPtr(vec![], p.tcx.tys.unit, crate::types::FnHeader::RUST, 0));
     let owner = p.tcx.tys.intern(TyKind::FnDef(p.def("produce"), vec![], crate::types::RegionArgsId::EMPTY));
-    let closure = p.tcx.tys.intern(TyKind::Closure(0, 123, sig, tuple, owner));
+    let closure = p.tcx.tys.intern(TyKind::Closure(0, 123, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: p.tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tuple }));
     for ty in [tuple, closure] {
         let mut w = Walker::new(&p); w.heap("t.0", "p", 0);
         assert_eq!(w.drop_value(ty, Address::new("t", 0)), Exit::Return);
@@ -449,13 +451,13 @@ fn tuple_box_and_vec_shim_and_closure_capture_storage() {
 #[test]
 fn query_semantics_empty_glue_and_failure_leave_body_unchanged() {
     let mut p = Provider::new();
-    for ty in [p.tcx.tys.unit, p.tcx.tys.intern(TyKind::Array(p.d(), 0)), p.adt("Manual", vec![p.d()]), p.adt("Suppress", vec![p.d()])] {
+    for ty in [p.tcx.tys.unit, p.tcx.tys.intern(TyKind::Array(p.d(), p.tcx.tys.const_usize(0))), p.adt("Manual", vec![p.d()]), p.adt("Suppress", vec![p.d()])] {
         let b = p.shim(ty); assert_eq!(b.basic_blocks.len(), 1); assert!(matches!(b.basic_blocks[0].terminator.as_ref().unwrap().kind, TerminatorKind::Return));
     }
     let param = p.tcx.tys.intern(TyKind::Param(0));
     assert!(p.needs_drop(param).unwrap()); p.copy.insert(param); assert!(!p.needs_drop(param).unwrap());
     assert!(p.needs_drop(p.tcx.tys.intern(TyKind::Slice(p.d()))).unwrap());
-    assert!(p.needs_drop(p.tcx.tys.intern(TyKind::Array(p.d(), 3))).unwrap(), "ZST element with Drop still drops");
+    assert!(p.needs_drop(p.tcx.tys.intern(TyKind::Array(p.d(), p.tcx.tys.const_usize(3)))).unwrap(), "ZST element with Drop still drops");
     let mut b = body(&p, &[p.tcx.tys.unit, p.d()], 1, vec![block(vec![], drop(local(1), 1)), block(vec![], TerminatorKind::Return)]);
     let original = format!("{b:?}"); p.fail = Some(p.d());
     assert_eq!(elaborate_drops(&mut b, &p), Err(DropError::Query(p.d())));
@@ -511,7 +513,7 @@ fn call_return_flag_is_only_set_on_success_and_not_on_a_shared_edge() {
 
 #[test]
 fn untracked_index_replacement_is_unconditional() {
-    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), 3));
+    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), p.tcx.tys.const_usize(3)));
     let place = project(&local(1), PlaceElem::Index(Local(2)));
     let mut b = body(&p, &[p.tcx.tys.unit, array, p.tcx.tys.usize_], 2, vec![
         block(vec![], TerminatorKind::Drop { place, target: BasicBlock(1), unwind: UnwindAction::Continue, replace: true }),
@@ -525,7 +527,7 @@ fn untracked_index_replacement_is_unconditional() {
 
 #[test]
 fn partially_moved_array_uses_reference_partition_order_and_cleanup() {
-    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), 5));
+    let p = Provider::new(); let array = p.tcx.tys.intern(TyKind::Array(p.d(), p.tcx.tys.const_usize(5)));
     let moved = project(&local(1), PlaceElem::ConstantIndex { offset: 2, min_length: 5, from_end: false });
     let mut b = body(&p, &[p.tcx.tys.unit, array, p.d()], 1, vec![
         block(vec![stmt(local(2), Rvalue::Use(Operand::Move(moved)))], drop(local(1), 1)),

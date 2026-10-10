@@ -140,10 +140,10 @@ pub struct Borrowck<'a> {
     pub ever_inits: EverInitializedPlaces<'a>,
 }
 impl<'a> Borrowck<'a> {
-    pub fn new(tcx: &'a Tcx, body: &'a Body, regions: &dyn RegionScope, borrow_set: &'a BorrowSet, moves: &'a MoveData) -> Self {
+    pub fn new(prog: &'a crate::program::Program, tcx: &'a Tcx, body: &'a Body, regions: &dyn RegionScope, borrow_set: &'a BorrowSet, moves: &'a MoveData) -> Self {
         Self {
             borrows: Borrows::new(tcx, body, regions, borrow_set),
-            uninits: MaybeUninitializedPlaces::new(tcx, body, moves),
+            uninits: MaybeUninitializedPlaces::new(prog, tcx, body, moves),
             ever_inits: EverInitializedPlaces::new(body, moves),
         }
     }

@@ -8,7 +8,13 @@ use crate::cmp::Ordering;
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::intrinsics_atomic as ia;
-use crate::ops::Deref;
+use crate::ops::{Deref, DispatchFromDyn};
+use crate::marker::Unsize;
+use crate::pin::PinSafePointer;
+
+// library/alloc/src/rcs/arc.rs:292,2577 @8d1a764
+impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Arc<U>> for Arc<T> {}
+unsafe impl<T: ?Sized> PinSafePointer for Arc<T> {}
 use crate::ptr;
 use crate::rc::{alloc_block, free_block, header_of, is_dangling, value_offset, Header, DANGLING};
 

@@ -63,7 +63,7 @@ fn borrow(dest: u32, source: Place, kind: BorrowKind) -> StatementKind {
 fn gather(tcx: &Tcx, b: &Body, invalidated: bool) -> BorrowSet {
     let session = std::sync::Arc::new(crate::Session::default());
     let prog = Program::new(&session);
-    let moves = MoveData::gather_moves(b, &prog, tcx, TypingEnv::fully_monomorphized(), &|_| true);
+    let moves = MoveData::gather_moves(b, &prog, tcx, TypingEnv::fully_monomorphized(&prog), &|_| true);
     BorrowSet::build(tcx, b, invalidated, &moves)
 }
 fn reference(tcx: &Tcx, mutable: bool, ty: TyId) -> TyId {
@@ -369,7 +369,7 @@ fn shared_deref_deep_prefix_is_an_invariant_failure() {
 fn fake_borrow_and_artificial_fields() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let b = empty_body(&[tcx.tys.unit, tcx.tys.intern(TyKind::Array(t, 4))]);
+    let b = empty_body(&[tcx.tys.unit, tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(4)))]);
     let p = place(1, vec![PlaceElem::ConstantIndex { offset: 1, min_length: 4, from_end: false }]);
     for field in [ArtificialField::ArrayLength, ArtificialField::FakeBorrow] {
         assert!(!depth(&tcx, &b, &p, &local(1), AccessDepth::Shallow(Some(field))));
@@ -438,7 +438,7 @@ fn runtime_index_bias_and_later_disjoint_fields() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
     let pair = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
-    let b = empty_body(&[tcx.tys.unit, tcx.tys.intern(TyKind::Array(pair, 4)), tcx.tys.usize_]);
+    let b = empty_body(&[tcx.tys.unit, tcx.tys.intern(TyKind::Array(pair, tcx.tys.const_usize(4))), tcx.tys.usize_]);
     let p = place(1, vec![PlaceElem::Index(Local(2))]);
     for elem in [PlaceElem::Index(Local(2)), index(0, 4, false), slice(1, 3, false)] {
         let q = place(1, vec![elem]);
@@ -598,8 +598,8 @@ fn def_use_rejects_set_discriminant() {
 fn generic_array_subslice_does_not_evaluate_unused_length() {
     let tcx = Tcx::new();
     let t = tcx.tys.i32_;
-    let n = tcx.tys.intern(TyKind::Param(0));
-    let array = tcx.tys.intern(TyKind::Array(t, crate::types::LEN_TY | u64::from(n.0)));
+    let n = tcx.tys.intern_const(crate::consts::ConstKind::Param(crate::consts::ParamConst { index: 0 }));
+    let array = tcx.tys.intern(TyKind::Array(t, n));
     let b = empty_body(&[tcx.tys.unit, array]);
     let p = place(1, vec![slice(1, 1, true)]);
     assert!(conflict(&tcx, &b, &p, &p));
@@ -629,7 +629,7 @@ fn inline_asm_gathering_stops_without_operand_metadata() {
     let session = std::sync::Arc::new(crate::Session::default());
     let prog = Program::new(&session);
     let mut b = empty_body(&[tcx.tys.unit]);
-    let moves = MoveData::gather_moves(&b, &prog, &tcx, TypingEnv::fully_monomorphized(), &|_| true);
+    let moves = MoveData::gather_moves(&b, &prog, &tcx, TypingEnv::fully_monomorphized(&prog), &|_| true);
     // MoveData also refuses inline asm; isolate BorrowSet's own boundary check.
     b.basic_blocks[0].terminator.as_mut().unwrap().kind = TerminatorKind::InlineAsm(InlineAsmUnsupported);
     BorrowSet::build(&tcx, &b, true, &moves);

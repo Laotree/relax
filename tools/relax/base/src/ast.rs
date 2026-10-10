@@ -7,13 +7,13 @@ pub struct Ident {
     pub hi: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExprId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatId(pub u32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TyId(pub u32);
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ItemId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockId(pub u32);
@@ -794,6 +794,8 @@ pub struct Block {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Item {
+    /// The specialization keyword, retained until collection rejects E0658.
+    pub default_: bool,
     /// arena ranges [expr_lo, expr_hi, pat_lo, pat_hi) covering everything parsed for this item
     pub ranges: [u32; 4],
     pub attrs: List<Attr>,
@@ -805,7 +807,7 @@ pub struct Item {
 }
 
 // Item used to be 168 bytes, before its owned children moved into flat arrays.
-const _: () = assert!(std::mem::size_of::<Item>() <= 112);
+const _: () = assert!(std::mem::size_of::<Item>() <= 120);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Param {

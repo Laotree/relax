@@ -31,6 +31,7 @@ pub mod provided;
 pub mod pmhost;
 mod native_macros;
 pub mod ctfe;
+mod valtrees;
 pub mod syms;
 pub mod pack;
 pub mod store;
@@ -609,6 +610,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let t2 = Instant::now();
     let tests = jit::find_tests(&prog, krate);
     let mut u = jit::Unit::new(prog, tcx, core);
+    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
+    if !enum_errors.is_empty() {
+        for error in enum_errors { eprintln!("error: {}", error); }
+        return 1;
+    }
     jit::enable_pipelining(options);
     println!(
         "boot: load+parse+resolve {:.2} ms, signatures/layouts {:.2} ms; {} tests",
@@ -687,6 +693,11 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             passes.push_str(&format!("{} {:.2}  ", opt::PASS_NAMES[i], opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
         }
         println!("opt passes (ms): {}", passes);
+    }
+    u.flush_query_errors(true);
+    if !u.errors.is_empty() {
+        for error in &u.errors { eprintln!("error: {error}"); }
+        return 1;
     }
     if failed > 0 {
         1
@@ -803,3 +814,24 @@ fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
 
 #[cfg(test)]
 mod lazy_reload_tests;
+
+#[cfg(test)]
+#[test]
+fn round18_rpit_diagnostic() {
+    // `relax test` is process-global (it installs the runtime and exits): run it in a child of
+    // this test binary, as lazy_reload_tests does, instead of naming a built relax binary.
+    const CHILD: &str = "RELAX_ROUND18_RPIT_CHILD";
+    let dir = env!("CARGO_MANIFEST_DIR");
+    if std::env::var_os(CHILD).is_some() {
+        let sess = session_from_env(&[]);
+        os::proc::exit(cmd_test(&sess, &[format!("{dir}/tests/rpit.rs")]));
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "round18_rpit_diagnostic", "--nocapture", "--test-threads=1"])
+        .env(CHILD, "1").env("RELAX_STD", format!("{dir}/std")).env("RELAX_CACHE", "off")
+        .env("MAKEPAD_HIDE_WINDOWS", "1").env("SANDBOX_MUTE", "1").output().unwrap();
+    let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    eprintln!("{all}");
+    assert!(output.status.success());
+    assert!(all.contains("test result: 10 passed; 0 failed"), "{all}");
+}

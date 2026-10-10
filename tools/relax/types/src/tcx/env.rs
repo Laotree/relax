@@ -1,4 +1,5 @@
-use super::{DefId, ParamEnv, Tcx};
+use super::{DefId, Tcx};
+use crate::next_solver::ParamEnv;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
@@ -10,7 +11,6 @@ pub struct ParamEnvId(u32);
 
 impl ParamEnvId {
     pub const EMPTY: Self = Self(0);
-    pub(crate) fn index(self) -> u32 { self.0 }
 }
 
 /// rustc_type_ir/src/infer_ctxt.rs:107: Analysis carries an interned owner list.
@@ -112,7 +112,7 @@ impl Envs {
         let mut b = ((n + CHUNK - 1) / CHUNK) * CHUNK * std::mem::size_of::<Entry>();
         for i in 0..n {
             b += match &self.entry(i as u32).data {
-                Data::Predicates(e) => e.preds.capacity() * std::mem::size_of::<(crate::types::TyId, DefId, Vec<crate::types::TyId>)>() + e.preds.iter().map(|p| p.2.capacity() * 4).sum::<usize>() + e.eqs.capacity() * 8,
+                Data::Predicates(e) => e.clauses.len() * std::mem::size_of::<crate::next_solver::Predicate>(),
                 Data::Owners(o) => o.capacity() * 4,
             };
         }
@@ -136,16 +136,17 @@ impl Drop for Envs {
 }
 
 impl Tcx {
+    /// rustc_middle/src/ty/context.rs mk_clauses: a typing environment's clause list is
+    /// interned before it enters query keys (TypingEnv); the empty list is EMPTY.
     pub fn intern_param_env(&self, env: ParamEnv) -> ParamEnvId {
-        if env.preds.is_empty() && env.eqs.is_empty() { return ParamEnvId::EMPTY; }
+        if env.clauses.is_empty() { return ParamEnvId::EMPTY; }
         ParamEnvId(self.envs.intern(Data::Predicates(env)))
     }
 
     #[inline]
-    pub fn param_env(&self, id: ParamEnvId) -> Option<&ParamEnv> {
-        if id == ParamEnvId::EMPTY { return None; }
+    pub fn param_env_by_id(&self, id: ParamEnvId) -> &ParamEnv {
         match &self.envs.entry(id.0).data {
-            Data::Predicates(env) => Some(env),
+            Data::Predicates(env) => env,
             Data::Owners(_) => unreachable!(),
         }
     }

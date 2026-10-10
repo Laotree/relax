@@ -100,7 +100,7 @@ pub fn panic_str(msg: &'static str) -> ! {
 
 #[track_caller]
 #[cfg_attr(not(relax_check), lang = "panic_display")]
-pub fn panic_display<T: fmt::Display + ?Sized>(x: &T) -> ! {
+pub fn panic_display<T: fmt::Display>(x: &T) -> ! {
     panic_fmt(format_args!("{}", x))
 }
 

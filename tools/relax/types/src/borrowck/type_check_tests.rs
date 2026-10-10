@@ -5,6 +5,7 @@ use super::constraints::{AnnotationSource, ConstraintCategory as Cat, OutlivesCo
 use super::region_infer::NllRegionVariableOrigin as Origin;
 use super::type_check::*;
 use crate::lang_items::LangItem;
+use crate::consts::GenericArg;
 use crate::mir::*;
 use crate::program::{DefId, Program};
 use crate::tcx::Tcx;
@@ -13,9 +14,9 @@ use crate::types::{BoundVar, FnHeader, RegionArgsId, RegionId, RegionKind, Safet
 
 #[derive(Debug, PartialEq)]
 enum Op {
-    Prove(LangItem, Vec<TyId>, Locations, Cat),
+    Prove(LangItem, Vec<GenericArg>, Locations, Cat),
     Wf(TyId, Locations, Cat),
-    Clauses(ClauseOwner, Vec<TyId>, Locations),
+    Clauses(ClauseOwner, Vec<GenericArg>, Locations),
     Ascribe(TyId, UserType, Span),
     AscribeSkipWf(TyId, TyId, Span),
     Opaque(TyId, V, TyId),
@@ -53,14 +54,15 @@ impl BorrowckTypeOps for Fake<'_> {
     }
     fn encountered_re_error(&self) -> bool { false }
     fn shallow_resolve(&mut self, ty: TyId) -> TyId { ty }
+    fn shallow_resolve_const(&mut self, ct: crate::consts::Const) -> crate::consts::Const { ct }
     fn next_ty_var(&mut self, _: Span) -> TyId { unreachable!() }
     fn generalize_ty_var(&mut self, _: u32, _: V, _: TyId, _: Span) -> Result<TyId, NoSolution> { unreachable!() }
     fn relate_opaque(&mut self, _: &mut MirTypeckRegionConstraints, a: TyId, v: V, b: TyId, _: Locations, _: Cat) -> Result<(), NoSolution> {
         self.ops.push(Op::Opaque(a, v, b)); Ok(())
     }
-    fn prove_trait_ref(&mut self, _: &mut MirTypeckRegionConstraints, t: LangItem, args: &[TyId], l: Locations, c: Cat) { self.ops.push(Op::Prove(t, args.to_vec(), l, c)); }
+    fn prove_trait_ref(&mut self, _: &mut MirTypeckRegionConstraints, t: LangItem, args: &[GenericArg], l: Locations, c: Cat) { self.ops.push(Op::Prove(t, args.to_vec(), l, c)); }
     fn prove_wf(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, l: Locations, c: Cat) { self.ops.push(Op::Wf(ty, l, c)); }
-    fn normalize_and_prove_instantiated_clauses(&mut self, _: &mut MirTypeckRegionConstraints, o: ClauseOwner, args: &[TyId], l: Locations) {
+    fn normalize_and_prove_instantiated_clauses(&mut self, _: &mut MirTypeckRegionConstraints, o: ClauseOwner, args: &[GenericArg], l: Locations) {
         self.ops.push(Op::Clauses(o, args.to_vec(), l));
     }
     fn normalize(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Locations) -> TyId { ty }
@@ -74,14 +76,14 @@ impl BorrowckTypeOps for Fake<'_> {
     fn field_ty(&self, _: PlaceTy, _: FieldIdx) -> Option<TyId> { None }
     fn aggregate_field_ty(&mut self, _: &mut MirTypeckRegionConstraints, _: &AggregateKind, _: FieldIdx, _: Location) -> Result<TyId, usize> { Err(0) }
     fn rvalue_query_ty(&self, _: &Body, _: &Rvalue) -> TyId { self.query_ty.unwrap() }
-    fn unevaluated_const_ty(&self, _: DefId, _: &[TyId]) -> TyId { self.const_ty.unwrap() }
+    fn unevaluated_const_ty(&self, _: DefId, _: &[GenericArg]) -> TyId { self.const_ty.unwrap() }
     fn static_ptr(&self, _: &ConstOperand) -> Option<DefId> { None }
     fn static_ty(&mut self, _: &mut MirTypeckRegionConstraints, _: DefId, _: Locations) -> TyId { unreachable!() }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool { !matches!(self.tcx.tys.kind(ty), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) }
     fn is_privately_uninhabited(&mut self, ty: TyId) -> bool { ty == self.tcx.tys.never }
     fn is_upvar_field_projection(&self, _: &Body, _: &Place) -> Option<FieldIdx> { None }
     fn simd_const_arg(&self, _: DefId) -> Option<(usize, &'static str)> { None }
-    fn closure_parent_args(&self, _: ClauseOwner, _: &[TyId]) -> (Vec<TyId>, Vec<TyId>) { (vec![], vec![]) }
+    fn closure_parent_args(&self, _: ClauseOwner, _: &[GenericArg]) -> (Vec<GenericArg>, Vec<GenericArg>) { (vec![], vec![]) }
     fn unsized_fn_params(&self) -> bool { false }
     fn is_inline_const(&self, _: DefId) -> bool { self.inline_const }
 }
@@ -111,8 +113,13 @@ fn val(ty: TyId) -> Operand { Operand::Constant(Box::new(ConstOperand { span: Sp
 fn assign(dst: u32, rv: Rvalue) -> StatementKind { StatementKind::Assign(p(dst), rv) }
 fn copy(src: u32) -> Rvalue { Rvalue::Use(Operand::Copy(p(src))) }
 fn check<'t>(tcx: &'t Tcx, fake: &mut Fake<'t>, b: &Body) -> MirTypeckResults {
+    check_in(tcx, &test_prog(), fake, b)
+}
+/// Bodies over collected declarations relate them through the declaration queries
+/// (variances_of), which read the program that declared them.
+fn check_in<'t>(tcx: &'t Tcx, prog: &Program, fake: &mut Fake<'t>, b: &Body) -> MirTypeckResults {
     let io: Vec<TyId> = (1..=b.arg_count as usize).chain([0]).map(|l| b.local_decls[l].ty).collect();
-    type_check(tcx, &test_prog(), fake, b, &io, None)
+    type_check(tcx, prog, fake, b, &io, None)
 }
 /// (sup, sub, point, category) of the constraints, without the I/O equalities
 /// (Locations::All with BoringNoLocation).
@@ -133,8 +140,8 @@ fn assignment_of_shorter_reference_emits_outlives_at_location() {
     let c: &OutlivesConstraint = r.constraints.outlives_constraints.outlives.iter().find(|c| c.category == Cat::Assignment).unwrap();
     assert_eq!(c.span, span(2)); assert!(!c.from_closure);
     // `Copy` operands prove `T: Copy`; assignments prove the place type Sized.
-    assert!(fake.ops.contains(&Op::Prove(LangItem::Copy, vec![r1], Locations::Single(at(0, 1)), Cat::CopyBound)));
-    assert!(fake.ops.contains(&Op::Prove(LangItem::Sized, vec![r2], Locations::Single(at(0, 1)), Cat::SizedBound)));
+    assert!(fake.ops.contains(&Op::Prove(LangItem::Copy, vec![GenericArg::Type(r1)], Locations::Single(at(0, 1)), Cat::CopyBound)));
+    assert!(fake.ops.contains(&Op::Prove(LangItem::Sized, vec![GenericArg::Type(r2)], Locations::Single(at(0, 1)), Cat::SizedBound)));
     // The signature is equated everywhere.
     let io: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category == Cat::BoringNoLocation).collect();
     assert!(io.iter().all(|c| c.location.is_none() && c.sup == c.sub || c.location.is_none()));
@@ -177,9 +184,9 @@ fn mutable_references_are_invariant_in_their_referent() {
 
 #[test]
 fn call_arguments_destination_and_late_bound_regions() {
-    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let (prog, tcx) = collect("fn f<'a>(x: &'a i32) -> &'a i32 { x }"); let t = tcx.tys.i32_;
     // fn f<'x>(&'x i32) -> &'x i32, called as `_3 = f(copy _2)`.
-    let f = tcx.tys.intern(TyKind::FnDef(DefId(9), vec![], RegionArgsId::EMPTY));
+    let f = tcx.tys.intern(TyKind::FnDef(named(&prog, "f"), vec![], RegionArgsId::EMPTY));
     let late = rf(&tcx, bound(&tcx, 0), t, false);
     let call = |source| TerminatorKind::Call { func: val(f), args: vec![Operand::Copy(p(2))], destination: p(3), target: Some(BasicBlock(1)),
         unwind: UnwindAction::Continue, call_source: source, fn_span: span(80), arg_spans: vec![] };
@@ -187,7 +194,7 @@ fn call_arguments_destination_and_late_bound_regions() {
         vec![block(vec![], call(CallSource::Normal)), block(vec![], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    let r = check(&tcx, &mut fake, &b); clean(&r);
+    let r = type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None); clean(&r);
     // The late-bound region becomes vid 3, live at the call (point 0).
     assert_eq!(fake.regions[3], (Origin::Existential, UniverseIndex::ROOT));
     assert!(r.constraints.liveness_constraints.point_liveness(3).is_some_and(|l| l.contains(0)));
@@ -198,12 +205,12 @@ fn call_arguments_destination_and_late_bound_regions() {
     // Calls not written by the user blame no argument.
     b.basic_blocks[0].terminator.as_mut().unwrap().kind = call(CallSource::OverloadedOperator);
     let mut fake = Fake::new(&tcx, 3); fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    assert_eq!(edges(&check(&tcx, &mut fake, &b))[1].3, Cat::Boring);
+    assert_eq!(edges(&type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None))[1].3, Cat::Boring);
     // Wrong arity is ill-typed MIR.
     b.basic_blocks[0].terminator.as_mut().unwrap().kind = TerminatorKind::Call { func: val(f), args: vec![], destination: p(3), target: Some(BasicBlock(1)),
         unwind: UnwindAction::Continue, call_source: CallSource::Normal, fn_span: span(80), arg_spans: vec![] };
     let mut fake = Fake::new(&tcx, 3); fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    let r = check(&tcx, &mut fake, &b);
+    let r = type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None);
     assert!(r.tainted_by_errors && r.mir_bugs[0].message.contains("wrong # of args"));
 }
 
@@ -239,13 +246,13 @@ fn cast_categories() {
     let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert_eq!(edges(&r)[0], (2, 1, Some(0), implicit(false)));
     // Unsizing proves CoerceUnsized; the target is recorded region-erased.
-    let arr = rf(&tcx, re(&tcx, 1), tcx.tys.intern(TyKind::Array(t, 2)), false);
+    let arr = rf(&tcx, re(&tcx, 1), tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(2))), false);
     let slice = rf(&tcx, re(&tcx, 2), tcx.tys.intern(TyKind::Slice(t)), false);
     let b = body(&[tcx.tys.unit, arr, slice], vec![block(vec![cast(CastKind::PointerCoercion(PointerCoercion::Unsize, CoercionSource::Implicit), slice)], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     check(&tcx, &mut fake, &b);
     let erased = rf(&tcx, RegionId::ERASED, tcx.tys.intern(TyKind::Slice(t)), false);
-    assert!(fake.ops.contains(&Op::Prove(LangItem::CoerceUnsized, vec![arr, slice], Locations::Single(at(0, 0)),
+    assert!(fake.ops.contains(&Op::Prove(LangItem::CoerceUnsized, vec![GenericArg::Type(arr), GenericArg::Type(slice)], Locations::Single(at(0, 0)),
         Cat::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: true, unsize_to: Some(erased) })));
     // Numeric casts are only checked for shape.
     let b = body(&[tcx.tys.unit, tcx.tys.f64_, t], vec![block(vec![cast(CastKind::IntToInt, t)], TerminatorKind::Return)]);
@@ -271,13 +278,13 @@ fn reify_and_closure_fn_pointer_casts() {
     assert!(e.contains(&(2, 3, Some(0), cat)) && e.contains(&(2, 4, Some(0), cat)), "{e:?}");
     // A closure's signature becomes a fn pointer of the target's safety.
     let sig = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 1), t, false)], tcx.tys.unit, 0);
-    let closure = tcx.tys.intern(TyKind::Closure(7, 1, sig, tcx.tys.unit, item));
+    let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: item, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tcx.tys.unit }));
     let b = body(&[tcx.tys.unit, closure, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer, CoercionSource::AsCast), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
     let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert_eq!(edges(&r)[0], (2, 1, Some(0), Cat::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: false, unsize_to: None }));
 }
 
-fn collect(source: &str) -> (Program, Tcx) {
+pub(crate) fn collect(source: &str) -> (Program, Tcx) {
     let session = std::sync::Arc::new(crate::Session::default());
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -295,6 +302,15 @@ fn collect(source: &str) -> (Program, Tcx) {
 fn named(prog: &Program, name: &str) -> DefId {
     (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == name).unwrap()
 }
+/// An RPIT whose opaque has the declared variances [Bi (parent 'a), Inv (captured 'a)]
+/// (rustc_hir_analysis/src/variance/mod.rs:98-239: an opaque's parent lifetimes are
+/// bivariant, its captured duplicates invariant).
+pub(crate) fn opaque_fixture() -> (Program, Tcx, DefId) {
+    let (prog, tcx) = collect("trait Bound<'a> {} fn f<'a: 'a>(x: &'a u32) -> impl Bound<'a> { loop {} }");
+    let opaque = prog.opaque_types_defined_by[&named(&prog, "f")][0];
+    assert_eq!(tcx.variances_of(&prog, opaque), [crate::types::variance::V::Bi, crate::types::variance::V::Inv]);
+    (prog, tcx, opaque)
+}
 
 #[test]
 fn adt_lifetime_arguments_follow_declared_variance() {
@@ -302,14 +318,14 @@ fn adt_lifetime_arguments_follow_declared_variance() {
     let adt = |name, v| tcx.tys.intern(TyKind::Adt(named(&prog, name), vec![], tcx.tys.intern_region_args(&[re(&tcx, v)])));
     for (name, expected) in [("Co", vec![(1, 2)]), ("Contra", vec![(2, 1)]), ("Inv", vec![(1, 2), (2, 1)])] {
         let b = body(&[tcx.tys.unit, adt(name, 1), adt(name, 2)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
-        let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
+        let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 3), &b); clean(&r);
         let mut e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect(); e.sort();
         assert_eq!(e, expected, "{name}");
     }
     // An unused (bivariant) lifetime parameter relates nothing.
     let bi = |v| tcx.tys.intern(TyKind::Adt(named(&prog, "Bi"), vec![tcx.tys.i32_], tcx.tys.intern_region_args(&[re(&tcx, v)])));
     let b = body(&[tcx.tys.unit, bi(1), bi(2)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
-    let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
+    let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert!(edges(&r).is_empty());
 }
 
@@ -435,13 +451,13 @@ fn promoted_constraints_move_to_the_use_location() {
 fn closure_aggregates_defer_requirements_and_prove_bounds() {
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
     let id = ClosureId { file: 7, expr: 3 };
-    let closure = tcx.tys.intern(TyKind::Closure(7, 3, fn_ptr(&tcx, vec![], tcx.tys.unit, 0), tcx.tys.intern(TyKind::Tuple(vec![])), tcx.tys.unit));
-    let b = body(&[tcx.tys.unit, t, closure], vec![block(vec![StatementKind::Nop, assign(2, Rvalue::Aggregate(Box::new(AggregateKind::Closure(id, vec![t])), vec![]))], TerminatorKind::Return)]);
+    let closure = tcx.tys.intern(TyKind::Closure(7, 3, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: fn_ptr(&tcx, vec![], tcx.tys.unit, 0), tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(vec![])) }));
+    let b = body(&[tcx.tys.unit, t, closure], vec![block(vec![StatementKind::Nop, assign(2, Rvalue::Aggregate(Box::new(AggregateKind::Closure(id, vec![GenericArg::Type(t)])), vec![]))], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.query_ty = Some(closure);
     let r = check(&tcx, &mut fake, &b); clean(&r);
-    assert_eq!(r.deferred_closure_requirements, [DeferredClosureRequirement { def: ClauseOwner::Closure(id), args: vec![t], locations: Locations::Single(at(0, 1)) }]);
-    assert!(fake.ops.contains(&Op::Clauses(ClauseOwner::Closure(id), vec![t], Locations::Single(at(0, 1)))));
+    assert_eq!(r.deferred_closure_requirements, [DeferredClosureRequirement { def: ClauseOwner::Closure(id), args: vec![GenericArg::Type(t)], locations: Locations::Single(at(0, 1)) }]);
+    assert!(fake.ops.contains(&Op::Clauses(ClauseOwner::Closure(id), vec![GenericArg::Type(t)], Locations::Single(at(0, 1)))));
 }
 
 #[test]
@@ -497,13 +513,13 @@ fn reaudit_generic_arguments_are_related_in_declaration_order() {
     let t = tcx.tys.i32_;
     let adt = |a, r| tcx.tys.intern(TyKind::Adt(named(&prog, "P"), vec![rf(&tcx, re(&tcx, r), t, false)], tcx.tys.intern_region_args(&[re(&tcx, a)])));
     let b = body(&[tcx.tys.unit, adt(1, 3), adt(2, 4)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
-    let r = check(&tcx, &mut Fake::new(&tcx, 5), &b); clean(&r);
+    let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 5), &b); clean(&r);
     let e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect();
     assert_eq!(e, [(1, 2), (3, 4)]);
     // Invariantly (`&mut P<..>`): the same order, both directions per argument.
     let m = |a, r| rf(&tcx, re(&tcx, 9), adt(a, r), true);
     let b = body(&[tcx.tys.unit, m(1, 3), m(2, 4)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
-    let r = check(&tcx, &mut Fake::new(&tcx, 10), &b); clean(&r);
+    let r = check_in(&tcx, &prog, &mut Fake::new(&tcx, 10), &b); clean(&r);
     let e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).filter(|e| e.0 != 9).collect();
     assert_eq!(e, [(2, 1), (1, 2), (4, 3), (3, 4)]);
 }
@@ -515,7 +531,7 @@ fn reaudit_closure_parent_arguments_are_related_first() {
         let owner = tcx.tys.intern(TyKind::FnDef(DefId(3), vec![], tcx.tys.intern_region_args(&[re(&tcx, o)])));
         let sig = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, s), t, false)], tcx.tys.unit, 0);
         let captures = tcx.tys.intern(TyKind::Tuple(vec![rf(&tcx, re(&tcx, c), t, false)]));
-        tcx.tys.intern(TyKind::Closure(7, 1, sig, captures, owner))
+        tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: captures }))
     };
     let b = body(&[tcx.tys.unit, closure(1, 3, 5), closure(2, 4, 6)], vec![block(vec![assign(2, Rvalue::Use(Operand::Move(p(1))))], TerminatorKind::Return)]);
     let r = check(&tcx, &mut Fake::new(&tcx, 7), &b); clean(&r);

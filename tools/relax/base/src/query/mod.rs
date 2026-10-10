@@ -1,3 +1,4 @@
+// ported from N:rustc_middle/src/dep_graph/graph.rs @8d1a764
 //! Demand-driven, revisioned queries. Providers are ordinary functions; typed values
 //! and key interners live in `QueryTable`, while this engine sees only `QueryId`.
 //! The caller's force function dispatches a kind and its interned key back to a query.
@@ -145,17 +146,36 @@ impl QueryEngine {
         Ok(fingerprint)
     }
 
+    /// rustc_middle/src/ty/context/tls.rs:49-58: an independent context owns
+    /// its task stack. Nested compiler invocations restore the enclosing query.
+    pub fn enter_context<R>(&self, op: impl FnOnce() -> R) -> R {
+        if dep_graph::in_context(self.id) { return op(); }
+        let frame = TaskDeps::new(self.id, None, false);
+        let _guard = TaskGuard::enter(&frame, &self.task_reads);
+        op()
+    }
+
     /// Every value read, including a memo hit, passes here (graph.rs:450 in rustc).
     pub fn read_index(&self, index: DepNodeIndex) {
         dep_graph::read_index(self.id, index, &self.task_reads);
     }
 
-    /// Anonymous work contributes its ordered reads directly to the enclosing task.
-    /// Adaptation of rustc_middle/src/dep_graph/graph.rs:361: Q1 has no persistent anon node.
-    pub fn with_anon_task(&self, op: &mut dyn FnMut() -> Result<(), QueryError>) -> Result<(), QueryError> {
+    /// graph.rs:347-365,405-481: retain the task's ordered reads and record
+    /// its node in the caller. Cached consumers must call read_index again.
+    pub fn with_anon_task<R>(&self, op: &mut dyn FnMut() -> R) -> (R, DepNodeIndex) {
         let frame = TaskDeps::new(self.id, dep_graph::current_job(self.id), true);
-        let _task = TaskGuard::enter(&frame, true, &self.task_reads);
-        op()
+        let task = TaskGuard::enter(&frame, &self.task_reads);
+        let result = op();
+        let mut index = None;
+        task.with_reads(&mut |reads| {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            index = Some(state.graph.intern_anon(self.revision, reads));
+            while state.jobs.len() < state.graph.nodes.len() { state.jobs.push(QueryJob::default()); }
+        });
+        drop(task);
+        let index = index.unwrap();
+        self.read_index(index);
+        (result, index)
     }
 
     fn with_task(
@@ -164,51 +184,67 @@ impl QueryEngine {
         compute: &mut dyn FnMut() -> Result<Fingerprint, QueryError>,
         force: &dyn Fn(QueryId) -> Result<(), QueryError>,
     ) -> Result<(), QueryError> {
-        let parent = dep_graph::current_job(self.id);
-        let latch = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let node = &state.graph.nodes[index.0 as usize];
-            if node.error_at == self.revision {
-                if let Some(error) = &node.error {
-                    return Err(error.clone());
+        loop {
+            let parent = dep_graph::current_job(self.id);
+            let latch = {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let node = &state.graph.nodes[index.0 as usize];
+                if node.error_at == self.revision {
+                    if let Some(error) = &node.error {
+                        return Err(error.clone());
+                    }
+                }
+                if node.verified_at == self.revision {
+                    return Ok(());
+                }
+                if let Some(parent) = parent {
+                    job::check_cycle(&state, parent, index)?;
+                    state.jobs[parent.0 as usize].waiting_on = Some(index);
+                }
+                let job = &mut state.jobs[index.0 as usize];
+                if job.active {
+                    Some(Arc::clone(job.latch.get_or_insert_with(|| Arc::new(QueryLatch::new()))))
+                } else {
+                    job.active = true;
+                    None
+                }
+            };
+            let _waiting = WaitGuard { engine: self, parent };
+            if let Some(latch) = latch {
+                match latch.wait() {
+                    job::Completion::Value(result) => return result,
+                    job::Completion::Retry => { crate::preempt::point(); continue; },
                 }
             }
-            if node.verified_at == self.revision {
-                return Ok(());
+            let mut job = ActiveJobGuard { engine: self, index, finished: false };
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Validation must not leak forced dependencies into the caller's read set.
+                let frame = TaskDeps::new(self.id, Some(index), false);
+                let task = TaskGuard::enter(&frame, &self.task_reads);
+                (|| {
+                    if self.try_mark_green(index, force)? {
+                        return Ok(());
+                    }
+                    task.record();
+                    let fingerprint = compute()?;
+                    task.with_reads(&mut |reads| {
+                        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.complete(index, self.revision, fingerprint, reads);
+                    });
+                    Ok(())
+                })()
+            }));
+            match result {
+                Ok(result) => { job.complete(result.clone()); return result; }
+                Err(payload) => {
+                    // The task/read frame has already dropped, before waiters may retry.
+                    if crate::preempt::is_cancelled(&*payload) {
+                        drop(_waiting);
+                        job.cancel();
+                    }
+                    std::panic::resume_unwind(payload);
+                }
             }
-            if let Some(parent) = parent {
-                job::check_cycle(&state, parent, index)?;
-                state.jobs[parent.0 as usize].waiting_on = Some(index);
-            }
-            let job = &mut state.jobs[index.0 as usize];
-            if job.active {
-                Some(Arc::clone(job.latch.get_or_insert_with(|| Arc::new(QueryLatch::new()))))
-            } else {
-                job.active = true;
-                None
-            }
-        };
-        let _waiting = WaitGuard { engine: self, parent };
-        if let Some(latch) = latch {
-            return latch.wait();
         }
-        let mut job = ActiveJobGuard { engine: self, index, finished: false };
-        // Validation must not leak forced dependencies into the caller's read set.
-        let frame = TaskDeps::new(self.id, Some(index), false);
-        let task = TaskGuard::enter(&frame, false, &self.task_reads);
-        let result = (|| {
-            if self.try_mark_green(index, force)? {
-                return Ok(());
-            }
-            task.record();
-            let fingerprint = compute()?;
-            task.with_reads(&mut |reads| {
-                self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.complete(index, self.revision, fingerprint, reads);
-            });
-            Ok(())
-        })();
-        job.complete(result.clone());
-        result
     }
 
     /// Walk previous reads in order, stopping at the first changed dependency.
@@ -237,6 +273,10 @@ impl QueryEngine {
                 }
                 continue;
             }
+            let Some(query) = query else {
+                if !self.try_mark_green(dep, force)? { return Ok(false); }
+                continue;
+            };
             force(query)?;
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let node = &state.graph.nodes[dep.0 as usize];
@@ -262,7 +302,7 @@ impl QueryEngine {
         let mut result = Vec::new();
         if let Some(index) = state.graph.indices.get(&query) {
             for &edge in &state.graph.edges[state.graph.nodes[index.0 as usize].edges.clone()] {
-                result.push(state.graph.nodes[edge as usize].query);
+                if let Some(query) = state.graph.nodes[edge as usize].query { result.push(query); }
             }
         }
         result

@@ -88,6 +88,11 @@ pub fn cmd_live(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let mut running: Vec<(String, u32)> = prog.file_paths.iter().enumerate().map(|(i, p)| (p.clone(), i as u32)).collect();
     let root_dir = crate::program::dir_of(&args[0]).to_string();
     let mut u = Unit::new(prog, tcx, core);
+    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, krate);
+    if !enum_errors.is_empty() {
+        for error in enum_errors { eprintln!("error: {}", error); }
+        return 1;
+    }
     jit::enable_pipelining(options);
     println!("v0: first run (lazy compile on first call)");
     run_tests(&mut u, &tests);

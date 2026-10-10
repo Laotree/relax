@@ -30,7 +30,7 @@ fn lattice() {
     use V::*;
     let all = [Bi, Co, Contra, Inv];
     let composition = [[Bi, Bi, Bi, Bi], [Bi, Co, Contra, Inv],
-        [Bi, Contra, Co, Inv], [Bi, Inv, Inv, Inv]];
+        [Bi, Contra, Co, Inv], [Inv, Inv, Inv, Inv]];
     let meet = [[Bi, Co, Contra, Inv], [Co, Co, Inv, Inv],
         [Contra, Inv, Contra, Inv], [Inv, Inv, Inv, Inv]];
     for (i, &a) in all.iter().enumerate() {
@@ -199,7 +199,7 @@ fn lazy_signatures_publish_complete_bounds_to_parallel_readers() {
             let sig = t.fn_sig(&p, used).unwrap();
             assert_eq!(sig.n_generics, 1);
             assert_eq!(t.fn_trait_bounds(&p, used).unwrap().len(), 1);
-            assert_eq!(t.fn_bound_bindings(&p, used).unwrap().len(), 1);
+            assert_eq!(t.clauses_of(&p, used).iter().filter(|p| matches!(p.kind, crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Projection(..)))).count(), 1);
             assert_eq!(t.variances_of(&p, used), &[V::Inv]);
             sig as *const crate::tcx::FnSigT as usize
         })).collect();
@@ -210,28 +210,16 @@ fn lazy_signatures_publish_complete_bounds_to_parallel_readers() {
 }
 
 #[test]
-fn lazy_signature_constants_are_recollected() {
-    let (p, mut t) = collect(r#"
-        const fn size() -> usize { let n = 4; n }
-        const LEN: usize = size();
-        fn uses(x: [u8; LEN]) -> [u8; LEN] { x }
-        fn untouched() {}
-    "#);
-    let uses = named(&p, "uses");
-    let len = named(&p, "LEN");
+fn lazy_signature_lengths_use_native_const_queries() {
+    let (p, t) = collect("const LEN: usize = 4; fn uses(x: [u8; LEN]) -> [u8; LEN] { x } fn untouched() {}");
     assert_eq!(t.signature_count(), 0);
-    t.fn_sig(&p, uses).unwrap();
-    assert!(t.has_blocked_consts());
-    assert!(t.const_requests.lock().unwrap().contains(&len));
-    t.const_requests.lock().unwrap().clear();
-    t.const_values.insert(len, 4);
-    let epoch = t.collect_epoch.load(std::sync::atomic::Ordering::Relaxed);
-    t.recollect_blocked(&p);
-    assert!(!t.has_blocked_consts());
-    assert!(t.collect_epoch.load(std::sync::atomic::Ordering::Relaxed) > epoch);
-    let sig = t.fn_sig(&p, uses).unwrap();
-    assert!(matches!(t.tys.kind(sig.ret), TyKind::Array(_, 4)));
-    assert_eq!(sig.params[0], sig.ret);
+    let sig = t.fn_sig(&p, named(&p, "uses")).unwrap();
+    for ty in [sig.params[0], sig.ret] {
+        let TyKind::Array(_, n) = t.tys.kind(ty) else { panic!("array") };
+        let crate::consts::ConstKind::Alias(_, alias) = t.tys.const_kind(*n) else { panic!("unevaluated length") };
+        let value = t.const_eval_resolve(&p, crate::tcx::TypingEnv::fully_monomorphized(&p), alias.kind.def_id(), &alias.args).unwrap();
+        assert_eq!(value.try_to_leaf().unwrap().to_bits(8), 4);
+    }
     assert_eq!(t.signature_count(), 1);
 }
 
@@ -243,8 +231,8 @@ fn lazy_signature_diagnostics_survive_first_reader_and_reload() {
     t.fn_sig(&p, bad).unwrap();
     assert!(t.signature_errors(&p, bad).iter().any(|e| e.contains("unsupported function ABI")));
     let state = crate::tcx::EvalState::new();
-    let cx = crate::tcx::EvalCx::new(&p, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-    let body = crate::typeck::check_fn_uncached(&cx, &p, &t, bad, &[]);
+    let cx = crate::tcx::EvalCx::new(&p, &t, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
+    let body = crate::typeck::instantiate_body(&cx, &p, &t, bad, &[]);
     assert!(body.errors.iter().any(|e| e.contains("unsupported function ABI")));
     assert_eq!(t.signature_count(), 1);
     t.collect_added(&p, &[bad], false);
@@ -261,9 +249,9 @@ fn lazy_foreign_signature_errors_reach_every_caller() {
         fn untouched() {}
     "#);
     let state = crate::tcx::EvalState::new();
-    let cx = crate::tcx::EvalCx::new(&p, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+    let cx = crate::tcx::EvalCx::new(&p, &t, crate::tcx::TypingEnv::fully_monomorphized(&p), &state);
     for name in ["first", "second"] {
-        let body = crate::typeck::check_fn_uncached(&cx, &p, &t, named(&p, name), &[]);
+        let body = crate::typeck::instantiate_body(&cx, &p, &t, named(&p, name), &[]);
         assert!(body.errors.iter().any(|e| e.contains("unsupported function ABI")), "{:?}", body.errors);
     }
     assert_eq!(t.signature_count(), 3);

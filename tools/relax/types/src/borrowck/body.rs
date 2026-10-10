@@ -5,7 +5,7 @@ use crate::ast::{ExprId, ExprKind, ItemKind};
 use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::typeck::Body;
-use crate::types::{TyId, TyKind};
+use crate::types::TyId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BodyKind {
@@ -44,17 +44,51 @@ impl CheckedBody {
     }
 
     pub fn identity_args(self, prog: &Program, tcx: &Tcx) -> Vec<TyId> {
-        let n = tcx.fn_sig(prog, self.owner).map_or_else(
-            || tcx.item_env(prog, self.owner).names.len(),
-            |s| s.n_generics as usize,
-        );
-        (0..n).map(|i| tcx.tys.intern(TyKind::Param(i as u32))).collect()
+        tcx.generic_indices_of(prog, self.owner).identity_types_consts(&tcx.tys)
     }
 }
 
 /// The single item-owner enumeration used by synchronous and background drivers.
 pub fn owners(prog: &Program) -> impl Iterator<Item = CheckedBody> + '_ {
     (0..prog.defs.len()).filter_map(|i| CheckedBody::item(prog, DefId(i as u32)))
+}
+
+/// typeck-audit 1.27: anonymous constants outside every body -- array lengths and const
+/// arguments in signatures and types, enum discriminants -- are typeck roots of their own
+/// (rustc_interface passes.rs analysis type-checks every body owner). Those inside a body
+/// (repeat counts) are checked with that body.
+pub fn signature_anon_consts(prog: &Program, tcx: &Tcx, krate: u32) -> Vec<DefId> {
+    use crate::def_collector::NodeId;
+    let mut out = Vec::new();
+    for (&def, &(file, node)) in &prog.def_id_to_node_id {
+        let NodeId::AnonConst(e) = node else { continue };
+        let d = prog.def(def);
+        if d.krate != krate || d.kind != DefKind::AnonConst { continue; }
+        // rustc_ast_lowering/src/lib.rs:3005-3022: a trivial parameter path
+        // lowers directly to Param, so it has no anonymous body to type-check.
+        if tcx.const_tys.get(&def).is_none() { continue; }
+        let lo = prog.files[file as usize].ast.expr(e).lo;
+        let mut owner = d.parent;
+        while matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy) { owner = prog.def(owner).parent; }
+        if !in_body(prog, owner, file, lo) { out.push(def); }
+    }
+    out.sort_unstable_by_key(|d| d.0);
+    out
+}
+
+fn in_body(prog: &Program, owner: DefId, file: u32, lo: u32) -> bool {
+    let d = prog.def(owner);
+    if d.file != file || !matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static) { return false; }
+    let ast = &prog.files[file as usize].ast;
+    match ast.item(d.item).kind {
+        ItemKind::Fn(_, Some(b), _) => { let b = ast.block(b); lo >= b.lo && lo < b.hi }
+        ItemKind::Fn(s, None, _) => match ast.fn_sig(s).lazy_body {
+            Some(r) if r.hi > r.lo => { let src = prog.src(file); lo >= src.tok(r.lo as usize).lo && lo < src.tok(r.hi as usize - 1).hi }
+            _ => false,
+        },
+        ItemKind::Const(_, Some(init)) | ItemKind::Static(_, _, Some(init)) => { let x = ast.expr(init); lo >= x.lo && lo < x.hi }
+        _ => false,
+    }
 }
 
 /// Anonymous const children for which typeck retained expression facts.

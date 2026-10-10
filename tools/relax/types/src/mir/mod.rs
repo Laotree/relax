@@ -3,7 +3,6 @@
 
 pub mod dataflow;
 pub mod drop_flag_effects;
-pub mod interpret;
 pub mod move_paths;
 pub mod transform;
 pub mod shim;

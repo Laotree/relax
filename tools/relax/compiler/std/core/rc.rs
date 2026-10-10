@@ -11,7 +11,13 @@ use crate::borrow::Borrow;
 use crate::cmp::Ordering;
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
-use crate::ops::Deref;
+use crate::ops::{Deref, DispatchFromDyn};
+use crate::marker::Unsize;
+use crate::pin::PinSafePointer;
+
+// library/alloc/src/rcs/rc.rs:357,2604 @8d1a764
+impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Rc<U>> for Rc<T> {}
+unsafe impl<T: ?Sized> PinSafePointer for Rc<T> {}
 use crate::ptr;
 
 // ---------------------------------------------------------------- raw blocks (shared with Arc)

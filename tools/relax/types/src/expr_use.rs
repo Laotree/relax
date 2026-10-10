@@ -1,7 +1,8 @@
 //! Typed expression uses, following rustc_hir_typeck::expr_use_visitor.
 //! A place is a source local plus typed projections; indices deliberately have
 //! no identity. Rvalues are walked, but never mistaken for captured locals.
-use crate::solve::SelectionResult;
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use crate::ast::*;
 use crate::borrowck::tyx::Tx;
 use crate::program::DefKind;
@@ -73,15 +74,24 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 Some(copy)
             }
             TyKind::Array(t, _) => self.copy_type(t),
-            TyKind::Adt(..) | TyKind::Assoc(..) => {
+            TyKind::Adt(..) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
                 let Some(td) = self.tx.copy_trait else { return Some(false) };
-                match self.tx.select_trait(td, t, &[]) {
-                    SelectionResult::Ok(_) => Some(true),
-                    SelectionResult::NoSolution => Some(false),
-                    SelectionResult::Ambiguous(_) => None,
+                match self.tx.evaluate_trait(td, t, &[]) {
+                    r if r.must_apply_modulo_regions() => Some(true),
+                    crate::next_solver::evaluate_obligation::EvaluationResult::EvaluatedToErr => Some(false),
+                    _ => None,
                 }
             }
-            TyKind::Closure(file, ce, _, _, owner) => crate::upvar::closure_properties(&self.tx.cx, self.tx.prog, self.tx.tcx, self.body, file, ce, owner).map(|(_, is_copy)| is_copy),
+            // structural_traits.rs instantiate_constituent_tys_for_copy_clone_trait: a closure
+            // is Copy when its tupled upvars are; coroutines are not (coroutine_clone is a
+            // feature gate). The current owner reads its in-progress postorder result.
+            TyKind::Closure(file, ce, args) => {
+                if crate::upvar::is_capture_owner(self.tx.tcx, self.body, file, args.parent_args) {
+                    return self.body.min_captures.get(&ce).filter(|c| c.errors.is_empty()).map(|c| c.is_copy);
+                }
+                if self.tx.tcx.is_coroutine(t) { return Some(false); }
+                self.copy_type(args.tupled_upvars_ty())
+            }
             _ => Some(self.tx.is_copy(t)),
         }
     }
@@ -120,7 +130,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
         }
         if self.body.coerce.contains_key(&e.0) { self.consume_place(p); None } else { Some(p) }
     }
-    fn deref(&mut self, p: Place, key: u32, step: u8, mutable: bool) -> Option<Place> {
+    fn deref(&mut self, p: Place, key: u32, step: usize, mutable: bool) -> Option<Place> {
         if let Some(t) = self.tx.builtin_deref(p.ty()) {
             return Some(p.project(Projection::Deref, t));
         }
@@ -133,7 +143,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
         } else { self.errors.push((key, "missing dereference adjustment")); }
         None
     }
-    fn receiver(&mut self, e: ExprId, key: u32, n: u8, autoref: u8) {
+    fn receiver(&mut self, e: ExprId, key: u32, n: usize, autoref: u8) {
         let Some(mut p) = self.walk_place(e, autoref == 2) else { return };
         for i in 0..n {
             let Some(q) = self.deref(p, key, i, autoref == 2) else { return };
@@ -144,19 +154,19 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
     /// The target of a recorded autoderef. Overloaded dereferences produce an
     /// rvalue reference from the selected method; its pointee is the adjusted
     /// callee type (rustc expr_use_visitor.rs:726-766).
-    fn adjusted_deref_ty(&self, t: Type, key: u32, step: u8) -> Option<Type> {
+    fn adjusted_deref_ty(&self, t: Type, key: u32, step: usize) -> Option<Type> {
         if let Some(target) = self.tx.builtin_deref(t) { return Some(target); }
         let (method, args) = self.body.ov_derefs.get(&(key, step))?;
         let sig = self.tx.tcx.fn_item_sig(self.tx.prog, *method)?;
         let ret = self.tx.tcx.tys.subst(sig.ret, args);
-        let ret = self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, ret);
+        let ret = self.tx.normalize(ret);
         self.tx.builtin_deref(ret)
     }
     /// Categorize the expression while visiting its evaluations. Field/deref
     /// bases are walked without consuming their containing local (:400-437).
     fn walk_expr(&mut self, e: ExprId) -> Option<Place> { self.walk_place(e, false) }
     fn has_mutable_place_impl(&self, path: &'static str, t: Type, args: &[Type]) -> bool {
-        self.tx.lang(path).is_some_and(|td| matches!(self.tx.select_trait(td, t, args), SelectionResult::Ok(_)))
+        self.tx.lang(path).is_some_and(|td| self.tx.evaluate_trait(td, t, args).must_apply_modulo_regions())
     }
     fn walk_place(&mut self, e: ExprId, mutable: bool) -> Option<Place> {
         let kind = self.ast().expr(e).kind;
@@ -295,7 +305,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
                 let xs = self.ast().list(xs).to_vec();
                 let array = matches!(self.tx.kind(ty), TyKind::Array(..));
-                let n = match self.tx.kind(ty) { TyKind::Array(_, n) => n as usize, _ => self.tx.n_fields(ty, 0) };
+                let n = match self.tx.kind(ty) { TyKind::Array(_, n) => n.try_to_target_usize(&self.tx.tcx.tys).expect("array length in expression use") as usize, _ => self.tx.n_fields(ty, 0) };
                 let rest = xs.iter().position(|x| matches!(self.ast().expr(*x).kind, ExprKind::Range(None, None, false)));
                 for (i, x) in xs.iter().enumerate() {
                     if Some(i) == rest { continue; }
@@ -457,7 +467,7 @@ mod tests {
         b.locals.push(crate::typeck::Local { name: 0, ty: t, mutable: false, pat: 0 });
         b.res.insert(id.0, Res::Local(0));
         let state = crate::tcx::EvalState::new();
-        let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+        let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         for reborrow in [false, true] {
             if reborrow { b.reborrows.insert(id.0, true); }
             let mut v = ExprUseVisitor { tx: &tx, body: &b, delegate: Events::default(), errors: Vec::new() };
@@ -482,7 +492,7 @@ mod tests {
         b.locals.push(crate::typeck::Local { name: 0, ty: t, mutable: false, pat: 0 });
         b.res.insert(base.0, Res::Local(0)); b.field_idx.insert(id.0, (0, 0));
         let state = crate::tcx::EvalState::new();
-        let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+        let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         let mut v = ExprUseVisitor { tx: &tx, body: &b, delegate: Events::default(), errors: Vec::new() };
         v.consume_expr(id);
         assert!(v.errors.is_empty()); assert_eq!(v.delegate.0.len(), 1);

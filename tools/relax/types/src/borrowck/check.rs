@@ -34,12 +34,12 @@ impl MirBorrowckResult {
 /// MoveData is the same body-owned, Copy-filtered arena used by MIR type checking.
 /// C-NLL5 supplies it and the region input; this entry never invokes BIR borrowck.
 pub fn mir_borrowck(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
-    let nll = check_with_scopes(tcx, body, regions, moves);
+    let nll = check_with_scopes(prog, tcx, body, regions, moves);
     if !nll.unsupported.is_empty() { return nll; }
     let verify = nll.accepted() && verify_polonius_sample();
     if nll.accepted() && !verify { return nll; }
     *regions = compute_polonius_regions(tcx, prog, body, regions, moves);
-    let polonius = check_with_scopes(tcx, body, regions, moves);
+    let polonius = check_with_scopes(prog, tcx, body, regions, moves);
     if verify { assert!(polonius.accepted(), "Polonius must accept NLL-accepted MIR: {polonius:?}"); }
     polonius
 }
@@ -54,7 +54,7 @@ fn verify_polonius_sample() -> bool {
 }
 #[cfg(test)]
 pub(super) fn check_polonius(tcx: &Tcx, prog: &Program, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
-    check_with_scopes(tcx, body, &compute_polonius_regions(tcx, prog, body, regions, moves), moves)
+    check_with_scopes(prog, tcx, body, &compute_polonius_regions(tcx, prog, body, regions, moves), moves)
 }
 fn compute_polonius_regions(tcx: &Tcx, prog: &Program, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirRegionResult {
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
@@ -65,7 +65,7 @@ fn compute_polonius_regions(tcx: &Tcx, prog: &Program, body: &Body, regions: &Mi
         polonius: regions.polonius.clone(), nested: regions.nested, tainted_by_errors: regions.tainted_by_errors }
 }
 
-pub(super) fn check_with_scopes(tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
+pub(super) fn check_with_scopes(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
     assert!(regions.locations.matches(body), "region locations belong to another MIR layout");
     let mut result = MirBorrowckResult { errors: vec![], used_mut: BitSet::new_empty(body.local_decls.len()),
         unsupported: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors };
@@ -73,7 +73,7 @@ pub(super) fn check_with_scopes(tcx: &Tcx, body: &Body, regions: &MirRegionResul
     if !result.unsupported.is_empty() { return result; }
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
     let borrows = BorrowSet::build(tcx, body, invalidated, moves);
-    let analysis = Borrowck::new(tcx, body, regions, &borrows, moves);
+    let analysis = Borrowck::new(prog, tcx, body, regions, &borrows, moves);
     let results = analysis.iterate_to_fixpoint();
     let mut cursor = results.cursor();
     let mut cx = MirBorrowckCtxt { tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,

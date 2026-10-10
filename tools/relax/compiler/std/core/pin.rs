@@ -1,10 +1,24 @@
 //! Pin (kept for futures/task uses; Relax does not move pinned values).
 
 use crate::fmt;
-use crate::ops::{Deref, DerefMut};
+use crate::ops::{Deref, DerefMut, DispatchFromDyn};
+
+// library/core/src/pin.rs:1827-1832,1899,1918,1937,1971 @8d1a764: a pinned pointer
+// dispatches as its pointer does (`self: Pin<&mut Self>` methods are dyn-callable).
+impl<Ptr, U> DispatchFromDyn<Pin<U>> for Pin<Ptr>
+where
+    Ptr: DispatchFromDyn<U> + PinSafePointer,
+    U: PinSafePointer,
+{
+}
+pub unsafe trait PinSafePointer: Deref + Sized {}
+unsafe impl<'a, T: ?Sized> PinSafePointer for &'a T {}
+unsafe impl<'a, T: ?Sized> PinSafePointer for &'a mut T {}
+unsafe impl<P: PinSafePointer> PinSafePointer for Pin<P> {}
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
+#[fundamental]
 #[cfg_attr(not(relax_check), lang = "pin")]
 pub struct Pin<P> {
     pointer: P,

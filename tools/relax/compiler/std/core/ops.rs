@@ -1,7 +1,18 @@
+// ported from library/core/src/ops/function.rs @8d1a764
+// ported from library/core/src/ops/async_function.rs @8d1a764
+// ported from library/core/src/ops/unsize.rs @8d1a764
 //! Operator traits, ranges, Fn traits, ControlFlow. Operators on primitives are built in;
 //! their trait impls (for generic code) are generated in num/prim_traits.rs.
 
 use crate::option::Option::{self, None, Some};
+use crate::marker::{PointeeSized, Unsize};
+
+#[cfg_attr(not(relax_check), lang = "dispatch_from_dyn")]
+pub trait DispatchFromDyn<T>: Sized {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a U> for &'a T {}
+impl<'a, T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<&'a mut U> for &'a mut T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<*const U> for *const T {}
+impl<T: PointeeSized + Unsize<U>, U: PointeeSized> DispatchFromDyn<*mut U> for *mut T {}
 
 #[cfg_attr(not(relax_check), lang = "drop")]
 pub trait Drop {
@@ -9,13 +20,13 @@ pub trait Drop {
 }
 
 #[cfg_attr(not(relax_check), lang = "deref")]
-pub trait Deref {
+pub trait Deref: PointeeSized {
     #[cfg_attr(not(relax_check), lang = "deref_target")]
     type Target: ?Sized;
     fn deref(&self) -> &Self::Target;
 }
 #[cfg_attr(not(relax_check), lang = "deref_mut")]
-pub trait DerefMut: Deref {
+pub trait DerefMut: Deref + PointeeSized {
     fn deref_mut(&mut self) -> &mut Self::Target;
 }
 
@@ -52,34 +63,130 @@ pub trait IndexMut<Idx: ?Sized>: Index<Idx> {
 // Closures. `F: FnMut(A, B) -> R` is sugar for `F: FnMut<(A, B), Output = R>`; Relax
 // implements these for closures, fn items and fn pointers itself.
 #[cfg_attr(not(relax_check), lang = "fn_once")]
+#[fundamental]
 pub trait FnOnce<Args> {
     #[cfg_attr(not(relax_check), lang = "fn_once_output")]
     type Output;
     extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
 }
 #[cfg_attr(not(relax_check), lang = "fn_mut")]
+#[fundamental]
 pub trait FnMut<Args>: FnOnce<Args> {
     extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
 }
 #[cfg_attr(not(relax_check), lang = "fn")]
+#[fundamental]
 pub trait Fn<Args>: FnMut<Args> {
     extern "rust-call" fn call(&self, args: Args) -> Self::Output;
 }
 
-// Async closures' traits (`F: AsyncFn(A) -> R`): Relax implements them itself for closures
-// and functions whose result is a future of R (an async closure is a closure returning its
-// body's coroutine); calls go through the closure's own call.
+// ported from library/core/src/ops/async_function.rs:1-164 @8d1a764
+use crate::future::Future;
+use crate::marker::Tuple;
+
+#[rustc_paren_sugar]
+#[must_use = "async closures are lazy and do nothing unless called"]
+#[cfg_attr(not(relax_check), lang = "async_fn")]
+pub trait AsyncFn<Args: Tuple>: AsyncFnMut<Args> {
+    extern "rust-call" fn async_call(&self, args: Args) -> Self::CallRefFuture<'_>;
+}
+
+#[rustc_paren_sugar]
+#[must_use = "async closures are lazy and do nothing unless called"]
+#[cfg_attr(not(relax_check), lang = "async_fn_mut")]
+pub trait AsyncFnMut<Args: Tuple>: AsyncFnOnce<Args> {
+    #[cfg_attr(not(relax_check), lang = "call_ref_future")]
+    type CallRefFuture<'a>: Future<Output = Self::Output>
+    where
+        Self: 'a;
+
+    extern "rust-call" fn async_call_mut(&mut self, args: Args) -> Self::CallRefFuture<'_>;
+}
+
+#[rustc_paren_sugar]
+#[must_use = "async closures are lazy and do nothing unless called"]
 #[cfg_attr(not(relax_check), lang = "async_fn_once")]
-pub trait AsyncFnOnce<Args> {
+pub trait AsyncFnOnce<Args: Tuple> {
     #[cfg_attr(not(relax_check), lang = "call_once_future")]
-    type CallOnceFuture: crate::future::Future<Output = Self::Output>;
+    type CallOnceFuture: Future<Output = Self::Output>;
+
     #[cfg_attr(not(relax_check), lang = "async_fn_once_output")]
     type Output;
+
+    extern "rust-call" fn async_call_once(self, args: Args) -> Self::CallOnceFuture;
 }
-#[cfg_attr(not(relax_check), lang = "async_fn_mut")]
-pub trait AsyncFnMut<Args>: AsyncFnOnce<Args> {}
-#[cfg_attr(not(relax_check), lang = "async_fn")]
-pub trait AsyncFn<Args>: AsyncFnMut<Args> {}
+
+mod impls {
+    use super::{AsyncFn, AsyncFnMut, AsyncFnOnce};
+    use crate::marker::Tuple;
+
+    impl<A: Tuple, F: ?Sized> AsyncFn<A> for &F
+    where
+        F: AsyncFn<A>,
+    {
+        extern "rust-call" fn async_call(&self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call(*self, args)
+        }
+    }
+
+    impl<A: Tuple, F: ?Sized> AsyncFnMut<A> for &F
+    where
+        F: AsyncFn<A>,
+    {
+        type CallRefFuture<'a>
+            = F::CallRefFuture<'a>
+        where
+            Self: 'a;
+
+        extern "rust-call" fn async_call_mut(&mut self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call(*self, args)
+        }
+    }
+
+    impl<'a, A: Tuple, F: ?Sized> AsyncFnOnce<A> for &'a F
+    where
+        F: AsyncFn<A>,
+    {
+        type Output = F::Output;
+        type CallOnceFuture = F::CallRefFuture<'a>;
+
+        extern "rust-call" fn async_call_once(self, args: A) -> Self::CallOnceFuture {
+            F::async_call(self, args)
+        }
+    }
+
+    impl<A: Tuple, F: ?Sized> AsyncFnMut<A> for &mut F
+    where
+        F: AsyncFnMut<A>,
+    {
+        type CallRefFuture<'a>
+            = F::CallRefFuture<'a>
+        where
+            Self: 'a;
+
+        extern "rust-call" fn async_call_mut(&mut self, args: A) -> Self::CallRefFuture<'_> {
+            F::async_call_mut(*self, args)
+        }
+    }
+
+    impl<'a, A: Tuple, F: ?Sized> AsyncFnOnce<A> for &'a mut F
+    where
+        F: AsyncFnMut<A>,
+    {
+        type Output = F::Output;
+        type CallOnceFuture = F::CallRefFuture<'a>;
+
+        extern "rust-call" fn async_call_once(self, args: A) -> Self::CallOnceFuture {
+            F::async_call_mut(self, args)
+        }
+    }
+}
+
+// library/core/src/ops/async_function.rs internal_implementation_detail: the solver's
+// pending closure-kind check of `AsyncFn*` (its `Upvars` belongs to coroutine-closures,
+// which Relax does not represent).
+#[cfg_attr(not(relax_check), lang = "async_fn_kind_helper")]
+pub trait AsyncFnKindHelper<GoalKind> {}
 
 #[cfg_attr(not(relax_check), lang = "add")]
 pub trait Add<Rhs = Self> {
@@ -508,11 +615,11 @@ pub enum ControlFlow<B, C = ()> {
 }
 
 /// The `?` protocol as real core spells it (core::ops::try_trait): used by Iterator::try_fold /
-/// try_for_each. Relax's `?` operator itself is built in for Option / Result.
+/// try_for_each and the `?` operator.
 #[cfg_attr(not(relax_check), lang = "Try")]
 pub trait Try: FromResidual<Self::Residual> {
     type Output;
-    type Residual;
+    type Residual: Residual<Self::Output>;
     #[cfg_attr(not(relax_check), lang = "from_output")]
     fn from_output(output: Self::Output) -> Self;
     #[cfg_attr(not(relax_check), lang = "branch")]
@@ -522,6 +629,24 @@ pub trait Try: FromResidual<Self::Residual> {
 pub trait FromResidual<R> {
     #[cfg_attr(not(relax_check), lang = "from_residual")]
     fn from_residual(residual: R) -> Self;
+}
+
+// ported from library/core/src/ops/try_trait.rs:364-368 @8d1a764.
+// Const-trait conditions are cut; the residual/output equality is preserved.
+pub trait Residual<O>: Sized {
+    type TryType: Try<Output = O, Residual = Self>;
+}
+
+// ported from library/core/src/option.rs:2908-2910,
+// result.rs:2202-2204, ops/control_flow.rs:138-140 @8d1a764.
+impl<T> Residual<T> for crate::option::Option<crate::convert::Infallible> {
+    type TryType = crate::option::Option<T>;
+}
+impl<T, E> Residual<T> for crate::result::Result<crate::convert::Infallible, E> {
+    type TryType = crate::result::Result<T, E>;
+}
+impl<B, C> Residual<C> for ControlFlow<B, crate::convert::Infallible> {
+    type TryType = ControlFlow<B, C>;
 }
 
 impl<T> Try for crate::option::Option<T> {
@@ -622,4 +747,23 @@ impl<A: crate::marker::Tuple, F: ?Sized + FnMut<A>> FnMut<A> for &mut F {
 impl<A: crate::marker::Tuple, F: ?Sized + FnMut<A>> FnOnce<A> for &mut F {
     type Output = F::Output;
     extern "rust-call" fn call_once(self, args: A) -> F::Output { (*self).call_mut(args) }
+}
+
+// ported from library/core/src/ops/function.rs:315-353 @8d1a764
+extern "C" {
+    #[cfg_attr(not(relax_check), lang = "code")]
+    pub type Code;
+}
+
+#[cfg_attr(not(relax_check), lang = "fn_ptr_trait")]
+#[fundamental]
+#[rustc_deny_explicit_impl]
+#[rustc_dyn_incompatible_trait]
+#[fundamental]
+pub trait FnPtr: Copy {
+    fn addr(self) -> usize { self.as_ptr().addr().get() }
+    #[cfg_attr(not(relax_check), lang = "fn_ptr_as_ptr")]
+    fn as_ptr(self) -> crate::ptr::NonNull<Code>;
+    #[cfg_attr(not(relax_check), lang = "fn_ptr_from_ptr")]
+    unsafe fn from_ptr(ptr: crate::ptr::NonNull<Code>) -> Self;
 }

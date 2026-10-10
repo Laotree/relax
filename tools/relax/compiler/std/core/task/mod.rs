@@ -219,3 +219,57 @@ fn raw_waker<W: Wake + Send + Sync + 'static>(waker: Arc<W>) -> RawWaker {
     }
     RawWaker::new(Arc::into_raw(waker) as *const (), arc_vtable::<W>())
 }
+
+// ported from library/core/src/task/poll.rs:233-291 @8d1a764
+impl<T, E> crate::ops::Try for Poll<Result<T, E>> {
+    type Output = Poll<T>;
+    type Residual = Result<crate::convert::Infallible, E>;
+
+    fn from_output(c: Self::Output) -> Self {
+        c.map(Ok)
+    }
+
+    fn branch(self) -> crate::ops::ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Poll::Ready(Ok(x)) => crate::ops::ControlFlow::Continue(Poll::Ready(x)),
+            Poll::Ready(Err(e)) => crate::ops::ControlFlow::Break(Err(e)),
+            Poll::Pending => crate::ops::ControlFlow::Continue(Poll::Pending),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> crate::ops::FromResidual<Result<crate::convert::Infallible, E>> for Poll<Result<T, F>> {
+    fn from_residual(x: Result<crate::convert::Infallible, E>) -> Self {
+        match x {
+            Err(e) => Poll::Ready(Err(From::from(e))),
+            Ok(never) => match never {},
+        }
+    }
+}
+
+impl<T, E> crate::ops::Try for Poll<Option<Result<T, E>>> {
+    type Output = Poll<Option<T>>;
+    type Residual = Result<crate::convert::Infallible, E>;
+
+    fn from_output(c: Self::Output) -> Self {
+        c.map(|x| x.map(Ok))
+    }
+
+    fn branch(self) -> crate::ops::ControlFlow<Self::Residual, Self::Output> {
+        match self {
+            Poll::Ready(Some(Ok(x))) => crate::ops::ControlFlow::Continue(Poll::Ready(Some(x))),
+            Poll::Ready(Some(Err(e))) => crate::ops::ControlFlow::Break(Err(e)),
+            Poll::Ready(None) => crate::ops::ControlFlow::Continue(Poll::Ready(None)),
+            Poll::Pending => crate::ops::ControlFlow::Continue(Poll::Pending),
+        }
+    }
+}
+
+impl<T, E, F: From<E>> crate::ops::FromResidual<Result<crate::convert::Infallible, E>> for Poll<Option<Result<T, F>>> {
+    fn from_residual(x: Result<crate::convert::Infallible, E>) -> Self {
+        match x {
+            Err(e) => Poll::Ready(Some(Err(From::from(e)))),
+            Ok(never) => match never {},
+        }
+    }
+}

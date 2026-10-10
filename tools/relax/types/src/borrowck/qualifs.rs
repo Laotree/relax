@@ -1,7 +1,6 @@
 //! Owner-scoped promotion queries and const-initializer qualification.
 //! rustc_const_eval/check_consts/{qualifs,resolver}.rs. This uses built bodies,
 //! never calls borrowck recursively, and never accesses the mutable JIT driver.
-use crate::solve::SelectionResult;
 use super::bir::*;
 use super::body::{BodyKind, CheckedBody};
 use super::promote::{Blocked, Qualif, Qualifier, Queries};
@@ -50,15 +49,14 @@ impl<'a, 'tcx> Provider<'a, 'tcx> {
                 self.root
             } else {
                 let owner = CheckedBody::item(self.tx.prog, owner).ok_or(Blocked("constant has no initializer body"))?;
-                let args = owner.identity_args(self.tx.prog, self.tx.tcx);
-                item = crate::typeck::check_fn(&self.tx.cx, self.tx.prog, self.tx.tcx, owner.owner, &args);
+                item = self.tx.tcx.typeck(self.tx.prog, owner.owner);
                 if !item.errors.is_empty() { return Err(Blocked("constant initializer failed type checking")); }
                 &item
             };
             // Separate type-query caches: the initializer's generic environment
             // must not overwrite the parent's Copy/drop memoization.
             // rustc_middle/src/ty/mod.rs:1050: each owner supplies its own predicates.
-            let env = crate::tcx::TypingEnv { param_env: root.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::Borrowck };
+            let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(self.tx.prog, root.def), param_env: root.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(self.tx.tcx, self.tx.prog, root.def) };
             let tx = Tx::new(self.tx.prog, self.tx.tcx, env, self.tx.cx.state);
             if root.args.iter().any(|a| matches!(tx.kind(*a), TyKind::Param(_))) {
                 tx.set_generic_env(root.def, root.args.len());
@@ -79,7 +77,7 @@ impl<'a, 'tcx> Provider<'a, 'tcx> {
     }
 
     fn type_query(&self, q: Qualif, ty: TyId) -> Result<bool, Blocked> {
-        let ty = self.tx.tcx.normalize(&self.tx.cx, self.tx.prog, ty);
+        let ty = self.tx.normalize(ty);
         let key = (q as u8, ty);
         if let Some(value) = self.types.borrow().get(&key) { return Ok(*value); }
         // Structural auto-trait recursion is coinductive; a recursive ADT can
@@ -104,32 +102,31 @@ impl<'a, 'tcx> Provider<'a, 'tcx> {
                 TyKind::Tuple(fields) => children = fields,
                 TyKind::Array(t, n) => {
                     // Freeze applies even to [T; 0]; needs_drop does not.
-                    let zero = n == 0 || crate::types::len_ty(n).map_or(false,
-                        |n| matches!(self.tx.kind(n), TyKind::ConstVal(0)));
+                    let zero = n.try_to_target_usize(&self.tx.tcx.tys) == Some(0);
                     if q == Qualif::HasMutInterior || !zero { children.push(t); }
                 }
                 TyKind::Slice(t) => children.push(t),
-                TyKind::Closure(_, _, _, captures, _) => {
+                TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) => {
                     if self.tx.tcx.is_coroutine(ty) { return Err(Blocked("coroutine saved-local types are unavailable for qualification")); }
                     children.push(captures);
                 }
                 // an escaping bound type is never qualified (rustc: bug!)
                 TyKind::Bound(..) => return Err(Blocked("escaping bound type in qualification")),
-                TyKind::Param(_) | TyKind::Placeholder(_) | TyKind::Assoc(..) | TyKind::Opaque(..) | TyKind::Dyn(..) => {
+                TyKind::Param(_) | TyKind::Placeholder(_) | TyKind::Alias(..) | TyKind::Dyn(..) => {
                     let td = if q == Qualif::NeedsDrop { self.tx.copy_trait } else { self.tx.lang("marker::Freeze") };
                     return match td {
                         None => Ok(true),
-                        Some(td) => match self.tx.select_trait(td, ty, &[]) {
-                            SelectionResult::Ok(_) => Ok(false),
-                            SelectionResult::NoSolution => Ok(true),
-                            SelectionResult::Ambiguous(_) => Err(Blocked("ambiguous trait qualification")),
+                        Some(td) => match self.tx.evaluate_trait(td, ty, &[]) {
+                            r if r.must_apply_modulo_regions() => Ok(false),
+                            crate::next_solver::evaluate_obligation::EvaluationResult::EvaluatedToErr => Ok(true),
+                            _ => Err(Blocked("ambiguous trait qualification")),
                         }
                     };
                 }
-                TyKind::Infer(_) | TyKind::Error => return Err(Blocked("unresolved type in constant qualification")),
+                TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error => return Err(Blocked("unresolved type in constant qualification")),
                 TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_)
                 | TyKind::Never | TyKind::Ref(..) | TyKind::Ptr(..) | TyKind::FnPtr(..)
-                | TyKind::FnDef(..) | TyKind::ConstVal(_) => {}
+                | TyKind::Foreign(_) | TyKind::FnDef(..) | TyKind::Const(_) => {}
             }
             for child in children { if self.type_query(q, child)? { return Ok(true); } }
             Ok(false)
@@ -173,11 +170,12 @@ impl Queries for Provider<'_, '_> {
     fn scalar(&self, c: &Constant) -> Result<Option<u128>, Blocked> {
         match &c.kind {
             ConstantKind::Scalar(n) => Ok(Some(*n)),
-            ConstantKind::Item { def, args } if args.is_empty() => {
-                if let Some(n) = self.tx.tcx.const_values.get(def) { return Ok(Some(n)); }
-                Err(Blocked("scalar CTFE result is not published to the read-only type context"))
+            ConstantKind::Item { def, args } => {
+                let args = self.tx.tcx.complete_args(self.tx.prog, *def, args, crate::types::RegionArgsId::EMPTY);
+                let value = self.tx.tcx.const_eval_resolve(self.tx.prog, crate::tcx::TypingEnv { param_env: self.tx.tcx.intern_param_env(self.tx.param_env.borrow().clone()), mode: self.tx.cx.typing_env.mode, limit: self.tx.cx.typing_env.limit }, *def, &args)
+                    .map_err(|_| Blocked("scalar constant could not be evaluated"))?;
+                Ok(value.try_to_leaf().map(|v| v.to_bits(v.size())))
             }
-            ConstantKind::Item { .. } => Err(Blocked("instantiated scalar CTFE query is unavailable")),
             ConstantKind::Unknown | ConstantKind::Promoted(_) => Err(Blocked("constant has no scalar promotion input")),
             _ => Ok(None),
         }

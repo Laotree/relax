@@ -43,7 +43,7 @@ pub mod intrinsics_mem {
         /// `T: Freeze` for this instantiation: no UnsafeCell outside indirection (rustc's auto
         /// trait)
         pub fn is_freeze<T>() -> bool;
-        pub fn drop_in_place<T: ?Sized>(p: *mut T);
+        pub fn drop_in_place<T: crate::marker::PointeeSized>(p: *mut T);
         pub fn ptr_read<T>(p: *const T) -> T;
         pub fn ptr_write<T>(p: *mut T, v: T);
         /// volatile access (never removed, merged, forwarded or reordered with other volatile ops)

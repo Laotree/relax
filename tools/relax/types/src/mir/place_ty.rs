@@ -2,7 +2,7 @@
 use super::*;
 use crate::program::Program;
 use crate::tcx::{Tcx, TypingEnv};
-use crate::types::{len_ty, TyKind};
+use crate::types::{TyKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlaceTy {
@@ -26,7 +26,7 @@ impl PlaceTy {
                 Some(tcx.field_ty(prog, env, *def, variant as u32, field.0, args))
             }
             TyKind::Tuple(fields) if self.variant_index.is_none() => fields.get(field.0 as usize).copied(),
-            TyKind::Closure(_, _, _, captures, _) if self.variant_index.is_none() => {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) if self.variant_index.is_none() => {
                 let TyKind::Tuple(fields) = tcx.tys.kind(*captures) else { return None; };
                 fields.get(field.0 as usize).copied()
             }
@@ -62,13 +62,10 @@ impl PlaceTy {
                 TyKind::Slice(_) => self.ty,
                 TyKind::Array(inner, size) => {
                     let len = if *from_end {
-                        let size = match len_ty(*size) {
-                            None => *size,
-                            Some(t) => match tcx.tys.kind(t) { TyKind::ConstVal(n) => *n, _ => return None },
-                        };
+                        let size = size.try_to_target_usize(&tcx.tys)?;
                         size.checked_sub(*from)?.checked_sub(*to)?
                     } else { to.checked_sub(*from)? };
-                    tcx.tys.intern(TyKind::Array(*inner, len))
+                    tcx.tys.intern(TyKind::Array(*inner, tcx.tys.const_usize(len)))
                 }
                 _ => return None,
             },

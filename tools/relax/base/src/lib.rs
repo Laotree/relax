@@ -11,6 +11,7 @@ pub mod memstat;
 pub use relax_session::{options, sip, Session};
 pub mod conc;
 pub mod query;
+pub mod preempt;
 pub mod arena;
 pub mod json;
 pub mod diag;
@@ -39,3 +40,5 @@ pub mod std_digest;
 pub mod tar;
 pub mod image;
 pub mod why;
+
+pub mod scc;

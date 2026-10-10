@@ -1,4 +1,5 @@
 // ported from N:rustc_borrowck/src/region_infer/region_context.rs @8d1a764
+use crate::types::{AliasTy, AliasTyKind};
 use super::{NllRegionVariableOrigin as Origin, RegionDefinition, RegionErrorKind, TypeTest, VerifyBound, ConstraintSccs};
 use super::values::{LivenessValues, PlaceholderIndices, RegionElement, RegionValues};
 use crate::borrowck::constraints::{ConstraintCategory as Category, OutlivesConstraint, OutlivesConstraintSet, ReturnConstraint};
@@ -269,7 +270,7 @@ impl RegionInferenceContext {
 }
 
 // ported from N:rustc_infer/src/infer/outlives/test_type_match.rs @8d1a764
-fn extract_verify_if_eq(tcx: &Tcx, prog: &Program, pattern: TyId, bound: RegionId, value: TyId) -> Option<RegionId> {
+pub(super) fn extract_verify_if_eq(tcx: &Tcx, prog: &Program, pattern: TyId, bound: RegionId, value: TyId) -> Option<RegionId> {
     let mut matcher = MatchAgainstHigherRankedOutlives { tcx, prog, map: Default::default() };
     if !matcher.tys(pattern,value,0) { return None; }
     Some(match tcx.tys.region_kind(bound) {
@@ -304,6 +305,41 @@ impl MatchAgainstHigherRankedOutlives<'_> {
         ar.len() == br.len() && ar.iter().zip(br.iter()).enumerate().all(|(i,(&a,&b))|
             indices.and_then(|g| g.lifetimes.get(i)).is_some_and(|&i| bi(i as usize)) || self.regions(a,b,depth))
     }
+    // Native const arguments participate in the same higher-ranked matching.
+    // rustc_infer/src/infer/outlives/test_type_match.rs:207-216 @8d1a764.
+    fn consts(&mut self, a: crate::consts::Const, b: crate::consts::Const, depth: u32) -> bool {
+        use crate::consts::{ConstKind, GenericArg, ValTreeKind};
+        if a == b { return true; }
+        let tys = &self.tcx.tys;
+        match (tys.const_kind(a),tys.const_kind(b)) {
+            (ConstKind::Infer(_),_) | (_,ConstKind::Infer(_)) => panic!("unresolved const inference"),
+            (ConstKind::Error,_) | (_,ConstKind::Error) => true,
+            (ConstKind::Alias(ar,a),ConstKind::Alias(br,b)) => {
+                debug_assert_eq!(ar,br);
+                if a.kind != b.kind || a.args.len() != b.args.len() { return false; }
+                for (&a,&b) in a.args.iter().zip(b.args.iter()) {
+                    let matched = match (a,b) {
+                        (GenericArg::Type(a),GenericArg::Type(b)) => self.tys(a,b,depth),
+                        (GenericArg::Lifetime(a),GenericArg::Lifetime(b)) => self.regions(a,b,depth),
+                        (GenericArg::Const(a),GenericArg::Const(b)) => self.consts(a,b,depth),
+                        _ => false,
+                    };
+                    if !matched { return false; }
+                }
+                true
+            }
+            (ConstKind::Value(a),ConstKind::Value(b)) => match (a.valtree.kind(),b.valtree.kind()) {
+                (ValTreeKind::Leaf(a),ValTreeKind::Leaf(b)) => a == b,
+                (ValTreeKind::Branch(a),ValTreeKind::Branch(b)) => {
+                    if a.len() != b.len() { return false; }
+                    for i in 0..a.len() { if !self.consts(a[i],b[i],depth) { return false; } }
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
     fn tys(&mut self, a: TyId, b: TyId, depth: u32) -> bool {
         let tys = &self.tcx.tys;
         if matches!(tys.kind(a),TyKind::Error | TyKind::Bound(..)) { return false; }
@@ -313,15 +349,18 @@ impl MatchAgainstHigherRankedOutlives<'_> {
             (TyKind::Ptr(am,a),TyKind::Ptr(bm,b)) => am == bm && self.tys(*a,*b,depth),
             (TyKind::Slice(a),TyKind::Slice(b)) => self.tys(*a,*b,depth),
             (TyKind::Tuple(a),TyKind::Tuple(b)) => self.list(a,b,depth),
-            (TyKind::Array(a,an),TyKind::Array(b,bn)) => self.tys(*a,*b,depth) && (an == bn || match (crate::types::len_ty(*an),crate::types::len_ty(*bn)) {
-                (Some(a),Some(b)) => self.tys(a,b,depth), _ => false,
-            }),
+            (TyKind::Const(a),TyKind::Const(b)) => self.consts(*a,*b,depth),
+            (TyKind::Array(a,an),TyKind::Array(b,bn)) => self.tys(*a,*b,depth) && self.consts(*an,*bn,depth),
             (TyKind::Adt(ad,a,ar),TyKind::Adt(bd,b,br)) | (TyKind::FnDef(ad,a,ar),TyKind::FnDef(bd,b,br)) =>
                 ad == bd && self.args(*ad,a,b,*ar,*br,depth,true),
-            (TyKind::Assoc(ad,a,ar),TyKind::Assoc(bd,b,br)) => ad == bd && self.args(*ad,a,b,*ar,*br,depth,false),
-            (TyKind::Opaque(ad,ai,a,ar),TyKind::Opaque(bd,bi,b,br)) => ad == bd && ai == bi && {
-                    let variance = self.tcx.opaques.get(&(*ad,*ai)).and_then(|o| o.variances);
-                    let bi = |region: bool, i: usize| variance.as_ref().is_some_and(|(indices, vs)| {
+            (TyKind::Alias(_, AliasTy { kind: ak, args: a, regions: ar }),TyKind::Alias(_, AliasTy { kind: bk, args: b, regions: br }))
+                if matches!(ak, AliasTyKind::Projection { .. } | AliasTyKind::Opaque { .. }) => ak == bk && {
+                    // Relate<AliasTy> (rustc_type_ir/src/relate.rs:224-240): opaques and RPITIT
+                    // projections relate through their declared variances (opt_alias_variances,
+                    // rustc_middle/src/ty/util.rs:954-974; bivariant arguments are skipped), other
+                    // projections invariantly.
+                    let declared = self.tcx.alias_declared_variances(self.prog, *ak);
+                    let bi = |region: bool, i: usize| declared.as_ref().is_some_and(|(indices, vs)| {
                         let indices = if region { &indices.lifetimes } else { &indices.types_consts };
                         indices.get(i).is_some_and(|&i| vs.get(i as usize) == Some(&crate::types::variance::V::Bi))
                     });
@@ -331,8 +370,8 @@ impl MatchAgainstHigherRankedOutlives<'_> {
                         && ar.iter().zip(br.iter()).enumerate().all(|(i,(&a,&b))| bi(true,i) || self.regions(a,b,depth))
                 },
             (TyKind::FnPtr(a,ao,ah,_),TyKind::FnPtr(b,bo,bh,_)) => ah == bh && self.list(a,b,depth+1) && self.tys(*ao,*bo,depth+1),
-            (TyKind::Closure(af,ae,a,au,ao),TyKind::Closure(bf,be,b,bu,bo)) => af == bf && ae == be
-                && self.tys(*a,*b,depth) && self.tys(*au,*bu,depth) && self.tys(*ao,*bo,depth),
+            (TyKind::Closure(af, ae, crate::types::ClosureArgs { parent_args: ao, closure_kind_ty: ak, closure_sig_as_fn_ptr_ty: a, tupled_upvars_ty: au }),TyKind::Closure(bf, be, crate::types::ClosureArgs { parent_args: bo, closure_kind_ty: bk, closure_sig_as_fn_ptr_ty: b, tupled_upvars_ty: bu })) => af == bf && ae == be
+                && self.tys(*ak,*bk,depth) && self.tys(*a,*b,depth) && self.tys(*au,*bu,depth) && self.tys(*ao,*bo,depth),
             (TyKind::Dyn(ad,a,ab,ar,al,_,aa),TyKind::Dyn(bd,b,bb,br,bl,_,ba)) => ad == bd && aa == ba
                 && self.args(*ad,a,b,*ar,*br,depth+1,false) && self.regions(*al,*bl,depth)
                 && ab.len() == bb.len() && ab.iter().zip(bb).all(|((ad,a,_),(bd,b,_))| ad == bd && self.tys(*a,*b,depth+1)),

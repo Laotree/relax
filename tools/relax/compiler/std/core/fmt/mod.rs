@@ -602,81 +602,81 @@ impl<'a> Write for Formatter<'a> {
 
 // ---------------------------------------------------------------- traits
 
-pub trait Debug {
+pub trait Debug: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait Display {
+pub trait Display: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait Octal {
+pub trait Octal: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait Binary {
+pub trait Binary: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait LowerHex {
+pub trait LowerHex: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait UpperHex {
+pub trait UpperHex: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait Pointer {
+pub trait Pointer: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait LowerExp {
+pub trait LowerExp: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
-pub trait UpperExp {
+pub trait UpperExp: crate::marker::PointeeSized {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result;
 }
 
 // References forward to the referent.
-impl<'a, T: Debug + ?Sized> Debug for &'a T {
+impl<'a, T: crate::marker::PointeeSized + Debug> Debug for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Debug::fmt(&**self, f)
     }
 }
-impl<'a, T: Debug + ?Sized> Debug for &'a mut T {
+impl<'a, T: crate::marker::PointeeSized + Debug> Debug for &'a mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Debug::fmt(&**self, f)
     }
 }
-impl<'a, T: Display + ?Sized> Display for &'a T {
+impl<'a, T: crate::marker::PointeeSized + Display> Display for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Display::fmt(&**self, f)
     }
 }
-impl<'a, T: Display + ?Sized> Display for &'a mut T {
+impl<'a, T: crate::marker::PointeeSized + Display> Display for &'a mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Display::fmt(&**self, f)
     }
 }
-impl<'a, T: LowerHex + ?Sized> LowerHex for &'a T {
+impl<'a, T: crate::marker::PointeeSized + LowerHex> LowerHex for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         LowerHex::fmt(&**self, f)
     }
 }
-impl<'a, T: UpperHex + ?Sized> UpperHex for &'a T {
+impl<'a, T: crate::marker::PointeeSized + UpperHex> UpperHex for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         UpperHex::fmt(&**self, f)
     }
 }
-impl<'a, T: Octal + ?Sized> Octal for &'a T {
+impl<'a, T: crate::marker::PointeeSized + Octal> Octal for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Octal::fmt(&**self, f)
     }
 }
-impl<'a, T: Binary + ?Sized> Binary for &'a T {
+impl<'a, T: crate::marker::PointeeSized + Binary> Binary for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Binary::fmt(&**self, f)
     }
 }
-impl<'a, T: LowerExp + ?Sized> LowerExp for &'a T {
+impl<'a, T: crate::marker::PointeeSized + LowerExp> LowerExp for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         LowerExp::fmt(&**self, f)
     }
 }
-impl<'a, T: UpperExp + ?Sized> UpperExp for &'a T {
+impl<'a, T: crate::marker::PointeeSized + UpperExp> UpperExp for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         UpperExp::fmt(&**self, f)
     }
@@ -759,32 +759,32 @@ impl<T: Debug> Debug for [T] {
     }
 }
 
-impl<T: ?Sized> Pointer for *const T {
+impl<T: crate::marker::PointeeSized> Pointer for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         pointer_fmt_inner(*self as *const u8 as usize, f)
     }
 }
-impl<T: ?Sized> Pointer for *mut T {
+impl<T: crate::marker::PointeeSized> Pointer for *mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         pointer_fmt_inner(*self as *const u8 as usize, f)
     }
 }
-impl<'a, T: ?Sized> Pointer for &'a T {
+impl<'a, T: crate::marker::PointeeSized> Pointer for &'a T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(*self as *const T), f)
     }
 }
-impl<'a, T: ?Sized> Pointer for &'a mut T {
+impl<'a, T: crate::marker::PointeeSized> Pointer for &'a mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(&(&**self as *const T), f)
     }
 }
-impl<T: ?Sized> Debug for *const T {
+impl<T: crate::marker::PointeeSized> Debug for *const T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(self, f)
     }
 }
-impl<T: ?Sized> Debug for *mut T {
+impl<T: crate::marker::PointeeSized> Debug for *mut T {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         Pointer::fmt(self, f)
     }

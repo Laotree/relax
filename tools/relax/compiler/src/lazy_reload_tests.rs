@@ -212,7 +212,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 fn app_scope_live_layout_edits() {
     const CHILD: &str = "RELAX_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
-        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer"] {
+        for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::app_scope_live_layout_edits", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case).output().unwrap();
@@ -244,6 +244,7 @@ fn app_scope_live_layout_edits() {
     let fw_path = dir.join("framework.rs");
     let wrapper = match case.as_str() {
         "generic_embedded" => "pub struct Holder<T> { pub value: ([T; 1], u64) }",
+        "bound_template" | "bound_template_embedded" => "pub trait Project<'a> { type Out; } impl<'a> Project<'a> for u8 { type Out = u64; } pub struct Holder<T> { pub value: ([T; 1], u64) }",
         "pointer" => "pub struct Holder { pub value: *mut app_lib::State }",
         "embedded" => "pub struct Holder { pub value: app_lib::State }",
         _ => "pub struct Holder { pub value: u64 }",
@@ -255,7 +256,7 @@ fn app_scope_live_layout_edits() {
     assert!(prog.errors.is_empty(), "{:?}", prog.errors);
     let def = |name: &str, krate| prog.defs.iter().enumerate().find_map(|(i, d)| {
         let id = DefId(i as u32);
-        (d.krate == krate && prog.name(id) == name).then_some(id)
+        (d.krate == krate && d.kind != crate::program::DefKind::Field && prog.name(id) == name).then_some(id)
     }).unwrap();
     let state = def("State", lib);
     let holder = def("Holder", framework);
@@ -271,8 +272,18 @@ fn app_scope_live_layout_edits() {
     tcx.collect(&prog);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let ty = tcx.tys.intern(TyKind::Adt(state, vec![], RegionArgsId::EMPTY));
-    if matches!(case.as_str(), "embedded" | "generic_embedded" | "pointer") {
-        let args = if case == "generic_embedded" { vec![ty] } else { vec![] };
+    if case.starts_with("bound_template") {
+        use crate::consts::GenericArg;
+        use crate::types::{AliasTyKind, BoundVar, RegionKind};
+        let region = tcx.tys.intern_region(RegionKind::ReBound(0, BoundVar(0)));
+        let projection = tcx.alias_ty_with_args(AliasTyKind::Projection { def_id: def("Out", framework) },
+            &[GenericArg::Type(tcx.tys.u8_), GenericArg::Lifetime(region)]);
+        let template = tcx.tys.intern(TyKind::Adt(holder, vec![projection], RegionArgsId::EMPTY));
+        assert!(tcx.tys.is_concrete(template));
+        assert!(tcx.tys.has_escaping_bound_vars(template));
+    }
+    if matches!(case.as_str(), "embedded" | "generic_embedded" | "pointer" | "bound_template_embedded") {
+        let args = if matches!(case.as_str(), "generic_embedded" | "bound_template_embedded") { vec![ty] } else { vec![] };
         tcx.tys.intern(TyKind::Adt(holder, args, RegionArgsId::EMPTY));
     }
     let mut u = jit::Unit::new(prog, tcx, core);
@@ -312,7 +323,7 @@ fn app_scope_live_layout_edits() {
         // removes this helper too; its old body must not be checked against the new names.
         + "\nfn obsolete_style() { let _entry = obsolete_style as fn(); }\n";
     let patch = unsafe { reload::apply(up, vec![Edit { file: u.prog.def(state).file, path: path.to_string_lossy().into_owned(), src: after.into_bytes() }]) };
-    if matches!(case.as_str(), "framework" | "embedded" | "generic_embedded") {
+    if matches!(case.as_str(), "framework" | "embedded" | "generic_embedded" | "bound_template_embedded") {
         assert_eq!(patch.rung, Rung::Restart, "{:?}", patch.lines);
         let reason = if case == "framework" { "in the app scope" } else { "embedded by value" };
         assert!(patch.lines.iter().any(|l| l.contains(reason) && l.contains("restart the app")), "{:?}", patch.lines);
@@ -340,8 +351,9 @@ fn app_scope_live_layout_edits() {
 }
 
 /// Gandalf's verdicts carry over a live edit only for owners whose crate cannot see the edited
-/// files, and only when the edit keeps every signature, item set and field list (a public
-/// signature or a layout another crate sees drops all verdicts, as before).
+/// files, and only when the edit keeps every field list and macro (a layout another crate sees
+/// drops all verdicts, as before). Lead decision 52 (R1): an item or signature edit is scoped by
+/// crate like a body edit -- a crate that cannot see it keeps everything.
 #[test]
 fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
     use crate::reload::{classify, crates_seeing_edit, gandalf_carries, gandalf_keeps};
@@ -372,7 +384,7 @@ fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
     assert!(gandalf_carries(&body.changes, [&body].into_iter()), "a body edit carries");
     let signature = plan_of(&a_src.replace("-> u32 { 1 }", "-> u64 { 1 }")).unwrap();
     assert!(!signature.added.is_empty() && !signature.removed.is_empty());
-    assert!(!gandalf_carries(&signature.changes, [&signature].into_iter()), "a public signature edit drops every verdict");
+    assert!(gandalf_carries(&signature.changes, [&signature].into_iter()), "a signature edit carries the verdicts of crates that cannot see it");
     if let Ok(layout) = plan_of(&a_src.replace("pub x: u32", "pub x: u32, pub y: u32")) {
         assert!(!gandalf_carries(&layout.changes, [&layout].into_iter()), "a layout edit drops every verdict");
     }
@@ -416,7 +428,7 @@ fn restored_images_take_live_edits() {
     let mut files: std::collections::HashMap<String, crate::parser::ParsedFile> = std::mem::take(&mut prog.files).into_iter()
         .zip(prog.file_paths.clone()).map(|(f, p)| (p, Arc::try_unwrap(f).ok().expect("unshared file"))).collect();
     let restored = Program::restore_collected(&session, program, &prog.load_recipe, |_, _, _, meta| files.remove(&meta.path)).expect("Program restore");
-    let restored_tcx = crate::tcx::Tcx::restore_collected(types).expect("Tcx restore");
+    let restored_tcx = crate::tcx::Tcx::restore_collected(types, restored.files.len(), restored.crates.len()).expect("Tcx restore");
     assert_eq!(restored.defs.len(), prog.defs.len());
     assert!(restored.syms.names().eq(prog.syms.names()));
     let def = restored.defs.iter().enumerate().find_map(|(i, d)| {

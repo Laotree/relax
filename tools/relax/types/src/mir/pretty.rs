@@ -16,13 +16,15 @@ impl Printer<'_> {
     fn ty(&self, ty: TyId) -> String {
         crate::typeck::ty_to_string(false, self.prog, self.tcx, ty)
     }
-    fn types(&self, tys: &[TyId]) -> String {
+    fn generic_args(&self, args: &[crate::consts::GenericArg]) -> String {
         let mut s = String::new();
-        for (i, ty) in tys.iter().enumerate() {
-            if i != 0 {
-                s.push_str(", ");
+        for (i, arg) in args.iter().enumerate() {
+            if i != 0 { s.push_str(", "); }
+            match *arg {
+                crate::consts::GenericArg::Type(ty) => s.push_str(&self.ty(ty)),
+                crate::consts::GenericArg::Lifetime(r) => write!(s, "{:?}", self.tcx.tys.region_kind(r)).unwrap(),
+                crate::consts::GenericArg::Const(c) => s.push_str(&self.ty(self.tcx.tys.intern(crate::types::TyKind::Const(c)))),
             }
-            s.push_str(&self.ty(*ty));
         }
         s
     }
@@ -91,7 +93,7 @@ impl Printer<'_> {
     fn constant(&self, c: &Const) -> String {
         match c {
             Const::Unevaluated { def, args, promoted } => {
-                let mut s = format!("def#{}::<{}>", def.0, self.types(args));
+                let mut s = format!("def#{}::<{}>", def.0, self.generic_args(args));
                 if let Some(id) = promoted {
                     write!(s, "::promoted[{}]", id.0).unwrap();
                 }
@@ -134,10 +136,10 @@ impl Printer<'_> {
             AggregateKind::Array(ty) => format!("Array<{}>", self.ty(*ty)),
             AggregateKind::Tuple => "Tuple".into(),
             AggregateKind::Adt(def, variant, args, user, field) => {
-                format!("Adt(def#{}, variant#{}, <{}>, user={user:?}, field={field:?})", def.0, variant.0, self.types(args))
+                format!("Adt(def#{}, variant#{}, <{}>, user={user:?}, field={field:?})", def.0, variant.0, self.generic_args(args))
             }
-            AggregateKind::Closure(id, args) => format!("Closure({}:{}, <{}>)", id.file, id.expr, self.types(args)),
-            AggregateKind::Coroutine(id, args) => format!("Coroutine({}:{}, <{}>)", id.file, id.expr, self.types(args)),
+            AggregateKind::Closure(id, args) => format!("Closure({}:{}, <{}>)", id.file, id.expr, self.generic_args(args)),
+            AggregateKind::Coroutine(id, args) => format!("Coroutine({}:{}, <{}>)", id.file, id.expr, self.generic_args(args)),
             AggregateKind::RawPtr(ty, mutable) => format!("RawPtr({}, {mutable:?})", self.ty(*ty)),
         }
     }

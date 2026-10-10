@@ -71,7 +71,7 @@ pub struct ConstOperand {
 #[derive(Clone, Debug)]
 pub enum Const {
     Val(ConstValue, TyId),
-    Unevaluated { def: DefId, args: Vec<TyId>, promoted: Option<PromotedId> },
+    Unevaluated { def: DefId, args: Vec<crate::consts::GenericArg>, promoted: Option<PromotedId> },
 }
 /// rustc_middle/src/mir/consts.rs:34; allocation identity preserves provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,7 +81,7 @@ pub enum ConstValue {
     Slice { alloc: AllocId, meta: u64 },
     Indirect { alloc: AllocId, offset: u64 },
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scalar {
     Int { bits: u128, size: u8 },
     Ptr { provenance: CtfeProvenance, offset: u64 },
@@ -210,9 +210,9 @@ pub struct ClosureId {
 pub enum AggregateKind {
     Array(TyId),
     Tuple,
-    Adt(DefId, VariantIdx, Vec<TyId>, Option<UserTypeAnnotationIndex>, Option<FieldIdx>),
-    Closure(ClosureId, Vec<TyId>),
-    Coroutine(ClosureId, Vec<TyId>),
+    Adt(DefId, VariantIdx, Vec<crate::consts::GenericArg>, Option<UserTypeAnnotationIndex>, Option<FieldIdx>),
+    Closure(ClosureId, Vec<crate::consts::GenericArg>),
+    Coroutine(ClosureId, Vec<crate::consts::GenericArg>),
     RawPtr(TyId, Mutability),
 }
 

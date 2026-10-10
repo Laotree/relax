@@ -5,6 +5,9 @@
 //! trait proving and region allocation are N01's (`BorrowckTypeOps`); each such
 //! operation converts its own region constraints into the sink it is given.
 pub mod free_region_relations;
+pub mod canonical;
+pub(crate) mod inhabitedness;
+pub mod constraint_conversion;
 mod input_output;
 pub mod liveness;
 mod relate_tys;
@@ -16,13 +19,14 @@ use super::mir_nll::LocationMap;
 use super::region_infer::{NllRegionVariableOrigin, TypeTest};
 use super::region_infer::values::{LivenessValues, PlaceholderIndices};
 use crate::lang_items::LangItem;
+use crate::consts::GenericArg;
 use crate::mir::visit::{MutatingUseContext, NonMutatingUseContext, NonUseContext, PlaceContext, Visitor};
 use crate::mir::*;
 use crate::program::{DefId, Program};
 use crate::tcx::Tcx;
 use crate::types::fold::BoundVarReplacer;
 use crate::types::variance::V;
-use crate::types::{len_ty, FnHeader, RegionId, RegionKind, Safety, TyId, TyKind, UniverseIndex};
+use crate::types::{FnHeader, RegionId, RegionKind, Safety, TyId, TyKind, UniverseIndex};
 pub use relate_tys::NoSolution;
 
 /// rustc_middle FnSig with its binder skipped: inputs/output may contain
@@ -38,7 +42,7 @@ pub enum UserType {
     /// A canonical annotation of the body, instantiated by N01's `instantiate_canonical`.
     Annotation(UserTypeId),
     /// `UserTypeKind::TypeOf(def, UserArgs { args, user_self_ty: None })`.
-    TypeOf(DefId, Vec<TyId>),
+    TypeOf(DefId, Vec<GenericArg>),
 }
 
 /// The definitions whose clauses `normalize_and_prove_instantiated_clauses` instantiates.
@@ -48,7 +52,7 @@ pub enum ClauseOwner { Def(DefId), Closure(ClosureId), Coroutine(ClosureId) }
 /// `crate::DeferredClosureRequirements` entry: the nested body is checked later
 /// and its requirements applied at these locations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeferredClosureRequirement { pub def: ClauseOwner, pub args: Vec<TyId>, pub locations: Locations }
+pub struct DeferredClosureRequirement { pub def: ClauseOwner, pub args: Vec<GenericArg>, pub locations: Locations }
 
 /// N:diagnostics/bound_region_errors.rs UniverseInfo: why a universe was created.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +76,7 @@ pub trait BorrowckTypeOps {
     fn to_region_vid(&self, r: RegionId) -> RegionVid;
     fn encountered_re_error(&self) -> bool;
     fn shallow_resolve(&mut self, ty: TyId) -> TyId;
+    fn shallow_resolve_const(&mut self, ct: crate::consts::Const) -> crate::consts::Const;
     fn next_ty_var(&mut self, span: Span) -> TyId;
     /// rustc_infer generalize.rs:124 instantiate_var up to `union_var_term`: generalizes
     /// `source` for `variance`, binds `vid`, returns the generalized type for the caller to relate.
@@ -80,12 +85,12 @@ pub trait BorrowckTypeOps {
     /// with the opaque storage of the root's inference context.
     fn relate_opaque(&mut self, out: &mut MirTypeckRegionConstraints, a: TyId, variance: V, b: TyId,
         locations: Locations, category: ConstraintCategory) -> Result<(), NoSolution>;
-    fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[TyId],
+    fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg],
         locations: Locations, category: ConstraintCategory);
     /// `prove_clause(ClauseKind::WellFormed(ty))`.
     fn prove_wf(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations, category: ConstraintCategory);
     fn normalize_and_prove_instantiated_clauses(&mut self, out: &mut MirTypeckRegionConstraints, owner: ClauseOwner,
-        args: &[TyId], locations: Locations);
+        args: &[GenericArg], locations: Locations);
     fn normalize(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations) -> TyId;
     /// Err is an ErrorGuaranteed already reported by the operation.
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, location: Location) -> Result<FnSig, ()>;
@@ -108,7 +113,7 @@ pub trait BorrowckTypeOps {
     /// ShallowInitBox, Repeat with a non-literal length and ADT/closure/coroutine aggregates.
     fn rvalue_query_ty(&self, body: &Body, rvalue: &Rvalue) -> TyId;
     /// The type of an unevaluated constant (`type_of(def)` instantiated with `args`).
-    fn unevaluated_const_ty(&self, def: DefId, args: &[TyId]) -> TyId;
+    fn unevaluated_const_ty(&self, def: DefId, args: &[GenericArg]) -> TyId;
     /// `ConstOperand::check_static_ptr`: the static this constant points to.
     fn static_ptr(&self, constant: &ConstOperand) -> Option<DefId>;
     /// `type_of(static)` instantiated and normalized.
@@ -120,7 +125,7 @@ pub trait BorrowckTypeOps {
     /// `(argument index, name)` of simd_shuffle/simd_insert/simd_extract.
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)>;
     /// (identity args of the typeck root, the closure's parent args) for #98589.
-    fn closure_parent_args(&self, def: ClauseOwner, args: &[TyId]) -> (Vec<TyId>, Vec<TyId>);
+    fn closure_parent_args(&self, def: ClauseOwner, args: &[GenericArg]) -> (Vec<GenericArg>, Vec<GenericArg>);
     fn unsized_fn_params(&self) -> bool;
     /// `def_kind == AnonConst && anon_const_kind == NonTypeSystemInline`.
     fn is_inline_const(&self, def: DefId) -> bool;
@@ -351,7 +356,7 @@ impl<'a> TypeChecker<'a> {
         match rv {
             Rvalue::Use(op) | Rvalue::UnaryOp(UnOp::Not | UnOp::Neg, op) => self.operand_ty(op),
             Rvalue::Repeat(op, len) => match try_to_target_usize(len) {
-                Some(n) => tys.intern(TyKind::Array(self.operand_ty(op), n)),
+                Some(n) => tys.intern(TyKind::Array(self.operand_ty(op), tys.const_usize(n))),
                 None => self.infcx.rvalue_query_ty(self.body, rv),
             },
             Rvalue::Ref(region, kind, place) => {
@@ -373,7 +378,7 @@ impl<'a> TypeChecker<'a> {
             }
             Rvalue::CopyForDeref(place) => self.place_ty(place).ty,
             Rvalue::Aggregate(kind, ops) => match &**kind {
-                AggregateKind::Array(ty) => tys.intern(TyKind::Array(*ty, ops.len() as u64)),
+                AggregateKind::Array(ty) => tys.intern(TyKind::Array(*ty, tys.const_usize(ops.len() as u64))),
                 AggregateKind::Tuple => tys.intern(TyKind::Tuple(ops.iter().map(|op| self.operand_ty(op)).collect())),
                 _ => self.infcx.rvalue_query_ty(self.body, rv),
             },
@@ -586,7 +591,7 @@ impl<'a> TypeChecker<'a> {
         self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, owner, &args, to_locations(location));
     }
 
-    fn prove_closure_bounds(&mut self, def: ClauseOwner, args: &[TyId], location: Location) -> Vec<TyId> {
+    fn prove_closure_bounds(&mut self, def: ClauseOwner, args: &[GenericArg], location: Location) -> Vec<GenericArg> {
         // Propagated requirements are applied once the nested body has been checked.
         self.deferred_closure_requirements.push(DeferredClosureRequirement { def, args: args.to_vec(), locations: to_locations(location) });
         // Equate closure args to regions inherited from the typeck root (#98589).
@@ -609,8 +614,16 @@ impl<'a> TypeChecker<'a> {
                 let implicit = source == CoercionSource::Implicit;
                 let Some(mut src_sig) = self.fn_sig(ty_from) else { return self.mirbug(format!("reify of non-function {ty_from:?}")) };
                 // Target safety: a safe fn item may be reified to an unsafe fn pointer.
-                // (#[target_feature] safe-sig adjustment needs codegen attributes: N01/M2b payload.)
                 let TyKind::FnPtr(_, _, target_hdr, target_bound) = *tys.kind(ty) else { return self.mirbug(format!("reify to {ty:?}")) };
+                // type_check/mod.rs:1047-1057: a safe #[target_feature] fn item is safe where
+                // the body has its features
+                if let TyKind::FnDef(def_id, _, _) = *tys.kind(ty_from) {
+                    if tcx.fn_item_sig(self.prog, def_id).is_some_and(|s| s.safe_target_features)
+                        && target_hdr.safety == Safety::Safe
+                        && tcx.adjust_target_feature_sig(self.prog, def_id, self.body.source.owner) {
+                        src_sig.sig.header.safety = Safety::Safe;
+                    }
+                }
                 if src_sig.sig.header.safety == Safety::Safe && target_hdr.safety == Safety::Unsafe {
                     src_sig.sig.header.safety = Safety::Unsafe;
                 }
@@ -636,7 +649,7 @@ impl<'a> TypeChecker<'a> {
             }
             CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer, source) => {
                 // Relax closure types carry their un-tupled signature as a FnPtr.
-                let TyKind::Closure(_, _, sig, _, _) = *tys.kind(ty_from) else { return self.mirbug(format!("closure cast of {ty_from:?}")) };
+                let TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) = *tys.kind(ty_from) else { return self.mirbug(format!("closure cast of {ty_from:?}")) };
                 let TyKind::FnPtr(inputs, output, header, n) = tys.kind(sig).clone() else { return self.mirbug(format!("closure signature {sig:?}")) };
                 // signature_unclosure: the target pointer's safety (nightly's payload) is the target type's.
                 let safety = match tys.kind(ty) { TyKind::FnPtr(_, _, h, _) => h.safety, _ => header.safety };
@@ -657,7 +670,7 @@ impl<'a> TypeChecker<'a> {
             }
             CastKind::PointerCoercion(PointerCoercion::Unsize, source) => {
                 let unsize_to = erase_region_vars(self.tcx, ty);
-                self.infcx.prove_trait_ref(&mut self.constraints, LangItem::CoerceUnsized, &[ty_from, ty], locations,
+                self.infcx.prove_trait_ref(&mut self.constraints, LangItem::CoerceUnsized, &[GenericArg::Type(ty_from), GenericArg::Type(ty)], locations,
                     ConstraintCategory::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: source == CoercionSource::Implicit, unsize_to: Some(unsize_to) });
             }
             CastKind::PointerCoercion(PointerCoercion::MutToConstPointer, source) => {
@@ -705,7 +718,7 @@ impl<'a> TypeChecker<'a> {
                 };
                 if self.infcx.type_is_sized_modulo_regions(dst) {
                     // Wide to thin pointer cast; may occur in an environment with impossible clauses.
-                    self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Sized, &[dst], locations, cast(true));
+                    self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Sized, &[GenericArg::Type(dst)], locations, cast(true));
                 } else {
                     let src_tail = self.infcx.struct_tail(&mut self.constraints, src, location);
                     let dst_tail = self.infcx.struct_tail(&mut self.constraints, dst, location);
@@ -807,7 +820,7 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
                 if !self.infcx.unsized_fn_params() {
-                    self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Sized, &[place_ty], to_locations(location), ConstraintCategory::SizedBound);
+                    self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Sized, &[GenericArg::Type(place_ty)], to_locations(location), ConstraintCategory::SizedBound);
                 }
             }
             StatementKind::AscribeUserType(place, projection, variance) => {
@@ -950,7 +963,7 @@ impl<'a> TypeChecker<'a> {
                 if try_to_target_usize(len).is_none_or(|len| len > 1) {
                     if let Operand::Move(place) = operand {
                         let ty = self.place_ty(place).ty;
-                        self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Copy, &[ty], locations, ConstraintCategory::CopyBound);
+                        self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Copy, &[GenericArg::Type(ty)], locations, ConstraintCategory::CopyBound);
                     }
                 }
             }
@@ -1040,8 +1053,8 @@ impl<'a> TypeChecker<'a> {
             }
             // Const generic parameters (`Const::Ty(Param)`) are ascribed TypeOf(param) by
             // nightly; Relax MIR has no const-parameter operand form (they are TyIds).
-            if let TyKind::FnDef(def, args, _) = self.tcx.tys.kind(ty).clone() {
-                self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &args, locations);
+            if let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() {
+                self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &self.tcx.complete_args(self.prog, def, &args, regions), locations);
                 for t in args {
                     self.infcx.prove_wf(&mut self.constraints, t, locations, ConstraintCategory::Boring);
                 }
@@ -1062,7 +1075,7 @@ impl<'a> TypeChecker<'a> {
         if context == PlaceContext::NonMutatingUse(NonMutatingUseContext::Copy) {
             // `T: Copy` is proven, not tested modulo regions: its impl's bounds apply (#29149).
             let ty = self.place_ty(place).ty;
-            self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Copy, &[ty], to_locations(location), ConstraintCategory::CopyBound);
+            self.infcx.prove_trait_ref(&mut self.constraints, LangItem::Copy, &[GenericArg::Type(ty)], to_locations(location), ConstraintCategory::CopyBound);
         }
     }
 
@@ -1144,7 +1157,7 @@ fn mk_fn_ptr(tcx: &Tcx, sig: &FnSig, bound_regions: u32) -> TyId {
 }
 fn without_auto_traits(tcx: &Tcx, t: TyId) -> TyId {
     match tcx.tys.kind(t).clone() {
-        TyKind::Dyn(d, args, bindings, rs, r, n, _) => tcx.tys.intern(TyKind::Dyn(d, args, bindings, rs, r, n, crate::types::DynList::new())),
+        TyKind::Dyn(d, args, bindings, rs, r, n, _) => tcx.tys.intern(TyKind::Dyn(d, args.into(), bindings.into(), rs, r, n, crate::types::DynList::new().into())),
         _ => t,
     }
 }

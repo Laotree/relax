@@ -1,6 +1,5 @@
-// Items the parser generates are named by their source position (`__relax_len_<pos>_<n>`: a
-// hidden const for an array length expression). An edit ABOVE such an item moves it: it is the
-// same item (paired by identity, renamed), not a removal plus an addition.
+// Moving a body in the source preserves its parent-owned anonymous constant
+// identity, including the array length in `sized`.
 const TABLE: [u8; 3] = [1, 2, 3];
 
 fn first(x: u64) -> u64 {

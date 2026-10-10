@@ -120,8 +120,6 @@ pub struct Options {
     pub spec: bool,
     /// `RELAX_SPEC_YIELD`; default `true`.
     pub spec_yield: bool,
-    /// `RELAX_TEMPLATES`; default `true`.
-    pub templates: bool,
     /// `RELAX_O3`; default `true`.
     pub tier1: bool,
     /// `RELAX_TYCK_AHEAD`; default `true`.
@@ -254,7 +252,6 @@ impl Default for Options {
             sandbox_fuel: true,
             spec: true,
             spec_yield: true,
-            templates: true,
             tier1: true,
             tyck_ahead: true,
             unwind: true,
@@ -355,7 +352,6 @@ impl Options {
             sandbox_fuel: { let os = get("RELAX_SANDBOX_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec: { let os = get("RELAX_SPEC"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec_yield: { let os = get("RELAX_SPEC_YIELD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            templates: { let os = get("RELAX_TEMPLATES"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             tier1: { let os = get("RELAX_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             tyck_ahead: { let os = get("RELAX_TYCK_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             unwind: { let os = get("RELAX_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
@@ -447,7 +443,6 @@ impl Options {
             sandbox_fuel,
             spec,
             spec_yield,
-            templates,
             tier1,
             tyck_ahead,
             unwind,
@@ -573,8 +568,6 @@ impl Options {
         h.u8(*spec as u8);
         h.str("spec_yield");
         h.u8(*spec_yield as u8);
-        h.str("templates");
-        h.u8(*templates as u8);
         h.str("o3");
         h.u8(*tier1 as u8);
         h.str("tyck_ahead");

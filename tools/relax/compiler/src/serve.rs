@@ -93,14 +93,25 @@ impl Session {
         let mut hot: Vec<_> = files.iter().filter(|(p, f)| p.ends_with(".rs") && own_crates.contains(&unit.prog.file_crate[**f as usize])).map(|(p, f)| (*f, p.clone())).collect();
         hot.sort_by_key(|(f, _)| *f);
         let mut normalize = Vec::new();
+        let mut primed = Vec::new();
         for (file, path) in hot {
             if let Ok(v) = unit.prog.parse_version(file, &path, sources[&path].clone()) {
                 if let Ok(plan) = crate::reload::classify(&unit.prog, file, &v.pf, &path) {
-                    if plan.changes.is_empty() && plan.added.is_empty() && plan.removed.is_empty() && plan.removed_uses.is_empty() {
-                        if let Ok(f) = unit.prog.commit_version(v, &plan.pairs) { files.insert(path, f); }
+                    if plan.changes.is_empty() && plan.added.is_empty() && plan.removed.is_empty() && plan.removed_uses.is_empty() && !plan.attributes_changed {
+                        if let Ok(f) = unit.prog.commit_body_version(v, &plan.pairs) {
+                            unit.prog.lower_body_declarations(&[]);
+                            primed.push(file);
+                            primed.push(f);
+                            files.insert(path, f);
+                        }
                     } else { normalize.push(path); }
                 } else { normalize.push(path); }
             }
+        }
+        // The new versions' body inputs (round-47 per-file inputs), as reload.rs publish_reload.
+        if !primed.is_empty() {
+            unit.tcx.queries.register_files(unit.prog.files.len());
+            unit.tcx.publish_file_bodies(&primed);
         }
         let lazy = !unit.prog.session.options.source_eager;
         let mut session = Self { unit, root, own_crates, sources, deep: false, lazy, deep_errors: Vec::new(), items: HashMap::new(), front, dependents: Vec::new(), edges: HashMap::new(), files,
@@ -152,19 +163,14 @@ impl Session {
                     errors.push("internal compiler error: check instance limit exceeded".to_string());
                     break;
                 }
-                u.resolve_const_requests();
                 // Body diagnostics are returned on Body. Do not let speculative type
                 // queries leak into the signature collector's next flush_errs call.
                 let state = crate::tcx::EvalState::new();
                 let check = |u: &crate::jit::Unit| {
-                    let cx = crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-                    u.tcx.with_errors(&cx, || crate::typeck::check_fn(&cx, &u.prog, &u.tcx, item, &args)).0
+                    let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
+                    u.tcx.with_errors(&cx, || crate::typeck::instantiate_body(&cx, &u.prog, &u.tcx, item, &args)).0
                 };
-                let mut body = check(u);
-                for _ in 0..4 {
-                    if (body.errors.is_empty() && !u.tcx.has_blocked_consts()) || !u.resolve_const_requests() { break; }
-                    body = check(u);
-                }
+                let body = check(u);
                 edges.extend_from_slice(&body.dependencies);
                 for r in body.res.values().chain(body.pat_res.values()).chain(body.fmt_named.values()) {
                     if let crate::typeck::Res::Def(d) = r { edges.push(*d); }
@@ -172,11 +178,12 @@ impl Session {
                 for m in body.methods.values().chain(body.binops.values()) { edges.push(m.def); }
                 for (d, _) in body.ov_derefs.values().chain(body.ov_index.values()).chain(body.for_next.values()) { edges.push(*d); }
                 for (d, _, _) in body.for_into.values() { edges.push(*d); }
-                for (d, _) in body.try_conv.values().flatten() { edges.push(*d); }
+                for (d, _, _) in body.try_branch.values() { edges.push(*d); }
+                for (d, _) in body.try_from_residual.values() { edges.push(*d); }
                 for t in body.expr_ty.iter().chain(body.pat_ty.iter()) { crate::typeck::type_dependencies(&u.tcx, *t, &mut edges); }
                 // Check concrete instances reached in the package, with diagnostics owned by
                 // the caller. Closure bodies are already checked in their enclosing Body.
-                let cx = crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+                let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
                 for (callee, args) in u.tcx.with_errors(&cx, || crate::jit::body_callees(&u.prog, &u.tcx, &body)).0 {
                     edges.push(callee);
                     if self.own_crates.contains(&u.prog.def(callee).krate) && !args.is_empty() { queue.push((callee, args)); }
@@ -267,6 +274,7 @@ impl Session {
         }
         self.rechecked = 0;
         let mut dirty = HashSet::new();
+        let mut legacy_owners = Vec::new();
         let mut rebuild = HashSet::new();
         let mut macro_rebuild = false;
         let mut versions = Vec::new();
@@ -301,10 +309,11 @@ impl Session {
             let pairs = match plan {
                 Ok(plan) => {
                     if trace { eprintln!("relax-check plan: {}: {} changes, {} added, {} removed, {} uses removed", path, plan.changes.len(), plan.added.len(), plan.removed.len(), plan.removed_uses.len()); }
-                    if !plan.added.is_empty() || !plan.removed.is_empty() || !plan.removed_uses.is_empty() { rebuild.insert(krate); }
+                    if !plan.added.is_empty() || !plan.removed.is_empty() || !plan.removed_uses.is_empty() || plan.attributes_changed { rebuild.insert(krate); }
                     for change in plan.changes {
                         match change {
                             Change::Body(d) => {
+                                legacy_owners.push(d);
                                 dirty.insert(d);
                                 let def = self.unit.prog.def(d);
                                 let pf = &self.unit.prog.files[def.file as usize];
@@ -337,17 +346,24 @@ impl Session {
             }
             versions.push((v, pairs));
         }
+        let mut body_files = Vec::new();
         for (v, pairs) in versions {
             let path = v.path.clone();
+            let old = v.old;
             let committed = if rebuild.is_empty() { self.unit.prog.commit_body_version(v, &pairs) }
                 else { self.unit.prog.commit_version(v, &pairs) };
             match committed {
-                Ok(f) => { self.files.insert(path, f); },
+                Ok(f) => { body_files.push(old); body_files.push(f); self.files.insert(path, f); },
                 Err(e) => { self.parse_errors.insert(path.clone(), crate::diag::from_legacy(&e, "parse")); }
             }
         }
         let parsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         if rebuild.is_empty() {
+            self.unit.prog.lower_body_declarations(&legacy_owners);
+            // The edited versions' body inputs, as reload.rs publish_reload.
+            self.unit.tcx.queries.register_files(self.unit.prog.files.len());
+            self.unit.tcx.publish_file_bodies(&body_files);
+            self.refresh_front();
             // Include callers before invalidating hidden opaque types: an unchanged
             // caller's inferred return can change when its callee's body changes.
             let mut queue: Vec<_> = dirty.iter().copied().collect();
@@ -357,7 +373,7 @@ impl Session {
                 }
             }
         }
-        if rebuild.is_empty() { self.unit.tcx.invalidate_check_bodies(&dirty.iter().copied().collect::<Vec<_>>()); }
+        if rebuild.is_empty() { self.unit.tcx.invalidate_check_bodies(&self.unit.prog, &dirty.iter().copied().collect::<Vec<_>>()); }
         else { self.unit.tcx.invalidate_check(&[]); }
         for i in 0..self.unit.fns.len() {
             let f = &mut self.unit.fns[i];
@@ -388,7 +404,7 @@ impl Session {
             for &krate in &crates {
                 let old: Vec<_> = self.unit.prog.defs.iter().enumerate().filter(|(_, d)| d.krate == krate).map(|(i, _)| DefId(i as u32)).collect();
                 let impls: Vec<_> = old.iter().copied().filter(|d| self.unit.prog.def(*d).kind == DefKind::Impl).collect();
-                self.unit.tcx.uncollect_impls(&impls, false);
+                self.unit.tcx.uncollect_impls(&impls);
                 self.unit.tcx.invalidate_check(&old);
                 let mut texts: Vec<_> = self.files.iter().filter(|(_, f)| self.unit.prog.file_crate[**f as usize] == krate)
                     .filter_map(|(p, f)| self.sources.get(p).map(|t| (*f, t.clone()))).collect();
@@ -424,8 +440,7 @@ impl Session {
                 match self.unit.prog.recollect_check_crate(krate, files) {
                     Ok(defs) => {
                         self.unit.tcx.errors.retain(|e| !self.files.iter().any(|(p, f)| self.unit.prog.file_crate[*f as usize] == krate && e.starts_with(p)));
-                        self.unit.tcx.const_values.clear(); self.unit.tcx.const_failed.clear();
-                        self.unit.consts.clear(); self.unit.statics.clear(); self.unit.static_spans.clear(); self.unit.ctfe_fn_bodies.lock().unwrap().clear();
+                        self.unit.consts.clear(); self.unit.statics.clear(); self.unit.static_spans.clear();
                         self.unit.tcx.collect_check(&self.unit.prog, &defs);
                     }
                     Err(e) => { self.parse_errors.insert(String::new(), crate::diag::from_legacy(&e, "resolve")); }
@@ -436,7 +451,7 @@ impl Session {
             for krate in affected.into_iter().filter(|k| !crates.contains(k)) {
                 let defs: Vec<_> = self.unit.prog.defs.iter().enumerate().filter(|(_, d)| d.krate == krate).map(|(i, _)| DefId(i as u32)).collect();
                 let impls: Vec<_> = defs.iter().copied().filter(|d| self.unit.prog.def(*d).kind == DefKind::Impl).collect();
-                self.unit.tcx.uncollect_impls(&impls, false);
+                self.unit.tcx.uncollect_impls(&impls);
                 self.unit.tcx.invalidate_check(&defs);
                 self.unit.tcx.errors.retain(|e| !self.files.iter().any(|(p, f)| self.unit.prog.file_crate[*f as usize] == krate && e.starts_with(p)));
                 self.unit.tcx.collect_check(&self.unit.prog, &defs);
@@ -575,16 +590,12 @@ impl Session {
             self.unit = Unit::new(prog, tcx, core);
         }
         self.unit.bodies.clear(); self.unit.old_bodies.clear();
-        self.unit.ctfe_fn_bodies.lock().unwrap().clear();
-        self.unit.tcx.templates.clear(); self.unit.tcx.poly_bodies.clear(); self.unit.tcx.template_seen.clear();
+
         for f in self.unit.fns.iter_mut() { f.rir = None; f.spec = None; }
         self.unit.reload_specs.clear();
         // No worker can read these retired tables: this session has a single writer.
         unsafe {
-            self.unit.tcx.templates.reclaim(); self.unit.tcx.poly_bodies.reclaim(); self.unit.tcx.template_seen.reclaim();
-            self.unit.tcx.reclaim_caches();
-            self.unit.tcx.opaque_hidden.reclaim(); self.unit.tcx.alias_tys.reclaim();
-            self.unit.tcx.const_failed.reclaim(); self.unit.tcx.const_values.reclaim();
+            self.unit.tcx.alias_tys.reclaim();
             self.unit.prog.reclaim_caches();
         }
         if self.rss_mb == 0.0 || self.rechecked > 8 { crate::memstat::trim(); }
@@ -705,5 +716,47 @@ mod lazy_tests {
         assert!(warm.diagnostics().is_empty(), "{:?}", warm.diagnostics());
         drop(warm);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod round45_tests {
+    use super::*;
+
+    #[test]
+    fn checking_body_edits_publish_owner_legacy_results() {
+        let dir = std::env::temp_dir().join(format!("relax-check-r45-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.join("lib.rs").to_string_lossy().into_owned();
+        let dep = dir.join("dep.rs").to_string_lossy().into_owned();
+        let source = "#![no_std] pub fn a() -> i32 { dep::f(1, 2) } pub fn b() -> i32 { dep::f(3, 4) }";
+        std::fs::write(&root, source).unwrap();
+        std::fs::write(&dep, "#![no_std] #[rustc_legacy_const_generics(1)] pub fn f<const N: i32>(x: i32) -> i32 { x }").unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = crate::program::Program::new(&session);
+        let cfg = crate::cfg::CfgSet::host(&session, &[]);
+        let dependency = prog.load_crate("dep", &dep, 2021, cfg.clone(), vec![]).unwrap();
+        let sym = prog.syms.intern("dep");
+        let krate = prog.load_crate("edited", &root, 2021, cfg, vec![(sym, dependency)]).unwrap();
+        prog.resolve_imports();
+        let mut tcx = crate::tcx::Tcx::new();
+        tcx.collect(&prog);
+        let mut warm = Session::new(Unit::new(prog, tcx, 0), krate, Vec::new());
+        warm.check();
+        assert!(warm.diagnostics().is_empty(), "{:?}", warm.diagnostics());
+        let b = warm.unit.prog.defs.iter().enumerate().find(|(_, d)| warm.unit.prog.syms.str(d.name) == "b").map(|(i, _)| DefId(i as u32)).unwrap();
+        let child = warm.unit.prog.legacy_const_args[&b].children[0].1;
+        warm.did_change(root.clone(), source.replace("dep::f(1, 2)", "let x = 5; dep::f(x, 6)"));
+        assert!(warm.diagnostics().is_empty(), "{:?}", warm.diagnostics());
+        let result = &warm.unit.prog.legacy_const_args[&b];
+        assert_eq!(result.file, warm.unit.prog.def(b).file);
+        assert_eq!(result.children[0].1, child);
+        assert_eq!(result.calls.len(), 1);
+        warm.did_change(root.clone(), source.into());
+        assert!(warm.diagnostics().is_empty(), "{:?}", warm.diagnostics());
+        drop(warm);
+        std::fs::remove_file(root).unwrap();
+        std::fs::remove_file(dep).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 }

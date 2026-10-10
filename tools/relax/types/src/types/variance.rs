@@ -2,6 +2,7 @@
 //! ADT/constructor inputs are collected types; function variance is inferred on demand
 //! against the converged ADT graph. Written signatures cannot contain FnDef types.
 //! Bounds do not constrain ADT variance.
+use crate::types::AliasTy;
 use crate::fxhash::{HashMap, HashSet};
 use crate::lang_items::LangItem;
 use crate::program::DefId;
@@ -9,7 +10,7 @@ use crate::tcx::{GenEnv, Tcx};
 use super::{RegionId, RegionKind, TyId, TyKind, Types};
 use std::collections::VecDeque;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum V {
     Bi,
     Co,
@@ -26,13 +27,9 @@ pub fn xform(ctx: V, v: V) -> V {
             V::Contra => V::Co,
             x => x,
         },
-        V::Inv => {
-            if v == V::Bi {
-                V::Bi
-            } else {
-                V::Inv
-            }
-        }
+        // rustc_type_ir/src/lib.rs:318: invariant context stays invariant,
+        // including unused arguments of an opaque being generalized.
+        V::Inv => V::Inv,
         V::Bi => V::Bi,
     }
 }
@@ -50,7 +47,7 @@ pub fn join(a: V, b: V) -> V {
 /// Maps each of Relax's two argument lists into the full declaration index
 /// space. `ReEarlyParam` uses full indices; `Param` uses compact type/const
 /// indices. Late-bound lifetimes are not generic arguments.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct GenericIndices {
     pub lifetimes: Vec<u32>,
     pub types_consts: Vec<u32>,
@@ -81,13 +78,36 @@ impl GenericIndices {
 }
 
 impl Tcx {
+    /// rustc_middle/src/ty/util.rs:954-974: capture variances exist only for
+    /// opaques and return-position impl-trait-in-trait projections.
+    pub(crate) fn opt_alias_variances(&self, prog: &crate::program::Program, kind: crate::types::AliasTyKind) -> Option<Vec<V>> {
+        let def = match kind {
+            crate::types::AliasTyKind::Opaque { def_id } => def_id,
+            crate::types::AliasTyKind::Projection { def_id } if prog.impl_trait_in_trait_data.contains_key(&def_id) => def_id,
+            _ => return None,
+        };
+        Some(self.variances_of(prog, def))
+    }
+    /// opt_alias_variances with the alias's generic indices, so callers can map an
+    /// alias's split type/region argument lists onto declaration-order variances.
+    pub(crate) fn alias_declared_variances(&self, prog: &crate::program::Program, kind: crate::types::AliasTyKind) -> Option<(GenericIndices, Vec<V>)> {
+        let variances = self.opt_alias_variances(prog, kind)?;
+        Some((self.rpitit_generic_indices(prog, kind.def_id())?, variances))
+    }
     /// Variances in full declaration order, cached only after convergence.
     /// Collection publication invalidates the entire dependency graph, including
     /// unchanged declarations which refer to an edited ADT. Session-local only.
-    pub fn variances_of(&self, prog: &crate::program::Program, def: DefId) -> &[V] {
+    pub fn variances_of(&self, prog: &crate::program::Program, def: DefId) -> Vec<V> {
+        crate::type_queries::Providers { tcx: self, prog }.variances_of(def).expect("variances_of query")
+    }
+    pub(crate) fn variances_of_uncached(&self, prog: &crate::program::Program, def: DefId) -> Vec<V> {
+        if let Some(relax_front::assoc::ImplTraitInTraitData::Trait { opaque_def_id, .. }) = prog.impl_trait_in_trait_data.get(&def) {
+            return self.variances_of(prog, *opaque_def_id);
+        }
+        if prog.def(def).kind == crate::program::DefKind::OpaqueTy { return self.variance_of_opaque(prog, def); }
         let values = self.variances.get_or_init(|| infer(self));
-        if let Some(v) = values.get(&def) { return v; }
-        let Some(parts) = self.signature_parts(prog, def) else { return &[]; };
+        if let Some(v) = values.get(&def) { return v.clone(); }
+        let Some(parts) = self.signature_parts(prog, def) else { return Vec::new(); };
         parts.variances.get_or_init(|| {
             let sig = self.fn_sig(prog, def).unwrap();
             let mut walk = Walk { tcx: self, tys: &self.tys, values, indices: &sig.generic_indices,
@@ -97,7 +117,7 @@ impl Tcx {
             for &i in &sig.generic_indices.consts { walk.uses[i as usize] = V::Inv; }
             for v in &mut walk.uses { if *v == V::Bi { *v = V::Inv; } }
             walk.uses
-        })
+        }).clone()
     }
 }
 
@@ -195,6 +215,21 @@ impl Walk<'_> {
         // ReBound belongs to a signature/predicate binder, not the declaration.
     }
 
+    fn ct(&mut self, ct: crate::consts::Const, v: V) {
+        use crate::consts::{ConstKind, GenericArg};
+        match self.tys.const_kind(ct) {
+            ConstKind::Alias(_, alias) => for arg in &*alias.args {
+                match *arg {
+                    GenericArg::Type(t) => self.ty(t, v),
+                    GenericArg::Const(ct) => self.ct(ct, v),
+                    GenericArg::Lifetime(r) => self.region(r, v),
+                }
+            },
+            ConstKind::Value(value) => self.ty(value.ty, v),
+            _ => {}
+        }
+    }
+
     fn ty(&mut self, t: TyId, v: V) {
         match self.tys.kind(t).clone() {
             TyKind::Param(i) => self.constrain(self.indices.types_consts[i as usize], v),
@@ -206,8 +241,9 @@ impl Walk<'_> {
             TyKind::Slice(t) => self.ty(t, v),
             TyKind::Array(t, len) => {
                 self.ty(t, v);
-                if let Some(c) = super::len_ty(len) { self.ty(c, xform(v, V::Inv)); }
+                self.ct(len, xform(v, V::Inv));
             }
+            TyKind::Const(ct) => self.ct(ct, V::Inv),
             TyKind::Tuple(ts) => { for t in ts { self.ty(t, v); } }
             TyKind::FnPtr(ps, ret, _, _) => {
                 for p in ps { self.ty(p, xform(v, V::Contra)); }
@@ -228,7 +264,7 @@ impl Walk<'_> {
                     self.region(r, xform(v, arg_v));
                 }
             }
-            TyKind::Assoc(_, ts, rs) | TyKind::Opaque(_, _, ts, rs) => {
+            TyKind::Alias(_, AliasTy { args: ts, regions: rs, .. }) => {
                 let inv = xform(v, V::Inv);
                 for t in ts { self.ty(t, inv); }
                 for &r in self.tys.region_args(rs).iter() { self.region(r, inv); }
@@ -240,12 +276,12 @@ impl Walk<'_> {
                 for &r in self.tys.region_args(rs).iter() { self.region(r, inv); }
                 for (_, t, _) in bindings { self.ty(t, V::Inv); }
             }
-            TyKind::Closure(_, _, sig, captures, owner) => {
-                for t in [sig, captures, owner] { self.ty(t, xform(v, V::Inv)); }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: captures }) => {
+                for t in [sig, captures, owner, closure_kind_ty] { self.ty(t, xform(v, V::Inv)); }
             }
             TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) |
-            TyKind::Float(_) | TyKind::Never | TyKind::ConstVal(_) | TyKind::Error |
-            TyKind::Infer(_) | TyKind::Bound(..) | TyKind::Placeholder(_) => {}
+            TyKind::Foreign(_) | TyKind::Float(_) | TyKind::Never | TyKind::Error |
+            TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Bound(..) | TyKind::Placeholder(_) => {}
         }
     }
 }

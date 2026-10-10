@@ -292,9 +292,8 @@ pub fn key(prog: &Program, tcx: &Tcx, d: DefId) -> String {
     parts.join("::")
 }
 
-/// The shim key of a derived `clone` / `eq` of opaque type `d` (Relax generates derived
-/// methods itself, so they have no fn def of their own).
-pub fn derived_key(prog: &Program, d: DefId, method: &str) -> String {
+/// The host bridge key for Clone / PartialEq on an opaque type.
+pub fn opaque_method_key(prog: &Program, d: DefId, method: &str) -> String {
     match method {
         "eq" => format!("<{} as PartialEq>::eq", prog.def_path(d)),
         _ => format!("<{} as Clone>::clone", prog.def_path(d)),
@@ -467,7 +466,7 @@ fn rust_ty(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> Option<String> {
         TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Str => Some(crate::typeck::ty_to_string(false, prog, tcx, t)),
         TyKind::Ref(m, x, _) => Some(format!("&{}{}", if *m { "mut " } else { "" }, rust_ty(prog, tcx, krate, *x)?)),
         TyKind::Slice(x) => Some(format!("[{}]", rust_ty(prog, tcx, krate, *x)?)),
-        TyKind::Array(x, n) if crate::types::len_ty(*n).is_none() => Some(format!("[{}; {}]", rust_ty(prog, tcx, krate, *x)?, n)),
+        TyKind::Array(x, n) => Some(format!("[{}; {}]", rust_ty(prog, tcx, krate, *x)?, n.try_to_target_usize(&tcx.tys)?)),
         TyKind::Tuple(v) if v.is_empty() => Some("()".to_string()),
         TyKind::Tuple(v) => {
             let a: Option<Vec<String>> = v.iter().map(|x| rust_ty(prog, tcx, krate, *x)).collect();
@@ -583,17 +582,16 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     }
     tys.sort_by(|a, b| a.0.cmp(&b.0));
     tys.dedup_by(|a, b| a.0 == b.0);
-    // derived clone / eq of opaque types (Relax would generate them field by field)
-    let mut derived_shims: Vec<(String, String)> = Vec::new();
+    // Clone / PartialEq impls on host-owned opaque types.
+    let mut opaque_trait_shims: Vec<(String, String)> = Vec::new();
     for (_, p, d) in &tys {
-        for &(ad, td) in tcx.derived.keys() {
-            if ad != *d {
-                continue;
-            }
+        for (&imp, &td) in &tcx.impl_trait {
+            if !tcx.impl_self.get(&imp).is_some_and(|t| matches!(tcx.tys.kind(*t), TyKind::Adt(ad, aa, _) if *ad == *d && aa.is_empty())) { continue; }
             if tcx.lang_items.get(LangItem::Clone) == Some(td) {
-                derived_shims.push((derived_key(prog, *d, "clone"), format!("<{} as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _))", p)));
-            } else if tcx.lang_items.get(LangItem::PartialEq) == Some(td) {
-                derived_shims.push((derived_key(prog, *d, "eq"), format!("<{} as ::core::cmp::PartialEq>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _))", p)));
+                opaque_trait_shims.push((opaque_method_key(prog, *d, "clone"), format!("<{} as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _))", p)));
+            } else if tcx.lang_items.get(LangItem::PartialEq) == Some(td)
+                && tcx.impl_trait_args.get(&imp).is_some_and(|args| args.as_slice() == [tcx.impl_self[&imp]]) {
+                opaque_trait_shims.push((opaque_method_key(prog, *d, "eq"), format!("<{} as ::core::cmp::PartialEq>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _))", p)));
             }
         }
     }
@@ -607,7 +605,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
         for (_, p, d) in &tys {
             if has(*d, "hash::Hash") {
                 hasher_used = true;
-                derived_shims.push((
+                opaque_trait_shims.push((
                     format!("<{} as Hash>::hash_into", prog.def_path(*d)),
                     format!("{{ let x: &{p} = std::ptr::read(*a.add(0) as *const &{p}); let st: *mut u8 = std::ptr::read(*a.add(1) as *const *mut u8); let w: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = std::ptr::read(*a.add(2) as *const _); ::core::hash::Hash::hash(x, &mut __RelaxHasher(st, w)) }}"),
                 ));
@@ -620,7 +618,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
                     if debug { "0 => format!(\"{:?}\", x), 1 => format!(\"{:#?}\", x), " } else { "" },
                     if display { "_ => format!(\"{}\", x)," } else { "_ => unreachable!(), " }
                 );
-                derived_shims.push((
+                opaque_trait_shims.push((
                     format!("<{} as Fmt>::fmt_into", prog.def_path(*d)),
                     format!("{{ let x: &{p} = std::ptr::read(*a.add(0) as *const &{p}); let mode: u8 = std::ptr::read(*a.add(1) as *const u8); let out: *mut u8 = std::ptr::read(*a.add(2) as *const *mut u8); let push: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = std::ptr::read(*a.add(3) as *const _); let s: String = match mode {{ {arms} }}; push(out, s.as_ptr(), s.len()) }}"),
                 ));
@@ -631,8 +629,8 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
         out.push_str("struct __RelaxHasher(*mut u8, unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize));\n");
         out.push_str("impl ::core::hash::Hasher for __RelaxHasher {\n    fn write(&mut self, b: &[u8]) { unsafe { (self.1)(self.0, b.as_ptr(), b.len()) } }\n    fn finish(&self) -> u64 { 0 }\n}\n\n");
     }
-    derived_shims.sort();
-    for (i, (_, call)) in derived_shims.iter().enumerate() {
+    opaque_trait_shims.sort();
+    for (i, (_, call)) in opaque_trait_shims.iter().enumerate() {
         out.push_str(&format!(
             "unsafe extern \"C\" fn v{}(a: *const *mut u8, r: *mut u8) -> u32 {{\n    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {} }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n",
             i, call
@@ -702,7 +700,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     for (i, (k, h, _, _, _)) in fns.iter().enumerate() {
         out.push_str(&format!("    ({:?}, 0x{:016x}, s{}),\n", k, h, i));
     }
-    for (i, (k, _)) in derived_shims.iter().enumerate() {
+    for (i, (k, _)) in opaque_trait_shims.iter().enumerate() {
         out.push_str(&format!("    ({:?}, 0, v{}),\n", k, i));
     }
     out.push_str("];\n");
@@ -758,7 +756,7 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
                     if let Some(adt) = tcx.adts.get(d) {
                         for (vi, v) in adt.variants.iter().enumerate() {
                             for fi in 0..v.fields.len() {
-                                stack.push(tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(), *d, vi as u32, fi as u32, a));
+                                stack.push(tcx.field_ty(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), *d, vi as u32, fi as u32, a));
                             }
                         }
                     }

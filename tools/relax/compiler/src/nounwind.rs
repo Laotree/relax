@@ -80,7 +80,7 @@ impl QueryCx {
     }
 
     fn get(&self, slot: u32) -> Result<bool, QueryError> {
-        self.nounwind.get(&self.engine, slot, &mut |slot| {
+        self.engine.enter_context(|| self.nounwind.get(&self.engine, slot, &mut |slot| {
             self.engine.input(0, 0)?;
             let Some((_, body)) = self.bodies.iter().find(|b| b.0 == slot) else { return Ok(false) };
             self.engine.input(1, slot)?;
@@ -92,7 +92,7 @@ impl QueryCx {
             Ok(!crate::opt::body_may_unwind(body, &|callee| {
                 body.nounwind_inputs.iter().find(|f| f.0 == callee).is_some_and(|f| f.1)
             }))
-        }, &|id| self.force(id))
+        }, &|id| self.force(id)))
     }
 
     /// The optimizer receives a query oracle explicitly. Afterwards the caller's input
@@ -118,12 +118,12 @@ impl QueryCx {
     fn build_inputs(&mut self, slot: u32, requested: &[(u32, bool)]) -> Vec<(u32, bool)> {
         self.engine.register_input(0, 2, Fingerprint::from_bytes(b"consulted callees")).unwrap();
         self.engine.set_input(0, 2, facts_fp(requested)).unwrap();
-        self.inputs.get(&self.engine, slot, &mut |_| {
+        self.engine.enter_context(|| self.inputs.get(&self.engine, slot, &mut |_| {
             self.engine.input(0, 2)?;
             let mut inputs = Vec::with_capacity(requested.len());
             for &(callee, _) in requested { inputs.push((callee, self.get(callee)?)); }
             Ok(inputs)
-        }, &|id| self.force(id)).expect("build nounwind inputs query")
+        }, &|id| self.force(id))).expect("build nounwind inputs query")
     }
 }
 

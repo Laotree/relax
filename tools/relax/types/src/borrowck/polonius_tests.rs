@@ -53,7 +53,7 @@ fn get_default_and_filtering_lending_iterator_use_final_polonius_verdict() {
         let moves = gather(&tcx, &b);
         generate(&tcx, &b, &moves, &mut i, &vec![vec![]; b.local_decls.len()]);
         let mut regions = compute_regions(&tcx, &test_prog(), &b, i, false);
-        let nll = check_with_scopes(&tcx, &b, &regions, &moves);
+        let nll = check_with_scopes(&test_prog(), &tcx, &b, &regions, &moves);
         assert!(!nll.accepted(), "fixture must expose NLL's imprecision");
         assert!(nll.errors.iter().any(|e| matches!(e.code(), "E0499" | "E0506")), "{nll:?}");
         let result = mir_borrowck(&tcx, &test_prog(), &b, &mut regions, &moves);
@@ -179,7 +179,7 @@ fn issuance_exception_keeps_scanning_until_the_first_dead_successor() {
     let regions = compute_regions(&tcx, &test_prog(), &b, i, false);
     // Killing at issuance would terminate scope precomputation too early:
     // generation then resurrects the loan, leaving no kill for statement 1.
-    assert!(check_with_scopes(&tcx, &b, &regions, &gather(&tcx, &b)).accepted());
+    assert!(check_with_scopes(&test_prog(), &tcx, &b, &regions, &gather(&tcx, &b)).accepted());
 }
 
 #[test]
@@ -225,7 +225,8 @@ fn deferred_drop_liveness_is_computed_and_uninitialized_drops_are_skipped() {
         let regions = compute_regions(&tcx, &test_prog(), &b, i, false);
         let result = check_polonius(&tcx, &test_prog(), &b, &regions, &moves);
         assert_eq!(result.errors.iter().any(|e| e.code() == "E0499"), initialized, "{result:?}");
-        let mut comp = crate::borrowck::type_check::liveness::LivenessComputation::new(&tcx, &b, &regions.locations, &moves);
+        let prog = test_prog();
+        let mut comp = crate::borrowck::type_check::liveness::LivenessComputation::new(&prog, &tcx, &b, &regions.locations, &moves);
         assert_eq!(!comp.compute(Local(2)).1.is_empty(), initialized);
     }
 }
@@ -235,7 +236,7 @@ fn regular_generic_args_are_invariant_and_drop_variance_uses_the_whole_type() {
     let tcx = Tcx::new();
     let b = body(&[tcx.tys.unit, tcx.tys.i32_, rty(&tcx, 1)], vec![block(vec![assign(2,
         Operand::Constant(Box::new(ConstOperand { span: Span::default(), user_ty: None,
-            const_: Const::Unevaluated { def: DefId(100), args: vec![rty(&tcx, 1)], promoted: None } })))], TerminatorKind::Return)]);
+            const_: Const::Unevaluated { def: DefId(100), args: vec![crate::consts::GenericArg::Type(rty(&tcx, 1))], promoted: None } })))], TerminatorKind::Return)]);
     let mut i = input(&b, &[vec![]]); let moves = gather(&tcx, &b);
     generate(&tcx, &b, &moves, &mut i, &[vec![], vec![], vec![]]);
     assert_eq!(i.polonius.live_region_variances[1], Some(D::Bidirectional));
@@ -254,22 +255,16 @@ fn regular_generic_args_are_invariant_and_drop_variance_uses_the_whole_type() {
 fn reaudit_opaque_variance_follows_declared_captures() {
     // Relate<AliasTy> via opt_alias_variances: an opaque's uncaptured (bivariant)
     // lifetime records no direction; captured ones are invariant. Projections stay invariant.
-    use crate::types::variance::V;
-    let tcx = Tcx::new();
-    let d = crate::program::DefId(9);
-    tcx.opaques.insert((d, 0), crate::tcx::OpaqueDecl {
-        variances: Some((crate::types::variance::GenericIndices { lifetimes: vec![0, 1], ..Default::default() }, vec![V::Bi, V::Inv])),
-        ..Default::default()
-    });
+    let (prog, tcx, d) = crate::borrowck::type_check_tests::opaque_fixture();
     let u = UniversalRegions::new(0, None, vec![(0, Class::Global)]);
     let region = |r| tcx.tys.intern_region(RegionKind::ReVar(r));
-    let opaque = tcx.tys.intern(TyKind::Opaque(d, 0, vec![], tcx.tys.intern_region_args(&[region(1), region(2)])));
+    let opaque = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[region(1), region(2)]) }));
     let mut dirs = vec![];
-    record_live_region_variance(&tcx, &test_prog(), &mut dirs, &u, opaque);
+    record_live_region_variance(&tcx, &prog, &mut dirs, &u, opaque);
     assert_eq!(dirs, [None, None, Some(D::Bidirectional)]);
-    let assoc = tcx.tys.intern(TyKind::Assoc(d, vec![], tcx.tys.intern_region_args(&[region(1)])));
+    let assoc = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::Yes, crate::types::AliasTy { kind: crate::types::AliasTyKind::Projection { def_id: d }, args: vec![], regions: tcx.tys.intern_region_args(&[region(1)]) }));
     let mut dirs = vec![];
-    record_live_region_variance(&tcx, &test_prog(), &mut dirs, &u, assoc);
+    record_live_region_variance(&tcx, &prog, &mut dirs, &u, assoc);
     assert_eq!(dirs, [None, Some(D::Bidirectional)]);
 }
 

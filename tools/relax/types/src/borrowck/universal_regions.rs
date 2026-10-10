@@ -11,12 +11,24 @@ pub struct UniversalRegions {
     pub fr_static: RegionVid,
     pub fr_fn_body: Option<RegionVid>,
     regions: Vec<(RegionVid, RegionClassification)>,
+    /// UniversalRegionIndices::indices: the universal regions by their original region.
+    pub indices: Vec<(crate::types::RegionId, RegionVid)>,
 }
 impl UniversalRegions {
     pub fn new(fr_static: RegionVid, fr_fn_body: Option<RegionVid>, regions: Vec<(RegionVid, RegionClassification)>) -> Self {
         assert!(regions.contains(&(fr_static, RegionClassification::Global)));
-        Self { fr_static, fr_fn_body, regions }
+        Self { fr_static, fr_fn_body, regions, indices: Vec::new() }
     }
+    /// universal_regions.rs to_region_vid: region variables are themselves, universal
+    /// regions map through their indices.
+    pub fn to_region_vid(&self, tys: &crate::types::Types, r: crate::types::RegionId) -> RegionVid {
+        match tys.region_kind(r) {
+            crate::types::RegionKind::ReVar(v) => v as RegionVid,
+            crate::types::RegionKind::ReStatic | crate::types::RegionKind::ReError => self.fr_static,
+            _ => self.indices.iter().find(|(o, _)| *o == r).map(|(_, v)| *v).unwrap_or_else(|| panic!("cannot convert `{:?}` to a region vid", tys.region_kind(r))),
+        }
+    }
+    pub fn implicit_region_bound(&self) -> Option<RegionVid> { self.fr_fn_body }
     pub fn universal_regions_iter(&self) -> impl Iterator<Item=RegionVid> + '_ { self.regions.iter().map(|r| r.0) }
     pub fn region_classification(&self, r: RegionVid) -> Option<RegionClassification> {
         self.regions.iter().find(|v| v.0 == r).map(|v| v.1)
@@ -83,7 +95,7 @@ impl DefiningTy {
                 }
                 (inputs, sig.ret, bound_regions)
             }
-            Self::Const(d) => (vec![],tcx.const_tys[&d],0),
+            Self::Const(d) => (vec![],tcx.const_tys.get(&d).unwrap(),0),
             Self::Closure { signature, bound, .. } => {
                 let TyKind::FnPtr(ins,out,_,_) = tcx.tys.kind(signature) else { unreachable!() };
                 let TyKind::FnPtr(_,_,_,n) = tcx.tys.kind(bound) else { unreachable!() };

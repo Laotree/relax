@@ -13,20 +13,19 @@ fn consumer_before_capture_owner() {
     let (prog, _, _) = relax_compiler::load_with_std(&session, path, "closure_owner", true).unwrap();
     let mut tcx = Tcx::new();
     tcx.collect(&prog);
-    tcx.impl_projection_ready = true;
+
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
     let state = EvalState::new();
-    let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
+    let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
     use relax_compiler::upvar::ClosureKind::{Fn, FnMut, FnOnce};
     for (name, wrapper, kind) in [("foreign_file", "wrap", Fn), ("same_file", "wrap", Fn), ("mutable", "wrap_mut", FnMut), ("consuming", "wrap_once", FnOnce)] {
-        // Obtain the closure's type as it would arrive from another checked/cached
-        // body, then discard published capture results to force consumer-first order.
-        let owner = typeck::check_fn(&cx, &prog, &tcx, named(&prog, name), &[]);
+        // Obtain the closure's type as it arrives from another checked/cached body: its
+        // kind and tupled upvars are the type's own resolved ClosureArgs.
+        let owner = typeck::instantiate_body(&cx, &prog, &tcx, named(&prog, name), &[]);
         assert!(owner.errors.is_empty(), "{:?}", owner.errors);
         let closure = owner.ty(relax_compiler::ast::ExprId(owner.closures[0]));
         assert!(matches!(tcx.tys.kind(closure), TyKind::Closure(..)));
-        tcx.closure_capture_types.clear();
-        let consumer = typeck::check_fn(&cx, &prog, &tcx, named(&prog, wrapper), &[closure]);
+        let consumer = typeck::instantiate_body(&cx, &prog, &tcx, named(&prog, wrapper), &[closure]);
         assert!(consumer.errors.is_empty(), "{name}: {:?}", consumer.errors);
         assert_eq!(consumer.min_captures.len(), 1);
         assert_eq!(consumer.min_captures.values().next().unwrap().kind, kind);

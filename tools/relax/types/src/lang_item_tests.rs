@@ -92,7 +92,7 @@ fn lang_item_incremental_collection_and_rollback() {
     let adt = named(&prog, "Owned");
     let dtor = tcx.adt_destructor(adt).unwrap();
     assert!(tcx.adts[&named(&prog, "Marker")].is_phantom_data());
-    tcx.uncollect_impls(&[prog.def(dtor.did).parent], false);
+    tcx.uncollect_impls(&[prog.def(dtor.did).parent]);
     assert!(tcx.adt_destructor(adt).is_none());
 }
 

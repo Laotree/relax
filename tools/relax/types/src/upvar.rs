@@ -13,58 +13,19 @@ use crate::types::{TyId, TyKind};
 pub enum ClosureKind { Fn, FnMut, FnOnce }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CaptureKind { ByRef(BorrowKind), ByValue }
-/// Published semantic captures, independent of the root-slot lowering ABI.
-/// rustc_trait_selection/src/traits/select/mod.rs:2383-2399 uses tupled upvars.
-/// Borrowed field types follow rustc_hir_typeck/src/upvar.rs:2029-2038.
-#[derive(Clone, Debug)]
-pub struct ClosureCaptureTypes {
-    pub kind: ClosureKind,
-    pub is_copy: bool,
-    pub upvars: TyId,
-}
-
 pub(crate) fn is_capture_owner(tcx: &Tcx, body: &Body, file: u32, owner: TyId) -> bool {
     file == body.file && matches!(tcx.tys.kind(owner), TyKind::FnDef(def, args, _) if *def == body.def && *args == body.args)
 }
 
-/// Closure kind and Copy are properties of the owner's capture analysis, like
-/// rustc's ClosureArgs::kind_ty filled by rustc_hir_typeck::upvar::analyze_closure.
-/// Only the current owner may use the in-progress postorder results. A foreign
-/// owner (including another function in this file) must be checked on demand.
-pub(crate) fn closure_properties(
-    cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &Body,
-    file: u32, ce: u32, owner: TyId,
-) -> Option<(ClosureKind, bool)> {
-    if is_capture_owner(tcx, body, file, owner) {
-        return body.min_captures.get(&ce).filter(|c| c.errors.is_empty()).map(|c| (c.kind, c.is_copy));
+/// ClosureArgs::kind_ty (rustc_type_ir/src/ty_kind/closure.rs:173-190): the owner's upvar
+/// analysis unifies it (upvar.rs:457-465) and writeback resolves it, so another body reads the
+/// kind from the closure type itself. Only the current owner, still inside its postorder
+/// analysis, reads the in-progress result. None while the kind is not yet known.
+pub(crate) fn closure_kind(tcx: &Tcx, body: &Body, file: u32, ce: u32, args: crate::types::ClosureArgs) -> Option<ClosureKind> {
+    if is_capture_owner(tcx, body, file, args.parent_args) {
+        return body.min_captures.get(&ce).filter(|c| c.errors.is_empty()).map(|c| c.kind);
     }
-    let key = (file, ce, owner, tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed));
-    if let Some(c) = tcx.closure_capture_types.get(&key) {
-        return Some((c.kind, c.is_copy));
-    }
-    let TyKind::FnDef(def, args, _) = tcx.tys.kind(owner) else { return None };
-    // Preserve unresolved results on recursive requests; never invent a Fn kind
-    // or start another analysis of a body already on this evaluation stack.
-    if cx.state.typeck_inprog.borrow().contains(def) { return None; }
-    crate::typeck::check_fn(cx, prog, tcx, *def, args);
-    tcx.closure_capture_types.get(&key).map(|c| (c.kind, c.is_copy))
-}
-/// The published capture result of closure `(file, ce)` owned by `owner`, type-checking a
-/// foreign owner on demand when it is not published yet (its code may come from the disk cache,
-/// so nothing else would check it; rustc: the owner's upvar analysis is a query, ClosureArgs::
-/// kind_ty). None while that owner is on this evaluation's typeck stack (the caller's goal stays
-/// pending and is retried) or when its analysis has errors.
-pub fn ensure_closure_captures(cx: &crate::tcx::EvalCx<'_>, tcx: &Tcx, file: u32, ce: u32, owner: TyId) -> Option<ClosureCaptureTypes> {
-    let key = (file, ce, owner, tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed));
-    if let Some(c) = tcx.closure_capture_types.get(&key) {
-        return Some(c);
-    }
-    let TyKind::FnDef(def, args, _) = tcx.tys.kind(owner) else { return None };
-    if cx.state.typeck_inprog.borrow().contains(def) {
-        return None;
-    }
-    crate::typeck::check_fn(cx, cx.prog, tcx, *def, args);
-    tcx.closure_capture_types.get(&key)
+    tcx.tys.to_opt_closure_kind(args.kind_ty())
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +45,7 @@ pub struct ClosureCaptures {
     pub kind_origin: Option<Span>,
     pub errors: Vec<(u32, &'static str)>,
     pub coroutine: Option<CoroutineClosureCaptures>,
+    pub suspension_points: Option<u32>,
 }
 
 /// Typeck leaves this upvar tuple variable open until postorder analysis.
@@ -94,6 +56,7 @@ pub(crate) enum CaptureSource {
 pub(crate) struct PendingCapture {
     pub closure: u32,
     pub upvars: TyId,
+    pub kind: TyId,
     pub source: CaptureSource,
     pub is_move: bool,
     pub force_args: Vec<u32>,
@@ -206,9 +169,12 @@ fn compute_min_captures(tx: &Tx, captures: Vec<Capture>) -> Vec<Capture> {
 /// Analyze innermost closures first, as closure_analyze does; walking a nested
 /// closure then consumes its captures instead of walking its syntax again.
 pub(crate) fn analyze(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &mut Body, pending: &PendingCapture) {
-    let tx = Tx::new(prog, tcx, cx.typing_env, cx.state);
+    // rustc_hir_typeck/src/expr_use_visitor.rs:210: capture queries use the
+    // body's inference context; its unresolved types belong to that table.
+    let mut tx = Tx::new(prog, tcx, cx.typing_env, cx.state);
+    tx.cx.infcx = cx.infcx;
     tx.obligation_owner.set(body.def);
-    tx.set_generic_env(body.def, body.args.len()); let pf = &prog.files[body.file as usize];
+    let pf = &prog.files[body.file as usize];
     let ce = pending.closure;
     let is_move = pending.is_move;
     let roots = body.closure_locals.get(&ce).cloned().unwrap_or_default();
@@ -344,71 +310,9 @@ pub(crate) fn analyze(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, bo
         kind_origin,
         errors: visitor.errors,
         coroutine: None,
+        suspension_points: pending.points,
     };
     body.min_captures.insert(ce, result);
-}
-
-/// Compatibility view for the existing root-slot lowering ABI. Every decision
-/// comes from minimum captures; this never walks syntax or recomputes uses.
-pub(crate) fn derive_root_view(tcx: &Tcx, body: &mut Body, ce: u32) -> Vec<TyId> {
-    let captures = &body.min_captures[&ce].captures;
-    let roots: Vec<_> = body
-        .closure_locals
-        .get(&ce)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|root| captures.iter().any(|c| c.place.root == *root))
-        .collect();
-    let mut by_value = Vec::new();
-    let mut fields = Vec::new();
-    let mut upvars = Vec::new();
-    for &root in &roots {
-        let cs: Vec<_> = captures.iter().filter(|c| c.place.root == root).collect();
-        let ty = body.locals[root as usize].ty;
-        // A captured *shared_ref is already a pointer to its referent. The old
-        // ABI accesses the root, so store that reference value, not &shared_ref.
-        let deref_shared = matches!(tcx.tys.kind(ty), TyKind::Ref(false, _, _))
-            && cs.iter().all(|c| {
-                c.place
-                    .projections
-                    .first()
-                    .is_some_and(|p| p.0 == Projection::Deref)
-            });
-        let value = deref_shared || cs.iter().any(|c| c.info.kind == CaptureKind::ByValue);
-        let mutable = cs.iter().any(|c| {
-            matches!(
-                c.info.kind,
-                CaptureKind::ByRef(BorrowKind::Mut | BorrowKind::UniqueImm)
-            )
-        });
-        by_value.push(value);
-        upvars.push(if value {
-            ty
-        } else {
-            tcx.tys.intern(TyKind::Ref(mutable, ty, crate::types::RegionId::ERASED))
-        });
-        let mut fs = Vec::new();
-        let precise = value
-            && !deref_shared
-            && cs.iter().filter(|c| c.info.kind == CaptureKind::ByValue).all(|c| {
-                if let Some((Projection::Field(0, field), _)) = c.place.projections.first() {
-                    fs.push(*field);
-                    true
-                } else {
-                    false
-                }
-            });
-        fs.sort_unstable();
-        fs.dedup();
-        fields.push(precise.then_some(fs));
-    }
-    tcx.closure_cap_fields
-        .insert((body.file, ce), fields.clone());
-    body.capture_fields.insert(ce, fields);
-    body.capture_by_value.insert(ce, by_value);
-    body.closure_locals.insert(ce, roots);
-    upvars
 }
 
 /// upvar.rs:394-483,1970; coroutine/by_move_body.rs:128-192. Parent capture
@@ -491,50 +395,7 @@ fn coroutine_closure_view(
     }
 }
 
-/// Publishes a foreign owner's capture result restored from the disk cache (its key
-/// covers the owner and its crates' transitive source fingerprints), so a cache hit
-/// needs no typed owner body. Goals stalled on this closure are retried, as after
-/// `publish`.
-pub fn publish_restored(tcx: &Tcx, file: u32, ce: u32, owner: TyId, result: ClosureCaptureTypes) {
-    let key = (file, ce, owner, tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed));
-    if tcx.closure_capture_types.get(&key).is_none() {
-        tcx.closure_capture_types.insert(key, result);
-        tcx.trait_input_revision.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
-}
-
-pub(crate) fn publish(prog: &Program, tcx: &Tcx, body: &Body) {
-    let owner = tcx.tys.intern(TyKind::FnDef(body.def, body.args.clone(), crate::types::RegionArgsId::EMPTY));
-    for (&ce, result) in &body.min_captures {
-        if result.errors.is_empty() {
-            let mut upvars = Vec::new();
-            for capture in &result.captures {
-                let ty = capture.place.ty();
-                upvars.push(match capture.info.kind {
-                    CaptureKind::ByValue => ty,
-                    CaptureKind::ByRef(kind) => tcx.tys.intern(TyKind::Ref(
-                        kind != BorrowKind::Imm, ty, crate::types::RegionId::ERASED,
-                    )),
-                });
-            }
-            tcx.closure_capture_types.insert(
-                (
-                    body.file,
-                    ce,
-                    owner,
-                    tcx.collect_epoch.load(std::sync::atomic::Ordering::Relaxed),
-                ),
-                ClosureCaptureTypes {
-                    kind: result.kind,
-                    is_copy: result.is_copy,
-                    upvars: tcx.tys.intern(TyKind::Tuple(upvars)),
-                },
-            );
-        }
-    }
-    if !body.min_captures.is_empty() {
-        tcx.trait_input_revision.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
+pub(crate) fn dump_captures(prog: &Program, body: &Body) {
     if std::env::var_os("RELAX_DUMP_CAPTURES").is_some() {
         dump(prog, body);
     }
@@ -554,7 +415,7 @@ fn dump(prog: &Program, b: &Body) {
         let Some(c) = b.min_captures.get(ce) else {
             continue;
         };
-        eprintln!("RELAX_CAPTURES {} file={} closure={} kind={:?} origin={:?} captures={:?} errors={:?} root_slots={:?} by_value={:?} fields={:?} keys={:?} coroutine={:?}", prog.def_path(b.def), b.file, ce, c.kind, c.kind_origin, c.captures, c.errors, b.closure_locals.get(ce), b.capture_by_value.get(ce), b.capture_fields.get(ce), capture_keys(c), c.coroutine);
+        eprintln!("RELAX_CAPTURES {} file={} closure={} kind={:?} origin={:?} captures={:?} errors={:?} root_slots={:?} keys={:?} coroutine={:?}", prog.def_path(b.def), b.file, ce, c.kind, c.kind_origin, c.captures, c.errors, b.closure_locals.get(ce), capture_keys(c), c.coroutine);
     }
 }
 
@@ -574,7 +435,7 @@ mod tests {
             is_copy: false,
             kind_origin: None,
             errors: Vec::new(),
-            coroutine: None,
+            coroutine: None, suspension_points: None,
         }
     }
     #[test]
@@ -662,7 +523,7 @@ mod tests {
     }
     #[test]
     fn minimum_capture_truncates_in_both_encounter_orders() {
-        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         let t = tcx.tys.bool_; let r = tcx.tys.intern(TyKind::Ref(true, t, crate::types::RegionId::ERASED));
         let ancestor = capture(r, vec![], CaptureKind::ByRef(BorrowKind::Imm), 1);
         let child = capture(r, vec![(Projection::Deref, t)], CaptureKind::ByRef(BorrowKind::Mut), 2);
@@ -676,7 +537,7 @@ mod tests {
     }
     #[test]
     fn disjoint_fields_and_same_place_kind_origin() {
-        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t, t]));
         let a = capture(tuple, vec![(Projection::Field(0, 0), t)], CaptureKind::ByRef(BorrowKind::Imm), 1);
         let b = capture(tuple, vec![(Projection::Field(0, 1), t)], CaptureKind::ByValue, 2);
@@ -689,7 +550,7 @@ mod tests {
     }
     #[test]
     fn optimization_only_truncates_after_last_deref_when_shared() {
-        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
+        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         let t = tcx.tys.bool_; let tuple = tcx.tys.intern(TyKind::Tuple(vec![t]));
         let m = tcx.tys.intern(TyKind::Ref(true, tuple, crate::types::RegionId::ERASED)); let r = tcx.tys.intern(TyKind::Ref(false, m, crate::types::RegionId::ERASED));
         let mut c = capture(r, vec![(Projection::Deref, m), (Projection::Deref, tuple), (Projection::Field(0, 0), t)], CaptureKind::ByRef(BorrowKind::Imm), 1);
@@ -702,8 +563,8 @@ mod tests {
     }
     #[test]
     fn opaque_index_restricts_to_array() {
-        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(), &state);
-        let t = tcx.tys.bool_; let array = tcx.tys.intern(TyKind::Array(t, 3));
+        let prog = Program::new(&std::sync::Arc::new(crate::Session::default())); let tcx = Tcx::new(); let state = crate::tcx::EvalState::new(); let tx = Tx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
+        let t = tcx.tys.bool_; let array = tcx.tys.intern(TyKind::Array(t, tcx.tys.const_usize(3)));
         let mut c = capture(array, vec![(Projection::Index, t)], CaptureKind::ByValue, 1);
         restrict_precision(&tx, &mut c);
         assert!(c.place.projections.is_empty());

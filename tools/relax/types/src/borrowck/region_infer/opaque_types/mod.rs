@@ -1,4 +1,5 @@
 // ported from N:rustc_borrowck/src/region_infer/opaque_types/mod.rs @8d1a764
+use crate::types::AliasTy;
 mod member_constraints;
 mod region_ctxt;
 use region_ctxt::RegionCtxt;
@@ -37,7 +38,7 @@ pub fn compute_definition_site_hidden_types(tcx: &Tcx, prog: &Program, definitio
     relations: &UniversalRegionRelations, constraints: OutlivesConstraintSet, defining_uses: &[DefiningUse])
     -> (Vec<(DefId,TyId)>, Vec<DeferredOpaqueTypeError>) {
     let mut rcx = RegionCtxt::new(definitions, relations, constraints);
-    member_constraints::apply_member_constraints(&mut rcx, tcx, defining_uses);
+    member_constraints::apply_member_constraints(&mut rcx, tcx, prog, defining_uses);
     let mut hidden_types = vec![];
     let mut errors = vec![];
     for defining_use in defining_uses {
@@ -134,37 +135,65 @@ impl ToArgRegionsFolder<'_, '_> {
             TyKind::Slice(t) => TyKind::Slice(self.fold_ty(*t)?),
             TyKind::Array(t,n) => {
                 let t = self.fold_ty(*t)?;
-                return Ok(match crate::types::len_ty(*n) {
-                    Some(n) => tys.mk_array(t,self.fold_ty(n)?), None => tys.intern(TyKind::Array(t,*n)),
-                });
+                let n = self.fold_ty(tys.intern(TyKind::Const(*n)))?;
+                return Ok(tys.mk_array(t,tys.expect_const(n)));
+            }
+            TyKind::Const(ct) => {
+                use crate::consts::{ConstKind, GenericArg, Value, ValTree};
+                let kind = match tys.const_kind(*ct) {
+                    ConstKind::Alias(rigid, mut alias) => {
+                        let mut args = Vec::new();
+                        for arg in &*alias.args {
+                            args.push(match *arg {
+                                GenericArg::Lifetime(r) => GenericArg::Lifetime(self.fold_region(r)?),
+                                GenericArg::Type(t) => GenericArg::Type(self.fold_ty(t)?),
+                                GenericArg::Const(c) => GenericArg::Const(tys.expect_const(self.fold_ty(tys.intern(TyKind::Const(c)))?)),
+                            });
+                        }
+                        alias.args = args.into(); ConstKind::Alias(rigid,alias)
+                    }
+                    ConstKind::Value(v) => {
+                        let ty = self.fold_ty(v.ty)?;
+                        let valtree = if let Some(branches) = v.valtree.try_to_branch() {
+                            let mut folded = Vec::new();
+                            for &c in branches { folded.push(tys.expect_const(self.fold_ty(tys.intern(TyKind::Const(c)))?)); }
+                            ValTree::from_branches(tys,&folded)
+                        } else { v.valtree };
+                        ConstKind::Value(Value { ty, valtree })
+                    }
+                    _ => return Ok(ty),
+                };
+                TyKind::Const(tys.intern_const(kind))
             }
             TyKind::Tuple(ts) => TyKind::Tuple(self.list(ts)?),
-            TyKind::Adt(d,ts,rs) | TyKind::FnDef(d,ts,rs) | TyKind::Assoc(d,ts,rs) => {
+            TyKind::Adt(d,ts,rs) | TyKind::FnDef(d,ts,rs) => {
                 let (ts,rs) = self.args(*d,ts,*rs,None)?;
                 match tys.kind(ty) {
                     TyKind::Adt(..) => TyKind::Adt(*d,ts,rs),
                     TyKind::FnDef(..) => TyKind::FnDef(*d,ts,rs),
-                    _ => TyKind::Assoc(*d,ts,rs),
+                    _ => unreachable!(),
                 }
             }
-            TyKind::Opaque(d,i,ts,rs) => {
-                let variance = self.tcx.opaques.get(&(*d,*i)).and_then(|o| o.variances);
-                let (ts,rs) = self.args(*d,ts,*rs,variance)?;
-                TyKind::Opaque(*d,*i,ts,rs)
+            TyKind::Alias(rigid, alias) => {
+                let d = alias.kind.def_id();
+                // mod.rs:502-514: opt_alias_variances (opaques and RPITITs).
+                let variance = self.tcx.alias_declared_variances(self.prog, alias.kind);
+                let (args,regions) = self.args(d,&alias.args,alias.regions,variance)?;
+                TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args, regions })
             }
             TyKind::FnPtr(ts,r,h,n) => TyKind::FnPtr(self.list(ts)?,self.fold_ty(*r)?,*h,*n),
             TyKind::Dyn(d,ts,bs,rs,r,n,autos) => {
                 let (ts,rs) = self.args(*d,ts,*rs,None)?;
-                let bs = bs.iter().map(|&(d,t,n)| Ok((d,self.fold_ty(t)?,n))).collect::<Result<_,usize>>()?;
-                TyKind::Dyn(*d,ts.into(),bs,rs,self.fold_region(*r)?,*n,autos.clone())
+                let bs: Vec<_> = bs.iter().map(|&(d,t,n)| Ok((d,self.fold_ty(t)?,n))).collect::<Result<_,usize>>()?;
+                TyKind::Dyn(*d,ts.into(),bs.into(),rs,self.fold_region(*r)?,*n,autos.clone().into())
             }
-            TyKind::Closure(f,e,s,u,o) => {
+            TyKind::Closure(f, e, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => {
                 let previous = self.erase_unknown_regions;
                 self.erase_unknown_regions = true;
                 let owner = self.fold_ty(*o);
                 self.erase_unknown_regions = previous;
                 let owner = owner?;
-                TyKind::Closure(*f,*e,self.fold_ty(*s)?,self.fold_ty(*u)?,owner)
+                TyKind::Closure(*f, *e, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty: self.fold_ty(*closure_kind_ty)?, closure_sig_as_fn_ptr_ty: self.fold_ty(*s)?, tupled_upvars_ty: self.fold_ty(*u)? })
             }
             _ => return Ok(ty),
         };

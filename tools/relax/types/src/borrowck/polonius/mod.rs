@@ -5,7 +5,7 @@ mod liveness_constraints;
 
 pub use liveness::DeferredRegionLiveness;
 pub use liveness_constraints::record_live_region_variance;
-pub(crate) use liveness_constraints::{regions_in, record_variance, record_region_variance};
+pub(crate) use liveness_constraints::{region_vid, regions_in, record_variance, record_region_variance};
 use super::borrow_set::BorrowSet;
 use super::mir_nll::LocationMap;
 use super::region_infer::RegionInferenceContext;
@@ -46,7 +46,7 @@ impl PoloniusContext {
             let mut source = liveness::DeferredLivenessSource {
                 tcx, prog, body, universals, liveness: &mut liveness,
                 deferred: self.deferred_liveness.clone(), variances: self.live_region_variances.clone(),
-                comp: super::type_check::liveness::LivenessComputation::new(tcx, body, locations, moves),
+                comp: super::type_check::liveness::LivenessComputation::new(prog, tcx, body, locations, moves),
             };
             graph.traverse(body, borrows, locations, &mut live_loans, &mut source);
         }

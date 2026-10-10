@@ -432,7 +432,7 @@ fn promoted_copy(u: &Unit, mutable: bool, v: u64) -> Option<Sym> {
         let (&start, &(size, ty)) = b.range(..=v).next_back()?;
         (start, size, ty)
     };
-    if v >= start + size || !u.in_rw(start, size) || !u.tcx.is_freeze(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), ty) {
+    if v >= start + size || !u.in_rw(start, size) || !u.tcx.is_freeze(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), ty) {
         return None;
     }
     let l = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, ty);
@@ -576,6 +576,9 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
     if depth > 24 {
         return None;
     }
+    // N:rustc_ty_utils/src/layout.rs:63-75 @8d1a764: inspect the normalized
+    // type, including native array lengths, just as the layout query does.
+    let t = u.tcx.try_normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), t).ok()?;
     let rd = |o: u32| unsafe { ((base + o as u64) as *const u64).read_unaligned() };
     match u.tcx.tys.kind(t).clone() {
         TyKind::Bool | TyKind::Char | TyKind::Int(_) | TyKind::Float(_) | TyKind::Never => Some(()),
@@ -605,6 +608,7 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
         }
         TyKind::FnDef(..) => Some(()),
         TyKind::Array(et, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys).expect("normalized array length");
             let es = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, et).size as u64;
             if es == 0 {
                 return Some(());
@@ -643,8 +647,8 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
                         for k in 0..n as usize {
                             raw[k] = unsafe { *p.add(k) };
                         }
-                        let disc = crate::lower::decode_tag_const(i128::from_le_bytes(raw), &l, &adt);
-                        adt.variants.iter().position(|v| v.disc == disc)?
+                        let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                        adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc)?
                     }
                     Some(_) => return None,
                     None => 0,
@@ -654,7 +658,7 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
             };
             let fields = adt.variants.get(vi)?.fields.clone();
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
                 let fo = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 walk(u, ft, base, off + fo?, out, depth + 1)?;
             }
@@ -673,7 +677,7 @@ fn has_enum(u: &Unit, t: TyId, depth: u32) -> bool {
     match u.tcx.tys.kind(t).clone() {
         TyKind::Adt(d, args, _) => match u.tcx.adts.get(&d) {
             Some(a) if a.is_enum => true,
-            Some(a) => a.variants.iter().enumerate().any(|(vi, v)| (0..v.fields.len()).any(|fi| has_enum(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args), depth + 1))),
+            Some(a) => a.variants.iter().enumerate().any(|(vi, v)| (0..v.fields.len()).any(|fi| has_enum(u, u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args), depth + 1))),
             None => true,
         },
         TyKind::Tuple(ts) => ts.iter().any(|x| has_enum(u, *x, depth + 1)),
@@ -873,6 +877,7 @@ fn stable_fn_name_d(u: &Unit, id: u32, depth: u32) -> String {
             let parent = if depth < 16 { stable_fn_name_d(u, p, depth + 1) } else { String::new() };
             format!("closure:{}:{}@{}", u.prog.file_paths.get(file as usize).map_or("", |x| x.as_str()), e, parent)
         }
+        crate::jit::FnKey::Shim(ref shim) => crate::lower::shim_name(&u.prog, &u.tcx, shim),
         crate::jit::FnKey::Glue(g, t) => format!("glue{}:{}", g, stable_ty(u, t)),
     }
 }

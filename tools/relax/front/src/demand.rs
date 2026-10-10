@@ -1343,6 +1343,27 @@ impl NamespaceDelta {
         self.plain_size() - self.bindings.plain_size() + self.bindings.legacy_size(delta)
     }
 }
+/// A part's closure delta: decoded when a stored part is read (a later load
+/// applies it), or the recorder's encoded image. Nothing in the recording
+/// process reads the delta again, and its decoded binding image (one owned
+/// spelling per name, 0.4 GB on a cold Stage) waits for the post-present graph
+/// write; the writer copies these exact bytes. The legacy size is RELAX_PROFILE's report,
+/// taken from the decoded delta at the record (0 unprofiled).
+pub(crate) enum ClosureDelta { Decoded(NamespaceDelta), Encoded(Vec<u8>, usize) }
+impl Codec for ClosureDelta {
+    fn put(&self, w: &mut Vec<u8>) {
+        match self { Self::Decoded(delta) => delta.put(w), Self::Encoded(image, _) => w.extend_from_slice(image) }
+    }
+    fn get(r: &mut Decode<'_>) -> Option<Self> { NamespaceDelta::get(r).map(Self::Decoded) }
+}
+impl ClosureDelta {
+    pub(super) fn decoded(&self) -> Option<&NamespaceDelta> {
+        match self { Self::Decoded(delta) => Some(delta), Self::Encoded(..) => None }
+    }
+    pub(super) fn legacy_size(&self) -> usize {
+        match self { Self::Decoded(value) => value.legacy_size(true), Self::Encoded(_, size) => *size }
+    }
+}
 pub(super) fn namespace_legacy_size(bytes: &[u8]) -> Option<usize> {
     let image: NamespaceDelta = strings::decode(bytes)?;
     image.bindings.valid().then(|| image.legacy_size(false))

@@ -1,3 +1,4 @@
+// ported from N:rustc_mir_build/src/builder/expr/as_rvalue.rs @8d1a764 (division/remainder checks)
 //! Constant initializers as data. A const/static whose initializer is built from literals,
 //! tuples, arrays, struct and enum constructors, references (promoted into data), other
 //! constants, layout queries and calls of simple `const fn`s is evaluated here, on its type-checked body,
@@ -36,21 +37,17 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
     if off(options) {
         return false;
     }
-    let def = u.prog.def(d);
-    let init = match &u.prog.files[def.file as usize].ast.item(def.item).kind {
-        ItemKind::Const(_, Some(_)) | ItemKind::Static(_, _, Some(_)) => match u.prog.const_body(def.file, def.item) { Ok(Some(e)) => e, _ => return false },
-        _ => return false,
-    };
+    let init = match relax_types::const_eval::const_body(&u.prog, d) { Some(e) => e, None => return false };
     let t = match u.tcx.const_tys.get(&d) {
-        Some(t) => u.tcx.tys.subst_erasing_regions(*t, args),
+        Some(t) => u.tcx.tys.subst_erasing_regions(t, args),
         None => return false,
     };
-    let epoch = (!u.tcx.has_blocked_consts()).then(|| u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst));
-    let (body, reusable) = match check_quiet(u, d, args) {
+    let epoch = u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let body = match check_quiet(u, d, args) {
         Some(b) => b,
         None => return false,
     };
-    let epoch = epoch.filter(|_| reusable);
+    let epoch = Some(epoch);
     if let Some(f) = u.prog.exec_profile_file(body.file) { f.note(crate::exec_profile::CTFE); }
     let mut cx = Ctx { u, steps: 0, depth: 0, trace: std::env::var_os("RELAX_CTFE_TRACE").is_some(), reason: None };
     let mut env: Vec<Option<Vec<u8>>> = Vec::new();
@@ -74,30 +71,14 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
     true
 }
 
-/// Type checks `d` for evaluation only: a body with errors (or one that waits on constants
-/// not evaluated yet -- the JIT path resolves those) is not evaluated, and the check leaves
-/// no const requests behind.
-fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<(Body, bool)> {
-    let unblocked = !u.tcx.has_blocked_consts();
-    let state = crate::tcx::EvalState::new();
-    let n = u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner()).len();
+/// A successful N01 body is complete: constant queries resolve synchronously or unwind.
+fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<Body> {
     let _o = crate::clock::origin("ctfe");
-    let mut b = crate::jit::ctfe_ahead_body(u, d, args).unwrap_or_else(|| crate::typeck::check_fn(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &state), &u.prog, &u.tcx, d, args));
-    let asked = {
-        let mut r = u.tcx.const_requests.lock().unwrap_or_else(|e| e.into_inner());
-        let asked = r.len() > n;
-        r.truncate(n);
-        asked
-    };
-    if asked || !b.errors.is_empty() {
-        if std::env::var_os("RELAX_CTFE_TRACE").is_some() {
-            eprintln!("ctfe: fallback {}: type check (pending constants: {asked}, errors: {:?})", u.prog.def_path(d), b.errors);
-        }
-        return None;
-    }
-    let reusable = unblocked && state.const_asked.get() == 0 && !u.tcx.has_blocked_consts();
-    b.erase_regions(&u.tcx.tys);
-    Some((b, reusable))
+    let b = crate::jit::ctfe_ahead_body(u, d, args).unwrap_or_else(|| crate::typeck::instantiate_body(
+        &crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()),
+        &u.prog, &u.tcx, d, args));
+    if !b.errors.is_empty() || !b.deferred_misses.is_empty() { return None; }
+    Some(b)
 }
 
 /// RELAX_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
@@ -111,6 +92,9 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
     if depth > 16 {
         return true;
     }
+    // N:rustc_ty_utils/src/layout.rs:63-75: the inspected type is the
+    // normalized layout type, not the unevaluated array-length alias.
+    let t = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), t);
     let l = u.layout_of(t);
     let bytes = |p: u64, n: usize| unsafe { std::slice::from_raw_parts(p as *const u8, n) };
     let rd = |p: u64| unsafe { (p as *const u64).read_unaligned() };
@@ -143,6 +127,7 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
             }
         }
         TyKind::Array(et, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys).expect("normalized array length");
             let es = u.layout_of(et).size as u64;
             (0..n.min(1 << 24)).all(|i| same_value(u, et, a + i * es, b + i * es, depth + 1))
         }
@@ -166,8 +151,8 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
                     }
                     let mut raw = [0u8; 16];
                     raw[..n as usize].copy_from_slice(bytes(a + toff as u64, n as usize));
-                    let disc = crate::lower::decode_tag_const(i128::from_le_bytes(raw), &l, &adt);
-                    match adt.variants.iter().position(|v| v.disc == disc) {
+                    let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                    match adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                         Some(v) => v,
                         None => return true,
                     }
@@ -182,7 +167,7 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
                 None => return true,
             };
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
                 let off = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 let off = match off {
                     Some(o) => o as u64,
@@ -202,6 +187,8 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
 /// whole, struct/tuple/array fields, an enum's tag and its ACTIVE variant's fields; padding and
 /// inactive-variant bytes stay 0. Unions and unknown types count as fully defined.
 pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, depth: u32) {
+    // N:rustc_ty_utils/src/layout.rs:63-75, as in same_value above.
+    let t = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), t);
     let l = u.layout_of(t);
     let size = l.size as usize;
     let all = |mask: &mut [u8]| {
@@ -215,6 +202,7 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
     let bytes = |p: u64, n: usize| unsafe { std::slice::from_raw_parts(p as *const u8, n) };
     match u.tcx.tys.kind(t).clone() {
         TyKind::Array(et, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys).expect("normalized array length");
             let es = u.layout_of(et).size as usize;
             for i in 0..(n as usize).min(1 << 20) {
                 defined_mask(u, et, a + (i * es) as u64, mask, off + i * es, depth + 1);
@@ -239,8 +227,8 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
                         }
                         let mut raw = [0u8; 16];
                         raw[..n as usize].copy_from_slice(bytes(a + toff as u64, n as usize));
-                        let disc = crate::lower::decode_tag_const(i128::from_le_bytes(raw), &l, &adt);
-                        match adt.variants.iter().position(|v| v.disc == disc) {
+                        let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                        match adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                             Some(v) => v,
                             None => return all(mask),
                         }
@@ -256,7 +244,7 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
                 None => return all(mask),
             };
             for fi in 0..fields.len() {
-                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), d, vi as u32, fi as u32, &args);
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, vi as u32, fi as u32, &args);
                 let fo = if adt.is_enum { l.variant_fields.get(vi).and_then(|v| v.get(fi)).copied() } else { l.fields.get(fi).copied() };
                 if let Some(fo) = fo {
                     defined_mask(u, ft, a + fo as u64, mask, off + fo as usize, depth + 1);
@@ -362,7 +350,7 @@ impl<'a> Ctx<'a> {
                 // &[T; N] -> &[T]: the thin pointer gets N
                 let n = match self.kind(b.ty(e)) {
                     TyKind::Ref(_, a, _) | TyKind::Ptr(_, a) => match self.kind(a) {
-                        TyKind::Array(_, n) if crate::types::len_ty(n).is_none() => n,
+                        TyKind::Array(_, n) if n.try_to_target_usize(&self.u.tcx.tys).is_some() => n.try_to_target_usize(&self.u.tcx.tys).unwrap(),
                         _ => return None,
                     },
                     _ => return None,
@@ -384,7 +372,7 @@ impl<'a> Ctx<'a> {
         let kind = self.u.prog.files[file].ast.expr(e).kind.clone();
         match kind {
             ExprKind::Closure { .. } => match self.kind(t) {
-                TyKind::Closure(_, _, _, captures, _) if matches!(self.kind(captures), TyKind::Tuple(ref ts) if ts.is_empty()) => Some(Vec::new()),
+                TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: captures, .. }) if matches!(self.kind(captures), TyKind::Tuple(ref ts) if ts.is_empty()) => Some(Vec::new()),
                 _ => None,
             },
             ExprKind::Paren(x) => self.eval(b, env, x),
@@ -401,7 +389,7 @@ impl<'a> Ctx<'a> {
                         if matches!(self.u.prog.files[file].ast.expr(literal).kind, ExprKind::Lit(LitKind::Int)) {
                             let ex = self.u.prog.files[file].ast.expr(literal);
                             let text = std::str::from_utf8(self.u.prog.files[file].bytes(ex.lo, ex.hi)).ok()?;
-                            let magnitude = crate::consteval::parse_int_lit(text)?;
+                            let magnitude = crate::const_fold::parse_int_lit(text)?;
                             if magnitude > 1u128 << (n * 8 - 1) { return None; }
                             return Some(store_int(magnitude.wrapping_neg() as i128, n));
                         }
@@ -462,7 +450,7 @@ impl<'a> Ctx<'a> {
                 let (li, off) = self.local_place(b, env, x)?;
                 let xt = b.ty(x);
                 let size = self.size(xt) as usize;
-                if self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), xt) { return None; }
+                if self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) { return None; }
                 if let ExprKind::AssignOp(op, _, _) = kind {
                     if b.binops.contains_key(&e.0) { return None; }
                     // A generic body's overloaded compound assignment retains its
@@ -495,7 +483,7 @@ impl<'a> Ctx<'a> {
             }
             ExprKind::Array(xs) => {
                 let (et, n) = match self.kind(t) {
-                    TyKind::Array(et, n) if crate::types::len_ty(n).is_none() => (et, n),
+                    TyKind::Array(et, n) if n.try_to_target_usize(&self.u.tcx.tys).is_some() => (et, n.try_to_target_usize(&self.u.tcx.tys).unwrap()),
                     _ => return None,
                 };
                 if n as usize != xs.len() {
@@ -514,7 +502,7 @@ impl<'a> Ctx<'a> {
             }
             ExprKind::Repeat(x, _) => {
                 let n = match self.kind(t) {
-                    TyKind::Array(_, n) if crate::types::len_ty(n).is_none() => n as usize,
+                    TyKind::Array(_, n) if n.try_to_target_usize(&self.u.tcx.tys).is_some() => n.try_to_target_usize(&self.u.tcx.tys).unwrap() as usize,
                     _ => return None,
                 };
                 let v = self.eval(b, env, x)?;
@@ -555,7 +543,7 @@ impl<'a> Ctx<'a> {
                     let nf = a.variants.first()?.fields.len();
                     for fi in 0..nf as u32 {
                         if vals.iter().any(|(i, _)| *i == fi) { continue; }
-                        let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), adt, 0, fi, &args);
+                        let ft = self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), adt, 0, fi, &args);
                         let off = self.struct_field_off(t, fi)? as usize;
                         let size = self.size(ft) as usize;
                         vals.push((fi, v.get(off..off + size)?.to_vec()));
@@ -580,7 +568,7 @@ impl<'a> Ctx<'a> {
                             // Mutable/interior-mutable static reads need a full interpreter.
                             let def = self.u.prog.def(d);
                             if !matches!(self.u.prog.files[def.file as usize].ast.item(def.item).kind, ItemKind::Static(false, _, Some(_)))
-                                || !self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), t) { return None; }
+                                || !self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t) { return None; }
                             let a = self.u.ctfe_static_addr(d)?;
                             // Only completed static initializers have a captured value.
                             // An address may already exist during a cyclic initialization.
@@ -616,7 +604,8 @@ impl<'a> Ctx<'a> {
                         let sig = self.u.tcx.fn_sig(&self.u.prog, m.def)?;
                         let st = self.u.tcx.tys.subst_erasing_regions(*sig.params.first()?, &m.args);
                         if matches!(self.kind(st), TyKind::Ref(_, p, _) if matches!(self.kind(p), TyKind::Slice(_))) {
-                            if crate::types::len_ty(n).is_some() || rv.len() != 8 { return None; }
+                            let n = n.try_to_target_usize(&self.u.tcx.tys)?;
+                            if rv.len() != 8 { return None; }
                             rv.extend_from_slice(&n.to_le_bytes());
                         }
                     }
@@ -650,8 +639,10 @@ impl<'a> Ctx<'a> {
                         for a in &self.u.prog.files[file].ast.list(args).to_vec() {
                             vals.push(self.eval(b, env, *a)?);
                         }
-                        let (d, gargs) = self.u.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.u.prog, d0, &gargs0).expect_dispatch();
-                        self.call_const_fn(d, gargs, vals, t)
+                        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d0, &gargs0).expect("established instance dispatch");
+                        let relax_types::instance::InstanceKind::Item(d) = instance.def else { return None };
+                        if self.u.prog.def(d).kind == DefKind::Closure { return None; }
+                        self.call_const_fn(d, instance.compact_args(&self.u.tcx), vals, t)
                     }
                     _ => None,
                 }
@@ -666,7 +657,7 @@ impl<'a> Ctx<'a> {
                 }
                 if self.owned_local_place(b, x) { return None; }
                 let xt = b.ty(x);
-                if self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), xt) {
+                if self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), xt) {
                     return self.borrow(b, env, x);
                 }
                 // a promoted rvalue (or a constant's place): its bytes in data, by address
@@ -732,7 +723,8 @@ impl<'a> Ctx<'a> {
                 let es = self.size(t) as usize;
                 let at = b.ty(a);
                 match (derefs, self.kind(at)) {
-                    (0, TyKind::Array(_, n)) if crate::types::len_ty(n).is_none() => {
+                    (0, TyKind::Array(_, n)) if n.try_to_target_usize(&self.u.tcx.tys).is_some() => {
+                        let n = n.try_to_target_usize(&self.u.tcx.tys).unwrap();
                         if idx >= n as usize {
                             return None;
                         }
@@ -740,7 +732,7 @@ impl<'a> Ctx<'a> {
                     }
                     (1, TyKind::Ref(_, inner, _)) => {
                         let (p, n) = match self.kind(inner) {
-                            TyKind::Array(_, n) if crate::types::len_ty(n).is_none() => (rd_u64(&av, 0)?, n),
+                            TyKind::Array(_, n) if n.try_to_target_usize(&self.u.tcx.tys).is_some() => (rd_u64(&av, 0)?, n.try_to_target_usize(&self.u.tcx.tys).unwrap()),
                             TyKind::Slice(_) => (rd_u64(&av, 0)?, rd_u64(&av, 8)?),
                             _ => return None,
                         };
@@ -846,7 +838,7 @@ impl<'a> Ctx<'a> {
                     _ => return None,
                 };
                 let (et, n) = match self.kind(t) {
-                    TyKind::Array(et, n) if crate::types::len_ty(n).is_none() => (et, n),
+                    TyKind::Array(et, n) => (et, n.try_to_target_usize(&self.u.tcx.tys)?),
                     TyKind::Slice(et) => (et, rd_u64(&ptr, 8)?),
                     _ => return None,
                 };
@@ -860,7 +852,7 @@ impl<'a> Ctx<'a> {
         }
         let t = b.ty(e);
         if self.u.lay.is_unsized(&crate::layout::LayoutCx::new(&self.u.prog), &mut self.u.tcx, t)
-            || !self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), t) { return None; }
+            || !self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t) { return None; }
         let v = self.eval(b, env, e)?;
         let l = self.layout(t);
         if l.uninhabited || v.len() != l.size as usize { return None; }
@@ -891,7 +883,7 @@ impl<'a> Ctx<'a> {
             ExprKind::Index(x, index) => {
                 if b.ov_index.contains_key(&e.0) || b.index_derefs.get(&e.0).copied().unwrap_or(0) != 0 { return None; }
                 let TyKind::Array(et, n) = self.kind(b.ty(x)) else { return None };
-                if crate::types::len_ty(n).is_some() { return None; }
+                let n = n.try_to_target_usize(&self.u.tcx.tys)?;
                 let (li, base) = self.local_place(b, env, x)?;
                 let i = rd_u64(&self.eval(b, env, index)?, 0)?;
                 if i >= n { return None; }
@@ -978,7 +970,9 @@ impl<'a> Ctx<'a> {
 
     fn fn_pointer(&mut self, t: TyId) -> Option<Vec<u8>> {
         let TyKind::FnDef(d, args, _) = self.kind(t) else { return None };
-        let (d, args) = self.u.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &self.u.prog, d, &args).expect_dispatch();
+        let instance = self.u.tcx.resolve_instance_raw(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), d, &args).ok()?;
+        let crate::instance::InstanceKind::Item(d) = instance.def else { return None; };
+        let args = instance.compact_args(&self.u.tcx);
         // Foreign symbols and track_caller shims have different entry conventions.
         if self.u.prog.def(d).kind == DefKind::ForeignFn || self.u.tcx.fn_sig(&self.u.prog, d).is_some_and(|s| s.track_caller) { return None; }
         let id = self.u.fn_id(crate::jit::FnKey::Inst(d, args));
@@ -1005,7 +999,7 @@ impl<'a> Ctx<'a> {
                 }
                 TyKind::Int(_) => {
                     let (n, s) = self.int_of(t)?;
-                    let v = crate::consteval::parse_int_lit(&text)?;
+                    let v = crate::const_fold::parse_int_lit(&text)?;
                     // A positive literal must fit. Negated signed minimum literals are
                     // handled at the unary expression, before evaluating the operand.
                     let max = if s { u128::MAX >> (129 - n * 8) } else { u128::MAX >> (128 - n * 8) };
@@ -1046,7 +1040,7 @@ impl<'a> Ctx<'a> {
             LitKind::ByteStr => {
                 let v = crate::lit::unescape_bytes(&text);
                 match self.kind(t) {
-                    TyKind::Ref(_, a, _) if matches!(self.kind(a), TyKind::Array(_, n) if n == v.len() as u64) => {}
+                    TyKind::Ref(_, a, _) if matches!(self.kind(a), TyKind::Array(_, n) if n.try_to_target_usize(&self.u.tcx.tys) == Some(v.len() as u64)) => {}
                     _ => return None,
                 }
                 let a = self.u.lit_data(&v);
@@ -1093,6 +1087,9 @@ impl<'a> Ctx<'a> {
         let q = load_int(bv, nq, sq);
         let cmp = |r: bool| Some(vec![r as u8]);
         let (pi, qi) = (p as i128, q as i128);
+        // N:rustc_mir_build/src/builder/expr/as_rvalue.rs:533-589: both / and %
+        // reject MIN/-1 regardless of the body's overflow policy.
+        if s && matches!(op, BinOp::Div | BinOp::Rem) && qi == -1 && pi == -(1i128 << (n * 8 - 1)) { return None; }
         let r: i128 = match op {
             BinOp::Eq => return cmp(p == q),
             BinOp::Ne => return cmp(p != q),
@@ -1175,10 +1172,10 @@ impl<'a> Ctx<'a> {
                 let disc = match l.tag {
                     Some((toff, crate::rir::Mem::Int(tn, ts))) => {
                         let raw = load_int(v.get(toff as usize..(toff + tn as u32) as usize)?, tn as usize, ts);
-                        crate::lower::decode_tag_const(raw, &l, &adt)
+                        crate::lower::decode_tag_const(self.u, raw, &l, &adt)
                     }
                     None => match l.enc {
-                        crate::layout::TagEnc::Single(vi) => crate::lower::variant_disc(&adt, vi) as i128,
+                        crate::layout::TagEnc::Single(vi) => adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value(),
                         _ => return None,
                     },
                     _ => return None,
@@ -1197,7 +1194,9 @@ impl<'a> Ctx<'a> {
     fn const_data(&mut self, d: crate::program::DefId, args: Vec<TyId>) -> Option<u64> {
         let u = &mut *self.u;
         let (d, args) = if u.prog.def(d).kind == DefKind::AssocConst && u.prog.def(u.prog.def(d).parent).kind == DefKind::Trait {
-            u.tcx.resolve_trait_method(&crate::tcx::EvalCx::new(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(), &crate::tcx::EvalState::new()), &u.prog, d, &args).expect_dispatch()
+            let instance = u.tcx.resolve_instance_raw(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, &args).expect("established instance dispatch");
+            let relax_types::instance::InstanceKind::Item(d) = instance.def else { panic!("non-item associated const") };
+            (d, instance.compact_args(&u.tcx))
         } else {
             (d, args)
         };
@@ -1213,7 +1212,7 @@ impl<'a> Ctx<'a> {
             u.consts.insert((d, args), a);
             return Some(a);
         }
-        let t = u.tcx.tys.subst_erasing_regions(*u.tcx.const_tys.get(&d)?, &args);
+        let t = u.tcx.tys.subst_erasing_regions(u.tcx.const_tys.get(&d)?, &args);
         let l = u.layout_of(t);
         let buf = u.data(&vec![0u8; l.size.max(1) as usize], l.align.max(8) as u64, crate::syms::DataKind::Typed(t));
         u.syms.set_data_name(buf, crate::jit::const_name(u, d, &args));
@@ -1287,13 +1286,13 @@ impl<'a> Ctx<'a> {
             // the tag (lower::emit_store_disc)
             if let Some((toff, crate::rir::Mem::Int(tn, _))) = l.tag {
                 let tv = match l.enc {
-                    crate::layout::TagEnc::Direct => Some(crate::lower::variant_disc(&adt, vi) as u64),
+                    crate::layout::TagEnc::Direct => Some(adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).val),
                     crate::layout::TagEnc::Single(_) => None,
                     crate::layout::TagEnc::Niche { untagged, lo, start, .. } => {
                         if vi == untagged {
                             None
                         } else {
-                            Some((start as u64).wrapping_add((vi - lo) as u64))
+                            Some(start.wrapping_add((vi - lo) as u128))
                         }
                     }
                 };
@@ -1352,7 +1351,7 @@ impl<'a> Ctx<'a> {
         let body = match cached {
             Some(b) => b,
             None => {
-                let b = std::sync::Arc::new(check_quiet(self.u, d, &gargs)?.0);
+                let b = std::sync::Arc::new(check_quiet(self.u, d, &gargs)?);
                 self.u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (epoch, b.clone()));
                 b
             }

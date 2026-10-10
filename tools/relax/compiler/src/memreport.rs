@@ -121,10 +121,6 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     let bs = std::mem::size_of::<crate::typeck::Body>();
     out.push((format!("checked bodies kept for closures ({}; {} B each + heap)", u.bodies.len(), bs), u.bodies.values().map(|b| bs + b.heap_bytes()).sum::<usize>() as u64));
     out.push((format!("old-version bodies ({})", u.old_bodies.len()), u.old_bodies.values().map(|b| bs + b.heap_bytes()).sum::<usize>() as u64));
-    {
-        let c = u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner());
-        out.push((format!("ctfe fn bodies ({})", c.len()), c.values().map(|(_, b)| bs + b.heap_bytes()).sum::<usize>() as u64));
-    }
     out.extend(u.front.mem_lines());
     out.extend(u.prog.memo_mem_lines());
     out.extend(u.tcx.mem_lines());

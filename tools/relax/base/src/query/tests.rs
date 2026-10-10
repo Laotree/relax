@@ -80,8 +80,8 @@ impl Cx {
                                 value += self.leaf(1)?;
                                 value += self.leaf(0)?;
                                 Ok(())
-                            })
-                        })?;
+                            }).0
+                        }).0?;
                         Ok(value)
                     }
                     2 => Ok(self.sum(0)? + self.sum(1)?),
@@ -183,13 +183,54 @@ fn memoization_and_stable_identity() {
     assert_eq!(cx.engine.dep_node(query), other.engine.dep_node(other.leaf.query_id(&0).unwrap()));
 }
 
+fn assert_anonymous_sum_edges(cx: &Cx) {
+    let state = cx.engine.state.lock().unwrap();
+    let graph = &state.graph;
+    let root = graph.indices[&cx.sum.query_id(&1).unwrap()];
+    let edges = &graph.edges[graph.nodes[root.0 as usize].edges.clone()];
+    assert_eq!(edges.len(), 1);
+    let outer = &graph.nodes[edges[0] as usize];
+    assert_eq!(outer.query, None);
+    let reads = &graph.edges[outer.edges.clone()];
+    assert_eq!(reads.len(), 2);
+    assert_eq!(graph.nodes[reads[0] as usize].query, cx.leaf.query_id(&0));
+    let inner = &graph.nodes[reads[1] as usize];
+    assert_eq!(inner.query, None);
+    let reads: Vec<_> = graph.edges[inner.edges.clone()].iter().map(|&i| graph.nodes[i as usize].query.unwrap()).collect();
+    assert_eq!(reads, vec![cx.leaf.query_id(&1).unwrap(), cx.leaf.query_id(&0).unwrap()]);
+}
+
+#[test]
+fn anonymous_cached_read_invalidates_and_preserves_early_cutoff() {
+    let mut cx = Cx::new();
+    let (value, node) = cx.engine.with_anon_task(&mut || Ok::<_, QueryError>(cx.leaf(0)? + cx.leaf(1)?));
+    assert_eq!(value, Ok(2));
+    let table = QueryTable::new(3, fp, value_fp);
+    let runs = AtomicUsize::new(0);
+    let get = |cx: &Cx| table.get(&cx.engine, 0, &mut |_| {
+        runs.fetch_add(1, Ordering::Relaxed);
+        cx.engine.read_index(node);
+        Ok(cx.leaf(0)? + cx.leaf(1)?)
+    }, &|id| cx.force(id));
+    assert_eq!(get(&cx), Ok(2));
+    cx.edit(0, 11);
+    assert_eq!(get(&cx), Ok(2));
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    cx.edit(1, 20);
+    assert_eq!(get(&cx), Ok(3));
+    assert_eq!(runs.load(Ordering::Relaxed), 2);
+    assert_eq!(cx.sum(1), Ok(4));
+    cx.edit(0, 30);
+    assert_eq!(cx.sum(1), Ok(8));
+}
+
 #[test]
 fn cached_reads_and_anonymous_tasks_record_ordered_edges() {
     let cx = Cx::new();
     cx.leaf(0).unwrap();
     cx.leaf(1).unwrap();
     assert_eq!(cx.sum(1), Ok(3));
-    assert_eq!(cx.engine.dependencies(cx.sum.query_id(&1).unwrap()), vec![cx.leaf.query_id(&0).unwrap(), cx.leaf.query_id(&1).unwrap()]);
+    assert_anonymous_sum_edges(&cx);
     assert_eq!(cx.engine.dependencies(cx.leaf.query_id(&0).unwrap()), vec![QueryId { kind: 0, key: 0 }]);
     cx.sum(4).unwrap();
     let mut expected = Vec::new();
@@ -456,7 +497,7 @@ fn panic_poison_wakes_blocked_waiters_and_restores_task_stack() {
             &local_engine,
             0,
             &mut |_| {
-                local_engine.with_anon_task(&mut || panic!("anonymous panic"))?;
+                local_engine.with_anon_task(&mut || -> Result<(), QueryError> { panic!("anonymous panic") }).0?;
                 Ok(0)
             },
             &no_force,
@@ -569,7 +610,7 @@ fn late_tls_provider_execution() {
 fn late_tls_nested_reads() {
     in_late_destructor(|cx| {
         assert_eq!(cx.sum(1), Ok(3));
-        assert_eq!(cx.engine.dependencies(cx.sum.query_id(&1).unwrap()), vec![cx.leaf.query_id(&0).unwrap(), cx.leaf.query_id(&1).unwrap()]);
+        assert_anonymous_sum_edges(cx);
         let table = QueryTable::new(3, fp, value_fp);
         assert_eq!(table.get(&cx.engine, 0, &mut |_| {
             for key in 0..16 { cx.input(key)?; cx.leaf(key)?; }
@@ -593,7 +634,7 @@ fn late_tls_provider_panic() {
         let table = QueryTable::new(3, fp, value_fp);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             table.get(&cx.engine, 0, &mut |_| {
-                cx.engine.with_anon_task(&mut || { cx.leaf(1)?; panic!("provider panic in TLS cleanup"); })?;
+                cx.engine.with_anon_task(&mut || -> Result<(), QueryError> { cx.leaf(1)?; panic!("provider panic in TLS cleanup"); }).0?;
                 Ok(0)
             }, &no_force)
         }));
@@ -615,13 +656,22 @@ fn spilled_task_reads_preserve_order_and_deduplicate() {
     table.get(&engine, 0, &mut |_| {
         engine.with_anon_task(&mut || {
             for _ in 0..2 { for key in 0..40 { engine.input(0, key)?; } }
-            Ok(())
-        })?;
+            Ok::<_, QueryError>(())
+        }).0?;
         Ok(0)
     }, &no_force).unwrap();
     let mut expected = Vec::new();
     for key in 0..40 { expected.push(QueryId { kind: 0, key }); }
-    assert_eq!(engine.dependencies(table.query_id(&0).unwrap()), expected);
+    {
+        let state = engine.state.lock().unwrap();
+        let root = state.graph.indices[&table.query_id(&0).unwrap()];
+        let edges = &state.graph.edges[state.graph.nodes[root.0 as usize].edges.clone()];
+        assert_eq!(edges.len(), 1);
+        let anon = &state.graph.nodes[edges[0] as usize];
+        assert_eq!(anon.query, None);
+        let reads: Vec<_> = state.graph.edges[anon.edges.clone()].iter().map(|&i| state.graph.nodes[i as usize].query.unwrap()).collect();
+        assert_eq!(reads, expected);
+    }
     table.get(&engine, 1, &mut |_| {
         for key in 20..40 { engine.input(0, key)?; }
         Ok(0)
@@ -666,4 +716,184 @@ fn micro_benchmark() {
         execute_ns as f64 / 10_000.0,
         green_ns as f64 / 10_000.0
     );
+}
+
+#[test]
+fn independent_context_restores_enclosing_query_after_unwind() {
+    let outer = Cx::new();
+    let inner = Cx::new();
+    let table = QueryTable::new(3, fp, value_fp);
+    let value = table.get(&outer.engine, 0, &mut |_| {
+        outer.input(0)?;
+        assert_eq!(inner.engine.enter_context(|| inner.leaf(1)), Ok(1));
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            inner.engine.enter_context(|| {
+                inner.input(2).unwrap();
+                panic!("nested compilation failed");
+            });
+        }));
+        assert!(panic.is_err());
+        outer.engine.enter_context(|| outer.input(3))
+    }, &no_force).unwrap();
+    assert_eq!(value, 10);
+    assert_eq!(outer.engine.dependencies(table.query_id(&0).unwrap()),
+        vec![QueryId { kind: 0, key: 0 }, QueryId { kind: 0, key: 3 }]);
+    assert_eq!(inner.engine.dependencies(inner.leaf.query_id(&1).unwrap()),
+        vec![QueryId { kind: 0, key: 1 }]);
+}
+
+#[test]
+fn round42_nested_cancellation_discards_reads_and_retries_after_edit() {
+    let mut engine = QueryEngine::new();
+    for key in 0..32 {
+        engine.register_input(0, key, fp(&key)).unwrap();
+        engine.set_input(0, key, value_fp(&10)).unwrap();
+    }
+    let parent = QueryTable::new(1, fp, value_fp);
+    let child = QueryTable::new(2, fp, value_fp);
+    let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parent.get(&engine, 0, &mut |_| {
+            engine.input(0, 0)?;
+            child.get(&engine, 0, &mut |_| {
+                // Exercise both inline and pooled read frames, including an anonymous task.
+                engine.with_anon_task(&mut || {
+                    for key in 0..32 { engine.input(0, key).unwrap(); }
+                    std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
+                });
+                Ok(0)
+            }, &no_force)
+        }, &no_force)
+    }));
+    assert!(cancelled.is_err_and(|p| crate::preempt::is_preempted(&*p)));
+    for query in [parent.query_id(&0).unwrap(), child.query_id(&0).unwrap()] {
+        assert_eq!(engine.color(query), DepNodeColor::Unknown);
+        assert!(engine.dependencies(query).is_empty());
+        let state = engine.state.lock().unwrap();
+        let index = state.graph.indices[&query].0 as usize;
+        assert!(state.graph.nodes[index].fingerprint.is_none());
+        assert!(state.graph.nodes[index].error.is_none());
+        assert!(!state.jobs[index].active);
+        assert!(state.jobs[index].waiting_on.is_none());
+    }
+    let mut published = 0;
+    parent.for_each(&mut |_, _, _| published += 1);
+    child.for_each(&mut |_, _, _| published += 1);
+    assert_eq!(published, 0);
+    assert!(dep_graph::current_job(engine.id).is_none());
+    engine.set_input(0, 31, value_fp(&20)).unwrap();
+    assert_eq!(parent.get(&engine, 0, &mut |_| child.get(&engine, 0, &mut |_| {
+        engine.input(0, 31)?;
+        Ok(20)
+    }, &no_force), &no_force), Ok(20));
+    assert_eq!(engine.dependencies(child.query_id(&0).unwrap()), vec![QueryId { kind: 0, key: 31 }]);
+    assert_eq!(engine.dependencies(parent.query_id(&0).unwrap()), vec![child.query_id(&0).unwrap()]);
+}
+
+/// The post-boot loader's NeedsLoad (a constant waiting for a skipped module) crosses
+/// nested queries like a preemption: neither caches a value or an error (not Poisoned), and
+/// the same key computes normally on the next request, in the same revision.
+#[test]
+fn needs_load_cancels_nested_queries_without_caching() {
+    let mut engine = QueryEngine::new();
+    engine.register_input(0, 0, fp(&0)).unwrap();
+    engine.set_input(0, 0, value_fp(&1)).unwrap();
+    let parent = QueryTable::new(1, fp, value_fp);
+    let child = QueryTable::new(2, fp, value_fp);
+    let cancelled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        parent.get(&engine, 0, &mut |_| {
+            engine.input(0, 0)?;
+            child.get(&engine, 0, &mut |_| -> Result<u64, QueryError> {
+                std::panic::resume_unwind(Box::new(crate::preempt::NeedsLoad));
+            }, &no_force)
+        }, &no_force)
+    }));
+    assert!(cancelled.is_err_and(|p| p.is::<crate::preempt::NeedsLoad>()));
+    for query in [parent.query_id(&0).unwrap(), child.query_id(&0).unwrap()] {
+        let state = engine.state.lock().unwrap();
+        let index = state.graph.indices[&query].0 as usize;
+        assert!(state.graph.nodes[index].fingerprint.is_none());
+        assert!(state.graph.nodes[index].error.is_none());
+        assert!(!state.jobs[index].active);
+    }
+    let mut published = 0;
+    parent.for_each(&mut |_, _, _| published += 1);
+    child.for_each(&mut |_, _, _| published += 1);
+    assert_eq!(published, 0);
+    assert_eq!(parent.get(&engine, 0, &mut |_| child.get(&engine, 0, &mut |_| Ok(7), &no_force), &no_force), Ok(7));
+}
+
+#[test]
+fn round42_cancelled_owner_wakes_foreground_and_preempts_background_waiters() {
+    let engine = Arc::new(QueryEngine::new());
+    let table = Arc::new(QueryTable::new(1, fp, value_fp));
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let owner = {
+        let engine = engine.clone(); let table = table.clone();
+        thread::spawn(move || {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| table.get(&engine, 0, &mut |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
+            }, &no_force)))
+        })
+    };
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (background_tx, background_rx) = mpsc::channel();
+    let background = {
+        let engine = engine.clone(); let table = table.clone();
+        thread::spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _p = crate::preempt::Preemptible::on();
+                table.get(&engine, 0, &mut |_| panic!("background must not compute"), &no_force)
+            }));
+            background_tx.send(r.is_err_and(|p| crate::preempt::is_preempted(&*p))).unwrap();
+        })
+    };
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut foreground = Vec::new();
+    for _ in 0..3 {
+        let engine = engine.clone(); let table = table.clone(); let runs = runs.clone();
+        foreground.push(thread::spawn(move || table.get(&engine, 0, &mut |_| {
+            runs.fetch_add(1, Ordering::Relaxed); Ok(42)
+        }, &no_force)));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = engine.state.lock().unwrap();
+        let waiting = state.jobs[0].latch.as_ref().is_some_and(|l| Arc::strong_count(l) == 5);
+        drop(state);
+        if waiting { break; }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    let writer = crate::preempt::WriterWaiting::new();
+    // The background waiter must unwind on a timed wait, before the owner finishes.
+    assert!(background_rx.recv_timeout(Duration::from_secs(5)).unwrap());
+    background.join().unwrap();
+    release_tx.send(()).unwrap();
+    assert!(owner.join().unwrap().is_err_and(|p| crate::preempt::is_preempted(&*p)));
+    for waiter in foreground { assert_eq!(waiter.join().unwrap(), Ok(42)); }
+    assert_eq!(runs.load(Ordering::Relaxed), 1);
+    drop(writer);
+    assert_eq!(table.get(&engine, 0, &mut |_| panic!("must reuse completed retry"), &no_force), Ok(42));
+}
+
+#[test]
+fn round42_cancellation_during_green_validation_preserves_previous_revision() {
+    let mut cx = Cx::new();
+    assert_eq!(cx.sum(0), Ok(2));
+    let query = cx.sum.query_id(&0).unwrap();
+    let deps = cx.engine.dependencies(query);
+    cx.edit(0, 20);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cx.sum.get(&cx.engine, 0, &mut |_| panic!("validation must run first"), &|_| {
+            std::panic::resume_unwind(Box::new(crate::preempt::Preempted));
+        })
+    }));
+    assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
+    assert_eq!(cx.engine.color(query), DepNodeColor::Unknown);
+    assert_eq!(cx.engine.dependencies(query), deps);
+    assert_eq!(cx.sum(0), Ok(4));
+    assert_eq!(cx.sum_runs[0].load(Ordering::Relaxed), 2);
 }

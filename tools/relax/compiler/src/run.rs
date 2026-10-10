@@ -680,7 +680,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // RELAX_PERTURB: type ids shift (code must not depend on them; syms.rs reloc_sig)
     for i in 0..crate::syms::perturb(options) {
         let u8_ = tcx.tys.prim(crate::program::Prim::U8);
-        let _ = tcx.tys.intern(crate::types::TyKind::Array(u8_, 1000 + i));
+        let _ = tcx.tys.intern(crate::types::TyKind::Array(u8_, tcx.tys.const_usize(1000 + i)));
     }
     *ROOT_DIR.lock().unwrap() = format!("{} {}", g.crates[g.root].name, root_dir);
     crate::program::collect_misses_begin();
@@ -694,9 +694,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() {
             eprintln!("relax-deferred: signatures name types in {} skipped file(s): loaded before main", mods.len());
         }
+        let (f0, d0) = (prog.files.len() as u32, prog.defs.len());
         for m in mods {
             if let Err(e) = prog.load_deferred_module(m) { eprintln!("relax: loading a deferred module failed: {}", e); }
         }
+        prog.link_deferred_modules(f0, d0);
         tcx = crate::tcx::Tcx::new();
         crate::program::collect_misses_begin();
         tcx.collect(&prog);
@@ -710,6 +712,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
 
     if check {
+        // a check runs no program: a constant that cannot be evaluated is a reported error
+        // (E0080), as for `relax test` / `live`, not the end of the process
+        jit::COMPILE_ERRORS_FATAL.store(false, Ordering::Relaxed);
         crate::jit::compile_watch(Some(("check: own errors", 0)));
         let mut pre = crate::macro_reg::derive_failures();
         pre.extend(watch_load_errors);
@@ -724,7 +729,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 eprintln!("relax-run: --host-gen: no crate `{}` in the graph", name);
                 return 2;
             };
+            let errors = tcx.dcx.clone();
             let (text, rep) = crate::provided::host_gen(&prog, &tcx, k as u32);
+            errors.flush_delayed();
+            let (errors, warnings) = errors.drain_reported();
+            for warning in warnings { eprintln!("warning: {}", warning.message); }
+            if !errors.is_empty() {
+                for error in errors { eprintln!("{}", error.message); }
+                return 1;
+            }
             if let Err(e) = std::fs::write(out, text) {
                 eprintln!("relax-run: --host-gen: {}: {}", out, e);
                 return 2;
@@ -828,27 +841,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut u = Unit::new(prog, tcx, core);
     if let Some((saved_prog, saved_tcx, _)) = verification_graph {
         saved_prog.verify_collected(&u.prog);
-        // Re-evaluate persisted scalar constants through a fresh unit, before opening its
-        // code cache. This independently verifies generated lengths as well as type IDs.
-        let mut constants: Vec<_> = saved_tcx.const_values.snapshot().into_iter().collect();
-        let constant_count = constants.len();
-        constants.sort_by_key(|(d, _)| d.0);
-        if !constants.is_empty() {
-            // Preserve the collector's dependency order before demanding values that
-            // were first requested by bodies later in the saved run. Queuing every
-            // saved value at once makes that LIFO queue start with dependent lengths.
-            u.resolve_const_requests();
-        }
-        for (d, value) in constants {
-            if !u.tcx.const_values.contains_key(&d) {
-                u.tcx.const_requests.lock().unwrap().push(d);
-                u.resolve_const_requests();
-            }
-            assert_eq!(u.tcx.const_values.get(&d), Some(value),
-                "collected constant differs: {}", u.prog.def_path(d));
-        }
         saved_tcx.verify_collected(&saved_prog, &u.prog, &u.tcx);
-        eprintln!("relax-collected: verified restored graph against rebuilt graph and {} evaluated constants", constant_count);
+        eprintln!("relax-collected: verified restored graph against rebuilt graph");
+    }
+    let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
+    if !enum_errors.is_empty() {
+        for error in enum_errors { eprintln!("error: {}", error); }
+        return 1;
     }
     jit::set_program_args(prog_args);
     drop(mem_g);
@@ -943,6 +942,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
     start_exit_summary();
+    *RUN_DIAGNOSTICS.lock().unwrap() = Some(u.tcx.dcx.clone());
     unsafe { atexit(at_exit) };
     crate::jit::set_exit_hook(at_exit);
     start_monitor(runtime, options);
@@ -1264,6 +1264,7 @@ fn flush_errors(block: bool) {
         return;
     }
     let u = unsafe { &mut *up };
+    u.flush_query_errors(false);
     let seen = ERRORS_SEEN.load(Ordering::Relaxed) as usize;
     if !QUIET.load(Ordering::Relaxed) {
         for e in u.errors.iter().skip(seen) {
@@ -1600,6 +1601,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     });
 }
 
+static RUN_DIAGNOSTICS: std::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = std::sync::Mutex::new(None);
+
 extern "C" fn at_exit() {
     finish_run("exit", EXIT_SUMMARY.get().and_then(|exit| exit.code.get().copied()));
 }
@@ -1651,6 +1654,7 @@ fn start_exit_summary() {
         summary_inner(why);
         if got { jit::unlock_unit(); }
         EXIT_PERSIST.store(false, Ordering::SeqCst);
+        if let Some(dcx) = RUN_DIAGNOSTICS.lock().unwrap().as_ref() { dcx.flush_delayed(); }
         exit_mark("summary tail");
         exit_report();
     });
@@ -2272,6 +2276,7 @@ if !SILENT.load(Ordering::Relaxed) {         verbose!("relax-run: opt passes (cp
             let (kind, krate, generic) = match &f.key {
                 FnKey::Inst(d, args) => ("inst", u.prog.syms.str(u.prog.crates[u.prog.def(*d).krate as usize].name).to_string(), !args.is_empty()),
                 FnKey::Closure(..) => ("closure", "-".to_string(), false),
+                FnKey::Shim(_) => ("shim", "-".to_string(), true),
                 FnKey::Glue(g, _) => (if *g == jit::GLUE_DROP { "drop" } else { "glue" }, "-".to_string(), true),
                 FnKey::Sandbox(_) => ("sandbox", "-".to_string(), false),
             };
@@ -2386,7 +2391,7 @@ fn report_origin(u: &jit::Unit, key: &FnKey) -> (&'static str, String, String) {
             };
             (origin, tr, selfty)
         }
-        FnKey::Glue(..) | FnKey::Sandbox(_) => ("-", String::new(), String::new()),
+        FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => ("-", String::new(), String::new()),
     }
 }
 

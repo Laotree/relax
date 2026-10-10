@@ -1,3 +1,4 @@
+// ported from N:rustc_middle/src/dep_graph/graph.rs @8d1a764
 use super::{QueryError, QueryId};
 use crate::fxhash::{HashMap, HashSet};
 use crate::sip::Sip128;
@@ -38,7 +39,7 @@ pub enum DepNodeColor {
 }
 
 pub(super) struct Node {
-    pub query: QueryId,
+    pub query: Option<QueryId>,
     pub identity: DepNode,
     pub eval_always: bool,
     pub fingerprint: Option<Fingerprint>,
@@ -58,6 +59,7 @@ pub(super) struct DepGraph {
     pub indices: HashMap<QueryId, DepNodeIndex>,
     identities: HashMap<DepNode, DepNodeIndex>,
     live_edges: usize,
+    anon_node_to_index: HashMap<(u64, Vec<u32>), DepNodeIndex>,
 }
 
 impl DepGraph {
@@ -75,7 +77,7 @@ impl DepGraph {
         }
         let index = DepNodeIndex(u32::try_from(self.nodes.len()).expect("query node limit"));
         self.nodes.push(Node {
-            query,
+            query: Some(query),
             identity,
             eval_always,
             fingerprint: None,
@@ -88,6 +90,27 @@ impl DepGraph {
         self.indices.insert(query, index);
         self.identities.insert(identity, index);
         Ok(index)
+    }
+
+    /// graph.rs:432-481: one read reuses that node; other ordered read sets
+    /// are interned per session (a revision is Q1's incremental session).
+    pub fn intern_anon(&mut self, revision: u64, reads: &[u32]) -> DepNodeIndex {
+        if reads.len() == 1 { return DepNodeIndex(reads[0]); }
+        let key = (if reads.is_empty() { 0 } else { revision }, reads.to_vec());
+        if let Some(&index) = self.anon_node_to_index.get(&key) { return index; }
+        let index = DepNodeIndex(u32::try_from(self.nodes.len()).expect("query node limit"));
+        let mut hash = Sip128::new();
+        hash.write(&key.0.to_le_bytes());
+        for read in reads { hash.write(&read.to_le_bytes()); }
+        self.nodes.push(Node {
+            query: None,
+            identity: DepNode { kind: DepKind(0), key_fingerprint: Fingerprint(hash.finish128()) },
+            eval_always: false, fingerprint: None, verified_at: 0, changed_at: 0,
+            edges: 0..0, error: None, error_at: 0,
+        });
+        self.complete(index, revision, Fingerprint(0), reads);
+        self.anon_node_to_index.insert(key, index);
+        index
     }
 
     pub fn complete(&mut self, index: DepNodeIndex, revision: u64, fingerprint: Fingerprint, reads: &[u32]) {
@@ -180,6 +203,10 @@ fn with_context<R>(op: impl FnOnce(Option<&RefCell<TaskDeps>>) -> R) -> R {
     op(Some(unsafe { &*ptr.cast::<RefCell<TaskDeps>>() }))
 }
 
+pub(super) fn in_context(engine: u64) -> bool {
+    with_context(|frame| frame.is_some_and(|frame| frame.borrow().engine == engine))
+}
+
 pub(super) fn current_job(engine: u64) -> Option<DepNodeIndex> {
     with_context(|frame| {
         let task = frame?.borrow();
@@ -201,14 +228,13 @@ pub(super) fn read_index(engine: u64, index: DepNodeIndex, spare: &Mutex<Vec<Tas
 pub(super) struct TaskGuard<'a> {
     frame: &'a RefCell<TaskDeps>,
     previous: *const (),
-    collapse: bool,
     spare: &'a Mutex<Vec<TaskReads>>,
 }
 
 impl<'a> TaskGuard<'a> {
-    pub fn enter(frame: &'a RefCell<TaskDeps>, collapse: bool, spare: &'a Mutex<Vec<TaskReads>>) -> Self {
+    pub fn enter(frame: &'a RefCell<TaskDeps>, spare: &'a Mutex<Vec<TaskReads>>) -> Self {
         let previous = CONTEXT.replace((frame as *const RefCell<TaskDeps>).cast());
-        Self { frame, previous, collapse, spare }
+        Self { frame, previous, spare }
     }
 
     pub fn record(&self) {
@@ -223,14 +249,6 @@ impl<'a> TaskGuard<'a> {
 impl Drop for TaskGuard<'_> {
     fn drop(&mut self) {
         CONTEXT.set(self.previous);
-        if self.collapse {
-            with_context(|parent| {
-                if let Some(parent) = parent {
-                    let mut parent = parent.borrow_mut();
-                    for &read in self.frame.borrow().reads() { parent.read(read, self.spare); }
-                }
-            });
-        }
         let mut task = self.frame.borrow_mut();
         if !task.spill.reads.is_empty() {
             let mut spill = std::mem::take(&mut task.spill);

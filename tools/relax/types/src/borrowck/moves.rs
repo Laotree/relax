@@ -3,6 +3,8 @@
 //! rustc_borrowck check_if_full_path_is_moved / check_if_path_or_subpath_is_moved /
 //! check_if_assigned_path_is_moved / check_movable_place / check_access_permissions).
 
+use crate::types::AliasTyKind;
+use crate::types::{AliasTy};
 use super::bir::*;
 use super::diag::{describe_place, Diag};
 use super::tyx::Tx;
@@ -146,7 +148,7 @@ impl MoveData {
             let q = Place { local: p.local, proj: p.proj[..=i].to_vec() };
             if let (Proj::Subslice(from, to, false), TyKind::Array(_, len)) = (pr, tx.kind(t)) {
                 // the elements of an array subslice are its move paths
-                if crate::types::len_ty(len).is_none() {
+                if let Some(len) = len.try_to_target_usize(&tx.tcx.tys) {
                     let mut els = Vec::new();
                     for k in *from..*to {
                         let mut e = Place { local: p.local, proj: p.proj[..i].to_vec() };
@@ -561,7 +563,7 @@ impl<'a> MoveCheck<'a> {
                             TyKind::Ptr(..) => ("E0507", "a raw pointer"),
                             // a deref of a type this body does not know (an unnormalized
                             // associated type of a generic body): no verdict
-                            TyKind::Assoc(..) | TyKind::Param(_) | TyKind::Opaque(..) | TyKind::Error | TyKind::Infer(_) => return,
+                            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) | TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, .. }) | TyKind::Error | TyKind::Infer(_) => return,
                             _ => ("E0507", "a raw pointer"),
                         };
                         let upvar = self.upvar_of(&base).or_else(|| if base.local == 1 && base.proj == [Proj::Deref] { self.upvar_of(p) } else { None });
@@ -690,9 +692,7 @@ impl<'a> MoveCheck<'a> {
         let Proj::Subslice(from, to, false) = last else { return None };
         let bp = Place { local: p.local, proj: base.to_vec() };
         let TyKind::Array(_, len) = self.tx.kind(place_ty(self.tx, self.bir, &bp)) else { return None };
-        if crate::types::len_ty(len).is_some() {
-            return None;
-        }
+        let len = len.try_to_target_usize(&self.tx.tcx.tys)?;
         let mut els = Vec::new();
         for k in *from..*to {
             let mut e = bp.clone();

@@ -1,5 +1,6 @@
 //! Typed signature-to-BIR producer adapter, retained until C0b.
 //! Declaration identity (including unused parameters) precedes I/O traversal.
+use crate::types::{AliasTy, AliasTyKind};
 use super::{Rty, SigTmpl, SK_ELIDED, SK_FRESH, SK_NAMED, SK_PARAM, SR};
 use crate::borrowck::implied_bounds::ImpliedBounds;
 use crate::program::DefId;
@@ -24,7 +25,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     } else if let Some(t) = tcx.const_tys.get(&d) {
         (
             Vec::new(),
-            *t,
+            t,
             tcx.const_region_contracts
                 .get(&d)
                 .cloned()
@@ -34,8 +35,14 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     } else {
         return empty();
     };
+    // N:rustc_borrowck/src/implied_bounds.rs:42-62: these are the
+    // declaration's uninstantiated inputs/output, so normalize them under that
+    // declaration's ParamEnv, including its const-parameter type clauses.
+    let result = tcx.param_env(rty.tx.prog, d);
+    let param_env = result;
     let mut p = Projection {
         rty,
+        param_env: param_env.clone(),
         args,
         regions: Vec::new(),
         params: Vec::new(),
@@ -54,7 +61,8 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     let out = p.ty(output);
     let raw: Vec<_> = inputs.iter().copied().chain([output]).collect();
     let (mut assumed, normalized) = crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(
-        tcx,&rty.tx.cx,false,&contract.predicates,&raw,&contract.assumed_wf);
+        tcx,rty.tx.prog,d,rty.tx.cx.typing_env.mode,&param_env,false,&contract.predicates,&raw,&contract.assumed_wf)
+        .unwrap_or_else(|_| crate::borrowck::implied_bounds::query_failed(tcx,rty.tx.prog,d,&contract.predicates,&raw));
     assumed.instantiate_query_bounds(tcx,&[]);
     let implied = assumed
         .outlives
@@ -144,7 +152,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     }
     let self_ty = contract
         .self_ty
-        .map(|t| tcx.normalize(&rty.tx.cx, rty.tx.prog, tcx.tys.subst(t, args)));
+        .map(|t| rty.tx.normalize(tcx.tys.subst(t, args)));
     let self_slots = contract.self_ty.map(|t| p.ty(t)).unwrap_or_default();
     let trait_lts = contract
         .trait_regions
@@ -156,7 +164,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
         .iter()
         .map(|t| {
             let s = p.ty(*t);
-            let t = tcx.normalize(&rty.tx.cx, rty.tx.prog, tcx.tys.subst(*t, args));
+            let t = rty.tx.normalize(tcx.tys.subst(*t, args));
             Some((s, t))
         })
         .collect();
@@ -167,12 +175,12 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
             i.and_then(|i| {
                 args.get(i as usize).map(|t| {
                     let s = p.ty(tcx.tys.intern(TyKind::Param(i)));
-                    (s, tcx.normalize(&rty.tx.cx, rty.tx.prog, *t))
+                    (s, rty.tx.normalize(*t))
                 })
             })
         })
         .collect();
-    let proj_bounds = contract.predicates.iter().any(|p| matches!(p,OutlivesPredicate::Type(t,_) if matches!(tcx.tys.kind(*t),TyKind::Assoc(..))));
+    let proj_bounds = contract.predicates.iter().any(|p| matches!(p,OutlivesPredicate::Type(t,_) if matches!(tcx.tys.kind(*t),TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }))));
     SigTmpl {
         assumptions: assumed,
         universal: u,
@@ -226,6 +234,7 @@ fn empty() -> SigTmpl {
 
 struct Projection<'a, 'b> {
     rty: &'a Rty<'b>,
+    param_env: crate::next_solver::ParamEnv,
     args: &'a [TyId],
     regions: Vec<(RegionId, SR)>,
     params: Vec<(u32, Vec<SR>)>,
@@ -272,7 +281,7 @@ impl Projection<'_, '_> {
                 }
                 let n = self.args.get(i as usize).map_or(0, |t| {
                     self.rty
-                        .n_slots(tcx.normalize(&self.rty.tx.cx, self.rty.tx.prog, *t))
+                        .n_slots(self.rty.tx.normalize(*t))
                 });
                 let s: Vec<_> = (0..n).map(|_| self.fresh("'_", SK_PARAM)).collect();
                 self.params.push((i, s.clone()));
@@ -307,15 +316,15 @@ impl Projection<'_, '_> {
                 }
                 s
             }
-            TyKind::Assoc(..) => {
-                let n = tcx.normalize(&self.rty.tx.cx, self.rty.tx.prog, t);
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => {
+                let n = self.rty.tx.normalize_in_env(t, &self.param_env);
                 if n != t {
                     self.ty(n)
                 } else {
                     Vec::new()
                 }
             }
-            TyKind::Opaque(_, _, ts, _) => ts.into_iter().flat_map(|t| self.ty(t)).collect(),
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { .. }, args: ts, .. }) => ts.into_iter().flat_map(|t| self.ty(t)).collect(),
             // Nested function binders have no slots in the legacy body layout.
             TyKind::FnPtr(..) => Vec::new(),
             _ => Vec::new(),
@@ -385,6 +394,7 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
     let sig = *rty.closure_signatures.borrow().get(&ce)?;
     let mut p = Projection {
         rty,
+        param_env: rty.tx.param_env.borrow().clone(),
         args: &bir.args,
         regions: Vec::new(),
         params: Vec::new(),
@@ -423,8 +433,10 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
     t.cons = equality;
     t.tparam_names = u.contract.type_names.clone();
     let raw: Vec<_> = u.inputs.iter().copied().chain([u.output]).chain(u.implicit_input).collect();
+    let owner = bir.owner?;
     let (mut relations, _) = crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(
-        rty.tx.tcx,&rty.tx.cx,true,&u.contract.predicates,&raw,&u.contract.assumed_wf);
+        rty.tx.tcx,rty.tx.prog,rty.tx.obligation_owner.get(),rty.tx.cx.typing_env.mode,&rty.tx.param_env.borrow(),true,&u.contract.predicates,&raw,&u.contract.assumed_wf)
+        .unwrap_or_else(|_| crate::borrowck::implied_bounds::query_failed(rty.tx.tcx,rty.tx.prog,owner,&u.contract.predicates,&raw));
     // External ROOT query variables already have SR identities in this adapter.
     for &r in &u.query_placeholders { p.region(r,None); }
     relations.retain_instantiated_query_bounds(rty.tx.tcx,&u.query_placeholders);
@@ -458,7 +470,7 @@ mod tests {
     use super::*;
     use crate::{
         program::Program,
-        tcx::{Tcx, EvalCx, EvalState, TypingEnv},
+        tcx::{Tcx, EvalState, TypingEnv},
     };
 
     #[test]
@@ -544,11 +556,7 @@ mod tests {
         let isolated = ImpliedBounds::create(&tcx,&prog, &[], &[], &[], obligations.clone());
         assert_eq!(isolated.obligations, obligations);
         assert!(isolated.outlives.is_empty());
-        let alias = tcx.tys.intern(TyKind::Assoc(
-            def("output"),
-            vec![tcx.tys.intern(TyKind::Param(0))],
-            crate::types::RegionArgsId::EMPTY,
-        ));
+        let alias = tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: def("output") }, args: vec![tcx.tys.intern(TyKind::Param(0))], regions: crate::types::RegionArgsId::EMPTY }));
         let alias_rel = ImpliedBounds::create(
             &tcx, &prog,
             &[OutlivesPredicate::Type(alias, *a)],
@@ -564,11 +572,12 @@ mod tests {
         let normalized_only = ImpliedBounds::create(&tcx,&prog, &[], &[], &raw, Vec::new());
         assert!(normalized_only.outlives.contains(&(*a, st)));
         let state = EvalState::new();
-        let cx = EvalCx::new(&prog, TypingEnv::fully_monomorphized(), &state);
         let owner = def("parent");
-        let body = crate::typeck::check_fn_uncached(&cx, &prog, &tcx, owner, &[]);
+        // Borrowck consumes the definition-owned result; codegen instantiation
+        // erases the very closure regions this assertion inspects.
+        let body = tcx.typeck(&prog, owner);
         assert!(body.errors.is_empty(), "{:?}", body.errors);
-        let tx = crate::borrowck::tyx::Tx::new(&prog, &tcx, TypingEnv::fully_monomorphized(), &state);
+        let tx = crate::borrowck::tyx::Tx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
         let rty = Rty::new(&tx);
         *rty.closure_signatures.borrow_mut() = body.closure_sigs.clone();
         let inferred = body.closure_sigs[&body.closures[1]];
@@ -591,6 +600,61 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod round33_tests {
+    use super::*;
+    use crate::{program::Program, tcx::Tcx};
+
+    /// D7 / N:rustc_borrowck/src/implied_bounds.rs:59,95 + free_region_relations.rs:523-529:
+    /// a signature type that fails to normalize fails the whole query; the caller keeps the
+    /// declared predicates and the unnormalized signature and records a delayed bug.
+    #[test]
+    fn round33_implied_bounds_failure_fails_query() {
+        let source = br#"
+            #![no_std]
+            trait Tr { type A; }
+            fn good<'a, T: Tr>(x: &'a T, y: <T as Tr>::A) where T: 'a {}
+            fn bad<'a, T: 'a>(x: &'a T, y: <T as Tr>::A) {}
+        "#;
+        let dir = std::env::temp_dir().join(format!("relax-r33-ib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, source).unwrap();
+        let session = std::sync::Arc::new(crate::Session::default());
+        let mut prog = Program::new(&session);
+        prog.load_crate("r33ib", file.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(&session, &[]), Vec::new()).unwrap();
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let def = |n| (0..prog.defs.len() as u32).map(DefId).find(|&d| prog.name(d) == n).unwrap();
+        let query = |name| {
+            let d = def(name);
+            let u = SignatureRegions::function(&tcx, &prog, d).unwrap();
+            let raw: Vec<_> = u.inputs.iter().copied().chain([u.output]).collect();
+            let env = tcx.param_env(&prog, d);
+            (d, raw.clone(), u.contract.predicates.clone(), crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(
+                &tcx, &prog, d, crate::tcx::TypingMode::non_body_analysis(), &env, false, &u.contract.predicates, &raw, &u.contract.assumed_wf))
+        };
+        let (_, _, _, good) = query("good");
+        let (bounds, normalized) = good.expect("a normalizable signature");
+        assert_eq!(normalized.len(), 3);
+        assert!(!bounds.outlives.is_empty() || !bounds.type_outlives.is_empty());
+        let (d, raw, predicates, bad) = query("bad");
+        assert!(bad.is_err(), "an unprovable projection fails the query");
+        let (fallback, signature) = crate::borrowck::implied_bounds::query_failed(&tcx, &prog, d, &predicates, &raw);
+        assert_eq!(signature, raw, "the unnormalized signature");
+        let declared = ImpliedBounds::create(&tcx, &prog, &predicates, &[], &[], Vec::new());
+        assert_eq!(fallback.outlives, declared.outlives);
+        assert_eq!(fallback.type_outlives, declared.type_outlives, "only the declared predicates, no implied bounds");
+        // rustc_errors::DiagCtxt: delayed bugs flush at session end, and only
+        // become an ICE when the session has not reported an error.
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tcx.dcx.flush_delayed())).is_err());
+        let _ = crate::borrowck::implied_bounds::query_failed(&tcx, &prog, d, &predicates, &raw);
+        tcx.dcx.report(Default::default(), "E0277".into());
+        tcx.dcx.flush_delayed();
+    }
+}
+
 /// The free subset of a closure input; bound positions are local to its call.
 /// Nightly represents these as captured generic args. BIR carries slot indices.
 pub fn external_closure_input_slots(rty: &Rty<'_>, expr: u32, input: usize) -> Vec<usize> {
@@ -598,7 +662,7 @@ pub fn external_closure_input_slots(rty: &Rty<'_>, expr: u32, input: usize) -> V
     let Some(sig) = sigs.get(&expr) else { return vec![]; };
     let TyKind::FnPtr(ps, _, _, _) = rty.tx.tcx.tys.kind(sig.bound) else { return vec![]; };
     let Some(&ty) = ps.get(input) else { return vec![]; };
-    let mut projection = Projection { rty,args:&[],regions:vec![],params:vec![],names:vec![],kinds:vec![] };
+    let mut projection = Projection { rty,param_env:rty.tx.param_env.borrow().clone(),args:&[],regions:vec![],params:vec![],names:vec![],kinds:vec![] };
     let tys = &rty.tx.tcx.tys;
     let ty = crate::borrowck::universal_regions::with_erased_adt_regions(rty.tx.tcx, ty);
     let ty = tys.map_regions(ty,&|r,depth| match tys.region_kind(r) {

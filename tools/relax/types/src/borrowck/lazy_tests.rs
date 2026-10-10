@@ -58,7 +58,7 @@ impl FrontSource for TestFront {
     fn with_front(&self, f: &mut dyn FnMut(&Program, &Tcx, &crate::tcx::EvalCx<'_>)) -> bool {
         if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.block_call { self.entered.wait(); self.release.wait(); }
         let state = crate::tcx::EvalState::new();
-        f(&self.prog, &self.tcx, &crate::tcx::EvalCx::new(&self.prog, crate::tcx::TypingEnv::fully_monomorphized(), &state));
+        f(&self.prog, &self.tcx, &crate::tcx::EvalCx::new(&self.prog, &self.tcx, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), &state));
         true
     }
     fn quiet_ns(&self) -> u64 { self.quiet.load(Ordering::SeqCst) }
@@ -254,5 +254,30 @@ fn live_epoch_carries_verdicts_of_unreached_owners() {
     assert!(matches!(wait_verdict(&front, edited), FnVerdict::Errors(_)));
     assert!(matches!(wait_verdict(&front, queued), FnVerdict::Errors(_)));
     assert_eq!(CHECKED.load(Ordering::SeqCst) - checked0, 2, "the carried clean owner was checked again");
+    stop();
+}
+
+#[test]
+fn round42_cancelled_gandalf_check_has_no_persisted_verdict() {
+    if child("round42_cancelled_gandalf_check_has_no_persisted_verdict") { return; }
+    let front = TestFront::new(1);
+    let def = named(&front.prog, "clean");
+    let src: Arc<dyn FrontSource> = front.clone();
+    note_compiled(&front.prog.session.options, &src, NoteFn { def, args: Vec::new(), cache_key: Some(42), epoch: front.epoch(), rank: None, cached: None });
+    front.ungate();
+    front.entered.wait();
+    let writer = crate::preempt::WriterWaiting::new();
+    front.release.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while PREEMPTED.load(Ordering::Relaxed) == 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(verdict(front.identity(), def, &[], front.epoch()), FnVerdict::Pending);
+    assert!(take_verdict_keys().is_empty());
+    assert_eq!(CHECKED.load(Ordering::Relaxed), 0);
+    drop(writer);
+    assert_eq!(wait_verdict(&front, def), FnVerdict::Clean);
+    assert!(take_verdict_keys().contains(&(42, StoredVerdict::Clean)));
     stop();
 }

@@ -10,8 +10,7 @@ use crate::types::variance::xform;
 use crate::types::RegionArgsId;
 
 /// rustc_middle::traits::query::NoSolution: the types cannot be related.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NoSolution;
+pub use crate::next_solver::NoSolution;
 
 impl<'a> TypeChecker<'a> {
     /// Adds constraints so that `a R b` where R is `v`: Co `a <: b`, Inv `a == b`, Contra `a :> b`.
@@ -20,9 +19,9 @@ impl<'a> TypeChecker<'a> {
         NllTypeRelating::new(self, locations, category, UniverseInfo::RelateTys { expected: a, found: b }, v).relate(a, b)
     }
     /// Add constraints so that `a == b` argument-wise.
-    pub(super) fn eq_args(&mut self, a: &[TyId], b: &[TyId], locations: Locations, category: ConstraintCategory) -> Result<(), NoSolution> {
+    pub(super) fn eq_args(&mut self, a: &[GenericArg], b: &[GenericArg], locations: Locations, category: ConstraintCategory) -> Result<(), NoSolution> {
         let mut relating = NllTypeRelating::new(self, locations, category, UniverseInfo::Other, V::Inv);
-        for (&a, &b) in a.iter().zip(b) { relating.relate_with_variance(V::Inv, a, b)?; }
+        for (&a, &b) in a.iter().zip(b) { relating.arg(a, b)?; }
         Ok(())
     }
 }
@@ -202,11 +201,49 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
                 let generalized = self.type_checker.infcx.generalize_ty_var(a_vid, self.ambient_variance, b, span)?;
                 self.relate(generalized, b)
             }
-            (TyKind::Opaque(..), _) | (_, TyKind::Opaque(..)) => {
+            (TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { .. }, .. }), _) | (_, TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { .. }, .. })) => {
                 let tc = &mut *self.type_checker;
                 tc.infcx.relate_opaque(&mut tc.constraints, a, self.ambient_variance, b, self.locations, self.category)
             }
             _ => self.super_combine_tys(a, b),
+        }
+    }
+
+    fn arg(&mut self, a: GenericArg, b: GenericArg) -> Result<(), NoSolution> {
+        match (a, b) {
+            (GenericArg::Type(a), GenericArg::Type(b)) => self.relate_with_variance(V::Inv, a, b),
+            (GenericArg::Lifetime(a), GenericArg::Lifetime(b)) => { self.relate_regions_with_variance(V::Inv, a, b); Ok(()) }
+            (GenericArg::Const(a), GenericArg::Const(b)) => self.consts(a, b),
+            _ => Err(NoSolution),
+        }
+    }
+
+    // N:relate_tys.rs:477-487 and rustc_type_ir/src/relate.rs:552-633.
+    fn consts(&mut self, a: crate::consts::Const, b: crate::consts::Const) -> Result<(), NoSolution> {
+        use crate::consts::{ConstKind, ValTreeKind};
+        let tys = &self.tcx().tys;
+        let a = self.type_checker.infcx.shallow_resolve_const(a);
+        assert!(!a.has_non_region_infer(tys) && !b.has_non_region_infer(tys), "unexpected const inference in MIR typeck");
+        if a == b { return Ok(()); }
+        match (tys.const_kind(a), tys.const_kind(b)) {
+            (ConstKind::Error, _) | (_, ConstKind::Error) => { self.type_checker.tainted_by_errors = true; Ok(()) }
+            (ConstKind::Param(a), ConstKind::Param(b)) if a.index == b.index => Ok(()),
+            (ConstKind::Placeholder(a), ConstKind::Placeholder(b)) if a == b => Ok(()),
+            (ConstKind::Value(a), ConstKind::Value(b)) => match (a.valtree.kind(), b.valtree.kind()) {
+                (ValTreeKind::Leaf(a), ValTreeKind::Leaf(b)) if a == b => Ok(()),
+                (ValTreeKind::Branch(a), ValTreeKind::Branch(b)) if a.len() == b.len() => {
+                    for (&a, &b) in a.iter().zip(b.iter()) { self.consts(a, b)?; }
+                    Ok(())
+                }
+                _ => Err(NoSolution),
+            },
+            (ConstKind::Alias(ar, a), ConstKind::Alias(br, b)) => {
+                debug_assert_eq!(ar, br);
+                if a.kind != b.kind || a.args.len() != b.args.len() { return Err(NoSolution); }
+                for (&a, &b) in a.args.iter().zip(b.args.iter()) { self.arg(a, b)?; }
+                Ok(())
+            }
+            _ => Err(NoSolution),
         }
     }
 
@@ -297,9 +334,9 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
                 Ok(())
             }
             // All closure types of one expression are the same closure: equate all their regions.
-            (TyKind::Closure(af, ae, asig, acap, aown), TyKind::Closure(bf, be, bsig, bcap, bown)) if (af, ae) == (bf, be) => {
-                // ClosureArgs order: parent args (the owner), then the signature, then the upvars.
-                for (a, b) in [(aown, bown), (asig, bsig), (acap, bcap)] { self.relate_with_variance(V::Inv, a, b)?; }
+            (TyKind::Closure(af, ae, aa), TyKind::Closure(bf, be, ba)) if (af, ae) == (bf, be) => {
+                // ClosureArgs order: parent args, kind, signature, then upvars.
+                for (a, b) in [(aa.parent_args, ba.parent_args), (aa.closure_kind_ty, ba.closure_kind_ty), (aa.closure_sig_as_fn_ptr_ty, ba.closure_sig_as_fn_ptr_ty), (aa.tupled_upvars_ty, ba.tupled_upvars_ty)] { self.relate_with_variance(V::Inv, a, b)?; }
                 Ok(())
             }
             (TyKind::Ptr(am, at), TyKind::Ptr(bm, bt)) => {
@@ -313,15 +350,7 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
             }
             (TyKind::Array(at, alen), TyKind::Array(bt, blen)) => {
                 self.relate(at, bt)?;
-                match (len_ty(alen), len_ty(blen)) {
-                    (None, None) => if alen == blen { Ok(()) } else { Err(NoSolution) },
-                    (al, bl) => {
-                        let ca = al.unwrap_or_else(|| tys.intern(TyKind::ConstVal(alen)));
-                        let cb = bl.unwrap_or_else(|| tys.intern(TyKind::ConstVal(blen)));
-                        // Consts are related invariantly.
-                        self.relate_with_variance(V::Inv, ca, cb)
-                    }
-                }
+                self.consts(alen, blen)
             }
             (TyKind::Slice(at), TyKind::Slice(bt)) => self.relate(at, bt),
             (TyKind::Tuple(as_), TyKind::Tuple(bs)) => {
@@ -335,7 +364,10 @@ impl<'r, 'a> NllTypeRelating<'r, 'a> {
                 self.binders(&a_sig, &b_sig, &mut |this, a, b| this.fn_sigs(a, ah, b, bh))
             }
             // Rigid projections (normalization already failed to make progress).
-            (TyKind::Assoc(ad, ats, ars), TyKind::Assoc(bd, bts, brs)) if ad == bd => {
+            (TyKind::Const(a), TyKind::Const(b)) => self.consts(a, b),
+            (TyKind::Alias(ar, aa), TyKind::Alias(br, ba)) if ar == br && aa.kind == ba.kind => {
+                let (ats, ars, bts, brs) = (aa.args, aa.regions, ba.args, ba.regions);
+                if ats.len() != bts.len() || tys.region_args(ars).len() != tys.region_args(brs).len() { return Err(NoSolution); }
                 for (a, b) in ats.into_iter().zip(bts) { self.relate_with_variance(V::Inv, a, b)?; }
                 for (&a, &b) in tys.region_args(ars).iter().zip(tys.region_args(brs).iter()) { self.relate_regions_with_variance(V::Inv, a, b); }
                 Ok(())

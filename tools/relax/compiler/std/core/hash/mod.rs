@@ -9,7 +9,7 @@ pub use fast::{DefaultHasher, FastHasher, RandomState};
 
 use crate::marker::PhantomData;
 
-pub trait Hash {
+pub trait Hash: crate::marker::PointeeSized {
     fn hash<H: Hasher>(&self, state: &mut H);
 
     fn hash_slice<H: Hasher>(data: &[Self], state: &mut H)
@@ -344,13 +344,13 @@ impl<T: Hash> Hash for [T] {
     }
 }
 
-impl<'a, T: ?Sized + Hash> Hash for &'a T {
+impl<'a, T: ?Sized + crate::marker::PointeeSized + Hash> Hash for &'a T {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state);
     }
 }
 
-impl<'a, T: ?Sized + Hash> Hash for &'a mut T {
+impl<'a, T: ?Sized + crate::marker::PointeeSized + Hash> Hash for &'a mut T {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (**self).hash(state);
     }
@@ -358,13 +358,13 @@ impl<'a, T: ?Sized + Hash> Hash for &'a mut T {
 
 /// Pointers hash their address (fat pointers: address only; real core also hashes the
 /// metadata, which no client code observes).
-impl<T: ?Sized> Hash for *const T {
+impl<T: ?Sized + crate::marker::PointeeSized> Hash for *const T {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(*self as *const u8 as usize)
     }
 }
 
-impl<T: ?Sized> Hash for *mut T {
+impl<T: ?Sized + crate::marker::PointeeSized> Hash for *mut T {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_usize(*self as *const u8 as usize)
     }

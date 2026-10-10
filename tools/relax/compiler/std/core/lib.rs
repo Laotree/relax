@@ -7,6 +7,10 @@
 //! Files shared with the rustc shim (std/check) gate Relax-only items with
 //! `#[cfg(not(relax_check))]`.
 
+// rustc library/{core,alloc}/src/lib.rs: unsized FnOnce receivers need this
+// semantic feature even though Relax does not enforce nightly feature gates.
+#![feature(unsized_fn_params)]
+
 #[path = "intrinsics.rs"]
 mod intrinsic_decls;
 pub use intrinsic_decls::{intrinsics, intrinsics_atomic, intrinsics_int, intrinsics_mem, intrinsics_rt, intrinsics_vx};

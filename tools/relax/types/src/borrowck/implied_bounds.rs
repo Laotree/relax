@@ -1,5 +1,6 @@
 // ported from N:rustc_borrowck/src/implied_bounds.rs @8d1a764
 use crate::program::Program;
+use crate::types::{AliasTy, AliasTyKind};
 use crate::tcx::{outlives::OutlivesPredicate, Tcx};
 use crate::types::{RegionId, RegionKind, TyId, TyKind};
 
@@ -56,7 +57,7 @@ impl ImpliedBounds {
     fn components(&mut self, tcx: &Tcx, t: TyId, r: RegionId) {
         match tcx.tys.kind(t) {
             TyKind::Param(_) => self.type_outlives.push((t,r)),
-            TyKind::Assoc(..) | TyKind::Opaque(..) => {
+            TyKind::Alias(..) => {
                 // EscapingAlias components imply no bounds (nightly #25860).
                 if !tcx.tys.has_vars_bound_at_or_above(t,0) { self.type_outlives.push((t,r)); }
             }
@@ -87,7 +88,7 @@ impl ImpliedBounds {
             TyKind::Array(t, _) | TyKind::Slice(t) | TyKind::Ptr(_, t) => {
                 self.components(tcx, *t, r)
             }
-            TyKind::Closure(_, _, _, upvars, _) => self.components(tcx, *upvars, r),
+            TyKind::Closure(_, _, crate::types::ClosureArgs { tupled_upvars_ty: upvars, .. }) => self.components(tcx, *upvars, r),
             TyKind::Dyn(_, ts, bindings, rs, a, _, _) => {
                 for t in ts { self.components(tcx,*t,r); }
                 for (_,t,_) in bindings { self.components(tcx,*t,r); }
@@ -144,21 +145,21 @@ impl ImpliedBounds {
                 }
                 wf_args.extend(args);
             }
-            TyKind::Assoc(d,args,rs) => {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args, regions: rs }) => {
                 if let Some(contract) = tcx.nominal_region_contracts.get(d) {
                     let params: Vec<_> = contract.regions.iter().map(|p| p.1).collect();
                     self.nominal(tcx,contract,args,&params,*rs);
                 }
                 wf_args.extend(args);
             }
-            TyKind::Opaque(d,i,args,rs) => {
-                if let Some(decl) = tcx.opaques.get(&(*d,*i)) {
+            TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args, regions: rs }) => {
+                if let Some(decl) = tcx.opaques.get(d) {
                     let params: Vec<_> = decl.region_contract.regions.iter().map(|p| p.1).collect();
                     self.nominal(tcx,&decl.region_contract,args,&params,*rs);
                 }
                 wf_args.extend(args);
             }
-            TyKind::Closure(_,_,_,upvars,owner) => {
+            TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, tupled_upvars_ty: upvars, .. }) => {
                 if let TyKind::FnDef(d,args,rs) = tcx.tys.kind(*owner) {
                     if let Some(sig) = tcx.fn_item_sig(prog, *d) {
                         let params: Vec<_> = sig.generic_indices.lifetimes.iter()
@@ -281,34 +282,58 @@ pub fn instantiate(
 /// Implied bounds are computed outside a defining root's opaque scope; nested
 /// bodies retain the parent's environment. The normalized signature is returned
 /// together with the assumptions, as required for subsequent I/O equality.
+/// Normalization is the query's own (rustc_borrowck/src/implied_bounds.rs:27-118:
+/// `ocx.deeply_normalize` in a separate inference context); its region constraints are
+/// produced again by the body's renormalization through fully_perform_op (nll.rs). A
+/// region variable left in a result is erased, since this context's variables cannot
+/// leave it. A type that fails to normalize fails the whole query (implied_bounds.rs:59,95
+/// `.map_err(|_| NoSolution)?`); the caller then keeps only `predicates` and the
+/// unnormalized signature (free_region_relations.rs:523-529, see `query_failed`).
+/// A type `in_signature_binder` cannot place under the signature's binder stays
+/// unnormalized without failing (that is not a normalization result).
+#[allow(clippy::too_many_arguments)]
 pub fn mir_borrowck_implied_outlives_bounds(
-    tcx: &Tcx, cx: &crate::tcx::EvalCx<'_>, nested: bool, predicates: &[OutlivesPredicate],
-    inputs_and_output: &[TyId], assumed_wf: &[TyId],
-) -> (ImpliedBounds, Vec<TyId>) {
-    let typing_env = if nested { cx.typing_env } else { crate::tcx::TypingEnv {
-        param_env: cx.typing_env.param_env,
-        mode: crate::tcx::TypingMode::Analysis { defining_opaques: Default::default() },
-    } };
-    let query_cx = crate::tcx::EvalCx::new(cx.prog,typing_env,cx.state);
-    let mut bounds = ImpliedBounds::create(tcx,cx.prog,predicates,&[],&[],vec![]);
+    tcx: &Tcx, prog: &crate::program::Program, owner: crate::program::DefId, body_typing_mode: crate::tcx::TypingMode, param_env: &crate::next_solver::ParamEnv,
+    nested: bool, predicates: &[OutlivesPredicate], inputs_and_output: &[TyId], assumed_wf: &[TyId],
+) -> Result<(ImpliedBounds, Vec<TyId>), crate::next_solver::NoSolution> {
+    let typing_mode = if nested { body_typing_mode } else { crate::tcx::TypingMode::non_body_analysis() };
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, typing_mode, owner);
+
+    let mut ocx = crate::next_solver::fulfill::ObligationCtxt::new(&infcx, prog);
+    let erase_vars = |ty: TyId| tcx.tys.map_regions(ty, &|r, _| if matches!(tcx.tys.region_kind(r), RegionKind::ReVar(_)) { RegionId::ERASED } else { r }, 0);
+    let registered_since = |snapshot: usize| -> Vec<OutlivesPredicate> {
+        infcx.inner.borrow().region_obligations()[snapshot..].iter().map(|&(t, r)| OutlivesPredicate::Type(erase_vars(t), if matches!(tcx.tys.region_kind(r), RegionKind::ReVar(_)) { RegionId::ERASED } else { r })).collect()
+    };
+    let mut bounds = ImpliedBounds::create(tcx,prog,predicates,&[],&[],vec![]);
     let mut normalized_inputs_and_output = vec![];
+    let failed = std::cell::Cell::new(false);
     for &ty in inputs_and_output {
-        let snapshot = cx.state.registered_region_obligations.borrow().len();
-        let normalized_ty = tcx.normalize(&query_cx,cx.prog,ty);
-        bounds.implied_wf_args(tcx,cx.prog,vec![ty,normalized_ty]);
-        bounds.consider_implied_bounds_compat(tcx,cx.prog,normalized_ty,
-            &cx.state.registered_region_obligations.borrow()[snapshot..]);
+        let snapshot = infcx.inner.borrow().region_obligations().len();
+        let normalized_ty = crate::borrowck::tyx::with_foreign_region_vars(&infcx, ty, |ty| crate::borrowck::tyx::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
+        if failed.get() { return Err(crate::next_solver::NoSolution); }
+        bounds.implied_wf_args(tcx,prog,vec![ty,normalized_ty]);
+        bounds.consider_implied_bounds_compat(tcx,prog,normalized_ty,&registered_since(snapshot));
         normalized_inputs_and_output.push(normalized_ty);
     }
     for &ty in assumed_wf {
-        let normalized_ty = tcx.normalize(&query_cx,cx.prog,ty);
+        let normalized_ty = crate::borrowck::tyx::with_foreign_region_vars(&infcx, ty, |ty| crate::borrowck::tyx::in_signature_binder(&tcx.tys, ty, |ty| ocx.deeply_normalize_ty(param_env, ty).map_err(|_| failed.set(true)).ok())).unwrap_or(ty);
+        if failed.get() { return Err(crate::next_solver::NoSolution); }
         // Impl-header normalization obligations do not enter the compatibility rule.
-        let snapshot = cx.state.registered_region_obligations.borrow().len();
-        bounds.implied(tcx,cx.prog,normalized_ty);
-        bounds.consider_implied_bounds_compat(tcx,cx.prog,normalized_ty,
-            &cx.state.registered_region_obligations.borrow()[snapshot..]);
+        let snapshot = infcx.inner.borrow().region_obligations().len();
+        bounds.implied(tcx,prog,normalized_ty);
+        bounds.consider_implied_bounds_compat(tcx,prog,normalized_ty,&registered_since(snapshot));
     }
-    (bounds,normalized_inputs_and_output)
+    Ok((bounds,normalized_inputs_and_output))
+}
+
+/// free_region_relations.rs:523-529: the query failed -- a delayed bug (an error must
+/// have been reported for the signature), no implied bounds, the unnormalized signature.
+/// The declared outlives predicates are the ParamEnv's (added before the query there).
+pub fn query_failed(tcx: &Tcx, prog: &Program, body: crate::program::DefId,
+    predicates: &[OutlivesPredicate], inputs_and_output: &[TyId]) -> (ImpliedBounds, Vec<TyId>) {
+    tcx.dcx.delayed_bug(crate::next_solver::fulfill::ObligationCause { span: 0, body_id: body },
+        format!("error computing implied bounds {}", prog.def_path(body)));
+    (ImpliedBounds::create(tcx,prog,predicates,&[],&[],vec![]), inputs_and_output.to_vec())
 }
 pub fn implied_bounds_query_var_values(tcx: &Tcx, inputs_and_output: &[TyId], is_external_region: impl Fn(RegionId) -> bool) -> Vec<RegionId> {
     let values = std::cell::RefCell::new(vec![]);
