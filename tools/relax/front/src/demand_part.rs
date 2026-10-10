@@ -214,7 +214,7 @@ impl DemandPart {
             } else { None };
             part.scans.push((path, module, hash, scan, Codec::get(&mut r)?, Codec::get(&mut r)?));
         }
-        let strings = Vec::<String>::get(&mut r)?;
+        let strings = strings::read_table(&mut r)?;
         part.aliases = Pack::unpack(&mut r, &strings)?;
         part.dependencies = Pack::unpack(&mut r, &strings)?;
         // the same bytes as Vec<u8>::get, which decodes them one at a time

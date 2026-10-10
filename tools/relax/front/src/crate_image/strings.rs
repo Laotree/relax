@@ -58,26 +58,51 @@ impl Strings {
         id
     }
     pub fn put(&mut self, value: &str, w: &mut Vec<u8>) {
-        self.id_of(value).put(w);
+        put_var(w, self.id_of(value) as u64);
     }
-    /// The table as `Vec<String>` encodes it (count, then length + bytes each), then `body`.
+    /// The table (count, then length + bytes each, as LEB128 varints), then `body`.
     pub fn finish(self, body: Vec<u8>) -> Vec<u8> {
         let mut w = Vec::with_capacity(self.header_len() + body.len());
         self.write_header(&mut w);
         w.extend(body);
         w
     }
-    fn header_len(&self) -> usize { 4 + 4 * self.ends.len() + self.bytes.len() }
-    /// Appends the table (`Vec<String>`'s encoding) to `out`; the caller appends the body after it.
+    fn header_len(&self) -> usize { 4 + 2 * self.ends.len() + self.bytes.len() }
+    /// Appends the table to `out`; the caller appends the body after it.
     pub fn write_header(&self, out: &mut Vec<u8>) {
         out.reserve(self.header_len());
-        self.ends.len().put(out);
+        put_var(out, self.ends.len() as u64);
         for id in 0..self.ends.len() {
             let text = self.text(id);
-            text.len().put(out);
+            put_var(out, text.len() as u64);
             out.extend_from_slice(text);
         }
     }
+}
+
+/// LEB128: 7 bits per byte, low group first, the high bit marks a following byte.
+pub(crate) fn put_var(w: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 { w.push(value as u8 | 0x80); value >>= 7; }
+    w.push(value as u8);
+}
+pub(crate) fn get_var(r: &mut Decode<'_>) -> Option<u64> {
+    let (mut value, mut shift) = (0u64, 0u32);
+    loop {
+        let byte = r.take(1)?[0];
+        if shift > 63 { return None; }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 { return Some(value); }
+        shift += 7;
+    }
+}
+fn get_len(r: &mut Decode<'_>) -> Option<usize> {
+    u32::try_from(get_var(r)?).ok().map(|n| n as usize)
+}
+/// The payload's string table, as `Strings::write_header` wrote it.
+pub(crate) fn read_table(r: &mut Decode<'_>) -> Option<Vec<String>> {
+    let n = get_len(r)?;
+    if n > r.bytes.len() { return None; }
+    (0..n).map(|_| { let len = get_len(r)?; String::from_utf8(r.take(len)?.to_vec()).ok() }).collect()
 }
 
 pub(crate) trait Pack: Sized {
@@ -93,13 +118,13 @@ pub(crate) fn encode<T: Pack>(value: &T) -> Vec<u8> {
 }
 pub(crate) fn decode<T: Pack>(bytes: &[u8]) -> Option<T> {
     let mut r = Decode::new(bytes);
-    let strings = Vec::<String>::get(&mut r)?;
+    let strings = read_table(&mut r)?;
     let value = T::unpack(&mut r, &strings)?;
     r.bytes.is_empty().then_some(value)
 }
 impl Pack for String {
     fn pack(&self, w: &mut Vec<u8>, strings: &mut Strings) { strings.put(self, w); }
-    fn unpack(r: &mut Decode<'_>, strings: &[String]) -> Option<Self> { strings.get(usize::get(r)?).cloned() }
+    fn unpack(r: &mut Decode<'_>, strings: &[String]) -> Option<Self> { strings.get(get_len(r)?).cloned() }
     fn plain_size(&self) -> usize { 4 + self.len() }
 }
 macro_rules! scalar {
@@ -109,16 +134,21 @@ macro_rules! scalar {
         fn plain_size(&self) -> usize { std::mem::size_of::<Self>() }
     })*};
 }
-scalar!(bool, u8, u32, u128);
+scalar!(bool, u8, u128);
+impl Pack for u32 {
+    fn pack(&self, w: &mut Vec<u8>, _: &mut Strings) { put_var(w, u64::from(*self)); }
+    fn unpack(r: &mut Decode<'_>, _: &[String]) -> Option<Self> { u32::try_from(get_var(r)?).ok() }
+    fn plain_size(&self) -> usize { 4 }
+}
 impl Pack for usize {
-    fn pack(&self, w: &mut Vec<u8>, _: &mut Strings) { self.put(w); }
-    fn unpack(r: &mut Decode<'_>, _: &[String]) -> Option<Self> { Self::get(r) }
+    fn pack(&self, w: &mut Vec<u8>, _: &mut Strings) { put_var(w, *self as u64); }
+    fn unpack(r: &mut Decode<'_>, _: &[String]) -> Option<Self> { get_len(r) }
     fn plain_size(&self) -> usize { 4 }
 }
 impl<T: Pack> Pack for Vec<T> {
-    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { self.len().put(w); for value in self { value.pack(w, s); } }
+    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { put_var(w, self.len() as u64); for value in self { value.pack(w, s); } }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> {
-        let n = usize::get(r)?;
+        let n = get_len(r)?;
         if n > r.bytes.len() { return None; }
         (0..n).map(|_| T::unpack(r, s)).collect()
     }
@@ -135,12 +165,12 @@ impl<T: Pack> Pack for Arc<T> {
     fn plain_size(&self) -> usize { (**self).plain_size() }
 }
 impl<T: Pack + Ord> Pack for BTreeSet<T> {
-    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { self.len().put(w); for value in self { value.pack(w, s); } }
+    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { put_var(w, self.len() as u64); for value in self { value.pack(w, s); } }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> { Some(Vec::<T>::unpack(r, s)?.into_iter().collect()) }
     fn plain_size(&self) -> usize { 4 + self.iter().map(Pack::plain_size).sum::<usize>() }
 }
 impl<K: Pack + Ord, V: Pack> Pack for BTreeMap<K, V> {
-    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { self.len().put(w); for (k, v) in self { k.pack(w, s); v.pack(w, s); } }
+    fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) { put_var(w, self.len() as u64); for (k, v) in self { k.pack(w, s); v.pack(w, s); } }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> { Some(Vec::<(K, V)>::unpack(r, s)?.into_iter().collect()) }
     fn plain_size(&self) -> usize { 4 + self.iter().map(|(k, v)| k.plain_size() + v.plain_size()).sum::<usize>() }
 }
@@ -168,7 +198,7 @@ impl<K: Pack + Ord + std::hash::Hash, V: Pack> Pack for HashMap<K, V> {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {
         let mut entries = self.iter().collect::<Vec<_>>();
         entries.sort_by(|a, b| a.0.cmp(b.0));
-        entries.len().put(w);
+        put_var(w, entries.len() as u64);
         for (k, v) in entries { k.pack(w, s); v.pack(w, s); }
     }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> { Some(Vec::<(K, V)>::unpack(r, s)?.into_iter().collect()) }
@@ -177,7 +207,7 @@ impl<K: Pack + Ord + std::hash::Hash, V: Pack> Pack for HashMap<K, V> {
 impl<T: Pack + Ord + std::hash::Hash> Pack for crate::fxhash::HashSet<T> {
     fn pack(&self, w: &mut Vec<u8>, s: &mut Strings) {
         let mut entries = self.iter().collect::<Vec<_>>();
-        entries.sort(); entries.len().put(w);
+        entries.sort(); put_var(w, entries.len() as u64);
         for value in entries { value.pack(w, s); }
     }
     fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> { Some(Vec::<T>::unpack(r, s)?.into_iter().collect()) }
@@ -201,7 +231,7 @@ impl Pack for crate::macros::CrateMods {
 #[cfg(test)]
 mod tests {
     use super::*;
-    /// The table keeps first-use ids, finds repeats through growth, and encodes as the Vec<String> it replaced.
+    /// The table keeps first-use ids, finds repeats through growth, and reads back what it wrote.
     #[test]
     fn strings_table_matches_vec_encoding() {
         let mut strings = Strings::default();
@@ -217,8 +247,11 @@ mod tests {
             }
         }
         let bytes = strings.finish(w.clone());
-        let mut expect = super::super::encode(&order);
+        let mut expect = Vec::new();
+        put_var(&mut expect, order.len() as u64);
+        for text in &order { put_var(&mut expect, text.len() as u64); expect.extend_from_slice(text.as_bytes()); }
         expect.extend(w);
         assert_eq!(bytes, expect);
+        assert_eq!(read_table(&mut Decode::new(&bytes)).unwrap(), order);
     }
 }

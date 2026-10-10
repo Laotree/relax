@@ -1219,7 +1219,78 @@ struct BindingImage {
     sets: Vec<Vec<usize>>,
     entries: Vec<(usize, bool, usize, usize)>,
 }
-strings::fields!(BindingImage, strings, sets, entries);
+/// The spellings are in sorted order and a crate's bindings share long prefixes (`a::b::c`,
+/// `a::b::d`): each is stored as the length it shares with the one before and its remaining bytes,
+/// inline (they are most of a namespace's bytes and nothing else in the payload repeats them).
+/// Sets are sorted ascending local ids, entries ascend by spelling (local id): both are stored as
+/// varint differences, and an entry's `public` flag rides in the low bit of its targets set id.
+impl Pack for BindingImage {
+    fn pack(&self, w: &mut Vec<u8>, _: &mut strings::Strings) {
+        strings::put_var(w, self.strings.len() as u64);
+        let mut previous = "";
+        for text in &self.strings {
+            let shared = previous.bytes().zip(text.bytes()).take_while(|(a, b)| a == b).count();
+            strings::put_var(w, shared as u64);
+            strings::put_var(w, (text.len() - shared) as u64);
+            w.extend_from_slice(&text.as_bytes()[shared..]);
+            previous = text;
+        }
+        strings::put_var(w, self.sets.len() as u64);
+        for set in &self.sets {
+            strings::put_var(w, set.len() as u64);
+            let mut last = 0usize;
+            for &id in set { strings::put_var(w, zigzag(id as i64 - last as i64)); last = id; }
+        }
+        strings::put_var(w, self.entries.len() as u64);
+        let mut last = 0usize;
+        for &(name, public, targets, via) in &self.entries {
+            strings::put_var(w, zigzag(name as i64 - last as i64)); last = name;
+            strings::put_var(w, ((targets as u64) << 1) | u64::from(public));
+            strings::put_var(w, via as u64);
+        }
+    }
+    fn unpack(r: &mut Decode<'_>, s: &[String]) -> Option<Self> {
+        let n = usize::unpack(r, s)?;
+        if n > r.bytes.len() { return None; }
+        let mut strings: Vec<String> = Vec::with_capacity(n);
+        for _ in 0..n {
+            let shared = usize::unpack(r, s)?;
+            let rest = usize::unpack(r, s)?;
+            let mut bytes = Vec::with_capacity(shared + rest);
+            bytes.extend_from_slice(strings.last().map_or(&[][..], |p| p.as_bytes()).get(..shared)?);
+            bytes.extend_from_slice(r.take(rest)?);
+            strings.push(String::from_utf8(bytes).ok()?);
+        }
+        let n = usize::unpack(r, s)?;
+        if n > r.bytes.len() { return None; }
+        let mut sets = Vec::with_capacity(n);
+        for _ in 0..n {
+            let len = usize::unpack(r, s)?;
+            if len > r.bytes.len() { return None; }
+            let mut set = Vec::with_capacity(len);
+            let mut last = 0i64;
+            for _ in 0..len {
+                last += unzigzag(strings::get_var(r)?);
+                set.push(usize::try_from(last).ok()?);
+            }
+            sets.push(set);
+        }
+        let n = usize::unpack(r, s)?;
+        if n > r.bytes.len() { return None; }
+        let mut entries = Vec::with_capacity(n);
+        let mut last = 0i64;
+        for _ in 0..n {
+            last += unzigzag(strings::get_var(r)?);
+            let tagged = strings::get_var(r)?;
+            let via = usize::unpack(r, s)?;
+            entries.push((usize::try_from(last).ok()?, tagged & 1 == 1, usize::try_from(tagged >> 1).ok()?, via));
+        }
+        Some(Self { strings, sets, entries })
+    }
+    fn plain_size(&self) -> usize { self.strings.plain_size() + self.sets.plain_size() + self.entries.plain_size() }
+}
+fn zigzag(value: i64) -> u64 { ((value << 1) ^ (value >> 63)) as u64 }
+fn unzigzag(value: u64) -> i64 { (value >> 1) as i64 ^ -((value & 1) as i64) }
 impl BindingImage {
     fn capture(names: &Names, mut entries: Vec<usize>) -> Self {
         let mut referenced = entries.iter().copied().collect::<HashSet<_>>();
@@ -1612,5 +1683,28 @@ impl Names {
             self.bindings.values[id] = value;
         }
         self.finish_prepare();
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+    #[test]
+    fn binding_image_round_trips() {
+        let image = BindingImage {
+            strings: ["a", "a::b", "a::b::c", "core::fmt::Debug", "z", "\u{e9}::x", "\u{e8}::y", "\u{e9}::x::\u{20ac}", "a"].map(String::from).to_vec(),
+            sets: vec![vec![], vec![0], vec![1, 2, 4], vec![0, 3, 4]],
+            // ascending names plus an out-of-order and a repeated one: the codec must not assume order
+            entries: vec![(1, true, 2, 0), (2, false, 3, 1), (3, true, 0, 3), (1, false, 1, 2), (1, true, 3, 3)],
+        };
+        let bytes = strings::encode(&image);
+        let back: BindingImage = strings::decode(&bytes).unwrap();
+        assert_eq!(back.strings, image.strings);
+        assert_eq!(back.sets, image.sets);
+        assert_eq!(back.entries, image.entries);
+        assert!(back.valid());
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(strings::decode::<BindingImage>(&truncated).is_none());
     }
 }
