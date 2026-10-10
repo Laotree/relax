@@ -84,7 +84,7 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) -> Result<(),
         let here = crate::srchash::closure_hash(pkgs, root);
         if here == p.source {
             matched.push(p.name.clone());
-        } else if matches!(p.name.as_str(), "makepad_live_id" | "makepad_script" | "makepad_script_std" | "makepad_script_compute" | "makepad_script_census" | "makepad_tween_script" | "makepad_script_audio_aot") {
+        } else if matches!(p.name.as_str(), "makepad_live_id" | "makepad_script" | "makepad_script_std" | "makepad_script_compute" | "makepad_shader" | "makepad_tween_script" | "makepad_script_audio_aot") {
             matched.clear();
             return Err(format!("the Splash VM in this tree differs from the one built into relax: rebuild relax (cargo build --release -p relax) [{}: source {:016x}, loader {:016x}]", p.name, here, p.source));
         } else if !quiet {

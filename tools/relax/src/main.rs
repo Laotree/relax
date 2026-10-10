@@ -245,7 +245,7 @@ fn src(name: &str) -> u64 {
         "makepad_script" => env!("RELAX_SRC_makepad_script"),
         "makepad_script_std" => env!("RELAX_SRC_makepad_script_std"),
         "makepad_script_compute" => env!("RELAX_SRC_makepad_script_compute"),
-        "makepad_script_census" => env!("RELAX_SRC_makepad_script_census"),
+        "makepad_shader" => env!("RELAX_SRC_makepad_shader"),
         "makepad_tween_script" => env!("RELAX_SRC_makepad_tween_script"),
         "makepad_script_audio_aot" => env!("RELAX_SRC_makepad_script_audio_aot"),
         _ => panic!("unknown provided crate: {name}"),
@@ -276,8 +276,8 @@ fn provided() {
         relax_compiler::provided::register("makepad-script-compute", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_compute"));
     }
     {
-        use makepad_script_census::__host_shims as sh;
-        relax_compiler::provided::register("makepad-script-census", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_census"));
+        use makepad_shader::__host_shims as sh;
+        relax_compiler::provided::register("makepad-shader", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_shader"));
     }
     {
         use makepad_tween_script::__host_shims as sh;

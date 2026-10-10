@@ -16,63 +16,93 @@ pub unsafe extern "C" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize)
 }
 
 unsafe extern "C" fn s0(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Io>::buffer_index(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Big as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s1(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry as ::core::default::Default>::default() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Big as ::core::cmp::PartialEq<crate::Big>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s2(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Io as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::boom(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Io as ::core::cmp::PartialEq<crate::Io>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s4(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::len(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Io>::buffer_index(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s5(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::name_len(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Kind as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s6(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::new() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Kind as ::core::cmp::PartialEq<crate::Kind>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s7(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::P as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s8(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::big_make(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::P as ::core::cmp::PartialEq<crate::P>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s9(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::big_sum(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry as ::core::default::Default>::default() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s10(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::bound() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s11(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::drops() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::boom(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s12(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::flip(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::len(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s13(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::ios() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::name_len(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s14(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::maybe(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Registry>::new() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s15(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::mix(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _), std::ptr::read(*a.add(3) as *const _), std::ptr::read(*a.add(4) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Site as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s16(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::scale(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::Site as ::core::cmp::PartialEq<crate::Site>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s17(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::site(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s18(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::sum(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::big_make(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn s19(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::big_sum(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s20(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::bound() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s21(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::drops() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s22(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::flip(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s23(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::ios() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s24(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::maybe(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s25(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::mix(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _), std::ptr::read(*a.add(3) as *const _), std::ptr::read(*a.add(4) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s26(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::scale(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s27(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::site(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s28(a: *const *mut u8, r: *mut u8) -> u32 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::sum(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
+}
+unsafe extern "C" fn s29(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { crate::text_len(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 struct __RelaxHasher(*mut u8, unsafe extern "C-unwind" fn(*mut u8, *const u8, usize));
@@ -110,26 +140,36 @@ pub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[
 ];
 
 pub static SHIMS: &[(&str, u64, unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32)] = &[
-    ("<Io>::buffer_index", 0x47814df3a922bcc7, s0),
-    ("<Registry as core::default::Default>::default", 0x22bd663533d8a7c9, s1),
-    ("<Registry>::add", 0xe87b8dc752dfdc6a, s2),
-    ("<Registry>::boom", 0xc5fbe91c21f10c1f, s3),
-    ("<Registry>::len", 0x96b7ce765f1c3e4d, s4),
-    ("<Registry>::name_len", 0x1ba4af686d9b2f3f, s5),
-    ("<Registry>::new", 0x22bd663533d8a7c9, s6),
-    ("relax_provided_fixture::add", 0xcc6e0c8598a9738c, s7),
-    ("relax_provided_fixture::big_make", 0xae4a629f339761a5, s8),
-    ("relax_provided_fixture::big_sum", 0x8d816a3e42479415, s9),
-    ("relax_provided_fixture::bound", 0xb857519764db389e, s10),
-    ("relax_provided_fixture::drops", 0x158e877f4bb283d0, s11),
-    ("relax_provided_fixture::flip", 0xc37c64ef5af9ddac, s12),
-    ("relax_provided_fixture::ios", 0xd05a851161866524, s13),
-    ("relax_provided_fixture::maybe", 0x9f3cce8b2696ab13, s14),
-    ("relax_provided_fixture::mix", 0xfbfecbb4102caf1c, s15),
-    ("relax_provided_fixture::scale", 0x7c34295700034535, s16),
-    ("relax_provided_fixture::site", 0x19325a10efdccec2, s17),
-    ("relax_provided_fixture::sum", 0xb44bd1671e9f7607, s18),
-    ("relax_provided_fixture::text_len", 0x26a4b502d081d56b, s19),
+    ("<Big as core::clone::Clone>::clone", 0x1ca8aec37e7692da, s0),
+    ("<Big as core::cmp::PartialEq<Big>>::eq", 0xc9a664ec625b7792, s1),
+    ("<Io as core::clone::Clone>::clone", 0x03ff0c9b5afb2e70, s2),
+    ("<Io as core::cmp::PartialEq<Io>>::eq", 0xb3c8484cf7904b92, s3),
+    ("<Io>::buffer_index", 0x47814df3a922bcc7, s4),
+    ("<Kind as core::clone::Clone>::clone", 0xfa274304c18c0a70, s5),
+    ("<Kind as core::cmp::PartialEq<Kind>>::eq", 0x5113bac319fa3996, s6),
+    ("<P as core::clone::Clone>::clone", 0x9aa32c18276d7506, s7),
+    ("<P as core::cmp::PartialEq<P>>::eq", 0xcc967849d2d7dc1e, s8),
+    ("<Registry as core::default::Default>::default", 0x22bd663533d8a7c9, s9),
+    ("<Registry>::add", 0xe87b8dc752dfdc6a, s10),
+    ("<Registry>::boom", 0xc5fbe91c21f10c1f, s11),
+    ("<Registry>::len", 0x96b7ce765f1c3e4d, s12),
+    ("<Registry>::name_len", 0x1ba4af686d9b2f3f, s13),
+    ("<Registry>::new", 0x22bd663533d8a7c9, s14),
+    ("<Site as core::clone::Clone>::clone", 0xc98dc6abf71bd0fa, s15),
+    ("<Site as core::cmp::PartialEq<Site>>::eq", 0xdba7ea420882af7a, s16),
+    ("relax_provided_fixture::add", 0xcc6e0c8598a9738c, s17),
+    ("relax_provided_fixture::big_make", 0xae4a629f339761a5, s18),
+    ("relax_provided_fixture::big_sum", 0x8d816a3e42479415, s19),
+    ("relax_provided_fixture::bound", 0xb857519764db389e, s20),
+    ("relax_provided_fixture::drops", 0x158e877f4bb283d0, s21),
+    ("relax_provided_fixture::flip", 0xc37c64ef5af9ddac, s22),
+    ("relax_provided_fixture::ios", 0xd05a851161866524, s23),
+    ("relax_provided_fixture::maybe", 0x9f3cce8b2696ab13, s24),
+    ("relax_provided_fixture::mix", 0xfbfecbb4102caf1c, s25),
+    ("relax_provided_fixture::scale", 0x7c34295700034535, s26),
+    ("relax_provided_fixture::site", 0x19325a10efdccec2, s27),
+    ("relax_provided_fixture::sum", 0xb44bd1671e9f7607, s28),
+    ("relax_provided_fixture::text_len", 0x26a4b502d081d56b, s29),
     ("<relax_provided_fixture::Site as Clone>::clone", 0, v0),
     ("<relax_provided_fixture::Site as Fmt>::fmt_into", 0, v1),
     ("<relax_provided_fixture::Site as Hash>::hash_into", 0, v2),
