@@ -461,6 +461,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     crate::borrowck::event::set_app_scope(app_roots);
     let front_images = crate::cache::FrontImages::open(options);
     prog.record_front = front_images.is_some();
+    prog.front_sink = front_images.as_ref().and_then(|images| images.sink());
     if front_images.is_none() && (crate::preload::trace() || crate::memstat::enabled()) {
         verbose!("relax-front: 0 crates from crate images (0 files, no parse), {} crates parsed", pre.len());
     }
@@ -970,37 +971,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 u.cache = Some(Box::new(crate::cache::CacheCell::new(c)));
             }
             Err(e) => eprintln!("relax-cache: off ({})", e),
-        }
-    }
-    // files whose front image is in their crate's store: their arrays become slices of it
-    // (front.rs), before any worker reads them
-    if crate::front::enabled() {
-        if let Some(c) = u.cache.as_ref() {
-            let prog = &mut u.prog;
-            let paths = &prog.file_paths;
-            let crates_cfg: Vec<&crate::cfg::CfgSet> = prog.file_crate.iter().map(|&k| &prog.crates[k as usize].cfg).collect();
-            crate::program::without_std_shares(&mut prog.files, paths, |files| for i in 0..files.len() {
-                // Boot images already use a pinned mapping (and were verified at load). Do
-                // not fault the same front pages into the cache-open mapping a second time.
-                if files[i].src.is_mapped() { continue; }
-                let Some(path) = paths.get(i) else { continue };
-                let source_hash = files[i].source_hash(path);
-                if let Some(img) = c.front_image(path, source_hash) {
-                    // a file another holder still shares keeps its heap arrays
-                    match std::sync::Arc::get_mut(&mut files[i]) {
-                        Some(pf) => {
-                            if !crate::front::apply(path, pf, img) { continue; }
-                            let cfg = crates_cfg.get(i).copied();
-                            if let (Some(pimg), Some(cfg)) = (c.front_part_image(path, source_hash), cfg) {
-                                crate::front::apply_part(path, pf, pimg, cfg, false);
-                            }
-                        }
-                        None => {
-                            crate::front::SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
-                }
-            });
         }
     }
     phase("image", t);
@@ -1951,7 +1921,6 @@ fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
     let n = push_front_images(&u.prog, &mut c);
     c.record_front_crates(&u.prog);
     let written = match c.spill_take() {
-        Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().map(|_| ()),
         Some(s) => s.write().map(|_| ()),
         None => Ok(()),
     };
@@ -1959,17 +1928,17 @@ fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
     verbose!("relax-check: {} front images written ({:?}, graph {:?}) in {:.0} ms", n, written.err(), graph.err(), t.elapsed().as_secs_f64() * 1e3);
 }
 
+/// References to the images of the program's files (and their parts) that their crate stores
+/// do not have yet (front.rs: each image was written when its file or part was published);
+/// the count queued.
 fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
     let mut n = 0;
     for i in 0..prog.files.len() {
         let f = &prog.files[i];
         let (Some(path), Some(&krate)) = (prog.file_paths.get(i), prog.file_crate.get(i)) else { continue };
-        let want_part = f.lazy.is_some() && crate::front::has_part_image(f) && !f.part.get().map_or(false, |p| p.toks.is_mapped());
-        let source_hash = f.source_hash(path);
-        let (m, p) = c.reserve_front(krate, path, source_hash, !f.src.is_mapped(), want_part);
-        if m { c.push_front(krate, path, source_hash, false, f.clone()); }
-        if p { c.push_front(krate, path, source_hash, true, f.clone()); }
-        n += m as usize + p as usize;
+        let part = f.part.get().and_then(|p| p.image.as_ref());
+        if f.image.is_none() && part.is_none() { continue; }
+        n += c.push_front_refs(krate, path, f.source_hash(path), f.image.as_ref(), part);
     }
     n
 }
@@ -1988,8 +1957,6 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         return None;
     }
     let mut parts = [0f64; 3];
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let options = &session.options;
     let mut n_imgs = 0;
     // the files whose front images this write holds: the collected program below is recorded
     // only if no file was loaded since (its restore maps every file from these images)
@@ -2033,11 +2000,16 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     Some((held, spill))
     }) else { return None };
     let held1 = held.elapsed().as_secs_f64() * 1e3;
-    let (n, mut stores) = match spill {
-        Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().ok()?,
-        Some(s) => (s.write().ok()?, Vec::new()),
-        None => (0, Vec::new()),
+    let n = match spill {
+        Some(s) => s.write().ok()?,
+        None => 0,
     };
+    // the front images' line once the program presented (a process ended by its framework
+    // never prints the exit summary): files mapped, images not matching, arrays copied back
+    static FRONT_REPORTED: AtomicBool = AtomicBool::new(false);
+    if jit::FIRST_PRESENT.load(Ordering::Acquire) && !FRONT_REPORTED.swap(true, Ordering::Relaxed) {
+        if let Some(s) = crate::front::summary() { verbose!("{} (after the first present)", s); }
+    }
     let graph_ready = jit::FIRST_PRESENT.load(Ordering::Acquire)
         && crate::cache::Cache::flush_front_graphs().is_ok();
     // the collected program, once per run and only when the program is quiet (it is encoded
@@ -2063,7 +2035,6 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                         push_front_images(&u.prog, c);
                         c.record_front_crates(&u.prog);
                         let written = match c.spill_take() {
-                            Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().map(|(_, more)| stores.extend(more)).is_ok(),
                             Some(s) => s.write().is_ok(),
                             None => true,
                         };
@@ -2094,65 +2065,6 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         }
     }
     if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: mid write held the unit lock {:.1} ms (manifest to {:.1}, front images to {:.1}, crate records to {:.1}, then spill)", held1, parts[0], parts[1], parts[2]); }
-    if crate::cache::ColdFront::enabled(options) {
-        // Files map their front images in chunks of 128, each under the locks for a few ms,
-        // with the main thread let in between (all 1100 of a cold Calculator at once held
-        // them 65-170 ms right after the first present: a frame's lazy compile waited).
-        let (mut installed, mut next, mut tries, mut max_held) = (false, 0usize, 0, 0f64);
-        loop {
-            let (done, held) = crate::owner::call(crate::owner::Class::App, || {
-            let held = Instant::now();
-                let front_guard = jit::front_write();
-                let u = unsafe { &mut *up };
-                let mut done = false;
-                if let Some(c) = u.cache.as_mut() {
-                    if !installed { c.install_front_stores(std::mem::take(&mut stores)); installed = true; }
-                    // Lowering is excluded by the owner thread; ahead type checking and borrowck
-                    // use FRONT_RW (raw Program pointers, not file Arcs), so exclude them too.
-                    // Other users owning another Arc keep their heap arrays. The encoder's
-                    // Arcs were dropped by the writer before attempting exclusive access here.
-                    let prog = &mut u.prog;
-                    let end = (next + 128).min(prog.files.len());
-                    crate::program::without_std_shares(&mut prog.files, &prog.file_paths, |files| {
-                        for i in next..end.min(files.len()) {
-                            let file = &mut files[i];
-                            let Some(path) = prog.file_paths.get(i) else { continue };
-                            let source_hash = file.source_hash(path);
-                            let main = (!file.src.is_mapped()).then(|| c.front_image(path, source_hash)).flatten();
-                            let part = file.part.get().filter(|p| !p.toks.is_mapped()).and_then(|_| c.front_part_image(path, source_hash));
-                            if main.is_none() && part.is_none() { continue; }
-                            let Some(pf) = std::sync::Arc::get_mut(file) else {
-                                crate::front::SHARED.fetch_add(1, Ordering::Relaxed);
-                                continue;
-                            };
-                            if let Some(img) = main { crate::front::apply(path, pf, img); }
-                            if let (Some(img), Some(&k)) = (part, prog.file_crate.get(i)) {
-                                crate::front::swap_part(path, pf, img, &prog.crates[k as usize].cfg);
-                            }
-                        }
-                    });
-                    next = end;
-                    done = next >= prog.files.len();
-                } else if installed {
-                    done = true;
-                }
-                drop(front_guard);
-            (done, held)
-            });
-            max_held = max_held.max(held.elapsed().as_secs_f64() * 1e3);
-            if done { break; }
-            if !installed {
-                // the exit has the cache: retry a little later, a bounded number of times
-                tries += 1;
-                if tries >= 50 { break; }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
-            }
-            let t = Instant::now();
-            while crate::owner::main_waiting() && t.elapsed().as_millis() < 50 { std::thread::yield_now(); }
-        }
-        if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: front image install held the unit lock {:.1} ms at most", max_held); }
-    }
     // All temporary encoders and retired boot arrays are now outside compiler locks.
     crate::memstat::trim();
     Some((n, n_imgs))
@@ -2240,15 +2152,7 @@ fn summary_inner(why: &str) {
                 // front images of the files the store does not have yet (front.rs) and the crate
                 // records: a run quit before its first mid-run write has all of them left
                 if front_recordable() {
-                    for i in 0..u.prog.files.len() {
-                        let f = &u.prog.files[i];
-                        let (Some(path), Some(&krate)) = (u.prog.file_paths.get(i), u.prog.file_crate.get(i)) else { continue };
-                        let want_part = f.lazy.is_some() && crate::front::has_part_image(f) && !f.part.get().map_or(false, |p| p.toks.is_mapped());
-                        let source_hash = f.source_hash(path);
-                        let (m, p) = c.reserve_front(krate, path, source_hash, !f.src.is_mapped(), want_part);
-                        if m { c.push_front(krate, path, source_hash, false, f.clone()); }
-                        if p { c.push_front(krate, path, source_hash, true, f.clone()); }
-                    }
+                    push_front_images(&u.prog, c);
                     c.record_front_crates(&u.prog);
                 }
                 exit_mark("front images");

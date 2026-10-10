@@ -3742,6 +3742,28 @@ pub struct ParsedFile {
     pub part: std::sync::OnceLock<Box<FilePart>>,
     /// per item: (an impl's header, how many earlier impls of the file have that header)
     pub impl_heads: std::sync::OnceLock<Box<[(Box<[u8]>, u32)]>>,
+    /// Where the arrays above are mapped from (None: they are on the heap).
+    pub image: Option<ImageLoc>,
+    /// Writes this file's lazily parsed part as an image (ImageSink::part) before it is published.
+    pub sink: Option<std::sync::Arc<dyn ImageSink>>,
+}
+
+/// A written front image: the compiler's image store (its file name) and the entry's key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageLoc {
+    pub store: std::sync::Arc<str>,
+    pub key: u128,
+}
+
+/// Writes final front-end arrays as images and makes them slices of the mapping (the compiler's
+/// image store, cache/front_run.rs): a file at its publication (Program, before it is shared), a
+/// lazily parsed part before ParsedFile::part publishes it. Both are no-ops when the arrays do not
+/// qualify or the write fails (they stay on the heap).
+pub trait ImageSink: Send + Sync {
+    /// true: `pf`'s arrays are mapped now (`pf.image` set)
+    fn file(&self, path: &str, pf: &mut ParsedFile) -> bool;
+    /// `part`/`ast`: the file's first lazily parsed part, not yet published
+    fn part(&self, pf: &ParsedFile, part: &mut FilePart, ast: &mut Ast);
 }
 
 /// A file's LazyCtx (None: the load skipped no body). A restored collected image keeps it
@@ -3808,6 +3830,8 @@ pub struct FilePart {
     /// per skipped fn item, in item order: its body block and the body's arena ranges
     /// [expr lo, expr hi, pat lo, pat hi), or the body's parse error
     pub bodies: PartBodies,
+    /// Where the part's arrays (and its AST part's) are mapped from (None: on the heap).
+    pub image: Option<ImageLoc>,
 }
 
 /// FilePart::bodies: a parse's list, or a restored part image's rows
@@ -3936,9 +3960,20 @@ impl ParsedFile {
     /// source order: their expression/pattern IDs are a function of the file alone, so IDs that
     /// outlive a run (closure slot keys in the code cache) mean the same expression in the next
     /// one. (Per-item parsing in demand order numbered them differently in every run.)
+    /// A file with an image gets its part written and mapped (ImageSink::part) before the part
+    /// and its AST are published: readers never hold heap part arrays that later go away.
     pub fn part(&self, cfg: &crate::cfg::CfgSet) -> Option<&FilePart> {
         self.lazy.as_ref()?;
-        Some(self.part.get_or_init(|| Box::new(parse_part(self, cfg))))
+        Some(self.part.get_or_init(|| {
+            let (mut fp, mut ast) = parse_part(self, cfg);
+            if let (Some(sink), Some(_)) = (&self.sink, &self.image) {
+                sink.part(self, &mut fp, &mut ast);
+            }
+            let mut tail = &self.ast;
+            while let Some(next) = tail.part.get() { tail = next; }
+            assert!(tail.part.set(Box::new(ast)).is_ok());
+            Box::new(fp)
+        }))
     }
 
     /// The body a fn item's load skipped (`cfg`: the file's crate's): its block and its arena
@@ -4274,7 +4309,7 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
     };
     src.reserve_exact(ext.len());
     src.extend_from_slice(&ext);
-    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: exp_map.into(), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), token_input, sources, rules_exp: rules_exp.into(), body_origin: body_origin.into(), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new() };
+    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: exp_map.into(), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), token_input, sources, rules_exp: rules_exp.into(), body_origin: body_origin.into(), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), image: None, sink: None };
     pf.shrink();
     Ok((pf, used))
 }
@@ -4308,7 +4343,8 @@ pub static LAZY_PARSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::
 
 /// Parses every fn body `pf`'s load skipped (in item order) as the load would have: the same
 /// file context, built-in macros only (see Parser::body_outline), then cfg-strips them.
-pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> FilePart {
+/// The part and its AST (continuing the file's last AST part's ids); the caller publishes both.
+pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) {
     let sess = &cfg.session;
     let _mem = crate::memstat::tag(crate::memstat::Tag::ParseLazy);
     let ctx = pf.lazy.as_ref().expect("parse_part: the file skipped no body");
@@ -4401,7 +4437,6 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> FilePart {
     let (toks, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin) = (exact(p.toks.into_own()), exact(p.ext.into_own()),
         exact(p.exp_map.into_own()), exact(p.tok_origin.into_own()), exact(p.token_origins.into_own()), exact(p.rules_exp.into_own()), exact(p.body_origin.into_own()));
     ast.shrink();
-    assert!(ast_tail.part.set(Box::new(ast)).is_ok());
     if lazy_stats_on() {
         let why = crate::clock::TYS_ORIGIN.with(|o| o.get());
         let th = std::thread::current().name().unwrap_or("?").trim_end_matches(char::is_numeric).to_string();
@@ -4411,9 +4446,9 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> FilePart {
         LAZY_PARSED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     LAZY_PARSED[1].fetch_add(bodies.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    FilePart { src_base: (n_src + n_ext) as u32, tok_base: n_toks as u32, rules_base: n_rules as u32,
+    (FilePart { src_base: (n_src + n_ext) as u32, tok_base: n_toks as u32, rules_base: n_rules as u32,
         rules_exp: rules_exp.into(), body_origin: body_origin.into(),
-        next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map: exp_map.into(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), bodies: PartBodies::Parsed(bodies) }
+        next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map: exp_map.into(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), bodies: PartBodies::Parsed(bodies), image: None }, ast)
 }
 
 /// RELAX_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.

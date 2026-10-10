@@ -78,6 +78,47 @@ impl Bytes {
     }
 }
 
+/// `len` bytes of `file` at `off`, mapped read-only for the rest of the process (unix: the
+/// page cache's pages, nothing copied; elsewhere a copy). The file is never truncated below
+/// `off + len` while this process runs (store.rs RunStore: append-only).
+#[cfg(unix)]
+pub fn map_pinned(file: &std::fs::File, off: u64, len: usize) -> Option<&'static [u8]> {
+    use std::os::unix::io::AsRawFd;
+    extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+        fn getpagesize() -> i32;
+    }
+    if len == 0 {
+        return Some(&[]);
+    }
+    let page = unsafe { getpagesize() }.max(4096) as u64;
+    let base = off & !(page - 1);
+    let span = (off - base) as usize + len;
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    let p = unsafe { mmap(std::ptr::null_mut(), span, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), base as i64) };
+    if p.is_null() || p as isize == -1 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(p.add((off - base) as usize), len) })
+}
+
+#[cfg(not(unix))]
+pub fn map_pinned(file: &std::fs::File, off: u64, len: usize) -> Option<&'static [u8]> {
+    use std::os::windows::fs::FileExt;
+    // 8-byte aligned, as a store payload is
+    let mut words = vec![0u64; len.div_ceil(8)];
+    let buf = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, len) };
+    let mut at = 0;
+    while at < len {
+        let n = file.seek_read(&mut buf[at..], off + at as u64).ok()?;
+        if n == 0 { return None; }
+        at += n;
+    }
+    let words = Box::leak(words.into_boxed_slice());
+    Some(unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, len) })
+}
+
 /// Writes `image` to `dir/name` atomically: a fresh temp file (O_EXCL, 0600) in the same
 /// directory, then rename. A crash leaves at most a temp file, never a partial pack.
 pub fn write_atomic(dir: &Path, name: &str, image: &[u8]) -> std::io::Result<PathBuf> {
@@ -102,7 +143,7 @@ pub fn write_atomic_with(dir: &Path, name: &str, write: impl FnOnce(&mut std::fs
     Ok(dst)
 }
 
-fn nonce() -> u64 {
+pub(crate) fn nonce() -> u64 {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
     let mut h = crate::sip::Sip128::new();
     h.u64(t);

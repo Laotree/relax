@@ -11,8 +11,8 @@
 //! in (inlined bodies, nounwind answers, transitively) with their keys: it links only while
 //! those keys are unchanged. So an edit of one fn body recompiles that fn and the code that
 //! inlined it, not its crate and every crate above it. Code entries live in per-crate code
-//! stores named by the interface fingerprint; front images stay in the stores named by the
-//! crate fingerprint (front.rs).
+//! stores named by the interface fingerprint; front images in the run image stores
+//! (cache/front_run.rs), which the stores named by the crate fingerprint refer to (front.rs).
 //!
 //! RELAX_CACHE=on (default) | off | verify | readonly;
 //! The stores live in the workspace's `<target>/relax/cache` (dirs.rs; RELAX_CACHE_DIR replaces
@@ -40,6 +40,10 @@ use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{complete_identities_unit, ids_report_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};
 mod items;
 mod demand;
+mod front_run;
+pub use front_run::FrontSink;
+#[cfg(test)]
+use front_run::commit_runs;
 
 const KIND_CODE: u32 = 1;
 const KIND_DATA: u32 = 2;
@@ -121,8 +125,12 @@ fn dec_verdict(p: &[u8]) -> Option<StoredVerdict> {
 /// the slots a program's start installed, in order, with the code entries they linked (startup
 /// slot manifest; per program + features)
 const KIND_MANIFEST: u32 = 5;
-/// a file's front-end image (front.rs), keyed by its path
+/// a front-end image (front.rs): a file's in a run store (front_run.rs), a demand part's
+/// surface or definition in a crate store
 const KIND_FRONT: u32 = 6;
+/// a crate store's reference to a file's image in a run store (front_run.rs), keyed by the
+/// file's path and source (Cache::front_key / front_part_key)
+const KIND_FRONT_REF: u32 = 14;
 const KIND_FRONT_CRATE: u32 = 7;
 const KIND_FRONT_GRAPH: u32 = 8;
 const KIND_DEMAND_PART: u32 = 13;
@@ -250,42 +258,6 @@ pub struct CacheStats {
     pub ids_bg: u64,
 }
 
-/// Pending images keep their immutable parse alive, not an encoded copy. Each image's small
-/// generated sections exist only while that entry is written; array sections are borrowed.
-struct PendingEntry {
-    entry: NewEntry,
-    front: Option<(std::sync::Arc<crate::parser::ParsedFile>, bool)>,
-}
-impl std::ops::Deref for PendingEntry {
-    type Target = NewEntry;
-    fn deref(&self) -> &NewEntry { &self.entry }
-}
-impl From<NewEntry> for PendingEntry {
-    fn from(entry: NewEntry) -> Self { Self { entry, front: None } }
-}
-impl PendingEntry {
-    fn front(key: u128, file: std::sync::Arc<crate::parser::ParsedFile>, part: bool) -> Self {
-        Self { entry: NewEntry { key, kind: KIND_FRONT, payload: Vec::new() }, front: Some((file, part)) }
-    }
-}
-impl crate::store::Entry for PendingEntry {
-    fn key(&self) -> u128 { self.key }
-    fn kind(&self) -> u32 { self.kind }
-    fn write_payload(&self, out: &mut dyn std::io::Write) -> std::io::Result<()> {
-        if let Some((file, part)) = &self.front {
-            let image = if *part { crate::front::part_image(file).expect("reserved valid front part") } else { crate::front::image(file) };
-            crate::memstat::print_tag("cache image", crate::memstat::Tag::CacheStore);
-            image.write_to(out)?;
-            let count = if *part { &crate::front::PARTS_RECORDED } else { &crate::front::RECORDED_FILES };
-            count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            crate::front::RECORDED_BYTES.fetch_add(image.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            Ok(())
-        } else {
-            out.write_all(&self.payload)
-        }
-    }
-}
-
 /// Interior storage for the cache installed in a Unit. The owner thread protects
 /// every access. Linker borrows one operation at a time and holds only this cell's
 /// raw pointer across callbacks, which may recursively access the same cell.
@@ -348,7 +320,7 @@ pub struct Cache {
     crate_ident: Vec<u128>,
     /// build id + codegen configuration
     cfg: u128,
-    pending: Vec<(u32, PendingEntry)>,
+    pending: Vec<(u32, NewEntry)>,
     /// payload bytes in `pending` (spill_take: written out during the run past a threshold)
     pending_bytes: usize,
     pending_keys: HashSet<u128>,
@@ -758,7 +730,7 @@ impl Cache {
             }
             let si = c.stores.len() as u32;
             if mapped_index.is_none() { for (e, ix) in st.index.iter().enumerate() {
-                if ix.kind == KIND_FRONT || ix.kind == KIND_FRONT_CRATE {
+                if ix.kind == KIND_FRONT || ix.kind == KIND_FRONT_REF || ix.kind == KIND_FRONT_CRATE {
                     c.index.insert(ix.key, (si, e as u32));
                 }
             }
@@ -785,7 +757,7 @@ impl Cache {
             } else {
                 for (si, st) in c.stores.iter().enumerate() {
                     for (ei, e) in st.index.iter().enumerate() {
-                        if e.kind == KIND_FRONT || e.kind == KIND_FRONT_CRATE { c.index.insert(e.key, (si as u32, ei as u32)); }
+                        if e.kind == KIND_FRONT || e.kind == KIND_FRONT_REF || e.kind == KIND_FRONT_CRATE { c.index.insert(e.key, (si as u32, ei as u32)); }
                     }
                 }
             }
@@ -801,7 +773,7 @@ impl Cache {
             }
             let si = c.stores.len() as u32;
             for (e, ix) in st.index.iter().enumerate() {
-                if ix.kind != KIND_LEDGER && ix.kind != KIND_MANIFEST && ix.kind != KIND_FRONT && ix.kind != KIND_FRONT_CRATE {
+                if ix.kind != KIND_LEDGER && ix.kind != KIND_MANIFEST && ix.kind != KIND_FRONT && ix.kind != KIND_FRONT_REF && ix.kind != KIND_FRONT_CRATE {
                     c.index.insert(ix.key, (si, e as u32));
                 }
             }
@@ -845,89 +817,41 @@ impl Cache {
         h.finish128()
     }
 
-    /// The image of file `path`'s lazily parsed bodies (front.rs), if a run recorded it.
-    pub fn front_part_image(&self, path: &str, source_hash: u128) -> Option<&'static [u8]> {
-        self.front_entry(Self::front_part_key(path, source_hash))
-    }
-
-    pub fn has_front_part(&self, path: &str, source_hash: u128) -> bool {
-        let key = Self::front_part_key(path, source_hash);
-        self.has_index(&key) || self.pending_keys.contains(&key)
-    }
-
-    /// The front image of file `path` in this crate version's store (front.rs). The store stays
-    /// mapped for the rest of the process.
-    pub fn front_image(&self, path: &str, source_hash: u128) -> Option<&'static [u8]> {
-        self.front_entry(Self::front_key(path, source_hash))
-    }
-
-    fn front_entry(&self, key: u128) -> Option<&'static [u8]> {
-        let (p, e) = self.index_at(key)?;
-        let st = &self.stores[p as usize];
-        mapped_front_entry(st, e as usize, key)
-    }
-
-    /// Attach freshly committed front images without changing code-cache lookup policy.
-    pub fn install_front_stores(&mut self, stores: Vec<std::sync::Arc<Store>>) {
-        for st in stores {
-            let si = self.stores.len() as u32;
-            for (i, e) in st.index.iter().enumerate() {
-                if e.kind == KIND_FRONT {
-                    self.index.insert(e.key, (si, i as u32));
-                }
-            }
-            self.stores.push(st);
-        }
-    }
-
     pub fn has_code_entries(&self) -> bool {
         self.stores.iter().any(|s| s.index.iter().any(|e| e.kind == KIND_CODE))
     }
 
-    /// Whether the store has (or this run recorded) file `path`'s front image.
-    pub fn has_front(&self, path: &str, source_hash: u128) -> bool {
-        let key = Self::front_key(path, source_hash);
-        self.has_index(&key) || self.pending_keys.contains(&key)
-    }
-
     /// Image availability is local to the crate's store, even when another world already
     /// mapped the same source (the process-wide key index may point at that other store).
-    fn has_front_in_crate(&self, krate: u32, path: &str, source_hash: u128) -> bool {
-        self.has_front_key_in_crate(krate, Self::front_key(path, source_hash))
-    }
-
     fn has_front_key_in_crate(&self, krate: u32, key: u128) -> bool {
         let stored = self.stores.iter().any(|st| {
             self.crate_path.get(krate as usize) == Some(&st.path)
-                && st.index.binary_search_by_key(&key, |e| e.key).ok().is_some_and(|i| st.index[i].kind == KIND_FRONT)
+                && st.index.binary_search_by_key(&key, |e| e.key).ok().is_some_and(|i| st.index[i].kind == KIND_FRONT_REF)
         });
-        stored || self.pending.iter().any(|(c, e)| *c == krate && e.key == key && e.kind == KIND_FRONT)
+        stored || self.pending.iter().any(|(c, e)| *c == krate && e.key == key && e.kind == KIND_FRONT_REF)
     }
 
-    /// Reserves the keys of file `path`'s front images that are neither stored nor pending:
-    /// (main, part) -- `push_front` retains the parse for encoding off the unit.
-    pub fn reserve_front(&mut self, krate: u32, path: &str, source_hash: u128, main: bool, part: bool) -> (bool, bool) {
-        // only the program's crates as the cache opened: run-time modules (sandboxed or not)
-        // never write into the program's stores
+    /// Queues references to file `path`'s images (`main`, `part`: where they are) for crate
+    /// `krate`'s store unless it has them or they are queued; the number queued. Per crate, as
+    /// record_front_crates and the crate images read them: a file two crates load (a lib's and
+    /// its bin's `mod x;`) needs a reference in each store, also when the lazy selection loaded
+    /// one copy after boot (restore_collected reads the file's own crate's store). Only the
+    /// program's crates as the cache opened: run-time modules (sandboxed or not) never write
+    /// into the program's stores.
+    pub fn push_front_refs(&mut self, krate: u32, path: &str, source_hash: u128, main: Option<&crate::parser::ImageLoc>, part: Option<&crate::parser::ImageLoc>) -> usize {
         if self.mode == Mode::ReadOnly || krate as usize >= self.crate_path.len() {
-            return (false, false);
+            return 0;
         }
-        // per crate, as record_front_crates and the crate images read them: a file two crates
-        // load (a lib's and its bin's `mod x;`) needs an image in each store, also when the
-        // lazy selection loaded one copy after boot (restore_collected reads the file's own
-        // crate's store)
-        let (km, kp) = (Self::front_key(path, source_hash), Self::front_part_key(path, source_hash));
-        let m = main && !self.front_reserved.contains(&(krate, km)) && !self.has_front_key_in_crate(krate, km) && self.front_reserved.insert((krate, km));
-        let p = part && !self.front_reserved.contains(&(krate, kp)) && !self.has_front_key_in_crate(krate, kp) && self.front_reserved.insert((krate, kp));
-        if m { self.pending_keys.insert(km); }
-        if p { self.pending_keys.insert(kp); }
-        (m, p)
-    }
-
-    /// A reserved front image, encoded directly into the next store write.
-    pub fn push_front(&mut self, krate: u32, path: &str, source_hash: u128, part: bool, file: std::sync::Arc<crate::parser::ParsedFile>) {
-        let key = if part { Self::front_part_key(path, source_hash) } else { Self::front_key(path, source_hash) };
-        self.pending.push((krate, PendingEntry::front(key, file, part)));
+        let mut n = 0;
+        for (key, loc) in [(Self::front_key(path, source_hash), main), (Self::front_part_key(path, source_hash), part)] {
+            let Some(loc) = loc else { continue };
+            if self.front_reserved.contains(&(krate, key)) || self.has_front_key_in_crate(krate, key) { continue; }
+            self.front_reserved.insert((krate, key));
+            self.pending_keys.insert(key);
+            self.push_pending(krate, NewEntry { key, kind: KIND_FRONT_REF, payload: front_run::encode_ref(loc) });
+            n += 1;
+        }
+        n
     }
 
     fn index_at(&self, key: u128) -> Option<(u32, u32)> {
@@ -968,13 +892,14 @@ impl Cache {
         }
         let pending = std::mem::take(&mut self.pending);
         self.pending_bytes = 0;
+        let marks = front_run::run_marks();
         let mut files = Vec::new();
         for ((c, front), entries) in by_store(pending) {
             let Some((path, stale)) = self.store_of(c, front) else { continue };
             let stale = std::mem::replace(stale, false);
             files.push((path, stale, entries));
         }
-        Some(Spill { dir: self.dir.clone(), files })
+        Some(Spill { dir: self.dir.clone(), files, marks })
     }
 
     // ------------------------------------------------------------ stable identities
@@ -2440,6 +2365,8 @@ impl Cache {
         self.pending_bytes = 0;
         self.pending_keys.clear();
         let n = pending.len();
+        // the images the references among `pending` name, written by now
+        let marks = front_run::run_marks();
         let late = crate::sip::late_inputs();
         pack::ensure_private_dir(&self.dir)?;
         let _io = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
@@ -2459,7 +2386,7 @@ impl Cache {
                 e.u128(*h);
             }
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
-            crate::store::append(&path, entries, stale).map_err(|e| format!("{}: {}", path.display(), e))?;
+            append_store(&path, entries, stale, &marks)?;
         }
         if let Some(root) = self.dir.parent() {
             prune_root(root);
@@ -2470,12 +2397,12 @@ impl Cache {
 
 /// Pending entries by the store they go to: (crate, front store) -- front images to the crate's
 /// front store, everything else to its code store.
-fn by_store(pending: Vec<(u32, PendingEntry)>) -> HashMap<(u32, bool), Vec<PendingEntry>> {
-    let mut by: HashMap<(u32, bool), Vec<PendingEntry>> = HashMap::new();
+fn by_store(pending: Vec<(u32, NewEntry)>) -> HashMap<(u32, bool), Vec<NewEntry>> {
+    let mut by: HashMap<(u32, bool), Vec<NewEntry>> = HashMap::new();
     // Records arrive oldest first; store::append keeps the first entry for a duplicate key.
     // A later O3/retier must win over O1/O2 recorded in the same spill or exit flush.
     for (c, e) in pending.into_iter().rev() {
-        let front = e.kind == KIND_FRONT || e.kind == KIND_FRONT_CRATE;
+        let front = e.kind == KIND_FRONT || e.kind == KIND_FRONT_REF || e.kind == KIND_FRONT_CRATE;
         by.entry((c, front)).or_default().push(e);
     }
     by
@@ -2495,7 +2422,17 @@ impl Cache {
 /// Entries taken out of a running cache (Cache::spill_take), written off the unit.
 pub struct Spill {
     dir: PathBuf,
-    files: Vec<(PathBuf, bool, Vec<PendingEntry>)>,
+    files: Vec<(PathBuf, bool, Vec<NewEntry>)>,
+    /// the images their references name, written by the time they were taken
+    marks: front_run::RunMarks,
+}
+
+/// store::append for the crate and code stores: the run-store images any reference among
+/// `entries` names (written by the time `marks` was taken) are committed first, so another
+/// process never finds a reference to an image it cannot read.
+fn append_store(path: &std::path::Path, entries: Vec<NewEntry>, stale: bool, marks: &front_run::RunMarks) -> Result<(), String> {
+    if entries.iter().any(|e| e.kind == KIND_FRONT_REF) { front_run::commit_marks(marks)?; }
+    crate::store::append(path, entries, stale).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
 /// Spills/flushes exclude all writers. Cold writers share the gate only while holding
@@ -2515,15 +2452,6 @@ fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<(
 }
 
 impl Spill {
-    /// Open the new committed files off the unit. Old mappings stay pinned.
-    pub fn write_mapped(self) -> Result<(usize, Vec<std::sync::Arc<Store>>), String> {
-        let paths: Vec<_> = self.files.iter().filter(|(_, _, es)| es.iter().any(|e| e.kind == KIND_FRONT))
-            .map(|(p, _, _)| p.clone()).collect();
-        let n = self.write()?;
-        let stores = paths.iter().filter_map(|p| Store::open(p).map(std::sync::Arc::new)).collect();
-        Ok((n, stores))
-    }
-
     pub fn write(self) -> Result<usize, String> {
         let _g = SPILL_IO.write().unwrap_or_else(|e| e.into_inner());
         let late = crate::sip::late_inputs();
@@ -2548,7 +2476,7 @@ impl Spill {
             }
             n += entries.len();
             entries.insert(0, NewEntry { key: LEDGER_KEY, kind: KIND_LEDGER, payload: e.0 }.into());
-            crate::store::append(&path, entries, stale).map_err(|e| format!("{}: {}", path.display(), e))?;
+            append_store(&path, entries, stale, &self.marks)?;
         }
         Ok(n)
     }
@@ -3394,6 +3322,8 @@ pub struct FrontImages {
     retained: std::sync::Mutex<Vec<(String, u128)>>,
     // A failed collected restore must hand its completed plan to ordinary preload.
     pending_plan: std::sync::Mutex<Option<(u128, std::sync::Arc<crate::preload::DemandPlan>)>>,
+    /// writes the images of the files this run parses (None: a read-only cache)
+    sink: Option<std::sync::Arc<FrontSink>>,
 }
 impl FrontImages {
     pub fn open(options: &crate::options::Options) -> Option<Self> {
@@ -3404,7 +3334,12 @@ impl FrontImages {
         pack::ensure_private_dir(&root).ok()?;
         let dir = root.join("cache");
         pack::ensure_private_dir(&dir).ok()?;
-        Some(Self { dir, ..Default::default() })
+        let sink = ColdFront::enabled(options).then(|| FrontSink::for_dir(&dir));
+        Some(Self { dir, sink, ..Default::default() })
+    }
+    /// What writes the images of the files and parts a program parses (Program::front_sink).
+    pub fn sink(&self) -> Option<std::sync::Arc<dyn crate::parser::ImageSink>> {
+        self.sink.clone().map(|s| s as std::sync::Arc<dyn crate::parser::ImageSink>)
     }
     fn input_current(&self, path: &str, expected: u128) -> bool {
         self.memo_input_hash(path) == Some(expected)
@@ -3536,32 +3471,26 @@ impl FrontImages {
                     }
                     if let Some(ix) = ix {
                         let (kind, _) = st.get_at(ix, key)?;
-                        if kind != KIND_FRONT {
+                        if kind != KIND_FRONT_REF {
                             return None;
                         }
                         entries.insert(key, ix);
                     }
                 }
             }
-            FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
-            FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).extend(entries.values().map(|&ix| (st.clone(), ix)));
-            let mapped = |key| -> Option<&'static [u8]> {
-                let (kind, b) = st.get_at(*entries.get(&key)?, key)?;
-                if kind != KIND_FRONT {
-                    return None;
-                }
-                // SAFETY: FRONT_STORES owns this immutable mapping for the process lifetime.
-                Some(unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) })
-            };
+            let mapped = |key| front_file_entry(&st, *entries.get(&key)?, key);
             why.set("file image restore");
             let mut files = Vec::new();
             for mut f in rec.files.drain(..) {
-                let img = mapped(Cache::front_key(&f.path, f.hash))?;
+                let (loc, img) = mapped(Cache::front_key(&f.path, f.hash))?;
                 let mut pf = crate::front::restore(&mut f, img)?;
-                if let Some(part) = mapped(Cache::front_part_key(&f.path, f.hash)) {
+                pf.image = Some(loc);
+                pf.sink = self.sink();
+                if let Some((loc, part)) = mapped(Cache::front_part_key(&f.path, f.hash)) {
                     if !crate::front::apply_part(&f.path, &mut pf, part, &c.cfg, false) {
                         return None;
                     }
+                    pf.part.get_mut()?.image = Some(loc);
                 }
                 if f.prep.idents.iter().any(|&(lo, hi)| lo > hi || hi as usize > pf.src.len()) {
                     return None;
@@ -3871,18 +3800,8 @@ impl Cache {
                 for (_, i, _) in prog.front_files.iter().filter(|(k, _, _)| *k as usize == ci) {
                     let f = &prog.files[*i];
                     let path = &prog.file_paths[*i];
-                    let hash = f.source_hash(path);
-                    if !self.has_front_in_crate(ci as u32, path, hash) {
-                        self.pending_keys.insert(Self::front_key(path, hash));
-                        self.push_front(ci as u32, path, hash, false, f.clone());
-                    }
-                    let key = Self::front_part_key(path, hash);
-                    if !self.has_front_key_in_crate(ci as u32, key) {
-                        if crate::front::has_part_image(f) {
-                            self.pending_keys.insert(key);
-                            self.push_front(ci as u32, path, hash, true, f.clone());
-                        }
-                    }
+                    let part = f.part.get().and_then(|p| p.image.as_ref());
+                    self.push_front_refs(ci as u32, path, f.source_hash(path), f.image.as_ref(), part);
                 }
                 self.pending_keys.insert(key);
                 self.push_pending(ci as u32, NewEntry { key, kind: KIND_FRONT_CRATE, payload: crate::crate_image::encode(&rec) });
@@ -3896,9 +3815,9 @@ fn front_record(prog: &crate::program::Program, ci: usize, fingerprint: impl Fn(
     front_record_from(&FrontRecordView::new(prog, ci, fingerprint)?)
 }
 
-/// A completed crate's immutable inputs, independent of Program's growing vectors.
-/// Copy only metadata; parsed source/AST arrays stay Arc-shared until finish joins the
-/// writers. Freeze the shared input ledgers now, not when a worker eventually runs.
+/// A completed crate's immutable inputs, independent of Program's growing vectors: metadata
+/// and where its files' images are, no parsed arrays. Freeze the shared input ledgers now,
+/// not when a worker eventually runs.
 struct FrontRecordView {
     session: std::sync::Arc<crate::Session>,
     name: String,
@@ -3919,8 +3838,11 @@ struct FrontRecordView {
 struct FrontRecordFile {
     index: usize,
     path: String,
-    parsed: std::sync::Arc<crate::parser::ParsedFile>,
+    hash: u128,
     fragment: bool,
+    /// the file's image and its lazily parsed part's (None: on the heap)
+    image: Option<crate::parser::ImageLoc>,
+    part: Option<crate::parser::ImageLoc>,
 }
 
 impl FrontRecordView {
@@ -3944,8 +3866,12 @@ impl FrontRecordView {
             ahead: prog.front_ahead.get(ci).cloned().unwrap_or_default(),
             probes: prog.front_probes.get(ci).cloned().unwrap_or_default(),
             metadata: prog.front_files.iter().filter(|(k, _, _)| *k as usize == ci).map(|(_, i, b)| (*i, b.clone())).collect(),
-            files: prog.file_crate.iter().enumerate().filter(|(_, k)| **k as usize == ci).map(|(i, _)| FrontRecordFile {
-                index: i, path: prog.file_paths[i].clone(), parsed: prog.files[i].clone(), fragment: prog.front_macro_fragments.contains(&i),
+            files: prog.file_crate.iter().enumerate().filter(|(_, k)| **k as usize == ci).map(|(i, _)| {
+                let f = &prog.files[i];
+                FrontRecordFile {
+                    index: i, path: prog.file_paths[i].clone(), hash: f.source_hash(&prog.file_paths[i]), fragment: prog.front_macro_fragments.contains(&i),
+                    image: f.image.clone(), part: f.part.get().and_then(|p| p.image.clone()),
+                }
             }).collect(),
             deps, dep_fps, fingerprint: fingerprint(ci), selection_hash: c.context.fingerprint(),
         })
@@ -3972,7 +3898,7 @@ fn front_record_from(prog: &FrontRecordView) -> Option<crate::crate_image::Recor
         };
         let loaded = prog.files.binary_search_by_key(i, |f| f.index).ok().map(|j| &prog.files[j]);
         if loaded.map(|f| &f.path) != Some(&f.path)
-            || loaded.map(|pf| pf.parsed.source_hash(&f.path)) != Some(f.hash)
+            || loaded.map(|pf| pf.hash) != Some(f.hash)
             || files.iter().any(|x: &FileMeta| x.path == f.path)
         {
             valid = false;
@@ -4027,40 +3953,64 @@ fn front_record_from(prog: &FrontRecordView) -> Option<crate::crate_image::Recor
     Some(rec)
 }
 
-fn mapped_front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128) -> Option<&'static [u8]> {
-    // structure only here (bounds; the image reader checks every section); the checksum is
-    // computed in the background (verify_front_images)
+/// A front image entry of store `st` (index entry `e`, key `key`), mapped for the rest of the
+/// process: inline (a demand part's) or a file's image a reference names (front_run.rs). The
+/// location is Some for a file's image. `check`: verify the payload checksums now; else
+/// structure only here (bounds; the image reader checks every section) and the checksum in the
+/// background (verify_front_images).
+fn front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128, check: bool) -> Option<(Option<crate::parser::ImageLoc>, &'static [u8])> {
     let (kind, b) = st.get_at(e, key)?;
-    if kind != KIND_FRONT {
+    if check && !st.verify_at(e) {
         return None;
     }
-    let mut keep = FRONT_STORES.lock().unwrap_or_else(|x| x.into_inner());
-    if !keep.iter().any(|k| std::sync::Arc::ptr_eq(k, st)) {
-        keep.push(st.clone());
+    match kind {
+        KIND_FRONT_REF => {
+            let (loc, img) = front_run::resolve(st.path.parent()?, b, check)?;
+            Some((Some(loc), img))
+        }
+        KIND_FRONT => {
+            let mut keep = FRONT_STORES.lock().unwrap_or_else(|x| x.into_inner());
+            if !keep.iter().any(|k| std::sync::Arc::ptr_eq(k, st)) {
+                keep.push(st.clone());
+            }
+            drop(keep);
+            if !check { FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).push((st.clone(), e)); }
+            // SAFETY: the store (and its mapping) is kept alive above for the rest of the
+            // process, and a committed payload never changes (store.rs)
+            Some((None, unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) }))
+        }
+        _ => None,
     }
-    FRONT_USED.lock().unwrap_or_else(|x| x.into_inner()).push((st.clone(), e));
-    // SAFETY: the store (and its mapping) is kept alive above for the rest of the process,
-    // and a committed payload never changes (store.rs)
-    Some(unsafe { std::slice::from_raw_parts(b.as_ptr(), b.len()) })
 }
 
-/// Load-time writer: completed crates use independent stores on a bounded worker pool.
-/// All writer references are gone before Arc::get_mut permits parallel heap retirement.
-/// Writes use the same append/rename and late-input ledger path as mid-run flushes.
+/// front_entry with both checksums verified first.
+fn checked_front_entry(st: &std::sync::Arc<Store>, e: usize, key: u128) -> Option<&'static [u8]> {
+    front_entry(st, e, key, true).map(|x| x.1)
+}
+
+/// A file's image (a reference entry), with its location.
+fn front_file_entry(st: &std::sync::Arc<Store>, e: usize, key: u128) -> Option<(crate::parser::ImageLoc, &'static [u8])> {
+    match front_entry(st, e, key, false)? {
+        (Some(loc), img) => Some((loc, img)),
+        (None, _) => None,
+    }
+}
+
+/// Load-time writer of crate records: a crate whose fingerprint is known (its dependencies are
+/// complete) gets its record and references to its files' images (written and mapped when
+/// each file was published) on a bounded worker pool. Writes use the same append and
+/// late-input ledger path as mid-run flushes.
 #[derive(Default)]
 pub struct ColdFront {
     fps: Vec<Option<u128>>,
     pending: Vec<usize>,
     writers: Option<FrontWriters>,
-    files: usize,
-    released: usize,
-    shared: HashSet<usize>,
+    /// crates whose record was written
+    records: usize,
 }
 impl ColdFront {
     pub fn enabled(options: &crate::options::Options) -> bool {
-        crate::front::enabled()
-            && matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
-            && std::env::var("RELAX_FRONT_COLD_SWAP").map_or(true, |v| v != "0")
+        crate::front::enabled() && matches!(mode_from_env(options), Some(Mode::On | Mode::Verify))
     }
 
     pub fn loaded(&mut self, prog: &crate::program::Program, krate: u32) {
@@ -4111,7 +4061,7 @@ impl ColdFront {
         // cannot become ready incrementally. Once loading succeeds, use the authoritative
         // full-program calculation for everything left, just as Cache::open does.
         // A complete incremental set skips the full hash pass; its writes are already
-        // queued and normally complete before this final join/remap.
+        // queued and normally complete before this final join.
         if self.fps.iter().any(Option::is_none) {
             let remaining: Vec<_> = self.fps.iter().enumerate().filter_map(|(ci, fp)| fp.is_none().then_some(ci)).collect();
             if prog.session.runtime.profile {
@@ -4123,7 +4073,7 @@ impl ColdFront {
                         else { "dependency pending" };
                     // Buffer diagnostics with the timeline; stderr must not serialize
                     // this measured phase just to explain why a crate is pending.
-                    let _profile = crate::load_profile::span(true, "front-swap-pending",
+                    let _profile = crate::load_profile::span(true, "front-record-pending",
                         &format!("{}: {}; waiting for {}", prog.syms.str(c.name), why, waiting.join(", ")));
                 }
             }
@@ -4136,10 +4086,14 @@ impl ColdFront {
             for ci in remaining { self.enqueue(prog, ci, &dir); }
         }
         let written = {
-            let _wait = crate::load_profile::span(prog.session.runtime.profile, "front-swap-wait", "main");
+            let _wait = crate::load_profile::span(prog.session.runtime.profile, "front-record-wait", "main");
             self.writers.take().map_or_else(Vec::new, |mut writers| writers.finish())
         };
-        self.remap(prog, &written);
+        for ci in written {
+            // front_restored means a current record, not necessarily a no-parse load.
+            prog.front_restored[ci] = true;
+            self.records += 1;
+        }
         // A partial restore can rebuild its entire suffix from older crate images
         // (for example after reverting an edit), leaving front_ahead empty. The
         // writer still needs this load's fingerprints and whole-plan demand
@@ -4171,86 +4125,24 @@ impl ColdFront {
     }
 
     fn enqueue(&mut self, prog: &crate::program::Program, ci: usize, dir: &std::path::Path) {
-        let _profile = crate::load_profile::span(prog.session.runtime.profile, "front-swap-enqueue", prog.syms.str(prog.crates[ci].name));
-        if prog.file_crate.iter().enumerate().filter(|(_, k)| **k as usize == ci).all(|(i, _)| prog.files[i].src.is_mapped()) { return; }
+        let _profile = crate::load_profile::span(prog.session.runtime.profile, "front-record-enqueue", prog.syms.str(prog.crates[ci].name));
+        // a crate loaded from its image (or a collected graph): its store has its record and
+        // its files' references
+        if prog.front_ahead.get(ci).is_some_and(|a| a.is_empty()) { return; }
         let Some(view) = FrontRecordView::new(prog, ci, |k| self.fps.get(k).copied().flatten()) else { return };
         let path = dir.join(front_store_name(&prog.session.options, &view.name, self.fps[ci].unwrap()));
         let late = crate::sip::late_inputs();
-        self.writers.get_or_insert_with(FrontWriters::new).enqueue(FrontWrite { ci, view, dir: dir.to_owned(), path, late });
-    }
-
-    fn remap(&mut self, prog: &mut crate::program::Program, written: &[FrontSwap]) {
-        if written.is_empty() { return; }
-        let profile = prog.session.runtime.profile;
-        let _profile = crate::load_profile::span(profile, "front-swap-apply", "main");
-        let jobs = crate::preload::jobs();
-        let mut stores = vec![None; prog.files.len()];
-        for swap in written {
-            // front_restored means a current record, not necessarily a no-parse load.
-            if swap.recorded { prog.front_restored[swap.ci] = true; }
-            for &i in &swap.indices { stores[i] = Some(&swap.store); }
-        }
-        let paths = &prog.file_paths;
-        let contexts: Vec<_> = prog.crates.iter().map(|c| c.context.clone()).collect();
-        let file_crate = &prog.file_crate;
-        // Detach std shares once, after ALL writer Arc clones have been dropped. Each
-        // worker owns disjoint file slots, so apply and the old arrays' final drops can
-        // run off main without changing shared-file ownership or parse order.
-        crate::program::without_std_shares(&mut prog.files, paths, |files| {
-            let chunk = files.len().div_ceil(jobs).max(1);
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = files.chunks_mut(chunk).enumerate().map(|(k, files)| {
-                    let stores = &stores;
-                    let contexts = &contexts;
-                    scope.spawn(move || {
-                        let _profile = crate::load_profile::span(profile, "front-swap-remap", "files");
-                        let (mut count, mut released, mut shared) = (0, 0, Vec::new());
-                        for (j, file) in files.iter_mut().enumerate() {
-                            let i = k * chunk + j;
-                            let Some(st) = stores[i] else { continue };
-                            if file.src.is_mapped() { continue; }
-                            let path = &paths[i];
-                            let key = Cache::front_key(path, file.source_hash(path));
-                            let Some(e) = st.index.iter().position(|e| e.key == key) else { continue };
-                            let Some(img) = mapped_front_entry(st, e, key) else { continue };
-                            let bytes = crate::front::heap_bytes(file);
-                            match std::sync::Arc::get_mut(file) {
-                                Some(f) => { if crate::front::apply(path, f, img) { count += 1; released += bytes; crate::front::map_sources(contexts, file_crate[i] as usize, path, f); } }
-                                None => {
-                                    shared.push(i);
-                                    crate::front::SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        }
-                        (count, released, shared)
-                    })
-                }).collect();
-                for h in handles {
-                    let (count, released, shared) = h.join().expect("front swap remap");
-                    self.files += count;
-                    self.released += released;
-                    self.shared.extend(shared);
-                }
-            });
-        });
+        let marks = front_run::run_marks();
+        self.writers.get_or_insert_with(FrontWriters::new).enqueue(FrontWrite { ci, view, dir: dir.to_owned(), path, late, marks });
     }
 
     pub fn report(&self, prog: &crate::program::Program) {
         if !prog.session.options.verbose || !Self::enabled(&prog.session.options) { return; }
-        let bytes: usize = self.shared.iter().map(|&i| crate::front::heap_bytes(&prog.files[i])).sum();
         use std::sync::atomic::Ordering::Relaxed;
         use crate::source::{MAPPED_SOURCES, MAPPED_SOURCE_MISMATCH, MAPPED_SOURCE_NOT_FOUND, MAPPED_SOURCE_NO_SNAPSHOT};
-        eprintln!("relax-front: cold swap: {} files, {:.1} MB of heap released at load finish, {:.1} MB still on the heap (shared); {} files shared; sources mapped {} mismatch {} not-found {} no-snapshot {}",
-            self.files, self.released as f64 / 1e6, bytes as f64 / 1e6, self.shared.len(),
+        eprintln!("relax-front: {} crate records written at load; sources mapped {} mismatch {} not-found {} no-snapshot {}", self.records,
             MAPPED_SOURCES.load(Relaxed), MAPPED_SOURCE_MISMATCH.load(Relaxed), MAPPED_SOURCE_NOT_FOUND.load(Relaxed), MAPPED_SOURCE_NO_SNAPSHOT.load(Relaxed));
     }
-}
-
-struct FrontSwap {
-    ci: usize,
-    indices: Vec<usize>,
-    store: std::sync::Arc<Store>,
-    recorded: bool,
 }
 
 struct FrontWrite {
@@ -4259,6 +4151,8 @@ struct FrontWrite {
     dir: PathBuf,
     path: PathBuf,
     late: Vec<(String, u8, String, u128)>,
+    /// the images written by the enqueue (the view's references name only those)
+    marks: front_run::RunMarks,
 }
 
 #[derive(Default)]
@@ -4268,12 +4162,12 @@ struct FrontWriteQueue {
     closed: bool,
 }
 
-/// One bounded group per load, fed without waiting for disk or worker capacity. The
-/// queue contains at most one snapshot per eligible crate, never copied AST payloads.
+/// One bounded group per load, fed without waiting for disk or worker capacity. The queue
+/// holds at most one snapshot per eligible crate (metadata and image locations only).
 /// Same-path jobs retain submission order; distinct paths use any available worker.
 struct FrontWriters {
     queue: std::sync::Arc<(std::sync::Mutex<FrontWriteQueue>, std::sync::Condvar)>,
-    workers: Vec<std::thread::JoinHandle<Vec<FrontSwap>>>,
+    workers: Vec<std::thread::JoinHandle<Vec<usize>>>,
 }
 
 impl FrontWriters {
@@ -4283,7 +4177,7 @@ impl FrontWriters {
             let queue = writers.queue.clone();
             writers.workers.push(std::thread::Builder::new().name("relax-front-writer".into()).spawn(move || {
                 let (queue, wake) = &*queue;
-                let mut written = Vec::new();
+                let mut recorded = Vec::new();
                 loop {
                     let job = {
                         let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -4293,23 +4187,22 @@ impl FrontWriters {
                                 q.active.insert(job.path.clone());
                                 break job;
                             }
-                            if q.closed && q.pending.is_empty() { return written; }
+                            if q.closed && q.pending.is_empty() { return recorded; }
                             q = wake.wait(q).unwrap_or_else(|e| e.into_inner());
                         }
                     };
                     let path = job.path.clone();
-                    // Consume/drop the snapshot before publishing completion, including on
-                    // failure: Arc::get_mut at finish must see no writer-held references.
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || write_front_swap(job)));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || write_front_record(job)));
                     match result {
-                        Ok(Ok(swap)) => written.push(swap),
-                        Ok(Err(e)) => eprintln!("relax-front: cold swap: {}", e),
-                        Err(_) => eprintln!("relax-front: cold swap worker panicked; keeping heap arrays"),
+                        Ok(Ok(Some(ci))) => recorded.push(ci),
+                        Ok(Ok(None)) => {}
+                        Ok(Err(e)) => eprintln!("relax-front: crate record: {}", e),
+                        Err(_) => eprintln!("relax-front: crate record writer panicked"),
                     }
                     queue.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&path);
                     wake.notify_all();
                 }
-            }).expect("front swap writer"));
+            }).expect("front record writer"));
         }
         writers
     }
@@ -4319,62 +4212,67 @@ impl FrontWriters {
         self.queue.1.notify_one();
     }
 
-    fn finish(&mut self) -> Vec<FrontSwap> {
+    /// The crates whose record was written.
+    fn finish(&mut self) -> Vec<usize> {
         self.queue.0.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
         self.queue.1.notify_all();
-        let mut written = Vec::new();
+        let mut recorded = Vec::new();
         for worker in self.workers.drain(..) {
             match worker.join() {
-                Ok(swaps) => written.extend(swaps),
-                Err(_) => eprintln!("relax-front: cold swap writer panicked; keeping heap arrays"),
+                Ok(cis) => recorded.extend(cis),
+                Err(_) => eprintln!("relax-front: crate record writer panicked"),
             }
         }
-        written
+        recorded
     }
 }
 
 impl Drop for FrontWriters {
     fn drop(&mut self) {
-        // Early load errors/unwinding must not leave detached writers or keep parsed
-        // files alive through the next load. No write gate is held while awaiting jobs.
+        // Early load errors/unwinding must not leave detached writers. No write gate is held
+        // while awaiting jobs.
         self.finish();
     }
 }
 
-fn write_front_swap(job: FrontWrite) -> Result<FrontSwap, String> {
-    let FrontWrite { ci, view: prog, dir, path, late } = job;
+/// A crate's references to its files' images and its record (Some(crate): a record was
+/// written), in its crate store.
+fn write_front_record(job: FrontWrite) -> Result<Option<usize>, String> {
+    let FrontWrite { ci, view: prog, dir, path, late, marks } = job;
     let profile = prog.session.runtime.profile;
     let name = prog.name.as_str();
-    let _profile = crate::load_profile::span(profile, "front-swap-crate", name);
+    let _profile = crate::load_profile::span(profile, "front-record-crate", name);
     // Only files with a unique source key can supply an image.
     let mut counts = HashMap::new();
     for f in &prog.files {
-        *counts.entry((f.path.as_str(), f.parsed.source_hash(&f.path))).or_insert(0usize) += 1;
+        *counts.entry((f.path.as_str(), f.hash)).or_insert(0usize) += 1;
     }
-    let files: Vec<_> = prog.files.iter().filter(|f|
-        counts.get(&(f.path.as_str(), f.parsed.source_hash(&f.path))) == Some(&1)).collect();
+    let mut entries = Vec::new();
+    for f in prog.files.iter().filter(|f| counts.get(&(f.path.as_str(), f.hash)) == Some(&1)) {
+        if let Some(loc) = &f.image {
+            entries.push(NewEntry { key: Cache::front_key(&f.path, f.hash), kind: KIND_FRONT_REF, payload: front_run::encode_ref(loc) });
+        }
+        if let Some(loc) = &f.part {
+            entries.push(NewEntry { key: Cache::front_part_key(&f.path, f.hash), kind: KIND_FRONT_REF, payload: front_run::encode_ref(loc) });
+        }
+    }
     let rec = {
-        let _profile = crate::load_profile::span(profile, "front-swap-record", name);
+        let _profile = crate::load_profile::span(profile, "front-record-encode", name);
         front_record_from(&prog)
     };
     let recorded = rec.is_some();
+    if let Some(rec) = rec {
+        entries.push(NewEntry { key: front_crate_key(&rec.name, &rec.root), kind: KIND_FRONT_CRATE, payload: crate::crate_image::encode(&rec) });
+    }
+    if entries.is_empty() { return Ok(None); }
     let lock = front_store_lock(&path);
     let _store = lock.lock().unwrap_or_else(|e| e.into_inner());
     let guard = SPILL_IO.read().unwrap_or_else(|e| e.into_inner());
-    {
-        let _profile = crate::load_profile::span(profile, "front-swap-write", name);
-        let mut entries: Vec<_> = files.iter().map(|f|
-            PendingEntry::front(Cache::front_key(&f.path, f.parsed.source_hash(&f.path)), f.parsed.clone(), false)).collect();
-        if let Some(rec) = rec {
-            entries.push(NewEntry { key: front_crate_key(&rec.name, &rec.root), kind: KIND_FRONT_CRATE, payload: crate::crate_image::encode(&rec) }.into());
-        }
-        // Keep code/old parts, even if the boot record was rejected. Cache::open decides
-        // staleness after loading; an early swap must not retire still-linkable code.
-        Spill { dir, files: vec![(path.clone(), false, entries)] }.write_locked(&guard, &late)?;
-    }
-    let _profile = crate::load_profile::span(profile, "front-swap-open", name);
-    let store = Store::open(&path).map(std::sync::Arc::new).ok_or_else(|| format!("cannot map {}", path.display()))?;
-    Ok(FrontSwap { ci, indices: files.iter().map(|f| f.index).collect(), store, recorded })
+    let _profile = crate::load_profile::span(profile, "front-record-write", name);
+    // Keep code/old parts, even if the boot record was rejected. Cache::open decides
+    // staleness after loading; an early write must not retire still-linkable code.
+    Spill { dir, files: vec![(path.clone(), false, entries)], marks }.write_locked(&guard, &late)?;
+    Ok(recorded.then_some(ci))
 }
 
 #[cfg(test)]
@@ -4402,9 +4300,12 @@ mod cold_tests {
         std::fs::write(&called, "pub fn value() -> u32 { 7 }").unwrap();
         let pre = vec![crate::preload::PreCrate {  name: "quiet".into(), root, edition: 2021, cfg,
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
-        let load = |images: Option<&dyn crate::crate_image::CrateImages>| {
+        let store = std::env::temp_dir().join(format!("relax-stat-graph-cache-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        // `sink`: the files' images are written (a load from images maps them anyway)
+        let load = |images: Option<&dyn crate::crate_image::CrateImages>, sink: bool| {
             let mut prog = crate::program::Program::new(sess);
             prog.record_front = true;
+            if sink { prog.front_sink = Some(FrontSink::for_dir(&store)); }
             prog.preload_images(pre.clone(), images);
             for c in &pre {
                 prog.load_crate(&c.name, &c.root, c.edition, c.cfg.clone(), vec![]).unwrap();
@@ -4414,14 +4315,13 @@ mod cold_tests {
         };
         // the files must be older than the racy window when the graph is recorded
         std::thread::sleep(std::time::Duration::from_millis(2300));
-        let store = std::env::temp_dir().join(format!("relax-stat-graph-cache-{}-{}", std::process::id(), crate::clock::wall_ns()));
-        let mut cold = load(None);
+        let mut cold = load(None, true);
         ColdFront::default().finish_in(&mut cold, store.clone());
         let identity = cold.front_graph.as_ref().unwrap().identity;
         let graph = read_front_graph(&store, identity).unwrap();
         assert!(!graph.stamps.is_empty() && graph.stamps.iter().all(|s| s.is_some()), "quiet inputs carry a stat: {:?}", graph.inputs.iter().zip(&graph.stamps).filter(|x| x.1.is_none()).map(|x| &x.0.0).collect::<Vec<_>>());
         let images = FrontImages { dir: store.clone(), ..Default::default() };
-        let warm = load(Some(&images));
+        let warm = load(Some(&images), false);
         assert!(warm.files.iter().all(|f| f.src.is_mapped()));
         assert_eq!(images.content_hashes.load(std::sync::atomic::Ordering::Relaxed), 0, "an unchanged warm start hashes no file");
         // same size, mtime restored: the stat alone differs only in ctime (and the inode when
@@ -4429,7 +4329,7 @@ mod cold_tests {
         let mtime = std::fs::metadata(&called).unwrap().modified().unwrap();
         std::fs::write(&called, "pub fn value() -> u32 { 8 }").unwrap();
         std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
-        let edited = load(Some(&images));
+        let edited = load(Some(&images), false);
         assert!(edited.files.iter().all(|f| !f.src.is_mapped()), "an edit with the same size and mtime is detected");
         assert!(images.content_hashes.load(std::sync::atomic::Ordering::Relaxed) > 0);
         // a graph recorded within the racy window of the edit carries no stat for that file
@@ -4440,7 +4340,7 @@ mod cold_tests {
         assert!(racy.stamps[at].is_none(), "a file changed just before the recording is hashed on every validation");
         std::fs::write(&called, "pub fn value() -> u32 { 9 }").unwrap();
         std::fs::File::options().write(true).open(&called).unwrap().set_modified(mtime).unwrap();
-        let again = load(Some(&images));
+        let again = load(Some(&images), false);
         assert!(again.files.iter().all(|f| !f.src.is_mapped()), "the racy case: same size, restored mtime");
     }
 
@@ -4461,14 +4361,15 @@ mod cold_tests {
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
         let pre = vec![crate::preload::PreCrate { name: "test_crate".into(), root, edition: 2021, cfg: cfg.clone(),
             deps: vec![],  proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
+        let store = dir.join("cache");
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&store));
         prog.preload(pre.clone());
         prog.load_crate(&pre[0].name, &pre[0].root, 2021, cfg.clone(), vec![]).unwrap();
         prog.resolve_imports();
         assert!(prog.errors.is_empty(), "{:?}", prog.errors);
         let deferred = *prog.skipped_files.keys().next().expect("deferred boot module");
-        let store = dir.join("cache");
         ColdFront::default().finish_in(&mut prog, store.clone());
         let identity = prog.front_graph.as_ref().unwrap().identity;
         let graph = read_front_graph(&store, identity).unwrap();
@@ -4577,9 +4478,11 @@ mod cold_tests {
                 deps: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect(), proc_macro: false,
                 image_deps: deps.clone(), image_dep_names: deps.iter().map(|&d| (names[d].to_string(), names[d].to_string())).collect() });
         }
+        let store = dir.join("cache");
         let load = |images: Option<&dyn crate::crate_image::CrateImages>| {
             let mut prog = crate::program::Program::new(sess);
             prog.record_front = true;
+            prog.front_sink = Some(FrontSink::for_dir(&store));
             prog.preload_images(pre.clone(), images);
             for c in &pre {
                 let deps = c.image_deps.iter().map(|&d| (prog.syms.intern(names[d]), d as u32)).collect();
@@ -4589,7 +4492,6 @@ mod cold_tests {
             assert!(prog.errors.is_empty(), "{:?}", prog.errors);
             prog
         };
-        let store = dir.join("cache");
         let images = FrontImages { dir: store.clone(), ..Default::default() };
         // a run that loads with these sources and records its collected graph
         let record = |images: &FrontImages| {
@@ -4644,6 +4546,7 @@ mod cold_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&dir));
         let mut cold = ColdFront::default();
         for name in ["a", "b"] {
             let path = dir.join(format!("{name}.rs")).to_string_lossy().into_owned();
@@ -4658,8 +4561,9 @@ mod cold_tests {
         assert!(cold.pending.is_empty());
         assert!(cold.fps[0].is_some());
         assert!(cold.fps[1].is_some());
-        assert_eq!(cold.files, 0);
-        assert!(prog.files.iter().all(|f| !f.src.is_mapped()));
+        assert_eq!(cold.records, 0);
+        // every file is mapped at its publication, before any record
+        assert!(prog.files.iter().all(|f| f.src.is_mapped() && f.image.is_some()));
         let fps = crate::stable::crate_fingerprints(&prog);
         assert_eq!(cold.fps[0], Some(fps[0]));
         assert_eq!(cold.fps[1], Some(fps[1]));
@@ -4667,8 +4571,8 @@ mod cold_tests {
         assert_eq!(cold.fps, fps.into_iter().map(Some).collect::<Vec<_>>());
         assert_fingerprints(&cold, &prog);
         assert!(cold.pending.is_empty());
-        assert_eq!(cold.files, 2);
-        assert!(prog.files.iter().all(|f| f.src.is_mapped()));
+        assert_eq!(cold.records, 2);
+        assert_eq!(prog.front_restored, vec![true; 2]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4679,6 +4583,7 @@ mod cold_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&dir));
         let mut cold = ColdFront::default();
         let names = ["draw", "widgets_core", "family", "app"];
         let sources = [
@@ -4697,37 +4602,41 @@ mod cold_tests {
             if ci < 2 {
                 assert!(prog.crates[ci].deps.iter().any(|&(_, d)| d == krate), "source added its self alias");
             }
-            let fps = crate::stable::crate_fingerprints(&prog);
-            assert_eq!(crate::stable::loaded_crate_fingerprint(&prog, ci, &cold.fps), Some(fps[ci]));
+            let fps = crate::stable::loaded_crate_fingerprint(&prog, ci, &cold.fps);
+            assert_eq!(fps, Some(crate::stable::crate_fingerprints(&prog)[ci]));
             cold.loaded_in(&mut prog, krate, dir.clone());
             assert_fingerprints(&cold, &prog);
             assert!(cold.pending.is_empty(), "{name} and its dependencies queued at completion");
-            assert_eq!(cold.files, 0);
-            assert!(prog.files.iter().all(|f| !f.src.is_mapped()));
+            assert_eq!(cold.records, 0);
         }
         assert!(prog.errors.is_empty(), "{:?}", prog.errors);
         let fps = cold.fps.clone();
         cold.finish_in(&mut prog, dir.clone());
         assert_eq!(cold.fps, fps);
-        assert_eq!(cold.files, prog.files.len());
         assert!(prog.files.iter().all(|f| f.src.is_mapped()));
+        // every file's crate store refers to its image (with or without a crate record)
+        for (i, f) in prog.files.iter().enumerate() {
+            let ci = prog.file_crate[i] as usize;
+            let st = Store::open(&dir.join(front_store_name(&sess.options, prog.syms.str(prog.crates[ci].name), cold.fps[ci].unwrap()))).unwrap();
+            let path = &prog.file_paths[i];
+            assert_eq!(st.get(Cache::front_key(path, f.source_hash(path))).map(|x| x.0), Some(KIND_FRONT_REF));
+        }
         // Complete consumers before their dependencies too: self aliases do not mask a
         // real missing dependency, and completing the root drains the entire graph.
-        let mut warm = ColdFront::default();
+        let mut again = ColdFront::default();
         for ci in (0..names.len()).rev() {
-            warm.loaded_in(&mut prog, ci as u32, dir.clone());
+            again.loaded_in(&mut prog, ci as u32, dir.clone());
             if ci != 0 {
-                assert!(warm.fps.iter().all(Option::is_none));
+                assert!(again.fps.iter().all(Option::is_none));
             }
         }
-        assert_fingerprints(&warm, &prog);
-        assert!(warm.pending.is_empty());
-        assert_eq!(warm.files, 0);
+        assert_fingerprints(&again, &prog);
+        assert!(again.pending.is_empty());
         let fps = cold.fps.clone();
-        let files = cold.files;
+        let records = cold.records;
         cold.finish_in(&mut prog, dir.clone());
         assert_eq!(cold.fps, fps);
-        assert_eq!(cold.files, files);
+        assert_eq!(cold.records, records, "a finished load writes no record twice");
         assert_fingerprints(&cold, &prog);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4738,6 +4647,7 @@ mod cold_tests {
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&dir));
         let mut cold = ColdFront::default();
         for (ci, name) in ["a", "b", "c"].into_iter().enumerate() {
             let path = dir.join(format!("{name}.rs")).to_string_lossy().into_owned();
@@ -4761,41 +4671,36 @@ mod cold_tests {
                 cold.loaded_in(&mut prog, krate, dir.clone());
             }
             if ci < 2 || missing_callback {
-                assert_eq!(cold.files, 0);
                 assert!(cold.fps.iter().all(Option::is_none));
-                assert!(prog.files.iter().all(|f| !f.src.is_mapped()));
             }
         }
         if !missing_callback {
-            // Completing c queues b and then a immediately; only finish remaps files.
+            // Completing c queues b and then a immediately.
             assert!(cold.pending.is_empty());
-            assert_eq!(cold.files, 0);
-            assert!(prog.files.iter().all(|f| !f.src.is_mapped()));
             assert_fingerprints(&cold, &prog);
         }
         cold.finish_in(&mut prog, dir.clone());
         assert!(cold.pending.is_empty());
-        assert_eq!(cold.files, 3);
-        assert!(prog.files.iter().all(|f| f.src.is_mapped()));
+        assert_eq!(cold.records, 3);
+        assert_eq!(prog.front_restored, vec![true; 3]);
         assert_fingerprints(&cold, &prog);
-        // A warm load with all sources already mapped must follow the same readiness rules.
-        let mut warm = ColdFront::default();
-        warm.loaded_in(&mut prog, 0, dir.clone());
-        warm.loaded_in(&mut prog, 1, dir.clone());
-        assert!(warm.fps.iter().all(Option::is_none));
-        warm.loaded_in(&mut prog, 2, dir.clone());
-        assert_fingerprints(&warm, &prog);
-        assert!(warm.pending.is_empty());
-        assert_eq!(warm.files, 0);
-        // Repeated completion/finalization must not rewrite or swap a crate twice.
+        // A load with the same files must follow the same readiness rules.
+        let mut again = ColdFront::default();
+        again.loaded_in(&mut prog, 0, dir.clone());
+        again.loaded_in(&mut prog, 1, dir.clone());
+        assert!(again.fps.iter().all(Option::is_none));
+        again.loaded_in(&mut prog, 2, dir.clone());
+        assert_fingerprints(&again, &prog);
+        assert!(again.pending.is_empty());
+        // Repeated completion/finalization must not write a crate's record twice.
         cold.loaded_in(&mut prog, 0, dir.clone());
         cold.finish_in(&mut prog, dir.clone());
-        assert_eq!(cold.files, 3);
+        assert_eq!(cold.records, 3);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn cold_load_store_restores_warm_and_keeps_shared_files() {
+    fn cold_load_maps_at_publication_and_restores_warm() {
         let sess = &std::sync::Arc::new(crate::Session::default());
         let dir = std::env::temp_dir().join(format!("relax-cold-front-{}-{}", std::process::id(), crate::clock::wall_ns()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4810,20 +4715,20 @@ mod cold_tests {
         ];
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        prog.front_sink = Some(FrontSink::for_dir(&dir));
         prog.preload_images_bounded(pre(), None, true, None);
         let mut cold = ColdFront::default();
         let ca = prog.load_crate("a", &a, 2021, cfg.clone(), vec![]).unwrap();
-        // A failed commit must not retire any heap or certify a crate record.
+        // the file left the heap at its publication
+        assert!(prog.files[0].src.is_mapped());
+        assert_eq!(crate::front::heap_bytes(&prog.files[0]), 0);
+        // A failed commit must not certify a crate record.
         let mut failed = ColdFront::default();
         failed.loaded_in(&mut prog, ca, PathBuf::from(&a)); // a source file, not a directory
         failed.finish_in(&mut prog, PathBuf::from(&a));
-        assert_eq!(failed.files, 0);
-        assert!(crate::front::heap_bytes(&prog.files[0]) > 0);
+        assert_eq!(failed.records, 0);
         assert!(!prog.front_restored[0]);
-        let shared = prog.files[0].clone();
         cold.loaded_in(&mut prog, ca, dir.clone());
-        assert!(!prog.files[0].src.is_mapped());
-        assert_eq!(cold.shared.len(), 0);
         assert_fingerprints(&cold, &prog);
         let alias = prog.syms.intern("alias");
         let alias2 = prog.syms.intern("alias2");
@@ -4831,14 +4736,9 @@ mod cold_tests {
         prog.crates[cb as usize].proc_macro = true;
         cold.loaded_in(&mut prog, cb, dir.clone());
         assert_fingerprints(&cold, &prog);
-        assert_eq!(cold.files, 0);
-        assert!(prog.files.iter().all(|f| !f.src.is_mapped()));
         cold.finish_in(&mut prog, dir.clone());
-        assert_eq!(cold.shared.len(), 1);
-        assert_eq!(cold.files, 1);
-        assert!(cold.released > 0);
-        assert_eq!(crate::front::heap_bytes(&prog.files[1]), 0);
-        drop(shared);
+        assert_eq!(cold.records, 2);
+        assert!(prog.files.iter().all(|f| f.src.is_mapped()));
         let images = FrontImages { dir: dir.clone(), ..Default::default() };
         let mut warm = crate::program::Program::new(sess);
         warm.record_front = true;
@@ -4847,16 +4747,50 @@ mod cold_tests {
         let alias = warm.syms.intern("alias");
         let wb = warm.load_crate("b", &b, 2021, prog.crates[1].cfg.clone(), vec![(alias, wa)]).unwrap();
         warm.crates[wb as usize].proc_macro = true;
+        // restored from the cold run's images: the same image (run store, key) per file
         assert!(warm.files.iter().all(|f| f.src.is_mapped()));
+        assert_eq!(warm.files.iter().map(|f| f.image.clone()).collect::<Vec<_>>(), prog.files.iter().map(|f| f.image.clone()).collect::<Vec<_>>());
         assert_fingerprints(&cold, &warm);
         for (a, b) in prog.files.iter().zip(&warm.files) { crate::front::verify_file(a, b); }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-
-
-
-
+    #[test]
+    fn lazy_part_is_mapped_before_publication_and_restored_warm() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let dir = std::env::temp_dir().join(format!("relax-cold-part-{}-{}", std::process::id(), crate::clock::wall_ns()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lib.rs").to_string_lossy().into_owned();
+        let text = b"pub fn f(x: u32) -> u32 { let y = x + 3; y * 2 }".to_vec();
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", &path, "test", &cfg));
+        let parse = || {
+            let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+            let (mut f, _) = crate::parser::parse_owned_ctx(sess, text.clone(), None, 2021,
+                Some(crate::macros::MacroScope::new(table)), "test", Some(ctx.clone()), true).unwrap();
+            crate::program::prepare_file(&mut f, &cfg);
+            assert!(f.lazy.is_some());
+            f
+        };
+        use crate::parser::ImageSink;
+        let sink = FrontSink::for_dir(&dir);
+        let mut f = parse();
+        assert!(sink.file(&path, &mut f));
+        f.sink = Some(sink.clone());
+        let part = f.part(&cfg).unwrap();
+        // published mapped: the part and its tree never held heap arrays a reader could see
+        assert!(part.toks.is_mapped() && part.image.is_some());
+        assert_eq!(f.ast.part.get().unwrap().exprs.heap_bytes(), 0);
+        // a fresh parse of the same file reads the cold part's image to the same part
+        let fresh = parse();
+        let fresh_part = fresh.part(&cfg).unwrap();
+        assert_eq!(format!("{:?}", part.bodies), format!("{:?}", fresh_part.bodies));
+        assert_eq!(&part.rules_exp[..], &fresh_part.rules_exp[..]);
+        assert_eq!(&part.body_origin[..], &fresh_part.body_origin[..]);
+        assert_eq!(format!("{:?}", &f.ast.part.get().unwrap().exprs[..]), format!("{:?}", &fresh.ast.part.get().unwrap().exprs[..]));
+        commit_runs().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -5256,14 +5190,14 @@ mod data_tests {
         let mut c = open_test_cache(&u, &root);
         c.crate_path = vec![root.join("first.rcs"), root.join("second.rcs")];
         let path = "same.rs";
-        let pf = std::sync::Arc::new(crate::parser::parse_owned(sess, b"fn value() {}".to_vec(), 2021).unwrap());
+        let pf = crate::parser::parse_owned(sess, b"fn value() {}".to_vec(), 2021).unwrap();
         let hash = pf.source_hash(path);
         let key = Cache::front_key(path, hash);
-        assert_eq!(c.reserve_front(0, path, hash, true, false), (true, false));
-        assert!(!c.has_front_in_crate(0, path, hash), "a reservation has no payload yet");
-        c.push_front(0, path, hash, false, pf.clone());
-        assert!(c.has_front_in_crate(0, path, hash));
-        assert!(!c.has_front_in_crate(1, path, hash), "another crate's pending image is insufficient");
+        let loc = crate::parser::ImageLoc { store: "front_run-0000000000000000.rcs".into(), key: 7 };
+        assert_eq!(c.push_front_refs(0, path, hash, Some(&loc), None), 1);
+        assert_eq!(c.push_front_refs(0, path, hash, Some(&loc), None), 0, "queued once");
+        assert!(c.has_front_key_in_crate(0, key));
+        assert!(!c.has_front_key_in_crate(1, key), "another crate's pending reference is insufficient");
 
         let entries = c.pending.drain(..).map(|(_, e)| e).collect();
         crate::store::append(&c.crate_path[0], entries, true).unwrap();
@@ -5271,13 +5205,12 @@ mod data_tests {
         let ix = st.index.binary_search_by_key(&key, |e| e.key).unwrap();
         c.index.insert(key, (0, ix as u32));
         c.stores.push(st);
-        assert!(c.has_front(path, hash));
-        assert!(c.has_front_in_crate(0, path, hash));
-        assert!(!c.has_front_in_crate(1, path, hash), "another crate's indexed image is insufficient");
+        assert!(c.has_front_key_in_crate(0, key));
+        assert!(!c.has_front_key_in_crate(1, key), "another crate's indexed reference is insufficient");
         c.push_pending(1, NewEntry { key, kind: KIND_FRONT_CRATE, payload: Vec::new() });
-        assert!(!c.has_front_in_crate(1, path, hash), "the entry must be KIND_FRONT");
-        c.push_pending(1, NewEntry { key, kind: KIND_FRONT, payload: crate::front::encode(&pf) });
-        assert!(c.has_front_in_crate(1, path, hash));
+        assert!(!c.has_front_key_in_crate(1, key), "the entry must be KIND_FRONT_REF");
+        assert_eq!(c.push_front_refs(1, path, hash, Some(&loc), None), 1);
+        assert!(c.has_front_key_in_crate(1, key));
         drop(c);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -5331,6 +5264,8 @@ mod data_tests {
         let cfg = crate::cfg::CfgSet::host(sess, &[]);
         let mut prog = crate::program::Program::new(sess);
         prog.record_front = true;
+        // the cache folder of open_test_cache(.., &root): files are mapped at publication
+        prog.front_sink = Some(FrontSink::for_dir(&root.join("cache")));
         let mut pre: Vec<crate::preload::PreCrate> = Vec::new();
         for (ci, name) in ["macro_impl", "mac", "dependent"].into_iter().enumerate() {
             let path = root.join(format!("{name}.rs")).to_string_lossy().into_owned();
@@ -5354,37 +5289,25 @@ mod data_tests {
         let options = &crate::options::Options::default();
         let sess = &std::sync::Arc::new(crate::Session::default());
         let (root, mut prog, pre) = front_fixture(sess, "host");
-        // A host world has already mapped these sources under a different crate fingerprint.
-        // This also exercises an available lazy part: it must travel with the main image.
-        let mut entries = Vec::new();
+        // Files parsed again (lazily) and published with their images: their lazy parts are
+        // written and mapped at publication too, and travel with the main images.
+        use crate::parser::ImageSink;
+        let sink = FrontSink::for_dir(&root.join("cache"));
         for i in 0..2 {
-            let path = &prog.file_paths[i];
-            let cfg = &prog.crates[i].cfg;
-            let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&pre[i].name, path, &pre[i].name, cfg));
-            let (mut pf, used) = crate::parser::parse_owned_ctx(sess, std::fs::read(path).unwrap(), None, 2021,
+            let path = prog.file_paths[i].clone();
+            let cfg = prog.crates[i].cfg.clone();
+            let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&pre[i].name, &path, &pre[i].name, &cfg));
+            let (mut pf, used) = crate::parser::parse_owned_ctx(sess, std::fs::read(&path).unwrap(), None, 2021,
                 Some(crate::macros::MacroScope::new(prog.macros.clone())), &pre[i].name, Some(ctx), true).unwrap();
-            let prep = crate::program::prepare_file(&mut pf, cfg);
-            prog.front_files[i].2 = crate::crate_image::file_meta(path, &pre[i].name, &pf, &used.unwrap(), &prep, false);
+            let prep = crate::program::prepare_file(&mut pf, &cfg);
+            prog.front_files[i].2 = crate::crate_image::file_meta(&path, &pre[i].name, &pf, &used.unwrap(), &prep, false);
+            assert!(sink.file(&path, &mut pf));
+            pf.sink = Some(sink.clone());
             prog.files[i] = std::sync::Arc::new(pf);
-            let f = &prog.files[i];
-            let path = &prog.file_paths[i];
-            f.part(&prog.crates[i].cfg).unwrap();
-            entries.push(NewEntry { key: Cache::front_key(path, f.source_hash(path)), kind: KIND_FRONT, payload: crate::front::encode(f) });
-            entries.push(NewEntry { key: Cache::front_part_key(path, f.source_hash(path)), kind: KIND_FRONT, payload: crate::front::encode_part(f).unwrap() });
-        }
-        let host_path = root.join("host.rcs");
-        crate::store::append(&host_path, entries, true).unwrap();
-        let host = std::sync::Arc::new(Store::open(&host_path).unwrap());
-        for i in 0..2 {
-            let path = &prog.file_paths[i];
-            let key = Cache::front_key(path, prog.files[i].source_hash(path));
-            let ix = host.index.binary_search_by_key(&key, |e| e.key).unwrap();
-            assert!(crate::front::apply(path, std::sync::Arc::get_mut(&mut prog.files[i]).unwrap(), mapped_front_entry(&host, ix, key).unwrap()));
+            assert!(prog.files[i].part(&cfg).unwrap().toks.is_mapped());
         }
         let u = Unit::new(prog, crate::tcx::Tcx::new(), 0);
         let mut c = open_test_cache(&u, &root);
-        c.install_front_stores(vec![host]);
-        assert!(c.has_front(&pre[0].root, u.prog.files[0].source_hash(&pre[0].root)));
         c.record_front_crates(&u.prog);
         let pending = c.pending.len();
         c.record_front_crates(&u.prog);
@@ -5406,6 +5329,49 @@ mod data_tests {
         let why = std::cell::Cell::new("");
         assert!(images.candidate(options, &pre[0], &[], &c.crate_path[0], &why, None).is_none());
         assert_eq!(why.get(), "input files changed");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The exit writes references through Cache::flush: another process must find every image
+    /// they name in the run store's committed index (read from disk, as a new process would).
+    #[test]
+    fn flushed_references_name_committed_images() {
+        use crate::parser::ImageSink;
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let (root, mut prog, pre) = front_fixture(sess, "flush");
+        let sink = FrontSink::for_dir(&root.join("cache"));
+        // a lazily parsed file whose part is written after the load, like a body parsed at run time
+        let path = prog.file_paths[0].clone();
+        let cfg = prog.crates[0].cfg.clone();
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&pre[0].name, &path, &pre[0].name, &cfg));
+        let (mut pf, used) = crate::parser::parse_owned_ctx(sess, std::fs::read(&path).unwrap(), None, 2021,
+            Some(crate::macros::MacroScope::new(prog.macros.clone())), &pre[0].name, Some(ctx), true).unwrap();
+        let prep = crate::program::prepare_file(&mut pf, &cfg);
+        prog.front_files[0].2 = crate::crate_image::file_meta(&path, &pre[0].name, &pf, &used.unwrap(), &prep, false);
+        assert!(sink.file(&path, &mut pf));
+        pf.sink = Some(sink.clone());
+        prog.files[0] = std::sync::Arc::new(pf);
+        assert!(prog.files[0].part(&cfg).unwrap().image.is_some());
+        let u = Unit::new(prog, crate::tcx::Tcx::new(), 0);
+        let mut c = open_test_cache(&u, &root);
+        c.record_front_crates(&u.prog);
+        c.flush().unwrap();
+        let mut checked = 0;
+        for (ci, store) in c.crate_path.iter().enumerate() {
+            let st = Store::open(store).unwrap();
+            for (i, path) in u.prog.file_paths.iter().enumerate().filter(|(i, _)| u.prog.file_crate[*i] as usize == ci) {
+                let hash = u.prog.files[i].source_hash(path);
+                for key in [Cache::front_key(path, hash), Cache::front_part_key(path, hash)] {
+                    let Some((kind, b)) = st.get(key) else { continue };
+                    assert_eq!(kind, KIND_FRONT_REF);
+                    let (name, image) = front_run::decode_ref(b).unwrap();
+                    let run = Store::open(&c.dir.join(name)).expect("the run store's committed index");
+                    assert_eq!(run.get(image).map(|x| x.0), Some(KIND_FRONT), "{path}: a reference to an uncommitted image");
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 4, "3 files and 1 part");
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -5438,7 +5404,7 @@ mod data_tests {
         let mut c = open_test_cache(&u, &root);
         c.record_front_crates(&u.prog);
         // A valid record without its arrays still certifies sources and dependencies.
-        c.pending.retain(|(ci, e)| *ci != 0 || e.kind != KIND_FRONT);
+        c.pending.retain(|(ci, e)| *ci != 0 || e.kind != KIND_FRONT_REF);
         c.spill_take().unwrap().write().unwrap();
         let images = FrontImages { dir: c.dir.clone(), ..Default::default() };
         let why = std::cell::Cell::new("");

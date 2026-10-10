@@ -513,6 +513,17 @@ impl Store {
     }
 }
 
+/// The generation (Store::generation: the header checksum) of the store file's current
+/// header, read without mapping the file; None: unreadable or not a store.
+pub fn header_generation(path: &Path) -> Option<u64> {
+    let mut f = std::fs::File::open(current(&base_path(path))).ok()?;
+    f.lock_shared().ok()?;
+    let mut hb = [0u8; HEADER];
+    let r = f.read_exact(&mut hb).ok().and_then(|_| Header::parse(&hb)).map(|_| sum64(&hb));
+    let _ = f.unlock();
+    r
+}
+
 /// Adds `entries` to the store at `path` (creating it), newest winning per key; `drop_all`: start
 /// from an empty store (its contents were found stale). Atomic: an append commits by flipping
 /// the header; a rewrite goes through a temp file and rename.
@@ -673,6 +684,220 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
     Ok(())
 }
 
+/// A run's image store (cache.rs front_run): an ordinary store file that one process creates
+/// under a fresh name and only appends to. Payloads go past the data end with positioned writes
+/// (the page cache; no sync per payload) and each is mapped read-only right after its write; the
+/// index is committed (data synced first, then the inactive slot and the header, as `append`)
+/// only before another store refers to its entries. Never truncated or rewritten: a full index
+/// makes the caller start another run store. Other processes read it as any store (Store::open).
+pub struct RunStore {
+    /// the file name (the run store's identity in references)
+    pub name: std::sync::Arc<str>,
+    pub path: PathBuf,
+    file: std::fs::File,
+    cap: u32,
+    state: std::sync::Mutex<RunState>,
+    /// serializes commits (slot alternation)
+    commit: std::sync::Mutex<()>,
+}
+
+#[derive(Default)]
+struct RunState {
+    /// the next free byte (payloads in flight included)
+    end: u64,
+    /// the end of the written payloads
+    written: u64,
+    /// entries written, in write order; how many of them the active slot holds
+    index: Vec<Ix>,
+    committed: usize,
+    /// payloads being written (their index slots are reserved)
+    in_flight: usize,
+    active: u32,
+    /// the written payloads' mappings, by key
+    mapped: std::collections::HashMap<u128, &'static [u8]>,
+}
+
+/// RunStore::append's outcome
+pub enum Appended {
+    /// the entry's key and its payload, mapped
+    Done(u128, &'static [u8]),
+    /// the index is full: use another run store
+    Full,
+    Failed(std::io::Error),
+}
+
+impl RunStore {
+    /// A new run store `<prefix>-<16 random hex>.rcs` in `dir` with room for `cap` entries.
+    pub fn create(dir: &Path, prefix: &str, cap: u32) -> std::io::Result<RunStore> {
+        let name = format!("{}-{:016x}.rcs", prefix, crate::pack::nonce());
+        let path = dir.join(&name);
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let file = o.open(&path)?;
+        let mut h = Header { active: 0, cap, slots: [(0, 0, 0); 2] };
+        h.slots = [(0, h.data_start(), sum64(&[])); 2];
+        write_at(&file, &h.bytes(), 0)?;
+        mark_live(&path, &path, false);
+        Ok(RunStore { name: name.into(), path, file, cap,
+            state: std::sync::Mutex::new(RunState { end: h.data_start(), written: h.data_start(), ..Default::default() }),
+            commit: std::sync::Mutex::new(()) })
+    }
+
+    /// Appends a `len`-byte payload streamed by `write` and maps it. Its key: `key` mixed with
+    /// the payload's length and checksum (equal payloads, equal keys). Threads append in
+    /// parallel: only the range reservation and the index push take the lock.
+    pub fn append(&self, key: u128, kind: u32, len: usize, write: &dyn Fn(&mut dyn Write) -> std::io::Result<()>) -> Appended {
+        let off = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.index.len() + s.in_flight >= self.cap as usize { return Appended::Full; }
+            let off = align8(s.end);
+            s.end = off + len as u64;
+            s.in_flight += 1;
+            off
+        };
+        let r = (|| -> std::io::Result<(u64, &'static [u8])> {
+            let mut out = PosWriter { file: &self.file, off, buf: Vec::with_capacity(64 * 1024), sum: Sum64::new() };
+            write(&mut out)?;
+            out.flush()?;
+            if out.sum.len != len as u64 {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "run store payload length"));
+            }
+            let sum = out.sum.finish();
+            let bytes = crate::pack::map_pinned(&self.file, off, len).ok_or_else(|| std::io::Error::other("cannot map a run store payload"))?;
+            Ok((sum, bytes))
+        })();
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.in_flight -= 1;
+        match r {
+            Ok((sum, bytes)) => {
+                let mut h = crate::sip::Sip128::new();
+                h.u128(key);
+                h.u64(len as u64);
+                h.u64(sum);
+                let key = h.finish128();
+                s.index.push(Ix { key, off, len: len as u32, kind, sum });
+                s.written = s.written.max(off + len as u64);
+                s.mapped.entry(key).or_insert(bytes);
+                Appended::Done(key, bytes)
+            }
+            // the reserved range stays a hole: no index entry names it
+            Err(e) => Appended::Failed(e),
+        }
+    }
+
+    /// Makes every payload written so far durable and visible to Store::open: data synced, then
+    /// the merged index into the inactive slot and the header flipped (under the file lock that
+    /// readers take shared).
+    pub fn commit(&self) -> std::io::Result<()> {
+        self.commit_upto(usize::MAX)
+    }
+
+    /// The payloads written so far (commit_upto's argument for references made now).
+    pub fn written(&self) -> usize {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).index.len()
+    }
+
+    /// commit, unless the first `n` payloads written are committed already (by a commit that
+    /// covered them, perhaps made for another writer meanwhile): one sync covers many writers.
+    pub fn commit_upto(&self, n: usize) -> std::io::Result<()> {
+        let _c = self.commit.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut ix, end, n, active) = {
+            let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.committed >= n.min(s.index.len()) { return Ok(()); }
+            (s.index.clone(), s.written, s.index.len(), s.active)
+        };
+        ix.sort_by_key(|e| e.key);
+        ix.dedup_by_key(|e| e.key);
+        self.file.sync_data()?;
+        let ib = encode_index(&ix);
+        let next = 1 - active;
+        let mut h = Header { active: next, cap: self.cap, slots: [(0, 0, 0); 2] };
+        h.slots[next as usize] = (ix.len() as u64, end, sum64(&ib));
+        self.file.lock()?;
+        let r = (|| {
+            write_at(&self.file, &ib, h.slot_off(next))?;
+            write_at(&self.file, &h.bytes(), 0)?;
+            self.file.sync_data()
+        })();
+        let _ = self.file.unlock();
+        r?;
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.committed = n;
+        s.active = next;
+        Ok(())
+    }
+
+    /// A payload this process appended, by key: its mapping.
+    pub fn mapped(&self, key: u128) -> Option<&'static [u8]> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).mapped.get(&key).copied()
+    }
+
+    /// Whether an index slot is still free.
+    pub fn full(&self) -> bool {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.index.len() + s.in_flight >= self.cap as usize
+    }
+}
+
+/// Buffers small writes; large slices go to the file directly (positioned, no seek).
+struct PosWriter<'a> {
+    file: &'a std::fs::File,
+    off: u64,
+    buf: Vec<u8>,
+    sum: Sum64,
+}
+impl Write for PosWriter<'_> {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        if self.sum.len + b.len() as u64 > u32::MAX as u64 {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "store payload exceeds u32"));
+        }
+        self.sum.update(b);
+        if self.buf.len() + b.len() <= self.buf.capacity() {
+            self.buf.extend_from_slice(b);
+        } else {
+            self.flush()?;
+            if b.len() >= self.buf.capacity() {
+                write_at(self.file, b, self.off)?;
+                self.off += b.len() as u64;
+            } else {
+                self.buf.extend_from_slice(b);
+            }
+        }
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        if !self.buf.is_empty() {
+            write_at(self.file, &self.buf, self.off)?;
+            self.off += self.buf.len() as u64;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_at(file: &std::fs::File, b: &[u8], off: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.write_all_at(b, off)
+}
+
+#[cfg(not(unix))]
+fn write_at(file: &std::fs::File, mut b: &[u8], mut off: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !b.is_empty() {
+        let n = file.seek_write(b, off)?;
+        if n == 0 { return Err(std::io::ErrorKind::WriteZero.into()); }
+        b = &b[n..];
+        off += n as u64;
+    }
+    Ok(())
+}
+
 /// A store file name this cache writes: `<crate name>-<16 hex>.rcs` (crate names: letters,
 /// digits, `_`), with or without a generation suffix (`.<g>`).
 pub fn name_ours(n: &str) -> bool {
@@ -703,6 +928,31 @@ mod tests {
         let d = std::env::temp_dir().join(format!("rcs-test-{}-{}", tag, std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn run_store_appends_maps_and_commits() {
+        let d = tmpdir("run");
+        let run = RunStore::create(&d, "front_run", 2).unwrap();
+        assert!(name_ours(&run.name));
+        let put = |payload: &'static [u8]| match run.append(1, 6, payload.len(), &|out| out.write_all(payload)) {
+            Appended::Done(key, bytes) => { assert_eq!(bytes, payload); assert_eq!(bytes.as_ptr() as usize % 8, 0); key }
+            _ => panic!("append"),
+        };
+        let a = put(b"first payload");
+        let b = put(b"second");
+        assert_ne!(a, b, "the payload is part of the key");
+        assert!(matches!(run.append(1, 6, 3, &|out| out.write_all(b"one")), Appended::Full));
+        assert!(Store::open(&run.path).is_some_and(|st| st.index.is_empty()), "nothing is visible before a commit");
+        run.commit().unwrap();
+        let st = Store::open(&run.path).unwrap();
+        assert_eq!(st.get(a).map(|x| x.1), Some(&b"first payload"[..]));
+        assert_eq!(st.get(b).map(|x| x.1), Some(&b"second"[..]));
+        assert!((0..st.index.len()).all(|i| st.verify_at(i)));
+        // a commit with nothing new changes nothing
+        run.commit().unwrap();
+        assert_eq!(Store::open(&run.path).unwrap().generation, st.generation);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

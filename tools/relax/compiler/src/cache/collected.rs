@@ -182,12 +182,16 @@ impl FrontImages {
                     (store.index.binary_search_by_key(&main, |e| e.key).ok()?, store.index.binary_search_by_key(&part, |e| e.key).ok())
                 }
             };
-            let img = mapped_front_entry(store, main, store.index.get(main)?.key)?;
+            let (loc, img) = front_file_entry(store, main, store.index.get(main)?.key)?;
             lap(0, &mut at);
             let mut pf = crate::front::restore_certified(meta, img)?;
+            pf.image = Some(loc);
+            pf.sink = self.sink();
             lap(1, &mut at);
             if let Some(i) = part {
-                if !crate::front::apply_part(&meta.path, &mut pf, mapped_front_entry(store, i, store.index.get(i)?.key)?, cfg, true) { return None; }
+                let (loc, img) = front_file_entry(store, i, store.index.get(i)?.key)?;
+                if !crate::front::apply_part(&meta.path, &mut pf, img, cfg, true) { return None; }
+                pf.part.get_mut()?.image = Some(loc);
             }
             lap(2, &mut at);
             Some(pf)
@@ -200,6 +204,7 @@ impl FrontImages {
                 file_times[0].as_secs_f64() * 1e3, file_times[1].as_secs_f64() * 1e3, file_times[2].as_secs_f64() * 1e3);
         }
         phase("Program");
+        prog.front_sink = self.sink();
         why = "crate identities";
         if prog.crates.len() != graph.crates.len() || prog.crates.iter().zip(&graph.crates)
             .any(|(c, ((name, root), _))| prog.syms.str(c.name) != name || c.root_path() != root) { return None; }

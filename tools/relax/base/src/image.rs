@@ -1,6 +1,7 @@
 //! Front-end images (plans/memory-use.md, "Image design"): a file's parsed state as sections
-//! of plain arrays, written into its crate's store and read back by mapping, so a warm run
-//! neither lexes nor parses and the arrays cost clean pages instead of heap.
+//! of plain arrays, written into the run's image store when the file is final and read back by
+//! mapping from then on (that run and later ones), so the arrays cost clean pages instead of
+//! heap and a warm run neither lexes nor parses.
 //!
 //! Layout of one image (all little endian, the store keeps payloads 8-byte aligned):
 //!   magic u32, version u32, section count u32, 0 u32
@@ -57,7 +58,7 @@ unsafe impl Pod for crate::ast::WherePred {}
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"RFI1");
 /// bump when a section's meaning changes (layouts are covered by the build id)
-pub const VERSION: u32 = 6;
+pub const VERSION: u32 = 7;
 
 const HEAD: usize = 16;
 const ENTRY: usize = 24;

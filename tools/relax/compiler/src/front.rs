@@ -1,12 +1,10 @@
-//! A file's front-end arrays read from its crate's store (plans/memory-use.md, "Image design"):
-//! each completed cold crate is written and mapped before loading continues. Warm files use
-//! the same images (the store name carries the crate fingerprint). The arrays become slices
-//! of the mapping -- clean pages instead of heap. Shared files retain their heap arrays;
-//! mid-run flushes also retire lazily parsed bodies. RELAX_FRONT_COLD_SWAP=0 disables cold
-//! swaps; RELAX_FRONT=0 disables all front images. RELAX_FRONT_VERIFY=1 compares every
-//! section with the parsed one before swapping.
-//!
-//! Whole-crate boot restoration is supplied by cache::FrontImages before preload starts.
+//! A file's front-end arrays as an image (plans/memory-use.md, "Image design"): written once,
+//! when the file is final (Program::map_image at its publication; a lazily parsed part before
+//! ParsedFile::part publishes it), into the run's image store (cache/front_run.rs), and from
+//! then on read through the mapping -- clean file pages instead of heap. Warm runs map the same
+//! images (crate stores refer to them) and read them through the same functions (restore,
+//! apply_part). RELAX_FRONT=0 disables front images; RELAX_FRONT_VERIFY=1 compares every
+//! section with the parse it replaces.
 
 use crate::arena::Arena;
 use crate::image::{Reader, Writer};
@@ -38,8 +36,6 @@ pub static RECORDED_FILES: AtomicU64 = AtomicU64::new(0);
 pub static RECORDED_BYTES: AtomicU64 = AtomicU64::new(0);
 /// images found but not used (another parse result: a bug or a stale store)
 pub static MISMATCHED: AtomicU64 = AtomicU64::new(0);
-/// files with an image that another holder still shares (not swapped)
-pub static SHARED: AtomicU64 = AtomicU64::new(0);
 
 fn mismatch(path: &str, section: &str) -> bool {
     MISMATCHED.fetch_add(1, Ordering::Relaxed);
@@ -96,7 +92,8 @@ pub fn heap_bytes(pf: &ParsedFile) -> usize {
     n
 }
 
-/// Swaps `pf`'s arrays for the image's when the image holds the same parse; false otherwise.
+/// Makes `pf`'s arrays slices of its image when the image holds the same parse; false
+/// otherwise (`pf` unchanged).
 pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     use crate::ast::*;
     let Some(r) = Reader::new(img) else { return false };
@@ -170,19 +167,6 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     true
 }
 
-/// A file's image just became its source: the registry's authored bytes for the file are
-/// now a view of the image's `src[..src_len]` (the one place a ParsedFile's src turning
-/// mapped reaches the registry).
-/// The read snapshots of every context sharing the registry drop their copy (preload workers and
-/// lazy expansion bind the first context, not the file's own crate's).
-pub fn map_sources(contexts: &[std::sync::Arc<crate::source_context::Context>], own: usize, path: &str, pf: &ParsedFile) {
-    if let Arena::Mapped(src) = pf.src {
-        if contexts[own].sources().map_authored(path, &src[..pf.src_len as usize]) {
-            for context in contexts { context.release_read(path); }
-        }
-    }
-}
-
 /// part image sections
 const P_EXT: u32 = 200;
 const P_TOKS: u32 = 201;
@@ -193,29 +177,27 @@ const P_BODIES: u32 = 204;
 const P_BASE: u32 = 205;
 const P_TOKEN_ORIGINS: u32 = 206;
 const P_SOURCES: u32 = 207;
+const P_RULES_EXP: u32 = 208;
+const P_BODY_ORIGIN: u32 = 209;
 const P_AST: u32 = 300;
 
 pub static PARTS_MAPPED: AtomicU64 = AtomicU64::new(0);
 pub static PARTS_RECORDED: AtomicU64 = AtomicU64::new(0);
 
-/// The image of a file's lazily parsed bodies, when this run parsed them (all of them parsed
-/// cleanly; a part with a parse error stays the parser's).
+/// The image of a file's lazily parsed bodies (tests: the published part).
 pub fn encode_part(pf: &ParsedFile) -> Option<Vec<u8>> {
-    Some(part_image(pf)?.finish())
+    Some(part_image(pf, pf.part.get()?, pf.ast.part.get()?)?.finish())
 }
 
-pub fn has_part_image(pf: &ParsedFile) -> bool {
-    pf.part.get().is_some_and(|fp| !fp.bodies.is_empty() && fp.next.get().is_none() && fp.bodies.iter().all(|(_, r)| r.is_ok()))
-        && pf.ast.part.get().is_some_and(|a| a.items.is_empty())
+/// Whether a part gets an image: one segment whose bodies all parsed and made no item (a
+/// part with a parse error stays the parser's).
+fn part_qualifies(fp: &crate::parser::FilePart, a: &crate::ast::Ast) -> bool {
+    !fp.bodies.is_empty() && fp.next.get().is_none() && fp.bodies.iter().all(|(_, r)| r.is_ok()) && a.items.is_empty()
 }
 
-pub fn part_image(pf: &ParsedFile) -> Option<Writer<'_>> {
-    if !has_part_image(pf) { return None; }
-    let fp = pf.part.get()?;
-    let a = pf.ast.part.get()?;
-    if !a.items.is_empty() {
-        return None;
-    }
+/// The image of part `fp` (with its AST part `a`) of `pf`, if it qualifies.
+pub fn part_image<'a>(pf: &'a ParsedFile, fp: &'a crate::parser::FilePart, a: &'a crate::ast::Ast) -> Option<Writer<'a>> {
+    if !part_qualifies(fp, a) { return None; }
     let mut bodies: Vec<u32> = Vec::new();
     for (item, r) in fp.bodies.iter() {
         let (b, rg) = r.ok()?;
@@ -238,28 +220,18 @@ pub fn part_image(pf: &ParsedFile) -> Option<Writer<'_>> {
     }
     ast_arrays!(put);
     let _ = k;
+    // its macro_rules expansions (hygiene), after the tree
+    w.add(P_RULES_EXP, &fp.rules_exp);
+    w.add(P_BODY_ORIGIN, &fp.body_origin);
     Some(w)
 }
 
-/// Warm restore before anything asked for bodies. Verify mode compares a fresh parse.
-/// `certified`: the image belongs to a certified collected graph (restore_origins).
-pub fn apply_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet, certified: bool) -> bool {
-    if pf.part.get().is_some() || pf.ast.part.get().is_some() { return false; }
-    swap_part_in(path, pf, img, cfg, certified)
-}
-
-/// Also accepts an already parsed part, retiring its heap only after comparison. Called
-/// with exclusive file access and, mid-run, both the unit and front-end write locks held.
-pub fn swap_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet) -> bool {
-    swap_part_in(path, pf, img, cfg, false)
-}
-fn swap_part_in(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet, certified: bool) -> bool {
+/// A part read from its image, continuing a file whose arrays end at `ends` (AST ids) and
+/// `src`/`toks`/`rules` (positions); `sources`: the file's registry (restore_origins).
+fn part_from_image(path: &str, ends: [u32; crate::ast::ARENAS], (src, toks, rules): (usize, usize, usize), img: &'static [u8], sources: &mut Option<std::sync::Arc<SourceRegistry>>, certified: bool) -> Option<(crate::parser::FilePart, crate::ast::Ast)> {
     use crate::ast::*;
-    if pf.lazy.is_none() {
-        return false;
-    }
-    let Some(r) = Reader::new(img) else { return false };
-    let (Some(ext), Some(toks), Some(em), Some(to), Some(bodies), Some(base), Some(origins), Some(sources)) = (
+    let Some(r) = Reader::new(img) else { return None };
+    let (Some(ext), Some(ptoks), Some(em), Some(to), Some(bodies), Some(base), Some(origins), Some(srcs)) = (
         r.slice::<u8>(0, P_EXT),
         r.slice::<crate::lexer::Tok>(1, P_TOKS),
         r.slice::<(u32, u32, u32)>(2, P_EXP_MAP),
@@ -269,67 +241,95 @@ fn swap_part_in(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate
         r.slice::<TokenOrigin>(6, P_TOKEN_ORIGINS),
         r.slice::<u8>(7, P_SOURCES),
     ) else {
-        return mismatch(path, "part.sections");
+        mismatch(path, "part.sections");
+        return None;
     };
-    let Some(origins) = restore_origins(origins, sources, &mut pf.sources, certified) else { return mismatch(path, "part.sources"); };
+    let Some(origins) = restore_origins(origins, srcs, sources, certified) else { mismatch(path, "part.sources"); return None; };
     // the part continues the file's ids and positions: its base must be the file's ends
-    if base != &pf.ast.ends()[..] { return mismatch(path, "part.base"); }
-    if bodies.len() % 6 != 0 { return mismatch(path, "part.bodies"); }
+    if base != &ends[..] { mismatch(path, "part.base"); return None; }
+    if bodies.len() % 6 != 0 { mismatch(path, "part.bodies"); return None; }
     let mut a = Ast::default();
     a.base.copy_from_slice(base);
     let mut k = 0usize;
     macro_rules! get {
         ($($f:ident: $t:ident),*) => {
-            $( match r.slice::<$t>(8 + k, P_AST + k as u32) { Some(x) => a.$f = Arena::Mapped(x), None => return mismatch(path, concat!("part.ast.", stringify!($f))) } k += 1; )*
+            $( match r.slice::<$t>(8 + k, P_AST + k as u32) { Some(x) => a.$f = Arena::Mapped(x), None => { mismatch(path, concat!("part.ast.", stringify!($f))); return None; } } k += 1; )*
         };
     }
     ast_arrays!(get);
-    let _ = k;
+    let (Some(rules_exp), Some(body_origin)) = (r.slice::<(u32, u32, u32)>(8 + k, P_RULES_EXP), r.slice::<(u32, u32, u32)>(9 + k, P_BODY_ORIGIN)) else {
+        mismatch(path, "part.rules");
+        return None;
+    };
     let fp = crate::parser::FilePart {
-        src_base: pf.src.len() as u32, tok_base: pf.toks.len() as u32, rules_base: pf.rules_exp.len() as u32,
-        rules_exp: Default::default(), body_origin: Default::default(), next: Default::default(),
+        src_base: src as u32, tok_base: toks as u32, rules_base: rules as u32,
+        rules_exp: Arena::Mapped(rules_exp), body_origin: Arena::Mapped(body_origin), next: Default::default(),
         ext: Arena::Mapped(ext),
-        toks: Arena::Mapped(toks),
+        toks: Arena::Mapped(ptoks),
         exp_map: Arena::Mapped(em),
         tok_origin: Arena::Mapped(to),
         token_origins: origins,
         bodies: crate::parser::PartBodies::Mapped(bodies),
+        image: None,
     };
-    // This function also retires a part parsed during this run. Exclusive access to the
-    // file is required by the signature; callers must first drop every worker Arc.
-    // Compare an existing part before discarding it, including in non-verify mode.
-    let old_part = pf.part.take();
-    let old_ast = pf.ast.part.take();
-    if old_part.is_some() != old_ast.is_some() {
-        if let Some(p) = old_part { let _ = pf.part.set(p); }
-        if let Some(a) = old_ast { let _ = pf.ast.part.set(a); }
-        return false;
+    Some((fp, a))
+}
+
+/// Whether part `a` (with its AST `aa`) holds the same parse as `b` (`ba`): every array's
+/// length, and verifying, every array's contents.
+fn same_part(a: &crate::parser::FilePart, aa: &crate::ast::Ast, b: &crate::parser::FilePart, ba: &crate::ast::Ast) -> bool {
+    let v = verify();
+    let mut s = aa.base == ba.base && a.bodies.iter().eq(b.bodies.iter()) && a.ext.len() == b.ext.len() && a.toks.len() == b.toks.len()
+        && a.exp_map.len() == b.exp_map.len() && a.tok_origin.len() == b.tok_origin.len() && a.token_origins.len() == b.token_origins.len()
+        && a.rules_exp.len() == b.rules_exp.len() && a.body_origin.len() == b.body_origin.len();
+    if v {
+        s = s && a.ext[..] == b.ext[..] && tok_bytes(&a.toks) == tok_bytes(&b.toks) && a.exp_map[..] == b.exp_map[..] && a.tok_origin[..] == b.tok_origin[..] && a.token_origins[..] == b.token_origins[..]
+            && a.rules_exp[..] == b.rules_exp[..] && a.body_origin[..] == b.body_origin[..];
     }
-    if verify() || old_part.is_some() {
-        // Verify reparses as a warm run would. Otherwise use the existing parse and the
-        // same length checks as the main image, avoiding AST formatting under the unit lock.
-        let (fresh, fresh_ast) = if verify() || old_part.is_none() {
-            (Box::new(crate::parser::parse_part(pf, cfg)), pf.ast.part.take())
-        } else {
-            (old_part.unwrap(), old_ast)
+    macro_rules! cmp {
+        ($($f:ident: $t:ident),*) => {
+            $( s = s && aa.$f.len() == ba.$f.len() && (!v || format!("{:?}", &aa.$f[..]) == format!("{:?}", &ba.$f[..])); )*
         };
-        let same = fresh_ast.as_ref().map_or(false, |fa| {
-            let mut s = fa.base == a.base && format!("{:?}", fresh.bodies) == format!("{:?}", fp.bodies) && &fresh.ext[..] == &fp.ext[..] && tok_bytes(&fresh.toks) == tok_bytes(&fp.toks) && &fresh.exp_map[..] == &fp.exp_map[..] && &fresh.tok_origin[..] == &fp.tok_origin[..] && fresh.token_origins[..] == fp.token_origins[..];
-            macro_rules! cmp {
-                ($($f:ident: $t:ident),*) => {
-                    $( s = s && fa.$f.len() == a.$f.len() && (!verify() || format!("{:?}", &fa.$f[..]) == format!("{:?}", &a.$f[..])); )*
-                };
-            }
-            ast_arrays!(cmp);
-            s
-        });
-        if !same {
-            mismatch(path, "part.verify");
-            if let Some(fa) = fresh_ast {
-                let _ = pf.ast.part.set(fa);
-            }
-            let _ = pf.part.set(fresh);
-            return false;
+    }
+    ast_arrays!(cmp);
+    s
+}
+
+/// A part this run parsed, before its publication (ParsedFile::part): its arrays become slices
+/// of its image when the image holds the same parse.
+pub fn map_part(path: &str, pf: &ParsedFile, fp: &mut crate::parser::FilePart, a: &mut crate::ast::Ast, img: &'static [u8]) -> bool {
+    let mut sources = pf.sources.clone();
+    let Some((mfp, ma)) = part_from_image(path, a.base, (fp.src_base as usize, fp.tok_base as usize, fp.rules_base as usize), img, &mut sources, false) else { return false };
+    // the part's source registry is its file's: an image must not need another one
+    let same_registry = match (&sources, &pf.sources) {
+        (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_registry || !same_part(&mfp, &ma, fp, a) {
+        return mismatch(path, "part.verify");
+    }
+    *fp = mfp;
+    *a = ma;
+    PARTS_MAPPED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Warm restore before anything asked for bodies. Verify mode compares a fresh parse.
+/// `certified`: the image belongs to a certified collected graph (restore_origins).
+pub fn apply_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet, certified: bool) -> bool {
+    if pf.part.get().is_some() || pf.ast.part.get().is_some() || pf.lazy.is_none() { return false; }
+    let base = (pf.src.len(), pf.toks.len(), pf.rules_exp.len());
+    let ends = pf.ast.ends();
+    let mut sources = pf.sources.take();
+    let got = part_from_image(path, ends, base, img, &mut sources, certified);
+    pf.sources = sources;
+    let Some((fp, a)) = got else { return false };
+    if verify() {
+        // Verify reparses as a warm run would.
+        let (fresh, fresh_ast) = crate::parser::parse_part(pf, cfg);
+        if !same_part(&fp, &a, &fresh, &fresh_ast) {
+            return mismatch(path, "part.verify");
         }
     }
     let _ = pf.ast.part.set(Box::new(a));
@@ -444,12 +444,11 @@ fn same_origins(a: &ParsedFile, ao: &[TokenOrigin], b: &ParsedFile, bo: &[TokenO
 pub fn summary() -> Option<String> {
     let (m, r) = (MAPPED_FILES.load(Ordering::Relaxed), RECORDED_FILES.load(Ordering::Relaxed));
     let bad = MISMATCHED.load(Ordering::Relaxed);
-    let shared = SHARED.load(Ordering::Relaxed);
-    if m + r + bad + shared == 0 {
+    if m + r + bad == 0 {
         return None;
     }
     Some(format!(
-        "relax-front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} files shared (kept on the heap), {} mapped arrays copied back by a change ({:.1} MB)",
+        "relax-front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} mapped arrays copied back by a change ({:.1} MB)",
         PARTS_MAPPED.load(Ordering::Relaxed),
         PARTS_RECORDED.load(Ordering::Relaxed),
         m,
@@ -457,7 +456,6 @@ pub fn summary() -> Option<String> {
         r,
         RECORDED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
         bad,
-        shared,
         crate::arena::COPIES.load(Ordering::Relaxed),
         crate::arena::COPIED_BYTES.load(Ordering::Relaxed) as f64 / 1e6
     ))
@@ -512,6 +510,8 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
         line_starts: Default::default(),
         part: Default::default(),
         impl_heads: Default::default(),
+        image: None,
+        sink: None,
     })
 }
 
@@ -611,8 +611,13 @@ mod tests {
         unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, bytes.len()) }
     }
 
+    /// A part image built from the part before its publication.
+    fn part_bytes(f: &ParsedFile, fp: &crate::parser::FilePart, a: &crate::ast::Ast) -> &'static [u8] {
+        image(part_image(f, fp, a).unwrap().finish())
+    }
+
     #[test]
-    fn cold_main_and_late_part_swap_match_fresh_parse() {
+    fn cold_main_and_part_map_before_publication_match_fresh_parse() {
         let sess = &std::sync::Arc::new(crate::Session::default());
         let (mut f, cfg) = lazy_file(sess);
         let main = image(encode(&f));
@@ -621,38 +626,38 @@ mod tests {
         assert_eq!(heap_bytes(&f), 0);
         let (fresh, _) = lazy_file(sess);
         verify_file(&f, &fresh);
-        f.part(&cfg).unwrap();
-        let part = image(encode_part(&f).unwrap());
-        assert!(f.ast.part.get().unwrap().exprs.heap_bytes() > 0);
-        assert!(swap_part("test.rs", &mut f, part, &cfg));
-        assert_eq!(f.ast.part.get().unwrap().exprs.heap_bytes(), 0);
-        assert_eq!(f.part.get().unwrap().toks.heap_bytes(), 0);
-        // The warm path must produce exactly the same ids and body ranges.
+        let (mut fp, mut a) = crate::parser::parse_part(&f, &cfg);
+        let part = part_bytes(&f, &fp, &a);
+        assert!(a.exprs.heap_bytes() > 0);
+        assert!(map_part("test.rs", &f, &mut fp, &mut a, part));
+        assert_eq!(a.exprs.heap_bytes(), 0);
+        assert_eq!(fp.toks.heap_bytes(), 0);
+        // The warm path reads the same image to exactly the same ids and body ranges.
         let (mut warm, _) = lazy_file(sess);
         assert!(apply("test.rs", &mut warm, main));
         assert!(apply_part("test.rs", &mut warm, part, &cfg, false));
-        assert_eq!(format!("{:?}", f.part.get().unwrap().bodies), format!("{:?}", warm.part.get().unwrap().bodies));
-        assert_eq!(format!("{:?}", f.ast.part.get().unwrap().exprs), format!("{:?}", warm.ast.part.get().unwrap().exprs));
+        assert_eq!(format!("{:?}", fp.bodies), format!("{:?}", warm.part.get().unwrap().bodies));
+        assert_eq!(format!("{:?}", a.exprs), format!("{:?}", warm.ast.part.get().unwrap().exprs));
     }
 
     #[test]
-    fn cold_part_rejection_preserves_existing_heap() {
+    fn cold_part_rejection_keeps_the_parse() {
         let sess = &std::sync::Arc::new(crate::Session::default());
-        let (mut f, cfg) = lazy_file(sess);
-        f.part(&cfg).unwrap();
-        let before = format!("{:?}", f.ast.part.get().unwrap().exprs);
-        let mut bytes = encode_part(&f).unwrap();
+        let (f, cfg) = lazy_file(sess);
+        let (mut fp, mut a) = crate::parser::parse_part(&f, &cfg);
+        let before = format!("{:?}", a.exprs);
+        let mut bytes = part_image(&f, &fp, &a).unwrap().finish();
         bytes[0] ^= 1; // invalid image header
-        assert!(!swap_part("test.rs", &mut f, image(bytes), &cfg));
-        assert_eq!(before, format!("{:?}", f.ast.part.get().unwrap().exprs));
-        assert!(!f.part.get().unwrap().toks.is_mapped());
+        assert!(!map_part("test.rs", &f, &mut fp, &mut a, image(bytes)));
+        assert_eq!(before, format!("{:?}", a.exprs));
+        assert!(!fp.toks.is_mapped());
         // A structurally valid image with different body ids must also leave the parse intact.
-        let mut bytes = encode_part(&f).unwrap();
+        let mut bytes = part_image(&f, &fp, &a).unwrap().finish();
         let table = 16 + 4 * 24; // P_BODIES section descriptor
         let at = u64::from_le_bytes(bytes[table..table + 8].try_into().unwrap()) as usize;
         bytes[at + 4] ^= 1;
-        assert!(!swap_part("test.rs", &mut f, image(bytes), &cfg));
-        assert_eq!(before, format!("{:?}", f.ast.part.get().unwrap().exprs));
-        assert!(!f.part.get().unwrap().toks.is_mapped());
+        assert!(!map_part("test.rs", &f, &mut fp, &mut a, image(bytes)));
+        assert_eq!(before, format!("{:?}", a.exprs));
+        assert!(!fp.toks.is_mapped());
     }
 }

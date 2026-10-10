@@ -595,6 +595,9 @@ pub struct Program {
     /// source buffers as additional files on disk.
     pub front_macro_fragments: crate::fxhash::HashSet<usize>,
     pub record_front: bool,
+    /// Writes each published file's image and maps its arrays from it (ImageSink::file; None:
+    /// files stay on the heap).
+    pub front_sink: Option<std::sync::Arc<dyn crate::parser::ImageSink>>,
     /// lines of the loaded files (with expansion text)
     pub lines_loaded: usize,
     /// The files the boot loaded (they come first; the post-boot loader appends the files the
@@ -807,6 +810,7 @@ impl Program {
             front_files: Vec::new(),
             front_macro_fragments: crate::fxhash::HashSet::default(),
             record_front: false,
+            front_sink: None,
             lines_loaded: 0,
             boot_files: usize::MAX,
             exec_profile_files: Default::default(),
@@ -1472,6 +1476,25 @@ impl Program {
         out
     }
 
+    /// A file of crate `krate` at its publication (final: cfg-stripped, its sources bound, its
+    /// speculative parse accepted): its image is written and its arrays become slices of the
+    /// mapping before it is shared, so its parse arrays leave the heap here. The registry's
+    /// authored bytes for the file become a view of the image too, and the read snapshots of
+    /// every context sharing the registry drop their copy (preload workers and lazy expansion
+    /// bind the first context, not the file's own crate's).
+    fn map_image(&self, path: &str, krate: u32, pf: &mut ParsedFile) {
+        let Some(sink) = &self.front_sink else { return };
+        if pf.image.is_some() { return; }
+        let _profile = crate::load_profile::span(self.session.runtime.profile, "front-image-write", path);
+        if !sink.file(path, pf) { return; }
+        pf.sink = Some(sink.clone());
+        if let (crate::arena::Arena::Mapped(src), Some(c)) = (&pf.src, self.crates.get(krate as usize)) {
+            if c.context.sources().map_authored(path, &src[..pf.src_len as usize]) {
+                for c in &self.crates { c.context.release_read(path); }
+            }
+        }
+    }
+
     fn load_file(&mut self, path: &str, edition: u16, krate: u32) -> Result<u32, String> {
         crate::why::event("load", path, 0, "", None);
         let _profile = crate::load_profile::span(self.session.runtime.profile, "load-file", path);
@@ -1596,6 +1619,7 @@ impl Program {
             let s = std::str::from_utf8(pf.bytes(lo, hi)).unwrap_or("?");
             self.syms.intern(s);
         }
+        self.map_image(path, krate, &mut pf);
         let pf = std::sync::Arc::new(pf);
         // a std file of the program's load: the proc-macro world takes it from here
         if std_file && !self.std_from_shared && SHARING.load(std::sync::atomic::Ordering::Acquire) {
@@ -1714,6 +1738,7 @@ impl Program {
                     table.add_exp_uses(&kname, used.uses);
                 }
                 self.front_macro_fragments.insert(self.files.len());
+                self.map_image(&path, krate, &mut pf);
                 self.files.push(std::sync::Arc::new(pf));
                 self.file_paths.push(path);
                 self.exec_profile_file(self.file_paths.len() as u32 - 1);
@@ -1860,7 +1885,9 @@ impl Program {
         self.source_versions.insert(new, v.context.clone());
         self.edit_versions.push(new);
         self.crates[krate as usize].context = v.context;
-        self.files.push(std::sync::Arc::new(v.pf));
+        let mut pf = v.pf;
+        self.map_image(&v.path, krate, &mut pf);
+        self.files.push(std::sync::Arc::new(pf));
         self.file_paths.push(v.path);
         self.exec_profile_file(self.file_paths.len() as u32 - 1);
         self.file_crate.push(krate);
@@ -2788,6 +2815,7 @@ impl Program {
             let s = std::str::from_utf8(pf.bytes(lo, hi)).unwrap_or("?").to_string();
             self.syms.intern(&s);
         }
+        self.map_image(path, krate, &mut pf);
         self.files.push(std::sync::Arc::new(pf));
         self.file_paths.push(path.to_string());
         self.exec_profile_file(self.file_paths.len() as u32 - 1);
@@ -4538,43 +4566,6 @@ impl Drop for WorldWait {
 pub fn share_std_end() {
     let _g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
     SHARING.store(false, std::sync::atomic::Ordering::Release);
-    SHARED_CV.notify_all();
-}
-
-/// Runs `f` with the std shares detached from the program's files (so each file's Arc is the
-/// program's alone and `f` can change it, front.rs), then shares the program's files again --
-/// the same files, as `f` left them. An entry another holder still has stays as it is.
-pub fn without_std_shares(files: &mut Vec<std::sync::Arc<ParsedFile>>, paths: &[String], f: impl FnOnce(&mut Vec<std::sync::Arc<ParsedFile>>)) {
-    let taken = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(std::mem::take);
-    let Some(taken) = taken else {
-        f(files);
-        return;
-    };
-    let mut kept = Vec::new();
-    let mut parked = Vec::new();
-    for (path, sp) in taken {
-        match std::sync::Arc::try_unwrap(sp) {
-            Ok(SharedParse { pf, used, idents, blocks, lines, edition, cfg, mod_path }) => {
-                drop(pf);
-                parked.push((path, used, idents, blocks, lines, edition, cfg, mod_path));
-            }
-            Err(sp) => kept.push((path, sp)),
-        }
-    }
-    f(files);
-    let at: HashMap<&str, usize> = paths.iter().enumerate().map(|(i, p)| (p.as_str(), i)).collect();
-    let mut g = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(HashMap::default);
-    for (path, sp) in kept {
-        m.insert(path, sp);
-    }
-    for (path, used, idents, blocks, lines, edition, cfg, mod_path) in parked {
-        if let Some(pf) = at.get(path.as_str()).and_then(|&i| files.get(i)) {
-            let pf = pf.clone();
-            m.insert(path, std::sync::Arc::new(SharedParse { pf, used, idents, blocks, lines, edition, cfg, mod_path }));
-        }
-    }
-    // A cold load can temporarily detach these while a proc-macro world waits for std.
     SHARED_CV.notify_all();
 }
 

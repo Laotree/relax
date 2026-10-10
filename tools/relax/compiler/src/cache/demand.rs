@@ -53,8 +53,7 @@ impl DemandWriter for Images {
         let main = Cache::front_key(path, hash);
         let image = *self.main.entry(main).or_insert_with(|| {
             let ix = self.store.index.binary_search_by_key(&main, |e| e.key).ok()?;
-            if !self.store.verify_at(ix) { return None; }
-            let r = Reader::new(mapped_front_entry(&self.store, ix, main)?)?;
+            let r = Reader::new(checked_front_entry(&self.store, ix, main)?)?;
             Some((r.slice::<u8>(0, 1)?, r.slice::<Tok>(1, 2)?))
         });
         let src_hash = crate::crate_image::file_hash("", src);
@@ -124,8 +123,7 @@ impl ReadImages {
         let store = self.stores.get(name)?;
         let ix = store.index.binary_search_by_key(&key, |e| e.key).ok()?;
         // Do not expose unchecked native token discriminants to a planning worker.
-        if !store.verify_at(ix) { return None; }
-        let bytes = mapped_front_entry(store, ix, key)?;
+        let bytes = checked_front_entry(store, ix, key)?;
         self.images.insert(id, bytes);
         Some(bytes)
     }
