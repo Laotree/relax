@@ -28,7 +28,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
     let table = match crate::vfs::read_to_string(format!("{}/substitutes.txt", std_dir)) {
         Ok(t) => t,
         Err(_) => {
-            crate::macro_reg::register_and_strip(sess, units, std_dir);
+            crate::macro_reg::register_and_strip(sess, units, std_dir)?;
             return Ok(());
         }
     };
@@ -57,7 +57,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
         }
     }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
-    crate::macro_reg::register_and_strip(sess, units, std_dir);
+    crate::macro_reg::register_and_strip(sess, units, std_dir)?;
     Ok(())
 }
 

@@ -22,9 +22,9 @@ pub trait MacroRunner: Send + Sync {
         Err("macro has no declaration surface".into())
     }
     /// The crate graph was registered (its source-matched native entries are known from now).
-    fn registered(&self, _sess: &std::sync::Arc<crate::Session>) {}
+    fn registered(&self, _sess: &std::sync::Arc<crate::Session>) -> Result<(), String> { Ok(()) }
     /// The registered graph's load will expand macros: a runner may start building what it needs.
-    fn prewarm(&self, sess: &std::sync::Arc<crate::Session>);
+    fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String>;
     /// Runs macro fn `entry` on `input`.
     fn call(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry, input: &TokenStream, call_span: Span) -> Result<TokenStream, String>;
     /// Runs attribute macro fn `entry` on its arguments `attr` and the item `item`.
@@ -77,7 +77,7 @@ pub struct Entry {
     pub kind: Kind,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Reg {
     pub units: Vec<UnitInfo>,
     pub std_dir: String,
@@ -270,7 +270,7 @@ pub fn stats() -> HostStats {
 }
 
 /// The loader's crate graph and std dir (before loading crates).
-fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir: &str) {
+fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir: &str) -> Result<(), String> {
     let mut reg = Reg { std_dir: std_dir.to_string(), ..Default::default() };
     for u in units {
         reg.units.push(UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.clone(), proc_macro: u.proc_macro });
@@ -291,32 +291,34 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     REG.with(|r| *r.borrow_mut() = Some(reg));
     if let Some(r) = RUNNER.get() {
         // a world built during the program's load takes its core/alloc/std from that load
+        r.registered(sess)?;
         crate::program::share_std_begin();
-        r.registered(sess);
     }
+    Ok(())
 }
 
 /// The boot driver's load will expand macros (it is not a warm restore of the whole program):
 /// the runner starts building what it needs now. Without this call the world is built on the
 /// first expansion (a warm start's first live edit that adds a derive).
-pub fn prewarm(sess: &std::sync::Arc<crate::Session>) {
+pub fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
     if let Some(r) = RUNNER.get() {
-        r.prewarm(sess);
+        r.prewarm(sess)?;
     }
+    Ok(())
 }
 
 /// Registers the graph with the host (when std provides `proc_macro`), then makes the app
 /// graph see proc-macro crates, and the crates only they depend on, as empty crates: they run in
 /// the macro world, never in the app (rustc also links them into the compiler, not the app).
-pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str) {
+pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str) -> Result<(), String> {
     let empty = format!("{}/proc_macro/empty.rs", std_dir);
     if trace() {
         eprintln!("pmhost: graph of {} units ({} proc-macro), std {}", units.len(), units.iter().filter(|u| u.proc_macro).count(), std_dir);
     }
+    register(sess, units, std_dir)?;
     if !crate::vfs::exists(&empty) {
-        return;
+        return Ok(());
     }
-    register(sess, units, std_dir);
     // units reachable from a non-proc-macro unit stay; the rest is host-only
     let n = units.len();
     let mut app = vec![false; n];
@@ -346,6 +348,7 @@ pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [Cr
             units[i].features.clear();
         }
     }
+    Ok(())
 }
 
 /// Is `name` a derive or proc macro of a registered proc-macro crate?

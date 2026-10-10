@@ -34,7 +34,7 @@ fn amp_parse_medians() {
                 features: vec![], deps,  proc_macro, build_script: false, version: "1.0.0".into() }
         }).collect::<Vec<_>>();
         crate::pmhost::install();
-        crate::macro_reg::register_and_strip(sess, &mut units, &crate::std_dir());
+        crate::macro_reg::register_and_strip(sess, &mut units, &crate::std_dir()).unwrap();
         crate::program::share_std_end();
     }
     let fallback = if hosted { "" } else {

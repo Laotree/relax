@@ -674,9 +674,9 @@ pub fn default_parse_jobs() -> usize {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
-    /// Source-matched linked proc macros; RELAX_NATIVE_MACROS=0 retains the JIT path.
+    /// Legacy switch retained to diagnose RELAX_NATIVE_MACROS=0 as a policy error.
     pub native_macros: bool,
-    /// Compare every native expansion (including spans) with its hosted implementation.
+    /// Legacy differential switch; RELAX_NATIVE_VERIFY=1 conflicts with native-only macros.
     pub native_verify: bool,
     /// Reparse accepted worker files in collection scope and compare their complete ASTs.
     pub parse_verify: bool,
@@ -740,6 +740,16 @@ impl Default for RuntimeOptions {
 }
 
 impl RuntimeOptions {
+    pub fn validate_native_macros(&self) -> Result<(), String> {
+        if !self.native_macros {
+            return Err("RELAX_NATIVE_MACROS=0 conflicts with native-only Makepad proc macros; unset it and rebuild relax to use changed macro sources".into());
+        }
+        if self.native_verify {
+            return Err("RELAX_NATIVE_VERIFY=1 conflicts with native-only Makepad proc macros; unset it (hosted differential expansion is not supported)".into());
+        }
+        Ok(())
+    }
+
     pub fn from_env() -> Self {
         Self::read(&|name| std::env::var_os(name))
     }

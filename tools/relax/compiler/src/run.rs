@@ -157,6 +157,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut driver_options = sess.options.clone();
     crate::registry_net::install();
     crate::pmhost::install();
+    if let Err(e) = sess.runtime.validate_native_macros() {
+        eprintln!("relax-run: {e}");
+        return 1;
+    }
     jit::COMPILE_ERRORS_FATAL.store(true, Ordering::Relaxed);
     jit::FAULTS_FATAL.store(true, Ordering::Relaxed);
     crate::clock::mark_start();
@@ -370,6 +374,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         .zip(g.pkg.iter())
         .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
         .collect();
+    // Validate native macros before any overlapping provided-crate identity error.
+    if let Err(e) = crate::crates::apply_substitutes(sess, &mut g.crates, &std_dir) {
+        eprintln!("relax-run: crate substitution: {}", e);
+        return 1;
+    }
     // Shim generation inspects source without executing it, including while bootstrapping.
     if !check || host_gen.is_none() {
         if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
@@ -378,10 +387,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     phase("provided sources", ts);
-    if let Err(e) = crate::crates::apply_substitutes(sess, &mut g.crates, &std_dir) {
-        eprintln!("relax-run: crate substitution: {}", e);
-        return 1;
-    }
     if crate::preload::trace() {
         eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
     }
@@ -480,7 +485,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // a load that parses crates expands their macros: the proc-macro world starts building on
     // its own thread now. A warm restore of the whole program expands nothing: no world (the
     // first live edit that expands builds it).
-    if !collected_restored { crate::macro_reg::prewarm(sess); }
+    if !collected_restored {
+        if let Err(e) = crate::macro_reg::prewarm(sess) {
+            eprintln!("relax-run: {e}");
+            return 1;
+        }
+    }
     // the whole program came from the collected store: it holds this program already
     COLLECTED_CURRENT.store(collected_restored, Ordering::Relaxed);
     let collected_suffix = restored.as_ref().filter(|_| !collected_restored)

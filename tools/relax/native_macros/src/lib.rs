@@ -1,5 +1,5 @@
 //! Source-matched native expansions. The compiler validates PACKAGES against the loaded
-//! graph before using these functions; every other source version stays on the JIT path.
+//! graph before using these functions; a different source version is a hard error.
 use relax_base::pm::{Span, TokenStream};
 mod sources;
 pub use sources::{PACKAGES, DEPENDENCIES};

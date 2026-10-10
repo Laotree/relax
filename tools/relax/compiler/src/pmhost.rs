@@ -47,44 +47,37 @@ pub extern "C" fn relax_pm_parse(src: *const u8, len: usize, out: *mut *const u8
 struct JitRunner;
 
 impl crate::macro_reg::MacroRunner for JitRunner {
-    fn native(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_some() }
+    fn native(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_ok_and(|n| n.is_some()) }
     fn declaration_surface(&self, entry: &Entry) -> bool {
-        crate::native_macros::find(entry).is_some_and(|native| native.declaration.is_some())
+        crate::native_macros::find(entry).is_ok_and(|n| n.is_some_and(|native| native.declaration.is_some()))
     }
     fn declare(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry,
         attr: Option<&TokenStream>, input: &TokenStream, span: Span) -> Result<TokenStream, String> {
-        let native = crate::native_macros::find(entry).ok_or("macro declaration source does not match")?;
+        let native = crate::native_macros::find(entry)?.ok_or("macro declaration source does not match")?;
         let _profile = crate::load_profile::span(sess.runtime.profile, "macro-declaration", &entry.fname);
         native.declarations(attr, input, span)
     }
-    fn reusable(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_some() }
-    fn registered(&self, sess: &std::sync::Arc<crate::Session>) {
-        crate::native_macros::prepare(sess.runtime.native_macros);
+    fn reusable(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_ok_and(|n| n.is_some()) }
+    fn registered(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
+        sess.runtime.validate_native_macros()?;
+        crate::native_macros::prepare()
     }
-    fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) {
-        prewarm(sess);
+    fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
+        sess.runtime.validate_native_macros()?;
+        crate::native_macros::prepare()?;
+        prewarm(sess)
     }
     fn call(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry, input: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
-        if let Some(native) = crate::native_macros::find(entry) {
+        if let Some(native) = crate::native_macros::find(entry)? {
             let _profile = crate::load_profile::span(sess.runtime.profile, "macro-native", &entry.fname);
-            let result = native.call(None, input, call_span);
-            if sess.runtime.native_verify {
-                let hosted = call(sess, entry, None, input, call_span);
-                assert_eq!(result.as_ref().map(|ts| crate::pm::encode(call_span, ts)), hosted.as_ref().map(|ts| crate::pm::encode(call_span, ts)), "native macro {}", entry.fname);
-            }
-            return result;
+            return native.call(None, input, call_span);
         }
         call(sess, entry, None, input, call_span)
     }
     fn call_attr(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry, attr: &TokenStream, item: &TokenStream, call_span: Span) -> Result<TokenStream, String> {
-        if let Some(native) = crate::native_macros::find(entry) {
+        if let Some(native) = crate::native_macros::find(entry)? {
             let _profile = crate::load_profile::span(sess.runtime.profile, "macro-native", &entry.fname);
-            let result = native.call(Some(attr), item, call_span);
-            if sess.runtime.native_verify {
-                let hosted = call(sess, entry, Some(attr), item, call_span);
-                assert_eq!(result.as_ref().map(|ts| crate::pm::encode(call_span, ts)), hosted.as_ref().map(|ts| crate::pm::encode(call_span, ts)), "native attribute {}", entry.fname);
-            }
-            return result;
+            return native.call(Some(attr), item, call_span);
         }
         call(sess, entry, Some(attr), item, call_span)
     }
@@ -215,18 +208,19 @@ pub fn free_world() -> bool {
 /// Starts building the world on its own thread when the graph has proc macros the JIT host
 /// runs (none linked for them): it is ready, or nearly, when the first file needs it. Only for
 /// a load that parses (run.rs); a warm restore builds it on the first expansion instead.
-fn prewarm(sess: &std::sync::Arc<crate::Session>) {
-    let (derives, bangs) = REG.with(|r| match r.borrow().as_ref() {
-        Some(r) => (r.derives.iter().filter(|x| crate::native_macros::find(&x.1).is_none()).map(|x| x.0.clone()).collect::<Vec<_>>(), r.macros.iter().filter(|x| crate::native_macros::find(&x.1).is_none()).map(|x| x.0.clone()).collect::<Vec<_>>()),
-        None => (Vec::new(), Vec::new()),
-    });
-    let hosted = sess.runtime.native_verify || !derives.is_empty() || !bangs.is_empty();
+fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
+    let entries = REG.with(|r| r.borrow().as_ref().map(|reg|
+        reg.derives.iter().chain(&reg.macros).map(|(_, e)| e.clone()).collect::<Vec<_>>()
+    ).unwrap_or_default());
+    let mut hosted = false;
+    for entry in entries { hosted |= crate::native_macros::find(&entry)?.is_none(); }
     if hosted && world_now().is_none() {
         let sess = sess.clone();
         let _ = std::thread::Builder::new().name("relax-pm-world".to_string()).stack_size(64 << 20).spawn(move || {
             let _ = world(&sess);
         });
     }
+    Ok(())
 }
 
 
@@ -292,9 +286,9 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let _mem = crate::memstat::tag(crate::memstat::Tag::PmHost);
     let reg = REG.with(|r| r.borrow().as_ref().map(|r| (r.units.clone(), r.std_dir.clone())));
     let (units, std_dir) = reg.ok_or("no crate graph registered")?;
-    // units needed: proc-macro crates and their dependencies
+    // Only third-party proc-macro roots and their dependencies need a JIT world.
     let mut need = vec![false; units.len()];
-    let mut stack: Vec<usize> = (0..units.len()).filter(|&i| units[i].proc_macro).collect();
+    let mut stack: Vec<usize> = (0..units.len()).filter(|&i| units[i].proc_macro && !crate::native_macros::required(&units[i].name)).collect();
     while let Some(i) = stack.pop() {
         if need[i] {
             continue;
