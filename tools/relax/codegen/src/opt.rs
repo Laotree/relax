@@ -1575,9 +1575,77 @@ fn unchanged_between(f: &Func, ndef: &[u32], v: VReg, from: (usize, usize), to: 
     })
 }
 
+/// A vreg defined only by `SlotAddr`s of one slot, more than once (inlining and sinking
+/// duplicate a slot address into each path), holds one value everywhere: it gets a single
+/// definition at the entry instead. The slot passes then follow it (slot_scan reads a slot
+/// address only through single-def vregs and takes a multi-def one as escaping: reconcile's
+/// 152-byte `Option<MirrorEntry>` temporaries were never forwarded) and the allocator
+/// rematerialises it. Not in baseline bodies, whose SlotAddr positions mark slot lifetimes
+/// (Slot::born), nor for call arguments, which the allocator does not rematerialise (see
+/// unify_slot_addrs).
+pub fn merge_slot_addr_defs(f: &mut Func) -> bool {
+    if f.baseline || f.blocks.is_empty() {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nsa = vec![0u32; nv];
+    // the slot of a vreg's SlotAddr defs (u32::MAX: none yet, u32::MAX - 1: several slots)
+    let mut slot = vec![u32::MAX; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::Call(_, args, _) = i {
+                for a in args {
+                    nsa[a.0 as usize] = u32::MAX / 2;
+                }
+            }
+            if let Inst::SlotAddr(d, s2) = i {
+                let d = d.0 as usize;
+                nsa[d] += 1;
+                slot[d] = if slot[d] == u32::MAX || slot[d] == *s2 { *s2 } else { u32::MAX - 1 };
+            }
+        }
+    }
+    let one = |v: usize| ndef[v] > 1 && nsa[v] == ndef[v] && slot[v] < u32::MAX - 1;
+    if !(0..nv).any(one) {
+        return false;
+    }
+    let mut hoist: Vec<(VReg, u32)> = Vec::new();
+    for b in f.blocks.iter_mut() {
+        let mut k = 0;
+        let keep: Vec<bool> = b.insts.iter().map(|i| !matches!(i, Inst::SlotAddr(d, _) if one(d.0 as usize))).collect();
+        for i in &b.insts {
+            if let Inst::SlotAddr(d, s2) = i {
+                if one(d.0 as usize) && !hoist.iter().any(|h| h.0 == *d) {
+                    hoist.push((*d, *s2));
+                }
+            }
+        }
+        b.insts.retain(|_| {
+            k += 1;
+            keep[k - 1]
+        });
+        let mut k2 = 0;
+        b.pos.retain(|_| {
+            k2 += 1;
+            keep.get(k2 - 1).copied().unwrap_or(true)
+        });
+    }
+    let p0 = f.blocks[0].pos.first().copied().unwrap_or(f.blocks[0].term_pos);
+    let n = hoist.len();
+    f.blocks[0].insts.splice(0..0, hoist.iter().map(|&(d, s2)| Inst::SlotAddr(d, s2)));
+    f.blocks[0].pos.splice(0..0, std::iter::repeat(p0).take(n));
+    true
+}
+
 pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoReader>, imm: bool, cse: bool) {
     let tc = pass_clock();
     compact_vregs(f);
+    merge_slot_addr_defs(f);
     pass_time(14, tc);
     trace_opt(f, "simplify-start");
     let mut uses = Vec::new();
@@ -12107,5 +12175,45 @@ mod rotate_tests {
         assert!(matches!(f.blocks[t as usize].insts[..], [Inst::ICmpI(Cond::Ne, false, _, x, 0)] if x == n));
         assert_eq!(f.blocks.iter().filter(|b| b.term.succs().any(|x| x == t)).count(), 1);
         assert!(matches!(f.blocks[t as usize].term, Term::Branch(..)));
+    }
+}
+
+#[cfg(test)]
+mod merge_slot_addr_tests {
+    use super::*;
+
+    /// `x = if c { None } else { Some(*p) }` then `x` moved into `y` and read: lowering /
+    /// inlining define y's address on both paths into the merge. One entry definition makes
+    /// the move forwardable: the read goes to x and the copy goes.
+    #[test]
+    fn duplicated_slot_address_is_one_value() {
+        let mut f = Func::new("unify".into(), 0);
+        let (p, c) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([p, c]);
+        f.rets.push(Cls::I);
+        let (x, y) = (f.slot(16, 8), f.slot(16, 8));
+        let (ax, ay, k, t) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..4 {
+            f.block();
+        }
+        f.blocks[0].insts = vec![Inst::SlotAddr(ax, x)];
+        f.blocks[0].term = Term::Branch(c, 1, 2);
+        f.blocks[1].insts = vec![Inst::Iconst(k, 2), Inst::Store(Mem::Int(4, false), ax, 8, k), Inst::SlotAddr(ay, y)];
+        f.blocks[1].term = Term::Jump(3);
+        f.blocks[2].insts = vec![Inst::Copy(ax, p, 16), Inst::SlotAddr(ay, y)];
+        f.blocks[2].term = Term::Jump(3);
+        f.blocks[3].insts = vec![Inst::Copy(ay, ax, 16), Inst::Load(Mem::Int(4, false), t, ay, 8)];
+        f.blocks[3].term = Term::Ret(vec![t]);
+        for b in &mut f.blocks {
+            b.pos = vec![0; b.insts.len()];
+        }
+        assert!(merge_slot_addr_defs(&mut f));
+        f.verify().unwrap();
+        let defs: Vec<usize> = f.blocks.iter().enumerate().flat_map(|(bi, b)| b.insts.iter().filter(move |i| matches!(i, Inst::SlotAddr(d, _) if *d == ay)).map(move |_| bi)).collect();
+        assert_eq!(defs, vec![0]);
+        assert!(forward_slot_copies(&mut f));
+        assert!(!f.blocks[3].insts.iter().any(|i| matches!(i, Inst::Copy(..))));
+        // a second pass changes nothing
+        assert!(!merge_slot_addr_defs(&mut f));
     }
 }
