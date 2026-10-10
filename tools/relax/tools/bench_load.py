@@ -25,7 +25,7 @@ def main():
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, RELAX_CACHE="off", RELAX_OFFLINE="1",
-               RUSTC_BOOTSTRAP="1", MAKEPAD_CEF_OFFLINE="1",
+               RUSTC_BOOTSTRAP="1",
                RELAX_CACHE_DIR=str(args.target.resolve()), RELAX_STD=str(args.std.resolve()))
     for key in ("RELAX_PROFILE", "RELAX_BOOT_TRACE"):
         env.pop(key, None)
