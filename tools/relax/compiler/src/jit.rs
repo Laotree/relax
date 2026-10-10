@@ -964,7 +964,7 @@ pub fn poisoned_note() -> Option<String> {
     POISONED.lock().ok().and_then(|g| g.clone())
 }
 
-/// A hardware fault in JIT code with a recovery point (from the signal handler, on the owner thread).
+/// A hardware fault in JIT code with a recovery point (from the signal handler, on the faulting thread).
 /// Returns true when the process must end: the report is printed and the caller restores the
 /// signal's default action and returns, so the faulting instruction faults again and the
 /// process dies by the signal (exit status 128 + signal, as a rustc build's would). Otherwise
@@ -4060,7 +4060,7 @@ fn exec_metadata(prog: &Program, d: DefId, name: String) -> crate::exec_census::
     }
 }
 
-/// Diagnostic metadata is read only while the owner thread is active.
+/// Diagnostic metadata is read only in a unit call (the slot table is the owner's).
 unsafe fn cost_name(up: *mut Unit, id: u32) {
     if !crate::fncost::enabled() && !crate::warm::enabled() { return; }
     let f = &(&*up).fns[id as usize];

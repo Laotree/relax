@@ -12,7 +12,7 @@
 //! The slots the image's keys name are made in one go, in image order, with their identities
 //! still encoded (`ImageIds`): relocations between image slots go by image key index, and a key
 //! is decoded (`complete_identities`) after main started, on a background thread, or at once by
-//! the first thread to make a unit call for anything else (jit.rs `ids_after_lock`), so every
+//! the first thread to make a unit call for anything else (jit.rs `ids_on_serve`), so every
 //! caller on the owner thread sees every slot's key. A lookup by encoded bytes finds an image slot through
 //! the image's sorted key index, with or without its identity decoded.
 
