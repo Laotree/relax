@@ -23,7 +23,7 @@ impl Outline {
     pub fn of_tokens(src: &[u8], tokens: &[Tok], cfg: &CfgSet) -> Option<(Self, Vec<Tok>)> {
         // Validate delimiters before the cfg walker, whose inputs normally come
         // from a successfully lowered file. Collection reports malformed input.
-        let _ = matching(tokens)?;
+        pairs(tokens, None)?;
         let active = crate::preload::configured_tokens(src, tokens, cfg);
         let mut declarations = Vec::new();
         surface(&active, &matching(&active)?, 0, active.len(), &mut declarations);
@@ -60,8 +60,16 @@ fn index(src: &[u8], tokens: &[Tok]) -> Option<NameIndex> {
     Some(crate::rs_index::of_tokens(&stream))
 }
 
-fn matching(tokens: &[Tok]) -> Option<Vec<usize>> {
-    let mut ends = vec![0; tokens.len()];
+/// The closing index of each opening delimiter (u32: a file's token indexes fit), None when the
+/// delimiters do not pair.
+fn matching(tokens: &[Tok]) -> Option<Vec<u32>> {
+    let mut ends = vec![0u32; tokens.len()];
+    pairs(tokens, Some(&mut ends))?;
+    Some(ends)
+}
+
+/// Whether the delimiters pair; fills `ends` (open index -> close index) when given one.
+fn pairs(tokens: &[Tok], mut ends: Option<&mut Vec<u32>>) -> Option<()> {
     let mut stack = Vec::new();
     for (i, t) in tokens.iter().enumerate() {
         match t.kind {
@@ -70,19 +78,19 @@ fn matching(tokens: &[Tok]) -> Option<Vec<usize>> {
                 let (open, kind) = stack.pop()?;
                 if !matches!((kind, t.kind), (T::OpenBrace, T::CloseBrace)
                     | (T::OpenParen, T::CloseParen) | (T::OpenBracket, T::CloseBracket)) { return None; }
-                ends[open] = i;
+                if let Some(ends) = ends.as_deref_mut() { ends[open] = i as u32; }
             }
             _ => {}
         }
     }
-    stack.is_empty().then_some(ends)
+    stack.is_empty().then_some(())
 }
 
 // Keep declaration headers, imports, attributes and inline module/foreign
 // scopes. A brace group belonging to an item body is represented by its original
 // delimiters. Macro definitions' order and attributes survive; their transcribers
 // remain in `active` for the existing textual macro scanner and demand analysis.
-fn surface(tokens: &[Tok], ends: &[usize], mut at: usize, hi: usize, out: &mut Vec<Tok>) {
+fn surface(tokens: &[Tok], ends: &[u32], mut at: usize, hi: usize, out: &mut Vec<Tok>) {
     let mut module = false;
     let mut foreign = false;
     let mut import = false;
@@ -97,13 +105,13 @@ fn surface(tokens: &[Tok], ends: &[usize], mut at: usize, hi: usize, out: &mut V
             T::KwUse => import = true,
             T::Semi => { module = false; foreign = false; import = false; initializer = false; }
             T::OpenParen | T::OpenBracket => {
-                let end = ends[at];
+                let end = ends[at] as usize;
                 out.extend_from_slice(&tokens[at..=end]);
                 at = end + 1;
                 continue;
             }
             T::OpenBrace => {
-                let end = ends[at];
+                let end = ends[at] as usize;
                 out.push(t);
                 if import { out.extend_from_slice(&tokens[at + 1..end]); }
                 else if module || foreign || initializer { surface(tokens, ends, at + 1, end, out); }
