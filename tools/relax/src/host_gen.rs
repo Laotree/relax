@@ -59,6 +59,9 @@ pub fn main(args: &[String]) -> i32 {
     let cwd = std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_default();
     let discovery = std::sync::Arc::new(relax_compiler::Session::default());
     let mut stale = Vec::new();
+    // Files are written after every crate was read: a rewritten live-id table would otherwise make
+    // the proc-macro substitution check (native_macros.rs) refuse every later crate of this run.
+    let mut pending: Vec<(String, String)> = Vec::new();
     for (pkg, features) in all.iter().filter(|(p, _)| only.is_empty() || only.contains(p)) {
         let dir = match relax_compiler::resolve::package_dir(&discovery, &cwd, pkg) {
             Ok(d) => d,
@@ -115,13 +118,16 @@ pub fn main(args: &[String]) -> i32 {
             stale.push(out.clone());
             "STALE"
         } else {
-            if let Err(e) = std::fs::write(&out, &text) {
-                eprintln!("relax host-gen: {out}: {e}");
-                return 2;
-            }
+            pending.push((out.clone(), text));
             "written"
         };
         eprintln!("host-gen {pkg}: fns bound {} -> {out} {state}", counts.join(" / "));
+    }
+    for (out, text) in &pending {
+        if let Err(e) = std::fs::write(out, text) {
+            eprintln!("relax host-gen: {out}: {e}");
+            return 2;
+        }
     }
     if !stale.is_empty() {
         eprintln!("relax host-gen --check: {} shim file(s) differ from the source; run `relax host-gen` and commit them", stale.len());
