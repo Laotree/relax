@@ -400,6 +400,45 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// A provided crate's own fn compiled here (it has no shim) that calls std's raw ownership
+    /// operations (Arc/Rc reference counts through raw pointers, Box/Arc/Rc::from_raw) works
+    /// objects rustc allocated with Relax's std, whose layouts differ (KernelRef::clone was
+    /// Arc::increment_strong_count on rustc's ArcInner: Stage aborted). Such a fn must be an op
+    /// in the crate's relax_api.txt, so it runs on the compiled side.
+    fn check_provided_ownership(&mut self, callee: u32) {
+        let crate::jit::FnKey::Inst(d, args) = self.u.fns[self.cur_fn as usize].key.clone() else { return };
+        let krate = self.u.prog.def(d).krate;
+        if !args.is_empty() || !self.u.provided.iter().any(|(k, _)| *k == krate) {
+            return;
+        }
+        let crate::jit::FnKey::Inst(cd, cargs) = self.u.fns[callee as usize].key.clone() else { return };
+        // a Box of a provided crate's opaque type is a pointer whose drop runs rustc's drop shim:
+        // wrapping and unwrapping it moves no object across (the host's VM slot)
+        if cargs.first().is_some_and(|t| matches!(self.u.tcx.tys.kind(*t), TyKind::Adt(ad, a, _) if a.is_empty() && self.u.provided_types.contains_key(ad))) {
+            return;
+        }
+        let path = self.u.prog.def_path(cd);
+        const RAW: [&str; 9] = [
+            "::increment_strong_count",
+            "::decrement_strong_count",
+            "::from_raw",
+            "::into_raw",
+            "::from_raw_in",
+            "::into_raw_with_allocator",
+            "::increment_weak_count",
+            "::decrement_weak_count",
+            "::assume_init_drop",
+        ];
+        let std_owner = path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::");
+        if std_owner && RAW.iter().any(|r| path.ends_with(r)) {
+            let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
+            if crate::provided::owns(&self.u.prog, krate, &key) {
+                return;
+            }
+            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: list it as an `op` in the crate's relax_api.txt (or `owns` if the object is one JIT code allocated)", key, path, key));
+        }
+    }
+
     fn relax_only_instance(&self, t: TyId) -> bool {
         !self.u.provided_shared.contains(&t)
     }
@@ -8676,6 +8715,7 @@ impl<'a> Lcx<'a> {
         }
         if let Callee::Fn(id) = &callee {
             crate::boundary::note_call(self.u, self.b.def, &self.b.args, *id);
+            self.check_provided_ownership(*id);
         }
         // a #[track_caller] callee gets the caller location (this fn's own when it tracks too)
         if let Callee::Fn(id) = &callee {

@@ -718,6 +718,9 @@ pub struct HostApi {
     jit: Vec<String>,
     ops: Vec<String>,
     internal: Vec<String>,
+    /// fns whose raw ownership calls work on objects JIT code allocated (reviewed): read by
+    /// the loader's check (lower.rs check_provided_ownership, `owns`)
+    pub owns: Vec<String>,
 }
 
 impl HostApi {
@@ -732,7 +735,8 @@ impl HostApi {
                 Some(("jit", t)) => api.jit.push(t.trim().to_string()),
                 Some(("op", k)) => api.ops.push(k.trim().to_string()),
                 Some(("internal", m)) => api.internal.push(m.trim().to_string()),
-                _ => return Err(format!("relax_api.txt:{}: expected `jit <type path>`, `op <shim key>` or `internal <path prefix>`: {line}", n + 1)),
+                Some(("owns", k)) => api.owns.push(k.trim().to_string()),
+                _ => return Err(format!("relax_api.txt:{}: expected `jit <type path>`, `op <shim key>`, `internal <path prefix>` or `owns <fn key>`: {line}", n + 1)),
             }
         }
         Ok(api)
@@ -762,6 +766,31 @@ impl HostApi {
     /// The manifest's names that match nothing in crate `krate`.
     fn stale(&self, prog: &Program, tcx: &Tcx, krate: u32) -> Vec<String> {
         let mut out = Vec::new();
+        // a `jit` type must be plain data: JIT code reads, builds and drops it with Relax's layout
+        for (i, d) in prog.defs.iter().enumerate() {
+            if d.krate != krate || !matches!(d.kind, DefKind::Struct | DefKind::Enum) {
+                continue;
+            }
+            let path = prog.def_path(DefId(i as u32));
+            if !self.jit.iter().any(|t| *t == path) {
+                continue;
+            }
+            let Some(adt) = tcx.adts.get(&DefId(i as u32)) else { continue };
+            if adt.n_generics > 0 {
+                continue;
+            }
+            let t = tcx.tys.intern(TyKind::Adt(DefId(i as u32), crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
+            if !trusted(prog, tcx, krate, t, 0) {
+                let why: Vec<String> = adt
+                    .variants
+                    .iter()
+                    .flat_map(|v| v.fields.iter())
+                    .filter(|f| !trusted_in(prog, tcx, krate, f.ty, 1, true))
+                    .map(|f| format!("{}: {}", prog.syms.str(f.name), crate::typeck::ty_to_string(false, prog, tcx, f.ty)))
+                    .collect();
+                out.push(format!("jit {path}: not plain data, so JIT code would read or drop it with Relax's layout ({}); make it plain or remove the `jit` line", why.join(", ")));
+            }
+        }
         for t in &self.jit {
             if !prog.defs.iter().enumerate().any(|(i, d)| d.krate == krate && matches!(d.kind, DefKind::Struct | DefKind::Enum) && prog.def_path(DefId(i as u32)) == *t) {
                 out.push(format!("jit {t}: no such type"));
@@ -1108,4 +1137,19 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
         }
     }
     out
+}
+
+/// Whether provided crate `krate`'s relax_api.txt (next to its src/) lists `key` as `owns`:
+/// a fn whose raw ownership calls (Box/Arc::from_raw ..) were reviewed to work on objects JIT
+/// code allocated. Read once per crate.
+pub fn owns(prog: &Program, krate: u32, key: &str) -> bool {
+    static CACHE: Mutex<Vec<(String, Vec<String>)>> = Mutex::new(Vec::new());
+    let root = prog.crates[krate as usize].root_path().to_string();
+    let mut g = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if !g.iter().any(|(r, _)| *r == root) {
+        let dir = std::path::Path::new(&root).parent().and_then(|p| p.parent()).map(|p| p.join("relax_api.txt"));
+        let list = dir.and_then(|f| std::fs::read_to_string(f).ok()).and_then(|t| HostApi::parse(&t).ok()).map(|a| a.owns).unwrap_or_default();
+        g.push((root.clone(), list));
+    }
+    g.iter().find(|(r, _)| *r == root).is_some_and(|(_, l)| l.iter().any(|k| k == key))
 }
