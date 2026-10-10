@@ -1992,6 +1992,27 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
                         }
                         other => other,
                     };
+                    // x * 1.0, 1.0 * x, x / 1.0, x - 0.0, x + -0.0, -0.0 + x: x itself (exact in
+                    // IEEE arithmetic, a NaN's payload aside, which Rust leaves unspecified;
+                    // LLVM's instsimplify does the same) -- `Vec4 { w: 1.0, .. }` through a matrix
+                    if let Inst::FBin(op, w, d, x, y) = new {
+                        let kf = |v: VReg| match kn[v.0 as usize] {
+                            Some(K::F(b, _)) => Some(b),
+                            _ => None,
+                        };
+                        let (one, nz) = if w { (1.0f64.to_bits(), (-0.0f64).to_bits()) } else { (1.0f32.to_bits() as u64, (-0.0f32).to_bits() as u64) };
+                        let same = match op {
+                            FOp::Mul | FOp::Div if kf(y) == Some(one) => Some(x),
+                            FOp::Mul if kf(x) == Some(one) => Some(y),
+                            FOp::Sub if kf(y) == Some(0) => Some(x),
+                            FOp::Add if kf(y) == Some(nz) => Some(x),
+                            FOp::Add if kf(x) == Some(nz) => Some(y),
+                            _ => None,
+                        };
+                        if let Some(v) = same {
+                            new = Inst::Mov(d, v);
+                        }
+                    }
                     // an unsigned compare of a narrow value with a constant beyond its range
                     if let Inst::ICmpI(c, false, d, x, k) = new {
                         let wx = zw[x.0 as usize];
@@ -12215,5 +12236,32 @@ mod merge_slot_addr_tests {
         assert!(!f.blocks[3].insts.iter().any(|i| matches!(i, Inst::Copy(..))));
         // a second pass changes nothing
         assert!(!merge_slot_addr_defs(&mut f));
+    }
+}
+
+#[cfg(test)]
+mod float_identity_tests {
+    use super::*;
+
+    /// The identities simplify drops: x * 1.0, x / 1.0, x - 0.0 and x + -0.0 are x; x + 0.0
+    /// is not (-0.0 + 0.0 = +0.0) and stays.
+    #[test]
+    fn exact_float_identities_fold() {
+        let opts = relax_session::Options::default();
+        for (op, k, folds) in [(FOp::Mul, 1.0f32, true), (FOp::Div, 1.0, true), (FOp::Sub, 0.0, true), (FOp::Add, -0.0, true), (FOp::Add, 0.0, false)] {
+            let mut f = Func::new("fid".into(), 0);
+            let x = f.vreg(Cls::F32);
+            f.params.push(x);
+            f.rets.push(Cls::F32);
+            let (c, d) = (f.vreg(Cls::F32), f.vreg(Cls::F32));
+            f.block();
+            f.blocks[0].insts = vec![Inst::Fconst(c, k.to_bits() as u64, false), Inst::FBin(op, false, d, x, c)];
+            f.blocks[0].pos = vec![0; 2];
+            f.blocks[0].term = Term::Ret(vec![d]);
+            simplify(&opts, &mut f, None, true, true);
+            f.verify().unwrap();
+            let has_op = f.blocks[0].insts.iter().any(|i| matches!(i, Inst::FBin(..)));
+            assert_eq!(!has_op, folds, "{op:?} {k}");
+        }
     }
 }
