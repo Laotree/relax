@@ -88,9 +88,9 @@ pub fn release_hold(s: &HoldSlot) {
     imp::release(s)
 }
 
-/// Pause: Mach suspend / resume of one thread (macOS; suspends nest).
+/// Pause: Mach suspend / resume of one thread (macOS; suspends nest); its run state.
 #[cfg(target_os = "macos")]
-pub use imp::{resume, suspend};
+pub use imp::{resume, running, suspend};
 
 /// Walks frame records from `fp` (fp rule: [fp] = caller's fp, [fp+8] = return address), appending
 /// to `raw` until the chain ends, leaves the stack upwards order or `raw` is full.
@@ -171,10 +171,10 @@ mod imp {
         }
         for i in 0..count as usize {
             let port = unsafe { *ports.add(i) };
-            let (os_id, mut handle) = ident(port);
-            if handle == 0 {
-                handle = unsafe { pthread_from_mach_thread_np(port) } as u64;
-            }
+            // THREAD_IDENTIFIER_INFO's thread_handle is the thread's TSD base, not its pthread_t:
+            // the handle the rest of Relax names threads by comes from libpthread
+            let os_id = ident(port).0;
+            let handle = unsafe { pthread_from_mach_thread_np(port) } as u64;
             // thread_extended_info: user/system ns, cpu usage, policy, run state, flags,
             // interruptible, cur/base/max priority, name[64]
             let mut ext = [0u32; 28];
@@ -214,6 +214,14 @@ mod imp {
                 unsafe { mach_port_deallocate(task(), self.port) };
             }
         }
+    }
+
+    /// Is the thread on a CPU now (THREAD_BASIC_INFO run state)? The profiler samples only these.
+    pub fn running(t: &Thread) -> bool {
+        // thread_basic_info: user_time(2), system_time(2), cpu_usage, policy, run_state, ...
+        let mut info = [0u32; 10];
+        let mut n = 10u32;
+        t.port != 0 && unsafe { thread_info(t.port, 3, info.as_mut_ptr(), &mut n) } == 0 && info[6] == 1
     }
 
     pub fn suspend(t: &Thread) -> bool {

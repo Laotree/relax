@@ -169,6 +169,9 @@ fn os_regions(s: &mut Snap) {
     }
     let page = unsafe { vm_page_size } as u64;
     let (mut addr, mut depth) = (0u64, 0u32);
+    // a VM object mapped more than once (Relax's JIT code has a writable and an executable view;
+    // shared libraries' pages) counts once
+    let mut seen_objects: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for _ in 0..200_000 {
         let mut size = 0u64;
         let mut info = [0u32; 19];
@@ -182,7 +185,8 @@ fn os_regions(s: &mut Snap) {
             continue;
         }
         let resident = info[6] as u64 * page;
-        if resident > 0 {
+        let object = (info[17] as u64) | ((info[18] as u64) << 32);
+        if resident > 0 && (object == 0 || seen_objects.insert(object)) {
             let share_mode = (info[11] >> 24) & 0xff;
             // SM_COW 1, SM_PRIVATE 2, SM_EMPTY 3, SM_SHARED 4, SM_TRUESHARED 5, SM_PRIVATE_ALIASED 6,
             // SM_SHARED_ALIASED 7

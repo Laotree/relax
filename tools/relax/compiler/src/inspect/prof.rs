@@ -186,10 +186,14 @@ mod imp {
             }
             for (k, t) in threads.iter().enumerate() {
                 let Some(now) = live.iter().find(|x| x.os_id == t.os_id) else { continue };
+                // CPU samples only: a thread that ran lately and is on a CPU right now
                 if now.cpu_ns == last_cpu[k] && now.state != "running" {
                     continue;
                 }
                 last_cpu[k] = now.cpu_ns;
+                if !crate::inspect::threads::running(now) {
+                    continue;
+                }
                 if crate::inspect::threads::capture(now, &mut raw).is_ok() && raw.n > 0 {
                     samples.push(Sample { os_id: t.os_id, frames: raw.frames().to_vec() });
                 }
