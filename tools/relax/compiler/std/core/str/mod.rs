@@ -734,10 +734,13 @@ pub fn cmp_str(a: &str, b: &str) -> crate::cmp::Ordering {
     let x = a.as_bytes();
     let y = b.as_bytes();
     let n = if x.len() < y.len() { x.len() } else { y.len() };
-    let mut i = 0;
+    // the first 8-byte word that differs (or the tail), then its first differing byte
+    let mut i = same_words(x.as_ptr(), y.as_ptr(), n);
     while i < n {
-        if x[i] != y[i] {
-            return if x[i] < y[i] { crate::cmp::Ordering::Less } else { crate::cmp::Ordering::Greater };
+        // SAFETY: i < n <= both lengths
+        let (p, q) = unsafe { (*x.as_ptr().add(i), *y.as_ptr().add(i)) };
+        if p != q {
+            return if p < q { crate::cmp::Ordering::Less } else { crate::cmp::Ordering::Greater };
         }
         i += 1;
     }
@@ -753,17 +756,37 @@ pub fn cmp_str(a: &str, b: &str) -> crate::cmp::Ordering {
 pub fn eq_str(a: &str, b: &str) -> bool {
     let x = a.as_bytes();
     let y = b.as_bytes();
-    if x.len() != y.len() {
+    let n = x.len();
+    if n != y.len() {
         return false;
     }
-    let mut i = 0;
-    while i < x.len() {
-        if x[i] != y[i] {
+    let mut i = same_words(x.as_ptr(), y.as_ptr(), n);
+    while i < n {
+        // SAFETY: i < n = both lengths
+        if unsafe { *x.as_ptr().add(i) != *y.as_ptr().add(i) } {
             return false;
         }
         i += 1;
     }
     true
+}
+
+/// How many leading bytes of `x` and `y` (n readable at each) are equal, counted in whole
+/// 8-byte words: a string compare reads a word per step, not a byte (rustc's core compares
+/// through memcmp). Relax loads have no alignment requirement (x64 mov, arm64 ldr), so the
+/// words are read unaligned as plain loads.
+#[inline]
+fn same_words(x: *const u8, y: *const u8, n: usize) -> usize {
+    let mut i = 0;
+    while i + 8 <= n {
+        // SAFETY: bytes i..i + 8 are inside both strings
+        let (p, q) = unsafe { (crate::intrinsics_mem::ptr_read(x.add(i) as *const u64), crate::intrinsics_mem::ptr_read(y.add(i) as *const u64)) };
+        if p != q {
+            break;
+        }
+        i += 8;
+    }
+    i
 }
 
 // ---------------------------------------------------------------- parsing
