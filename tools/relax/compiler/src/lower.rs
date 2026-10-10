@@ -9822,6 +9822,15 @@ impl<'a> Lcx<'a> {
             return Val::L(vec![r]);
         } else if name == "vx_ternary" {
             let selector = constant(self, 3);
+            if selector == 8 || selector == 9 {
+                // NEON FMLA / FMLS .4s: a + b * c, a - b * c, fused (one rounding, the
+                // instruction's own NaN rules).
+                let a = vector(self, 0);
+                let b = vector(self, 1);
+                let c = vector(self, 2);
+                self.emit(Inst::VFma(selector == 9, false, d, b, c, a));
+                return self.vx_result(d, t);
+            }
             let op = match selector {
                 0 => VX::X86Sha256Rnds2,
                 1 => VX::ArmSha1C,

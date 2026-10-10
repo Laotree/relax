@@ -1944,15 +1944,10 @@ pub unsafe fn vextq_u32<const N: i32>(a: uint32x4_t, b: uint32x4_t) -> uint32x4_
     uint32x4_t(r)
 }
 
-// Match stdarch's full-vector FMLA operand order; indexed FMLA uses b, c.
+// a + b * c: stdarch's full-vector FMLA operand order; indexed FMLA uses b, c.
+#[inline(always)]
 pub unsafe fn vfmaq_f32(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
-    let mut r = [0.0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = neon_fma_f32(a.0[i], c.0[i], b.0[i]);
-        i += 1;
-    }
-    float32x4_t(r)
+    vx::vx_ternary(a, b, c, 8)
 }
 
 pub unsafe fn vfmaq_f64(a: float64x2_t, b: float64x2_t, c: float64x2_t) -> float64x2_t {
@@ -1995,15 +1990,10 @@ pub unsafe fn vfmaq_laneq_f64<const LANE: i32>(
     float64x2_t(r)
 }
 
-// Match stdarch's full-vector FMLS operand order: a - c * b.
+// a - b * c: stdarch's full-vector FMLS operand order.
+#[inline(always)]
 pub unsafe fn vfmsq_f32(a: float32x4_t, b: float32x4_t, c: float32x4_t) -> float32x4_t {
-    let mut r = [0.0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = neon_fma_f32(a.0[i], -c.0[i], b.0[i]);
-        i += 1;
-    }
-    float32x4_t(r)
+    vx::vx_ternary(a, b, c, 9)
 }
 
 pub unsafe fn vget_high_s16(a: int16x8_t) -> int16x4_t {
