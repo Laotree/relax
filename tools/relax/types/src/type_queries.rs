@@ -75,7 +75,7 @@ pub struct QueryCx {
     inherent_overlap: QueryTable<DefId, bool>,
     pub(crate) engine: QueryEngine,
     pub(crate) declarations: crate::next_solver::sizedness::DeclarationQueries,
-    pub(crate) solver: std::sync::Mutex<crate::next_solver::search_graph::SolverCache>,
+    pub(crate) solver: crate::next_solver::search_graph::SolverCache,
     drop: QueryTable<TypeKey, bool>,
     freeze: QueryTable<TypeKey, bool>,
     normalize: QueryTable<TypeKey, Result<TyId, crate::next_solver::NoSolution>>,
@@ -168,7 +168,7 @@ impl QueryCx {
                 self.engine.set_input(DECLARATIONS.kind, krate, fp).unwrap();
             }
         }
-        let retired = std::mem::take(self.solver.get_mut().unwrap_or_else(|e| e.into_inner()));
+        let retired = std::mem::take(&mut self.solver);
         // Freeing a session's worth of solver entries took ~0.4 s of every declaration edit
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)

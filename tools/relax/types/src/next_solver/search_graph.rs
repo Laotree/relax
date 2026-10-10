@@ -6,18 +6,30 @@ use crate::program::Program;
 mod graph;
 pub use graph::{SearchGraph, SearchGraphConfig, PathKind, LowerAvailableDepth, CandidateHeadUsages, RequiredDepth};
 use crate::tcx::Tcx;
-use std::collections::HashMap;
 
 // Kept audit design: rustc_type_ir/src/search_graph/global_cache.rs:47-72.
 // Interned IDs preserve equality and dep-node reads; storage lives for this Tcx revision.
-#[derive(Default)]
+// Shared by every thread that type-checks (a parallel `relax check`): interned inputs and
+// results are append-only arenas read without a lock with sharded lookup maps, a lock only to
+// intern a new one; the global cache is sharded by input. One Mutex over all of it was the top
+// contended lock of the check after the region interner.
 pub(crate) struct SolverCache {
-    pub(super) proof_trees: HashMap<(u32, usize), ProofTreeCacheEntry>,
-    inputs: Vec<CanonicalQueryInput>,
-    input_ids: HashMap<CanonicalQueryInput, u32>,
-    results: Vec<(QueryResult, AccessedOpaques)>,
-    result_ids: HashMap<(QueryResult, AccessedOpaques), u32>,
-    global_cache: graph::GlobalCache,
+    pub(super) proof_trees: crate::conc::ShardMap<(u32, usize), ProofTreeCacheEntry>,
+    inputs: crate::conc::AppendVec<CanonicalQueryInput>,
+    input_ids: crate::conc::ShardMap<CanonicalQueryInput, u32>,
+    results: crate::conc::AppendVec<(QueryResult, AccessedOpaques)>,
+    result_ids: crate::conc::ShardMap<(QueryResult, AccessedOpaques), u32>,
+    intern: std::sync::Mutex<()>,
+    global_cache: Box<[std::sync::Mutex<graph::GlobalCache>]>,
+}
+const SOLVER_CAP: usize = 1 << 26;
+const GLOBAL_SHARDS: usize = 64;
+impl Default for SolverCache {
+    fn default() -> Self {
+        SolverCache { proof_trees: Default::default(), inputs: crate::conc::AppendVec::with_capacity(SOLVER_CAP), input_ids: Default::default(),
+            results: crate::conc::AppendVec::with_capacity(SOLVER_CAP), result_ids: Default::default(), intern: Default::default(),
+            global_cache: (0..GLOBAL_SHARDS).map(|_| Default::default()).collect() }
+    }
 }
 
 #[derive(Clone)]
@@ -27,24 +39,32 @@ pub(super) struct ProofTreeCacheEntry {
 }
 impl SolverCache {
     pub(crate) fn len(&self) -> usize { self.inputs.len() + self.proof_trees.len() }
+    /// The global cache shard holding `input`'s entries.
+    pub(super) fn global(&self, input: u32) -> std::sync::MutexGuard<'_, graph::GlobalCache> {
+        self.global_cache[input as usize % GLOBAL_SHARDS].lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 pub struct SolverDelegate<'a> { pub limit: crate::tcx::RecursionLimit, pub tcx: &'a Tcx, pub prog: &'a Program, pub cause: super::fulfill::ObligationCause }
 impl<'a> SolverDelegate<'a> {
     pub fn new(tcx: &'a Tcx, prog: &'a Program) -> Self { Self { tcx, prog, limit: Default::default(), cause: Default::default() } }
     pub fn input(&mut self, input: CanonicalQueryInput) -> u32 {
-        let mut cache = self.tcx.queries.solver.lock().unwrap();
-        if let Some(&id) = cache.input_ids.get(&input) { return id; }
-        let id = cache.inputs.len() as u32;
-        cache.inputs.push(input.clone()); cache.input_ids.insert(input, id); id
+        let cache = &self.tcx.queries.solver;
+        if let Some(id) = cache.input_ids.get(&input) { return id; }
+        let _g = cache.intern.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = cache.input_ids.get(&input) { return id; }
+        let id = cache.inputs.push(input.clone()) as u32;
+        cache.input_ids.insert(input, id); id
     }
     fn result_id(&mut self, result: (QueryResult, AccessedOpaques)) -> u32 {
-        let mut cache = self.tcx.queries.solver.lock().unwrap();
-        if let Some(&id) = cache.result_ids.get(&result) { return id; }
-        let id = cache.results.len() as u32;
-        cache.results.push(result.clone()); cache.result_ids.insert(result, id); id
+        let cache = &self.tcx.queries.solver;
+        if let Some(id) = cache.result_ids.get(&result) { return id; }
+        let _g = cache.intern.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = cache.result_ids.get(&result) { return id; }
+        let id = cache.results.push(result.clone()) as u32;
+        cache.result_ids.insert(result, id); id
     }
-    pub fn result(&self, id: u32) -> (QueryResult, AccessedOpaques) { self.tcx.queries.solver.lock().unwrap().results[id as usize].clone() }
-    fn query_input(&self, id: u32) -> CanonicalQueryInput { self.tcx.queries.solver.lock().unwrap().inputs[id as usize].clone() }
+    pub fn result(&self, id: u32) -> (QueryResult, AccessedOpaques) { self.tcx.queries.solver.results[id as usize].clone() }
+    fn query_input(&self, id: u32) -> CanonicalQueryInput { self.tcx.queries.solver.inputs[id as usize].clone() }
     fn unconstrained(&mut self, input: u32, certainty: Certainty) -> u32 {
         let input = self.query_input(input);
         let response = response_no_constraints_raw(&self.tcx.tys, input.canonical.max_universe,
@@ -95,7 +115,7 @@ impl SolverDelegate<'_> {
 
 impl SolverDelegate<'_> {
     pub(super) fn evaluate_root_goal_for_proof_tree_raw_provider(&mut self, input: u32, root_depth: usize) -> ProofTreeCacheEntry {
-        let cached = self.tcx.queries.solver.lock().unwrap().proof_trees.get(&(input, root_depth)).cloned();
+        let cached = self.tcx.queries.solver.proof_trees.get(&(input, root_depth));
         if let Some(cached) = cached { self.tcx.queries.engine.read_index(cached.dep_node); return cached; }
         let engine = &self.tcx.queries.engine;
         let ((result, final_revision, required_depth), dep_node) = engine.with_anon_task(&mut || {
@@ -105,7 +125,7 @@ impl SolverDelegate<'_> {
             (result, inspect.unwrap(), required_depth)
         });
         let entry = ProofTreeCacheEntry { result, final_revision, required_depth, dep_node };
-        self.tcx.queries.solver.lock().unwrap().proof_trees.insert((input, root_depth), entry.clone()); entry
+        self.tcx.queries.solver.proof_trees.insert((input, root_depth), entry.clone()); entry
     }
 }
 

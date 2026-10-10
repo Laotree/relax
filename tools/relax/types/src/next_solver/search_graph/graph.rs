@@ -462,8 +462,8 @@ impl SearchGraph {
         let result = evaluation.result;
         if evaluation.heads.0.is_empty() {
             if inspect.is_noop() {
-            let mut cache = delegate.tcx.queries.solver.lock().unwrap();
-            let entry = cache.global_cache.entries.entry(input).or_default();
+            let mut cache = delegate.tcx.queries.solver.global(input);
+            let entry = cache.entries.entry(input).or_default();
             let cached = CachedResult {
                 result: delegate.mk_tracked(result, dep_node),
                 required_depth: evaluation.required_depth,
@@ -581,8 +581,8 @@ impl SearchGraph {
     }
 
     fn lookup_global_cache(&mut self, delegate: &SolverDelegate<'_>, input: u32, step: PathKind, depth: usize) -> Option<u32> {
-        let cache = delegate.tcx.queries.solver.lock().unwrap();
-        let entry = cache.global_cache.entries.get(&input)?;
+        let cache = delegate.tcx.queries.solver.global(input);
+        let entry = cache.entries.get(&input)?;
         let mut selected = None;
         if let Some(success) = &entry.success {
             if depth >= success.required_depth.0 && self.candidate_is_applicable(step, &success.nested_goals) {
