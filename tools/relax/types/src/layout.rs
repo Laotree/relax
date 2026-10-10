@@ -1198,7 +1198,7 @@ impl Layouts {
                 Some((l.fields[tcx.tys.list(v).len() - 1] + o, tail))
             }
             TyKind::Adt(d, args, _) => {
-                let adt = tcx.adts.get(&d)?.clone();
+                let adt = tcx.adts.get(&d)?;
                 if adt.is_enum || (adt.is_union && adt.variants[0].fields.len() != 1) {
                     return None;
                 }

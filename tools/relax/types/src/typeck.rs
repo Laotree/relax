@@ -2508,7 +2508,7 @@ impl<'a> Fcx<'a> {
     fn struct_defaults(&mut self, e: ExprId, ctor: DefId, adt_ty: TyId, vi: u32, given: &[u32], lo: u32) {
         let t = self.shallow(adt_ty);
         let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t).clone() else { return };
-        let Some(adt) = self.tcx.adts.get(&ad).cloned() else { return };
+        let Some(adt) = self.tcx.adts.get(&ad) else { return };
         let Some(v) = adt.variants.get(vi as usize) else { return };
         let ty_name = self.prog.syms.str(self.prog.def(ad).name).to_string();
         let variant = if self.prog.def(ctor).kind == DefKind::Variant { Some(self.prog.syms.str(self.prog.def(ctor).name).to_string()) } else { None };
@@ -2537,7 +2537,7 @@ impl<'a> Fcx<'a> {
     fn field_ty(&mut self, adt_ty: TyId, vi: u32, name: Sym) -> Option<(u32, TyId)> {
         let t = self.shallow(adt_ty);
         if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(t).clone() {
-            let adt = self.tcx.adts.get(&d)?.clone();
+            let adt = self.tcx.adts.get(&d)?;
             let v = adt.variants.get(vi as usize)?;
             for (i, f) in v.fields.iter().enumerate() {
                 if f.name == name {
@@ -2567,7 +2567,7 @@ impl<'a> Fcx<'a> {
             self.coerce_or_unify(adt_ty, expected, None, pos);
             let t = self.shallow(adt_ty);
             if let TyKind::Adt(ad, args, regions) = self.tcx.tys.kind(t).clone() {
-                if let Some(adt) = self.tcx.adts.get(&ad).cloned() {
+                if let Some(adt) = self.tcx.adts.get(&ad) {
                     if let Some(v) = adt.variants.get(vi as usize) {
                         let mut out = Vec::new();
                         for f in &v.fields {
@@ -2722,7 +2722,7 @@ impl<'a> Fcx<'a> {
                     _ => NO_DEF,
                 };
                 let adt = match self.tcx.adts.get(&adt_def) {
-                    Some(a) => a.clone(),
+                    Some(a) => a,
                     None => return self.tcx.tys.error,
                 };
                 let mut args = Vec::new();
@@ -4506,7 +4506,7 @@ impl<'a> Fcx<'a> {
                             return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
                         }
                         TyKind::Adt(d, args, regions) => {
-                            let adt = self.tcx.adts.get(&d).cloned();
+                            let adt = self.tcx.adts.get(&d);
                             if let Some(adt) = adt {
                                 if !adt.is_enum {
                                     if let Some(f) = adt.variants[0].fields.get(*idx as usize) {
@@ -5196,7 +5196,7 @@ impl<'a> Fcx<'a> {
         let mut derefs = 0usize;
         loop {
             if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(cur).clone() {
-                if let Some(adt) = self.tcx.adts.get(&d).cloned() {
+                if let Some(adt) = self.tcx.adts.get(&d) {
                     if !adt.is_enum {
                         for (i, f) in adt.variants[0].fields.iter().enumerate() {
                             // a private field of a type from elsewhere is not visible: autoderef
