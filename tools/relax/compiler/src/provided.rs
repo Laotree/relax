@@ -693,13 +693,18 @@ pub fn host_gen_file(targets: &[Vec<ShimRow>]) -> String {
 /// - `jit <type path>`: plain-data type; its methods and the trait impls on it (or taking it as
 ///   a trait argument, `From<ScriptValue> for f32`) get no shim: JIT code compiles them from
 ///   source, rustc builds inline them as before;
-/// - `op <shim key>`: a fn that stays a shim although its type is `jit` (it reads rustc-owned
-///   state: an interner, a global table).
+/// - `op <shim key>`: a fn that stays a shim although its type is `jit` or its module is
+///   `internal` (it reads rustc-owned state: an interner, a global table; or it is the
+///   crate's operation for JIT code);
+/// - `internal <path prefix>`: the crate's own machinery (a compiler's passes, IR, emitters):
+///   its fns get no shim; JIT code reaches the crate through the `op`s, and anything else it
+///   reaches compiles from source.
 /// Every named type and key must exist (a stale manifest is a host-gen error).
 #[derive(Default)]
 pub struct HostApi {
     jit: Vec<String>,
     ops: Vec<String>,
+    internal: Vec<String>,
 }
 
 impl HostApi {
@@ -713,7 +718,8 @@ impl HostApi {
             match line.split_once(char::is_whitespace) {
                 Some(("jit", t)) => api.jit.push(t.trim().to_string()),
                 Some(("op", k)) => api.ops.push(k.trim().to_string()),
-                _ => return Err(format!("relax_api.txt:{}: expected `jit <type path>` or `op <shim key>`: {line}", n + 1)),
+                Some(("internal", m)) => api.internal.push(m.trim().to_string()),
+                _ => return Err(format!("relax_api.txt:{}: expected `jit <type path>`, `op <shim key>` or `internal <path prefix>`: {line}", n + 1)),
             }
         }
         Ok(api)
@@ -721,7 +727,14 @@ impl HostApi {
 
     /// Is fn `d` compiled on the JIT side by this manifest?
     fn jit_side(&self, prog: &Program, tcx: &Tcx, d: DefId, key: &str) -> bool {
-        if self.jit.is_empty() || self.ops.iter().any(|k| k == key) {
+        if self.ops.iter().any(|k| k == key) {
+            return false;
+        }
+        let path = prog.def_path(d);
+        if self.internal.iter().any(|m| path == *m || path.starts_with(&format!("{m}::"))) {
+            return true;
+        }
+        if self.jit.is_empty() {
             return false;
         }
         let parent = prog.def(d).parent;
@@ -739,6 +752,17 @@ impl HostApi {
         for t in &self.jit {
             if !prog.defs.iter().enumerate().any(|(i, d)| d.krate == krate && matches!(d.kind, DefKind::Struct | DefKind::Enum) && prog.def_path(DefId(i as u32)) == *t) {
                 out.push(format!("jit {t}: no such type"));
+            }
+        }
+        for m in &self.internal {
+            let hit = (0..prog.defs.len()).any(|i| {
+                prog.defs[i].krate == krate && {
+                    let p = prog.def_path(DefId(i as u32));
+                    p == *m || p.starts_with(&format!("{m}::"))
+                }
+            });
+            if !hit {
+                out.push(format!("internal {m}: no such path"));
             }
         }
         for k in &self.ops {
@@ -778,7 +802,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
             continue;
         }
         if api.jit_side(prog, tcx, d, &key(prog, tcx, d)) {
-            *why.entry("JIT-side (relax_api.txt `jit` type)").or_default() += 1;
+            *why.entry("JIT-side (relax_api.txt `jit` type / `internal`)").or_default() += 1;
             continue;
         }
         if let Some(r) = unbound_reason(prog, tcx, krate, d, &|a| opaque_candidate(prog, tcx, krate, a)) {
