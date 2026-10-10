@@ -25,6 +25,7 @@ fn detect_app_name(out_dir: &Path) -> Option<String> {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(relax)");
     let out_dir = env::var("OUT_DIR").unwrap();
     let path = Path::new(&out_dir)
         .parent()
