@@ -290,7 +290,7 @@ impl<'a> Parser<'a> {
         let source = self.source_span(call);
         let g = super::fmtmac::Gen::from_text(text);
         let start = self.splice_expansion("derive", &g, call)?;
-        self.token_origins.extend(self.toks[start..].iter().filter(|t| t.kind != T::Eof)
+        self.token_origins.extend(self.toks.range(start, self.toks.len()).iter().filter(|t| t.kind != T::Eof)
             .map(|t| crate::source::TokenOrigin { lo: t.lo, hi: t.hi, source }));
         let items = self.in_expansion(start, |p| p.items_until(T::Eof))?;
         self.extra_items.extend(items);

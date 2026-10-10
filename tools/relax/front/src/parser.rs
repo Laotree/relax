@@ -34,7 +34,7 @@ enum BodyOutline {
 pub struct Parser<'a> {
     pub session: &'a std::sync::Arc<crate::Session>,
     pub src: &'a [u8],
-    pub toks: Vec<Tok>,
+    pub toks: lazy_bodies::Toks<'a>,
     pub pos: usize,
     pub edition: u16,
     pub ast: Ast,
@@ -53,24 +53,24 @@ pub struct Parser<'a> {
     /// this file's crate name (`$crate`)
     pub krate: String,
     /// text of macro expansions, addressed by positions >= src.len()
-    pub ext: Vec<u8>,
+    pub ext: lazy_bodies::Seg<'a, u8>,
     /// expansion text ranges -> call-site position: (lo, hi, call lo)
-    pub exp_map: Vec<(u32, u32, u32)>,
+    pub exp_map: lazy_bodies::Seg<'a, (u32, u32, u32)>,
     /// macro_rules expansion tokens substituted from a fragment -> the fragment token's own
     /// position (rustc: substituted tokens keep their spans), ascending by expansion position:
     /// (expansion position, origin position, length)
-    pub tok_origin: Vec<(u32, u32, u32)>,
+    pub tok_origin: lazy_bodies::Seg<'a, (u32, u32, u32)>,
     /// Complete token provenance, in spelling-buffer order (independent of Rust grammar).
-    pub token_origins: Vec<TokenOrigin>,
+    pub token_origins: lazy_bodies::Seg<'a, TokenOrigin>,
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
-    pub rules_exp: Vec<(u32, u32, u32)>,
+    pub rules_exp: lazy_bodies::Seg<'a, (u32, u32, u32)>,
     /// macro_rules body tokens -> their position in the definition: (expansion position,
     /// definition position, length), ascending
-    pub body_origin: Vec<(u32, u32, u32)>,
+    pub body_origin: lazy_bodies::Seg<'a, (u32, u32, u32)>,
     /// tokens split by `eat_gt` (`>>` -> `>`), with their old value
     pub tok_undo: Vec<(u32, Tok)>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
@@ -108,11 +108,11 @@ const P_MUL: u8 = 11;
 const P_AS: u8 = 12;
 
 impl<'a> Parser<'a> {
-    pub fn new(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8], toks: Vec<Tok>, edition: u16) -> Self {
+    pub fn new(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8], toks: impl Into<lazy_bodies::Toks<'a>>, edition: u16) -> Self {
         Parser {
             session: sess,
             src,
-            toks,
+            toks: toks.into(),
             pos: 0,
             edition,
             ast: Ast::default(),
@@ -123,15 +123,15 @@ impl<'a> Parser<'a> {
             lazy_mods: Vec::new(),
             macros: None,
             krate: String::new(),
-            ext: Vec::new(),
-            exp_map: Vec::new(),
-            tok_origin: Vec::new(),
-            token_origins: Vec::new(),
+            ext: Default::default(),
+            exp_map: Default::default(),
+            tok_origin: Default::default(),
+            token_origins: Default::default(),
             token_input: false,
             sources: None,
             exp_depth: 0,
-            rules_exp: Vec::new(),
-            body_origin: Vec::new(),
+            rules_exp: Default::default(),
+            body_origin: Default::default(),
             tok_undo: Vec::new(),
             bctx: None,
             mod_stack: Vec::new(),
@@ -698,7 +698,8 @@ impl<'a> Parser<'a> {
             Some(c) => c.clone(),
             None => return v,
         };
-        let p = crate::cfg::Src { src: self.src, toks: &self.toks, ext: &self.ext, ptoks: &[], parts: None };
+        let view = lazy_bodies::TokView::new(self.src, &self.toks, &self.ext);
+        let p = view.src();
         if !v.iter().any(|a| a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"cfg_attr") {
             return v;
         }
@@ -731,7 +732,7 @@ impl<'a> Parser<'a> {
         }
         // a raw identifier names the same macro (`macro_rules! r#try` is `try!`)
         let n = String::from_utf8_lossy(self.bytes(name.lo, name.hi)).trim_start_matches("r#").to_string();
-        let mt = crate::macros::mtoks(self, &self.toks[toks.lo as usize..toks.hi as usize]);
+        let mt = crate::macros::mtoks(self, &self.toks.range(toks.lo as usize, toks.hi as usize));
         let file = self.bctx.as_ref().map_or("", |c| c.path.as_str());
         self.macros.as_mut().unwrap().define_tokens(&n, &self.krate, file, name.lo, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })
@@ -1301,7 +1302,8 @@ impl<'a> Parser<'a> {
         if !attrs.iter().any(|a| a.toks.hi > a.toks.lo && self.tok_text(self.toks[a.toks.lo as usize]) == b"cfg") {
             return true;
         }
-        let p = crate::cfg::Src { src: self.src, toks: &self.toks, ext: &self.ext, ptoks: &[], parts: None };
+        let view = lazy_bodies::TokView::new(self.src, &self.toks, &self.ext);
+        let p = view.src();
         crate::cfg::active(p, attrs, &ctx.cfg)
     }
 
@@ -3604,7 +3606,8 @@ pub fn parse_source_mode<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a 
 }
 
 /// The origin of a substituted fragment token at `pos` (tok_origin is ascending).
-fn origin_of(tok_origin: &[(u32, u32, u32)], pos: u32) -> Option<u32> {
+fn origin_of<'t>(tok_origin: impl Into<lazy_bodies::SegRef<'t, (u32, u32, u32)>>, pos: u32) -> Option<u32> {
+    let tok_origin = tok_origin.into();
     let i = match tok_origin.binary_search_by_key(&pos, |x| x.0) {
         Ok(i) => i + 1,
         Err(i) => i,
@@ -3616,7 +3619,8 @@ fn origin_of(tok_origin: &[(u32, u32, u32)], pos: u32) -> Option<u32> {
 }
 
 /// The call site of the expansion whose text contains `pos` (regions ascending, disjoint).
-fn region_of(exp_map: &[(u32, u32, u32)], pos: u32) -> Option<u32> {
+fn region_of<'t>(exp_map: impl Into<lazy_bodies::SegRef<'t, (u32, u32, u32)>>, pos: u32) -> Option<u32> {
+    let exp_map = exp_map.into();
     let i = exp_map.partition_point(|x| x.0 <= pos);
     let r = exp_map.get(i.checked_sub(1)?)?;
     if pos <= r.1 {
@@ -3629,12 +3633,18 @@ fn region_of(exp_map: &[(u32, u32, u32)], pos: u32) -> Option<u32> {
 /// Resolve macro positions before interpreting a source span. A full origin is terminal:
 /// its offsets belong to authored bytes, never to another expansion's spelling buffer.
 fn source_origin<'a>(mut pos: u32, exact: bool, src_len: u32,
-    tables: impl Fn(u32) -> (&'a [(u32, u32, u32)], &'a [(u32, u32, u32)], &'a [TokenOrigin]),
+    tables: impl Fn(u32) -> (lazy_bodies::SegRef<'a, (u32, u32, u32)>, lazy_bodies::SegRef<'a, (u32, u32, u32)>, lazy_bodies::SegRef<'a, TokenOrigin>),
 ) -> Result<SourceSpan, u32> {
     for _ in 0..64 {
         let (to, em, origins) = tables(pos);
         if exact {
-            if let Some(span) = origin_at(origins, pos) { return Ok(span); }
+            let span = if origins.own.is_empty() || origins.base.is_empty() {
+                origin_at(if origins.own.is_empty() { origins.base } else { origins.own }, pos)
+            } else {
+                // origin_at over the two parts as one array
+                origins.partition_point(|o| o.lo <= pos).checked_sub(1).map(|i| origins[i]).filter(|o| pos <= o.hi).map(|o| o.source)
+            };
+            if let Some(span) = span { return Ok(span); }
         }
         if pos < src_len { break; }
         let next = if exact { origin_of(to, pos).or_else(|| region_of(em, pos)) } else { region_of(em, pos) };
@@ -3645,7 +3655,7 @@ fn source_origin<'a>(mut pos: u32, exact: bool, src_len: u32,
 
 impl Parser<'_> {
     pub fn source_span(&self, pos: u32) -> SourceSpan {
-        match source_origin(pos, true, self.src.len() as u32, |_| (&self.tok_origin, &self.exp_map, &self.token_origins)) {
+        match source_origin(pos, true, self.src.len() as u32, |_| (self.tok_origin.view(), self.exp_map.view(), self.token_origins.view())) {
             Ok(span) => span,
             Err(lo) => {
                 let i = self.toks.partition_point(|t| t.lo <= lo);
@@ -3732,10 +3742,6 @@ pub struct ParsedFile {
     pub part: std::sync::OnceLock<Box<FilePart>>,
     /// per item: (an impl's header, how many earlier impls of the file have that header)
     pub impl_heads: std::sync::OnceLock<Box<[(Box<[u8]>, u32)]>>,
-    /// Ordinary and generated bodies append to the same immutable arena chain.
-    pub body_publish: std::sync::Mutex<Option<lazy_bodies::BodyScratch>>,
-    /// Item-addressed results avoid walking the segment chain on repeated queries.
-    pub body_results: std::sync::OnceLock<Vec<std::sync::OnceLock<BodyResult>>>,
 }
 
 /// A file's LazyCtx (None: the load skipped no body). A restored collected image keeps it
@@ -3855,7 +3861,7 @@ impl ParsedFile {
                 let origins = if pos as usize >= self.src.len() {
                     self.part_at(pos).map_or(&self.token_origins[..], |p| &p.token_origins[..])
                 } else { &self.token_origins };
-                (to, em, origins)
+                (to.into(), em.into(), origins.into())
             });
             if let Ok(span) = resolved { return span; }
         }
@@ -4230,11 +4236,11 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
         }};
         let mut p = Parser::new(sess, &src, toks, edition);
         if let Some(input) = input {
-            p.ext = input.text.into_bytes();
-            p.toks = input.toks.into_iter().map(|t| Tok { kind: t.kind, lo: t.lo + src_len, hi: t.hi + src_len }).collect();
+            p.ext = input.text.into_bytes().into();
+            p.toks = input.toks.into_iter().map(|t| Tok { kind: t.kind, lo: t.lo + src_len, hi: t.hi + src_len }).collect::<Vec<_>>().into();
             let end = src_len + p.ext.len() as u32;
             p.toks.push(Tok { kind: T::Eof, lo: end, hi: end });
-            p.token_origins = input.origins.into_iter().map(|o| o.shifted(src_len)).collect();
+            p.token_origins = input.origins.into_iter().map(|o| o.shifted(src_len)).collect::<Vec<_>>().into();
             // EOF has no spelling, but syntax errors at EOF retain the final authored span.
             let source = p.token_origins.last().map_or(SourceSpan::default(), |o| o.source);
             p.token_origins.push(TokenOrigin { lo: end, hi: end, source });
@@ -4253,7 +4259,7 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
             let mut pos = e.pos;
             for _ in 0..64 {
                 if pos < src_len { break; }
-                let next = region_of(&p.exp_map,pos);
+                let next = region_of(p.exp_map.view(),pos);
                 match next { Some(at) if at != pos => pos = at, _ => break }
             }
             return Err((SourceSpan { file: 0, lo: pos, hi: pos }, e.msg));
@@ -4264,11 +4270,11 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
             Some((krate, path, module_path)) if (p.lazy_auto && skipped) => Some(Box::new(LazyCtx { krate, path, module_path, mods: std::mem::take(&mut p.lazy_mods), s2_fmt })),
             _ => None,
         };
-        (p.toks, p.ast, p.ext, p.exp_map, p.tok_origin, p.token_origins, p.rules_exp, p.body_origin, p.macros.map(|m| m.finish()), lazy)
+        (p.toks.into_own(), p.ast, p.ext.into_own(), p.exp_map.into_own(), p.tok_origin.into_own(), p.token_origins.into_own(), p.rules_exp.into_own(), p.body_origin.into_own(), p.macros.map(|m| m.finish()), lazy)
     };
     src.reserve_exact(ext.len());
     src.extend_from_slice(&ext);
-    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: exp_map.into(), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), token_input, sources, rules_exp: rules_exp.into(), body_origin: body_origin.into(), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), body_publish: Default::default(), body_results: Default::default() };
+    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: exp_map.into(), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), token_input, sources, rules_exp: rules_exp.into(), body_origin: body_origin.into(), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new() };
     pf.shrink();
     Ok((pf, used))
 }
@@ -4303,17 +4309,22 @@ pub static LAZY_PARSED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::
 /// Parses every fn body `pf`'s load skipped (in item order) as the load would have: the same
 /// file context, built-in macros only (see Parser::body_outline), then cfg-strips them.
 pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> FilePart {
-    parse_part_items(pf, cfg, None, None)
-}
-
-fn parse_part_items(pf: &ParsedFile, cfg: &crate::cfg::CfgSet, only: Option<ItemId>, mut scratch: Option<&mut Option<lazy_bodies::BodyScratch>>) -> FilePart {
     let sess = &cfg.session;
     let _mem = crate::memstat::tag(crate::memstat::Tag::ParseLazy);
     let ctx = pf.lazy.as_ref().expect("parse_part: the file skipped no body");
+    // the file's only part: it continues the file's own arrays
+    assert!(pf.part.get().is_none(), "parse_part: the file's bodies are already parsed");
     // as at the load: the file's own text, its expansions as the parser's `ext` (line!/column!
-    // and spans of macro output map through them to call sites)
+    // and spans of macro output map through them to call sites), its tokens and expansion
+    // tables -- all read in place; the parse keeps only what its own expansions append
     let n_src = pf.src_len as usize;
-    let mut p = lazy_bodies::BodyScratch::parser(pf, sess, scratch.as_mut().and_then(|s| s.take()));
+    let mut p = Parser::new(sess, &pf.src[..n_src], &pf.toks[..], pf.edition);
+    p.ext = lazy_bodies::Seg::on(&pf.src[n_src..]);
+    p.exp_map = lazy_bodies::Seg::on(&pf.exp_map);
+    p.tok_origin = lazy_bodies::Seg::on(&pf.tok_origin);
+    p.token_origins = lazy_bodies::Seg::on(&pf.token_origins);
+    p.rules_exp = lazy_bodies::Seg::on(&pf.rules_exp);
+    p.body_origin = lazy_bodies::Seg::on(&pf.body_origin);
     let mut table = crate::macros::MacroTable::default();
     table.s2_fmt = ctx.s2_fmt;
     p.macros = Some(crate::macros::MacroScope::new(std::sync::Arc::new(table)));
@@ -4325,15 +4336,12 @@ fn parse_part_items(pf: &ParsedFile, cfg: &crate::cfg::CfgSet, only: Option<Item
     let mut ast_tail = &pf.ast;
     while let Some(next) = ast_tail.part.get() { ast_tail = next; }
     p.ast.base = ast_tail.ends();
-    let (n_ext, n_toks, n_em, n_to, n_origins, n_rules, n_bo) =
-        (p.ext.len(), p.toks.len(), p.exp_map.len(), p.tok_origin.len(), p.token_origins.len(), p.rules_exp.len(), p.body_origin.len());
+    let (n_ext, n_toks, n_rules) = (pf.src.len() - n_src, pf.toks.len(), pf.rules_exp.len());
     p.krate = ctx.krate.clone();
     p.bctx = Some(std::rc::Rc::new(crate::builtins::FileCtx::new(&ctx.krate, &ctx.path, &ctx.module_path, cfg)));
     let mut bodies = Vec::new();
     let mut roots = Vec::new();
-    let start = only.map_or(0, |item| item.0 as usize).min(pf.ast.items.len());
-    let count = if only.is_some() { usize::from(start < pf.ast.items.len()) } else { pf.ast.items.len() };
-    for (ii, it) in pf.ast.items.iter().enumerate().skip(start).take(count) {
+    for (ii, it) in pf.ast.items.iter().enumerate() {
         let r = match &it.kind {
             ItemKind::Fn(sig, None, _) => match pf.ast.fn_sig(*sig).lazy_body {
                 Some(r) => r,
@@ -4380,22 +4388,18 @@ fn parse_part_items(pf: &ParsedFile, cfg: &crate::cfg::CfgSet, only: Option<Item
         }
     }
     {
-        let src = crate::cfg::Src { src: p.src, toks: &p.toks, ext: &p.ext, ptoks: &[], parts: None };
+        let view = lazy_bodies::TokView::new(p.src, &p.toks, &p.ext);
+        let src = view.src();
         crate::program::strip_cfg_nodes(&mut p.ast, src, cfg);
         for b in roots {
             crate::program::strip_body_block(&mut p.ast, src, cfg, b);
         }
     }
     let mut ast = std::mem::take(&mut p.ast);
-    let (toks, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin) = if let Some(saved) = scratch {
-        let suffix = (p.toks[n_toks..].to_vec(), p.ext[n_ext..].to_vec(), p.exp_map[n_em..].to_vec(),
-            p.tok_origin[n_to..].to_vec(), p.token_origins[n_origins..].to_vec(), p.rules_exp[n_rules..].to_vec(), p.body_origin[n_bo..].to_vec());
-        *saved = Some(lazy_bodies::BodyScratch::retain(&mut p));
-        suffix
-    } else {
-        (p.toks.split_off(n_toks), p.ext.split_off(n_ext), p.exp_map.split_off(n_em),
-            p.tok_origin.split_off(n_to), p.token_origins.split_off(n_origins), p.rules_exp.split_off(n_rules), p.body_origin.split_off(n_bo))
-    };
+    // what the part appended, exactly sized (it is never appended to again)
+    fn exact<T>(mut v: Vec<T>) -> Vec<T> { v.shrink_to_fit(); v }
+    let (toks, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin) = (exact(p.toks.into_own()), exact(p.ext.into_own()),
+        exact(p.exp_map.into_own()), exact(p.tok_origin.into_own()), exact(p.token_origins.into_own()), exact(p.rules_exp.into_own()), exact(p.body_origin.into_own()));
     ast.shrink();
     assert!(ast_tail.part.set(Box::new(ast)).is_ok());
     if lazy_stats_on() {

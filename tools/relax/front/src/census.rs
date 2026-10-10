@@ -195,7 +195,7 @@ impl<'p, 'a> Walker<'p, 'a> {
         let p = self.p;
         self.cen.c[C_FILES] += 1;
         self.cen.c[C_LINES] += self.line_starts.len() as u64;
-        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, &p.ast.root_attrs, self.cfg) {
+        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, &p.ast.root_attrs, self.cfg) {
             return;
         }
         self.attrs(&p.ast.root_attrs, true);
@@ -247,7 +247,7 @@ impl<'p, 'a> Walker<'p, 'a> {
                     }
                     i += 1;
                 }
-            } else if name == "cfg_attr" && crate::cfg::cfg_attr_holds(crate::cfg::Src { src: self.p.src, toks: &self.p.toks, ext: &[], ptoks: &[], parts: None }, a, self.cfg) {
+            } else if name == "cfg_attr" && crate::cfg::cfg_attr_holds(crate::cfg::Src { src: self.p.src, toks: self.p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, a, self.cfg) {
                 // look for derive inside
                 let mut i = a.toks.lo + 1;
                 while i < a.toks.hi {
@@ -454,7 +454,7 @@ impl<'p, 'a> Walker<'p, 'a> {
     fn item(&mut self, id: ItemId, in_generic_impl: bool) {
         let p = self.p;
         let it = p.ast.item(id);
-        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, p.ast.list(it.attrs), self.cfg) {
+        if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(it.attrs), self.cfg) {
             return;
         }
         self.attrs(p.ast.list(it.attrs), true);
@@ -668,7 +668,7 @@ impl<'p, 'a> Walker<'p, 'a> {
         for s in p.ast.list(blk.stmts) {
             match s {
                 Stmt::Let { attrs, pat, ty, init, else_ } => {
-                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, p.ast.list(*attrs), self.cfg) {
+                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(*attrs), self.cfg) {
                         continue;
                     }
                     self.attrs(p.ast.list(*attrs), false);
@@ -812,7 +812,7 @@ impl<'p, 'a> Walker<'p, 'a> {
             ExprKind::Match(x, arms) => {
                 self.expr(*x);
                 for a in p.ast.list(*arms) {
-                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: &p.toks, ext: &[], ptoks: &[], parts: None }, p.ast.list(a.attrs), self.cfg) {
+                    if !crate::cfg::active(crate::cfg::Src { src: p.src, toks: p.toks.as_slice(), ext: &[], ptoks: &[], parts: None }, p.ast.list(a.attrs), self.cfg) {
                         continue;
                     }
                     self.attrs(p.ast.list(a.attrs), false);

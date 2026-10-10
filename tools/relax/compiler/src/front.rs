@@ -512,8 +512,6 @@ fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], ce
         line_starts: Default::default(),
         part: Default::default(),
         impl_heads: Default::default(),
-        body_publish: Default::default(),
-        body_results: Default::default(),
     })
 }
 

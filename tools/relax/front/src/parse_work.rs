@@ -99,7 +99,7 @@ pub fn key_tokens(p: &crate::parser::Parser, kind: &str, lo: u32, hi: u32, toks:
     };
     span(&mut key, lo)?;
     span(&mut key, hi.saturating_sub(1).max(lo))?;
-    for t in p.toks.get(toks)? {
+    for t in crate::parser::lazy_bodies::TokSeq::slice(&p.toks, toks.start, toks.end)?.iter() {
         span(&mut key, t.lo)?;
         span(&mut key, t.hi.saturating_sub(1).max(t.lo))?;
     }

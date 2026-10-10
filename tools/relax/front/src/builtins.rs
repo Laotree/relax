@@ -11,6 +11,7 @@
 
 use crate::cfg::CfgSet;
 use crate::lexer::{Tok, T};
+use crate::parser::lazy_bodies::{SegRef, TokSeq};
 use crate::pm::{Delimiter, Group, LineColumn, Punct, Spacing, Span, TokenStream, TokenTree};
 #[cfg(test)]
 use crate::pm::{Ident, Literal};
@@ -379,14 +380,16 @@ pub fn macro_def(name: &str) -> Option<crate::macros::MacroRef> {
 #[derive(Clone, Copy)]
 pub struct Buf<'a> {
     pub src: &'a [u8],
-    pub ext: &'a [u8],
+    pub ext: SegRef<'a, u8>,
 }
 
 impl<'a> Buf<'a> {
+    /// A source without expansion text.
+    pub fn plain(src: &'a [u8]) -> Self { Self { src, ext: (&[][..]).into() } }
     pub fn get(&self, lo: u32, hi: u32) -> &'a [u8] {
         let base = self.src.len() as u32;
         if lo >= base {
-            &self.ext[(lo - base) as usize..((hi - base) as usize).min(self.ext.len())]
+            self.ext.slice((lo - base) as usize, ((hi - base) as usize).min(self.ext.len()))
         } else {
             &self.src[lo as usize..(hi as usize).min(self.src.len())]
         }
@@ -424,18 +427,31 @@ fn is_keyword(k: T) -> bool {
 
 /// Tokens `toks[lo..hi]` (balanced) as a TokenStream. `None` on unbalanced delimiters.
 pub fn to_stream(src: &[u8], toks: &[Tok], lo: usize, hi: usize, span_of: &dyn Fn(u32, u32) -> Span) -> Option<TokenStream> {
-    to_stream_buf(Buf { src, ext: &[] }, toks, lo, hi, span_of)
+    to_stream_buf(Buf::plain(src), toks, lo, hi, span_of)
 }
 
-pub fn to_stream_buf(buf: Buf, toks: &[Tok], lo: usize, hi: usize, span_of: &dyn Fn(u32, u32) -> Span) -> Option<TokenStream> {
-    let selected = toks.get(lo..hi)?;
+pub fn to_stream_buf(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, span_of: &dyn Fn(u32, u32) -> Span) -> Option<TokenStream> {
+    let selected = toks.slice(lo, hi)?;
+    let selected = &selected[..];
     let base = buf.src.len() as u32;
     if selected.iter().all(|t| t.hi <= base) {
         return crate::pm_tokens::from_toks(buf.src, selected, span_of).ok();
     }
     if selected.iter().all(|t| t.lo >= base) {
-        let shifted: Vec<_> = selected.iter().map(|t| Tok { kind: t.kind, lo: t.lo - base, hi: t.hi - base }).collect();
-        return crate::pm_tokens::from_toks(buf.ext, &shifted, &|a,b| span_of(a + base,b + base)).ok();
+        // the expansion text the tokens spell, as one buffer from `at` (only the span the
+        // tokens and their gaps cover is read)
+        let nb = buf.ext.base.len() as u32;
+        let (text, at) = if selected.iter().all(|t| t.lo - base >= nb) {
+            (std::borrow::Cow::Borrowed(buf.ext.own), base + nb)
+        } else if selected.iter().all(|t| t.hi - base <= nb) {
+            (std::borrow::Cow::Borrowed(buf.ext.base), base)
+        } else {
+            let lo = selected.iter().map(|t| t.lo).min().unwrap_or(base);
+            let hi = selected.iter().map(|t| t.hi).max().unwrap_or(base);
+            (buf.ext.window((lo - base) as usize, (hi - base) as usize), lo)
+        };
+        let shifted: Vec<_> = selected.iter().map(|t| Tok { kind: t.kind, lo: t.lo - at, hi: t.hi - at }).collect();
+        return crate::pm_tokens::from_toks(&text, &shifted, &|a,b| span_of(a + at,b + at)).ok();
     }
     // Macro transcription can mix the two backing buffers. Gather only the selected
     // spelling and real same-buffer gaps; the shared builder still owns tree formation.
@@ -505,14 +521,14 @@ fn render_into(trees: &[TokenTree], out: &mut String) {
 
 /// rustc's `stringify!`: tokens printed with source spacing (a space only where the source
 /// had whitespace and rustc's `space_between` allows one).
-fn stringify(buf: Buf, toks: &[Tok], lo: usize, hi: usize) -> String {
-    stringify_o(buf, toks, lo, hi, &[], u32::MAX)
+fn stringify(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize) -> String {
+    stringify_o(buf, toks, lo, hi, (&[][..]).into(), u32::MAX)
 }
 
 /// stringify! with substituted fragment tokens' spacing taken from their source (rustc keeps a
 /// fragment's tokens with their original spans and spacing): `origins` is Parser::tok_origin,
 /// `src_len` the length of the file's own text.
-fn stringify_o(buf: Buf, toks: &[Tok], lo: usize, hi: usize, origins: &[(u32, u32, u32)], src_len: u32) -> String {
+fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, origins: SegRef<(u32, u32, u32)>, src_len: u32) -> String {
     let orig = |mut pos: u32| -> Option<u32> {
         for _ in 0..32 {
             if pos < src_len {
@@ -740,7 +756,7 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
 
 fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<String, String> {
     let b = from_u8(id);
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let ctx = p.bctx.as_deref();
     match b {
@@ -779,7 +795,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
             return Ok(str_lit(&m));
         }
         Builtin::Stringify => {
-            return Ok(str_lit(&stringify_o(buf, toks, lo, hi, &p.tok_origin, p.src.len() as u32)));
+            return Ok(str_lit(&stringify_o(buf, toks, lo, hi, p.tok_origin.view(), p.src.len() as u32)));
         }
         Builtin::Env | Builtin::OptionEnv => {
             let args = lit_args(p, lo, hi)?;
@@ -875,7 +891,9 @@ fn indexed_line_col(src: &[u8], ls: &[u32], cs: &[u32], cursor: &std::cell::Cell
 fn legacy_pm_input(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usize, call_lo: u32, call_hi: u32, profile: bool) -> (TokenStream, Span) {
     let started = std::time::Instant::now();
     let src = p.src;
-    let ext = &p.ext;
+    let ext_view = p.ext.view();
+    let ext_c = ext_view.contiguous();
+    let ext: &[u8] = &ext_c;
     let ls = line_starts(src);
     let ext_ls = line_starts(ext);
     let indexes = started.elapsed();
@@ -896,7 +914,7 @@ fn legacy_pm_input(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: 
             Span { file: 0, lo: a, hi: z, start: line_col(src, &ls, a), end: line_col(src, &ls, z.min(base)) }
         }
     };
-    let input = to_stream_buf(Buf { src, ext }, &p.toks, lo, hi, &span_of).expect("legacy macro input");
+    let input = to_stream_buf(Buf { src, ext: ext_view }, &p.toks, lo, hi, &span_of).expect("legacy macro input");
     let call = span_of(call_lo, call_hi);
     let total = started.elapsed();
     if profile {
@@ -919,7 +937,7 @@ fn legacy_pm_input(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: 
         }
         let columns = started.elapsed();
         let started = std::time::Instant::now();
-        std::hint::black_box(to_stream_buf(Buf { src, ext }, &p.toks, lo, hi, &|_, _| Span::DUMMY));
+        std::hint::black_box(to_stream_buf(Buf { src, ext: ext_view }, &p.toks, lo, hi, &|_, _| Span::DUMMY));
         let stream = started.elapsed();
         eprintln!("input-profile: src={} ext={} expansions={} origins={} spans={} generated={} legacy={:.3} indexes={:.3} origins={:.3} line_col={:.3} stream_no_spans={:.3} ms",
             src.len(), ext.len(), p.exp_map.len(), p.tok_origin.len(), positions.len(), generated,
@@ -944,7 +962,7 @@ fn verify_pm_spans(actual: &TokenStream, expected: &TokenStream) {
 fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usize, call_lo: u32, call_hi: u32, run: impl FnOnce(TokenStream, Span) -> Result<TokenStream, String>) -> Result<TokenStream, String> {
     let input_timer = crate::parse_work::time(7);
     let index_timer = crate::parse_work::time(8);
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let ctx = p.bctx.as_deref();
     let ls_own;
     let ls: &[u32] = if span_needed {
@@ -958,7 +976,7 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
     } else {
         &[]
     };
-    let (src, ext): (&[u8], &[u8]) = (p.src, &p.ext);
+    let src: &[u8] = p.src;
     let cs_own;
     let cs: &[u32] = if span_needed {
         match ctx {
@@ -992,7 +1010,11 @@ fn expand_pm_ts(p: &crate::parser::Parser, span_needed: bool, lo: usize, hi: usi
                 let e = src_origin_end(p, z).unwrap_or(o).min(base);
                 return Span { file: 0, lo: a, hi: z, start: indexed_line_col(src, ls, cs, &src_cursor, o), end: indexed_line_col(src, ls, cs, &src_cursor, e) };
             }
-            let (ext_ls, ext_cs) = ext_index.get_or_init(|| (line_starts(ext), continuation_bytes(ext)));
+            let (ext, ext_ls, ext_cs) = ext_index.get_or_init(|| {
+                let ext = p.ext.view().contiguous();
+                let (ls, cs) = (line_starts(&ext), continuation_bytes(&ext));
+                (ext, ls, cs)
+            });
             Span { file: 0, lo: a, hi: z, start: indexed_line_col(ext, ext_ls, ext_cs, &ext_cursor, a - base), end: indexed_line_col(ext, ext_ls, ext_cs, &ext_cursor, z.saturating_sub(base)) }
         } else {
             Span { file: 0, lo: a, hi: z, start: indexed_line_col(src, ls, cs, &src_cursor, a), end: indexed_line_col(src, ls, cs, &src_cursor, z.min(base)) }
@@ -1062,7 +1084,7 @@ fn concat_args(p: &crate::parser::Parser, lo: usize, hi: usize) -> Result<Vec<St
     Ok(v)
 }
 
-fn split_commas(toks: &[Tok], lo: usize, hi: usize) -> Vec<(usize, usize)> {
+fn split_commas(toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize) -> Vec<(usize, usize)> {
     let mut v = Vec::new();
     let mut depth = 0i32;
     let mut s = lo;
@@ -1088,7 +1110,7 @@ fn split_commas(toks: &[Tok], lo: usize, hi: usize) -> Vec<(usize, usize)> {
 /// The value of a literal-producing argument: a literal, `-`literal, `true`/`false`, or a
 /// nested built-in call (`env!(..)`, `stringify!(..)`, ...). Second: was it a string.
 fn eval_lit(p: &crate::parser::Parser, a: usize, z: usize) -> Result<(String, bool), String> {
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let text = |i: usize| String::from_utf8_lossy(buf.get(toks[i].lo, toks[i].hi)).into_owned();
     if z == a + 1 {
@@ -1206,7 +1228,7 @@ fn expand_item(sess: &std::sync::Arc<crate::Session>, path: &str, item: &[u8], i
     if crate::lexer::lex(item, 2021, &mut fresh).is_err() {
         return Err((item_lo, "derive input does not lex".to_string()));
     }
-    let input = match to_stream_buf(Buf { src: item, ext: &[] }, &fresh, 0, fresh.len(), &span_of) {
+    let input = match to_stream_buf(Buf::plain(item), &fresh, 0, fresh.len(), &span_of) {
         Some(s) => s,
         None => return Err((item_lo, "unbalanced delimiters in derive input".to_string())),
     };
@@ -1440,7 +1462,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
     if crate::preload::derives_off(&p.session.options) {
         return Ok(None);
     }
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let item_lo = toks[lo].lo;
     let item_hi = toks[hi.saturating_sub(1)].hi;
@@ -1503,7 +1525,7 @@ fn derive_items_inner(p: &crate::parser::Parser, attrs: &[crate::ast::Attr], lo:
 /// one of the item's derives (rustc: an attribute in scope as both would be ambiguous; makepad's
 /// derives own many plain names). Only attributes written as `#[..]` (not cfg_attr output).
 pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> Option<usize> {
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let text = |i: usize| std::str::from_utf8(buf.get(toks[i].lo, toks[i].hi)).unwrap_or("").trim_start_matches("r#").to_string();
     let mut derives: Vec<String> = Vec::new();
@@ -1555,7 +1577,7 @@ pub fn attr_macro_at(p: &crate::parser::Parser, attrs: &[crate::ast::Attr]) -> O
 
 /// Optimisation level of a `relax(..)` attribute's arguments at tokens [i, hi) (i at the `(`):
 /// 2 = `(O2)`, 3 = `(O3)`, 4 = `(O3, always)`; None for anything else.
-pub fn relax_level_toks(text: &dyn Fn(usize) -> String, toks: &[Tok], i: usize, hi: usize) -> Option<u8> {
+pub fn relax_level_toks(text: &dyn Fn(usize) -> String, toks: &(impl TokSeq + ?Sized), i: usize, hi: usize) -> Option<u8> {
     if i >= hi || toks[i].kind != T::OpenParen {
         return None;
     }
@@ -1574,7 +1596,7 @@ pub fn relax_level_toks(text: &dyn Fn(usize) -> String, toks: &[Tok], i: usize, 
 /// failed expansion leaves a `compile_error!` item and is a reported failure (derive_failed).
 pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo: usize, hi: usize) -> Result<Expansion, (u32, String)> {
     let _timing = crate::parse_work::time(3);
-    let buf = Buf { src: p.src, ext: &p.ext };
+    let buf = Buf { src: p.src, ext: p.ext.view() };
     let toks = &p.toks;
     let (alo, ahi) = (attr.toks.lo as usize, attr.toks.hi as usize);
     let item_lo = toks[lo].lo;
@@ -1614,7 +1636,7 @@ pub fn expand_attr_macro(p: &crate::parser::Parser, attr: &crate::ast::Attr, lo:
         if crate::lexer::lex(text, 2021, &mut t).is_err() {
             return Err((item_lo, format!("#[{}] input does not lex", name)));
         }
-        to_stream_buf(Buf { src: text, ext: &[] }, &t, 0, t.len(), &|a, z| span_of(offset(a), offset(z))).ok_or_else(|| (item_lo, format!("unbalanced delimiters in #[{}] input", name)))
+        to_stream_buf(Buf::plain(text), &t, 0, t.len(), &|a, z| span_of(offset(a), offset(z))).ok_or_else(|| (item_lo, format!("unbalanced delimiters in #[{}] input", name)))
     };
     let args_lo = if i + 1 < ahi { toks[i + 1].lo.min(toks[ahi - 1].lo) } else { item_lo };
     let attr_ts = stream(&args, &|a| args_lo + a)?;
@@ -2254,9 +2276,9 @@ mod pm_input_tests {
         let input = TokenStream { trees: vec![TokenTree::Ident(Ident::new_raw("type", sources.get(file).unwrap().token_span(source)))] };
         let output = Expansion::from_stream(&input, 2021).unwrap();
         let base = src.len() as u32;
-        let mut p = crate::parser::Parser::new(&sess, src, output.toks.iter().map(|t| Tok { kind: t.kind, lo: base + t.lo, hi: base + t.hi }).collect(), 2021);
-        p.ext = output.text.into_bytes();
-        p.token_origins = output.origins.iter().map(|o| o.shifted(base)).collect();
+        let mut p = crate::parser::Parser::new(&sess, src, output.toks.iter().map(|t| Tok { kind: t.kind, lo: base + t.lo, hi: base + t.hi }).collect::<Vec<_>>(), 2021);
+        p.ext = output.text.into_bytes().into();
+        p.token_origins = output.origins.iter().map(|o| o.shifted(base)).collect::<Vec<_>>().into();
         p.token_input = true;
         p.sources = Some(sources);
         p.bctx = Some(std::rc::Rc::new(FileCtx::new("test", "/fake/module.rs", "test", &CfgSet::host(&sess, &[]))));
@@ -2310,7 +2332,7 @@ mod pm_input_tests {
         compare(&p, 0, p.toks.len(), 0, src.len() as u32);
         // An unrelated large expansion must not affect source spans or require an
         // expansion index. Deliberately use a single long line, as generated text does.
-        p.ext.resize(2_000_000, b' ');
+        p.ext.extend(std::iter::repeat_n(b' ', 2_000_000 - p.ext.len()));
         compare(&p, 0, p.toks.len(), 0, src.len() as u32);
         let start = p.expand_text("test", "(forwarded >>= 2)", 0).unwrap_or_else(|e| panic!("{}", e.msg));
         let base = p.toks[start].lo;

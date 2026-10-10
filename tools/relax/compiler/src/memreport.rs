@@ -163,16 +163,6 @@ fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
             a = ast.part.get().map(|a| &**a);
             prefix = "part.ast.";
         }
-        // A report must not wait for a body parser to release its publication lock.
-        if let Ok(scratch) = f.body_publish.try_lock() {
-            if let Some(scratch) = scratch.as_ref() {
-                for (name, heap, used) in scratch.mem_sizes() {
-                    let n = totals.entry(format!("scratch.{name}")).or_default();
-                    n.0 += heap as u64;
-                    n.1 += used as u64;
-                }
-            }
-        }
     }
     totals.into_iter().map(|(name, (heap, used))| {
         (format!("files: {name} heap ({} logical bytes)", used), heap)

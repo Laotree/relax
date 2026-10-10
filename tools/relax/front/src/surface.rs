@@ -251,7 +251,7 @@ pub fn surface_text(sess: &std::sync::Arc<crate::Session>, src: &[u8], commit: &
         format!("{}:{}: {}", l, c, msg)
     })?;
     let mut fns = Vec::new();
-    scan(&p.ast, &p.toks, &p.ast.root_items, &mut fns);
+    scan(&p.ast, p.toks.as_slice(), &p.ast.root_items, &mut fns);
     let mut ranges = Vec::new();
     for b in fns {
         match b.own {

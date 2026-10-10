@@ -5560,7 +5560,7 @@ fn relax_mark(u: &Unit, id: u32) -> u8 {
         for a in f.ast.list(f.ast.item(def.item).attrs) {
             let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
             if hi > lo + 1 && f.tok_text(lo as u32) == "relax" {
-                if let Some(l) = crate::builtins::relax_level_toks(&text, &f.toks, lo + 1, hi) {
+                if let Some(l) = crate::builtins::relax_level_toks(&text, &f.toks[..], lo + 1, hi) {
                     return l;
                 }
             }

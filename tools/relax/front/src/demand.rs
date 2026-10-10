@@ -599,7 +599,7 @@ impl Names {
             })
         }
         if !def.arms.iter().all(|(matcher, _)| names_only(matcher)) { return None; }
-        let mut parser = crate::parser::Parser::new(&c.cfg.session, src, toks.to_vec(), c.edition);
+        let mut parser = crate::parser::Parser::new(&c.cfg.session, src, toks, c.edition);
         parser.krate = c.name.clone();
         let Ok((expanded, _, _)) = parser.expand_rules(&def, open + 1, end) else { return None; };
         let mut tokens = Vec::new();

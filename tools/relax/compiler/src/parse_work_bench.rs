@@ -111,7 +111,7 @@ fn amp_parse_medians() {
             let call_hi = toks[lo + 1].hi;
             let mut p = crate::parser::Parser::new(sess, &text, toks, 2021);
             p.bctx = Some(std::rc::Rc::new(crate::builtins::FileCtx::new("amp", path, "amp", &snapshot.cfg)));
-            p.ext.resize(bytes, b' ');
+            p.ext = vec![b' '; bytes].into();
             let id = crate::builtins::HOSTED + crate::macro_reg::bang_index("live_id").unwrap() as u8;
             crate::parse_work::begin();
             std::hint::black_box(crate::builtins::expand(&p, id, lo, lo + 1, call_lo, call_hi).unwrap());

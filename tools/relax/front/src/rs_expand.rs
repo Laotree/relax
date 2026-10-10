@@ -49,10 +49,10 @@ fn outline(mut p: Parser<'_>, ctx: std::rc::Rc<crate::builtins::FileCtx>, table:
     let mut eager_bodies = BTreeSet::new();
     if let Err(e) = p.outline_items(T::Eof, &mut tokens, &mut unknown, &mut eager_bodies) {
         unknown.insert(("syntax".into(), e.msg));
-        tokens = p.toks[..p.toks.iter().position(|t| t.kind == T::Eof).unwrap_or(p.toks.len())].to_vec();
+        tokens = p.toks.as_slice()[..p.toks.iter().position(|t| t.kind == T::Eof).unwrap_or(p.toks.len())].to_vec();
     }
     let mut src = src.to_vec();
-    src.extend_from_slice(&p.ext);
+    src.extend_from_slice(&p.ext.view().contiguous());
     let toks = crate::preload::configured_tokens(&src, &tokens, &ctx.cfg);
     let mut items = Vec::new();
     crate::preload::rs_items::split(&src, &toks, 0, toks.len(), &ctx.module_path, &mut items);
@@ -80,7 +80,7 @@ impl Parser<'_> {
                     }
                     return Ok(());
                 }
-                out.extend_from_slice(&self.toks[start..self.pos]);
+                out.extend_from_slice(&self.toks.as_slice()[start..self.pos]);
                 continue;
             }
             let attrs = self.outer_attrs()?;
@@ -96,7 +96,7 @@ impl Parser<'_> {
                 let local_inner = attrs.iter().any(|a| (a.toks.lo..a.toks.hi).any(|i| self.tok_text(self.toks[i as usize]) == b"local_inner_macros"));
                 self.define_rules(name, range, exported, local_inner)?;
                 self.eat(T::Semi);
-                out.extend_from_slice(&self.toks[start..self.pos]);
+                out.extend_from_slice(&self.toks.as_slice()[start..self.pos]);
                 continue;
             }
             if self.mac_ahead() {
@@ -116,11 +116,11 @@ impl Parser<'_> {
                         .and_then(|at| self.in_expansion(at, |p| p.outline_items(T::Eof, out, unknown, eager_bodies)));
                     if let Err(e) = result {
                         out.truncate(before);
-                        out.extend_from_slice(&self.toks[start..after]);
+                        out.extend_from_slice(&self.toks.as_slice()[start..after]);
                         unknown.insert((format!("macro {name}"), e.msg));
                     }
                 } else {
-                    out.extend_from_slice(&self.toks[start..after]);
+                    out.extend_from_slice(&self.toks.as_slice()[start..after]);
                     unknown.insert((format!("macro {name}"), "no outline expander".into()));
                 }
                 self.pos = after;
@@ -171,11 +171,11 @@ impl Parser<'_> {
             let kind = self.toks[keyword].kind;
             let nested = matches!(kind, T::KwMod | T::KwTrait | T::KwImpl)
                 || kind == T::KwExtern && self.toks.get(keyword + 1).is_some_and(|t| t.kind != T::KwCrate)
-                    && !self.toks[keyword..stop].iter().any(|t| t.kind == T::KwFn);
+                    && !self.toks.as_slice()[keyword..stop].iter().any(|t| t.kind == T::KwFn);
             if nested {
                 let open = (keyword..stop).find(|&i| self.toks[i].kind == T::OpenBrace);
                 if let Some(open) = open {
-                    out.extend_from_slice(&self.toks[start..=open]);
+                    out.extend_from_slice(&self.toks.as_slice()[start..=open]);
                     if kind == T::KwMod {
                         self.mod_stack.push(String::from_utf8_lossy(self.tok_text(self.toks[keyword + 1])).into_owned());
                     }
@@ -183,14 +183,14 @@ impl Parser<'_> {
                     self.outline_items(T::CloseBrace, out, unknown, eager_bodies)?;
                     out.push(self.expect(T::CloseBrace)?);
                     if kind == T::KwMod { self.mod_stack.pop(); }
-                    if self.pos < stop { out.extend_from_slice(&self.toks[self.pos..stop]); }
-                } else { out.extend_from_slice(&self.toks[start..stop]); }
+                    if self.pos < stop { out.extend_from_slice(&self.toks.as_slice()[self.pos..stop]); }
+                } else { out.extend_from_slice(&self.toks.as_slice()[start..stop]); }
             } else if matches!(kind, T::KwConst | T::KwStatic) && !self.fn_ahead_from(keyword - head) {
-                out.extend_from_slice(&self.toks[start..head]);
+                out.extend_from_slice(&self.toks.as_slice()[start..head]);
                 self.pos = head;
                 self.outline_initializer(stop, out, unknown)?;
             } else {
-                out.extend_from_slice(&self.toks[start..stop]);
+                out.extend_from_slice(&self.toks.as_slice()[start..stop]);
             }
             if kind == T::KwUse {
                 self.pos = keyword + 1;
@@ -239,7 +239,7 @@ impl Parser<'_> {
             let start = self.pos;
             if self.is_word(0, b"macro_rules") && self.nth(1) == T::Not {
                 let stop = self.outline_item_end()?;
-                out.extend_from_slice(&self.toks[start..stop]);
+                out.extend_from_slice(&self.toks.as_slice()[start..stop]);
                 self.pos = stop;
                 unknown.insert(("initializer macro definition".into(), "nested textual scope".into()));
                 continue;
@@ -263,11 +263,11 @@ impl Parser<'_> {
                     .and_then(|at| self.in_expansion(at, |p| p.outline_initializer(p.toks.len(), out, unknown)));
                 if let Err(error) = result {
                     out.truncate(before);
-                    out.extend_from_slice(&self.toks[start..after]);
+                    out.extend_from_slice(&self.toks.as_slice()[start..after]);
                     unknown.insert((format!("initializer macro {name}"), error.msg));
                 }
             } else {
-                out.extend_from_slice(&self.toks[start..after]);
+                out.extend_from_slice(&self.toks.as_slice()[start..after]);
                 // Parser-owned expression builtins have no MacroRef and their
                 // implicit language dependencies are already demand seeds.
                 if def.is_some() || !crate::program::BUILTIN_MACROS.contains(&name.as_str()) {
