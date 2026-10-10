@@ -279,6 +279,31 @@ impl Program {
         Some(image)
     }
 
+    /// The running program's heap tables become views of `bytes`, the collected Program image
+    /// written from them (`collected_writer`), as a warm restore's are: the heap copies are
+    /// moved to `retired` (the caller drops them outside its locks) and an entry decodes on first use. A table that changed since it was written (or
+    /// whose entry count differs) stays as it is. `note` hears each table's outcome. Needs
+    /// exclusive access to the program, like any mutation.
+    pub fn adopt_collected(&mut self, bytes: &'static [u8], retired: &mut Vec<Box<dyn Send>>, mut note: impl FnMut(&'static str, crate::collected::Adopt)) -> Option<()> {
+        let image = crate::image::Reader::new(bytes)?;
+        let (mut k, mut id) = (6, 6);
+        macro_rules! table { ($($f:ident),+) => { $({
+            let t = crate::collected::ImageMap::read_image(&image, &mut k, &mut id)?;
+            note(stringify!($f), self.$f.adopt(t, retired));
+        })+ }; }
+        tables!(table);
+        macro_rules! list { ($($f:ident),+) => { $({
+            let t = crate::collected::ImageVec::read_image(&image, &mut k, &mut id)?;
+            note(stringify!($f), self.$f.adopt(t, retired));
+        })+ }; }
+        lists!(list);
+        let t = crate::collected::ImageSet::read_image(&image, &mut k, &mut id)?;
+        note("repeat_expr_counts", self.repeat_expr_counts.adopt(t, retired));
+        let t = crate::collected::ImageSet::read_image(&image, &mut k, &mut id)?;
+        note("collected_definitions", self.collected_definitions.adopt(t, retired));
+        (k == image.len()).then_some(())
+    }
+
     pub fn restore_collected(
         session: &Arc<crate::Session>, bytes: &'static [u8], pre: &[crate::preload::PreCrate],
         mut file: impl FnMut(usize, u32, &CfgSet, &mut FileMeta) -> Option<ParsedFile>,

@@ -230,6 +230,23 @@ impl Tcx {
         Some(image)
     }
 
+    /// As Program::adopt_collected, for the declaration tables of the Tcx image `bytes`
+    /// (`collected_writer_with`). The type interner is not touched.
+    pub fn adopt_collected(&mut self, bytes: &'static [u8], retired: &mut Vec<Box<dyn Send>>, mut note: impl FnMut(&'static str, crate::collected::Adopt)) -> Option<()> {
+        let image = crate::image::Reader::new(bytes)?;
+        let (mut k, mut id) = (2, 2);
+        macro_rules! table { ($($f:ident),+) => { $({
+            let t = ImageMap::read_image(&image, &mut k, &mut id)?;
+            note(stringify!($f), self.$f.adopt(t, retired));
+        })+ }; }
+        tables!(table);
+        let t = ConstTypes::read_image(&image, &mut k, &mut id)?;
+        note("const_tys", self.const_tys.adopt(t, retired));
+        let t = crate::collected::ImageSet::read_image(&image, &mut k, &mut id)?;
+        note("contracts_waiting", self.contracts_waiting.adopt(t, retired));
+        (k == image.len()).then_some(())
+    }
+
     pub fn restore_collected(bytes: &'static [u8], files: usize, crates: usize) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
@@ -289,6 +306,22 @@ mod tests {
         let restored_tcx = Tcx::restore_collected(Box::leak(types_image.into_boxed_slice()), restored_prog.files.len(), restored_prog.crates.len()).unwrap();
         prog.verify_collected(&restored_prog);
         tcx.verify_collected(&prog, &restored_prog, &restored_tcx);
+        // the running tables adopt the images written from them: same declarations, read in place
+        {
+            let mut retired: Vec<Box<dyn Send>> = Vec::new();
+            let mut outcomes = Vec::new();
+            let (program_bytes, types_bytes): (&'static [u8], &'static [u8]) = (
+                Box::leak(prog.collected_image().unwrap().into_boxed_slice()), Box::leak(tcx.collected_image().unwrap().into_boxed_slice()));
+            let before = tcx.fn_item_sig(&prog, def).unwrap().bound_regions.clone();
+            prog.adopt_collected(program_bytes, &mut retired, |n, how| outcomes.push((n, how))).unwrap();
+            tcx.adopt_collected(types_bytes, &mut retired, |n, how| outcomes.push((n, how))).unwrap();
+            assert!(outcomes.iter().any(|(n, how)| *n == "sigs" && matches!(how, crate::collected::Adopt::Adopted(_))), "{outcomes:?}");
+            assert!(outcomes.iter().any(|(n, how)| *n == "item_defs" && matches!(how, crate::collected::Adopt::Adopted(_))), "{outcomes:?}");
+            assert!(outcomes.iter().all(|(_, how)| !matches!(how, crate::collected::Adopt::Dirty | crate::collected::Adopt::Mismatch)), "{outcomes:?}");
+            prog.verify_collected(&restored_prog);
+            tcx.verify_collected(&prog, &restored_prog, &restored_tcx);
+            assert_eq!(tcx.fn_item_sig(&prog, def).unwrap().bound_regions, before);
+        }
         assert!(!restored_prog.node_id_to_def_id.is_empty());
         assert!(!restored_prog.impl_trait_in_trait_data.is_empty());
         assert_eq!(restored_tcx.fn_item_sig(&restored_prog, def).unwrap().bound_regions,
@@ -358,5 +391,11 @@ impl ConstTypes {
     }
     fn read_image(image: &crate::image::Reader, k: &mut usize, id: &mut u32) -> Option<Self> {
         Some(Self { image: ImageMap::read_image(image, k, id)?, added: Default::default() })
+    }
+    /// As ImageMap::adopt; fed types the image folded in make the written table a copy, so
+    /// a table with any stays as it is.
+    fn adopt(&mut self, image: Self, retired: &mut Vec<Box<dyn Send>>) -> crate::collected::Adopt {
+        if !self.added.snapshot().is_empty() { return crate::collected::Adopt::Dirty; }
+        self.image.adopt(image.image, retired)
     }
 }

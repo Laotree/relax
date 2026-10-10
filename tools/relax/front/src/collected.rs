@@ -301,6 +301,25 @@ impl KeyRow { fn get(self) -> u128 { self.lo as u128 | ((self.hi as u128) << 64)
 pub struct ImageMap<K, V> {
     owned: crate::fxhash::HashMap<K, V>,
     mapped: Option<MappedTable<K, V>>,
+    /// write_image ran on this owned table and nothing has taken `&mut` access since: its
+    /// entries are what the image holds (adopt). Interior state of a value (lazy cells) is
+    /// derived and may differ.
+    snap: std::sync::atomic::AtomicBool,
+}
+/// What `adopt` did with a table: the live heap table became a view of the image just written
+/// from it, or why not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Adopt {
+    /// the heap table was freed; n entries are read in place from now on
+    Adopted(usize),
+    /// already read in place (a warm restore, or adopted before)
+    Mapped,
+    /// empty: nothing to free
+    Empty,
+    /// mutated since the image was written from it (or never written)
+    Dirty,
+    /// the image does not hold this table's entries
+    Mismatch,
 }
 pub struct MappedTable<K, V> {
     keys: &'static [KeyRow],
@@ -311,7 +330,7 @@ pub struct MappedTable<K, V> {
     slots: LazySlots<(K, V)>,
 }
 impl<K, V> Default for ImageMap<K, V> {
-    fn default() -> Self { Self { owned: Default::default(), mapped: None } }
+    fn default() -> Self { Self { owned: Default::default(), mapped: None, snap: Default::default() } }
 }
 impl<K: Codec, V: Codec> MappedTable<K, V> {
     fn entry(&self, i: usize) -> &(K, V) {
@@ -339,6 +358,7 @@ fn key_slot(key: u128, table: usize) -> usize {
 impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> ImageMap<K, V> {
     /// Sections of a collected image: keys, offsets, entries, hash index.
     pub fn write_image(&self, image: &mut crate::image::Writer<'_>, id: &mut u32) {
+        self.snap.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut rows: Vec<(u128, Option<(u32, u32)>, Option<(&K, &V)>)> = match &self.mapped {
             // An entry nobody decoded is unchanged; a decoded one may have filled a lazy cell.
             Some(m) => (0..m.keys.len()).map(|i| match m.slots.get(i) {
@@ -382,7 +402,23 @@ impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> ImageMap<K, V> {
         if offsets.len() != keys.len() + 1 || *offsets.last()? as usize != entries.len()
             || !index.len().is_power_of_two() || index.len() <= keys.len() { return None; }
         *k += 4; *id += 4;
-        Some(Self { owned: Default::default(), mapped: Some(MappedTable { keys, index, offsets, entries, slots: LazySlots::new(keys.len()) }) })
+        Some(Self { owned: Default::default(), mapped: Some(MappedTable { keys, index, offsets, entries, slots: LazySlots::new(keys.len()) }), snap: Default::default() })
+    }
+
+    /// Replace this heap table by `image` (read_image of the image `write_image` made from
+    /// it), when it has not been mutated since: the same entries, now read in place, decoded on
+    /// first use like a warm restore's. Needs exclusive access, as any mutation does.
+    /// The freed heap table goes to `retired`: the caller drops it outside its locks.
+    pub fn adopt(&mut self, image: Self, retired: &mut Vec<Box<dyn Send>>) -> Adopt where K: Send + 'static, V: Send + 'static {
+        if self.mapped.is_some() { return Adopt::Mapped; }
+        if self.owned.is_empty() { return Adopt::Empty; }
+        if !*self.snap.get_mut() { return Adopt::Dirty; }
+        let Some(m) = image.mapped else { return Adopt::Mismatch };
+        if m.keys.len() != self.owned.len() { return Adopt::Mismatch; }
+        let n = m.keys.len();
+        retired.push(Box::new(std::mem::take(&mut self.owned)));
+        self.mapped = Some(m);
+        Adopt::Adopted(n)
     }
 
     pub fn get(&self, k: &K) -> Option<&V> {
@@ -408,6 +444,7 @@ impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> ImageMap<K, V> {
 
     /// Mutation needs the owned map: decode every entry once, keeping the decoded ones.
     pub fn owned(&mut self) -> &mut crate::fxhash::HashMap<K, V> {
+        *self.snap.get_mut() = false;
         if let Some(mut m) = self.mapped.take() {
             self.owned.reserve(m.keys.len());
             for i in 0..m.keys.len() {
@@ -441,13 +478,13 @@ impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> ImageMap<K, V> {
         }
     }
     pub fn iter_mut(&mut self) -> std::collections::hash_map::IterMut<'_, K, V> { self.owned().iter_mut() }
-    pub fn clear(&mut self) { self.mapped = None; self.owned.clear() }
+    pub fn clear(&mut self) { *self.snap.get_mut() = false; self.mapped = None; self.owned.clear() }
 }
 impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> Extend<(K, V)> for ImageMap<K, V> {
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, it: I) { self.owned().extend(it) }
 }
 impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> FromIterator<(K, V)> for ImageMap<K, V> {
-    fn from_iter<I: IntoIterator<Item = (K, V)>>(it: I) -> Self { Self { owned: it.into_iter().collect(), mapped: None } }
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(it: I) -> Self { Self { owned: it.into_iter().collect(), mapped: None, snap: Default::default() } }
 }
 impl<K: Codec + ImageKey + std::hash::Hash + Eq, V: Codec> std::ops::Index<&K> for ImageMap<K, V> {
     type Output = V;
@@ -493,6 +530,8 @@ impl<K: Codec + ImageKey + Ord + std::hash::Hash + Eq, V: Codec> Codec for Image
 pub struct ImageVec<T> {
     owned: Vec<T>,
     mapped: Option<MappedList<T>>,
+    /// as ImageMap::snap
+    snap: std::sync::atomic::AtomicBool,
 }
 pub struct MappedList<T> {
     offsets: &'static [u32],
@@ -500,7 +539,7 @@ pub struct MappedList<T> {
     slots: LazySlots<T>,
 }
 impl<T> Default for ImageVec<T> {
-    fn default() -> Self { Self { owned: Vec::new(), mapped: None } }
+    fn default() -> Self { Self { owned: Vec::new(), mapped: None, snap: Default::default() } }
 }
 impl<T: Codec> MappedList<T> {
     fn len(&self) -> usize { self.offsets.len() - 1 }
@@ -516,6 +555,7 @@ impl<T: Codec> MappedList<T> {
 impl<T: Codec> ImageVec<T> {
     /// Sections of a collected image: offsets, entries.
     pub fn write_image(&self, image: &mut crate::image::Writer<'_>, id: &mut u32) {
+        self.snap.store(true, std::sync::atomic::Ordering::Relaxed);
         let mut offsets = Vec::with_capacity(self.len() + 1);
         let mut entries = ImageEntries::default();
         for i in 0..self.len() {
@@ -536,7 +576,19 @@ impl<T: Codec> ImageVec<T> {
         let entries = image.bytes(*k + 1, *id + 1)?;
         if offsets.is_empty() || *offsets.last()? as usize != entries.len() { return None; }
         *k += 2; *id += 2;
-        Some(Self { owned: Vec::new(), mapped: Some(MappedList { offsets, entries, slots: LazySlots::new(offsets.len() - 1) }) })
+        Some(Self { owned: Vec::new(), mapped: Some(MappedList { offsets, entries, slots: LazySlots::new(offsets.len() - 1) }), snap: Default::default() })
+    }
+    /// As ImageMap::adopt.
+    pub fn adopt(&mut self, image: Self, retired: &mut Vec<Box<dyn Send>>) -> Adopt where T: Send + 'static {
+        if self.mapped.is_some() { return Adopt::Mapped; }
+        if self.owned.is_empty() { return Adopt::Empty; }
+        if !*self.snap.get_mut() { return Adopt::Dirty; }
+        let Some(m) = image.mapped else { return Adopt::Mismatch };
+        if m.len() != self.owned.len() { return Adopt::Mismatch; }
+        let n = m.len();
+        retired.push(Box::new(std::mem::take(&mut self.owned)));
+        self.mapped = Some(m);
+        Adopt::Adopted(n)
     }
     pub fn len(&self) -> usize { self.mapped.as_ref().map_or(self.owned.len(), |m| m.len()) }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
@@ -547,6 +599,7 @@ impl<T: Codec> ImageVec<T> {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + '_ { (0..self.len()).map(|i| &self[i]) }
     /// Mutation needs the owned Vec: decode every element once, keeping the decoded ones.
     pub fn owned(&mut self) -> &mut Vec<T> {
+        *self.snap.get_mut() = false;
         if let Some(mut m) = self.mapped.take() {
             self.owned = (0..m.len()).map(|i| match m.slots.take(i) {
                 Some(x) => x,
@@ -584,7 +637,7 @@ impl<'a, T: Codec> IntoIterator for &'a mut ImageVec<T> {
     fn into_iter(self) -> Self::IntoIter { self.owned().iter_mut() }
 }
 impl<T: Codec> From<Vec<T>> for ImageVec<T> {
-    fn from(owned: Vec<T>) -> Self { Self { owned, mapped: None } }
+    fn from(owned: Vec<T>) -> Self { Self { owned, mapped: None, snap: Default::default() } }
 }
 /// Same encoding as a Vec.
 impl<T: Codec> Codec for ImageVec<T> {
@@ -642,6 +695,50 @@ mod image_table_tests {
     }
 
     #[test]
+    fn heap_tables_adopt_their_own_image_unless_changed() {
+        let mut retired: Vec<Box<dyn Send>> = Vec::new();
+        // a map: written, read back, adopted: same entries, now in place, the heap table retired
+        let mut owned: ImageMap<(u32, DefId), Vec<String>> = Default::default();
+        for i in 0..500u32 { owned.insert((i % 7, DefId(i)), vec![format!("v{i}"); (i % 3) as usize]); }
+        let want = crate::crate_image::encode(&owned);
+        // never written: not adoptable
+        let r0 = image(|w| owned.clone().write_image(w, &mut 0));
+        assert_eq!(owned.adopt(ImageMap::read_image(&r0, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Dirty);
+        let r = image(|w| owned.write_image(w, &mut 0));
+        assert_eq!(owned.adopt(ImageMap::read_image(&r, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Adopted(500));
+        assert_eq!(retired.len(), 1);
+        assert!(owned.is_mapped() && owned.len() == 500);
+        assert_eq!(crate::crate_image::encode(&owned), want);
+        assert_eq!(owned.adopt(ImageMap::read_image(&r, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Mapped);
+        // a mutation after the write keeps the heap table
+        let mut edited: ImageMap<(u32, DefId), Vec<String>> = (0..50u32).map(|i| ((0, DefId(i)), vec![format!("e{i}")])).collect();
+        let r = image(|w| edited.write_image(w, &mut 0));
+        edited.insert((0, DefId(99)), vec![]);
+        assert_eq!(edited.adopt(ImageMap::read_image(&r, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Dirty);
+        assert!(!edited.is_mapped() && edited.len() == 51);
+        // an image of another table is refused by its entry count
+        let other: ImageMap<(u32, DefId), Vec<String>> = (0..10u32).map(|i| ((0, DefId(i)), vec![])).collect();
+        let ro = image(|w| other.write_image(w, &mut 0));
+        let mut same: ImageMap<(u32, DefId), Vec<String>> = (0..50u32).map(|i| ((0, DefId(i)), vec![])).collect();
+        same.write_image(&mut crate::image::Writer::default(), &mut 0);
+        assert_eq!(same.adopt(ImageMap::read_image(&ro, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Mismatch);
+        // a list and a set
+        let mut list: ImageVec<(u32, String)> = (0..300u32).map(|i| (i, format!("m{i}"))).collect::<Vec<_>>().into();
+        let want = crate::crate_image::encode(&list);
+        let r = image(|w| list.write_image(w, &mut 0));
+        assert_eq!(list.adopt(ImageVec::read_image(&r, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Adopted(300));
+        assert_eq!(crate::crate_image::encode(&list), want);
+        let mut set: ImageSet<DefId> = Default::default();
+        for i in 0..40u32 { set.insert(DefId(i)); }
+        let r = image(|w| set.write_image(w, &mut 0));
+        assert_eq!(set.adopt(ImageSet::read_image(&r, &mut 0, &mut 0).unwrap(), &mut retired), Adopt::Adopted(40));
+        assert!(set.contains(&DefId(39)) && !set.contains(&DefId(40)));
+        // the first mutation of an adopted table owns it again, as after a restore
+        set.insert(DefId(77));
+        assert!(set.contains(&DefId(77)) && set.contains(&DefId(0)) && set.len() == 41);
+    }
+
+    #[test]
     fn image_vec_reads_in_place_and_owns_on_first_mutation() {
         let owned: ImageVec<(u32, String)> = (0..300u32).map(|i| (i, format!("m{i}"))).collect::<Vec<_>>().into();
         let r = image(|w| owned.write_image(w, &mut 0));
@@ -690,6 +787,7 @@ impl<K: Codec + ImageKey + std::hash::Hash + Eq> ImageSet<K> {
     pub fn iter(&self) -> impl Iterator<Item = &K> { self.0.keys() }
     pub fn write_image(&self, image: &mut crate::image::Writer<'_>, id: &mut u32) { self.0.write_image(image, id); }
     pub fn read_image(image: &crate::image::Reader, k: &mut usize, id: &mut u32) -> Option<Self> { Some(Self(ImageMap::read_image(image, k, id)?)) }
+    pub fn adopt(&mut self, image: Self, retired: &mut Vec<Box<dyn Send>>) -> Adopt where K: Send + 'static { self.0.adopt(image.0, retired) }
 }
 impl<'a, K: Codec + ImageKey + std::hash::Hash + Eq> IntoIterator for &'a ImageSet<K> {
     type Item = &'a K;

@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 mod collected;
-pub use collected::{CollectedCache, CollectedRecord};
+pub use collected::{CollectedCache, CollectedRecord, CollectedWritten};
 mod image;
 use image::{ManifestImage, IMAGE_MAGIC};
 pub(crate) use image::{complete_identities_unit, ids_report_unit, image_slot_by_key_unit, name_unnamed_unit, prelink_unit, PrelinkedSlot};

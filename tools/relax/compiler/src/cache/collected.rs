@@ -338,7 +338,7 @@ impl Cache {
     /// Per-crate file images are flushed first, then the complete graph is committed last.
     pub fn record_collected(&mut self, prog: &Program, tcx: &Tcx) -> Option<()> {
         match self.encode_collected(prog, tcx, &|| false) {
-            CollectedRecord::Ready(dest, payload) => Self::commit_collected(prog.session.options.verbose.then_some(self.collected_crates(prog)), dest, payload)?,
+            CollectedRecord::Ready(dest, payload) => { Self::commit_collected(prog.session.options.verbose.then_some(self.collected_crates(prog)), dest, payload)?; }
             CollectedRecord::Current => (),
             CollectedRecord::Yielded | CollectedRecord::Failed => return None,
         }
@@ -401,19 +401,54 @@ impl Cache {
         }
     }
 
-    /// `report`: the crate count to print (verbose).
-    pub fn commit_collected(report: Option<usize>, (dest, key): (PathBuf, u128), payload: crate::image::Writer<'static>) -> Option<()> {
+    /// `report`: the crate count to print (verbose). The entry as the store now holds it.
+    pub fn commit_collected(report: Option<usize>, (dest, key): (PathBuf, u128), payload: crate::image::Writer<'static>) -> Option<CollectedWritten> {
         // Hash/verify outside the compiler locks, alongside the store write. The
         // immutable snapshot is already complete; a current store needs no replacement.
-        if Store::open(&dest).is_some_and(|s| s.matches_entry(
-            &CollectedEntry { key, payload: &payload }, payload.len())) { return Some(()); }
+        let (len, sum) = crate::store::entry_sum(&CollectedEntry { key, payload: &payload })?;
+        let written = CollectedWritten { dest: dest.clone(), key, len, sum };
+        if Store::open(&dest).is_some_and(|s| s.matches_sum(key, KIND_COLLECTED, len, sum)) { return Some(written); }
         if crate::store::append(&dest, vec![CollectedEntry { key, payload: &payload }], true).is_err() {
             if crate::preload::trace() { eprintln!("relax-collected: not recorded: write"); }
             return None;
         }
         if let Some(n) = report { eprintln!("relax-collected: recorded {} crates", n); }
+        Some(written)
+    }
+
+    /// The running program's collected tables become views of the image this run wrote
+    /// (`written`): a cold run holds what a warm restore would map. Tables that were mutated
+    /// since the image was encoded stay as they are. The freed heap tables go to `retired`
+    /// (drop them outside the compiler locks); `note` hears each table's outcome. Both the
+    /// unit and the front-end write locks are held. None: the image on disk is not the one
+    /// written (or unreadable), nothing was changed.
+    pub(crate) fn adopt_collected(&self, prog: &mut Program, tcx: &mut Tcx, written: &CollectedWritten,
+        retired: &mut Vec<Box<dyn Send>>, mut note: impl FnMut(&'static str, crate::collected::Adopt)) -> Option<()> {
+        let st = Arc::new(Store::open(&written.dest)?);
+        let at = st.index.binary_search_by(|e| { let k = e.key; k.cmp(&written.key) }).ok()?;
+        let ix = st.index[at];
+        if { ix.len } != written.len || { ix.sum } != written.sum || { ix.kind } != KIND_COLLECTED { return None; }
+        let (_, bytes) = st.get_at(at, written.key)?;
+        // the mapping is pinned for the rest of the process: the tables point into it
+        FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner()).push(st.clone());
+        FRONT_USED.lock().unwrap_or_else(|e| e.into_inner()).push((st.clone(), at));
+        let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes.as_ptr(), bytes.len()) };
+        let image = crate::image::Reader::new(bytes)?;
+        if image.len() != 6 { return None; }
+        let (program, types) = (image.bytes(1, 1)?, image.bytes(2, 2)?);
+        prog.adopt_collected(program, retired, &mut note)?;
+        tcx.adopt_collected(types, retired, &mut note)?;
         Some(())
     }
+}
+
+/// The collected store entry a run wrote: where, and its length and checksum there.
+#[derive(Clone)]
+pub struct CollectedWritten {
+    dest: PathBuf,
+    key: u128,
+    len: u32,
+    sum: u64,
 }
 
 pub enum CollectedRecord {

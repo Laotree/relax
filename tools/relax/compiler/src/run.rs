@@ -1473,6 +1473,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let mut mem_snapshot = std::env::var_os("RELAX_MEM_SNAPSHOT").map(std::path::PathBuf::from);
         let mut last = u64::MAX;
         let settle_on = runtime.settle_drop;
+        // RELAX_ADOPT=0: the heap tables stay (the cold run's footprint, for comparison)
+        let adopt_on = std::env::var("RELAX_ADOPT").map_or(true, |v| v != "0");
         let mut settle_watch = SettleWatch::default();
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
@@ -1613,6 +1615,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     } else if requested {
                         SETTLE_REQUESTED.store(true, Ordering::Release);
                     }
+                }
+                // once the settle ran and this run's collected image is written: the heap tables
+                // it was encoded from become views of it (what a warm run maps), then the freed
+                // pages go back
+                if settle_watch.settled.is_some() && runtime.mem_trim && adopt_on
+                    && COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() && adopt_collected_tables() {
+                    crate::memstat::trim();
                 }
             }
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
@@ -1810,6 +1819,47 @@ pub(crate) fn preserve_collected_boot(u: &mut jit::Unit) {
         if let Some(c) = u.cache.as_mut() { c.preserve_collected_boot(&u.prog, &u.tcx); }
     }
 }
+/// The collected store entry this run wrote mid-run (not one a warm restore mapped): the
+/// settle makes the program's tables views of it (adopt_collected_tables).
+static COLLECTED_WRITTEN: std::sync::Mutex<Option<crate::cache::CollectedWritten>> = std::sync::Mutex::new(None);
+
+/// A cold run holds what a warm run maps: once the collected image is written and the program
+/// is quiet, the heap tables it was encoded from become views of it, decoded entry by entry on
+/// use as after a restore (Program::adopt_collected, Tcx::adopt_collected). Tables changed since
+/// the encode stay. Retried while the locks are busy; true: done (adopted or nothing to adopt).
+fn adopt_collected_tables() -> bool {
+    let up = unsafe { RUN_UNIT };
+    if up.is_null() { return true; }
+    let Some(written) = COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return true };
+    let mut retired: Vec<Box<dyn Send>> = Vec::new();
+    let mut notes: Vec<(&'static str, crate::collected::Adopt)> = Vec::new();
+    let before = crate::memstat::live_total();
+    let t = Instant::now();
+    let Some(done) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+        let u = unsafe { &mut *up };
+        if !front_recordable() { return Some(None); }
+        let cache = u.cache.as_ref()?;
+        Some(cache.adopt_collected(&mut u.prog, &mut u.tcx, &written, &mut retired, |name, how| notes.push((name, how))))
+    }).flatten() else { return false };
+    let held = t.elapsed().as_secs_f64() * 1e3;
+    drop(retired);
+    let after = crate::memstat::live_total();
+    *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    {
+        use crate::collected::Adopt;
+        let count = |f: fn(&Adopt) -> bool| notes.iter().filter(|(_, a)| f(a)).count();
+        let entries: usize = notes.iter().map(|(_, a)| if let Adopt::Adopted(n) = a { *n } else { 0 }).sum();
+        verbose!("relax-mem: adopt collected tables at t={:.0} ms: {} adopted ({} entries), {} dirty, {} mismatch, {} already mapped, {} empty; counted heap {:.1} -> {:.1} MB; locks held {:.1} ms{}",
+            crate::clock::ms_since_start(), count(|a| matches!(a, Adopt::Adopted(_))), entries, count(|a| matches!(a, Adopt::Dirty)),
+            count(|a| matches!(a, Adopt::Mismatch)), count(|a| matches!(a, Adopt::Mapped)), count(|a| matches!(a, Adopt::Empty)),
+            before as f64 / 1048576.0, after as f64 / 1048576.0, held,
+            if done.is_none() { " (image not the one written: unchanged)" } else { "" });
+        if crate::memstat::enabled() { for (name, how) in &notes { verbose!("relax-mem:   adopt {} {:?}", name, how); } }
+    }
+    true
+}
+
 /// A mid-run write tried to record the collected program (once per run; the exit tries again
 /// only if it is still not current).
 static MID_COLLECTED_TRIED: AtomicBool = AtomicBool::new(false);
@@ -2020,8 +2070,9 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: collected record held the unit lock {:.1} ms", t.elapsed().as_secs_f64() * 1e3); }
             drop(retired_boot);
             if let Some((report, dest, payload)) = ready {
-                if crate::cache::Cache::commit_collected(report, dest, payload).is_some() {
+                if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
+                    *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(written);
                     let retired_boot = crate::owner::call(crate::owner::Class::App, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
                     drop(retired_boot);
                 }

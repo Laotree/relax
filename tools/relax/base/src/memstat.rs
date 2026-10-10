@@ -897,7 +897,7 @@ mod sites {
         d.fbase as usize
     }
 
-    /// Appends the sites with >= 1 MB live or peak (estimated) to the sites file.
+    /// Appends the sites with >= 1 MB (RELAX_MEM_SITES_MIN_KB) live or peak (estimated) to the sites file.
     pub fn report(label: &str) {
         if iv() <= 0 { return; }
         #[cfg(target_os = "linux")]
@@ -907,9 +907,11 @@ mod sites {
             let path = std::env::var("RELAX_MEM_SITES_OUT").unwrap_or_else(|_| format!("/tmp/relax-mem-sites-{}.txt", std::process::id()));
             let b = base();
             let mut rows: Vec<(i64, i64, i64, usize)> = Vec::new();
+            // RELAX_MEM_SITES_MIN_KB (default 1024): the smallest live / peak a listed site has
+            let min = std::env::var("RELAX_MEM_SITES_MIN_KB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1024) << 10;
             for i in 1..N {
                 let (l, p) = (LIVE[i].load(Relaxed), PEAK[i].load(Relaxed));
-                if l >= 1 << 20 || p >= 1 << 20 || COUNT[i].load(Relaxed) * iv() >= 1 << 20 { rows.push((l, p, COUNT[i].load(Relaxed), i)); }
+                if l >= min || p >= min || COUNT[i].load(Relaxed) * iv() >= min { rows.push((l, p, COUNT[i].load(Relaxed), i)); }
             }
             rows.sort_by_key(|r| std::cmp::Reverse(r.0.max(r.1 / 2)));
             let mut out = format!("== {} t_ms={:.0} interval={} sites_used={} base={:#x}\n", label, crate::clock::ms_since_start(), iv(), USED.load(Relaxed), b);

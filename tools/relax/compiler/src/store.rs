@@ -502,6 +502,14 @@ impl Store {
             && out.sum.finish() == e.sum && self.verify_at(i)
     }
 
+    /// Whether the entry `key` holds exactly a payload of `len` bytes with checksum `sum`
+    /// (from `entry_sum`), checked against the payload on disk.
+    pub fn matches_sum(&self, key: u128, kind: u32, len: u32, sum: u64) -> bool {
+        let Ok(i) = self.index.binary_search_by_key(&key, |e| e.key) else { return false; };
+        let e = self.index[i];
+        e.kind == kind && e.len == len && e.sum == sum && self.verify_at(i)
+    }
+
     /// The payload of `key` (binary search).
     pub fn get(&self, key: u128) -> Option<(u32, &[u8])> {
         let i = self.index.binary_search_by(|e| { let k = e.key; k.cmp(&key) }).ok()?;
@@ -511,6 +519,15 @@ impl Store {
     pub fn file_len(&self) -> u64 {
         self.data_end
     }
+}
+
+/// The length and checksum an entry's payload gets in a store, from streaming it once.
+pub fn entry_sum(entry: &impl Entry) -> Option<(u32, u64)> {
+    let mut sink = std::io::sink();
+    let mut out = PayloadWriter { out: &mut sink, sum: Sum64::new() };
+    entry.write_payload(&mut out).ok()?;
+    let len = u32::try_from(out.sum.len).ok()?;
+    Some((len, out.sum.finish()))
 }
 
 /// The generation (Store::generation: the header checksum) of the store file's current
