@@ -6924,6 +6924,11 @@ pub fn addr_modes(f: &mut Func) {
 /// Loop rotation on the codegen copy: a latch ending in `jump H` to a loop header whose
 /// block is only a short compare-and-branch gets a copy of that test, so each iteration
 /// runs one conditional branch at the bottom instead of a jump plus the header test.
+/// A latch whose branch goes back to the header on its false edge (`if skip { continue }`)
+/// gets the copy as a new block laid out after it: the latch falls into the test instead of
+/// jumping to the header. Header values used only in the header get fresh vregs in the copy;
+/// a header value the loop reads elsewhere (`let i = it.start` of a range's `next`, a loaded length) keeps its
+/// vreg -- the copy is the very code the jump would have run, so it defines the same values.
 pub fn rotate_loops(f: &mut Func) {
     if forward_only(f) {
         return;
@@ -6957,9 +6962,13 @@ pub fn rotate_loops(f: &mut Func) {
             nuse[u.0 as usize] += 1;
         }
     }
+    // latches ending in a branch whose false edge goes to the header get a new block with the
+    // header's copy there (laid out after the latch below)
+    let mut added = false;
     for l in 0..n {
-        let h = match f.blocks[l].term {
-            Term::Jump(h) if idom[l] != u32::MAX && dominates(h, l as u32) => h as usize,
+        let (h, branch_latch) = match f.blocks[l].term {
+            Term::Jump(h) if idom[l] != u32::MAX && dominates(h, l as u32) => (h as usize, false),
+            Term::Branch(_, t, e) if t != e && e as usize != l && idom[l] != u32::MAX && dominates(e, l as u32) => (e as usize, true),
             _ => continue,
         };
         let hb = f.blocks[h].clone();
@@ -6971,7 +6980,7 @@ pub fn rotate_loops(f: &mut Func) {
         let mut local_uses = vec![0u32; f.vregs.len()];
         for i in &hb.insts {
             match i {
-                Inst::Iconst(..) | Inst::Fconst(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..) | Inst::IBinI(..) | Inst::IBin(..) | Inst::Mov(..) | Inst::Conv(..) => {}
+                Inst::Iconst(..) | Inst::Fconst(..) | Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..) | Inst::IBinI(..) | Inst::IBin(..) | Inst::Mov(..) | Inst::Conv(..) | Inst::Load(..) => {}
                 _ => ok = false,
             }
             for_uses(i, |u| local_uses[u.0 as usize] += 1);
@@ -6980,19 +6989,17 @@ pub fn rotate_loops(f: &mut Func) {
         for u in &uses {
             local_uses[u.0 as usize] += 1;
         }
+        // (header def, its copy's vreg): u32::MAX = a fresh one, the def itself when the loop
+        // reads it outside the header
         let mut map: Vec<(VReg, VReg)> = Vec::new();
         for i in &hb.insts {
             uses_defs(i, &mut uses, &mut defs);
+            if matches!(i, Inst::IBin(IOp::Div | IOp::Rem, ..)) {
+                ok = false;
+            }
             for d in &defs {
-                if nuse[d.0 as usize] != local_uses[d.0 as usize] {
-                    ok = false;
-                }
-                if matches!(i, Inst::IBin(IOp::Div | IOp::Rem, ..)) {
-                    ok = false;
-                }
-                let c = f.vregs[d.0 as usize];
-                map.push((*d, VReg(u32::MAX)));
-                let _ = c;
+                let keep = nuse[d.0 as usize] != local_uses[d.0 as usize];
+                map.push((*d, if keep { *d } else { VReg(u32::MAX) }));
             }
         }
         // a header def read in the header before it is (re)defined carries its value around
@@ -7000,7 +7007,7 @@ pub fn rotate_loops(f: &mut Func) {
         let mut seen_def: Vec<VReg> = Vec::new();
         for i in &hb.insts {
             uses_defs(i, &mut uses, &mut defs);
-            if uses.iter().any(|u| map.iter().any(|(a, _)| a == u) && !seen_def.contains(u)) {
+            if uses.iter().any(|u| map.iter().any(|(a, b)| a == u && a != b) && !seen_def.contains(u)) {
                 ok = false;
             }
             seen_def.extend(defs.iter().cloned());
@@ -7009,8 +7016,10 @@ pub fn rotate_loops(f: &mut Func) {
             continue;
         }
         for m in map.iter_mut() {
-            let c = f.vregs[m.0 .0 as usize];
-            m.1 = f.vreg(c);
+            if m.1 == VReg(u32::MAX) {
+                let c = f.vregs[m.0 .0 as usize];
+                m.1 = f.vreg(c);
+            }
         }
         let look = |v: VReg| -> VReg {
             for (a, b) in &map {
@@ -7020,16 +7029,28 @@ pub fn rotate_loops(f: &mut Func) {
             }
             v
         };
-        for (k, i) in hb.insts.iter().enumerate() {
-            let ni = map_inst(i, &look, 0);
-            f.blocks[l].insts.push(ni);
-            f.blocks[l].pos.push(hb.pos[k]);
-        }
-        f.blocks[l].term = match hb.term {
+        let insts: Vec<Inst> = hb.insts.iter().map(|i| map_inst(i, &look, 0)).collect();
+        let term = match hb.term {
             Term::Branch(c, t, e) => Term::Branch(look(c), t, e),
             t => t,
         };
-        f.blocks[l].term_pos = hb.term_pos;
+        if branch_latch {
+            let nb = f.blocks.len() as u32;
+            f.blocks.push(Block { insts, pos: hb.pos.clone(), term, term_pos: hb.term_pos });
+            if let Term::Branch(_, _, ref mut e) = f.blocks[l].term {
+                *e = nb;
+            }
+            added = true;
+        } else {
+            f.blocks[l].insts.extend(insts);
+            f.blocks[l].pos.extend(hb.pos.iter().copied());
+            f.blocks[l].term = term;
+            f.blocks[l].term_pos = hb.term_pos;
+        }
+    }
+    // the header copies follow their latches (a branch's false target is laid out next)
+    if added {
+        relayout(f);
     }
 }
 
@@ -12009,4 +12030,82 @@ pub fn drop_unread_slot_stores(f: &mut Func) -> bool {
         }
     }
     any
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    /// `while i < n { s += i; i += 1 }` with the header `i = k; c = i < n; branch c` (b1),
+    /// body + latch b2 (`jump b1`); i is read in the body, c only in the header.
+    fn counted_loop() -> (Func, VReg, VReg) {
+        let mut f = Func::new("rot".into(), 0);
+        let n = f.vreg(Cls::I);
+        f.params.push(n);
+        f.rets.push(Cls::I);
+        let (k, i, c, s) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..4 {
+            f.block();
+        }
+        f.blocks[0].insts = vec![Inst::Iconst(k, 0), Inst::Iconst(s, 0)];
+        f.blocks[0].term = Term::Jump(1);
+        f.blocks[1].insts = vec![Inst::Mov(i, k), Inst::ICmp(Cond::Lt, false, c, i, n)];
+        f.blocks[1].term = Term::Branch(c, 2, 3);
+        f.blocks[2].insts = vec![Inst::IBin(IOp::Add, U64T, s, s, i), Inst::IBinI(IOp::Add, U64T, k, i, 1)];
+        f.blocks[2].term = Term::Jump(1);
+        f.blocks[3].term = Term::Ret(vec![s]);
+        for b in &mut f.blocks {
+            b.pos = vec![0; b.insts.len()];
+        }
+        (f, i, c)
+    }
+    const U64T: IntTy = IntTy { bits: 64, signed: false };
+
+    #[test]
+    fn rotation_keeps_a_header_value_the_body_reads() {
+        let (mut f, i, c) = counted_loop();
+        rotate_loops(&mut f);
+        f.verify().unwrap();
+        // the latch runs the test itself: i keeps its vreg (the body reads it), c gets a fresh one
+        let l = &f.blocks[2];
+        assert!(matches!(l.term, Term::Branch(c2, 2, 3) if c2 != c));
+        assert!(matches!(l.insts[2], Inst::Mov(d, _) if d == i));
+        assert!(matches!(l.insts[3], Inst::ICmp(Cond::Lt, false, _, a, _) if a == i));
+        // the header is unchanged (the entry still runs it)
+        assert!(matches!(f.blocks[1].term, Term::Branch(c1, 2, 3) if c1 == c));
+    }
+
+    /// `while n != 0 { n -= 1; if skip(n) { continue } work }`: the skip branch's false edge
+    /// goes to the header; it gets its own copy of the header's test.
+    #[test]
+    fn rotation_gives_a_branch_latch_its_own_test() {
+        let mut f = Func::new("rotb".into(), 0);
+        let n0 = f.vreg(Cls::I);
+        f.params.push(n0);
+        f.rets.push(Cls::I);
+        let (n, c, s, k) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..5 {
+            f.block();
+        }
+        f.blocks[0].insts = vec![Inst::Mov(n, n0), Inst::Iconst(k, 0)];
+        f.blocks[0].term = Term::Jump(1);
+        f.blocks[1].insts = vec![Inst::ICmpI(Cond::Ne, false, c, n, 0)];
+        f.blocks[1].term = Term::Branch(c, 2, 4);
+        f.blocks[2].insts = vec![Inst::IBinI(IOp::Sub, U64T, n, n, 1), Inst::ICmpI(Cond::Eq, false, s, n, 7)];
+        f.blocks[2].term = Term::Branch(s, 3, 1);
+        f.blocks[3].insts = vec![Inst::IBinI(IOp::Add, U64T, k, k, 1)];
+        f.blocks[3].term = Term::Jump(1);
+        f.blocks[4].term = Term::Ret(vec![k]);
+        for b in &mut f.blocks {
+            b.pos = vec![0; b.insts.len()];
+        }
+        rotate_loops(&mut f);
+        f.verify().unwrap();
+        // the skip block's false edge goes to a block of its own that tests n again
+        let li = f.blocks.iter().position(|b| matches!(b.insts.last(), Some(Inst::ICmpI(Cond::Eq, _, _, _, 7)))).unwrap();
+        let Term::Branch(_, _, t) = f.blocks[li].term else { panic!("latch branch") };
+        assert!(matches!(f.blocks[t as usize].insts[..], [Inst::ICmpI(Cond::Ne, false, _, x, 0)] if x == n));
+        assert_eq!(f.blocks.iter().filter(|b| b.term.succs().any(|x| x == t)).count(), 1);
+        assert!(matches!(f.blocks[t as usize].term, Term::Branch(..)));
+    }
 }
