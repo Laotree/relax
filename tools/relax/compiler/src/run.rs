@@ -614,6 +614,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // builds it again from its disk cache)
     let pm0 = crate::memstat::live_of(crate::memstat::Tag::PmHost);
     let freed = crate::pmhost::free_world();
+    crate::native_macros::report(sess.runtime.profile);
     if crate::preload::trace() && crate::memstat::enabled() {
         eprintln!("boot-trace: pmhost heap {} KB before the free, {} KB after", pm0 >> 10, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 10);
     }

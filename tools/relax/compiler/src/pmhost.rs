@@ -64,7 +64,7 @@ impl crate::macro_reg::MacroRunner for JitRunner {
     }
     fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
         sess.runtime.validate_native_macros()?;
-        crate::native_macros::prepare()?;
+        crate::native_macros::verdict()?;
         prewarm(sess)
     }
     fn call(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry, input: &TokenStream, call_span: Span) -> Result<TokenStream, String> {

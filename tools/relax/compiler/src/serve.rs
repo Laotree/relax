@@ -36,6 +36,7 @@ impl Session {
         paths.extend(self.unit.prog.module_probes.iter().filter(|(p, _)| p.ends_with(".rs")).map(|(p, _)| p.clone()));
         paths.extend(self.failed_probes.iter().map(|(p, _)| p.clone()));
         if let Some(plan) = &self.unit.prog.demand_plan { paths.extend(plan.indexed_paths()); }
+        paths.extend(crate::native_macros::paths());
         paths.sort(); paths.dedup(); paths
     }
     pub fn file(&self, path: &str) -> Option<u32> {
@@ -136,6 +137,10 @@ impl Session {
     }
 
     pub fn check(&mut self) {
+        if let Err(error) = crate::native_macros::verdict() {
+            self.parse_errors.insert("native-macros".into(), Diagnostic::new("macro", "", 0, 0, error));
+            return;
+        }
         let sess = &self.unit.prog.session.clone();
         let options = &sess.options;
         let start = Instant::now();
@@ -252,6 +257,14 @@ impl Session {
     }
 
     fn apply_texts_inner(&mut self, edits: Vec<(String, std::io::Result<Vec<u8>>)>, check_bodies: bool) {
+        let changes: Vec<_> = edits.iter().map(|(p, text)| (p.as_str(), text.as_ref().ok().map(|s| s.as_slice()))).collect();
+        if let Err(error) = crate::native_macros::reload(&changes, self.unit.prog.session.runtime.profile) {
+            self.parse_errors.insert("native-macros".into(), Diagnostic::new("macro", "", 0, 0, error));
+            return;
+        }
+        self.parse_errors.remove("native-macros");
+        let edits: Vec<_> = edits.into_iter().filter(|(p, _)| !crate::native_macros::owns_path(p)).collect();
+        if edits.is_empty() { return; }
         // A skipped/appearing file has no old DefId to invalidate. Recompute the
         // demand closure and publish a canonical program before any query runs.
         if !self.unit.prog.load_recipe.is_empty() && (self.lazy

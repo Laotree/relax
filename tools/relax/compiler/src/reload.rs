@@ -1908,6 +1908,14 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
     let _p = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let _reloading = jit::Reloading::begin();
     let t0 = Instant::now();
+    let changes: Vec<_> = edits.iter().map(|e| (e.path.as_str(), Some(e.src.as_slice()))).collect();
+    if let Err(error) = crate::native_macros::reload(&changes, (&(*up).prog.session).runtime.profile) {
+        let mut out = idle_outcome(None, &error);
+        out.rung = Rung::Refuse;
+        return out;
+    }
+    let edits: Vec<_> = edits.into_iter().filter(|e| !crate::native_macros::owns_path(&e.path)).collect();
+    if edits.is_empty() { return idle_outcome(None, "native macro sources match the running compiler"); }
     let depth = jit::lock_depth();
     assert_eq!(depth, 0, "reload caller holds the unit lock");
     // an internal compiler panic in the transaction refuses the edit with its message (the app
@@ -3605,6 +3613,10 @@ unsafe fn apply_stream_target(up: *mut Unit, target: StreamTarget, text: Vec<u8>
 /// the next feed or the live watcher drains the newest pending prefix.
 pub unsafe fn apply_stream(up: *mut Unit, path: &str, text: Vec<u8>) -> Outcome {
     let path = std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
+    if let Err(error) = crate::native_macros::reload(&[(&path, Some(&text))], (&(*up).prog.session).runtime.profile) {
+        let mut out = idle_outcome(None, &error); out.rung = Rung::Refuse; return out;
+    }
+    if crate::native_macros::owns_path(&path) { return idle_outcome(None, "native macro sources match the running compiler"); }
     apply_stream_target(up, StreamTarget::Path(path), text)
 }
 
@@ -3724,6 +3736,11 @@ unsafe fn watch(up: *mut Unit) {
         jit::unlock_unit();
         v
     };
+    // Proc-macro source crates are stripped from the app graph. Their inputs and
+    // directories still participate in the existing watcher's changed-path batch.
+    for path in crate::native_macros::paths() {
+        if !files.iter().any(|f| f.0 == path) { files.push((path, u32::MAX, None)); }
+    }
     // the post-boot loader adds files after boot; each is watched from its load (an
     // edit made before it is simply what the load read)
     let mut loads_seen = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
@@ -3867,6 +3884,13 @@ unsafe fn watch(up: *mut Unit) {
                 break;
             }
         }
+        let macro_changes: Vec<_> = changed.iter().map(|&k| (files[k].0.as_str(), None)).collect();
+        if let Err(error) = crate::native_macros::reload(&macro_changes, (&(*up).prog.session).runtime.profile) {
+            for &k in &changed { files[k].2 = stamp(&files[k].0); }
+            eprintln!("relax-live: {error}");
+            live_log(&error);
+            continue;
+        }
         let saved = changed.iter().filter_map(|&k| stamp(&files[k].0).map(|s| s.0)).max();
         let read_started = Instant::now();
         let watch_ms = saved.and_then(|s| s.elapsed().ok()).map_or_else(|| ms(seen), |d| d.as_secs_f64() * 1000.);
@@ -3876,6 +3900,7 @@ unsafe fn watch(up: *mut Unit) {
             stalled.remove(&k);
             let f = &mut files[k];
             f.2 = stamp(&f.0);
+            if f.1 == u32::MAX || crate::native_macros::owns_path(&f.0) { continue; }
             let src = match std::fs::read(&f.0) {
                 Ok(s) => s,
                 Err(_) => continue,
