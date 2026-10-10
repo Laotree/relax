@@ -22,6 +22,15 @@ pub trait Step: Clone + PartialOrd + Sized {
             None => crate::panicking::panic_str("overflow in `Step::backward`"),
         }
     }
+    /// `start + count` when the caller knows it stays in range (rustc: `Step::forward_unchecked`,
+    /// used by `Range::next` after `start < end`): no overflow test in every range loop's step
+    unsafe fn forward_unchecked(start: Self, count: usize) -> Self {
+        Step::forward(start, count)
+    }
+    /// `start - count` when the caller knows it stays in range (rustc: `Step::backward_unchecked`)
+    unsafe fn backward_unchecked(start: Self, count: usize) -> Self {
+        Step::backward(start, count)
+    }
 }
 
 impl Step for char {
@@ -63,7 +72,8 @@ impl<A: Step> Iterator for Range<A> {
     type Item = A;
     fn next(&mut self) -> Option<A> {
         if self.start < self.end {
-            let n = Step::forward(self.start.clone(), 1);
+            // SAFETY: start < end, so start + 1 <= end does not overflow (rustc's Range::next)
+            let n = unsafe { Step::forward_unchecked(self.start.clone(), 1) };
             Some(crate::mem::replace(&mut self.start, n))
         } else {
             None
@@ -109,7 +119,8 @@ impl<A: Step> Iterator for Range<A> {
 impl<A: Step> DoubleEndedIterator for Range<A> {
     fn next_back(&mut self) -> Option<A> {
         if self.start < self.end {
-            self.end = Step::backward(self.end.clone(), 1);
+            // SAFETY: start < end, so end - 1 >= start does not overflow
+            self.end = unsafe { Step::backward_unchecked(self.end.clone(), 1) };
             Some(self.end.clone())
         } else {
             None
@@ -156,7 +167,8 @@ impl<A: Step> Iterator for RangeInclusive<A> {
         }
         let is_iterating = self.start < self.end;
         Some(if is_iterating {
-            let n = Step::forward(self.start.clone(), 1);
+            // SAFETY: start < end
+            let n = unsafe { Step::forward_unchecked(self.start.clone(), 1) };
             crate::mem::replace(&mut self.start, n)
         } else {
             self.exhausted = true;
@@ -219,7 +231,8 @@ impl<A: Step> DoubleEndedIterator for RangeInclusive<A> {
         }
         let is_iterating = self.start < self.end;
         Some(if is_iterating {
-            let n = Step::backward(self.end.clone(), 1);
+            // SAFETY: start < end
+            let n = unsafe { Step::backward_unchecked(self.end.clone(), 1) };
             crate::mem::replace(&mut self.end, n)
         } else {
             self.exhausted = true;

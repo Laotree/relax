@@ -91,6 +91,8 @@ impl Step for u8 {
     fn steps_between(start: &u8, end: &u8) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u8).wrapping_sub(*start as u8) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: u8, n: usize) -> Option<u8> { if n > u8::MAX as usize { return None; } start.checked_add(n as u8) }
     fn backward_checked(start: u8, n: usize) -> Option<u8> { if n > u8::MAX as usize { return None; } start.checked_sub(n as u8) }
+    unsafe fn forward_unchecked(start: u8, n: usize) -> u8 { start.wrapping_add(n as u8) }
+    unsafe fn backward_unchecked(start: u8, n: usize) -> u8 { start.wrapping_sub(n as u8) }
 }
 
 // ---- u16
@@ -176,6 +178,8 @@ impl Step for u16 {
     fn steps_between(start: &u16, end: &u16) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u16).wrapping_sub(*start as u16) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: u16, n: usize) -> Option<u16> { if n > u16::MAX as usize { return None; } start.checked_add(n as u16) }
     fn backward_checked(start: u16, n: usize) -> Option<u16> { if n > u16::MAX as usize { return None; } start.checked_sub(n as u16) }
+    unsafe fn forward_unchecked(start: u16, n: usize) -> u16 { start.wrapping_add(n as u16) }
+    unsafe fn backward_unchecked(start: u16, n: usize) -> u16 { start.wrapping_sub(n as u16) }
 }
 
 // ---- u32
@@ -257,6 +261,8 @@ impl Step for u32 {
     fn steps_between(start: &u32, end: &u32) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u32).wrapping_sub(*start as u32) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: u32, n: usize) -> Option<u32> { if n > u32::MAX as usize { return None; } start.checked_add(n as u32) }
     fn backward_checked(start: u32, n: usize) -> Option<u32> { if n > u32::MAX as usize { return None; } start.checked_sub(n as u32) }
+    unsafe fn forward_unchecked(start: u32, n: usize) -> u32 { start.wrapping_add(n as u32) }
+    unsafe fn backward_unchecked(start: u32, n: usize) -> u32 { start.wrapping_sub(n as u32) }
 }
 
 // ---- u64
@@ -342,6 +348,8 @@ impl Step for u64 {
     fn steps_between(start: &u64, end: &u64) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u64).wrapping_sub(*start as u64) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: u64, n: usize) -> Option<u64> { if false { return None; } start.checked_add(n as u64) }
     fn backward_checked(start: u64, n: usize) -> Option<u64> { if false { return None; } start.checked_sub(n as u64) }
+    unsafe fn forward_unchecked(start: u64, n: usize) -> u64 { start.wrapping_add(n as u64) }
+    unsafe fn backward_unchecked(start: u64, n: usize) -> u64 { start.wrapping_sub(n as u64) }
 }
 
 // ---- u128
@@ -427,6 +435,8 @@ impl Step for u128 {
     fn steps_between(start: &u128, end: &u128) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u128).wrapping_sub(*start as u128); if s <= usize::MAX as u128 { (s as usize, Some(s as usize)) } else { (usize::MAX, None) } } else { (0, None) } }
     fn forward_checked(start: u128, n: usize) -> Option<u128> { if false { return None; } start.checked_add(n as u128) }
     fn backward_checked(start: u128, n: usize) -> Option<u128> { if false { return None; } start.checked_sub(n as u128) }
+    unsafe fn forward_unchecked(start: u128, n: usize) -> u128 { start.wrapping_add(n as u128) }
+    unsafe fn backward_unchecked(start: u128, n: usize) -> u128 { start.wrapping_sub(n as u128) }
 }
 
 // ---- usize
@@ -508,6 +518,8 @@ impl Step for usize {
     fn steps_between(start: &usize, end: &usize) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as usize).wrapping_sub(*start as usize) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: usize, n: usize) -> Option<usize> { if false { return None; } start.checked_add(n as usize) }
     fn backward_checked(start: usize, n: usize) -> Option<usize> { if false { return None; } start.checked_sub(n as usize) }
+    unsafe fn forward_unchecked(start: usize, n: usize) -> usize { start.wrapping_add(n as usize) }
+    unsafe fn backward_unchecked(start: usize, n: usize) -> usize { start.wrapping_sub(n as usize) }
 }
 
 // ---- i8
@@ -595,6 +607,8 @@ impl Step for i8 {
     fn steps_between(start: &i8, end: &i8) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u8).wrapping_sub(*start as u8) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: i8, n: usize) -> Option<i8> { if n > u8::MAX as usize { return None; } let w = start.wrapping_add(n as u8 as i8); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: i8, n: usize) -> Option<i8> { if n > u8::MAX as usize { return None; } let w = start.wrapping_sub(n as u8 as i8); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: i8, n: usize) -> i8 { start.wrapping_add(n as i8) }
+    unsafe fn backward_unchecked(start: i8, n: usize) -> i8 { start.wrapping_sub(n as i8) }
 }
 
 // ---- i16
@@ -682,6 +696,8 @@ impl Step for i16 {
     fn steps_between(start: &i16, end: &i16) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u16).wrapping_sub(*start as u16) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: i16, n: usize) -> Option<i16> { if n > u16::MAX as usize { return None; } let w = start.wrapping_add(n as u16 as i16); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: i16, n: usize) -> Option<i16> { if n > u16::MAX as usize { return None; } let w = start.wrapping_sub(n as u16 as i16); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: i16, n: usize) -> i16 { start.wrapping_add(n as i16) }
+    unsafe fn backward_unchecked(start: i16, n: usize) -> i16 { start.wrapping_sub(n as i16) }
 }
 
 // ---- i32
@@ -765,6 +781,8 @@ impl Step for i32 {
     fn steps_between(start: &i32, end: &i32) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u32).wrapping_sub(*start as u32) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: i32, n: usize) -> Option<i32> { if n > u32::MAX as usize { return None; } let w = start.wrapping_add(n as u32 as i32); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: i32, n: usize) -> Option<i32> { if n > u32::MAX as usize { return None; } let w = start.wrapping_sub(n as u32 as i32); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: i32, n: usize) -> i32 { start.wrapping_add(n as i32) }
+    unsafe fn backward_unchecked(start: i32, n: usize) -> i32 { start.wrapping_sub(n as i32) }
 }
 
 // ---- i64
@@ -852,6 +870,8 @@ impl Step for i64 {
     fn steps_between(start: &i64, end: &i64) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u64).wrapping_sub(*start as u64) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: i64, n: usize) -> Option<i64> { if false { return None; } let w = start.wrapping_add(n as u64 as i64); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: i64, n: usize) -> Option<i64> { if false { return None; } let w = start.wrapping_sub(n as u64 as i64); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: i64, n: usize) -> i64 { start.wrapping_add(n as i64) }
+    unsafe fn backward_unchecked(start: i64, n: usize) -> i64 { start.wrapping_sub(n as i64) }
 }
 
 // ---- i128
@@ -939,6 +959,8 @@ impl Step for i128 {
     fn steps_between(start: &i128, end: &i128) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as u128).wrapping_sub(*start as u128); if s <= usize::MAX as u128 { (s as usize, Some(s as usize)) } else { (usize::MAX, None) } } else { (0, None) } }
     fn forward_checked(start: i128, n: usize) -> Option<i128> { if false { return None; } let w = start.wrapping_add(n as u128 as i128); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: i128, n: usize) -> Option<i128> { if false { return None; } let w = start.wrapping_sub(n as u128 as i128); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: i128, n: usize) -> i128 { start.wrapping_add(n as i128) }
+    unsafe fn backward_unchecked(start: i128, n: usize) -> i128 { start.wrapping_sub(n as i128) }
 }
 
 // ---- isize
@@ -1026,6 +1048,8 @@ impl Step for isize {
     fn steps_between(start: &isize, end: &isize) -> (usize, Option<usize>) { if *start <= *end { let s = (*end as usize).wrapping_sub(*start as usize) as usize; (s, Some(s)) } else { (0, None) } }
     fn forward_checked(start: isize, n: usize) -> Option<isize> { if false { return None; } let w = start.wrapping_add(n as usize as isize); if w >= start { Some(w) } else { None } }
     fn backward_checked(start: isize, n: usize) -> Option<isize> { if false { return None; } let w = start.wrapping_sub(n as usize as isize); if w <= start { Some(w) } else { None } }
+    unsafe fn forward_unchecked(start: isize, n: usize) -> isize { start.wrapping_add(n as isize) }
+    unsafe fn backward_unchecked(start: isize, n: usize) -> isize { start.wrapping_sub(n as isize) }
 }
 
 // ---- f32

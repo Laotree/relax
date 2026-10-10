@@ -638,6 +638,9 @@ fn gen_step(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    fn forward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_add(n as {n}) }}");
         let _ = writeln!(o, "    fn backward_checked(start: {n}, n: usize) -> Option<{n}> {{ if {fits} {{ return None; }} start.checked_sub(n as {n}) }}");
     }
+    // the caller knows the step stays in range (rustc's Step::forward_unchecked): no test
+    let _ = writeln!(o, "    unsafe fn forward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_add(n as {n}) }}");
+    let _ = writeln!(o, "    unsafe fn backward_unchecked(start: {n}, n: usize) -> {n} {{ start.wrapping_sub(n as {n}) }}");
     o.push_str("}\n");
 }
 
