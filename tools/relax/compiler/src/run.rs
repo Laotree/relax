@@ -368,7 +368,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         .zip(g.pkg.iter())
         .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
         .collect();
-    crate::provided::check_sources(&pkgs, !options.verbose);
+    // Shim generation inspects source without executing it, including while bootstrapping.
+    if !check || host_gen.is_none() {
+        if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
+            eprintln!("relax-run: {}", e);
+            return 1;
+        }
+    }
     phase("provided sources", ts);
     if let Err(e) = crate::crates::apply_substitutes(sess, &mut g.crates, &std_dir) {
         eprintln!("relax-run: crate substitution: {}", e);

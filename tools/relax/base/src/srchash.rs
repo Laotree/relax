@@ -103,6 +103,13 @@ pub fn closure_hash(pkgs: &[SrcPkg], root: usize) -> u64 {
             continue;
         }
         let host = host || pkgs[i].proc_macro;
+        // Cargo metadata unifies the loader's target-side `relax-tokens` adapter into
+        // micro-proc-macro's dependencies. Resolver 2 does not enable that adapter in
+        // rustc's proc-macro build: it uses proc_macro tokens, never relax-lex. The
+        // loader's own provenance still hashes relax-lex on its target-side path.
+        if host && pkgs[i].name == "relax-lex" {
+            continue;
+        }
         if std::mem::replace(&mut seen[i][host as usize], true) {
             continue;
         }

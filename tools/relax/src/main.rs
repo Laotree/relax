@@ -241,6 +241,13 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
 fn src(name: &str) -> u64 {
     let v = match name {
         "relax_provided_fixture" => env!("RELAX_SRC_relax_provided_fixture"),
+        "makepad_live_id" => env!("RELAX_SRC_makepad_live_id"),
+        "makepad_script" => env!("RELAX_SRC_makepad_script"),
+        "makepad_script_std" => env!("RELAX_SRC_makepad_script_std"),
+        "makepad_script_compute" => env!("RELAX_SRC_makepad_script_compute"),
+        "makepad_script_census" => env!("RELAX_SRC_makepad_script_census"),
+        "makepad_tween_script" => env!("RELAX_SRC_makepad_tween_script"),
+        "makepad_script_audio_aot" => env!("RELAX_SRC_makepad_script_audio_aot"),
         _ => panic!("unknown provided crate: {name}"),
     };
     u64::from_str_radix(v, 16).unwrap()
@@ -252,7 +259,35 @@ fn src(name: &str) -> u64 {
 fn provided() {
     use relax_provided_fixture::__host_shims as fx;
     relax_compiler::provided::register("relax-provided-fixture", fx::SHIMS, fx::TYPES, fx::LAYOUTS, fx::__host_last_panic, src("relax_provided_fixture"));
-    // The interner remains provided; shader code compiles from source with the app.
+    {
+        use makepad_live_id::__host_shims as sh;
+        relax_compiler::provided::register("makepad-live-id", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_live_id"));
+    }
+    {
+        use makepad_script::__host_shims as sh;
+        relax_compiler::provided::register("makepad-script", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script"));
+    }
+    {
+        use makepad_script_std::__host_shims as sh;
+        relax_compiler::provided::register("makepad-script-std", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_std"));
+    }
+    {
+        use makepad_script_compute::__host_shims as sh;
+        relax_compiler::provided::register("makepad-script-compute", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_compute"));
+    }
+    {
+        use makepad_script_census::__host_shims as sh;
+        relax_compiler::provided::register("makepad-script-census", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_census"));
+    }
+    {
+        use makepad_tween_script::__host_shims as sh;
+        relax_compiler::provided::register("makepad-tween-script", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_tween_script"));
+    }
+    {
+        use makepad_script_audio_aot::__host_shims as sh;
+        relax_compiler::provided::register("makepad-script-audio-aot", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_audio_aot"));
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("host-gen") {
         if args.len() != 5 {
@@ -260,7 +295,9 @@ fn provided() {
             std::process::exit(2);
         }
         let a = ["--check".to_string(), "--host-gen".to_string(), args[3].clone(), args[4].clone(), args[2].clone()];
-        let sess = relax_compiler::session_from_env(&args);
+        let mut sess = relax_compiler::session_from_env(&args);
+        // A shim table describes the whole crate, including modules no program calls yet.
+        std::sync::Arc::get_mut(&mut sess).expect("new host-gen session").options.source_eager = true;
         std::process::exit(relax_compiler::run::cmd_run(&sess, &a));
     }
 }

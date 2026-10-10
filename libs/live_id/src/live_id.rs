@@ -267,6 +267,7 @@ impl LiveId {
 }
 
 #[derive(Clone, Copy)]
+#[repr(u8)]
 pub enum InternLiveId {
     Yes,
     No,

@@ -12,7 +12,7 @@ mod build_stamp;
 use build_stamp::vfs;
 
 /// The crates this binary provides (src/main.rs registers them).
-const PROVIDED: &[&str] = &["relax-provided-fixture"];
+const PROVIDED: &[&str] = &["relax-provided-fixture", "makepad-live-id", "makepad-script", "makepad-script-std", "makepad-script-compute", "makepad-script-census", "makepad-tween-script", "makepad-script-audio-aot"];
 
 fn main() {
     // Windows: Relax runs the program's main on the process's main thread; give it the 8 MiB

@@ -73,9 +73,9 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Compares each registered crate's source identity in the program's crate graph (`pkgs`:
 /// the unit graph's packages, srchash.rs) with the loader's. A crate that differs (a dev edit,
-/// another checkout or release, a patched dependency) or is absent is compiled by Relax from
-/// source like any crate: said once on stderr, not an error.
-pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) {
+/// another checkout or release, a patched dependency) is an error for the Splash VM; other
+/// provided crates retain source fallback. Crates absent from the program need no binding.
+pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) -> Result<(), String> {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     matched.clear();
@@ -84,10 +84,14 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) {
         let here = crate::srchash::closure_hash(pkgs, root);
         if here == p.source {
             matched.push(p.name.clone());
+        } else if matches!(p.name.as_str(), "makepad_live_id" | "makepad_script" | "makepad_script_std" | "makepad_script_compute" | "makepad_script_census" | "makepad_tween_script" | "makepad_script_audio_aot") {
+            matched.clear();
+            return Err(format!("the Splash VM in this tree differs from the one built into relax: rebuild relax (cargo build --release -p relax) [{}: source {:016x}, loader {:016x}]", p.name, here, p.source));
         } else if !quiet {
             eprintln!("relax-run: {}: source differs from the loader's build ({:016x}, loader {:016x}): compiled from source", p.name, here, p.source);
         }
     }
+    Ok(())
 }
 
 /// The registered crates as (crate index in `prog`, entry) whose source matched (check_sources);
@@ -337,6 +341,13 @@ pub fn unbound_reason(prog: &Program, tcx: &Tcx, krate: u32, d: DefId, opaque: &
     if parent.kind == DefKind::Trait {
         return Some("trait default body");
     }
+    // Eq's derived assertion is a rustc-internal type-check helper, not a callable API.
+    if parent.kind == DefKind::Impl
+        && prog.syms.str(def.name) == "assert_fields_are_eq"
+        && tcx.impl_trait.get(&def.parent).is_some_and(|t| prog.def_path(*t) == "core::cmp::Eq")
+    {
+        return Some("Eq assertion (compiler internal)");
+    }
     // `Drop::drop` runs inside the type's drop shim (rustc refuses an explicit call, E0040)
     if parent.kind == DefKind::Impl && tcx.impl_trait.get(&def.parent).is_some_and(|t| tcx.lang_items.get(LangItem::Drop) == Some(*t)) {
         return Some("Drop::drop (in the drop shim)");
@@ -363,11 +374,53 @@ pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool
     !trusted(prog, tcx, krate, t, 0)
 }
 
+/// Whether the root shim module can name this item (including restricted visibility).
+fn root_visible(prog: &Program, d: DefId) -> bool {
+    let def = prog.def(d);
+    if def.parent == NO_DEF { return true; }
+    let item = prog.files[def.file as usize].ast.item(def.item);
+    prog.vis_module(def.file, def.scope, &item.vis)
+        .is_none_or(|m| m == prog.crates[def.krate as usize].root_mod)
+}
+
+/// Preserve conditions on enclosing modules/items in the generated declarations and tables.
+/// In particular, an ARM host's compute shims must still compile on x86.
+fn item_cfg(prog: &Program, d: DefId) -> String {
+    let mut attrs = std::collections::BTreeSet::new();
+    let mut cur = d;
+    while cur != NO_DEF {
+        let def = prog.def(cur);
+        if def.parent == NO_DEF { break; }
+        let f = &prog.files[def.file as usize];
+        for a in f.ast.list(f.ast.item(def.item).attrs) {
+            if a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "cfg" {
+                let text = (a.toks.lo..a.toks.hi).map(|i| f.tok_text(i)).collect::<Vec<_>>().join(" ");
+                attrs.insert(format!("#[{text}]\n"));
+            }
+        }
+        cur = def.parent;
+    }
+    attrs.into_iter().collect()
+}
+
+fn type_cfg(prog: &Program, tcx: &Tcx, t: TyId) -> String {
+    match tcx.tys.kind(t) {
+        TyKind::Adt(d, args, _) => {
+            let mut out = item_cfg(prog, *d);
+            for a in args { out.push_str(&type_cfg(prog, tcx, *a)); }
+            out
+        }
+        TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => type_cfg(prog, tcx, *t),
+        TyKind::Tuple(ts) => ts.iter().map(|t| type_cfg(prog, tcx, *t)).collect(),
+        _ => String::new(),
+    }
+}
+
 /// Shim Rust path for fn `d` of crate `krate` (from inside the crate: `crate::...`), or None
 /// when rustc cannot name it from the crate root (a private fn or module path).
 fn rust_path(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> Option<String> {
     let def = prog.def(d);
-    if !def.is_pub {
+    if !def.is_pub || !root_visible(prog, d) {
         // impl methods of trait impls are callable through the trait
         let p = prog.def(def.parent);
         if !(p.kind == DefKind::Impl && tcx.impl_trait.contains_key(&def.parent)) {
@@ -444,6 +497,7 @@ fn item_path(prog: &Program, krate: u32, d: DefId) -> Option<String> {
             parts.push(if def.krate == krate { "crate".to_string() } else { format!("::{}", prog.syms.str(prog.crates[def.krate as usize].name)) });
             break;
         }
+        if def.krate == krate && !root_visible(prog, cur) { return None; }
         parts.push(prog.syms.str(def.name).to_string());
         cur = def.parent;
     }
@@ -479,11 +533,11 @@ fn rust_ty(prog: &Program, tcx: &Tcx, krate: u32, t: TyId) -> Option<String> {
 /// `makepad host-gen`: the shim file of provided crate `krate` (included by the crate under
 /// `#[cfg(feature = "host-shims")]`, see the crate's lib.rs). Returns (file text, report).
 pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
-    let mut fns: Vec<(String, u64, String, usize, bool)> = Vec::new();
+    let mut fns: Vec<(String, u64, String, usize, bool, String)> = Vec::new();
     let mut why: HashMap<&'static str, usize> = HashMap::new();
     let mut unshaped: Vec<String> = Vec::new();
     let mut blockers: HashMap<String, usize> = HashMap::new();
-    let mut dep_lays: Vec<(String, String)> = Vec::new();
+    let mut dep_lays: Vec<(String, String, String)> = Vec::new();
     // the fns that get a shim: only they cross (a private fn with a C-shaped signature does not)
     let mut bound: std::collections::HashSet<DefId> = Default::default();
     for (i, def) in prog.defs.iter().enumerate() {
@@ -528,14 +582,18 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
                 layout_deps(prog, tcx, krate, *t, &mut deps);
             }
         }
-        let named: Option<Vec<(String, String)>> = deps.iter().map(|t| rust_ty(prog, tcx, krate, *t).map(|r| (crate::typeck::ty_to_string(false, prog, tcx, *t), r))).collect();
+        let named: Option<Vec<(String, String, String)>> = deps.iter().map(|t| rust_ty(prog, tcx, krate, *t).map(|r| (crate::typeck::ty_to_string(false, prog, tcx, *t), r, type_cfg(prog, tcx, *t)))).collect();
         let Some(named) = named else {
             *why.entry("a type in the signature is not nameable for its layout check").or_default() += 1;
             continue;
         };
         dep_lays.extend(named);
         bound.insert(d);
-        fns.push((key(prog, tcx, d), sig_hash(prog, tcx, d), path, n, never));
+        let mut cfg = item_cfg(prog, d);
+        if let Some(sg) = tcx.fn_sig(prog, d) {
+            for t in sg.params.iter().chain(std::iter::once(&sg.ret)) { cfg.push_str(&type_cfg(prog, tcx, *t)); }
+        }
+        fns.push((key(prog, tcx, d), sig_hash(prog, tcx, d), path, n, never, cfg));
     }
     fns.sort();
     fns.dedup_by(|a, b| a.0 == b.0);
@@ -550,7 +608,8 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     out.push_str("    LAST_PANIC.with(|l| *l.borrow_mut() = msg);\n    1\n}\n\n");
     out.push_str("pub unsafe extern \"C\" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize) {\n");
     out.push_str("    LAST_PANIC.with(|l| { let l = l.borrow(); *ptr = l.as_ptr(); *len = l.len(); });\n}\n\n");
-    for (i, (_, _, path, n, never)) in fns.iter().enumerate() {
+    for (i, (_, _, path, n, never, cfg)) in fns.iter().enumerate() {
+        out.push_str(cfg);
         out.push_str(&format!("unsafe extern \"C\" fn s{}(a: *const *mut u8, r: *mut u8) -> u32 {{\n", i));
         let args: Vec<String> = (0..*n).map(|k| format!("std::ptr::read(*a.add({}) as *const _)", k)).collect();
         if *never {
@@ -571,10 +630,12 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     // opaque types: rustc's size/align and drop
     // opaque only what crosses (a type no bound fn reaches is Relax's alone)
     let crossing = crossing_types(prog, tcx, &[krate], &|d| bound.contains(&d));
+    // Regions do not affect the opaque layout: signatures can carry non-empty lifetime
+    // arguments even when a type has no type parameters (ScriptModuleRead, for example).
     let mut tys: Vec<(String, String, DefId)> = Vec::new();
     for (i, def) in prog.defs.iter().enumerate() {
         let d = DefId(i as u32);
-        if def.krate == krate && opaque_candidate(prog, tcx, krate, d) && crossing.contains(&tcx.tys.intern(TyKind::Adt(d, Vec::new(), crate::types::RegionArgsId::EMPTY))) {
+        if def.krate == krate && opaque_candidate(prog, tcx, krate, d) && crossing.iter().any(|t| matches!(tcx.tys.kind(*t), TyKind::Adt(ad, args, _) if *ad == d && args.is_empty())) {
             if let Some(p) = item_path(prog, krate, d) {
                 tys.push((prog.def_path(d), p, d));
             }
@@ -583,15 +644,15 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     tys.sort_by(|a, b| a.0.cmp(&b.0));
     tys.dedup_by(|a, b| a.0 == b.0);
     // Clone / PartialEq impls on host-owned opaque types.
-    let mut opaque_trait_shims: Vec<(String, String)> = Vec::new();
+    let mut opaque_trait_shims: Vec<(String, String, String)> = Vec::new();
     for (_, p, d) in &tys {
         for (&imp, &td) in &tcx.impl_trait {
             if !tcx.impl_self.get(&imp).is_some_and(|t| matches!(tcx.tys.kind(*t), TyKind::Adt(ad, aa, _) if *ad == *d && aa.is_empty())) { continue; }
             if tcx.lang_items.get(LangItem::Clone) == Some(td) {
-                opaque_trait_shims.push((opaque_method_key(prog, *d, "clone"), format!("<{} as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _))", p)));
+                opaque_trait_shims.push((opaque_method_key(prog, *d, "clone"), format!("<{} as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _))", p), item_cfg(prog, *d)));
             } else if tcx.lang_items.get(LangItem::PartialEq) == Some(td)
                 && tcx.impl_trait_args.get(&imp).is_some_and(|args| args.as_slice() == [tcx.impl_self[&imp]]) {
-                opaque_trait_shims.push((opaque_method_key(prog, *d, "eq"), format!("<{} as ::core::cmp::PartialEq>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _))", p)));
+                opaque_trait_shims.push((opaque_method_key(prog, *d, "eq"), format!("<{} as ::core::cmp::PartialEq>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _))", p), item_cfg(prog, *d)));
             }
         }
     }
@@ -608,6 +669,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
                 opaque_trait_shims.push((
                     format!("<{} as Hash>::hash_into", prog.def_path(*d)),
                     format!("{{ let x: &{p} = std::ptr::read(*a.add(0) as *const &{p}); let st: *mut u8 = std::ptr::read(*a.add(1) as *const *mut u8); let w: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = std::ptr::read(*a.add(2) as *const _); ::core::hash::Hash::hash(x, &mut __RelaxHasher(st, w)) }}"),
+                    item_cfg(prog, *d),
                 ));
             }
             let debug = has(*d, "fmt::Debug");
@@ -621,6 +683,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
                 opaque_trait_shims.push((
                     format!("<{} as Fmt>::fmt_into", prog.def_path(*d)),
                     format!("{{ let x: &{p} = std::ptr::read(*a.add(0) as *const &{p}); let mode: u8 = std::ptr::read(*a.add(1) as *const u8); let out: *mut u8 = std::ptr::read(*a.add(2) as *const *mut u8); let push: unsafe extern \"C-unwind\" fn(*mut u8, *const u8, usize) = std::ptr::read(*a.add(3) as *const _); let s: String = match mode {{ {arms} }}; push(out, s.as_ptr(), s.len()) }}"),
+                    item_cfg(prog, *d),
                 ));
             }
         }
@@ -630,20 +693,23 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
         out.push_str("impl ::core::hash::Hasher for __RelaxHasher {\n    fn write(&mut self, b: &[u8]) { unsafe { (self.1)(self.0, b.as_ptr(), b.len()) } }\n    fn finish(&self) -> u64 { 0 }\n}\n\n");
     }
     opaque_trait_shims.sort();
-    for (i, (_, call)) in opaque_trait_shims.iter().enumerate() {
+    for (i, (_, call, cfg)) in opaque_trait_shims.iter().enumerate() {
+        out.push_str(cfg);
         out.push_str(&format!(
             "unsafe extern \"C\" fn v{}(a: *const *mut u8, r: *mut u8) -> u32 {{\n    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ {} }})) {{ Ok(v) => {{ std::ptr::write(r as *mut _, v); 0 }} Err(p) => caught(p) }}\n}}\n",
             i, call
         ));
     }
-    for (i, (_, p, _)) in tys.iter().enumerate() {
+    for (i, (_, p, d)) in tys.iter().enumerate() {
+        out.push_str(&item_cfg(prog, *d));
         out.push_str(&format!(
             "unsafe extern \"C\" fn d{}(p: *mut u8) {{ let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {{ std::ptr::drop_in_place(p as *mut {}) }})); }}\n",
             i, p
         ));
     }
     out.push_str("\npub static TYPES: &[(&str, u64, u64, Option<unsafe extern \"C\" fn(*mut u8)>)] = &[\n");
-    for (i, (k, p, _)) in tys.iter().enumerate() {
+    for (i, (k, p, d)) in tys.iter().enumerate() {
+        out.push_str(&item_cfg(prog, *d));
         out.push_str(&format!(
             "    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, if std::mem::needs_drop::<{p}>() {{ Some(d{i}) }} else {{ None }}),\n",
             k
@@ -652,7 +718,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
     out.push_str("];\n");
     // trusted types: rustc's size/align, checked by Relax at unit creation
     // (key, rust path, field names for offset_of! -- empty: size/align only)
-    let mut lays: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut lays: Vec<(String, String, Vec<String>, String)> = Vec::new();
     let mut unchecked_offsets = 0usize;
     for (i, def) in prog.defs.iter().enumerate() {
         let d = DefId(i as u32);
@@ -682,25 +748,28 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (String, String) {
                     unchecked_offsets += 1;
                 }
             }
-            lays.push((prog.def_path(d), p, names));
+            lays.push((prog.def_path(d), p, names, item_cfg(prog, d)));
         }
     }
     // the types bound signatures rely on (keyed by Relax's type name, checked at bind time)
-    lays.extend(dep_lays.into_iter().map(|(k, p)| (k, p, Vec::new())));
+    lays.extend(dep_lays.into_iter().map(|(k, p, cfg)| (k, p, Vec::new(), cfg)));
     lays.sort();
     lays.dedup_by(|a, b| a.0 == b.0);
     out.push_str("\npub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[\n");
-    for (k, p, names) in &lays {
+    for (k, p, names, cfg) in &lays {
+        out.push_str(cfg);
         let offs: Vec<String> = names.iter().map(|n| format!("std::mem::offset_of!({p}, {n}) as u64")).collect();
         out.push_str(&format!("    ({:?}, std::mem::size_of::<{p}>() as u64, std::mem::align_of::<{p}>() as u64, &[{}]),\n", k, offs.join(", ")));
     }
     out.push_str("];\n");
     let _ = unchecked_offsets;
     out.push_str("\npub static SHIMS: &[(&str, u64, unsafe extern \"C\" fn(*const *mut u8, *mut u8) -> u32)] = &[\n");
-    for (i, (k, h, _, _, _)) in fns.iter().enumerate() {
+    for (i, (k, h, _, _, _, cfg)) in fns.iter().enumerate() {
+        out.push_str(cfg);
         out.push_str(&format!("    ({:?}, 0x{:016x}, s{}),\n", k, h, i));
     }
-    for (i, (k, _)) in opaque_trait_shims.iter().enumerate() {
+    for (i, (k, _, cfg)) in opaque_trait_shims.iter().enumerate() {
+        out.push_str(cfg);
         out.push_str(&format!("    ({:?}, 0, v{}),\n", k, i));
     }
     out.push_str("];\n");

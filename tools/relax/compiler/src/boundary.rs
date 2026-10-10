@@ -34,6 +34,7 @@ struct Audit {
     rec: BTreeMap<(&'static str, String), Entry>,
     /// call key -> (param types, return type) as printed
     sigs: BTreeMap<String, (Vec<TyId>, TyId)>,
+    bindings: BTreeMap<String, (bool, String)>,
 }
 
 static AUDIT: Mutex<Option<Audit>> = Mutex::new(None);
@@ -68,7 +69,23 @@ fn provided(a: &Audit, u: &Unit, d: DefId) -> bool {
 
 /// Is a body of `def` with `args` compiled by Relax (not on the provided side)?
 fn relax_side(a: &Audit, u: &Unit, def: DefId, args: &[TyId]) -> bool {
-    !(provided(a, u, def) && args.is_empty())
+    !(provided(a, u, def) && binding(u, def, args).0)
+}
+
+/// The same signature and table requirements used by Unit's bridge binding.
+fn binding(u: &Unit, d: DefId, args: &[TyId]) -> (bool, String) {
+    if !args.is_empty() { return (false, "generic".into()); }
+    let k = u.prog.def(d).krate;
+    let Some((_, pc)) = u.provided.iter().find(|(pk, _)| *pk == k) else {
+        return (false, "crate not registered/matched".into());
+    };
+    if let Some(reason) = crate::provided::unbound_reason(&u.prog, &u.tcx, k, d, &|a| u.provided_types.contains_key(&a)) {
+        return (false, reason.into());
+    }
+    if !pc.shims.contains_key(crate::provided::key(&u.prog, &u.tcx, d).as_str()) {
+        return (false, "no generated shim".into());
+    }
+    (true, String::new())
 }
 
 fn caller_name(u: &Unit, def: DefId) -> String {
@@ -87,6 +104,7 @@ pub fn note_call(u: &Unit, def: DefId, args: &[TyId], callee: u32) {
     if !provided(a, u, cd) || !relax_side(a, u, def, args) {
         return;
     }
+    a.bindings.insert(crate::provided::key(&u.prog, &u.tcx, cd), binding(u, cd, &cargs));
     let generic = !cargs.is_empty();
     let name = u.prog.def_path(cd);
     let kind = if generic { "generic" } else { "call" };
@@ -283,6 +301,11 @@ pub fn run(up: *mut Unit) -> String {
     fails.sort();
     for f in &fails {
         let _ = writeln!(out, "{}", f);
+    }
+    let bound = a.bindings.values().filter(|(b, _)| *b).count();
+    let _ = writeln!(out, "# bindings: {} rustc, {} from source, {} total distinct called functions", bound, a.bindings.len() - bound, a.bindings.len());
+    for (key, (bound, reason)) in &a.bindings {
+        let _ = writeln!(out, "binding\t{}\t{}\t{}", if *bound { "rustc" } else { "source" }, key, reason);
     }
     let mut shapes: BTreeMap<String, (u32, u32)> = BTreeMap::new();
     for ((kind, name), e) in &a.rec {

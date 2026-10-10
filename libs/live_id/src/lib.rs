@@ -4,3 +4,7 @@ pub use makepad_live_id_macros::*;
 
 pub mod live_id;
 pub use live_id::*;
+
+#[cfg(feature = "host-shims")]
+#[path = "host_shims.rs"]
+pub mod __host_shims;
