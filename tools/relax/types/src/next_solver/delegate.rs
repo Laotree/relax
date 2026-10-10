@@ -11,17 +11,15 @@ impl Tcx {
         let regions = self.tys.region_args(regions);
         assert_eq!(compact.len(), indices.types_consts.len(), "generic type/const slots for {}", prog.def_path(def));
         assert_eq!(regions.len(), indices.lifetimes.len(), "generic lifetime slots for {}", prog.def_path(def));
-        let mut args = Vec::with_capacity(compact.len() + regions.len());
-        for index in 0..(compact.len() + regions.len()) as u32 {
-            if let Some(pos) = indices.lifetimes.iter().position(|&i| i == index) {
-                args.push(GenericArg::Lifetime(regions[pos]));
-            } else {
-                let pos = indices.types_consts.iter().position(|&i| i == index).expect("generic declaration index");
-                args.push(match self.tys.kind(compact[pos]) {
-                    TyKind::Const(ct) => GenericArg::Const(*ct),
-                    _ => GenericArg::Type(compact[pos]),
-                });
-            }
+        let mut args = vec![GenericArg::Lifetime(crate::types::RegionId::ERASED); compact.len() + regions.len()];
+        for (&full, &region) in indices.lifetimes.iter().zip(regions.iter()) {
+            args[full as usize] = GenericArg::Lifetime(region);
+        }
+        for (&full, &ty) in indices.types_consts.iter().zip(compact) {
+            args[full as usize] = match self.tys.kind(ty) {
+                TyKind::Const(ct) => GenericArg::Const(*ct),
+                _ => GenericArg::Type(ty),
+            };
         }
         args
     }
@@ -31,17 +29,33 @@ impl Tcx {
     pub fn instantiate_predicate(&self, prog: &Program, def: DefId, args: &[GenericArg], p: &Predicate) -> Predicate {
         fold::fold_predicate(&self.tys, p, &mut ArgFolder { indices: &self.generic_indices_of(prog, def), args })
     }
-    pub fn impl_trait_ref(&self, prog: &Program, imp: DefId, args: &[GenericArg]) -> TraitRef {
-        let def_id = self.impl_trait[&imp];
-        let mut compact = vec![self.impl_self[&imp]];
-        compact.extend_from_slice(self.impl_trait_args.get(&imp).map_or(&[], |a| a.as_slice()));
-        let regions = self.impl_trait_regions.get(&imp).copied().unwrap_or(RegionArgsId::EMPTY);
-        let identity = self.complete_args(prog, def_id, &compact, regions);
-        let mut f = ArgFolder { indices: &self.generic_indices_of(prog, imp), args };
-        let mut result = Vec::with_capacity(identity.len());
-        for arg in identity { result.push(fold::fold_arg(&self.tys, arg, &mut f, 0)); }
-        TraitRef { def_id, args: result }
+    pub(crate) fn identity_impl_trait_ref(&self, prog: &Program, imp: DefId) -> &TraitRef {
+        self.declaration_queries(prog, imp).impl_trait_ref.get_or_init(|| {
+            let def_id = self.impl_trait[&imp];
+            let mut compact = vec![self.impl_self[&imp]];
+            compact.extend_from_slice(self.impl_trait_args.get(&imp).map_or(&[], |a| a.as_slice()));
+            let regions = self.impl_trait_regions.get(&imp).copied().unwrap_or(RegionArgsId::EMPTY);
+            TraitRef { def_id, args: self.complete_args(prog, def_id, &compact, regions) }
+        })
     }
+    pub fn impl_trait_ref(&self, prog: &Program, imp: DefId, args: &[GenericArg]) -> TraitRef {
+        let identity = self.identity_impl_trait_ref(prog, imp);
+        let mut f = ArgFolder { indices: self.generic_indices_of(prog, imp), args };
+        let args = identity.args.iter().map(|arg| fold::fold_arg(&self.tys, *arg, &mut f, 0)).collect();
+        TraitRef { def_id: identity.def_id, args }
+    }
+
+    /// rustc_hir_analysis/src/collect/item_bounds.rs:526: elaborate in the impl's
+    /// identity binder once, then instantiate for each candidate.
+    pub fn impl_super_outlives(&self, prog: &Program, imp: DefId) -> &[Predicate] {
+        self.declaration_queries(prog, imp).impl_super_outlives.get_or_init(|| {
+            let identity = self.identity_impl_trait_ref(prog, imp);
+            self.supertraits(prog, collect::trait_predicate(identity.def_id, identity.args.clone()))
+                .into_iter().filter(|p| matches!(p.kind,
+                    PredicateKind::Clause(ClauseKind::RegionOutlives(..) | ClauseKind::TypeOutlives(..)))).collect()
+        })
+    }
+
 }
 
 impl Tcx {

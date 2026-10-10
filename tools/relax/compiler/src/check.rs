@@ -374,6 +374,11 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                         jit::unlock_to(depth);
                         let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                         panics.lock().unwrap().push((id, format!("internal compiler error: {}{}", msg, jit::take_ice_location())));
+                    } else if jit::lock_depth() > depth {
+                        // a build that returned holding the unit lock: every other worker would
+                        // wait for it forever (the check never ends); a Relax bug, reported
+                        jit::unlock_to(depth);
+                        panics.lock().unwrap().push((id, "internal compiler error: the build returned holding the unit lock".to_string()));
                     }
                     active.fetch_sub(1, Ordering::SeqCst);
                     let n = compiled.fetch_add(1, Ordering::Relaxed) + 1;

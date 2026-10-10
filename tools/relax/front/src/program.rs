@@ -382,6 +382,8 @@ pub struct CrateInfo {
     pub name: Sym,
     pub root_mod: u32,
     pub edition: u16,
+    /// Read once from the root attributes at load (and refreshed on root replacement).
+    pub recursion_limit: usize,
     /// (extern name, crate index)
     pub deps: Vec<(Sym, u32)>,
     pub cfg: CfgSet,
@@ -393,6 +395,17 @@ pub struct CrateInfo {
     /// the crate's root source file (for its manifest)
     root_path: String,
     pub context: std::sync::Arc<crate::source_context::Context>,
+}
+
+fn recursion_limit(file: &ParsedFile) -> usize {
+    crate::solver_work::count(crate::solver_work::RECURSION_SCANS);
+    for attr in &file.ast.root_attrs {
+        if attr.toks.hi == attr.toks.lo + 3 && file.tok_text(attr.toks.lo) == "recursion_limit"
+            && file.tok_text(attr.toks.lo + 1) == "=" {
+            if let Ok(limit) = file.tok_text(attr.toks.lo + 2).trim_matches('"').parse() { return limit; }
+        }
+    }
+    128
 }
 
 impl CrateInfo {
@@ -839,6 +852,10 @@ impl Program {
         self.defs[def.0 as usize].file = file;
     }
     pub fn set_mod_file(&mut self, module: u32, file: u32) {
+        let krate = self.mods[module as usize].krate as usize;
+        if self.crates[krate].root_mod == module {
+            self.crates[krate].recursion_limit = recursion_limit(&self.files[file as usize]);
+        }
         let old = self.mods[module as usize].file;
         if old == file { return; }
         let r = self.reload_files_mut();
@@ -1060,7 +1077,7 @@ impl Program {
         let root_mod = self.new_module(root_def, None, None, krate, 0);
         self.defs[root_def.0 as usize].sub = root_mod;
         self.defs[root_def.0 as usize].scope = root_mod;
-        self.crates.push(CrateInfo { name: cname, root_mod, edition, deps, cfg, proc_macro: false, relaxed: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
+        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, relaxed: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
         let akey = (kname.clone(), root.to_string());
         if !self.ahead.contains_key(&akey) {
@@ -2250,8 +2267,7 @@ impl Program {
             reload(&mut self.reload).impls.entry(im.file).or_default().push(id);
         }
         for id in reload(&mut self.reload).mods.remove(&from).unwrap_or_default() {
-            self.mods[id as usize].file = to;
-            reload(&mut self.reload).mods.entry(to).or_default().push(id);
+            self.set_mod_file(id, to);
         }
         for (&a, &b) in m.iter() {
             if let Some(&d) = self.item_defs.get(&(from, a)) {

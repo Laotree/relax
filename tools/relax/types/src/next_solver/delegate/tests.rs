@@ -152,7 +152,7 @@ fn round10_nested_rpitit_and_async_bounds_keep_captured_regions() {
         assert_eq!(opaque.captured_lifetimes.len(), 2);
         assert_eq!(generics.lifetimes.len(), 3);
         for bound in t.item_bounds(&p, assoc) {
-            if let PredicateKind::Clause(ClauseKind::Projection(proj)) = bound.kind {
+            if let PredicateKind::Clause(ClauseKind::Projection(proj)) = &bound.kind {
                 let AliasTerm::Ty(projection) = proj.projection_term else { panic!() };
                 let TyKind::Alias(_, a) = t.tys.kind(projection) else { panic!() };
                 let Term::Ty(value) = proj.term else { panic!() };

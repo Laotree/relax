@@ -27,15 +27,13 @@ impl Children {
 /// blindly before local impls. Specialization and marker overlap are cut, so
 /// every accepted local impl is a root sibling (round-34 lead decision).
 pub fn specialization_graph(tcx: &Tcx, prog: &Program, krate: u32, trait_def: DefId) -> bool {
-    specialization_graph_of(tcx, prog, krate, trait_def, &impls_of_trait(tcx, prog, trait_def))
+    specialization_graph_of(tcx, prog, krate, trait_def, impls_of_trait(tcx, prog, trait_def))
 }
 
 /// The impls of `trait_def` in program order (rustc_middle/src/ty/trait_def.rs trait_impls_of,
 /// which specialization_graph_provider walks as `all_impls`).
-pub fn impls_of_trait(tcx: &Tcx, prog: &Program, trait_def: DefId) -> Vec<DefId> {
-    let mut impls=Vec::new();
-    for im in &prog.impls { if tcx.impl_trait.get(&im.def)==Some(&trait_def) { impls.push(im.def); } }
-    impls
+pub fn impls_of_trait<'a>(tcx: &'a Tcx, _prog: &Program, trait_def: DefId) -> &'a [DefId] {
+    tcx.trait_impls_of.get(&trait_def).map_or(&[], |impls| impls.as_slice())
 }
 
 /// specialization_graph for `trait_def` given its impls in program order (impls_of_trait):
@@ -54,6 +52,8 @@ pub fn specialization_graph_of(tcx: &Tcx, prog: &Program, krate: u32, trait_def:
     let mut local_keys=Vec::new(); let mut has_local_blanket=false;
     let mut remote=Vec::new();
     for &imp in impls {
+        // Declaration invalidation can remove a head before its index is rebuilt.
+        if tcx.impl_trait.get(&imp) != Some(&trait_def) { continue; }
         let owner=prog.def(imp).krate;
         if owner==krate {
             if let Some(key)=simplify_type(&tcx.tys,tcx.impl_self[&imp]) {
@@ -68,6 +68,7 @@ pub fn specialization_graph_of(tcx: &Tcx, prog: &Program, krate: u32, trait_def:
     }
     let mut ok=true;
     for &imp in impls {
+        if tcx.impl_trait.get(&imp) != Some(&trait_def) { continue; }
         if prog.def(imp).krate!=krate { continue; }
         let im=&prog.impls[prog.def(imp).sub as usize];
         let key=simplify_type(&tcx.tys,tcx.impl_self[&im.def]);

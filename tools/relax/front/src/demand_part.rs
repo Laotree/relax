@@ -389,8 +389,16 @@ impl DemandImage {
         let Some((crates, final_names, mut parts)) = pending.take() else { return recording.ready.lock().unwrap().clone(); };
         let profile = crates.first().is_some_and(|c| c.cfg.session.runtime.profile);
         let _profile = crate::load_profile::span(profile, "rust-demand-record", "graph writer");
+        let t0 = std::time::Instant::now();
         let mut names = Names::new(&crates);
-        let mut identities = Vec::new();
+        // A crate's namespace is final once it is prepared: imports bind only in scopes of
+        // their own crate (Names::prepare_crate). So the namespaces are taken after the loop,
+        // in one pass over the tables, except where crates share a name (a package's library
+        // and binary): those are taken in place, as each one's projection at that point.
+        let mut shared = HashMap::<&str, usize>::default();
+        for c in &crates { *shared.entry(c.name.as_str()).or_default() += 1; }
+        let mut later = Vec::new();
+        let mut fresh = vec![false; parts.len()];
         for (ci, part) in parts.iter_mut().enumerate() {
             if part.namespace.is_empty() {
                 for (_, module, _, scan, ..) in &part.scans {
@@ -398,14 +406,26 @@ impl DemandImage {
                 }
                 names.recorded_indexes(&part.files);
                 names.prepare_crate(ci);
-                part.namespace = names.snapshot(ci);
+                if shared[crates[ci].name.as_str()] > 1 { part.namespace = names.snapshot(ci); } else { later.push(ci); }
+                fresh[ci] = true;
+            } else { names.restore(ci, &part.namespace).expect("planner namespace"); }
+        }
+        let t_loop = t0.elapsed();
+        for (ci, namespace) in later.iter().copied().zip(names.snapshots(&later)) { parts[ci].namespace = namespace; }
+        let t_snap = t0.elapsed();
+        let mut identities = Vec::new();
+        for (ci, part) in parts.iter_mut().enumerate() {
+            if fresh[ci] {
                 part.namespace_id = crate::crate_image::file_hash("", &part.namespace);
                 part.dependencies = names.reference_crates(ci).into_iter().filter(|&d| d < ci).map(|d| identities[d]).collect();
                 part.seal_identity();
-            } else { names.restore(ci, &part.namespace).expect("planner namespace"); }
+            }
             identities.push(part.surface_id);
-            part.finish_boundary();
         }
+        // the parts' boundaries are independent (string set unions: seconds for Stage)
+        let chunk = parts.len().div_ceil(crate::preload::jobs().max(1)).max(1);
+        std::thread::scope(|scope| { for chunk in parts.chunks_mut(chunk) { scope.spawn(move || for part in chunk { part.finish_boundary(); }); } });
+        let t_seal = t0.elapsed();
         if let Some(first) = parts.first_mut() {
             let value = final_names.closure_delta(&names);
             // Both namespaces end here (planner + rebuilt, ~1 GB on a cold Stage): not held
@@ -421,6 +441,11 @@ impl DemandImage {
                 first.key = 0;
             }
             first.closure_delta = Some(Arc::new(demand::ClosureDelta::Encoded(delta, legacy)));
+        }
+        if crate::preload::trace() {
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            eprintln!("rx-demand-record: {} parts in {:.0} ms: prepare {:.0}, namespaces {:.0} ({} in one pass), identities+boundaries {:.0}, closure delta {:.0}",
+                parts.len(), ms(t0.elapsed()), ms(t_loop), ms(t_snap - t_loop), later.len(), ms(t_seal - t_snap), ms(t0.elapsed() - t_seal));
         }
         let parts = parts.into_iter().map(Arc::new).collect::<Vec<_>>();
         *recording.ready.lock().unwrap() = parts.clone();

@@ -5777,8 +5777,12 @@ impl Linker {
                 let id = match self.image_slot_at(d) {
                     Some(id) => id,
                     None => {
+                        let t = crate::jit::wall_ns();
                         let key = self.dec_fnkey(u, d, 0)?;
-                        u.fn_id(key)
+                        let id = u.fn_id(key);
+                        THUNK_DECODED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        THUNK_DECODE_NS.fetch_add(crate::jit::wall_ns() - t, std::sync::atomic::Ordering::Relaxed);
+                        id
                     }
                 };
                 u.syms.intern(SymKind::Thunk(id), u.entry(id))
@@ -6247,3 +6251,7 @@ mod prune_tests {
         std::fs::remove_dir(&root).unwrap();
     }
 }
+
+/// (trace) thunk symbols whose fn key was not an image key: decoded, and the time
+pub(crate) static THUNK_DECODED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static THUNK_DECODE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

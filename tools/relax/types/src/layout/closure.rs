@@ -15,6 +15,17 @@ pub struct ClosureStorage {
 
 impl ClosureStorage {
     pub fn new(tcx: &Tcx, body: &Body, ce: u32) -> Self {
+        Self::with_types(tcx, body, ce, |ty| ty)
+    }
+
+    /// The parent may be the shared typeck result. Normalize capture reads without
+    /// copying its tables (rustc_codegen_ssa::mir::FunctionCx::monomorphize).
+    pub fn for_codegen(prog: &crate::program::Program, tcx: &Tcx, body: &Body, ce: u32) -> Self {
+        Self::with_types(tcx, body, ce, |ty| tcx.normalize_erasing_regions(
+            prog, crate::tcx::TypingEnv::fully_monomorphized(prog), ty))
+    }
+
+    fn with_types(tcx: &Tcx, body: &Body, ce: u32, ty: impl Fn(TyId) -> TyId) -> Self {
         let captures = &body.min_captures[&ce].captures;
         let roots: Vec<_> = body
             .closure_locals
@@ -29,7 +40,7 @@ impl ClosureStorage {
         let mut upvars = Vec::new();
         for &root in &roots {
             let cs: Vec<_> = captures.iter().filter(|c| c.place.root == root).collect();
-            let ty = body.locals[root as usize].ty;
+            let ty = ty(body.locals[root as usize].ty);
             // A captured *shared_ref is already a pointer to its referent. The old
             // ABI accesses the root, so store that reference value, not &shared_ref.
             let deref_shared = matches!(tcx.tys.kind(ty), TyKind::Ref(false, _, _))

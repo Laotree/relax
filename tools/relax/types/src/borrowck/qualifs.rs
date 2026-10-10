@@ -172,7 +172,7 @@ impl Queries for Provider<'_, '_> {
             ConstantKind::Scalar(n) => Ok(Some(*n)),
             ConstantKind::Item { def, args } => {
                 let args = self.tx.tcx.complete_args(self.tx.prog, *def, args, crate::types::RegionArgsId::EMPTY);
-                let value = self.tx.tcx.const_eval_resolve(self.tx.prog, crate::tcx::TypingEnv { param_env: self.tx.tcx.intern_param_env(self.tx.param_env.borrow().clone()), mode: self.tx.cx.typing_env.mode, limit: self.tx.cx.typing_env.limit }, *def, &args)
+                let value = self.tx.tcx.const_eval_resolve(self.tx.prog, self.tx.typing_env(), *def, &args)
                     .map_err(|_| Blocked("scalar constant could not be evaluated"))?;
                 Ok(value.try_to_leaf().map(|v| v.to_bits(v.size())))
             }

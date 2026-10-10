@@ -139,6 +139,7 @@ impl Tcx {
     /// rustc_middle/src/ty/context.rs mk_clauses: a typing environment's clause list is
     /// interned before it enters query keys (TypingEnv); the empty list is EMPTY.
     pub fn intern_param_env(&self, env: ParamEnv) -> ParamEnvId {
+        crate::solver_work::count(crate::solver_work::ENV_INTERNS);
         if env.clauses.is_empty() { return ParamEnvId::EMPTY; }
         ParamEnvId(self.envs.intern(Data::Predicates(env)))
     }

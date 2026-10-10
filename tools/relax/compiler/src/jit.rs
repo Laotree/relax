@@ -293,10 +293,10 @@ pub struct Unit {
     /// slots installed in the first seconds after main, in order (the disk cache's startup
     /// manifest for the next run)
     pub start_order: Vec<u32>,
-    pub bodies: crate::fxhash::HashMap<u32, Body>,
+    pub bodies: crate::fxhash::HashMap<u32, std::sync::Arc<Body>>,
     /// hot reload: checked bodies of older file versions, by (slot, file): closures those
     /// versions made are lowered from them (put_body)
-    pub old_bodies: crate::fxhash::HashMap<(u32, u32), Body>,
+    pub old_bodies: crate::fxhash::HashMap<(u32, u32), std::sync::Arc<Body>>,
     /// coroutine poll functions lowered to find their state layout (coro_frame): the build of
     /// the slot takes this RIR, so the layout callers saw and the code agree
     pub coro_rir: crate::conc::MemoMap<u32, crate::rir::Func>,
@@ -2988,7 +2988,7 @@ impl Unit {
             if !self.has_body(parent, cfile) {
                 if let FnKey::Inst(d, args) = self.fns[parent as usize].key.clone() {
                     let _o = crate::clock::origin("coro-owner");
-                    let body = crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&self.prog, &self.tcx, crate::tcx::TypingEnv::fully_monomorphized(&self.prog), &crate::tcx::EvalState::new()), &self.prog, &self.tcx, d, &args);
+                    let body = crate::typeck::codegen_body(&self.prog, &self.tcx, d, &args);
                     if body.errors.is_empty() {
                         self.put_body(parent, body);
                     }
@@ -4143,14 +4143,14 @@ impl Unit {
     }
 
     /// Slot `id`'s checked body for file version `file` (u32::MAX: the current one).
-    pub fn body_of(&self, id: u32, file: u32) -> Option<&Body> {
+    pub fn body_of(&self, id: u32, file: u32) -> Option<&std::sync::Arc<Body>> {
         match self.bodies.get(&id) {
             Some(b) if b.file == file || file == u32::MAX => Some(b),
             _ => self.old_bodies.get(&(id, file)),
         }
     }
 
-    pub fn put_body(&mut self, id: u32, body: Body) {
+    pub fn put_body(&mut self, id: u32, body: std::sync::Arc<Body>) {
         if let Some(old) = self.bodies.remove(&id) {
             if old.file != body.file {
                 self.old_bodies.insert((id, old.file), old);
@@ -4802,9 +4802,11 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32) -> u64 {
     }
     // an internal compiler panic (front end or code generator) becomes this function's
     // compile error: the process never goes down for it (rt_compile is extern "C")
+    let held = lock_depth();
     let r = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_fn(up, id))) {
         Ok(r) => r,
         Err(p) => {
+            unlock_to(held);
             let msg = if let Some(s) = p.downcast_ref::<&str>() {
                 s.to_string()
             } else if let Some(s) = p.downcast_ref::<String>() {
@@ -5374,7 +5376,7 @@ fn callee_attrs(prog: &crate::program::Program, tcx: &crate::tcx::Tcx, fns: &cra
     Some(match &fns[c as usize].key {
         FnKey::Inst(d, args) => {
             let core = prog.def(*d).krate == core_crate;
-            if !inline_all && !core {
+            if !inline_all && !core || inline_never(prog, *d) {
                 return None;
             }
             let mut a = inline_attrs(prog, *d);
@@ -5422,7 +5424,8 @@ fn has_closure(tcx: &crate::tcx::Tcx, t: TyId, depth: u32) -> bool {
     }
 }
 
-/// `#[inline(always)]` -> ATTR_ALWAYS, `#[inline]` -> ATTR_HINT.
+/// `#[inline(always)]` -> ATTR_ALWAYS, `#[inline]` -> ATTR_HINT; `#[inline(never)]` -> 0
+/// (inline_never).
 pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
     let def = prog.def(d);
     let f = &prog.files[def.file as usize];
@@ -5430,6 +5433,9 @@ pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
     let mut r = 0;
     for a in f.ast.list(it.attrs) {
         if a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "inline" {
+            if (a.toks.lo..a.toks.hi).any(|i| f.tok_text(i) == "never") {
+                return 0;
+            }
             r |= crate::opt::ATTR_HINT;
             for i in a.toks.lo..a.toks.hi {
                 if f.tok_text(i) == "always" {
@@ -5441,22 +5447,37 @@ pub(crate) fn inline_attrs(prog: &crate::program::Program, d: DefId) -> u8 {
     r
 }
 
+/// `#[inline(never)]`: never inlined (rustc's inliner refuses InlineAttr::Never).
+pub(crate) fn inline_never(prog: &crate::program::Program, d: DefId) -> bool {
+    let def = prog.def(d);
+    let f = &prog.files[def.file as usize];
+    let it = f.ast.item(def.item);
+    f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "inline" && (a.toks.lo..a.toks.hi).any(|i| f.tok_text(i) == "never"))
+}
+
 /// A function on cold paths (speculation skips it and the blocks that call it): `#[cold]`
 /// (rustc's attribute: the slow paths of Vec / HashMap growth, panics), diverging (returns
 /// `!`), or a panic / failure / formatting function by name.
 fn is_cold_fn(u: &Unit, c: u32) -> bool {
     if let FnKey::Inst(d, _) = &u.fns[c as usize].key {
-        let def = u.prog.def(*d);
-        let f = &u.prog.files[def.file as usize];
-        let it = f.ast.item(def.item);
-        if f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "cold") {
-            return true;
-        }
-        if u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.ret == u.tcx.tys.never) {
+        if is_cold_def(&u.prog, &u.tcx, *d) {
             return true;
         }
     }
-    let n = &u.fns[c as usize].name;
+    is_cold_name(&u.fns[c as usize].name)
+}
+
+/// `#[cold]` or diverging (is_cold_fn).
+fn is_cold_def(prog: &Program, tcx: &Tcx, d: DefId) -> bool {
+    let def = prog.def(d);
+    let f = &prog.files[def.file as usize];
+    let it = f.ast.item(def.item);
+    f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "cold")
+        || tcx.fn_sig(prog, d).map_or(false, |s| s.ret == tcx.tys.never)
+}
+
+/// A panic / failure / formatting function by name (is_cold_fn).
+fn is_cold_name(n: &str) -> bool {
     n.contains("panic") || n.contains("_failed") || n.contains("::fmt") || n.contains("fmt::") || n.contains("abort")
 }
 
@@ -5801,10 +5822,12 @@ unsafe fn build_o2(up: *mut Unit, id: u32) {
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
     O2_BUILD.with(|c| c.set(true));
     O2_SNAPSHOT.with(|c| c.set(snapshot));
+    let held = lock_depth();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir_from(up, id, true, lowered, RirMode::Normal)));
     O2_BUILD.with(|c| c.set(false));
     O2_SNAPSHOT.with(|c| c.set(false));
     if r.is_err() {
+        unlock_to(held);
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
         for x in open.into_iter().rev() {
             end_build(up, x);
@@ -6311,9 +6334,11 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
     }));
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
     let child0 = BUILD_CHILD.try_with(|c| c.borrow().len()).unwrap_or(0);
+    let held = lock_depth();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_rir_unguarded(up, id, mode)));
     std::panic::set_hook(prev);
     if r.is_err() {
+        unlock_to(held);
         // the unwound builds' bookkeeping
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
         for x in open.into_iter().rev() {
@@ -6495,6 +6520,28 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         }
     }
     (&mut *up).fns[id as usize].calls = callees.as_slice().into();
+    // inline candidates come from warm blocks only: a callee called only on a panic / error
+    // path stays a call and its RIR is not built for it
+    let warm: Vec<u32> = if cfg.inline {
+        let cold = cold_blocks(&*up, &func);
+        let mut w = Vec::new();
+        for (bi, b) in func.blocks.iter().enumerate() {
+            if cold[bi] {
+                continue;
+            }
+            for i in &b.insts {
+                if let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), _, _) = i {
+                    if !w.contains(c) {
+                        w.push(*c);
+                    }
+                }
+            }
+        }
+        w
+    } else { Vec::new() };
+    let inline_all = cfg.inline_all;
+    let noinl_callee = noinl_env(options).1.as_deref();
+    let core_hint = full || tier0_core_hint(options, (&*up).tier1.is_some());
     if full {
         // the Relax core helpers hot code calls (index, next, push...) are as hot: their RIR,
         // inlined here, and their own code are built the same way
@@ -6508,6 +6555,9 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     if cfg.inline {
         // callees small enough in source get their RIR built (bottom-up)
         for c in &callees {
+            if !warm.contains(c) {
+                continue;
+            }
             abandon_if_exiting();
             // a speculative worker gives the lock to a waiting thread between bodies; a build
             // of its that was taken over meanwhile ends this front (the other thread's wins)
@@ -6542,7 +6592,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             if baseline && !base_inline_wanted(u, *c) {
                 continue;
             }
-            let want = inline_source_wanted(u, *c, full);
+            // refused callees (#[inline(never)], sandboxed, user code without inline_all,
+            // RELAX_NOINL) are not built for inlining: decided before the build, not after
+            let want = inline_source_wanted(u, *c, full)
+                && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint).is_some()
+                && !noinl_callee.is_some_and(|p| name_matches(&u.fns[*c as usize].name, p));
             if want && O2_SNAPSHOT.try_with(|c| c.get()).unwrap_or(false) {
                 // a snapshot O2 build makes no front end under the lock: candidates with RIR only
                 if u.fns[*c as usize].rir.is_some() {
@@ -6610,7 +6664,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
                     if let Ok(Front::Opt(p, _)) = r {
                         let u = &*up;
                         // built (its RIR is stored) but not inlined when it calls this fn back
-                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, cfg.inline_all, full || tier0_core_hint(options, u.tier1.is_some())) };
+                        let attrs = if inline_cycle(u, id, *c) { None } else { callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, *c, inline_all, core_hint) };
                         if attrs.is_none() && sig_dir().is_some() && inline_cycle(u, id, *c) {
                             skipped.push((*c, "cycle"));
                         }
@@ -6628,9 +6682,6 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             }
         }
         let u = &mut *up;
-        let inline_all = cfg.inline_all;
-        let noinl_callee = noinl_env(options).1.as_deref();
-        let core_hint = full || tier0_core_hint(options, u.tier1.is_some());
         for &c in &callees {
             if !wanted.contains(&c) {
                 continue;
@@ -7690,7 +7741,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
             // that requested more is checked again once they are
             // checked ahead (off the unit lock) when it could be; else here
             let again = (&*up).front.built.contains(&(*d, args.clone()));
-            let body = match take_ahead(&(&*up).prog.session.options, &(&*up).front, &(&*up).tcx, *d, args) {
+            let body = match take_ahead(&(&*up).prog, &(&*up).front, &(&*up).tcx, *d, args) {
                 Ok(b) => { ahead_check_diag(&*up, id, "hit", 0); b }
                 Err(reason) => {
                     let u = &mut *up;
@@ -7700,7 +7751,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
                     } else {
                         let _o = crate::clock::origin(if again { "build-again" } else { "build" });
                         let start = cpu_ns();
-                        let b = crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, *d, args);
+                        let b = crate::typeck::codegen_body(&u.prog, &u.tcx, *d, args);
                         ahead_check_diag(u, id, reason, cpu_ns() - start);
                         b
                     }
@@ -7726,7 +7777,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
                 }
             }
             match u.body_of(*parent, *cfile) {
-                Some(b) => clone_body(b),
+                Some(b) => b.clone(),
                 None => return Err("closure parent body missing".to_string()),
             }
         }
@@ -7827,8 +7878,6 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
     }
     Ok((lcx.f, !lcx.new_closures.is_empty()))
 }
-
-fn clone_body(b: &Body) -> Body { b.clone() }
 
 /// Finds `#[test]` functions of a crate.
 pub fn find_tests(prog: &Program, krate: u32) -> Vec<DefId> {
@@ -10336,7 +10385,9 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
 extern "C" fn relax_first_present() {
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+        crate::solver_work::report();
         crate::exec_census::first_present();
+        crate::tcx::Tcx::report_declaration_counters();
         if profile_path().is_some() { crate::exec_profile::first_present(); }
         // the startup manifest's window ends 1 s after the first present at the latest, so the
         // run's warm record is written soon after it (run.rs), not 5 s after main
@@ -10621,25 +10672,16 @@ fn slot_key_inner(u: &Unit, id: u32) -> String {
     }
 }
 
-/// Queues the slots `func` calls (but not `skip`) at depth + 1 (lock held).
-unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32], depth: u8) {
-    if startup_phase() { return; }
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let options = &session.options;
-    if !pipelined() || depth >= spec_depth_max(options) {
-        return;
-    }
+/// The cold blocks of `func`: they end in `unreachable` (after a diverging call), call a
+/// panic / failure / formatting path, or lead only to cold blocks -- error paths the program
+/// rarely takes. Speculation does not build their callees ahead, and O1 does not build them as
+/// inline candidates (rustc's inliner skips cleanup blocks, inline.rs process_blocks).
+fn cold_blocks(u: &Unit, func: &crate::rir::Func) -> Vec<bool> {
     use crate::rir::{Callee, Inst, Term};
-    let u = &mut *up;
-    let nb = func.blocks.len();
-    // cold blocks: they end in `unreachable` (after a diverging call), call a panic / failure
-    // / formatting path, or lead only to cold blocks -- error paths the program rarely takes
-    let cold_callee = |u: &Unit, c: u32| is_cold_fn(u, c);
-    let mut cold = vec![false; nb];
-    for (bi, b) in func.blocks.iter().enumerate() {
-        cold[bi] = matches!(b.term, Term::Unreachable)
-            || b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Fn(c), _, _) if cold_callee(u, *c)));
-    }
+    let mut cold: Vec<bool> = func.blocks.iter().map(|b| {
+        matches!(b.term, Term::Unreachable)
+            || b.insts.iter().any(|i| matches!(i, Inst::Call(Callee::Fn(c), _, _) if is_cold_fn(u, *c)))
+    }).collect();
     loop {
         let mut changed = false;
         for (bi, b) in func.blocks.iter().enumerate() {
@@ -10657,9 +10699,23 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
             }
         }
         if !changed {
-            break;
+            return cold;
         }
     }
+}
+
+/// Queues the slots `func` calls (but not `skip`) at depth + 1 (lock held).
+unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32], depth: u8) {
+    if startup_phase() { return; }
+    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let options = &session.options;
+    if !pipelined() || depth >= spec_depth_max(options) {
+        return;
+    }
+    use crate::rir::{Callee, Inst, Term};
+    let u = &mut *up;
+    let nb = func.blocks.len();
+    let cold = cold_blocks(u, func);
     // the fall-through path: from the entry, jumps, and at a branch its first warm target;
     // its callees go first in the queue
     let mut hot = vec![false; nb];
@@ -11478,8 +11534,10 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
     let child0 = BUILD_CHILD.try_with(|c| c.borrow().len()).unwrap_or(0);
     child_push();
     let t0 = cpu_ns();
+    let held = lock_depth();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_rir(up, id, true)));
     if r.is_err() {
+        unlock_to(held);
         let open: Vec<u32> = BUILD_STACK.try_with(|s| s.borrow()[depth0.min(s.borrow().len())..].to_vec()).unwrap_or_default();
         for x in open.into_iter().rev() {
             end_build(up, x);
@@ -12023,8 +12081,8 @@ struct LoweredAhead {
     epoch: u64,
     file: u32,
     func: crate::rir::Func,
-    /// Closures need their owner's region-erased body, installed only by the locked build.
-    body: Option<Body>,
+    /// Closures share their owner's body, installed only by the locked build.
+    body: Option<std::sync::Arc<Body>>,
     /// New callees in the order normal lowering would discover them. Helpers do not create
     /// their slots: doing that early changes check's traversal and inline preparation order.
     callees: Vec<FnKey>,
@@ -12129,7 +12187,7 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
-        let body = clone_body(&body);
+        let body = crate::typeck::codegen_body(&u.prog, &u.tcx, d, &key.1);
         let (func, closures) = lower_checked_body(u, id, &fn_key, &body)?;
         let callees = LOWER_AHEAD_IDS.with(|a| std::mem::take(&mut a.borrow_mut().keys));
         Ok::<_, String>(LoweredAhead { epoch, file: body.file, func, body: closures.then_some(body), callees })
@@ -12208,9 +12266,8 @@ enum AheadWork {
     Body(AheadKey, bool),
 }
 
-fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: Body) {
+fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Arc<Body>) {
     let before = crate::memstat::live_total();
-    let body = std::sync::Arc::new(body);
     let claim = f.inprog.lock().unwrap_or_else(|e| e.into_inner());
     if !f.built.contains(&key) {
         f.ahead.insert(key, (epoch, body));
@@ -12231,8 +12288,8 @@ fn ahead_on(options: &crate::options::Options) -> bool {
 }
 
 /// The checked-ahead body of an instance, if one waits (unit lock held).
-fn take_ahead(options: &crate::options::Options, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId]) -> Result<Body, &'static str> {
-    if !ahead_on(options) {
+fn take_ahead(prog: &Program, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId]) -> Result<std::sync::Arc<Body>, &'static str> {
+    if !ahead_on(&prog.session.options) {
         return Err("off");
     }
     let key = (d, args.to_vec());
@@ -12246,25 +12303,20 @@ fn take_ahead(options: &crate::options::Options, f: &FrontShared, tcx: &Tcx, d: 
         return Err("epoch");
     }
     AHEAD_STATS[1].fetch_add(1, Ordering::Relaxed);
-    Ok(std::sync::Arc::try_unwrap(b).unwrap_or_else(|a| clone_body(&a)))
+    if b.args == args { return Ok(b); }
+    Ok(crate::typeck::codegen_body(prog, tcx, d, args))
 }
 
 /// CTFE's existing const-fn body can also supply code generation.
-fn ctfe_checked_body(u: &Unit, d: DefId, args: &[TyId]) -> Option<Body> {
+fn ctfe_checked_body(u: &Unit, d: DefId, args: &[TyId]) -> Option<std::sync::Arc<Body>> {
     let cached = u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()).get(&(d, args.to_vec())).cloned();
     let (epoch, b) = cached?;
-    (epoch == u.tcx.collect_epoch.load(Ordering::SeqCst)).then(|| clone_body(&b))
-}
-
-/// Evaluation borrows a completed ahead result; a later JIT build can still take it.
-pub(crate) fn ctfe_ahead_body(u: &Unit, d: DefId, args: &[TyId]) -> Option<Body> {
-    let (epoch, b) = u.front.ahead.get(&(d, args.to_vec()))?;
-    (epoch == u.tcx.collect_epoch.load(Ordering::SeqCst)).then(|| clone_body(&b))
+    (epoch == u.tcx.collect_epoch.load(Ordering::SeqCst)).then_some(b)
 }
 
 /// An initializer outside the interpreter's subset still has a checked body for its JIT
 /// fallback. Keep the check's original epoch: evaluation may have re-collected signatures.
-pub(crate) fn ctfe_fallback_body(u: &Unit, epoch: Option<u64>, b: Body) {
+pub(crate) fn ctfe_fallback_body(u: &Unit, epoch: Option<u64>, b: std::sync::Arc<Body>) {
     let Some(epoch) = epoch else { return };
     if ahead_on(&u.prog.session.options) && b.deferred_misses.is_empty() {
         publish_ahead(&u.front, (b.def, b.args.clone()), epoch, b);
@@ -12364,13 +12416,11 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
             continue;
         }
         let epoch = tcx.collect_epoch.load(Ordering::SeqCst);
-        let cx_state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &cx_state);
         let _o = crate::clock::origin("ahead");
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _p = crate::preempt::Preemptible::on();
             crate::preempt::point();
-            crate::typeck::instantiate_body(&cx, prog, tcx, key.0, &key.1)
+            tcx.typeck(prog, key.0)
         }));
         if r.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
             inprog_end(f, &key);
@@ -12397,7 +12447,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         };
         // Discover only direct inline candidates; publish before checking any of them.
         let callees = if depth > 0 {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b, true))) {
                 Ok(c) => c,
                 Err(_) => Vec::new(),
             }
@@ -12409,6 +12459,10 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         for (c, mut cargs) in callees {
             let cd = prog.def(c);
             if cd.krate != core || !matches!(cd.kind, DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            // what prepare_rir_from does not take as an inline candidate is not checked ahead
+            if inline_never(prog, c) || is_cold_def(prog, tcx, c) || is_cold_name(&prog.def_path(c)) {
                 continue;
             }
             let attr = inline_attrs(prog, c);
@@ -12441,10 +12495,31 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
 
 /// The fn instances a checked body calls, as lowering will most likely key them (trait
 /// methods resolved to their impls); open or erroneous instances are left out. A guess: a
-/// miss only means the build checks that body itself.
-pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body) -> Vec<(DefId, Vec<TyId>)> {
+/// miss only means the build checks that body itself. `warm_only`: calls inside a diverging
+/// call's expression (`panic!(..)`'s formatting, `unwrap_failed(..)`) are left out, as
+/// prepare_rir_from leaves the callees of cold blocks out of its inline candidates.
+pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool) -> Vec<(DefId, Vec<TyId>)> {
+    use crate::ast::ExprKind;
+    let ast = &prog.files[b.file as usize].ast;
+    let cold: Vec<(u32, u32)> = if warm_only {
+        (0..b.expr_ty.len())
+            .filter(|&i| b.expr_ty[i] == tcx.tys.never)
+            .filter_map(|i| {
+                let e = ast.expr(b.expr_at(i));
+                matches!(e.kind, ExprKind::Call(..) | ExprKind::MethodCall { .. } | ExprKind::Mac(..)).then_some((e.lo, e.hi))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let in_cold = |k: u32| {
+        !cold.is_empty() && b.has_expr(crate::ast::ExprId(k)) && {
+            let e = ast.expr(crate::ast::ExprId(k));
+            cold.iter().any(|&(lo, hi)| lo <= e.lo && e.hi <= hi)
+        }
+    };
     let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
-    let mut add = |d: DefId, args: &[TyId]| {
+    let mut add = |k: u32, d: DefId, args: &[TyId]| {
         // rustc_ty_utils/src/instance.rs:187-198 @8d1a764: instance
         // discovery is a codegen boundary, including non-trait callees.
         let mut erased = Vec::with_capacity(args.len());
@@ -12453,7 +12528,7 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body) -> Vec<(DefId, V
             erased.push(ty);
         }
         let args = erased.as_slice();
-        if !args.iter().all(|t| tcx.tys.is_concrete(*t)) {
+        if !args.iter().all(|t| tcx.tys.is_concrete(*t)) || in_cold(k) {
             return;
         }
         let Ok(instance) = tcx.resolve_instance_raw(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), d, args) else { return };
@@ -12469,18 +12544,21 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body) -> Vec<(DefId, V
         if let Res::Def(d) = r {
             if matches!(prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
                 let a = b.res_args.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
-                add(*d, a);
+                add(*k, *d, a);
             }
         }
     }
-    for m in b.methods.values().chain(b.binops.values()) {
-        add(m.def, &m.args);
+    for (k, m) in b.methods.iter().chain(b.binops.iter()) {
+        add(*k, m.def, &m.args);
     }
-    for (d, a) in b.ov_derefs.values().chain(b.ov_index.values()).chain(b.for_next.values()) {
-        add(*d, a);
+    for ((k, _), (d, a)) in &b.ov_derefs {
+        add(*k, *d, a);
     }
-    for (d, a, _) in b.for_into.values() {
-        add(*d, a);
+    for (k, (d, a)) in b.ov_index.iter().chain(b.for_next.iter()) {
+        add(*k, *d, a);
+    }
+    for (k, (d, a, _)) in &b.for_into {
+        add(*k, *d, a);
     }
     out
 }
@@ -12552,6 +12630,16 @@ pub(crate) unsafe fn preserve_closure_bodies(up: *mut Unit, files: &[u32]) -> Re
     owners.dedup();
     for (parent, file) in owners {
         ensure_parent_body(up, parent, file, 0)?;
+        let u = &mut *up;
+        let body = u.body_of(parent, file).unwrap().clone();
+        // Freeze shared identity tables before their definitions are replaced.
+        // Old closures must never normalize an old alias against the new source.
+        if std::sync::Arc::ptr_eq(&body, &u.tcx.typeck(&u.prog, body.def)) {
+            let state = crate::tcx::EvalState::new();
+            let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
+            let frozen = crate::typeck::instantiate_body(&cx, &u.prog, &u.tcx, body.def, &body.args);
+            u.put_body(parent, std::sync::Arc::new(frozen));
+        }
     }
     Ok(())
 }
@@ -12574,16 +12662,16 @@ unsafe fn ensure_parent_body(up: *mut Unit, id: u32, file: u32, depth: u32) -> R
                 return Err("closure parent body missing (its file version was replaced)".to_string());
             }
             let _o = crate::clock::origin("closure-owner");
-            match take_ahead(&u.prog.session.options, &u.front, &u.tcx, d, &args) {
+            match take_ahead(&u.prog, &u.front, &u.tcx, d, &args) {
                 Ok(b) => b,
-                Err(_) => ctfe_checked_body(u, d, &args).unwrap_or_else(|| crate::typeck::instantiate_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, d, &args)),
+                Err(_) => ctfe_checked_body(u, d, &args).unwrap_or_else(|| crate::typeck::codegen_body(&u.prog, &u.tcx, d, &args)),
             }
         }
         FnKey::Sandbox(_) => return Err("closure parent is a sandbox twin".to_string()),
         FnKey::Closure(_, _, grand) => {
             ensure_parent_body(up, grand, file, depth + 1)?;
             match (&*up).body_of(grand, file) {
-                Some(b) => clone_body(b),
+                Some(b) => b.clone(),
                 None => return Err("closure parent body missing".to_string()),
             }
         }

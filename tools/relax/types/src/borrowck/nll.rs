@@ -489,11 +489,24 @@ impl<'a> Nll<'a> {
                     }
                 } else if let Some(input) = li.checked_sub(if is_closure { 2 } else { 1 })
                     .filter(|_| l.kind == LocalKind::Arg).and_then(|i| t.inputs.get(i)).filter(|input| input.len() == n) {
-                    for sr in input {
+                    // An inferred closure parameter's regions are the closure type's (external)
+                    // only at its external coordinates (external_closure_input_slots): a position
+                    // bound by a binder inside the parameter's type (`&dyn for<'a> Fn(&'a T)`) is
+                    // local to that type, never a free region of the closure, so it is existential.
+                    let external_slots = if is_closure && bir.infer_params.contains(&(li as Local)) {
+                        bir.closure_expr.and_then(|ce| self.rty.closures.borrow().get(&(bir.file, ce))
+                            .and_then(|cs| cs.params.iter().find(|(k, _, _)| k + 2 == li).map(|(_, _, slots)| slots.clone())))
+                            .unwrap_or_default()
+                    } else { Vec::new() };
+                    for (slot, sr) in input.iter().enumerate() {
                         match map_sr(&tmpl_map, *sr) {
                             Some(r) => v.push(r),
                             None => {
-                                let r = self.new_rv(if is_closure { if bir.infer_params.contains(&(li as Local)) { Kind::External } else { Kind::Placeholder } } else { Kind::Var }, "'_");
+                                let kind = if !is_closure { Kind::Var }
+                                    else if !bir.infer_params.contains(&(li as Local)) { Kind::Placeholder }
+                                    else if external_slots.contains(&slot) { Kind::External }
+                                    else { Kind::Var };
+                                let r = self.new_rv(kind, "'_");
                                 v.push(r);
                             }
                         }
@@ -3170,7 +3183,7 @@ impl<'a> Nll<'a> {
                 let names = all.entry(ce).or_default();
                 let k = names.iter().position(|n| n == name).unwrap_or_else(|| { names.push(name.clone()); names.len()-1 });
                 NAMED_REQ + k as u32
-            } else { *self.ext_slot.get(&(r as Rv)).unwrap_or_else(|| panic!("external region missing its closure coordinate: def {:?}, typeck root {:?}, closure {:?}, BIR region {}, external slots {:?}, outer names {:?}", self.bir.def, self.bir.owner, self.bir.closure_expr, r, self.ext_slot, self.outer_named)) }
+            } else { *self.ext_slot.get(&(r as Rv)).unwrap_or_else(|| panic!("external region missing its closure coordinate: def {:?}, typeck root {:?} ({}), closure {:?}, BIR region {}, external slots {:?}, outer names {:?}", self.bir.def, self.bir.owner, self.bir.owner.map(|d| self.prog.def_path(d)).unwrap_or_default(), self.bir.closure_expr, r, self.ext_slot, self.outer_named)) }
         };
         let mut requirements: Vec<_> = self.regioncx().propagated_outlives_requirements.iter().map(|c|
             ClosureOutlivesRequirement { subject:ClosureOutlivesSubject::Region(encode(c.sup)),outlived_free_region:encode(c.sub),blame_span:Span { lo: c.span.lo, hi: c.span.hi },category:c.category }).collect();

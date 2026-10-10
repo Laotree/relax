@@ -60,7 +60,7 @@ macro_rules! fields {
 macro_rules! tables {
     ($op:ident) => { $op!(sigs, ctor_sigs, adts, adt_destructors, destructor_impls,
         nominal_region_contracts, impl_self, impl_trait, impl_generics,
-        inherent, trait_impls, impls_by_key, impl_trait_args, impl_trait_regions,
+        inherent, trait_impls, trait_impls_of, impls_by_key, impl_trait_args, impl_trait_regions,
         impl_trait_bounds, trait_closure); };
 }
 
@@ -68,6 +68,7 @@ impl Tcx {
     /// Invalidate declaration owners in the changed suffix, preserving the independent
     /// dependency graph and its type IDs. Derived query caches were never in the image.
     pub fn retain_collected_prefix(&mut self, first: usize) {
+        self.declarations.retain_prefix(first);
         let keep = |d: &DefId| (d.0 as usize) < first;
         let impls: Vec<_> = self.impl_self.keys().filter(|d| !keep(d)).copied().collect();
         self.uncollect_impls(&impls);
@@ -183,7 +184,7 @@ impl Tcx {
         let errors = self.collected_errors.as_ref()?;
         if !errors.is_empty() { return None; }
         let mut w = Vec::new();
-        5u32.put(&mut w);
+        6u32.put(&mut w);
         macro_rules! put_one {
             (errors) => { errors.put(&mut w) };
             ($f:ident) => { self.$f.put(&mut w) };
@@ -205,7 +206,7 @@ impl Tcx {
     pub fn restore_collected(bytes: &'static [u8], files: usize, crates: usize) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
-        if u32::get(&mut r)? != 5 { return None; }
+        if u32::get(&mut r)? != 6 { return None; }
         let mut t = Self::with_types(Types::restore_collected(image.bytes(1, 1)?)?);
         macro_rules! get { ($($f:ident),+) => { $(t.$f = Codec::get(&mut r)?;)+ }; }
         fields!(get);

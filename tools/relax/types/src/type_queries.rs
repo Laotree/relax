@@ -80,11 +80,10 @@ pub struct QueryCx {
     freeze: QueryTable<TypeKey, bool>,
     normalize: QueryTable<TypeKey, Result<TyId, crate::next_solver::NoSolution>>,
     const_eval: QueryTable<ConstEvalKey, EvalToValTreeResult>,
-    param_env: QueryTable<DefId, crate::next_solver::ParamEnv>,
+    param_env: QueryTable<DefId, crate::tcx::ParamEnvId>,
     pub(crate) compare_impl_item: QueryTable<DefId, Result<(), crate::next_solver::NoSolution>>,
     typeck: QueryTable<DefId, (u64, std::sync::Arc<crate::typeck::Body>)>,
     opaque_generics: QueryTable<DefId, crate::next_solver::rpitit::OpaqueGenerics>,
-    explicit_item_bounds: QueryTable<DefId, Vec<crate::next_solver::Predicate>>,
     variances: QueryTable<DefId, Vec<crate::types::variance::V>>,
     lifetime_names: QueryTable<DefId, (u64, std::sync::Arc<crate::tcx::lifetime_resolve::LifetimeResolution>)>,
     resolved_bound_vars: QueryTable<DefId, (u64, std::sync::Arc<crate::tcx::resolve_bound_vars::ResolveBoundVars>)>,
@@ -149,7 +148,7 @@ impl QueryCx {
         let mut engine = QueryEngine::new();
         engine.register_input(DECLARATIONS.kind, DECLARATIONS.key, Fingerprint::from_bytes(b"declarations")).unwrap();
         engine.set_input(DECLARATIONS.kind, DECLARATIONS.key, Fingerprint::from_bytes(&0u64.to_le_bytes())).unwrap();
-        Self { file_count: 0, crate_count: 0, type_param_clauses: QueryTable::new(20, type_param_key_fp, item_bounds_fp), specialization_graph: QueryTable::new(18, coherence_key_fp, property_bool_fp), inherent_overlap: QueryTable::new(19, opaque_def_fp, property_bool_fp), opaque_generics: QueryTable::new(15, opaque_def_fp, opaque_generics_fp), explicit_item_bounds: QueryTable::new(16, opaque_def_fp, item_bounds_fp), variances: QueryTable::new(17, opaque_def_fp, variances_fp), lifetime_names: QueryTable::new(13, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), resolved_bound_vars: QueryTable::new(14, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), param_env: QueryTable::new(12, opaque_def_fp, param_env_fp), compare_impl_item: QueryTable::new(11, opaque_def_fp, |r| property_bool_fp(&r.is_ok())), typeck: QueryTable::new(10, opaque_def_fp, typeck_fp), opaque_hidden_type: QueryTable::new(9, opaque_def_fp, opaque_ty_fp), engine, declarations: crate::next_solver::sizedness::DeclarationQueries::new(), solver: Default::default(), drop: QueryTable::new(1, type_fp, property_bool_fp), freeze: QueryTable::new(2, type_fp, property_bool_fp), normalize: QueryTable::new(3, type_fp, property_ty_fp),
+        Self { file_count: 0, crate_count: 0, type_param_clauses: QueryTable::new(20, type_param_key_fp, item_bounds_fp), specialization_graph: QueryTable::new(18, coherence_key_fp, property_bool_fp), inherent_overlap: QueryTable::new(19, opaque_def_fp, property_bool_fp), opaque_generics: QueryTable::new(15, opaque_def_fp, opaque_generics_fp), variances: QueryTable::new(17, opaque_def_fp, variances_fp), lifetime_names: QueryTable::new(13, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), resolved_bound_vars: QueryTable::new(14, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), param_env: QueryTable::new(12, opaque_def_fp, param_env_fp), compare_impl_item: QueryTable::new(11, opaque_def_fp, |r| property_bool_fp(&r.is_ok())), typeck: QueryTable::new(10, opaque_def_fp, typeck_fp), opaque_hidden_type: QueryTable::new(9, opaque_def_fp, opaque_ty_fp), engine, declarations: crate::next_solver::sizedness::DeclarationQueries::new(), solver: Default::default(), drop: QueryTable::new(1, type_fp, property_bool_fp), freeze: QueryTable::new(2, type_fp, property_bool_fp), normalize: QueryTable::new(3, type_fp, property_ty_fp),
             const_eval: QueryTable::new(4, const_key_fp, const_value_fp),
             codegen_select: QueryTable::new(22, hash_fp, hash_fp), resolve_instance: QueryTable::new(23, hash_fp, hash_fp),
             dyn_compatibility: QueryTable::new(24, opaque_def_fp, hash_fp), own_vtable_entries: QueryTable::new(25, opaque_def_fp, hash_fp),
@@ -299,7 +298,6 @@ impl Providers<'_> {
             18 => { self.specialization_graph(q.specialization_graph.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             19 => { self.crate_inherent_impls_overlap_check(q.inherent_overlap.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             15 => { self.opaque_generics(q.opaque_generics.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
-            16 => { self.explicit_item_bounds(q.explicit_item_bounds.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             17 => { self.variances_of(q.variances.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             13 => { self.resolve_lifetime_names(q.lifetime_names.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             14 => { self.resolve_bound_vars(q.resolved_bound_vars.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
@@ -344,13 +342,6 @@ impl Providers<'_> {
         q.opaque_generics.get(&q.engine, def, &mut |def| {
             q.read_def_declarations(self.prog, def)?;
             Ok(self.tcx.opaque_generics_uncached(self.prog, def))
-        }, &|id| self.force(id))
-    }
-    pub(crate) fn explicit_item_bounds(&self, def: DefId) -> Result<Vec<crate::next_solver::Predicate>, QueryError> {
-        let q = &self.tcx.queries;
-        q.explicit_item_bounds.get(&q.engine, def, &mut |def| {
-            q.read_def_declarations(self.prog, def)?;
-            Ok(self.tcx.explicit_item_bounds_uncached(self.prog, def))
         }, &|id| self.force(id))
     }
     pub(crate) fn variances_of(&self, def: DefId) -> Result<Vec<crate::types::variance::V>, QueryError> {
@@ -441,11 +432,11 @@ impl Providers<'_> {
         }, &|id| self.force(id))
     }
 
-    fn param_env(&self, def: DefId) -> Result<crate::next_solver::ParamEnv, QueryError> {
+    fn param_env(&self, def: DefId) -> Result<crate::tcx::ParamEnvId, QueryError> {
         let q = &self.tcx.queries;
         q.param_env.get(&q.engine, def, &mut |def| {
             q.read_def_declarations(self.prog, def)?;
-            Ok(crate::next_solver::param_env::param_env(self.tcx, self.prog, def))
+            Ok(self.tcx.intern_param_env(crate::next_solver::param_env::param_env(self.tcx, self.prog, def)))
         }, &|id| self.force(id))
     }
 
@@ -650,11 +641,10 @@ impl Tcx {
     }
 
     /// normalize_erasing_regions.rs:95-120: erase before keying; alias-free types bypass
-    /// the query. may_project includes projections inside closures and trait objects,
-    /// which has_assoc deliberately omits.
+    /// the query. HAS_ALIAS includes type and const aliases at every depth.
     pub fn try_normalize_erasing_regions(&self, prog: &Program, env: TypingEnv, ty: TyId) -> Result<TyId, crate::next_solver::NoSolution> {
+        if !self.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ALIAS) { return Ok(self.tys.erase_regions(ty)); }
         let ty = self.tys.erase_regions(self.tys.set_aliases_to_non_rigid(ty));
-        if !self.tys.may_project(ty) && !self.tys.has_opaque(ty) { return Ok(ty); }
         Providers { tcx: self, prog }.try_normalize_generic_arg_after_erasing_regions(TypeKey { env, ty }).expect("normalize_erasing_regions query")
     }
 
@@ -991,7 +981,7 @@ mod tests {
 
 }
 
-fn param_env_fp(result: &crate::next_solver::ParamEnv) -> Fingerprint {
+fn param_env_fp(result: &crate::tcx::ParamEnvId) -> Fingerprint {
     let mut h = KeyHasher(crate::sip::Sip128::new());
     result.hash(&mut h);
     Fingerprint(h.0.finish128())
@@ -1001,6 +991,10 @@ impl Tcx {
         Providers { tcx: self, prog }.type_param_clauses((owner, param, assoc)).expect("type_param_clauses query")
     }
     pub fn param_env(&self, prog: &Program, def: DefId) -> crate::next_solver::ParamEnv {
+        self.param_env_by_id(self.param_env_id(prog, def)).clone()
+    }
+    /// The declaration query retains its interned identity, as rustc's param_env query does.
+    pub fn param_env_id(&self, prog: &Program, def: DefId) -> crate::tcx::ParamEnvId {
         Providers { tcx: self, prog }.param_env(def).expect("param_env query")
     }
     /// The dyn_compatibility_violations query (provider: dyn_compatibility_violations_uncached).
@@ -1061,20 +1055,18 @@ impl Tcx {
     /// complete impl index has been published, independently of body reachability.
     pub fn coherence_check(&self, prog: &Program) {
         let providers=Providers { tcx:self,prog };
-        // one pass over the impls: every trait's impls in program order, and each crate's
-        // traits in the order of its first impl of them (what a per-crate scan finds)
-        let mut impls_of: crate::fxhash::HashMap<DefId, Vec<DefId>> = Default::default();
+        // The collected per-trait index supplies impls; this pass preserves each crate's
+        // traits in the order of its first impl of them (what a per-crate scan finds).
         let mut traits_of: Vec<Vec<DefId>> = vec![Vec::new(); prog.crates.len()];
         let mut seen: crate::fxhash::HashSet<(u32, DefId)> = Default::default();
         for im in &prog.impls {
             let Some(&td)=self.impl_trait.get(&im.def) else { continue };
-            impls_of.entry(td).or_default().push(im.def);
             let krate=prog.def(im.def).krate;
             if seen.insert((krate,td)) { traits_of[krate as usize].push(td); }
         }
         for krate in 0..prog.crates.len() as u32 {
             if matches!(prog.syms.str(prog.crates[krate as usize].name),"core"|"alloc"|"std"|"proc_macro") { continue; }
-            for &td in &traits_of[krate as usize] { providers.specialization_graph_with((krate,td), Some(&impls_of[&td])).expect("coherence query"); }
+            for &td in &traits_of[krate as usize] { providers.specialization_graph_with((krate,td), Some(&self.trait_impls_of[&td])).expect("coherence query"); }
             providers.crate_inherent_impls_overlap_check(DefId(krate)).expect("inherent coherence query");
         }
     }

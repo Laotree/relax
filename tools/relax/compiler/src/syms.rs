@@ -647,7 +647,7 @@ fn walk(u: &Unit, t: TyId, base: u64, off: u32, out: &mut Vec<(u32, Option<bool>
                         for k in 0..n as usize {
                             raw[k] = unsafe { *p.add(k) };
                         }
-                        let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                        let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt)?;
                         adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc)?
                     }
                     Some(_) => return None,

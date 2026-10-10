@@ -16,8 +16,25 @@ pub fn trait_predicate(def_id: DefId, args: Vec<GenericArg>) -> Predicate {
     Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id, args }, polarity: ClausePolarity::Positive })))
 }
 
+static DECLARATION_ENVS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOWER_BOUNDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+fn count_query(counter: &std::sync::atomic::AtomicU64) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("RELAX_DECL_COUNTERS").is_some()) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 impl Tcx {
+    pub fn report_declaration_counters() {
+        if std::env::var_os("RELAX_DECL_COUNTERS").is_some() {
+            eprintln!("relax declarations at first present: declaration_env={} lower_bounds={}",
+                DECLARATION_ENVS.load(std::sync::atomic::Ordering::Relaxed),
+                LOWER_BOUNDS.load(std::sync::atomic::Ordering::Relaxed));
+        }
+    }
     pub fn declaration_env(&self, prog: &Program, def_id: DefId) -> GenEnv {
+        count_query(&DECLARATION_ENVS);
         let def = prog.def(def_id);
         if matches!(def.kind, DefKind::Prim(_) | DefKind::Mod | DefKind::MacroRules) { return GenEnv::default(); }
         let mut env = if def.kind == DefKind::Trait {
@@ -35,12 +52,14 @@ impl Tcx {
         env
     }
 
-    pub fn explicit_super_predicates_of(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
-        self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly)
+    pub fn explicit_super_predicates_of(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
+        self.declaration_queries(prog, def_id).super_predicates.get_or_init(||
+            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfOnly))
     }
 
     pub(crate) fn explicit_supertraits_containing_assoc_item(&self, prog: &Program, def_id: DefId, name: crate::program::Sym) -> Vec<Predicate> {
-        self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfTraitThatDefines(name))
+        self.declaration_queries(prog, def_id).filtered_supers(name, ||
+            self.implied_clauses_with_filter(prog, def_id, PredicateFilter::SelfTraitThatDefines(name)))
     }
 
     // context.rs:2090 and type_ir/elaborate.rs:324: traverse the lowered
@@ -51,7 +70,7 @@ impl Tcx {
         visited.insert(def_id);
         while let Some(def) = stack.pop() {
             for bound in self.explicit_super_predicates_of(prog, def) {
-                if let PredicateKind::Clause(ClauseKind::Trait(clause)) = bound.kind {
+                if let PredicateKind::Clause(ClauseKind::Trait(clause)) = &bound.kind {
                     if visited.insert(clause.trait_ref.def_id) { stack.push(clause.trait_ref.def_id); }
                 }
             }
@@ -76,7 +95,7 @@ impl Tcx {
         let mut binder = env.clone();
         binder.regions = env.regions.with_binder(None);
         let self_ty = env.self_ty.unwrap();
-        self.add_implicit_sizedness_bounds(&cx, def_id, &binder, self_ty, supers, true, &mut out);
+        self.add_implicit_sizedness_bounds(&cx, def_id, &binder, self_ty, supers, &[], true, &mut out);
         self.lower_bounds(&cx, def_id, &binder, self_ty, supers, false, filter, &mut out);
         for (where_index, &pred) in ast.list(generics.where_).iter().enumerate() {
             if let WherePred::Bound { ty, bounds, .. } = pred {
@@ -166,7 +185,20 @@ impl Tcx {
     }
 
     pub fn clauses_of(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
-        if let Some(clauses) = self.rpitit_clauses(prog, def_id) { return clauses; }
+        let def = prog.def(def_id);
+        let mut out = if matches!(def.kind, DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst) {
+            self.clauses_of(prog, def.parent)
+        } else { Vec::new() };
+        out.extend_from_slice(self.own_clauses_of(prog, def_id));
+        out
+    }
+
+    pub(crate) fn own_clauses_uncached(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
+        if let Some(mut clauses) = self.rpitit_clauses(prog, def_id) {
+            let count = self.clauses_of(prog, prog.def(def_id).parent).len();
+            clauses.drain(..count);
+            return clauses;
+        }
         let def = prog.def(def_id);
         // rustc_hir_analysis/src/collect/generics_of.rs:96: MCG has no parent.
         if def.kind == DefKind::AnonConst && !prog.repeat_expr_counts.contains(&def_id)
@@ -185,13 +217,12 @@ impl Tcx {
             _ => Default::default(),
         };
         let mut out = Vec::new();
-        if matches!(def.kind, DefKind::AssocFn | DefKind::AssocTy | DefKind::AssocConst) { out.extend(self.clauses_of(prog, def.parent)); }
         if def.kind == DefKind::Trait {
             out.push(trait_predicate(def_id, self.generic_indices_of(prog, def_id).identity_args(&self.tys)));
             if let ItemKind::Trait { supers, .. } = ast.item(def.item).kind {
                 let mut binder = env.clone();
                 binder.regions = env.regions.with_binder(None);
-                self.add_implicit_sizedness_bounds(&cx, def_id, &binder, env.self_ty.unwrap(), supers, true, &mut out);
+                self.add_implicit_sizedness_bounds(&cx, def_id, &binder, env.self_ty.unwrap(), supers, &[], true, &mut out);
                 for &b in ast.list(supers) { self.lower_bound(&cx, def_id, &binder, env.self_ty.unwrap(), b, PredicateFilter::All, &mut out); }
             }
         }
@@ -212,7 +243,10 @@ impl Tcx {
                 }
                 GenericParamKind::Type(bounds, _) => {
                     let ty = self.tys.intern(TyKind::Param(index as u32));
-                    self.lower_bounds(&cx, def_id, &binder, ty, bounds, true, PredicateFilter::All, &mut out);
+                    let name = prog.syms.get(prog.files[def.file as usize].text(p.name));
+                    let where_bounds = param_where_bounds(prog, def.file, &generics, name);
+                    self.add_implicit_sizedness_bounds(&cx, def_id, &binder, ty, bounds, &where_bounds, false, &mut out);
+                    self.lower_bounds(&cx, def_id, &binder, ty, bounds, false, PredicateFilter::All, &mut out);
                 }
                 GenericParamKind::Const(ty, _) => {
                     let ct = self.tys.intern_const(ConstKind::Param(crate::consts::ParamConst { index: index as u32 }));
@@ -248,21 +282,24 @@ impl Tcx {
     }
 
     pub(crate) fn lower_bounds(&self, cx: &EvalCx<'_>, owner: DefId, env: &GenEnv, ty: TyId, bounds: ast::List<Bound>, sized: bool, filter: PredicateFilter, out: &mut Vec<Predicate>) {
+        count_query(&LOWER_BOUNDS);
         let ast = &cx.prog.files[cx.prog.def(owner).file as usize].ast;
-        if sized { self.add_implicit_sizedness_bounds(cx, owner, env, ty, bounds, false, out); }
+        if sized { self.add_implicit_sizedness_bounds(cx, owner, env, ty, bounds, &[], false, out); }
         for &b in ast.list(bounds) { self.lower_bound(cx, owner, env, ty, b, filter, out); }
     }
 
     /// hir_ty_lowering/bounds.rs:145-207: explicit sizedness replaces the default;
-    /// `?Sized` means MetaSized, while PointeeSized imposes no predicate.
-    fn add_implicit_sizedness_bounds(&self, cx: &EvalCx<'_>, owner: DefId, _env: &GenEnv, ty: TyId, bounds: ast::List<Bound>, trait_def: bool, out: &mut Vec<Predicate>) {
+    /// `?Sized` means MetaSized, while PointeeSized imposes no predicate. A type
+    /// parameter's sizedness bounds include its where-clause bounds
+    /// (bounds.rs:61-85 `search_bounds_for` with `ImpliedBoundsContext::TyParam`).
+    fn add_implicit_sizedness_bounds(&self, cx: &EvalCx<'_>, owner: DefId, _env: &GenEnv, ty: TyId, bounds: ast::List<Bound>, where_bounds: &[ast::List<Bound>], trait_def: bool, out: &mut Vec<Predicate>) {
         use crate::lang_items::LangItem;
         if trait_def && (self.lang_items.get(LangItem::PointeeSized) == Some(owner) || eval_ctxt::trait_is_auto(cx.prog, owner)) { return; }
         let d = cx.prog.def(owner);
         let ast = &cx.prog.files[d.file as usize].ast;
         let mut maybe_sized = false;
         let mut explicit = false;
-        for &bound in ast.list(bounds) {
+        for &bound in std::iter::once(&bounds).chain(where_bounds).flat_map(|list| ast.list(*list)) {
             if let Bound::Trait { maybe, path, .. } = bound {
                 if let Some(def) = self.resolve_type_path_def(cx.prog, d.file, d.scope, &path) {
                     match self.lang_items.by_def.get(&def) {
@@ -376,4 +413,22 @@ impl Tcx {
             }
         }
     }
+}
+
+/// The bound lists of `generics`' where clauses whose subject is the type
+/// parameter `name` itself (rustc_hir/src/hir.rs `WhereBoundPredicate::is_param_bound`:
+/// a one-segment path resolving to that parameter).
+fn param_where_bounds(prog: &Program, file: u32, generics: &ast::Generics, name: Option<crate::program::Sym>) -> Vec<ast::List<Bound>> {
+    let ast = &prog.files[file as usize].ast;
+    let mut out = Vec::new();
+    for predicate in ast.list(generics.where_) {
+        let WherePred::Bound { ty: mut subject, bounds, .. } = *predicate else { continue; };
+        while let ast::Ty::Paren(inner) = ast.ty(subject) { subject = *inner; }
+        let ast::Ty::Path(path) = ast.ty(subject) else { continue; };
+        if path.qself.is_some() || path.global() || path.segs.len() != 1 { continue; }
+        let segment = ast.segs(path.segs)[0];
+        if !segment.args.is_none() || segment.kind == ast::SegKind::SelfType { continue; }
+        if prog.syms.get(prog.files[file as usize].text(segment.name)) == name { out.push(bounds); }
+    }
+    out
 }

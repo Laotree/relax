@@ -187,6 +187,12 @@ impl Tcx {
     /// rustc_traits/src/normalize_erasing_regions.rs:20-66; type_ir/fold.rs:594.
     /// A typing-environment change invalidates the previous rigidness proof.
     pub fn try_normalize_after_erasing_regions(&self, prog: &Program, typing_env: TypingEnv, ty: TyId) -> Result<TyId, NoSolution> {
+        crate::solver_work::count(crate::solver_work::NORMALIZE);
+        // rustc_middle::ty::normalize_erasing_regions: alias-free values need only erasure.
+        if !self.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ALIAS) {
+            crate::solver_work::count(crate::solver_work::NORMALIZE_SKIPPED);
+            return if self.tys.has_infer(ty) { Err(NoSolution) } else { Ok(self.tys.erase_regions(ty)) };
+        }
         let ty = self.tys.erase_regions(self.tys.set_aliases_to_non_rigid(ty));
         let infcx = InferCtxt::new(self, typing_env.mode, typing_env.limit);
 

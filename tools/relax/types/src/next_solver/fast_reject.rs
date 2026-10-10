@@ -32,9 +32,11 @@ pub fn simplify_type(tys: &Types, ty: TyId) -> Option<SimplifiedType> {
 
 /// fast_reject.rs:190-566, concrete relate_infer_infer specialization.
 #[derive(Clone, Copy)]
-pub struct DeepRejectCtxt<'a> { tys: &'a Types }
+pub struct DeepRejectCtxt<'a> { tys: &'a Types, instantiate_lhs: bool }
 impl<'a> DeepRejectCtxt<'a> {
-    pub fn relate_infer_infer(tys: &'a Types) -> Self { Self { tys } }
+    pub fn relate_infer_infer(tys: &'a Types) -> Self { Self { tys, instantiate_lhs: true } }
+    /// Goal parameters are rigid; impl parameters will be instantiated by the probe.
+    pub fn relate_rigid_infer(tys: &'a Types) -> Self { Self { tys, instantiate_lhs: false } }
     pub fn args_may_unify(self, a: &[GenericArg], b: &[GenericArg]) -> bool { self.args_may_unify_inner(a, b, 8) }
     pub fn types_may_unify(self, a: TyId, b: TyId) -> bool { self.types_may_unify_inner(a, b, 8) }
     fn args_may_unify_inner(self, a: &[GenericArg], b: &[GenericArg], depth: usize) -> bool {
@@ -62,7 +64,9 @@ impl<'a> DeepRejectCtxt<'a> {
         }
         let Some(depth) = depth.checked_sub(1) else { return true; };
         match (self.tys.kind(a), self.tys.kind(b)) {
-            (TyKind::Param(_) | TyKind::Alias(..) | TyKind::Error | TyKind::Bound(..), _) => true,
+            (TyKind::Param(a), TyKind::Param(b)) => self.instantiate_lhs || a == b,
+            (TyKind::Param(_), _) => self.instantiate_lhs,
+            (TyKind::Alias(..) | TyKind::Error | TyKind::Bound(..), _) => true,
             (TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_), _) => self.var_and_ty_may_unify(a,b),
             (TyKind::Ref(am,a,_), TyKind::Ref(bm,b,_)) | (TyKind::Ptr(am,a), TyKind::Ptr(bm,b)) => am==bm && self.types_may_unify_inner(*a,*b,depth),
             (TyKind::Adt(ad,a,_), TyKind::Adt(bd,b,_)) | (TyKind::FnDef(ad,a,_), TyKind::FnDef(bd,b,_)) => ad==bd && self.compact_args_may_unify(a,b,depth),
@@ -83,6 +87,8 @@ impl<'a> DeepRejectCtxt<'a> {
         if matches!(bk, ConstKind::Param(_) | ConstKind::Alias(..) | ConstKind::Error | ConstKind::Infer(_) | ConstKind::Bound(..)) { return true; }
         match (self.tys.const_kind(a),bk) {
             (ConstKind::Value(a),ConstKind::Value(b)) => a.valtree==b.valtree,
+            (ConstKind::Param(a),ConstKind::Param(b)) => self.instantiate_lhs || a==b,
+            (ConstKind::Param(_),_) => self.instantiate_lhs,
             (ConstKind::Placeholder(a),ConstKind::Placeholder(b)) => a==b,
             (ConstKind::Value(_) | ConstKind::Placeholder(_),_) => false,
             _ => true,

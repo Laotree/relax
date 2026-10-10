@@ -79,6 +79,19 @@ impl Cache {
             }
         }
         data.settle();
+        // the functions thunk symbols name (fn pointers in data: vtables, callbacks) are keys
+        // too: the prelink makes their slots with the others, so linking a thunk is a lookup by
+        // bytes instead of a fn key decode per symbol (Stage: ~18k of 22k thunks)
+        let mut thunk_keys = Vec::new();
+        for i in 0..tab.syms.list.len() {
+            let b = &tab.syms.list[i];
+            if b.first() == Some(&7) && b.len() > 9 {
+                let key = b[1..b.len() - 8].to_vec();
+                thunk_keys.push(tab.keys.id(&key));
+            }
+        }
+        thunk_keys.sort_unstable();
+        thunk_keys.dedup();
         let mut e = E::default();
         e.u32(tab.crates.len() as u32);
         for &c in &tab.crates {
@@ -96,6 +109,10 @@ impl Cache {
         sorted.sort_unstable_by(|&a, &b| tab.keys.list[a as usize].cmp(&tab.keys.list[b as usize]));
         e.u32(sorted.len() as u32);
         for k in sorted {
+            e.u32(k);
+        }
+        e.u32(thunk_keys.len() as u32);
+        for k in thunk_keys {
             e.u32(k);
         }
         data.encode(&mut e);
@@ -233,8 +250,8 @@ impl Cache {
     }
 }
 
-/// The startup image section of a manifest ("PLI5" after the slot list).
-pub(super) const IMAGE_MAGIC: u32 = 0x3549_4c50;
+/// The startup image section of a manifest ("PLI6" after the slot list).
+pub(super) const IMAGE_MAGIC: u32 = 0x3649_4c50;
 
 /// A loaded manifest's image section, read in place: the store it is mapped from stays open.
 pub(super) struct ManifestImage {
@@ -686,6 +703,8 @@ struct Img {
     files: Vec<&'static [u8]>,
     slots: Vec<ImgSlot>,
     flat: Vec<u32>,
+    /// keys of the functions thunk symbols name (their slots are made with the others)
+    thunks: Vec<u32>,
     /// the image (relocation records and pc entries are read from it in place)
     bytes: &'static [u8],
     blob: &'static [u8],
@@ -710,6 +729,9 @@ struct Img {
     failed: u64,
     had_code: u64,
     t_syms: u64,
+    /// (trace) per symbol tag: resolve ns and count; place_data ns
+    t_tag: [(u64, u32); 10],
+    t_place: u64,
     /// the symbols part of the prelink time is measured (verbose: a clock read per symbol
     /// otherwise costs thousands of clock reads at every warm start)
     timed: bool,
@@ -739,6 +761,13 @@ fn parse_image(img: &'static [u8], store: std::sync::Arc<Store>, crate_ok: impl 
         return None;
     }
     let sorted = d.take(nsorted.checked_mul(4)?)?;
+    let nthunks = d.u32()? as usize;
+    let mut thunks = Vec::with_capacity(nthunks.min(1 << 20));
+    for _ in 0..nthunks {
+        let k = d.u32()?;
+        if k as usize >= tables[0].len() { return None; }
+        thunks.push(k);
+    }
     let nd = d.u32()? as usize;
     let mut data = Vec::with_capacity(nd.min(1 << 20));
     for _ in 0..nd {
@@ -823,6 +852,7 @@ fn parse_image(img: &'static [u8], store: std::sync::Arc<Store>, crate_ok: impl 
         files,
         slots,
         flat,
+        thunks,
         bytes: img,
         blob,
         fresh: HashMap::new(),
@@ -831,6 +861,8 @@ fn parse_image(img: &'static [u8], store: std::sync::Arc<Store>, crate_ok: impl 
         failed: 0,
         had_code: 0,
         t_syms: 0,
+        t_tag: [(0, 0); 10],
+        t_place: 0,
         timed: false,
     })
 }
@@ -958,6 +990,10 @@ impl Linker {
         }
         let t = if im.timed { crate::jit::wall_ns() } else { 0 };
         let r = self.link_symbol(u, &mut D { b, p: 0 });
+        if im.timed {
+            let e = &mut im.t_tag[(b.first().copied().unwrap_or(0) as usize).min(9)];
+            e.0 += crate::jit::wall_ns() - t; e.1 += 1;
+        }
         if b.first() == Some(&8) {
             if let Some(s) = r {
                 im.fresh.insert(ri, s);
@@ -1330,6 +1366,9 @@ impl Linker {
         let mut need_sym = vec![false; im.syms.len()];
         let live: Vec<bool> = (0..im.slots.len()).map(|si| self.img_live(&im, si, &mut need, &mut need_sym)).collect();
         im.changed += live.iter().filter(|&&l| !l).count() as u64;
+        for &k in &im.thunks {
+            need[k as usize] = true;
+        }
         // keys this run has a slot for already (made before the prelink), found by their encoding
         for id in 0..u.fns.len() as u32 {
             if let Some(b) = self.cache().slot_bytes(u, id) {
@@ -1357,11 +1396,12 @@ impl Linker {
             crate::jit::ids_pending(u);
         }
         let t_keys = crate::jit::wall_ns();
-        let timed = std::mem::replace(&mut im.timed, false);
+        let tagged = im.t_tag.iter().map(|e| e.0).sum::<u64>();
         self.place_data(u, &mut im, &need_sym);
-        im.timed = timed;
-        if timed {
-            im.t_syms += crate::jit::wall_ns() - t_keys;
+        if im.timed {
+            im.t_place = crate::jit::wall_ns() - t_keys;
+            let inner = im.t_tag.iter().map(|e| e.0).sum::<u64>() - tagged;
+            im.t_syms += im.t_place.saturating_sub(inner);
         }
         let (mut ready, mut later) = (Vec::with_capacity(im.slots.len()), Vec::new());
         for si in 0..im.slots.len() {
@@ -1396,6 +1436,11 @@ impl Linker {
         c.stats.prelink_failed += im.failed;
         c.stats.prelink_had_code += im.had_code;
         c.stats.prelink_ns += crate::jit::wall_ns() - t0;
+        if im.timed && std::env::var_os("RELAX_BOOT_TRACE").is_some() {
+            let tags: Vec<String> = im.t_tag.iter().enumerate().filter(|(_, e)| e.1 != 0).map(|(k, e)| format!("tag{}={}/{:.1}ms", k, e.1, e.0 as f64 / 1e6)).collect();
+            eprintln!("relax-cache: prelink symbols: place_data {:.1} ms (incl. its symbols), {} symbols in the image; resolved by tag: {}; thunks decoded (not image keys) {} in {:.1} ms",
+                im.t_place as f64 / 1e6, im.syms.len(), tags.join(" "), super::THUNK_DECODED.load(std::sync::atomic::Ordering::Relaxed), super::THUNK_DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
+        }
         // what decides whether the next manifest carries a fresh image (record_manifest)
         c.image_slots = im.slots.len().max(1);
         c.image_stale += (im.changed + im.failed) as usize;

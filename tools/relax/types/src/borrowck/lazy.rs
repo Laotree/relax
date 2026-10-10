@@ -31,16 +31,17 @@ fn publish(ev: &mut GandalfEvent) {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FnVerdict { Clean, Errors(Vec<GandalfEvent>), Unchecked(String), Pending }
-type ItemKey = (usize, DefId, Option<Vec<TyId>>, u64);
-// Group by owner so a live edit invalidates/publishes only that owner's instances.
+// rustc mir_borrowck is per LocalDefId, independent of codegen substitutions.
+type ItemKey = (usize, DefId, u64);
+// Group by owner so live edits invalidate only that definition.
 static VERDICTS: LazyLock<Mutex<HashMap<DefId, HashMap<ItemKey, FnVerdict>>>> = LazyLock::new(|| Mutex::new(HashMap::default()));
-pub fn verdict(src: usize, def: DefId, args: &[TyId], epoch: u64) -> FnVerdict {
+pub fn verdict(src: usize, def: DefId, _args: &[TyId], epoch: u64) -> FnVerdict {
     let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     let epoch = queue.as_ref().map_or(epoch, |q| q.canon(src, epoch));
     if queue.as_ref().and_then(|q| q.epoch.get(&src)).is_some_and(|e| epoch < *e) {
         return FnVerdict::Unchecked("stale".into());
     }
-    VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(&def).and_then(|instances| instances.get(&(src, def, Some(args.to_vec()), epoch))).cloned()
+    VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(&def).and_then(|instances| instances.get(&(src, def, epoch))).cloned()
         .unwrap_or_else(|| FnVerdict::Unchecked("not queued".into()))
 }
 fn record(key: ItemKey, value: FnVerdict) { VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).entry(key.1).or_default().insert(key, value); }
@@ -56,7 +57,7 @@ pub fn report_checked(prog: &Program, src: usize, epoch: u64, def: DefId, args: 
         else { WITHHELD.fetch_add(1, Ordering::Relaxed); }
         all.push(ev);
     }
-    record((src, def, Some(args.to_vec()), epoch), if all.is_empty() { FnVerdict::Clean } else { FnVerdict::Errors(all) });
+    record((src, def, epoch), if all.is_empty() { FnVerdict::Clean } else { FnVerdict::Errors(all) });
     admitted
 }
 
@@ -87,13 +88,12 @@ pub fn carry_epoch(src: usize, from: u64, to: u64, keep: &dyn Fn(DefId) -> bool)
     // queue or the seen set (they hold the whole program)
     let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
     let dropped: Vec<DefId> = verdicts.keys().copied().filter(|d| *d == crate::program::NO_DEF || !keep(*d)).collect();
-    let mut gone: Vec<ItemKey> = vec![(src, crate::program::NO_DEF, None, base)];
+    let mut gone: Vec<ItemKey> = vec![(src, crate::program::NO_DEF, base)];
     for d in dropped {
         let Some(instances) = verdicts.get_mut(&d) else { continue };
         let keys: Vec<ItemKey> = instances.keys().filter(|k| k.0 == src).cloned().collect();
         for k in keys {
             instances.remove(&k);
-            gone.push((src, d, None, k.3));
             gone.push(k);
         }
         if instances.is_empty() { verdicts.remove(&d); }
@@ -152,13 +152,13 @@ impl StoredVerdict {
     }
 }
 
-struct Item { key: ItemKey, cache_key: Option<u128>, src: Arc<dyn FrontSource>, discovery: usize }
+struct Item { key: ItemKey, args: Option<Vec<TyId>>, cache_key: Option<u128>, src: Arc<dyn FrontSource>, discovery: usize }
 #[derive(Default)]
 struct Queue {
     order: BTreeSet<(u32, u64)>, items: HashMap<(u32, u64), Item>,
     rank_of: HashMap<ItemKey, (u32, u64)>, seen: HashMap<ItemKey, ()>,
-    pending_ranks: HashMap<(usize, DefId, Vec<TyId>), u32>,
-    pending_order: VecDeque<(usize, DefId, Vec<TyId>)>,
+    pending_ranks: HashMap<(usize, DefId), u32>,
+    pending_order: VecDeque<(usize, DefId)>,
     epoch: HashMap<usize, u64>, seq: u64,
     /// (src, epoch) -> the earlier epoch it stands for (carry_epoch): keys hold that one
     alias: HashMap<(usize, u64), u64>,
@@ -189,15 +189,15 @@ impl Queue {
         if previous.is_some_and(|e| e > epoch) { return false; }
         if previous == Some(epoch) { return true; }
         self.epoch.insert(src, epoch);
-        let stale: Vec<_> = self.rank_of.iter().filter(|(k, _)| k.0 == src && k.3 < epoch).map(|(k, at)| (k.clone(), *at)).collect();
+        let stale: Vec<_> = self.rank_of.iter().filter(|(k, _)| k.0 == src && k.2 < epoch).map(|(k, at)| (k.clone(), *at)).collect();
         STALE.fetch_add(stale.len() as u64, Ordering::Relaxed);
         for (key, at) in stale { self.rank_of.remove(&key); self.order.remove(&at); self.items.remove(&at); }
-        self.seen.retain(|k, _| k.0 != src || k.3 >= epoch);
+        self.seen.retain(|k, _| k.0 != src || k.2 >= epoch);
         self.alias.retain(|k, base| k.0 != src || *base >= epoch);
         self.pending_ranks.retain(|k, _| k.0 != src);
         self.pending_order.retain(|k| k.0 != src);
         VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, instances| {
-            instances.retain(|k, _| k.0 != src || k.3 >= epoch);
+            instances.retain(|k, _| k.0 != src || k.2 >= epoch);
             !instances.is_empty()
         });
         true
@@ -208,17 +208,17 @@ pub fn set_ranks(src: usize, epoch: u64, ranks: &[(DefId, Vec<TyId>, u32)]) {
     let q = guard.get_or_insert_with(Queue::default);
     let epoch = q.canon(src, epoch);
     if !q.advance(src, epoch) { return; }
-    for (def, args, rank) in ranks {
-        let key = (src, *def, Some(args.clone()), epoch);
+    for (def, _, rank) in ranks {
+        let key = (src, *def, epoch);
         if let Some(at) = q.rank_of.remove(&key) {
             q.order.remove(&at);
             let item = q.items.remove(&at).unwrap();
-            let next = (*rank, at.1);
+            let next = ((*rank).min(at.0), at.1);
             q.order.insert(next); q.items.insert(next, item); q.rank_of.insert(key, next);
         } else if !q.seen.contains_key(&key) {
-            let key = (src, *def, args.clone());
+            let key = (src, *def);
             if !q.pending_ranks.contains_key(&key) { q.pending_order.push_back(key.clone()); }
-            q.pending_ranks.insert(key, *rank);
+            q.pending_ranks.entry(key).and_modify(|r| *r = (*r).min(*rank)).or_insert(*rank);
             while q.pending_ranks.len() > 65_536 {
                 if let Some(key) = q.pending_order.pop_front() { q.pending_ranks.remove(&key); }
             }
@@ -282,22 +282,32 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
         let q = guard.get_or_insert_with(Queue::default);
         let epoch = q.canon(src.identity(), epoch);
         if !q.advance(src.identity(), epoch) { return; }
-        let key = (src.identity(), def, args, epoch);
-        if q.seen.contains_key(&key) { return; }
-        q.seen.insert(key.clone(), ());
+        let key = (src.identity(), def, epoch);
+        if q.seen.contains_key(&key) {
+            // Discovery may have queued this owner first. A compiled instance
+            // promotes that same check instead of adding an instance check.
+            if args.is_some() {
+                if let Some(at) = q.rank_of.remove(&key) {
+                    let requested = rank.or_else(|| q.pending_ranks.get(&(key.0, def)).copied()).unwrap_or(RANK_DEFAULT);
+                    q.order.remove(&at);
+                    let item = q.items.remove(&at).unwrap();
+                    let next = (at.0.min(requested), at.1);
+                    q.order.insert(next); q.items.insert(next, item); q.rank_of.insert(key, next);
+                }
+            }
+            return;
+        }
+        q.seen.insert(key, ());
         if let Some(v) = cached {
             v.reuse(key);
             return;
         }
-        let pending = key.2.as_ref().and_then(|args| {
-            let k = (key.0, def, args.clone());
-            let rank = q.pending_ranks.remove(&k);
-            if rank.is_some() { q.pending_order.retain(|x| *x != k); }
-            rank
-        });
-        let rank = if def == crate::program::NO_DEF { RANK_DISCOVER } else if key.2.is_none() { RANK_OWNER } else { rank.or(pending).unwrap_or(RANK_DEFAULT) };
-        if key.2.is_some() { record(key.clone(), FnVerdict::Pending); }
-        q.insert(Item { key, cache_key, src: src.clone(), discovery: 0 }, rank);
+        let k = (key.0, def);
+        let pending = q.pending_ranks.remove(&k);
+        if pending.is_some() { q.pending_order.retain(|x| *x != k); }
+        let rank = if def == crate::program::NO_DEF { RANK_DISCOVER } else if args.is_none() { RANK_OWNER } else { rank.or(pending).unwrap_or(RANK_DEFAULT) };
+        record(key, FnVerdict::Pending);
+        q.insert(Item { key, args, cache_key, src: src.clone(), discovery: 0 }, rank);
     }
     if !STARTED.swap(true, Ordering::SeqCst) {
         let s = src.clone(); let verbose = options.verbose;
@@ -379,7 +389,7 @@ fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
 }
 fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[TyId], result: Result<Option<super::Verdict>, String>, origin: Origin) -> Vec<GandalfEvent> {
-    let key = (src, def, Some(args.to_vec()), epoch);
+    let key = (src, def, epoch);
     match result {
         Ok(Some(v)) => {
             let incomplete = v.errors.is_empty().then(|| v.unchecked.first().cloned()).flatten();
@@ -424,12 +434,10 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
         let _cost = crate::fncost::Record::new(u32::MAX, 0, "gandalf");
         let t0 = crate::clock::cpu_ns();
         let mut stale = false;
-        let mut duplicate = false;
-        let mut checked_identity = None;
         let mut discovery_next = None;
         let mut reused_owner = false;
         let mut preempted = false;
-        let (identity, def, _, epoch) = &item.key;
+        let (identity, def, epoch) = &item.key;
         let phase = std::cell::Cell::new("start");
         let ok = item.src.with_front(&mut |prog, tcx, cx| {
             struct Slow<'a>(std::time::Instant, &'a std::cell::Cell<&'static str>, &'a Program, DefId, usize);
@@ -473,31 +481,20 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
                 return;
             }
             let identity_args;
-            let args = match &item.key.2 {
+            let args = match &item.args {
                 Some(args) => args,
                 None => {
                     let Some(owner) = super::body::CheckedBody::item(prog, *def) else { return; };
                     identity_args = owner.identity_args(prog, tcx);
-                    let key = (*identity, *def, Some(identity_args.clone()), *epoch);
-                    if QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|q| q.seen.contains_key(&key)) {
-                        duplicate = true; return;
-                    }
-                    record(key, FnVerdict::Pending);
                     &identity_args
                 }
             };
-            // A compiled non-generic instance is also its owner's identity
-            // body. Persist both names even if discovery deduplicates that item.
-            let is_owner = item.key.2.is_none() || super::body::CheckedBody::item(prog, *def)
-                .is_some_and(|owner| owner.identity_args(prog, tcx) == *args);
-            let (owner_key, stored) = if is_owner {
-                item.src.owner_verdict(prog, *def, *epoch)
-            } else { (None, None) };
+            // Every instance checks the same generic body and can persist its owner verdict.
+            let (owner_key, stored) = item.src.owner_verdict(prog, *def, *epoch);
             phase.set("stored");
             if let Some(v) = stored {
                 reused_owner = true;
-                v.reuse((*identity, *def, Some(args.clone()), *epoch));
-                checked_identity = Some(args.clone());
+                v.reuse(item.key);
                 return;
             }
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -511,6 +508,8 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
                 let body = tcx.typeck(prog, *def);
                 if !body.errors.is_empty() { phase.set("typeck (errors)"); return None; }
                 phase.set("borrowck");
+                static COUNTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *COUNTS.get_or_init(|| std::env::var_os("RELAX_BODY_COUNTS").is_some()) { eprintln!("body-count borrowck"); }
                 Some(super::check_body(cx, prog, tcx, &body))
             }));
             if result.as_ref().is_err_and(|p| crate::preempt::is_preempted(&**p)) {
@@ -541,13 +540,11 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             }
             phase.set("finish");
             finish_verdict(prog, *identity, *epoch, *def, args, result, Origin::Background);
-            if item.key.2.is_none() { checked_identity = Some(args.clone()); }
         });
         CHECK_NS.fetch_add(crate::clock::cpu_ns() - t0, Ordering::Relaxed);
         // An exit cancels the whole attempt, including constant deferrals/discovery.
         // Only a front writer's temporary preemption is queued again below.
         if crate::preempt::is_stopped() { return; }
-        if duplicate { continue; }
         if stale {
             STALE.fetch_add(1, Ordering::Relaxed);
             // Epoch-purged entries stay purged; verdict() supplies the stale reason.
@@ -584,13 +581,8 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(q) = guard.as_mut() {
                 if q.epoch.get(identity) == Some(epoch) {
-                    q.insert(Item { key: item.key.clone(), cache_key: None, src: item.src.clone(), discovery: next }, RANK_DISCOVER);
+                    q.insert(Item { key: item.key, args: None, cache_key: None, src: item.src.clone(), discovery: next }, RANK_DISCOVER);
                 }
-            }
-        }
-        if let Some(args) = checked_identity {
-            if let Some(q) = QUEUE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                if q.epoch.get(identity) == Some(epoch) { q.seen.insert((*identity, *def, Some(args), *epoch), ()); }
             }
         }
         if *def != crate::program::NO_DEF && !reused_owner { CHECKED.fetch_add(1, Ordering::Relaxed); }
@@ -631,8 +623,8 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
         }
     }
     for (def, args) in todo {
-        if done.contains(&(def, args.clone())) { continue; }
-        done.push((def, args.clone()));
+        if done.contains(&def) { continue; }
+        done.push(def);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let state = crate::tcx::EvalState::new();
             let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
@@ -646,7 +638,7 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
         out.events.extend(events);
         let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
         let instances = verdicts.get_mut(&def).expect("completed gate verdict");
-        let value = instances[&(0, def, Some(args.clone()), req.epoch)].clone();
+        let value = instances[&(0, def, req.epoch)].clone();
         for old in instances.values_mut() { *old = value.clone(); }
         if out.refuses() { break; }
     }

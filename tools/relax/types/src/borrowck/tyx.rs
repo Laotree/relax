@@ -33,6 +33,7 @@ pub struct Tx<'a> {
     pub closure_copy: RefCell<HashMap<(u32, u32), bool>>,
     /// The body's clauses for the native solver.
     pub param_env: RefCell<crate::next_solver::ParamEnv>,
+    param_env_id: std::cell::Cell<crate::tcx::ParamEnvId>,
 }
 
 impl<'a> Tx<'a> {
@@ -71,6 +72,7 @@ impl<'a> Tx<'a> {
             // N:rustc_ty_utils/src/ty.rs:150-156 and solve/mod.rs:280-319:
             // const-only bodies need their ConstArgHasType clauses too.
             param_env: RefCell::new(tcx.param_env_by_id(env.param_env).clone()),
+            param_env_id: std::cell::Cell::new(env.param_env),
         };
         t.box_def = t.lang("boxed::Box");
         if t.copy_trait.is_none() {
@@ -91,13 +93,15 @@ impl<'a> Tx<'a> {
             self.polymorphic.set(false);
             self.param_copy.borrow_mut().clear();
             self.copy_memo.borrow_mut().clear();
+            self.param_env_id.set(self.cx.typing_env.param_env);
             *self.param_env.borrow_mut() = self.tcx.param_env_by_id(self.cx.typing_env.param_env).clone();
         }
     }
 
     pub fn set_generic_env(&self, def: DefId, n: usize) {
-        let result = self.tcx.param_env(self.prog, def);
-        *self.param_env.borrow_mut() = result;
+        let id = self.tcx.param_env_id(self.prog, def);
+        self.param_env_id.set(id);
+        *self.param_env.borrow_mut() = self.tcx.param_env_by_id(id).clone();
         let mut v = vec![false; n];
         let ct = match self.copy_trait {
             Some(c) => c,
@@ -154,7 +158,21 @@ impl<'a> Tx<'a> {
 
     pub(super) fn normalize_in_env(&self, ty: TyId, param_env: &crate::next_solver::ParamEnv) -> TyId {
         let tys = &self.tcx.tys;
+        let ty = self.cx.infcx.map_or(ty, |infcx| infcx.deeply_resolve_ignoring_regions(ty));
         if !tys.may_project(ty) && !tys.has_opaque(ty) { return ty; }
+        // Capture analysis runs during type checking with the body's inference context
+        // (upvar::analyze): its types can still hold that table's variables, which the fresh
+        // context of the type operation below cannot resolve. They are resolved in the body's
+        // context first (rustc expr_use_visitor.rs, FnCtxt: resolve_vars_if_possible in its own
+        // InferCtxt); a variable the body has not inferred yet is left as it is.
+        let ty = match self.cx.infcx {
+            Some(body) => {
+                let ty = body.deeply_resolve_ignoring_regions(ty);
+                if tys.has_infer(ty) { return ty; }
+                ty
+            }
+            None => ty,
+        };
         let infcx = self.infer_ctxt();
         let param_env = param_env.clone();
         with_foreign_region_vars(&infcx, ty, |ty| in_signature_binder(tys, ty, |value| {
@@ -380,10 +398,15 @@ impl<'a> Tx<'a> {
         }
     }
 
+    /// The active body's interned clauses, including set_generic_env/reset_env transitions.
+    pub fn typing_env(&self) -> crate::tcx::TypingEnv {
+        crate::tcx::TypingEnv { param_env: self.param_env_id.get(), ..self.cx.typing_env }
+    }
+
     /// rustc_ty_utils/src/instance.rs:108-131: an unresolvable call (a where-clause
     /// source, ambiguity) stays on the trait item, as generic MIR keeps it.
     pub fn resolve_trait_method(&self, def: DefId, args: &[TyId]) -> (DefId, Vec<TyId>) {
-        let typing_env = crate::tcx::TypingEnv { limit: self.cx.typing_env.limit, param_env: self.tcx.intern_param_env(self.param_env.borrow().clone()), mode: self.cx.typing_env.mode };
+        let typing_env = self.typing_env();
         match self.tcx.resolve_instance_raw(self.prog, typing_env, def, args) {
             Ok(instance) => match instance.def {
                 crate::instance::InstanceKind::Item(d) if self.prog.def(d).kind != crate::program::DefKind::Closure => (d, instance.compact_args(self.tcx)),

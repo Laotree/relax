@@ -385,7 +385,7 @@ impl LifetimeCollector<'_> {
         }
         let indices = self.tcx.generic_indices_of(self.prog, alias);
         let mut walker = ConstrainedCollectorPostHirTyLowering {
-            constrained: vec![false; indices.lifetimes.len() + indices.types_consts.len()], types: indices.types_consts,
+            constrained: vec![false; indices.lifetimes.len() + indices.types_consts.len()], types: indices.types_consts.clone(),
         };
         if let Ok(ty) = self.tcx.type_of(self.prog, alias) { walker.fold_ty(&self.tcx.tys, ty, 0); }
         let ast = &self.prog.files[self.prog.def(self.owner).file as usize].ast;
@@ -1258,7 +1258,7 @@ mod tests {
         let opaque = prog.opaque_types_defined_by[&owner][0];
         let before = tcx.resolve_bound_vars(&prog, owner);
         let generics = tcx.opaque_generics(&prog, opaque);
-        let bounds = tcx.explicit_item_bounds(&prog, opaque);
+        let bounds = tcx.explicit_item_bounds(&prog, opaque).to_vec();
         let variances = tcx.variances_of(&prog, opaque);
         assert!(tcx.sigs[&owner].get().is_none());
         assert_eq!(generics.captured_lifetimes.len(), 1);
@@ -1412,7 +1412,7 @@ mod tests {
                 let expected = if prog.name(owner) == "inherent" { usize::from(edition >= 2024) } else { 2 };
                 let before = tcx.opaque_generics(&prog, opaque);
                 assert_eq!(before.captured_lifetimes.len(), expected, "{} {edition}", prog.name(owner));
-                let bounds = tcx.explicit_item_bounds(&prog, opaque);
+                let bounds = tcx.explicit_item_bounds(&prog, opaque).to_vec();
                 tcx.fn_sig(&prog, owner).unwrap();
                 assert_eq!(before.captured_lifetimes, tcx.opaque_generics(&prog, opaque).captured_lifetimes);
                 assert_eq!(bounds, tcx.explicit_item_bounds(&prog, opaque));

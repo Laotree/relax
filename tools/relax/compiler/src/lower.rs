@@ -300,9 +300,9 @@ impl<'a> Lcx<'a> {
         let mut f = Func::new(name, b.file);
         let entry = f.block();
         let n = b.locals.len();
-        let ret = b.ret;
+        let ret = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), b.ret);
         let mut closure_storage = HashMap::default();
-        for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::new(&u.tcx, b, ce)); }
+        for &ce in b.min_captures.keys() { closure_storage.insert(ce, crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, b, ce)); }
         Lcx {
             closure_storage,
             u,
@@ -708,11 +708,21 @@ impl<'a> Lcx<'a> {
         }
         l
     }
+    // rustc_codegen_ssa/src/mir/mod.rs: FunctionCx::monomorphize. Identity
+    // bodies stay shared with typeck/borrowck; codegen normalizes only reads.
+    fn monomorphize(&self, t: TyId) -> TyId {
+        self.u.tcx.normalize_erasing_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t)
+    }
+    fn monomorphize_args(&self, args: &mut [TyId]) {
+        for ty in args { *ty = self.monomorphize(*ty); }
+    }
+    fn body_ty(&self, e: ExprId) -> TyId { self.monomorphize(self.b.ty(e)) }
+    fn body_pty(&self, p: PatId) -> TyId { self.monomorphize(self.b.pty(p)) }
     fn kind(&self, t: TyId) -> TyKind {
         self.kind_ref(t).clone()
     }
     fn kind_ref(&self, t: TyId) -> &'a TyKind {
-        self.u.tcx.tys.kind(self.u.tcx.tys.erase_regions(t))
+        self.u.tcx.tys.kind(self.monomorphize(t))
     }
     fn needs_drop_glue(&mut self, t: TyId) -> bool {
         // These kinds own no values or live-session extension blocks. Avoid even the
@@ -1290,7 +1300,7 @@ impl<'a> Lcx<'a> {
     // ------------------------------------------------------------ locals
 
     fn alloc_local(&mut self, li: u32) -> LocalSt {
-        let t = self.b.locals[li as usize].ty;
+        let t = self.monomorphize(self.b.locals[li as usize].ty);
         let l = self.layout(t);
         let st = match (&l.leaves, self.addr_taken[li as usize]) {
             (Some(leaves), false) => LocalSt::Regs(self.fresh_leaves(leaves)),
@@ -1334,7 +1344,7 @@ impl<'a> Lcx<'a> {
                 // calling a closure passes its state by reference (`c()` on an FnMut closure
                 // mutates the state in place: a register copy would lose the change and drop
                 // the old captures twice)
-                ExprKind::Call(f, _) if matches!(self.u.tcx.tys.kind(b.ty(*f)), TyKind::Closure(..)) => self.mark_root(*f),
+                ExprKind::Call(f, _) if matches!(self.kind_ref(b.ty(*f)), TyKind::Closure(..)) => self.mark_root(*f),
                 // overloaded index / deref take `&self` / `&mut self` of the base
                 ExprKind::Index(x, _) if b.ov_index.contains_key(&e.0) => self.mark_root(*x),
                 ExprKind::Unary(UnOp::Deref, x) if b.ov_derefs.contains_key(&(e.0, 0)) => self.mark_root(*x),
@@ -1424,7 +1434,7 @@ impl<'a> Lcx<'a> {
             self.f.params.push(out);
             self.pos = ast.expr(e).lo;
             self.const_init = true;
-            let t = self.b.ret;
+            let t = self.monomorphize(self.b.ret);
             let v = self.lower_expr_coerced(e, t);
             self.store_val(out, 0, t, v);
             self.term(Term::Ret(Vec::new()));
@@ -1442,7 +1452,7 @@ impl<'a> Lcx<'a> {
                 // stored at the item's declared type (`const P: &[u32] = &[1, 2, 3];` unsizes)
                 let t = match self.u.tcx.const_ty(&self.u.prog, def) {
                     Some(ct) => self.u.tcx.tys.subst_erasing_regions(ct, &self.b.args.clone()),
-                    None => self.b.ty(e),
+                    None => self.body_ty(e),
                 };
                 let v = self.lower_expr_coerced(e, t);
                 self.store_val(out, 0, t, v);
@@ -1451,7 +1461,7 @@ impl<'a> Lcx<'a> {
             }
             _ => return,
         };
-        let ret = self.b.ret;
+        let ret = self.monomorphize(self.b.ret);
         let rl = self.layout(ret);
         // self param: local 0 when present
         let mut li_self = None;
@@ -1466,10 +1476,10 @@ impl<'a> Lcx<'a> {
         if c_abi {
             let mut ptys = Vec::new();
             if let Some(li) = li_self {
-                ptys.push(self.b.locals[li as usize].ty);
+                ptys.push(self.monomorphize(self.b.locals[li as usize].ty));
             }
             for p in &self.b.param_pats {
-                ptys.push(self.b.pty(*p));
+                ptys.push(self.body_pty(*p));
             }
             let cs = crate::cabi::c_sig(self.u, &ptys, ret, None);
             self.f.cabi = Some(Box::new(cs));
@@ -1496,14 +1506,14 @@ impl<'a> Lcx<'a> {
         }
         let mut param_vals: Vec<(Option<u32>, Option<PatId>, TyId, Vec<VReg>, bool)> = Vec::new();
         if let Some(li) = li_self {
-            let t = self.b.locals[li as usize].ty;
+            let t = self.monomorphize(self.b.locals[li as usize].ty);
             let (regs, by_ptr) = self.abi_param_c(t, c_abi);
             param_vals.push((Some(li), None, t, regs, by_ptr));
         }
         let rust_call = self.u.tcx.fn_sig(&self.u.prog, def).is_some_and(|s| s.header.abi == crate::types::Abi::RustCall);
         let patterns = self.b.param_pats.clone();
         for (index, p) in patterns.iter().enumerate() {
-            let t = self.b.pty(*p);
+            let t = self.body_pty(*p);
             let (regs, by_ptr) = if rust_call && index + 1 == patterns.len() { self.abi_tuple_param(t) } else { self.abi_param_c(t, c_abi) };
             param_vals.push((None, Some(*p), t, regs, by_ptr));
         }
@@ -1569,7 +1579,7 @@ impl<'a> Lcx<'a> {
                 _ => None,
             };
             // a tail of type `!` (`fn f(x: !) -> T { x }`) never produces a value either
-            let never_tail = tail.map_or(false, |x| self.is_never(self.b.ty(x)) && !self.is_never(ret));
+            let never_tail = tail.map_or(false, |x| self.is_never(self.body_ty(x)) && !self.is_never(ret));
             if (tail.is_none() && !self.is_unit(ret)) || never_tail {
                 self.term(Term::Unreachable);
             } else {
@@ -1620,12 +1630,12 @@ impl<'a> Lcx<'a> {
             }
         };
         // the signature's return type (the body may have a type of its own that coerces to it)
-        let ret = match self.kind(self.b.ty(ExprId(ce))) {
+        let ret = match self.kind(self.body_ty(ExprId(ce))) {
             TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => match self.kind(sig) {
                 TyKind::FnPtr(_, r, _, _) => r,
-                _ => self.b.ty(body),
+                _ => self.body_ty(body),
             },
-            _ => self.b.ty(body),
+            _ => self.body_ty(body),
         };
         self.ret_ty = ret;
         let rl = self.layout(ret);
@@ -1648,7 +1658,7 @@ impl<'a> Lcx<'a> {
         // the owner's locals
         let caps = self.storage_for_closure(ce).roots.clone();
         {
-            let ct = self.b.ty(ExprId(ce));
+            let ct = self.body_ty(ExprId(ce));
             let TyKind::Closure(_, _, ca) = self.kind(ct) else { panic!("closure type") };
 
             let env = if self.u.tcx.tys.to_opt_closure_kind(ca.kind_ty()) == Some(relax_types::upvar::ClosureKind::FnOnce) {
@@ -1697,7 +1707,7 @@ impl<'a> Lcx<'a> {
                     // a precise capture owns only its fields: the others are not this
                     // body's to drop
                     if let Some(fs) = self.capture_fields(ce, i) {
-                        let lt = self.b.locals[*li as usize].ty;
+                        let lt = self.monomorphize(self.b.locals[*li as usize].ty);
                         let n = match self.kind(lt) {
                             TyKind::Adt(d, _, _) => self.u.tcx.adts.get(&d).map_or(0, |a| a.variants.first().map_or(0, |v| v.fields.len())),
                             _ => 0,
@@ -1713,7 +1723,7 @@ impl<'a> Lcx<'a> {
         }
         let mut pv = Vec::new();
         for p in ast.list(params) {
-            let t = self.b.pty(p.pat);
+            let t = self.body_pty(p.pat);
             let (regs, by_ptr) = self.abi_param(t);
             pv.push((p.pat, t, regs, by_ptr));
         }
@@ -1741,10 +1751,10 @@ impl<'a> Lcx<'a> {
     /// The coroutine (closure) type of async block / async fn body `ce`.
     fn coroutine_ty(&mut self, ce: u32) -> TyId {
         if ce & crate::tcx::ASYNC_FN_BODY != 0 {
-            let r = self.b.ret;
+            let r = self.monomorphize(self.b.ret);
             self.u.tcx.try_normalize_after_erasing_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), r).expect("codegen normalization")
         } else {
-            self.b.ty(ExprId(ce))
+            self.body_ty(ExprId(ce))
         }
     }
 
@@ -1766,7 +1776,7 @@ impl<'a> Lcx<'a> {
         let caps = self.storage_for_closure(ce).roots.clone();
         let mut vals = Vec::new();
         for (i, li) in caps.iter().enumerate() {
-            let lt = self.b.locals[*li as usize].ty;
+            let lt = self.monomorphize(self.b.locals[*li as usize].ty);
             let pl = self.local_place(*li);
             if self.capture_by_value(ce, i, *li) {
                 let v = self.read_place(&pl, lt);
@@ -1902,7 +1912,7 @@ impl<'a> Lcx<'a> {
             for (i, li) in caps.iter().enumerate() {
                 if self.capture_by_value(ce, i, *li) {
                     if let Some(&(fenv, foff)) = self.capture_flag.get(li) {
-                        let lt = self.b.locals[*li as usize].ty;
+                        let lt = self.monomorphize(self.b.locals[*li as usize].ty);
                         let fl = self.f.vreg(Cls::I);
                         self.emit(Inst::Load(Mem::Int(1, false), fl, fenv, foff));
                         let yes = self.f.block();
@@ -1954,7 +1964,7 @@ impl<'a> Lcx<'a> {
                 return self.unit();
             }
         };
-        let xt = self.b.ty(x);
+        let xt = self.body_ty(x);
         let v = self.lower_expr(x);
         let (itf, fut_t) = {
             let u = self.u;
@@ -2381,7 +2391,7 @@ impl<'a> Lcx<'a> {
                     if !self.active(*attrs) {
                         continue;
                     }
-                    let t = self.b.pty(*pat);
+                    let t = self.body_pty(*pat);
                     // the bound variables belong to this block's scope even when their drop flag is
                     // made later in a nested one (`let y; if c { y = v; }`: y lives to the block end)
                     let mut lis = Vec::new();
@@ -2597,13 +2607,13 @@ impl<'a> Lcx<'a> {
                     self.pos = ast.expr(*e).lo;
                     let v = self.lower_expr(*e);
                     // a block's tail is a coercion site (`&self.v` as `&[T]`, `self` as `&dyn Tr`)
-                    let et = self.b.ty(*e);
+                    let et = self.body_ty(*e);
                     let v = if i == n - 1 && !*semi { self.apply_coercion(*e, v, et) } else { v };
                     if i == n - 1 && !*semi {
                         result = v;
                     } else {
                         // a discarded rvalue that owns resources is dropped here
-                        let et = self.b.ty(*e);
+                        let et = self.body_ty(*e);
                         if !self.is_place_expr(*e) && self.needs_drop_glue(et) {
                             self.drop_val(v, et);
                         } else if self.needs_drop_glue(et) {
@@ -2635,7 +2645,7 @@ impl<'a> Lcx<'a> {
             let is_tail = i + 1 == n && matches!(s, Stmt::Expr(_, false));
             if !is_tail || self.u.prog.files[self.b.file as usize].edition >= 2024 {
                 if is_tail {
-                    result = self.settle_before_temp_drop(result, self.b.ty(match s { Stmt::Expr(e, _) => *e, _ => ExprId(0) }), mark);
+                    result = self.settle_before_temp_drop(result, self.body_ty(match s { Stmt::Expr(e, _) => *e, _ => ExprId(0) }), mark);
                 }
                 self.drop_stmt_temps_from(mark);
             }
@@ -2688,7 +2698,8 @@ impl<'a> Lcx<'a> {
     /// references/pointers, a `Deref::deref` (or `deref_mut` in a mutable context) call
     /// for overloaded steps.
     fn deref_place(&mut self, e: u32, k: usize, pl: Place, pt: TyId) -> (Place, TyId) {
-        if let Some((m, args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
+        if let Some((m, mut args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
+            self.monomorphize_args(&mut args);
             return self.overloaded_deref(m, args, pl, pt);
         }
         let inner = match self.kind(pt) {
@@ -2747,9 +2758,12 @@ impl<'a> Lcx<'a> {
 
     /// `for p in it` over an Iterator: `loop { match it.next() { Some(p) => body, None => break } }`.
     fn lower_for_iterator(&mut self, p: PatId, it: ExprId, b: BlockId, l: Option<(u32, u32)>) {
-        let (next, nargs) = self.b.for_next.get(&it.0).cloned().unwrap();
-        let (into, iargs, iter_t) = self.b.for_into[&it.0].clone();
-        let head_t = self.b.ty(it);
+        let (next, mut nargs) = self.b.for_next.get(&it.0).cloned().unwrap();
+        self.monomorphize_args(&mut nargs);
+        let (into, mut iargs, iter_t) = self.b.for_into[&it.0].clone();
+        self.monomorphize_args(&mut iargs);
+        let iter_t = self.monomorphize(iter_t);
+        let head_t = self.body_ty(it);
         let head_v = self.lower_expr(it);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), into, &iargs);
 
@@ -2847,7 +2861,7 @@ impl<'a> Lcx<'a> {
         // `v[&string]` with `Index<&str>` -- passes the coerced value)
         let it = match args.get(1) {
             Some(&ia) if self.b.coerce.contains_key(&i.0) => ia,
-            _ => self.b.ty(i),
+            _ => self.body_ty(i),
         };
         let iv = self.lower_expr_coerced(i, it);
         self.want_mut = saved;
@@ -2953,7 +2967,7 @@ impl<'a> Lcx<'a> {
         if self.foreign[li as usize] {
             return;
         }
-        let lt = self.b.locals[li as usize].ty;
+        let lt = self.monomorphize(self.b.locals[li as usize].ty);
         if !self.needs_drop_glue(lt) {
             return;
         }
@@ -2963,7 +2977,7 @@ impl<'a> Lcx<'a> {
 
     /// Drop a previous value of a local about to be overwritten (before the write).
     fn drop_local_before_rebind(&mut self, li: u32) {
-        let lt = self.b.locals[li as usize].ty;
+        let lt = self.monomorphize(self.b.locals[li as usize].ty);
         if self.needs_drop_glue(lt) && self.drop_flags[li as usize].is_some() {
             self.drop_local_if_live(li);
         }
@@ -2978,7 +2992,7 @@ impl<'a> Lcx<'a> {
             }
             return;
         }
-        let lt = self.b.locals[li as usize].ty;
+        let lt = self.monomorphize(self.b.locals[li as usize].ty);
         if self.needs_drop_glue(lt) {
             let f = self.flag_of(li);
             self.emit(Inst::Iconst(f, 0));
@@ -2994,7 +3008,7 @@ impl<'a> Lcx<'a> {
             Some(f) => f,
             None => return,
         };
-        let lt = self.b.locals[li as usize].ty;
+        let lt = self.monomorphize(self.b.locals[li as usize].ty);
         let yes = self.f.block();
         let join = self.f.block();
         self.term(Term::Branch(f, yes, join));
@@ -3032,7 +3046,7 @@ impl<'a> Lcx<'a> {
                 let (li, mut p) = self.field_move_path(*x)?;
                 // through a Box only (rustc: `*b` of a Box is a place that can be moved out of;
                 // other derefs are borrows)
-                let mut t = self.b.ty(*x);
+                let mut t = self.body_ty(*x);
                 for _ in 0..derefs {
                     t = self.box_inner(t)?;
                     p.push((BOX_STEP, 0));
@@ -3043,7 +3057,7 @@ impl<'a> Lcx<'a> {
             // `*b` of a Box local: its contents (moving them out leaves the allocation to free)
             ExprKind::Unary(UnOp::Deref, x) => {
                 let (li, mut p) = self.field_move_path(*x)?;
-                self.box_inner(self.b.ty(*x))?;
+                self.box_inner(self.body_ty(*x))?;
                 p.push((BOX_STEP, 0));
                 Some((li, p))
             }
@@ -3610,7 +3624,7 @@ impl<'a> Lcx<'a> {
             // `*b` of a Box: still a place owned by `b` (rustc move_paths/builder.rs: a Deref
             // of a Box is a move path, of a reference / raw pointer none), so the arms' moves
             // out of `match *b` are tracked in `b` and its drop frees the box without them
-            ExprKind::Unary(UnOp::Deref, x) if self.box_inner(self.b.ty(*x)).is_some() => self.place_root_local(*x),
+            ExprKind::Unary(UnOp::Deref, x) if self.box_inner(self.body_ty(*x)).is_some() => self.place_root_local(*x),
             _ => None,
         }
     }
@@ -3677,7 +3691,7 @@ impl<'a> Lcx<'a> {
                     return;
                 }
                 if let Some(&li) = self.b.pat_local.get(&p.0) {
-                    let lt = self.b.locals[li as usize].ty;
+                    let lt = self.monomorphize(self.b.locals[li as usize].ty);
                     let by_ref = *by_ref || self.b.pat_bind_ref.contains_key(&p.0);
                     let v = if by_ref {
                         match place {
@@ -3915,7 +3929,7 @@ impl<'a> Lcx<'a> {
                 let mut moves = false;
                 if !by_ref && !self.b.pat_bind_ref.contains_key(&p.0) && !self.b.pat_res.contains_key(&p.0) {
                     if let Some(&li) = self.b.pat_local.get(&p.0) {
-                        let lt = self.b.locals[li as usize].ty;
+                        let lt = self.monomorphize(self.b.locals[li as usize].ty);
                         moves = self.needs_drop_glue(lt);
                     }
                 }
@@ -4561,7 +4575,8 @@ impl<'a> Lcx<'a> {
             DefKind::Const | DefKind::AssocConst => {
                 // a constant pattern matches structurally, by its value (rustc const_to_pat):
                 // variants, fields and pointees of the evaluated constant, read at compile time
-                let args = self.b.res_args.get(&(p.0 | crate::typeck::PAT_KEY)).cloned().unwrap_or_default();
+                let mut args = self.b.res_args.get(&(p.0 | crate::typeck::PAT_KEY)).cloned().unwrap_or_default();
+                self.monomorphize_args(&mut args);
                 match self.u.const_addr_shared(d, args) {
                     Some(addr) => {
                         let cs = self.u.data_sym(addr);
@@ -4694,7 +4709,7 @@ impl<'a> Lcx<'a> {
                         }
                         None => 0,
                     };
-                    let disc = decode_tag_const(self.u, raw, &l, &adt);
+                    let Some(disc) = decode_tag_const(self.u, raw, &l, &adt) else { return; };
                     match adt.discriminants(&self.u.tcx, &self.u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                         Some(i) => i as u32,
                         None => return,
@@ -4733,9 +4748,11 @@ impl<'a> Lcx<'a> {
 
     /// rustc_ast_lowering/src/expr.rs:1945-2033 @8d1a764.
     fn lower_try(&mut self, e: ExprId, x: ExprId, t: TyId) -> Val {
-        let xt = self.b.ty(x);
+        let xt = self.body_ty(x);
         let v = self.lower_expr(x);
-        let (branch, args, flow) = self.b.try_branch[&e.0].clone();
+        let (branch, mut args, flow) = self.b.try_branch[&e.0].clone();
+        self.monomorphize_args(&mut args);
+        let flow = self.monomorphize(flow);
         let env = crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env.clone(), branch, &args);
         let v = self.emit_instance(instance, vec![(v, xt)], flow);
@@ -4755,7 +4772,8 @@ impl<'a> Lcx<'a> {
         let vi_err = self.variant_index(flow, LangItem::ControlFlowBreak);
         let (ep, et) = self.project(&place, flow, vi_err, 0);
         let ev = self.read_place(&ep, et);
-        let (fd, args) = self.b.try_from_residual[&e.0].clone();
+        let (fd, mut args) = self.b.try_from_residual[&e.0].clone();
+        self.monomorphize_args(&mut args);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env, fd, &args);
         let r = self.emit_instance(instance, vec![(ev, et)], self.ret_ty);
         self.ret_val_early(r, self.ret_ty);
@@ -4786,7 +4804,8 @@ impl<'a> Lcx<'a> {
         if adt.variants.len() <= 1 {
             return;
         }
-        let disc128 = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value();
+        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return; };
+        let disc128 = discr.signed_value();
         let disc = disc128 as i64;
         let tag = match place {
             Place::Mem(b, o) => match self.load_disc(*b, *o, t) {
@@ -4809,7 +4828,10 @@ impl<'a> Lcx<'a> {
                     Some(adt) => {
                         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
                         let cur = self.cur;
-                        emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt)
+                        match emit_decode_tag(self.u, &mut self.f, cur, pos, raw, &l, &adt) {
+                            Some(tag) => tag,
+                            None => return,
+                        }
                     }
                     None => raw,
                 }
@@ -4910,7 +4932,7 @@ impl<'a> Lcx<'a> {
     /// literals, constants, constructors and operations that cannot fail, of a type without
     /// drop glue)?
     fn promotable(&mut self, e: ExprId) -> bool {
-        let t = self.b.ty(e);
+        let t = self.body_ty(e);
         if self.u.tcx.needs_drop(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t) || self.unsized_ty(t) {
             return false;
         }
@@ -4949,7 +4971,7 @@ impl<'a> Lcx<'a> {
     /// Constant promotion: the rvalue `x` stored in static memory, its address (None for an
     /// unsized type).
     fn promote_rvalue(&mut self, x: ExprId, shared: bool) -> Option<VReg> {
-        let xt = self.b.ty(x);
+        let xt = self.body_ty(x);
         if self.unsized_ty(xt) {
             return None;
         }
@@ -5064,7 +5086,7 @@ impl<'a> Lcx<'a> {
                 // a local: drop its old value if it holds one, then it owns the new one
                 if let ExprKind::Path(_) = &self.ast().expr(strip_paren(self.ast(), a)).kind {
                     if let Some(Res::Local(li)) = self.b.res.get(&strip_paren(self.ast(), a).0).copied() {
-                        let lt = self.b.locals[li as usize].ty;
+                        let lt = self.monomorphize(self.b.locals[li as usize].ty);
                         let dynamic = self.unwind_on() && self.nounwind == 0 && self.needs_drop_glue(lt) && self.drop_flags[li as usize].is_some() && !self.foreign[li as usize] && self.u.drop_may_unwind(lt);
                         if dynamic && self.dead_blk != Some(self.cur) {
                             // rustc's drop-and-replace: if dropping the old value panics, the new
@@ -5374,7 +5396,7 @@ impl<'a> Lcx<'a> {
         }
         let pos = ((self.b.file as u64) << 32) | self.pos as u64;
         let cur = self.cur;
-        Some(emit_load_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt))
+        emit_load_disc(self.u, &mut self.f, cur, pos, base, off, &l, &adt)
     }
 
     /// Writes variant `vi`'s discriminant of an enum of type `t` at `base + off`.
@@ -5406,7 +5428,7 @@ impl<'a> Lcx<'a> {
                 // here; the rest is emitted into a dead block with a placeholder of T's shape
                 // (the target may be unknown here -- a block tail passes its own type -- so the
                 // placeholder is memory, which reads as any shape)
-                if self.is_never(self.b.ty(e)) && self.dead_blk != Some(self.cur) {
+                if self.is_never(self.body_ty(e)) && self.dead_blk != Some(self.cur) {
                     self.term(Term::Unreachable);
                     self.dead();
                     let a = if self.is_never(target) {
@@ -5424,7 +5446,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::Unsize) => {
                 // [T; N] -> [T] behind a pointer (&, *const/*mut) or a smart pointer (Box, Rc, ..):
                 // the thin pointer gets the length N
-                let src = self.b.ty(e);
+                let src = self.body_ty(e);
                 let len = match (self.kind(src), self.kind(target)) {
                     (TyKind::Ref(_, a, _) | TyKind::Ptr(_, a), TyKind::Ref(_, b, _) | TyKind::Ptr(_, b)) => self.unsize_len(a, b),
                     // Box<[T; N]> / Box<S<[T; N]>> -> Box<[T]> / Box<S<[T]>>
@@ -5443,8 +5465,10 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![p[0], l])
             }
             Some(Coerce::ToDyn(src, dy)) => {
+                let src = self.monomorphize(src);
+                let dy = self.monomorphize(dy);
                 // thin pointer (alone in its wrapper) -> (data, vtable)
-                let st = self.b.ty(e);
+                let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
                 if p.len() != 1 {
                     self.err(self.pos, "unsizing to `dyn` needs a single-pointer value".to_string());
@@ -5463,8 +5487,10 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![p[0], vt])
             }
             Some(Coerce::Upcast(sd, dd)) => {
+                let sd = self.monomorphize(sd);
+                let dd = self.monomorphize(dd);
                 // (data, vtable of Sub) -> (data, Sub's stored vtable for Super)
-                let st = self.b.ty(e);
+                let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
                 if p.len() != 2 {
                     self.err(self.pos, "internal: trait object upcast of a value without a vtable -- Relax bug, report it".to_string());
@@ -5477,7 +5503,7 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![p[0], vt])
             }
             Some(Coerce::DerefRef(n)) => {
-                let st = self.b.ty(e);
+                let st = self.body_ty(e);
                 let (inner, m) = match self.kind(st) {
                     TyKind::Ref(m, i, _) => (i, m),
                     _ => return v,
@@ -5505,7 +5531,7 @@ impl<'a> Lcx<'a> {
                 }
             }
             Some(Coerce::ReifyFn) => {
-                let t = self.b.ty(e);
+                let t = self.body_ty(e);
                 if let TyKind::FnDef(d, args, _) = self.kind(t) {
                     // `<T as Trait>::method` as a value: the impl's method (or the default body)
                     let r = self.fn_item_addr(d, args);
@@ -5516,7 +5542,7 @@ impl<'a> Lcx<'a> {
             Some(Coerce::UnsafeFn) => v,
             Some(Coerce::ClosureFn) => {
                 // rustc_codegen_ssa/src/mir/rvalue.rs:536-550.
-                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, self.b.ty(e), relax_types::upvar::ClosureKind::FnOnce);
+                let instance = Instance::resolve_closure(&self.u.tcx, &self.u.prog, self.body_ty(e), relax_types::upvar::ClosureKind::FnOnce);
                 let id = self.u.instance_fn_id(instance);
                 let r = self.f.vreg(Cls::I);
                 self.emit(Inst::FnAddr(r, id));
@@ -5534,7 +5560,7 @@ impl<'a> Lcx<'a> {
                 _ => break,
             }
         }
-        let t = self.b.ty(ce);
+        let t = self.body_ty(ce);
         self.closure_fn_of(t)
     }
 
@@ -5562,7 +5588,7 @@ impl<'a> Lcx<'a> {
         let ex = ast.expr(e);
         let save_pos = self.pos;
         self.pos = ex.lo;
-        let t = self.b.ty(e);
+        let t = self.body_ty(e);
         let v = self.lower_expr_inner(e, t);
         self.pos = save_pos;
         v
@@ -5577,8 +5603,8 @@ impl<'a> Lcx<'a> {
         let ex = ast.expr(e);
         // Two-word integer operations need both halves of every operand.
         let wide = match &ex.kind {
-            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.b.ty(*a)) || self.is_wide(self.b.ty(*b)),
-            ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.b.ty(*x)) || self.is_wide(t),
+            ExprKind::Binary(_, a, b) | ExprKind::AssignOp(_, a, b) => self.is_wide(self.body_ty(*a)) || self.is_wide(self.body_ty(*b)),
+            ExprKind::Unary(UnOp::Neg | UnOp::Not, x) | ExprKind::Cast(x, _) => self.is_wide(self.body_ty(*x)) || self.is_wide(t),
             _ => false,
         };
         if wide {
@@ -5590,7 +5616,7 @@ impl<'a> Lcx<'a> {
             ExprKind::Path(_) => match self.b.res.get(&e.0).copied() {
                 Some(Res::Local(li)) => {
                     let pl = self.local_place(li);
-                    let lt = self.b.locals[li as usize].ty;
+                    let lt = self.monomorphize(self.b.locals[li as usize].ty);
                     let v = self.read_place(&pl, lt);
                     self.moved_local(li);
                     v
@@ -5614,15 +5640,16 @@ impl<'a> Lcx<'a> {
             },
             ExprKind::Unary(UnOp::Not | UnOp::Neg, x) if self.b.binops.contains_key(&e.0) => {
                 // operator trait call: Not::not(x) / Neg::neg(x)
-                let m = self.b.binops[&e.0].clone();
-                let xt = self.b.ty(*x);
+                let mut m = self.b.binops[&e.0].clone();
+                self.monomorphize_args(&mut m.args);
+                let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
 
                 self.emit_instance(instance, vec![(v, xt)], t)
             }
             ExprKind::Unary(op, x) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 match op {
                     // `*x` on a Deref type is `*Deref::deref(&x)` (Reference expressions/
                     // operator-expr.md dereference operator): read through the place
@@ -5702,10 +5729,11 @@ impl<'a> Lcx<'a> {
                 }
             }
             ExprKind::Binary(op, a, b) => {
-                if let Some(m) = self.b.binops.get(&e.0).cloned() {
+                if let Some(mut m) = self.b.binops.get(&e.0).cloned() {
+                    self.monomorphize_args(&mut m.args);
                     // operator trait call: Op::op(a, b); comparisons take both by reference
-                    let at = self.b.ty(*a);
-                    let bt = self.b.ty(*b);
+                    let at = self.body_ty(*a);
+                    let bt = self.body_ty(*b);
                     if m.autoref == 1 {
                         return self.lower_cmp_call(*a, *b, m.def, &m.args, t);
                     }
@@ -5724,25 +5752,26 @@ impl<'a> Lcx<'a> {
                     // destructuring assignment (rustc desugars `(a, b) = e` to
                     // `{ let (x, y) = e; a = x; b = y; }`): the value first, then each part is
                     // assigned left to right; parts matched by `_` / `..` drop with the value
-                    let bt = self.b.ty(*b);
+                    let bt = self.body_ty(*b);
                     let v = self.lower_expr(*b);
                     let pl = self.val_to_place(v);
                     self.assign_parts(*a, &pl, bt);
                     return self.unit();
                 }
-                let at = self.b.ty(*a);
+                let at = self.body_ty(*a);
                 let v = self.lower_expr_coerced(*b, at);
                 self.assign_to(*a, v);
                 self.unit()
             }
             ExprKind::AssignOp(_, a, b) if self.b.binops.contains_key(&e.0) => {
                 // `a op= b` through <A as OpAssign<B>>::op_assign(&mut a, b)
-                let m = self.b.binops[&e.0].clone();
+                let mut m = self.b.binops[&e.0].clone();
+                self.monomorphize_args(&mut m.args);
                 self.want_mut = true;
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
                 let addr = self.place_addr(&pl, pt);
-                let bt = self.b.ty(*b);
+                let bt = self.body_ty(*b);
                 let bt = m.args.get(1).copied().unwrap_or(bt);
                 let bv = self.lower_expr_coerced(*b, bt);
                 let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
@@ -5754,7 +5783,7 @@ impl<'a> Lcx<'a> {
             ExprKind::AssignOp(op, a, b) => {
                 // primitive `place op= v`: v first, then the place (rustc: right-to-left for
                 // built-in compound assignment; the overloaded form above is left-to-right).
-                let bt = self.b.ty(*b);
+                let bt = self.body_ty(*b);
                 let rv = self.lower_expr(*b);
                 let (rv, bt) = self.prim_leaves(rv, bt);
                 self.want_mut = true;
@@ -5767,7 +5796,7 @@ impl<'a> Lcx<'a> {
                 self.unit()
             }
             ExprKind::Cast(x, _) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 if let Some(Coerce::ToDyn(..) | Coerce::Upcast(..) | Coerce::Unsize | Coerce::DerefRef(_) | Coerce::ReifyFn | Coerce::ClosureFn | Coerce::UnsafeFn | Coerce::RefToRaw(_)) = self.b.coerce.get(&x.0) {
                     return self.lower_expr_coerced(*x, t);
                 }
@@ -5806,7 +5835,7 @@ impl<'a> Lcx<'a> {
             ExprKind::If(c, then, els) => self.lower_if(*c, *then, *els, t),
             ExprKind::Let(p, x) => {
                 // only reached as a bare condition (`if let` handles its own); evaluate as a test
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 let place = self.val_to_place(v);
                 let res = self.f.vreg(Cls::I);
@@ -6122,7 +6151,7 @@ impl<'a> Lcx<'a> {
                 let mut vals = Vec::new();
                 let _ = is_move;
                 for (i, li) in caps.into_iter().enumerate() {
-                    let lt = self.b.locals[li as usize].ty;
+                    let lt = self.monomorphize(self.b.locals[li as usize].ty);
                     let pl = self.local_place(li);
                     // by value (a `move` closure, or the body consumes it): moved into the
                     // closure, the enclosing fn no longer drops it (rustc upvar.rs ByValue)
@@ -6340,7 +6369,8 @@ impl<'a> Lcx<'a> {
         let k = self.u.prog.def(d).kind;
         match k {
             DefKind::Const | DefKind::AssocConst => {
-                let args = self.b.res_args.get(&e.0).cloned().unwrap_or_default();
+                let mut args = self.b.res_args.get(&e.0).cloned().unwrap_or_default();
+                self.monomorphize_args(&mut args);
                 self.const_val(d, args, t)
             }
             DefKind::Static => {
@@ -6462,7 +6492,8 @@ impl<'a> Lcx<'a> {
             return self.build_record(t, 0, vals);
         }
         let l = self.layout(t);
-        let disc128 = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value();
+        let Some(discr) = adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi) else { return self.unit(); };
+        let disc128 = discr.signed_value();
         let disc = disc128 as i64;
         if l.tag == Some((0, l.leaves.as_ref().and_then(|v| v.first()).map_or(Mem::Int(0, false), |x| x.mem))) && l.enc == crate::layout::TagEnc::Direct && l.leaves.as_ref().map_or(false, |v| v.len() == 1) {
             // fieldless enum: the tag itself
@@ -6628,12 +6659,12 @@ impl<'a> Lcx<'a> {
     pub fn lower_place(&mut self, e: ExprId) -> (Place, TyId) {
         let ast = self.ast();
         let ex = ast.expr(e);
-        let t = self.b.ty(e);
+        let t = self.body_ty(e);
         match &ex.kind {
             ExprKind::Paren(x) => self.lower_place(*x),
             ExprKind::Path(_) => match self.b.res.get(&e.0).copied() {
                 Some(Res::Local(li)) => {
-                    let lt = self.b.locals[li as usize].ty;
+                    let lt = self.monomorphize(self.b.locals[li as usize].ty);
                     (self.local_place(li), lt)
                 }
                 Some(Res::Def(d)) if self.u.prog.def(d).kind == DefKind::Static => {
@@ -6671,7 +6702,7 @@ impl<'a> Lcx<'a> {
                 self.deref_place(e.0, 0, pl, pt)
             }
             ExprKind::Unary(UnOp::Deref, x) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 let saved = std::mem::replace(&mut self.want_mut, false);
                 let p = self.lower_expr(*x);
                 self.want_mut = saved;
@@ -6711,7 +6742,8 @@ impl<'a> Lcx<'a> {
                     pl = a2;
                     pt = b2;
                 }
-                if let Some((m, args)) = self.b.ov_index.get(&e.0).cloned() {
+                if let Some((m, mut args)) = self.b.ov_index.get(&e.0).cloned() {
+                    self.monomorphize_args(&mut args);
                     // the call's location is the brackets (rustc, issue 114388: `x\n[0]` is at
                     // `[0]`): the `[` between the base and the index operand
                     let (alo, ilo) = (self.ast().expr(*a).hi, self.ast().expr(*i).lo);
@@ -6721,7 +6753,7 @@ impl<'a> Lcx<'a> {
                     }
                     return self.overloaded_index(m, args, pl, pt, *i, t);
                 }
-                let it = self.b.ty(*i);
+                let it = self.body_ty(*i);
                 let iv = self.lower_expr(*i);
                 let iv = self.to_leaves(iv, it);
                 let (elem, base, len) = match self.kind(pt) {
@@ -6788,7 +6820,7 @@ impl<'a> Lcx<'a> {
         if self.b.ov_index.contains_key(&e.0) {
             return false;
         }
-        match self.kind(self.b.ty(i)) {
+        match self.kind(self.body_ty(i)) {
             TyKind::Adt(d, _, _) => matches!(self.u.tcx.lang_items.by_def.get(&d), Some(LangItem::Range | LangItem::RangeFrom | LangItem::RangeTo | LangItem::RangeFull | LangItem::RangeInclusiveStruct | LangItem::RangeToInclusive)),
             _ => false,
         }
@@ -6811,7 +6843,7 @@ impl<'a> Lcx<'a> {
 
     fn lower_slice_range(&mut self, e: ExprId, a: ExprId, i: ExprId, t: TyId) -> Val {
         // base[lo..hi] -> fat pointer
-        let at = self.b.ty(a);
+        let at = self.body_ty(a);
         let (mut pl, mut pt) = self.lower_place(a);
         // autoderef recorded by type checking (Vec<T> -> [T], String -> str, &&[T] ..)
         let derefs = self.b.index_derefs.get(&e.0).copied().unwrap_or(0);
@@ -6847,7 +6879,7 @@ impl<'a> Lcx<'a> {
             },
             _ => return self.unit(),
         };
-        let it = self.b.ty(i);
+        let it = self.body_ty(i);
         let rv = self.lower_expr(i);
         let rv = self.to_leaves(rv, it);
         let item = match self.kind(it) {
@@ -6918,8 +6950,8 @@ impl<'a> Lcx<'a> {
 
     /// Comparison operators borrow both operands, including unsized places.
     fn lower_cmp_call(&mut self, a: ExprId, b: ExprId, method: DefId, args: &[TyId], t: TyId) -> Val {
-        let at = self.b.ty(a);
-        let bt = self.b.ty(b);
+        let at = self.body_ty(a);
+        let bt = self.body_ty(b);
         let (pa, ta) = self.lower_place(a);
         let ra = self.ref_to_place(&pa, ta);
         let (pb, tb) = self.lower_place(b);
@@ -6940,7 +6972,7 @@ impl<'a> Lcx<'a> {
                 // both operands of a lazy boolean operator are terminating scopes (rustc
                 // region.rs resolve_expr): their temporaries drop right after the operand, so a
                 // skipped right-hand side never drops temporaries it did not create
-                let at = self.b.ty(a);
+                let at = self.body_ty(a);
                 let mark = self.stmt_temps.len();
                 let av = self.lower_expr(a);
                 let av = self.to_leaves(av, at);
@@ -6957,7 +6989,7 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::Iconst(res, if op == BinOp::And { 0 } else { 1 }));
                 self.goto(join);
                 self.switch(rhs);
-                let bt = self.b.ty(b);
+                let bt = self.body_ty(b);
                 let mark = self.stmt_temps.len();
                 let bv = self.lower_expr(b);
                 let bv = self.to_leaves(bv, bt);
@@ -6973,7 +7005,7 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![res])
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let at = self.b.ty(a);
+                let at = self.body_ty(a);
                 if self.trait_ordering(op, at) {
                     // A concrete non-primitive operand still needs PartialOrd when no
                     // operator resolution was recorded on the typed body.
@@ -6990,7 +7022,7 @@ impl<'a> Lcx<'a> {
                         self.err(self.pos, format!("missing PartialOrd::{}", name));
                         return self.dummy_val(t);
                     };
-                    return self.lower_cmp_call(a, b, method, &[at, self.b.ty(b)], t);
+                    return self.lower_cmp_call(a, b, method, &[at, self.body_ty(b)], t);
                 }
                 let av = self.lower_expr(a);
                 // (`fn_ptr == fn_item`: the rhs reified to the lhs pointer type)
@@ -6998,7 +7030,7 @@ impl<'a> Lcx<'a> {
                 // `&a < &b` on primitives compares the values
                 let (av, bv, at) = match self.kind(at) {
                     TyKind::Ref(_, inner, _) if matches!(self.kind_ref(inner), TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ref(..) | TyKind::FnPtr(..)) => {
-                        let bt = self.b.ty(b);
+                        let bt = self.body_ty(b);
                         let (x, xt) = self.prim_leaves(av, at);
                         let (y, _) = self.prim_leaves(bv, bt);
                         if matches!(self.kind_ref(xt), TyKind::Ref(..)) {
@@ -7089,8 +7121,8 @@ impl<'a> Lcx<'a> {
                 }
             }
             _ => {
-                let at = self.b.ty(a);
-                let bt = self.b.ty(b);
+                let at = self.body_ty(a);
+                let bt = self.body_ty(b);
                 let av = self.lower_expr(a);
                 let (av, _) = self.prim_leaves(av, at);
                 let bv = self.lower_expr(b);
@@ -7466,17 +7498,17 @@ impl<'a> Lcx<'a> {
         let ex = ast.expr(e);
         match &ex.kind {
             ExprKind::Binary(op, a, b) if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) => {
-                let at = self.b.ty(*a);
+                let at = self.body_ty(*a);
                 let signed = self.wide_signed(at) || (!self.is_wide(at) && self.int_ty(at).signed);
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
-                let bt = self.b.ty(*b);
+                let bt = self.body_ty(*b);
                 let bv = self.lower_expr(*b);
                 let y = self.wide_parts(bv, bt);
                 Val::L(vec![self.wide_cmp(*op, signed, x, y)])
             }
             ExprKind::Binary(op, a, b) => {
-                let (at, bt) = (self.b.ty(*a), self.b.ty(*b));
+                let (at, bt) = (self.body_ty(*a), self.body_ty(*b));
                 let av = self.lower_expr(*a);
                 let x = self.wide_parts(av, at);
                 let bv = self.lower_expr(*b);
@@ -7495,7 +7527,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::AssignOp(op, a, b) => {
                 // the value first, then the place (built-in compound assignment)
-                let bt = self.b.ty(*b);
+                let bt = self.body_ty(*b);
                 let bv = self.lower_expr(*b);
                 let y = self.wide_parts(bv, bt);
                 self.want_mut = true;
@@ -7516,7 +7548,7 @@ impl<'a> Lcx<'a> {
                 self.unit()
             }
             ExprKind::Unary(UnOp::Neg, x) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 let p = self.wide_parts(v, xt);
                 let z = (self.iconst(0), self.iconst(0));
@@ -7529,14 +7561,14 @@ impl<'a> Lcx<'a> {
                 Val::L(vec![lo, hi])
             }
             ExprKind::Unary(UnOp::Not, x) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 let p = self.wide_parts(v, xt);
                 let m = self.iconst(-1);
                 Val::L(vec![self.ibin(IOp::Xor, false, p.0, m), self.ibin(IOp::Xor, false, p.1, m)])
             }
             ExprKind::Cast(x, _) => {
-                let xt = self.b.ty(*x);
+                let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 if matches!(self.kind(xt), TyKind::Adt(..)) { return self.cast(v, xt, t); }
                 match (self.is_wide(xt), self.kind(t)) {
@@ -8027,7 +8059,7 @@ impl<'a> Lcx<'a> {
                 // a condition is a terminating scope: its temporaries (`c.borrow().len() == 0`)
                 // are dropped before either branch runs
                 let mark = self.stmt_temps.len();
-                let ct = self.b.ty(c);
+                let ct = self.body_ty(c);
                 let rescope = self.cond_rescope.take();
                 let v = self.lower_expr(c);
                 self.cond_rescope = rescope;
@@ -8096,7 +8128,7 @@ impl<'a> Lcx<'a> {
     /// elaborate_drop.rs open_drop_for_adt / drop_ladder: per-field move paths, the fields that
     /// remain dropped in declaration order).
     fn lower_rvalue_proj(&mut self, root: ExprId, path: &[(u32, u32)]) -> (VReg, TyId, VReg, Place, TyId) {
-        let rt = self.b.ty(root);
+        let rt = self.body_ty(root);
         // an rvalue: its own subexpressions are not part of the place (want_mut ends)
         let saved = std::mem::replace(&mut self.want_mut, false);
         let v = self.lower_expr(root);
@@ -8123,7 +8155,7 @@ impl<'a> Lcx<'a> {
         if self.is_place_expr(x) {
             return false;
         }
-        match self.box_inner(self.b.ty(x)) {
+        match self.box_inner(self.body_ty(x)) {
             Some(inner) => self.needs_drop_glue(inner),
             None => false,
         }
@@ -8274,7 +8306,7 @@ impl<'a> Lcx<'a> {
     /// (MatchRoot::Temp) also the temporary for the caller to register (its address and type)
     /// and the scrutinee's field path in it.
     fn scrutinee(&mut self, x: ExprId) -> (Place, TyId, Option<MatchRoot>, Option<ScrutTemp>) {
-        let xt = self.b.ty(x);
+        let xt = self.body_ty(x);
         // `*tmp_box` of a temporary Box is the owned contents (temp_box_deref), not a place:
         // what the arms move out of it is tracked like any rvalue scrutinee
         let owned_deref = matches!(self.ast().expr(x).kind, ExprKind::Unary(UnOp::Deref, b) if self.temp_box_deref(b));
@@ -8285,7 +8317,7 @@ impl<'a> Lcx<'a> {
             // live to the end of the enclosing statement); what the arms move out of it is not
             // dropped with it
             if let Some((r, path)) = self.rvalue_proj(x) {
-                if self.needs_drop_glue(self.b.ty(r)) {
+                if self.needs_drop_glue(self.body_ty(r)) {
                     let (a, rt, f, pl, pt) = self.lower_rvalue_proj(r, &path);
                     return (pl, pt, Some(MatchRoot::Temp(f)), Some(ScrutTemp { addr: a, ty: rt, path }));
                 }
@@ -8408,7 +8440,7 @@ impl<'a> Lcx<'a> {
                     self.local_place(*li);
                     // the pattern's bindings belong to the arm scope (registered before the
                     // guard's scope is pushed)
-                    let lt = self.b.locals[*li as usize].ty;
+                    let lt = self.monomorphize(self.b.locals[*li as usize].ty);
                     if self.needs_drop_glue(lt) && !self.foreign[*li as usize] {
                         self.flag_of(*li);
                     }
@@ -8740,7 +8772,7 @@ impl<'a> Lcx<'a> {
     }
 
     fn lower_call(&mut self, e: ExprId, f: ExprId, args: &[ExprId], t: TyId) -> Val {
-        let mut ft = self.b.ty(f);
+        let mut ft = self.body_ty(f);
         // `#[rustc_legacy_const_generics]` arguments are const generic args, not values
         let legacy_kept: Vec<ExprId>;
         let args: &[ExprId] = match self.b.legacy_args.get(&e.0) {
@@ -8754,11 +8786,11 @@ impl<'a> Lcx<'a> {
         // the generic body's selected trait, resolved with the instance's args.
         if let Some(selected) = self.b.call_traits.get(&e.0).copied().filter(|s|
             matches!(self.u.tcx.lang_items.by_def.get(&s.trait_def), Some(LangItem::Fn | LangItem::FnMut | LangItem::FnOnce | LangItem::AsyncFn | LangItem::AsyncFnMut | LangItem::AsyncFnOnce))) {
-            let tuple = selected.tupled_args;
+            let tuple = self.monomorphize(selected.tupled_args);
             let TyKind::Tuple(params) = self.kind(tuple) else { panic!("call arguments are not a tuple") };
             let method = self.u.prog.traits[self.u.prog.def(selected.trait_def).sub as usize].iter().copied()
                 .find(|d| self.u.prog.def(*d).kind == DefKind::AssocFn).expect("call trait method");
-            let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), method, &[selected.self_ty, tuple]);
+            let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), method, &[self.monomorphize(selected.self_ty), tuple]);
             {
                 let once = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnOnce | LangItem::AsyncFnOnce));
                 let mutable = matches!(self.u.tcx.lang_items.by_def.get(&selected.trait_def), Some(LangItem::FnMut | LangItem::AsyncFnMut));
@@ -8810,7 +8842,7 @@ impl<'a> Lcx<'a> {
                         let mut vals = Vec::new();
                         let mut guards = Vec::new();
                         for (i, a) in args.iter().enumerate() {
-                            let p = ps.get(i).copied().unwrap_or_else(|| self.b.ty(*a));
+                            let p = ps.get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                             let v = self.lower_expr_coerced(*a, p);
                             let v = self.guard_operand(&args[i + 1..], v, p, &mut guards);
                             vals.push((v, p));
@@ -8844,7 +8876,7 @@ impl<'a> Lcx<'a> {
                 let mut vals = Vec::new();
                 let mut guards = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let pt = ps.get(i).copied().unwrap_or_else(|| self.b.ty(*a));
+                    let pt = ps.get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                     let v = self.lower_expr_coerced(*a, pt);
                     let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
                     vals.push((v, pt));
@@ -8867,7 +8899,7 @@ impl<'a> Lcx<'a> {
                     let pt = if i < sig.params.len() {
                         { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i], &gargs); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
                     } else {
-                        self.b.ty(*a)
+                        self.body_ty(*a)
                     };
                     let v = self.lower_expr_coerced(*a, pt);
                     let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
@@ -8884,7 +8916,7 @@ impl<'a> Lcx<'a> {
                 let mut vals = Vec::new();
                 let mut guards = Vec::new();
                 for (i, a) in args.iter().enumerate() {
-                    let pt = ps.get(i).copied().unwrap_or_else(|| self.b.ty(*a));
+                    let pt = ps.get(i).copied().unwrap_or_else(|| self.body_ty(*a));
                     let v = self.lower_expr_coerced(*a, pt);
                     let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
                     vals.push((v, pt));
@@ -8909,10 +8941,11 @@ impl<'a> Lcx<'a> {
     }
 
     fn lower_method(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], t: TyId) -> Val {
-        let m = match self.b.methods.get(&e.0) {
+        let mut m = match self.b.methods.get(&e.0) {
             Some(m) => m.clone(),
             None => return self.unit(),
         };
+        self.monomorphize_args(&mut m.args);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
         let virt = matches!(instance.def, InstanceKind::Virtual(..));
         let sig = match self.u.tcx.fn_sig(&self.u.prog, m.def).cloned() {
@@ -8921,7 +8954,7 @@ impl<'a> Lcx<'a> {
         };
         let self_pt = { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[0], &m.args); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) };
         // receiver with derefs, then autoref
-        let rt = self.b.ty(recv);
+        let rt = self.body_ty(recv);
         let recv_val = if m.autoref != 0 {
             // `make().method()`: lower_place makes the rvalue a statement temporary
             // a `&mut self` receiver makes the whole place mutable: overloaded derefs/indexes
@@ -9003,7 +9036,7 @@ impl<'a> Lcx<'a> {
             let pt = if i + 1 < sig.params.len() {
                 { let x = self.u.tcx.tys.subst_erasing_regions(sig.params[i + 1], &m.args); let u = self.u; u.tcx.normalize_erasing_late_bound_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), x) }
             } else {
-                self.b.ty(*a)
+                self.body_ty(*a)
             };
             let v = self.lower_expr_coerced(*a, pt);
             let v = self.guard_operand(&args[i + 1..], v, pt, &mut guards);
@@ -10159,7 +10192,7 @@ impl<'a> Lcx<'a> {
             "assert_eq" | "assert_ne" => {
                 let a = mexprs[0];
                 let b2 = mexprs[1];
-                let at = self.b.ty(a);
+                let at = self.body_ty(a);
                 let av = self.lower_expr(a);
                 let bv = self.lower_expr(b2);
                 // compare through references
@@ -10221,7 +10254,7 @@ impl<'a> Lcx<'a> {
             }
             "matches" => {
                 let x = mexprs[0];
-                let xt = self.b.ty(x);
+                let xt = self.body_ty(x);
                 let v = self.lower_expr(x);
                 let place = self.val_to_place(v);
                 let res = self.f.vreg(Cls::I);
@@ -10363,7 +10396,7 @@ impl<'a> Lcx<'a> {
         let text = self.src_text(fe.lo, fe.hi);
         if !matches!(fe.kind, ExprKind::Lit(LitKind::Str) | ExprKind::Lit(LitKind::RawStr)) {
             // panic!(value) with a non-literal (2018 style): format it with Display
-            let t = self.b.ty(exprs[0]);
+            let t = self.body_ty(exprs[0]);
             let v = self.lower_expr(exprs[0]);
             self.fmt_value(v, t, 0);
             return;
@@ -10373,7 +10406,7 @@ impl<'a> Lcx<'a> {
         // evaluate positional args once, in order
         let mut argv = Vec::new();
         for x in &exprs[1..] {
-            let t = self.b.ty(*x);
+            let t = self.body_ty(*x);
             argv.push((self.lower_expr(*x), t));
         }
         let mut next = 0usize;
@@ -10387,7 +10420,7 @@ impl<'a> Lcx<'a> {
                             match self.b.fmt_named.get(&(e.0, sy)).copied() {
                                 Some(Res::Local(li)) => {
                                     let pl = self.local_place(li);
-                                    let lt = self.b.locals[li as usize].ty;
+                                    let lt = self.monomorphize(self.b.locals[li as usize].ty);
                                     (self.read_place(&pl, lt), lt)
                                 }
                                 Some(Res::Def(d)) => {
@@ -10738,7 +10771,10 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
                 let sig = crate::cabi::c_sig(u, &[u.tcx.tys.usize_], u.tcx.tys.unit, None);
                 push(&mut f, cur, Inst::Call(Callee::CHost(addr, Box::new(sig)), vec![p], Vec::new()));
             }
-            None => drop_glue_body(u, &mut f, &mut cur, p, t),
+            // Like rustc's DropGlue(_, None), even an explicitly requested shim is
+            // empty when no cleanup is needed. In particular, do not read an empty enum's tag.
+            None if u.needs_drop_glue(t) => drop_glue_body(u, &mut f, &mut cur, p, t),
+            None => {}
         }
     }
     f.blocks[cur as usize].term = Term::Ret(Vec::new());
@@ -10832,20 +10868,22 @@ fn push_at(f: &mut Func, b: u32, pos: u64, i: Inst) {
 }
 
 /// Variant `vi`'s discriminant value.
-pub fn variant_disc(u: &Unit, adt: &crate::tcx::AdtT, vi: u32) -> i64 {
-    adt.discriminant_for_variant(&u.tcx, &u.prog, vi).signed_value() as i64
+pub fn variant_disc(u: &Unit, adt: &crate::tcx::AdtT, vi: u32) -> Option<i64> {
+    Some(adt.discriminant_for_variant(&u.tcx, &u.prog, vi)?.signed_value() as i64)
 }
 
 /// The discriminant from the tag field's value `raw` (loaded with the tag's Mem): Direct tags
 /// hold it; a niche encoding maps tag values to variants (rustc_codegen_ssa codegen_get_discr:
 /// relative = tag - niche_start, in the niche variants' range when relative <= hi - lo).
-pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT) -> Vec<VReg> {
+/// Uninhabited layouts have no discriminant.
+pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>, l: &Layout, adt: &crate::tcx::AdtT) -> Option<Vec<VReg>> {
     use crate::layout::TagEnc;
-    match l.enc {
+    if l.uninhabited { return None; }
+    Some(match l.enc {
         TagEnc::Direct => raw,
         TagEnc::Single(v) => {
             let d = f.vreg(Cls::I);
-            let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v);
+            let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, v)?;
             push_at(f, b, pos, Inst::Iconst(d, discr.signed_value() as i64));
             if crate::types::Types::int_info(discr.ty).0 == 16 {
                 let hi = f.vreg(Cls::I);
@@ -10878,13 +10916,13 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
             } else {
                 push_at(f, b, pos, Inst::IBinI(IOp::Add, U64, vidx, rel, lo as i64));
             }
-            let by_index = (0..adt.variants.len() as u32).all(|v| variant_disc(u, adt, v) == v as i64);
+            let by_index = (0..adt.variants.len() as u32).all(|v| variant_disc(u, adt, v) == Some(v as i64));
             let ud = f.vreg(Cls::I);
-            push_at(f, b, pos, Inst::Iconst(ud, if by_index { untagged as i64 } else { variant_disc(u, adt, untagged) }));
+            push_at(f, b, pos, Inst::Iconst(ud, if by_index { untagged as i64 } else { variant_disc(u, adt, untagged)? }));
             if by_index {
                 let d = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Sel(d, inr, vidx, ud));
-                return vec![d];
+                return Some(vec![d]);
             }
             // general discriminants: the niche variant's, else the untagged one's
             let mut d = ud;
@@ -10897,18 +10935,19 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
                 let c2 = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::IBin(IOp::And, U64, c2, c, inr));
                 let k = f.vreg(Cls::I);
-                push_at(f, b, pos, Inst::Iconst(k, variant_disc(u, adt, v)));
+                push_at(f, b, pos, Inst::Iconst(k, variant_disc(u, adt, v)?));
                 let nd = f.vreg(Cls::I);
                 push_at(f, b, pos, Inst::Sel(nd, c2, k, d));
                 d = nd;
             }
             vec![d]
         }
-    }
+    })
 }
 
 /// The discriminant of the enum at `p + off` (layout `l`).
-pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT) -> Vec<VReg> {
+pub fn emit_load_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i32, l: &Layout, adt: &crate::tcx::AdtT) -> Option<Vec<VReg>> {
+    if l.uninhabited { return None; }
     let mut raw = Vec::new();
     if let Some((toff, tmem)) = l.tag {
         let r = f.vreg(Cls::I);
@@ -10934,7 +10973,10 @@ pub fn emit_store_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i
         None => return,
     };
     let v = match l.enc {
-        TagEnc::Direct => adt.discriminant_for_variant(&u.tcx, &u.prog, vi).val,
+        TagEnc::Direct => match adt.discriminant_for_variant(&u.tcx, &u.prog, vi) {
+            Some(discr) => discr.val,
+            None => return,
+        },
         TagEnc::Single(_) => return,
         TagEnc::Niche { untagged, lo, start, .. } => {
             if vi == untagged {
@@ -10955,11 +10997,12 @@ pub fn emit_store_disc(u: &Unit, f: &mut Func, b: u32, pos: u64, p: VReg, off: i
 
 /// The discriminant of a constant's enum value whose tag field reads `raw` (sign-extended
 /// per the tag's Mem).
-pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT) -> i128 {
+pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT) -> Option<i128> {
     use crate::layout::TagEnc;
-    match l.enc {
+    if l.uninhabited { return None; }
+    Some(match l.enc {
         TagEnc::Direct => crate::tcx::Discr { val: raw as u128, ty: adt.repr_int.unwrap_or(Prim::Isize) }.signed_value(),
-        TagEnc::Single(v) => adt.discriminant_for_variant(&u.tcx, &u.prog, v).signed_value(),
+        TagEnc::Single(v) => adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value(),
         TagEnc::Niche { untagged, lo, hi, start } => {
             let bytes = match l.tag {
                 Some((_, Mem::Int(n, _))) => n as u32,
@@ -10968,9 +11011,9 @@ pub fn decode_tag_const(u: &Unit, raw: i128, l: &Layout, adt: &crate::tcx::AdtT)
             let m: u128 = if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 };
             let rel = (raw as u128).wrapping_sub(start) & m;
             let v = if rel <= (hi - lo) as u128 { lo + rel as u32 } else { untagged };
-            adt.discriminant_for_variant(&u.tcx, &u.prog, v).signed_value()
+            adt.discriminant_for_variant(&u.tcx, &u.prog, v)?.signed_value()
         }
-    }
+    })
 }
 
 /// A live-editable struct's extension (M10, hotreload.md section 13): the ext word's offset and
@@ -11272,7 +11315,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
             if l.tag.is_none() && !matches!(l.enc, crate::layout::TagEnc::Single(_)) {
                 return;
             }
-            let tag = emit_load_disc(u, f, *cur, 0, p, 0, &l, &adt);
+            let Some(tag) = emit_load_disc(u, f, *cur, 0, p, 0, &l, &adt) else { return; };
             let join = f.block();
             for (vi, v) in adt.variants.iter().enumerate() {
                 let mut any = false;
@@ -11286,7 +11329,7 @@ fn drop_glue_body(u: &mut Unit, f: &mut Func, cur: &mut u32, p: VReg, t: TyId) {
                     continue;
                 }
                 let c = f.vreg(Cls::I);
-                let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, vi as u32).signed_value() as u128;
+                let discr = adt.discriminant_for_variant(&u.tcx, &u.prog, vi as u32).expect("existing drop variant").signed_value() as u128;
                 push(f, *cur, Inst::ICmpI(Cond::Eq, false, c, tag[0], discr as i64));
                 let c = if tag.len() == 2 {
                     let hi = f.vreg(Cls::I); let both = f.vreg(Cls::I);

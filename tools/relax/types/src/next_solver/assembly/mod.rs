@@ -164,22 +164,24 @@ impl EvalCtxt<'_, '_> {
         Ok(())
     }
     pub(super) fn assemble_impl_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+        crate::solver_work::count(crate::solver_work::IMPL_GOALS);
         let tr = goal.trait_ref(self); let tcx = self.delegate.tcx;
-        let mut keys = vec![crate::tcx::ty_key(&tcx.tys, goal.self_ty(self))];
-        if keys[0] != crate::tcx::TyKey::Other { keys.push(crate::tcx::TyKey::Other); }
-        let self_kind = tcx.tys.kind(goal.self_ty(self));
-        if matches!(self_kind, TyKind::IntVar(_) | TyKind::FloatVar(_)) {
-            for &(key, td) in tcx.trait_impls.keys() {
-                if td == tr.def_id {
-                    if let crate::tcx::TyKey::Prim(p) = key {
-                        if matches!((self_kind, tcx.tys.kind(tcx.tys.prim(p))), (TyKind::IntVar(_), TyKind::Int(_)) | (TyKind::FloatVar(_), TyKind::Float(_))) && !keys.contains(&key) { keys.push(key); }
-                    }
-                }
+        let self_ty = goal.self_ty(self);
+        if matches!(tcx.tys.kind(self_ty), TyKind::IntVar(_) | TyKind::FloatVar(_)) {
+            // rustc_middle::ty::trait_def::for_each_relevant_impl: inference only
+            // visits this trait's impls; deep rejection filters concrete heads.
+            if let Some(impls) = tcx.trait_impls_of.get(&tr.def_id) { for &imp in impls {
+                if let Some(candidate) = self.consider_impl_candidate(env, goal, imp, |ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))? { candidates.push(candidate); }
+            } }
+        } else {
+            let key = crate::tcx::ty_key(&tcx.tys, self_ty);
+            let keys = [key, crate::tcx::TyKey::Other];
+            for &key in &keys[..if key == crate::tcx::TyKey::Other { 1 } else { 2 }] {
+                if let Some(impls) = tcx.trait_impls.get(&(key, tr.def_id)) { for &imp in impls {
+                    if let Some(candidate) = self.consider_impl_candidate(env, goal, imp, |ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))? { candidates.push(candidate); }
+                } }
             }
         }
-        for key in keys { if let Some(impls) = tcx.trait_impls.get(&(key, tr.def_id)) { for &imp in impls {
-            if let Some(candidate) = self.consider_impl_candidate(env, goal, imp, |ecx| ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes))? { candidates.push(candidate); }
-        } } }
         Ok(())
     }
     pub(super) fn consider_impl_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, imp: DefId,
@@ -189,6 +191,13 @@ impl EvalCtxt<'_, '_> {
         let negative = matches!(self.solver.prog.files[d.file as usize].ast.item(d.item).kind, crate::ast::ItemKind::Impl { negative: true, .. });
         let wanted_negative = matches!(goal, GoalKind::Trait(TraitClause { polarity: ClausePolarity::Negative, .. }));
         if negative != wanted_negative { return Ok(None); }
+        // Shared by trait and projection candidates, before any inference probe.
+        let impl_ref = tcx.identity_impl_trait_ref(self.solver.prog, imp);
+        if !super::fast_reject::DeepRejectCtxt::relate_rigid_infer(&tcx.tys).args_may_unify(&tr.args, &impl_ref.args) {
+            crate::solver_work::count(crate::solver_work::IMPL_REJECTED);
+            return Ok(None);
+        }
+        crate::solver_work::count(crate::solver_work::IMPL_PROBES);
         let (result, head_usages) = self.probe().enter_single_candidate(CandidateSource::Impl(imp), |ecx| {
                 let args = ecx.fresh_args_for_item(imp);
                 ecx.inspect.record_impl_args(ecx.delegate, ecx.max_input_universe, args.clone());
@@ -196,10 +205,9 @@ impl EvalCtxt<'_, '_> {
                 ecx.eq_args(env, &tr.args, &impl_ref.args)?;
                 ecx.add_item_clauses(env, imp, &args, GoalSource::ImplWhereBound, false)?;
                 // trait_goals.rs:104-120: elaborated supertrait outlives obligations.
-                for predicate in tcx.supertraits(ecx.solver.prog, collect::trait_predicate(impl_ref.def_id, impl_ref.args)) {
-                    if matches!(predicate.kind, PredicateKind::Clause(ClauseKind::RegionOutlives(..) | ClauseKind::TypeOutlives(..))) {
-                        ecx.add_goal(GoalSource::Misc, Goal { param_env: env.clone(), predicate })?;
-                    }
+                for predicate in tcx.impl_super_outlives(ecx.solver.prog, imp) {
+                    let predicate = tcx.instantiate_predicate(ecx.solver.prog, imp, &args, predicate);
+                    ecx.add_goal(GoalSource::Misc, Goal { param_env: env.clone(), predicate })?;
                 }
                 if let GoalKind::NormalizesTo(p) = goal { ecx.confirm_projection_impl(env, p, imp, &args)?; }
             then(ecx)
@@ -211,7 +219,8 @@ impl EvalCtxt<'_, '_> {
     }
     pub(super) fn add_item_clauses(&mut self, env: &ParamEnv, def: DefId, args: &[GenericArg], source: GoalSource, own: bool) -> Result<(), NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx;
-        let ps = if own { tcx.own_clauses_of(self.solver.prog, def) } else { tcx.clauses_of(self.solver.prog, def) };
+        let inherited;
+        let ps = if own { tcx.own_clauses_of(self.solver.prog, def) } else { inherited = tcx.clauses_of(self.solver.prog, def); &inherited };
         for p in ps { let p = tcx.instantiate_predicate(self.solver.prog, def, args, &p); self.add_goal(source, Goal { param_env: env.clone(), predicate: p })?; }
         Ok(())
     }

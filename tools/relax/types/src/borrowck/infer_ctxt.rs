@@ -16,6 +16,7 @@ pub struct BorrowckInferCtxt<'tcx> {
     pub prog: &'tcx Program,
     pub root_def_id: DefId,
     pub param_env: ParamEnv,
+    param_env_id: std::cell::OnceCell<crate::tcx::ParamEnvId>,
     pub tainted_by_errors: std::cell::Cell<bool>,
     encountered_re_error: std::cell::Cell<bool>,
     pub universal_regions: Option<super::universal_regions::UniversalRegions>,
@@ -42,7 +43,12 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         let mut clauses = Vec::new();
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_body: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
+        let param_env_id = std::cell::OnceCell::new();
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_body: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
+    }
+
+    pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
+        *self.param_env_id.get_or_init(|| self.tcx.intern_param_env(self.param_env.clone()))
     }
 
     pub fn next_region_var(&self, get_ctxt_fn: impl Fn() -> RegionCtxt) -> RegionId {

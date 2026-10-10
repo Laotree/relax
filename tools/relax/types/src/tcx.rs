@@ -12,6 +12,7 @@ use crate::collected::ImageMap;
 use crate::lang_items::{LangItem, LangItems};
 
 mod collected;
+mod declarations;
 mod regions;
 pub(crate) mod lifetime_resolve;
 pub(crate) mod resolve_bound_vars;
@@ -206,12 +207,15 @@ pub struct Tcx {
     destructor_impls: ImageMap<DefId, DefId>,
     /// One mapped store for lazy const/static declarations and fed anonymous types.
     const_tys: collected::ConstTypes,
+    declarations: declarations::DeclarationQueries,
     pub nominal_region_contracts: ImageMap<DefId, outlives::RegionContract>,
     pub impl_self: ImageMap<DefId, TyId>,
     pub impl_trait: ImageMap<DefId, DefId>,
     pub impl_generics: ImageMap<DefId, GenEnv>,
     pub inherent: ImageMap<TyKey, Vec<DefId>>,
     pub trait_impls: ImageMap<(TyKey, DefId), Vec<DefId>>,
+    /// All impls of a trait, shared by candidate assembly and coherence.
+    pub trait_impls_of: ImageMap<DefId, Vec<DefId>>,
     pub contracts_waiting: crate::collected::ImageSet<DefId>,
     /// trait impls by self type constructor
     pub impls_by_key: ImageMap<TyKey, Vec<DefId>>,
@@ -376,6 +380,7 @@ impl Tcx {
             ctor_sigs: Default::default(),
             adts: Default::default(),
             const_tys: Default::default(),
+            declarations: Default::default(),
             nominal_region_contracts: Default::default(),
             contracts_waiting: Default::default(),
             impl_self: Default::default(),
@@ -383,6 +388,7 @@ impl Tcx {
             impl_generics: Default::default(),
             inherent: Default::default(),
             trait_impls: Default::default(),
+            trait_impls_of: Default::default(),
             impls_by_key: Default::default(),
             impl_trait_args: Default::default(),
             impl_trait_regions: Default::default(),
@@ -622,6 +628,13 @@ impl Tcx {
     /// `visible` (reload::crates_seeing_edit) can see; None: every crate. The owner
     /// queries of every other crate keep their results (type_queries.rs DECLARATIONS).
     pub fn publish_declarations(&mut self, visible: Option<&[bool]>) {
+        self.declarations.invalidate_visible(visible);
+        self.publish_declaration_inputs(visible);
+    }
+
+    // Collection already reset declaration cells before lowering. In particular, a
+    // deferred load preserves successful cells even though solver inputs change.
+    fn publish_declaration_inputs(&mut self, visible: Option<&[bool]>) {
         self.variances.take();
         for cell in self.sigs.decoded_values_mut() {
             if let Some(p) = cell.get_mut() {
@@ -650,6 +663,7 @@ impl Tcx {
     /// Collects impls and ADTs; registers functions and constants for their declaration
     /// queries. Coherence is not checked (check_coherence / report_coherence).
     pub fn collect_declarations(&mut self, prog: &Program) {
+        self.declarations = Default::default();
         self.queries.register_files(prog.files.len());
         self.queries.register_crates(prog.crates.len());
         let cx_state = crate::tcx::EvalState::new();
@@ -704,6 +718,7 @@ impl Tcx {
                 Some(Some((td, targs))) => {
                     self.impl_trait.insert(im.def, td);
                     self.trait_impls.entry((key, td)).or_default().push(im.def);
+                    self.trait_impls_of.entry(td).or_default().push(im.def);
                     self.impls_by_key.entry(key).or_default().push(im.def);
                     self.impl_trait_args.insert(im.def, targs);
                 }
@@ -805,7 +820,7 @@ impl Tcx {
         // (new impls and associated types: projection answers may change; publication
         // resets the solver's global cache)
         let r = self.collect_added_inner(cx, prog, defs, own_crate, false, visible);
-        self.publish_declarations(visible);
+        self.publish_declaration_inputs(visible);
         r
     }
 
@@ -821,7 +836,7 @@ impl Tcx {
         let cx_state = crate::tcx::EvalState::new();
         let cx = &EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &cx_state);
         let r = self.collect_added_inner(cx, prog, defs, false, true, Some(visible));
-        self.publish_declarations(Some(visible));
+        self.publish_declaration_inputs(Some(visible));
         r
     }
 
@@ -831,6 +846,8 @@ impl Tcx {
         self.flush_errs();
         let n0 = self.errors.len();
         self.reset_const_decls_with_misses();
+        self.declarations.prepare(prog, loaded, own_crate, visible);
+        self.declarations.invalidate(defs);
         self.lang_items.collect(prog, defs, &mut self.errors);
         let mut impls_added = Vec::new();
         for &d in defs {
@@ -852,6 +869,7 @@ impl Tcx {
                 Some(Some((td, targs))) => {
                     self.impl_trait.insert(d, td);
                     self.trait_impls.entry((key, td)).or_default().push(d);
+                    self.trait_impls_of.entry(td).or_default().push(d);
                     self.impls_by_key.entry(key).or_default().push(d);
                     self.impl_trait_args.insert(d, targs);
                 }
@@ -895,12 +913,20 @@ impl Tcx {
         } else {
             self.collect_nominal_region_contracts(cx, prog, (0..prog.defs.len() as u32).map(DefId).filter(sees));
         }
-        self.collect_adt_destructors(prog);
+        // A run-time module can only implement Drop for its own types (orphan rule, checked
+        // before it is accepted): the host's destructors stay, its new ADTs are looked up.
+        if own_crate {
+            let adts: Vec<DefId> = defs.iter().copied().filter(|d| matches!(prog.def(*d).kind, DefKind::Struct | DefKind::Enum | DefKind::Union)).collect();
+            self.collect_adt_destructors_of(prog, &adts);
+        } else {
+            self.collect_adt_destructors(prog);
+        }
         self.errors[n0..].to_vec()
     }
 
     /// A single-writer check session discards answers tied to old bodies and definitions.
     pub fn invalidate_check(&mut self, gone: &[DefId]) {
+        self.declarations.invalidate(gone);
         self.alias_tys.clear();
         if gone.is_empty() { self.publish_collected(); return; }
         let gone: crate::fxhash::HashSet<_> = gone.iter().copied().collect();
@@ -912,6 +938,7 @@ impl Tcx {
         self.contracts_waiting.retain(|d| !gone.contains(d));
         self.impl_self.retain(|d, _| !gone.contains(d));
         self.impl_trait.retain(|d, _| !gone.contains(d));
+        for impls in self.trait_impls_of.values_mut() { impls.retain(|d| !gone.contains(d)); }
         self.impl_generics.retain(|d, _| !gone.contains(d));
         self.opaques.retain(|k, _| !gone.contains(k));
         self.trait_closure.retain(|d, _| !gone.contains(d));
@@ -961,6 +988,9 @@ impl Tcx {
         for v in self.inherent.values_mut() {
             v.retain(|d| !impls.contains(d));
         }
+        for v in self.trait_impls_of.values_mut() {
+            v.retain(|d| !impls.contains(d));
+        }
         for v in self.trait_impls.values_mut() {
             v.retain(|d| !impls.contains(d));
         }
@@ -979,8 +1009,13 @@ impl Tcx {
     fn collect_adt_destructors(&mut self, prog: &Program) {
         self.adt_destructors.clear();
         self.destructor_impls.clear();
+        let adts: Vec<DefId> = self.adts.keys().copied().collect();
+        self.collect_adt_destructors_of(prog, &adts);
+    }
+
+    fn collect_adt_destructors_of(&mut self, prog: &Program, adts: &[DefId]) {
         let Some(drop_trait) = self.lang_items.get(LangItem::Drop) else { return };
-        for &adt in self.adts.keys() {
+        for &adt in adts {
             let Some(impls) = self.trait_impls.get(&(TyKey::Adt(adt), drop_trait)) else { continue };
             for &imp in impls {
                 let Some(&self_ty) = self.impl_self.get(&imp) else { continue };
@@ -1534,6 +1569,11 @@ impl Tcx {
             };
             let mut parent_env = env.clone();
             parent_env.impl_params.clear();
+            // The parent's bounds resolve their lifetimes and object lifetime defaults in the
+            // parent's own resolve_bound_vars table (rustc lowers predicates_of(parent) in the
+            // parent's ItemCtxt): the method's table has no entry for the parent's nodes, which
+            // left `F: Fn() -> Box<dyn Tr>` on an impl indeterminate (E0228).
+            parent_env.regions = self.bound_region_env(prog, def.parent);
             self.collect_callable_signatures(cx, prog, parent.file, module, &parent_env, generics, offset, &mut callable_signatures);
         }
         let mut tb = Vec::new();
@@ -3263,17 +3303,9 @@ pub struct RecursionLimit(pub usize);
 impl Default for RecursionLimit { fn default() -> Self { Self(128) } }
 impl RecursionLimit {
     pub fn for_crate(prog: &Program, krate: u32) -> Self {
-        let Some(krate) = prog.crates.get(krate as usize) else { return Self::default() };
-        let root = &prog.mods[krate.root_mod as usize];
-        let file = &prog.files[root.file as usize];
-        for attr in &file.ast.root_attrs {
-            if attr.toks.hi == attr.toks.lo + 3 && file.tok_text(attr.toks.lo) == "recursion_limit"
-                && file.tok_text(attr.toks.lo + 1) == "=" {
-                if let Ok(limit) = file.tok_text(attr.toks.lo + 2).trim_matches('"').parse() { return Self(limit); }
-            }
-        }
-        Self::default()
+        Self(prog.crates.get(krate as usize).map_or(128, |c| c.recursion_limit))
     }
+
     pub fn for_item(prog: &Program, def: DefId) -> Self {
         if def == crate::program::NO_DEF { Self::default() }
         else { Self::for_crate(prog, prog.def(def).krate) }

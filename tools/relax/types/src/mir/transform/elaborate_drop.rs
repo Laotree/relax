@@ -215,7 +215,7 @@ impl DropCtxt<'_> {
             if let Some(path) = self.elaborator.subpath(site.path, &elem) {
                 let base = project(&site.place, elem);
                 let fields = self.fields(ty, Some(v), &base, path, variant.fields.len())?;
-                values.push(adt.discriminant_for_variant(self.provider.tcx(), self.provider.program(), i as u32).val);
+                values.push(adt.discriminant_for_variant(self.provider.tcx(), self.provider.program(), i as u32).ok_or(DropError::InvalidMir("invalid drop variant"))?.val);
                 if let Unwind::To(bb) = site.unwind {
                     // Separate half-ladders preserve the MSVC funclet successor invariant.
                     let unwinds = vec![Unwind::InCleanup; fields.len() + 1];

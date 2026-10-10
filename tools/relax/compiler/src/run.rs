@@ -475,6 +475,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // relaunch built the world for the suffix's derives and waited 10 s for every std file.
     if restored_crates != 0 { crate::program::share_std_end(); }
     let collected_restored = restored_crates == pre.len();
+    // a load that parses crates expands their macros: the proc-macro world starts building on
+    // its own thread now. A warm restore of the whole program expands nothing: no world (the
+    // first live edit that expands builds it).
+    if !collected_restored { crate::macro_reg::prewarm(sess); }
     // the whole program came from the collected store: it holds this program already
     COLLECTED_CURRENT.store(collected_restored, Ordering::Relaxed);
     let collected_suffix = restored.as_ref().filter(|_| !collected_restored)

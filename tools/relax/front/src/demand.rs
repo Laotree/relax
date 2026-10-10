@@ -1237,15 +1237,20 @@ impl Names {
     /// References see their crate, its transitive extern/reexport graph and the
     /// implicit standard preludes. Unrelated consumers cannot change a lookup.
     pub fn reference_crates(&self, ci: usize) -> Vec<usize> {
+        // crates by name (one pass): looking each visited crate's roots up by scanning every
+        // crate made a call O(crates^2), and the demand record calls it for every crate
+        let mut by_name = HashMap::<&str, Vec<usize>>::default();
+        for (i, c) in self.crates.iter().enumerate() { by_name.entry(c.name.as_str()).or_default().push(i); }
+        let named = |name: &str| by_name.get(name).map_or(&[][..], |v| &v[..]);
         let mut todo = vec![ci];
-        todo.extend(self.crates.iter().enumerate().filter(|(_, c)| matches!(c.name.as_str(), "core" | "alloc" | "std")).map(|(i, _)| i));
+        for std in ["core", "alloc", "std"] { todo.extend_from_slice(named(std)); }
         let mut seen = BTreeSet::new();
         while let Some(ci) = todo.pop() {
             if !seen.insert(ci) { continue; }
             let c = &self.crates[ci];
             todo.extend(c.image_deps.iter().copied());
-            let roots = std::iter::once(c.name.as_str()).chain(c.deps.iter().chain(&c.image_dep_names).map(|(_, root)| root.as_str())).collect::<BTreeSet<_>>();
-            todo.extend(self.crates.iter().enumerate().filter(|(_, c)| roots.contains(c.name.as_str())).map(|(i, _)| i));
+            todo.extend_from_slice(named(&c.name));
+            for (_, root) in c.deps.iter().chain(&c.image_dep_names) { todo.extend_from_slice(named(root)); }
         }
         seen.into_iter().collect()
     }
@@ -1276,6 +1281,51 @@ impl Names {
                 .flat_map(|(_, entries)| entries.values().copied()).collect()),
         };
         strings::encode(&image)
+    }
+    /// `snapshot(ci)` of each of `cis` (crates whose names no other crate of the graph has),
+    /// from one pass over each table: a snapshot per crate filtered every table, which made
+    /// the demand record of a 257-crate graph quadratic (Stage: 11.6 s). An entry belongs to
+    /// the crate its first path segment names (`within`; crate names have no `::`).
+    pub fn snapshots(&self, cis: &[usize]) -> Vec<Vec<u8>> {
+        let slot: HashMap<&str, usize> = cis.iter().enumerate().map(|(k, &ci)| (self.crates[ci].name.as_str(), k)).collect();
+        let owner = |s: &str| slot.get(s.split("::").next().unwrap_or(s)).copied();
+        let mut images: Vec<NamespaceDelta> = (0..cis.len()).map(|_| NamespaceDelta::default()).collect();
+        // symbols, uses and empty_rules iterate sorted (BTree); bucketing keeps that order
+        for name in &self.symbols { if let Some(k) = owner(name) { images[k].symbols.push(name.clone()); } }
+        for (name, uses) in &self.uses { if let Some(k) = owner(name) { images[k].uses.insert(name.clone(), uses.clone()); } }
+        for (name, rule) in &self.empty_rules { if let Some(k) = owner(name) { images[k].empty_rules.insert(name.clone(), rule.clone()); } }
+        // vectors keep their order
+        for entry in &self.macro_uses { if let Some(k) = owner(&entry.0) { images[k].macro_uses.push(entry.clone()); } }
+        for entry in &self.externs { if let Some(k) = owner(&entry.0) { images[k].externs.push(entry.clone()); } }
+        // hash sets: sorted and deduplicated, as snapshot's BTreeSet collect
+        let sets: [(&HashSet<String>, fn(&mut NamespaceDelta) -> &mut Vec<String>); 7] = [
+            (&self.type_symbols, |d| &mut d.types), (&self.trait_symbols, |d| &mut d.traits), (&self.value_symbols, |d| &mut d.values),
+            (&self.public, |d| &mut d.public), (&self.modules, |d| &mut d.modules), (&self.module_macros, |d| &mut d.module_macros),
+            (&self.macros, |d| &mut d.macros)];
+        for (set, field) in sets {
+            for name in set { if let Some(k) = owner(name) { field(&mut images[k]).push(name.clone()); } }
+            for image in &mut images { let v = field(image); v.sort_unstable(); v.dedup(); }
+        }
+        let mut entries: Vec<Vec<usize>> = vec![Vec::new(); cis.len()];
+        for (&module, names) in &self.bindings.modules {
+            if let Some(k) = owner(self.bindings.spelling(module)) { entries[k].extend(names.values().copied()); }
+        }
+        // each crate's bindings and encoding are independent: spread over the loader's workers
+        let work: Vec<std::sync::Mutex<Option<(NamespaceDelta, Vec<usize>)>>> = images.into_iter().zip(entries).map(|w| std::sync::Mutex::new(Some(w))).collect();
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let out: Vec<std::sync::Mutex<Vec<u8>>> = (0..work.len()).map(|_| Default::default()).collect();
+        std::thread::scope(|scope| {
+            for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
+                scope.spawn(|| loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(cell) = work.get(k) else { break };
+                    let (mut image, entries) = cell.lock().unwrap().take().unwrap();
+                    image.bindings = BindingImage::capture(self, entries);
+                    *out[k].lock().unwrap() = strings::encode(&image);
+                });
+            }
+        });
+        out.into_iter().map(|o| o.into_inner().unwrap()).collect()
     }
     pub fn restore(&mut self, ci: usize, bytes: &[u8]) -> Option<()> {
         let image: NamespaceDelta = strings::decode(bytes)?;
@@ -1373,23 +1423,31 @@ impl Names {
         let additions = |after: &HashSet<String>, before: &HashSet<String>| {
             let mut out = after.difference(before).cloned().collect::<Vec<_>>(); out.sort(); out
         };
+        let t0 = std::time::Instant::now();
         let mut bindings = Vec::new();
+        // each id's id in `before` (before.bindings.id(spelling)), without rendering spellings
+        let map = self.bindings.ids_in(&before.bindings);
+        let t_map = t0.elapsed();
         for entries in self.bindings.modules.values() {
             for &id in entries.values() {
-                let spelling = self.bindings.spelling(id);
                 let value = &self.bindings.values[id];
                 let same_set = |new: &bindings::Names, old: &bindings::Names| {
                     new.iter().len() == old.iter().len() && new.iter().all(|&id|
-                        before.bindings.id(self.bindings.spelling(id)).is_some_and(|id| old.contains(id)))
+                        map[id].is_some_and(|id| old.contains(id)))
                 };
-                let unchanged = before.bindings.id(spelling).is_some_and(|id| {
+                let unchanged = map[id].is_some_and(|id| {
                     let old = &before.bindings.values[id];
                     old.public == value.public && same_set(&value.targets, &old.targets) && same_set(&value.via, &old.via)
                 });
                 if !unchanged { bindings.push(id); }
             }
         }
+        let (t_loop, changed) = (t0.elapsed(), bindings.len());
         let bindings = BindingImage::capture(self, bindings);
+        if crate::preload::trace() {
+            eprintln!("rx-demand-closure-delta: {} ids mapped in {:.0} ms, bindings compared in {:.0} ms, {} changed captured in {:.0} ms",
+                map.len(), t_map.as_secs_f64() * 1e3, (t_loop - t_map).as_secs_f64() * 1e3, changed, (t0.elapsed() - t_loop).as_secs_f64() * 1e3);
+        }
         NamespaceDelta {
             symbols: self.symbols.difference(&before.symbols).cloned().collect(),
             types: additions(&self.type_symbols, &before.type_symbols),

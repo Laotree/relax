@@ -399,6 +399,17 @@ pub struct Fcx<'a> {
     diverging: Vec<TyId>,
 }
 
+/// Codegen shares identity bodies; lowering erases regions and normalizes on use,
+/// as rustc_codegen_ssa::mir::FunctionCx::monomorphize does. Analysis consumers
+/// requesting fully normalized tables use instantiate_body instead.
+pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std::sync::Arc<Body> {
+    let _cost_typeck = crate::fncost::phase(1);
+    let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
+    let body = tcx.typeck(prog, def);
+    instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args)
+        .expect("failed to normalize body for codegen")
+}
+
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
     try_instantiate_body(cx, prog, tcx, def, args).expect("failed to normalize body for codegen")
 }
@@ -434,9 +445,8 @@ pub(crate) fn try_instantiate_body(_cx: &crate::tcx::EvalCx<'_>, prog: &Program,
     let cost_start = if crate::fncost::enabled() { (crate::fncost::mono(), crate::clock::cpu_ns()) } else { (0, 0) };
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
-    // rustc_middle/src/ty/instance.rs:955-990: every codegen consumer crosses
-    // the PostAnalysis boundary, including non-generic and identity instances.
-    let b = instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, &body, args)?;
+    // Explicit normalization consumers retain the fallible PostAnalysis boundary.
+    let b = instantiate::try_normalize_body(prog, tcx, &body, args)?;
     if crate::fncost::enabled() {
         crate::fncost::type_detail(def.0, &args.iter().map(|a| a.0).collect::<Vec<_>>(), b.expr_ty.len(), &prog.def_path(def), cost_start.0, cost_start.1);
     }
@@ -606,10 +616,9 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         method_expected: None,
     };
     fcx.init_body_regions();
-    let declaration_env = tcx.param_env(prog, def);
-    fcx.param_env = declaration_env;
+    let penv = tcx.param_env_id(prog, def);
+    fcx.param_env = tcx.param_env_by_id(penv).clone();
     // (also an empty one: a body checked inside another's check never sees the outer's env)
-    let penv = tcx.intern_param_env(fcx.param_env.clone());
     fcx.cx.typing_env = crate::tcx::TypingEnv { limit: fcx.infcx.recursion_limit, param_env: penv, mode: crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) } };
     if penv != crate::tcx::ParamEnvId::EMPTY {
         fcx.b.param_env = Some(penv);
@@ -1002,11 +1011,11 @@ impl<'a> Fcx<'a> {
                 let args = self.tcx.complete_args(self.prog, d, &args, regions);
                 Some(self.tcx.instantiate_ty(self.prog, d, &args, poly))
             }
-            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: up, .. }) => {
-                let captures = match self.tcx.tys.kind(up) {
-                    TyKind::Tuple(v) => !v.is_empty(),
-                    _ => true,
-                };
+            TyKind::Closure(file, ce, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => {
+                // rustc sig_for_closure_coercion: capture inference has not run
+                // yet, so the upvar tuple is still an inference variable. Use
+                // mentioned roots, as for coercion to an expected fn pointer.
+                let captures = file != self.file || self.b.closure_locals.get(&ce).is_some_and(|v| !v.is_empty());
                 if captures {
                     None
                 } else {
@@ -1068,7 +1077,7 @@ impl<'a> Fcx<'a> {
             if let Some(ty) = self.try_coerce_inner(new_ty, prev_ty, Some(new_e), self.last_lo, true) { return Some(ty); }
         }
         // A single coercion determines the adjustments for all previous arms.
-        // The temporary slot retains an existing adjustment on the chosen arm.
+        // Copy the overloaded deref calls too: lowering looks them up per expression.
         let first = prev.first().copied();
         let ty = self.try_coerce_inner(prev_ty, new_ty, first, self.last_lo, true)?;
         if let Some(first) = first {
@@ -1077,6 +1086,13 @@ impl<'a> Fcx<'a> {
             for e in &prev[1..] {
                 if let Some(adjustment) = adjustment { self.b.coerce.insert(e.0, adjustment); }
                 if let Some(reborrow) = reborrow { self.b.reborrows.insert(e.0, reborrow); }
+                if let Some(Coerce::DerefRef(n)) = adjustment {
+                    for step in 0..n {
+                        if let Some(deref) = self.b.ov_derefs.get(&(first.0 | DEREF_COERCE_KEY, step)).cloned() {
+                            self.b.ov_derefs.insert((e.0 | DEREF_COERCE_KEY, step), deref);
+                        }
+                    }
+                }
             }
         }
         Some(ty)
@@ -5264,6 +5280,10 @@ impl<'a> Fcx<'a> {
         for (&ty, &arg) in params.iter().zip(args) {
             self.register_wf(ty, self.ast().expr(arg).lo);
         }
+        // An unsized expectation reaches a call only as rvalue_hint's ExpectRvalueLikeUnsized
+        // (a call is never a place expression), whose only_has_type is None: no expected inputs
+        // (expectation.rs:76-88, 113-118; fn_ctxt/checks.rs check_argument_types)
+        let expected = expected.filter(|x| !self.is_unsized_ty(*x));
         let exp_inputs = expected.and_then(|x| self.expected_inputs_for_expected_output(ret, x, &params));
         // rustc check_argument_types: non-closures first, then select their obligations
         // before deriving closure signatures from the call's Fn bounds.
@@ -5801,7 +5821,9 @@ impl<'a> Fcx<'a> {
     #[allow(clippy::too_many_arguments)]
     /// rustc expected_inputs_for_expected_output for a method call: per input, the type the
     /// expected result gives it (None: no hint). See check_method_sym.
+    /// An unsized expectation is rvalue_hint's ExpectRvalueLikeUnsized: no hint (as for calls).
     fn method_expected_inputs(&mut self, ret: TyId, ps: &[TyId], expected: Option<TyId>) -> Option<Vec<Option<TyId>>> {
+        let expected = expected.filter(|x| !self.is_unsized_ty(*x));
         expected.and_then(|x| self.expected_inputs_for_expected_output(ret, x, &ps[1..]))
     }
 

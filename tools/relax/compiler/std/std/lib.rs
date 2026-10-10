@@ -22,6 +22,7 @@ pub use core::mem;
 pub use core::ops;
 pub use core::option;
 pub use core::prelude;
+pub use core::primitive;
 pub use core::ptr;
 pub use core::result;
 pub use core::slice;

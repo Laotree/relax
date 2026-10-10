@@ -37,7 +37,11 @@ impl InferCtxt<'_> {
 }
 
 impl crate::tcx::Tcx {
-    pub fn generic_indices_of(&self, prog: &Program, def: DefId) -> GenericIndices {
+    pub fn generic_indices_of(&self, prog: &Program, def: DefId) -> &GenericIndices {
+        self.declaration_queries(prog, def).generics.get_or_init(|| self.generic_indices_uncached(prog, def))
+    }
+
+    fn generic_indices_uncached(&self, prog: &Program, def: DefId) -> GenericIndices {
         if let Some(indices) = self.rpitit_generic_indices(prog, def) { return indices; }
         if matches!(prog.def(def).kind, crate::program::DefKind::Prim(_) | crate::program::DefKind::Mod | crate::program::DefKind::MacroRules) { return GenericIndices::default(); }
         // rustc_hir_analysis/src/collect/generics_of.rs:96-100: MCG has no

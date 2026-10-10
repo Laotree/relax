@@ -169,13 +169,13 @@ fn round31_discriminants_query_explicit_relative_signed_and_wide() {
     assert_eq!(signed.variants[1].discr, VariantDiscr::Relative(1));
     assert_eq!(signed.variants[3].discr, VariantDiscr::Relative(1));
     assert_eq!(signed.discriminants(&tcx, &prog).iter().map(|(_,d)| d.signed_value()).collect::<Vec<_>>(), vec![-2, -1, 126, 127]);
-    for (i, d) in signed.discriminants(&tcx, &prog) { assert_eq!(signed.discriminant_for_variant(&tcx, &prog, i), d); }
+    for (i, d) in signed.discriminants(&tcx, &prog) { assert_eq!(signed.discriminant_for_variant(&tcx, &prog, i), Some(d)); }
     assert!(signed.check_discriminants(&tcx, &prog).is_empty());
     let wide = &tcx.adts[&named(&prog, "Wide")];
-    assert_eq!(wide.discriminant_for_variant(&tcx, &prog, 1).val, u128::MAX);
+    assert_eq!(wide.discriminant_for_variant(&tcx, &prog, 1).unwrap().val, u128::MAX);
     assert!(wide.check_discriminants(&tcx, &prog).is_empty());
     let signed_wide = &tcx.adts[&named(&prog, "SignedWide")];
-    assert_eq!(signed_wide.discriminant_for_variant(&tcx, &prog, 1).signed_value(), i128::MIN + 1);
+    assert_eq!(signed_wide.discriminant_for_variant(&tcx, &prog, 1).unwrap().signed_value(), i128::MIN + 1);
 }
 
 #[test]
@@ -196,6 +196,6 @@ fn round31_discriminant_errors_preserve_recovery_and_diagnostics() {
     assert_eq!(errors.len(), 1); assert!(errors[0].contains("E0081"));
     let adt = &tcx.adts[&named(&prog, "Eval")];
     assert!(adt.check_discriminants(&tcx, &prog)[0].contains("E0080"));
-    assert_eq!(adt.discriminant_for_variant(&tcx, &prog, 1).val, 1);
+    assert_eq!(adt.discriminant_for_variant(&tcx, &prog, 1).unwrap().val, 1);
     assert!(tcx.adts[&named(&prog, "Reset")].check_discriminants(&tcx, &prog).is_empty());
 }

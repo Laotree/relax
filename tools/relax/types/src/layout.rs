@@ -365,10 +365,8 @@ impl Layouts {
         if let Some(storage) = self.closure_storage.get(&ty) { return storage; }
         let TyKind::Closure(_, ce, crate::types::ClosureArgs { parent_args: owner, .. }) = tcx.tys.kind(ty) else { panic!("closure storage for non-closure") };
         let TyKind::FnDef(def, args, _) = tcx.tys.kind(*owner) else { panic!("closure owner") };
-        let state = crate::tcx::EvalState::new();
-        let cx = crate::tcx::EvalCx::new(prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
-        let body = crate::typeck::instantiate_body(&cx, prog, tcx, *def, args);
-        let storage = ClosureStorage::new(tcx, &body, *ce);
+        let body = crate::typeck::codegen_body(prog, tcx, *def, args);
+        let storage = ClosureStorage::for_codegen(prog, tcx, &body, *ce);
         self.closure_storage.insert(ty, storage.clone());
         storage
     }
@@ -970,7 +968,7 @@ impl Layouts {
     fn tagged(&self, lcx: &LayoutCx<'_>, tcx: &Tcx, adt: &crate::tcx::AdtT, vfl: &[Vec<FieldL>], vls: &[Vec<&'static Layout>], repr: Repr) -> Layout {
         let nv = vfl.len();
         // the discriminants of inhabited variants, and the largest gap between them (wrapping)
-        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).signed_value()).collect();
+        let mut ds: Vec<i128> = (0..nv).filter(|&i| adt.repr_c || !vfl[i].iter().any(|f| f.uninhabited)).map(|i| adt.discriminant_for_variant(tcx, lcx.prog, i as u32).expect("existing layout variant").signed_value()).collect();
         ds.sort();
         ds.dedup();
         let discr_signed = match adt.repr_int {

@@ -37,6 +37,7 @@ pub mod option;
 pub mod panic;
 pub mod panicking;
 pub mod pin;
+pub mod primitive;
 pub mod future;
 pub mod task;
 pub mod ptr;

@@ -155,6 +155,25 @@ impl Bindings {
         self.values.push(Binding::default());
         id
     }
+    /// For every id, the id `other.id(self.spelling(id))` returns: the spelling's segments
+    /// folded through `other`'s tables (a qualified id's parts precede it).
+    pub fn ids_in(&self, other: &Bindings) -> Vec<Option<usize>> {
+        fn fold(this: &Bindings, other: &Bindings, acc: usize, id: usize) -> Option<usize> {
+            match &this.text[id] {
+                Spelling::Segment(text) => other.qualified.get(&(acc, *other.ids.get(text)?)).copied(),
+                Spelling::Qualified { module, name, .. } => fold(this, other, fold(this, other, acc, *module)?, *name),
+            }
+        }
+        let mut map: Vec<Option<usize>> = Vec::with_capacity(self.text.len());
+        for id in 0..self.text.len() {
+            let mapped = match &self.text[id] {
+                Spelling::Segment(text) => other.ids.get(text).copied(),
+                Spelling::Qualified { module, name, .. } => map[*module].and_then(|m| fold(self, other, m, *name)),
+            };
+            map.push(mapped);
+        }
+        map
+    }
     pub fn spelling(&self, id: usize) -> &str {
         match &self.text[id] {
             Spelling::Segment(text) => text,

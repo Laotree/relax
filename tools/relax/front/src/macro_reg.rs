@@ -21,7 +21,9 @@ pub trait MacroRunner: Send + Sync {
         _attr: Option<&TokenStream>, _input: &TokenStream, _span: Span) -> Result<TokenStream, String> {
         Err("macro has no declaration surface".into())
     }
-    /// The crate graph was registered: a runner may start building what it needs.
+    /// The crate graph was registered (its source-matched native entries are known from now).
+    fn registered(&self, _sess: &std::sync::Arc<crate::Session>) {}
+    /// The registered graph's load will expand macros: a runner may start building what it needs.
     fn prewarm(&self, sess: &std::sync::Arc<crate::Session>);
     /// Runs macro fn `entry` on `input`.
     fn call(&self, sess: &std::sync::Arc<crate::Session>, entry: &Entry, input: &TokenStream, call_span: Span) -> Result<TokenStream, String>;
@@ -288,8 +290,17 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     }
     REG.with(|r| *r.borrow_mut() = Some(reg));
     if let Some(r) = RUNNER.get() {
-        // the world takes its core/alloc/std from the program's load that follows
+        // a world built during the program's load takes its core/alloc/std from that load
         crate::program::share_std_begin();
+        r.registered(sess);
+    }
+}
+
+/// The boot driver's load will expand macros (it is not a warm restore of the whole program):
+/// the runner starts building what it needs now. Without this call the world is built on the
+/// first expansion (a warm start's first live edit that adds a derive).
+pub fn prewarm(sess: &std::sync::Arc<crate::Session>) {
+    if let Some(r) = RUNNER.get() {
         r.prewarm(sess);
     }
 }

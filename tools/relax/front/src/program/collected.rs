@@ -222,7 +222,7 @@ impl Program {
             let selection_hash = u128::get(&mut r)?;
             context.restore_fingerprint(selection_hash);
             p.crates.push(CrateInfo {
-                name, root_mod, edition, deps, cfg: CfgSet { set, session: session.clone() },
+                name, root_mod, edition, recursion_limit: 128, deps, cfg: CfgSet { set, session: session.clone() },
                 proc_macro, relaxed: OnceLock::new(), root_path, context,
             });
         }
@@ -259,6 +259,9 @@ impl Program {
             p.files.push(Arc::new(file(i, k, &c.cfg, &mut meta)?));
         }
         phase("files");
+        for krate in &mut p.crates {
+            krate.recursion_limit = recursion_limit(&p.files[p.mods[krate.root_mod as usize].file as usize]);
+        }
         if !r.bytes.is_empty() { return None; }
         p.front_restored = vec![true; p.crates.len()];
         p.front_ahead.resize_with(p.crates.len(), Vec::new);

@@ -2,11 +2,19 @@
 // ported from N:rustc_middle/src/ty/normalize_erasing_regions.rs @8d1a764
 use super::*;
 
-/// instance.rs:955-990: instantiate the definition's types, then normalize in
-/// the consumer's PostAnalysis environment. Resolved body decisions are retained.
-/// normalize_erasing_regions.rs:172-186: callers that cannot guarantee normalization
-/// use the fallible folder and discard the body on failure.
-pub(super) fn try_instantiate_mir_and_normalize_erasing_regions(prog: &Program, tcx: &Tcx, body: &Body, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
+/// Share identity codegen bodies, including empty argument lists. Substituted
+/// instances retain the fallible PostAnalysis fold; identity consumers normalize
+/// individual reads (rustc_codegen_ssa/src/mir/mod.rs:129-139).
+pub(super) fn try_instantiate_mir_and_normalize_erasing_regions(prog: &Program, tcx: &Tcx, body: std::sync::Arc<Body>, args: &[TyId]) -> Result<std::sync::Arc<Body>, crate::next_solver::NoSolution> {
+    if body.args == args { return Ok(body); }
+    try_normalize_body(prog, tcx, &body, args).map(std::sync::Arc::new)
+}
+
+/// Analysis consumers explicitly requesting normalized tables keep the fallible
+/// boundary even for identity substitutions (unresolved projections must fail).
+pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, body: &Body, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
+    static COUNTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *COUNTS.get_or_init(|| std::env::var_os("RELAX_BODY_COUNTS").is_some()) { eprintln!("body-count instantiate-clone"); }
     let mut b = body.clone();
     let root_errors = tcx.dcx.clone();
     let checkpoint = root_errors.checkpoint();

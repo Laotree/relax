@@ -91,23 +91,23 @@ impl AdtT {
         }
         Some(result)
     }
-    pub fn discriminant_for_variant(&self, tcx: &Tcx, prog: &Program, index: u32) -> Discr {
-        assert!(self.is_enum());
-        let (def, offset) = self.discriminant_def_for_variant(index);
+    /// Empty enums have no discriminant, including for layout's placeholder variant 0.
+    pub fn discriminant_for_variant(&self, tcx: &Tcx, prog: &Program, index: u32) -> Option<Discr> {
+        if !self.is_enum() { return None; }
+        let (def, offset) = self.discriminant_def_for_variant(index)?;
         let value = def.and_then(|def| self.eval_explicit_discr(tcx, prog, def).ok()).unwrap_or(self.initial_discriminant());
-        value.checked_add(offset as u128).0
+        Some(value.checked_add(offset as u128).0)
     }
-    pub fn discriminant_def_for_variant(&self, index: u32) -> (Option<DefId>, u32) {
-        assert!(!self.variants.is_empty());
+    pub fn discriminant_def_for_variant(&self, index: u32) -> Option<(Option<DefId>, u32)> {
         let mut explicit_index = index;
         let def = loop {
-            match self.variants[explicit_index as usize].discr {
+            match self.variants.get(explicit_index as usize)?.discr {
                 VariantDiscr::Relative(0) => break None,
                 VariantDiscr::Relative(distance) => explicit_index -= distance,
                 VariantDiscr::Explicit(def) => break Some(def),
             }
         };
-        (def, index - explicit_index)
+        Some((def, index - explicit_index))
     }
     /// collect.rs:825-850 and check/check.rs:2005-2101: the recovery values
     /// used by layout do not suppress evaluation, increment or duplicate errors.

@@ -5,5 +5,5 @@
 use crate::fmt;
 use crate::ops::FnPtr;
 
-impl<F: FnPtr> fmt::Debug for F { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Pointer::fmt(&(FnPtr::addr(*self) as *const ()), f) } }
 impl<F: FnPtr> fmt::Pointer for F { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Pointer::fmt(&(FnPtr::addr(*self) as *const ()), f) } }
+impl<F: FnPtr> fmt::Debug for F { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Pointer::fmt(&(FnPtr::addr(*self) as *const ()), f) } }

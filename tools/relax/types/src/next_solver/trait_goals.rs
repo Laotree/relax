@@ -48,7 +48,7 @@ impl EvalCtxt<'_, '_> {
                 if let TyKind::Alias(IsRigid::Yes, alias) = tcx.tys.kind(ty) {
                     if let AliasTyKind::Opaque { def_id } = alias.kind {
                         for bound in tcx.item_bounds(ecx.solver.prog,def_id) {
-                            if let PredicateKind::Clause(ClauseKind::Trait(t)) = bound.kind {
+                            if let PredicateKind::Clause(ClauseKind::Trait(t)) = &bound.kind {
                                 if t.trait_ref.def_id == tr.def_id && matches!(t.trait_ref.args.first(),Some(GenericArg::Type(t)) if matches!(tcx.tys.kind(*t),TyKind::Alias(_,a) if a.kind.def_id()==def_id)) { return Err(NoSolution.into()); }
                             }
                         }

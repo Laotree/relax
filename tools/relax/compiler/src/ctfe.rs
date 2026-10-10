@@ -72,9 +72,9 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
 }
 
 /// A successful N01 body is complete: constant queries resolve synchronously or unwind.
-fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<Body> {
+fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<std::sync::Arc<Body>> {
     let _o = crate::clock::origin("ctfe");
-    let b = crate::jit::ctfe_ahead_body(u, d, args).unwrap_or_else(|| crate::typeck::instantiate_body(
+    let b = std::sync::Arc::new(crate::typeck::instantiate_body(
         &crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()),
         &u.prog, &u.tcx, d, args));
     if !b.errors.is_empty() || !b.deferred_misses.is_empty() { return None; }
@@ -151,7 +151,7 @@ pub fn same_value(u: &mut Unit, t: TyId, a: u64, b: u64, depth: u32) -> bool {
                     }
                     let mut raw = [0u8; 16];
                     raw[..n as usize].copy_from_slice(bytes(a + toff as u64, n as usize));
-                    let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                    let Some(disc) = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt) else { return false; };
                     match adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                         Some(v) => v,
                         None => return true,
@@ -227,7 +227,7 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
                         }
                         let mut raw = [0u8; 16];
                         raw[..n as usize].copy_from_slice(bytes(a + toff as u64, n as usize));
-                        let disc = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt);
+                        let Some(disc) = crate::lower::decode_tag_const(u, i128::from_le_bytes(raw), &l, &adt) else { return all(mask); };
                         match adt.discriminants(&u.tcx, &u.prog).iter().position(|(_, v)| v.signed_value() == disc) {
                             Some(v) => v,
                             None => return all(mask),
@@ -1172,13 +1172,14 @@ impl<'a> Ctx<'a> {
                     return None;
                 }
                 let l = self.layout(from);
+                if l.uninhabited { return None; }
                 let disc = match l.tag {
                     Some((toff, crate::rir::Mem::Int(tn, ts))) => {
                         let raw = load_int(v.get(toff as usize..(toff + tn as u32) as usize)?, tn as usize, ts);
-                        crate::lower::decode_tag_const(self.u, raw, &l, &adt)
+                        crate::lower::decode_tag_const(self.u, raw, &l, &adt)?
                     }
                     None => match l.enc {
-                        crate::layout::TagEnc::Single(vi) => adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).signed_value(),
+                        crate::layout::TagEnc::Single(vi) => adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi)?.signed_value(),
                         _ => return None,
                     },
                     _ => return None,
@@ -1289,7 +1290,7 @@ impl<'a> Ctx<'a> {
             // the tag (lower::emit_store_disc)
             if let Some((toff, crate::rir::Mem::Int(tn, _))) = l.tag {
                 let tv = match l.enc {
-                    crate::layout::TagEnc::Direct => Some(adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi).val),
+                    crate::layout::TagEnc::Direct => Some(adt.discriminant_for_variant(&self.u.tcx, &self.u.prog, vi)?.val),
                     crate::layout::TagEnc::Single(_) => None,
                     crate::layout::TagEnc::Niche { untagged, lo, start, .. } => {
                         if vi == untagged {
@@ -1354,7 +1355,7 @@ impl<'a> Ctx<'a> {
         let body = match cached {
             Some(b) => b,
             None => {
-                let b = std::sync::Arc::new(check_quiet(self.u, d, &gargs)?);
+                let b = check_quiet(self.u, d, &gargs)?;
                 self.u.ctfe_fn_bodies.lock().unwrap_or_else(|e| e.into_inner()).insert(key, (epoch, b.clone()));
                 b
             }

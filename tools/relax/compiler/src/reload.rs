@@ -1732,9 +1732,10 @@ fn closure_ident(u: &Unit, slot: u32) -> Option<(u32, TyId, Vec<TyId>, TyId)> {
             ord += 1;
         }
     }
-    match u.tcx.tys.kind(body.ty(crate::ast::ExprId(ce))).clone() {
+    let ty = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), body.ty(crate::ast::ExprId(ce)));
+    match u.tcx.tys.kind(ty).clone() {
         crate::types::TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: owner, closure_sig_as_fn_ptr_ty: sig, .. }) => {
-            let storage = crate::layout::ClosureStorage::new(&u.tcx, &body, ce);
+            let storage = crate::layout::ClosureStorage::for_codegen(&u.prog, &u.tcx, &body, ce);
             Some((ord, sig, storage.fields, owner))
         },
         _ => None,

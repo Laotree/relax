@@ -58,6 +58,9 @@ impl crate::macro_reg::MacroRunner for JitRunner {
         native.declarations(attr, input, span)
     }
     fn reusable(&self, entry: &Entry) -> bool { crate::native_macros::find(entry).is_some() }
+    fn registered(&self, sess: &std::sync::Arc<crate::Session>) {
+        crate::native_macros::prepare(sess.runtime.native_macros);
+    }
     fn prewarm(&self, sess: &std::sync::Arc<crate::Session>) {
         prewarm(sess);
     }
@@ -210,9 +213,9 @@ pub fn free_world() -> bool {
 }
 
 /// Starts building the world on its own thread when the graph has proc macros the JIT host
-/// runs (none linked for them): it is ready, or nearly, when the first file needs it.
+/// runs (none linked for them): it is ready, or nearly, when the first file needs it. Only for
+/// a load that parses (run.rs); a warm restore builds it on the first expansion instead.
 fn prewarm(sess: &std::sync::Arc<crate::Session>) {
-    crate::native_macros::prepare(sess.runtime.native_macros);
     let (derives, bangs) = REG.with(|r| match r.borrow().as_ref() {
         Some(r) => (r.derives.iter().filter(|x| crate::native_macros::find(&x.1).is_none()).map(|x| x.0.clone()).collect::<Vec<_>>(), r.macros.iter().filter(|x| crate::native_macros::find(&x.1).is_none()).map(|x| x.0.clone()).collect::<Vec<_>>()),
         None => (Vec::new(), Vec::new()),

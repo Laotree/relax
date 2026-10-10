@@ -42,3 +42,5 @@ pub mod image;
 pub mod why;
 
 pub mod scc;
+
+pub mod solver_work;

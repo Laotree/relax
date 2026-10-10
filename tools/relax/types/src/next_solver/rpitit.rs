@@ -50,12 +50,12 @@ impl Tcx {
                 let trait_assoc = prog.trait_item_def_id[&def_id];
                 let trait_indices = self.generic_indices_of(prog, trait_assoc);
                 let trait_parent = self.generic_indices_of(prog, prog.def(trait_assoc).parent);
-                let mut indices = self.generic_indices_of(prog, prog.def(*fn_def_id).parent);
+                let mut indices = self.generic_indices_of(prog, prog.def(*fn_def_id).parent).clone();
                 let old_count = (trait_parent.types_consts.len() + trait_parent.lifetimes.len()) as u32;
                 let new_count = (indices.types_consts.len() + indices.lifetimes.len()) as u32;
-                for i in trait_indices.lifetimes { if i >= old_count { indices.lifetimes.push(i - old_count + new_count); } }
-                for i in trait_indices.types_consts { if i >= old_count { indices.types_consts.push(i - old_count + new_count); } }
-                for i in trait_indices.consts { if i >= old_count { indices.consts.push(i - old_count + new_count); } }
+                for &i in &trait_indices.lifetimes { if i >= old_count { indices.lifetimes.push(i - old_count + new_count); } }
+                for &i in &trait_indices.types_consts { if i >= old_count { indices.types_consts.push(i - old_count + new_count); } }
+                for &i in &trait_indices.consts { if i >= old_count { indices.consts.push(i - old_count + new_count); } }
                 return Some(indices);
             }
             None if prog.def(def_id).kind == DefKind::OpaqueTy => def_id,
@@ -98,27 +98,25 @@ impl Tcx {
         }
     }
 
-    pub fn own_clauses_of(&self, prog: &Program, def: DefId) -> Vec<Predicate> {
-        let mut clauses = self.clauses_of(prog, def);
-        if matches!(prog.def(def).kind, DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst) {
-            let count = self.clauses_of(prog, prog.def(def).parent).len();
-            clauses.drain(..count);
-        }
-        clauses
+    pub fn own_clauses_of(&self, prog: &Program, def: DefId) -> &[Predicate] {
+        self.declaration_queries(prog, def).own_clauses.get_or_init(|| self.own_clauses_uncached(prog, def))
     }
 
     /// rustc_hir_analysis/src/collect/item_bounds.rs: elaboration belongs to the provider.
-    pub fn item_bounds(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
+    pub fn item_bounds(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
+        self.declaration_queries(prog, def_id).item_bounds.get_or_init(|| self.item_bounds_uncached(prog, def_id))
+    }
+    fn item_bounds_uncached(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
         let mut out = Vec::new();
         for bound in self.explicit_item_bounds(prog, def_id) {
-            for predicate in self.supertraits(prog, bound) {
+            for predicate in self.supertraits(prog, bound.clone()) {
                 if !out.contains(&predicate) { out.push(predicate); }
             }
         }
         out
     }
-    pub fn explicit_item_bounds(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
-        crate::type_queries::Providers { tcx: self, prog }.explicit_item_bounds(def_id).expect("explicit_item_bounds query")
+    pub fn explicit_item_bounds(&self, prog: &Program, def_id: DefId) -> &[Predicate] {
+        self.declaration_queries(prog, def_id).explicit_item_bounds.get_or_init(|| self.explicit_item_bounds_uncached(prog, def_id))
     }
     pub(crate) fn explicit_item_bounds_uncached(&self, prog: &Program, def_id: DefId) -> Vec<Predicate> {
         match prog.impl_trait_in_trait_data.get(&def_id) {
@@ -180,7 +178,7 @@ impl Tcx {
             }
         }
         let mut collector = OpaqueTypeLifetimeCollector { tcx: self, prog, root, used: Vec::new() };
-        for p in &bounds {
+        for p in bounds {
             match &p.kind {
                 PredicateKind::Clause(ClauseKind::Trait(t)) => { for &a in &t.trait_ref.args[1..] { fold::fold_arg(&self.tys, a, &mut collector, 1); } }
                 PredicateKind::Clause(ClauseKind::Projection(p)) => {
@@ -197,7 +195,7 @@ impl Tcx {
         }
         let owner = prog.opaque_owner(root);
         let container = prog.def(owner).parent;
-        let trait_regions = if prog.def(container).kind == DefKind::Trait { self.generic_indices_of(prog, container).lifetimes } else { Vec::new() };
+        let trait_regions = if prog.def(container).kind == DefKind::Trait { self.generic_indices_of(prog, container).lifetimes.as_slice() } else { &[] };
         use crate::types::variance::V;
         let mut result = vec![V::Inv; parent.lifetimes.len() + parent.types_consts.len() + captures];
         for &index in &parent.lifetimes {
