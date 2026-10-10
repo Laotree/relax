@@ -10125,6 +10125,16 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 drop_why(up, why);
                 let u = &mut *up;
                 u.stats.tier1_dropped += 1;
+                // The slot got other code while this build ran -- nearly always its O2 build from
+                // the relax-O2 worker, queued together with this one (tier1_thread: o2_hot) and
+                // finished first. The slot is T_QUEUED (it no longer counts calls), so a dropped
+                // build left hot code at O2 for the rest of the run (sandbox leap: 917 of 3,388 O3
+                // builds dropped this way, 17% of the main thread's JIT samples in O2 code at
+                // steady state). Build it again from the new version (retier: RETIERS times at most
+                // per slot, so a slot a patch keeps changing is not chased).
+                if why == "slot changed meanwhile" && !u.fns[id as usize].o3.load(Ordering::Relaxed) {
+                    u.retier(id);
+                }
                 // Replay never retries according to install order; expose a refused install.
                 if let Some(k) = &t1key {
                     if t1prof_replay(options) { t1prof_divergence(why, k); }
