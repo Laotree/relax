@@ -80,8 +80,14 @@ impl Inputs {
         inputs
     }
 
+    /// More source files than this in one settled batch is a bulk change.
+    pub(super) const BULK_SOURCES: usize = 16;
+    /// Sources of more packages than this in one settled batch is a bulk change.
+    pub(super) const BULK_PACKAGES: usize = 4;
+
     pub(super) fn restart_reason<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Option<&'static str> {
         let mut packages = BTreeSet::new();
+        let mut sources = 0usize;
         let mut reason = None;
         for path in paths {
             match self.paths.get(path).map(|x| &x.1) {
@@ -89,14 +95,16 @@ impl Inputs {
                 Some(Kind::Std) => reason = Some("Relax's std changed"),
                 Some(Kind::Manifest) => { if reason.is_none() { reason = Some("the Cargo graph changed"); } }
                 Some(Kind::Build) => { if reason.is_none() { reason = Some("a build script changed"); } }
-                Some(Kind::Source(package)) => { packages.insert(package); }
+                Some(Kind::Source(package)) => { packages.insert(package); sources += 1; }
                 None => {}
             }
         }
-        // A transaction spanning package ownership boundaries can be a partial checkout.
-        // There is no atomic filesystem snapshot tying those packages to the loaded graph.
-        // Keep running the old program; this is a reload policy, not a capacity limit.
-        reason.or_else(|| (packages.len() > 1).then_some("sources in multiple packages changed (e.g. a git checkout)"))
+        // A bulk change (a git checkout / ff / stash pop) rewrites many files across packages at
+        // once and can leave the tree between revisions; an editor or an agent saving a multi-file
+        // edit touches a few files of a few packages, which a patch handles. Keep running the old
+        // program on a bulk change; this is a reload policy, not a capacity limit.
+        let bulk = sources > Self::BULK_SOURCES || packages.len() > Self::BULK_PACKAGES;
+        reason.or_else(|| bulk.then_some("many sources changed at once (e.g. a git checkout)"))
     }
 }
 
@@ -111,7 +119,15 @@ mod tests {
         inputs.insert(Path::new("app/b.rs"), Kind::Source("app".into()));
         inputs.insert(Path::new("dep/c.rs"), Kind::Source("dep".into()));
         assert_eq!(inputs.restart_reason(["app/a.rs", "app/b.rs"].into_iter()), None);
-        assert!(inputs.restart_reason(["app/a.rs", "dep/c.rs"].into_iter()).is_some());
+        // a multi-package edit (app + its library) is patched
+        assert_eq!(inputs.restart_reason(["app/a.rs", "dep/c.rs"].into_iter()), None);
+        // a checkout-sized batch is not
+        let many: Vec<String> = (0..=Inputs::BULK_SOURCES).map(|i| format!("bulk/{i}.rs")).collect();
+        for p in &many { inputs.insert(Path::new(p), Kind::Source("bulk".into())); }
+        assert!(inputs.restart_reason(many.iter().map(|s| s.as_str())).is_some());
+        let pkgs: Vec<String> = (0..=Inputs::BULK_PACKAGES).map(|i| format!("p{i}/a.rs")).collect();
+        for (i, p) in pkgs.iter().enumerate() { inputs.insert(Path::new(p), Kind::Source(format!("p{i}"))); }
+        assert!(inputs.restart_reason(pkgs.iter().map(|s| s.as_str())).is_some());
         for kind in [Kind::Provided, Kind::Build, Kind::Manifest, Kind::Std] {
             inputs.insert(Path::new("changed"), kind);
             assert!(inputs.restart_reason(["changed"].into_iter()).is_some());
