@@ -58,6 +58,7 @@ impl QueryLatch {
             (hook.pump)(runner, &|| self.result.lock().unwrap_or_else(|e| e.into_inner()).is_some());
             return self.result.lock().unwrap_or_else(|e| e.into_inner()).as_ref().unwrap().clone();
         }
+        let _w = (result.is_none()).then(|| crate::waits::begin(crate::waits::Kind::Query, 0, runner, "query"));
         while result.is_none() {
             drop(result);
             crate::preempt::point();

@@ -215,6 +215,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             // type/borrow check (`--deep` also compiles), run nothing
             "--check" => check = true,
             "--watch" => watch = true,
+            // relax inspect: panics park for an agent and events are printed on stderr
+            "--agent" => crate::inspect::AGENT.store(true, Ordering::Relaxed),
             "--deep" => deep = true,
             "--json" if crate::diag::enabled() => {
                 QUIET.store(true, Ordering::Relaxed);
@@ -280,6 +282,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     let package = args[i].clone();
+    // relax inspect: the program answers questions from now on (compiles included)
+    if !check && session.is_none() && entries.is_empty() && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
+        crate::inspect::start(&package);
+    }
     let mut cargo_flags = Vec::new();
     let mut prog_args: Vec<Vec<u8>> = vec![package.clone().into_bytes()];
     let mut k = i + 1;

@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `relax` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "fetch", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition", "host-gen",
+    "run", "fetch", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition", "host-gen",
     "parse", "resolve", "file", "std-surface", "relax-lex", "help",
 ];
 
@@ -120,6 +120,7 @@ fn main_page(st: &Style) -> String {
     p.row("run <package>", "Run an app from this workspace");
     p.row("run <git-url> <package>", "Run an app straight from a git repository");
     p.row("fetch <git-url>", "Fetch a repository into the local store");
+    p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
     p.row("check <package>", "Type- and borrow-check without running");
     p.row("selftest <package>", "Test Relax: compile every fn of a package, list failures");
     p.row("test <file.rs> [filter]", "Run a crate's tests");
@@ -158,6 +159,7 @@ fn run_page(st: &Style) -> String {
     p.row("--quiet", "Hide the compile-error stream");
     p.row("--ahead", "Compile in the background what the last run used");
     p.row("--units <json>", "Use a saved unit graph instead of cargo");
+    p.row("--agent", "Park panics for an agent; print events on stderr");
     p.row("--relaxed[=<list>]", "Relaxed Rust for every crate (all, or a list)");
     p.row("--mount <dir>=<git-url>", "Mount another repository at a folder of the\nfirst (repeatable); an optional #ref pins it");
     p.row("--cached", "Run the newest local snapshot at once, and\nrefresh it in the background for next time");
@@ -282,12 +284,32 @@ fn clean_page(st: &Style) -> String {
     p.out
 }
 
+fn inspect_page(st: &Style) -> String {
+    let mut p = Page::new(st, 34);
+    title(&mut p, "ask a running app about itself");
+    p.blank();
+    p.usage("relax inspect <pid|app|all|list> <command> [k=v]...");
+    p.blank();
+    p.text("Every `relax run` listens on a local socket. Answers are JSON lines,");
+    p.text("pre-analysed and bounded, each starting with what was measured.");
+    p.section("Questions:");
+    p.row("why-hung", "Verdict, wait chain or cycle, stacks");
+    p.row("watch [on=panic,hang,..]", "Wait for the next event, print it, exit");
+    p.row("events follow=1", "Stream events, one line each");
+    p.row("threads | stacks | waits", "Threads, symbolised stacks, waits");
+    p.row("panics | resume <id> panic", "Parked panics");
+    p.row("help schema", "Tool definition for agents");
+    p.text("`all` covers every running app, also ones started later.");
+    p.out
+}
+
 /// The page for `relax help [command]`; None for a word that is no command.
 fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
     Some(match cmd {
         None | Some("help") => main_page(st),
         Some("run") => run_page(st),
         Some("fetch") => fetch_page(st),
+        Some("inspect") => inspect_page(st),
         Some("check") => check_page(st),
         Some("selftest") => selftest_page(st),
         Some("test") => test_page(st),

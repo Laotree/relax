@@ -41,6 +41,7 @@ pub mod std_digest;
 pub mod tar;
 pub mod image;
 pub mod why;
+pub mod waits;
 
 pub mod scc;
 

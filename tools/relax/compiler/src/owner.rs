@@ -170,6 +170,17 @@ pub fn serving_note() -> String {
     }
 }
 
+/// The request queue as a JSON object (relax inspect; atomics only, never the queue's lock):
+/// queued requests, of which foreground (main + app) and main.
+pub fn queued_note() -> String {
+    format!(
+        "{{\"total\":{},\"foreground\":{},\"main\":{}}}",
+        QUEUED_N.load(Ordering::Relaxed),
+        FOREGROUND.load(Ordering::Relaxed),
+        MAIN_QUEUED.load(Ordering::Relaxed)
+    )
+}
+
 /// What the main thread's longest post-present wait was behind (diagnostics).
 pub fn main_wait_behind() -> String {
     match MAIN_WAIT_BEHIND.load(Ordering::Relaxed) {
@@ -194,6 +205,7 @@ pub fn start() {
             .spawn(move || {
                 IS_OWNER.with(|o| o.set(true));
                 OWNER_TID.store(me(), Ordering::SeqCst);
+                crate::waits::register();
                 let _ = OWNER_THREAD.set(std::thread::current());
                 crate::jit::ensure_altstack();
                 let _ = tx.send(());
@@ -265,7 +277,10 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     in_call_add(1);
     push(&req as *const Req as usize, class);
-    let withdrawn = wait(&req, deadline);
+    let withdrawn = {
+        let _w = crate::waits::begin(crate::waits::Kind::Owner, class as u64, OWNER_TID.load(Ordering::Relaxed), CLASS_NAMES[class as usize]);
+        wait(&req, deadline)
+    };
     in_call_add(-1);
     if main_wait {
         let w = crate::jit::wall_ns() - t0;
@@ -529,6 +544,15 @@ fn owner_loop() -> ! {
 /// requests (a type check's constant, a back end's finish). On another thread it waits
 /// plainly. `done` only reads state or takes leaf locks.
 pub fn pump_wait(done: &dyn Fn() -> bool) {
+    pump_wait_for(0, done)
+}
+
+/// `pump_wait` for a wait on thread `runner` (0: unknown), as the wait registry records it.
+fn pump_wait_for(runner: u64, done: &dyn Fn() -> bool) {
+    if done() {
+        return;
+    }
+    let _w = crate::waits::begin(crate::waits::Kind::Pump, 0, runner, "pump");
     if !is_owner() || CHILD.load(Ordering::Relaxed) {
         let t0 = std::time::Instant::now();
         while !done() {
@@ -574,7 +598,7 @@ fn pump_latch(runner: u64, done: &dyn Fn() -> bool) {
         }
         panic!("relax: a query waits for itself on the compiler's owner thread (a query cycle the engine did not see)");
     }
-    pump_wait(done);
+    pump_wait_for(runner, done);
 }
 
 /// A request served nested cannot do what only the owner's earlier request may finish (a load,

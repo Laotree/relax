@@ -203,6 +203,12 @@ pub fn compiling() {
     PHASE.store(9, Ordering::Relaxed);
 }
 
+/// The session log of this run (`relax-run: session log ...`), once `start` made one.
+pub fn session_log_path() -> Option<std::path::PathBuf> {
+    SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+static SESSION_LOG: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
 #[cfg(not(unix))]
 pub fn start(_progress: bool) {}
 #[cfg(not(unix))]
@@ -382,6 +388,7 @@ mod unix {
             unsafe { close(out); close(write_fd); close(read_fd); }
             return;
         }
+        *super::SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
         let note = format!("relax-run: session log {}\n", path.display());
         out_all(write_fd, note.as_bytes());
         let mut st = State { out, read_fd, write_fd, path, forwarded: 0, partial: Vec::new(), drawn: false, last_draw_ms: 0.0 };

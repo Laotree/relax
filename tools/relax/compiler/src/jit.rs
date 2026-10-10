@@ -1304,6 +1304,8 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         eprintln!("relax: {} on a thread without a recovery point: {}\n  panic in a function that cannot unwind, aborting\n  report: {}", kind, info.message, r);
         std::process::abort();
     }
+    // relax inspect: a watched run parks the panic here, stack intact, until a client decides
+    crate::inspect::events::on_panic(&info);
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
         let mut v = f.borrow_mut();
@@ -11019,6 +11021,9 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         // `"..".parse::<TokenStream>()` in JIT-run proc macros (std proc_macro; pmhost.rs)
         b"relax_pm_parse" => Some(crate::pmhost::relax_pm_parse as *const () as usize),
         b"__relax_exit" => Some(__relax_exit as *const () as usize),
+        // relax inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
+        b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
+        b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
         // run-time modules (modules.rs; Relax's std::relax)
         _ => crate::modules::symbol(name),
     }

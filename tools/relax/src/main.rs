@@ -112,6 +112,8 @@ fn main() {
             std::process::exit(0);
         }
         Some("help") => std::process::exit(help::help(&args[2..])),
+        // `inspect <pid|app|all|list> <command>`: ask a running app (no compiler started here)
+        Some("inspect") => std::process::exit(relax_compiler::inspect::client::main(&args[2..])),
         // `run <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <package> ...`
         Some("run") => match fetch::split_args(&args[2..]) {
             None => {}

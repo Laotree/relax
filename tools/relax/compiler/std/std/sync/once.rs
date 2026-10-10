@@ -7,7 +7,8 @@ use core::ops::Deref;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::sys::os::{futex_wait, futex_wake_all};
+use crate::sys::os::futex_wake_all;
+use crate::sync::raw::{futex_wait, WAIT_ONCE};
 
 const INCOMPLETE: u32 = 3;
 const POISONED: u32 = 2;
@@ -113,7 +114,7 @@ impl Once {
                     continue;
                 }
             }
-            futex_wait(&self.state_and_queued, state_and_queued, None);
+            futex_wait(&self.state_and_queued, state_and_queued, None, WAIT_ONCE, 0);
             state_and_queued = self.state_and_queued.load(Acquire);
         }
     }
@@ -150,7 +151,7 @@ impl Once {
                     continue;
                 }
             }
-            futex_wait(&self.state_and_queued, state_and_queued, None);
+            futex_wait(&self.state_and_queued, state_and_queued, None, WAIT_ONCE, 0);
             state_and_queued = self.state_and_queued.load(Acquire);
         }
     }

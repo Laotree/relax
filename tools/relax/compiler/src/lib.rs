@@ -39,6 +39,7 @@ pub mod store;
 pub mod cache;
 pub mod clean;
 pub mod mainprof;
+pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
 #[cfg(test)]

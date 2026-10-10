@@ -232,8 +232,15 @@ pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<N
 }
 
 pub fn join_thread(t: NativeThread) {
+    // relax inspect's wait registry: this thread waits for thread `t` (kind 7: join)
+    extern "C" {
+        fn __relax_wait_enter(kind: u32, addr: usize, holder: usize);
+        fn __relax_wait_leave();
+    }
     unsafe {
+        __relax_wait_enter(7, 0, t as usize);
         pthread_join(t, core::ptr::null_mut());
+        __relax_wait_leave();
     }
 }
 

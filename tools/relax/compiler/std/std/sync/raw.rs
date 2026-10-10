@@ -5,21 +5,54 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::time::Duration;
 
-use crate::sys::os::{futex_wait, futex_wake, futex_wake_all};
+use crate::sys::os::{futex_wake, futex_wake_all};
+
+// relax inspect's wait registry (loader entries): a blocking wait names what it waits on and,
+// for a mutex, its holder. Called only around a wait that blocks anyway.
+extern "C" {
+    fn __relax_wait_enter(kind: u32, addr: usize, holder: usize);
+    fn __relax_wait_leave();
+}
+
+pub(crate) const WAIT_MUTEX: u32 = 1;
+pub(crate) const WAIT_CONDVAR: u32 = 2;
+pub(crate) const WAIT_READ: u32 = 3;
+pub(crate) const WAIT_WRITE: u32 = 4;
+pub(crate) const WAIT_PARK: u32 = 5;
+pub(crate) const WAIT_ONCE: u32 = 6;
+
+/// futex_wait, recorded in the wait registry while it blocks.
+pub(crate) fn futex_wait(futex: &AtomicU32, expected: u32, timeout: Option<Duration>, kind: u32, holder: usize) -> bool {
+    unsafe { __relax_wait_enter(kind, futex.as_ptr() as usize, holder) };
+    let r = crate::sys::os::futex_wait(futex, expected, timeout);
+    unsafe { __relax_wait_leave() };
+    r
+}
 
 fn spin_loop() {
     core::hint::spin_loop();
 }
 
-// ---- Mutex: 0 unlocked, 1 locked, 2 locked with waiters
+// ---- Mutex: 0 unlocked; otherwise the holder's tag, with CONTENDED set when threads wait
+//
+// The tag names the holder without a thread-local lookup: its stack page number (bits 1..31,
+// bit 0 set so a tag is never 0). relax inspect maps a tag to the thread whose stack holds that
+// page (hang analysis: who holds the lock a thread waits for).
 
 pub struct RawMutex {
     futex: AtomicU32,
 }
 
 const UNLOCKED: u32 = 0;
-const LOCKED: u32 = 1;
-const CONTENDED: u32 = 2;
+const CONTENDED: u32 = 1 << 31;
+
+/// The calling thread's holder tag.
+#[inline(always)]
+fn holder_tag() -> u32 {
+    let mark = 0u8;
+    let sp = core::hint::black_box(&mark) as *const u8 as usize;
+    ((((sp >> 12) << 1) | 1) & 0x7fff_ffff) as u32
+}
 
 impl RawMutex {
     pub const fn new() -> RawMutex {
@@ -27,29 +60,44 @@ impl RawMutex {
     }
 
     pub fn try_lock(&self) -> bool {
-        self.futex.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_ok()
+        self.futex.compare_exchange(UNLOCKED, holder_tag(), Acquire, Relaxed).is_ok()
     }
 
     pub fn lock(&self) {
-        if self.futex.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed).is_err() {
-            self.lock_contended();
+        let me = holder_tag();
+        if self.futex.compare_exchange(UNLOCKED, me, Acquire, Relaxed).is_err() {
+            self.lock_contended(me);
         }
     }
 
     #[cold]
-    fn lock_contended(&self) {
+    fn lock_contended(&self, me: u32) {
         let mut state = self.spin();
         if state == UNLOCKED {
-            match self.futex.compare_exchange(UNLOCKED, LOCKED, Acquire, Relaxed) {
+            match self.futex.compare_exchange(UNLOCKED, me, Acquire, Relaxed) {
                 Ok(_) => return,
                 Err(s) => state = s,
             }
         }
         loop {
-            if state != CONTENDED && self.futex.swap(CONTENDED, Acquire) == UNLOCKED {
-                return;
+            // after a wait, others may wait too: the lock is taken marked contended
+            if state == UNLOCKED {
+                match self.futex.compare_exchange(UNLOCKED, me | CONTENDED, Acquire, Relaxed) {
+                    Ok(_) => return,
+                    Err(s) => {
+                        state = s;
+                        continue;
+                    }
+                }
             }
-            futex_wait(&self.futex, CONTENDED, None);
+            if state & CONTENDED == 0 {
+                if let Err(s) = self.futex.compare_exchange(state, state | CONTENDED, Relaxed, Relaxed) {
+                    state = s;
+                    continue;
+                }
+                state |= CONTENDED;
+            }
+            futex_wait(&self.futex, state, None, WAIT_MUTEX, (state & !CONTENDED) as usize);
             state = self.spin();
         }
     }
@@ -58,7 +106,7 @@ impl RawMutex {
         let mut spin = 100;
         loop {
             let state = self.futex.load(Relaxed);
-            if state != LOCKED || spin == 0 {
+            if state == UNLOCKED || state & CONTENDED != 0 || spin == 0 {
                 return state;
             }
             spin_loop();
@@ -68,7 +116,7 @@ impl RawMutex {
 
     /// # Safety: the calling thread holds the lock.
     pub unsafe fn unlock(&self) {
-        if self.futex.swap(UNLOCKED, Release) == CONTENDED {
+        if self.futex.swap(UNLOCKED, Release) & CONTENDED != 0 {
             futex_wake(&self.futex);
         }
     }
@@ -96,7 +144,7 @@ impl RawCondvar {
     pub unsafe fn wait(&self, mutex: &RawMutex, timeout: Option<Duration>) -> bool {
         let value = self.futex.load(Relaxed);
         mutex.unlock();
-        let r = futex_wait(&self.futex, value, timeout);
+        let r = futex_wait(&self.futex, value, timeout, WAIT_CONDVAR, 0);
         mutex.lock();
         r
     }
@@ -195,7 +243,7 @@ impl RawRwLock {
                     continue;
                 }
             }
-            futex_wait(&self.state, state | READERS_WAITING, None);
+            futex_wait(&self.state, state | READERS_WAITING, None, WAIT_READ, 0);
             has_slept = true;
             state = self.spin_read();
         }
@@ -263,7 +311,7 @@ impl RawRwLock {
             if is_unlocked(state) || !has_writers_waiting(state) {
                 continue;
             }
-            futex_wait(&self.writer_notify, seq, None);
+            futex_wait(&self.writer_notify, seq, None, WAIT_WRITE, 0);
             state = self.spin_write();
         }
     }
@@ -345,7 +393,7 @@ impl Parker {
             return;
         }
         loop {
-            futex_wait(&self.state, PARK_PARKED, None);
+            futex_wait(&self.state, PARK_PARKED, None, WAIT_PARK, 0);
             if self.state.compare_exchange(PARK_NOTIFIED, PARK_EMPTY, Acquire, Acquire).is_ok() {
                 return;
             }
@@ -355,7 +403,7 @@ impl Parker {
         if self.state.fetch_sub(1, Acquire) == PARK_NOTIFIED {
             return;
         }
-        futex_wait(&self.state, PARK_PARKED, Some(timeout));
+        futex_wait(&self.state, PARK_PARKED, Some(timeout), WAIT_PARK, 0);
         self.state.swap(PARK_EMPTY, Acquire);
     }
     pub fn unpark(&self) {
