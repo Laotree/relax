@@ -116,6 +116,7 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         *GANDALF_CONSOLE.lock().unwrap() = Some(crate::gandalf_out::Console::start(crate::diag::enabled(), args.iter().any(|a| a == "--quiet")));
     }
     let code = cmd_run_inner(sess, args, None);
+    crate::tui::exit_code(code);
     if let Some(exit) = EXIT_SUMMARY.get() {
         // atexit runs after application TLS destructors. Do not quiesce earlier:
         // those destructors may still call JIT code on the returning main thread.
@@ -248,8 +249,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("RELAX_RUN_PROGRESS") };
-    if !check && !watch && session.is_none() && entries.is_empty() && !driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled() {
-        crate::tui::start();
+    if !check && !watch && session.is_none() && entries.is_empty() {
+        crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
     }
     // `relax run` of a working tree is a live session (watcher + hot reload); sources served from
     // a store (`relax run <git url>`, mounted bundles) are not, and neither are checks and the
@@ -1697,7 +1698,6 @@ fn start_exit_summary() {
         let Ok((why, code)) = receive.recv() else { return };
         EXIT_PERSIST.store(true, Ordering::SeqCst);
         exit_mark("start");
-        crate::tui::finish(false);
         remove_present_report();
         if let Some(code) = code { report("exit", &code.to_string()); }
         // background compilers stop and release the unit: the errors, the panic's report and
@@ -1721,6 +1721,7 @@ fn start_exit_summary() {
         if let Some(dcx) = RUN_DIAGNOSTICS.lock().unwrap().as_ref() { dcx.flush_delayed(); }
         exit_mark("summary tail");
         exit_report();
+        crate::tui::finish(false);
     });
     // Failure to start optional cleanup must not turn a successful run into a failure.
     if let Ok(worker) = worker { let _ = EXIT_SUMMARY.set(ExitSummary { request, worker, code: std::sync::OnceLock::new() }); }
@@ -1812,6 +1813,7 @@ fn front_recordable() -> bool {
 /// 5 s after SIGTERM left no manifest and no collected program, so every relaunch was cold.
 /// The exit write still runs and adds what came after.
 pub(crate) extern "C" fn relax_quit_requested() {
+    crate::tui::abnormal();
     static ONCE: AtomicBool = AtomicBool::new(false);
     jit::QUIT_SEEN.store(true, Ordering::Relaxed);
     if ONCE.swap(true, Ordering::SeqCst) || unsafe { RUN_UNIT }.is_null() { return; }

@@ -11301,6 +11301,7 @@ pub fn set_exit_hook(f: extern "C" fn()) {
 /// compile waited forever for the unit lock of a thread ExitProcess had already ended (Amp never
 /// exited after its window closed).
 pub extern "C" fn __relax_exit(code: i32) {
+    crate::tui::exit_code(code);
     let h = EXIT_HOOK.load(Ordering::SeqCst);
     if h != 0 {
         let f: extern "C" fn() = unsafe { std::mem::transmute(h) };
@@ -11309,9 +11310,17 @@ pub extern "C" fn __relax_exit(code: i32) {
     os::proc::exit(code)
 }
 
+#[cfg(unix)]
+extern "C" fn recorded_exit(code: i32) -> ! {
+    crate::tui::exit_code(code);
+    os::proc::exit(code)
+}
+
 /// Symbols the loader provides to the programs it runs (found through dlsym).
 fn loader_symbol(name: &[u8]) -> Option<usize> {
     match name {
+        #[cfg(unix)]
+        b"exit" => Some(recorded_exit as *const () as usize),
         b"relax_allocator_swap" => Some(relax_allocator_swap as *const () as usize),
         b"relax_first_present" => Some(relax_first_present as *const () as usize),
         b"relax_quit_requested" => Some(crate::run::relax_quit_requested as *const () as usize),

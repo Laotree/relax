@@ -1,14 +1,14 @@
 //! The boot progress line of `relax run` on a terminal: one line redrawn in place while the
 //! program boots (phase, counts, time), replaced at first present by one summary line.
 //!
-//! How it stays out of the way: while the bar is up, fd 2 is a pipe. One small thread forwards
+//! How it stays out of the way: fd 2 writes directly to a private session log. One thread forwards
 //! everything written to it (errors, warnings, the program's own stderr, [I] log lines) to the real
 //! terminal, erasing the bar before each batch of lines and drawing it again after, so output
 //! prints above the bar and nothing is garbled. The thread redraws at most ~20 times a second from
 //! plain atomics (phase, crate counter, compiled functions); the compile path takes no lock and
-//! does no extra work. At first present (jit.rs relax_first_present) fd 2 is the terminal again.
-//! Off (no bar, today's plain lines): stderr not a terminal, `--quiet`, `--verbose`, NO_COLOR,
-//! a launcher's report file, non-Unix.
+//! does no extra work. At first present only the bar ends; the transcript continues until exit.
+//! A signal or crash cannot lose data in a forwarding pipe. Only a confirmed clean exit
+//! deletes the transcript. Non-terminal runs keep the same plain output, with a log path.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
@@ -18,6 +18,11 @@ static PHASE: AtomicU8 = AtomicU8::new(0);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Item tracking (the bar, or --verbose's slowest lists) is on.
 static TRACK: AtomicBool = AtomicBool::new(false);
+static EXIT_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+static ABNORMAL: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn exit_code(code: i32) { EXIT_CODE.store(code, Ordering::Release); }
+pub(crate) fn abnormal() { ABNORMAL.store(true, Ordering::Release); }
 
 // ---- what each compiling thread is on: one slot per thread, written without locks.
 // A slot is a sequence number (odd while written), the start (ms since process start, +1) and
@@ -199,7 +204,7 @@ pub fn compiling() {
 }
 
 #[cfg(not(unix))]
-pub fn start() {}
+pub fn start(_progress: bool) {}
 #[cfg(not(unix))]
 pub fn finish(_summary: bool) {}
 
@@ -210,42 +215,34 @@ pub use unix::{finish, start};
 mod unix {
     use super::*;
     use std::io::IsTerminal;
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::Mutex;
 
-    #[repr(C)]
-    struct PollFd {
-        fd: i32,
-        events: i16,
-        revents: i16,
-    }
     extern "C" {
-        fn pipe(fds: *mut i32) -> i32;
         fn dup(fd: i32) -> i32;
         fn dup2(a: i32, b: i32) -> i32;
         fn close(fd: i32) -> i32;
         fn read(fd: i32, buf: *mut u8, n: usize) -> isize;
         fn write(fd: i32, buf: *const u8, n: usize) -> isize;
-        fn poll(fds: *mut PollFd, n: u64, ms: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn atexit(f: extern "C" fn()) -> i32;
     }
-    #[cfg(target_os = "macos")]
-    const O_NONBLOCK: i32 = 0x4;
-    #[cfg(not(target_os = "macos"))]
-    const O_NONBLOCK: i32 = 0x800;
 
     struct State {
         /// the real stderr (a dup of it)
         out: i32,
         read_fd: i32,
-        /// our copy of the pipe's write end (fd 2 is the other); -1 once closed
+        /// A separate append descriptor; fd 2 writes to the same durable log.
         write_fd: i32,
+        path: std::path::PathBuf,
+        forwarded: u64,
         /// bytes of a line that has no newline yet
         partial: Vec<u8>,
         drawn: bool,
         last_draw_ms: f64,
     }
     static STATE: Mutex<Option<State>> = Mutex::new(None);
+    static READY_LINE: AtomicBool = AtomicBool::new(false);
 
     fn out_all(fd: i32, mut b: &[u8]) {
         while !b.is_empty() {
@@ -329,38 +326,28 @@ mod unix {
         st.last_draw_ms = crate::clock::ms_since_process_start() as f64;
     }
 
-    /// Reads what is in the pipe (nonblocking) and prints its whole lines above the bar.
-    /// Returns false at end of input.
-    fn pump(st: &mut State, flush_partial: bool) -> bool {
+    /// Drain a snapshot of the log. New writes never extend this pass indefinitely.
+    /// A busy producer can leave bytes for the next tick; none are dropped or capped.
+    fn pump(st: &mut State, flush_partial: bool) {
+        let end = std::fs::metadata(&st.path).map_or(st.forwarded, |m| m.len());
+        let started = std::time::Instant::now();
         let mut buf = [0u8; 8192];
-        let mut open = true;
-        let mut got = false;
-        loop {
-            let n = unsafe { read(st.read_fd, buf.as_mut_ptr(), buf.len()) };
-            if n == 0 {
-                open = false;
-                break;
-            }
-            if n < 0 {
-                break;
-            }
+        while st.forwarded < end {
+            let take = (end - st.forwarded).min(buf.len() as u64) as usize;
+            let n = unsafe { read(st.read_fd, buf.as_mut_ptr(), take) };
+            if n <= 0 { break; }
+            st.forwarded += n as u64;
             st.partial.extend_from_slice(&buf[..n as usize]);
-            got = true;
+            // Yield display work to the ticker even when diagnostics stream continuously.
+            if !flush_partial && started.elapsed().as_millis() >= 25 { break; }
         }
         let cut = if flush_partial { st.partial.len() } else { st.partial.iter().rposition(|&c| c == b'\n').map_or(0, |i| i + 1) };
         if cut > 0 {
             let mut chunk: Vec<u8> = st.partial.drain(..cut).collect();
-            if flush_partial && chunk.last() != Some(&b'\n') {
-                chunk.push(b'\n');
-            }
+            if flush_partial && chunk.last() != Some(&b'\n') { chunk.push(b'\n'); }
             erase(st);
             out_all(st.out, &chunk);
-            if ACTIVE.load(Ordering::Relaxed) && !flush_partial {
-                draw(st);
-            }
         }
-        let _ = got;
-        open
     }
 
     extern "C" fn at_exit() {
@@ -369,59 +356,62 @@ mod unix {
         if !crate::preempt::is_stopped() { finish(false); }
     }
 
-    /// Puts the bar up when this run is on a terminal and nothing asks for plain output.
-    pub fn start() {
+    /// Start a durable transcript, and optionally the terminal progress bar.
+    pub fn start(progress: bool) {
         unsafe { std::env::remove_var("RELAX_RUN_PROGRESS") };
+        if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() || STATE.lock().unwrap().is_some() { return; }
         let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
-        if !std::io::stderr().is_terminal()
-            || env("NO_COLOR").is_some()
-            || env("RELAX_REPORT_TO").is_some()
-            || env("RELAX_SCRIPT_DEPTH").is_some()
-            || ACTIVE.load(Ordering::Relaxed)
-        {
+        let progress = progress && std::io::stderr().is_terminal()
+            && env("NO_COLOR").is_none() && env("RELAX_REPORT_TO").is_none();
+        let path = std::env::temp_dir().join(format!("relax-session-{}-{}.log", std::process::id(), crate::clock::wall_ns()));
+        let writer = match std::fs::OpenOptions::new().create_new(true).append(true).mode(0o600).open(&path) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("relax-run: cannot create session log: {e}"); return; }
+        };
+        let reader = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => { eprintln!("relax-run: cannot read session log {}: {e}", path.display()); return; }
+        };
+        let out = unsafe { dup(2) };
+        if out < 0 { return; }
+        let write_fd = writer.into_raw_fd();
+        let read_fd = reader.into_raw_fd();
+        if unsafe { dup2(write_fd, 2) } < 0 {
+            unsafe { close(out); close(write_fd); close(read_fd); }
             return;
         }
-        let (mut fds, out) = ([0i32; 2], unsafe { dup(2) });
-        if out < 0 || unsafe { pipe(fds.as_mut_ptr()) } != 0 {
-            return;
-        }
-        unsafe {
-            fcntl(fds[0], 4, fcntl(fds[0], 3, 0) | O_NONBLOCK);
-        }
-        if unsafe { dup2(fds[1], 2) } < 0 {
-            return;
-        }
-        let mut st = State { out, read_fd: fds[0], write_fd: fds[1], partial: Vec::new(), drawn: false, last_draw_ms: 0.0 };
+        let note = format!("relax-run: session log {}\n", path.display());
+        out_all(write_fd, note.as_bytes());
+        let mut st = State { out, read_fd, write_fd, path, forwarded: 0, partial: Vec::new(), drawn: false, last_draw_ms: 0.0 };
         PHASE.store(1, Ordering::Relaxed);
-        TRACK.store(true, Ordering::Relaxed);
-        draw(&mut st);
+        if progress { TRACK.store(true, Ordering::Relaxed); }
+        ACTIVE.store(progress, Ordering::Relaxed);
+        pump(&mut st, false);
+        if progress { draw(&mut st); }
         *STATE.lock().unwrap() = Some(st);
-        ACTIVE.store(true, Ordering::Relaxed);
-        unsafe { std::env::set_var("RELAX_RUN_PROGRESS", "1") };
+        if progress { unsafe { std::env::set_var("RELAX_RUN_PROGRESS", "1") }; }
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); }));
         unsafe { atexit(at_exit) };
-        let _ = std::thread::Builder::new().name("relax-progress".into()).spawn(forward);
+        if let Err(e) = std::thread::Builder::new().name("relax-progress".into()).spawn(forward) {
+            eprintln!("relax-run: cannot forward session log: {e}");
+            abnormal();
+            finish(false);
+        }
     }
 
-    /// Forwards the pipe until every writer is gone; draws the bar while it is up.
     fn forward() {
-        let rfd = match STATE.lock().unwrap().as_ref() {
-            Some(s) => s.read_fd,
-            None => return,
-        };
         loop {
-            let mut p = PollFd { fd: rfd, events: 1, revents: 0 };
-            unsafe { poll(&mut p, 1, 50) };
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let mut g = STATE.lock().unwrap();
             let Some(st) = g.as_mut() else { return };
-            if !pump(st, false) {
-                // end of input: all writers closed (after finish)
-                if !ACTIVE.load(Ordering::Relaxed) {
-                    unsafe { close(st.read_fd) };
-                    *g = None;
-                }
-                return;
+            pump(st, false);
+            if READY_LINE.swap(false, Ordering::AcqRel) {
+                let active = ACTIVE.swap(false, Ordering::Relaxed);
+                erase(st);
+                if active { ready_line(st); }
             }
-            if ACTIVE.load(Ordering::Relaxed) && crate::clock::ms_since_process_start() as f64 - st.last_draw_ms >= 50.0 {
+            if ACTIVE.load(Ordering::Relaxed) && crate::clock::ms_since_process_start() - st.last_draw_ms >= 50.0 {
                 draw(st);
             }
         }
@@ -430,32 +420,40 @@ mod unix {
     /// Takes the bar down and gives fd 2 back its terminal. `summary`: first present, print the
     /// ready line. Idempotent.
     pub fn finish(summary: bool) {
-        let mut g = STATE.lock().unwrap();
-        let Some(st) = g.as_mut() else { return };
-        if !ACTIVE.swap(false, Ordering::Relaxed) {
+        // The native first-present callback runs on the UI thread. It must never
+        // wait for log I/O or a terminal reader; the display worker owns both.
+        if summary {
+            READY_LINE.store(true, Ordering::Release);
             return;
         }
-        let _ = pump(st, true);
+        let mut g = STATE.lock().unwrap();
+        let Some(st) = g.as_mut() else { return };
+        ACTIVE.store(false, Ordering::Relaxed);
+        pump(st, true);
         erase(st);
-        if summary {
-            let pkg = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "program".to_string());
-            let cache = match std::env::var("RELAX_RUN_CACHE").as_deref() {
-                Ok("warm") => " (warm)".to_string(),
-                Ok("cold") => " (cold)".to_string(),
-                _ => String::new(),
-            };
-            let ms = crate::clock::ms_since_process_start() as f64;
-            let line = format!("{} {} ready in {}{}\n", style("1;32", "\u{2713}"), style("1;36", &pkg), secs(ms), style("2", &cache));
-            out_all(st.out, line.as_bytes());
+        unsafe { dup2(st.out, 2); close(st.write_fd); }
+        pump(st, true);
+        let clean = EXIT_CODE.load(Ordering::Acquire) == 0 && !ABNORMAL.load(Ordering::Acquire);
+        if clean {
+            if let Err(e) = std::fs::remove_file(&st.path) {
+                out_all(st.out, format!("relax-run: session log kept at {}: {e}\n", st.path.display()).as_bytes());
+            }
+        } else {
+            out_all(st.out, format!("relax-run: session log kept at {}\n", st.path.display()).as_bytes());
         }
-        unsafe {
-            dup2(st.out, 2);
-            close(st.write_fd);
-        }
-        st.write_fd = -1;
-        // the forwarder drains what children that still hold the pipe write, then ends
-        if !summary {
-            let _ = pump(st, true);
-        }
+        unsafe { close(st.read_fd); close(st.out); }
+        *g = None;
+    }
+
+    fn ready_line(st: &State) {
+        let pkg = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "program".to_string());
+        let cache = match std::env::var("RELAX_RUN_CACHE").as_deref() {
+            Ok("warm") => " (warm)".to_string(),
+            Ok("cold") => " (cold)".to_string(),
+            _ => String::new(),
+        };
+        let ms = crate::clock::ms_since_process_start() as f64;
+        let line = format!("{} {} ready in {}{}\n", style("1;32", "\u{2713}"), style("1;36", &pkg), secs(ms), style("2", &cache));
+        out_all(st.out, line.as_bytes());
     }
 }
