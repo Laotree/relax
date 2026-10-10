@@ -209,16 +209,21 @@ pub fn call_quick<R>(class: Class, f: impl FnOnce() -> R) -> R {
 
 /// `call`, unless the owner has not started it within `ms`: then it is withdrawn (None).
 pub fn call_within<R>(class: Class, ms: u64, f: impl FnOnce() -> R) -> Option<R> {
-    request(class, false, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms)), f)
+    // (at least 2 ms: an idle owner picks a request up in microseconds; 0 means "only if the
+    // owner is free now")
+    request(class, false, Some(std::time::Instant::now() + std::time::Duration::from_millis(ms.max(2))), f)
 }
 
 fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f: impl FnOnce() -> R) -> Option<R> {
     if is_owner() || CHILD.load(Ordering::Relaxed) {
         return Some(f());
     }
-    // a front reader that must not wait (lowering ahead) gives the work back first
-    crate::jit::lower_ahead_needs_unit();
-    crate::preempt::point();
+    // a front reader that must not wait (lowering ahead) gives the work back first; a back
+    // end's finish is never refused (its slots stay in flight until it is served)
+    if class != Class::Finish {
+        crate::jit::lower_ahead_needs_unit();
+        crate::preempt::point();
+    }
     start();
     let mut out: Option<R> = None;
     let outp: *mut Option<R> = &mut out;
@@ -409,7 +414,13 @@ fn serve(r: usize) {
         }
         unsafe { (*req.run)() }
     }));
-    crate::jit::frame_leave(frame);
+    let busy = crate::jit::frame_leave(frame);
+    // a compile the request's code reached was cancelled and nothing cancelled the request yet:
+    // its result is not used
+    let res = match res {
+        Ok(()) if busy => Err(Box::new(crate::preempt::OwnerBusy) as Box<dyn Any + Send>),
+        r => r,
+    };
     // RELAX_OWNER_TRACE: a request's panic, with where it happened on the owner (the compiler's
     // panic hook is silent there; the requester resumes it)
     if let Err(p) = &res {
@@ -424,6 +435,11 @@ fn serve(r: usize) {
     SERVING.with(|s| s.set(prev));
     unsafe { crate::query::swap_context(prev_ctx) };
     BUSY_NS[req.class as usize].fetch_add(crate::jit::wall_ns().saturating_sub(t0), Ordering::Relaxed);
+    // the process is ending on another thread: this request is never answered (its requester
+    // waits until the process is gone)
+    if res.as_ref().is_err_and(|p| p.is::<ExitParked>()) {
+        return;
+    }
     match req.waited {
         true => {
             if let Err(p) = res {
@@ -558,6 +574,25 @@ pub fn exit_tid() -> u64 {
     EXIT_TID.load(Ordering::Acquire)
 }
 
+/// The request being served is the exit's (the exiting thread's or its helper's).
+pub fn serving_exit() -> bool {
+    let from = serving().1;
+    from == EXIT_TID.load(Ordering::Acquire) || from != 0 && from == EXIT_HELPER.load(Ordering::Acquire)
+}
+
+/// The unwind payload of a request left unanswered because the process is ending.
+pub struct ExitParked;
+
+/// Ends the request being served without an answer: the process is ending on another thread.
+pub fn park_for_exit() -> ! {
+    std::panic::resume_unwind(Box::new(ExitParked))
+}
+
+/// The owner is serving a request of another thread than `tid` now.
+pub fn busy_for_other(tid: u64) -> bool {
+    NOW_CLASS.load(Ordering::Acquire) != u8::MAX && NOW_FROM.load(Ordering::Acquire) != tid
+}
+
 /// The allocator swap ended: the owner serves everyone again.
 pub fn resume() {
     wake();
@@ -570,9 +605,15 @@ pub fn resume() {
 /// and runs every request on its one thread. 0: no fork, 1: asked, 2: owner parked, 3: released.
 static FORK: AtomicU8 = AtomicU8::new(0);
 
+/// One fork at a time (two threads forking at once would release each other's parked owner).
+static FORKING: AtomicBool = AtomicBool::new(false);
+
 pub fn fork_prepare() {
     if is_owner() || CHILD.load(Ordering::Relaxed) || !STARTED.is_completed() {
         return;
+    }
+    while FORKING.swap(true, Ordering::SeqCst) {
+        std::thread::yield_now();
     }
     FORK.store(1, Ordering::SeqCst);
     wake();
@@ -589,9 +630,11 @@ pub fn fork_parent() {
     if let Some(t) = OWNER_THREAD.get() {
         t.unpark();
     }
+    FORKING.store(false, Ordering::SeqCst);
 }
 
 pub fn fork_child() {
     CHILD.store(true, Ordering::SeqCst);
+    FORKING.store(false, Ordering::SeqCst);
     IS_OWNER.with(|o| o.set(true));
 }

@@ -3645,6 +3645,11 @@ impl Unit {
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
             r = unsafe { call_jit(self as *mut Unit, entry, buf) };
             compile_watch(None);
+            // a compile the code reached was cancelled (a nested request blocked by an earlier
+            // one): no value and no error -- the request is cancelled here, in Rust frames
+            if BUSY_PENDING.with(|b| b.replace(false)) {
+                std::panic::resume_unwind(Box::new(crate::preempt::OwnerBusy));
+            }
             // Evaluated outside any build (statics initialized before main, the prelink): no
             // outer compile above to retry it, so the post-boot loader loads what its build
             // missed right here, and it runs again.
@@ -4234,9 +4239,18 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
     // inside a unit call already (a constant's initializer running code, a nested build): the
     // whole build here, no split
     if owner::is_owner() {
-        return match compile_slot_locked(up, id, false) {
-            Compiled::Code(a) => a,
-            Compiled::Back(_) => unreachable!("a nested compile is never split"),
+        // (a cancellation must not unwind through the JIT frames above: the call gets a stub that
+        // panics, and the Rust frame that ran the code -- run_init_code -- cancels the request)
+        return match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_slot_locked(up, id, false))) {
+            Ok(Compiled::Code(a)) => a,
+            Ok(Compiled::Back(_)) => unreachable!("a nested compile is never split"),
+            Err(p) if p.is::<crate::preempt::OwnerBusy>() => {
+                BUSY_PENDING.with(|b| b.set(true));
+                let u = &mut *up;
+                let (code, relocs) = error_stub(u, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
+                u.emit_linked(&code, &relocs).unwrap_or(0)
+            }
+            Err(p) => std::panic::resume_unwind(p),
         };
     }
     let _startup = StartupCompile::foreground();
@@ -4465,6 +4479,8 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
             Begin::Done(Split::Spec | Split::Restart) => unreachable!(),
             // it looked into a module the selection skipped: load it, build again
             Begin::Done(Split::Failed(e)) if e.starts_with(DEFERRED_RETRY) && load_deferred(up, id) => compile_slot_locked(up, id, outer),
+            // the process is ending on another thread: this request is never answered
+            Begin::Done(Split::Failed(e)) if e == YIELDED => owner::park_for_exit(),
             Begin::Done(Split::Failed(e)) => Compiled::Code(install_error(up, id, &e)),
         };
     }
@@ -5679,12 +5695,17 @@ fn open_here(id: u32) -> bool {
     BUILD_STACK.try_with(|s| s.borrow().contains(&id)).unwrap_or(false)
 }
 
-/// Starts building slot `id`. Err: it is being built already -- by this request (recursion), or
-/// by an earlier request lower on the owner's stack whose wait this one was served in (that
-/// build waits, through a query, for this request: a cycle, as rustc's).
+/// Starts building slot `id`. Err: this request is building it already (recursion). Open in an
+/// earlier request lower on the owner's stack (this one was served inside its wait): this
+/// request is cancelled (owner::busy_if_nested), so the slot never gets an error stub that
+/// depends on that timing.
 unsafe fn begin_build(up: *mut Unit, id: u32) -> Result<(), String> {
     let f = &mut (&mut *up).fns[id as usize];
     if f.building {
+        // open in an earlier request lower on the owner's stack: this nested one is cancelled
+        if !open_here(id) {
+            owner::busy_if_nested();
+        }
         return Err("recursive build".to_string());
     }
     f.building = true;
@@ -5741,6 +5762,7 @@ pub(crate) struct Frame {
     rec: *const std::cell::Cell<Option<MainCompile>>,
     tainted: bool,
     taint_built: Vec<(usize, u32)>,
+    busy: bool,
 }
 
 thread_local! {
@@ -5749,6 +5771,9 @@ thread_local! {
     static TAINTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// (unit, slot) whose RIR such a request stored: dropped when it ends (its code stays)
     static TAINT_BUILT: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// a compile reached from JIT code in this request was cancelled (OwnerBusy) and got a
+    /// panicking stub: the request is cancelled once a Rust frame can unwind
+    static BUSY_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Enters a fresh frame for a request whose requester's compile record is at `rec`.
@@ -5768,11 +5793,25 @@ pub(crate) fn frame_enter(rec: *const ()) -> Frame {
         rec: MAIN_REC_AT.with(|r| r.replace(rec as *const std::cell::Cell<Option<MainCompile>>)),
         tainted: TAINTED.with(|t| t.replace(false)),
         taint_built: TAINT_BUILT.with(|b| std::mem::take(&mut *b.borrow_mut())),
+        busy: BUSY_PENDING.with(|b| b.replace(false)),
     }
 }
 
-/// Leaves a request's frame: the state of the frame below it comes back.
-pub(crate) fn frame_leave(f: Frame) {
+/// Leaves a request's frame: the state of the frame below it comes back. True: a compile in it
+/// was cancelled and nothing turned that into the request's cancellation yet (its result is not
+/// to be used).
+pub(crate) fn frame_leave(f: Frame) -> bool {
+    // builds a panic left open (backstop: their bookkeeping normally closes them)
+    for id in BUILD_STACK.with(|s| std::mem::take(&mut *s.borrow_mut())) {
+        let up = IDS_UNIT.load(Ordering::Acquire);
+        let unit = unsafe { UNIT };
+        for u in [unit, up] {
+            if !u.is_null() && (id as usize) < unsafe { (&*u).fns.len() } {
+                unsafe { (&mut *u).fns[id as usize].building = false };
+                break;
+            }
+        }
+    }
     BUILD_STACK.with(|s| *s.borrow_mut() = f.build_stack);
     BUILD_CHILD.with(|c| *c.borrow_mut() = f.build_child);
     BUILD_DEPTH.with(|d| d.set(f.build_depth));
@@ -5793,6 +5832,7 @@ pub(crate) fn frame_leave(f: Frame) {
         }
     }
     TAINTED.with(|t| t.set(f.tainted));
+    BUSY_PENDING.with(|b| b.replace(f.busy))
 }
 
 /// Amount released at settle. Counted bytes are live-heap deltas; without heap
@@ -6244,6 +6284,11 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             // keep their RIR)
             if defer && owner::serving().0 == owner::Class::Background && spec_yield(options) && owner::urgent() {
                 SPEC_YIELDS.fetch_add(1, Ordering::Relaxed);
+                return Err(YIELDED.to_string());
+            }
+            // the process is ending on another thread: this front ends here (its requester
+            // then waits until the process is gone)
+            if defer && owner::exit_tid() != 0 && !owner::serving_exit() {
                 return Err(YIELDED.to_string());
             }
             if let FnKey::Closure(file, _, parent) = (&*up).fns[*c as usize].key {
@@ -8862,8 +8907,9 @@ fn rt_hot(slot: u64) -> u64 {
                     if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
                         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
                         let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_tier1(up, slot as u32)));
-                        if let Err(p) = ok {
-                            if p.is::<crate::preempt::OwnerBusy>() { std::panic::resume_unwind(p); }
+                        if let Err(_) = ok {
+                            // (a cancelled nested build too: the O1 code stays; never unwound
+                            // through the JIT frames that called rt_hot)
                             t1prof_divergence("first-call-build", &t1_key(up, slot as u32));
                             (*s).store(code, Ordering::SeqCst);
                         } else if !matches!(ok, Ok(true)) {
@@ -9386,7 +9432,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let mut ensure_rir = |c: u32, force: bool, callers: &[u32]| {
         // a program thread waits for the owner: the snapshot gives way (built RIR is kept;
         // the slot is queued again)
-        if gave_way.get() || !t1prof_replay(options) && owner::urgent() {
+        if gave_way.get() || !t1prof_replay(options) && !o3_first() && owner::serving().0 == owner::Class::Background && owner::urgent() {
             gave_way.set(true);
             return;
         }
@@ -10814,7 +10860,8 @@ pub(crate) struct JobIdle(bool);
 
 impl JobIdle {
     pub(crate) fn enter() -> JobIdle {
-        let held = JOB_DEPTH.try_with(|d| d.get() > 0).unwrap_or(false);
+        // only the outermost job of the thread counts (JOB_DEPTH 1): it is lifted for the wait
+        let held = JOB_DEPTH.try_with(|d| d.get() == 1).unwrap_or(false);
         if held {
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
         }
@@ -10825,15 +10872,22 @@ impl JobIdle {
 impl Drop for JobIdle {
     fn drop(&mut self) {
         if self.0 {
-            BG_ACTIVE.fetch_add(1, Ordering::SeqCst);
+            // back through the job gate: a pause that began meanwhile holds this job too
+            JOB_DEPTH.with(|d| d.set(d.get() - 1));
+            std::mem::forget(compile_job());
         }
     }
 }
 
-/// The thread compile jobs are paused for (an allocator swap, a fork), 0: none.
+/// The thread compile jobs are paused for (an allocator swap, a fork), 0: none. Bounded as the
+/// job gate is: after 2 s everyone is served again (a swap may wait for a callback on another
+/// thread that needs a compile).
 pub(crate) fn paused_for() -> u64 {
-    if BG_PAUSE.load(Ordering::SeqCst) { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
+    if BG_PAUSE.load(Ordering::SeqCst) && wall_ns().saturating_sub(BG_PAUSE_AT.load(Ordering::SeqCst)) < 2_000_000_000 { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
 }
+
+/// When the current pause began (wall ns).
+static BG_PAUSE_AT: AtomicU64 = AtomicU64::new(0);
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
@@ -10854,9 +10908,11 @@ impl Drop for JobGuard {
 fn pause_compile_jobs(trace: bool) {
     let t0 = std::time::Instant::now();
     BG_PAUSER.store(me(), Ordering::SeqCst);
+    BG_PAUSE_AT.store(wall_ns(), Ordering::SeqCst);
     BG_PAUSE.store(true, Ordering::SeqCst);
     let mine = if JOB_DEPTH.with(|d| d.get()) > 0 { 1 } else { 0 };
-    while BG_ACTIVE.load(Ordering::SeqCst) > mine {
+    // the jobs running, and the request the owner serves now (unless it is the pauser's own)
+    while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
         if t0.elapsed().as_millis() > 5000 {
             eprintln!("relax: compile jobs still running after 5 s -- going ahead");
             break;

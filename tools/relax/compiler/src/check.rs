@@ -201,6 +201,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             // a module the check did not load (another crate's skipped file): checked again
             // once every file is loaded
             Err(p) if p.is::<crate::preempt::NeedsLoad>() => out.retry = true,
+            // a constant it needed was asked of the compiler's owner thread while an earlier
+            // request held it up (owner.rs): checked again
+            Err(p) if crate::preempt::is_preempted(&*p) => out.retry = true,
             Err(_) => {
                 let def = prog.def(d);
                 let pos = prog.files[def.file as usize].ast.item(def.item).lo;
