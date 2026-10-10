@@ -320,7 +320,7 @@ fn round32_body_taint_ignores_untyped_arena_slots() {
     assert!(good.errors.is_empty(), "{:?}", good.errors);
     let bad = tcx.typeck(&prog, named(&prog, "bad"));
     assert!(!bad.errors.is_empty());
-    assert!(bad.expr_ty.iter().zip(&bad.expr_typed).any(|(ty, typed)| *typed && tcx.tys.has_error(*ty)));
+    assert!(bad.expr_ty.iter().zip(bad.expr_typed.iter()).any(|(ty, typed)| typed && tcx.tys.has_error(*ty)));
     // A cached body retains its taint without emitting the same diagnostic twice.
     let count = tcx.dcx.err_count();
     assert!(!tcx.typeck(&prog, named(&prog, "bad")).errors.is_empty());

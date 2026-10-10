@@ -5721,8 +5721,18 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     if !(&*up).fns[id as usize].inflight {
         return;
     }
+    // a slot this thread's own batch put in flight (compile_batch_off_lock): its back end starts
+    // only after all fronts, so a later front of the same batch builds what it needs itself
+    if BATCH_FLIGHT.with(|b| b.borrow().contains(&id)) {
+        return;
+    }
     owner::busy_if_nested();
     owner::pump_wait(&|| !(&*up).fns[id as usize].inflight);
+}
+
+thread_local! {
+    /// Slots the running compile_batch_off_lock on this thread marked in flight during its fronts.
+    static BATCH_FLIGHT: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Bumped whenever a build ends (reclaim_generation).
@@ -7526,7 +7536,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
         if let Res::Def(d) = r {
             let kind = (&*up).prog.def(*d).kind;
             if matches!(kind, DefKind::Const | DefKind::AssocConst | DefKind::Static) {
-                let args = body.res_args.get(k).cloned().unwrap_or_default();
+                let args = body.res_args.get(k).map_or_else(Vec::new, |&l| (&*up).tcx.tys.list(l).to_vec());
                 const_uses.push((*d, args, kind));
             }
         }
@@ -7535,7 +7545,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
         if let Res::Def(d) = r {
             let kind = (&*up).prog.def(*d).kind;
             if matches!(kind, DefKind::Const | DefKind::AssocConst) {
-                let args = body.res_args.get(&(k | crate::typeck::PAT_KEY)).cloned().unwrap_or_default();
+                let args = body.res_args.get(&(k | crate::typeck::PAT_KEY)).map_or_else(Vec::new, |&l| (&*up).tcx.tys.list(l).to_vec());
                 const_uses.push((*d, args, kind));
             }
         }
@@ -11086,9 +11096,14 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let mut out: Vec<(u32, Result<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>)> = Vec::new();
-    // fronts, under the lock
+    // fronts, under the lock; each front's slots go in flight at once (no other thread starts
+    // them meanwhile). A later front of this batch that inlines one of them does not wait for it
+    // (wait_inflight skips BATCH_FLIGHT): its back end starts only after the last front.
     let mut work: Vec<(u32, Front, String)> = Vec::new();
     let mut flight: Vec<u32> = Vec::new();
+    struct ClearBatch;
+    impl Drop for ClearBatch { fn drop(&mut self) { let _ = BATCH_FLIGHT.try_with(|b| b.borrow_mut().clear()); } }
+    let clear_batch = ClearBatch;
     for &id in ids {
         match split_front(up, id) {
             Ok(f) => {
@@ -11101,6 +11116,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                     if !u.fns[x as usize].inflight {
                         u.fns[x as usize].inflight = true;
                         flight.push(x);
+                        BATCH_FLIGHT.with(|b| b.borrow_mut().push(x));
                     }
                 }
                 work.push((id, f, u.fns[id as usize].name.clone()));
@@ -11108,6 +11124,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
             Err(e) => out.push((id, Err(e))),
         }
     }
+    drop(clear_batch);
     let (env, fold, rotate) = {
         let u = &*up;
         let e = &u.env;
@@ -12080,7 +12097,7 @@ fn take_ahead(prog: &Program, f: &FrontShared, tcx: &Tcx, d: DefId, args: &[TyId
         return Err("epoch");
     }
     AHEAD_STATS[1].fetch_add(1, Ordering::Relaxed);
-    if b.args == args { return Ok(b); }
+    if *b.args == *args { return Ok(b); }
     Ok(crate::typeck::codegen_body(prog, tcx, d, args))
 }
 
@@ -12096,7 +12113,7 @@ fn ctfe_checked_body(u: &Unit, d: DefId, args: &[TyId]) -> Option<std::sync::Arc
 pub(crate) fn ctfe_fallback_body(u: &Unit, epoch: Option<u64>, b: std::sync::Arc<Body>) {
     let Some(epoch) = epoch else { return };
     if ahead_on(&u.prog.session.options) && b.deferred_misses.is_empty() {
-        publish_ahead(&u.front, (b.def, b.args.clone()), epoch, b);
+        publish_ahead(&u.front, (b.def, b.args.to_vec()), epoch, b);
     }
 }
 
@@ -12320,22 +12337,22 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool)
     for (k, r) in &b.res {
         if let Res::Def(d) = r {
             if matches!(prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) {
-                let a = b.res_args.get(k).map(|v| v.as_slice()).unwrap_or(&[]);
+                let a = b.res_args.get(k).map_or(&[][..], |&v| tcx.tys.list(v));
                 add(*k, *d, a);
             }
         }
     }
     for (k, m) in b.methods.iter().chain(b.binops.iter()) {
-        add(*k, m.def, &m.args);
+        add(*k, m.def, tcx.tys.list(m.args));
     }
     for ((k, _), (d, a)) in &b.ov_derefs {
-        add(*k, *d, a);
+        add(*k, *d, tcx.tys.list(*a));
     }
     for (k, (d, a)) in b.ov_index.iter().chain(b.for_next.iter()) {
-        add(*k, *d, a);
+        add(*k, *d, tcx.tys.list(*a));
     }
     for (k, (d, a, _)) in &b.for_into {
-        add(*k, *d, a);
+        add(*k, *d, tcx.tys.list(*a));
     }
     out
 }

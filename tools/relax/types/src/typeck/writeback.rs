@@ -27,7 +27,13 @@ impl WritebackCx<'_, '_> {
         // rustc_hir_typeck/src/writeback.rs:868-872: taint final results containing errors.
         if self.infcx.tcx.tys.flags(*ty).intersects(crate::types::TypeFlags::HAS_ERROR) { self.infcx.set_tainted_by_errors(); }
     }
-    fn resolve_args(&mut self, args: &mut Vec<TyId>) { for ty in args { self.resolve(ty); } }
+    fn resolve_args(&mut self, args: &mut [TyId]) { for ty in args { self.resolve(ty); } }
+    fn resolve_list(&mut self, args: &mut crate::types::TyList) {
+        if args.is_empty() { return; }
+        let mut v = self.infcx.tcx.tys.list(*args).to_vec();
+        self.resolve_args(&mut v);
+        *args = self.infcx.tcx.tys.mk_list(&v);
+    }
     fn resolve_place(&mut self, place: &mut crate::expr_use::Place) {
         self.resolve(&mut place.root_ty);
         for (_, ty) in &mut place.projections { self.resolve(ty); }
@@ -43,17 +49,17 @@ impl Fcx<'_> {
         let body = &mut self.b;
         wbcx.resolve_args(&mut body.args);
         // Nightly writeback visits populated node_types, not untyped AST arena slots.
-        for i in 0..body.expr_ty.len() { if body.expr_typed[i] { wbcx.resolve(&mut body.expr_ty[i]); } }
-        for i in 0..body.pat_ty.len() { if body.pat_typed[i] { wbcx.resolve(&mut body.pat_ty[i]); } }
+        for i in 0..body.expr_ty.len() { if body.expr_typed.get(i) { wbcx.resolve(&mut body.expr_ty[i]); } }
+        for i in 0..body.pat_ty.len() { if body.pat_typed.get(i) { wbcx.resolve(&mut body.pat_ty[i]); } }
         wbcx.resolve(&mut body.ret);
         for ty in body.hidden_types.values_mut() { wbcx.resolve(ty); }
         for local in &mut body.locals { wbcx.resolve(&mut local.ty); }
-        for args in body.res_args.values_mut() { wbcx.resolve_args(args); }
-        for method in body.methods.values_mut().chain(body.binops.values_mut()) { wbcx.resolve_args(&mut method.args); }
-        for (_, args) in body.ov_derefs.values_mut().chain(body.ov_index.values_mut()).chain(body.for_next.values_mut()) { wbcx.resolve_args(args); }
-        for (_, args, ty) in body.for_into.values_mut() { wbcx.resolve_args(args); wbcx.resolve(ty); }
-        for (_, args, ty) in body.try_branch.values_mut() { wbcx.resolve_args(args); wbcx.resolve(ty); }
-        for (_, args) in body.try_from_residual.values_mut() { wbcx.resolve_args(args); }
+        for args in body.res_args.values_mut() { wbcx.resolve_list(args); }
+        for method in body.methods.values_mut().chain(body.binops.values_mut()) { wbcx.resolve_list(&mut method.args); }
+        for (_, args) in body.ov_derefs.values_mut().chain(body.ov_index.values_mut()).chain(body.for_next.values_mut()) { wbcx.resolve_list(args); }
+        for (_, args, ty) in body.for_into.values_mut() { wbcx.resolve_list(args); wbcx.resolve(ty); }
+        for (_, args, ty) in body.try_branch.values_mut() { wbcx.resolve_list(args); wbcx.resolve(ty); }
+        for (_, args) in body.try_from_residual.values_mut() { wbcx.resolve_list(args); }
         for coerce in body.coerce.values_mut() {
             match coerce { Coerce::ToDyn(a, b) | Coerce::Upcast(a, b) => { wbcx.resolve(a); wbcx.resolve(b); } _ => {} }
         }

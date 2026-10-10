@@ -43,6 +43,14 @@ pub enum Place {
 }
 
 /// A place matched by a slice pattern (see Lcx::slice_pat).
+/// A recorded method resolution with this instance's generic args.
+struct MonoMethod {
+    def: DefId,
+    derefs: usize,
+    autoref: u8,
+    args: Vec<TyId>,
+}
+
 struct SlicePat {
     base: VReg,
     /// dynamic length (slices); None for arrays (length `n`)
@@ -766,8 +774,12 @@ impl<'a> Lcx<'a> {
     fn monomorphize(&self, t: TyId) -> TyId {
         self.u.tcx.normalize_erasing_regions(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t)
     }
-    fn monomorphize_args(&self, args: &mut [TyId]) {
-        for ty in args { *ty = self.monomorphize(*ty); }
+    /// typeck's recorded generic args, monomorphized.
+    fn mono_list(&self, l: crate::types::TyList) -> Vec<TyId> {
+        self.u.tcx.tys.list(l).iter().map(|&t| self.monomorphize(t)).collect()
+    }
+    fn mono_method(&self, m: crate::typeck::MethodRes) -> MonoMethod {
+        MonoMethod { def: m.def, derefs: m.derefs as usize, autoref: m.autoref, args: self.mono_list(m.args) }
     }
     fn body_ty(&self, e: ExprId) -> TyId { self.monomorphize(self.b.ty(e)) }
     fn body_pty(&self, p: PatId) -> TyId { self.monomorphize(self.b.pty(p)) }
@@ -2751,8 +2763,8 @@ impl<'a> Lcx<'a> {
     /// references/pointers, a `Deref::deref` (or `deref_mut` in a mutable context) call
     /// for overloaded steps.
     fn deref_place(&mut self, e: u32, k: usize, pl: Place, pt: TyId) -> (Place, TyId) {
-        if let Some((m, mut args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
-            self.monomorphize_args(&mut args);
+        if let Some((m, args)) = self.b.ov_derefs.get(&(e, k)).cloned() {
+            let args = self.mono_list(args);
             return self.overloaded_deref(m, args, pl, pt);
         }
         let inner = match self.kind(pt) {
@@ -2811,10 +2823,10 @@ impl<'a> Lcx<'a> {
 
     /// `for p in it` over an Iterator: `loop { match it.next() { Some(p) => body, None => break } }`.
     fn lower_for_iterator(&mut self, p: PatId, it: ExprId, b: BlockId, l: Option<(u32, u32)>) {
-        let (next, mut nargs) = self.b.for_next.get(&it.0).cloned().unwrap();
-        self.monomorphize_args(&mut nargs);
-        let (into, mut iargs, iter_t) = self.b.for_into[&it.0].clone();
-        self.monomorphize_args(&mut iargs);
+        let (next, nargs) = self.b.for_next.get(&it.0).cloned().unwrap();
+        let nargs = self.mono_list(nargs);
+        let (into, iargs, iter_t) = self.b.for_into[&it.0].clone();
+        let iargs = self.mono_list(iargs);
         let iter_t = self.monomorphize(iter_t);
         let head_t = self.body_ty(it);
         let head_v = self.lower_expr(it);
@@ -3095,7 +3107,7 @@ impl<'a> Lcx<'a> {
                 _ => None,
             },
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
-                let (derefs, fi) = self.b.field_idx.get(&e.0).copied()?;
+                let (derefs, fi) = self.b.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 let (li, mut p) = self.field_move_path(*x)?;
                 // through a Box only (rustc: `*b` of a Box is a place that can be moved out of;
                 // other derefs are borrows)
@@ -4630,8 +4642,8 @@ impl<'a> Lcx<'a> {
             DefKind::Const | DefKind::AssocConst => {
                 // a constant pattern matches structurally, by its value (rustc const_to_pat):
                 // variants, fields and pointees of the evaluated constant, read at compile time
-                let mut args = self.b.res_args.get(&(p.0 | crate::typeck::PAT_KEY)).cloned().unwrap_or_default();
-                self.monomorphize_args(&mut args);
+                let args = self.b.res_args.get(&(p.0 | crate::typeck::PAT_KEY)).copied().unwrap_or_default();
+                let args = self.mono_list(args);
                 match self.u.const_addr_shared(d, args) {
                     Some(addr) => {
                         let cs = self.u.data_sym(addr);
@@ -4805,8 +4817,8 @@ impl<'a> Lcx<'a> {
     fn lower_try(&mut self, e: ExprId, x: ExprId, t: TyId) -> Val {
         let xt = self.body_ty(x);
         let v = self.lower_expr(x);
-        let (branch, mut args, flow) = self.b.try_branch[&e.0].clone();
-        self.monomorphize_args(&mut args);
+        let (branch, args, flow) = self.b.try_branch[&e.0].clone();
+        let args = self.mono_list(args);
         let flow = self.monomorphize(flow);
         let env = crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env.clone(), branch, &args);
@@ -4827,8 +4839,8 @@ impl<'a> Lcx<'a> {
         let vi_err = self.variant_index(flow, LangItem::ControlFlowBreak);
         let (ep, et) = self.project(&place, flow, vi_err, 0);
         let ev = self.read_place(&ep, et);
-        let (fd, mut args) = self.b.try_from_residual[&e.0].clone();
-        self.monomorphize_args(&mut args);
+        let (fd, args) = self.b.try_from_residual[&e.0].clone();
+        let args = self.mono_list(args);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, env, fd, &args);
         let r = self.emit_instance(instance, vec![(ev, et)], self.ret_ty);
         self.ret_val_early(r, self.ret_ty);
@@ -5630,7 +5642,7 @@ impl<'a> Lcx<'a> {
             _ => self.cur_fn,
         };
         let id = self.u.fn_id(FnKey::Closure(file, ce, parent));
-        if self.b.file == file && parent == self.u.fn_id(FnKey::Inst(self.b.def, self.b.args.clone())) {
+        if self.b.file == file && parent == self.u.fn_id(FnKey::Inst(self.b.def, self.b.args.to_vec())) {
             self.new_closures.push((ce, id));
         }
         id
@@ -5695,8 +5707,7 @@ impl<'a> Lcx<'a> {
             },
             ExprKind::Unary(UnOp::Not | UnOp::Neg, x) if self.b.binops.contains_key(&e.0) => {
                 // operator trait call: Not::not(x) / Neg::neg(x)
-                let mut m = self.b.binops[&e.0].clone();
-                self.monomorphize_args(&mut m.args);
+                let m = self.mono_method(self.b.binops[&e.0]);
                 let xt = self.body_ty(*x);
                 let v = self.lower_expr(*x);
                 let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
@@ -5786,8 +5797,7 @@ impl<'a> Lcx<'a> {
                 }
             }
             ExprKind::Binary(op, a, b) => {
-                if let Some(mut m) = self.b.binops.get(&e.0).cloned() {
-                    self.monomorphize_args(&mut m.args);
+                if let Some(m) = self.b.binops.get(&e.0).map(|&m| self.mono_method(m)) {
                     // operator trait call: Op::op(a, b); comparisons take both by reference
                     let at = self.body_ty(*a);
                     let bt = self.body_ty(*b);
@@ -5822,8 +5832,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::AssignOp(_, a, b) if self.b.binops.contains_key(&e.0) => {
                 // `a op= b` through <A as OpAssign<B>>::op_assign(&mut a, b)
-                let mut m = self.b.binops[&e.0].clone();
-                self.monomorphize_args(&mut m.args);
+                let m = self.mono_method(self.b.binops[&e.0]);
                 self.want_mut = true;
                 let (pl, pt) = self.lower_place(*a);
                 self.want_mut = false;
@@ -6426,8 +6435,8 @@ impl<'a> Lcx<'a> {
         let k = self.u.prog.def(d).kind;
         match k {
             DefKind::Const | DefKind::AssocConst => {
-                let mut args = self.b.res_args.get(&e.0).cloned().unwrap_or_default();
-                self.monomorphize_args(&mut args);
+                let args = self.b.res_args.get(&e.0).copied().unwrap_or_default();
+                let args = self.mono_list(args);
                 self.const_val(d, args, t)
             }
             DefKind::Static => {
@@ -6771,7 +6780,7 @@ impl<'a> Lcx<'a> {
             }
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
                 let (derefs, fi) = match self.b.field_idx.get(&e.0) {
-                    Some(v) => *v,
+                    Some(&(d, f)) => (d as usize, f),
                     None => return (Place::Regs(Vec::new()), t),
                 };
                 let (mut pl, mut pt) = self.lower_place(*x);
@@ -6799,8 +6808,8 @@ impl<'a> Lcx<'a> {
                     pl = a2;
                     pt = b2;
                 }
-                if let Some((m, mut args)) = self.b.ov_index.get(&e.0).cloned() {
-                    self.monomorphize_args(&mut args);
+                if let Some((m, args)) = self.b.ov_index.get(&e.0).cloned() {
+                    let args = self.mono_list(args);
                     // the call's location is the brackets (rustc, issue 114388: `x\n[0]` is at
                     // `[0]`): the `[` between the base and the index operand
                     let (alo, ilo) = (self.ast().expr(*a).hi, self.ast().expr(*i).lo);
@@ -8990,11 +8999,10 @@ impl<'a> Lcx<'a> {
     }
 
     fn lower_method(&mut self, e: ExprId, recv: ExprId, args: &[ExprId], t: TyId) -> Val {
-        let mut m = match self.b.methods.get(&e.0) {
-            Some(m) => m.clone(),
+        let m = match self.b.methods.get(&e.0) {
+            Some(&m) => self.mono_method(m),
             None => return self.unit(),
         };
-        self.monomorphize_args(&mut m.args);
         let instance = crate::instance::Instance::expect_resolve(&self.u.tcx, &self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), m.def, &m.args);
         let virt = matches!(instance.def, InstanceKind::Virtual(..));
         let sig = match self.u.tcx.fn_sig(&self.u.prog, m.def).cloned() {

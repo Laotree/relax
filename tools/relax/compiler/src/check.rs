@@ -181,7 +181,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = tcx.typeck(prog, d);
             if !body.errors.is_empty() {
-                return (body.errors.clone(), Vec::new());
+                return (body.errors.to_vec(), Vec::new());
             }
             if !crate::borrowck::enabled(options) {
                 return (Vec::new(), Vec::new());
@@ -191,7 +191,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
                 for x in &v.unchecked { eprintln!("relax-check: borrowck unchecked: {}", x); }
             }
-            let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.clone() };
+            let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
             let diags = crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()).collect();
             (Vec::new(), diags)
         }));

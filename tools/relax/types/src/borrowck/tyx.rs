@@ -37,6 +37,11 @@ pub struct Tx<'a> {
 }
 
 impl<'a> Tx<'a> {
+    /// The types of an interned list (typeck's recorded generic args).
+    #[inline]
+    pub fn list(&self, l: crate::types::TyList) -> &'a [TyId] {
+        self.tcx.tys.list(l)
+    }
     fn infer_ctxt(&self) -> crate::infer::InferCtxt<'a> {
         let infcx = crate::infer::InferCtxt::for_item(
             self.tcx, self.prog, self.cx.typing_env.mode, self.obligation_owner.get());

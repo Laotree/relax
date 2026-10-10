@@ -248,18 +248,18 @@ pub fn position(s: &mut Session,path: &str,params: &Json,only: bool) -> Result<S
             let id = body.expr_at(i); let e = pf.ast.expr(id);
             match e.kind {
                 ExprKind::MethodCall { name:n,.. } if hit(p,body.file,n.lo,query_path,at) => {
-                    if let Some(m) = body.methods.get(&id.0) { return Ok(answer(hover_args(s,m.def,&m.args),definition(p,m.def),only)); }
+                    if let Some(m) = body.methods.get(&id.0) { return Ok(answer(hover_args(s,m.def,s.unit.tcx.tys.list(m.args)),definition(p,m.def),only)); }
                 }
                 ExprKind::Field(recv,n) if hit(p,body.file,n.lo,query_path,at) => {
                     if let Some((derefs,index)) = body.field_idx.get(&id.0) {
                         let mut t = body.ty(recv);
-                        for step in 0..*derefs {
+                        for step in 0..*derefs as usize {
                             t = match s.unit.tcx.tys.kind(t) {
                                 TyKind::Ref(_,inner, _)|TyKind::Ptr(_,inner) => *inner,
                                 _ => {
                                     let Some((method,args)) = body.ov_derefs.get(&(id.0,step)) else { break; };
                                     let Some(sig) = s.unit.tcx.fn_sig(&s.unit.prog, *method) else { break; };
-                                    let ret = s.unit.tcx.tys.subst(sig.ret,args);
+                                    let ret = s.unit.tcx.tys.subst(sig.ret,s.unit.tcx.tys.list(*args));
                                     match s.unit.tcx.tys.kind(ret) { TyKind::Ref(_,inner, _) => s.unit.tcx.try_normalize_erasing_regions(p,cx.typing_env,*inner).unwrap_or(*inner), _ => break }
                                 }
                             };

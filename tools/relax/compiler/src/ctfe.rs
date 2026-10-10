@@ -560,7 +560,7 @@ impl<'a> Ctx<'a> {
                     let k = self.u.prog.def(d).kind;
                     match k {
                         DefKind::Const | DefKind::AssocConst => {
-                            let args = b.res_args.get(&e.0).cloned().unwrap_or_default();
+                            let args = b.res_args.get(&e.0).map_or_else(Vec::new, |&l| self.u.tcx.tys.list(l).to_vec());
                             let a = self.const_data(d, args)?;
                             let n = self.size(t) as usize;
                             let mut out = vec![0u8; n];
@@ -605,7 +605,7 @@ impl<'a> Ctx<'a> {
                 if m.autoref == 1 {
                     if let TyKind::Array(_, n) = self.kind(rt) {
                         let sig = self.u.tcx.fn_sig(&self.u.prog, m.def)?;
-                        let st = self.u.tcx.tys.subst_erasing_regions(*sig.params.first()?, &m.args);
+                        let st = self.u.tcx.tys.subst_erasing_regions(*sig.params.first()?, self.u.tcx.tys.list(m.args));
                         if matches!(self.kind(st), TyKind::Ref(_, p, _) if matches!(self.kind(p), TyKind::Slice(_))) {
                             let n = n.try_to_target_usize(&self.u.tcx.tys)?;
                             if rv.len() != 8 { return None; }
@@ -617,7 +617,7 @@ impl<'a> Ctx<'a> {
                 for a in self.u.prog.files[file].ast.list(args).to_vec() {
                     vals.push(self.eval(b, env, a)?);
                 }
-                self.call_const_fn(m.def, m.args.clone(), vals, t)
+                self.call_const_fn(m.def, self.u.tcx.tys.list(m.args).to_vec(), vals, t)
             }
             ExprKind::Call(f, args) => {
                 if b.legacy_args.contains_key(&e.0) || b.call_derefs.contains_key(&e.0) {
@@ -705,7 +705,7 @@ impl<'a> Ctx<'a> {
                 Some(v.get(off..off + n)?.to_vec())
             }
             ExprKind::Field(x, _) => {
-                let (derefs, fi) = *b.field_idx.get(&e.0)?;
+                let (derefs, fi) = b.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 if derefs != 0 {
                     return None;
                 }
@@ -803,7 +803,7 @@ impl<'a> Ctx<'a> {
             ExprKind::Paren(x) => return self.borrow(b, env, x),
             ExprKind::Unary(UnOp::Deref, x) if matches!(self.kind(b.ty(x)), TyKind::Ref(..)) => return self.eval(b, env, x),
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
-                let (derefs, fi) = *b.field_idx.get(&e.0)?;
+                let (derefs, fi) = b.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 let (mut ptr, t) = match (derefs, self.kind(b.ty(x))) {
                     (0, _) => (self.borrow(b, env, x)?, b.ty(x)),
                     (1, TyKind::Ref(_, inner, _)) if !b.ov_derefs.contains_key(&(x.0, 0)) => (self.eval(b, env, x)?, inner),
@@ -872,7 +872,7 @@ impl<'a> Ctx<'a> {
                 _ => None,
             },
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
-                let (derefs, fi) = *b.field_idx.get(&e.0)?;
+                let (derefs, fi) = b.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 if derefs != 0 { return None; }
                 let t = b.ty(x);
                 let off = match self.kind(t) {
@@ -950,7 +950,7 @@ impl<'a> Ctx<'a> {
             ExprKind::Paren(x) => return self.place_offset(b, x, base),
             ExprKind::Unary(UnOp::Deref, x) if b.res.get(&x.0) == Some(&Res::Local(base)) => return Some(0),
             ExprKind::Field(x, _) => {
-                let (derefs, fi) = *b.field_idx.get(&e.0)?;
+                let (derefs, fi) = b.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 if derefs != 0 { return None; }
                 (x, fi)
             }

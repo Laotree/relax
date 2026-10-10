@@ -2839,7 +2839,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             if !checked.contains(&krate) && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Closure(file, 0, 0)) {
                 checked.push(krate);
                 let bodies: Vec<_> = checked_bodies.iter().filter(|b| u.prog.file_crate[b.file as usize] == krate
-                    && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(b.def, b.args.clone()))).collect();
+                    && crate::sandbox::is_sandboxed_crate_key(&u.prog, &FnKey::Inst(b.def, b.args.to_vec()))).collect();
                 errs.extend(crate::modules::sandbox_check(&u.prog, &u.tcx, krate, &bodies));
             }
         }

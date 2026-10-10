@@ -158,7 +158,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
         if let Some(target) = self.tx.builtin_deref(t) { return Some(target); }
         let (method, args) = self.body.ov_derefs.get(&(key, step))?;
         let sig = self.tx.tcx.fn_item_sig(self.tx.prog, *method)?;
-        let ret = self.tx.tcx.tys.subst(sig.ret, args);
+        let ret = self.tx.tcx.tys.subst(sig.ret, self.tx.tcx.tys.list(*args));
         let ret = self.tx.normalize(ret);
         self.tx.builtin_deref(ret)
     }
@@ -174,7 +174,7 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
             ExprKind::Path(_) => if let Some(Res::Local(l)) = self.body.res.get(&e.0) { return Some(self.local(*l, e)); },
             ExprKind::Paren(x) => return self.walk_place(x, mutable),
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
-                let (n, fi) = *self.body.field_idx.get(&e.0)?;
+                let (n, fi) = self.body.field_idx.get(&e.0).map(|&(d, f)| (d as usize, f))?;
                 let mut p = self.walk_place(x, mutable)?;
                 for i in 0..n { p = self.deref(p, e.0, i, mutable)?; }
                 p.expr = e.0; p.span = self.span(e);
@@ -208,19 +208,19 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 } else { self.use_expr(x, Access::Mutate); self.consume_expr(y); }
             }
             ExprKind::AssignOp(_, x, y) => {
-                if let Some(m) = self.body.binops.get(&e.0) { self.receiver(x, e.0, m.derefs, m.autoref); }
+                if let Some(m) = self.body.binops.get(&e.0) { self.receiver(x, e.0, m.derefs as usize, m.autoref); }
                 else { self.use_expr(x, Access::Mutate); }
                 self.consume_expr(y);
             }
             ExprKind::Binary(_, x, y) => {
                 if let Some(m) = self.body.binops.get(&e.0) {
-                    self.receiver(x, e.0, m.derefs, m.autoref);
+                    self.receiver(x, e.0, m.derefs as usize, m.autoref);
                     if m.autoref != 0 { self.use_expr(y, Access::Borrow(BorrowKind::Imm)); } else { self.consume_expr(y); }
                 } else { self.consume_expr(x); self.consume_expr(y); }
             }
             ExprKind::Unary(_, x) | ExprKind::Cast(x, _) | ExprKind::Box(x) | ExprKind::Try(x) => self.consume_expr(x),
             ExprKind::MethodCall { recv, args, .. } => {
-                if let Some(m) = self.body.methods.get(&e.0) { self.receiver(recv, e.0, m.derefs, m.autoref); }
+                if let Some(m) = self.body.methods.get(&e.0) { self.receiver(recv, e.0, m.derefs as usize, m.autoref); }
                 else { self.errors.push((e.0, "missing method callee")); }
                 for x in self.ast().list(args).to_vec() { self.consume_expr(x); }
             }
@@ -463,7 +463,7 @@ mod tests {
         let n = pf.ast.exprs.len(); prog.files.push(std::sync::Arc::new(pf));
         let t = tcx.tys.intern(TyKind::Ref(true, tcx.tys.bool_, crate::types::RegionId::ERASED));
         let mut b = Body::empty(crate::program::NO_DEF, vec![], 0, tcx.tys.unit);
-        b.expr_ty = vec![t; n];
+        b.expr_ty = vec![t; n].into();
         b.locals.push(crate::typeck::Local { name: 0, ty: t, mutable: false, pat: 0 });
         b.res.insert(id.0, Res::Local(0));
         let state = crate::tcx::EvalState::new();
@@ -488,7 +488,7 @@ mod tests {
         let n = pf.ast.exprs.len(); prog.files.push(std::sync::Arc::new(pf));
         let t = tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[tcx.tys.bool_])));
         let mut b = Body::empty(crate::program::NO_DEF, vec![], 0, tcx.tys.unit);
-        b.expr_ty = vec![tcx.tys.bool_; n]; b.expr_ty[base.0 as usize] = t;
+        b.expr_ty = vec![tcx.tys.bool_; n].into(); b.expr_ty[base.0 as usize] = t;
         b.locals.push(crate::typeck::Local { name: 0, ty: t, mutable: false, pat: 0 });
         b.res.insert(base.0, Res::Local(0)); b.field_idx.insert(id.0, (0, 0));
         let state = crate::tcx::EvalState::new();

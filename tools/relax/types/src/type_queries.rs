@@ -93,7 +93,7 @@ pub struct QueryCx {
     /// answer, as Body::deferred_misses do, so every reader fails for the same skipped modules)
     codegen_select: QueryTable<(TypingEnv, crate::next_solver::TraitRef), (Result<crate::next_solver::select::ImplSource, crate::next_solver::codegen::CodegenObligationError>, Misses)>,
     /// rustc_middle/src/query/mod.rs resolve_instance_raw (PseudoCanonicalInput<(DefId, GenericArgsRef)>)
-    resolve_instance: QueryTable<(TypingEnv, DefId, Vec<TyId>), (Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, Misses)>,
+    resolve_instance: QueryTable<(TypingEnv, DefId, crate::types::TyList), (Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, Misses)>,
     /// rustc_middle/src/query/mod.rs dyn_compatibility_violations (per trait)
     dyn_compatibility: QueryTable<DefId, Vec<DefId>>,
     /// rustc_middle/src/query/mod.rs own_existential_vtable_entries (per trait)
@@ -144,14 +144,75 @@ pub(crate) const DECLARATIONS: QueryId = QueryId { kind: 0, key: ALL_CRATES };
 const ALL_CRATES: u32 = u32::MAX;
 const FILE_BODIES: u16 = 21;
 
+/// Memory report (RELAX_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
+/// reads more than 2 s after the first) -- who still reads a Body after its owner is lowered.
+static TYPECK_READS: std::sync::Mutex<Option<crate::fxhash::HashMap<u32, (u64, u64, u32, u32)>>> = std::sync::Mutex::new(None);
+static TYPECK_READS_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn note_typeck_read(def: DefId) {
+    let ms = TYPECK_READS_T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+    let mut g = TYPECK_READS.lock().unwrap_or_else(|e| e.into_inner());
+    let e = g.get_or_insert_with(Default::default).entry(def.0).or_insert((ms, ms, 0, 0));
+    e.1 = ms;
+    e.2 += 1;
+    if ms > e.0 + 2000 { e.3 += 1; }
+}
+
 impl QueryCx {
     /// memory report (RELAX_MEM_REPORT): the solver cache and the bound-vars tables
-    pub fn mem_lines(&self) -> Vec<(String, u64)> {
+    pub fn mem_lines(&self, tys: &crate::types::Types) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut p = |name: &str, (n, b): (usize, usize)| out.push((format!("qt {} ({})", name, n), b as u64));
         p("resolved_bound_vars", self.resolved_bound_vars.mem_stats(&|_, v| { let (a, b) = v.1.heap_bytes_split(); if std::sync::Arc::strong_count(&v.1) > 1 { 8 } else { 16 + std::mem::size_of::<crate::tcx::resolve_bound_vars::ResolveBoundVars>() + a + b } }));
         p("lifetime_names Arc<LifetimeResolution>", self.lifetime_names.mem_stats(&|_, v| if std::sync::Arc::strong_count(&v.1) > 2 { 8 } else { 16 + v.1.heap_bytes() }));
         out.extend(self.solver.mem_lines());
+        {
+            // keys hold an interned list id: 4 B, no heap. A Vec<TyId> key (the previous layout)
+            // was 20 B more inline plus an exact-size heap block (glibc chunk: len * 4 + 8 rounded
+            // up to 16, at least 32), held twice: by the slot and by the shard's key index.
+            let stats = self.resolve_instance.mem_stats(&|_, v| v.0.as_ref().map_or(0, |i| i.args.capacity() * std::mem::size_of::<crate::consts::GenericArg>()));
+            let mut vec_keys = 0usize;
+            let inline = std::mem::size_of::<(TypingEnv, DefId, Vec<TyId>)>() - std::mem::size_of::<(TypingEnv, DefId, crate::types::TyList)>();
+            self.resolve_instance.for_each(&mut |k, _, _| {
+                let n = tys.list(k.2).len();
+                vec_keys += 2 * (inline + if n == 0 { 0 } else { (n * 4 + 8).div_ceil(16).max(2) * 16 });
+            });
+            out.push((format!("qt resolve_instance ({}; {} B; Vec<TyId> keys would add {} B)", stats.0, stats.1, vec_keys), stats.1 as u64));
+        }
+        {
+            let mut acc = std::collections::BTreeMap::new();
+            let (mut n, mut shared) = (0u64, 0u64);
+            let mut prev = 0u64;
+            self.typeck.for_each(&mut |_, v, _| {
+                n += 1;
+                if std::sync::Arc::strong_count(&v.1) > 1 { shared += 1; }
+                v.1.mem_breakdown(&mut acc);
+                prev += v.1.prev_layout_bytes(tys) as u64;
+            });
+            let total: u64 = acc.values().map(|x| x.1).sum();
+            out.push((format!("qt typeck bodies ({n}; {shared} also held elsewhere; {total} B; previous layout {prev} B)"), total));
+            // reads: [generic owner][read in the last 10 s] -> (bodies, bytes, reads, late reads)
+            let now = TYPECK_READS_T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64;
+            let reads = TYPECK_READS.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
+            let mut cls = [[(0u64, 0u64, 0u64, 0u64); 2]; 2];
+            self.typeck.for_each(&mut |def, v, _| {
+                let (_, last, n, late) = reads.get(&def.0).copied().unwrap_or((0, 0, 0, 0));
+                let c = &mut cls[!v.1.args.is_empty() as usize][(now.saturating_sub(last) < 10_000) as usize];
+                c.0 += 1;
+                c.1 += (std::mem::size_of::<crate::typeck::Body>() + v.1.heap_bytes()) as u64;
+                c.2 += n as u64;
+                c.3 += late as u64;
+            });
+            for (g, gname) in [(0, "non-generic"), (1, "generic")] {
+                for (r, rname) in [(0, "idle 10 s"), (1, "read in the last 10 s")] {
+                    let c = cls[g][r];
+                    out.push((format!("  typeck reads: {gname} owners, {rname}: {} bodies, {} reads, {} reads > 2 s after the first; {} B", c.0, c.2, c.3, c.1), c.1));
+                }
+            }
+            for (k, (e, b)) in acc {
+                out.push((format!("  typeck.{k} ({e}; {b} B)"), b));
+            }
+        }
         out
     }
     pub(crate) fn read_declarations(&self) -> Result<Fingerprint, QueryError> {
@@ -441,13 +502,14 @@ impl Providers<'_> {
         Ok(r)
     }
 
-    fn resolve_instance_raw(&self, key: (TypingEnv, DefId, Vec<TyId>)) -> Result<Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, QueryError> {
+    fn resolve_instance_raw(&self, key: (TypingEnv, DefId, crate::types::TyList)) -> Result<Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, QueryError> {
         let q = &self.tcx.queries;
         let mut computed = false;
         let (r, misses) = q.resolve_instance.get(&q.engine, key, &mut |(typing_env, def, args)| {
-            q.read_key_declarations(self.tcx, self.prog, typing_env, &args, &[def])?;
+            let args = self.tcx.tys.list(args);
+            q.read_key_declarations(self.tcx, self.prog, typing_env, args, &[def])?;
             computed = true;
-            let value = with_misses(|| self.tcx.resolve_instance_raw_uncached(self.prog, typing_env, def, &args));
+            let value = with_misses(|| self.tcx.resolve_instance_raw_uncached(self.prog, typing_env, def, args));
             if !value.1.is_empty() { q.read_declarations()?; }
             Ok(value)
         }, &|id| self.force(id))?;
@@ -505,11 +567,12 @@ impl Providers<'_> {
             q.read_owner(self.prog, def)?;
             let mark = crate::program::missing_mark();
             let mut body = crate::typeck::check_fn(self.prog, self.tcx, def);
-            if !body.errors.is_empty() { body.deferred_misses = crate::program::missing_since(mark); }
+            if !body.errors.is_empty() { body.deferred_misses = crate::program::missing_since(mark).into(); }
             Ok((self.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), std::sync::Arc::new(body)))
         }, &|id| self.force(id))?;
         // the post-boot loader's misses travel with the cached failure (Body::deferred_misses)
         if !body.deferred_misses.is_empty() { crate::program::note_misses(&body.deferred_misses); }
+        if crate::memstat::enabled() { note_typeck_read(def); }
         Ok(body)
     }
 
@@ -1066,7 +1129,7 @@ impl Tcx {
     }
     /// The resolve_instance_raw query (provider: resolve_instance_raw_uncached).
     pub fn resolve_instance_raw(&self, prog: &Program, typing_env: TypingEnv, def: DefId, args: &[TyId]) -> Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError> {
-        Providers { tcx: self, prog }.resolve_instance_raw((typing_env, def, args.to_vec())).expect("resolve_instance_raw query")
+        Providers { tcx: self, prog }.resolve_instance_raw((typing_env, def, self.tys.mk_list(args))).expect("resolve_instance_raw query")
     }
 }
 

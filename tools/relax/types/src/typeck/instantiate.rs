@@ -6,7 +6,7 @@ use super::*;
 /// instances retain the fallible PostAnalysis fold; identity consumers normalize
 /// individual reads (rustc_codegen_ssa/src/mir/mod.rs:129-139).
 pub(super) fn try_instantiate_mir_and_normalize_erasing_regions(prog: &Program, tcx: &Tcx, body: std::sync::Arc<Body>, args: &[TyId]) -> Result<std::sync::Arc<Body>, crate::next_solver::NoSolution> {
-    if body.args == args { return Ok(body); }
+    if *body.args == *args { return Ok(body); }
     try_normalize_body(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &body, args).map(std::sync::Arc::new)
 }
 
@@ -22,7 +22,7 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, env: crate::tcx::Typ
     let errors = &root_errors;
     // Const-param operands read this argument list. It is instantiated data,
     // and must cross the same normalization boundary as MIR operand constants.
-    b.args = args.iter().map(|&ty| tcx.try_normalize_erasing_regions(prog, env, ty)).collect::<Result<Vec<_>, _>>()?;
+    b.args = args.iter().map(|&ty| tcx.try_normalize_erasing_regions(prog, env, ty)).collect::<Result<ThinVec<_>, _>>()?;
     // The body now uses the caller's parameters, including consts nested in
     // types. Keep their clauses for subsequent borrowck type operations.
     b.param_env = (env.param_env != crate::tcx::ParamEnvId::EMPTY).then_some(env.param_env);
@@ -41,18 +41,25 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, env: crate::tcx::Typ
     for ty in &mut b.pat_ty { *ty = s(*ty)?; }
     b.ret = s(b.ret)?;
     for ty in b.hidden_types.values_mut() { *ty = s(*ty)?; }
-    for args in b.res_args.values_mut() { for ty in args { *ty = s(*ty)?; } }
-    for method in b.methods.values_mut() { for ty in &mut method.args { *ty = s(*ty)?; } }
-    for method in b.binops.values_mut() { for ty in &mut method.args { *ty = s(*ty)?; } }
+    let tys = &tcx.tys;
+    let sl = |l: &mut crate::types::TyList, s: &mut dyn FnMut(TyId) -> Result<TyId, crate::next_solver::NoSolution>| -> Result<(), crate::next_solver::NoSolution> {
+        if l.is_empty() { return Ok(()); }
+        let v = tys.list(*l).iter().map(|&t| s(t)).collect::<Result<Vec<_>, _>>()?;
+        *l = tys.mk_list(&v);
+        Ok(())
+    };
+    for args in b.res_args.values_mut() { sl(args, &mut s)?; }
+    for method in b.methods.values_mut() { sl(&mut method.args, &mut s)?; }
+    for method in b.binops.values_mut() { sl(&mut method.args, &mut s)?; }
     for c in b.coerce.values_mut() {
         match c { Coerce::ToDyn(a, d) | Coerce::Upcast(a, d) => { *a = s(*a)?; *d = s(*d)?; }, _ => {} }
     }
-    for (_, args) in b.ov_derefs.values_mut() { for ty in args { *ty = s(*ty)?; } }
-    for (_, args) in b.ov_index.values_mut() { for ty in args { *ty = s(*ty)?; } }
-    for (_, args) in b.for_next.values_mut() { for ty in args { *ty = s(*ty)?; } }
-    for (_, args, ty) in b.for_into.values_mut() { for ty in args { *ty = s(*ty)?; } *ty = s(*ty)?; }
-    for (_, args, ty) in b.try_branch.values_mut() { for t in args { *t = s(*t)?; } *ty = s(*ty)?; }
-    for (_, args) in b.try_from_residual.values_mut() { for t in args { *t = s(*t)?; } }
+    for (_, args) in b.ov_derefs.values_mut() { sl(args, &mut s)?; }
+    for (_, args) in b.ov_index.values_mut() { sl(args, &mut s)?; }
+    for (_, args) in b.for_next.values_mut() { sl(args, &mut s)?; }
+    for (_, args, ty) in b.for_into.values_mut() { sl(args, &mut s)?; *ty = s(*ty)?; }
+    for (_, args, ty) in b.try_branch.values_mut() { sl(args, &mut s)?; *ty = s(*ty)?; }
+    for (_, args) in b.try_from_residual.values_mut() { sl(args, &mut s)?; }
     for local in &mut b.locals { local.ty = s(local.ty)?; }
     for sig in b.closure_sigs.values_mut() {
         sig.bound = s(sig.bound)?; sig.liberated = s(sig.liberated)?;

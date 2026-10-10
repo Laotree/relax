@@ -24,6 +24,8 @@ mod opaque_types;
 mod call;
 mod checks;
 mod instantiate;
+mod side_table;
+pub use side_table::{BitSet, SideTable, ThinVec};
 pub use call::CallTrait;
 pub use closure::ClosureSignatures;
 
@@ -36,15 +38,15 @@ pub enum Res {
     Err,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct MethodRes {
     pub def: DefId,
     /// number of derefs applied to the receiver before the call
-    pub derefs: usize,
+    pub derefs: u32,
     /// 0 none, 1 `&`, 2 `&mut`
     pub autoref: u8,
     /// full generic args (impl params then method params)
-    pub args: Vec<TyId>,
+    pub args: crate::types::TyList,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -99,90 +101,90 @@ pub enum ExpectedClosureKind {
 #[derive(Clone)]
 pub struct Body {
     pub def: DefId,
-    pub args: Vec<TyId>,
+    pub args: ThinVec<TyId>,
     pub file: u32,
     pub expr_lo: u32,
-    pub expr_ty: Vec<TyId>,
+    pub expr_ty: ThinVec<TyId>,
     /// Presence in nightly TypeckResults::node_types: arena holes are not error types.
-    pub expr_typed: Vec<bool>,
+    pub expr_typed: BitSet,
     pub pat_lo: u32,
-    pub pat_ty: Vec<TyId>,
-    pub pat_typed: Vec<bool>,
+    pub pat_ty: ThinVec<TyId>,
+    pub pat_typed: BitSet,
     /// a lazily parsed body's nodes (ParsedFile::part) follow the item's own range in
     /// expr_ty / pat_ty: their first ids (u32::MAX: none) and the item range's lengths
     pub expr_lo2: u32,
     pub expr_n1: u32,
     pub pat_lo2: u32,
     pub pat_n1: u32,
-    pub res: HashMap<u32, Res>,
-    pub res_args: HashMap<u32, Vec<TyId>>,
-    pub pat_res: HashMap<u32, Res>,
-    pub pat_local: HashMap<u32, u32>,
-    pub methods: HashMap<u32, MethodRes>,
+    pub res: SideTable<u32, Res>,
+    pub res_args: SideTable<u32, crate::types::TyList>,
+    pub pat_res: SideTable<u32, Res>,
+    pub pat_local: SideTable<u32, u32>,
+    pub methods: SideTable<u32, MethodRes>,
     /// binary operators on non-primitive types: expr -> operator trait method call
-    pub binops: HashMap<u32, MethodRes>,
-    pub coerce: HashMap<u32, Coerce>,
+    pub binops: SideTable<u32, MethodRes>,
+    pub coerce: SideTable<u32, Coerce>,
     /// Reference coercions, including equal-type reborrows (rustc coerce_to_ref).
-    pub reborrows: HashMap<u32, bool>,
-    pub min_captures: HashMap<u32, crate::upvar::ClosureCaptures>,
-    pub hidden_types: HashMap<DefId, TyId>,
-    pub field_idx: HashMap<u32, (usize, u32)>,
+    pub reborrows: SideTable<u32, bool>,
+    pub min_captures: SideTable<u32, crate::upvar::ClosureCaptures>,
+    pub hidden_types: SideTable<DefId, TyId>,
+    pub field_idx: SideTable<u32, (u32, u32)>,
     /// every struct field the body names, resolved: (ADT, field index) -- a live layout edit's
     /// dependents (reload.rs: the fns using a removed or renamed field, not its name)
-    pub field_uses: Vec<(DefId, u32)>,
+    pub field_uses: ThinVec<(DefId, u32)>,
     /// Resolved definitions read while checking; deduplicated by the warm session.
-    pub dependencies: Vec<DefId>,
+    pub dependencies: ThinVec<DefId>,
     /// overloaded deref steps: (expr, step index) -> `Deref::deref` with [Self]
-    pub ov_derefs: HashMap<(u32, usize), (DefId, Vec<TyId>)>,
+    pub ov_derefs: SideTable<(u32, usize), (DefId, crate::types::TyList)>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
-    pub ov_index: HashMap<u32, (DefId, Vec<TyId>)>,
+    pub ov_index: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> `Iterator::next` with [Iter].
-    pub for_next: HashMap<u32, (DefId, Vec<TyId>)>,
+    pub for_next: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> (`IntoIterator::into_iter`, [Self], iterator type).
     /// The head is passed by value with identity adjustment (no method receiver coercion).
-    pub for_into: HashMap<u32, (DefId, Vec<TyId>, TyId)>,
-    pub index_derefs: HashMap<u32, usize>,
+    pub for_into: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
+    pub index_derefs: SideTable<u32, usize>,
     /// call expr -> deref steps from the callee expression to the callable
-    pub call_derefs: HashMap<u32, usize>,
+    pub call_derefs: SideTable<u32, usize>,
     /// Fn-family selection in the generic body, before instance substitution.
-    pub call_traits: HashMap<u32, CallTrait>,
+    pub call_traits: SideTable<u32, CallTrait>,
     /// calls of `#[rustc_legacy_const_generics]` fns: the argument positions that are const
     /// generic args (not passed as values)
-    pub legacy_args: HashMap<u32, Vec<u32>>,
+    pub legacy_args: SideTable<u32, Vec<u32>>,
     /// match ergonomics: pattern -> references peeled before matching it
-    pub pat_derefs: HashMap<u32, usize>,
+    pub pat_derefs: SideTable<u32, usize>,
     /// identifier patterns bound by reference through the default binding mode (1 ref, 2 ref mut)
-    pub pat_bind_ref: HashMap<u32, u8>,
+    pub pat_bind_ref: SideTable<u32, u8>,
     /// Semantic discriminant reads of constructor patterns, including irrefutable
     /// patterns of enums with uninhabited variants (ExprUseVisitor::walk_pat).
     /// These are capture uses even when runtime lowering needs no discriminant test.
-    pub pat_discriminant_reads: HashMap<u32, ()>,
+    pub pat_discriminant_reads: SideTable<u32, ()>,
     /// The two lang-item calls of the `?` desugaring, with their inferred types.
-    pub try_branch: HashMap<u32, (DefId, Vec<TyId>, TyId)>,
-    pub try_from_residual: HashMap<u32, (DefId, Vec<TyId>)>,
-    pub locals: Vec<Local>,
-    pub param_pats: Vec<PatId>,
+    pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
+    pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
+    pub locals: ThinVec<Local>,
+    pub param_pats: ThinVec<PatId>,
     pub ret: TyId,
     pub body: Option<BlockId>,
     /// (macro expr, named arg) -> resolution of `{name}` in a format string
-    pub fmt_named: HashMap<(u32, Sym), Res>,
+    pub fmt_named: SideTable<(u32, Sym), Res>,
     /// closures that capture nothing (can become plain functions)
-    pub closures: Vec<u32>,
-    pub closure_locals: HashMap<u32, Vec<u32>>,
+    pub closures: ThinVec<u32>,
+    pub closure_locals: SideTable<u32, Vec<u32>>,
     /// Kind deduced from the closure's expected type, before capture inference.
-    pub closure_expected_kinds: HashMap<u32, ExpectedClosureKind>,
+    pub closure_expected_kinds: SideTable<u32, ExpectedClosureKind>,
     /// PolyFnSig and the signature used inside each closure body.
-    pub closure_sigs: HashMap<u32, ClosureSignatures>,
-    pub inline_const_types: HashMap<u32, TyId>,
+    pub closure_sigs: SideTable<u32, ClosureSignatures>,
+    pub inline_const_types: SideTable<u32, TyId>,
     /// `S { a: 1, .. }` (bare `..`): struct literal expr -> (field index, the const holding the
     /// field's declared default) for every omitted field (rustc default_field_values)
-    pub struct_defaults: HashMap<u32, Vec<(u32, DefId)>>,
-    pub errors: Vec<String>,
+    pub struct_defaults: SideTable<u32, Vec<(u32, DefId)>>,
+    pub errors: ThinVec<String>,
     /// A failed check's lookups that missed in modules the lazy Rust selection skipped
     /// (program.rs note_deferred_miss): every reader of the cached result notes them again, so
     /// the build that fails on it defers to the post-boot loader (jit.rs DEFERRED_RETRY) like
     /// the run that computed it. Loading a module republishes declarations, which recomputes it.
-    pub deferred_misses: Vec<(u32, String)>,
+    pub deferred_misses: ThinVec<(u32, String)>,
     /// Clauses for this body's parameter space: the declaration's environment
     /// after typeck, or the caller's after instantiation for analysis.
     pub param_env: Option<crate::tcx::ParamEnvId>,
@@ -193,57 +195,57 @@ impl Body {
     pub fn empty(def: DefId, args: Vec<TyId>, file: u32, unit: TyId) -> Body {
         Body {
             def,
-            args,
+            args: args.into(),
             file,
             expr_lo: 0,
-            expr_ty: Vec::new(),
-            expr_typed: Vec::new(),
+            expr_ty: ThinVec::new(),
+            expr_typed: BitSet::default(),
             pat_lo: 0,
-            pat_ty: Vec::new(),
-            pat_typed: Vec::new(),
+            pat_ty: ThinVec::new(),
+            pat_typed: BitSet::default(),
             expr_lo2: u32::MAX,
             expr_n1: 0,
             pat_lo2: u32::MAX,
             pat_n1: 0,
-            res: HashMap::default(),
-            res_args: HashMap::default(),
-            pat_res: HashMap::default(),
-            pat_local: HashMap::default(),
-            methods: HashMap::default(),
-            binops: HashMap::default(),
-            coerce: HashMap::default(),
-            reborrows: HashMap::default(),
-            min_captures: HashMap::default(),
-            hidden_types: HashMap::default(),
-            field_idx: HashMap::default(),
-            field_uses: Vec::new(),
-            dependencies: Vec::new(),
-            ov_derefs: HashMap::default(),
-            ov_index: HashMap::default(),
-            for_next: HashMap::default(),
-            for_into: HashMap::default(),
-            index_derefs: HashMap::default(),
-            call_derefs: HashMap::default(),
-            call_traits: HashMap::default(),
-            legacy_args: HashMap::default(),
-            pat_derefs: HashMap::default(),
-            pat_bind_ref: HashMap::default(),
-            pat_discriminant_reads: HashMap::default(),
-            try_branch: HashMap::default(),
-            try_from_residual: HashMap::default(),
-            locals: Vec::new(),
-            param_pats: Vec::new(),
+            res: SideTable::new(),
+            res_args: SideTable::new(),
+            pat_res: SideTable::new(),
+            pat_local: SideTable::new(),
+            methods: SideTable::new(),
+            binops: SideTable::new(),
+            coerce: SideTable::new(),
+            reborrows: SideTable::new(),
+            min_captures: SideTable::new(),
+            hidden_types: SideTable::new(),
+            field_idx: SideTable::new(),
+            field_uses: ThinVec::new(),
+            dependencies: ThinVec::new(),
+            ov_derefs: SideTable::new(),
+            ov_index: SideTable::new(),
+            for_next: SideTable::new(),
+            for_into: SideTable::new(),
+            index_derefs: SideTable::new(),
+            call_derefs: SideTable::new(),
+            call_traits: SideTable::new(),
+            legacy_args: SideTable::new(),
+            pat_derefs: SideTable::new(),
+            pat_bind_ref: SideTable::new(),
+            pat_discriminant_reads: SideTable::new(),
+            try_branch: SideTable::new(),
+            try_from_residual: SideTable::new(),
+            locals: ThinVec::new(),
+            param_pats: ThinVec::new(),
             ret: unit,
             body: None,
-            fmt_named: HashMap::default(),
-            closures: Vec::new(),
-            closure_locals: HashMap::default(),
-            closure_expected_kinds: HashMap::default(),
-            closure_sigs: HashMap::default(),
-            inline_const_types: HashMap::default(),
-            struct_defaults: HashMap::default(),
-            errors: Vec::new(),
-            deferred_misses: Vec::new(),
+            fmt_named: SideTable::new(),
+            closures: ThinVec::new(),
+            closure_locals: SideTable::new(),
+            closure_expected_kinds: SideTable::new(),
+            closure_sigs: SideTable::new(),
+            inline_const_types: SideTable::new(),
+            struct_defaults: SideTable::new(),
+            errors: ThinVec::new(),
+            deferred_misses: ThinVec::new(),
             param_env: None,
         }
     }
@@ -288,29 +290,98 @@ impl Body {
         self.expr_ix(e) < self.expr_ty.len()
     }
 
-    /// Heap bytes this body owns (memory report: tables at their capacity, nested vectors
-    /// followed one level), without the struct itself.
+    /// Heap bytes this body owns (memory report: tables and arrays at their capacity, nested
+    /// vectors followed one level), without the struct itself.
     pub fn heap_bytes(&self) -> usize {
+        let mut acc = std::collections::BTreeMap::new();
+        self.mem_breakdown(&mut acc);
+        (acc.values().map(|x| x.1).sum::<u64>() - std::mem::size_of::<Body>() as u64) as usize
+    }
+
+    /// The results are final: every table and array holds exactly its entries.
+    pub fn freeze(&mut self) {
+        macro_rules! shrink { ($($f:ident),*) => { $( self.$f.shrink_to_fit(); )* } }
+        shrink!(res, res_args, pat_res, pat_local, methods, binops, coerce, reborrows, min_captures, hidden_types,
+            field_idx, ov_derefs, ov_index, for_next, for_into, index_derefs, call_derefs, call_traits, legacy_args,
+            pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
+            closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
+            args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
+    }
+
+    /// Memory report (RELAX_MEM_REPORT): per table (entries, heap bytes incl. nested vectors),
+    /// accumulated into `acc` by name.
+    /// Memory report: the bytes these contents took in the previous layout, counted as that
+    /// layout's report counted them: a 1304 B struct; HashMap side tables grown by insertion
+    /// (4, 8, else the next power of two of n * 8 / 7 buckets of entry + 1 control byte, + 16)
+    /// with their entries' previous sizes and Vec<TyId> payloads; Vec fields at their growth
+    /// capacity (exact where they were built at their length).
+    pub fn prev_layout_bytes(&self, tys: &crate::types::Types) -> usize {
+        fn m(n: usize, entry: usize) -> usize {
+            if n == 0 {
+                return 0;
+            }
+            let buckets = if n < 4 { 4 } else if n < 8 { 8 } else { (n * 8 / 7).next_power_of_two() };
+            buckets * (entry + 1) + 16
+        }
+        fn t<K, V>(x: &SideTable<K, V>) -> usize {
+            m(x.len(), std::mem::size_of::<(K, V)>())
+        }
+        fn grown<T>(x: &ThinVec<T>) -> usize {
+            if x.is_empty() { 0 } else { x.len().next_power_of_two().max(4) * std::mem::size_of::<T>() }
+        }
         fn v<T>(x: &Vec<T>) -> usize {
             x.capacity() * std::mem::size_of::<T>()
         }
-        fn m<K, V>(x: &HashMap<K, V>) -> usize {
-            let c = x.capacity();
-            if c == 0 {
-                return 0;
-            }
-            let buckets = if c < 4 { 4 } else if c < 8 { 8 } else { (c * 8 / 7).next_power_of_two() };
-            buckets * (std::mem::size_of::<(K, V)>() + 1) + 16
-        }
-        let mut n = v(&self.args) + v(&self.expr_ty) + v(&self.pat_ty) + m(&self.res) + m(&self.res_args) + m(&self.pat_res) + m(&self.pat_local) + m(&self.methods) + m(&self.binops) + m(&self.coerce) + m(&self.reborrows) + m(&self.min_captures) + m(&self.field_idx) + v(&self.field_uses) + v(&self.dependencies) + m(&self.ov_derefs) + m(&self.ov_index) + m(&self.for_next) + m(&self.for_into) + m(&self.index_derefs) + m(&self.call_derefs) + m(&self.call_traits) + m(&self.legacy_args) + m(&self.pat_derefs) + m(&self.pat_bind_ref) + m(&self.pat_discriminant_reads) + m(&self.try_branch) + m(&self.try_from_residual) + v(&self.locals) + v(&self.param_pats) + m(&self.fmt_named) + v(&self.closures) + m(&self.closure_locals) + m(&self.closure_expected_kinds) + m(&self.closure_sigs) + m(&self.inline_const_types) + m(&self.struct_defaults) + v(&self.errors);
-        n += self.res_args.values().map(v).sum::<usize>() + self.methods.values().chain(self.binops.values()).map(|x| v(&x.args)).sum::<usize>();
-        n += self.ov_derefs.values().chain(self.ov_index.values()).chain(self.for_next.values()).map(|x| v(&x.1)).sum::<usize>() + self.for_into.values().map(|x| v(&x.1)).sum::<usize>();
-        n += self.legacy_args.values().map(v).sum::<usize>();
-        n += self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
-        n += self.try_branch.values().map(|x| v(&x.1)).sum::<usize>() + self.try_from_residual.values().map(|x| v(&x.1)).sum::<usize>();
-        n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors)).sum::<usize>();
+        let l = |x: crate::types::TyList| tys.list(x).len() * 4;
+        let mut n = 1304;
+        n += t(&self.res) + t(&self.pat_res) + t(&self.pat_local) + t(&self.coerce) + t(&self.reborrows) + t(&self.hidden_types) + t(&self.index_derefs) + t(&self.call_derefs) + t(&self.call_traits) + t(&self.pat_derefs) + t(&self.pat_bind_ref) + t(&self.pat_discriminant_reads) + t(&self.fmt_named) + t(&self.closure_expected_kinds) + t(&self.closure_sigs) + t(&self.inline_const_types) + t(&self.legacy_args) + t(&self.closure_locals) + t(&self.struct_defaults) + t(&self.min_captures);
+        // entries that held a Vec<TyId> (24 B) or a usize where they now hold a list id or a u32
+        n += m(self.res_args.len(), 32) + m(self.methods.len(), 48) + m(self.binops.len(), 48) + m(self.ov_derefs.len(), 48) + m(self.ov_index.len(), 40) + m(self.for_next.len(), 40) + m(self.for_into.len(), 40) + m(self.try_branch.len(), 40) + m(self.try_from_residual.len(), 40) + m(self.field_idx.len(), 24);
+        n += self.res_args.values().map(|&x| l(x)).sum::<usize>() + self.methods.values().chain(self.binops.values()).map(|x| l(x.args)).sum::<usize>();
+        n += self.ov_derefs.values().chain(self.ov_index.values()).chain(self.for_next.values()).chain(self.try_from_residual.values()).map(|x| l(x.1)).sum::<usize>();
+        n += self.for_into.values().chain(self.try_branch.values()).map(|x| l(x.1)).sum::<usize>();
+        n += self.legacy_args.values().map(v).sum::<usize>() + self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
+        n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>();
+        n += (self.args.len() + self.expr_ty.len() + self.pat_ty.len()) * 4 + self.expr_typed.len() + self.pat_typed.len();
+        n += grown(&self.field_uses) + grown(&self.dependencies) + grown(&self.locals) + grown(&self.param_pats) + grown(&self.closures) + grown(&self.errors) + grown(&self.deferred_misses);
         n += self.errors.iter().map(|e| e.capacity()).sum::<usize>();
         n
+    }
+
+    pub fn mem_breakdown(&self, acc: &mut std::collections::BTreeMap<&'static str, (u64, u64)>) {
+        fn v<T>(x: &Vec<T>) -> usize {
+            x.capacity() * std::mem::size_of::<T>()
+        }
+        fn t<T>(x: &ThinVec<T>) -> usize {
+            x.heap_bytes()
+        }
+        fn m<K, V>(x: &SideTable<K, V>) -> usize {
+            x.heap_bytes()
+        }
+        let mut add = |name: &'static str, n: usize, b: usize| {
+            let e = acc.entry(name).or_default();
+            e.0 += n as u64;
+            e.1 += b as u64;
+        };
+        add("struct", 1, std::mem::size_of::<Body>());
+        add("args", self.args.len(), t(&self.args));
+        add("expr_ty", self.expr_ty.len(), t(&self.expr_ty));
+        add("expr_typed", self.expr_typed.len(), self.expr_typed.heap_bytes());
+        add("pat_ty", self.pat_ty.len(), t(&self.pat_ty));
+        add("pat_typed", self.pat_typed.len(), self.pat_typed.heap_bytes());
+        macro_rules! maps { ($($f:ident),*) => { $( add(stringify!($f), self.$f.len(), m(&self.$f)); )* } }
+        maps!(res, res_args, methods, binops, ov_derefs, ov_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, coerce, reborrows, hidden_types, field_idx, index_derefs, call_derefs, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
+        add("legacy_args", self.legacy_args.len(), m(&self.legacy_args) + self.legacy_args.values().map(v).sum::<usize>());
+        add("closure_locals", self.closure_locals.len(), m(&self.closure_locals) + self.closure_locals.values().map(v).sum::<usize>());
+        add("struct_defaults", self.struct_defaults.len(), m(&self.struct_defaults) + self.struct_defaults.values().map(v).sum::<usize>());
+        add("min_captures", self.min_captures.len(), m(&self.min_captures) + self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>());
+        add("field_uses", self.field_uses.len(), t(&self.field_uses));
+        add("dependencies", self.dependencies.len(), t(&self.dependencies));
+        add("locals", self.locals.len(), t(&self.locals));
+        add("param_pats", self.param_pats.len(), t(&self.param_pats));
+        add("closures", self.closures.len(), t(&self.closures));
+        add("errors", self.errors.len(), t(&self.errors) + self.errors.iter().map(|e| e.capacity()).sum::<usize>());
+        add("deferred_misses", self.deferred_misses.len(), t(&self.deferred_misses));
     }
 }
 
@@ -529,57 +600,57 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         env,
         b: Body {
             def,
-            args: args.to_vec(),
+            args: ThinVec::from_slice(args),
             file,
             expr_lo: ranges[0],
-            expr_ty: vec![error; n_expr],
-            expr_typed: vec![false; n_expr],
+            expr_ty: vec![error; n_expr].into(),
+            expr_typed: BitSet::new(n_expr),
             pat_lo: ranges[2],
-            pat_ty: vec![error; n_pat],
-            pat_typed: vec![false; n_pat],
+            pat_ty: vec![error; n_pat].into(),
+            pat_typed: BitSet::new(n_pat),
             expr_lo2: ranges2.map_or(u32::MAX, |r| r[0]),
             expr_n1: n_expr1,
             pat_lo2: ranges2.map_or(u32::MAX, |r| r[2]),
             pat_n1: n_pat1,
-            res: HashMap::default(),
-            res_args: HashMap::default(),
-            pat_res: HashMap::default(),
-            pat_local: HashMap::default(),
-            methods: HashMap::default(),
-            binops: HashMap::default(),
-            coerce: HashMap::default(),
-            reborrows: HashMap::default(),
-            min_captures: HashMap::default(),
-            hidden_types: HashMap::default(),
-            field_idx: HashMap::default(),
-            field_uses: Vec::new(),
-            dependencies: Vec::new(),
-            ov_derefs: HashMap::default(),
-            ov_index: HashMap::default(),
-            for_next: HashMap::default(),
-            for_into: HashMap::default(),
-            index_derefs: HashMap::default(),
-            call_derefs: HashMap::default(),
-            call_traits: HashMap::default(),
-            legacy_args: HashMap::default(),
-            try_branch: HashMap::default(),
-            try_from_residual: HashMap::default(),
-            pat_derefs: HashMap::default(),
-            pat_bind_ref: HashMap::default(),
-            pat_discriminant_reads: HashMap::default(),
-            locals: Vec::new(),
-            param_pats: Vec::new(),
+            res: SideTable::new(),
+            res_args: SideTable::new(),
+            pat_res: SideTable::new(),
+            pat_local: SideTable::new(),
+            methods: SideTable::new(),
+            binops: SideTable::new(),
+            coerce: SideTable::new(),
+            reborrows: SideTable::new(),
+            min_captures: SideTable::new(),
+            hidden_types: SideTable::new(),
+            field_idx: SideTable::new(),
+            field_uses: ThinVec::new(),
+            dependencies: ThinVec::new(),
+            ov_derefs: SideTable::new(),
+            ov_index: SideTable::new(),
+            for_next: SideTable::new(),
+            for_into: SideTable::new(),
+            index_derefs: SideTable::new(),
+            call_derefs: SideTable::new(),
+            call_traits: SideTable::new(),
+            legacy_args: SideTable::new(),
+            try_branch: SideTable::new(),
+            try_from_residual: SideTable::new(),
+            pat_derefs: SideTable::new(),
+            pat_bind_ref: SideTable::new(),
+            pat_discriminant_reads: SideTable::new(),
+            locals: ThinVec::new(),
+            param_pats: ThinVec::new(),
             ret: error,
             body: None,
-            fmt_named: HashMap::default(),
-            closures: Vec::new(),
-            closure_locals: HashMap::default(),
-            closure_expected_kinds: HashMap::default(),
-            closure_sigs: HashMap::default(),
-            inline_const_types: HashMap::default(),
-            struct_defaults: HashMap::default(),
-            errors: tcx.signature_errors(prog, def).to_vec(),
-            deferred_misses: Vec::new(),
+            fmt_named: SideTable::new(),
+            closures: ThinVec::new(),
+            closure_locals: SideTable::new(),
+            closure_expected_kinds: SideTable::new(),
+            closure_sigs: SideTable::new(),
+            inline_const_types: SideTable::new(),
+            struct_defaults: SideTable::new(),
+            errors: ThinVec::from_slice(tcx.signature_errors(prog, def)),
+            deferred_misses: ThinVec::new(),
             param_env: None,
         },
         scopes: Vec::new(),
@@ -758,6 +829,7 @@ impl<'a> Fcx<'a> {
         if self.b.errors.is_empty() && self.infcx.tainted_by_errors() {
             self.b.errors.push(self.prog.record_error(self.file, self.last_lo, "typeck", "type checking failed due to previous errors".into()));
         }
+        self.b.freeze();
         self.b
     }
     fn ast(&self) -> &'a Ast {
@@ -1662,16 +1734,16 @@ impl<'a> Fcx<'a> {
         if self.pending_captures.is_empty() || !self.b.errors.is_empty() { return; }
         // The visitor's type queries must see this inference context's assignments.
         for i in 0..self.b.locals.len() { self.b.locals[i].ty = self.norm(self.b.locals[i].ty); }
-        for i in 0..self.b.expr_ty.len() { if self.b.expr_typed[i] { self.b.expr_ty[i] = self.norm(self.b.expr_ty[i]); } }
-        for i in 0..self.b.pat_ty.len() { if self.b.pat_typed[i] { self.b.pat_ty[i] = self.norm(self.b.pat_ty[i]); } }
+        for i in 0..self.b.expr_ty.len() { if self.b.expr_typed.get(i) { self.b.expr_ty[i] = self.norm(self.b.expr_ty[i]); } }
+        for i in 0..self.b.pat_ty.len() { if self.b.pat_typed.get(i) { self.b.pat_ty[i] = self.norm(self.b.pat_ty[i]); } }
         for k in self.b.methods.keys().copied().collect::<Vec<_>>() {
-            let args = self.b.methods[&k].args.clone();
-            self.b.methods.get_mut(&k).unwrap().args = args.into_iter().map(|t| self.norm(t)).collect();
+            let args = self.tcx.tys.list(self.b.methods[&k].args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
+            self.b.methods.get_mut(&k).unwrap().args = self.tcx.tys.mk_list(&args);
         }
         for k in self.b.ov_derefs.keys().copied().collect::<Vec<_>>() {
-            let (method, args) = self.b.ov_derefs[&k].clone();
-            let args = args.into_iter().map(|t| self.norm(t)).collect();
-            self.b.ov_derefs.insert(k, (method, args));
+            let (method, args) = self.b.ov_derefs[&k];
+            let args = self.tcx.tys.list(args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
+            self.b.ov_derefs.insert(k, (method, self.tcx.tys.mk_list(&args)));
         }
         for pending in std::mem::take(&mut self.pending_captures) {
             crate::upvar::analyze(&self.cx.with_infcx(&self.infcx), self.prog, self.tcx, &mut self.b, &pending);
@@ -1857,7 +1929,7 @@ impl<'a> Fcx<'a> {
         let i = self.b.expr_ix(e);
         if i < self.b.expr_ty.len() {
             self.b.expr_ty[i] = t;
-            self.b.expr_typed[i] = true;
+            self.b.expr_typed.set(i);
             // rustc_hir_typeck/src/fn_ctxt/_impl.rs:194: write_ty taints on error types.
             if self.tcx.tys.flags(t).intersects(crate::types::TypeFlags::HAS_ERROR) { self.infcx.set_tainted_by_errors(); }
         }
@@ -1871,7 +1943,7 @@ impl<'a> Fcx<'a> {
         let pi = self.b.pat_ix(p);
         if pi < self.b.pat_ty.len() {
             self.b.pat_ty[pi] = expected;
-            self.b.pat_typed[pi] = true;
+            self.b.pat_typed.set(pi);
             if self.tcx.tys.flags(expected).intersects(crate::types::TypeFlags::HAS_ERROR) { self.infcx.set_tainted_by_errors(); }
         }
         // match ergonomics: a structural pattern against references matches through them and
@@ -2488,7 +2560,7 @@ impl<'a> Fcx<'a> {
             let given = key.and_then(|k| self.b.res_args.get(&k).cloned());
             let adt_ty = self.instantiate_adt(adt_ty);
             let adt_ty = match (self.tcx.tys.kind(adt_ty).clone(), given) {
-                (TyKind::Adt(ad, gen, regions), Some(a)) if a.len() == self.tcx.tys.list(gen).len() => self.tcx.tys.intern(TyKind::Adt(ad, self.tcx.tys.mk_list(&a), regions)),
+                (TyKind::Adt(ad, gen, regions), Some(a)) if self.tcx.tys.list(a).len() == self.tcx.tys.list(gen).len() => self.tcx.tys.intern(TyKind::Adt(ad, a, regions)),
                 _ => adt_ty,
             };
             self.coerce_or_unify(adt_ty, expected, None, pos);
@@ -2588,7 +2660,7 @@ impl<'a> Fcx<'a> {
                         }
                     }
                 }
-                self.b.res_args.insert(key, args.clone());
+                self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
                 // fn_ctxt/_impl.rs:1180-1205 (instantiate_value_path's lifetime
                 // args) with hir_ty_lowering/generics.rs:520-580: written lifetimes
                 // instantiate the fn's own early-bound lifetimes; with late-bound
@@ -2626,7 +2698,7 @@ impl<'a> Fcx<'a> {
                 match explicit {
                     Some(v) => {
                         // the args pick the impl of a trait's const at evaluation (`T::ZERO`)
-                        self.b.res_args.insert(key, v.clone());
+                        self.b.res_args.insert(key, self.tcx.tys.mk_list(&v));
                         // typeck-audit 1.9 / fn_ctxt/_impl.rs:1293-1301: every value path
                         // registers its item's predicates with the path's args
                         // (`<T as Tr>::C` proves `T: Tr`)
@@ -2661,7 +2733,7 @@ impl<'a> Fcx<'a> {
                         }
                     }
                 }
-                self.b.res_args.insert(key, args.clone());
+                self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
                 let mut regions = Vec::new();
                 for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
                 let regions = self.tcx.tys.intern_region_args(&regions);
@@ -3178,7 +3250,7 @@ impl<'a> Fcx<'a> {
         let iter_t = self.normalize_signature(iter_t);
         let item = self.iterator_item(it, iter_t)?;
         self.b.dependencies.push(into);
-        self.b.for_into.insert(it, (into, vec![s], iter_t));
+        self.b.for_into.insert(it, (into, self.tcx.tys.mk_list(&[s]), iter_t));
         Some(item)
     }
 
@@ -3371,7 +3443,7 @@ impl<'a> Fcx<'a> {
                 let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: self.tcx.tys.mk_list(&[dt]), regions: crate::types::RegionArgsId::EMPTY }));
                 let r = self.norm(proj);
                 let m = self.trait_fn(td, "deref")?;
-                self.b.ov_derefs.insert((e, step), (m, vec![dt]));
+                self.b.ov_derefs.insert((e, step), (m, self.tcx.tys.mk_list(&[dt])));
                 Some(r)
             }
             _ => None,
@@ -3742,7 +3814,7 @@ impl<'a> Fcx<'a> {
             if declared_inside {
                 break;
             }
-            let caps = self.b.closure_locals.entry(ce).or_default();
+            let caps = self.b.closure_locals.get_or_insert_with(ce, Vec::new);
             if !caps.contains(&li) {
                 caps.push(li);
             }
@@ -4424,7 +4496,7 @@ impl<'a> Fcx<'a> {
                 loop {
                     match self.tcx.tys.kind(cur).clone() {
                         TyKind::Tuple(v) => {
-                            self.b.field_idx.insert(e.0, (derefs, *idx));
+                            self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                             return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
                         }
                         TyKind::Adt(d, args, regions) => {
@@ -4433,7 +4505,7 @@ impl<'a> Fcx<'a> {
                                 if !adt.is_enum {
                                     if let Some(f) = adt.variants[0].fields.get(*idx as usize) {
                                         if self.field_visible(d, f) {
-                                            self.b.field_idx.insert(e.0, (derefs, *idx));
+                                            self.b.field_idx.insert(e.0, (derefs as u32, *idx));
                                             return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                                         }
                                     }
@@ -4502,7 +4574,7 @@ impl<'a> Fcx<'a> {
                                         let ds = self.infcx.deeply_resolve_ignoring_regions(st);
                                         if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
                                             let m = self.trait_fn(td, "index").unwrap();
-                                            self.b.ov_index.insert(e.0, (m, vec![ds, ti2]));
+                                            self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
                                             let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
                                             let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: self.tcx.tys.mk_list(&[ds, ti2]), regions: crate::types::RegionArgsId::EMPTY }));
                                             return self.norm_keep(r);
@@ -4558,7 +4630,7 @@ impl<'a> Fcx<'a> {
                                     self.b.index_derefs.insert(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
-                                    self.b.ov_index.insert(e.0, (m, vec![dc, index]));
+                                    self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[dc, index])));
                                     let output = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
                                     let projection = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: output }, args: self.tcx.tys.mk_list(&[dc, index]), regions: crate::types::RegionArgsId::EMPTY }));
                                     return self.norm_keep(projection);
@@ -4832,8 +4904,8 @@ impl<'a> Fcx<'a> {
         self.apply_fn_bounds(from_residual, &full, lo);
         self.b.dependencies.push(branch);
         self.b.dependencies.push(from_residual);
-        self.b.try_branch.insert(e.0, (branch, vec![t], flow));
-        self.b.try_from_residual.insert(e.0, (from_residual, vec![ret, residual]));
+        self.b.try_branch.insert(e.0, (branch, self.tcx.tys.mk_list(&[t]), flow));
+        self.b.try_from_residual.insert(e.0, (from_residual, self.tcx.tys.mk_list(&[ret, residual])));
         output
     }
 
@@ -5092,7 +5164,7 @@ impl<'a> Fcx<'a> {
         let variant = self.tcx.adts.get(&def)?.variants.iter().find(|v| v.def == some)?;
         let item = self.tcx.instantiate_ty(self.prog, def, &self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions), variant.fields[0].ty);
         self.b.dependencies.push(next);
-        self.b.for_next.insert(key, (next, vec![t]));
+        self.b.for_next.insert(key, (next, self.tcx.tys.mk_list(&[t])));
         Some(item)
     }
 
@@ -5120,7 +5192,7 @@ impl<'a> Fcx<'a> {
                             // a private field of a type from elsewhere is not visible: autoderef
                             // continues (`rc.0` on Rc<Shared> is Shared's field)
                             if f.name == s && self.field_visible(d, f) {
-                                self.b.field_idx.insert(e.0, (derefs, i as u32));
+                                self.b.field_idx.insert(e.0, (derefs as u32, i as u32));
                                 if !self.b.field_uses.contains(&(d, i as u32)) {
                                     self.b.field_uses.push((d, i as u32));
                                     self.b.dependencies.push(d);
@@ -5381,7 +5453,7 @@ impl<'a> Fcx<'a> {
                 force_args = self.scopes[self.closure_depth.last().unwrap().1..].iter().map(|p| p.1).collect();
             }
         }
-        let caps = self.b.closure_locals.entry(e.0).or_default();
+        let caps = self.b.closure_locals.get_or_insert_with(e.0, Vec::new);
         for &li in &force_args { if !caps.contains(&li) { caps.push(li); } }
         self.coroutine_type(e.0, b, force_args, is_move, force_move_if_consumes, out, points)
     }
@@ -5616,7 +5688,7 @@ impl<'a> Fcx<'a> {
         }
         let autoref = self.forced_autoref.take().unwrap_or(match sig.self_kind { 2 => 1, 3 => 2, _ => 0 });
         self.b.dependencies.push(item);
-        self.b.methods.insert(e.0, MethodRes { def: item, derefs, autoref, args: gargs.clone() });
+        self.b.methods.insert(e.0, MethodRes { def: item, derefs: derefs as u32, autoref, args: self.tcx.tys.mk_list(&gargs) });
         if sig.self_kind == 0 {
             self.err(lo, format!("`{}` is an associated function, not a method", self.prog.syms.str(s)));
             return error;
@@ -5720,7 +5792,7 @@ impl<'a> Fcx<'a> {
             self.err(lo, format!("no `{}` impl to compare `{}` with `{}` -- derive or impl {}", tr, x, y, tr));
             return Some(self.tcx.tys.bool_);
         };
-        self.b.binops.insert(e.0, MethodRes { def: item, derefs: 0, autoref: 1, args: vec![da, rhs] });
+        self.b.binops.insert(e.0, MethodRes { def: item, derefs: 0, autoref: 1, args: self.tcx.tys.mk_list(&[da, rhs]) });
         Some(self.tcx.tys.bool_)
     }
 
@@ -5733,7 +5805,7 @@ impl<'a> Fcx<'a> {
         let ms = self.prog.syms.get(m)?;
         let item = self.prog.traits[self.prog.def(td).sub as usize].iter().copied().find(|&it| self.prog.def(it).name == ms)?;
         let args = vec![t];
-        self.b.binops.insert(e.0, MethodRes { def: item, derefs: 0, autoref: 0, args: args.clone() });
+        self.b.binops.insert(e.0, MethodRes { def: item, derefs: 0, autoref: 0, args: self.tcx.tys.mk_list(&args) });
         let sig = self.tcx.fn_sig(self.prog, item).cloned()?;
         let r = self.tcx.tys.subst(sig.ret, &args);
         Some(self.norm(r))
@@ -5807,7 +5879,7 @@ impl<'a> Fcx<'a> {
             return error;
         }
         let args = vec![ta, tb];
-        self.b.binops.insert(me, MethodRes { def: item, derefs: 0, autoref: 0, args: args.clone() });
+        self.b.binops.insert(me, MethodRes { def: item, derefs: 0, autoref: 0, args: self.tcx.tys.mk_list(&args) });
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
         let r = self.tcx.tys.subst(sig.ret, &args);
         self.norm(r)
@@ -5918,7 +5990,7 @@ impl<'a> Fcx<'a> {
             },
         };
         self.b.dependencies.push(item);
-        self.b.methods.insert(e.0, MethodRes { def: item, derefs, autoref, args: gargs.clone() });
+        self.b.methods.insert(e.0, MethodRes { def: item, derefs: derefs as u32, autoref, args: self.tcx.tys.mk_list(&gargs) });
         let mut full = self.infer_item_args(item, &gargs);
         if let Some(known) = known_full {
             for (arg, known) in full.iter_mut().zip(known) {
@@ -6555,12 +6627,12 @@ pub fn is_rest_pat(ast: &Ast, p: PatId) -> bool {
 }
 
 /// Walk a resolved type without allocating a set in the type-checker's hot path.
-pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>) {
-    fn walk(tcx: &Tcx, ty: TyId, out: &mut Vec<DefId>, depth: usize) {
+pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut impl Extend<DefId>) {
+    fn walk(tcx: &Tcx, ty: TyId, out: &mut impl Extend<DefId>, depth: usize) {
         if depth > 64 { return; }
         match tcx.tys.kind(ty) {
             TyKind::Adt(d, a, _) | TyKind::FnDef(d, a, _) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { def_id: d }, args: a, regions: _ }) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Opaque { def_id: d }, args: a, regions: _ }) => {
-                out.push(*d);
+                out.extend([*d]);
                 for t in tcx.tys.list(*a) { walk(tcx, *t, out, depth + 1); }
             }
             TyKind::Ref(_, t, _) | TyKind::Ptr(_, t) | TyKind::Slice(t) | TyKind::Array(t, _) => walk(tcx, *t, out, depth + 1),

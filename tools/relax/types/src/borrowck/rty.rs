@@ -53,7 +53,7 @@ pub struct Rty<'a> {
     adts: RefCell<HashMap<DefId, Rc<AdtInfo>>>,
     fields: RefCell<HashMap<(TyId, u32, u32), Rc<Vec<SR>>>>,
     pub closures: RefCell<HashMap<(u32, u32), ClosureSkel>>,
-    pub closure_signatures: RefCell<HashMap<u32, crate::typeck::ClosureSignatures>>,
+    pub closure_signatures: RefCell<crate::typeck::SideTable<u32, crate::typeck::ClosureSignatures>>,
     pub closure_parents: RefCell<HashMap<u32, Option<u32>>>,
     /// per closure expression: the owner's named lifetimes its body requires its external
     /// regions to outlive (a closure requirement `'c: 'a` whose outlived region is a free region
@@ -207,7 +207,7 @@ impl<'a> Rty<'a> {
             adts: RefCell::new(HashMap::default()),
             fields: RefCell::new(HashMap::default()),
             closures: RefCell::new(HashMap::default()),
-            closure_signatures: RefCell::new(HashMap::default()),
+            closure_signatures: RefCell::new(crate::typeck::SideTable::new()),
             closure_parents: RefCell::new(HashMap::default()),
             closure_req_names: RefCell::new(HashMap::default()),
             templates: RefCell::new(HashMap::default()),

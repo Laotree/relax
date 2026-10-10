@@ -431,7 +431,7 @@ impl<'a> Build<'a> {
                 _ => unreachable!(),
             };
             self.out.def = Some(self.b.def);
-            self.out.args = self.b.args.clone();
+            self.out.args = self.b.args.to_vec();
             self.build_const_expr(init, self.b.ret);
         }
     }
@@ -439,7 +439,7 @@ impl<'a> Build<'a> {
     pub fn build_const_child(&mut self, owner: super::body::CheckedBody) {
         use super::body::BodyKind;
         self.out.checked_body = Some(owner);
-        self.out.args = self.b.args.clone();
+        self.out.args = self.b.args.to_vec();
         match owner.kind {
             BodyKind::InlineConst(e) => {
                 let ExprKind::ConstBlock(block) = self.ast.expr(e).kind else { unreachable!() };
@@ -486,7 +486,7 @@ impl<'a> Build<'a> {
     /// `_0`, the args, the param patterns and the body block.
     pub fn build_fn(&mut self) {
         self.out.def = Some(self.b.def);
-        self.out.args = self.b.args.clone();
+        self.out.args = self.b.args.to_vec();
         let ret = self.b.ret;
         self.ret_ty = ret;
         let r0 = self.new_local(ret, LocalKind::Ret, true, None);
@@ -1113,7 +1113,7 @@ impl<'a> Build<'a> {
             return base.deref();
         }
         if let Some((m, args)) = self.b.ov_derefs.get(&(key, k)).cloned() {
-            return self.overloaded_deref(m, args, base, bt, mutbl);
+            return self.overloaded_deref(m, self.tx.list(args).to_vec(), base, bt, mutbl);
         }
         base.deref()
     }
@@ -1411,7 +1411,7 @@ impl<'a> Build<'a> {
             }
             ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
                 let (derefs, fi) = match self.b.field_idx.get(&e.0) {
-                    Some(v) => *v,
+                    Some(&(d, f)) => (d as usize, f),
                     None => {
                         unsup!(self, "field without resolution");
                         (0, 0)
@@ -1443,7 +1443,7 @@ impl<'a> Build<'a> {
                     pt = self.place_ty(&pl);
                 }
                 if let Some((m, args)) = self.b.ov_index.get(&e.0).cloned() {
-                    self.overloaded_index(m, args, pl, pt, *i, t, mutbl)
+                    self.overloaded_index(m, self.tx.list(args).to_vec(), pl, pt, *i, t, mutbl)
                 } else if matches!(self.tx.kind(pt), TyKind::Array(..) | TyKind::Slice(_)) && !self.is_range_ty(self.ty(*i)) {
                     // builtin: the index value in a temp
                     let it = self.ty(*i);
@@ -1595,12 +1595,12 @@ impl<'a> Build<'a> {
             ExprKind::Path(_) => match self.b.res.get(&e.0).copied() {
                 Some(Res::Def(def)) => ConstantKind::Item {
                     def,
-                    args: self.b.res_args.get(&e.0).cloned().unwrap_or_default(),
+                    args: self.b.res_args.get(&e.0).map_or_else(Vec::new, |&l| self.tx.list(l).to_vec()),
                 },
-                Some(Res::ConstParam(index)) => ConstantKind::Param { owner: self.b.def, index, args: self.b.args.clone() },
+                Some(Res::ConstParam(index)) => ConstantKind::Param { owner: self.b.def, index, args: self.b.args.to_vec() },
                 _ => ConstantKind::Unknown,
             },
-            ExprKind::ConstBlock(_) => ConstantKind::Inline { owner: self.b.def, expr: e, args: self.b.args.clone() },
+            ExprKind::ConstBlock(_) => ConstantKind::Inline { owner: self.b.def, expr: e, args: self.b.args.to_vec() },
             _ => ConstantKind::Unknown,
         };
         self.constant(ty, kind)
@@ -1634,7 +1634,7 @@ impl<'a> Build<'a> {
         }
         // a trait's const is the selected impl's (rustc proves the trait ref, which relates the
         // written regions to the impl header's)
-        let args0 = self.b.res_args.get(&key).cloned().unwrap_or_default();
+        let args0 = self.b.res_args.get(&key).map_or_else(Vec::new, |&l| self.tx.list(l).to_vec());
         let (d, args) = self.tx.resolve_trait_method(d, &args0);
         let tmp = self.temp(t);
         self.assign(Place::local(tmp), Rvalue::Use(self.item_constant(t, d, args.clone())));
@@ -1907,7 +1907,7 @@ impl<'a> Build<'a> {
             ExprKind::Unary(unary, x) => {
                 if let Some(m) = self.b.binops.get(&e.0).cloned() {
                     let op = self.as_operand(*x);
-                    let (d, a) = self.tx.resolve_trait_method(m.def, &m.args);
+                    let (d, a) = self.tx.resolve_trait_method(m.def, self.tx.list(m.args));
                     self.call(Callee::Fn(d, a), vec![op], dest);
                 } else {
                     let op = self.as_operand(*x);
@@ -1947,9 +1947,9 @@ impl<'a> Build<'a> {
                     let rt = self.tx.ref_ty(true, pt);
                     let tmp = self.temp(rt);
                     self.assign(Place::local(tmp), Rvalue::Ref(r, BorrowKind::Mut { two_phase: true }, p));
-                    let bt = m.args.get(1).copied().unwrap_or(self.ty(*b2));
+                    let bt = self.tx.list(m.args).get(1).copied().unwrap_or(self.ty(*b2));
                     let op = self.as_operand_coerced(*b2, bt, true);
-                    let (d, aa) = self.tx.resolve_trait_method(m.def, &m.args);
+                    let (d, aa) = self.tx.resolve_trait_method(m.def, self.tx.list(m.args));
                     let unit = self.tx.unit();
                     let res = self.temp(unit);
                     self.call(Callee::Fn(d, aa), vec![Operand::Move(Place::local(tmp)), op], Place::local(res));
@@ -2227,7 +2227,7 @@ impl<'a> Build<'a> {
 
     pub(super) fn binary(&mut self, dest: Place, e: ExprId, op: BinOp, a: ExprId, b2: ExprId) {
         if let Some(m) = self.b.binops.get(&e.0).cloned() {
-            let (d, aa) = self.tx.resolve_trait_method(m.def, &m.args);
+            let (d, aa) = self.tx.resolve_trait_method(m.def, self.tx.list(m.args));
             if m.autoref == 1 {
                 // comparisons: PartialEq::eq(&a, &b)
                 let pa = self.as_place(a, false);
@@ -2244,7 +2244,7 @@ impl<'a> Build<'a> {
                 return;
             }
             let o1 = self.as_operand(a);
-            let bt = m.args.get(1).copied().unwrap_or(self.ty(b2));
+            let bt = self.tx.list(m.args).get(1).copied().unwrap_or(self.ty(b2));
             let o2 = self.as_operand_coerced(b2, bt, false);
             self.call(Callee::Fn(d, aa), vec![o1, o2], dest);
             return;
@@ -2676,8 +2676,10 @@ impl<'a> Build<'a> {
     }
 
     pub(super) fn method_call(&mut self, dest: Place, e: ExprId, recv: ExprId, args: &[ExprId]) {
+        /// typeck's resolution, adjusted below (impl selection, receiver reborrow)
+        struct MethodCall { def: DefId, derefs: usize, autoref: u8, args: Vec<TyId> }
         let mut m = match self.b.methods.get(&e.0) {
-            Some(m) => m.clone(),
+            Some(m) => MethodCall { def: m.def, derefs: m.derefs as usize, autoref: m.autoref, args: self.tx.list(m.args).to_vec() },
             None => {
                 unsup!(self, "method without resolution");
                 return;
@@ -2893,7 +2895,7 @@ impl<'a> Build<'a> {
         let (branch, args, flow) = self.b.try_branch[&e.0].clone();
         let tmp = self.temp(flow);
         let op = self.operand_of(Place::local(input));
-        let (dd, aa) = self.tx.resolve_trait_method(branch, &args);
+        let (dd, aa) = self.tx.resolve_trait_method(branch, self.tx.list(args));
         self.call(Callee::Fn(dd, aa), vec![op], Place::local(tmp));
         let TyKind::Adt(def, _, _) = self.tx.kind(flow) else { return; };
         let variants = &self.tx.tcx.adts[&def].variants;
@@ -2910,7 +2912,7 @@ impl<'a> Build<'a> {
         let ep = Place::local(tmp).project(Proj::Downcast(vi_err)).project(Proj::Field(0, et));
         let eop = self.operand_of(ep);
         let (fd, args) = self.b.try_from_residual[&e.0].clone();
-        let (dd, aa) = self.tx.resolve_trait_method(fd, &args);
+        let (dd, aa) = self.tx.resolve_trait_method(fd, self.tx.list(args));
         self.call(Callee::Fn(dd, aa), vec![eop], Place::local(0));
         self.exit_to(0);
         self.term(TermKind::Return);
@@ -2941,7 +2943,7 @@ impl<'a> Build<'a> {
         let outer = self.push_scope(false);
         let (d, args, itt) = self.b.for_into[&it.0].clone();
         let op = self.as_operand(it);
-        let (dd, aa) = self.tx.resolve_trait_method(d, &args);
+        let (dd, aa) = self.tx.resolve_trait_method(d, self.tx.list(args));
         let iter = self.new_local(itt, LocalKind::Temp, true, Some("iter".to_string()));
         self.push(StmtKind::StorageLive(iter));
         self.schedule(iter);
@@ -2956,7 +2958,7 @@ impl<'a> Build<'a> {
         let depth = self.scopes.len();
         self.push_scope(true);
         let (nd, nargs) = self.b.for_next[&it.0].clone();
-        let (dd, aa) = self.tx.resolve_trait_method(nd, &nargs);
+        let (dd, aa) = self.tx.resolve_trait_method(nd, self.tx.list(nargs));
         let sig = self.tx.tcx.fn_sig(self.tx.prog, dd).unwrap().clone();
         let ot = self.tx.tcx.tys.subst(sig.ret, &aa);
         let ot = self.tx.normalize(ot);
