@@ -85,7 +85,7 @@ pub fn why_hung(req: &Req, out: &mut Out) {
     let cycle = cycle_in(&e);
     let mut partial = Vec::new();
     let all_frames: Vec<Vec<u64>> = caps.iter().map(|c| c.frames.iter().copied().take(depth + 1).collect()).collect();
-    let syms = super::symbolise(&all_frames, &mut partial);
+    let syms = super::symbolise_within(&all_frames, &mut partial, 300);
     let main_i = caps.iter().position(|c| is_main(&c.t));
     let idx_of = |h: u64| caps.iter().position(|c| c.t.handle == h && h != 0);
     let wait_of = |h: u64| waits.iter().find(|w| w.thread == h && w.kind != Kind::None);
@@ -134,7 +134,7 @@ pub fn why_hung(req: &Req, out: &mut Out) {
             // the innermost JIT frame most often seen while main ran
             let mut count: Vec<(String, usize)> = Vec::new();
             let mut p2 = Vec::new();
-            let tops = super::symbolise(&main_tops, &mut p2);
+            let tops = super::symbolise_within(&main_tops, &mut p2, 300);
             for s in &tops {
                 if let Some(f) = s.iter().find(|f| f.module.starts_with("jit")).or(s.first()) {
                     let k = if f.at.is_empty() { f.name.clone() } else { format!("{} at {}", f.name, f.at) };

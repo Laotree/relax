@@ -53,6 +53,8 @@ fn phase(name: &str, t: Instant) {
     report("phase", name.split(" (").next().unwrap_or(name));
     PHASES.lock().unwrap().push((name.to_string(), ms));
     crate::tui::phase_done(name);
+    // relax inspect's memory timeline: the boot phase that just ended
+    crate::inspect::mem::mark(&format!("{} done", name.split(" (").next().unwrap_or(name)));
 }
 
 // ---- `--report-to <path>`: progress lines for a launcher (the runner app)

@@ -13,6 +13,8 @@ pub mod client;
 pub mod cfi;
 pub mod events;
 mod hang;
+pub mod heap;
+pub mod mem;
 mod symbols;
 pub mod threads;
 
@@ -78,6 +80,7 @@ pub fn start(app: &str) {
     unsafe { atexit(cleanup) };
     eprintln!("relax-inspect: pid {} app {} socket {} (relax inspect {} help)", pid, app, sock.display(), pid);
     events::start();
+    heap::start_from_env();
     let _ = std::thread::Builder::new().name("relax-inspect".into()).spawn(move || {
         SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
         for conn in listener.incoming() {
@@ -278,6 +281,10 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
     ("resume", "<panic id> panic", "let a parked panic continue (unwind as usual)"),
+    ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, Relax's own parts, findings, growth since the last `memory`"),
+    ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
+    ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
+    ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -294,6 +301,10 @@ fn dispatch(req: &Req, out: &mut Out) {
         "waits" => cmd_waits(out),
         "owner" => cmd_owner(out),
         "why-hung" | "hang" => hang::why_hung(req, out),
+        "memory" => mem::cmd_memory(req, out),
+        "mem" => mem::cmd_mem(req, out),
+        "diff" => mem::cmd_diff(req, out),
+        "heap" => heap::cmd_heap(req, out),
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
@@ -420,6 +431,12 @@ pub struct Frame {
 /// Names for raw pcs: JIT frames by the unit (one owner Job request; on timeout `slot#id+off`),
 /// host frames by the images' symbol tables. `lookup` pcs are return addresses except the first.
 pub fn symbolise(frames: &[Vec<u64>], partial: &mut Vec<String>) -> Vec<Vec<Frame>> {
+    symbolise_within(frames, partial, 1000)
+}
+
+/// `symbolise`, waiting at most `ms` for the owner (why-hung asks briefly: the owner may be the
+/// thing that hangs).
+pub fn symbolise_within(frames: &[Vec<u64>], partial: &mut Vec<String>, ms: u64) -> Vec<Vec<Frame>> {
     let mut jit_pcs: Vec<u64> = Vec::new();
     for f in frames {
         for (i, &pc) in f.iter().enumerate() {
@@ -431,7 +448,7 @@ pub fn symbolise(frames: &[Vec<u64>], partial: &mut Vec<String>) -> Vec<Vec<Fram
     }
     jit_pcs.sort_unstable();
     jit_pcs.dedup();
-    let names = jit_names(&jit_pcs, partial);
+    let names = jit_names(&jit_pcs, partial, ms);
     frames
         .iter()
         .map(|f| {
@@ -455,13 +472,13 @@ pub fn symbolise(frames: &[Vec<u64>], partial: &mut Vec<String>) -> Vec<Vec<Fram
 }
 
 /// (name, file:line:col, tier) of JIT pcs.
-fn jit_names(pcs: &[u64], partial: &mut Vec<String>) -> Vec<(String, String, String)> {
+fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, String, String)> {
     let up = crate::jit::current_unit();
     if pcs.is_empty() || up.is_null() {
         return pcs.iter().map(|pc| (format!("jit {:#x}", pc), String::new(), "jit".into())).collect();
     }
     let pcs_v = pcs.to_vec();
-    let r = crate::owner::call_within(crate::owner::Class::Job, 300, move || {
+    let r = crate::owner::call_within(crate::owner::Class::Job, ms, move || {
         let u = unsafe { &*up };
         pcs_v
             .iter()

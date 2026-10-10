@@ -2438,6 +2438,15 @@ impl Unit {
         (self.ro_base, self.data_next.load(Ordering::Acquire))
     }
 
+    /// Bytes used of the unit's code, read-only data and static memory reservations (relax
+    /// inspect's `memory`; atomics only, no owner): (code, data, statics).
+    pub fn reserved_use(&self) -> (u64, u64, u64) {
+        let code = self.code_next.load(Ordering::Relaxed).saturating_sub(self.exec_base);
+        let data = self.data_next.load(Ordering::Relaxed).saturating_sub(self.ro_base);
+        let rw = self.rw_next.load(Ordering::Relaxed).saturating_sub(self.rw_end - UNIT_RW_SIZE);
+        (code, data, rw)
+    }
+
     /// Reserves `size` bytes of every thread's thread-local block (zeroed per thread on
     /// first use); returns the offset for `Inst::TlsAddr`.
     pub fn tls_alloc(&mut self, size: u32, align: u32) -> u32 {
@@ -11024,8 +11033,9 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         // relax inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
-        // run-time modules (modules.rs; Relax's std::relax)
-        _ => crate::modules::symbol(name),
+        // run-time modules (modules.rs; Relax's std::relax); the C allocator through relax
+        // inspect's heap veneers (one indirect jump; tracking patches the word)
+        _ => crate::inspect::heap::veneer(name).or_else(|| crate::modules::symbol(name)),
     }
 }
 

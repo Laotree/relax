@@ -74,6 +74,8 @@ impl Raw {
 }
 
 pub use imp::{capture, list, self_os_id, tid_of_handle};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub use imp::{stack_hi_of_self, walk_regs_with};
 
 /// Walks frame records from `fp` (fp rule: [fp] = caller's fp, [fp+8] = return address), appending
 /// to `raw` until the chain ends, leaves the stack upwards order or `raw` is full.
@@ -460,6 +462,16 @@ mod imp {
         Ok(())
     }
 
+    /// Walks from registers into `out` (pcs, innermost first; a running thread's own stack:
+    /// the host heap tracker); returns how many.
+    pub fn walk_regs_with(r: &mut super::super::cfi::Regs, out: &mut [u64], read: &dyn Fn(u64) -> Option<u64>) -> usize {
+        let mut raw = Raw::new();
+        walk_with(&mut raw, r, read);
+        let n = raw.n.min(out.len());
+        out[..n].copy_from_slice(&raw.pcs[..n]);
+        n
+    }
+
     /// A frame record at or above `sp`: [a] = a higher record (or 0), [a+8] = code, and the record
     /// it links to looks the same (two links checked: stale data rarely chains twice).
     fn find_record(sp: u64, read: &dyn Fn(u64) -> Option<u64>) -> Option<u64> {
@@ -484,23 +496,52 @@ mod imp {
     /// Mixed walk: JIT frames by their frame pointers, host frames by their CFI (frame pointers
     /// where a module has none).
     fn walk(raw: &mut Raw, r: &mut super::super::cfi::Regs) {
+        walk_with(raw, r, &read)
+    }
+
+    /// The highest address of the calling thread's stack (glibc reads /proc/self/maps for the
+    /// main thread: called once per thread, outside any capture).
+    pub fn stack_hi_of_self() -> u64 {
+        extern "C" {
+            fn pthread_getattr_np(t: usize, attr: *mut u64) -> i32;
+            fn pthread_attr_getstack(attr: *const u64, addr: *mut usize, size: *mut usize) -> i32;
+            fn pthread_attr_destroy(attr: *mut u64) -> i32;
+        }
+        unsafe {
+            let mut attr = [0u64; 16];
+            if pthread_getattr_np(pthread_self(), attr.as_mut_ptr()) != 0 {
+                return 0;
+            }
+            let (mut addr, mut size) = (0usize, 0usize);
+            pthread_attr_getstack(attr.as_ptr(), &mut addr, &mut size);
+            pthread_attr_destroy(attr.as_mut_ptr());
+            (addr + size) as u64
+        }
+    }
+
+    fn walk_with(raw: &mut Raw, r: &mut super::super::cfi::Regs, read: &dyn Fn(u64) -> Option<u64>) {
         use super::super::cfi;
         let mut top = true;
         while raw.n < MAX_FRAMES && r.rip != 0 {
+            // a caller that is no code we know ends the walk (a frame-pointer guess through code
+            // without frame pointers or CFI reads garbage)
+            if !top && !crate::jit::in_jit_code(r.rip.wrapping_sub(1)) && !cfi::covers(r.rip.wrapping_sub(1)) {
+                break;
+            }
             raw.pcs[raw.n] = r.rip;
             raw.n += 1;
             let sp0 = r.rsp;
             let jit = crate::jit::in_jit_code(r.rip);
             let mut stepped = false;
             if !jit && cfi::covers(r.rip) {
-                match cfi::step(r, top, &read) {
+                match cfi::step(r, top, read) {
                     cfi::Step::Done => stepped = true,
                     cfi::Step::NeedRbp => {
                         // a frame-pointer frame of a walk without registers: its record is the
                         // first chained one above sp
-                        let Some(fp) = find_record(r.rsp, &read) else { break };
+                        let Some(fp) = find_record(r.rsp, read) else { break };
                         r.rbp = fp;
-                        stepped = cfi::step(r, top, &read) == cfi::Step::Done;
+                        stepped = cfi::step(r, top, read) == cfi::Step::Done;
                     }
                     cfi::Step::Fail => {}
                 }
@@ -509,7 +550,7 @@ mod imp {
                 // a JIT frame reached from host frames that never saved rbp (a walk from a
                 // syscall's sp/pc has no rbp): its frame record is the first one above sp that
                 // chains to another record
-                match find_record(r.rsp, &read) {
+                match find_record(r.rsp, read) {
                     Some(fp) => r.rbp = fp,
                     None => break,
                 }

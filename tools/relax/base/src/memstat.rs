@@ -141,9 +141,8 @@ impl Drop for TagGuard {
 /// Allocations of this thread are charged to `t` until the guard drops.
 #[inline(always)]
 pub fn tag(t: Tag) -> TagGuard {
-    if !enabled() {
-        return TagGuard(0, false);
-    }
+    // the category is kept also when nothing counts: relax inspect's host heap tracking labels
+    // its samples with it
     // everything the proc-macro host's world does stays charged to it
     let prev = CUR.with(|c| c.get());
     if prev == Tag::PmHost as u8 {
@@ -243,11 +242,51 @@ fn cur() -> u8 {
 
 pub struct Counting;
 
+/// relax inspect's host heap tracker: called for blocks of the off path while set (the on path
+/// has its own accounting). One relaxed load per call when unset.
+static TRACK: AtomicBool = AtomicBool::new(false);
+static TRACK_ALLOC: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TRACK_FREE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Sets (or clears) the host tracker: `alloc(block, size)` after an allocation, `free(block)`
+/// before a free.
+pub fn set_tracker(t: Option<(fn(*mut u8, usize), fn(*mut u8))>) {
+    match t {
+        Some((a, f)) => {
+            TRACK_ALLOC.store(a as usize, Relaxed);
+            TRACK_FREE.store(f as usize, Relaxed);
+            TRACK.store(true, std::sync::atomic::Ordering::Release);
+        }
+        None => TRACK.store(false, std::sync::atomic::Ordering::Release),
+    }
+}
+
+/// The calling thread's compiler category (Tag as u8).
+pub fn current_tag() -> u8 {
+    CUR.try_with(|c| c.get()).unwrap_or(0)
+}
+
+#[cold]
+fn track_alloc(p: *mut u8, size: usize) {
+    let f: fn(*mut u8, usize) = unsafe { std::mem::transmute(TRACK_ALLOC.load(Relaxed)) };
+    f(p, size)
+}
+
+#[cold]
+fn track_free(p: *mut u8) {
+    let f: fn(*mut u8) = unsafe { std::mem::transmute(TRACK_FREE.load(Relaxed)) };
+    f(p)
+}
+
 unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
         if !on() {
-            return System.alloc(l);
+            let p = System.alloc(l);
+            if TRACK.load(Relaxed) {
+                track_alloc(p, l.size());
+            }
+            return p;
         }
         let h = hdr(l.align());
         let b = System.alloc(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
@@ -265,7 +304,11 @@ unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
         if !on() {
-            return System.alloc_zeroed(l);
+            let p = System.alloc_zeroed(l);
+            if TRACK.load(Relaxed) {
+                track_alloc(p, l.size());
+            }
+            return p;
         }
         let h = hdr(l.align());
         let b = System.alloc_zeroed(Layout::from_size_align_unchecked(l.size() + h, l.align().max(HDR)));
@@ -283,6 +326,9 @@ unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         if !on() {
+            if TRACK.load(Relaxed) {
+                track_free(p);
+            }
             return System.dealloc(p, l);
         }
         let h = hdr(l.align());
@@ -296,6 +342,12 @@ unsafe impl GlobalAlloc for Counting {
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         if !on() {
+            if TRACK.load(Relaxed) {
+                track_free(p);
+                let q = System.realloc(p, l, new);
+                track_alloc(q, new);
+                return q;
+            }
             return System.realloc(p, l, new);
         }
         let h = hdr(l.align());
@@ -331,6 +383,11 @@ unsafe impl GlobalAlloc for Counting {
 /// Live bytes charged to `t` (0 unless RELAX_MEM_REPORT).
 pub fn live_of(t: Tag) -> i64 {
     CTRS[t as usize].live.load(Relaxed)
+}
+
+/// Live bytes charged to the tag with index `i` (TAG_NAMES order; 0 unless RELAX_MEM_REPORT).
+pub fn live_of_index(i: usize) -> i64 {
+    CTRS.get(i).map_or(0, |c| c.live.load(Relaxed))
 }
 
 /// Live bytes of the whole counted heap.

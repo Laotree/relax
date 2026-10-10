@@ -272,6 +272,7 @@ pub fn start() {
         let mut last_cycle: Vec<u64> = Vec::new();
         let mut base_rss = 0u64;
         let mut tick = 0u64;
+        let (mut marked_main, mut marked_present) = (false, false);
         loop {
             std::thread::sleep(std::time::Duration::from_millis(250));
             tick += 1;
@@ -290,7 +291,8 @@ pub fn start() {
                     _ => true,
                 };
                 if relevant && ms >= hang_ms {
-                    let list = super::threads::list();
+                    let mut list = super::threads::list();
+                    super::name_handles(&mut list);
                     let what = super::wait_text(w, &list);
                     emit("hang", &format!("main|{:?}|{:#x}", w.kind, w.object), &format!("\"thread\":\"main\",\"blocked_ms\":{},\"waits\":{},\"more\":[\"why-hung\",\"stacks thread=main\"]", ms, json_str(&what)));
                 }
@@ -298,16 +300,28 @@ pub fn start() {
             // a cycle among registry waits (thread -> holder handle)
             let cycle = super::hang::registry_cycle(&waits);
             if !cycle.is_empty() && cycle == last_cycle {
-                let list = super::threads::list();
+                let mut list = super::threads::list();
+                super::name_handles(&mut list);
                 let names: Vec<String> = cycle.iter().map(|h| json_str(&super::thread_label(*h, &list))).collect();
                 let mut key = cycle.clone();
                 key.sort_unstable();
                 emit("deadlock", &format!("{:?}", key), &format!("\"cycle\":[{}],\"more\":[\"why-hung\"]", names.join(",")));
             }
             last_cycle = cycle;
+            super::heap::expire();
+            // the memory timeline and its phase markers
+            let rss = crate::memstat::resident();
+            super::mem::tick(tick, rss);
+            if !marked_main && main != 0 {
+                marked_main = true;
+                super::mem::mark("main");
+            }
+            if !marked_present && crate::jit::FIRST_PRESENT.load(Relaxed) {
+                marked_present = true;
+                super::mem::mark("first present");
+            }
             // memory: resident size against the level 5 s after the first present
             if tick % 8 == 0 && crate::jit::FIRST_PRESENT.load(Relaxed) {
-                let rss = crate::memstat::resident();
                 if base_rss == 0 {
                     base_rss = rss;
                 } else if rss > base_rss + (base_rss / 2).max(512 << 20) {
