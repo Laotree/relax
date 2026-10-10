@@ -187,9 +187,22 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
         TyKind::FnPtr(_, _, header, _) => header.abi.is_c_like(),
         TyKind::Array(e, _) => tr(*e),
         TyKind::Adt(d, a, _) => {
-            // Box<T> (global allocator): a pointer; both sides allocate with the system malloc
+            // Box<T> (global allocator): both sides allocate with the system malloc, but a box
+            // OWNS its value: Relax-compiled code that drops it runs T's drop glue. That glue is
+            // rustc's when T is the crate's own public type (host-gen gives it a TYPES entry with
+            // its drop_in_place, or checks its layout in LAYOUTS); a private T has no entry, so
+            // Relax would lay it out and drop it by its own rules (String/Vec fields: a bogus
+            // free). Such a box is no handle: the type holding it stays opaque (TYPES), dropped
+            // and cloned by the crate.
             if tcx.adts.get(d).is_some_and(|a| a.is_box()) {
-                return a.len() <= 2 && a.first().is_some_and(|x| !matches!(tcx.tys.kind(*x), TyKind::Dyn(..)) && pointee(*x));
+                return a.len() <= 2
+                    && a.first().is_some_and(|x| match tcx.tys.kind(*x) {
+                        TyKind::Str => true,
+                        TyKind::Slice(e) => tr(*e) || own_pub(*e),
+                        TyKind::Dyn(..) => false,
+                        TyKind::Adt(d2, _, _) if prog.def(*d2).krate == krate => own_pub(*x) || tr(*x),
+                        _ => pointee(*x),
+                    });
             }
             let std_crate = is_std(prog, prog.def(*d).krate);
             // Option<T>: rustc's layout (niche or tag), checked against host-gen's LAYOUTS
@@ -791,6 +804,9 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
     let mut dep_lays: Vec<(String, String, String)> = Vec::new();
     // the fns that get a shim: only they cross (a private fn with a C-shaped signature does not)
     let mut bound: std::collections::HashSet<DefId> = Default::default();
+    // an `op` the manifest lists that gets no shim would compile from source on the JIT side
+    // (reading the crate's rustc-laid-out state): an error here, not a crash at run time
+    let mut listed_unbound: Vec<String> = Vec::new();
     for (i, def) in prog.defs.iter().enumerate() {
         let d = DefId(i as u32);
         if def.krate != krate || !matches!(def.kind, DefKind::Fn | DefKind::AssocFn) {
@@ -807,6 +823,10 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
         }
         if let Some(r) = unbound_reason(prog, tcx, krate, d, &|a| opaque_candidate(prog, tcx, krate, a)) {
             *why.entry(r).or_default() += 1;
+            let k = key(prog, tcx, d);
+            if api.ops.iter().any(|o| *o == k) {
+                listed_unbound.push(format!("op {k}: {r}"));
+            }
             if r == "signature not C-shaped" {
                 unshaped.push(key(prog, tcx, d));
                 if let Some(sg) = tcx.fn_sig(prog, d) {
@@ -825,6 +845,10 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
             Some(p) => p,
             None => {
                 *why.entry("not nameable from the crate root (private)").or_default() += 1;
+                let k = key(prog, tcx, d);
+                if api.ops.iter().any(|o| *o == k) {
+                    listed_unbound.push(format!("op {k}: not nameable from the crate root (private)"));
+                }
                 continue;
             }
         };
@@ -840,6 +864,10 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
         let named: Option<Vec<(String, String, String)>> = deps.iter().map(|t| rust_ty(prog, tcx, krate, *t).map(|r| (crate::typeck::ty_to_string(false, prog, tcx, *t), r, type_cfg(prog, tcx, *t)))).collect();
         let Some(named) = named else {
             *why.entry("a type in the signature is not nameable for its layout check").or_default() += 1;
+            let k = key(prog, tcx, d);
+            if api.ops.iter().any(|o| *o == k) {
+                listed_unbound.push(format!("op {k}: a type in the signature is not nameable for its layout check"));
+            }
             continue;
         };
         dep_lays.extend(named);
@@ -849,6 +877,11 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<
             for t in sg.params.iter().chain(std::iter::once(&sg.ret)) { cfg.push_str(&type_cfg(prog, tcx, *t)); }
         }
         fns.push((key(prog, tcx, d), sig_hash(prog, tcx, d), path, n, never, cfg));
+    }
+    if !listed_unbound.is_empty() {
+        listed_unbound.sort();
+        listed_unbound.dedup();
+        return Err(format!("relax_api.txt of {} lists ops that get no shim (they would compile from source and read the crate's own layouts):\n  {}", prog.syms.str(prog.crates[krate as usize].name), listed_unbound.join("\n  ")));
     }
     fns.sort();
     fns.dedup_by(|a, b| a.0 == b.0);
