@@ -15,6 +15,7 @@ mod table;
 
 pub use dep_graph::{DepKind, DepNode, DepNodeColor, DepNodeIndex, Fingerprint};
 pub use table::QueryTable;
+pub use job::set_wait_release;
 
 use crate::fxhash::HashMap;
 use dep_graph::{DepGraph, TaskDeps, TaskGuard, TaskReads};

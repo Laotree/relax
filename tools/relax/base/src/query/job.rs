@@ -16,6 +16,14 @@ pub(super) enum Completion {
     Retry,
 }
 
+/// What a thread about to wait for another thread's query gives up for the wait (true: given up)
+/// and takes back after: set once by the JIT for its unit lock.
+static WAIT_RELEASE: std::sync::OnceLock<(fn() -> bool, fn())> = std::sync::OnceLock::new();
+
+pub fn set_wait_release(give_up: fn() -> bool, take_back: fn()) {
+    let _ = WAIT_RELEASE.set((give_up, take_back));
+}
+
 pub(super) struct QueryLatch {
     result: Mutex<Option<Completion>>,
     ready: Condvar,
@@ -28,6 +36,13 @@ impl QueryLatch {
 
     pub fn wait(&self) -> Completion {
         let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(done) = result.as_ref() {
+            return done.clone();
+        }
+        // the running query may need a lock this thread holds (the JIT's unit lock, for CTFE):
+        // give it up for the wait, or both threads wait for each other
+        let release = WAIT_RELEASE.get();
+        let released = release.is_some_and(|(give_up, _)| give_up());
         while result.is_none() {
             drop(result);
             crate::preempt::point();
@@ -36,7 +51,12 @@ impl QueryLatch {
                 result = self.ready.wait_timeout(result, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
             }
         }
-        result.as_ref().unwrap().clone()
+        let done = result.as_ref().unwrap().clone();
+        drop(result);
+        if released {
+            (release.unwrap().1)();
+        }
+        done
     }
 
     pub fn complete(&self, result: Completion) {

@@ -1222,7 +1222,26 @@ static FORK_CHILD: AtomicBool = AtomicBool::new(false);
 /// Registers the fork handlers once per process.
 fn install_fork_handlers() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| os::thread::at_fork(fork_prepare, fork_parent, fork_child));
+    ONCE.call_once(|| {
+        os::thread::at_fork(fork_prepare, fork_parent, fork_child);
+        crate::query::set_wait_release(give_up_unit_for_query, take_back_unit_after_query);
+    });
+}
+
+/// A build waiting for a query another thread runs gives the unit lock up for the wait (as
+/// wait_program_build does): that query may evaluate a const (CTFE takes the lock), and holding
+/// the lock deadlocked them (an O2 build waited for typeck an ahead checker ran, which waited for
+/// the lock). Nested inside another compile (depth > 1) the lock cannot be given up.
+fn give_up_unit_for_query() -> bool {
+    if lock_depth() != 1 {
+        return false;
+    }
+    unlock_unit();
+    true
+}
+
+fn take_back_unit_after_query() {
+    lock_unit();
 }
 
 /// Does the calling thread hold the unit lock (i.e. is it inside the compiler)?
