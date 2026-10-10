@@ -187,9 +187,9 @@ impl Types {
 
     pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
         let mut meta = Vec::new();
-        let regions = self.regions.lock().unwrap_or_else(|e| e.into_inner());
-        regions.kinds.put(&mut meta); regions.args.put(&mut meta);
-        drop(regions);
+        let kinds: Vec<RegionKind> = self.regions.kinds.iter().copied().collect();
+        let args: Vec<std::sync::Arc<[RegionId]>> = self.regions.args.iter().cloned().collect();
+        kinds.put(&mut meta); args.put(&mut meta);
         self.consts.lock().unwrap_or_else(|e| e.into_inner()).put(&mut meta);
         self.free_regions.load(Ordering::Relaxed).put(&mut meta);
         for t in [self.unit, self.bool_, self.char_, self.str_, self.never, self.error,
@@ -240,7 +240,7 @@ impl Types {
             || args.iter().flat_map(|a| a.iter()).any(|id| id.0 as usize > region_kinds.len()) { return None; }
         let mut t = Types::new();
         if n < t.len() { return None; }
-        *t.regions.get_mut().ok()? = Regions { kinds: region_kinds, args, unindexed: true, ..Default::default() };
+        t.regions = Regions::restored(region_kinds, args);
         *t.consts.get_mut().ok()? = Codec::get(&mut r)?;
         *t.free_regions.get_mut() = bool::get(&mut r)?;
         for dst in [&mut t.unit, &mut t.bool_, &mut t.char_, &mut t.str_, &mut t.never,

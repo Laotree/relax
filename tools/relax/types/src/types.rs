@@ -109,20 +109,43 @@ impl RegionArgsId {
     pub const EMPTY: Self = Self(0);
 }
 
-#[derive(Default)]
-struct Regions {
-    kinds: Vec<RegionKind>,
-    ids: crate::fxhash::HashMap<RegionKind, RegionId>,
-    args: Vec<std::sync::Arc<[RegionId]>>,
-    arg_ids: crate::fxhash::HashMap<std::sync::Arc<[RegionId]>, RegionArgsId>,
+/// The region interner: kinds and argument lists in append-only arenas whose published entries
+/// are read without a lock, the lookup maps sharded (rustc's sharded interners). Interning a new
+/// entry takes `intern` so ids stay dense. A single Mutex over all of it was the top contended
+/// lock of a parallel `relax check` (20% of Scope's cycles spinning on it).
+pub(crate) struct Regions {
+    pub(crate) kinds: crate::conc::AppendVec<RegionKind>,
+    pub(crate) args: crate::conc::AppendVec<std::sync::Arc<[RegionId]>>,
+    ids: crate::conc::ShardMap<RegionKind, RegionId>,
+    arg_ids: crate::conc::ShardMap<std::sync::Arc<[RegionId]>, RegionArgsId>,
+    intern: std::sync::Mutex<()>,
     /// a restored image's lookup maps are built by the first interning
-    unindexed: bool,
+    unindexed: std::sync::atomic::AtomicBool,
+}
+const REGION_CAP: usize = 1 << 26;
+impl Default for Regions {
+    fn default() -> Self {
+        Regions { kinds: crate::conc::AppendVec::with_capacity(REGION_CAP), args: crate::conc::AppendVec::with_capacity(REGION_CAP),
+            ids: Default::default(), arg_ids: Default::default(), intern: Default::default(), unindexed: Default::default() }
+    }
 }
 impl Regions {
-    fn index(&mut self) {
-        if !std::mem::take(&mut self.unindexed) { return; }
-        self.ids = self.kinds.iter().enumerate().map(|(i, k)| (*k, RegionId(i as u32 + 1))).collect();
-        self.arg_ids = self.args.iter().enumerate().map(|(i, a)| (a.clone(), RegionArgsId(i as u32 + 1))).collect();
+    /// A restored image's entries (ids follow their order); the maps are built on first use.
+    pub(crate) fn restored(kinds: Vec<RegionKind>, args: Vec<std::sync::Arc<[RegionId]>>) -> Self {
+        let r = Regions::default();
+        for k in kinds { r.kinds.push(k); }
+        for a in args { r.args.push(a); }
+        r.unindexed.store(true, std::sync::atomic::Ordering::Release);
+        r
+    }
+    fn index(&self) {
+        use std::sync::atomic::Ordering;
+        if !self.unindexed.load(Ordering::Acquire) { return; }
+        let _g = self.intern.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.unindexed.load(Ordering::Acquire) { return; }
+        for (i, k) in self.kinds.iter().enumerate() { self.ids.insert(*k, RegionId(i as u32 + 1)); }
+        for (i, a) in self.args.iter().enumerate() { self.arg_ids.insert(a.clone(), RegionArgsId(i as u32 + 1)); }
+        self.unindexed.store(false, Ordering::Release);
     }
 }
 
@@ -385,7 +408,7 @@ const LOCKS: usize = 64;
 pub struct Types {
     image: Option<collected::MappedTypes>,
     pub(crate) consts: std::sync::Mutex<crate::consts::ConstInterner>,
-    regions: std::sync::Mutex<Regions>,
+    regions: Regions,
     free_regions: std::sync::atomic::AtomicBool,
     chunks: Box<[std::sync::atomic::AtomicPtr<Entry>]>,
     len: std::sync::atomic::AtomicU32,
@@ -442,7 +465,7 @@ impl Types {
         let t = Types {
             image: None,
             consts: std::sync::Mutex::new(crate::consts::ConstInterner::default()),
-            regions: std::sync::Mutex::new(Regions::default()),
+            regions: Regions::default(),
             free_regions: std::sync::atomic::AtomicBool::new(false),
             chunks: (0..MAX_CHUNKS).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect(),
             len: std::sync::atomic::AtomicU32::new(0),
@@ -582,8 +605,8 @@ impl Types {
                 out.push((format!("  types {} ({}; entries + arrays)", names.get(i).copied().unwrap_or("other"), c), (c * es + p) as u64));
             }
         }
-        let r = self.regions.lock().unwrap_or_else(|e| e.into_inner());
-        let rb = r.kinds.capacity() * std::mem::size_of::<RegionKind>() + r.ids.capacity() * (std::mem::size_of::<(RegionKind, RegionId)>() + 1) + r.args.capacity() * 16 + r.args.iter().map(|a| a.len() * 4 + 16).sum::<usize>() + r.arg_ids.capacity() * 17;
+        let r = &self.regions;
+        let rb = r.kinds.len() * std::mem::size_of::<RegionKind>() + r.ids.len() * (std::mem::size_of::<(RegionKind, RegionId)>() + 1) + r.args.len() * 16 + r.args.iter().map(|a| a.len() * 4 + 16).sum::<usize>() + r.arg_ids.len() * 17;
         out.push((format!("regions ({} kinds, {} arg lists)", r.kinds.len(), r.args.len()), rb as u64));
         out
     }
@@ -1062,35 +1085,39 @@ impl std::hash::Hash for TyKind {
 impl Types {
     pub fn intern_region(&self, kind: RegionKind) -> RegionId {
         if kind == RegionKind::ReErased { return RegionId::ERASED; }
-        let mut r = self.regions.lock().unwrap_or_else(|e| e.into_inner());
+        let r = &self.regions;
         r.index();
-        if let Some(id) = r.ids.get(&kind) { return *id; }
-        let id = RegionId(r.kinds.len() as u32 + 1);
-        r.kinds.push(kind);
+        if let Some(id) = r.ids.get(&kind) { return id; }
+        let _g = r.intern.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = r.ids.get(&kind) { return id; }
+        let id = RegionId(r.kinds.push(kind) as u32 + 1);
         r.ids.insert(kind, id);
         id
     }
 
+    #[inline]
     pub fn region_kind(&self, id: RegionId) -> RegionKind {
         if id == RegionId::ERASED { return RegionKind::ReErased; }
-        self.regions.lock().unwrap_or_else(|e| e.into_inner()).kinds[id.0 as usize - 1]
+        self.regions.kinds[id.0 as usize - 1]
     }
 
     pub fn intern_region_args(&self, args: &[RegionId]) -> RegionArgsId {
         if args.is_empty() { return RegionArgsId::EMPTY; }
-        let mut r = self.regions.lock().unwrap_or_else(|e| e.into_inner());
+        let r = &self.regions;
         r.index();
-        if let Some(id) = r.arg_ids.get(args) { return *id; }
-        let id = RegionArgsId(r.args.len() as u32 + 1);
+        if let Some(id) = r.arg_ids.get_by(args) { return id; }
+        let _g = r.intern.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = r.arg_ids.get_by(args) { return id; }
         let args: std::sync::Arc<[RegionId]> = args.into();
-        r.args.push(args.clone());
+        let id = RegionArgsId(r.args.push(args.clone()) as u32 + 1);
         r.arg_ids.insert(args, id);
         id
     }
 
+    #[inline]
     pub fn region_args(&self, id: RegionArgsId) -> std::sync::Arc<[RegionId]> {
         if id == RegionArgsId::EMPTY { return std::sync::Arc::from([]); }
-        self.regions.lock().unwrap_or_else(|e| e.into_inner()).args[id.0 as usize - 1].clone()
+        self.regions.args[id.0 as usize - 1].clone()
     }
 
     /// rustc_middle/ty/erase_regions.rs: free regions are erased; bound regions

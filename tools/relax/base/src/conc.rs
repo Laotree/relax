@@ -32,6 +32,12 @@ impl<K: Hash + Eq, V: Clone> ShardMap<K, V> {
         self.shard(k).read().unwrap_or_else(|e| e.into_inner()).get(k).cloned()
     }
 
+    /// `get` by a borrowed form of the key (`&[T]` for an `Arc<[T]>` key: no allocation).
+    #[inline]
+    pub fn get_by<Q: Hash + Eq + ?Sized>(&self, k: &Q) -> Option<V> where K: std::borrow::Borrow<Q> {
+        self.shard(k).read().unwrap_or_else(|e| e.into_inner()).get(k).cloned()
+    }
+
     #[inline]
     pub fn insert(&self, k: K, v: V) {
         self.shard(&k).write().unwrap_or_else(|e| e.into_inner()).insert(k, v);

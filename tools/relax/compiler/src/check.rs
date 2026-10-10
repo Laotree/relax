@@ -61,6 +61,31 @@ pub fn app_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     (0..prog.crates.len() as u32).filter(|&k| k == root || crate::borrowck::event::app_crate(prog, k)).collect()
 }
 
+/// `f` over `items` on RELAX_JOBS threads (at most 16), results in `items` order.
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let out: std::sync::Mutex<Vec<(usize, R)>> = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|sc| {
+        for w in 0..jobs.min(items.len().max(1)) {
+            let (next, out, f) = (&next, &out, &f);
+            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || {
+                let mut local = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(x) = items.get(i) else { break };
+                    local.push((i, f(x)));
+                }
+                out.lock().unwrap().extend(local);
+            }).expect("check worker");
+        }
+    });
+    let mut v = out.into_inner().unwrap();
+    v.sort_by_key(|(i, _)| *i);
+    v.into_iter().map(|(_, r)| r).collect()
+}
+
 /// `selftest`: every workspace crate, then every function compiled (see the module doc); else
 /// the app check of the application's crates.
 pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool, selftest: bool) -> i32 {
@@ -78,12 +103,19 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // a constant that cannot be evaluated is one reported failure, not the end of the check
     jit::COMPILE_ERRORS_FATAL.store(false, std::sync::atomic::Ordering::Relaxed);
     crate::layout::set_root_crate(root);
-    for &k in crates {
-        errors.extend(u.tcx.check_signature_errors(&u.prog, k));
-    }
     let mut own = vec![false; u.prog.crates.len()];
     for &k in crates {
         own[k as usize] = true;
+    }
+    // every checked definition's signature, on RELAX_JOBS threads (queries over the shared
+    // context); errors in definition order
+    {
+        let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).collect();
+        let (prog, tcx) = (&u.prog, &u.tcx);
+        for e in par_map(&defs, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tcx.check_def_signature(prog, d)))
+            .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- Relax bug, report it", prog.def_path(d))])) {
+            errors.extend(e);
+        }
     }
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();

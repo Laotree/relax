@@ -796,6 +796,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             return session.watch(deep);
         }
         let code = crate::check::check_crate(&mut u, root, pre, root_only, selftest);
+        // the parsed files go to the cache's front images as a run's do (one store shared with
+        // `relax run`): the next check (or run) of the package maps them instead of parsing
+        // every file again (Stage: 6 s of a warm check was parsing)
+        if !selftest { record_check_front(&mut u, options); }
         std::mem::forget(u);
         return code;
     }
@@ -1798,6 +1802,28 @@ pub(crate) extern "C" fn relax_quit_requested() {
 /// cache; images are encoded and stores written without it. Ok(None): the unit was busy.
 /// The front images of the program's files the store does not have yet (front.rs), queued
 /// for the next spill; the count.
+/// `relax check`: this load's files written as front images and its crate records, as a run's
+/// boot does (`push_front_images` + `record_front_crates` + the front graph), so the next check
+/// maps them. Only when the cache is on and some file was parsed (nothing new otherwise).
+fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
+    if !front_recordable() || u.prog.front_restored.iter().all(|r| *r) { return; }
+    let Some(mode) = crate::cache::mode_from_env(options) else { return };
+    let t = Instant::now();
+    let mut c = match crate::cache::Cache::open_collected(u, mode, None) {
+        Ok(c) => c,
+        Err(e) => { verbose!("relax-check: front images not written: {}", e); return; }
+    };
+    let n = push_front_images(&u.prog, &mut c);
+    c.record_front_crates(&u.prog);
+    let written = match c.spill_take() {
+        Some(s) if crate::cache::ColdFront::enabled(options) => s.write_mapped().map(|_| ()),
+        Some(s) => s.write().map(|_| ()),
+        None => Ok(()),
+    };
+    let graph = crate::cache::Cache::flush_front_graphs();
+    verbose!("relax-check: {} front images written ({:?}, graph {:?}) in {:.0} ms", n, written.err(), graph.err(), t.elapsed().as_secs_f64() * 1e3);
+}
+
 fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
     let mut n = 0;
     for i in 0..prog.files.len() {

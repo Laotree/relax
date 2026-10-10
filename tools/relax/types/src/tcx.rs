@@ -1433,18 +1433,26 @@ impl Tcx {
         let mut errors = Vec::new();
         for (i, def) in prog.defs.iter().enumerate() {
             if def.krate == krate {
-                let did = DefId(i as u32);
-                if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
-                    errors.extend(self.check_item_type_defaults(prog, did));
-                }
-                errors.extend_from_slice(self.signature_errors(prog, DefId(i as u32)));
-                if def.kind == DefKind::Enum {
-                    errors.extend(self.adts[&DefId(i as u32)].check_discriminants(self, prog));
-                }
-                if def.kind == DefKind::Impl {
-                    errors.extend(self.check_impl_items_against_trait(prog, DefId(i as u32)));
-                }
+                errors.extend(self.check_def_signature(prog, DefId(i as u32)));
             }
+        }
+        errors
+    }
+
+    /// One definition's share of `check_signature_errors` (a parallel check runs these on
+    /// several threads: every part is a query over the shared context).
+    pub fn check_def_signature(&self, prog: &Program, did: DefId) -> Vec<String> {
+        let def = prog.def(did);
+        let mut errors = Vec::new();
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(self.check_item_type_defaults(prog, did));
+        }
+        errors.extend_from_slice(self.signature_errors(prog, did));
+        if def.kind == DefKind::Enum {
+            errors.extend(self.adts[&did].check_discriminants(self, prog));
+        }
+        if def.kind == DefKind::Impl {
+            errors.extend(self.check_impl_items_against_trait(prog, did));
         }
         errors
     }

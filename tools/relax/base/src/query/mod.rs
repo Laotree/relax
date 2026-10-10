@@ -65,6 +65,10 @@ pub struct QueryEngine {
     revision: u64,
     state: Mutex<State>,
     task_reads: Mutex<Vec<TaskReads>>,
+    /// Input nodes as read (index, fingerprint): every query reads inputs, and taking `state`
+    /// for each read serialised the parallel `relax check`. Inputs change only through
+    /// `set_input` (`&mut self`), which clears this.
+    inputs: crate::conc::ShardMap<QueryId, (DepNodeIndex, Fingerprint)>,
 }
 
 impl Default for QueryEngine {
@@ -75,7 +79,7 @@ impl Default for QueryEngine {
 
 impl QueryEngine {
     pub fn new() -> Self {
-        Self { id: next_id(), revision: 1, state: Mutex::new(State::default()), task_reads: Mutex::new(Vec::new()) }
+        Self { id: next_id(), revision: 1, state: Mutex::new(State::default()), task_reads: Mutex::new(Vec::new()), inputs: Default::default() }
     }
 
     pub fn revision(&self) -> u64 {
@@ -114,6 +118,7 @@ impl QueryEngine {
     /// Inputs are eval_always roots (rustc_middle/src/dep_graph/graph.rs:334,921).
     pub fn set_input(&mut self, kind: u16, key: u32, fingerprint: Fingerprint) -> Result<(), QueryError> {
         let query = QueryId { kind, key };
+        self.inputs.clear();
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
         let &index = state.graph.indices.get(&query).ok_or(QueryError::MissingInput(query))?;
         let node = &mut state.graph.nodes[index.0 as usize];
@@ -133,14 +138,19 @@ impl QueryEngine {
 
     pub fn input(&self, kind: u16, key: u32) -> Result<Fingerprint, QueryError> {
         let query = QueryId { kind, key };
-        let (index, fingerprint) = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let &index = state.graph.indices.get(&query).ok_or(QueryError::MissingInput(query))?;
-            let node = &state.graph.nodes[index.0 as usize];
-            if !node.eval_always {
-                return Err(QueryError::KindConflict(kind));
+        let (index, fingerprint) = match self.inputs.get(&query) {
+            Some(x) => x,
+            None => {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let &index = state.graph.indices.get(&query).ok_or(QueryError::MissingInput(query))?;
+                let node = &state.graph.nodes[index.0 as usize];
+                if !node.eval_always {
+                    return Err(QueryError::KindConflict(kind));
+                }
+                let x = (index, node.fingerprint.ok_or(QueryError::MissingInput(query))?);
+                self.inputs.insert(query, x);
+                x
             }
-            (index, node.fingerprint.ok_or(QueryError::MissingInput(query))?)
         };
         self.read_index(index);
         Ok(fingerprint)
