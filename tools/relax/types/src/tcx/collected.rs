@@ -14,8 +14,6 @@ crate::collected_fields!(AdtT, region_contract, generic_indices, flags, region_p
     valid_start, valid_end, no_niche, param_maybe_unsized, ext_from, ext_conv);
 crate::collected_id!(AdtFlags);
 crate::collected_fields!(Destructor, did);
-crate::collected_fields!(GenEnv, sized_params, regions, names, self_ty, trait_def, impl_def,
-    impl_params, bounds, parent_bounds, consts, opaque_owner);
 crate::collected_fields!(OpaqueDecl, region_contract, bounds);
 crate::collected_fields!(ConstDecl, ty, region_contract, errors, misses);
 // Derived variance is rebuilt after declaration publication.
@@ -59,7 +57,7 @@ macro_rules! fields {
 /// Declaration tables decoded only when demanded from the collected image.
 macro_rules! tables {
     ($op:ident) => { $op!(sigs, ctor_sigs, adts, adt_destructors, destructor_impls,
-        nominal_region_contracts, impl_self, impl_trait, impl_generics,
+        nominal_region_contracts, impl_self, impl_trait,
         inherent, trait_impls, trait_impls_of, impls_by_key, impl_trait_args, impl_trait_regions,
         impl_trait_bounds, trait_closure); };
 }
@@ -185,7 +183,7 @@ impl Tcx {
         }
         compare!(ctor_sigs, adts, lang_items, adt_destructors, destructor_impls,
             nominal_region_contracts, contracts_waiting, impl_self, impl_trait,
-            impl_generics, inherent, trait_impls, impls_by_key, impl_trait_args,
+            inherent, trait_impls, impls_by_key, impl_trait_args,
             impl_trait_regions, impl_trait_bounds, trait_closure, copy_trait);
         assert_eq!(self.collected_errors, rebuilt.collected_errors, "collected declaration diagnostics differ");
     }
@@ -213,7 +211,7 @@ impl Tcx {
         let errors = self.collected_errors.as_ref()?;
         if !errors.is_empty() { return None; }
         let mut w = Vec::new();
-        6u32.put(&mut w);
+        7u32.put(&mut w);
         macro_rules! put_one {
             (errors) => { errors.put(&mut w) };
             ($f:ident) => { self.$f.put(&mut w) };
@@ -235,7 +233,7 @@ impl Tcx {
     pub fn restore_collected(bytes: &'static [u8], files: usize, crates: usize) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
-        if u32::get(&mut r)? != 6 { return None; }
+        if u32::get(&mut r)? != 7 { return None; }
         let mut t = Self::with_types(Types::restore_collected(image.bytes(1, 1)?)?);
         macro_rules! get { ($($f:ident),+) => { $(t.$f = Codec::get(&mut r)?;)+ }; }
         fields!(get);

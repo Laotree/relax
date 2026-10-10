@@ -214,7 +214,6 @@ pub struct Tcx {
     pub nominal_region_contracts: ImageMap<DefId, outlives::RegionContract>,
     pub impl_self: ImageMap<DefId, TyId>,
     pub impl_trait: ImageMap<DefId, DefId>,
-    pub impl_generics: ImageMap<DefId, GenEnv>,
     pub inherent: ImageMap<TyKey, Vec<DefId>>,
     pub trait_impls: ImageMap<(TyKey, DefId), Vec<DefId>>,
     /// All impls of a trait, shared by candidate assembly and coherence.
@@ -304,7 +303,6 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 
 /// One impl header's collection (Tcx::impl_head_captured), recorded in impl order.
 struct ImplHead {
-    env: GenEnv,
     self_ty: TyId,
     /// None: inherent impl; Some(None): a trait path that did not resolve
     trait_: Option<Option<(DefId, Vec<TyId>)>>,
@@ -388,7 +386,6 @@ impl Tcx {
             contracts_waiting: Default::default(),
             impl_self: Default::default(),
             impl_trait: Default::default(),
-            impl_generics: Default::default(),
             inherent: Default::default(),
             trait_impls: Default::default(),
             trait_impls_of: Default::default(),
@@ -742,7 +739,6 @@ impl Tcx {
                 }
             }
             self.impl_trait_regions.insert(im.def, h.trait_regions);
-            self.impl_generics.insert(im.def, h.env);
         }
         // trait args naming another impl's constant (`impl Tr<{ u64::BYTE_LEN }, 0> for X`,
         // the const coming from `impl Tr<8, 0> for u64`): with every header recorded now, those
@@ -928,7 +924,6 @@ impl Tcx {
                 }
             }
             self.impl_trait_regions.insert(d, h.trait_regions);
-            self.impl_generics.insert(d, h.env);
             impls_added.push(d);
         }
         for &d in &impls_added {
@@ -992,7 +987,6 @@ impl Tcx {
         self.impl_self.retain(|d, _| !gone.contains(d));
         self.impl_trait.retain(|d, _| !gone.contains(d));
         for impls in self.trait_impls_of.values_mut() { impls.retain(|d| !gone.contains(d)); }
-        self.impl_generics.retain(|d, _| !gone.contains(d));
         self.opaques.retain(|k, _| !gone.contains(k));
         self.trait_closure.retain(|d, _| !gone.contains(d));
         self.publish_collected();
@@ -1112,14 +1106,14 @@ impl Tcx {
             return self.item_generic_env(prog, def.parent);
         }
         if def.kind == DefKind::Impl {
-            if let Some(env) = self.impl_generics.get(&d) { return env.clone(); }
+            if let Some(env) = self.impl_generics(prog, d) { return env; }
         }
         let mut env = GenEnv::default();
         if def.parent != NO_DEF {
             let pd = prog.def(def.parent);
             if pd.kind == DefKind::Impl {
-                if let Some(e) = self.impl_generics.get(&def.parent) {
-                    env = e.clone();
+                if let Some(e) = self.impl_generics(prog, def.parent) {
+                    env = e;
                 }
             } else if pd.kind == DefKind::Trait {
                 let ast = &prog.files[pd.file as usize].ast;
@@ -1185,6 +1179,36 @@ impl Tcx {
         env
     }
 
+    /// An impl's generic environment, rebuilt from its declaration: the collected tables keep only
+    /// the self type (`impl_self`), everything else here is a function of the impl's AST and its
+    /// lifetime resolution. None when the impl is not collected.
+    pub(crate) fn impl_generics(&self, prog: &Program, d: DefId) -> Option<GenEnv> {
+        let st = *self.impl_self.get(&d)?;
+        let def = prog.def(d);
+        let ItemKind::Impl { generics, .. } = &prog.files[def.file as usize].ast.item(def.item).kind else { return None };
+        let mut env = self.impl_header_env(prog, d, def.file, generics);
+        env.self_ty = Some(st);
+        Some(env)
+    }
+
+    /// Type and const parameter count of a collected impl (the parent generics of its items).
+    fn impl_generic_count(&self, prog: &Program, d: DefId) -> u32 {
+        if !self.impl_self.contains_key(&d) { return 0; }
+        let def = prog.def(d);
+        let ast = &prog.files[def.file as usize].ast;
+        let ItemKind::Impl { generics, .. } = &ast.item(def.item).kind else { return 0 };
+        ast.list(generics.params).iter().filter(|g| !matches!(g.kind, GenericParamKind::Lifetime(_))).count() as u32
+    }
+
+    /// The impl's parameters and lifetime resolution, before its self type is lowered.
+    fn impl_header_env(&self, prog: &Program, d: DefId, file: u32, generics: &ast::Generics) -> GenEnv {
+        let mut env = GenEnv::default();
+        push_generics(prog, file, generics, &mut env);
+        env.regions = self.bound_region_env(prog, d);
+        env.impl_def = Some(d);
+        env
+    }
+
     /// One impl's header with this evaluation's errors captured; None for a non-impl item.
     fn impl_head_captured(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, ii: usize) -> Option<ImplHead> {
         let im = &prog.impls[ii];
@@ -1195,11 +1219,7 @@ impl Tcx {
         };
         let outer = cx.state.errors.replace(Some(Vec::new()));
         let read0 = cx.state.impl_read.replace(false);
-        let mut env = GenEnv::default();
-        env.regions.enabled = true;
-        push_generics(prog, im.file, generics, &mut env);
-        env.regions = self.bound_region_env(prog, im.def);
-        env.impl_def = Some(im.def);
+        let mut env = self.impl_header_env(prog, im.def, im.file, generics);
         let st = self.lower_ty(cx, prog, im.file, im.module, &env, self_ty);
         env.self_ty = Some(st);
         let trait_regions = trait_.as_ref().map(|p| self.lower_region_args(cx.infcx, prog, im.file, im.module, &env, p)).unwrap_or(RegionArgsId::EMPTY);
@@ -1231,7 +1251,7 @@ impl Tcx {
         });
         let errors = cx.state.errors.replace(outer).unwrap_or_default();
         let reads_impls = cx.state.impl_read.replace(read0);
-        Some(ImplHead { env, self_ty: st, trait_: tr, errors, reads_impls, trait_regions })
+        Some(ImplHead { self_ty: st, trait_: tr, errors, reads_impls, trait_regions })
     }
 
 
@@ -1568,7 +1588,7 @@ impl Tcx {
         let module = self.item_module(prog, d);
         let env = self.item_env(prog, d);
         let n_parent = match prog.def(def.parent).kind {
-            DefKind::Impl => self.impl_generics.get(&def.parent).map_or(0, |e| e.names.len() as u32),
+            DefKind::Impl => self.impl_generic_count(prog, def.parent),
             DefKind::Trait => 1 + self.trait_generic_count(prog, def.parent) as u32,
             _ => 0,
         };
@@ -3351,7 +3371,7 @@ impl Tcx {
 
     /// Written impl bounds for param-environment elaboration; proof goes through solve.
     fn resolve_impl_bounds(&mut self, cx: &EvalCx<'_>, imp: DefId, prog: &Program) {
-        if let Some(env) = self.impl_generics.get(&imp).cloned() {
+        if let Some(env) = self.impl_generics(prog, imp) {
             let module = self.item_module(prog, imp);
             for (param, file, path) in &env.bounds {
                 if let Some(td) = self.resolve_type_path_def(prog, *file, module, path) {

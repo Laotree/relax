@@ -47,7 +47,7 @@ impl Tcx {
             env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
             env.trait_def = Some(def_id);
             env
-        } else { self.impl_generics.get(&def_id).cloned().unwrap_or_else(|| self.item_env(prog, def_id)) };
+        } else { self.impl_generics(prog, def_id).unwrap_or_else(|| self.item_env(prog, def_id)) };
         env.regions = self.bound_region_env(prog, def_id);
         env
     }
