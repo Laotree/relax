@@ -148,7 +148,12 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 !infcx.evaluate_obligation(&u.prog, Goal { param_env: ParamEnvId::EMPTY, predicate }).may_apply()
             })
         };
-        fns.push((owner, generic || in_trait || impossible));
+        // a provided crate's fns are built by rustc into the loader: JIT code reaches its listed
+        // ops through their shims, and an unlisted fn is compiled from source only when a body
+        // reaches it -- that body's compile covers it (relax_api.txt); compiling every unlisted fn
+        // here would report what never runs on the JIT side
+        let provided = u.provided.iter().any(|(k, _)| *k == d.krate);
+        fns.push((owner, generic || in_trait || impossible || provided));
     }
     let n_own = fns.len();
     let t_owners = t_check.elapsed();
