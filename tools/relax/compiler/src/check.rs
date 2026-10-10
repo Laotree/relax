@@ -95,9 +95,15 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let mut borrow_diagnostics = Vec::new();
     let up: *mut Unit = u;
     let mut fns = Vec::new();
-    for owner in crate::borrowck::body::owners(&u.prog) {
+    // the checked crates' definitions only (the program's other bodies are never looked at)
+    for owner in (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).filter_map(|i| crate::borrowck::body::CheckedBody::item(&u.prog, crate::program::DefId(i as u32))) {
         let d = u.prog.def(owner.owner);
-        if !own[d.krate as usize] { continue; }
+        // the app check needs no seeds: no signature is asked here (each costs a query; Stage's
+        // 9,200 took 3.4 s on one thread), the body's own args are used as they are
+        if !compile {
+            fns.push((owner, true));
+            continue;
+        }
         let in_trait = u.prog.def(d.parent).kind == DefKind::Trait;
         let generic = u.tcx.fn_sig(&u.prog, owner.owner).map_or(true, |s| s.n_generics > 0);
         // a fn whose where-clauses on concrete types cannot hold (`where &'a mut (): Clone`) is
@@ -270,6 +276,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         }
     }
     unsafe {
+        // a delayed bug no error explains (rustc: an ICE at session end) is one internal failure
+        // of the check, never the end of it
+        for bug in (*up).query_errors.take_delayed() {
+            errors.push(format!("internal: delayed bug at the end of the check: {}", bug));
+        }
         if !errors.is_empty() { (*up).query_errors.note_reported_error(); }
         (*up).flush_query_errors(true);
         errors.extend_from_slice(&(*up).errors);

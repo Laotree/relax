@@ -92,6 +92,12 @@ impl DiagCtxt {
         }
         result
     }
+    /// The delayed bugs not yet turned into errors, taken (a check reports each as an internal
+    /// failure instead of ending the session on them).
+    pub fn take_delayed(&self) -> Vec<String> {
+        let mut data = self.data.lock().unwrap();
+        std::mem::take(&mut data.delayed_bugs).into_iter().map(|bug| bug.message).collect()
+    }
     pub fn flush_delayed(&self) {
         let bugs = {
             let mut data = self.data.lock().unwrap();
