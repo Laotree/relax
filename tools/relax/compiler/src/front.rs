@@ -1,0 +1,644 @@
+//! A file's front-end arrays read from its crate's store (plans/memory-use.md, "Image design"):
+//! each completed cold crate is written and mapped before loading continues. Warm files use
+//! the same images (the store name carries the crate fingerprint). The arrays become slices
+//! of the mapping -- clean pages instead of heap. Shared files retain their heap arrays;
+//! mid-run flushes also retire lazily parsed bodies. RELAX_FRONT_COLD_SWAP=0 disables cold
+//! swaps; RELAX_FRONT=0 disables all front images. RELAX_FRONT_VERIFY=1 compares every
+//! section with the parsed one before swapping.
+//!
+//! Whole-crate boot restoration is supplied by cache::FrontImages before preload starts.
+
+use crate::arena::Arena;
+use crate::image::{Reader, Writer};
+use crate::parser::ParsedFile;
+use crate::source::{SourceRegistry, TokenOrigin};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+const S_SRC: u32 = 1;
+const S_TOKS: u32 = 2;
+const S_EXP_MAP: u32 = 3;
+const S_TOK_ORIGIN: u32 = 4;
+const S_RULES_EXP: u32 = 5;
+const S_BODY_ORIGIN: u32 = 6;
+const S_TOKEN_ORIGINS: u32 = 7;
+const S_SOURCES: u32 = 8;
+/// tree arrays: 100 + index in AST_ARRAYS order
+const S_AST: u32 = 100;
+
+/// The tree's arrays (every Ast arena), in section order.
+macro_rules! ast_arrays {
+    ($m:ident) => {
+        $m!(exprs: Expr, pats: Pat, tys: Ty, blocks: Block, root_attrs: Attr, root_items: ItemId, mac_args: MacArgs, path_segs: PathSeg, stmts: Stmt, expr_lists: ExprId, pat_lists: PatId, ty_lists: TyId, field_exprs: FieldExpr, arms: Arm, closure_params: ClosureParam, field_pats: FieldPat, qselfs: QSelf, generic_args: GenericArgs, fn_ptrs: FnPtr, generic_arg_lists: GenericArg, bounds: Bound, generic_params: GenericParam, ident_lists: Ident, attrs: Attr, asm_ops: AsmOp, items: Item, fn_sigs: FnSig, params: Param, field_defs: FieldDef, variants: Variant, use_trees: UseTree, item_lists: ItemId, where_preds: WherePred)
+    };
+}
+
+pub static MAPPED_FILES: AtomicU64 = AtomicU64::new(0);
+pub static MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static RECORDED_FILES: AtomicU64 = AtomicU64::new(0);
+pub static RECORDED_BYTES: AtomicU64 = AtomicU64::new(0);
+/// images found but not used (another parse result: a bug or a stale store)
+pub static MISMATCHED: AtomicU64 = AtomicU64::new(0);
+/// files with an image that another holder still shares (not swapped)
+pub static SHARED: AtomicU64 = AtomicU64::new(0);
+
+fn mismatch(path: &str, section: &str) -> bool {
+    MISMATCHED.fetch_add(1, Ordering::Relaxed);
+    if crate::preload::trace() {
+        eprintln!("relax-front mismatch: {} {}", path, section);
+    }
+    false
+}
+
+pub fn enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RELAX_FRONT").map_or(true, |v| v != "0"))
+}
+
+pub fn verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("RELAX_FRONT_VERIFY").map_or(false, |v| v == "1"))
+}
+
+/// The image of a loaded file (its arrays as they are after the load; the lazily parsed part
+/// is not in it).
+pub fn encode(pf: &ParsedFile) -> Vec<u8> {
+    image(pf).finish()
+}
+
+pub fn image(pf: &ParsedFile) -> Writer<'_> {
+    let mut w = Writer::default();
+    w.add(S_SRC, &pf.src);
+    w.add(S_TOKS, &pf.toks);
+    w.add(S_EXP_MAP, &pf.exp_map);
+    w.add(S_TOK_ORIGIN, &pf.tok_origin);
+    w.add(S_RULES_EXP, &pf.rules_exp);
+    w.add(S_BODY_ORIGIN, &pf.body_origin);
+    w.add(S_TOKEN_ORIGINS, &pf.token_origins);
+    w.add_chunks(S_SOURCES, source_chunks(pf, &pf.token_origins));
+    let a = &pf.ast;
+    let mut k = 0u32;
+    macro_rules! put {
+        ($($f:ident: $t:ident),*) => {
+            $( w.add(S_AST + k, &a.$f); k += 1; )*
+        };
+    }
+    ast_arrays!(put);
+    let _ = k;
+    w
+}
+
+/// Heap capacity retired by the main image (parts are accounted separately).
+pub fn heap_bytes(pf: &ParsedFile) -> usize {
+    let mut n = pf.src.heap_bytes() + pf.toks.heap_bytes() + pf.exp_map.heap_bytes()
+        + pf.tok_origin.heap_bytes() + pf.token_origins.heap_bytes() + pf.rules_exp.heap_bytes() + pf.body_origin.heap_bytes();
+    macro_rules! count { ($($f:ident: $t:ident),*) => { $( n += pf.ast.$f.heap_bytes(); )* }; }
+    ast_arrays!(count);
+    n
+}
+
+/// Swaps `pf`'s arrays for the image's when the image holds the same parse; false otherwise.
+pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
+    use crate::ast::*;
+    let Some(r) = Reader::new(img) else { return false };
+    macro_rules! read {
+        ($ty:ty, $index:expr, $id:expr, $section:literal) => {
+            match r.slice::<$ty>($index, $id) {
+                Some(x) => x,
+                None => return mismatch(path, $section),
+            }
+        };
+    }
+    let src = read!(u8, 0, S_SRC, "src");
+    let toks = read!(crate::lexer::Tok, 1, S_TOKS, "toks");
+    let em = read!((u32, u32, u32), 2, S_EXP_MAP, "exp_map");
+    let to = read!((u32, u32, u32), 3, S_TOK_ORIGIN, "tok_origin");
+    let re = read!((u32, u32, u32), 4, S_RULES_EXP, "rules_exp");
+    let bo = read!((u32, u32, u32), 5, S_BODY_ORIGIN, "body_origin");
+    let origins = read!(TokenOrigin, 6, S_TOKEN_ORIGINS, "token_origins");
+    let sources = read!(u8, 7, S_SOURCES, "sources");
+    let Some(origins) = restore_origins(origins, sources, &mut pf.sources, false) else { return mismatch(path, "sources"); };
+    // The key identifies the original source. Expansion text must also match; verify mode
+    // additionally compares array contents instead of only their lengths.
+    if src != &pf.src[..] { return mismatch(path, "src"); }
+    let v = verify();
+    macro_rules! check {
+        ($mapped:expr, $parsed:expr, $same:expr, $section:literal) => {
+            if $mapped.len() != $parsed.len() { return mismatch(path, concat!($section, ".len")); }
+            if v && !$same { return mismatch(path, $section); }
+        };
+    }
+    check!(toks, pf.toks, tok_bytes(toks) == tok_bytes(&pf.toks), "toks");
+    check!(em, pf.exp_map, em == &pf.exp_map[..], "exp_map");
+    check!(to, pf.tok_origin, to == &pf.tok_origin[..], "tok_origin");
+    check!(re, pf.rules_exp, re == &pf.rules_exp[..], "rules_exp");
+    check!(bo, pf.body_origin, bo == &pf.body_origin[..], "body_origin");
+    if origins[..] != pf.token_origins[..] { return mismatch(path, "token_origins"); }
+    // the tree's arrays: same lengths (and, verifying, the same nodes)
+    let a = &pf.ast;
+    let mut k = 0usize;
+    macro_rules! get {
+        ($($f:ident: $t:ident),*) => {
+            ($( {
+                let Some(x) = r.slice::<$t>(8 + k, S_AST + k as u32) else { return mismatch(path, concat!("ast.", stringify!($f))); };
+                if x.len() != a.$f.len() { return mismatch(path, concat!("ast.", stringify!($f), ".len")); }
+                if v && format!("{:?}", x) != format!("{:?}", &a.$f[..]) { return mismatch(path, concat!("ast.", stringify!($f))); }
+                k += 1;
+                x
+            }, )*)
+        };
+    }
+    let got = ast_arrays!(get);
+    let _ = k;
+    let mut before = pf.src.heap_bytes() + pf.toks.heap_bytes() + vb(&pf.exp_map) + vb(&pf.tok_origin) + vb(&pf.token_origins) + vb(&pf.rules_exp) + vb(&pf.body_origin);
+    pf.src = Arena::Mapped(src);
+    pf.toks = Arena::Mapped(toks);
+    pf.exp_map = Arena::Mapped(em);
+    pf.tok_origin = Arena::Mapped(to);
+    pf.rules_exp = Arena::Mapped(re);
+    pf.body_origin = Arena::Mapped(bo);
+    pf.token_origins = origins;
+    let a = &mut pf.ast;
+    macro_rules! set {
+        ($($f:ident: $t:ident),*) => {
+            let ($($f,)*) = got;
+            $( before += a.$f.heap_bytes(); a.$f = Arena::Mapped($f); )*
+        };
+    }
+    ast_arrays!(set);
+    MAPPED_FILES.fetch_add(1, Ordering::Relaxed);
+    MAPPED_BYTES.fetch_add(before as u64, Ordering::Relaxed);
+    true
+}
+
+/// part image sections
+const P_EXT: u32 = 200;
+const P_TOKS: u32 = 201;
+const P_EXP_MAP: u32 = 202;
+const P_TOK_ORIGIN: u32 = 203;
+/// (item, block, expr lo, expr hi, pat lo, pat hi) per skipped body
+const P_BODIES: u32 = 204;
+const P_BASE: u32 = 205;
+const P_TOKEN_ORIGINS: u32 = 206;
+const P_SOURCES: u32 = 207;
+const P_AST: u32 = 300;
+
+pub static PARTS_MAPPED: AtomicU64 = AtomicU64::new(0);
+pub static PARTS_RECORDED: AtomicU64 = AtomicU64::new(0);
+
+/// The image of a file's lazily parsed bodies, when this run parsed them (all of them parsed
+/// cleanly; a part with a parse error stays the parser's).
+pub fn encode_part(pf: &ParsedFile) -> Option<Vec<u8>> {
+    Some(part_image(pf)?.finish())
+}
+
+pub fn has_part_image(pf: &ParsedFile) -> bool {
+    pf.part.get().is_some_and(|fp| !fp.bodies.is_empty() && fp.next.get().is_none() && fp.bodies.iter().all(|(_, r)| r.is_ok()))
+        && pf.ast.part.get().is_some_and(|a| a.items.is_empty())
+}
+
+pub fn part_image(pf: &ParsedFile) -> Option<Writer<'_>> {
+    if !has_part_image(pf) { return None; }
+    let fp = pf.part.get()?;
+    let a = pf.ast.part.get()?;
+    if !a.items.is_empty() {
+        return None;
+    }
+    let mut bodies: Vec<u32> = Vec::new();
+    for (item, r) in fp.bodies.iter() {
+        let (b, rg) = r.ok()?;
+        bodies.extend_from_slice(&[item, b.0, rg[0], rg[1], rg[2], rg[3]]);
+    }
+    let mut w = Writer::default();
+    w.add(P_EXT, &fp.ext);
+    w.add(P_TOKS, &fp.toks);
+    w.add(P_EXP_MAP, &fp.exp_map);
+    w.add(P_TOK_ORIGIN, &fp.tok_origin);
+    w.add_owned(P_BODIES, &bodies);
+    w.add(P_BASE, &a.base[..]);
+    w.add(P_TOKEN_ORIGINS, &fp.token_origins);
+    w.add_chunks(P_SOURCES, source_chunks(pf, &fp.token_origins));
+    let mut k = 0u32;
+    macro_rules! put {
+        ($($f:ident: $t:ident),*) => {
+            $( w.add(P_AST + k, &a.$f); k += 1; )*
+        };
+    }
+    ast_arrays!(put);
+    let _ = k;
+    Some(w)
+}
+
+/// Warm restore before anything asked for bodies. Verify mode compares a fresh parse.
+/// `certified`: the image belongs to a certified collected graph (restore_origins).
+pub fn apply_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet, certified: bool) -> bool {
+    if pf.part.get().is_some() || pf.ast.part.get().is_some() { return false; }
+    swap_part_in(path, pf, img, cfg, certified)
+}
+
+/// Also accepts an already parsed part, retiring its heap only after comparison. Called
+/// with exclusive file access and, mid-run, both the unit and front-end write locks held.
+pub fn swap_part(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet) -> bool {
+    swap_part_in(path, pf, img, cfg, false)
+}
+fn swap_part_in(path: &str, pf: &mut ParsedFile, img: &'static [u8], cfg: &crate::cfg::CfgSet, certified: bool) -> bool {
+    use crate::ast::*;
+    if pf.lazy.is_none() {
+        return false;
+    }
+    let Some(r) = Reader::new(img) else { return false };
+    let (Some(ext), Some(toks), Some(em), Some(to), Some(bodies), Some(base), Some(origins), Some(sources)) = (
+        r.slice::<u8>(0, P_EXT),
+        r.slice::<crate::lexer::Tok>(1, P_TOKS),
+        r.slice::<(u32, u32, u32)>(2, P_EXP_MAP),
+        r.slice::<(u32, u32, u32)>(3, P_TOK_ORIGIN),
+        r.slice::<u32>(4, P_BODIES),
+        r.slice::<u32>(5, P_BASE),
+        r.slice::<TokenOrigin>(6, P_TOKEN_ORIGINS),
+        r.slice::<u8>(7, P_SOURCES),
+    ) else {
+        return mismatch(path, "part.sections");
+    };
+    let Some(origins) = restore_origins(origins, sources, &mut pf.sources, certified) else { return mismatch(path, "part.sources"); };
+    // the part continues the file's ids and positions: its base must be the file's ends
+    if base != &pf.ast.ends()[..] { return mismatch(path, "part.base"); }
+    if bodies.len() % 6 != 0 { return mismatch(path, "part.bodies"); }
+    let mut a = Ast::default();
+    a.base.copy_from_slice(base);
+    let mut k = 0usize;
+    macro_rules! get {
+        ($($f:ident: $t:ident),*) => {
+            $( match r.slice::<$t>(8 + k, P_AST + k as u32) { Some(x) => a.$f = Arena::Mapped(x), None => return mismatch(path, concat!("part.ast.", stringify!($f))) } k += 1; )*
+        };
+    }
+    ast_arrays!(get);
+    let _ = k;
+    let fp = crate::parser::FilePart {
+        src_base: pf.src.len() as u32, tok_base: pf.toks.len() as u32, rules_base: pf.rules_exp.len() as u32,
+        rules_exp: Default::default(), body_origin: Default::default(), next: Default::default(),
+        ext: Arena::Mapped(ext),
+        toks: Arena::Mapped(toks),
+        exp_map: Arena::Mapped(em),
+        tok_origin: Arena::Mapped(to),
+        token_origins: origins,
+        bodies: crate::parser::PartBodies::Mapped(bodies),
+    };
+    // This function also retires a part parsed during this run. Exclusive access to the
+    // file is required by the signature; callers must first drop every worker Arc.
+    // Compare an existing part before discarding it, including in non-verify mode.
+    let old_part = pf.part.take();
+    let old_ast = pf.ast.part.take();
+    if old_part.is_some() != old_ast.is_some() {
+        if let Some(p) = old_part { let _ = pf.part.set(p); }
+        if let Some(a) = old_ast { let _ = pf.ast.part.set(a); }
+        return false;
+    }
+    if verify() || old_part.is_some() {
+        // Verify reparses as a warm run would. Otherwise use the existing parse and the
+        // same length checks as the main image, avoiding AST formatting under the unit lock.
+        let (fresh, fresh_ast) = if verify() || old_part.is_none() {
+            (Box::new(crate::parser::parse_part(pf, cfg)), pf.ast.part.take())
+        } else {
+            (old_part.unwrap(), old_ast)
+        };
+        let same = fresh_ast.as_ref().map_or(false, |fa| {
+            let mut s = fa.base == a.base && format!("{:?}", fresh.bodies) == format!("{:?}", fp.bodies) && &fresh.ext[..] == &fp.ext[..] && tok_bytes(&fresh.toks) == tok_bytes(&fp.toks) && &fresh.exp_map[..] == &fp.exp_map[..] && &fresh.tok_origin[..] == &fp.tok_origin[..] && fresh.token_origins[..] == fp.token_origins[..];
+            macro_rules! cmp {
+                ($($f:ident: $t:ident),*) => {
+                    $( s = s && fa.$f.len() == a.$f.len() && (!verify() || format!("{:?}", &fa.$f[..]) == format!("{:?}", &a.$f[..])); )*
+                };
+            }
+            ast_arrays!(cmp);
+            s
+        });
+        if !same {
+            mismatch(path, "part.verify");
+            if let Some(fa) = fresh_ast {
+                let _ = pf.ast.part.set(fa);
+            }
+            let _ = pf.part.set(fresh);
+            return false;
+        }
+    }
+    let _ = pf.ast.part.set(Box::new(a));
+    let _ = pf.part.set(Box::new(fp));
+    PARTS_MAPPED.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+fn vb<T>(a: &crate::arena::Arena<T>) -> usize {
+    a.heap_bytes()
+}
+
+fn tok_bytes(t: &[crate::lexer::Tok]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(t.as_ptr() as *const u8, std::mem::size_of_val(t)) }
+}
+
+/// Store source identities and immutable snapshots next to the arena. Numeric IDs in an
+/// image are local to this manifest; restore never treats them as IDs in another load.
+fn source_chunks(pf: &ParsedFile, origins: &[TokenOrigin]) -> Vec<crate::image::Chunk<'static>> {
+    use crate::image::Chunk;
+    use crate::crate_image::Codec;
+    let mut ids: Vec<_> = origins.iter().map(|o| o.source.file).filter(|id| *id != 0).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let mut head = Vec::new();
+    ids.len().put(&mut head);
+    let mut chunks = vec![Chunk::Owned(head)];
+    for id in ids {
+        let src = pf.sources.as_ref().expect("origin source registry").get(id).expect("origin source snapshot");
+        let mut head = Vec::new();
+        id.put(&mut head);
+        src.path.put(&mut head);
+        src.src.len().put(&mut head);
+        chunks.push(Chunk::Owned(head));
+        chunks.push(Chunk::Shared(src.src.clone()));
+    }
+    chunks
+}
+
+fn restore_origins(origins: &'static [TokenOrigin], bytes: &'static [u8], sources: &mut Option<std::sync::Arc<SourceRegistry>>, certified: bool) -> Option<Arena<TokenOrigin>> {
+    use crate::crate_image::{Codec, Decode};
+    let mut r = Decode::new(bytes);
+    let count = usize::get(&mut r)?;
+    if count > r.bytes.len() { return None; }
+    let mut snapshots = Vec::with_capacity(count);
+    for _ in 0..count {
+        let old = u32::get(&mut r)?;
+        let path = String::get(&mut r)?;
+        let len = usize::get(&mut r)?;
+        snapshots.push((old, path, r.take(len)?));
+    }
+    if !r.bytes.is_empty() { return None; }
+    if certified {
+        // The completed collected graph references this exact immutable file image.
+        // Its origin array is trusted like the AST arrays, under the store checksum;
+        // preserving source IDs makes a full origin scan/remap unnecessary at boot.
+        match sources {
+            None => {
+                if !snapshots.is_empty() { *sources = Some(std::sync::Arc::new(SourceRegistry::from_mapped(snapshots)?)); }
+                return Some(Arena::Mapped(origins));
+            }
+            // a lazily parsed part continues its file's registry: same IDs, nothing to remap
+            Some(reg) if snapshots.iter().all(|(old, path, src)| reg.adopt_mapped(*old, path, src)) => return Some(Arena::Mapped(origins)),
+            Some(_) => {}
+        }
+    }
+    let mut ids = std::collections::HashMap::new();
+    for (old, path, src) in snapshots {
+        if old == 0 || ids.contains_key(&old) { return None; }
+        let len = u32::try_from(src.len()).ok()?;
+        let id = sources.get_or_insert_with(Default::default).register_mapped(&path, src).ok()?;
+        ids.insert(old, (id, len));
+    }
+    let mut same = true;
+    let mut end = 0;
+    for o in origins {
+        if o.lo < end || o.hi < o.lo || o.source.hi < o.source.lo { return None; }
+        end = o.hi;
+        if o.source.file != 0 {
+            let &(id, len) = ids.get(&o.source.file)?;
+            if o.source.hi > len { return None; }
+            same &= id == o.source.file;
+        }
+    }
+    if same { return Some(Arena::Mapped(origins)); }
+    Some(origins.iter().map(|o| {
+        let mut o = *o;
+        if o.source.file != 0 { o.source.file = ids[&o.source.file].0; }
+        o
+    }).collect::<Vec<_>>().into())
+}
+
+fn same_origins(a: &ParsedFile, ao: &[TokenOrigin], b: &ParsedFile, bo: &[TokenOrigin]) -> bool {
+    ao.len() == bo.len() && ao.iter().zip(bo).all(|(x, y)| {
+        if (x.lo, x.hi, x.source.lo, x.source.hi) != (y.lo, y.hi, y.source.lo, y.source.hi) { return false; }
+        match (x.source.file, y.source.file) {
+            (0, 0) => true,
+            (0, _) | (_, 0) => false,
+            (xi, yi) => {
+                let xs = a.sources.as_ref().and_then(|s| s.get(xi).ok());
+                let ys = b.sources.as_ref().and_then(|s| s.get(yi).ok());
+                xs.zip(ys).is_some_and(|(x, y)| x.path == y.path && x.src == y.src)
+            }
+        }
+    })
+}
+
+/// The run summary line.
+pub fn summary() -> Option<String> {
+    let (m, r) = (MAPPED_FILES.load(Ordering::Relaxed), RECORDED_FILES.load(Ordering::Relaxed));
+    let bad = MISMATCHED.load(Ordering::Relaxed);
+    let shared = SHARED.load(Ordering::Relaxed);
+    if m + r + bad + shared == 0 {
+        return None;
+    }
+    Some(format!(
+        "relax-front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} files shared (kept on the heap), {} mapped arrays copied back by a change ({:.1} MB)",
+        PARTS_MAPPED.load(Ordering::Relaxed),
+        PARTS_RECORDED.load(Ordering::Relaxed),
+        m,
+        MAPPED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+        r,
+        RECORDED_BYTES.load(Ordering::Relaxed) as f64 / 1e6,
+        bad,
+        shared,
+        crate::arena::COPIES.load(Ordering::Relaxed),
+        crate::arena::COPIED_BYTES.load(Ordering::Relaxed) as f64 / 1e6
+    ))
+}
+
+/// Construct arrays directly from a validated store; no temporary source/token/AST heap.
+/// The caller pins the store before passing its process-lifetime slices here.
+pub fn restore(meta: &mut crate::crate_image::FileMeta, img: &'static [u8]) -> Option<ParsedFile> {
+    restore_inner(meta, img, false)
+}
+
+/// The collected graph's single input certificate already verified this source hash and
+/// selected this exact file-image key. Keep section/bounds and asynchronous checksum checks;
+/// preserve source identities so authored origins can remain mapped without a boot-time scan.
+pub fn restore_certified(meta: &mut crate::crate_image::FileMeta, img: &'static [u8]) -> Option<ParsedFile> {
+    restore_inner(meta, img, true)
+}
+
+fn restore_inner(meta: &mut crate::crate_image::FileMeta, img: &'static [u8], certified: bool) -> Option<ParsedFile> {
+    // A provider owns live lowering state; current image formats cannot reconstruct it.
+    use crate::ast::*;
+    let r = Reader::new(img)?;
+    let src = r.slice::<u8>(0, S_SRC)?;
+    if meta.src_len as usize > src.len() || (!certified && crate::crate_image::file_hash(&meta.path, &src[..meta.src_len as usize]) != meta.hash) {
+        return None;
+    }
+    let mut ast = Ast::default();
+    let mut k = 0usize;
+    macro_rules! get { ($($f:ident: $t:ident),*) => { $(ast.$f=Arena::Mapped(r.slice::<$t>(8+k,S_AST+k as u32)?);k+=1;)* }; }
+    ast_arrays!(get);
+    let _ = k;
+    let mut sources = None;
+    let origins = restore_origins(r.slice(6, S_TOKEN_ORIGINS)?, r.slice(7, S_SOURCES)?, &mut sources, certified)?;
+    if meta.token_input {
+        sources.get_or_insert_with(Default::default).register_mapped(&meta.path, &src[..meta.src_len as usize]).ok()?;
+    }
+    Some(ParsedFile {
+        src: Arena::Mapped(src),
+        toks: Arena::Mapped(r.slice(1, S_TOKS)?),
+        ast,
+        edition: meta.edition,
+        src_len: meta.src_len,
+        source_hash: std::sync::OnceLock::from((meta.path.clone(), meta.hash)),
+        token_input: meta.token_input,
+        sources,
+        token_origins: origins,
+        lazy: meta.lazy.take(),
+        exp_map: Arena::Mapped(r.slice(2, S_EXP_MAP)?),
+        tok_origin: Arena::Mapped(r.slice(3, S_TOK_ORIGIN)?),
+        rules_exp: Arena::Mapped(r.slice(4, S_RULES_EXP)?),
+        body_origin: Arena::Mapped(r.slice(5, S_BODY_ORIGIN)?),
+        line_starts: Default::default(),
+        part: Default::default(),
+        impl_heads: Default::default(),
+        body_publish: Default::default(),
+        body_results: Default::default(),
+    })
+}
+
+pub fn verify_file(image: &ParsedFile, fresh: &ParsedFile) {
+    let a = &image.ast;
+    let b = &fresh.ast;
+    macro_rules! cmp { ($($f:ident: $t:ident),*) => { $(assert_eq!(format!("{:?}",&a.$f[..]),format!("{:?}",&b.$f[..]),"front AST {}",stringify!($f));)* }; }
+    ast_arrays!(cmp);
+    assert_eq!(&image.src[..], &fresh.src[..], "front source");
+    assert_eq!(tok_bytes(&image.toks), tok_bytes(&fresh.toks), "front tokens");
+    assert_eq!(&image.exp_map[..], &fresh.exp_map[..]);
+    assert_eq!(&image.tok_origin[..], &fresh.tok_origin[..]);
+    assert!(same_origins(image, &image.token_origins, fresh, &fresh.token_origins), "front token origins");
+    assert_eq!(&image.rules_exp[..], &fresh.rules_exp[..]);
+    assert_eq!(&image.body_origin[..], &fresh.body_origin[..]);
+    assert_eq!((image.edition, image.src_len, image.token_input), (fresh.edition, fresh.src_len, fresh.token_input));
+    assert_eq!(crate::crate_image::encode(&image.lazy), crate::crate_image::encode(&fresh.lazy));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_file_images_remap_source_ids_and_lazy_origins() {
+        use crate::pm_tokens::{Span, TokenTree};
+        let sess = std::sync::Arc::new(crate::Session::default());
+        let cfg = crate::cfg::CfgSet::host(&sess, &[]);
+        let sources = std::sync::Arc::new(SourceRegistry::default());
+        sources.source_id("/fake/earlier.rs");
+        let path = "/fake/image-token.rs";
+        sources.register(path, std::sync::Arc::from(&b"module construct"[..])).unwrap();
+        let source = "// imported\néé source construct for an entire function\n";
+        let imported = sources.register("/fake/image-import.rs", std::sync::Arc::from(source.as_bytes())).unwrap();
+        let span = Span { file: imported, lo: 16, hi: source.trim_end().len() as u32, ..Span::DUMMY };
+        fn set_spans(tokens: &mut [TokenTree], span: Span) {
+            for t in tokens {
+                t.set_span(span);
+                if let TokenTree::Group(g) = t { set_spans(&mut g.stream.trees, span); }
+            }
+        }
+        let mut stream = crate::builtins::lex_stream("pub fn f() -> u32 { concat!(\"one\", \"two\"); 3 }").unwrap();
+        set_spans(&mut stream.trees, span);
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", path, "test", &cfg));
+        let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+        let (mut f, used) = crate::parser::parse_token_stream(stream, path, 2021,
+            Some(crate::macros::MacroScope::new(table)), ctx, sources, true).unwrap();
+        let prep = crate::program::prepare_file(&mut f, &cfg);
+        assert!(f.lazy.is_some());
+        let main = image(encode(&f));
+        let mut changed = main.to_vec();
+        let descriptor = 16 + 6 * 24; // S_TOKEN_ORIGINS
+        let offset = u64::from_le_bytes(changed[descriptor..descriptor + 8].try_into().unwrap()) as usize;
+        changed[offset + 12] ^= 1; // same-sized arena, different source lo
+        assert!(!apply(path, &mut f, image(changed)));
+        let metadata = crate::crate_image::file_meta(path, "test", &f, &used.unwrap(), &prep, false);
+        let mut meta = crate::crate_image::decode(&metadata).unwrap();
+        let mut restored = restore(&mut meta, main).unwrap();
+        assert_ne!(restored.token_origins[0].source.file, imported);
+        verify_file(&restored, &f);
+        let part = f.part(&cfg).unwrap();
+        assert!(!part.token_origins.is_empty());
+        let at = part.token_origins[0].lo;
+        let part_image = image(encode_part(&f).unwrap());
+        assert!(apply_part(path, &mut restored, part_image, &cfg, false));
+        assert!(same_origins(&f, &f.part.get().unwrap().token_origins, &restored, &restored.part.get().unwrap().token_origins));
+        let mut program = crate::program::Program::new(&sess);
+        for n in 0..5 { program.source_id(&format!("/fake/reserved-{n}.rs")); }
+        restored.bind_sources(path, &program.sources).unwrap();
+        program.file_paths.push(path.into());
+        program.files.push(std::sync::Arc::new(restored));
+        let loc = program.source_location(0, at);
+        assert_eq!(loc.source.path(), "/fake/image-import.rs");
+        assert_eq!((loc.span.lo, loc.span.hi), (span.lo, span.hi));
+        assert_eq!(loc.source.bytes(), source.as_bytes());
+    }
+
+    fn lazy_file(sess: &std::sync::Arc<crate::Session>) -> (ParsedFile, crate::cfg::CfgSet) {
+        let cfg = crate::cfg::CfgSet::host(sess, &[]);
+        let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new("test", "test.rs", "test", &cfg));
+        let table = std::sync::Arc::new(crate::macros::MacroTable::default());
+        let (mut f, _) = crate::parser::parse_owned_ctx(sess,
+            b"pub fn f(x: u32) -> u32 { let y = x + 3; y * 2 }".to_vec(), None, 2021,
+            Some(crate::macros::MacroScope::new(table)), "test", Some(ctx), true,
+        ).unwrap();
+        crate::program::prepare_file(&mut f, &cfg);
+        assert!(f.lazy.is_some());
+        (f, cfg)
+    }
+
+    fn image(bytes: Vec<u8>) -> &'static [u8] {
+        // The store aligns payloads to 8; emulate that without relying on Vec<u8>'s alignment.
+        let mut words = vec![0u64; (bytes.len() + 7) / 8];
+        let dst = unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+        dst[..bytes.len()].copy_from_slice(&bytes);
+        let words = Box::leak(words.into_boxed_slice());
+        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, bytes.len()) }
+    }
+
+    #[test]
+    fn cold_main_and_late_part_swap_match_fresh_parse() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let (mut f, cfg) = lazy_file(sess);
+        let main = image(encode(&f));
+        assert!(heap_bytes(&f) > 0);
+        assert!(apply("test.rs", &mut f, main));
+        assert_eq!(heap_bytes(&f), 0);
+        let (fresh, _) = lazy_file(sess);
+        verify_file(&f, &fresh);
+        f.part(&cfg).unwrap();
+        let part = image(encode_part(&f).unwrap());
+        assert!(f.ast.part.get().unwrap().exprs.heap_bytes() > 0);
+        assert!(swap_part("test.rs", &mut f, part, &cfg));
+        assert_eq!(f.ast.part.get().unwrap().exprs.heap_bytes(), 0);
+        assert_eq!(f.part.get().unwrap().toks.heap_bytes(), 0);
+        // The warm path must produce exactly the same ids and body ranges.
+        let (mut warm, _) = lazy_file(sess);
+        assert!(apply("test.rs", &mut warm, main));
+        assert!(apply_part("test.rs", &mut warm, part, &cfg, false));
+        assert_eq!(format!("{:?}", f.part.get().unwrap().bodies), format!("{:?}", warm.part.get().unwrap().bodies));
+        assert_eq!(format!("{:?}", f.ast.part.get().unwrap().exprs), format!("{:?}", warm.ast.part.get().unwrap().exprs));
+    }
+
+    #[test]
+    fn cold_part_rejection_preserves_existing_heap() {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        let (mut f, cfg) = lazy_file(sess);
+        f.part(&cfg).unwrap();
+        let before = format!("{:?}", f.ast.part.get().unwrap().exprs);
+        let mut bytes = encode_part(&f).unwrap();
+        bytes[0] ^= 1; // invalid image header
+        assert!(!swap_part("test.rs", &mut f, image(bytes), &cfg));
+        assert_eq!(before, format!("{:?}", f.ast.part.get().unwrap().exprs));
+        assert!(!f.part.get().unwrap().toks.is_mapped());
+        // A structurally valid image with different body ids must also leave the parse intact.
+        let mut bytes = encode_part(&f).unwrap();
+        let table = 16 + 4 * 24; // P_BODIES section descriptor
+        let at = u64::from_le_bytes(bytes[table..table + 8].try_into().unwrap()) as usize;
+        bytes[at + 4] ^= 1;
+        assert!(!swap_part("test.rs", &mut f, image(bytes), &cfg));
+        assert_eq!(before, format!("{:?}", f.ast.part.get().unwrap().exprs));
+        assert!(!f.part.get().unwrap().toks.is_mapped());
+    }
+}

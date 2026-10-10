@@ -1,0 +1,118 @@
+//! Disk cache file helpers shared by the store (store.rs): byte buffers that map a file
+//! read-only, the pending-entry type, atomic whole-file writes and the private-directory check of the cache
+//! folder (dirs.rs: `<target>/relax/cache`).
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+/// An entry to write: its key, kind (code, data, ...) and payload.
+pub struct NewEntry {
+    pub key: u128,
+    pub kind: u32,
+    pub payload: Vec<u8>,
+}
+
+/// A pack file's bytes: mapped read-only (unix; pages are read as entries are linked, nothing is
+/// copied at open), else read into memory.
+pub struct Bytes {
+    ptr: *const u8,
+    len: usize,
+    mapped: bool,
+    owned: Vec<u8>,
+}
+
+unsafe impl Send for Bytes {}
+unsafe impl Sync for Bytes {}
+
+impl std::ops::Deref for Bytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        if self.mapped {
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        } else {
+            &self.owned
+        }
+    }
+}
+
+impl Drop for Bytes {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.mapped {
+            extern "C" {
+                fn munmap(addr: *mut u8, len: usize) -> i32;
+            }
+            unsafe { munmap(self.ptr as *mut u8, self.len) };
+        }
+    }
+}
+
+impl Bytes {
+    pub fn from_vec(v: Vec<u8>) -> Bytes {
+        Bytes { ptr: std::ptr::null(), len: v.len(), mapped: false, owned: v }
+    }
+
+    /// The file mapped read-only and private (packs are immutable: written whole, then renamed).
+    pub fn map(path: &Path) -> Option<Bytes> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            extern "C" {
+                fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+            }
+            let f = std::fs::File::open(path).ok()?;
+            let len = f.metadata().ok()?.len() as usize;
+            if len == 0 {
+                return None;
+            }
+            const PROT_READ: i32 = 1;
+            const MAP_PRIVATE: i32 = 2;
+            let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+            if p.is_null() || p as isize == -1 {
+                return None;
+            }
+            return Some(Bytes { ptr: p, len, mapped: true, owned: Vec::new() });
+        }
+        #[allow(unreachable_code)]
+        std::fs::read(path).ok().map(Bytes::from_vec)
+    }
+}
+
+/// Writes `image` to `dir/name` atomically: a fresh temp file (O_EXCL, 0600) in the same
+/// directory, then rename. A crash leaves at most a temp file, never a partial pack.
+pub fn write_atomic(dir: &Path, name: &str, image: &[u8]) -> std::io::Result<PathBuf> {
+    write_atomic_with(dir, name, |f| f.write_all(image))
+}
+
+/// Build an atomic file without assembling its contents in memory.
+pub fn write_atomic_with(dir: &Path, name: &str, write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>) -> std::io::Result<PathBuf> {
+    let tmp = dir.join(format!(".tmp-{}-{}-{}", std::process::id(), name, nonce()));
+    let mut f = crate::os::proc::create_private(&tmp)?;
+    let r = write(&mut f);
+    drop(f);
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    let dst = dir.join(name);
+    if let Err(e) = std::fs::rename(&tmp, &dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(dst)
+}
+
+fn nonce() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
+    let mut h = crate::sip::Sip128::new();
+    h.u64(t);
+    h.u64(std::process::id() as u64);
+    h.u64(&t as *const u64 as u64);
+    h.finish128() as u64
+}
+
+/// Creates `dir` (and parents) as 0700 and checks it is safe to load code from: owned by this
+/// user, not writable by group or others. Err(reason) turns the cache off.
+pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
+    crate::os::proc::ensure_private_dir(dir)
+}

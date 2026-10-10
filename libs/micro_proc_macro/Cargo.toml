@@ -12,3 +12,8 @@ metadata.makepad-auto-version = "2tKeN-afCtZGYbB_BxPOVxkh0W4="
 [features]
 ## Back the token types with a plain-data proc_macro-compatible model (Rapid's loader) instead of rustc's proc_macro.
 rapid = []
+
+relax-tokens = ["dep:relax-lex"]
+
+[dependencies]
+relax-lex = { workspace = true, optional = true }

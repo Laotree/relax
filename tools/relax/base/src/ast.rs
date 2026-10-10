@@ -1,0 +1,1226 @@
+//! Syntax tree. One `Ast` per file; nodes live in per-kind arenas and refer to
+//! each other by index. Names are source spans (`Ident`), resolved later.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Ident {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExprId(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PatId(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TyId(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemId(pub u32);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockId(pub u32);
+
+/// ExprKind::Async capture modes: by use, all by value, and an async closure's body (the
+/// closure's parameters by value, its upvars by use -- rustc's async closure coroutine)
+pub const ASYNC_PLAIN: u8 = 0;
+pub const ASYNC_MOVE: u8 = 1;
+pub const ASYNC_CLOSURE_BODY: u8 = 2;
+
+/// A token range `[lo, hi)` into the file's token list (macro bodies, attribute args).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TokRange {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Attr {
+    pub inner: bool,
+    /// tokens inside `#[ ... ]`
+    pub toks: TokRange,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Vis {
+    Private,
+    Pub,
+    Crate,
+    Super,
+    SelfMod,
+    In(Path),
+}
+
+/// `len` consecutive entries of one of its tree's flat arrays from `lo` (Ast::list): the
+/// position-independent form of a node's list of children.
+pub struct List<T> {
+    pub lo: u32,
+    pub len: u32,
+    _t: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T> List<T> {
+    pub const EMPTY: List<T> = List { lo: 0, len: 0, _t: std::marker::PhantomData };
+    #[inline]
+    pub fn new(lo: u32, len: u32) -> List<T> {
+        List { lo, len, _t: std::marker::PhantomData }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<T> Clone for List<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for List<T> {}
+impl<T> Default for List<T> {
+    fn default() -> Self {
+        List::EMPTY
+    }
+}
+impl<T> PartialEq for List<T> {
+    fn eq(&self, o: &Self) -> bool {
+        self.lo == o.lo && self.len == o.len
+    }
+}
+impl<T> std::fmt::Debug for List<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "List({}+{})", self.lo, self.len)
+    }
+}
+
+/// The flat arrays a tree's lists live in (index into Ast::base).
+pub trait FlatArray<T> {
+    const BASE: usize;
+    fn array(a: &Ast) -> &[T];
+    fn array_mut(a: &mut Ast) -> &mut Vec<T>;
+}
+
+impl FlatArray<Stmt> for Ast {
+    const BASE: usize = 6;
+    fn array(a: &Ast) -> &[Stmt] {
+        &a.stmts
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Stmt> {
+        a.stmts.vec_mut()
+    }
+}
+
+impl FlatArray<ExprId> for Ast {
+    const BASE: usize = 7;
+    fn array(a: &Ast) -> &[ExprId] {
+        &a.expr_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ExprId> {
+        a.expr_lists.vec_mut()
+    }
+}
+
+impl FlatArray<PatId> for Ast {
+    const BASE: usize = 8;
+    fn array(a: &Ast) -> &[PatId] {
+        &a.pat_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<PatId> {
+        a.pat_lists.vec_mut()
+    }
+}
+
+impl FlatArray<TyId> for Ast {
+    const BASE: usize = 9;
+    fn array(a: &Ast) -> &[TyId] {
+        &a.ty_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<TyId> {
+        a.ty_lists.vec_mut()
+    }
+}
+
+impl FlatArray<FieldExpr> for Ast {
+    const BASE: usize = 10;
+    fn array(a: &Ast) -> &[FieldExpr] {
+        &a.field_exprs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<FieldExpr> {
+        a.field_exprs.vec_mut()
+    }
+}
+
+impl FlatArray<Arm> for Ast {
+    const BASE: usize = 11;
+    fn array(a: &Ast) -> &[Arm] {
+        &a.arms
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Arm> {
+        a.arms.vec_mut()
+    }
+}
+
+impl FlatArray<ClosureParam> for Ast {
+    const BASE: usize = 12;
+    fn array(a: &Ast) -> &[ClosureParam] {
+        &a.closure_params
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ClosureParam> {
+        a.closure_params.vec_mut()
+    }
+}
+
+impl FlatArray<FieldPat> for Ast {
+    const BASE: usize = 13;
+    fn array(a: &Ast) -> &[FieldPat] {
+        &a.field_pats
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<FieldPat> {
+        a.field_pats.vec_mut()
+    }
+}
+
+impl FlatArray<GenericArg> for Ast {
+    const BASE: usize = 17;
+    fn array(a: &Ast) -> &[GenericArg] {
+        &a.generic_arg_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<GenericArg> {
+        a.generic_arg_lists.vec_mut()
+    }
+}
+
+impl FlatArray<Bound> for Ast {
+    const BASE: usize = 18;
+    fn array(a: &Ast) -> &[Bound] {
+        &a.bounds
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Bound> {
+        a.bounds.vec_mut()
+    }
+}
+
+impl FlatArray<GenericParam> for Ast {
+    const BASE: usize = 19;
+    fn array(a: &Ast) -> &[GenericParam] {
+        &a.generic_params
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<GenericParam> {
+        a.generic_params.vec_mut()
+    }
+}
+
+impl FlatArray<Ident> for Ast {
+    const BASE: usize = 20;
+    fn array(a: &Ast) -> &[Ident] {
+        &a.ident_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Ident> {
+        a.ident_lists.vec_mut()
+    }
+}
+
+impl FlatArray<Attr> for Ast {
+    const BASE: usize = 21;
+    fn array(a: &Ast) -> &[Attr] {
+        &a.attrs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Attr> {
+        a.attrs.vec_mut()
+    }
+}
+
+impl FlatArray<AsmOp> for Ast {
+    const BASE: usize = 22;
+    fn array(a: &Ast) -> &[AsmOp] {
+        &a.asm_ops
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<AsmOp> {
+        a.asm_ops.vec_mut()
+    }
+}
+
+impl FlatArray<Param> for Ast {
+    const BASE: usize = 25;
+    fn array(a: &Ast) -> &[Param] {
+        &a.params
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Param> {
+        a.params.vec_mut()
+    }
+}
+
+impl FlatArray<FieldDef> for Ast {
+    const BASE: usize = 26;
+    fn array(a: &Ast) -> &[FieldDef] {
+        &a.field_defs
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<FieldDef> {
+        a.field_defs.vec_mut()
+    }
+}
+
+impl FlatArray<Variant> for Ast {
+    const BASE: usize = 27;
+    fn array(a: &Ast) -> &[Variant] {
+        &a.variants
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Variant> {
+        a.variants.vec_mut()
+    }
+}
+
+impl FlatArray<UseTree> for Ast {
+    const BASE: usize = 28;
+    fn array(a: &Ast) -> &[UseTree] {
+        &a.use_trees
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<UseTree> {
+        a.use_trees.vec_mut()
+    }
+}
+
+impl FlatArray<ItemId> for Ast {
+    const BASE: usize = 29;
+    fn array(a: &Ast) -> &[ItemId] {
+        &a.item_lists
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ItemId> {
+        a.item_lists.vec_mut()
+    }
+}
+
+impl FlatArray<WherePred> for Ast {
+    const BASE: usize = 30;
+    fn array(a: &Ast) -> &[WherePred] {
+        &a.where_preds
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<WherePred> {
+        a.where_preds.vec_mut()
+    }
+}
+
+/// A path's segments: `len` consecutive entries of its tree's segment array from `lo`
+/// (Ast::segs). A prefix of a path is a path (`SegList { lo, len: n }`).
+/// The top bit of `n` is the path's leading `::` (Path::global).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SegList {
+    pub lo: u32,
+    n: u32,
+}
+
+const GLOBAL_BIT: u32 = 1 << 31;
+
+impl SegList {
+    #[inline]
+    pub fn new(lo: u32, len: u32, global: bool) -> SegList {
+        SegList { lo, n: len | if global { GLOBAL_BIT } else { 0 } }
+    }
+    #[inline]
+    pub fn len(&self) -> usize {
+        (self.n & !GLOBAL_BIT) as usize
+    }
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    #[inline]
+    pub fn global(&self) -> bool {
+        self.n & GLOBAL_BIT != 0
+    }
+    /// The first `n` segments.
+    #[inline]
+    pub fn prefix(&self, n: usize) -> SegList {
+        SegList::new(self.lo, (n as u32).min(self.len() as u32), self.global())
+    }
+}
+
+/// An optional expression in 4 bytes (u32::MAX: none) -- keeps ExprKind at 32 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptExprId(pub u32);
+
+impl OptExprId {
+    pub const NONE: OptExprId = OptExprId(u32::MAX);
+    #[inline]
+    pub fn get(self) -> Option<ExprId> {
+        if self.0 == u32::MAX {
+            None
+        } else {
+            Some(ExprId(self.0))
+        }
+    }
+    #[inline]
+    pub fn from(e: Option<ExprId>) -> OptExprId {
+        e.map_or(OptExprId::NONE, |e| OptExprId(e.0))
+    }
+}
+
+/// A path's `<T as Trait>` part: an index into its tree's Ast::qselfs (u32::MAX: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QSelfId(pub u32);
+
+impl QSelfId {
+    pub const NONE: QSelfId = QSelfId(u32::MAX);
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.0 != u32::MAX
+    }
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
+/// 16 bytes: segments (with the leading-`::` bit), the qualified self, the position.
+#[derive(Debug, Clone, Copy)]
+pub struct Path {
+    pub qself: QSelfId,
+    pub segs: SegList,
+    pub lo: u32,
+}
+
+impl Path {
+    /// `::a::b`
+    #[inline]
+    pub fn global(&self) -> bool {
+        self.segs.global()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct QSelf {
+    pub ty: TyId,
+    /// `<T as Trait>`: the trait path; number of segments of `segs` belonging to it
+    pub trait_path: Option<Path>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegKind {
+    Ident,
+    SelfValue,
+    SelfType,
+    Super,
+    Crate,
+}
+
+/// A segment's or method call's generic arguments: an index into its tree's
+/// Ast::generic_args (u32::MAX: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenericArgsId(pub u32);
+
+impl GenericArgsId {
+    pub const NONE: GenericArgsId = GenericArgsId(u32::MAX);
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.0 != u32::MAX
+    }
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.0 == u32::MAX
+    }
+}
+
+/// A fn pointer type's signature: an index into its tree's Ast::fn_ptrs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnPtrId(pub u32);
+
+/// An item function signature: an index into its tree's Ast::fn_sigs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnSigId(pub u32);
+
+/// A use-tree path's child: an index into its tree's Ast::use_trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UseTreeId(pub u32);
+
+#[derive(Debug, Clone, Copy)]
+pub struct PathSeg {
+    pub kind: SegKind,
+    pub name: Ident,
+    pub args: GenericArgsId,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GenericArgs {
+    Angle(List<GenericArg>),
+    /// `Fn(A, B) -> C`
+    Paren(List<TyId>, Option<TyId>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GenericArg {
+    Lifetime(Ident),
+    Type(TyId),
+    Const(ExprId),
+    /// `Item = T`
+    Binding(Ident, GenericArgsId, TyId),
+    /// `Item: Bound`
+    Constraint(Ident, List<Bound>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Bound {
+    Lifetime(Ident),
+    Trait {
+        hrtb: List<GenericParam>,
+        maybe: bool,
+        konst: bool,
+        path: Path,
+    },
+    /// `use<'a, T>` precise capture
+    Use(GenericArgsId),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GenericParam {
+    pub attrs: List<Attr>,
+    pub name: Ident,
+    pub kind: GenericParamKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum GenericParamKind {
+    Lifetime(List<Ident>),
+    Type(List<Bound>, Option<TyId>),
+    Const(TyId, Option<ExprId>),
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Generics {
+    pub params: List<GenericParam>,
+    pub where_: List<WherePred>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum WherePred {
+    Bound {
+        hrtb: List<GenericParam>,
+        ty: TyId,
+        bounds: List<Bound>,
+    },
+    Lifetime(Ident, List<Ident>),
+}
+
+// ---------------------------------------------------------------- types
+
+#[derive(Debug, Clone, Copy)]
+pub enum Ty {
+    Path(Path),
+    Ref(Option<Ident>, bool, TyId),
+    Ptr(bool, TyId),
+    Slice(TyId),
+    Array(TyId, ExprId),
+    Tuple(List<TyId>),
+    Fn(FnPtrId),
+    Never,
+    Infer,
+    ImplTrait(List<Bound>),
+    DynTrait(List<Bound>, bool),
+    Paren(TyId),
+    Mac(MacCall),
+    /// `Self` inside impls is a path; this is the implicit `self` type of `&self`
+    ImplicitSelf,
+    CVarArgs,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FnPtr {
+    pub hrtb: List<GenericParam>,
+    pub unsafe_: bool,
+    /// `extern` / `extern "abi"`: Some(abi string, if written)
+    pub abi: Option<Option<Ident>>,
+    pub params: List<TyId>,
+    pub ret: Option<TyId>,
+    pub variadic: bool,
+}
+
+// ---------------------------------------------------------------- patterns
+
+#[derive(Debug, Clone, Copy)]
+pub enum Pat {
+    Wild,
+    Rest,
+    Ident {
+        by_ref: bool,
+        mutbl: bool,
+        name: Ident,
+        sub: Option<PatId>,
+    },
+    Lit(ExprId),
+    Range(Option<ExprId>, Option<ExprId>, bool),
+    Path(Path),
+    TupleStruct(Path, List<PatId>),
+    Struct(Path, List<FieldPat>, bool),
+    Tuple(List<PatId>),
+    Slice(List<PatId>),
+    Ref(bool, PatId),
+    Or(List<PatId>),
+    Paren(PatId),
+    Box(PatId),
+    Mac(MacCall),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FieldPat {
+    pub attrs: List<Attr>,
+    pub name: Ident,
+    /// None: shorthand `x` / `ref mut x`
+    pub pat: PatId,
+    pub shorthand: bool,
+}
+
+// ---------------------------------------------------------------- expressions
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    BitXor,
+    BitAnd,
+    BitOr,
+    Shl,
+    Shr,
+    Eq,
+    Lt,
+    Le,
+    Ne,
+    Ge,
+    Gt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnOp {
+    Neg,
+    Not,
+    Deref,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LitKind {
+    Int,
+    Float,
+    Str,
+    ByteStr,
+    CStr,
+    RawStr,
+    Char,
+    Byte,
+    Bool(bool),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MacCall {
+    pub path: Path,
+    pub delim: u8,
+    /// tokens between the delimiters
+    pub toks: TokRange,
+    /// index into `Ast::mac_args` for built-in macros whose arguments were parsed
+    pub args: u32,
+}
+
+pub const NO_MAC_ARGS: u32 = u32::MAX;
+
+/// Parsed arguments of a built-in macro (format family, assert*, vec!, matches!).
+#[derive(Debug, Clone, Copy)]
+pub struct MacArgs {
+    pub exprs: List<ExprId>,
+    /// `vec![x; n]`
+    pub repeat: bool,
+    /// `matches!(e, pat if guard)`
+    pub pat: Option<PatId>,
+    pub guard: Option<ExprId>,
+    /// `asm!`: the operands and options; the template strings are `exprs[..asm.templates]`
+    pub asm: Option<AsmArgs>,
+}
+
+/// Operands of an `asm!` (Reference inline-assembly.md [asm.syntax]).
+#[derive(Debug, Clone, Copy)]
+pub struct AsmArgs {
+    /// how many leading `exprs` are template string literals
+    pub templates: u32,
+    pub ops: List<AsmOp>,
+    /// ASM_* option bits
+    pub options: u32,
+}
+
+pub const ASM_NORETURN: u32 = 1;
+pub const ASM_RAW: u32 = 2;
+pub const ASM_ATT_SYNTAX: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmDir {
+    In,
+    Out,
+    LateOut,
+    InOut,
+    InLateOut,
+    Const,
+    Sym,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AsmOp {
+    /// `name = ...`
+    pub name: Option<Ident>,
+    pub dir: AsmDir,
+    /// the register class (`reg`) or, when `explicit`, the register's string literal token
+    pub reg: Ident,
+    pub explicit: bool,
+    /// in / inout input / const value / sym path expression
+    pub input: Option<ExprId>,
+    /// out / inout output place; None for `_`
+    pub output: Option<ExprId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Arm {
+    pub attrs: List<Attr>,
+    pub pat: PatId,
+    pub guard: Option<ExprId>,
+    pub body: ExprId,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FieldExpr {
+    pub attrs: List<Attr>,
+    pub name: Ident,
+    pub expr: ExprId,
+    pub shorthand: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ClosureParam {
+    pub attrs: List<Attr>,
+    pub pat: PatId,
+    pub ty: Option<TyId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ExprKind {
+    Lit(LitKind),
+    Path(Path),
+    Unary(UnOp, ExprId),
+    Binary(BinOp, ExprId, ExprId),
+    Assign(ExprId, ExprId),
+    AssignOp(BinOp, ExprId, ExprId),
+    Call(ExprId, List<ExprId>),
+    MethodCall {
+        recv: ExprId,
+        name: Ident,
+        turbofish: GenericArgsId,
+        args: List<ExprId>,
+    },
+    Field(ExprId, Ident),
+    TupleField(ExprId, u32),
+    Index(ExprId, ExprId),
+    AddrOf(bool, bool, ExprId), // (raw, mut, expr)
+    Cast(ExprId, TyId),
+    Block(BlockId, Option<Ident>),
+    Unsafe(BlockId),
+    /// `async { }` / `async move { }` / an async closure's body (ASYNC_*)
+    Async(u8, BlockId),
+    ConstBlock(BlockId),
+    If(ExprId, BlockId, Option<ExprId>),
+    Let(PatId, ExprId),
+    Match(ExprId, List<Arm>),
+    While(ExprId, BlockId, Option<Ident>),
+    Loop(BlockId, Option<Ident>),
+    For(PatId, ExprId, BlockId, Option<Ident>),
+    Break(Option<Ident>, Option<ExprId>),
+    Continue(Option<Ident>),
+    Return(Option<ExprId>),
+    Closure {
+        is_move: bool,
+        is_async: bool,
+        params: List<ClosureParam>,
+        ret: Option<TyId>,
+        body: ExprId,
+    },
+    Tuple(List<ExprId>),
+    Array(List<ExprId>),
+    Repeat(ExprId, ExprId),
+    /// `S { fields, ..base }`; the bool: a bare `..` (rustc default_field_values: the omitted
+    /// fields take their declared defaults)
+    Struct(Path, List<FieldExpr>, OptExprId, bool),
+    Range(Option<ExprId>, Option<ExprId>, bool),
+    Try(ExprId),
+    Await(ExprId),
+    Mac(MacCall),
+    Paren(ExprId),
+    Underscore,
+    Yield(Option<ExprId>),
+    Box(ExprId),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub lo: u32,
+    pub hi: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Stmt {
+    Let {
+        attrs: List<Attr>,
+        pat: PatId,
+        ty: Option<TyId>,
+        init: Option<ExprId>,
+        else_: Option<BlockId>,
+    },
+    Item(ItemId),
+    Expr(ExprId, bool),
+    /// an expression statement (`Stmt::Expr(expr, semi)`) with outer attributes; program
+    /// loading strips it by its `#[cfg]` (keeping the statement or dropping it), so later
+    /// passes never see it
+    Attrs(List<Attr>, ExprId, bool),
+    Empty,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Block {
+    pub attrs: List<Attr>,
+    pub stmts: List<Stmt>,
+    pub lo: u32,
+    pub hi: u32,
+}
+
+// ---------------------------------------------------------------- items
+
+#[derive(Debug, Clone, Copy)]
+pub struct Item {
+    /// arena ranges [expr_lo, expr_hi, pat_lo, pat_hi) covering everything parsed for this item
+    pub ranges: [u32; 4],
+    pub attrs: List<Attr>,
+    pub vis: Vis,
+    pub name: Ident,
+    pub kind: ItemKind,
+    pub lo: u32,
+    pub hi: u32,
+}
+
+// Item used to be 168 bytes, before its owned children moved into flat arrays.
+const _: () = assert!(std::mem::size_of::<Item>() <= 112);
+
+#[derive(Debug, Clone, Copy)]
+pub struct Param {
+    pub attrs: List<Attr>,
+    pub pat: PatId,
+    pub ty: TyId,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum SelfParam {
+    Value(bool),                // self / mut self
+    Ref(Option<Ident>, bool),   // &'a mut self
+    Typed(bool, TyId),          // mut self: Box<Self>
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FnSig {
+    pub konst: bool,
+    pub asyncness: bool,
+    pub unsafe_: bool,
+    pub abi: Option<Option<Ident>>, // extern / extern "C"
+    pub generics: Generics,
+    pub self_param: Option<SelfParam>,
+    pub params: List<Param>,
+    pub variadic: bool,
+    pub ret: Option<TyId>,
+    /// lazy-body parse mode: the unparsed body's token range (inside the braces)
+    pub lazy_body: Option<TokRange>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FieldDef {
+    pub attrs: List<Attr>,
+    pub vis: Vis,
+    pub name: Option<Ident>,
+    pub ty: TyId,
+    pub default: Option<ExprId>,
+    /// source range of the field's type (the default's anonymous const is written with it)
+    pub ty_span: (u32, u32),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum VariantData {
+    Unit,
+    Tuple(List<FieldDef>),
+    Struct(List<FieldDef>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Variant {
+    pub attrs: List<Attr>,
+    pub name: Ident,
+    pub data: VariantData,
+    pub disc: Option<ExprId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum UseTree {
+    Path(PathSeg, UseTreeId),
+    Name(PathSeg, Option<Ident>), // rename; `as _` -> Some(ident "_")
+    Glob,
+    Group(List<UseTree>),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ItemKind {
+    Use { global: bool, tree: UseTree },
+    ExternCrate(Option<Ident>),
+    Fn(FnSigId, Option<BlockId>, bool), // bool: `default fn`
+    Struct(Generics, VariantData),
+    Union(Generics, List<FieldDef>),
+    Enum(Generics, List<Variant>),
+    TypeAlias {
+        generics: Generics,
+        bounds: List<Bound>,
+        ty: Option<TyId>,
+    },
+    Const(Option<TyId>, Option<ExprId>),
+    Static(bool, TyId, Option<ExprId>),
+    Trait {
+        unsafe_: bool,
+        auto: bool,
+        generics: Generics,
+        supers: List<Bound>,
+        items: List<ItemId>,
+    },
+    TraitAlias(Generics, List<Bound>),
+    Impl {
+        unsafe_: bool,
+        default_: bool,
+        generics: Generics,
+        negative: bool,
+        trait_: Option<Path>,
+        self_ty: TyId,
+        items: List<ItemId>,
+    },
+    Mod(Option<List<ItemId>>),
+    ForeignMod(Option<Ident>, List<ItemId>),
+    MacroRules(TokRange),
+    Mac(MacCall),
+}
+
+/// Number of id ranges a tree has (Ast::base / Ast::ends).
+pub const ARENAS: usize = 31;
+
+#[derive(Debug, Default)]
+pub struct Ast {
+    pub exprs: crate::arena::Arena<Expr>,
+    pub pats: crate::arena::Arena<Pat>,
+    pub tys: crate::arena::Arena<Ty>,
+    pub items: crate::arena::Arena<Item>,
+    pub blocks: crate::arena::Arena<Block>,
+    pub root_attrs: crate::arena::Arena<Attr>,
+    pub root_items: crate::arena::Arena<ItemId>,
+    pub mac_args: crate::arena::Arena<MacArgs>,
+    /// every path's segments (Path::segs indexes it)
+    pub path_segs: crate::arena::Arena<PathSeg>,
+    /// every block's statements (Block::stmts)
+    pub stmts: crate::arena::Arena<Stmt>,
+    /// child lists of nodes (call / tuple / array elements, patterns, types, struct literal
+    /// fields, match arms, closure params, struct pattern fields)
+    pub expr_lists: crate::arena::Arena<ExprId>,
+    pub pat_lists: crate::arena::Arena<PatId>,
+    pub ty_lists: crate::arena::Arena<TyId>,
+    pub field_exprs: crate::arena::Arena<FieldExpr>,
+    pub arms: crate::arena::Arena<Arm>,
+    pub closure_params: crate::arena::Arena<ClosureParam>,
+    pub field_pats: crate::arena::Arena<FieldPat>,
+    /// the `<T as Trait>` parts of paths (Path::qself)
+    pub qselfs: crate::arena::Arena<QSelf>,
+    /// generic arguments of path segments and method calls (PathSeg::args, GenericArgsId)
+    pub generic_args: crate::arena::Arena<GenericArgs>,
+    /// fn pointer types' signatures (Ty::Fn)
+    pub fn_ptrs: crate::arena::Arena<FnPtr>,
+    /// lists: generic arguments, bounds, generic params (hrtb and item generics' bounds),
+    /// lifetimes (lifetime params' bounds), attributes of body-level nodes and generic params,
+    /// asm! operands
+    pub generic_arg_lists: crate::arena::Arena<GenericArg>,
+    pub bounds: crate::arena::Arena<Bound>,
+    pub generic_params: crate::arena::Arena<GenericParam>,
+    pub ident_lists: crate::arena::Arena<Ident>,
+    pub attrs: crate::arena::Arena<Attr>,
+    pub asm_ops: crate::arena::Arena<AsmOp>,
+    /// Item signatures and children (all position-independent, including use-tree edges).
+    pub fn_sigs: crate::arena::Arena<FnSig>,
+    pub params: crate::arena::Arena<Param>,
+    pub field_defs: crate::arena::Arena<FieldDef>,
+    pub variants: crate::arena::Arena<Variant>,
+    pub use_trees: crate::arena::Arena<UseTree>,
+    pub item_lists: crate::arena::Arena<ItemId>,
+    pub where_preds: crate::arena::Arena<WherePred>,
+    /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
+    /// fn bodies (`part`) continue its ids
+    pub base: [u32; ARENAS],
+    /// the fn bodies the file's parse skipped (FnSig::lazy_body), parsed on the first need of
+    /// any of them (parser::ParsedFile::part): their nodes, ids after this tree's
+    pub part: std::sync::OnceLock<Box<Ast>>,
+}
+
+impl Ast {
+    #[inline]
+    pub fn expr(&self, id: ExprId) -> &Expr {
+        match self.exprs.get(id.0.wrapping_sub(self.base[0]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("expr", id.0).expr(id),
+        }
+    }
+    #[inline]
+    pub fn pat(&self, id: PatId) -> &Pat {
+        match self.pats.get(id.0.wrapping_sub(self.base[1]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("pat", id.0).pat(id),
+        }
+    }
+    #[inline]
+    pub fn ty(&self, id: TyId) -> &Ty {
+        match self.tys.get(id.0.wrapping_sub(self.base[2]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("ty", id.0).ty(id),
+        }
+    }
+    #[inline]
+    pub fn item(&self, id: ItemId) -> &Item {
+        match self.items.get(id.0.wrapping_sub(self.base[23]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("item", id.0).item(id),
+        }
+    }
+    #[inline]
+    pub fn block(&self, id: BlockId) -> &Block {
+        match self.blocks.get(id.0.wrapping_sub(self.base[3]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("block", id.0).block(id),
+        }
+    }
+    /// A built-in macro's parsed arguments (MacCall::args).
+    #[inline]
+    pub fn mac_arg(&self, i: u32) -> &MacArgs {
+        match self.mac_args.get(i.wrapping_sub(self.base[4]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("mac_args", i).mac_arg(i),
+        }
+    }
+    /// A path's segments (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn segs(&self, l: SegList) -> &[PathSeg] {
+        if l.is_empty() {
+            return &[];
+        }
+        let i = l.lo.wrapping_sub(self.base[5]) as usize;
+        match self.path_segs.get(i..i + l.len()) {
+            Some(x) => x,
+            None => self.part_or_panic("path segments", l.lo).segs(l),
+        }
+    }
+    /// A path's `<T as Trait>` part (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn qself(&self, p: &Path) -> Option<&QSelf> {
+        if p.qself.is_none() {
+            return None;
+        }
+        match self.qselfs.get(p.qself.0.wrapping_sub(self.base[14]) as usize) {
+            Some(q) => Some(q),
+            None => self.part_or_panic("qself", p.qself.0).qself(p),
+        }
+    }
+    /// A segment's or method call's generic arguments (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn gargs(&self, id: GenericArgsId) -> Option<&GenericArgs> {
+        if id.is_none() {
+            return None;
+        }
+        match self.generic_args.get(id.0.wrapping_sub(self.base[15]) as usize) {
+            Some(g) => Some(g),
+            None => self.part_or_panic("generic args", id.0).gargs(id),
+        }
+    }
+    /// A fn pointer type's signature (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn fn_ptr(&self, id: FnPtrId) -> &FnPtr {
+        match self.fn_ptrs.get(id.0.wrapping_sub(self.base[16]) as usize) {
+            Some(f) => f,
+            None => self.part_or_panic("fn ptr", id.0).fn_ptr(id),
+        }
+    }
+    /// An item function signature (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn fn_sig(&self, id: FnSigId) -> &FnSig {
+        match self.fn_sigs.get(id.0.wrapping_sub(self.base[24]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("fn_sigs", id.0).fn_sig(id),
+        }
+    }
+    /// Stores an item function signature (a tree being built).
+    pub fn push_fn_sig(&mut self, x: FnSig) -> FnSigId {
+        let id = FnSigId(self.base[24] + self.fn_sigs.len() as u32);
+        self.fn_sigs.push(x);
+        id
+    }
+    /// A use-tree path child (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn use_tree(&self, id: UseTreeId) -> &UseTree {
+        match self.use_trees.get(id.0.wrapping_sub(self.base[28]) as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("use_trees", id.0).use_tree(id),
+        }
+    }
+    /// Stores a use-tree path child (a tree being built).
+    pub fn push_use_tree(&mut self, x: UseTree) -> UseTreeId {
+        let id = UseTreeId(self.base[28] + self.use_trees.len() as u32);
+        self.use_trees.push(x);
+        id
+    }
+    /// Stores generic arguments (a tree being built).
+    pub fn push_gargs(&mut self, g: GenericArgs) -> GenericArgsId {
+        self.generic_args.push(g);
+        GenericArgsId(self.base[15] + self.generic_args.len() as u32 - 1)
+    }
+    /// Stores a fn pointer type's signature (a tree being built).
+    pub fn push_fn_ptr(&mut self, f: FnPtr) -> FnPtrId {
+        self.fn_ptrs.push(f);
+        FnPtrId(self.base[16] + self.fn_ptrs.len() as u32 - 1)
+    }
+    /// A list's entries (in this tree or its lazily parsed part).
+    #[inline]
+    pub fn list<T>(&self, l: List<T>) -> &[T]
+    where
+        Ast: FlatArray<T>,
+    {
+        if l.len == 0 {
+            return &[];
+        }
+        let i = l.lo.wrapping_sub(self.base[<Ast as FlatArray<T>>::BASE]) as usize;
+        match <Ast as FlatArray<T>>::array(self).get(i..i + l.len as usize) {
+            Some(x) => x,
+            None => self.part_or_panic("list", l.lo).list(l),
+        }
+    }
+    /// Stores a list's entries (a tree being built).
+    pub fn push_list<T>(&mut self, v: Vec<T>) -> List<T>
+    where
+        Ast: FlatArray<T>,
+    {
+        let b = self.base[<Ast as FlatArray<T>>::BASE];
+        let a = <Ast as FlatArray<T>>::array_mut(self);
+        let lo = b + a.len() as u32;
+        let len = v.len() as u32;
+        a.extend(v);
+        List::new(lo, len)
+    }
+    /// A block's statements.
+    #[inline]
+    pub fn stmts(&self, b: BlockId) -> &[Stmt] {
+        self.list(self.block(b).stmts)
+    }
+    /// The expression exists (in this tree or its lazily parsed part).
+    pub fn has_expr(&self, id: ExprId) -> bool {
+        (id.0.wrapping_sub(self.base[0]) as usize) < self.exprs.len() || self.part.get().map_or(false, |p| p.has_expr(id))
+    }
+    pub fn has_block(&self, id: BlockId) -> bool {
+        (id.0.wrapping_sub(self.base[3]) as usize) < self.blocks.len() || self.part.get().map_or(false, |p| p.has_block(id))
+    }
+    /// Next ids of each arena after this tree (Ast::base order).
+    pub fn ends(&self) -> [u32; ARENAS] {
+        [
+            self.base[0] + self.exprs.len() as u32,
+            self.base[1] + self.pats.len() as u32,
+            self.base[2] + self.tys.len() as u32,
+            self.base[3] + self.blocks.len() as u32,
+            self.base[4] + self.mac_args.len() as u32,
+            self.base[5] + self.path_segs.len() as u32,
+            self.base[6] + self.stmts.len() as u32,
+            self.base[7] + self.expr_lists.len() as u32,
+            self.base[8] + self.pat_lists.len() as u32,
+            self.base[9] + self.ty_lists.len() as u32,
+            self.base[10] + self.field_exprs.len() as u32,
+            self.base[11] + self.arms.len() as u32,
+            self.base[12] + self.closure_params.len() as u32,
+            self.base[13] + self.field_pats.len() as u32,
+            self.base[14] + self.qselfs.len() as u32,
+            self.base[15] + self.generic_args.len() as u32,
+            self.base[16] + self.fn_ptrs.len() as u32,
+            self.base[17] + self.generic_arg_lists.len() as u32,
+            self.base[18] + self.bounds.len() as u32,
+            self.base[19] + self.generic_params.len() as u32,
+            self.base[20] + self.ident_lists.len() as u32,
+            self.base[21] + self.attrs.len() as u32,
+            self.base[22] + self.asm_ops.len() as u32,
+            self.base[23] + self.items.len() as u32,
+            self.base[24] + self.fn_sigs.len() as u32,
+            self.base[25] + self.params.len() as u32,
+            self.base[26] + self.field_defs.len() as u32,
+            self.base[27] + self.variants.len() as u32,
+            self.base[28] + self.use_trees.len() as u32,
+            self.base[29] + self.item_lists.len() as u32,
+            self.base[30] + self.where_preds.len() as u32,
+        ]
+    }
+    #[cold]
+    #[inline(never)]
+    fn part_or_panic(&self, what: &str, id: u32) -> &Ast {
+        match self.part.get() {
+            Some(p) => p,
+            None => panic!("relax: {} {} is outside the parsed tree (its lazily parsed body part is missing)", what, id),
+        }
+    }
+    /// Drops the arrays' growth slack (a parsed tree is not appended to again).
+    pub fn shrink(&mut self) {
+        self.exprs.shrink_to_fit();
+        self.pats.shrink_to_fit();
+        self.tys.shrink_to_fit();
+        self.items.shrink_to_fit();
+        self.blocks.shrink_to_fit();
+        self.root_attrs.shrink_to_fit();
+        self.root_items.shrink_to_fit();
+        self.mac_args.shrink_to_fit();
+        self.path_segs.shrink_to_fit();
+        self.stmts.shrink_to_fit();
+        self.expr_lists.shrink_to_fit();
+        self.pat_lists.shrink_to_fit();
+        self.ty_lists.shrink_to_fit();
+        self.field_exprs.shrink_to_fit();
+        self.arms.shrink_to_fit();
+        self.closure_params.shrink_to_fit();
+        self.field_pats.shrink_to_fit();
+        self.qselfs.shrink_to_fit();
+        self.generic_args.shrink_to_fit();
+        self.fn_ptrs.shrink_to_fit();
+        self.generic_arg_lists.shrink_to_fit();
+        self.bounds.shrink_to_fit();
+        self.generic_params.shrink_to_fit();
+        self.ident_lists.shrink_to_fit();
+        self.attrs.shrink_to_fit();
+        self.asm_ops.shrink_to_fit();
+        self.fn_sigs.shrink_to_fit();
+        self.params.shrink_to_fit();
+        self.field_defs.shrink_to_fit();
+        self.variants.shrink_to_fit();
+        self.use_trees.shrink_to_fit();
+        self.item_lists.shrink_to_fit();
+        self.where_preds.shrink_to_fit();
+    }
+    /// Mutable block (cfg stripping of a tree being built).
+    pub fn block_mut(&mut self, id: BlockId) -> &mut Block {
+        let b = self.base[3];
+        &mut self.blocks[(id.0 - b) as usize]
+    }
+}
+
+/// A field name written as a tuple index (`S { 0: a }`, `x.1`): plain decimal digits without a
+/// leading zero (rustc: `0x1`, `0b1`, `01` and suffixed `0u32` name no field).
+pub fn tuple_index(text: &str) -> Option<u32> {
+    let b = text.as_bytes();
+    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) || (b.len() > 1 && b[0] == b'0') {
+        return None;
+    }
+    text.parse::<u32>().ok()
+}

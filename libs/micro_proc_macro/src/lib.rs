@@ -3,13 +3,21 @@
 //! `proc_macro`-compatible model with the `rapid` feature (for proc-macro libraries linked into
 //! Rapid's loader). Proc-macro libraries name the token types through this re-export.
 
-#[cfg(not(feature = "rapid"))]
+#[cfg(not(any(feature = "rapid", feature = "relax-tokens")))]
 pub extern crate proc_macro;
 
-#[cfg(feature = "rapid")]
+#[cfg(all(feature = "rapid", not(feature = "relax-tokens")))]
 #[path = "rapid_tokens.rs"]
 pub mod proc_macro;
 
 #[allow(dead_code)]
 pub mod macro_lib;
 pub use macro_lib::*;
+
+#[cfg(feature = "relax-tokens")]
+pub use relax_lex::tokens as proc_macro;
+
+#[cfg(feature = "relax-tokens")]
+mod declaration;
+#[cfg(feature = "relax-tokens")]
+pub use declaration::declaration_surface;

@@ -1,0 +1,431 @@
+//! `#[cfg(...)]` evaluation for one target and one crate's feature set.
+
+use crate::ast::{Attr, TokRange};
+use crate::lexer::T;
+use crate::lexer::Tok;
+
+#[derive(Clone)]
+pub struct CfgSet {
+    pub session: std::sync::Arc<crate::Session>,
+    /// `name` or `name=value` entries that are true
+    pub set: Vec<String>,
+}
+
+impl CfgSet {
+    /// The machine Relax runs on (JIT target).
+    pub fn host(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        // RELAX_CHECK_TARGET=x86_64-pc-windows-gnu: type-check (`relax check` / `relax run
+        // --check`, with cargo's `--target` of the same triple) another platform's code from here
+        if sess.options.check_target == crate::options::CheckTarget::WindowsX64 {
+            return CfgSet::windows_x64(sess, features);
+        }
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            CfgSet::macos_arm64(sess, features)
+        } else if cfg!(windows) {
+            CfgSet::windows_x64(sess, features)
+        } else {
+            CfgSet::linux_x64(sess, features)
+        }
+    }
+
+    /// aarch64 macOS, release, panic=abort, not test.
+    pub fn macos_arm64(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        let mut set = Vec::new();
+        for s in [
+            "unix",
+            "target_os=macos",
+            "target_family=unix",
+            "target_vendor=apple",
+            "target_arch=aarch64",
+            "target_pointer_width=64",
+            "target_endian=little",
+            "target_env=",
+            "target_has_atomic=8",
+            "target_has_atomic=16",
+            "target_has_atomic=32",
+            "target_has_atomic=64",
+            "target_has_atomic=ptr",
+            "panic=abort",
+            // rustc --print cfg --target aarch64-apple-darwin (1.97.1): the target's default features
+            "target_feature=aes",
+            "target_feature=crc",
+            "target_feature=dit",
+            "target_feature=dotprod",
+            "target_feature=dpb",
+            "target_feature=dpb2",
+            "target_feature=fcma",
+            "target_feature=fhm",
+            "target_feature=flagm",
+            "target_feature=fp16",
+            "target_feature=frintts",
+            "target_feature=jsconv",
+            "target_feature=lor",
+            "target_feature=lse",
+            "target_feature=neon",
+            "target_feature=paca",
+            "target_feature=pacg",
+            "target_feature=pan",
+            "target_feature=pmuv3",
+            "target_feature=ras",
+            "target_feature=rcpc",
+            "target_feature=rcpc2",
+            "target_feature=rdm",
+            "target_feature=sb",
+            "target_feature=sha2",
+            "target_feature=sha3",
+            "target_feature=ssbs",
+            "target_feature=vh",
+        ] {
+            set.push(s.to_string());
+        }
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+
+    /// x86_64 Linux, release (no debug_assertions), panic=abort, not test.
+    pub fn linux_x64(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        let mut set = Vec::new();
+        for s in [
+            "unix",
+            "target_os=linux",
+            "target_family=unix",
+            "target_arch=x86_64",
+            "target_pointer_width=64",
+            "target_endian=little",
+            "target_env=gnu",
+            "target_vendor=unknown",
+            "target_has_atomic=8",
+            "target_has_atomic=16",
+            "target_has_atomic=32",
+            "target_has_atomic=64",
+            "target_has_atomic=ptr",
+            "panic=abort",
+            "target_feature=sse",
+            "target_feature=sse2",
+            "target_feature=fxsr",
+        ] {
+            set.push(s.to_string());
+        }
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+    /// x86_64-pc-windows-gnu (`rustc --print cfg --target x86_64-pc-windows-gnu`), release,
+    /// panic=abort, not test.
+    pub fn windows_x64(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        let mut set = Vec::new();
+        for s in [
+            "windows",
+            "target_os=windows",
+            "target_family=windows",
+            "target_arch=x86_64",
+            "target_pointer_width=64",
+            "target_endian=little",
+            "target_env=gnu",
+            "target_abi=",
+            "target_vendor=pc",
+            "target_has_atomic=8",
+            "target_has_atomic=16",
+            "target_has_atomic=32",
+            "target_has_atomic=64",
+            "target_has_atomic=ptr",
+            "panic=abort",
+            "target_feature=sse",
+            "target_feature=sse2",
+            "target_feature=fxsr",
+        ] {
+            set.push(s.to_string());
+        }
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+    /// The target triple of this cfg set (build scripts' TARGET / HOST).
+    pub fn triple(&self) -> &'static str {
+        if self.has("target_os=windows") {
+            "x86_64-pc-windows-gnu"
+        } else if self.has("target_os=macos") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+    }
+
+    /// The CARGO_CFG_* variables cargo gives a build script for the target's basic cfgs (OS, arch,
+    /// env, vendor, family, endianness, pointer width, and the family flag `unix` / `windows`).
+    pub fn build_script_env(&self) -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        for key in ["target_endian", "target_pointer_width", "target_family", "target_os", "target_arch", "target_env", "target_vendor"] {
+            let prefix = format!("{}=", key);
+            if let Some(e) = self.set.iter().find(|e| e.starts_with(&prefix)) {
+                v.push((format!("CARGO_CFG_{}", key.to_uppercase()), e[prefix.len()..].to_string()));
+            }
+        }
+        for flag in ["unix", "windows"] {
+            if self.has(flag) {
+                v.push((format!("CARGO_CFG_{}", flag.to_uppercase()), String::new()));
+            }
+        }
+        v
+    }
+
+    /// Is `name` / `name=value` set? (dependency platform predicates, resolve.rs)
+    pub fn holds(&self, s: &str) -> bool {
+        self.has(s)
+    }
+
+    fn has(&self, s: &str) -> bool {
+        for x in &self.set {
+            if x == s {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Source and tokens of one file.
+pub trait SourceTokens {
+    fn token(&self, i: u32) -> Tok;
+    fn bytes(&self, lo: u32, hi: u32) -> &[u8];
+}
+
+#[derive(Clone, Copy)]
+pub struct Src<'a> {
+    pub src: &'a [u8],
+    pub toks: &'a [Tok],
+    /// expansion text past the end of `src` (while parsing; empty afterwards: then `src`
+    /// already holds it)
+    pub ext: &'a [u8],
+    /// tokens past the end of `toks` (a file's lazily parsed fn bodies' expansions)
+    pub ptoks: &'a [Tok],
+    /// Immutable body segments published after the file was parsed.
+    pub parts: Option<&'a dyn SourceTokens>,
+}
+
+impl<'a> Src<'a> {
+    #[inline]
+    pub fn tok(&self, i: usize) -> Tok {
+        if let Some(parts) = self.parts { return parts.token(i as u32); }
+        match self.toks.get(i) {
+            Some(t) => *t,
+            None => self.ptoks[i - self.toks.len()],
+        }
+    }
+}
+
+pub fn tok_str<'a>(p: Src<'a>, i: usize) -> &'a [u8] {
+    let t = p.tok(i);
+    if let Some(parts) = p.parts { return parts.bytes(t.lo, t.hi); }
+    let (lo, hi) = (t.lo as usize, t.hi as usize);
+    if lo >= p.src.len() && !p.ext.is_empty() {
+        // a token of a macro expansion (the parser's text past the file's end)
+        let b = p.src.len();
+        return &p.ext[(lo - b).min(p.ext.len())..(hi - b).min(p.ext.len())];
+    }
+    &p.src[lo.min(p.src.len())..hi.min(p.src.len())]
+}
+
+/// Evaluates a predicate starting at token `*i` (inside an attribute range ending at `end`).
+fn pred(p: Src, i: &mut usize, end: usize, cfg: &CfgSet) -> bool {
+    if *i >= end {
+        return false;
+    }
+    let name = tok_str(p, *i);
+    *i += 1;
+    if *i < end && p.tok(*i).kind == T::OpenParen && (name == b"all" || name == b"any" || name == b"not") {
+        *i += 1;
+        let mut vals = Vec::new();
+        while *i < end && p.tok(*i).kind != T::CloseParen {
+            vals.push(pred(p, i, end, cfg));
+            if *i < end && p.tok(*i).kind == T::Comma {
+                *i += 1;
+            }
+        }
+        *i += 1; // `)`
+        return match name {
+            b"all" => {
+                let mut r = true;
+                for v in &vals {
+                    r = r && *v;
+                }
+                r
+            }
+            b"any" => {
+                let mut r = false;
+                for v in &vals {
+                    r = r || *v;
+                }
+                r
+            }
+            _ => vals.len() == 1 && !vals[0],
+        };
+    }
+    // `cfg(true)` / `cfg(false)` (boolean literals, stable since 1.88)
+    if name == b"true" || name == b"false" {
+        return name == b"true";
+    }
+    let n = String::from_utf8_lossy(name).into_owned();
+    if *i < end && p.tok(*i).kind == T::Eq {
+        *i += 1;
+        let v = tok_str(p, *i);
+        *i += 1;
+        let v = String::from_utf8_lossy(v).into_owned();
+        let v = v.trim_matches('"');
+        return cfg.has(&format!("{}={}", n, v));
+    }
+    cfg.has(&n)
+}
+
+/// Is an item/statement with these attributes active? (all `cfg` attrs must hold;
+/// `cfg_attr(pred, cfg(x))` is followed too)
+pub fn active(p: Src, attrs: &[Attr], cfg: &CfgSet) -> bool {
+    // Configure nested cfg_attr before inspecting cfg, as rustc's
+    // StripUnconfigured::configure does. A cfg inside a false nested cfg_attr
+    // must not disable the item.
+    let expanded;
+    let attrs = if attrs.iter().any(|a| a.toks.hi > a.toks.lo && tok_str(p, a.toks.lo as usize) == b"cfg_attr") {
+        expanded = expand_cfg_attr_list(p, attrs, cfg);
+        &expanded[..]
+    } else {
+        attrs
+    };
+    for a in attrs {
+        let lo = a.toks.lo as usize;
+        let hi = a.toks.hi as usize;
+        if hi <= lo {
+            continue;
+        }
+        let name = tok_str(p, lo);
+        if name == b"cfg" && lo + 1 < hi && p.tok(lo + 1).kind == T::OpenParen {
+            let mut i = lo + 2;
+            if !pred(p, &mut i, hi - 1, cfg) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Configured outer attributes preceding an item keyword (past its visibility).
+/// Prescans must use the same cfg_attr expansion as the parser before publishing
+/// macros, exports or imports. Returned ranges still address the original tokens.
+pub fn attrs_before(p: Src, mut i: usize, cfg: &CfgSet) -> Vec<Attr> {
+    if i > 0 && p.tok(i - 1).kind == T::CloseParen {
+        let mut open = i - 1;
+        while open > 0 && p.tok(open).kind != T::OpenParen {
+            open -= 1;
+        }
+        if open > 0 && p.tok(open - 1).kind == T::KwPub {
+            i = open - 1;
+        }
+    } else if i > 0 && p.tok(i - 1).kind == T::KwPub {
+        i -= 1;
+    }
+    let mut attrs = Vec::new();
+    while i >= 3 && p.tok(i - 1).kind == T::CloseBracket {
+        let close = i - 1;
+        let mut open = close;
+        let mut depth = 0;
+        loop {
+            match p.tok(open).kind {
+                T::CloseBracket => depth += 1,
+                T::OpenBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if open == 0 {
+                break;
+            }
+            open -= 1;
+        }
+        if open == 0 || p.tok(open - 1).kind != T::Pound {
+            break;
+        }
+        attrs.push(Attr { inner: false, toks: TokRange { lo: (open + 1) as u32, hi: close as u32 } });
+        i = open - 1;
+    }
+    attrs.reverse();
+    expand_cfg_attr_list(p, &attrs, cfg)
+}
+
+
+/// `cfg!(pred)`: the predicate in tokens [lo, hi).
+pub fn eval_tokens(p: Src, lo: usize, hi: usize, cfg: &CfgSet) -> bool {
+    let mut i = lo;
+    pred(p, &mut i, hi, cfg)
+}
+
+/// Is `#[test]` among the attributes (tests are inactive in a normal build)?
+pub fn is_test(p: Src, attrs: &[Attr]) -> bool {
+    for a in attrs {
+        let lo = a.toks.lo as usize;
+        if a.toks.hi as usize == lo + 1 && tok_str(p, lo) == b"test" {
+            return true;
+        }
+    }
+    false
+}
+
+/// For `cfg_attr(pred, ...)`: does `pred` hold?
+pub fn cfg_attr_holds(p: Src, a: &Attr, cfg: &CfgSet) -> bool {
+    let lo = a.toks.lo as usize;
+    let hi = a.toks.hi as usize;
+    if hi <= lo + 2 {
+        return false;
+    }
+    let mut i = lo + 2;
+    pred(p, &mut i, hi - 1, cfg)
+}
+
+/// rustc_expand config.rs `expand_cfg_attr`: `#[cfg_attr(pred, a, b(..))]` becomes `#[a] #[b(..)]`
+/// when pred holds and nothing otherwise (recursively: the expanded attributes may be cfg_attr
+/// again). The expanded attributes are sub-ranges of the original tokens.
+pub fn expand_cfg_attr_list(p: Src, attrs: &[Attr], cfg: &CfgSet) -> Vec<Attr> {
+    let mut out = Vec::with_capacity(attrs.len());
+    for a in attrs {
+        let lo = a.toks.lo as usize;
+        let hi = a.toks.hi as usize;
+        if hi <= lo + 2 || tok_str(p, lo) != b"cfg_attr" || p.tok(lo + 1).kind != T::OpenParen {
+            out.push(a.clone());
+            continue;
+        }
+        // tokens: cfg_attr ( pred , a1 , a2 ... )
+        let end = hi - 1; // the closing paren
+        let mut i = lo + 2;
+        if !pred(p, &mut i, end, cfg) {
+            continue;
+        }
+        let mut parts = Vec::new();
+        while i < end {
+            if p.tok(i).kind == T::Comma {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut depth = 0i32;
+            while i < end {
+                match p.tok(i).kind {
+                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                    T::Comma if depth == 0 => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if i > start {
+                parts.push(Attr { inner: a.inner, toks: TokRange { lo: start as u32, hi: i as u32 } });
+            }
+        }
+        out.extend(expand_cfg_attr_list(p, &parts, cfg));
+    }
+    out
+}

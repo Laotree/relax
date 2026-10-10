@@ -1,0 +1,252 @@
+//! Resolved name graph checkpoint. No collection, import resolution or body parsing on restore.
+use super::*;
+use crate::crate_image::{Codec, Decode, FileMeta};
+use std::sync::{Arc, OnceLock};
+
+// Same-build data: the definition is Copy and contains only enums and integer IDs.
+unsafe impl crate::image::Pod for Def {}
+
+crate::collected_fields!(Def, kind, name, parent, file, item, sub, is_pub, krate, scope);
+crate::collected_fields!(Module, def, lexical_parent, normal, parent_mod, krate, file,
+    types, values, macros, globs, anon_traits, import_pub);
+crate::collected_fields!(ImplData, def, file, item, module, items);
+crate::collected_fields!(Import, module, global, segs, bind, glob, is_pub, done, file, pos);
+
+/// Binding tables read in place from the image (ImageMap).
+macro_rules! tables { ($op:ident) => { $op!(block_mods, block_owner, item_defs); }; }
+/// Record lists read in place from the image (ImageVec).
+macro_rules! lists { ($op:ident) => { $op!(mods, impls, imports, variants, traits, file_blocks); }; }
+
+#[derive(Clone, Copy)]
+pub(super) struct Start {
+    defs: usize, mods: usize, variants: usize, impls: usize, traits: usize,
+    imports: usize, files: usize, lines: usize,
+}
+crate::collected_fields!(Start, defs, mods, variants, impls, traits, imports, files, lines);
+
+impl Program {
+    pub(super) fn mark_collected_start(&mut self) {
+        self.collected_starts.push(Start { defs: self.defs.len(), mods: self.mods.len(),
+            variants: self.variants.len(), impls: self.impls.len(), traits: self.traits.len(),
+            imports: self.imports.len(), files: self.files.len(), lines: self.lines_loaded });
+    }
+
+    /// Verification uses the same symbol numbering, but independently parses/collects every
+    /// definition and resolves every binding. Symbols are opaque identities, not queries.
+    pub fn seed_collected_symbols(&mut self, saved: &Self) {
+        self.syms = Interner::default();
+        for s in saved.syms.names() { self.syms.intern(s); }
+        for s in &saved.syms.late.lock().unwrap_or_else(|e| e.into_inner()).1 { self.syms.intern_late(s); }
+    }
+
+    /// Reuse a certified dependency prefix after a leaf (or dependent suffix) changes.
+    /// Its IDs remain stable; only new crates pass through the ordinary loader/collector.
+    pub fn retain_collected_prefix(&mut self, crates: usize) -> Option<usize> {
+        let s = *self.collected_starts.get(crates)?;
+        if self.defs.get(s.defs..)?.iter().any(|d| (d.krate as usize) < crates)
+            || s.mods > self.mods.len() || self.mods.iter().skip(s.mods).any(|m| (m.krate as usize) < crates)
+            || self.file_crate.get(s.files..)?.iter().any(|k| (*k as usize) < crates) { return None; }
+        let names: crate::fxhash::HashSet<String> = self.crates[..crates].iter().map(|c| self.syms.str(c.name).to_string()).collect();
+        // A library and its binary can share a name; their macro-table shadowing requires
+        // the ordinary loader if either changes.
+        if self.crates[crates..].iter().any(|c| names.contains(self.syms.str(c.name))) { return None; }
+        self.crates.truncate(crates);
+        self.load_recipe.truncate(crates);
+        self.collected_starts.truncate(crates);
+        self.defs = match std::mem::take(&mut self.defs) {
+            crate::arena::Arena::Mapped(a) => crate::arena::Arena::Mapped(&a[..s.defs]),
+            crate::arena::Arena::Owned(mut a) => { a.truncate(s.defs); a.into() },
+        };
+        self.mods.truncate(s.mods); self.variants.truncate(s.variants);
+        self.impls.truncate(s.impls); self.traits.truncate(s.traits); self.imports.truncate(s.imports);
+        self.files.truncate(s.files); self.file_paths.truncate(s.files);
+        self.file_crate.truncate(s.files); self.file_blocks.truncate(s.files);
+        self.lines_loaded = s.lines;
+        self.reload = OnceLock::new();
+        self.block_mods.retain(|(f, _), m| (*f as usize) < s.files && (*m as usize) < s.mods);
+        self.block_owner.retain(|m, _| (*m as usize) < s.mods);
+        self.item_defs.retain(|(f, _), _| (*f as usize) < s.files);
+        self.imports_of_module.retain(|m, _| (*m as usize) < s.mods);
+        self.part_interned.get_mut().ok()?.retain(|(f, _)| (*f as usize) < s.files);
+        self.front_ahead.truncate(crates); self.front_restored.truncate(crates);
+        self.front_dep_names.truncate(crates); self.front_probes.truncate(crates);
+        self.front_macro_fragments.retain(|f| *f < s.files);
+        // the lazy selection's state of the dropped crates (a restored image may carry it)
+        self.skipped_files.retain(|m, _| (*m as usize) < s.mods);
+        self.deferred_imports.retain(|(i, _)| (*i as usize) < s.imports);
+        self.deferred_waits.retain(|m, w| { w.retain(|x| (*x as usize) < s.mods); (*m as usize) < s.mods });
+        self.deferred_binds.retain(|(m, _), w| { w.retain(|x| (*x as usize) < s.mods); (*m as usize) < s.mods });
+        let table = Arc::make_mut(&mut self.macros);
+        table.clear_lookup_cache();
+        table.defs.retain(|_, defs| { defs.retain(|d| d.krate.is_empty() || names.contains(&d.krate)); !defs.is_empty() });
+        table.aliases.retain(|k, _| names.contains(k));
+        table.macro_use.retain(|k, _| names.contains(k));
+        table.crates.retain(|k, _| names.contains(k.split('\u{1}').next().unwrap_or(k)));
+        table.exp_uses.retain(|k, _| names.contains(k)); table.sealed.retain(|k| names.contains(k));
+        self.record_front = true;
+        // the suffix crates load into an unresolved program, as at a cold load (run.rs resolves
+        // after the last one): with imports_done left set, every define() of the suffix cleared
+        // scope_cache, each clear retiring a 512 KB table until a quiescent point -- an app-edit
+        // relaunch (48 crates collected again under lazy) grew to 16 GB and was OOM-killed
+        self.imports_done = false;
+        Some(s.defs)
+    }
+
+    pub fn verify_collected(&self, rebuilt: &Self) {
+        macro_rules! compare { ($($f:ident),+) => { $(
+            assert!(crate::crate_image::encode(&self.$f) == crate::crate_image::encode(&rebuilt.$f),
+                "collected Program {} differs", stringify!($f));
+        )+ }; }
+        assert!(self.syms.names().eq(rebuilt.syms.names()), "collected symbols differ");
+        compare!(file_paths, file_crate, defs, mods, variants, impls, traits, imports,
+            block_mods, block_owner, item_defs, prim_defs, prelude_crate, imports_of_module, file_blocks);
+        assert_eq!(self.crates.len(), rebuilt.crates.len(), "collected crate count");
+        for (a, b) in self.crates.iter().zip(&rebuilt.crates) {
+            assert_eq!((a.name, a.root_mod, a.edition, &a.deps, &a.cfg.set, a.proc_macro, &a.root_path),
+                (b.name, b.root_mod, b.edition, &b.deps, &b.cfg.set, b.proc_macro, &b.root_path), "collected crate");
+        }
+        for (i, (a, b)) in self.files.iter().zip(&rebuilt.files).enumerate() {
+            assert_eq!(a.source_hash(&self.file_paths[i]), b.source_hash(&rebuilt.file_paths[i]), "collected file identity");
+        }
+    }
+
+    /// Checkpoints only a completed immutable boot. Runtime body/lookup caches stay lazy.
+    /// The lazy selection's state goes with it: the modules whose files are still skipped and
+    /// the imports waiting on them, so a restored program loads them later (post-boot loader,
+    /// completion race) exactly as the boot that recorded it would have.
+    pub fn collected_image(&self) -> Option<Vec<u8>> {
+        Some(self.collected_writer()?.finish())
+    }
+
+    pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
+        if !self.imports_done || !self.errors.is_empty() || !self.pending_macs.is_empty() {
+            if crate::preload::trace() { eprintln!("relax-collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); }
+            return None;
+        }
+        // Certify record relationships once, when publishing. The reader verifies the
+        // immutable image checksum and its input certificate, not every definition again.
+        if self.crates.iter().any(|c| c.root_mod as usize >= self.mods.len())
+            || self.defs.iter().any(|d| d.krate as usize >= self.crates.len()
+                || d.scope as usize >= self.mods.len() || d.file as usize >= self.files.len()
+                || (d.parent != NO_DEF && d.parent.0 as usize >= self.defs.len())) { return None; }
+        let mut w = Vec::new();
+        2u32.put(&mut w);
+        let late = self.syms.late.lock().unwrap_or_else(|e| e.into_inner());
+        late.1.len().put(&mut w);
+        for s in &late.1 { s.to_string().put(&mut w); }
+        drop(late);
+        self.crates.len().put(&mut w);
+        for c in &self.crates {
+            c.name.put(&mut w); c.root_mod.put(&mut w); c.edition.put(&mut w);
+            c.deps.put(&mut w); c.cfg.set.put(&mut w); c.proc_macro.put(&mut w);
+            c.root_path.put(&mut w); c.context.fingerprint().put(&mut w);
+        }
+        macro_rules! put { ($($f:ident),+) => { $(self.$f.put(&mut w);)+ }; }
+        put!(collected_starts, lines_loaded);
+        // Standalone loaders leave the interface prefix at usize::MAX (all files).
+        // Persist its concrete length; the image's counts are bounded u32 values.
+        self.boot_files.min(self.files.len()).put(&mut w);
+        put!(file_paths, file_crate, prim_defs, prelude_crate,
+            imports_of_module, front_dep_names, front_probes, front_macro_fragments,
+            part_interned, deferred_imports, deferred_waits, deferred_binds);
+        let skipped: Vec<(u32, (String, (String, bool)))> = self.skipped_files.iter()
+            .map(|(m, (path, dir, mod_rs))| (*m, (path.clone(), (dir.clone(), *mod_rs)))).collect();
+        skipped.put(&mut w);
+        self.files.len().put(&mut w);
+        for (i, f) in self.files.iter().enumerate() {
+            f.source_hash(&self.file_paths[i]).put(&mut w);
+            f.edition.put(&mut w); f.src_len.put(&mut w); f.token_input.put(&mut w);
+            // length-prefixed: a restore keeps it encoded until a body parse needs it
+            let lazy = crate::crate_image::encode(&f.lazy);
+            lazy.len().put(&mut w); w.extend_from_slice(&lazy);
+        }
+        let mut image = crate::image::Writer::default();
+        image.add_bytes(0, w);
+        match &self.defs {
+            crate::arena::Arena::Mapped(defs) => image.add_mapped(1, defs),
+            crate::arena::Arena::Owned(defs) => image.add(1, defs),
+        }
+        self.macros.write_image(&mut image, 2);
+        self.syms.write_image(&mut image, 3);
+        let mut id = 6;
+        macro_rules! table { ($($f:ident),+) => { $(self.$f.write_image(&mut image, &mut id);)+ }; }
+        tables!(table);
+        macro_rules! list { ($($f:ident),+) => { $(self.$f.write_image(&mut image, &mut id);)+ }; }
+        lists!(list);
+        Some(image)
+    }
+
+    pub fn restore_collected(
+        session: &Arc<crate::Session>, bytes: &'static [u8], pre: &[crate::preload::PreCrate],
+        mut file: impl FnMut(usize, u32, &CfgSet, &mut FileMeta) -> Option<ParsedFile>,
+    ) -> Option<Self> {
+        let started = std::time::Instant::now();
+        let phase = |name: &str| if crate::preload::trace() {
+            eprintln!("relax-collected: Program {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
+        };
+        let image = crate::image::Reader::new(bytes)?;
+        let mut r = Decode::new(image.bytes(0, 0)?);
+        if u32::get(&mut r)? != 2 { return None; }
+        let mut p = Program::new(session);
+        p.syms = Interner::from_image(&image, 3, 3)?;
+        for s in Vec::<String>::get(&mut r)? { p.syms.intern_late(&s); }
+        phase("symbols");
+        let n = usize::get(&mut r)?;
+        if n > r.bytes.len() || n != pre.len() { return None; }
+        let contexts = crate::source_context::Context::for_crates(pre, p.sources.clone(), session);
+        p.load_recipe = pre.to_vec();
+        for context in contexts {
+            let name = Codec::get(&mut r)?;
+            let root_mod = Codec::get(&mut r)?;
+            let edition = Codec::get(&mut r)?;
+            let deps = Codec::get(&mut r)?;
+            let set = Codec::get(&mut r)?;
+            let proc_macro = Codec::get(&mut r)?;
+            let root_path: String = Codec::get(&mut r)?;
+            let selection_hash = u128::get(&mut r)?;
+            context.restore_fingerprint(selection_hash);
+            p.crates.push(CrateInfo {
+                name, root_mod, edition, deps, cfg: CfgSet { set, session: session.clone() },
+                proc_macro, relaxed: OnceLock::new(), root_path, context,
+            });
+        }
+        macro_rules! get { ($($f:ident),+) => { $(p.$f = Codec::get(&mut r)?;)+ }; }
+        p.defs = crate::arena::Arena::Mapped(image.slice(1, 1)?);
+        p.macros = crate::collected::Deferred::mapped(image.bytes(2, 2)?);
+        get!(collected_starts, lines_loaded, boot_files, file_paths, file_crate, prim_defs, prelude_crate,
+            imports_of_module, front_dep_names, front_probes, front_macro_fragments,
+            part_interned, deferred_imports, deferred_waits, deferred_binds);
+        p.skipped_files = Vec::<(u32, (String, (String, bool)))>::get(&mut r)?.into_iter()
+            .map(|(m, (path, (dir, mod_rs)))| (m, (path, dir, mod_rs))).collect();
+        let (mut k, mut id) = (6, 6);
+        macro_rules! table { ($($f:ident),+) => { $(p.$f = crate::collected::ImageMap::read_image(&image, &mut k, &mut id)?;)+ }; }
+        tables!(table);
+        macro_rules! list { ($($f:ident),+) => { $(p.$f = crate::collected::ImageVec::read_image(&image, &mut k, &mut id)?;)+ }; }
+        lists!(list);
+        if k != image.len() { return None; }
+        phase("bindings");
+        let n = usize::get(&mut r)?;
+        if n != p.file_paths.len() || n != p.file_crate.len() || n != p.file_blocks.len() { return None; }
+        p.files.reserve(n);
+        for i in 0..n {
+            let mut meta = FileMeta {
+                path: p.file_paths[i].clone(), module: String::new(), hash: Codec::get(&mut r)?,
+                edition: Codec::get(&mut r)?, src_len: Codec::get(&mut r)?, token_input: Codec::get(&mut r)?,
+                lazy: { let n = usize::get(&mut r)?; crate::parser::FileLazy::mapped(r.take(n)?) }, shared: false,
+                used: crate::macros::MacroUse::from_image(Default::default(), Default::default()),
+                prep: FilePrep { idents: Vec::new(), blocks: Default::default(), lines: 0 },
+            };
+            let k = p.file_crate[i];
+            let c = p.crates.get(k as usize)?;
+            p.files.push(Arc::new(file(i, k, &c.cfg, &mut meta)?));
+        }
+        phase("files");
+        if !r.bytes.is_empty() { return None; }
+        p.front_restored = vec![true; p.crates.len()];
+        p.front_ahead.resize_with(p.crates.len(), Vec::new);
+        p.imports_done = true;
+        // the reload index is built from the restored tables by its first user
+        p.reload = OnceLock::new();
+        Some(p)
+    }
+}

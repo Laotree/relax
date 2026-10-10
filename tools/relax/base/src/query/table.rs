@@ -1,0 +1,150 @@
+use super::{next_id, DepNodeIndex, Fingerprint, QueryEngine, QueryError, QueryId};
+use crate::fxhash::{FxHasher, HashMap};
+use std::hash::{Hash, Hasher};
+use std::sync::{OnceLock, RwLock};
+
+const SHARDS: usize = 32;
+
+struct Slot<K, V> {
+    key: K,
+    value: Option<V>,
+    verified_at: u64,
+    // This index also addresses the engine's in-progress job slot.
+    node: DepNodeIndex,
+}
+
+struct Shard<K, V> {
+    keys: HashMap<K, u32>,
+    slots: Vec<Slot<K, V>>,
+}
+
+/// A per-kind key interner, value cache and handle to in-progress state. Hits need
+/// only a shared shard lock. Values should be cheap to clone (ids or Arc handles).
+/// rustc_middle/src/query/caches.rs:16,42 separates typed values from dep-node indices;
+/// rustc_middle/src/query/plumbing.rs:79 associates each query with its cache/state.
+///
+/// A table binds permanently to its first engine and exclusively owns its kind.
+/// `new` is const so concrete queries can own static tables without generated code.
+/// Key/value hashing functions must encode stable semantic identities with Sip128;
+/// ordinary Hash is used only for the in-memory shard and interner.
+/// Every call for a kind must use the same provider semantics and force dispatcher.
+pub struct QueryTable<K, V> {
+    kind: u16,
+    key_fingerprint: fn(&K) -> Fingerprint,
+    value_fingerprint: fn(&V) -> Fingerprint,
+    owner: OnceLock<Result<u64, QueryError>>,
+    shards: OnceLock<Vec<RwLock<Shard<K, V>>>>,
+}
+
+impl<K: Hash + Eq + Clone, V: Clone> QueryTable<K, V> {
+    pub const fn new(kind: u16, key_fingerprint: fn(&K) -> Fingerprint, value_fingerprint: fn(&V) -> Fingerprint) -> Self {
+        Self { kind, key_fingerprint, value_fingerprint, owner: OnceLock::new(), shards: OnceLock::new() }
+    }
+
+    fn bind(&self, engine: &QueryEngine) -> Result<(), QueryError> {
+        let owner = self.owner.get_or_init(|| {
+            engine.claim_kind(self.kind, next_id())?;
+            Ok(engine.id)
+        });
+        match owner {
+            Ok(id) if *id == engine.id => Ok(()),
+            Ok(_) => Err(QueryError::WrongEngine),
+            Err(error) => Err(error.clone()),
+        }
+    }
+
+    fn shards(&self) -> &[RwLock<Shard<K, V>>] {
+        self.shards.get_or_init(|| {
+            let mut shards = Vec::with_capacity(SHARDS);
+            for _ in 0..SHARDS {
+                shards.push(RwLock::new(Shard { keys: HashMap::default(), slots: Vec::new() }));
+            }
+            shards
+        })
+    }
+
+    fn shard(key: &K) -> usize {
+        let mut hash = FxHasher::default();
+        key.hash(&mut hash);
+        (hash.finish() >> 40) as usize % SHARDS
+    }
+
+    /// Recover an interned key for the context's kind-dispatching force function.
+    pub fn key(&self, index: u32) -> Option<K> {
+        let shard = &self.shards()[index as usize % SHARDS];
+        let shard = shard.read().unwrap_or_else(|e| e.into_inner());
+        Some(shard.slots.get(index as usize / SHARDS)?.key.clone())
+    }
+
+    pub fn query_id(&self, key: &K) -> Option<QueryId> {
+        let shard_index = Self::shard(key);
+        let shard = self.shards()[shard_index].read().unwrap_or_else(|e| e.into_inner());
+        let &slot = shard.keys.get(key)?;
+        Some(QueryId { kind: self.kind, key: slot * SHARDS as u32 + shard_index as u32 })
+    }
+
+    pub fn get(
+        &self,
+        engine: &QueryEngine,
+        key: K,
+        compute: &mut dyn FnMut(K) -> Result<V, QueryError>,
+        force: &dyn Fn(QueryId) -> Result<(), QueryError>,
+    ) -> Result<V, QueryError> {
+        self.bind(engine)?;
+        let shard_index = Self::shard(&key);
+        let shard_lock = &self.shards()[shard_index];
+        let found = {
+            let shard = shard_lock.read().unwrap_or_else(|e| e.into_inner());
+            match shard.keys.get(&key) {
+                Some(&slot_index) => {
+                    let slot = &shard.slots[slot_index as usize];
+                    if slot.verified_at == engine.revision() {
+                        let value = slot.value.as_ref().unwrap().clone();
+                        engine.read_index(slot.node);
+                        return Ok(value);
+                    }
+                    Some((slot_index, slot.node))
+                }
+                None => None,
+            }
+        };
+        let (slot_index, node) = match found {
+            Some(found) => found,
+            None => {
+                let fingerprint = (self.key_fingerprint)(&key);
+                let mut shard = shard_lock.write().unwrap_or_else(|e| e.into_inner());
+                match shard.keys.get(&key) {
+                    Some(&index) => (index, shard.slots[index as usize].node),
+                    None => {
+                        let index = u32::try_from(shard.slots.len()).expect("query key limit");
+                        let key_index =
+                            index.checked_mul(SHARDS as u32).and_then(|v| v.checked_add(shard_index as u32)).expect("query key limit");
+                        let node = engine.intern(QueryId { kind: self.kind, key: key_index }, fingerprint, false)?;
+                        shard.slots.push(Slot { key: key.clone(), value: None, verified_at: 0, node });
+                        shard.keys.insert(key.clone(), index);
+                        (index, node)
+                    }
+                }
+            }
+        };
+        engine.with_task(
+            node,
+            &mut || {
+                let value = compute(key.clone())?;
+                let fingerprint = (self.value_fingerprint)(&value);
+                shard_lock.write().unwrap_or_else(|e| e.into_inner()).slots[slot_index as usize].value = Some(value);
+                Ok(fingerprint)
+            },
+            force,
+        )?;
+        let value = {
+            let mut shard = shard_lock.write().unwrap_or_else(|e| e.into_inner());
+            let slot = &mut shard.slots[slot_index as usize];
+            let value = slot.value.as_ref().unwrap().clone();
+            slot.verified_at = engine.revision();
+            value
+        };
+        engine.read_index(node);
+        Ok(value)
+    }
+}
