@@ -237,16 +237,9 @@ pub struct Unit {
     /// Short-lived jobs reuse their compile inputs until the entire unit is released.
     /// Reclaiming individual bodies there only adds rebuild work to the load path.
     pub keep_compile_state: bool,
-    /// (code start, code len, slot) of every code body ever installed, in address order
-    /// (emit_code allocates upward): pc -> slot for the O3 sampler without a scan
-    pub code_index: Vec<(u64, u32, u32)>,
-    /// unwind info (callee-saved register saves, frame size, landing stubs) by code start
-    pub unwind_info: HashMap<u64, crate::rir::UnwindInfo>,
-    /// unwind trailers of code installed from the startup image, read in place there (code
-    /// start, trailer address and length; ascending): parsed by `unwind_at` when a frame of
-    /// that code unwinds. `image_keep` keeps the image mapped.
-    image_unwind: Vec<(u64, u64, u32)>,
-    image_keep: Option<std::sync::Arc<PcFiles>>,
+    /// which slot's code holds a pc, and how its frames unwind (a leaf lock: panics, unwinding
+    /// and faults read it on their own thread, without a unit call)
+    pub code: std::sync::RwLock<CodeTables>,
     pub prog: Program,
     pub tcx: Tcx,
     /// provided crates (provided.rs): crate index -> its shims
@@ -406,6 +399,76 @@ pub struct Stats {
     pub ctfe_data: u32,
     pub ctfe_code: u32,
     pub ctfe_ns: u64,
+}
+
+/// The code address tables (JIT_THREADS.md §2.10): which slot's code holds a pc and how its
+/// frames unwind. A leaf lock: installs write it for a few instructions, panics, unwinding,
+/// faults and the sampler read it on their own thread.
+#[derive(Default)]
+pub struct CodeTables {
+    /// (code start, code len, slot) of every code body ever installed, in address order
+    /// (emit_code allocates upward; sandbox code spaces lie below later unit code)
+    pub index: Vec<(u64, u32, u32)>,
+    /// unwind info (callee-saved register saves, frame size, landing stubs) by code start
+    pub unwind: HashMap<u64, crate::rir::UnwindInfo>,
+    /// unwind trailers of code installed from the startup image, read in place there (code
+    /// start, trailer address and length; ascending): parsed when a frame of that code
+    /// unwinds. `image_keep` keeps the image mapped.
+    image_unwind: Vec<(u64, u64, u32)>,
+    image_keep: Option<std::sync::Arc<PcFiles>>,
+}
+
+impl CodeTables {
+    fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<crate::rir::UnwindInfo>) {
+        if let Some(i) = unwind {
+            self.unwind.insert(at, i);
+        }
+        if self.index.last().map_or(true, |l| l.0 < at) {
+            self.index.push((at, len, id));
+        } else {
+            let k = self.index.partition_point(|x| x.0 < at);
+            self.index.insert(k, (at, len, id));
+        }
+    }
+
+    fn reserve(&mut self, n: usize) {
+        self.index.reserve(n);
+        self.image_unwind.reserve(n);
+    }
+
+    fn add_image_unwind(&mut self, at: u64, trailer: &'static [u8], pc_map: &PcMap) {
+        let e = (at, trailer.as_ptr() as u64, trailer.len() as u32);
+        if self.image_unwind.last().map_or(true, |l| l.0 < at) {
+            self.image_unwind.push(e);
+        } else {
+            let k = self.image_unwind.partition_point(|x| x.0 < at);
+            self.image_unwind.insert(k, e);
+        }
+        if self.image_keep.is_none() {
+            self.image_keep = pc_map.keep();
+        }
+    }
+
+    /// The code body holding `pc`: (start, len, slot).
+    pub fn entry_at(&self, pc: u64) -> Option<(u64, u32, u32)> {
+        let k = self.index.partition_point(|x| x.0 <= pc);
+        let e = *self.index.get(k.checked_sub(1)?)?;
+        (pc < e.0 + e.1 as u64).then_some(e)
+    }
+
+    pub fn slot_at(&self, pc: u64) -> Option<u32> {
+        self.entry_at(pc).map(|e| e.2)
+    }
+
+    /// The unwind info of the startup image code at `start` (its trailer, parsed now).
+    fn image_unwind_at(&self, start: u64) -> Option<crate::rir::UnwindInfo> {
+        let k = self.image_unwind.partition_point(|x| x.0 < start);
+        let &(at, t, n) = self.image_unwind.get(k)?;
+        if at != start {
+            return None;
+        }
+        unsafe { crate::rir::read_unwind_info(t, n as u64) }
+    }
 }
 
 // ------------------------------------------------------------ OS memory
@@ -860,8 +923,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         // profile replay (they name the slots as they install them)
         let eager = !(&*up).prog.skipped_files.is_empty() || perf_map_on() || crate::cache::trace_on() || t1prof_replay(&options);
         let n = crate::cache::prelink_unit(up, eager, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
-            u.code_index.reserve(slots.len());
-            u.image_unwind.reserve(slots.len());
+            u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
             u.start_order.reserve(slots.len());
             let mut arm = Vec::with_capacity(slots.len());
             let up: *mut Unit = u;
@@ -1326,7 +1388,7 @@ pub fn poisoned_note() -> Option<String> {
 pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
     let u = &*UNIT;
     let tname = os::thread::name(os::thread::current());
-    let at = info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| format!("{:#x}", info.frames.first().copied().unwrap_or(0)));
+    let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| format!("{:#x}", info.frames.first().copied().unwrap_or(0))));
     // a guarded run-time module call (std::relax::guard): the fault is contained to the call
     // and reported; the caller marks the module failed
     if GUARD_DEPTH.with(|g| g.get()) > 0 {
@@ -1334,7 +1396,7 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
         return false;
     }
     if FAULTS_FATAL.load(Ordering::Relaxed) {
-        let r = u.report(info);
+        let r = owner::call(owner::Class::Job, || u.report(info));
         eprintln!("relax: {} ({}, address {:#x}) in program code on thread '{}' at {}: the process ends (the fault may be the program's or a Relax miscompile; a crash report follows)\n  report: {}", info.kind, label, info.fault_addr, tname, at, r);
         return true;
     }
@@ -1352,7 +1414,7 @@ unsafe fn fatal_report(f: &os::fault::Fault) -> ! {
     let frames = collect_frames(f.fp, f.pc, false);
     let kind = if is_stack_fault(f.addr, f.sp) { "stack overflow" } else { "fault" };
     let info = PanicInfo { kind: kind.to_string(), message: format!("{} at {:#x}", f.label(), f.addr), site: u64::MAX, frames, fault_addr: f.addr, location: String::new() };
-    let r = (&*UNIT).report(&info);
+    let r = owner::call(owner::Class::Job, || (&*UNIT).report(&info));
     eprintln!("relax: fault on a thread without a recovery point, aborting\n  report: {}", r);
     std::process::abort()
 }
@@ -1643,7 +1705,6 @@ pub(crate) fn collect_frames(rbp: u64, pc: u64, pc_is_ret: bool) -> Vec<u64> {
 /// Reports a panic and leaves to the recovery point; with the register block of a panic
 /// trampoline (`regs`), the frames' cleanup pads run on the way (unwind_walk).
 fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret: u64, regs: *const u64) -> ! {
-    lock_unit();
     let frames = collect_frames(rbp, ret, true);
     let location = PANIC_LOC.with(|l| std::mem::take(&mut *l.borrow_mut()));
     let info = PanicInfo { kind: kind.to_string(), message, site, frames, fault_addr: fault, location };
@@ -1654,11 +1715,10 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         // start routine, a C callback -- aborts with "panic in a function that cannot
         // unwind": core/src/panicking.rs panic_cannot_unwind, mir_transform
         // abort_unwinding_calls.rs). The message goes first, then the report.
-        let r = unsafe { (&*UNIT).report(&info) };
+        let r = owner::call(owner::Class::Job, || unsafe { (&*UNIT).report(&info) });
         eprintln!("relax: {} on a thread without a recovery point: {}\n  panic in a function that cannot unwind, aborting\n  report: {}", kind, info.message, r);
         std::process::abort();
     }
-    unlock_unit();
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
         let mut v = f.borrow_mut();
@@ -1763,11 +1823,10 @@ fn raise_unwinding(kind: &str, message: String, site: u64, regs: *const u64) -> 
     let (rbp, ret) = unsafe { (*regs, *regs.add(1)) };
     let ctx = unsafe { *ctx_ptr() };
     if ctx != 0 && CLEANING.with(|c| c.get()) == ctx {
-        lock_unit();
         let frames = collect_frames(rbp, ret, true);
         let location = PANIC_LOC.with(|l| std::mem::take(&mut *l.borrow_mut()));
         let info = PanicInfo { kind: kind.to_string(), message, site, frames, fault_addr: 0, location };
-        let r = unsafe { (&*UNIT).report(&info) };
+        let r = owner::call(owner::Class::Job, || unsafe { (&*UNIT).report(&info) });
         eprintln!("relax: panic in a destructor during cleanup: {}\n  thread caused non-unwinding panic. aborting.\n  report: {}", info.message, r);
         std::process::abort();
     }
@@ -1791,8 +1850,8 @@ fn rt_resume_unwind(_a0: u64, _a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64, 
 unsafe fn unwind_walk(regs: *const u64) -> ! {
     let mut r = [0u64; REG_WORDS];
     std::ptr::copy_nonoverlapping(regs, r.as_mut_ptr(), REG_WORDS);
-    lock_unit();
     let u = &*UNIT;
+    let tables = u.code.read().unwrap_or_else(|e| e.into_inner());
     let mut target: Option<(u64, u64, u64)> = None;
     for _ in 0..100_000 {
         let (fp, ret) = (r[0], r[1]);
@@ -1800,18 +1859,11 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
             break;
         }
         let pc = ret.wrapping_sub(1);
-        let k = u.code_index.partition_point(|x| x.0 <= pc);
-        if k == 0 {
-            break;
-        }
-        let (start, len, _) = u.code_index[k - 1];
-        if pc >= start + len as u64 {
-            break;
-        }
+        let Some((start, _, _)) = tables.entry_at(pc) else { break };
         let image_info;
-        let info = match u.unwind_info.get(&start) {
+        let info = match tables.unwind.get(&start) {
             Some(i) => i,
-            None => match u.unwind_at(start) {
+            None => match tables.image_unwind_at(start) {
                 Some(i) => {
                     image_info = i;
                     &image_info
@@ -1835,7 +1887,7 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
         r[0] = *(fp as *const u64);
     }
     let land = u.rt.land;
-    unlock_unit();
+    drop(tables);
     match target {
         Some((fp, sp, pc)) => {
             CLEANING.with(|c| c.set(*ctx_ptr()));
@@ -2068,21 +2120,15 @@ pub(crate) fn fn_name_at(pc: u64) -> String {
 }
 
 /// A fault or the watchdog's interrupt on this thread (os::fault's handler): what to do with it.
-/// The handler reads the unit's tables: it waits out (or, for the watchdog, skips) a compile on
-/// another thread so they are not changing underneath it.
+/// The code tables are read under their own leaf lock; reports are unit calls. A watchdog kick
+/// on a thread inside the compiler (a unit call) is skipped.
 pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
-    if f.kind == os::fault::Kind::Watchdog {
-        if in_compile() || !try_lock_unit() {
-            return os::fault::Action::Ignore;
-        }
-    } else {
-        lock_unit();
+    if f.kind == os::fault::Kind::Watchdog && owner::is_owner() {
+        return os::fault::Action::Ignore;
     }
     ensure_altstack();
     (hooks.prepare)();
-    let a = unsafe { on_fault_locked(f, hooks) };
-    unlock_unit();
-    a
+    unsafe { on_fault_locked(f, hooks) }
 }
 
 unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
@@ -2444,10 +2490,7 @@ impl Unit {
             },
             retired: false,
             keep_compile_state: false,
-            code_index: Vec::new(),
-            unwind_info: HashMap::new(),
-            image_unwind: Vec::new(),
-            image_keep: None,
+            code: Default::default(),
             cold_users: HashMap::new(),
             retiers: HashMap::new(),
             frequency_profiles: HashMap::new(),
@@ -2592,19 +2635,15 @@ impl Unit {
 
     /// Records code at `at` in the address-ordered index (sandbox code spaces lie below later
     /// unit code: inserted in order).
-    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32) {
-        if self.code_index.last().map_or(true, |l| l.0 < at) {
-            self.code_index.push((at, len, id));
-        } else {
-            let k = self.code_index.partition_point(|x| x.0 < at);
-            self.code_index.insert(k, (at, len, id));
-        }
+    pub(crate) fn index_code(&mut self, at: u64, len: u32, id: u32, unwind: Option<crate::rir::UnwindInfo>) {
+        self.code.write().unwrap_or_else(|e| e.into_inner()).add(at, len, id, unwind);
     }
 
     /// Drops the index entries of code in [lo, hi) (a recycled sandbox code space).
     pub(crate) fn unindex_range(&mut self, lo: u64, hi: u64) {
-        self.code_index.retain(|x| x.0 < lo || x.0 >= hi);
-        self.unwind_info.retain(|a, _| *a < lo || *a >= hi);
+        let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
+        t.index.retain(|x| x.0 < lo || x.0 >= hi);
+        t.unwind.retain(|a, _| *a < lo || *a >= hi);
     }
 
     /// Reserves code memory without writing it (sandbox code spaces).
@@ -3633,23 +3672,9 @@ impl Unit {
         false
     }
 
+    /// The slot whose code (current, earlier or retired) holds `pc` (no unit call needed).
     pub fn find_fn(&self, pc: u64) -> Option<u32> {
-        for (i, f) in self.fns.iter().enumerate() {
-            if f.compiled && pc >= f.code && pc < f.code + f.code_len as u64 {
-                return Some(i as u32);
-            }
-            for (c, l, _, _) in &f.prev {
-                if pc >= *c && pc < *c + *l as u64 {
-                    return Some(i as u32);
-                }
-            }
-            for (c, l, _) in &f.retired {
-                if pc >= *c && pc < *c + *l as u64 {
-                    return Some(i as u32);
-                }
-            }
-        }
-        None
+        self.code.read().unwrap_or_else(|e| e.into_inner()).slot_at(pc)
     }
 
     /// Foreign fns declared in Relax core's `intrinsics*` modules become instructions.
@@ -4189,10 +4214,7 @@ impl Unit {
             Some(a) => a,
             None => self.emit_linked(code, relocs)?,
         };
-        if let Some(i) = info {
-            self.unwind_info.insert(at, i);
-        }
-        self.index_code(at, code.len() as u32, id);
+        self.index_code(at, code.len() as u32, id, info);
         let f = &mut self.fns[id as usize];
         if twin && f.compiled {
             crate::sandbox::note_dead(f.code_len as u64);
@@ -4280,19 +4302,13 @@ impl Unit {
     /// it at `at`): what `install` does for a first install outside a patch group, except the
     /// borrowck note (prelink_startup sends those in the background).
     pub(crate) fn install_prelinked(&mut self, id: u32, at: u64, len: u32, trailer: &'static [u8], pc_map: PcMap) {
-        if !trailer.is_empty() {
-            let e = (at, trailer.as_ptr() as u64, trailer.len() as u32);
-            if self.image_unwind.last().map_or(true, |l| l.0 < at) {
-                self.image_unwind.push(e);
-            } else {
-                let k = self.image_unwind.partition_point(|x| x.0 < at);
-                self.image_unwind.insert(k, e);
+        {
+            let mut t = self.code.write().unwrap_or_else(|e| e.into_inner());
+            if !trailer.is_empty() {
+                t.add_image_unwind(at, trailer, &pc_map);
             }
-            if self.image_keep.is_none() {
-                self.image_keep = pc_map.keep();
-            }
+            t.add(at, len, id, None);
         }
-        self.index_code(at, len, id);
         let f = &mut self.fns[id as usize];
         f.code = at;
         f.code_len = len;
@@ -4315,15 +4331,6 @@ impl Unit {
         self.exec_note(id, crate::exec_profile::AHEAD);
     }
 
-    /// The unwind info of the startup image code at `start` (its trailer, parsed now).
-    fn unwind_at(&self, start: u64) -> Option<crate::rir::UnwindInfo> {
-        let k = self.image_unwind.partition_point(|x| x.0 < start);
-        let &(at, t, n) = self.image_unwind.get(k)?;
-        if at != start {
-            return None;
-        }
-        unsafe { crate::rir::read_unwind_info(t, n as u64) }
-    }
 
     /// Rolls back every slot installed by patch group `gen`. Their cached RIR is dropped,
     /// so later inlining recompiles them from source (the agent's next edit).
@@ -8394,14 +8401,7 @@ fn sampled_freqs(f: &crate::rir::Func, h: &HashMap<u64, u32>) -> Vec<f32> {
 
 /// The source position of the instruction a JIT pc is in (current or retired code of its slot).
 fn pc_source_pos(u: &Unit, pc: u64) -> Option<u64> {
-    let k = u.code_index.partition_point(|x| x.0 <= pc);
-    if k == 0 {
-        return None;
-    }
-    let (start, len, id) = u.code_index[k - 1];
-    if pc >= start + len as u64 {
-        return None;
-    }
+    let (start, _, id) = u.code.read().unwrap_or_else(|e| e.into_inner()).entry_at(pc)?;
     let f = &u.fns[id as usize];
     let map = if pc >= f.code && pc < f.code + f.code_len as u64 {
         &f.pc_map
@@ -8599,9 +8599,7 @@ fn sampler_thread() {
                     let u = unsafe { &mut *up };
                     if !u.prog.session.options.no_block_freq && !t1prof_replay(&u.prog.session.options) {
                         for &os::sample::Sample { pc, weight } in &selfs {
-                            let k = u.code_index.partition_point(|x| x.0 <= pc);
-                            if k == 0 { continue; }
-                            let id = u.code_index[k - 1].2;
+                            let Some(id) = u.find_fn(pc) else { continue; };
                             let f = &u.fns[id as usize];
                             if pc < f.code || pc >= f.code + f.code_len as u64 { continue; }
                             let Some(pos) = pc_source_pos(u, pc) else { continue; };
@@ -8648,9 +8646,7 @@ fn sampler_thread() {
                         let mut pc_code = PC_CODE.lock().unwrap();
                         let pcm = pc_code.get_or_insert_with(std::collections::HashMap::new);
                         for &os::sample::Sample { pc, weight } in &selfs {
-                            let k = u.code_index.partition_point(|x| x.0 <= pc);
-                            if k > 0 && pc < u.code_index[k - 1].0 + u.code_index[k - 1].1 as u64 {
-                                let id = u.code_index[k - 1].2;
+                            if let Some(id) = u.find_fn(pc) {
                                 let f = &u.fns[id as usize];
                                 let t1 = !f.retired.is_empty();
                                 let e = m.entry(f.name.clone()).or_insert((0, t1, f.code_len));
@@ -8699,14 +8695,7 @@ fn sampler_thread() {
             let mut heat = HEAT.lock().unwrap();
             let counts = heat.get_or_insert_with(std::collections::HashMap::new);
             for &os::sample::Sample { pc, weight } in &pcs {
-                let k = u.code_index.partition_point(|x| x.0 <= pc);
-                if k == 0 {
-                    continue;
-                }
-                let (start, len, id) = u.code_index[k - 1];
-                if pc >= start + len as u64 {
-                    continue;
-                }
+                let Some(id) = u.find_fn(pc) else { continue };
                 unsafe { base_sampled(up, id) };
                 let c = counts.entry(id).or_insert(0);
                 let before = *c;
@@ -10284,11 +10273,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if sandboxed {
                     crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
                 }
-                if let Some(i) = info {
-                    u.unwind_info.insert(at, i);
-                }
                 // Twin spaces can precede the last host code in the address index.
-                u.index_code(at, code.len() as u32, id);
+                u.index_code(at, code.len() as u32, id, info);
                 if perf_map_on() {
                     perf_map(at, code.len(), &format!("{} [O3]", u.fns[id as usize].name));
                 }

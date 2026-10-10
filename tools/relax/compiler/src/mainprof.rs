@@ -141,9 +141,8 @@ pub fn write(u: &crate::jit::Unit) {
         if let Some(x) = names.get(&pc) {
             return x.clone();
         }
-        let k = u.code_index.partition_point(|x| x.0 <= pc);
-        let r = if k > 0 && pc < u.code_index[k - 1].0 + u.code_index[k - 1].1 as u64 {
-            (crate::syms::stable_fn_name(u, u.code_index[k - 1].2), true)
+        let r = if let Some(id) = u.find_fn(pc) {
+            (crate::syms::stable_fn_name(u, id), true)
         } else {
             (host_name(pc), false)
         };

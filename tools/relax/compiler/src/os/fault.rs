@@ -297,16 +297,14 @@ mod imp {
             eprintln!("relax: SIGABRT on thread '{}' (no JIT unit)", tname);
             return;
         }
-        // the unit may be locked by this very thread (an abort inside the compiler) or by another
-        if !crate::jit::try_lock_unit() {
-            eprintln!("relax: SIGABRT on thread '{}' while the compiler is busy on another thread", tname);
-            return;
-        }
         let frames = collect_frames(fp, pc, false);
         let info = PanicInfo { kind: "abort".to_string(), message: format!("SIGABRT (abort() called) on thread '{}'", tname), site: u64::MAX, frames, fault_addr: 0, location: String::new() };
-        let r = (&*UNIT).report(&info);
-        eprintln!("relax: abort on thread '{}'\n  report: {}", tname, r);
-        crate::jit::unlock_unit();
+        // the report is a unit call: none when the compiler is busy (this very thread may be
+        // the one aborting inside it)
+        match crate::owner::call_within(crate::owner::Class::Job, 0, || (&*UNIT).report(&info)) {
+            Some(r) => eprintln!("relax: abort on thread '{}'\n  report: {}", tname, r),
+            None => eprintln!("relax: SIGABRT on thread '{}' while the compiler is busy", tname),
+        }
     }
 
     /// RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:

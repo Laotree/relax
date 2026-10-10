@@ -372,10 +372,7 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
     let u = &mut *up;
     for (t, at, code, map, info) in built {
         crate::os::mem::write_code(at, &code);
-        if let Some(i) = info {
-            u.unwind_info.insert(at, i);
-        }
-        u.index_code(at, code.len() as u32, t);
+        u.index_code(at, code.len() as u32, t, info);
         let f = &mut u.fns[t as usize];
         let old = (f.code, f.code_len, std::mem::take(&mut f.pc_map), f.patch_gen);
         f.retired.push((old.0, old.1, old.2));
