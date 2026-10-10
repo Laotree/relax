@@ -312,6 +312,7 @@ fn provided() {
 
     // Splash VM registry -> relax inspect (vm list, script error events)
     relax_compiler::inspect::set_vm_provider(makepad_script::inspect_registry::summaries);
+    relax_compiler::inspect::set_script_stack_provider(makepad_script::inspect_registry::script_stack);
     makepad_script::inspect_registry::set_error_hook(relax_compiler::inspect::script_error_event);
 
     let args: Vec<String> = std::env::args().collect();

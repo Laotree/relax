@@ -29,6 +29,8 @@ struct Site {
     kind: Kind,
     slot: u32,
     label: String,
+    /// a breakpoint: how its argument words read (the hooked fn's parameters)
+    args: std::sync::OnceLock<ArgPlan>,
     /// the probe group (a site's patch generation; `rm` rolls the generation back)
     group: u32,
     hits: AtomicU64,
@@ -101,8 +103,120 @@ static PARKED: Mutex<Vec<std::sync::Arc<Parked>>> = Mutex::new(Vec::new());
 static GO: std::sync::Condvar = std::sync::Condvar::new();
 static PARK_IDS: AtomicU64 = AtomicU64::new(0);
 
+/// How the words a breakpoint receives map to the hooked fn's parameters: per parameter its name,
+/// its type as source spells it, and how many integer words it takes (0: passed in a float register,
+/// not received). `exact` is false when the words did not line up with the types (then only the
+/// raw words are shown).
+#[derive(Clone, Default)]
+struct ArgPlan {
+    params: Vec<(String, String, u8, Shape)>,
+    exact: bool,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    Signed(u8),
+    Unsigned(u8),
+    Bool,
+    Char,
+    Str,
+    Slice,
+    Pointer,
+    Other,
+}
+
+/// The parameters of slot `id` (on the owner) and how they map onto `f`'s integer parameter words.
+fn arg_plan(u: &crate::jit::Unit, id: u32, f: &crate::rir::Func) -> ArgPlan {
+    use crate::types::TyKind;
+    let crate::jit::FnKey::Inst(d, gargs) = &u.fns[id as usize].key else { return ArgPlan::default() };
+    let Some(sig) = u.tcx.fn_sig(&u.prog, *d) else { return ArgPlan::default() };
+    let mut names: Vec<String> = Vec::new();
+    {
+        let def = u.prog.def(*d);
+        let file = &u.prog.files[def.file as usize];
+        if let crate::ast::ItemKind::Fn(fsig, _, _) = &file.ast.item(def.item).kind {
+            if sig.self_kind != 0 {
+                names.push("self".into());
+            }
+            for p in file.ast.list(file.ast.fn_sig(*fsig).params) {
+                names.push(match file.ast.pat(p.pat) {
+                    crate::ast::Pat::Ident { name, .. } => file.text(*name).to_string(),
+                    _ => "_".into(),
+                });
+            }
+        }
+    }
+    let mut params = Vec::new();
+    let mut words = 0usize;
+    for (k, t) in sig.params.iter().enumerate() {
+        let t = u.tcx.tys.erase_regions(u.tcx.tys.subst(*t, gargs));
+        let text = crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t);
+        let (n, shape) = match u.tcx.tys.kind(t) {
+            TyKind::Bool => (1, Shape::Bool),
+            TyKind::Char => (1, Shape::Char),
+            TyKind::Float(_) => (0, Shape::Other),
+            TyKind::Int(p) => {
+                let s = format!("{:?}", p).to_lowercase();
+                let bits: u8 = s.trim_start_matches(|c| c == 'i' || c == 'u').parse().unwrap_or(64);
+                (1, if s.starts_with('i') { Shape::Signed(bits) } else { Shape::Unsigned(bits) })
+            }
+            TyKind::Ref(_, inner, _) | TyKind::Ptr(_, inner) => match u.tcx.tys.kind(*inner) {
+                TyKind::Str => (2, Shape::Str),
+                TyKind::Slice(_) | TyKind::Dyn(..) => (2, Shape::Slice),
+                _ => (1, Shape::Pointer),
+            },
+            _ => (1, Shape::Other),
+        };
+        words += n as usize;
+        params.push((names.get(k).cloned().unwrap_or_else(|| format!("arg{}", k)), text, n, shape));
+    }
+    let int_params = f.params.iter().filter(|v| Some(**v) != f.sret && f.vregs[v.0 as usize] == crate::rir::Cls::I).count();
+    ArgPlan { params, exact: int_params == words }
+}
+
+/// The breakpoint's argument words, decoded by the plan (scalars, pointers, &str read safely).
+fn args_json(plan: &ArgPlan, words: &[u64; 5]) -> String {
+    if !plan.exact {
+        let w: Vec<String> = words.iter().map(|x| format!("\"{:#x}\"", x)).collect();
+        let p: Vec<String> = plan.params.iter().map(|x| json_str(&format!("{}: {}", x.0, x.1))).collect();
+        return format!(",\"params\":[{}],\"arg_words\":[{}]", p.join(","), w.join(","));
+    }
+    let mut out = Vec::new();
+    let mut k = 0usize;
+    for (name, ty, n, shape) in &plan.params {
+        let v = |i: usize| words.get(k + i).copied();
+        let shown = match (*n, shape) {
+            (0, _) => "(float register)".to_string(),
+            _ if k + *n as usize > words.len() => "(not received)".to_string(),
+            (_, Shape::Bool) => (v(0).unwrap_or(0) & 1 != 0).to_string(),
+            (_, Shape::Char) => char::from_u32(v(0).unwrap_or(0) as u32).map(|c| format!("{:?}", c)).unwrap_or_else(|| "?".into()),
+            (_, Shape::Signed(b)) => {
+                let x = v(0).unwrap_or(0);
+                let sh = 64 - (*b as u32).min(64);
+                (((x << sh) as i64) >> sh).to_string()
+            }
+            (_, Shape::Unsigned(b)) => {
+                let x = v(0).unwrap_or(0);
+                (if *b >= 64 { x } else { x & ((1u64 << b) - 1) }).to_string()
+            }
+            (_, Shape::Str) => {
+                let (p, len) = (v(0).unwrap_or(0), v(1).unwrap_or(0));
+                match super::threads::read_mem(p, len.min(200) as usize) {
+                    Some(b) => format!("{:?}{}", String::from_utf8_lossy(&b), if len > 200 { format!(" (+{} bytes)", len - 200) } else { String::new() }),
+                    None => format!("<str {:#x} len {}>", p, len),
+                }
+            }
+            (_, Shape::Slice) => format!("<{:#x} len {}>", v(0).unwrap_or(0), v(1).unwrap_or(0)),
+            (_, Shape::Pointer) | (_, Shape::Other) => format!("{:#x}", v(0).unwrap_or(0)),
+        };
+        k += *n as usize;
+        out.push(format!("{{\"name\":{},\"type\":{},\"value\":{}}}", json_str(name), json_str(&short(ty, 80)), json_str(&shown)));
+    }
+    format!(",\"args\":[{}]", out.join(","))
+}
+
 rt_fn! {
-fn rt_inspect_break(i: u64) {
+fn rt_inspect_break(i: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) {
     let Some(s) = site(i) else { return };
     if !s.on.load(Relaxed) {
         return;
@@ -117,7 +231,18 @@ fn rt_inspect_break(i: u64) {
     super::events::emit(
         "break",
         &format!("K{}", id),
-        &format!("\"id\":\"K{}\",\"site\":\"B{}\",\"at\":{},\"thread\":{},\"tid\":\"T{}\",\"more\":[\"stacks thread=T{}\",\"continue K{}\"]", id, i, json_str(&s.label), json_str(&thread), p.os_id, p.os_id, id),
+        &format!(
+            "\"id\":\"K{}\",\"site\":\"B{}\",\"at\":{},\"thread\":{},\"tid\":\"T{}\"{}{},\"more\":[\"stacks thread=T{}\",\"continue K{}\"]",
+            id,
+            i,
+            json_str(&s.label),
+            json_str(&thread),
+            p.os_id,
+            s.args.get().map(|plan| args_json(plan, &[a0, a1, a2, a3, a4])).unwrap_or_default(),
+            super::script_stack_field("script_stack", me),
+            p.os_id,
+            id
+        ),
     );
     // parked until `continue` (or 10 minutes)
     let t0 = std::time::Instant::now();
@@ -191,21 +316,39 @@ fn pos_line(u: &crate::jit::Unit, p: u64) -> Option<u32> {
 
 /// Adds the probe calls to slot `id`'s RIR: `enter` (Some) at the entry or before the first
 /// instruction on `line`, `exit` before every return.
-fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, enter: (&'static str, u64), exit: Option<u64>, line: Option<u32>, hit: &mut bool) {
+fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, enter: (&'static str, u64), exit: Option<u64>, line: Option<u32>, with_args: bool, hit: &mut bool) {
     use crate::rir::{Callee, Inst, Term};
     let sym = |name: &'static str, addr: u64| u.syms.intern(crate::syms::SymKind::Rt(name), addr);
     let enter_sym = sym(enter.0, enter.1);
-    let call = |f: &mut crate::rir::Func, b: usize, at: usize, s: crate::rir::Sym, pos: u64| {
+    // a breakpoint also receives the fn's first five integer parameter words (zeros past them)
+    let words: Vec<crate::rir::VReg> = if with_args {
+        f.params.iter().copied().filter(|v| Some(*v) != f.sret && f.vregs[v.0 as usize] == crate::rir::Cls::I).take(5).collect()
+    } else {
+        Vec::new()
+    };
+    let call = |f: &mut crate::rir::Func, b: usize, at: usize, s: crate::rir::Sym, pos: u64, words: &[crate::rir::VReg]| {
         let v = f.vreg(crate::rir::Cls::I);
-        f.blocks[b].insts.insert(at, Inst::Call(Callee::Host(s), vec![v], Vec::new()));
+        let mut args = vec![v];
+        let mut consts = vec![(v, site as i64)];
+        if with_args {
+            args.extend_from_slice(words);
+            while args.len() < 6 {
+                let z = f.vreg(crate::rir::Cls::I);
+                consts.push((z, 0));
+                args.push(z);
+            }
+        }
+        f.blocks[b].insts.insert(at, Inst::Call(Callee::Host(s), args, Vec::new()));
         f.blocks[b].pos.insert(at, pos);
-        f.blocks[b].insts.insert(at, Inst::Iconst(v, site as i64));
-        f.blocks[b].pos.insert(at, pos);
+        for (r, c) in consts.into_iter().rev() {
+            f.blocks[b].insts.insert(at, Inst::Iconst(r, c));
+            f.blocks[b].pos.insert(at, pos);
+        }
     };
     match line {
         None => {
             let pos = f.blocks.first().and_then(|b| b.pos.first().copied()).unwrap_or(0);
-            call(f, 0, 0, enter_sym, pos);
+            call(f, 0, 0, enter_sym, pos, &words);
             *hit = true;
         }
         Some(l) => {
@@ -213,7 +356,7 @@ fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, enter: (&'sta
                 for k in 0..f.blocks[b].insts.len() {
                     let p = f.blocks[b].pos[k];
                     if pos_line(u, p) == Some(l) {
-                        call(f, b, k, enter_sym, p);
+                        call(f, b, k, enter_sym, p, &words);
                         *hit = true;
                         break 'found;
                     }
@@ -227,7 +370,7 @@ fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, enter: (&'sta
             if matches!(f.blocks[b].term, Term::Ret(_)) {
                 let at = f.blocks[b].insts.len();
                 let pos = f.blocks[b].term_pos;
-                call(f, b, at, xs, pos);
+                call(f, b, at, xs, pos, &[]);
             }
         }
     }
@@ -252,7 +395,7 @@ fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u3
         for (id, line, name) in found {
             let si = {
                 let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
-                sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
+                sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, args: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
                 sites.len() as u64 - 1
             };
             let (enter, exit) = match kind {
@@ -260,7 +403,18 @@ fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u3
                 Kind::Break => (("inspect_break", rt_inspect_break as *const () as u64), None),
             };
             let mut hit = false;
-            let r = unsafe { crate::jit::install_instrumented(up, id, gen, &mut |f, u| edit(f, u, si, enter, exit, line, &mut hit)) };
+            let with_args = kind == Kind::Break;
+            let site_ref = site(si);
+            let r = unsafe {
+                crate::jit::install_instrumented(up, id, gen, &mut |f, u| {
+                    if with_args {
+                        if let Some(s) = &site_ref {
+                            let _ = s.args.set(arg_plan(u, id, f));
+                        }
+                    }
+                    edit(f, u, si, enter, exit, line, with_args, &mut hit)
+                })
+            };
             match r {
                 Ok(_) if hit => {
                     ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(id);
@@ -323,6 +477,15 @@ fn remove(group: Option<u32>) -> Result<usize, String> {
 // ------------------------------------------------------------------ pause
 
 static PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// True when the thread is stopped for inspection: parked at a breakpoint or a panic, or a
+/// program thread while the program is paused (a thread not yet held by the pause sweep, at most
+/// 5 ms, may still move: the script stack read is then best effort).
+pub fn stopped(t: &super::threads::Thread) -> bool {
+    PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == t.os_id)
+        || super::events::panic_parked(t.os_id)
+        || (PAUSED.load(Relaxed) && program_thread(t))
+}
 
 /// Program threads (main and the threads the program started; not Relax's own, not inspect's).
 fn program_thread(t: &super::threads::Thread) -> bool {

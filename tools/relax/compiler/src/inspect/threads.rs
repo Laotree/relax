@@ -88,6 +88,41 @@ pub fn release_hold(s: &HoldSlot) {
     imp::release(s)
 }
 
+/// Up to `len` bytes of this process's memory at `addr`, or None where it is not readable (a
+/// read that fails instead of faulting: process_vm_readv / mach_vm_read_overwrite).
+pub fn read_mem(addr: u64, len: usize) -> Option<Vec<u8>> {
+    let mut v = vec![0u8; len];
+    if len == 0 {
+        return Some(v);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn syscall(n: i64, ...) -> i64;
+            fn getpid() -> i32;
+        }
+        let local = [v.as_mut_ptr() as usize, len];
+        let remote = [addr as usize, len];
+        let n = unsafe { syscall(310, getpid(), local.as_ptr(), 1u64, remote.as_ptr(), 1u64, 0u64) };
+        (n == len as i64).then_some(v)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn mach_vm_read_overwrite(task: u32, addr: u64, size: u64, data: u64, out: *mut u64) -> i32;
+        }
+        let mut got = 0u64;
+        let r = unsafe { mach_vm_read_overwrite(mach_task_self_, addr, len as u64, v.as_mut_ptr() as u64, &mut got) };
+        (r == 0 && got == len as u64).then_some(v)
+    }
+    #[cfg(windows)]
+    {
+        let _ = addr;
+        None
+    }
+}
+
 /// Pause: Mach suspend / resume of one thread (macOS; suspends nest); its run state.
 #[cfg(target_os = "macos")]
 pub use imp::{resume, running, suspend};

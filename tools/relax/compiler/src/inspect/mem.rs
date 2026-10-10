@@ -1,9 +1,10 @@
 //! `memory`: where the process's memory is and why, now and over time (DESIGN.md §5).
 //!
 //! One snapshot is a flat list of named byte counts (nodes, `/`-separated paths):
-//! - `rss/...`: the resident set split by what the OS says each mapping is (Linux smaps: the
-//!   heap, relax's named mappings, GPU driver mappings, the relax cache files, libraries, ...;
-//!   macOS: regions by their VM tag). These add up to the RSS.
+//! - `rss/...` (Linux): the resident set split by what smaps says each mapping is (the heap,
+//!   relax's named mappings, GPU driver mappings, the relax cache files, libraries, ...); these
+//!   add up to the RSS. `regions/...` (macOS): resident pages by VM tag, private vs shared --
+//!   shared file pages are counted whole, so they do not add up to the kernel's resident size.
 //! - `malloc/...`: the allocator's own view: in use, held free (the retention a trim returns).
 //! - `relax/...`: what Relax holds for the app: JIT code / data / statics, the burst arena, the
 //!   compiler's heap by subsystem when RELAX_MEM_REPORT counts it, structure sizes on request.
@@ -163,6 +164,9 @@ fn os_regions(s: &mut Snap) {
     let mut vm = [0u64; 24];
     let mut count: u32 = 38;
     if unsafe { task_info(task, 22, vm.as_mut_ptr(), &mut count) } == 0 {
+        // the resident size is the kernel's (the region walk below counts pages a file and other
+        // processes share too, so its parts do not add up to it)
+        s.add("rss", vm[2]);
         s.add("footprint", vm[18]);
         s.add("peak_rss", vm[3]);
         s.add("compressed", vm[15]);
@@ -192,8 +196,7 @@ fn os_regions(s: &mut Snap) {
             // SM_SHARED_ALIASED 7
             let shared = matches!(share_mode, 4 | 5 | 7);
             let cat = tag_name(info[5]);
-            s.add("rss", resident);
-            s.add(&format!("rss/{}/{}", if shared { "shared" } else { "private" }, cat), resident);
+            s.add(&format!("regions/{}/{}", if shared { "shared" } else { "private" }, cat), resident);
         }
         addr += size;
     }
@@ -385,7 +388,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     let mut rows: Vec<&(String, u64)> = snap.nodes.iter().filter(|x| x.0.contains('/') && x.1 >= 1 << 20).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (k, v) in rows.iter().take(n) {
-        let base = if k.starts_with("rss") { rss } else if k.starts_with("malloc") { inuse.max(1) } else { rss };
+        let base = if k.starts_with("malloc") { inuse.max(1) } else { rss };
         let delta = prev.as_ref().map(|p| p.iter().find(|x| &x.0 == k).map_or(*v as i64, |x| *v as i64 - x.1 as i64));
         let d = delta.filter(|d| d.unsigned_abs() >= 1 << 20).map(|d| format!(",\"since_last_mb\":{}", smb(d))).unwrap_or_default();
         out.line(&format!("{{\"node\":{},\"mb\":{},\"pct\":{:.0}{}}}", json_str(k), mb(*v), *v as f64 * 100.0 / base.max(1) as f64, d));

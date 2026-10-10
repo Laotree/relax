@@ -158,6 +158,7 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
 struct Parked {
     id: u64,
     seq: u64,
+    os_id: u64,
     /// 0 waiting, 1 resume as a panic, 2 retry the boundary's unit
     decision: AtomicU32,
 }
@@ -208,6 +209,11 @@ fn park_secs_unwatched() -> u64 {
 
 /// A panic is about to unwind on this (program) thread: park it if someone may want to look
 /// (jit.rs raise_with; not on the owner, not without a recovery point).
+/// True when `os_id` is a thread parked at a panic.
+pub fn panic_parked(os_id: u64) -> bool {
+    PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == os_id)
+}
+
 pub fn on_panic(info: &crate::jit::PanicInfo) {
     if !super::STARTED.load(Relaxed) || crate::owner::is_owner() {
         return;
@@ -235,13 +241,14 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
     let wait_s = if watched { 600 } else { park_secs_unwatched() };
     let boundary = innermost_boundary();
     let fields = format!(
-        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}],\"parked_s\":{},\"retry\":{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} panic\"]",
+        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}]{},\"parked_s\":{},\"retry\":{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} panic\"]",
         id,
         json_str(&info.kind),
         json_str(&super::short(&info.message, 400)),
         json_str(&location),
         json_str(&thread),
         fr.join(","),
+        super::script_stack_field("script_stack", me),
         wait_s,
         match &boundary {
             Some(b) => format!("{{\"reruns\":{},\"note\":\"side effects since it began may repeat\"}}", json_str(b)),
@@ -252,7 +259,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
     );
     let mut list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     let seq = emit("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, decision: AtomicU32::new(0) });
+    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), decision: AtomicU32::new(0) });
     list.push(p.clone());
     if !watched {
         eprintln!(

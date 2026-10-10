@@ -702,7 +702,10 @@ fn cmd_stacks(req: &Req, out: &mut Out) {
     for (key, members) in &groups {
         let names: Vec<String> = members.iter().map(|&i| json_str(&format!("{} (T{})", caps[i].t.name, caps[i].t.os_id))).collect();
         let c = &caps[members[0]];
-        let err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
+        let mut err = c.err.map(|e| format!(",\"err\":{}", json_str(e))).unwrap_or_default();
+        if c.t.handle != 0 && instrument::stopped(&c.t) {
+            err.push_str(&script_stack_field("script", c.t.handle));
+        }
         out.line(&format!("{{\"threads\":[{}],\"state\":\"{}\",\"frames\":[{}]{}}}", names.join(","), c.t.state, key.join(","), err));
     }
 }
@@ -739,6 +742,29 @@ pub fn set_vm_provider(f: fn() -> Vec<String>) {
 pub fn vm_summaries() -> Vec<String> {
     let f = *VM_PROVIDER.lock().unwrap_or_else(|e| e.into_inner());
     f.map(|f| f()).unwrap_or_default()
+}
+
+/// The Splash script stack of a thread (makepad-script, set by main.rs): only valid for a thread
+/// that is stopped (parked at a panic or breakpoint, or paused).
+static SCRIPT_STACK_PROVIDER: std::sync::Mutex<Option<fn(u64, usize) -> Option<Vec<String>>>> = std::sync::Mutex::new(None);
+
+pub fn set_script_stack_provider(f: fn(u64, usize) -> Option<Vec<String>>) {
+    *SCRIPT_STACK_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
+}
+
+/// The script frames (innermost first, at most 16) of the VM that the thread with pthread handle
+/// `thread` is evaluating; None when it is in no VM. The caller guarantees the thread is stopped.
+pub fn script_stack(thread: u64) -> Option<Vec<String>> {
+    let f = (*SCRIPT_STACK_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()))?;
+    f(thread, 16)
+}
+
+/// `,"<key>":[...]` for a stopped thread inside a VM, else an empty string.
+pub fn script_stack_field(key: &str, thread: u64) -> String {
+    match script_stack(thread) {
+        Some(v) if !v.is_empty() => format!(",\"{}\":[{}]", key, v.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")),
+        _ => String::new(),
+    }
 }
 
 /// A Splash script error (makepad-script's error hook): an agent's `scripterr` event.
