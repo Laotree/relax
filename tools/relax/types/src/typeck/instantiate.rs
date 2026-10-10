@@ -7,12 +7,13 @@ use super::*;
 /// individual reads (rustc_codegen_ssa/src/mir/mod.rs:129-139).
 pub(super) fn try_instantiate_mir_and_normalize_erasing_regions(prog: &Program, tcx: &Tcx, body: std::sync::Arc<Body>, args: &[TyId]) -> Result<std::sync::Arc<Body>, crate::next_solver::NoSolution> {
     if body.args == args { return Ok(body); }
-    try_normalize_body(prog, tcx, &body, args).map(std::sync::Arc::new)
+    try_normalize_body(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &body, args).map(std::sync::Arc::new)
 }
 
-/// Analysis consumers explicitly requesting normalized tables keep the fallible
-/// boundary even for identity substitutions (unresolved projections must fail).
-pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, body: &Body, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
+/// Analysis consumers normalize in the environment of the substituted arguments
+/// (rustc_middle/src/ty/normalize_erasing_regions.rs), even for identity
+/// substitutions. Unresolved projections still fail at this fallible boundary.
+pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, env: crate::tcx::TypingEnv, body: &Body, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
     static COUNTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *COUNTS.get_or_init(|| std::env::var_os("RELAX_BODY_COUNTS").is_some()) { eprintln!("body-count instantiate-clone"); }
     let mut b = body.clone();
@@ -21,8 +22,10 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, body: &Body, args: &
     let errors = &root_errors;
     // Const-param operands read this argument list. It is instantiated data,
     // and must cross the same normalization boundary as MIR operand constants.
-    b.args = args.iter().map(|&ty| tcx.try_normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), ty)).collect::<Result<Vec<_>, _>>()?;
-    b.param_env = None;
+    b.args = args.iter().map(|&ty| tcx.try_normalize_erasing_regions(prog, env, ty)).collect::<Result<Vec<_>, _>>()?;
+    // The body now uses the caller's parameters, including consts nested in
+    // types. Keep their clauses for subsequent borrowck type operations.
+    b.param_env = (env.param_env != crate::tcx::ParamEnvId::EMPTY).then_some(env.param_env);
     let indices = tcx.generic_indices_of(prog, body.def);
     let regions = tcx.tys.intern_region_args(&vec![crate::types::RegionId::ERASED; indices.lifetimes.len()]);
     let full = tcx.complete_args(prog, body.def, args, regions);
@@ -30,7 +33,7 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, body: &Body, args: &
     let mut s = |ty: TyId| {
         if let Some(&ty) = folded.get(&ty) { return Ok(ty); }
         let instantiated = crate::types::fold::EarlyBinder::bind(&tcx.tys, ty).instantiate(&tcx.tys, &indices, &full);
-        let result = tcx.try_normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(&prog), instantiated)?;
+        let result = tcx.try_normalize_erasing_regions(prog, env, instantiated)?;
         folded.insert(ty, result);
         Ok(result)
     };

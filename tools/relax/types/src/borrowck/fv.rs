@@ -122,7 +122,7 @@ pub fn summaries(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], de
     // ty/erase_regions.rs: retain generic arity and nested signature binders.
     let erased: Vec<_> = args.iter().map(|&ty| tcx.tys.erase_regions(ty)).collect();
     let args = erased.as_slice();
-    let key = (tx.cx.typing_env, d, args.to_vec());
+    let key = (tx.typing_env(), d, args.to_vec());
     if let Some((s, reach)) = tx.fv.cache.borrow().get(&key).cloned() {
         tx.fv.reached_by_callers(&reach);
         return s;
@@ -161,7 +161,8 @@ fn compute(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], depth: u
     // T10 (conform): generic callers can leave projections unnormalizable here.
     // normalize_erasing_regions.rs:172-186: failure means the existing unknown
     // summary, which keeps the whole borrow; definition-body summaries belong to T10.
-    let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::try_instantiate_body(&tx.cx, prog, tcx, d, args))) {
+    let cx = crate::tcx::EvalCx::new(prog, tcx, tx.typing_env(), tx.cx.state);
+    let body = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::typeck::try_instantiate_body(&cx, prog, tcx, d, args))) {
         Ok(Ok(b)) if b.errors.is_empty() && b.body.is_some() => b,
         Err(p) if crate::preempt::is_cancelled(&*p) => std::panic::resume_unwind(p),
         _ => return Vec::new(),
@@ -169,9 +170,10 @@ fn compute(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], depth: u
     let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
     let mut callee = Tx::new(prog, tcx, env, tx.cx.state);
     callee.fv = tx.fv.clone();
-    if body.args.iter().any(|a| matches!(tcx.tys.kind(*a), TyKind::Param(_))) {
-        callee.set_generic_env(body.def, body.args.len());
-    }
+    // These are caller arguments, not the callee's identity parameters. Its
+    // declaration environment would give them the wrong indices/bounds and
+    // lose ConstArgHasType clauses for consts nested inside type arguments.
+    callee.polymorphic.set(body.args.iter().any(|a| matches!(tcx.tys.kind(*a), TyKind::Param(_))));
     let tx = &callee;
     let mut b = super::build::Build::new(tx, &body, prog.def_path(d));
     let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

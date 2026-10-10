@@ -183,8 +183,8 @@ pub struct Body {
     /// the build that fails on it defers to the post-boot loader (jit.rs DEFERRED_RETRY) like
     /// the run that computed it. Loading a module republishes declarations, which recomputes it.
     pub deferred_misses: Vec<(u32, String)>,
-    /// the where-clauses of a body checked polymorphically (its ParamEnv): the borrow checker
-    /// answers impl queries on its params with it too (`DerefMut` of `D: DerefMut<Target = X>`)
+    /// Clauses for this body's parameter space: the declaration's environment
+    /// after typeck, or the caller's after instantiation for analysis.
     pub param_env: Option<crate::tcx::ParamEnvId>,
 }
 
@@ -416,7 +416,7 @@ pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, 
 
 /// rustc_middle/src/ty/normalize_erasing_regions.rs:172-186: normalization failure
 /// is a result for consumers that cannot require a fully monomorphic instance.
-pub(crate) fn try_instantiate_body(_cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
+pub(crate) fn try_instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Result<Body, crate::next_solver::NoSolution> {
     // Diagnostic only: sample one in N calls, including queries outside JIT scopes.
     // Keep this off for timing runs; symbolizing a backtrace is deliberately expensive.
     static SAMPLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -445,8 +445,8 @@ pub(crate) fn try_instantiate_body(_cx: &crate::tcx::EvalCx<'_>, prog: &Program,
     let cost_start = if crate::fncost::enabled() { (crate::fncost::mono(), crate::clock::cpu_ns()) } else { (0, 0) };
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
-    // Explicit normalization consumers retain the fallible PostAnalysis boundary.
-    let b = instantiate::try_normalize_body(prog, tcx, &body, args)?;
+    // Analysis uses the supplied environment; codegen supplies a monomorphic one.
+    let b = instantiate::try_normalize_body(prog, tcx, cx.typing_env, &body, args)?;
     if crate::fncost::enabled() {
         crate::fncost::type_detail(def.0, &args.iter().map(|a| a.0).collect::<Vec<_>>(), b.expr_ty.len(), &prog.def_path(def), cost_start.0, cost_start.1);
     }
