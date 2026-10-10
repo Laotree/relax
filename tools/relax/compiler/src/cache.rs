@@ -159,7 +159,7 @@ pub fn verify_front_images() {
 }
 const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints.
-const ENTRY_VERSION: u32 = 24;
+const ENTRY_VERSION: u32 = 25;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -367,7 +367,7 @@ pub struct Cache {
     /// Frozen before the first run-time crate mutates the boot's front end.
     collected_boot: Option<collected::CollectedBoot>,
     collected_committed: bool,
-    file_ids: HashMap<(String, u128), u32>,
+    file_ids: HashMap<(String, u128, u128), u32>,
     file_ids_n: usize,
     file_hash: HashMap<u32, u128>,
     /// data entry key -> address in this run
@@ -1063,7 +1063,7 @@ impl Cache {
     /// text, and a key naming them would mean other expressions in a run that booted from it
     /// (a warm Scope ran cached code calling `{closure#175197}`, which was no closure there:
     /// SIGILL). Code that names such a file's closures, sites or types is not cached.
-    fn enc_file(u: &Unit, file: u32, e: &mut E) -> Option<()> {
+    fn enc_file(&self, u: &Unit, file: u32, e: &mut E) -> Option<()> {
         if u.prog.is_edit_version(file) {
             return None;
         }
@@ -1071,9 +1071,14 @@ impl Cache {
             Some(p) => {
                 e.str(p);
                 e.u128(u.prog.files[file as usize].source_hash(p));
+                // A package's lib and bin parse one file separately: the same path and text, two
+                // crates, and rules that depend on the crate (the live layout of the root crate's
+                // enums) make their code differ. The owner is part of the identity.
+                e.u128(u.prog.file_crate.get(file as usize).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0));
             }
             None => {
                 e.str("");
+                e.u128(0);
                 e.u128(0);
             }
         }
@@ -1117,17 +1122,19 @@ impl Cache {
     fn dec_file(&mut self, u: &Unit, d: &mut D) -> Option<u32> {
         let path = d.str()?.to_string();
         let hash = d.u128()?;
+        let owner = d.u128()?;
         if self.file_ids_n != u.prog.file_paths.len() {
             for i in self.file_ids_n..u.prog.file_paths.len() {
                 // a live edit's version never: its ids are not a boot parse's (enc_file)
                 if u.prog.is_edit_version(i as u32) { continue; }
                 let p = &u.prog.file_paths[i];
                 // the first file with this content keeps the key (later identical copies are the same text)
-                self.file_ids.entry((p.clone(), u.prog.files[i].source_hash(p))).or_insert(i as u32);
+                let owner = u.prog.file_crate.get(i).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
+                self.file_ids.entry((p.clone(), u.prog.files[i].source_hash(p), owner)).or_insert(i as u32);
             }
             self.file_ids_n = u.prog.file_paths.len();
         }
-        self.file_ids.get(&(path, hash)).copied()
+        self.file_ids.get(&(path, hash, owner)).copied()
     }
 
     fn enc_def(&mut self, u: &Unit, d: DefId, e: &mut E, crates: &mut Vec<u32>) {
@@ -1260,7 +1267,7 @@ impl Cache {
             TyKind::Closure(file, expr, crate::types::ClosureArgs { parent_args: owner, closure_kind_ty, closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: state }) => {
                 e.u8(17);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
-                Self::enc_file(u, file, e)?;
+                self.enc_file(u, file, e)?;
                 e.u32(expr);
                 e.u64(self.closure_fp(u, file, expr)?);
                 self.enc_ty(u, closure_kind_ty, e, crates, depth + 1)?; self.enc_ty(u, sig, e, crates, depth + 1)?; self.enc_ty(u, state, e, crates, depth + 1)?;
@@ -1579,7 +1586,7 @@ impl Cache {
                 }
                 e.u8(1);
                 crates.push(u.prog.file_crate.get(file as usize).copied().unwrap_or(0));
-                Self::enc_file(u, file, e)?;
+                self.enc_file(u, file, e)?;
                 e.u32(expr);
                 e.u64(self.closure_fp(u, file, expr)?);
                 let pk = u.fns[parent as usize].key.clone();
@@ -1846,7 +1853,7 @@ impl Cache {
                 let sites = u.sites.lock().unwrap_or_else(|x| x.into_inner());
                 let st = sites.get(i as usize)?;
                 e.u8(6);
-                Self::enc_file(u, st.file, e)?;
+                self.enc_file(u, st.file, e)?;
                 e.u32(st.pos);
                 e.str(&st.msg);
             }
@@ -2248,7 +2255,7 @@ impl Cache {
         e.u32(files.len() as u32);
         for f in files {
             // a live edit's version: positions unknown to the next run (enc_file)
-            if Self::enc_file(u, f, &mut e).is_none() {
+            if self.enc_file(u, f, &mut e).is_none() {
                 e.str("");
                 e.u128(0);
             }
