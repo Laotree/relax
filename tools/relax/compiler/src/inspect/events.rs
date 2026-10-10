@@ -159,8 +159,10 @@ struct Parked {
     id: u64,
     seq: u64,
     os_id: u64,
-    /// 0 waiting, 1 resume as a panic, 2 retry the boundary's unit
+    /// 0 waiting, 1 resume as a panic, 2 retry the boundary's unit, 3 restart the restartable fn,
+    /// 4 make it return `words`
     decision: AtomicU32,
+    words: Mutex<Vec<u64>>,
 }
 
 // ---- retry boundaries (DESIGN.md §10b): makepad's event dispatch runs inside one while an agent
@@ -214,7 +216,7 @@ pub fn panic_parked(os_id: u64) -> bool {
     PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == os_id)
 }
 
-pub fn on_panic(info: &crate::jit::PanicInfo) {
+pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     if !super::STARTED.load(Relaxed) || crate::owner::is_owner() {
         return;
     }
@@ -240,8 +242,10 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
     let thread = if me == crate::jit::MAIN_TID.load(Relaxed) { "main".to_string() } else { crate::os::thread::name(me) };
     let wait_s = if watched { 600 } else { park_secs_unwatched() };
     let boundary = innermost_boundary();
+    // a restartable frame (`restartable <fn>`) on the stack: restart / return are offered
+    let restartable = if unwinds && info.kind == "panic" { super::instrument::restartable_in(&info.frames) } else { None };
     let fields = format!(
-        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}]{},\"parked_s\":{},\"retry\":{},\"more\":[\"stacks\",\"why-hung\",{}\"resume P{} panic\"]",
+        "\"id\":\"P{}\",\"kind\":{},\"message\":{},\"location\":{},\"thread\":{},\"frames\":[{}]{},\"parked_s\":{},\"retry\":{}{},\"more\":[\"stacks\",\"why-hung\",{}{}\"resume P{} panic\"]",
         id,
         json_str(&info.kind),
         json_str(&super::short(&info.message, 400)),
@@ -254,12 +258,25 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
             Some(b) => format!("{{\"reruns\":{},\"note\":\"side effects since it began may repeat\"}}", json_str(b)),
             None => "null".into(),
         },
+        match &restartable {
+            Some((_, name, rets)) => format!(
+                ",\"restart\":{{\"fn\":{},\"return_words\":{}}}",
+                json_str(&super::short(name, 160)),
+                rets.map_or("null".to_string(), |n| n.to_string())
+            ),
+            None => String::new(),
+        },
         if boundary.is_some() { format!("\"resume P{} retry\",", id) } else { String::new() },
+        match &restartable {
+            Some((_, _, Some(_))) => format!("\"resume P{} restart\",\"resume P{} return <value>\",", id, id),
+            Some(_) => format!("\"resume P{} restart\",", id),
+            None => String::new(),
+        },
         id
     );
     let mut list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     let seq = emit("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), decision: AtomicU32::new(0) });
+    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), decision: AtomicU32::new(0), words: Mutex::new(Vec::new()) });
     list.push(p.clone());
     if !watched {
         eprintln!(
@@ -277,8 +294,18 @@ pub fn on_panic(info: &crate::jit::PanicInfo) {
         list = RESUME.wait_timeout(list, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
-    if p.decision.load(SeqCst) == 2 && boundary.is_some() {
+    let decision = p.decision.load(SeqCst);
+    if decision == 2 && boundary.is_some() {
         let _ = RETRY.try_with(|r| r.set(true));
+    }
+    if restartable.is_none() && unwinds && watched && info.kind == "panic" {
+        super::instrument::auto_restartable(&info.frames);
+    }
+    if let (3 | 4, Some((slot, _, rets))) = (decision, &restartable) {
+        let words = std::mem::take(&mut *p.words.lock().unwrap_or_else(|e| e.into_inner()));
+        if decision == 3 || rets.is_some() {
+            super::instrument::set_pending(super::instrument::Pending { slot: *slot, mode: if decision == 3 { 1 } else { 2 }, words });
+        }
     }
 }
 
@@ -319,14 +346,37 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
     let decision = match how {
         "panic" => 1,
         "retry" => 2,
+        "restart" => 3,
+        "return" => 4,
         _ => {
-            out.err("resume <P<n>> panic | retry (restart / return come with probes)");
+            out.err("resume <P<n>> panic | retry | restart | return <value>[,<value>..]");
             return;
         }
     };
+    // return values: integers (decimal, 0x hex, negative), true / false, separated by commas
+    let mut words = Vec::new();
+    if decision == 4 {
+        let text: String = req.pos.iter().skip(2).cloned().collect::<Vec<_>>().join(",");
+        for w in text.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+            let v = match w {
+                "true" => Some(1u64),
+                "false" => Some(0),
+                _ if w.starts_with("0x") => u64::from_str_radix(&w[2..], 16).ok(),
+                _ => w.parse::<i64>().ok().map(|x| x as u64).or_else(|| w.parse::<u64>().ok()),
+            };
+            match v {
+                Some(v) => words.push(v),
+                None => {
+                    out.err(&format!("cannot read `{}` as a return value (integers, 0x.., true, false)", w));
+                    return;
+                }
+            }
+        }
+    }
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     match list.iter().find(|p| p.id == id) {
         Some(p) => {
+            *p.words.lock().unwrap_or_else(|e| e.into_inner()) = words;
             p.decision.store(decision, SeqCst);
             RESUME.notify_all();
             out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"{}\"}}", id, how));

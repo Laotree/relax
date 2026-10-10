@@ -1305,7 +1305,7 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         std::process::abort();
     }
     // relax inspect: a watched run parks the panic here, stack intact, until a client decides
-    crate::inspect::events::on_panic(&info);
+    crate::inspect::events::on_panic(&info, !regs.is_null());
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
         let mut v = f.borrow_mut();
@@ -1495,6 +1495,14 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
             leave(ctx_ptr(), 1)
         }
     }
+}
+
+/// relax inspect's restart / return: a frame's unwind landing ended the panic -- this thread
+/// is no longer unwinding and its panic is dropped.
+pub(crate) fn abandon_unwind() {
+    CLEANING.with(|c| c.set(0));
+    UNWINDING.with(|c| c.set(false));
+    PANIC.with(|p| *p.borrow_mut() = None);
 }
 
 rt_fn! {
@@ -4717,7 +4725,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
 
 /// RELAX_PERF_MAP=1: append `addr size name [tier]` (tier: B / O1 / O2 / O3) to /tmp/perf-<pid>.map so `perf report` names
 /// JIT code (Linux perf's JIT symbol convention).
-fn perf_map_on() -> bool {
+pub(crate) fn perf_map_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("RELAX_PERF_MAP").is_ok())
 }

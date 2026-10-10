@@ -163,7 +163,13 @@ mod imp {
 
     pub fn reserve(code: usize, rest: usize) -> u64 {
         let base = alloc_rw(code + rest);
-        crate::memstat::name_mapping(base as usize, code, c"relax-jit-code");
+        // perf names samples in anonymous memory from /tmp/perf-<pid>.map, but only for mappings
+        // it sees as anonymous ("//anon"): a prctl-named mapping ("[anon:relax-jit-code]") is a
+        // DSO to it, and the JIT's names would never appear. With the perf map on, the code
+        // stays unnamed.
+        if !crate::jit::perf_map_on() {
+            crate::memstat::name_mapping(base as usize, code, c"relax-jit-code");
+        }
         crate::memstat::name_mapping(base as usize + code, rest, c"relax-jit-data");
         if unsafe { mprotect(base as *mut u8, code, PROT_RWX) } != 0 {
             panic!("reservation: mprotect RWX failed");

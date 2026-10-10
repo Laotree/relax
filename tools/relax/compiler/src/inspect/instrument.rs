@@ -23,6 +23,8 @@ include!("../rt_abi.rs");
 enum Kind {
     Count,
     Break,
+    /// a panic through the fn can restart it or make it return (DESIGN.md §10b)
+    Restart,
 }
 
 struct Site {
@@ -31,6 +33,9 @@ struct Site {
     label: String,
     /// a breakpoint: how its argument words read (the hooked fn's parameters)
     args: std::sync::OnceLock<ArgPlan>,
+    /// a restart site: its return values' count when `return` can be offered (all integer-class,
+    /// not returned in memory), None when it cannot
+    returns: std::sync::OnceLock<Option<usize>>,
     /// the probe group (a site's patch generation; `rm` rolls the generation back)
     group: u32,
     hits: AtomicU64,
@@ -376,17 +381,262 @@ fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, enter: (&'sta
     }
 }
 
+// ------------------------------------------------------------------ restart / return
+
+/// A panic's resume decision for the innermost restartable frame of a slot (set by the parked
+/// panic's thread before it unwinds; consumed by that frame's unwind landing).
+#[derive(Clone)]
+pub struct Pending {
+    pub slot: u32,
+    /// 1 restart, 2 return
+    pub mode: u64,
+    pub words: Vec<u64>,
+}
+
+thread_local! {
+    static PENDING: std::cell::RefCell<Option<Pending>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_pending(p: Pending) {
+    let _ = PENDING.try_with(|x| *x.borrow_mut() = Some(p));
+}
+
+/// After a watched panic with no restartable frame: the innermost program frame (not std / core /
+/// alloc) becomes restartable in the background, so the next panic through it offers restart /
+/// return.
+pub fn auto_restartable(frames: &[u64]) {
+    let up = crate::jit::current_unit();
+    if up.is_null() {
+        return;
+    }
+    let u = unsafe { &*up };
+    let slot = frames.iter().filter_map(|&pc| u.find_fn(pc)).find(|&id| {
+        let n = &u.fns[id as usize].name;
+        !(n.starts_with("core::") || n.starts_with("std::") || n.starts_with("alloc::") || n.is_empty())
+    });
+    let Some(slot) = slot else { return };
+    if SITES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.kind == Kind::Restart && s.slot == slot && s.on.load(Relaxed)) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("relax-inspect-restartable".into()).spawn(move || {
+        super::heap::exclude_this_thread();
+        let _ = add_to(Kind::Restart, Target::Slot(slot), false);
+    });
+}
+
+/// The innermost restartable frame among a panic's frames (lookup pcs): (slot, fn, return words
+/// count when return is possible).
+pub fn restartable_in(frames: &[u64]) -> Option<(u32, String, Option<usize>)> {
+    let up = crate::jit::current_unit();
+    if up.is_null() {
+        return None;
+    }
+    let u = unsafe { &*up };
+    let sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    for &pc in frames {
+        let Some(slot) = u.find_fn(pc) else { continue };
+        if let Some(s) = sites.iter().find(|s| s.kind == Kind::Restart && s.slot == slot && s.on.load(Relaxed)) {
+            return Some((slot, s.label.clone(), s.returns.get().copied().flatten()));
+        }
+    }
+    None
+}
+
+rt_fn! {
+/// The unwind landing of a restartable frame: 0 unwind on, 1 restart the fn, 2 return the pending
+/// words. A decision taken here ends the unwinding (the panic is over).
+fn rt_inspect_unwind_decide(i: u64) -> u64 {
+    let Some(s) = site(i) else { return 0 };
+    let take = PENDING.try_with(|p| {
+        let mut p = p.borrow_mut();
+        match p.as_ref() {
+            Some(x) if x.slot == s.slot => p.take(),
+            _ => None,
+        }
+    });
+    match take {
+        Ok(Some(x)) => {
+            s.hits.fetch_add(1, Relaxed);
+            if x.mode == 2 {
+                let _ = RETURN_WORDS.try_with(|w| *w.borrow_mut() = x.words.clone());
+            }
+            crate::jit::abandon_unwind();
+            x.mode
+        }
+        _ => 0,
+    }
+}
+}
+
+thread_local! {
+    static RETURN_WORDS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+rt_fn! {
+/// The k-th word of an agent-supplied return value (0 past the given ones).
+fn rt_inspect_return_word(k: u64) -> u64 {
+    RETURN_WORDS.try_with(|w| w.borrow().get(k as usize).copied().unwrap_or(0)).unwrap_or(0)
+}
+}
+
+/// Rebuilds `f` so a panic through it lands in a decision block: unwind on, restart from the
+/// entry with the original arguments, or return agent-supplied words. Every call reachable on the
+/// normal path becomes an invoke whose unwind edge goes there (existing cleanup pads end there
+/// instead of resuming); the arguments are kept in copies made at entry. Returns the return-word
+/// count when `return` can be offered.
+fn edit_restart(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64) -> Option<usize> {
+    use crate::rir::{Callee, Cls, Cond, Inst, Term};
+    let nb = f.blocks.len();
+    // blocks on the normal path (entry, jumps, branches, invoke normal edges)
+    let mut normal = vec![false; nb];
+    let mut work = vec![0usize];
+    while let Some(b) = work.pop() {
+        if b >= nb || normal[b] {
+            continue;
+        }
+        normal[b] = true;
+        match &f.blocks[b].term {
+            Term::Jump(t) => work.push(*t as usize),
+            Term::Branch(_, t, e) => {
+                work.push(*t as usize);
+                work.push(*e as usize);
+            }
+            Term::Invoke(t, _) => work.push(*t as usize),
+            _ => {}
+        }
+    }
+    let pad = f.block();
+    // existing cleanup pads end in the decision instead of resuming
+    for b in 0..nb {
+        if !normal[b] && matches!(f.blocks[b].term, Term::Resume) {
+            f.blocks[b].term = Term::Jump(pad);
+        }
+    }
+    // every Relax-ABI call on the normal path that can unwind gets the decision as its unwind edge
+    let (land, resume) = (u.rs.land, u.rs.resume);
+    for b in 0..nb {
+        if !normal[b] {
+            continue;
+        }
+        let mut k = 0;
+        let mut cur = b;
+        loop {
+            let n = f.blocks[cur].insts.len();
+            let Some(at) = (k..n).find(|&i| matches!(&f.blocks[cur].insts[i], Inst::Call(Callee::Fn(_) | Callee::Indirect(_), _, _))
+                || matches!(&f.blocks[cur].insts[i], Inst::Call(Callee::Host(h), _, _) if *h != land && *h != resume)) else { break };
+            let last = at + 1 == n;
+            if last && matches!(f.blocks[cur].term, Term::Invoke(..)) {
+                break;
+            }
+            // split after the call: the rest moves to a new block, the call becomes an invoke
+            let rest_insts = f.blocks[cur].insts.split_off(at + 1);
+            let rest_pos = f.blocks[cur].pos.split_off(at + 1);
+            let next = f.block();
+            let term = std::mem::replace(&mut f.blocks[cur].term, Term::Invoke(next, pad));
+            let term_pos = f.blocks[cur].term_pos;
+            f.blocks[next as usize].insts = rest_insts;
+            f.blocks[next as usize].pos = rest_pos;
+            f.blocks[next as usize].term = term;
+            f.blocks[next as usize].term_pos = term_pos;
+            cur = next as usize;
+            k = 0;
+        }
+    }
+    // entry: argument copies, then the original entry (now a block of its own: block 0 keeps no
+    // predecessors)
+    let body = f.block();
+    let entry_insts = std::mem::take(&mut f.blocks[0].insts);
+    let entry_pos = std::mem::take(&mut f.blocks[0].pos);
+    let entry_term = std::mem::replace(&mut f.blocks[0].term, Term::Jump(body));
+    f.blocks[body as usize].insts = entry_insts;
+    f.blocks[body as usize].pos = entry_pos;
+    f.blocks[body as usize].term = entry_term;
+    f.blocks[body as usize].term_pos = f.blocks[0].term_pos;
+    // blocks that jumped to 0 (none should) now reach the body
+    let params = f.params.clone();
+    let mut saved = Vec::new();
+    for p in &params {
+        let c = f.vregs[p.0 as usize];
+        let v = f.vreg(c);
+        saved.push((v, *p));
+        f.blocks[0].insts.push(Inst::Mov(v, *p));
+        f.blocks[0].pos.push(0);
+    }
+    // the decision
+    let sym = |name: &'static str, addr: u64| u.syms.intern(crate::syms::SymKind::Rt(name), addr);
+    let decide = sym("inspect_unwind_decide", rt_inspect_unwind_decide as *const () as u64);
+    let sv = f.vreg(Cls::I);
+    let d = f.vreg(Cls::I);
+    let c1 = f.vreg(Cls::I);
+    let c2 = f.vreg(Cls::I);
+    let restart = f.block();
+    let second = f.block();
+    let resume_blk = f.block();
+    {
+        let b = &mut f.blocks[pad as usize];
+        b.insts.push(Inst::Iconst(sv, site as i64));
+        b.insts.push(Inst::Call(Callee::Host(decide), vec![sv], vec![d]));
+        b.insts.push(Inst::ICmpI(Cond::Eq, false, c1, d, 1));
+        b.pos.extend([0, 0, 0]);
+        b.term = Term::Branch(c1, restart, second);
+    }
+    for (v, p) in &saved {
+        f.blocks[restart as usize].insts.push(Inst::Mov(*p, *v));
+        f.blocks[restart as usize].pos.push(0);
+    }
+    f.blocks[restart as usize].term = Term::Jump(body);
+    f.blocks[resume_blk as usize].term = Term::Resume;
+    let returnable = f.sret.is_none() && f.cabi.is_none() && f.rets.iter().all(|c| *c == Cls::I);
+    if returnable {
+        let ret = f.block();
+        f.blocks[second as usize].insts.push(Inst::ICmpI(Cond::Eq, false, c2, d, 2));
+        f.blocks[second as usize].pos.push(0);
+        f.blocks[second as usize].term = Term::Branch(c2, ret, resume_blk);
+        let word = sym("inspect_return_word", rt_inspect_return_word as *const () as u64);
+        let mut rv = Vec::new();
+        for k in 0..f.rets.len() {
+            let kv = f.vreg(Cls::I);
+            let r = f.vreg(Cls::I);
+            let b = &mut f.blocks[ret as usize];
+            b.insts.push(Inst::Iconst(kv, k as i64));
+            b.insts.push(Inst::Call(Callee::Host(word), vec![kv], vec![r]));
+            b.pos.extend([0, 0]);
+            rv.push(r);
+        }
+        f.blocks[ret as usize].term = Term::Ret(rv);
+        Some(f.rets.len())
+    } else {
+        f.blocks[second as usize].term = Term::Jump(resume_blk);
+        None
+    }
+}
+
 /// Installs probes of `kind` for `query` (on the owner, within `ms`): (group, sites).
 fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u32)>), String> {
+    add_to(kind, Target::Query(query.to_string()), time)
+}
+
+enum Target {
+    Query(String),
+    Slot(u32),
+}
+
+fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, String, u32)>), String> {
     let up = crate::jit::current_unit();
     if up.is_null() {
         return Err("no running unit".into());
     }
-    let query = query.to_string();
+    let query = match &target {
+        Target::Query(q) => q.clone(),
+        Target::Slot(id) => format!("slot#{}", id),
+    };
     let group = NEXT_GROUP.fetch_add(1, SeqCst) as u32;
     let r = crate::owner::call_within(crate::owner::Class::App, 10_000, move || -> Result<(u32, Vec<(u64, String, u32)>), String> {
         let u = unsafe { &mut *up };
-        let found = find(u, &query, if kind == Kind::Break { 4 } else { 32 });
+        let found = match target {
+            Target::Query(ref q) => find(u, q, if kind == Kind::Break { 4 } else { 32 }),
+            Target::Slot(id) => vec![(id, None, u.fns[id as usize].name.clone())],
+        };
         if found.is_empty() {
             return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch)", query));
         }
@@ -395,12 +645,13 @@ fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u3
         for (id, line, name) in found {
             let si = {
                 let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
-                sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, args: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
+                sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, args: std::sync::OnceLock::new(), returns: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
                 sites.len() as u64 - 1
             };
             let (enter, exit) = match kind {
                 Kind::Count => (("inspect_enter", rt_inspect_enter as *const () as u64), time.then_some(rt_inspect_exit as *const () as u64)),
                 Kind::Break => (("inspect_break", rt_inspect_break as *const () as u64), None),
+                Kind::Restart => (("inspect_unwind_decide", rt_inspect_unwind_decide as *const () as u64), None),
             };
             let mut hit = false;
             let with_args = kind == Kind::Break;
@@ -411,6 +662,14 @@ fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u3
                         if let Some(s) = &site_ref {
                             let _ = s.args.set(arg_plan(u, id, f));
                         }
+                    }
+                    if kind == Kind::Restart {
+                        let n = edit_restart(f, u, si);
+                        if let Some(s) = &site_ref {
+                            let _ = s.returns.set(n);
+                        }
+                        hit = true;
+                        return;
                     }
                     edit(f, u, si, enter, exit, line, with_args, &mut hit)
                 })
@@ -574,23 +833,35 @@ mod pause_imp {
     }
 }
 
+fn site_letter(k: Kind) -> &'static str {
+    match k {
+        Kind::Count => "C",
+        Kind::Break => "B",
+        Kind::Restart => "R",
+    }
+}
+
 // ------------------------------------------------------------------ commands
 
 /// `count <fn> [time=1]` | `break <fn>|<file>:<line>` | `probes` | `rm <group|all>` |
 /// `continue [K<n>|all]` | `pause` | `resume`
 pub fn cmd(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
-        "count" | "break" => {
+        "count" | "break" | "restartable" => {
             let Some(q) = req.pos.first() else {
-                out.err("usage: count <fn> [time=1] | break <fn>|<file>:<line>");
+                out.err("usage: count <fn> [time=1] | break <fn>|<file>:<line> | restartable <fn>");
                 return;
             };
-            let kind = if req.cmd == "count" { Kind::Count } else { Kind::Break };
+            let kind = match req.cmd.as_str() {
+                "count" => Kind::Count,
+                "break" => Kind::Break,
+                _ => Kind::Restart,
+            };
             match add(kind, q, req.get("time") == Some("1")) {
                 Ok((group, sites)) => {
                     out.measured(&format!("probe group G{} installed ({} slot(s))", group, sites.len()), "owner: instrumented builds", &[]);
                     for (si, name, slot) in sites {
-                        out.line(&format!("{{\"site\":\"{}{}\",\"slot\":{},\"fn\":{}}}", if kind == Kind::Break { "B" } else { "C" }, si, slot, json_str(&short(&name, 160))));
+                        out.line(&format!("{{\"site\":\"{}{}\",\"slot\":{},\"fn\":{}}}", site_letter(kind), si, slot, json_str(&short(&name, 160))));
                     }
                     out.line(&format!("{{\"more\":[\"probes\",\"rm G{}\"{}]}}", group, if kind == Kind::Break { ",\"watch on=break\",\"continue all\"" } else { "" }));
                 }
@@ -607,7 +878,7 @@ pub fn cmd(req: &Req, out: &mut Out) {
                 let hits = s.hits.load(Relaxed);
                 let ns = s.ns.load(Relaxed);
                 let time = if ns > 0 { format!(",\"total_ms\":{:.3},\"per_call_us\":{:.3}", ns as f64 / 1e6, ns as f64 / 1e3 / hits.max(1) as f64) } else { String::new() };
-                out.line(&format!("{{\"site\":\"{}{}\",\"group\":\"G{}\",\"slot\":{},\"fn\":{},\"hits\":{}{}}}", if s.kind == Kind::Break { "B" } else { "C" }, i, s.group, s.slot, json_str(&short(&s.label, 160)), hits, time));
+                out.line(&format!("{{\"site\":\"{}{}\",\"group\":\"G{}\",\"slot\":{},\"fn\":{},\"hits\":{}{}}}", site_letter(s.kind), i, s.group, s.slot, json_str(&short(&s.label, 160)), hits, time));
             }
             let parked = PARKED.lock().unwrap_or_else(|e| e.into_inner());
             for p in parked.iter() {
