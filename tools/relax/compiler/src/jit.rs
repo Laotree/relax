@@ -2513,6 +2513,9 @@ impl Unit {
         // runtime symbols lowering interns on first use: a cached entry may name them before any
         // function of this run was lowered (the cache links them by name)
         let _ = u.syms.intern(crate::syms::SymKind::Rt("divrem128"), crate::lower::divrem128_addr());
+        for (name, addr) in ["wide_f32", "wide_f64"].into_iter().zip(crate::lower::wide_float_addrs()) {
+            let _ = u.syms.intern(crate::syms::SymKind::Rt(name), addr);
+        }
         let _ = u.syms.intern(crate::syms::SymKind::Rt("null"), 0);
         // RELAX_PERTURB: shift what code must not depend on (syms.rs reloc_sig)
         let n = crate::syms::perturb(options);

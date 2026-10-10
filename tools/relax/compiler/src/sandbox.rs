@@ -1217,7 +1217,7 @@ fn mask_thunk(f: u64) -> u64 {
 /// replaced by an arena-checked version.
 fn rt_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
     Some(match name {
-        "fmt_int" | "fmt_float" | "fmt_push" | "fmt_print" | "panicking" | "fmod" | "fmodf" | "null" | "panic_site" | "panic_bounds" | "panic_impl" | "resume" | "land" | "divrem128" => None,
+        "fmt_int" | "fmt_float" | "fmt_push" | "fmt_print" | "panicking" | "fmod" | "fmodf" | "null" | "panic_site" | "panic_bounds" | "panic_impl" | "resume" | "land" | "divrem128" | "wide_f32" | "wide_f64" => None,
         "fmt_str" => Some(("sb_fmt_str", sb_fmt_str as *const () as u64)),
         "fmt_pop" => Some(("sb_fmt_pop", sb_fmt_pop as *const () as u64)),
         "str_eq" => Some(("sb_str_eq", sb_str_eq as *const () as u64)),

@@ -7582,27 +7582,18 @@ impl<'a> Lcx<'a> {
                         Val::L(vec![d])
                     }
                     (true, TyKind::Float(_)) => {
-                        // hi * 2^64 + lo
+                        // Convert the complete integer with one rounding step. Converting
+                        // signed halves separately cancels small negatives to zero (or a
+                        // multiple of 2048); it also double-rounds large values and f32.
                         let p = self.wide_parts(v, xt);
                         let f64_ = self.is_f64(t);
-                        let lo = self.f.vreg(Cls::F64);
-                        self.emit(Inst::Conv(Conv::IntToF(IntTy { bits: 64, signed: false }, true), lo, p.0));
-                        let hi = self.f.vreg(Cls::F64);
-                        let signed = self.wide_signed(xt);
-                        self.emit(Inst::Conv(Conv::IntToF(IntTy { bits: 64, signed }, true), hi, p.1));
-                        let k = self.f.vreg(Cls::F64);
-                        self.emit(Inst::Fconst(k, 18446744073709551616.0f64.to_bits(), true));
-                        let m = self.f.vreg(Cls::F64);
-                        self.emit(Inst::FBin(FOp::Mul, true, m, hi, k));
-                        let s = self.f.vreg(Cls::F64);
-                        self.emit(Inst::FBin(FOp::Add, true, s, m, lo));
-                        if f64_ {
-                            Val::L(vec![s])
-                        } else {
-                            let d = self.f.vreg(Cls::F32);
-                            self.emit(Inst::Conv(Conv::F64ToF32, d, s));
-                            Val::L(vec![d])
-                        }
+                        let mode = self.iconst(self.wide_signed(xt) as i64);
+                        let name = if f64_ { "wide_f64" } else { "wide_f32" };
+                        let addr = wide_float_addrs()[f64_ as usize];
+                        let fs = self.u.syms.intern(crate::syms::SymKind::Rt(name), addr);
+                        let d = self.f.vreg(if f64_ { Cls::F64 } else { Cls::F32 });
+                        self.emit(Inst::Call(Callee::Host(fs), vec![mode, p.0, p.1], vec![d]));
+                        Val::L(vec![d])
                     }
                     (_, TyKind::Int(_)) if self.is_wide(t) && matches!(self.kind_ref(xt), TyKind::Int(_) | TyKind::Bool | TyKind::Char) => {
                         let (lo, hi) = self.wide_parts(v, xt);
@@ -11574,6 +11565,27 @@ struct WideRet {
 pub fn divrem128_addr() -> u64 {
     let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128;
     f as usize as u64
+}
+
+/// Scalar-only cast helpers, with the integer split to avoid a platform-specific i128 ABI.
+pub fn wide_float_addrs() -> [u64; 2] {
+    let f32_: rt_fn_ty!(fn(u64, u64, u64) -> f32) = rt_wide_f32;
+    let f64_: rt_fn_ty!(fn(u64, u64, u64) -> f64) = rt_wide_f64;
+    [f32_ as usize as u64, f64_ as usize as u64]
+}
+
+rt_fn! {
+fn rt_wide_f32(signed: u64, lo: u64, hi: u64) -> f32 {
+    let value = ((hi as u128) << 64) | lo as u128;
+    if signed != 0 { (value as i128) as f32 } else { value as f32 }
+}
+}
+
+rt_fn! {
+fn rt_wide_f64(signed: u64, lo: u64, hi: u64) -> f64 {
+    let value = ((hi as u128) << 64) | lo as u128;
+    if signed != 0 { (value as i128) as f64 } else { value as f64 }
+}
 }
 
 rt_fn! {
