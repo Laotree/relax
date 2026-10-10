@@ -7037,6 +7037,8 @@ pub fn rotate_loops(f: &mut Func) {
 /// another slot, both never escaping, reads the source slot instead when no write to the
 /// source can come between the copy and a read (moves of a big value through inlined
 /// calls: `Option<T>` unwrapped, passed and returned as copy chains of one 272-byte value).
+/// A source may also be a single call's result buffer. Disjoint destination writes keep
+/// their slot: only reads wholly within the copied prefix are redirected in that case.
 /// Returns whether any copy went.
 pub fn forward_slot_copies(f: &mut Func) -> bool {
     let ns = f.slots.len();
@@ -7046,12 +7048,23 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
     let mut any = false;
     // a chain resolves one link per round
     for _round in 0..8 {
-        let SlotScan { vs, esc, writes, rd_end, whole, .. } = slot_scan(f);
+        let SlotScan { vs, esc, writes, rd_end, whole, ret_call, .. } = slot_scan(f);
         let sl = |v: VReg| vs[v.0 as usize].0;
         const NONE: u32 = u32::MAX;
         // slots read at runtime offsets too (an array iterator's `data[start]`): only loads /
         // copies out through `slot + i`; their reads are events like the others
         let dynr = dyn_read_slots(f, &vs);
+        // Constant byte extent of an access; indexed accesses cannot be split safely.
+        let extent = |i: &Inst, write: bool| -> Option<(i64, i64)> {
+            let (base, off, n) = match (i, write) {
+                (Inst::Load(m, _, base, off), false) | (Inst::Store(m, base, off, _), true) => (*base, *off as i64, mem_size(*m) as i64),
+                (Inst::VLoad(_, base, off), false) | (Inst::VStore(base, off, _), true) => (*base, *off as i64, 16),
+                (Inst::Copy(d, s, n), _) => (if write { *d } else { *s }, 0, *n as i64),
+                _ => return None,
+            };
+            let start = vs[base.0 as usize].1.checked_add(off)?;
+            Some((start, start.checked_add(n)?))
+        };
         // reads / writes of each slot in program order: (block, inst, write)
         let mut ev: Vec<Vec<(u32, u32, bool)>> = vec![Vec::new(); ns];
         for (s2, reads) in dynr.iter().enumerate() {
@@ -7077,10 +7090,15 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
                 }
             }
         }
+        for (s, call) in ret_call.iter().enumerate() {
+            if let Some((bi, ii)) = *call {
+                ev[s].push((bi as u32, ii as u32, true));
+            }
+        }
         // one candidate per source slot per round (a copy of A into B and C both forwarded
         // keeps the analysis of A's writes simple)
         let mut used = vec![false; ns];
-        let mut repl: Vec<(u32, u32, usize, usize)> = Vec::new();
+        let mut repl: Vec<(u32, u32, usize, usize, Option<u32>)> = Vec::new();
         let nb = f.blocks.len();
         let mut seen = vec![0u32; nb];
         let mut stamp = 0u32;
@@ -7089,16 +7107,20 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
             // read outside the slot is undefined behaviour, so every read sees copied bytes)
             let dyn_ok = |n: u32| dynr[b].is_some() && n >= f.slots[b].size;
             let (cb, ci, a) = match whole[b] {
-                Some(w) if writes[b] == 1 && (!esc[b] || matches!(f.blocks[w.0].insts[w.1], Inst::Copy(_, _, n) if dyn_ok(n))) => w,
+                Some(w) if !esc[b] || matches!(f.blocks[w.0].insts[w.1], Inst::Copy(_, _, n) if dyn_ok(n)) => w,
                 _ => continue,
             };
-            if esc[a as usize] || used[a as usize] || used[b] {
+            if (esc[a as usize] && ret_call[a as usize].is_none()) || used[a as usize] || used[b] {
                 continue;
             }
-            if let Inst::Copy(_, _, n) = f.blocks[cb].insts[ci] {
-                if rd_end[b] > n as i64 && !dyn_ok(n) {
-                    continue;
-                }
+            let Inst::Copy(_, _, n) = f.blocks[cb].insts[ci] else { unreachable!() };
+            let partial = writes[b] != 1;
+            // runtime-offset reads have no constant extent: no partial forwarding with them
+            if partial && dynr[b].is_some() {
+                continue;
+            }
+            if !partial && rd_end[b] > n as i64 && !dyn_ok(n) {
+                continue;
             }
             // the events that matter, per block in order: A written (1), B read (2), the copy (3)
             let mut evs: Vec<(u32, u32, u8)> = Vec::new();
@@ -7107,10 +7129,30 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
                     evs.push((eb, ei, 1));
                 }
             }
+            let mut ok = true;
             for &(eb, ei, w) in &ev[b] {
+                if partial {
+                    if w && eb as usize == cb && ei as usize == ci {
+                        continue;
+                    }
+                    let Some((start, end)) = extent(&f.blocks[eb as usize].insts[ei as usize], w) else {
+                        ok = false;
+                        break;
+                    };
+                    if start >= n as i64 || end <= 0 {
+                        continue;
+                    }
+                    if w || start < 0 || end > n as i64 {
+                        ok = false;
+                        break;
+                    }
+                }
                 if !w {
                     evs.push((eb, ei, 2));
                 }
+            }
+            if !ok {
+                continue;
             }
             evs.push((cb as u32, ci as u32, 3));
             evs.sort_unstable();
@@ -7133,7 +7175,6 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
             };
             // dirtiness starts at A's writes and flows forward until the copy runs again
             stamp += 1;
-            let mut ok = true;
             let mut work: Vec<u32> = Vec::new();
             for e in &evs {
                 if e.2 == 1 {
@@ -7161,15 +7202,15 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
             if ok {
                 used[a as usize] = true;
                 used[b] = true;
-                repl.push((b as u32, a, cb, ci));
+                repl.push((b as u32, a, cb, ci, partial.then_some(n)));
             }
         }
         if repl.is_empty() {
             break;
         }
-        let mut to = vec![NONE; ns];
-        for &(b, a, ..) in &repl {
-            to[b as usize] = a;
+        let mut to = vec![(NONE, None); ns];
+        for &(b, a, _, _, prefix) in &repl {
+            to[b as usize] = (a, prefix);
         }
         let mut dels: Vec<(usize, usize)> = repl.iter().map(|r| (r.2, r.3)).collect();
         dels.sort_unstable_by(|x, y| y.cmp(x));
@@ -7182,9 +7223,45 @@ pub fn forward_slot_copies(f: &mut Func) -> bool {
         for blk in f.blocks.iter_mut() {
             for i in blk.insts.iter_mut() {
                 if let Inst::SlotAddr(_, s) = i {
-                    if to[*s as usize] != NONE {
-                        *s = to[*s as usize];
+                    if let (a, None) = to[*s as usize] {
+                        if a != NONE {
+                            *s = a;
+                        }
                     }
+                }
+            }
+        }
+        if repl.iter().any(|r| r.4.is_some()) {
+            for bi in 0..nb {
+                let insts = std::mem::take(&mut f.blocks[bi].insts);
+                let pos = std::mem::take(&mut f.blocks[bi].pos);
+                for (ii, mut i) in insts.into_iter().enumerate() {
+                    let range = extent(&i, false);
+                    let base = match &mut i {
+                        Inst::Load(_, _, base, _) | Inst::VLoad(_, base, _) | Inst::Copy(_, base, _) => Some(base),
+                        _ => None,
+                    };
+                    if let Some(base) = base {
+                        let (s, off) = vs[base.0 as usize];
+                        if s != NONE {
+                            if let (a, Some(n)) = to[s as usize] {
+                                if range.is_some_and(|(start, end)| start >= 0 && end <= n as i64) {
+                                    let t = f.vreg(Cls::I);
+                                    f.blocks[bi].insts.push(Inst::SlotAddr(t, a));
+                                    if let Some(&p) = pos.get(ii) { f.blocks[bi].pos.push(p); }
+                                    *base = t;
+                                    if off != 0 {
+                                        let t2 = f.vreg(Cls::I);
+                                        f.blocks[bi].insts.push(Inst::IBinI(IOp::Add, U64, t2, t, off));
+                                        if let Some(&p) = pos.get(ii) { f.blocks[bi].pos.push(p); }
+                                        *base = t2;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    f.blocks[bi].insts.push(i);
+                    if let Some(&p) = pos.get(ii) { f.blocks[bi].pos.push(p); }
                 }
             }
         }
@@ -7205,6 +7282,9 @@ struct SlotScan {
     rd_end: Vec<i64>,
     /// a copy into the slot's start from another slot's start: (block, inst, source slot)
     whole: Vec<Option<(usize, usize, u32)>>,
+    /// A ret slot escaping only into one call's arguments: (block, inst). `esc` stays
+    /// conservative for the other passes; forwarding counts this call as a write.
+    ret_call: Vec<Option<(usize, usize)>>,
 }
 
 fn slot_scan(f: &Func) -> SlotScan {
@@ -7258,6 +7338,9 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
         }
     }
     // per slot: escaped, write count, the one whole copy (block, inst, source slot)
+    // Poison a potential result-buffer call on any other escape or a second call.
+    const BAD_CALL: (usize, usize) = (usize::MAX, usize::MAX);
+    let mut ret_call = multi.iter().map(|&m| m.then_some(BAD_CALL)).collect::<Vec<_>>();
     let mut esc = multi;
     let mut writes = vec![0u32; ns];
     // end of the furthest byte read (a copy of fewer bytes than the slot holds -- its tail
@@ -7288,6 +7371,7 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
                     }
                     if sl(*x) != NONE {
                         esc[sl(*x) as usize] = true;
+                        ret_call[sl(*x) as usize] = Some(BAD_CALL);
                     }
                 }
                 Inst::Store(_, base, _, src) | Inst::VStore(base, _, src) => {
@@ -7296,6 +7380,7 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
                     }
                     if sl(*src) != NONE {
                         esc[sl(*src) as usize] = true;
+                        ret_call[sl(*src) as usize] = Some(BAD_CALL);
                     }
                 }
                 Inst::StoreX(_, base, x, _, _, src) => {
@@ -7305,6 +7390,7 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
                     for v in [x, src] {
                         if sl(*v) != NONE {
                             esc[sl(*v) as usize] = true;
+                            ret_call[sl(*v) as usize] = Some(BAD_CALL);
                         }
                     }
                 }
@@ -7325,12 +7411,33 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
                 // Vector promotion materializes the cells before entering a
                 // terminal block; calls there may observe or retain the address.
                 Inst::Call(..) if terminal_calls && matches!(b.term, Term::Unreachable) => {}
+                Inst::Call(c, args, _) => {
+                    for arg in args {
+                        let s = sl(*arg);
+                        if s != NONE {
+                            esc[s as usize] = true;
+                            let call = &mut ret_call[s as usize];
+                            *call = Some(match *call {
+                                None => (bi, ii),
+                                Some(at) if at == (bi, ii) => at,
+                                _ => BAD_CALL,
+                            });
+                        }
+                    }
+                    if let Callee::Indirect(v) | Callee::CIndirect(v, _) = c {
+                        if sl(*v) != NONE {
+                            esc[sl(*v) as usize] = true;
+                            ret_call[sl(*v) as usize] = Some(BAD_CALL);
+                        }
+                    }
+                }
                 Inst::SlotAddr(..) => {}
                 Inst::Mov(d, s) | Inst::IBinI(IOp::Add, _, d, s, _) if sl(*s) != NONE && sl(*d) == sl(*s) => {}
                 _ => {
                     for_uses(i, |v| {
                         if sl(v) != NONE {
                             esc[sl(v) as usize] = true;
+                            ret_call[sl(v) as usize] = Some(BAD_CALL);
                         }
                     });
                 }
@@ -7340,6 +7447,7 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
         for v in &tu {
             if sl(*v) != NONE {
                 esc[sl(*v) as usize] = true;
+                ret_call[sl(*v) as usize] = Some(BAD_CALL);
             }
         }
     }
@@ -7355,7 +7463,12 @@ fn slot_scan_inner(f: &Func, terminal_calls: bool) -> SlotScan {
             }
         }
     }
-    SlotScan { vs, esc, writes, reads, rd_end, whole }
+    for (s, call) in ret_call.iter_mut().enumerate() {
+        if !f.slots[s].ret || *call == Some(BAD_CALL) {
+            *call = None;
+        }
+    }
+    SlotScan { vs, esc, writes, reads, rd_end, whole, ret_call }
 }
 
 /// Replace a private, read-only stack copy of immutable data with the data's address.
@@ -9422,6 +9535,191 @@ pub fn sink_single_uses(f: &mut Func) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn slot_copy_fixture(ret: bool) -> (Func, [VReg; 5]) {
+        let mut f = Func::new("slot_copy".into(), 0);
+        let (sa, sb) = (f.slot(16, 8), f.slot(24, 8));
+        f.slots[sa as usize].ret = ret;
+        let regs = std::array::from_fn(|_| f.vreg(Cls::I));
+        let [a, b, k, x, y] = regs;
+        f.params.push(k);
+        f.rets = vec![Cls::I, Cls::I];
+        f.block();
+        f.blocks[0].insts = vec![
+            Inst::SlotAddr(a, sa), Inst::SlotAddr(b, sb),
+            if ret { Inst::Call(Callee::Fn(7), vec![a], vec![]) } else { Inst::Store(Mem::Int(8, false), a, 0, k) },
+            Inst::Copy(b, a, 16),
+            Inst::Load(Mem::Int(8, false), x, b, 0), Inst::Load(Mem::Int(8, false), y, b, 8),
+        ];
+        f.blocks[0].term = Term::Ret(vec![x, y]);
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        (f, regs)
+    }
+
+    #[test]
+    fn slot_copies_forward_private_and_single_call_result_slots() {
+        for ret in [false, true] {
+            let (mut f, [a, b, _, _, _]) = slot_copy_fixture(ret);
+            let scan = slot_scan(&f);
+            assert_eq!(scan.esc[0], ret); // other slot passes still see the call escape
+            assert_eq!(scan.ret_call[0], ret.then_some((0, 2)));
+            let mut expected = f.blocks[0].insts.clone();
+            expected.remove(3);
+            expected[1] = Inst::SlotAddr(b, 0);
+            assert!(forward_slot_copies(&mut f));
+            assert_eq!(f.blocks[0].insts, expected);
+            let scan = slot_scan(&f);
+            assert_eq!(scan.vs[a.0 as usize], (0, 0));
+            assert_eq!(scan.vs[b.0 as usize], (0, 0));
+            assert!(f.blocks[0].insts.iter().filter_map(|i| match i {
+                Inst::Load(_, _, base, _) => Some(scan.vs[base.0 as usize].0),
+                _ => None,
+            }).all(|s| s == 0));
+            assert_eq!(f.blocks[0].insts.len(), f.blocks[0].pos.len());
+            f.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn slot_copies_keep_a_result_passed_to_two_calls() {
+        let (mut f, [a, _, _, _, _]) = slot_copy_fixture(true);
+        // Two calls before the copy: this must reject even though neither dirties a read.
+        f.blocks[0].insts.insert(3, Inst::Call(Callee::Fn(8), vec![a], vec![]));
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        let before = f.blocks[0].insts.clone();
+        assert!(!forward_slot_copies(&mut f));
+        assert_eq!(f.blocks[0].insts, before);
+        f.verify().unwrap();
+    }
+
+    #[test]
+    fn slot_copies_forward_only_the_prefix_with_a_tail_store() {
+        let (mut f, [a, b, k, x, y]) = slot_copy_fixture(false);
+        f.blocks[0].insts.insert(4, Inst::Store(Mem::Int(8, false), b, 16, k));
+        f.blocks[0].insts[6] = Inst::Load(Mem::Int(8, false), y, b, 16);
+        // A source write after the forwarded read must not block the remaining tail read.
+        f.blocks[0].insts.insert(6, Inst::Store(Mem::Int(8, false), a, 0, k));
+        f.blocks[0].pos = (0..f.blocks[0].insts.len() as u64).collect();
+        assert!(forward_slot_copies(&mut f));
+        let scan = slot_scan(&f);
+        assert_eq!(scan.vs[b.0 as usize], (1, 0));
+        for (i, &pos) in f.blocks[0].insts.iter().zip(&f.blocks[0].pos) {
+            match i {
+                Inst::Load(_, d, base, off) if *d == x => {
+                    assert_eq!((scan.vs[base.0 as usize], *off, pos), ((0, 0), 0, 5));
+                }
+                Inst::Load(_, d, base, off) if *d == y => {
+                    assert_eq!((scan.vs[base.0 as usize], *off, pos), ((1, 0), 16, 7));
+                }
+                Inst::SlotAddr(_, 0) if pos != 0 => assert_eq!(pos, 5),
+                Inst::Store(_, base, 16, _) => assert_eq!(scan.vs[base.0 as usize], (1, 0)),
+                Inst::Copy(..) => panic!("prefix copy survived"),
+                _ => {}
+            }
+        }
+        assert_eq!(f.blocks[0].insts.len(), f.blocks[0].pos.len());
+        f.verify().unwrap();
+    }
+
+    #[test]
+    fn slot_copies_keep_an_overwritten_prefix() {
+        let (mut f, [_, b, k, _, _]) = slot_copy_fixture(false);
+        f.blocks[0].insts.insert(4, Inst::Store(Mem::Int(8, false), b, 8, k));
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        let before = f.blocks[0].insts.clone();
+        assert!(!forward_slot_copies(&mut f));
+        assert_eq!(f.blocks[0].insts, before);
+        f.verify().unwrap();
+    }
+
+    #[test]
+    fn slot_copies_keep_reads_after_a_source_write() {
+        for ret in [false, true] {
+            for partial in [false, true] {
+                let (mut f, [a, b, k, _, _]) = slot_copy_fixture(ret);
+                if ret {
+                    // Move the sole result-buffer call between the copy and the read.
+                    f.blocks[0].insts.swap(2, 3);
+                } else {
+                    f.blocks[0].insts.insert(4, Inst::Store(Mem::Int(8, false), a, 0, k));
+                }
+                if partial { f.blocks[0].insts.push(Inst::Store(Mem::Int(8, false), b, 16, k)); }
+                f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+                let before = f.blocks[0].insts.clone();
+                assert!(!forward_slot_copies(&mut f));
+                assert_eq!(f.blocks[0].insts, before);
+                f.verify().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn slot_copies_keep_noncall_escapes_and_unmarked_call_buffers() {
+        for escape in 0..4 {
+            let (mut f, [a, _, k, _, _]) = slot_copy_fixture(true);
+            match escape {
+                0 => f.slots[0].ret = false,
+                1 => f.blocks[0].insts.push(Inst::Store(Mem::Int(8, false), k, 0, a)),
+                2 => {
+                    let cmp = f.vreg(Cls::I);
+                    f.blocks[0].insts.push(Inst::ICmpI(Cond::Eq, false, cmp, a, 0));
+                }
+                _ => f.blocks[0].term = Term::Ret(vec![a, k]),
+            }
+            f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+            let before = f.blocks[0].insts.clone();
+            assert!(!forward_slot_copies(&mut f));
+            assert_eq!(f.blocks[0].insts, before);
+            f.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn slot_copies_keep_straddling_and_indexed_accesses() {
+        for access in 0..4 {
+            let (mut f, [_, b, k, x, _]) = slot_copy_fixture(false);
+            f.blocks[0].insts.insert(4, Inst::Store(Mem::Int(8, false), b, 16, k));
+            match access {
+                0 => f.blocks[0].insts[5] = Inst::Load(Mem::Int(8, false), x, b, 12),
+                1 => f.blocks[0].insts[5] = Inst::LoadX(Mem::Int(8, false), x, b, k, 0, 16),
+                2 => f.blocks[0].insts[4] = Inst::StoreX(Mem::Int(8, false), b, k, 0, 16, k),
+                _ => f.blocks[0].insts.push(Inst::Copy(k, b, 24)),
+            }
+            f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+            let before = f.blocks[0].insts.clone();
+            assert!(!forward_slot_copies(&mut f));
+            assert_eq!(f.blocks[0].insts, before);
+            f.verify().unwrap();
+        }
+    }
+
+    #[test]
+    fn slot_copies_forward_derived_vector_and_copy_reads_with_a_tail_copy() {
+        let (mut f, [_, b, k, x, _]) = slot_copy_fixture(false);
+        let (field, tail, vector) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::V128));
+        f.blocks[0].insts.splice(4..5, [
+            Inst::IBinI(IOp::Add, U64, tail, b, 16), Inst::Copy(tail, k, 8),
+            Inst::IBinI(IOp::Add, U64, field, b, 8), Inst::Load(Mem::Int(8, false), x, field, 0),
+            Inst::VLoad(vector, b, 0), Inst::Copy(k, field, 8),
+        ]);
+        f.blocks[0].pos = vec![0; f.blocks[0].insts.len()];
+        assert!(forward_slot_copies(&mut f));
+        let scan = slot_scan(&f);
+        assert_eq!(scan.vs[b.0 as usize], (1, 0));
+        assert_eq!(scan.vs[tail.0 as usize], (1, 16));
+        for i in &f.blocks[0].insts {
+            match i {
+                Inst::Load(_, d, base, 0) if *d == x => assert_eq!(scan.vs[base.0 as usize], (0, 8)),
+                Inst::VLoad(_, base, 0) => assert_eq!(scan.vs[base.0 as usize], (0, 0)),
+                Inst::Copy(d, src, 8) if *d == k => assert_eq!(scan.vs[src.0 as usize], (0, 8)),
+                Inst::Copy(d, src, 8) => assert_eq!((*d, *src), (tail, k)),
+                Inst::Copy(..) => panic!("prefix copy survived"),
+                _ => {}
+            }
+        }
+        assert_eq!(f.blocks[0].insts.len(), f.blocks[0].pos.len());
+        f.verify().unwrap();
+    }
 
     #[test]
     fn dests_x_moves_one_slot_per_round_into_the_result_buffer() {
