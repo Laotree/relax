@@ -659,8 +659,8 @@ impl Names {
             if !value.targets.is_empty() {
                 found = true;
                 out.insert(p);
-                out.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string()));
-                out.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
+                out.extend(value.targets.iter().map(|id| self.bindings.spelling(id).to_string()));
+                out.extend(value.via.iter().map(|id| self.bindings.spelling(id).to_string()));
             }
         }
         // Rust file selection has no forced core: an unbound first segment
@@ -672,8 +672,8 @@ impl Names {
             let value = self.binding(&p);
             if !value.targets.is_empty() {
                 out.insert(p);
-                out.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string()));
-                out.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
+                out.extend(value.targets.iter().map(|id| self.bindings.spelling(id).to_string()));
+                out.extend(value.via.iter().map(|id| self.bindings.spelling(id).to_string()));
             }
         }
         out
@@ -713,7 +713,7 @@ impl Names {
             loop {
                 let value = self.binding(&format!("{scope}::{}", path[0].borrow()));
                 if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
-                    result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string())); result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
+                    result.extend(value.targets.iter().map(|id| self.bindings.spelling(id).to_string())); result.extend(value.via.iter().map(|id| self.bindings.spelling(id).to_string()));
                 }
                 let Some((parent, _)) = scope.rsplit_once("::") else { break; };
                 scope = parent;
@@ -723,8 +723,8 @@ impl Names {
                 for krate in ["std", "core", "alloc"] {
                     let value = self.binding(&format!("{krate}::{}", path[0].borrow()));
                     if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
-                        result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string()));
-                        result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
+                        result.extend(value.targets.iter().map(|id| self.bindings.spelling(id).to_string()));
+                        result.extend(value.via.iter().map(|id| self.bindings.spelling(id).to_string()));
                         break;
                     }
                 }
@@ -936,7 +936,7 @@ impl Names {
                         // `resolve` carries the modules on the reexport route
                         // as well as the imported declaration. Only terminal
                         // declarations determine the imported namespace.
-                        let targets = candidates.iter().flat_map(|name| self.binding(name).targets)
+                        let targets = candidates.iter().flat_map(|name| self.binding(name).targets.iter().collect::<Vec<_>>())
                             .filter(|target| !self.modules.contains(self.bindings.spelling(*target))).collect::<BTreeSet<_>>();
                         if !targets.is_empty() && targets.iter().all(|target| self.type_symbols.contains(self.bindings.spelling(*target))
                             && !self.value_symbols.contains(self.bindings.spelling(*target)) && !self.macros.contains(self.bindings.spelling(*target))) {
@@ -1089,7 +1089,7 @@ impl Names {
                         else {
                             for target in targets {
                                 let value = self.binding(&format!("{target}::{}", path[1..].join("::")));
-                                if !value.targets.is_empty() { resolved.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string())); resolved.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string())); resolved.insert(target.clone()); }
+                                if !value.targets.is_empty() { resolved.extend(value.targets.iter().map(|id| self.bindings.spelling(id).to_string())); resolved.extend(value.via.iter().map(|id| self.bindings.spelling(id).to_string())); resolved.insert(target.clone()); }
                             }
                         }
                     }

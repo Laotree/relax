@@ -4,25 +4,41 @@ use crate::fxhash::HashMap;
 use std::sync::{Arc, OnceLock};
 
 /// A sorted set of binding ids. Ids are 32-bit (a graph has far fewer than 2^32 names): a
-/// set is half the bytes it was with `usize`, and a grown set holds exactly its elements
-/// (the planner keeps millions of them until the graph is recorded).
-#[derive(Clone, Default, PartialEq, Eq)]
+/// set is half the bytes it was with `usize`; up to four ids live inline (58% of a Calculator's
+/// non-empty sets are two or three, and the planner keeps millions until the graph is recorded,
+/// each otherwise a heap block), and a larger set holds exactly its elements. Canonical: `Small`
+/// iff at most four ids, its unused slots zero, so the derived equality is set equality.
+#[derive(Clone, PartialEq, Eq)]
 pub enum Names {
-    #[default]
-    Empty,
-    One(u32),
-    Many(Vec<u32>),
+    Small(u8, [u32; 4]),
+    Many(Box<[u32]>),
 }
+impl Default for Names {
+    fn default() -> Self { Self::Small(0, [0; 4]) }
+}
+const INLINE: usize = 4;
 fn id32(value: usize) -> u32 {
     u32::try_from(value).expect("binding ids fit 32 bits")
 }
 impl Names {
+    pub fn one(value: usize) -> Self { Self::Small(1, [id32(value), 0, 0, 0]) }
+    /// The canonical set of sorted, distinct `ids`.
+    fn from_ids(ids: &[u32]) -> Self {
+        if ids.len() <= INLINE {
+            let mut small = [0; INLINE];
+            small[..ids.len()].copy_from_slice(ids);
+            Self::Small(ids.len() as u8, small)
+        } else {
+            Self::Many(ids.into())
+        }
+    }
     fn slice(&self) -> &[u32] {
-        match self { Self::Empty => &[], Self::One(value) => std::slice::from_ref(value), Self::Many(values) => values }
+        match self { Self::Small(len, ids) => &ids[..*len as usize], Self::Many(values) => values }
     }
     /// `values` sorted ascending without duplicates.
-    pub fn from_sorted(mut values: Vec<usize>) -> Self {
-        match values.len() { 0 => Self::Empty, 1 => Self::One([values[0]]), _ => { values.shrink_to_fit(); Self::Many(values) } }
+    pub fn from_sorted(values: Vec<usize>) -> Self {
+        let ids: Vec<u32> = values.into_iter().map(id32).collect();
+        Self::from_ids(&ids)
     }
     pub fn is_empty(&self) -> bool {
         self.slice().is_empty()
@@ -49,17 +65,21 @@ impl Names {
     }
     pub fn insert(&mut self, value: usize) {
         let value = id32(value);
-        match self {
-            Self::Empty => *self = Self::One(value),
-            Self::One(first) if *first != value => {
-                *self = Self::Many(vec![(*first).min(value), (*first).max(value)]);
-            }
-            Self::Many(values) => if let Err(at) = values.binary_search(&value) {
-                values.reserve_exact(1);
-                values.insert(at, value);
-            },
-            _ => {},
+        let at = match self.slice().binary_search(&value) { Ok(_) => return, Err(at) => at };
+        if let Self::Many(values) = self {
+            let mut grown = Vec::with_capacity(values.len() + 1);
+            grown.extend_from_slice(&values[..at]);
+            grown.push(value);
+            grown.extend_from_slice(&values[at..]);
+            *values = grown.into_boxed_slice();
+            return;
         }
+        let current = self.slice();
+        let mut grown = [0u32; INLINE + 1];
+        grown[..at].copy_from_slice(&current[..at]);
+        grown[at] = value;
+        grown[at + 1..=current.len()].copy_from_slice(&current[at..]);
+        *self = Self::from_ids(&grown[..current.len() + 1]);
     }
     pub fn extend(&mut self, values: &Self) {
         if values.is_empty() || self == values {
@@ -69,8 +89,8 @@ impl Names {
             self.clone_from(values);
             return;
         }
-        if let Self::One(value) = values {
-            self.insert(*value as usize);
+        if values.len() == 1 {
+            self.insert(values.slice()[0] as usize);
             return;
         }
         // Repeated import waves commonly offer an already included subset.
@@ -89,20 +109,7 @@ impl Names {
         }
         merged.extend_from_slice(&left[a..]);
         merged.extend_from_slice(&right[b..]);
-        merged.shrink_to_fit();
-        *self = Self::Many(merged);
-    }
-}
-impl IntoIterator for Names {
-    type Item = usize;
-    type IntoIter = std::iter::Map<std::iter::Chain<std::option::IntoIter<u32>, std::vec::IntoIter<u32>>, fn(u32) -> usize>;
-    fn into_iter(self) -> Self::IntoIter {
-        let (one, many) = match self {
-            Self::Empty => (None, Vec::new()),
-            Self::One(value) => (Some(value), Vec::new()),
-            Self::Many(values) => (None, values),
-        };
-        one.into_iter().chain(many).map(|id| id as usize)
+        *self = Self::from_ids(&merged);
     }
 }
 impl<'a> IntoIterator for &'a Names {
@@ -165,7 +172,7 @@ impl Bindings {
     }
     /// The (module, name) ids a qualified id was interned from.
     pub fn parts(&self, id: usize) -> Option<(usize, usize)> {
-        match self.text.get(id)? { Spelling::Qualified { module, name, .. } => Some((*module, *name)), Spelling::Segment(_) => None }
+        match self.text.get(id)? { Spelling::Qualified { module, name, .. } => Some((*module as usize, *name as usize)), Spelling::Segment(_) => None }
     }
     fn segment(&mut self, name: &str) -> usize {
         if let Some(&id) = self.ids.get(name) { return id; }
@@ -244,7 +251,7 @@ impl Bindings {
     }
     pub fn watched(&self, path: &[usize], mut watch: impl FnMut(usize, usize)) -> Binding {
         let Some((&root, parts)) = path.split_first() else { return Binding::default(); };
-        let mut value = Binding { targets: Names::One(id32(root)), public: true, ..Binding::default() };
+        let mut value = Binding { targets: Names::one(root), public: true, ..Binding::default() };
         for &part in parts {
             let mut next = Binding::default();
             for module in &value.targets {
@@ -258,5 +265,40 @@ impl Bindings {
             if value.targets.is_empty() { break; }
         }
         value
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn model(ids: &std::collections::BTreeSet<usize>) -> Vec<usize> { ids.iter().copied().collect() }
+    /// Names behaves as a sorted set through every inline/heap boundary and is canonical (equal sets are
+    /// equal values), checked against a BTreeSet over a deterministic stream of inserts and unions.
+    #[test]
+    fn names_is_a_canonical_sorted_set() {
+        assert_eq!(std::mem::size_of::<Names>(), 24);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |n: u64| { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; (seed % n) as usize };
+        for _ in 0..3000 {
+            let mut names = Names::default();
+            let mut set = std::collections::BTreeSet::new();
+            for _ in 0..next(12) {
+                if next(3) == 0 {
+                    let mut other = Names::default();
+                    let mut other_set = std::collections::BTreeSet::new();
+                    for _ in 0..next(8) { let v = next(20); other.insert(v); other_set.insert(v); }
+                    let contained = names.contains_all(&other);
+                    assert_eq!(contained, other_set.is_subset(&set));
+                    names.extend(&other);
+                    set.extend(other_set);
+                } else { let v = next(20); names.insert(v); set.insert(v); }
+                assert_eq!(names.iter().collect::<Vec<_>>(), model(&set));
+                assert_eq!(names.len(), set.len());
+                assert!(set.iter().all(|&v| names.contains(v)) && !names.contains(99));
+                let mut rebuilt = Names::default();
+                for &v in set.iter().rev() { rebuilt.insert(v); }
+                assert!(rebuilt == names, "canonical form");
+            }
+        }
     }
 }
