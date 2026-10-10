@@ -132,7 +132,9 @@ impl DemandPart {
         packed!(aliases);
         packed!(dependencies);
         let start = w.len();
-        self.namespace.put(&mut w);
+        // the same bytes as Vec<u8>::put (length, then the bytes), in one copy
+        self.namespace.len().put(&mut w);
+        w.extend_from_slice(&self.namespace);
         sizes.insert("namespace_data", (4 + if profile { demand::namespace_legacy_size(&self.namespace)? } else { self.namespace.len() }, w.len() - start));
         let start = w.len();
         self.namespace_id.put(&mut w);
@@ -216,7 +218,9 @@ impl DemandPart {
         let strings = Vec::<String>::get(&mut r)?;
         part.aliases = Pack::unpack(&mut r, &strings)?;
         part.dependencies = Pack::unpack(&mut r, &strings)?;
-        part.namespace = Codec::get(&mut r)?;
+        // the same bytes as Vec<u8>::get, which decodes them one at a time
+        let namespace = usize::get(&mut r)?;
+        part.namespace = r.take(namespace)?.to_vec();
         part.namespace_id = Codec::get(&mut r)?;
         part.surface_id = Codec::get(&mut r)?;
         part.input_id = Codec::get(&mut r)?;
