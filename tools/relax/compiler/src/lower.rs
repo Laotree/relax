@@ -5734,8 +5734,10 @@ impl<'a> Lcx<'a> {
                         let v = self.to_leaves(v, xt);
                         let d = self.f.vreg(Cls::I);
                         if matches!(self.kind_ref(t), TyKind::Bool) {
-                            let one = self.iconst(1);
-                            self.emit(Inst::IBin(IOp::Xor, U64, d, v[0], one));
+                            // `!b` as `b == 0` (same value for a bool): a branch on it folds into
+                            // the compare-and-branch (test + jz), where `b ^ 1` kept a movzx + xor +
+                            // test + jnz per test (a filter closure's `!e.flag` in a hot loop)
+                            self.emit(Inst::ICmpI(Cond::Eq, false, d, v[0], 0));
                         } else {
                             let it = self.int_ty(t);
                             self.emit(Inst::INot(it, d, v[0]));
@@ -7114,9 +7116,8 @@ impl<'a> Lcx<'a> {
                         if cond == Cond::Eq || cond == Cond::Ne {
                             let c = self.eq_vals(av, bv, at);
                             if cond == Cond::Ne {
-                                let one = self.iconst(1);
                                 let d = self.f.vreg(Cls::I);
-                                self.emit(Inst::IBin(IOp::Xor, U64, d, c, one));
+                                self.emit(Inst::ICmpI(Cond::Eq, false, d, c, 0));
                                 return Val::L(vec![d]);
                             }
                             return Val::L(vec![c]);
