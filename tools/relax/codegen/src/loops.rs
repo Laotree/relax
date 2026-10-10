@@ -1042,14 +1042,24 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         // the latch steps the counter: c = c + s
         let lb = &f.blocks[l as usize];
         let mut found = None;
+        // (k, type, counter, step, the step's value made at k is a constant in each copy)
         for (k, i) in lb.insts.iter().enumerate() {
             if let Inst::IBinI(IOp::Add, it, d, a, s) = *i {
                 if d == a && ndef[d.0 as usize] == 2 {
-                    found = Some((k, it, d, s));
+                    found = Some((k, it, d, s, false));
+                }
+            }
+            // a narrow counter steps through a normalizing chain: `c = conv(conv(c) + s)` (an
+            // i32 `for i in 0..8`: zero-extend, add, sign-extend), the last link a move into c
+            if let Inst::Mov(d, x) = *i {
+                if ndef[d.0 as usize] == 2 {
+                    if let Some((it, s)) = narrow_step(lb, k, d, x, &ndef) {
+                        found = Some((k, it, d, s, true));
+                    }
                 }
             }
         }
-        let Some((ak, it, c, step)) = found else {
+        let Some((ak, it, c, step, step_const)) = found else {
             if tr {
                 eprintln!("  no counter step c = c + s in latch b{}", l);
             }
@@ -1156,9 +1166,11 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             }
             v = extend_const(v.wrapping_add(step), it);
             t += 1;
-            if t > 5 {
+            // up to 4 trips; a small body (the copies fold: `i & 1` selects, `for i in 0..8` over
+            // a matrix's corners) up to 8
+            if t > if size <= 64 { 9 } else { 5 } {
                 if tr {
-                    eprintln!("  trip count > 4");
+                    eprintln!("  trip count too large for a body of {} insts", size);
                 }
                 continue 'next;
             }
@@ -1167,6 +1179,11 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
             continue;
         }
         budget -= size * t;
+        // iteration-local values: single-definition vregs defined in the loop whose every use is
+        // in the loop, in a block the definition's block dominates (after it, in its own block).
+        // Each copy gets its own: as clones of one definition they would be defined T+1 times,
+        // and constant folding (the copy's counter is a constant) follows single definitions only
+        let local = iteration_locals(f, &members, m, &ndef, c);
         // T copies
         let base = f.blocks.len() as u32;
         let idx: Vec<u32> = members.clone();
@@ -1176,24 +1193,34 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         for j in 0..t as u32 {
             let rj = f.vreg(Cls::I);
             let rj2 = f.vreg(Cls::I);
+            let mut fresh: std::collections::HashMap<u32, VReg> = std::collections::HashMap::new();
+            for &lv in &local {
+                let cls = f.vregs[lv as usize];
+                fresh.insert(lv, f.vreg(cls));
+            }
             for (q, &b) in idx.iter().enumerate() {
                 let mut blk = f.blocks[b as usize].clone();
                 let latch = b == l;
                 for (ii, ins) in blk.insts.iter_mut().enumerate() {
                     let after = latch && ii > ak;
                     if latch && ii == ak {
-                        *ins = Inst::IBinI(IOp::Add, it, rj2, rj, step);
+                        // the normalizing chain's value is this copy's next counter: a constant
+                        *ins = if step_const { Inst::Iconst(rj2, extend_const(v.wrapping_add(step), it)) } else { Inst::IBinI(IOp::Add, it, rj2, rj, step) };
                         continue;
                     }
                     ins.vregs_mut(|r| {
                         if *r == c {
                             *r = if after { rj2 } else { rj };
+                        } else if let Some(x) = fresh.get(&r.0) {
+                            *r = *x;
                         }
                     });
                 }
                 crate::regalloc::term_vregs_mut(&mut blk.term, |r| {
                     if *r == c {
                         *r = if latch { rj2 } else { rj };
+                    } else if let Some(x) = fresh.get(&r.0) {
+                        *r = *x;
                     }
                 });
                 let last = j + 1 == t as u32;
@@ -1233,4 +1260,88 @@ pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> boo
         changed = true;
     }
     changed
+}
+
+/// `c = conv(conv(c) + s)` ending in `Mov(c, x)` at `k` of block `b`: the counter step of a
+/// narrow integer as lowering writes it (each link single-defined in `b` before `k`). Returns the
+/// final conversion's type (the counter's representation) and the step.
+fn narrow_step(b: &Block, k: usize, c: VReg, x: VReg, ndef: &[u32]) -> Option<(IntTy, i64)> {
+    let def_of = |v: VReg| -> Option<&Inst> {
+        if ndef[v.0 as usize] != 1 {
+            return None;
+        }
+        b.insts[..k].iter().rev().find(|i| {
+            let mut d = false;
+            for_defs(i, |r| d |= r == v);
+            d
+        })
+    };
+    let Some(&Inst::Conv(Conv::IntToInt(it), _, y)) = def_of(x) else { return None };
+    let Some(&Inst::IBinI(IOp::Add, _, _, z, s)) = def_of(y) else { return None };
+    let src = if z == c {
+        z
+    } else {
+        match def_of(z) {
+            Some(&Inst::Conv(Conv::IntToInt(_), _, w)) if w == c => w,
+            _ => return None,
+        }
+    };
+    (src == c && it.bits <= 32).then_some((it, s))
+}
+
+/// Vregs defined once (`ndef`), inside the loop (`m`), whose every use is inside the loop and
+/// dominated by the definition (a later instruction of its block, or a block it dominates): the
+/// value of one iteration, never read by another or after the loop. The counter `c` is excluded.
+fn iteration_locals(f: &Func, members: &[u32], m: &[bool], ndef: &[u32], c: VReg) -> Vec<u32> {
+    let idom = crate::opt::idoms(f);
+    let dominates = |a: u32, b: u32| -> bool {
+        let mut x = b;
+        for _ in 0..100_000 {
+            if x == a {
+                return true;
+            }
+            let p = idom[x as usize];
+            if p == u32::MAX || p == x {
+                return false;
+            }
+            x = p;
+        }
+        false
+    };
+    let nv = f.vregs.len();
+    const NONE: u32 = u32::MAX;
+    // definition site in the loop: (block, inst)
+    let mut def_at = vec![(NONE, 0u32); nv];
+    for &b in members {
+        for (k, i) in f.blocks[b as usize].insts.iter().enumerate() {
+            for_defs(i, |d| {
+                if ndef[d.0 as usize] == 1 && d != c {
+                    def_at[d.0 as usize] = (b, k as u32);
+                }
+            });
+        }
+    }
+    let mut ok: Vec<bool> = def_at.iter().map(|d| d.0 != NONE).collect();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        let inside = m.get(bi).copied().unwrap_or(false);
+        let mut check = |u: VReg, at: u32| {
+            let (db, dk) = def_at[u.0 as usize];
+            if db == NONE {
+                return;
+            }
+            let fine = inside && if db == bi as u32 { dk < at } else { dominates(db, bi as u32) };
+            if !fine {
+                ok[u.0 as usize] = false;
+            }
+        };
+        for (k, i) in b.insts.iter().enumerate() {
+            for_uses(i, |u| check(u, k as u32));
+        }
+        let mut tu = Vec::new();
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for u in tu {
+            check(u, u32::MAX);
+        }
+    }
+    (0..nv as u32).filter(|v| ok[*v as usize]).collect()
 }
