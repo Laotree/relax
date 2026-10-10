@@ -3601,7 +3601,7 @@ impl Unit {
         let def = self.prog.def(*d);
         let f = &self.prog.files[def.file as usize];
         self.prog.name(*d) == "main" || def.kind == DefKind::ForeignFn
-            || self.tcx.fn_sig(&self.prog, *d).map_or(false, |s| s.header.abi != crate::types::Abi::Rust)
+            || self.tcx.fn_abi(&self.prog, *d).map_or(false, |abi| abi != crate::types::Abi::Rust)
             || f.ast.list(f.ast.item(def.item).attrs).iter().any(|a| {
                 (a.toks.lo..a.toks.hi).any(|t| matches!(f.tok_text(t), "no_mangle" | "export_name" | "test" | "bench" | "start"))
             })
@@ -3861,7 +3861,7 @@ impl Unit {
         // refer to each other's addresses, also cyclically): record the address first, then run
         // the initializer, so `static A: &T = &B; static B: &T = &A;` and `static mut S = &S as ..`
         // see the final addresses instead of recursing.
-        let t = match self.tcx.const_tys.get(&d) {
+        let t = match self.tcx.const_ty(&self.prog, d) {
             Some(t) => t,
             None => {
                 self.statics.insert(d, 0);
@@ -3950,7 +3950,7 @@ impl Unit {
         // tables and other plain-data initializers: evaluated to bytes, no code (ctfe.rs)
         let t0 = cpu_ns();
         if crate::ctfe::check_mode(options) {
-            let t = self.tcx.const_tys.get(&d).map(|t| self.tcx.tys.subst_erasing_regions(t, &args));
+            let t = self.tcx.const_ty(&self.prog, d).map(|t| self.tcx.tys.subst_erasing_regions(t, &args));
             if let Some(t) = t {
                 let l = self.layout_of(t);
                 let tmp = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
@@ -12709,6 +12709,52 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
     fn lower_priority(&self) {
         lower_worker_priority(&self.0.session.runtime);
     }
+}
+
+/// Lead decision 53.2: a run's coherence check (orphan rules, overlapping impls: E0116/E0117/
+/// E0210/E0390, E0119, E0592) is not on its startup path. It runs once, in the background, after
+/// the first present (as Gandalf's checks: after the startup phase, at worker priority, under
+/// the front end's read lock, preempted by a live patch's writer and then run again); its errors
+/// go to the diagnostics context and are reported with the run's other compile errors.
+/// Selection never reads coherence verdicts, so nothing waits for it (`relax check` checks it
+/// synchronously, Tcx::check_coherence).
+pub fn start_background_coherence(u: &Unit) {
+    if std::env::var("RELAX_COHERENCE").is_ok_and(|v| v == "0") { return; }
+    let front = u.front.clone();
+    let _ = std::thread::Builder::new().name("relax-coherence".into()).spawn(move || {
+        let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
+        lower_worker_priority(&front.session.runtime);
+        while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut orphan_done = false;
+        loop {
+            if SPEC_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
+            let r = {
+                let _job = compile_job();
+                let _r = front_read("coherence");
+                if !front.alive.load(Ordering::SeqCst) { return; }
+                let (prog, tcx) = unsafe { (&*front.prog.load(Ordering::Relaxed), &*front.tcx.load(Ordering::Relaxed)) };
+                let t0 = std::time::Instant::now();
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _p = crate::preempt::Preemptible::on();
+                    crate::preempt::point();
+                    tcx.report_coherence(prog, &mut orphan_done);
+                }));
+                if r.is_ok() && front.session.options.verbose { eprintln!("relax-coherence: checked in {:.1} ms (background)", t0.elapsed().as_secs_f64() * 1e3); }
+                r
+            };
+            match r {
+                Ok(()) => return,
+                Err(p) if crate::preempt::is_preempted(&*p) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(p) => {
+                    let m = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
+                    eprintln!("relax-coherence: checker failure (Relax bug, please report): {}", m);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// RELAX_MEM_REPORT's size line of a function: instructions, vregs, blocks, slots.

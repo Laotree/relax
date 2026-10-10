@@ -66,7 +66,7 @@ pub fn signature_anon_consts(prog: &Program, tcx: &Tcx, krate: u32) -> Vec<DefId
         if d.krate != krate || d.kind != DefKind::AnonConst { continue; }
         // rustc_ast_lowering/src/lib.rs:3005-3022: a trivial parameter path
         // lowers directly to Param, so it has no anonymous body to type-check.
-        if tcx.const_tys.get(&def).is_none() { continue; }
+        if tcx.const_ty(prog, def).is_none() { continue; }
         let lo = prog.files[file as usize].ast.expr(e).lo;
         let mut owner = d.parent;
         while matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy) { owner = prog.def(owner).parent; }

@@ -5,7 +5,7 @@ use super::inspect::{InspectCandidate, InspectGoal, ProbeKind};
 use crate::infer::InferCtxt;
 use crate::program::{DefId, Program};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash)]
 pub enum ImplSource {
     UserDefined { impl_def_id: DefId, args: Vec<GenericArg>, nested: Vec<Goal> },
     Builtin(BuiltinImplSource, Vec<Goal>), Param(Vec<Goal>),

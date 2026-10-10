@@ -89,6 +89,37 @@ pub struct QueryCx {
     lifetime_names: QueryTable<DefId, (u64, std::sync::Arc<crate::tcx::lifetime_resolve::LifetimeResolution>)>,
     resolved_bound_vars: QueryTable<DefId, (u64, std::sync::Arc<crate::tcx::resolve_bound_vars::ResolveBoundVars>)>,
     pub(crate) opaque_hidden_type: QueryTable<DefId, Result<TyId, crate::next_solver::NoSolution>>,
+    /// rustc_middle/src/query/mod.rs codegen_select_candidate (PseudoCanonicalInput<TraitRef>)
+    /// (with the post-boot loader's misses of its computation: they travel with the cached
+    /// answer, as Body::deferred_misses do, so every reader fails for the same skipped modules)
+    codegen_select: QueryTable<(TypingEnv, crate::next_solver::TraitRef), (Result<crate::next_solver::select::ImplSource, crate::next_solver::codegen::CodegenObligationError>, Misses)>,
+    /// rustc_middle/src/query/mod.rs resolve_instance_raw (PseudoCanonicalInput<(DefId, GenericArgsRef)>)
+    resolve_instance: QueryTable<(TypingEnv, DefId, Vec<TyId>), (Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, Misses)>,
+    /// rustc_middle/src/query/mod.rs dyn_compatibility_violations (per trait)
+    dyn_compatibility: QueryTable<DefId, Vec<DefId>>,
+    /// rustc_middle/src/query/mod.rs own_existential_vtable_entries (per trait)
+    own_vtable_entries: QueryTable<DefId, Vec<DefId>>,
+    /// rustc_middle/src/query/mod.rs first_method_vtable_slot (per trait ref)
+    first_vtable_slot: QueryTable<crate::next_solver::TraitRef, usize>,
+}
+
+type Misses = std::sync::Arc<Vec<(u32, String)>>;
+
+/// `f` with this thread's miss notes started clean; returns its value and its misses, and
+/// leaves the enclosing notes plus these.
+fn with_misses<R>(f: impl FnOnce() -> R) -> (R, Misses) {
+    let enclosing = crate::program::missing_save();
+    let r = f();
+    let misses = crate::program::take_missing();
+    crate::program::missing_restore(enclosing);
+    crate::program::note_misses(&misses);
+    (r, std::sync::Arc::new(misses))
+}
+
+fn hash_fp<T: Hash>(value: &T) -> Fingerprint {
+    let mut h = KeyHasher(crate::sip::Sip128::new());
+    value.hash(&mut h);
+    Fingerprint(h.0.finish128())
 }
 
 // A recomputed whole-owner result changes its fingerprint even when its return
@@ -119,7 +150,10 @@ impl QueryCx {
         engine.register_input(DECLARATIONS.kind, DECLARATIONS.key, Fingerprint::from_bytes(b"declarations")).unwrap();
         engine.set_input(DECLARATIONS.kind, DECLARATIONS.key, Fingerprint::from_bytes(&0u64.to_le_bytes())).unwrap();
         Self { file_count: 0, crate_count: 0, type_param_clauses: QueryTable::new(20, type_param_key_fp, item_bounds_fp), specialization_graph: QueryTable::new(18, coherence_key_fp, property_bool_fp), inherent_overlap: QueryTable::new(19, opaque_def_fp, property_bool_fp), opaque_generics: QueryTable::new(15, opaque_def_fp, opaque_generics_fp), explicit_item_bounds: QueryTable::new(16, opaque_def_fp, item_bounds_fp), variances: QueryTable::new(17, opaque_def_fp, variances_fp), lifetime_names: QueryTable::new(13, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), resolved_bound_vars: QueryTable::new(14, opaque_def_fp, |v| Fingerprint::from_bytes(&v.0.to_le_bytes())), param_env: QueryTable::new(12, opaque_def_fp, param_env_fp), compare_impl_item: QueryTable::new(11, opaque_def_fp, |r| property_bool_fp(&r.is_ok())), typeck: QueryTable::new(10, opaque_def_fp, typeck_fp), opaque_hidden_type: QueryTable::new(9, opaque_def_fp, opaque_ty_fp), engine, declarations: crate::next_solver::sizedness::DeclarationQueries::new(), solver: Default::default(), drop: QueryTable::new(1, type_fp, property_bool_fp), freeze: QueryTable::new(2, type_fp, property_bool_fp), normalize: QueryTable::new(3, type_fp, property_ty_fp),
-            const_eval: QueryTable::new(4, const_key_fp, const_value_fp) }
+            const_eval: QueryTable::new(4, const_key_fp, const_value_fp),
+            codegen_select: QueryTable::new(22, hash_fp, hash_fp), resolve_instance: QueryTable::new(23, hash_fp, hash_fp),
+            dyn_compatibility: QueryTable::new(24, opaque_def_fp, hash_fp), own_vtable_entries: QueryTable::new(25, opaque_def_fp, hash_fp),
+            first_vtable_slot: QueryTable::new(26, hash_fp, hash_fp) }
     }
 
     /// Publish only under the same exclusive Tcx borrow that edits the tables.
@@ -257,6 +291,11 @@ impl Providers<'_> {
         let q = &self.tcx.queries;
         match id.kind {
             20 => { self.type_param_clauses(q.type_param_clauses.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
+            22 => { let _ = self.codegen_select_candidate(q.codegen_select.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
+            23 => { let _ = self.resolve_instance_raw(q.resolve_instance.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
+            24 => { self.dyn_compatibility_violations(q.dyn_compatibility.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
+            25 => { self.own_existential_vtable_entries(q.own_vtable_entries.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
+            26 => { self.first_method_vtable_slot(q.first_vtable_slot.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             18 => { self.specialization_graph(q.specialization_graph.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             19 => { self.crate_inherent_impls_overlap_check(q.inherent_overlap.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
             15 => { self.opaque_generics(q.opaque_generics.key(id.key).ok_or(QueryError::MissingQuery(id))?)?; }
@@ -351,6 +390,54 @@ impl Providers<'_> {
         q.type_param_clauses.get(&q.engine, key, &mut |(owner, param, assoc)| {
             q.read_def_declarations(self.prog, owner)?;
             Ok(self.tcx.compute_type_param_clauses(self.prog, owner, param, assoc))
+        }, &|id| self.force(id))
+    }
+
+    /// Selection reads the impl tables and every declaration (the solver's inputs): it reads
+    /// every crate's declarations, as the solver's global cache is dropped with any of them.
+    fn codegen_select_candidate(&self, key: (TypingEnv, crate::next_solver::TraitRef)) -> Result<Result<crate::next_solver::select::ImplSource, crate::next_solver::codegen::CodegenObligationError>, QueryError> {
+        let q = &self.tcx.queries;
+        let mut computed = false;
+        let (r, misses) = q.codegen_select.get(&q.engine, key, &mut |(typing_env, trait_ref)| {
+            q.read_declarations()?;
+            computed = true;
+            Ok(with_misses(|| self.tcx.codegen_select_candidate_uncached(self.prog, typing_env, trait_ref)))
+        }, &|id| self.force(id))?;
+        if !computed && !misses.is_empty() { crate::program::note_misses(&misses); }
+        Ok(r)
+    }
+
+    fn resolve_instance_raw(&self, key: (TypingEnv, DefId, Vec<TyId>)) -> Result<Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError>, QueryError> {
+        let q = &self.tcx.queries;
+        let mut computed = false;
+        let (r, misses) = q.resolve_instance.get(&q.engine, key, &mut |(typing_env, def, args)| {
+            q.read_declarations()?;
+            computed = true;
+            Ok(with_misses(|| self.tcx.resolve_instance_raw_uncached(self.prog, typing_env, def, &args)))
+        }, &|id| self.force(id))?;
+        if !computed && !misses.is_empty() { crate::program::note_misses(&misses); }
+        Ok(r)
+    }
+
+    fn dyn_compatibility_violations(&self, def: DefId) -> Result<Vec<DefId>, QueryError> {
+        let q = &self.tcx.queries;
+        q.dyn_compatibility.get(&q.engine, def, &mut |def| {
+            q.read_def_declarations(self.prog, def)?;
+            Ok(self.tcx.dyn_compatibility_violations_uncached(self.prog, def))
+        }, &|id| self.force(id))
+    }
+    fn own_existential_vtable_entries(&self, def: DefId) -> Result<Vec<DefId>, QueryError> {
+        let q = &self.tcx.queries;
+        q.own_vtable_entries.get(&q.engine, def, &mut |def| {
+            q.read_def_declarations(self.prog, def)?;
+            Ok(self.tcx.own_existential_vtable_entries_uncached(self.prog, def))
+        }, &|id| self.force(id))
+    }
+    fn first_method_vtable_slot(&self, key: crate::next_solver::TraitRef) -> Result<usize, QueryError> {
+        let q = &self.tcx.queries;
+        q.first_vtable_slot.get(&q.engine, key, &mut |key| {
+            q.read_declarations()?;
+            Ok(self.tcx.first_method_vtable_slot_uncached(self.prog, &key))
         }, &|id| self.force(id))
     }
 
@@ -915,6 +1002,26 @@ impl Tcx {
     }
     pub fn param_env(&self, prog: &Program, def: DefId) -> crate::next_solver::ParamEnv {
         Providers { tcx: self, prog }.param_env(def).expect("param_env query")
+    }
+    /// The dyn_compatibility_violations query (provider: dyn_compatibility_violations_uncached).
+    pub fn dyn_compatibility_violations(&self, prog: &Program, def: DefId) -> Vec<DefId> {
+        Providers { tcx: self, prog }.dyn_compatibility_violations(def).expect("dyn_compatibility_violations query")
+    }
+    /// The own_existential_vtable_entries query (provider: own_existential_vtable_entries_uncached).
+    pub fn own_existential_vtable_entries(&self, prog: &Program, def: DefId) -> Vec<DefId> {
+        Providers { tcx: self, prog }.own_existential_vtable_entries(def).expect("own_existential_vtable_entries query")
+    }
+    /// The first_method_vtable_slot query (provider: first_method_vtable_slot_uncached).
+    pub fn first_method_vtable_slot(&self, prog: &Program, key: &crate::next_solver::TraitRef) -> usize {
+        Providers { tcx: self, prog }.first_method_vtable_slot(key.clone()).expect("first_method_vtable_slot query")
+    }
+    /// The codegen_select_candidate query (provider: codegen_select_candidate_uncached).
+    pub fn codegen_select_candidate(&self, prog: &Program, typing_env: TypingEnv, trait_ref: crate::next_solver::TraitRef) -> Result<crate::next_solver::select::ImplSource, crate::next_solver::codegen::CodegenObligationError> {
+        Providers { tcx: self, prog }.codegen_select_candidate((typing_env, trait_ref)).expect("codegen_select_candidate query")
+    }
+    /// The resolve_instance_raw query (provider: resolve_instance_raw_uncached).
+    pub fn resolve_instance_raw(&self, prog: &Program, typing_env: TypingEnv, def: DefId, args: &[TyId]) -> Result<crate::instance::Instance, crate::next_solver::codegen::CodegenObligationError> {
+        Providers { tcx: self, prog }.resolve_instance_raw((typing_env, def, args.to_vec())).expect("resolve_instance_raw query")
     }
 }
 

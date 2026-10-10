@@ -21,7 +21,9 @@ impl Tcx {
         TraitRef { def_id: value.def_id, args }
     }
 
-    pub fn own_existential_vtable_entries(&self, prog: &Program, td: DefId) -> Vec<DefId> {
+    /// vtable.rs own_existential_vtable_entries (the query's provider; the query:
+    /// Tcx::own_existential_vtable_entries, type_queries.rs).
+    pub(crate) fn own_existential_vtable_entries_uncached(&self, prog: &Program, td: DefId) -> Vec<DefId> {
         let violations = self.dyn_compatibility_violations(prog, td);
         let mut result = Vec::new();
         for &method in &prog.traits[prog.def(td).sub as usize] {
@@ -88,7 +90,9 @@ impl Tcx {
         }
     }
 
-    pub fn first_method_vtable_slot(&self, prog: &Program, key: &TraitRef) -> usize {
+    /// vtable.rs:300-335 first_method_vtable_slot (the query's provider; the query:
+    /// Tcx::first_method_vtable_slot, type_queries.rs).
+    pub(crate) fn first_method_vtable_slot_uncached(&self, prog: &Program, key: &TraitRef) -> usize {
         let GenericArg::Type(self_ty) = key.args[0] else { unreachable!() };
         let TyKind::Dyn(def, args, _, regions, _, _, _) = self.tys.kind(self_ty) else { panic!("virtual receiver") };
         let mut compact = vec![self_ty]; compact.extend_from_slice(args);

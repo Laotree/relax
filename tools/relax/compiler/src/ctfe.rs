@@ -38,7 +38,7 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
         return false;
     }
     let init = match relax_types::const_eval::const_body(&u.prog, d) { Some(e) => e, None => return false };
-    let t = match u.tcx.const_tys.get(&d) {
+    let t = match u.tcx.const_ty(&u.prog, d) {
         Some(t) => u.tcx.tys.subst_erasing_regions(t, args),
         None => return false,
     };
@@ -343,7 +343,10 @@ impl<'a> Ctx<'a> {
             None | Some(Coerce::MutToConst | Coerce::UnsafeFn | Coerce::RefToRaw(_)) => Some(v),
             Some(Coerce::ReifyFn) => self.fn_pointer(b.ty(e)),
             Some(Coerce::ClosureFn) => {
-                let id = self.u.closure_fn_id(b.ty(e))?;
+                // the closure's FnOnce instance, as lowering reifies it (lower.rs Coerce::ClosureFn,
+                // rustc_codegen_ssa/src/mir/rvalue.rs:536-550): its body takes the environment first
+                let instance = crate::instance::Instance::resolve_closure(&self.u.tcx, &self.u.prog, b.ty(e), relax_types::upvar::ClosureKind::FnOnce);
+                let id = self.u.instance_fn_id(instance);
                 Some(self.u.entry(id).to_le_bytes().to_vec())
             }
             Some(Coerce::Unsize) => {
@@ -1212,7 +1215,7 @@ impl<'a> Ctx<'a> {
             u.consts.insert((d, args), a);
             return Some(a);
         }
-        let t = u.tcx.tys.subst_erasing_regions(u.tcx.const_tys.get(&d)?, &args);
+        let t = u.tcx.tys.subst_erasing_regions(u.tcx.const_ty(&u.prog, d)?, &args);
         let l = u.layout_of(t);
         let buf = u.data(&vec![0u8; l.size.max(1) as usize], l.align.max(8) as u64, crate::syms::DataKind::Typed(t));
         u.syms.set_data_name(buf, crate::jit::const_name(u, d, &args));

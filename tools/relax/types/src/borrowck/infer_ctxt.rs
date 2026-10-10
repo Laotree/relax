@@ -296,7 +296,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             Rvalue::ThreadLocalRef(def) => {
                 let d = self.prog.def(*def);
                 let crate::ast::ItemKind::Static(mutable, _, _) = self.prog.files[d.file as usize].ast.item(d.item).kind else { unreachable!("static declaration") };
-                let ty = self.tcx.const_tys.get(def).expect("static type");
+                let ty = self.tcx.const_ty(self.prog, *def).expect("static type");
                 if mutable { tys.intern(TyKind::Ptr(true, ty)) }
                 else if d.kind == crate::program::DefKind::ForeignStatic { tys.intern(TyKind::Ptr(false, ty)) }
                 else { tys.intern(TyKind::Ref(false, ty, tys.intern_region(RegionKind::ReStatic))) }
@@ -395,7 +395,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }
     }
     fn static_ty(&mut self, out: &mut MirTypeckRegionConstraints, def: DefId, locations: Locations) -> TyId {
-        let ty = self.tcx.const_tys.get(&def).expect("static declaration type");
+        let ty = self.tcx.const_ty(self.prog, def).expect("static declaration type");
         BorrowckTypeOps::normalize(self, out, ty, locations)
     }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool {

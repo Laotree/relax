@@ -15,7 +15,9 @@ impl Tcx {
         } }
         false
     }
-    pub fn dyn_compatibility_violations(&self, prog: &Program, def: DefId) -> Vec<DefId> {
+    /// dyn_compatibility.rs:39-60 dyn_compatibility_violations (the query's provider; the
+    /// query: Tcx::dyn_compatibility_violations, type_queries.rs).
+    pub(crate) fn dyn_compatibility_violations_uncached(&self, prog: &Program, def: DefId) -> Vec<DefId> {
         let mut violations = Vec::new();
         let identity = collect::trait_predicate(def, self.generic_indices_of(prog, def).identity_args(&self.tys));
         let mut supers = Vec::new();

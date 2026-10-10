@@ -58,7 +58,7 @@ fn signature_args(s: &Session,d: DefId,args: &[TyId]) -> String {
     if let Some(sig) = s.unit.tcx.fn_sig(&s.unit.prog, d) {
         let params = sig.params.iter().map(|t|ty(s,s.unit.tcx.tys.subst(*t,args))).collect::<Vec<_>>().join(", ");
         format!("{}fn {}({}) -> {}",if sig.header.safety == crate::types::Safety::Unsafe { "unsafe " } else { "" },p.name(d),params,ty(s,s.unit.tcx.tys.subst(sig.ret,args)))
-    } else if let Some(t) = s.unit.tcx.const_tys.get(&d) { ty(s,t) }
+    } else if let Some(t) = s.unit.tcx.const_ty(&s.unit.prog, d) { ty(s,t) }
     else if p.def(d).kind == DefKind::TypeAlias { ty(s,s.unit.tcx.alias_ty(&crate::tcx::EvalCx::new(p, &s.unit.tcx, crate::tcx::TypingEnv::fully_monomorphized(&p), &crate::tcx::EvalState::new()), p,d)) }
     else { p.def_path(d) }
 }

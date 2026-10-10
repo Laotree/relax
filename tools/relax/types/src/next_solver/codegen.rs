@@ -11,11 +11,12 @@ use crate::instance::{Instance, InstanceKind, ShimKind};
 use crate::program::DefKind;
 use crate::lang_items::LangItem;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum CodegenObligationError { Ambiguity, Unimplemented, UnconstrainedParam }
 impl Tcx {
-    /// rustc_ty_utils/src/instance.rs:17-438. All callers retain the instance kind.
-    pub fn resolve_instance_raw(&self, prog: &Program, typing_env: TypingEnv, def: crate::program::DefId, compact: &[TyId]) -> Result<Instance, CodegenObligationError> {
+    /// rustc_ty_utils/src/instance.rs:17-438 (the resolve_instance_raw query's provider; the
+    /// query: Tcx::resolve_instance_raw, type_queries.rs). All callers retain the instance kind.
+    pub(crate) fn resolve_instance_raw_uncached(&self, prog: &Program, typing_env: TypingEnv, def: crate::program::DefId, compact: &[TyId]) -> Result<Instance, CodegenObligationError> {
         let indices = self.generic_indices_of(prog, def);
         let regions = self.tys.intern_region_args(&vec![RegionId::ERASED; indices.lifetimes.len()]);
         let mut args = self.complete_args(prog, def, compact, regions);
@@ -144,9 +145,10 @@ impl Tcx {
         }
     }
 
-    /// codegen.rs:26-105: selection and fulfillment share one inference owner;
-    /// regions are erased only after its impl arguments are fully resolved.
-    pub fn codegen_select_candidate(&self, prog: &Program, typing_env: TypingEnv, trait_ref: TraitRef) -> Result<ImplSource, CodegenObligationError> {
+    /// codegen.rs:26-105 (the codegen_select_candidate query's provider; the query:
+    /// Tcx::codegen_select_candidate, type_queries.rs): selection and fulfillment share one
+    /// inference owner; regions are erased only after its impl arguments are fully resolved.
+    pub(crate) fn codegen_select_candidate_uncached(&self, prog: &Program, typing_env: TypingEnv, trait_ref: TraitRef) -> Result<ImplSource, CodegenObligationError> {
         let infcx = InferCtxt::new(self, typing_env.mode, typing_env.limit);
 
         let param_env = self.param_env_by_id(typing_env.param_env).clone();

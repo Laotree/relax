@@ -16,6 +16,9 @@ impl TypeFlags {
     pub const HAS_TY_PARAM: Self = Self(F_PARAM);
     pub const HAS_CT_BOUND: Self = Self(1 << 17);
     pub const HAS_CT_PLACEHOLDER: Self = Self(1 << 18);
+    /// rustc_type_ir flags.rs HAS_ALIAS (any type or const alias, rigid or not, at any depth,
+    /// closure parent args included): set_aliases_to_non_rigid's needs_change
+    pub const HAS_ALIAS: Self = Self(1 << 19);
     pub const HAS_TY_BOUND: Self = Self(1 << 8);
     pub const HAS_TY_PLACEHOLDER: Self = Self(1 << 9);
     pub const HAS_RE_BOUND: Self = Self(1 << 10);
@@ -83,7 +86,7 @@ impl Computation {
             ConstKind::Bound(d, _) => self.add(F::HAS_CT_BOUND.0 | F_NONCONC, d + 1, binders),
             ConstKind::Placeholder(_) => self.flags |= F::HAS_CT_PLACEHOLDER.0 | F_NONCONC,
             ConstKind::Alias(_, alias) => {
-                self.flags |= F_PROJ;
+                self.flags |= F_PROJ | F::HAS_ALIAS.0;
                 for arg in &*alias.args {
                     match *arg {
                         GenericArg::Type(t) => { self.flags |= tys.fl(t); self.ty(tys, t, binders); }
@@ -171,6 +174,7 @@ impl Types {
             TyKind::Slice(t) | TyKind::Ptr(_, t) => c.ty(self, *t, 0),
             TyKind::Ref(_, t, r) => { c.ty(self, *t, 0); c.region(self, *r, 0); }
             TyKind::Adt(_, v, rs) | TyKind::FnDef(_, v, rs) | TyKind::Alias(_, AliasTy { args: v, regions: rs, .. }) => {
+                if matches!(k, TyKind::Alias(..)) { c.flags |= TypeFlags::HAS_ALIAS.0; }
                 for t in v { c.ty(self, *t, 0); }
                 c.regions(self, *rs, 0);
             }

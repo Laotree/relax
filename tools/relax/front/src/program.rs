@@ -4895,11 +4895,34 @@ thread_local! {
     /// so the notes since any open mark hold every miss of its lookups, also one this thread
     /// noted before the mark (an earlier lookup of the same name).
     static MISSING_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The notes of MISSING[from..] as a set (push_missing's dedup), valid for (generation,
+    /// from, len); a body's bound-variable walk notes thousands of misses in one window, and
+    /// a scan of the window per note made that quadratic.
+    static MISSING_SEEN: std::cell::RefCell<(u64, usize, usize, std::collections::HashSet<(u32, String)>)> = std::cell::RefCell::new((0, 0, 0, Default::default()));
+    /// bumped whenever MISSING is replaced (save, restore, take)
+    static MISSING_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
+
+fn bump_missing_gen() { let _ = MISSING_GEN.try_with(|g| g.set(g.get() + 1)); }
 
 fn push_missing(m: &mut Vec<(u32, String)>, w: u32, name: &str) {
     let from = MISSING_FROM.try_with(|f| f.get()).unwrap_or(0).min(m.len());
-    if !m[from..].iter().any(|(x, n)| *x == w && n == name) { m.push((w, name.to_owned())); }
+    let gen = MISSING_GEN.try_with(|g| g.get()).unwrap_or(0);
+    let pushed = MISSING_SEEN.try_with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen.0 != gen || seen.1 != from || seen.2 != m.len() {
+            seen.3.clear();
+            for n in &m[from..] { seen.3.insert(n.clone()); }
+            seen.0 = gen; seen.1 = from;
+        }
+        let key = (w, name.to_owned());
+        if seen.3.contains(&key) { seen.2 = m.len(); return false; }
+        m.push(key.clone());
+        seen.3.insert(key);
+        seen.2 = m.len();
+        true
+    });
+    if pushed.is_err() && !m[from..].iter().any(|(x, n)| *x == w && n == name) { m.push((w, name.to_owned())); }
 }
 
 /// Signature collection runs on several threads: while it runs, misses are also gathered here.
@@ -4961,17 +4984,20 @@ pub fn note_misses(misses: &[(u32, String)]) {
 /// clean; missing_restore puts them back when it ends, so the enclosing work keeps its notes.
 pub fn missing_save() -> (Vec<(u32, String)>, usize) {
     let from = MISSING_FROM.try_with(|f| f.replace(0)).unwrap_or(0);
+    bump_missing_gen();
     (MISSING.try_with(|m| std::mem::take(&mut *m.borrow_mut())).unwrap_or_default(), from)
 }
 
 pub fn missing_restore(saved: (Vec<(u32, String)>, usize)) {
     let _ = MISSING_FROM.try_with(|f| f.set(saved.1));
+    bump_missing_gen();
     let _ = MISSING.try_with(|m| *m.borrow_mut() = saved.0);
 }
 
 /// The (skipped module, name) misses of this thread's lookups (cleared).
 pub fn take_missing() -> Vec<(u32, String)> {
     let _ = MISSING_FROM.try_with(|f| f.set(0));
+    bump_missing_gen();
     MISSING.try_with(|m| std::mem::take(&mut *m.borrow_mut())).unwrap_or_default()
 }
 

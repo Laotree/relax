@@ -17,6 +17,7 @@ crate::collected_fields!(Destructor, did);
 crate::collected_fields!(GenEnv, sized_params, regions, names, self_ty, trait_def, impl_def,
     impl_params, bounds, consts, opaque_owner);
 crate::collected_fields!(OpaqueDecl, region_contract, bounds);
+crate::collected_fields!(ConstDecl, ty, region_contract, errors, misses);
 // Derived variance is rebuilt after declaration publication.
 impl Codec for SigParts {
     fn put(&self, w: &mut Vec<u8>) {
@@ -58,7 +59,7 @@ macro_rules! fields {
 /// Declaration tables decoded only when demanded from the collected image.
 macro_rules! tables {
     ($op:ident) => { $op!(sigs, ctor_sigs, adts, adt_destructors, destructor_impls,
-        nominal_region_contracts, const_region_contracts, impl_self, impl_trait, impl_generics,
+        nominal_region_contracts, impl_self, impl_trait, impl_generics,
         inherent, trait_impls, impls_by_key, impl_trait_args, impl_trait_regions,
         impl_trait_bounds, trait_closure); };
 }
@@ -71,14 +72,13 @@ impl Tcx {
         let impls: Vec<_> = self.impl_self.keys().filter(|d| !keep(d)).copied().collect();
         self.uncollect_impls(&impls);
         self.inherent.retain(|_, v| !v.is_empty()); self.trait_impls.retain(|_, v| !v.is_empty());
-        let consts = self.const_tys.snapshot();
-        let gone: Vec<_> = self.sigs.keys().chain(self.adts.keys()).chain(consts.keys())
+        let mut gone: Vec<_> = self.sigs.keys().chain(self.adts.keys())
             .chain(self.impl_self.keys()).chain(self.trait_closure.keys()).filter(|d| !keep(d)).copied().collect();
+        gone.extend(self.const_tys.keys().filter(|d| !keep(d)));
         self.invalidate_check(&gone);
         self.impl_trait_args.retain(|d, _| keep(d)); self.impl_trait_regions.retain(|d, _| keep(d));
         self.impl_trait_bounds.retain(|d, _| keep(d));
         self.nominal_region_contracts.retain(|d, _| keep(d)); self.contracts_waiting.retain(|d| keep(d));
-        self.const_region_contracts.retain(|d, _| keep(d));
         self.ctor_sigs.retain(|d, _| keep(d)); self.opaques.retain(|d, _| keep(d));
         self.adt_destructors.retain(|d, v| keep(d) && keep(&v.did));
         self.destructor_impls.retain(|d, v| keep(d) && keep(v));
@@ -98,7 +98,6 @@ impl Tcx {
                 self.trait_closure.insert(d, all);
             }
         }
-        self.orphan_check(&EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &EvalState::new()), prog);
         self.flush_errs();
         self.seal_collected_diagnostics();
         self.publish_collected();
@@ -133,8 +132,29 @@ impl Tcx {
                 rebuilt.tys.with_semantic_ids(|| crate::crate_image::encode(&rebuilt.$f)),
                 "collected Tcx {} differs", stringify!($f));
         )+ }; }
-        compare!(ctor_sigs, adts, lang_items, adt_destructors, destructor_impls, const_tys,
-            nominal_region_contracts, contracts_waiting, const_region_contracts, impl_self, impl_trait,
+        let mut a_keys: Vec<_> = self.const_tys.declaration_keys().collect(); a_keys.sort_by_key(|d| d.0);
+        let mut b_keys: Vec<_> = rebuilt.const_tys.declaration_keys().collect(); b_keys.sort_by_key(|d| d.0);
+        assert_eq!(a_keys, b_keys, "collected constant definitions differ");
+        for d in a_keys {
+            // as for signatures: the same declarations on both sides, only those demanded
+            if self.const_tys.declaration(&d).unwrap().get().is_some() || rebuilt.const_tys.declaration(&d).unwrap().get().is_some() {
+                // Lower before entering semantic encoding: lowering may intern new types.
+                let a = self.const_decl(saved_prog, d, self.const_tys.declaration(&d).unwrap());
+                let b = rebuilt.const_decl(prog, d, rebuilt.const_tys.declaration(&d).unwrap());
+                let encode = |decl: &ConstDecl| {
+                    let mut w = Vec::new();
+                    decl.ty.put(&mut w); decl.region_contract.put(&mut w); decl.errors.put(&mut w);
+                    w
+                };
+                assert_eq!(self.tys.with_semantic_ids(|| encode(a)), rebuilt.tys.with_semantic_ids(|| encode(b)),
+                    "collected constant differs: {}", prog.def_path(d));
+            }
+        }
+        assert_eq!(self.tys.with_semantic_ids(|| crate::crate_image::encode(&self.const_tys.fed_types())),
+            rebuilt.tys.with_semantic_ids(|| crate::crate_image::encode(&rebuilt.const_tys.fed_types())),
+            "collected anonymous constant types differ");
+        compare!(ctor_sigs, adts, lang_items, adt_destructors, destructor_impls,
+            nominal_region_contracts, contracts_waiting, impl_self, impl_trait,
             impl_generics, inherent, trait_impls, impls_by_key, impl_trait_args,
             impl_trait_regions, impl_trait_bounds, trait_closure, copy_trait);
         assert_eq!(self.collected_errors, rebuilt.collected_errors, "collected declaration diagnostics differ");
@@ -163,7 +183,7 @@ impl Tcx {
         let errors = self.collected_errors.as_ref()?;
         if !errors.is_empty() { return None; }
         let mut w = Vec::new();
-        4u32.put(&mut w);
+        5u32.put(&mut w);
         macro_rules! put_one {
             (errors) => { errors.put(&mut w) };
             ($f:ident) => { self.$f.put(&mut w) };
@@ -185,7 +205,7 @@ impl Tcx {
     pub fn restore_collected(bytes: &'static [u8], files: usize, crates: usize) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);
-        if u32::get(&mut r)? != 4 { return None; }
+        if u32::get(&mut r)? != 5 { return None; }
         let mut t = Self::with_types(Types::restore_collected(image.bytes(1, 1)?)?);
         macro_rules! get { ($($f:ident),+) => { $(t.$f = Codec::get(&mut r)?;)+ }; }
         fields!(get);
@@ -249,30 +269,66 @@ mod tests {
     }
 }
 
-/// Mapped declaration types plus types published by shared anonymous-constant lowering.
+/// Const/static declarations and anonymous types share one mapped definition table.
+/// The overlay contains only anonymous types fed by shared lowering; checkpointing folds
+/// it into that table. Undemanded declaration cells stay empty across an image round trip.
 #[derive(Default)]
-pub struct ConstTypes {
-    image: ImageMap<DefId, TyId>,
+pub(super) struct ConstTypes {
+    image: ImageMap<DefId, ConstType>,
     added: crate::conc::ShardMap<DefId, TyId>,
 }
+
+#[derive(Clone)]
+enum ConstType {
+    Declaration(std::sync::OnceLock<Box<ConstDecl>>),
+    Fed(TyId),
+}
+crate::collected_enum!(ConstType; 0 => Declaration(cell), 1 => Fed(ty));
+
 impl ConstTypes {
-    pub fn get(&self, d: &DefId) -> Option<TyId> { self.added.get(d).or_else(|| self.image.get(d).copied()) }
-    pub fn insert(&self, d: DefId, t: TyId) { self.added.insert(d, t); }
-    pub fn snapshot(&self) -> crate::fxhash::HashMap<DefId, TyId> {
-        let mut out: crate::fxhash::HashMap<_, _> = self.image.iter().map(|(d, t)| (*d, *t)).collect();
+    pub(super) fn declaration(&self, d: &DefId) -> Option<&std::sync::OnceLock<Box<ConstDecl>>> {
+        match self.image.get(d)? { ConstType::Declaration(cell) => Some(cell), ConstType::Fed(_) => None }
+    }
+    pub(super) fn insert_declaration(&mut self, d: DefId) {
+        self.image.insert(d, ConstType::Declaration(Default::default()));
+    }
+    pub(super) fn fed_type(&self, d: &DefId) -> Option<TyId> {
+        self.added.get(d).or_else(|| match self.image.get(d)? {
+            ConstType::Fed(ty) => Some(*ty), ConstType::Declaration(_) => None,
+        })
+    }
+    pub(super) fn feed(&self, d: DefId, ty: TyId) { self.added.insert(d, ty); }
+    fn declaration_keys(&self) -> impl Iterator<Item = DefId> + '_ {
+        self.image.iter().filter_map(|(d, v)| matches!(v, ConstType::Declaration(_)).then_some(*d))
+    }
+    fn fed_types(&self) -> crate::fxhash::HashMap<DefId, TyId> {
+        let mut out: crate::fxhash::HashMap<_, _> = self.image.iter().filter_map(|(d, v)| match v {
+            ConstType::Fed(ty) => Some((*d, *ty)), ConstType::Declaration(_) => None,
+        }).collect();
         out.extend(self.added.snapshot()); out
     }
-    pub fn retain(&mut self, mut f: impl FnMut(&DefId, &mut TyId) -> bool) {
-        self.image.retain(|d, t| f(d, t)); self.added.retain(|d, t| f(d, t));
+    fn keys(&self) -> impl Iterator<Item = DefId> + '_ {
+        self.image.keys().copied().chain(self.added.snapshot().into_keys())
+    }
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&DefId) -> bool) {
+        self.image.retain(|d, _| keep(d)); self.added.retain(|d, _| keep(d));
+    }
+    pub(super) fn reset_declarations_with_misses(&mut self) {
+        // Include persisted misses in entries not yet decoded in this process.
+        for value in self.image.values_mut() {
+            if let ConstType::Declaration(cell) = value {
+                if cell.get().is_some_and(|decl| !decl.misses.is_empty()) { *cell = Default::default(); }
+            }
+        }
     }
     fn write_image(&self, image: &mut crate::image::Writer<'_>, id: &mut u32) {
-        let table: ImageMap<_, _> = self.snapshot().into_iter().collect(); table.write_image(image, id);
+        let added = self.added.snapshot();
+        if added.is_empty() { self.image.write_image(image, id); return; }
+        let mut table = self.image.clone();
+        table.extend(added.into_iter().map(|(d, ty)| (d, ConstType::Fed(ty))));
+        table.write_image(image, id);
     }
     fn read_image(image: &crate::image::Reader, k: &mut usize, id: &mut u32) -> Option<Self> {
         Some(Self { image: ImageMap::read_image(image, k, id)?, added: Default::default() })
     }
-}
-impl Codec for ConstTypes {
-    fn put(&self, w: &mut Vec<u8>) { self.snapshot().put(w); }
-    fn get(r: &mut Decode<'_>) -> Option<Self> { Some(Self { image: Codec::get(r)?, added: Default::default() }) }
 }

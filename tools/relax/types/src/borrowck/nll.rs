@@ -590,7 +590,7 @@ impl<'a> Nll<'a> {
         // need without the owner's other regions)
         if is_closure {
             if let Some(o) = bir.owner {
-                if self.tcx.fn_sig(self.prog, o).is_some() || self.tcx.const_region_contracts.contains_key(&o) {
+                if self.tcx.fn_sig(self.prog, o).is_some() || self.tcx.const_region_contract(self.prog, o).is_some() {
                     let args = self.tcx.generic_indices_of(self.prog, o).identity_types_consts(&self.tcx.tys);
                     let t = self.rty.sig_template(o, &args);
                     if t.ok {

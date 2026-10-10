@@ -650,7 +650,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         ItemKind::Const(_, Some(init)) | ItemKind::Static(_, _, Some(init)) => {
             let init = &prog.const_body(file, d.item).expect("body_ranges validated initializer").unwrap_or(*init);
             // const/static initializer: checked against the declared type
-            let ct = fcx.tcx.const_tys.get(&def).unwrap_or(error);
+            let ct = fcx.tcx.const_ty(prog, def).unwrap_or(error);
             let ct = fcx.tcx.tys.subst(ct, args);
             // hir_typeck lib.rs:194-198: the normalized expected type is well formed
             let ct = fcx.norm(ct);
@@ -2595,7 +2595,7 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.intern(TyKind::FnDef(d, args, regions))
             }
             DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
-                let t = self.tcx.const_tys.get(&d).unwrap_or(self.tcx.tys.error);
+                let t = self.tcx.const_ty(self.prog, d).unwrap_or(self.tcx.tys.error);
                 match explicit {
                     Some(v) => {
                         // the args pick the impl of a trait's const at evaluation (`T::ZERO`)
@@ -6372,7 +6372,9 @@ pub fn item_path(prog: &Program, tcx: &Tcx, d: DefId) -> String {
             }
         }
     }
-    if parent != crate::program::NO_DEF && matches!(prog.def(parent).kind, DefKind::Trait | DefKind::Enum) {
+    // under a trait or enum, or in a body whose owner is its def parent (rustc's DefCollector,
+    // def_collector.rs visit_block): the parent's path, so an impl above prints its self type
+    if parent != crate::program::NO_DEF && !matches!(prog.def(parent).kind, DefKind::Mod | DefKind::Impl) {
         return format!("{}::{}", item_path(prog, tcx, parent), name);
     }
     prog.def_path(d)

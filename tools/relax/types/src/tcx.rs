@@ -204,9 +204,9 @@ pub struct Tcx {
     pub(crate) variances: std::sync::OnceLock<HashMap<DefId, Vec<crate::types::variance::V>>>,
     adt_destructors: ImageMap<DefId, Destructor>,
     destructor_impls: ImageMap<DefId, DefId>,
-    pub const_tys: collected::ConstTypes,
+    /// One mapped store for lazy const/static declarations and fed anonymous types.
+    const_tys: collected::ConstTypes,
     pub nominal_region_contracts: ImageMap<DefId, outlives::RegionContract>,
-    pub const_region_contracts: ImageMap<DefId, outlives::RegionContract>,
     pub impl_self: ImageMap<DefId, TyId>,
     pub impl_trait: ImageMap<DefId, DefId>,
     pub impl_generics: ImageMap<DefId, GenEnv>,
@@ -326,6 +326,15 @@ pub(crate) struct SigParts {
     errors: Vec<String>,
 }
 
+/// One const/static item's declaration (Tcx::const_ty), published under its own OnceLock.
+#[derive(Clone, Default)]
+pub(crate) struct ConstDecl {
+    ty: Option<TyId>,
+    region_contract: Option<outlives::RegionContract>,
+    errors: Vec<String>,
+    /// (skipped module, name) misses of its lowering (the post-boot loader's)
+    misses: Vec<(u32, String)>,
+}
 
 pub fn ty_key(tys: &Types, t: TyId) -> TyKey {
     match tys.kind(t) {
@@ -369,7 +378,6 @@ impl Tcx {
             const_tys: Default::default(),
             nominal_region_contracts: Default::default(),
             contracts_waiting: Default::default(),
-            const_region_contracts: Default::default(),
             impl_self: Default::default(),
             impl_trait: Default::default(),
             impl_generics: Default::default(),
@@ -417,7 +425,12 @@ impl Tcx {
     /// of a foreign trait only when one of `Self, T1..Tn` is a local type (through the
     /// fundamental `&`, `&mut`, `Box`, `Pin`) and no uncovered type parameter comes before it
     /// (E0210), else E0117.
-    fn orphan_check(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program) {
+    /// The orphan errors (impl, position, message), unreported: the caller reports them
+    /// (Tcx::check_coherence into the collected errors, the background coherence check of a
+    /// run into the diagnostics context).
+    pub fn orphan_errors(&self, prog: &Program) -> Vec<(DefId, u32, String)> {
+        let typing_env = TypingEnv::fully_monomorphized(prog);
+        let mut errors = Vec::new();
         for im in &prog.impls {
             let krate = prog.def(im.def).krate;
             let kname = prog.syms.str(prog.crates[krate as usize].name);
@@ -426,7 +439,7 @@ impl Tcx {
             }
             let Some(&st) = self.impl_self.get(&im.def) else { continue };
             // (a projection self type is checked as what it normalizes to)
-            let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, cx.typing_env, st).unwrap_or(st) } else { st };
+            let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st) } else { st };
             let item = prog.files[im.file as usize].ast.item(im.item);
             let pos = item.lo;
             let is_trait_impl = matches!(&item.kind, crate::ast::ItemKind::Impl { trait_: Some(_), .. });
@@ -439,9 +452,9 @@ impl Tcx {
                     }
                     let shown = crate::typeck::ty_to_string(false, prog, self, st);
                     if matches!(self.tys.kind(st), TyKind::Adt(..) | TyKind::Dyn(..)) {
-                        self.err(cx, prog, im.file, pos, format!("E0116: cannot define inherent `impl` for a type outside of the crate where the type is defined (`{}`) -- define and implement a trait or a new type instead", shown));
+                        errors.push((im.def, pos, format!("E0116: cannot define inherent `impl` for a type outside of the crate where the type is defined (`{}`) -- define and implement a trait or a new type instead", shown)));
                     } else {
-                        self.err(cx, prog, im.file, pos, format!("E0390: cannot define inherent `impl` for primitive types (`{}`) -- use a trait instead", shown));
+                        errors.push((im.def, pos, format!("E0390: cannot define inherent `impl` for primitive types (`{}`) -- use a trait instead", shown)));
                     }
                 }
                 Some(&td) => {
@@ -465,12 +478,45 @@ impl Tcx {
                     };
                     match verdict {
                         Ok(()) => {}
-                        Err(OrphanCheckErr::UncoveredTyParams { .. }) => self.err(cx, prog, im.file, pos, format!("E0210: type parameter must be covered by another type when it appears before the first local type in an impl of `{}` -- implement it for a local type or a local wrapper", prog.def_path(td))),
-                        Err(OrphanCheckErr::NonLocalInputType(_)) => self.err(cx, prog, im.file, pos, format!("E0117: only traits defined in the current crate can be implemented for types defined outside of the crate (`impl {} for {}`) -- implement it for a local type or a local wrapper", prog.def_path(td), crate::typeck::ty_to_string(false, prog, self, st))),
+                        Err(OrphanCheckErr::UncoveredTyParams { .. }) => errors.push((im.def, pos, format!("E0210: type parameter must be covered by another type when it appears before the first local type in an impl of `{}` -- implement it for a local type or a local wrapper", prog.def_path(td)))),
+                        Err(OrphanCheckErr::NonLocalInputType(_)) => errors.push((im.def, pos, format!("E0117: only traits defined in the current crate can be implemented for types defined outside of the crate (`impl {} for {}`) -- implement it for a local type or a local wrapper", prog.def_path(td), crate::typeck::ty_to_string(false, prog, self, st)))),
                     }
                 }
             }
         }
+        errors
+    }
+
+    /// Coherence (N:rustc_hir_analysis/src/coherence/mod.rs:126-170 coherent_trait: orphan
+    /// check, then the overlap check of specialization_graph_of; inherent_impls_overlap.rs)
+    /// checked now, its errors reported as collection errors (orphan) and through the
+    /// diagnostics context (overlap). Lead decision 53.2: coherence is not on a run's startup
+    /// path -- `collect_declarations` leaves it out, a run checks it in the background after
+    /// the first present (Tcx::report_coherence), `relax check` and the other full collections
+    /// (`collect`) here. Selection never reads its verdicts (nightly reports coherence errors
+    /// and selection proceeds), so where it runs changes no other answer.
+    pub fn check_coherence(&mut self, prog: &Program) {
+        for (imp, pos, message) in self.orphan_errors(prog) {
+            let m = prog.record_error(prog.def(imp).file, pos, "typeck", message);
+            self.err_sink.get_mut().unwrap_or_else(|e| e.into_inner()).push(m);
+        }
+        self.flush_errs();
+        self.coherence_check(prog);
+    }
+
+    /// check_coherence for a run's background check: every error goes to the diagnostics
+    /// context, which the run reports as it reports the other compile errors.
+    /// `orphan_done`: the orphan errors were reported by an earlier, preempted attempt (the
+    /// overlap queries are memoized: an attempt again reports nothing twice).
+    pub fn report_coherence(&self, prog: &Program, orphan_done: &mut bool) {
+        if !*orphan_done {
+            let errors = self.orphan_errors(prog);
+            for (imp, pos, message) in errors {
+                self.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: imp, span: pos }, message);
+            }
+            *orphan_done = true;
+        }
+        self.coherence_check(prog);
     }
 
     /// A local type for the orphan rules: an ADT or trait object of crate `krate`, or one behind
@@ -593,8 +639,17 @@ impl Tcx {
         self.queries.file_bodies_changed(files, epoch);
     }
 
-    /// Collects impls, ADTs and constants; registers functions for signature queries.
+    /// collect_declarations, then coherence (check_coherence): every collection but a run's
+    /// startup, which checks coherence in the background.
     pub fn collect(&mut self, prog: &Program) {
+        self.collect_declarations(prog);
+        self.check_coherence(prog);
+        self.seal_collected_diagnostics();
+    }
+
+    /// Collects impls and ADTs; registers functions and constants for their declaration
+    /// queries. Coherence is not checked (check_coherence / report_coherence).
+    pub fn collect_declarations(&mut self, prog: &Program) {
         self.queries.register_files(prog.files.len());
         self.queries.register_crates(prog.crates.len());
         let cx_state = crate::tcx::EvalState::new();
@@ -608,7 +663,6 @@ impl Tcx {
         self.collect_adt_destructors(prog);
         self.seal_collected_diagnostics();
         self.publish_collected();
-        self.coherence_check(prog);
     }
 
     fn collect_all(&mut self, cx: &crate::tcx::EvalCx<'_>, prog: &Program) {
@@ -675,7 +729,6 @@ impl Tcx {
                 }
             }
         }
-        self.orphan_check(cx, prog);
         let t1 = std::time::Instant::now();
         for ii in 0..prog.impls.len() {
             let d = prog.impls[ii].def;
@@ -709,8 +762,8 @@ impl Tcx {
             self.apply_adt(d, p);
         }
         let t3 = std::time::Instant::now();
-        // Allocate only the publication cells. Function declarations are lowered by
-        // their first reader, after impl/ADT inputs are complete.
+        // Allocate only the publication cells. Function and const/static declarations
+        // are lowered by their first reader, after impl/ADT inputs are complete.
         for di in 0..prog.defs.len() {
             let d = DefId(di as u32);
             let def = prog.def(d);
@@ -718,7 +771,9 @@ impl Tcx {
                 DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                     self.sigs.insert(d, Default::default());
                 }
-                DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => self.collect_const(cx, prog, d),
+                DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
+                    self.const_tys.insert_declaration(d);
+                }
                 _ => {}
             }
         }
@@ -775,6 +830,7 @@ impl Tcx {
         // errors: they go to `errors` first, and only this collection's are returned
         self.flush_errs();
         let n0 = self.errors.len();
+        self.reset_const_decls_with_misses();
         self.lang_items.collect(prog, defs, &mut self.errors);
         let mut impls_added = Vec::new();
         for &d in defs {
@@ -817,7 +873,9 @@ impl Tcx {
                 DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
                     self.sigs.insert(d, Default::default());
                 }
-                DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => self.collect_const(cx, prog, d),
+                DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
+                    self.const_tys.insert_declaration(d);
+                }
                 _ => {}
             }
         }
@@ -849,10 +907,9 @@ impl Tcx {
         self.sigs.retain(|d, _| !gone.contains(d));
         self.adts.retain(|d, _| !gone.contains(d));
         self.ctor_sigs.retain(|d, _| !gone.contains(d));
-        self.const_tys.retain(|d, _| !gone.contains(d));
+        self.const_tys.retain(|d| !gone.contains(d));
         self.nominal_region_contracts.retain(|d, _| !gone.contains(d));
         self.contracts_waiting.retain(|d| !gone.contains(d));
-        self.const_region_contracts.retain(|d, _| !gone.contains(d));
         self.impl_self.retain(|d, _| !gone.contains(d));
         self.impl_trait.retain(|d, _| !gone.contains(d));
         self.impl_generics.retain(|d, _| !gone.contains(d));
@@ -885,10 +942,9 @@ impl Tcx {
                 self.trait_closure.insert(d, all);
             }
         }
-        self.orphan_check(&EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &EvalState::new()), prog);
         self.flush_errs();
         self.publish_collected();
-        self.coherence_check(prog);
+        self.check_coherence(prog);
     }
 
     /// Hot reload: takes impls a refused version added out of the impl tables.
@@ -1204,7 +1260,7 @@ impl Tcx {
                     let discr = if let Some(e) = v.disc {
                         distance_from_explicit = 0;
                         let did = prog.node_id_to_def_id[&(file, relax_front::def_collector::NodeId::AnonConst(e))];
-                        self.const_tys.insert(did, discr_ty);
+                        self.const_tys.feed(did, discr_ty);
                         VariantDiscr::Explicit(did)
                     } else {
                         VariantDiscr::Relative(distance_from_explicit)
@@ -1291,6 +1347,23 @@ impl Tcx {
         })
     }
 
+    /// fn_sig(d).header.abi without lowering the signature: lower_fn_header reads it from
+    /// the written header alone (an unsupported ABI is reported by the signature and is Rust
+    /// there), so a reader that needs only the ABI (a slot's entry linkage) does not compute
+    /// the signature and its owner's bound-variable table. None: no fn signature.
+    pub fn fn_abi(&self, prog: &Program, d: DefId) -> Option<Abi> {
+        let cell = self.sigs.get(&d)?;
+        if let Some(parts) = cell.get() { return parts.sig.as_ref().map(|s| s.header.abi); }
+        let def = prog.def(d);
+        let file = &prog.files[def.file as usize];
+        let ItemKind::Fn(sig, _, _) = &file.ast.item(def.item).kind else { return None };
+        Some(match file.ast.fn_sig(*sig).abi {
+            None => Abi::Rust,
+            Some(None) => Abi::C,
+            Some(Some(a)) => Abi::from_name(file.text(a).trim_matches('"')).unwrap_or(Abi::Rust),
+        })
+    }
+
     #[inline]
     /// Signatures computed with errors (a type in a module the lazy selection had skipped) are
     /// computed again on next use: the post-boot loader calls this after it loads modules.
@@ -1309,7 +1382,9 @@ impl Tcx {
 
     /// Diagnostics belong to the declaration and are available to every checker,
     /// including readers that arrive after another worker initialized it.
+    /// A const/static item's are its declared type's (Tcx::const_ty).
     pub fn signature_errors(&self, prog: &Program, d: DefId) -> &[String] {
+        if let Some(cell) = self.const_tys.declaration(&d) { return &self.const_decl(prog, d, cell).errors; }
         self.signature_parts(prog, d).map_or(&[], |p| p.errors.as_slice())
     }
 
@@ -1739,21 +1814,83 @@ impl Tcx {
         }
     }
 
-    fn collect_const(&mut self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) {
+    /// type_of for a const/static item (N:rustc_hir_analysis/src/collect/type_of.rs:228-262,
+    /// ItemKind::Const/Static and TraitItem/ImplItem consts: the written type, lowered in the
+    /// item's generic environment), with its region contract (what borrowck's universal
+    /// regions of the constant's body read). On demand, like nightly's type_of query: the
+    /// first reader lowers it; its errors stay with the declaration (signature_errors).
+    /// None: not a const/static item (anonymous constants are fed, `ConstTypes`), or an
+    /// item without a written type.
+    pub fn const_ty(&self, prog: &Program, d: DefId) -> Option<TyId> {
+        match self.const_tys.declaration(&d) {
+            Some(cell) => self.const_decl(prog, d, cell).ty,
+            None => self.const_tys.fed_type(&d),
+        }
+    }
+
+    /// The region contract of a const/static item's declared type (None: not one, or no type).
+    pub fn const_region_contract(&self, prog: &Program, d: DefId) -> Option<&outlives::RegionContract> {
+        let cell = self.const_tys.declaration(&d)?;
+        self.const_decl(prog, d, cell).region_contract.as_ref()
+    }
+
+    #[inline]
+    fn const_decl<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<ConstDecl>>) -> &'a ConstDecl {
+        let decl = match cell.get() {
+            Some(decl) => decl,
+            None => self.init_const_decl(prog, d, cell),
+        };
+        // the post-boot loader's misses travel with the declaration (as Body::deferred_misses):
+        // a reader fails for the same skipped modules as the lowering, and the load that adds
+        // them resets the declaration (reset_const_decls_with_misses)
+        if !decl.misses.is_empty() { crate::program::note_misses(&decl.misses); }
+        decl
+    }
+
+    /// A load (or reload) may add a name a constant's type missed: those declarations are
+    /// lowered again by their next reader.
+    fn reset_const_decls_with_misses(&mut self) {
+        self.const_tys.reset_declarations_with_misses();
+    }
+
+    #[cold]
+    fn init_const_decl<'a>(&'a self, prog: &Program, d: DefId, cell: &'a std::sync::OnceLock<Box<ConstDecl>>) -> &'a ConstDecl {
+        cell.get_or_init(|| {
+            let _mem = crate::memstat::tag(crate::memstat::Tag::Sigs);
+            let state = EvalState::new();
+            let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(prog), &state);
+            let checkpoint = self.dcx.checkpoint();
+            let outer = cx.state.errors.replace(Some(Vec::new()));
+            let enclosing = crate::program::missing_save();
+            let mut decl = self.const_decl_uncached(&cx, prog, d);
+            decl.misses = crate::program::take_missing();
+            crate::program::missing_restore(enclosing);
+            decl.errors = cx.state.errors.replace(outer).unwrap_or_default();
+            if !decl.errors.is_empty() { cx.errors().note_reported_error(); }
+            let (errors, warnings) = cx.errors().take_since(checkpoint);
+            for error in errors {
+                let owner = if error.cause.body_id == NO_DEF { d } else { error.cause.body_id };
+                decl.errors.push(prog.record_error(prog.def(owner).file, error.cause.span, "signature", error.message));
+            }
+            for warning in warnings { eprintln!("warning: {}", warning.message); }
+            Box::new(decl)
+        })
+    }
+
+    fn const_decl_uncached(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> ConstDecl {
         let def = prog.def(d);
         let file = def.file;
         let module = self.item_module(prog, d);
-        let mut env = self.item_env(prog, d);
-        env.regions.enabled = true;
         let ast = &prog.files[file as usize].ast;
         let t = match &ast.item(def.item).kind {
             ItemKind::Const(Some(t), _) => *t,
             ItemKind::Static(_, t, _) => *t,
-            _ => return,
+            _ => return ConstDecl::default(),
         };
+        let mut env = self.item_env(prog, d);
+        env.regions.enabled = true;
         let ty = self.lower_ty(cx, prog, file, module, &env, t);
-        self.const_region_contracts.insert(d, self.region_contract(cx, prog, d, &env));
-        self.const_tys.insert(d, ty);
+        ConstDecl { ty: Some(ty), region_contract: Some(self.region_contract(cx, prog, d, &env)), errors: Vec::new(), misses: Vec::new() }
     }
 
     // ------------------------------------------------------------ type lowering
@@ -1869,7 +2006,7 @@ impl Tcx {
         // feed_anon_const_type (front-bck H5): a re-lowering whose expected type holds
         // inference/params (replaced by the error type above) never replaces the fed type.
         // A real type still replaces it: a live edit can change the parameter's type.
-        if expected_ty != self.tys.error || self.const_tys.get(&def_id).is_none() { self.const_tys.insert(def_id, expected_ty); }
+        if expected_ty != self.tys.error || self.const_tys.fed_type(&def_id).is_none() { self.const_tys.feed(def_id, expected_ty); }
         if expected_ty == self.tys.error { return self.tys.intern_const(ConstKind::Error); }
         // hir_ty_lowering/mod.rs:3083-3118 try_lower_anon_const_lit: a (negated) integer literal
         // whose kind matches the type (ty/consts/lit.rs:50-55 const_lit_matches_ty) is lowered

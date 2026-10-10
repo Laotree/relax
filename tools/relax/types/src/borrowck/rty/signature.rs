@@ -22,12 +22,11 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     let u = if body { SignatureRegions::function(tcx,rty.tx.prog,d) } else { SignatureRegions::function_call(tcx,rty.tx.prog,d) };
     let (inputs, output, contract, universals) = if let Some(u) = u.clone() {
         (u.inputs, u.output, u.contract, u.regions)
-    } else if let Some(t) = tcx.const_tys.get(&d) {
+    } else if let Some(t) = tcx.const_ty(rty.tx.prog, d) {
         (
             Vec::new(),
             t,
-            tcx.const_region_contracts
-                .get(&d)
+            tcx.const_region_contract(rty.tx.prog, d)
                 .cloned()
                 .unwrap_or_default(),
             Vec::new(),

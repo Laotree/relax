@@ -1440,7 +1440,7 @@ impl<'a> Lcx<'a> {
                 self.pos = ast.expr(e).lo;
                 self.const_init = true;
                 // stored at the item's declared type (`const P: &[u32] = &[1, 2, 3];` unsizes)
-                let t = match self.u.tcx.const_tys.get(&def) {
+                let t = match self.u.tcx.const_ty(&self.u.prog, def) {
                     Some(ct) => self.u.tcx.tys.subst_erasing_regions(ct, &self.b.args.clone()),
                     None => self.b.ty(e),
                 };
@@ -10391,7 +10391,7 @@ impl<'a> Lcx<'a> {
                                     (self.read_place(&pl, lt), lt)
                                 }
                                 Some(Res::Def(d)) => {
-                                    let ct = self.u.tcx.const_tys.get(&d).unwrap_or(self.u.tcx.tys.error);
+                                    let ct = self.u.tcx.const_ty(&self.u.prog, d).unwrap_or(self.u.tcx.tys.error);
                                     (self.const_val(d, Vec::new(), ct), ct)
                                 }
                                 _ => continue,

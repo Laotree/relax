@@ -8,7 +8,7 @@ use crate::consts::IsRigid;
 use crate::next_solver::search_graph::CandidateHeadUsages;
 pub mod structural_traits;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinImplSource { Misc, Trivial, Object(usize), TraitUpcasting(usize) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateSource { Impl(DefId), ParamEnv(bool), AliasBound(bool), BuiltinImpl(BuiltinImplSource) }

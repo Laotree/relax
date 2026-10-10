@@ -25,7 +25,7 @@ impl Tcx {
         match prog.def(def).kind {
             DefKind::TypeAlias | DefKind::AssocTy => Ok(self.alias_ty(&cx, prog, def)),
             DefKind::OpaqueTy => crate::type_queries::Providers { tcx: self, prog }.type_of_opaque_hir_typeck(def).map_err(|_| NoSolution)?,
-            DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::Static => self.const_tys.get(&def).ok_or(NoSolution),
+            DefKind::Const | DefKind::AssocConst | DefKind::AnonConst | DefKind::Static => self.const_ty(prog, def).ok_or(NoSolution),
             _ => panic!("type_of unsupported definition"),
         }
     }

@@ -244,6 +244,10 @@ impl Types {
         struct RigidnessFolder;
         impl TypeFolder for RigidnessFolder {
             fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
+                // fold.rs:643-656 RigidnessFoldMode::needs_change: nothing to change in a type
+                // without aliases (nightly's has_rigid_aliases; HAS_ALIAS records any alias, a
+                // superset, so the answer is the same)
+                if !tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ALIAS) { return ty; }
                 let ty = super_fold_ty(tys, ty, self, depth);
                 match tys.kind(ty) { TyKind::Alias(_, alias) => tys.intern(TyKind::Alias(crate::consts::IsRigid::No, alias.clone())), _ => ty }
             }

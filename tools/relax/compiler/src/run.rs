@@ -691,7 +691,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     *ROOT_DIR.lock().unwrap() = format!("{} {}", g.crates[g.root].name, root_dir);
     crate::program::collect_misses_begin();
     if let Some((first, _)) = collected_suffix { tcx.collect_collected_suffix(&prog, first); }
-    else if !collected_restored { tcx.collect(&prog); }
+    else if !collected_restored { tcx.collect_declarations(&prog); }
     // A signature, field or impl header that names a type in a file the lazy selection skipped
     // (a closure miss): load those files and collect again, until nothing is missing.
     loop {
@@ -707,7 +707,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         prog.link_deferred_modules(f0, d0);
         tcx = crate::tcx::Tcx::new();
         crate::program::collect_misses_begin();
-        tcx.collect(&prog);
+        tcx.collect_declarations(&prog);
     }
     phase("signatures", t);
     if !tcx.errors.is_empty() {
@@ -724,6 +724,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::jit::compile_watch(Some(("check: own errors", 0)));
         let mut pre = crate::macro_reg::derive_failures();
         pre.extend(watch_load_errors);
+        // A run checks coherence in the background; a check needs its errors now.
+        tcx.check_coherence(&prog);
         // the watch session reports its root crate's; a one-shot check every workspace crate's
         let checked = if watch || root_only || session.is_some() { vec![root] } else { crate::check::workspace_crates(&prog, root) };
         for k in checked {
@@ -856,6 +858,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 1;
     }
     jit::set_program_args(prog_args);
+    jit::start_background_coherence(&u);
     drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     // Classify the disk cache before workers add newly compiled entries.

@@ -95,7 +95,7 @@ impl DefiningTy {
                 }
                 (inputs, sig.ret, bound_regions)
             }
-            Self::Const(d) => (vec![],tcx.const_tys.get(&d).unwrap(),0),
+            Self::Const(d) => (vec![],tcx.const_ty(prog, d).unwrap(),0),
             Self::Closure { signature, bound, .. } => {
                 let TyKind::FnPtr(ins,out,_,_) = tcx.tys.kind(signature) else { unreachable!() };
                 let TyKind::FnPtr(_,_,_,n) = tcx.tys.kind(bound) else { unreachable!() };
@@ -201,8 +201,8 @@ impl SignatureRegions {
     fn function_signature(tcx: &Tcx, prog: &Program, owner: DefId, body: bool) -> Option<Self> {
         let (defining_ty,contract) = if let Some(sig) = tcx.fn_sig(prog, owner).or_else(|| tcx.ctor_sigs.get(&owner)) {
             (DefiningTy::FnDef(owner,body),sig.region_contract.clone())
-        } else { tcx.const_tys.get(&owner)?;
-            (DefiningTy::Const(owner),tcx.const_region_contracts.get(&owner).cloned().unwrap_or_default()) };
+        } else { tcx.const_ty(prog, owner)?;
+            (DefiningTy::Const(owner),tcx.const_region_contract(prog, owner).cloned().unwrap_or_default()) };
         Some(UniversalRegionsBuilder { tcx,prog,defining_ty,parent:None,contract }.build())
     }
     pub fn closure(rty: &Rty<'_>, owner: DefId, expr: u32) -> Option<Self> {
