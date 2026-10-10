@@ -169,6 +169,14 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
         "check" => {
             os::proc::exit(serve_rpc::check(sess, &args[2..]));
         }
+        // `relax selftest [--root-only] <package>`: a test of Relax itself -- every fn of the
+        // package's crates through the whole pipeline to machine code, every failure listed
+        // (check.rs); never through the check server
+        "selftest" => {
+            let mut a = vec!["--check".to_string(), "--selftest".to_string()];
+            a.extend(args[2..].iter().filter(|x| !matches!(x.as_str(), "--serve" | "--no-serve")).cloned());
+            os::proc::exit(run::cmd_run(sess, &a));
+        }
         "serve" => os::proc::exit(serve_rpc::cmd_serve(sess, &args[2..])),
         // `relax clean [-p <package>]`: remove the workspace's <target>/relax (clean.rs)
         "clean" => std::process::exit(clean::cmd_clean(&args[2..])),

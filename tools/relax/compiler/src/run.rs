@@ -170,6 +170,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut boundary: Option<Vec<String>> = None;
     let mut host_gen: Option<(String, String)> = None;
     let mut root_only = false;
+    let mut selftest = false;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
@@ -178,9 +179,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 i += 1;
             }
             "--ahead" => ahead = true,
-            // `relax check --root-only`: the root crate's fns and what they reach (the coverage
-            // before the whole-workspace check)
+            // `relax selftest --root-only`: the root crate's fns and what they reach
             "--root-only" => root_only = true,
+            // `relax selftest` (lib.rs): the check, then every fn compiled (check.rs)
+            "--selftest" => selftest = true,
             "--verbose" => driver_options.verbose = true,
             "--report-to" if i + 1 < args.len() => {
                 if let Err(e) = report_open(&args[i + 1]) {
@@ -731,7 +733,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // A run checks coherence in the background; a check needs its errors now.
         tcx.check_coherence(&prog);
         // the watch session reports its root crate's; a one-shot check every workspace crate's
-        let checked = if watch || root_only || session.is_some() { vec![root] } else { crate::check::workspace_crates(&prog, root) };
+        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
         for k in checked {
             pre.extend(crate::check::own_errors(&prog, k, &prog.errors, "resolve"));
             pre.extend(crate::check::own_errors(&prog, k, &tcx.errors, "typeck"));
@@ -759,8 +761,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         crate::jit::compile_watch(Some(("check: unit", 0)));
         let mut u = Unit::new(prog, tcx, core);
-        // every body is checked, so the files the selection skipped load first
-        unsafe { jit::load_all_skipped(&mut *u) };
+        // every body is checked, so the files the selection skipped load first: all of them for
+        // selftest, a watch session or --root-only; the checked (app) crates' for the app check
+        let t = Instant::now();
+        if selftest || watch || root_only || session.is_some() {
+            unsafe { jit::load_all_skipped(&mut *u) };
+        } else {
+            let crates = crate::check::app_crates(&u.prog, root);
+            unsafe { jit::load_skipped_of(&mut *u, &crates) };
+        }
+        phase("load checked files", t);
         crate::jit::compile_watch(Some(("check: crate", 0)));
         if let Some(b) = &boundary {
             if let Err(e) = crate::boundary::start(&u, b) {
@@ -785,7 +795,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let mut session = crate::serve::Session::new(u, root, pre);
             return session.watch(deep);
         }
-        let code = crate::check::check_crate(&mut u, root, pre, root_only);
+        let code = crate::check::check_crate(&mut u, root, pre, root_only, selftest);
         std::mem::forget(u);
         return code;
     }

@@ -7486,6 +7486,20 @@ pub unsafe fn load_all_skipped(up: *mut Unit) {
     unlock_unit();
 }
 
+/// `relax check`: the skipped files of the checked crates only (their bodies are what the check
+/// reads); other crates' files stay skipped unless a check needs them (check.rs loads them all
+/// and checks again then).
+pub unsafe fn load_skipped_of(up: *mut Unit, crates: &[u32]) {
+    lock_unit();
+    loop {
+        let prog = &(*up).prog;
+        let mods: Vec<u32> = prog.skipped_files.keys().copied().filter(|m| crates.contains(&prog.mods[*m as usize].krate)).collect();
+        if mods.is_empty() { break; }
+        load_modules(up, &mods, "check");
+    }
+    unlock_unit();
+}
+
 /// Modules the post-boot loader loaded (run.rs reports it).
 pub static DEFERRED_LOADS: AtomicU64 = AtomicU64::new(0);
 /// Hot-reload work in progress (a save being read, a transaction): the completion loader waits.

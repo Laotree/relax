@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `relax` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "fetch", "check", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition", "host-gen",
+    "run", "fetch", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition", "host-gen",
     "parse", "resolve", "file", "std-surface", "relax-lex", "help",
 ];
 
@@ -121,6 +121,7 @@ fn main_page(st: &Style) -> String {
     p.row("run <git-url> <package>", "Run an app straight from a git repository");
     p.row("fetch <git-url>", "Fetch a repository into the local store");
     p.row("check <package>", "Type- and borrow-check without running");
+    p.row("selftest <package>", "Test Relax: compile every fn of a package, list failures");
     p.row("test <file.rs> [filter]", "Run a crate's tests");
     p.row("live <file.rs> <edit.rs>...", "Run tests, then apply edits as live patches");
     p.row("fix --to-strict <package>", "Rewrite relaxed code to plain rustc Rust");
@@ -191,17 +192,30 @@ fn check_page(st: &Style) -> String {
     p.blank();
     p.usage("relax check [options] <package>");
     p.blank();
-    p.text("Checks the package and runs nothing: every fn of the workspace's crates");
-    p.text("and all they reach is type- and borrow-checked and compiled to machine code.");
-    p.text("Each failure prints as one line; `internal:` marks a Relax bug.");
+    p.text("Type- and borrow-checks every function of the package's workspace crates,");
+    p.text("like `cargo check`; compiles and runs nothing. Errors go to stderr.");
     p.section("Options:");
-    p.row("--root-only", "Only the root crate's fns and what they reach");
     p.row("--json", "One JSON object per diagnostic, then a summary");
     p.row("--serve", "Start (or use) the warm check server");
     p.row("--no-serve", "Never use the check server");
     p.row("--watch", "Re-check what each edit invalidates");
     p.row("--deep", "Also compile (with --watch)");
     p.text("The other `relax run` options apply too.");
+    p.out
+}
+
+fn selftest_page(st: &Style) -> String {
+    let mut p = Page::new(st, 16);
+    title(&mut p, "test Relax on a package");
+    p.blank();
+    p.usage("relax selftest [--root-only] <package>");
+    p.blank();
+    p.text("A test of Relax itself: compiles every function of the package's crates");
+    p.text("(and every instance, closure and drop glue they reach) through the whole");
+    p.text("pipeline to machine code, runs nothing, and lists every failure, one line");
+    p.text("each; `internal:` marks a Relax bug. Slow: minutes for a large app.");
+    p.section("Options:");
+    p.row("--root-only", "Start from the root crate's functions only");
     p.out
 }
 
@@ -275,6 +289,7 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         Some("run") => run_page(st),
         Some("fetch") => fetch_page(st),
         Some("check") => check_page(st),
+        Some("selftest") => selftest_page(st),
         Some("test") => test_page(st),
         Some("live") => live_page(st),
         Some("fix") => fix_page(st),

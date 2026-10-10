@@ -1,13 +1,16 @@
-//! `relax check`: compile without running (rustc `check-pass` / `build-pass`). Every function
-//! of the package's workspace crates (every loaded crate whose sources are in the workspace,
-//! std excepted) is type- and borrow-checked (generic ones polymorphically, as rustc checks
-//! generic bodies once), every non-generic one is compiled to machine code by the run's own
-//! per-function compile (`jit::compile_slot`), and so is every instance, closure and glue those
-//! reach (rustc's monomorphization collector for `build-pass`), on `RELAX_JOBS` threads. Every
-//! failure prints as one line (`file:line:col: error|internal: ..`); `internal` marks a Relax
-//! bug (a compiler panic, an error without a user-facing code, or an error inside std or a
-//! dependency rustc builds). The exit code is 0 when there are none. `--root-only` and the watch
-//! session's deep check (`collect_deep`) cover the root crate (and what it reaches) only.
+//! `relax check`: the app check, like `cargo check`: every function of the package's workspace
+//! crates (every loaded crate whose sources are in the workspace, std excepted) is type- and
+//! borrow-checked (generic ones polymorphically, as rustc checks generic bodies once); nothing
+//! is compiled or run. Errors print as one line each; the exit code is 0 when there are none.
+//!
+//! `relax selftest`: a test of Relax itself on a package -- the same checks, then every
+//! non-generic function is compiled to machine code by the run's own per-function compile
+//! (`jit::compile_slot`), and so is every instance, closure and glue those reach (rustc's
+//! monomorphization collector for `build-pass`), on `RELAX_JOBS` threads. Every failure prints
+//! as one line (`file:line:col: error|internal: ..`); `internal` marks a Relax bug (a compiler
+//! panic, an error without a user-facing code, or an error inside std or a dependency rustc
+//! builds). `--root-only` and the watch session's deep check (`collect_deep`) cover the root
+//! crate (and what it reaches) only.
 
 macro_rules! eprintln {
     ($($arg:tt)*) => { if !crate::diag::enabled() { std::eprintln!($($arg)*); } };
@@ -51,17 +54,26 @@ pub fn workspace_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     out
 }
 
-pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool) -> i32 {
-    let crates = if root_only { vec![root] } else { workspace_crates(&u.prog, root) };
-    check_crate_impl(u, root, &crates, errors, true).0
+/// The crates `relax check` checks: the application's own -- the root and the crates of the
+/// app's project tree that are not the framework (the one app-crate rule the check server and
+/// Gandalf use, reload.rs gandalf_app_roots), as `cargo check` re-checks only what changed.
+pub fn app_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
+    (0..prog.crates.len() as u32).filter(|&k| k == root || crate::borrowck::event::app_crate(prog, k)).collect()
+}
+
+/// `selftest`: every workspace crate, then every function compiled (see the module doc); else
+/// the app check of the application's crates.
+pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool, selftest: bool) -> i32 {
+    let crates = if root_only { vec![root] } else if selftest { workspace_crates(&u.prog, root) } else { app_crates(&u.prog, root) };
+    check_crate_impl(u, root, &crates, errors, true, selftest).0
 }
 
 /// The deep check's diagnostics without printing a second stream into a watch response.
 pub fn collect_deep(u: &mut Unit, root: u32) -> Vec<crate::diag::Diagnostic> {
-    check_crate_impl(u, root, &[root], Vec::new(), false).1
+    check_crate_impl(u, root, &[root], Vec::new(), false, true).1
 }
 
-fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<String>, emit: bool) -> (i32, Vec<crate::diag::Diagnostic>) {
+fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<String>, emit: bool, compile: bool) -> (i32, Vec<crate::diag::Diagnostic>) {
     let t_check = std::time::Instant::now();
     // a constant that cannot be evaluated is one reported failure, not the end of the check
     jit::COMPILE_ERRORS_FATAL.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -90,7 +102,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let generic = u.tcx.fn_sig(&u.prog, owner.owner).map_or(true, |s| s.n_generics > 0);
         // a fn whose where-clauses on concrete types cannot hold (`where &'a mut (): Clone`) is
         // type-checked but never compiled (rustc: impossible predicates are not codegened)
-        let impossible = if generic || in_trait { false } else {
+        // (only selftest compiles: the app check needs no such filter)
+        let impossible = if generic || in_trait || !compile { false } else {
             let infcx = relax_types::infer::InferCtxt::new(&u.tcx, crate::tcx::TypingMode::PostAnalysis, crate::tcx::TypingEnv::fully_monomorphized(&u.prog).limit);
 
             u.tcx.clauses_of(&u.prog, owner.owner).into_iter().any(|predicate| {
@@ -100,108 +113,119 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         fns.push((owner, generic || in_trait || impossible));
     }
     let n_own = fns.len();
+    let t_owners = t_check.elapsed();
     // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own
-    for anon in crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, root) {
+    for anon in crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.typeck(&u.prog, anon).errors.clone()));
         match r {
             Ok(e) => errors.extend(e),
             Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(anon))),
         }
     }
-    let mut checked = 0usize;
-    // the non-generic fns whose bodies type-check: compiled below, in parallel
-    let mut seeds = Vec::new();
-    for (owner, generic) in fns {
+    // every body owner type- and borrow-checked on RELAX_JOBS threads: typeck and the borrow
+    // checker are queries over the shared program and type context (as the run's typeck-ahead
+    // workers use them); results are merged in owner order
+    struct Outcome { errors: Vec<String>, diags: Vec<crate::diag::Diagnostic>, seed: Option<crate::program::DefId>, retry: bool }
+    let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
+    let upn = up as usize;
+    let check_one = move |owner: &crate::borrowck::body::CheckedBody, generic: bool| -> Outcome {
+        let uu = unsafe { &*(upn as *const Unit) };
+        let (prog, tcx) = (&uu.prog, &uu.tcx);
         let d = owner.owner;
-        if owner.kind != crate::borrowck::body::BodyKind::Function {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let body = u.tcx.typeck(&u.prog, d);
-                if !body.errors.is_empty() { return body.errors.clone(); }
-                if !crate::borrowck::enabled(options) { return Vec::new(); }
-                let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &crate::tcx::EvalState::new()), &u.prog, &u.tcx, &body);
-                crate::borrowck::note_verdict(&v);
-                if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
-                    for x in &v.unchecked { eprintln!("relax-check: borrowck unchecked: {}", x); }
-                }
-                borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&u.prog, 0, u.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
-                Vec::<String>::new()
-            }));
-            match r {
-                Ok(e) => errors.extend(e),
-                Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(d))),
+        let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, retry: false };
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let body = tcx.typeck(prog, d);
+            if !body.errors.is_empty() {
+                return (body.errors.clone(), Vec::new());
             }
-            continue;
-        }
-        if generic {
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-                let uu = &mut *up;
-                let body = uu.tcx.typeck(&uu.prog, d);
-                let errors = body.errors.clone();
-                if errors.is_empty() && crate::borrowck::enabled(options) {
-                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
-                    crate::borrowck::note_verdict(&v);
-                    borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &body.args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
-                }
-                errors
-            }));
-            match r {
-                Ok(e) => errors.extend(e),
-                Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(d))),
+            if !crate::borrowck::enabled(options) {
+                return (Vec::new(), Vec::new());
             }
-            continue;
-        }
-        let name = u.prog.def_path(d);
-        jit::compile_watch(Some((&format!("check typeck {}", name), 0)));
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            let errs = { let uu = &mut *up; uu.tcx.typeck(&uu.prog, d).errors.clone() };
-            // the borrow checker on the checked body (plans/relax-borrowck.md)
-            if errs.is_empty() && crate::borrowck::enabled(options) {
-                let uu = &mut *up;
-                let body = uu.tcx.typeck(&uu.prog, d);
-                if body.errors.is_empty() {
-                    let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(&uu.prog, &uu.tcx, crate::tcx::TypingEnv::fully_monomorphized(&uu.prog), &crate::tcx::EvalState::new()), &uu.prog, &uu.tcx, &body);
-                    crate::borrowck::note_verdict(&v);
-                    borrow_diagnostics.extend(crate::borrowck::lazy::report_checked(&uu.prog, 0, uu.tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &[], v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()));
-                    if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
-                        for x in v.unchecked {
-                            eprintln!("relax-check: borrowck unchecked: {}", x);
-                        }
-                    }
-                }
+            let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
+            crate::borrowck::note_verdict(&v);
+            if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
+                for x in &v.unchecked { eprintln!("relax-check: borrowck unchecked: {}", x); }
             }
-            errs
+            let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.clone() };
+            let diags = crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()).collect();
+            (Vec::new(), diags)
         }));
         match r {
-            Ok(errs) => {
-                if errs.is_empty() {
-                    seeds.push(d);
+            Ok((errs, diags)) => {
+                if errs.is_empty() && owner.kind == crate::borrowck::body::BodyKind::Function && !generic {
+                    out.seed = Some(d);
                 }
-                errors.extend(errs)
+                out.errors = errs;
+                out.diags = diags;
             }
+            // a module the check did not load (another crate's skipped file): checked again
+            // once every file is loaded
+            Err(p) if p.is::<crate::preempt::NeedsLoad>() => out.retry = true,
             Err(_) => {
-                let def = u.prog.def(d);
-                let pos = u.prog.files[def.file as usize].ast.item(def.item).lo;
-                errors.push(u.prog.record_error(def.file,pos,"typeck",format!("internal compiler error while type-checking {} -- Relax bug, report it",name)));
-            },
+                let def = prog.def(d);
+                let pos = prog.files[def.file as usize].ast.item(def.item).lo;
+                out.errors.push(prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- Relax bug, report it{}", prog.def_path(d), jit::take_ice_location())));
+            }
         }
-        checked += 1;
-        // the type/borrow check of a whole workspace frees as much as it allocates: return the
-        // allocator's free pages as it goes (Stage held 4.6 GB of them at the end of this loop)
-        if checked % 20_000 == 0 {
-            crate::memstat::trim();
+        // an error may be a name in a file the app check left unloaded: settled with all loaded
+        if !out.errors.is_empty() { out.retry = true; }
+        out
+    };
+    let t_par = t_check.elapsed();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
+    {
+        let results = std::sync::Mutex::new(Vec::with_capacity(fns.len()));
+        let (fns, next, results, check_one) = (&fns, &next, &results, &check_one);
+        std::thread::scope(|sc| {
+            for w in 0..jobs {
+                std::thread::Builder::new().name(format!("relax-check-ty-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some((owner, generic)) = fns.get(i) else { break };
+                        local.push((i, check_one(owner, *generic)));
+                        // return the allocator's free pages as the check goes (Stage held 4.6 GB)
+                        if i % 20_000 == 19_999 { crate::memstat::trim(); }
+                    }
+                    results.lock().unwrap().extend(local);
+                }).expect("check worker");
+            }
+        });
+        outcomes.extend(results.lock().unwrap().drain(..));
+    }
+    if std::env::var_os("RELAX_CHECK_TIMES").is_some() { std::eprintln!("relax-check: owners {:.2} s, anon consts {:.2} s, bodies {:.2} s ({} jobs)", t_owners.as_secs_f64(), (t_par - t_owners).as_secs_f64(), (t_check.elapsed() - t_par).as_secs_f64(), jobs); }
+    outcomes.sort_by_key(|(i, _)| *i);
+    // owners that failed or met an unloaded module: every skipped file loaded, checked again
+    // (only when some other crate's file is still skipped: else the first answer stands)
+    let skipped_left = unsafe { !(&*up).prog.skipped_files.is_empty() };
+    if skipped_left && outcomes.iter().any(|(_, o)| o.retry) {
+        unsafe { jit::load_all_skipped(up) };
+        for (i, o) in outcomes.iter_mut() {
+            if o.retry {
+                let (owner, generic) = &fns[*i];
+                *o = check_one(owner, *generic);
+            }
         }
     }
+    let mut seeds = Vec::new();
+    for (_, o) in outcomes {
+        errors.extend(o.errors);
+        borrow_diagnostics.extend(o.diags);
+        if let Some(d) = o.seed { seeds.push(d); }
+    }
+    let checked = seeds.len();
     let t_front = t_check.elapsed();
     // the type/borrow check's freed memory goes back before the compile starts (Stage: 4.6 GB
     // of malloc free pages held after it)
-    unsafe {
+    if compile { unsafe {
         let _job = jit::compile_job();
         jit::lock_unit();
         let mut d = jit::settle_drop(up);
         jit::unlock_unit();
         d.release_rir();
-    }
-    crate::memstat::trim();
+    } crate::memstat::trim(); }
     if crate::memstat::enabled() {
         crate::memstat::print("check: type/borrow checked", &crate::memreport::unit_sizes(unsafe { &*up }));
     }
@@ -213,7 +237,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // every seed, and every instance, closure and glue slot the compiled code reaches (generic
     // callees, drop glue, vtable methods, std), compiled to machine code by the run's per-fn
     // compile until no new slots appear
-    let failures = unsafe { compile_all(up, &seeds) };
+    let failures = if compile { unsafe { compile_all(up, &seeds) } } else { Vec::new() };
     let n_failed = failures.len();
     // what the builds reported besides their own failures: constants that could not be
     // evaluated (CTFE panics), recorded instead of ending the check
@@ -254,7 +278,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     if crate::memstat::enabled() {
         crate::memstat::print("check", &crate::memreport::unit_sizes(unsafe { &*up }));
     }
-    eprintln!("relax-check: {} crates checked, {} fns compiled from {} seeds, {} failed builds; type/borrow check {:.1} s, compile {:.1} s", crates.len(), unsafe { (&(*up).fns).len() }, seeds.len(), n_failed, t_front.as_secs_f64(), t_compile.as_secs_f64());
+    if compile {
+        eprintln!("relax-check: {} crates checked, {} fns compiled from {} seeds, {} failed builds; type/borrow check {:.1} s, compile {:.1} s", crates.len(), unsafe { (&(*up).fns).len() }, seeds.len(), n_failed, t_front.as_secs_f64(), t_compile.as_secs_f64());
+    } else {
+        eprintln!("relax-check: {} crates type- and borrow-checked in {:.1} s", crates.len(), t_front.as_secs_f64());
+    }
     errors.sort();
     errors.dedup();
     for e in errors.iter().filter(|_| emit) {
