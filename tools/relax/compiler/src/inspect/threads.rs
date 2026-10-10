@@ -75,7 +75,22 @@ impl Raw {
 
 pub use imp::{capture, list, self_os_id, tid_of_handle};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub use imp::{stack_hi_of_self, walk_regs_with};
+pub use imp::{stack_hi_of_self, walk_regs_with, Slot as HoldSlot};
+
+/// Pause: holds thread `tid` in its handler until `release_hold` (Linux).
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn hold_paused(tid: u64) -> Result<&'static HoldSlot, &'static str> {
+    imp::hold(tid, true)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn release_hold(s: &HoldSlot) {
+    imp::release(s)
+}
+
+/// Pause: Mach suspend / resume of one thread (macOS; suspends nest).
+#[cfg(target_os = "macos")]
+pub use imp::{resume, suspend};
 
 /// Walks frame records from `fp` (fp rule: [fp] = caller's fp, [fp+8] = return address), appending
 /// to `raw` until the chain ends, leaves the stack upwards order or `raw` is full.
@@ -198,6 +213,16 @@ mod imp {
             if self.port != 0 {
                 unsafe { mach_port_deallocate(task(), self.port) };
             }
+        }
+    }
+
+    pub fn suspend(t: &Thread) -> bool {
+        t.port != 0 && unsafe { thread_suspend(t.port) } == 0
+    }
+
+    pub fn resume(t: &Thread) {
+        if t.port != 0 {
+            unsafe { thread_resume(t.port) };
         }
     }
 
@@ -326,14 +351,21 @@ mod imp {
         Some((n, hex(w[1])?, hex(w[7])?, hex(w[8])?))
     }
 
-    // ---- the capture handshake (one capture at a time: the inspect thread)
+    // ---- holds: a thread stands still in the capture signal's handler
     //
-    // 0 idle; 1 asked (signal sent); 5 the handler claimed it; 2 registers ready, the thread
-    // waits; 3 released by the inspector; 4 the handler left
-    static STATE: AtomicU32 = AtomicU32::new(0);
-    static TARGET: AtomicI32 = AtomicI32::new(0);
-    /// rip, rsp, rbp, rbx, r12, r13, r14, r15, pthread handle
-    static REGS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+    // A slot per held thread. State: 0 free; 1 asked (signal sent); 5 the handler claimed it;
+    // 2 registers ready, the thread waits; 3 released by the inspector; 4 the handler left.
+    // A capture uses a slot for the time of one walk; `pause` keeps slots until `resume`.
+    const SLOTS: usize = 256;
+    pub struct Slot {
+        state: AtomicU32,
+        tid: AtomicI32,
+        /// rip, rsp, rbp, rbx, r12, r13, r14, r15, pthread handle
+        regs: [AtomicU64; 9],
+        /// a pause holds it (released by `resume`, not after one walk)
+        paused: std::sync::atomic::AtomicBool,
+    }
+    static HOLDS: [Slot; SLOTS] = [const { Slot { state: AtomicU32::new(0), tid: AtomicI32::new(0), regs: [const { AtomicU64::new(0) }; 9], paused: std::sync::atomic::AtomicBool::new(false) } }; SLOTS];
     static SIGNAL: AtomicI32 = AtomicI32::new(0);
 
     fn futex_wait(w: &AtomicU32, val: u32, ms: u64) {
@@ -346,30 +378,94 @@ mod imp {
     }
 
     /// The capture signal's handler, on the interrupted thread: hand over the registers, stand
-    /// still until the inspector is done with the stack. Async-signal-safe: atomics and futex
-    /// syscalls only.
+    /// still until released (a capture's walk, or a pause until `resume`). Async-signal-safe:
+    /// atomics and futex syscalls only.
     extern "C" fn on_capture(_sig: i32, _info: *mut u8, uc: *mut u8) {
         unsafe {
             let tid = syscall(SYS_GETTID) as i32;
-            if TARGET.load(Acquire) != tid || STATE.compare_exchange(1, 5, AcqRel, Relaxed).is_err() {
-                return; // a late signal of a capture that gave up
-            }
+            // the slot asked for this thread (a late signal of a capture that gave up finds none)
+            let Some(slot) = HOLDS.iter().find(|h| h.tid.load(Acquire) == tid && h.state.compare_exchange(1, 5, AcqRel, Relaxed).is_ok()) else { return };
             let gregs = uc.add(40) as *const u64;
             // REG_RIP 16, REG_RSP 15, REG_RBP 10, REG_RBX 11, REG_R12..R15 4..7
             for (k, g) in [16usize, 15, 10, 11, 4, 5, 6, 7].iter().enumerate() {
-                REGS[k].store(*gregs.add(*g), Relaxed);
+                slot.regs[k].store(*gregs.add(*g), Relaxed);
             }
-            REGS[8].store(pthread_self() as u64, Relaxed);
-            STATE.store(2, Release);
-            futex_wake(&STATE);
-            // a bounded hold: an inspector that died mid-walk must not stop this thread forever
+            slot.regs[8].store(pthread_self() as u64, Relaxed);
+            slot.state.store(2, Release);
+            futex_wake(&slot.state);
+            // a capture's hold is bounded (an inspector that died mid-walk must not stop this
+            // thread forever); a pause's lasts until resume, or 10 minutes
             let t0 = std::time::Instant::now();
-            while STATE.load(Acquire) == 2 && t0.elapsed().as_secs() < 5 {
-                futex_wait(&STATE, 2, 100);
+            loop {
+                if slot.state.load(Acquire) != 2 {
+                    break;
+                }
+                let limit = if slot.paused.load(Relaxed) { 600 } else { 5 };
+                if t0.elapsed().as_secs() >= limit {
+                    break;
+                }
+                futex_wait(&slot.state, 2, 100);
             }
-            STATE.store(4, Release);
-            futex_wake(&STATE);
+            slot.state.store(4, Release);
+            futex_wake(&slot.state);
         }
+    }
+
+    /// Asks thread `tid` to stand still in its handler; Some(slot) once its registers are in,
+    /// None when it did not answer in time (signals blocked, uninterruptible, ended).
+    pub fn hold(tid: u64, paused: bool) -> Result<&'static Slot, &'static str> {
+        let sig = install();
+        if sig == 0 {
+            return Err("no free real-time signal for stack capture");
+        }
+        let Some(slot) = HOLDS.iter().find(|h| h.state.compare_exchange(0, 1, AcqRel, Relaxed).is_ok()) else { return Err("too many held threads") };
+        slot.paused.store(paused, Relaxed);
+        slot.tid.store(tid as i32, Release);
+        if unsafe { syscall(SYS_TGKILL, getpid(), tid as i32, sig) } != 0 {
+            slot.tid.store(0, Relaxed);
+            slot.state.store(0, Release);
+            return Err("the thread ended");
+        }
+        let t0 = std::time::Instant::now();
+        loop {
+            match slot.state.load(Acquire) {
+                2 => return Ok(slot),
+                1 if t0.elapsed().as_millis() >= 250 => {
+                    if slot.state.compare_exchange(1, 0, AcqRel, Relaxed).is_ok() {
+                        slot.tid.store(0, Relaxed);
+                        return Err("no answer in 250 ms (signals blocked or uninterruptible)");
+                    }
+                }
+                st @ (1 | 5) => futex_wait(&slot.state, st, 10),
+                _ => return Err("capture handshake lost"),
+            }
+        }
+    }
+
+    /// Lets a held thread go and waits until it left its handler.
+    pub fn release(slot: &Slot) {
+        slot.state.store(3, Release);
+        futex_wake(&slot.state);
+        let t1 = std::time::Instant::now();
+        while slot.state.load(Acquire) == 3 && t1.elapsed().as_millis() < 1000 {
+            futex_wait(&slot.state, 3, 10);
+        }
+        slot.tid.store(0, Relaxed);
+        slot.paused.store(false, Relaxed);
+        slot.state.store(0, Release);
+    }
+
+    /// The slot holding `tid` now (a paused thread), if any.
+    fn held(tid: u64) -> Option<&'static Slot> {
+        HOLDS.iter().find(|h| h.tid.load(Acquire) == tid as i32 && h.state.load(Acquire) == 2)
+    }
+
+    fn walk_slot(slot: &Slot, raw: &mut Raw) {
+        let r = |k: usize| slot.regs[k].load(Relaxed);
+        let mut regs = super::super::cfi::Regs { rip: r(0), rsp: r(1), rbp: r(2), rbx: r(3), r12: r(4), r13: r(5), r14: r(6), r15: r(7) };
+        raw.handle = r(8);
+        raw.sp = regs.rsp;
+        walk(raw, &mut regs);
     }
 
     /// Installs the capture signal's handler (once, on the inspect thread's start): the first
@@ -424,41 +520,14 @@ mod imp {
                 raw.n = 0;
             }
         }
-        let sig = install();
-        if sig == 0 {
-            return Err("no free real-time signal for stack capture");
+        // a paused thread already stands still in its handler
+        if let Some(slot) = held(t.os_id) {
+            walk_slot(slot, raw);
+            return Ok(());
         }
-        TARGET.store(t.os_id as i32, Release);
-        STATE.store(1, Release);
-        if unsafe { syscall(SYS_TGKILL, getpid(), t.os_id as i32, sig) } != 0 {
-            STATE.store(0, Release);
-            return Err("the thread ended");
-        }
-        let t0 = std::time::Instant::now();
-        loop {
-            match STATE.load(Acquire) {
-                2 => break,
-                1 if t0.elapsed().as_millis() >= 250 => {
-                    if STATE.compare_exchange(1, 0, AcqRel, Relaxed).is_ok() {
-                        return Err("no answer in 250 ms (signals blocked or uninterruptible)");
-                    }
-                }
-                s @ (1 | 5) => futex_wait(&STATE, s, 10),
-                _ => return Err("capture handshake lost"),
-            }
-        }
-        let r = |k: usize| REGS[k].load(Relaxed);
-        let mut regs = super::super::cfi::Regs { rip: r(0), rsp: r(1), rbp: r(2), rbx: r(3), r12: r(4), r13: r(5), r14: r(6), r15: r(7) };
-        raw.handle = r(8);
-        raw.sp = regs.rsp;
-        walk(raw, &mut regs);
-        STATE.store(3, Release);
-        futex_wake(&STATE);
-        let t1 = std::time::Instant::now();
-        while STATE.load(Acquire) == 3 && t1.elapsed().as_millis() < 1000 {
-            futex_wait(&STATE, 3, 10);
-        }
-        STATE.store(0, Release);
+        let slot = hold(t.os_id, false)?;
+        walk_slot(slot, raw);
+        release(slot);
         Ok(())
     }
 

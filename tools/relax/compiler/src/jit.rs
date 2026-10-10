@@ -4855,6 +4855,35 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
     Ok((c.code, c.pc_map, c.relocs))
 }
 
+/// relax inspect's instrumented builds: slot `id` built again from its RIR with `edit` applied
+/// (probe calls added), then installed as part of patch group `gen` -- `rollback_gen(gen)`
+/// restores the code it replaced. Nothing is recorded in the disk cache and the slot's RIR stays
+/// the plain one (O3 and O2 installs skip instrumented slots: inspect::instrument::active).
+pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, edit: &mut dyn FnMut(&mut crate::rir::Func, &Unit)) -> Result<u64, String> {
+    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let options = &session.options;
+    let runtime = &session.runtime;
+    match (&*up).fns[id as usize].key.clone() {
+        FnKey::Sandbox(_) => return Err("a sandboxed twin cannot be instrumented".into()),
+        FnKey::Inst(d, _) if (&*up).prog.def(d).kind == crate::program::DefKind::ForeignFn => return Err("a foreign fn has no body".into()),
+        _ => {}
+    }
+    if (&*up).fns[id as usize].rir.is_none() {
+        build_rir(up, id)?;
+    }
+    let u = &mut *up;
+    let Some(rir) = u.fns[id as usize].rir.clone() else { return Err("no RIR for this slot".into()) };
+    let mut f: crate::rir::Func = (*rir).clone();
+    edit(&mut f, u);
+    let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
+    let c = {
+        let _scratch = crate::zone_alloc::scratch(runtime);
+        x64::compile(options, &cg, &u.env)
+    }?;
+    note_frame(id, c.frame_size, slot_bytes(&cg), false);
+    u.install(id, &c.code, &c.relocs, c.pc_map, gen)
+}
+
 /// Stack frame bytes of each slot's latest code (O1, O3): the compile report's frame
 /// columns (kernel-worker threads have 2 MiB stacks; Relax frames larger than rustc's
 /// overflowed them)
@@ -5605,7 +5634,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
     }
-    if u.fns[id as usize].o3.load(Ordering::Relaxed) {
+    if u.fns[id as usize].o3.load(Ordering::Relaxed) || crate::inspect::instrument::active(id) {
         O2_STATS[2].fetch_add(1, Ordering::Relaxed);
         return;
     }
@@ -9863,7 +9892,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_locked_ns += (t1 - t0) + (cpu_ns() - t2);
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
-            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && {
+            Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && !crate::inspect::instrument::active(id) && {
                 let (n, _) = crate::rir::split_unwind_info(&code);
                 u.link_check(&code[..n], &relocs)
             } => {

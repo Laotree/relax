@@ -14,6 +14,7 @@ pub mod cfi;
 pub mod events;
 mod hang;
 pub mod heap;
+pub mod instrument;
 pub mod mem;
 mod prof;
 pub mod timeline;
@@ -295,6 +296,13 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("top", "by=time|alloc|bytes|live [s=3] [n=15]", "the top functions by CPU time (prof) or allocation sites by allocated / live bytes (heap)"),
     ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
     ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
+    ("count", "<fn> [time=1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes and installed as a probe group G<n>"),
+    ("break", "<fn>|<file>:<line>", "breakpoint: a hit parks the thread at the call (stack intact) and raises a `break` event K<n>"),
+    ("probes", "", "installed probes with hits and time, parked breakpoints, pause state"),
+    ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
+    ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
+    ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
+    ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -333,7 +341,8 @@ fn dispatch(req: &Req, out: &mut Out) {
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),
-        "resume" => events::cmd_resume(req, out),
+        "resume" if !req.pos.is_empty() => events::cmd_resume(req, out),
+        "count" | "break" | "probes" | "rm" | "continue" | "pause" | "resume" => instrument::cmd(req, out),
         "" => out.err("empty request"),
         c => out.err(&format!("unknown command `{}` (try `help`)", c)),
     }
