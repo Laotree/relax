@@ -303,7 +303,9 @@ impl FlatArray<WherePred> for Ast {
 
 /// A path's segments: `len` consecutive entries of its tree's segment array from `lo`
 /// (Ast::segs). A prefix of a path is a path (`SegList { lo, len: n }`).
-/// The top bit of `n` is the path's leading `::` (Path::global).
+/// The top bit of `n` is the path's leading `::` (Path::global), the next one marks a qualified
+/// path `<T as Trait>::..`: its QSelf id is the `args` of the placeholder segment stored just
+/// before the first segment (Ast::qself).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SegList {
     pub lo: u32,
@@ -311,6 +313,8 @@ pub struct SegList {
 }
 
 const GLOBAL_BIT: u32 = 1 << 31;
+const QSELF_BIT: u32 = 1 << 30;
+const LEN_MASK: u32 = !(GLOBAL_BIT | QSELF_BIT);
 
 impl SegList {
     #[inline]
@@ -319,7 +323,7 @@ impl SegList {
     }
     #[inline]
     pub fn len(&self) -> usize {
-        (self.n & !GLOBAL_BIT) as usize
+        (self.n & LEN_MASK) as usize
     }
     #[inline]
     pub fn is_empty(&self) -> bool {
@@ -329,10 +333,26 @@ impl SegList {
     pub fn global(&self) -> bool {
         self.n & GLOBAL_BIT != 0
     }
-    /// The first `n` segments.
+    /// The path is `<T as Trait>::..` (its segment list is preceded by the QSelf placeholder).
+    #[inline]
+    pub fn has_qself(&self) -> bool {
+        self.n & QSELF_BIT != 0
+    }
+    /// This list marked as qualified (a tree being built: the placeholder precedes `lo`).
+    #[inline]
+    pub fn with_qself(self) -> SegList {
+        SegList { lo: self.lo, n: self.n | QSELF_BIT }
+    }
+    /// The same segments as a plain path (no `<T as Trait>` part).
+    #[inline]
+    pub fn without_qself(self) -> SegList {
+        SegList { lo: self.lo, n: self.n & !QSELF_BIT }
+    }
+    /// The first `n` segments (a qualified path's prefix is qualified).
     #[inline]
     pub fn prefix(&self, n: usize) -> SegList {
-        SegList::new(self.lo, (n as u32).min(self.len() as u32), self.global())
+        let len = (n as u32).min(self.len() as u32);
+        SegList { lo: self.lo, n: len | (self.n & !LEN_MASK) }
     }
 }
 
@@ -372,21 +392,32 @@ impl QSelfId {
     }
 }
 
-/// 16 bytes: segments (with the leading-`::` bit), the qualified self, the position.
+/// 12 bytes: segments (with the leading-`::` and qualified-self bits), the position.
 #[derive(Debug, Clone, Copy)]
 pub struct Path {
-    pub qself: QSelfId,
     pub segs: SegList,
     pub lo: u32,
 }
 
 impl Path {
+    /// no `<T as Trait>` part
+    #[inline]
+    pub fn no_qself(&self) -> bool {
+        !self.segs.has_qself()
+    }
+    /// `<T as Trait>::..` (Ast::qself has the part)
+    #[inline]
+    pub fn has_qself(&self) -> bool {
+        self.segs.has_qself()
+    }
     /// `::a::b`
     #[inline]
     pub fn global(&self) -> bool {
         self.segs.global()
     }
 }
+
+const _: () = assert!(std::mem::size_of::<Path>() == 12);
 
 #[derive(Debug, Clone, Copy)]
 pub struct QSelf {
@@ -1026,12 +1057,13 @@ impl Ast {
     /// A path's `<T as Trait>` part (in this tree or its lazily parsed part).
     #[inline]
     pub fn qself(&self, p: &Path) -> Option<&QSelf> {
-        if p.qself.is_none() {
+        if p.no_qself() {
             return None;
         }
-        match self.qselfs.get(p.qself.0.wrapping_sub(self.base[14]) as usize) {
+        let q = self.segs(SegList::new(p.segs.lo - 1, 1, false))[0].args.0;
+        match self.qselfs.get(q.wrapping_sub(self.base[14]) as usize) {
             Some(q) => Some(q),
-            None => self.part_or_panic("qself", p.qself.0).qself(p),
+            None => self.part_or_panic("qself", q).qself(p),
         }
     }
     /// A segment's or method call's generic arguments (in this tree or its lazily parsed part).

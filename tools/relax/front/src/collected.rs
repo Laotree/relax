@@ -166,14 +166,16 @@ crate::collected_enum!(crate::program::DefKind;
     11 => AssocFn, 12 => AssocConst, 13 => AssocTy, 14 => ForeignFn,
     15 => ForeignStatic, 16 => MacroRules, 17 => Prim(p), 18 => AnonConst, 19 => OpaqueTy, 20 => Closure, 21 => ForeignTy, 22 => Field);
 crate::collected_enum!(crate::ast::SegKind; 0 => Ident, 1 => SelfValue, 2 => SelfType, 3 => Super, 4 => Crate);
-crate::collected_fields!(crate::ast::Path, qself, segs, lo);
+crate::collected_fields!(crate::ast::Path, segs, lo);
 impl Codec for crate::ast::SegList {
-    fn put(&self, w: &mut Vec<u8>) { self.lo.put(w); self.len().put(w); self.global().put(w); }
+    fn put(&self, w: &mut Vec<u8>) { self.lo.put(w); self.len().put(w); self.global().put(w); self.has_qself().put(w); }
     fn get(r: &mut Decode<'_>) -> Option<Self> {
         let lo = u32::get(r)?;
         let len = u32::get(r)?;
-        if len >= 1 << 31 { return None; }
-        Some(Self::new(lo, len, bool::get(r)?))
+        if len >= 1 << 30 { return None; }
+        let global = bool::get(r)?;
+        let segs = Self::new(lo, len, global);
+        Some(if bool::get(r)? { segs.with_qself() } else { segs })
     }
 }
 

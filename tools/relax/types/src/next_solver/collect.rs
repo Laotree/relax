@@ -105,7 +105,7 @@ impl Tcx {
                 let mut subject = ty;
                 while let ast::Ty::Paren(inner) = ast.ty(subject) { subject = *inner; }
                 let ast::Ty::Path(path) = ast.ty(subject) else { continue; };
-                if path.qself.is_some() || path.segs.len() != 1 || ast.segs(path.segs)[0].kind != ast::SegKind::SelfType { continue; }
+                if path.has_qself() || path.segs.len() != 1 || ast.segs(path.segs)[0].kind != ast::SegKind::SelfType { continue; }
                 let mut binder = env.clone();
                 binder.regions = env.regions.with_binder(Some(BinderId::Where(generics.where_.lo + where_index as u32)));
                 self.lower_bounds(&cx, def_id, &binder, self_ty, bounds, false, filter, &mut out);
@@ -172,7 +172,7 @@ impl Tcx {
             let mut subject = subject;
             while let ast::Ty::Paren(inner) = ast.ty(subject) { subject = *inner; }
             let ast::Ty::Path(path) = ast.ty(subject) else { continue; };
-            if path.qself.is_some() || path.global() || path.segs.len() != 1 { continue; }
+            if path.has_qself() || path.global() || path.segs.len() != 1 { continue; }
             let segment = ast.segs(path.segs)[0];
             if !segment.args.is_none() { continue; }
             let name = prog.syms.get(prog.files[def.file as usize].text(segment.name));
@@ -425,7 +425,7 @@ fn param_where_bounds(prog: &Program, file: u32, generics: &ast::Generics, name:
         let WherePred::Bound { ty: mut subject, bounds, .. } = *predicate else { continue; };
         while let ast::Ty::Paren(inner) = ast.ty(subject) { subject = *inner; }
         let ast::Ty::Path(path) = ast.ty(subject) else { continue; };
-        if path.qself.is_some() || path.global() || path.segs.len() != 1 { continue; }
+        if path.has_qself() || path.global() || path.segs.len() != 1 { continue; }
         let segment = ast.segs(path.segs)[0];
         if !segment.args.is_none() || segment.kind == ast::SegKind::SelfType { continue; }
         if prog.syms.get(prog.files[file as usize].text(segment.name)) == name { out.push(bounds); }

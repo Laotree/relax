@@ -2421,7 +2421,7 @@ impl<'a> Fcx<'a> {
     /// param (rustc resolves the path as a type, then takes its ADT and args).
     fn assoc_struct_path(&mut self, path: &Path) -> Option<TyId> {
         let n = path.segs.len();
-        if n < 2 || path.qself != QSelfId::NONE {
+        if n < 2 || path.has_qself() {
             return None;
         }
         let s0 = self.ast().segs(path.segs)[0].clone();
@@ -2912,7 +2912,7 @@ impl<'a> Fcx<'a> {
             // resolve_qpath with a partial resolution: the unresolved segments go to
             // hir_ty_lowering's associated-path lowering)
             if segs.len() >= 2 {
-                let sub = Path { qself: path.qself, segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
+                let sub = Path { segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
                 let env = self.env.clone();
                 let t = self.tcx.lower_path_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, &sub, None);
                 let t = self.norm(t);
@@ -3113,7 +3113,7 @@ impl<'a> Fcx<'a> {
         // From::from even when the instance's U has an inherent `from`).
         // rustc_hir_analysis hir_ty_lowering lower_assoc_path / probe_single_bound_for_assoc_item
         let prefix_is_param = n == 2
-            && path.qself.is_none()
+            && path.no_qself()
             && match self.ast().segs(path.segs)[0].kind {
                 SegKind::SelfType => self.env.trait_def.is_some(),
                 _ => {
@@ -3737,7 +3737,7 @@ impl<'a> Fcx<'a> {
                 }
             }
         }
-        let sub = Path { qself: QSelfId::NONE, segs: path.segs.prefix(n), lo: path.lo };
+        let sub = Path { segs: path.segs.prefix(n).without_qself(), lo: path.lo };
         // `Self::Bits::EMPTY` / `T::Assoc::f`: the prefix is an associated-type projection,
         // lowered as a type path and normalized for this instance
         if n >= 2 && (self.ast().segs(path.segs)[0].kind == SegKind::SelfType || self.env.names.contains(&self.sym(self.ast().segs(path.segs)[0].name))) {

@@ -158,7 +158,7 @@ pub(crate) fn eval_query_expr(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: 
             };
             if fits(value) { Some(value) } else { None }
         }
-        ExprKind::Path(path) if path.qself.is_none() => {
+        ExprKind::Path(path) if path.no_qself() => {
             let segments = crate::program::path_segs(prog, file, path);
             if segments.is_empty() { return None; }
             if !path.global() && segments.len() == 1 {

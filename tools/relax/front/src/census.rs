@@ -600,7 +600,7 @@ impl<'p, 'a> Walker<'p, 'a> {
             match self.p.ast.ty(t) {
                 Ty::Ref(_, _, inner) => t = *inner,
                 Ty::Path(path) => {
-                    if path.qself.is_some() || path.segs.len() != 1 || self.p.ast.segs(path.segs)[0].args.is_some() {
+                    if path.has_qself() || path.segs.len() != 1 || self.p.ast.segs(path.segs)[0].args.is_some() {
                         // Box<T>
                         if path.segs.len() == 1 && self.text(self.p.ast.segs(path.segs)[0].name) == "Box" {
                             if let Some(a) = self.p.ast.gargs(self.p.ast.segs(path.segs)[0].args) {

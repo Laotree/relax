@@ -315,7 +315,7 @@ impl LifetimeResolver<'_> {
         // names one type constructor: a struct, union, enum or primitive type.
         let primitive = |file: u32, path: &ast::Path| -> Option<&'static str> {
             let a = &self.prog.files[file as usize].ast;
-            if !path.qself.is_none() || path.global() || path.segs.len() != 1 || a.gargs(a.segs(path.segs)[0].args).is_some() { return None; }
+            if !path.no_qself() || path.global() || path.segs.len() != 1 || a.gargs(a.segs(path.segs)[0].args).is_some() { return None; }
             let text = self.prog.files[file as usize].text(a.segs(path.segs)[0].name);
             crate::program::PRIMS.iter().find(|(name, _)| *name == text).map(|(name, _)| *name)
         };
@@ -340,7 +340,7 @@ impl LifetimeResolver<'_> {
                 while let Some(child) = referent.pop() {
                     match *ast.ty(child) {
                         ast::Ty::ImplicitSelf => { contains_self = true; break; }
-                        ast::Ty::Path(path) if path.qself.is_none() => {
+                        ast::Ty::Path(path) if path.no_qself() => {
                             if (path.segs.len() == 1 && ast.segs(path.segs)[0].kind == SegKind::SelfType) ||
                                 impl_self.is_some_and(|(d, prim)| match d {
                                     Some(d) => self.tcx.resolve_type_path_def(self.prog, self.file, self.module, &path) == Some(d),

@@ -346,7 +346,7 @@ impl LifetimeCollector<'_> {
         let file = self.prog.def(self.owner).file;
         let ast = &self.prog.files[file as usize].ast;
         if self.constrained {
-            if path.qself.is_some() { return; }
+            if path.has_qself() { return; }
             if path.segs.len() > 1 {
                 let root = ast.segs(path.segs)[0];
                 let symbol = self.prog.syms.get(self.prog.files[file as usize].text(root.name));
@@ -743,7 +743,7 @@ impl BoundVarContext<'_> {
         let segments = ast.segs(path.segs);
         let Some(segment) = segments.first() else { return; };
         let symbol = self.prog.syms.get(self.prog.files[self.file as usize].text(segment.name));
-        let parameter = path.qself.is_none() && segments.len() == 1 && segment.args.is_none() && symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name));
+        let parameter = path.no_qself() && segments.len() == 1 && segment.args.is_none() && symbol.is_some_and(|name| self.tcx.lifetime_path_is_parameter(self.prog, self.owner, name));
         if segment.kind == SegKind::SelfType && !parameter {
             self.tcx.dcx.report(self.cause(segment.name.lo), "precise capture cannot name the Self alias of an impl".into());
         } else if !parameter {
@@ -1099,7 +1099,7 @@ impl BoundVarContext<'_> {
                 if let ast::WherePred::Bound { hrtb, ty, bounds } = *pred {
                     if !hrtb.is_empty() { continue; }
                     if let ast::Ty::Path(path) = file.ast.ty(ty) {
-                        if path.qself.is_none() && path.segs.len() == 1 && file.text(file.ast.segs(path.segs)[0].name) == name { add(bounds); }
+                        if path.no_qself() && path.segs.len() == 1 && file.text(file.ast.segs(path.segs)[0].name) == name { add(bounds); }
                     }
                 }
             }

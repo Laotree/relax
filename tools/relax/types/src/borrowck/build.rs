@@ -1191,7 +1191,7 @@ impl<'a> Build<'a> {
             StmtKind::Assign(_, Rvalue::Aggregate(AggKind::Adt(t, _), _)) => *t,
             _ => return,
         };
-        let src = if p.qself.is_none() && p.segs.len() == 1 && self.ast.segs(p.segs)[0].kind == crate::ast::SegKind::SelfType {
+        let src = if p.no_qself() && p.segs.len() == 1 && self.ast.segs(p.segs)[0].kind == crate::ast::SegKind::SelfType {
             UserAnn::SelfTy
         } else if !v.is_empty() {
             UserAnn::Path(v)
@@ -1242,7 +1242,7 @@ impl<'a> Build<'a> {
         let self_ann = if let Some(q) = ast.qself(p) {
             Some(SelfAnn::Ty(q.ty))
         } else if n >= 2 {
-            let v = Self::path_args(ast, &crate::ast::Path { segs: p.segs.prefix(n - 1), qself: crate::ast::QSelfId::NONE, lo: p.lo });
+            let v = Self::path_args(ast, &crate::ast::Path { segs: p.segs.prefix(n - 1).without_qself(), lo: p.lo });
             if v.is_empty() { None } else { Some(SelfAnn::Args(v)) }
         } else {
             None
@@ -3496,7 +3496,7 @@ fn ast_ty_has_ref(ast: &Ast, t: crate::ast::TyId, depth: u32) -> bool {
 /// A single-segment path with type arguments (`PairCoupled<u32>` may be an alias
 /// `type PairCoupled<'a, T> = (&'a T, &'a T)` whose expansion holds references).
 fn ast_ty_is_local_alias_use(_ast: &Ast, p: &crate::ast::Path) -> bool {
-    p.qself.is_none() && p.segs.len() == 1 && matches!(_ast.gargs(_ast.segs(p.segs)[0].args), Some(crate::ast::GenericArgs::Angle(v)) if _ast.list(*v).iter().any(|a| matches!(a, crate::ast::GenericArg::Type(_))))
+    p.no_qself() && p.segs.len() == 1 && matches!(_ast.gargs(_ast.segs(p.segs)[0].args), Some(crate::ast::GenericArgs::Angle(v)) if _ast.list(*v).iter().any(|a| matches!(a, crate::ast::GenericArg::Type(_))))
 }
 
 pub fn unit_ty(tx: &Tx) -> TyId {

@@ -1704,7 +1704,7 @@ impl Tcx {
         for w in f.ast.list(sig.generics.where_).iter().chain(impl_where.iter()) {
             if let ast::WherePred::Bound { ty, bounds, .. } = w {
                 let simple = match f.ast.ty(*ty) {
-                    ast::Ty::Path(p) => p.qself.is_none() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].args.is_none(),
+                    ast::Ty::Path(p) => p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].args.is_none(),
                     _ => false,
                 };
                 if simple {
@@ -2043,7 +2043,7 @@ impl Tcx {
                     if let Some(&(_, cfile, cty)) = env.consts.iter().find(|c| c.0 == i) {
                         let cast = &prog.files[cfile as usize].ast;
                         if let ast::Ty::Path(cp) = cast.ty(cty) {
-                            if cp.qself.is_none() && cp.segs.len() == 1 {
+                            if cp.no_qself() && cp.segs.len() == 1 {
                                 let tn = prog.files[cfile as usize].text(cast.segs(cp.segs)[0].name);
                                 if crate::program::PRIMS.iter().any(|(pn, _)| *pn == tn) && tn != "usize" {
                                     let lo = ast.expr(*n).lo;
@@ -2099,7 +2099,7 @@ impl Tcx {
             _ => e,
         };
         if let ast::ExprKind::Path(p) = pf.ast.expr(unwrapped).kind {
-            if p.qself.is_none() && !p.global() && p.segs.len() == 1 {
+            if p.no_qself() && !p.global() && p.segs.len() == 1 {
                 let name = prog.syms.get(pf.text(pf.ast.segs(p.segs)[0].name));
                 for &(index, _, _) in &env.consts {
                     if env.names.get(index as usize).copied() == name {
@@ -2439,7 +2439,7 @@ impl Tcx {
             }
         }
         // `T::Name` on a generic param: the associated type of one of its bounds
-        if p.qself.is_none() && p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::Ident && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+        if p.no_qself() && p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::Ident && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
             let pn = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX - 1);
             if let Some(pi) = env.names.iter().rposition(|n| *n == pn) {
                 let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[1].name)).unwrap_or(u32::MAX);
@@ -2450,7 +2450,7 @@ impl Tcx {
                 return self.tys.error;
             }
         }
-        if p.qself.is_none() && p.segs.len() == 1 {
+        if p.no_qself() && p.segs.len() == 1 {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind == SegKind::SelfType {
                 return env.self_ty.unwrap_or(self.tys.error);
@@ -2465,7 +2465,7 @@ impl Tcx {
             }
         }
         let relaxed = || -> Option<DefId> {
-            if p.segs.len() != 1 || p.qself.is_some() || p.global() {
+            if p.segs.len() != 1 || p.has_qself() || p.global() {
                 return None;
             }
             let s = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name))?;
@@ -2478,7 +2478,7 @@ impl Tcx {
                 // (lazy loading) the skipped files this lookup missed in may define it
                 crate::program::missing_confirm(mark);
                 // a single name that exists elsewhere in the program: where to import it from
-                let help = if p.segs.len() == 1 && p.qself.is_none() {
+                let help = if p.segs.len() == 1 && p.no_qself() {
                     let f = &prog.files[file as usize];
                     match prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)) {
                         Some(s) => crate::typeck::import_help(prog, module, s, true),
@@ -2496,7 +2496,7 @@ impl Tcx {
         let def = prog.def(d);
         // a module named like a primitive (`use std::str;`, globs re-exporting std's modules)
         // does not hide the primitive type
-        if def.kind == DefKind::Mod && p.segs.len() == 1 && p.qself.is_none() {
+        if def.kind == DefKind::Mod && p.segs.len() == 1 && p.no_qself() {
             let name = f.text(prog.files[file as usize].ast.segs(p.segs)[0].name);
             for (pn, pr) in crate::program::PRIMS {
                 if pn == name {
@@ -2718,7 +2718,7 @@ impl Tcx {
     pub fn type_or_const_arg(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, t: ast::TyId) -> TyId {
         let ast = &prog.files[file as usize].ast;
         if let ast::Ty::Path(p) = ast.ty(t) {
-            if p.qself.is_none() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+            if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
                 let name = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX);
                 for &(index, _, _) in &env.consts {
                     if env.names.get(index as usize) == Some(&name) {
@@ -2889,7 +2889,7 @@ pub fn push_generics(prog: &Program, file: u32, g: &ast::Generics, env: &mut Gen
     for w in f.ast.list(g.where_) {
         if let ast::WherePred::Bound { ty, bounds, .. } = w {
             if let ast::Ty::Path(p) = f.ast.ty(*ty) {
-                if p.qself.is_none() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+                if p.no_qself() && p.segs.len() == 1 && prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
                     let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)).unwrap_or(u32::MAX - 1);
                     if let Some(i) = env.names.iter().rposition(|n| *n == name) {
                         for b in f.ast.list(*bounds) {

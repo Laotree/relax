@@ -216,7 +216,7 @@ pub fn rir_bytes(f: &crate::rir::Func) -> u64 {
 pub fn ast_nested(p: &crate::program::Program) -> Vec<(String, u64)> {
     use crate::ast::*;
     fn path(p: &Path) -> u64 {
-        if p.qself.is_some() {
+        if p.has_qself() {
             64
         } else {
             0

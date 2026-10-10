@@ -721,7 +721,7 @@ impl Parser<'_> {
                         out.push(TypeParameter { ty, bound_generic_params: bound.clone() });
                     }
                 }
-                if path.qself.is_some() { self.find_type_parameters(self.ast.qself(&path).unwrap().ty, names, bound, out); }
+                if path.has_qself() { self.find_type_parameters(self.ast.qself(&path).unwrap().ty, names, bound, out); }
                 for seg in segments { self.find_args_type_parameters(seg.args, names, bound, out); }
             }
             Ty::Ref(_, _, t) | Ty::Ptr(_, t) | Ty::Slice(t) | Ty::Array(t, _) | Ty::Paren(t) => self.find_type_parameters(t, names, bound, out),
@@ -841,7 +841,7 @@ impl Parser<'_> {
             for f in fields {
                 if let Ty::Path(p) = *self.ast.ty(f.ty) {
                     let segs = self.ast.segs(p.segs);
-                    if p.qself.is_none() && segs.len() == 1 && segs[0].args.is_none() {
+                    if p.no_qself() && segs.len() == 1 && segs[0].args.is_none() {
                         let n = String::from_utf8_lossy(self.bytes(segs[0].name.lo, segs[0].name.hi)).into_owned();
                         if seen.contains(&n) { continue; } seen.push(n);
                     }
@@ -899,7 +899,7 @@ impl Parser<'_> {
         loop { match *self.ast.ty(t) { Ty::Ref(_, _, inner) | Ty::Ptr(_, inner) => t = inner, _ => break } }
         match *self.ast.ty(t) {
             Ty::Tuple(ts) => ts.is_empty(),
-            Ty::Path(p) if p.qself.is_none() && p.segs.len() == 1 => {
+            Ty::Path(p) if p.no_qself() && p.segs.len() == 1 => {
                 let seg = self.ast.segs(p.segs)[0];
                 seg.args.is_none() && matches!(self.bytes(seg.name.lo, seg.name.hi), b"i8" | b"i16" | b"i32" | b"i64" | b"i128" | b"u8" | b"u16" | b"u32" | b"u64" | b"u128" | b"f16" | b"f32" | b"f64" | b"f128" | b"char" | b"bool")
             }

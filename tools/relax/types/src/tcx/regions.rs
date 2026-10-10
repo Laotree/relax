@@ -200,7 +200,7 @@ impl Tcx {
             let mut all = f.ast.list(*supers).to_vec();
             for w in f.ast.list(generics.where_) {
                 if let ast::WherePred::Bound { hrtb, ty, bounds } = w {
-                    if hrtb.is_empty() && matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.qself.is_none() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind == SegKind::SelfType) {
+                    if hrtb.is_empty() && matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.no_qself() && p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind == SegKind::SelfType) {
                         all.extend_from_slice(f.ast.list(*bounds));
                     }
                 }

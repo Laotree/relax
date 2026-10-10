@@ -706,7 +706,7 @@ impl<'a> Rty<'a> {
             }
         }
         // a type param / Self
-        if p.qself.is_none() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
+        if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() {
             let seg = &self.tx.prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind == SegKind::SelfType {
                 match env.self_slots.clone() {
@@ -750,7 +750,7 @@ impl<'a> Rty<'a> {
             }
         }
         // `Self::X` in an impl: the impl's assoc type
-        if p.qself.is_none() && p.segs.len() == 2 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::SelfType {
+        if p.no_qself() && p.segs.len() == 2 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].kind == SegKind::SelfType {
             if let Some(imp) = env.impl_def {
                 let name = self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[1].name);
                 if let Some(x) = self.impl_assoc_ty(imp, name) {
@@ -787,7 +787,7 @@ impl<'a> Rty<'a> {
             }
         }
         let k = self.tx.kind(t);
-        let def = if p.qself.is_none() { self.tx.tcx.resolve_type_path_def(self.tx.prog, file, env.module, p) } else { None };
+        let def = if p.no_qself() { self.tx.tcx.resolve_type_path_def(self.tx.prog, file, env.module, p) } else { None };
         match (def.map(|d| (d, self.tx.prog.def(d).kind)), k) {
             (Some((d, DefKind::Struct | DefKind::Enum | DefKind::Union)), TyKind::Adt(d2, args, _)) if d == d2 => {
                 let info = self.adt_info(d);
@@ -1232,7 +1232,7 @@ impl<'a> Rty<'a> {
         let ast_ = &self.tx.prog.files[file as usize].ast;
         match (ast_.ty(at), self.tx.kind(t)) {
             (AstTy::Paren(x), _) => self.alias_param_ty(file, *x, t, name, depth + 1),
-            (AstTy::Path(p), _) if p.qself.is_none() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() && self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[0].name).as_bytes() == name => Some(t),
+            (AstTy::Path(p), _) if p.no_qself() && p.segs.len() == 1 && self.tx.prog.files[file as usize].ast.segs(p.segs)[0].args.is_none() && self.text(file, self.tx.prog.files[file as usize].ast.segs(p.segs)[0].name).as_bytes() == name => Some(t),
             (AstTy::Ref(_, _, x), TyKind::Ref(_, i, _)) | (AstTy::Ptr(_, x), TyKind::Ptr(_, i)) | (AstTy::Slice(x), TyKind::Slice(i)) | (AstTy::Array(x, _), TyKind::Array(i, _)) => self.alias_param_ty(file, *x, i, name, depth + 1),
             (AstTy::Tuple(v), TyKind::Tuple(ts)) if v.len() == self.tx.tcx.tys.list(ts).len() => ast_.list(*v).iter().zip(self.tx.tcx.tys.list(ts).iter()).find_map(|(x, y)| self.alias_param_ty(file, *x, *y, name, depth + 1)),
             (AstTy::Path(p), TyKind::Adt(_, args, _)) => {

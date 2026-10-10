@@ -1967,7 +1967,7 @@ impl<'a> Parser<'a> {
         let mut more = Vec::new();
         for w in self.ast.list(generics.where_) {
             if let WherePred::Bound { ty, bounds, hrtb } = w {
-                if hrtb.is_empty() && matches!(self.ast.ty(*ty), Ty::Path(p) if p.qself.is_none() && matches!(self.ast.segs(p.segs), [s] if s.kind == SegKind::SelfType && s.args.is_none())) {
+                if hrtb.is_empty() && matches!(self.ast.ty(*ty), Ty::Path(p) if p.no_qself() && matches!(self.ast.segs(p.segs), [s] if s.kind == SegKind::SelfType && s.args.is_none())) {
                     more.extend_from_slice(self.ast.list(*bounds));
                 }
             }
@@ -2293,16 +2293,26 @@ impl<'a> Parser<'a> {
             }
             break;
         }
-        let segs = self.mk_segs(segs, global);
-        Ok(Path { qself, segs, lo })
+        let segs = self.mk_segs_q(segs, global, qself);
+        Ok(Path { segs, lo })
     }
 
     /// Stores a path's segments in the tree's segment array.
     pub fn mk_segs(&mut self, v: Vec<PathSeg>, global: bool) -> SegList {
+        self.mk_segs_q(v, global, QSelfId::NONE)
+    }
+
+    /// Stores a path's segments; a qualified path's QSelf id goes in a placeholder segment
+    /// just before them (Ast::qself).
+    pub fn mk_segs_q(&mut self, v: Vec<PathSeg>, global: bool, qself: QSelfId) -> SegList {
+        if qself.is_some() {
+            self.ast.path_segs.push(PathSeg { kind: SegKind::Ident, name: Ident::default(), args: GenericArgsId(qself.0) });
+        }
         let lo = self.ast.base[5] + self.ast.path_segs.len() as u32;
         let len = v.len() as u32;
         self.ast.path_segs.extend(v);
-        SegList::new(lo, len, global)
+        let segs = SegList::new(lo, len, global);
+        if qself.is_some() { segs.with_qself() } else { segs }
     }
 
     fn generic_args_angle(&mut self) -> PResult<GenericArgsId> {
@@ -3456,7 +3466,7 @@ impl<'a> Parser<'a> {
                 fields.push(FieldExpr { attrs, name, expr: e, shorthand: false });
             } else {
                 let segs = self.mk_segs(vec![PathSeg { kind: SegKind::Ident, name, args: GenericArgsId::NONE }], false);
-                let p = Path { qself: QSelfId::NONE, segs, lo: t.lo };
+                let p = Path { segs, lo: t.lo };
                 let e = self.mk_expr(ExprKind::Path(p), t.lo);
                 fields.push(FieldExpr { attrs, name, expr: e, shorthand: true });
             }
@@ -3509,7 +3519,7 @@ impl<'a> Parser<'a> {
                 Some(t) => {
                     let pat = self.mk_pat(Pat::Ident { by_ref: false, mutbl: false, name, sub: None });
                     let segs = self.mk_segs(vec![PathSeg { kind: SegKind::Ident, name, args: GenericArgsId::NONE }], false);
-                    let path = Path { qself: QSelfId::NONE, segs, lo: blo };
+                    let path = Path { segs, lo: blo };
                     let tail = self.mk_expr(ExprKind::Path(path), blo);
                     vec![Stmt::Let { attrs: List::EMPTY, pat, ty: Some(t), init: Some(body), else_: None }, Stmt::Expr(tail, false)]
                 }

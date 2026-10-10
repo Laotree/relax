@@ -402,7 +402,7 @@ impl DefCollector<'_> {
     }
 
     fn check_generic_path(&mut self, p: Path, type_ns: bool) {
-        if !self.legacy || self.checking_defs || p.global() || !p.qself.is_none() { return; }
+        if !self.legacy || self.checking_defs || p.global() || !p.no_qself() { return; }
         let Some(first) = self.ast.segs(p.segs).first() else { return; };
         let type_ns = type_ns || p.segs.len() > 1;
         let pf = &self.prog.files[self.file as usize];
@@ -635,7 +635,7 @@ impl DefCollector<'_> {
             _ => e,
         };
         match self.ast.expr(e).kind {
-            ExprKind::Path(p) => p.qself.is_none() && !p.global() && p.segs.len() == 1 && self.ast.gargs(self.ast.segs(p.segs)[0].args).is_none(),
+            ExprKind::Path(p) => p.no_qself() && !p.global() && p.segs.len() == 1 && self.ast.gargs(self.ast.segs(p.segs)[0].args).is_none(),
             _ => false,
         }
     }
@@ -791,7 +791,7 @@ impl DefCollector<'_> {
     /// The name lower_legacy_call looks up for a call of `callee`, if it gets that far.
     fn note_call_name(&mut self, callee: ExprId) {
         let ExprKind::Path(path) = self.ast.expr(callee).kind else { return; };
-        if !path.qself.is_none() { return; }
+        if !path.no_qself() { return; }
         let Some(last) = self.ast.segs(path.segs).last() else { return; };
         if self.ast.gargs(last.args).is_some() { return; }
         let text = self.prog.files[self.file as usize].text(last.name);
@@ -803,7 +803,7 @@ impl DefCollector<'_> {
     fn lower_legacy_call(&mut self, call: ExprId, callee: ExprId, args: List<ExprId>) {
         if self.legacy_calls.contains_key(&call) { return; }
         let ExprKind::Path(path) = self.ast.expr(callee).kind else { return; };
-        if !path.qself.is_none() { return; }
+        if !path.no_qself() { return; }
         let segments = self.ast.segs(path.segs);
         let Some(last) = segments.last() else { return; };
         if self.ast.gargs(last.args).is_some() { return; }
