@@ -7789,6 +7789,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     if cfg.fold && relax_codegen::loops::unroll_const_loops(options, func) {
         crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
     }
+    // Rust min/max with an operand that is never NaN: one minss/maxss (bounding boxes)
+    if cfg.fold {
+        crate::opt::min_max_non_nan(func);
+    }
     // compares value ranges decide (bounds checks of masked / branch-limited indices)
     if cfg.fold && relax_codegen::ranges::fold_ranges(options, func) {
         crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);

@@ -11239,3 +11239,91 @@ mod slot_layout_tests {
         assert_ne!(at[0], at[1]);
     }
 }
+
+/// Rust `min`/`max` (`FOp::Min`/`Max`: a NaN operand yields the other) with one operand that is
+/// never NaN become `a < b ? a : b` / `a > b ? a : b` (`MinLt`/`MaxGt`) with that operand second:
+/// `minss` returns its second operand when either is NaN, which is then the right answer -- one
+/// instruction instead of the five of the general NaN fix-up. Never NaN: non-NaN constants,
+/// integer conversions, and (to a fixpoint over every definition, loop-carried ones included)
+/// moves, negations / absolute values of such values and min/max results with such an operand
+/// (a bounding box's running `lo = lo.min(p)` from `f32::MAX`). Returns whether anything changed.
+pub fn min_max_non_nan(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    // candidates: vregs all of whose definitions are of a kind that can be non-NaN
+    let mut non_nan = vec![false; nv];
+    let mut seen = vec![false; nv];
+    let mut any_minmax = false;
+    for b in &f.blocks {
+        for i in &b.insts {
+            match i {
+                Inst::FBin(FOp::Min | FOp::Max, ..) => {
+                    any_minmax = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    if !any_minmax {
+        return false;
+    }
+    for p in &f.params {
+        seen[p.0 as usize] = true; // params: unknown
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            let ok = match i {
+                Inst::Fconst(_, bits, f64_) => {
+                    if *f64_ { !f64::from_bits(*bits).is_nan() } else { !f32::from_bits(*bits as u32).is_nan() }
+                }
+                Inst::Conv(Conv::IntToF(..), ..) => true,
+                Inst::Mov(..) | Inst::FUnary(FUn::Neg | FUn::Abs, ..) | Inst::FBin(FOp::Min | FOp::Max | FOp::MinLt | FOp::MaxGt, ..) => true,
+                _ => false,
+            };
+            for_defs(i, |d| {
+                let k = d.0 as usize;
+                if !seen[k] {
+                    seen[k] = true;
+                    non_nan[k] = ok;
+                } else if !ok {
+                    non_nan[k] = false;
+                }
+            });
+        }
+    }
+    // operands decide, to a fixpoint (only falls)
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            for i in &b.insts {
+                let (d, ok) = match *i {
+                    Inst::Mov(d, s) => (d, non_nan[s.0 as usize]),
+                    Inst::FUnary(FUn::Neg | FUn::Abs, _, d, s) => (d, non_nan[s.0 as usize]),
+                    Inst::FBin(FOp::Min | FOp::Max, _, d, a, b2) => (d, non_nan[a.0 as usize] || non_nan[b2.0 as usize]),
+                    Inst::FBin(FOp::MinLt | FOp::MaxGt, _, d, _, b2) => (d, non_nan[b2.0 as usize]),
+                    _ => continue,
+                };
+                if non_nan[d.0 as usize] && !ok {
+                    non_nan[d.0 as usize] = false;
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut any = false;
+    for b in &mut f.blocks {
+        for i in &mut b.insts {
+            if let Inst::FBin(op @ (FOp::Min | FOp::Max), w, d, a, b2) = *i {
+                let lt = if op == FOp::Min { FOp::MinLt } else { FOp::MaxGt };
+                if non_nan[b2.0 as usize] {
+                    *i = Inst::FBin(lt, w, d, a, b2);
+                    any = true;
+                } else if non_nan[a.0 as usize] {
+                    *i = Inst::FBin(lt, w, d, b2, a);
+                    any = true;
+                }
+            }
+        }
+    }
+    any
+}
