@@ -384,11 +384,24 @@ pub fn loaded_crate_fingerprint(prog: &Program, ci: usize, previous: &[Option<u1
     let c = prog.crates.get(ci)?;
     // Match crate_fingerprints: `extern crate self as name` is not a dependency.
     // Genuine dependency cycles still wait for finish() to hash the completed graph.
-    let deps = c.deps.iter().filter(|&&(_, k)| k as usize != ci).map(|&(_, k)| {
-        let fp = previous.get(k as usize).copied().flatten()?;
-        let dep = prog.crates.get(k as usize)?;
-        Some((prog.syms.str(dep.name).to_string(), fp))
-    }).collect::<Option<Vec<_>>>()?;
+    // The dependencies as the preload saw them (the crate image's identity: the restore names
+    // its store from these), each bound by its (extern alias, crate name) pair -- not every
+    // extern crate the sources added while loading (brotli-decompressor's own
+    // `extern crate alloc_no_stdlib as alloc` made its load fingerprint differ from the
+    // restore's every run). Without preload records (no front images): the crate's deps.
+    let pre = prog.front_dep_names.get(ci).filter(|d| !d.is_empty());
+    let deps = match pre {
+        Some(names) => names.iter().map(|(alias, name)| {
+            let k = c.deps.iter().find(|&&(a, k)| prog.syms.str(a) == alias.as_str()
+                && prog.crates.get(k as usize).is_some_and(|d| prog.syms.str(d.name) == name.as_str())).map(|&(_, k)| k)?;
+            Some((name.clone(), previous.get(k as usize).copied().flatten()?))
+        }).collect::<Option<Vec<_>>>()?,
+        None => c.deps.iter().filter(|&&(_, k)| k as usize != ci).map(|&(_, k)| {
+            let fp = previous.get(k as usize).copied().flatten()?;
+            let dep = prog.crates.get(k as usize)?;
+            Some((prog.syms.str(dep.name).to_string(), fp))
+        }).collect::<Option<Vec<_>>>()?,
+    };
     let deps = crate::crate_image::canon_deps(deps);
     let inputs: Vec<_> = prog.file_crate.iter().enumerate().filter(|(i, k)|
         **k as usize == ci && !prog.front_macro_fragments.contains(i)).map(|(i, _)| {

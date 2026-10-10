@@ -3924,9 +3924,17 @@ impl FrontRecordView {
     fn new(prog: &crate::program::Program, ci: usize, fingerprint: impl Fn(usize) -> Option<u128>) -> Option<Self> {
         let c = prog.crates.get(ci)?;
         let deps = prog.front_dep_names.get(ci).cloned();
-        let by_name = |n: &str| (0..prog.crates.len()).find(|&k| prog.syms.str(prog.crates[k].name) == n);
+        // each dependency as the crate its (extern alias, crate name) pair binds in c.deps --
+        // the crate index the load's fingerprint (stable::loaded_crate_fingerprint) and the
+        // preload's image deps use -- not the first crate of that name: a graph can hold two
+        // crates of one name (Stage: cfg-if 1.0.4 and 1.0.5), and an alias can be both std's and
+        // a renamed dependency's (brotli-decompressor's `alloc` = alloc-no-stdlib). Either made the
+        // record's fingerprint differ from the load's every run, so no front graph certificate
+        // was ever written and every warm Stage load re-validated its 3,500 files.
+        let binds = |alias: &str, name: &str| c.deps.iter().find(|&&(a, k)| prog.syms.str(a) == alias
+            && prog.crates.get(k as usize).is_some_and(|d| prog.syms.str(d.name) == name)).map(|&(_, k)| k as usize);
         let dep_fps = deps.as_ref().and_then(|deps|
-            deps.iter().map(|(_, n)| by_name(n).and_then(&fingerprint)).collect());
+            deps.iter().map(|(alias, name)| binds(alias, name).and_then(&fingerprint)).collect());
         Some(Self {
             session: prog.session.clone(), name: prog.syms.str(c.name).to_owned(), root: c.root_path().to_owned(),
             edition: c.edition, cfg: c.cfg.set.clone(), proc_macro: c.proc_macro,
