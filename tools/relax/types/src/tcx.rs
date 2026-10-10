@@ -363,6 +363,7 @@ impl Tcx {
     /// Memory report lines: the type interner and the shared memo tables typeck fills.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
         let mut out = self.tys.mem_lines();
+        out.extend(self.queries.engine_mem_lines());
         let mut push = |name: &str, (n, b): (usize, usize)| out.push((format!("tcx {} ({})", name, n), b as u64));
         push("param envs", self.envs.mem_stats());
         push("alias_tys", self.alias_tys.mem_stats(|_, _| 0));

@@ -1,9 +1,10 @@
 // ported from N:rustc_middle/src/dep_graph/graph.rs @8d1a764
 use super::{QueryError, QueryId};
-use crate::fxhash::{HashMap, HashSet};
+use crate::fxhash::{FxHasher, HashMap, HashSet};
 use crate::sip::Sip128;
+use std::hash::{Hash, Hasher};
 use std::cell::{Cell, RefCell};
-use std::ops::Range;
+use std::ops::{Index, IndexMut, Range};
 use std::sync::Mutex;
 
 /// Stable encodings must use fixed widths, explicit endianness and length prefixes.
@@ -28,8 +29,17 @@ pub struct DepNode {
     pub key_fingerprint: Fingerprint,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DepNodeIndex(pub u32);
+
+impl Hash for DepNodeIndex {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Mix the page into the slot bits: otherwise key zero in every kind
+        // lands in the same small FxHashMap bucket in the sparse job table.
+        state.write_u32(self.0 ^ (self.0 >> 8));
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DepNodeColor {
@@ -38,108 +48,417 @@ pub enum DepNodeColor {
     Green,
 }
 
-pub(super) struct Node {
-    pub query: Option<QueryId>,
-    pub identity: DepNode,
-    pub eval_always: bool,
-    pub fingerprint: Option<Fingerprint>,
-    pub verified_at: u64,
-    pub changed_at: u64,
-    pub edges: Range<usize>,
-    pub error: Option<QueryError>,
-    pub error_at: u64,
+// Fixed-capacity chunks never reallocate their elements. Only the small directory
+// moves; a memo hit in QueryTable still bypasses the graph entirely.
+const CHUNK: usize = 1024;
+
+pub(super) struct Chunks<T> {
+    chunks: Vec<Vec<T>>,
+    len: usize,
 }
 
-/// Flat edge ranges follow rustc_middle/src/dep_graph/serialized.rs:99.
-/// Nodes retain their last verified revision: a lazy node can skip many edits.
+impl<T> Default for Chunks<T> {
+    fn default() -> Self { Self { chunks: Vec::new(), len: 0 } }
+}
+
+impl<T> Chunks<T> {
+    pub fn len(&self) -> usize { self.len }
+    fn push(&mut self, value: T) {
+        if self.len % CHUNK == 0 { self.chunks.push(Vec::with_capacity(CHUNK)); }
+        self.chunks.last_mut().unwrap().push(value);
+        self.len += 1;
+    }
+    fn bytes(&self) -> usize {
+        self.chunks.capacity() * std::mem::size_of::<Vec<T>>()
+            + self.chunks.iter().map(|c| c.capacity() * std::mem::size_of::<T>()).sum::<usize>()
+    }
+}
+
+impl<T> Index<usize> for Chunks<T> {
+    type Output = T;
+    #[inline]
+    fn index(&self, index: usize) -> &T { &self.chunks[index / CHUNK][index % CHUNK] }
+}
+impl<T> IndexMut<usize> for Chunks<T> {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut T { &mut self.chunks[index / CHUNK][index % CHUNK] }
+}
+
+fn hash(value: &impl Hash) -> u64 {
+    let mut h = FxHasher::default();
+    value.hash(&mut h);
+    h.finish()
+}
+
+// Buckets contain only indices. The authoritative key is in the indexed store,
+// so growing a table never copies identities or fingerprints.
+#[derive(Default)]
+struct IndexTable {
+    buckets: Vec<u32>,
+    len: usize,
+}
+const NONE: u32 = u32::MAX;
+
+impl IndexTable {
+    fn get(&self, hash: u64, equal: impl Fn(u32) -> bool) -> Option<u32> {
+        if self.buckets.is_empty() { return None; }
+        let mut slot = hash as usize & (self.buckets.len() - 1);
+        loop {
+            let index = self.buckets[slot];
+            if index == NONE { return None; }
+            if equal(index) { return Some(index); }
+            slot = (slot + 1) & (self.buckets.len() - 1);
+        }
+    }
+    fn insert(&mut self, index: u32, hash: u64, rehash: impl Fn(u32) -> u64) {
+        if (self.len + 1) * 4 > self.buckets.len() * 3 {
+            let size = (self.buckets.len() * 2).max(16);
+            let old = std::mem::replace(&mut self.buckets, vec![NONE; size]);
+            for index in old.into_iter().filter(|&i| i != NONE) { self.place(index, rehash(index)); }
+        }
+        self.place(index, hash);
+        self.len += 1;
+    }
+    fn place(&mut self, index: u32, hash: u64) {
+        let mut slot = hash as usize & (self.buckets.len() - 1);
+        while self.buckets[slot] != NONE { slot = (slot + 1) & (self.buckets.len() - 1); }
+        self.buckets[slot] = index;
+    }
+    fn bytes(&self) -> usize { self.buckets.capacity() * 4 }
+}
+
+#[derive(Default)]
+struct Fingerprints {
+    values: Chunks<Fingerprint>,
+    index: IndexTable,
+}
+impl Fingerprints {
+    fn intern(&mut self, value: Fingerprint) -> u32 {
+        let h = hash(&value);
+        if let Some(index) = self.index.get(h, |i| self.values[i as usize] == value) { return index; }
+        let index = u32::try_from(self.values.len()).expect("query fingerprint index overflow");
+        assert_ne!(index, NONE, "query fingerprint index overflow");
+        self.values.push(value);
+        self.index.insert(index, h, |i| hash(&self.values[i as usize]));
+        index
+    }
+}
+
+// Query keys include QueryTable's shard bits and are dense within a kind.
+// A page supplies the kind, key prefix and input flag once for 256 nodes. The
+// node index addresses that page/slot directly, so no reverse QueryId is stored.
+const PAGE: usize = 256;
+struct NodePage {
+    query: Option<QueryId>,
+    eval_always: bool,
+    nodes: Box<[Node; PAGE]>,
+}
+#[derive(Default)]
+pub(super) struct Nodes {
+    pages: Vec<NodePage>,
+    len: usize,
+    anon_next: Option<DepNodeIndex>,
+}
+impl Nodes {
+    pub fn len(&self) -> usize { self.len }
+    fn page(&mut self, query: Option<QueryId>, eval_always: bool) -> u32 {
+        let first = u32::try_from(self.pages.len() * PAGE).expect("query node limit");
+        self.pages.push(NodePage { query, eval_always, nodes: Box::new([Node::EMPTY; PAGE]) });
+        first
+    }
+    #[inline]
+    fn query(&self, index: DepNodeIndex) -> Option<QueryId> {
+        let base = self.pages[index.0 as usize / PAGE].query?;
+        Some(QueryId { kind: base.kind, key: base.key + index.0 % PAGE as u32 })
+    }
+    #[inline]
+    fn eval_always(&self, index: DepNodeIndex) -> bool { self.pages[index.0 as usize / PAGE].eval_always }
+    fn bytes(&self) -> usize {
+        self.pages.capacity() * std::mem::size_of::<NodePage>() + self.pages.len() * PAGE * std::mem::size_of::<Node>()
+    }
+    fn capacity(&self) -> usize { self.pages.len() * PAGE }
+}
+impl Index<usize> for Nodes {
+    type Output = Node;
+    #[inline]
+    fn index(&self, index: usize) -> &Node { &self.pages[index / PAGE].nodes[index % PAGE] }
+}
+impl IndexMut<usize> for Nodes {
+    #[inline]
+    fn index_mut(&mut self, index: usize) -> &mut Node { &mut self.pages[index / PAGE].nodes[index % PAGE] }
+}
+
+// The low two bits describe inline edges. Each revision has 15 inline bits;
+// crossing that width spills the full u64 pair rather than limiting revisions.
+const REVISION_WIDE: u32 = (1 << 15) - 1;
+
+// 20 bytes. Zero/one/two reads stay in these same two edge words; longer
+// lists use (start,len) in the packed edge array. Rare wide ranges spill.
+#[derive(Clone, Copy)]
+pub(super) struct Node {
+    key_fingerprint: u32,
+    fingerprint: u32,
+    revisions: u32,
+    edges: [u32; 2],
+}
+impl Node {
+    const EMPTY: Self = Self { key_fingerprint: NONE, fingerprint: NONE, revisions: 0, edges: [0, 0] };
+    #[inline]
+    pub fn has_fingerprint(&self) -> bool { self.fingerprint != NONE }
+}
+
+// A validation walk snapshots its descriptor once, as it did with the old
+// Range<usize>. Appending other nodes cannot change these immutable reads.
+pub(super) enum ReadEdges {
+    Inline([u32; 2], usize),
+    Stored(Range<usize>),
+}
+impl ReadEdges {
+    #[inline]
+    pub fn len(&self) -> usize { match self { Self::Inline(_, len) => *len, Self::Stored(range) => range.len() } }
+    #[inline]
+    pub fn get(&self, graph: &DepGraph, offset: usize) -> u32 {
+        match self { Self::Inline(reads, _) => reads[offset], Self::Stored(range) => graph.edges[range.start + offset] }
+    }
+}
+
+/// Flat u32 edges, with one (start, len) per node. Nodes retain their last
+/// verified revision: a lazy node can skip many edits.
 #[derive(Default)]
 pub(super) struct DepGraph {
-    pub nodes: Vec<Node>,
+    pub nodes: Nodes,
     pub edges: Vec<u32>,
-    pub indices: HashMap<QueryId, DepNodeIndex>,
-    identities: HashMap<DepNode, DepNodeIndex>,
+    indices: HashMap<(u16, u32), u32>,
+    identities: IndexTable,
+    fingerprints: Fingerprints,
     live_edges: usize,
-    anon_node_to_index: HashMap<(u64, Vec<u32>), DepNodeIndex>,
+    last_edges: Range<usize>,
+    anon_node_to_index: IndexTable,
+    pub errors: HashMap<DepNodeIndex, (u64, QueryError)>,
+    wide_revisions: HashMap<DepNodeIndex, [u64; 2]>,
+    wide_edges: HashMap<DepNodeIndex, Range<usize>>,
 }
 
 impl DepGraph {
+    pub fn find(&self, query: QueryId) -> Option<DepNodeIndex> {
+        let &page = self.indices.get(&(query.kind, query.key / PAGE as u32))?;
+        let index = DepNodeIndex(page + query.key % PAGE as u32);
+        (self.nodes[index.0 as usize].key_fingerprint != NONE).then_some(index)
+    }
+    #[inline]
+    pub fn query(&self, index: DepNodeIndex) -> Option<QueryId> { self.nodes.query(index) }
+    #[inline]
+    pub fn eval_always(&self, index: DepNodeIndex) -> bool { self.nodes.eval_always(index) }
+    pub fn identity(&self, index: DepNodeIndex) -> DepNode {
+        let n = &self.nodes[index.0 as usize];
+        DepNode { kind: DepKind(self.query(index).map_or(0, |q| q.kind)), key_fingerprint: self.fingerprints.values[n.key_fingerprint as usize] }
+    }
+    #[inline]
+    pub fn fingerprint(&self, index: DepNodeIndex) -> Option<Fingerprint> {
+        let id = self.nodes[index.0 as usize].fingerprint;
+        (id != NONE).then(|| self.fingerprints.values[id as usize])
+    }
+    #[inline]
+    pub fn revision(&self, index: DepNodeIndex, changed: bool) -> u64 {
+        let shift = if changed { 2 } else { 17 };
+        let revision = (self.nodes[index.0 as usize].revisions >> shift) & REVISION_WIDE;
+        if revision == REVISION_WIDE { self.wide_revisions[&index][changed as usize] } else { revision as u64 }
+    }
+    #[inline]
+    pub fn set_revision(&mut self, index: DepNodeIndex, changed: bool, revision: u64) {
+        let mut pair = [self.revision(index, false), self.revision(index, true)];
+        pair[changed as usize] = revision;
+        self.set_revisions(index, pair);
+    }
+    #[inline]
+    fn set_revisions(&mut self, index: DepNodeIndex, pair: [u64; 2]) {
+        if pair[0] >= REVISION_WIDE as u64 || pair[1] >= REVISION_WIDE as u64 {
+            if self.wide_revisions.is_empty() { eprintln!("query graph: retaining full-width revisions after {}", pair[0]); }
+            self.wide_revisions.insert(index, pair);
+        }
+        let node = &mut self.nodes[index.0 as usize];
+        node.revisions = ((pair[0].min(REVISION_WIDE as u64) as u32) << 17)
+            | ((pair[1].min(REVISION_WIDE as u64) as u32) << 2) | (node.revisions & 3);
+    }
+    fn stored_range(&self, index: DepNodeIndex) -> Range<usize> {
+        let node = &self.nodes[index.0 as usize];
+        if node.edges[1] == NONE { self.wide_edges[&index].clone() }
+            else { node.edges[0] as usize..node.edges[0] as usize + node.edges[1] as usize }
+    }
+    pub fn read_edges(&self, index: DepNodeIndex) -> ReadEdges {
+        let node = &self.nodes[index.0 as usize];
+        let mode = node.revisions & 3;
+        if mode < 3 { ReadEdges::Inline(node.edges, mode as usize) }
+        else { ReadEdges::Stored(self.stored_range(index)) }
+    }
+    #[inline]
+    pub fn reads(&self, index: DepNodeIndex) -> &[u32] {
+        let node = &self.nodes[index.0 as usize];
+        let mode = node.revisions & 3;
+        if mode < 3 { return &node.edges[..mode as usize]; }
+        &self.edges[self.stored_range(index)]
+    }
+    fn set_edges(&mut self, index: DepNodeIndex, range: Range<usize>) {
+        let node = &mut self.nodes[index.0 as usize];
+        node.revisions = (node.revisions & !3) | 3;
+        if range.start > u32::MAX as usize || range.len() >= NONE as usize {
+            node.edges[1] = NONE;
+            self.wide_edges.insert(index, range);
+        } else {
+            node.edges = [range.start as u32, range.len() as u32];
+            if !self.wide_edges.is_empty() { self.wide_edges.remove(&index); }
+        }
+    }
+    fn push(&mut self, query: Option<QueryId>, key: Fingerprint, eval_always: bool) -> DepNodeIndex {
+        let index = if let Some(query) = query {
+            let page = *self.indices.entry((query.kind, query.key / PAGE as u32)).or_insert_with(|| {
+                self.nodes.page(Some(QueryId { kind: query.kind, key: query.key / PAGE as u32 * PAGE as u32 }), eval_always)
+            });
+            DepNodeIndex(page + query.key % PAGE as u32)
+        } else {
+            let index = self.nodes.anon_next.take().unwrap_or_else(|| DepNodeIndex(self.nodes.page(None, false)));
+            if index.0 as usize % PAGE + 1 < PAGE { self.nodes.anon_next = Some(DepNodeIndex(index.0 + 1)); }
+            index
+        };
+        let key_fingerprint = self.fingerprints.intern(key);
+        self.nodes[index.0 as usize] = Node { key_fingerprint, ..Node::EMPTY };
+        self.nodes.len += 1;
+        index
+    }
     pub fn intern(&mut self, query: QueryId, key: Fingerprint, eval_always: bool) -> Result<DepNodeIndex, QueryError> {
         let identity = DepNode { kind: DepKind(query.kind), key_fingerprint: key };
-        if let Some(&index) = self.indices.get(&query) {
-            let node = &self.nodes[index.0 as usize];
-            if node.identity != identity || node.eval_always != eval_always {
+        if let Some(index) = self.find(query) {
+            if self.identity(index) != identity || self.eval_always(index) != eval_always {
                 return Err(QueryError::IdentityConflict(query));
             }
             return Ok(index);
         }
-        if self.identities.contains_key(&identity) {
+        let h = hash(&identity);
+        if self.identities.get(h, |i| self.identity(DepNodeIndex(i)) == identity).is_some() {
             return Err(QueryError::IdentityConflict(query));
         }
-        let index = DepNodeIndex(u32::try_from(self.nodes.len()).expect("query node limit"));
-        self.nodes.push(Node {
-            query: Some(query),
-            identity,
-            eval_always,
-            fingerprint: None,
-            verified_at: 0,
-            changed_at: 0,
-            edges: 0..0,
-            error: None,
-            error_at: 0,
+        let index = self.push(Some(query), key, eval_always);
+        let nodes = &self.nodes;
+        let fingerprints = &self.fingerprints;
+        self.identities.insert(index.0, h, |i| {
+            let n = &nodes[i as usize];
+            hash(&DepNode { kind: DepKind(nodes.query(DepNodeIndex(i)).unwrap().kind), key_fingerprint: fingerprints.values[n.key_fingerprint as usize] })
         });
-        self.indices.insert(query, index);
-        self.identities.insert(identity, index);
         Ok(index)
     }
 
-    /// graph.rs:432-481: one read reuses that node; other ordered read sets
-    /// are interned per session (a revision is Q1's incremental session).
+    /// One read reuses that node; ordered multi-read sets are interned per revision.
+    /// The index compares the packed edges themselves instead of keeping a second Vec.
     pub fn intern_anon(&mut self, revision: u64, reads: &[u32]) -> DepNodeIndex {
         if reads.len() == 1 { return DepNodeIndex(reads[0]); }
-        let key = (if reads.is_empty() { 0 } else { revision }, reads.to_vec());
-        if let Some(&index) = self.anon_node_to_index.get(&key) { return index; }
-        let index = DepNodeIndex(u32::try_from(self.nodes.len()).expect("query node limit"));
-        let mut hash = Sip128::new();
-        hash.write(&key.0.to_le_bytes());
-        for read in reads { hash.write(&read.to_le_bytes()); }
-        self.nodes.push(Node {
-            query: None,
-            identity: DepNode { kind: DepKind(0), key_fingerprint: Fingerprint(hash.finish128()) },
-            eval_always: false, fingerprint: None, verified_at: 0, changed_at: 0,
-            edges: 0..0, error: None, error_at: 0,
-        });
+        let key_revision = if reads.is_empty() { 0 } else { revision };
+        let mut h = Sip128::new();
+        h.write(&key_revision.to_le_bytes());
+        for read in reads { h.write(&read.to_le_bytes()); }
+        let key = Fingerprint(h.finish128());
+        let key_hash = hash(&key);
+        if let Some(index) = self.anon_node_to_index.get(key_hash, |i| {
+            let index = DepNodeIndex(i);
+            self.identity(index).key_fingerprint == key
+                && (reads.is_empty() || self.revision(index, true) == key_revision)
+                && self.reads(index) == reads
+        }) { return DepNodeIndex(index); }
+        let index = self.push(None, key, false);
         self.complete(index, revision, Fingerprint(0), reads);
-        self.anon_node_to_index.insert(key, index);
+        self.anon_node_to_index.insert(index.0, key_hash, |i| {
+            hash(&self.fingerprints.values[self.nodes[i as usize].key_fingerprint as usize])
+        });
         index
     }
 
-    pub fn complete(&mut self, index: DepNodeIndex, revision: u64, fingerprint: Fingerprint, reads: &[u32]) {
-        let node = &mut self.nodes[index.0 as usize];
-        if node.fingerprint != Some(fingerprint) {
-            node.changed_at = revision;
+    pub fn set_fingerprint(&mut self, index: DepNodeIndex, revision: u64, fingerprint: Fingerprint) {
+        if self.fingerprint(index) == Some(fingerprint) {
+            self.set_revision(index, false, revision);
+        } else {
+            self.nodes[index.0 as usize].fingerprint = self.fingerprints.intern(fingerprint);
+            self.set_revisions(index, [revision, revision]);
         }
-        node.fingerprint = Some(fingerprint);
-        node.verified_at = revision;
-        self.live_edges -= node.edges.len();
-        let start = self.edges.len();
-        self.edges.extend_from_slice(reads);
-        node.edges = start..self.edges.len();
-        self.live_edges += reads.len();
+    }
+
+    pub fn complete(&mut self, index: DepNodeIndex, revision: u64, fingerprint: Fingerprint, reads: &[u32]) {
+        self.set_fingerprint(index, revision, fingerprint);
+        // Identical reads need no new range, even when the result changes.
+        if self.reads(index) == reads { return; }
+        if self.nodes[index.0 as usize].revisions & 3 == 3 { self.live_edges -= self.reads(index).len(); }
+        if reads.len() <= 2 {
+            let node = &mut self.nodes[index.0 as usize];
+            node.edges[..reads.len()].copy_from_slice(reads);
+            node.revisions = (node.revisions & !3) | reads.len() as u32;
+            if !self.wide_edges.is_empty() { self.wide_edges.remove(&index); }
+        } else if &self.edges[self.last_edges.clone()] == reads {
+            // Adjacent queries often read the same declaration roots. Reuse
+            // that immutable range without allocating or hashing another set.
+            self.set_edges(index, self.last_edges.clone());
+            self.live_edges += reads.len();
+        } else {
+            let start = self.edges.len();
+            if reads.len() > self.edges.capacity() - self.edges.len() {
+                // Geometric growth retains amortised linear append work, with
+                // at most 12.5% unused edge capacity instead of almost 100%.
+                let capacity = (self.edges.capacity() + self.edges.capacity() / 8).max(self.edges.len() + reads.len()).max(16);
+                self.edges.reserve_exact(capacity - self.edges.len());
+            }
+            self.edges.extend_from_slice(reads);
+            self.last_edges = start..self.edges.len();
+            self.set_edges(index, self.last_edges.clone());
+            self.live_edges += reads.len();
+        }
     }
 
     // Called only between revisions; obsolete ranges cannot grow without bound.
     pub fn compact(&mut self) {
-        if self.edges.len() <= self.live_edges.saturating_mul(2) + 1024 {
-            return;
+        // Old result fingerprints can become unreachable after edits. Rebuild
+        // only after enough garbage accumulates to pay for a linear sweep.
+        if self.fingerprints.values.len() > self.nodes.len().saturating_mul(2) + CHUNK {
+            let mut fingerprints = Fingerprints::default();
+            for i in 0..self.nodes.capacity() {
+                let node = &mut self.nodes[i];
+                if node.key_fingerprint == NONE { continue; }
+                node.key_fingerprint = fingerprints.intern(self.fingerprints.values[node.key_fingerprint as usize]);
+                if node.fingerprint != NONE {
+                    node.fingerprint = fingerprints.intern(self.fingerprints.values[node.fingerprint as usize]);
+                }
+            }
+            self.fingerprints = fingerprints;
         }
+        if self.edges.len() <= self.live_edges.saturating_mul(2) + 1024 { return; }
         let mut edges = Vec::with_capacity(self.live_edges);
-        for node in &mut self.nodes {
+        for i in 0..self.nodes.capacity() {
+            let index = DepNodeIndex(i as u32);
+            if self.nodes[i].key_fingerprint == NONE || self.nodes[i].revisions & 3 != 3 { continue; }
             let start = edges.len();
-            edges.extend_from_slice(&self.edges[node.edges.clone()]);
-            node.edges = start..edges.len();
+            edges.extend_from_slice(self.reads(index));
+            self.set_edges(index, start..edges.len());
         }
         self.edges = edges;
+        self.last_edges = 0..0;
     }
+
+    pub fn mem_lines(&self) -> Vec<(String, u64)> {
+        let mut lines = vec![
+            (format!("query graph nodes ({}; Node {} B)", self.nodes.len(), std::mem::size_of::<Node>()), self.nodes.bytes() as u64),
+            (format!("query graph edges ({}; live {})", self.edges.len(), self.live_edges), (self.edges.capacity() * 4) as u64),
+            (format!("query graph indices ({})", self.indices.len()), map_bytes(&self.indices)),
+            (format!("query graph identities ({})", self.identities.len), self.identities.bytes() as u64),
+            (format!("query graph fingerprints ({})", self.fingerprints.values.len()), (self.fingerprints.values.bytes() + self.fingerprints.index.bytes()) as u64),
+            (format!("query graph anon ({})", self.anon_node_to_index.len), self.anon_node_to_index.bytes() as u64),
+        ];
+        lines.push((format!("query graph errors ({})", self.errors.len()), map_bytes(&self.errors)));
+        lines.push((format!("query graph wide revisions ({})", self.wide_revisions.len()), map_bytes(&self.wide_revisions)));
+        lines.push(("query graph wide edges".into(), map_bytes(&self.wide_edges)));
+        lines
+    }
+}
+
+pub(super) fn map_bytes<K, V>(map: &HashMap<K, V>) -> u64 {
+    if map.capacity() == 0 { return 0; }
+    let buckets = (map.capacity() * 8 / 7).next_power_of_two();
+    (buckets * (std::mem::size_of::<(K, V)>() + 1) + 16) as u64
 }
 
 /// First-read order and deduplication follow rustc_middle/src/dep_graph/graph.rs:450.
@@ -158,7 +477,7 @@ pub(super) struct TaskDeps {
 #[derive(Default)]
 pub(super) struct TaskReads {
     reads: Vec<u32>,
-    read_set: HashSet<u32>,
+    read_set: HashSet<DepNodeIndex>,
 }
 
 impl TaskDeps {
@@ -179,9 +498,9 @@ impl TaskDeps {
             if self.len == self.inline.len() && self.spill.read_set.is_empty() {
                 self.spill = spare.lock().unwrap_or_else(|e| e.into_inner()).pop().unwrap_or_default();
                 self.spill.reads.extend_from_slice(&self.inline);
-                for &read in &self.inline { self.spill.read_set.insert(read); }
+                for &read in &self.inline { self.spill.read_set.insert(DepNodeIndex(read)); }
             }
-            if !self.spill.read_set.insert(index) { return; }
+            if !self.spill.read_set.insert(DepNodeIndex(index)) { return; }
             self.spill.reads.push(index);
         }
         self.len += 1;

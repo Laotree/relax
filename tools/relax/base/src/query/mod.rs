@@ -56,7 +56,7 @@ pub(super) fn next_id() -> u64 {
 #[derive(Default)]
 struct State {
     graph: DepGraph,
-    jobs: Vec<QueryJob>,
+    jobs: HashMap<DepNodeIndex, QueryJob>,
     // Zero denotes an input kind; other owners are typed table identities.
     kinds: HashMap<u16, u64>,
 }
@@ -84,6 +84,16 @@ impl QueryEngine {
         Self { id: next_id(), revision: 1, state: Mutex::new(State::default()), task_reads: Mutex::new(Vec::new()), empty_anon: Default::default(), inputs: Default::default() }
     }
 
+    /// Exact backing capacities for the graph's compact stores. Called by the
+    /// opt-in memory report, never on the query hit path.
+    pub fn mem_lines(&self) -> Vec<(String, u64)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lines = state.graph.mem_lines();
+        lines.push((format!("query jobs ({} active)", state.jobs.len()), dep_graph::map_bytes(&state.jobs)));
+        for (name, bytes) in &mut lines { name.push_str(&format!("; bytes={bytes}")); }
+        lines
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -103,9 +113,6 @@ impl QueryEngine {
     fn intern(&self, query: QueryId, key: Fingerprint, eval_always: bool) -> Result<DepNodeIndex, QueryError> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let index = state.graph.intern(query, key, eval_always)?;
-        while state.jobs.len() < state.graph.nodes.len() {
-            state.jobs.push(QueryJob::default());
-        }
         Ok(index)
     }
 
@@ -122,18 +129,15 @@ impl QueryEngine {
         let query = QueryId { kind, key };
         self.inputs.clear();
         let state = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
-        let &index = state.graph.indices.get(&query).ok_or(QueryError::MissingInput(query))?;
-        let node = &mut state.graph.nodes[index.0 as usize];
-        if !node.eval_always {
+        let index = state.graph.find(query).ok_or(QueryError::MissingInput(query))?;
+        if !state.graph.eval_always(index) {
             return Err(QueryError::KindConflict(kind));
         }
-        if node.fingerprint == Some(fingerprint) {
+        if state.graph.fingerprint(index) == Some(fingerprint) {
             return Ok(());
         }
         self.revision = self.revision.checked_add(1).expect("query revision limit");
-        node.fingerprint = Some(fingerprint);
-        node.verified_at = self.revision;
-        node.changed_at = self.revision;
+        state.graph.set_fingerprint(index, self.revision, fingerprint);
         state.graph.compact();
         Ok(())
     }
@@ -144,12 +148,11 @@ impl QueryEngine {
             Some(x) => x,
             None => {
                 let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let &index = state.graph.indices.get(&query).ok_or(QueryError::MissingInput(query))?;
-                let node = &state.graph.nodes[index.0 as usize];
-                if !node.eval_always {
+                let index = state.graph.find(query).ok_or(QueryError::MissingInput(query))?;
+                if !state.graph.eval_always(index) {
                     return Err(QueryError::KindConflict(kind));
                 }
-                let x = (index, node.fingerprint.ok_or(QueryError::MissingInput(query))?);
+                let x = (index, state.graph.fingerprint(index).ok_or(QueryError::MissingInput(query))?);
                 self.inputs.insert(query, x);
                 x
             }
@@ -187,7 +190,6 @@ impl QueryEngine {
                 crate::solver_work::count(crate::solver_work::ANON_LOCKS);
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 let index = state.graph.intern_anon(self.revision, reads);
-                while state.jobs.len() < state.graph.nodes.len() { state.jobs.push(QueryJob::default()); }
                 index
             };
             index = Some(match reads {
@@ -212,20 +214,17 @@ impl QueryEngine {
             let parent = dep_graph::current_job(self.id);
             let latch = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let node = &state.graph.nodes[index.0 as usize];
-                if node.error_at == self.revision {
-                    if let Some(error) = &node.error {
-                        return Err(error.clone());
-                    }
+                if let Some((revision, error)) = state.graph.errors.get(&index) {
+                    if *revision == self.revision { return Err(error.clone()); }
                 }
-                if node.verified_at == self.revision {
+                if state.graph.revision(index, false) == self.revision {
                     return Ok(());
                 }
                 if let Some(parent) = parent {
                     job::check_cycle(&state, parent, index)?;
-                    state.jobs[parent.0 as usize].waiting_on = Some(index);
+                    state.jobs.get_mut(&parent).unwrap().waiting_on = Some(index);
                 }
-                let job = &mut state.jobs[index.0 as usize];
+                let job = state.jobs.entry(index).or_default();
                 if job.active {
                     Some(Arc::clone(job.latch.get_or_insert_with(|| Arc::new(QueryLatch::new()))))
                 } else {
@@ -276,57 +275,53 @@ impl QueryEngine {
     /// Compare change revisions against this node's verification revision, not just
     /// this revision's color: lazy nodes may have missed intermediate revisions.
     fn try_mark_green(&self, index: DepNodeIndex, force: &dyn Fn(QueryId) -> Result<(), QueryError>) -> Result<bool, QueryError> {
-        let (verified_at, edges) = {
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let node = &state.graph.nodes[index.0 as usize];
-            if node.fingerprint.is_none() {
-                return Ok(false);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.graph.nodes[index.0 as usize].has_fingerprint() { return Ok(false); }
+        let verified_at = state.graph.revision(index, false);
+        let edges = state.graph.read_edges(index);
+        for edge in 0..edges.len() {
+            // Keep validation's critical sections short even for large read sets.
+            // Common small tasks inspect their current dependencies with one lock;
+            // larger tasks release it periodically, and forcing always runs unlocked.
+            if edge != 0 && edge % 16 == 0 {
+                drop(state);
+                state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             }
-            (node.verified_at, node.edges.clone())
-        };
-        for edge in edges {
-            let (dep, query, eval_always, current, changed_at) = {
-                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                let dep = DepNodeIndex(state.graph.edges[edge]);
-                let node = &state.graph.nodes[dep.0 as usize];
-                (dep, node.query, node.eval_always, node.verified_at == self.revision, node.changed_at)
-            };
-            if eval_always || current {
-                if changed_at > verified_at {
-                    return Ok(false);
-                }
+            let dep = DepNodeIndex(edges.get(&state.graph, edge));
+            if state.graph.eval_always(dep) || state.graph.revision(dep, false) == self.revision {
+                if state.graph.revision(dep, true) > verified_at { return Ok(false); }
                 continue;
             }
+            let query = state.graph.query(dep);
+            drop(state);
             let Some(query) = query else {
                 if !self.try_mark_green(dep, force)? { return Ok(false); }
+                state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 continue;
             };
             force(query)?;
-            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let node = &state.graph.nodes[dep.0 as usize];
-            if node.verified_at != self.revision {
+            state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.graph.revision(dep, false) != self.revision {
                 return Err(QueryError::ForceDidNotComplete(query));
             }
-            if node.changed_at > verified_at {
-                return Ok(false);
-            }
+            if state.graph.revision(dep, true) > verified_at { return Ok(false); }
         }
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).graph.nodes[index.0 as usize].verified_at = self.revision;
+        state.graph.set_revision(index, false, self.revision);
         Ok(true)
     }
 
     pub fn dep_node(&self, query: QueryId) -> Option<DepNode> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let index = *state.graph.indices.get(&query)?;
-        Some(state.graph.nodes[index.0 as usize].identity)
+        let index = state.graph.find(query)?;
+        Some(state.graph.identity(index))
     }
 
     pub fn dependencies(&self, query: QueryId) -> Vec<QueryId> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut result = Vec::new();
-        if let Some(index) = state.graph.indices.get(&query) {
-            for &edge in &state.graph.edges[state.graph.nodes[index.0 as usize].edges.clone()] {
-                if let Some(query) = state.graph.nodes[edge as usize].query { result.push(query); }
+        if let Some(index) = state.graph.find(query) {
+            for &edge in state.graph.reads(index) {
+                if let Some(query) = state.graph.query(DepNodeIndex(edge)) { result.push(query); }
             }
         }
         result
@@ -334,13 +329,13 @@ impl QueryEngine {
 
     pub fn color(&self, query: QueryId) -> DepNodeColor {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(index) = state.graph.indices.get(&query) else { return DepNodeColor::Unknown };
+        let Some(index) = state.graph.find(query) else { return DepNodeColor::Unknown };
         let node = &state.graph.nodes[index.0 as usize];
-        if node.error_at == self.revision && node.error.is_some() {
+        if state.graph.errors.get(&index).is_some_and(|(rev, _)| *rev == self.revision) {
             DepNodeColor::Red
-        } else if node.fingerprint.is_none() || (!node.eval_always && node.verified_at != self.revision) {
+        } else if !node.has_fingerprint() || (!state.graph.eval_always(index) && state.graph.revision(index, false) != self.revision) {
             DepNodeColor::Unknown
-        } else if node.changed_at == self.revision {
+        } else if state.graph.revision(index, true) == self.revision {
             DepNodeColor::Red
         } else {
             DepNodeColor::Green

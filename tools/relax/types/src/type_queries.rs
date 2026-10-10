@@ -148,6 +148,8 @@ impl QueryCx {
     pub(crate) fn read_declarations(&self) -> Result<Fingerprint, QueryError> {
         self.engine.input(DECLARATIONS.kind, DECLARATIONS.key)
     }
+    pub(crate) fn engine_mem_lines(&self) -> Vec<(String, u64)> { self.engine.mem_lines() }
+
     pub fn new() -> Self {
         let mut engine = QueryEngine::new();
         engine.register_input(DECLARATIONS.kind, DECLARATIONS.key, Fingerprint::from_bytes(b"declarations")).unwrap();

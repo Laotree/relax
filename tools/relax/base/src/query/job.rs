@@ -1,7 +1,7 @@
 use super::{Cycle, DepNodeIndex, QueryEngine, QueryError, State};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// A live job occupies its node's flat slot; a latch is allocated only on contention.
+/// Only live jobs occupy storage; a latch is allocated only on contention.
 /// rustc_middle/src/query/job.rs:17,35 uses the same lazy latch ownership.
 #[derive(Default)]
 pub(super) struct QueryJob {
@@ -72,17 +72,16 @@ pub(super) fn check_cycle(state: &State, parent: DepNodeIndex, target: DepNodeIn
     let mut next = Some(target);
     while let Some(index) = next {
         if index == parent {
-            let mut stack = vec![state.graph.nodes[parent.0 as usize].query.unwrap()];
+            let mut stack = vec![state.graph.query(parent).unwrap()];
             let mut index = target;
             while index != parent {
-                stack.push(state.graph.nodes[index.0 as usize].query.unwrap());
-                index = state.jobs[index.0 as usize].waiting_on.unwrap();
+                stack.push(state.graph.query(index).unwrap());
+                index = state.jobs[&index].waiting_on.unwrap();
             }
-            stack.push(state.graph.nodes[parent.0 as usize].query.unwrap());
+            stack.push(state.graph.query(parent).unwrap());
             return Err(QueryError::Cycle(Cycle { stack }));
         }
-        let job = &state.jobs[index.0 as usize];
-        next = if job.active { job.waiting_on } else { None };
+        next = state.jobs.get(&index).and_then(|job| job.waiting_on);
     }
     Ok(())
 }
@@ -95,7 +94,8 @@ pub(super) struct WaitGuard<'a> {
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
         if let Some(parent) = self.parent {
-            self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).jobs[parent.0 as usize].waiting_on = None;
+            // a drop during unwinding must not panic (the job map is sparse now)
+            if let Some(job) = self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).jobs.get_mut(&parent) { job.waiting_on = None; }
         }
     }
 }
@@ -115,10 +115,7 @@ impl ActiveJobGuard<'_> {
     pub fn cancel(&mut self) {
         let latch = {
             let mut state = self.engine.state.lock().unwrap_or_else(|e| e.into_inner());
-            let job = &mut state.jobs[self.index.0 as usize];
-            job.active = false;
-            job.waiting_on = None;
-            job.latch.take()
+            state.jobs.remove(&self.index).unwrap().latch
         };
         self.finished = true;
         if let Some(latch) = latch { latch.complete(Completion::Retry); }
@@ -127,13 +124,11 @@ impl ActiveJobGuard<'_> {
     pub fn complete(&mut self, result: Result<(), QueryError>) {
         let latch = {
             let mut state = self.engine.state.lock().unwrap_or_else(|e| e.into_inner());
-            let node = &mut state.graph.nodes[self.index.0 as usize];
-            node.error = result.as_ref().err().cloned();
-            node.error_at = self.engine.revision;
-            let job = &mut state.jobs[self.index.0 as usize];
-            job.active = false;
-            job.waiting_on = None;
-            job.latch.take()
+            match &result {
+                Err(error) => { state.graph.errors.insert(self.index, (self.engine.revision, error.clone())); }
+                Ok(()) => { state.graph.errors.remove(&self.index); }
+            }
+            state.jobs.remove(&self.index).unwrap().latch
         };
         self.finished = true;
         if let Some(latch) = latch {
@@ -145,7 +140,7 @@ impl ActiveJobGuard<'_> {
 impl Drop for ActiveJobGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            let query = self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).graph.nodes[self.index.0 as usize].query.unwrap();
+            let query = self.engine.state.lock().unwrap_or_else(|e| e.into_inner()).graph.query(self.index).unwrap();
             self.complete(Err(QueryError::Poisoned(query)));
         }
     }

@@ -186,17 +186,17 @@ fn memoization_and_stable_identity() {
 fn assert_anonymous_sum_edges(cx: &Cx) {
     let state = cx.engine.state.lock().unwrap();
     let graph = &state.graph;
-    let root = graph.indices[&cx.sum.query_id(&1).unwrap()];
-    let edges = &graph.edges[graph.nodes[root.0 as usize].edges.clone()];
+    let root = graph.find(cx.sum.query_id(&1).unwrap()).unwrap();
+    let edges = graph.reads(root);
     assert_eq!(edges.len(), 1);
-    let outer = &graph.nodes[edges[0] as usize];
-    assert_eq!(outer.query, None);
-    let reads = &graph.edges[outer.edges.clone()];
+    let outer = DepNodeIndex(edges[0]);
+    assert_eq!(graph.query(outer), None);
+    let reads = graph.reads(outer);
     assert_eq!(reads.len(), 2);
-    assert_eq!(graph.nodes[reads[0] as usize].query, cx.leaf.query_id(&0));
-    let inner = &graph.nodes[reads[1] as usize];
-    assert_eq!(inner.query, None);
-    let reads: Vec<_> = graph.edges[inner.edges.clone()].iter().map(|&i| graph.nodes[i as usize].query.unwrap()).collect();
+    assert_eq!(graph.query(DepNodeIndex(reads[0])), cx.leaf.query_id(&0));
+    let inner = DepNodeIndex(reads[1]);
+    assert_eq!(graph.query(inner), None);
+    let reads: Vec<_> = graph.reads(inner).iter().map(|&i| graph.query(DepNodeIndex(i)).unwrap()).collect();
     assert_eq!(reads, vec![cx.leaf.query_id(&1).unwrap(), cx.leaf.query_id(&0).unwrap()]);
 }
 
@@ -466,7 +466,7 @@ fn panic_poison_wakes_blocked_waiters_and_restores_task_stack() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let state = engine.state.lock().unwrap();
-        let waiting = match &state.jobs[0].latch {
+        let waiting = match &state.jobs[&DepNodeIndex(0)].latch {
             Some(latch) => Arc::strong_count(latch) == 8,
             None => false,
         };
@@ -664,12 +664,12 @@ fn spilled_task_reads_preserve_order_and_deduplicate() {
     for key in 0..40 { expected.push(QueryId { kind: 0, key }); }
     {
         let state = engine.state.lock().unwrap();
-        let root = state.graph.indices[&table.query_id(&0).unwrap()];
-        let edges = &state.graph.edges[state.graph.nodes[root.0 as usize].edges.clone()];
+        let root = state.graph.find(table.query_id(&0).unwrap()).unwrap();
+        let edges = state.graph.reads(root);
         assert_eq!(edges.len(), 1);
-        let anon = &state.graph.nodes[edges[0] as usize];
-        assert_eq!(anon.query, None);
-        let reads: Vec<_> = state.graph.edges[anon.edges.clone()].iter().map(|&i| state.graph.nodes[i as usize].query.unwrap()).collect();
+        let anon = DepNodeIndex(edges[0]);
+        assert_eq!(state.graph.query(anon), None);
+        let reads: Vec<_> = state.graph.reads(anon).iter().map(|&i| state.graph.query(DepNodeIndex(i)).unwrap()).collect();
         assert_eq!(reads, expected);
     }
     table.get(&engine, 1, &mut |_| {
@@ -769,11 +769,11 @@ fn round42_nested_cancellation_discards_reads_and_retries_after_edit() {
         assert_eq!(engine.color(query), DepNodeColor::Unknown);
         assert!(engine.dependencies(query).is_empty());
         let state = engine.state.lock().unwrap();
-        let index = state.graph.indices[&query].0 as usize;
-        assert!(state.graph.nodes[index].fingerprint.is_none());
-        assert!(state.graph.nodes[index].error.is_none());
-        assert!(!state.jobs[index].active);
-        assert!(state.jobs[index].waiting_on.is_none());
+        let index = state.graph.find(query).unwrap().0 as usize;
+        assert!(state.graph.fingerprint(DepNodeIndex(index as u32)).is_none());
+        assert!(!state.graph.errors.contains_key(&DepNodeIndex(index as u32)));
+        assert!(!state.jobs.contains_key(&DepNodeIndex(index as u32)));
+        assert!(state.jobs.get(&DepNodeIndex(index as u32)).and_then(|job| job.waiting_on).is_none());
     }
     let mut published = 0;
     parent.for_each(&mut |_, _, _| published += 1);
@@ -810,10 +810,10 @@ fn needs_load_cancels_nested_queries_without_caching() {
     assert!(cancelled.is_err_and(|p| p.is::<crate::preempt::NeedsLoad>()));
     for query in [parent.query_id(&0).unwrap(), child.query_id(&0).unwrap()] {
         let state = engine.state.lock().unwrap();
-        let index = state.graph.indices[&query].0 as usize;
-        assert!(state.graph.nodes[index].fingerprint.is_none());
-        assert!(state.graph.nodes[index].error.is_none());
-        assert!(!state.jobs[index].active);
+        let index = state.graph.find(query).unwrap().0 as usize;
+        assert!(state.graph.fingerprint(DepNodeIndex(index as u32)).is_none());
+        assert!(!state.graph.errors.contains_key(&DepNodeIndex(index as u32)));
+        assert!(!state.jobs.contains_key(&DepNodeIndex(index as u32)));
     }
     let mut published = 0;
     parent.for_each(&mut |_, _, _| published += 1);
@@ -861,7 +861,7 @@ fn round42_cancelled_owner_wakes_foreground_and_preempts_background_waiters() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let state = engine.state.lock().unwrap();
-        let waiting = state.jobs[0].latch.as_ref().is_some_and(|l| Arc::strong_count(l) == 5);
+        let waiting = state.jobs[&DepNodeIndex(0)].latch.as_ref().is_some_and(|l| Arc::strong_count(l) == 5);
         drop(state);
         if waiting { break; }
         assert!(Instant::now() < deadline);
@@ -896,4 +896,27 @@ fn round42_cancellation_during_green_validation_preserves_previous_revision() {
     assert_eq!(cx.engine.dependencies(query), deps);
     assert_eq!(cx.sum(0), Ok(4));
     assert_eq!(cx.sum_runs[0].load(Ordering::Relaxed), 2);
+}
+
+/// Revisions past the inline encoding (>= 32767) go to the overflow map: a node created before the
+/// boundary and validated after it, and nodes created after it, must keep red/green answers.
+#[test]
+fn revisions_past_the_inline_encoding_keep_red_green_answers() {
+    let mut cx = Cx::new();
+    let before = cx.sum(0);
+    assert!(before.is_ok());
+    let runs_before = cx.count(2, 0);
+    for i in 0..33_000u64 {
+        cx.edit(15, 100 + (i & 1));
+    }
+    cx.edit(15, 10);
+    assert!(cx.engine.revision() > 32_767);
+    assert_eq!(cx.sum(0), before);
+    cx.edit(0, 20);
+    let changed = cx.sum(0);
+    assert!(changed.is_ok());
+    assert!(cx.count(2, 0) > runs_before);
+    let runs = cx.count(2, 0);
+    assert_eq!(cx.sum(0), changed);
+    assert_eq!(cx.count(2, 0), runs);
 }
