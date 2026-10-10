@@ -2,6 +2,7 @@
 //! Expansion uncertainty belongs to the invocation scope (rustc's reduced graph),
 //! not to every crate that happens to contain an identifier with the same spelling.
 use super::*;
+use std::borrow::{Borrow, Cow};
 
 pub fn within(path: &str, module: &str) -> bool {
     path == module || path.strip_prefix(module).is_some_and(|tail| tail.starts_with("::"))
@@ -27,6 +28,14 @@ pub fn close(toks: &[Tok], start: usize) -> usize {
 }
 fn word(src: &[u8], t: &Tok) -> String {
     String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).trim_start_matches("r#").into()
+}
+
+/// `word` without the allocation when the token is valid UTF-8 (every Rust source is).
+fn word_ref<'a>(src: &'a [u8], t: &Tok) -> std::borrow::Cow<'a, str> {
+    match String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]) {
+        std::borrow::Cow::Borrowed(text) => std::borrow::Cow::Borrowed(text.trim_start_matches("r#")),
+        std::borrow::Cow::Owned(text) => std::borrow::Cow::Owned(text.trim_start_matches("r#").into()),
+    }
 }
 
 fn is_word(src: &[u8], token: &Tok, expected: &str) -> bool {
@@ -276,21 +285,21 @@ impl Names {
         }
     }
 
-    fn absolute(&self, ci: usize, module: &str, path: &[String]) -> Vec<String> {
+    fn absolute<P: Borrow<str>>(&self, ci: usize, module: &str, path: &[P]) -> Vec<String> {
         let mut at = 0;
-        if path.first().is_some_and(String::is_empty) { at += 1; }
+        if path.first().is_some_and(|p| p.borrow().is_empty()) { at += 1; }
         let Some(first) = path.get(at) else { return Vec::new(); };
         at += 1;
-        let base = match first.as_str() {
+        let base = match first.borrow() {
             "crate" => self.crates[ci].name.clone(),
             "self" => {
                 let mut base = module;
-                while path.get(at).is_some_and(|x| x == "super") { at += 1; base = base.rsplit_once("::").map_or(base, |x| x.0); }
+                while path.get(at).is_some_and(|x| x.borrow() == "super") { at += 1; base = base.rsplit_once("::").map_or(base, |x| x.0); }
                 base.to_owned()
             }
             "super" => {
                 let mut base = module.rsplit_once("::").map_or(module, |x| x.0);
-                while path.get(at).is_some_and(|x| x == "super") { at += 1; base = base.rsplit_once("::").map_or(base, |x| x.0); }
+                while path.get(at).is_some_and(|x| x.borrow() == "super") { at += 1; base = base.rsplit_once("::").map_or(base, |x| x.0); }
                 base.to_owned()
             }
             name => {
@@ -563,9 +572,9 @@ impl Names {
         }
     }
     pub fn entry(&self, ci: usize, name: &str) -> BTreeSet<String> {
-        self.resolve(ci, &self.crates[ci].name, &[name.into()])
+        self.resolve(ci, &self.crates[ci].name, &[name])
     }
-    pub fn empty_macro(&self, ci: usize, module: &str, path: &[String]) -> bool {
+    pub fn empty_macro<P: Borrow<str>>(&self, ci: usize, module: &str, path: &[P]) -> bool {
         let resolved = self.resolve_macro(ci, module, path);
         let definitions = resolved.iter().filter(|name| self.macros.contains(*name)).collect::<Vec<_>>();
         !definitions.is_empty() && definitions.iter().all(|name| self.empty_macros.contains(*name))
@@ -639,9 +648,9 @@ impl Names {
         }
         Some((expanded, tokens))
     }
-    fn resolve(&self, ci: usize, module: &str, path: &[String]) -> BTreeSet<String> {
+    fn resolve<P: Borrow<str>>(&self, ci: usize, module: &str, path: &[P]) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
-        if path.len() == 1 && primitive(&path[0]) { out.insert(format!("<primitive>::{}", path[0])); }
+        if path.len() == 1 && primitive(path[0].borrow()) { out.insert(format!("<primitive>::{}", path[0].borrow())); }
         let mut found = false;
         for p in self.absolute(ci, module, path) {
             let value = self.binding(&p);
@@ -656,7 +665,7 @@ impl Names {
         // falls back to the std prelude Relax puts in every crate (core's
         // `prelude` module, Program::prelude_crate), after local scopes.
         if !found && self.crates[ci].cfg.session.options.rs_lazy
-            && path.first().is_some_and(|first| !matches!(first.as_str(), "" | "crate" | "self" | "super")) {
+            && path.first().is_some_and(|first| !matches!(first.borrow(), "" | "crate" | "self" | "super")) {
             let p = format!("core::prelude::{}", path.join("::"));
             let value = self.binding(&p);
             if !value.targets.is_empty() {
@@ -693,14 +702,14 @@ impl Names {
         }
         BTreeSet::new()
     }
-    fn resolve_macro(&self, ci: usize, module: &str, path: &[String]) -> BTreeSet<String> {
+    fn resolve_macro<P: Borrow<str>>(&self, ci: usize, module: &str, path: &[P]) -> BTreeSet<String> {
         let mut result = self.resolve(ci, module, path);
         if path.len() == 1 {
             // Textual macros are visible in child modules. Keep shadowed
             // candidates too; the real expansion pass retains source order.
             let mut scope = module;
             loop {
-                let value = self.binding(&format!("{scope}::{}", path[0]));
+                let value = self.binding(&format!("{scope}::{}", path[0].borrow()));
                 if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
                     result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string())); result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
                 }
@@ -710,7 +719,7 @@ impl Names {
             // macros::MacroScope::std_prelude: the exported macros of std, core, alloc.
             if result.is_empty() && self.crates[ci].cfg.session.options.rs_lazy {
                 for krate in ["std", "core", "alloc"] {
-                    let value = self.binding(&format!("{krate}::{}", path[0]));
+                    let value = self.binding(&format!("{krate}::{}", path[0].borrow()));
                     if value.targets.iter().any(|target| self.macros.contains(self.bindings.spelling(target))) {
                         result.extend(value.targets.into_iter().map(|id| self.bindings.spelling(id).to_string()));
                         result.extend(value.via.into_iter().map(|id| self.bindings.spelling(id).to_string()));
@@ -969,7 +978,11 @@ impl Names {
             at += 1;
         }
         let mut out = BTreeSet::new();
-        let mut lookups = BTreeSet::new();
+        // The paths this call has resolved, as flag bytes + the `::`-joined spelling (an identifier
+        // never holds `::`, so the key is the path): a repeat costs no allocation.
+        let mut lookups = HashSet::<String>::default();
+        let mut key_buf = String::new();
+        let mut path: Vec<Cow<'_, str>> = Vec::new();
         let mut implicit_names = BTreeSet::new();
         let mut i = 0;
         while i < toks.len() {
@@ -1026,10 +1039,11 @@ impl Names {
                     i += 1; continue;
                 }
                 let lookup_at = i;
-                let mut path = vec![word(src, &toks[i])];
+                path.clear();
+                path.push(word_ref(src, &toks[i]));
                 i += 1;
                 while i + 1 < toks.len() && toks[i].kind == T::PathSep && matches!(toks[i + 1].kind, T::Ident | T::RawIdent | T::KwSuper | T::KwSelfValue | T::KwCrate) {
-                    path.push(word(src, &toks[i + 1])); i += 2;
+                    path.push(word_ref(src, &toks[i + 1])); i += 2;
                 }
                 let invocation = toks.get(i).is_some_and(|token| token.kind == T::Not);
                 if invocation && self.empty_macro(ci, module, &path)
@@ -1038,16 +1052,22 @@ impl Names {
                     continue;
                 }
                 let shadowed = !invocation && local_types.iter().any(|(lo, hi, name)| *lo < lookup_at && lookup_at < *hi && *name == path[0]);
-                if !lookups.insert((path.clone(), invocation, shadowed)) { continue; }
-                let block_local = local.contains_key(&path[0]);
+                key_buf.clear();
+                key_buf.push(char::from(invocation as u8 + 2 * shadowed as u8));
+                for (n, segment) in path.iter().enumerate() { if n > 0 { key_buf.push_str("::"); } key_buf.push_str(segment); }
+                if lookups.contains(key_buf.as_str()) { continue; }
+                lookups.insert(key_buf.clone());
+                let block_local = local.contains_key(&*path[0]);
+                // the shared key leaves out `shadowed` (flag bit 1), as the pair (path, invocation) did
+                key_buf.replace_range(..1, if invocation { "\u{1}" } else { "\u{0}" });
                 if !block_local {
-                    if let Some(resolved) = shared.resolved.get(&(path.clone(), invocation)) {
+                    if let Some(resolved) = shared.resolved.get(key_buf.as_str()) {
                         shared.hits += 1;
-                        out.extend(resolved.iter().cloned());
+                        for name in resolved { if !out.contains(name.as_str()) { out.insert(name.clone()); } }
                         continue;
                     }
                 }
-                let key = (!block_local).then(|| (path.clone(), invocation));
+                let key = (!block_local).then(|| key_buf.clone());
                 shared.misses += 1;
                 // A type's associated item still demands the defining type.
                 while !path.is_empty() {
@@ -1062,7 +1082,7 @@ impl Names {
                                 || self.type_symbols.contains(self.bindings.spelling(target)) && !self.value_symbols.contains(self.bindings.spelling(target)) && !self.macros.contains(self.bindings.spelling(target)))
                         });
                     }
-                    if let Some(targets) = local.get(&path[0]) {
+                    if let Some(targets) = local.get(&*path[0]) {
                         if path.len() == 1 { resolved.extend(targets.iter().cloned()); }
                         else {
                             for target in targets {
@@ -1102,7 +1122,7 @@ impl Names {
 #[derive(Default)]
 pub struct Lookups {
     scope: Option<(usize, String)>,
-    resolved: HashMap<(Vec<String>, bool), Vec<String>>,
+    resolved: HashMap<String, Vec<String>>,
     pub hits: usize,
     pub misses: usize,
     pub glob_queries: usize,

@@ -1313,7 +1313,7 @@ fn rust_eager_reason(src: &[u8], tokens: &[Tok], names: &Names, ci: usize, modul
             && tokens.get(i + 1).is_some_and(|t| t.kind == T::Not) {
             if tokens.get(i + 2).is_some_and(|t| matches!(t.kind, T::OpenBrace | T::OpenParen | T::OpenBracket))
                 && (i == 0 || tokens[i - 1].kind != T::PathSep) {
-                if names.empty_macro(ci, module, &[spelling.into()]) {
+                if names.empty_macro(ci, module, &[spelling]) {
                     i = demand::close(tokens, i + 2) + 1;
                     continue;
                 }
