@@ -648,7 +648,6 @@ impl Plan {
                     let selected = files.iter().enumerate().filter_map(|(f, file)| edited.contains(&file.ci).then_some(f)).collect::<Vec<_>>();
                     let mut local_inputs = selected.iter().map(|&f| inputs[f].clone()).collect::<Vec<_>>();
                     let result = select(&mut names, &mut local_inputs, &mut parts, Some(&incoming));
-                    for &ci in &edited { parts[ci].finish_boundary(); }
                     Some((selected, result))
                 } else { None }
             } else { None };

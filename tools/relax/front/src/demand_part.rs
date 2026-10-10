@@ -30,9 +30,6 @@ pub struct DemandPart {
     pub(super) outlined: BTreeSet<(String, String)>,
     // Scopes whose scans carry a certified expanded external declaration index.
     pub(super) failures: BTreeMap<(String, String), bool>,
-    // Worker-owned complete contributions, moved here before global deduplication.
-    // The graph writer unions them; no reference keys/hashes on the cold path.
-    pub(super) contributions: Vec<(bool, items::References)>,
     pub(super) boundary: Boundary,
     pub(super) roots: Option<(BTreeSet<String>, BTreeSet<String>, usize)>,
     pub(super) closure_delta: Option<Arc<demand::ClosureDelta>>,
@@ -366,21 +363,10 @@ impl DemandPart {
                 }
             })
     }
-    pub(super) fn finish_boundary(&mut self) {
-        if self.contributions.is_empty() { return; }
-        let traits = std::mem::take(&mut self.boundary.traits);
-        self.boundary = Boundary { traits, ..Boundary::default() };
-        for (used, (names, members)) in std::mem::take(&mut self.contributions) {
-            if used { self.boundary.used.extend(names); }
-            else { self.boundary.declared.extend(names); }
-            self.boundary.members.extend(members);
-        }
-        self.boundary.declared.retain(|name| !self.boundary.used.contains(name));
-    }
 }
 
 // Planning gives the writer the data it already owns. Namespace serialization,
-// identity hashing, contribution unioning and part encoding all happen there.
+// identity hashing and part encoding all happen there.
 pub(crate) struct Recording {
     pending: std::sync::Mutex<Option<(Vec<PreCrate>, Names, Vec<DemandPart>)>>,
     ready: std::sync::Mutex<Vec<Arc<DemandPart>>>,
@@ -433,9 +419,6 @@ impl DemandImage {
             }
             identities.push(part.surface_id);
         }
-        // the parts' boundaries are independent (string set unions: seconds for Stage)
-        let chunk = parts.len().div_ceil(crate::preload::jobs().max(1)).max(1);
-        std::thread::scope(|scope| { for chunk in parts.chunks_mut(chunk) { scope.spawn(move || for part in chunk { part.finish_boundary(); }); } });
         let t_seal = t0.elapsed();
         if let Some(first) = parts.first_mut() {
             let value = final_names.closure_delta(&names);

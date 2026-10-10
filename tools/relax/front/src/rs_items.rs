@@ -422,7 +422,10 @@ pub struct Closure {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Strength { Declared, Used }
 
-pub type References = (BTreeSet<String>, BTreeSet<String>);
+/// A crate's boundary names while its closure runs: each evaluation's references are folded in as they
+/// are produced (a name repeats across thousands of evaluations; the sets keep it once).
+#[derive(Default)]
+struct Accumulated { declared: BTreeSet<String>, used: BTreeSet<String>, members: BTreeSet<String> }
 
 struct Work { file: usize, module: String, ranges: Vec<(usize, usize)>, strength: Strength, exclude: Vec<String> }
 
@@ -431,9 +434,10 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
 ) -> Closure {
     let entry = std::time::Instant::now();
     for file in files.iter() {
-        parts[file.ci].contributions.clear();
         parts[file.ci].boundary = part::Boundary::default();
     }
+    // per crate (parts index), merged from the workers as each finishes
+    let accumulated: Vec<std::sync::Mutex<Accumulated>> = (0..parts.len()).map(|_| Default::default()).collect();
     let n = files.len();
     // Splits/raw heads were built by outline workers and qualified as each
     // crate's namespace was prepared; each item list is moved, never cloned.
@@ -706,6 +710,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
         // also selects the names that are new to them, so the serial merge
         // only moves sets and queues those names.
         let (seen_declared, seen_used, seen_members) = (&declared, &used, &members);
+        let accumulated = &accumulated;
         let (files, names) = (&*files, &*names);
         let evaluation = crate::load_profile::span(profile, "rust-demand-reference-eval", "load");
         let evaluated = std::thread::scope(|scope| {
@@ -715,6 +720,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
                     let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
                     let cpu = std::time::Instant::now();
                     let mut out = Vec::new();
+                    let mut local: HashMap<usize, Accumulated> = HashMap::default();
                     let mut counts = [0usize; 4];
                     let _profile = crate::load_profile::span(profile, "rust-demand-reference-worker", "load");
                     loop {
@@ -744,10 +750,18 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
                                 let fresh: Vec<_> = refs.iter().filter(|name| !seen_declared.contains(name.as_str())
                                     || w.strength == Strength::Used && !seen_used.contains(name.as_str())).map(|name| (w.strength, name.clone())).collect();
                                 let fresh_members: Vec<_> = found.iter().filter(|name| !seen_members.contains(name.as_str())).cloned().collect();
-                                out.push((at, (w.file, w.strength == Strength::Used, (refs, found), fresh, fresh_members)));
+                                let used = w.strength == Strength::Used;
+                                let acc = local.entry(files[w.file].ci).or_default();
+                                if used { acc.used.extend(refs); } else { acc.declared.extend(refs); }
+                                acc.members.extend(found);
+                                out.push((at, (w.file, fresh, fresh_members)));
                             }
                         }
                         for (total, count) in counts.iter_mut().zip([lookups.hits, lookups.misses, lookups.glob_queries, lookups.glob_bindings]) { *total += count; }
+                    }
+                    for (ci, acc) in local {
+                        let mut total = accumulated[ci].lock().unwrap();
+                        total.declared.extend(acc.declared); total.used.extend(acc.used); total.members.extend(acc.members);
                     }
                     if trace { eprintln!("rs-items-eval: worker_us={} hits={} misses={}", cpu.elapsed().as_micros(), counts[0], counts[1]); }
                     (out, counts)
@@ -771,8 +785,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
         }
         if trace { eprintln!("rs-items-eval-round: wall_us={}", eval_started.elapsed().as_micros()); }
         let t3 = std::time::Instant::now();
-        for (_, (f, used, contribution, fresh, found)) in results {
-            parts[files[f].ci].contributions.push((used, contribution));
+        for (_, (f, fresh, found)) in results {
             if trace {
                 for (_, name) in &fresh { origin.entry(name.clone()).or_insert(f); }
                 for name in &found { member_origin.entry(name.clone()).or_insert(f); }
@@ -796,6 +809,14 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
             (from.copied(), key)
         })).collect()
     } else { Vec::new() };
+    // Each crate's boundary: its folded names, a declaration only where nothing used it.
+    for (ci, acc) in accumulated.into_iter().enumerate() {
+        let Accumulated { mut declared, used, members } = acc.into_inner().unwrap();
+        if declared.is_empty() && used.is_empty() && members.is_empty() { continue; }
+        declared.retain(|name| !used.contains(name));
+        let boundary = &mut parts[ci].boundary;
+        boundary.declared = declared; boundary.used = used; boundary.members = members;
+    }
     for file in files.iter() { parts[file.ci].key = 0; parts[file.ci].reached.clear(); parts[file.ci].counts = (0, 0); }
     for (f, (file, reached)) in files.iter().zip(&reached).enumerate() {
         parts[file.ci].counts.0 += parsed[f].len();
