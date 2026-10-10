@@ -35,6 +35,8 @@ pub enum Class {
 }
 const CLASSES: usize = 5;
 pub const CLASS_NAMES: [&str; CLASSES] = ["job", "finish", "main", "app", "background"];
+/// relax inspect's timeline span names of the owner's service, by class
+const SERVE_NAMES: [&str; CLASSES] = ["serve job", "serve finish", "serve main", "serve app", "serve background"];
 
 const QUEUED: u8 = 0;
 const RUNNING: u8 = 1;
@@ -449,6 +451,11 @@ fn serve(r: usize) {
     let prev_now = (NOW_CLASS.swap(req.class as u8, Ordering::Relaxed), NOW_FROM.swap(req.from, Ordering::Relaxed));
     DEPTH.with(|d| d.set(d.get() + 1));
     let frame = crate::jit::frame_enter(req.rec);
+    // relax inspect's timeline: the owner's service of this request is a span
+    let traced = crate::inspect::timeline::recording();
+    if traced {
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanBegin, SERVE_NAMES[req.class as usize], req.from, 0);
+    }
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !req.quick {
             crate::jit::ids_on_serve();
@@ -456,6 +463,9 @@ fn serve(r: usize) {
         unsafe { (*req.run)() }
     }));
     let busy = crate::jit::frame_leave(frame);
+    if traced {
+        crate::inspect::timeline::push(crate::inspect::timeline::Kind::SpanEnd, SERVE_NAMES[req.class as usize], req.from, 0);
+    }
     // a compile the request's code reached was cancelled and nothing cancelled the request yet:
     // its result is not used
     let res = match res {
@@ -485,6 +495,10 @@ fn serve(r: usize) {
         true => {
             if let Err(p) = res {
                 req.panic.set(Some(p));
+            }
+            if traced {
+                // the edge that ends the requester's wait
+                crate::inspect::timeline::push(crate::inspect::timeline::Kind::Served, "", req.from, 0);
             }
             req.state.store(DONE, Ordering::Release);
             {

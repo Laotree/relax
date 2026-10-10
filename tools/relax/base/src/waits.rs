@@ -114,6 +114,20 @@ fn row() -> Option<&'static Row> {
     }
 }
 
+/// relax inspect's timeline: called at each wait's start (`true`, label, kind name, object) and
+/// end (`false`) while set (one relaxed load per wait otherwise).
+pub static TRACE: AtomicUsize = AtomicUsize::new(0);
+type TraceFn = fn(bool, &'static str, &'static str, u64);
+
+#[inline]
+fn trace(begin: bool, kind: Kind, label: &'static str, object: u64) {
+    let h = TRACE.load(Relaxed);
+    if h != 0 {
+        let f: TraceFn = unsafe { std::mem::transmute(h) };
+        f(begin, KIND_NAMES[kind as usize], label, object);
+    }
+}
+
 /// While alive, this thread is recorded as waiting; dropping it restores the wait it was nested in
 /// (the owner pumping inside a wait serves requests that wait again).
 pub struct Guard {
@@ -127,6 +141,7 @@ pub fn begin(kind: Kind, object: u64, holder: u64, label: &'static str) -> Guard
     let s = r.state.load(Relaxed);
     let prev = Some((s, r.object.load(Relaxed), r.holder.load(Relaxed), r.since_ns.load(Relaxed), r.label.load(Relaxed), r.label_len.load(Relaxed)));
     write(r, kind as u64, object, holder, crate::clock::wall_ns(), label.as_ptr() as usize, label.len());
+    trace(true, kind, label, object);
     Guard { prev }
 }
 
@@ -146,6 +161,7 @@ impl Drop for Guard {
     #[inline]
     fn drop(&mut self) {
         let (Some((s, o, h, t, l, n)), Some(r)) = (self.prev, row()) else { return };
+        trace(false, Kind::None, "", 0);
         write(r, s & 0xff, o, h, t, l, n);
     }
 }
@@ -162,11 +178,13 @@ pub fn set_holder(holder: u64) {
 pub fn enter(kind: Kind, object: u64, holder: u64, label: &'static str) {
     if let Some(r) = row() {
         write(r, kind as u64, object, holder, crate::clock::wall_ns(), label.as_ptr() as usize, label.len());
+        trace(true, kind, label, object);
     }
 }
 
 pub fn leave() {
     if let Some(r) = row() {
+        trace(false, Kind::None, "", 0);
         write(r, 0, 0, 0, 0, 0, 0);
     }
 }

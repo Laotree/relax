@@ -5,13 +5,33 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 use core::time::Duration;
 
-use crate::sys::os::{futex_wake, futex_wake_all};
+
 
 // relax inspect's wait registry (loader entries): a blocking wait names what it waits on and,
 // for a mutex, its holder. Called only around a wait that blocks anyway.
 extern "C" {
     fn __relax_wait_enter(kind: u32, addr: usize, holder: usize);
     fn __relax_wait_leave();
+    // relax inspect's timeline: a wake is an edge that ends someone's wait (recorded only while
+    // a client records; the flag is the loader's)
+    fn __relax_wake(addr: usize);
+    static __relax_recording: core::sync::atomic::AtomicBool;
+}
+
+/// futex_wake, noted on relax inspect's timeline while it records.
+pub(crate) fn futex_wake(futex: &AtomicU32) -> bool {
+    if unsafe { __relax_recording.load(Relaxed) } {
+        unsafe { __relax_wake(futex.as_ptr() as usize) };
+    }
+    crate::sys::os::futex_wake(futex)
+}
+
+/// futex_wake_all, noted like futex_wake.
+pub(crate) fn futex_wake_all(futex: &AtomicU32) {
+    if unsafe { __relax_recording.load(Relaxed) } {
+        unsafe { __relax_wake(futex.as_ptr() as usize) };
+    }
+    crate::sys::os::futex_wake_all(futex)
 }
 
 pub(crate) const WAIT_MUTEX: u32 = 1;

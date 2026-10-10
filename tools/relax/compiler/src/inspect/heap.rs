@@ -517,6 +517,7 @@ extern "C" fn track_memalign(out: *mut *mut u8, align: usize, size: usize, fp: u
 
 /// memstat's allocator: a host block was allocated (tracking on).
 fn host_alloc(p: *mut u8, size: usize) {
+    // (inspect's own threads set IN_HOST_SAMPLE for good: their answers are not Relax's heap)
     if p.is_null() || !HOST.on.load(Relaxed) || IN_HOST_SAMPLE.with(|b| b.get()) {
         return;
     }
@@ -541,15 +542,20 @@ fn host_alloc(p: *mut u8, size: usize) {
     IN_HOST_SAMPLE.with(|b| b.set(false));
 }
 
+/// Leaves this thread's allocations out of the host heap's samples (inspect's own threads).
+pub fn exclude_this_thread() {
+    IN_HOST_SAMPLE.with(|b| b.set(true));
+}
+
 fn host_free(p: *mut u8) {
     forget(&HOST, p);
 }
 
 fn new_tables(rate: u64) -> *mut Tables {
     // the tracker's own tables are not the host heap's samples
-    IN_HOST_SAMPLE.with(|b| b.set(true));
+    let was = IN_HOST_SAMPLE.with(|b| b.replace(true));
     let t = new_tables_inner(rate);
-    IN_HOST_SAMPLE.with(|b| b.set(false));
+    IN_HOST_SAMPLE.with(|b| b.set(was));
     t
 }
 

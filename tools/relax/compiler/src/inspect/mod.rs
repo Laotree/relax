@@ -15,6 +15,8 @@ pub mod events;
 mod hang;
 pub mod heap;
 pub mod mem;
+mod prof;
+pub mod timeline;
 mod symbols;
 pub mod threads;
 
@@ -83,6 +85,7 @@ pub fn start(app: &str) {
     heap::start_from_env();
     let _ = std::thread::Builder::new().name("relax-inspect".into()).spawn(move || {
         SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
+        heap::exclude_this_thread();
         for conn in listener.incoming() {
             let Ok(conn) = conn else { continue };
             if !same_user(&conn) {
@@ -90,6 +93,7 @@ pub fn start(app: &str) {
             }
             let _ = std::thread::Builder::new().name("relax-inspect-conn".into()).spawn(move || {
                 SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
+                heap::exclude_this_thread();
                 serve(conn);
                 let me = threads::self_os_id();
                 SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
@@ -277,6 +281,9 @@ fn serve(conn: Conn) {
 /// The commands: (name, arguments, what it answers).
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
+    ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / Relax runtime / system), its hot fns, the owner's service, other busy threads"),
+    ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
+    ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = Chrome trace JSON"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
@@ -285,6 +292,9 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
     ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
+    ("top", "by=time|alloc|bytes|live [s=3] [n=15]", "the top functions by CPU time (prof) or allocation sites by allocated / live bytes (heap)"),
+    ("frame", "<n|slowest>", "one frame of the last timeline: UI phases, critical path, waits and who ended them (alias of timeline frame)"),
+    ("path", "<H<n>|R<n>>", "the full stack of a heap site id"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
     ("waits", "", "the wait registry: who waits for what, held by whom"),
@@ -302,6 +312,21 @@ fn dispatch(req: &Req, out: &mut Out) {
         "owner" => cmd_owner(out),
         "why-hung" | "hang" => hang::why_hung(req, out),
         "memory" => mem::cmd_memory(req, out),
+        "prof" => prof::cmd_prof(req, out),
+        "timeline" => timeline::cmd_timeline(req, out),
+        // question-shaped aliases (DESIGN.md §2.1)
+        "frame" => timeline::cmd_timeline(&shifted(req, "frame"), out),
+        "frames" => timeline::cmd_timeline(&shifted(req, "frames"), out),
+        "top" => match req.get("by").unwrap_or("time") {
+            "time" | "cpu" => prof::cmd_prof(req, out),
+            "alloc" | "bytes" | "live" | "churn" => heap::cmd_heap(&shifted(&with_by(req), "top"), out),
+            b => out.err(&format!("top by={}: time | alloc | bytes | live | churn", b)),
+        },
+        "path" => match req.pos.first().map(|p| p.chars().next().unwrap_or(' ')) {
+            Some('H') | Some('R') => heap::cmd_heap(&shifted(req, "path"), out),
+            _ => out.err("path <H<n>|R<n>>: heap stacks (frame ids: `frame <n>`)"),
+        },
+        "why-slow" => prof::cmd_why_slow(req, out),
         "mem" => mem::cmd_mem(req, out),
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
@@ -312,6 +337,25 @@ fn dispatch(req: &Req, out: &mut Out) {
         "" => out.err("empty request"),
         c => out.err(&format!("unknown command `{}` (try `help`)", c)),
     }
+}
+
+/// `req` with `word` put in front of its positional words (an alias for a subcommand).
+fn shifted(req: &Req, word: &str) -> Req {
+    let mut pos = vec![word.to_string()];
+    pos.extend(req.pos.iter().cloned());
+    Req { cmd: req.cmd.clone(), pos, kv: req.kv.clone() }
+}
+
+/// `top by=bytes|alloc` speaks heap's words (alloc = allocated bytes, bytes / live = live bytes).
+fn with_by(req: &Req) -> Req {
+    let mut kv: Vec<(String, String)> = req.kv.iter().filter(|x| x.0 != "by").cloned().collect();
+    let by = match req.get("by") {
+        Some("alloc") => "alloc",
+        Some("churn") => "freed",
+        _ => "live",
+    };
+    kv.push(("by".into(), by.into()));
+    Req { cmd: req.cmd.clone(), pos: req.pos.clone(), kv }
 }
 
 fn help(req: &Req, out: &mut Out) {

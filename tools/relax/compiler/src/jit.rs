@@ -11030,6 +11030,12 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         // `"..".parse::<TokenStream>()` in JIT-run proc macros (std proc_macro; pmhost.rs)
         b"relax_pm_parse" => Some(crate::pmhost::relax_pm_parse as *const () as usize),
         b"__relax_exit" => Some(__relax_exit as *const () as usize),
+        // relax inspect's timeline: makepad's UI phases (platform thread/ui_hang.rs), Relax std's
+        // futex wakes and the recording flag they check
+        b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
+        b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),
+        b"__relax_wake" => Some(crate::inspect::timeline::relax_wake as *const () as usize),
+        b"__relax_recording" | b"relax_recording" => Some(&crate::inspect::timeline::RELAX_RECORDING as *const _ as usize),
         // relax inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),

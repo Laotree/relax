@@ -7,8 +7,7 @@ use core::ops::Deref;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
-use crate::sys::os::futex_wake_all;
-use crate::sync::raw::{futex_wait, WAIT_ONCE};
+use crate::sync::raw::{futex_wait, futex_wake_all, WAIT_ONCE};
 
 const INCOMPLETE: u32 = 3;
 const POISONED: u32 = 2;
