@@ -18,141 +18,24 @@ pub unsafe extern "C" fn __host_last_panic(ptr: *mut *const u8, len: *mut usize)
 }
 
 unsafe extern "C" fn s0(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::InternLiveId as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s1(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s2(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId as ::core::cmp::Ord>::cmp(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId as ::core::cmp::PartialEq<crate::live_id::LiveId>>::eq(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s4(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId as ::core::cmp::PartialOrd<crate::live_id::LiveId>>::partial_cmp(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s5(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId as ::core::default::Default>::default() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s6(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s7(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::bytes_append(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s8(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::empty() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s9(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_bytes(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _), std::ptr::read(*a.add(3) as *const _), std::ptr::read(*a.add(4) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s10(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_bytes_lc(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _), std::ptr::read(*a.add(3) as *const _), std::ptr::read(*a.add(4) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s11(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_lo_hi(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s12(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_num(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s13(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_str(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s14(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_str_lc(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s15(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_str_num(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s16(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::from_str_with_intern(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s17(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::get_value(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s18(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::hi(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s19(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::id_append(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s20(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::is_empty(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s21(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lo(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s22(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s1(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_insert(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _), std::ptr::read(*a.add(2) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s23(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s2(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_name_copy(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s24(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s3(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::lut_name_len(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s25(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::not_empty(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s26(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::seeded() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s27(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::str_append(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s28(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::sub(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s29(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s4(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::unique() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s30(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveId>::xor(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s31(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::default::Default>::default() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s32(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s33(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_i16(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s34(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_i32(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s35(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_i64(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s36(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_i8(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s37(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_isize(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s38(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_u16(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s39(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_u32(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s40(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_u8(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s41(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasher as ::core::hash::Hasher>::write_usize(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s42(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasherBuilder as ::core::clone::Clone>::clone(std::ptr::read(*a.add(0) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s43(a: *const *mut u8, r: *mut u8) -> u32 {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdHasherBuilder as ::core::default::Default>::default() })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
-}
-unsafe extern "C" fn s44(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s5(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdInterner>::add(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
-unsafe extern "C" fn s45(a: *const *mut u8, r: *mut u8) -> u32 {
+unsafe extern "C" fn s6(a: *const *mut u8, r: *mut u8) -> u32 {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { <crate::live_id::LiveIdInterner>::contains(std::ptr::read(*a.add(0) as *const _), std::ptr::read(*a.add(1) as *const _)) })) { Ok(v) => { std::ptr::write(r as *mut _, v); 0 } Err(p) => caught(p) }
 }
 unsafe extern "C" fn d0(p: *mut u8) { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { std::ptr::drop_in_place(p as *mut crate::live_id::LiveIdInterner) })); }
@@ -162,8 +45,6 @@ pub static TYPES: &[(&str, u64, u64, Option<unsafe extern "C" fn(*mut u8)>)] = &
 ];
 
 pub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[
-    ("Option<Ordering>", std::mem::size_of::<::core::option::Option<::core::cmp::Ordering>>() as u64, std::mem::align_of::<::core::option::Option<::core::cmp::Ordering>>() as u64, &[]),
-    ("Ordering", std::mem::size_of::<::core::cmp::Ordering>() as u64, std::mem::align_of::<::core::cmp::Ordering>() as u64, &[]),
     ("makepad_live_id::live_id::InternLiveId", std::mem::size_of::<crate::live_id::InternLiveId>() as u64, std::mem::align_of::<crate::live_id::InternLiveId>() as u64, &[]),
     ("makepad_live_id::live_id::LiveId", std::mem::size_of::<crate::live_id::LiveId>() as u64, std::mem::align_of::<crate::live_id::LiveId>() as u64, &[std::mem::offset_of!(crate::live_id::LiveId, 0) as u64]),
     ("makepad_live_id::live_id::LiveIdHasher", std::mem::size_of::<crate::live_id::LiveIdHasher>() as u64, std::mem::align_of::<crate::live_id::LiveIdHasher>() as u64, &[]),
@@ -171,50 +52,11 @@ pub static LAYOUTS: &[(&str, u64, u64, &[u64])] = &[
 ];
 
 pub static SHIMS: &[(&str, u64, unsafe extern "C" fn(*const *mut u8, *mut u8) -> u32)] = &[
-    ("<InternLiveId as core::clone::Clone>::clone", 0x4a4bbc96ea2ae5e2, s0),
-    ("<LiveId as core::clone::Clone>::clone", 0x8e4218da29eafb12, s1),
-    ("<LiveId as core::cmp::Ord>::cmp", 0xb847101bec136fba, s2),
-    ("<LiveId as core::cmp::PartialEq<LiveId>>::eq", 0xf754ff23927cd4f2, s3),
-    ("<LiveId as core::cmp::PartialOrd<LiveId>>::partial_cmp", 0xbdbde127b7649165, s4),
-    ("<LiveId as core::default::Default>::default", 0x26b73ad84b8c84c5, s5),
-    ("<LiveId>::add", 0x6fe1ba03d1d3944d, s6),
-    ("<LiveId>::bytes_append", 0x72a50bc4f8ff61b1, s7),
-    ("<LiveId>::empty", 0x26b73ad84b8c84c5, s8),
-    ("<LiveId>::from_bytes", 0x8bd430c1d1d52ee6, s9),
-    ("<LiveId>::from_bytes_lc", 0x8bd430c1d1d52ee6, s10),
-    ("<LiveId>::from_lo_hi", 0xd88a5870a17c1771, s11),
-    ("<LiveId>::from_num", 0x43f06a4edc8592e9, s12),
-    ("<LiveId>::from_str", 0x023668abea6a30f4, s13),
-    ("<LiveId>::from_str_lc", 0x023668abea6a30f4, s14),
-    ("<LiveId>::from_str_num", 0x81ebe3d071b2f5e3, s15),
-    ("<LiveId>::from_str_with_intern", 0x774c4354cae2289d, s16),
-    ("<LiveId>::get_value", 0xebd69478a03ade22, s17),
-    ("<LiveId>::hi", 0xebcca078a0329e01, s18),
-    ("<LiveId>::id_append", 0xaf86c51b1d3996db, s19),
-    ("<LiveId>::is_empty", 0xedd5fab8e85b5e6d, s20),
-    ("<LiveId>::lo", 0xebcca078a0329e01, s21),
-    ("<LiveId>::lut_insert", 0xe5c432919f9a828c, s22),
-    ("<LiveId>::lut_name_copy", 0x276cdb7597c63c4a, s23),
-    ("<LiveId>::lut_name_len", 0x036c692a4896c595, s24),
-    ("<LiveId>::not_empty", 0xedd5fab8e85b5e6d, s25),
-    ("<LiveId>::seeded", 0x26b73ad84b8c84c5, s26),
-    ("<LiveId>::str_append", 0x91e6a64ba05424bd, s27),
-    ("<LiveId>::sub", 0x6fe1ba03d1d3944d, s28),
-    ("<LiveId>::unique", 0x26b73ad84b8c84c5, s29),
-    ("<LiveId>::xor", 0x6fe1ba03d1d3944d, s30),
-    ("<LiveIdHasher as core::default::Default>::default", 0x0cc4b284b23c3aaa, s31),
-    ("<LiveIdHasher as core::hash::Hasher>::write", 0x4d02b5a9737f5582, s32),
-    ("<LiveIdHasher as core::hash::Hasher>::write_i16", 0xf97d047c475a1e69, s33),
-    ("<LiveIdHasher as core::hash::Hasher>::write_i32", 0xcf2df113ee5e67e3, s34),
-    ("<LiveIdHasher as core::hash::Hasher>::write_i64", 0x9ebce68d864ed3f6, s35),
-    ("<LiveIdHasher as core::hash::Hasher>::write_i8", 0xfd64441af238d9bc, s36),
-    ("<LiveIdHasher as core::hash::Hasher>::write_isize", 0x5d1a9014402bc293, s37),
-    ("<LiveIdHasher as core::hash::Hasher>::write_u16", 0x7fb94fff6771dc95, s38),
-    ("<LiveIdHasher as core::hash::Hasher>::write_u32", 0x674fe4a3d5f99417, s39),
-    ("<LiveIdHasher as core::hash::Hasher>::write_u8", 0xd216bbce2b1d23d8, s40),
-    ("<LiveIdHasher as core::hash::Hasher>::write_usize", 0xc2fa8b6440be856f, s41),
-    ("<LiveIdHasherBuilder as core::clone::Clone>::clone", 0xfb870f8878ae7596, s42),
-    ("<LiveIdHasherBuilder as core::default::Default>::default", 0x3c5e74ec7759f225, s43),
-    ("<LiveIdInterner>::add", 0x01e9a8e42b676e10, s44),
-    ("<LiveIdInterner>::contains", 0x49d95c1f5b9b78cf, s45),
+    ("<LiveId>::from_str_with_intern", 0x774c4354cae2289d, s0),
+    ("<LiveId>::lut_insert", 0xe5c432919f9a828c, s1),
+    ("<LiveId>::lut_name_copy", 0x276cdb7597c63c4a, s2),
+    ("<LiveId>::lut_name_len", 0x036c692a4896c595, s3),
+    ("<LiveId>::unique", 0x26b73ad84b8c84c5, s4),
+    ("<LiveIdInterner>::add", 0x01e9a8e42b676e10, s5),
+    ("<LiveIdInterner>::contains", 0x49d95c1f5b9b78cf, s6),
 ];

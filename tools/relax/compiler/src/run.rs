@@ -748,7 +748,24 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 return 2;
             };
             let errors = tcx.dcx.clone();
-            let (rows, rep) = crate::provided::host_gen(&prog, &tcx, k as u32);
+            // the crate's reviewed interface (relax_api.txt), passed by `relax host-gen`
+            let api = match std::env::var("RELAX_HOST_API").ok().and_then(|f| std::fs::read_to_string(f).ok()) {
+                Some(t) => match crate::provided::HostApi::parse(&t) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("relax host-gen: {e}");
+                        return 1;
+                    }
+                },
+                None => crate::provided::HostApi::default(),
+            };
+            let (rows, rep) = match crate::provided::host_gen(&prog, &tcx, k as u32, &api) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("relax host-gen: {e}");
+                    return 1;
+                }
+            };
             let text = crate::provided::rows_to_text(&rows);
             errors.flush_delayed();
             let (errors, warnings) = errors.drain_reported();

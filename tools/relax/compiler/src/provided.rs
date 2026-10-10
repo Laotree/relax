@@ -683,11 +683,78 @@ pub fn host_gen_file(targets: &[Vec<ShimRow>]) -> String {
     out
 }
 
+/// A provided crate's reviewed interface for JIT code (`<crate dir>/relax_api.txt`, read by
+/// `relax host-gen`). Lines (`#` starts a comment):
+/// - `jit <type path>`: plain-data type; its methods and the trait impls on it (or taking it as
+///   a trait argument, `From<ScriptValue> for f32`) get no shim: JIT code compiles them from
+///   source, rustc builds inline them as before;
+/// - `op <shim key>`: a fn that stays a shim although its type is `jit` (it reads rustc-owned
+///   state: an interner, a global table).
+/// Every named type and key must exist (a stale manifest is a host-gen error).
+#[derive(Default)]
+pub struct HostApi {
+    jit: Vec<String>,
+    ops: Vec<String>,
+}
+
+impl HostApi {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut api = HostApi::default();
+        for (n, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            match line.split_once(char::is_whitespace) {
+                Some(("jit", t)) => api.jit.push(t.trim().to_string()),
+                Some(("op", k)) => api.ops.push(k.trim().to_string()),
+                _ => return Err(format!("relax_api.txt:{}: expected `jit <type path>` or `op <shim key>`: {line}", n + 1)),
+            }
+        }
+        Ok(api)
+    }
+
+    /// Is fn `d` compiled on the JIT side by this manifest?
+    fn jit_side(&self, prog: &Program, tcx: &Tcx, d: DefId, key: &str) -> bool {
+        if self.jit.is_empty() || self.ops.iter().any(|k| k == key) {
+            return false;
+        }
+        let parent = prog.def(d).parent;
+        if parent == NO_DEF || prog.def(parent).kind != DefKind::Impl {
+            return false;
+        }
+        let is_jit = |t: TyId| matches!(tcx.tys.kind(t), TyKind::Adt(a, _, _) if self.jit.iter().any(|p| *p == prog.def_path(*a)));
+        tcx.impl_self.get(&parent).is_some_and(|t| is_jit(*t))
+            || tcx.impl_trait_args.get(&parent).is_some_and(|args| args.iter().any(|t| is_jit(*t)))
+    }
+
+    /// The manifest's names that match nothing in crate `krate`.
+    fn stale(&self, prog: &Program, tcx: &Tcx, krate: u32) -> Vec<String> {
+        let mut out = Vec::new();
+        for t in &self.jit {
+            if !prog.defs.iter().enumerate().any(|(i, d)| d.krate == krate && matches!(d.kind, DefKind::Struct | DefKind::Enum) && prog.def_path(DefId(i as u32)) == *t) {
+                out.push(format!("jit {t}: no such type"));
+            }
+        }
+        for k in &self.ops {
+            let found = prog.defs.iter().enumerate().any(|(i, d)| d.krate == krate && matches!(d.kind, DefKind::Fn | DefKind::AssocFn) && key(prog, tcx, DefId(i as u32)) == *k);
+            if !found {
+                out.push(format!("op {k}: no such fn"));
+            }
+        }
+        out
+    }
+}
+
 /// `relax host-gen`: provided crate `krate`'s shim rows as this run's target sees the crate
 /// (the file is `host_gen_file` of every target's rows, included by the crate under
 /// `#[cfg(feature = "host-shims")]`, see the crate's lib.rs). Returns (rows, report). Which fns
 /// get a shim is decided in the first loop (`unbound_reason`, then nameability).
-pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (Vec<ShimRow>, String) {
+pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32, api: &HostApi) -> Result<(Vec<ShimRow>, String), String> {
+    let stale = api.stale(prog, tcx, krate);
+    if !stale.is_empty() {
+        return Err(format!("relax_api.txt of {} names what the crate does not have:\n  {}", prog.syms.str(prog.crates[krate as usize].name), stale.join("\n  ")));
+    }
     let mut fns: Vec<(String, u64, String, usize, bool, String)> = Vec::new();
     let mut why: HashMap<&'static str, usize> = HashMap::new();
     let mut unshaped: Vec<String> = Vec::new();
@@ -703,6 +770,10 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (Vec<ShimRow>, String)
         let it = prog.files[def.file as usize].ast.item(def.item);
         let has_body = matches!(&it.kind, crate::ast::ItemKind::Fn(s, b, _) if b.is_some() || prog.files[def.file as usize].ast.fn_sig(*s).lazy_body.is_some());
         if !has_body {
+            continue;
+        }
+        if api.jit_side(prog, tcx, d, &key(prog, tcx, d)) {
+            *why.entry("JIT-side (relax_api.txt `jit` type)").or_default() += 1;
             continue;
         }
         if let Some(r) = unbound_reason(prog, tcx, krate, d, &|a| opaque_candidate(prog, tcx, krate, a)) {
@@ -923,7 +994,7 @@ pub fn host_gen(prog: &Program, tcx: &Tcx, krate: u32) -> (Vec<ShimRow>, String)
     for k in unshaped {
         rep.push_str(&format!("\n  not C-shaped (compiled from source; may not read the crate's opaque fields): {}", k));
     }
-    (rows, rep)
+    Ok((rows, rep))
 }
 
 /// The types whose values cross between the provided crates' rustc code and Relax-compiled code:

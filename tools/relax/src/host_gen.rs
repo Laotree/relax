@@ -5,6 +5,7 @@
 //! RELAX_PROVIDED), never the host's cfgs or a program's feature set; the targets' rows merge into
 //! one file whose target-only rows are cfg-gated (provided.rs host_gen_file).
 //! `--check` writes nothing: exit 1 when a file would change (the merge gate).
+//! A crate's `relax_api.txt` (provided.rs HostApi) says which of its fns stay shims.
 
 use std::process::{Command, Stdio};
 
@@ -74,7 +75,7 @@ pub fn main(args: &[String]) -> i32 {
             if !features.is_empty() {
                 c.args(["--features", features]);
             }
-            c.env("RELAX_CHECK_TARGET", triple).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+            c.env("RELAX_CHECK_TARGET", triple).env("RELAX_HOST_API", format!("{dir}/relax_api.txt")).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
             let res = match c.output() {
                 Ok(o) => o,
                 Err(e) => {

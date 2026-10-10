@@ -1,0 +1,16 @@
+# makepad-live-id: its interface for JIT-compiled (Relax) code, read by `relax host-gen`
+# (tools/relax/compiler/src/provided.rs HostApi; plan: local WORK_PORT.md section 7).
+#   jit <type path>  plain data: methods and trait impls compile on the JIT side (no shim)
+#   op <shim key>    stays a shim (reads the process-wide interner / counter)
+
+# LiveId is a u64 hash (repr(transparent)); hashing is const code.
+jit makepad_live_id::live_id::LiveId
+jit makepad_live_id::live_id::LiveIdHasher
+jit makepad_live_id::live_id::LiveIdHasherBuilder
+jit makepad_live_id::live_id::InternLiveId
+# the interner and the unique-id counter: one per process, owned by rustc's copy
+op <LiveId>::lut_insert
+op <LiveId>::lut_name_len
+op <LiveId>::lut_name_copy
+op <LiveId>::from_str_with_intern
+op <LiveId>::unique
