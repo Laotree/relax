@@ -30,6 +30,7 @@ pub mod exec_profile;
 
 pub mod diagnostics;
 pub mod source;
+pub mod origin_table;
 
 pub mod lang_items;
 pub mod target_features;

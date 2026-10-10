@@ -168,7 +168,7 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
     holes.sort_unstable_by_key(|x| x.0);
     nested_in.sort_unstable();
     nested_in.dedup_by_key(|x| x.0);
-    let origins_sorted = pf.token_origins.windows(2).all(|w| w[0].lo <= w[1].lo);
+    let origins_sorted = pf.token_origins.sorted();
     let iface = h.finish128();
     FileDigest { iface, holes, nested_in, origins_sorted }
 }
@@ -215,25 +215,28 @@ pub(crate) fn pos_digest(pf: &ParsedFile, d: &FileDigest, item: ItemId) -> u128 
     let (l, c) = pf.line_col(pf.src_len);
     h.u64(l as u64);
     h.u64(c as u64);
-    let origins: &[crate::source::TokenOrigin] = &pf.token_origins;
-    let inside = |o: &&crate::source::TokenOrigin| o.lo >= it.lo && o.lo <= it.hi;
-    let slice: &[crate::source::TokenOrigin] = if d.origins_sorted {
-        let a = origins.partition_point(|o| o.lo < it.lo);
-        let b = origins.partition_point(|o| o.lo <= it.hi);
-        &origins[a..b.max(a)]
-    } else {
-        origins
+    let origins = &pf.token_origins;
+    let inside = |o: &crate::source::TokenOrigin| o.lo >= it.lo && o.lo <= it.hi;
+    // the rows to look at: those with lo in it.lo..=it.hi when the table is sorted, else all
+    let slice = || -> Box<dyn Iterator<Item = crate::source::TokenOrigin> + '_> {
+        if d.origins_sorted {
+            let a = if it.lo == 0 { 0 } else { origins.count_le(it.lo - 1) };
+            let b = origins.count_le(it.hi);
+            Box::new(origins.iter_from(a).take(b.max(a) - a))
+        } else {
+            Box::new(origins.iter())
+        }
     };
     // per authored file: the span the tokens come from
     let mut spans: Vec<(u32, u32, u32)> = Vec::new();
-    for o in slice.iter().filter(inside) {
+    for o in slice().filter(inside) {
         match spans.iter_mut().find(|s| s.0 == o.source.file) {
             Some(s) => { s.1 = s.1.min(o.source.lo); s.2 = s.2.max(o.source.hi); }
             None => spans.push((o.source.file, o.source.lo, o.source.hi)),
         }
     }
     // each token's place relative to its span
-    for o in slice.iter().filter(inside) {
+    for o in slice().filter(inside) {
         let k = spans.iter().position(|s| s.0 == o.source.file).unwrap_or(0);
         h.u32(k as u32);
         h.u32(o.lo - it.lo);

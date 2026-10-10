@@ -905,9 +905,8 @@ impl<'a> Ctx<'a> {
         let ast = &file.ast;
         // Only the macro expansion, never a user-written pointer-to-integer const.
         let pos = ast.expr(e).lo;
-        let expansions = file.part_at(pos).map_or(&file.exp_map[..], |p| &p.exp_map[..]);
-        let i = expansions.partition_point(|r| r.0 <= pos).checked_sub(1)?;
-        let (_, end, call) = expansions[i];
+        let expansions = file.part_at(pos).map_or(&file.exp_map, |p| &p.exp_map);
+        let (_, (_, end, call)) = crate::origin_table::OSegRef::from(expansions).floor(pos)?;
         if pos >= end { return None; }
         let invocation = file.bytes(call, u32::MAX);
         let bang = invocation.iter().position(|c| *c == b'!')?;

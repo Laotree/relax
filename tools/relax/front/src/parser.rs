@@ -4,7 +4,8 @@
 
 use crate::ast::*;
 use crate::lexer::{T, Tok};
-use crate::source::{SourceSpan, TokenOrigin, SourceRegistry, origin_at};
+use crate::source::{SourceSpan, TokenOrigin, SourceRegistry};
+use crate::origin_table::{Table, OSeg, OSegRef, Regions, Maps, Origins};
 
 #[path = "fmtmac.rs"]
 mod fmtmac;
@@ -55,22 +56,22 @@ pub struct Parser<'a> {
     /// text of macro expansions, addressed by positions >= src.len()
     pub ext: lazy_bodies::Seg<'a, u8>,
     /// expansion text ranges -> call-site position: (lo, hi, call lo)
-    pub exp_map: lazy_bodies::Seg<'a, (u32, u32, u32)>,
+    pub exp_map: OSeg<'a, Regions>,
     /// macro_rules expansion tokens substituted from a fragment -> the fragment token's own
     /// position (rustc: substituted tokens keep their spans), ascending by expansion position:
     /// (expansion position, origin position, length)
-    pub tok_origin: lazy_bodies::Seg<'a, (u32, u32, u32)>,
+    pub tok_origin: OSeg<'a, Maps>,
     /// Complete token provenance, in spelling-buffer order (independent of Rust grammar).
-    pub token_origins: lazy_bodies::Seg<'a, TokenOrigin>,
+    pub token_origins: OSeg<'a, Origins>,
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     exp_depth: u32,
     /// macro_rules expansions: (text lo, text hi, the macro's definition position in this
     /// file; 0 when defined elsewhere) -- the hygiene marks (ParsedFile::hyg_ctxt)
-    pub rules_exp: lazy_bodies::Seg<'a, (u32, u32, u32)>,
+    pub rules_exp: OSeg<'a, Regions>,
     /// macro_rules body tokens -> their position in the definition: (expansion position,
     /// definition position, length), ascending
-    pub body_origin: lazy_bodies::Seg<'a, (u32, u32, u32)>,
+    pub body_origin: OSeg<'a, Maps>,
     /// tokens split by `eat_gt` (`>>` -> `>`), with their old value
     pub tok_undo: Vec<(u32, Tok)>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
@@ -1056,7 +1057,7 @@ impl<'a> Parser<'a> {
 
     /// Parses an expansion that starts at token `start`; it must consume it all.
     fn in_expansion<X>(&mut self, start: usize, f: impl FnOnce(&mut Self) -> PResult<X>) -> PResult<X> {
-        let rules = self.session.runtime.profile && self.rules_exp.last().map_or(false, |(lo, hi, _)| *lo <= self.toks[start].lo && self.toks[start].lo < *hi);
+        let rules = self.session.runtime.profile && self.rules_exp.last().map_or(false, |(lo, hi, _)| lo <= self.toks[start].lo && self.toks[start].lo < hi);
         let _profile = crate::load_profile::span(rules, "macro-rules-parse", self.bctx.as_ref().map_or("", |c| c.path.as_str()));
         let save = self.pos;
         self.pos = start;
@@ -3606,23 +3607,16 @@ pub fn parse_source_mode<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a 
 }
 
 /// The origin of a substituted fragment token at `pos` (tok_origin is ascending).
-fn origin_of<'t>(tok_origin: impl Into<lazy_bodies::SegRef<'t, (u32, u32, u32)>>, pos: u32) -> Option<u32> {
-    let tok_origin = tok_origin.into();
-    let i = match tok_origin.binary_search_by_key(&pos, |x| x.0) {
-        Ok(i) => i + 1,
-        Err(i) => i,
-    };
-    match i.checked_sub(1).map(|k| tok_origin[k]) {
-        Some((t, o, n)) if pos < t + n => Some(o + (pos - t)),
+fn origin_of<'t>(tok_origin: impl Into<OSegRef<'t, Maps>>, pos: u32) -> Option<u32> {
+    match tok_origin.into().floor_exact(pos) {
+        Some((_, (t, o, n))) if pos < t + n => Some(o + (pos - t)),
         _ => None,
     }
 }
 
 /// The call site of the expansion whose text contains `pos` (regions ascending, disjoint).
-fn region_of<'t>(exp_map: impl Into<lazy_bodies::SegRef<'t, (u32, u32, u32)>>, pos: u32) -> Option<u32> {
-    let exp_map = exp_map.into();
-    let i = exp_map.partition_point(|x| x.0 <= pos);
-    let r = exp_map.get(i.checked_sub(1)?)?;
+fn region_of<'t>(exp_map: impl Into<OSegRef<'t, Regions>>, pos: u32) -> Option<u32> {
+    let (_, r) = exp_map.into().floor(pos)?;
     if pos <= r.1 {
         Some(r.2)
     } else {
@@ -3633,17 +3627,14 @@ fn region_of<'t>(exp_map: impl Into<lazy_bodies::SegRef<'t, (u32, u32, u32)>>, p
 /// Resolve macro positions before interpreting a source span. A full origin is terminal:
 /// its offsets belong to authored bytes, never to another expansion's spelling buffer.
 fn source_origin<'a>(mut pos: u32, exact: bool, src_len: u32,
-    tables: impl Fn(u32) -> (lazy_bodies::SegRef<'a, (u32, u32, u32)>, lazy_bodies::SegRef<'a, (u32, u32, u32)>, lazy_bodies::SegRef<'a, TokenOrigin>),
+    tables: impl Fn(u32) -> (OSegRef<'a, Maps>, OSegRef<'a, Regions>, OSegRef<'a, Origins>),
 ) -> Result<SourceSpan, u32> {
     for _ in 0..64 {
         let (to, em, origins) = tables(pos);
         if exact {
-            let span = if origins.own.is_empty() || origins.base.is_empty() {
-                origin_at(if origins.own.is_empty() { origins.base } else { origins.own }, pos)
-            } else {
-                // origin_at over the two parts as one array
-                origins.partition_point(|o| o.lo <= pos).checked_sub(1).map(|i| origins[i]).filter(|o| pos <= o.hi).map(|o| o.source)
-            };
+            // AST ends (for example Block.hi) are exclusive. If no next token starts here,
+            // that boundary still belongs to the preceding token's authored construct.
+            let span = origins.floor(pos).map(|(_, o)| o).filter(|o| pos <= o.hi).map(|o| o.source);
             if let Some(span) = span { return Ok(span); }
         }
         if pos < src_len { break; }
@@ -3718,7 +3709,7 @@ pub struct ParsedFile {
     pub ast: Ast,
     pub edition: u16,
     /// expansion text ranges -> call-site position
-    pub exp_map: crate::arena::Arena<(u32, u32, u32)>,
+    pub exp_map: Table<Regions>,
     /// byte offset of each line start (built on the first position query)
     pub line_starts: std::sync::OnceLock<Vec<u32>>,
     /// length of the file's own source (expansion text follows it)
@@ -3726,16 +3717,16 @@ pub struct ParsedFile {
     /// Cached path/source identity, shared by file metadata and front-image lookups.
     pub source_hash: std::sync::OnceLock<(String, u128)>,
     /// substituted fragment tokens -> their origin (Parser::tok_origin)
-    pub tok_origin: crate::arena::Arena<(u32, u32, u32)>,
-    pub token_origins: crate::arena::Arena<TokenOrigin>,
+    pub tok_origin: Table<Maps>,
+    pub token_origins: Table<Origins>,
     /// Whole-file TokenStream input: diagnostics use authored origins.
     pub token_input: bool,
     pub sources: Option<std::sync::Arc<SourceRegistry>>,
     /// macro_rules expansion regions with their macro's definition position (Parser::rules_exp;
     /// u32::MAX: defined in another file)
-    pub rules_exp: crate::arena::Arena<(u32, u32, u32)>,
+    pub rules_exp: Table<Regions>,
     /// macro_rules body tokens -> definition positions (Parser::body_origin)
-    pub body_origin: crate::arena::Arena<(u32, u32, u32)>,
+    pub body_origin: Table<Maps>,
     /// the fn bodies this parse skipped (FnSig::lazy_body) and what parsing them later needs
     pub lazy: FileLazy,
     /// Immutable body segments, published when their owners are demanded.
@@ -3819,14 +3810,14 @@ pub struct FilePart {
     pub src_base: u32,
     pub tok_base: u32,
     pub rules_base: u32,
-    pub rules_exp: crate::arena::Arena<(u32, u32, u32)>,
-    pub body_origin: crate::arena::Arena<(u32, u32, u32)>,
+    pub rules_exp: Table<Regions>,
+    pub body_origin: Table<Maps>,
     pub next: std::sync::OnceLock<Box<FilePart>>,
     pub ext: crate::arena::Arena<u8>,
     pub toks: crate::arena::Arena<Tok>,
-    pub exp_map: crate::arena::Arena<(u32, u32, u32)>,
-    pub tok_origin: crate::arena::Arena<(u32, u32, u32)>,
-    pub token_origins: crate::arena::Arena<TokenOrigin>,
+    pub exp_map: Table<Regions>,
+    pub tok_origin: Table<Maps>,
+    pub token_origins: Table<Origins>,
     /// per skipped fn item, in item order: its body block and the body's arena ranges
     /// [expr lo, expr hi, pat lo, pat hi), or the body's parse error
     pub bodies: PartBodies,
@@ -3883,7 +3874,7 @@ impl ParsedFile {
             let resolved = source_origin(pos, true, self.src_len, |pos| {
                 let (to, em) = self.tables(pos);
                 let origins = if pos as usize >= self.src.len() {
-                    self.part_at(pos).map_or(&self.token_origins[..], |p| &p.token_origins[..])
+                    self.part_at(pos).map_or(&self.token_origins, |p| &p.token_origins)
                 } else { &self.token_origins };
                 (to.into(), em.into(), origins.into())
             });
@@ -3907,10 +3898,10 @@ impl ParsedFile {
                 crate::source::SourceBytes::Mapped(bytes) => sources.register_mapped(&src.path, bytes)?,
             });
         }
-        for o in self.token_origins.iter_mut() { if o.source.file != 0 { o.source.file = ids[&o.source.file]; } }
+        self.token_origins = self.token_origins.remap_files(|f| ids[&f]);
         let mut part = self.part.get_mut();
         while let Some(p) = part {
-            for o in p.token_origins.iter_mut() { if o.source.file != 0 { o.source.file = ids[&o.source.file]; } }
+            p.token_origins = p.token_origins.remap_files(|f| ids[&f]);
             part = p.next.get_mut();
         }
         // Include the current source for nested macros in bodies parsed after restoration.
@@ -4024,7 +4015,7 @@ impl ParsedFile {
     /// The expansion tables that hold position `pos` (the lazily parsed bodies' own past the
     /// file's text).
     #[inline]
-    fn tables(&self, pos: u32) -> (&[(u32, u32, u32)], &[(u32, u32, u32)]) {
+    fn tables(&self, pos: u32) -> (&Table<Maps>, &Table<Regions>) {
         if pos as usize >= self.src.len() {
             if let Some(p) = self.part_at(pos) {
                 return (&p.tok_origin, &p.exp_map);
@@ -4038,11 +4029,6 @@ impl ParsedFile {
     pub fn shrink(&mut self) {
         self.src.shrink_to_fit();
         self.toks.shrink_to_fit();
-        self.exp_map.shrink_to_fit();
-        self.tok_origin.shrink_to_fit();
-        self.token_origins.shrink_to_fit();
-        self.rules_exp.shrink_to_fit();
-        self.body_origin.shrink_to_fit();
         self.ast.shrink();
     }
 
@@ -4069,10 +4055,8 @@ impl ParsedFile {
                 continue;
             }
             let part = self.part_at(pos);
-            let (rules, bodies, base) = part.map_or((&self.rules_exp[..], &self.body_origin[..], 0), |p| (&p.rules_exp[..], &p.body_origin[..], p.rules_base));
-            let i = rules.partition_point(|x| x.0 <= pos);
-            if let Some(k) = i.checked_sub(1) {
-                let r = rules[k];
+            let (rules, bodies, base) = part.map_or((&self.rules_exp, &self.body_origin, 0), |p| (&p.rules_exp, &p.body_origin, p.rules_base));
+            if let Some((k, r)) = OSegRef::from(rules).floor(pos) {
                 if pos < r.1 {
                     // the token's context in the definition (a macro made by a macro), then
                     // this expansion's mark
@@ -4117,8 +4101,7 @@ impl ParsedFile {
                 return None;
             }
             let em = self.tables(p).1;
-            let i = em.partition_point(|x| x.0 <= p);
-            i.checked_sub(1).filter(|k| p <= em[*k].1).map(|k| (k, p as usize >= self.src.len()))
+            OSegRef::from(em).floor(p).filter(|(_, r)| p <= r.1).map(|(k, _)| (k, p as usize >= self.src.len()))
         };
         if reg(a) == reg(b) {
             return a < b;
@@ -4309,7 +4292,7 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
     };
     src.reserve_exact(ext.len());
     src.extend_from_slice(&ext);
-    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: exp_map.into(), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), token_input, sources, rules_exp: rules_exp.into(), body_origin: body_origin.into(), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), image: None, sink: None };
+    let mut pf = ParsedFile { src: src.into(), toks: toks.into(), ast, edition, exp_map: Table::from_rows(&exp_map), line_starts: std::sync::OnceLock::new(), src_len, source_hash: Default::default(), tok_origin: Table::from_rows(&tok_origin), token_origins: Table::from_rows(&token_origins), token_input, sources, rules_exp: Table::from_rows(&rules_exp), body_origin: Table::from_rows(&body_origin), lazy: lazy.into(), part: std::sync::OnceLock::new(), impl_heads: std::sync::OnceLock::new(), image: None, sink: None };
     pf.shrink();
     Ok((pf, used))
 }
@@ -4356,11 +4339,11 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     let n_src = pf.src_len as usize;
     let mut p = Parser::new(sess, &pf.src[..n_src], &pf.toks[..], pf.edition);
     p.ext = lazy_bodies::Seg::on(&pf.src[n_src..]);
-    p.exp_map = lazy_bodies::Seg::on(&pf.exp_map);
-    p.tok_origin = lazy_bodies::Seg::on(&pf.tok_origin);
-    p.token_origins = lazy_bodies::Seg::on(&pf.token_origins);
-    p.rules_exp = lazy_bodies::Seg::on(&pf.rules_exp);
-    p.body_origin = lazy_bodies::Seg::on(&pf.body_origin);
+    p.exp_map = OSeg::on(&pf.exp_map);
+    p.tok_origin = OSeg::on(&pf.tok_origin);
+    p.token_origins = OSeg::on(&pf.token_origins);
+    p.rules_exp = OSeg::on(&pf.rules_exp);
+    p.body_origin = OSeg::on(&pf.body_origin);
     let mut table = crate::macros::MacroTable::default();
     table.s2_fmt = ctx.s2_fmt;
     p.macros = Some(crate::macros::MacroScope::new(std::sync::Arc::new(table)));
@@ -4434,8 +4417,9 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     let mut ast = std::mem::take(&mut p.ast);
     // what the part appended, exactly sized (it is never appended to again)
     fn exact<T>(mut v: Vec<T>) -> Vec<T> { v.shrink_to_fit(); v }
-    let (toks, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin) = (exact(p.toks.into_own()), exact(p.ext.into_own()),
-        exact(p.exp_map.into_own()), exact(p.tok_origin.into_own()), exact(p.token_origins.into_own()), exact(p.rules_exp.into_own()), exact(p.body_origin.into_own()));
+    let (toks, ext) = (exact(p.toks.into_own()), exact(p.ext.into_own()));
+    let (exp_map, tok_origin, token_origins, rules_exp, body_origin) = (Table::from_rows(p.exp_map.own()), Table::from_rows(p.tok_origin.own()),
+        Table::from_rows(p.token_origins.own()), Table::from_rows(p.rules_exp.own()), Table::from_rows(p.body_origin.own()));
     ast.shrink();
     if lazy_stats_on() {
         let why = crate::clock::TYS_ORIGIN.with(|o| o.get());
@@ -4447,8 +4431,8 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     }
     LAZY_PARSED[1].fetch_add(bodies.len() as u64, std::sync::atomic::Ordering::Relaxed);
     (FilePart { src_base: (n_src + n_ext) as u32, tok_base: n_toks as u32, rules_base: n_rules as u32,
-        rules_exp: rules_exp.into(), body_origin: body_origin.into(),
-        next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map: exp_map.into(), tok_origin: tok_origin.into(), token_origins: token_origins.into(), bodies: PartBodies::Parsed(bodies), image: None }, ast)
+        rules_exp, body_origin,
+        next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map, tok_origin, token_origins, bodies: PartBodies::Parsed(bodies), image: None }, ast)
 }
 
 /// RELAX_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.

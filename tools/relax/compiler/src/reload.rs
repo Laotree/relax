@@ -366,7 +366,7 @@ fn const_contexts_mention(prog: &Program, items: &[DefId]) -> bool {
         let src: &[u8] = &pf.src[..];
         // (source text is UTF-8; text that is not counts as a mention)
         let Ok(text) = std::str::from_utf8(src) else { return true };
-        let mut calls: Vec<(u32, u32, u32)> = pf.exp_map.iter().copied().collect();
+        let mut calls: Vec<(u32, u32, u32)> = pf.exp_map.iter().collect();
         calls.sort_unstable();
         for name in &all {
             let Ok(name) = std::str::from_utf8(name) else { return true };
@@ -864,7 +864,7 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
         let mut pos = old.ast.item(*i).lo;
         // Expanded roots belong to their authored macro invocation.
         for _ in 0..32 {
-            let Some(&(_, _, call)) = old.exp_map.iter().rev().find(|&&(a, b, _)| a <= pos && pos < b) else { break };
+            let Some((_, _, call)) = old.exp_map.iter_rev().find(|&(a, b, _)| a <= pos && pos < b) else { break };
             if call == pos { break; }
             pos = call;
         }

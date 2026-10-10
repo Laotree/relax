@@ -4635,11 +4635,11 @@ impl ParseSnapshot {
             assert_eq!(format!("{:?}", v.pf.ast), format!("{:?}", full.pf.ast), "parse reuse AST mismatch: {}", self.path);
             assert_eq!(&*v.pf.src, &*full.pf.src);
             assert_eq!(v.pf.toks.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>(), full.pf.toks.iter().map(|t| (t.kind, t.lo, t.hi)).collect::<Vec<_>>());
-            assert_eq!(&*v.pf.exp_map, &*full.pf.exp_map);
-            assert_eq!(&*v.pf.tok_origin, &*full.pf.tok_origin);
-            assert_eq!(&*v.pf.token_origins, &*full.pf.token_origins);
-            assert_eq!(&*v.pf.rules_exp, &*full.pf.rules_exp);
-            assert_eq!(&*v.pf.body_origin, &*full.pf.body_origin);
+            assert_eq!(v.pf.exp_map, full.pf.exp_map);
+            assert_eq!(v.pf.tok_origin, full.pf.tok_origin);
+            assert_eq!(v.pf.token_origins, full.pf.token_origins);
+            assert_eq!(v.pf.rules_exp, full.pf.rules_exp);
+            assert_eq!(v.pf.body_origin, full.pf.body_origin);
             assert_eq!(v.idents, full.idents);
             let defs = |v: &FileVersion| v.macros.iter().map(|d| format!("{:?}:{:?}:{}:{}:{:?}:{}:{:?}", d.name, d.krate, d.exported, d.builtin, d.def_file, d.def_pos, d.arms)).collect::<Vec<_>>();
             assert_eq!(defs(&v), defs(&full));

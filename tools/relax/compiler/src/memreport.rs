@@ -143,15 +143,27 @@ fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
         n.0 += a.heap_bytes() as u64;
         n.1 += std::mem::size_of_val(&**a) as u64;
     }
+    fn add_t<K: crate::origin_table::Kind>(totals: &mut std::collections::BTreeMap<String, (u64, u64)>, name: String, t: &crate::origin_table::Table<K>) {
+        let n = totals.entry(name).or_default();
+        n.0 += t.heap_bytes() as u64;
+        n.1 += t.bytes().len() as u64;
+    }
     for f in &p.files {
+        macro_rules! tables {
+            ($prefix:expr, $value:expr, $($field:ident),*) => {
+                $(add_t(&mut totals, format!("{}{}", $prefix, stringify!($field)), &$value.$field);)*
+            };
+        }
         macro_rules! arrays {
             ($prefix:expr, $value:expr, $($field:ident),*) => {
                 $(add(&mut totals, format!("{}{}", $prefix, stringify!($field)), &$value.$field);)*
             };
         }
-        arrays!("main.", f, src, toks, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+        arrays!("main.", f, src, toks);
+        tables!("main.", f, exp_map, tok_origin, token_origins, rules_exp, body_origin);
         for part in f.parts() {
-            arrays!("part.", part, ext, toks, exp_map, tok_origin, token_origins, rules_exp, body_origin);
+            arrays!("part.", part, ext, toks);
+            tables!("part.", part, exp_map, tok_origin, token_origins, rules_exp, body_origin);
         }
         let mut a = Some(&f.ast);
         let mut prefix = "main.ast.";

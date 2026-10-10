@@ -522,23 +522,19 @@ fn render_into(trees: &[TokenTree], out: &mut String) {
 /// rustc's `stringify!`: tokens printed with source spacing (a space only where the source
 /// had whitespace and rustc's `space_between` allows one).
 fn stringify(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize) -> String {
-    stringify_o(buf, toks, lo, hi, (&[][..]).into(), u32::MAX)
+    stringify_o(buf, toks, lo, hi, Default::default(), u32::MAX)
 }
 
 /// stringify! with substituted fragment tokens' spacing taken from their source (rustc keeps a
 /// fragment's tokens with their original spans and spacing): `origins` is Parser::tok_origin,
 /// `src_len` the length of the file's own text.
-fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, origins: SegRef<(u32, u32, u32)>, src_len: u32) -> String {
+fn stringify_o(buf: Buf, toks: &(impl TokSeq + ?Sized), lo: usize, hi: usize, origins: crate::origin_table::OSegRef<crate::origin_table::Maps>, src_len: u32) -> String {
     let orig = |mut pos: u32| -> Option<u32> {
         for _ in 0..32 {
             if pos < src_len {
                 return Some(pos);
             }
-            let i = match origins.binary_search_by_key(&pos, |x| x.0) {
-                Ok(i) => i + 1,
-                Err(i) => i,
-            };
-            match i.checked_sub(1).map(|k| origins[k]) {
+            match origins.floor_exact(pos).map(|(_, r)| r) {
                 Some((t, o, n)) if pos < t + n => pos = o + (pos - t),
                 _ => return None,
             }
@@ -620,8 +616,7 @@ fn src_origin(p: &crate::parser::Parser, mut pos: u32) -> u32 {
 
 fn proc_token_origin(p: &crate::parser::Parser, pos: u32) -> Option<u32> {
     for origins in [&p.tok_origin, &p.body_origin] {
-        let i = origins.partition_point(|x| x.0 <= pos);
-        if let Some((t, o, n)) = i.checked_sub(1).map(|i| origins[i]) {
+        if let Some((_, (t, o, n))) = origins.floor(pos) {
             if pos < t + n { return Some(o + (pos - t)); }
         }
     }
@@ -1207,8 +1202,8 @@ fn trace_on(what: &str) -> bool {
 fn item_location(p: &crate::parser::Parser, mut origin: u32) -> (usize,usize) {
     for _ in 0..64 {
         if origin < p.src.len() as u32 { break; }
-        match p.exp_map.iter().rev().find(|(lo,hi,_)| *lo <= origin && origin <= *hi) {
-            Some((_,_,at)) if *at != origin => origin = *at,
+        match p.exp_map.iter_rev().find(|(lo,hi,_)| *lo <= origin && origin <= *hi) {
+            Some((_,_,at)) if at != origin => origin = at,
             _ => break,
         }
     }

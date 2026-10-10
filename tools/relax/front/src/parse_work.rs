@@ -232,9 +232,9 @@ mod tests {
             let full = s.parse_full(text.as_bytes().to_vec()).unwrap();
             assert_eq!(format!("{:?}", v.pf.ast), format!("{:?}", full.pf.ast));
             assert_eq!(&*v.pf.src, &*full.pf.src);
-            assert_eq!(&*v.pf.tok_origin, &*full.pf.tok_origin);
-            assert_eq!(&*v.pf.token_origins, &*full.pf.token_origins);
-            assert_eq!(&*v.pf.body_origin, &*full.pf.body_origin);
+            assert_eq!(v.pf.tok_origin, full.pf.tok_origin);
+            assert_eq!(v.pf.token_origins, full.pf.token_origins);
+            assert_eq!(v.pf.body_origin, full.pf.body_origin);
             s.reuse = v.reuse;
         }
         assert!(s.reuse.expansions.is_empty() && s.reuse.rules.is_empty());
