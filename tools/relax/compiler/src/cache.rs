@@ -4195,6 +4195,8 @@ impl ColdFront {
             for &i in &swap.indices { stores[i] = Some(&swap.store); }
         }
         let paths = &prog.file_paths;
+        let contexts: Vec<_> = prog.crates.iter().map(|c| c.context.clone()).collect();
+        let file_crate = &prog.file_crate;
         // Detach std shares once, after ALL writer Arc clones have been dropped. Each
         // worker owns disjoint file slots, so apply and the old arrays' final drops can
         // run off main without changing shared-file ownership or parse order.
@@ -4203,6 +4205,7 @@ impl ColdFront {
             std::thread::scope(|scope| {
                 let handles: Vec<_> = files.chunks_mut(chunk).enumerate().map(|(k, files)| {
                     let stores = &stores;
+                    let contexts = &contexts;
                     scope.spawn(move || {
                         let _profile = crate::load_profile::span(profile, "front-swap-remap", "files");
                         let (mut count, mut released, mut shared) = (0, 0, Vec::new());
@@ -4216,7 +4219,7 @@ impl ColdFront {
                             let Some(img) = mapped_front_entry(st, e, key) else { continue };
                             let bytes = crate::front::heap_bytes(file);
                             match std::sync::Arc::get_mut(file) {
-                                Some(f) => { if crate::front::apply(path, f, img) { count += 1; released += bytes; } }
+                                Some(f) => { if crate::front::apply(path, f, img) { count += 1; released += bytes; crate::front::map_sources(contexts, file_crate[i] as usize, path, f); } }
                                 None => {
                                     shared.push(i);
                                     crate::front::SHARED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4239,8 +4242,11 @@ impl ColdFront {
     pub fn report(&self, prog: &crate::program::Program) {
         if !prog.session.options.verbose || !Self::enabled(&prog.session.options) { return; }
         let bytes: usize = self.shared.iter().map(|&i| crate::front::heap_bytes(&prog.files[i])).sum();
-        eprintln!("relax-front: cold swap: {} files, {:.1} MB of heap released at load finish, {:.1} MB still on the heap (shared); {} files shared",
-            self.files, self.released as f64 / 1e6, bytes as f64 / 1e6, self.shared.len());
+        use std::sync::atomic::Ordering::Relaxed;
+        use crate::source::{MAPPED_SOURCES, MAPPED_SOURCE_MISMATCH, MAPPED_SOURCE_NOT_FOUND, MAPPED_SOURCE_NO_SNAPSHOT};
+        eprintln!("relax-front: cold swap: {} files, {:.1} MB of heap released at load finish, {:.1} MB still on the heap (shared); {} files shared; sources mapped {} mismatch {} not-found {} no-snapshot {}",
+            self.files, self.released as f64 / 1e6, bytes as f64 / 1e6, self.shared.len(),
+            MAPPED_SOURCES.load(Relaxed), MAPPED_SOURCE_MISMATCH.load(Relaxed), MAPPED_SOURCE_NOT_FOUND.load(Relaxed), MAPPED_SOURCE_NO_SNAPSHOT.load(Relaxed));
     }
 }
 

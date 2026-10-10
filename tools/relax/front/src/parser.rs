@@ -3872,7 +3872,10 @@ impl ParsedFile {
             let id = origin.source.file;
             if id == 0 || ids.contains_key(&id) { continue; }
             let src = old.get(id)?;
-            ids.insert(id, sources.register(&src.path, src.src.clone())?);
+            ids.insert(id, match &src.src {
+                crate::source::SourceBytes::Shared(bytes) => sources.register(&src.path, bytes.clone())?,
+                crate::source::SourceBytes::Mapped(bytes) => sources.register_mapped(&src.path, bytes)?,
+            });
         }
         for o in self.token_origins.iter_mut() { if o.source.file != 0 { o.source.file = ids[&o.source.file]; } }
         let mut part = self.part.get_mut();

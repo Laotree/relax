@@ -170,6 +170,19 @@ pub fn apply(path: &str, pf: &mut ParsedFile, img: &'static [u8]) -> bool {
     true
 }
 
+/// A file's image just became its source: the registry's authored bytes for the file are
+/// now a view of the image's `src[..src_len]` (the one place a ParsedFile's src turning
+/// mapped reaches the registry).
+/// The read snapshots of every context sharing the registry drop their copy (preload workers and
+/// lazy expansion bind the first context, not the file's own crate's).
+pub fn map_sources(contexts: &[std::sync::Arc<crate::source_context::Context>], own: usize, path: &str, pf: &ParsedFile) {
+    if let Arena::Mapped(src) = pf.src {
+        if contexts[own].sources().map_authored(path, &src[..pf.src_len as usize]) {
+            for context in contexts { context.release_read(path); }
+        }
+    }
+}
+
 /// part image sections
 const P_EXT: u32 = 200;
 const P_TOKS: u32 = 201;
@@ -351,7 +364,10 @@ fn source_chunks(pf: &ParsedFile, origins: &[TokenOrigin]) -> Vec<crate::image::
         src.path.put(&mut head);
         src.src.len().put(&mut head);
         chunks.push(Chunk::Owned(head));
-        chunks.push(Chunk::Shared(src.src.clone()));
+        chunks.push(match &src.src {
+            crate::source::SourceBytes::Shared(bytes) => Chunk::Shared(bytes.clone()),
+            crate::source::SourceBytes::Mapped(bytes) => Chunk::Mapped(bytes),
+        });
     }
     chunks
 }
@@ -418,7 +434,7 @@ fn same_origins(a: &ParsedFile, ao: &[TokenOrigin], b: &ParsedFile, bo: &[TokenO
             (xi, yi) => {
                 let xs = a.sources.as_ref().and_then(|s| s.get(xi).ok());
                 let ys = b.sources.as_ref().and_then(|s| s.get(yi).ok());
-                xs.zip(ys).is_some_and(|(x, y)| x.path == y.path && x.src == y.src)
+                xs.zip(ys).is_some_and(|(x, y)| x.path == y.path && *x.src == *y.src)
             }
         }
     })

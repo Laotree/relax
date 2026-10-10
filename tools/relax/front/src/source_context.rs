@@ -33,6 +33,8 @@ impl Context {
         self.rust_outlines.lock().unwrap().clear();
         self.outline_reuse.lock().unwrap().clear();
     }
+    /// `path`'s authored bytes are now a mapped image's: the load's read snapshot drops its copy.
+    pub fn release_read(&self, path: &str) { self.reads.release(std::path::Path::new(path)); }
     pub fn report_host_profile(&self) { self.reads.report(); }
     pub fn read_source(&self, path: &str) -> Result<Arc<crate::source::SourceFile>, String> {
         let _reads = self.bind_source_reads();

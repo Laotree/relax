@@ -59,15 +59,37 @@ pub fn line_col(src: &[u8], starts: &[u32], pos: u32) -> (usize, usize) {
     (line + 1, (pos - starts[line]) as usize + 1)
 }
 
+/// Authored source bytes: shared heap bytes, or a view of a mapped image that outlives the load.
+#[derive(Clone)]
+pub enum SourceBytes { Shared(Arc<[u8]>), Mapped(&'static [u8]) }
+
+impl std::ops::Deref for SourceBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { match self { Self::Shared(src) => src, Self::Mapped(src) => src } }
+}
+
+impl From<Arc<[u8]>> for SourceBytes {
+    fn from(src: Arc<[u8]>) -> Self { Self::Shared(src) }
+}
+
+/// Registry entries whose owned bytes differed from their image's source (kept owned).
+pub static MAPPED_SOURCE_MISMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Registry entries switched from owned bytes to their image's source.
+pub static MAPPED_SOURCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `map_authored` calls whose path has no registry entry.
+pub static MAPPED_SOURCE_NOT_FOUND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `map_authored` calls whose registry entry holds no snapshot (never read, or an error).
+pub static MAPPED_SOURCE_NO_SNAPSHOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct SourceFile {
     pub path: String,
-    pub src: Arc<[u8]>,
+    pub src: SourceBytes,
     pub lines: OnceLock<Vec<u32>>,
     hash: OnceLock<u128>,
 }
 
 impl SourceFile {
-    pub fn new(path: String, src: Arc<[u8]>) -> Self {
+    pub fn new(path: String, src: SourceBytes) -> Self {
         Self { path, src, lines: OnceLock::new(), hash: OnceLock::new() }
     }
 
@@ -96,14 +118,20 @@ impl SourceFile {
 
 struct Entry {
     path: String,
-    source: OnceLock<Arc<SourceFile>>,
-    snapshot: OnceLock<Snapshot>,
+    state: Mutex<EntryState>,
 }
 
-enum Snapshot { Owned(Arc<[u8]>), Mapped(&'static [u8]) }
-impl Snapshot {
-    fn bytes(&self) -> &[u8] { match self { Self::Owned(src) => src, Self::Mapped(src) => src } }
-    fn shared(&self) -> Arc<[u8]> { match self { Self::Owned(src) => src.clone(), Self::Mapped(src) => Arc::from(*src) } }
+#[derive(Default)]
+struct EntryState {
+    source: Option<Arc<SourceFile>>,
+    snapshot: Option<SourceBytes>,
+}
+
+impl Entry {
+    fn new(path: &str, snapshot: Option<SourceBytes>) -> Arc<Self> {
+        Arc::new(Self { path: path.into(), state: Mutex::new(EntryState { source: None, snapshot }) })
+    }
+    fn state(&self) -> std::sync::MutexGuard<'_, EntryState> { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
 }
 
 struct Registry {
@@ -119,7 +147,10 @@ impl Default for Registry {
     }
 }
 
-/// Shared by Program and parsing workers. Snapshots are immutable for the entire load.
+/// Shared by Program and parsing workers. Snapshots are immutable for the entire load, with one
+/// exception: once a file's image is mapped (`map_authored`), the file's bytes are the image's and
+/// its read-snapshot entry is released, so an include!/include_str! of that same module file from
+/// a later lazy expansion reads the disk again.
 #[derive(Default)]
 pub struct SourceRegistry {
     identities: Arc<Mutex<Registry>>,
@@ -137,10 +168,12 @@ impl SourceRegistry {
         r.entries.iter().enumerate().map(|(i, e)| (i as u32 + r.first, e))
             .chain(r.imported.iter().map(|(id, e)| (*id, e))).map(|(id, e)| {
             let e = self.overrides.get(&id).unwrap_or(e);
-            let source = e.source.get();
-            let bytes = match e.snapshot.get() {
-                Some(Snapshot::Owned(src)) => src.len(),
-                _ => source.map_or(0, |s| s.src.len()),
+            let st = e.state();
+            let owned = |b: &SourceBytes| if let SourceBytes::Shared(src) = b { src.len() } else { 0 };
+            let source = st.source.as_ref();
+            let bytes = match &st.snapshot {
+                Some(snapshot) => owned(snapshot),
+                None => source.map_or(0, |s| owned(&s.src)),
             };
             (bytes + source.map_or(0, |s| s.lines.get().map_or(0, |lines| lines.capacity() * 4)) + e.path.capacity()) as u64
         }).sum()
@@ -151,7 +184,7 @@ impl SourceRegistry {
     pub fn overlay(&self, path: &str, src: Arc<[u8]>) -> Self {
         let id = self.source_id(path);
         let mut overrides = self.overrides.clone();
-        let entry = Arc::new(Entry { path: path.into(), source: OnceLock::new(), snapshot: OnceLock::from(Snapshot::Owned(src)) });
+        let entry = Entry::new(path, Some(src.into()));
         overrides.insert(id, entry);
         Self { identities: self.identities.clone(), overrides }
     }
@@ -161,7 +194,7 @@ impl SourceRegistry {
         let mut r = self.identities.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(id) = r.paths.get(path) { return *id; }
         let id = u32::try_from(r.entries.len()).ok().and_then(|n| r.first.checked_add(n)).expect("source ID overflow");
-        r.entries.push(Arc::new(Entry { path: path.into(), source: OnceLock::new(), snapshot: OnceLock::new() }));
+        r.entries.push(Entry::new(path, None));
         r.paths.insert(path.into(), id);
         id
     }
@@ -185,7 +218,7 @@ impl SourceRegistry {
         if let Some(&have) = r.paths.get(path) { return have == id; }
         if id == 0 || id >= r.first || r.imported.contains_key(&id) { return false; }
         r.paths.insert(path.into(), id);
-        r.imported.insert(id, Arc::new(Entry { path: path.into(), source: OnceLock::new(), snapshot: OnceLock::from(Snapshot::Mapped(src)) }));
+        r.imported.insert(id, Entry::new(path, Some(SourceBytes::Mapped(src))));
         true
     }
 
@@ -197,7 +230,7 @@ impl SourceRegistry {
             if id == 0 || r.imported.contains_key(&id) || r.paths.contains_key(&path) { return None; }
             r.first = r.first.max(id.checked_add(1)?);
             r.paths.insert(path.clone(), id);
-            r.imported.insert(id, Arc::new(Entry { path, source: OnceLock::new(), snapshot: OnceLock::from(Snapshot::Mapped(src)) }));
+            r.imported.insert(id, Entry::new(&path, Some(SourceBytes::Mapped(src))));
         }
         Some(Self { identities: Arc::new(Mutex::new(r)), overrides: Default::default() })
     }
@@ -207,8 +240,9 @@ impl SourceRegistry {
         let _mem = crate::memstat::tag(crate::memstat::Tag::Source);
         let id = self.source_id(path);
         let entry = self.entry(id)?;
-        let saved = entry.snapshot.get_or_init(|| Snapshot::Owned(src.clone()));
-        if saved.bytes() != &*src { return Err(format!("source snapshot changed during load: {path}")); }
+        let mut st = entry.state();
+        let saved = st.snapshot.get_or_insert_with(|| SourceBytes::Shared(src.clone()));
+        if **saved != *src { return Err(format!("source snapshot changed during load: {path}")); }
         Ok(id)
     }
 
@@ -217,8 +251,9 @@ impl SourceRegistry {
     pub fn register_mapped(&self, path: &str, src: &'static [u8]) -> Result<u32, String> {
         let id = self.source_id(path);
         let entry = self.entry(id)?;
-        let saved = entry.snapshot.get_or_init(|| Snapshot::Mapped(src));
-        if saved.bytes() != src {
+        let mut st = entry.state();
+        let saved = st.snapshot.get_or_insert(SourceBytes::Mapped(src));
+        if **saved != *src {
             return Err(format!("source snapshot changed during load: {path}"));
         }
         Ok(id)
@@ -227,15 +262,46 @@ impl SourceRegistry {
     pub fn get(&self, id: u32) -> Result<Arc<SourceFile>, String> {
         let _mem = crate::memstat::tag(crate::memstat::Tag::Source);
         let entry = self.entry(id)?;
-        if let Some(source) = entry.source.get() { return Ok(source.clone()); }
-        let src = match entry.snapshot.get() {
-            Some(src) => src,
+        let mut st = entry.state();
+        if let Some(source) = &st.source { return Ok(source.clone()); }
+        let src = match &st.snapshot {
+            Some(src) => src.clone(),
             None => {
                 let read = crate::vfs::read_shared(&entry.path).map_err(|e| format!("{}: {e}", entry.path))?;
-                entry.snapshot.get_or_init(|| Snapshot::Owned(read))
+                st.snapshot.insert(SourceBytes::Shared(read)).clone()
             }
         };
-        Ok(entry.source.get_or_init(|| Arc::new(SourceFile::new(entry.path.clone(), src.shared()))).clone())
+        let source = Arc::new(SourceFile::new(entry.path.clone(), src));
+        st.source = Some(source.clone());
+        Ok(source)
+    }
+
+    /// The one switch from owned to mapped authored bytes: `path`'s file image is now mapped
+    /// and its authored source is `src`. The registry entry (and its cached SourceFile) drops
+    /// the owned bytes after they are shown identical; otherwise it stays owned and is counted.
+    /// Holders of an earlier `Arc<SourceFile>` keep that file's bytes only while they hold it.
+    /// Returns true when the entry's authored bytes are now (or already were) the mapped `src`:
+    /// only then may the caller release the file's read snapshot.
+    pub fn map_authored(&self, path: &str, src: &'static [u8]) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(id) = self.find(path) else { MAPPED_SOURCE_NOT_FOUND.fetch_add(1, Relaxed); return false };
+        let Ok(entry) = self.entry(id) else { MAPPED_SOURCE_NOT_FOUND.fetch_add(1, Relaxed); return false };
+        let mut st = entry.state();
+        match &st.snapshot {
+            Some(SourceBytes::Shared(owned)) if **owned == *src => {
+                st.snapshot = Some(SourceBytes::Mapped(src));
+                st.source = None;
+                MAPPED_SOURCES.fetch_add(1, Relaxed);
+                true
+            }
+            Some(SourceBytes::Shared(_)) => {
+                MAPPED_SOURCE_MISMATCH.fetch_add(1, Relaxed);
+                if std::env::var_os("RELAX_LAZY_VERIFY").is_some() { panic!("mapped source differs from the registry's bytes: {path}"); }
+                false
+            }
+            Some(_) => true,
+            None => { MAPPED_SOURCE_NO_SNAPSHOT.fetch_add(1, Relaxed); false }
+        }
     }
 }
 

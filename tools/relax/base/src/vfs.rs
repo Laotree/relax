@@ -260,7 +260,9 @@ struct ReadPaths {
     retired: Vec<(String, Arc<ReadEntry>)>,
 }
 /// Immutable bytes shared by prescan, lowering and loader retries. Each new
-/// load/edited candidate owns a fresh table; it never serves a subsequent load.
+/// load/edited candidate owns a fresh table; it never serves a subsequent load. Exception: once a
+/// file's image is mapped its entry is released (`release`), so an include!/include_str! of that
+/// same module file from a later lazy expansion reads the disk.
 #[derive(Default)]
 pub struct ReadSnapshot {
     paths: std::sync::Mutex<ReadPaths>,
@@ -288,6 +290,16 @@ impl ReadSnapshot {
             } else { paths.files.insert(canonical.clone(), entry); }
         }
         paths.aliases.insert(path, canonical);
+    }
+    /// Drops the snapshot's copy of `path` once its bytes live elsewhere (a mapped image); the
+    /// bytes stay alive only for holders that already have them.
+    pub fn release(&self, path: &std::path::Path) {
+        let key = normalize_components(&path.to_string_lossy(), false);
+        let mut paths = self.paths.lock().unwrap();
+        let key = paths.aliases.get(&key).cloned().unwrap_or(key);
+        if let Some(entry) = paths.files.remove(&key) {
+            if self.profile { paths.retired.push((key, entry)); }
+        }
     }
     fn read_shared(&self, path: &std::path::Path) -> io::Result<Arc<[u8]>> {
         let key = normalize_components(&path.to_string_lossy(), false);
