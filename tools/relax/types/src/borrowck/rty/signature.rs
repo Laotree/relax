@@ -131,7 +131,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
             for (i, _, slots) in &layout.params {
                 let n = slots.len();
                 if let Some(t) = ps.get(*i) {
-                    let all = p.ty(*t);
+                    let all = p.callable_ty(*t, &mut cons);
                     let input: Vec<_> = slots.iter().filter_map(|&i| all.get(i).copied()).collect();
                     if input.len() == n && offset + n <= closure.len() {
                         for (a, b) in closure[offset..offset + n].iter().copied().zip(input) {
@@ -141,7 +141,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
                 }
                 offset += n;
             }
-            let output = p.ty(*ret);
+            let output = p.callable_ty(*ret, &mut cons);
             if offset + output.len() == closure.len() {
                 for (a, b) in closure[offset..].iter().copied().zip(output) {
                     cons.extend([(a, b), (b, a)]);
@@ -270,6 +270,122 @@ impl Projection<'_, '_> {
         let s = self.fresh(n, k);
         self.regions.push((r, s));
         s
+    }
+    /// Instantiate before normalizing a callable predicate, as in rustc_borrowck
+    /// type_check/mod.rs (FnDef predicates) and canonical.rs. The call's generic
+    /// argument slots must survive normalization of e.g. `Self::Item`; normalizing
+    /// the declaration under the callee's environment leaves that alias rigid.
+    fn callable_ty(&mut self, ty: TyId, cons: &mut Vec<(SR, SR)>) -> Vec<SR> {
+        use crate::types::fold::{TypeFolder, super_fold_ty};
+        use crate::next_solver::type_op::{Normalize, ParamEnvAnd, TypeOp};
+        let tx = self.rty.tx;
+        let tys = &tx.tcx.tys;
+        if !tys.may_project(ty) { return self.ty(ty); }
+        let infcx = crate::infer::InferCtxt::for_item(tx.tcx, tx.prog, tx.cx.typing_env.mode, tx.obligation_owner.get());
+        // Reify the adapter's existing slots into this operation's inference
+        // context. Never reuse typeck's region variables or identify two slots
+        // merely because their erased/typeck regions happen to match.
+        struct Instantiate<'a, 'b, 'c, 'tcx> {
+            p: &'a mut Projection<'b, 'c>, infcx: &'a crate::infer::InferCtxt<'tcx>,
+            regions: Vec<(RegionId, SR)>, valid: bool,
+        }
+        impl Instantiate<'_, '_, '_, '_> {
+            fn region(&mut self, slot: SR) -> RegionId {
+                if slot == SR::Static { return self.infcx.tcx.tys.intern_region(RegionKind::ReStatic); }
+                let slot = if slot == SR::Fresh { self.p.fresh("'_", SK_FRESH) } else { slot };
+                if let Some((r, _)) = self.regions.iter().find(|(_, s)| *s == slot) { return *r; }
+                let r = self.infcx.next_region_var();
+                self.regions.push((r, slot)); r
+            }
+            fn unnumbered_region(&mut self, r: RegionId, depth: u32) -> RegionId {
+                match self.infcx.tcx.tys.region_kind(r) {
+                    RegionKind::ReBound(d, _) if d < depth => r,
+                    RegionKind::ReStatic => r,
+                    _ => self.region(SR::Fresh),
+                }
+            }
+            fn argument(&mut self, ty: TyId, slots: &mut std::slice::Iter<'_, SR>, depth: u32) -> TyId {
+                let tys = &self.infcx.tcx.tys;
+                let mut region = |r| {
+                    let Some(&slot) = slots.next() else { self.valid = false; return r; };
+                    if matches!(tys.region_kind(r), RegionKind::ReBound(d, _) if d < depth) { r }
+                    else { self.region(slot) }
+                };
+                // Same order as Projection::ty / Rty::skel_into. Nested FnPtr
+                // binders have no BIR slots; dyn predicates retain their binders.
+                let kind = match tys.kind(ty).clone() {
+                    TyKind::Ref(m, t, r) => { let r = region(r); TyKind::Ref(m, self.argument(t, slots, depth), r) }
+                    TyKind::Adt(d, ts, rs) => {
+                        let rs = tys.intern_region_args(&tys.region_args(rs).iter().map(|r| region(*r)).collect::<Vec<_>>());
+                        TyKind::Adt(d, ts.into_iter().map(|t| self.argument(t, slots, depth)).collect(), rs)
+                    }
+                    TyKind::Dyn(d, ts, bs, rs, r, n, autos) => {
+                        let r = region(r);
+                        let ts = ts.iter().map(|t| self.argument(*t, slots, depth + 1)).collect::<Vec<_>>();
+                        let bs = bs.iter().map(|(d, t, n)| (*d, self.argument(*t, slots, depth + 1), *n)).collect::<Vec<_>>();
+                        let rs = tys.intern_region_args(&tys.region_args(rs).iter().map(|r| self.unnumbered_region(*r, depth + 1)).collect::<Vec<_>>());
+                        TyKind::Dyn(d, ts.into(), bs.into(), rs, r, n, autos)
+                    }
+                    TyKind::Tuple(ts) => TyKind::Tuple(ts.into_iter().map(|t| self.argument(t, slots, depth)).collect()),
+                    TyKind::Slice(t) => TyKind::Slice(self.argument(t, slots, depth)),
+                    TyKind::Array(t, n) => TyKind::Array(self.argument(t, slots, depth), n),
+                    TyKind::Ptr(m, t) => TyKind::Ptr(m, self.argument(t, slots, depth)),
+                    _ => {
+                        // Types without layout slots can still contain free
+                        // regions (notably FnPtr). Keep those out of the foreign
+                        // typeck context as well, without inventing BIR slots.
+                        let this = std::cell::RefCell::new(self);
+                        return tys.map_regions(ty, &|r, d| this.borrow_mut().unnumbered_region(r, d), depth);
+                    }
+                };
+                tys.intern(kind)
+            }
+        }
+        impl TypeFolder for Instantiate<'_, '_, '_, '_> {
+            fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
+                if let TyKind::Param(i) = tys.kind(ty) {
+                    if let Some(&actual) = self.p.args.get(*i as usize) {
+                        let slots = self.p.ty(ty);
+                        let actual = crate::borrowck::universal_regions::with_erased_adt_regions(self.p.rty.tx.tcx, self.p.rty.tx.normalize(actual));
+                        let mut slots = slots.iter();
+                        let actual = self.argument(actual, &mut slots, 0);
+                        self.valid &= slots.next().is_none();
+                        return tys.shift_in(actual, depth);
+                    }
+                }
+                super_fold_ty(tys, ty, self, depth)
+            }
+            fn fold_region(&mut self, tys: &crate::types::Types, r: RegionId, depth: u32) -> RegionId {
+                if matches!(tys.region_kind(r), RegionKind::ReBound(d, _) if d < depth) { return r; }
+                let slot = self.p.region(r, None); self.region(slot)
+            }
+        }
+        let mut inst = Instantiate { p: self, infcx: &infcx, regions: Vec::new(), valid: true };
+        let value = inst.fold_ty(tys, tys.set_aliases_to_non_rigid(ty), 0);
+        if !inst.valid { return inst.p.ty(ty); }
+        let regions = inst.regions;
+        let op = ParamEnvAnd { param_env: tx.param_env.borrow().clone(), value: Normalize { value } };
+        let Ok(out) = op.fully_perform(&infcx, tx.prog) else { return self.ty(ty); };
+        // The type operation's new regions are existential symbols, and its
+        // constraints are caller requirements, never implied assumptions.
+        let mut normalized = Projection { rty: self.rty, param_env: tx.param_env.borrow().clone(), args: &[],
+            regions, params: Vec::new(), names: std::mem::take(&mut self.names), kinds: std::mem::take(&mut self.kinds) };
+        let slots = normalized.ty(out.output);
+        if let Some(constraints) = out.constraints {
+            for c in constraints.constraints {
+                for c in c.constraint.iter_outlives() {
+                    match c {
+                        OutlivesPredicate::Region(a, b) => cons.push((normalized.region(a, None), normalized.region(b, None))),
+                        OutlivesPredicate::Type(t, r) => {
+                            let r = normalized.region(r, None);
+                            for s in normalized.ty(t) { cons.push((s, r)); }
+                        }
+                    }
+                }
+            }
+        }
+        self.names = normalized.names; self.kinds = normalized.kinds;
+        slots
     }
     fn ty(&mut self, t: TyId) -> Vec<SR> {
         let tcx = self.rty.tx.tcx;
