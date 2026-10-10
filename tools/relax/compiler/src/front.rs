@@ -301,7 +301,7 @@ fn same_part(a: &crate::parser::FilePart, aa: &crate::ast::Ast, b: &crate::parse
 /// of its image when the image holds the same parse.
 pub fn map_part(path: &str, pf: &ParsedFile, fp: &mut crate::parser::FilePart, a: &mut crate::ast::Ast, img: &'static [u8]) -> bool {
     let mut sources = pf.sources.clone();
-    let Some((mfp, ma)) = part_from_image(path, a.base, (fp.src_base as usize, fp.tok_base as usize, fp.rules_base as usize), img, &mut sources, false) else { return false };
+    let Some((mfp, ma)) = part_from_image(path, *a.base, (fp.src_base as usize, fp.tok_base as usize, fp.rules_base as usize), img, &mut sources, false) else { return false };
     // the part's source registry is its file's: an image must not need another one
     let same_registry = match (&sources, &pf.sources) {
         (Some(x), Some(y)) => std::sync::Arc::ptr_eq(x, y),
