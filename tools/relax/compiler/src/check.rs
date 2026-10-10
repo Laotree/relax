@@ -348,12 +348,6 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         );
         eprintln!("relax-check: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", st.ctfe_data, st.ctfe_code, st.ctfe_ns as f64 / 1e6);
     }
-    {
-        let n = crate::jit::NESTED_AT_YIELD.load(std::sync::atomic::Ordering::Relaxed);
-        if n != 0 {
-            eprintln!("relax-check: UNBALANCED unit lock in O3 jobs: {} nested at a yield, {} left held", n & 0xffff_ffff, n >> 32);
-        }
-    }
     unsafe { crate::jit::backend_bench(up) };
     if std::env::var("RELAX_PASS_TIMES").is_ok() || std::env::var("RELAX_OPT_HIST").is_ok() {
         let mut passes = String::new();
@@ -438,17 +432,10 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     };
-                    let depth = jit::lock_depth();
                     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::compile_slot(up, id)));
                     if let Err(p) = r {
-                        jit::unlock_to(depth);
                         let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".into());
                         panics.lock().unwrap().push((id, format!("internal compiler error: {}{}", msg, jit::take_ice_location())));
-                    } else if jit::lock_depth() > depth {
-                        // a build that returned holding the unit lock: every other worker would
-                        // wait for it forever (the check never ends); a Relax bug, reported
-                        jit::unlock_to(depth);
-                        panics.lock().unwrap().push((id, "internal compiler error: the build returned holding the unit lock".to_string()));
                     }
                     active.fetch_sub(1, Ordering::SeqCst);
                     let n = compiled.fetch_add(1, Ordering::Relaxed) + 1;

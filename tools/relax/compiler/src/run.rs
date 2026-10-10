@@ -1783,14 +1783,16 @@ fn start_exit_summary() {
         exit_mark("start");
         remove_present_report();
         if let Some(code) = code { report("exit", &code.to_string()); }
-        // background compilers stop and release the unit: the errors, the panic's report and
-        // the summary below read it under the lock (summary_inner's quiesce re-enters it)
+        // this thread works for the exiting one: its unit calls are served (the owner serves only
+        // the exit's from now on); the errors, the panic's report and the summary below are unit
+        // calls, made only if the owner answers in time
+        crate::owner::exit_helper();
         let up = unsafe { RUN_UNIT };
-        let got = !up.is_null() && jit::quiesce(exit_quiesce_ms());
+        let got = !up.is_null() && crate::owner::call_within(crate::owner::Class::App, exit_quiesce_ms(), || ()).is_some();
         flush_errors(false);
         if let Some(p) = RUN_PANIC.get() {
             // the message itself was printed when main returned
-            let rep = if got { unsafe { (&*up).report(p) } } else { "compiler busy; backtrace unavailable at exit".to_string() };
+            let rep = if got { crate::owner::call(crate::owner::Class::App, || unsafe { (&*up).report(p) }) } else { "compiler busy; backtrace unavailable at exit".to_string() };
             eprintln!("relax-run: main {} report: {}", p.kind, rep);
             report("panic", &format!("main {}: {} -- report: {}", p.kind, p.message, rep));
         }
@@ -1799,7 +1801,6 @@ fn start_exit_summary() {
         }
         exit_mark("errors");
         summary_inner(why);
-        if got { jit::unlock_unit(); }
         EXIT_PERSIST.store(false, Ordering::SeqCst);
         if let Some(dcx) = RUN_DIAGNOSTICS.lock().unwrap().as_ref() { dcx.flush_delayed(); }
         exit_mark("summary tail");
@@ -1817,7 +1818,10 @@ fn finish_run(why: &'static str, code: Option<i32>) {
     // does not spend a second budget after a JIT exit hook ran.
     static DONE: AtomicBool = AtomicBool::new(false);
     if DONE.swap(true, Ordering::AcqRel) { return; }
-    EXIT_CALLER_HOLDS.store(jit::lock_depth() > 0, Ordering::SeqCst);
+    // ending on the owner thread itself (an initializer's process::exit): it cannot serve the
+    // exit worker while it waits for it
+    EXIT_CALLER_HOLDS.store(crate::owner::is_owner(), Ordering::SeqCst);
+    jit::begin_exit();
     if exit.request.try_send((why, code)).is_err() { return; }
     // 100 ms for the cleanup, counted from the end of the cache write; the write itself only
     // has a hang guard (a store on a stalled disk must not keep the process forever)
@@ -2003,7 +2007,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a frame's lazy compile goes first: the manifest is made again by a later write
-                let stop = || jit::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
+                let stop = || crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
                 if !c.record_manifest(u, crate::layout::root_crate(), &order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed), &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
                     verbose!("relax-cache: startup manifest yielded to the main thread; retried later");
@@ -2068,7 +2072,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                     }
                 }
                 if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
-                    let stop = || jit::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
+                    let stop = || crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
                         crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
                         crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
@@ -2146,7 +2150,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                 continue;
             }
             let t = Instant::now();
-            while jit::main_waiting() && t.elapsed().as_millis() < 50 { std::thread::yield_now(); }
+            while crate::owner::main_waiting() && t.elapsed().as_millis() < 50 { std::thread::yield_now(); }
         }
         if std::env::var_os("RELAX_CACHE_TRACE").is_some() { verbose!("relax-cache: front image install held the unit lock {:.1} ms at most", max_held); }
     }
@@ -2187,18 +2191,18 @@ fn summary_inner(why: &str) {
     let options = &session.options;
     // at the end of the run the background compilers stop and release the unit (a mid-run
     // "stats" summary keeps them going); the summary reads it under the lock
-    let holder = jit::lock_holder();
+    let holder = crate::owner::serving_note();
     let t_wait = std::time::Instant::now();
     // the end of the run never waits on compiles: other threads' builds are abandoned at their next
     // safe point (jit::quiesce); a holder still busy after EXIT_QUIESCE_MS costs this run's
     // summary + cache pack
     let preamble = |got: bool| -> bool {
-        if got && holder != "nobody" && t_wait.elapsed().as_micros() > 100 && !SILENT.load(Ordering::Relaxed) {
-            verbose!("relax-run: {}: waited {:.1} ms for the unit lock (held by `{}`)", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
+        if got && holder != "idle" && t_wait.elapsed().as_micros() > 100 && !SILENT.load(Ordering::Relaxed) {
+            verbose!("relax-run: {}: waited {:.1} ms for the owner thread (serving {})", why, t_wait.elapsed().as_secs_f64() * 1e3, holder);
         }
         if why != "stats" { exit_mark("quiesce"); jit::tier1_stats_report(); }
         if !got {
-            verbose!("relax-run: {}: no summary -- the unit lock is still held by thread `{}`", why, jit::lock_holder());
+            verbose!("relax-run: {}: no summary -- the owner thread is still serving {}", why, crate::owner::serving_note());
             return false;
         }
         true
@@ -2206,7 +2210,7 @@ fn summary_inner(why: &str) {
     let rest = || {
         if why != "stats" {
             let (ms, site) = jit::main_post_present_wait();
-            verbose!("relax-run: main thread's longest unit-lock wait after first present: {:.1} ms (holder locked at {})", ms, site);
+            verbose!("relax-run: main thread's longest unit-call wait after first present: {:.1} ms ({})", ms, site);
         }
         verbose!("relax-run: startup seeds skipped: {} initializers (demand evaluation required), {} recursive builds", jit::SEED_INITIALIZERS_SKIPPED.load(Ordering::Relaxed), jit::SEED_RECURSIVE_SKIPPED.load(Ordering::Relaxed));
         // borrowck lane: the background checker's summary, with or without the disk cache; checker
@@ -2358,14 +2362,14 @@ fn summary_inner(why: &str) {
             }
             if built > 0 || n[0] > 0.0 {
                 verbose!(
-                    "relax-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after RELAX_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} yields, {} cold calls skipped, {} priority relocks{}",
-                    n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_YIELDS.load(Ordering::Relaxed), jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), jit::SPEC_PRIORITY.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
+                    "relax-run: pipelined compile: callers front {:.0} ms locked, back {:.0} ms unlocked, relock wait {:.0} ms, in-flight waits {:.0} ms; speculative {} built ({} called, {} unused; {} expired after RELAX_SPEC_TTL_MS, {:.0} MB freed), workers front {:.0} ms back {:.0} ms, {} yields, {} cold calls skipped{}",
+                    n[0], n[1], n[2], n[3], built, used, built - used, jit::SPEC_EXPIRED[0].load(Ordering::Relaxed), jit::SPEC_EXPIRED[1].load(Ordering::Relaxed) as f64 / 1048576.0, n[4], n[5], jit::SPEC_YIELDS.load(Ordering::Relaxed), jit::SPEC_COLD_SKIPPED.load(Ordering::Relaxed), if jit::spec_hot_only(options) { " (fall-through only)" } else { "" }
                 );
             }
         }
         if !SILENT.load(Ordering::Relaxed) {
-            let h = |i: usize| jit::LOCK_HELD_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
-            verbose!("relax-run: unit lock held: main {:.0} ms, workers {:.0} ms, other threads {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), crate::clock::ms_since_start());
+            let h = |i: usize| crate::owner::BUSY_NS[i].load(Ordering::Relaxed) as f64 / 1e6;
+            verbose!("relax-run: owner thread busy: job {:.0} ms, finish {:.0} ms, main {:.0} ms, app {:.0} ms, background {:.0} ms (t={:.0} ms)", h(0), h(1), h(2), h(3), h(4), crate::clock::ms_since_start());
         }
         let ah = |i: usize| jit::AHEAD_STATS[i].load(Ordering::Relaxed);
         if ah(0) + ah(2) > 0 && !SILENT.load(Ordering::Relaxed) {
@@ -2400,7 +2404,7 @@ fn summary_inner(why: &str) {
         let q = jit::TIER_QUEUED.load(Ordering::Relaxed);
         if q > 0 {
             verbose!(
-                "relax-run: O3: {} hot, {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms with the lock, {:.0} ms without{}",
+                "relax-run: O3: {} hot, {} installed ({} rebuild requests), {} dropped {:?}; {} RIRs rebuilt ({:.0} ms); cpu {:.0} ms on the owner, {:.0} ms off it",
                 q,
                 s.tier1_installed,
                 s.tier1_retier,
@@ -2410,10 +2414,6 @@ fn summary_inner(why: &str) {
                 jit::TIER1_RIR_REBUILT[1].load(Ordering::Relaxed) as f64 / 1e6,
                 s.tier1_locked_ns as f64 / 1e6,
                 s.tier1_free_ns as f64 / 1e6,
-                {
-                    let n = jit::NESTED_AT_YIELD.load(Ordering::Relaxed);
-                    if n == 0 { String::new() } else { format!("; UNBALANCED unit lock: {} nested at a yield, {} left held by a O3 job", n & 0xffff_ffff, n >> 32) }
-                }
             );
         }
         let mut tl = String::new();
@@ -2529,11 +2529,7 @@ fn summary_inner(why: &str) {
         if crate::owner::call_within(crate::owner::Class::App, 0, || { if preamble(true) { rest(); } }).is_none() {
             preamble(false);
         }
-    } else if jit::quiesce(exit_quiesce_ms()) {
-        // quiesce returns holding the unit lock; the summary is one unit call within that hold
-        crate::owner::call(crate::owner::Class::App, || { if preamble(true) { rest(); } });
-        jit::unlock_unit();
-    } else {
+    } else if crate::owner::call_within(crate::owner::Class::App, exit_quiesce_ms(), || { if preamble(true) { rest(); } }).is_none() {
         preamble(false);
     }
 }

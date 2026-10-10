@@ -126,73 +126,29 @@ fn round48_const_fn_tentative_check_uses_new_body() {
 }
 
 #[test]
-fn round42_quiesce_front_snapshot_completes() {
-    const CHILD: &str = "RELAX_SHUTDOWN_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "jit::settle_tests::round42_quiesce_front_snapshot_completes", "--test-threads=1"])
-            .env(CHILD, "1").spawn().unwrap();
-        let start = std::time::Instant::now();
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                return;
-            }
-            if start.elapsed().as_secs() >= 10 {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("shutdown waited for a parked front-end reader");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-    // A contending reader must withdraw unit-lock waiter bookkeeping on live preemption.
-    crate::owner::call(crate::owner::Class::App, || {
-        let waiter = std::thread::spawn(|| {
-            let result = std::panic::catch_unwind(|| {
-                let _reader = front_read("unit-wait-test");
-                let _p = crate::preempt::Preemptible::on();
-                crate::owner::call(crate::owner::Class::App, || {});
-            });
-            assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-            assert_eq!(lock_depth(), 0);
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while LOCK_WAITERS.load(Ordering::SeqCst) == 0 {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::yield_now();
-        }
-        let writer = crate::preempt::WriterWaiting::new();
-        waiter.join().unwrap();
-        assert_eq!(LOCK_WAITERS.load(Ordering::SeqCst), 0);
-        drop(writer);
-    });
+fn owner_front_write_serves_waiting_readers() {
+    // A front reader waiting for the owner thread (a constant for its type check) holds its read
+    // guard; the owner taking the front's write lock serves it meanwhile (front_write pumps), so
+    // neither waits for the other.
+    let session = std::sync::Arc::new(crate::Session::default());
+    let prog = Program::new(&session);
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    let _u = Unit::new(prog, tcx, 0);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let (go_tx, go_rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
-        let result = std::panic::catch_unwind(|| {
-            let _reader = front_read("shutdown-test");
-            let _p = crate::preempt::Preemptible::on();
-            ready_tx.send(()).unwrap();
-            go_rx.recv().unwrap();
-            crate::owner::call(crate::owner::Class::App, || {});
-        });
-        assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-        assert_eq!(lock_depth(), 0);
+        let _reader = front_read("owner-test");
+        ready_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::owner::call(crate::owner::Class::Job, || {});
     });
     ready_rx.recv().unwrap();
-    assert!(quiesce(200));
-    go_tx.send(()).unwrap();
-    let _writer = front_write();
-    // Same unconditional writer boundary as run::summary's collected snapshot.
-    let path = std::env::temp_dir().join(format!("relax-shutdown-snapshot-{}", std::process::id()));
-    std::fs::write(&path, b"snapshot").unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), b"snapshot");
-    std::fs::remove_file(path).unwrap();
+    let start = std::time::Instant::now();
+    crate::owner::call(crate::owner::Class::App, || {
+        let _writer = front_write();
+    });
     reader.join().unwrap();
-    assert_eq!(LOCK_WAITERS.load(Ordering::SeqCst), 0);
-    // releases the hold `quiesce` above returned with
-    unlock_unit();
+    assert!(start.elapsed().as_secs() < 5, "the owner's front write waited for a reader waiting for the owner");
 }
 
 #[test]
@@ -550,7 +506,6 @@ fn round42_const_and_build_cancellation_are_retryable() {
         let body = || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, value, &[])));
             assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-            assert_eq!(lock_depth(), depth);
             assert!(!u.tcx.const_was_evaluated(value));
             assert!(!u.consts.contains_key(&(value, vec![])));
             assert!(!u.const_failed.contains(&(value, vec![])));
@@ -563,17 +518,14 @@ fn round42_const_and_build_cancellation_are_retryable() {
     u.tcx.const_eval_provider = Some(original);
     let value = u.tcx.const_eval_resolve(&u.prog, env, value, &[]).unwrap();
     assert_eq!(value.try_to_leaf().unwrap().to_bits(4), 3);
-    assert_eq!(lock_depth(), 0);
     crate::owner::call(crate::owner::Class::App, || {
         let id = u.fn_id(FnKey::Inst(target, vec![]));
-        let depth = lock_depth();
         let writer = crate::preempt::WriterWaiting::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _p = crate::preempt::Preemptible::on();
             unsafe { build_rir_mode(up, id, RirMode::Tier0) }
         }));
         assert!(result.is_err_and(|p| crate::preempt::is_preempted(&*p)));
-        assert_eq!(lock_depth(), depth);
         assert!(!u.fns[id as usize].building);
         assert!(u.fns[id as usize].build_err.is_none());
         assert!(u.fns[id as usize].rir.is_none());

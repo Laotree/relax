@@ -82,12 +82,12 @@ fn trace_sub(name: &'static str) {
 /// the holder seen when the wait began (whose hold delayed the edit).
 fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
     let traced = TRACE.with(|s| s.borrow().started.is_some());
-    let holder = if traced { jit::unit_lock_holder() } else { None };
+    let holder = if traced { Some(crate::owner::serving_note()) } else { None };
     let t = Instant::now();
     crate::owner::call(crate::owner::Class::App, || {
         let waited = t.elapsed().as_secs_f64() * 1e3;
         if let Some(h) = holder.filter(|_| waited > 5.0) {
-            eprintln!("reload-trace: unit lock wait {waited:.1} ms before {at}: held by {h}");
+            eprintln!("reload-trace: unit call wait {waited:.1} ms before {at}: the owner was serving {h}");
         }
         f()
     })
@@ -1749,9 +1749,11 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
+            if p.is::<crate::preempt::OwnerBusy>() {
+                std::panic::resume_unwind(p);
+            }
             let u = &mut *up;
             u.fns[id as usize].building = false;
-            u.fns[id as usize].builder = 0;
             Err(format!("internal compiler error in {}: {} -- Relax bug, report it", u.fns[id as usize].name, msg))
         }
     }
@@ -1918,8 +1920,6 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
     }
     let edits: Vec<_> = edits.into_iter().filter(|e| !crate::native_macros::owns_path(&e.path)).collect();
     if edits.is_empty() { return idle_outcome(None, "native macro sources match the running compiler"); }
-    let depth = jit::lock_depth();
-    assert_eq!(depth, 0, "reload caller holds the unit lock");
     // an internal compiler panic in the transaction refuses the edit with its message (the app
     // keeps running the code it had; a half-applied state is not installed)
     let files: Vec<u32> = edits.iter().map(|e| e.file).collect();
@@ -3725,11 +3725,10 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
             let runtime = &session.runtime;
             let p = p;
             jit::lower_this_thread_priority(runtime);
-            // a panic here (the ICE hook is silent while the unit lock is held) would end live
-            // editing without a word: say so, and give the lock back
+            // a panic here (the ICE hook is silent on the compiler's owner thread) would end
+            // live editing without a word: say so
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs) }));
             if let Err(e) = r {
-                jit::unlock_to(0);
                 let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
                 eprintln!("relax-live: the watcher stopped: {why}{}; saves are no longer applied -- restart `relax run`", jit::take_ice_location());
             }

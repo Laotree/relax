@@ -2906,7 +2906,7 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
         FnKey::Closure(f, _, _) => u.prog.file_crate.get(*f as usize).map_or("-".to_string(), |c| u.prog.syms.str(u.prog.crates[*c as usize].name).to_string()),
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => "-".to_string(),
     };
-    let on_main = crate::jit::MAIN_TID.load(std::sync::atomic::Ordering::Relaxed) == crate::jit::current_thread_id();
+    let on_main = crate::owner::for_main();
     let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id));
     TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line);
 }

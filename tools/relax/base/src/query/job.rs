@@ -6,6 +6,8 @@ use std::sync::{Arc, Condvar, Mutex};
 #[derive(Default)]
 pub(super) struct QueryJob {
     pub active: bool,
+    /// the thread running it (WaitHook::me; 0 without a hook)
+    pub runner: u64,
     pub waiting_on: Option<DepNodeIndex>,
     pub latch: Option<Arc<QueryLatch>>,
 }
@@ -16,12 +18,27 @@ pub(super) enum Completion {
     Retry,
 }
 
-/// What a thread about to wait for another thread's query gives up for the wait (true: given up)
-/// and takes back after: set once by the JIT for its unit lock.
-static WAIT_RELEASE: std::sync::OnceLock<(fn() -> bool, fn())> = std::sync::OnceLock::new();
+/// How a waiting thread waits, when it is the JIT's owner thread (set once by the JIT): the owner
+/// never blocks on another thread; it serves requests while it waits (`pump`), and the latch's
+/// completion wakes it (`wake`).
+pub struct WaitHook {
+    pub on_owner: fn() -> bool,
+    /// waits for `done` serving requests; the first argument is the thread running the query
+    pub pump: fn(u64, &dyn Fn() -> bool),
+    pub wake: fn(),
+    /// this thread's id (the runner recorded with an active query)
+    pub me: fn() -> u64,
+}
 
-pub fn set_wait_release(give_up: fn() -> bool, take_back: fn()) {
-    let _ = WAIT_RELEASE.set((give_up, take_back));
+/// This thread's id as the wait hook names threads (0: no hook).
+pub(super) fn runner_id() -> u64 {
+    WAIT_HOOK.get().map_or(0, |h| (h.me)())
+}
+
+static WAIT_HOOK: std::sync::OnceLock<WaitHook> = std::sync::OnceLock::new();
+
+pub fn set_wait_hook(hook: WaitHook) {
+    let _ = WAIT_HOOK.set(hook);
 }
 
 pub(super) struct QueryLatch {
@@ -34,15 +51,13 @@ impl QueryLatch {
         Self { result: Mutex::new(None), ready: Condvar::new() }
     }
 
-    pub fn wait(&self) -> Completion {
+    pub fn wait(&self, runner: u64) -> Completion {
         let mut result = self.result.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(done) = result.as_ref() {
-            return done.clone();
+        if let Some(hook) = WAIT_HOOK.get().filter(|h| result.is_none() && (h.on_owner)()) {
+            drop(result);
+            (hook.pump)(runner, &|| self.result.lock().unwrap_or_else(|e| e.into_inner()).is_some());
+            return self.result.lock().unwrap_or_else(|e| e.into_inner()).as_ref().unwrap().clone();
         }
-        // the running query may need a lock this thread holds (the JIT's unit lock, for CTFE):
-        // give it up for the wait, or both threads wait for each other
-        let release = WAIT_RELEASE.get();
-        let released = release.is_some_and(|(give_up, _)| give_up());
         while result.is_none() {
             drop(result);
             crate::preempt::point();
@@ -51,17 +66,15 @@ impl QueryLatch {
                 result = self.ready.wait_timeout(result, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
             }
         }
-        let done = result.as_ref().unwrap().clone();
-        drop(result);
-        if released {
-            (release.unwrap().1)();
-        }
-        done
+        result.as_ref().unwrap().clone()
     }
 
     pub fn complete(&self, result: Completion) {
         *self.result.lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
         self.ready.notify_all();
+        if let Some(hook) = WAIT_HOOK.get() {
+            (hook.wake)();
+        }
     }
 }
 

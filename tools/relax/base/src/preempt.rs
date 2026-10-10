@@ -58,7 +58,7 @@ impl Drop for Preemptible {
 /// Unwinds with `Preempted` on opted-in threads when a writer waits or shutdown begins.
 #[inline]
 pub fn point() {
-    if (WRITERS.load(Ordering::Relaxed) != 0 || is_stopped()) && ON.with(|c| c.get()) {
+    if (WRITERS.load(Ordering::Relaxed) != 0 || is_stopped()) && ON.try_with(|c| c.get()).unwrap_or(false) {
         std::panic::resume_unwind(Box::new(Preempted));
     }
 }
@@ -81,11 +81,18 @@ pub struct NeedsLoad;
 /// interrupts has no result, so every query it crosses is cancelled (not cached as an error).
 pub struct NeedsUnit;
 
+/// The unwind payload of a request the JIT's owner thread served nested, inside a wait of an
+/// earlier request (compiler/src/owner.rs): it reached something only that earlier request can
+/// finish -- a query or a build it has open, a load. It is no result: every query it crosses is
+/// cancelled, and its requester posts it again once the owner has moved on.
+pub struct OwnerBusy;
+
 /// Whether a caught unwind payload is work to be redone rather than a failure: a preemption,
-/// a build waiting for the post-boot loader (NeedsLoad), or lowering ahead that needs the unit
-/// lock (NeedsUnit). A query it crosses is cancelled.
+/// a build waiting for the post-boot loader (NeedsLoad), lowering ahead that needs the unit
+/// (NeedsUnit), or a request the owner thread could not serve yet (OwnerBusy). A query it
+/// crosses is cancelled.
 pub fn is_cancelled(payload: &(dyn std::any::Any + Send)) -> bool {
-    payload.is::<Preempted>() || payload.is::<NeedsLoad>() || payload.is::<NeedsUnit>()
+    payload.is::<Preempted>() || payload.is::<NeedsLoad>() || payload.is::<NeedsUnit>() || payload.is::<OwnerBusy>()
 }
 
 #[cfg(test)]

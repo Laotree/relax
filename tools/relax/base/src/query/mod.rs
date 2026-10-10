@@ -15,7 +15,7 @@ mod table;
 
 pub use dep_graph::{DepKind, DepNode, DepNodeColor, DepNodeIndex, Fingerprint};
 pub use table::QueryTable;
-pub use job::set_wait_release;
+pub use job::{set_wait_hook, WaitHook};
 pub use dep_graph::{context_ptr, swap_context};
 
 use crate::fxhash::HashMap;
@@ -227,15 +227,16 @@ impl QueryEngine {
                 }
                 let job = state.jobs.entry(index).or_default();
                 if job.active {
-                    Some(Arc::clone(job.latch.get_or_insert_with(|| Arc::new(QueryLatch::new()))))
+                    Some((Arc::clone(job.latch.get_or_insert_with(|| Arc::new(QueryLatch::new()))), job.runner))
                 } else {
                     job.active = true;
+                    job.runner = job::runner_id();
                     None
                 }
             };
             let _waiting = WaitGuard { engine: self, parent };
-            if let Some(latch) = latch {
-                match latch.wait() {
+            if let Some((latch, runner)) = latch {
+                match latch.wait(runner) {
                     job::Completion::Value(result) => return result,
                     job::Completion::Retry => { crate::preempt::point(); continue; },
                 }
