@@ -38,13 +38,13 @@ impl Tcx {
                 env.regions.next_param = 1;
                 env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
                 env.trait_def = Some(d);
-                if let ItemKind::Trait { generics, .. } = &prog.files[def.file as usize].ast.item(def.item).kind {
+                if let Some(crate::ast::TraitItem { generics, .. }) = { let a = &prog.files[def.file as usize].ast; a.as_trait(&a.item(def.item).kind) } {
                     push_generics(prog,def.file,generics,&mut env);
                 }
             }
             env.regions.enabled = true;
             let mut contract = self.region_contract(cx,prog,d,&env);
-            if let ItemKind::Trait { supers, .. } = &prog.files[def.file as usize].ast.item(def.item).kind {
+            if let Some(crate::ast::TraitItem { supers, .. }) = { let a = &prog.files[def.file as usize].ast; a.as_trait(&a.item(def.item).kind) } {
                 self.contract_type_bounds(cx,prog,def.file,def.scope,&env,self.tys.intern(TyKind::Param(0)),
                     prog.files[def.file as usize].ast.list(*supers),true,&mut contract);
             }
@@ -130,9 +130,10 @@ impl Tcx {
                         .collect();
                     // Trait Self occupies full generic index zero. Reuse the
                     // inherited entries in the item's already-lowered environment.
-                    if let ItemKind::Trait { generics, .. } =
-                        &prog.files[pp.file as usize].ast.item(pp.item).kind
-                    {
+                    if let Some(crate::ast::TraitItem { generics, .. }) = {
+                        let a = &prog.files[pp.file as usize].ast;
+                        a.as_trait(&a.item(pp.item).kind)
+                    } {
                         let count = prog.files[pp.file as usize]
                             .ast
                             .list(generics.params)
@@ -217,12 +218,8 @@ impl Tcx {
         let pd = prog.def(d);
         let f = &prog.files[pd.file as usize];
         let g = match &f.ast.item(pd.item).kind {
-            ItemKind::Fn(s, ..) => &f.ast.fn_sig(*s).generics,
-            ItemKind::Impl { generics, .. }
-            | ItemKind::Trait { generics, .. }
-            | ItemKind::TypeAlias { generics, .. } => generics,
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) => g,
-            _ => return,
+            ItemKind::TraitAlias(_) => return,
+            k => match f.ast.kind_generics(k) { Some(g) => g, None => return },
         };
         let region = |n| env.regions.resolve(cx.infcx, &self.tys, prog, pd.file, Some(n));
         for p in f.ast.list(g.params) {
@@ -339,10 +336,8 @@ impl Tcx {
         let pd = prog.def(d);
         let f = &prog.files[pd.file as usize];
         let (g, bs) = match &f.ast.item(pd.item).kind {
-            ItemKind::Trait {
-                generics, supers, ..
-            } => (generics, *supers),
-            ItemKind::TraitAlias(g, bs) => (g, *bs),
+            ItemKind::Trait(r) => { let t = f.ast.row(*r); (&t.generics, t.supers) }
+            ItemKind::TraitAlias(r) => { let t = f.ast.row(*r); (&t.generics, t.bounds) }
             _ => return false,
         };
         let mut bounds = f.ast.list(bs).to_vec();

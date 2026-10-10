@@ -459,7 +459,8 @@ impl<'p, 'a> Walker<'p, 'a> {
         }
         self.attrs(p.ast.list(it.attrs), true);
         match &it.kind {
-            ItemKind::Use { tree, .. } => {
+            ItemKind::Use(r) => {
+                let UseItem { tree, .. } = p.ast.row(*r);
                 let pubvis = !matches!(it.vis, Vis::Private);
                 self.use_tree(tree, pubvis);
             }
@@ -486,18 +487,21 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.block(*b);
                 }
             }
-            ItemKind::Struct(g, data) => {
+            ItemKind::Struct(r) => {
+                let StructItem { generics: g, data } = p.ast.row(*r);
                 self.generics(g);
                 self.variant_data(data);
             }
-            ItemKind::Union(g, f) => {
+            ItemKind::Union(r) => {
+                let UnionItem { generics: g, fields: f } = p.ast.row(*r);
                 self.cen.c[C_UNION] += 1;
                 self.generics(g);
                 for fd in self.p.ast.list(*f) {
                     self.ty(fd.ty, false);
                 }
             }
-            ItemKind::Enum(g, vars) => {
+            ItemKind::Enum(r) => {
+                let EnumItem { generics: g, variants: vars } = p.ast.row(*r);
                 self.generics(g);
                 for v in self.p.ast.list(*vars) {
                     self.attrs(self.p.ast.list(v.attrs), false);
@@ -507,7 +511,8 @@ impl<'p, 'a> Walker<'p, 'a> {
                     }
                 }
             }
-            ItemKind::TypeAlias { generics, bounds, ty } => {
+            ItemKind::TypeAlias(r) => {
+                let TypeAliasItem { generics, bounds, ty } = p.ast.row(*r);
                 self.generics(generics);
                 self.bounds(p.ast.list(*bounds));
                 if let Some(t) = ty {
@@ -515,11 +520,11 @@ impl<'p, 'a> Walker<'p, 'a> {
                 }
             }
             ItemKind::Const(t, e) => {
-                if let Some(t) = t {
-                    self.ty(*t, false);
+                if let Some(t) = t.get() {
+                    self.ty(t, false);
                 }
-                if let Some(e) = e {
-                    self.expr(*e);
+                if let Some(e) = e.get() {
+                    self.expr(e);
                 }
             }
             ItemKind::Static(m, t, e) => {
@@ -527,17 +532,18 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.cen.c[C_STATIC_MUT] += 1;
                 }
                 self.ty(*t, false);
-                if let Some(e) = e {
-                    self.expr(*e);
+                if let Some(e) = e.get() {
+                    self.expr(e);
                 }
             }
-            ItemKind::Trait { generics, supers, items, .. } => {
+            ItemKind::Trait(r) => {
+                let TraitItem { generics, supers, items, .. } = p.ast.row(*r);
                 self.cen.c[C_TRAITS] += 1;
                 self.generics(generics);
                 self.bounds(p.ast.list(*supers));
                 for &i in self.p.ast.list(*items) {
                     // GAT: associated type with generic params
-                    if let ItemKind::TypeAlias { generics: g2, .. } = &p.ast.item(i).kind {
+                    if let Some(TypeAliasItem { generics: g2, .. }) = p.ast.as_alias(&p.ast.item(i).kind) {
                         if !g2.params.is_empty() {
                             self.cen.c[C_GAT] += 1;
                         }
@@ -545,11 +551,13 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.item(i, self.is_generic(generics));
                 }
             }
-            ItemKind::TraitAlias(g, b) => {
+            ItemKind::TraitAlias(r) => {
+                let TraitAliasItem { generics: g, bounds: b } = p.ast.row(*r);
                 self.generics(g);
                 self.bounds(p.ast.list(*b));
             }
-            ItemKind::Impl { generics, negative, trait_, self_ty, items, default_, .. } => {
+            ItemKind::Impl(r) => {
+                let ImplItem { generics, negative, trait_, self_ty, items, default_, .. } = p.ast.row(*r);
                 self.cen.c[C_IMPLS] += 1;
                 if *negative || *default_ {
                     self.cen.c[C_SPECIAL] += 1;
@@ -581,7 +589,8 @@ impl<'p, 'a> Walker<'p, 'a> {
                     self.item(i, false);
                 }
             }
-            ItemKind::ForeignMod(_, items) => {
+            ItemKind::ForeignMod(r) => {
+                let ForeignModItem { items, .. } = p.ast.row(*r);
                 for &i in self.p.ast.list(*items) {
                     self.item(i, false);
                 }
@@ -589,7 +598,7 @@ impl<'p, 'a> Walker<'p, 'a> {
             ItemKind::MacroRules(_) => {
                 self.cen.c[C_MACRO_RULES] += 1;
             }
-            ItemKind::Mac(m) => self.mac(m),
+            ItemKind::Mac(m) => self.mac(p.ast.row(*m)),
             _ => {}
         }
     }

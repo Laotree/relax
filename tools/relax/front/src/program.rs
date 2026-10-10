@@ -945,7 +945,7 @@ impl Program {
         if let Some(f) = self.exec_profile_file(file) { f.note(crate::exec_profile::BODY); }
         let pf = &self.files[file as usize];
         Ok(match pf.ast.item(item).kind {
-            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => e,
+            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => e.get(),
             _ => None,
         })
     }
@@ -1755,7 +1755,7 @@ impl Program {
                     let f = &self.files[file as usize];
                     let it = f.ast.item(iid);
                     let name = match &it.kind {
-                        ItemKind::Mac(m) => f.ast.segs(m.path.segs).last().map(|sg| f.text(sg.name).to_string()).unwrap_or_default(),
+                        ItemKind::Mac(m) => f.ast.segs(f.ast.row(*m).path.segs).last().map(|sg| f.text(sg.name).to_string()).unwrap_or_default(),
                         _ => String::new(),
                     };
                     self.errors.push(self.record_error(file, it.lo, "macro", format!("cannot find macro `{}` in this scope", name)));
@@ -1992,7 +1992,7 @@ impl Program {
         let li = sub as usize;
         let had = self.variants.get(li).map_or(0, |v| v.len());
         let names: Vec<Ident> = match &self.files[file as usize].ast.item(item).kind {
-            ItemKind::Enum(_, v) => self.files[file as usize].ast.list(*v).iter().map(|x| x.name).collect(),
+            ItemKind::Enum(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).variants).iter().map(|x| x.name).collect() }
             _ => return had,
         };
         let (krate, scope) = self.variants.get(li).and_then(|v| v.first()).map_or((dkrate, dscope), |&v0| (self.def(v0).krate, self.def(v0).scope));
@@ -2394,7 +2394,7 @@ impl Program {
                     self.item_defs.insert((file, iid.0), d);
                     self.define(module, true, name, d);
                     // tuple and unit structs also live in the value namespace
-                    if let ItemKind::Struct(_, data) = &self.files[file as usize].ast.item(iid).kind {
+                    if let Some(StructItem { data, .. }) = { let ast = &self.files[file as usize].ast; ast.as_struct(&ast.item(iid).kind) } {
                         if !matches!(data, VariantData::Struct(_)) {
                             self.define(module, false, name, d);
                         }
@@ -2411,12 +2411,12 @@ impl Program {
                     self.define(module, true, name, d);
                     let mut vars = Vec::new();
                     let n = match &self.files[file as usize].ast.item(iid).kind {
-                        ItemKind::Enum(_, v) => v.len(),
+                        ItemKind::Enum(r) => self.files[file as usize].ast.row(*r).variants.len(),
                         _ => 0,
                     };
                     for vi in 0..n {
                         let vname_id = match &self.files[file as usize].ast.item(iid).kind {
-                            ItemKind::Enum(_, v) => self.files[file as usize].ast.list(*v)[vi].name,
+                            ItemKind::Enum(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).variants)[vi].name }
                             _ => Ident::default(),
                         };
                         let vname = self.ident(file, vname_id);
@@ -2447,7 +2447,7 @@ impl Program {
                     self.item_defs.insert((file, iid.0), d);
                     self.define(module, true, name, d);
                     let sub_items = match &self.files[file as usize].ast.item(iid).kind {
-                        ItemKind::Trait { items, .. } => self.files[file as usize].ast.list(*items).to_vec(),
+                        ItemKind::Trait(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).items).to_vec() }
                         _ => Vec::new(),
                     };
                     let mut list = Vec::new();
@@ -2467,7 +2467,7 @@ impl Program {
                     let d = self.add_def(mk(DefKind::Impl));
                     self.item_defs.insert((file, iid.0), d);
                     let sub_items = match &self.files[file as usize].ast.item(iid).kind {
-                        ItemKind::Impl { items, .. } => self.files[file as usize].ast.list(*items).to_vec(),
+                        ItemKind::Impl(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).items).to_vec() }
                         _ => Vec::new(),
                     };
                     let mut list = Vec::new();
@@ -2552,7 +2552,7 @@ impl Program {
                 }
                 Tag::ForeignMod => {
                     let sub_items = match &self.files[file as usize].ast.item(iid).kind {
-                        ItemKind::ForeignMod(_, items) => self.files[file as usize].ast.list(*items).to_vec(),
+                        ItemKind::ForeignMod(r) => { let ast = &self.files[file as usize].ast; ast.list(ast.row(*r).items).to_vec() }
                         _ => Vec::new(),
                     };
                     for si in sub_items {
@@ -2578,7 +2578,7 @@ impl Program {
                 }
                 Tag::Use => {
                     let (global, tree) = match &self.files[file as usize].ast.item(iid).kind {
-                        ItemKind::Use { global, tree } => (*global, tree.clone()),
+                        ItemKind::Use(r) => { let u = self.files[file as usize].ast.row(*r); (u.global, u.tree.clone()) }
                         _ => continue,
                     };
                     let pos = self.files[file as usize].ast.item(iid).lo;
@@ -2626,6 +2626,7 @@ impl Program {
                     let f = &self.files[file as usize];
                     let it = f.ast.item(iid);
                     if let ItemKind::Mac(m) = &it.kind {
+                        let m = f.ast.row(*m);
                         let last = f.ast.segs(m.path.segs).last().map(|sg| f.text(sg.name).to_string()).unwrap_or_default();
                         if last == "global_asm" || last == "naked_asm" {
                             self.errors.push(self.record_error(file,it.lo,"lower","inline assembly is not supported; use core::arch intrinsics".to_string()));
@@ -2717,7 +2718,7 @@ impl Program {
             match &ast.item(iid).kind {
                 ItemKind::Fn(_, Some(b), _) => blocks.push(*b),
                 // `const _: () = { impl X { .. } };` (bitflags and friends put impls there)
-                ItemKind::Const(_, Some(e)) | ItemKind::Static(_, _, Some(e)) => blocks_in_expr(ast, *e, &mut blocks),
+                ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { blocks_in_expr(ast, e, &mut blocks) },
                 _ => {}
             }
         }
@@ -3832,6 +3833,7 @@ impl Program {
             Vis::Crate => Some(self.crates[self.mods[normal as usize].krate as usize].root_mod),
             Vis::Super => Some(self.mods[normal as usize].parent_mod.map_or(normal, |p| self.mods[p as usize].normal)),
             Vis::In(p) => {
+                let p = self.files[file as usize].ast.row(*p);
                 let segs = path_segs(self, file, p);
                 let d = self.resolve_mod_path(normal, p.global(), &segs, false, false)?;
                 if self.def(d).kind == DefKind::Mod {
@@ -4433,38 +4435,56 @@ pub fn strip_cfg_fields(pf: &mut ParsedFile, cfg: &CfgSet) {
     let view = crate::cfg::PackedSrc { src: &pf.src, toks: &pf.toks };
     let src = Src { src: &pf.src, plain: &[], ext: &[], parts: Some(&view) };
     let ast = &mut pf.ast;
-    let mut items = std::mem::take(&mut ast.items);
-    for it in items.iter_mut() {
-        match &mut it.kind {
-            ItemKind::Struct(_, VariantData::Struct(f)) | ItemKind::Struct(_, VariantData::Tuple(f)) | ItemKind::Union(_, f) => {
-                strip_attrs_list(src, cfg, ast.field_defs.vec_mut(), ast.base[26], (&ast.attrs, ast.base[21]), f, |f| f.attrs);
+    let kinds: Vec<ItemKind> = ast.items.iter().map(|it| it.kind).collect();
+    // an item row's generics, their parameter list stripped
+    macro_rules! strip_generics {
+        ($r:expr) => {{
+            let mut g = ast.row($r).generics;
+            strip_attrs_list(src, cfg, ast.generic_params.vec_mut(), ast.base[19], (&ast.attrs, ast.base[21]), &mut g.params, |p| p.attrs);
+            ast.row_mut($r).generics = g;
+        }};
+    }
+    for kind in kinds {
+        match kind {
+            ItemKind::Struct(r) => {
+                let mut data = ast.row(r).data;
+                if let VariantData::Struct(f) | VariantData::Tuple(f) = &mut data {
+                    strip_attrs_list(src, cfg, ast.field_defs.vec_mut(), ast.base[26], (&ast.attrs, ast.base[21]), f, |f| f.attrs);
+                }
+                ast.row_mut(r).data = data;
+                strip_generics!(r);
             }
-            ItemKind::Enum(_, vs) => {
-                strip_attrs_list(src, cfg, ast.variants.vec_mut(), ast.base[27], (&ast.attrs, ast.base[21]), vs, |v| v.attrs);
+            ItemKind::Union(r) => {
+                let mut f = ast.row(r).fields;
+                strip_attrs_list(src, cfg, ast.field_defs.vec_mut(), ast.base[26], (&ast.attrs, ast.base[21]), &mut f, |f| f.attrs);
+                ast.row_mut(r).fields = f;
+                strip_generics!(r);
+            }
+            ItemKind::Enum(r) => {
+                let mut vs = ast.row(r).variants;
+                strip_attrs_list(src, cfg, ast.variants.vec_mut(), ast.base[27], (&ast.attrs, ast.base[21]), &mut vs, |v| v.attrs);
+                ast.row_mut(r).variants = vs;
                 let lo = vs.lo.wrapping_sub(ast.base[27]) as usize;
                 for v in &mut ast.variants[lo..lo + vs.len()] {
                     if let VariantData::Struct(f) | VariantData::Tuple(f) = &mut v.data {
                         strip_attrs_list(src, cfg, ast.field_defs.vec_mut(), ast.base[26], (&ast.attrs, ast.base[21]), f, |f| f.attrs);
                     }
                 }
+                strip_generics!(r);
             }
-            _ => {}
-        }
-        let g = match &mut it.kind {
             ItemKind::Fn(id, _, _) => {
                 let sig = &mut ast.fn_sigs[(id.0 - ast.base[24]) as usize];
                 strip_attrs_list(src, cfg, ast.params.vec_mut(), ast.base[25], (&ast.attrs, ast.base[21]), &mut sig.params, |p| p.attrs);
-                Some(&mut sig.generics)
+                let g = &mut sig.generics;
+                strip_attrs_list(src, cfg, ast.generic_params.vec_mut(), ast.base[19], (&ast.attrs, ast.base[21]), &mut g.params, |p| p.attrs);
             }
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) | ItemKind::TraitAlias(g, _) => Some(g),
-            ItemKind::TypeAlias { generics, .. } | ItemKind::Trait { generics, .. } | ItemKind::Impl { generics, .. } => Some(generics),
-            _ => None,
-        };
-        if let Some(g) = g {
-            strip_attrs_list(src, cfg, ast.generic_params.vec_mut(), ast.base[19], (&ast.attrs, ast.base[21]), &mut g.params, |p| p.attrs);
+            ItemKind::TraitAlias(r) => strip_generics!(r),
+            ItemKind::TypeAlias(r) => strip_generics!(r),
+            ItemKind::Trait(r) => strip_generics!(r),
+            ItemKind::Impl(r) => strip_generics!(r),
+            _ => {}
         }
     }
-    ast.items = items;
     let ParsedFile { src, toks, ast, .. } = pf;
     let view = crate::cfg::PackedSrc { src: &src[..], toks };
     strip_cfg_nodes(ast, Src { src: &src[..], plain: &[], ext: &[], parts: Some(&view) }, cfg);
@@ -4745,7 +4765,7 @@ fn body_blocks(pf: &mut ParsedFile, cfg: &CfgSet) -> BodyBlocks {
             // body do not exist (rustc removes it before resolution)
             ItemKind::Fn(..) if !testing && crate::cfg::is_test(pf.src_view(), pf.ast.list(it.attrs)) => {}
             ItemKind::Fn(_, Some(b), _) => roots.push(*b),
-            ItemKind::Const(_, Some(e)) | ItemKind::Static(_, _, Some(e)) => blocks_in_expr(&pf.ast, *e, &mut roots),
+            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { blocks_in_expr(&pf.ast, e, &mut roots) },
             _ => {}
         }
     }
@@ -4871,7 +4891,7 @@ pub fn hint_path(defs: &[Def], syms: &Interner, files: &[std::sync::Arc<ParsedFi
         let mut name = syms.str(def.name).to_string();
         if def.kind == DefKind::Impl {
             if let Some(f) = files.get(def.file as usize) {
-                if let ItemKind::Impl { self_ty, trait_, .. } = &f.ast.item(def.item).kind {
+                if let Some(ImplItem { self_ty, trait_, .. }) = f.ast.as_impl(&f.ast.item(def.item).kind) {
                     name = match trait_ {
                         Some(t) => format!("<{} as {}>", ty_text(f, *self_ty, 0), f.ast.segs(t.segs).iter().map(|s| f.text(s.name)).collect::<Vec<_>>().join("::")),
                         None => format!("<{}>", ty_text(f, *self_ty, 0)),

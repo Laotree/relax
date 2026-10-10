@@ -132,7 +132,7 @@ impl Tcx {
         }
         let def = prog.def(def_id);
         let ast = &prog.files[def.file as usize].ast;
-        let crate::ast::ItemKind::TypeAlias { bounds, .. } = ast.item(def.item).kind else { return Vec::new(); };
+        let Some(&crate::ast::TypeAliasItem { bounds, .. }) = ast.as_alias(&ast.item(def.item).kind) else { return Vec::new(); };
         let mut env = self.declaration_env(prog, def_id);
         let indices = self.generic_indices_of(prog, def_id);
         let mut regions = Vec::new();

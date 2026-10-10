@@ -384,13 +384,10 @@ impl DefCollector<'_> {
     // Generic and constant ribs share the lexical stack with legacy-call resolution.
     fn push_item_generics(&mut self, owner: DefId) {
         let item = self.prog.def(owner).item;
-        let g = match self.ast.item(item).kind {
-            ItemKind::Fn(sig, ..) => self.ast.fn_sig(sig).generics,
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) |
-            ItemKind::TypeAlias { generics: g, .. } | ItemKind::TraitAlias(g, _) => g,
-            ItemKind::Trait { generics, .. } => { self.bindings.push(ValueRib::SelfParam); generics }
-            ItemKind::Impl { generics, .. } => generics,
-            _ => return,
+        let kind = self.ast.item(item).kind;
+        let g = match kind {
+            ItemKind::Trait(r) => { self.bindings.push(ValueRib::SelfParam); self.ast.row(r).generics }
+            k => match self.ast.kind_generics(&k) { Some(g) => *g, None => return },
         };
         for p in self.ast.list(g.params) {
             match p.kind {
@@ -476,9 +473,10 @@ impl DefCollector<'_> {
                     if let Some(b) = self.prog.fn_body(self.file, item)? { self.visit_block(b); }
                 }
             }
-            ItemKind::Struct(g, data) => { self.visit_generics(g); self.visit_variant_data(data); }
-            ItemKind::Union(g, fields) => { self.visit_generics(g); self.visit_fields(fields); }
-            ItemKind::Enum(g, variants) => {
+            ItemKind::Struct(r) => { let StructItem { generics: g, data } = *self.ast.row(r); self.visit_generics(g); self.visit_variant_data(data); }
+            ItemKind::Union(r) => { let UnionItem { generics: g, fields } = *self.ast.row(r); self.visit_generics(g); self.visit_fields(fields); }
+            ItemKind::Enum(r) => {
+                let EnumItem { generics: g, variants } = *self.ast.row(r);
                 self.visit_generics(g);
                 for (i, v) in self.ast.list(variants).iter().enumerate() {
                     let vd = self.prog.variants[self.prog.def(owner).sub as usize][i];
@@ -488,22 +486,29 @@ impl DefCollector<'_> {
                     self.parent_def = saved;
                 }
             }
-            ItemKind::TypeAlias { generics, bounds, ty } => {
+            ItemKind::TypeAlias(r) => {
+                let TypeAliasItem { generics, bounds, ty } = *self.ast.row(r);
                 self.visit_generics(generics); self.visit_bounds(bounds, true);
                 if let Some(t) = ty { self.visit_ty(t, true); }
             }
             ItemKind::Const(ty, _) => {
-                if let Some(t) = ty { self.visit_ty(t, false); }
+                if let Some(t) = ty.get() { self.visit_ty(t, false); }
                 if let Some(e) = self.prog.const_body(self.file, item)? { self.visit_expr(e); }
             }
             ItemKind::Static(_, ty, _) => {
                 self.visit_ty(ty, false);
                 if let Some(e) = self.prog.const_body(self.file, item)? { self.visit_expr(e); }
             }
-            ItemKind::Trait { generics, supers, .. } | ItemKind::TraitAlias(generics, supers) => {
+            ItemKind::Trait(r) => {
+                let TraitItem { generics, supers, .. } = *self.ast.row(r);
                 self.visit_generics(generics); self.visit_bounds(supers, false);
             }
-            ItemKind::Impl { generics, trait_, self_ty, .. } => {
+            ItemKind::TraitAlias(r) => {
+                let TraitAliasItem { generics, bounds: supers } = *self.ast.row(r);
+                self.visit_generics(generics); self.visit_bounds(supers, false);
+            }
+            ItemKind::Impl(r) => {
+                let ImplItem { generics, trait_, self_ty, .. } = *self.ast.row(r);
                 self.visit_generics(generics);
                 if let Some(p) = trait_ { self.visit_path(p, false); }
                 self.visit_ty(self_ty, false);

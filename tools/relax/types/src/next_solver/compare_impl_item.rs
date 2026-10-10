@@ -226,7 +226,7 @@ impl Tcx {
             let d = prog.def(item);
             prog.record_error(d.file, prog.files[d.file as usize].ast.item(d.item).lo, "typeck", message)
         };
-        if matches!(ast.item(def.item).kind, crate::ast::ItemKind::Impl { negative: true, .. }) {
+        if ast.as_impl(&ast.item(def.item).kind).is_some_and(|i| i.negative) {
             if let Some(&item) = data.items.first() { errors.push(error(item, "E0749: negative impls cannot have any items".into())); }
             return errors;
         }
@@ -250,7 +250,7 @@ impl Tcx {
             let has_value = match pf.ast.item(d.item).kind {
                 crate::ast::ItemKind::Fn(sig, body, _) => body.is_some() || pf.ast.fn_sig(sig).lazy_body.is_some(),
                 crate::ast::ItemKind::Const(_, value) => value.is_some(),
-                crate::ast::ItemKind::TypeAlias { ty, .. } => ty.is_some(),
+                crate::ast::ItemKind::TypeAlias(r) => pf.ast.row(r).ty.is_some(),
                 _ => false,
             };
             if !has_value && !(unsized_self && self.generics_require_sized_self(prog, item)) { missing.push(format!("`{}`", prog.name(item))); }

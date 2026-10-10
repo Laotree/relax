@@ -703,9 +703,10 @@ fn restart_reason(k: &crate::ast::ItemKind) -> &'static str {
 fn child_items(ast: &crate::ast::Ast, k: &crate::ast::ItemKind) -> Vec<crate::ast::ItemId> {
     use crate::ast::ItemKind::*;
     match k {
-        Trait { items, .. } | Impl { items, .. } => ast.list(*items).to_vec(),
+        Trait(r) => ast.list(ast.row(*r).items).to_vec(),
+        Impl(r) => ast.list(ast.row(*r).items).to_vec(),
         Mod(Some(items)) => ast.list(*items).to_vec(),
-        ForeignMod(_, items) => ast.list(*items).to_vec(),
+        ForeignMod(r) => ast.list(ast.row(*r).items).to_vec(),
         _ => Vec::new(),
     }
 }
@@ -1068,7 +1069,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     // (M13: a `use` and an inline `mod` with its items may be added -- their imports resolve
     // incrementally, apply_locked)
     let addable = |pf: &crate::parser::ParsedFile, k: &ItemKind| matches!(k, ItemKind::Fn(sig, _, _) if pf.ast.fn_sig(*sig).lazy_body.is_some()) || matches!(k, ItemKind::Fn(_, Some(_), _) | ItemKind::Const(..) | ItemKind::Static(..) | ItemKind::Struct(..) | ItemKind::Enum(..) | ItemKind::Union(..) | ItemKind::TypeAlias { .. } | ItemKind::Impl { .. } | ItemKind::Use { .. } | ItemKind::Mod(Some(_)));
-    let inherent_impl = |pf: &crate::parser::ParsedFile, i: u32| matches!(&pf.ast.items[i as usize].kind, ItemKind::Impl { trait_: None, .. });
+    let inherent_impl = |pf: &crate::parser::ParsedFile, i: u32| matches!(&pf.ast.items[i as usize].kind, ItemKind::Impl(r) if pf.ast.row(*r).trait_.is_none());
     for &j in &added {
         let it = &na.items[j as usize];
         let name = String::from_utf8_lossy(&new.src[it.name.lo as usize..it.name.hi as usize]).into_owned();
@@ -1110,7 +1111,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 None => addable(old, &it.kind) && !matches!(it.kind, ItemKind::Impl { .. }),
                 Some(p) => match &oa.items[p as usize].kind {
                     ItemKind::Mod(Some(_)) => addable(old, &it.kind) && !matches!(it.kind, ItemKind::Impl { .. }) && !removed.contains(&p),
-                    ItemKind::Impl { trait_: None, .. } => matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..)),
+                    ItemKind::Impl(r) if oa.row(*r).trait_.is_none() => matches!(it.kind, ItemKind::Fn(..) | ItemKind::Const(..)),
                     _ => false,
                 },
             };
@@ -1181,8 +1182,8 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                     _ => why.push(format!("{}: fn `{}` has no definition to patch -- restart the app", pos(new, b.lo), name)),
                 }
             }
-            (ItemKind::Const(_, Some(ea)), ItemKind::Const(_, Some(eb))) => {
-                let (ea, eb) = (oa.expr(*ea), na.expr(*eb));
+            (ItemKind::Const(_, ea), ItemKind::Const(_, eb)) if ea.is_some() && eb.is_some() => {
+                let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
                 if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
                     if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
@@ -1197,8 +1198,8 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                     None => why.push(format!("{}: const `{}` has no definition to patch -- restart the app", pos(new, b.lo), name)),
                 }
             }
-            (ItemKind::Static(_, _, Some(ea)), ItemKind::Static(_, _, Some(eb))) => {
-                let (ea, eb) = (oa.expr(*ea), na.expr(*eb));
+            (ItemKind::Static(_, _, ea), ItemKind::Static(_, _, eb)) if ea.is_some() && eb.is_some() => {
+                let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
                 if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
                     why.push(format!("{}: the type of static `{}` changed; its storage has the old size -- restart the app (the value is not migrated yet)", pos(new, b.lo), name));
                     continue;
@@ -1226,7 +1227,11 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                     // Native expanded derives add ordinary impl items, classified above.
                     // The ADT's layout and marker/glue derives did not change.
                 }
-            (ItemKind::Struct(_, crate::ast::VariantData::Struct(_)), ItemKind::Struct(_, crate::ast::VariantData::Struct(_))) | (ItemKind::Enum(..), ItemKind::Enum(..)) if attrs_same && struct_head(old, a) == struct_head(new, b) => match def {
+            (ItemKind::Struct(ra), ItemKind::Struct(rb)) if matches!(oa.row(*ra).data, crate::ast::VariantData::Struct(_)) && matches!(na.row(*rb).data, crate::ast::VariantData::Struct(_)) && attrs_same && struct_head(old, a) == struct_head(new, b) => match def {
+                Some(d) => out.push(Change::Layout(d)),
+                None => why.push(format!("{}: struct `{}` has no definition -- restart the app", pos(new, b.lo), name)),
+            },
+            (ItemKind::Enum(..), ItemKind::Enum(..)) if attrs_same && struct_head(old, a) == struct_head(new, b) => match def {
                 Some(d) => out.push(Change::Layout(d)),
                 None => why.push(format!("{}: struct `{}` has no definition -- restart the app", pos(new, b.lo), name)),
             },
@@ -2161,8 +2166,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 if u.prog.item_defs.get(&(v.old, i)) != Some(&d) {
                     continue;
                 }
-                if let crate::ast::ItemKind::Struct(_, crate::ast::VariantData::Struct(fs)) = &v.pf.ast.items[j as usize].kind {
-                    for f in v.pf.ast.list(*fs) {
+                if let Some(crate::ast::VariantData::Struct(fs)) = match &v.pf.ast.items[j as usize].kind { crate::ast::ItemKind::Struct(r) => Some(v.pf.ast.row(*r).data), _ => None } {
+                    for f in v.pf.ast.list(fs) {
                         if let Some(n) = f.name {
                             new_names.push(v.pf.text(n).as_bytes().to_vec());
                         }
@@ -2208,7 +2213,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
             set_names.push(v.pf.src[it.name.lo as usize..it.name.hi as usize].to_vec());
             // a trait impl's methods shadow nothing (the trait's own methods resolve as before
             // for every other type); an inherent impl's may hide a trait method of its type
-            if matches!(it.kind, crate::ast::ItemKind::Impl { trait_: Some(_), .. }) {
+            if matches!(&it.kind, crate::ast::ItemKind::Impl(r) if na.row(*r).trait_.is_some()) {
                 continue;
             }
             for c in child_items(na, &it.kind) {

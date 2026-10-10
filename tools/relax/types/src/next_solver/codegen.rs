@@ -140,7 +140,7 @@ impl Tcx {
         match &prog.files[d.file as usize].ast.item(d.item).kind {
             crate::ast::ItemKind::Fn(_, body, _) => body.is_some() || prog.fn_body(d.file, d.item).ok().flatten().is_some(),
             crate::ast::ItemKind::Const(_, value) => value.is_some(),
-            crate::ast::ItemKind::TypeAlias { ty, .. } => ty.is_some(),
+            crate::ast::ItemKind::TypeAlias(r) => prog.files[d.file as usize].ast.row(*r).ty.is_some(),
             _ => false,
         }
     }

@@ -86,7 +86,7 @@ pub fn collect_loaded_with(prog: &mut Program, first_def: usize, visible: &[bool
         let imp = prog.impls[ii].def;
         if imp.0 as usize >= first_def || !visible.get(prog.def(imp).krate as usize).copied().unwrap_or(true) { continue; }
         let def = prog.def(imp);
-        if !matches!(prog.files[def.file as usize].ast.item(def.item).kind, ItemKind::Impl { trait_: Some(_), .. }) { continue; }
+        if !{ let ast = &prog.files[def.file as usize].ast; ast.as_impl(&ast.item(def.item).kind).is_some_and(|i| i.trait_.is_some()) } { continue; }
         let unlinked = prog.impls[ii].items.iter().any(|d| !prog.trait_item_def_id.contains_key(d));
         if unlinked && !extra_impls.contains(&ii) { impls.push(ii); }
     }
@@ -137,7 +137,7 @@ fn link_impl(prog: &mut Program, ii: usize, previous: &crate::fxhash::HashMap<De
     prog.impls[ii].items.retain(|d| !previous.contains_key(d));
     let imp = prog.impls[ii].def;
     let def = prog.def(imp);
-    let ItemKind::Impl { trait_: Some(path), .. } = prog.files[def.file as usize].ast.item(def.item).kind else { return; };
+    let Some(path) = ({ let ast = &prog.files[def.file as usize].ast; ast.as_impl(&ast.item(def.item).kind).and_then(|i| i.trait_) }) else { return; };
     let segs = path_segs(prog, def.file, &path);
     let Some(trait_def) = prog.resolve_mod_path(def.scope, path.global(), &segs, false, false) else { return; };
     if prog.def(trait_def).kind != DefKind::Trait { return; }

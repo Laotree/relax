@@ -49,7 +49,10 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
         let Some(r) = reached.get_mut(i.0 as usize) else { continue };
         if std::mem::replace(r, true) { continue; }
         match &ast.item(i).kind {
-            ItemKind::Trait { items, .. } | ItemKind::Impl { items, .. } | ItemKind::Mod(Some(items)) | ItemKind::ForeignMod(_, items) => stack.extend_from_slice(ast.list(*items)),
+            ItemKind::Trait(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
+            ItemKind::Impl(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
+            ItemKind::ForeignMod(r) => stack.extend_from_slice(ast.list(ast.row(*r).items)),
+            ItemKind::Mod(Some(items)) => stack.extend_from_slice(ast.list(*items)),
             _ => {}
         }
     }
@@ -75,8 +78,8 @@ fn digest_into(pf: &ParsedFile, mut text: Option<&mut Vec<u8>>) -> FileDigest {
             if !reached[i] { continue; }
             // a static's initializer runs in every run (its value is read at its address, never
             // folded into another fn's code): the initializer's own code only
-            if let ItemKind::Static(_, _, Some(e)) = &it.kind {
-                let elo = ast.expr(*e).lo;
+            if let Some(e) = match &it.kind { ItemKind::Static(_, _, e) => e.get(), _ => None } {
+                let elo = ast.expr(e).lo;
                 if elo >= lo && it.hi <= hi && elo >= it.lo && elo < it.hi {
                     if let Some(v) = in_body(elo, it.hi) {
                         nested_in.extend(v.into_iter().map(|x| (x, i as u32)));

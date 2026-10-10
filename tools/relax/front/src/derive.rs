@@ -63,9 +63,12 @@ impl<'a> Parser<'a> {
         let it = self.ast.item(id).clone();
         let mut groups: Vec<(Option<String>, Vec<FieldDef>)> = Vec::new();
         match &it.kind {
-            ItemKind::Struct(g, VariantData::Struct(f)) if g.params.is_empty() => groups.push((None, self.ast.list(*f).to_vec())),
-            ItemKind::Enum(g, vars) if g.params.is_empty() => {
-                for v in self.ast.list(*vars) {
+            ItemKind::Struct(r) if self.ast.row(*r).generics.params.is_empty() && matches!(self.ast.row(*r).data, VariantData::Struct(_)) => {
+                let VariantData::Struct(f) = &self.ast.row(*r).data else { unreachable!() };
+                groups.push((None, self.ast.list(*f).to_vec()))
+            }
+            ItemKind::Enum(r) if self.ast.row(*r).generics.params.is_empty() => {
+                for v in self.ast.list(self.ast.row(*r).variants) {
                     if let VariantData::Struct(f) = &v.data {
                         groups.push((Some(String::from_utf8_lossy(self.bytes(v.name.lo, v.name.hi)).into_owned()), self.ast.list(*f).to_vec()));
                     }
@@ -526,8 +529,8 @@ impl<'a> Parser<'a> {
             }
         };
         match &it.kind {
-            ItemKind::Struct(_, d) => vec![shape_of(self, d, None, &[])],
-            ItemKind::Enum(_, vs) => self.ast.list(*vs)
+            ItemKind::Struct(r) => vec![shape_of(self, &self.ast.row(*r).data, None, &[])],
+            ItemKind::Enum(r) => self.ast.list(self.ast.row(*r).variants)
                 .iter()
                 .filter(|v| self.cfg_present(self.ast.list(v.attrs)))
                 .map(|v| shape_of(self, &v.data, Some(String::from_utf8_lossy(self.bytes(v.name.lo, v.name.hi)).into_owned()), self.ast.list(v.attrs)))
@@ -679,9 +682,9 @@ impl Parser<'_> {
         let mut out = Vec::new();
         let mut data = Vec::new();
         match it.kind {
-            ItemKind::Struct(_, d) => data.push((None, d)),
-            ItemKind::Union(_, f) => data.push((None, VariantData::Struct(f))),
-            ItemKind::Enum(_, vs) => for v in self.ast.list(vs) {
+            ItemKind::Struct(r) => data.push((None, self.ast.row(r).data)),
+            ItemKind::Union(r) => data.push((None, VariantData::Struct(self.ast.row(r).fields))),
+            ItemKind::Enum(r) => for v in self.ast.list(self.ast.row(r).variants) {
                 if self.cfg_present(self.ast.list(v.attrs)) {
                     data.push((Some(String::from_utf8_lossy(self.bytes(v.name.lo, v.name.hi)).into_owned()), v.data));
                 }
@@ -798,7 +801,8 @@ impl Parser<'_> {
         let first = self.extra_items.len();
         self.install_derive_text(text, it.name.lo)?;
         let iid = self.extra_items[first];
-        let mut generics = match self.ast.item(iid).kind { ItemKind::Impl { generics, .. } => generics, _ => unreachable!() };
+        let impl_row = match self.ast.item(iid).kind { ItemKind::Impl(r) => r, _ => unreachable!() };
+        let mut generics = self.ast.row(impl_row).generics;
         if !field_params.is_empty() {
             // The generated type parameter has exactly the additional derive bounds
             // before its declared bounds. Reuse those paths without source scanning.
@@ -816,7 +820,7 @@ impl Parser<'_> {
                 predicates.push(WherePred::Bound { hrtb, ty: p.ty, bounds: bs });
             }
             generics.where_ = self.ast.push_list(predicates);
-            if let ItemKind::Impl { generics: g, .. } = &mut self.ast.items[iid.0.wrapping_sub(self.ast.base[23]) as usize].kind { *g = generics; }
+            self.ast.row_mut(impl_row).generics = generics;
         }
         Ok(())
     }
@@ -1003,7 +1007,7 @@ mod tests {
         assert!(p.errors.is_empty(), "{:?}", p.errors);
         assert_eq!(p.impls.len(), 1);
         let imp = &p.impls[0]; let f = &p.files[imp.file as usize];
-        let ItemKind::Impl { generics, .. } = f.ast.item(imp.item).kind else { unreachable!() };
+        let Some(ImplItem { generics, .. }) = f.ast.as_impl(&f.ast.item(imp.item).kind).copied() else { unreachable!() };
         let predicates = f.ast.list(generics.where_);
         assert_eq!(predicates.len(), 1);
         let WherePred::Bound { hrtb, ty, .. } = predicates[0] else { unreachable!() };

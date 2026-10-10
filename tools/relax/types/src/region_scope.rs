@@ -94,7 +94,7 @@ pub fn region_scope_tree(prog: &Program, body: &Body) -> Result<ScopeTree, Strin
             }
             v.block(block, true);
         }
-        ItemKind::Const(_, Some(_)) | ItemKind::Static(_, _, Some(_)) => {
+        ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => {
             let e = prog.const_body(d.file, d.item)?.ok_or("missing initializer")?;
             v.enter_body(Node::Expr(e.0), BodyKind::Constant);
             v.extend_borrows(e, None);

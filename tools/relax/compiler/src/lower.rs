@@ -1507,9 +1507,9 @@ impl<'a> Lcx<'a> {
         }
         let (fsig, body) = match &ast.item(prog_def_item).kind {
             ItemKind::Fn(s, b, _) => (*ast.fn_sig(*s), b.or_else(|| self.u.prog.fn_body(self.u.prog.def(def).file, prog_def_item).ok().flatten())),
-            ItemKind::Const(_, Some(e)) | ItemKind::Static(_, _, Some(e)) => {
+            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) if e.is_some() => {
                 // const/static initializer thunk: fn(out: *mut T)
-                let e = self.u.prog.const_body(self.u.prog.def(def).file, prog_def_item).expect("checked initializer").unwrap_or(*e);
+                let e = self.u.prog.const_body(self.u.prog.def(def).file, prog_def_item).expect("checked initializer").unwrap_or(e.get().unwrap());
                 let out = self.f.vreg(Cls::I);
                 self.f.params.push(out);
                 self.pos = ast.expr(e).lo;

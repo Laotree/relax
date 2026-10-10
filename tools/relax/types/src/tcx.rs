@@ -4,7 +4,7 @@
 
 use crate::types::AliasTyKind;
 use crate::types::{AliasTy};
-use crate::ast::{self, GenericArg, GenericArgs, GenericParamKind, ItemKind, SegKind, TyId as AstTy, VariantData};
+use crate::ast::{self, GenericArg, GenericArgs, GenericParamKind, ImplItem, ItemKind, SegKind, TraitItem, TypeAliasItem, TyId as AstTy, VariantData};
 use crate::program::{DefId, DefKind, Prim, Program, Sym, NO_DEF};
 use crate::types::{Abi, FnHeader, Safety, TyId, TyKind, Types};
 use crate::fxhash::HashMap;
@@ -455,7 +455,7 @@ impl Tcx {
             let st = if self.tys.has_assoc(st) { self.try_normalize_erasing_regions(prog, typing_env, st).unwrap_or(st) } else { st };
             let item = prog.files[im.file as usize].ast.item(im.item);
             let pos = item.lo;
-            let is_trait_impl = matches!(&item.kind, crate::ast::ItemKind::Impl { trait_: Some(_), .. });
+            let is_trait_impl = prog.files[im.file as usize].ast.as_impl(&item.kind).is_some_and(|i| i.trait_.is_some());
             match self.impl_trait.get(&im.def) {
                 // a trait impl whose trait did not resolve: reported there
                 None if is_trait_impl => {}
@@ -888,7 +888,7 @@ impl Tcx {
             if let Some(td) = self.impl_trait.get(d) { return added.contains(td); }
             // An unresolved trait path must not be mistaken for an inherent impl.
             let def = prog.def(*d);
-            if !matches!(prog.files[def.file as usize].ast.item(def.item).kind, crate::ast::ItemKind::Impl { trait_: None, .. }) { return false; }
+            if !{ let a = &prog.files[def.file as usize].ast; a.as_impl(&a.item(def.item).kind).is_some_and(|i| i.trait_.is_none()) } { return false; }
             self.impl_self.get(d).is_some_and(|ty| matches!(self.tys.kind(*ty), TyKind::Adt(td, ..) if added.contains(td)))
         })
     }
@@ -1123,7 +1123,7 @@ impl Tcx {
                 }
             } else if pd.kind == DefKind::Trait {
                 let ast = &prog.files[pd.file as usize].ast;
-                if let ItemKind::Trait { generics, .. } = &ast.item(pd.item).kind {
+                if let Some(TraitItem { generics, .. }) = ast.as_trait(&ast.item(pd.item).kind) {
                     // `Self` is param 0 inside traits
                     env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
                     env.regions.next_param += 1;
@@ -1164,19 +1164,19 @@ impl Tcx {
                     }
                 }
             }
-            ItemKind::Struct(g, _) | ItemKind::Enum(g, _) | ItemKind::Union(g, _) => {
-                push_generics(prog, def.file, g, &mut env);
+            ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) => {
+                push_generics(prog, def.file, ast.kind_generics(&ast.item(def.item).kind).unwrap(), &mut env);
                 // hir_ty_lowering/mod.rs:2270: Self denotes this declaration
                 // instantiated with its identity arguments, also in field consts.
                 let indices = crate::types::variance::GenericIndices::from_env(&env);
                 let regions: Vec<_> = indices.lifetimes.iter().map(|&i| self.tys.intern_region(crate::types::RegionKind::ReEarlyParam(i))).collect();
                 env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
-            ItemKind::TypeAlias { generics, .. } => push_generics(prog, def.file, generics, &mut env),
-            ItemKind::Impl { generics, .. } => {
+            ItemKind::TypeAlias(r) => push_generics(prog, def.file, &ast.row(*r).generics, &mut env),
+            ItemKind::Impl(r) => {
                 // collect/generics_of.rs: impl parameters are available while
                 // lowering the impl header, before its self type is collected.
-                push_generics(prog, def.file, generics, &mut env);
+                push_generics(prog, def.file, &ast.row(*r).generics, &mut env);
                 env.impl_def = Some(d);
             }
             _ => {}
@@ -1189,9 +1189,9 @@ impl Tcx {
     fn impl_head_captured(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, ii: usize) -> Option<ImplHead> {
         let im = &prog.impls[ii];
         let ast = &prog.files[im.file as usize].ast;
-        let (generics, trait_, self_ty) = match &ast.item(im.item).kind {
-            ItemKind::Impl { generics, trait_, self_ty, .. } => (generics, trait_, *self_ty),
-            _ => return None,
+        let (generics, trait_, self_ty) = match ast.as_impl(&ast.item(im.item).kind) {
+            Some(ImplItem { generics, trait_, self_ty, .. }) => (generics, trait_, *self_ty),
+            None => return None,
         };
         let outer = cx.state.errors.replace(Some(Vec::new()));
         let read0 = cx.state.impl_read.replace(false);
@@ -1302,7 +1302,7 @@ impl Tcx {
         let (repr_align, repr_packed) = read_repr(prog, file, ast.list(it.attrs), &mut repr_c, &mut repr_int);
         let (valid_start, valid_end, no_niche) = read_layout_attrs(prog, file, ast.list(it.attrs));
         let param_maybe_unsized = match &it.kind {
-            ItemKind::Struct(g, _) | ItemKind::Enum(g, _) | ItemKind::Union(g, _) => maybe_unsized_params(prog, file, g),
+            k @ (ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_)) => maybe_unsized_params(prog, file, ast.kind_generics(k).unwrap()),
             _ => Vec::new(),
         };
         let mut flags = match it.kind {
@@ -1310,7 +1310,7 @@ impl Tcx {
             ItemKind::Union(..) => AdtFlags::IS_UNION,
             _ => AdtFlags::IS_STRUCT,
         };
-        if matches!(it.kind, ItemKind::Struct(_, VariantData::Unit | VariantData::Tuple(_))) {
+        if matches!(it.kind, ItemKind::Struct(r) if matches!(ast.row(r).data, VariantData::Unit | VariantData::Tuple(_))) {
             flags.insert(AdtFlags::HAS_CTOR);
         }
         if matches!(it.kind, ItemKind::Enum(..)) && crate::lang_items::has_attr(prog, file, ast.list(it.attrs), "non_exhaustive") {
@@ -1329,16 +1329,17 @@ impl Tcx {
         }
         let mut adt = AdtT { region_contract: self.region_contract(cx, prog, d, &env), generic_indices: crate::types::variance::GenericIndices::from_env(&env), flags, region_params: env.regions.identity_args(&self.tys), is_enum: false, is_union: false, n_generics, variants: Vec::new(), repr_c, repr_int, repr_align, repr_packed, valid_start, valid_end, no_niche, param_maybe_unsized, ext_from: u32::MAX, ext_conv: Vec::new() };
         match &it.kind {
-            ItemKind::Struct(_, data) => {
-                let (shape, fields) = self.lower_fields(cx, prog, file, module, &env, data);
+            ItemKind::Struct(r) => {
+                let (shape, fields) = self.lower_fields(cx, prog, file, module, &env, &ast.row(*r).data);
                 adt.variants.push(VariantT { def: d, name: def.name, shape, fields, discr: VariantDiscr::Relative(0) });
             }
-            ItemKind::Union(_, fields) => {
+            ItemKind::Union(r) => {
                 adt.is_union = true;
-                let (_, f) = self.lower_fields(cx, prog, file, module, &env, &VariantData::Struct(fields.clone()));
+                let (_, f) = self.lower_fields(cx, prog, file, module, &env, &VariantData::Struct(ast.row(*r).fields));
                 adt.variants.push(VariantT { def: d, name: def.name, shape: 2, fields: f, discr: VariantDiscr::Relative(0) });
             }
-            ItemKind::Enum(_, vars) => {
+            ItemKind::Enum(r) => {
+                let vars = &ast.row(*r).variants;
                 adt.is_enum = true;
                 // rustc_hir_analysis/src/collect.rs:1044-1059: declarations
                 // retain anonymous constant identities; evaluation is a query.
@@ -1513,11 +1514,9 @@ impl Tcx {
     fn check_item_type_defaults(&self, prog: &Program, d: DefId) -> Vec<String> {
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
-        let generics = match ast.item(def.item).kind {
-            ItemKind::Impl { generics, .. } | ItemKind::Trait { generics, .. } | ItemKind::TypeAlias { generics, .. } => generics,
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) | ItemKind::TraitAlias(g, _) => g,
-            ItemKind::Fn(sig, ..) => ast.fn_sig(sig).generics,
-            _ => return Vec::new(),
+        let generics = match ast.kind_generics(&ast.item(def.item).kind) {
+            Some(g) => *g,
+            None => return Vec::new(),
         };
         let env = self.item_env(prog, d);
         let state = EvalState::new();
@@ -1626,8 +1625,8 @@ impl Tcx {
         if matches!(parent.kind, DefKind::Impl | DefKind::Trait) {
             let parent_ast = &prog.files[parent.file as usize].ast;
             let (generics, offset) = match &parent_ast.item(parent.item).kind {
-                ItemKind::Impl { generics, .. } => (generics, 0),
-                ItemKind::Trait { generics, .. } => (generics, 1),
+                ItemKind::Impl(r) => (&parent_ast.row(*r).generics, 0),
+                ItemKind::Trait(r) => (&parent_ast.row(*r).generics, 1),
                 _ => unreachable!(),
             };
             let mut penv = env.clone();
@@ -1694,8 +1693,8 @@ impl Tcx {
         // (and the enclosing impl's: `impl<A: Array> SmallVec<A> where A::Item: Clone`)
         let impl_where: &[ast::WherePred] = if prog.def(def.parent).kind == DefKind::Impl {
             let im = &prog.impls[prog.def(def.parent).sub as usize];
-            match &prog.files[im.file as usize].ast.item(im.item).kind {
-                ItemKind::Impl { generics, .. } if im.file == file => f.ast.list(generics.where_),
+            match prog.files[im.file as usize].ast.as_impl(&prog.files[im.file as usize].ast.item(im.item).kind) {
+                Some(ImplItem { generics, .. }) if im.file == file => f.ast.list(generics.where_),
                 _ => &[],
             }
         } else {
@@ -1993,7 +1992,7 @@ impl Tcx {
         let module = self.item_module(prog, d);
         let ast = &prog.files[file as usize].ast;
         let t = match &ast.item(def.item).kind {
-            ItemKind::Const(Some(t), _) => *t,
+            ItemKind::Const(t, _) if t.is_some() => t.get().unwrap(),
             ItemKind::Static(_, t, _) => *t,
             _ => return ConstDecl::default(),
         };
@@ -2270,7 +2269,7 @@ impl Tcx {
             if let ast::Bound::Trait { path, .. } = bound {
                 if let Some(td) = self.resolve_type_path_def(prog, file, module, path) {
                     let d = prog.def(td);
-                    if matches!(prog.files[d.file as usize].ast.item(d.item).kind, ItemKind::Trait { auto: true, .. }) {
+                    if { let a = &prog.files[d.file as usize].ast; a.as_trait(&a.item(d.item).kind).is_some_and(|t| t.auto) } {
                         autos.push(td);
                     }
                 }
@@ -2414,7 +2413,7 @@ impl Tcx {
                 if let Some(td) = td {
                     let gat = prog.traits[prog.def(td).sub as usize].iter().copied().find(|&it| prog.def(it).name == name && prog.def(it).kind == DefKind::AssocTy).map_or(false, |it| {
                         let d = prog.def(it);
-                        matches!(&prog.files[d.file as usize].ast.item(d.item).kind, ItemKind::TypeAlias { generics, .. } if !generics.params.is_empty())
+                        { let a = &prog.files[d.file as usize].ast; a.as_alias(&a.item(d.item).kind).is_some_and(|t| !t.generics.params.is_empty()) }
                     });
                     if gat {
                         // (reported, then lowered as written: an expression path takes it, typeck
@@ -2542,10 +2541,9 @@ impl Tcx {
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
         let g = match &ast.item(def.item).kind {
-            ItemKind::Struct(g, _) | ItemKind::Enum(g, _) | ItemKind::Union(g, _) => g.clone(),
             // `type Result<T, E = Error> = ..` written `Result<()>` (rustc: alias params default
             // like any other generic params)
-            ItemKind::TypeAlias { generics, .. } => generics.clone(),
+            k @ (ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) | ItemKind::TypeAlias(_)) => *ast.kind_generics(k).unwrap(),
             _ => return,
         };
         let params: Vec<&ast::GenericParam> = ast.list(g.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))).collect();
@@ -2654,8 +2652,8 @@ impl Tcx {
         let mut env = self.item_env(prog, d);
         env.regions.enabled = true;
         let ast = &prog.files[def.file as usize].ast;
-        let t = match &ast.item(def.item).kind {
-            ItemKind::TypeAlias { ty: Some(t), .. } => self.lower_ty(cx, prog, def.file, module, &env, *t),
+        let t = match ast.as_alias(&ast.item(def.item).kind) {
+            Some(TypeAliasItem { ty: Some(t), .. }) => self.lower_ty(cx, prog, def.file, module, &env, *t),
             _ => self.tys.error,
         };
         cx.state.alias_inprog.borrow_mut().remove(&ik);
@@ -2924,7 +2922,7 @@ impl Tcx {
     pub fn trait_generic_count(&self, prog: &Program, td: DefId) -> usize {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
-        if let ItemKind::Trait { generics, .. } = &ast.item(pd.item).kind {
+        if let Some(TraitItem { generics, .. }) = ast.as_trait(&ast.item(pd.item).kind) {
             let mut n = 0;
             for g in ast.list(generics.params) {
                 if !matches!(g.kind, GenericParamKind::Lifetime(_)) {
@@ -2941,9 +2939,9 @@ impl Tcx {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
         let mut out = explicit;
-        let generics = match &ast.item(pd.item).kind {
-            ItemKind::Trait { generics, .. } => generics.clone(),
-            _ => return out,
+        let generics = match ast.as_trait(&ast.item(pd.item).kind) {
+            Some(t) => t.generics,
+            None => return out,
         };
         // (type and const params in order: `trait Traitor<const N: u8 = 1, const M: u8 = N>`)
         let mut k = 0;
@@ -3117,7 +3115,7 @@ impl Tcx {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
         let mut out = Vec::new();
-        if let ItemKind::Trait { supers, .. } = &ast.item(pd.item).kind {
+        if let Some(TraitItem { supers, .. }) = ast.as_trait(&ast.item(pd.item).kind) {
             for b in ast.list(*supers) {
                 if let ast::Bound::Trait { path, .. } = b {
                     if let Some(d) = self.resolve_type_path_def(prog, pd.file, pd.scope, path) {
@@ -3144,8 +3142,8 @@ impl Tcx {
     pub fn trait_super_bindings(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, td: DefId, self_t: TyId, targs: &[TyId]) -> Vec<(TyId, TyId)> {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
-        let paths: Vec<ast::Path> = match &ast.item(pd.item).kind {
-            ItemKind::Trait { supers, .. } => ast.list(*supers).iter().filter_map(|b| match b {
+        let paths: Vec<ast::Path> = match ast.as_trait(&ast.item(pd.item).kind) {
+            Some(TraitItem { supers, .. }) => ast.list(*supers).iter().filter_map(|b| match b {
                 ast::Bound::Trait { path, .. } => Some(path.clone()),
                 _ => None,
             }).collect(),
@@ -3154,7 +3152,7 @@ impl Tcx {
         let mut env = GenEnv::default();
         env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
                     env.regions.next_param += 1;
-        if let ItemKind::Trait { generics, .. } = &ast.item(pd.item).kind {
+        if let Some(TraitItem { generics, .. }) = ast.as_trait(&ast.item(pd.item).kind) {
             push_generics(prog, pd.file, generics, &mut env);
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
@@ -3216,8 +3214,8 @@ impl Tcx {
     pub fn trait_super_refs_of(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, td: DefId, self_t: TyId, targs: &[TyId]) -> Vec<(DefId, Vec<TyId>)> {
         let pd = prog.def(td);
         let ast = &prog.files[pd.file as usize].ast;
-        let paths: Vec<ast::Path> = match &ast.item(pd.item).kind {
-            ItemKind::Trait { supers, .. } => ast
+        let paths: Vec<ast::Path> = match ast.as_trait(&ast.item(pd.item).kind) {
+            Some(TraitItem { supers, .. }) => ast
                 .list(*supers)
                 .iter()
                 .filter_map(|b| match b {
@@ -3234,7 +3232,7 @@ impl Tcx {
         let mut env = GenEnv::default();
         env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
                     env.regions.next_param += 1;
-        if let ItemKind::Trait { generics, .. } = &ast.item(pd.item).kind {
+        if let Some(TraitItem { generics, .. }) = ast.as_trait(&ast.item(pd.item).kind) {
             push_generics(prog, pd.file, generics, &mut env);
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
@@ -3270,7 +3268,7 @@ impl Tcx {
             if d.name == name && d.kind == DefKind::AssocTy {
                 let env = self.item_env(prog, it);
                 let ast = &prog.files[d.file as usize].ast;
-                if let ItemKind::TypeAlias { ty: Some(t), .. } = &ast.item(d.item).kind {
+                if let Some(TypeAliasItem { ty: Some(t), .. }) = ast.as_alias(&ast.item(d.item).kind) {
                     return Some(self.lower_ty(cx, prog, d.file, d.scope, &env, *t));
                 }
             }
@@ -3295,8 +3293,8 @@ impl Tcx {
             return (Vec::new(), Vec::new());
         }
         let ast = &prog.files[d.file as usize].ast;
-        let paths: Vec<ast::Path> = match &ast.item(d.item).kind {
-            ItemKind::TypeAlias { bounds, .. } => ast
+        let paths: Vec<ast::Path> = match ast.as_alias(&ast.item(d.item).kind) {
+            Some(TypeAliasItem { bounds, .. }) => ast
                 .list(*bounds)
                 .iter()
                 .filter_map(|b| match b {
@@ -3306,8 +3304,8 @@ impl Tcx {
                 .collect(),
             _ => Vec::new(),
         };
-        let maybe_sized = match ast.item(d.item).kind {
-            ItemKind::TypeAlias { bounds, .. } => ast.list(bounds).iter().any(|b| matches!(b, ast::Bound::Trait { maybe: true, .. })),
+        let maybe_sized = match ast.as_alias(&ast.item(d.item).kind) {
+            Some(&TypeAliasItem { bounds, .. }) => ast.list(bounds).iter().any(|b| matches!(b, ast::Bound::Trait { maybe: true, .. })),
             _ => false,
         };
         let proj = self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(args), regions: crate::types::RegionArgsId::EMPTY }));
@@ -3317,7 +3315,7 @@ impl Tcx {
         let mut env = GenEnv::default();
         env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
                     env.regions.next_param += 1;
-        if let ItemKind::Trait { generics, .. } = &tast.item(pd.item).kind {
+        if let Some(TraitItem { generics, .. }) = tast.as_trait(&tast.item(pd.item).kind) {
             push_generics(prog, pd.file, generics, &mut env);
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));

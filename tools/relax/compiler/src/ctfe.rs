@@ -571,7 +571,7 @@ impl<'a> Ctx<'a> {
                         DefKind::Static => {
                             // Mutable/interior-mutable static reads need a full interpreter.
                             let def = self.u.prog.def(d);
-                            if !matches!(self.u.prog.files[def.file as usize].ast.item(def.item).kind, ItemKind::Static(false, _, Some(_)))
+                            if !matches!(self.u.prog.files[def.file as usize].ast.item(def.item).kind, ItemKind::Static(false, _, e) if e.is_some())
                                 || !self.u.tcx.is_freeze(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), t) { return None; }
                             let a = self.u.ctfe_static_addr(d)?;
                             // Only completed static initializers have a captured value.

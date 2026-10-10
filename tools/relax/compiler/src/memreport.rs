@@ -180,7 +180,7 @@ fn file_arrays(p: &crate::program::Program) -> Vec<(String, u64)> {
                 arms, closure_params, field_pats, qselfs, generic_args, fn_ptrs,
                 generic_arg_lists, bounds, generic_params, ident_lists, attrs,
                 asm_ops, items, fn_sigs, params, field_defs, variants, use_trees,
-                item_lists, where_preds, method_calls, for_exprs, closure_exprs, struct_exprs, mac_calls, while_exprs, let_stmts, attrs_stmts);
+                item_lists, where_preds, method_calls, for_exprs, closure_exprs, struct_exprs, mac_calls, while_exprs, let_stmts, attrs_stmts, use_items, struct_items, union_items, enum_items, alias_items, trait_items, trait_alias_items, impl_items, foreign_mods, vis_paths);
             a = ast.part.get().map(|a| &**a);
             prefix = "part.ast.";
         }

@@ -1230,8 +1230,8 @@ fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
         for it in &f.ast.items {
             let active = match &it.kind {
                 // an extern block without items: its own #[cfg]s decide, as for any item
-                crate::ast::ItemKind::ForeignMod(_, items) if items.is_empty() => crate::cfg::active(src, f.ast.list(it.attrs), cfg),
-                crate::ast::ItemKind::ForeignMod(_, items) => f.ast.list(*items).iter().any(|si| prog.item_defs.contains_key(&(fi as u32, si.0))),
+                crate::ast::ItemKind::ForeignMod(r) if f.ast.row(*r).items.is_empty() => crate::cfg::active(src, f.ast.list(it.attrs), cfg),
+                crate::ast::ItemKind::ForeignMod(r) => f.ast.list(f.ast.row(*r).items).iter().any(|si| prog.item_defs.contains_key(&(fi as u32, si.0))),
                 _ => false,
             };
             if !active {
@@ -2476,7 +2476,7 @@ fn report_origin(u: &jit::Unit, key: &FnKey) -> (&'static str, String, String) {
                     DefKind::Impl => {
                         tr = "I:".to_string();
                         let pf = &u.prog.files[p.file as usize];
-                        if let crate::ast::ItemKind::Impl { trait_: Some(path), .. } = &pf.ast.item(p.item).kind {
+                        if let Some(crate::ast::ImplItem { trait_: Some(path), .. }) = pf.ast.as_impl(&pf.ast.item(p.item).kind) {
                             if let Some(seg) = pf.ast.segs(path.segs).last() {
                                 tr.push_str(pf.text(seg.name));
                             }

@@ -156,8 +156,7 @@ impl Tcx {
                 if !matches!(df.kind, DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait | DefKind::AssocTy) { return RegionArgsId::EMPTY; }
                 let a = &prog.files[df.file as usize].ast;
                 let g = match &a.item(df.item).kind {
-                    ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) |
-                    ItemKind::TypeAlias { generics: g, .. } | ItemKind::Trait { generics: g, .. } => Some(g),
+                    k @ (ItemKind::Struct(_) | ItemKind::Union(_) | ItemKind::Enum(_) | ItemKind::TypeAlias(_) | ItemKind::Trait(_)) => a.kind_generics(k),
                     _ => None,
                 };
                 if let Some(g) = g {
@@ -189,7 +188,7 @@ impl Tcx {
         seen.push(td);
         let d = prog.def(td);
         let f = &prog.files[d.file as usize];
-        if let ItemKind::Trait { generics, supers, .. } = &f.ast.item(d.item).kind {
+        if let Some(crate::ast::TraitItem { generics, supers, .. }) = f.ast.as_trait(&f.ast.item(d.item).kind) {
             let env = self.declaration_env(prog, td);
             let params = crate::types::variance::GenericIndices::from_env(&env).lifetimes;
             let rs = self.tys.region_args(args);

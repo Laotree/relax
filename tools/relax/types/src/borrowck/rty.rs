@@ -379,8 +379,10 @@ impl<'a> Rty<'a> {
         let ast_ = &self.tx.prog.files[def.file as usize].ast;
         let it = ast_.item(def.item);
         match &it.kind {
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) => Some((def.file, g)),
-            ItemKind::TypeAlias { generics, ty: Some(_), .. } => Some((def.file, generics)),
+            ItemKind::Struct(r) => Some((def.file, &ast_.row(*r).generics)),
+            ItemKind::Union(r) => Some((def.file, &ast_.row(*r).generics)),
+            ItemKind::Enum(r) => Some((def.file, &ast_.row(*r).generics)),
+            ItemKind::TypeAlias(r) if ast_.row(*r).ty.is_some() => Some((def.file, &ast_.row(*r).generics)),
             _ => None,
         }
     }
@@ -448,9 +450,9 @@ impl<'a> Rty<'a> {
                 let ast_ = &self.tx.prog.files[def.file as usize].ast;
                 let it = ast_.item(def.item);
                 let fast: Option<ast::TyId> = match &it.kind {
-                    ItemKind::Struct(_, vd) => vd_fields(ast_, vd).get(fi as usize).copied(),
-                    ItemKind::Union(_, fs) => ast_.list(*fs).get(fi as usize).map(|f| f.ty),
-                    ItemKind::Enum(_, vs) => ast_.list(*vs).get(vi as usize).and_then(|v| vd_fields(ast_, &v.data).get(fi as usize).copied()),
+                    ItemKind::Struct(r) => vd_fields(ast_, &ast_.row(*r).data).get(fi as usize).copied(),
+                    ItemKind::Union(r) => ast_.list(ast_.row(*r).fields).get(fi as usize).map(|f| f.ty),
+                    ItemKind::Enum(r) => ast_.list(ast_.row(*r).variants).get(vi as usize).and_then(|v| vd_fields(ast_, &v.data).get(fi as usize).copied()),
                     _ => None,
                 };
                 let fast = match fast {
@@ -871,7 +873,7 @@ impl<'a> Rty<'a> {
             seen.push(t);
             let pd = self.tx.prog.def(t);
             let tast = &self.tx.prog.files[pd.file as usize].ast;
-            if let ItemKind::Trait { supers, .. } = &tast.item(pd.item).kind {
+            if let Some(crate::ast::TraitItem { supers, .. }) = tast.as_trait(&tast.item(pd.item).kind) {
                 for b in tast.list(*supers) {
                     if let ast::Bound::Lifetime(l) = b {
                         if self.text(pd.file, *l) == "'static" {
@@ -1004,7 +1006,7 @@ impl<'a> Rty<'a> {
         }
         let pd = prog.def(parent);
         match &prog.files[pd.file as usize].ast.item(pd.item).kind {
-            ItemKind::Impl { self_ty, .. } => Some((pd.file, pd.scope, *self_ty)),
+            ItemKind::Impl(r) => Some((pd.file, pd.scope, prog.files[pd.file as usize].ast.row(*r).self_ty)),
             _ => None,
         }
     }
@@ -1035,7 +1037,7 @@ impl<'a> Rty<'a> {
         };
         let ipd = prog.def(imp);
         let self_ast = match &prog.files[ipd.file as usize].ast.item(ipd.item).kind {
-            ItemKind::Impl { self_ty, .. } => *self_ty,
+            ItemKind::Impl(r) => prog.files[ipd.file as usize].ast.row(*r).self_ty,
             _ => return false,
         };
         // the written self type's regions
@@ -1102,7 +1104,7 @@ impl<'a> Rty<'a> {
             if self.n_slots(t) > 0 {
                 if let Some(imp) = self.tx.select_impl(ct, t, &[]) {
                     let pd = prog.def(imp);
-                    if let ItemKind::Impl { self_ty, .. } = &prog.files[pd.file as usize].ast.item(pd.item).kind {
+                    if let Some(crate::ast::ImplItem { self_ty, .. }) = { let a = &prog.files[pd.file as usize].ast; a.as_impl(&a.item(pd.item).kind) } {
                         let ann = self.annotation(pd.file, pd.scope, *self_ty, t, &[]);
                         if ann.len() == self.n_slots(t) {
                             for (i, a) in ann.iter().enumerate() {
@@ -1124,11 +1126,11 @@ impl<'a> Rty<'a> {
     fn impl_assoc_lifetimes(&self, imp: DefId, name: &str) -> Vec<String> {
         let pd = self.tx.prog.def(imp);
         let ast_ = &self.tx.prog.files[pd.file as usize].ast;
-        if let ItemKind::Impl { items, .. } = &ast_.item(pd.item).kind {
+        if let Some(crate::ast::ImplItem { items, .. }) = ast_.as_impl(&ast_.item(pd.item).kind) {
             for it in ast_.list(*items) {
                 let item = ast_.item(*it);
                 if self.text(pd.file, item.name) == name {
-                    if let ItemKind::TypeAlias { generics, .. } = &item.kind {
+                    if let Some(crate::ast::TypeAliasItem { generics, .. }) = ast_.as_alias(&item.kind) {
                         return ast_.list(generics.params).iter().filter(|g| matches!(g.kind, GenericParamKind::Lifetime(_))).map(|g| self.text(pd.file, g.name).to_string()).collect();
                     }
                 }
@@ -1140,11 +1142,11 @@ impl<'a> Rty<'a> {
     fn impl_assoc_ty(&self, imp: DefId, name: &str) -> Option<(u32, ast::TyId)> {
         let pd = self.tx.prog.def(imp);
         let ast_ = &self.tx.prog.files[pd.file as usize].ast;
-        if let ItemKind::Impl { items, .. } = &ast_.item(pd.item).kind {
+        if let Some(crate::ast::ImplItem { items, .. }) = ast_.as_impl(&ast_.item(pd.item).kind) {
             for it in ast_.list(*items) {
                 let item = ast_.item(*it);
                 if self.text(pd.file, item.name) == name {
-                    if let ItemKind::TypeAlias { ty: Some(t), .. } = &item.kind {
+                    if let Some(crate::ast::TypeAliasItem { ty: Some(t), .. }) = ast_.as_alias(&item.kind) {
                         return Some((pd.file, *t));
                     }
                 }
@@ -1157,8 +1159,8 @@ impl<'a> Rty<'a> {
     fn inst_alias(&self, env: &mut IEnv, d: DefId, p: &ast::Path, t: TyId, obj: SR, out: &mut Vec<SR>, depth: u32) {
         let pd = self.tx.prog.def(d);
         let ast_ = &self.tx.prog.files[pd.file as usize].ast;
-        let (generics, aty) = match &ast_.item(pd.item).kind {
-            ItemKind::TypeAlias { generics, ty: Some(x), .. } => (generics, *x),
+        let (generics, aty) = match ast_.as_alias(&ast_.item(pd.item).kind) {
+            Some(crate::ast::TypeAliasItem { generics, ty: Some(x), .. }) => (generics, *x),
             _ => return self.fill_fresh(env, t, out),
         };
         let mut lt_args: Vec<ast::Ident> = Vec::new();
@@ -1286,7 +1288,7 @@ impl<'a> Rty<'a> {
         let pd = self.tx.prog.def(ad);
         let ast_ = &self.tx.prog.files[pd.file as usize].ast;
         match &ast_.item(pd.item).kind {
-            ItemKind::TypeAlias { bounds, .. } => ast_.list(*bounds).iter().any(|b| match b {
+            ItemKind::TypeAlias(r) => ast_.list(ast_.row(*r).bounds).iter().any(|b| match b {
                 ast::Bound::Lifetime(_) => true,
                 ast::Bound::Trait { path, maybe: false, .. } => self.trait_static(pd.file, pd.scope, path, 0),
                 _ => false,
@@ -1310,8 +1312,8 @@ impl<'a> Rty<'a> {
         let pd = self.tx.prog.def(d);
         let ast_ = &self.tx.prog.files[pd.file as usize].ast;
         let (supers, gens): (&[ast::Bound], Option<&ast::Generics>) = match &ast_.item(pd.item).kind {
-            ItemKind::Trait { supers, generics, .. } => (ast_.list(*supers), Some(generics)),
-            ItemKind::TraitAlias(g, bs) => (ast_.list(*bs), Some(g)),
+            ItemKind::Trait(r) => (ast_.list(ast_.row(*r).supers), Some(&ast_.row(*r).generics)),
+            ItemKind::TraitAlias(r) => (ast_.list(ast_.row(*r).bounds), Some(&ast_.row(*r).generics)),
             _ => (&[], None),
         };
         let mut r = false;
@@ -1502,7 +1504,7 @@ pub fn struct_field_ast(prog: &crate::program::Program, d: DefId, fi: u32) -> Op
     let ast_ = &prog.files[def.file as usize].ast;
     let it = ast_.item(def.item);
     match &it.kind {
-        ItemKind::Struct(_, vd) => vd_fields(ast_, vd).get(fi as usize).map(|t| (def.file, def.scope, *t)),
+        ItemKind::Struct(r) => vd_fields(ast_, &ast_.row(*r).data).get(fi as usize).map(|t| (def.file, def.scope, *t)),
         _ => None,
     }
 }

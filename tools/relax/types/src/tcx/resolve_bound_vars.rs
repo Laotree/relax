@@ -302,7 +302,7 @@ fn opaque_captures_all_in_scope_lifetimes(_tcx: &Tcx, prog: &Program, owner: Def
     let ast = &prog.files[def.file as usize].ast;
     if ast.list(bounds).iter().any(|b| matches!(b, ast::Bound::Use(_))) { return false; }
     let parent = prog.def(def.parent);
-    let trait_impl = parent.kind == DefKind::Impl && matches!(prog.files[parent.file as usize].ast.item(parent.item).kind, ItemKind::Impl { trait_: Some(_), .. });
+    let trait_impl = parent.kind == DefKind::Impl && { let a = &prog.files[parent.file as usize].ast; a.as_impl(&a.item(parent.item).kind).is_some_and(|i| i.trait_.is_some()) };
     is_async || prog.crates[def.krate as usize].edition >= 2024 || parent.kind == DefKind::Trait || trait_impl
 }
 
@@ -492,11 +492,9 @@ impl LifetimeCollector<'_> {
 pub(crate) fn owner_generics(prog: &Program, owner: DefId) -> ast::Generics {
     let def = prog.def(owner);
     let ast = &prog.files[def.file as usize].ast;
-    match ast.item(def.item).kind {
-        ItemKind::Fn(sig, _, _) => ast.fn_sig(sig).generics,
-        ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) | ItemKind::TypeAlias { generics: g, .. } |
-        ItemKind::Trait { generics: g, .. } | ItemKind::TraitAlias(g, _) | ItemKind::Impl { generics: g, .. } => g,
-        _ => Default::default(),
+    match ast.kind_generics(&ast.item(def.item).kind) {
+        Some(g) => *g,
+        None => Default::default(),
     }
 }
 
@@ -628,23 +626,26 @@ impl BoundVarContext<'_> {
                     self.scopes.pop();
                 }
             }
-            ItemKind::Struct(_, data) => self.visit_variant_data(data),
-            ItemKind::Union(_, fields) => self.visit_fields(fields),
-            ItemKind::Enum(_, variants) => for variant in ast.list(variants) {
+            ItemKind::Struct(r) => self.visit_variant_data(ast.row(r).data),
+            ItemKind::Union(r) => self.visit_fields(ast.row(r).fields),
+            ItemKind::Enum(r) => for variant in ast.list(ast.row(r).variants) {
                 self.visit_variant_data(variant.data);
                 if let Some(expr) = variant.disc { self.visit_anon_const(expr); }
             },
-            ItemKind::TypeAlias { bounds, ty, .. } => {
+            ItemKind::TypeAlias(r) => {
+                let ast::TypeAliasItem { bounds, ty, .. } = *ast.row(r);
                 self.visit_bounds(bounds);
                 if let Some(ty) = ty { self.visit_ty(ty); }
             }
-            ItemKind::Trait { supers, .. } | ItemKind::TraitAlias(_, supers) => self.visit_bounds(supers),
-            ItemKind::Impl { trait_, self_ty, .. } => {
+            ItemKind::Trait(r) => self.visit_bounds(ast.row(r).supers),
+            ItemKind::TraitAlias(r) => self.visit_bounds(ast.row(r).bounds),
+            ItemKind::Impl(r) => {
+                let ast::ImplItem { trait_, self_ty, .. } = *ast.row(r);
                 if let Some(path) = trait_ { self.visit_path(&path); }
                 self.visit_ty(self_ty);
             }
             ItemKind::Const(ty, _) => {
-                if let Some(ty) = ty { self.visit_ty(ty); }
+                if let Some(ty) = ty.get() { self.visit_ty(ty); }
                 if let Some(expr) = self.prog.const_body(self.file, def.item).expect("collected constant") {
                     self.scopes.push(Scope::Body(self.owner)); self.visit_expr(expr); self.scopes.pop();
                 }
@@ -1077,7 +1078,7 @@ impl BoundVarContext<'_> {
         let in_body = self.scopes.iter().any(|scope| matches!(scope, Scope::Body(_)));
         let mut parameters = Vec::new();
         if def.kind == DefKind::Trait {
-            let bounds = match file.ast.item(def.item).kind { ItemKind::Trait { supers, .. } => supers, _ => Default::default() };
+            let bounds = match file.ast.as_trait(&file.ast.item(def.item).kind) { Some(t) => t.supers, None => Default::default() };
             parameters.push(("Self".to_owned(), bounds));
         }
         for param in file.ast.list(generics.params) {

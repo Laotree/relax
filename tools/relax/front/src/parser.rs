@@ -1327,6 +1327,16 @@ impl<'a> Parser<'a> {
         self.ast.struct_exprs.truncate((ends[34] - self.ast.base[34]) as usize);
         self.ast.mac_calls.truncate((ends[35] - self.ast.base[35]) as usize);
         self.ast.while_exprs.truncate((ends[36] - self.ast.base[36]) as usize);
+        self.ast.use_items.truncate((ends[39] - self.ast.base[39]) as usize);
+        self.ast.struct_items.truncate((ends[40] - self.ast.base[40]) as usize);
+        self.ast.union_items.truncate((ends[41] - self.ast.base[41]) as usize);
+        self.ast.enum_items.truncate((ends[42] - self.ast.base[42]) as usize);
+        self.ast.alias_items.truncate((ends[43] - self.ast.base[43]) as usize);
+        self.ast.trait_items.truncate((ends[44] - self.ast.base[44]) as usize);
+        self.ast.trait_alias_items.truncate((ends[45] - self.ast.base[45]) as usize);
+        self.ast.impl_items.truncate((ends[46] - self.ast.base[46]) as usize);
+        self.ast.foreign_mods.truncate((ends[47] - self.ast.base[47]) as usize);
+        self.ast.vis_paths.truncate((ends[48] - self.ast.base[48]) as usize);
         // let_stmts / attrs_stmts stay: the statement lists (never truncated here) keep the
         // cfg'd-out bodies' statements, which point at them
         self.extra_items.truncate(lens.6);
@@ -1367,7 +1377,7 @@ impl<'a> Parser<'a> {
                     self.pos += 2;
                     let p = self.path(false)?;
                     self.expect(T::CloseParen)?;
-                    return Ok(Vis::In(p));
+                    return Ok(Vis::In(self.ast.push_row(p)));
                 }
                 _ => {}
             }
@@ -1440,7 +1450,7 @@ impl<'a> Parser<'a> {
                 if self.macros.is_some() && use_lo as usize >= self.src.len() {
                     self.record_use(global, &tree);
                 }
-                ItemKind::Use { global, tree }
+                ItemKind::Use(self.ast.push_row(UseItem { global, tree }))
             }
             T::KwExtern if self.nth(1) == T::KwCrate => {
                 self.pos += 2;
@@ -1457,13 +1467,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let abi = self.abi();
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(abi, items)
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
             }
             T::KwUnsafe if self.nth(1) == T::KwExtern && (self.nth(2) == T::OpenBrace || (is_str(self.nth(2)) && self.nth(3) == T::OpenBrace)) => {
                 self.pos += 2;
                 let abi = self.abi();
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(abi, items)
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
             }
             T::KwFn | T::KwConst | T::KwAsync | T::KwUnsafe | T::KwExtern
                 if self.fn_ahead() =>
@@ -1500,14 +1510,15 @@ impl<'a> Parser<'a> {
                         VariantData::Struct(self.named_fields()?)
                     }
                 };
-                ItemKind::Struct(g, data)
+                ItemKind::Struct(self.ast.push_row(StructItem { generics: g, data }))
             }
             T::Ident if self.is_word(0, b"union") && matches!(self.nth(1), T::Ident | T::RawIdent) => {
                 self.pos += 1;
                 name = self.ident_tok()?;
                 let mut g = self.generics()?;
                 self.where_clause(&mut g)?;
-                ItemKind::Union(g, self.named_fields()?)
+                let fields = self.named_fields()?;
+                ItemKind::Union(self.ast.push_row(UnionItem { generics: g, fields }))
             }
             T::KwEnum => {
                 self.pos += 1;
@@ -1532,7 +1543,8 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(T::CloseBrace)?;
-                ItemKind::Enum(g, self.ast.push_list(vars))
+                let variants = self.ast.push_list(vars);
+                ItemKind::Enum(self.ast.push_row(EnumItem { generics: g, variants }))
             }
             T::KwTrait => {
                 self.pos += 1;
@@ -1567,7 +1579,7 @@ impl<'a> Parser<'a> {
                 let ty = if self.eat(T::Eq) { Some(self.ty_plus()?) } else { None };
                 self.where_clause(&mut generics)?;
                 self.expect(T::Semi)?;
-                ItemKind::TypeAlias { generics, bounds, ty }
+                ItemKind::TypeAlias(self.ast.push_row(TypeAliasItem { generics, bounds, ty }))
             }
             T::KwConst => {
                 self.pos += 1;
@@ -1576,7 +1588,7 @@ impl<'a> Parser<'a> {
                 let ty = if self.eat(T::Colon) { Some(self.ty()?) } else { None };
                 let e = if self.eat(T::Eq) { Some(self.expr()?) } else { None };
                 self.expect(T::Semi)?;
-                ItemKind::Const(ty, e)
+                ItemKind::Const(OptTyId::from(ty), OptExprId::from(e))
             }
             T::KwStatic => {
                 self.pos += 1;
@@ -1586,7 +1598,7 @@ impl<'a> Parser<'a> {
                 let ty = self.ty()?;
                 let e = if self.eat(T::Eq) { Some(self.expr()?) } else { None };
                 self.expect(T::Semi)?;
-                ItemKind::Static(m, ty, e)
+                ItemKind::Static(m, ty, OptExprId::from(e))
             }
             T::KwMod => {
                 self.pos += 1;
@@ -1644,7 +1656,7 @@ impl<'a> Parser<'a> {
                     self.eat(T::Semi);
                 }
                 let args = self.mac_args(&path, toks);
-                ItemKind::Mac(MacCall { path, delim, toks, args })
+                ItemKind::Mac(self.ast.push_row(MacCall { path, delim, toks, args }))
             }
             _ => {
                 if matches!(vis, Vis::Private) && attrs.is_empty() && !default_ {
@@ -1966,7 +1978,7 @@ impl<'a> Parser<'a> {
             let b = self.bounds()?;
             self.where_clause(&mut generics)?;
             self.expect(T::Semi)?;
-            return Ok(ItemKind::TraitAlias(generics, b));
+            return Ok(ItemKind::TraitAlias(self.ast.push_row(TraitAliasItem { generics, bounds: b })));
         }
         let mut supers = if self.eat(T::Colon) { self.bounds()? } else { List::EMPTY };
         self.where_clause(&mut generics)?;
@@ -1986,7 +1998,7 @@ impl<'a> Parser<'a> {
             supers = self.ast.push_list(v);
         }
         let items = self.assoc_items()?;
-        Ok(ItemKind::Trait { unsafe_, auto, generics, supers, items })
+        Ok(ItemKind::Trait(self.ast.push_row(TraitItem { unsafe_, auto, generics, supers, items })))
     }
 
     fn assoc_items(&mut self) -> PResult<List<ItemId>> {
@@ -2044,7 +2056,7 @@ impl<'a> Parser<'a> {
         };
         self.where_clause(&mut generics)?;
         let items = self.assoc_items()?;
-        Ok(ItemKind::Impl { unsafe_, default_, generics, negative, trait_, self_ty, items })
+        Ok(ItemKind::Impl(self.ast.push_row(ImplItem { unsafe_, default_, generics, negative, trait_, self_ty, items })))
     }
 
     fn ty_impl_header(&mut self) -> PResult<TyId> {
@@ -3941,8 +3953,8 @@ impl ParsedFile {
         let v = self.impl_heads.get_or_init(|| {
             let mut seen: std::collections::HashMap<Vec<u8>, u32> = std::collections::HashMap::new();
             self.ast.items.iter().map(|it| {
-                let ItemKind::Impl { items, .. } = &it.kind else { return (Box::default(), 0) };
-                let end = self.ast.list(*items).first().map_or(it.hi, |&c| self.ast.item(c).lo.min(it.hi));
+                let ItemKind::Impl(row) = &it.kind else { return (Box::default(), 0) };
+                let end = self.ast.list(self.ast.row(*row).items).first().map_or(it.hi, |&c| self.ast.item(c).lo.min(it.hi));
                 let head: Vec<u8> = self.bytes(it.lo, end.max(it.lo)).iter().copied().filter(|c| !c.is_ascii_whitespace()).collect();
                 let n = seen.entry(head.clone()).or_insert(0);
                 *n += 1;

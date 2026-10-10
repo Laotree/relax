@@ -204,19 +204,22 @@ impl LifetimeResolver<'_> {
                 self.ribs.pop();
                 self.ribs.pop();
             }
-            ItemKind::Struct(generics, data) => {
+            ItemKind::Struct(r) => {
+                let ast::StructItem { generics, data } = *ast.row(r);
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 self.visit_variant_data(data);
                 self.ribs.pop();
             }
-            ItemKind::Union(generics, fields) => {
+            ItemKind::Union(r) => {
+                let ast::UnionItem { generics, fields } = *ast.row(r);
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 self.visit_fields(fields);
                 self.ribs.pop();
             }
-            ItemKind::Enum(generics, variants) => {
+            ItemKind::Enum(r) => {
+                let ast::EnumItem { generics, variants } = *ast.row(r);
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 for variant in ast.list(variants) {
@@ -225,20 +228,23 @@ impl LifetimeResolver<'_> {
                 }
                 self.ribs.pop();
             }
-            ItemKind::TypeAlias { generics, bounds, ty } => {
+            ItemKind::TypeAlias(r) => {
+                let ast::TypeAliasItem { generics, bounds, ty } = *ast.row(r);
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 self.visit_bounds(bounds);
                 if let Some(ty) = ty { self.visit_ty(ty); }
                 self.ribs.pop();
             }
-            ItemKind::Trait { generics, supers, .. } | ItemKind::TraitAlias(generics, supers) => {
+            ItemKind::Trait(_) | ItemKind::TraitAlias(_) => {
+                let (generics, supers) = match ast.item(def.item).kind { ItemKind::Trait(r) => { let t = ast.row(r); (t.generics, t.supers) } ItemKind::TraitAlias(r) => { let t = ast.row(r); (t.generics, t.bounds) } _ => unreachable!() };
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 self.visit_bounds(supers);
                 self.ribs.pop();
             }
-            ItemKind::Impl { generics, trait_, self_ty, .. } => {
+            ItemKind::Impl(r) => {
+                let ast::ImplItem { generics, trait_, self_ty, .. } = *ast.row(r);
                 self.push_generics(BinderId::Item, generics.params);
                 self.visit_generics(&generics);
                 // late.rs:3549-3552: implicit elided path lifetimes in an impl header are an error.
@@ -250,7 +256,7 @@ impl LifetimeResolver<'_> {
             }
             ItemKind::Const(ty, _) => {
                 self.push(LifetimeRibKind::Elided { res: LifetimeRes::Static, error_in_path: def.kind == DefKind::AssocConst });
-                if let Some(ty) = ty { self.visit_ty(ty); }
+                if let Some(ty) = ty.get() { self.visit_ty(ty); }
                 self.ribs.pop();
                 self.push(LifetimeRibKind::Elided { res: LifetimeRes::Infer, error_in_path: false });
                 if let Some(expr) = self.prog.const_body(self.file, def.item).expect("collected constant body") { self.visit_expr(expr); }
@@ -323,7 +329,7 @@ impl LifetimeResolver<'_> {
         };
         let impl_self = if parent.kind == DefKind::Impl {
             let parent_ast = &self.prog.files[parent.file as usize].ast;
-            if let ItemKind::Impl { self_ty, .. } = parent_ast.item(parent.item).kind {
+            if let Some(ast::ImplItem { self_ty, .. }) = parent_ast.as_impl(&parent_ast.item(parent.item).kind).copied() {
                 if let ast::Ty::Path(path) = parent_ast.ty(self_ty) {
                     match self.tcx.resolve_type_path_def(self.prog, parent.file, parent.scope, path) {
                         Some(d) if matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Enum) => Some((Some(d), None)),
@@ -514,10 +520,8 @@ impl LifetimeResolver<'_> {
             let d = self.prog.def(type_def);
             let a = &self.prog.files[d.file as usize].ast;
             let generics = match a.item(d.item).kind {
-                ItemKind::Struct(g, _) | ItemKind::Enum(g, _) | ItemKind::Union(g, _) |
-                ItemKind::Trait { generics: g, .. } | ItemKind::TypeAlias { generics: g, .. } |
-                ItemKind::TraitAlias(g, _) => g,
-                _ => continue,
+                ItemKind::Fn(..) | ItemKind::Impl(_) => continue,
+                k => match a.kind_generics(&k) { Some(g) => *g, None => continue },
             };
             let count = a.list(generics.params).iter().filter(|param| matches!(param.kind, GenericParamKind::Lifetime(_))).count() as u32;
             for index in 0..count {

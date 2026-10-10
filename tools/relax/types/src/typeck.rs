@@ -727,8 +727,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     }
     let (fsig, body) = match &ast.item(d.item).kind {
         ItemKind::Fn(s, b, _) => (ast.fn_sig(*s), b.or_else(|| prog.fn_body(file, d.item).ok().flatten())),
-        ItemKind::Const(_, Some(init)) | ItemKind::Static(_, _, Some(init)) => {
-            let init = &prog.const_body(file, d.item).expect("body_ranges validated initializer").unwrap_or(*init);
+        ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => {
+            let init = &prog.const_body(file, d.item).expect("body_ranges validated initializer").unwrap_or(init.get().unwrap());
             // const/static initializer: checked against the declared type
             let ct = fcx.tcx.const_ty(prog, def).unwrap_or(error);
             let ct = fcx.tcx.tys.subst(ct, args);

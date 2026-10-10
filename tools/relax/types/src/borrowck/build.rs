@@ -427,7 +427,7 @@ impl<'a> Build<'a> {
         } else {
             let d = self.tx.prog.def(self.b.def);
             let init = match self.ast.item(d.item).kind {
-                ItemKind::Const(_, Some(_)) | ItemKind::Static(_, _, Some(_)) => self.tx.prog.const_body(d.file, d.item).expect("checked initializer").unwrap(),
+                ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => self.tx.prog.const_body(d.file, d.item).expect("checked initializer").unwrap(),
                 _ => unreachable!(),
             };
             self.out.def = Some(self.b.def);

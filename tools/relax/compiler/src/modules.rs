@@ -93,8 +93,8 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
             let bad = match &it.kind {
                 ItemKind::Fn(sig, _, _) if ast.fn_sig(*sig).unsafe_ => Some("`unsafe fn`"),
                 ItemKind::Fn(sig, _, _) if ast.fn_sig(*sig).abi.is_some() => Some("an `extern` fn"),
-                ItemKind::Impl { unsafe_: true, .. } => Some("`unsafe impl`"),
-                ItemKind::Trait { unsafe_: true, .. } => Some("`unsafe trait`"),
+                ItemKind::Impl(r) if ast.row(*r).unsafe_ => Some("`unsafe impl`"),
+                ItemKind::Trait(r) if ast.row(*r).unsafe_ => Some("`unsafe trait`"),
                 ItemKind::ForeignMod(..) => Some("an `extern` block"),
                 ItemKind::Static(true, _, _) => Some("`static mut`"),
                 ItemKind::Union(..) => Some("a `union`"),

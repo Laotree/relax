@@ -35,9 +35,9 @@ impl CheckedBody {
         let kind = match (&d.kind, &ast.item(d.item).kind) {
             (DefKind::Fn | DefKind::AssocFn, ItemKind::Fn(s, b, _))
                 if b.is_some() || ast.fn_sig(*s).lazy_body.is_some() => BodyKind::Function,
-            (DefKind::Const, ItemKind::Const(_, Some(_))) => BodyKind::Const,
-            (DefKind::AssocConst, ItemKind::Const(_, Some(_))) => BodyKind::AssocConst,
-            (DefKind::Static, ItemKind::Static(_, _, Some(_))) => BodyKind::Static,
+            (DefKind::Const, ItemKind::Const(_, init)) if init.is_some() => BodyKind::Const,
+            (DefKind::AssocConst, ItemKind::Const(_, init)) if init.is_some() => BodyKind::AssocConst,
+            (DefKind::Static, ItemKind::Static(_, _, init)) if init.is_some() => BodyKind::Static,
             _ => return None,
         };
         Some(Self { owner, kind })
@@ -86,7 +86,7 @@ fn in_body(prog: &Program, owner: DefId, file: u32, lo: u32) -> bool {
             Some(r) if r.hi > r.lo => { let src = prog.src(file); lo >= src.tok(r.lo as usize).lo && lo < src.tok(r.hi as usize - 1).hi }
             _ => false,
         },
-        ItemKind::Const(_, Some(init)) | ItemKind::Static(_, _, Some(init)) => { let x = ast.expr(init); lo >= x.lo && lo < x.hi }
+        ItemKind::Const(_, init) | ItemKind::Static(_, _, init) if init.is_some() => { let x = ast.expr(init.get().unwrap()); lo >= x.lo && lo < x.hi }
         _ => false,
     }
 }

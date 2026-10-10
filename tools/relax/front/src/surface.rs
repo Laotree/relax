@@ -163,8 +163,10 @@ fn scan(ast: &Ast, toks: &[crate::lexer::Tok], items: &[ItemId], fns: &mut Vec<F
                 macro_fn_bodies(toks, *r, &mut v);
                 fns.extend(v.into_iter().map(|block| FnBody { own: None, block }));
             }
-            ItemKind::Mod(Some(v)) | ItemKind::ForeignMod(_, v) => scan(ast, toks, ast.list(*v), fns),
-            ItemKind::Impl { items, .. } | ItemKind::Trait { items, .. } => scan(ast, toks, ast.list(*items), fns),
+            ItemKind::Mod(Some(v)) => scan(ast, toks, ast.list(*v), fns),
+            ItemKind::ForeignMod(r) => scan(ast, toks, ast.list(ast.row(*r).items), fns),
+            ItemKind::Impl(r) => scan(ast, toks, ast.list(ast.row(*r).items), fns),
+            ItemKind::Trait(r) => scan(ast, toks, ast.list(ast.row(*r).items), fns),
             _ => {}
         }
     }

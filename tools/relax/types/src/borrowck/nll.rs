@@ -3265,7 +3265,7 @@ impl<'a> Nll<'a> {
         // the struct's lifetime params are its first slots
         let pd = self.prog.def(d);
         let names: Vec<Vec<u8>> = match &ast.item(pd.item).kind {
-            crate::ast::ItemKind::Struct(g, _) => ast.list(g.params).iter().filter(|x| matches!(x.kind, crate::ast::GenericParamKind::Lifetime(_))).map(|x| self.prog.files[file as usize].text(x.name).as_bytes().to_vec()).collect(),
+            crate::ast::ItemKind::Struct(r) => ast.list(ast.row(*r).generics.params).iter().filter(|x| matches!(x.kind, crate::ast::GenericParamKind::Lifetime(_))).map(|x| self.prog.files[file as usize].text(x.name).as_bytes().to_vec()).collect(),
             _ => return,
         };
         let mut lts: Vec<(Vec<u8>, u32)> = Vec::new();

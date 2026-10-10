@@ -150,7 +150,7 @@ impl Context {
                         deferred += usize::from(file.ast.fn_sig(*sig).lazy_body.is_some());
                         eager += usize::from(body.is_some());
                     }
-                    if let crate::ast::ItemKind::Const(_, Some(_)) | crate::ast::ItemKind::Static(_, _, Some(_)) = &item.kind {
+                    if matches!(&item.kind, crate::ast::ItemKind::Const(_, e) | crate::ast::ItemKind::Static(_, _, e) if e.is_some()) {
                         initializers += 1;
                     }
                 }

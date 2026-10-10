@@ -63,6 +63,16 @@ unsafe impl Pod for crate::ast::MacCall {}
 unsafe impl Pod for crate::ast::WhileRow {}
 unsafe impl Pod for crate::ast::LetStmt {}
 unsafe impl Pod for crate::ast::AttrsStmt {}
+unsafe impl Pod for crate::ast::UseItem {}
+unsafe impl Pod for crate::ast::StructItem {}
+unsafe impl Pod for crate::ast::UnionItem {}
+unsafe impl Pod for crate::ast::EnumItem {}
+unsafe impl Pod for crate::ast::TypeAliasItem {}
+unsafe impl Pod for crate::ast::TraitItem {}
+unsafe impl Pod for crate::ast::TraitAliasItem {}
+unsafe impl Pod for crate::ast::ImplItem {}
+unsafe impl Pod for crate::ast::ForeignModItem {}
+unsafe impl Pod for crate::ast::Path {}
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"RFI1");
 /// bump when a section's meaning changes (layouts are covered by the build id)

@@ -45,7 +45,7 @@ pub enum Vis {
     Crate,
     Super,
     SelfMod,
-    In(Path),
+    In(Row<Path>),
 }
 
 /// `len` consecutive entries of one of its tree's flat arrays from `lo` (Ast::list): the
@@ -402,6 +402,106 @@ impl FlatArray<AttrsStmt> for Ast {
     }
 }
 
+impl FlatArray<UseItem> for Ast {
+    const BASE: usize = 39;
+    fn array(a: &Ast) -> &[UseItem] {
+        &a.use_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<UseItem> {
+        a.use_items.vec_mut()
+    }
+}
+
+impl FlatArray<StructItem> for Ast {
+    const BASE: usize = 40;
+    fn array(a: &Ast) -> &[StructItem] {
+        &a.struct_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<StructItem> {
+        a.struct_items.vec_mut()
+    }
+}
+
+impl FlatArray<UnionItem> for Ast {
+    const BASE: usize = 41;
+    fn array(a: &Ast) -> &[UnionItem] {
+        &a.union_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<UnionItem> {
+        a.union_items.vec_mut()
+    }
+}
+
+impl FlatArray<EnumItem> for Ast {
+    const BASE: usize = 42;
+    fn array(a: &Ast) -> &[EnumItem] {
+        &a.enum_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<EnumItem> {
+        a.enum_items.vec_mut()
+    }
+}
+
+impl FlatArray<TypeAliasItem> for Ast {
+    const BASE: usize = 43;
+    fn array(a: &Ast) -> &[TypeAliasItem] {
+        &a.alias_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<TypeAliasItem> {
+        a.alias_items.vec_mut()
+    }
+}
+
+impl FlatArray<TraitItem> for Ast {
+    const BASE: usize = 44;
+    fn array(a: &Ast) -> &[TraitItem] {
+        &a.trait_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<TraitItem> {
+        a.trait_items.vec_mut()
+    }
+}
+
+impl FlatArray<TraitAliasItem> for Ast {
+    const BASE: usize = 45;
+    fn array(a: &Ast) -> &[TraitAliasItem] {
+        &a.trait_alias_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<TraitAliasItem> {
+        a.trait_alias_items.vec_mut()
+    }
+}
+
+impl FlatArray<ImplItem> for Ast {
+    const BASE: usize = 46;
+    fn array(a: &Ast) -> &[ImplItem] {
+        &a.impl_items
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ImplItem> {
+        a.impl_items.vec_mut()
+    }
+}
+
+impl FlatArray<ForeignModItem> for Ast {
+    const BASE: usize = 47;
+    fn array(a: &Ast) -> &[ForeignModItem] {
+        &a.foreign_mods
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<ForeignModItem> {
+        a.foreign_mods.vec_mut()
+    }
+}
+
+impl FlatArray<Path> for Ast {
+    const BASE: usize = 48;
+    fn array(a: &Ast) -> &[Path] {
+        &a.vis_paths
+    }
+    fn array_mut(a: &mut Ast) -> &mut Vec<Path> {
+        a.vis_paths.vec_mut()
+    }
+}
+
 impl FlatArray<WherePred> for Ast {
     const BASE: usize = 30;
     fn array(a: &Ast) -> &[WherePred] {
@@ -500,6 +600,38 @@ impl OptExprId {
     #[inline]
     pub fn map_or<U>(self, d: U, f: impl FnOnce(ExprId) -> U) -> U {
         self.get().map_or(d, f)
+    }
+}
+
+/// An optional type in 4 bytes (u32::MAX: none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptTyId(pub u32);
+
+impl OptTyId {
+    pub const NONE: OptTyId = OptTyId(u32::MAX);
+    #[inline]
+    pub fn get(self) -> Option<TyId> {
+        if self.0 == u32::MAX {
+            None
+        } else {
+            Some(TyId(self.0))
+        }
+    }
+    #[inline]
+    pub fn from(t: Option<TyId>) -> OptTyId {
+        t.map_or(OptTyId::NONE, |t| OptTyId(t.0))
+    }
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0 != u32::MAX
+    }
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+    #[inline]
+    pub fn map<U>(self, f: impl FnOnce(TyId) -> U) -> Option<U> {
+        self.get().map(f)
     }
 }
 
@@ -1094,7 +1226,7 @@ pub struct Item {
 }
 
 // Item used to be 168 bytes, before its owned children moved into flat arrays.
-const _: () = assert!(std::mem::size_of::<Item>() <= 120);
+const _: () = assert!(std::mem::size_of::<Item>() <= 68);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Param {
@@ -1159,46 +1291,96 @@ pub enum UseTree {
     Group(List<UseTree>),
 }
 
+/// `use tree;` (global: a leading `::`)
 #[derive(Debug, Clone, Copy)]
-pub enum ItemKind {
-    Use { global: bool, tree: UseTree },
-    ExternCrate(Option<Ident>),
-    Fn(FnSigId, Option<BlockId>, bool), // bool: `default fn`
-    Struct(Generics, VariantData),
-    Union(Generics, List<FieldDef>),
-    Enum(Generics, List<Variant>),
-    TypeAlias {
-        generics: Generics,
-        bounds: List<Bound>,
-        ty: Option<TyId>,
-    },
-    Const(Option<TyId>, Option<ExprId>),
-    Static(bool, TyId, Option<ExprId>),
-    Trait {
-        unsafe_: bool,
-        auto: bool,
-        generics: Generics,
-        supers: List<Bound>,
-        items: List<ItemId>,
-    },
-    TraitAlias(Generics, List<Bound>),
-    Impl {
-        unsafe_: bool,
-        default_: bool,
-        generics: Generics,
-        negative: bool,
-        trait_: Option<Path>,
-        self_ty: TyId,
-        items: List<ItemId>,
-    },
-    Mod(Option<List<ItemId>>),
-    ForeignMod(Option<Ident>, List<ItemId>),
-    MacroRules(TokRange),
-    Mac(MacCall),
+pub struct UseItem {
+    pub global: bool,
+    pub tree: UseTree,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct StructItem {
+    pub generics: Generics,
+    pub data: VariantData,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct UnionItem {
+    pub generics: Generics,
+    pub fields: List<FieldDef>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct EnumItem {
+    pub generics: Generics,
+    pub variants: List<Variant>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TypeAliasItem {
+    pub generics: Generics,
+    pub bounds: List<Bound>,
+    pub ty: Option<TyId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TraitItem {
+    pub unsafe_: bool,
+    pub auto: bool,
+    pub generics: Generics,
+    pub supers: List<Bound>,
+    pub items: List<ItemId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TraitAliasItem {
+    pub generics: Generics,
+    pub bounds: List<Bound>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ImplItem {
+    pub unsafe_: bool,
+    pub default_: bool,
+    pub generics: Generics,
+    pub negative: bool,
+    pub trait_: Option<Path>,
+    pub self_ty: TyId,
+    pub items: List<ItemId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ForeignModItem {
+    pub abi: Option<Ident>,
+    pub items: List<ItemId>,
+}
+
+/// An item's kind in 16 bytes: the kinds with generics or other big payloads keep them in a row
+/// of their own array (an Item used to be 116 bytes, its ItemKind 56).
+#[derive(Debug, Clone, Copy)]
+pub enum ItemKind {
+    Use(Row<UseItem>),
+    ExternCrate(Option<Ident>),
+    Fn(FnSigId, Option<BlockId>, bool), // bool: `default fn`
+    Struct(Row<StructItem>),
+    Union(Row<UnionItem>),
+    Enum(Row<EnumItem>),
+    TypeAlias(Row<TypeAliasItem>),
+    Const(OptTyId, OptExprId),
+    Static(bool, TyId, OptExprId),
+    Trait(Row<TraitItem>),
+    TraitAlias(Row<TraitAliasItem>),
+    Impl(Row<ImplItem>),
+    Mod(Option<List<ItemId>>),
+    ForeignMod(Row<ForeignModItem>),
+    MacroRules(TokRange),
+    Mac(Row<MacCall>),
+}
+
+const _: () = assert!(std::mem::size_of::<ItemKind>() == 16);
+
 /// Number of id ranges a tree has (Ast::base / Ast::ends).
-pub const ARENAS: usize = 39;
+pub const ARENAS: usize = 49;
 
 /// Ast::base (an array of more than 32 entries has no Default).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1284,6 +1466,17 @@ pub struct Ast {
     pub while_exprs: crate::arena::Arena<WhileRow>,
     pub let_stmts: crate::arena::Arena<LetStmt>,
     pub attrs_stmts: crate::arena::Arena<AttrsStmt>,
+    /// the big payloads of item kinds (ItemKind::Struct / Impl / ..) and `pub(in path)` paths
+    pub use_items: crate::arena::Arena<UseItem>,
+    pub struct_items: crate::arena::Arena<StructItem>,
+    pub union_items: crate::arena::Arena<UnionItem>,
+    pub enum_items: crate::arena::Arena<EnumItem>,
+    pub alias_items: crate::arena::Arena<TypeAliasItem>,
+    pub trait_items: crate::arena::Arena<TraitItem>,
+    pub trait_alias_items: crate::arena::Arena<TraitAliasItem>,
+    pub impl_items: crate::arena::Arena<ImplItem>,
+    pub foreign_mods: crate::arena::Arena<ForeignModItem>,
+    pub vis_paths: crate::arena::Arena<Path>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
     pub base: Bases,
@@ -1432,6 +1625,92 @@ impl Ast {
             None => self.part_or_panic("list", l.lo).list(l),
         }
     }
+    /// The `Use` payload of an item kind.
+    #[inline]
+    pub fn as_use(&self, k: &ItemKind) -> Option<&UseItem> {
+        match k {
+            ItemKind::Use(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `Struct` payload of an item kind.
+    #[inline]
+    pub fn as_struct(&self, k: &ItemKind) -> Option<&StructItem> {
+        match k {
+            ItemKind::Struct(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `Union` payload of an item kind.
+    #[inline]
+    pub fn as_union(&self, k: &ItemKind) -> Option<&UnionItem> {
+        match k {
+            ItemKind::Union(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `Enum` payload of an item kind.
+    #[inline]
+    pub fn as_enum(&self, k: &ItemKind) -> Option<&EnumItem> {
+        match k {
+            ItemKind::Enum(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `TypeAlias` payload of an item kind.
+    #[inline]
+    pub fn as_alias(&self, k: &ItemKind) -> Option<&TypeAliasItem> {
+        match k {
+            ItemKind::TypeAlias(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `Trait` payload of an item kind.
+    #[inline]
+    pub fn as_trait(&self, k: &ItemKind) -> Option<&TraitItem> {
+        match k {
+            ItemKind::Trait(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `TraitAlias` payload of an item kind.
+    #[inline]
+    pub fn as_trait_alias(&self, k: &ItemKind) -> Option<&TraitAliasItem> {
+        match k {
+            ItemKind::TraitAlias(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `Impl` payload of an item kind.
+    #[inline]
+    pub fn as_impl(&self, k: &ItemKind) -> Option<&ImplItem> {
+        match k {
+            ItemKind::Impl(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The `ForeignMod` payload of an item kind.
+    #[inline]
+    pub fn as_foreign_mod(&self, k: &ItemKind) -> Option<&ForeignModItem> {
+        match k {
+            ItemKind::ForeignMod(r) => Some(self.row(*r)),
+            _ => None,
+        }
+    }
+    /// The generics of an item kind that has them (a fn's included).
+    pub fn kind_generics(&self, k: &ItemKind) -> Option<&Generics> {
+        match k {
+            ItemKind::Struct(r) => Some(&self.row(*r).generics),
+            ItemKind::Union(r) => Some(&self.row(*r).generics),
+            ItemKind::Enum(r) => Some(&self.row(*r).generics),
+            ItemKind::TypeAlias(r) => Some(&self.row(*r).generics),
+            ItemKind::Trait(r) => Some(&self.row(*r).generics),
+            ItemKind::TraitAlias(r) => Some(&self.row(*r).generics),
+            ItemKind::Impl(r) => Some(&self.row(*r).generics),
+            ItemKind::Fn(sig, _, _) => Some(&self.fn_sig(*sig).generics),
+            _ => None,
+        }
+    }
     /// A row (in this tree or its lazily parsed part).
     #[inline]
     pub fn row<T>(&self, r: Row<T>) -> &T
@@ -1442,6 +1721,16 @@ impl Ast {
             Some(x) => x,
             None => self.part_or_panic("row", r.id).row(r),
         }
+    }
+    /// A row of a tree being built, to change.
+    pub fn row_mut<T>(&mut self, r: Row<T>) -> &mut T
+    where
+        Ast: FlatArray<T>,
+        T: Clone,
+    {
+        let b = self.base[<Ast as FlatArray<T>>::BASE];
+        let a = <Ast as FlatArray<T>>::array_mut(self);
+        &mut a[r.id.wrapping_sub(b) as usize]
     }
     /// Stores a row (a tree being built).
     pub fn push_row<T>(&mut self, x: T) -> Row<T>
@@ -1533,6 +1822,16 @@ impl Ast {
             self.base[36] + self.while_exprs.len() as u32,
             self.base[37] + self.let_stmts.len() as u32,
             self.base[38] + self.attrs_stmts.len() as u32,
+            self.base[39] + self.use_items.len() as u32,
+            self.base[40] + self.struct_items.len() as u32,
+            self.base[41] + self.union_items.len() as u32,
+            self.base[42] + self.enum_items.len() as u32,
+            self.base[43] + self.alias_items.len() as u32,
+            self.base[44] + self.trait_items.len() as u32,
+            self.base[45] + self.trait_alias_items.len() as u32,
+            self.base[46] + self.impl_items.len() as u32,
+            self.base[47] + self.foreign_mods.len() as u32,
+            self.base[48] + self.vis_paths.len() as u32,
         ]
     }
     #[cold]
@@ -1586,6 +1885,16 @@ impl Ast {
         self.while_exprs.shrink_to_fit();
         self.let_stmts.shrink_to_fit();
         self.attrs_stmts.shrink_to_fit();
+        self.use_items.shrink_to_fit();
+        self.struct_items.shrink_to_fit();
+        self.union_items.shrink_to_fit();
+        self.enum_items.shrink_to_fit();
+        self.alias_items.shrink_to_fit();
+        self.trait_items.shrink_to_fit();
+        self.trait_alias_items.shrink_to_fit();
+        self.impl_items.shrink_to_fit();
+        self.foreign_mods.shrink_to_fit();
+        self.vis_paths.shrink_to_fit();
     }
     /// Mutable block (cfg stripping of a tree being built).
     pub fn block_mut(&mut self, id: BlockId) -> &mut Block {

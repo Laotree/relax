@@ -188,7 +188,7 @@ impl EvalCtxt<'_, '_> {
         then: impl FnOnce(&mut EvalCtxt<'_, '_>) -> QueryResultOrRerunNonErased) -> Result<Option<Candidate>, NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx; let tr = goal.trait_ref(self);
         let d = self.solver.prog.def(imp);
-        let negative = matches!(self.solver.prog.files[d.file as usize].ast.item(d.item).kind, crate::ast::ItemKind::Impl { negative: true, .. });
+        let negative = { let ast = &self.solver.prog.files[d.file as usize].ast; ast.as_impl(&ast.item(d.item).kind).is_some_and(|i| i.negative) };
         let wanted_negative = matches!(goal, GoalKind::Trait(TraitClause { polarity: ClausePolarity::Negative, .. }));
         if negative != wanted_negative { return Ok(None); }
         // Shared by trait and projection candidates, before any inference probe.

@@ -77,9 +77,9 @@ fn resolve(p: &Program, scope: u32, path: &str) -> Option<DefId> {
 fn field_defs(p: &Program,d: DefId,variant: usize) -> &[ast::FieldDef] {
     let def = p.def(d); let pf = &p.files[def.file as usize];
     let data = match pf.ast.item(def.item).kind {
-        ItemKind::Struct(_,v) => v,
-        ItemKind::Union(_,fields) => return pf.ast.list(fields),
-        ItemKind::Enum(_,vs) => match pf.ast.list(vs).get(variant) { Some(v) => v.data, None => return &[] },
+        ItemKind::Struct(r) => pf.ast.row(r).data,
+        ItemKind::Union(r) => return pf.ast.list(pf.ast.row(r).fields),
+        ItemKind::Enum(r) => match pf.ast.list(pf.ast.row(r).variants).get(variant) { Some(v) => v.data, None => return &[] },
         _ => return &[],
     };
     match data { VariantData::Unit => &[], VariantData::Tuple(fs)|VariantData::Struct(fs) => pf.ast.list(fs) }
@@ -105,8 +105,7 @@ pub fn schema(s: &mut Session,path: &str) -> Result<String,String> {
     let pf = &p.files[def.file as usize]; let it = pf.ast.item(def.item);
     let generics = match it.kind {
         ItemKind::Fn(sig,_,_) => pf.ast.fn_sig(sig).generics,
-        ItemKind::Struct(g,_)|ItemKind::Enum(g,_)|ItemKind::Union(g,_) => g,
-        ItemKind::Trait { generics:g,.. }|ItemKind::TypeAlias { generics:g,.. } => g,
+        k @ (ItemKind::Struct(_)|ItemKind::Enum(_)|ItemKind::Union(_)|ItemKind::Trait(_)|ItemKind::TypeAlias(_)) => *pf.ast.kind_generics(&k).unwrap(),
         _ => ast::Generics::default(),
     };
     let gs = pf.ast.list(generics.params).iter().map(|g|q(pf.text(g.name))).collect::<Vec<_>>().join(",");
@@ -121,7 +120,7 @@ pub fn schema(s: &mut Session,path: &str) -> Result<String,String> {
 );
     for imp in &p.impls {
         let idef = p.def(imp.def);
-        if matches!(p.files[idef.file as usize].ast.item(idef.item).kind,ItemKind::Impl { negative:true,.. }) { continue; }
+        if { let a=&p.files[idef.file as usize].ast; a.as_impl(&a.item(idef.item).kind).is_some_and(|i| i.negative) } { continue; }
         let Some(&pattern) = tcx.impl_self.get(&imp.def) else { continue; };
         // rustc_hir_typeck/src/method/probe.rs:2034-2085: instantiate the
         // impl header, relate Self, and evaluate its predicates in native inference.

@@ -2,7 +2,7 @@
 // ported from N:rustc_hir_analysis/src/hir_ty_lowering/bounds.rs @8d1a764
 // ported from N:rustc_hir_analysis/src/collect/item_bounds.rs @8d1a764
 use super::*;
-use crate::ast::{self, ItemKind, GenericParamKind, Bound, GenericArgs, WherePred};
+use crate::ast::{self, GenericParamKind, Bound, GenericArgs, WherePred};
 use crate::program::{Program, DefKind};
 use crate::tcx::{Tcx, GenEnv, EvalCx, EvalState, TypingEnv};
 use crate::types::{TyKind, AliasTy, AliasTyKind};
@@ -41,8 +41,8 @@ impl Tcx {
             let mut env = GenEnv::default();
             env.names.push(prog.syms.get("Self").unwrap());
             env.regions.next_param = 1;
-            if let ItemKind::Trait { generics, .. } = prog.files[def.file as usize].ast.item(def.item).kind {
-                crate::tcx::push_generics(prog, def.file, &generics, &mut env);
+            if let Some(crate::ast::TraitItem { generics, .. }) = { let ast = &prog.files[def.file as usize].ast; ast.as_trait(&ast.item(def.item).kind) } {
+                crate::tcx::push_generics(prog, def.file, generics, &mut env);
             }
             env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
             env.trait_def = Some(def_id);
@@ -87,7 +87,7 @@ impl Tcx {
     fn implied_clauses_with_filter(&self, prog: &Program, def_id: DefId, filter: PredicateFilter) -> Vec<Predicate> {
         let def = prog.def(def_id);
         let ast = &prog.files[def.file as usize].ast;
-        let ItemKind::Trait { supers, generics, .. } = ast.item(def.item).kind else { return Vec::new(); };
+        let Some(&crate::ast::TraitItem { supers, generics, .. }) = ast.as_trait(&ast.item(def.item).kind) else { return Vec::new(); };
         let env = self.declaration_env(prog, def_id);
         let state = EvalState::new();
         let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &state);
@@ -210,16 +210,14 @@ impl Tcx {
         let state = EvalState::new();
         let cx = EvalCx::new(prog, self, TypingEnv::fully_monomorphized(&prog), &state);
         let ast = &prog.files[def.file as usize].ast;
-        let generics = match ast.item(def.item).kind {
-            ItemKind::Impl { generics, .. } | ItemKind::Trait { generics, .. } | ItemKind::TypeAlias { generics, .. } => generics,
-            ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) | ItemKind::TraitAlias(g, _) => g,
-            ItemKind::Fn(sig, _, _) => ast.fn_sig(sig).generics,
-            _ => Default::default(),
+        let generics = match ast.kind_generics(&ast.item(def.item).kind) {
+            Some(g) => *g,
+            None => Default::default(),
         };
         let mut out = Vec::new();
         if def.kind == DefKind::Trait {
             out.push(trait_predicate(def_id, self.generic_indices_of(prog, def_id).identity_args(&self.tys)));
-            if let ItemKind::Trait { supers, .. } = ast.item(def.item).kind {
+            if let Some(&crate::ast::TraitItem { supers, .. }) = ast.as_trait(&ast.item(def.item).kind) {
                 let mut binder = env.clone();
                 binder.regions = env.regions.with_binder(None);
                 self.add_implicit_sizedness_bounds(&cx, def_id, &binder, env.self_ty.unwrap(), supers, &[], true, &mut out);

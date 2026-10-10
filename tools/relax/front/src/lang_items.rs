@@ -529,8 +529,8 @@ impl LangItems {
             let item = ast.item(def.item);
             let attrs = if def.kind == DefKind::Variant {
                 let parent = prog.def(def.parent);
-                let ItemKind::Enum(_, variants) = ast.item(parent.item).kind else { continue };
-                ast.list(ast.list(variants)[def.sub as usize].attrs)
+                let Some(en) = ast.as_enum(&ast.item(parent.item).kind) else { continue };
+                ast.list(ast.list(en.variants)[def.sub as usize].attrs)
             } else {
                 ast.list(item.attrs)
             };
@@ -596,12 +596,8 @@ pub fn has_attr(prog: &Program, file: u32, attrs: &[Attr], name: &str) -> bool {
 
 fn generic_count(ast: &Ast, kind: &ItemKind) -> Option<usize> {
     let g = match kind {
-        ItemKind::Struct(g, _) | ItemKind::Union(g, _) | ItemKind::Enum(g, _) |
-        ItemKind::TraitAlias(g, _) | ItemKind::TypeAlias { generics: g, .. } |
-        ItemKind::Trait { generics: g, .. } | ItemKind::Impl { generics: g, .. } => g,
-        ItemKind::Fn(sig, _, _) => &ast.fn_sig(*sig).generics,
         ItemKind::Const(..) => return Some(0),
-        _ => return None,
+        k => ast.kind_generics(k)?,
     };
     Some(ast.list(g.params).len())
 }
@@ -630,8 +626,8 @@ fn target(prog: &Program, did: DefId) -> Target {
                 Target::Method(MethodKind::Trait { body })
             } else {
                 let pa = &prog.files[parent.file as usize].ast;
-                match pa.item(parent.item).kind {
-                    ItemKind::Impl { trait_: Some(_), .. } => Target::Method(MethodKind::TraitImpl),
+                match pa.as_impl(&pa.item(parent.item).kind) {
+                    Some(i) if i.trait_.is_some() => Target::Method(MethodKind::TraitImpl),
                     _ => Target::Method(MethodKind::Inherent),
                 }
             }

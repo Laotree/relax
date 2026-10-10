@@ -3298,8 +3298,8 @@ impl Unit {
                 // active blocks (cfg) are the ones whose items got definitions
                 let active = match &it.kind {
                     // an empty block (link-only) counts unless it has a cfg we cannot see here
-                    crate::ast::ItemKind::ForeignMod(_, items) if items.is_empty() => !f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo).starts_with("cfg")),
-                    crate::ast::ItemKind::ForeignMod(_, items) => f.ast.list(*items).iter().any(|si| self.prog.item_defs.contains_key(&(fi as u32, si.0))),
+                    crate::ast::ItemKind::ForeignMod(r) if f.ast.row(*r).items.is_empty() => !f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo).starts_with("cfg")),
+                    crate::ast::ItemKind::ForeignMod(r) => f.ast.list(f.ast.row(*r).items).iter().any(|si| self.prog.item_defs.contains_key(&(fi as u32, si.0))),
                     _ => false,
                 };
                 if !active {
