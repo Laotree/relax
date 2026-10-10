@@ -1578,39 +1578,40 @@ pub(crate) struct NamespaceDelta {
 }
 strings::fields!(NamespaceDelta, symbols, types, traits, values, public, modules, module_macros,
     macros, uses, macro_uses, externs, empty_rules, bindings);
-impl Codec for NamespaceDelta {
-    fn put(&self, w: &mut Vec<u8>) { strings::encode(self).put(w); }
-    fn get(r: &mut Decode<'_>) -> Option<Self> {
-        let n = usize::get(r)?;
-        let value: Self = strings::decode(r.take(n)?)?;
-        value.bindings.valid().then_some(value)
-    }
-}
 impl NamespaceDelta {
     pub(super) fn legacy_size(&self, delta: bool) -> usize {
         self.plain_size() - self.bindings.plain_size() + self.bindings.legacy_size(delta)
     }
 }
-/// A part's closure delta: decoded when a stored part is read (a later load
-/// applies it), or the recorder's encoded image. Nothing in the recording
-/// process reads the delta again, and its decoded binding image (one owned
-/// spelling per name, 0.4 GB on a cold Stage) waits for the post-present graph
-/// write; the writer copies these exact bytes. The legacy size is RELAX_PROFILE's report,
-/// taken from the decoded delta at the record (0 unprofiled).
-pub(crate) enum ClosureDelta { Decoded(NamespaceDelta), Encoded(Vec<u8>, usize) }
+/// A part's closure delta, always as the bytes it is stored as: the recorder encodes it once, a
+/// stored part reads those bytes without decoding them (a decoded delta is one owned spelling per
+/// name, 0.4 GB on a cold Stage), and only a load that applies the delta decodes it. The legacy
+/// size is RELAX_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
+pub(crate) struct ClosureDelta { image: Vec<u8>, legacy: usize }
 impl Codec for ClosureDelta {
     fn put(&self, w: &mut Vec<u8>) {
-        match self { Self::Decoded(delta) => delta.put(w), Self::Encoded(image, _) => w.extend_from_slice(image) }
+        self.image.len().put(w);
+        w.extend_from_slice(&self.image);
     }
-    fn get(r: &mut Decode<'_>) -> Option<Self> { NamespaceDelta::get(r).map(Self::Decoded) }
+    fn get(r: &mut Decode<'_>) -> Option<Self> {
+        let n = usize::get(r)?;
+        Some(Self { image: r.take(n)?.to_vec(), legacy: 0 })
+    }
 }
 impl ClosureDelta {
-    pub(super) fn decoded(&self) -> Option<&NamespaceDelta> {
-        match self { Self::Decoded(delta) => Some(delta), Self::Encoded(..) => None }
+    pub(super) fn new(value: &NamespaceDelta, legacy: usize) -> Self {
+        let _mem = crate::memstat::tag(crate::memstat::Tag::FrontRecord);
+        let mut image = strings::encode(value);
+        image.shrink_to_fit();
+        Self { image, legacy }
     }
-    pub(super) fn legacy_size(&self) -> usize {
-        match self { Self::Decoded(value) => value.legacy_size(true), Self::Encoded(_, size) => *size }
+    pub(super) fn same_image(&self, other: &Self) -> bool { self.image == other.image }
+    /// The delta, decoded (None when the stored bytes are not a valid delta).
+    pub(super) fn decoded(&self) -> Option<NamespaceDelta> {
+        let value: NamespaceDelta = strings::decode(&self.image)?;
+        value.bindings.valid().then_some(value)
     }
+    pub(super) fn legacy_size(&self) -> usize { self.legacy }
 }
 pub(super) fn namespace_legacy_size(bytes: &[u8]) -> Option<usize> {
     let image: NamespaceDelta = strings::decode(bytes)?;

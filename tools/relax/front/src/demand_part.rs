@@ -427,15 +427,14 @@ impl DemandImage {
             // through the delta's encode, its shrink copy and the parts' publication.
             drop((final_names, names));
             let legacy = if profile { value.legacy_size(true) } else { 0 };
-            let mut delta = crate::crate_image::encode(&value);
+            let delta = demand::ClosureDelta::new(&value, legacy);
             drop(value);
-            delta.shrink_to_fit();
             // The closure delta covers this graph, including other edited crates.
             // An equivalent local edit leaves this row untouched too.
-            if first.closure_delta.as_ref().is_none_or(|old| crate::crate_image::encode(old.as_ref()) != delta) {
+            if first.closure_delta.as_ref().is_none_or(|old| !old.same_image(&delta)) {
                 first.key = 0;
             }
-            first.closure_delta = Some(Arc::new(demand::ClosureDelta::Encoded(delta, legacy)));
+            first.closure_delta = Some(Arc::new(delta));
         }
         if crate::preload::trace() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
