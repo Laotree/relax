@@ -907,8 +907,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
     }
     phase(&format!("link libraries ({})", n_link), t);
+    // a library that is not there only matters when one of its symbols is used: that miss is
+    // reported where it happens (the #[link] block's lazy load); here only with --verbose
     if !missing.is_empty() {
-        eprintln!("relax-run: libraries not found: {:?}", missing);
+        verbose!("relax-run: libraries not found: {:?}", missing);
     }
 
     let t = Instant::now();
@@ -1238,21 +1240,30 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for (fi, f) in prog.files.iter().enumerate() {
+        let Some(cfg) = prog.file_crate.get(fi).and_then(|&k| prog.crates.get(k as usize)).map(|c| &c.cfg) else { continue };
+        let src = crate::cfg::Src { src: &f.src, toks: &f.toks, ext: &[], ptoks: &[], parts: None };
+        // Every item of the file's arena, as before: it also holds the items of macro expansions
+        // the collector dropped (libc's cfg_if! branches for other targets carry no #[cfg] of
+        // their own), so an empty `#[link] extern "C" {}` of another target's branch still
+        // reaches here (root, network, bsd, rt); the collector would have to record the extern
+        // blocks it keeps to tell them apart. The `cfg(..)` of `#[link(.., cfg(..))]` is honoured.
         for it in &f.ast.items {
             let active = match &it.kind {
-                crate::ast::ItemKind::ForeignMod(_, items) if items.is_empty() => !f.ast.list(it.attrs).iter().any(|a| a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo).starts_with("cfg")),
+                // an extern block without items: its own #[cfg]s decide, as for any item
+                crate::ast::ItemKind::ForeignMod(_, items) if items.is_empty() => crate::cfg::active(src, f.ast.list(it.attrs), cfg),
                 crate::ast::ItemKind::ForeignMod(_, items) => f.ast.list(*items).iter().any(|si| prog.item_defs.contains_key(&(fi as u32, si.0))),
                 _ => false,
             };
             if !active {
                 continue;
             }
-            for a in f.ast.list(it.attrs) {
+            for a in crate::cfg::expand_cfg_attr_list(src, f.ast.list(it.attrs), cfg) {
                 if a.toks.hi <= a.toks.lo || f.tok_text(a.toks.lo) != "link" {
                     continue;
                 }
                 let mut name = String::new();
                 let mut fw = false;
+                let mut holds = true;
                 let mut k = a.toks.lo;
                 while k + 2 < a.toks.hi {
                     if f.tok_text(k + 1) == "=" {
@@ -1262,10 +1273,26 @@ fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
                             "kind" => fw = v == "framework",
                             _ => {}
                         }
+                    } else if f.tok_text(k) == "cfg" && f.tok_text(k + 1) == "(" {
+                        // `#[link(name = "x", cfg(pred))]` (link_cfg): the library only when
+                        // the predicate holds (libc's crt-static variants)
+                        let mut depth = 0;
+                        let mut end = k + 1;
+                        while end < a.toks.hi {
+                            match f.tok_text(end) { "(" => depth += 1, ")" => { depth -= 1; if depth == 0 { break; } } _ => {} }
+                            end += 1;
+                        }
+                        holds &= crate::cfg::eval_tokens(src, k as usize + 2, end as usize, cfg);
+                        k = end;
+                        continue;
                     }
                     k += 1;
                 }
-                if !name.is_empty() && !out.iter().any(|l| l.0 == name && l.1 == fw) {
+                if std::env::var_os("RELAX_LINK_TRACE").is_some() {
+                    let item_attrs: Vec<String> = f.ast.list(it.attrs).iter().map(|x| (x.toks.lo..x.toks.hi).map(|t| f.tok_text(t)).collect::<Vec<_>>().join(" ")).collect();
+                    eprintln!("relax-link: {} holds={} in {} (item attrs {:?})", name, holds, prog.file_paths[fi], item_attrs);
+                }
+                if holds && !name.is_empty() && !out.iter().any(|l| l.0 == name && l.1 == fw) {
                     out.push((name, fw));
                 }
             }
