@@ -1213,7 +1213,7 @@ use crate::crate_image::strings::{self, Pack};
 // fanout repeats sets, not their contents, and never emits process binding IDs.
 #[derive(Clone, Default)]
 struct BindingImage {
-    strings: Vec<String>,
+    strings: Vec<Arc<str>>,
     sets: Vec<Vec<usize>>,
     entries: Vec<(usize, bool, usize, usize)>,
 }
@@ -1229,20 +1229,23 @@ impl BindingImage {
         let mut strings = referenced.into_iter().collect::<Vec<_>>();
         strings.sort_by_key(|&id| names.bindings.spelling(id));
         let ids = strings.iter().enumerate().map(|(local, &id)| (id, local)).collect::<HashMap<_, _>>();
-        let mut sets = Vec::new();
+        // each distinct set once, as the key of its id (no second copy in a list)
         let mut set_ids = HashMap::<Vec<usize>, usize>::default();
         let mut intern = |set: &bindings::Names| {
             let mut local = set.iter().map(|id| ids[&id]).collect::<Vec<_>>();
             local.sort_unstable();
             if let Some(&id) = set_ids.get(&local) { return id; }
-            let id = sets.len();
-            sets.push(local.clone()); set_ids.insert(local, id); id
+            let id = set_ids.len();
+            set_ids.insert(local, id);
+            id
         };
         let entries = entries.into_iter().map(|id| {
             let value = &names.bindings.values[id];
             (ids[&id], value.public, intern(&value.targets), intern(&value.via))
         }).collect();
-        Self { strings: strings.into_iter().map(|id| names.bindings.spelling(id).to_owned()).collect(), sets, entries }
+        let mut sets = vec![Vec::new(); set_ids.len()];
+        for (set, id) in set_ids { sets[id] = set; }
+        Self { strings: strings.into_iter().map(|id| names.bindings.spelling_arc(id)).collect(), sets, entries }
     }
     fn valid(&self) -> bool {
         self.sets.iter().all(|set| set.iter().all(|&id| id < self.strings.len()) && set.windows(2).all(|w| w[0] < w[1]))

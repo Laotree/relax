@@ -129,7 +129,7 @@ impl Binding {
 
 enum Spelling {
     Segment(Arc<str>),
-    Qualified { module: u32, name: u32, text: OnceLock<Box<str>> },
+    Qualified { module: u32, name: u32, text: OnceLock<Arc<str>> },
 }
 
 #[derive(Default)]
@@ -207,9 +207,19 @@ impl Bindings {
     pub fn spelling(&self, id: usize) -> &str {
         match &self.text[id] {
             Spelling::Segment(text) => text,
-            Spelling::Qualified { module, name, text } => text.get_or_init(||
-                format!("{}::{}", self.spelling(*module as usize), self.spelling(*name as usize)).into_boxed_str()),
+            Spelling::Qualified { .. } => self.shared_spelling(id),
         }
+    }
+    /// The spelling as a shared string: a segment's own, or the qualified one rendered once and kept.
+    pub fn spelling_arc(&self, id: usize) -> Arc<str> {
+        match &self.text[id] {
+            Spelling::Segment(text) => text.clone(),
+            Spelling::Qualified { .. } => self.shared_spelling(id).clone(),
+        }
+    }
+    fn shared_spelling(&self, id: usize) -> &Arc<str> {
+        let Spelling::Qualified { module, name, text } = &self.text[id] else { unreachable!("segments carry their own text") };
+        text.get_or_init(|| Arc::from(format!("{}::{}", self.spelling(*module as usize), self.spelling(*name as usize))))
     }
     pub fn entry(&mut self, module: usize, name: usize) -> usize {
         if let Some(&id) = self.modules.get(&module).and_then(|names| names.get(&name)) { return id; }

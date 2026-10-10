@@ -156,10 +156,11 @@ impl DemandPart {
         sizes.insert("closure_delta", (old_delta, w.len() - start));
         packed!(reached);
         packed!(counts);
-        let body_len = w.len();
-        let body = strings.finish(w);
-        sizes.insert("strings", (0, body.len() - body_len));
-        prefix.extend(body);
+        let before = prefix.len();
+        strings.write_header(&mut prefix);
+        sizes.insert("strings", (0, prefix.len() - before));
+        prefix.extend_from_slice(&w);
+        drop(w);
         let w = prefix;
         if profile {
             for (old, label, version) in [(true, "rust-demand-part-bytes-before", 5), (false, "rust-demand-part-bytes", PART_VERSION)] {
