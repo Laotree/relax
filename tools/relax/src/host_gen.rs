@@ -4,6 +4,8 @@
 //! RELAX_CHECK_TARGET), with the features this build compiles it with (build.rs
 //! RELAX_PROVIDED), never the host's cfgs or a program's feature set; the targets' rows merge into
 //! one file whose target-only rows are cfg-gated (provided.rs host_gen_file).
+//! A target whose read has any error (a failed derive, an unresolved import, a signature error:
+//! run.rs `--host-gen`) fails the run naming the crate and target; a partial table is never written.
 //! `--check` writes nothing: exit 1 when a file would change (the merge gate).
 //! A crate's `relax_api.txt` (provided.rs HostApi) says which of its fns stay shims.
 

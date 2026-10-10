@@ -328,7 +328,8 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let mut prog = crate::program::Program::new(sess);
     // core/alloc/std: the program's own parses (program::SharedParse), not a second copy
     prog.std_from_shared = true;
-    let host = |f: &[String]| crate::cfg::CfgSet::host(sess, f);
+    // macros run here: the machine's cfg, never RELAX_CHECK_TARGET's
+    let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
     let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
     let mut std_deps = vec![(prog.syms.intern("core"), core)];
     let alloc_root = format!("{}/alloc/lib.rs", std_dir);

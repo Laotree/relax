@@ -12,7 +12,8 @@ pub struct CfgSet {
 }
 
 impl CfgSet {
-    /// The machine Relax runs on (JIT target).
+    /// The target the program is read for: the machine Relax runs on (JIT target), or
+    /// RELAX_CHECK_TARGET's.
     pub fn host(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
         // RELAX_CHECK_TARGET=x86_64-pc-windows-gnu: type-check (`relax check` / `relax run
         // --check`, with cargo's `--target` of the same triple) another platform's code from here
@@ -24,6 +25,14 @@ impl CfgSet {
             crate::options::CheckTarget::LinuxX64 => return CfgSet::linux_x64(sess, features),
             crate::options::CheckTarget::Host => {}
         }
+        CfgSet::machine(sess, features)
+    }
+
+    /// The machine Relax runs on, whatever RELAX_CHECK_TARGET checks: code Relax itself runs
+    /// at compile time (the proc-macro world, pmhost.rs) is built for here. A world read as
+    /// another target called that target's OS (Windows' FlsAlloc on Linux): every JIT derive
+    /// failed, and `relax host-gen` wrote a short Windows table.
+    pub fn machine(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             CfgSet::macos_arm64(sess, features)
         } else if cfg!(windows) {

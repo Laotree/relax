@@ -713,6 +713,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     else if !collected_restored { tcx.collect_declarations(&prog); }
     // A signature, field or impl header that names a type in a file the lazy selection skipped
     // (a closure miss): load those files and collect again, until nothing is missing.
+    let mut deferred_errors: Vec<String> = Vec::new();
     loop {
         let mods = prog.misses_to_load(&crate::program::collect_misses_take());
         if mods.is_empty() { break; }
@@ -721,7 +722,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         }
         let (f0, d0) = (prog.files.len() as u32, prog.defs.len());
         for m in mods {
-            if let Err(e) = prog.load_deferred_module(m) { eprintln!("relax: loading a deferred module failed: {}", e); }
+            if let Err(e) = prog.load_deferred_module(m) {
+                eprintln!("relax: loading a deferred module failed: {}", e);
+                deferred_errors.push(format!("loading a deferred module failed: {}", e));
+            }
         }
         prog.link_deferred_modules(f0, d0);
         tcx = crate::tcx::Tcx::new();
@@ -760,6 +764,21 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 eprintln!("relax-run: --host-gen: no crate `{}` in the graph", name);
                 return 2;
             };
+            // A table is only as complete as the read behind it: a failed derive drops the
+            // items it generates, an unresolved import or a signature error drops what names
+            // it, and the crate reads as smaller without failing. Any such error fails the
+            // worker (`relax host-gen` then writes nothing), never a short table.
+            let mut gaps: Vec<String> = crate::macro_reg::derive_failures();
+            gaps.extend(deferred_errors.iter().cloned());
+            gaps.extend(prog.errors.iter().map(|e| format!("resolve: {e}")));
+            gaps.extend(tcx.errors.iter().map(|e| format!("signature: {e}")));
+            if !gaps.is_empty() {
+                eprintln!("relax host-gen: {} ({}): {} error(s) reading the crate graph; no shim rows (first {}):", name, sess.options.target, gaps.len(), max_err.min(gaps.len()));
+                for g in gaps.iter().take(max_err) {
+                    eprintln!("  {}", g);
+                }
+                return 1;
+            }
             let errors = tcx.dcx.clone();
             // the crate's reviewed interface (relax_api.txt), passed by `relax host-gen`
             let api = match std::env::var("RELAX_HOST_API").ok().and_then(|f| std::fs::read_to_string(f).ok()) {
