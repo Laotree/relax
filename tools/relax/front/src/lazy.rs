@@ -151,6 +151,7 @@ impl Plan {
             }
         }
         let previous = stored.map(|parts| (parts.load)()).unwrap_or_default();
+        let predecoded = demand::Predecoded::start(previous.clone(), jobs());
         let mut parts = vec![DemandPart::default(); crates.len()];
         let mut identities = Vec::new();
         let dependency_names = Names::new(crates);
@@ -162,6 +163,7 @@ impl Plan {
         }
         let saved = &saved;
         let mut reused_outline = BTreeSet::new();
+        let verify_restore = std::env::var_os("RELAX_DEMAND_RESTORE_CHECK").is_some_and(|v| v == "1");
         let mut restored_surfaces = BTreeSet::new();
         let mut demands = BTreeSet::new();
         let mut origins = BTreeMap::<String, (String, String)>::new();
@@ -225,7 +227,7 @@ impl Plan {
                 if profile && reusable.is_none() && saved.get(*ci).and_then(Option::as_ref).is_some() {
                     eprintln!("rust-demand-part-invalid: {} dependency surface", c.name);
                 }
-                if let Some(part) = reusable.filter(|part| names.restore(*ci, &part.namespace).is_some()) {
+                if let Some(part) = reusable.filter(|_| predecoded.take(*ci).and_then(|image| names.restore_decoded(*ci, image, false)).is_some()) {
                     *scans = part.scans.clone();
                     part.macros.publish(Arc::make_mut(&mut table), &c.name);
                     Arc::make_mut(&mut table).seal_crate(&c.name);
@@ -255,6 +257,7 @@ impl Plan {
                     after[0].macros.inherit_definitions(&before[previous].macros);
                 }
                 let files_start = prepared_files.len();
+                let mut namespace_restored: Option<Arc<DemandPart>> = None;
                 let mut modules = crate::macros::CrateMods { root: c.name.clone(), src: c.root.clone(), ..Default::default() };
                 modules.externs.extend(c.deps.iter().cloned());
                 for (_, _, _, scan, _, _) in scans.iter_mut() {
@@ -405,7 +408,28 @@ impl Plan {
                         names.qualify_index(&mut file);
                         prepared_files.push(file);
                     }
-                    names.prepare_crate(*ci);
+                    // An edit that left this crate's namespace inputs as recorded (a
+                    // comment, a function body) changes no binding: restore the recorded
+                    // namespace as an unchanged crate's part does. The recorded bindings
+                    // are the prepare_crate result for equal tables and equal
+                    // dependency surfaces (see Names::snapshot).
+                    let stale = previous.get(*ci).and_then(Option::as_ref).filter(|_| !saved.is_empty());
+                    let input_id = stale.map(|_| names.input_id(*ci));
+                    let recorded = stale.filter(|old| Some(old.input_id) == input_id && old.input_id != 0
+                        && !old.namespace.is_empty() && old.dependencies == dependencies);
+                    if let Some(old) = recorded {
+                        if verify_restore {
+                            names.prepare_crate(*ci);
+                            let (now, _) = names.snapshot(*ci);
+                            eprintln!("rust-demand-restore-check: crate={} {}", c.name, if now == old.namespace { "identical" } else { "MISMATCH" });
+                        } else if predecoded.take(*ci).and_then(|image| names.restore_decoded(*ci, image, true)).is_some() {
+                            namespace_restored = Some(old.clone());
+                            if profile { eprintln!("rust-demand-restore: crate={} namespace inputs unchanged", c.name); }
+                        } else { names.prepare_crate(*ci); }
+                    } else {
+                        names.prepare_crate(*ci);
+                        if stale.is_some() && profile { eprintln!("rust-demand-restore: crate={} namespace inputs changed", c.name); }
+                    }
                     // Its namespace is final too: qualify impl heads and check
                     // for unindexed items before the closure needs them.
                     let start = prepared_files.len() - raw.len();
@@ -430,8 +454,12 @@ impl Plan {
                 part.dependencies = dependencies;
                 if !saved.is_empty() {
                     let _snapshot = crate::load_profile::span(profile, "rust-demand-namespace-save", &c.name);
-                    part.namespace = names.snapshot(*ci);
-                    part.namespace_id = crate::crate_image::file_hash("", &part.namespace);
+                    if let Some(old) = &namespace_restored {
+                        (part.namespace, part.namespace_id, part.input_id) = (old.namespace.clone(), old.namespace_id, old.input_id);
+                    } else {
+                        (part.namespace, part.input_id) = names.snapshot(*ci);
+                        part.namespace_id = crate::crate_image::file_hash("", &part.namespace);
+                    }
                 }
                 part.macros.finish_capture(&table, &c.name);
                 part.files = prepared_files[files_start..].to_vec();
@@ -641,7 +669,7 @@ impl Plan {
                 let _full = crate::load_profile::span(profile, "rust-demand-closure", "load");
                 if tried_local {
                     names = Names::new(crates);
-                    for (ci, part) in parts.iter().enumerate() { names.restore(ci, &part.namespace).expect("current outline namespace"); }
+                    for (ci, part) in parts.iter().enumerate() { names.restore(ci, &part.namespace, false).expect("current outline namespace"); }
                     names.finish_prepare();
                 }
                 select(&mut names, &mut inputs, &mut parts, None)
@@ -715,6 +743,7 @@ impl Plan {
             opaque_crates: forced.len(), eager_prefix,
             parts: if rust_lazy { headers } else { Vec::new() }, recording });
         plan.set_selection_identities();
+        plan.dump();
         if profile { plan.report_counts(); }
         drop(image_profile);
         drop(finish_profile);
@@ -748,6 +777,19 @@ impl Plan {
             let reached = self.reached.iter().filter(|(_, path)| path.ends_with(&suffix)).count();
             eprintln!("source-lazy: language={extension} indexed={indexed} reached={reached} deferred={}", indexed - reached);
         }
+    }
+    /// RELAX_DEMAND_DUMP=<file>: the plan's observable result (per-crate selection
+    /// identity and deferred list, reached/indexed counts), to diff an incremental
+    /// plan against one built from scratch (RELAX_LAZY_VERIFY=1) for the same sources.
+    fn dump(&self) {
+        let Some(path) = std::env::var_os("RELAX_DEMAND_DUMP") else { return; };
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        let _ = writeln!(out, "reached={} indexed={}", self.reached.len(), self.indexed.len());
+        for (ci, c) in self.crates.iter().enumerate() {
+            let _ = writeln!(out, "{ci} {} {:032x} deferred={:?}", c.name, self.selection[ci], self.deferred(ci));
+        }
+        let _ = std::fs::write(path, out);
     }
     pub fn selection_identity(&self, ci: usize) -> u128 {
         self.selection[ci]

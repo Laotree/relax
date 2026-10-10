@@ -375,16 +375,24 @@ impl Names {
             }
         }
         if let Some(saved) = saved {
-            let ids = saved.strings.iter().map(|name| self.bindings.intern(name)).collect::<Vec<_>>();
+            // The strings are sorted by spelling, so neighbours share their module: intern
+            // it once per run. A set is the sorted union of its members' ids in this table.
+            let mut last = (String::new(), usize::MAX);
+            let ids = saved.strings.iter().map(|name| self.bindings.intern_after(name, &mut last)).collect::<Vec<_>>();
+            let sets = saved.sets.iter().map(|set| {
+                let mut set = set.iter().map(|&id| ids[id]).collect::<Vec<_>>();
+                set.sort_unstable();
+                set.dedup();
+                bindings::Names::from_sorted(set)
+            }).collect::<Vec<_>>();
             for (name, public, targets, via) in saved.entries {
-                let (module, local) = saved.strings[name].rsplit_once("::").expect("validated binding image");
-                let module = self.bindings.intern(module);
-                let local = self.bindings.intern(local);
+                // ids[name] is the interned `module::local`: its parts are the pair.
+                let (module, local) = self.bindings.parts(ids[name]).expect("validated binding image");
                 let id = self.bindings.entry(module, local);
                 let binding = &mut self.bindings.values[id];
                 binding.public = public;
-                for &target in &saved.sets[targets] { binding.targets.insert(ids[target]); }
-                for &source in &saved.sets[via] { binding.via.insert(ids[source]); }
+                binding.targets.extend(&sets[targets]);
+                binding.via.extend(&sets[via]);
             }
             self.prepared = prepared;
             return;
@@ -1261,10 +1269,41 @@ impl Names {
             self.public.extend(file.glob_names.iter().map(|name| format!("{}::{name}", file.module)));
         }
     }
-    pub fn snapshot(&self, ci: usize) -> Vec<u8> {
+    /// The crate's namespace and its input identity. The identity names exactly what
+    /// `prepare_crate(ci)` consumes from this crate before any import is evaluated:
+    /// the declaration/use/extern/macro tables for paths within it (the snapshot's
+    /// tables, canonically ordered, without bindings) and the crate's dependency
+    /// spellings that `absolute` reads. Everything else it reads is the bindings of
+    /// earlier crates, which a part pins by its dependency identities.
+    pub fn snapshot(&self, ci: usize) -> (Vec<u8>, u128) {
+        let mut image = self.tables(ci);
         let krate = &self.crates[ci].name;
         let mine = |s: &str| within(s, krate);
-        let image = NamespaceDelta {
+        let input = self.input_identity(ci, &image);
+        image.bindings = BindingImage::capture(self, self.bindings.modules.iter().filter(|(id, _)| mine(self.bindings.spelling(**id)))
+            .flat_map(|(_, entries)| entries.values().copied()).collect());
+        (strings::encode(&image), input)
+    }
+    /// See `snapshot`: `tables` is the crate's namespace image with empty bindings.
+    fn input_identity(&self, ci: usize, tables: &NamespaceDelta) -> u128 {
+        let c = &self.crates[ci];
+        let mut hash = crate::sip::Sip128::new();
+        hash.str("demand-namespace-input-v1");
+        hash.u128(crate::crate_image::file_hash("", &strings::encode(tables)));
+        hash.str(&c.name);
+        hash.u8(c.cfg.session.options.rs_lazy as u8);
+        for (alias, root) in &c.deps { hash.str(alias); hash.str(root); }
+        hash.u8(0xff);
+        for (alias, root) in &c.image_dep_names { hash.str(alias); hash.str(root); }
+        hash.finish128()
+    }
+    /// The input identity alone, for a crate about to be prepared.
+    pub fn input_id(&self, ci: usize) -> u128 { self.input_identity(ci, &self.tables(ci)) }
+    /// The crate's tables as the snapshot records them, without bindings.
+    fn tables(&self, ci: usize) -> NamespaceDelta {
+        let krate = &self.crates[ci].name;
+        let mine = |s: &str| within(s, krate);
+        NamespaceDelta {
             symbols: self.symbols.iter().filter(|s| mine(s)).cloned().collect(),
             types: self.type_symbols.iter().filter(|s| mine(s)).cloned().collect::<BTreeSet<_>>().into_iter().collect(),
             traits: self.trait_symbols.iter().filter(|s| mine(s)).cloned().collect::<BTreeSet<_>>().into_iter().collect(),
@@ -1277,16 +1316,14 @@ impl Names {
             macro_uses: self.macro_uses.iter().filter(|v| mine(&v.0)).cloned().collect(),
             externs: self.externs.iter().filter(|v| mine(&v.0)).cloned().collect(),
             empty_rules: self.empty_rules.iter().filter(|(s, _)| mine(s)).map(|(s, v)| (s.clone(), v.clone())).collect(),
-            bindings: BindingImage::capture(self, self.bindings.modules.iter().filter(|(id, _)| mine(self.bindings.spelling(**id)))
-                .flat_map(|(_, entries)| entries.values().copied()).collect()),
-        };
-        strings::encode(&image)
+            bindings: BindingImage::default(),
+        }
     }
     /// `snapshot(ci)` of each of `cis` (crates whose names no other crate of the graph has),
     /// from one pass over each table: a snapshot per crate filtered every table, which made
     /// the demand record of a 257-crate graph quadratic (Stage: 11.6 s). An entry belongs to
     /// the crate its first path segment names (`within`; crate names have no `::`).
-    pub fn snapshots(&self, cis: &[usize]) -> Vec<Vec<u8>> {
+    pub fn snapshots(&self, cis: &[usize]) -> Vec<(Vec<u8>, u128)> {
         let slot: HashMap<&str, usize> = cis.iter().enumerate().map(|(k, &ci)| (self.crates[ci].name.as_str(), k)).collect();
         let owner = |s: &str| slot.get(s.split("::").next().unwrap_or(s)).copied();
         let mut images: Vec<NamespaceDelta> = (0..cis.len()).map(|_| NamespaceDelta::default()).collect();
@@ -1313,23 +1350,27 @@ impl Names {
         // each crate's bindings and encoding are independent: spread over the loader's workers
         let work: Vec<std::sync::Mutex<Option<(NamespaceDelta, Vec<usize>)>>> = images.into_iter().zip(entries).map(|w| std::sync::Mutex::new(Some(w))).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let out: Vec<std::sync::Mutex<Vec<u8>>> = (0..work.len()).map(|_| Default::default()).collect();
+        let out: Vec<std::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
         std::thread::scope(|scope| {
             for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
                 scope.spawn(|| loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(cell) = work.get(k) else { break };
                     let (mut image, entries) = cell.lock().unwrap().take().unwrap();
+                    let input = self.input_identity(cis[k], &image);
                     image.bindings = BindingImage::capture(self, entries);
-                    *out[k].lock().unwrap() = strings::encode(&image);
+                    *out[k].lock().unwrap() = (strings::encode(&image), input);
                 });
             }
         });
         out.into_iter().map(|o| o.into_inner().unwrap()).collect()
     }
-    pub fn restore(&mut self, ci: usize, bytes: &[u8]) -> Option<()> {
-        let image: NamespaceDelta = strings::decode(bytes)?;
-        if !image.bindings.valid() { return None; }
+    /// Restore a crate's recorded namespace. `replace`: the tables may already hold entries
+    /// for this crate (it was added this run); otherwise only a same-named crate can.
+    pub fn restore(&mut self, ci: usize, bytes: &[u8], replace: bool) -> Option<()> {
+        self.restore_decoded(ci, decode_namespace(bytes)?, replace)
+    }
+    pub fn restore_decoded(&mut self, ci: usize, image: NamespaceDelta, replace: bool) -> Option<()> {
         let mut local = self.fork();
         local.symbols = image.symbols.into_iter().collect();
         local.type_symbols = image.types.into_iter().collect();
@@ -1348,21 +1389,79 @@ impl Names {
         // its complete projection at this point, so replace its raw facts rather
         // than appending the library's imports a second time.
         let krate = &self.crates[ci].name;
-        self.symbols.retain(|name| !within(name, krate));
-        self.type_symbols.retain(|name| !within(name, krate));
-        self.trait_symbols.retain(|name| !within(name, krate));
-        self.value_symbols.retain(|name| !within(name, krate));
-        self.public.retain(|name| !within(name, krate));
-        self.modules.retain(|name| !within(name, krate));
-        self.module_macros.retain(|name| !within(name, krate));
-        self.macros.retain(|name| !within(name, krate));
-        self.uses.retain(|name, _| !within(name, krate));
-        self.macro_uses.retain(|entry| !within(&entry.0, krate));
-        self.externs.retain(|entry| !within(&entry.0, krate));
-        self.empty_rules.retain(|name, _| !within(name, krate));
+        // Entries for this crate's paths come from adding or restoring it, or a crate of
+        // its name (a package's library and binary). None of those: nothing to retain.
+        if replace || self.crates.iter().enumerate().any(|(other, c)| other != ci && c.name == *krate) {
+            self.symbols.retain(|name| !within(name, krate));
+            self.type_symbols.retain(|name| !within(name, krate));
+            self.trait_symbols.retain(|name| !within(name, krate));
+            self.value_symbols.retain(|name| !within(name, krate));
+            self.public.retain(|name| !within(name, krate));
+            self.modules.retain(|name| !within(name, krate));
+            self.module_macros.retain(|name| !within(name, krate));
+            self.macros.retain(|name| !within(name, krate));
+            self.uses.retain(|name, _| !within(name, krate));
+            self.macro_uses.retain(|entry| !within(&entry.0, krate));
+            self.externs.retain(|entry| !within(&entry.0, krate));
+            self.empty_rules.retain(|name, _| !within(name, krate));
+        }
         self.merge(local, true);
         self.prepare_crate_with(ci, Some(bindings));
         Some(())
+    }
+}
+
+fn decode_namespace(bytes: &[u8]) -> Option<NamespaceDelta> {
+    let image: NamespaceDelta = strings::decode(bytes)?;
+    image.bindings.valid().then_some(image)
+}
+
+/// Recorded namespaces decoded ahead on background threads, in crate order, while the
+/// planner discovers; `take` decodes a crate itself when no worker has reached it.
+pub(super) struct Predecoded {
+    parts: Vec<Option<Arc<DemandPart>>>,
+    slots: std::sync::Mutex<Vec<Slot>>,
+    done: std::sync::Condvar,
+}
+enum Slot { Free, Busy, Done(Option<NamespaceDelta>), Taken }
+impl Predecoded {
+    pub(super) fn start(parts: Vec<Option<Arc<DemandPart>>>, workers: usize) -> Arc<Self> {
+        let slots = parts.iter().map(|p| if p.as_ref().is_some_and(|p| !p.namespace.is_empty()) { Slot::Free } else { Slot::Taken }).collect();
+        let this = Arc::new(Self { parts, slots: std::sync::Mutex::new(slots), done: std::sync::Condvar::new() });
+        for _ in 0..workers.min(this.parts.len()) {
+            let this = this.clone();
+            std::thread::Builder::new().name("relax-namespace-decode".into()).spawn(move || {
+                while let Some(ci) = this.claim(None) { this.decode(ci); }
+            }).expect("namespace decode worker");
+        }
+        this
+    }
+    // The next free slot (or `only`, if it is free); None when there is nothing to claim.
+    fn claim(&self, only: Option<usize>) -> Option<usize> {
+        let mut slots = self.slots.lock().unwrap();
+        let ci = match only {
+            Some(ci) => matches!(slots[ci], Slot::Free).then_some(ci),
+            None => slots.iter().position(|s| matches!(s, Slot::Free)),
+        }?;
+        slots[ci] = Slot::Busy;
+        Some(ci)
+    }
+    fn decode(&self, ci: usize) {
+        let image = decode_namespace(&self.parts[ci].as_ref().unwrap().namespace);
+        self.slots.lock().unwrap()[ci] = Slot::Done(image);
+        self.done.notify_all();
+    }
+    /// The decoded recorded namespace of crate `ci`, once.
+    pub(super) fn take(&self, ci: usize) -> Option<NamespaceDelta> {
+        if self.claim(Some(ci)).is_some() { self.decode(ci); }
+        let mut slots = self.slots.lock().unwrap();
+        loop {
+            match std::mem::replace(&mut slots[ci], Slot::Taken) {
+                Slot::Done(image) => return image,
+                Slot::Taken => return None,
+                busy => { slots[ci] = busy; slots = self.done.wait(slots).unwrap(); }
+            }
+        }
     }
 }
 

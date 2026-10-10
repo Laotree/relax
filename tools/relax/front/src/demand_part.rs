@@ -19,6 +19,8 @@ pub struct DemandPart {
     pub(super) dependencies: Vec<u128>,
     pub(super) namespace: Vec<u8>,
     pub(super) namespace_id: u128,
+    // Identity of what preparing this crate's namespace consumed (Names::snapshot).
+    pub(super) input_id: u128,
     pub(super) surface_id: u128,
     pub(super) macros: MacroPart,
     pub(super) files: Vec<FileIndex>,
@@ -47,8 +49,8 @@ impl Codec for DemandPart {
         Some(Self { key: Codec::get(r)?, ..Self::default() })
     }
 }
-const PART_VERSION: u32 = 7;
-const PART_DOMAIN: &str = "demand-part-v7";
+const PART_VERSION: u32 = 8;
+const PART_DOMAIN: &str = "demand-part-v8";
 
 type Resolve<'a> = dyn FnMut(&str, u128) -> Option<&'static [u8]> + 'a;
 
@@ -135,6 +137,7 @@ impl DemandPart {
         let start = w.len();
         self.namespace_id.put(&mut w);
         self.surface_id.put(&mut w);
+        self.input_id.put(&mut w);
         sizes.insert("identities", (w.len() - start, w.len() - start));
         let start = w.len();
         self.macros.put_referenced(&mut w, images, &mut strings, &mut macro_records)?;
@@ -216,6 +219,7 @@ impl DemandPart {
         part.namespace = Codec::get(&mut r)?;
         part.namespace_id = Codec::get(&mut r)?;
         part.surface_id = Codec::get(&mut r)?;
+        part.input_id = Codec::get(&mut r)?;
         let mut macro_records = Vec::new();
         part.macros = MacroPart::get_referenced(&mut r, &store, images, &mut definitions, &strings, &mut macro_records)?;
         part.files = Pack::unpack(&mut r, &strings)?;
@@ -407,12 +411,12 @@ impl DemandImage {
                 }
                 names.recorded_indexes(&part.files);
                 names.prepare_crate(ci);
-                if shared[crates[ci].name.as_str()] > 1 { part.namespace = names.snapshot(ci); } else { later.push(ci); }
+                if shared[crates[ci].name.as_str()] > 1 { (part.namespace, part.input_id) = names.snapshot(ci); } else { later.push(ci); }
                 fresh[ci] = true;
-            } else { names.restore(ci, &part.namespace).expect("planner namespace"); }
+            } else { names.restore(ci, &part.namespace, false).expect("planner namespace"); }
         }
         let t_loop = t0.elapsed();
-        for (ci, namespace) in later.iter().copied().zip(names.snapshots(&later)) { parts[ci].namespace = namespace; }
+        for (ci, (namespace, input)) in later.iter().copied().zip(names.snapshots(&later)) { (parts[ci].namespace, parts[ci].input_id) = (namespace, input); }
         let t_snap = t0.elapsed();
         let mut identities = Vec::new();
         for (ci, part) in parts.iter_mut().enumerate() {

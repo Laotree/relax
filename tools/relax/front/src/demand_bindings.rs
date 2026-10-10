@@ -14,6 +14,10 @@ impl Names {
     fn slice(&self) -> &[usize] {
         match self { Self::Empty => &[], Self::One(value) => value, Self::Many(values) => values }
     }
+    /// `values` sorted ascending without duplicates.
+    pub fn from_sorted(mut values: Vec<usize>) -> Self {
+        match values.len() { 0 => Self::Empty, 1 => Self::One([values[0]]), _ => { values.shrink_to_fit(); Self::Many(values) } }
+    }
     pub fn is_empty(&self) -> bool {
         self.slice().is_empty()
     }
@@ -137,6 +141,17 @@ impl Bindings {
             id = self.qualify(id, name);
         }
         id
+    }
+    /// `intern`, with `last` remembering the previous module part's id.
+    pub fn intern_after(&mut self, name: &str, last: &mut (String, usize)) -> usize {
+        let Some((module, local)) = name.rsplit_once("::") else { return self.intern(name); };
+        if last.1 == usize::MAX || last.0 != module { *last = (module.to_owned(), self.intern(module)); }
+        let local = self.segment(local);
+        self.qualify(last.1, local)
+    }
+    /// The (module, name) ids a qualified id was interned from.
+    pub fn parts(&self, id: usize) -> Option<(usize, usize)> {
+        match self.text.get(id)? { Spelling::Qualified { module, name, .. } => Some((*module, *name)), Spelling::Segment(_) => None }
     }
     fn segment(&mut self, name: &str) -> usize {
         if let Some(&id) = self.ids.get(name) { return id; }
