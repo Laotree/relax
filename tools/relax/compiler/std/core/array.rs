@@ -313,6 +313,11 @@ impl<T: fmt::Debug, const N: usize> fmt::Debug for IntoIter<T, N> {
 
 impl<T, const N: usize> Drop for IntoIter<T, N> {
     fn drop(&mut self) {
+        // nothing to drop for plain data (rustc's drop_in_place of the alive slice is a no-op
+        // then): no loop walking `start` to `end` after every array iteration
+        if !crate::mem::needs_drop::<T>() {
+            return;
+        }
         let p = &mut *self.data as *mut [T; N] as *mut T;
         while self.start < self.end {
             unsafe { im::drop_in_place(im::ptr_add_mut(p, self.start)) };
