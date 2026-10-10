@@ -61,22 +61,22 @@ impl<'a, 'tcx> ObligationCtxt<'a, 'tcx> {
     pub fn new(infcx: &'a InferCtxt<'tcx>, prog: &'a Program) -> Self { Self { infcx, prog, engine: FulfillmentCtxt::new(infcx), cause: infcx.cause } }
     pub fn register_obligation(&mut self, goal: Goal) { self.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: self.cause }); }
     pub fn register_obligations(&mut self, goals: Vec<Goal>) { for goal in goals { self.register_obligation(goal); } }
-    pub fn eq(&mut self, env: &ParamEnv, a: TyId, b: TyId) -> Result<(), NoSolution> {
+    pub fn eq(&mut self, env: &ParamEnvId, a: TyId, b: TyId) -> Result<(), NoSolution> {
         let goals = self.infcx.at(self.prog, env.clone()).eq(a, b).map_err(|_| NoSolution)?;
         self.register_obligations(goals); Ok(())
     }
-    pub fn normalize_ty(&mut self, env: &ParamEnv, ty: TyId) -> TyId {
+    pub fn normalize_ty(&mut self, env: &ParamEnvId, ty: TyId) -> TyId {
         let (ty, goals) = self.infcx.normalize_ty(self.prog, env, ty); self.register_obligations(goals); ty
     }
-    pub fn normalize_predicate(&mut self, env: &ParamEnv, p: &Predicate) -> Predicate {
+    pub fn normalize_predicate(&mut self, env: &ParamEnvId, p: &Predicate) -> Predicate {
         let (p, goals) = self.infcx.normalize_predicate(self.prog, env, p); self.register_obligations(goals); p
     }
-    pub fn deeply_normalize_ty(&mut self, env: &ParamEnv, ty: TyId) -> Result<TyId, NoSolution> {
+    pub fn deeply_normalize_ty(&mut self, env: &ParamEnvId, ty: TyId) -> Result<TyId, NoSolution> {
         let ty = self.normalize_ty(env, ty);
         self.evaluate_obligations_error_on_ambiguity()?;
         Ok(self.infcx.deeply_resolve_ignoring_regions(ty))
     }
-    pub fn deeply_normalize_predicate(&mut self, env: &ParamEnv, p: &Predicate) -> Result<Predicate, NoSolution> {
+    pub fn deeply_normalize_predicate(&mut self, env: &ParamEnvId, p: &Predicate) -> Result<Predicate, NoSolution> {
         let p = self.normalize_predicate(env, p);
         self.evaluate_obligations_error_on_ambiguity()?;
         let mut resolver = crate::infer::resolve::DeepResolverIgnoringRegions::new(self.infcx);

@@ -45,7 +45,7 @@ impl EvalCtxt<'_, '_> {
                     ConstKind::Value(v) => v.ty,
                     ConstKind::Placeholder(_) => {
                         let mut found = None;
-                        for p in &*env.clauses {
+                        for p in &*self.delegate.tcx.param_env_by_id(env).clauses {
                             if let PredicateKind::Clause(ClauseKind::ConstArgHasType(other, ty)) = p.kind {
                                 if other == ct { found = Some(ty); break; }
                             }
@@ -67,7 +67,7 @@ impl EvalCtxt<'_, '_> {
             PredicateKind::ConstEquate(..) => panic!("ConstEquate is not emitted by the next solver"),
         }
     }
-    fn compute_subtype_goal(&mut self, env: ParamEnv, a: TyId, b: TyId) -> QueryResultOrRerunNonErased {
+    fn compute_subtype_goal(&mut self, env: ParamEnvId, a: TyId, b: TyId) -> QueryResultOrRerunNonErased {
         let a = self.delegate.shallow_resolve(a);
         let b = self.delegate.shallow_resolve(b);
         if let (TyKind::Infer(a), TyKind::Infer(b)) = (self.delegate.tcx.tys.kind(a), self.delegate.tcx.tys.kind(b)) {
@@ -86,7 +86,7 @@ impl EvalCtxt<'_, '_> {
     pub(super) fn shallow_resolve_term(&self, term: Term) -> Term {
         match term { Term::Ty(ty) => Term::Ty(self.delegate.shallow_resolve(ty)), Term::Const(ct) => Term::Const(self.delegate.shallow_resolve_const(ct)) }
     }
-    pub(super) fn structurally_normalize_term(&mut self, env: &ParamEnv, term: Term) -> Result<Term, NoSolutionOrRerunNonErased> {
+    pub(super) fn structurally_normalize_term(&mut self, env: &ParamEnvId, term: Term) -> Result<Term, NoSolutionOrRerunNonErased> {
         let term = self.shallow_resolve_term(term);
         let alias = match term {
             Term::Ty(ty) => match self.delegate.tcx.tys.kind(ty) { TyKind::Alias(IsRigid::No, _) => Some(AliasTerm::Ty(ty)), _ => None },
@@ -104,7 +104,7 @@ impl EvalCtxt<'_, '_> {
         let ty = tcx.type_of(self.solver.prog, def)?;
         Ok(tcx.instantiate_ty(self.solver.prog, def, &alias.args, ty))
     }
-    pub(super) fn evaluate_const(&mut self, env: &ParamEnv, alias: &crate::consts::AliasConst) -> Result<Option<crate::consts::Const>, NoSolutionOrRerunNonErased> {
+    pub(super) fn evaluate_const(&mut self, env: &ParamEnvId, alias: &crate::consts::AliasConst) -> Result<Option<crate::consts::Const>, NoSolutionOrRerunNonErased> {
         use crate::types::fold::TypeFolder;
         let tcx = self.delegate.tcx;
         let mut f = crate::infer::resolve::DeepResolverIgnoringRegions::new(self.delegate);
@@ -117,7 +117,7 @@ impl EvalCtxt<'_, '_> {
         }
         if ct.has_non_region_infer(&tcx.tys) { return Ok(None); }
         let ConstKind::Alias(_, alias) = tcx.tys.const_kind(ct) else { unreachable!() };
-        let typing_env = crate::tcx::TypingEnv { limit: self.delegate.recursion_limit, param_env: tcx.intern_param_env(env.clone()), mode: self.delegate.typing_mode };
+        let typing_env = crate::tcx::TypingEnv { limit: self.delegate.recursion_limit, param_env: *env, mode: self.delegate.typing_mode };
         match tcx.const_eval_resolve(self.solver.prog, typing_env, alias.kind.def_id(), &alias.args) {
             Ok(value) => Ok(Some(crate::consts::Const::new_value(&tcx.tys, value, self.const_type(&alias)?))),
             Err(crate::const_eval::ErrorHandled::TooGeneric) => Ok(None),

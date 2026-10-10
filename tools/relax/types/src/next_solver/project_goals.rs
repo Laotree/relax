@@ -8,7 +8,7 @@ use super::assembly::*;
 use crate::types::{TyKind, AliasTyKind};
 use crate::consts::{AliasConstKind, ConstKind, IsRigid};
 impl EvalCtxt<'_, '_> {
-    pub(super) fn compute_projection_goal(&mut self, env: ParamEnv, p: ProjectionClause) -> QueryResultOrRerunNonErased {
+    pub(super) fn compute_projection_goal(&mut self, env: ParamEnvId, p: ProjectionClause) -> QueryResultOrRerunNonErased {
         let associated = match &p.projection_term {
             AliasTerm::Ty(t) => match self.delegate.tcx.tys.kind(*t) {
                 TyKind::Alias(_, alias) => match alias.kind {
@@ -42,7 +42,7 @@ impl EvalCtxt<'_, '_> {
         for (source, goal) in nested { self.add_goal(source, goal)?; }
         self.evaluate_added_goals_and_make_canonical_response(evaluation.certainty)
     }
-    pub(super) fn compute_normalizes_to_goal(&mut self, env: ParamEnv, p: NormalizesTo) -> QueryResultOrRerunNonErased {
+    pub(super) fn compute_normalizes_to_goal(&mut self, env: ParamEnvId, p: NormalizesTo) -> QueryResultOrRerunNonErased {
         let tr = self.alias_trait_ref(&p.alias);
         let (_, via) = self.probe().enter(|ecx| ecx.compute_trait_goal_with_source(&env, &TraitClause { trait_ref: tr.clone(), polarity: ClausePolarity::Positive }))?;
         let Some(via) = via else { return self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS); };
@@ -65,7 +65,7 @@ impl EvalCtxt<'_, '_> {
         if has_param { candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_))); }
         match self.try_merge_candidates(&candidates) { Some((r,_)) => Ok(r), None => self.flounder(&candidates) }
     }
-    pub(super) fn instantiate_normalizes_to_term(&mut self, env: &ParamEnv, p: &NormalizesTo, value: Term) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn instantiate_normalizes_to_term(&mut self, env: &ParamEnvId, p: &NormalizesTo, value: Term) -> Result<(), NoSolutionOrRerunNonErased> {
         if let (AliasTerm::Const(alias), Term::Const(ct)) = (&p.alias, value) {
             self.add_goal(GoalSource::Misc, Goal { param_env: env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::ConstArgHasType(ct, self.const_type(alias)?))) })?;
         }
@@ -79,7 +79,7 @@ impl EvalCtxt<'_, '_> {
             AliasTerm::Const(a) => Term::Const(tys.intern_const(ConstKind::Alias(IsRigid::Yes, a.clone()))),
         }
     }
-    pub(super) fn confirm_projection_impl(&mut self, env: &ParamEnv, p: &NormalizesTo, imp: crate::program::DefId, impl_args: &[GenericArg]) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn confirm_projection_impl(&mut self, env: &ParamEnvId, p: &NormalizesTo, imp: crate::program::DefId, impl_args: &[GenericArg]) -> Result<(), NoSolutionOrRerunNonErased> {
         self.try_evaluate_added_goals()?;
         let tcx = self.delegate.tcx;
         let (def, args) = self.alias_args(&p.alias); let trait_def = self.solver.prog.def(def).parent;
@@ -115,20 +115,20 @@ impl EvalCtxt<'_, '_> {
         };
         self.instantiate_normalizes_to_term(env, p, value)
     }
-    fn instantiate_normalizes_to_error(&mut self, env: &ParamEnv, p: &NormalizesTo) -> Result<(), NoSolutionOrRerunNonErased> {
+    fn instantiate_normalizes_to_error(&mut self, env: &ParamEnvId, p: &NormalizesTo) -> Result<(), NoSolutionOrRerunNonErased> {
         let value = match &p.alias {
             AliasTerm::Ty(_) => Term::Ty(self.delegate.tcx.tys.error),
             AliasTerm::Const(_) => Term::Const(self.delegate.tcx.tys.intern_const(ConstKind::Error)),
         };
         self.instantiate_normalizes_to_term(env, p, value)
     }
-    pub(super) fn evaluate_const_and_instantiate_projection_term(&mut self, env: &ParamEnv, expected: Term, alias: &AliasConst) -> QueryResultOrRerunNonErased {
+    pub(super) fn evaluate_const_and_instantiate_projection_term(&mut self, env: &ParamEnvId, expected: Term, alias: &AliasConst) -> QueryResultOrRerunNonErased {
         match self.evaluate_const(env, alias)? {
             Some(ct) => { self.eq(env, expected, Term::Const(ct))?; self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes) }
             None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
         }
     }
-    fn normalize_inherent_associated_term(&mut self, env: &ParamEnv, p: &ProjectionClause) -> QueryResultOrRerunNonErased {
+    fn normalize_inherent_associated_term(&mut self, env: &ParamEnvId, p: &ProjectionClause) -> QueryResultOrRerunNonErased {
         let (def, mut args) = self.alias_args(&p.projection_term); let tcx = self.delegate.tcx;
         if !matches!(&p.projection_term, AliasTerm::Const(AliasConst { kind: AliasConstKind::InherentImpl { .. }, .. })) {
             let imp = self.solver.prog.def(def).parent;
@@ -153,7 +153,7 @@ impl crate::infer::InferCtxt<'_> {
     fn impl_self_is_guaranteed_unsized(&self, prog: &crate::program::Program, imp: DefId) -> bool {
         let infcx = crate::infer::InferCtxt::for_item(self.tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
 
-        let env = self.tcx.param_env(prog, imp);
+        let env = self.tcx.param_env_id(prog, imp);
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, prog);
         let mut ty = ocx.normalize_ty(&env, self.tcx.impl_self[&imp]);
         let mut depth = 0;

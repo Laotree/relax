@@ -72,7 +72,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
 
     pub fn fully_perform<Q>(&self, q: Q) -> Result<TypeOpOutput<<ParamEnvAnd<Q> as TypeOp>::Output>, NoSolution>
     where ParamEnvAnd<Q>: TypeOp {
-        ParamEnvAnd { param_env: self.param_env.clone(), value: q }.fully_perform(&self.infcx, self.prog)
+        ParamEnvAnd { param_env: self.param_env_id(), value: q }.fully_perform(&self.infcx, self.prog)
     }
 }
 
@@ -190,7 +190,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         self.infcx.generalize_ty_var(self.prog, vid, variance, source).map_err(|_| NoSolution)
     }
     fn relate_opaque(&mut self, out: &mut MirTypeckRegionConstraints, a: TyId, variance: V, b: TyId, locations: Locations, category: ConstraintCategory) -> Result<(), NoSolution> {
-        let env = self.param_env.clone();
+        let env = self.param_env_id();
         self.fully_perform_op(out, locations, category, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             let goals = ocx.infcx.at(ocx.prog, env).relate(a, variance, b).map_err(|_| NoSolution)?;
             ocx.register_obligations(goals); Ok(())
@@ -199,14 +199,14 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg], locations: Locations, category: ConstraintCategory) {
         let def = self.tcx.lang_items.get(trait_).expect("required trait lang item");
         let op = ProvePredicate { predicate: crate::next_solver::collect::trait_predicate(def, args.to_vec()) };
-        let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env.clone(), value: op });
+        let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
     }
     fn prove_wf(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations, category: ConstraintCategory) {
         let op = ProvePredicate { predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) };
-        let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env.clone(), value: op });
+        let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
     }
     fn normalize_and_prove_instantiated_clauses(&mut self, out: &mut MirTypeckRegionConstraints, owner: ClauseOwner, args: &[GenericArg], locations: Locations) {
-        let def = self.clause_owner(owner); let env = self.param_env.clone();
+        let def = self.clause_owner(owner); let env = self.param_env_id();
         let _ = self.fully_perform_op(out, locations, ConstraintCategory::Predicate(locations.span(self.mir_body.expect("MIR type ops require configure_mir")), def), CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             for p in ocx.infcx.tcx.clauses_of(ocx.prog, def) {
                 let p = ocx.infcx.tcx.instantiate_predicate(ocx.prog, def, args, &p);
@@ -217,11 +217,11 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }));
     }
     fn normalize(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, locations: Locations) -> TyId {
-        self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env.clone(), value: Normalize { value: ty } }).unwrap_or(ty)
+        self.fully_perform_op(out, locations, ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value: ty } }).unwrap_or(ty)
     }
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, at: Location) -> Result<FnSig, ()> {
         let value = self.tcx.tys.intern(TyKind::FnPtr(sig.inputs.clone(), sig.output, sig.header, 0));
-        let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env.clone(), value: Normalize { value } }).map_err(|_| ())?;
+        let ty = self.fully_perform_op(out, Locations::Single(at), ConstraintCategory::Boring, ParamEnvAnd { param_env: self.param_env_id(), value: Normalize { value } }).map_err(|_| ())?;
         let TyKind::FnPtr(inputs, output, header, _) = self.tcx.tys.kind(ty) else { unreachable!() };
         Ok(FnSig { inputs: inputs.clone(), output: *output, header: *header })
     }
@@ -249,7 +249,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     fn ascribe_user_type(&mut self, _: &mut MirTypeckRegionConstraints, _: TyId, _: UserType, _: Span) { panic!("M2b: canonical user-type annotations on MIR Body") }
     fn ascribe_user_type_skip_wf(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: TyId, span: Span) {
-        let env = self.param_env.clone();
+        let env = self.param_env_id();
         let _ = self.fully_perform_op(out, Locations::All(span), ConstraintCategory::Boring, CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             let user = ocx.normalize_ty(&env, user); ocx.eq(&env, user, inferred)
         }));
@@ -406,7 +406,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool {
         let def = self.tcx.lang_items.get(LangItem::Sized).expect("Sized lang item");
-        self.infcx.evaluate_obligation(self.prog, Goal { param_env: self.param_env.clone(), predicate: crate::next_solver::collect::trait_predicate(def, vec![GenericArg::Type(ty)]) }).must_apply_modulo_regions()
+        self.infcx.evaluate_obligation(self.prog, Goal { param_env: self.param_env_id(), predicate: crate::next_solver::collect::trait_predicate(def, vec![GenericArg::Type(ty)]) }).must_apply_modulo_regions()
     }
     fn is_upvar_field_projection(&self, _: &Body, _: &Place) -> Option<FieldIdx> { panic!("M2b: MIR capture metadata for upvar field projections") }
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)> {

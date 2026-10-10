@@ -4,7 +4,7 @@ use super::*;
 struct WritebackCx<'a, 'tcx> {
     infcx: &'a crate::infer::InferCtxt<'tcx>,
     prog: &'a Program,
-    param_env: crate::next_solver::ParamEnv,
+    param_env: crate::next_solver::ParamEnvId,
     normalize: bool,
     unresolved: bool,
 }
@@ -39,7 +39,7 @@ impl Fcx<'_> {
     /// writeback.rs:997-1006 erases these; Relax erases the codegen copy in
     /// instantiate_mir_and_normalize_erasing_regions, never the borrowck input.
     pub(super) fn resolve_type_vars_in_body(&mut self) {
-        let mut wbcx = WritebackCx { infcx: &self.infcx, prog: self.prog, param_env: self.param_env.clone(), normalize: self.b.errors.is_empty(), unresolved: false };
+        let mut wbcx = WritebackCx { infcx: &self.infcx, prog: self.prog, param_env: self.param_env, normalize: self.b.errors.is_empty(), unresolved: false };
         let body = &mut self.b;
         wbcx.resolve_args(&mut body.args);
         // Nightly writeback visits populated node_types, not untyped AST arena slots.

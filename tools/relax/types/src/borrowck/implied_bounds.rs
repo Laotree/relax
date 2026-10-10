@@ -293,7 +293,7 @@ pub fn instantiate(
 /// unnormalized without failing (that is not a normalization result).
 #[allow(clippy::too_many_arguments)]
 pub fn mir_borrowck_implied_outlives_bounds(
-    tcx: &Tcx, prog: &crate::program::Program, owner: crate::program::DefId, body_typing_mode: crate::tcx::TypingMode, param_env: &crate::next_solver::ParamEnv,
+    tcx: &Tcx, prog: &crate::program::Program, owner: crate::program::DefId, body_typing_mode: crate::tcx::TypingMode, param_env: &crate::next_solver::ParamEnvId,
     nested: bool, predicates: &[OutlivesPredicate], inputs_and_output: &[TyId], assumed_wf: &[TyId],
 ) -> Result<(ImpliedBounds, Vec<TyId>), crate::next_solver::NoSolution> {
     let typing_mode = if nested { body_typing_mode } else { crate::tcx::TypingMode::non_body_analysis() };

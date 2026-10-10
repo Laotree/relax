@@ -124,7 +124,7 @@ pub fn schema(s: &mut Session,path: &str) -> Result<String,String> {
         let Some(&pattern) = tcx.impl_self.get(&imp.def) else { continue; };
         // rustc_hir_typeck/src/method/probe.rs:2034-2085: instantiate the
         // impl header, relate Self, and evaluate its predicates in native inference.
-        let env = tcx.param_env(p, d);
+        let env = tcx.param_env_id(p, d);
         let infcx = crate::infer::InferCtxt::new(tcx, crate::tcx::TypingMode::PostAnalysis, crate::tcx::TypingEnv::fully_monomorphized(p).limit);
         let full = infcx.fresh_args_for_item(p, imp.def);
         let instantiated = tcx.instantiate_ty(p, imp.def, &full, pattern);

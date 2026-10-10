@@ -49,7 +49,7 @@ impl EvalCtxt<'_, '_> {
         let n = indices.lifetimes.len() + indices.types_consts.len();
         args.truncate(n); TraitRef { def_id: parent, args }
     }
-    pub(super) fn assemble_and_evaluate_candidates(&mut self, env: &ParamEnv, mut goal: GoalKind, from: AssembleCandidatesFrom) -> Result<(Vec<Candidate>, CandidateHeadUsages), NoSolutionOrRerunNonErased> {
+    pub(super) fn assemble_and_evaluate_candidates(&mut self, env: &ParamEnvId, mut goal: GoalKind, from: AssembleCandidatesFrom) -> Result<(Vec<Candidate>, CandidateHeadUsages), NoSolutionOrRerunNonErased> {
         let mut candidates = Vec::new(); let mut failed = CandidateHeadUsages::default();
         let self_ty = match map_err_to_rerun(self.structurally_normalize_term(env, Term::Ty(goal.self_ty(self))))? { Ok(Term::Ty(t)) => t, _ => return Ok((candidates, failed)) };
         goal.replace_self(self, self_ty);
@@ -81,7 +81,7 @@ impl EvalCtxt<'_, '_> {
             ecx.inspect.probe_kind(super::inspect::ProbeKind::NormalizedSelfTyAssembly);
             ecx.assemble_alias_bound_candidates_recur(env, &goal, self_ty, true, &mut candidates)
         })?;
-        for p in &*env.clauses {
+        for p in &*self.delegate.tcx.param_env_by_id(*env).clauses {
             if !self.assumption_matches_kind(&goal, p) { continue; }
             let mut global = false;
             let (result, usages) = self.probe().enter_single_candidate(CandidateSource::ParamEnv(false), |ecx| {
@@ -119,7 +119,7 @@ impl EvalCtxt<'_, '_> {
             _ => false,
         }
     }
-    pub(super) fn match_assumption(&mut self, env: &ParamEnv, goal: &GoalKind, p: &Predicate) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn match_assumption(&mut self, env: &ParamEnvId, goal: &GoalKind, p: &Predicate) -> Result<(), NoSolutionOrRerunNonErased> {
         let kind = self.delegate.instantiate_predicate_binder_with_infer(p);
         let p = self.normalize_predicate(env, &Predicate::dummy(kind))?;
         match (goal, p.kind) {
@@ -133,13 +133,13 @@ impl EvalCtxt<'_, '_> {
             _ => Err(NoSolution.into()),
         }
     }
-    pub(super) fn probe_and_consider_implied_clause(&mut self, env: &ParamEnv, goal: &GoalKind, p: &Predicate, source: CandidateSource, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn probe_and_consider_implied_clause(&mut self, env: &ParamEnvId, goal: &GoalKind, p: &Predicate, source: CandidateSource, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         if !self.assumption_matches_kind(goal, p) { return Ok(()); }
         let (result, head_usages) = self.probe().enter_single_candidate(source, |ecx| { ecx.match_assumption(env, goal, p)?; ecx.evaluate_added_goals_and_make_canonical_response(Certainty::Yes) });
         if let Ok(result) = map_err_to_rerun(result)? { candidates.push(Candidate { source, result, head_usages }); }
         Ok(())
     }
-    fn assemble_alias_bound_candidates_recur(&mut self, env: &ParamEnv, goal: &GoalKind, ty: TyId, self_bounds: bool, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    fn assemble_alias_bound_candidates_recur(&mut self, env: &ParamEnvId, goal: &GoalKind, ty: TyId, self_bounds: bool, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx;
         if matches!(tcx.tys.kind(ty), TyKind::Infer(_)) {
             candidates.push(self.forced_ambiguity(MaybeInfo::AMBIGUOUS)?); return Ok(());
@@ -163,7 +163,7 @@ impl EvalCtxt<'_, '_> {
         }
         Ok(())
     }
-    pub(super) fn assemble_impl_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn assemble_impl_candidates(&mut self, env: &ParamEnvId, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         crate::solver_work::count(crate::solver_work::IMPL_GOALS);
         let tr = goal.trait_ref(self); let tcx = self.delegate.tcx;
         let self_ty = goal.self_ty(self);
@@ -184,7 +184,7 @@ impl EvalCtxt<'_, '_> {
         }
         Ok(())
     }
-    pub(super) fn consider_impl_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, imp: DefId,
+    pub(super) fn consider_impl_candidate(&mut self, env: &ParamEnvId, goal: &GoalKind, imp: DefId,
         then: impl FnOnce(&mut EvalCtxt<'_, '_>) -> QueryResultOrRerunNonErased) -> Result<Option<Candidate>, NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx; let tr = goal.trait_ref(self);
         let d = self.solver.prog.def(imp);
@@ -217,7 +217,7 @@ impl EvalCtxt<'_, '_> {
             Err(_) => None,
         })
     }
-    pub(super) fn add_item_clauses(&mut self, env: &ParamEnv, def: DefId, args: &[GenericArg], source: GoalSource, own: bool) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn add_item_clauses(&mut self, env: &ParamEnvId, def: DefId, args: &[GenericArg], source: GoalSource, own: bool) -> Result<(), NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx;
         let inherited;
         let ps = if own { tcx.own_clauses_of(self.solver.prog, def) } else { inherited = tcx.clauses_of(self.solver.prog, def); &inherited };
@@ -280,10 +280,10 @@ impl EvalCtxt<'_, '_> {
         if all_builtin { if let Some((r,_)) = self.try_merge_candidates(&candidates) { return Ok((r,Some(TraitGoalProvenVia::Misc))); } }
         Ok((self.flounder(&candidates)?, None))
     }
-    pub(super) fn compute_trait_goal(&mut self, env: ParamEnv, goal: TraitClause) -> QueryResultOrRerunNonErased {
+    pub(super) fn compute_trait_goal(&mut self, env: ParamEnvId, goal: TraitClause) -> QueryResultOrRerunNonErased {
         self.compute_trait_goal_with_source(&env, &goal).map(|r| r.0)
     }
-    pub(super) fn compute_trait_goal_with_source(&mut self, env: &ParamEnv, goal: &TraitClause) -> Result<(canonical::Canonical<Response>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased> {
+    pub(super) fn compute_trait_goal_with_source(&mut self, env: &ParamEnvId, goal: &TraitClause) -> Result<(canonical::Canonical<Response>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased> {
         let (candidates, failed) = self.assemble_and_evaluate_candidates(env, GoalKind::Trait(goal.clone()), AssembleCandidatesFrom::All)?;
         self.merge_trait_candidates(&goal.trait_ref, candidates, failed)
     }
@@ -291,7 +291,7 @@ impl EvalCtxt<'_, '_> {
 // assembly/mod.rs:1382-1515: stop at the first parameter, unresolved inference,
 // failed normalization or recursion overflow, including lifetime-only clauses.
 impl EvalCtxt<'_, '_> {
-    fn characterize_param_env_assumption(&mut self, env: &ParamEnv, predicate: &Predicate) -> Result<(bool, Certainty), NoSolutionOrRerunNonErased> {
+    fn characterize_param_env_assumption(&mut self, env: &ParamEnvId, predicate: &Predicate) -> Result<(bool, Certainty), NoSolutionOrRerunNonErased> {
         if predicate.has_bound_vars(&self.delegate.tcx.tys) { return Ok((false, Certainty::Yes)); }
         let tys = &self.delegate.tcx.tys;
         let mut visitor = FindParamInClause { ecx: self, env, result: None, recursion_depth: 0, universes: Vec::new() };
@@ -299,7 +299,7 @@ impl EvalCtxt<'_, '_> {
         match visitor.result { Some(result) => Ok((false, result?)), None => Ok((true, Certainty::Yes)) }
     }
 }
-struct FindParamInClause<'a, 'b, 'tcx> { ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnv, result: Option<Result<Certainty, NoSolutionOrRerunNonErased>>, recursion_depth: usize, universes: Vec<Option<crate::types::UniverseIndex>> }
+struct FindParamInClause<'a, 'b, 'tcx> { ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnvId, result: Option<Result<Certainty, NoSolutionOrRerunNonErased>>, recursion_depth: usize, universes: Vec<Option<crate::types::UniverseIndex>> }
 impl crate::types::fold::TypeFolder for FindParamInClause<'_, '_, '_> {
     fn fold_ty(&mut self, tys: &crate::types::Types, ty: TyId, depth: u32) -> TyId {
         if self.result.is_some() { return ty; }

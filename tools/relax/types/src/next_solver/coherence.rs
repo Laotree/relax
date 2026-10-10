@@ -40,7 +40,7 @@ pub fn orphan_check_trait_ref(tcx: &crate::tcx::Tcx, prog: &Program, tr: &TraitR
         }
     })
 }
-pub fn trait_ref_is_knowable(ecx:&mut EvalCtxt<'_, '_>,env:&ParamEnv,tr:&TraitRef,local_crate:u32)->Result<Result<(),Conflict>,NoSolutionOrRerunNonErased> {
+pub fn trait_ref_is_knowable(ecx:&mut EvalCtxt<'_, '_>,env:&ParamEnvId,tr:&TraitRef,local_crate:u32)->Result<Result<(),Conflict>,NoSolutionOrRerunNonErased> {
     let (tcx, prog) = (ecx.delegate.tcx, ecx.solver.prog);
     let mut normalize = |ty: TyId| {
         let ty = ecx.delegate.shallow_resolve(ty);
@@ -118,7 +118,7 @@ impl crate::tcx::Tcx {
             let user_ty = infcx.shallow_resolve(user_ty);
             if !matches!(self.tys.kind(user_ty), TyKind::Alias(..)) { return (user_ty, Ok(user_ty)); }
             let mut ocx = super::fulfill::ObligationCtxt::new(&infcx, prog);
-            let ty = ocx.normalize_ty(&ParamEnv::default(), user_ty);
+            let ty = ocx.normalize_ty(&ParamEnvId::EMPTY, user_ty);
             let ty = infcx.deeply_resolve_ignoring_regions(ty);
             if !ocx.try_evaluate_obligations().is_empty() { return (user_ty, Ok(user_ty)); }
             (user_ty, Ok(ty))

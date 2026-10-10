@@ -792,7 +792,7 @@ impl<'a> Nll<'a> {
                 },
             }, 0);
             if unmapped.get() { continue; }
-            let op = ParamEnvAnd { param_env: self.infcx.param_env.clone(), value: Normalize { value: ty } };
+            let op = ParamEnvAnd { param_env: self.infcx.param_env_id(), value: Normalize { value: ty } };
             let _ = fully_perform_op_raw(&self.infcx, &universal_regions, &t.assumptions.type_outlives, &known,
                 &mut self.typeck_constraints, Locations::All(crate::mir::Span { file: self.bir.file, lo: span.lo, hi: span.hi }), crate::mir::Span { file: self.bir.file, lo: span.lo, hi: span.hi }, ConstraintCategory::Internal, op);
         }

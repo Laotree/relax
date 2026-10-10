@@ -150,7 +150,7 @@ impl Tcx {
         let infcx = crate::infer::InferCtxt::new(self, crate::tcx::TypingMode::PostAnalysis, TypingEnv::fully_monomorphized(prog).limit);
 
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, prog);
-        let env = ParamEnv::default();
+        let env = ParamEnvId::EMPTY;
         for p in clauses {
             struct HasParam(bool);
             impl crate::types::fold::TypeFolder for HasParam {

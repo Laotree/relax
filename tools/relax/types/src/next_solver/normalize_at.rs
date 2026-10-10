@@ -10,7 +10,7 @@ use super::placeholder::BoundVarReplacer;
 impl InferCtxt<'_> {
     /// normalize.rs:22-35: failed eager normalization is represented by fresh
     /// terms and projection obligations; fulfillment owns the eventual errors.
-    pub fn normalize_ty(&self, prog: &Program, env: &ParamEnv, ty: TyId) -> (TyId, Vec<Goal>) {
+    pub fn normalize_ty(&self, prog: &Program, env: &ParamEnvId, ty: TyId) -> (TyId, Vec<Goal>) {
         match self.normalize_ty_with_universes(prog, env, ty) {
             Ok(result) => result,
             Err(_) => {
@@ -20,7 +20,7 @@ impl InferCtxt<'_> {
             }
         }
     }
-    pub fn normalize_predicate(&self, prog: &Program, env: &ParamEnv, p: &Predicate) -> (Predicate, Vec<Goal>) {
+    pub fn normalize_predicate(&self, prog: &Program, env: &ParamEnvId, p: &Predicate) -> (Predicate, Vec<Goal>) {
         match self.normalize_predicate_with_universes(prog, env, p) {
             Ok(result) => result,
             Err(_) => {
@@ -35,10 +35,10 @@ impl InferCtxt<'_> {
     }
 }
 struct ReplaceAliasWithInfer<'a, 'tcx> {
-    infcx: &'a InferCtxt<'tcx>, env: &'a ParamEnv, obligations: Vec<Goal>, universes: Vec<Option<UniverseIndex>>,
+    infcx: &'a InferCtxt<'tcx>, env: &'a ParamEnvId, obligations: Vec<Goal>, universes: Vec<Option<UniverseIndex>>,
 }
 impl<'a, 'tcx> ReplaceAliasWithInfer<'a, 'tcx> {
-    fn new(infcx: &'a InferCtxt<'tcx>, env: &'a ParamEnv) -> Self { Self { infcx, env, obligations: Vec::new(), universes: Vec::new() } }
+    fn new(infcx: &'a InferCtxt<'tcx>, env: &'a ParamEnvId) -> Self { Self { infcx, env, obligations: Vec::new(), universes: Vec::new() } }
     fn term_to_infer(&mut self, alias: AliasTerm) -> Term {
         let term = match alias { AliasTerm::Ty(_) => Term::Ty(self.infcx.next_ty_var()), AliasTerm::Const(_) => Term::Const(self.infcx.next_const_var()) };
         self.obligations.push(Goal { param_env: self.env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: alias, term }))) });

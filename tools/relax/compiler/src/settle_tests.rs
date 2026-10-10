@@ -34,7 +34,7 @@ fn round47_const_fn_body_invalidates_solver_answer() {
         use crate::consts::{AliasConst, AliasConstKind, Const, ScalarInt, ValTree};
         let infcx = crate::infer::InferCtxt::new(&u.tcx, crate::tcx::TypingMode::PostAnalysis, Default::default());
         let expected = Const::new_value(&u.tcx.tys, ValTree::from_scalar_int(&u.tcx.tys, ScalarInt::try_from_uint(bits, 4).unwrap()), u.tcx.tys.u32_);
-        let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause {
+        let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause {
             projection_term: AliasTerm::Const(AliasConst { kind: AliasConstKind::Free { def_id: value }, args: vec![].into() }), term: Term::Const(expected),
         }))) };
         infcx.evaluate_root_goal(&u.prog, goal, None).is_ok_and(|r| r.certainty.is_yes())

@@ -73,6 +73,7 @@ impl Tcx {
         // before moving its clauses into the signature comparison context.
         let env = super::param_env::normalize_param_env_or_error(
             self, prog, ParamEnv { clauses: clauses.into() }, cause);
+        let env = self.intern_param_env(env);
 
         let infcx = InferCtxt::for_item(self, prog, mode, method);
 
@@ -138,8 +139,8 @@ impl Tcx {
         let identity = own.identity_args(&self.tys);
         let mut args = self.impl_trait_ref(prog, imp, &parent.identity_args(&self.tys)).args;
         args.extend_from_slice(&identity[parent.types_consts.len() + parent.lifetimes.len()..]);
-        let env = self.param_env(prog, item);
-        let normalize_env = self.param_env_with_gat_bounds(prog, item)?;
+        let env = self.param_env_id(prog, item);
+        let normalize_env = self.intern_param_env(self.param_env_with_gat_bounds(prog, item)?);
         let infcx = InferCtxt::for_item(self, prog, TypingMode::non_body_analysis(), item);
         let mut ocx = ObligationCtxt::new(&infcx, prog);
         let mut obligations = Vec::new();
@@ -262,7 +263,7 @@ impl Tcx {
     fn impl_self_is_guaranteed_unsized(&self, prog: &Program, imp: DefId) -> Result<bool, String> {
         let infcx = InferCtxt::for_item(self, prog, TypingMode::non_body_analysis(), imp);
         let mut ocx = ObligationCtxt::new(&infcx, prog);
-        let env = self.param_env(prog, imp);
+        let env = self.param_env_id(prog, imp);
         let mut ty = ocx.normalize_ty(&env, self.impl_self[&imp]);
         let limit = infcx.recursion_limit(prog);
         for _ in 0..=limit {

@@ -44,8 +44,9 @@ impl<'a, 'tcx> DeepVariableResolver<'a, 'tcx> {
     pub fn new(infcx: &'a InferCtxt<'tcx>) -> Self { Self { infcx } }
 }
 impl TypeFolder for DeepVariableResolver<'_, '_> {
-    fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId { super_fold_ty(tys, self.infcx.shallow_resolve(ty), self, depth) }
-    fn fold_const(&mut self, tys: &Types, ct: Const, depth: u32) -> Const { super_fold_const(tys, self.infcx.shallow_resolve_const(ct), self, depth) }
+    fn fold_flags(&self) -> Option<crate::types::TypeFlags> { Some(crate::types::TypeFlags::HAS_ANY_INFER) }
+    fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId { if !tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ANY_INFER) { return ty; } super_fold_ty(tys, self.infcx.shallow_resolve(ty), self, depth) }
+    fn fold_const(&mut self, tys: &Types, ct: Const, depth: u32) -> Const { if tys.const_flags(ct).0 & crate::types::TypeFlags::HAS_ANY_INFER.bits() == 0 { return ct; } super_fold_const(tys, self.infcx.shallow_resolve_const(ct), self, depth) }
     fn fold_region(&mut self, tys: &Types, r: crate::types::RegionId, _: u32) -> crate::types::RegionId {
         if let crate::types::RegionKind::ReVar(v) = tys.region_kind(r) { self.infcx.inner.borrow_mut().unwrap_region_constraints().shallow_resolve_region_var(tys, v) } else { r }
     }

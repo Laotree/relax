@@ -77,7 +77,7 @@ impl CanonicalizerState {
 }
 #[derive(Clone)]
 pub(crate) struct CanonicalParamEnvCacheEntry {
-    param_env: ParamEnv,
+    param_env: ParamEnvId,
     variables: Vec<GenericArg>,
     var_kinds: Vec<CanonicalVarKind>,
     variable_lookup_table: HashMap<GenericArg, usize>,
@@ -85,11 +85,14 @@ pub(crate) struct CanonicalParamEnvCacheEntry {
 
 struct DeepVariableResolver<'a, 'tcx> { infcx: &'a InferCtxt<'tcx> }
 impl TypeFolder for DeepVariableResolver<'_, '_> {
+    fn fold_flags(&self) -> Option<TypeFlags> { Some(TypeFlags::HAS_ANY_INFER) }
     fn fold_const(&mut self, tys: &Types, ct: Const, depth: u32) -> Const {
+        if tys.const_flags(ct).0 & TypeFlags::HAS_ANY_INFER.bits() == 0 { return ct; }
         super_fold_const(tys, self.infcx.shallow_resolve_const(ct), self, depth)
     }
 
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
+        if !tys.flags(ty).intersects(TypeFlags::HAS_ANY_INFER) { return ty; }
         super_fold_ty(tys, self.infcx.shallow_resolve(ty), self, depth)
     }
     fn fold_region(&mut self, tys: &Types, region: RegionId, _depth: u32) -> RegionId {
@@ -98,14 +101,6 @@ impl TypeFolder for DeepVariableResolver<'_, '_> {
         } else { region }
     }
 }
-
-struct HasNonRegionInfer(bool);
-impl TypeFolder for HasNonRegionInfer {
-    fn fold_const(&mut self, tys: &Types, ct: Const, _depth: u32) -> Const { self.0 |= ct.has_non_region_infer(tys); ct }
-
-    fn fold_ty(&mut self, tys: &Types, ty: TyId, _depth: u32) -> TyId { self.0 |= tys.has_infer(ty); ty }
-}
-
 
 struct Canonicalizer<'a, 'tcx> { delegate: &'a InferCtxt<'tcx>, mode: CanonicalizeMode, state: CanonicalizerState, infer_query: bool }
 impl<'a, 'tcx> Canonicalizer<'a, 'tcx> {
@@ -155,7 +150,9 @@ impl<'a, 'tcx> Canonicalizer<'a, 'tcx> {
     }
 }
 impl TypeFolder for Canonicalizer<'_, '_> {
+    fn fold_flags(&self) -> Option<TypeFlags> { Some(TypeFlags::NEEDS_CANONICAL) }
     fn fold_const(&mut self, tys: &Types, ct: Const, depth: DebruijnIndex) -> Const {
+        if tys.const_flags(ct).0 & TypeFlags::NEEDS_CANONICAL.bits() == 0 { return ct; }
         let ct = self.delegate.shallow_resolve_const(ct);
         let kind = match tys.const_kind(ct) {
             ConstKind::Infer(InferConst::Var(vid)) => {
@@ -181,6 +178,10 @@ impl TypeFolder for Canonicalizer<'_, '_> {
     }
 
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: DebruijnIndex) -> TyId {
+        if !tys.flags(ty).intersects(TypeFlags::NEEDS_CANONICAL) {
+            crate::solver_work::count(crate::solver_work::CANON_TY_SKIPPED);
+            return ty;
+        }
         let ty = self.delegate.shallow_resolve(ty);
         if let Some(&value) = self.state.cache.get(&(ty, depth)) { return value; }
         let kind = match *tys.kind(ty) {
@@ -241,40 +242,50 @@ impl TypeFolder for Canonicalizer<'_, '_> {
 
 
 pub fn canonicalize_goal(infcx: &InferCtxt<'_>, goal: &Goal, opaque_types: &[(OpaqueTypeKey, TyId)], typing_mode: TypingMode) -> (Vec<GenericArg>, CanonicalQueryInput) {
-    let tys = &infcx.tcx.tys;
+    crate::solver_work::count(crate::solver_work::CANON_GOALS);
+    let tcx = infcx.tcx;
+    let tys = &tcx.tys;
     let mut c = Canonicalizer::new(infcx, CanonicalizeMode::Input { in_param_env: true });
-    let mut resolved = Vec::with_capacity(goal.param_env.clauses.len());
-    let mut resolver = DeepVariableResolver { infcx };
-    let mut has_infer = HasNonRegionInfer(false);
-    for clause in &*goal.param_env.clauses {
-        let clause = fold_predicate(tys, clause, &mut resolver);
-        fold_predicate(tys, &clause, &mut has_infer);
-        resolved.push(clause);
+    let mut resolved = goal.param_env;
+    if tcx.param_env_flags(resolved) & TypeFlags::HAS_ANY_INFER.bits() != 0 {
+        crate::solver_work::add(crate::solver_work::ENV_RESOLVE_CLAUSES, tcx.param_env_by_id(resolved).clauses.len() as u64);
+        resolved = super::fold::fold_param_env(tcx, resolved, &mut DeepVariableResolver { infcx });
     }
-    let resolved = ParamEnv { clauses: resolved.into() };
-    let cached = if has_infer.0 { None } else {
-        infcx.tcx.canonical_param_env_cache.lock().unwrap().get(&resolved).cloned()
-    };
-    let param_env = if let Some(entry) = cached {
+    let flags = tcx.param_env_flags(resolved);
+    let param_env = if flags & TypeFlags::NEEDS_CANONICAL.bits() == 0 {
+        crate::solver_work::count(crate::solver_work::CANON_ENV_SKIPPED);
+        resolved
+    } else if flags & TypeFlags::HAS_NON_REGION_INFER.bits() == 0 {
+        // rustc canonicalizer.rs: only type/const inference depends on the caller's
+        // universes. Resolved region variables can use the environment's cell.
+        let cell = tcx.canonical_param_env(resolved);
+        if cell.get().is_none() {
+            crate::solver_work::add(crate::solver_work::ENV_CANON_CLAUSES, tcx.param_env_by_id(resolved).clauses.len() as u64);
+            let param_env = super::fold::fold_param_env(tcx, resolved, &mut c);
+            let entry = CanonicalParamEnvCacheEntry {
+                param_env,
+                variables: std::mem::take(&mut c.state.variables),
+                var_kinds: std::mem::take(&mut c.state.var_kinds),
+                variable_lookup_table: std::mem::take(&mut c.state.variable_lookup_table),
+            };
+            // Compute without holding a lock. Races produce the same deterministic entry.
+            let _ = cell.set(entry);
+        }
+        let entry = cell.get().unwrap();
         c.state.variables.extend_from_slice(&entry.variables);
         c.state.var_kinds.extend_from_slice(&entry.var_kinds);
-        c.state.variable_lookup_table.extend(entry.variable_lookup_table);
+        c.state.variable_lookup_table.extend(entry.variable_lookup_table.iter().map(|(&k, &v)| (k, v)));
         entry.param_env
     } else {
-        let mut clauses = Vec::with_capacity(resolved.clauses.len());
-        for clause in &*resolved.clauses { clauses.push(fold_predicate(tys, clause, &mut c)); }
-        let param_env = ParamEnv { clauses: clauses.into() };
-        if !has_infer.0 {
-            infcx.tcx.canonical_param_env_cache.lock().unwrap().insert(resolved, CanonicalParamEnvCacheEntry {
-                param_env: param_env.clone(), variables: c.state.variables.clone(), var_kinds: c.state.var_kinds.clone(),
-                variable_lookup_table: c.state.variable_lookup_table.clone(),
-            });
-        }
-        param_env
+        crate::solver_work::add(crate::solver_work::ENV_CANON_CLAUSES, tcx.param_env_by_id(resolved).clauses.len() as u64);
+        super::fold::fold_param_env(tcx, resolved, &mut c)
     };
     c.state.cache.clear();
     c.mode = CanonicalizeMode::Input { in_param_env: false };
-    let predicate = fold_predicate(tys, &goal.predicate, &mut c);
+    let predicate = if goal.predicate.flags(tys) & TypeFlags::NEEDS_CANONICAL.bits() == 0 {
+        crate::solver_work::count(crate::solver_work::CANON_PRED_SKIPPED);
+        goal.predicate.clone()
+    } else { fold_predicate(tys, &goal.predicate, &mut c) };
     let mut predefined_opaques_in_body = Vec::with_capacity(opaque_types.len());
     for (key, ty) in opaque_types {
         let mut args = Vec::with_capacity(key.args.len());
@@ -326,6 +337,7 @@ pub fn instantiate_canonical_vars(infcx: &InferCtxt<'_>, max_universe: UniverseI
 
 struct CanonicalInstantiator<'a> { values: &'a [GenericArg] }
 impl TypeFolder for CanonicalInstantiator<'_> {
+    fn fold_flags(&self) -> Option<TypeFlags> { Some(TypeFlags::HAS_BOUND_VARS) }
     fn fold_const(&mut self, tys: &Types, ct: Const, depth: DebruijnIndex) -> Const {
         match tys.const_kind(ct) {
             ConstKind::Bound(d, bound) if d == depth => {
@@ -338,6 +350,7 @@ impl TypeFolder for CanonicalInstantiator<'_> {
     }
 
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: DebruijnIndex) -> TyId {
+        if !tys.has_vars_bound_at_or_above(ty, depth) { return ty; }
         match *tys.kind(ty) {
             TyKind::Bound(d, bound) if d == depth => {
                 let GenericArg::Type(ty) = self.values[bound.var.0 as usize] else { panic!("canonical type kind") };
@@ -383,10 +396,10 @@ impl TypeFolder for Shift {
 }
 
 
-pub fn instantiate_query_input(tys: &Types, input: &QueryInput, values: &[GenericArg]) -> QueryInput {
+pub fn instantiate_query_input(tcx: &crate::tcx::Tcx, input: &QueryInput, values: &[GenericArg]) -> QueryInput {
+    let tys = &tcx.tys;
     let mut f = CanonicalInstantiator { values };
-    let mut clauses = Vec::with_capacity(input.goal.param_env.clauses.len());
-    for p in &*input.goal.param_env.clauses { clauses.push(fold_predicate(tys, p, &mut f)); }
+    let param_env = super::fold::fold_param_env(tcx, input.goal.param_env, &mut f);
     let predicate = fold_predicate(tys, &input.goal.predicate, &mut f);
     let mut predefined_opaques_in_body = Vec::with_capacity(input.predefined_opaques_in_body.len());
     for (key, ty) in &input.predefined_opaques_in_body {
@@ -394,20 +407,21 @@ pub fn instantiate_query_input(tys: &Types, input: &QueryInput, values: &[Generi
         for &arg in &*key.args { args.push(super::fold::fold_arg(tys, arg, &mut f, 0)); }
         predefined_opaques_in_body.push((OpaqueTypeKey { def_id: key.def_id, args: args.into() }, f.fold_ty(tys, *ty, 0)));
     }
-    QueryInput { goal: Goal { param_env: ParamEnv { clauses: clauses.into() }, predicate }, predefined_opaques_in_body }
+    QueryInput { goal: Goal { param_env, predicate }, predefined_opaques_in_body }
 }
 
 #[cfg(test)]
 mod tests;
 
 // canonical/mod.rs:556-613: proof states retain all query-local variable identities.
-fn fold_state(tys: &Types, state: &super::inspect::State, folder: &mut dyn TypeFolder) -> super::inspect::State {
+fn fold_state(tcx: &crate::tcx::Tcx, state: &super::inspect::State, folder: &mut dyn TypeFolder) -> super::inspect::State {
+    let tys = &tcx.tys;
     use super::inspect::{State, StateData};
     let mut var_values = Vec::with_capacity(state.var_values.len());
     for &arg in &state.var_values { var_values.push(super::fold::fold_arg(tys, arg, folder, 0)); }
     let data = match &state.data {
         StateData::Unit => StateData::Unit,
-        StateData::Goal(g) => StateData::Goal(super::fold::fold_goal(tys, g, folder)),
+        StateData::Goal(g) => StateData::Goal(super::fold::fold_goal(tcx, g, folder)),
         StateData::Args(args) => {
             let mut values = Vec::with_capacity(args.len());
             for &arg in args { values.push(super::fold::fold_arg(tys, arg, folder, 0)); }
@@ -418,9 +432,9 @@ fn fold_state(tys: &Types, state: &super::inspect::State, folder: &mut dyn TypeF
 }
 pub fn make_canonical_state(infcx: &InferCtxt<'_>, values: &[GenericArg], universe: UniverseIndex, data: super::inspect::StateData) -> super::inspect::CanonicalState {
     let state = super::inspect::State { var_values: values.to_vec(), data };
-    let state = fold_state(&infcx.tcx.tys, &state, &mut DeepVariableResolver { infcx });
+    let state = fold_state(infcx.tcx, &state, &mut DeepVariableResolver { infcx });
     let mut c = Canonicalizer::new(infcx, CanonicalizeMode::Response { max_input_universe: universe });
-    let value = fold_state(&infcx.tcx.tys, &state, &mut c);
+    let value = fold_state(infcx.tcx, &state, &mut c);
     let (max_universe, _, var_kinds) = c.finalize(); Canonical { value, max_universe, var_kinds }
 }
 pub fn instantiate_canonical_state(infcx: &InferCtxt<'_>, prog: &crate::program::Program, previous: UniverseIndex, original: &mut Vec<GenericArg>, state: &super::inspect::CanonicalState) -> super::inspect::StateData {
@@ -435,7 +449,7 @@ pub fn instantiate_canonical_state(infcx: &InferCtxt<'_>, prog: &crate::program:
     }
     let response = Canonical { value: Response { var_values: state.value.var_values.clone(), certainty: Certainty::Yes, external_constraints: Default::default() }, max_universe: state.max_universe, var_kinds: state.var_kinds.clone() };
     let values = response::compute_query_response_instantiation_values_in_universe(infcx, original, &response, previous);
-    let state = fold_state(&infcx.tcx.tys, &state.value, &mut CanonicalInstantiator { values: &values });
+    let state = fold_state(infcx.tcx, &state.value, &mut CanonicalInstantiator { values: &values });
     crate::infer::relate::relate_args(&mut response::ResponseRelating { infcx, prog }, original, &state.var_values).expect("invalid canonical state");
     state.data
 }

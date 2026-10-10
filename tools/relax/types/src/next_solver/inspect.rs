@@ -123,7 +123,7 @@ pub struct InspectCandidate<'a, 'tcx> {
 }
 impl<'a, 'tcx> InspectGoal<'a, 'tcx> {
     pub fn new(infcx: &'a InferCtxt<'tcx>, prog: &'a crate::program::Program, root: GoalEvaluation) -> Self {
-        Self { infcx, prog, prev_universe: infcx.universe(), goal: fold::fold_goal(&infcx.tcx.tys, &root.uncanonicalized_goal, &mut crate::infer::resolve::DeepVariableResolver::new(infcx)), orig_values: root.orig_values,
+        Self { infcx, prog, prev_universe: infcx.universe(), goal: fold::fold_goal(infcx.tcx, &root.uncanonicalized_goal, &mut crate::infer::resolve::DeepVariableResolver::new(infcx)), orig_values: root.orig_values,
             final_revision: root.final_revision, result: root.result.map(|r| r.value.certainty) }
     }
     fn candidates_recur(&'a self, candidates: &mut Vec<InspectCandidate<'a, 'tcx>>, steps: &mut Vec<&'a ProbeStep>, probe: &'a Probe) {

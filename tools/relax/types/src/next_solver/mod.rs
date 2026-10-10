@@ -3,6 +3,7 @@
 // ported from N:rustc_type_ir/src/predicate_kind.rs @8d1a764
 use crate::consts::{AliasConst, Const, GenericArg};
 use crate::program::DefId;
+pub use crate::tcx::ParamEnvId;
 use std::sync::Arc;
 pub mod canonical;
 pub mod fold;
@@ -11,8 +12,15 @@ use typing_mode::{NoSolutionOrRerunNonErased, QueryResultOrRerunNonErased, Acces
 pub mod response;
 pub use response::*;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ParamEnv { pub clauses: Arc<[Predicate]> }
+impl std::hash::Hash for ParamEnv {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        crate::solver_work::count(crate::solver_work::ENV_HASHES);
+        crate::solver_work::add(crate::solver_work::ENV_HASH_CLAUSES, self.clauses.len() as u64);
+        std::hash::Hash::hash(&self.clauses, state);
+    }
+}
 use crate::types::{RegionId, TyId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -71,11 +79,43 @@ pub enum BoundVariableKind { Ty, Region(crate::types::BoundRegionKind), Const }
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Predicate { pub kind: PredicateKind, pub bound_vars: Arc<[BoundVariableKind]> }
 impl Predicate {
+    /// rustc_type_ir/flags.rs: aggregate the cached flags of each predicate child.
+    pub(crate) fn flags(&self, tys: &crate::types::Types) -> u32 {
+        fn arg(tys: &crate::types::Types, a: GenericArg) -> u32 {
+            match a {
+                GenericArg::Type(t) => tys.flags(t).bits(),
+                GenericArg::Const(c) => tys.const_flags(c).0,
+                GenericArg::Lifetime(r) => tys.region_flags(r),
+            }
+        }
+        let term = |t: Term| match t { Term::Ty(t) => tys.flags(t).bits(), Term::Const(c) => tys.const_flags(c).0 };
+        let alias = |a: &AliasTerm| match a {
+            AliasTerm::Ty(t) => tys.flags(*t).bits(),
+            AliasTerm::Const(a) => a.args.iter().fold(0, |flags, a| flags | arg(tys, *a)),
+        };
+        match &self.kind {
+            PredicateKind::Clause(c) => match c {
+                ClauseKind::Trait(t) => t.trait_ref.args.iter().fold(0, |flags, a| flags | arg(tys, *a)),
+                ClauseKind::Projection(p) => alias(&p.projection_term) | term(p.term),
+                ClauseKind::RegionOutlives(a, b) => tys.region_flags(*a) | tys.region_flags(*b),
+                ClauseKind::TypeOutlives(t, r) => tys.flags(*t).bits() | tys.region_flags(*r),
+                ClauseKind::WellFormed(t) => term(*t),
+                ClauseKind::ConstEvaluatable(c) => tys.const_flags(*c).0,
+                ClauseKind::ConstArgHasType(c, t) => tys.const_flags(*c).0 | tys.flags(*t).bits(),
+            },
+            PredicateKind::Subtype(p) => tys.flags(p.a).bits() | tys.flags(p.b).bits(),
+            PredicateKind::Coerce(p) => tys.flags(p.a).bits() | tys.flags(p.b).bits(),
+            PredicateKind::ConstEquate(a, b) => tys.const_flags(*a).0 | tys.const_flags(*b).0,
+            PredicateKind::NormalizesTo(p) => alias(&p.alias) | term(p.term),
+            PredicateKind::DynCompatible(_) | PredicateKind::Ambiguous => 0,
+        }
+    }
+
     pub fn dummy(kind: PredicateKind) -> Self { Self { kind, bound_vars: Arc::from([]) } }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Goal { pub param_env: ParamEnv, pub predicate: Predicate }
+pub struct Goal { pub param_env: ParamEnvId, pub predicate: Predicate }
 
 pub mod delegate;
 

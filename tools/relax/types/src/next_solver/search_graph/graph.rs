@@ -428,6 +428,7 @@ impl SearchGraph {
         lower_available_depth: LowerAvailableDepth,
         inspect: &mut crate::next_solver::inspect::ProofTreeBuilder,
     ) -> u32 {
+        crate::solver_work::count(crate::solver_work::SEARCH_GOALS);
         crate::preempt::point();
         let available_depth = match self.stack.last() {
             None => self.config.recursion_limit,

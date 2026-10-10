@@ -18,7 +18,7 @@ fn named(prog: &Program, name: &str) -> DefId { prog.defs.iter().enumerate().fin
 #[test]
 fn round11_impl_candidates_and_nested_projection() {
     let (p, t) = program("trait Marker {} impl Marker for u32 {} trait Iter { type Item; } impl Iter for u32 { type Item = u32; } trait Outer { type Item; } impl<T: Iter> Outer for T where T::Item: Marker { type Item = T::Item; }", "projection");
-    let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default()); let env = ParamEnv::default();
+    let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default()); let env = ParamEnvId::EMPTY;
     let marker = named(&p, "Marker");
     for (ty, yes) in [(t.tys.u32_, true), (t.tys.bool_, false)] {
         let r = infcx.evaluate_root_goal(&p, Goal { param_env: env.clone(), predicate: collect::trait_predicate(marker, vec![GenericArg::Type(ty)]) }, None);
@@ -37,13 +37,13 @@ fn round11_projection_keeps_full_lifetime_arguments() {
     let s = t.tys.intern(TyKind::Adt(named(&p,"S"), vec![], crate::types::RegionArgsId::EMPTY));
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p,"Out") }, &[GenericArg::Type(s), GenericArg::Lifetime(a)]);
     let mut ocx = fulfill::ObligationCtxt::new(&infcx,&p);
-    assert_eq!(ocx.deeply_normalize_ty(&ParamEnv::default(), alias).unwrap(), t.tys.intern(TyKind::Ref(false,t.tys.u32_,a)));
+    assert_eq!(ocx.deeply_normalize_ty(&ParamEnvId::EMPTY, alias).unwrap(), t.tys.intern(TyKind::Ref(false,t.tys.u32_,a)));
 }
 #[test]
 fn round11_param_env_projection_is_rigid_without_equality_bound() {
     let (p,t) = program("trait Tr { type Out; }", "rigid");
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default()); let param = t.tys.intern(TyKind::Param(0));
-    let env = ParamEnv { clauses: vec![collect::trait_predicate(named(&p,"Tr"),vec![GenericArg::Type(param)])].into() };
+    let env = t.intern_param_env(ParamEnv { clauses: vec![collect::trait_predicate(named(&p,"Tr"),vec![GenericArg::Type(param)])].into() });
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p,"Out") }, &[GenericArg::Type(param)]);
     let mut ocx = fulfill::ObligationCtxt::new(&infcx,&p); let value = ocx.deeply_normalize_ty(&env,alias).unwrap();
     assert!(matches!(t.tys.kind(value), TyKind::Alias(crate::consts::IsRigid::Yes,_)));
@@ -55,7 +55,7 @@ fn round11_implied_wf_bounds_supply_generic_outlives() {
     let a = t.tys.intern_region(RegionKind::ReEarlyParam(0)); let param = t.tys.intern(TyKind::Param(0));
     let input = t.tys.intern(TyKind::Ref(false,param,a));
     infcx.register_ty_outlives(param,a);
-    assert!(infcx.resolve_regions(&p,ParamEnv::default(),&[input]).is_empty());
+    assert!(infcx.resolve_regions(&p,ParamEnvId::EMPTY,&[input]).is_empty());
 }
 #[test]
 fn round33_implied_bounds_failure_drops_only_that_type() {
@@ -66,11 +66,11 @@ fn round33_implied_bounds_failure_drops_only_that_type() {
     let a = t.tys.intern_region(RegionKind::ReEarlyParam(0)); let param = t.tys.intern(TyKind::Param(0));
     let input = t.tys.intern(TyKind::Ref(false,param,a));
     let failing = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p,"Out") }, &[GenericArg::Type(t.tys.u8_)]);
-    assert!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnv::default(), failing).is_empty());
-    assert_eq!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnv::default(), input).len(), 1);
-    assert_eq!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnv::default(), t.tys.u32_).len(), 0);
+    assert!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnvId::EMPTY, failing).is_empty());
+    assert_eq!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnvId::EMPTY, input).len(), 1);
+    assert_eq!(implied_outlives_bounds::implied_outlives_bounds(&infcx, &p, &ParamEnvId::EMPTY, t.tys.u32_).len(), 0);
     infcx.register_ty_outlives(param,a);
-    assert!(infcx.resolve_regions(&p,ParamEnv::default(),&[failing, input]).is_empty());
+    assert!(infcx.resolve_regions(&p,ParamEnvId::EMPTY,&[failing, input]).is_empty());
 }
 #[test]
 fn round11_rpitit_rejects_e0477_and_accepts_declared_outlives() {
@@ -111,7 +111,7 @@ fn round11_rpitit_full_signature_checks_function_header() {
 #[test]
 fn round12_global_cache_replays_reads_and_invalidates_with_revision() {
     let (p, mut t) = program("trait Marker {} impl Marker for u32 {}", "global_cache");
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p,"Marker"),vec![GenericArg::Type(t.tys.u32_)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p,"Marker"),vec![GenericArg::Type(t.tys.u32_)]) };
     let node = {
         let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
         let (r, node) = t.queries.engine.with_anon_task(&mut || infcx.evaluate_root_goal(&p, goal.clone(), None));
@@ -132,7 +132,7 @@ fn round12_erased_opaque_rerun_preserves_owner_scope() {
     let (p,t) = program("trait Marker {} impl Marker for bool {} fn f() -> impl Marker { true }", "erased_opaque");
     let opaque = p.defs.iter().position(|d| d.kind == crate::program::DefKind::OpaqueTy).map(|i| DefId(i as u32)).unwrap();
     let alias = t.alias_ty_with_args(AliasTyKind::Opaque { def_id: opaque }, &[]);
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(t.tys.bool_) }))) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(t.tys.bool_) }))) };
     for owns in [false,true,false] {
         let owners = t.intern_defining_opaques(if owns { vec![opaque] } else { vec![] });
         let infcx = InferCtxt::new(&t, TypingMode::Typeck { defining_opaque_types_and_generators: owners }, Default::default());
@@ -143,7 +143,7 @@ fn round12_erased_opaque_rerun_preserves_owner_scope() {
 #[test]
 fn round12_stalled_fulfillment_wakes_on_type_and_subtype_progress() {
     let (p,t) = program("trait Marker {} impl Marker for bool {}", "stalled");
-    let infcx = InferCtxt::new(&t,TypingMode::PostAnalysis, Default::default()); let env = ParamEnv::default();
+    let infcx = InferCtxt::new(&t,TypingMode::PostAnalysis, Default::default()); let env = ParamEnvId::EMPTY;
     let a = infcx.next_ty_var(); let b = infcx.next_ty_var();
     let goal = Goal { param_env: env.clone(), predicate: collect::trait_predicate(named(&p,"Marker"),vec![GenericArg::Type(a)]) };
     let result = infcx.evaluate_root_goal(&p,goal.clone(),None).unwrap();
@@ -167,7 +167,7 @@ fn round12_structural_unsize_requires_only_tail_parameters() {
     let wrong = t.tys.intern(TyKind::Slice(t.tys.bool_));
     let wrap = |name,ty| t.tys.intern(TyKind::Adt(named(&p,name),vec![ty],crate::types::RegionArgsId::EMPTY));
     for (a,b,yes) in [(array,slice,true),(array,wrong,false),(wrap("Tail",array),wrap("Tail",slice),true),(wrap("Repeated",array),wrap("Repeated",slice),false)] {
-        let goal = Goal { param_env:ParamEnv::default(),predicate:collect::trait_predicate(named(&p,"Unsize"),vec![GenericArg::Type(a),GenericArg::Type(b)]) };
+        let goal = Goal { param_env:ParamEnvId::EMPTY,predicate:collect::trait_predicate(named(&p,"Unsize"),vec![GenericArg::Type(a),GenericArg::Type(b)]) };
         assert_eq!(infcx.evaluate_root_goal(&p,goal,None).is_ok_and(|r| r.certainty.is_yes()),yes);
     }
 }
@@ -182,7 +182,7 @@ fn round12_coherence_distinguishes_upstream_downstream_and_local_ownership() {
     let unknown=infcx.next_ty_var();
     for (ty,expected) in [(t.tys.bool_,Err(coherence::Conflict::Upstream)),(local_ty,Ok(())),(container,Err(coherence::Conflict::Upstream)),(unknown,Err(coherence::Conflict::Downstream))] {
         let tr=TraitRef { def_id:named(&p,"Foreign"),args:vec![GenericArg::Type(ty),GenericArg::Type(t.tys.bool_)] };
-        let actual=infcx.enter_root(&p,|ecx| coherence::trait_ref_is_knowable(ecx,&ParamEnv::default(),&tr,1)).unwrap();
+        let actual=infcx.enter_root(&p,|ecx| coherence::trait_ref_is_knowable(ecx,&ParamEnvId::EMPTY,&tr,1)).unwrap();
         assert_eq!(actual,expected);
     }
     let tr=TraitRef { def_id:named(&p,"Foreign"),args:vec![GenericArg::Type(unknown),GenericArg::Type(local_ty)] };
@@ -242,7 +242,7 @@ fn round12_unsize_to_object_and_supertrait_upcast() {
     let make_dyn=|name| t.tys.intern(TyKind::Dyn(named(&p,name),vec![].into(),vec![].into(),crate::types::RegionArgsId::EMPTY,t.tys.intern_region(RegionKind::ReStatic),0,vec![].into()));
     let parent=make_dyn("Parent"); let child=make_dyn("Child");
     for (a,b,yes) in [(t.tys.u32_,child,true),(child,parent,true),(parent,child,false),(t.tys.bool_,child,false)] {
-        let goal=Goal { param_env:ParamEnv::default(),predicate:collect::trait_predicate(named(&p,"Unsize"),vec![GenericArg::Type(a),GenericArg::Type(b)]) };
+        let goal=Goal { param_env:ParamEnvId::EMPTY,predicate:collect::trait_predicate(named(&p,"Unsize"),vec![GenericArg::Type(a),GenericArg::Type(b)]) };
         assert_eq!(infcx.evaluate_root_goal(&p,goal,None).is_ok_and(|r| r.certainty.is_yes()),yes);
     }
 }
@@ -266,7 +266,7 @@ fn closure_uses_minimum_capture_types() {
     assert_eq!(layout.fields.len(), 1);
     assert_ne!(layout.fields[0], t.tys.u32_);
     let infcx = InferCtxt::new(&t,TypingMode::PostAnalysis, Default::default());
-    let goal = |ty| Goal { param_env:ParamEnv::default(),predicate:collect::trait_predicate(named(&p,"Auto"),vec![GenericArg::Type(ty)]) };
+    let goal = |ty| Goal { param_env:ParamEnvId::EMPTY,predicate:collect::trait_predicate(named(&p,"Auto"),vec![GenericArg::Type(ty)]) };
     assert!(infcx.evaluate_root_goal(&p,goal(semantic),None).unwrap().certainty.is_yes());
     let result = infcx.evaluate_root_goal(&p,goal(closure),None);
     assert!(result.is_ok_and(|r| r.certainty.is_yes()),"native closure auto trait must use minimum captures");
@@ -280,7 +280,7 @@ fn closure_kind_and_captures_change_canonical_input() {
     let kind = infcx.next_ty_var(); let upvars = infcx.next_ty_var();
     let sig = t.tys.intern(TyKind::FnPtr(vec![],t.tys.unit,crate::types::FnHeader::RUST,0));
     let closure = t.tys.intern(TyKind::Closure(0,0,crate::types::ClosureArgs { parent_args:owner, closure_kind_ty:kind, closure_sig_as_fn_ptr_ty:sig, tupled_upvars_ty:upvars }));
-    let env = ParamEnv::default();
+    let env = ParamEnvId::EMPTY;
     let call = Goal { param_env:env.clone(), predicate:collect::trait_predicate(named(&p,"Call"),vec![GenericArg::Type(closure), GenericArg::Type(t.tys.unit)]) };
     let auto = Goal { param_env:env.clone(), predicate:collect::trait_predicate(named(&p,"Auto"),vec![GenericArg::Type(closure)]) };
     let before_call = infcx.evaluate_root_goal(&p,call.clone(),None).unwrap();
@@ -307,7 +307,7 @@ fn closure_clone_requires_captured_places_not_storage_roots() {
     let storage = crate::layout::ClosureStorage::new(&t,&body,expr);
     assert!(matches!(t.tys.kind(storage.fields[0]),TyKind::Adt(d,..) if *d == named(&p,"Pair")));
     let infcx = InferCtxt::new(&t,TypingMode::PostAnalysis, Default::default());
-    let goal = |ty| Goal { param_env:ParamEnv::default(), predicate:collect::trait_predicate(named(&p,"Clone"),vec![GenericArg::Type(ty)]) };
+    let goal = |ty| Goal { param_env:ParamEnvId::EMPTY, predicate:collect::trait_predicate(named(&p,"Clone"),vec![GenericArg::Type(ty)]) };
     assert!(infcx.evaluate_root_goal(&p,goal(closure),None).unwrap().certainty.is_yes());
     assert!(infcx.evaluate_root_goal(&p,goal(storage.fields[0]),None).is_err());
 }
@@ -346,7 +346,7 @@ fn round15_sizedness_uses_definition_constraints() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     for (arg, yes) in [(t.tys.u32_,true), (t.tys.intern(TyKind::Slice(t.tys.u8_)),false)] {
         let ty = t.tys.intern(TyKind::Adt(named(&p,"Nested"),vec![arg],crate::types::RegionArgsId::EMPTY));
-        let result = infcx.evaluate_root_goal(&p,Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p,"Sized"),vec![GenericArg::Type(ty)]) },None);
+        let result = infcx.evaluate_root_goal(&p,Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p,"Sized"),vec![GenericArg::Type(ty)]) },None);
         assert_eq!(result.is_ok_and(|r|r.certainty.is_yes()),yes);
     }
 }
@@ -384,7 +384,7 @@ fn round15_normalization_defers_failed_projections_to_fulfillment() {
     let infcx = InferCtxt::new(&t,TypingMode::PostAnalysis, Default::default());
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p,"Out") }, &[GenericArg::Type(t.tys.u32_)]);
     let mut ocx = fulfill::ObligationCtxt::new(&infcx,&p);
-    let ty = ocx.normalize_ty(&ParamEnv::default(),alias);
+    let ty = ocx.normalize_ty(&ParamEnvId::EMPTY,alias);
     assert!(matches!(t.tys.kind(ty),TyKind::Infer(_)));
     assert!(ocx.engine.has_pending_obligations());
     assert!(ocx.evaluate_obligations_error_on_ambiguity().is_err());
@@ -398,7 +398,7 @@ fn round15_failed_higher_ranked_normalization_keeps_bound_alias() {
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p,"Out") }, &[GenericArg::Type(t.tys.u32_),GenericArg::Lifetime(region)]);
     let sig = t.tys.intern(TyKind::FnPtr(vec![],alias,crate::types::FnHeader::RUST,1));
     let mut ocx = fulfill::ObligationCtxt::new(&infcx,&p);
-    assert_eq!(ocx.normalize_ty(&ParamEnv::default(),sig),sig);
+    assert_eq!(ocx.normalize_ty(&ParamEnvId::EMPTY,sig),sig);
     assert_eq!(ocx.engine.pending_obligations().len(),1);
     assert!(ocx.evaluate_obligations_error_on_ambiguity().is_err());
 }
@@ -409,7 +409,7 @@ fn round16_selection_replays_impl_args_after_cached_evaluation() {
     let (p, t) = program("trait Marker {} impl Marker for bool {} struct Wrap<T>(T); trait Trait {} impl<T: Marker> Trait for Wrap<T> {}", "select_cached");
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let ty = t.tys.intern(TyKind::Adt(named(&p, "Wrap"), vec![t.tys.bool_], crate::types::RegionArgsId::EMPTY));
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
     assert!(infcx.evaluate_root_goal(&p, goal.clone(), None).unwrap().certainty.is_yes());
     for _ in 0..2 {
         let selected = infcx.select_in_new_trait_solver(&p, goal.clone()).unwrap().unwrap();
@@ -427,7 +427,7 @@ fn round16_selection_preserves_lifetime_and_const_impl_args() {
     let lifetime = t.tys.intern_region(RegionKind::ReStatic);
     let ct = t.tys.const_usize(7);
     let ty = t.tys.intern(TyKind::Adt(named(&p, "Wrap"), vec![t.tys.bool_, t.tys.intern(TyKind::Const(ct))], t.tys.intern_region_args(&[lifetime])));
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
     let select::ImplSource::UserDefined { args, .. } = infcx.select_in_new_trait_solver(&p, goal).unwrap().unwrap() else { panic!("impl candidate expected") };
     assert_eq!(args, vec![GenericArg::Lifetime(lifetime), GenericArg::Type(t.tys.bool_), GenericArg::Const(ct)]);
 }
@@ -438,10 +438,10 @@ fn round16_selection_retains_nested_ambiguity_and_rejects_failed_candidate() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let var = infcx.next_ty_var();
     let ty = t.tys.intern(TyKind::Adt(named(&p, "Wrap"), vec![var], crate::types::RegionArgsId::EMPTY));
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(ty)]) };
     let select::ImplSource::UserDefined { args, nested, .. } = infcx.select_in_new_trait_solver(&p, goal.clone()).unwrap().unwrap() else { panic!("impl candidate expected") };
     assert_eq!(args.len(), 1); assert!(!nested.is_empty());
-    infcx.at(&p, ParamEnv::default()).eq(var, t.tys.u32_).unwrap();
+    infcx.at(&p, ParamEnvId::EMPTY).eq(var, t.tys.u32_).unwrap();
     assert!(infcx.select_in_new_trait_solver(&p, goal).is_err());
     assert_eq!(infcx.num_open_snapshots(), 0);
 }
@@ -452,10 +452,10 @@ fn round16_selection_unknown_self_is_ambiguous_and_proof_cache_invalidates() {
     let tr = named(&p, "Trait");
     {
         let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
-        let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(tr, vec![GenericArg::Type(infcx.next_ty_var())]) };
+        let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(tr, vec![GenericArg::Type(infcx.next_ty_var())]) };
         assert!(infcx.select_in_new_trait_solver(&p, goal).unwrap().is_none());
     }
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(tr, vec![GenericArg::Type(t.tys.bool_)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(tr, vec![GenericArg::Type(t.tys.bool_)]) };
     let engine = &t.queries.engine;
     let (_, first) = engine.with_anon_task(&mut || assert!(InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default()).select_in_new_trait_solver(&p, goal.clone()).unwrap().is_some()));
     let (_, hit) = engine.with_anon_task(&mut || assert!(InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default()).select_in_new_trait_solver(&p, goal.clone()).unwrap().is_some()));
@@ -471,7 +471,7 @@ fn round16_selection_alias_self_and_global_bound_precedence() {
     let assoc = named(&p, "Item"); let marker = named(&p, "Marker");
     let ty = t.alias_ty_with_args(AliasTyKind::Projection { def_id: assoc }, &[GenericArg::Type(t.tys.bool_)]);
     let bound = collect::trait_predicate(marker, vec![GenericArg::Type(t.tys.u32_)]);
-    let goal = Goal { param_env: ParamEnv { clauses: vec![bound].into() }, predicate: collect::trait_predicate(marker, vec![GenericArg::Type(ty)]) };
+    let goal = Goal { param_env: t.intern_param_env(ParamEnv { clauses: vec![bound].into() }), predicate: collect::trait_predicate(marker, vec![GenericArg::Type(ty)]) };
     assert!(matches!(infcx.select_in_new_trait_solver(&p, goal).unwrap(), Some(select::ImplSource::UserDefined { .. })));
 }
 
@@ -480,10 +480,10 @@ fn round16_selection_ambiguous_impls_do_not_choose_one() {
     let (p, t) = program("trait Trait<T> {} impl Trait<bool> for u32 {} impl Trait<u32> for u32 {}", "select_multi");
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let var = infcx.next_ty_var();
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(t.tys.u32_), GenericArg::Type(var)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "Trait"), vec![GenericArg::Type(t.tys.u32_), GenericArg::Type(var)]) };
     assert!(infcx.select_in_new_trait_solver(&p, goal.clone()).unwrap().is_none());
     assert_eq!(infcx.shallow_resolve(var), var);
-    infcx.at(&p, ParamEnv::default()).eq(var, t.tys.bool_).unwrap();
+    infcx.at(&p, ParamEnvId::EMPTY).eq(var, t.tys.bool_).unwrap();
     assert!(matches!(infcx.select_in_new_trait_solver(&p, goal).unwrap(), Some(select::ImplSource::UserDefined { .. })));
 }
 
@@ -559,7 +559,7 @@ fn round17_property_query_preserves_uncertainty_and_rolls_back() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let variable = infcx.next_ty_var();
     let tr = |ty| TraitRef { def_id: named(&p, "Outer"), args: vec![GenericArg::Type(ty)] };
-    assert_eq!(infcx.type_implements_trait(&p, ParamEnv::default(), tr(variable)), EvaluatedToAmbig);
+    assert_eq!(infcx.type_implements_trait(&p, ParamEnvId::EMPTY, tr(variable)), EvaluatedToAmbig);
     assert_eq!(infcx.shallow_resolve(variable), variable);
     for (element, expected) in [(t.tys.u32_, true), (t.tys.bool_, false)] {
         let array = t.tys.intern(TyKind::Array(element, t.tys.const_usize(2)));
@@ -579,7 +579,7 @@ fn round17_normalization_retains_constraints_for_borrowck() {
     let projection = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Out") }, &[GenericArg::Type(input), GenericArg::Lifetime(b)]);
     infcx.probe(|snapshot| {
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, &p);
-        let result = ocx.deeply_normalize_ty(&ParamEnv::default(), projection).unwrap();
+        let result = ocx.deeply_normalize_ty(&ParamEnvId::EMPTY, projection).unwrap();
         assert_eq!(result, t.tys.intern(TyKind::Ref(false, t.tys.u32_, b)));
         assert!(infcx.region_constraints_added_in_snapshot(snapshot));
     });
@@ -642,7 +642,7 @@ fn n01c_fully_perform_op_converts_normalization_outlives_for_region_inference() 
     let input = t.tys.intern(TyKind::Ref(false, t.tys.u32_, a));
     let projection = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Out") }, &[GenericArg::Type(input), GenericArg::Lifetime(b)]);
     let mut constraints = MirTypeckRegionConstraints::new(0);
-    let op = ParamEnvAnd { param_env: ParamEnv::default(), value: Normalize { value: projection } };
+    let op = ParamEnvAnd { param_env: ParamEnvId::EMPTY, value: Normalize { value: projection } };
     let span = Span { file: 0, lo: 1, hi: 2 };
     let output = fully_perform_op_raw(&infcx, &universal_regions, &[], &[], &mut constraints, Locations::All(crate::mir::Span { file: 0, lo: span.lo, hi: span.hi }), span, ConstraintCategory::Internal, op).unwrap();
     assert_eq!(output, t.tys.unit);
@@ -969,11 +969,11 @@ fn round28_at_failure_rollback_is_owned_by_caller() {
     let var = infcx.next_ty_var();
     let a = t.tys.intern(TyKind::Tuple(vec![var, t.tys.bool_]));
     let b = t.tys.intern(TyKind::Tuple(vec![t.tys.u32_, t.tys.u32_]));
-    assert!(infcx.at(&p, ParamEnv::default()).eq(a, b).is_err());
+    assert!(infcx.at(&p, ParamEnvId::EMPTY).eq(a, b).is_err());
     assert_eq!(infcx.shallow_resolve(var), t.tys.u32_);
     let var = infcx.next_ty_var();
     let a = t.tys.intern(TyKind::Tuple(vec![var, t.tys.bool_]));
-    assert!(infcx.commit_if_ok(|_| infcx.at(&p, ParamEnv::default()).eq(a, b)).is_err());
+    assert!(infcx.commit_if_ok(|_| infcx.at(&p, ParamEnvId::EMPTY).eq(a, b)).is_err());
     assert_eq!(infcx.shallow_resolve(var), var);
 }
 
@@ -1026,7 +1026,7 @@ fn round28_sizedness_rejects_foreign_and_infinite_tail() {
     let foreign = t.tys.intern(TyKind::Foreign(named(&p, "Foreign")));
     let infinite = t.tys.intern(TyKind::Adt(named(&p, "Infinite"), vec![], crate::types::RegionArgsId::EMPTY));
     for ty in [foreign, infinite] { for item in ["Sized", "MetaSized"] {
-        let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, item), vec![GenericArg::Type(ty)]) };
+        let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, item), vec![GenericArg::Type(ty)]) };
         assert!(infcx.evaluate_root_goal(&p, goal, None).is_err());
     } }
 }
@@ -1037,7 +1037,7 @@ fn round28_wf_normalization_keeps_original_alias() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Out") }, &[GenericArg::Type(t.tys.u32_)]);
     let predicate = Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(alias))));
-    let (normalized, goals) = infcx.normalize_predicate(&p, &ParamEnv::default(), &predicate);
+    let (normalized, goals) = infcx.normalize_predicate(&p, &ParamEnvId::EMPTY, &predicate);
     assert_eq!(normalized, predicate);
     assert!(goals.is_empty());
 }
@@ -1046,7 +1046,7 @@ fn round28_wf_normalization_keeps_original_alias() {
 fn round28_builtin_metadata_and_discriminant() {
     let (p, t) = program("#[lang = \"pointee_trait\"] trait Pointee { #[lang = \"metadata_type\"] type Metadata; } #[lang = \"discriminant_kind\"] trait DiscriminantKind { #[lang = \"discriminant_type\"] type Discriminant; } #[lang = \"destruct\"] trait Destruct {} #[repr(u16)] enum E { A, B }", "r28_builtins");
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
-    let env = ParamEnv::default();
+    let env = ParamEnvId::EMPTY;
     let e = t.tys.intern(TyKind::Adt(named(&p, "E"), vec![], crate::types::RegionArgsId::EMPTY));
     for (name, ty, expected) in [("Metadata", t.tys.u32_, t.tys.unit), ("Metadata", t.tys.intern(TyKind::Slice(t.tys.u8_)), t.tys.usize_), ("Discriminant", t.tys.bool_, t.tys.u8_), ("Discriminant", e, t.tys.prim(crate::program::Prim::U16))] {
         let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, name) }, &[GenericArg::Type(ty)]);
@@ -1076,7 +1076,7 @@ fn round28_lifetime_only_param_env_is_not_global() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let lifetime = t.tys.intern_region(RegionKind::ReEarlyParam(0));
     let predicate = collect::trait_predicate(named(&p, "Tr"), vec![GenericArg::Type(t.tys.u32_), GenericArg::Lifetime(lifetime)]);
-    let goal = Goal { param_env: ParamEnv { clauses: vec![predicate.clone()].into() }, predicate };
+    let goal = Goal { param_env: t.intern_param_env(ParamEnv { clauses: vec![predicate.clone()].into() }), predicate };
     let tree = infcx.evaluate_root_goal_for_proof_tree(&p, goal);
     let inspect = inspect::InspectGoal::new(&infcx, &p, tree);
     assert!(inspect.candidates().iter().any(|c| matches!(c.kind, inspect::ProbeKind::TraitCandidate { source: assembly::CandidateSource::ParamEnv(false), .. })));
@@ -1088,10 +1088,10 @@ fn round28_projection_assumption_requires_item_where_clause() {
     let infcx = InferCtxt::new(&t, TypingMode::PostAnalysis, Default::default());
     let x = t.tys.intern(TyKind::Adt(named(&p, "X"), vec![], crate::types::RegionArgsId::EMPTY));
     let alias = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "A") }, &[GenericArg::Type(x)]);
-    let env = ParamEnv { clauses: vec![
+    let env = t.intern_param_env(ParamEnv { clauses: vec![
         collect::trait_predicate(named(&p, "G"), vec![GenericArg::Type(x)]),
         Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(t.tys.u32_) }))),
-    ].into() };
+    ].into() });
     let goal = Goal { param_env: env, predicate: Predicate::dummy(PredicateKind::NormalizesTo(NormalizesTo { alias: AliasTerm::Ty(alias), term: Term::Ty(t.tys.u32_) })) };
     assert!(infcx.evaluate_root_goal(&p, goal, None).is_err());
 }
@@ -1104,7 +1104,7 @@ fn round28_coherence_unknowable_candidate_proves_supertraits() {
     let x = t.tys.intern(TyKind::Adt(named(&p, "X"), vec![], crate::types::RegionArgsId::EMPTY));
     let mut infcx = InferCtxt::new(&t, TypingMode::Coherence, Default::default());
     infcx.coherence_crate = Some(1);
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "Foreign"), vec![GenericArg::Type(x)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "Foreign"), vec![GenericArg::Type(x)]) };
     assert!(infcx.evaluate_root_goal(&p, goal, None).is_err());
 }
 
@@ -1144,7 +1144,7 @@ fn round29_recursion_limit_belongs_to_analysis_owner() {
     let high = InferCtxt::for_item(&t, &p, TypingMode::non_body_analysis(), named(&p, "high"));
     let low = InferCtxt::for_item(&t, &p, TypingMode::non_body_analysis(), named(&p, "low"));
     assert_eq!(high.recursion_limit(&p), 64); assert_eq!(low.recursion_limit(&p), 1);
-    let goal = Goal { param_env: ParamEnv::default(), predicate: collect::trait_predicate(named(&p, "A"), vec![GenericArg::Type(t.tys.u32_)]) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: collect::trait_predicate(named(&p, "A"), vec![GenericArg::Type(t.tys.u32_)]) };
     assert!(high.evaluate_root_goal(&p, goal.clone(), None).unwrap().certainty.is_yes());
     assert!(low.evaluate_root_goal(&p, goal.clone(), None).unwrap().certainty.is_overflow(), "deep cached proof cannot bypass owner's depth limit");
     assert!(low.evaluate_root_goal_for_proof_tree(&p, goal.clone()).result.unwrap().value.certainty.is_overflow());
@@ -1160,7 +1160,7 @@ fn round29_missing_projection_definition_is_error_or_rigid_unsized() {
         let self_ty = if is_unsized { t.tys.str_ } else { t.tys.u32_ };
         let ty = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Out") }, &[GenericArg::Type(self_ty)]);
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, &p);
-        let normalized = ocx.deeply_normalize_ty(&ParamEnv::default(), ty).unwrap();
+        let normalized = ocx.deeply_normalize_ty(&ParamEnvId::EMPTY, ty).unwrap();
         if is_unsized {
             assert!(matches!(t.tys.kind(normalized), TyKind::Alias(crate::consts::IsRigid::Yes, _)));
             assert!(infcx.errors.drain_reported().0.is_empty());
@@ -1239,7 +1239,7 @@ fn round32_solver_cache_taints_roots_and_flushes_delayed_once() {
         let infcx = InferCtxt::for_item(&tcx, &prog, TypingMode::PostAnalysis, named(&prog, owner));
         assert!(!infcx.tainted_by_errors());
         let mut ocx = fulfill::ObligationCtxt::new(&infcx, &prog);
-        assert_eq!(ocx.deeply_normalize_ty(&ParamEnv::default(), alias).unwrap(), tcx.tys.error);
+        assert_eq!(ocx.deeply_normalize_ty(&ParamEnvId::EMPTY, alias).unwrap(), tcx.tys.error);
         assert!(infcx.tainted_by_errors(), "{owner}: cached error type must taint its consumer");
         assert_eq!(tcx.dcx.err_count(), 0);
     }
@@ -1324,23 +1324,23 @@ fn round37_method_query_retains_parameters_and_snapshots_assignments() {
     let param = tcx.tys.intern(TyKind::Param(0));
     let error_region = tcx.tys.intern_region(RegionKind::ReError);
     let error_ref = tcx.tys.intern(TyKind::Ref(false, param, error_region));
-    let (err_goal, _) = canonicalize_method_autoderef_goal(&infcx, ParamEnv::default(), error_ref);
+    let (err_goal, _) = canonicalize_method_autoderef_goal(&infcx, ParamEnvId::EMPTY, error_ref);
     assert_eq!(err_goal.value.self_ty, error_ref);
     let receiver = tcx.tys.intern(TyKind::Tuple(vec![param, var]));
-    let (goal, original) = canonicalize_method_autoderef_goal(&infcx, ParamEnv::default(), receiver);
+    let (goal, original) = canonicalize_method_autoderef_goal(&infcx, ParamEnvId::EMPTY, receiver);
     let query = InferCtxt::new(&tcx, TypingMode::non_body_analysis(), Default::default());
     let (goal, values) = instantiate_method_autoderef_goal(&query, &goal);
     let TyKind::Tuple(parts) = tcx.tys.kind(goal.self_ty) else { panic!() };
     assert_eq!(parts[0], param);
     let previous = query.inner.borrow_mut().opaque_types().num_entries();
     let before = make_query_response_ignoring_pending_obligations(&query, &values, goal.self_ty, previous);
-    query.at(&prog, ParamEnv::default()).eq(parts[1], tcx.tys.u32_).unwrap();
+    query.at(&prog, ParamEnvId::EMPTY).eq(parts[1], tcx.tys.u32_).unwrap();
     let after = make_query_response_ignoring_pending_obligations(&query, &values, goal.self_ty, previous);
-    let (ty, goals) = probe_instantiate_query_response(&infcx, &prog, &ParamEnv::default(), &original, &before).unwrap();
+    let (ty, goals) = probe_instantiate_query_response(&infcx, &prog, &ParamEnvId::EMPTY, &original, &before).unwrap();
     assert!(goals.is_empty());
     assert!(tcx.tys.has_infer(infcx.deeply_resolve_ignoring_regions(ty)));
     assert!(tcx.tys.has_infer(infcx.shallow_resolve(var)));
-    let (ty, _) = probe_instantiate_query_response(&infcx, &prog, &ParamEnv::default(), &original, &after).unwrap();
+    let (ty, _) = probe_instantiate_query_response(&infcx, &prog, &ParamEnvId::EMPTY, &original, &after).unwrap();
     assert_eq!(infcx.deeply_resolve_ignoring_regions(ty), tcx.tys.intern(TyKind::Tuple(vec![param, tcx.tys.u32_])));
 }
 

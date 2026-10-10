@@ -65,6 +65,7 @@ pub struct QueryEngine {
     revision: u64,
     state: Mutex<State>,
     task_reads: Mutex<Vec<TaskReads>>,
+    empty_anon: std::sync::OnceLock<DepNodeIndex>,
     /// Input nodes as read (index, fingerprint): every query reads inputs, and taking `state`
     /// for each read serialised the parallel `relax check`. Inputs change only through
     /// `set_input` (`&mut self`), which clears this.
@@ -79,7 +80,7 @@ impl Default for QueryEngine {
 
 impl QueryEngine {
     pub fn new() -> Self {
-        Self { id: next_id(), revision: 1, state: Mutex::new(State::default()), task_reads: Mutex::new(Vec::new()), inputs: Default::default() }
+        Self { id: next_id(), revision: 1, state: Mutex::new(State::default()), task_reads: Mutex::new(Vec::new()), empty_anon: Default::default(), inputs: Default::default() }
     }
 
     pub fn revision(&self) -> u64 {
@@ -173,14 +174,26 @@ impl QueryEngine {
     /// graph.rs:347-365,405-481: retain the task's ordered reads and record
     /// its node in the caller. Cached consumers must call read_index again.
     pub fn with_anon_task<R>(&self, op: &mut dyn FnMut() -> R) -> (R, DepNodeIndex) {
+        crate::solver_work::count(crate::solver_work::ANON_TASKS);
         let frame = TaskDeps::new(self.id, dep_graph::current_job(self.id), true);
         let task = TaskGuard::enter(&frame, &self.task_reads);
         let result = op();
         let mut index = None;
         task.with_reads(&mut |reads| {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            index = Some(state.graph.intern_anon(self.revision, reads));
-            while state.jobs.len() < state.graph.nodes.len() { state.jobs.push(QueryJob::default()); }
+            // rustc_middle dep_graph/graph.rs: zero/single-read tasks reuse a node.
+            // intern_anon already gives the empty set revision-independent identity.
+            let intern = || {
+                crate::solver_work::count(crate::solver_work::ANON_LOCKS);
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let index = state.graph.intern_anon(self.revision, reads);
+                while state.jobs.len() < state.graph.nodes.len() { state.jobs.push(QueryJob::default()); }
+                index
+            };
+            index = Some(match reads {
+                [only] => DepNodeIndex(*only),
+                [] => *self.empty_anon.get_or_init(intern),
+                _ => intern(),
+            });
         });
         drop(task);
         let index = index.unwrap();

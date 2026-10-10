@@ -118,7 +118,7 @@ fn round31_array_length_uses_const_query() {
 fn round15_anon_const_expected_type_reaches_evaluation_and_solver() {
     use relax_front::def_collector::NodeId;
     use crate::consts::{ConstKind, IsRigid};
-    use crate::next_solver::{AliasTerm, Goal, ParamEnv, Predicate, PredicateKind, ClauseKind, ProjectionClause, Term};
+    use crate::next_solver::{AliasTerm, Goal, ParamEnvId, Predicate, PredicateKind, ClauseKind, ProjectionClause, Term};
     let (prog,tcx) = program(b"struct S<const B: bool>; fn owner() { let _: S<{true}>; }");
     let def = named(&prog,"owner");
     let (file,expr) = prog.node_id_to_def_id.iter().find_map(|(&(file,node),_)| match node { NodeId::AnonConst(e) => Some((file,e)), _ => None }).unwrap();
@@ -129,7 +129,7 @@ fn round15_anon_const_expected_type_reaches_evaluation_and_solver() {
     assert_eq!(leaf(tcx.const_eval_resolve(&prog,TypingEnv::fully_monomorphized(&prog),alias.kind.def_id(),&alias.args),1),Ok(1));
     let infcx = crate::infer::InferCtxt::new(&tcx,crate::tcx::TypingMode::PostAnalysis, Default::default());
     let result = infcx.next_const_var();
-    assert!(infcx.evaluate_root_goal(&prog,Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Const(alias),term: Term::Const(result) }))) },None).unwrap().certainty.is_yes());
+    assert!(infcx.evaluate_root_goal(&prog,Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Const(alias),term: Term::Const(result) }))) },None).unwrap().certainty.is_yes());
     let ConstKind::Value(value) = tcx.tys.const_kind(infcx.shallow_resolve_const(result)) else { panic!() };
     assert_eq!(value.ty,tcx.tys.bool_);
 }

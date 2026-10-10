@@ -4,7 +4,7 @@
 // suggestion probes, import provenance and private-candidate notes are debloated.
 use super::*;
 use crate::consts::GenericArg;
-use crate::next_solver::{ClausePolarity, ParamEnv};
+use crate::next_solver::{ClausePolarity, ParamEnvId};
 use crate::next_solver::fulfill::ObligationCtxt;
 use crate::next_solver::canonical::{Canonical, method_response::{self, QueryResponse}};
 
@@ -66,7 +66,7 @@ fn method_autoderef_steps(fcx: &Fcx<'_>, receiver: TyId) -> (Vec<CandidateStep>,
 }
 /// rustc_hir_analysis/src/autoderef.rs:149-202. Pending normalization goals
 /// belong to the deref query; confirmation records the chosen adjustments.
-fn overloaded_deref_ty(infcx: &crate::infer::InferCtxt<'_>, prog: &Program, env: &ParamEnv, ty: TyId) -> Option<TyId> {
+fn overloaded_deref_ty(infcx: &crate::infer::InferCtxt<'_>, prog: &Program, env: &ParamEnvId, ty: TyId) -> Option<TyId> {
     let tcx = infcx.tcx;
     let td = tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
     let target = tcx.lang_items.get(crate::lang_items::LangItem::DerefTarget)?;
@@ -129,7 +129,7 @@ impl Fcx<'_> {
             match self.tcx.tys.kind(ty) {
                 TyKind::Param(_) => {
                     let mut clauses = Vec::new();
-                    for p in self.param_env.clauses.iter() {
+                    for p in self.tcx.param_env_by_id(self.param_env).clauses.iter() {
                         if let PredicateKind::Clause(ClauseKind::Trait(tr)) = &p.kind {
                             if tr.trait_ref.args.first() == Some(&GenericArg::Type(ty)) { clauses.push(p.clone()); }
                         }
@@ -232,7 +232,7 @@ impl Fcx<'_> {
         } else { self.infcx.instantiate_binder_with_infer(raw) };
         let TyKind::FnPtr(ps, ret, _, _) = self.tcx.tys.kind(raw) else { unreachable!() };
         let xform_self_ty = ocx.normalize_ty(&self.param_env, ps[0]);
-        let goals = self.infcx.at(self.prog, self.param_env.clone()).sub(receiver, xform_self_ty).ok()?;
+        let goals = self.infcx.at(self.prog, self.param_env).sub(receiver, xform_self_ty).ok()?;
         ocx.register_obligations(goals);
         let mut trait_goal = None;
         match &candidate.kind {
@@ -241,11 +241,11 @@ impl Fcx<'_> {
                 for p in self.tcx.clauses_of(self.prog, *imp) {
                     let p = self.tcx.instantiate_predicate(self.prog, *imp, &parent_args, &p);
                     let p = ocx.normalize_predicate(&self.param_env, &p);
-                    ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: p });
+                    ocx.register_obligation(Goal { param_env: self.param_env, predicate: p });
                 }
             }
             CandidateKind::TraitCandidate(_) => {
-                let goal = Goal { param_env: self.param_env.clone(), predicate: crate::next_solver::collect::trait_predicate(parent, parent_args) };
+                let goal = Goal { param_env: self.param_env, predicate: crate::next_solver::collect::trait_predicate(parent, parent_args) };
                 trait_goal = Some(goal.clone()); ocx.register_obligation(goal);
             }
             _ => {}

@@ -16,7 +16,7 @@ macro_rules! eprintln {
     ($($arg:tt)*) => { if !crate::diag::enabled() { std::eprintln!($($arg)*); } };
 }
 
-use relax_types::next_solver::{Goal, ParamEnv};
+use relax_types::next_solver::{Goal, ParamEnvId};
 use crate::jit::{self, FnKey, Unit};
 use crate::program::DefKind;
 
@@ -145,7 +145,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             let infcx = relax_types::infer::InferCtxt::new(&u.tcx, crate::tcx::TypingMode::PostAnalysis, crate::tcx::TypingEnv::fully_monomorphized(&u.prog).limit);
 
             u.tcx.clauses_of(&u.prog, owner.owner).into_iter().any(|predicate| {
-                !infcx.evaluate_obligation(&u.prog, Goal { param_env: ParamEnv::default(), predicate }).may_apply()
+                !infcx.evaluate_obligation(&u.prog, Goal { param_env: ParamEnvId::EMPTY, predicate }).may_apply()
             })
         };
         fns.push((owner, generic || in_trait || impossible));

@@ -9,7 +9,7 @@ use crate::lang_items::LangItem;
 use crate::program::NO_DEF;
 
 impl EvalCtxt<'_, '_> {
-    pub(super) fn consider_structural_builtin_unsize_candidates(&mut self, env: &ParamEnv, tr: &TraitRef, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn consider_structural_builtin_unsize_candidates(&mut self, env: &ParamEnvId, tr: &TraitRef, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         let GenericArg::Type(a) = tr.args[0] else { unreachable!() };
         let GenericArg::Type(b) = tr.args[1] else { unreachable!() };
         let result = self.probe().enter_with_kind(|ecx| {
@@ -76,7 +76,7 @@ impl EvalCtxt<'_, '_> {
         if let Ok(results) = map_err_to_rerun(result)? { candidates.extend(results); }
         Ok(())
     }
-    fn consider_builtin_upcast_to_principal(&mut self, env: &ParamEnv, a: TyId, b: TyId, source_bounds: &[Predicate], principal: Option<&Predicate>) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_upcast_to_principal(&mut self, env: &ParamEnvId, a: TyId, b: TyId, source_bounds: &[Predicate], principal: Option<&Predicate>) -> QueryResultOrRerunNonErased {
         let tcx = self.delegate.tcx;
         let TyKind::Dyn(_,_,_,_,ar,..) = tcx.tys.kind(a) else { unreachable!() };
         let TyKind::Dyn(_,_,_,_,br,..) = tcx.tys.kind(b) else { unreachable!() };

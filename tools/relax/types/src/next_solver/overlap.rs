@@ -22,11 +22,11 @@ fn equate_impl_headers(infcx: &InferCtxt<'_>, prog: &Program, a: &ImplHeader, b:
     match (&a.trait_ref,&b.trait_ref) {
         (Some(a),Some(b)) => {
             if a.def_id!=b.def_id { return None; }
-            let mut relation=SolverRelating::new(infcx,prog,V::Inv,ParamEnv::default());
+            let mut relation=SolverRelating::new(infcx,prog,V::Inv,ParamEnvId::EMPTY);
             relate_args(&mut relation,&a.args,&b.args).ok()?;
             Some(relation.goals)
         }
-        (None,None) => infcx.at(prog,ParamEnv::default()).eq(a.self_ty,b.self_ty).ok(),
+        (None,None) => infcx.at(prog,ParamEnvId::EMPTY).eq(a.self_ty,b.self_ty).ok(),
         _ => panic!("mismatched impl kinds"),
     }
 }
@@ -70,7 +70,7 @@ pub fn overlapping_impls(tcx: &Tcx, prog: &Program, a: DefId, b: DefId, krate: u
     let a=fresh_impl_header(&infcx,prog,a,is_trait);
     let b=fresh_impl_header(&infcx,prog,b,is_trait);
     let mut goals=equate_impl_headers(&infcx,prog,&a,&b)?;
-    for p in a.predicates.into_iter().chain(b.predicates) { goals.push(Goal { param_env: ParamEnv::default(), predicate:p }); }
+    for p in a.predicates.into_iter().chain(b.predicates) { goals.push(Goal { param_env: ParamEnvId::default(), predicate:p }); }
     let overflowing_predicates=impl_intersection_has_impossible_obligation(&infcx,prog,&goals)?;
     infcx.leak_check(UniverseIndex::ROOT,None).ok()?;
     // The overlap header, placeholder note and intercrate proof-tree visitor only

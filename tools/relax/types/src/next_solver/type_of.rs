@@ -60,6 +60,7 @@ impl Tcx {
 
         let env = super::param_env::normalize_param_env_or_error(
             self, prog, ParamEnv { clauses: clauses.into() }, infcx.cause);
+        let env = self.intern_param_env(env);
         let mut ocx = ObligationCtxt::new(&infcx, prog);
         for p in self.own_clauses_of(prog, method) { let p = ocx.normalize_predicate(&env, &p); ocx.register_obligation(Goal { param_env: env.clone(), predicate: p }); }
         let impl_fn = self.tys.intern(TyKind::FnPtr(impl_sig.params.clone(), impl_sig.ret, impl_sig.header, impl_sig.bound_regions));
@@ -114,7 +115,7 @@ impl Tcx {
         Ok(result)
     }
 }
-struct ImplTraitInTraitCollector<'a, 'b, 'tcx> { ocx: &'a mut ObligationCtxt<'b, 'tcx>, env: &'a ParamEnv, types: Vec<(DefId, TyId, Vec<GenericArg>)> }
+struct ImplTraitInTraitCollector<'a, 'b, 'tcx> { ocx: &'a mut ObligationCtxt<'b, 'tcx>, env: &'a ParamEnvId, types: Vec<(DefId, TyId, Vec<GenericArg>)> }
 impl TypeFolder for ImplTraitInTraitCollector<'_, '_, '_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         let tcx = self.ocx.infcx.tcx;

@@ -177,7 +177,7 @@ fn do_normalize_clauses(tcx: &Tcx, prog: &Program, cause: ObligationCause, elabo
     let mut rigid_bounds = Vec::new();
     for p in &*elaborated_env.clauses { rigid_bounds.push(fold::fold_predicate(&tcx.tys, p, &mut Rigidness { types_rigid: true, opaques_only: false })); }
     set_projection_term_to_non_rigid(&tcx.tys, &mut rigid_bounds);
-    let elaborated_env = ParamEnv { clauses: rigid_bounds.into() };
+    let elaborated_env = tcx.intern_param_env(ParamEnv { clauses: rigid_bounds.into() });
     let mut ocx = ObligationCtxt::new(&infcx, prog);
     let mut normalized = Vec::new();
     for p in clauses { normalized.push(ocx.normalize_predicate(&elaborated_env, &p)); }
@@ -188,7 +188,7 @@ fn do_normalize_clauses(tcx: &Tcx, prog: &Program, cause: ObligationCause, elabo
         normalized = replace_infer_and_non_rigid_alias_with_error(&infcx, normalized, false);
     }
     // There are no assumed WF types here; this cannot fail to build the outlives env.
-    let _ = infcx.resolve_regions(prog, ParamEnv { clauses: normalized.clone().into() }, &[]);
+    let _ = infcx.resolve_regions(prog, tcx.intern_param_env(ParamEnv { clauses: normalized.clone().into() }), &[]);
     match infcx.deeply_resolve_clauses_via_region_graph(&normalized) {
         Ok(clauses) => clauses,
         Err(error) => {

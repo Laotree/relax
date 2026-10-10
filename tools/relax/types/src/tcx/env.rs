@@ -27,6 +27,8 @@ struct Entry {
     data: Data,
     hash: u64,
     next: u32,
+    flags: u32,
+    canonical: std::sync::OnceLock<crate::next_solver::canonical::CanonicalParamEnvCacheEntry>,
 }
 
 const CHUNK: usize = 256;
@@ -44,7 +46,8 @@ pub(super) struct Envs {
     locks: Box<[Mutex<()>]>,
 }
 
-// Entries never move or change after publication and are freed only with their Tcx.
+// Entries never move; published data and flags are immutable. The canonical cell
+// synchronizes its own initialization. All entries are freed only with their Tcx.
 unsafe impl Send for Envs {}
 unsafe impl Sync for Envs {}
 
@@ -57,7 +60,7 @@ impl Envs {
         for _ in 0..BUCKETS { buckets.push(AtomicU32::new(0)); }
         for _ in 0..LOCKS { locks.push(Mutex::new(())); }
         let envs = Self { chunks: chunks.into_boxed_slice(), len: AtomicU32::new(0), grow: Mutex::new(()), buckets: buckets.into_boxed_slice(), locks: locks.into_boxed_slice() };
-        assert_eq!(envs.intern(Data::Predicates(ParamEnv::default())), 0);
+        assert_eq!(envs.intern(Data::Predicates(ParamEnv::default()), None), 0);
         envs
     }
 
@@ -79,12 +82,17 @@ impl Envs {
         None
     }
 
-    fn intern(&self, data: Data) -> u32 {
+    fn intern(&self, data: Data, tys: Option<&crate::types::Types>) -> u32 {
         let mut hasher = crate::fxhash::FxHasher::default();
         data.hash(&mut hasher);
         let hash = hasher.finish();
         let bucket = (hash >> 52) as usize;
         if let Some(id) = self.find(self.buckets[bucket].load(Acquire), hash, &data) { return id; }
+        // Compute before taking the interner locks: const flags may read the const table.
+        let flags = match (&data, tys) {
+            (Data::Predicates(env), Some(tys)) => env.clauses.iter().fold(0, |flags, p| flags | p.flags(tys)),
+            _ => 0,
+        };
         let _lock = self.locks[bucket % LOCKS].lock().unwrap_or_else(|e| e.into_inner());
         let head = self.buckets[bucket].load(Acquire);
         if let Some(id) = self.find(head, hash, &data) { return id; }
@@ -98,7 +106,7 @@ impl Envs {
             if chunk.is_null() { std::alloc::handle_alloc_error(layout); }
             self.chunks[i / CHUNK].store(chunk, Release);
         }
-        unsafe { chunk.add(i % CHUNK).write(Entry { data, hash, next: head }); }
+        unsafe { chunk.add(i % CHUNK).write(Entry { data, hash, next: head, flags, canonical: Default::default() }); }
         self.len.store(i as u32 + 1, Release);
         self.buckets[bucket].store(i as u32 + 1, Release);
         i as u32
@@ -141,7 +149,7 @@ impl Tcx {
     pub fn intern_param_env(&self, env: ParamEnv) -> ParamEnvId {
         crate::solver_work::count(crate::solver_work::ENV_INTERNS);
         if env.clauses.is_empty() { return ParamEnvId::EMPTY; }
-        ParamEnvId(self.envs.intern(Data::Predicates(env)))
+        ParamEnvId(self.envs.intern(Data::Predicates(env), Some(&self.tys)))
     }
 
     #[inline]
@@ -152,9 +160,16 @@ impl Tcx {
         }
     }
 
+    pub(crate) fn param_env_flags(&self, id: ParamEnvId) -> u32 { self.envs.entry(id.0).flags }
+
+    /// One canonicalization cell per interned key; no second map or global lock.
+    pub(crate) fn canonical_param_env(&self, id: ParamEnvId) -> &std::sync::OnceLock<crate::next_solver::canonical::CanonicalParamEnvCacheEntry> {
+        &self.envs.entry(id.0).canonical
+    }
+
     pub fn intern_defining_opaques(&self, owners: Vec<DefId>) -> DefiningOpaquesId {
         if owners.is_empty() { return DefiningOpaquesId::default(); }
-        DefiningOpaquesId(self.envs.intern(Data::Owners(owners)))
+        DefiningOpaquesId(self.envs.intern(Data::Owners(owners), None))
     }
 
     pub fn defining_opaques(&self, id: DefiningOpaquesId) -> &[DefId] {

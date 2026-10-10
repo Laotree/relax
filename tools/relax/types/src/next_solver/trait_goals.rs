@@ -6,7 +6,7 @@ use crate::lang_items::LangItem;
 use crate::types::{TyKind, AliasTyKind};
 use crate::consts::IsRigid;
 impl EvalCtxt<'_, '_> {
-    pub(super) fn assemble_builtin_impl_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn assemble_builtin_impl_candidates(&mut self, env: &ParamEnvId, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         if matches!(self.delegate.typing_mode, crate::tcx::TypingMode::Reflection) { return Ok(()); }
         if matches!(goal, GoalKind::Trait(TraitClause { polarity: ClausePolarity::Negative, .. })) { return Ok(()); }
         let tcx = self.delegate.tcx; let tr = goal.trait_ref(self); let ty = goal.self_ty(self);
@@ -85,7 +85,7 @@ impl EvalCtxt<'_, '_> {
         Ok(())
     }
     /// trait_goals.rs:355-391 / normalizes_to.rs:533-572.
-    fn consider_builtin_fn_trait_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, tr: &TraitRef, ty: TyId, goal_kind: crate::upvar::ClosureKind) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_fn_trait_candidates(&mut self, env: &ParamEnvId, goal: &GoalKind, tr: &TraitRef, ty: TyId, goal_kind: crate::upvar::ClosureKind) -> QueryResultOrRerunNonErased {
         let tcx = self.delegate.tcx;
         let Some(sig) = structural_traits::extract_tupled_inputs_and_output_from_callable(self, ty, goal_kind)? else { return self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS); };
         let sig = self.delegate.instantiate_binder_with_infer(sig);
@@ -98,7 +98,7 @@ impl EvalCtxt<'_, '_> {
     /// trait_goals.rs:393-441 / normalizes_to.rs:574-656. For closures
     /// returning futures, the environment region does not change the future type;
     /// the lending CoroutineClosure arm remains EXCEPTION(M7).
-    fn consider_builtin_async_fn_trait_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, tr: &TraitRef, ty: TyId, goal_kind: crate::upvar::ClosureKind) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_async_fn_trait_candidates(&mut self, env: &ParamEnvId, goal: &GoalKind, tr: &TraitRef, ty: TyId, goal_kind: crate::upvar::ClosureKind) -> QueryResultOrRerunNonErased {
         let tcx = self.delegate.tcx;
         let (sig, nested) = structural_traits::extract_tupled_inputs_and_output_from_async_callable(self, ty, goal_kind)?;
         let sig = self.delegate.instantiate_binder_with_infer(sig);
@@ -128,7 +128,7 @@ impl EvalCtxt<'_, '_> {
     }
     /// trait_goals.rs:498-520 / normalizes_to.rs:819-845: async coroutines implement
     /// `Future` with their return type as `Output`.
-    fn consider_builtin_future_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_future_candidate(&mut self, env: &ParamEnvId, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
         let tcx = self.delegate.tcx;
         if !tcx.is_coroutine(ty) { return Err(NoSolution.into()); }
         if let GoalKind::NormalizesTo(p) = goal {
@@ -138,14 +138,14 @@ impl EvalCtxt<'_, '_> {
         }
         self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
-    pub(super) fn add_trait_goal(&mut self, env: &ParamEnv, def: crate::program::DefId, ty: TyId) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn add_trait_goal(&mut self, env: &ParamEnvId, def: crate::program::DefId, ty: TyId) -> Result<(), NoSolutionOrRerunNonErased> {
         self.add_goal(GoalSource::ImplWhereBound, Goal { param_env: env.clone(), predicate: collect::trait_predicate(def, vec![GenericArg::Type(ty)]) })
     }
 }
 
 impl EvalCtxt<'_, '_> {
     /// normalizes_to.rs:712-817: tail metadata, Sized fallback, then rigid alias.
-    fn consider_builtin_pointee_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_pointee_candidate(&mut self, env: &ParamEnvId, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
         let GoalKind::NormalizesTo(p) = goal else { return self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes); };
         let tcx = self.delegate.tcx;
         let metadata = tcx.lang_items.get(LangItem::Metadata).ok_or(NoSolution)?;
@@ -188,7 +188,7 @@ impl EvalCtxt<'_, '_> {
         self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
     /// normalizes_to.rs:979-1037; rustc_middle/src/ty/sty.rs:1710-1761.
-    fn consider_builtin_discriminant_kind_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
+    fn consider_builtin_discriminant_kind_candidate(&mut self, env: &ParamEnvId, goal: &GoalKind, ty: TyId) -> QueryResultOrRerunNonErased {
         if let GoalKind::NormalizesTo(p) = goal {
             let tcx = self.delegate.tcx;
             let value = match tcx.tys.kind(ty) {

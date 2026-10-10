@@ -230,8 +230,6 @@ pub struct Tcx {
     /// where-clauses once the impl is selected (`impl<A, B> PartialEq<Vec<B>> for Vec<A> where
     /// A: PartialEq<B>` fixes an integer literal B from A's impls, rustc's obligation processing)
     pub impl_trait_bounds: ImageMap<DefId, Vec<(u32, DefId, Vec<TyId>)>>,
-    /// Definite selection answers, keyed by the full typing environment.
-    pub(crate) canonical_param_env_cache: std::sync::Mutex<std::collections::HashMap<crate::next_solver::ParamEnv, crate::next_solver::canonical::CanonicalParamEnvCacheEntry>>,
     /// `core::<path>` items typeck asks for by path ("ops:Index:")
     pub core_path_items: crate::conc::MemoMap<String, Option<DefId>>,
     /// async blocks / async fn bodies (file, expr; an async fn body is ASYNC_FN_BODY | block):
@@ -397,7 +395,6 @@ impl Tcx {
             impl_trait_regions: Default::default(),
             alias_tys: Default::default(),
             impl_trait_bounds: Default::default(),
-            canonical_param_env_cache: Default::default(),
             core_path_items: Default::default(),
             lang_items: Default::default(),
             variances: Default::default(),

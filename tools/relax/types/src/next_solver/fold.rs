@@ -55,10 +55,18 @@ pub fn fold_predicate_kind(tys: &Types, predicate: &PredicateKind, f: &mut dyn T
 }
 
 pub fn fold_predicate(tys: &Types, predicate: &Predicate, f: &mut dyn TypeFolder) -> Predicate {
+    if f.fold_flags().is_some_and(|flags| predicate.flags(tys) & flags.bits() == 0) { return predicate.clone(); }
     Predicate { kind: fold_predicate_kind(tys, &predicate.kind, f, 1), bound_vars: predicate.bound_vars.clone() }
 }
 
-pub fn fold_response(tys: &Types, response: &Response, f: &mut dyn TypeFolder) -> Response {
+pub fn fold_param_env(tcx: &crate::tcx::Tcx, env: ParamEnvId, f: &mut dyn TypeFolder) -> ParamEnvId {
+    if f.fold_flags().is_some_and(|flags| tcx.param_env_flags(env) & flags.bits() == 0) { return env; }
+    let clauses = tcx.param_env_by_id(env).clauses.iter().map(|p| fold_predicate(&tcx.tys, p, f)).collect::<Vec<_>>();
+    tcx.intern_param_env(ParamEnv { clauses: clauses.into() })
+}
+
+pub fn fold_response(tcx: &crate::tcx::Tcx, response: &Response, f: &mut dyn TypeFolder) -> Response {
+    let tys = &tcx.tys;
     let mut var_values = Vec::with_capacity(response.var_values.len());
     for &arg in &response.var_values { var_values.push(fold_arg(tys, arg, f, 0)); }
     let mut external_constraints = ExternalConstraintsData::default();
@@ -76,16 +84,11 @@ pub fn fold_response(tys: &Types, response: &Response, f: &mut dyn TypeFolder) -
         external_constraints.opaque_types.push((crate::infer::opaque_types::OpaqueTypeKey { def_id: key.def_id, args: args.into() }, f.fold_ty(tys, *ty, 0)));
     }
     for (source, goal) in &response.external_constraints.normalization_nested_goals {
-        let mut clauses = Vec::with_capacity(goal.param_env.clauses.len());
-        for p in &*goal.param_env.clauses { clauses.push(fold_predicate(tys, p, f)); }
-        external_constraints.normalization_nested_goals.push((*source, Goal {
-            param_env: ParamEnv { clauses: clauses.into() }, predicate: fold_predicate(tys, &goal.predicate, f),
-        }));
+        external_constraints.normalization_nested_goals.push((*source, fold_goal(tcx, goal, f)));
     }
     Response { certainty: response.certainty, var_values, external_constraints }
 }
 
-pub fn fold_goal(tys: &Types, goal: &Goal, f: &mut dyn TypeFolder) -> Goal {
-    let mut clauses = Vec::new(); for p in &*goal.param_env.clauses { clauses.push(fold_predicate(tys, p, f)); }
-    Goal { param_env: ParamEnv { clauses: clauses.into() }, predicate: fold_predicate(tys, &goal.predicate, f) }
+pub fn fold_goal(tcx: &crate::tcx::Tcx, goal: &Goal, f: &mut dyn TypeFolder) -> Goal {
+    Goal { param_env: fold_param_env(tcx, goal.param_env, f), predicate: fold_predicate(&tcx.tys, &goal.predicate, f) }
 }

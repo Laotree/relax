@@ -10,7 +10,7 @@ use crate::infer::outlives::{env::{OutlivesBound, OutlivesEnvironment}, componen
 
 /// implied_outlives_bounds.rs:151-199. NOT PORTED: the bevy_ecs `ParamSet` compatibility hack
 /// (consider_implied_bounds_hack_for_ty, #119956) -- a crate-name special case, left to the lead.
-pub fn query_compute_implied_outlives_bounds(ocx: &mut ObligationCtxt<'_, '_>, env: &ParamEnv, ty: TyId) -> Result<Vec<OutlivesBound>, NoSolution> {
+pub fn query_compute_implied_outlives_bounds(ocx: &mut ObligationCtxt<'_, '_>, env: &ParamEnvId, ty: TyId) -> Result<Vec<OutlivesBound>, NoSolution> {
     let normalized = ocx.deeply_normalize_ty(env, ty)?;
     compute_implied_outlives_bounds_inner(ocx, env, ty, normalized)
 }
@@ -25,7 +25,7 @@ pub fn query_compute_implied_outlives_bounds(ocx: &mut ObligationCtxt<'_, '_>, e
 /// A failing query yields no bounds for this type only (:58-73); bounds with placeholders are
 /// dropped (:76, #109628); the query's fast path for types without lifetimes
 /// (implied_outlives_bounds.rs:22-34) answers `[]`.
-pub fn implied_outlives_bounds(infcx: &crate::infer::InferCtxt<'_>, prog: &crate::program::Program, env: &ParamEnv, ty: TyId) -> Vec<OutlivesBound> {
+pub fn implied_outlives_bounds(infcx: &crate::infer::InferCtxt<'_>, prog: &crate::program::Program, env: &ParamEnvId, ty: TyId) -> Vec<OutlivesBound> {
     let tys = &infcx.tcx.tys;
     let ty = infcx.deeply_resolve_ignoring_regions(ty);
     assert!(!tys.flags(ty).intersects(crate::types::TypeFlags::HAS_TY_INFER), "implied bounds of a type with inference variables");
@@ -47,7 +47,7 @@ pub fn implied_outlives_bounds(infcx: &crate::infer::InferCtxt<'_>, prog: &crate
     });
     bounds
 }
-pub fn compute_implied_outlives_bounds_inner(ocx: &mut ObligationCtxt<'_, '_>, env: &ParamEnv, ty: TyId, normalized: TyId) -> Result<Vec<OutlivesBound>, NoSolution> {
+pub fn compute_implied_outlives_bounds_inner(ocx: &mut ObligationCtxt<'_, '_>, env: &ParamEnvId, ty: TyId, normalized: TyId) -> Result<Vec<OutlivesBound>, NoSolution> {
     let mut checked = crate::fxhash::HashSet::default();
     let mut wf_args = vec![Term::Ty(ty), Term::Ty(normalized)]; let mut result = Vec::new();
     while let Some(arg) = wf_args.pop() {
@@ -77,16 +77,16 @@ pub fn compute_implied_outlives_bounds_inner(ocx: &mut ObligationCtxt<'_, '_>, e
 impl OutlivesEnvironment {
     /// rustc_trait_selection/src/regions.rs (OutlivesEnvironment::new): infallible; each
     /// assumed-WF type contributes whatever bounds its query yields.
-    pub fn new(infcx: &crate::infer::InferCtxt<'_>, prog: &crate::program::Program, param_env: ParamEnv, assumed_wf_tys: &[TyId]) -> Self {
+    pub fn new(infcx: &crate::infer::InferCtxt<'_>, prog: &crate::program::Program, param_env: ParamEnvId, assumed_wf_tys: &[TyId]) -> Self {
         let mut known = Vec::new();
-        for p in &*param_env.clauses { if matches!(p.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(..))) { known.push(p.clone()); } }
+        for p in &*infcx.tcx.param_env_by_id(param_env).clauses { if matches!(p.kind, PredicateKind::Clause(ClauseKind::TypeOutlives(..))) { known.push(p.clone()); } }
         let mut implied = Vec::new();
         for &ty in assumed_wf_tys { implied.extend(implied_outlives_bounds(infcx, prog, &param_env, ty)); }
-        Self::from_normalized_bounds(&infcx.tcx.tys, param_env, known, implied)
+        Self::from_normalized_bounds(&infcx.tcx.tys, infcx.tcx.param_env_by_id(param_env).clone(), known, implied)
     }
 }
 impl crate::infer::InferCtxt<'_> {
-    pub fn resolve_regions(&self, prog: &crate::program::Program, env: ParamEnv, assumed_wf_tys: &[TyId]) -> Vec<crate::infer::lexical_region_resolve::RegionResolutionError> {
+    pub fn resolve_regions(&self, prog: &crate::program::Program, env: ParamEnvId, assumed_wf_tys: &[TyId]) -> Vec<crate::infer::lexical_region_resolve::RegionResolutionError> {
         let outlives = OutlivesEnvironment::new(self, prog, env, assumed_wf_tys);
         self.resolve_regions_with_outlives_env(prog, &outlives)
     }

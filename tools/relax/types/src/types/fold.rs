@@ -23,6 +23,9 @@ impl EarlyBinder {
 /// A structural folder. `depth` counts binders entered since the root value.
 /// Overridden type callbacks can recurse with `super_fold_ty`.
 pub trait TypeFolder {
+    /// Flags this folder needs to visit; None means it must visit every environment.
+    fn fold_flags(&self) -> Option<TypeFlags> { None }
+
     fn fold_const(&mut self, tys: &Types, ct: crate::consts::Const, depth: DebruijnIndex) -> crate::consts::Const {
         super_fold_const(tys, ct, self, depth)
     }

@@ -84,11 +84,11 @@ fn input_round_trip_keeps_lifetime_type_const_and_nested_binder_identity() {
     let sig = tys.intern(TyKind::FnPtr(vec![tys.intern(TyKind::Ref(false, ty, local))], tys.intern(TyKind::Ref(false, ty, outer)), FnHeader::RUST, 1));
     let alias = AliasConst { kind: AliasConstKind::Anon { def_id: DefId(9) }, args: vec![GenericArg::Lifetime(outer), GenericArg::Type(sig), GenericArg::Const(ct)].into() };
     let alias = tys.intern_const(ConstKind::Alias(IsRigid::No, alias));
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(sig), GenericArg::Const(alias)] }, polarity: ClausePolarity::Positive }))) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(sig), GenericArg::Const(alias)] }, polarity: ClausePolarity::Positive }))) };
     let (values, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence);
     assert_eq!(canonical.canonical.max_universe, UniverseIndex::ROOT);
     assert_eq!(values.len(), 3);
-    let input = instantiate_query_input(tys, &canonical.canonical.value, &values);
+    let input = instantiate_query_input(&tcx, &canonical.canonical.value, &values);
     assert_eq!(input.goal, goal);
     assert!(infcx.canonicalizer_state.borrow().variables.is_empty());
     assert_eq!(canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence).1, canonical);
@@ -104,7 +104,7 @@ fn input_parameters_and_free_regions_become_root_placeholders() {
     let ty = tys.intern(TyKind::Param(2));
     let ct = tys.intern_const(ConstKind::Param(ParamConst { index: 3 }));
     let region = tys.intern_region(RegionKind::RePlaceholder { universe, var: BoundVar(7) });
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(ty), GenericArg::Lifetime(region), GenericArg::Const(ct)] }, polarity: ClausePolarity::Positive }))) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(ty), GenericArg::Lifetime(region), GenericArg::Const(ct)] }, polarity: ClausePolarity::Positive }))) };
     let (_, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence);
     assert_eq!(canonical.canonical.var_kinds, vec![
         CanonicalVarKind::PlaceholderTy(PlaceholderType { universe: UniverseIndex::ROOT, bound: BoundVar(0) }),
@@ -121,12 +121,12 @@ fn environment_static_is_preserved_without_poisoning_predicate_cache() {
     let static_ = tys.intern_region(RegionKind::ReStatic);
     let ty = tys.intern(TyKind::Ref(false, tys.u8_, static_));
     let predicate = Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty))));
-    let goal = Goal { param_env: ParamEnv { clauses: vec![predicate.clone()].into() }, predicate: predicate.clone() };
+    let goal = Goal { param_env: tcx.intern_param_env(ParamEnv { clauses: vec![predicate.clone()].into() }), predicate: predicate.clone() };
     let (values, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
-    assert_eq!(canonical.canonical.value.goal.param_env.clauses[0], predicate);
+    assert_eq!(tcx.param_env_by_id(canonical.canonical.value.goal.param_env).clauses[0], predicate);
     assert_ne!(canonical.canonical.value.goal.predicate, predicate);
     assert_eq!(values, vec![GenericArg::Lifetime(static_)]);
-    assert_eq!(instantiate_query_input(tys, &canonical.canonical.value, &values).goal, goal);
+    assert_eq!(instantiate_query_input(&tcx, &canonical.canonical.value, &values).goal, goal);
 }
 
 #[test]
@@ -137,7 +137,7 @@ fn fresh_instantiation_restores_subtype_components_without_equating_them() {
     let b = infcx.next_ty_var();
     let (TyKind::Infer(av), TyKind::Infer(bv)) = (tcx.tys.kind(a), tcx.tys.kind(b)) else { panic!() };
     infcx.inner.borrow_mut().type_variables().sub_unify(*av, *bv);
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Subtype(SubtypePredicate { a_is_expected: true, a, b })) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Subtype(SubtypePredicate { a_is_expected: true, a, b })) };
     let (_, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
     let fresh = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let values = instantiate_canonical_vars(&fresh, canonical.canonical.max_universe, &canonical.canonical.var_kinds);
@@ -174,7 +174,7 @@ fn numeric_variables_keep_their_class_across_canonical_instantiation() {
     infcx.create_next_universe();
     let a = infcx.next_int_var();
     let b = infcx.next_float_var();
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(a), GenericArg::Type(b)] }, polarity: ClausePolarity::Positive }))) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::Trait(TraitClause { trait_ref: TraitRef { def_id: DefId(1), args: vec![GenericArg::Type(a), GenericArg::Type(b)] }, polarity: ClausePolarity::Positive }))) };
     let (_, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence);
     assert_eq!(canonical.canonical.var_kinds, vec![CanonicalVarKind::Int, CanonicalVarKind::Float]);
     let values = instantiate_canonical_vars(&infcx, UniverseIndex::ROOT, &canonical.canonical.var_kinds);
@@ -190,19 +190,23 @@ fn parameter_environment_cache_excludes_non_region_inference_and_reuses_rigid_en
     let infcx = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let param = tcx.tys.intern(TyKind::Param(0));
     let clause = Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(param))));
-    let goal = Goal { param_env: ParamEnv { clauses: vec![clause.clone()].into() }, predicate: clause };
+    let goal = Goal { param_env: tcx.intern_param_env(ParamEnv { clauses: vec![clause.clone()].into() }), predicate: clause };
     let first = canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
     let second = canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
     assert_eq!(first, second);
-    assert_eq!(tcx.canonical_param_env_cache.lock().unwrap().len(), 1);
+    assert!(tcx.canonical_param_env(goal.param_env).get().is_some());
     let var = infcx.next_ty_var();
     let clause = Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(var))));
-    let goal = Goal { param_env: ParamEnv { clauses: vec![clause.clone()].into() }, predicate: clause };
+    let goal = Goal { param_env: tcx.intern_param_env(ParamEnv { clauses: vec![clause.clone()].into() }), predicate: clause };
     canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
-    assert_eq!(tcx.canonical_param_env_cache.lock().unwrap().len(), 1);
+    assert!(tcx.canonical_param_env(goal.param_env).get().is_none());
     infcx.at(&crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())), Default::default()).eq(var, tcx.tys.u8_).unwrap();
-    canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
-    assert_eq!(tcx.canonical_param_env_cache.lock().unwrap().len(), 2);
+    let (_, resolved) = canonicalize_goal(&infcx, &goal, &[], TypingMode::PostAnalysis);
+    // WF(u8) has no canonical variables, so it is returned directly without filling a cell.
+    let env = resolved.canonical.value.goal.param_env;
+    assert_eq!(tcx.param_env_by_id(env).clauses[0],
+        Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(tcx.tys.u8_)))));
+    assert!(tcx.canonical_param_env(env).get().is_none());
 }
 
 #[test]
@@ -213,13 +217,13 @@ fn native_array_lengths_and_nominal_const_slots_round_trip() {
     let ct = infcx.next_const_var();
     let array = tys.mk_array(tys.u8_, ct);
     let nominal = tys.intern(TyKind::Adt(DefId(1), vec![tys.intern(TyKind::Const(ct)), array], crate::types::RegionArgsId::EMPTY));
-    let goal = Goal { param_env: ParamEnv::default(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(nominal)))) };
+    let goal = Goal { param_env: ParamEnvId::EMPTY, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(nominal)))) };
     let (values, canonical) = canonicalize_goal(&infcx, &goal, &[], TypingMode::ErasedNotCoherence);
     assert_eq!(values, vec![GenericArg::Const(ct)]);
-    assert_eq!(instantiate_query_input(tys, &canonical.canonical.value, &values).goal, goal);
+    assert_eq!(instantiate_query_input(&tcx, &canonical.canonical.value, &values).goal, goal);
     let other = InferCtxt::new(&tcx, TypingMode::PostAnalysis, Default::default());
     let fresh = instantiate_canonical_vars(&other, canonical.canonical.max_universe, &canonical.canonical.var_kinds);
-    let input = instantiate_query_input(tys, &canonical.canonical.value, &fresh);
+    let input = instantiate_query_input(&tcx, &canonical.canonical.value, &fresh);
     let PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty))) = input.goal.predicate.kind else { panic!() };
     assert!(tys.has_infer(ty));
 }

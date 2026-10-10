@@ -38,7 +38,7 @@ impl Tcx {
     }
 }
 impl EvalCtxt<'_, '_> {
-    pub(super) fn assemble_object_bound_candidates(&mut self, env: &ParamEnv, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn assemble_object_bound_candidates(&mut self, env: &ParamEnvId, goal: &GoalKind, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx;
         if [crate::lang_items::LangItem::Sized, crate::lang_items::LangItem::MetaSized, crate::lang_items::LangItem::PointeeSized].iter().any(|&item| tcx.lang_items.get(item) == Some(goal.trait_ref(self).def_id)) || matches!(self.delegate.typing_mode, crate::tcx::TypingMode::Reflection) { return Ok(()); }
         let ty = goal.self_ty(self);
@@ -52,7 +52,7 @@ impl EvalCtxt<'_, '_> {
         }
         Ok(())
     }
-    fn probe_and_consider_object_bound_candidate(&mut self, env: &ParamEnv, goal: &GoalKind, p: &Predicate, source: CandidateSource, bounds: &[Predicate], candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    fn probe_and_consider_object_bound_candidate(&mut self, env: &ParamEnvId, goal: &GoalKind, p: &Predicate, source: CandidateSource, bounds: &[Predicate], candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         if !self.assumption_matches_kind(goal, p) { return Ok(()); }
         let (result, head_usages) = self.probe().enter_single_candidate(source, |ecx| {
             if matches!(goal, GoalKind::NormalizesTo(_)) {
@@ -69,7 +69,7 @@ impl EvalCtxt<'_, '_> {
         if let Ok(result) = map_err_to_rerun(result)? { candidates.push(Candidate { source, result, head_usages }); }
         Ok(())
     }
-    fn predicates_for_object_candidate(&mut self, env: &ParamEnv, tr: &TraitRef, bounds: &[Predicate]) -> Result<bool, NoSolutionOrRerunNonErased> {
+    fn predicates_for_object_candidate(&mut self, env: &ParamEnvId, tr: &TraitRef, bounds: &[Predicate]) -> Result<bool, NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx; let prog = self.solver.prog; let mut requirements = Vec::new();
         for p in tcx.explicit_super_predicates_of(prog, tr.def_id) {
             let p = tcx.instantiate_predicate(prog, tr.def_id, &tr.args, &p);
@@ -89,7 +89,7 @@ impl EvalCtxt<'_, '_> {
         Ok(true)
     }
 }
-struct ReplaceProjectionWith<'a, 'b, 'tcx> { ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnv, self_ty: TyId, mapping: &'a [Predicate], ambiguous: bool, failed: bool }
+struct ReplaceProjectionWith<'a, 'b, 'tcx> { ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnvId, self_ty: TyId, mapping: &'a [Predicate], ambiguous: bool, failed: bool }
 impl TypeFolder for ReplaceProjectionWith<'_, '_, '_> {
     fn fold_ty(&mut self, tys: &Types, ty: TyId, depth: u32) -> TyId {
         if let TyKind::Alias(_, a) = tys.kind(ty) {

@@ -34,7 +34,7 @@ impl Default for SolverCache {
 
 #[derive(Clone)]
 pub(super) struct ProofTreeCacheEntry {
-    pub result: QueryResult, pub final_revision: super::inspect::Probe,
+    pub result: u32, pub final_revision: super::inspect::Probe,
     pub required_depth: graph::RequiredDepth, pub dep_node: crate::query::DepNodeIndex,
     pub misses: std::sync::Arc<Vec<(u32, String)>>,
 }
@@ -42,6 +42,7 @@ impl SolverCache {
     pub(crate) fn len(&self) -> usize { self.inputs.len() + self.proof_trees.len() }
     /// The global cache shard holding `input`'s entries.
     fn global(&self, input: u32) -> std::sync::MutexGuard<'_, graph::GlobalCache> {
+        crate::solver_work::count(crate::solver_work::SOLVER_GLOBAL_LOCKS);
         self.global_cache[input as usize % GLOBAL_SHARDS].lock().unwrap_or_else(|e| e.into_inner())
     }
     pub(crate) fn cached_len(&self) -> usize {
@@ -57,22 +58,31 @@ impl<'a> SolverDelegate<'a> {
     pub fn new(tcx: &'a Tcx, prog: &'a Program) -> Self { Self { tcx, prog, limit: Default::default(), cause: Default::default() } }
     pub fn input(&mut self, input: CanonicalQueryInput) -> u32 {
         let cache = &self.tcx.queries.solver;
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         if let Some(id) = cache.input_ids.get(&input) { return id; }
+        crate::solver_work::count(crate::solver_work::SOLVER_INTERN_LOCKS);
         let _g = cache.intern.lock().unwrap_or_else(|e| e.into_inner());
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         if let Some(id) = cache.input_ids.get(&input) { return id; }
         let id = cache.inputs.push(input.clone()) as u32;
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         cache.input_ids.insert(input, id); id
     }
     fn result_id(&mut self, result: (QueryResult, AccessedOpaques)) -> u32 {
         let cache = &self.tcx.queries.solver;
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         if let Some(id) = cache.result_ids.get(&result) { return id; }
+        crate::solver_work::count(crate::solver_work::SOLVER_INTERN_LOCKS);
         let _g = cache.intern.lock().unwrap_or_else(|e| e.into_inner());
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         if let Some(id) = cache.result_ids.get(&result) { return id; }
         let id = cache.results.push(result.clone()) as u32;
+        crate::solver_work::count(crate::solver_work::SOLVER_MAP_LOCKS);
         cache.result_ids.insert(result, id); id
     }
-    pub fn result(&self, id: u32) -> (QueryResult, AccessedOpaques) { self.tcx.queries.solver.results[id as usize].clone() }
-    fn query_input(&self, id: u32) -> CanonicalQueryInput { self.tcx.queries.solver.inputs[id as usize].clone() }
+    // Entries are immutable and live for the borrowed Tcx, including across nested evaluations.
+    pub fn result(&self, id: u32) -> &'a (QueryResult, AccessedOpaques) { crate::solver_work::count(crate::solver_work::RESULT_READS); &self.tcx.queries.solver.results[id as usize] }
+    fn query_input(&self, id: u32) -> &'a CanonicalQueryInput { &self.tcx.queries.solver.inputs[id as usize] }
     fn unconstrained(&mut self, input: u32, certainty: Certainty) -> u32 {
         let input = self.query_input(input);
         let response = response_no_constraints_raw(&self.tcx.tys, input.canonical.max_universe,
@@ -90,7 +100,7 @@ impl SolverDelegate<'_> {
         self.unconstrained(input, certainty)
     }
     fn is_initial_provisional_result(&self, result: u32) -> Option<PathKind> {
-        match self.result(result).0 {
+        match &self.result(result).0 {
             Ok(response) if has_no_inference_or_external_constraints(&self.tcx.tys, &response) => {
                 if response.value.certainty == Certainty::Yes { Some(PathKind::Coinductive) }
                 else if response.value.certainty == Certainty::overflow(false) { Some(PathKind::Unknown) }
@@ -103,7 +113,7 @@ impl SolverDelegate<'_> {
     fn stack_overflow_result(&mut self, input: u32) -> u32 { self.unconstrained(input, Certainty::overflow(true)) }
     fn fixpoint_overflow_result(&mut self, input: u32) -> u32 { self.unconstrained(input, Certainty::overflow(false)) }
     fn is_ambiguous_result(&self, result: u32) -> Option<Certainty> {
-        let response = self.result(result).0.ok()?;
+        let response = self.result(result).0.as_ref().ok()?;
         if !has_no_inference_or_external_constraints(&self.tcx.tys, &response) { return None; }
         match response.value.certainty {
             Certainty::Yes => None,
@@ -127,8 +137,8 @@ impl SolverDelegate<'_> {
         let (((result, final_revision, required_depth), misses), dep_node) = engine.with_anon_task(&mut || crate::type_queries::with_misses(|| {
             let mut inspect = super::inspect::ProofTreeBuilder::new();
             let (id, required_depth) = SearchGraph::evaluate_root_goal_for_proof_tree(self, root_depth, input, &mut inspect);
-            let (result, accessed_opaques) = self.result(id); assert!(!accessed_opaques.might_rerun());
-            (result, inspect.unwrap(), required_depth)
+            let (_, accessed_opaques) = self.result(id); assert!(!accessed_opaques.might_rerun());
+            (id, inspect.unwrap(), required_depth)
         }));
         let entry = ProofTreeCacheEntry { result, final_revision, required_depth, dep_node, misses };
         self.tcx.queries.solver.proof_trees.insert((input, root_depth), entry.clone()); entry

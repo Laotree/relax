@@ -1,6 +1,6 @@
 // ported from N:rustc_infer/src/infer/relate/lattice.rs @8d1a764
 use super::*;
-use crate::next_solver::{Goal, ParamEnv};
+use crate::next_solver::{Goal, ParamEnvId};
 use crate::program::Program;
 
 #[derive(Clone, Copy)]
@@ -9,19 +9,19 @@ pub enum LatticeOpKind { Glb, Lub }
 pub struct LatticeOp<'a, 'tcx> {
     infcx: &'a InferCtxt<'tcx>,
     prog: &'a Program,
-    param_env: ParamEnv,
+    param_env: ParamEnvId,
     variance: V,
     pub goals: Vec<Goal>,
 }
 impl<'a, 'tcx> LatticeOp<'a, 'tcx> {
-    pub fn new(infcx: &'a InferCtxt<'tcx>, prog: &'a Program, param_env: ParamEnv, kind: LatticeOpKind) -> Self {
+    pub fn new(infcx: &'a InferCtxt<'tcx>, prog: &'a Program, param_env: ParamEnvId, kind: LatticeOpKind) -> Self {
         Self { infcx, prog, param_env, variance: match kind { LatticeOpKind::Lub => V::Co, LatticeOpKind::Glb => V::Contra }, goals: Vec::new() }
     }
     fn invariant(&self) -> solver_relating::SolverRelating<'_, 'tcx> {
-        solver_relating::SolverRelating::new(self.infcx, self.prog, V::Inv, self.param_env.clone())
+        solver_relating::SolverRelating::new(self.infcx, self.prog, V::Inv, self.param_env)
     }
     fn relate_bound(&mut self, v: TyId, a: TyId, b: TyId) -> Result<(), TypeError> {
-        let at = self.infcx.at(self.prog, self.param_env.clone());
+        let at = self.infcx.at(self.prog, self.param_env);
         for bound in [a, b] {
             self.goals.extend(if self.variance == V::Co { at.sub(bound, v)? } else { at.sub(v, bound)? });
         }
@@ -105,6 +105,6 @@ impl<'tcx> TypeRelation<'tcx> for LatticeOp<'_, 'tcx> {
     }
     fn well_formed(&mut self, ty: TyId) {
         use crate::next_solver::{Predicate, PredicateKind, ClauseKind, Term};
-        self.goals.push(Goal { param_env: self.param_env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) });
+        self.goals.push(Goal { param_env: self.param_env, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) });
     }
 }

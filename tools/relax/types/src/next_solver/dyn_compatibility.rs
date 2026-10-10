@@ -102,6 +102,7 @@ impl Tcx {
         clauses.push(collect::trait_predicate(meta_sized, vec![GenericArg::Type(u)]));
         let env = super::param_env::normalize_param_env_or_error(self, prog,
             ParamEnv { clauses: clauses.into() }, infcx.cause);
+        let env = self.intern_param_env(env);
         let goal = Goal { param_env: env, predicate: collect::trait_predicate(dispatch, vec![GenericArg::Type(receiver), GenericArg::Type(target)]) };
         infcx.evaluate_root_goal(prog, goal, None).is_ok_and(|r| r.certainty.is_yes())
     }

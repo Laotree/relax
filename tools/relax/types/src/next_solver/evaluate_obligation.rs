@@ -41,7 +41,7 @@ impl InferCtxt<'_> {
     }
 
     /// rustc_trait_selection/src/infer.rs:89-107.
-    pub fn type_implements_trait(&self, prog: &Program, param_env: ParamEnv, trait_ref: TraitRef) -> EvaluationResult {
+    pub fn type_implements_trait(&self, prog: &Program, param_env: ParamEnvId, trait_ref: TraitRef) -> EvaluationResult {
         self.evaluate_obligation(prog, Goal { param_env, predicate: collect::trait_predicate(trait_ref.def_id, trait_ref.args) })
     }
 }
@@ -60,7 +60,7 @@ impl Tcx {
         }
         let infcx = InferCtxt::new(self, typing_env.mode, typing_env.limit);
 
-        infcx.type_implements_trait(prog, self.param_env_by_id(typing_env.param_env).clone(), trait_ref)
+        infcx.type_implements_trait(prog, typing_env.param_env, trait_ref)
     }
 
     /// rustc_ty_utils/src/common_traits.rs:11-13,47-57 (is_copy_raw / is_trait_raw).

@@ -47,7 +47,7 @@ pub trait TypeOp: Sized {
 }
 
 #[derive(Clone, Debug)]
-pub struct ParamEnvAnd<Q> { pub param_env: ParamEnv, pub value: Q }
+pub struct ParamEnvAnd<Q> { pub param_env: ParamEnvId, pub value: Q }
 #[derive(Clone, Copy, Debug)]
 pub struct Normalize { pub value: TyId }
 #[derive(Clone, Debug)]

@@ -72,10 +72,10 @@ impl<'tcx> TypeRelation<'tcx> for ResponseRelating<'_, 'tcx> {
 }
 
 pub fn canonicalize_query_response(infcx: &InferCtxt<'_>, max_input_universe: UniverseIndex, response: &Response) -> Canonical<Response> {
-    let mut resolved = fold_response(&infcx.tcx.tys, response, &mut DeepVariableResolver { infcx });
+    let mut resolved = fold_response(infcx.tcx, response, &mut DeepVariableResolver { infcx });
     filter_irrelevant_region_constraints(infcx, &mut resolved);
     let mut c = Canonicalizer::new(infcx, CanonicalizeMode::Response { max_input_universe });
-    let value = fold_response(&infcx.tcx.tys, &resolved, &mut c);
+    let value = fold_response(infcx.tcx, &resolved, &mut c);
     let (max_universe, _, var_kinds) = c.finalize();
     Canonical { value, max_universe, var_kinds }
 }
@@ -137,7 +137,7 @@ pub(super) fn compute_query_response_instantiation_values_in_universe(infcx: &In
 
 pub fn instantiate_and_apply_query_response(infcx: &InferCtxt<'_>, prog: &crate::program::Program, original: &[GenericArg], response: &Canonical<Response>) -> (Vec<(GoalSource, Goal)>, Certainty) {
     let values = compute_query_response_instantiation_values(infcx, original, response);
-    let response = fold_response(&infcx.tcx.tys, &response.value, &mut CanonicalInstantiator { values: &values });
+    let response = fold_response(infcx.tcx, &response.value, &mut CanonicalInstantiator { values: &values });
     let mut relation = ResponseRelating { infcx, prog };
     relate_args(&mut relation, original, &response.var_values).expect("invalid canonical response");
     for (constraint, _) in response.external_constraints.region_constraints {
@@ -176,6 +176,7 @@ fn filter_irrelevant_region_constraints(infcx: &InferCtxt<'_>, response: &mut Re
     response.external_constraints.region_constraints = unique;
     struct NonTrivialVars(crate::fxhash::HashSet<u32>);
     impl TypeFolder for NonTrivialVars {
+        fn fold_flags(&self) -> Option<crate::types::TypeFlags> { Some(crate::types::TypeFlags::HAS_RE_INFER) }
         fn fold_region(&mut self, tys: &Types, r: RegionId, _: u32) -> RegionId {
             if let RegionKind::ReVar(vid) = tys.region_kind(r) { self.0.insert(vid); } r
         }
@@ -183,7 +184,7 @@ fn filter_irrelevant_region_constraints(infcx: &InferCtxt<'_>, response: &mut Re
     let mut visitor = NonTrivialVars(Default::default());
     let mut remaining = response.clone();
     remaining.external_constraints.region_constraints.clear();
-    fold_response(tys, &remaining, &mut visitor);
+    fold_response(infcx.tcx, &remaining, &mut visitor);
     for &(constraint, _) in &response.external_constraints.region_constraints {
         match constraint {
             RegionConstraint::Eq(a, b) => { visitor.fold_region(tys, a, 0); visitor.fold_region(tys, b, 0); }

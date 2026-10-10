@@ -33,7 +33,7 @@ pub struct Tx<'a> {
     pub closure_copy: RefCell<HashMap<(u32, u32), bool>>,
     /// The body's clauses for the native solver.
     pub param_env: RefCell<crate::next_solver::ParamEnv>,
-    param_env_id: std::cell::Cell<crate::tcx::ParamEnvId>,
+    pub(super) param_env_id: std::cell::Cell<crate::tcx::ParamEnvId>,
 }
 
 impl<'a> Tx<'a> {
@@ -153,10 +153,10 @@ impl<'a> Tx<'a> {
     /// type_check/canonical.rs:205 normalize_with_category; a region variable the
     /// operation leaves unresolved is a fresh slot (erased) to the layout.
     pub fn normalize(&self, ty: TyId) -> TyId {
-        self.normalize_in_env(ty, &self.param_env.borrow())
+        self.normalize_in_env(ty, &self.param_env_id.get())
     }
 
-    pub(super) fn normalize_in_env(&self, ty: TyId, param_env: &crate::next_solver::ParamEnv) -> TyId {
+    pub(super) fn normalize_in_env(&self, ty: TyId, param_env: &crate::next_solver::ParamEnvId) -> TyId {
         let tys = &self.tcx.tys;
         let ty = self.cx.infcx.map_or(ty, |infcx| infcx.deeply_resolve_ignoring_regions(ty));
         if !tys.may_project(ty) && !tys.has_opaque(ty) { return ty; }
@@ -364,7 +364,7 @@ impl<'a> Tx<'a> {
         let lifetimes = self.tcx.generic_indices_of(self.prog, td).lifetimes.len();
         let regions = tys.intern_region_args(&vec![crate::types::RegionId::ERASED; lifetimes]);
         let args = self.tcx.complete_args(self.prog, td, &compact, regions);
-        crate::next_solver::Goal { param_env: self.param_env.borrow().clone(), predicate: crate::next_solver::collect::trait_predicate(td, args) }
+        crate::next_solver::Goal { param_env: self.param_env_id.get(), predicate: crate::next_solver::collect::trait_predicate(td, args) }
     }
 
     /// Borrowck retains undecided properties as obligations in its explicit environment.

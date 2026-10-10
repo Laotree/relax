@@ -37,7 +37,7 @@ fn signature_template_for(rty: &Rty<'_>, d: DefId, args: &[TyId], body: bool) ->
     // N:rustc_borrowck/src/implied_bounds.rs:42-62: these are the
     // declaration's uninstantiated inputs/output, so normalize them under that
     // declaration's ParamEnv, including its const-parameter type clauses.
-    let result = tcx.param_env(rty.tx.prog, d);
+    let result = tcx.param_env_id(rty.tx.prog, d);
     let param_env = result;
     let mut p = Projection {
         rty,
@@ -233,7 +233,7 @@ fn empty() -> SigTmpl {
 
 struct Projection<'a, 'b> {
     rty: &'a Rty<'b>,
-    param_env: crate::next_solver::ParamEnv,
+    param_env: crate::next_solver::ParamEnvId,
     args: &'a [TyId],
     regions: Vec<(RegionId, SR)>,
     params: Vec<(u32, Vec<SR>)>,
@@ -364,11 +364,11 @@ impl Projection<'_, '_> {
         let value = inst.fold_ty(tys, tys.set_aliases_to_non_rigid(ty), 0);
         if !inst.valid { return inst.p.ty(ty); }
         let regions = inst.regions;
-        let op = ParamEnvAnd { param_env: tx.param_env.borrow().clone(), value: Normalize { value } };
+        let op = ParamEnvAnd { param_env: tx.param_env_id.get(), value: Normalize { value } };
         let Ok(out) = op.fully_perform(&infcx, tx.prog) else { return self.ty(ty); };
         // The type operation's new regions are existential symbols, and its
         // constraints are caller requirements, never implied assumptions.
-        let mut normalized = Projection { rty: self.rty, param_env: tx.param_env.borrow().clone(), args: &[],
+        let mut normalized = Projection { rty: self.rty, param_env: tx.param_env_id.get(), args: &[],
             regions, params: Vec::new(), names: std::mem::take(&mut self.names), kinds: std::mem::take(&mut self.kinds) };
         let slots = normalized.ty(out.output);
         if let Some(constraints) = out.constraints {
@@ -509,7 +509,7 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
     let sig = *rty.closure_signatures.borrow().get(&ce)?;
     let mut p = Projection {
         rty,
-        param_env: rty.tx.param_env.borrow().clone(),
+        param_env: rty.tx.param_env_id.get(),
         args: &bir.args,
         regions: Vec::new(),
         params: Vec::new(),
@@ -553,7 +553,7 @@ pub fn closure_template(rty: &Rty<'_>, bir: &crate::borrowck::bir::Bir) -> Optio
     let raw: Vec<_> = u.inputs.iter().copied().chain([u.output]).chain(u.implicit_input).collect();
     let owner = bir.owner?;
     let (mut relations, _) = crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(
-        rty.tx.tcx,rty.tx.prog,rty.tx.obligation_owner.get(),rty.tx.cx.typing_env.mode,&rty.tx.param_env.borrow(),true,&u.contract.predicates,&raw,&u.contract.assumed_wf)
+        rty.tx.tcx,rty.tx.prog,rty.tx.obligation_owner.get(),rty.tx.cx.typing_env.mode,&rty.tx.param_env_id.get(),true,&u.contract.predicates,&raw,&u.contract.assumed_wf)
         .unwrap_or_else(|_| crate::borrowck::implied_bounds::query_failed(rty.tx.tcx,rty.tx.prog,owner,&u.contract.predicates,&raw));
     // External ROOT query variables already have SR identities in this adapter.
     for &r in &u.query_placeholders { p.region(r,None); }
@@ -749,7 +749,7 @@ mod round33_tests {
             let d = def(name);
             let u = SignatureRegions::function(&tcx, &prog, d).unwrap();
             let raw: Vec<_> = u.inputs.iter().copied().chain([u.output]).collect();
-            let env = tcx.param_env(&prog, d);
+            let env = tcx.param_env_id(&prog, d);
             (d, raw.clone(), u.contract.predicates.clone(), crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(
                 &tcx, &prog, d, crate::tcx::TypingMode::non_body_analysis(), &env, false, &u.contract.predicates, &raw, &u.contract.assumed_wf))
         };
@@ -780,7 +780,7 @@ pub fn external_closure_input_slots(rty: &Rty<'_>, expr: u32, input: usize) -> V
     let Some(sig) = sigs.get(&expr) else { return vec![]; };
     let TyKind::FnPtr(ps, _, _, _) = rty.tx.tcx.tys.kind(sig.bound) else { return vec![]; };
     let Some(&ty) = ps.get(input) else { return vec![]; };
-    let mut projection = Projection { rty,param_env:rty.tx.param_env.borrow().clone(),args:&[],regions:vec![],params:vec![],names:vec![],kinds:vec![] };
+    let mut projection = Projection { rty,param_env:rty.tx.param_env_id.get(),args:&[],regions:vec![],params:vec![],names:vec![],kinds:vec![] };
     let tys = &rty.tx.tcx.tys;
     let ty = crate::borrowck::universal_regions::with_erased_adt_regions(rty.tx.tcx, ty);
     let ty = tys.map_regions(ty,&|r,depth| match tys.region_kind(r) {

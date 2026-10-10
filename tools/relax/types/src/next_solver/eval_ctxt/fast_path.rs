@@ -67,7 +67,7 @@ pub fn compute_goal_fast_path(infcx: &InferCtxt<'_>, prog: &crate::program::Prog
                         let meta = lang == Some(LangItem::MetaSized);
                         let mut holds = has_trivial_sizedness(infcx, prog, ty, meta);
                         if !holds && matches!(tys.kind(ty), TyKind::Param(_) | TyKind::Placeholder(_)) {
-                            for clause in &*goal.param_env.clauses {
+                            for clause in &*infcx.tcx.param_env_by_id(goal.param_env).clauses {
                                 if let PredicateKind::Clause(ClauseKind::Trait(c)) = &clause.kind {
                                     holds |= c.polarity == ClausePolarity::Positive && c.trait_ref.args[0] == GenericArg::Type(ty) &&
                                         (c.trait_ref.def_id == p.trait_ref.def_id || (meta && infcx.tcx.lang_items.get(LangItem::Sized) == Some(c.trait_ref.def_id)));

@@ -86,14 +86,14 @@ impl InferCtxt<'_> {
         }))
     }
 
-    pub(crate) fn normalize_ty_with_universes(&self, prog: &crate::program::Program, env: &ParamEnv, ty: TyId) -> Result<(TyId, Vec<Goal>), NoSolution> {
+    pub(crate) fn normalize_ty_with_universes(&self, prog: &crate::program::Program, env: &ParamEnvId, ty: TyId) -> Result<(TyId, Vec<Goal>), NoSolution> {
         self.enter_root(prog, |ecx| {
             let result = ecx.normalize_ty(env, ty);
             let goals = std::mem::take(&mut ecx.nested_goals).into_iter().map(|(_, g, _)| g).collect();
             result.map(|ty| (ty, goals)).map_err(NoSolutionOrRerunNonErased::assert_no_rerun)
         })
     }
-    pub(crate) fn normalize_predicate_with_universes(&self, prog: &crate::program::Program, env: &ParamEnv, p: &Predicate) -> Result<(Predicate, Vec<Goal>), NoSolution> {
+    pub(crate) fn normalize_predicate_with_universes(&self, prog: &crate::program::Program, env: &ParamEnvId, p: &Predicate) -> Result<(Predicate, Vec<Goal>), NoSolution> {
         self.enter_root(prog, |ecx| {
             let result = ecx.normalize_predicate(env, p);
             let goals = std::mem::take(&mut ecx.nested_goals).into_iter().map(|(_, g, _)| g).collect();
@@ -110,7 +110,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
 
         infcx.cause = solver.cause;
         let values = instantiate_canonical_vars(&infcx, input.canonical.max_universe, &input.canonical.var_kinds);
-        let instantiated = instantiate_query_input(&infcx.tcx.tys, &input.canonical.value, &values);
+        let instantiated = instantiate_query_input(infcx.tcx, &input.canonical.value, &values);
         for (key, ty) in instantiated.predefined_opaques_in_body {
             infcx.inner.borrow_mut().opaque_types().register(key, ProvisionalHiddenType { ty });
         }
@@ -144,7 +144,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         }
     }
     pub(super) fn evaluate_goal_raw(&mut self, goal: Goal) -> Result<(Vec<(GoalSource, Goal)>, GoalEvaluation), NoSolutionOrRerunNonErased> {
-        let goal = fold::fold_goal(&self.delegate.tcx.tys, &goal, &mut crate::infer::resolve::DeepVariableResolver::new(self.delegate));
+        let goal = fold::fold_goal(self.delegate.tcx, &goal, &mut crate::infer::resolve::DeepVariableResolver::new(self.delegate));
         let opaque_types = self.delegate.resolved_opaque_types();
         let mode = self.delegate.typing_mode;
         if mode.is_erased_not_coherence() { assert!(opaque_types.is_empty()); }
@@ -157,15 +157,15 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
                 let (original, input) = canonicalize_goal(self.delegate, &goal, &[], crate::tcx::TypingMode::ErasedNotCoherence);
                 let (result, accesses) = self.evaluate_in_search_graph(input);
                 match typing_mode::should_rerun_after_erased_canonicalization(self.delegate.tcx, &accesses.rerun, mode, &opaque_types) {
-                    typing_mode::RerunDecision::No => break 'canonicalize (original, result?, SucceededInErased::Yes { accessed_opaques: accesses }, 0),
-                    typing_mode::RerunDecision::EagerlyPropagateToParent => { self.opaque_accesses.update(accesses)?; break 'canonicalize (original, result?, SucceededInErased::No, 0); }
+                    typing_mode::RerunDecision::No => break 'canonicalize (original, result.as_ref().map_err(|e| *e)?, SucceededInErased::Yes { accessed_opaques: accesses.clone() }, 0),
+                    typing_mode::RerunDecision::EagerlyPropagateToParent => { self.opaque_accesses.update(accesses.clone())?; break 'canonicalize (original, result.as_ref().map_err(|e| *e)?, SucceededInErased::No, 0); }
                     typing_mode::RerunDecision::Yes => {},
                 }
             }
             let (original, input) = canonicalize_goal(self.delegate, &goal, &opaque_types, mode);
             let (result, accesses) = self.evaluate_in_search_graph(input);
             assert!(!accesses.might_rerun());
-            (original, result?, SucceededInErased::No, opaque_types.len())
+            (original, result.as_ref().map_err(|e| *e)?, SucceededInErased::No, opaque_types.len())
         };
         let has_changed = !has_only_region_constraints(&self.delegate.tcx.tys, &response);
         let (nested, certainty) = canonical::response::instantiate_and_apply_query_response(self.delegate, self.solver.prog, &original, &response);
@@ -175,7 +175,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         };
         Ok((nested, GoalEvaluation { goal, certainty, has_changed, stalled_on }))
     }
-    fn evaluate_in_search_graph(&mut self, input: CanonicalQueryInput) -> (QueryResult, AccessedOpaques) {
+    fn evaluate_in_search_graph(&mut self, input: CanonicalQueryInput) -> &'tcx (QueryResult, AccessedOpaques) {
         let lower_depth = match &input.canonical.value.goal.predicate.kind {
             PredicateKind::NormalizesTo(_) => LowerAvailableDepth::No,
             PredicateKind::Clause(ClauseKind::Trait(p)) if trait_is_auto(self.solver.prog, p.trait_ref.def_id) => {
@@ -210,7 +210,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         for goal in goals { self.add_goal(source, goal)?; }
         Ok(())
     }
-    pub(super) fn eq(&mut self, env: &ParamEnv, a: Term, b: Term) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn eq(&mut self, env: &ParamEnvId, a: Term, b: Term) -> Result<(), NoSolutionOrRerunNonErased> {
         let mut relate = SolverRelating::new(self.delegate, self.solver.prog, V::Inv, env.clone());
         match (a, b) {
             (Term::Ty(a), Term::Ty(b)) => { relate.tys(a, b).map_err(|_| NoSolution)?; }
@@ -220,7 +220,7 @@ impl<'a, 'tcx> EvalCtxt<'a, 'tcx> {
         self.add_goals(GoalSource::Misc, relate.goals)?;
         Ok(())
     }
-    pub(super) fn eq_args(&mut self, env: &ParamEnv, a: &[GenericArg], b: &[GenericArg]) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn eq_args(&mut self, env: &ParamEnvId, a: &[GenericArg], b: &[GenericArg]) -> Result<(), NoSolutionOrRerunNonErased> {
         let mut relate = SolverRelating::new(self.delegate, self.solver.prog, V::Inv, env.clone());
         relate_args(&mut relate, a, b).map_err(|_| NoSolution)?;
         self.add_goals(GoalSource::Misc, relate.goals)?;
@@ -316,14 +316,14 @@ impl InferCtxt<'_> {
     }
     fn evaluate_root_goal_for_proof_tree_with_depth(&self, prog: &crate::program::Program, goal: Goal, root_depth: usize) -> super::inspect::GoalEvaluation {
         assert!(!self.typing_mode.is_erased_not_coherence());
-        let goal = fold::fold_goal(&self.tcx.tys, &goal, &mut crate::infer::resolve::DeepVariableResolver::new(self));
+        let goal = fold::fold_goal(self.tcx, &goal, &mut crate::infer::resolve::DeepVariableResolver::new(self));
         let opaques = self.resolved_opaque_types();
         let (original, input) = canonicalize_goal(self, &goal, &opaques, self.typing_mode);
         let mut solver = SolverDelegate::new(self.tcx, prog);
         solver.cause = self.cause; solver.limit = self.recursion_limit;
         let input = solver.input(input);
         let root = solver.evaluate_root_goal_for_proof_tree_raw_provider(input, root_depth);
-        let result = root.result;
+        let result = solver.result(root.result).0.clone();
         if let Ok(response) = &result {
             let (nested, _) = canonical::response::instantiate_and_apply_query_response(self, prog, &original, response); assert!(nested.is_empty());
         }

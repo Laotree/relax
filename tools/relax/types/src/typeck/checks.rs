@@ -35,7 +35,7 @@ impl Fcx<'_> {
 
     // fn_ctxt/checks.rs:229-235: each call input must be well formed.
     pub(super) fn register_wf(&mut self, ty: TyId, lo: u32) {
-        self.register_goal(Goal { param_env: self.param_env.clone(), predicate: Predicate::dummy(
+        self.register_goal(Goal { param_env: self.param_env, predicate: Predicate::dummy(
             PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }, lo);
     }
 
@@ -55,9 +55,9 @@ impl Fcx<'_> {
         let ret = self.deeply_resolve_ignoring_regions_with_obligations(ret);
         let tuple = self.infcx.fudge_inference_if_ok(|| {
             let mut ocx = ObligationCtxt::new(&self.infcx, self.prog);
-            let goals = self.infcx.at(self.prog, self.param_env.clone()).sub(ret, expected).map_err(|_| crate::next_solver::NoSolution)?;
+            let goals = self.infcx.at(self.prog, self.param_env).sub(ret, expected).map_err(|_| crate::next_solver::NoSolution)?;
             ocx.register_obligations(goals);
-            for &ty in inputs { ocx.register_obligation(Goal { param_env: self.param_env.clone(), predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }); }
+            for &ty in inputs { ocx.register_obligation(Goal { param_env: self.param_env, predicate: Predicate::dummy(PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }); }
             if !ocx.engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty() { return Err(crate::next_solver::NoSolution); }
             Ok(self.tcx.tys.intern(TyKind::Tuple(inputs.to_vec())))
         }).ok()?;

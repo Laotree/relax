@@ -340,7 +340,7 @@ pub struct Fcx<'a> {
     local_hyg: Vec<(Option<crate::parser::HygCtxt>, u32)>,
     infcx: crate::infer::InferCtxt<'a>,
     fulfillment_cx: crate::next_solver::fulfill::FulfillmentCtxt,
-    param_env: crate::next_solver::ParamEnv,
+    param_env: crate::next_solver::ParamEnvId,
     loops: Vec<Loop>,
     in_loop_condition: bool,
     diverges: bool,
@@ -617,7 +617,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     };
     fcx.init_body_regions();
     let penv = tcx.param_env_id(prog, def);
-    fcx.param_env = tcx.param_env_by_id(penv).clone();
+    fcx.param_env = penv;
     // (also an empty one: a body checked inside another's check never sees the outer's env)
     fcx.cx.typing_env = crate::tcx::TypingEnv { limit: fcx.infcx.recursion_limit, param_env: penv, mode: crate::tcx::TypingMode::Typeck { defining_opaque_types_and_generators: tcx.opaque_types_defined_by(prog, def) } };
     if penv != crate::tcx::ParamEnvId::EMPTY {
@@ -1254,7 +1254,7 @@ impl<'a> Fcx<'a> {
     /// method/probe.rs:assemble_inherent_candidates_from_param: read the
     /// native ParamEnv and an alias's instantiated item bounds, never re-lower AST bounds.
     fn param_bounds(&mut self, t: TyId) -> Vec<(DefId, Vec<TyId>)> {
-        let mut clauses = self.param_env.clauses.to_vec();
+        let mut clauses = self.tcx.param_env_by_id(self.param_env).clauses.to_vec();
         clauses.extend(self.alias_bound_clauses(t));
         self.trait_bounds_for_self(t, &clauses)
     }

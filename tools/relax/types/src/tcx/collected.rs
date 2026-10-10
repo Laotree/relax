@@ -254,7 +254,7 @@ mod tests {
         let _ = tcx.fn_item_sig(&prog, def).unwrap();
         let program_image = prog.collected_image().unwrap();
         let types_image = tcx.collected_image().unwrap();
-        let pre = [crate::preload::PreCrate { rx_packages: Default::default(), name: "fixture".into(),
+        let pre = [crate::preload::PreCrate { name: "fixture".into(),
             root: source.to_str().unwrap().into(), edition: 2021, cfg: crate::cfg::CfgSet::host(&session, &[]),
             deps: vec![], proc_macro: false, image_deps: vec![], image_dep_names: vec![] }];
         let restored_prog = Program::restore_collected(&session, Box::leak(program_image.into_boxed_slice()), &pre,

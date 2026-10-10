@@ -19,6 +19,12 @@ impl TypeFlags {
     /// rustc_type_ir flags.rs HAS_ALIAS (any type or const alias, rigid or not, at any depth,
     /// closure parent args included): set_aliases_to_non_rigid's needs_change
     pub const HAS_ALIAS: Self = Self(1 << 19);
+    /// Unlike the legacy F_INFER, structural inference visits closure parent args too.
+    pub const HAS_NON_REGION_INFER: Self = Self(1 << 20);
+    pub const HAS_ANY_INFER: Self = Self(Self::HAS_NON_REGION_INFER.0 | Self::HAS_RE_INFER.0);
+    /// rustc_next_trait_solver/canonical/canonicalizer.rs: NEEDS_CANONICAL.
+    pub const NEEDS_CANONICAL: Self = Self(Self::HAS_ANY_INFER.0 | Self::HAS_PLACEHOLDER.0
+        | Self::HAS_PARAM.0 | Self::HAS_FREE_REGIONS.0 | Self::HAS_RE_ERASED.0);
     pub const HAS_TY_BOUND: Self = Self(1 << 8);
     pub const HAS_TY_PLACEHOLDER: Self = Self(1 << 9);
     pub const HAS_RE_BOUND: Self = Self(1 << 10);
@@ -81,7 +87,7 @@ impl Computation {
         use TypeFlags as F;
         match tys.const_kind(ct) {
             ConstKind::Param(_) => self.flags |= F_PARAM | F_NONCONC,
-            ConstKind::Infer(_) => self.flags |= F_INFER | F_NONCONC,
+            ConstKind::Infer(_) => self.flags |= F_INFER | F_NONCONC | F::HAS_NON_REGION_INFER.0,
             ConstKind::Error => self.flags |= F_ERROR | F_NONCONC,
             ConstKind::Bound(d, _) => self.add(F::HAS_CT_BOUND.0 | F_NONCONC, d + 1, binders),
             ConstKind::Placeholder(_) => self.flags |= F::HAS_CT_PLACEHOLDER.0 | F_NONCONC,
@@ -113,6 +119,12 @@ impl Computation {
 }
 
 impl Types {
+    pub(crate) fn region_flags(&self, region: RegionId) -> u32 {
+        let mut c = Computation::default();
+        c.region(self, region, 0);
+        c.flags
+    }
+
     pub(crate) fn const_flags(&self, ct: Const) -> (u32, DebruijnIndex) {
         let mut c = Computation::default();
         c.ct(self, ct, 0);
@@ -191,7 +203,8 @@ impl Types {
             TyKind::Closure(_, _, crate::types::ClosureArgs { parent_args: o, closure_kind_ty, closure_sig_as_fn_ptr_ty: s, tupled_upvars_ty: u }) => for t in [s, u, o, closure_kind_ty] { c.ty(self, *t, 0); },
             TyKind::Const(ct) => c.ct(self, *ct, 0),
             TyKind::Bool | TyKind::Char | TyKind::Str | TyKind::Int(_) | TyKind::Float(_) |
-            TyKind::Foreign(_) | TyKind::Never | TyKind::Param(_) | TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Error => {}
+            TyKind::Foreign(_) | TyKind::Never | TyKind::Param(_) | TyKind::Error => {}
+            TyKind::Infer(_) | TyKind::IntVar(_) | TyKind::FloatVar(_) => c.flags |= TypeFlags::HAS_NON_REGION_INFER.0,
         }
         (c.flags, c.outer)
     }

@@ -8,7 +8,7 @@ use crate::tcx::TypingMode;
 use crate::types::{TyKind, Types, AliasTyKind, RegionKind};
 use crate::types::fold::{TypeFolder, super_fold_ty};
 impl EvalCtxt<'_, '_> {
-    pub(super) fn normalize_opaque_type(&mut self, env: &ParamEnv, p: &ProjectionClause) -> QueryResultOrRerunNonErased {
+    pub(super) fn normalize_opaque_type(&mut self, env: &ParamEnvId, p: &ProjectionClause) -> QueryResultOrRerunNonErased {
         let tcx = self.delegate.tcx; let (def, args) = self.alias_args(&p.projection_term);
         let Term::Ty(expected) = p.term else { unreachable!() };
         let owners = match self.delegate.typing_mode {
@@ -48,7 +48,7 @@ impl EvalCtxt<'_, '_> {
         }
         self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes)
     }
-    fn add_item_bounds_for_hidden_type(&mut self, env: &ParamEnv, def: DefId, args: &[GenericArg], expected: TyId) -> Result<(), NoSolutionOrRerunNonErased> {
+    fn add_item_bounds_for_hidden_type(&mut self, env: &ParamEnvId, def: DefId, args: &[GenericArg], expected: TyId) -> Result<(), NoSolutionOrRerunNonErased> {
         let tcx = self.delegate.tcx;
         let alias = tcx.alias_ty_with_args(AliasTyKind::Opaque { def_id: def }, args);
         for p in tcx.item_bounds(self.solver.prog, def) {
@@ -58,7 +58,7 @@ impl EvalCtxt<'_, '_> {
         }
         Ok(())
     }
-    pub(super) fn try_assemble_bounds_via_registered_opaques(&mut self, env: &ParamEnv, goal: &GoalKind, from: AssembleCandidatesFrom, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
+    pub(super) fn try_assemble_bounds_via_registered_opaques(&mut self, env: &ParamEnvId, goal: &GoalKind, from: AssembleCandidatesFrom, candidates: &mut Vec<Candidate>) -> Result<(), NoSolutionOrRerunNonErased> {
         let self_ty = goal.self_ty(self); let tcx = self.delegate.tcx;
         let TyKind::Infer(var) = tcx.tys.kind(self_ty) else { unreachable!() };
         let mut opaque_types = Vec::new();

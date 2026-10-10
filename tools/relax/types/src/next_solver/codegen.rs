@@ -151,7 +151,7 @@ impl Tcx {
     pub(crate) fn codegen_select_candidate_uncached(&self, prog: &Program, typing_env: TypingEnv, trait_ref: TraitRef) -> Result<ImplSource, CodegenObligationError> {
         let infcx = InferCtxt::new(self, typing_env.mode, typing_env.limit);
 
-        let param_env = self.param_env_by_id(typing_env.param_env).clone();
+        let param_env = typing_env.param_env;
         let goal = Goal { param_env, predicate: collect::trait_predicate(trait_ref.def_id, trait_ref.args) };
         let mut selected = match infcx.select_in_new_trait_solver(prog, goal) {
             Ok(Some(selected)) => selected,
@@ -197,7 +197,7 @@ impl Tcx {
         let infcx = InferCtxt::new(self, typing_env.mode, typing_env.limit);
 
         let mut ocx = ObligationCtxt::new(&infcx, prog);
-        let ty = ocx.deeply_normalize_ty(self.param_env_by_id(typing_env.param_env), ty)?;
+        let ty = ocx.deeply_normalize_ty(&typing_env.param_env, ty)?;
         if self.tys.has_infer(ty) { return Err(NoSolution); }
         Ok(self.tys.erase_regions(ty))
     }

@@ -8,16 +8,16 @@ use crate::consts::{ConstKind, IsRigid};
 use crate::types::fold::{TypeFolder, super_fold_ty, super_fold_const};
 
 pub struct NormalizationFolder<'a, 'b, 'tcx> {
-    ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnv, universes: Vec<Option<UniverseIndex>>, error: Option<NoSolutionOrRerunNonErased>,
+    ecx: &'a mut EvalCtxt<'b, 'tcx>, env: &'a ParamEnvId, universes: Vec<Option<UniverseIndex>>, error: Option<NoSolutionOrRerunNonErased>,
 }
 impl EvalCtxt<'_, '_> {
-    pub(super) fn normalize_ty(&mut self, env: &ParamEnv, ty: TyId) -> Result<TyId, NoSolutionOrRerunNonErased> {
+    pub(super) fn normalize_ty(&mut self, env: &ParamEnvId, ty: TyId) -> Result<TyId, NoSolutionOrRerunNonErased> {
         let tys = &self.delegate.tcx.tys;
         let mut folder = NormalizationFolder { ecx: self, env, universes: Vec::new(), error: None };
         let result = folder.fold_ty(tys, ty, 0);
         match folder.error { Some(e) => Err(e), None => Ok(result) }
     }
-    pub(super) fn normalize_predicate(&mut self, env: &ParamEnv, predicate: &Predicate) -> Result<Predicate, NoSolutionOrRerunNonErased> {
+    pub(super) fn normalize_predicate(&mut self, env: &ParamEnvId, predicate: &Predicate) -> Result<Predicate, NoSolutionOrRerunNonErased> {
         // rustc_type_ir/src/inherent.rs:438-455: WF must inspect the original type.
         if matches!(predicate.kind, PredicateKind::Clause(ClauseKind::WellFormed(_))) { return Ok(predicate.clone()); }
         let tys = &self.delegate.tcx.tys;

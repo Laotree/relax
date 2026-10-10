@@ -6,7 +6,7 @@ use crate::types::{Types, TyKind, RegionKind, AliasTyKind};
 use crate::types::fold::{TypeFolder, super_fold_ty, super_fold_const};
 use crate::consts::{ConstKind, AliasConstKind};
 
-pub fn unnormalized_obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &ParamEnv, term: Term) -> Result<Option<Vec<Goal>>, NoSolution> {
+pub fn unnormalized_obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &ParamEnvId, term: Term) -> Result<Option<Vec<Goal>>, NoSolution> {
     let term = match term { Term::Ty(t) => Term::Ty(infcx.deeply_resolve_ignoring_regions(t)), Term::Const(c) => Term::Const(crate::infer::resolve::DeepResolverIgnoringRegions::new(infcx).fold_const(&infcx.tcx.tys, c, 0)) };
     match term {
         Term::Ty(t) if matches!(infcx.tcx.tys.kind(t), TyKind::Infer(_)) => return Ok(None),
@@ -18,7 +18,7 @@ pub fn unnormalized_obligations(infcx: &InferCtxt<'_>, prog: &Program, env: &Par
     if wf.failed { Err(NoSolution) } else { Ok(Some(wf.out)) }
 }
 struct WfPredicates<'a, 'tcx> {
-    infcx: &'a InferCtxt<'tcx>, prog: &'a Program, env: &'a ParamEnv, out: Vec<Goal>, visited_tys: crate::fxhash::HashSet<TyId>, failed: bool,
+    infcx: &'a InferCtxt<'tcx>, prog: &'a Program, env: &'a ParamEnvId, out: Vec<Goal>, visited_tys: crate::fxhash::HashSet<TyId>, failed: bool,
 }
 impl WfPredicates<'_, '_> {
     fn push(&mut self, kind: PredicateKind) { self.out.push(Goal { param_env: self.env.clone(), predicate: Predicate::dummy(kind) }); }
@@ -138,7 +138,7 @@ pub fn predicate_has_escaping_bound_vars(tys: &Types, p: &Predicate) -> bool {
     let mut f = Finder(false); fold::fold_predicate(tys, p, &mut f); f.0
 }
 impl eval_ctxt::EvalCtxt<'_, '_> {
-    pub(super) fn compute_well_formed_goal(&mut self, env: ParamEnv, term: Term) -> QueryResultOrRerunNonErased {
+    pub(super) fn compute_well_formed_goal(&mut self, env: ParamEnvId, term: Term) -> QueryResultOrRerunNonErased {
         match unnormalized_obligations(self.delegate, self.solver.prog, &env, term)? {
             Some(goals) => { self.add_goals(GoalSource::Misc, goals)?; self.evaluate_added_goals_and_make_canonical_response(Certainty::Yes) }
             None => self.evaluate_added_goals_and_make_canonical_response(Certainty::AMBIGUOUS),
