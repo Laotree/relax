@@ -1977,12 +1977,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
         // what the exit recorded before, so a killed or force-quit app starts warm too; the exit
         // writes it again only if O2 code replaced startup code since (record_manifest)
         if u.cache.is_some() && jit::FIRST_PRESENT.load(Ordering::Acquire) && jit::wall_ns() >= jit::ORDER_UNTIL_NS.load(Ordering::Relaxed) && !MID_MANIFEST_DONE.swap(true, Ordering::Relaxed) {
-            let order = u.start_order.clone();
+            let (order, present) = jit::manifest_order(u.start_order.clone(), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
                 // a frame's lazy compile goes first: the manifest is made again by a later write
                 let stop = || crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
-                if !c.record_manifest(u, crate::layout::root_crate(), &order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed), &stop) {
+                if !c.record_manifest(u, crate::layout::root_crate(), &order, present, &stop) {
                     MID_MANIFEST_DONE.store(false, Ordering::Relaxed);
                     verbose!("relax-cache: startup manifest yielded to the main thread; retried later");
                 }
@@ -2144,10 +2144,10 @@ fn summary_inner(why: &str) {
         // the disk cache: this run's new entries become a pack (on the owner thread: no compiles)
         if why != "stats" {
             let u = unsafe { &mut *up };
-            let order = std::mem::take(&mut u.start_order);
+            let (order, present) = jit::manifest_order(std::mem::take(&mut u.start_order), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {
-                c.record_manifest(u, crate::layout::root_crate(), &order, jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed), &|| false);
+                c.record_manifest(u, crate::layout::root_crate(), &order, present, &|| false);
             }
             u.cache = cache;
             exit_mark("manifest");

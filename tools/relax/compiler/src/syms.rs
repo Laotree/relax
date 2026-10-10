@@ -358,6 +358,28 @@ pub fn read_leaf(u: &Unit, s: Sym, m: Mem) -> crate::opt::RoRead {
     read_obj(u, s, n)
 }
 
+/// The functions a constant data object at `addr` points at, directly or through the data
+/// objects it points at (vtables and their supertrait vtables, fn tables, constants holding fn
+/// pointers): what code reading it can call (real-time reach, jit.rs realtime).
+pub(crate) fn data_thunks(u: &Unit, addr: u64, out: &mut Vec<u32>) {
+    let mut seen = Vec::new();
+    let mut todo: Vec<u32> = u.syms.data_at(addr).into_iter().filter_map(|s| match u.syms.kind(s.id) { Some(SymKind::Data(i)) => Some(i), _ => None }).collect();
+    while let Some(idx) = todo.pop() {
+        if seen.contains(&idx) || seen.len() > 4096 {
+            continue;
+        }
+        seen.push(idx);
+        let Some((_, _, ptrs, _)) = obj_ptrs(u, idx) else { continue };
+        for (_, s) in ptrs.iter() {
+            match s.and_then(|s| u.syms.kind(s.id)) {
+                Some(SymKind::Thunk(id)) => out.push(id),
+                Some(SymKind::Data(i)) => todo.push(i),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// (start, len, pointer words, opaque) of object `idx`, computing the pointer words once.
 fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Option<Sym>)>>, bool)> {
     let (start, len, kind) = {

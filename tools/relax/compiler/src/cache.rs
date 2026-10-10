@@ -356,6 +356,10 @@ pub struct Cache {
     linking_data: HashSet<u128>,
     /// the slots the last linked entry calls (speculative linking follows them)
     pub last_callees: Vec<u32>,
+    /// the slots whose address the last linked entry takes, and the data objects it reads
+    /// (real-time code's reach: jit.rs realtime)
+    pub last_thunks: Vec<u32>,
+    pub last_data: Vec<u64>,
     /// the hit just linked is O3 code; the slots its body inlined (live patches of those
     /// rebuild it)
     pub last_tier1: Option<Vec<u32>>,
@@ -605,6 +609,8 @@ impl Cache {
             slot_keys: HashMap::new(),
             key_waits: false,
             last_callees: Vec::new(),
+            last_thunks: Vec::new(),
+            last_data: Vec::new(),
             last_tier1: None,
             last_o2: false,
             last_base: false,
@@ -1534,6 +1540,47 @@ impl Cache {
     /// The slot a key encoding names in this run (startup manifest).
     pub fn slot_for_bytes(&mut self, u: &mut Unit, b: &[u8]) -> Option<u32> {
         self.slot_of_bytes(u, b)
+    }
+
+    /// The key encodings of the slots real-time threads of the program rooted at crate `root`
+    /// reached in earlier runs (jit.rs realtime; resolve them with slot_for_bytes_unit): compiled
+    /// ahead when the program marks its real-time code.
+    pub fn rt_set_keys(&self, u: &Unit, root: u32) -> Vec<Vec<u8>> {
+        let Ok(b) = std::fs::read(self.rt_set_path(u, root)) else { return Vec::new() };
+        let mut d = D { b: &b, p: 0 };
+        let mut out = Vec::new();
+        while let Some(k) = d.bytes() {
+            out.push(k.to_vec());
+        }
+        out
+    }
+
+    /// Writes the real-time set (see rt_set_keys).
+    pub fn rt_set_store(&mut self, u: &Unit, root: u32, ids: &[u32]) {
+        if self.mode == Mode::ReadOnly {
+            return;
+        }
+        let mut e = E::default();
+        let mut n = 0;
+        for &id in ids {
+            if let Some(b) = self.slot_bytes(u, id) {
+                e.bytes(&b);
+                n += 1;
+            }
+        }
+        if std::env::var_os("RELAX_RT_TRACE").is_some() {
+            eprintln!("relax-rt: recorded {} of {} slots", n, ids.len());
+        }
+        let path = self.rt_set_path(u, root);
+        let tmp = path.with_extension("new");
+        if std::fs::write(&tmp, &e.0).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+
+    fn rt_set_path(&self, u: &Unit, root: u32) -> PathBuf {
+        let name = u.prog.crates.get(root as usize).map_or("program", |c| u.prog.syms.str(c.name));
+        self.dir.join(format!("rt-{}.keys", name))
     }
 
     /// Slot `id`'s key encoding (memo).
@@ -5940,6 +5987,8 @@ impl Linker {
             if let Some(hook) = hook { hook(u); }
         }
         let mut callees = Vec::new();
+        let mut thunks = Vec::new();
+        let mut data = Vec::new();
         let mut d = D { b: payload, p: 0 };
         if d.u32()? != ENTRY_VERSION {
             return None;
@@ -5969,6 +6018,8 @@ impl Linker {
                     let sid = self.slot_of_bytes(u, b)?;
                     if tag == 20 {
                         callees.push(sid);
+                    } else {
+                        thunks.push(sid);
                     }
                     u.env.reloc_value(if tag == 20 { Reloc::Slot(sid) } else { Reloc::Thunk(sid) })
                 }
@@ -5984,7 +6035,13 @@ impl Linker {
                     d.u8()?;
                     u.env.reloc_value(Reloc::Resume)
                 }
-                _ => self.link_sym(u, &mut d)?,
+                _ => {
+                    let v = self.link_sym(u, &mut d)?;
+                    if u.syms.data_at(v).is_some() {
+                        data.push(v);
+                    }
+                    v
+                }
             };
             if o >= code.len() {
                 return None;
@@ -6016,6 +6073,8 @@ impl Linker {
         }
         let pc = raw.into_iter().map(|(o, fi, byte)| (o, (*files.get(fi as usize).unwrap_or(&u32::MAX) as u64) << 32 | byte as u64)).collect();
         self.cache().last_callees = callees;
+        self.cache().last_thunks = thunks;
+        self.cache().last_data = data;
         self.cache().last_tier1 = if is_o3 { Some(inl) } else { None };
         self.cache().last_o2 = tier == TIER_O2;
         self.cache().last_base = tier == TIER_BASE;

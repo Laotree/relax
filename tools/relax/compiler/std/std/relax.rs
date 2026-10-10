@@ -22,6 +22,31 @@ extern "C" {
 }
 
 extern "C" {
+    fn __relax_realtime(root: usize, data: usize, meta: usize);
+}
+
+/// The type whose code `realtime` names (its address is the root's identity, not a call).
+fn __realtime_root<T: ?Sized>(_: &T) {}
+
+/// The code reachable from `x` runs on a real-time thread (an audio device's callback, a
+/// thread with a real-time policy): it must never wait for a compile. Under Relax everything
+/// it can reach -- the closure or fn's body, what that calls, the methods of the trait objects
+/// it calls through, now and as new ones are made -- is compiled now, before the first call.
+/// Pass the closure or fn pointer itself, or `&*boxed` for a trait object. Call it where the
+/// callback is installed, before the device or thread starts.
+pub fn realtime<T: ?Sized>(x: &T) {
+    let p: *const T = x;
+    // a trait object's (or slice's) metadata is the word after the data pointer
+    let meta = if crate::mem::size_of::<*const T>() == 2 * crate::mem::size_of::<usize>() {
+        unsafe { *(&p as *const *const T as *const usize).add(1) }
+    } else {
+        0
+    };
+    let root = __realtime_root::<T> as fn(&T) as usize;
+    unsafe { __relax_realtime(root, p as *const u8 as usize, meta) }
+}
+
+extern "C" {
     fn __relax_budget_enter(module: u64, token: u64) -> u32;
     fn __relax_budget_leave();
     fn __relax_budget_new(fuel: u64, growth: u64) -> u64;
