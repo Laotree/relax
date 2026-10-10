@@ -63,6 +63,13 @@ pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
     seq
 }
 
+/// Someone may want events now (a watcher, a stream, `--agent`): detectors with a cost on the
+/// program's paths run only then.
+#[inline]
+pub fn watched() -> bool {
+    WATCHERS.load(Relaxed) > 0 || super::AGENT.load(Relaxed)
+}
+
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
     on.as_ref().map_or(true, |v| v.iter().any(|k| k == kind))
 }
@@ -80,6 +87,7 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
     let timeout = req.num("timeout_s", 0);
     let t0 = std::time::Instant::now();
     WATCHERS.fetch_add(1, SeqCst);
+    super::timeline::set_frame_watch(true);
     let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     let found = loop {
         if let Some(e) = q.iter().find(|e| e.seq > since && wanted(&on, e.kind)) {
@@ -91,7 +99,9 @@ pub fn cmd_watch(req: &Req, out: &mut Out) {
         q = NEW.wait_timeout(q, std::time::Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
     };
     drop(q);
-    WATCHERS.fetch_sub(1, SeqCst);
+    if WATCHERS.fetch_sub(1, SeqCst) == 1 && !super::AGENT.load(Relaxed) {
+        super::timeline::set_frame_watch(false);
+    }
     match found {
         Some((seq, json)) => out.line(&format!("{},\"rearm\":\"watch since={}\"}}", &json[..json.len() - 1], seq)),
         None => out.line(&format!("{{\"event\":\"none\",\"waited_s\":{},\"rearm\":\"watch since={}\"}}", timeout, since)),
@@ -109,6 +119,7 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
         // a stream is unbounded by design
         out.limit = usize::MAX;
         WATCHERS.fetch_add(1, SeqCst);
+        super::timeline::set_frame_watch(true);
     }
     loop {
         let batch: Vec<(u64, String)> = {
@@ -128,8 +139,8 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
         }
         // a heartbeat-free stream: a closed client is noticed at the next write
     }
-    if follow {
-        WATCHERS.fetch_sub(1, SeqCst);
+    if follow && WATCHERS.fetch_sub(1, SeqCst) == 1 && !super::AGENT.load(Relaxed) {
+        super::timeline::set_frame_watch(false);
     }
 }
 

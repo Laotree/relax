@@ -20,10 +20,25 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
 use std::sync::Mutex;
 
-/// The recording flag (one relaxed load at each marker site; Relax std reads it through the
-/// loader symbol `__relax_recording`).
+/// The markers' flag (one relaxed load at each marker site; makepad and Relax std read it
+/// through the loader symbols `relax_recording` / `__relax_recording`): on while the timeline
+/// records or a watcher wants frame spikes.
 #[no_mangle]
 pub static RELAX_RECORDING: AtomicBool = AtomicBool::new(false);
+/// the timeline's rings record
+static RINGS_ON: AtomicBool = AtomicBool::new(false);
+/// frame spikes are watched (`watch`, `events follow=1`, `--agent`)
+static FRAME_WATCH: AtomicBool = AtomicBool::new(false);
+
+fn flag_update() {
+    RELAX_RECORDING.store(RINGS_ON.load(Relaxed) || FRAME_WATCH.load(Relaxed), Release);
+}
+
+/// Frame-time spike detection on (a watcher attached) or off.
+pub fn set_frame_watch(on: bool) {
+    FRAME_WATCH.store(on, Relaxed);
+    flag_update();
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -90,7 +105,7 @@ fn ring() -> Option<&'static Ring> {
 
 #[inline]
 pub fn recording() -> bool {
-    RELAX_RECORDING.load(Relaxed)
+    RINGS_ON.load(Relaxed)
 }
 
 /// Appends a record to this thread's ring (callers check `recording()` first).
@@ -115,15 +130,57 @@ pub fn push(kind: Kind, label: &'static str, a: u64, b: u64) {
 /// makepad's UI phases (platform thread/ui_hang.rs, found by dlsym): a phase begins / ends;
 /// `name` is a static string of the program.
 pub extern "C" fn relax_span_begin(name: *const u8, len: usize) {
+    let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
     if recording() {
-        push(Kind::SpanBegin, unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) }, 0, 0);
+        push(Kind::SpanBegin, name, 0, 0);
+    }
+    if FRAME_WATCH.load(Relaxed) {
+        frame_watch(true, name);
     }
 }
 
 pub extern "C" fn relax_span_end(name: *const u8, len: usize) {
+    let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
     if recording() {
-        push(Kind::SpanEnd, unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) }, 0, 0);
+        push(Kind::SpanEnd, name, 0, 0);
     }
+    if FRAME_WATCH.load(Relaxed) {
+        frame_watch(false, name);
+    }
+}
+
+thread_local! {
+    /// spike detection on the UI thread: span depth, the frame's first begin, its EWMA (ns)
+    static FW: Cell<(u32, u64, u64)> = const { Cell::new((0, 0, 0)) };
+}
+
+/// A frame's busy time: from the first phase that begins after the previous frame's Draw ended
+/// to the end of this frame's Draw. A frame over max(100 ms, 4x the running average) after the
+/// first present is a `spike` event.
+fn frame_watch(begin: bool, name: &str) {
+    let now = crate::clock::wall_ns();
+    FW.with(|c| {
+        let (depth, start, avg) = c.get();
+        if begin {
+            c.set((depth + 1, if start == 0 { now } else { start }, avg));
+            return;
+        }
+        let depth = depth.saturating_sub(1);
+        if name != "Draw" || start == 0 {
+            c.set((depth, start, avg));
+            return;
+        }
+        let ms = now.saturating_sub(start);
+        let avg2 = if avg == 0 { ms } else { (avg * 15 + ms) / 16 };
+        c.set((depth, 0, avg2));
+        if crate::jit::FIRST_PRESENT.load(Relaxed) && avg > 0 && ms > 100_000_000 && ms > avg * 4 {
+            super::events::emit(
+                "spike",
+                "frame",
+                &format!("\"frame_ms\":{:.1},\"typical_ms\":{:.1},\"more\":[\"why-slow\",\"timeline start\",\"frame slowest\"]", ms as f64 / 1e6, avg as f64 / 1e6),
+            );
+        }
+    });
 }
 
 /// The wait registry's hook (relax_base::waits::TRACE, set while recording): a wait begins (its
@@ -256,14 +313,15 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
             STOPPED_NS.store(0, Relaxed);
             let f: fn(bool, &'static str, &'static str, u64) = wait_trace;
             crate::waits::TRACE.store(f as usize, Release);
-            RELAX_RECORDING.store(true, Release);
+            RINGS_ON.store(true, Release);
+            flag_update();
             let max = req.num("max_s", 30);
             let e = EPOCH.load(Relaxed);
             // a forgotten recording stops itself
             let _ = std::thread::Builder::new().name("relax-inspect-tl".into()).spawn(move || {
                 super::heap::exclude_this_thread();
                 std::thread::sleep(std::time::Duration::from_secs(max));
-                if EPOCH.load(Relaxed) == e && RELAX_RECORDING.load(Relaxed) {
+                if EPOCH.load(Relaxed) == e && RINGS_ON.load(Relaxed) {
                     stop();
                 }
             });
@@ -286,7 +344,8 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
 use std::sync::atomic::Ordering::AcqRel;
 
 fn stop() {
-    RELAX_RECORDING.store(false, Release);
+    RINGS_ON.store(false, Release);
+    flag_update();
     crate::waits::TRACE.store(0, Release);
     STOPPED_NS.store(crate::clock::wall_ns(), Relaxed);
     super::mem::mark("timeline stop");

@@ -3389,6 +3389,17 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     }
 }
 
+/// relax inspect: an edit that did not reach the running program is an agent's event (refused:
+/// errors; restart: the change needs one).
+fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
+    let reasons: Vec<String> = lines.iter().take(6).map(|l| crate::inspect::json_str(l)).collect();
+    crate::inspect::events::emit(
+        "patchrefused",
+        &format!("{}|{}", what, lines.first().cloned().unwrap_or_default()),
+        &format!("\"edit\":{},\"outcome\":\"{}\",\"reasons\":[{}]", crate::inspect::json_str(what), if refused { "refused" } else { "restart" }, reasons.join(",")),
+    );
+}
+
 // ------------------------------------------------------------ the live session log (scoreboard)
 
 /// The session log: one JSON line per edit (rung, reasons, phase latencies) and per restart
@@ -3834,6 +3845,7 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
                 log_edit(&f.0, &o, f.2.map(|s| s.0), seen);
                 eprintln!("relax-live: {}: NOT applied after stream stalled", f.0);
                 for l in &o.lines { eprintln!("relax-live:   {}", l); }
+                patch_refused_event(&f.0, o.rung == Rung::Refuse, &o.lines);
             } else {
                 // reported as the first attempt's patch would have been (else a save that
                 // patched on this retry looks like one that never finished)
@@ -4014,6 +4026,9 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
         }
         for l in &o.lines {
             eprintln!("relax-live:   {}", l);
+        }
+        if o.rung != Rung::Patch {
+            patch_refused_event(&what, o.rung == Rung::Refuse, &o.lines);
         }
         crate::tui::flush();
         if o.rung == Rung::Patch { wake_program(); }

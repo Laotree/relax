@@ -276,6 +276,7 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
         wake: Condvar::new(),
     };
     let behind = NOW_CLASS.load(Ordering::Relaxed);
+    let t_req = std::time::Instant::now();
     let t0 = if main_wait { crate::jit::wall_ns() } else { 0 };
     in_call_add(1);
     push(&req as *const Req as usize, class);
@@ -284,6 +285,23 @@ fn request<R>(class: Class, quick: bool, deadline: Option<std::time::Instant>, f
         wait(&req, deadline)
     };
     in_call_add(-1);
+    // relax inspect: a real-time thread (an audio callback) that waited for the compiler
+    if crate::inspect::events::watched() {
+        let waited = std::time::Instant::now().duration_since(t_req);
+        if waited.as_millis() >= 2 && crate::os::thread::realtime() {
+            crate::inspect::events::emit(
+                "rtstall",
+                &format!("{}", me()),
+                &format!(
+                    "\"thread\":{},\"waited_ms\":{:.1},\"class\":\"{}\",\"owner_serves\":{},\"more\":[\"why-slow\",\"timeline start\"]",
+                    crate::inspect::json_str(&crate::os::thread::name(me())),
+                    waited.as_secs_f64() * 1e3,
+                    CLASS_NAMES[class as usize],
+                    crate::inspect::json_str(&serving_note())
+                ),
+            );
+        }
+    }
     if main_wait {
         let w = crate::jit::wall_ns() - t0;
         if MAIN_WAIT_MAX.fetch_max(w, Ordering::Relaxed) < w {
