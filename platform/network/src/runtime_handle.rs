@@ -421,3 +421,97 @@ impl NetworkRuntimeHandle {
         response
     }
 }
+
+/// Scalar fields of server headers. Lines are supplied separately by their
+/// owner, so no slice of Rust Strings crosses a compiler boundary.
+#[repr(C)]
+pub struct HttpServerHeadersView<'a> {
+    pub addr_text: &'a str,
+    pub verb: &'a str,
+    pub path: &'a str,
+    pub path_no_slash: &'a str,
+    pub has_search: bool,
+    pub search: &'a str,
+    pub has_content_length: bool,
+    pub content_length: u64,
+    pub has_accept_encoding: bool,
+    pub accept_encoding: &'a str,
+    pub has_sec_websocket_key: bool,
+    pub sec_websocket_key: &'a str,
+}
+
+impl crate::utils::HttpServerHeaders {
+    #[inline]
+    pub fn view(&self) -> HttpServerHeadersView<'_> {
+        HttpServerHeadersView {
+            addr_text: &self.addr_text,
+            verb: &self.verb,
+            path: &self.path,
+            path_no_slash: &self.path_no_slash,
+            has_search: self.search.is_some(),
+            search: self.search.as_deref().unwrap_or_default(),
+            has_content_length: self.content_length.is_some(),
+            content_length: self.content_length.unwrap_or_default(),
+            has_accept_encoding: self.accept_encoding.is_some(),
+            accept_encoding: self.accept_encoding.as_deref().unwrap_or_default(),
+            has_sec_websocket_key: self.sec_websocket_key.is_some(),
+            sec_websocket_key: self.sec_websocket_key.as_deref().unwrap_or_default(),
+        }
+    }
+}
+
+/// Owns one global-allocator byte allocation. Fields are private and the value
+/// is neither Copy nor Clone: moving transfers ownership, dropping frees it.
+#[repr(C)]
+pub struct NetworkOwnedBytes {
+    ptr: *mut u8,
+    len: usize,
+    capacity: usize,
+}
+impl NetworkOwnedBytes {
+    #[inline]
+    fn new(bytes: Vec<u8>) -> Self {
+        let mut bytes = std::mem::ManuallyDrop::new(bytes);
+        Self {
+            ptr: bytes.as_mut_ptr(),
+            len: bytes.len(),
+            capacity: bytes.capacity(),
+        }
+    }
+    #[inline]
+    fn into_vec(self) -> Vec<u8> {
+        let this = std::mem::ManuallyDrop::new(self);
+        // Both sides use the process global allocator (as for VM byte buffers).
+        unsafe { Vec::from_raw_parts(this.ptr, this.len, this.capacity) }
+    }
+}
+impl Drop for NetworkOwnedBytes {
+    fn drop(&mut self) {
+        unsafe { drop(Vec::from_raw_parts(self.ptr, self.len, self.capacity)) }
+    }
+}
+
+/// Transfer of a byte-backed server response without passing String/Vec layouts.
+/// The private header allocation always contains UTF-8, established by `new`.
+/// If a receiver does not consume this value, its fields free both allocations.
+#[repr(C)]
+pub struct HttpServerResponseBuffers {
+    header: NetworkOwnedBytes,
+    body: NetworkOwnedBytes,
+}
+impl HttpServerResponseBuffers {
+    #[inline]
+    pub fn new(header: String, body: Vec<u8>) -> Self {
+        Self {
+            header: NetworkOwnedBytes::new(header.into_bytes()),
+            body: NetworkOwnedBytes::new(body),
+        }
+    }
+    #[inline]
+    pub fn into_response(self) -> crate::http_server::HttpServerResponse {
+        let Self { header, body } = self;
+        // Only a String can initialize the private header; ownership moves once.
+        let header = unsafe { String::from_utf8_unchecked(header.into_vec()) };
+        crate::http_server::HttpServerResponse::new(header, body.into_vec())
+    }
+}
