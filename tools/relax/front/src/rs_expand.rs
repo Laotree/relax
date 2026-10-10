@@ -41,6 +41,8 @@ fn outline(mut p: Parser<'_>, ctx: std::rc::Rc<crate::builtins::FileCtx>, table:
     let src = p.src;
     p.krate = ctx.krate.clone();
     p.bctx = Some(ctx.clone());
+    // Includes in declaration discovery need the same file-aware macro spans as parsing.
+    p.sources = Some(Arc::default());
     p.macros = Some(crate::macros::MacroScope::new(table));
     let mut unknown = BTreeSet::new();
     let mut tokens = Vec::new();

@@ -676,6 +676,34 @@ pub fn expand(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: 
         crate::parse_work::put(key, &out);
         return Ok(out);
     }
+    if from_u8(id) == Builtin::Include {
+        let (path, data) = include_input(p, lo, hi, call_lo)?;
+        let text = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8", path))?;
+        let sources = p.sources.as_ref().ok_or("include! requires a source registry")?;
+        let file = sources.register(&path, std::sync::Arc::from(text.as_bytes()))?;
+        let mut toks = Vec::new();
+        crate::lexer::lex(text.as_bytes(), p.edition, &mut toks).map_err(|e| format!("`{path}`: {}", e.msg))?;
+        toks.retain(|t| t.kind != T::Eof);
+        let mut origins = Vec::new();
+        let mut origin = |lo, hi| origins.push(TokenOrigin { lo, hi, source: SourceSpan { file, lo, hi } });
+        for t in &toks {
+            // Proc macros split joint punctuation into smaller source ranges. Lifetimes
+            // deliberately keep one full span for both the apostrophe and name, like rustc.
+            if t.kind == T::AtId {
+                origin(t.lo, t.lo + 1);
+                origin(t.lo + 1, t.hi);
+            } else if (T::Semi as u8..=T::LArrow as u8).contains(&(t.kind as u8))
+                || matches!(t.kind, T::ColonEq | T::PlusColon | T::OtherPunct)
+            {
+                for (i, ch) in text[t.lo as usize..t.hi as usize].char_indices() {
+                    origin(t.lo + i as u32, t.lo + (i + ch.len_utf8()) as u32);
+                }
+            } else {
+                origin(t.lo, t.hi);
+            }
+        }
+        return Ok(Expansion { text, toks, origins });
+    }
     Expansion::lexed(expand_text(p, id, lo, hi, call_lo, call_hi)?)
 }
 
@@ -696,6 +724,26 @@ impl Expansion {
     }
 }
 
+/// Resolve nested includes relative to the file that authored the invocation.
+fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) -> Result<(String, Vec<u8>), String> {
+    let args = lit_args(p, lo, hi)?;
+    let rel = args.first().ok_or("include! takes a path")?;
+    let source = p.source_span(call_lo);
+    let authored = if source.file != 0 {
+        Some(p.sources.as_ref().ok_or("include! requires a source registry")?.get(source.file)?)
+    } else { None };
+    let current = authored.as_ref().map(|s| s.path.as_str()).or_else(|| p.bctx.as_ref().map(|c| c.path.as_str()));
+    let path = if std::path::Path::new(rel).is_absolute() {
+        rel.clone()
+    } else if let Some(path) = current {
+        format!("{}/{}", crate::program::dir_of(path), rel)
+    } else { rel.clone() };
+    let path = crate::vfs::normalize_path(&path);
+    let data = crate::vfs::read(&path).map_err(|e| format!("cannot read `{}`: {} -- check the path (relative to this file)", path, e))?;
+    crate::sip::note_late_input(p.bctx.as_ref().map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE, &path, Some(&data));
+    Ok((path, data))
+}
+
 fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<String, String> {
     let b = from_u8(id);
     let buf = Buf { src: p.src, ext: &p.ext };
@@ -703,6 +751,10 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
     let ctx = p.bctx.as_deref();
     match b {
         Builtin::File => {
+            let source = p.source_span(call_lo);
+            if source.file != 0 {
+                if let Some(sources) = &p.sources { return Ok(str_lit(&file_macro_path(&sources.get(source.file)?.path))); }
+            }
             let f = match ctx {
                 Some(c) => c.file_macro.clone(),
                 None => String::new(),
@@ -710,6 +762,10 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
             return Ok(str_lit(&f));
         }
         Builtin::Line | Builtin::Column => {
+            if let Some(span) = p.input_span(call_lo, call_hi) {
+                let value = if b == Builtin::Line { span.start.line } else { span.start.column };
+                return Ok(format!("{}u32", value));
+            }
             let pos = orig_pos(p, call_lo);
             let lc = match ctx {
                 Some(c) => line_col(p.src, c.line_starts(p.src), pos),
@@ -762,25 +818,8 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
             }
             return crate::thread_local_mac::expand(&v);
         }
-        Builtin::IncludeStr | Builtin::IncludeBytes | Builtin::Include => {
-            let args = lit_args(p, lo, hi)?;
-            let rel = args.first().cloned().ok_or_else(|| "include_str! takes a path".to_string())?;
-            let path = match ctx {
-                Some(c) => {
-                    if std::path::Path::new(&rel).is_absolute() {
-                        rel.clone()
-                    } else {
-                        format!("{}/{}", crate::program::dir_of(&c.path), rel)
-                    }
-                }
-                None => rel.clone(),
-            };
-            let data = crate::vfs::read(&path).map_err(|e| format!("cannot read `{}`: {} -- check the path (relative to this file)", path, e))?;
-            crate::sip::note_late_input(ctx.map_or("", |c| c.krate.as_str()), crate::sip::LATE_FILE, &path, Some(&data));
-            if b == Builtin::Include {
-                // the file's text, parsed in place (items or an expression)
-                return String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8", path));
-            }
+        Builtin::IncludeStr | Builtin::IncludeBytes => {
+            let (path, data) = include_input(p, lo, hi, call_lo)?;
             return if b == Builtin::IncludeStr {
                 let s = String::from_utf8(data).map_err(|_| format!("`{}` is not UTF-8 -- use include_bytes!", path))?;
                 Ok(str_lit(&s))

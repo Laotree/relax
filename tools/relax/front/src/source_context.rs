@@ -140,7 +140,7 @@ impl Context {
         crate::why::event("parse", path, 0, "", None);
         let result = {
             let _profile = crate::load_profile::span(self.session.runtime.profile, "parse-rs", path);
-            crate::parser::parse_owned_ctx(
+            crate::parser::parse_owned_input(
                 &ctx.cfg.session,
                 src,
                 pre,
@@ -149,17 +149,9 @@ impl Context {
                 &ctx.krate,
                 Some(ctx.clone()),
                 lazy,
+                None,
+                Some(self.sources.clone()),
             )
-            .map_err(|(pos, m)| {
-                (
-                    SourceSpan {
-                        file: 0,
-                        lo: pos,
-                        hi: pos,
-                    },
-                    m,
-                )
-            })
         };
         if self.session.runtime.profile || crate::why::enabled() {
             if let Ok((file, _)) = &result {

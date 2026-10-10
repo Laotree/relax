@@ -3658,8 +3658,11 @@ impl Parser<'_> {
     /// Source spans for nested proc-macro inputs. Ordinary Rust retains its parser offsets
     /// for hygiene; token-file inputs use explicit source IDs throughout the macro bridge.
     pub fn input_span(&self, lo: u32, hi: u32) -> Option<crate::pm_tokens::Span> {
-        if !self.token_input { return None; }
+        if !self.token_input && lo < self.src.len() as u32 { return None; }
         let mut span = self.source_span(lo).join(self.source_span(hi.saturating_sub(1).max(lo)));
+        // Ordinary Rust keeps parser offsets for hygiene, except tokens authored in
+        // an included file: those offsets belong to that file's immutable snapshot.
+        if !self.token_input && span.file == 0 { return None; }
         let sources = self.sources.as_ref()?;
         if span.file == 0 { span.file = sources.source_id(&self.bctx.as_ref()?.path); }
         Some(sources.get(span.file).expect("validated token source").token_span(span))
@@ -4206,9 +4209,10 @@ pub fn parse_token_input(input: crate::builtins::Expansion, path: &str, edition:
     parse_owned_input(&ctx.cfg.session, own.src.to_vec(), None, edition, macros, &ctx.krate, Some(ctx.clone()), lazy, Some(input), Some(sources))
 }
 
-fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
+pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
     input: Option<crate::builtins::Expansion>, sources: Option<std::sync::Arc<SourceRegistry>>,
 ) -> Result<(ParsedFile, Option<crate::macros::MacroUse>), (SourceSpan, String)> {
+    let sources = Some(sources.unwrap_or_default());
     let src_len = src.len() as u32;
     let token_input = input.is_some();
     let (toks, ast, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin, used, lazy) = {
