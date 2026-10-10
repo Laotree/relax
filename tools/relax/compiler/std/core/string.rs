@@ -745,6 +745,13 @@ impl<'a> From<&'a String> for String {
     }
 }
 
+// alloc/src/string.rs: `impl From<Box<str>> for String` (Rust 1.18)
+impl From<crate::boxed::Box<str>> for String {
+    fn from(s: crate::boxed::Box<str>) -> String {
+        s.into_string()
+    }
+}
+
 impl From<char> for String {
     fn from(c: char) -> String {
         let mut s = String::new();
