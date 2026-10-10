@@ -982,7 +982,7 @@ static LOCK_WAITERS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32
 /// The unit lock for background work (O3): taken only while nobody waits for it, and
 /// work done under it is split into steps that check `lock_contended` in between.
 #[track_caller]
-fn lock_bg() {
+pub(crate) fn lock_bg() {
     let _cost_wait = crate::fncost::phase(7);
     // a thread that already holds the lock re-enters it (as lock_unit): waiting for the lock to
     // be free would wait for itself, forever, with every other thread spinning behind it
