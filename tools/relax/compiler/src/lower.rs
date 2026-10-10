@@ -10803,6 +10803,25 @@ pub fn glue_func(u: &mut Unit, kind: u8, t: TyId) -> Func {
     if kind == crate::jit::GLUE_EXT_DROP {
         return ext_drop_fn(u, t);
     }
+    if kind == crate::jit::GLUE_DROP
+        && u.lay.is_unsized(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t)
+    {
+        // A drop_in_place shim takes the whole pointer, including a dyn
+        // vtable or slice length. Use the same unsized drop lowering as the
+        // intrinsic; the sized glue below only accepts a data pointer.
+        let def = u.tcx.lang_items.get(LangItem::DropGlue).expect("drop glue lang item");
+        let body = Body::empty(def, vec![t], u.prog.def(def).file, u.tcx.tys.unit);
+        let id = u.fn_id(FnKey::Glue(kind, t));
+        let mut l = Lcx::new(u, &body, fn_name(u, &FnKey::Glue(kind, t)), id);
+        let p = l.f.vreg(Cls::I);
+        let metadata = l.f.vreg(Cls::I);
+        l.f.params.extend([p, metadata]);
+        l.drop_unsized(p, metadata, t);
+        l.term(Term::Ret(Vec::new()));
+        l.finish();
+        assert!(l.errors.is_empty(), "unsized drop glue: {:?}", l.errors);
+        return l.f;
+    }
     let name = fn_name(u, &FnKey::Glue(kind, t));
     let mut f = Func::new(name, 0);
     let entry = f.block();
