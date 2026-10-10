@@ -561,6 +561,14 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         let cost = size.saturating_sub(args.len() + rets.len() + 3);
         // Preserve the raw-size R13 free cap; the paid budget charges net growth.
         let free = size <= INLINE_FREE_INSTS && size <= free_budget;
+        // A tiny body (no bigger than the call's own argument/return moves, or within the free
+        // size) is admitted whatever the caller has grown to: refusing it keeps a call that costs
+        // more than the body (sandbox leap, node: encode_cascades left core::mem::drop x130,
+        // rc::header_of x140, slice::iter::next x26 as calls -- "budget" -- once big chains had
+        // filled the growth ceiling). Only the raw free allowance is charged for it.
+        let tiny = size <= INLINE_FREE_INSTS;
+        // ... and one no bigger than the call itself costs nothing: no allowance at all.
+        let no_growth = cost == 0;
         let rule = found.and_then(|(_, attrs)| site_rule(options, callee.unwrap(), id, args.len(), rets.len(), attrs, priorities[bi].1, priorities[bi].2, single(*ancestry[bi].last().unwrap(), id), ancestry[bi].len() - 1, multi_depths[bi], lim));
         // New admissions respect the actual growth ceiling, including ABI moves.
         let growth = callee.map_or(0, |c| size.saturating_add(args.len()).saturating_add(
@@ -577,9 +585,10 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
         } else if callee.unwrap().params.len() != args.len() || callee.unwrap().rets.len() != rets.len() {
             Some(4)
         } else if match rule.unwrap() {
-            RULE_COST => size > free_budget || inst_count.saturating_add(growth) > growth_limit,
+            _ if no_growth => false,
+            RULE_COST => size > free_budget || !tiny && inst_count.saturating_add(growth) > growth_limit,
             RULE_SINGLE => inst_count.saturating_add(growth) > growth_limit,
-            _ => !free && (cost > budget || inst_count > growth_limit),
+            _ => !free && (cost > budget || !tiny && inst_count > growth_limit),
         } {
             Some(3)
         } else {
@@ -592,6 +601,7 @@ pub fn inline_calls_ordered(options: &relax_session::Options, f: &mut Func, self
             // the body moves here (its one caller): the ceiling grows with it, so the calls
             // around it (Vec::push in the absorbed loop) still fit
             RULE_SINGLE => growth_limit = growth_limit.saturating_add(growth),
+            _ if no_growth => {}
             RULE_COST => free_budget -= size,
             _ if free => free_budget -= size,
             _ => budget -= cost,
