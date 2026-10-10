@@ -136,5 +136,5 @@ pub fn macro_declaration_index(input: &crate::pm::TokenStream, edition: u16,
         crate::parser::rs_expand::expand(input.text.as_bytes(), toks, edition, ctx, table)
     };
     if !surface.unknown.is_empty() { return Err(format!("unsupported macro surface: {:?}", surface.unknown)); }
-    expanded_index(&surface.src, &surface.toks).ok_or_else(|| "invalid expanded declaration tokens".into())
+    expanded_index(&surface.text(input.text.as_bytes()), &surface.toks).ok_or_else(|| "invalid expanded declaration tokens".into())
 }

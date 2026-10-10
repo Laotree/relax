@@ -76,7 +76,7 @@ fn put_surface(path: &str, hash: u128, src: &[u8], toks: &[Tok], w: &mut Vec<u8>
     images.surface(path, hash, src, toks)?.put(w);
     Some(())
 }
-fn get_surface(r: &mut Decode<'_>, store: &str, images: &mut Resolve<'_>) -> Option<(String, u128, Arena<u8>, Arena<Tok>)> {
+fn get_surface(r: &mut Decode<'_>, store: &str, images: &mut Resolve<'_>) -> Option<(String, u128, ScanBytes, Arena<Tok>)> {
     let path = String::get(r)?;
     let hash = u128::get(r)?;
     let (src, toks) = <(DemandSlice, DemandSlice)>::get(r)?;
@@ -88,7 +88,7 @@ fn get_surface(r: &mut Decode<'_>, store: &str, images: &mut Resolve<'_>) -> Opt
     let toks = tokens.slice::<Tok>(1, 2)?.get(toks.start..toks.start.checked_add(toks.len)?)?;
     if crate::crate_image::file_hash("", src) != source_hash || crate::crate_image::demand_token_hash(toks) != token_hash { return None; }
     if toks.iter().any(|t| t.lo > t.hi || t.hi as usize > src.len()) { return None; }
-    Some((path, hash, Arena::Mapped(src), Arena::Mapped(toks)))
+    Some((path, hash, ScanBytes::Mapped(src), Arena::Mapped(toks)))
 }
 impl DemandPart {
     pub fn encode_body(&self, images: &mut dyn DemandWriter, profile: bool, name: &str) -> Option<(u128, Vec<u8>)> {

@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub(crate) struct Surface {
-    pub src: Vec<u8>,
+    /// The expansion text appended to the input's bytes (`text` is the whole): empty for a file
+    /// whose expansion produced none, so the input is not copied.
+    pub ext: Vec<u8>,
     pub toks: Vec<Tok>,
     pub unknown: BTreeSet<(String, String)>,
     /// Body openings the parser must collect eagerly (nested items or macro output).
@@ -13,6 +15,14 @@ pub(crate) struct Surface {
     pub items: Vec<crate::preload::rs_items::Item>,
     pub used: crate::macros::MacroUse,
     pub reuse: Arc<crate::parse_work::Reuse>,
+}
+
+impl Surface {
+    /// The expanded file's bytes: `input` (what `expand` was given) followed by the expansion text.
+    pub(crate) fn text<'a>(&'a self, input: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        if self.ext.is_empty() { std::borrow::Cow::Borrowed(input) }
+        else { std::borrow::Cow::Owned([input, &self.ext[..]].concat()) }
+    }
 }
 
 pub(crate) fn expand<'a>(src: &'a [u8], toks: impl Into<super::lazy_bodies::Toks<'a>>, edition: u16,
@@ -53,15 +63,19 @@ fn outline(mut p: Parser<'_>, ctx: std::rc::Rc<crate::builtins::FileCtx>, table:
         let end = p.toks.iter().position(|t| t.kind == T::Eof).unwrap_or(p.toks.len());
         tokens = p.toks.range(0, end).into_owned();
     }
-    let ext = p.ext.view().contiguous();
-    let mut src = Vec::with_capacity(src.len() + ext.len());
-    src.extend_from_slice(p.src);
-    src.extend_from_slice(&ext);
-    drop(ext);
-    let toks = crate::preload::configured_tokens(&src, &tokens, &ctx.cfg);
+    let ext = p.ext.view().contiguous().into_owned();
+    let joined;
+    let text: &[u8] = if ext.is_empty() { src } else {
+        let mut all = Vec::with_capacity(src.len() + ext.len());
+        all.extend_from_slice(src);
+        all.extend_from_slice(&ext);
+        joined = all;
+        &joined
+    };
+    let toks = crate::preload::configured_tokens(text, &tokens, &ctx.cfg);
     let mut items = Vec::new();
-    crate::preload::rs_items::split(&src, &toks, 0, toks.len(), &ctx.module_path, &mut items);
-    Surface { src, toks, unknown, eager_bodies, items, used: p.macros.take().unwrap().finish(), reuse: reuse.finish() }
+    crate::preload::rs_items::split(text, &toks, 0, toks.len(), &ctx.module_path, &mut items);
+    Surface { ext, toks, unknown, eager_bodies, items, used: p.macros.take().unwrap().finish(), reuse: reuse.finish() }
 }
 
 impl Parser<'_> {

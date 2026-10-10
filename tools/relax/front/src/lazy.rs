@@ -311,8 +311,8 @@ impl Plan {
                                     }
                                     Some(crate::parser::rs_expand::expand(src, toks, c.edition, ctx, base.clone()))
                                 };
+                                let surface = surface.map(|surface| OutlineIndexes::new(surface, &scan.src, profile, &path));
                                 drop(scan);
-                                let surface = surface.map(|surface| OutlineIndexes::new(surface, profile, &path));
                                 ready.0.lock().unwrap().insert((path.clone(), module.clone()), surface);
                                 ready.1.notify_all();
                             }
@@ -358,9 +358,11 @@ impl Plan {
                                     let _profile = crate::load_profile::span(profile, "rust-demand-outline-replay", path);
                                     let ctx = std::rc::Rc::new(crate::builtins::FileCtx::new(&c.name, path, module, &c.cfg));
                                     let surface = crate::parser::rs_expand::expand(&scan.src, &scan.toks[..], c.edition, ctx, table.clone());
-                                    OutlineIndexes::new(surface, profile, path)
+                                    OutlineIndexes::new(surface, &scan.src, profile, path)
                                 });
                             let OutlineIndexes { surface, index, parameters: found_parameters } = surface;
+                            // an expansion that added no text keeps the file's own bytes, shared
+                            let expanded_src: ScanBytes = if surface.ext.is_empty() { scan.src.clone() } else { surface.text(&scan.src).into_owned().into() };
                             *parameters = found_parameters;
                             if let Some(index) = index { expanded_indexes.insert((*ci, path.clone(), module.clone()), index); }
                             contexts[*ci].set_outline_reuse(path, surface.reuse.clone());
@@ -377,14 +379,14 @@ impl Plan {
                             let dir = directories.get(path).cloned().unwrap_or_else(|| crate::program::dir_of(path).into());
                             let _profile = crate::load_profile::span(profile, "rust-demand-outline-scan", path);
                             if let Some(expanded) = scan_tokens(path, &dir, module, &c.name, &c.cfg, scan.src_len,
-                                surface.src, surface.toks, &contexts[*ci], false) { *scan = expanded; }
+                                expanded_src, surface.toks, &contexts[*ci], false) { *scan = expanded; }
                         }
                         for (child, dir, child_module) in &scan.children {
                             directories.insert(child.clone(), dir.clone());
                             if !seen.insert((child.clone(), child_module.clone())) { continue; }
                             let source = contexts[*ci].read_source(child).ok();
                             let hash = source.as_ref().map(|s| crate::crate_image::file_hash(child, &s.src));
-                            let child_scan = source.and_then(|s| scan_text_mode(child, dir, child_module, &c.name, c.edition, &c.cfg, s.src.to_vec(), &contexts[*ci], true)).map(Arc::new);
+                            let child_scan = source.and_then(|s| scan_text_mode(child, dir, child_module, &c.name, c.edition, &c.cfg, (&s.src).into(), &contexts[*ci], true)).map(Arc::new);
                             pending.push_back((child.clone(), child_module.clone(), hash, child_scan, BTreeSet::new(), Vec::new()));
                         }
                         {
@@ -855,10 +857,13 @@ struct OutlineIndexes {
     parameters: BTreeSet<String>,
 }
 impl OutlineIndexes {
-    fn new(surface: crate::parser::rs_expand::Surface, profile: bool, path: &str) -> Self {
+    /// `input` is the source the surface was expanded from.
+    fn new(surface: crate::parser::rs_expand::Surface, input: &[u8], profile: bool, path: &str) -> Self {
         let _profile = crate::load_profile::span(profile, "rust-demand-outline-index", path);
-        let index = crate::rs_outline::expanded_index(&surface.src, &surface.toks).map(Arc::new);
-        let parameters = impl_parameters(&surface.src, &surface.toks);
+        let text = surface.text(input);
+        let index = crate::rs_outline::expanded_index(&text, &surface.toks).map(Arc::new);
+        let parameters = impl_parameters(&text, &surface.toks);
+        drop(text);
         Self { surface, index, parameters }
     }
     fn replays(&self, table: &Arc<crate::macros::MacroTable>, krate: &str, path: &str, profile: bool) -> bool {
@@ -916,7 +921,7 @@ fn discover_crate(c: &PreCrate, ci: usize, context: &crate::source_context::Cont
         }
         let source = context.read_source(&path).ok();
         let hash = source.as_ref().map(|source| crate::crate_image::file_hash(&path, &source.src));
-        let scan = source.and_then(|source| scan_text_mode(&path, &dir, &module, &c.name, c.edition, &c.cfg, source.src.to_vec(), context, true)).map(Arc::new);
+        let scan = source.and_then(|source| scan_text_mode(&path, &dir, &module, &c.name, c.edition, &c.cfg, (&source.src).into(), context, true)).map(Arc::new);
         let parameters = BTreeSet::new();
         let mut opaque = Vec::new();
         if let Some(scan) = &scan {

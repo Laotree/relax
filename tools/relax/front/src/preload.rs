@@ -704,13 +704,41 @@ pub fn jobs() -> usize {
     std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(crate::options::default_parse_jobs).clamp(1, 32)
 }
 
+/// A scanned file's source bytes: its own, a mapped image's, or the registry's authored bytes
+/// shared (a scan of an authored file with no expansion text holds the one copy the registry
+/// holds, not a second one).
+#[derive(Clone)]
+pub(crate) enum ScanBytes {
+    Owned(Vec<u8>),
+    Mapped(&'static [u8]),
+    Shared(Arc<[u8]>),
+}
+impl std::ops::Deref for ScanBytes {
+    type Target = [u8];
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self { Self::Owned(v) => v, Self::Mapped(s) => s, Self::Shared(a) => a }
+    }
+}
+impl From<Vec<u8>> for ScanBytes {
+    fn from(v: Vec<u8>) -> Self { Self::Owned(v) }
+}
+impl From<&crate::source::SourceBytes> for ScanBytes {
+    fn from(src: &crate::source::SourceBytes) -> Self {
+        match src {
+            crate::source::SourceBytes::Shared(a) => Self::Shared(a.clone()),
+            crate::source::SourceBytes::Mapped(m) => Self::Mapped(m),
+        }
+    }
+}
+
 /// A scanned file: source, tokens, its `macro_rules!` definitions in token order and the
 /// module files it declares (path, dir for their `mod x;`, module path).
 #[derive(Clone)]
 struct Scanned {
     src_len: usize,
     probes: Vec<(String, bool)>,
-    src: crate::arena::Arena<u8>,
+    src: ScanBytes,
     toks: crate::arena::Arena<Tok>,
     defs: Vec<crate::macros::MacroDef>,
     children: Vec<(String, String, String)>,
@@ -866,14 +894,14 @@ pub fn file_cfg_active(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> bool {
 
 fn scan_file(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, context: &crate::source_context::Context) -> Option<Scanned> {
     let _profile = crate::load_profile::span(cfg.session.runtime.profile, "prescan", path);
-    scan_text(path, dir, mpath, krate, edition, cfg, context.read_source(path).ok()?.src.to_vec(), context)
+    scan_text(path, dir, mpath, krate, edition, cfg, context.read_source(path).ok()?.src.to_vec().into(), context)
 }
 
-fn scan_text(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: Vec<u8>, context: &crate::source_context::Context) -> Option<Scanned> {
+fn scan_text(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: ScanBytes, context: &crate::source_context::Context) -> Option<Scanned> {
     scan_text_mode(path, dir, mpath, krate, edition, cfg, src, context, false)
 }
 
-fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: Vec<u8>, context: &crate::source_context::Context, declarations_only: bool) -> Option<Scanned> {
+fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src: ScanBytes, context: &crate::source_context::Context, declarations_only: bool) -> Option<Scanned> {
     let macro_surface = !declarations_only || cfg.session.options.rs_lazy;
     let src_len = src.len();
     let mut toks;
@@ -898,7 +926,7 @@ fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16,
 }
 
 fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, cfg: &CfgSet, src_len: usize,
-    src: Vec<u8>, toks: Vec<Tok>, context: &crate::source_context::Context, macro_surface: bool,
+    src: ScanBytes, toks: Vec<Tok>, context: &crate::source_context::Context, macro_surface: bool,
 ) -> Option<Scanned> {
     let mut defs = Vec::new();
     let mut children = Vec::new();
@@ -909,7 +937,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, cfg: &CfgSet, sr
     let mut mods: Vec<String> = vec![mpath.to_string()];
     if !file_cfg_active(&src, &toks, cfg) {
         // `#![cfg(false)]` file: removed with its module; nothing in it counts
-        return Some(Scanned { src_len, src: src.into(), toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new() });
+        return Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods: Vec::new() });
     }
     {
         let text = |i: usize| -> &[u8] { &src[toks[i].lo as usize..toks[i].hi as usize] };
@@ -1126,7 +1154,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, cfg: &CfgSet, sr
             i += 1;
         }
     }
-    Some(Scanned { src_len, src: src.into(), toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods })
+    Some(Scanned { src_len, src, toks: toks.into(), defs, children, probes, aliases, macro_use, uses, mods })
 }
 
 /// Starts the pipeline for `crates` (load order): scans (all crates at once, earliest crate
@@ -1285,7 +1313,7 @@ pub fn check_macros(prog: &mut crate::program::Program, krate: u32, files: &[(u3
             reachable.push(path.clone());
             let text = files.iter().find(|(f, _)| prog.file_paths[*f as usize] == path).map(|(_, t)| t.clone())
                 .or_else(|| crate::vfs::read(&path).ok());
-            if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t, &c.context)) {
+            if let Some(scan) = text.and_then(|t| scan_text(&path, &dir, &module, &name, c.edition, &c.cfg, t.into(), &c.context)) {
                 todo.extend(scan.children.iter().rev().cloned());
                 scans.push(scan);
             }
@@ -1361,7 +1389,7 @@ mod cold_tests {
 
             let path = path.to_string_lossy().into_owned();
             let context = crate::source_context::Context::new(&path, Default::default(), &sess);
-            let scan = scan_text_mode(&path, ".", name, name, 2021, &cfg, source.as_bytes().to_vec(), &context, true).unwrap();
+            let scan = scan_text_mode(&path, ".", name, name, 2021, &cfg, source.as_bytes().to_vec().into(), &context, true).unwrap();
             let mut mods = crate::macros::CrateMods { root: name.into(), src: path.clone(), ..Default::default() };
             mods.externs.extend(deps.iter().map(|dep| (dep.to_string(), dep.to_string())));
             mods.mods.extend(scan.mods);
@@ -1502,7 +1530,7 @@ mod cold_tests {
         ] {
             let path = format!("{name}.rs");
             let context = crate::source_context::Context::new(&path, Default::default(), &sess);
-            let scan = scan_text_mode(&path, ".", name, name, 2021, &cfg, source.as_bytes().to_vec(), &context, true).unwrap();
+            let scan = scan_text_mode(&path, ".", name, name, 2021, &cfg, source.as_bytes().to_vec().into(), &context, true).unwrap();
             let mut mods = crate::macros::CrateMods { root: name.into(), src: path, ..Default::default() };
             mods.externs.extend(deps.into_iter().map(|dep| (dep.into(), dep.into())));
             mods.mods.extend(scan.mods);
@@ -1532,7 +1560,7 @@ mod cold_tests {
         let table = Arc::new(table);
         let surface = crate::parser::rs_expand::expand(source, toks, 2021, ctx, table.clone());
         assert!(surface.unknown.is_empty(), "{:?}", surface.unknown);
-        let index = crate::rs_outline::expanded_index(&surface.src, &surface.toks).unwrap();
+        let index = crate::rs_outline::expanded_index(&surface.text(source), &surface.toks).unwrap();
         let names = index.items.iter().map(|item| item.name.as_str()).collect::<Vec<_>>();
         assert_eq!(names, ["bridge", "generated", "Selected", "Aliased", "Direct", "Generated", "Absolute"]);
         assert!(surface.used.replays(&table, "app", "ui.rs"));
@@ -1592,7 +1620,7 @@ mod lowered_scope_tests {
         let context = crate::source_context::Context::new(path, Default::default(), &sess);
         for (features, expected) in [(vec![], "disabled"), (vec!["selected".to_string()], "enabled")] {
             let cfg = CfgSet::host(&sess, &features);
-            let scan = scan_text(path, ".", "fixture", "fixture", 2021, &cfg, source.to_vec(), &context).unwrap();
+            let scan = scan_text(path, ".", "fixture", "fixture", 2021, &cfg, source.to_vec().into(), &context).unwrap();
             assert_eq!(scan.macro_use, [expected]);
         }
     }
