@@ -53,8 +53,11 @@ fn outline(mut p: Parser<'_>, ctx: std::rc::Rc<crate::builtins::FileCtx>, table:
         let end = p.toks.iter().position(|t| t.kind == T::Eof).unwrap_or(p.toks.len());
         tokens = p.toks.range(0, end).into_owned();
     }
-    let mut src = src.to_vec();
-    src.extend_from_slice(&p.ext.view().contiguous());
+    let ext = p.ext.view().contiguous();
+    let mut src = Vec::with_capacity(src.len() + ext.len());
+    src.extend_from_slice(p.src);
+    src.extend_from_slice(&ext);
+    drop(ext);
     let toks = crate::preload::configured_tokens(&src, &tokens, &ctx.cfg);
     let mut items = Vec::new();
     crate::preload::rs_items::split(&src, &toks, 0, toks.len(), &ctx.module_path, &mut items);

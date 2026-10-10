@@ -49,6 +49,8 @@ pub fn active_tokens(src: &[u8], toks: &[Tok], cfg: &CfgSet) -> Vec<Tok> {
     let _profile = crate::load_profile::span(cfg.session.runtime.profile, "rust-demand-cfg", "tokens");
     let mut out = Vec::with_capacity(toks.len());
     active_tokens_inner(src, toks, cfg, &mut out);
+    // a file with disabled items keeps the slack of the unfiltered length for as long as the scan lives
+    if out.capacity() - out.len() > out.len() / 32 { out.shrink_to_fit(); }
     out
 }
 fn active_tokens_inner(src: &[u8], toks: &[Tok], cfg: &CfgSet, out: &mut Vec<Tok>) {
