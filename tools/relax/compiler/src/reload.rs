@@ -3824,8 +3824,9 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
                 // patched on this retry looks like one that never finished)
                 let what = f.0.rsplit('/').next().unwrap_or("").to_string();
                 log_edit(&what, &o, f.2.map(|s| s.0), seen);
-                wake_program();
                 eprintln!("relax-live: {}: patched ({} item(s) changed, {} fn(s) installed) in {:.1} ms", what, o.changed, o.names.len(), o.ms.iter().sum::<f64>());
+                crate::tui::flush();
+                wake_program();
                 for l in &o.lines { eprintln!("relax-live:   {}", l); }
                 if let Some(&file) = o.files.first() { f.1 = file; }
             }
@@ -3974,7 +3975,6 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
         if o.rung == Rung::Restart {
             RESTART_SAVED_MS.store(saved.map_or(0.0, unix_ms) as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        if o.rung == Rung::Patch { wake_program(); }
         log_edit(&what, &o, saved, seen);
         match o.rung {
             Rung::Patch => eprintln!(
@@ -3996,6 +3996,8 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
         for l in &o.lines {
             eprintln!("relax-live:   {}", l);
         }
+        crate::tui::flush();
+        if o.rung == Rung::Patch { wake_program(); }
         for (j, &k) in which.iter().enumerate() {
             files[k].1 = o.files[j];
         }

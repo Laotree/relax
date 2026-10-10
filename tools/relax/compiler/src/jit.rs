@@ -4478,6 +4478,18 @@ pub static MAIN_TID: AtomicU64 = AtomicU64::new(0);
 /// Functions compiled so far (= Stats::compiled), readable without the unit lock: progress
 /// reports (run.rs `--report-to`) poll it while the unit lock is busy.
 pub static COMPILED_FNS: AtomicU64 = AtomicU64::new(0);
+
+/// Display-only snapshot. Never wait for a compiler or take the unit lock to draw
+/// progress: a busy queue is reported as busy and sampled again on the next tick.
+pub(crate) fn compile_progress() -> (Option<usize>, u64) {
+    let queued = (|| {
+        let spec = SPEC_Q.try_lock().ok()?.len();
+        let base = O2_QUEUE.try_lock().ok()?.len();
+        let tier = TIER_QUEUE.try_lock().ok()?.len();
+        Some(spec + base + tier)
+    })();
+    (queued, STARTUP_COMPILES.load(Ordering::Relaxed))
+}
 /// O3 installs (read without the unit lock: run.rs's monitor)
 pub static TIER1_INSTALLS: AtomicU64 = AtomicU64::new(0);
 static TIER1_FINISHED: AtomicU64 = AtomicU64::new(0);

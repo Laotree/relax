@@ -207,9 +207,13 @@ pub fn compiling() {
 pub fn start(_progress: bool) {}
 #[cfg(not(unix))]
 pub fn finish(_summary: bool) {}
+#[cfg(not(unix))]
+pub(crate) fn flush() {}
 
 #[cfg(unix)]
 pub use unix::{finish, start};
+#[cfg(unix)]
+pub(crate) use unix::flush;
 
 #[cfg(unix)]
 mod unix {
@@ -293,11 +297,9 @@ mod unix {
             }
             9 => {
                 let n = crate::jit::COMPILED_FNS.load(Ordering::Relaxed);
-                if n >= 1000 {
-                    text.push_str(&format!(" {:.1}k fns", n as f64 / 1000.0));
-                } else {
-                    text.push_str(&format!(" {n} fns"));
-                }
+                let (queued, active) = crate::jit::compile_progress();
+                let queued = queued.map_or_else(|| "busy".to_string(), |n| n.to_string());
+                text.push_str(&format!(" {n} fns · {queued} queued · {active} active"));
                 if let Some((name, ms)) = longest_item().filter(|x| x.1 > 500.0) {
                     text.push_str(&format!(" {} {} {}", style("2", "\u{b7}"), cut(&name, 40), style("2", &secs(ms))));
                 }
@@ -415,6 +417,13 @@ mod unix {
                 draw(st);
             }
         }
+    }
+
+    /// A watcher acknowledgement must not lag behind the program's new stdout.
+    /// Called only off the UI thread and after the reload releases compiler locks.
+    pub(crate) fn flush() {
+        let mut g = STATE.lock().unwrap();
+        if let Some(st) = g.as_mut() { pump(st, true); }
     }
 
     /// Takes the bar down and gives fd 2 back its terminal. `summary`: first present, print the
