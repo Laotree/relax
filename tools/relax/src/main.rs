@@ -71,11 +71,11 @@ fn same_binary(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 fn main() {
-    relax_compiler::clock::mark_process_start();
     // CEF started this loader as a subprocess of the program it runs (cef.rs)
     if let Some(code) = cef::subprocess() {
         std::process::exit(code);
     }
+    relax_compiler::clock::mark_process_start();
     // a build script's RUSTC (Relax itself) asked for its version
     if relax_compiler::relax_as_rustc() {
         return;
