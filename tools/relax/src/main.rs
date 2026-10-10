@@ -244,6 +244,7 @@ fn src(name: &str) -> u64 {
         "makepad_live_id" => env!("RELAX_SRC_makepad_live_id"),
         "makepad_script" => env!("RELAX_SRC_makepad_script"),
         "makepad_script_std" => env!("RELAX_SRC_makepad_script_std"),
+        "makepad_script_census" => env!("RELAX_SRC_makepad_script_census"),
         "makepad_script_compute" => env!("RELAX_SRC_makepad_script_compute"),
         "makepad_shader" => env!("RELAX_SRC_makepad_shader"),
         "makepad_tween_script" => env!("RELAX_SRC_makepad_tween_script"),
@@ -269,7 +270,25 @@ fn provided() {
     }
     {
         use makepad_script_std::__host_shims as sh;
-        relax_compiler::provided::register("makepad-script-std", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_std"));
+        relax_compiler::provided::register(
+            "makepad-script-std",
+            sh::SHIMS,
+            sh::TYPES,
+            sh::LAYOUTS,
+            sh::__host_last_panic,
+            src("makepad_script_std"),
+        );
+    }
+    {
+        use makepad_script_census::__host_shims as sh;
+        relax_compiler::provided::register(
+            "makepad-script-census",
+            sh::SHIMS,
+            sh::TYPES,
+            sh::LAYOUTS,
+            sh::__host_last_panic,
+            src("makepad_script_census"),
+        );
     }
     {
         use makepad_script_compute::__host_shims as sh;
