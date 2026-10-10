@@ -256,7 +256,7 @@ struct CacheEntry {
 /// rustc_type_ir/src/search_graph/global_cache.rs:19,80: success requires enough
 /// depth; stack overflow requires exactly the same available depth.
 #[derive(Default)]
-pub(super) struct GlobalCache {
+pub(in crate::next_solver) struct GlobalCache {
     entries: HashMap<u32, CacheEntry>,
 }
 
