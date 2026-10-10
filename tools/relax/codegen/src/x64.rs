@@ -662,12 +662,18 @@ struct Gen<'a> {
     relocs: Vec<RelocAt>,
     /// emission order successor of each block (u32::MAX for the last)
     next_block: Vec<u32>,
+    /// block -> where its code goes on: blocks that emit only their jump (moves the allocator
+    /// coalesced, edge blocks of split ranges) are passed through by the jumps into them
+    thru: Vec<u32>,
     frame: i32,
     text_len: u32,
     /// a single-use float constant whose use (the next FBin) reads it from the pool
     mem_const: Option<(VReg, u64)>,
     /// the block ends `t = x & K; t ==/!= 0; branch`: emitted as test x, K (the And skipped)
     test_fuse: Option<(VReg, i64)>,
+    /// `t = load [base + off]; c = t cmp K` feeding the branch (t used once): cmp [base + off], K
+    /// in the load's width -- (base, off, bytes, K)
+    load_fuse: Option<(VReg, i32, u8, i64)>,
     /// the last spill store emitted: (rbp displacement, register, position right after it)
     last_spill: Option<(i32, u8, usize)>,
     /// spill windows (Alloc::windows): vreg -> (first use pos, last use pos, register); and the
@@ -1019,6 +1025,7 @@ impl<'a> Gen<'a> {
                 prev = Some(bi);
             }
         }
+        self.thru_blocks(&reach);
         for bi in 0..nb {
             if !reach[bi] {
                 continue;
@@ -1047,6 +1054,15 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            // `t = load [p + o]; c = t cmp K` feeding the branch (t used once): cmp [p + o], K
+            self.load_fuse = None;
+            if fused && n >= 2 && self.test_fuse.is_none() {
+                if let (Inst::Load(Mem::Int(sz, sx), t, base, off), Inst::ICmpI(cond, signed, _, t2, k)) = (&b.insts[n - 2], &b.insts[n - 1]) {
+                    if t == t2 && base != t && self.al.uses[t.0 as usize] == 1 && load_cmp_fits(*sz, *sx, *cond, *signed, *k) {
+                        self.load_fuse = Some((*base, *off, *sz, *k));
+                    }
+                }
+            }
             // a block start can be a jump target: no spill store before it carries over, nor
             // the flags of the ALU op that ended the block above (a jump arrives with other ones)
             self.last_spill = None;
@@ -1068,7 +1084,7 @@ impl<'a> Gen<'a> {
                 if fused && ii == n - 1 {
                     break;
                 }
-                if self.test_fuse.is_some() && ii == n - 2 {
+                if (self.test_fuse.is_some() || self.load_fuse.is_some()) && ii == n - 2 {
                     continue;
                 }
                 // a compare whose one use is the next select: fused into it (flags + cmov,
@@ -1837,14 +1853,57 @@ impl<'a> Gen<'a> {
         self.a.ret();
     }
 
+    /// Blocks whose code is only their `jmp`: a block (not the entry) of moves the allocator
+    /// placed in one location, no spill-window loads, ending in a jump elsewhere. `thru` maps
+    /// every block to the end of such a chain (itself otherwise).
+    fn thru_blocks(&mut self, reach: &[bool]) {
+        let nb = self.f.blocks.len();
+        let mut step: Vec<u32> = (0..nb as u32).collect();
+        for bi in 1..nb {
+            let b = &self.f.blocks[bi];
+            let Term::Jump(t) = b.term else { continue };
+            if !reach[bi] || t as usize == bi {
+                continue;
+            }
+            let silent = b.insts.iter().enumerate().all(|(ii, i)| match *i {
+                Inst::Mov(d, s2) => {
+                    let (ld, ls) = (self.al.loc[d.0 as usize], self.al.loc[s2.0 as usize]);
+                    ld == ls && matches!(ld, Loc::Reg(_) | Loc::Flt(_) | Loc::Stack(_)) && !self.win_start.contains_key(&self.al.inst_pos(bi, ii))
+                }
+                _ => false,
+            });
+            if silent {
+                step[bi] = t;
+            }
+        }
+        self.thru = (0..nb as u32)
+            .map(|b| {
+                let mut x = b;
+                for _ in 0..8 {
+                    if step[x as usize] == x {
+                        break;
+                    }
+                    x = step[x as usize];
+                }
+                x
+            })
+            .collect();
+    }
+
+    fn thru(&self, b: u32) -> u32 {
+        self.thru.get(b as usize).copied().unwrap_or(b)
+    }
+
     fn jump_to(&mut self, target: u32, bi: usize) {
-        if self.next_block[bi] != target {
+        let target = self.thru(target);
+        if self.thru(self.next_block[bi]) != target {
             let p = self.a.jmp32();
             self.fixups.push((p, target));
         }
     }
 
     fn jcc_to(&mut self, cc: u8, target: u32) {
+        let target = self.thru(target);
         let p = self.a.jcc32(cc);
         self.fixups.push((p, target));
     }
@@ -1896,6 +1955,30 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// cmp <sz bytes> [rb + disp], k (k fits the width's immediate: load_cmp_fits)
+    fn cmp_mem_imm(&mut self, rb: u8, disp: i32, sz: u8, k: i64) {
+        let small = (-128..128).contains(&k);
+        if sz == 2 {
+            self.a.byte(0x66);
+        }
+        self.a.rex(sz == 8, 0, 0, rb, false);
+        match sz {
+            1 => self.a.byte(0x80),
+            _ if small => self.a.byte(0x83),
+            _ => self.a.byte(0x81),
+        }
+        self.a.modrm_mem(7, rb, disp);
+        match sz {
+            1 => self.a.byte(k as u8),
+            _ if small => self.a.byte(k as i8 as u8),
+            2 => {
+                self.a.byte(k as u8);
+                self.a.byte((k >> 8) as u8);
+            }
+            _ => self.a.u32(k as i32 as u32),
+        }
+    }
+
     fn term(&mut self, options: &relax_session::Options, t: &Term, bi: usize, fused: Option<Inst>) {
         match t {
             Term::Jump(target) => self.jump_to(*target, bi),
@@ -1940,6 +2023,12 @@ impl<'a> Gen<'a> {
                 let icond: Option<u8> = match &fused {
                     Some(Inst::ICmp(cond, signed, _, x, y)) => {
                         self.cmp_vregs(options, *x, *y);
+                        Some(icc(*cond, *signed))
+                    }
+                    Some(Inst::ICmpI(cond, signed, _, _, _)) if self.load_fuse.is_some() => {
+                        let (base, off, sz, k) = self.load_fuse.take().unwrap();
+                        let (rb, disp) = self.base_disp(options, base, R11, off);
+                        self.cmp_mem_imm(rb, disp, sz, k);
                         Some(icc(*cond, *signed))
                     }
                     Some(Inst::ICmpI(cond, signed, _, x, k)) => match self.test_fuse.take() {
@@ -1994,7 +2083,7 @@ impl<'a> Gen<'a> {
                     }
                 };
                 let cc = icond.unwrap();
-                if *tt == next {
+                if self.thru(*tt) == self.thru(next) {
                     // fall into the true block: branch on the inverted condition
                     self.jcc_to(cc ^ 1, *ff);
                 } else {
@@ -3568,6 +3657,14 @@ impl<'a> Gen<'a> {
         // two-address form; when d aliases b, swap commutative operands or compute in rax
         let commutative = matches!(op, IOp::Add | IOp::Mul | IOp::And | IOp::Or | IOp::Xor);
         let (ra, rb) = if rd == rb && rd != ra && commutative { (rb, ra) } else { (ra, rb) };
+        // a 64-bit sum into a third register: lea rd, [ra + rb] (one instruction for mov + add;
+        // flags are not read after a register-register add, see last_alu)
+        if op == IOp::Add && it.bits == 64 && rd != ra && rd != rb && rb != RSP {
+            self.a.sib = Some((rb, 0));
+            self.a.lea(rd, ra, 0);
+            self.fin_i(d, rd);
+            return;
+        }
         let work = if rd == rb && rd != ra { RAX } else { rd };
         self.a.mov_rr(work, ra);
         if it == U32 {
@@ -4013,6 +4110,25 @@ fn use_gather(options: &relax_session::Options) -> bool {
 }
 
 /// The vreg a compare defines.
+/// Can `load (sz bytes, sx: sign-extended) cmp k` read the memory in the load's width
+/// (cmp [m], imm)? k must be a value of that width as the load extends it; a zero-extended
+/// narrow value compared signed (or ordered against a constant outside its range) differs.
+fn load_cmp_fits(sz: u8, sx: bool, c: Cond, signed: bool, k: i64) -> bool {
+    let ordered = !matches!(c, Cond::Eq | Cond::Ne);
+    match sz {
+        8 => (i32::MIN as i64..=i32::MAX as i64).contains(&k),
+        1 | 2 | 4 => {
+            let b = sz as u32 * 8;
+            if sx {
+                (-(1i64 << (b - 1))..(1i64 << (b - 1))).contains(&k)
+            } else {
+                (0..(1i64 << b)).contains(&k) && !(ordered && signed)
+            }
+        }
+        _ => false,
+    }
+}
+
 fn cmp_def(i: &Inst) -> Option<VReg> {
     match i {
         Inst::ICmp(_, _, d, _, _) | Inst::ICmpI(_, _, d, _, _) | Inst::FCmp(_, _, d, _, _) => Some(*d),
@@ -4131,10 +4247,12 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         cur_pos: 0,
         fpool: Vec::new(),
         next_block: Vec::new(),
+        thru: Vec::new(),
         frame: 0,
         text_len: 0,
         mem_const: None,
         test_fuse: None,
+        load_fuse: None,
         jt_plan,
         jt_fix: Vec::new(),
         last_spill: None,
