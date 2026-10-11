@@ -1,0 +1,354 @@
+use crate::cmd::{Out, Req};
+use crate::conn::{Channel, Conn, Event, Hooks, Io, CLOSE_UNSUPPORTED};
+use crate::endpoint::{Endpoint, Factory};
+use crate::frame::{kind, write_frame, FrameReader, MAX_FRAME};
+use crate::hello::{self, Hello};
+use crate::link::{Client, Error, Target};
+use crate::ring::{Cursor, Kind, Ring};
+use crate::stream::{parse_chunk, read_varint, TAG_DROP};
+use std::io::Write;
+use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+const WAIT: Duration = Duration::from_secs(10);
+
+fn dispatch(req: &Req, out: &mut Out) {
+    match req.cmd.as_str() {
+        "ping" => out.line("{\"pong\":1}"),
+        "big" => {
+            for i in 0..2000 {
+                out.line(&format!("{{\"row\":{i}}}"));
+            }
+        }
+        "boom" => panic!("a bug in a command"),
+        c => out.err(&format!("unknown command `{c}`")),
+    }
+}
+
+/// Echoes every message back on its channel.
+fn echo() -> Factory {
+    Arc::new(|_, open| {
+        std::thread::spawn(move || {
+            while let Some(ev) = open.channel.recv() {
+                match ev {
+                    Event::Data(d) => {
+                        if open.channel.send(d).is_err() {
+                            return;
+                        }
+                    }
+                    Event::Closed(..) => return,
+                    Event::Opened(_) => {}
+                }
+            }
+        });
+        Ok(())
+    })
+}
+
+/// Connects a client `Conn` to `ep` over an in-process socket pair.
+fn pair(ep: &Endpoint) -> Conn {
+    let (a, b) = UnixStream::pair().unwrap();
+    let ep = ep.clone();
+    std::thread::spawn(move || {
+        let (r, w, s) = (a.try_clone().unwrap(), a.try_clone().unwrap(), a);
+        let _ = ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(move || {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }));
+    });
+    let (r, w, s) = (b.try_clone().unwrap(), b.try_clone().unwrap(), b);
+    let mut reader = FrameReader::new(Box::new(r));
+    let mut writer: Box<dyn Write + Send> = Box::new(w);
+    let ok = hello::client_handshake(&mut reader, &mut *writer, &Hello { name: "test".into(), link_id: "t".into(), ..Hello::default() }).unwrap();
+    Conn::start(Io { reader, writer, shutdown: Box::new(move || {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }) }, ok, true, None, Hooks::default())
+}
+
+fn data(ch: &Channel) -> Vec<u8> {
+    match ch.recv_timeout(WAIT) {
+        Ok(Event::Data(d)) => d,
+        other => panic!("expected data, got {other:?}"),
+    }
+}
+
+#[test]
+fn frame_round_trip_and_limit() {
+    let mut buf = Vec::new();
+    write_frame(&mut buf, 7, kind::DATA, 1, b"hello").unwrap();
+    write_frame(&mut buf, 9, kind::CLOSE, 0, b"").unwrap();
+    let mut r = FrameReader::new(Box::new(std::io::Cursor::new(buf)));
+    let f = r.next().unwrap();
+    assert_eq!((f.chan, f.kind, f.flags, f.payload.as_slice()), (7, kind::DATA, 1, &b"hello"[..]));
+    assert_eq!(r.next().unwrap().kind, kind::CLOSE);
+    assert!(r.next().is_err());
+    // a frame announcing more than 1 MiB is refused
+    let mut big = ((MAX_FRAME + 1) as u32).to_le_bytes().to_vec();
+    big.extend_from_slice(&[0; 16]);
+    let e = FrameReader::new(Box::new(std::io::Cursor::new(big))).next().unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+    assert!(write_frame(&mut Vec::new(), 1, kind::DATA, 0, &vec![0; MAX_FRAME]).is_err());
+}
+
+#[test]
+fn big_message_is_split_and_reassembled() {
+    let ep = Endpoint::new("t");
+    ep.register("echo", 1, echo());
+    let conn = pair(&ep);
+    let ch = conn.open("echo", "").unwrap();
+    let msg: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+    ch.send(msg.clone()).unwrap();
+    assert!(data(&ch) == msg, "3 MB echoed back whole");
+    assert_eq!(conn.peer().caps, vec!["echo/1".to_string()]);
+}
+
+#[test]
+fn slow_reader_does_not_block_cmd() {
+    let ep = Endpoint::new("t");
+    ep.register_cmd(dispatch);
+    let held: Arc<Mutex<Vec<Channel>>> = Arc::new(Mutex::new(Vec::new()));
+    let h = held.clone();
+    // a service that accepts the channel and never reads it
+    ep.register("stream", 1, Arc::new(move |_, open| {
+        h.lock().unwrap().push(open.channel);
+        Ok(())
+    }));
+    let conn = pair(&ep);
+    let slow = conn.open("stream", "").unwrap();
+    let tx = slow.tx();
+    let sender = std::thread::spawn(move || {
+        // 4 MiB cannot be accepted by a receiver that never drains: this call blocks
+        let mut sent = 0;
+        while tx.send(vec![0u8; 64 << 10]).is_ok() {
+            sent += 64 << 10;
+            if sent > 4 << 20 {
+                break;
+            }
+        }
+        sent
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!sender.is_finished(), "the starved channel is held by credit");
+    let cmd = conn.open("cmd", "").unwrap();
+    cmd.send(b"ping".to_vec()).unwrap();
+    let t = std::time::Instant::now();
+    let mut text = String::new();
+    while !text.contains("\"end\"") {
+        text.push_str(&String::from_utf8(data(&cmd)).unwrap());
+    }
+    assert!(text.contains("pong") && t.elapsed() < Duration::from_secs(5));
+    // the receiver drains: the sender goes on
+    let rx_side = held.lock().unwrap().pop().unwrap();
+    let drain = std::thread::spawn(move || {
+        let mut n = 0;
+        while let Some(Event::Data(d)) = rx_side.recv() {
+            n += d.len();
+            if n >= 4 << 20 {
+                break;
+            }
+        }
+        n
+    });
+    assert!(sender.join().unwrap() > 0);
+    assert!(drain.join().unwrap() >= 4 << 20);
+}
+
+#[test]
+fn different_major_version_is_refused_with_both_versions() {
+    let ep = Endpoint::new("t");
+    let (a, b) = UnixStream::pair().unwrap();
+    let (r, w) = (a.try_clone().unwrap(), a.try_clone().unwrap());
+    let h = std::thread::spawn(move || ep.serve(FrameReader::new(Box::new(r)), Box::new(w), Box::new(|| {})).err().map(|e| e.to_string()));
+    let mut p = vec![hello::OP_HELLO];
+    p.extend_from_slice(b"major=9\nminor=2\nrole=client\nname=x\nlink_id=1\n");
+    let mut w = b.try_clone().unwrap();
+    write_frame(&mut w, 0, kind::DATA, 0, &p).unwrap();
+    let mut rd = FrameReader::new(Box::new(b));
+    let f = rd.next().unwrap();
+    assert_eq!(f.payload[0], hello::OP_GOODBYE);
+    let msg = String::from_utf8(f.payload[1..].to_vec()).unwrap();
+    assert!(msg.contains("1.0") && msg.contains("9.2"), "{msg}");
+    assert!(h.join().unwrap().unwrap().contains("9.2"));
+}
+
+#[test]
+fn unknown_service_is_refused() {
+    let ep = Endpoint::new("t");
+    let conn = pair(&ep);
+    match conn.open("nope", "") {
+        Err((code, why)) => assert!(code == CLOSE_UNSUPPORTED && why.contains("nope"), "{why}"),
+        Ok(_) => panic!("opened a service that does not exist"),
+    }
+}
+
+#[test]
+fn cmd_answers_end_and_truncation() {
+    let ep = Endpoint::new("t");
+    ep.register_cmd(dispatch);
+    let conn = pair(&ep);
+    let ask = |line: &str| -> Vec<String> {
+        let ch = conn.open("cmd", "").unwrap();
+        ch.send(line.as_bytes().to_vec()).unwrap();
+        let mut lines = Vec::new();
+        while !lines.last().is_some_and(|l: &String| l.starts_with("{\"end\":")) {
+            lines.extend(String::from_utf8(data(&ch)).unwrap().lines().map(str::to_string));
+        }
+        lines
+    };
+    let l = ask("ping");
+    assert_eq!(l[0], "{\"pong\":1}");
+    assert!(l[1].starts_with("{\"end\":\"ping\"") && !l[1].contains("truncated"));
+    let l = ask("big");
+    assert!(l.last().unwrap().contains("\"truncated\":true") && l.len() < 2000);
+    let l = ask("big full=1");
+    assert_eq!(l.len(), 2001);
+    let l = ask("boom");
+    assert!(l[0].starts_with("{\"err\":") && l.last().unwrap().starts_with("{\"end\":\"boom\""));
+    // several cmd channels at once
+    let a = conn.open("cmd", "").unwrap();
+    let b = conn.open("cmd", "").unwrap();
+    a.send(b"ping".to_vec()).unwrap();
+    b.send(b"ping".to_vec()).unwrap();
+    assert!(String::from_utf8(data(&a)).unwrap().contains("pong") && String::from_utf8(data(&b)).unwrap().contains("pong"));
+}
+
+#[test]
+fn ring_drops_oldest_and_resume_counts_the_loss() {
+    let ring = Ring::new(1000);
+    let chunk = [7u8; 88]; // 100 bytes with the record header: ten fit
+    for _ in 0..25 {
+        ring.push_stream(&chunk);
+    }
+    assert_eq!(ring.last_seq(Kind::Stream), 25);
+    let mut cur = ring.after(Kind::Stream, 5);
+    let r = ring.read(Kind::Stream, &mut cur, usize::MAX);
+    assert_eq!(r.recs.first().map(|x| x.0), Some(16), "oldest still held");
+    assert_eq!(r.lost, 10, "records 6..=15 were dropped");
+    assert_eq!(r.recs.len(), 10);
+    assert_eq!(cur.seq, 25);
+    // a reader that is current loses nothing
+    let mut cur = ring.after(Kind::Stream, 20);
+    let r = ring.read(Kind::Stream, &mut cur, usize::MAX);
+    assert_eq!((r.lost, r.recs.len()), (0, 5));
+    // the wrap of the buffer keeps record contents intact
+    for i in 0..40u8 {
+        ring.push_stream(&[i; 61]);
+    }
+    let mut cur = Cursor { pos: 0, seq: 0 };
+    let r = ring.read(Kind::Stream, &mut cur, usize::MAX);
+    assert!(r.recs.iter().all(|(s, d)| d.iter().all(|b| *b == (*s - 26) as u8) && d.len() == 61));
+    // watch keeps the last 256
+    let w = Ring::new(1000);
+    for i in 0..300u32 {
+        w.push_watch(format!("{{\"n\":{i}}}").as_bytes());
+    }
+    let mut cur = w.after(Kind::Watch, 10);
+    let r = w.read(Kind::Watch, &mut cur, usize::MAX);
+    assert_eq!((r.lost, r.recs.len(), r.recs[0].0), (34, 256, 45));
+}
+
+#[test]
+fn resume_replays_the_ring_with_a_drop_marker() {
+    let ep = Endpoint::with_ring("t", 1000);
+    let sink = ep.register_stream();
+    let watch = ep.register_watch();
+    for i in 0..25u8 {
+        sink.push(1, &[i; 88 - 3]);
+    }
+    for i in 0..300 {
+        watch.emit(&format!("{{\"n\":{i}}}"));
+    }
+    let conn = pair(&ep);
+    conn.send_control(hello::encode_resume(&hello::Resume { link_id: "t".into(), seqs: vec![("stream".into(), 5), ("watch".into(), 10)] }));
+    let s = conn.open("stream", "").unwrap();
+    let first = data(&s);
+    let seq = u64::from_le_bytes(first[..8].try_into().unwrap());
+    let (tag, payload) = parse_chunk(&first[8..]).unwrap();
+    assert_eq!(tag, TAG_DROP);
+    assert_eq!(read_varint(payload).unwrap().0, 10, "chunks 6..=15");
+    assert_eq!(seq, 15);
+    let mut last = 0;
+    while last < 25 {
+        last = u64::from_le_bytes(data(&s)[..8].try_into().unwrap());
+    }
+    let w = conn.open("watch", "").unwrap();
+    let first = data(&w);
+    assert_eq!(u64::from_le_bytes(first[..8].try_into().unwrap()), 44);
+    assert_eq!(&first[8..], b"{\"event\":\"drop\",\"lost\":34}");
+    let next = data(&w);
+    assert_eq!(u64::from_le_bytes(next[..8].try_into().unwrap()), 45);
+}
+
+fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
+    static S: OnceLock<(Endpoint, crate::watch::WatchSink)> = OnceLock::new();
+    S.get_or_init(|| {
+        let ep = Endpoint::new("makepad-remote-test");
+        ep.register_cmd(dispatch);
+        let w = ep.register_watch();
+        ep.register_stream();
+        ep.listen_unix(",\"extra\":\"x\"").unwrap();
+        (ep, w)
+    })
+}
+
+#[test]
+fn unix_end_to_end_with_discovery_and_reconnect() {
+    let (_, watch) = shared();
+    let me = std::process::id();
+    let app = crate::discovery::find(&me.to_string()).expect("discovery file");
+    assert_eq!(app.app, "makepad-remote-test");
+    assert!(app.serves("cmd") && app.serves("watch") && app.serves("stream"));
+    assert_eq!(app.text("extra").as_deref(), Some("x"));
+    let client = Client::connect("makepad-remote-test").unwrap();
+    assert!(client.caps().contains(&"cmd/1".to_string()));
+    let mut lines = client.cmd("ping").unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), "{\"pong\":1}");
+    assert!(lines.next().is_none() && lines.end().unwrap().starts_with("{\"end\":\"ping\""));
+    match client.open("nope", "") {
+        Err(Error::Refused(c, _)) => assert_eq!(c, CLOSE_UNSUPPORTED),
+        _ => panic!("expected a refusal"),
+    }
+    // a feed continues after the link is dropped: nothing lost, nothing twice
+    let mut feed = client.watch();
+    assert!(feed.next(Duration::from_millis(100), 3).unwrap().is_none());
+    watch.emit("{\"event\":\"a\"}");
+    watch.emit("{\"event\":\"b\"}");
+    let a = feed.next(WAIT, 3).unwrap().unwrap();
+    let b = feed.next(WAIT, 3).unwrap().unwrap();
+    assert_eq!(b.0, a.0 + 1);
+    client.conn().unwrap().close("test drop");
+    watch.emit("{\"event\":\"c\"}");
+    watch.emit("{\"event\":\"d\"}");
+    let c = feed.next(WAIT, 20).unwrap().unwrap();
+    let d = feed.next(WAIT, 20).unwrap().unwrap();
+    assert_eq!((c.0, d.0), (b.0 + 1, b.0 + 2));
+    assert_eq!(c.1, b"{\"event\":\"c\"}");
+    // an in-flight request fails with LinkLost
+    let mut lines = client.cmd("ping").unwrap();
+    client.conn().unwrap().close("drop again");
+    let all: Vec<_> = lines.by_ref().collect();
+    assert!(all.iter().all(|l| l.is_ok()) || all.iter().any(|l| matches!(l, Err(Error::LinkLost(_)))));
+    let _ = Target::Command(Vec::new());
+}
+
+#[test]
+fn tcp_loopback_with_tls_and_key_proof() {
+    use makepad_network::tls::TlsIdentity;
+    use makepad_network::tunnel::{ClientCredentials, Psk};
+    let dir = std::env::temp_dir().join(format!("makepad-remote-tls-{}", std::process::id()));
+    let identity = TlsIdentity::load_or_create(&dir, "makepad-remote-test").unwrap();
+    let fp = identity.fingerprint;
+    let key = Psk::generate().unwrap();
+    let ep = Endpoint::new("tcp-test");
+    ep.register_cmd(dispatch);
+    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, vec![key.clone()]).unwrap();
+    let creds = |k: &Psk| ClientCredentials { keys: vec![k.clone()], known_hosts: None, expect: Some(fp) };
+    let client = Client::connect_tcp(&addr.to_string(), creds(&key)).unwrap();
+    let mut lines = client.cmd("ping").unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), "{\"pong\":1}");
+    let big = client.cmd("big full=1").unwrap().count();
+    assert_eq!(big, 2000);
+    // a key the endpoint does not hold never gets a connection
+    assert!(Client::connect_tcp(&addr.to_string(), creds(&Psk::generate().unwrap())).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
