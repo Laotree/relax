@@ -454,9 +454,8 @@ impl Command {
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
         let exe = crate::path::Path::new(parts[0]);
         let p = crate::fs::canonicalize(crate::path::Path::new(&self.program)).ok()?;
-        // the Relax executable itself, or a copy of it (makepad-cef re-execs the program from a
-        // copy of its executable inside a synthetic app bundle): the copy runs this program
-        if p.as_path() != exe && !same_file_contents(p.as_path(), exe) {
+        // the Relax executable itself runs this program
+        if p.as_path() != exe {
             return None;
         }
         let mut out: Vec<OsString> = parts.iter().map(|x| OsString::from(*x)).collect();
@@ -873,26 +872,6 @@ impl fmt::Debug for Command {
             fmt::Debug::fmt(a, f)?;
         }
         Ok(())
-    }
-}
-
-/// Whether two files have the same bytes (a copy of an executable).
-/// The same file (dev + inode), or a copy of it: equal size and modification time (makepad-cef
-/// keeps the source's mtime on its bundle copy and re-copies on any change), else equal bytes.
-fn same_file_contents(a: &crate::path::Path, b: &crate::path::Path) -> bool {
-    use crate::os::unix::fs::MetadataExt;
-    match (crate::fs::metadata(a), crate::fs::metadata(b)) {
-        (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino() => return true,
-        (Ok(x), Ok(y)) if x.len() == y.len() => {
-            if matches!((x.modified(), y.modified()), (Ok(m), Ok(n)) if m == n) {
-                return true;
-            }
-        }
-        _ => return false,
-    }
-    match (crate::fs::read(a), crate::fs::read(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
     }
 }
 

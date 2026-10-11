@@ -50,8 +50,8 @@ pub fn ms_since_start() -> f64 {
 // (wall start, its Instant, continued across an exec)
 static PROCESS_START: std::sync::OnceLock<(std::time::SystemTime, std::time::Instant, bool)> = std::sync::OnceLock::new();
 
-/// The program replaced this process with the loader again (makepad-cef's exec into its app
-/// bundle: Relax's std sets this on that exec) -- the same session going on, so every clock
+/// The program replaced this process with the loader again (an exec of its own executable:
+/// Relax's std sets this on that exec) -- the same session going on, so every clock
 /// counts from the first process's start (epoch seconds), and first-frame / main times include
 /// both boots. Taken once at entry and removed, so no child launch inherits it.
 pub const EXEC_ORIGIN_ENV: &str = "RELAX_EXEC_ORIGIN_EPOCH";
