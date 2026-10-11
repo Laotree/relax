@@ -13468,3 +13468,15 @@ fn arithmetic_overflow_message(op: BinOp) -> &'static str {
         _ => unreachable!(),
     }
 }
+
+/// The runtime helpers lowering interns on first use, by symbol name: a cached entry naming one links
+/// before any lowering has run.
+pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<crate::rir::Sym> {
+    let (kind, addr) = match name {
+        "ext_free" => { let f: rt_fn_ty!(fn(u64)) = rt_ext_free; ("ext_free", f as usize as u64) }
+        "ext_get" => { let f: rt_fn_ty!(fn(u64, u64, u64) -> u64) = rt_ext_get; ("ext_get", f as usize as u64) }
+        "divrem128" => { let f: rt_fn_ty!(fn(u64, u64, u64, u64, u64) -> WideRet) = rt_divrem128; ("divrem128", f as usize as u64) }
+        _ => return None,
+    };
+    Some(u.syms.intern(crate::syms::SymKind::Rt(kind), addr))
+}

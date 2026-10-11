@@ -2052,6 +2052,7 @@ impl Cache {
         let replace = o3.is_some() || o2;
         let f = &u.fns[id as usize];
         if self.mode == Mode::ReadOnly || f.patch_gen != 0 || u.prog.is_edit_version(f.file) || (!replace && self.linked.contains(&id)) {
+            trace_lookup(u, id, "norecord:mode/patch/linked");
             return;
         }
         // a foreign fn's slot holds a jump to the C address (no relocation): never stored
@@ -2072,10 +2073,12 @@ impl Cache {
         let rejected = self.cert_rejected.contains(&key) && !self.pending_keys.contains(&key);
         let existing = (self.has_index(&key) && !rejected) || self.pending_keys.contains(&key);
         if existing && !replace {
+            trace_lookup(u, id, "norecord:exists");
             return;
         }
         let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, o2) else {
             let w = self.last_why;
+            trace_lookup(u, id, &format!("norecord:encode:{}", w));
             if o3.is_none() {
                 crate::warm::reason(id, &format!("unstorable:{}", w));
                 self.remember_outcome(u, id, Some(key), &format!("cold record-rejected:{}", w));
@@ -5948,7 +5951,9 @@ impl Linker {
     fn link_symbol(&mut self, u: &mut Unit, d: &mut D, rw: &mut Vec<Sym>) -> Option<Sym> {
         let tag = d.u8()?;
         let mut s = match tag {
-            1 => u.syms.find_rt(d.str()?)?,
+            // runtime helpers the lowering interns on first use (ext_get / ext_free / divrem128) are interned here the
+            // same way: a warm start links the entry before any lowering has asked for them
+            1 => { let n = d.str()?; match u.syms.find_rt(n) { Some(s) => s, None => crate::lower::intern_lazy_rt(u, n)? } }
             2 => {
                 let k = d.u128()?;
                 let a = self.link_data(u, k)?;

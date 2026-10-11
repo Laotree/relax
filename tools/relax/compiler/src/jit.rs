@@ -4628,6 +4628,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
 unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[crate::rir::RelocAt], record: bool) -> u64 {
     let _cost_install = crate::fncost::phase(6);
     // built while an earlier request's slot was open (it was left out): no cache record
+    if record && TAINTED.with(|t| t.get()) { crate::cache::trace_lookup(&*up, id, "norecord:tainted"); }
     let record = record && !TAINTED.with(|t| t.get());
     // a `#[relax(O2)]` fn's O1 code is not the cache's entry for it: the O2 worker's code is
     let o2 = record && marked_hot(&*up, id);
