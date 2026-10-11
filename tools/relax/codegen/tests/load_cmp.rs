@@ -87,3 +87,39 @@ fn load_compare_branches_as_the_extended_value() {
     }
     assert!(n > 0);
 }
+
+/// f(p) = if load<sz>(p + 8) { 1 } else { 2 }: the branch on a loaded value itself
+fn branch_fn(sz: u8, sx: bool) -> Func {
+    let mut f = Func::new("load_branch".to_string(), 0);
+    let p = f.vreg(Cls::I);
+    f.params = vec![p];
+    f.rets = vec![Cls::I];
+    let (b0, b1, b2) = (f.block(), f.block(), f.block());
+    let (t, one, two) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+    push(&mut f, b0, Inst::Load(Mem::Int(sz, sx), t, p, 8));
+    f.blocks[b0 as usize].term = Term::Branch(t, b1, b2);
+    push(&mut f, b1, Inst::Iconst(one, 1));
+    f.blocks[b1 as usize].term = Term::Ret(vec![one]);
+    push(&mut f, b2, Inst::Iconst(two, 2));
+    f.blocks[b2 as usize].term = Term::Ret(vec![two]);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+fn branch_on_a_loaded_value_tests_its_bytes() {
+    let env = x64::Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    for sz in [1u8, 2, 4, 8] {
+        for sx in [false, true] {
+            let c = x64::compile(&relax_session::Options::default(), &branch_fn(sz, sx), &env).unwrap();
+            let code = relax_codegen::exec::Code::new(&c.code).unwrap();
+            let run: extern "C" fn(*const u8) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+            for v in [0u64, 1, 0x80, 0x100, 0x1_0000, 0x1_0000_0000, u64::MAX] {
+                let mut buf = [0u8; 16];
+                buf[8..16].copy_from_slice(&v.to_le_bytes());
+                let low = if sz == 8 { v } else { v & ((1u64 << (sz as u32 * 8)) - 1) };
+                assert_eq!(run(buf.as_ptr()), if low != 0 { 1 } else { 2 }, "sz {sz} sx {sx} v {v:#x}");
+            }
+        }
+    }
+}

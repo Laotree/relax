@@ -1062,6 +1062,16 @@ impl<'a> Gen<'a> {
                     }
                 }
             }
+            // a branch on a loaded value itself (a bool field): cmp [p + o], 0
+            let mut load_branch = false;
+            if !fused && n >= 1 {
+                if let (Term::Branch(c, _, _), Inst::Load(Mem::Int(sz, _), t, base, off)) = (&b.term, &b.insts[n - 1]) {
+                    if c == t && base != t && self.al.uses[t.0 as usize] == 1 {
+                        self.load_fuse = Some((*base, *off, *sz, 0));
+                        load_branch = true;
+                    }
+                }
+            }
             // a block start can be a jump target: no spill store before it carries over, nor
             // the flags of the ALU op that ended the block above (a jump arrives with other ones)
             self.last_spill = None;
@@ -1083,8 +1093,11 @@ impl<'a> Gen<'a> {
                 if fused && ii == n - 1 {
                     break;
                 }
-                if (self.test_fuse.is_some() || self.load_fuse.is_some()) && ii == n - 2 {
+                if (self.test_fuse.is_some() || self.load_fuse.is_some() && !load_branch) && ii == n - 2 {
                     continue;
+                }
+                if load_branch && ii == n - 1 {
+                    break;
                 }
                 // a compare whose one use is the next select: fused into it (flags + cmov,
                 // or a scalar float branch)
@@ -2076,6 +2089,12 @@ impl<'a> Gen<'a> {
                                 Some(CC_NE)
                             }
                         }
+                    }
+                    _ if self.load_fuse.is_some() => {
+                        let (base, off, sz, k) = self.load_fuse.take().unwrap();
+                        let (rb, disp) = self.base_disp(options, base, R11, off);
+                        self.cmp_mem_imm(rb, disp, sz, k);
+                        Some(CC_NE)
                     }
                     _ => {
                         let r = self.use_i(options, *c, R10);
