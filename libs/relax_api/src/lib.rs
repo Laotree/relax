@@ -168,7 +168,31 @@ const fn anchor() -> Entry {
 }
 
 #[allow(dead_code)]
+fn platform() -> &'static str {
+    if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_arch = "wasm32") {
+        "wasm32"
+    } else {
+        "elf"
+    }
+}
+
+#[allow(dead_code)]
 unsafe fn between(start: *const Entry, stop: *const Entry) -> &'static [Entry] {
-    let n = (stop as usize - start as usize) / core::mem::size_of::<Entry>();
+    let bytes = stop as usize - start as usize;
+    let size = core::mem::size_of::<Entry>();
+    if bytes % size != 0 || (start as usize) % core::mem::align_of::<Entry>() != 0 {
+        panic!(
+            "relax_api table on {} is not whole Entrys: {} bytes (Entry is {} bytes), start {:#x}",
+            platform(),
+            bytes,
+            size,
+            start as usize
+        );
+    }
+    let n = bytes / size;
     core::slice::from_raw_parts(start, n)
 }

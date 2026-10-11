@@ -301,6 +301,9 @@ fn provided() {
             if e.module.split("::").next() != Some(krate) {
                 continue;
             }
+            if e.kind == 0 || e.kind > 4 {
+                continue;
+            }
             match e.kind {
                 makepad_relax_api::OP => {
                     if let Some(f) = e.shim {
