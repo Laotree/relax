@@ -61,6 +61,12 @@ pub const GLUE_CTOR: u8 = 16;
 /// whose key did not decode: never built
 pub const GLUE_UNNAMED: u8 = 15;
 
+/// A slot. Heap classes (memlane zones, DESIGN-zones.md F): identity fields are KEPT (built and
+/// grown under `zone_alloc::kept`, they survive a destroy of the compiler arena): key, name,
+/// code/code_len, pc_map, file, prev, compiled, patch_gen, refs, entry_ref*, inlined_into,
+/// version, retired, the flags, spec_state/spec_depth, build_ns/cg_ns. Compile-generation fields
+/// live in the compiler arena and are forgotten at the swap: rir, rir_refs, build_err, spec,
+/// calls, building, inflight.
 pub struct FnEntry {
     pub key: FnKey,
     pub name: String,
@@ -226,6 +232,14 @@ impl ReloadSlots {
 #[path = "zone_scan.rs"]
 pub(crate) mod zone_scan;
 
+/// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
+/// `zone_alloc::kept`; checked by RELAX_ZONE_CHECK, zone_scan.rs): the Unit box, code tables,
+/// fns/fn_map, consts, const_readers, body_deps, statics/static_spans, sites/site_ix, rt/rs,
+/// syms, start_order, vtables, locations, lit_data, provided*, slots, missing_stubs, patch_log,
+/// tier-1 state, stats, errors and the scalars/addresses. COMPILER generation (rebuilt or
+/// refilled after the swap): prog, tcx, lay, bodies, old_bodies, coro_*, spec_cached, the
+/// unwind/unpin/cycle/core-path memos, const_failed, cache, front, ctfe_fn_bodies, query_errors,
+/// reload_*.
 pub struct Unit {
     pub query_errors: relax_types::infer::diagnostics::DiagCtxt,
     /// retired (retire_unit): an auxiliary unit going away mid-run (the proc-macro world);
