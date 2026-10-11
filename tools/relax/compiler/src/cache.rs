@@ -2511,6 +2511,12 @@ impl Cache {
         true
     }
 
+    /// At exit, after the writes: the generations they replaced are deleted (retire_replaced_generations).
+    pub fn retire_replaced(&self) {
+        if self.mode == Mode::ReadOnly { return; }
+        if let Some(root) = self.dir.parent() { retire_replaced_generations(root); }
+    }
+
     pub fn flush_front_graphs() -> Result<(), String> {
         flush_front_graphs()
     }
@@ -2803,6 +2809,28 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
     let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     prune(root, &crate::store::live(), &crate::store::open_files(), cap)
+}
+
+/// At exit: every store's replaced generations go, including the ones this process itself
+/// read (it is ending; on Windows a mapped file cannot be deleted and stays for the next
+/// start's prune). Without this the generation a run's write replaced would stay on disk until
+/// the next start (a whole copy of each rewritten store).
+pub fn retire_replaced_generations(root: &std::path::Path) {
+    let dir = root.join("cache");
+    let names: Vec<String> = std::fs::read_dir(&dir).into_iter().flatten().flatten()
+        .filter_map(|e| e.file_name().into_string().ok()).filter(|n| crate::store::name_ours(n)).collect();
+    let mut newest: HashMap<String, u32> = HashMap::new();
+    for n in &names {
+        let (base, g) = crate::store::split_gen(n);
+        let e = newest.entry(base.to_string()).or_insert(0);
+        *e = (*e).max(g);
+    }
+    for n in &names {
+        let (base, g) = crate::store::split_gen(n);
+        if g < newest[base] {
+            crate::store::delete_checked(&dir.join(n));
+        }
+    }
 }
 
 /// prune_root with this run's stores `live` (generation 0 paths), the generation files it opened

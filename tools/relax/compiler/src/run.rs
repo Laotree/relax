@@ -2231,6 +2231,7 @@ fn summary_inner(why: &str) {
                         verbose!("relax-collected: not recorded at exit: the front end is still read by another thread");
                     }
                 }
+                if r.is_ok() { c.retire_replaced(); }
                 if !options.verbose {
                     if let Err(e) = &r { eprintln!("relax-cache: write: {}", e); }
                 }
