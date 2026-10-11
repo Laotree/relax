@@ -220,6 +220,23 @@ impl CfgSet {
                 v.push((format!("CARGO_CFG_{}", flag.to_uppercase()), String::new()));
             }
         }
+        // cargo gives a build script every `--cfg` of RUSTFLAGS the same way: `CARGO_CFG_HAL`
+        // (empty) for `--cfg hal`, `CARGO_CFG_KEY=value` for `--cfg key="value"` (several
+        // values of one key are joined by commas)
+        for e in &self.session.options.cfgs {
+            let (k, val) = e.split_once('=').unwrap_or((e.as_str(), ""));
+            let name = format!("CARGO_CFG_{}", k.to_uppercase());
+            match v.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, old)) if !val.is_empty() => {
+                    if !old.is_empty() {
+                        old.push(',');
+                    }
+                    old.push_str(val);
+                }
+                Some(_) => {}
+                None => v.push((name, val.to_string())),
+            }
+        }
         v
     }
 
