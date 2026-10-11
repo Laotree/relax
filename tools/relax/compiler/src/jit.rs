@@ -11202,6 +11202,7 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_probe_hist" => Some(crate::inspect::probes::relax_probe_hist as *const () as usize),
         b"__relax_probe_sample" => Some(crate::inspect::probes::relax_probe_sample as *const () as usize),
         b"__relax_probe_pause" => Some(crate::inspect::probes::relax_probe_pause as *const () as usize),
+        b"relax_register_inspect" => Some(crate::inspect::relax_register_inspect as *const () as usize),
         b"relax_gpu_span" => Some(crate::inspect::timeline::relax_gpu_span as *const () as usize),
         b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
         b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),

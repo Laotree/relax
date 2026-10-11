@@ -143,12 +143,8 @@ fn dispatch(req: &Req, out: &mut Out) {
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
-        // the program's GPU ledger (makepad-platform, MAKEPAD_INSPECT=1) answers on its own socket
-        "gpu" => {
-            if !makepad_inspect_serve::forward(req, out) {
-                out.err("no GPU ledger in this program (a makepad-platform app under relax run, or a native app started with MAKEPAD_INSPECT=1, answers it)");
-            }
-        }
+        // commands the program registered (`relax_register_inspect`): the GPU ledger's `gpu`
+        c if provider(c).is_some() => cmd_provided(req, out),
         "probe" => probes::cmd(req, out),
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
@@ -577,6 +573,46 @@ pub fn script_stack_field(key: &str, thread: u64) -> String {
 /// A Splash script error (makepad-script's error hook): an agent's `scripterr` event.
 pub fn script_error_event(line: &str) {
     events::emit("scripterr", line, &format!("\"error\":{},\"more\":[\"vms\"]", json_str(&short(line, 400))));
+}
+
+/// A command the running program answers itself: `query(line, sink, ctx)` writes the reply's JSON
+/// lines through `sink` (called from the inspect thread; the program's code does its own thread
+/// hand-over).
+pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void);
+
+static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery)>> = std::sync::Mutex::new(Vec::new());
+
+/// The program registers the command `name` (makepad-platform: `gpu`); a later registration
+/// replaces the earlier one.
+pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: ProgramQuery) {
+    let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
+    let mut p = PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
+    p.retain(|x| x.0 != name);
+    p.push((name, query));
+}
+
+fn provider(cmd: &str) -> Option<ProgramQuery> {
+    PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == cmd).map(|x| x.1)
+}
+
+fn cmd_provided(req: &Req, out: &mut Out) {
+    let Some(query) = provider(&req.cmd) else { return };
+    let mut line = req.cmd.clone();
+    for p in &req.pos {
+        line.push(' ');
+        line.push_str(p);
+    }
+    for (k, v) in &req.kv {
+        line.push_str(&format!(" {k}={v}"));
+    }
+    extern "C" fn sink(p: *const u8, len: usize, ctx: *mut std::ffi::c_void) {
+        let out = unsafe { &mut *(ctx as *mut Out) };
+        let text = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(p, len)) };
+        for l in text.lines() {
+            out.line(l);
+        }
+    }
+    query(line.as_ptr(), line.len(), sink, out as *mut Out as *mut std::ffi::c_void);
 }
 
 fn cmd_vms(out: &mut Out) {
