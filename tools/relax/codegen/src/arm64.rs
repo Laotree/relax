@@ -1613,11 +1613,12 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// d = this thread's thread-local block + off. Fast path: the block pointer sits in
-    /// the thread's pthread TSD slot (tpidrro_el0 base); a null slot calls `tls_slow`.
+    /// d = this thread's thread-local block + off. Fast path: the block pointer sits in a
+    /// word of the thread's slot array (macOS: pthread TSD slot `key` at tpidrro_el0; Android:
+    /// bionic TLS_SLOT_APP at tpidr_el0, os/tls.rs); a null slot calls `tls_slow`.
     fn tls_addr(&mut self, d: VReg, off: Sym) {
-        // mrs x16, tpidrro_el0; and x16, x16, #~7; ldr x17, =key*8; ldr x16, [x16, x17]
-        self.a.e(0xD53B_D060 | IP0 as u32);
+        // mrs x16, <thread slot base>; and x16, x16, #~7; ldr x17, =key*8; ldr x16, [x16, x17]
+        self.a.e(MRS_SLOT_BASE | IP0 as u32);
         self.a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
         self.ldr_reloc(IP1, Reloc::TlsKey);
         self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
@@ -3697,9 +3698,17 @@ pub fn tls_slow(host: u64) -> Vec<u8> {
 
 /// `read_tsd(key) -> value`: this thread's TSD slot through tpidrro_el0, exactly the
 /// sequence `tls_addr` inlines (checked against pthread_getspecific at startup).
+/// `mrs xN, <register holding the thread's slot array>` (N or-ed in). macOS: tpidrro_el0 (the
+/// pthread TSD base; its low 3 bits carry the cpu number, masked off after). Android: tpidr_el0,
+/// bionic's thread pointer = its TLS slot array (bionic libc/platform/bionic/tls_defines.h).
+#[cfg(not(target_os = "android"))]
+const MRS_SLOT_BASE: u32 = 0xD53B_D060;
+#[cfg(target_os = "android")]
+const MRS_SLOT_BASE: u32 = 0xD53B_D040;
+
 pub fn tsd_reader() -> Vec<u8> {
     let mut a = Asm { w: Vec::new() };
-    a.e(0xD53B_D060 | IP0 as u32);
+    a.e(MRS_SLOT_BASE | IP0 as u32);
     a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
     // ldr x0, [x16, x0, lsl #3]
     a.e(0xF860_7800 | (IP0 as u32) << 5);

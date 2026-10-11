@@ -5,7 +5,7 @@
 //! - `get(key)` / `set(key, block)`: the calling thread's block.
 //! - `jit_offset(key, emit)`: the value of `Env::tls_key` for this OS (`emit` places glue code
 //!   and returns its address): Linux x86-64 the fs-relative offset of a static-TLS cell, macOS
-//!   the TSD slot (checked against pthread_getspecific).
+//!   the TSD slot (checked against pthread_getspecific), Android bionic's TLS_SLOT_APP.
 
 include!("../rt_abi.rs");
 pub use imp::*;
@@ -68,17 +68,37 @@ mod imp {
 mod imp {
     pub use super::unix::{get, key_create};
 
-    pub fn set(key: u64, block: *mut u8) {
-        unsafe { super::unix::pthread_setspecific(key as usize, block); }
+    /// bionic TLS_SLOT_APP: word 2 of the slot array tpidr_el0 points at, "available for use by
+    /// apps in API level 29 and later" (bionic libc/platform/bionic/tls_defines.h; our minSdk is
+    /// 30). The process is ours (one makepad run host), so Relax owns the slot. The pthread key
+    /// stays for its thread-exit destructor; JIT code reads the slot (codegen arm64 tls_addr).
+    const TLS_SLOT_APP: u64 = 2;
+
+    fn slot() -> *mut u64 {
+        let tp: u64;
+        unsafe { core::arch::asm!("mrs {}, tpidr_el0", out(reg) tp, options(nomem, nostack, preserves_flags)); }
+        (tp as *mut u64).wrapping_add(TLS_SLOT_APP as usize)
     }
 
-    // Compiled thread-locals are NOT implemented on Android (codegen2, android lane item A5):
-    // codegen/arm64.rs tls_addr reads the Darwin TSD base from tpidrro_el0, which is 0 on
-    // Linux/Android (the thread pointer is tpidr_el0), so JIT code touching a thread-local
-    // would fault. Fail loudly here instead of handing it a bogus slot. Relax's own
-    // (rustc-built) code uses get/set above and is fine.
-    pub fn jit_offset(_key: u64, _emit: &dyn Fn(&[u8]) -> u64) -> u64 {
-        panic!("Android: compiled thread-locals are not implemented (arm64 tls_addr needs a tpidr_el0 / AAPCS64 TLS path in codegen)")
+    pub fn set(key: u64, block: *mut u8) {
+        unsafe {
+            super::unix::pthread_setspecific(key as usize, block);
+            slot().write_volatile(block as u64);
+        }
+    }
+
+    /// The slot index JIT code reads (`Env::tls_key`), checked through the emitted reader.
+    pub fn jit_offset(key: u64, emit: &dyn Fn(&[u8]) -> u64) -> u64 {
+        let reader = emit(&crate::arm64::tsd_reader());
+        let read: extern "C" fn(u64) -> u64 = unsafe { std::mem::transmute(reader as usize) };
+        let old = get(key);
+        set(key, 0x5a5a_0000 as *mut u8);
+        let seen = read(TLS_SLOT_APP);
+        set(key, old);
+        if seen != 0x5a5a_0000 {
+            panic!("thread-local fast path: bionic TLS_SLOT_APP reads {:#x}", seen);
+        }
+        TLS_SLOT_APP
     }
 }
 
