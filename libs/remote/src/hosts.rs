@@ -5,6 +5,7 @@
 //! via = "ssh"
 //! ssh = "arch@192.0.2.16"
 //! relax = "[path]/bin/relax"   # optional: the relax binary on that host
+//! env = { DISPLAY = ":0" }          # optional: environment of the sessions launched there
 //!
 //! [host.phone]
 //! via = "dial"                      # the host dials in to the hub's TCP listener
@@ -18,8 +19,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Via {
-    /// reached with `ssh <ssh> <relax> remote-relay`
-    Ssh { ssh: String, relax: String },
+    /// reached with `ssh <ssh> <relax> remote-relay [--env K=V ...]`
+    Ssh { ssh: String, relax: String, env: Vec<(String, String)> },
     /// dials in; `key` and `fingerprint` are hex
     Dial { key: String, fingerprint: String },
 }
@@ -50,6 +51,11 @@ pub fn identity_dir() -> PathBuf {
     config_dir().join("identity")
 }
 
+/// Environment variable names: what a shell accepts and a TOML bare key holds.
+pub fn valid_env_name(name: &str) -> bool {
+    !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Host names are TOML bare keys without dots, and one word on a command line.
 pub fn valid_name(name: &str) -> bool {
     !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -67,6 +73,20 @@ fn quote(s: &str) -> String {
     }
     o.push('"');
     o
+}
+
+fn parse_env(host: &str, v: Option<&Toml>) -> Result<Vec<(String, String)>, String> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    let Toml::Table(t) = v else { return Err(format!("host `{host}`: env must be a table like env = {{ DISPLAY = \":0\" }}")) };
+    let mut out = Vec::new();
+    for (k, v) in t {
+        if !valid_env_name(k) {
+            return Err(format!("host `{host}`: env name `{k}`: use letters, digits and `_`"));
+        }
+        let v = v.as_str().ok_or_else(|| format!("host `{host}`: env {k} must be a string"))?;
+        out.push((k.clone(), v.to_string()));
+    }
+    Ok(out)
 }
 
 impl Hosts {
@@ -101,7 +121,9 @@ impl Hosts {
                 Some("ssh") => Via::Ssh {
                     ssh: text("ssh").ok_or_else(|| format!("host `{name}`: via = \"ssh\" needs ssh = \"user@host\""))?,
                     relax: text("relax").unwrap_or_else(|| "relax".into()),
+                    env: parse_env(name, t.get("env"))?,
                 },
+                Some("dial") if t.contains_key("env") => return Err(format!("host `{name}`: env applies to via = \"ssh\" hosts; a dialling relay takes `--env K=V` on its command line")),
                 Some("dial") => Via::Dial {
                     key: text("key").ok_or_else(|| format!("host `{name}`: via = \"dial\" needs key = \"<hex>\""))?,
                     fingerprint: text("fingerprint").unwrap_or_default(),
@@ -119,10 +141,14 @@ impl Hosts {
         for h in &self.hosts {
             s.push_str(&format!("\n[host.{}]\n", h.name));
             match &h.via {
-                Via::Ssh { ssh, relax } => {
+                Via::Ssh { ssh, relax, env } => {
                     s.push_str(&format!("via = \"ssh\"\nssh = {}\n", quote(ssh)));
                     if relax != "relax" {
                         s.push_str(&format!("relax = {}\n", quote(relax)));
+                    }
+                    if !env.is_empty() {
+                        let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k} = {}", quote(v))).collect();
+                        s.push_str(&format!("env = {{ {} }}\n", pairs.join(", ")));
                     }
                 }
                 Via::Dial { key, fingerprint } => {

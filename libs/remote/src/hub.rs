@@ -55,8 +55,13 @@ struct HostLink {
 impl HostLink {
     fn new(host: Host) -> HostLink {
         let client = match &host.via {
-            Via::Ssh { ssh, relax } => {
-                let argv: Vec<String> = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", ssh, &format!("{relax} remote-relay")].iter().map(|s| s.to_string()).collect();
+            Via::Ssh { ssh, relax, env } => {
+                // the remote shell splits the command: every env pair is one single-quoted word
+                let mut remote = format!("{relax} remote-relay");
+                for (k, v) in env {
+                    remote.push_str(&format!(" --env '{}'", format!("{k}={v}").replace('\'', "'\\''")));
+                }
+                let argv: Vec<String> = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3", ssh, &remote].iter().map(|s| s.to_string()).collect();
                 Some(Client::new(Target::Command(argv), "hub"))
             }
             Via::Dial { .. } => None,

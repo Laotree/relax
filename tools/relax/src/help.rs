@@ -305,11 +305,13 @@ fn inspect_page(st: &Style) -> String {
     p.section("Other machines:");
     p.row("<host>:<app|pid> <command>", "Ask an app on a host of hosts.toml (via the hub)");
     p.row("<host>:list", "That host's running apps");
-    p.row("<host>:session launch <app>", "Start a hidden session there (kill <pid> ends it)");
+    p.row("<host>:session launch <app>", "Start a hidden session there (kill <pid> ends it, also after the hub restarted)");
+    p.row("<host>:session relaunch <pid>", "Kill it and start the same app again (process level for now)");
     p.row("hosts", "Registry, link state and round trip");
     p.row("all:list", "Apps here and on every host");
     p.text("Hosts are added with `relax remote add <name> --ssh user@host` or paired with");
     p.text("`relax remote pair <name> --hub <addr>` (the device dials `relax hub --listen`).");
+    p.text("`--env NAME=value` on `remote add` (hosts.toml: env = { DISPLAY = \":0\" }) sets the environment of its sessions.");
     p.out
 }
 

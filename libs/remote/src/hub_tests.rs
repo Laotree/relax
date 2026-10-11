@@ -28,8 +28,21 @@ fn hosts() -> Hosts {
     Hosts { hosts: vec![Host { name: "d".into(), via: Via::Dial { key: "00".repeat(32), fingerprint: String::new() } }] }
 }
 
+fn ledger_dir(test: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("makepad-remote-test-ledger-{}-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 fn relay_endpoint() -> Endpoint {
-    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["/bin/sleep".into()], env: vec![("SANDBOX_MUTE".into(), "1".into())] })
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    relay::endpoint(relay::Config { name: "d".into(), launch: vec!["/bin/sleep".into()], env: vec![("SANDBOX_MUTE".into(), "1".into())], ledger: ledger_dir(&format!("shared{n}")) })
+}
+
+/// A relay on an existing ledger (what a restarted relay does).
+fn relay_on(dir: &std::path::Path, launch: Vec<String>, env: Vec<(String, String)>) -> Endpoint {
+    relay::endpoint(relay::Config { name: "d".into(), launch, env, ledger: dir.to_path_buf() })
 }
 
 /// A relay named `d` links itself to the hub over a socket pair.
@@ -223,7 +236,7 @@ fn dial_host(name: &str, key: &makepad_network::tunnel::Psk) -> Host {
 }
 
 fn relay_named(name: &str) -> Endpoint {
-    relay::endpoint(relay::Config { name: name.into(), launch: vec![], env: vec![] })
+    relay::endpoint(relay::Config { name: name.into(), launch: vec![], env: vec![], ledger: ledger_dir(name) })
 }
 
 fn dial_relay(ep: Endpoint, addr: &str, key: makepad_network::tunnel::Psk, fp: [u8; 32]) {
@@ -281,4 +294,107 @@ fn hosts_registry_round_trips() {
     assert_eq!(Hosts::parse(&h.to_text()).unwrap(), h);
     assert!(Hosts::parse("[host.x]\nvia = \"carrier-pigeon\"\n").unwrap_err().contains("via must be"));
     assert!(Hosts::parse("[host.x]\nvia = \"ssh\"\n").unwrap_err().contains("needs ssh"));
+}
+
+fn ask(ch: &Channel, line: &str) -> Vec<String> {
+    ch.send(line.as_bytes().to_vec()).unwrap();
+    lines_of(ch)
+}
+
+fn field(line: &str, key: &str) -> String {
+    let pat = format!("\"{key}\":");
+    let rest = &line[line.find(&pat).unwrap() + pat.len()..];
+    let rest = rest.trim_start_matches('"');
+    rest.split(|c| c == ',' || c == '}' || c == '"').next().unwrap().to_string()
+}
+
+fn wait_state(ch: &Channel, pid: u32, want: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..200 {
+        last = ask(ch, "launched").into_iter().find(|l| l.contains(&format!("\"pid\":{pid},"))).unwrap_or_default();
+        if last.contains(want) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    last
+}
+
+#[test]
+fn the_ledger_lets_a_restarted_relay_kill_and_drops_stale_entries() {
+    let dir = ledger_dir("restart");
+    // the first relay launches a session, then goes away
+    let hub1 = Hub::new(&hosts());
+    let first = link(&hub1, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let c1 = client(&hub1);
+    let ch1 = c1.open("route", "d session").unwrap();
+    let pid: u32 = field(&ask(&ch1, "launch 30")[0], "launched").parse().unwrap();
+    assert!(dir.join(format!("{pid}.json")).exists());
+    first.close("relay restart");
+    first.wait_closed();
+    // a stale entry: this very process with a start time it never had
+    std::fs::write(dir.join(format!("{}.json", std::process::id())), format!("{{\"pid\":{},\"start\":1,\"app\":\"x\",\"args\":\"\",\"cwd\":\"\",\"env_keys\":\"\",\"log\":\"/dev/null\"}}", std::process::id())).unwrap();
+    // a new relay on the same ledger knows the session
+    let hub2 = Hub::new(&hosts());
+    let _second = link(&hub2, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let c2 = client(&hub2);
+    let ch2 = c2.open("route", "d session").unwrap();
+    let listed = ask(&ch2, "launched");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].contains(&format!("\"pid\":{pid},")) && listed[0].contains("\"state\":\"running\""), "{listed:?}");
+    assert!(!dir.join(format!("{}.json", std::process::id())).exists(), "the stale entry is deleted");
+    let refused = ask(&ch2, &format!("kill {}", std::process::id()));
+    assert!(refused[0].contains("was not launched"), "{refused:?}");
+    assert_eq!(ask(&ch2, &format!("kill {pid}"))[0], format!("{{\"killed\":{pid}}}"));
+    assert!(wait_state(&ch2, pid, "exited").contains("exited"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn relaunch_starts_the_same_app_again() {
+    let dir = ledger_dir("relaunch");
+    let hub = Hub::new(&hosts());
+    let _l = link(&hub, &relay_on(&dir, vec!["/bin/sleep".into()], vec![]));
+    let c = client(&hub);
+    let ch = c.open("route", "d session").unwrap();
+    let old: u32 = field(&ask(&ch, "launch 30")[0], "launched").parse().unwrap();
+    let r = ask(&ch, &format!("relaunch {old}"));
+    assert!(r[0].starts_with("{\"relaunched\":"), "{r:?}");
+    let new: u32 = field(&r[0], "relaunched").parse().unwrap();
+    assert_ne!(new, old);
+    assert_eq!(field(&r[0], "was"), old.to_string());
+    assert!(wait_state(&ch, old, "exited").contains("exited"));
+    assert!(wait_state(&ch, new, "running").contains("running"));
+    let none = ask(&ch, "relaunch 1");
+    assert!(none[0].contains("was not launched"), "{none:?}");
+    assert_eq!(ask(&ch, &format!("kill {new}"))[0], format!("{{\"killed\":{new}}}"));
+    assert!(wait_state(&ch, new, "exited").contains("exited"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn launches_get_the_relays_env() {
+    let dir = ledger_dir("env");
+    let hub = Hub::new(&hosts());
+    let _l = link(&hub, &relay_on(&dir, vec!["/usr/bin/env".into()], vec![("T3B_PROBE".into(), "from-hosts-toml".into())]));
+    let c = client(&hub);
+    let ch = c.open("route", "d session").unwrap();
+    let l = ask(&ch, "launch printenv T3B_PROBE");
+    let pid: u32 = field(&l[0], "launched").parse().unwrap();
+    let log = field(&l[0], "log");
+    assert!(wait_state(&ch, pid, "exited").contains("exited"));
+    assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "from-hosts-toml");
+    let _ = std::fs::remove_file(&log);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_env_round_trips_in_hosts_toml() {
+    let text = "[host.n]\nvia = \"ssh\"\nssh = \"a@b\"\nenv = { DISPLAY = \":0\", WAYLAND_DISPLAY = \"wayland-1\" }\n";
+    let h = Hosts::parse(text).unwrap();
+    let Via::Ssh { env, .. } = &h.get("n").unwrap().via else { panic!() };
+    assert_eq!(env.len(), 2);
+    assert!(env.contains(&("DISPLAY".to_string(), ":0".to_string())));
+    assert_eq!(Hosts::parse(&h.to_text()).unwrap(), h);
+    assert!(Hosts::parse("[host.d]\nvia = \"dial\"\nkey = \"00\"\nenv = { A = \"b\" }\n").is_err());
 }

@@ -43,8 +43,9 @@ pub fn hub(args: &[String]) -> i32 {
     }
 }
 
-/// `relax remote-relay [--dial <hub host:port> --key-file <path> [--name <n>] [--fingerprint <hex>]]`:
+/// `relax remote-relay [--env NAME=value ...] [--dial <hub host:port> --key-file <path> [--name <n>] [--fingerprint <hex>]]`:
 /// serves this machine's endpoints to a hub, over stdin/stdout (run through ssh) or by dialling.
+/// `--env` adds to the environment of the sessions it launches (the hub passes a host's `env`).
 pub fn relay(args: &[String]) -> i32 {
     #[cfg(unix)]
     {
@@ -54,11 +55,19 @@ pub fn relay(args: &[String]) -> i32 {
             return 1;
         };
         let name = flag(args, "--name").unwrap_or("relay").to_string();
-        let cfg = relay::Config {
-            name,
-            launch: vec![exe.display().to_string(), "run".into()],
-            env: vec![("MAKEPAD_HIDE_WINDOWS".into(), "1".into()), ("SANDBOX_MUTE".into(), "1".into())],
-        };
+        let mut env: Vec<(String, String)> = vec![("MAKEPAD_HIDE_WINDOWS".into(), "1".into()), ("SANDBOX_MUTE".into(), "1".into())];
+        for (i, a) in args.iter().enumerate() {
+            if a != "--env" {
+                continue;
+            }
+            let Some((k, v)) = args.get(i + 1).and_then(|p| p.split_once('=')).filter(|(k, _)| hosts::valid_env_name(k)) else {
+                eprintln!("remote-relay: --env needs NAME=value");
+                return 2;
+            };
+            env.retain(|(have, _)| have != k);
+            env.push((k.to_string(), v.to_string()));
+        }
+        let cfg = relay::Config { name, launch: vec![exe.display().to_string(), "run".into()], env, ledger: relay::default_ledger() };
         let ep = relay::endpoint(cfg);
         let Some(addr) = flag(args, "--dial") else {
             return match relay::serve_stdio(&ep) {
@@ -91,7 +100,7 @@ pub fn relay(args: &[String]) -> i32 {
 }
 
 fn remote_usage() -> i32 {
-    eprintln!("usage: relax remote add <name> --ssh <user@host> [--relax <path on that host>]");
+    eprintln!("usage: relax remote add <name> --ssh <user@host> [--relax <path on that host>] [--env NAME=value ...]");
     eprintln!("       relax remote pair <name> [--hub <host:port>] [--print | --adb | --ssh <user@host>]");
     eprintln!("       relax remote list");
     2
@@ -108,7 +117,14 @@ pub fn remote(args: &[String]) -> i32 {
                     return Err(format!("host name `{name}`: use letters, digits, `-` and `_`"));
                 }
                 let mut reg = registry()?;
-                reg.set(Host { name: name.clone(), via: Via::Ssh { ssh: ssh.to_string(), relax: flag(args, "--relax").unwrap_or("relax").to_string() } });
+                let mut env = Vec::new();
+                for (i, a) in args.iter().enumerate() {
+                    if a == "--env" {
+                        let (k, v) = args.get(i + 1).and_then(|p| p.split_once('=')).filter(|(k, _)| hosts::valid_env_name(k)).ok_or("add: --env NAME=value")?;
+                        env.push((k.to_string(), v.to_string()));
+                    }
+                }
+                reg.set(Host { name: name.clone(), via: Via::Ssh { ssh: ssh.to_string(), relax: flag(args, "--relax").unwrap_or("relax").to_string(), env } });
                 reg.save(&hosts::registry_path()).map_err(|e| e.to_string())
             }
             Some("pair") => {
@@ -133,7 +149,7 @@ pub fn remote(args: &[String]) -> i32 {
             Some("list") => {
                 for h in registry()?.hosts {
                     match h.via {
-                        Via::Ssh { ssh, relax } => println!("{} ssh {ssh} {relax}", h.name),
+                        Via::Ssh { ssh, relax, .. } => println!("{} ssh {ssh} {relax}", h.name),
                         Via::Dial { .. } => println!("{} dial", h.name),
                     }
                 }
