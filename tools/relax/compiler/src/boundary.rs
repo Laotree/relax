@@ -348,7 +348,7 @@ pub fn run(up: *mut Unit) -> String {
         }
     }
     for (_, pc) in u.provided.iter() {
-        let _ = writeln!(out, "# relax_api {}: {} ops, {} handles, {} plain, {} owns", pc.name, pc.shims.len(), pc.types.len(), pc.layouts.len(), pc.owns.len());
+        let _ = writeln!(out, "# relax_api {}: {} ops, {} handles, {} plain", pc.name, pc.shims.len(), pc.types.len(), pc.layouts.len());
     }
     entry_bad.sort();
     let _ = writeln!(out, "# relax_api entries without a matching fn: {}", entry_bad.len());

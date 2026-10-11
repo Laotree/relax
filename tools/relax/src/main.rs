@@ -296,7 +296,6 @@ fn provided() {
         let mut shims = HashMap::new();
         let mut types = HashMap::new();
         let mut layouts = HashMap::new();
-        let mut owns = HashSet::new();
         for e in makepad_relax_api::entries() {
             if e.module.split("::").next() != Some(krate) {
                 continue;
@@ -316,13 +315,10 @@ fn provided() {
                 makepad_relax_api::PLAIN => {
                     layouts.insert(relax_compiler::provided::norm((e.key)()), (e.size, e.align, e.offsets));
                 }
-                makepad_relax_api::OWNS => {
-                    owns.insert(relax_compiler::provided::norm((e.key)()));
-                }
                 _ => {}
             }
         }
-        relax_compiler::provided::register(krate, shims, types, layouts, owns, makepad_relax_api::last_panic, src(krate));
+        relax_compiler::provided::register(krate, shims, types, layouts, makepad_relax_api::last_panic, src(krate));
     }
 
     // Splash VM registry -> relax inspect (vm list, script error events)

@@ -9,9 +9,7 @@
 //! - `#[relax_api(plain)]` on a struct/enum: plain data JIT code reads, builds and drops itself
 //!   (Relax checks rustc's size, align and field offsets against its own);
 //! - `#[relax_api(handle[, clone][, eq][, hash][, debug][, display])]` on a struct/enum: an opaque
-//!   handle -- rustc's size/align/drop (and the listed trait ops) cross, its fields never do;
-//! - `#[relax_api(owns)]` on a fn that is no op: its raw ownership calls (`Box::from_raw` ..)
-//!   work objects JIT code allocated itself (reviewed), so Relax may compile it from source.
+//!   handle -- rustc's size/align/drop (and the listed trait ops) cross, its fields never do.
 //!
 //! In a normal build the attribute leaves the item as it is. With the crate's `host-shims`
 //! feature (only the `relax` build enables it) it also emits, next to the item, an extern "C"
@@ -28,7 +26,6 @@ pub type DropFn = unsafe extern "C" fn(*mut u8);
 pub const OP: u32 = 1;
 pub const HANDLE: u32 = 2;
 pub const PLAIN: u32 = 3;
-pub const OWNS: u32 = 4;
 
 /// One marked item, as the attribute lays it down in the `relax_api` link section.
 #[repr(C)]
@@ -36,7 +33,7 @@ pub struct Entry {
     pub kind: u32,
     /// `module_path!()` where the item is marked (its crate is the first segment)
     pub module: &'static str,
-    /// OP/OWNS: `core::any::type_name` of the fn item (`<f32 as krate::traits::ScriptNew>::script_new`,
+    /// OP: `core::any::type_name` of the fn item (`<f32 as krate::traits::ScriptNew>::script_new`,
     /// `krate::heap::ScriptHeap::value`); HANDLE/PLAIN: the type's path; a handle's trait ops:
     /// `<path as Clone>::clone`, `<path as PartialEq>::eq`, `<path as Hash>::hash_into`,
     /// `<path as Fmt>::fmt_into`

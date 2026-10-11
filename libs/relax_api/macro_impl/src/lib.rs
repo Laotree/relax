@@ -474,19 +474,7 @@ fn op_code(o: &Owner, s: &Sig) -> String {
     )
 }
 
-fn owns_code(o: &Owner, s: &Sig) -> String {
-    let key = key_code(o, &s.name);
-    let id = fnv(&format!("owns {} {}", text(&o.self_ty, None), s.name));
-    format!(
-        "{CFG} {SECTION} #[doc(hidden)] #[allow(non_upper_case_globals)] static __relax_api_o{id:016x}: ::makepad_relax_api::Entry = ::makepad_relax_api::Entry {{
-  kind: ::makepad_relax_api::OWNS, module: module_path!(),
-  key: {key},
-  sig: {{ fn s() -> &'static str {{ \"\" }} s }},
-  shim: None, slots: &[], size: 0, align: 0, offsets: &[], drop: None }};"
-    )
-}
-
-fn expand_fn(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String), String> {
+fn expand_fn(toks: &[TokenTree], _args: &[String]) -> Result<(TokenStream, String), String> {
     let (s, _, _) = parse_fn(toks, 0).ok_or("cannot read the fn")?;
     if s.generic {
         return Err(format!("`{}` is generic: an op has one compiled body", s.name));
@@ -495,7 +483,7 @@ fn expand_fn(toks: &[TokenTree], args: &[String]) -> Result<(TokenStream, String
         return Err(format!("`{}` is a method: put #[relax_api] on its impl block (and on the method inside it)", s.name));
     }
     let o = Owner { self_ty: Vec::new(), trait_: None };
-    let extra = if args.iter().any(|a| a == "owns") { owns_code(&o, &s) } else { op_code(&o, &s) };
+    let extra = op_code(&o, &s);
     Ok((toks.iter().cloned().collect(), extra))
 }
 

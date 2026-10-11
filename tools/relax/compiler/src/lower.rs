@@ -444,12 +444,13 @@ impl<'a> Lcx<'a> {
             return;
         }
         let crate::jit::FnKey::Inst(cd, cargs) = self.u.fns[callee as usize].key.clone() else { return };
-        // a Box of a provided crate's opaque type is a pointer whose drop runs rustc's drop shim:
-        // wrapping and unwrapping it moves no object across (the host's VM slot)
-        if cargs.first().is_some_and(|t| matches!(self.u.tcx.tys.kind(*t), TyKind::Adt(ad, a, _) if a.is_empty() && self.u.provided_types.contains_key(ad))) {
+        let path = self.u.prog.def_path(cd);
+        // a Box of a provided crate's opaque type is one owner: JIT code allocates it, rustc's
+        // drop shim runs on the inner value, JIT code frees the box; wrapping and unwrapping it
+        // moves no object across (the host's VM slot: take_vm / restore_vm)
+        if (path.starts_with("core::boxed::") || path.starts_with("alloc::boxed::")) && cargs.first().is_some_and(|t| matches!(self.u.tcx.tys.kind(*t), TyKind::Adt(ad, a, _) if a.is_empty() && self.u.provided_types.contains_key(ad))) {
             return;
         }
-        let path = self.u.prog.def_path(cd);
         const RAW: [&str; 9] = [
             "::increment_strong_count",
             "::decrement_strong_count",
@@ -464,10 +465,7 @@ impl<'a> Lcx<'a> {
         let std_owner = path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::");
         if std_owner && RAW.iter().any(|r| path.ends_with(r)) {
             let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
-            if crate::provided::owns(&self.u.provided, krate, &key) {
-                return;
-            }
-            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or #[relax_api(owns)] if the object is one JIT code allocated", key, path, key));
+            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
         }
     }
 

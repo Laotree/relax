@@ -55,8 +55,6 @@ pub struct ProvidedCrate {
     /// plain types by def path: rustc's (size, align, field offsets), checked against Relax's at
     /// unit creation
     pub layouts: HashMap<String, (u64, u64, &'static [u64])>,
-    /// fns marked `#[relax_api(owns)]`: their raw ownership calls work objects JIT code allocated
-    pub owns: std::collections::HashSet<String>,
     pub last_panic: LastPanicFn,
     /// the source identity rustc built it from (srchash.rs; the loader's build.rs)
     pub source: u64,
@@ -64,7 +62,7 @@ pub struct ProvidedCrate {
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), owns: self.owns.clone(), last_panic: self.last_panic, source: self.source }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), last_panic: self.last_panic, source: self.source }
     }
 }
 
@@ -82,12 +80,11 @@ pub fn register(
     shims: HashMap<String, Shim>,
     types: HashMap<String, (u64, u64, Option<DropFn>)>,
     layouts: HashMap<String, (u64, u64, &'static [u64])>,
-    owns: std::collections::HashSet<String>,
     last_panic: LastPanicFn,
     source: u64,
 ) {
     let name = name.replace('-', "_");
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, owns, last_panic, source });
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, last_panic, source });
 }
 
 /// The registered crates whose source in the program is what the loader was built from
@@ -538,7 +535,4 @@ pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(
     out
 }
 
-/// Whether `key` (an fn of a provided crate) is marked `#[relax_api(owns)]`.
-pub fn owns(provided: &[(u32, ProvidedCrate)], krate: u32, key: &str) -> bool {
-    provided.iter().any(|(k, pc)| *k == krate && pc.owns.contains(key))
-}
+
