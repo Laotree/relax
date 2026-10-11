@@ -482,16 +482,11 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
             _ => rel.push((at, kind, IMG_SYM, tab.sym(&mut d)?)),
         }
     }
-    let m = d.u32()? as usize;
-    let mut raw = Vec::with_capacity(m);
-    for _ in 0..m {
-        raw.push((d.u32()?, d.u32()?, d.u32()?));
-    }
+    let raw = crate::jit::PcMap::decode(d.bytes()?);
     let nf = d.u32()? as usize;
     let mut files = Vec::with_capacity(nf);
     for _ in 0..nf {
         let start = d.p;
-        d.str()?;
         d.u128()?;
         files.push(tab.files.id(&payload[start..d.p]));
     }
@@ -528,7 +523,7 @@ fn image_slot(tab: &mut ImageTables, out: &mut E, blob: &mut Vec<u8>, entry_key:
     }
     // the pc map as this run's maps hold it (jit.rs PcMap), positions naming image files
     let mut pc = Vec::with_capacity(raw.len() * 3);
-    crate::jit::PcMap::encode_to(&mut pc, raw.into_iter().map(|(o, fi, byte)| (o, (files.get(fi as usize).copied().unwrap_or(u32::MAX) as u64) << 32 | byte as u64)));
+    crate::jit::PcMap::encode_to(&mut pc, raw.into_iter().map(|(o, p)| (o, (files.get((p >> 32) as usize).copied().unwrap_or(u32::MAX) as u64) << 32 | (p & 0xffff_ffff))));
     e.bytes(&pc);
     blob.extend_from_slice(code);
     out.0.extend_from_slice(&e.0);
@@ -543,7 +538,6 @@ fn skip_def(d: &mut D) -> Option<()> {
 }
 
 fn skip_file(d: &mut D) -> Option<()> {
-    d.str()?;
     d.u128()?;
     Some(())
 }

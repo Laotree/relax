@@ -12987,6 +12987,11 @@ impl PcMap {
         }
     }
 
+    /// The entries of the map whose bytes (`encode_to`'s) are `b`.
+    pub fn decode(b: &[u8]) -> Vec<(u32, u64)> {
+        PcMap(PcBytes::Own(b.into())).entries()
+    }
+
     /// What keeps the image a mapped map is read from mapped.
     pub fn keep(&self) -> Option<std::sync::Arc<PcFiles>> {
         match &self.0 {

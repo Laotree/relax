@@ -49,7 +49,7 @@ const KIND_CODE: u32 = 1;
 const KIND_DATA: u32 = 2;
 const KIND_LEDGER: u32 = 3;
 /// part of the codegen configuration hash (store format changes invalidate entries)
-const STORE_FORMAT: u32 = 4;
+const STORE_FORMAT: u32 = 5;
 /// borrowck lane: a clean borrow-check verdict (empty payload)
 const KIND_BORROWCK: u32 = 4;
 /// the checker's own version: bump when its rules change (old verdicts are then ignored)
@@ -171,7 +171,7 @@ const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
 // symbol names which block of its entry it is (its ordinal), so two relocations to different
 // offsets of one block link to one block.
-const ENTRY_VERSION: u32 = 26;
+const ENTRY_VERSION: u32 = 28;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -343,7 +343,7 @@ pub struct Cache {
     /// Frozen before the first run-time crate mutates the boot's front end.
     collected_boot: Option<collected::CollectedBoot>,
     collected_committed: bool,
-    file_ids: HashMap<(String, u128, u128), u32>,
+    file_ids: HashMap<u128, u32>,
     file_ids_n: usize,
     file_hash: HashMap<u32, u128>,
     /// data entry key -> address in this run
@@ -1010,18 +1010,13 @@ impl Cache {
         }
         match u.prog.file_paths.get(file as usize) {
             Some(p) => {
-                e.str(p);
-                e.u128(u.prog.files[file as usize].source_hash(p));
                 // A package's lib and bin parse one file separately: the same path and text, two
                 // crates, and rules that depend on the crate (the live layout of the root crate's
                 // enums) make their code differ. The owner is part of the identity.
-                e.u128(u.prog.file_crate.get(file as usize).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0));
+                let owner = u.prog.file_crate.get(file as usize).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
+                e.u128(file_ident(p, u.prog.files[file as usize].source_hash(p), owner));
             }
-            None => {
-                e.str("");
-                e.u128(0);
-                e.u128(0);
-            }
+            None => e.u128(0),
         }
         Some(())
     }
@@ -1061,9 +1056,8 @@ impl Cache {
     }
 
     fn dec_file(&mut self, u: &Unit, d: &mut D) -> Option<u32> {
-        let path = d.str()?.to_string();
-        let hash = d.u128()?;
-        let owner = d.u128()?;
+        let ident = d.u128()?;
+        if ident == 0 { return None; }
         if self.file_ids_n != u.prog.file_paths.len() {
             for i in self.file_ids_n..u.prog.file_paths.len() {
                 // a live edit's version never: its ids are not a boot parse's (enc_file)
@@ -1071,11 +1065,11 @@ impl Cache {
                 let p = &u.prog.file_paths[i];
                 // the first file with this content keeps the key (later identical copies are the same text)
                 let owner = u.prog.file_crate.get(i).and_then(|&c| self.crate_ident.get(c as usize)).copied().unwrap_or(0);
-                self.file_ids.entry((p.clone(), u.prog.files[i].source_hash(p), owner)).or_insert(i as u32);
+                self.file_ids.entry(file_ident(p, u.prog.files[i].source_hash(p), owner)).or_insert(i as u32);
             }
             self.file_ids_n = u.prog.file_paths.len();
         }
-        self.file_ids.get(&(path, hash, owner)).copied()
+        self.file_ids.get(&ident).copied()
     }
 
     fn enc_def(&mut self, u: &Unit, d: DefId, e: &mut E, crates: &mut Vec<u32>) {
@@ -2296,8 +2290,10 @@ impl Cache {
                 return None;
             }
         }
+        // the pc map as the jit keeps it (PcMap: varint offset and position deltas), its
+        // positions naming this entry's file table by index
         let mut files: Vec<u32> = Vec::new();
-        e.u32(pc_map.len() as u32);
+        let mut local = Vec::with_capacity(pc_map.len());
         for (o, pos) in pc_map {
             let f = (pos >> 32) as u32;
             let fi = match files.iter().position(|x| *x == f) {
@@ -2307,10 +2303,11 @@ impl Cache {
                     files.len() - 1
                 }
             };
-            e.u32(*o);
-            e.u32(fi as u32);
-            e.u32(*pos as u32);
+            local.push((*o, (fi as u64) << 32 | (*pos & 0xffff_ffff)));
         }
+        let mut pcb = Vec::new();
+        crate::jit::PcMap::encode_to(&mut pcb, local.into_iter());
+        e.bytes(&pcb);
         e.u32(files.len() as u32);
         for f in files {
             // a live edit's version: positions unknown to the next run (enc_file)
@@ -3253,6 +3250,17 @@ pub(crate) fn closure_identity_ok(u: &Unit, file: u32, expr: u32) -> bool {
 
 /// Reads the nounwind inputs and the dependency certificate; returns the nounwind section (for
 /// verification).
+/// A file version's identity in an entry: a hash of its path, source and owning crate (one
+/// 16-byte id where the path string and two hashes were stored per file and entry).
+fn file_ident(path: &str, source: u128, owner: u128) -> u128 {
+    let mut h = Sip128::new();
+    h.str("file-ident");
+    h.str(path);
+    h.u128(source);
+    h.u128(owner);
+    h.finish128()
+}
+
 fn skip_build_inputs(d: &mut D) -> Option<(usize, usize)> {
     // the O3 byte and the inlined slots
     d.u8()?;
@@ -6224,11 +6232,7 @@ impl Linker {
                 eprintln!("relax-cache: code {} {}", _name, hex);
             }
         }
-        let m = d.u32()? as usize;
-        let mut raw = Vec::with_capacity(m);
-        for _ in 0..m {
-            raw.push((d.u32()?, d.u32()?, d.u32()?));
-        }
+        let raw = crate::jit::PcMap::decode(d.bytes()?);
         let nf = d.u32()? as usize;
         let mut files = Vec::with_capacity(nf);
         for _ in 0..nf {
@@ -6236,7 +6240,7 @@ impl Linker {
             // never another file's (file 0 printed std's cmp.rs:1:1 for inlined code)
             files.push(self.cache().dec_file(u, &mut d).unwrap_or(u32::MAX));
         }
-        let pc = raw.into_iter().map(|(o, fi, byte)| (o, (*files.get(fi as usize).unwrap_or(&u32::MAX) as u64) << 32 | byte as u64)).collect();
+        let pc = raw.into_iter().map(|(o, p)| (o, (*files.get((p >> 32) as usize).unwrap_or(&u32::MAX) as u64) << 32 | (p & 0xffff_ffff))).collect();
         self.cache().last_callees = callees;
         self.cache().last_thunks = thunks;
         self.cache().last_data = data;
