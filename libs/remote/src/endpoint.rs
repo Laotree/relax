@@ -30,6 +30,8 @@ struct Inner {
     ring: Arc<Ring>,
     accept: Mutex<Option<AcceptHook>>,
     end_fields: cmd::EndFields,
+    /// The discovery file this endpoint wrote: its caps follow later registrations.
+    discovery: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// Called with every connection the endpoint accepts, once its handshake is done.
@@ -45,7 +47,7 @@ impl Endpoint {
 
     /// An endpoint whose replay ring holds `ring_bytes` of stream chunks.
     pub fn with_ring(app: &str, ring_bytes: usize) -> Endpoint {
-        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None), end_fields: Default::default() }))
+        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None), end_fields: Default::default(), discovery: Mutex::new(None) }))
     }
 
     /// Listens on this process's Unix socket and writes the discovery file (register the services
@@ -74,9 +76,20 @@ impl Endpoint {
 
     /// Registers (or replaces) a service.
     pub fn register(&self, name: &str, version: u32, factory: Factory) {
-        let mut s = self.0.services.write().unwrap();
-        s.retain(|x| x.name != name);
-        s.push(Service { name: name.to_string(), version, factory });
+        {
+            let mut s = self.0.services.write().unwrap();
+            s.retain(|x| x.name != name);
+            s.push(Service { name: name.to_string(), version, factory });
+        }
+        let file = self.0.discovery.lock().unwrap().clone();
+        if let Some(file) = file {
+            crate::discovery::rewrite_caps(&file, &self.caps());
+        }
+    }
+
+    /// The discovery file written for this endpoint (by its carrier's `listen`).
+    pub(crate) fn set_discovery(&self, file: std::path::PathBuf) {
+        *self.0.discovery.lock().unwrap() = Some(file);
     }
 
     /// The `cmd` service, answered by `dispatch`.

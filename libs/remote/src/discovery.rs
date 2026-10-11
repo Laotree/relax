@@ -170,6 +170,21 @@ pub fn parse(text: &str) -> Option<App> {
     })
 }
 
+/// Replaces the `caps` of a discovery file (a service registered after the endpoint started
+/// listening): written to a temporary file and renamed, so a reader never sees half a file.
+pub(crate) fn rewrite_caps(file: &std::path::Path, caps: &[String]) {
+    let Ok(text) = std::fs::read_to_string(file) else { return };
+    let Some(at) = text.find("\"caps\":[") else { return };
+    let start = at + "\"caps\":[".len();
+    let Some(len) = text[start..].find(']') else { return };
+    let list: Vec<String> = caps.iter().map(|c| crate::cmd::json_str(c)).collect();
+    let new = format!("{}{}{}", &text[..start], list.join(","), &text[start + len..]);
+    let tmp = file.with_extension("json.new");
+    if std::fs::write(&tmp, new).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
+}
+
 /// The running endpoints, oldest first by pid (stale discovery files of ended processes are
 /// removed).
 pub fn apps() -> Vec<App> {
@@ -198,5 +213,19 @@ pub fn find(spec: &str) -> Option<App> {
     match spec.parse::<u32>() {
         Ok(pid) => list.into_iter().find(|a| a.pid == pid),
         Err(_) => list.into_iter().rfind(|a| a.app == spec),
+    }
+}
+
+#[cfg(test)]
+mod rewrite_tests {
+    #[test]
+    fn caps_follow_a_later_registration() {
+        let file = std::env::temp_dir().join(format!("makepad-remote-caps-test-{}.json", std::process::id()));
+        std::fs::write(&file, "{\"pid\":1,\"app\":\"x\",\"socket\":\"/s\",\"started_ms\":2,\"caps\":[\"cmd/1\"],\"extra\":3}\n").unwrap();
+        super::rewrite_caps(&file, &["cmd/1".into(), "app/1".into()]);
+        let app = super::parse(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert!(app.serves("app") && app.serves("cmd"));
+        assert_eq!(app.text("app").as_deref(), Some("x"));
+        std::fs::remove_file(&file).unwrap();
     }
 }

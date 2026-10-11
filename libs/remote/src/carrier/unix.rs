@@ -106,6 +106,7 @@ mod imp {
             extra
         );
         let _ = std::fs::write(&disc, info);
+        ep.set_discovery(disc.clone());
         extern "C" {
             fn atexit(f: extern "C" fn()) -> i32;
         }
@@ -179,6 +180,7 @@ mod imp {
             extra
         );
         std::fs::write(paths(pid).1, info)?;
+        ep.set_discovery(paths(pid).1);
         extern "C" {
             fn atexit(f: extern "C" fn()) -> i32;
         }
