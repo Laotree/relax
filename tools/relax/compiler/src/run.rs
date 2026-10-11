@@ -898,7 +898,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 1;
     }
     jit::set_program_args(prog_args);
-    jit::start_background_coherence(&u);
     drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     // Classify the disk cache before workers add newly compiled entries.
@@ -932,6 +931,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     phase("image", t);
     drop(mem_g);
+    // after the cache is open: a validated warm start with the program's clean verdict stored skips the check
+    jit::start_background_coherence(&u);
     *STARTUP_PATH.lock().unwrap() = format!("{}/relax-run/{}.startup", target_dir, package);
     if let Ok(p) = std::env::var("RELAX_RUN_REPORT") {
         *REPORT_PATH.lock().unwrap() = p;

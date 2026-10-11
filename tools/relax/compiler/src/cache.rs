@@ -54,6 +54,8 @@ const STORE_FORMAT: u32 = 4;
 const KIND_BORROWCK: u32 = 4;
 /// the checker's own version: bump when its rules change (old verdicts are then ignored)
 pub const BORROWCK_VERSION: u32 = 1;
+/// the coherence check's own version: bump when its rules change
+const COHERENCE_VERSION: u32 = 1;
 
 /// Immutable driver view for Gandalf's generic owner discovery. No Unit/cache
 /// callbacks under the front read lock, and no need to construct an instance key
@@ -1798,6 +1800,30 @@ impl Cache {
         let dom = self.key_crate.get(&code).copied().unwrap_or(0);
         self.key_crate.insert(k, dom);
         Some(k)
+    }
+
+    /// The key of the run's coherence verdict (orphan rules, overlapping impls: Tcx::report_coherence):
+    /// the checker version, the cache configuration (Relax build, options), every crate's
+    /// fingerprint (all its files' text, cfg, dependencies) and the files the program's impls come
+    /// from (the selection loads a subset of files). A clean verdict under this key is stored
+    /// as a borrowck-kind entry with an empty payload. None after a live edit.
+    pub fn coherence_key(&self, prog: &crate::program::Program) -> Option<u128> {
+        if !crate::reload::edited_crates().is_empty() || self.fps.len() != prog.crates.len() { return None; }
+        let mut h = Sip128::new();
+        h.str("coherence-verdict");
+        h.u32(COHERENCE_VERSION);
+        h.u128(self.cfg);
+        h.u32(self.fps.len() as u32);
+        for fp in &self.fps { h.u128(*fp); }
+        let mut from = vec![false; prog.files.len()];
+        for im in &prog.impls {
+            *from.get_mut(prog.def(im.def).file as usize)? = true;
+        }
+        h.u32(prog.impls.len() as u32);
+        for (i, f) in from.iter().enumerate() {
+            if *f { h.str(prog.file_paths.get(i).map_or("", |p| p.as_str())); }
+        }
+        Some(h.finish128())
     }
 
     /// The verdict stored for this key (on disk, or recorded by this run).

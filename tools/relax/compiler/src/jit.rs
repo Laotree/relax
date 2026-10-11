@@ -12850,6 +12850,17 @@ impl crate::borrowck::lazy::FrontSource for BorrowckFront {
 /// synchronously, Tcx::check_coherence).
 pub fn start_background_coherence(u: &Unit) {
     if std::env::var("RELAX_COHERENCE").is_ok_and(|v| v == "0") { return; }
+    // A validated warm start whose cache holds this program's clean verdict (the same crate texts,
+    // cfg, Relax build and impl files) does not check again: the check type-checks and collects
+    // the signatures of the whole impl set, 300+ ms and tens of MB for nothing it can find.
+    // Without errors and warnings this run, the verdict is stored for the next one.
+    let key = u.cache.as_ref().and_then(|c| c.coherence_key(&u.prog));
+    if let (Some(k), Some(c)) = (key, u.cache.as_ref()) {
+        if u.front.warm_cache.load(Ordering::Relaxed) && matches!(c.borrowck_stored(k), Some(crate::borrowck::lazy::StoredVerdict::Clean)) {
+            if u.prog.session.options.verbose { eprintln!("relax-coherence: clean verdict from the cache"); }
+            return;
+        }
+    }
     let front = u.front.clone();
     let _ = std::thread::Builder::new().name("relax-coherence".into()).spawn(move || {
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
@@ -12858,6 +12869,7 @@ pub fn start_background_coherence(u: &Unit) {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let mut orphan_done = false;
+        let emitted = crate::infer::diagnostics::DiagCtxt::thread_emitted();
         loop {
             if SPEC_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
             let r = {
@@ -12875,7 +12887,15 @@ pub fn start_background_coherence(u: &Unit) {
                 r
             };
             match r {
-                Ok(()) => return,
+                Ok(()) => {
+                    if let Some(k) = key {
+                        // a live edit meanwhile: the key names the text this run started with
+                        if crate::infer::diagnostics::DiagCtxt::thread_emitted() == emitted && crate::reload::edited_crates().is_empty() {
+                            crate::borrowck::lazy::push_verdict_key(k, crate::borrowck::lazy::StoredVerdict::Clean);
+                        }
+                    }
+                    return;
+                }
                 Err(p) if crate::preempt::is_preempted(&*p) => std::thread::sleep(std::time::Duration::from_millis(50)),
                 Err(p) => {
                     let m = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();

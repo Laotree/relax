@@ -232,6 +232,11 @@ pub static CACHED_CLEAN: AtomicU64 = AtomicU64::new(0);
 /// fns whose stored Unchecked verdict was reused this run (not checked again)
 pub static CACHED_UNCHECKED: AtomicU64 = AtomicU64::new(0);
 
+/// A verdict found outside the lazy checker (the coherence check) for the run to write to the cache.
+pub fn push_verdict_key(key: u128, v: StoredVerdict) {
+    VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner()).push((key, v));
+}
+
 /// Storable verdicts' cache keys found since the last call (the run writes them to the cache).
 pub fn take_verdict_keys() -> Vec<(u128, StoredVerdict)> {
     std::mem::take(&mut *VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner()))

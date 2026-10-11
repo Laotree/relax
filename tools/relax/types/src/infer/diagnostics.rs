@@ -2,6 +2,7 @@
 use crate::next_solver::fulfill::ObligationCause;
 use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 
+thread_local! { static THREAD_EMITTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 #[derive(Clone, Debug)]
 pub struct Diagnostic { pub cause: ObligationCause, pub message: String }
 struct Emitted { diagnostic: Diagnostic, thread: u32, delivered: bool }
@@ -61,7 +62,11 @@ impl DiagCtxt {
     pub fn warn(&self, cause: ObligationCause, message: String) {
         Self::emit(&mut self.data.lock().unwrap().warnings, cause, message);
     }
+    /// Diagnostics (errors and warnings, also deduplicated ones) this thread has emitted so far:
+    /// a check that ran on one thread compares it before and after to know it found nothing.
+    pub fn thread_emitted() -> u64 { THREAD_EMITTED.with(|c| c.get()) }
     fn emit(log: &mut Vec<Emitted>, cause: ObligationCause, message: String) {
+        THREAD_EMITTED.with(|c| c.set(c.get() + 1));
         if log.iter().any(|d| d.diagnostic.cause == cause && d.diagnostic.message == message) { return; }
         log.push(Emitted { diagnostic: Diagnostic { cause, message }, thread: crate::conc::thread_id(), delivered: false });
     }
