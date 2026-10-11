@@ -343,7 +343,7 @@ mod imp {
         let nm = |a: u64| u.find_fn(a).map(|id| format!("{}#{}", u.fns[id as usize].name, id)).unwrap_or("-".to_string());
         let mut slots = Vec::new();
         for id in 0..u.fns.len() {
-            let t = *((u.table_base + id as u64 * 8) as *const u64);
+            let t = *(u.slots.table(id as u32) as *const u64);
             if t == x16 || t == pc {
                 slots.push(format!("{}={}", id, u.fns[id].name));
             }
@@ -368,8 +368,8 @@ mod imp {
                 }
             }
         }
-        if a >= u.table_base && a < u.table_base + 8 * u.fns.len() as u64 {
-            let id = ((a - u.table_base) / 8) as usize;
+        if let Some((id, 0)) = u.slots.find(2, a).filter(|(id, _)| (*id as usize) < u.fns.len()) {
+            let id = id as usize;
             let t = *(a as *const u64);
             let f = &u.fns[id];
             eprintln!("relax-fault-regs: called slot {} = {} (compiled {}, code {:#x}) table now {:#x} ({})", id, f.name, f.compiled, f.code, t, nm(t));

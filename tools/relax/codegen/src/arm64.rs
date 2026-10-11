@@ -94,9 +94,8 @@ pub struct Compiled {
 
 /// Addresses the backend needs from the runtime.
 pub struct Env {
-    pub table_base: u64,
-    pub thunk_base: u64,
-    pub thunk_size: u64,
+    /// where the function slots' tables and thunks are
+    pub slots: SlotsPtr,
     /// pthread TSD slot holding this thread's thread-local block (0 = none yet)
     pub tls_key: u64,
     /// glue that allocates the calling thread's block: returns it in x16, preserves all else
@@ -117,8 +116,8 @@ impl Env {
     pub fn reloc_value(&self, r: Reloc) -> u64 {
         match r {
             Reloc::Sym(s) => unsafe { s.value(self.syms) },
-            Reloc::Slot(id) => self.table_base + id as u64 * 8,
-            Reloc::Thunk(id) => self.thunk_base + id as u64 * self.thunk_size,
+            Reloc::Slot(id) => self.slots.table(id),
+            Reloc::Thunk(id) => self.slots.thunk(id),
             // the TSD slot's byte offset (ldr x16, [x16, x17])
             Reloc::TlsKey => self.tls_key * 8,
             Reloc::TlsSlow => self.tls_slow,
@@ -3735,7 +3734,7 @@ mod tests {
         }
         f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
         f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-        let env = Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
         let r = compile(options, &f, &env).expect("relaxed");
         let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         // the entry block's branch on p: cbz/cbnz skipping one word, then `b` beyond 1 MB
@@ -3802,7 +3801,7 @@ mod tests {
             }
             f.blocks[b1 as usize].term = Term::Ret(vec![acc]);
             f.blocks[b2 as usize].term = Term::Ret(vec![p]);
-            let env = Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+            let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
             let r = compile(options, &f, &env).expect("relaxed");
             let w: Vec<u32> = r.code[..r.text_len as usize].chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             // the first conditional branch skips one word; a `b` beyond 1 MB follows

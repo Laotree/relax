@@ -190,12 +190,6 @@ pub struct Site {
     pub msg: String,
 }
 
-/// function slots (instances incl. generics and closures; virtual memory only)
-/// Slots in the function table (thunks, stubs, tier records sized by it). RELAX_TABLE_SLOTS raises it
-/// for whole-graph runs (the boundary audit lowers every fn of every crate).
-fn table_cap(options: &crate::options::Options) -> usize {
-    options.table_slots
-}
 #[cfg(not(target_arch = "aarch64"))]
 const THUNK_SIZE: usize = 16;
 #[cfg(not(target_arch = "aarch64"))]
@@ -317,9 +311,8 @@ pub struct Unit {
     // memory
     exec_base: u64,
     exec_size: u64,
-    pub table_base: u64,
-    thunk_base: u64,
-    stub_base: u64,
+    /// where every slot's thunk, stub, table word and tier record are (segments, reserved as ids reach them)
+    pub slots: Box<crate::rir::SlotTable>,
     lazy_entry: u64,
     pub enter: u64,
     pub leave: u64,
@@ -352,7 +345,6 @@ pub struct Unit {
     /// O3 rebuilds per slot for that reason (bounded)
     retiers: HashMap<u32, u8>,
     frequency_profiles: HashMap<u32, FrequencyProfile>,
-    tier_base: u64,
     hot_entry: u64,
     /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
@@ -1973,25 +1965,20 @@ impl Unit {
         let options = &sess.options;
         let _mem = crate::memstat::tag(crate::memstat::Tag::Unit);
         // One reservation, so code reaches everything of the unit pc-relatively (x64 rel32:
-        // +-2 GB; arm64 adrp: +-4 GB): [code (thunks, stubs, glue, fns)][function table][data]
-        // [statics][symbol values]. Only host / C symbols are outside it.
+        // +-2 GB; arm64 adrp: +-4 GB): [code (glue, fns)][data][statics][symbol values]. Only
+        // host / C symbols are outside it. The function slots (thunks, stubs, table words,
+        // tier records) are in segments of their own, reserved as ids reach them: code calls
+        // through full 64-bit addresses.
         let exec_size: u64 = 768 << 20;
         let data_size: u64 = UNIT_DATA_SIZE;
         let rw_size: u64 = UNIT_RW_SIZE;
-        let table_size = (table_cap(options) * 8) as u64;
         let syms_size = (crate::syms::SYM_CAP * 8) as u64;
-        let exec_base = os::mem::reserve(exec_size as usize, (table_size + data_size + rw_size + syms_size) as usize);
-        let table_base = exec_base + exec_size;
-        let thunk_base = exec_base;
-        let stub_base = thunk_base + (table_cap(options) * THUNK_SIZE) as u64;
-        let misc = stub_base + (table_cap(options) * STUB_SIZE) as u64;
-        let data_base = table_base + table_size;
+        let exec_base = os::mem::reserve(exec_size as usize, (data_size + rw_size + syms_size) as usize);
+        let misc = exec_base;
+        let data_base = exec_base + exec_size;
         let rw_base = data_base + data_size;
         let syms_base = rw_base + rw_size;
-        // the parts written outside the bump allocators: thunks + stubs, the function table, the
-        // symbol values (no-op where the OS overcommits)
-        os::mem::commit(exec_base, (misc - exec_base) as usize);
-        os::mem::commit(table_base, table_size as usize);
+        // the symbol values are written outside the bump allocators (no-op where the OS overcommits)
         os::mem::commit(syms_base, syms_size as usize);
         let provided = crate::provided::take_for(&prog);
         let mut provided_types = HashMap::new();
@@ -2025,6 +2012,8 @@ impl Unit {
                 })
             }
         };
+        let slots = Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64));
+        let slots_ptr = crate::rir::SlotsPtr(&*slots);
         let mut u = Box::new(Unit {
             prog,
             tcx,
@@ -2032,7 +2021,7 @@ impl Unit {
             provided,
             provided_types,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
-            fns: crate::conc::AppendVec::with_capacity(table_cap(options)),
+            fns: crate::conc::AppendVec::with_capacity(u32::MAX as usize + 1),
             reload_slots: Default::default(),
             reload_rir: None,
             reload_errors: Default::default(),
@@ -2069,9 +2058,7 @@ impl Unit {
             core_crate,
             exec_base,
             exec_size,
-            table_base,
-            thunk_base,
-            stub_base,
+            slots,
             lazy_entry: 0,
             enter: 0,
             leave: 0,
@@ -2083,7 +2070,7 @@ impl Unit {
             rw_next: AtomicU64::new(rw_base),
             rw_end: rw_base + rw_size,
             opt: crate::opt::OptCfg::from_options(options),
-            env: x64::Env { table_base, thunk_base, thunk_size: THUNK_SIZE as u64, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: false, syms: 0, sym_class: 0 },
+            env: x64::Env { slots: slots_ptr, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: false, syms: 0, sym_class: 0 },
             stats: Stats::default(),
             patch_log: Vec::new(),
             patch_gen: 0,
@@ -2100,7 +2087,6 @@ impl Unit {
             cold_users: HashMap::new(),
             retiers: HashMap::new(),
             frequency_profiles: HashMap::new(),
-            tier_base: os::mem::alloc_rw(table_cap(options) * TIER_REC),
             hot_entry: 0,
             front: std::sync::Arc::new(FrontShared::new(&sess)),
             ctfe_fn_bodies: Default::default(),
@@ -2266,7 +2252,7 @@ impl Unit {
 
     /// The lazy stub of slot `id` (what its table word holds before its first compile).
     pub(crate) fn stub_of(&self, id: u32) -> u64 {
-        self.stub_base + id as u64 * STUB_SIZE as u64
+        self.slots.stub(id)
     }
 
     /// Code at a fresh address with its relocated fields linked for that address.
@@ -2374,15 +2360,10 @@ impl Unit {
 
     /// The slot whose thunk is at `addr`.
     pub fn thunk_slot(&self, addr: u64) -> Option<u32> {
-        let options = &self.prog.session.clone().options;
-        if addr < self.thunk_base || addr >= self.thunk_base + (table_cap(options) * THUNK_SIZE) as u64 {
-            return None;
-        }
-        let k = addr - self.thunk_base;
-        if k % THUNK_SIZE as u64 != 0 {
-            return None;
-        }
-        let id = (k / THUNK_SIZE as u64) as u32;
+        let id = match self.slots.find(0, addr) {
+            Some((id, 0)) => id,
+            _ => return None,
+        };
         if (id as usize) < self.fns.len() {
             // A thunk observed as a pointer (e.g. in constant data) escaped even
             // when no current RIR contains the FnAddr that originally made it.
@@ -2970,7 +2951,6 @@ impl Unit {
 
     pub fn fn_id(&self, key: FnKey) -> u32 {
         let key = self.slot_key_form(key);
-        let options = &self.prog.session.clone().options;
         if let Some(id) = lower_ahead_fn_id(self, &key) {
             return id;
         }
@@ -3009,18 +2989,16 @@ impl Unit {
             return id;
         }
         let id = self.fns.len() as u32;
-        if id as usize >= table_cap(options) {
-            panic!("function table full");
-        }
+        self.ensure_slots(id, 1);
         let name = fn_name(self, &key);
         let file = self.key_file(&key);
-        let stub_addr = self.stub_base + id as u64 * STUB_SIZE as u64;
+        let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
-        let slot_addr = self.table_base + id as u64 * 8;
+        let slot_addr = self.slots.table(id);
         let thunk = x64::thunk(slot_addr, THUNK_SIZE);
         unsafe {
             os::mem::write_code(stub_addr, &stub);
-            os::mem::write_code(self.thunk_base + id as u64 * THUNK_SIZE as u64, &thunk);
+            os::mem::write_code(self.slots.thunk(id), &thunk);
             *(slot_addr as *mut u64) = stub_addr;
         }
         self.slot_named(id, &key);
@@ -3107,6 +3085,41 @@ impl Unit {
         }
     }
 
+    /// Makes slots `first..first + n` usable (the caller holds `fn_create`): reserves the
+    /// segments that do not exist yet, and commits their entries' memory where the OS commits on
+    /// demand (Windows). The ids are u32; the only limit below that is address space.
+    fn ensure_slots(&self, first: u32, n: usize) {
+        let last = first as u64 + n as u64 - 1;
+        if last > u32::MAX as u64 {
+            panic!("more than 4 billion function instances");
+        }
+        let (last_seg, _) = crate::rir::SlotTable::locate(last as u32);
+        for seg in 0..=last_seg {
+            if self.slots.has_seg(seg) {
+                continue;
+            }
+            let count = crate::rir::SlotTable::seg_slots(seg);
+            let code = count * (THUNK_SIZE + STUB_SIZE);
+            let base = os::mem::reserve(code, count * (8 + TIER_REC));
+            let thunk = base;
+            let stub = thunk + (count * THUNK_SIZE) as u64;
+            let table = base + code as u64;
+            let tier = table + (count * 8) as u64;
+            self.slots.install(seg, thunk, stub, table, tier);
+        }
+        let mut id = first as u64;
+        while id <= last {
+            let (seg, ix) = crate::rir::SlotTable::locate(id as u32);
+            let run = (crate::rir::SlotTable::seg_slots(seg) - ix).min((last - id + 1) as usize) as u64;
+            let id32 = id as u32;
+            os::mem::commit(self.slots.thunk(id32), (run * THUNK_SIZE as u64) as usize);
+            os::mem::commit(self.slots.stub(id32), (run * STUB_SIZE as u64) as usize);
+            os::mem::commit(self.slots.table(id32), (run * 8) as usize);
+            os::mem::commit(self.slots.tier(id32), (run * TIER_REC as u64) as usize);
+            id += run;
+        }
+    }
+
     /// `n` new slots in one go, ids `first..first + n` (the startup image's, cache/image.rs):
     /// lazy stubs, no identity yet (GLUE_UNNAMED until `name_slot`). Returns `first`.
     pub(crate) fn new_slots(&self, n: usize) -> u32 {
@@ -3115,32 +3128,37 @@ impl Unit {
         if n == 0 {
             return first;
         }
-        let options = &self.prog.session.clone().options;
-        if first as usize + n > table_cap(options) {
-            panic!("function table full");
-        }
+        self.ensure_slots(first, n);
         let unnamed = FnKey::Glue(GLUE_UNNAMED, TyId(0));
         let stub_len = x64::stub(first, self.lazy_entry).len();
         unsafe {
-            os::mem::fill_code(self.stub_base + first as u64 * STUB_SIZE as u64, n * STUB_SIZE, |buf| {
-                for i in 0..n {
-                    let b = x64::stub(first + i as u32, self.lazy_entry);
-                    buf[i * STUB_SIZE..i * STUB_SIZE + b.len()].copy_from_slice(&b);
-                }
-            });
-            os::mem::fill_code(self.thunk_base + first as u64 * THUNK_SIZE as u64, n * THUNK_SIZE, |buf| {
-                for i in 0..n {
-                    let b = x64::thunk(self.table_base + (first as u64 + i as u64) * 8, THUNK_SIZE);
-                    buf[i * THUNK_SIZE..(i + 1) * THUNK_SIZE].copy_from_slice(&b);
-                }
-            });
+            // a run per segment: its slots are contiguous
+            let mut id = first as usize;
+            while id < first as usize + n {
+                let (seg, ix) = crate::rir::SlotTable::locate(id as u32);
+                let run = (crate::rir::SlotTable::seg_slots(seg) - ix).min(first as usize + n - id);
+                let id0 = id as u32;
+                os::mem::fill_code(self.slots.stub(id0), run * STUB_SIZE, |buf| {
+                    for i in 0..run {
+                        let b = x64::stub(id0 + i as u32, self.lazy_entry);
+                        buf[i * STUB_SIZE..i * STUB_SIZE + b.len()].copy_from_slice(&b);
+                    }
+                });
+                os::mem::fill_code(self.slots.thunk(id0), run * THUNK_SIZE, |buf| {
+                    for i in 0..run {
+                        let b = x64::thunk(self.slots.table(id0 + i as u32), THUNK_SIZE);
+                        buf[i * THUNK_SIZE..(i + 1) * THUNK_SIZE].copy_from_slice(&b);
+                    }
+                });
+                id += run;
+            }
         }
         // (the entries' memory mapped in one go: thousands of them)
         self.fns.reserve(first as usize + n, |p, len| os::mem::prefault(p as u64, len));
         for i in 0..n as u32 {
             let id = first + i;
-            let stub_addr = self.stub_base + id as u64 * STUB_SIZE as u64;
-            unsafe { *((self.table_base + id as u64 * 8) as *mut u64) = stub_addr };
+            let stub_addr = self.slots.stub(id);
+            unsafe { *(self.slots.table(id) as *mut u64) = stub_addr };
             self.fns.push(Self::new_entry(unnamed.clone(), String::new(), 0, stub_addr, stub_len as u32));
         }
         first
@@ -3177,7 +3195,7 @@ impl Unit {
             lower_ahead_needs_unit();
         }
         self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
-        self.thunk_base + id as u64 * THUNK_SIZE as u64
+        self.slots.thunk(id)
     }
 
     fn sync_entry_ref(&mut self, id: u32) {
@@ -3867,7 +3885,7 @@ impl Unit {
             self.note_first_borrowck(id);
         }
         unsafe {
-            let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+            let slot = self.slots.table(id) as *const AtomicU64;
             (*slot).store(at, Ordering::SeqCst);
         }
         // its first run: O3 code that kept a call to it as never-run is built again
@@ -3941,7 +3959,7 @@ impl Unit {
         f.compiled = true;
         f.version += 1;
         unsafe {
-            let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+            let slot = self.slots.table(id) as *const AtomicU64;
             (*slot).store(at, Ordering::SeqCst);
         }
         if !self.cold_users.is_empty() {
@@ -3981,7 +3999,7 @@ impl Unit {
             f.version += 1;
             let at = f.code;
             unsafe {
-                let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+                let slot = self.slots.table(id) as *const AtomicU64;
                 (*slot).store(at, Ordering::SeqCst);
             }
         }
@@ -4010,7 +4028,7 @@ impl Unit {
                 f.compiled = false;
             }
             unsafe {
-                let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+                let slot = self.slots.table(id as u32) as *const AtomicU64;
                 (*slot).store(prev.0, Ordering::SeqCst);
             }
             self.frequency_profiles.remove(&(id as u32));
@@ -4418,7 +4436,7 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     let u = &mut *up;
     u.fns[id as usize].o3.store(true, Ordering::Relaxed);
     if u.tier1.is_some() {
-        let rec = tier_rec(u.tier_base, id);
+        let rec = tier_rec(&u.slots, id);
         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
     }
     for &c in inlined {
@@ -4665,8 +4683,8 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             note_entered(&*up, id);
             spec_enqueue(up, id, 0);
             drop_completed_body(&mut *up, id);
-            if (*tier_rec(u.tier_base, id).add(3)).load(Ordering::Acquire) == T_REPLAY {
-                (*tier_rec(u.tier_base, id).add(2)).load(Ordering::Relaxed)
+            if (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) == T_REPLAY {
+                (*tier_rec(&u.slots, id).add(2)).load(Ordering::Relaxed)
             } else { a }
         }
     }
@@ -4692,7 +4710,7 @@ fn perf_name(u: &Unit, id: u32) -> String {
 
 /// Cached O3 code (queued as O3 already) gets one opportunity to train this run.
 unsafe fn train_cached_tier1(u: &mut Unit, id: u32) {
-    if (*tier_rec(u.tier_base, id).add(3)).load(Ordering::Acquire) == T_QUEUED
+    if (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) == T_QUEUED
         && !u.prog.session.options.no_block_freq && !t1prof_replay(&u.prog.session.options) {
         u.frequency_profiles.entry(id).or_default();
     }
@@ -4880,7 +4898,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
         &u.env
     } else {
         let e = &u.env;
-        env_full = x64::Env { table_base: e.table_base, thunk_base: e.thunk_base, thunk_size: e.thunk_size, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
+        env_full = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
         &env_full
     };
     compile_watch(Some((&format!("codegen {}", func.name), crate::opt::inst_count(func))));
@@ -5630,7 +5648,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     let u = &*up;
     let session = (*std::ptr::addr_of!(u.prog.session)).clone();
     let e = &u.env;
-    let env = x64::Env { table_base: e.table_base, thunk_base: e.thunk_base, thunk_size: e.thunk_size, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
+    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: true, syms: e.syms, sym_class: e.sym_class };
     let (fold, layout) = (u.opt.fold, u.opt.layout);
     Some(O2Work { id, prep, epoch, snapshot, session, env, fold, layout, t0 })
 }
@@ -6611,7 +6629,7 @@ pub unsafe fn backend_bench(up: *mut Unit) {
     }
     let u = &*up;
     let full = !TIER1_ENABLED.load(Ordering::Relaxed);
-    let env = x64::Env { table_base: u.env.table_base, thunk_base: u.env.thunk_base, thunk_size: u.env.thunk_size, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: full, syms: u.env.syms, sym_class: u.env.sym_class };
+    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: full, syms: u.env.syms, sym_class: u.env.sym_class };
     let bucket = |f: &crate::rir::Func| -> usize {
         match f.blocks.iter().map(|b| b.insts.len()).sum::<usize>() {
             0..=15 => 0,
@@ -8550,8 +8568,15 @@ impl Drop for Unit {
         // program's own unit lives to process exit
         if !std::thread::panicking() { self.flush_query_errors(true); }
         if self.retired {
-            let rest = (table_cap(options) * 8 + crate::syms::SYM_CAP * 8) as u64 + UNIT_DATA_SIZE + UNIT_RW_SIZE;
+            let rest = UNIT_DATA_SIZE + UNIT_RW_SIZE + (crate::syms::SYM_CAP * 8) as u64;
             os::mem::release(self.exec_base, self.exec_size as usize, rest as usize);
+            // the slot segments: thunks and stubs first, then the table words and tier records
+            for seg in 0..crate::rir::SLOT_SEGS {
+                if self.slots.has_seg(seg) {
+                    let count = crate::rir::SlotTable::seg_slots(seg);
+                    os::mem::release(self.slots.seg_base(0, seg), count * (THUNK_SIZE + STUB_SIZE), count * (8 + TIER_REC));
+                }
+            }
         }
     }
 }
@@ -8610,11 +8635,11 @@ static TIER_STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 
 /// Queues `#[relax(O3)]` slot `id` for its O3 build ahead of hotness (if it is still counting).
 unsafe fn queue_marked(u: &Unit, id: u32) {
-    let rec = tier_rec(u.tier_base, id);
+    let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-        let s = (u.table_base + id as u64 * 8) as *const AtomicU64;
+        let s = u.slots.table(id) as *const AtomicU64;
         let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         tier_push(id, Q_MARKED, 0);
@@ -8624,11 +8649,11 @@ unsafe fn queue_marked(u: &Unit, id: u32) {
 
 /// Queues slot `id` for O3 as the count stub's rt_hot does (if it is still counting).
 unsafe fn queue_hot(u: &Unit, id: u32) {
-    let rec = tier_rec(u.tier_base, id);
+    let rec = tier_rec(&u.slots, id);
     let code = (*rec.add(1)).load(Ordering::Relaxed);
     let stub = (*rec.add(2)).load(Ordering::Relaxed);
     if (*rec.add(3)).compare_exchange(T_COUNTING, T_QUEUED, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-        let s = (u.table_base + id as u64 * 8) as *const AtomicU64;
+        let s = u.slots.table(id) as *const AtomicU64;
         let _ = (*s).compare_exchange(stub, code, Ordering::SeqCst, Ordering::SeqCst);
         TIER_QUEUED.fetch_add(1, Ordering::Relaxed);
         churn_queued(id);
@@ -8637,7 +8662,7 @@ unsafe fn queue_hot(u: &Unit, id: u32) {
     }
 }
 
-/// Per-slot record at tier_base + slot * TIER_REC: [counter, O1 code, count stub, state,
+/// Per-slot record at `SlotTable::tier(slot)`: [counter, O1 code, count stub, state,
 /// counting window start (wall_ns), O1 code bytes] (read by JIT code and rt_hot without
 /// the lock).
 const TIER_REC: usize = 48;
@@ -8657,8 +8682,8 @@ const T_QUEUED: u64 = 2;
 // The sampler cannot queue a recorded instance before its first call.
 const T_REPLAY: u64 = 3;
 
-fn tier_rec(base: u64, id: u32) -> *const AtomicU64 {
-    (base + id as u64 * TIER_REC as u64) as *const AtomicU64
+fn tier_rec(slots: &crate::rir::SlotTable, id: u32) -> *const AtomicU64 {
+    slots.tier(id) as *const AtomicU64
 }
 
 static TIER_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -8916,7 +8941,7 @@ impl Unit {
     pub(crate) fn rearm_sandbox_counter(&mut self, id: u32, code: u64) {
         debug_assert!(matches!(self.fns[id as usize].key, FnKey::Sandbox(_)));
         if self.tier1.is_some() {
-            unsafe { (*tier_rec(self.tier_base, id).add(3)).store(0, Ordering::Release); }
+            unsafe { (*tier_rec(&self.slots, id).add(3)).store(0, Ordering::Release); }
             self.arm_counter(id, code);
         }
     }
@@ -8956,7 +8981,7 @@ impl Unit {
         let mut stubs = Vec::with_capacity(ids.len());
         unsafe {
             for &(id, code) in ids {
-                let rec = tier_rec(self.tier_base, id);
+                let rec = tier_rec(&self.slots, id);
                 if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                     continue;
                 }
@@ -8973,10 +8998,10 @@ impl Unit {
             }
             let at = self.emit_code(&buf);
             for (id, off) in stubs {
-                let rec = tier_rec(self.tier_base, id);
+                let rec = tier_rec(&self.slots, id);
                 (*rec.add(2)).store(at + off, Ordering::Relaxed);
                 (*rec.add(3)).store(T_COUNTING, Ordering::Release);
-                let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+                let slot = self.slots.table(id) as *const AtomicU64;
                 (*slot).store(at + off, Ordering::SeqCst);
             }
         }
@@ -9003,7 +9028,7 @@ impl Unit {
             T1PROF.lock().unwrap().as_ref().unwrap().map.contains_key(&t1_key(self, id))
         };
         if recorded { calls = 1; }
-        let rec = tier_rec(self.tier_base, id);
+        let rec = tier_rec(&self.slots, id);
         unsafe {
             if (*rec.add(3)).load(Ordering::Relaxed) != 0 {
                 return;
@@ -9019,7 +9044,7 @@ impl Unit {
             let at = self.emit_code(&stub);
             (*rec.add(2)).store(at, Ordering::Relaxed);
             (*rec.add(3)).store(if recorded { T_REPLAY } else { T_COUNTING }, Ordering::Release);
-            let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+            let slot = self.slots.table(id) as *const AtomicU64;
             (*slot).store(at, Ordering::SeqCst);
         }
         // tier-up state is process-wide (TIER_UNIT, the hot queue, the sampler: slot ids with
@@ -9060,10 +9085,10 @@ fn rt_hot(slot: u64) -> u64 {
     unsafe {
         let u = &*up;
         u.exec_event(slot as u32, "call");
-        let rec = tier_rec(u.tier_base, slot as u32);
+        let rec = tier_rec(&u.slots, slot as u32);
         let code = (*rec.add(1)).load(Ordering::Relaxed);
         let stub = (*rec.add(2)).load(Ordering::Relaxed);
-        let s = (u.table_base + slot * 8) as *const AtomicU64;
+        let s = u.slots.table(slot as u32) as *const AtomicU64;
         if (*rec.add(3)).load(Ordering::Acquire) == T_REPLAY {
             if startup_holds_tier1() {
                 if (*rec.add(3)).compare_exchange(T_REPLAY, T_QUEUED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
@@ -9815,7 +9840,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         if p.replay { p.map.get(k).map(|e| e.inline_freq.clone()) } else { None }
     });
     let ro = u.ro_reader();
-    let env = x64::Env { table_base: u.env.table_base, thunk_base: u.env.thunk_base, thunk_size: u.env.thunk_size, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class };
+    let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class };
     let cfg = u.tier1.as_ref().unwrap().opt;
     let name = u.fns[id as usize].name.clone();
     // One immutable sample input for register allocation. Both inlining rounds
@@ -10040,7 +10065,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 if o3_first() {
                     // #[relax(O3, always)]: its first code (no O1/O2 ever), installed as a lazy
                     // compile's is, its O3 state already final (no call counter)
-                    let rec = tier_rec(u.tier_base, id);
+                    let rec = tier_rec(&u.slots, id);
                     if u.tier1.is_some() {
                         (*rec.add(3)).store(T_QUEUED, Ordering::Release);
                     }
@@ -10078,7 +10103,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
                 f.version += 1;
-                let slot = (u.table_base + id as u64 * 8) as *const AtomicU64;
+                let slot = u.slots.table(id) as *const AtomicU64;
                 (*slot).store(at, Ordering::SeqCst);
                 // a patch of an inlined callee recompiles this slot (live.rs)
                 let n_inl = inlined.len();
@@ -11323,7 +11348,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let (env, fold, rotate) = {
         let u = &*up;
         let e = &u.env;
-        (x64::Env { table_base: e.table_base, thunk_base: e.thunk_base, thunk_size: e.thunk_size, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class }, u.opt.fold, u.opt.layout)
+        (x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class }, u.opt.fold, u.opt.layout)
     };
     // back ends, off the unit (on helper threads; the owner serves requests meanwhile)
     type Built = (u32, Result<(Option<(std::sync::Arc<crate::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>, Vec<Deferred>);
@@ -11367,7 +11392,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         };
                         let cg = tier0_codegen_rir(options, &rir, fold, rotate);
                         let e = &env;
-                        let env = x64::Env { table_base: e.table_base, thunk_base: e.thunk_base, thunk_size: e.thunk_size, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class };
+                        let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: e.opt_regs && !rir.baseline, syms: e.syms, sym_class: e.sym_class };
                         let c = x64::compile(options, &cg, &env)?;
                         note_frame(id, c.frame_size, slot_bytes(&cg), false);
                         dump_o1(&cg, &c);
@@ -11575,7 +11600,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
         u.fns[x as usize].inflight = true;
     }
     let e = &u.env;
-    let env = x64::Env { table_base: e.table_base, thunk_base: e.thunk_base, thunk_size: e.thunk_size, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class };
+    let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class };
     let (fold, rotate) = (u.opt.fold, u.opt.layout);
     let name = u.fns[id as usize].name.clone();
     let w1 = wall_ns();

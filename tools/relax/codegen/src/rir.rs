@@ -399,6 +399,115 @@ pub struct RelocAt {
     pub target: Reloc,
 }
 
+/// Where the function slots live. A slot (u32 id) owns a thunk (its permanent callable
+/// address), a lazy stub, a table word and a tier record; they sit in segments that are
+/// reserved when the ids first reach them, so the number of functions has no fixed bound
+/// (ids are u32; the rest is address space). Segment 0 holds ids `0..2^18`, segment k >= 1 the
+/// ids `2^(17+k)..2^(18+k)`: doubling, so 4G ids take 15 reservations. Nothing needs the
+/// segments to be near each other or near the code: code reaches a slot through a full 64-bit
+/// address (a literal in its pool), thunks and stubs hold absolute addresses.
+pub struct SlotTable {
+    /// per kind (thunk, stub, table, tier), per segment: the segment's first byte (0 = none yet)
+    bases: [[std::sync::atomic::AtomicU64; SLOT_SEGS]; 4],
+    /// bytes per slot of each kind
+    stride: [u64; 4],
+}
+
+pub const SLOT_SEGS: usize = 15;
+const SK_THUNK: usize = 0;
+const SK_STUB: usize = 1;
+const SK_TABLE: usize = 2;
+const SK_TIER: usize = 3;
+
+impl SlotTable {
+    pub fn new(thunk: u64, stub: u64, table: u64, tier: u64) -> Self {
+        SlotTable { bases: [const { [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_SEGS] }; 4], stride: [thunk, stub, table, tier] }
+    }
+
+    /// Slots in segment `seg`.
+    pub fn seg_slots(seg: usize) -> usize {
+        if seg == 0 { 1 << 18 } else { 1 << (17 + seg) }
+    }
+
+    /// (segment, index in it) of a slot id.
+    pub fn locate(id: u32) -> (usize, usize) {
+        if id < 1 << 18 {
+            (0, id as usize)
+        } else {
+            let bits = 32 - id.leading_zeros() as usize;
+            (bits - 18, (id - (1u32 << (bits - 1))) as usize)
+        }
+    }
+
+    /// First id of a segment.
+    pub fn seg_first(seg: usize) -> u64 {
+        if seg == 0 { 0 } else { 1 << (17 + seg) }
+    }
+
+    pub fn has_seg(&self, seg: usize) -> bool {
+        self.bases[SK_TABLE][seg].load(std::sync::atomic::Ordering::Acquire) != 0
+    }
+
+    /// Records a segment's four arrays (published last: a set table base means all are set).
+    pub fn install(&self, seg: usize, thunk: u64, stub: u64, table: u64, tier: u64) {
+        use std::sync::atomic::Ordering::*;
+        self.bases[SK_THUNK][seg].store(thunk, Relaxed);
+        self.bases[SK_STUB][seg].store(stub, Relaxed);
+        self.bases[SK_TIER][seg].store(tier, Relaxed);
+        self.bases[SK_TABLE][seg].store(table, Release);
+    }
+
+    /// The first byte of each installed segment's thunk array.
+    pub fn seg_base(&self, kind: usize, seg: usize) -> u64 {
+        self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn addr(&self, kind: usize, id: u32) -> u64 {
+        let (seg, ix) = Self::locate(id);
+        self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire) + ix as u64 * self.stride[kind]
+    }
+    pub fn thunk(&self, id: u32) -> u64 { self.addr(SK_THUNK, id) }
+    pub fn stub(&self, id: u32) -> u64 { self.addr(SK_STUB, id) }
+    /// The function table word of a slot.
+    pub fn table(&self, id: u32) -> u64 { self.addr(SK_TABLE, id) }
+    pub fn tier(&self, id: u32) -> u64 { self.addr(SK_TIER, id) }
+
+    /// The id whose entry of `kind` (0 thunk, 1 stub, 2 table, 3 tier) starts at or contains
+    /// `addr`, with the offset into the entry.
+    pub fn find(&self, kind: usize, addr: u64) -> Option<(u32, u64)> {
+        for seg in 0..SLOT_SEGS {
+            let base = self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire);
+            if base == 0 {
+                continue;
+            }
+            let len = Self::seg_slots(seg) as u64 * self.stride[kind];
+            if addr >= base && addr < base + len {
+                let k = addr - base;
+                return Some(((Self::seg_first(seg) + k / self.stride[kind]) as u32, k % self.stride[kind]));
+            }
+        }
+        None
+    }
+}
+
+/// The unit's slot table as the backends' `Env` holds it (the unit owns the table and outlives
+/// every compile that uses the env).
+#[derive(Clone, Copy)]
+pub struct SlotsPtr(pub *const SlotTable);
+unsafe impl Send for SlotsPtr {}
+unsafe impl Sync for SlotsPtr {}
+
+impl SlotsPtr {
+    /// no table (backend tests that never relocate a slot)
+    pub const NONE: SlotsPtr = SlotsPtr(std::ptr::null());
+    pub fn table(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).table(id) } }
+    }
+    pub fn thunk(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).thunk(id) } }
+    }
+}
+
 /// Writes every relocated field of `code`, to run at address `base`. Backends emit the fields
 /// zeroed, so emitted code is independent of where and in which run it runs; the embedder
 /// links it here (fresh and cached code alike). Err: a value does not fit its field at `base`.
@@ -470,9 +579,9 @@ pub fn link(code: &mut [u8], base: u64, relocs: &[RelocAt], value: &dyn Fn(Reloc
 pub enum Reloc {
     /// a symbol's value + offset
     Sym(Sym),
-    /// the function table word of a slot (`Env::table_base + id * 8`)
+    /// the function table word of a slot (`SlotTable::table`)
     Slot(u32),
-    /// a slot's permanent callable address (`Env::thunk_base + id * thunk_size`)
+    /// a slot's permanent callable address (`SlotTable::thunk`)
     Thunk(u32),
     /// the thread-local block key / cell offset (`Env::tls_key`, pre-scaled as the backend loads it)
     TlsKey,

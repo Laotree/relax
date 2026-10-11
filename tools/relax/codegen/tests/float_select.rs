@@ -49,9 +49,7 @@ fn compile(w: bool, cond: Option<Cond>, swap_cmp: bool, swap_select: bool, share
     }
     f.verify().unwrap();
     let env = x64::Env {
-        table_base: 0,
-        thunk_base: 0,
-        thunk_size: 0,
+        slots: relax_codegen::rir::SlotsPtr::NONE,
         tls_key: 0,
         tls_slow: 0,
         resume: 0,
@@ -165,9 +163,7 @@ fn unrelated_float_compare_and_redefined_input() {
             f.blocks[0].term = Term::Ret(vec![d]);
             f.verify().unwrap();
             let env = x64::Env {
-                table_base: 0,
-                thunk_base: 0,
-                thunk_size: 0,
+                slots: relax_codegen::rir::SlotsPtr::NONE,
                 tls_key: 0,
                 tls_slow: 0,
                 resume: 0,
@@ -215,9 +211,7 @@ fn f64_compare_selects_f32() {
     f.blocks[0].term = Term::Ret(vec![d]);
     f.verify().unwrap();
     let env = x64::Env {
-        table_base: 0,
-        thunk_base: 0,
-        thunk_size: 0,
+        slots: relax_codegen::rir::SlotsPtr::NONE,
         tls_key: 0,
         tls_slow: 0,
         resume: 0,

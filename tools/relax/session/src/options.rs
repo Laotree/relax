@@ -185,8 +185,6 @@ pub struct Options {
     pub inline_src: Option<u32>,
     /// `RELAX_SPEC_JOBS`; default `None`.
     pub spec_jobs: Option<usize>,
-    /// `RELAX_TABLE_SLOTS`; default `1 << 18`.
-    pub table_slots: usize,
     /// `RELAX_INLINE_LEAF`; default `(40, 8)`.
     pub inline_leaf: (usize, usize),
     /// `RELAX_OPT`; default `Vec::new()`.
@@ -289,7 +287,6 @@ impl Default for Options {
             sandbox_opt: None,
             inline_src: None,
             spec_jobs: None,
-            table_slots: 1 << 18,
             inline_leaf: (40, 8),
             opt: Vec::new(),
             a64: Vec::new(),
@@ -389,7 +386,6 @@ impl Options {
             sandbox_opt: { let os = get("RELAX_SANDBOX_OPT"); let v = os.and_then(|v| v.into_string().ok()); match v.as_deref() { Some("0") => Some(false), Some("1") => Some(true), _ => None } },
             inline_src: { let os = get("RELAX_INLINE_SRC"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             spec_jobs: { let os = get("RELAX_SPEC_JOBS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
-            table_slots: { let os = get("RELAX_TABLE_SLOTS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse::<usize>().ok()).map(|n| n.next_power_of_two().max(1 << 18)).unwrap_or(1 << 18) },
             inline_leaf: { let os = get("RELAX_INLINE_LEAF"); let v = os.and_then(|v| v.into_string().ok()); parse_leaf(v.as_deref()) },
             opt: { let os = get("RELAX_OPT"); let v = os.and_then(|v| v.into_string().ok()); split(v) },
             a64: { let os = get("RELAX_A64"); let v = os.and_then(|v| v.into_string().ok()); split(v) },
@@ -480,7 +476,6 @@ impl Options {
             sandbox_opt,
             inline_src,
             spec_jobs,
-            table_slots,
             inline_leaf,
             opt,
             a64,
@@ -631,8 +626,6 @@ impl Options {
         match inline_src { Some(v) => { h.u8(1); h.u64(*v as u64); }, None => h.u8(0) }
         h.str("spec_jobs");
         match spec_jobs { Some(v) => { h.u8(1); h.u64(*v as u64); }, None => h.u8(0) }
-        h.str("table_slots");
-        h.u64(*table_slots as u64);
         h.str("inline_leaf");
         h.u64(inline_leaf.0 as u64); h.u64(inline_leaf.1 as u64);
         h.str("opt");

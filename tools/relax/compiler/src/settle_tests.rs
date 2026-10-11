@@ -217,7 +217,7 @@ fn main() {}
             assert_eq!(u.stats.tier1_cached, 1);
             assert_eq!(u.stats.tier1_installed, 0, "warm linking must not rebuild O3");
             assert!(u.fns[id as usize].rir.is_none());
-            assert_eq!(unsafe { (*tier_rec(u.tier_base, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
+            assert_eq!(unsafe { (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) }, T_QUEUED);
             assert!(u.frequency_profiles.contains_key(&id), "cached O3 keeps its training opportunity");
             assert!(TIER_QUEUE.lock().unwrap().is_empty());
             assert!(O2_QUEUE.lock().unwrap().is_empty());

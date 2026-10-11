@@ -79,9 +79,8 @@ pub fn set_rir_map(on: bool) {
 
 /// Addresses the backend needs from the runtime.
 pub struct Env {
-    pub table_base: u64,
-    pub thunk_base: u64,
-    pub thunk_size: u64,
+    /// where the function slots' tables and thunks are
+    pub slots: SlotsPtr,
     /// fs-relative offset of the runtime's per-thread block pointer
     pub tls_key: u64,
     /// glue that allocates the calling thread's block: returns it in r11, preserves all else
@@ -102,8 +101,8 @@ impl Env {
     pub fn reloc_value(&self, r: Reloc) -> u64 {
         match r {
             Reloc::Sym(s) => unsafe { s.value(self.syms) },
-            Reloc::Slot(id) => self.table_base + id as u64 * 8,
-            Reloc::Thunk(id) => self.thunk_base + id as u64 * self.thunk_size,
+            Reloc::Slot(id) => self.slots.table(id),
+            Reloc::Thunk(id) => self.slots.thunk(id),
             // fs-relative offset of the block pointer cell (mov r11, fs:[rax])
             Reloc::TlsKey => self.tls_key,
             Reloc::TlsSlow => self.tls_slow,
@@ -4609,7 +4608,7 @@ mod tests {
         push(&mut f, b4, Inst::Iconst(one, 1));
         f.blocks[b4 as usize].term = Term::Ret(vec![one]);
         f.blocks[b5 as usize].term = Term::Ret(vec![x]);
-        let env = Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+        let env = Env { slots: SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
         let r = compile(options, &f, &env).expect("compiles");
         let code = &r.code[..r.text_len as usize];
         // add r64, 12: REX.W(+B) 83 /0 ib

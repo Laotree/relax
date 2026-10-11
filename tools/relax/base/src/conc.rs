@@ -367,7 +367,8 @@ impl<T> AppendVec<T> {
     /// Room for `cap` entries (rounded up to whole chunks).
     pub fn with_capacity(cap: usize) -> Self {
         let n = (cap + AV_CHUNK - 1) / AV_CHUNK;
-        AppendVec { chunks: (0..n).map(|_| std::sync::atomic::AtomicPtr::new(std::ptr::null_mut())).collect(), len: Default::default(), grow: Default::default() }
+        // zeroed pages (null pointers) straight from the allocator: a table for every u32 index stays virtual until chunks are used
+        AppendVec { chunks: unsafe { Box::<[std::sync::atomic::AtomicPtr<T>]>::new_zeroed_slice(n).assume_init() }, len: Default::default(), grow: Default::default() }
     }
 
     #[inline]

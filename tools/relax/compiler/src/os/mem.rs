@@ -218,7 +218,7 @@ mod imp {
     }
 
     /// Code regions: (RX base, size, RW base); append-only, published by CODE_REGIONS_N.
-    const CODE_REGIONS_CAP: usize = 16;
+    const CODE_REGIONS_CAP: usize = 64;
     static CODE_REGIONS: [[AtomicU64; 3]; CODE_REGIONS_CAP] = [const { [const { AtomicU64::new(0) }; 3] }; CODE_REGIONS_CAP];
     static CODE_REGIONS_N: AtomicUsize = AtomicUsize::new(0);
     static CODE_REGIONS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -378,7 +378,7 @@ mod imp {
     const GRANULE: u64 = 1 << 20;
     /// the last page of the code area holds its unwind table entry (register_unwind)
     pub const CODE_TAIL: u64 = 4096;
-    const REGIONS: usize = 4;
+    const REGIONS: usize = 64;
     /// (base, code bytes, total bytes) of each reservation
     static RES: [[AtomicU64; 3]; REGIONS] = [const { [const { AtomicU64::new(0) }; 3] }; REGIONS];
     static RES_N: AtomicUsize = AtomicUsize::new(0);

@@ -59,7 +59,7 @@ fn holds(c: Cond, signed: bool, a: i64, b: i64) -> bool {
 
 #[test]
 fn load_compare_branches_as_the_extended_value() {
-    let env = x64::Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = x64::Env { slots: relax_codegen::rir::SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
     let vals: [u64; 9] = [0, 1, 2, 0x7f, 0x80, 0xff, 0x7fff_ffff, 0x8000_0000, u64::MAX];
     let ks: [i64; 13] = [0, 1, 2, -1, -2, 0x7f, 0x80, 0xff, -0x80, 0x7fff, 0xffff, 0x7fff_ffff, -0x8000_0000];
     let conds = [Cond::Eq, Cond::Ne, Cond::Lt, Cond::Le, Cond::Gt, Cond::Ge];

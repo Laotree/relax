@@ -271,14 +271,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         && !crate::vfs::is_virtual(&workspace_dir()) {
         driver_options.live = true;
     }
-    // a one-shot check compiles every fn of the workspace's crates and all they reach (and
-    // --root-only, whose speculative callee builds reach far past the root: Scope ran out at
-    // 256k slots): a whole-graph function table, unless RELAX_TABLE_SLOTS says otherwise.
-    // 2M slots (Stage reaches 1.41M); the table's thunks and stubs (48 B a slot) share the
-    // 768 MB code reservation with the code itself (Stage: 522 MB), so 4M ran it out of code
-    if check && !watch && session.is_none() && std::env::var_os("RELAX_TABLE_SLOTS").is_none() {
-        driver_options.table_slots = driver_options.table_slots.max(1 << 21);
-    }
     let frozen = std::sync::Arc::new(crate::Session { options: driver_options, runtime: sess.runtime.clone() });
     let sess = &frozen;
     let options = &sess.options;
