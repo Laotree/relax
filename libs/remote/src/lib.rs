@@ -22,6 +22,7 @@ pub mod hosts;
 pub mod hub;
 pub mod lines;
 pub mod pair;
+pub mod program;
 pub mod link;
 #[cfg(unix)]
 pub mod relay;

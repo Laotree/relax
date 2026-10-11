@@ -8,6 +8,9 @@
 //! - `gseq [n=8] [every_ms=50] [scale=F] [w=ID] [out=DIR]`: n frames at a cadence
 //! - `gq [scale=F] [w=ID] [if_user_seq=N]`: a frame of every window, then `quit`
 //! - `tweak final`: the app's answer, plus `"png"` (the composited window) when the user drew
+//! - `tools`: the app's AI services and their tools (the `app` service's `list`)
+//! - `call <service>.<tool> [<instance>] [<json args>]`: one AI tool call (progress lines, then
+//!   the result)
 
 use crate::discovery;
 use crate::frames::{self, Record};
@@ -73,6 +76,19 @@ fn run_inner(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> boo
         ("gseq", _) => gseq(client, &kv),
         ("gq", _) => gq(client, &kv),
         ("tweak", Some("final")) => return tweak_final(client, &words, &kv, each),
+        ("tools", _) => return app_request(client, "list", each),
+        ("call", _) => {
+            let Some(tool) = second else {
+                return Ok((emit(Err("call <service>.<tool> [<instance>] [<json args>]".into()), each), None));
+            };
+            let rest = &words[2..];
+            let (instance, args) = match rest.last() {
+                Some(last) if last.trim_start().starts_with('{') => (&rest[..rest.len() - 1], last.as_str()),
+                _ => (rest, "{}"),
+            };
+            let head = if instance.is_empty() { format!("call {tool}") } else { format!("call {tool} {}", instance.join(" ")) };
+            return app_request(client, &format!("{head}\n{args}"), each);
+        }
         _ => return forward(client, &words, &kv, each),
     };
     let err = emit(reply, each);
@@ -105,6 +121,40 @@ fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mu
         }
     }
     Ok((err, lines.end().map(str::to_string)))
+}
+
+/// One request of the `app` service (the app's AI tools): its answer lines, as they come. The
+/// channel's end is the end of the answer; dropping it early cancels a call.
+fn app_request(client: &Client, args: &str, each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    use crate::conn::{Event, CLOSE_LINK_LOST, CLOSE_NORMAL};
+    let ch = match client.open("app", args) {
+        Ok(ch) => ch,
+        Err(Error::Refused(_, why)) if why.starts_with("unsupported service") => {
+            return Ok((emit(Err("this process serves no AI tools (no `app` service)".into()), each), None));
+        }
+        Err(e) => return Err(e),
+    };
+    let mut err = false;
+    while let Some(ev) = ch.recv() {
+        match ev {
+            Event::Data(d) => {
+                for line in String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()) {
+                    if !each(line) {
+                        return Ok((err, None));
+                    }
+                }
+            }
+            Event::Closed(CLOSE_NORMAL, _) => break,
+            Event::Closed(CLOSE_LINK_LOST, why) => return Err(Error::LinkLost(why)),
+            Event::Closed(_, why) => {
+                err = true;
+                each(&format!("{{\"err\":{}}}", crate::json_str(&why)));
+                break;
+            }
+            Event::Opened(_) => {}
+        }
+    }
+    Ok((err, None))
 }
 
 /// The end line of a command's answer.
