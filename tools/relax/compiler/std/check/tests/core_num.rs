@@ -123,6 +123,11 @@ macro_rules! unsigned_extra {
                     assert_eq!(h.checked_add_signed(sb), a.checked_add_signed(sb), "{} + {}", a, sb);
                     assert_eq!(h.saturating_add_signed(sb), a.saturating_add_signed(sb), "{} +sat {}", a, sb);
                     assert_eq!(h.wrapping_add_signed(sb), a.wrapping_add_signed(sb));
+                    assert_eq!(h.overflowing_add_signed(sb), a.overflowing_add_signed(sb));
+                    assert_eq!(h.checked_sub_signed(sb), a.checked_sub_signed(sb));
+                    assert_eq!(h.saturating_sub_signed(sb), a.saturating_sub_signed(sb), "{} -sat {}", a, sb);
+                    assert_eq!(h.wrapping_sub_signed(sb), a.wrapping_sub_signed(sb));
+                    assert_eq!(h.overflowing_sub_signed(sb), a.overflowing_sub_signed(sb));
                 }
             }
         }
@@ -145,6 +150,12 @@ macro_rules! signed_extra {
                     let ub = b as $u;
                     assert_eq!(h.checked_add_unsigned(ub), a.checked_add_unsigned(ub), "{} + {}", a, ub);
                     assert_eq!(h.saturating_add_unsigned(ub), a.saturating_add_unsigned(ub));
+                    assert_eq!(h.wrapping_add_unsigned(ub), a.wrapping_add_unsigned(ub));
+                    assert_eq!(h.overflowing_add_unsigned(ub), a.overflowing_add_unsigned(ub));
+                    assert_eq!(h.checked_sub_unsigned(ub), a.checked_sub_unsigned(ub), "{} - {}", a, ub);
+                    assert_eq!(h.saturating_sub_unsigned(ub), a.saturating_sub_unsigned(ub), "{} -sat {}", a, ub);
+                    assert_eq!(h.wrapping_sub_unsigned(ub), a.wrapping_sub_unsigned(ub));
+                    assert_eq!(h.overflowing_sub_unsigned(ub), a.overflowing_sub_unsigned(ub));
                     if b != 0 {
                         assert_eq!(h.saturating_div(b), a.saturating_div(b));
                     }

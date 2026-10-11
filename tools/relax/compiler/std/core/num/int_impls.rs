@@ -85,6 +85,10 @@ impl u8 {
     pub const fn wrapping_add_signed(self, rhs: i8) -> u8 { self.wrapping_add(rhs as u8) }
     pub const fn saturating_add_signed(self, rhs: i8) -> u8 { let (res, over) = self.overflowing_add(rhs as u8); if over == (rhs < 0) { res } else if over { u8::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: i8) -> Option<u8> { if rhs >= 0 { self.checked_sub(rhs as u8) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: i8) -> (u8, bool) { let (res, overflowed) = self.overflowing_add(rhs as u8); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: i8) -> (u8, bool) { let (res, overflow) = self.overflowing_sub(rhs as u8); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: i8) -> u8 { self.wrapping_sub(rhs as u8) }
+    pub const fn saturating_sub_signed(self, rhs: i8) -> u8 { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { u8::MAX } else { 0 } }
     pub const fn isqrt(self) -> u8 { if self < 2 { return self; } let mut x = self; let mut c: u8 = 0; let mut d: u8 = 1 << (((8 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(7 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -188,6 +192,10 @@ impl u16 {
     pub const fn wrapping_add_signed(self, rhs: i16) -> u16 { self.wrapping_add(rhs as u16) }
     pub const fn saturating_add_signed(self, rhs: i16) -> u16 { let (res, over) = self.overflowing_add(rhs as u16); if over == (rhs < 0) { res } else if over { u16::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: i16) -> Option<u16> { if rhs >= 0 { self.checked_sub(rhs as u16) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: i16) -> (u16, bool) { let (res, overflowed) = self.overflowing_add(rhs as u16); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: i16) -> (u16, bool) { let (res, overflow) = self.overflowing_sub(rhs as u16); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: i16) -> u16 { self.wrapping_sub(rhs as u16) }
+    pub const fn saturating_sub_signed(self, rhs: i16) -> u16 { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { u16::MAX } else { 0 } }
     pub const fn isqrt(self) -> u16 { if self < 2 { return self; } let mut x = self; let mut c: u16 = 0; let mut d: u16 = 1 << (((16 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(15 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -291,6 +299,10 @@ impl u32 {
     pub const fn wrapping_add_signed(self, rhs: i32) -> u32 { self.wrapping_add(rhs as u32) }
     pub const fn saturating_add_signed(self, rhs: i32) -> u32 { let (res, over) = self.overflowing_add(rhs as u32); if over == (rhs < 0) { res } else if over { u32::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: i32) -> Option<u32> { if rhs >= 0 { self.checked_sub(rhs as u32) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: i32) -> (u32, bool) { let (res, overflowed) = self.overflowing_add(rhs as u32); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: i32) -> (u32, bool) { let (res, overflow) = self.overflowing_sub(rhs as u32); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: i32) -> u32 { self.wrapping_sub(rhs as u32) }
+    pub const fn saturating_sub_signed(self, rhs: i32) -> u32 { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { u32::MAX } else { 0 } }
     pub const fn isqrt(self) -> u32 { if self < 2 { return self; } let mut x = self; let mut c: u32 = 0; let mut d: u32 = 1 << (((32 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(31 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -394,6 +406,10 @@ impl u64 {
     pub const fn wrapping_add_signed(self, rhs: i64) -> u64 { self.wrapping_add(rhs as u64) }
     pub const fn saturating_add_signed(self, rhs: i64) -> u64 { let (res, over) = self.overflowing_add(rhs as u64); if over == (rhs < 0) { res } else if over { u64::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: i64) -> Option<u64> { if rhs >= 0 { self.checked_sub(rhs as u64) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: i64) -> (u64, bool) { let (res, overflowed) = self.overflowing_add(rhs as u64); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: i64) -> (u64, bool) { let (res, overflow) = self.overflowing_sub(rhs as u64); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: i64) -> u64 { self.wrapping_sub(rhs as u64) }
+    pub const fn saturating_sub_signed(self, rhs: i64) -> u64 { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { u64::MAX } else { 0 } }
     pub const fn isqrt(self) -> u64 { if self < 2 { return self; } let mut x = self; let mut c: u64 = 0; let mut d: u64 = 1 << (((64 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(63 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -511,6 +527,10 @@ impl u128 {
     pub const fn wrapping_add_signed(self, rhs: i128) -> u128 { self.wrapping_add(rhs as u128) }
     pub const fn saturating_add_signed(self, rhs: i128) -> u128 { let (res, over) = self.overflowing_add(rhs as u128); if over == (rhs < 0) { res } else if over { u128::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: i128) -> Option<u128> { if rhs >= 0 { self.checked_sub(rhs as u128) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: i128) -> (u128, bool) { let (res, overflowed) = self.overflowing_add(rhs as u128); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: i128) -> (u128, bool) { let (res, overflow) = self.overflowing_sub(rhs as u128); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: i128) -> u128 { self.wrapping_sub(rhs as u128) }
+    pub const fn saturating_sub_signed(self, rhs: i128) -> u128 { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { u128::MAX } else { 0 } }
     pub const fn isqrt(self) -> u128 { if self < 2 { return self; } let mut x = self; let mut c: u128 = 0; let mut d: u128 = 1 << (((128 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(127 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -614,6 +634,10 @@ impl usize {
     pub const fn wrapping_add_signed(self, rhs: isize) -> usize { self.wrapping_add(rhs as usize) }
     pub const fn saturating_add_signed(self, rhs: isize) -> usize { let (res, over) = self.overflowing_add(rhs as usize); if over == (rhs < 0) { res } else if over { usize::MAX } else { 0 } }
     pub const fn checked_sub_signed(self, rhs: isize) -> Option<usize> { if rhs >= 0 { self.checked_sub(rhs as usize) } else { self.checked_add(rhs.unsigned_abs()) } }
+    pub const fn overflowing_add_signed(self, rhs: isize) -> (usize, bool) { let (res, overflowed) = self.overflowing_add(rhs as usize); (res, overflowed ^ (rhs < 0)) }
+    pub const fn overflowing_sub_signed(self, rhs: isize) -> (usize, bool) { let (res, overflow) = self.overflowing_sub(rhs as usize); (res, overflow ^ (rhs < 0)) }
+    pub const fn wrapping_sub_signed(self, rhs: isize) -> usize { self.wrapping_sub(rhs as usize) }
+    pub const fn saturating_sub_signed(self, rhs: isize) -> usize { let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow { res } else if rhs < 0 { usize::MAX } else { 0 } }
     pub const fn isqrt(self) -> usize { if self < 2 { return self; } let mut x = self; let mut c: usize = 0; let mut d: usize = 1 << (((64 - 1) - self.leading_zeros()) & !1); while d != 0 { if x >= c + d { x -= c + d; c = (c >> 1) + d; } else { c >>= 1; } d >>= 2; } c }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(63 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
@@ -719,6 +743,10 @@ impl i8 {
     pub const fn checked_add_unsigned(self, rhs: u8) -> Option<i8> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u8) -> i8 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i8::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: u8) -> i8 { self.wrapping_add(rhs as i8) }
+    pub const fn overflowing_sub_unsigned(self, rhs: u8) -> (i8, bool) { let rhs = rhs as i8; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: u8) -> Option<i8> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: u8) -> i8 { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => i8::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: u8) -> i8 { self.wrapping_sub(rhs as i8) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(7 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: i8) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }
@@ -823,6 +851,10 @@ impl i16 {
     pub const fn checked_add_unsigned(self, rhs: u16) -> Option<i16> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u16) -> i16 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i16::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: u16) -> i16 { self.wrapping_add(rhs as i16) }
+    pub const fn overflowing_sub_unsigned(self, rhs: u16) -> (i16, bool) { let rhs = rhs as i16; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: u16) -> Option<i16> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: u16) -> i16 { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => i16::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: u16) -> i16 { self.wrapping_sub(rhs as i16) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(15 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: i16) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }
@@ -927,6 +959,10 @@ impl i32 {
     pub const fn checked_add_unsigned(self, rhs: u32) -> Option<i32> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u32) -> i32 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i32::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: u32) -> i32 { self.wrapping_add(rhs as i32) }
+    pub const fn overflowing_sub_unsigned(self, rhs: u32) -> (i32, bool) { let rhs = rhs as i32; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: u32) -> Option<i32> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: u32) -> i32 { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => i32::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: u32) -> i32 { self.wrapping_sub(rhs as i32) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(31 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: i32) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }
@@ -1034,6 +1070,10 @@ impl i64 {
     pub const fn checked_add_unsigned(self, rhs: u64) -> Option<i64> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u64) -> i64 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i64::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: u64) -> i64 { self.wrapping_add(rhs as i64) }
+    pub const fn overflowing_sub_unsigned(self, rhs: u64) -> (i64, bool) { let rhs = rhs as i64; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: u64) -> Option<i64> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: u64) -> i64 { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => i64::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: u64) -> i64 { self.wrapping_sub(rhs as i64) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(63 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: i64) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }
@@ -1147,6 +1187,10 @@ impl i128 {
     pub const fn checked_add_unsigned(self, rhs: u128) -> Option<i128> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: u128) -> i128 { match self.checked_add_unsigned(rhs) { Some(v) => v, None => i128::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: u128) -> i128 { self.wrapping_add(rhs as i128) }
+    pub const fn overflowing_sub_unsigned(self, rhs: u128) -> (i128, bool) { let rhs = rhs as i128; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: u128) -> Option<i128> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: u128) -> i128 { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => i128::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: u128) -> i128 { self.wrapping_sub(rhs as i128) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(127 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: i128) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }
@@ -1254,6 +1298,10 @@ impl isize {
     pub const fn checked_add_unsigned(self, rhs: usize) -> Option<isize> { let (a, b) = self.overflowing_add_unsigned(rhs); if b { None } else { Some(a) } }
     pub const fn saturating_add_unsigned(self, rhs: usize) -> isize { match self.checked_add_unsigned(rhs) { Some(v) => v, None => isize::MAX } }
     pub const fn wrapping_add_unsigned(self, rhs: usize) -> isize { self.wrapping_add(rhs as isize) }
+    pub const fn overflowing_sub_unsigned(self, rhs: usize) -> (isize, bool) { let rhs = rhs as isize; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }
+    pub const fn checked_sub_unsigned(self, rhs: usize) -> Option<isize> { let (a, b) = self.overflowing_sub_unsigned(rhs); if b { None } else { Some(a) } }
+    pub const fn saturating_sub_unsigned(self, rhs: usize) -> isize { match self.checked_sub_unsigned(rhs) { Some(v) => v, None => isize::MIN } }
+    pub const fn wrapping_sub_unsigned(self, rhs: usize) -> isize { self.wrapping_sub(rhs as isize) }
     pub const fn checked_ilog2(self) -> Option<u32> { if self <= 0 { None } else { Some(63 - self.leading_zeros()) } }
     pub const fn checked_ilog10(self) -> Option<u32> { if self <= 0 { return None; } let mut n = 0u32; let mut v = self; while v >= 10 { v /= 10; n += 1; } Some(n) }
     pub const fn checked_ilog(self, base: isize) -> Option<u32> { if self <= 0 || base < 2 { return None; } let mut n = 0u32; let mut r = self; while r >= base { r /= base; n += 1; } Some(n) }

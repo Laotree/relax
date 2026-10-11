@@ -333,6 +333,11 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn checked_add_unsigned(self, rhs: {u}) -> Option<{n}> {{ let (a, b) = self.overflowing_add_unsigned(rhs); if b {{ None }} else {{ Some(a) }} }}");
         let _ = writeln!(o, "    pub const fn saturating_add_unsigned(self, rhs: {u}) -> {n} {{ match self.checked_add_unsigned(rhs) {{ Some(v) => v, None => {n}::MAX }} }}");
         let _ = writeln!(o, "    pub const fn wrapping_add_unsigned(self, rhs: {u}) -> {n} {{ self.wrapping_add(rhs as {n}) }}");
+        // int_macros.rs:2753 overflowing_sub_unsigned, :821 checked_, :2019 saturating_, :2219 wrapping_
+        let _ = writeln!(o, "    pub const fn overflowing_sub_unsigned(self, rhs: {u}) -> ({n}, bool) {{ let rhs = rhs as {n}; let (res, o) = self.overflowing_sub(rhs); (res, o ^ (rhs < 0)) }}");
+        let _ = writeln!(o, "    pub const fn checked_sub_unsigned(self, rhs: {u}) -> Option<{n}> {{ let (a, b) = self.overflowing_sub_unsigned(rhs); if b {{ None }} else {{ Some(a) }} }}");
+        let _ = writeln!(o, "    pub const fn saturating_sub_unsigned(self, rhs: {u}) -> {n} {{ match self.checked_sub_unsigned(rhs) {{ Some(v) => v, None => {n}::MIN }} }}");
+        let _ = writeln!(o, "    pub const fn wrapping_sub_unsigned(self, rhs: {u}) -> {n} {{ self.wrapping_sub(rhs as {n}) }}");
     } else {
         let s = signed_of(n);
         let _ = writeln!(o, "    pub const fn rem_euclid(self, rhs: {n}) -> {n} {{ self % rhs }}");
@@ -350,6 +355,11 @@ fn gen_int(o: &mut String, t: &Int) {
         let _ = writeln!(o, "    pub const fn wrapping_add_signed(self, rhs: {s}) -> {n} {{ self.wrapping_add(rhs as {n}) }}");
         let _ = writeln!(o, "    pub const fn saturating_add_signed(self, rhs: {s}) -> {n} {{ let (res, over) = self.overflowing_add(rhs as {n}); if over == (rhs < 0) {{ res }} else if over {{ {n}::MAX }} else {{ 0 }} }}");
         let _ = writeln!(o, "    pub const fn checked_sub_signed(self, rhs: {s}) -> Option<{n}> {{ if rhs >= 0 {{ self.checked_sub(rhs as {n}) }} else {{ self.checked_add(rhs.unsigned_abs()) }} }}");
+        // uint_macros.rs:3032 overflowing_add_signed, :3122 overflowing_sub_signed, :2639 wrapping_sub_signed, :2490 saturating_sub_signed
+        let _ = writeln!(o, "    pub const fn overflowing_add_signed(self, rhs: {s}) -> ({n}, bool) {{ let (res, overflowed) = self.overflowing_add(rhs as {n}); (res, overflowed ^ (rhs < 0)) }}");
+        let _ = writeln!(o, "    pub const fn overflowing_sub_signed(self, rhs: {s}) -> ({n}, bool) {{ let (res, overflow) = self.overflowing_sub(rhs as {n}); (res, overflow ^ (rhs < 0)) }}");
+        let _ = writeln!(o, "    pub const fn wrapping_sub_signed(self, rhs: {s}) -> {n} {{ self.wrapping_sub(rhs as {n}) }}");
+        let _ = writeln!(o, "    pub const fn saturating_sub_signed(self, rhs: {s}) -> {n} {{ let (res, overflow) = self.overflowing_sub_signed(rhs); if !overflow {{ res }} else if rhs < 0 {{ {n}::MAX }} else {{ 0 }} }}");
         let _ = writeln!(o, "    pub const fn isqrt(self) -> {n} {{ if self < 2 {{ return self; }} let mut x = self; let mut c: {n} = 0; let mut d: {n} = 1 << ((({b} - 1) - self.leading_zeros()) & !1); while d != 0 {{ if x >= c + d {{ x -= c + d; c = (c >> 1) + d; }} else {{ c >>= 1; }} d >>= 2; }} c }}");
     }
     // logarithms
