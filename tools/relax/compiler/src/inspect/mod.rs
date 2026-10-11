@@ -42,7 +42,20 @@ static SERVER_TIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 static CAPTURE: Mutex<()> = Mutex::new(());
 static APP: Mutex<String> = Mutex::new(String::new());
 
-pub use makepad_inspect_serve::{json_str, now_ms, paths, Out, Req};
+pub use makepad_remote::{json_str, now_ms, Out, Req};
+
+/// The `watch` service's sink: every event also goes to clients following it over makepad-remote.
+pub static WATCH: std::sync::OnceLock<makepad_remote::watch::WatchSink> = std::sync::OnceLock::new();
+
+fn server_thread_enter() {
+    SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
+    heap::exclude_this_thread();
+}
+
+fn server_thread_exit() {
+    let me = threads::self_os_id();
+    SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
+}
 
 /// Starts the inspect thread for program `app` (once per process; RELAX_INSPECT=0: off).
 pub fn start(app: &str) {
@@ -53,25 +66,18 @@ pub fn start(app: &str) {
     let pid = std::process::id();
     let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
     let extra = format!(",\"session_log\":{},\"relax\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));
-    let host = makepad_inspect_serve::Host {
-        dispatch,
-        thread_enter: || {
-            SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
-            heap::exclude_this_thread();
-        },
-        thread_exit: || {
-            let me = threads::self_os_id();
-            SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
-        },
-    };
-    let sock = match makepad_inspect_serve::listen(app, &extra, host) {
+    let endpoint = makepad_remote::Endpoint::new(app);
+    endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
+    endpoint.register_cmd(dispatch);
+    let _ = WATCH.set(endpoint.register_watch());
+    let sock = match endpoint.listen_unix(&extra) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("relax-inspect: cannot listen on {}: {}", paths(pid).0.display(), e);
+            eprintln!("makepad-remote: cannot listen on {}: {}", makepad_remote::carrier::unix::paths(pid).0.display(), e);
             return;
         }
     };
-    eprintln!("relax-inspect: pid {} app {} socket {} (relax inspect {} help)", pid, app, sock.display(), pid);
+    eprintln!("makepad-remote: pid {} app {} socket {} (relax inspect {} help)", pid, app, sock.display(), pid);
     events::start();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
@@ -105,7 +111,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
-    ("gpu", "[top [by=bytes|owner|site|churn]|idle [s=30]|snap <name>|diff <a> <b|now>|path G<id>]", "where the GPU memory is (native makepad apps: MAKEPAD_INSPECT=1): totals by kind and owner against the device, automatic findings; top / idle / snap / diff / path"),
+    ("gpu", "[top [by=bytes|owner|site|churn]|idle [s=30]|snap <name>|diff <a> <b|now>|path G<id>]", "where the GPU memory is (native makepad apps: MAKEPAD_REMOTE=1): totals by kind and owner against the device, automatic findings; top / idle / snap / diff / path"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -214,7 +220,7 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     }
     let _ = os_id;
     match name {
-        n if n.starts_with("relax-inspect") => "inspect",
+        n if n.starts_with("relax-inspect") || n.starts_with("makepad-remote") => "inspect",
         n if n.starts_with("relax-spec") || n.starts_with("relax-O2") || n.starts_with("relax-o3") || n.starts_with("relax-ahead") || n == "gandalf" || n.starts_with("relax-check") => "compiler",
         n if n.starts_with("relax-") => "relax",
         _ => "program",

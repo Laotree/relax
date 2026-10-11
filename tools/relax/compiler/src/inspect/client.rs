@@ -1,12 +1,12 @@
 //! `relax inspect <pid|app|all|list> <command> [args]`: the client side of the inspect protocol.
-//! Finds running apps by their discovery files (relax-inspect-<pid>.json in the temp dir), sends
+//! Finds running apps by their discovery files (makepad-remote-<pid>.json in the temp dir), sends
 //! one request line and prints the answer's JSON lines (the `end` line left out). Exit status 1 when
 //! the answer had an error, 2 for usage / no such app.
 //!
 //! `all`: every running app, including ones started later: `watch` returns the first event of any
 //! of them; `events follow=1` streams all of them; other commands run on each in turn.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 
 pub struct App {
     pub pid: u32,
@@ -14,39 +14,9 @@ pub struct App {
     pub socket: String,
 }
 
-fn alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        unsafe { kill(pid as i32, 0) == 0 }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
-}
-
-/// The running apps (stale discovery files of ended processes are removed).
+/// The running apps (discovery files `makepad-remote-<pid>.json`; stale ones of ended processes are removed).
 pub fn apps() -> Vec<App> {
-    let mut out = Vec::new();
-    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else { return out };
-    for e in dir.flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        let Some(pid) = name.strip_prefix("relax-inspect-").and_then(|r| r.strip_suffix(".json")).and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if !alive(pid) {
-            let _ = std::fs::remove_file(e.path());
-            let _ = std::fs::remove_file(super::paths(pid).0);
-            continue;
-        }
-        let Ok(text) = std::fs::read(e.path()) else { continue };
-        let Ok(j) = crate::json::parse(&text) else { continue };
-        out.push(App { pid, app: j.get("app").map(|v| v.str().to_string()).unwrap_or_default(), socket: j.get("socket").map(|v| v.str().to_string()).unwrap_or_default() });
-    }
-    out.sort_by_key(|a| a.pid);
-    out
+    makepad_remote::discovery::apps().into_iter().map(|a| App { pid: a.pid, app: a.app, socket: a.socket }).collect()
 }
 
 fn usage() -> i32 {
@@ -105,29 +75,17 @@ pub fn main(args: &[String]) -> i32 {
 /// Sends one request; `each` gets every answer line but the end line (false: stop reading).
 /// Ok(true) when the answer had an error line.
 fn ask(app: &App, line: &str, each: &mut dyn FnMut(&str) -> bool) -> std::io::Result<bool> {
-    #[cfg(unix)]
-    {
-        let mut s = std::os::unix::net::UnixStream::connect(&app.socket)?;
-        s.write_all(line.as_bytes())?;
-        s.write_all(b"\n")?;
-        let mut err = false;
-        for l in BufReader::new(s).lines() {
-            let l = l?;
-            if l.starts_with("{\"end\":") {
-                break;
-            }
-            err |= l.starts_with("{\"err\":");
-            if !each(&l) {
-                break;
-            }
+    let to_io = |e: makepad_remote::link::Error| std::io::Error::other(e.to_string());
+    let client = makepad_remote::Client::connect(&app.socket).map_err(to_io)?;
+    let mut err = false;
+    for l in client.cmd(line).map_err(to_io)? {
+        let l = l.map_err(to_io)?;
+        err |= l.starts_with("{\"err\":");
+        if !each(&l) {
+            break;
         }
-        Ok(err)
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (app, line, each);
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "not available on this platform"))
-    }
+    Ok(err)
 }
 
 /// `all`: every app now and every app that starts while this runs.

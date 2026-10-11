@@ -766,7 +766,7 @@ mod pause_imp {
         let skip = crate::inspect::SERVER_TIDS.lock().unwrap().clone();
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
         for t in crate::inspect::threads::list() {
-            if skip.contains(&t.os_id) || t.name.starts_with("relax-inspect") || !want(&t) {
+            if skip.contains(&t.os_id) || t.name.starts_with("relax-inspect") || t.name.starts_with("makepad-remote") || !want(&t) {
                 continue;
             }
             if crate::inspect::threads::suspend(&t) {
@@ -808,7 +808,7 @@ mod pause_imp {
         let mut list = crate::inspect::threads::list();
         crate::inspect::name_handles(&mut list);
         for t in list {
-            if skip.contains(&t.os_id) || t.name.starts_with("relax-inspect") || !want(&t) || held.iter().any(|h| h.0 == t.os_id) || t.state != "running" {
+            if skip.contains(&t.os_id) || t.name.starts_with("relax-inspect") || t.name.starts_with("makepad-remote") || !want(&t) || held.iter().any(|h| h.0 == t.os_id) || t.state != "running" {
                 continue;
             }
             if let Ok(slot) = crate::inspect::threads::hold_paused(t.os_id) {

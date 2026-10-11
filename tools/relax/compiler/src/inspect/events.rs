@@ -55,6 +55,9 @@ pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
     if super::AGENT.load(Relaxed) {
         eprintln!("relax-event: {}", json);
     }
+    if let Some(w) = super::WATCH.get() {
+        w.emit(&json);
+    }
     q.push_back(Event { seq, kind, key: key.to_string(), json, at: std::time::Instant::now() });
     while q.len() > KEEP {
         q.pop_front();

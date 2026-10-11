@@ -32,7 +32,7 @@ pub fn collect(secs: f64, hz: u64, want: &dyn Fn(&super::threads::Thread) -> boo
     let skip = super::SERVER_TIDS.lock().unwrap().clone();
     let mut threads = super::threads::list();
     super::name_handles(&mut threads);
-    threads.retain(|t| !skip.contains(&t.os_id) && want(t) && !t.name.starts_with("relax-inspect"));
+    threads.retain(|t| !skip.contains(&t.os_id) && want(t) && !t.name.starts_with("relax-inspect") || t.name.starts_with("makepad-remote"));
     imp::collect(threads, secs, hz)
 }
 
