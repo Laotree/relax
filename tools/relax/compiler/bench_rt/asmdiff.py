@@ -13,7 +13,7 @@ Options:
   --relax <bin>        relax binary (default: env RELAX, else `relax` on PATH)
   --native <bin>       rustc release binary holding the symbol
   --kernel <name>      bench_rt kernel to run (default: the fn's last path segment)
-  --run "<args>"       instead of a kernel: `relax run --quiet <args>` (cwd: --dir), e.g. "makepad-amp"
+  --run "<args>"       instead of a kernel: `relax run --quiet <args>` (cwd: --dir), e.g. "makepad-app-amp"
   --dir <dir>          cwd for relax run (default: this bench_rt dir)
   --dumps <dir>        use existing dumps in <dir> (no run): relax_dump_<fn>.t1.bin / .bin / .prof
   --warm <ms>          BENCH_WARM_MS (default 3000)

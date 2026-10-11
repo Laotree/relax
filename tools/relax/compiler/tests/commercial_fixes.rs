@@ -1,4 +1,4 @@
-// Fixes found running makepad-amp under Relax; each assertion is rustc's behaviour.
+// Fixes found running makepad-app-amp under Relax; each assertion is rustc's behaviour.
 use std::ops::Shl;
 
 // derive(Clone) with derive(Copy) on a generic type clones field by field (rustc deriving/clone.rs

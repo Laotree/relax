@@ -1,7 +1,7 @@
 # The AI-edit corpus for Amp: one cumulative UI-editing session (see todo.py).
 # Each old string occurs exactly once after the preceding edits; grouped pairs
 # are saved together. Only the adjacent typo/fix pair leaves invalid Rust.
-PKG = "makepad-amp"
+PKG = "makepad-app-amp"
 FILE = "apps/amp/src/main.rs"
 EDITS = [
     ("window title", "text", 'window.title: "Makepad Amp"', 'window.title: "Amp — Music"'),
