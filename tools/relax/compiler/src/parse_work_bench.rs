@@ -6,7 +6,7 @@
 fn amp_parse_medians() {
     let sess = &std::sync::Arc::new(crate::Session::default());
     let makepad = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let path = makepad.join("apps/commercial/stage/apps/amp/src/lib.rs");
+    let path = makepad.join("apps/amp/src/lib.rs");
     let source = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

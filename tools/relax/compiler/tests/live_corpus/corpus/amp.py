@@ -2,7 +2,7 @@
 # Each old string occurs exactly once after the preceding edits; grouped pairs
 # are saved together. Only the adjacent typo/fix pair leaves invalid Rust.
 PKG = "makepad-amp"
-FILE = "apps/commercial/stage/apps/amp/src/main.rs"
+FILE = "apps/amp/src/main.rs"
 EDITS = [
     ("window title", "text", 'window.title: "Makepad Amp"', 'window.title: "Amp — Music"'),
     ("window size", "layout", "window.inner_size: vec2(1360 900)", "window.inner_size: vec2(1440 920)"),
