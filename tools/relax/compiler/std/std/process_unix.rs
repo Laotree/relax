@@ -862,9 +862,17 @@ impl fmt::Debug for Command {
 }
 
 /// Whether two files have the same bytes (a copy of an executable).
+/// The same file (dev + inode), or a copy of it: equal size and modification time (makepad-cef
+/// keeps the source's mtime on its bundle copy and re-copies on any change), else equal bytes.
 fn same_file_contents(a: &crate::path::Path, b: &crate::path::Path) -> bool {
+    use crate::os::unix::fs::MetadataExt;
     match (crate::fs::metadata(a), crate::fs::metadata(b)) {
-        (Ok(x), Ok(y)) if x.len() == y.len() => {}
+        (Ok(x), Ok(y)) if x.dev() == y.dev() && x.ino() == y.ino() => return true,
+        (Ok(x), Ok(y)) if x.len() == y.len() => {
+            if matches!((x.modified(), y.modified()), (Ok(m), Ok(n)) if m == n) {
+                return true;
+            }
+        }
         _ => return false,
     }
     match (crate::fs::read(a), crate::fs::read(b)) {
