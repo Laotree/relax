@@ -29,3 +29,8 @@ path = "src/main.rs"
 [[bin]]
 name = "relax-provided-fixture-guard"
 path = "src/guard.rs"
+
+# panic unwinding through frames with drop guards (driven by compiler/tests/unwind_modes.py)
+[[bin]]
+name = "relax-unwind-probe"
+path = "src/unwind_probe.rs"

@@ -1,6 +1,6 @@
 //! std::panic: hooks, catch_unwind over the runtime's catch_panic, Location re-export.
-//! Under Relax no panic unwinds through frames (R11): catch_unwind returns Err after the
-//! runtime reset the stack to its frame (live mode) and Drop of the skipped frames does not run.
+//! A panic unwinds the frames between it and the catch, running each frame's cleanup pads
+//! (Drop of its live locals) as rustc's unwinder does; catch_unwind returns Err after that.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -200,10 +200,11 @@ pub(crate) fn take_resuming() -> bool {
     RESUMING.try_with(|c| c.replace(false)).unwrap_or(false)
 }
 
-/// Panics with `payload` as the payload catch_unwind / join return (Relax reports it like any
-/// panic: there is no hook-free unwind, R11).
+/// Panics with `payload` as the payload catch_unwind / join return. No hook runs for it and
+/// inspect does not park it again; the runtime's report is the only trace.
 pub fn resume_unwind(payload: Box<dyn Any + Send>) -> ! {
     let _ = RESUMING.try_with(|c| c.set(true));
+    sys::rt::rethrow();
     unwind_with(payload)
 }
 

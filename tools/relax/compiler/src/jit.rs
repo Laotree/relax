@@ -155,6 +155,8 @@ pub struct Rt {
     pub land: u64,
     /// `panicking() -> u64`: 1 while this thread unwinds a panic (std::thread::panicking)
     pub panicking: u64,
+    /// `rethrow()`: the next panic on this thread continues one already reported (resume_unwind)
+    pub rethrow: u64,
 }
 
 /// `Rt` as symbols (syms.rs): what lowering and glue put into RIR.
@@ -181,6 +183,7 @@ pub struct RtSyms {
     pub resume: crate::rir::Sym,
     pub land: crate::rir::Sym,
     pub panicking: crate::rir::Sym,
+    pub rethrow: crate::rir::Sym,
 }
 
 
@@ -1297,7 +1300,10 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
         std::process::abort();
     }
     // relax inspect: a watched run parks the panic here, stack intact, until a client decides
-    crate::inspect::events::on_panic(&info, !regs.is_null());
+    // (a resume_unwind continues a panic inspect already parked: no second park)
+    if !RETHROW.with(|c| c.replace(false)) {
+        crate::inspect::events::on_panic(&info, !regs.is_null());
+    }
     PANIC.with(|p| *p.borrow_mut() = Some(info));
     FMT.with(|f| {
         let mut v = f.borrow_mut();
@@ -1509,7 +1515,17 @@ fn rt_panicking() -> u64 {
 }
 }
 
+rt_fn! {
+/// std::panic::resume_unwind: the panic that follows continues one already reported (and
+/// parked, under inspect). Like rustc's resume_unwind it starts no new report: the unwind
+/// goes on to the next catch.
+fn rt_rethrow() {
+    RETHROW.with(|c| c.set(true));
+}
+}
+
 thread_local! {
+    static RETHROW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static UNWINDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAND_REGS: std::cell::UnsafeCell<[u64; REG_WORDS]> = const { std::cell::UnsafeCell::new([0; REG_WORDS]) };
 }
@@ -2035,11 +2051,11 @@ impl Unit {
             static_spans: Default::default(),
             sites: Default::default(),
             site_ix: Default::default(),
-            rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0) },
+            rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base),
             cache: None,
             start_order: Vec::new(),
-            rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0 },
+            rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
             bodies: Default::default(),
             old_bodies: Default::default(),
             coro_rir: Default::default(),
@@ -2124,6 +2140,7 @@ impl Unit {
             resume: 0,
             land: 0,
             panicking: rt_panicking as *const () as usize as u64,
+            rethrow: rt_rethrow as *const () as usize as u64,
         };
         u.rt.panic_site = u.emit_code(&ps);
         u.rt.panic_bounds = u.emit_code(&pb);
@@ -2160,6 +2177,7 @@ impl Unit {
             resume: u.syms.intern(crate::syms::SymKind::Rt("resume"), u.rt.resume),
             land: u.syms.intern(crate::syms::SymKind::Rt("land"), u.rt.land),
             panicking: u.syms.intern(crate::syms::SymKind::Rt("panicking"), u.rt.panicking),
+            rethrow: u.syms.intern(crate::syms::SymKind::Rt("rethrow"), u.rt.rethrow),
         };
         crate::opt::set_mem_fns(u.rs.memcpy, u.rs.memmove);
         // runtime symbols lowering interns on first use: a cached entry may name them before any

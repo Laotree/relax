@@ -22,6 +22,8 @@ pub fn args() -> (usize, *const *const c_char) {
     (n, p as *const *const c_char)
 }
 
+pub fn rethrow() {}
+
 pub fn panicking() -> bool {
     std::thread::panicking()
 }

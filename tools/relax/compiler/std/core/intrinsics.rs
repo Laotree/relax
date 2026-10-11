@@ -129,6 +129,9 @@ pub mod intrinsics_rt {
         /// Whether this thread is unwinding a panic (from the panic to the recovery point that
         /// catches it): std::thread::panicking.
         pub fn panicking() -> bool;
+        /// The next panic on this thread continues one already reported (resume_unwind): no new
+        /// inspect park (Rt::rethrow).
+        pub fn rethrow();
         /// This thread's floating-point control register (x86-64: MXCSR, zero-extended;
         /// AArch64: FPCR): one instruction, no call.
         pub fn fp_env_get() -> u64;

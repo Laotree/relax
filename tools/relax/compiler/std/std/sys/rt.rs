@@ -26,6 +26,11 @@ pub fn panicking() -> bool {
     unsafe { core::intrinsics_rt::panicking() }
 }
 
+/// The next panic continues one already reported (resume_unwind).
+pub fn rethrow() {
+    unsafe { core::intrinsics_rt::rethrow() }
+}
+
 /// The std hook trampoline (std::panic), called by `core_hook` below.
 static mut STD_HOOK: Option<fn(&str, &core::panic::Location<'_>)> = None;
 
@@ -62,4 +67,4 @@ pub fn install_core_hook() {
 }
 }
 
-pub use self::imp::{args, catch_panic, install_core_hook, panicking, set_panic_trampoline};
+pub use self::imp::{args, catch_panic, install_core_hook, panicking, rethrow, set_panic_trampoline};

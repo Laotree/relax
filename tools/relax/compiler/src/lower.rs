@@ -10365,6 +10365,12 @@ impl<'a> Lcx<'a> {
                 self.emit(Inst::Call(Callee::Host(rt), Vec::new(), vec![r]));
                 Some(Val::L(vec![r]))
             }
+            "rethrow" => {
+                // intrinsics_rt::rethrow(): Rt::rethrow (the next panic continues a reported one)
+                let rt = self.u.rs.rethrow;
+                self.emit(Inst::Call(Callee::Host(rt), Vec::new(), Vec::new()));
+                Some(self.unit())
+            }
             "args" => {
                 // intrinsics_rt::args() -> (usize, *const *const c_char): Rt::args (argc, argv)
                 let (c, v) = (self.f.vreg(Cls::I), self.f.vreg(Cls::I));
