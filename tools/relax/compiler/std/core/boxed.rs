@@ -381,7 +381,9 @@ impl<'a, 'b> From<&'b str> for Box<dyn Error + 'a> {
     }
 }
 
-impl<T: Error + ?Sized> Error for Box<T> {
+// library/alloc/src/boxed.rs:2420: `E: Error` is Sized, so Box<dyn Error> is not an Error and
+// `From<E: Error> for Box<dyn Error>` does not overlap the reflexive `From<T> for T`
+impl<E: Error> Error for Box<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Error::source(&**self)
     }
