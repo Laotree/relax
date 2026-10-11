@@ -483,6 +483,23 @@ fn script_units(bs: &BuildScript, raw: &[RawUnit], rewrite: Option<&noop::Rewrit
     (json, h)
 }
 
+static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The program a build script runs as: Relax running itself again. It is this process's
+/// executable unless the host names another one ([`set_self_exe`]): in an Android app this
+/// process is `app_process64`, and Relax's own executable is the PIE the APK carries next to the
+/// host library.
+pub fn set_self_exe(exe: std::path::PathBuf) {
+    let _ = SELF_EXE.set(exe);
+}
+
+fn self_exe() -> std::io::Result<std::path::PathBuf> {
+    match SELF_EXE.get() {
+        Some(e) => Ok(e.clone()),
+        None => std::env::current_exe(),
+    }
+}
+
 /// (stdout of the script, OUT_DIR). The script runs as a Relax program: this executable started
 /// again on the script's units (script_units) -- no rustc, no script binary; Relax re-running
 /// itself is the only process it starts. A script of a git run reads its package through the
@@ -525,7 +542,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         }
     }
     let _ = std::fs::create_dir_all(&out_dir);
-    let exe = match std::env::current_exe() {
+    let exe = match self_exe() {
         Ok(e) => e,
         Err(e) => return (Err(format!("this executable: {e}")), out_dir),
     };

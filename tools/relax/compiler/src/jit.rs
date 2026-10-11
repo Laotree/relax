@@ -4056,6 +4056,13 @@ impl Unit {
     }
 }
 
+/// Names `u` the runtime's unit without calling into it: code entered through an address the
+/// host handed out (an exported function called from a thread of the host's, not through
+/// `call_jit`) compiles its lazy stubs against it.
+pub unsafe fn set_runtime_unit(u: *mut Unit) {
+    UNIT = u;
+}
+
 /// Calls JIT code `entry(arg)` under a fresh recovery context. No Rust borrow of the
 /// unit may be alive across this call; `u` becomes the runtime's unit pointer.
 pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {

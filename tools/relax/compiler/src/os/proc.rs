@@ -8,11 +8,28 @@
 //! - `lookup(handle, name)`: the system's own lookup in a library handle (the program's dlsym).
 //! - `exit(code)`: ends the process once Relax is done with the program (see the Windows half).
 //! - `on_battery()`.
-//! - `args_bytes()`: the process arguments as bytes.
+//! - `args_bytes()`: the process arguments as bytes (`set_args`: an embedder names them).
 //! - `create_private(path)`: a new file only this user can read (O_EXCL); `ensure_private_dir`:
 //!   a directory that is safe to load code from (owned by this user, not writable by others).
 
 pub use imp::*;
+
+static ARGS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+/// The arguments Relax runs under, when the process's own are not what it was started with: a
+/// host library started from a loader (Android: bionic hands a cdylib's std no argv, the APK's
+/// executable passes its own).
+pub fn set_args(args: Vec<Vec<u8>>) {
+    let _ = ARGS.set(args);
+}
+
+/// The process arguments as bytes (`set_args` first, else the process's).
+pub fn args_bytes() -> Vec<Vec<u8>> {
+    match ARGS.get() {
+        Some(a) => a.clone(),
+        None => os_args_bytes(),
+    }
+}
 
 /// Keeps the calling thread's last OS error (errno / GetLastError) across runtime work done in
 /// the middle of program code (lazy compiles, tier-up glue, thread-local block allocation).
@@ -69,7 +86,7 @@ mod unix {
         }
     }
 
-    pub fn args_bytes() -> Vec<Vec<u8>> {
+    pub fn os_args_bytes() -> Vec<Vec<u8>> {
         use std::os::unix::ffi::OsStringExt;
         std::env::args_os().map(|a| a.into_vec()).collect()
     }
@@ -103,7 +120,7 @@ mod unix {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    pub use super::unix::{args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     pub unsafe fn find(name: *const u8) -> *mut u8 {
@@ -179,13 +196,28 @@ mod imp {
 
 #[cfg(target_os = "android")]
 mod imp {
-    pub use super::unix::{args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
+
+    /// The library Relax itself is (libmakepad.so): System.loadLibrary loads it into a scope of its
+    /// own, so the process-wide lookup below never sees its exported symbols (the C functions the
+    /// compiled program calls by name: Relax std's file system, the runtime's hooks).
+    static HOST_LIBRARY: std::sync::atomic::AtomicPtr<u8> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+    /// Names the loaded host library's handle (dlopen of its soname with RTLD_NOLOAD).
+    pub fn set_host_library(handle: *mut u8) {
+        HOST_LIBRARY.store(handle, std::sync::atomic::Ordering::Release);
+    }
 
     // NDK r28 dlfcn.h:169 RTLD_DEFAULT = 0, :191 RTLD_NOW = 2,
     // :204 RTLD_GLOBAL = 0x100 on LP64.
     pub unsafe fn find(name: *const u8) -> *mut u8 {
-        dlsym(std::ptr::null_mut(), name)
+        let p = dlsym(std::ptr::null_mut(), name);
+        let host = HOST_LIBRARY.load(std::sync::atomic::Ordering::Acquire);
+        if p.is_null() && !host.is_null() {
+            return dlsym(host, name);
+        }
+        p
     }
 
     /// The C math library is not necessarily loaded into the host.
@@ -232,7 +264,7 @@ mod imp {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    pub use super::unix::{args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// Symbol in any loaded image (RTLD_DEFAULT). libm lives in libSystem, always loaded.
@@ -358,7 +390,7 @@ mod imp {
     }
 
     /// The arguments as UTF-8 (WTF-16 decoded lossily: the program's C argv view).
-    pub fn args_bytes() -> Vec<Vec<u8>> {
+    pub fn os_args_bytes() -> Vec<Vec<u8>> {
         std::env::args_os().map(|a| a.to_string_lossy().into_owned().into_bytes()).collect()
     }
 

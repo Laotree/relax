@@ -8,6 +8,10 @@ publish = false
 # tests/ are `relax test` programs (they use makepad's macros), not cargo tests
 autotests = false
 
+[lib]
+name = "relax"
+path = "src/lib.rs"
+
 [[bin]]
 name = "relax"
 path = "src/main.rs"

@@ -171,6 +171,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut units_json = String::new();
     let mut ahead = false;
     let mut entries: Vec<String> = Vec::new();
+    // `--exports a,b`: compile (and publish the addresses of) the `#[no_mangle]` / `#[export_name]`
+    // fns whose names start with one of these, then return to the caller instead of running `main`
+    // (the Android host: the Activity's JNI natives are these fns, `exports()`)
+    let mut export_names: Vec<String> = Vec::new();
     let mut check = false;
     let mut watch = session.is_some();
     let mut deep = false;
@@ -204,6 +208,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
             "--cfg" if i + 1 < args.len() => {
                 driver_options.cfgs.push(crate::options::Options::cfg_entry(&args[i + 1]));
+                i += 1;
+            }
+            "--exports" if i + 1 < args.len() => {
+                export_names.extend(args[i + 1].split(',').filter(|n| !n.is_empty()).map(str::to_string));
                 i += 1;
             }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
@@ -265,7 +273,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if driver_options.verbose { crate::tui::track_for_verbose(); }
     // the boot progress line (tui.rs): a terminal run of a program, with nothing asking for plain output
     unsafe { std::env::remove_var("RELAX_RUN_PROGRESS") };
-    if !check && !watch && session.is_none() && entries.is_empty() {
+    let hosted = !entries.is_empty() || !export_names.is_empty();
+    if !check && !watch && session.is_none() && !hosted {
         crate::tui::start(!driver_options.verbose && !QUIET.load(Ordering::Relaxed) && !crate::diag::enabled());
     }
     // `relax run` of a working tree is a live session (watcher + hot reload); sources served from
@@ -319,7 +328,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let package = args[i].clone();
     // relax inspect: the program answers questions from now on (compiles included)
-    if !check && session.is_none() && entries.is_empty() && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
+    if !check && session.is_none() && !hosted && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none() {
         crate::inspect::start(&package);
     }
     let mut cargo_flags = Vec::new();
@@ -343,7 +352,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // with the new arguments (std process.rs: RELAX_SELF_EXEC holds this command line up to `--`);
     // a spawn of it with `run` as the first argument launches another program instead
     if let Ok(exe) = std::env::current_exe().and_then(|e| e.canonicalize()) {
-        let mut pre: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+        let mut pre: Vec<String> = crate::os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
         if let Some(d) = pre.iter().position(|a| a == "--") {
             pre.truncate(d);
         }
@@ -867,11 +876,27 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
 
     // ---- main
-    let main_def = match find_main(&prog, root) {
-        Some(d) => d,
-        None => {
-            eprintln!("relax-run: no `fn main` at the root of {}", g.crates[g.root].name);
-            return 1;
+    let exports_mode = !export_names.is_empty();
+    // the exported fns a host asked for (`--exports`): no `main` at all (an Android app has none)
+    let mut export_defs: Vec<(String, DefId)> = Vec::new();
+    if exports_mode {
+        match exported_fns(&prog, &export_names) {
+            Ok(v) => export_defs = v,
+            Err(e) => {
+                eprintln!("relax-run: --exports: {e}");
+                return 1;
+            }
+        }
+    }
+    let main_def = if exports_mode {
+        None
+    } else {
+        match find_main(&prog, root) {
+            Some(d) => Some(d),
+            None => {
+                eprintln!("relax-run: no `fn main` at the root of {}", g.crates[g.root].name);
+                return 1;
+            }
         }
     };
     let mut entry_defs = Vec::new();
@@ -921,7 +946,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     let t = Instant::now();
     let fn_defs = if ahead { startup_defs(&prog, &format!("{}/relax-run/{}.startup", target_dir, package)) } else { Vec::new() };
-    let root_crate = prog.def(main_def).krate;
+    // `main` lives at the root of the root crate (find_main)
+    let root_crate = root;
     crate::layout::set_root_crate(root_crate);
     // A live session (hot reload of the program's own sources, reload.rs); set
     // before anything is laid out (app structs take the live layout, layout.rs live_editable)
@@ -991,15 +1017,20 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             }
         }
     }
-    let id = {
-        let _why = crate::why::enabled().then(|| {
-            let mut c = u.prog.why_def(main_def, "entry-point");
-            c.symbol = "run main stub before execution".into();
-            crate::why::enter(c)
-        });
-        u.fn_id(FnKey::Inst(main_def, Vec::new()))
+    let entry = match main_def {
+        Some(main_def) => {
+            let id = {
+                let _why = crate::why::enabled().then(|| {
+                    let mut c = u.prog.why_def(main_def, "entry-point");
+                    c.symbol = "run main stub before execution".into();
+                    crate::why::enter(c)
+                });
+                u.fn_id(FnKey::Inst(main_def, Vec::new()))
+            };
+            u.entry(id)
+        }
+        None => 0,
     };
-    let entry = u.entry(id);
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
     start_exit_summary();
@@ -1158,6 +1189,24 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         std::mem::forget(u);
         return 0;
     }
+    if exports_mode {
+        // the exported fns' permanent addresses (lazy stubs: each compiles on its first call, on
+        // whatever thread calls it); the unit outlives this call as it does for `main`
+        let mut addrs = Vec::with_capacity(export_defs.len());
+        for (name, d) in &export_defs {
+            let en = crate::owner::call(crate::owner::Class::App, || {
+                let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
+                u.entry(id)
+            });
+            addrs.push((name.clone(), en));
+        }
+        *EXPORTS.lock().unwrap() = addrs;
+        // the host calls these from its own threads, not through call_jit
+        unsafe { jit::set_runtime_unit(up) };
+        std::mem::forget(u);
+        return 0;
+    }
+    let main_def = main_def.expect("a run without --exports has main");
     // `fn main() -> T` (T != ()): rustc's lang_start runs `main().report()` (Termination) and exits
     // with its code; std::process::__relax_lang_start::<T>(main) does the same.
     // (a `#[no_main]` crate's `extern "C" fn main(argc, argv) -> c_int` is called as before)
@@ -1205,6 +1254,58 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // unit must outlive cmd_run (dropping it here freed it under them)
     std::mem::forget(u);
     code
+}
+
+/// What `--exports` published: (symbol, address) of each exported fn, in program order.
+static EXPORTS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The symbols (and their callable addresses) a `cmd_run` with `--exports` published.
+pub fn exports() -> Vec<(String, u64)> {
+    EXPORTS.lock().unwrap().clone()
+}
+
+/// The last boot phase that finished ("unit graph", "build scripts", ...), for a host's progress
+/// display, and how many crates the front end has loaded of how many (tui.rs counters).
+pub fn progress() -> (String, u32, u32) {
+    let phase = PHASES.lock().unwrap().last().map(|p| p.0.split(" (").next().unwrap_or(&p.0).to_string()).unwrap_or_default();
+    (phase, crate::tui::LOAD_DONE.load(Ordering::Relaxed), crate::tui::LOAD_TOTAL.load(Ordering::Relaxed))
+}
+
+/// The C-ABI fns carrying `#[no_mangle]` (symbol = the fn's name) or `#[export_name = ".."]` whose
+/// symbol starts with one of `prefixes`. A symbol defined twice is an error: the host would bind
+/// one of the two silently.
+fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<Vec<(String, DefId)>, String> {
+    let mut out: Vec<(String, DefId)> = Vec::new();
+    for (di, d) in prog.defs.iter().enumerate() {
+        if d.kind != DefKind::Fn {
+            continue;
+        }
+        let f = &prog.files[d.file as usize];
+        let mut symbol = None;
+        for a in f.ast.list(f.ast.item(d.item).attrs) {
+            let toks: Vec<&str> = (a.toks.lo..a.toks.hi).map(|t| f.tok_text(t)).collect();
+            // `#[no_mangle]`, `#[unsafe(no_mangle)]`, `#[export_name = ".."]`, `#[unsafe(export_name = "..")]`
+            if toks.contains(&"no_mangle") {
+                symbol = Some(prog.name(DefId(di as u32)).to_string());
+            } else if let Some(k) = toks.iter().position(|t| *t == "export_name") {
+                if let (Some(&"="), Some(lit)) = (toks.get(k + 1), toks.get(k + 2)) {
+                    symbol = Some(lit.trim_matches('"').to_string());
+                }
+            }
+        }
+        let Some(symbol) = symbol else { continue };
+        if !prefixes.iter().any(|p| symbol.starts_with(p.as_str())) {
+            continue;
+        }
+        if let Some((_, other)) = out.iter().find(|(s, _)| *s == symbol) {
+            return Err(format!("`{symbol}` is defined twice ({} and {})", prog.def_path(*other), prog.def_path(DefId(di as u32))));
+        }
+        out.push((symbol, DefId(di as u32)));
+    }
+    if out.is_empty() {
+        return Err(format!("no exported fn starts with {}", prefixes.join(" or ")));
+    }
+    Ok(out)
 }
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items

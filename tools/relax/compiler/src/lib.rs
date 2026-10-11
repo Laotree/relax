@@ -80,7 +80,7 @@ pub fn relax_as_rustc() -> bool {
     if std::env::var_os("RELAX_AS_RUSTC").is_none() {
         return false;
     }
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     // the script's own run (and a nested script's) is a Relax command, not a RUSTC question
     if args.first().is_some_and(|a| a == "run") {
         return false;
@@ -144,7 +144,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     }
     // a program's own arguments after `--` may be any bytes (`relax run p -- $'\xff'`): Relax
     // reads its own options lossily, the program gets the bytes (run.rs)
-    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+    let args: Vec<String> = os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if args.get(1).map(String::as_str) == Some("--version") {
         println!("relax {}", PROVENANCE);
         std::process::exit(0);
