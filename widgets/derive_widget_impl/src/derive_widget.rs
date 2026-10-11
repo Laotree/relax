@@ -199,10 +199,10 @@ fn widget_node_impl(
                 .ident(wrap_field)
                 .add(".visit_cancel(visit)");
             tb.add("   }");
-            tb.add("   fn skip_widget_tree_search(&self)->bool{");
+            tb.add("   fn search_scope(&self)->bool{");
             tb.add("       self.")
                 .ident(wrap_field)
-                .add(".skip_widget_tree_search()");
+                .add(".search_scope()");
             tb.add("   }");
             tb.add("   fn find_widgets_from_point(&self, cx:&Cx, point:DVec2, found:&mut dyn FnMut(&WidgetRef)){");
             tb.add("       self.")
@@ -386,10 +386,10 @@ fn widget_node_impl(
                 tb.add("       self.visible() && self.")
                     .ident(deref_field).add(".visit_cancel(visit)");
                 tb.add("   }");
-                tb.add("   fn skip_widget_tree_search(&self)->bool{");
+                tb.add("   fn search_scope(&self)->bool{");
                 tb.add("       self.")
                     .ident(deref_field)
-                    .add(".skip_widget_tree_search()");
+                    .add(".search_scope()");
                 tb.add("   }");
                 tb.add("   fn find_widgets_from_point(&self, cx:&Cx, point:DVec2, found:&mut dyn FnMut(&WidgetRef)){");
                 tb.add("       self.")
