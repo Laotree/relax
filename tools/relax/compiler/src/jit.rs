@@ -4902,7 +4902,7 @@ pub unsafe fn compile_fn(up: *mut Unit, id: u32) -> Result<(Vec<u8>, Vec<(u32, u
 /// (probe calls added), then installed as part of patch group `gen` -- `rollback_gen(gen)`
 /// restores the code it replaced. Nothing is recorded in the disk cache and the slot's RIR stays
 /// the plain one (O3 and O2 installs skip instrumented slots: inspect::instrument::active).
-pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, edit: &mut dyn FnMut(&mut crate::rir::Func, &Unit)) -> Result<u64, String> {
+pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, base: Option<crate::rir::Func>, edit: &mut dyn FnMut(&mut crate::rir::Func, &Unit)) -> Result<u64, String> {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
     let runtime = &session.runtime;
@@ -4915,8 +4915,13 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, edit
         build_rir(up, id)?;
     }
     let u = &mut *up;
-    let Some(rir) = u.fns[id as usize].rir.clone() else { return Err("no RIR for this slot".into()) };
-    let mut f: crate::rir::Func = (*rir).clone();
+    let mut f: crate::rir::Func = match base {
+        Some(f) => f,
+        None => {
+            let Some(rir) = u.fns[id as usize].rir.clone() else { return Err("no RIR for this slot".into()) };
+            (*rir).clone()
+        }
+    };
     edit(&mut f, u);
     let cg = tier0_codegen_rir(options, &f, u.opt.fold, u.opt.layout);
     let c = {
@@ -4925,6 +4930,23 @@ pub(crate) unsafe fn install_instrumented(up: *mut Unit, id: u32, gen: u32, edit
     }?;
     note_frame(id, c.frame_size, slot_bytes(&cg), false);
     u.install(id, &c.code, &c.relocs, c.pc_map, gen)
+}
+
+/// relax inspect's by-name probes: slot `id`'s body lowered again with probe calls at `points`
+/// (lower.rs ProbePoint), as baseline RIR (no inlining of user fns: the probe calls stay calls
+/// for probes.rs to guard). The slot's own RIR is untouched. What each point found comes back.
+pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<crate::lower::ProbePoint>) -> Result<(crate::rir::Func, Vec<(u32, Result<(), String>)>), String> {
+    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let options = &session.options;
+    let _ = crate::lower::PROBE_POINTS.try_with(|p| *p.borrow_mut() = points);
+    let _ = crate::lower::PROBE_RESULTS.try_with(|p| p.borrow_mut().clear());
+    let lowered = build_rir_lowered(up, id);
+    let _ = crate::lower::PROBE_POINTS.try_with(|p| p.borrow_mut().clear());
+    let results = crate::lower::PROBE_RESULTS.try_with(|p| std::mem::take(&mut *p.borrow_mut())).unwrap_or_default();
+    let lowered = lowered?;
+    let (prep, _) = prepare_rir_from(up, id, false, Some(lowered), RirMode::Baseline)?;
+    let (func, _) = optimize_rir(options, id, prep)?;
+    Ok((func, results))
 }
 
 /// Stack frame bytes of each slot's latest code (O1, O3): the compile report's frame

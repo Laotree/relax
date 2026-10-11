@@ -42,6 +42,24 @@ pub enum Place {
     Mem(VReg, i32),
 }
 
+/// relax inspect's probes (inspect/probes.rs): a call of probe fn `probe_slot` lowered into slot
+/// `slot`'s body before the first statement that starts on `line`, with the address of each
+/// named local or parameter in scope there (`params`: (name, T) for a probe parameter `&T`).
+/// Set (thread-local) around a re-lowering of the slot on the owner thread; what each point
+/// found goes to PROBE_RESULTS.
+#[derive(Clone)]
+pub struct ProbePoint {
+    pub slot: u32,
+    pub line: u32,
+    pub probe_slot: u32,
+    pub params: Vec<(String, TyId)>,
+}
+
+thread_local! {
+    pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>> = const { std::cell::RefCell::new(Vec::new()) };
+    pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// A place matched by a slice pattern (see Lcx::slice_pat).
 /// A recorded method resolution with this instance's generic args.
 struct MonoMethod {
@@ -236,6 +254,10 @@ pub struct Lcx<'a> {
     /// or-pattern -> vreg holding the index of the alternative that matched (set by test_pat,
     /// read by bind_pat_place: bindings come from the matching alternative)
     or_sel: HashMap<u32, VReg>,
+    /// relax inspect: probe points of this body (and whether each was placed), and the `let`
+    /// locals in scope while lowering (innermost last)
+    probe_pts: Vec<(ProbePoint, bool)>,
+    probe_scope: Vec<u32>,
     /// or-pattern alternatives fixed at compile time (a guarded arm tried one alternative
     /// combination at a time, rustc's per-candidate guard evaluation)
     or_force: HashMap<u32, usize>,
@@ -342,6 +364,8 @@ impl<'a> Lcx<'a> {
             scope_temp_pos: vec![Vec::new()],
             scope_marks: vec![0],
             or_sel: HashMap::default(),
+            probe_pts: PROBE_POINTS.try_with(|p| p.borrow().iter().filter(|x| x.slot == cur_fn).map(|x| (x.clone(), false)).collect()).unwrap_or_default(),
+            probe_scope: Vec::new(),
             or_force: HashMap::default(),
             defer_moves: None,
             drop_misaligned: false,
@@ -2439,11 +2463,88 @@ impl<'a> Lcx<'a> {
     }
 
     fn lower_block_stmts(&mut self, b: BlockId) -> Val {
+        let scope_mark = self.probe_scope.len();
+        let v = self.lower_block_stmts_inner(b);
+        self.probe_scope.truncate(scope_mark);
+        v
+    }
+
+    /// relax inspect: the first statement that starts on a probe point's line gets the probe call
+    /// before it.
+    fn probe_before(&mut self, s: &Stmt) {
+        let ast = self.ast();
+        let pos = match s {
+            Stmt::Let { init: Some(e), .. } => ast.expr(*e).lo,
+            Stmt::Expr(e, _) | Stmt::Attrs(_, e, _) => ast.expr(*e).lo,
+            _ => return,
+        };
+        let line = self.u.prog.files[self.b.file as usize].line_col(pos).0 as u32;
+        for k in 0..self.probe_pts.len() {
+            if self.probe_pts[k].1 || self.probe_pts[k].0.line != line {
+                continue;
+            }
+            self.probe_pts[k].1 = true;
+            let pt = self.probe_pts[k].0.clone();
+            let r = self.emit_probe(&pt);
+            let _ = PROBE_RESULTS.try_with(|x| x.borrow_mut().push((pt.probe_slot, r)));
+        }
+    }
+
+    /// The probe call: each probe parameter `name: &T` gets the address of the local or parameter
+    /// `name` in scope (a register-held one is copied to a slot first: a snapshot).
+    fn emit_probe(&mut self, pt: &ProbePoint) -> Result<(), String> {
+        let mut params: Vec<u32> = Vec::new();
+        for p in self.b.param_pats.clone() {
+            self.pat_binding_locals(p, &mut params);
+        }
+        if !self.b.locals.is_empty() && self.u.prog.syms.str(self.b.locals[0].name) == "self" {
+            params.push(0);
+        }
+        let mut args = Vec::new();
+        for (name, want) in &pt.params {
+            let li = self.probe_scope.iter().rev().chain(params.iter()).copied().find(|&li| self.u.prog.syms.str(self.b.locals[li as usize].name) == name.as_str());
+            let Some(li) = li else {
+                let mut names: Vec<String> = self.probe_scope.iter().chain(params.iter()).map(|&li| self.u.prog.syms.str(self.b.locals[li as usize].name).to_string()).collect();
+                names.sort();
+                names.dedup();
+                return Err(format!("no local or parameter `{}` in scope at line {} (in scope: {})", name, pt.line, names.join(", ")));
+            };
+            let t = self.u.tcx.tys.erase_regions(self.monomorphize(self.b.locals[li as usize].ty));
+            if t != *want {
+                return Err(format!("`{}` is `{}` at line {}, the probe takes `&{}`", name, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t), pt.line, crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, *want)));
+            }
+            let addr = match self.local_place(li) {
+                Place::Mem(a, 0) => a,
+                Place::Mem(a, off) => {
+                    let d = self.f.vreg(Cls::I);
+                    self.emit(Inst::IBinI(IOp::Add, U64, d, a, off as i64));
+                    d
+                }
+                Place::Regs(r) => {
+                    let s = self.new_slot_for(t);
+                    self.store_val(s, 0, t, Val::L(r));
+                    s
+                }
+            };
+            args.push(addr);
+        }
+        // a plain call (no unwind edge here): probes.rs makes it a guarded invoke whose unwind
+        // edge disables the probe
+        let b = &mut self.f.blocks[self.cur as usize];
+        b.insts.push(Inst::Call(Callee::Fn(pt.probe_slot), args, Vec::new()));
+        b.pos.push(((self.b.file as u64) << 32) | self.pos as u64);
+        Ok(())
+    }
+
+    fn lower_block_stmts_inner(&mut self, b: BlockId) -> Val {
         let ast = self.ast();
         let blk = ast.block(b);
         let n = blk.stmts.len();
         let mut result = Val::L(Vec::new());
         for (i, s) in ast.list(blk.stmts).iter().enumerate() {
+            if !self.probe_pts.is_empty() {
+                self.probe_before(s);
+            }
             // this statement's temporaries (an enclosing statement's stay pending)
             let mark = self.stmt_temps.len();
             if i + 1 == n && matches!(s, Stmt::Expr(_, false)) && self.u.prog.files[self.b.file as usize].edition < 2024 {
@@ -2463,6 +2564,9 @@ impl<'a> Lcx<'a> {
                     let mut lis = Vec::new();
                     self.pat_binding_locals(*pat, &mut lis);
                     let depth = self.scopes.len() - 1;
+                    if !self.probe_pts.is_empty() {
+                        self.probe_scope.extend(lis.iter().copied());
+                    }
                     for li in lis {
                         self.decl_depth[li as usize] = Some(depth);
                     }

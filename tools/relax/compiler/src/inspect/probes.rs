@@ -197,10 +197,8 @@ pub extern "C" fn relax_probe_pause() {
 
 // ------------------------------------------------------------------ adding a probe
 
-/// The probe call at the hook (entry: line None): `enter` guard, the probe as an invoke with the
-/// hooked fn's parameters, `leave` on the normal path, `failed` on the unwind path.
+/// The probe call at the hook (entry: line None) with the hooked fn's own parameters.
 pub(super) fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, line: Option<u32>) -> bool {
-    use crate::rir::{Callee, Cls, Inst, Term};
     // where: block b before instruction k
     let (b, k) = match line {
         None => (0usize, 0usize),
@@ -220,8 +218,41 @@ pub(super) fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, pro
             }
         }
     };
-    let pos = f.blocks[b].pos.get(k).copied().unwrap_or(f.blocks[b].term_pos);
     let args: Vec<crate::rir::VReg> = f.params.iter().copied().filter(|v| Some(*v) != f.sret).collect();
+    place_call(f, u, idx, probe_slot, b, k, args);
+    true
+}
+
+/// A by-name probe's calls, lowered into the body already (lower.rs ProbePoint): each becomes the
+/// guarded invoke.
+pub(super) fn wrap_calls(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32) -> bool {
+    use crate::rir::{Callee, Inst, Term};
+    let mut found = false;
+    let mut b = 0;
+    while b < f.blocks.len() {
+        let at = f.blocks[b].insts.iter().position(|i| matches!(i, Inst::Call(Callee::Fn(s), _, r) if *s == probe_slot && r.is_empty()));
+        if let Some(k) = at {
+            // a call already made an invoke by an earlier wrap is the last instruction of a block
+            // ending in Invoke: skip it
+            let last = k + 1 == f.blocks[b].insts.len();
+            if !(last && matches!(f.blocks[b].term, Term::Invoke(..))) {
+                let Inst::Call(_, args, _) = f.blocks[b].insts.remove(k) else { unreachable!() };
+                f.blocks[b].pos.remove(k);
+                place_call(f, u, idx, probe_slot, b, k, args);
+                found = true;
+                continue;
+            }
+        }
+        b += 1;
+    }
+    found
+}
+
+/// In block `b` before instruction `k`: `enter` guard, the probe as an invoke with `args`, `leave`
+/// on the normal path, `failed` on the unwind path; both go on with the rest of the block.
+fn place_call(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, probe_slot: u32, b: usize, k: usize, args: Vec<crate::rir::VReg>) {
+    use crate::rir::{Callee, Cls, Inst, Term};
+    let pos = f.blocks[b].pos.get(k).copied().unwrap_or(f.blocks[b].term_pos);
     let sym = |name: &'static str, a: u64| u.syms.intern(crate::syms::SymKind::Rt(name), a);
     let (enter, leave, failed) = (
         sym("probe_enter", rt_probe_enter as *const () as u64),
@@ -256,7 +287,36 @@ pub(super) fn edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, idx: u64, pro
     f.blocks[pad as usize].insts.push(Inst::Call(Callee::Host(failed), vec![iv2], Vec::new()));
     f.blocks[pad as usize].pos.extend([pos, pos]);
     f.blocks[pad as usize].term = Term::Jump(rest);
-    true
+}
+
+/// The probe's parameters as (name, T) when every one is a shared reference `name: &T` (the by-name
+/// form: locals and parameters in scope at a line).
+fn by_name_params(u: &crate::jit::Unit, probe: crate::program::DefId) -> Option<Vec<(String, crate::types::TyId)>> {
+    use crate::types::TyKind;
+    let sig = u.tcx.fn_sig(&u.prog, probe)?;
+    let def = u.prog.def(probe);
+    let file = &u.prog.files[def.file as usize];
+    let crate::ast::ItemKind::Fn(fsig, _, _) = &file.ast.item(def.item).kind else { return None };
+    let names: Vec<String> = file
+        .ast
+        .list(file.ast.fn_sig(*fsig).params)
+        .iter()
+        .map(|p| match file.ast.pat(p.pat) {
+            crate::ast::Pat::Ident { name, .. } => file.text(*name).to_string(),
+            _ => "_".into(),
+        })
+        .collect();
+    if names.len() != sig.params.len() || names.is_empty() {
+        return None;
+    }
+    let mut out = Vec::new();
+    for (n, t) in names.iter().zip(sig.params.iter()) {
+        match u.tcx.tys.kind(u.tcx.tys.erase_regions(*t)) {
+            TyKind::Ref(false, inner, _) => out.push((n.clone(), u.tcx.tys.erase_regions(*inner))),
+            _ => return None,
+        }
+    }
+    Some(out)
 }
 
 /// Checks the probe fn's parameters against the hooked slot's: same count and types, a by-value
@@ -329,10 +389,21 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
         let mut lines = Vec::new();
         let mut slots = Vec::new();
         let mut ok: Vec<(u32, Option<u32>)> = Vec::new();
+        // by name: every probe parameter is `&T`, at a file:line -- locals and parameters in scope
+        // there, by the probe parameters' names
+        let by_name = by_name_params(u, pd);
         for (slot, line, fname) in found {
-            match check_params(u, slot, pd, mutate) {
-                Ok(()) => ok.push((slot, line)),
-                Err(e) => lines.push(format!("{}: not hooked: {}", fname, e)),
+            match (&by_name, line) {
+                (Some(_), Some(_)) => ok.push((slot, line)),
+                _ => match check_params(u, slot, pd, mutate) {
+                    Ok(()) => ok.push((slot, line)),
+                    Err(e) => lines.push(format!(
+                        "{}: not hooked: {}{}",
+                        fname,
+                        e,
+                        if line.is_some() { " (or name locals in scope: every parameter `name: &T`)" } else { "" }
+                    )),
+                },
             }
         }
         let p = Arc::new(Probe {
@@ -353,7 +424,14 @@ fn add(hook: &str, src: Vec<u8>, mutate: bool) -> Result<(Arc<Probe>, Vec<String
         };
         for (slot, line) in ok {
             let fname = u.fns[slot as usize].name.clone();
-            match unsafe { super::patches::add(up, slot, super::patches::Owner::Probe(id), super::patches::Edit::Probe { idx, probe_slot, line }) } {
+            let edit = match (&by_name, line) {
+                (Some(params), Some(l)) => super::patches::Edit::ProbeLocals {
+                    idx,
+                    point: Arc::new(crate::lower::ProbePoint { slot, line: l, probe_slot, params: params.clone() }),
+                },
+                _ => super::patches::Edit::Probe { idx, probe_slot, line },
+            };
+            match unsafe { super::patches::add(up, slot, super::patches::Owner::Probe(id), edit) } {
                 Ok(true) => {
                     slots.push(slot);
                     lines.push(format!("{}: hooked", fname));

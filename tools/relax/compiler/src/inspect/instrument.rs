@@ -275,10 +275,15 @@ pub(super) fn find(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, O
             if !f.compiled || !files.contains(&f.file) {
                 continue;
             }
-            if let Some(r) = f.rir.as_ref() {
-                if r.blocks.iter().any(|b| b.pos.iter().any(|&p| pos_line(u, p) == Some(line) && files.contains(&((p >> 32) as u32)))) {
-                    out.push((id as u32, Some(line), f.name.clone()));
-                }
+            // the fn whose item spans the line (its RIR, built for the instrumented build when it
+            // is gone -- code from the disk cache has none -- places the hook)
+            let crate::jit::FnKey::Inst(d, _) = &f.key else { continue };
+            let def = u.prog.def(*d);
+            let file = &u.prog.files[def.file as usize];
+            let item = file.ast.item(def.item);
+            let (lo, hi) = (file.line_col(item.lo).0 as u32, file.line_col(item.hi).0 as u32);
+            if lo <= line && line <= hi && matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
+                out.push((id as u32, Some(line), f.name.clone()));
             }
             if out.len() >= max {
                 break;

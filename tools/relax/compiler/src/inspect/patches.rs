@@ -16,12 +16,14 @@ pub enum Owner {
     Probe(u32),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Edit {
     Count { site: u64, time: bool },
     Break { site: u64, line: Option<u32> },
     Restart { site: u64 },
     Probe { idx: u64, probe_slot: u32, line: Option<u32> },
+    /// a by-name probe: its call is lowered into the body (lower.rs ProbePoint), then guarded
+    ProbeLocals { idx: u64, point: std::sync::Arc<crate::lower::ProbePoint> },
 }
 
 struct SlotState {
@@ -44,6 +46,7 @@ fn apply_edit(f: &mut crate::rir::Func, u: &crate::jit::Unit, slot: u32, e: Edit
         Edit::Break { site, line } => super::instrument::edit_break(f, u, slot, site, line),
         Edit::Restart { site } => super::instrument::edit_restart_site(f, u, site),
         Edit::Probe { idx, probe_slot, line } => super::probes::edit(f, u, idx, probe_slot, line),
+        Edit::ProbeLocals { idx, point } => super::probes::wrap_calls(f, u, idx, point.probe_slot),
     }
 }
 
@@ -55,9 +58,25 @@ unsafe fn rebuild(up: *mut crate::jit::Unit, id: u32, edits: &[(Owner, Edit)]) -
     let mut hits = vec![false; edits.len()];
     let mut order: Vec<usize> = (0..edits.len()).filter(|&k| !matches!(edits[k].1, Edit::Restart { .. })).collect();
     order.extend((0..edits.len()).filter(|&k| matches!(edits[k].1, Edit::Restart { .. })));
-    crate::jit::install_instrumented(up, id, gen, &mut |f, u| {
+    // by-name probes: the body is lowered again with their calls in it
+    let points: Vec<crate::lower::ProbePoint> = edits.iter().filter_map(|e| match &e.1 {
+        Edit::ProbeLocals { point, .. } => Some((**point).clone()),
+        _ => None,
+    }).collect();
+    let mut placed: Vec<(u32, Result<(), String>)> = Vec::new();
+    let base = if points.is_empty() {
+        None
+    } else {
+        let (f, r) = crate::jit::relower_with_probes(up, id, points)?;
+        placed = r;
+        Some(f)
+    };
+    if let Some((_, Err(e))) = placed.iter().find(|r| r.1.is_err()) {
+        return Err(e.clone());
+    }
+    crate::jit::install_instrumented(up, id, gen, base, &mut |f, u| {
         for &k in &order {
-            hits[k] = apply_edit(f, u, id, edits[k].1);
+            hits[k] = apply_edit(f, u, id, edits[k].1.clone());
         }
     })?;
     Ok((gen, hits))
