@@ -393,9 +393,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 1;
     }
     {
-        if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
-            eprintln!("relax-run: {}", e);
-            return 1;
+        // The loader's provided crates are host code built for the machine: their shims bind
+        // only where the program is read for the machine too. A program read for another target
+        // (RELAX_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
+        // makepad-windows-sys on Windows) and only type-checks: it never runs the crates' code,
+        // so nothing binds and every provided crate is read from source.
+        let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
+        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine {
+            if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
+                eprintln!("relax-run: {}", e);
+                return 1;
+            }
         }
     }
     phase("provided sources", ts);

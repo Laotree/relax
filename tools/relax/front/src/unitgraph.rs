@@ -255,8 +255,14 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
     h
 }
 
-fn host_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
+/// The triple the checked crate graph is read for (RELAX_CHECK_TARGET, else the machine).
+fn target_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
     crate::cfg::CfgSet::host(sess, &[]).triple()
+}
+
+/// The machine Relax runs on: build scripts are host artifacts (cargo's HOST) and run here.
+fn host_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
+    crate::cfg::CfgSet::machine(sess, &[]).triple()
 }
 
 /// Compiles (once per source) and runs every build script; records cfgs, link libraries,
@@ -529,14 +535,13 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     if depth > 2 {
         return (Err(format!("{}: build scripts nest {} deep (a script that runs itself again?); refused", bs.src_path, depth)), out_dir);
     }
-    let triple = host_triple(sess);
     let mut cmd = std::process::Command::new(&exe);
     cmd.args(["run", "--quiet", "--silent", "--relax-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.
         .env("RELAX_BUILD_SCRIPT", "1")
-        .env("TARGET", triple)
-        .env("HOST", triple)
+        .env("TARGET", target_triple(sess))
+        .env("HOST", host_triple(sess))
         .env("PROFILE", "release")
         .env("OPT_LEVEL", "3")
         .env("DEBUG", "false")
@@ -548,7 +553,10 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("RUSTC", &exe)
         .env("RELAX_AS_RUSTC", "1")
         .env("RELAX_SCRIPT_DEPTH", depth.to_string())
-        .env_remove("RELAX_SELF_EXEC");
+        .env_remove("RELAX_SELF_EXEC")
+        // the script is compiled and run for the machine (cargo: build scripts are host
+        // artifacts); the target it builds for reaches it only as TARGET / CARGO_CFG_TARGET_*
+        .env_remove("RELAX_CHECK_TARGET");
     for (k, v) in crate::cfg::CfgSet::host(sess, &[]).build_script_env() {
         cmd.env(k, v);
     }
