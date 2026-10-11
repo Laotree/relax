@@ -1,7 +1,7 @@
-//! Thread-local storage over pthread keys. `thread_local! { static K: T = e; }` is lowered
+//! Thread-local storage over Relax runtime keys. `thread_local! { static K: T = e; }` is lowered
 //! by Relax's frontend to `static K: LocalKey<T> = LocalKey::new(<fn returning e>);`
-//! (coord.md F-OS2). Each key lazily creates one pthread key; a thread's value lives in a
-//! heap slot whose destructor runs at thread exit through the key destructor.
+//! (coord.md F-OS2). Each key lazily creates one domain-local runtime key; a thread's value lives in a
+//! heap slot whose destructor runs before the runtime deregisters its domain thread.
 
 use alloc::boxed::Box;
 use core::cell::{Cell, RefCell};
@@ -14,7 +14,7 @@ use core::sync::atomic::Ordering::{AcqRel, Acquire};
 use crate::sys;
 
 pub struct LocalKey<T: 'static> {
-    key: AtomicUsize, // pthread key + 1; 0 = not created yet
+    key: AtomicUsize, // runtime key + 1; 0 = not created yet
     init: fn() -> T,
 }
 
@@ -62,8 +62,8 @@ extern "C" fn key_dtor(p: *mut c_void) {
         return; // second destructor round: leave the key empty
     }
     unsafe {
-        // pthread cleared the key before calling us: mark it destroyed while the value
-        // drops (access from other destructors then fails with AccessError); pthread
+        // The runtime cleared the key before calling us: mark it destroyed while the value
+        // drops (access from other destructors then fails with AccessError); the runtime
         // calls us once more with DESTROYED and then leaves the key empty.
         let header = &*(p as *const SlotHeader);
         let drop_fn = header.drop_slot;

@@ -13,6 +13,7 @@ pub mod reload;
 pub mod modules;
 pub mod sandbox;
 pub mod domain;
+mod domain_threads;
 pub mod jit;
 pub mod owner;
 mod nounwind;

@@ -206,7 +206,7 @@ pub(crate) struct Added {
 /// load itself (`Err`); diagnostics of the new files come back in `Added::errs` for the caller to
 /// refuse the load or not. `tolerant` (an app's crates: a boot goes on after unresolved imports):
 /// the declarations are collected whatever the diagnostics.
-pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool) -> Result<Added, Vec<String>> {
+pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool, domain: Option<crate::domain::DomainId>) -> Result<Added, Vec<String>> {
     let u = &mut *up;
     let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
@@ -269,6 +269,12 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool)
             errs.push(format!("{}:{}:{}: unresolved import -- name a crate the module depends on", u.prog.file_paths[im.file as usize], l, c));
         }
     }
+    if let Some(id) = domain {
+        // Observe cancellation between loading and collection, but finish collecting what is
+        // already in the shared program. Leaving half-published crates would corrupt later
+        // starts and concurrent lazy compilation. The caller records them, then stops.
+        let _ = crate::domain::compile_phase(id, "collect");
+    }
     if errs.is_empty() || tolerant {
         let _fw = jit::front_write();
         // collect_added also drains diagnostics queued by background checks of the host.
@@ -309,7 +315,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
     };
     let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
-    let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false)?;
+    let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false, None)?;
     let u = &mut *up;
     let Added { crates, defs, d0, e0, f0, mut errs } = added;
     let krate = crates[0];

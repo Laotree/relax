@@ -378,6 +378,12 @@ fn keep(name: &str, s: Snap) {
 /// `memory [compiler=1] [n=24]`: the snapshot as a ranked tree plus findings, and the growth since
 /// the previous `memory` (kept as snapshot `last`).
 pub fn cmd_memory(req: &Req, out: &mut Out) {
+    out.line(&format!("{{\"freed_by_domain_teardown_bytes\":{}}}", crate::domain::freed_by_teardown()));
+    for d in crate::domain::list() {
+        out.line(&format!("{{\"domain\":{},\"package\":{},\"state\":{},\"arena_in_use_bytes\":{},\"arena_committed_bytes\":{},\"static_committed_bytes\":{},\"threads\":{},\"thread_names\":[{}]}}",
+            d.id, json_str(&d.package), json_str(&format!("{:?}", d.state)), d.arena_in_use, d.arena_committed, d.static_committed, d.threads,
+            d.thread_names.iter().map(|s| json_str(s)).collect::<Vec<_>>().join(",")));
+    }
     let compiler = req.get("compiler") == Some("1");
     let n = req.num("n", 24) as usize;
     let mut partial = Vec::new();

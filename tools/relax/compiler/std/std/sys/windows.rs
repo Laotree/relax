@@ -448,16 +448,19 @@ pub mod portable {
         arg: *mut u8,
         /// the starting thread's domain static block (relax domain.rs): the new thread runs in it
         domain: u64,
+        token: u64,
     }
 
     extern "C" {
         fn __relax_domain_base() -> u64;
-        fn __relax_domain_enter(base: u64);
+        fn __relax_domain_enter(base: u64, token: u64);
+        fn __relax_domain_reserve(base: u64) -> u64;
+        fn __relax_domain_failed(base: u64, token: u64);
     }
 
     extern "system" fn windows_thread_start(p: *mut c_void) -> DWORD {
         // first, before anything that may name a static
-        unsafe { __relax_domain_enter((*(p as *const StartArg)).domain) };
+        unsafe { __relax_domain_enter((*(p as *const StartArg)).domain, (*(p as *const StartArg)).token) };
         let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
         (a.f)(a.arg);
         0
@@ -466,11 +469,14 @@ pub mod portable {
     /// CreateThread with `stack_size` reserved (STACK_SIZE_PARAM_IS_A_RESERVATION, as real std).
     pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<NativeThread, i32> {
         const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
-        let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain: unsafe { __relax_domain_base() } })) as *mut c_void;
+        let domain = unsafe { __relax_domain_base() };
+        let token = unsafe { __relax_domain_reserve(domain) };
+        let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain, token })) as *mut c_void;
         let h = unsafe { CreateThread(core::ptr::null_mut(), stack_size, windows_thread_start, start, STACK_SIZE_PARAM_IS_A_RESERVATION, core::ptr::null_mut()) };
         if h.is_null() {
             let e = errno();
             drop(unsafe { alloc::boxed::Box::from_raw(start as *mut StartArg) });
+            unsafe { __relax_domain_failed(domain, token); }
             return Err(e);
         }
         Ok(NativeThread(h))
@@ -489,36 +495,18 @@ pub mod portable {
         }
     }
 
-    /// A fiber-local storage index: FlsAlloc runs its callback with the thread's value when the
-    /// thread exits (pthread_key_create's destructor).
+    /// Runtime-owned TLS: domain teardown waits until these destructors have completed.
     pub type Key = u32;
-
-    pub fn key_create(dtor: extern "C" fn(*mut c_void)) -> Option<Key> {
-        // x86-64 Windows has one C calling convention: "C" and "system" are the same
-        let cb: extern "system" fn(*mut c_void) = unsafe { core::mem::transmute(dtor) };
-        let k = unsafe { FlsAlloc(cb) };
-        if k == 0xffff_ffff {
-            None
-        } else {
-            Some(k)
-        }
+    extern "C" {
+        fn __relax_key_create(dtor: extern "C" fn(*mut c_void)) -> u32;
+        fn __relax_key_delete(key: u32);
+        fn __relax_key_get(key: u32) -> *mut c_void;
+        fn __relax_key_set(key: u32, value: *const c_void);
     }
-
-    pub fn key_delete(k: Key) {
-        unsafe {
-            FlsFree(k);
-        }
-    }
-
-    pub fn key_get(k: Key) -> *mut c_void {
-        unsafe { FlsGetValue(k) }
-    }
-
-    pub fn key_set(k: Key, v: *const c_void) {
-        unsafe {
-            FlsSetValue(k, v);
-        }
-    }
+    pub fn key_create(dtor: extern "C" fn(*mut c_void)) -> Option<Key> { Some(unsafe { __relax_key_create(dtor) }) }
+    pub fn key_delete(key: Key) { unsafe { __relax_key_delete(key); } }
+    pub fn key_get(key: Key) -> *mut c_void { unsafe { __relax_key_get(key) } }
+    pub fn key_set(key: Key, value: *const c_void) { unsafe { __relax_key_set(key, value); } }
 
     fn std_handle(fd: i32) -> HANDLE {
         let which = match fd {

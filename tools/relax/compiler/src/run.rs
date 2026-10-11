@@ -166,7 +166,7 @@ pub fn load_check_session(sess: &std::sync::Arc<crate::Session>, args: &[String]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResolveFor {
     Boot,
-    Domain,
+    Domain(crate::domain::DomainId),
 }
 
 /// A package resolved to the crates that make it up: cargo's unit graph (or a saved one), the
@@ -194,6 +194,11 @@ pub(crate) fn resolve_package(
     who: ResolveFor,
 ) -> Result<Resolved, String> {
     let boot = who == ResolveFor::Boot;
+    let checkpoint = |name: &str| match who {
+        ResolveFor::Domain(id) => crate::domain::compile_phase(id, name),
+        ResolveFor::Boot => Ok(()),
+    };
+    checkpoint("resolve")?;
     let options = &sess.options;
     let _mem = crate::memstat::tag(crate::memstat::Tag::Boot);
     // ---- crate graph
@@ -238,7 +243,9 @@ pub(crate) fn resolve_package(
         phase("unit graph", t);
     }
     let t = Instant::now();
+    checkpoint("build scripts")?;
     unitgraph::run_build_scripts(sess, &mut g, target_dir)?;
+    checkpoint("loading crates")?;
     if boot {
         phase(&format!("build scripts ({})", g.build_scripts.len()), t);
         // the scripts that still run (as Relax programs) that the source is to lose (unitgraph::script_role)

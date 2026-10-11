@@ -18,7 +18,7 @@
 //! `scratch()` routes Rust compile working sets through a reserved-address burst arena.
 //! Arena pointers must come back through this allocator, never directly through C `free`.
 //!
-//! Two heaps, one allocator code path (arena.rs, compiled twice with different constants):
+//! One arena implementation (arena.rs): two static instances and runtime-created domain heaps.
 //! - the **burst** arena: scratch for one compile, emptied chunks go straight back;
 //! - the **compiler** arena: everything the compiler allocates and keeps -- the program's tables,
 //!   the caches, the parse trees -- so the system heap holds only the program (JIT code's
@@ -30,7 +30,11 @@
 //! phase, so a block can be freed from any thread in any phase. A realloc moves a compiler block
 //! to the system heap when it grows in the kept phase; a system block never moves into the
 //! compiler arena (a program block must not end up where a later destroy would take it).
-//! `RELAX_COMPILER_ARENA=0` turns the routing off (read once, without allocating).
+//! `RELAX_COMPILER_ARENA=0` turns compiler routing off (read once, without allocating).
+//!
+//! The JIT allocator ABI selects a domain heap through thread-local ownership (domain.rs).
+//! Native shims and runtime helpers use this global allocator and stay shared. Domain frees
+//! and reallocs find the owning range, including calls from native code and other threads.
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
 #[allow(dead_code)]
@@ -252,6 +256,9 @@ pub fn compiler_owns(p: *const u8) -> bool {
     compiler::owns(p as *mut u8)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+pub mod domain;
+
 pub struct RelaxAlloc;
 
 /// Set when the program announces a malloc-zone swap (before it happens).
@@ -402,6 +409,8 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        if domain::dealloc(p) { return; }
         if burst::owns(p) {
             return burst::dealloc(p, l);
         }
@@ -416,6 +425,8 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        if let Some(q) = domain::realloc_owned(p, size) { return q; }
         let in_burst = burst::owns(p);
         if in_burst || burst::active() {
             // The destination follows the current scope. On failure the old block stays valid.

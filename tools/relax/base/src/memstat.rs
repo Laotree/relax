@@ -327,6 +327,10 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // JIT-owned buffers carry the domain allocator's header, never a native tag header.
+        // A provided crate may take ownership of one and drop it through this allocator.
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        if on() && crate::zone_alloc::domain::dealloc(p) { return; }
         if !on() {
             if TRACK.load(Relaxed) {
                 track_free(p);
@@ -343,6 +347,10 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+        if on() {
+            if let Some(q) = crate::zone_alloc::domain::realloc_owned(p, new) { return q; }
+        }
         if !on() {
             if TRACK.load(Relaxed) {
                 track_free(p);

@@ -505,12 +505,18 @@ unsafe fn write_bytes(addr: u64, b: &[u8]) {
 
 /// Size of each thread's thread-local block (virtual; pages are touched on use).
 const TLS_CAP: usize = 1 << 20;
-/// Offset of the first thread-local variable: slot 0 holds the thread's domain static block base.
+/// Offset of the first thread-local variable: slot 0 is the domain base; slot 1 owns runtime
+/// thread registrations and Relax std TLS values, drained before the block is freed.
 const TLS_FIRST_FREE: u32 = 16;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 extern "C" fn tls_dtor(p: *mut u8) {
+    // pthread clears its key before calling us. Reinstall it while Relax std destructors run.
+    os::tls::set(tls_key(), p);
+    let registrations = unsafe { crate::domain_threads::finish(p as u64) };
+    os::tls::set(tls_key(), std::ptr::null_mut());
     os::mem::free(p as u64, TLS_CAP);
+    for (base, token) in registrations { crate::domain::thread_finished(base, token); }
 }
 
 /// The OS key holding each thread's block (one per process).
@@ -8715,6 +8721,7 @@ fn sampler_thread() {
 /// holding the lock from here on (never released: the process is ending) stops them.
 impl Drop for Unit {
     fn drop(&mut self) {
+        crate::domain::forget_tls_keys(self.syms.dom0());
         let options = &self.prog.session.clone().options;
         if !self.retired {
             crate::borrowck::lazy::stop();
@@ -11448,7 +11455,15 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
         // the domain a thread runs in (domain.rs): a thread std starts inherits its parent's
         b"__relax_domain_base" => Some(crate::domain::relax_domain_base as *const () as usize),
+        b"__relax_domain_id" => Some(crate::domain::relax_domain_id as *const () as usize),
         b"__relax_domain_enter" => Some(crate::domain::relax_domain_enter as *const () as usize),
+        b"__relax_domain_reserve" => Some(crate::domain::relax_domain_reserve as *const () as usize),
+        b"__relax_domain_failed" => Some(crate::domain::thread_finished as *const () as usize),
+        b"__relax_domain_name" => Some(crate::domain::relax_domain_name as *const () as usize),
+        b"__relax_key_create" => Some(crate::domain_threads::key_create as *const () as usize),
+        b"__relax_key_delete" => Some(crate::domain_threads::key_delete as *const () as usize),
+        b"__relax_key_get" => Some(crate::domain_threads::key_get as *const () as usize),
+        b"__relax_key_set" => Some(crate::domain_threads::key_set as *const () as usize),
         // run-time modules (modules.rs; Relax's std::relax); the C allocator through relax
         // inspect's heap veneers (one indirect jump; tracking patches the word)
         _ => crate::inspect::heap::veneer(name).or_else(|| crate::modules::symbol(name)),

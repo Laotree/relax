@@ -133,16 +133,16 @@ mod tests {
         let _scope = scratch(&crate::options::RuntimeOptions::default());
         unsafe {
             let (p, l) = checked(64, 16);
-            let index = (p as usize - BASE.load(Ordering::Relaxed)) / CHUNK;
-            let generation = lock(&HEADERS[index].state).generation;
+            let index = (p as usize - DEFAULT.base.load(Ordering::Relaxed)) / CHUNK;
+            let generation = lock(&DEFAULT.headers[index].state).generation;
             assert_eq!(stats(), (before.0 + CHUNK, before.1 + 64, before.2 + 1));
             RelaxAlloc.dealloc(p, l);
-            assert_eq!(HEADERS[index].live.load(Ordering::Relaxed), 0);
+            assert_eq!(DEFAULT.headers[index].live.load(Ordering::Relaxed), 0);
             // emptied with 64 bytes touched: kept warm (committed) until trim
-            assert_eq!(lock(&HEADERS[index].state).committed, CHUNK);
+            assert_eq!(lock(&DEFAULT.headers[index].state).committed, CHUNK);
             assert_eq!(stats(), (before.0 + CHUNK, before.1, before.2 + 1));
             trim();
-            assert_eq!(lock(&HEADERS[index].state).committed, 0);
+            assert_eq!(lock(&DEFAULT.headers[index].state).committed, 0);
             assert_eq!(stats(), before); // scope still active; no TLS pin
                                          // A different thread reuses the exact chunk while our TLS still caches it.
             let barrier = Arc::new(Barrier::new(2));
@@ -158,7 +158,7 @@ mod tests {
                 RelaxAlloc.dealloc(other, layout);
             });
             barrier.wait();
-            assert_ne!(lock(&HEADERS[index].state).generation, generation);
+            assert_ne!(lock(&DEFAULT.headers[index].state).generation, generation);
             let (next, layout) = checked(64, 16);
             assert_ne!((next as usize) & !(CHUNK - 1), (p as usize) & !(CHUNK - 1));
             RelaxAlloc.dealloc(next, layout);
@@ -258,8 +258,8 @@ mod tests {
             for (p, l) in blocks.drain(..) {
                 RelaxAlloc.dealloc(p, l);
             }
-            let index = (big - BASE.load(Ordering::Relaxed)) / CHUNK;
-            assert_eq!(lock(&HEADERS[index].state).committed, 0);
+            let index = (big - DEFAULT.base.load(Ordering::Relaxed)) / CHUNK;
+            assert_eq!(lock(&DEFAULT.headers[index].state).committed, 0);
         }
         trim();
         assert_eq!(stats(), before);
@@ -304,14 +304,14 @@ mod tests {
         let huge = Layout::from_size_align(RESERVE + CHUNK, 16).unwrap();
         assert!(unsafe { alloc(huge) }.is_null());
         // Temporarily occupy the virtual free list without committing payload pages.
-        let run = lock(&POOL).take(MAX_ORDER).unwrap();
+        let run = lock(&DEFAULT.pool).take(MAX_ORDER).unwrap();
         unsafe {
             let l = Layout::from_size_align(123, 16).unwrap();
             let p = RelaxAlloc.alloc(l);
             assert!(!p.is_null() && !owns(p));
             RelaxAlloc.dealloc(p, l);
         }
-        lock(&POOL).release(run, MAX_ORDER);
+        lock(&DEFAULT.pool).release(run, MAX_ORDER);
         unsafe {
             use crate::memstat::Counting;
             for align in [16, 4096] {

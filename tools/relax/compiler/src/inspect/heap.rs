@@ -1,10 +1,11 @@
 //! Program heap tracking by call stack, patched in on request (DESIGN.md §6).
 //!
 //! The program's allocator calls (Relax core heap.rs and std: malloc, calloc, realloc, free,
-//! posix_memalign) resolve to veneers here: one indirect jump through a word holding the real C
-//! function. `heap start` swaps the words to entry stubs that pass the JIT caller's frame pointer
-//! and return address to the trackers below; `heap stop` swaps them back. Idle cost: the indirect
-//! jump. Tracked: one allocation per `rate` bytes (byte sampling: a block of at least `rate` bytes
+//! posix_memalign) resolve to veneers here: one indirect jump to the program allocator.
+//! `heap start` swaps the words to entry stubs that pass the JIT caller's frame pointer
+//! and return address to the trackers below; `heap stop` swaps them back. Domain ownership is
+//! applied beneath both targets, so sampling never changes which heap owns a block. Tracked:
+//! one allocation per `rate` bytes (byte sampling: a block of at least `rate` bytes
 //! is always sampled), its JIT call stack (frame records, no unwinder), and the block until it is
 //! freed. Per stack: estimated live, allocated and freed bytes and blocks. Frees look the block up
 //! only when a counting filter says it may be tracked.
@@ -14,7 +15,8 @@
 //! allocator) is tracked the same way with `host=1`: memstat calls the host tracker while it is
 //! set, and its samples carry the compiler category of the allocating thread.
 
-// The interposers exist on Linux x86-64 and macOS arm64 only (veneer returns None elsewhere).
+// Sampling interposers exist on Linux x86-64 and macOS arm64. Other native targets bind the
+// same program allocator directly, so ownership does not depend on sampling support.
 #![cfg_attr(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))), allow(dead_code))]
 
 use super::{json_str, now_ms, Out, Req};
@@ -30,7 +32,7 @@ static CALLOC_T: AtomicUsize = AtomicUsize::new(0);
 static REALLOC_T: AtomicUsize = AtomicUsize::new(0);
 static FREE_T: AtomicUsize = AtomicUsize::new(0);
 static MEMALIGN_T: AtomicUsize = AtomicUsize::new(0);
-/// the real C functions
+/// Program allocator entries (domain routing stays active when sampling is off).
 static REAL: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
 const NAMES: [&str; 5] = ["malloc", "calloc", "realloc", "free", "posix_memalign"];
 
@@ -39,8 +41,8 @@ fn targets() -> [&'static AtomicUsize; 5] {
 }
 
 /// The address a program's call to C allocator function `name` binds to (jit.rs loader_symbol):
-/// its veneer, with the word set to the real function on first use. None: not one of ours, or a
-/// target without veneers.
+/// its veneer, with the word set to the program allocator on first use. Targets without
+/// sampling veneers bind that allocator directly. None: not an allocator symbol.
 pub fn veneer(name: &[u8]) -> Option<usize> {
     #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     {
@@ -57,8 +59,7 @@ pub fn veneer(name: &[u8]) -> Option<usize> {
     }
     #[cfg(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))))]
     {
-        let _ = name;
-        None
+        crate::zone_alloc::domain::symbol(name)
     }
 }
 
@@ -66,8 +67,7 @@ fn init_real() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         for (k, n) in NAMES.iter().enumerate() {
-            let c = format!("{}\0", n);
-            let p = unsafe { crate::os::proc::find(c.as_ptr()) } as usize;
+            let p = crate::zone_alloc::domain::symbol(n.as_bytes()).expect("program allocator");
             REAL[k].store(p, Release);
             targets()[k].store(p, Release);
         }
@@ -900,5 +900,16 @@ pub fn cmd_heap(req: &Req, out: &mut Out) {
             out.line(&format!("{{\"id\":{},\"live_mb\":{},\"alloc_mb\":{},\"freed_mb\":{},\"frames\":[{}]}}", json_str(id_s), mbs(x.1), mbs(x.3), mbs(x.5), fr.join(",")));
         }
         _ => out.err("usage: heap start [host=1] [rate=] [ttl_s=] | stop | status | top [by=live|alloc|freed|peak] [group=tag] | snap <name> | diff <a> <b|now> | path H<id>|R<id>"),
+    }
+}
+
+/// Wholesale domain teardown has no individual free calls. Retire its samples before the
+/// address reservation can be reused, so inspect never attributes a later allocation to it.
+pub(crate) fn forget_range(base: usize, size: usize) {
+    if let Some(t) = PROGRAM.tables() {
+        for key in t.keys.iter() {
+            let p = key.load(Acquire) as usize;
+            if p > 2 && p.wrapping_sub(base) < size { forget(&PROGRAM, p as *mut u8); }
+        }
     }
 }

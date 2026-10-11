@@ -72,6 +72,7 @@ extern "C" {
     fn __relax_sb_leave(prev: *const [i64; 4]);
     fn __relax_sb_alloca(size: usize, align: usize) -> usize;
     fn __relax_sb_stats(out: *mut [u64; 6], recycle: u32) -> u32;
+    fn __relax_domain_id() -> u32;
     fn __relax_restart_supported();
     fn __relax_restart_requested() -> u32;
     fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize;
@@ -169,6 +170,14 @@ pub fn restart_saved_ms() -> Option<f64> {
 }
 
 // ---- state-preserving restart (live sessions: an edit Relax cannot patch in place)
+
+/// The id of the app domain the calling thread runs in: 0 is the process's own app, a hosted
+/// app (started by a window manager) has its own id. Process-wide resources (signal handlers) are
+/// the process's app's; a hosted app's background workers must end with it (domain teardown
+/// waits for its threads and never terminates one).
+pub fn domain() -> u32 {
+    unsafe { __relax_domain_id() }
+}
 
 /// The program (its app framework) can restart with its state: from now on an edit that needs a
 /// restart asks for one through `restart_requested` instead of only being reported.

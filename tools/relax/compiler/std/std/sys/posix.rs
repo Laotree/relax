@@ -203,16 +203,19 @@ struct StartArg {
     arg: *mut u8,
     /// the starting thread's domain static block (relax domain.rs): the new thread runs in it
     domain: u64,
+    token: u64,
 }
 
 extern "C" {
     fn __relax_domain_base() -> u64;
-    fn __relax_domain_enter(base: u64);
+    fn __relax_domain_enter(base: u64, token: u64);
+    fn __relax_domain_reserve(base: u64) -> u64;
+    fn __relax_domain_failed(base: u64, token: u64);
 }
 
 extern "C" fn posix_thread_start(p: *mut c_void) -> *mut c_void {
     // first, before anything that may name a static
-    unsafe { __relax_domain_enter((*(p as *const StartArg)).domain) };
+    unsafe { __relax_domain_enter((*(p as *const StartArg)).domain, (*(p as *const StartArg)).token) };
     let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
     (a.f)(a.arg);
     core::ptr::null_mut()
@@ -220,12 +223,17 @@ extern "C" fn posix_thread_start(p: *mut c_void) -> *mut c_void {
 
 /// Starts a thread running `f(arg)` with a stack of at least `stack_size` bytes; Err(os error).
 pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<NativeThread, i32> {
-    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain: unsafe { __relax_domain_base() } })) as *mut c_void;
+    let domain = unsafe { __relax_domain_base() };
+    let token = unsafe { __relax_domain_reserve(domain) };
+    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain, token })) as *mut c_void;
     let mut native: pthread_t = 0;
     let mut attr = pthread_attr_t { storage: [0; 8] };
     unsafe {
-        if pthread_attr_init(&mut attr as *mut pthread_attr_t) != 0 {
-            panic!("pthread_attr_init failed");
+        let r = pthread_attr_init(&mut attr as *mut pthread_attr_t);
+        if r != 0 {
+            drop(alloc::boxed::Box::from_raw(start as *mut StartArg));
+            __relax_domain_failed(domain, token);
+            return Err(r);
         }
         let page = 16 * 1024;
         let size = (stack_size + page - 1) / page * page;
@@ -234,6 +242,7 @@ pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<N
         pthread_attr_destroy(&mut attr as *mut pthread_attr_t);
         if r != 0 {
             drop(alloc::boxed::Box::from_raw(start as *mut StartArg));
+            __relax_domain_failed(domain, token);
             return Err(r);
         }
     }
@@ -260,31 +269,17 @@ pub fn detach_thread(t: NativeThread) {
 }
 
 /// A thread-local storage key whose destructor runs with the thread's value at thread exit.
-pub type Key = pthread_key_t;
-
-pub fn key_create(dtor: extern "C" fn(*mut c_void)) -> Option<Key> {
-    let mut k: pthread_key_t = 0;
-    if unsafe { pthread_key_create(&mut k as *mut pthread_key_t, dtor) } != 0 {
-        return None;
-    }
-    Some(k)
+pub type Key = u32;
+extern "C" {
+    fn __relax_key_create(dtor: extern "C" fn(*mut c_void)) -> u32;
+    fn __relax_key_delete(key: u32);
+    fn __relax_key_get(key: u32) -> *mut c_void;
+    fn __relax_key_set(key: u32, value: *const c_void);
 }
-
-pub fn key_delete(k: Key) {
-    unsafe {
-        pthread_key_delete(k);
-    }
-}
-
-pub fn key_get(k: Key) -> *mut c_void {
-    unsafe { pthread_getspecific(k) }
-}
-
-pub fn key_set(k: Key, v: *const c_void) {
-    unsafe {
-        pthread_setspecific(k, v);
-    }
-}
+pub fn key_create(dtor: extern "C" fn(*mut c_void)) -> Option<Key> { Some(unsafe { __relax_key_create(dtor) }) }
+pub fn key_delete(key: Key) { unsafe { __relax_key_delete(key); } }
+pub fn key_get(key: Key) -> *mut c_void { unsafe { __relax_key_get(key) } }
+pub fn key_set(key: Key, value: *const c_void) { unsafe { __relax_key_set(key, value); } }
 
 /// Writes to standard stream `fd` (1 stdout, 2 stderr); a closed stream swallows the bytes, as
 /// real std's (EBADF -> Ok(len)).

@@ -11,52 +11,38 @@
 
 use makepad_hal::{domain_state, domain_stop, with_caps, with_launch, Caps, DomainHost, DomainLaunch, Hal};
 use relax_compiler::domain::{self, AppSpec, Around, DomainState};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The compile phases `domain::start` reports, in order (the HAL's `phase` is the index).
-const PHASES: [&str; 3] = ["package graph", "loading crates", "main"];
-
-/// How long `stop` waits for a domain's run to end before it marks the domain stopped.
-const QUIT_WAIT: Duration = Duration::from_secs(10);
-const KILL_WAIT: Duration = Duration::from_secs(5);
+const PHASES: [&str; 8] = ["package graph", "resolve", "build scripts", "loading crates", "load", "collect", "link", "main"];
 
 #[derive(Default)]
-pub struct Host {
-    /// the threads still loading an app (compiling its crates); `stop` waits for them
-    loading: Mutex<HashMap<u32, std::thread::JoinHandle<()>>>,
-}
+pub struct Host;
 
 impl Host {
     fn launch(&self, launch: DomainLaunch) -> Result<(), String> {
         let domain = launch.domain;
-        // loading an app takes seconds: not on the thread that sent the command (the window
-        // manager's own loop)
-        let handle = std::thread::Builder::new()
-            .name(format!("domain-load-{domain}"))
-            .spawn(move || {
-                let hook = launch.clone();
-                let around: Around = Arc::new(move |run: &mut dyn FnMut()| with_launch(&hook, || run()));
-                let spec = AppSpec {
-                    package: launch.app.clone(),
-                    args: launch.args.split_whitespace().map(str::to_string).collect(),
-                    parent: Some(launch.parent),
-                    id: Some(domain),
-                    around: Some(around),
-                    ..Default::default()
-                };
-                if let Err(e) = domain::start_in_run(spec) {
-                    let msg = e.join(" | ");
-                    eprintln!("relax-domain: {}: {msg}", launch.app);
-                    // (a start that failed after it began has reported its crash already)
-                    if !matches!(domain::state(domain), Some(DomainState::Crashed(_))) {
-                        Hal::global().report_domain(domain, domain_state::CRASHED, 0, 0.0, &msg);
-                    }
+        let hook = launch.clone();
+        let around: Around = Arc::new(move |run: &mut dyn FnMut()| with_launch(&hook, || run()));
+        let spec = AppSpec {
+            package: launch.app.clone(),
+            args: launch.args.split_whitespace().map(str::to_string).collect(),
+            parent: Some(launch.parent), id: Some(domain), around: Some(around), ..Default::default()
+        };
+        domain::prepare(&spec).map_err(|e| e.join(" | "))?;
+        // The registry exists before returning to HAL, so stop can cancel the loader even
+        // before it is scheduled. Never join the compiling thread ahead of cancellation.
+        if let Err(e) = std::thread::Builder::new().name(format!("domain-load-{domain}")).spawn(move || {
+            if let Err(e) = domain::start_prepared_in_run(spec, domain) {
+                if !matches!(domain::state(domain), Some(DomainState::Stopped)) {
+                    eprintln!("relax-domain: {}: {}", launch.app, e.join(" | "));
                 }
-            })
-            .map_err(|e| format!("starting the loader thread: {e}"))?;
-        self.loading.lock().unwrap_or_else(|e| e.into_inner()).insert(domain, handle);
+            }
+        }) {
+            domain::loading_failed(domain, &e.to_string());
+            return Err(format!("starting the loader thread: {e}"));
+        }
         Ok(())
     }
 }
@@ -66,20 +52,10 @@ impl DomainHost for Host {
         self.launch(launch)
     }
 
-    // The app was asked to quit (QUIT) or its session is freed and it hears one quit request on
-    // its next pump (KILL); it ends its own run, and this returns once it did. Relax cannot park
-    // or stop a thread: a domain that does not end in time is marked stopped and its thread keeps
-    // running (a known gap; the HAL side is freed either way).
     fn stop(&self, domain: u32, mode: u32) {
-        let loading = self.loading.lock().unwrap_or_else(|e| e.into_inner()).remove(&domain);
-        if let Some(h) = loading {
-            let _ = h.join();
-        }
-        let wait = if mode == domain_stop::KILL { KILL_WAIT } else { QUIT_WAIT };
-        if !domain::wait_thread_done(domain, wait) {
-            eprintln!("relax-domain: domain {domain} did not end its run within {} s: marked stopped, its thread keeps running", wait.as_secs());
-            let _ = domain::stop(domain, domain::Stop::Kill);
-        }
+        let how = if mode == domain_stop::KILL { domain::Stop::Kill } else { domain::Stop::Quit };
+        if let Err(e) = domain::stop(domain, how) { eprintln!("relax-domain: {domain}: {e}"); }
+        report_stop(domain);
     }
 
     // The HAL stopped the old run (`stop(QUIT)` returned) and freed its session: start again.
@@ -115,6 +91,26 @@ fn report_start(id: domain::DomainId) {
     });
 }
 
+/// `RELAX_DOMAIN_REPORT=1`: what a stop left of the domain on stderr: its state, threads, arena and
+/// static-block bytes still held, the bytes teardown has freed in all so far, and the process memory.
+fn report_stop(id: domain::DomainId) {
+    if std::env::var_os("RELAX_DOMAIN_REPORT").is_none() {
+        return;
+    }
+    let Some(i) = domain::info(id) else { return };
+    let (rss, pss) = domain::process_memory_kb();
+    eprintln!(
+        "relax-domain-stop: id={id} pkg={} state={:?} threads={} arena_in_use={} arena_committed={} static_committed={} freed_by_teardown={} rss_kb={rss} pss_kb={pss}",
+        i.package, i.state, i.threads, i.arena_in_use, i.arena_committed, i.static_committed, domain::freed_by_teardown()
+    );
+    // the process's memory once the stop's own work and the next frames have settled
+    let _ = std::thread::Builder::new().name(format!("domain-report-{id}")).spawn(move || {
+        std::thread::sleep(Duration::from_secs(8));
+        let (rss, pss) = domain::process_memory_kb();
+        eprintln!("relax-domain-after-stop: id={id} 8s later rss_kb={rss} pss_kb={pss}");
+    });
+}
+
 /// A domain changed state (`domain::set_observer`): the HAL tells the parent.
 fn observe(id: domain::DomainId, state: &DomainState) {
     let hal = Hal::global();
@@ -137,6 +133,9 @@ fn observe(id: domain::DomainId, state: &DomainState) {
         }
         // the HAL freed the session before it asked to stop
         DomainState::Stopped => {}
+        DomainState::Leaked { threads } => {
+            hal.report_domain(id, domain_state::CRASHED, 0, 0.0, &format!("shutdown timed out: {threads} threads still alive; domain memory retained"));
+        }
     }
 }
 
