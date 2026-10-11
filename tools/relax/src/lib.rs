@@ -12,6 +12,7 @@ mod lexer {
 }
 mod cef;
 pub mod fetch;
+mod hal_host;
 mod help;
 mod macros;
 mod remote;
@@ -116,6 +117,11 @@ fn run(raw_args: Vec<Vec<u8>>) {
         eprintln!("relax: RELAX_VFS: {e}");
         std::process::exit(2);
     }
+    let mut raw_args = raw_args;
+    if take_privileged(&mut raw_args) {
+        PRIVILEGED.store(true, std::sync::atomic::Ordering::Relaxed);
+        relax_compiler::os::proc::set_args(raw_args.clone());
+    }
     let args: Vec<String> = raw_args.iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if args.get(1).map(String::as_str) == Some("--version") {
         println!("makepad {} (compiler: {})", PROVENANCE, relax_compiler::PROVENANCE);
@@ -203,6 +209,30 @@ fn run(raw_args: Vec<Vec<u8>>) {
     provided();
     let sess = relax_compiler::session_from_env(&args);
     relax_compiler::cli_main(&sess);
+}
+
+/// `relax run --privileged ..`: the booted app is granted the HAL's domain control (hal_host.rs).
+/// The host's own flag: taken out of the command line here, before anything else reads it.
+static PRIVILEGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Removes `--privileged` from among the options of a `run` (before its package); whether it was there.
+fn take_privileged(raw: &mut Vec<Vec<u8>>) -> bool {
+    if raw.get(1).map(Vec::as_slice) != Some(b"run".as_slice()) {
+        return false;
+    }
+    let mut i = 2;
+    while i < raw.len() {
+        match raw[i].as_slice() {
+            b"--privileged" => {
+                raw.remove(i);
+                return true;
+            }
+            b"--units" | b"--report-to" | b"--entry" | b"--boundary" | b"--relax-dir" | b"--cfg" => i += 2,
+            w if w.starts_with(b"--") => i += 1,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The package a `run` names: the first word after its options (and their values).
@@ -423,6 +453,11 @@ extern crate relax_provided_fixture;
 
 fn provided() {
     use std::collections::HashMap;
+    // the HAL starts and stops apps as domains through this host; the boot app's privilege is the host's grant
+    hal_host::register();
+    if PRIVILEGED.load(std::sync::atomic::Ordering::Relaxed) {
+        hal_host::boot_privileged();
+    }
     const CRATES: [&str; 10] = [
         "relax_provided_fixture",
         "makepad_live_id",

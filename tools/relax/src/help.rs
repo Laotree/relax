@@ -165,6 +165,7 @@ fn run_page(st: &Style) -> String {
     p.row("--agent", "Park panics for an agent; print events on stderr");
     p.row("--heap[=<bytes>]", "Track the heap by stack from the start (inspect heap)");
     p.row("--cfg <spec>", "Set a cfg for the program (name or name=\"value\"), as RUSTFLAGS=--cfg");
+    p.row("--privileged", "Grant the app the HAL's domain control: it may start,\nstop and embed other apps as domains (a window\nmanager; use with --cfg hal)");
     p.row("--relaxed[=<list>]", "Relaxed Rust for every crate (all, or a list)");
     p.row("--mount <dir>=<git-url>", "Mount another repository at a folder of the\nfirst (repeatable); an optional #ref pins it");
     p.row("--cached", "Run the newest local snapshot at once, and\nrefresh it in the background for next time");
