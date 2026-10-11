@@ -85,7 +85,7 @@ fn destroy_returns_the_touched_bytes_and_a_free_afterwards_is_a_counted_noop() {
         // the current generation cannot be destroyed
         assert_eq!(compiler_destroy_generation(g_next), (0, 0));
         assert!(all_eq(survivor.0, 100, 5));
-        assert!(compiler_tombstones() >= 3);
+        assert!(compiler_tombstones() >= chunks, "tombstones {} chunks {chunks}", compiler_tombstones());
         RelaxAlloc.dealloc(survivor.0, survivor.1);
         RelaxAlloc.dealloc(kept_block.0, kept_block.1);
         compiler_begin_generation();
