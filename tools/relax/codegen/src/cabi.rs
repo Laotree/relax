@@ -17,10 +17,15 @@ pub enum Target {
     /// AAPCS64 with Apple's rules: variadic arguments on the stack in 8-byte slots,
     /// fixed stack arguments packed by natural size and alignment
     Darwin64,
+    /// standard AAPCS64 (Linux, Android): variadic arguments like fixed ones (registers, then the
+    /// stack), every stack argument in its own 8-byte-aligned slot of at least 8 bytes
+    Aapcs64,
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
 pub const HOST: Target = Target::Darwin64;
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+pub const HOST: Target = Target::Aapcs64;
 #[cfg(all(not(target_arch = "aarch64"), not(windows)))]
 pub const HOST: Target = Target::SysV;
 #[cfg(all(not(target_arch = "aarch64"), windows))]
@@ -231,7 +236,7 @@ fn plan_win64(sig: &CSig) -> Plan {
 pub fn plan(sig: &CSig, t: Target) -> Plan {
     let (n_int, n_flt) = match t {
         Target::SysV => (6u8, 8u8),
-        Target::Darwin64 => (8u8, 8u8),
+        Target::Darwin64 | Target::Aapcs64 => (8u8, 8u8),
         Target::Win64 => return plan_win64(sig),
     };
     let mut gi = 0u8;
@@ -241,7 +246,7 @@ pub fn plan(sig: &CSig, t: Target) -> Plan {
     let ret = match &sig.ret {
         None => RetPlan::Scalar,
         Some(a) => match t {
-            Target::Darwin64 => {
+            Target::Darwin64 | Target::Aapcs64 => {
                 if let Some((n, m)) = hfa(a) {
                     let es = mem_size(m);
                     let mut parts = Vec::new();
@@ -283,12 +288,14 @@ pub fn plan(sig: &CSig, t: Target) -> Plan {
             },
         },
     };
+    // Apple's AAPCS64 variant: variadic arguments on the stack, fixed stack arguments packed
+    let apple = t == Target::Darwin64;
     let mut args = Vec::new();
     for (k, arg) in sig.args.iter().enumerate() {
         let variadic = (k as u32) >= sig.n_fixed;
         let p = match (t, arg) {
-            (Target::Darwin64, CArg::Scalar(m)) => {
-                if variadic {
+            (Target::Darwin64 | Target::Aapcs64, CArg::Scalar(m)) => {
+                if variadic && apple {
                     ArgPlan::Scalar(PLoc::Stack(st.take(8, 8)), 8)
                 } else if is_float(*m) && fi < n_flt {
                     fi += 1;
@@ -296,22 +303,24 @@ pub fn plan(sig: &CSig, t: Target) -> Plan {
                 } else if !is_float(*m) && gi < n_int {
                     gi += 1;
                     ArgPlan::Scalar(PLoc::Int(gi - 1), 8)
-                } else {
+                } else if apple {
                     let sz = mem_size(*m);
                     ArgPlan::Scalar(PLoc::Stack(st.take(sz, sz)), sz)
+                } else {
+                    ArgPlan::Scalar(PLoc::Stack(st.take(8, 8)), 8)
                 }
             }
-            (Target::Darwin64, CArg::Agg(a)) => {
+            (Target::Darwin64 | Target::Aapcs64, CArg::Agg(a)) => {
                 let h = hfa(a);
                 if a.size > 16 && h.is_none() {
                     // pointer to the (private) copy
-                    if !variadic && gi < n_int {
+                    if !(variadic && apple) && gi < n_int {
                         gi += 1;
                         ArgPlan::ByRef(PLoc::Int(gi - 1))
                     } else {
                         ArgPlan::ByRef(PLoc::Stack(st.take(8, 8)))
                     }
-                } else if let (Some((n, m)), false) = (h, variadic) {
+                } else if let (Some((n, m)), false) = (h, variadic && apple) {
                     let es = mem_size(m);
                     if fi as u32 + n <= n_flt as u32 {
                         let mut parts = Vec::new();
@@ -326,7 +335,7 @@ pub fn plan(sig: &CSig, t: Target) -> Plan {
                     }
                 } else {
                     let words = (a.size + 7) / 8;
-                    if !variadic && gi as u32 + words <= n_int as u32 && words > 0 {
+                    if !(variadic && apple) && gi as u32 + words <= n_int as u32 && words > 0 {
                         let mut parts = Vec::new();
                         for j in 0..words {
                             parts.push(Part { off: 8 * j, size: piece_size(a, j), loc: PLoc::Int(gi + j as u8) });
@@ -334,7 +343,7 @@ pub fn plan(sig: &CSig, t: Target) -> Plan {
                         gi += words as u8;
                         ArgPlan::Parts(parts)
                     } else {
-                        if !variadic {
+                        if !(variadic && apple) {
                             gi = n_int;
                         }
                         ArgPlan::Stack(st.take(round_up(a.size, 8), a.align.max(8)), a.size)
@@ -427,6 +436,30 @@ mod tests {
         let p = plan(&CSig { args: vec![CArg::Scalar(I64), CArg::Scalar(I32), CArg::Scalar(Mem::F64)], ret: None, n_fixed: 1, ret_narrow: None, unwinds: false }, Target::Darwin64);
         assert_eq!(p.args[1], ArgPlan::Scalar(PLoc::Stack(0), 8));
         assert_eq!(p.args[2], ArgPlan::Scalar(PLoc::Stack(8), 8));
+    }
+
+    /// Standard AAPCS64 (Linux/Android, e.g. JNI's variadic Call*Method): variadic arguments
+    /// take the next registers like fixed ones (int in x, double in v), stack arguments
+    /// (here the 9th and 10th integers) one 8-byte slot each.
+    #[test]
+    fn aapcs64_variadic_in_registers_and_slots() {
+        let mut args = Vec::new();
+        for _ in 0..8 {
+            args.push(CArg::Scalar(I64));
+        }
+        args.push(CArg::Scalar(Mem::Int(1, false)));
+        args.push(CArg::Scalar(I32));
+        let p = plan(&CSig { args, ret: None, n_fixed: u32::MAX, ret_narrow: None, unwinds: false }, Target::Aapcs64);
+        assert_eq!(p.args[8], ArgPlan::Scalar(PLoc::Stack(0), 8));
+        assert_eq!(p.args[9], ArgPlan::Scalar(PLoc::Stack(8), 8));
+        assert_eq!(p.stack_bytes, 16);
+        let p = plan(&CSig { args: vec![CArg::Scalar(I64), CArg::Scalar(I32), CArg::Scalar(Mem::F64)], ret: None, n_fixed: 1, ret_narrow: None, unwinds: false }, Target::Aapcs64);
+        assert_eq!(p.args[1], ArgPlan::Scalar(PLoc::Int(1), 8));
+        assert_eq!(p.args[2], ArgPlan::Scalar(PLoc::Flt(0), 8));
+        assert_eq!(p.stack_bytes, 0);
+        let hfa = agg(8, 4, &[(0, Mem::F32), (4, Mem::F32)]);
+        let p = plan(&CSig { args: vec![CArg::Scalar(I64), hfa], ret: None, n_fixed: 1, ret_narrow: None, unwinds: false }, Target::Aapcs64);
+        assert!(matches!(&p.args[1], ArgPlan::Parts(v) if v.len() == 2 && v[1].loc == PLoc::Flt(1)));
     }
 
     /// The Microsoft x64 docs' examples: `func1(int a, int b, int c, int d, int e, int f)` (e, f
