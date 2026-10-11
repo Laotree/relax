@@ -797,6 +797,8 @@ fn script_slot() -> ScriptSlot {
 fn path_lock(path: &str) -> std::sync::MutexGuard<'static, ()> {
     static LOCKS: Mutex<Vec<(String, &'static Mutex<()>)>> = Mutex::new(Vec::new());
     let m: &'static Mutex<()> = {
+        // leaked locks and their table live for the process: the program's heap
+        let _k = crate::zone_alloc::kept();
         let mut t = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
         match t.iter().find(|e| e.0 == path) {
             Some(e) => e.1,

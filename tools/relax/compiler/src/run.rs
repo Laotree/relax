@@ -56,7 +56,7 @@ fn phase(name: &str, t: Instant) {
     }
     // the phase's name without its counts: "build scripts (12)" -> "build scripts"
     report("phase", name.split(" (").next().unwrap_or(name));
-    PHASES.lock().unwrap().push((name.to_string(), ms));
+    { let _k = crate::zone_alloc::kept(); PHASES.lock().unwrap().push((name.to_string(), ms)); }
     crate::tui::phase_done(name);
     use crate::run_state::{self, Phase};
     let next = match name.split(" (").next().unwrap_or(name) {
@@ -880,7 +880,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let u8_ = tcx.tys.prim(crate::program::Prim::U8);
         let _ = tcx.tys.intern(crate::types::TyKind::Array(u8_, tcx.tys.const_usize(1000 + i)));
     }
-    *ROOT_DIR.lock().unwrap() = format!("{} {}", g.crates[g.root].name, root_dir);
+    *ROOT_DIR.lock().unwrap() = crate::zone_alloc::kept_with(|| format!("{} {}", g.crates[g.root].name, root_dir));
     crate::program::collect_misses_begin();
     if let Some((first, _)) = collected_suffix { tcx.collect_collected_suffix(&prog, first); }
     else if !collected_restored { tcx.collect_declarations(&prog); }
@@ -1101,7 +1101,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     drop(mem_g);
     // after the cache is open: a validated warm start with the program's clean verdict stored skips the check
     jit::start_background_coherence(&u);
-    *STARTUP_PATH.lock().unwrap() = format!("{}/relax-run/{}.startup", target_dir, package);
+    *STARTUP_PATH.lock().unwrap() = crate::zone_alloc::kept_with(|| format!("{}/relax-run/{}.startup", target_dir, package));
     if let Ok(p) = std::env::var("RELAX_RUN_REPORT") {
         *REPORT_PATH.lock().unwrap() = p;
     }
@@ -1690,7 +1690,7 @@ static PRESENT_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::M
 fn present_report() -> std::io::Result<std::fs::File> {
     let path = std::env::temp_dir().join(format!("relax-present-{}-{}", std::process::id(), jit::wall_ns()));
     let file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
-    *PRESENT_PATH.lock().unwrap() = Some(path.clone());
+    *PRESENT_PATH.lock().unwrap() = Some(crate::zone_alloc::kept_with(|| path.clone()));
     unsafe { std::env::set_var("RELAX_REPORT_TO", path); }
     Ok(file)
 }
@@ -2084,7 +2084,7 @@ fn start_exit_summary() {
         crate::tui::finish(false);
     });
     // Failure to start optional cleanup must not turn a successful run into a failure.
-    if let Ok(worker) = worker { let _ = EXIT_SUMMARY.set(ExitSummary { request, worker, code: std::sync::OnceLock::new() }); }
+    if let Ok(worker) = worker { let _k = crate::zone_alloc::kept(); let _ = EXIT_SUMMARY.set(ExitSummary { request, worker, code: std::sync::OnceLock::new() }); }
 }
 
 fn finish_run(why: &'static str, code: Option<i32>) {

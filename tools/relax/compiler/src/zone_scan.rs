@@ -253,10 +253,20 @@ pub(crate) fn kept_scan(u: &Unit) -> Vec<(&'static str, usize)> {
     a.counts
 }
 
-/// Whether `RELAX_ZONE_CHECK=1`.
+/// `RELAX_ZONE_CHECK`: 0 off, 1 the kept-state scan at every settle, 2 that plus the static scan
+/// (writable data of the executable and the TLS of every thread, `static_scan`).
+fn level() -> u8 {
+    static L: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *L.get_or_init(|| match std::env::var("RELAX_ZONE_CHECK").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the kept-state scan runs (`RELAX_ZONE_CHECK=1` or 2).
 pub(crate) fn enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_ZONE_CHECK").map_or(false, |v| v == "1"))
+    level() >= 1
 }
 
 /// The scan's result: the one-line report, and the total (for `inspect memory`).
@@ -285,4 +295,250 @@ pub(crate) fn settle_check(u: &Unit) {
     let (total, line) = report(u);
     LAST.store(total, std::sync::atomic::Ordering::Relaxed);
     eprintln!("{line}");
+    if level() >= 2 {
+        static_scan();
+    }
+}
+
+// ------------------------------------------------------------------ static scan (level 2)
+//
+// Conservative scan of everything outside the Unit that can hold a pointer into the compiler
+// arena of the current generation at a settle: the writable data of the executable (and of
+// libmakepad when Relax is a library), and the static TLS of every thread. Each 8-byte-aligned
+// word that points into a live block area of the arena is printed as `module+offset`, which
+// `nm -C --defined-only` resolves to the static (statics) or the thread_local (`tls[exe]+offset`
+// against `nm`'s TLS symbol values). It finds the roots a swap must reset, keep or forbid.
+
+/// One scanned word: where it lives and what it holds.
+struct Hit {
+    place: String,
+    target: usize,
+}
+
+fn print_hits(what: &str, hits: &[Hit], extra: &str) {
+    eprintln!("relax-zone: {what}: {} words into the compiler arena{extra}", hits.len());
+    // up to 200 entries; RELAX_ZONE_SCAN_MAX raises it (the classification wants them all)
+    let max = std::env::var("RELAX_ZONE_SCAN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200usize);
+    for h in hits.iter().take(max) {
+        eprintln!("relax-zone:   {} -> {:#x}", h.place, h.target);
+    }
+}
+
+/// The words of `[start, start+len)` that point into generation `g` (exact), skipping the
+/// arena's own header table.
+fn scan_words(start: usize, len: usize, g: u64, mut place: impl FnMut(usize) -> String, out: &mut Vec<Hit>) {
+    let skip = crate::zone_alloc::compiler_internal_ranges();
+    let mut a = (start + 7) & !7;
+    let end = start + len;
+    while a + 8 <= end {
+        if !skip.iter().any(|r| a >= r.0 && a < r.1) {
+            let v = unsafe { *(a as *const usize) };
+            if crate::zone_alloc::compiler_owns(v as *const u8) && crate::zone_alloc::compiler_points_into(v, g) {
+                out.push(Hit { place: place(a), target: v });
+            }
+        }
+        a += 8;
+    }
+}
+
+pub(crate) fn static_scan() {
+    let g = crate::zone_alloc::compiler_generation();
+    let mut hits = Vec::new();
+    let mut words = 0usize;
+    for (name, base, start, len) in data_regions() {
+        words += len / 8;
+        scan_words(start, len, g, |a| format!("{name}+{:#x}", a - base), &mut hits);
+    }
+    print_hits("static scan", &hits, &format!(" (generation {g}, {words} words scanned)"));
+    tls_scan(g);
+}
+
+/// (module, load base, start, len) of every writable data range of the executable and, when
+/// Relax is a library, of libmakepad.
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+fn data_regions() -> Vec<(String, usize, usize, usize)> {
+    use crate::inspect::symbols::{dl_iterate_phdr, PhdrInfo};
+    use std::ffi::CStr;
+    extern "C" fn cb(info: *const PhdrInfo, _size: usize, data: *mut u8) -> i32 {
+        let out = unsafe { &mut *(data as *mut Vec<(String, usize, usize, usize)>) };
+        let info = unsafe { &*info };
+        let name = if info.name.is_null() { String::new() } else { unsafe { CStr::from_ptr(info.name) }.to_string_lossy().into_owned() };
+        let module = if name.is_empty() { "exe".to_string() } else if name.contains("makepad") || name.contains("relax") { name.rsplit('/').next().unwrap_or("lib").to_string() } else { return 0 };
+        for i in 0..info.phnum as usize {
+            let p = unsafe { &*(info.phdr as *const Phdr).add(i) };
+            // PT_LOAD with PF_W: .data, .bss, .got and the like
+            if p.kind == 1 && p.flags & 2 != 0 {
+                out.push((module.clone(), info.addr as usize, info.addr as usize + p.vaddr as usize, p.memsz as usize));
+            }
+        }
+        0
+    }
+    let mut out = Vec::new();
+    unsafe { dl_iterate_phdr(cb, &mut out as *mut _ as *mut u8) };
+    out
+}
+
+/// ELF64 program header.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Phdr {
+    kind: u32,
+    flags: u32,
+    offset: u64,
+    vaddr: u64,
+    paddr: u64,
+    filesz: u64,
+    memsz: u64,
+    align: u64,
+}
+
+/// macOS: the __DATA segments of the main image (relax binary or the library that contains it).
+#[cfg(target_os = "macos")]
+fn data_regions() -> Vec<(String, usize, usize, usize)> {
+    use std::ffi::c_char;
+    extern "C" {
+        fn _dyld_get_image_header(i: u32) -> *const u8;
+        fn getsegmentdata(h: *const u8, name: *const c_char, size: *mut usize) -> *mut u8;
+    }
+    let mut out = Vec::new();
+    let h = unsafe { _dyld_get_image_header(0) };
+    if h.is_null() {
+        return out;
+    }
+    for seg in [c"__DATA", c"__DATA_CONST", c"__DATA_DIRTY"] {
+        let mut size = 0usize;
+        let p = unsafe { getsegmentdata(h, seg.as_ptr(), &mut size) };
+        if !p.is_null() && size > 0 {
+            out.push(("exe".to_string(), h as usize, p as usize, size));
+        }
+    }
+    out
+}
+
+#[cfg(not(any(all(target_os = "linux", target_pointer_width = "64"), target_os = "macos")))]
+fn data_regions() -> Vec<(String, usize, usize, usize)> {
+    Vec::new()
+}
+
+// ---- static TLS of every thread (Linux x86-64, glibc): variant II, the block of the initial
+// modules lies directly below the thread pointer. The calling thread scans itself; every other
+// thread of the process is sent a real-time signal whose handler (no locks, no allocation) records
+// the candidate words; the exactness test runs afterwards on the calling thread.
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn tls_scan(g: u64) {
+    use std::sync::atomic::{AtomicUsize, Ordering::*};
+    const SIG: i32 = 40;
+    const CAP: usize = 4096;
+    static N: AtomicUsize = AtomicUsize::new(0);
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    static SPAN: AtomicUsize = AtomicUsize::new(0);
+    static EXE_SPAN: AtomicUsize = AtomicUsize::new(0);
+    static REC: [[AtomicUsize; 4]; CAP] = [const { [const { AtomicUsize::new(0) }; 4] }; CAP];
+    extern "C" {
+        fn syscall(n: i64, ...) -> i64;
+        // glibc: BSD semantics (the handler stays installed, interrupted calls restart)
+        fn signal(sig: i32, handler: usize) -> usize;
+    }
+    // runs on the signalled thread (or directly on the calling one): async-signal-safe
+    extern "C" fn scan_self(_: i32) {
+        unsafe {
+            let tid = syscall(186) as usize;
+            let mut fs = 0u64;
+            syscall(158, 0x1003i64, &mut fs as *mut u64);
+            let fs = fs as usize;
+            let mut span = SPAN.load(Relaxed);
+            // the block must be mapped below the thread pointer (madvise says ENOMEM otherwise)
+            for _ in 0..2 {
+                let lo = (fs - span) & !4095;
+                if syscall(28, lo as i64, (fs - lo) as i64, 0i64) == 0 {
+                    break;
+                }
+                span = EXE_SPAN.load(Relaxed);
+            }
+            let mut a = (fs - span + 7) & !7;
+            while a + 8 <= fs {
+                let v = *(a as *const usize);
+                if crate::zone_alloc::compiler_owns(v as *const u8) {
+                    let i = N.fetch_add(1, Relaxed);
+                    if i < CAP {
+                        REC[i][0].store(tid, Relaxed);
+                        REC[i][1].store(fs, Relaxed);
+                        REC[i][2].store(a, Relaxed);
+                        REC[i][3].store(v, Relaxed);
+                    }
+                }
+                a += 8;
+            }
+            DONE.fetch_add(1, Release);
+        }
+    }
+    // spans of the static TLS: all initial modules, and the executable alone
+    {
+        use crate::inspect::symbols::{dl_iterate_phdr, PhdrInfo};
+        extern "C" fn cb(info: *const PhdrInfo, _s: usize, data: *mut u8) -> i32 {
+            let tot = unsafe { &mut *(data as *mut [usize; 2]) };
+            let info = unsafe { &*info };
+            for i in 0..info.phnum as usize {
+                let p = unsafe { &*(info.phdr as *const Phdr).add(i) };
+                if p.kind == 7 {
+                    let al = (p.align as usize).max(1);
+                    let sz = (p.memsz as usize + al - 1) / al * al;
+                    if tot[1] == 0 {
+                        tot[1] = sz; // the first module is the executable
+                    }
+                    tot[0] += sz;
+                }
+            }
+            0
+        }
+        let mut tot = [0usize; 2];
+        unsafe { dl_iterate_phdr(cb, &mut tot as *mut _ as *mut u8) };
+        // only the executable's block (Rust thread_locals live there): reading further below the
+        // thread pointer reaches modules loaded later and the thread's stack
+        SPAN.store(tot[1].min(1 << 20), Relaxed);
+        EXE_SPAN.store(tot[1].min(1 << 20), Relaxed);
+    }
+    N.store(0, Relaxed);
+    DONE.store(0, Release);
+    let me = unsafe { syscall(186) } as usize;
+    let pid = std::process::id() as i64;
+    let old = unsafe { signal(SIG, scan_self as *const () as usize) };
+    let mut sent = 0usize;
+    if let Ok(dir) = std::fs::read_dir("/proc/self/task") {
+        for e in dir.flatten() {
+            let Some(tid) = e.file_name().to_str().and_then(|n| n.parse::<usize>().ok()) else { continue };
+            if tid != me && unsafe { syscall(234, pid, tid as i64, SIG as i64) } == 0 {
+                sent += 1;
+            }
+        }
+    }
+    scan_self(0);
+    let t0 = std::time::Instant::now();
+    while DONE.load(Acquire) < sent + 1 && t0.elapsed() < std::time::Duration::from_millis(500) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let done = DONE.load(Acquire);
+    unsafe { signal(SIG, old) };
+    // exactness, on this thread: the TLS image of the executable starts at tp - exe span
+    let exe_span = EXE_SPAN.load(Relaxed);
+    let mut hits = Vec::new();
+    for r in REC.iter().take(N.load(Relaxed).min(CAP)) {
+        let (tid, fs, a, v) = (r[0].load(Relaxed), r[1].load(Relaxed), r[2].load(Relaxed), r[3].load(Relaxed));
+        if crate::zone_alloc::compiler_points_into(v, g) {
+            let off = a as isize - (fs - exe_span) as isize;
+            let place = format!("tid {tid} tls[exe]+{off:#x}");
+            hits.push(Hit { place, target: v });
+        }
+    }
+    // the record table is a static: leave no arena address in it for the next static scan
+    for r in REC.iter() {
+        r[3].store(0, Relaxed);
+    }
+    print_hits("tls scan", &hits, &format!(" ({done} of {} threads answered)", sent + 1));
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")))]
+fn tls_scan(_g: u64) {
+    eprintln!("relax-zone: tls scan: not available on this target (statics only)");
 }

@@ -73,7 +73,7 @@ fn dladdr_name(pc: u64) -> Option<(String, u64)> {
 /// glibc's `struct dl_phdr_info` (the members used)
 #[cfg(target_os = "linux")]
 #[repr(C)]
-pub(super) struct PhdrInfo {
+pub(crate) struct PhdrInfo {
     pub addr: u64,
     pub name: *const i8,
     pub phdr: *const u8,
@@ -82,7 +82,7 @@ pub(super) struct PhdrInfo {
 
 #[cfg(target_os = "linux")]
 extern "C" {
-    pub(super) fn dl_iterate_phdr(cb: extern "C" fn(*const PhdrInfo, usize, *mut u8) -> i32, data: *mut u8) -> i32;
+    pub(crate) fn dl_iterate_phdr(cb: extern "C" fn(*const PhdrInfo, usize, *mut u8) -> i32, data: *mut u8) -> i32;
 }
 
 #[cfg(target_os = "linux")]

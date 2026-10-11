@@ -171,7 +171,7 @@ impl Context {
 static OUTPUT_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 pub fn set_output_dir(dir: &str) {
-    let _ = OUTPUT_DIR.set(PathBuf::from(crate::vfs::normalize_path(dir)));
+    let _ = OUTPUT_DIR.set(crate::zone_alloc::kept_with(|| PathBuf::from(crate::vfs::normalize_path(dir))));
 }
 
 fn output_dir_entry(dir: &Path, name: &str) -> bool {

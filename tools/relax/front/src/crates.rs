@@ -463,6 +463,9 @@ pub fn join_path(base: &str, p: &str) -> String {
 static CRATE_ENV: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>> = std::sync::Mutex::new(Vec::new());
 
 pub fn set_crate_env(name: &str, env: Vec<(String, String)>) {
+    // the table lives for the run: grown in the kept phase
+    let _k = crate::zone_alloc::kept();
+    let env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut t = CRATE_ENV.lock().unwrap();
     t.retain(|e| e.0 != name);
     t.push((name.to_string(), env));

@@ -33,6 +33,7 @@ const PROVENANCE: &str = env!("RELAX_PROVENANCE");
 pub(crate) fn loader_exe() -> Option<std::path::PathBuf> {
     static EXE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
     EXE.get_or_init(|| {
+        let _kept = relax_compiler::zone_alloc::kept();
         let exe = plain(std::env::current_exe().and_then(|e| e.canonicalize()).ok()?);
         if let Some(named) = std::env::var_os("RELAX_LOADER").map(std::path::PathBuf::from) {
             if let Ok(named) = named.canonicalize().map(plain) {
@@ -477,6 +478,9 @@ fn provided() {
     use std::collections::HashMap;
     // the HAL starts and stops apps as domains through this host; the boot app's privilege is the host's grant
     hal_host::register();
+    // the registry, its keys and the lazily built `type_name` strings of the entries (statics of
+    // the provided crates) live for the process: the program's heap, not the compiler's
+    let _kept = relax_compiler::zone_alloc::kept();
     const CRATES: [&str; 10] = [
         "relax_provided_fixture",
         "makepad_live_id",

@@ -396,7 +396,7 @@ mod unix {
             unsafe { close(out); close(write_fd); close(read_fd); }
             return;
         }
-        *super::SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(path.clone());
+        *super::SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| path.clone()));
         let note = format!("relax-run: session log {}\n", path.display());
         out_all(write_fd, note.as_bytes());
         let mut st = State { out, read_fd, write_fd, path, forwarded: 0, partial: Vec::new(), drawn: false, last_draw_ms: 0.0 };
@@ -408,7 +408,8 @@ mod unix {
         *STATE.lock().unwrap() = Some(st);
         if progress { unsafe { std::env::set_var("RELAX_RUN_PROGRESS", "1") }; }
         let previous = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); }));
+        // the hook lives as long as the process: the program's heap
+        { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); })); }
         unsafe { atexit(at_exit) };
         if let Err(e) = std::thread::Builder::new().name("relax-progress".into()).spawn(forward) {
             eprintln!("relax-run: cannot forward session log: {e}");

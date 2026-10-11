@@ -968,6 +968,8 @@ fn install_ice_hook() {
         return;
     }
     let prev = std::panic::take_hook();
+    // the hook lives as long as the process: the program's heap
+    let _kept = crate::zone_alloc::kept();
     std::panic::set_hook(Box::new(move |info| {
         if owner::is_owner() {
             if let Some(l) = info.location() {
@@ -1610,7 +1612,8 @@ static ARGV: std::sync::Mutex<Vec<(u64, usize, usize)>> = std::sync::Mutex::new(
 /// Sets the program's argv (argv[0] first) before it starts; default: this process's args.
 pub fn set_program_args(args: Vec<Vec<u8>>) {
     if let Ok(mut a) = PROGRAM_ARGS.lock() {
-        *a = args;
+        // the program's argv outlives the compiler heap: rebuilt in the kept phase
+        *a = crate::zone_alloc::kept_with(|| args.iter().map(|v| v.clone()).collect());
     }
 }
 
@@ -1826,9 +1829,19 @@ pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fa
     if f.kind == os::fault::Kind::Watchdog && owner::is_owner() {
         return os::fault::Action::Ignore;
     }
+    note_tombstone_fault(f);
     ensure_altstack();
     (hooks.prepare)();
     unsafe { on_fault_locked(f, hooks) }
+}
+
+/// A fault inside the address range of a destroyed compiler generation (memlane step 1b): a
+/// stale pointer into the compiler arena. Says so on stderr (one lock-free table lookup; the
+/// report that follows is the ordinary fault report).
+fn note_tombstone_fault(f: &os::fault::Fault) {
+    if let Some(g) = crate::zone_alloc::compiler_tombstone_of(f.addr as usize) {
+        eprintln!("relax: use after compiler-zone destroy (generation {g}): {} at {:#x}, pc {:#x}", f.label(), f.addr, f.pc);
+    }
 }
 
 unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fault::Action {
@@ -5234,7 +5247,7 @@ fn sig_name(u: &Unit, id: u32) -> String {
 
 fn sig_dir() -> Option<std::ffi::OsString> {
     static D: std::sync::OnceLock<Option<std::ffi::OsString>> = std::sync::OnceLock::new();
-    D.get_or_init(|| std::env::var_os("RELAX_CODE_SIG_DIR")).clone()
+    D.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var_os("RELAX_CODE_SIG_DIR"))).clone()
 }
 
 fn code_sig(id: u32, f: &crate::rir::Func, code: &[u8], alloc: u64) {

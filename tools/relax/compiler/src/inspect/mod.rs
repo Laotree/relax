@@ -21,7 +21,7 @@ pub mod probes;
 pub mod mem;
 mod prof;
 pub mod timeline;
-mod symbols;
+pub(crate) mod symbols;
 pub mod threads;
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
@@ -63,7 +63,7 @@ pub fn start(app: &str) {
     if std::env::var("RELAX_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
         return;
     }
-    *APP.lock().unwrap() = app.to_string();
+    *APP.lock().unwrap() = crate::zone_alloc::kept_with(|| app.to_string());
     let pid = std::process::id();
     let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
     let extra = format!(",\"session_log\":{},\"relax\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));

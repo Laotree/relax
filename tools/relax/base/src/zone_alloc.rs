@@ -83,6 +83,34 @@ mod disabled {
     }
     pub fn trim() {}
     pub fn detach_thread() {}
+    pub fn generation() -> u64 {
+        0
+    }
+    pub fn begin_generation() -> u64 {
+        0
+    }
+    pub fn destroy_generation(_: u64) -> (usize, usize) {
+        (0, 0)
+    }
+    pub fn epoch_of(_: *const u8) -> Option<u64> {
+        None
+    }
+    pub fn tombstone_of(_: usize) -> Option<u64> {
+        None
+    }
+    pub fn tombstone_frees() -> usize {
+        0
+    }
+    pub fn tombstones() -> usize {
+        0
+    }
+    pub fn tombstone_hit(_: *mut u8, _: &str) {}
+    pub fn points_into(_: usize, _: u64) -> bool {
+        false
+    }
+    pub fn internal_ranges() -> [(usize, usize); 2] {
+        [(0, 0); 2]
+    }
     pub unsafe fn alloc(_: Layout) -> *mut u8 {
         std::ptr::null_mut()
     }
@@ -134,6 +162,56 @@ pub fn compiler_trim() {
 /// (pthread mutexes, condition variables) std boxed in the compiler arena (macOS; see arena.rs).
 pub fn compiler_pthread_boxes() -> (usize, usize) {
     compiler::pthread_boxes()
+}
+
+/// The compiler arena's current generation (starts at 0).
+pub fn compiler_generation() -> u64 {
+    compiler::generation()
+}
+
+/// Starts a new compiler generation and returns it: compiler-phase allocations from now on take
+/// only chunks and runs carved for it; frees of older blocks keep working by address.
+pub fn compiler_begin_generation() -> u64 {
+    compiler::begin_generation()
+}
+
+/// Destroys generation `g` (older than the current one): its chunks and large runs are
+/// decommitted with the zeroing path and left PROT_NONE as tombstones, never reused. Returns
+/// (chunks, touched bytes). The caller has stopped every user of `g` (the settle swap).
+pub fn compiler_destroy_generation(g: u64) -> (usize, usize) {
+    compiler::destroy_generation(g)
+}
+
+/// The generation of the live compiler block at `p` (None: not a live arena address).
+pub fn compiler_epoch_of(p: *const u8) -> Option<u64> {
+    compiler::epoch_of(p)
+}
+
+/// The destroyed generation whose address range holds `addr` (async-signal-safe: the fault
+/// handler reports "use after compiler-zone destroy").
+pub fn compiler_tombstone_of(addr: usize) -> Option<u64> {
+    compiler::tombstone_of(addr)
+}
+
+/// Frees and reallocs that hit a destroyed generation (counted no-ops).
+pub fn compiler_tombstone_frees() -> usize {
+    compiler::tombstone_frees()
+}
+
+/// Does `p` point into the carved part of a live block area of generation `g`? (exact; the
+/// static scan's test.)
+pub fn compiler_points_into(p: usize, g: u64) -> bool {
+    compiler::points_into(p, g)
+}
+
+/// The arena's own statics (address ranges): its free lists and base address are not roots.
+pub fn compiler_internal_ranges() -> [(usize, usize); 2] {
+    compiler::internal_ranges()
+}
+
+/// Number of tombstoned chunks and runs.
+pub fn compiler_tombstones() -> usize {
+    compiler::tombstones()
 }
 
 /// Whether compiler-phase routing is on in this process (`RELAX_COMPILER_ARENA=0` turns it off).
@@ -438,6 +516,12 @@ unsafe impl GlobalAlloc for RelaxAlloc {
             return n;
         }
         if compiler::owns(p) {
+            if compiler::tombstone_of(p as usize).is_some() {
+                // a destroyed block: counted (an abort under RELAX_ZONE_CHECK); its bytes are
+                // gone, so the new block is not a copy
+                compiler::tombstone_hit(p, "realloc");
+                return self.alloc(Layout::from_size_align_unchecked(size, l.align()));
+            }
             if in_compiler() && compiler::resize_in_place(p, l, size) {
                 return p;
             }
@@ -511,6 +595,8 @@ mod routing_tests {
     fn kept_guard_for_test() -> PhaseGuard {
         kept()
     }
+
+    include!("zone_alloc/generation_tests.rs");
 
     #[test]
     fn realloc_stays_in_place_in_a_class_and_moves_to_the_phase_heap() {
