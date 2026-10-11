@@ -437,6 +437,10 @@ impl TunnelConn {
     pub fn set_read_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
         self.stream.set_read_timeout(t)
     }
+
+    pub fn set_write_timeout(&self, t: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.set_write_timeout(t)
+    }
 }
 
 impl Read for TunnelConn {

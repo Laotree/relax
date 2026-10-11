@@ -110,6 +110,8 @@ struct Chan {
     served: u64,
     reasm: Vec<u8>,
     partial: bool,
+    /// opened by the peer and not yet answered: nothing is written for it until the OK or CLOSE
+    hold: bool,
     close_after: Option<(u16, String)>,
 }
 
@@ -127,6 +129,8 @@ struct Shared {
     work: Condvar,
     space: Condvar,
     closed: Arc<AtomicBool>,
+    /// close() was called: the goodbye is being written, no new work should start
+    closing: AtomicBool,
     peer: Hello,
     resume: Mutex<Option<Resume>>,
     rtt_ns: AtomicU64,
@@ -156,7 +160,7 @@ impl State {
         }
         let mut best: Option<(u8, u64, u16)> = None;
         for (id, c) in &self.chans {
-            let ready = match c.q.front() {
+            let ready = !c.hold && match c.q.front() {
                 Some(m) => c.credit > 0 || (m.is_empty() && c.off == 0),
                 None => c.close_after.is_some(),
             };
@@ -213,6 +217,7 @@ impl Conn {
             work: Condvar::new(),
             space: Condvar::new(),
             closed,
+            closing: AtomicBool::new(false),
             peer,
             resume: Mutex::new(None),
             rtt_ns: AtomicU64::new(0),
@@ -247,6 +252,11 @@ impl Conn {
 
     pub fn is_closed(&self) -> bool {
         self.0.closed.load(Relaxed)
+    }
+
+    /// False once the connection has ended or `close` was called (a client dials a new one).
+    pub fn is_usable(&self) -> bool {
+        !self.is_closed() && !self.0.closing.load(Relaxed)
     }
 
     /// Blocks until the connection has ended.
@@ -291,6 +301,7 @@ impl Conn {
 
     /// Says goodbye and closes once everything queued before it is written.
     pub fn close(&self, reason: &str) {
+        self.0.closing.store(true, Relaxed);
         let mut st = self.0.st.lock().unwrap();
         st.push_ctrl(0, kind::DATA, hello::encode_goodbye(reason));
         st.draining = true;
@@ -318,7 +329,7 @@ impl Conn {
     }
 
     pub fn open_timeout(&self, service: &str, args: &str, wait: Duration) -> Result<Channel, (u16, String)> {
-        if self.is_closed() {
+        if !self.is_usable() {
             return Err((CLOSE_LINK_LOST, self.close_reason()));
         }
         let (tx, rx) = channel();
@@ -460,7 +471,9 @@ impl Conn {
             if f.chan == 0 || st.chans.contains_key(&f.chan) {
                 return Err(format!("OPEN of channel {} which is already in use", f.chan));
             }
-            st.chans.insert(f.chan, new_chan(service, tx));
+            let mut c = new_chan(service, tx);
+            c.hold = true;
+            st.chans.insert(f.chan, c);
         }
         let channel = Channel { tx: ChannelTx { conn: self.clone(), id: f.chan }, rx };
         let open = Open { service: service.to_string(), args: args.to_string(), channel };
@@ -470,7 +483,12 @@ impl Conn {
         };
         let mut st = self.0.st.lock().unwrap();
         match answer {
-            Ok(caps) => st.push_ctrl(f.chan, kind::OK, caps.into_bytes()),
+            Ok(caps) => {
+                if let Some(c) = st.chans.get_mut(&f.chan) {
+                    c.hold = false;
+                }
+                st.push_ctrl(f.chan, kind::OK, caps.into_bytes());
+            }
             Err((code, reason)) => {
                 st.chans.remove(&f.chan);
                 let mut p = code.to_le_bytes().to_vec();
@@ -558,7 +576,7 @@ impl Conn {
 }
 
 fn new_chan(service: &str, tx: Sender<(Event, bool)>) -> Chan {
-    Chan { prio: priority(service), credit: INITIAL_CREDIT, q: VecDeque::new(), off: 0, queued: 0, tx, ungranted: 0, served: 0, reasm: Vec::new(), partial: false, close_after: None }
+    Chan { prio: priority(service), credit: INITIAL_CREDIT, q: VecDeque::new(), off: 0, queued: 0, tx, ungranted: 0, served: 0, reasm: Vec::new(), partial: false, hold: false, close_after: None }
 }
 
 /// The sending half of a channel; cloneable, usable from any thread.

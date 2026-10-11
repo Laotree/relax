@@ -127,7 +127,7 @@ impl Client {
     pub fn conn(&self) -> Result<Conn, Error> {
         let mut slot = self.0.conn.lock().unwrap();
         if let Some(c) = slot.as_ref() {
-            if !c.is_closed() {
+            if c.is_usable() {
                 return Ok(c.clone());
             }
         }

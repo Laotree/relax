@@ -352,3 +352,59 @@ fn tcp_loopback_with_tls_and_key_proof() {
     assert!(Client::connect_tcp(&addr.to_string(), creds(&Psk::generate().unwrap())).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Both ends send 8 MB at once over loopback TLS (32 channels, so far more is in flight than the
+/// socket buffers hold) and both must receive all of it.
+#[test]
+fn tcp_both_ends_send_8mb_at_once() {
+    use makepad_network::tls::TlsIdentity;
+    use makepad_network::tunnel::{ClientCredentials, Psk};
+    const CHANNELS: usize = 32;
+    const PER_CHANNEL: usize = (8 << 20) / CHANNELS;
+    fn blast(ch: Channel) -> std::thread::JoinHandle<usize> {
+        let tx = ch.tx();
+        std::thread::spawn(move || {
+            let sender = std::thread::spawn(move || {
+                let mut sent = 0;
+                while sent < PER_CHANNEL {
+                    tx.send(vec![0xA5u8; 32 << 10]).unwrap();
+                    sent += 32 << 10;
+                }
+            });
+            let mut got = 0;
+            while got < PER_CHANNEL {
+                match ch.recv_timeout(Duration::from_secs(60)) {
+                    Ok(Event::Data(d)) => got += d.len(),
+                    _ => break,
+                }
+            }
+            sender.join().unwrap();
+            got
+        })
+    }
+    let dir = std::env::temp_dir().join(format!("makepad-remote-tls8-{}", std::process::id()));
+    let identity = TlsIdentity::load_or_create(&dir, "makepad-remote-test").unwrap();
+    let fp = identity.fingerprint;
+    let key = Psk::generate().unwrap();
+    let ep = Endpoint::new("tcp-blast");
+    let server_side: Arc<Mutex<Vec<std::thread::JoinHandle<usize>>>> = Arc::new(Mutex::new(Vec::new()));
+    let s2 = server_side.clone();
+    ep.register("blast", 1, Arc::new(move |_, open| {
+        s2.lock().unwrap().push(blast(open.channel));
+        Ok(())
+    }));
+    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, vec![key.clone()]).unwrap();
+    let creds = ClientCredentials { keys: vec![key], known_hosts: None, expect: Some(fp) };
+    let client = Client::connect_tcp(&addr.to_string(), creds).unwrap();
+    let t = std::time::Instant::now();
+    let handles: Vec<_> = (0..CHANNELS).map(|_| blast(client.open("blast", "").unwrap())).collect();
+    let got: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(got, CHANNELS * PER_CHANNEL, "client received everything");
+    let theirs: Vec<_> = std::mem::take(&mut *server_side.lock().unwrap());
+    assert_eq!(theirs.len(), CHANNELS);
+    let got: usize = theirs.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(got, CHANNELS * PER_CHANNEL, "server received everything");
+    assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
+    eprintln!("8 MB each way over TLS in {:?}", t.elapsed());
+    let _ = std::fs::remove_dir_all(&dir);
+}

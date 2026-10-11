@@ -3,9 +3,13 @@
 //! [`listen`] for an endpoint that accepts paired peers, [`dial`] for a client. Nothing in this
 //! crate opens a TCP port by default.
 //!
-//! The TLS streams cannot be split between a reader and a writer thread, so both share one
-//! mutex-guarded stream and the reader uses a short read timeout (a resumable `WouldBlock`),
-//! releasing the lock between reads.
+//! A TLS stream cannot be split between a reader and a writer thread, so ONE I/O thread owns it.
+//! It writes the pending outgoing bytes with a write timeout; when the write would block (the
+//! peer is not draining) it reads with a short timeout, which drains the peer, and then retries
+//! the same remaining buffer (every stack resumes an interrupted write that way, see the Write
+//! impls in platform/network). Two peers that both fill their send buffers therefore cannot
+//! stall each other. The frame reader and the connection's writer talk to this thread through a
+//! small in-memory pipe.
 
 use super::Carrier;
 use crate::endpoint::Endpoint;
@@ -13,65 +17,159 @@ use crate::frame::FrameReader;
 use makepad_network::tls::{TlsIdentity, TlsServer, TlsStream};
 use makepad_network::tunnel::{connect_with_credentials, server_authenticate, ClientCredentials, Psk, TunnelConn};
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpListener, ToSocketAddrs};
-use std::sync::{Arc, Mutex};
+use std::net::{TcpListener, ToSocketAddrs};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 const POLL: Duration = Duration::from_millis(20);
 const HANDSHAKE: Duration = Duration::from_secs(10);
-
-struct LockedRead<S>(Arc<Mutex<S>>);
-struct LockedWrite<S>(Arc<Mutex<S>>);
+/// outgoing bytes the connection's writer may have queued for the I/O thread
+const OUT_CAP: usize = 256 << 10;
 
 fn would_block(e: &io::Error) -> bool {
     matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted)
 }
 
-impl<S: Read> Read for LockedRead<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let r = self.0.lock().unwrap().read(buf);
-        if r.as_ref().is_err_and(would_block) {
-            // let a waiting writer take the lock
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        r
+#[derive(Default)]
+struct PipeState {
+    inb: Vec<u8>,
+    inpos: usize,
+    out: Vec<u8>,
+    closed: bool,
+}
+
+#[derive(Default)]
+struct Pipe {
+    st: Mutex<PipeState>,
+    cv_in: Condvar,
+    cv_out: Condvar,
+}
+
+impl Pipe {
+    fn close(&self) {
+        self.st.lock().unwrap().closed = true;
+        self.cv_in.notify_all();
+        self.cv_out.notify_all();
     }
 }
 
-impl<S: Write> Write for LockedWrite<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+struct PipeRead(Arc<Pipe>);
+struct PipeWrite(Arc<Pipe>);
+
+impl Read for PipeRead {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut st = self.0.st.lock().unwrap();
         loop {
-            match self.0.lock().unwrap().write(buf) {
-                Err(e) if would_block(&e) => std::thread::sleep(Duration::from_millis(1)),
-                r => return r,
+            if st.inpos < st.inb.len() {
+                let n = buf.len().min(st.inb.len() - st.inpos);
+                buf[..n].copy_from_slice(&st.inb[st.inpos..st.inpos + n]);
+                st.inpos += n;
+                if st.inpos == st.inb.len() {
+                    st.inb.clear();
+                    st.inpos = 0;
+                }
+                return Ok(n);
             }
+            if st.closed {
+                return Ok(0);
+            }
+            st = self.0.cv_in.wait(st).unwrap();
         }
+    }
+}
+
+impl Write for PipeWrite {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut st = self.0.st.lock().unwrap();
+        while st.out.len() >= OUT_CAP && !st.closed {
+            st = self.0.cv_out.wait(st).unwrap();
+        }
+        if st.closed {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "connection closed"));
+        }
+        st.out.extend_from_slice(buf);
+        Ok(buf.len())
     }
     fn flush(&mut self) -> io::Result<()> {
-        loop {
-            match self.0.lock().unwrap().flush() {
-                Err(e) if would_block(&e) => std::thread::sleep(Duration::from_millis(1)),
-                r => return r,
+        Ok(())
+    }
+}
+
+/// The I/O thread: owns `s` until the pipe closes or the stream fails; `close` shuts it down.
+fn io_loop<S: Read + Write>(mut s: S, pipe: Arc<Pipe>, close: impl FnOnce(&mut S)) {
+    let mut cur: Vec<u8> = Vec::new();
+    let mut pos = 0;
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        if pos == cur.len() {
+            cur.clear();
+            pos = 0;
+            let mut st = pipe.st.lock().unwrap();
+            if st.closed {
+                break;
+            }
+            std::mem::swap(&mut cur, &mut st.out);
+            if !cur.is_empty() {
+                pipe.cv_out.notify_all();
+            }
+        }
+        let mut blocked = true;
+        if pos < cur.len() {
+            match s.write(&cur[pos..]) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pos += n;
+                    blocked = false;
+                }
+                Err(e) if would_block(&e) => {}
+                Err(_) => break,
+            }
+        }
+        if pos == cur.len() {
+            // a stack that holds back part of a record sends it here
+            match s.flush() {
+                Ok(()) => {}
+                Err(e) if would_block(&e) => {}
+                Err(_) => break,
+            }
+            // more queued by now: write it before waiting in a read
+            blocked = pipe.st.lock().unwrap().out.is_empty();
+        }
+        // read when the write would block (drains the peer) or there is nothing to write
+        if blocked {
+            match s.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pipe.st.lock().unwrap().inb.extend_from_slice(&buf[..n]);
+                    pipe.cv_in.notify_all();
+                }
+                Err(e) if would_block(&e) => {}
+                Err(_) => break,
             }
         }
     }
+    pipe.close();
+    close(&mut s);
+}
+
+fn carrier<S: Read + Write + Send + 'static>(s: S, hooks: crate::conn::Hooks, close: impl FnOnce(&mut S) + Send + 'static) -> Carrier {
+    let pipe = Arc::new(Pipe::default());
+    let p = pipe.clone();
+    let _ = std::thread::Builder::new().name("makepad-remote-io".into()).spawn(move || {
+        (hooks.enter)();
+        io_loop(s, p, close);
+        (hooks.exit)();
+    });
+    let closer = pipe.clone();
+    Carrier { reader: FrameReader::new(Box::new(PipeRead(pipe.clone()))), writer: Box::new(PipeWrite(pipe)), shutdown: Box::new(move || closer.close()) }
 }
 
 /// Connects to a paired endpoint at `addr` (`host:port`): TLS, pinned certificate, key proof.
 pub fn dial(addr: &str, creds: &ClientCredentials) -> io::Result<Carrier> {
     let conn = connect_with_credentials(addr, creds)?;
     conn.set_read_timeout(Some(POLL))?;
-    let shared: Arc<Mutex<TunnelConn>> = Arc::new(Mutex::new(conn));
-    let closer = shared.clone();
-    Ok(Carrier {
-        reader: FrameReader::new(Box::new(LockedRead(shared.clone()))),
-        writer: Box::new(LockedWrite(shared)),
-        shutdown: Box::new(move || {
-            if let Ok(mut c) = closer.lock() {
-                c.shutdown();
-            }
-        }),
-    })
+    conn.set_write_timeout(Some(POLL))?;
+    Ok(carrier(conn, crate::conn::Hooks::default(), |c: &mut TunnelConn| c.shutdown()))
 }
 
 /// Accepts paired peers on `bind` (`host:port`): each connection does the TLS handshake with
@@ -109,17 +207,8 @@ fn accept_one(ep: &Endpoint, tls: &TlsServer, keys: &[Psk], fingerprint: &[u8; 3
     tcp.set_write_timeout(Some(HANDSHAKE))?;
     let mut stream: TlsStream = tls.accept(tcp)?;
     server_authenticate(&mut stream, keys, fingerprint).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
-    let raw = stream.try_clone_tcp()?;
-    stream.set_write_timeout(None)?;
+    stream.set_write_timeout(Some(POLL))?;
     stream.set_read_timeout(Some(POLL))?;
-    let shared = Arc::new(Mutex::new(stream));
-    ep.serve(
-        FrameReader::new(Box::new(LockedRead(shared.clone()))),
-        Box::new(LockedWrite(shared)),
-        Box::new(move || {
-            let _ = raw.shutdown(Shutdown::Both);
-        }),
-    )
-    .map(|_| ())
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    let c = carrier(stream, ep.hooks(), |s: &mut TlsStream| s.shutdown());
+    ep.serve(c.reader, c.writer, c.shutdown).map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
