@@ -167,60 +167,93 @@ pub(crate) fn sandbox_check(prog: &crate::program::Program, tcx: &crate::tcx::Tc
     out
 }
 
-/// Parses, resolves, collects and type-checks a crate loaded at run time (on the owner thread);
-/// `sandbox`: the compile-time refusal applies. On an error nothing of it stays reachable.
-unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
-    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let sess = &session;
+/// A crate to add to the running program.
+pub(crate) struct NewCrate {
+    pub name: String,
+    pub path: String,
+    pub edition: u16,
+    pub cfg: crate::cfg::CfgSet,
+    /// (extern name, dependency)
+    pub deps: Vec<(String, Dep)>,
+    pub proc_macro: bool,
+}
+
+/// What a new crate depends on.
+#[derive(Clone, Copy)]
+pub(crate) enum Dep {
+    /// a crate of the program (std crates included)
+    Existing(u32),
+    /// a crate of the same batch (an earlier one)
+    New(usize),
+}
+
+/// What `add_crates` put in the program.
+pub(crate) struct Added {
+    /// crate index of each new crate, in batch order
+    pub crates: Vec<u32>,
+    pub defs: Vec<DefId>,
+    /// the program's counts before the load
+    pub d0: usize,
+    pub e0: usize,
+    pub f0: usize,
+    /// diagnostics of the new crates
+    pub errs: Vec<String>,
+}
+
+/// Loads `new` (in order) into the running program on the owner thread: parse and collect each
+/// crate, resolve the imports it added, collect its declarations. Macros expand as for any load
+/// (the macro world builds on the first need). The program stays consistent on an error in the
+/// load itself (`Err`); diagnostics of the new files come back in `Added::errs` for the caller to
+/// refuse the load or not. `tolerant` (an app's crates: a boot goes on after unresolved imports):
+/// the declarations are collected whatever the diagnostics.
+pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool) -> Result<Added, Vec<String>> {
     let u = &mut *up;
-    let mut dep_list = Vec::new();
-    // std, then the named crates of the running program (the newest crate of each name)
-    for c in ["core", "alloc", "std"].iter().map(|s| s.to_string()).chain(deps.iter().cloned()) {
-        let found = (0..u.prog.crates.len()).rev().find(|&k| u.prog.syms.str(u.prog.crates[k].name) == c.replace('-', "_"));
-        match found {
-            Some(k) => dep_list.push((u.prog.crates[k].name, k as u32)),
-            None if matches!(c.as_str(), "core" | "alloc" | "std") => {}
-            None => return Err(vec![format!("{}: dependency `{}` is not a crate of the running program", path, c)]),
-        }
-    }
-    let cfg = {
-        let mut c = crate::cfg::CfgSet::host(sess, &[]);
-        c.set.push("relax".to_string());
-        c
-    };
     let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
     let d0 = u.prog.defs.len();
     let i0 = u.prog.imports.len();
     let e0 = u.prog.errors.len();
     let f0 = u.prog.files.len();
-    let krate = {
+    let mut crates: Vec<u32> = Vec::new();
+    {
         let _fw = jit::front_write();
         crate::run::preserve_collected_boot(u);
         u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         // parsed on this thread (no parse workers for one small crate)
         crate::preload::SINGLE.with(|s| s.set(true));
-        let r = u.prog.load_crate_deferred(name, path, 2021, cfg, dep_list);
+        let mut failed = None;
+        for nc in new {
+            let mut dep_list = Vec::new();
+            for (n, d) in &nc.deps {
+                let k = match d {
+                    Dep::Existing(k) => *k,
+                    Dep::New(i) => crates[*i],
+                };
+                dep_list.push((u.prog.syms.intern(n), k));
+            }
+            match u.prog.load_crate_deferred(&nc.name, &nc.path, nc.edition, nc.cfg.clone(), dep_list) {
+                Ok(k) => {
+                    u.prog.crates[k as usize].proc_macro = nc.proc_macro;
+                    crates.push(k);
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
         crate::preload::SINGLE.with(|s| s.set(false));
         marks.push(("parse", std::time::Instant::now()));
-        let k = match r {
-            Ok(k) => k,
-            Err(e) => {
-                unsafe {
+        if let Some(e) = failed {
             u.prog.reclaim_caches();
+            return Err(vec![e]);
         }
-                return Err(vec![e]);
-            }
-        };
         u.prog.resolve_imports_added(i0, d0);
         marks.push(("resolve", std::time::Instant::now()));
         // the caches resolve_imports cleared (front-end write lock on owner thread: no reader)
-        unsafe {
-            u.prog.reclaim_caches();
-        }
+        u.prog.reclaim_caches();
         marks.push(("reclaim", std::time::Instant::now()));
-        k
-    };
+    }
     let defs: Vec<DefId> = (d0 as u32..u.prog.defs.len() as u32).map(DefId).collect();
     // resolve_imports retries every import still open in the running program and reports the
     // ones that stay open again: the program's own (e.g. items of a derive that failed in the
@@ -236,14 +269,53 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
             errs.push(format!("{}:{}:{}: unresolved import -- name a crate the module depends on", u.prog.file_paths[im.file as usize], l, c));
         }
     }
-    if errs.is_empty() {
+    if errs.is_empty() || tolerant {
         let _fw = jit::front_write();
         // collect_added also drains diagnostics queued by background checks of the host.
         // As for resolve_imports above, only errors in this module's files refuse its load.
         errs.extend(u.tcx.collect_added(&u.prog, &defs, true).into_iter().filter(|e| mine.iter().any(|p| e.starts_with(p.as_str()))));
-        errs.extend(check_orphans(u, krate, &defs));
     }
     marks.push(("collect", std::time::Instant::now()));
+    if tr {
+        let mut line = format!("relax-module: {} crate(s) front:", new.len());
+        for w in marks.windows(2) {
+            line.push_str(&format!(" {} {:.2}", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3));
+        }
+        eprintln!("{} ms ({} defs)", line, u.prog.defs.len() - d0);
+    }
+    Ok(Added { crates, defs, d0, e0, f0, errs })
+}
+
+/// Parses, resolves, collects and type-checks a crate loaded at run time (on the owner thread);
+/// `sandbox`: the compile-time refusal applies. On an error nothing of it stays reachable.
+unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
+    let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let sess = &session;
+    let u = &mut *up;
+    let mut dep_list = Vec::new();
+    // std, then the named crates of the running program (the newest crate of each name)
+    for c in ["core", "alloc", "std"].iter().map(|s| s.to_string()).chain(deps.iter().cloned()) {
+        let found = (0..u.prog.crates.len()).rev().find(|&k| u.prog.syms.str(u.prog.crates[k].name) == c.replace('-', "_"));
+        match found {
+            Some(k) => dep_list.push((u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))),
+            None if matches!(c.as_str(), "core" | "alloc" | "std") => {}
+            None => return Err(vec![format!("{}: dependency `{}` is not a crate of the running program", path, c)]),
+        }
+    }
+    let cfg = {
+        let mut c = crate::cfg::CfgSet::host(sess, &[]);
+        c.set.push("relax".to_string());
+        c
+    };
+    let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
+    let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
+    let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false)?;
+    let u = &mut *up;
+    let Added { crates, defs, d0, e0, f0, mut errs } = added;
+    let krate = crates[0];
+    if errs.is_empty() {
+        errs.extend(check_orphans(u, krate, &defs));
+    }
     let root_file = (f0 as u32..u.prog.files.len() as u32).find(|&f| u.prog.file_paths[f as usize] == path).unwrap_or(f0 as u32);
     let mut bodies: Vec<crate::typeck::Body> = Vec::new();
     if errs.is_empty() {
@@ -290,7 +362,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
 }
 
 /// Takes defs out of the program (a refused load, an unload).
-unsafe fn drop_defs(up: *mut Unit, defs: &[DefId]) {
+pub(crate) unsafe fn drop_defs(up: *mut Unit, defs: &[DefId]) {
     let u = &mut *up;
     let _fw = jit::front_write();
     let impls: Vec<DefId> = defs.iter().copied().filter(|d| u.prog.def(*d).kind == DefKind::Impl).collect();

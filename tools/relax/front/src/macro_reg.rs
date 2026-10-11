@@ -270,14 +270,37 @@ pub fn stats() -> HostStats {
 }
 
 /// The loader's crate graph and std dir (before loading crates).
-fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir: &str) -> Result<(), String> {
-    let mut reg = Reg { std_dir: std_dir.to_string(), ..Default::default() };
-    for u in units {
-        reg.units.push(UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.clone(), proc_macro: u.proc_macro });
+///
+/// `additive`: another program's graph joins the one registered (a domain started into a running
+/// unit, domain.rs): units the registry has already (same name, source, edition, features) keep
+/// their index, new ones are appended with their dependencies mapped, and only new proc-macro
+/// units are scanned for entries. The index of every earlier unit and entry stays valid.
+fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
+    let mut reg = if additive { REG.with(|r| r.borrow().clone()).unwrap_or_default() } else { Reg::default() };
+    reg.std_dir = std_dir.to_string();
+    // unit index of the graph -> unit index in the registry
+    let mut map = vec![usize::MAX; units.len()];
+    let mut fresh = Vec::new();
+    for (i, u) in units.iter().enumerate() {
+        let same = if additive {
+            reg.units.iter().position(|r| r.name == u.name && r.src_path == u.src_path && r.edition == u.edition && r.features == u.features && r.proc_macro == u.proc_macro)
+        } else {
+            None
+        };
+        map[i] = same.unwrap_or_else(|| {
+            reg.units.push(UnitInfo { name: String::new(), src_path: String::new(), edition: 0, features: Vec::new(), deps: Vec::new(), proc_macro: false });
+            fresh.push(i);
+            reg.units.len() - 1
+        });
     }
-    for (i, u) in reg.units.clone().iter().enumerate() {
+    for &i in &fresh {
+        let u = &units[i];
+        reg.units[map[i]] = UnitInfo { name: u.name.clone(), src_path: u.src_path.clone(), edition: u.edition, features: u.features.clone(), deps: u.deps.iter().map(|(d, n)| (map[*d], n.clone())).collect(), proc_macro: u.proc_macro };
+    }
+    for &i in &fresh {
+        let u = reg.units[map[i]].clone();
         if u.proc_macro {
-            scan_entries(&mut reg, i, &u.src_path, u.edition);
+            scan_entries(&mut reg, map[i], &u.src_path, u.edition);
         }
     }
     if trace() {
@@ -292,7 +315,10 @@ fn register(sess: &std::sync::Arc<crate::Session>, units: &[CrateUnit], std_dir:
     if let Some(r) = RUNNER.get() {
         // a world built during the program's load takes its core/alloc/std from that load
         r.registered(sess)?;
-        crate::program::share_std_begin();
+        // (a program started into a running one has its std loaded already)
+        if !additive {
+            crate::program::share_std_begin();
+        }
     }
     Ok(())
 }
@@ -310,12 +336,12 @@ pub fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
 /// Registers the graph with the host (when std provides `proc_macro`), then makes the app
 /// graph see proc-macro crates, and the crates only they depend on, as empty crates: they run in
 /// the macro world, never in the app (rustc also links them into the compiler, not the app).
-pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str) -> Result<(), String> {
+pub fn register_and_strip(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
     let empty = format!("{}/proc_macro/empty.rs", std_dir);
     if trace() {
         eprintln!("pmhost: graph of {} units ({} proc-macro), std {}", units.len(), units.iter().filter(|u| u.proc_macro).count(), std_dir);
     }
-    register(sess, units, std_dir)?;
+    register(sess, units, std_dir, additive)?;
     if !crate::vfs::exists(&empty) {
         return Ok(());
     }

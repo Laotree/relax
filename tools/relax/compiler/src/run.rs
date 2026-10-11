@@ -154,6 +154,110 @@ pub fn load_check_session(sess: &std::sync::Arc<crate::Session>, args: &[String]
     session.ok_or_else(|| format!("check could not load or initialize the package (status {})", code))
 }
 
+
+/// Who asks for a package's crate list: the boot of a run, or a domain started into a running
+/// unit (domain.rs `start`). The domain's graph is registered with the macro host additively and
+/// binds no provided crate (the unit's are bound).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResolveFor {
+    Boot,
+    Domain,
+}
+
+/// A package resolved to the crates that make it up: cargo's unit graph (or a saved one), the
+/// substitutions of provided crates, the build scripts run (their cfgs, env and link libraries),
+/// and each crate's cfg set. `relax run` and `domain::start` build exactly this, then load.
+pub(crate) struct Resolved {
+    pub units: unitgraph::Units,
+    pub g: unitgraph::Graph,
+    /// crate indices of `g`, every crate after its dependencies
+    pub order: Vec<usize>,
+    /// per crate: its cfg set (features, relax, the build script's cfgs)
+    pub cfgs: Vec<crate::cfg::CfgSet>,
+    /// the files a live session watches (boot only)
+    pub live_inputs: Option<crate::reload::Inputs>,
+}
+
+pub(crate) fn resolve_package(
+    sess: &std::sync::Arc<crate::Session>,
+    workspace: &str,
+    package: &str,
+    cargo_flags: &[String],
+    units_json: &str,
+    target_dir: &str,
+    std_dir: &str,
+    who: ResolveFor,
+) -> Result<Resolved, String> {
+    let boot = who == ResolveFor::Boot;
+    let options = &sess.options;
+    let _mem = crate::memstat::tag(crate::memstat::Tag::Boot);
+    // ---- crate graph
+    let t = Instant::now();
+    // the resolver's graph in memory; a build script's child reads its units from JSON
+    let units = if units_json.is_empty() {
+        unitgraph::unit_graph(sess, workspace, package, cargo_flags)
+    } else {
+        std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
+    }?;
+    let t_load = Instant::now();
+    let mut g = unitgraph::load(&units)?;
+    // provided crates bind only to their own source (before substitution rewrites deps)
+    let ts = Instant::now();
+    let pkgs: Vec<crate::srchash::SrcPkg> = g
+        .crates
+        .iter()
+        .zip(g.pkg.iter())
+        .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
+        .collect();
+    let live_inputs = (boot && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
+    // Validate native macros before any overlapping provided-crate identity error.
+    crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;
+    if boot {
+        // The loader's provided crates are host code built for the machine: their shims bind
+        // only where the program is read for the machine too. A program read for another target
+        // (RELAX_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
+        // makepad-windows-sys on Windows) and only type-checks: it never runs the crates' code,
+        // so nothing binds and every provided crate is read from source.
+        let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
+        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine {
+            crate::provided::check_sources(&pkgs, !options.verbose)?;
+        } else {
+            crate::provided::read_identity_files(&pkgs);
+        }
+        phase("provided sources", ts);
+    }
+    if crate::preload::trace() {
+        eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
+    }
+    if boot {
+        phase("unit graph", t);
+    }
+    let t = Instant::now();
+    unitgraph::run_build_scripts(sess, &mut g, target_dir)?;
+    if boot {
+        phase(&format!("build scripts ({})", g.build_scripts.len()), t);
+        // the scripts that still run (as Relax programs) that the source is to lose (unitgraph::script_role)
+        let mut l = unitgraph::TO_REMOVE.lock().unwrap().clone();
+        if !l.is_empty() && !SILENT.load(Ordering::Relaxed) {
+            l.sort();
+            let names: Vec<String> = l.iter().map(|(p, src)| format!("{} ({})", p, src)).collect();
+            verbose!("relax-run: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
+        }
+    }
+    // every crate's cfg set (its env!() environment is set when it is loaded: `set_crate_env`)
+    let order = crate::crates::topo_order(&g.crates);
+    let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
+    for (ci, c) in g.crates.iter().enumerate() {
+        let mut cs = crate::cfg::CfgSet::host(sess, &c.features);
+        cs.set.push("relax".to_string());
+        for x in &g.cfgs[ci] {
+            cs.set.push(x.replace('"', ""));
+        }
+        cfgs.push(cs);
+    }
+    Ok(Resolved { units, g, order, cfgs, live_inputs })
+}
+
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     crate::clock::mark_process_start();
     jit::begin_startup_phase();
@@ -287,6 +391,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`relax run <pkg> --cfg hal`) or
     // before the package: extra cfgs for the program's crates, not cargo flags
     let mut cargo_flags_in: Vec<String> = Vec::new();
+    // `--domain <package>` (a test vehicle, any number): once the program has presented its first
+    // frame, start each of these packages as a domain of this process (domain.rs)
+    let mut domain_packages: Vec<String> = Vec::new();
     {
         let mut words = args[i..].iter().cloned();
         let mut in_prog = false;
@@ -294,6 +401,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             if in_prog || w == "--" {
                 in_prog = true;
                 cargo_flags_in.push(w);
+            } else if w == "--domain" {
+                match words.next() {
+                    Some(v) => domain_packages.push(v),
+                    None => {
+                        eprintln!("relax-run: --domain wants a package");
+                        return 2;
+                    }
+                }
             } else if w == "--cfg" {
                 match words.next() {
                     Some(v) => driver_options.cfgs.push(crate::options::Options::cfg_entry(&v)),
@@ -397,82 +512,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         verbose!("relax-run: package {} ({}), std {}", package, if cargo_flags.is_empty() { "default features".to_string() } else { cargo_flags.join(" ") }, std_dir);
     }
 
-    let mem_g = crate::memstat::tag(crate::memstat::Tag::Boot);
-    // ---- crate graph
-    let t = Instant::now();
-    // the resolver's graph in memory; a build script's child reads its units from JSON
-    let units = if units_json.is_empty() {
-        unitgraph::unit_graph(sess, &workspace, &package, &cargo_flags)
-    } else {
-        std::fs::read(&units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
-    };
-    let units = match units {
-        Ok(u) => u,
+    let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot) {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("relax-run: {}", e);
+            eprintln!("relax-run: {e}");
             return 1;
         }
     };
-    let t_load = Instant::now();
-    let mut g = match unitgraph::load(&units) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("relax-run: {}", e);
-            return 1;
-        }
-    };
-    // provided crates bind only to their own source (before substitution rewrites deps)
-    let ts = Instant::now();
-    let pkgs: Vec<crate::srchash::SrcPkg> = g
-        .crates
-        .iter()
-        .zip(g.pkg.iter())
-        .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
-        .collect();
-    let live_inputs = options.live.then(|| crate::reload::Inputs::collect(&g, &std_dir, &workspace));
-    // Validate native macros before any overlapping provided-crate identity error.
-    if let Err(e) = crate::crates::apply_substitutes(sess, &mut g.crates, &std_dir) {
-        eprintln!("relax-run: crate substitution: {}", e);
-        return 1;
-    }
-    {
-        // The loader's provided crates are host code built for the machine: their shims bind
-        // only where the program is read for the machine too. A program read for another target
-        // (RELAX_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
-        // makepad-windows-sys on Windows) and only type-checks: it never runs the crates' code,
-        // so nothing binds and every provided crate is read from source.
-        let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine {
-            if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
-                eprintln!("relax-run: {}", e);
-                return 1;
-            }
-        } else {
-            crate::provided::read_identity_files(&pkgs);
-        }
-    }
-    phase("provided sources", ts);
-    if crate::preload::trace() {
-        eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
-    }
-    phase("unit graph", t);
-    let t = Instant::now();
-    if let Err(e) = unitgraph::run_build_scripts(sess, &mut g, &target_dir) {
-        eprintln!("relax-run: {}", e);
-        return 1;
-    }
-    phase(&format!("build scripts ({})", g.build_scripts.len()), t);
-    {
-        // the scripts that still run (as Relax programs) that the source is to lose (unitgraph::script_role)
-        let mut l = unitgraph::TO_REMOVE.lock().unwrap().clone();
-        if !l.is_empty() && !SILENT.load(Ordering::Relaxed) {
-            l.sort();
-            let names: Vec<String> = l.iter().map(|(p, src)| format!("{} ({})", p, src)).collect();
-            verbose!("relax-run: build scripts to remove ({}; only makepad-platform keeps one): {}", l.len(), names.join(", "));
-        }
-    }
-
-    drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::Load);
     // fn bodies a later parse can do alone are parsed on their first need (a warm run needs
     // few: their code comes from the disk cache); --check reads every body. RELAX_LAZY_BODIES=0: off
@@ -486,15 +532,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if sess.runtime.parse_verify { let _ = crate::preload::VERIFY.set(crate::front::verify_file); }
     // every crate's cfg set and env!() environment, then all of them scanned and parsed ahead
     // (preload.rs) while the loop below collects them in order
-    let order = crate::crates::topo_order(&g.crates);
-    let mut cfgs: Vec<crate::cfg::CfgSet> = Vec::with_capacity(g.crates.len());
     for (ci, c) in g.crates.iter().enumerate() {
-        let mut cs = crate::cfg::CfgSet::host(sess, &c.features);
-        cs.set.push("relax".to_string());
-        for x in &g.cfgs[ci] {
-            cs.set.push(x.replace('"', ""));
-        }
-        cfgs.push(cs);
         crate::crates::set_crate_env(&c.name, g.env[ci].clone());
     }
     let mut pre = crate::std_pre_crates(sess);
@@ -731,6 +769,15 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if load_errors > 0 && !watch {
         return 1;
     }
+    {
+        // what the unit holds, by identity: a domain started later shares these crates (domain.rs)
+        let idents = crate::domain::identities(&g, &cfgs, &order);
+        for &ci in &order {
+            if crate_of[ci] != u32::MAX {
+                crate::domain::record_loaded(idents[ci], crate_of[ci], &g.crates[ci], &cfgs[ci]);
+            }
+        }
+    }
     let root = crate_of[g.root];
     if root == u32::MAX {
         eprintln!("relax-run: the package root did not load");
@@ -920,25 +967,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
     // ---- the libraries the build scripts link (#[link] blocks load on the first miss)
     let t = Instant::now();
-    let mut missing = Vec::new();
-    for (name, fw) in &g.link_libs {
-        if !crate::os::proc::load_library(name, *fw) && (*fw || !crate::os::proc::load_library_versioned(name)) {
-            missing.push(name.clone());
-        }
-    }
-    // what the system linker would have linked: every library an active extern block names
-    // with #[link] (frameworks register their Objective-C classes and protocols on load, and
-    // the program looks those up by name at run time)
-    let mut n_link = g.link_libs.len();
-    for (name, fw) in link_attr_libs(&prog) {
-        if g.link_libs.iter().any(|l| l.0 == name && l.1 == fw) {
-            continue;
-        }
-        n_link += 1;
-        if !crate::os::proc::load_library(&name, fw) && (fw || !crate::os::proc::load_library_versioned(&name)) {
-            missing.push(name);
-        }
-    }
+    let (n_link, missing) = link_libraries(&prog, &g.link_libs, 0);
     phase(&format!("link libraries ({})", n_link), t);
     // a library that is not there only matters when one of its symbols is used: that miss is
     // reported where it happens (the #[link] block's lazy load); here only with --verbose
@@ -1035,6 +1064,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     };
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
+    crate::domain::register_boot(&package, u.syms.dom0());
     start_exit_summary();
     *RUN_DIAGNOSTICS.lock().unwrap() = Some(u.tcx.dcx.clone());
     unsafe { atexit(at_exit) };
@@ -1209,36 +1239,18 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 0;
     }
     let main_def = main_def.expect("a run without --exports has main");
-    // `fn main() -> T` (T != ()): rustc's lang_start runs `main().report()` (Termination) and exits
-    // with its code; std::process::__relax_lang_start::<T>(main) does the same.
-    // (a `#[no_main]` crate's `extern "C" fn main(argc, argv) -> c_int` is called as before)
-    let main_ret = u.tcx.fn_sig(&u.prog, main_def).filter(|s| !s.header.abi.is_c_like()).map(|s| s.ret);
-    let r = match main_ret {
-        Some(ret) if ret != u.tcx.tys.unit => {
-            let start = (0..u.prog.defs.len() as u32)
-                .map(DefId)
-                // std::process re-exports its OS half (`pub use imp::*`: process_unix.rs /
-                // process_windows.rs), so the fn's own path is std::process::imp::...
-                .find(|d| {
-                    u.prog.def(*d).kind == DefKind::Fn
-                        && matches!(u.prog.def_path(*d).as_str(), "std::process::__relax_lang_start" | "std::process::imp::__relax_lang_start")
-                });
-            match start {
-                Some(sd) => {
-                    let sid = u.fn_id(FnKey::Inst(sd, vec![ret]));
-                    let sentry = u.entry(sid);
-                    unsafe { jit::call_jit(up, sentry, entry) }
-                }
-                None => {
-                    eprintln!("relax-run: `fn main` returns a value but std has no process::__relax_lang_start");
-                    // Workers already hold this unit's pointer. Its Drop waits
-                    // for the front end and O3; process shutdown owns it now.
-                    std::mem::forget(u);
-                    return 1;
-                }
-            }
+    if !domain_packages.is_empty() {
+        crate::domain::run_vehicle(up, domain_packages);
+    }
+    let r = match main_call(&mut u, main_def, entry) {
+        Ok((target, arg)) => unsafe { jit::call_jit(up, target, arg) },
+        Err(e) => {
+            eprintln!("relax-run: {e}");
+            // Workers already hold this unit's pointer. Its Drop waits
+            // for the front end and O3; process shutdown owns it now.
+            std::mem::forget(u);
+            return 1;
         }
-        _ => unsafe { jit::call_jit(up, entry, 0) },
     };
     let code = match r {
         Ok(_) => 0,
@@ -1310,11 +1322,37 @@ fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<V
     Ok(out)
 }
 
+/// Loads the libraries the build scripts link and the ones `#[link]` blocks of files from
+/// `first_file` on name: (how many, the ones not found).
+pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], first_file: usize) -> (usize, Vec<String>) {
+    let mut missing = Vec::new();
+    for (name, fw) in link_libs {
+        if !crate::os::proc::load_library(name, *fw) && (*fw || !crate::os::proc::load_library_versioned(name)) {
+            missing.push(name.clone());
+        }
+    }
+    // what the system linker would have linked: every library an active extern block names
+    // with #[link] (frameworks register their Objective-C classes and protocols on load, and
+    // the program looks those up by name at run time)
+    let mut n_link = link_libs.len();
+    for (name, fw) in link_attr_libs(prog, first_file) {
+        if link_libs.iter().any(|l| l.0 == name && l.1 == fw) {
+            continue;
+        }
+        n_link += 1;
+        if !crate::os::proc::load_library(&name, fw) && (fw || !crate::os::proc::load_library_versioned(&name)) {
+            missing.push(name);
+        }
+    }
+    (n_link, missing)
+}
+
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
-/// are active (got definitions), or an empty link-only block without a cfg.
-fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
+/// are active (got definitions), or an empty link-only block without a cfg; files from
+/// `first_file` on.
+pub(crate) fn link_attr_libs(prog: &crate::program::Program, first_file: usize) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
-    for (fi, f) in prog.files.iter().enumerate() {
+    for (fi, f) in prog.files.iter().enumerate().skip(first_file) {
         let Some(cfg) = prog.file_crate.get(fi).and_then(|&k| prog.crates.get(k as usize)).map(|c| &c.cfg) else { continue };
         let src = f.src_view();
         // Every item of the file's arena, as before: it also holds the items of macro expansions
@@ -1381,7 +1419,35 @@ fn link_attr_libs(prog: &crate::program::Program) -> Vec<(String, bool)> {
 /// `main` as rustc's resolver finds it (rustc_resolve lib.rs: `main` resolved in the crate root's
 /// value namespace, imports and globs included -- `pub use app::*;` brings it in), then entry.rs:
 /// it must be a fn.
-fn find_main(prog: &crate::program::Program, root: u32) -> Option<DefId> {
+/// What to call to run `main` (whose lazy stub is `entry`): (target, argument) for `call_jit`.
+/// `fn main() -> T` (T != ()): rustc's lang_start runs `main().report()` (Termination) and exits
+/// with its code; std::process::__relax_lang_start::<T>(main) does the same.
+/// (a `#[no_main]` crate's `extern "C" fn main(argc, argv) -> c_int` is called as before)
+pub(crate) fn main_call(u: &mut Unit, main_def: DefId, entry: u64) -> Result<(u64, u64), String> {
+    let main_ret = u.tcx.fn_sig(&u.prog, main_def).filter(|s| !s.header.abi.is_c_like()).map(|s| s.ret);
+    match main_ret {
+        Some(ret) if ret != u.tcx.tys.unit => {
+            let start = (0..u.prog.defs.len() as u32)
+                .map(DefId)
+                // std::process re-exports its OS half (`pub use imp::*`: process_unix.rs /
+                // process_windows.rs), so the fn's own path is std::process::imp::...
+                .find(|d| {
+                    u.prog.def(*d).kind == DefKind::Fn
+                        && matches!(u.prog.def_path(*d).as_str(), "std::process::__relax_lang_start" | "std::process::imp::__relax_lang_start")
+                });
+            match start {
+                Some(sd) => {
+                    let sid = u.fn_id(FnKey::Inst(sd, vec![ret]));
+                    Ok((u.entry(sid), entry))
+                }
+                None => Err("`fn main` returns a value but std has no process::__relax_lang_start".to_string()),
+            }
+        }
+        _ => Ok((entry, 0)),
+    }
+}
+
+pub(crate) fn find_main(prog: &crate::program::Program, root: u32) -> Option<DefId> {
     let sym = prog.syms.get("main")?;
     let m = prog.crates[root as usize].root_mod;
     let d = prog.lookup_in_module(m, sym, false, &mut Vec::new())?;

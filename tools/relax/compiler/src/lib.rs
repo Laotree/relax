@@ -740,7 +740,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
 /// M2: loads every crate of the unit graph with Relax's core/std and resolves all imports.
 fn cmd_resolve(sess: &std::sync::Arc<crate::Session>, units_path: &str) {
     let crates = match crates::load_units(units_path).and_then(|mut c| {
-        crates::apply_substitutes(sess, &mut c, &std_dir())?;
+        crates::apply_substitutes(sess, &mut c, &std_dir(), false)?;
         Ok(c)
     }) {
         Ok(c) => c,

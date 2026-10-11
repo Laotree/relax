@@ -1558,7 +1558,8 @@ thread_local! {
 }
 
 static PROGRAM_ARGS: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
-static ARGV: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+/// (argc, argv) built for each domain that asked, by block base (the process's own: dom0's)
+static ARGV: std::sync::Mutex<Vec<(u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
 /// Sets the program's argv (argv[0] first) before it starts; default: this process's args.
 pub fn set_program_args(args: Vec<Vec<u8>>) {
@@ -1576,21 +1577,31 @@ pub struct ArgsRet {
 rt_fn! {
 /// (argc, argv) as C sees them, built once (the strings and the array live forever).
 fn rt_args() -> ArgsRet {
-    let (argc, argv) = *ARGV.get_or_init(|| {
-        let mut v = PROGRAM_ARGS.lock().map(|a| a.clone()).unwrap_or_default();
-        if v.is_empty() {
-            v = os::proc::args_bytes();
+    // a domain started by `domain::start` has its own argv; any other thread the process's
+    let base = crate::domain::current();
+    let own = crate::domain::args_of(base);
+    let key = if own.is_some() { base } else { 0 };
+    let mut tab = ARGV.lock().unwrap_or_else(|e| e.into_inner());
+    let (argc, argv) = match tab.iter().find(|x| x.0 == key) {
+        Some(x) => (x.1, x.2),
+        None => {
+            let mut v = own.unwrap_or_else(|| PROGRAM_ARGS.lock().map(|a| a.clone()).unwrap_or_default());
+            if v.is_empty() {
+                v = os::proc::args_bytes();
+            }
+            let mut ptrs: Vec<*const u8> = Vec::new();
+            for a in &v {
+                let mut b = a.clone();
+                b.push(0);
+                ptrs.push(Box::leak(b.into_boxed_slice()).as_ptr());
+            }
+            let n = ptrs.len();
+            ptrs.push(std::ptr::null());
+            let argv = Box::leak(ptrs.into_boxed_slice()).as_ptr() as usize;
+            tab.push((key, n, argv));
+            (n, argv)
         }
-        let mut ptrs: Vec<*const u8> = Vec::new();
-        for a in &v {
-            let mut b = a.clone();
-            b.push(0);
-            ptrs.push(Box::leak(b.into_boxed_slice()).as_ptr());
-        }
-        let n = ptrs.len();
-        ptrs.push(std::ptr::null());
-        (n, Box::leak(ptrs.into_boxed_slice()).as_ptr() as usize)
-    });
+    };
     ArgsRet { argc: argc as u64, argv: argv as u64 }
 }
 }
@@ -10458,6 +10469,7 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
 }
 
 extern "C" fn relax_first_present() {
+    crate::domain::first_present();
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
         crate::solver_work::report();

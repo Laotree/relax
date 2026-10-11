@@ -225,6 +225,480 @@ pub fn blocks() -> Vec<u64> {
     BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Apps as domains: load an app's crate graph into the running unit, run its main in a domain.
+// ---------------------------------------------------------------------------------------------
+
+/// A domain's id (the host's session id when a host names it: `AppSpec::id`). 0 is the app
+/// `relax run` booted.
+pub type DomainId = u32;
+
+/// Where a domain is.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DomainState {
+    /// loading: the phase it is in
+    Compiling(String),
+    Running,
+    /// main panicked (or faulted): the message
+    Crashed(String),
+    /// main returned (the exit code of `fn main() -> ExitCode`)
+    Exited(i32),
+    /// `stop` marked it
+    Stopped,
+}
+
+/// The app to start as a domain.
+#[derive(Clone, Debug, Default)]
+pub struct AppSpec {
+    /// the cargo package (as `relax run <package>`)
+    pub package: String,
+    /// cargo flags (features, ...) as `relax run <package> <flags>`
+    pub cargo_flags: Vec<String>,
+    /// the app's arguments
+    pub args: Vec<String>,
+    /// the domain this one is embedded in
+    pub parent: Option<DomainId>,
+    /// the id the host allocated (its session id); None: the next free one
+    pub id: Option<DomainId>,
+}
+
+/// One domain, as `list` / `state` report it.
+#[derive(Clone, Debug)]
+pub struct DomainInfo {
+    pub id: DomainId,
+    pub package: String,
+    pub parent: Option<DomainId>,
+    pub state: DomainState,
+    /// the base of its static block
+    pub base: u64,
+    /// crates of its package graph / shared with the unit already / loaded for it
+    pub crates: usize,
+    pub reused: usize,
+    pub loaded: usize,
+    /// the crates loaded for it
+    pub new_crates: Vec<String>,
+    /// ms from the call of `start` to main being called, split: package graph + build scripts,
+    /// loading the new crates, the rest (find main, block, thread)
+    pub resolve_ms: f64,
+    pub load_ms: f64,
+    pub spawn_ms: f64,
+    /// ms from `start` to the domain's first frame (None: not yet)
+    pub first_frame_ms: Option<f64>,
+}
+
+struct Domain {
+    info: DomainInfo,
+    started: std::time::Instant,
+    /// the app's argv (argv[0] first); empty: the process's (domain 0)
+    args: Vec<Vec<u8>>,
+}
+
+/// The argv of the domain whose block is at `base` (None: the process's own).
+pub(crate) fn args_of(base: u64) -> Option<Vec<Vec<u8>>> {
+    domains().iter().find(|d| d.info.base == base && !d.args.is_empty()).map(|d| d.args.clone())
+}
+
+static DOMAINS: Mutex<Vec<Domain>> = Mutex::new(Vec::new());
+static CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+type Observer = Box<dyn Fn(DomainId, &DomainState) + Send + Sync>;
+static OBSERVER: Mutex<Option<Observer>> = Mutex::new(None);
+
+fn domains() -> std::sync::MutexGuard<'static, Vec<Domain>> {
+    DOMAINS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The host's callback for state changes (compiling phases, running, crashed, exited).
+pub fn set_observer(f: impl Fn(DomainId, &DomainState) + Send + Sync + 'static) {
+    *OBSERVER.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
+}
+
+fn set_state(id: DomainId, st: DomainState) {
+    {
+        let mut d = domains();
+        if let Some(x) = d.iter_mut().find(|x| x.info.id == id) {
+            x.info.state = st.clone();
+        }
+    }
+    CHANGED.notify_all();
+    if let Some(f) = OBSERVER.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        f(id, &st);
+    }
+}
+
+/// `relax run` booted `package` in the unit's own domain: domain 0.
+pub(crate) fn register_boot(package: &str, base: u64) {
+    domains().push(Domain {
+        info: DomainInfo { id: 0, package: package.to_string(), parent: None, state: DomainState::Running, base, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None },
+        started: std::time::Instant::now(),
+        args: Vec::new(),
+    });
+}
+
+/// The domain running on the calling thread presented its first frame (jit.rs `relax_first_present`).
+pub(crate) fn first_present() {
+    let base = current();
+    {
+        let mut d = domains();
+        if let Some(x) = d.iter_mut().find(|x| x.info.base == base && x.info.first_frame_ms.is_none()) {
+            x.info.first_frame_ms = Some(x.started.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    CHANGED.notify_all();
+}
+
+pub fn list() -> Vec<DomainInfo> {
+    domains().iter().map(|d| d.info.clone()).collect()
+}
+
+pub fn state(id: DomainId) -> Option<DomainState> {
+    domains().iter().find(|d| d.info.id == id).map(|d| d.info.state.clone())
+}
+
+pub fn info(id: DomainId) -> Option<DomainInfo> {
+    domains().iter().find(|d| d.info.id == id).map(|d| d.info.clone())
+}
+
+/// Waits (up to `timeout`) until domain `id` presented its first frame, or ended: its first frame
+/// time in ms since `start`.
+pub fn wait_first_frame(id: DomainId, timeout: std::time::Duration) -> Option<f64> {
+    let end = std::time::Instant::now() + timeout;
+    let mut d = domains();
+    loop {
+        match d.iter().find(|x| x.info.id == id) {
+            Some(x) if x.info.first_frame_ms.is_some() => return x.info.first_frame_ms,
+            Some(x) if matches!(x.info.state, DomainState::Crashed(_) | DomainState::Exited(_) | DomainState::Stopped) => return None,
+            None => return None,
+            _ => {}
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return None;
+        }
+        d = CHANGED.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// How a domain is to end.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stop {
+    /// through the app's own exit path (the host's window close): not Relax's to do
+    Quit,
+    /// now
+    Kill,
+}
+
+/// Marks the domain stopped. What Relax can do: the state change and the observer's event. What it
+/// cannot (HAL's: the domain's threads are parked or told to exit, its windows and GPU session
+/// freed, then `destroy(base)`): a running domain's threads keep running, its block stays, and
+/// an app that calls `process::exit` ends the whole process.
+pub fn stop(id: DomainId, how: Stop) -> Result<(), String> {
+    if id == 0 {
+        return Err("domain 0 is the process's own app".to_string());
+    }
+    if how == Stop::Quit {
+        return Err("quit is the app's own exit path (the host closes its window)".to_string());
+    }
+    if state(id).is_none() {
+        return Err(format!("no domain {id}"));
+    }
+    set_state(id, DomainState::Stopped);
+    Ok(())
+}
+
+// ---- crate identity
+
+/// Crates of the unit by identity: what loaded them (the boot, a domain start) recorded.
+static LOADED: Mutex<Vec<(u64, u32, String, Vec<String>, String)>> = Mutex::new(Vec::new());
+
+/// What makes two crates of two package graphs the same compiled crate: name, source file, edition,
+/// cfg set (features and the build script's cfgs), the env!() environment (build script output
+/// included), the proc-macro flag, and, by extern name, the identities of its dependencies.
+/// Per crate of `g`, in `order` (every crate after its dependencies).
+pub(crate) fn identities(g: &crate::unitgraph::Graph, cfgs: &[crate::cfg::CfgSet], order: &[usize]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut out = vec![0u64; g.crates.len()];
+    for &ci in order {
+        let c = &g.crates[ci];
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&c.name, &c.src_path, c.edition, c.proc_macro).hash(&mut h);
+        let mut set = cfgs[ci].set.clone();
+        set.sort();
+        set.hash(&mut h);
+        let mut env = g.env[ci].clone();
+        env.sort();
+        env.hash(&mut h);
+        for (d, ext) in &c.deps {
+            (ext, out.get(*d).copied().unwrap_or(0)).hash(&mut h);
+        }
+        out[ci] = h.finish();
+    }
+    out
+}
+
+pub(crate) fn record_loaded(ident: u64, krate: u32, c: &crate::crates::CrateUnit, cfg: &crate::cfg::CfgSet) {
+    let mut set = cfg.set.clone();
+    set.sort();
+    LOADED.lock().unwrap_or_else(|e| e.into_inner()).push((ident, krate, c.name.clone(), set, c.src_path.clone()));
+}
+
+/// Why a crate of the app's graph is loaded again when the unit has one of its name: the cfg
+/// entries (features) that differ, a different source, or else a dependency (or env) that does.
+fn namesake_diff(c: &crate::crates::CrateUnit, cfg: &crate::cfg::CfgSet) -> Option<String> {
+    let mut set = cfg.set.clone();
+    set.sort();
+    let l = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    let other = l.iter().rev().find(|x| x.2 == c.name)?;
+    if other.4 != c.src_path {
+        return Some(format!("{}: source {} vs {}", c.name, c.src_path, other.4));
+    }
+    let plus: Vec<&String> = set.iter().filter(|x| !other.3.contains(x)).collect();
+    let minus: Vec<&String> = other.3.iter().filter(|x| !set.contains(x)).collect();
+    if plus.is_empty() && minus.is_empty() {
+        return Some(format!("{}: same cfg, a dependency or its env differs", c.name));
+    }
+    let f = |v: Vec<&String>| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(" ");
+    Some(format!("{}: cfg +[{}] -[{}]", c.name, f(plus), f(minus)))
+}
+
+fn lookup_loaded(ident: u64) -> Option<u32> {
+    LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == ident).map(|x| x.1)
+}
+
+// ---- measurements
+
+/// (resident set, proportional set) of the process in KB (0 where /proc has none).
+pub fn process_memory_kb() -> (u64, u64) {
+    let rss = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
+        .map_or(0, |pages| pages * 4);
+    let pss = std::fs::read_to_string("/proc/self/smaps_rollup")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok())))
+        .unwrap_or(0);
+    (rss, pss)
+}
+
+/// Bytes of the block at `base` that are resident (Linux: mincore).
+pub fn block_committed(base: u64) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        extern "C" {
+            fn mincore(addr: *mut u8, len: usize, vec: *mut u8) -> i32;
+        }
+        let mut v = vec![0u8; BLOCK_SIZE / 4096];
+        if unsafe { mincore(base as *mut u8, BLOCK_SIZE, v.as_mut_ptr()) } == 0 {
+            return v.iter().filter(|b| **b & 1 != 0).count() as u64 * 4096;
+        }
+    }
+    let _ = base;
+    0
+}
+
+// ---- start
+
+fn fail<T>(id: DomainId, e: Vec<String>) -> Result<T, Vec<String>> {
+    set_state(id, DomainState::Crashed(e.first().cloned().unwrap_or_default()));
+    Err(e)
+}
+
+/// Starts an app as a domain of the running unit `up` (the `relax run` unit, or any unit that
+/// was set up as one): resolves its package with the code `relax run` uses, loads the crates the
+/// unit does not have yet (a crate is shared when its identity matches: `identities`), makes the
+/// domain's static block, and runs the app's `main` on a thread of its own in that domain.
+/// Returns once main is called; progress and the end are reported through `state` / the observer.
+/// Host-native and privileged: only the host calls it.
+pub fn start(up: *mut Unit, spec: AppSpec) -> Result<DomainId, Vec<String>> {
+    let t0 = std::time::Instant::now();
+    let id = {
+        let mut d = domains();
+        let id = spec.id.unwrap_or_else(|| d.iter().map(|x| x.info.id + 1).max().unwrap_or(1));
+        if d.iter().any(|x| x.info.id == id) {
+            return Err(vec![format!("domain {id} exists")]);
+        }
+        d.push(Domain {
+            info: DomainInfo { id, package: spec.package.clone(), parent: spec.parent, state: DomainState::Compiling("package graph".into()), base: 0, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None },
+            started: t0,
+            args: std::iter::once(spec.package.clone().into_bytes()).chain(spec.args.iter().map(|a| a.clone().into_bytes())).collect(),
+        });
+        id
+    };
+    set_state(id, DomainState::Compiling("package graph".into()));
+    let sess = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    let workspace = crate::run::workspace_dir();
+    let target_dir = crate::dirs::relax_dir().display().to_string();
+    let std_dir = crate::std_dir();
+    let resolved = match crate::run::resolve_package(&sess, &workspace, &spec.package, &spec.cargo_flags, "", &target_dir, &std_dir, crate::run::ResolveFor::Domain) {
+        Ok(r) => r,
+        Err(e) => return fail(id, vec![e]),
+    };
+    let resolve_ms = t0.elapsed().as_secs_f64() * 1e3;
+    set_state(id, DomainState::Compiling("loading crates".into()));
+    let crate::run::Resolved { g, order, cfgs, .. } = resolved;
+    let idents = identities(&g, &cfgs, &order);
+    let t1 = std::time::Instant::now();
+    let upn = up as usize;
+    // the owner thread: the program's tables change there
+    let loaded = crate::owner::call(crate::owner::Class::App, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents) });
+    let (root, n_reused, new_names, first_file) = match loaded {
+        Ok(x) => x,
+        Err(e) => return fail(id, e),
+    };
+    let load_ms = t1.elapsed().as_secs_f64() * 1e3;
+    set_state(id, DomainState::Compiling("main".into()));
+    let t2 = std::time::Instant::now();
+    // the libraries the new crates link
+    let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, first_file);
+    if !missing.is_empty() && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("relax-domain: libraries not found: {:?}", missing);
+    }
+    // the macro world only the load needed goes again (hot reload and later loads rebuild it)
+    if crate::pmhost::free_world() {
+        std::thread::spawn(crate::memstat::trim);
+    }
+    let prepared = crate::owner::call(crate::owner::Class::App, || unsafe {
+        let u = &mut *(upn as *mut Unit);
+        let main_def = crate::run::find_main(&u.prog, root).ok_or_else(|| format!("no `fn main` at the root of {}", spec.package))?;
+        let fid = u.fn_id(crate::jit::FnKey::Inst(main_def, Vec::new()));
+        let entry = u.entry(fid);
+        let (target, arg) = crate::run::main_call(u, main_def, entry)?;
+        Ok::<_, String>((target, arg, create(u)))
+    });
+    let (target, arg, base) = match prepared {
+        Ok(x) => x,
+        Err(e) => return fail(id, vec![e]),
+    };
+    {
+        let mut d = domains();
+        if let Some(x) = d.iter_mut().find(|x| x.info.id == id) {
+            x.info.base = base;
+            x.info.crates = g.crates.len();
+            x.info.reused = n_reused;
+            x.info.loaded = new_names.len();
+            x.info.new_crates = new_names;
+            x.info.resolve_ms = resolve_ms;
+            x.info.load_ms = load_ms;
+            x.info.spawn_ms = t2.elapsed().as_secs_f64() * 1e3;
+        }
+    }
+    let name = format!("domain-{id}-{}", spec.package);
+    let spawned = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || {
+        let up = upn as *mut Unit;
+        set_state(id, DomainState::Running);
+        match unsafe { crate::jit::call_jit_in(up, base, target, arg) } {
+            Ok(_) => set_state(id, DomainState::Exited(0)),
+            Err(p) => set_state(id, DomainState::Crashed(format!("{}: {}", p.kind, p.message))),
+        }
+    });
+    if let Err(e) = spawned {
+        destroy(base);
+        return fail(id, vec![format!("starting the domain's thread: {e}")]);
+    }
+    Ok(id)
+}
+
+/// On the owner thread: gets the crates of `g` into the program (shared ones are reused) and
+/// returns (root crate, crates reused, names of the crates loaded, first file index of the load).
+unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64]) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
+    use crate::modules::{Dep, NewCrate};
+    let u = &mut *up;
+    let std_count = crate::std_pre_crates(&u.prog.session.clone()).len();
+    let std_deps: Vec<(String, Dep)> = (0..std_count).map(|k| (u.prog.syms.str(u.prog.crates[k].name).to_string(), Dep::Existing(k as u32))).collect();
+    let mut crate_of = vec![u32::MAX; g.crates.len()];
+    let mut batch_of = vec![usize::MAX; g.crates.len()];
+    let mut batch: Vec<NewCrate> = Vec::new();
+    let mut batch_ci: Vec<usize> = Vec::new();
+    let mut reused = 0;
+    let mut why_new: Vec<String> = Vec::new();
+    for &ci in order {
+        if let Some(k) = lookup_loaded(idents[ci]) {
+            crate_of[ci] = k;
+            reused += 1;
+            continue;
+        }
+        let c = &g.crates[ci];
+        why_new.push(namesake_diff(c, &cfgs[ci]).unwrap_or_else(|| c.name.clone()));
+        let mut deps = std_deps.clone();
+        for (d, ext) in &c.deps {
+            if crate_of[*d] != u32::MAX {
+                deps.push((ext.clone(), Dep::Existing(crate_of[*d])));
+            } else if batch_of[*d] != usize::MAX {
+                deps.push((ext.clone(), Dep::New(batch_of[*d])));
+            }
+        }
+        batch_of[ci] = batch.len();
+        batch_ci.push(ci);
+        batch.push(NewCrate { name: c.name.clone(), path: c.src_path.clone(), edition: c.edition, cfg: cfgs[ci].clone(), deps, proc_macro: c.proc_macro });
+        // (env!() looks a crate up by name: a second crate of a name replaces the first one's
+        // environment, which differs here by definition of a new identity)
+        crate::crates::set_crate_env(&c.name, g.env[ci].clone());
+    }
+    let first_file = u.prog.files.len();
+    if !batch.is_empty() {
+        let added = crate::modules::add_crates(up, &batch, true)?;
+        // As for a boot: unresolved imports and signature errors are reported, the load goes on
+        // (only a crate that does not parse is refused).
+        if !added.errs.is_empty() {
+            let max: usize = std::env::var("RELAX_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            eprintln!("relax-domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
+            for e in added.errs.iter().take(max) {
+                eprintln!("  {}", e);
+            }
+        }
+        for (b, &ci) in batch_ci.iter().enumerate() {
+            crate_of[ci] = added.crates[b];
+            record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
+        }
+    }
+    let root = crate_of[g.root];
+    if root == u32::MAX {
+        return Err(vec![format!("the package root {} did not load", g.crates[g.root].name)]);
+    }
+    Ok((root, reused, why_new, first_file))
+}
+
+// ---- the test vehicle: `relax run <package> --domain <package2> ..`
+
+/// Starts each of `packages` as a domain, one after the other, once domain 0 presented its first
+/// frame (or after 3 minutes), and reports on stderr for each: the crates shared and loaded, the
+/// time to its first frame, the process's memory before the start, at its first frame and 10 s
+/// later, and what its static block holds.
+pub(crate) fn run_vehicle(up: *mut Unit, packages: Vec<String>) {
+    let upn = up as usize;
+    let _ = std::thread::Builder::new().name("relax-domains".to_string()).spawn(move || {
+        let up = upn as *mut Unit;
+        let wait = std::time::Duration::from_secs(180);
+        let ff0 = wait_first_frame(0, wait);
+        let (rss, pss) = process_memory_kb();
+        eprintln!("relax-domain: id=0 first_frame_ms={} rss_kb={} pss_kb={}", ff0.map_or("none".to_string(), |x| format!("{x:.0}")), rss, pss);
+        for pkg in packages {
+            let (rss0, pss0) = process_memory_kb();
+            let t = std::time::Instant::now();
+            let id = match start(up, AppSpec { package: pkg.clone(), ..Default::default() }) {
+                Ok(id) => id,
+                Err(e) => {
+                    eprintln!("relax-domain: {pkg}: start failed: {}", e.join(" | "));
+                    continue;
+                }
+            };
+            let started_ms = t.elapsed().as_secs_f64() * 1e3;
+            let ff = wait_first_frame(id, wait);
+            let (rss1, pss1) = process_memory_kb();
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            let (rss2, pss2) = process_memory_kb();
+            let i = info(id).unwrap();
+            eprintln!(
+                "relax-domain: id={id} pkg={pkg} state={:?} crates={} reused={} new={} start_call_ms={started_ms:.0} resolve_ms={:.0} load_ms={:.0} spawn_ms={:.0} first_frame_ms={} block_committed_kb={} new_crates=[{}] rss_kb={rss0}/{rss1}/{rss2} pss_kb={pss0}/{pss1}/{pss2}",
+                i.state, i.crates, i.reused, i.loaded, i.resolve_ms, i.load_ms, i.spawn_ms,
+                ff.map_or("none".to_string(), |x| format!("{x:.0}")), block_committed(i.base) / 1024, i.new_crates.join(",")
+            );
+        }
+        for d in list() {
+            eprintln!("relax-domain: list id={} pkg={} state={:?} first_frame_ms={:?}", d.id, d.package, d.state, d.first_frame_ms.map(|x| x.round()));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

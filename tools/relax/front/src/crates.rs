@@ -23,12 +23,13 @@ pub struct CrateUnit {
 /// Crates Relax provides itself (std/substitutes.txt: `<name> <version prefix> <root>`):
 /// a unit of that crate at a matching version loads the provided root instead of its sources
 /// (same name; deps become core/alloc/std only; features ignored). The rustc build keeps the
-/// real crates. Also hands the graph to the proc-macro host (macro_reg::register_and_strip).
-pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str) -> Result<(), String> {
+/// real crates. Also hands the graph to the proc-macro host (macro_reg::register_and_strip);
+/// `additive`: the graph of a program started into a running one joins the registered graph.
+pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [CrateUnit], std_dir: &str, additive: bool) -> Result<(), String> {
     let table = match crate::vfs::read_to_string(format!("{}/substitutes.txt", std_dir)) {
         Ok(t) => t,
         Err(_) => {
-            crate::macro_reg::register_and_strip(sess, units, std_dir)?;
+            crate::macro_reg::register_and_strip(sess, units, std_dir, additive)?;
             return Ok(());
         }
     };
@@ -57,7 +58,7 @@ pub fn apply_substitutes(sess: &std::sync::Arc<crate::Session>, units: &mut [Cra
         }
     }
     // proc-macro crates run in the JIT proc-macro host; the app graph sees them empty
-    crate::macro_reg::register_and_strip(sess, units, std_dir)?;
+    crate::macro_reg::register_and_strip(sess, units, std_dir, additive)?;
     Ok(())
 }
 
