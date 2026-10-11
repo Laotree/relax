@@ -279,7 +279,7 @@ extern crate makepad_tween_script;
 extern crate relax_provided_fixture;
 
 fn provided() {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     const CRATES: [&str; 10] = [
         "relax_provided_fixture",
         "makepad_live_id",
