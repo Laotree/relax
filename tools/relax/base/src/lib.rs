@@ -23,6 +23,7 @@ pub mod inflate;
 pub mod git;
 pub mod gitstore;
 pub mod vfs;
+pub mod packsrc;
 pub mod progress;
 pub mod dirs;
 pub use relax_lex::tokens as pm_tokens;

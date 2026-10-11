@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `relax` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "fetch", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
+    "run", "fetch", "pack-src", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
     "parse", "resolve", "file", "std-surface", "relax-lex", "hub", "remote-relay", "remote", "help",
 ];
 
@@ -119,7 +119,9 @@ fn main_page(st: &Style) -> String {
     p.section("Commands:");
     p.row("run <package>", "Run an app from this workspace");
     p.row("run <git-url> <package>", "Run an app straight from a git repository");
+    p.row("run --src <store> <package>", "Run an app from a packed source archive (no checkout)");
     p.row("fetch <git-url>", "Fetch a repository into the local store");
+    p.row("pack-src <out> <package>...", "Pack the sources a run of these packages reads into one store");
     p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
     p.row("hub | remote-relay | remote", "Reach apps on other machines (see relax help inspect)");
     p.row("check <package>", "Type- and borrow-check without running");
@@ -170,6 +172,26 @@ fn run_page(st: &Style) -> String {
     p.text("target/relax (like cargo). A git run has no checkout and keeps them in");
     p.text("$RELAX_HOME/target/<hash>. Repositories are one store file each in");
     p.text("$RELAX_HOME/relax_cache (default ~/.relax).");
+    p.out
+}
+
+fn pack_src_page(st: &Style) -> String {
+    let mut p = Page::new(st, 36);
+    title(&mut p, "pack the sources of apps into one store");
+    p.blank();
+    p.usage("relax pack-src [--target <triple>] <out.store> <package> [flags] [<package> [flags]]...");
+    p.blank();
+    p.text("Runs `relax check` of each package cold, records every file the front end");
+    p.text("reads (the crate graph and cfg of --target, build scripts included), adds the");
+    p.text("resources/ folders of the crates it read sources of and Relax's std tree, and");
+    p.text("writes ONE synthetic commit into a one-file git store: git blob ids, sorted");
+    p.text("trees, a fixed author, date and message, objects in id order, a fixed deflate");
+    p.text("level, so the same files give the same bytes. `relax run --src <out.store>");
+    p.text("<package>` runs from it with no checkout; the store may also sit inside a");
+    p.text("bigger file: --src <file>@<offset>+<len> (an APK asset).");
+    p.section("Options:");
+    p.row("--target <triple>", "Pack the crate graph of that target (RELAX_CHECK_TARGET)");
+    p.row("<package> [flags]", "--features <list>, --no-default-features, as for check");
     p.out
 }
 
@@ -321,6 +343,7 @@ fn page(st: &Style, cmd: Option<&str>) -> Option<String> {
         None | Some("help") => main_page(st),
         Some("run") => run_page(st),
         Some("fetch") => fetch_page(st),
+        Some("pack-src") => pack_src_page(st),
         Some("inspect") => inspect_page(st),
         Some("check") => check_page(st),
         Some("selftest") => selftest_page(st),

@@ -32,6 +32,37 @@ struct Mount {
 }
 
 static ANY: AtomicBool = AtomicBool::new(false);
+
+// ---- the read log (RELAX_READ_LOG=<file>): what `pack-src` records. Every process of a run (the
+// build-script children inherit the variable) appends `<kind>\t<path>` once per path and kind:
+// `f` a file whose bytes were read, `p` a path a probe (metadata, exists, is_file, is_dir) found,
+// `d` a folder that was listed. One relaxed load when off.
+static RECORDING: AtomicBool = AtomicBool::new(false);
+static RECORDED: std::sync::Mutex<Option<(std::collections::HashSet<(u8, String)>, std::fs::File)>> = std::sync::Mutex::new(None);
+
+/// Starts the read log from RELAX_READ_LOG (the loader calls this at start, next to RELAX_VFS).
+pub fn record_from_env() -> Result<(), String> {
+    let Some(p) = std::env::var_os("RELAX_READ_LOG").filter(|p| !p.is_empty()) else { return Ok(()) };
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("RELAX_READ_LOG {}: {e}", p.to_string_lossy()))?;
+    *RECORDED.lock().unwrap() = Some((Default::default(), f));
+    RECORDING.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn note(kind: u8, path: &std::path::Path) {
+    if !RECORDING.load(Ordering::Relaxed) {
+        return;
+    }
+    let p = normalize_path(&path.to_string_lossy());
+    let mut g = RECORDED.lock().unwrap();
+    if let Some((seen, file)) = g.as_mut() {
+        if seen.insert((kind, p.clone())) {
+            use std::io::Write;
+            // one write per line: appends of different processes do not interleave
+            let _ = file.write_all(format!("{}\t{p}\n", kind as char).as_bytes());
+        }
+    }
+}
 static MOUNTS: RwLock<Vec<Arc<Mount>>> = RwLock::new(Vec::new());
 /// RELAX_EDITS: the disk folder holding the edited files (None: virtual files are read-only)
 static EDITS: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
@@ -369,6 +400,14 @@ pub fn read(path: impl AsRef<std::path::Path>) -> io::Result<Vec<u8>> {
 }
 
 fn read_uncached(path: &std::path::Path, entry: Option<&ReadEntry>) -> io::Result<Vec<u8>> {
+    let r = read_uncached_inner(path, entry);
+    if r.is_ok() {
+        note(b'f', path);
+    }
+    r
+}
+
+fn read_uncached_inner(path: &std::path::Path, entry: Option<&ReadEntry>) -> io::Result<Vec<u8>> {
     if !ANY.load(Ordering::Acquire) {
         return read_disk(path, entry);
     }
@@ -406,7 +445,14 @@ pub struct Metadata {
 /// Content metadata for either backend. Immutable store identities supply a stable
 /// timestamp; edited virtual files use their overlay's filesystem metadata.
 pub fn metadata(path: impl AsRef<std::path::Path>) -> io::Result<Metadata> {
-    let path = path.as_ref();
+    let r = metadata_inner(path.as_ref());
+    if r.is_ok() {
+        note(b'p', path.as_ref());
+    }
+    r
+}
+
+fn metadata_inner(path: &std::path::Path) -> io::Result<Metadata> {
     let s = path.to_string_lossy();
     if let Some((mount, rel)) = ANY.load(Ordering::Acquire).then(|| find(&s)).flatten() {
         if let Some(edited) = edited_file(&s) { return metadata(edited); }
@@ -463,7 +509,14 @@ pub fn canonicalize(path: impl AsRef<std::path::Path>) -> io::Result<std::path::
 }
 
 pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
-    let path = path.as_ref();
+    let found = exists_inner(path.as_ref());
+    if found {
+        note(b'p', path.as_ref());
+    }
+    found
+}
+
+fn exists_inner(path: &std::path::Path) -> bool {
     if !ANY.load(Ordering::Acquire) {
         return path.exists();
     }
@@ -475,7 +528,14 @@ pub fn exists(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 pub fn is_file(path: impl AsRef<std::path::Path>) -> bool {
-    let path = path.as_ref();
+    let found = is_file_inner(path.as_ref());
+    if found {
+        note(b'p', path.as_ref());
+    }
+    found
+}
+
+fn is_file_inner(path: &std::path::Path) -> bool {
     if !ANY.load(Ordering::Acquire) {
         return path.is_file();
     }
@@ -487,7 +547,14 @@ pub fn is_file(path: impl AsRef<std::path::Path>) -> bool {
 }
 
 pub fn is_dir(path: impl AsRef<std::path::Path>) -> bool {
-    let path = path.as_ref();
+    let found = is_dir_inner(path.as_ref());
+    if found {
+        note(b'p', path.as_ref());
+    }
+    found
+}
+
+fn is_dir_inner(path: &std::path::Path) -> bool {
     if !ANY.load(Ordering::Acquire) {
         return path.is_dir();
     }
@@ -500,7 +567,14 @@ pub fn is_dir(path: impl AsRef<std::path::Path>) -> bool {
 
 /// A folder's entries: (name, is folder), sorted by name.
 pub fn read_dir(path: impl AsRef<std::path::Path>) -> io::Result<Vec<(String, bool)>> {
-    let path = path.as_ref();
+    let r = read_dir_inner(path.as_ref());
+    if r.is_ok() {
+        note(b'd', path.as_ref());
+    }
+    r
+}
+
+fn read_dir_inner(path: &std::path::Path) -> io::Result<Vec<(String, bool)>> {
     let disk = || -> io::Result<Vec<(String, bool)>> {
         let mut v: Vec<(String, bool)> = std::fs::read_dir(path)?
             .flatten()
@@ -646,17 +720,25 @@ pub fn identity(path: &str) -> Option<String> {
     if edited_file(path).is_some() {
         return None;
     }
-    Some(format!("{}@{}", m.store.path.display(), store::hex(&m.commit)))
+    Some(match m.store.range {
+        Some((offset, len)) => format!("{}@{offset}+{len}@{}", m.store.path.display(), store::hex(&m.commit)),
+        None => format!("{}@{}", m.store.path.display(), store::hex(&m.commit)),
+    })
 }
 
 // ---- the mount table as text (a child process started in a virtual folder mounts the same)
 
-/// `root\tstore path\tcommit hex` per mount, newline-separated.
+/// `root\tstore path\tcommit hex[\toffset+len]` per mount, newline-separated (the range of a store
+/// that sits inside a bigger file, gitstore.rs `open_range`).
 pub fn mounts_text() -> String {
     let m = MOUNTS.read().unwrap();
     let mut out = String::new();
     for x in m.iter() {
-        out.push_str(&format!("{}\t{}\t{}\n", x.root, x.store.path.display(), store::hex(&x.commit)));
+        out.push_str(&format!("{}\t{}\t{}", x.root, x.store.path.display(), store::hex(&x.commit)));
+        if let Some((offset, len)) = x.store.range {
+            out.push_str(&format!("\t{offset}+{len}"));
+        }
+        out.push('\n');
     }
     out
 }
@@ -667,14 +749,27 @@ pub fn mount_text(text: &str) -> Result<(), String> {
         let mut it = line.split('\t');
         let (Some(root), Some(path), Some(commit)) = (it.next(), it.next(), it.next()) else { return Err(format!("RELAX_VFS: bad line {line}")) };
         let commit = store::from_hex(commit).ok_or_else(|| format!("RELAX_VFS: bad commit in {line}"))?;
-        let s = Store::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?.ok_or_else(|| format!("{path}: no store"))?;
-        mount(root, Arc::new(s), &commit)?;
+        let s = match it.next() {
+            None => Store::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?,
+            Some(range) => {
+                let (offset, len) = parse_range(range).ok_or_else(|| format!("RELAX_VFS: bad range in {line}"))?;
+                Store::open_range(std::path::Path::new(path), offset, len).map_err(|e| format!("{path}: {e}"))?
+            }
+        };
+        mount(root, Arc::new(s.ok_or_else(|| format!("{path}: no store"))?), &commit)?;
     }
     Ok(())
 }
 
+/// `offset+len` (decimal).
+pub fn parse_range(s: &str) -> Option<(u64, u64)> {
+    let (o, l) = s.split_once('+')?;
+    Some((o.parse().ok()?, l.parse().ok()?))
+}
+
 /// RELAX_VFS from the environment, mounted once (the loader and `relax` call this at start).
 pub fn mount_from_env() -> Result<(), String> {
+    record_from_env()?;
     if let Some(d) = std::env::var_os("RELAX_EDITS").filter(|d| !d.is_empty()) {
         set_edits(Some(d.into()));
     }

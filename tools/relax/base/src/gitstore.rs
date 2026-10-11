@@ -185,6 +185,9 @@ pub struct Store {
     pub path: PathBuf,
     file: File,
     pub index: Index,
+    /// (offset, len) when the store sits inside a bigger file (`open_range`): read-only, every
+    /// offset in the store is relative to `offset`
+    pub range: Option<(u64, u64)>,
 }
 
 /// SHA-1 (git's object ids; the trailer's index check).
@@ -197,7 +200,7 @@ pub fn sha1(data: &[u8]) -> [u8; 20] {
 impl Store {
     /// The store at `path`, or None when there is none (or it is not a store).
     pub fn open(path: &Path) -> std::io::Result<Option<Store>> {
-        let mut file = match File::open(path) {
+        let file = match File::open(path) {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
@@ -209,23 +212,41 @@ impl Store {
         let r = (|| -> std::io::Result<Option<Index>> {
             let len = file.metadata()?.len();
             let mut head = [0u8; 12];
-            if len < 12 || file.read_exact(&mut head).is_err() || &head[..8] != MAGIC {
+            if len < 12 || read_at(&file, &mut head, 0)? != 12 || &head[..8] != MAGIC {
                 return Ok(None);
             }
             // the last valid trailer: at the end, else (an interrupted append) searched backwards
-            Ok(Some(Self::last_trailer(&mut file, len)?.map(|(_, index)| index).unwrap_or_default()))
+            Ok(Some(Self::last_trailer(&file, 0, len)?.map(|(_, index)| index).unwrap_or_default()))
         })();
         let _ = file.unlock();
         match r? {
             None => Ok(None),
-            Some(index) => Ok(Some(Store { path: path.to_path_buf(), file, index })),
+            Some(index) => Ok(Some(Store { path: path.to_path_buf(), file, index, range: None })),
         }
     }
 
-    fn trailer_at(file: &mut File, at: u64) -> std::io::Result<Option<Index>> {
+    /// The store that sits at bytes `offset..offset + len` of the file at `path` (an APK asset
+    /// that is stored uncompressed, a store appended to another file; a plain store file is
+    /// `(0, size)`). Read-only: it ends exactly at its trailer, there is no append or compaction
+    /// of a range, and nothing is locked. None when the range is not a store.
+    pub fn open_range(path: &Path, offset: u64, len: u64) -> std::io::Result<Option<Store>> {
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        if offset.checked_add(len).map_or(true, |end| end > size) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{}: range {offset}+{len} is outside the file", path.display())));
+        }
+        let mut head = [0u8; 12];
+        if len < 12 || read_at(&file, &mut head, offset)? != 12 || &head[..8] != MAGIC {
+            return Ok(None);
+        }
+        // a range ends at its trailer: no backwards search over bytes that belong to the next thing
+        let Some(index) = Self::trailer_at(&file, offset, len.saturating_sub(TRAILER_LEN as u64))? else { return Ok(None) };
+        Ok(Some(Store { path: path.to_path_buf(), file, index, range: Some((offset, len)) }))
+    }
+
+    fn trailer_at(file: &File, base: u64, at: u64) -> std::io::Result<Option<Index>> {
         let mut t = [0u8; TRAILER_LEN];
-        file.seek(SeekFrom::Start(at))?;
-        if file.read_exact(&mut t).is_err() || t[0] != b'T' || &t[1..9] != TRAILER {
+        if read_at(file, &mut t, base + at)? != TRAILER_LEN || t[0] != b'T' || &t[1..9] != TRAILER {
             return Ok(None);
         }
         let off = u64::from_le_bytes(t[9..17].try_into().unwrap());
@@ -234,17 +255,19 @@ impl Store {
             return Ok(None);
         }
         let mut body = vec![0u8; ilen as usize];
-        file.seek(SeekFrom::Start(off))?;
-        file.read_exact(&mut body)?;
+        if read_at(file, &mut body, base + off)? != body.len() {
+            return Ok(None);
+        }
         if sha1(&body) != t[25..45] {
             return Ok(None);
         }
         Ok(Index::decode(&body))
     }
 
-    fn last_trailer(file: &mut File, len: u64) -> std::io::Result<Option<(u64, Index)>> {
+    /// The last valid trailer of the `len` bytes at `base`: (end of the store, index).
+    fn last_trailer(file: &File, base: u64, len: u64) -> std::io::Result<Option<(u64, Index)>> {
         if len >= TRAILER_LEN as u64 + 12 {
-            if let Some(i) = Self::trailer_at(file, len - TRAILER_LEN as u64)? {
+            if let Some(i) = Self::trailer_at(file, base, len - TRAILER_LEN as u64)? {
                 return Ok(Some((len, i)));
             }
         }
@@ -253,14 +276,13 @@ impl Store {
         while hi > 12 {
             let lo = hi.saturating_sub(1 << 20).max(12);
             let mut buf = vec![0u8; (hi - lo) as usize + TRAILER_LEN];
-            file.seek(SeekFrom::Start(lo))?;
-            let n = file.read(&mut buf)?;
+            let n = read_at(file, &mut buf, base + lo)?;
             buf.truncate(n);
             let mut i = buf.len().saturating_sub(9);
             loop {
                 if buf[i] == b'T' && buf.get(i + 1..i + 9) == Some(TRAILER) {
                     let at = lo + i as u64;
-                    if let Some(idx) = Self::trailer_at(file, at)? {
+                    if let Some(idx) = Self::trailer_at(file, base, at)? {
                         return Ok(Some((at + TRAILER_LEN as u64, idx)));
                     }
                 }
@@ -282,8 +304,9 @@ impl Store {
 
     fn object_at(&self, off: u64) -> std::io::Result<(u8, Vec<u8>)> {
         let bad = || std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: damaged object at {off}", self.path.display()));
+        let base = self.range.map_or(0, |r| r.0);
         let mut head = [0u8; 1 + 1 + 20 + 20];
-        let n = read_at(&self.file, &mut head, off)?;
+        let n = read_at(&self.file, &mut head, base + off)?;
         if n < 24 || head[0] != b'O' {
             return Err(bad());
         }
@@ -292,7 +315,7 @@ impl Store {
         let size = get_varint(&head[..n], &mut at).ok_or_else(bad)? as usize;
         let clen = get_varint(&head[..n], &mut at).ok_or_else(bad)? as usize;
         let mut comp = vec![0u8; clen];
-        if read_at(&self.file, &mut comp, off + at as u64)? != clen {
+        if read_at(&self.file, &mut comp, base + off + at as u64)? != clen {
             return Err(bad());
         }
         let data = crate::inflate::inflate::decompress_to_vec(&comp).map_err(|_| bad())?;
@@ -306,9 +329,21 @@ impl Store {
     pub fn object_size(&self, oid: &Oid) -> std::io::Result<Option<u64>> {
         let Some(off) = self.index.offset(oid) else { return Ok(None) };
         let mut head = [0u8; 1 + 1 + 20 + 10];
-        let n = read_at(&self.file, &mut head, off)?;
+        let n = read_at(&self.file, &mut head, self.range.map_or(0, |r| r.0) + off)?;
         let mut at = 22;
         Ok(if n > 22 && head[0] == b'O' { get_varint(&head[..n], &mut at) } else { None })
+    }
+
+    /// An object's compressed size in the file (its record's payload, from the header).
+    pub fn stored_size(&self, oid: &Oid) -> std::io::Result<Option<u64>> {
+        let Some(off) = self.index.offset(oid) else { return Ok(None) };
+        let mut head = [0u8; 1 + 1 + 20 + 20];
+        let n = read_at(&self.file, &mut head, self.range.map_or(0, |r| r.0) + off)?;
+        let mut at = 22;
+        if n < 24 || head[0] != b'O' || get_varint(&head[..n], &mut at).is_none() {
+            return Ok(None);
+        }
+        Ok(get_varint(&head[..n], &mut at))
     }
 
     pub fn contains(&self, oid: &Oid) -> bool {
@@ -471,7 +506,7 @@ pub fn append(path: &Path, add: Append, keep: &dyn Fn(&[Ref]) -> Vec<Ref>) -> Re
         if &head[..8] != MAGIC {
             return Err(format!("{}: not a Relax git store", path.display()));
         }
-        match Store::last_trailer(&mut file, len).map_err(err)? {
+        match Store::last_trailer(&file, 0, len).map_err(err)? {
             Some((e, i)) => (e, i),
             None => (12, Index::default()),
         }
@@ -520,7 +555,7 @@ pub fn append(path: &Path, add: Append, keep: &dyn Fn(&[Ref]) -> Vec<Ref>) -> Re
     // the commit's files, from the store as written now plus this fetch's objects
     let fetched: HashMap<Oid, (u8, &Vec<u8>)> = add.objects.iter().map(|(o, k, d)| (*o, (*k, d))).collect();
     let table = {
-        let store = Store { path: path.to_path_buf(), file: file.try_clone().map_err(err)?, index: index.clone() };
+        let store = Store { path: path.to_path_buf(), file: file.try_clone().map_err(err)?, index: index.clone(), range: None };
         let mut get = |o: &Oid| fetched.get(o).map(|(k, d)| (*k, (*d).clone())).or_else(|| store.object(o).ok().flatten());
         path_table(&add.reference.commit, &mut get)?
     };
@@ -561,6 +596,9 @@ pub fn append(path: &Path, add: Append, keep: &dyn Fn(&[Ref]) -> Vec<Ref>) -> Re
 
 /// Rewrites the store with only what its kept commits reach: `<store>.new`, then renamed over.
 pub fn compact(store: &Store) -> Result<(), String> {
+    if store.range.is_some() {
+        return Err(format!("{}: a store inside another file is read-only", store.path.display()));
+    }
     let path = &store.path;
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let mut live = HashSet::new();
@@ -730,6 +768,54 @@ mod tests {
         assert!(!std::path::Path::new(&root).exists(), "a mount is never created on disk");
         // the disk is untouched by mounts elsewhere
         assert!(crate::vfs::is_file(&outer));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_store_inside_a_bigger_file_mounts_and_reads() {
+        let dir = std::env::temp_dir().join(format!("relax-range-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("git-x-00000000.store");
+        let a = b"pub fn a() {}\n".to_vec();
+        let b = b"[package]\nname = \"x\"\n".to_vec();
+        let (ao, bo) = (obj("blob", &a), obj("blob", &b));
+        let src = tree(&[("100644", "lib.rs", ao)]);
+        let srco = obj("tree", &src);
+        let root = tree(&[("100644", "Cargo.toml", bo), ("40000", "src", srco)]);
+        let rooto = obj("tree", &root);
+        let c = format!("tree {}\nauthor a <a> 0 +0000\ncommitter a <a> 0 +0000\n\none\n", hex(&rooto)).into_bytes();
+        let co = obj("commit", &c);
+        let objects = vec![(co, COMMIT, c), (rooto, TREE, root), (srco, TREE, src), (ao, BLOB, a.clone()), (bo, BLOB, b.clone())];
+        append(&path, Append { objects: &objects, reference: Ref { key: "k".into(), commit: co, time: 1 } }, &|r| r.to_vec()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        // embedded at an odd offset, with other bytes (even a store's magic and trailer words) around it
+        let mut big = b"RELAXGITnoise-before-".to_vec();
+        big.extend_from_slice(&[0xff; 14]);
+        let offset = big.len() as u64;
+        assert_eq!(offset % 4096 != 0 && offset % 2 == 1, true);
+        big.extend_from_slice(&bytes);
+        big.extend_from_slice(b"RGITEND1-after");
+        let bigger = dir.join("bigger.bin");
+        std::fs::write(&bigger, &big).unwrap();
+        let s = Store::open_range(&bigger, offset, bytes.len() as u64).unwrap().unwrap();
+        assert_eq!(s.range, Some((offset, bytes.len() as u64)));
+        assert_eq!(s.object(&ao).unwrap().unwrap(), (BLOB, a.clone()));
+        assert_eq!(s.stored_size(&ao).unwrap().is_some(), true);
+        assert_eq!(s.index.table(&co).unwrap().len(), 2);
+        // a range that is not a store, or outside the file, is no store / an error
+        assert!(Store::open_range(&bigger, 3, bytes.len() as u64).unwrap().is_none());
+        assert!(Store::open_range(&bigger, offset, bytes.len() as u64 + 100).is_err());
+        assert!(compact(&s).is_err(), "a range store is read-only");
+        // mounted through the VFS, and through the text a build-script child gets
+        let root_dir = dir.join("vfs").join("r").to_string_lossy().into_owned();
+        crate::vfs::mount(&root_dir, Arc::new(s), &co).unwrap();
+        assert_eq!(crate::vfs::read(format!("{root_dir}/src/lib.rs")).unwrap(), a);
+        let text = crate::vfs::mounts_text();
+        assert!(text.contains(&format!("\t{offset}+{}\n", bytes.len())), "{text}");
+        let root2 = dir.join("vfs").join("r2").to_string_lossy().into_owned();
+        let line = text.lines().find(|l| l.starts_with(&root_dir)).unwrap().replacen(&root_dir, &root2, 1);
+        crate::vfs::mount_text(&line).unwrap();
+        assert_eq!(crate::vfs::read(format!("{root2}/Cargo.toml")).unwrap(), b);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

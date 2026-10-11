@@ -15,7 +15,9 @@ pub fn select(workspace: &str, fallback: &std::path::Path) {
     if SELECTED.set(()).is_err() {
         return;
     }
-    let candidate = format!("{}/tools/relax/compiler/std", workspace.trim_end_matches(['/', '\\']));
+    // a build script's child has its package folder as workspace: the std is the mount root's
+    let root = crate::vfs::outer_root(workspace).unwrap_or_else(|| workspace.to_string());
+    let candidate = format!("{}/tools/relax/compiler/std", root.trim_end_matches(['/', '\\']));
     let chosen = if crate::vfs::is_virtual(workspace) {
         // Diagnostic hook only forces rejection; it can never approve an incompatible std.
         let expected = if std::env::var_os("RELAX_TEST_STD_MISMATCH").is_some() {

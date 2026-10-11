@@ -120,6 +120,16 @@ fn main() {
         Some("hub") => std::process::exit(remote::hub(&args[2..])),
         Some("remote-relay") => std::process::exit(remote::relay(&args[2..])),
         Some("remote") => std::process::exit(remote::remote(&args[2..])),
+        // `pack-src [--target <triple>] <out.store> <package>...`: the source archive `run --src` runs from
+        Some("pack-src") => match relax_compiler::packsrc::parse_args(&args[2..]).and_then(relax_compiler::packsrc::run) {
+            Ok(()) => std::process::exit(0),
+            Err(e) => {
+                eprintln!("relax: pack-src: {e}");
+                std::process::exit(1);
+            }
+        },
+        // `run --src <store>[@<offset>+<len>] <package> ...`: from a packed source archive, no checkout
+        Some("run") if args[2..].iter().any(|a| a == "--src") => std::process::exit(run_src(&args[2..])),
         // `run <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <package> ...`
         Some("run") => match fetch::split_args(&args[2..]) {
             None => {}
@@ -224,18 +234,98 @@ fn run_spec(opts: Vec<String>, spec: &fetch::Spec, cached: bool, rest: Vec<Strin
             return 1;
         }
     };
-    std::env::set_var("RELAX_WORKSPACE", &workspace);
-    // programs it starts that run on Relax (the runner's apps) mount the same repositories
-    std::env::set_var("RELAX_VFS", relax_compiler::vfs::mounts_text());
     // and the spec itself (the runner names its own repositories for apps that share them)
     std::env::set_var("RELAX_SPEC", spec.args().join("\u{1f}"));
+    run_mounted(&workspace, opts, rest)
+}
+
+/// `run [options] [--root <folder>] --src <store>[@<offset>+<len>] <package> ...`: the app from a packed source
+/// archive (packsrc.rs): the store, or the range of a bigger file it sits in (an APK asset), is the
+/// whole workspace; nothing is read from a checkout.
+fn run_src(words: &[String]) -> i32 {
+    let mut opts = Vec::new();
+    let mut src = None;
+    let mut root = None;
+    let mut i = 0;
+    while i < words.len() && words[i].starts_with("--") {
+        let n = match words[i].as_str() {
+            "--src" => {
+                let Some(s) = words.get(i + 1) else {
+                    eprintln!("relax: --src wants <store>[@<offset>+<len>]");
+                    return 2;
+                };
+                src = Some(s.clone());
+                i += 2;
+                continue;
+            }
+            "--root" => {
+                let Some(r) = words.get(i + 1) else {
+                    eprintln!("relax: --root wants a folder");
+                    return 2;
+                };
+                root = Some(r.clone());
+                i += 2;
+                continue;
+            }
+            "--units" | "--report-to" | "--entry" | "--boundary" | "--relax-dir" => 2,
+            _ => 1,
+        };
+        opts.extend(words[i..(i + n).min(words.len())].iter().cloned());
+        i += n;
+    }
+    let rest = words[i..].to_vec();
+    let Some(src) = src else {
+        eprintln!("relax: --src goes before the package");
+        return 2;
+    };
+    if rest.first().map_or(true, |p| p.starts_with('-')) {
+        eprintln!("relax: run --src <store> needs a package after the store");
+        return 2;
+    }
+    let (path, range) = match src.rsplit_once('@').and_then(|(p, r)| relax_compiler::vfs::parse_range(r).map(|r| (p, Some(r)))) {
+        Some((p, r)) => (p.to_string(), r),
+        None => (src.clone(), None),
+    };
+    let mount_archive = || -> Result<String, String> {
+        let path = std::path::Path::new(&path);
+        let (offset, len) = match range {
+            Some(r) => r,
+            None => (0, std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?.len()),
+        };
+        let store = relax_compiler::gitstore::Store::open_range(path, offset, len).map_err(|e| format!("{}: {e}", path.display()))?.ok_or_else(|| format!("{}: not a Relax git store", path.display()))?;
+        let [(commit, _)] = store.index.tables.as_slice() else { return Err(format!("{}: a source archive holds exactly one commit", path.display())) };
+        let commit = *commit;
+        // one root for every archive of this home (the same across updates, like a git run's): the
+        // compile cache keys a crate by its root path, so a run is warm against the previous one;
+        // --root puts it where a checkout of the same sources sits (then their keys are the same)
+        let workspace = match &root {
+            Some(r) => r.trim_end_matches('/').to_string(),
+            None => fetch::home().join("vfs").join("src").display().to_string(),
+        };
+        relax_compiler::vfs::mount(&workspace, std::sync::Arc::new(store), &commit)?;
+        Ok(workspace)
+    };
+    match mount_archive() {
+        Ok(workspace) => run_mounted(&workspace, opts, rest),
+        Err(e) => {
+            eprintln!("relax: {e}");
+            1
+        }
+    }
+}
+
+/// The run of `rest[0]` in the virtual workspace the mounts make (a git run's, an archive's).
+fn run_mounted(workspace: &str, opts: Vec<String>, rest: Vec<String>) -> i32 {
+    std::env::set_var("RELAX_WORKSPACE", workspace);
+    // programs it starts that run on Relax (the runner's apps) mount the same repositories
+    std::env::set_var("RELAX_VFS", relax_compiler::vfs::mounts_text());
     // Verify the mounted std against the compiler build before any std disk probes.
     let own = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("compiler/std");
-    relax_compiler::std_source::select(&workspace, &own);
+    relax_compiler::std_source::select(workspace, &own);
     // the run's own files (unit graph, build script outputs, code cache): no workspace on disk,
     // so its relax dir is $RELAX_HOME/target/<hash of the virtual workspace> (relax dirs.rs), one
     // per spec shape (the same across updates)
-    apply_run_env(&workspace, &rest[0]);
+    apply_run_env(workspace, &rest[0]);
     provided();
     let mut a = opts;
     a.extend(rest);
