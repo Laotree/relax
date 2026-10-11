@@ -142,7 +142,7 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
-    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,linux_direct,quest,no_android_choreographer,ohos_sim,gpusim,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio,use_unstable_unix_socket_ancillary_data_2021)");
+    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,linux_direct,quest,no_android_choreographer,ohos_sim,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio,use_unstable_unix_socket_ancillary_data_2021)");
     // Every variable declared here rebuilds this crate and everything that
     // depends on it (draw, widgets, every app) when its value changes: keep
     // per-app inputs out (see src/app_meta.rs). MAKEPAD selects the backend
@@ -171,7 +171,14 @@ fn main() {
     let makepad_configs: Vec<String> = env::var("MAKEPAD")
         .map(|configs| configs.split(['+', ',']).map(str::to_string).collect())
         .unwrap_or_default();
-    let names_gpu_api = makepad_configs
+    // `RUSTFLAGS=--cfg hal` builds the HAL client (os/hal). Until the cut it is a build with no
+    // native os backend, so it takes every `cfg(gpusim)` classification of this crate (what
+    // exists and what does not); os/mod.rs and the raster callers tell the two apart by `hal`.
+    let hal = env::var_os("CARGO_CFG_HAL").is_some();
+    if hal {
+        println!("cargo:rustc-cfg=gpusim");
+    }
+    let names_gpu_api = hal || makepad_configs
         .iter()
         .any(|config| matches!(config.as_str(), "gl" | "vulkan" | "use_vulkan" | "gpusim" | "quest"));
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
