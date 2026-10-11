@@ -68,7 +68,7 @@ fn init_real() {
             REAL[k].store(p, Release);
             targets()[k].store(p, Release);
         }
-        // RELAX_INSPECT_HEAP asked for the program's heap from its first allocation
+        // `--heap` asked for the program's heap from its first allocation
         let rate = PENDING_PROGRAM.swap(0, Relaxed);
         if rate != 0 {
             let _ = start(false, rate);
@@ -79,20 +79,22 @@ fn init_real() {
 /// rate of a program tracker to start at the first allocator binding (0: none)
 static PENDING_PROGRAM: AtomicU64 = AtomicU64::new(0);
 
-/// RELAX_INSPECT_HEAP=program,host[,rate=<bytes>]: tracking from the start of the run (cold-boot
-/// attribution), without a time to live. Called when the inspect thread starts.
-pub fn start_from_env() {
-    let Ok(v) = std::env::var("RELAX_INSPECT_HEAP") else { return };
-    let rate = v.split(',').find_map(|w| w.strip_prefix("rate=")).and_then(|r| r.parse().ok()).unwrap_or(64u64 << 10);
-    if v.split(',').any(|w| w == "host") {
-        let _ = start(true, rate);
+/// `relax run --heap[=<rate bytes>]` (and `--agent`): heap tracking from the start of the run --
+/// Relax's own heap from now, the program's from its first allocator call -- so startup
+/// allocations have stacks too. 0: off.
+pub static AT_LOAD: AtomicU64 = AtomicU64::new(0);
+
+/// Starts the trackers `--heap` asked for (the inspect thread's start), with no time to live.
+pub fn start_at_load() {
+    let rate = AT_LOAD.load(Relaxed);
+    if rate == 0 {
+        return;
     }
-    if v.split(',').any(|w| w == "program") {
-        if REAL[0].load(Relaxed) != 0 {
-            let _ = start(false, rate);
-        } else {
-            PENDING_PROGRAM.store(rate, Relaxed);
-        }
+    let _ = start(true, rate);
+    if REAL[0].load(Relaxed) != 0 {
+        let _ = start(false, rate);
+    } else {
+        PENDING_PROGRAM.store(rate, Relaxed);
     }
 }
 

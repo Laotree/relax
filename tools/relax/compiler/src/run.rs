@@ -217,7 +217,22 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--check" => check = true,
             "--watch" => watch = true,
             // relax inspect: panics park for an agent and events are printed on stderr
-            "--agent" => crate::inspect::AGENT.store(true, Ordering::Relaxed),
+            // `--agent` also tracks the heap from the start (sampled, the default rate) unless
+            // `--heap=<rate>` set it
+            "--agent" => {
+                crate::inspect::AGENT.store(true, Ordering::Relaxed);
+                let _ = crate::inspect::heap::AT_LOAD.compare_exchange(0, 64 << 10, Ordering::Relaxed, Ordering::Relaxed);
+            }
+            // relax inspect: sampled heap tracking (program + Relax's own) from the first
+            // allocation, one sample per <rate> bytes (default 64 KB)
+            "--heap" => crate::inspect::heap::AT_LOAD.store(64 << 10, Ordering::Relaxed),
+            a if a.starts_with("--heap=") => match a[7..].parse::<u64>() {
+                Ok(r) if r > 0 => crate::inspect::heap::AT_LOAD.store(r, Ordering::Relaxed),
+                _ => {
+                    eprintln!("relax-run: --heap=<bytes per sample> wants a positive number");
+                    return 2;
+                }
+            },
             "--deep" => deep = true,
             "--json" if crate::diag::enabled() => {
                 QUIET.store(true, Ordering::Relaxed);

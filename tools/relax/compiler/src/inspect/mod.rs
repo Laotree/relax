@@ -88,7 +88,7 @@ pub fn start(app: &str) {
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
-    heap::start_from_env();
+    heap::start_at_load();
     let _ = std::thread::Builder::new().name("relax-inspect".into()).spawn(move || {
         SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
         heap::exclude_this_thread();
