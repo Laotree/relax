@@ -519,6 +519,12 @@ impl Command {
                 v.remove(2);
             }
         }
+        // ... and its clocks go on from this process's start (relax base clock.rs EXEC_ORIGIN_ENV)
+        if exec && self_exec.is_some() {
+            if let Some(t0) = crate::env::var_os("RELAX_RUN_STARTUP_T0") {
+                self.env("RELAX_EXEC_ORIGIN_EPOCH", &t0);
+            }
+        }
         let prog = match &self_exec {
             Some(v) => cstring(v[0].as_encoded_bytes().to_vec())?,
             None => cstring(self.program.as_encoded_bytes().to_vec())?,
