@@ -105,6 +105,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
+    ("gpu", "[top [by=bytes|owner|site|churn]|idle [s=30]|snap <name>|diff <a> <b|now>|path G<id>]", "where the GPU memory is (native makepad apps: MAKEPAD_INSPECT=1): totals by kind and owner against the device, automatic findings; top / idle / snap / diff / path"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -142,6 +143,12 @@ fn dispatch(req: &Req, out: &mut Out) {
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
+        // the program's GPU ledger (makepad-platform, MAKEPAD_INSPECT=1) answers on its own socket
+        "gpu" => {
+            if !makepad_inspect_serve::forward(req, out) {
+                out.err("no GPU ledger in this program (a makepad-platform app under relax run, or a native app started with MAKEPAD_INSPECT=1, answers it)");
+            }
+        }
         "probe" => probes::cmd(req, out),
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
