@@ -56,6 +56,8 @@ pub enum Target {
     Tcp(String, Arc<makepad_network::tunnel::ClientCredentials>),
     /// a command whose stdin/stdout speak makepad-remote (`ssh host relax remote-relay`)
     Command(Vec<String>),
+    /// an endpoint behind a hub (`<host>:<app|pid>`): every channel is the hub's `route` to it
+    Routed(Client, String),
 }
 
 struct Inner {
@@ -133,6 +135,7 @@ impl Client {
             }
             #[cfg(not(target_arch = "wasm32"))]
             Target::Tcp(addr, creds) => Ok((carrier::tcp::dial(addr, creds)?, None)),
+            Target::Routed(..) => Err(io::Error::new(io::ErrorKind::Unsupported, "a routed client opens its channels through the hub")),
             Target::Command(argv) => {
                 let (first, rest) = argv.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
                 Ok((carrier::stdio::spawn(std::process::Command::new(first).args(rest))?, None))
@@ -186,8 +189,17 @@ impl Client {
         self.0.caps.lock().unwrap().clone()
     }
 
+    /// A client of `target` (`<host>:<app|pid>`) through the hub `hub`: the same requests,
+    /// grabs included, as on a local endpoint.
+    pub fn routed(hub: &Client, target: &str) -> Client {
+        Client::new(Target::Routed(hub.clone(), target.to_string()), "client")
+    }
+
     /// Opens a channel against `service`.
     pub fn open(&self, service: &str, args: &str) -> Result<Channel, Error> {
+        if let Target::Routed(hub, target) = &self.0.target {
+            return hub.open("route", &format!("{target} {service} {args}"));
+        }
         let conn = self.conn()?;
         match conn.open(service, args) {
             Ok(ch) => Ok(ch),
