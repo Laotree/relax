@@ -13,6 +13,8 @@ mod cef;
 mod fetch;
 mod help;
 mod macros;
+#[cfg(target_os = "linux")]
+mod malloc_compat;
 mod remote;
 
 /// What this loader was built from (build.rs; the linked compiler's own stamp is
