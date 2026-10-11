@@ -34,6 +34,13 @@ fn main() {
             println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");
         }
     }
+    // ELF: the #[relax_api] entries (makepad-relax-api) sit in the `relax_api` section, reached
+    // only through __start_/__stop_relax_api; LLD's default start-stop-gc would drop every
+    // object's section that nothing else references
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    if !matches!(os.as_str(), "windows" | "macos" | "ios") && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-z,nostart-stop-gc");
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=build_stamp.rs");
     let dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -42,16 +49,8 @@ fn main() {
     println!("cargo:rustc-env=RELAX_PROVENANCE={}", g.provenance(&dir, ""));
     // RELAX_SRC_<crate>: the source identity (srchash.rs) of each provided crate as this build
     // compiles it (its resolved features and dependencies)
-    // RELAX_PROVIDED: `<package>=<feature>,..;..`, each provided crate with the features this
-    // build compiles it with (`relax host-gen` reads it with them; `host-shims` only selects the
-    // shim file itself)
-    let mut provided = Vec::new();
     for name in PROVIDED {
         let root = g.pkgs.iter().position(|p| p.name == *name).unwrap_or_else(|| panic!("{} is not a dependency", name));
         println!("cargo:rustc-env=RELAX_SRC_{}={:016x}", name.replace('-', "_"), srchash::closure_hash(&g.pkgs, root));
-        let mut features: Vec<&str> = g.pkgs[root].features.iter().map(String::as_str).filter(|f| *f != "host-shims").collect();
-        features.sort();
-        provided.push(format!("{}={}", name, features.join(",")));
     }
-    println!("cargo:rustc-env=RELAX_PROVIDED={}", provided.join(";"));
 }

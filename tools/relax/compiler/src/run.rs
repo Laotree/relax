@@ -175,7 +175,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut watch = session.is_some();
     let mut deep = false;
     let mut boundary: Option<Vec<String>> = None;
-    let mut host_gen: Option<(String, String)> = None;
     let mut root_only = false;
     let mut selftest = false;
     let mut i = 0;
@@ -234,12 +233,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--boundary" => {
                 i += 1;
                 boundary = args.get(i).map(|s| s.split(',').map(|x| x.to_string()).collect());
-            }
-            // `--host-gen <crate> <rows>`: with --check, write provided crate <crate>'s shim rows
-            // as this run's target sees it (provided.rs; a `relax host-gen` worker)
-            "--host-gen" if i + 2 < args.len() => {
-                host_gen = Some((args[i + 1].replace('-', "_"), args[i + 2].clone()));
-                i += 2;
             }
             _ => return usage(),
         }
@@ -392,8 +385,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         eprintln!("relax-run: crate substitution: {}", e);
         return 1;
     }
-    // Shim generation inspects source without executing it, including while bootstrapping.
-    if !check || host_gen.is_none() {
+    {
         if let Err(e) = crate::provided::check_sources(&pkgs, !options.verbose) {
             eprintln!("relax-run: {}", e);
             return 1;
@@ -770,60 +762,6 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         for k in checked {
             pre.extend(crate::check::own_errors(&prog, k, &prog.errors, "resolve"));
             pre.extend(crate::check::own_errors(&prog, k, &tcx.errors, "typeck"));
-        }
-        if let Some((name, out)) = &host_gen {
-            let Some(k) = prog.crates.iter().position(|c| prog.syms.str(c.name) == name.as_str()) else {
-                eprintln!("relax-run: --host-gen: no crate `{}` in the graph", name);
-                return 2;
-            };
-            // A table is only as complete as the read behind it: a failed derive drops the
-            // items it generates, an unresolved import or a signature error drops what names
-            // it, and the crate reads as smaller without failing. Any such error fails the
-            // worker (`relax host-gen` then writes nothing), never a short table.
-            let mut gaps: Vec<String> = crate::macro_reg::derive_failures();
-            gaps.extend(deferred_errors.iter().cloned());
-            gaps.extend(prog.errors.iter().map(|e| format!("resolve: {e}")));
-            gaps.extend(tcx.errors.iter().map(|e| format!("signature: {e}")));
-            if !gaps.is_empty() {
-                eprintln!("relax host-gen: {} ({}): {} error(s) reading the crate graph; no shim rows (first {}):", name, sess.options.target, gaps.len(), max_err.min(gaps.len()));
-                for g in gaps.iter().take(max_err) {
-                    eprintln!("  {}", g);
-                }
-                return 1;
-            }
-            let errors = tcx.dcx.clone();
-            // the crate's reviewed interface (relax_api.txt), passed by `relax host-gen`
-            let api = match std::env::var("RELAX_HOST_API").ok().and_then(|f| std::fs::read_to_string(f).ok()) {
-                Some(t) => match crate::provided::HostApi::parse(&t) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("relax host-gen: {e}");
-                        return 1;
-                    }
-                },
-                None => crate::provided::HostApi::default(),
-            };
-            let (rows, rep) = match crate::provided::host_gen(&prog, &tcx, k as u32, &api) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("relax host-gen: {e}");
-                    return 1;
-                }
-            };
-            let text = crate::provided::rows_to_text(&rows);
-            errors.flush_delayed();
-            let (errors, warnings) = errors.drain_reported();
-            for warning in warnings { eprintln!("warning: {}", warning.message); }
-            if !errors.is_empty() {
-                for error in errors { eprintln!("{}", error.message); }
-                return 1;
-            }
-            if let Err(e) = std::fs::write(out, text) {
-                eprintln!("relax-run: --host-gen: {}: {}", out, e);
-                return 2;
-            }
-            eprintln!("{}", rep);
-            return 0;
         }
         crate::jit::compile_watch(Some(("check: unit", 0)));
         let t = Instant::now();

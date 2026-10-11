@@ -16,6 +16,9 @@ const PACKAGES: &[(&str, &str, Option<&str>)] = &[
     ("makepad_script_derive_impl", "platform/script/derive_impl", None),
     ("makepad_derive_widget", "widgets/derive_widget", Some("widget")),
     ("makepad_derive_widget_impl", "widgets/derive_widget_impl", None),
+    ("makepad_relax_api", "libs/relax_api", None),
+    ("makepad_relax_api_macro", "libs/relax_api/macro", Some("relax_api")),
+    ("makepad_relax_api_macro_impl", "libs/relax_api/macro_impl", None),
 ];
 
 fn ident(token: Option<&TokenTree>, name: &str) -> bool {

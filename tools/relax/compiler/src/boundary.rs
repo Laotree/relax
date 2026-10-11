@@ -305,6 +305,56 @@ pub fn run(up: *mut Unit) -> String {
     for f in &fails {
         let _ = writeln!(out, "{}", f);
     }
+    // every `#[relax_api]` op names a fn of this source with the signature rustc built: an entry
+    // whose key no fn has (Relax reads the item's path differently, or the source moved on) or
+    // whose signature differs is reported here, before any body reaches it
+    let mut entry_bad = Vec::new();
+    for (k, pc) in u.provided.iter() {
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for (di, d) in u.prog.defs.iter().enumerate() {
+            if d.krate != *k || !matches!(d.kind, DefKind::Fn | DefKind::AssocFn) {
+                continue;
+            }
+            let key = crate::provided::key(&u.prog, &u.tcx, DefId(di as u32));
+            if let Some((ek, sh)) = pc.shims.get_key_value(key.as_str()) {
+                seen.insert(ek);
+                if !sh.sig.is_empty() {
+                    let ours = crate::provided::sig(&u.prog, &u.tcx, DefId(di as u32));
+                    if crate::provided::norm(sh.sig) != ours {
+                        entry_bad.push(format!("entry-sig\t{}\trustc `{}`\tRelax `{}`", key, sh.sig, ours));
+                    }
+                }
+            }
+        }
+        for (di, d) in u.prog.defs.iter().enumerate() {
+            if d.krate == *k && matches!(d.kind, DefKind::Struct | DefKind::Enum) {
+                let path = crate::provided::norm(&u.prog.def_path(DefId(di as u32)));
+                if let Some((ek, _)) = pc.types.get_key_value(path.as_str()).map(|(k, v)| (k, v.0)).or_else(|| pc.layouts.get_key_value(path.as_str()).map(|(k, v)| (k, v.0))) {
+                    seen.insert(ek);
+                }
+            }
+        }
+        for ek in pc.types.keys().chain(pc.layouts.keys()) {
+            if !seen.contains(ek.as_str()) {
+                entry_bad.push(format!("entry-notype\t{}\t{}", pc.name, ek));
+            }
+        }
+        for (ek, sh) in pc.shims.iter() {
+            // a handle's trait ops are keyed by the type (Relax's opaque bridges)
+            if sh.sig.is_empty() || seen.contains(ek.as_str()) {
+                continue;
+            }
+            entry_bad.push(format!("entry-nodef\t{}\t{}", pc.name, ek));
+        }
+    }
+    for (_, pc) in u.provided.iter() {
+        let _ = writeln!(out, "# relax_api {}: {} ops, {} handles, {} plain, {} owns", pc.name, pc.shims.len(), pc.types.len(), pc.layouts.len(), pc.owns.len());
+    }
+    entry_bad.sort();
+    let _ = writeln!(out, "# relax_api entries without a matching fn: {}", entry_bad.len());
+    for e in &entry_bad {
+        let _ = writeln!(out, "{}", e);
+    }
     let bound = a.bindings.values().filter(|(b, _)| *b).count();
     let _ = writeln!(out, "# bindings: {} rustc, {} from source, {} total distinct called functions", bound, a.bindings.len() - bound, a.bindings.len());
     for (key, (bound, reason)) in &a.bindings {

@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use makepad_relax_api::relax_api;
 
 use std::{
     collections::HashMap,
@@ -54,10 +55,12 @@ impl LiveIdInterner {
     }
 }
 
+#[relax_api(plain)]
 #[derive(Clone, Default, Eq, Hash, Copy, Ord, PartialOrd, PartialEq)]
 #[repr(transparent)]
 pub struct LiveId(pub u64);
 
+#[relax_api]
 impl LiveId {
     pub const SEED: u64 = 0xd6e8_feb8_6659_fd93;
 
@@ -191,6 +194,7 @@ impl LiveId {
 
     /// Records `id_str` as the name of `id`. `replace`: overwrite an existing name; otherwise an
     /// existing different name is kept and false returned.
+    #[relax_api]
     pub fn lut_insert(id: LiveId, id_str: &str, replace: bool) -> bool {
         LiveIdInterner::with(|idmap| {
             if !replace {
@@ -204,11 +208,13 @@ impl LiveId {
     }
 
     /// The byte length of `id`'s recorded name; usize::MAX when it has none.
+    #[relax_api]
     pub fn lut_name_len(id: LiveId) -> usize {
         LiveIdInterner::with(|idmap| idmap.id_to_string.get(&id).map_or(usize::MAX, |s| s.len()))
     }
 
     /// Copies `id`'s recorded name into `out` (as much as fits); returns the bytes copied.
+    #[relax_api]
     pub fn lut_name_copy(id: LiveId, out: &mut [u8]) -> usize {
         LiveIdInterner::with(|idmap| match idmap.id_to_string.get(&id) {
             Some(s) => {
@@ -260,11 +266,13 @@ impl LiveId {
         self.0 != 0
     }
 
+    #[relax_api]
     pub fn unique() -> Self {
         LiveId(UNIQUE_LIVE_ID.fetch_add(1, Ordering::SeqCst))
     }
 }
 
+#[relax_api(plain)]
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum InternLiveId {
@@ -333,6 +341,7 @@ pub struct LiveIdInterner {
 // ----------------------------------------------------------------------------
 
 // Idea taken from the `nohash_hasher` crate.
+#[relax_api(plain)]
 #[derive(Default)]
 pub struct LiveIdHasher(u64);
 
@@ -382,6 +391,7 @@ impl std::hash::Hasher for LiveIdHasher {
     }
 }
 
+#[relax_api(plain)]
 #[derive(Copy, Clone, Default)]
 pub struct LiveIdHasherBuilder {}
 

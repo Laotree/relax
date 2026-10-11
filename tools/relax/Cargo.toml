@@ -13,6 +13,7 @@ name = "relax"
 path = "src/main.rs"
 
 [dependencies]
+makepad-relax-api = { workspace = true, features = ["host-shims"] }
 relax-compiler = { workspace = true }
 # provided crates (Relax binds their C-shaped fns to this binary's code; loader-core.md section 8)
 relax-provided-fixture = { workspace = true, features = ["host-shims"] }

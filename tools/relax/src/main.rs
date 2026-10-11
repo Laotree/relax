@@ -12,7 +12,6 @@ mod lexer {
 mod cef;
 mod fetch;
 mod help;
-mod host_gen;
 mod macros;
 
 /// What this loader was built from (build.rs; the linked compiler's own stamp is
@@ -167,7 +166,6 @@ fn run_package(words: &[String]) -> Option<String> {
         let w = words[i].as_str();
         match w {
             "--units" | "--report-to" | "--entry" | "--boundary" | "--relax-dir" => i += 2,
-            "--host-gen" => i += 3,
             _ if w.starts_with("--") => i += 1,
             _ => return Some(w.to_string()),
         }
@@ -257,66 +255,67 @@ fn src(name: &str) -> u64 {
     u64::from_str_radix(v, 16).unwrap()
 }
 
-/// The crates built into this binary that Relax binds instead of compiling (provided.rs), and
-/// `relax host-gen`, which writes their shim files (host_gen.rs).
+/// The crates built into this binary that Relax binds instead of compiling (provided.rs): their
+/// `#[relax_api]` entries, read from this binary's `relax_api` link section.
 /// Each binds only while the program's source of it is the one built here (check_sources).
+// The provided crates: nothing here calls into them, but they must be in the link for their
+// `#[relax_api]` entries (rustc keeps a linked crate's #[used] statics; an unnamed dependency is
+// not linked at all)
+extern crate makepad_live_id;
+extern crate makepad_script;
+extern crate makepad_script_audio_aot;
+extern crate makepad_script_census;
+extern crate makepad_script_compute;
+extern crate makepad_script_std;
+extern crate makepad_shader;
+extern crate makepad_tween_script;
+extern crate relax_provided_fixture;
+
 fn provided() {
-    use relax_provided_fixture::__host_shims as fx;
-    relax_compiler::provided::register("relax-provided-fixture", fx::SHIMS, fx::TYPES, fx::LAYOUTS, fx::__host_last_panic, src("relax_provided_fixture"));
-    {
-        use makepad_live_id::__host_shims as sh;
-        relax_compiler::provided::register("makepad-live-id", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_live_id"));
-    }
-    {
-        use makepad_script::__host_shims as sh;
-        relax_compiler::provided::register("makepad-script", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script"));
-    }
-    {
-        use makepad_script_std::__host_shims as sh;
-        relax_compiler::provided::register(
-            "makepad-script-std",
-            sh::SHIMS,
-            sh::TYPES,
-            sh::LAYOUTS,
-            sh::__host_last_panic,
-            src("makepad_script_std"),
-        );
-    }
-    {
-        use makepad_script_census::__host_shims as sh;
-        relax_compiler::provided::register(
-            "makepad-script-census",
-            sh::SHIMS,
-            sh::TYPES,
-            sh::LAYOUTS,
-            sh::__host_last_panic,
-            src("makepad_script_census"),
-        );
-    }
-    {
-        use makepad_script_compute::__host_shims as sh;
-        relax_compiler::provided::register("makepad-script-compute", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_compute"));
-    }
-    {
-        use makepad_shader::__host_shims as sh;
-        relax_compiler::provided::register("makepad-shader", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_shader"));
-    }
-    {
-        use makepad_tween_script::__host_shims as sh;
-        relax_compiler::provided::register("makepad-tween-script", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_tween_script"));
-    }
-    {
-        use makepad_script_audio_aot::__host_shims as sh;
-        relax_compiler::provided::register("makepad-script-audio-aot", sh::SHIMS, sh::TYPES, sh::LAYOUTS, sh::__host_last_panic, src("makepad_script_audio_aot"));
+    use std::collections::{HashMap, HashSet};
+    const CRATES: [&str; 9] = [
+        "relax_provided_fixture",
+        "makepad_live_id",
+        "makepad_script",
+        "makepad_script_std",
+        "makepad_script_census",
+        "makepad_script_compute",
+        "makepad_shader",
+        "makepad_tween_script",
+        "makepad_script_audio_aot",
+    ];
+    for krate in CRATES {
+        let mut shims = HashMap::new();
+        let mut types = HashMap::new();
+        let mut layouts = HashMap::new();
+        let mut owns = HashSet::new();
+        for e in makepad_relax_api::entries() {
+            if e.module.split("::").next() != Some(krate) {
+                continue;
+            }
+            match e.kind {
+                makepad_relax_api::OP => {
+                    if let Some(f) = e.shim {
+                        shims.insert(relax_compiler::provided::norm((e.key)()), relax_compiler::provided::Shim { sig: (e.sig)(), slots: e.slots, f });
+                    }
+                }
+                makepad_relax_api::HANDLE => {
+                    types.insert(relax_compiler::provided::norm((e.key)()), (e.size, e.align, e.drop));
+                }
+                makepad_relax_api::PLAIN => {
+                    layouts.insert(relax_compiler::provided::norm((e.key)()), (e.size, e.align, e.offsets));
+                }
+                makepad_relax_api::OWNS => {
+                    owns.insert(relax_compiler::provided::norm((e.key)()));
+                }
+                _ => {}
+            }
+        }
+        relax_compiler::provided::register(krate, shims, types, layouts, owns, makepad_relax_api::last_panic, src(krate));
     }
 
     // Splash VM registry -> relax inspect (vm list, script error events)
     relax_compiler::inspect::set_vm_provider(makepad_script::inspect_registry::summaries);
     relax_compiler::inspect::set_script_stack_provider(makepad_script::inspect_registry::script_stack);
     makepad_script::inspect_registry::set_error_hook(relax_compiler::inspect::script_error_event);
-
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some("host-gen") {
-        std::process::exit(if args.get(2).map(String::as_str) == Some("--worker") { host_gen::worker(&args[3..]) } else { host_gen::main(&args[2..]) });
-    }
 }

@@ -6,7 +6,7 @@ use std::io::IsTerminal;
 
 /// The word a command line starts with, for every command `relax` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
-    "run", "fetch", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition", "host-gen",
+    "run", "fetch", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
     "parse", "resolve", "file", "std-surface", "relax-lex", "help",
 ];
 

@@ -2000,7 +2000,7 @@ impl Unit {
         for (k, pc) in &provided {
             for (i, def) in prog.defs.iter().enumerate() {
                 if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
-                    let path = prog.def_path(DefId(i as u32));
+                    let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
                     if let Some((size, align, drop)) = pc.types.get(path.as_str()) {
                         provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
                         opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
@@ -7383,13 +7383,13 @@ unsafe fn build_rir_inner_body(up: *mut Unit, id: u32) -> Result<crate::rir::Fun
 }
 
 /// The bridge body of `d` when it is a provided crate's bound fn; Ok(None) when `d` compiles
-/// from source; Err when its shim is missing or its signature changed since host-gen.
+/// from source; Err when its shim is missing or its signature differs from what rustc built (rebuild relax).
 /// `<T as Hash>::hash::<H>`, `<T as Debug>::fmt`, `<T as Display>::fmt` of a provided crate's
 /// opaque type T (rustc's layout; its fields are rustc's to read, also by its own impls of
 /// these traits, derived or written): forwarded to std's `core::hash::__relax_opaque_hash::<T,
 /// H>` / `core::fmt::__relax_opaque_debug::<T>` / `__relax_opaque_display::<T>`, whose
 /// `__relax_opaque_hash_into::<T>` / `__relax_opaque_fmt_into::<T>` are bridged here to the
-/// shims host-gen writes for T (rustc runs the impl; bytes / text come back by callback).
+/// ops `#[relax_api(handle, hash, debug, display)]` generates for T (rustc runs the impl; bytes / text come back by callback).
 unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> Result<Option<crate::rir::Func>, String> {
     let opaque = |u: &Unit, t: TyId| match u.tcx.tys.kind(t) {
         TyKind::Adt(ad, aa, _) if aa.is_empty() && u.provided_types.contains_key(ad) => Some(*ad),
@@ -7402,16 +7402,16 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
     if Some(d) == hash_into || Some(d) == fmt_into {
         let Some(ad) = args.first().and_then(|t| opaque(u, *t)) else { return Ok(None) };
         let tr = if Some(d) == hash_into { "Hash>::hash_into" } else { "Fmt>::fmt_into" };
-        let key = format!("<{} as {}", u.prog.def_path(ad), tr);
+        let key = crate::provided::norm(&format!("<{} as {}", u.prog.def_path(ad), tr));
         let krate = u.prog.def(ad).krate;
         let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
-        let Some((_, shim)) = pc.shims.get(key.as_str()) else {
-            return Err(format!("host shims are stale: no `{}` (run relax host-gen)", key));
+        let Some(shim) = pc.shims.get(key.as_str()).map(|s| s.f) else {
+            return Err(format!("`{}` is not provided: mark the type #[relax_api(handle, ..)] with that trait", key));
         };
         let sig = u.tcx.fn_sig(&u.prog, d).cloned().ok_or("no signature")?;
         let ps: Vec<TyId> = sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)).collect();
         let ret = u.tcx.tys.unit;
-        let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), *shim as usize as u64);
+        let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), shim as usize as u64);
         let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
         return Ok(Some(crate::lower::bridge_func_sig(u, &ps, ret, format!("{} (provided)", key), shim, last)));
     }
@@ -7431,12 +7431,12 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
         let krate = u.prog.def(ad).krate;
         let key = crate::provided::opaque_method_key(&u.prog, ad, &mname);
         let pc = &u.provided.iter().find(|(k, _)| *k == krate).unwrap().1;
-        let Some((_, shim)) = pc.shims.get(key.as_str()) else {
-            return Err(format!("host shims are stale: no `{}` (run relax host-gen)", key));
+        let Some(shim) = pc.shims.get(key.as_str()).map(|s| s.f) else {
+            return Err(format!("`{}` is not provided: mark the type #[relax_api(handle, ..)] with that trait", key));
         };
         let r = u.tcx.tys.intern(TyKind::Ref(false, st, crate::types::RegionId::ERASED));
         let (ps, ret) = if is_eq { (vec![r, r], u.tcx.tys.bool_) } else { (vec![r], st) };
-        let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), *shim as usize as u64);
+        let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), shim as usize as u64);
         let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
         return Ok(Some(crate::lower::bridge_func_sig(u, &ps, ret, format!("{} (provided)", key), shim, last)));
     }
@@ -7469,32 +7469,45 @@ fn provided_bridge(u: &Unit, d: DefId) -> Result<Option<crate::rir::Func>, Strin
     }
     let key = crate::provided::key(&u.prog, &u.tcx, d);
     match pc.shims.get(key.as_str()) {
-        Some((h, shim)) if *h == crate::provided::sig_hash(&u.prog, &u.tcx, d) => {
-            // the std instances and other crates' types it passes must be laid out as rustc does
-            let mut deps = Vec::new();
-            if let Some(sg) = u.tcx.fn_sig(&u.prog, d) {
-                for t in sg.params.iter().chain(std::iter::once(&sg.ret)) {
-                    crate::provided::layout_deps(&u.prog, &u.tcx, krate, *t, &mut deps);
-                }
+        Some(sh) => {
+            let ours = crate::provided::sig(&u.prog, &u.tcx, d);
+            if crate::provided::norm(sh.sig) != ours {
+                return Err(format!("`{}`: rustc built it as `{}`, this source reads `{}`: rebuild relax (cargo build --release -p relax)", key, sh.sig, ours));
             }
-            for t in deps {
-                let tk = crate::typeck::ty_to_string(false, &u.prog, &u.tcx, t);
-                let l = u.lay.of(&crate::layout::LayoutCx::new(&u.prog), &u.tcx, t);
-                match pc.layouts.get(tk.as_str()) {
-                    Some((size, align, _)) if *size == l.size as u64 && *align == l.align as u64 => {}
-                    Some((size, align, _)) => {
-                        return Err(format!("`{}` passes `{}`, which rustc lays out in {} bytes (align {}) and Relax in {} (align {})", key, tk, size, align, l.size, l.align));
+            // every parameter and the result laid out as rustc does
+            if let Some(sg) = u.tcx.fn_sig(&u.prog, d) {
+                let cx = crate::layout::LayoutCx::new(&u.prog);
+                let tys: Vec<TyId> = sg.params.iter().copied().chain(std::iter::once(sg.ret)).collect();
+                if tys.len() != sh.slots.len() {
+                    return Err(format!("`{}`: rustc records {} slots, Relax reads {}: rebuild relax", key, sh.slots.len(), tys.len()));
+                }
+                for (t, slot) in tys.iter().zip(sh.slots) {
+                    let empty = matches!(u.tcx.tys.kind(*t), TyKind::Never) || matches!(u.tcx.tys.kind(*t), TyKind::Tuple(v) if v.is_empty());
+                    if empty {
+                        continue;
                     }
-                    None => return Err(format!("host shims are stale: no layout of `{}` for `{}` (run relax host-gen)", tk, key)),
+                    let l = u.lay.of(&cx, &u.tcx, *t);
+                    if l.size as u64 != slot[0] || l.align as u64 != slot[1] {
+                        let ts = crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t);
+                        return Err(format!("`{}` passes `{}`, which rustc lays out in {} bytes (align {}) and Relax in {} (align {})", key, ts, slot[0], slot[1], l.size, l.align));
+                    }
+                    if slot[2] != 0 {
+                        if let TyKind::Ref(_, x, _) = u.tcx.tys.kind(*t).clone() {
+                            let l = u.lay.of(&cx, &u.tcx, x);
+                            if l.size as u64 != slot[2] || l.align as u64 != slot[3] {
+                                let ts = crate::typeck::ty_to_string(false, &u.prog, &u.tcx, x);
+                                return Err(format!("`{}` passes a reference to `{}`, which rustc lays out in {} bytes (align {}) and Relax in {} (align {})", key, ts, slot[2], slot[3], l.size, l.align));
+                            }
+                        }
+                    }
                 }
             }
             let name = format!("{} (provided)", key);
-            let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), *shim as usize as u64);
+            let shim = u.syms.intern(crate::syms::SymKind::Provided(format!("shim:{}", key)), sh.f as usize as u64);
             let last = u.syms.intern(crate::syms::SymKind::Provided(format!("last_panic:{}", pc.name)), pc.last_panic as usize as u64);
             Ok(crate::lower::bridge_func(u, d, name, shim, last))
         }
-        Some(_) => Err(format!("host shims are stale: `{}` changed its signature (run relax host-gen)", key)),
-        // not nameable from the crate root (host-gen skipped it): compiled from source
+        // not marked #[relax_api]: compiled from source
         None => Ok(None),
     }
 }

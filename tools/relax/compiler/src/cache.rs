@@ -2899,8 +2899,8 @@ pub fn write_trace() {
 fn provided_value(u: &Unit, name: &str) -> Option<u64> {
     if let Some(key) = name.strip_prefix("shim:") {
         for (_, pc) in &u.provided {
-            if let Some((_, f)) = pc.shims.get(key) {
-                return Some(*f as usize as u64);
+            if let Some(sh) = pc.shims.get(key) {
+                return Some(sh.f as usize as u64);
             }
         }
         return None;

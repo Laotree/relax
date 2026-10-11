@@ -435,8 +435,8 @@ impl<'a> Lcx<'a> {
     /// A provided crate's own fn compiled here (it has no shim) that calls std's raw ownership
     /// operations (Arc/Rc reference counts through raw pointers, Box/Arc/Rc::from_raw) works
     /// objects rustc allocated with Relax's std, whose layouts differ (KernelRef::clone was
-    /// Arc::increment_strong_count on rustc's ArcInner: Stage aborted). Such a fn must be an op
-    /// in the crate's relax_api.txt, so it runs on the compiled side.
+    /// Arc::increment_strong_count on rustc's ArcInner: Stage aborted). Such a fn must be marked
+    /// `#[relax_api]` (an op), so it runs on the compiled side.
     fn check_provided_ownership(&mut self, callee: u32) {
         let crate::jit::FnKey::Inst(d, args) = self.u.fns[self.cur_fn as usize].key.clone() else { return };
         let krate = self.u.prog.def(d).krate;
@@ -464,10 +464,10 @@ impl<'a> Lcx<'a> {
         let std_owner = path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::");
         if std_owner && RAW.iter().any(|r| path.ends_with(r)) {
             let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
-            if crate::provided::owns(&self.u.prog, krate, &key) {
+            if crate::provided::owns(&self.u.provided, krate, &key) {
                 return;
             }
-            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: list it as an `op` in the crate's relax_api.txt (or `owns` if the object is one JIT code allocated)", key, path, key));
+            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or #[relax_api(owns)] if the object is one JIT code allocated", key, path, key));
         }
     }
 
@@ -494,7 +494,7 @@ impl<'a> Lcx<'a> {
                 if args.is_empty() && self.u.provided.iter().any(|(k, _)| *k == krate) {
                     let name = self.u.prog.syms.str(self.u.prog.crates[krate as usize].name).replace('_', "-");
                     msg.push_str(&format!(
-                        " (`{}` of {} runs here because it is not an `op` in that crate's relax_api.txt: add it there, or call one of the listed ops)",
+                        " (`{}` of {} runs here because it is not marked `#[relax_api]` in that crate: mark it, or call one of the crate's ops)",
                         crate::provided::key(&self.u.prog, &self.u.tcx, d),
                         name
                     ));

@@ -391,7 +391,6 @@ pub fn split_args(args: &[String]) -> Option<Result<(Vec<String>, Spec, bool, Ve
         }
         let n = match args[i].as_str() {
             "--units" | "--report-to" | "--entry" | "--boundary" => 2,
-            "--host-gen" => 3,
             _ => 1,
         };
         opts.extend(args[i..(i + n).min(args.len())].iter().cloned());
