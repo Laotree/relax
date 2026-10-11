@@ -4,7 +4,7 @@
 
 use crate::endpoint::Endpoint;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// The socket and discovery file paths of process `pid`.
 pub fn paths(pid: u32) -> (PathBuf, PathBuf) {
@@ -25,6 +25,7 @@ mod imp {
     use crate::carrier::Carrier;
     use crate::frame::FrameReader;
     use std::os::unix::net::{UnixListener, UnixStream};
+    use std::path::Path;
 
     fn bind(path: &Path) -> io::Result<UnixListener> {
         use std::os::unix::fs::PermissionsExt;
