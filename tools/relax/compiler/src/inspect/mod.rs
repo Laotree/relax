@@ -76,7 +76,7 @@ pub fn start(app: &str) {
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
-    heap::start_from_env();
+    heap::start_at_load();
 }
 
 /// The commands: (name, arguments, what it answers).
