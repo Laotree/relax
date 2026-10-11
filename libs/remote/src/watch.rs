@@ -24,6 +24,12 @@ fn drop_line(lost: u64) -> Vec<u8> {
 /// Args: `from=<seq>` continues after that event; without it the connection's RESUME (if any)
 /// decides, else the channel sees events from now on.
 pub fn service(ring: Arc<Ring>) -> Factory {
+    service_with(ring, || {}, || {})
+}
+
+/// As [`service`], calling `opened` when a channel starts following and `closed` when it ends
+/// (a host counts its watchers with them).
+pub fn service_with(ring: Arc<Ring>, opened: fn(), closed: fn()) -> Factory {
     Arc::new(move |conn, open| {
         let from = open.args.split_whitespace().find_map(|a| a.strip_prefix("from=")?.parse::<u64>().ok()).or_else(|| conn.resume().and_then(|r| r.seqs.iter().find(|s| s.0 == "watch").map(|s| s.1)));
         let cur = match from {
@@ -36,7 +42,9 @@ pub fn service(ring: Arc<Ring>) -> Factory {
             .name("makepad-remote-watch".into())
             .spawn(move || {
                 (hooks.enter)();
+                opened();
                 serve_feed(&ring, Kind::Watch, open.channel, cur, drop_line);
+                closed();
                 (hooks.exit)();
             })
             .map(|_| ())

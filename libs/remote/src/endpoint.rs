@@ -79,6 +79,12 @@ impl Endpoint {
         WatchSink(self.0.ring.clone())
     }
 
+    /// The `watch` service, calling `opened` / `closed` as channels start and stop following.
+    pub fn register_watch_with(&self, opened: fn(), closed: fn()) -> WatchSink {
+        self.register("watch", 1, crate::watch::service_with(self.0.ring.clone(), opened, closed));
+        WatchSink(self.0.ring.clone())
+    }
+
     /// The `stream` service; chunks are published through the returned sink.
     pub fn register_stream(&self) -> StreamSink {
         self.register("stream", 1, crate::stream::service(self.0.ring.clone()));

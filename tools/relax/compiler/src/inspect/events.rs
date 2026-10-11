@@ -73,6 +73,20 @@ pub fn watched() -> bool {
     WATCHERS.load(Relaxed) > 0 || super::AGENT.load(Relaxed)
 }
 
+/// A makepad-remote `watch` channel started following: it counts as a watcher, like a `watch` command.
+pub fn remote_watcher_opened() {
+    WATCHERS.fetch_add(1, SeqCst);
+    super::timeline::set_frame_watch(true);
+    retry_update();
+}
+
+pub fn remote_watcher_closed() {
+    if WATCHERS.fetch_sub(1, SeqCst) == 1 && !super::AGENT.load(Relaxed) {
+        super::timeline::set_frame_watch(false);
+    }
+    retry_update();
+}
+
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
     RELAX_RETRY_ON.store(watched(), Relaxed);
