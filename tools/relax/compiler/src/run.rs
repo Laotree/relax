@@ -33,6 +33,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 static mut RUN_UNIT: *mut Unit = std::ptr::null_mut();
+
+/// The unit of the program `relax run` booted (null before it did).
+pub(crate) fn running_unit() -> *mut Unit {
+    unsafe { RUN_UNIT }
+}
 static PHASES: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
 static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
@@ -1243,7 +1248,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         crate::domain::run_vehicle(up, domain_packages);
     }
     let r = match main_call(&mut u, main_def, entry) {
-        Ok((target, arg)) => unsafe { jit::call_jit(up, target, arg) },
+        // (the host's hook around the app, e.g. the capabilities it grants: domain.rs)
+        Ok((target, arg)) => crate::domain::boot_around(|| unsafe { jit::call_jit(up, target, arg) }),
         Err(e) => {
             eprintln!("relax-run: {e}");
             // Workers already hold this unit's pointer. Its Drop waits

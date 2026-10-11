@@ -1002,7 +1002,8 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
         eprintln!("relax: {} ({}, address {:#x}) inside a guarded module call on thread '{}' at {}: contained, the call returns an error", info.kind, label, info.fault_addr, tname, at);
         return false;
     }
-    if FAULTS_FATAL.load(Ordering::Relaxed) {
+    // (a fault in an app domain is that domain's crash: the others go on)
+    if FAULTS_FATAL.load(Ordering::Relaxed) && !crate::domain::in_app_domain() {
         let r = owner::call(owner::Class::Job, || u.report(info));
         eprintln!("relax: {} ({}, address {:#x}) in program code on thread '{}' at {}: the process ends (the fault may be the program's or a Relax miscompile; a crash report follows)\n  report: {}", info.kind, label, info.fault_addr, tname, at, r);
         return true;
@@ -1348,6 +1349,26 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     }
 }
 
+/// Ends the run of the calling thread's `call_jit_in` without a panic report: it returns
+/// `Err(PanicInfo { kind, message })` to its caller (a domain's `process::exit`, domain.rs). The
+/// frames in between run no cleanups. A thread with no recovery point (native code called into
+/// JIT code) cannot leave: it parks for good.
+pub(crate) fn leave_thread(kind: &str, message: String) -> ! {
+    if unsafe { *ctx_ptr() } == 0 {
+        loop {
+            std::thread::park();
+        }
+    }
+    let info = PanicInfo { kind: kind.to_string(), message, site: u64::MAX, frames: Vec::new(), fault_addr: 0, location: String::new() };
+    PANIC.with(|p| *p.borrow_mut() = Some(info));
+    CLEANING.with(|c| c.set(0));
+    UNWINDING.with(|c| c.set(false));
+    unsafe {
+        let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
+        leave(ctx_ptr(), 1)
+    }
+}
+
 // Panic entries are reached through `panic_tramp`, which passes the JIT caller's frame
 // (frame pointer, return address) as arguments 6 and 7 (x6/x7 on arm64, the first two
 // stack arguments on x86-64), so entries keep up to six arguments of their own.
@@ -1617,6 +1638,10 @@ pub static COMPILE_ERRORS_FATAL: std::sync::atomic::AtomicBool = std::sync::atom
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
     if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) && p.message.starts_with("compile error in ") {
         eprintln!("relax-run: {} -- the program cannot run past it (rustc rejects it)\n  report: {}", p.message, report);
+        // an app domain's compile error is that domain's crash (its thread ends next); the others go on
+        if crate::domain::crash_current(&p.message) {
+            return;
+        }
         std::process::exit(101);
     }
 }
@@ -1628,6 +1653,8 @@ fn rt_thread_run(entry: u64, arg: u64) -> u64 {
     // runs on the calling thread, in the domain it is in
     match unsafe { call_jit_in(u, crate::domain::current(), entry, arg) } {
         Ok(_) => 0,
+        // `process::exit` on a thread of an app domain: it ended the domain (domain.rs), this thread ends quietly
+        Err(p) if p.kind == crate::domain::EXIT_KIND => 0,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
             fatal_compile_error(&p, &r);
@@ -3829,7 +3856,9 @@ impl Unit {
                 // (`relax test` / `live` keep it recoverable, as for compile errors)
                 if COMPILE_ERRORS_FATAL.load(Ordering::Relaxed) {
                     eprintln!("relax-run: {} -- the program cannot run past it (rustc rejects it)", m);
-                    std::process::exit(101);
+                    if !crate::domain::crash_current(&m) {
+                        std::process::exit(101);
+                    }
                 }
                 // queries.rs:58-108: evaluation errors return to the caller;
                 // const_eval_resolve turns this into Reported.
@@ -11353,6 +11382,7 @@ pub fn set_exit_hook(f: extern "C" fn()) {
 /// compile waited forever for the unit lock of a thread ExitProcess had already ended (Amp never
 /// exited after its window closed).
 pub extern "C" fn __relax_exit(code: i32) {
+    crate::domain::exit_current(code);
     crate::tui::exit_code(code);
     let h = EXIT_HOOK.load(Ordering::SeqCst);
     if h != 0 {
@@ -11364,6 +11394,8 @@ pub extern "C" fn __relax_exit(code: i32) {
 
 #[cfg(unix)]
 extern "C" fn recorded_exit(code: i32) -> ! {
+    // an app domain's exit ends that domain only (domain.rs)
+    crate::domain::exit_current(code);
     crate::tui::exit_code(code);
     os::proc::exit(code)
 }

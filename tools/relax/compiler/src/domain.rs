@@ -247,8 +247,12 @@ pub enum DomainState {
     Stopped,
 }
 
+/// Runs a closure on the calling thread, with whatever the host sets up around it (its
+/// capabilities, the launch a HAL session is opened with): the host's hook around the app's `main`.
+pub type Around = std::sync::Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>;
+
 /// The app to start as a domain.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct AppSpec {
     /// the cargo package (as `relax run <package>`)
     pub package: String,
@@ -260,6 +264,9 @@ pub struct AppSpec {
     pub parent: Option<DomainId>,
     /// the id the host allocated (its session id); None: the next free one
     pub id: Option<DomainId>,
+    /// the host's hook around the app's whole run, on the domain's thread (host-native code,
+    /// never JIT code; nothing app-specific)
+    pub around: Option<Around>,
 }
 
 /// One domain, as `list` / `state` report it.
@@ -291,6 +298,8 @@ struct Domain {
     started: std::time::Instant,
     /// the app's argv (argv[0] first); empty: the process's (domain 0)
     args: Vec<Vec<u8>>,
+    /// the domain's main thread has returned (its block can go)
+    thread_done: bool,
 }
 
 /// The argv of the domain whose block is at `base` (None: the process's own).
@@ -331,6 +340,7 @@ pub(crate) fn register_boot(package: &str, base: u64) {
         info: DomainInfo { id: 0, package: package.to_string(), parent: None, state: DomainState::Running, base, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None },
         started: std::time::Instant::now(),
         args: Vec::new(),
+        thread_done: false,
     });
 }
 
@@ -513,13 +523,23 @@ pub fn start(up: *mut Unit, spec: AppSpec) -> Result<DomainId, Vec<String>> {
     let id = {
         let mut d = domains();
         let id = spec.id.unwrap_or_else(|| d.iter().map(|x| x.info.id + 1).max().unwrap_or(1));
-        if d.iter().any(|x| x.info.id == id) {
-            return Err(vec![format!("domain {id} exists")]);
+        // a relaunch starts the app again under its id: the ended run's record and block go
+        if let Some(k) = d.iter().position(|x| x.info.id == id) {
+            let old = &d[k];
+            let ended = matches!(old.info.state, DomainState::Crashed(_) | DomainState::Exited(_) | DomainState::Stopped);
+            if id == 0 || !ended || !(old.thread_done || old.info.base == 0) {
+                return Err(vec![format!("domain {id} exists")]);
+            }
+            let old = d.remove(k);
+            if old.info.base != 0 {
+                destroy(old.info.base);
+            }
         }
         d.push(Domain {
             info: DomainInfo { id, package: spec.package.clone(), parent: spec.parent, state: DomainState::Compiling("package graph".into()), base: 0, crates: 0, reused: 0, loaded: 0, new_crates: Vec::new(), resolve_ms: 0.0, load_ms: 0.0, spawn_ms: 0.0, first_frame_ms: None },
             started: t0,
             args: std::iter::once(spec.package.clone().into_bytes()).chain(spec.args.iter().map(|a| a.clone().into_bytes())).collect(),
+            thread_done: false,
         });
         id
     };
@@ -582,19 +602,120 @@ pub fn start(up: *mut Unit, spec: AppSpec) -> Result<DomainId, Vec<String>> {
         }
     }
     let name = format!("domain-{id}-{}", spec.package);
+    let around = spec.around.clone();
     let spawned = std::thread::Builder::new().name(name).stack_size(64 << 20).spawn(move || {
         let up = upn as *mut Unit;
-        set_state(id, DomainState::Running);
-        match unsafe { crate::jit::call_jit_in(up, base, target, arg) } {
-            Ok(_) => set_state(id, DomainState::Exited(0)),
-            Err(p) => set_state(id, DomainState::Crashed(format!("{}: {}", p.kind, p.message))),
+        let mut run = || {
+            set_state(id, DomainState::Running);
+            match unsafe { crate::jit::call_jit_in(up, base, target, arg) } {
+                Ok(_) => end(id, DomainState::Exited(0)),
+                // `process::exit` on the domain's thread (exit_current) already ended it
+                Err(p) if p.kind == EXIT_KIND => {}
+                Err(p) => end(id, DomainState::Crashed(format!("{}: {}", p.kind, p.message))),
+            }
+        };
+        match &around {
+            Some(a) => a(&mut run),
+            None => run(),
         }
+        if let Some(x) = domains().iter_mut().find(|x| x.info.id == id) {
+            x.thread_done = true;
+        }
+        CHANGED.notify_all();
     });
     if let Err(e) = spawned {
         destroy(base);
         return fail(id, vec![format!("starting the domain's thread: {e}")]);
     }
     Ok(id)
+}
+
+/// The kind of the `PanicInfo` a domain thread's `process::exit` leaves with (the code is its message).
+pub(crate) const EXIT_KIND: &str = "domain exit";
+
+/// The domain ends in `st` (exited or crashed); a domain that already ended keeps its first end.
+fn end(id: DomainId, st: DomainState) {
+    if matches!(state(id), Some(DomainState::Compiling(_) | DomainState::Running)) {
+        set_state(id, st);
+    }
+}
+
+/// The id of the app domain whose block is the calling thread's (None: the compile domain, or a
+/// thread that is in none).
+fn current_app_domain() -> Option<DomainId> {
+    let base = current();
+    domains().iter().find(|d| d.info.base == base && d.info.id != 0).map(|d| d.info.id)
+}
+
+/// `std::process::exit(code)` on a thread of an app domain ends that domain, not the process:
+/// the domain is Exited(code) and the thread leaves its run (the frames' cleanups do not run, as
+/// for an exit). False on any other thread: the caller exits the process.
+pub(crate) fn exit_current(code: i32) -> bool {
+    let Some(id) = current_app_domain() else { return false };
+    end(id, DomainState::Exited(code));
+    crate::jit::leave_thread(EXIT_KIND, code.to_string())
+}
+
+/// A compile error or fault the run cannot go on past (`COMPILE_ERRORS_FATAL`): in an app domain
+/// it crashes that domain only. False on any other thread: the caller ends the process.
+pub(crate) fn crash_current(msg: &str) -> bool {
+    let Some(id) = current_app_domain() else { return false };
+    end(id, DomainState::Crashed(msg.to_string()));
+    true
+}
+
+/// Whether the calling thread runs an app domain (not the process's own app).
+pub(crate) fn in_app_domain() -> bool {
+    current_app_domain().is_some()
+}
+
+/// Waits (up to `timeout`) until the domain's main thread has returned (or it never ran); true
+/// when it has.
+pub fn wait_thread_done(id: DomainId, timeout: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + timeout;
+    let mut d = domains();
+    loop {
+        match d.iter().find(|x| x.info.id == id) {
+            Some(x) if !(x.thread_done || x.info.base == 0) => {}
+            _ => return true,
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        d = CHANGED.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
+}
+
+/// The host starts an app as a domain of the program `relax run` booted (`start` on its unit).
+pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
+    let up = crate::run::running_unit();
+    if up.is_null() {
+        return Err(vec!["no program is running".to_string()]);
+    }
+    start(up, spec)
+}
+
+/// The hook around the boot app's `main` (domain 0), set by the host before `relax run` boots
+/// (the privilege `--privileged` grants is one such hook).
+static BOOT_AROUND: Mutex<Option<Around>> = Mutex::new(None);
+
+pub fn set_boot_around(a: Around) {
+    *BOOT_AROUND.lock().unwrap_or_else(|e| e.into_inner()) = Some(a);
+}
+
+/// Runs the boot app's main inside the host's hook, if it set one.
+pub(crate) fn boot_around<R>(f: impl FnOnce() -> R) -> R {
+    let a = BOOT_AROUND.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match a {
+        None => f(),
+        Some(a) => {
+            let mut f = Some(f);
+            let mut out = None;
+            a(&mut || out = Some((f.take().expect("once"))()));
+            out.expect("the hook ran the app")
+        }
+    }
 }
 
 /// On the owner thread: gets the crates of `g` into the program (shared ones are reused) and
