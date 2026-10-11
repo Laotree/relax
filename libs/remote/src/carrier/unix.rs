@@ -1,6 +1,6 @@
 //! The local carrier: a Unix socket `$TMPDIR/makepad-remote-<pid>.sock` (0600, same-uid peers
-//! only) next to the discovery file `makepad-remote-<pid>.json`. On Windows the socket is not
-//! available yet (as with the inspect socket before it).
+//! only) next to the discovery file `makepad-remote-<pid>.json`. On Windows the same
+//! discovery file points at the loopback carrier (`carrier::loopback`: TCP on 127.0.0.1 behind a token).
 
 use crate::endpoint::Endpoint;
 use std::io;
@@ -185,7 +185,7 @@ mod imp {
         unsafe { atexit(cleanup) };
         Ok(PathBuf::from(socket))
     }
-    pub fn listen_at(_ep: &Endpoint, _path: &Path) -> io::Result<()> {
+    pub fn listen_at(_ep: &Endpoint, _path: &std::path::Path) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
     }
 }

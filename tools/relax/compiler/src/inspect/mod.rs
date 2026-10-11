@@ -71,6 +71,10 @@ pub fn start(app: &str) {
     endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
     endpoint.register_cmd(dispatch);
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
+    for (name, version, open, close) in SERVICES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        serve_program_service(&endpoint, name, *version, *open, *close);
+    }
+    *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
     let sock = match endpoint.listen_unix(&extra) {
         Ok(s) => s,
         Err(e) => {
@@ -582,15 +586,17 @@ pub fn script_error_event(line: &str) {
     events::emit("scripterr", line, &format!("\"error\":{},\"more\":[\"vms\"]", json_str(&short(line, 400))));
 }
 
-/// A command the running program answers itself: `query(line, sink, ctx)` writes the reply's JSON
-/// lines through `sink` (called from the inspect thread; the program's code does its own thread
-/// hand-over).
-pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void);
+/// A command the running program answers itself: `query(line, sink, ctx)` gets the request as the
+/// host received it (one flat JSON object), applies the request's own size rule (`full=1`) and
+/// writes the reply's JSON lines through `sink` as it produces them (chunks, not lines; called
+/// from the inspect thread, the program's code does its own thread hand-over). Returns whether
+/// it cut the reply at the limit.
+pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) -> bool;
 
 static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery)>> = std::sync::Mutex::new(Vec::new());
 
-/// The program registers the command `name` (makepad-platform: `gpu`); a later registration
-/// replaces the earlier one.
+/// The program registers the command `name` (makepad-platform: `gpu` and the remote commands); a
+/// later registration replaces the earlier one.
 pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: ProgramQuery) {
     let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
     let mut p = PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
@@ -602,24 +608,112 @@ fn provider(cmd: &str) -> Option<ProgramQuery> {
     PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == cmd).map(|x| x.1)
 }
 
+/// What the sink of [`cmd_provided`] writes into: the reply, cut into lines.
+struct ProvidedReply<'a, 'b> {
+    out: &'a mut Out<'b>,
+    pending: Vec<u8>,
+}
+
 fn cmd_provided(req: &Req, out: &mut Out) {
     let Some(query) = provider(&req.cmd) else { return };
-    let mut line = req.cmd.clone();
-    for p in &req.pos {
-        line.push(' ');
-        line.push_str(p);
-    }
-    for (k, v) in &req.kv {
-        line.push_str(&format!(" {k}={v}"));
-    }
+    let mut words = vec![req.cmd.clone()];
+    words.extend(req.pos.iter().cloned());
+    let line = makepad_remote::app::request_line(&words, &req.kv);
     extern "C" fn sink(p: *const u8, len: usize, ctx: *mut std::ffi::c_void) {
-        let out = unsafe { &mut *(ctx as *mut Out) };
-        let text = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(p, len)) };
-        for l in text.lines() {
-            out.line(l);
+        let reply = unsafe { &mut *(ctx as *mut ProvidedReply) };
+        reply.pending.extend_from_slice(unsafe { std::slice::from_raw_parts(p, len) });
+        while let Some(nl) = reply.pending.iter().position(|b| *b == b'\n') {
+            let l: Vec<u8> = reply.pending.drain(..=nl).collect();
+            // the program applied the size rule itself: not metered again here
+            reply.out.always(String::from_utf8_lossy(&l[..nl]).as_ref());
         }
     }
-    query(line.as_ptr(), line.len(), sink, out as *mut Out as *mut std::ffi::c_void);
+    let mut reply = ProvidedReply { out, pending: Vec::new() };
+    let truncated = query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void);
+    if !reply.pending.is_empty() {
+        let rest = String::from_utf8_lossy(&reply.pending).into_owned();
+        reply.out.always(&rest);
+    }
+    if truncated {
+        reply.out.truncated = true;
+    }
+}
+
+// ------------------------------------------------------------------ program services
+
+/// `sink(ctx, kind, ptr, len)` of a service channel: kind 0 sends `ptr..len` as one message (false:
+/// the client is gone), 1 ends the stream, 2 ends it with `ptr..len` as the reason. The end call
+/// is the last the program makes for the channel.
+pub type ServiceSink = extern "C" fn(ctx: *mut std::ffi::c_void, kind: u32, ptr: *const u8, len: usize) -> bool;
+/// Starts a producer for one channel (`args` = the OPEN arguments); returns its handle, 0 when
+/// refused (after an end call with the reason).
+pub type ServiceOpen = extern "C" fn(args: *const u8, len: usize, sink: ServiceSink, ctx: *mut std::ffi::c_void) -> usize;
+/// The client closed the channel: the producer for `handle` stops.
+pub type ServiceClose = extern "C" fn(handle: usize);
+
+struct ServiceChannel {
+    tx: makepad_remote::ChannelTx,
+    reason: Mutex<Option<String>>,
+}
+
+extern "C" fn service_sink(ctx: *mut std::ffi::c_void, kind: u32, ptr: *const u8, len: usize) -> bool {
+    let channel = unsafe { &*(ctx as *const ServiceChannel) };
+    let bytes = if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(ptr, len) } };
+    if kind == 0 {
+        return channel.tx.send(bytes.to_vec()).is_ok();
+    }
+    // the end: close the channel and give back the program's reference
+    let why = String::from_utf8_lossy(bytes).into_owned();
+    if kind == 2 {
+        *channel.reason.lock().unwrap() = Some(why.clone());
+    }
+    channel.tx.close(if kind == 2 { makepad_remote::conn::CLOSE_REFUSED } else { makepad_remote::conn::CLOSE_NORMAL }, &why);
+    drop(unsafe { std::sync::Arc::from_raw(ctx as *const ServiceChannel) });
+    true
+}
+
+static ENDPOINT: Mutex<Option<makepad_remote::Endpoint>> = Mutex::new(None);
+static SERVICES: Mutex<Vec<(String, u32, ServiceOpen, ServiceClose)>> = Mutex::new(Vec::new());
+
+fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, version: u32, open: ServiceOpen, close: ServiceClose) {
+    endpoint.register(
+        name,
+        version,
+        std::sync::Arc::new(move |_conn, opened| {
+            let channel = std::sync::Arc::new(ServiceChannel { tx: opened.channel.tx(), reason: Mutex::new(None) });
+            // one reference for the program (freed by its end call), one kept here
+            let for_program = std::sync::Arc::into_raw(channel.clone()) as *mut std::ffi::c_void;
+            let handle = open(opened.args.as_ptr(), opened.args.len(), service_sink, for_program);
+            if handle == 0 {
+                let why = channel.reason.lock().unwrap().take().unwrap_or_else(|| "the program refused".into());
+                return Err((makepad_remote::conn::CLOSE_REFUSED, why));
+            }
+            let ch = opened.channel;
+            let _ = std::thread::Builder::new().name("makepad-remote-service".into()).spawn(move || {
+                while let Some(ev) = ch.recv() {
+                    if matches!(ev, makepad_remote::Event::Closed(..)) {
+                        break;
+                    }
+                }
+                close(handle);
+            });
+            Ok(())
+        }),
+    );
+}
+
+/// The program registers the service `name` (makepad-platform: `frames`): the host serves it on
+/// its endpoint, each channel a producer the program runs. The same mechanism as
+/// [`relax_register_inspect`], for streams.
+pub extern "C" fn relax_register_remote_service(name: *const u8, len: usize, version: u32, open: ServiceOpen, close: ServiceClose) {
+    let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
+    let mut services = SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+    services.retain(|x| x.0 != name);
+    services.push((name.clone(), version, open, close));
+    // the endpoint may be up already; otherwise `start` serves what is registered by then
+    if let Some(endpoint) = ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        serve_program_service(endpoint, &name, version, open, close);
+    }
 }
 
 fn cmd_vms(out: &mut Out) {

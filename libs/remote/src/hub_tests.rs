@@ -90,10 +90,12 @@ fn cmd_goes_to_the_endpoint() {
     for target in [format!("d:makepad-remote-test"), format!("d:{me}"), format!("d:x#{me}")] {
         let ch = c.open("route", &format!("{target} cmd")).unwrap();
         ch.send(b"ping".to_vec()).unwrap();
-        assert_eq!(lines_of(&ch), vec!["{\"pong\":1}".to_string()], "{target}");
+        let reply = lines_of(&ch);
+        assert!(reply.len() == 1 && reply[0].starts_with("{\"pong\":1"), "{target}: {reply:?}");
         // a second request on the same channel
         ch.send(b"ping".to_vec()).unwrap();
-        assert_eq!(lines_of(&ch), vec!["{\"pong\":1}".to_string()]);
+        let reply = lines_of(&ch);
+        assert!(reply.len() == 1 && reply[0].starts_with("{\"pong\":1"), "{reply:?}");
     }
 }
 

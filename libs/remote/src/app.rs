@@ -54,6 +54,17 @@ pub fn run_line(client: &Client, line: &str, each: &mut dyn FnMut(&str) -> bool)
 /// Runs one command: `each` gets every answer line (the `end` line left out; false stops the
 /// reading). Ok(true) when the answer had an error.
 pub fn run(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+    run_inner(client, argv, each, false).map(|r| r.0)
+}
+
+/// As [`run`], also returning the `end` line of the answer (it carries the fields the app adds,
+/// such as `"user_seq"`). The client-side commands have no end line of their own: the line of
+/// a `ping` that follows them stands in, and `gq` has none (the app is gone).
+pub fn run_end(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
+    run_inner(client, argv, each, true)
+}
+
+fn run_inner(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool, want_end: bool) -> Result<(bool, Option<String>), Error> {
     let (words, kv) = split_args(argv);
     let first = words.first().map(String::as_str).unwrap_or("help");
     let second = words.get(1).map(String::as_str);
@@ -64,7 +75,9 @@ pub fn run(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> bool)
         ("tweak", Some("final")) => return tweak_final(client, &words, &kv, each),
         _ => return forward(client, &words, &kv, each),
     };
-    Ok(emit(reply, each))
+    let err = emit(reply, each);
+    let end = if want_end && first != "gq" { ask_end(client, "ping") } else { None };
+    Ok((err, end))
 }
 
 fn emit(reply: Result<String, String>, each: &mut dyn FnMut(&str) -> bool) -> bool {
@@ -80,17 +93,27 @@ fn emit(reply: Result<String, String>, each: &mut dyn FnMut(&str) -> bool) -> bo
     }
 }
 
-fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+fn forward(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
     let line = if words.is_empty() { "help".to_string() } else { request_line(words, kv) };
     let mut err = false;
-    for l in client.cmd(&line)? {
+    let mut lines = client.cmd(&line)?;
+    while let Some(l) = lines.next() {
         let l = l?;
         err |= l.starts_with("{\"err\":");
         if !each(&l) {
             break;
         }
     }
-    Ok(err)
+    Ok((err, lines.end().map(str::to_string)))
+}
+
+/// The end line of a command's answer.
+fn ask_end(client: &Client, line: &str) -> Option<String> {
+    let mut lines = client.cmd(line).ok()?;
+    for l in lines.by_ref() {
+        l.ok()?;
+    }
+    lines.end().map(str::to_string)
 }
 
 /// The one answer line of a command (the first line), for the commands this module chains.
@@ -294,14 +317,16 @@ fn gq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
 
 /// The app's `tweak final`; when it says the user drew (`"drew":1`) a frame of the window is
 /// written too and named in the same JSON.
-fn tweak_final(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<bool, Error> {
+fn tweak_final(client: &Client, words: &[String], kv: &[(String, String)], each: &mut dyn FnMut(&str) -> bool) -> Result<(bool, Option<String>), Error> {
     let mut lines = Vec::new();
     let mut err = false;
-    for l in client.cmd(&request_line(words, kv))? {
+    let mut answer = client.cmd(&request_line(words, kv))?;
+    while let Some(l) = answer.next() {
         let l = l?;
         err |= l.starts_with("{\"err\":");
         lines.push(l);
     }
+    let end = answer.end().map(str::to_string);
     if let Some(json) = lines.first_mut() {
         if json.contains("\"drew\":1") && json.ends_with('}') {
             json.pop();
@@ -316,5 +341,5 @@ fn tweak_final(client: &Client, words: &[String], kv: &[(String, String)], each:
             break;
         }
     }
-    Ok(err)
+    Ok((err, end))
 }
