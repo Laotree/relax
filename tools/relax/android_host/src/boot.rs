@@ -79,7 +79,7 @@ pub fn boot(b: &Boot) -> Result<Vec<(String, u64)>, String> {
     let code = match &b.source {
         Source::Checkout => relax::run_checkout(opts, rest),
         Source::Archive { file, offset, len } => {
-            let workspace = relax::mount_archive(file, *offset, *len)?;
+            let workspace = relax::mount_archive(file, *offset, *len, None)?;
             relax::run_mounted(&workspace, opts, rest)
         }
     };
