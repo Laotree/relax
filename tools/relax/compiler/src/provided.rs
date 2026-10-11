@@ -16,6 +16,10 @@
 //! computes the same way) with rustc's signature (`type_name` of its fn pointer type) and the
 //! layout of each parameter and of the result; a mismatch is a clear "rebuild relax" error at
 //! bind time, never a wrong call.
+//!
+//! Before binding, every registered crate present in the program must match the loader's
+//! library source closure (srchash.rs). A mismatch is always an error naming changed, added
+//! and removed inputs and feature/version differences; it never selects a second source copy.
 
 use crate::lang_items::LangItem;
 use crate::program::{DefId, DefKind, Program};
@@ -58,11 +62,13 @@ pub struct ProvidedCrate {
     pub last_panic: LastPanicFn,
     /// the source identity rustc built it from (srchash.rs; the loader's build.rs)
     pub source: u64,
+    /// Per-file and feature/version identity embedded by the loader build.
+    pub manifest: &'static [u8],
 }
 
 impl Clone for ProvidedCrate {
     fn clone(&self) -> Self {
-        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), last_panic: self.last_panic, source: self.source }
+        ProvidedCrate { name: self.name.clone(), shims: self.shims.clone(), types: self.types.clone(), layouts: self.layouts.clone(), last_panic: self.last_panic, source: self.source, manifest: self.manifest }
     }
 }
 
@@ -82,45 +88,34 @@ pub fn register(
     layouts: HashMap<String, (u64, u64, &'static [u64])>,
     last_panic: LastPanicFn,
     source: u64,
+    manifest: &'static [u8],
 ) {
     let name = name.replace('-', "_");
-    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, last_panic, source });
+    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).push(ProvidedCrate { name, shims, types, layouts, last_panic, source, manifest });
 }
 
 /// The registered crates whose source in the program is what the loader was built from
 /// (check_sources); only they bind.
 static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Compares each registered crate's source identity in the program's crate graph (`pkgs`:
-/// the unit graph's packages, srchash.rs) with the loader's. A crate that differs (a dev edit,
-/// another checkout or release, a patched dependency) is an error for the Splash VM; other
-/// provided crates retain source fallback. Crates absent from the program need no binding.
-pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) -> Result<(), String> {
+/// Compares every registered crate present in the program against its embedded library
+/// closure. Any mismatch fails with file and feature/version differences; absent crates skip.
+pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     matched.clear();
+    let mut verified = Vec::new();
     for p in reg.iter() {
-        let Some(root) = pkgs.iter().position(|k| k.name.replace('-', "_") == p.name) else { continue };
-        let here = crate::srchash::closure_hash(pkgs, root);
-        if here == p.source {
-            matched.push(p.name.clone());
-        } else if matches!(
-            p.name.as_str(),
-            "makepad_live_id"
-                | "makepad_script"
-                | "makepad_script_std"
-                | "makepad_script_census"
-                | "makepad_script_compute"
-                | "makepad_shader"
-                | "makepad_tween_script"
-                | "makepad_script_audio_aot"
-        ) {
-            matched.clear();
-            return Err(format!("the Splash VM in this tree differs from the one built into relax: rebuild relax (cargo build --release -p relax) [{}: source {:016x}, loader {:016x}]", p.name, here, p.source));
-        } else if !quiet {
-            eprintln!("relax-run: {}: source differs from the loader's build ({:016x}, loader {:016x}): compiled from source", p.name, here, p.source);
+        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == p.name) {
+            let current = crate::srchash::closure_manifest(pkgs, root);
+            if crate::srchash::manifest_hash(&current) != p.source {
+                let built = crate::srchash::decode_manifest(p.manifest)?;
+                return Err(crate::srchash::diff_message(&p.name, &built, &current));
+            }
+            if !verified.contains(&p.name) { verified.push(p.name.clone()); }
         }
     }
+    *matched = verified;
     Ok(())
 }
 
@@ -131,7 +126,7 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg], quiet: bool) -> Result<(),
 pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
     let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     for p in reg.iter() {
-        if let Some(root) = pkgs.iter().position(|k| k.name.replace('-', "_") == p.name) {
+        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == p.name) {
             let _ = crate::srchash::closure_hash(pkgs, root);
         }
     }

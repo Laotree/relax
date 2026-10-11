@@ -225,7 +225,7 @@ pub(crate) fn resolve_package(
         // so nothing binds and every provided crate is read from source.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
         if crate::cfg::CfgSet::host(sess, &[]).triple() == machine {
-            crate::provided::check_sources(&pkgs, !options.verbose)?;
+            crate::provided::check_sources(&pkgs)?;
         } else {
             crate::provided::read_identity_files(&pkgs);
         }

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 #[allow(dead_code)]
 mod json;
 #[path = "base/src/srchash.rs"]
+#[allow(dead_code)]
 mod srchash;
 #[path = "build_stamp.rs"]
 mod build_stamp;
@@ -57,6 +58,21 @@ fn main() {
     // compiles it (its resolved features and dependencies)
     for name in PROVIDED {
         let root = g.pkgs.iter().position(|p| p.name == *name).unwrap_or_else(|| panic!("{} is not a dependency", name));
-        println!("cargo:rustc-env=RELAX_SRC_{}={:016x}", name.replace('-', "_"), srchash::closure_hash(&g.pkgs, root));
+        let manifest = srchash::closure_manifest(&g.pkgs, root);
+        let output = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join(format!("{name}.src.bin"));
+        std::fs::write(output, srchash::encode_manifest(&manifest)).expect("write provided source manifest");
+        for i in g.closure(root) {
+            let p = &g.pkgs[i];
+            if p.dir.contains("/.cargo/registry/") || p.dir.contains("/.cargo/git/") { continue; }
+            // Directory watches catch additions, including an initially absent build.rs.
+            println!("cargo:rerun-if-changed={}", p.dir);
+            let key = format!("{}@{}", p.name.replace('-', "_"), p.version);
+            for ((package, path), _) in &manifest {
+                if (package == &key || package == &format!("host:{key}")) && !path.starts_with('\0') {
+                    println!("cargo:rerun-if-changed={}", PathBuf::from(&p.dir).join(path).display());
+                }
+            }
+        }
+        println!("cargo:rustc-env=RELAX_SRC_{}={:016x}", name.replace('-', "_"), srchash::manifest_hash(&manifest));
     }
 }

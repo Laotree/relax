@@ -416,6 +416,23 @@ fn boot_package(opts: Vec<String>, rest: Vec<String>) -> i32 {
     relax_compiler::run::cmd_run(&sess, &a)
 }
 
+/// Per-file identity data emitted by build.rs, parsed only on a mismatch.
+fn source_manifest(name: &str) -> &'static [u8] {
+    match name {
+        "relax_provided_fixture" => include_bytes!(concat!(env!("OUT_DIR"), "/relax-provided-fixture.src.bin")),
+        "makepad_live_id" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-live-id.src.bin")),
+        "makepad_script" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script.src.bin")),
+        "makepad_script_std" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-std.src.bin")),
+        "makepad_script_census" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-census.src.bin")),
+        "makepad_script_compute" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-compute.src.bin")),
+        "makepad_shader" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-shader.src.bin")),
+        "makepad_tween_script" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-tween-script.src.bin")),
+        "makepad_script_audio_aot" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-script-audio-aot.src.bin")),
+        "makepad_hal" => include_bytes!(concat!(env!("OUT_DIR"), "/makepad-hal.src.bin")),
+        _ => panic!("unregistered provided crate {name}"),
+    }
+}
+
 /// The source identity build.rs computed for a provided crate (srchash.rs).
 fn src(name: &str) -> u64 {
     let v = match name {
@@ -496,7 +513,7 @@ fn provided() {
                 _ => {}
             }
         }
-        relax_compiler::provided::register(krate, shims, types, layouts, makepad_relax_api::last_panic, src(krate));
+        relax_compiler::provided::register(krate, shims, types, layouts, makepad_relax_api::last_panic, src(krate), source_manifest(krate));
     }
 
     // Splash VM registry -> relax inspect (vm list, script error events)
