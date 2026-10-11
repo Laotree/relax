@@ -1087,6 +1087,27 @@ fn lex_rx_number<const VALIDATE: bool, E: ScanError>(source: &str, lo: usize) ->
 }
 
 /// 1-based line and column of a byte position.
+/// Byte offsets where each line of `src` starts (0 first): with line_col_at, line_col without
+/// scanning the source for every position (a file's macro sites asked it of the whole prefix each:
+/// quadratic in a 1.7 MB file).
+pub fn line_starts(src: &[u8]) -> Vec<u32> {
+    let mut v = vec![0u32];
+    for (i, &c) in src.iter().enumerate() {
+        if c == b'\n' {
+            v.push(i as u32 + 1);
+        }
+    }
+    v
+}
+
+/// line_col(src, pos) from `src`'s line_starts (`len` = src.len()): the same 1-based line and
+/// byte column.
+pub fn line_col_at(lines: &[u32], len: usize, pos: u32) -> (usize, usize) {
+    let pos = pos.min(len as u32);
+    let line = lines.partition_point(|&start| start <= pos);
+    (line, (pos - lines[line - 1]) as usize + 1)
+}
+
 pub fn line_col(src: &[u8], pos: u32) -> (usize, usize) {
     let pos = (pos as usize).min(src.len());
     let mut line = 1;

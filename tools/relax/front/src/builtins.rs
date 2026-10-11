@@ -185,6 +185,11 @@ impl FileCtx {
     fn line_starts(&self, src: &[u8]) -> &Vec<u32> {
         self.lines.get_or_init(|| line_starts(src))
     }
+
+    /// crate::lexer::line_col(src, pos) from the cached line starts
+    pub(crate) fn byte_line_col(&self, src: &[u8], pos: u32) -> (usize, usize) {
+        crate::lexer::line_col_at(self.line_starts(src), src.len(), pos)
+    }
 }
 
 fn line_starts(src: &[u8]) -> Vec<u32> {
@@ -1682,6 +1687,13 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
     if sites.is_empty() {
         return;
     }
+    // line starts of the files with sites, once (each site's line/column)
+    let mut lines: Vec<Vec<u32>> = vec![Vec::new(); files.len()];
+    for &(fi, _, _) in &sites {
+        if lines[fi].is_empty() {
+            lines[fi] = crate::lexer::line_starts(files[fi].1);
+        }
+    }
     let t_wall = std::time::Instant::now();
     let jobs = crate::preload::jobs();
     let next = std::sync::atomic::AtomicUsize::new(0);
@@ -1697,7 +1709,7 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
                     }
                     let (fi, lo, hi) = sites[k];
                     let src = files[fi].1;
-                    out.push((k, expand_item(sess, files[fi].0, &src[lo as usize..hi as usize], lo, crate::lexer::line_col(src,lo), Some(cfg), edition, None)));
+                    out.push((k, expand_item(sess, files[fi].0, &src[lo as usize..hi as usize], lo, crate::lexer::line_col_at(&lines[fi], src.len(), lo), Some(cfg), edition, None)));
                 }
                 out
             }));

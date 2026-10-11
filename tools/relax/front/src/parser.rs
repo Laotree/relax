@@ -4168,8 +4168,12 @@ impl ParsedFile {
 
     fn legacy_diagnostic_span(&self, pos: u32) -> (u32, u32) {
         let lo = if self.token_input { pos.min(self.src_len) } else { self.diagnostic_pos(pos) };
-        match self.toks.iter().find(|t| t.lo <= lo && lo < t.hi && t.hi <= self.src_len) {
-            Some(t) => (lo, t.hi), None => (lo,lo),
+        // the token holding lo: the last one starting at or before it (tokens are in position
+        // order and do not overlap; a scan of every token per lookup made each warm closure
+        // identity check linear in its file)
+        let i = self.toks.partition_point(|t| t.lo <= lo);
+        match i.checked_sub(1).and_then(|i| self.toks.get(i)).filter(|t| lo < t.hi && t.hi <= self.src_len) {
+            Some(t) => (lo, t.hi), None => (lo, lo),
         }
     }
 

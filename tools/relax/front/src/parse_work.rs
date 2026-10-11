@@ -52,7 +52,7 @@ pub fn key(p: &crate::parser::Parser, kind: &str, lo: u32, hi: u32, contextual: 
     if let Some(c) = &p.bctx { key.extend_from_slice(format!("{:?}\0", c.cfg.set).as_bytes()); }
     if contextual {
         let c = p.bctx.as_ref()?;
-        let (line, col) = crate::lexer::line_col(p.src, lo);
+        let (line, col) = c.byte_line_col(p.src, lo);
         let at = if lowered { 0 } else { lo };
         key.extend_from_slice(format!("{at}:{line}:{col}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}\0",
             c.krate, c.path, c.module_path, p.mod_stack, c.cfg.set,
