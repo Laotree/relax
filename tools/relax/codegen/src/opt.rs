@@ -2322,7 +2322,93 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     if f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::IBin(IOp::Or, ..)))) && combine_rotates(f) {
         dce(f);
     }
+    // x / 2^k: x * 2^-k (adds vregs, so after the rounds)
+    if recip_pow2_div(f) {
+        dce(f);
+    }
 
+}
+
+/// The reciprocal of a power-of-two float constant (`bits` of an f32 / f64) when that is itself
+/// a finite non-zero power of two, normal or subnormal: then `x / c` and `x * (1 / c)` are the
+/// correctly rounded value of the same real number for every x (NaN, inf, zero and signs
+/// included; an overflow or underflow of `x * r` rounds identically in both). Zero, inf, NaN and
+/// non-powers of two have none; 1 / c rounds when it is not representable, which the power-of-two
+/// check on the result rejects (an overflow gives inf, an underflow 0).
+fn exact_recip(w: bool, bits: u64) -> Option<u64> {
+    if w {
+        let pow2 = |b: u64| {
+            let m = b & ((1u64 << 52) - 1);
+            let e = (b >> 52) & 0x7ff;
+            e != 0x7ff && if e == 0 { m.count_ones() == 1 } else { m == 0 }
+        };
+        if !pow2(bits) {
+            return None;
+        }
+        let r = (1.0 / f64::from_bits(bits)).to_bits();
+        pow2(r).then_some(r)
+    } else {
+        let pow2 = |b: u32| {
+            let m = b & ((1u32 << 23) - 1);
+            let e = (b >> 23) & 0xff;
+            e != 0xff && if e == 0 { m.count_ones() == 1 } else { m == 0 }
+        };
+        let bits = bits as u32;
+        if !pow2(bits) {
+            return None;
+        }
+        let r = (1.0 / f32::from_bits(bits)).to_bits();
+        pow2(r).then_some(r as u64)
+    }
+}
+
+/// `x / c` for a single-definition float constant c = +-2^k with an exact reciprocal becomes
+/// `x * c^-1` (LLVM does the same for exact reciprocals; a multiply is far cheaper than a divide).
+fn recip_pow2_div(f: &mut Func) -> bool {
+    if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::FBin(FOp::Div, ..)))) {
+        return false;
+    }
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    let mut kf: Vec<Option<u64>> = vec![None; nv];
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            if let Inst::Fconst(d, bits, _) = i {
+                kf[d.0 as usize] = Some(*bits);
+            }
+        }
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let mut out: Vec<Inst> = Vec::new();
+        let mut pos: Vec<_> = Vec::new();
+        let old = std::mem::take(&mut f.blocks[bi].insts);
+        let old_pos = std::mem::take(&mut f.blocks[bi].pos);
+        for (i, p) in old.into_iter().zip(old_pos) {
+            if let Inst::FBin(FOp::Div, w, d, x, y) = i {
+                if ndef[y.0 as usize] == 1 {
+                    if let Some(r) = kf[y.0 as usize].and_then(|b| exact_recip(w, b)) {
+                        let c = f.vreg(if w { Cls::F64 } else { Cls::F32 });
+                        out.push(Inst::Fconst(c, r, w));
+                        out.push(Inst::FBin(FOp::Mul, w, d, x, c));
+                        pos.push(p);
+                        pos.push(p);
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            out.push(i);
+            pos.push(p);
+        }
+        f.blocks[bi].insts = out;
+        f.blocks[bi].pos = pos;
+    }
+    changed
 }
 
 /// Rotates: `d = (x << k) | (x >> (w - k))` (either operand order) with both shifts by
