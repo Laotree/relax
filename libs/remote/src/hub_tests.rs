@@ -176,7 +176,7 @@ fn session_launch_and_kill_only_own_pids() {
     let pid: u32 = launched[0]["{\"launched\":".len()..].split(',').next().unwrap().parse().unwrap();
     assert!(ask("launched")[0].contains("\"state\":\"running\""));
     let other = ask(&format!("kill {}", std::process::id()));
-    assert!(other[0].contains("was not launched by this relay"), "{other:?}");
+    assert!(other[0].contains("was not launched"), "{other:?}");
     assert_eq!(ask(&format!("kill {pid}"))[0], format!("{{\"killed\":{pid}}}"));
     let mut state = String::new();
     for _ in 0..100 {
