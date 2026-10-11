@@ -2513,12 +2513,6 @@ impl Cache {
         true
     }
 
-    /// At exit, after the writes: the generations they replaced are deleted (retire_replaced_generations).
-    pub fn retire_replaced(&self) {
-        if self.mode == Mode::ReadOnly { return; }
-        if let Some(root) = self.dir.parent() { retire_replaced_generations(root); }
-    }
-
     pub fn flush_front_graphs() -> Result<(), String> {
         flush_front_graphs()
     }
@@ -2816,10 +2810,9 @@ pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
 /// At exit: every store's replaced generations go, including the ones this process itself
 /// read (it is ending; on Windows a mapped file cannot be deleted and stays for the next
 /// start's prune). Without this the generation a run's write replaced would stay on disk until
-/// the next start (a whole copy of each rewritten store).
-pub fn retire_replaced_generations(root: &std::path::Path) {
-    let dir = root.join("cache");
-    let names: Vec<String> = std::fs::read_dir(&dir).into_iter().flatten().flatten()
+/// the next start (a whole copy of each rewritten store). `dir`: the cache folder.
+pub fn retire_replaced_generations(dir: &std::path::Path) {
+    let names: Vec<String> = std::fs::read_dir(dir).into_iter().flatten().flatten()
         .filter_map(|e| e.file_name().into_string().ok()).filter(|n| crate::store::name_ours(n)).collect();
     let mut newest: HashMap<String, u32> = HashMap::new();
     for n in &names {
@@ -2833,6 +2826,12 @@ pub fn retire_replaced_generations(root: &std::path::Path) {
             crate::store::delete_checked(&dir.join(n));
         }
     }
+}
+
+/// retire_replaced_generations in the folders of the stores this process opened or wrote.
+pub fn retire_replaced_in_use() {
+    let dirs: HashSet<PathBuf> = crate::store::live().iter().filter_map(|p| p.parent().map(|d| d.to_path_buf())).collect();
+    for d in dirs { retire_replaced_generations(&d); }
 }
 
 /// prune_root with this run's stores `live` (generation 0 paths), the generation files it opened

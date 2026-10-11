@@ -12,8 +12,8 @@
 //! Readers take a shared lock, copy the active slot's index and map the file; payloads below a
 //! committed data end never change. A writer (exclusive lock) appends payloads past data end,
 //! writes the merged index into the inactive slot, then flips the header: a crash leaves the old
-//! header and index valid. When the merged index does not fit a slot, or dead bytes outgrow the
-//! live ones (or the store is stale), the store is rewritten whole as its next generation.
+//! header and index valid. When the merged index does not fit a slot, or dead bytes outgrow a
+//! quarter of the live ones (or the store is stale), the store is rewritten whole as its next generation.
 //! The newest entry of a key wins.
 //!
 //! Generations (one design on every OS): a store is never renamed over or deleted while it may
@@ -624,7 +624,7 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool) -> s
     // all new images. Only a dead-space compaction needs to copy the just-appended bytes.
     let live: u64 = ix.iter().map(|e| e.len as u64).sum();
     let dead = end.saturating_sub(h.data_start()).saturating_sub(live.min(end));
-    if dead > live && dead > 1 << 20 {
+    if dead * 4 > live && dead > 1 << 20 {
         let res = rewrite::<T>(path, dir, ix, Some(&f), Vec::new());
         let _ = f.unlock();
         return res;

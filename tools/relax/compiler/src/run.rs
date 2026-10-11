@@ -1939,6 +1939,9 @@ pub(crate) extern "C" fn relax_quit_requested() {
             if r.is_some() && (COLLECTED_CURRENT.load(Ordering::Relaxed) || MID_COLLECTED_TRIED.load(Ordering::Relaxed)) { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        // the generations the write replaced go now: the exit summary may never run (a harness
+        // kills the app, a framework ends the process)
+        if r.is_some() { crate::cache::retire_replaced_in_use(); }
         verbose!("relax-cache: quit write at t={:.0} ms: {:?} (entries, front images), collected {} in {:.1} ms",
             crate::clock::ms_since_start(), r, COLLECTED_CURRENT.load(Ordering::Relaxed), t.elapsed().as_secs_f64() * 1e3);
     });
@@ -2221,7 +2224,7 @@ fn summary_inner(why: &str) {
                 });
                 exit_mark("flush");
                 // the generations the writes replaced go now: the rest of the exit can be cut short
-                if r.is_ok() { c.retire_replaced(); }
+                if r.is_ok() { crate::cache::retire_replaced_in_use(); }
                 // the collected program, unless restored whole or written mid-run; never waits long
                 // for a reader: an app thread parked for good (EXITING) may hold one
                 if r.is_ok() && front_recordable() && !COLLECTED_CURRENT.load(Ordering::Relaxed) {
