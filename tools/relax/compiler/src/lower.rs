@@ -11209,6 +11209,39 @@ pub fn emit_decode_tag(u: &Unit, f: &mut Func, b: u32, pos: u64, raw: Vec<VReg>,
                 Some((_, Mem::Int(n, _))) => n as u32,
                 _ => 8,
             };
+            // one dataless niche variant behind a narrow unsigned tag (Option<char>, Option<NonZeroU32>):
+            // `(tag - start) & mask <= 0` is `tag & mask == start & mask`
+            if hi == lo && lo != untagged && bytes < 8 && raw.len() == 1 {
+                let inr = f.vreg(Cls::I);
+                let mask = (1u64 << (bytes * 8)) - 1;
+                let k = (start as u64 & mask) as i64;
+                // the register may hold a sign-extended or dirty value: only the tag's bytes count
+                let m = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::IBinI(IOp::And, U64, m, raw[0], mask as i64));
+                if k == k as i32 as i64 {
+                    push_at(f, b, pos, Inst::ICmpI(Cond::Eq, false, inr, m, k));
+                } else {
+                    // the back ends' compare-immediate is a sign-extended imm32
+                    let kr = f.vreg(Cls::I);
+                    push_at(f, b, pos, Inst::Iconst(kr, k));
+                    push_at(f, b, pos, Inst::ICmp(Cond::Eq, false, inr, m, kr));
+                }
+                let vidx = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(vidx, lo as i64));
+                let by_index = (0..adt.variants.len() as u32).all(|v| variant_disc(u, adt, v) == Some(v as i64));
+                let ud = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(ud, if by_index { untagged as i64 } else { variant_disc(u, adt, untagged)? }));
+                if by_index {
+                    let d = f.vreg(Cls::I);
+                    push_at(f, b, pos, Inst::Sel(d, inr, vidx, ud));
+                    return Some(vec![d]);
+                }
+                let k2 = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Iconst(k2, variant_disc(u, adt, lo)?));
+                let d = f.vreg(Cls::I);
+                push_at(f, b, pos, Inst::Sel(d, inr, k2, ud));
+                return Some(vec![d]);
+            }
             let ks = f.vreg(Cls::I);
             push_at(f, b, pos, Inst::Iconst(ks, start as u64 as i64));
             let rel = f.vreg(Cls::I);
