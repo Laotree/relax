@@ -2539,7 +2539,15 @@ impl<'a> Build<'a> {
                 }
             };
             let mut ops = vec![recv];
-            let ps = self.callable_params(pt);
+            // The formal inputs are the selected `Fn*` obligation's argument tuple: a callee whose
+            // type implements the trait itself (`Box<dyn Fn(&Ui)>`: Box<F>: Fn<A>) has no
+            // signature of its own to read, and a `&mut` argument for a `&` input needs its
+            // coercion (rustc_hir_typeck/src/callee.rs confirm_builtin_call / check_call inputs
+            // from the method signature of `call`/`call_mut`/`call_once`)
+            let ps = match selection.map(|s| self.tx.kind(s.tupled_args)) {
+                Some(TyKind::Tuple(ps)) => self.tx.tcx.tys.list(ps).to_vec(),
+                _ => self.callable_params(pt),
+            };
             let saved = std::mem::replace(&mut self.args_two_phase, true);
             for (i, a) in args.iter().enumerate() {
                 let pt2 = ps.get(i).copied().unwrap_or(self.ty(*a));
