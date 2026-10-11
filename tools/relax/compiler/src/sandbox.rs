@@ -608,12 +608,13 @@ pub(crate) fn capture_initial_data(u: &Unit, root: Sym) {
             Some(SymKind::Rw(i)) => u.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner())[i as usize].0.max(1) as usize,
             _ => continue,
         };
-        let bytes = unsafe { std::slice::from_raw_parts(u.syms.value(Sym::new(sym.id)) as *const u8, size).to_vec() };
+        // identity state (the declared initial bytes): the program's heap, not the compiler arena's
+        let bytes = crate::zone_alloc::kept_with(|| unsafe { std::slice::from_raw_parts(u.syms.value(Sym::new(sym.id)) as *const u8, size).to_vec() });
         // the data objects its words point into: what provenance_words would attribute to a
         // data object (only those are captured; the thunk / static / runtime / C attributions
         // it tries after are never data, and its C declaration scan is not needed here)
         let words = u.syms.data_words(&bytes);
-        u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).insert(sym.id, bytes);
+        crate::zone_alloc::kept_with(|| u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).insert(sym.id, bytes));
         pending.extend(words);
     }
 }

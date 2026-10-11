@@ -223,6 +223,9 @@ impl ReloadSlots {
     }
 }
 
+#[path = "zone_scan.rs"]
+pub(crate) mod zone_scan;
+
 pub struct Unit {
     pub query_errors: relax_types::infer::diagnostics::DiagCtxt,
     /// retired (retire_unit): an auxiliary unit going away mid-run (the proc-macro world);
@@ -412,8 +415,11 @@ pub struct CodeTables {
 
 impl CodeTables {
     fn add(&mut self, at: u64, len: u32, id: u32, unwind: Option<crate::rir::UnwindInfo>) {
+        // identity state (panics and faults walk it): the tables are the program's
+        let _k = crate::zone_alloc::kept();
         if let Some(i) = unwind {
-            self.unwind.insert(at, i);
+            let own = crate::rir::UnwindInfo { saved: i.saved.clone(), pads: i.pads.clone(), sp_off: i.sp_off };
+            self.unwind.insert(at, own);
         }
         if self.index.last().map_or(true, |l| l.0 < at) {
             self.index.push((at, len, id));
@@ -424,11 +430,13 @@ impl CodeTables {
     }
 
     fn reserve(&mut self, n: usize) {
+        let _k = crate::zone_alloc::kept();
         self.index.reserve(n);
         self.image_unwind.reserve(n);
     }
 
     fn add_image_unwind(&mut self, at: u64, trailer: &'static [u8], pc_map: &PcMap) {
+        let _k = crate::zone_alloc::kept();
         let e = (at, trailer.as_ptr() as u64, trailer.len() as u32);
         if self.image_unwind.last().map_or(true, |l| l.0 < at) {
             self.image_unwind.push(e);
@@ -583,7 +591,7 @@ pub fn main_post_present_wait() -> (f64, String) {
 
 /// O3 drops by reason (on the owner thread).
 unsafe fn drop_why(up: *mut Unit, why: &'static str) {
-    *(&mut *up).stats.tier1_drop_why.entry(why).or_insert(0) += 1;
+    crate::zone_alloc::kept_with(|| *(&mut *up).stats.tier1_drop_why.entry(why).or_insert(0) += 1);
 }
 
 /// A recursive #[relax(O3)] build with a larger stack frame is not recorded in the disk cache
@@ -657,7 +665,7 @@ unsafe fn install_prelinked_slot(up: *mut Unit, s: crate::cache::PrelinkedSlot, 
     let u = &mut *up;
     // the startup set of the next manifest (install_compiled's rule: before the first present)
     if u.fns[s.id as usize].patch_gen == 0 && (!FIRST_PRESENT.load(Ordering::Acquire) || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) {
-        u.start_order.push(s.id);
+        crate::zone_alloc::kept_with(|| u.start_order.push(s.id));
         if !FIRST_PRESENT.load(Ordering::Acquire) {
             ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
         }
@@ -1965,9 +1973,16 @@ impl Unit {
         for error in errors {
             let message = if error.cause.body_id == crate::program::NO_DEF { error.message }
                 else { self.prog.record_error(self.prog.def(error.cause.body_id).file, error.cause.span, "typeck", error.message) };
-            self.errors.push(message);
+            self.note_error(message);
         }
         for warning in warnings { eprintln!("warning: {}", warning.message); }
+    }
+
+    /// Records a build error (identity state: the message is the program's).
+    pub(crate) fn note_error(&mut self, m: String) {
+        let _k = crate::zone_alloc::kept();
+        let m = m.clone();
+        self.errors.push(m);
     }
 
     pub fn new(prog: Program, tcx: Tcx, core_crate: u32) -> Box<Unit> {
@@ -1996,7 +2011,9 @@ impl Unit {
         let syms_base = rw_base + rw_size;
         // the symbol values are written outside the bump allocators (no-op where the OS overcommits)
         os::mem::commit(syms_base, syms_size as usize);
-        let provided = crate::provided::take_for(&prog);
+        // identity state below (the provided crates' shims, the slot table, the unit itself) is
+        // built in the kept heap; the compile state (prog, tcx, layouts, front) stays as built
+        let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
         let mut provided_types = HashMap::new();
         let mut opaque_layouts = HashMap::new();
         let mut check_layouts = Vec::new();
@@ -2013,6 +2030,7 @@ impl Unit {
                 }
             }
         }
+        let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let provided_shared = {
             let ks: Vec<u32> = provided.iter().map(|(k, _)| *k).collect();
             if ks.is_empty() {
@@ -2028,21 +2046,22 @@ impl Unit {
                 })
             }
         };
-        let slots = Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64));
+        let provided_shared = crate::zone_alloc::kept_clone(&provided_shared);
+        let slots = crate::zone_alloc::kept_with(|| Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64)));
         let slots_ptr = crate::rir::SlotsPtr(&*slots);
-        let mut u = Box::new(Unit {
+        let unit = Unit {
             prog,
             tcx,
             provided_shared,
             provided,
             provided_types,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
-            fns: crate::conc::AppendVec::with_capacity(u32::MAX as usize + 1),
+            fns: crate::conc::AppendVec::new_kept(u32::MAX as usize + 1),
             reload_slots: Default::default(),
             reload_rir: None,
             reload_errors: Default::default(),
             reload_specs: Default::default(),
-            fn_map: crate::conc::MemoMap::with_bits(17),
+            fn_map: crate::conc::MemoMap::new_kept(17),
             fn_create: Default::default(),
             consts: Default::default(),
             const_readers: Default::default(),
@@ -2064,7 +2083,7 @@ impl Unit {
             coro_cycle: Default::default(),
             unwind_drop_cache: Default::default(),
             cycle_inprog: Default::default(),
-            vtables: Default::default(),
+            vtables: crate::conc::MemoMap::new_kept(16),
             locations: Default::default(),
             const_failed: std::collections::HashSet::new(),
             core_path_cache: crate::conc::MemoMap::with_bits(8),
@@ -2107,7 +2126,8 @@ impl Unit {
             front: std::sync::Arc::new(FrontShared::new(&sess)),
             ctfe_fn_bodies: Default::default(),
             self_ptr: UnitPtr(std::ptr::null_mut()),
-        });
+        };
+        let mut u = crate::zone_alloc::kept_with(|| Box::new(unit));
         let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
         u.lazy_entry = u.emit_code(&lazy);
         let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
@@ -2218,7 +2238,7 @@ impl Unit {
             }
             for (d, size, align) in demoted {
                 u.lay.opaque.insert(d, (size, align));
-                u.provided_types.insert(d, 0);
+                crate::zone_alloc::kept_with(|| u.provided_types.insert(d, 0));
             }
         }
         u.self_ptr = UnitPtr(&mut *u as *mut Unit);
@@ -2374,7 +2394,7 @@ impl Unit {
         let missing = self.missing_stubs.lock().unwrap_or_else(|e| e.into_inner()).get(&name) == Some(&a);
         let k = if missing { crate::syms::SymKind::Missing(name) } else { crate::syms::SymKind::Foreign(name) };
         let s = self.syms.intern(k, a);
-        self.syms.foreign_defs.lock().unwrap_or_else(|e| e.into_inner()).entry(s.id).or_insert(d);
+        crate::zone_alloc::kept_with(|| { self.syms.foreign_defs.lock().unwrap_or_else(|e| e.into_inner()).entry(s.id).or_insert(d); });
         Some(s)
     }
 
@@ -2416,6 +2436,8 @@ impl Unit {
         if let Some(&a) = m.get(&key) {
             return a;
         }
+        let _k = crate::zone_alloc::kept();
+        let key = key.clone();
         let a = self.data(b, align, crate::syms::DataKind::Bytes);
         m.insert(key, a);
         a
@@ -2426,6 +2448,7 @@ impl Unit {
     /// value pointing into it can then store the block's bytes (syms.rs promoted_copy).
     pub fn rw_sym(&self, size: u64, align: u64, ty: Option<TyId>) -> crate::rir::Sym {
         let a = self.rw_data(size, align);
+        let _k = crate::zone_alloc::kept();
         let k = {
             let mut b = self.syms.rw_blocks.lock().unwrap_or_else(|e| e.into_inner());
             b.push((size, align));
@@ -2488,6 +2511,9 @@ impl Unit {
         if let Some(&i) = ix.get(&key) {
             return i;
         }
+        // identity state (panic sites are read by the program): the strings are the program's
+        let _k = crate::zone_alloc::kept();
+        let key = key.clone();
         let mut s = self.sites.lock().unwrap_or_else(|e| e.into_inner());
         s.push(Site { file, pos, msg: msg.to_string() });
         let i = s.len() as u64 - 1;
@@ -2990,7 +3016,7 @@ impl Unit {
                     let fp = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), r, sig.header, 0));
                     let vi = if k == crate::program::DefKind::Variant { self.prog.def(*d).sub } else { 0 };
                     let id = self.fn_id(FnKey::Glue(GLUE_CTOR + vi as u8, fp));
-                    self.fn_map.insert(key, id);
+                    self.fn_map.insert(crate::zone_alloc::kept_clone(&key), id);
                     return id;
                 }
             }
@@ -3010,7 +3036,12 @@ impl Unit {
         }
         let id = self.fns.len() as u32;
         self.ensure_slots(id, 1);
-        let name = fn_name(self, &key);
+        // identity state: the slot's key and name (and the map's copy of the key) are the
+        // program's, not the compiler arena's
+        let (entry_key, map_key, name) = {
+            let _k = crate::zone_alloc::kept();
+            (key.clone(), key.clone(), fn_name(self, &key))
+        };
         let file = self.key_file(&key);
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
@@ -3022,11 +3053,11 @@ impl Unit {
             *(slot_addr as *mut u64) = stub_addr;
         }
         self.slot_named(id, &key);
-        self.fns.push(Self::new_entry(key.clone(), name, file, stub_addr, stub.len() as u32));
+        self.fns.push(Self::new_entry(entry_key, name, file, stub_addr, stub.len() as u32));
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             index.insert(&key, id);
         }
-        self.fn_map.insert(key, id);
+        self.fn_map.insert(map_key, id);
         id
     }
 
@@ -3189,11 +3220,11 @@ impl Unit {
     /// function (its code and callers stay; the reload index finds both), the map the first.
     pub(crate) fn name_slot(&mut self, id: u32, key: FnKey) -> bool {
         let key = self.slot_key_form(key);
-        let name = fn_name(self, &key);
+        let name = crate::zone_alloc::kept_with(|| fn_name(self, &key));
         let file = self.key_file(&key);
         self.slot_named(id, &key);
         let f = &mut self.fns[id as usize];
-        f.key = key.clone();
+        f.key = crate::zone_alloc::kept_clone(&key);
         f.name = name;
         f.file = file;
         if let Some(index) = self.reload_slots.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -3203,7 +3234,7 @@ impl Unit {
         if self.fn_map.get(&key).is_some() {
             return false;
         }
-        self.fn_map.insert(key, id);
+        self.fn_map.insert(crate::zone_alloc::kept_clone(&key), id);
         true
     }
 
@@ -3472,7 +3503,7 @@ impl Unit {
         let site = self.site(file, pos, &format!("foreign function `{}` is not available on this host -- cfg the call out or link its library", name));
         let code = x64::jump_with_arg0(site, self.rt.panic_site);
         let a = self.emit_code(&code);
-        m.insert(name, a);
+        crate::zone_alloc::kept_with(|| m.insert(name.clone(), a));
         a
     }
 
@@ -3515,7 +3546,7 @@ impl Unit {
             return None;
         }
         if let Some(a) = unsafe { crate::cache::const_value(self.self_ptr.0, d, &args) } {
-            self.consts.insert((d, args), a);
+            self.put_const(d, args, a);
             return Some(a);
         }
         match self.eval_init(d, args.clone(), false) {
@@ -3524,7 +3555,7 @@ impl Unit {
                     cache.record_const(self, d, &args, a);
                     self.cache = Some(cache);
                 }
-                self.consts.insert((d, args), a);
+                self.put_const(d, args, a);
                 Some(a)
             }
             None => {
@@ -3541,6 +3572,13 @@ impl Unit {
     pub(crate) fn ctfe_static_addr(&mut self, d: DefId) -> Option<u64> {
         let a = self.static_addr(d);
         (a != 0 && !DEFERRED_ABORT.with(|f| f.get())).then_some(a)
+    }
+
+    /// Memoises a constant's value; the key's types are built in the kept heap (the memo is
+    /// identity state: it must outlive the compiler arena).
+    pub(crate) fn put_const(&mut self, d: DefId, args: Vec<TyId>, a: u64) {
+        let _k = crate::zone_alloc::kept();
+        self.consts.insert((d, args.as_slice().to_vec()), a);
     }
 
     pub fn static_addr(&mut self, d: DefId) -> u64 {
@@ -3564,14 +3602,16 @@ impl Unit {
         let t = match self.tcx.const_ty(&self.prog, d) {
             Some(t) => t,
             None => {
-                self.statics.insert(d, 0);
+                crate::zone_alloc::kept_with(|| self.statics.insert(d, 0));
                 return 0;
             }
         };
         let l = self.layout_of(t);
         let buf = self.rw_data(l.size.max(1) as u64, l.align.max(8) as u64);
-        self.statics.insert(d, buf);
-        self.static_spans.insert(buf, (d, l.size as u64));
+        crate::zone_alloc::kept_with(|| {
+            self.statics.insert(d, buf);
+            self.static_spans.insert(buf, (d, l.size as u64));
+        });
         // Restore the initial value into this run's writable storage. The cached
         // object is an immutable snapshot taken immediately after pure CTFE,
         // never the static's later (possibly mutated) contents.
@@ -3585,7 +3625,7 @@ impl Unit {
                 DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0);
                 return buf;
             }
-            self.statics.insert(d, 0);
+            crate::zone_alloc::kept_with(|| self.statics.insert(d, 0));
             return 0;
         } else {
             self.record_static(d, t, buf);
@@ -3664,7 +3704,7 @@ impl Unit {
                     self.exec_event(id, "call");
                     match unsafe { call_jit(self as *mut Unit, entry, buf) } {
                         Ok(_) if crate::ctfe::same_value(self, t, tmp, buf, 0) => return Some(buf),
-                        Ok(_) => self.errors.push(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
+                        Ok(_) => self.note_error(format!("CTFE MISMATCH in {}", self.prog.def_path(d))),
                         // Use the normal deferred-initialization retry and error path.
                         Err(_) => return self.run_init_code(d, args, buf),
                     }
@@ -3749,7 +3789,7 @@ impl Unit {
                 }
                 // queries.rs:58-108: evaluation errors return to the caller;
                 // const_eval_resolve turns this into Reported.
-                self.errors.push(m);
+                self.note_error(m);
                 None
             }
         }
@@ -3891,11 +3931,11 @@ impl Unit {
         }
         if f.compiled {
             let old_map = std::mem::take(&mut f.pc_map);
-            f.prev.push((f.code, f.code_len, old_map, f.patch_gen));
+            crate::zone_alloc::kept_with(|| f.prev.push((f.code, f.code_len, old_map, f.patch_gen)));
         } else if gen > 0 {
             // a patch group's first code for a slot: rolling it back restores the lazy stub
             // (length 0 marks it), so the slot builds again from the restored source
-            f.prev.push((f.code, 0, PcMap::default(), 0));
+            crate::zone_alloc::kept_with(|| f.prev.push((f.code, 0, PcMap::default(), 0)));
         }
         f.code = at;
         f.code_len = code.len() as u32;
@@ -3905,7 +3945,7 @@ impl Unit {
         f.version += 1;
         if gen > 0 {
             f.patch_gen = gen;
-            self.patch_log.push((id, gen));
+            crate::zone_alloc::kept_with(|| self.patch_log.push((id, gen)));
         }
         // borrowck lane: a fn instance's first code is checked lazily in the background
         if first && gen == 0 && crate::borrowck::lazy::gandalf_enabled(options) {
@@ -4470,7 +4510,7 @@ unsafe fn compile_wall_add(up: *mut Unit, w0: u64) {
         let b = (w1 / 100_000_000) as usize;
         if b < 6000 {
             if u.stats.timeline.len() <= b {
-                u.stats.timeline.resize(b + 1, (0, 0));
+                crate::zone_alloc::kept_with(|| u.stats.timeline.resize(b + 1, (0, 0)));
             }
             u.stats.timeline[b].0 += 1;
             u.stats.timeline[b].1 += w1 - w0;
@@ -4493,7 +4533,7 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     for &c in inlined {
         u.exec_event(c, "inline");
         if c != id && !u.fns[c as usize].inlined_into.contains(&id) {
-            u.fns[c as usize].inlined_into.push(id);
+            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
         }
     }
     u.stats.tier1_cached += 1;
@@ -4687,7 +4727,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             // first seconds after main install
             let before_present = !FIRST_PRESENT.load(Ordering::Acquire);
             if (before_present || wall_ns() < ORDER_UNTIL_NS.load(Ordering::Relaxed)) && u.fns[id as usize].patch_gen == 0 && !u.fns[id as usize].compiled {
-                u.start_order.push(id);
+                crate::zone_alloc::kept_with(|| u.start_order.push(id));
                 // RELAX_PRESENT_FILES=1: the source file of every fn installed before the first
                 // present (what startup executes, per file)
                 if before_present && present_files() {
@@ -4764,7 +4804,7 @@ fn perf_name(u: &Unit, id: u32) -> String {
 unsafe fn train_cached_tier1(u: &mut Unit, id: u32) {
     if (*tier_rec(&u.slots, id).add(3)).load(Ordering::Acquire) == T_QUEUED
         && !u.prog.session.options.no_block_freq && !t1prof_replay(&u.prog.session.options) {
-        u.frequency_profiles.entry(id).or_default();
+        crate::zone_alloc::kept_with(|| { u.frequency_profiles.entry(id).or_default(); });
     }
 }
 
@@ -4774,6 +4814,7 @@ pub(crate) fn note_body_deps(u: &mut Unit, id: u32, deps: impl Iterator<Item = u
     if v.is_empty() {
         return;
     }
+    let _k = crate::zone_alloc::kept();
     let e = u.body_deps.entry(id).or_default();
     v.retain(|c| !e.contains(c));
     e.extend(v);
@@ -4781,6 +4822,7 @@ pub(crate) fn note_body_deps(u: &mut Unit, id: u32, deps: impl Iterator<Item = u
 
 fn note_const_reader(u: &Unit, d: DefId, slot: u32) {
     let mut g = u.const_readers.lock().unwrap_or_else(|e| e.into_inner());
+    let _k = crate::zone_alloc::kept();
     let v = g.entry(d).or_default();
     if v.last() != Some(&slot) && !v.contains(&slot) {
         v.push(slot);
@@ -4833,7 +4875,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             // a startup image slot whose key does not decode is not the program's error: no
             // identity to rebuild, only the stub that reports it if the slot is ever called
             if !matches!(u.fns[id as usize].key, FnKey::Glue(GLUE_UNNAMED, _)) {
-                u.errors.push(format!("compile error in {}: {}", name, e));
+                u.note_error(format!("compile error in {}: {}", name, e));
             }
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
@@ -6855,7 +6897,7 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: crate::rir::Func, inlined: Vec
         }
         u.stats.inline_rules[rule] += 1;
         if !u.fns[c as usize].inlined_into.contains(&id) {
-            u.fns[c as usize].inlined_into.push(id);
+            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
         }
     }
     u.stats.opt_ns += opt_ns;
@@ -8473,7 +8515,7 @@ fn sampler_thread() {
                             if pos == 0 { continue; }
                             let Some(h) = u.frequency_profiles.get_mut(&id) else { continue; };
                             if h.samples >= FREQUENCY_SAMPLES { continue; }
-                            *h.positions.entry(pos).or_default() += weight;
+                            crate::zone_alloc::kept_with(|| *h.positions.entry(pos).or_default() += weight);
                             h.samples += 1;
                             if h.samples == FREQUENCY_SAMPLES && !h.queued {
                                 if tier1_trace() {
@@ -9133,6 +9175,7 @@ impl Unit {
     fn retier(&mut self, id: u32) {
         if t1prof_replay(&self.prog.session.options) { return; }
         const RETIERS: u8 = 4;
+        let _k = crate::zone_alloc::kept();
         let n = self.retiers.entry(id).or_insert(0);
         if *n >= RETIERS {
             return;
@@ -10141,7 +10184,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     for &c in &inlined {
                         u.exec_event(c, "inline");
                         if c != id && !u.fns[c as usize].inlined_into.contains(&id) {
-                            u.fns[c as usize].inlined_into.push(id);
+                            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
                         }
                     }
                     u.stats.tier1_installed += 1;
@@ -10167,7 +10210,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let f = &mut u.fns[id as usize];
                 let old_map = std::mem::take(&mut f.pc_map);
-                f.retired.push((f.code, f.code_len, old_map));
+                crate::zone_alloc::kept_with(|| f.retired.push((f.code, f.code_len, old_map)));
                 f.code = at;
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
@@ -10179,11 +10222,11 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 for c in inlined {
                     u.exec_event(c, "inline");
                     if !u.fns[c as usize].inlined_into.contains(&id) {
-                        u.fns[c as usize].inlined_into.push(id);
+                        crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
                     }
                 }
                 if !options.no_block_freq && !t1prof_replay(options) {
-                    u.frequency_profiles.entry(id).or_default();
+                    crate::zone_alloc::kept_with(|| { u.frequency_profiles.entry(id).or_default(); });
                     if sampled_positions.is_some() && tier1_trace() {
                         eprintln!("O3-frequency installed @{:.3} ms samples={} {}", crate::clock::ms_since_start(), FREQUENCY_SAMPLES, name);
                     }
@@ -10200,10 +10243,12 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     if u.fns[c as usize].compiled {
                         again = true;
                     } else {
-                        let v = u.cold_users.entry(c).or_default();
-                        if !v.contains(&id) {
-                            v.push(id);
-                        }
+                        crate::zone_alloc::kept_with(|| {
+                            let v = u.cold_users.entry(c).or_default();
+                            if !v.contains(&id) {
+                                v.push(id);
+                            }
+                        });
                     }
                 }
                 if again && !(t1prof_on(options) && T1PROF.lock().unwrap().as_ref().map_or(false, |p| p.replay)) {
@@ -13003,7 +13048,9 @@ pub struct PcFiles {
 }
 
 impl PcMap {
+    /// An installed code body's map: identity state, built in the kept heap.
     pub fn new(v: &[(u32, u64)]) -> PcMap {
+        let _k = crate::zone_alloc::kept();
         PcMap::encode(v.len(), v.iter().copied())
     }
 

@@ -123,7 +123,69 @@ struct DataIndex {
 
 impl Syms {
     pub fn new(vals: u64) -> Syms {
-        Syms { vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::with_capacity(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+        Syms { vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+    }
+
+    /// The kept-state scan (jit/zone_scan.rs): the owned allocations of the symbol table.
+    pub(crate) fn scan(&self, a: &mut crate::jit::zone_scan::Acc) {
+        fn kind(a: &mut crate::jit::zone_scan::Acc, k: &SymKind) {
+            match k {
+                SymKind::Foreign(s) | SymKind::Missing(s) | SymKind::Asm(s) | SymKind::Provided(s) => a.string(s),
+                _ => {}
+            }
+        }
+        a.field("syms.kinds");
+        self.kinds.alloc_ptrs(|p| a.ptr(p));
+        for k in self.kinds.iter() {
+            kind(a, k);
+        }
+        a.field("syms.map");
+        if let Ok(g) = self.inner.try_lock() {
+            a.map(&g.map, |a, k, _| kind(a, k));
+        }
+        a.field("syms.data");
+        if let Ok(g) = self.data.try_lock() {
+            a.vec(&g.objs);
+            for o in g.objs.iter() {
+                if let Some(n) = &o.name {
+                    a.string(n);
+                }
+                match &o.kind {
+                    DataKind::Words(w) => a.vec(w),
+                    DataKind::Relocs(r) => a.vec(r),
+                    _ => {}
+                }
+                if let Some(p) = &o.ptrs {
+                    a.arc(p);
+                    a.vec(p);
+                }
+            }
+            a.btree(&g.by_start, |_, _, _| {});
+        }
+        a.field("syms.rw_blocks");
+        if let Ok(g) = self.rw_blocks.try_lock() {
+            a.vec(&g);
+        }
+        a.field("syms.rw_starts");
+        if let Ok(g) = self.rw_starts.try_lock() {
+            a.btree(&g, |_, _, _| {});
+        }
+        a.field("syms.initial_data");
+        if let Ok(g) = self.initial_data.try_lock() {
+            a.map(&g, |a, _, v| a.vec(v));
+        }
+        a.field("syms.foreign_defs");
+        if let Ok(g) = self.foreign_defs.try_lock() {
+            a.map(&g, |_, _, _| {});
+        }
+        a.field("syms.rt_by_addr");
+        if let Some(m) = self.rt_by_addr.get() {
+            a.map(m, |_, _, _| {});
+        }
+        a.field("syms.foreign_by_addr");
+        if let Ok(g) = self.foreign_by_addr.try_lock() {
+            a.map(&g.by_addr, |_, _, _| {});
+        }
     }
 
     /// The symbol for `kind` (created with `value` on first use; later calls return the same id).
@@ -135,8 +197,11 @@ impl Syms {
         if let Some(&id) = g.map.get(&kind) {
             return Sym::new(id);
         }
-        let s = self.push(kind.clone(), value);
-        g.map.insert(kind, s.id);
+        // identity state: the kind (and its string) outlives the compiler arena
+        let _k = crate::zone_alloc::kept();
+        let own = kind.clone();
+        let s = self.push(own.clone(), value);
+        g.map.insert(own, s.id);
         s
     }
 
@@ -172,6 +237,8 @@ impl Syms {
         // one critical section: the object's index and its symbol must agree (lock order:
         // data, then the symbol table)
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let _k = crate::zone_alloc::kept();
+        let kind = kind.clone();
         let idx = d.objs.len() as u32;
         let s = self.intern(SymKind::Data(idx), start);
         d.objs.push(DataObj { start, len, align, kind, sym: s.id, name: None, mutable, ptrs: None, opaque: false });
@@ -184,6 +251,7 @@ impl Syms {
     /// given the symbol of every object of the batch.
     pub fn add_data_batch(&self, objs: &[(u64, u64, u64, Option<String>)], mut ptrs: impl FnMut(usize, &[Sym]) -> Vec<(u32, Sym)>) -> Vec<Sym> {
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let _k = crate::zone_alloc::kept();
         d.objs.reserve(objs.len());
         let first = d.objs.len() as u32;
         let syms: Vec<Sym> = objs.iter().enumerate().map(|(i, o)| self.intern(SymKind::Data(first + i as u32), o.0)).collect();
@@ -203,6 +271,8 @@ impl Syms {
 
     /// Sets what a registered object holds (its bytes are written after `Unit::data`).
     pub fn set_data_kind(&self, start: u64, kind: DataKind) {
+        let _k = crate::zone_alloc::kept();
+        let kind = kind.clone();
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&i) = d.by_start.get(&start) {
             let o = &mut d.objs[i as usize];
@@ -214,6 +284,8 @@ impl Syms {
 
     /// Names a registered object (its stable identity across runs).
     pub fn set_data_name(&self, start: u64, name: String) {
+        let _k = crate::zone_alloc::kept();
+        let name = name.clone();
         let mut d = self.data.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&i) = d.by_start.get(&start) {
             d.objs[i as usize].name = Some(name);
@@ -429,7 +501,7 @@ fn obj_ptrs(u: &Unit, idx: u32) -> Option<(u64, u64, std::sync::Arc<Vec<(u32, Op
             }
         }
     }
-    let ptrs = std::sync::Arc::new(ptrs);
+    let ptrs = crate::zone_alloc::kept_with(|| std::sync::Arc::new(ptrs.clone()));
     let mut d = u.syms.data.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(o) = d.objs.get_mut(idx as usize) {
         o.ptrs = Some(ptrs.clone());
@@ -483,6 +555,7 @@ fn provenance(u: &Unit, v: u64) -> Option<Sym> {
     // Runtime entries are all installed at Unit creation. Prefer their stable names over
     // foreign aliases (e.g. memcpy), never the symbol id / order of compilation.
     let rt = u.syms.rt_by_addr.get_or_init(|| {
+        let _k = crate::zone_alloc::kept();
         let mut entries: Vec<_> = u.syms.kinds.iter().enumerate().filter_map(|(i, k)| match k {
             SymKind::Rt(n) => Some((*n, Sym::new(i as u32))),
             _ => None,
@@ -513,6 +586,7 @@ fn provenance(u: &Unit, v: u64) -> Option<Sym> {
         }).collect();
         foreign.sort_unstable_by(|(a, da), (b, db)| a.cmp(b).then(da.0.cmp(&db.0)));
         foreign.dedup_by(|a, b| a.0 == b.0);
+        let _k = crate::zone_alloc::kept();
         for (_, d) in foreign {
             if let Some(addr) = u.loaded_foreign_addr(d) {
                 // First per address wins, also when later modules add aliases.

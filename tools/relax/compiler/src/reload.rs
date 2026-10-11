@@ -463,7 +463,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
                 u.consts.remove(&x);
             }
         }
-        for (k, v) in undo.consts { u.consts.insert(k, v); }
+        for ((d, args), v) in undo.consts { u.put_const(d, args, v); }
         u.const_failed.retain(|(d, _)| !undo.consts_hit.contains(d));
         u.const_failed.extend(undo.const_failed);
         // RIR built from the rolled-back text (inlining sources) is dropped
@@ -3137,8 +3137,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                 u.consts.remove(&x);
             }
         }
-        for (k, v) in saved_consts {
-            u.consts.insert(k, v);
+        for ((d, args), v) in saved_consts {
+            u.put_const(d, args, v);
         }
         for k in saved_failed {
             u.const_failed.insert(k);

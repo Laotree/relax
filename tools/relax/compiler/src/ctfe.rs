@@ -1218,7 +1218,7 @@ impl<'a> Ctx<'a> {
         // Nested CTFE used to bypass the persistent value cache even when the
         // outer initializer came from a warm program.
         if let Some(a) = unsafe { crate::cache::const_value(u as *mut Unit, d, &args) } {
-            u.consts.insert((d, args), a);
+            u.put_const(d, args, a);
             return Some(a);
         }
         let t = u.tcx.tys.subst_erasing_regions(u.tcx.const_ty(&u.prog, d)?, &args);
@@ -1237,7 +1237,7 @@ impl<'a> Ctx<'a> {
             cache.record_const(self.u, d, &args, buf);
             self.u.cache = Some(cache);
         }
-        self.u.consts.insert((d, args), buf);
+        self.u.put_const(d, args, buf);
         Some(buf)
     }
 

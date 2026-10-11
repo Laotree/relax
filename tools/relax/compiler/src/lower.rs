@@ -10879,6 +10879,9 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
     // another thread may have made this location meanwhile (the memo is not held while the
     // object is built): every user gets the first one -- one symbol per location, whatever the
     // compile order (one constant pool word; the copy made here stays unused)
+    // identity state: the memo's key is the program's, not the compiler arena's
+    let _k = crate::zone_alloc::kept();
+    let key = key.clone();
     *u.locations.lock().unwrap_or_else(|e| e.into_inner()).entry(key).or_insert(a)
 }
 

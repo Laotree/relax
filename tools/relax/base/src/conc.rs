@@ -121,6 +121,8 @@ pub struct MemoMap<K, V> {
     graveyard: std::sync::Mutex<Vec<*mut MemoTable<K, V>>>,
     locks: Box<[std::sync::Mutex<()>]>,
     bits: u32,
+    /// the table, its nodes and keys live in the kept heap (zone_alloc::kept), not the compiler arena
+    kept: bool,
 }
 
 struct MemoTable<K, V> {
@@ -179,12 +181,30 @@ impl<K: Hash + Eq, V: Clone> Default for MemoMap<K, V> {
 impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
     /// A table of 2^bits buckets (chains grow past that, gracefully).
     pub fn with_bits(bits: u32) -> Self {
+        Self::build(bits, false)
+    }
+
+    /// `with_bits` for state that must outlive the compiler arena: every allocation the map
+    /// makes itself (table, nodes) is in the kept heap. Keys and values the caller built before
+    /// `insert` are the caller's to build in the kept phase.
+    pub fn new_kept(bits: u32) -> Self {
+        Self::build(bits, true)
+    }
+
+    fn build(bits: u32, kept: bool) -> Self {
+        let _k = if kept { Some(crate::zone_alloc::kept()) } else { None };
         MemoMap {
             table: std::sync::atomic::AtomicPtr::new(MemoTable::new(bits)),
             graveyard: std::sync::Mutex::new(Vec::new()),
             locks: (0..MEMO_LOCKS).map(|_| std::sync::Mutex::new(())).collect(),
             bits,
+            kept,
         }
+    }
+
+    #[inline]
+    fn phase(&self) -> Option<crate::zone_alloc::PhaseGuard> {
+        if self.kept { Some(crate::zone_alloc::kept()) } else { None }
     }
 
     #[inline]
@@ -251,6 +271,7 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         let _l = self.locks[b % MEMO_LOCKS].lock().unwrap_or_else(|e| e.into_inner());
         let t = unsafe { &*self.table.load(std::sync::atomic::Ordering::Acquire) };
         let head = t.buckets[b].load(std::sync::atomic::Ordering::Acquire);
+        let _k = self.phase();
         let n = Box::into_raw(Box::new(MemoNode { hash: h, key: k, val: v, next: head }));
         t.buckets[b].store(n, std::sync::atomic::Ordering::Release);
     }
@@ -266,9 +287,36 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         }
         let t = unsafe { &*self.table.load(std::sync::atomic::Ordering::Acquire) };
         let head = t.buckets[b].load(std::sync::atomic::Ordering::Acquire);
+        let _k = self.phase();
         let n = Box::into_raw(Box::new(MemoNode { hash: h, key: k, val: v.clone(), next: head }));
         t.buckets[b].store(n, std::sync::atomic::Ordering::Release);
         v
+    }
+
+    /// The kept-state scan (RELAX_ZONE_CHECK): `own` sees each allocation the map owns (tables,
+    /// bucket arrays, nodes), `entry` each live entry's key and value. Quiescent callers only.
+    pub fn scan(&self, mut own: impl FnMut(*const u8), mut entry: impl FnMut(&K, &V)) {
+        let tables: Vec<*mut MemoTable<K, V>> = {
+            let g = self.graveyard.lock().unwrap_or_else(|e| e.into_inner());
+            std::iter::once(self.table.load(std::sync::atomic::Ordering::Acquire)).chain(g.iter().copied()).collect()
+        };
+        own(self as *const Self as *const u8);
+        for (ti, t) in tables.into_iter().enumerate() {
+            own(t as *const u8);
+            let t = unsafe { &*t };
+            own(t.buckets.as_ptr() as *const u8);
+            for bucket in t.buckets.iter() {
+                let mut p = bucket.load(std::sync::atomic::Ordering::Acquire);
+                while !p.is_null() {
+                    own(p as *const u8);
+                    let n = unsafe { &*p };
+                    if ti == 0 {
+                        entry(&n.key, &n.val);
+                    }
+                    p = n.next;
+                }
+            }
+        }
     }
 
     /// Memory report: (entries, bytes) of the current table, `deep` adding each entry's own heap
@@ -289,6 +337,7 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
     }
 
     pub fn clear(&self) {
+        let _k = self.phase();
         let fresh = MemoTable::new(self.bits);
         let old = self.table.swap(fresh, std::sync::atomic::Ordering::AcqRel);
         self.graveyard.lock().unwrap_or_else(|e| e.into_inner()).push(old);
@@ -322,6 +371,7 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
     /// `clear`, and the retired tables with it, handed back instead of freed: the entries are
     /// freed when the returned value drops (outside the caller's locks). Same safety as `reclaim`.
     pub unsafe fn detach(&self) -> Detached<K, V> {
+        let _k = self.phase();
         let fresh = MemoTable::new(self.bits);
         let mut all = vec![self.table.swap(fresh, std::sync::atomic::Ordering::AcqRel)];
         all.extend(self.graveyard.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
@@ -355,6 +405,8 @@ pub struct AppendVec<T> {
     chunks: Box<[std::sync::atomic::AtomicPtr<T>]>,
     len: std::sync::atomic::AtomicUsize,
     grow: std::sync::Mutex<()>,
+    /// its chunk table and chunks live in the kept heap (zone_alloc::kept)
+    kept: bool,
 }
 
 const AV_BITS: u32 = 12;
@@ -366,9 +418,21 @@ unsafe impl<T: Send + Sync> Sync for AppendVec<T> {}
 impl<T> AppendVec<T> {
     /// Room for `cap` entries (rounded up to whole chunks).
     pub fn with_capacity(cap: usize) -> Self {
+        Self::build(cap, false)
+    }
+
+    /// `with_capacity` for state that must outlive the compiler arena: the chunk table and
+    /// every chunk are allocated in the kept heap. Heap data the entries own is the pusher's to
+    /// build in the kept phase.
+    pub fn new_kept(cap: usize) -> Self {
+        Self::build(cap, true)
+    }
+
+    fn build(cap: usize, kept: bool) -> Self {
+        let _k = if kept { Some(crate::zone_alloc::kept()) } else { None };
         let n = (cap + AV_CHUNK - 1) / AV_CHUNK;
         // zeroed pages (null pointers) straight from the allocator: a table for every u32 index stays virtual until chunks are used
-        AppendVec { chunks: unsafe { Box::<[std::sync::atomic::AtomicPtr<T>]>::new_zeroed_slice(n).assume_init() }, len: Default::default(), grow: Default::default() }
+        AppendVec { chunks: unsafe { Box::<[std::sync::atomic::AtomicPtr<T>]>::new_zeroed_slice(n).assume_init() }, len: Default::default(), grow: Default::default(), kept }
     }
 
     #[inline]
@@ -381,6 +445,7 @@ impl<T> AppendVec<T> {
     pub fn reserve(&self, upto: usize, fresh: impl Fn(*mut u8, usize)) {
         use std::sync::atomic::Ordering;
         let _g = self.grow.lock().unwrap_or_else(|e| e.into_inner());
+        let _k = if self.kept { Some(crate::zone_alloc::kept()) } else { None };
         let last = upto.saturating_sub(1) >> AV_BITS;
         for ci in (self.len.load(Ordering::Relaxed) >> AV_BITS)..=last.min(self.chunks.len().saturating_sub(1)) {
             if self.chunks[ci].load(Ordering::Relaxed).is_null() {
@@ -402,6 +467,7 @@ impl<T> AppendVec<T> {
         assert!(ci < self.chunks.len(), "AppendVec full");
         let mut c = self.chunks[ci].load(Ordering::Relaxed);
         if c.is_null() {
+            let _k = if self.kept { Some(crate::zone_alloc::kept()) } else { None };
             let mut v: Vec<std::mem::MaybeUninit<T>> = Vec::with_capacity(AV_CHUNK);
             unsafe { v.set_len(AV_CHUNK) };
             c = Box::into_raw(v.into_boxed_slice()) as *mut T;
@@ -422,6 +488,18 @@ impl<T> AppendVec<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> + '_ {
         let n = self.len();
         (0..n).map(move |i| unsafe { &*self.ptr(i) })
+    }
+
+    /// Every allocation the vector itself owns (the chunk table, each chunk): the kept-state
+    /// scan (RELAX_ZONE_CHECK) asks the compiler arena whether any of them lies in it.
+    pub fn alloc_ptrs(&self, mut f: impl FnMut(*const u8)) {
+        f(self.chunks.as_ptr() as *const u8);
+        for c in self.chunks.iter() {
+            let p = c.load(std::sync::atomic::Ordering::Acquire);
+            if !p.is_null() {
+                f(p as *const u8);
+            }
+        }
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> + '_ {

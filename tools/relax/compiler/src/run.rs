@@ -1569,6 +1569,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         let drops = std::mem::take(drops);
         let retired = unsafe { jit::retire_type_side(up) };
         let u = unsafe { &mut *up };
+        jit::zone_scan::settle_check(u);
         let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
         let spill = u.cache.as_mut().and_then(|c| c.spill_take());
         let at = crate::clock::ms_since_start();

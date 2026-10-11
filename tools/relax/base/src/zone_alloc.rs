@@ -231,6 +231,27 @@ pub fn kept() -> PhaseGuard {
     enter(KEPT)
 }
 
+/// Runs `f` in the kept phase (the system heap): what it allocates and returns is the program's.
+#[inline]
+pub fn kept_with<R>(f: impl FnOnce() -> R) -> R {
+    let _k = kept();
+    f()
+}
+
+/// A copy of `v` allocated in the kept phase (state that must outlive the compiler arena).
+#[inline]
+pub fn kept_clone<T: Clone>(v: &T) -> T {
+    let _k = kept();
+    v.clone()
+}
+
+/// Does `p` lie in the compiler arena (a block there is destroyed by step 1b)? The check
+/// `RELAX_ZONE_CHECK=1` runs over the kept state.
+#[inline]
+pub fn compiler_owns(p: *const u8) -> bool {
+    compiler::owns(p as *mut u8)
+}
+
 pub struct RelaxAlloc;
 
 /// Set when the program announces a malloc-zone swap (before it happens).
