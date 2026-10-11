@@ -266,7 +266,10 @@ pub fn run(opts: Options) -> Result<(), String> {
         }
     }
     let read_only: BTreeSet<String> = files.clone();
-    for p in &graph {
+    // an Android app reads its resources (fonts, images, ..) from the APK's assets, which the
+    // APK builder packages per crate (cargo makepad android): the archive holds the sources
+    let assets_in_apk = opts.target.as_deref().is_some_and(|t| t.contains("android"));
+    for p in graph.iter().filter(|_| !assets_in_apk) {
         let res = if p.is_empty() { "resources".to_string() } else { format!("{p}/resources") };
         walk(&root, &res, &mut files)?;
     }
