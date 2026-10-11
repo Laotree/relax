@@ -86,7 +86,7 @@ fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::
         eprintln!("relax-event: {}", json);
     }
     if let Some(w) = super::WATCH.get() {
-        w.emit(&json);
+        crate::zone_alloc::kept_with(|| w.emit(&json));
     }
     let json: std::sync::Arc<str> = json.into();
     q.push_back(Event { seq, kind, key: key.to_string(), json: json.clone(), at: std::time::Instant::now() });

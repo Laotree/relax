@@ -63,7 +63,8 @@ pub fn start(app: &str) {
     if std::env::var("RELAX_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
         return;
     }
-    *APP.lock().unwrap() = crate::zone_alloc::kept_with(|| app.to_string());
+    let _k = crate::zone_alloc::kept();
+    *APP.lock().unwrap() = app.to_string();
     let pid = std::process::id();
     let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
     let extra = format!(",\"session_log\":{},\"relax\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));
@@ -740,6 +741,7 @@ pub fn stop_domain(id: u32) {
 }
 
 fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, version: u32, open: ServiceOpen, close: ServiceClose, scope: crate::domain::Callback) {
+    let _k = crate::zone_alloc::kept();
     endpoint.register(
         name,
         version,

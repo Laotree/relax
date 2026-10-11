@@ -111,6 +111,13 @@ fn run(raw_args: Vec<Vec<u8>>) {
     if let Some(code) = cef::subprocess() {
         std::process::exit(code);
     }
+    {
+        let _k = relax_compiler::zone_alloc::kept();
+        // A connected zero-capacity receive enters std's persistent mpmc context before
+        // checking its deadline; try_recv does not. Keep that TLS Arc out of the arena.
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let _ = rx.recv_timeout(std::time::Duration::ZERO);
+    }
     // the boot thread compiles: its allocations go to the compiler arena (JIT calls switch back)
     let _phase = relax_compiler::zone_alloc::compiler();
     relax_compiler::clock::mark_process_start();

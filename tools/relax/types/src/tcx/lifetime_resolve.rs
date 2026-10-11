@@ -27,7 +27,7 @@ impl LifetimeResolution {
     /// The answer to share: every empty resolution is the same value, kept once.
     pub(crate) fn share(self) -> std::sync::Arc<LifetimeResolution> {
         static EMPTY: std::sync::OnceLock<std::sync::Arc<LifetimeResolution>> = std::sync::OnceLock::new();
-        if self.is_empty() { EMPTY.get_or_init(Default::default).clone() } else { std::sync::Arc::new(self) }
+        if self.is_empty() { EMPTY.get_or_init(|| crate::zone_alloc::kept_with(Default::default)).clone() } else { std::sync::Arc::new(self) }
     }
     /// memory report: heap bytes owned (excluding the struct)
     pub(crate) fn heap_bytes(&self) -> usize {

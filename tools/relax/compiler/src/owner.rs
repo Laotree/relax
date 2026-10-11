@@ -199,18 +199,27 @@ pub fn owner_tid() -> u64 {
 /// Starts the owner thread (once; every unit shares it).
 pub fn start() {
     STARTED.call_once(|| {
+        // The blocking context retains the owner's thread handle, including its name.
+        let _k = crate::zone_alloc::kept();
         crate::query::set_wait_hook(crate::query::WaitHook { on_owner: is_owner, pump: pump_latch, wake, me });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("relax-owner".into())
             .stack_size(256 << 20)
-            .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            .spawn(move || {
+                {
+                    let _k = crate::zone_alloc::kept();
+                    // std's blocking context survives every compiler generation on this thread.
+                    let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+                    let _ = rx.recv_timeout(std::time::Duration::ZERO);
+                }
+                let _z = crate::zone_alloc::compiler_thread();
                 IS_OWNER.with(|o| o.set(true));
                 OWNER_TID.store(me(), Ordering::SeqCst);
                 crate::waits::register();
                 let _ = OWNER_THREAD.set(std::thread::current());
                 crate::jit::ensure_altstack();
-                let _ = tx.send(());
+                let _ = crate::zone_alloc::kept_with(|| tx.send(()));
                 owner_loop();
             })
             .expect("relax: cannot start the compiler's owner thread");

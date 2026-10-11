@@ -115,7 +115,9 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     }
     let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     for name in verified {
-        if !matched.contains(&name) { matched.push(name); }
+        if !matched.contains(&name) {
+            crate::zone_alloc::kept_with(|| matched.push(name));
+        }
     }
     Ok(())
 }

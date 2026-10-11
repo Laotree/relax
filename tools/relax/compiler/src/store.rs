@@ -231,6 +231,7 @@ static LIVE: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std:
 /// gets its modification time stamped: the order the cap evicts in, and how another run sees it
 /// in use.
 fn mark_live(base: &Path, file: &Path, stamp: bool) {
+    let _k = crate::zone_alloc::kept();
     OPEN_FILES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(file.to_path_buf());
     let new = LIVE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(base.to_path_buf());
     if new && stamp {
@@ -300,6 +301,7 @@ pub fn current(path: &Path) -> PathBuf {
 }
 
 fn current_gen(path: &Path) -> (u32, PathBuf) {
+    let _k = crate::zone_alloc::kept();
     let base = base_path(path);
     let dir = base.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut guard = GENS.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,6 +339,7 @@ fn next_gen(base: &Path) -> (u32, PathBuf) {
 }
 
 fn written_gen(base: &Path, g: u32) {
+    let _k = crate::zone_alloc::kept();
     let mut guard = GENS.lock().unwrap_or_else(|e| e.into_inner());
     let (gens, _) = guard.get_or_insert_with(Default::default);
     let k = gens.entry(base.to_path_buf()).or_insert(0);

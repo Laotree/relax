@@ -353,7 +353,7 @@ mod unix {
             let n = unsafe { read(st.read_fd, buf.as_mut_ptr(), take) };
             if n <= 0 { break; }
             st.forwarded += n as u64;
-            st.partial.extend_from_slice(&buf[..n as usize]);
+            crate::zone_alloc::kept_with(|| st.partial.extend_from_slice(&buf[..n as usize]));
             // Yield display work to the ticker even when diagnostics stream continuously.
             if !flush_partial && started.elapsed().as_millis() >= 25 { break; }
         }
@@ -374,6 +374,7 @@ mod unix {
 
     /// Start a durable transcript, and optionally the terminal progress bar.
     pub fn start(progress: bool) {
+        let _k = crate::zone_alloc::kept();
         unsafe { std::env::remove_var("RELAX_RUN_PROGRESS") };
         if std::env::var_os("RELAX_SCRIPT_DEPTH").is_some() || STATE.lock().unwrap().is_some() { return; }
         let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());

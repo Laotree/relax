@@ -2691,7 +2691,10 @@ static UNWIND_HOSTS: std::sync::OnceLock<Vec<Sym>> = std::sync::OnceLock::new();
 /// The runtime functions a panic starts unwinding from (the panic entries): an inlined call of
 /// one of them inside an invoked call's body unwinds into the caller's cleanup pad.
 pub fn set_unwind_hosts(hosts: Vec<Sym>) {
-    let _ = UNWIND_HOSTS.set(hosts);
+    let _ = UNWIND_HOSTS.get_or_init(|| {
+        let _k = relax_session::phase::kept();
+        hosts.clone()
+    });
 }
 
 /// Whether a call of `c` may unwind: Relax code not known to be nounwind, calls through

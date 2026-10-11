@@ -114,7 +114,7 @@ pub(crate) fn with_misses<R>(f: impl FnOnce() -> R) -> (R, Misses) {
     crate::program::note_misses(&misses);
     // Most solver goals have no misses; share that immutable empty payload.
     static EMPTY: std::sync::OnceLock<Misses> = std::sync::OnceLock::new();
-    let misses = if misses.is_empty() { EMPTY.get_or_init(|| std::sync::Arc::new(Vec::new())).clone() }
+    let misses = if misses.is_empty() { EMPTY.get_or_init(|| crate::zone_alloc::kept_with(|| std::sync::Arc::new(Vec::new()))).clone() }
         else { std::sync::Arc::new(misses) };
     (r, misses)
 }

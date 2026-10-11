@@ -133,6 +133,7 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         session_cache_off();
     }
     if !args.iter().any(|a| a == "--check") {
+        let _k = crate::zone_alloc::kept();
         *GANDALF_CONSOLE.lock().unwrap() = Some(crate::gandalf_out::Console::start(crate::diag::enabled(), args.iter().any(|a| a == "--quiet")));
     }
     let host = MAIN_HOST.get().filter(|_| {
@@ -2052,6 +2053,7 @@ fn exit_quiesce_ms() -> u64 {
 }
 
 fn start_exit_summary() {
+    let _k = crate::zone_alloc::kept();
     let (request, receive) = std::sync::mpsc::sync_channel::<(&'static str, Option<i32>)>(1);
     let worker = std::thread::Builder::new().name("relax-exit".into()).spawn(move || {
         let Ok((why, code)) = receive.recv() else { return };
@@ -2084,7 +2086,7 @@ fn start_exit_summary() {
         crate::tui::finish(false);
     });
     // Failure to start optional cleanup must not turn a successful run into a failure.
-    if let Ok(worker) = worker { let _k = crate::zone_alloc::kept(); let _ = EXIT_SUMMARY.set(ExitSummary { request, worker, code: std::sync::OnceLock::new() }); }
+    if let Ok(worker) = worker { let _ = EXIT_SUMMARY.set(ExitSummary { request, worker, code: std::sync::OnceLock::new() }); }
 }
 
 fn finish_run(why: &'static str, code: Option<i32>) {
@@ -2434,7 +2436,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             if let Some((report, dest, payload)) = ready {
                 if let Some(written) = crate::cache::Cache::commit_collected(report, dest, payload) {
                     COLLECTED_CURRENT.store(true, Ordering::Relaxed);
-                    *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(written);
+                    crate::zone_alloc::kept_with(|| *COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(written.clone()));
                     let retired_boot = crate::owner::call(crate::owner::Class::App, || unsafe { &mut *up }.cache.as_mut().map(|c| c.finish_collected()));
                     drop(retired_boot);
                 }

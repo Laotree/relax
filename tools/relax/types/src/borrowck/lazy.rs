@@ -17,6 +17,7 @@ static SUBS: Mutex<Vec<(u64, Sender<GandalfEvent>)>> = Mutex::new(Vec::new());
 static NEXT_SUB: AtomicU64 = AtomicU64::new(1);
 static SEQ: AtomicU64 = AtomicU64::new(1);
 pub fn subscribe() -> (u64, Receiver<GandalfEvent>) {
+    let _k = crate::zone_alloc::kept();
     let (tx, rx) = mpsc::channel();
     let id = NEXT_SUB.fetch_add(1, Ordering::Relaxed);
     SUBS.lock().unwrap_or_else(|e| e.into_inner()).push((id, tx));
@@ -24,6 +25,8 @@ pub fn subscribe() -> (u64, Receiver<GandalfEvent>) {
 }
 pub fn unsubscribe(id: u64) { SUBS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(i, _)| *i != id); }
 fn publish(ev: &mut GandalfEvent) {
+    // Subscribers can retain queued events after the compiler arena is destroyed.
+    let _k = crate::zone_alloc::kept();
     let mut subs = SUBS.lock().unwrap_or_else(|e| e.into_inner());
     ev.seq = SEQ.fetch_add(1, Ordering::Relaxed);
     subs.retain(|(_, tx)| tx.send(ev.clone()).is_ok());

@@ -130,11 +130,11 @@ use disabled as burst;
 use disabled as compiler;
 
 pub use burst::{scratch, stats as burst_stats, trim as burst_trim, ScratchGuard};
+pub use relax_session::phase::{in_compiler, PhaseGuard};
 
+use relax_session::phase::ROUTING as MODE;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::Ordering;
 #[cfg(target_os = "macos")]
 use std::sync::atomic::AtomicBool;
 
@@ -219,18 +219,6 @@ pub fn compiler_arena_enabled() -> bool {
     enabled()
 }
 
-const KEPT: u8 = 0;
-const COMPILER: u8 = 1;
-const OFF: u8 = 0xff;
-
-thread_local! {
-    // const, no destructor: readable in the allocator at any point of a thread's life
-    static PHASE: Cell<u8> = const { Cell::new(KEPT) };
-}
-
-/// 0 = not read yet, 1 = on, 2 = off.
-static MODE: AtomicU8 = AtomicU8::new(0);
-
 #[cold]
 fn decide() -> bool {
     #[cfg(unix)]
@@ -258,37 +246,12 @@ fn enabled() -> bool {
     }
 }
 
-#[inline]
-fn in_compiler() -> bool {
-    PHASE.with(|p| p.get()) == COMPILER
-}
-
-/// Puts the calling thread in a phase until dropped. !Send: it restores this thread's TLS.
-pub struct PhaseGuard(u8, PhantomData<*mut ()>);
-
-impl Drop for PhaseGuard {
-    #[inline]
-    fn drop(&mut self) {
-        if self.0 != OFF {
-            PHASE.with(|p| p.set(self.0));
-        }
-    }
-}
-
-#[inline]
-fn enter(phase: u8) -> PhaseGuard {
-    if !enabled() {
-        return PhaseGuard(OFF, PhantomData);
-    }
-    let prev = PHASE.with(|p| p.replace(phase));
-    PhaseGuard(prev, PhantomData)
-}
-
 /// Allocations of the calling thread go to the compiler arena until the guard drops. Compiler
 /// threads take it as their first statement; app threads take it around a compile entry.
 #[inline]
 pub fn compiler() -> PhaseGuard {
-    enter(COMPILER)
+    enabled();
+    relax_session::phase::compiler()
 }
 
 /// `compiler()` for the first statement of a thread that compiles: when the thread ends its
@@ -303,14 +266,15 @@ impl Drop for ThreadGuard {
 
 #[inline]
 pub fn compiler_thread() -> ThreadGuard {
-    ThreadGuard(enter(COMPILER))
+    ThreadGuard(compiler())
 }
 
 /// Allocations go to the system heap (the program's) until the guard drops. JIT code and
 /// everything it calls runs in this phase.
 #[inline]
 pub fn kept() -> PhaseGuard {
-    enter(KEPT)
+    enabled();
+    relax_session::phase::kept()
 }
 
 /// Runs `f` in the kept phase (the system heap): what it allocates and returns is the program's.

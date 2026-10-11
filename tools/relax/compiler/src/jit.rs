@@ -759,7 +759,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         let eager = !(&*up).prog.skipped_files.is_empty() || perf_map_on() || crate::cache::trace_on() || t1prof_replay(&options);
         let n = crate::cache::prelink_unit(up, eager, &mut |u: &mut Unit, slots: Vec<crate::cache::PrelinkedSlot>| {
             u.code.write().unwrap_or_else(|e| e.into_inner()).reserve(slots.len());
-            u.start_order.reserve(slots.len());
+            crate::zone_alloc::kept_with(|| u.start_order.reserve(slots.len()));
             let mut arm = Vec::with_capacity(slots.len());
             let up: *mut Unit = u;
             for s in slots {
@@ -5203,6 +5203,7 @@ pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<cra
 pub static FRAMES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
 
 fn note_frame(id: u32, frame: u32, slots: u32, tier1: bool) {
+    let _k = crate::zone_alloc::kept();
     let mut g = FRAMES.lock().unwrap_or_else(|e| e.into_inner());
     if g.len() <= id as usize {
         g.resize(id as usize + 1, (0, 0));
@@ -8722,15 +8723,18 @@ fn sampler_thread() {
                 return;
             }
             let u = unsafe { &*up };
-            let mut heat = HEAT.lock().unwrap();
+            let mut heat = crate::zone_alloc::kept_with(|| HEAT.lock().unwrap());
             let counts = heat.get_or_insert_with(std::collections::HashMap::new);
             for &os::sample::Sample { pc, weight } in &pcs {
                 let Some(id) = u.find_fn(pc) else { continue };
                 unsafe { base_sampled(up, id) };
-                let c = counts.entry(id).or_insert(0);
-                let before = *c;
-                *c += weight;
-                if before < SAMPLES_HOT && *c >= SAMPLES_HOT {
+                let (before, count) = crate::zone_alloc::kept_with(|| {
+                    let c = counts.entry(id).or_insert(0);
+                    let before = *c;
+                    *c += weight;
+                    (before, *c)
+                });
+                if before < SAMPLES_HOT && count >= SAMPLES_HOT {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }

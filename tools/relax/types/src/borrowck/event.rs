@@ -78,6 +78,7 @@ static APP_SCOPE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// them with `reload::gandalf_app_roots` from the unit graph (or the root crate alone when
 /// there is none); this is the one app-crate rule.
 pub fn set_app_scope(roots: Vec<String>) {
+    let _k = crate::zone_alloc::kept();
     let roots = roots.iter().map(|r| crate::vfs::normalize_path(r)).collect();
     *APP_SCOPE.lock().unwrap_or_else(|e| e.into_inner()) = roots;
 }

@@ -302,6 +302,8 @@ pub struct ReadSnapshot {
 impl ReadSnapshot {
     pub fn new(profile: bool) -> Arc<Self> { Arc::new(Self { profile, ..Self::default() }) }
     pub fn bind(self: &Arc<Self>) -> ReadScope {
+        // The registry's weak pointers retain the binding's allocation after its scope ends.
+        let _k = crate::zone_alloc::kept();
         let binding = Arc::new(ReadBinding { thread: std::thread::current().id(), snapshot: Arc::downgrade(self) });
         let mut bindings = READ_BINDINGS.lock().unwrap();
         bindings.retain(|b| b.strong_count() != 0);

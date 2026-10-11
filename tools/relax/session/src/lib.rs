@@ -1,5 +1,6 @@
 //! Compilation inputs shared by every compiler layer.
 pub mod options;
+pub mod phase;
 pub mod sip;
 pub use options::{Options, RuntimeOptions};
 
