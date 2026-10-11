@@ -9,74 +9,128 @@ fn take_mut<'a, T>(s: &mut &'a mut [T]) -> &'a mut [T] {
 
 // ---------------------------------------------------------------- Iter / IterMut
 
-pub struct Iter<'a, T> {
-    s: &'a [T],
+// An iterator holds the next element's pointer and the end pointer (rustc's core does the same):
+// a step is one compare and one add, where a (pointer, length) pair needed a test, an add and a
+// subtract. For a zero-sized T both pointers stay put as addresses and `end` counts the
+// remaining elements in bytes past `ptr` (the pointer never moves).
+
+#[inline]
+fn zst<T>() -> bool {
+    crate::mem::size_of::<T>() == 0
 }
 
+#[inline]
+fn end_of<T>(p: *const T, len: usize) -> *const T {
+    if zst::<T>() {
+        (p as *const u8).wrapping_add(len) as *const T
+    } else {
+        // SAFETY: one past the end of the slice
+        unsafe { p.add(len) }
+    }
+}
+
+#[inline]
+fn len_between<T>(p: *const T, end: *const T) -> usize {
+    let bytes = end as usize - p as usize;
+    if zst::<T>() { bytes } else { bytes / crate::mem::size_of::<T>() }
+}
+
+pub struct Iter<'a, T> {
+    ptr: *const T,
+    end: *const T,
+    _m: crate::marker::PhantomData<&'a T>,
+}
+
+// as the reference it stands for (rustc: core::slice::Iter)
+unsafe impl<T: Sync> Send for Iter<'_, T> {}
+unsafe impl<T: Sync> Sync for Iter<'_, T> {}
+
 pub fn iter<T>(s: &[T]) -> Iter<'_, T> {
-    Iter { s }
+    Iter::new(s)
 }
 
 impl<'a, T> Iter<'a, T> {
     pub(crate) fn new(s: &'a [T]) -> Iter<'a, T> {
-        Iter { s }
+        let ptr = s.as_ptr();
+        Iter { ptr, end: end_of(ptr, s.len()), _m: crate::marker::PhantomData }
     }
     pub fn as_slice(&self) -> &'a [T] {
-        self.s
+        // SAFETY: ptr..end is the rest of the slice the iterator was made from
+        unsafe { super::from_raw_parts(self.ptr, len_between(self.ptr, self.end)) }
+    }
+    #[inline]
+    fn len_left(&self) -> usize {
+        len_between(self.ptr, self.end)
     }
 }
 
 impl<'a, T> Clone for Iter<'a, T> {
     fn clone(&self) -> Iter<'a, T> {
-        Iter { s: self.s }
+        Iter { ptr: self.ptr, end: self.end, _m: crate::marker::PhantomData }
     }
 }
 
 impl<'a, T> Default for Iter<'a, T> {
     fn default() -> Iter<'a, T> {
-        Iter { s: &[] }
+        Iter::new(&[])
     }
 }
 
 impl<'a, T: fmt::Debug> fmt::Debug for Iter<'a, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Iter").field(&self.s).finish()
+        f.debug_tuple("Iter").field(&self.as_slice()).finish()
     }
 }
 
 impl<'a, T> Iterator for Iter<'a, T> {
     type Item = &'a T;
+    #[inline]
     fn next(&mut self) -> Option<&'a T> {
-        let len = self.s.len();
-        if len == 0 {
+        if self.ptr == self.end {
             return None;
         }
-        // Split the known nonempty slice without constructing another Option.
-        // This also handles ZSTs: the pointer stays put and the length shrinks.
+        // SAFETY: ptr < end: ptr points at the next element
         unsafe {
-            let p = self.s.as_ptr();
-            self.s = super::from_raw_parts(p.add(1), len - 1);
+            let p = self.ptr;
+            if zst::<T>() {
+                self.end = (self.end as *const u8).wrapping_sub(1) as *const T;
+            } else {
+                self.ptr = p.add(1);
+            }
             Some(&*p)
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.s.len(), Some(self.s.len()))
+        let n = self.len_left();
+        (n, Some(n))
     }
     fn count(self) -> usize {
-        self.s.len()
+        self.len_left()
     }
     fn nth(&mut self, n: usize) -> Option<&'a T> {
-        if n >= self.s.len() {
-            self.s = &[];
+        if n >= self.len_left() {
+            if zst::<T>() {
+                self.end = self.ptr;
+            } else {
+                self.ptr = self.end;
+            }
             None
         } else {
-            let r = &self.s[n];
-            self.s = &self.s[n + 1..];
-            Some(r)
+            // SAFETY: n < len: element n and the rest exist
+            unsafe {
+                if zst::<T>() {
+                    self.end = (self.end as *const u8).wrapping_sub(n + 1) as *const T;
+                    Some(&*self.ptr)
+                } else {
+                    let r = self.ptr.add(n);
+                    self.ptr = r.add(1);
+                    Some(&*r)
+                }
+            }
         }
     }
     fn last(self) -> Option<&'a T> {
-        self.s.last()
+        self.as_slice().last()
     }
     fn position<P: FnMut(&'a T) -> bool>(&mut self, predicate: P) -> Option<usize> {
         let mut predicate = predicate;
@@ -92,24 +146,38 @@ impl<'a, T> Iterator for Iter<'a, T> {
 }
 
 impl<'a, T> DoubleEndedIterator for Iter<'a, T> {
+    #[inline]
     fn next_back(&mut self) -> Option<&'a T> {
-        match self.s.split_last() {
-            Some((last, rest)) => {
-                self.s = rest;
-                Some(last)
+        if self.ptr == self.end {
+            return None;
+        }
+        // SAFETY: ptr < end: the last element is at end - 1
+        unsafe {
+            if zst::<T>() {
+                self.end = (self.end as *const u8).wrapping_sub(1) as *const T;
+                Some(&*self.ptr)
+            } else {
+                self.end = self.end.sub(1);
+                Some(&*self.end)
             }
-            None => None,
         }
     }
     fn nth_back(&mut self, n: usize) -> Option<&'a T> {
-        let len = self.s.len();
+        let len = self.len_left();
         if n >= len {
-            self.s = &[];
+            self.end = self.ptr;
             None
         } else {
-            let r = &self.s[len - 1 - n];
-            self.s = &self.s[..len - 1 - n];
-            Some(r)
+            // SAFETY: n < len
+            unsafe {
+                if zst::<T>() {
+                    self.end = (self.end as *const u8).wrapping_sub(n + 1) as *const T;
+                    Some(&*self.ptr)
+                } else {
+                    self.end = self.end.sub(n + 1);
+                    Some(&*self.end)
+                }
+            }
         }
     }
 }
@@ -118,22 +186,36 @@ impl<'a, T> ExactSizeIterator for Iter<'a, T> {}
 impl<'a, T> FusedIterator for Iter<'a, T> {}
 
 pub struct IterMut<'a, T> {
-    s: &'a mut [T],
+    ptr: *mut T,
+    end: *mut T,
+    _m: crate::marker::PhantomData<&'a mut T>,
 }
 
+// as the reference it stands for (rustc: core::slice::IterMut)
+unsafe impl<T: Send> Send for IterMut<'_, T> {}
+unsafe impl<T: Sync> Sync for IterMut<'_, T> {}
+
 pub fn iter_mut<T>(s: &mut [T]) -> IterMut<'_, T> {
-    IterMut { s }
+    IterMut::new(s)
 }
 
 impl<'a, T> IterMut<'a, T> {
     pub(crate) fn new(s: &'a mut [T]) -> IterMut<'a, T> {
-        IterMut { s }
+        let len = s.len();
+        let ptr = s.as_mut_ptr();
+        IterMut { ptr, end: end_of(ptr as *const T, len) as *mut T, _m: crate::marker::PhantomData }
     }
     pub fn into_slice(self) -> &'a mut [T] {
-        self.s
+        // SAFETY: ptr..end is the rest of the slice, borrowed mutably for 'a
+        unsafe { super::from_raw_parts_mut(self.ptr, len_between(self.ptr as *const T, self.end as *const T)) }
     }
     pub fn as_slice(&self) -> &[T] {
-        self.s
+        // SAFETY: as into_slice, shared for the borrow of self
+        unsafe { super::from_raw_parts(self.ptr as *const T, self.len_left()) }
+    }
+    #[inline]
+    fn len_left(&self) -> usize {
+        len_between(self.ptr as *const T, self.end as *const T)
     }
 }
 
@@ -145,50 +227,68 @@ impl<'a, T: fmt::Debug> fmt::Debug for IterMut<'a, T> {
 
 impl<'a, T> Iterator for IterMut<'a, T> {
     type Item = &'a mut T;
+    #[inline]
     fn next(&mut self) -> Option<&'a mut T> {
-        let len = self.s.len();
-        if len == 0 {
+        if self.ptr == self.end {
             return None;
         }
-        // Remove the original mutable slice before returning disjoint references
-        // to its first element and its tail.
+        // SAFETY: ptr < end; each element is handed out once
         unsafe {
-            let p = take_mut(&mut self.s).as_mut_ptr();
-            self.s = super::from_raw_parts_mut(p.add(1), len - 1);
+            let p = self.ptr;
+            if zst::<T>() {
+                self.end = (self.end as *mut u8).wrapping_sub(1) as *mut T;
+            } else {
+                self.ptr = p.add(1);
+            }
             Some(&mut *p)
         }
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.s.len(), Some(self.s.len()))
+        let n = self.len_left();
+        (n, Some(n))
     }
     fn count(self) -> usize {
-        self.s.len()
+        self.len_left()
     }
     fn nth(&mut self, n: usize) -> Option<&'a mut T> {
-        let s = take_mut(&mut self.s);
-        if n >= s.len() {
+        if n >= self.len_left() {
+            if zst::<T>() {
+                self.end = self.ptr;
+            } else {
+                self.ptr = self.end;
+            }
             None
         } else {
-            let (_, rest) = s.split_at_mut(n);
-            let (x, rest) = match rest.split_first_mut() {
-                Some(p) => p,
-                None => return None,
-            };
-            self.s = rest;
-            Some(x)
+            // SAFETY: n < len
+            unsafe {
+                if zst::<T>() {
+                    self.end = (self.end as *mut u8).wrapping_sub(n + 1) as *mut T;
+                    Some(&mut *self.ptr)
+                } else {
+                    let r = self.ptr.add(n);
+                    self.ptr = r.add(1);
+                    Some(&mut *r)
+                }
+            }
         }
     }
 }
 
 impl<'a, T> DoubleEndedIterator for IterMut<'a, T> {
+    #[inline]
     fn next_back(&mut self) -> Option<&'a mut T> {
-        let s = take_mut(&mut self.s);
-        match s.split_last_mut() {
-            Some((last, rest)) => {
-                self.s = rest;
-                Some(last)
+        if self.ptr == self.end {
+            return None;
+        }
+        // SAFETY: ptr < end
+        unsafe {
+            if zst::<T>() {
+                self.end = (self.end as *mut u8).wrapping_sub(1) as *mut T;
+                Some(&mut *self.ptr)
+            } else {
+                self.end = self.end.sub(1);
+                Some(&mut *self.end)
             }
-            None => None,
         }
     }
 }
