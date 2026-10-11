@@ -195,6 +195,30 @@ impl Types {
         Some(image)
     }
 
+    /// The running interner reads the rows of `bytes` (the image `collected_writer` made from
+    /// it) in place, as a restored one does: the arena chunks that lie wholly below the image's
+    /// row count are freed (type ids and the rows never change). Needs exclusive access, as any
+    /// mutation does: no reader may hold a type's row. Mismatch: not this interner's image.
+    pub fn adopt_collected(&mut self, bytes: &'static [u8]) -> crate::collected::Adopt {
+        use crate::collected::Adopt;
+        if self.image.is_some() { return Adopt::Mapped; }
+        let Some(image) = crate::image::Reader::new(bytes) else { return Adopt::Mismatch };
+        let Some(rows) = image.slice::<Entry>(1, 1) else { return Adopt::Mismatch };
+        let n = rows.len();
+        let same = |i: usize| {
+            let (a, b) = (self.entry(TyId(i as u32)), &rows[i]);
+            a.kind == b.kind && a.next == b.next && a.erased == b.erased && a.meta == b.meta
+        };
+        if n == 0 || n > self.len() || !same(0) || !same(n - 1) || !same(n / 2) { return Adopt::Mismatch; }
+        let whole = n >> CHUNK_BITS;
+        for c in 0..whole {
+            let p = std::mem::replace(self.chunks[c].get_mut(), std::ptr::null_mut());
+            if !p.is_null() { unsafe { std::alloc::dealloc(p.cast(), std::alloc::Layout::array::<Entry>(CHUNK).unwrap()) }; }
+        }
+        self.image = Some(MappedTypes { rows });
+        Adopt::Adopted(whole << CHUNK_BITS)
+    }
+
     pub fn restore_collected(bytes: &'static [u8]) -> Option<Self> {
         let image = crate::image::Reader::new(bytes)?;
         let rows: &'static [Entry] = image.slice(1, 1)?;
@@ -277,5 +301,37 @@ mod tests {
         let second = restored.collected_image().unwrap();
         let again = Types::restore_collected(Box::leak(second.into_boxed_slice())).unwrap();
         assert!(again.kind(new) == restored.kind(new));
+    }
+
+    #[test]
+    fn running_interner_adopts_its_image_and_keeps_interning() {
+        use crate::collected::Adopt;
+        let mut tys = Types::new();
+        let u8_ref = tys.intern(TyKind::Ref(false, tys.u8_, tys.intern_region(RegionKind::ReStatic)));
+        let arrays: Vec<TyId> = (0..40_000u64).map(|i| { let n = tys.const_usize(i); tys.mk_array(u8_ref, n) }).collect();
+        assert!(tys.len() > 2 * CHUNK + 1000);
+        let kinds: Vec<TyKind> = arrays.iter().step_by(997).map(|t| *tys.kind(*t)).collect();
+        let before = tys.len();
+        let bytes: &'static [u8] = Box::leak(tys.collected_image().unwrap().into_boxed_slice());
+        // types made after the image was written stay in the arena
+        let late = tys.mk_array(u8_ref, tys.const_usize(1_000_000));
+        let a = tys.adopt_collected(bytes);
+        let whole = before >> CHUNK_BITS;
+        assert_eq!(a, Adopt::Adopted(whole << CHUNK_BITS), "{a:?}");
+        assert!(whole >= 2 && (0..whole).all(|c| tys.chunks[c].load(Ordering::Relaxed).is_null()));
+        assert!(!tys.chunks[whole].load(Ordering::Relaxed).is_null());
+        assert_eq!(tys.adopt_collected(bytes), Adopt::Mapped);
+        for (t, k) in arrays.iter().step_by(997).zip(&kinds) { assert!(tys.kind(*t) == k); }
+        // interning finds the mapped rows and the late one, and appends after both
+        assert_eq!(tys.mk_array(u8_ref, tys.const_usize(5)), arrays[5]);
+        assert_eq!(tys.mk_array(u8_ref, tys.const_usize(1_000_000)), late);
+        assert!(tys.len() >= before && tys.mk_array(u8_ref, tys.const_usize(2_000_000)).0 as usize >= before + 1);
+        // an image of other types at the same ids is refused
+        let other = Types::new();
+        let _ = other.intern(TyKind::Slice(other.u8_));
+        let theirs: &'static [u8] = Box::leak(other.collected_image().unwrap().into_boxed_slice());
+        let mut mine = Types::new();
+        let _ = mine.intern(TyKind::Slice(mine.u32_));
+        assert_eq!(mine.adopt_collected(theirs), Adopt::Mismatch);
     }
 }

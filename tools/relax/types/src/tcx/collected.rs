@@ -230,10 +230,12 @@ impl Tcx {
         Some(image)
     }
 
-    /// As Program::adopt_collected, for the declaration tables of the Tcx image `bytes`
-    /// (`collected_writer_with`). The type interner is not touched.
+    /// As Program::adopt_collected, for the declaration tables and type interner of the Tcx image
+    /// `bytes` (`collected_writer_with`).
     pub fn adopt_collected(&mut self, bytes: &'static [u8], retired: &mut Vec<Box<dyn Send>>, mut note: impl FnMut(&'static str, crate::collected::Adopt)) -> Option<()> {
         let image = crate::image::Reader::new(bytes)?;
+        // (the interner's mapped rows are the image's section 1; its arena chunks below them are freed)
+        note("types", self.tys.adopt_collected(image.bytes(1, 1)?));
         let (mut k, mut id) = (2, 2);
         macro_rules! table { ($($f:ident),+) => { $({
             let t = ImageMap::read_image(&image, &mut k, &mut id)?;

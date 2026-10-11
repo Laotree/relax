@@ -286,6 +286,17 @@ impl Program {
     /// exclusive access to the program, like any mutation.
     pub fn adopt_collected(&mut self, bytes: &'static [u8], retired: &mut Vec<Box<dyn Send>>, mut note: impl FnMut(&'static str, crate::collected::Adopt)) -> Option<()> {
         let image = crate::image::Reader::new(bytes)?;
+        // the definition array: the image's rows, if they are the same definitions
+        let mapped: &'static [Def] = image.slice(1, 1)?;
+        let same = |a: &Def, b: &Def| a.kind == b.kind && a.name == b.name && a.parent == b.parent && a.file == b.file
+            && a.item == b.item && a.sub == b.sub && a.is_pub == b.is_pub && a.krate == b.krate && a.scope == b.scope;
+        note("defs", if self.defs.is_mapped() { crate::collected::Adopt::Mapped }
+            else if self.defs.len() != mapped.len() || !self.defs.iter().zip(mapped).all(|(a, b)| same(a, b)) { crate::collected::Adopt::Mismatch }
+            else {
+                let n = mapped.len();
+                if let crate::arena::Arena::Owned(old) = std::mem::replace(&mut self.defs, crate::arena::Arena::Mapped(mapped)) { retired.push(Box::new(old)); }
+                crate::collected::Adopt::Adopted(n)
+            });
         let (mut k, mut id) = (6, 6);
         macro_rules! table { ($($f:ident),+) => { $({
             let t = crate::collected::ImageMap::read_image(&image, &mut k, &mut id)?;
