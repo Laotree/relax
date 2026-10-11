@@ -29,8 +29,7 @@ pub mod cfi {
     pub fn refresh() {}
 }
 
-use std::io::{BufRead, BufReader, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Mutex;
 
 /// The inspect thread runs (a socket is listening).
@@ -42,13 +41,8 @@ static SERVER_TIDS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// one capture at a time (the Linux handshake has one slot)
 static CAPTURE: Mutex<()> = Mutex::new(());
 static APP: Mutex<String> = Mutex::new(String::new());
-static T0_NS: AtomicU64 = AtomicU64::new(0);
 
-/// The socket and discovery file paths of this process.
-pub fn paths(pid: u32) -> (std::path::PathBuf, std::path::PathBuf) {
-    let dir = std::env::temp_dir();
-    (dir.join(format!("relax-inspect-{}.sock", pid)), dir.join(format!("relax-inspect-{}.json", pid)))
-}
+pub use makepad_inspect_serve::{json_str, now_ms, paths, Out, Req};
 
 /// Starts the inspect thread for program `app` (once per process; RELAX_INSPECT=0: off).
 pub fn start(app: &str) {
@@ -56,232 +50,33 @@ pub fn start(app: &str) {
         return;
     }
     *APP.lock().unwrap() = app.to_string();
-    T0_NS.store(crate::clock::wall_ns(), Relaxed);
     let pid = std::process::id();
-    let (sock, disc) = paths(pid);
-    let _ = std::fs::remove_file(&sock);
-    let listener = match bind(&sock) {
-        Ok(l) => l,
+    let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
+    let extra = format!(",\"session_log\":{},\"relax\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));
+    let host = makepad_inspect_serve::Host {
+        dispatch,
+        thread_enter: || {
+            SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
+            heap::exclude_this_thread();
+        },
+        thread_exit: || {
+            let me = threads::self_os_id();
+            SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
+        },
+    };
+    let sock = match makepad_inspect_serve::listen(app, &extra, host) {
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("relax-inspect: cannot listen on {}: {}", sock.display(), e);
+            eprintln!("relax-inspect: cannot listen on {}: {}", paths(pid).0.display(), e);
             return;
         }
     };
-    let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
-    let info = format!(
-        "{{\"pid\":{},\"app\":{},\"socket\":{},\"session_log\":{},\"started_ms\":{},\"relax\":{},\"agent\":{}}}\n",
-        pid,
-        json_str(app),
-        json_str(&sock.display().to_string()),
-        json_str(&log),
-        crate::clock::wall_ns() / 1_000_000,
-        json_str(crate::jit::PROVENANCE),
-        AGENT.load(Relaxed)
-    );
-    let _ = std::fs::write(&disc, info);
-    extern "C" {
-        fn atexit(f: extern "C" fn()) -> i32;
-    }
-    unsafe { atexit(cleanup) };
     eprintln!("relax-inspect: pid {} app {} socket {} (relax inspect {} help)", pid, app, sock.display(), pid);
     events::start();
     if AGENT.load(Relaxed) {
         timeline::set_frame_watch(true);
     }
-    heap::start_at_load();
-    let _ = std::thread::Builder::new().name("relax-inspect".into()).spawn(move || {
-        SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
-        heap::exclude_this_thread();
-        for conn in listener.incoming() {
-            let Ok(conn) = conn else { continue };
-            if !same_user(&conn) {
-                continue;
-            }
-            let _ = std::thread::Builder::new().name("relax-inspect-conn".into()).spawn(move || {
-                SERVER_TIDS.lock().unwrap().push(threads::self_os_id());
-                heap::exclude_this_thread();
-                serve(conn);
-                let me = threads::self_os_id();
-                SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
-            });
-        }
-    });
-}
-
-/// Removes the socket and discovery file (at exit).
-extern "C" fn cleanup() {
-    let (sock, disc) = paths(std::process::id());
-    let _ = std::fs::remove_file(sock);
-    let _ = std::fs::remove_file(disc);
-}
-
-#[cfg(unix)]
-fn bind(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    let l = std::os::unix::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(l)
-}
-
-#[cfg(unix)]
-type Conn = std::os::unix::net::UnixStream;
-
-/// Only this user's processes may ask (the socket is 0600 too).
-#[cfg(unix)]
-fn same_user(c: &Conn) -> bool {
-    use std::os::unix::io::AsRawFd;
-    extern "C" {
-        fn getuid() -> u32;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        extern "C" {
-            fn getpeereid(fd: i32, uid: *mut u32, gid: *mut u32) -> i32;
-        }
-        let (mut uid, mut gid) = (u32::MAX, 0u32);
-        unsafe { getpeereid(c.as_raw_fd(), &mut uid, &mut gid) == 0 && uid == getuid() }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        extern "C" {
-            fn getsockopt(fd: i32, level: i32, name: i32, val: *mut u8, len: *mut u32) -> i32;
-        }
-        // SOL_SOCKET 1, SO_PEERCRED 17: struct ucred { pid, uid, gid }
-        let mut cred = [0u32; 3];
-        let mut len = 12u32;
-        unsafe { getsockopt(c.as_raw_fd(), 1, 17, cred.as_mut_ptr() as *mut u8, &mut len) == 0 && cred[1] == getuid() }
-    }
-}
-
-#[cfg(windows)]
-fn bind(_path: &std::path::Path) -> std::io::Result<std::net::TcpListener> {
-    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "relax inspect is not available on Windows yet"))
-}
-#[cfg(windows)]
-type Conn = std::net::TcpStream;
-#[cfg(windows)]
-fn same_user(_c: &Conn) -> bool {
-    false
-}
-
-// ------------------------------------------------------------------ sessions
-
-/// A reply being written: JSON lines, bounded (a reply never grows past `LIMIT` bytes unless the
-/// request said `full=1`).
-pub struct Out<'a> {
-    w: &'a mut dyn Write,
-    bytes: usize,
-    limit: usize,
-    pub truncated: bool,
-    ok: bool,
-}
-
-const LIMIT: usize = 16 << 10;
-
-impl<'a> Out<'a> {
-    pub fn line(&mut self, s: &str) {
-        if self.bytes + s.len() > self.limit {
-            self.truncated = true;
-            return;
-        }
-        self.bytes += s.len() + 1;
-        self.ok &= self.w.write_all(s.as_bytes()).is_ok() && self.w.write_all(b"\n").is_ok();
-    }
-    /// A line that is always written (headers, errors, the end line).
-    fn always(&mut self, s: &str) {
-        self.ok &= self.w.write_all(s.as_bytes()).is_ok() && self.w.write_all(b"\n").is_ok();
-    }
-    pub fn err(&mut self, msg: &str) {
-        self.always(&format!("{{\"err\":{}}}", json_str(msg)));
-    }
-    pub fn flush(&mut self) -> bool {
-        self.ok &= self.w.flush().is_ok();
-        self.ok
-    }
-    /// The measurement header every reply starts with.
-    pub fn measured(&mut self, what: &str, source: &str, partial: &[String]) {
-        let p: Vec<String> = partial.iter().map(|s| json_str(s)).collect();
-        self.always(&format!("{{\"measured\":{},\"at_ms\":{},\"source\":{},\"partial\":[{}]}}", json_str(what), now_ms(), json_str(source), p.join(",")));
-    }
-}
-
-/// ms since the inspect thread started (the clock every reply and event uses)
-pub fn now_ms() -> u64 {
-    (crate::clock::wall_ns().saturating_sub(T0_NS.load(Relaxed))) / 1_000_000
-}
-
-/// A parsed request: the command word, positional words and k=v arguments.
-pub struct Req {
-    pub cmd: String,
-    pub pos: Vec<String>,
-    pub kv: Vec<(String, String)>,
-}
-
-impl Req {
-    pub fn parse(line: &str) -> Req {
-        let line = line.trim();
-        if line.starts_with('{') {
-            if let Ok(j) = crate::json::parse(line.as_bytes()) {
-                let mut r = Req { cmd: j.get("cmd").map(|c| c.str().to_string()).unwrap_or_default(), pos: Vec::new(), kv: Vec::new() };
-                if let crate::json::Json::Obj(m) = &j {
-                    for (k, v) in m.iter() {
-                        if k != "cmd" {
-                            let s = match v {
-                                crate::json::Json::Str(s) => s.clone(),
-                                crate::json::Json::Num(n) => format!("{}", n),
-                                crate::json::Json::Bool(b) => (*b as u8).to_string(),
-                                _ => continue,
-                            };
-                            r.kv.push((k.clone(), s));
-                        }
-                    }
-                }
-                return r;
-            }
-        }
-        let mut words = line.split_whitespace();
-        let cmd = words.next().unwrap_or("").to_string();
-        let mut r = Req { cmd, pos: Vec::new(), kv: Vec::new() };
-        for w in words {
-            let w = w.trim_start_matches("--");
-            match w.split_once('=') {
-                Some((k, v)) => r.kv.push((k.to_string(), v.to_string())),
-                None => r.pos.push(w.to_string()),
-            }
-        }
-        r
-    }
-    pub fn get(&self, k: &str) -> Option<&str> {
-        self.kv.iter().rev().find(|x| x.0 == k).map(|x| x.1.as_str())
-    }
-    pub fn num(&self, k: &str, d: u64) -> u64 {
-        self.get(k).and_then(|v| v.parse().ok()).unwrap_or(d)
-    }
-}
-
-fn serve(conn: Conn) {
-    let Ok(read) = conn.try_clone() else { return };
-    let mut w = std::io::BufWriter::new(conn);
-    let mut lines = BufReader::new(read).lines();
-    while let Some(Ok(line)) = lines.next() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let req = Req::parse(&line);
-        let t = std::time::Instant::now();
-        let mut out = Out { w: &mut w, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true };
-        let cmd = req.cmd.clone();
-        // a panic in a command (a bug here) answers as an error, the session goes on
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req, &mut out)));
-        if r.is_err() {
-            out.err("internal error in this command (relax inspect bug)");
-        }
-        let trunc = out.truncated;
-        out.always(&format!("{{\"end\":{},\"ms\":{}{}}}", json_str(&cmd), t.elapsed().as_millis(), if trunc { ",\"truncated\":true" } else { "" }));
-        if !out.flush() {
-            break;
-        }
-    }
+    heap::start_from_env();
 }
 
 /// The commands: (name, arguments, what it answers).
@@ -804,22 +599,3 @@ pub extern "C" fn relax_wait_leave() {
     crate::waits::leave();
 }
 
-// ------------------------------------------------------------------ json
-
-pub fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}

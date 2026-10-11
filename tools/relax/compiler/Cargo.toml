@@ -24,6 +24,7 @@ relax-codegen = { workspace = true }
 # the layers below the JIT, each its own crate so they compile in parallel/pipelined and are
 # reused when only a layer above changes: relax-base <- relax-front <- relax-types <- relax-compiler
 relax-types = { workspace = true }
+makepad-inspect-serve = { workspace = true }
 # registry packages a program needs that are neither vendored nor in $CARGO_HOME (registry_net.rs)
 relax-light-http = { workspace = true }
 relax-native-macros = { workspace = true }
