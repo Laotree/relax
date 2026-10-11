@@ -40,6 +40,8 @@ pub struct CpuFeatures {
     pub popcnt: bool,
     pub lzcnt: bool,
     pub bmi1: bool,
+    /// FMA3 (vfmadd*) next to AVX: the fused multiply-add intrinsics lower to hardware
+    pub fma: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -653,8 +655,8 @@ impl Options {
         match tier1_profile { Some(v) => { h.u8(1); h.u64(v.as_encoded_bytes().len() as u64); h.write(v.as_encoded_bytes()); }, None => h.u8(0) }
         match tier1_profile_data { Some(v) => { h.u8(1); h.str(v); }, None => h.u8(0) }
         h.str(target);
-        let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1 } = cpu;
-        for b in [avx, bmi2, popcnt, lzcnt, bmi1] { h.u8(*b as u8); }
+        let CpuFeatures { avx, bmi2, popcnt, lzcnt, bmi1, fma } = cpu;
+        for b in [avx, bmi2, popcnt, lzcnt, bmi1, fma] { h.u8(*b as u8); }
         h.finish128()
     }
 }

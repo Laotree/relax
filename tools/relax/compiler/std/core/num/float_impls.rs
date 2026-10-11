@@ -52,7 +52,7 @@ impl f64 {
     pub fn maximum(self, other: f64) -> f64 { if self > other { self } else if other > self { other } else if self == other { if self.is_sign_positive() && other.is_sign_negative() { self } else { other } } else { self + other } }
     #[track_caller]
     pub fn clamp(self, min: f64, max: f64) -> f64 { if !(min <= max) { crate::panicking::panic_fmt(format_args!("min > max, or either was NaN. min = {min:?}, max = {max:?}")); } let mut x = self; if x < min { x = min; } if x > max { x = max; } x }
-    pub fn mul_add(self, a: f64, b: f64) -> f64 { unsafe { libm::fma(self, a, b) } }
+    pub fn mul_add(self, a: f64, b: f64) -> f64 { unsafe { if intrinsics::fma_native() { intrinsics::fma_f64(self, a, b) } else { libm::fma(self, a, b) } } }
     pub fn div_euclid(self, rhs: f64) -> f64 { let q = (self / rhs).trunc(); if self % rhs < 0.0 { return if rhs > 0.0 { q - 1.0 } else { q + 1.0 }; } q }
     pub fn rem_euclid(self, rhs: f64) -> f64 { let r = self % rhs; if r < 0.0 { r + rhs.abs() } else { r } }
     pub fn powi(self, n: i32) -> f64 { let recip = n < 0; let mut b = n; let mut a = self; let mut r: f64 = 1.0; loop { if (b & 1) != 0 { r *= a; } b /= 2; if b == 0 { break; } a *= a; } if recip { 1.0 / r } else { r } }
@@ -139,7 +139,7 @@ impl f32 {
     pub fn maximum(self, other: f32) -> f32 { if self > other { self } else if other > self { other } else if self == other { if self.is_sign_positive() && other.is_sign_negative() { self } else { other } } else { self + other } }
     #[track_caller]
     pub fn clamp(self, min: f32, max: f32) -> f32 { if !(min <= max) { crate::panicking::panic_fmt(format_args!("min > max, or either was NaN. min = {min:?}, max = {max:?}")); } let mut x = self; if x < min { x = min; } if x > max { x = max; } x }
-    pub fn mul_add(self, a: f32, b: f32) -> f32 { unsafe { libm::fmaf(self, a, b) } }
+    pub fn mul_add(self, a: f32, b: f32) -> f32 { unsafe { if intrinsics::fma_native() { intrinsics::fma_f32(self, a, b) } else { libm::fmaf(self, a, b) } } }
     pub fn div_euclid(self, rhs: f32) -> f32 { let q = (self / rhs).trunc(); if self % rhs < 0.0 { return if rhs > 0.0 { q - 1.0 } else { q + 1.0 }; } q }
     pub fn rem_euclid(self, rhs: f32) -> f32 { let r = self % rhs; if r < 0.0 { r + rhs.abs() } else { r } }
     pub fn powi(self, n: i32) -> f32 { let recip = n < 0; let mut b = n; let mut a = self; let mut r: f32 = 1.0; loop { if (b & 1) != 0 { r *= a; } b /= 2; if b == 0 { break; } a *= a; } if recip { 1.0 / r } else { r } }

@@ -9791,14 +9791,50 @@ impl<'a> Lcx<'a> {
             return self.dummy_val(t);
         }
         let scalar = |s: &mut Self, k: usize| s.to_leaves(vals[k].0.clone(), vals[k].1)[0];
-        let constant = |s: &mut Self, k: usize| -> i64 {
-            let mut r = scalar(s, k);
-            for i in s.f.blocks[s.cur as usize].insts.iter().rev() {
+        // the selector's value when the current block defines it from constants: an Iconst,
+        // copies/int casts of one, or and/or/xor/shift/add/sub with an immediate or another
+        // constant (`MASK & 0x0f` of a const generic)
+        fn const_of(insts: &[Inst], upto: usize, r: VReg) -> Option<i64> {
+            for (at, i) in insts[..upto].iter().enumerate().rev() {
                 match i {
-                    Inst::Iconst(d, x) if *d == r => return *x,
-                    Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => r = *a,
+                    Inst::Iconst(d, x) if *d == r => return Some(*x),
+                    Inst::Mov(d, a) | Inst::Conv(Conv::IntToInt(_), d, a) if *d == r => return const_of(insts, at, *a),
+                    Inst::IBinI(op, _, d, a, imm) if *d == r => {
+                        let x = const_of(insts, at, *a)?;
+                        return match op {
+                            IOp::And => Some(x & imm),
+                            IOp::Or => Some(x | imm),
+                            IOp::Xor => Some(x ^ imm),
+                            IOp::Shl => Some(x.wrapping_shl(*imm as u32)),
+                            IOp::Shr => Some(((x as u64) >> (*imm as u32 & 63)) as i64),
+                            IOp::Add => Some(x.wrapping_add(*imm)),
+                            IOp::Sub => Some(x.wrapping_sub(*imm)),
+                            _ => None,
+                        };
+                    }
+                    Inst::IBin(op, _, d, a, b) if *d == r => {
+                        let (x, y) = (const_of(insts, at, *a)?, const_of(insts, at, *b)?);
+                        return match op {
+                            IOp::And => Some(x & y),
+                            IOp::Or => Some(x | y),
+                            IOp::Xor => Some(x ^ y),
+                            IOp::Shl => Some(x.wrapping_shl(y as u32)),
+                            IOp::Shr => Some(((x as u64) >> (y as u32 & 63)) as i64),
+                            IOp::Add => Some(x.wrapping_add(y)),
+                            IOp::Sub => Some(x.wrapping_sub(y)),
+                            _ => None,
+                        };
+                    }
                     _ => {}
                 }
+            }
+            None
+        }
+        let constant = |s: &mut Self, k: usize| -> i64 {
+            let r = scalar(s, k);
+            let insts = &s.f.blocks[s.cur as usize].insts;
+            if let Some(x) = const_of(insts, insts.len(), r) {
+                return x;
             }
             s.err(s.pos, "SIMD selector must be a compile-time constant".into());
             0
@@ -10143,6 +10179,18 @@ impl<'a> Lcx<'a> {
             return Some(Val::L(vec![d]));
         }
         match base {
+            "fma" => {
+                // a * b + c, one rounding: vfmadd231 (x86-64 with FMA3) / fmadd (arm64);
+                // std calls it only under `fma_native()`
+                let d = self.f.vreg(cls);
+                self.emit(Inst::FMulAdd(false, false, f64_, d, a[0], a[1], a[2]));
+                Some(Val::L(vec![d]))
+            }
+            "fma_native" => {
+                let opts = &self.u.prog.session.options;
+                let on = opts.target.starts_with("aarch64") || opts.cpu.fma;
+                Some(Val::L(vec![self.iconst(on as i64)]))
+            }
             "fmin" | "fmax" => {
                 let d = self.f.vreg(cls);
                 let op = if base == "fmin" { FOp::Min } else { FOp::Max };

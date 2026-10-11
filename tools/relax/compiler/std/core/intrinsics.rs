@@ -25,6 +25,12 @@ pub mod intrinsics {
         pub fn to_bits_f32(x: f32) -> u32;
         pub fn from_bits_f64(x: u64) -> f64;
         pub fn from_bits_f32(x: u32) -> f32;
+        /// a * b + c with one rounding (hardware fused multiply-add); only valid to call when
+        /// `fma_native()` is true
+        pub fn fma_f64(a: f64, b: f64, c: f64) -> f64;
+        pub fn fma_f32(a: f32, b: f32, c: f32) -> f32;
+        /// true when this target (arm64; x86-64 with FMA3) fuses in hardware: a constant per run
+        pub fn fma_native() -> bool;
     }
 }
 

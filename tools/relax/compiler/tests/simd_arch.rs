@@ -132,6 +132,8 @@ fn chain_adler(a: [u8; 64], b: [u8; 64]) -> [u32; 4] {
 
 #[cfg(target_arch = "aarch64")]
 fn arch() {
+    tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
+    tri("f64::mul_add", |a: f64, b: f64, c: f64| a.mul_add(b, c), |a: f64, b: f64, c: f64| a.mul_add(b, c));
     b!(vaddq_s16, int16x8_t, int16x8_t);
     b!(vaddq_s32, int32x4_t, int32x4_t);
     b!(vaddq_u32, uint32x4_t, uint32x4_t);
@@ -361,6 +363,57 @@ fn arch() {
     b!(_mm256_unpackhi_epi32, __m256i, __m256i);
     b!(_mm256_unpacklo_epi64, __m256i, __m256i);
     b!(_mm256_unpackhi_epi64, __m256i, __m256i);
+    // 256-bit and fused float operations (two 128-bit halves in Relax)
+    b!(_mm_shuffle_ps::<0>, __m128, __m128);
+    b!(_mm_shuffle_ps::<0x1b>, __m128, __m128);
+    b!(_mm_shuffle_ps::<0xb1>, __m128, __m128);
+    b!(_mm_shuffle_ps::<0x4e>, __m128, __m128);
+    b!(_mm_shuffle_ps::<0xff>, __m128, __m128);
+    b!(_mm_movehl_ps, __m128, __m128);
+    b!(_mm_unpacklo_ps, __m128, __m128);
+    b!(_mm_unpackhi_ps, __m128, __m128);
+    b!(_mm256_add_ps, __m256, __m256);
+    b!(_mm256_sub_ps, __m256, __m256);
+    b!(_mm256_mul_ps, __m256, __m256);
+    b!(_mm256_div_ps, __m256, __m256);
+    b!(_mm256_max_ps, __m256, __m256);
+    b!(_mm256_min_ps, __m256, __m256);
+    b!(_mm256_and_ps, __m256, __m256);
+    b!(_mm256_or_ps, __m256, __m256);
+    b!(_mm256_xor_ps, __m256, __m256);
+    b!(_mm256_andnot_ps, __m256, __m256);
+    t!(_mm256_fmadd_ps, __m256, __m256, __m256);
+    t!(_mm256_fmsub_ps, __m256, __m256, __m256);
+    t!(_mm256_fnmadd_ps, __m256, __m256, __m256);
+    t!(_mm256_fnmsub_ps, __m256, __m256, __m256);
+    t!(_mm_fmadd_ps, __m128, __m128, __m128);
+    t!(_mm_fmsub_ps, __m128, __m128, __m128);
+    t!(_mm_fnmadd_ps, __m128, __m128, __m128);
+    t!(_mm_fnmsub_ps, __m128, __m128, __m128);
+    b!(_mm256_and_si256, __m256i, __m256i);
+    b!(_mm256_cmpeq_epi8, __m256i, __m256i);
+    u!(_mm256_set1_ps, f32);
+    un("_mm256_setzero_ps", |_a: u8| unsafe { _mm256_setzero_ps() }, |_a: u8| unsafe { _mm256_setzero_ps() });
+    u!(_mm256_castps256_ps128, __m256);
+    u!(_mm256_extractf128_ps::<0>, __m256);
+    u!(_mm256_extractf128_ps::<1>, __m256);
+    un("_mm256_loadu_ps", |p: [u8; 40]| unsafe { _mm256_loadu_ps(p.as_ptr().add(5) as *const f32) }, |p: [u8; 40]| unsafe { _mm256_loadu_ps(p.as_ptr().add(5) as *const f32) });
+    un(
+        "_mm256_storeu_ps",
+        |a: __m256| {
+            let mut o = [0u8; 40];
+            unsafe { _mm256_storeu_ps(o.as_mut_ptr().add(5) as *mut f32, a) };
+            o
+        },
+        |a: __m256| {
+            let mut o = [0u8; 40];
+            unsafe { _mm256_storeu_ps(o.as_mut_ptr().add(5) as *mut f32, a) };
+            o
+        },
+    );
+    // scalar fused multiply-add (f32::mul_add / f64::mul_add)
+    tri("f32::mul_add", |a: f32, b: f32, c: f32| a.mul_add(b, c), |a: f32, b: f32, c: f32| a.mul_add(b, c));
+    tri("f64::mul_add", |a: f64, b: f64, c: f64| a.mul_add(b, c), |a: f64, b: f64, c: f64| a.mul_add(b, c));
     u!(_mm256_set1_epi16, i16);
     u!(_mm256_set1_epi32, i32);
     un("_mm256_setzero_si256", |_a: u8| unsafe { _mm256_setzero_si256() }, |_a: u8| unsafe { _mm256_setzero_si256() });

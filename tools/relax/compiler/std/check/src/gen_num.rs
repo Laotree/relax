@@ -526,7 +526,7 @@ fn gen_float(o: &mut String, f: &str) {
     let _ = writeln!(o, "    pub fn minimum(self, other: {f}) -> {f} {{ if self < other {{ self }} else if other < self {{ other }} else if self == other {{ if self.is_sign_negative() && other.is_sign_positive() {{ self }} else {{ other }} }} else {{ self + other }} }}");
     let _ = writeln!(o, "    pub fn maximum(self, other: {f}) -> {f} {{ if self > other {{ self }} else if other > self {{ other }} else if self == other {{ if self.is_sign_positive() && other.is_sign_negative() {{ self }} else {{ other }} }} else {{ self + other }} }}");
     let _ = writeln!(o, "    #[track_caller]\n    pub fn clamp(self, min: {f}, max: {f}) -> {f} {{ if !(min <= max) {{ crate::panicking::panic_fmt(format_args!(\"min > max, or either was NaN. min = {{min:?}}, max = {{max:?}}\")); }} let mut x = self; if x < min {{ x = min; }} if x > max {{ x = max; }} x }}");
-    let _ = writeln!(o, "    pub fn mul_add(self, a: {f}, b: {f}) -> {f} {{ unsafe {{ libm::fma{sfx}(self, a, b) }} }}");
+    let _ = writeln!(o, "    pub fn mul_add(self, a: {f}, b: {f}) -> {f} {{ unsafe {{ if intrinsics::fma_native() {{ intrinsics::fma_{f}(self, a, b) }} else {{ libm::fma{sfx}(self, a, b) }} }} }}");
     let _ = writeln!(o, "    pub fn div_euclid(self, rhs: {f}) -> {f} {{ let q = (self / rhs).trunc(); if self % rhs < 0.0 {{ return if rhs > 0.0 {{ q - 1.0 }} else {{ q + 1.0 }}; }} q }}");
     let _ = writeln!(o, "    pub fn rem_euclid(self, rhs: {f}) -> {f} {{ let r = self % rhs; if r < 0.0 {{ r + rhs.abs() }} else {{ r }} }}");
     // compiler-rt __powidf2 / __powisf2

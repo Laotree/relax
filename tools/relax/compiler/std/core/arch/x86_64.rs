@@ -183,30 +183,6 @@ pub const fn _MM_SHUFFLE(z: u32, y: u32, x: u32, w: u32) -> i32 {
     ((z << 6) | (y << 4) | (x << 2) | w) as i32
 }
 
-pub unsafe fn _mm256_add_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a[i].wrapping_add(b[i]);
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_add_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a[i].wrapping_add(b[i]);
-        i += 1;
-    }
-    from256_i32(r)
-}
-
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
 pub unsafe fn _mm256_blend_epi32<const IMM8: i32>(a: __m256i, b: __m256i) -> __m256i {
     let a = lanes256_i32(a);
@@ -218,19 +194,6 @@ pub unsafe fn _mm256_blend_epi32<const IMM8: i32>(a: __m256i, b: __m256i) -> __m
         i += 1;
     }
     from256_i32(r)
-}
-
-pub unsafe fn _mm256_blendv_epi8(a: __m256i, b: __m256i, mask: __m256i) -> __m256i {
-    let a = lanes256_u8(a);
-    let b = lanes256_u8(b);
-    let mask = lanes256_u8(mask);
-    let mut r = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = if mask[i] & 0x80 != 0 { b[i] } else { a[i] };
-        i += 1;
-    }
-    from256_u8(r)
 }
 
 pub unsafe fn _mm256_castsi256_si128(a: __m256i) -> __m128i {
@@ -245,61 +208,6 @@ pub unsafe fn _mm256_extractf128_si256<const IMM1: i32>(a: __m256i) -> __m128i {
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
 pub unsafe fn _mm256_extracti128_si256<const IMM1: i32>(a: __m256i) -> __m128i {
     __m128i([a.0[IMM1 as usize * 2], a.0[IMM1 as usize * 2 + 1]])
-}
-
-pub unsafe fn _mm256_loadu_si256(mem_addr: *const __m256i) -> __m256i {
-    crate::ptr::read_unaligned(mem_addr)
-}
-
-pub unsafe fn _mm256_madd_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = (a[i * 2] as i32 * b[i * 2] as i32)
-            .wrapping_add(a[i * 2 + 1] as i32 * b[i * 2 + 1] as i32);
-        i += 1;
-    }
-    from256_i32(r)
-}
-
-pub unsafe fn _mm256_maddubs_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_u8(a);
-    let b = lanes256_i8(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = ((a[i * 2] as i32 * b[i * 2] as i32) + (a[i * 2 + 1] as i32 * b[i * 2 + 1] as i32))
-            .max(-32768)
-            .min(32767) as i16;
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_max_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a[i].max(b[i]);
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_min_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a[i].min(b[i]);
-        i += 1;
-    }
-    from256_i16(r)
 }
 
 pub unsafe fn _mm256_mullo_epi16(a: __m256i, b: __m256i) -> __m256i {
@@ -324,67 +232,6 @@ pub unsafe fn _mm256_mullo_epi32(a: __m256i, b: __m256i) -> __m256i {
         i += 1;
     }
     from256_i32(r)
-}
-
-pub unsafe fn _mm256_or_si256(a: __m256i, b: __m256i) -> __m256i {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = a.0[i] | b.0[i];
-        i += 1;
-    }
-    __m256i(r)
-}
-
-pub unsafe fn _mm256_packs_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = {
-            let base = (i / 8) * 4;
-            let j = i % 8;
-            let x = if j < 4 { a[base + j] } else { b[base + j - 4] };
-            x.max(-32768).min(32767) as i16
-        };
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_packus_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = {
-            let base = (i / 16) * 8;
-            let j = i % 16;
-            let x = if j < 8 { a[base + j] } else { b[base + j - 8] };
-            x.max(0).min(255) as u8
-        };
-        i += 1;
-    }
-    from256_u8(r)
-}
-
-pub unsafe fn _mm256_packus_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0u16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = {
-            let base = (i / 8) * 4;
-            let j = i % 8;
-            let x = if j < 4 { a[base + j] } else { b[base + j - 4] };
-            x.max(0).min(65535) as u16
-        };
-        i += 1;
-    }
-    from256_u16(r)
 }
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
@@ -414,18 +261,6 @@ pub unsafe fn _mm256_permute4x64_epi64<const IMM8: i32>(a: __m256i) -> __m256i {
     let mut i = 0;
     while i < 4 {
         r[i] = a.0[(((IMM8 as u32) >> (i * 2)) & 3) as usize];
-        i += 1;
-    }
-    __m256i(r)
-}
-
-pub unsafe fn _mm256_sad_epu8(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_u8(a);
-    let b = lanes256_u8(b);
-    let mut r = [0i64; 4];
-    let mut i = 0;
-    while i < 32 {
-        r[i / 8] += ((a[i] as i16) - (b[i] as i16)).abs() as i64;
         i += 1;
     }
     __m256i(r)
@@ -532,110 +367,6 @@ pub unsafe fn _mm256_setr_epi8(
     ])
 }
 
-pub unsafe fn _mm256_setzero_si256() -> __m256i {
-    __m256i([0; 4])
-}
-
-pub unsafe fn _mm256_shuffle_epi8(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_u8(a);
-    let b = lanes256_u8(b);
-    let mut r = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = if b[i] & 0x80 != 0 {
-            0
-        } else {
-            a[(i & !15) + (b[i] & 15) as usize]
-        };
-        i += 1;
-    }
-    from256_u8(r)
-}
-
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_slli_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = if (IMM8 as u32) < 16 {
-            a[i].wrapping_shl(IMM8 as u32)
-        } else {
-            0
-        };
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_slli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = if (IMM8 as u32) < 32 {
-            a[i].wrapping_shl(IMM8 as u32)
-        } else {
-            0
-        };
-        i += 1;
-    }
-    from256_i32(r)
-}
-
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_srai_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a[i] >> (IMM8 as u32).min(15);
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_srai_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a[i] >> (IMM8 as u32).min(31);
-        i += 1;
-    }
-    from256_i32(r)
-}
-
-pub unsafe fn _mm256_storeu_si256(mem_addr: *mut __m256i, a: __m256i) {
-    crate::ptr::write_unaligned(mem_addr, a);
-}
-
-pub unsafe fn _mm256_sub_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = a[i].wrapping_sub(b[i]);
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_sub_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a[i].wrapping_sub(b[i]);
-        i += 1;
-    }
-    from256_i32(r)
-}
-
 pub unsafe fn _mm256_testz_si256(a: __m256i, b: __m256i) -> i32 {
     let mut r = 0i64;
     let mut i = 0;
@@ -650,186 +381,8 @@ pub unsafe fn _mm256_testz_si256(a: __m256i, b: __m256i) -> i32 {
     }
 }
 
-pub unsafe fn _mm256_unpackhi_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = {
-            let j = (i / 8) * 8 + (i % 8) / 2 + 4;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_unpackhi_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = {
-            let j = (i / 4) * 4 + (i % 4) / 2 + 2;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i32(r)
-}
-
-pub unsafe fn _mm256_unpackhi_epi64(a: __m256i, b: __m256i) -> __m256i {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = if i % 2 == 0 {
-            a.0[(i / 2) * 2 + 1]
-        } else {
-            b.0[(i / 2) * 2 + 1]
-        };
-        i += 1;
-    }
-    __m256i(r)
-}
-
-pub unsafe fn _mm256_unpackhi_epi8(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i8(a);
-    let b = lanes256_i8(b);
-    let mut r = [0i8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = {
-            let j = (i / 16) * 16 + (i % 16) / 2 + 8;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i8(r)
-}
-
-pub unsafe fn _mm256_unpacklo_epi16(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i16(a);
-    let b = lanes256_i16(b);
-    let mut r = [0i16; 16];
-    let mut i = 0;
-    while i < 16 {
-        r[i] = {
-            let j = (i / 8) * 8 + (i % 8) / 2 + 0;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i16(r)
-}
-
-pub unsafe fn _mm256_unpacklo_epi32(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let b = lanes256_i32(b);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = {
-            let j = (i / 4) * 4 + (i % 4) / 2 + 0;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i32(r)
-}
-
-pub unsafe fn _mm256_unpacklo_epi64(a: __m256i, b: __m256i) -> __m256i {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = if i % 2 == 0 {
-            a.0[(i / 2) * 2 + 0]
-        } else {
-            b.0[(i / 2) * 2 + 0]
-        };
-        i += 1;
-    }
-    __m256i(r)
-}
-
-pub unsafe fn _mm256_unpacklo_epi8(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_i8(a);
-    let b = lanes256_i8(b);
-    let mut r = [0i8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = {
-            let j = (i / 16) * 16 + (i % 16) / 2 + 0;
-            if i % 2 == 0 {
-                a[j]
-            } else {
-                b[j]
-            }
-        };
-        i += 1;
-    }
-    from256_i8(r)
-}
-
 unsafe fn mask_f32(b: bool) -> f32 {
     f32::from_bits(if b { 0xffff_ffff } else { 0 })
-}
-
-pub unsafe fn _mm256_add_ps(a: __m256, b: __m256) -> __m256 {
-    let mut r = [0f32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a.0[i] + b.0[i];
-        i += 1;
-    }
-    __m256(r)
-}
-
-pub unsafe fn _mm256_and_si256(a: __m256i, b: __m256i) -> __m256i {
-    let mut r = [0; 4];
-    let mut i = 0;
-    while i < 4 {
-        r[i] = a.0[i] & b.0[i];
-        i += 1;
-    }
-    __m256i(r)
-}
-
-pub unsafe fn _mm256_castps256_ps128(a: __m256) -> __m128 {
-    __m128([a.0[0], a.0[1], a.0[2], a.0[3]])
-}
-
-pub unsafe fn _mm256_cmpeq_epi8(a: __m256i, b: __m256i) -> __m256i {
-    let a = lanes256_u8(a);
-    let b = lanes256_u8(b);
-    let mut r = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        r[i] = if a[i] == b[i] { 255 } else { 0 };
-        i += 1;
-    }
-    from256_u8(r)
 }
 
 pub unsafe fn _mm256_cvtepi32_ps(a: __m256i) -> __m256 {
@@ -854,30 +407,6 @@ pub unsafe fn _mm256_cvtepi8_epi32(a: __m128i) -> __m256i {
     from256_i32(r)
 }
 
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_extractf128_ps<const IMM1: i32>(a: __m256) -> __m128 {
-    let o = (IMM1 as usize & 1) * 4;
-    __m128([a.0[o], a.0[o + 1], a.0[o + 2], a.0[o + 3]])
-}
-
-pub unsafe fn _mm256_fmadd_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
-    let mut r = [0f32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a.0[i].mul_add(b.0[i], c.0[i]);
-        i += 1;
-    }
-    __m256(r)
-}
-
-pub unsafe fn _mm256_load_si256(mem_addr: *const __m256i) -> __m256i {
-    crate::ptr::read_unaligned(mem_addr)
-}
-
-pub unsafe fn _mm256_loadu_ps(mem_addr: *const f32) -> __m256 {
-    crate::ptr::read_unaligned(mem_addr as *const __m256)
-}
-
 pub unsafe fn _mm256_movemask_epi8(a: __m256i) -> i32 {
     let a = lanes256_u8(a);
     let mut r = 0u32;
@@ -889,40 +418,270 @@ pub unsafe fn _mm256_movemask_epi8(a: __m256i) -> i32 {
     r as i32
 }
 
-pub unsafe fn _mm256_mul_ps(a: __m256, b: __m256) -> __m256 {
-    let mut r = [0f32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a.0[i] * b.0[i];
-        i += 1;
-    }
-    __m256(r)
-}
-
 pub unsafe fn _mm256_set1_epi8(a: i8) -> __m256i {
     from256_i8([a; 32])
 }
 
-pub unsafe fn _mm256_set1_ps(a: f32) -> __m256 {
-    __m256([a; 8])
+// ---- 256-bit float vectors as two 128-bit halves -------------------------------------------
+// A __m256 is 32 bytes in memory; every lane-wise operation loads its two 16-byte halves into
+// V128 values, applies the 128-bit bridge operation to each half and stores the halves back,
+// so the backend emits real vector code (and slot forwarding removes the copies). No 256-bit
+// register class exists in the back end; the halves cost two instructions per operation
+// where AVX has one. Lane order is memory order, so lane-wise ops are exact.
+
+#[inline(always)]
+unsafe fn ps_lo(a: &__m256) -> __m128 {
+    vx::vx_load(a as *const __m256 as *const u8)
+}
+#[inline(always)]
+unsafe fn ps_hi(a: &__m256) -> __m128 {
+    vx::vx_load((a as *const __m256 as *const u8).add(16))
+}
+#[inline(always)]
+unsafe fn ps_join(lo: __m128, hi: __m128) -> __m256 {
+    let mut r = __m256([0.0; 8]);
+    vx::vx_store(&mut r as *mut __m256 as *mut u8, lo);
+    vx::vx_store((&mut r as *mut __m256 as *mut u8).add(16), hi);
+    r
 }
 
-pub unsafe fn _mm256_setzero_ps() -> __m256 {
-    __m256([0.0; 8])
+pub unsafe fn _mm256_add_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_add_ps(ps_lo(&a), ps_lo(&b)), _mm_add_ps(ps_hi(&a), ps_hi(&b)))
 }
-
-pub unsafe fn _mm256_storeu_ps(mem_addr: *mut f32, a: __m256) {
-    crate::ptr::write_unaligned(mem_addr as *mut __m256, a);
-}
-
 pub unsafe fn _mm256_sub_ps(a: __m256, b: __m256) -> __m256 {
-    let mut r = [0f32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = a.0[i] - b.0[i];
-        i += 1;
+    ps_join(_mm_sub_ps(ps_lo(&a), ps_lo(&b)), _mm_sub_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_mul_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_mul_ps(ps_lo(&a), ps_lo(&b)), _mm_mul_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_div_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_div_ps(ps_lo(&a), ps_lo(&b)), _mm_div_ps(ps_hi(&a), ps_hi(&b)))
+}
+/// Intel vmaxps/vminps: the second operand when either is NaN (or both zero)
+pub unsafe fn _mm256_max_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_max_ps(ps_lo(&a), ps_lo(&b)), _mm_max_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_min_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_min_ps(ps_lo(&a), ps_lo(&b)), _mm_min_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_and_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_and_ps(ps_lo(&a), ps_lo(&b)), _mm_and_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_or_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_or_ps(ps_lo(&a), ps_lo(&b)), _mm_or_ps(ps_hi(&a), ps_hi(&b)))
+}
+pub unsafe fn _mm256_xor_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_xor_ps(ps_lo(&a), ps_lo(&b)), _mm_xor_ps(ps_hi(&a), ps_hi(&b)))
+}
+/// (!a) & b
+pub unsafe fn _mm256_andnot_ps(a: __m256, b: __m256) -> __m256 {
+    ps_join(_mm_andnot_ps(ps_lo(&a), ps_lo(&b)), _mm_andnot_ps(ps_hi(&a), ps_hi(&b)))
+}
+
+// Fused multiply-add, one rounding: a*b + c (fmadd), a*b - c (fmsub), -(a*b) + c (fnmadd),
+// -(a*b) - c (fnmsub). With hardware FMA each is the packed fused op (c +- a*b) and, for
+// fmsub / fnmsub, a sign flip of the exact result (negation commutes with round-to-nearest);
+// without it, one libm fmaf per lane.
+#[inline(always)]
+unsafe fn fma_ps(a: __m128, b: __m128, c: __m128, neg_prod: bool, neg_add: bool) -> __m128 {
+    if crate::intrinsics::fma_native() {
+        // c' + a*b (selector 8) or c' - a*b (selector 9), c' = c or -c. The addend is negated
+        // before the fused op (so a*b - c has one rounding, signed zeros included), on non-NaN
+        // lanes only: hardware leaves a NaN operand's sign alone.
+        let c = if neg_add {
+            let is_nan: __m128 = vx::vx_binary(c, c, 47, 32);
+            _mm_xor_ps(c, _mm_andnot_ps(is_nan, _mm_set1_ps(-0.0)))
+        } else {
+            c
+        };
+        if neg_prod { vx::vx_ternary(c, a, b, 9) } else { vx::vx_ternary(c, a, b, 8) }
+    } else {
+        let (x, y, z) = (a.0, b.0, c.0);
+        let mut r = [0f32; 4];
+        let mut i = 0;
+        while i < 4 {
+            let p = if neg_prod { -x[i] } else { x[i] };
+            let q = if neg_add { -z[i] } else { z[i] };
+            r[i] = p.mul_add(y[i], q);
+            i += 1;
+        }
+        __m128(r)
     }
-    __m256(r)
+}
+pub unsafe fn _mm_fmadd_ps(a: __m128, b: __m128, c: __m128) -> __m128 { fma_ps(a, b, c, false, false) }
+pub unsafe fn _mm_fmsub_ps(a: __m128, b: __m128, c: __m128) -> __m128 { fma_ps(a, b, c, false, true) }
+pub unsafe fn _mm_fnmadd_ps(a: __m128, b: __m128, c: __m128) -> __m128 { fma_ps(a, b, c, true, false) }
+pub unsafe fn _mm_fnmsub_ps(a: __m128, b: __m128, c: __m128) -> __m128 { fma_ps(a, b, c, true, true) }
+pub unsafe fn _mm256_fmadd_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    ps_join(fma_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c), false, false), fma_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c), false, false))
+}
+pub unsafe fn _mm256_fmsub_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    ps_join(fma_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c), false, true), fma_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c), false, true))
+}
+pub unsafe fn _mm256_fnmadd_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    ps_join(fma_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c), true, false), fma_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c), true, false))
+}
+pub unsafe fn _mm256_fnmsub_ps(a: __m256, b: __m256, c: __m256) -> __m256 {
+    ps_join(fma_ps(ps_lo(&a), ps_lo(&b), ps_lo(&c), true, true), fma_ps(ps_hi(&a), ps_hi(&b), ps_hi(&c), true, true))
+}
+
+pub unsafe fn _mm256_loadu_ps(mem_addr: *const f32) -> __m256 {
+    ps_join(vx::vx_load(mem_addr as *const u8), vx::vx_load((mem_addr as *const u8).add(16)))
+}
+/// 32-byte alignment is the caller's contract (as on hardware); the loads are the same.
+pub unsafe fn _mm256_load_ps(mem_addr: *const f32) -> __m256 {
+    _mm256_loadu_ps(mem_addr)
+}
+pub unsafe fn _mm256_storeu_ps(mem_addr: *mut f32, a: __m256) {
+    vx::vx_store(mem_addr as *mut u8, ps_lo(&a));
+    vx::vx_store((mem_addr as *mut u8).add(16), ps_hi(&a));
+}
+pub unsafe fn _mm256_store_ps(mem_addr: *mut f32, a: __m256) {
+    _mm256_storeu_ps(mem_addr, a)
+}
+pub unsafe fn _mm256_set1_ps(a: f32) -> __m256 {
+    let v: __m128 = vx::vx_splat(a.to_bits() as u64, 32);
+    ps_join(v, v)
+}
+pub unsafe fn _mm256_setzero_ps() -> __m256 {
+    let z = _mm_setzero_ps();
+    ps_join(z, z)
+}
+pub unsafe fn _mm256_castps256_ps128(a: __m256) -> __m128 {
+    ps_lo(&a)
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_extractf128_ps<const IMM1: i32>(a: __m256) -> __m128 {
+    if IMM1 & 1 == 0 { ps_lo(&a) } else { ps_hi(&a) }
+}
+
+#[inline(always)]
+unsafe fn i_lo(a: &__m256i) -> __m128i {
+    vx::vx_load(a as *const __m256i as *const u8)
+}
+#[inline(always)]
+unsafe fn i_hi(a: &__m256i) -> __m128i {
+    vx::vx_load((a as *const __m256i as *const u8).add(16))
+}
+#[inline(always)]
+unsafe fn i_join(lo: __m128i, hi: __m128i) -> __m256i {
+    let mut r = __m256i([0; 4]);
+    vx::vx_store(&mut r as *mut __m256i as *mut u8, lo);
+    vx::vx_store((&mut r as *mut __m256i as *mut u8).add(16), hi);
+    r
+}
+
+// AVX2 integer operations that work within each 128-bit lane are the 128-bit bridge operation on
+// each half (lane order is memory order); lane-crossing ones (permutes, extracts, converts)
+// stay scalar.
+pub unsafe fn _mm256_add_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_add_epi16(i_lo(&a), i_lo(&b)), _mm_add_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_add_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_add_epi32(i_lo(&a), i_lo(&b)), _mm_add_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_sub_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_sub_epi16(i_lo(&a), i_lo(&b)), _mm_sub_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_sub_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_sub_epi32(i_lo(&a), i_lo(&b)), _mm_sub_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_cmpeq_epi8(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_cmpeq_epi8(i_lo(&a), i_lo(&b)), _mm_cmpeq_epi8(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_madd_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_madd_epi16(i_lo(&a), i_lo(&b)), _mm_madd_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_max_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_max_epi16(i_lo(&a), i_lo(&b)), _mm_max_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_min_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_min_epi16(i_lo(&a), i_lo(&b)), _mm_min_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_sad_epu8(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_sad_epu8(i_lo(&a), i_lo(&b)), _mm_sad_epu8(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_shuffle_epi8(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_shuffle_epi8(i_lo(&a), i_lo(&b)), _mm_shuffle_epi8(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_packs_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_packs_epi32(i_lo(&a), i_lo(&b)), _mm_packs_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_packus_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_packus_epi16(i_lo(&a), i_lo(&b)), _mm_packus_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_packus_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_packus_epi32(i_lo(&a), i_lo(&b)), _mm_packus_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_maddubs_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_maddubs_epi16(i_lo(&a), i_lo(&b)), _mm_maddubs_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpacklo_epi8(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpacklo_epi8(i_lo(&a), i_lo(&b)), _mm_unpacklo_epi8(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpackhi_epi8(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpackhi_epi8(i_lo(&a), i_lo(&b)), _mm_unpackhi_epi8(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpacklo_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpacklo_epi16(i_lo(&a), i_lo(&b)), _mm_unpacklo_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpackhi_epi16(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpackhi_epi16(i_lo(&a), i_lo(&b)), _mm_unpackhi_epi16(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpacklo_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpacklo_epi32(i_lo(&a), i_lo(&b)), _mm_unpacklo_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpackhi_epi32(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpackhi_epi32(i_lo(&a), i_lo(&b)), _mm_unpackhi_epi32(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpacklo_epi64(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpacklo_epi64(i_lo(&a), i_lo(&b)), _mm_unpacklo_epi64(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_unpackhi_epi64(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_unpackhi_epi64(i_lo(&a), i_lo(&b)), _mm_unpackhi_epi64(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_blendv_epi8(a: __m256i, b: __m256i, mask: __m256i) -> __m256i {
+    i_join(_mm_blendv_epi8(i_lo(&a), i_lo(&b), i_lo(&mask)), _mm_blendv_epi8(i_hi(&a), i_hi(&b), i_hi(&mask)))
+}
+pub unsafe fn _mm256_and_si256(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_and_si128(i_lo(&a), i_lo(&b)), _mm_and_si128(i_hi(&a), i_hi(&b)))
+}
+pub unsafe fn _mm256_or_si256(a: __m256i, b: __m256i) -> __m256i {
+    i_join(_mm_or_si128(i_lo(&a), i_lo(&b)), _mm_or_si128(i_hi(&a), i_hi(&b)))
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_slli_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
+    i_join(_mm_slli_epi16::<IMM8>(i_lo(&a)), _mm_slli_epi16::<IMM8>(i_hi(&a)))
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_slli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
+    i_join(_mm_slli_epi32::<IMM8>(i_lo(&a)), _mm_slli_epi32::<IMM8>(i_hi(&a)))
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_srai_epi16<const IMM8: i32>(a: __m256i) -> __m256i {
+    i_join(_mm_srai_epi16::<IMM8>(i_lo(&a)), _mm_srai_epi16::<IMM8>(i_hi(&a)))
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_srai_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
+    i_join(_mm_srai_epi32::<IMM8>(i_lo(&a)), _mm_srai_epi32::<IMM8>(i_hi(&a)))
+}
+#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
+pub unsafe fn _mm256_srli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
+    i_join(_mm_srli_epi32::<IMM8>(i_lo(&a)), _mm_srli_epi32::<IMM8>(i_hi(&a)))
+}
+pub unsafe fn _mm256_loadu_si256(mem_addr: *const __m256i) -> __m256i {
+    i_join(vx::vx_load(mem_addr as *const u8), vx::vx_load((mem_addr as *const u8).add(16)))
+}
+pub unsafe fn _mm256_load_si256(mem_addr: *const __m256i) -> __m256i {
+    _mm256_loadu_si256(mem_addr)
+}
+pub unsafe fn _mm256_storeu_si256(mem_addr: *mut __m256i, a: __m256i) {
+    vx::vx_store(mem_addr as *mut u8, i_lo(&a));
+    vx::vx_store((mem_addr as *mut u8).add(16), i_hi(&a));
+}
+pub unsafe fn _mm256_setzero_si256() -> __m256i {
+    let z = _mm_setzero_si128();
+    i_join(z, z)
 }
 
 pub unsafe fn _mm512_add_epi32(a: __m512i, b: __m512i) -> __m512i {
@@ -1491,7 +1250,7 @@ pub unsafe fn _mm_movehdup_ps(a: __m128) -> __m128 {
 }
 
 pub unsafe fn _mm_movehl_ps(a: __m128, b: __m128) -> __m128 {
-    __m128([b.0[2], b.0[3], a.0[2], a.0[3]])
+    vx::vx_binary(b, a, 18, 64)
 }
 
 pub unsafe fn _mm_movemask_ps(a: __m128) -> i32 {
@@ -1581,13 +1340,11 @@ pub unsafe fn _mm_sha256rnds2_epu32(a: __m128i, b: __m128i, k: __m128i) -> __m12
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(2))]
 pub unsafe fn _mm_shuffle_ps<const MASK: i32>(a: __m128, b: __m128) -> __m128 {
-    let m = MASK as u32;
-    __m128([
-        a.0[(m & 3) as usize],
-        a.0[((m >> 2) & 3) as usize],
-        b.0[((m >> 4) & 3) as usize],
-        b.0[((m >> 6) & 3) as usize],
-    ])
+    // lanes 0,1 from a (fields 0..4 of MASK), lanes 2,3 from b (fields 4..8): two lane shuffles
+    // and a 64-bit zip, all bridge operations
+    let x: __m128 = vx::vx_unary(a, 4, 32, MASK & 0x0f);
+    let y: __m128 = vx::vx_unary(b, 4, 32, (MASK >> 4) & 0x0f);
+    vx::vx_binary(x, y, 17, 64)
 }
 
 #[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
@@ -1652,7 +1409,7 @@ pub unsafe fn _mm_unpackhi_epi32(a: __m128i, b: __m128i) -> __m128i {
 }
 
 pub unsafe fn _mm_unpackhi_ps(a: __m128, b: __m128) -> __m128 {
-    __m128([a.0[2], b.0[2], a.0[3], b.0[3]])
+    vx::vx_binary(a, b, 18, 32)
 }
 
 #[inline(always)]
@@ -1671,7 +1428,7 @@ pub unsafe fn _mm_unpacklo_epi64(a: __m128i, b: __m128i) -> __m128i {
 }
 
 pub unsafe fn _mm_unpacklo_ps(a: __m128, b: __m128) -> __m128 {
-    __m128([a.0[0], b.0[0], a.0[1], b.0[1]])
+    vx::vx_binary(a, b, 17, 32)
 }
 
 #[inline(always)]
@@ -1901,18 +1658,6 @@ pub unsafe fn _mm256_sign_epi16(a: __m256i, b: __m256i) -> __m256i {
         i += 1;
     }
     from256_i16(r)
-}
-
-#[cfg_attr(not(relax_check), rustc_legacy_const_generics(1))]
-pub unsafe fn _mm256_srli_epi32<const IMM8: i32>(a: __m256i) -> __m256i {
-    let a = lanes256_i32(a);
-    let mut r = [0i32; 8];
-    let mut i = 0;
-    while i < 8 {
-        r[i] = if (IMM8 as u32) < 32 { ((a[i] as u32) >> (IMM8 as u32)) as i32 } else { 0 };
-        i += 1;
-    }
-    from256_i32(r)
 }
 
 #[inline(always)]

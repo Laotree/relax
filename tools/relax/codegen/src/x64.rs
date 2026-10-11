@@ -4649,6 +4649,7 @@ pub fn detect_cpu(options: &relax_session::Options) -> relax_session::options::C
         cpu.popcnt = !options.no_bitops && std::is_x86_feature_detected!("popcnt");
         cpu.lzcnt = !options.no_bitops && std::is_x86_feature_detected!("lzcnt");
         cpu.bmi1 = !options.no_bitops && std::is_x86_feature_detected!("bmi1");
+        cpu.fma = cpu.avx && std::is_x86_feature_detected!("fma");
         cpu
     }
     #[cfg(not(target_arch = "x86_64"))]
