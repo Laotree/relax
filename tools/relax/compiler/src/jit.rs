@@ -10285,8 +10285,11 @@ pub(crate) fn live_needs_present(needs_present: bool) {
     LIVE_NEEDS_PRESENT.store(needs_present, Ordering::Release);
 }
 
+/// A program that links makepad_platform takes live edits only after its first present; the
+/// quiet release of a headless start (startup_main) admits them only for other programs.
 pub(crate) fn live_startup_done() -> bool {
-    FIRST_PRESENT.load(Ordering::Acquire) || LIVE_STARTUP_DONE.load(Ordering::Acquire)
+    FIRST_PRESENT.load(Ordering::Acquire)
+        || LIVE_STARTUP_DONE.load(Ordering::Acquire) && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire)
 }
 /// A program that has not presented and made no demand compile for this long is headless:
 /// its startup phase ends (startup_main).
@@ -10365,7 +10368,10 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
             } else {
                 0
             };
-            if quiet >= STARTUP_QUIET_NS && !LIVE_NEEDS_PRESENT.load(Ordering::Acquire) {
+            // the live-edit gate (live_startup_done) waits for a present on its own: a
+            // platform program that never presents (a headless bench, a hidden tool) still
+            // releases speculation and O3 on quiet
+            if quiet >= STARTUP_QUIET_NS {
                 break;
             }
             std::thread::park_timeout(std::time::Duration::from_nanos(STARTUP_QUIET_NS.saturating_sub(quiet).max(50_000_000)));
