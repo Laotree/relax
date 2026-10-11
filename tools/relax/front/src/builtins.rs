@@ -38,11 +38,12 @@ pub struct FileCtx {
     continuations: std::cell::OnceCell<Vec<u32>>,
 }
 
+// Process-wide, by the file's directory: files parse on many worker threads, and the walk up
+// to the manifest (a stat per level) and the manifest reads are the same for every file.
+static BY_DIR: std::sync::Mutex<Option<crate::fxhash::HashMap<String, (String, String, String, String)>>> = std::sync::Mutex::new(None);
+
 /// Per crate root: (manifest dir, package name, version, workspace root).
 fn crate_meta(path: &str) -> (String, String, String, String) {
-    // process-wide, by the file's directory: files parse on many worker threads, and the walk up
-    // to the manifest (a stat per level) and the manifest reads are the same for every file
-    static BY_DIR: std::sync::Mutex<Option<crate::fxhash::HashMap<String, (String, String, String, String)>>> = std::sync::Mutex::new(None);
     let fdir = crate::program::dir_of(path);
     if let Some(v) = BY_DIR.lock().unwrap().as_ref().and_then(|m| m.get(fdir).cloned()) {
         return v;
@@ -53,8 +54,8 @@ fn crate_meta(path: &str) -> (String, String, String, String) {
 }
 
 fn crate_meta_uncached(path: &str) -> (String, String, String, String) {
-    thread_local! {
-        static CACHE: std::cell::RefCell<crate::fxhash::HashMap<String, (String, String, String, String)>> = Default::default();
+    crate::gen_local! {
+        static CACHE: std::cell::RefCell<crate::fxhash::HashMap<String, (String, String, String, String)>>;
     }
     let mut dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf());
     let mut manifest: Option<std::path::PathBuf> = None;
@@ -225,6 +226,15 @@ pub const PAYLOAD_MARK: &str = "\\0relax-include:";
 
 static PAYLOADS: std::sync::Mutex<Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>> = std::sync::Mutex::new(None);
 
+pub(crate) fn zone_reset() {
+    let mut payloads = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *payloads));
+    let mut dirs = BY_DIR.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *dirs));
+    #[cfg(test)]
+    { assert!(payloads.is_none()); assert!(dirs.is_none()); }
+}
+
 /// The payload's key: its hash and length (the same text whichever thread or order includes it;
 /// files parse in parallel), disambiguated in the unlikely case two contents collide.
 fn register_payload(data: Vec<u8>) -> String {
@@ -316,10 +326,10 @@ pub fn lookup(name: &str) -> Builtin {
 /// `bitflags!` (RELAX_NATIVE_BITFLAGS=0 keeps the crate's macro_rules, for A/B measurement).
 pub fn override_rules(options: &crate::options::Options, d: crate::macros::MacroRef) -> crate::macros::MacroRef {
     if d.name == "bitflags" && d.krate == "bitflags" && options.native_bitflags {
-        thread_local! {
-            static BF: crate::macros::MacroRef = std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u8, def_file: String::new(), def_pos: 0, input: None });
+        crate::gen_local! {
+            static BF: std::cell::OnceCell<crate::macros::MacroRef>;
         }
-        return BF.with(|b| b.clone());
+        return BF.with(|b| b.get_or_init(|| std::sync::Arc::new(crate::macros::MacroDef { name: "bitflags".to_string(), krate: "bitflags".to_string(), exported: true, arms: Vec::new(), builtin: Builtin::Bitflags as u8, def_file: String::new(), def_pos: 0, input: None })).clone());
     }
     d
 }
@@ -353,8 +363,8 @@ pub fn from_u8(x: u8) -> Builtin {
     Builtin::None
 }
 
-thread_local! {
-    static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>> = Default::default();
+crate::gen_local! {
+    static DEFS: std::cell::RefCell<Vec<Option<crate::macros::MacroRef>>>;
 }
 
 /// The macro definition standing for built-in `name` (no arms; `builtin` set), if any.
@@ -1444,9 +1454,9 @@ fn single_punct(c: char) -> Option<T> {
     })
 }
 
-thread_local! {
+crate::gen_local! {
     /// derive expansions computed ahead in parallel (pre_expand_derives): (file, item byte range)
-    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>> = Default::default();
+    static PRE: std::cell::RefCell<crate::fxhash::HashMap<(String, u32, u32), Result<Option<Expansion>, (u32, String)>>>;
 }
 
 

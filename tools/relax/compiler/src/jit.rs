@@ -232,6 +232,30 @@ impl ReloadSlots {
 #[path = "zone_scan.rs"]
 pub(crate) mod zone_scan;
 
+pub(crate) fn zone_reset() {
+    macro_rules! reset {
+        ($($name:ident => $empty:ident),* $(,)?) => { $(
+            {
+                let mut guard = $name.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::forget(std::mem::take(&mut *guard));
+                #[cfg(test)]
+                assert!(guard.$empty());
+            }
+        )* };
+    }
+    reset!(
+        LAST_FRONT => is_none,
+        MAIN_COMPILES => is_empty,
+        TIER_QUEUE => is_empty,
+        TIER_ACTIVE => is_empty,
+        SPEC_Q => is_empty,
+        SPEC_BUILT => is_empty,
+        O2_QUEUE => is_empty,
+        O2_BASE => is_empty,
+        O2_SEEN => is_none,
+    );
+}
+
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
 /// `zone_alloc::kept`; checked by RELAX_ZONE_CHECK, zone_scan.rs): the Unit box, code tables,
 /// fns/fn_map, consts, const_readers, body_deps, statics/static_spans, sites/site_ix, rt/rs,
@@ -615,8 +639,10 @@ struct WatchdogCall {
 }
 static WATCHDOG_CALLS: std::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = std::sync::Mutex::new(Vec::new());
 static WATCHDOG_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+crate::gen_local! {
+    static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>>;
+}
 thread_local! {
-    static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>> = const { std::cell::RefCell::new(Vec::new()) };
     // The signal handler must not borrow a RefCell interrupted during enter/leave.
     // The stack and worker registry own the pointed-to call until this is reset.
     static WATCHDOG_CURRENT: std::cell::Cell<*const WatchdogCall> = const { std::cell::Cell::new(std::ptr::null()) };
@@ -955,9 +981,9 @@ thread_local! {
     static PANIC_LOC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-thread_local! {
+crate::gen_local! {
     /// source location of the last panic caught inside the compiler (one-line diagnostics)
-    static ICE_LOC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    static ICE_LOC: std::cell::RefCell<String>;
 }
 
 /// Installs (once) a panic hook that stays silent for panics inside the compiler (they
@@ -1960,14 +1986,16 @@ fn panic_tramp(target: u64) -> Vec<u8> {
 
 // ------------------------------------------------------------ the unit
 
-thread_local! {
+crate::gen_local! {
     /// The memoized recursive type queries in progress on this thread (drop_may_unwind 1,
     /// is_unpin 2; outermost first) and the outermost entry a cycle was cut
     /// at (usize::MAX: none). An answer computed below a cut of an entry still in progress
     /// further out is provisional (it misses what that entry's other parts contribute) and is not
     /// memoized: memoizing it made the answer depend on which type was asked first, and with it
     /// the lowered code (Call vs Invoke, drop glue) -- O1 RIR that depended on build order.
-    static CYC_AT: std::cell::RefCell<Vec<(u8, TyId)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CYC_AT: std::cell::RefCell<Vec<(u8, TyId)>>;
+}
+thread_local! {
     static CYC_CUT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
@@ -5995,12 +6023,14 @@ fn inline_src_toks(options: &crate::options::Options, tier1: bool) -> u32 {
     options.inline_src.unwrap_or(if tier1 { INLINE_SRC_TOKS_WITH_TIER1 } else { INLINE_SRC_TOKS_DEFAULT })
 }
 
-thread_local! {
+crate::gen_local! {
     /// CPU time of the builds nested in each running build of this thread (innermost last):
     /// phases count exclusive time, without the callees and CTFE compiles they wait for
-    static BUILD_CHILD: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BUILD_CHILD: std::cell::RefCell<Vec<u64>>;
     /// slots this thread is building (begin_build .. end_build), innermost last
-    static BUILD_STACK: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BUILD_STACK: std::cell::RefCell<Vec<u32>>;
+}
+thread_local! {
     /// a speculative worker: its fronts may suspend between bodies (prepare_rir)
     static IS_WORKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -6084,9 +6114,9 @@ unsafe fn wait_inflight(up: *mut Unit, id: u32) {
     owner::pump_wait(&|| !(&*up).fns[id as usize].inflight);
 }
 
-thread_local! {
+crate::gen_local! {
     /// Slots the running compile_batch_off_lock on this thread marked in flight during its fronts.
-    static BATCH_FLIGHT: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static BATCH_FLIGHT: std::cell::RefCell<Vec<u32>>;
 }
 
 /// Bumped whenever a build ends (reclaim_generation).
@@ -6134,8 +6164,12 @@ thread_local! {
     /// this request left out an inline candidate open in an earlier request lower on the
     /// owner's stack: its builds depend on timing (owner frames)
     static TAINTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+crate::gen_local! {
     /// (unit, slot) whose RIR such a request stored: dropped when it ends (its code stays)
-    static TAINT_BUILT: std::cell::RefCell<Vec<(usize, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static TAINT_BUILT: std::cell::RefCell<Vec<(usize, u32)>>;
+}
+thread_local! {
     /// a compile reached from JIT code in this request was cancelled (OwnerBusy) and got a
     /// panicking stub: the request is cancelled once a Rust frame can unwind
     static BUSY_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -11509,7 +11543,9 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
 thread_local! {
     /// guarded run-time module calls this thread is inside (std::relax::guard)
     static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static GUARD_MARKS: std::cell::RefCell<Vec<crate::modules::GuardMark>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+crate::gen_local! {
+    static GUARD_MARKS: std::cell::RefCell<Vec<crate::modules::GuardMark>>;
 }
 
 /// std::relax::guard: enters a guarded call (faults inside it are contained), with a deadline
@@ -12366,7 +12402,9 @@ struct LoweredAhead {
 
 thread_local! {
     static LOWERING_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static LOWER_AHEAD_IDS: std::cell::RefCell<AheadFnIds> = std::cell::RefCell::new(AheadFnIds::default());
+}
+crate::gen_local! {
+    static LOWER_AHEAD_IDS: std::cell::RefCell<AheadFnIds>;
 }
 
 #[derive(Default)]

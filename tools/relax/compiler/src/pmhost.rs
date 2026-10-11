@@ -20,9 +20,9 @@ use std::cell::Cell;
 use crate::pm::{Span, TokenStream};
 use crate::program::*;
 
-thread_local! {
+crate::gen_local! {
     /// the last `relax_pm_parse` result of this thread (the macro copies it right away)
-    static PARSE_OUT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PARSE_OUT: std::cell::RefCell<Vec<u8>>;
 }
 
 /// `"..".parse::<TokenStream>()` inside JIT-run macro code (Relax's std proc_macro FromStr):

@@ -189,6 +189,16 @@ impl<T> Shared<T> {
 }
 
 pub static REG: Shared<Reg> = Shared(std::sync::Mutex::new(RefCell::new(None)));
+
+pub(crate) fn zone_reset() {
+    // The warm path must call register_and_strip again before expanding macros;
+    // registry lookups do not load a missing graph themselves.
+    let mut reg = REG.0.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(reg.get_mut()));
+    #[cfg(test)]
+    assert!(reg.get_mut().is_none());
+}
+
 static STATS_CELL: Shared<HostStats> = Shared(std::sync::Mutex::new(RefCell::new(None)));
 
 /// `STATS.with(|s| ..)` over the shared stats (a copy in a Cell, written back).

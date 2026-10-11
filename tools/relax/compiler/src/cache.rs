@@ -144,6 +144,19 @@ static FRONT_STORES: std::sync::Mutex<Vec<std::sync::Arc<Store>>> = std::sync::M
 /// front images this run mapped (store, index entry): checksummed in the background
 static FRONT_USED: std::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = std::sync::Mutex::new(Vec::new());
 
+pub(crate) fn zone_reset() {
+    front_run::zone_reset();
+    // Forget the Arc owners too: their mappings may still back kept image views.
+    let mut stores = FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *stores));
+    let mut used = FRONT_USED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *used));
+    let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *paths));
+    #[cfg(test)]
+    { assert!(stores.is_empty()); assert!(used.is_empty()); assert!(paths.is_none()); }
+}
+
 /// Checksums the front images this run mapped, on a low-priority background thread (after the
 /// start). A mismatch -- a store damaged on disk -- removes that store file, so the next run
 /// parses and compiles that crate afresh; this run already validated the images' structure
@@ -2620,9 +2633,10 @@ fn append_store(path: &std::path::Path, entries: Vec<NewEntry>, stale: bool, mar
 /// their store's lock, so independent stores can progress during serial collection.
 pub static SPILL_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+// Weak entries coordinate concurrent compiler worlds without retaining old stores.
+static PATHS: std::sync::Mutex<Option<HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>> = std::sync::Mutex::new(None);
+
 fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
-    // Weak entries coordinate concurrent compiler worlds without retaining old stores.
-    static PATHS: std::sync::Mutex<Option<HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>> = std::sync::Mutex::new(None);
     let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
     let paths = paths.get_or_insert_with(HashMap::new);
     paths.retain(|_, lock| lock.strong_count() != 0);

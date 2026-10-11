@@ -246,6 +246,19 @@ pub fn take_verdict_keys() -> Vec<(u128, StoredVerdict)> {
 }
 
 static QUEUE: Mutex<Option<Queue>> = Mutex::new(None);
+
+pub(crate) fn zone_reset() {
+    // VERDICTS' LazyLock stays initialised; its mutex payload can be reset normally.
+    let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *verdicts));
+    let mut keys = VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *keys));
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *queue));
+    #[cfg(test)]
+    { assert!(verdicts.is_empty()); assert!(keys.is_empty()); assert!(queue.is_none()); }
+}
+
 static WAKE: Condvar = Condvar::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);

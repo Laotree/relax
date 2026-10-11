@@ -55,9 +55,9 @@ pub struct ProbePoint {
     pub params: Vec<(String, TyId)>,
 }
 
-thread_local! {
-    pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>> = const { std::cell::RefCell::new(Vec::new()) };
-    pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>> = const { std::cell::RefCell::new(Vec::new()) };
+crate::gen_local! {
+    pub static PROBE_POINTS: std::cell::RefCell<Vec<ProbePoint>>;
+    pub static PROBE_RESULTS: std::cell::RefCell<Vec<(u32, Result<(), String>)>>;
 }
 
 /// A place matched by a slice pattern (see Lcx::slice_pat).

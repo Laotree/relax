@@ -16,6 +16,20 @@ const RUN_PREFIX: &str = "front_run";
 
 /// The run stores this process writes: committed before a crate store refers to them.
 static RUNS: Mutex<Vec<Arc<RunStore>>> = Mutex::new(Vec::new());
+static SINKS: Mutex<Option<HashMap<PathBuf, Arc<FrontSink>>>> = Mutex::new(None);
+/// Run stores opened to resolve references, and keys found missing in them.
+static OPEN: Mutex<Option<(HashMap<PathBuf, Arc<Store>>, HashSet<(PathBuf, u128)>)>> = Mutex::new(None);
+
+pub(super) fn zone_reset() {
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *runs));
+    let mut sinks = SINKS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *sinks));
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *open));
+    #[cfg(test)]
+    { assert!(runs.is_empty()); assert!(sinks.is_none()); assert!(open.is_none()); }
+}
 
 /// The images written so far, per run store of this process: what references made now can
 /// name (commit_marks makes exactly those durable).
@@ -51,7 +65,6 @@ pub struct FrontSink {
 impl FrontSink {
     /// The sink of the cache folder `dir` (one per folder and process).
     pub fn for_dir(dir: &Path) -> Arc<FrontSink> {
-        static SINKS: Mutex<Option<HashMap<PathBuf, Arc<FrontSink>>>> = Mutex::new(None);
         let mut g = SINKS.lock().unwrap_or_else(|e| e.into_inner());
         g.get_or_insert_with(HashMap::new).entry(dir.to_path_buf())
             .or_insert_with(|| Arc::new(FrontSink { dir: dir.to_path_buf(), cur: Mutex::new(None), off: Default::default() })).clone()
@@ -148,8 +161,6 @@ pub(super) fn decode_ref(b: &[u8]) -> Option<(&str, u128)> {
 /// stores), mapped for the rest of the process. `check`: its checksum is verified now (else in
 /// the background, verify_front_images, as any mapped front image's).
 pub(super) fn resolve(dir: &Path, b: &[u8], check: bool) -> Option<(ImageLoc, &'static [u8])> {
-    /// run stores opened to resolve references, and keys found missing in them
-    static OPEN: Mutex<Option<(HashMap<PathBuf, Arc<Store>>, HashSet<(PathBuf, u128)>)>> = Mutex::new(None);
     let (name, key) = decode_ref(b)?;
     if !crate::store::name_ours(name) { return None; }
     // an image this process wrote: its own mapping (not a second one of the same pages)

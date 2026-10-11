@@ -43,8 +43,10 @@ struct ReloadTrace {
     subs: std::collections::BTreeMap<&'static str, f64>,
     counts: std::collections::BTreeMap<&'static str, usize>,
 }
+crate::gen_local! {
+    static TRACE: std::cell::RefCell<ReloadTrace>;
+}
 thread_local! {
-    static TRACE: std::cell::RefCell<ReloadTrace> = Default::default();
     static TRACE_INPUT: std::cell::Cell<(f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0)) };
 }
 pub(crate) fn trace_input(watch_ms: f64, read_ms: f64, scanned: usize) {
@@ -938,8 +940,8 @@ fn item_keys_memo(pf: &crate::parser::ParsedFile) -> std::rc::Rc<Vec<String>> {
     pf.ast.items.len().hash(&mut h);
     for it in &pf.ast.items { (it.lo, it.hi).hash(&mut h); }
     let id = h.finish();
-    thread_local! {
-        static LAST: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<String>>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    crate::gen_local! {
+        static LAST: std::cell::RefCell<Vec<(u64, std::rc::Rc<Vec<String>>)>>;
     }
     if let Some(keys) = LAST.with(|last| last.borrow().iter().find(|(k, _)| *k == id).map(|(_, keys)| keys.clone())) { return keys; }
     let keys = std::rc::Rc::new(item_keys(pf));
@@ -2019,10 +2021,10 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
 /// Live edit transactions so far: a field-view summary context kept by one transaction is
 /// used by the next only when no other transaction ran in between.
 static TRANSACTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-thread_local! {
+crate::gen_local! {
     /// The field-view summaries of the program as the last patched edit left it (the
     /// transaction number it was kept by).
-    static FV_SESSION: std::cell::RefCell<Option<(u64, std::rc::Rc<crate::borrowck::fv::SummaryCx>)>> = const { std::cell::RefCell::new(None) };
+    static FV_SESSION: std::cell::RefCell<Option<(u64, std::rc::Rc<crate::borrowck::fv::SummaryCx>)>>;
 }
 fn fv_session_take(transaction: u64) -> std::rc::Rc<crate::borrowck::fv::SummaryCx> {
     match FV_SESSION.with(|s| s.borrow_mut().take()) {

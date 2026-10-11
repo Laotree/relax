@@ -13,16 +13,22 @@ pub struct Span {
 struct Event { start_us: u128, dur_us: u128, phase: &'static str, subject: String }
 struct Buffer { thread: std::thread::ThreadId, worker: String, events: Vec<Event> }
 static BUFFERS: Mutex<Vec<Arc<Mutex<Buffer>>>> = Mutex::new(Vec::new());
-thread_local! {
-    // Exclusive CPU among the selected file spans: nested parse/lower work
-    // belongs to its own file, not also to the enclosing parse.
-    static FILE_CHILD_CPU: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
-    static BUFFER: Arc<Mutex<Buffer>> = {
+
+/// Registers the calling thread's new generation of timeline events for flush().
+struct LocalBuffer(Arc<Mutex<Buffer>>);
+impl Default for LocalBuffer {
+    fn default() -> Self {
         let thread = std::thread::current();
         let buffer = Arc::new(Mutex::new(Buffer { thread: thread.id(), worker: thread.name().unwrap_or("unnamed").into(), events: Vec::new() }));
         BUFFERS.lock().unwrap().push(buffer.clone());
-        buffer
-    };
+        Self(buffer)
+    }
+}
+crate::gen_local! {
+    // Exclusive CPU among the selected file spans: nested parse/lower work
+    // belongs to its own file, not also to the enclosing parse.
+    static FILE_CHILD_CPU: std::cell::RefCell<Vec<u64>>;
+    static BUFFER: LocalBuffer;
 }
 
 pub fn span(enabled: bool, phase: &'static str, subject: &str) -> Option<Span> {
@@ -56,7 +62,7 @@ impl Drop for Span {
             if !self.phase.is_empty() { file.cost(*lower, own); }
         }
         if self.phase.is_empty() { return; }
-        BUFFER.with(|buffer| buffer.lock().unwrap().events.push(Event {
+        BUFFER.with(|buffer| buffer.0.lock().unwrap().events.push(Event {
             start_us: self.start.duration_since(epoch()).as_micros(),
             dur_us: end.duration_since(self.start).as_micros(), phase: self.phase,
             subject: std::mem::take(&mut self.subject),
@@ -89,7 +95,7 @@ impl Span {
 pub fn flush_current() {
     use std::io::Write;
     let (thread, worker, events) = BUFFER.with(|buffer| {
-        let mut buffer = buffer.lock().unwrap();
+        let mut buffer = buffer.0.lock().unwrap();
         (buffer.thread, buffer.worker.clone(), std::mem::take(&mut buffer.events))
     });
     let mut out = std::io::BufWriter::new(std::io::stderr().lock());

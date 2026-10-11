@@ -145,6 +145,13 @@ pub const LATE_ENV: u8 = 2;
 
 static LATE: std::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = std::sync::Mutex::new(None);
 
+pub(crate) fn zone_reset() {
+    let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *late));
+    #[cfg(test)]
+    assert!(late.is_none());
+}
+
 /// The content hash a late input is recorded with.
 pub fn late_hash(content: Option<&[u8]>) -> u128 {
     let mut h = Sip128::new();

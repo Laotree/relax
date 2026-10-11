@@ -24,8 +24,8 @@ struct Module {
 
 static MODULES: std::sync::Mutex<Vec<Module>> = std::sync::Mutex::new(Vec::new());
 
-thread_local! {
-    static LAST_ERROR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+crate::gen_local! {
+    static LAST_ERROR: std::cell::RefCell<String>;
 }
 
 fn set_error(e: String) {
@@ -1107,8 +1107,8 @@ struct HostEntry {
     busy: bool,
 }
 
-thread_local! {
-    static HOSTS: std::cell::RefCell<Vec<HostEntry>> = const { std::cell::RefCell::new(Vec::new()) };
+crate::gen_local! {
+    static HOSTS: std::cell::RefCell<Vec<HostEntry>>;
 }
 static NEXT_HOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 

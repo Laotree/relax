@@ -36,9 +36,9 @@ fn state() -> &'static Mutex<State> {
     static STATE: OnceLock<Mutex<State>> = OnceLock::new();
     STATE.get_or_init(Default::default)
 }
-thread_local! {
-    static SLOTS: RefCell<Vec<(u32, u8)>> = const { RefCell::new(Vec::new()) };
-    static CHILD_CPU: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+relax_session::gen_local! {
+    static SLOTS: RefCell<Vec<(u32, u8)>>;
+    static CHILD_CPU: RefCell<Vec<u64>>;
 }
 pub struct Context(bool);
 impl Context {

@@ -42,6 +42,13 @@ static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
 thread_local! { static MY_SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed) as usize % SLOTS; }
 /// Items that took long enough to list: (what, name, ms).
 static SLOW: std::sync::Mutex<Vec<(&'static str, String, f64)>> = std::sync::Mutex::new(Vec::new());
+
+pub(crate) fn zone_reset() {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *slow));
+    #[cfg(test)]
+    assert!(slow.is_empty());
+}
 /// The crate being loaded and when it started.
 static LOADING: std::sync::Mutex<(String, f64)> = std::sync::Mutex::new((String::new(), 0.0));
 

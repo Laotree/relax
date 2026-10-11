@@ -44,11 +44,19 @@ pub struct ResolveBoundVars {
     pub(crate) generic_indices: GenericIndices,
 }
 
+static TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn zone_reset() {
+    let mut trivial = TRIVIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *trivial));
+    #[cfg(test)]
+    assert!(trivial.is_none());
+}
+
 impl ResolveBoundVars {
     /// An item without lifetimes: its answer depends only on its generic indices, so equal
     /// ones are one shared value (most items; each distinct index set is stored once).
     pub(crate) fn share(self) -> std::sync::Arc<ResolveBoundVars> {
-        static TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = std::sync::Mutex::new(None);
         let trivial = self.names.declarations.is_empty() && self.names.inherited.is_empty() && self.names.uses.is_empty() && self.names.binders.is_empty()
             && self.named_variable_map.is_empty() && self.opaque_captured_lifetimes.is_empty() && self.early_indices.is_empty()
             && self.late_bound_vars_map.len() == 1 && self.late_bound_vars_map.get(&BinderId::Item).is_some_and(|v| v.is_empty());

@@ -44,6 +44,18 @@ pub mod mainprof;
 pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
+
+/// memlane swap: forget the compiler generation's state held in this crate's statics;
+/// called with every compiler thread quiesced, right before the old generation is destroyed.
+pub fn zone_reset() {
+    owner::zone_reset();
+    native_macros::zone_reset();
+    cache::zone_reset();
+    jit::zone_reset();
+    run::zone_reset();
+    tui::zone_reset();
+}
+
 #[cfg(test)]
 mod parse_work_bench;
 

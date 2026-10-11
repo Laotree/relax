@@ -2028,6 +2028,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
 
 static RUN_DIAGNOSTICS: std::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = std::sync::Mutex::new(None);
 
+pub(crate) fn zone_reset() {
+    let mut diagnostics = RUN_DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *diagnostics));
+    #[cfg(test)]
+    assert!(diagnostics.is_none());
+}
+
 extern "C" fn at_exit() {
     finish_run("exit", EXIT_SUMMARY.get().and_then(|exit| exit.code.get().copied()));
 }

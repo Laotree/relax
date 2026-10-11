@@ -1328,8 +1328,10 @@ pub fn compact_vregs(f: &mut Func) {
     f.vregs = cls;
 }
 
+// OnceLock cannot be reset through a shared static; see this crate's zone_reset.
+pub(crate) static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 fn trace_opt(f: &Func, tag: &str) {
-    static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     if let Some(t) = T.get_or_init(|| std::env::var("RELAX_TRACE_OPT").ok()) {
         if f.name.contains(t.as_str()) {
             eprintln!("=== {} {}\n{}", tag, f.name, f.dump());
@@ -5436,10 +5438,10 @@ fn sroa_reject_slot(ok: &mut [bool], sl: usize, why: SroaReject, stats: &mut Opt
     }
 }
 
-thread_local! {
+relax_session::gen_local! {
     /// sroa's answer to "does this call keep or return a pointer passed as argument k?":
     /// set by the O3 driver from the callees' RIR (param_nocapture), None elsewhere
-    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>> = const { std::cell::RefCell::new(None) };
+    static SROA_NOCAP: std::cell::RefCell<Option<Box<dyn Fn(&Callee, usize) -> bool>>>;
 }
 
 /// Installs (Some) or removes (None) sroa's no-capture oracle for this thread.

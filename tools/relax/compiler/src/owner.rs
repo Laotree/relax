@@ -74,6 +74,16 @@ struct Queue {
 }
 
 static Q: Mutex<Queue> = Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES] });
+
+pub(crate) fn zone_reset() {
+    let mut queue = Q.lock().unwrap_or_else(|e| e.into_inner());
+    // Quiescence includes draining every request before forgetting the lanes' buffers.
+    assert!(queue.lanes.iter().all(VecDeque::is_empty), "memlane swap with queued owner requests");
+    std::mem::forget(std::mem::replace(&mut *queue, Queue { lanes: [const { VecDeque::new() }; CLASSES] }));
+    #[cfg(test)]
+    assert!(queue.lanes.iter().all(|lane| lane.is_empty() && lane.capacity() == 0));
+}
+
 static WAKE: Condvar = Condvar::new();
 static STARTED: std::sync::Once = std::sync::Once::new();
 /// Main or App requests queued (background work gives way: `urgent`)

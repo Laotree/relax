@@ -8,6 +8,38 @@
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 
+/// Forgets compiler statics and invalidates compiler TLS before destroying the old arena.
+/// Every compiler thread is quiesced; the caller is already in the new compiler generation.
+pub(crate) fn zone_reset_all() {
+    crate::zone_reset();
+    relax_types::zone_reset();
+    relax_front::zone_reset();
+    relax_codegen::zone_reset();
+    relax_session::zone_reset();
+    relax_session::gen_local::bump();
+}
+
+#[cfg(test)]
+mod reset_tests {
+    #[test]
+    fn zone_reset_fresh_process() {
+        const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            // Reset helpers assert their statics are empty. Repeat to cover an empty reset.
+            let _phase = crate::zone_alloc::compiler();
+            super::zone_reset_all();
+            super::zone_reset_all();
+            return;
+        }
+        // Other native tests use these process-wide caches: reset only in an isolated child.
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "jit::zone_scan::reset_tests::zone_reset_fresh_process"])
+            .env(CHILD, "1")
+            .status().unwrap();
+        assert!(status.success());
+    }
+}
+
 /// Counts, per named field, the owned allocations that lie in the compiler arena.
 pub(crate) struct Acc {
     counts: Vec<(&'static str, usize)>,

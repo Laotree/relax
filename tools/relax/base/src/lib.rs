@@ -8,7 +8,7 @@ pub use relax_codegen::{arm64, exec_census, fncost, warm, opt, regalloc, rir, x6
 
 pub mod fxhash;
 pub mod memstat;
-pub use relax_session::{options, sip, Session};
+pub use relax_session::{gen_local, options, sip, Session};
 pub mod conc;
 pub mod query;
 pub mod preempt;

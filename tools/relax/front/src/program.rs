@@ -4574,6 +4574,13 @@ pub struct SharedParse {
 /// The program's std parses by path, while its load runs (`share_std_begin` .. `share_std_end`)
 /// and after it (a world built again for hot reload takes them too).
 static SHARED_STD: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = std::sync::Mutex::new(None);
+
+pub(crate) fn zone_reset() {
+    let mut shared = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::take(&mut *shared));
+    #[cfg(test)]
+    assert!(shared.is_none());
+}
 static SHARED_CV: std::sync::Condvar = std::sync::Condvar::new();
 /// the program's std load is running: the world waits for its files
 static SHARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4978,17 +4985,23 @@ struct TraitQuery {
     hits: Vec<(u32, std::sync::Arc<Vec<(DefId, BindVis)>>)>,
 }
 
-thread_local! {
+crate::gen_local! {
     /// (skipped module, name) pairs a lookup on this thread missed since the last take_missing.
-    static MISSING: std::cell::RefCell<Vec<(u32, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static MISSING: std::cell::RefCell<Vec<(u32, String)>>;
+}
+thread_local! {
     /// The latest missing_mark: a note is deduplicated only against the notes from there on,
     /// so the notes since any open mark hold every miss of its lookups, also one this thread
     /// noted before the mark (an earlier lookup of the same name).
     static MISSING_FROM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+crate::gen_local! {
     /// The notes of MISSING[from..] as a set (push_missing's dedup), valid for (generation,
     /// from, len); a body's bound-variable walk notes thousands of misses in one window, and
     /// a scan of the window per note made that quadratic.
-    static MISSING_SEEN: std::cell::RefCell<(u64, usize, usize, std::collections::HashSet<(u32, String)>)> = std::cell::RefCell::new((0, 0, 0, Default::default()));
+    static MISSING_SEEN: std::cell::RefCell<(u64, usize, usize, std::collections::HashSet<(u32, String)>)>;
+}
+thread_local! {
     /// bumped whenever MISSING is replaced (save, restore, take)
     static MISSING_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }

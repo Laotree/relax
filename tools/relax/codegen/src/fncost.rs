@@ -149,7 +149,10 @@ impl State {
         self.wall = mono();
     }
 }
-thread_local! { static STATE: RefCell<State> = RefCell::new(State::new()); }
+impl Default for State {
+    fn default() -> Self { Self::new() }
+}
+relax_session::gen_local! { static STATE: RefCell<State>; }
 // JIT TLS destructors can lazily compile after this thread's logger was destroyed.
 // That late diagnostic is best-effort, as are all the existing JIT TLS statistics.
 fn local<R: Default>(f: impl FnOnce(&RefCell<State>) -> R) -> R {
