@@ -18,6 +18,9 @@ pub enum Error {
     LinkLost(String),
     /// The endpoint refused: close code and reason (unsupported service, version mismatch, ...).
     Refused(u16, String),
+    /// The answer did not finish within the client's timeout; the request's channel was closed
+    /// and the connection stays usable.
+    Timeout,
     Io(io::Error),
 }
 
@@ -26,6 +29,7 @@ impl std::fmt::Display for Error {
         match self {
             Error::LinkLost(w) => write!(f, "link lost: {w}"),
             Error::Refused(_, w) => f.write_str(w),
+            Error::Timeout => f.write_str("no answer within the timeout"),
             Error::Io(e) => write!(f, "{e}"),
         }
     }
@@ -62,6 +66,7 @@ struct Inner {
     ever: Mutex<bool>,
     seqs: Mutex<HashMap<String, u64>>,
     caps: Mutex<Vec<String>>,
+    timeout: Mutex<Option<Duration>>,
 }
 
 #[derive(Clone)]
@@ -73,7 +78,7 @@ fn link_id() -> String {
 
 impl Client {
     pub fn new(target: Target, name: &str) -> Client {
-        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()) }))
+        Client(Arc::new(Inner { target, name: name.to_string(), link_id: link_id(), conn: Mutex::new(None), ever: Mutex::new(false), seqs: Mutex::new(HashMap::new()), caps: Mutex::new(Vec::new()), timeout: Mutex::new(None) }))
     }
 
     /// Dials a local endpoint: `spec` is a socket path, a pid or an app name (discovery files).
@@ -191,12 +196,23 @@ impl Client {
         }
     }
 
+    /// Bounds how long a `cmd` answer (and each message of a `frames` stream, see
+    /// [`Client::timeout`]) may take from now on: past it the request's channel is closed and
+    /// the reader gets [`Error::Timeout`]. `None`: wait as long as the app takes.
+    pub fn set_timeout(&self, timeout: Option<Duration>) {
+        *self.0.timeout.lock().unwrap() = timeout;
+    }
+
+    pub fn timeout(&self) -> Option<Duration> {
+        *self.0.timeout.lock().unwrap()
+    }
+
     /// Sends one request line and returns the answer's lines (the `end` line excluded; read it
     /// with [`Lines::end`] after the iterator ends).
     pub fn cmd(&self, line: &str) -> Result<Lines, Error> {
         let ch = self.open("cmd", "")?;
         ch.send(line.as_bytes().to_vec()).map_err(|e| Error::LinkLost(e.to_string()))?;
-        Ok(Lines { ch: Some(ch), pending: VecDeque::new(), end: None })
+        Ok(Lines { ch: Some(ch), pending: VecDeque::new(), end: None, deadline: self.timeout().map(|t| std::time::Instant::now() + t) })
     }
 
     /// Follows the `watch` service (events) or `stream` service (chunks).
@@ -225,6 +241,7 @@ pub struct Lines {
     ch: Option<Channel>,
     pending: VecDeque<String>,
     end: Option<String>,
+    deadline: Option<std::time::Instant>,
 }
 
 impl Lines {
@@ -249,7 +266,19 @@ impl Iterator for Lines {
                 return Some(Ok(l));
             }
             let ch = self.ch.as_ref()?;
-            match ch.recv() {
+            let event = match self.deadline {
+                None => ch.recv(),
+                Some(deadline) => match ch.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(e) => Some(e),
+                    Err(true) => {
+                        // dropping the channel closes it; the connection goes on
+                        self.ch = None;
+                        return Some(Err(Error::Timeout));
+                    }
+                    Err(false) => None,
+                },
+            };
+            match event {
                 Some(Event::Data(d)) => self.pending.extend(String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()).map(str::to_string)),
                 Some(Event::Closed(code, why)) => {
                     self.ch = None;

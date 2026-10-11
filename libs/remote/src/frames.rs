@@ -6,7 +6,7 @@
 //! record format and the client side of it.
 
 use crate::conn::{Event, CLOSE_NORMAL};
-use crate::link::Client;
+use crate::link::{Client, Error};
 
 /// One frame: its header json and the image bytes (a PNG, or tightly packed RGBA for `raw`).
 #[derive(Debug, Clone, PartialEq)]
@@ -85,7 +85,15 @@ impl Request {
 pub fn fetch(client: &Client, req: &Request, each: &mut dyn FnMut(Record) -> Result<(), String>) -> Result<(), String> {
     let ch = client.open("frames", &req.args()).map_err(|e| e.to_string())?;
     loop {
-        match ch.recv() {
+        let event = match client.timeout() {
+            None => ch.recv(),
+            Some(t) => match ch.recv_timeout(t) {
+                Ok(e) => Some(e),
+                Err(true) => return Err(Error::Timeout.to_string()),
+                Err(false) => None,
+            },
+        };
+        match event {
             Some(Event::Data(d)) => each(decode_record(&d)?)?,
             Some(Event::Closed(code, why)) => return if code == CLOSE_NORMAL { Ok(()) } else { Err(why) },
             Some(Event::Opened(_)) => {}

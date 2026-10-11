@@ -606,3 +606,30 @@ fn loopback_carrier_requires_its_token_and_end_lines_carry_host_fields() {
     }
     assert!(crate::carrier::loopback::dial("192.0.2.3:80").is_err(), "only loopback is dialled");
 }
+
+#[test]
+fn a_request_past_its_timeout_is_closed_and_the_connection_goes_on() {
+    let ep = Endpoint::new("timeout-test");
+    ep.register_cmd(|req, out| match req.cmd.as_str() {
+        "slow" => {
+            std::thread::sleep(Duration::from_millis(600));
+            out.line("{\"late\":1}");
+        }
+        _ => out.line("{\"fast\":1}"),
+    });
+    let token = crate::carrier::loopback::new_token().unwrap();
+    let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
+    let client = Client::new(Target::Loopback(addr, token), "t");
+    client.set_timeout(Some(Duration::from_millis(100)));
+    let t = std::time::Instant::now();
+    let mut lines = client.cmd("slow").unwrap();
+    assert!(matches!(lines.next(), Some(Err(Error::Timeout))));
+    assert!(t.elapsed() < Duration::from_millis(500));
+    assert!(lines.next().is_none());
+    // the same connection answers the next request in time
+    let first = client.cmd("quick").unwrap().next().unwrap().unwrap();
+    assert_eq!(first, "{\"fast\":1}");
+    // no timeout set: it waits for the slow one
+    client.set_timeout(None);
+    assert_eq!(client.cmd("slow").unwrap().next().unwrap().unwrap(), "{\"late\":1}");
+}

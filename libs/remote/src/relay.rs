@@ -175,6 +175,7 @@ fn to_close(e: Error) -> (u16, String) {
     match e {
         Error::LinkLost(w) => (CLOSE_LINK_LOST, w),
         Error::Refused(c, w) => (c, w),
+        Error::Timeout => (CLOSE_REFUSED, e.to_string()),
         Error::Io(e) => (CLOSE_REFUSED, e.to_string()),
     }
 }
