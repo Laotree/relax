@@ -11,6 +11,8 @@ use makepad_network::tunnel::*;
 
 fn print_usage() {
     eprintln!("Usage:");
+    eprintln!("  App:    makepad-remote app <pid|app-name|socket> <command> [k=v ...]   (a running makepad app's endpoint; `help` lists its commands)");
+    eprintln!("          makepad-remote app <app> grab [w=ID] [scale=F] out=<file>   (images are written by this client)");
     eprintln!("  Server: makepad-remote --server [--port 8384] [--bind lan|<ip>] [--all]");
     eprintln!("                         [--keys <file>] [--identity <dir>] [--audit-log <file>] [--max-run <secs>]");
     eprintln!("          makepad-remote --init [--identity <dir>]     create the TLS identity, print its pin");
@@ -36,6 +38,30 @@ fn exit_with(result: std::io::Result<i32>) -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::from(1)
+        }
+    }
+}
+
+/// `makepad-remote app <pid|app|socket> <command> [k=v ...]`: prints the answer's lines; exit
+/// status 1 when the answer had an error, 2 when the app cannot be reached.
+fn run_app(spec: &str, argv: &[String]) -> ExitCode {
+    let client = match makepad_remote::Client::connect(spec) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let argv = if argv.is_empty() { vec!["help".to_string()] } else { argv.to_vec() };
+    match makepad_remote::app::run(&client, &argv, &mut |l| {
+        println!("{l}");
+        true
+    }) {
+        Ok(false) => ExitCode::SUCCESS,
+        Ok(true) => ExitCode::from(1),
+        Err(e) => {
+            eprintln!("makepad-remote app: {e}");
+            ExitCode::from(2)
         }
     }
 }
@@ -106,6 +132,7 @@ fn main() -> ExitCode {
             };
             exit_with(client::probe(addr, &PathBuf::from(keys), &PathBuf::from(identity)).map(|_| 0))
         }
+        "app" if args.len() >= 2 => run_app(&args[1], &args[2..]),
         "keygen" if args.len() == 2 => exit_with(client::keygen(&args[1]).map(|_| 0)),
         "pin" if args.len() == 3 => exit_with(client::set_pin(&args[1], &args[2]).map(|_| 0)),
         "rotate" if args.len() == 2 => exit_with(client::rotate(&args[1]).map(|_| 0)),

@@ -89,15 +89,9 @@ pub fn main(args: &[String]) -> i32 {
 fn ask(app: &App, line: &str, each: &mut dyn FnMut(&str) -> bool) -> std::io::Result<bool> {
     let to_io = |e: makepad_remote::link::Error| std::io::Error::other(e.to_string());
     let client = makepad_remote::Client::connect(&app.socket).map_err(to_io)?;
-    let mut err = false;
-    for l in client.cmd(line).map_err(to_io)? {
-        let l = l.map_err(to_io)?;
-        err |= l.starts_with("{\"err\":");
-        if !each(&l) {
-            break;
-        }
-    }
-    Ok(err)
+    // the commands that are images (`grab`, `gseq`, `gq`) are answered client side from the
+    // `frames` service, like `makepad-remote app` does: the same library function
+    makepad_remote::app::run_line(&client, line, each).map_err(to_io)
 }
 
 /// `all`: every app now and every app that starts while this runs.

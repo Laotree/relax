@@ -4,15 +4,18 @@
 //! control and priorities over any carrier), [`hello`] (version and capability handshake on
 //! channel 0), [`endpoint`] (the service registry a process serves), the services ([`cmd`],
 //! [`watch`], [`stream`], with the replay [`ring`] behind the last two), the [`carrier`]s
-//! (Unix socket, stdio, TCP with TLS) and the blocking client ([`link`]). The CI bridge of the
+//! (Unix socket, stdio, TCP with TLS), the blocking client ([`link`]) and the command line
+//! front end for an app's remote commands ([`app`], with the `frames` service records in [`frames`]). The CI bridge of the
 //! same name is built from `main.rs` and keeps its own wire until it moves onto this one.
 
+pub mod app;
 pub mod carrier;
 pub mod cmd;
 pub mod conn;
 pub mod discovery;
 pub mod endpoint;
 pub mod frame;
+pub mod frames;
 pub mod hello;
 pub mod hosts;
 #[cfg(unix)]

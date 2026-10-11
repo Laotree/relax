@@ -43,7 +43,7 @@ pub(crate) fn alive(pid: u32) -> bool {
     }
 }
 
-fn string(b: &[u8], i: &mut usize) -> Option<String> {
+pub(crate) fn string(b: &[u8], i: &mut usize) -> Option<String> {
     if b.get(*i) != Some(&b'"') {
         return None;
     }
@@ -81,7 +81,7 @@ fn string(b: &[u8], i: &mut usize) -> Option<String> {
 }
 
 /// The top-level `"key": value` pairs of one JSON object (values kept as raw text).
-fn fields(text: &str) -> Vec<(String, String)> {
+pub(crate) fn fields(text: &str) -> Vec<(String, String)> {
     let b = text.as_bytes();
     let mut i = 0;
     let mut out = Vec::new();

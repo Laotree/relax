@@ -81,11 +81,18 @@ pub struct Req {
 }
 
 impl Req {
-    /// `cmd word k=v ...`, or one flat JSON object `{"cmd":"..","k":"v","n":1}`.
+    /// `cmd word k=v ...`, or one flat JSON object `{"cmd":"..","k":"v","n":1}` (the cmd may
+    /// be several words; values keep their spaces).
     pub fn parse(line: &str) -> Req {
         let line = line.trim();
         if line.starts_with('{') {
-            if let Some(r) = parse_json_request(line) {
+            if let Some(mut r) = parse_json_request(line) {
+                // `{"cmd":"tweak apply",...}`: the words after the first are positional, as typed
+                if r.cmd.contains(char::is_whitespace) {
+                    let words: Vec<String> = r.cmd.split_whitespace().map(str::to_string).collect();
+                    r.cmd = words[0].clone();
+                    r.pos = words[1..].to_vec();
+                }
                 return r;
             }
         }
@@ -137,6 +144,14 @@ fn parse_json_request(s: &str) -> Option<Req> {
                         b'n' => out.push(b'\n'),
                         b't' => out.push(b'\t'),
                         b'r' => out.push(b'\r'),
+                        b'b' => out.push(8),
+                        b'f' => out.push(12),
+                        b'u' => {
+                            let h = std::str::from_utf8(b.get(*i + 1..*i + 5)?).ok()?;
+                            let c = char::from_u32(u32::from_str_radix(h, 16).ok()?).unwrap_or('\u{fffd}');
+                            out.extend_from_slice(c.to_string().as_bytes());
+                            *i += 4;
+                        }
                         c => out.push(c),
                     }
                     *i += 1;

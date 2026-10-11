@@ -283,7 +283,8 @@ pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     static S: OnceLock<(Endpoint, crate::watch::WatchSink)> = OnceLock::new();
     S.get_or_init(|| {
         let ep = Endpoint::new("makepad-remote-test");
-        ep.register_cmd(dispatch);
+        ep.register_cmd(app_dispatch);
+        ep.register("frames", 1, fake_frames());
         let w = ep.register_watch();
         ep.register_stream();
         ep.listen_unix(",\"extra\":\"x\"").unwrap();
@@ -302,7 +303,7 @@ fn unix_end_to_end_with_discovery_and_reconnect() {
     let client = Client::connect("makepad-remote-test").unwrap();
     assert!(client.caps().contains(&"cmd/1".to_string()));
     let mut lines = client.cmd("ping").unwrap();
-    assert_eq!(lines.next().unwrap().unwrap(), "{\"pong\":1}");
+    assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
     assert!(lines.next().is_none() && lines.end().unwrap().starts_with("{\"end\":\"ping\""));
     match client.open("nope", "") {
         Err(Error::Refused(c, _)) => assert_eq!(c, CLOSE_UNSUPPORTED),
@@ -345,7 +346,7 @@ fn tcp_loopback_with_tls_and_key_proof() {
     let creds = |k: &Psk| ClientCredentials { keys: vec![k.clone()], known_hosts: None, expect: Some(fp) };
     let client = Client::connect_tcp(&addr.to_string(), creds(&key)).unwrap();
     let mut lines = client.cmd("ping").unwrap();
-    assert_eq!(lines.next().unwrap().unwrap(), "{\"pong\":1}");
+    assert!(lines.next().unwrap().unwrap().starts_with("{\"pong\":1"));
     let big = client.cmd("big full=1").unwrap().count();
     assert_eq!(big, 2000);
     // a key the endpoint does not hold never gets a connection
@@ -407,4 +408,177 @@ fn tcp_both_ends_send_8mb_at_once() {
     assert!(t.elapsed() < Duration::from_secs(60), "{:?}", t.elapsed());
     eprintln!("8 MB each way over TLS in {:?}", t.elapsed());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The dispatch of the shared endpoint: what an app answers for `makepad-remote app`.
+fn app_dispatch(req: &Req, out: &mut Out) {
+    match req.cmd.as_str() {
+        "ping" => out.line(&format!("{{\"pong\":1,\"pid\":{},\"app\":\"makepad-remote-test\"}}", std::process::id())),
+        "status" => out.line("{\"app\":\"x\",\"pid\":1,\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\",\"sz\":[4,3]},{\"i\":2,\"t\":\"b\"}],\"closed\":[{\"i\":7}]}"),
+        "quit" => out.line("{\"ok\":1}"),
+        "echo" => out.line(&format!("{{\"cmd\":{},\"pos\":{},\"t\":{}}}", crate::json_str(&req.cmd), req.pos.len(), crate::json_str(req.get("t").unwrap_or("")))),
+        _ => dispatch(req, out),
+    }
+}
+
+/// A `frames` service that sends `n` fake PNGs of `window` (4x3), or fails for window 99.
+fn fake_frames() -> Factory {
+    Arc::new(|_, open| {
+        let arg = |k: &str| open.args.split_whitespace().find_map(|a| a.strip_prefix(k)?.strip_prefix('=')).map(str::to_string);
+        let window: usize = arg("window").and_then(|v| v.parse().ok()).unwrap_or(1);
+        let n: usize = if arg("once").is_some() { 1 } else { arg("n").and_then(|v| v.parse().ok()).unwrap_or(1) };
+        std::thread::spawn(move || {
+            let ch = open.channel;
+            if window == 99 {
+                ch.close(crate::conn::CLOSE_REFUSED, "no window 99");
+                return;
+            }
+            for i in 0..n {
+                let head = format!("{{\"seq\":{i},\"w\":4,\"h\":3,\"window\":{window},\"t_ns\":5,\"codec\":\"png\",\"capture_ms\":1.5,\"encode_ms\":0.5,\"capture_kind\":\"pixels\"}}");
+                if ch.send(crate::frames::encode_record(&head, format!("PNG{window}-{i}").as_bytes())).is_err() {
+                    return;
+                }
+            }
+            ch.close(crate::conn::CLOSE_NORMAL, "");
+        });
+        Ok(())
+    })
+}
+
+fn run_app(argv: &[&str]) -> (Vec<String>, bool) {
+    shared();
+    let client = Client::connect("makepad-remote-test").unwrap();
+    let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+    let mut lines = Vec::new();
+    let err = crate::app::run(&client, &argv, &mut |l| {
+        lines.push(l.to_string());
+        true
+    })
+    .unwrap();
+    (lines, err)
+}
+
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("makepad-remote-test-{}-{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn frames_records_round_trip_and_reject_truncation() {
+    let head = "{\"seq\":3,\"w\":4,\"codec\":\"png\",\"t\":\"a\\\"b\"}";
+    let m = crate::frames::encode_record(head, &[1, 2, 3, 0, 255]);
+    assert_eq!(&m[..4], &(head.len() as u32).to_le_bytes());
+    let r = crate::frames::decode_record(&m).unwrap();
+    assert_eq!(r.bytes, [1, 2, 3, 0, 255]);
+    assert_eq!((r.num("seq"), r.num("w"), r.text("codec").as_deref(), r.text("t").as_deref()), (Some(3.0), Some(4.0), Some("png"), Some("a\"b")));
+    assert!(r.num("missing").is_none());
+    assert!(crate::frames::decode_record(&m[..2]).is_err());
+    assert!(crate::frames::decode_record(&m[..20]).is_err());
+    let empty = crate::frames::decode_record(&crate::frames::encode_record("{}", &[])).unwrap();
+    assert!(empty.bytes.is_empty());
+    // a record bigger than a frame is split and put back together by the channel
+    let big = vec![7u8; 3 << 20];
+    let rec = crate::frames::decode_record(&crate::frames::encode_record("{\"seq\":0}", &big)).unwrap();
+    assert_eq!(rec.bytes.len(), big.len());
+}
+
+#[test]
+fn frames_request_arguments_match_the_services_vocabulary() {
+    use crate::frames::Request;
+    assert_eq!(Request { window: Some(2), scale: Some(0.5), raw: false, n: Some(1), fps: None }.args(), "window=2 scale=0.5 codec=png once=1");
+    assert_eq!(Request { window: None, scale: None, raw: true, n: Some(8), fps: Some(20.0) }.args(), "codec=raw n=8 fps=20");
+    assert_eq!(Request::default().args(), "codec=png");
+}
+
+#[test]
+fn app_commands_split_words_from_arguments_and_keep_spaces() {
+    let argv: Vec<String> = ["tweak", "apply", "path=a.b", "splash={padding: 20}", "--x=1", "=odd", "all"].iter().map(|s| s.to_string()).collect();
+    let (words, kv) = crate::app::split_args(&argv);
+    assert_eq!(words, ["tweak", "apply", "=odd", "all"]);
+    assert_eq!(kv[1], ("splash".to_string(), "{padding: 20}".to_string()));
+    assert_eq!(kv[2].0, "x");
+    let line = crate::app::request_line(&words[..2], &kv);
+    let req = Req::parse(&line);
+    assert_eq!((req.cmd.as_str(), req.pos.as_slice()), ("tweak", &["apply".to_string()][..]));
+    assert_eq!(req.get("splash"), Some("{padding: 20}"));
+    // control characters survive the JSON request
+    let req = Req::parse(&crate::app::request_line(&["text".to_string()], &[("t".to_string(), "a\tb\u{1b}c \"q\"".to_string())]));
+    assert_eq!(req.get("t"), Some("a\tb\u{1b}c \"q\""));
+    // a window id is told from a window title that mentions one
+    assert_eq!(crate::app::window_ids("{\"app\":\"x\",\"w\":[{\"i\":0,\"t\":\"say \\\"i\\\":9\"},{\"i\":12}],\"closed\":[{\"i\":7}]}"), [0, 12]);
+    assert!(crate::app::window_ids("{\"err\":\"x\"}").is_empty());
+}
+
+#[test]
+fn app_cmd_goes_through_with_words_and_arguments() {
+    let (lines, err) = run_app(&["echo", "one", "t=hello world"]);
+    assert!(!err);
+    assert_eq!(lines, ["{\"cmd\":\"echo\",\"pos\":1,\"t\":\"hello world\"}"]);
+    let (lines, err) = run_app(&["nope"]);
+    assert!(err && lines[0].contains("unknown command"));
+}
+
+#[test]
+fn grab_writes_the_png_on_the_clients_side() {
+    let dir = scratch("grab");
+    let file = dir.join("one.png");
+    let (lines, err) = run_app(&["grab", "w=2", &format!("out={}", file.display())]);
+    assert!(!err, "{lines:?}");
+    assert_eq!(std::fs::read(&file).unwrap(), b"PNG2-0");
+    assert!(lines[0].contains("\"w\":2") && lines[0].contains("\"sz\":[4,3]") && lines[0].contains("\"capture_ms\":1.500") && lines[0].contains(&file.display().to_string()), "{lines:?}");
+    // the default folder is the client's temp dir, app-pid named, numbered past what is there
+    let (a, _) = run_app(&["grab"]);
+    let (b, _) = run_app(&["tweak", "grab"]);
+    let path = |l: &str| l.split("\"png\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
+    let (pa, pb) = (path(&a[0]), path(&b[0]));
+    assert!(pa.contains(&format!("makepad-remote-test-{}", std::process::id())) && pa.ends_with(".png"), "{pa}");
+    assert_ne!(pa, pb);
+    assert_eq!(std::fs::read(&pa).unwrap(), b"PNG1-0");
+    let _ = std::fs::remove_file(&pa);
+    let _ = std::fs::remove_file(&pb);
+    let _ = std::fs::remove_dir(std::path::Path::new(&pa).parent().unwrap());
+    // a failure on the app's side is an error line
+    let (lines, err) = run_app(&["grab", "w=99"]);
+    assert!(err && lines[0].contains("no window 99"), "{lines:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gseq_writes_n_frames_with_timings_and_validates() {
+    let dir = scratch("gseq");
+    let (lines, err) = run_app(&["gseq", "n=3", "every_ms=20", &format!("out={}", dir.display())]);
+    assert!(!err, "{lines:?}");
+    let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    names.sort();
+    assert_eq!(names, ["grab-w1-00001.png", "grab-w1-00002.png", "grab-w1-00003.png"]);
+    assert_eq!(std::fs::read(dir.join("grab-w1-00003.png")).unwrap(), b"PNG1-2");
+    assert!(lines[0].contains("\"n\":3,\"every_ms\":20") && lines[0].contains("\"scheduled_ms\":40,\"pixels_ms\":41.500"), "{lines:?}");
+    // later sequences continue the numbering
+    let (_, err) = run_app(&["gseq", "n=2", &format!("out={}", dir.display())]);
+    assert!(!err);
+    assert!(dir.join("grab-w1-00005.png").exists());
+    // too many frames, too fast, or a span over 60 s: refused before anything is asked of the app
+    for bad in [&["gseq", "n=0"][..], &["gseq", "n=65"], &["gseq", "every_ms=7"], &["gseq", "n=64", "every_ms=1000"]] {
+        let (lines, err) = run_app(bad);
+        assert!(err && lines.len() == 1 && lines[0].starts_with("{\"err\":\"gseq "), "{bad:?}: {lines:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn gq_grabs_every_window_then_quits() {
+    let (lines, err) = run_app(&["gq"]);
+    assert!(!err, "{lines:?}");
+    assert!(lines[0].starts_with("{\"png\":[") && lines[0].ends_with("],\"quit\":1}"), "{lines:?}");
+    // the two windows of `status` (0 and 2), not the title or the closed one
+    assert_eq!(lines[0].matches("grab-w").count(), 2, "{lines:?}");
+    let files: Vec<String> = lines[0].split('"').filter(|s| s.contains("grab-w")).map(str::to_string).collect();
+    assert!(files[0].contains("grab-w0-") && files[1].contains("grab-w2-"));
+    for f in files {
+        let _ = std::fs::remove_file(&f);
+        // best effort: the folder goes too once the other tests are done with it
+        let _ = std::fs::remove_dir(std::path::Path::new(&f).parent().unwrap());
+    }
 }
