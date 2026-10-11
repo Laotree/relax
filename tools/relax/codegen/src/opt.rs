@@ -5378,8 +5378,13 @@ pub fn param_nocapture(f: &Func, k: usize, sub: &dyn Fn(&Callee, usize) -> bool)
 /// Only slots reached by a vector access (or a whole copy of one) qualify.
 /// Unknown uses reject the slot. Terminal panic blocks get the current value
 /// materialized at entry and retain their original memory operations.
+/// Slots promote_vector_slots can hold in V128 registers: whole 16-byte chunks, up to 64 bytes.
+fn vec_slot_size(n: u32) -> bool {
+    n >= 16 && n <= 64 && n % 16 == 0
+}
+
 pub fn promote_vector_slots(f: &mut Func) -> bool {
-    if !f.slots.iter().any(|s| s.size == 16) || !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VLoad(..) | Inst::VStore(..)))) {
+    if !f.slots.iter().any(|s| vec_slot_size(s.size)) || !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::VLoad(..) | Inst::VStore(..)))) {
         return false;
     }
     if f.blocks.iter().any(|b| b.term.succs().any(|s| s == 0)) {
@@ -5392,13 +5397,14 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
         let (s, o) = sc.vs[v.0 as usize];
         (s, o + off as i64)
     };
-    let mut ok: Vec<bool> = f.slots.iter().enumerate().map(|(s, x)| x.size == 16 && !sc.esc[s]).collect();
+    let mut ok: Vec<bool> = f.slots.iter().enumerate().map(|(s, x)| vec_slot_size(x.size) && !sc.esc[s]).collect();
     let mut vector = vec![false; ok.len()];
+    let ssz: Vec<i64> = f.slots.iter().map(|x| x.size as i64).collect();
     for b in &f.blocks {
         for i in &b.insts {
             let mut access = |v: VReg, off: i32, n: u32, valid: bool| {
                 let (s, o) = at(v, off);
-                if s != NONE && (!valid || o < 0 || o + n as i64 > 16 || (n < 16 && o % n.max(1) as i64 != 0)) {
+                if s != NONE && (!valid || o < 0 || o + n as i64 > ssz[s as usize] || (n < 16 && o % n.max(1) as i64 != 0) || (n == 16 && o % 16 != 0)) {
                     ok[s as usize] = false;
                 }
             };
@@ -5418,7 +5424,7 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
                     // offsets need not align to the entire copy's length.
                     for p in [d, s] {
                         let (sl, o) = at(p, 0);
-                        if sl != NONE && (o < 0 || o + n as i64 > 16) {
+                        if sl != NONE && (o < 0 || o + n as i64 > ssz[sl as usize]) {
                             ok[sl as usize] = false;
                         }
                     }
@@ -5432,7 +5438,10 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
         let mut changed = false;
         for b in &f.blocks {
             for i in &b.insts {
-                if let Inst::Copy(d, s, 16) = *i {
+                if let Inst::Copy(d, s, n) = *i {
+                    if n % 16 != 0 {
+                        continue;
+                    }
                     let (ds, ss) = (at(d, 0).0, at(s, 0).0);
                     if ds != NONE && ss != NONE && (vector[ds as usize] || vector[ss as usize]) {
                         for sl in [ds, ss] {
@@ -5455,21 +5464,25 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
     if !ok.iter().any(|x| *x) {
         return false;
     }
-    let mut regs = vec![VReg(NONE); ok.len()];
-    let mut ptrs = regs.clone();
+    // one V128 per 16-byte chunk of a promoted slot
+    let mut regs: Vec<Vec<VReg>> = vec![Vec::new(); ok.len()];
+    let mut ptrs = vec![VReg(NONE); ok.len()];
     let mut init = Vec::new();
     for s in 0..ok.len() {
         if ok[s] {
-            regs[s] = f.vreg(Cls::V128);
             ptrs[s] = f.vreg(Cls::I);
-            init.push(Inst::VConst(regs[s], 0));
+            for _ in 0..ssz[s] / 16 {
+                let r = f.vreg(Cls::V128);
+                init.push(Inst::VConst(r, 0));
+                regs[s].push(r);
+            }
             init.push(Inst::SlotAddr(ptrs[s], s as u32));
         }
     }
     let cell = |p: VReg, o: i32| -> Option<(VReg, u8)> {
         let (s, off) = at(p, o);
         if s != NONE && ok[s as usize] {
-            Some((regs[s as usize], off as u8))
+            Some((regs[s as usize][(off / 16) as usize], (off % 16) as u8))
         } else {
             None
         }
@@ -5495,7 +5508,9 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
                         hit
                     })
                 {
-                    flush.push(Inst::VStore(ptrs[s], 0, regs[s]));
+                    for (k, r) in regs[s].iter().enumerate() {
+                        flush.push(Inst::VStore(ptrs[s], 16 * k as i32, *r));
+                    }
                 }
             }
             let p = f.blocks[bi].pos.first().copied().unwrap_or(f.blocks[bi].term_pos);
@@ -5523,16 +5538,23 @@ pub fn promote_vector_slots(f: &mut Func) -> bool {
                     out.push(Inst::VX(VX::Insert(width(n), off / n), v, v, x));
                 }
                 Inst::Copy(d, s, n) if cell(d, 0).is_some() || cell(s, 0).is_some() => {
-                    if n == 16 {
-                        let r = f.vreg(Cls::V128);
-                        out.push(match cell(s, 0) {
-                            Some((v, _)) => Inst::Mov(r, v),
-                            None => Inst::VLoad(r, s, 0),
-                        });
-                        out.push(match cell(d, 0) {
-                            Some((v, _)) => Inst::Mov(v, r),
-                            None => Inst::VStore(d, 0, r),
-                        });
+                    if n % 16 == 0 && [d, s].iter().all(|&p| cell(p, 0).map_or(true, |(_, off)| off == 0)) {
+                        // whole 16-byte chunks: read every chunk before writing any
+                        let mut tmp = Vec::new();
+                        for k in 0..(n / 16) as i32 {
+                            let r = f.vreg(Cls::V128);
+                            out.push(match cell(s, 16 * k) {
+                                Some((v, _)) => Inst::Mov(r, v),
+                                None => Inst::VLoad(r, s, 16 * k),
+                            });
+                            tmp.push(r);
+                        }
+                        for (k, r) in tmp.into_iter().enumerate() {
+                            out.push(match cell(d, 16 * k as i32) {
+                                Some((v, _)) => Inst::Mov(v, r),
+                                None => Inst::VStore(d, 16 * k as i32, r),
+                            });
+                        }
                     } else {
                         // Read all lanes before writing, preserving Copy's
                         // snapshot semantics even for overlapping slot ranges.

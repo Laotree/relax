@@ -439,10 +439,7 @@ unsafe fn ps_hi(a: &__m256) -> __m128 {
 }
 #[inline(always)]
 unsafe fn ps_join(lo: __m128, hi: __m128) -> __m256 {
-    let mut r = __m256([0.0; 8]);
-    vx::vx_store(&mut r as *mut __m256 as *mut u8, lo);
-    vx::vx_store((&mut r as *mut __m256 as *mut u8).add(16), hi);
-    r
+    crate::mem::transmute::<[__m128; 2], __m256>([lo, hi])
 }
 
 pub unsafe fn _mm256_add_ps(a: __m256, b: __m256) -> __m256 {
@@ -565,10 +562,7 @@ unsafe fn i_hi(a: &__m256i) -> __m128i {
 }
 #[inline(always)]
 unsafe fn i_join(lo: __m128i, hi: __m128i) -> __m256i {
-    let mut r = __m256i([0; 4]);
-    vx::vx_store(&mut r as *mut __m256i as *mut u8, lo);
-    vx::vx_store((&mut r as *mut __m256i as *mut u8).add(16), hi);
-    r
+    crate::mem::transmute::<[__m128i; 2], __m256i>([lo, hi])
 }
 
 // AVX2 integer operations that work within each 128-bit lane are the 128-bit bridge operation on
