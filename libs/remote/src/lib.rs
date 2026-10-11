@@ -14,13 +14,22 @@ pub mod discovery;
 pub mod endpoint;
 pub mod frame;
 pub mod hello;
+pub mod hosts;
+#[cfg(unix)]
+pub mod hub;
+pub mod lines;
+pub mod pair;
 pub mod link;
+#[cfg(unix)]
+pub mod relay;
 pub mod ring;
 pub mod stream;
 pub mod watch;
 
 #[cfg(all(test, unix))]
 mod tests;
+#[cfg(all(test, unix))]
+mod hub_tests;
 
 pub use cmd::{json_str, now_ms, Out, Req};
 pub use conn::{Channel, ChannelTx, Conn, Event, Hooks};

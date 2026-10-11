@@ -7,7 +7,7 @@ use std::io::IsTerminal;
 /// The word a command line starts with, for every command `relax` knows (help pages or not).
 pub const COMMANDS: &[&str] = &[
     "run", "fetch", "inspect", "check", "selftest", "test", "live", "fix", "clean", "serve", "schema", "hover", "definition",
-    "parse", "resolve", "file", "std-surface", "relax-lex", "help",
+    "parse", "resolve", "file", "std-surface", "relax-lex", "hub", "remote-relay", "remote", "help",
 ];
 
 #[derive(Clone, Copy)]
@@ -121,6 +121,7 @@ fn main_page(st: &Style) -> String {
     p.row("run <git-url> <package>", "Run an app straight from a git repository");
     p.row("fetch <git-url>", "Fetch a repository into the local store");
     p.row("inspect <app> <question>", "Ask a running app about itself (hangs, stacks, events)");
+    p.row("hub | remote-relay | remote", "Reach apps on other machines (see relax help inspect)");
     p.row("check <package>", "Type- and borrow-check without running");
     p.row("selftest <package>", "Test Relax: compile every fn of a package, list failures");
     p.row("test <file.rs> [filter]", "Run a crate's tests");
@@ -301,6 +302,14 @@ fn inspect_page(st: &Style) -> String {
     p.row("panics | resume <id> panic", "Parked panics");
     p.row("help schema", "Tool definition for agents");
     p.text("`all` covers every running app, also ones started later.");
+    p.section("Other machines:");
+    p.row("<host>:<app|pid> <command>", "Ask an app on a host of hosts.toml (via the hub)");
+    p.row("<host>:list", "That host's running apps");
+    p.row("<host>:session launch <app>", "Start a hidden session there (kill <pid> ends it)");
+    p.row("hosts", "Registry, link state and round trip");
+    p.row("all:list", "Apps here and on every host");
+    p.text("Hosts are added with `relax remote add <name> --ssh user@host` or paired with");
+    p.text("`relax remote pair <name> --hub <addr>` (the device dials `relax hub --listen`).");
     p.out
 }
 

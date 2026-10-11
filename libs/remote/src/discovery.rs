@@ -28,7 +28,7 @@ impl App {
     }
 }
 
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         extern "C" {

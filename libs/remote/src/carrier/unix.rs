@@ -110,6 +110,11 @@ mod imp {
             fn atexit(f: extern "C" fn()) -> i32;
         }
         unsafe { atexit(cleanup) };
+        accept_loop(ep, listener);
+        Ok(sock)
+    }
+
+    fn accept_loop(ep: &Endpoint, listener: UnixListener) {
         let ep = ep.clone();
         let hooks = ep.hooks();
         let _ = std::thread::Builder::new().name("makepad-remote-accept".into()).spawn(move || {
@@ -135,7 +140,15 @@ mod imp {
                 });
             }
         });
-        Ok(sock)
+    }
+
+    /// Listens on the socket at `path` (0600, same-uid peers) without a discovery file: for a
+    /// service with a fixed address such as the hub. The caller has made sure no live process
+    /// serves the path; a stale socket file is replaced.
+    pub fn listen_at(ep: &Endpoint, path: &Path) -> io::Result<()> {
+        let _ = std::fs::remove_file(path);
+        accept_loop(ep, bind(path)?);
+        Ok(())
     }
 }
 
@@ -147,6 +160,9 @@ mod imp {
     use super::*;
     pub fn listen(_ep: &Endpoint, _extra: &str) -> io::Result<PathBuf> {
         let _ = cleanup as extern "C" fn();
+        Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
+    }
+    pub fn listen_at(_ep: &Endpoint, _path: &Path) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
     }
 }

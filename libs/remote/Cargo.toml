@@ -8,6 +8,7 @@ default-run = "makepad-remote"
 
 [dependencies]
 makepad-network = { path = "../../platform/network" }
+makepad-toml-parser = { path = "../toml_parser", version = "1.0.0" }
 
 
 [lib]

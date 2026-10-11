@@ -13,6 +13,7 @@ mod cef;
 mod fetch;
 mod help;
 mod macros;
+mod remote;
 
 /// What this loader was built from (build.rs; the linked compiler's own stamp is
 /// relax_compiler::PROVENANCE).
@@ -113,6 +114,10 @@ fn main() {
         Some("help") => std::process::exit(help::help(&args[2..])),
         // `inspect <pid|app|all|list> <command>`: ask a running app (no compiler started here)
         Some("inspect") => std::process::exit(relax_compiler::inspect::client::main(&args[2..])),
+        // the remote hub: `hub [--listen <addr>]`, `remote-relay [--dial ..]`, `remote add|pair|list`
+        Some("hub") => std::process::exit(remote::hub(&args[2..])),
+        Some("remote-relay") => std::process::exit(remote::relay(&args[2..])),
+        Some("remote") => std::process::exit(remote::remote(&args[2..])),
         // `run <git url>[#ref] [--mount <dir>=<git url>[#ref]]... [--cached] <package> ...`
         Some("run") => match fetch::split_args(&args[2..]) {
             None => {}

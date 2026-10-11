@@ -236,7 +236,11 @@ impl Iterator for Lines {
                 Some(Event::Data(d)) => self.pending.extend(String::from_utf8_lossy(&d).lines().filter(|l| !l.is_empty()).map(str::to_string)),
                 Some(Event::Closed(code, why)) => {
                     self.ch = None;
-                    return if code == CLOSE_LINK_LOST { Some(Err(Error::LinkLost(why))) } else { None };
+                    return match code {
+                        CLOSE_LINK_LOST => Some(Err(Error::LinkLost(why))),
+                        CLOSE_NORMAL => None,
+                        _ => Some(Err(Error::Refused(code, why))),
+                    };
                 }
                 Some(Event::Opened(_)) => {}
                 None => {

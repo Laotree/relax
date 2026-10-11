@@ -47,7 +47,7 @@ fn echo() -> Factory {
 }
 
 /// Connects a client `Conn` to `ep` over an in-process socket pair.
-fn pair(ep: &Endpoint) -> Conn {
+pub(crate) fn pair(ep: &Endpoint) -> Conn {
     let (a, b) = UnixStream::pair().unwrap();
     let ep = ep.clone();
     std::thread::spawn(move || {
@@ -279,7 +279,7 @@ fn resume_replays_the_ring_with_a_drop_marker() {
     assert_eq!(u64::from_le_bytes(next[..8].try_into().unwrap()), 45);
 }
 
-fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
+pub(crate) fn shared() -> &'static (Endpoint, crate::watch::WatchSink) {
     static S: OnceLock<(Endpoint, crate::watch::WatchSink)> = OnceLock::new();
     S.get_or_init(|| {
         let ep = Endpoint::new("makepad-remote-test");

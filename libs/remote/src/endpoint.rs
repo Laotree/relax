@@ -2,6 +2,7 @@
 //! the carriers that accept connections. Hosts register services (`cmd` with their dispatch,
 //! `watch`, `stream`, others later); Relax registers its inspect dispatch as the `cmd` service.
 
+use crate::carrier::Carrier;
 use crate::cmd::{self, Out, Req};
 use crate::conn::{Conn, Hooks, Io, Open, OpenHandler, CLOSE_UNSUPPORTED};
 use crate::frame::FrameReader;
@@ -27,7 +28,11 @@ struct Inner {
     services: RwLock<Vec<Service>>,
     hooks: Mutex<Hooks>,
     ring: Arc<Ring>,
+    accept: Mutex<Option<AcceptHook>>,
 }
+
+/// Called with every connection the endpoint accepts, once its handshake is done.
+pub type AcceptHook = Arc<dyn Fn(&Conn) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Endpoint(Arc<Inner>);
@@ -39,13 +44,18 @@ impl Endpoint {
 
     /// An endpoint whose replay ring holds `ring_bytes` of stream chunks.
     pub fn with_ring(app: &str, ring_bytes: usize) -> Endpoint {
-        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)) }))
+        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None) }))
     }
 
     /// Listens on this process's Unix socket and writes the discovery file (register the services
     /// first: the caps are written now). `extra`: already-serialised `,"key":value` fields.
     pub fn listen_unix(&self, extra: &str) -> std::io::Result<std::path::PathBuf> {
         crate::carrier::unix::listen(self, extra)
+    }
+
+    /// Sets the hook that sees every accepted connection (a hub keeps its links this way).
+    pub fn set_accept(&self, hook: AcceptHook) {
+        *self.0.accept.lock().unwrap() = Some(hook);
     }
 
     pub fn app(&self) -> &str {
@@ -124,6 +134,27 @@ impl Endpoint {
                 return Err(e);
             }
         };
-        Ok(Conn::start(Io { reader, writer, shutdown }, peer, false, Some(self.handler()), self.hooks()))
+        let conn = Conn::start(Io { reader, writer, shutdown }, peer, false, Some(self.handler()), self.hooks());
+        let hook = self.0.accept.lock().unwrap().clone();
+        if let Some(h) = hook {
+            h(&conn);
+        }
+        Ok(conn)
+    }
+
+    /// The dialling side of a link on which this endpoint's services are served: a device that
+    /// dials a hub offers its services to the hub over the connection it opened. `link_id` names
+    /// the link across reconnects.
+    pub fn connect(&self, mut car: Carrier, link_id: &str) -> Result<Conn, HandshakeError> {
+        car.reader.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let hello = Hello { name: self.0.app.clone(), link_id: link_id.to_string(), ..Hello::default() };
+        let peer = match hello::client_handshake(&mut car.reader, &mut *car.writer, &hello) {
+            Ok(p) => p,
+            Err(e) => {
+                (car.shutdown)();
+                return Err(e);
+            }
+        };
+        Ok(Conn::start(Io { reader: car.reader, writer: car.writer, shutdown: car.shutdown }, peer, true, Some(self.handler()), self.hooks()))
     }
 }

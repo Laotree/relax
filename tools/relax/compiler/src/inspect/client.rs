@@ -21,6 +21,7 @@ pub fn apps() -> Vec<App> {
 
 fn usage() -> i32 {
     eprintln!("usage: relax inspect <pid|app|all|list> <command> [args]   (relax inspect <pid> help: the commands)");
+    eprintln!("       relax inspect <host>:<app|pid> <command> | <host>:list | <host>:session <launch|kill> .. | hosts | all:list");
     2
 }
 
@@ -35,6 +36,13 @@ pub fn main(args: &[String]) -> i32 {
             println!("{{\"pid\":{},\"app\":{},\"socket\":{}}}", a.pid, super::json_str(&a.app), super::json_str(&a.socket));
         }
         return 0;
+    }
+    if target == "hosts" {
+        return remote::hosts();
+    }
+    if let Some((host, app)) = target.split_once(':') {
+        let line = if args.len() > 1 { args[1..].join(" ") } else { "help".to_string() };
+        return remote::main(host, app, &line);
     }
     if target == "schema" {
         println!("{}", super::schema());
@@ -146,5 +154,121 @@ fn all(line: &str, cmd: &str) -> i32 {
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(_) => return 0,
         }
+    }
+}
+
+/// Addresses with a host part (`149:stage`), `hosts` and `all:list`: through the hub.
+#[cfg(unix)]
+mod remote {
+    use makepad_remote::hosts::{registry_path, Hosts};
+    use makepad_remote::hub;
+
+    fn hub_client() -> Result<makepad_remote::Client, String> {
+        hub::connect(std::env::current_exe().ok().as_deref())
+    }
+
+    /// `{"host":"<h>",` in front of a JSON object line.
+    fn tag(host: &str, line: &str) -> String {
+        match line.strip_prefix('{') {
+            Some(rest) if rest != "}" => format!("{{\"host\":{},{rest}", super::super::json_str(host)),
+            _ => line.to_string(),
+        }
+    }
+
+    pub fn hosts() -> i32 {
+        match hub_client().and_then(|c| {
+            hub::hosts(&c, &mut |l| {
+                println!("{l}");
+                true
+            })
+        }) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("relax inspect: {e}");
+                2
+            }
+        }
+    }
+
+    pub fn main(host: &str, app: &str, line: &str) -> i32 {
+        if host == "all" {
+            return all(app);
+        }
+        let (service, target, args, request) = match app {
+            "" => {
+                eprintln!("relax inspect: `{host}:` needs an app, a pid, `list` or `session`");
+                return 2;
+            }
+            "list" => ("list", host.to_string(), "", "list".to_string()),
+            "session" => ("session", host.to_string(), "", line.to_string()),
+            _ => ("cmd", format!("{host}:{app}"), "", line.to_string()),
+        };
+        let client = match hub_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("relax inspect: {e}");
+                return 2;
+            }
+        };
+        match hub::ask(&client, &target, service, args, &request, &mut |l| {
+            println!("{}", if service == "list" { tag(host, l) } else { l.to_string() });
+            true
+        }) {
+            Ok(had_err) => i32::from(had_err),
+            Err(e) => {
+                eprintln!("relax inspect: {host}:{app}: {e}");
+                2
+            }
+        }
+    }
+
+    /// `all:list`: the apps here, then those of every host in the registry.
+    fn all(what: &str) -> i32 {
+        if what != "list" {
+            eprintln!("relax inspect: all:{what}: only `all:list` spans hosts");
+            return 2;
+        }
+        for a in super::apps() {
+            println!("{{\"host\":\"local\",\"pid\":{},\"app\":{},\"socket\":{}}}", a.pid, super::super::json_str(&a.app), super::super::json_str(&a.socket));
+        }
+        let reg = match Hosts::load(&registry_path()) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("relax inspect: {e}");
+                return 2;
+            }
+        };
+        if reg.hosts.is_empty() {
+            return 0;
+        }
+        let client = match hub_client() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("relax inspect: {e}");
+                return 2;
+            }
+        };
+        let mut code = 0;
+        for h in &reg.hosts {
+            if let Err(e) = hub::ask(&client, &h.name, "list", "", "list", &mut |l| {
+                println!("{}", tag(&h.name, l));
+                true
+            }) {
+                println!("{{\"host\":{},\"err\":{}}}", super::super::json_str(&h.name), super::super::json_str(&e));
+                code = 1;
+            }
+        }
+        code
+    }
+}
+
+#[cfg(not(unix))]
+mod remote {
+    pub fn hosts() -> i32 {
+        eprintln!("relax inspect: remote hosts are not available on Windows yet");
+        2
+    }
+    pub fn main(_: &str, _: &str, _: &str) -> i32 {
+        hosts()
     }
 }
