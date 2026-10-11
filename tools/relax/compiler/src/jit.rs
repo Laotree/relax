@@ -2222,6 +2222,8 @@ impl Unit {
             }
         }
         u.self_ptr = UnitPtr(&mut *u as *mut Unit);
+        #[cfg(target_os = "android")]
+        u.slots.set_callable_hook(c_callable_hook, u.self_ptr.0 as usize);
         u.tcx.const_eval_provider = Some(relax_types::const_eval::ConstEvalProvider {
             context: u.self_ptr.0 as usize, evaluate: const_eval_to_valtree,
         });
@@ -3213,6 +3215,13 @@ impl Unit {
             lower_ahead_needs_unit();
         }
         self.fns[id as usize].entry_ref.store(true, Ordering::Relaxed);
+        self.slots.callable(id)
+    }
+
+    /// The slot's own thunk, never a stub: what a host that calls a function itself (not through
+    /// a C library) is given, e.g. the JNI natives (run --exports).
+    pub fn entry_direct(&self, id: u32) -> u64 {
+        self.entry(id);
         self.slots.thunk(id)
     }
 
@@ -4061,6 +4070,20 @@ impl Unit {
 /// `call_jit`) compiles its lazy stubs against it.
 pub unsafe fn set_runtime_unit(u: *mut Unit) {
     UNIT = u;
+}
+
+/// Android: the address of a C-ABI function as a value is a stub in the host library
+/// (os::proc::trampoline): system libraries check indirect calls against the code they know
+/// (CFI: libaaudio crashed in __cfi_slowpath on a JIT address), and JIT memory is not any library's.
+#[cfg(target_os = "android")]
+fn c_callable_hook(ctx: usize, id: u32, thunk: u64) -> u64 {
+    let u = unsafe { &*(ctx as *const Unit) };
+    let c_abi = (id as usize) < u.fns.len()
+        && match &u.fns[id as usize].key {
+            FnKey::Inst(d, _) => u.tcx.fn_abi(&u.prog, *d).map_or(false, |abi| abi != crate::types::Abi::Rust),
+            _ => false,
+        };
+    if c_abi { os::proc::trampoline(thunk) } else { thunk }
 }
 
 /// Calls JIT code `entry(arg)` under a fresh recovery context. No Rust borrow of the

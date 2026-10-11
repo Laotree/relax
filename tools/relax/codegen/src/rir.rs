@@ -411,6 +411,9 @@ pub struct SlotTable {
     bases: [[std::sync::atomic::AtomicU64; SLOT_SEGS]; 4],
     /// bytes per slot of each kind
     stride: [u64; 4],
+    /// the embedder's hook for the address C code gets for a slot (`callable`): 0 = none
+    callable_hook: std::sync::atomic::AtomicUsize,
+    callable_ctx: std::sync::atomic::AtomicUsize,
 }
 
 pub const SLOT_SEGS: usize = 15;
@@ -421,7 +424,12 @@ const SK_TIER: usize = 3;
 
 impl SlotTable {
     pub fn new(thunk: u64, stub: u64, table: u64, tier: u64) -> Self {
-        SlotTable { bases: [const { [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_SEGS] }; 4], stride: [thunk, stub, table, tier] }
+        SlotTable {
+            bases: [const { [const { std::sync::atomic::AtomicU64::new(0) }; SLOT_SEGS] }; 4],
+            stride: [thunk, stub, table, tier],
+            callable_hook: std::sync::atomic::AtomicUsize::new(0),
+            callable_ctx: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 
     /// Slots in segment `seg`.
@@ -467,6 +475,24 @@ impl SlotTable {
         self.bases[kind][seg].load(std::sync::atomic::Ordering::Acquire) + ix as u64 * self.stride[kind]
     }
     pub fn thunk(&self, id: u32) -> u64 { self.addr(SK_THUNK, id) }
+    /// The embedder decides what address a slot has as a value (a function pointer): `hook(ctx,
+    /// id, thunk)` answers it. Android: a C-ABI function handed to a system library is called
+    /// through a stub inside the host library, as those libraries check indirect calls
+    /// (CFI) against the code they know.
+    pub fn set_callable_hook(&self, hook: fn(usize, u32, u64) -> u64, ctx: usize) {
+        self.callable_ctx.store(ctx, std::sync::atomic::Ordering::Relaxed);
+        self.callable_hook.store(hook as usize, std::sync::atomic::Ordering::Release);
+    }
+    /// The address of the slot as a value: its thunk, unless the embedder's hook says otherwise.
+    pub fn callable(&self, id: u32) -> u64 {
+        let thunk = self.thunk(id);
+        let h = self.callable_hook.load(std::sync::atomic::Ordering::Acquire);
+        if h == 0 {
+            return thunk;
+        }
+        let hook: fn(usize, u32, u64) -> u64 = unsafe { std::mem::transmute(h) };
+        hook(self.callable_ctx.load(std::sync::atomic::Ordering::Relaxed), id, thunk)
+    }
     pub fn stub(&self, id: u32) -> u64 { self.addr(SK_STUB, id) }
     /// The function table word of a slot.
     pub fn table(&self, id: u32) -> u64 { self.addr(SK_TABLE, id) }
@@ -505,6 +531,10 @@ impl SlotsPtr {
     }
     pub fn thunk(&self, id: u32) -> u64 {
         if self.0.is_null() { 0 } else { unsafe { (*self.0).thunk(id) } }
+    }
+    /// The slot's address as a value (SlotTable::callable).
+    pub fn callable(&self, id: u32) -> u64 {
+        if self.0.is_null() { 0 } else { unsafe { (*self.0).callable(id) } }
     }
 }
 

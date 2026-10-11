@@ -12,6 +12,8 @@
 //! - `makepad_cli_main`: Relax's command line, for the APK's executable (build scripts run as it).
 
 pub mod boot;
+#[cfg(all(target_os = "android", target_arch = "aarch64"))]
+mod trampolines;
 #[cfg(target_os = "android")]
 mod jni;
 #[cfg(target_os = "android")]

@@ -212,6 +212,38 @@ mod imp {
     /// Handles of the libraries `load_library` opened.
     static LOADED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+    /// The stub pool of the host library: `count` stubs of 16 bytes from `base`, each jumping to
+    /// the address in its word of `table` (android_host/src/trampolines.rs).
+    struct Pool {
+        base: u64,
+        table: *mut u64,
+        count: usize,
+        used: std::collections::HashMap<u64, u64>,
+    }
+    unsafe impl Send for Pool {}
+    static POOL: std::sync::Mutex<Option<Pool>> = std::sync::Mutex::new(None);
+
+    pub fn set_trampolines(base: u64, table: *mut u64, count: usize) {
+        *POOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pool { base, table, count, used: std::collections::HashMap::new() });
+    }
+
+    /// An address in the host library that jumps to `target`, one per target. System libraries
+    /// (libaaudio ...) check an indirect call's target against the libraries they know (CFI) and
+    /// crash on JIT memory: C code is given these instead of a thunk of the JIT.
+    pub fn trampoline(target: u64) -> u64 {
+        let mut guard = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pool) = guard.as_mut() else { return target };
+        if let Some(&a) = pool.used.get(&target) {
+            return a;
+        }
+        let i = pool.used.len();
+        assert!(i < pool.count, "the host library's {} C-callable stubs are all in use", pool.count);
+        unsafe { *pool.table.add(i) = target };
+        let a = pool.base + 16 * i as u64;
+        pool.used.insert(target, a);
+        a
+    }
+
     // NDK r28 dlfcn.h:169 RTLD_DEFAULT = 0, :191 RTLD_NOW = 2,
     // :204 RTLD_GLOBAL = 0x100 on LP64.
     pub unsafe fn find(name: *const u8) -> *mut u8 {

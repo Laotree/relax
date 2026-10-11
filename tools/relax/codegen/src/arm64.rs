@@ -117,7 +117,7 @@ impl Env {
         match r {
             Reloc::Sym(s) => unsafe { s.value(self.syms) },
             Reloc::Slot(id) => self.slots.table(id),
-            Reloc::Thunk(id) => self.slots.thunk(id),
+            Reloc::Thunk(id) => self.slots.callable(id),
             // the TSD slot's byte offset (ldr x16, [x16, x17])
             Reloc::TlsKey => self.tls_key * 8,
             Reloc::TlsSlow => self.tls_slow,

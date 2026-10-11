@@ -51,6 +51,7 @@ pub unsafe extern "system" fn JNI_OnLoad(vm: *mut sys::JavaVM, _: *mut c_void) -
 pub fn name_host_library() {
     let h = unsafe { dlopen(c"libmakepad.so".as_ptr(), RTLD_NOW | RTLD_NOLOAD) };
     relax_compiler::os::proc::set_host_library(h as *mut u8);
+    crate::trampolines::register();
 }
 
 unsafe fn jstring_to_string(env: *mut sys::JNIEnv, s: sys::jstring) -> String {
@@ -124,22 +125,26 @@ unsafe fn asset_text(manager: *mut c_void, name: &str) -> Result<String, String>
     String::from_utf8(buf).map_err(|_| format!("asset {name} is not UTF-8"))
 }
 
-struct Conf {
+struct App {
     package: String,
     cargo_flags: Vec<String>,
+}
+
+struct Conf {
+    /// the apps the APK carries (`app=<package>`, then its `flag=` lines); the first is the default
+    apps: Vec<App>,
     /// environment of the process (`env=KEY=VALUE`: MAKEPAD_TRACE, SANDBOX_MUTE, ...)
     env: Vec<(String, String)>,
 }
 
 fn parse_conf(text: &str) -> Result<Conf, String> {
-    let mut package = None;
-    let mut cargo_flags = Vec::new();
+    let mut apps: Vec<App> = Vec::new();
     let mut env = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let (k, v) = line.split_once('=').ok_or_else(|| format!("{CONF_ASSET}: bad line {line:?}"))?;
         match k {
-            "package" => package = Some(v.to_string()),
-            "flag" => cargo_flags.push(v.to_string()),
+            "app" => apps.push(App { package: v.to_string(), cargo_flags: Vec::new() }),
+            "flag" => apps.last_mut().ok_or_else(|| format!("{CONF_ASSET}: flag before app"))?.cargo_flags.push(v.to_string()),
             "env" => {
                 let (k, val) = v.split_once('=').ok_or_else(|| format!("{CONF_ASSET}: env wants KEY=VALUE, got {v:?}"))?;
                 env.push((k.to_string(), val.to_string()));
@@ -147,11 +152,14 @@ fn parse_conf(text: &str) -> Result<Conf, String> {
             _ => return Err(format!("{CONF_ASSET}: unknown key {k:?}")),
         }
     }
-    Ok(Conf { package: package.ok_or_else(|| format!("{CONF_ASSET}: no package"))?, cargo_flags, env })
+    if apps.is_empty() {
+        return Err(format!("{CONF_ASSET}: no app"));
+    }
+    Ok(Conf { apps, env })
 }
 
 /// `RunActivity.boot(Class nativeClass, String natives, String apkPath, String filesDir, String cacheDir,
-/// String libDir, AssetManager assets)`: `natives` is one `name:signature` line per native method of
+/// String libDir, AssetManager assets, String app)` (`app`: the package to run, empty for the APK's first): `natives` is one `name:signature` line per native method of
 /// MakepadNative. Returns at once; `status()` follows the boot.
 #[no_mangle]
 pub unsafe extern "system" fn Java_dev_makepad_run_RunActivity_boot(
@@ -164,6 +172,7 @@ pub unsafe extern "system" fn Java_dev_makepad_run_RunActivity_boot(
     cache_dir: sys::jstring,
     lib_dir: sys::jstring,
     assets: sys::jobject,
+    app: sys::jstring,
 ) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     let mut first = false;
@@ -172,6 +181,11 @@ pub unsafe extern "system" fn Java_dev_makepad_run_RunActivity_boot(
         return;
     }
     logcat::redirect_stdio();
+    // a panic of the host's own code (the compiler) is written to logcat before it can abort the process
+    std::panic::set_hook(Box::new(|info| {
+        logcat::log(&format!("host panic: {info}"));
+        logcat::log(&format!("{}", std::backtrace::Backtrace::force_capture()));
+    }));
     let new_global = (**env).NewGlobalRef.unwrap();
     let native_class = new_global(env, native_class) as usize;
     let assets = new_global(env, assets);
@@ -181,9 +195,10 @@ pub unsafe extern "system" fn Java_dev_makepad_run_RunActivity_boot(
     let files = PathBuf::from(jstring_to_string(env, files_dir));
     let cache = jstring_to_string(env, cache_dir);
     let lib_dir = PathBuf::from(jstring_to_string(env, lib_dir));
+    let app = jstring_to_string(env, app);
     boot::set_state("starting", String::new());
     let spawned = std::thread::Builder::new().name("relax-boot".into()).stack_size(64 << 20).spawn(move || {
-        let result = boot_thread(manager as *mut c_void, &natives, &apk, &files, &cache, &lib_dir, native_class as sys::jclass);
+        let result = boot_thread(manager as *mut c_void, &natives, &apk, &files, &cache, &lib_dir, &app, native_class as sys::jclass);
         match result {
             Ok(()) => boot::set_state("ready", String::new()),
             Err(e) => {
@@ -208,6 +223,7 @@ fn boot_thread(
     files: &std::path::Path,
     cache: &str,
     lib_dir: &std::path::Path,
+    app: &str,
     native_class: sys::jclass,
 ) -> Result<(), String> {
     name_host_library();
@@ -225,9 +241,15 @@ fn boot_thread(
         std::env::set_var(k, v);
     }
     let (offset, len) = unsafe { asset_range(manager, ARCHIVE_ASSET)? };
+    let chosen = if app.is_empty() {
+        conf.apps.into_iter().next()
+    } else {
+        conf.apps.into_iter().find(|a| a.package == app)
+    }
+    .ok_or_else(|| format!("the APK does not carry the app {app:?}"))?;
     let b = Boot {
-        package: conf.package,
-        cargo_flags: conf.cargo_flags,
+        package: chosen.package,
+        cargo_flags: chosen.cargo_flags,
         exports: vec!["Java_dev_makepad_android_".to_string(), "jni_on_load".to_string()],
         source: Source::Archive { file: apk.to_path_buf(), offset, len },
         exe: lib_dir.join("libmakepad_exe.so"),

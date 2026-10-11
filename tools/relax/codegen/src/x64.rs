@@ -102,7 +102,7 @@ impl Env {
         match r {
             Reloc::Sym(s) => unsafe { s.value(self.syms) },
             Reloc::Slot(id) => self.slots.table(id),
-            Reloc::Thunk(id) => self.slots.thunk(id),
+            Reloc::Thunk(id) => self.slots.callable(id),
             // fs-relative offset of the block pointer cell (mov r11, fs:[rax])
             Reloc::TlsKey => self.tls_key,
             Reloc::TlsSlow => self.tls_slow,
