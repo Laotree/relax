@@ -320,6 +320,16 @@ fn gen_int(o: &mut String, t: &Int) {
     // pow etc (release semantics: wrapping)
     let _ = writeln!(o, "    pub const fn pow(self, exp: u32) -> {n} {{ self.wrapping_pow(exp) }}");
     let _ = writeln!(o, "    pub const fn abs_diff(self, other: {n}) -> {u} {{ if self < other {{ (other as {u}).wrapping_sub(self as {u}) }} else {{ (self as {u}).wrapping_sub(other as {u}) }} }}");
+    // library/core/src/num/mod.rs:129-186 midpoint_impl!: a type with a wider integer widens, the
+    // 128-bit types use the branchless algorithm (the signed one rounds toward zero)
+    if b < 128 {
+        let w = format!("{}{}", if t.signed { 'i' } else { 'u' }, b * 2);
+        let _ = writeln!(o, "    pub const fn midpoint(self, rhs: {n}) -> {n} {{ ((self as {w} + rhs as {w}) / 2) as {n} }}");
+    } else if t.signed {
+        let _ = writeln!(o, "    pub const fn midpoint(self, rhs: {n}) -> {n} {{ let t = ((self ^ rhs) >> 1) + (self & rhs); t + (if t < 0 {{ 1 }} else {{ 0 }} & (self ^ rhs)) }}");
+    } else {
+        let _ = writeln!(o, "    pub const fn midpoint(self, rhs: {n}) -> {n} {{ ((self ^ rhs) >> 1) + (self & rhs) }}");
+    }
     if t.signed {
         let _ = writeln!(o, "    pub const fn abs(self) -> {n} {{ if self < 0 {{ self.wrapping_neg() }} else {{ self }} }}");
         let _ = writeln!(o, "    pub const fn unsigned_abs(self) -> {u} {{ self.wrapping_abs() as {u} }}");
