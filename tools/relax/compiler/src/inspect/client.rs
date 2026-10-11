@@ -26,6 +26,10 @@ fn usage() -> i32 {
 
 pub fn main(args: &[String]) -> i32 {
     let Some(target) = args.first() else { return usage() };
+    // `file=<x.mkgp> gpu prof <query>`: a saved GPU recording, no app
+    if let Some(path) = target.strip_prefix("file=") {
+        return super::gpuprof::file_main(path, &args[1..]);
+    }
     if target == "list" {
         for a in apps() {
             println!("{{\"pid\":{},\"app\":{},\"socket\":{}}}", a.pid, super::json_str(&a.app), super::json_str(&a.socket));

@@ -25,6 +25,7 @@ relax-codegen = { workspace = true }
 # reused when only a layer above changes: relax-base <- relax-front <- relax-types <- relax-compiler
 relax-types = { workspace = true }
 makepad-remote = { workspace = true }
+makepad-gpu-trace = { workspace = true }
 # registry packages a program needs that are neither vendored nor in $CARGO_HOME (registry_net.rs)
 relax-light-http = { workspace = true }
 relax-native-macros = { workspace = true }

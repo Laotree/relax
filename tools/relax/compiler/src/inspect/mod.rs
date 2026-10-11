@@ -12,6 +12,7 @@ pub mod client;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod cfi;
 pub mod events;
+pub mod gpuprof;
 mod hang;
 pub mod heap;
 pub mod instrument;
@@ -187,7 +188,7 @@ fn help(req: &Req, out: &mut Out) {
         return;
     }
     out.measured("commands", "static", &[]);
-    for (name, args, what) in COMMANDS {
+    for (name, args, what) in COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS) {
         if let Some(w) = req.pos.first() {
             if w != name {
                 continue;
@@ -200,7 +201,7 @@ fn help(req: &Req, out: &mut Out) {
 /// A tool definition for agent / MCP-style clients: one tool, `relax_inspect`, whose `command`
 /// is one line of this protocol.
 pub fn schema() -> String {
-    let cmds: Vec<String> = COMMANDS.iter().map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
+    let cmds: Vec<String> = COMMANDS.iter().chain(makepad_gpu_trace::query::COMMANDS).map(|(n, a, w)| format!("{} {} -- {}", n, a, w)).collect();
     format!(
         "{{\"name\":\"relax_inspect\",\"description\":{},\"input_schema\":{{\"type\":\"object\",\"properties\":{{\"target\":{{\"type\":\"string\",\"description\":\"pid, app name, or all\"}},\"command\":{{\"type\":\"string\",\"description\":\"one request line, e.g. `why-hung` or `stacks thread=main`\"}}}},\"required\":[\"target\",\"command\"]}}}}",
         json_str(&format!("Ask a running relax app about itself. Run as `relax inspect <target> <command>`. Commands:\n{}", cmds.join("\n")))
