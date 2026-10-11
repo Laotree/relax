@@ -1325,3 +1325,37 @@ pub fn used_slots(f: &Func) -> Vec<bool> {
     }
     used
 }
+
+#[cfg(test)]
+mod slot_table_tests {
+    use super::SlotTable;
+
+    #[test]
+    fn locate_covers_every_id_once() {
+        // segment boundaries: the last id of a segment and the first of the next
+        let mut next = 0u64;
+        for seg in 0..super::SLOT_SEGS {
+            assert_eq!(SlotTable::seg_first(seg), next);
+            let n = SlotTable::seg_slots(seg) as u64;
+            for id in [next, next + 1, next + n - 1] {
+                assert_eq!(SlotTable::locate(id as u32), (seg, (id - next) as usize), "id {}", id);
+            }
+            next += n;
+        }
+        assert_eq!(next, 1 << 32);
+    }
+
+    #[test]
+    fn addresses_and_reverse_lookup() {
+        let t = SlotTable::new(32, 32, 8, 48);
+        let (a, b) = (0x10_0000u64, 0x4000_0000u64);
+        t.install(0, a, a + (1 << 18) * 32, a + (1 << 19) * 32, a + (1 << 19) * 32 + (1 << 18) * 8);
+        t.install(1, b, b + (1 << 18) * 32, b + (1 << 19) * 32, b + (1 << 19) * 32 + (1 << 18) * 8);
+        assert_eq!(t.thunk(5), a + 5 * 32);
+        assert_eq!(t.thunk(1 << 18), b);
+        assert_eq!(t.table((1 << 18) + 3), b + (1 << 19) * 32 + 24);
+        assert_eq!(t.find(2, t.table((1 << 18) + 3)), Some(((1 << 18) + 3, 0)));
+        assert_eq!(t.find(0, a + 5 * 32 + 4), Some((5, 4)));
+        assert_eq!(t.find(0, 0x2000_0000), None);
+    }
+}
