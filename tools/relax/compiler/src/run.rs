@@ -202,6 +202,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 entries.push(args[i + 1].clone());
                 i += 1;
             }
+            "--cfg" if i + 1 < args.len() => {
+                driver_options.cfgs.push(crate::options::Options::cfg_entry(&args[i + 1]));
+                i += 1;
+            }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
             // the parent run's relax dir (dirs.rs): a build script it runs shares it
             "--relax-dir" if i + 1 < args.len() => {
@@ -271,6 +275,36 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         && !crate::vfs::is_virtual(&workspace_dir()) {
         driver_options.live = true;
     }
+    // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`relax run <pkg> --cfg hal`) or
+    // before the package: extra cfgs for the program's crates, not cargo flags
+    let mut cargo_flags_in: Vec<String> = Vec::new();
+    {
+        let mut words = args[i..].iter().cloned();
+        let mut in_prog = false;
+        while let Some(w) = words.next() {
+            if in_prog || w == "--" {
+                in_prog = true;
+                cargo_flags_in.push(w);
+            } else if w == "--cfg" {
+                match words.next() {
+                    Some(v) => driver_options.cfgs.push(crate::options::Options::cfg_entry(&v)),
+                    None => {
+                        eprintln!("relax-run: --cfg wants a value");
+                        return 2;
+                    }
+                }
+            } else if let Some(v) = w.strip_prefix("--cfg=") {
+                driver_options.cfgs.push(crate::options::Options::cfg_entry(v));
+            } else {
+                cargo_flags_in.push(w);
+            }
+        }
+    }
+    let args: &[String] = &{
+        let mut a = args[..i].to_vec();
+        a.extend(cargo_flags_in);
+        a
+    };
     let frozen = std::sync::Arc::new(crate::Session { options: driver_options, runtime: sess.runtime.clone() });
     let sess = &frozen;
     let options = &sess.options;

@@ -214,6 +214,9 @@ pub struct Options {
     pub tier1_profile: Option<std::ffi::OsString>,
     /// Profile replay contents frozen by the driver, separately from its environment path.
     pub tier1_profile_data: Option<String>,
+    /// `--cfg <name>` / `--cfg name="value"` of `relax run|check` (what `RUSTFLAGS=--cfg` is to
+    /// cargo), as `name` / `name=value` entries added to the cfg set the program is read with.
+    pub cfgs: Vec<String>,
     /// Effective target triple, finalized by the driver.
     pub target: String,
     pub cpu: CpuFeatures,
@@ -303,6 +306,7 @@ impl Default for Options {
             spec_order: false,
             tier1_profile: None,
             tier1_profile_data: None,
+            cfgs: Vec::new(),
             target: String::new(),
             cpu: CpuFeatures::default(),
         }
@@ -310,6 +314,14 @@ impl Default for Options {
 }
 
 impl Options {
+    /// One `--cfg` value as a cfg set entry: `name` or `name="value"` (-> `name=value`).
+    pub fn cfg_entry(v: &str) -> String {
+        match v.split_once('=') {
+            Some((k, val)) => format!("{}={}", k.trim(), val.trim().trim_matches('"')),
+            None => v.trim().to_string(),
+        }
+    }
+
     pub fn from_env() -> Self {
         Self::read(&|name| std::env::var_os(name))
     }
@@ -402,6 +414,7 @@ impl Options {
             spec_order: { let os = get("RELAX_SPEC_ORDER"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("lifo") },
             tier1_profile: { let os = get("RELAX_O3_PROFILE"); os },
             tier1_profile_data: None,
+            cfgs: Vec::new(),
             target: String::new(),
             cpu: CpuFeatures::default(),
         }
@@ -491,7 +504,7 @@ impl Options {
             ra_order,
             spec_order,
             tier1_profile,
-            tier1_profile_data, target, cpu,
+            tier1_profile_data, cfgs, target, cpu,
         } = self;
         let mut h = Sip128::new();
         h.str("relax-options-v1");
@@ -633,6 +646,8 @@ impl Options {
         h.u64(inline_leaf.0 as u64); h.u64(inline_leaf.1 as u64);
         h.str("opt");
         h.u64(opt.len() as u64); for v in opt { h.str(v); }
+        h.str("cfgs");
+        h.u64(cfgs.len() as u64); for v in cfgs { h.str(v); }
         h.str("a64");
         h.u64(a64.len() as u64); for v in a64 { h.str(v); }
         h.str("borrowck");

@@ -164,6 +164,7 @@ fn run_page(st: &Style) -> String {
     p.row("--units <json>", "Use a saved unit graph instead of cargo");
     p.row("--agent", "Park panics for an agent; print events on stderr");
     p.row("--heap[=<bytes>]", "Track the heap by stack from the start (inspect heap)");
+    p.row("--cfg <spec>", "Set a cfg for the program (name or name=\"value\"), as RUSTFLAGS=--cfg");
     p.row("--relaxed[=<list>]", "Relaxed Rust for every crate (all, or a list)");
     p.row("--mount <dir>=<git-url>", "Mount another repository at a folder of the\nfirst (repeatable); an optional #ref pins it");
     p.row("--cached", "Run the newest local snapshot at once, and\nrefresh it in the background for next time");
@@ -226,6 +227,7 @@ fn check_page(st: &Style) -> String {
     p.row("--no-serve", "Never use the check server");
     p.row("--watch", "Re-check what each edit invalidates");
     p.row("--deep", "Also compile (with --watch)");
+    p.row("--cfg <spec>", "Set a cfg for the program (name or name=\"value\"), as RUSTFLAGS=--cfg");
     p.text("The other `relax run` options apply too.");
     p.out
 }

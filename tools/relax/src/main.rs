@@ -182,7 +182,7 @@ fn run_package(words: &[String]) -> Option<String> {
     while i < words.len() {
         let w = words[i].as_str();
         match w {
-            "--units" | "--report-to" | "--entry" | "--boundary" | "--relax-dir" => i += 2,
+            "--units" | "--report-to" | "--entry" | "--boundary" | "--relax-dir" | "--cfg" => i += 2,
             _ if w.starts_with("--") => i += 1,
             _ => return Some(w.to_string()),
         }

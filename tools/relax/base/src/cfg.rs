@@ -19,14 +19,18 @@ impl CfgSet {
         // --check`, with cargo's `--target` of the same triple) another platform's code from here
         // and RELAX_CHECK_TARGET=aarch64-apple-darwin / x86_64-unknown-linux-gnu (`relax host-gen`
         // reads the provided crates as each target sees them)
-        match sess.options.check_target {
-            crate::options::CheckTarget::WindowsX64 => return CfgSet::windows_x64(sess, features),
-            crate::options::CheckTarget::MacosArm64 => return CfgSet::macos_arm64(sess, features),
-            crate::options::CheckTarget::LinuxX64 => return CfgSet::linux_x64(sess, features),
-            crate::options::CheckTarget::AndroidArm64 => return CfgSet::android_arm64(sess, features),
-            crate::options::CheckTarget::Host => {}
-        }
-        CfgSet::machine(sess, features)
+        let mut cs = match sess.options.check_target {
+            crate::options::CheckTarget::WindowsX64 => CfgSet::windows_x64(sess, features),
+            crate::options::CheckTarget::MacosArm64 => CfgSet::macos_arm64(sess, features),
+            crate::options::CheckTarget::LinuxX64 => CfgSet::linux_x64(sess, features),
+            crate::options::CheckTarget::AndroidArm64 => CfgSet::android_arm64(sess, features),
+            // machine() adds the extra cfgs itself
+            crate::options::CheckTarget::Host => return CfgSet::machine(sess, features),
+        };
+        // cargo with `--target` applies RUSTFLAGS to the target's artifacts only, not to the
+        // proc-macro world (machine()), which Relax builds for here
+        cs.set.extend(sess.options.cfgs.iter().cloned());
+        cs
     }
 
     /// The machine Relax runs on, whatever RELAX_CHECK_TARGET checks: code Relax itself runs
@@ -34,6 +38,16 @@ impl CfgSet {
     /// another target called that target's OS (Windows' FlsAlloc on Linux): every JIT derive
     /// failed, and `relax host-gen` wrote a short Windows table.
     pub fn machine(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        let mut cs = CfgSet::machine_base(sess, features);
+        // cargo without `--target` (what a Host check target stands for) applies RUSTFLAGS
+        // `--cfg` to everything it builds, proc macros and build scripts included
+        if sess.options.check_target == crate::options::CheckTarget::Host {
+            cs.set.extend(sess.options.cfgs.iter().cloned());
+        }
+        cs
+    }
+
+    fn machine_base(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
         if cfg!(target_os = "android") {
             CfgSet::android_arm64(sess, features)
         } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
