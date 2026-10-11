@@ -1,6 +1,7 @@
 //! Carriers: what a connection runs over. Each produces a `FrameReader`, a writer and a shutdown
 //! function; the handshake and everything above are the same for all of them.
 
+pub mod loopback;
 pub mod stdio;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod tcp;

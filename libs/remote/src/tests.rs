@@ -582,3 +582,27 @@ fn gq_grabs_every_window_then_quits() {
         let _ = std::fs::remove_dir(std::path::Path::new(&f).parent().unwrap());
     }
 }
+
+#[test]
+fn loopback_carrier_requires_its_token_and_end_lines_carry_host_fields() {
+    let ep = Endpoint::new("loop-test");
+    ep.register_cmd(dispatch);
+    ep.set_end_fields(|s| s.push_str(",\"user_seq\":7"));
+    let token = crate::carrier::loopback::new_token().unwrap();
+    assert_eq!(token.len(), 64);
+    let addr = crate::carrier::loopback::serve(&ep, &token).unwrap().to_string();
+    let good = Client::new(Target::Loopback(addr.clone(), token.clone()), "good");
+    let mut lines = good.cmd("ping").unwrap();
+    assert_eq!(lines.next().unwrap().unwrap(), "{\"pong\":1}");
+    assert!(lines.next().is_none());
+    let end = lines.end().unwrap().to_string();
+    assert!(end.starts_with("{\"end\":\"ping\"") && end.ends_with(",\"user_seq\":7}"), "{end}");
+    for wrong in [String::new(), "0".repeat(64), token[..63].to_string()] {
+        let bad = Client::new(Target::Loopback(addr.clone(), wrong), "bad");
+        match bad.cmd("ping") {
+            Err(Error::Refused(_, why)) => assert!(why.contains("token"), "{why}"),
+            _ => panic!("a peer without the token must be refused"),
+        }
+    }
+    assert!(crate::carrier::loopback::dial("192.0.2.3:80").is_err(), "only loopback is dialled");
+}

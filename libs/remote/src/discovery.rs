@@ -36,7 +36,24 @@ pub(crate) fn alive(pid: u32) -> bool {
         }
         unsafe { kill(pid as i32, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut core::ffi::c_void;
+            fn GetExitCodeProcess(h: *mut core::ffi::c_void, code: *mut u32) -> i32;
+            fn CloseHandle(h: *mut core::ffi::c_void) -> i32;
+        }
+        // PROCESS_QUERY_LIMITED_INFORMATION; STILL_ACTIVE = 259
+        let h = unsafe { OpenProcess(0x1000, 0, pid) };
+        if h.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(h, &mut code) } != 0 && code == 259;
+        unsafe { CloseHandle(h) };
+        ok
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false

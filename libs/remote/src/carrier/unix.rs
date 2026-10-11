@@ -158,9 +158,32 @@ pub use imp::*;
 #[cfg(windows)]
 mod imp {
     use super::*;
-    pub fn listen(_ep: &Endpoint, _extra: &str) -> io::Result<PathBuf> {
-        let _ = cleanup as extern "C" fn();
-        Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))
+    /// No Unix sockets here: the endpoint listens on loopback TCP (ephemeral port) behind a random
+    /// token, both written to the discovery file `{"pid","app","socket":"tcp:127.0.0.1:PORT",
+    /// "token","started_ms","caps"}` (+ `extra`). Returns `tcp:127.0.0.1:PORT`.
+    pub fn listen(ep: &Endpoint, extra: &str) -> io::Result<PathBuf> {
+        let _ = crate::cmd::now_ms();
+        let token = crate::carrier::loopback::new_token()?;
+        let addr = crate::carrier::loopback::serve(ep, &token)?;
+        let socket = format!("tcp:{addr}");
+        let pid = std::process::id();
+        let caps: Vec<String> = ep.caps().iter().map(|c| crate::cmd::json_str(c)).collect();
+        let info = format!(
+            "{{\"pid\":{},\"app\":{},\"socket\":{},\"token\":{},\"started_ms\":{},\"caps\":[{}]{}}}\n",
+            pid,
+            crate::cmd::json_str(ep.app()),
+            crate::cmd::json_str(&socket),
+            crate::cmd::json_str(&token),
+            crate::cmd::wall_ms(),
+            caps.join(","),
+            extra
+        );
+        std::fs::write(paths(pid).1, info)?;
+        extern "C" {
+            fn atexit(f: extern "C" fn()) -> i32;
+        }
+        unsafe { atexit(cleanup) };
+        Ok(PathBuf::from(socket))
     }
     pub fn listen_at(_ep: &Endpoint, _path: &Path) -> io::Result<()> {
         Err(io::Error::new(io::ErrorKind::Unsupported, "makepad-remote is not available on Windows yet"))

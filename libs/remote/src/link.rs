@@ -43,6 +43,10 @@ impl From<io::Error> for Error {
 #[derive(Clone)]
 pub enum Target {
     Unix(PathBuf),
+    /// `127.0.0.1:PORT` and the token of the discovery file (the local carrier where there are no
+    /// Unix sockets)
+    #[cfg(not(target_arch = "wasm32"))]
+    Loopback(String, String),
     /// `host:port` and the credentials of the pairing
     #[cfg(not(target_arch = "wasm32"))]
     Tcp(String, Arc<makepad_network::tunnel::ClientCredentials>),
@@ -74,13 +78,16 @@ impl Client {
 
     /// Dials a local endpoint: `spec` is a socket path, a pid or an app name (discovery files).
     pub fn connect(spec: &str) -> Result<Client, Error> {
-        let path = if spec.contains('/') || spec.ends_with(".sock") {
-            PathBuf::from(spec)
+        let target = if spec.contains('/') || spec.ends_with(".sock") {
+            Target::Unix(PathBuf::from(spec))
         } else {
             let app = crate::discovery::find(spec).ok_or_else(|| Error::Refused(CLOSE_LINK_LOST, format!("no running makepad-remote endpoint `{spec}`")))?;
-            PathBuf::from(app.socket)
+            match app.socket.strip_prefix("tcp:") {
+                Some(addr) => Target::Loopback(addr.to_string(), app.text("token").unwrap_or_default()),
+                None => Target::Unix(PathBuf::from(app.socket)),
+            }
         };
-        let c = Client::new(Target::Unix(path), "client");
+        let c = Client::new(target, "client");
         c.conn()?;
         Ok(c)
     }
@@ -115,6 +122,11 @@ impl Client {
                 }
             }
             #[cfg(not(target_arch = "wasm32"))]
+            Target::Loopback(addr, _) => {
+                let (c, keep) = carrier::loopback::dial(addr)?;
+                Ok((c, Some(Box::new(move || carrier::loopback::settle(&keep)))))
+            }
+            #[cfg(not(target_arch = "wasm32"))]
             Target::Tcp(addr, creds) => Ok((carrier::tcp::dial(addr, creds)?, None)),
             Target::Command(argv) => {
                 let (first, rest) = argv.split_first().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
@@ -133,7 +145,12 @@ impl Client {
         }
         let (mut car, settle) = self.carrier().map_err(|e| Error::LinkLost(e.to_string()))?;
         car.reader.deadline = Some(std::time::Instant::now() + Duration::from_secs(10));
-        let hello = Hello { name: self.0.name.clone(), link_id: self.0.link_id.clone(), ..Hello::default() };
+        let token = match &self.0.target {
+            #[cfg(not(target_arch = "wasm32"))]
+            Target::Loopback(_, token) => token.clone(),
+            _ => String::new(),
+        };
+        let hello = Hello { name: self.0.name.clone(), link_id: self.0.link_id.clone(), token, ..Hello::default() };
         let ok = match hello::client_handshake(&mut car.reader, &mut *car.writer, &hello) {
             Ok(ok) => ok,
             Err(e) => {

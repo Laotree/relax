@@ -29,6 +29,7 @@ struct Inner {
     hooks: Mutex<Hooks>,
     ring: Arc<Ring>,
     accept: Mutex<Option<AcceptHook>>,
+    end_fields: cmd::EndFields,
 }
 
 /// Called with every connection the endpoint accepts, once its handshake is done.
@@ -44,7 +45,7 @@ impl Endpoint {
 
     /// An endpoint whose replay ring holds `ring_bytes` of stream chunks.
     pub fn with_ring(app: &str, ring_bytes: usize) -> Endpoint {
-        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None) }))
+        Endpoint(Arc::new(Inner { app: app.to_string(), services: RwLock::new(Vec::new()), hooks: Mutex::new(Hooks::default()), ring: Arc::new(Ring::new(ring_bytes)), accept: Mutex::new(None), end_fields: Default::default() }))
     }
 
     /// Listens on this process's Unix socket and writes the discovery file (register the services
@@ -80,7 +81,12 @@ impl Endpoint {
 
     /// The `cmd` service, answered by `dispatch`.
     pub fn register_cmd(&self, dispatch: fn(&Req, &mut Out)) {
-        self.register("cmd", 1, cmd::service(dispatch));
+        self.register("cmd", 1, cmd::service(dispatch, self.0.end_fields.clone()));
+    }
+
+    /// Adds fields to the `end` line of every `cmd` answer: `f` appends `,"key":value` text.
+    pub fn set_end_fields(&self, f: fn(&mut String)) {
+        *self.0.end_fields.lock().unwrap() = Some(f);
     }
 
     /// The `watch` service; events are published through the returned sink.
@@ -124,9 +130,15 @@ impl Endpoint {
     /// Runs the endpoint side of the handshake on a carrier and, if the peer is acceptable, starts
     /// the connection. A different protocol major version is refused with a message that names
     /// both versions.
-    pub fn serve(&self, mut reader: FrameReader, mut writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>) -> Result<Conn, HandshakeError> {
+    pub fn serve(&self, reader: FrameReader, writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>) -> Result<Conn, HandshakeError> {
+        self.serve_checked(reader, writer, shutdown, "")
+    }
+
+    /// As [`serve`](Self::serve), refusing a peer whose HELLO does not carry `token` (when it is
+    /// not empty): the loopback carrier's shared secret.
+    pub fn serve_checked(&self, mut reader: FrameReader, mut writer: Box<dyn Write + Send>, shutdown: Box<dyn Fn() + Send + Sync>, token: &str) -> Result<Conn, HandshakeError> {
         reader.deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
-        let own = Hello { name: self.0.app.clone(), caps: self.caps(), ..Hello::default() };
+        let own = Hello { name: self.0.app.clone(), caps: self.caps(), token: token.to_string(), ..Hello::default() };
         let peer = match hello::server_handshake(&mut reader, &mut *writer, &own) {
             Ok(p) => p,
             Err(e) => {

@@ -22,16 +22,27 @@ pub fn now_ms() -> u64 {
 /// Answers one request line in memory: the reply's JSON lines (no `end` line) and whether it was
 /// cut at the size limit. For hosts that call a program's commands directly (`relax inspect`).
 pub fn answer(dispatch: fn(&Req, &mut Out), line: &str) -> (Vec<u8>, bool) {
-    let req = Req::parse(line);
     let mut buf: Vec<u8> = Vec::new();
-    let mut out = Out { w: &mut buf, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true };
+    let truncated = answer_to(dispatch, line, &mut buf);
+    (buf, truncated)
+}
+
+/// As [`answer`], writing the reply's lines to `w` as they are produced (a host streams them on).
+/// Returns whether the reply was cut at the size limit.
+pub fn answer_to(dispatch: fn(&Req, &mut Out), line: &str, w: &mut dyn Write) -> bool {
+    let req = Req::parse(line);
+    let mut out = Out { w, bytes: 0, limit: if req.get("full") == Some("1") { usize::MAX } else { LIMIT }, truncated: false, ok: true };
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(&req, &mut out)));
     if r.is_err() {
         out.err("internal error in this command (inspect bug)");
     }
-    let truncated = out.truncated;
-    (buf, truncated)
+    out.truncated
 }
+
+/// Host-provided fields for the `end` line of every answer: the function appends `,"key":value`
+/// text (the platform reports the user sequence this way). Runs on the command's thread, right
+/// after its dispatch.
+pub type EndFields = Arc<std::sync::Mutex<Option<fn(&mut String)>>>;
 
 
 /// A reply being written: JSON lines, bounded (a reply never grows past `LIMIT` bytes unless the
@@ -246,14 +257,15 @@ impl Write for ChanWriter {
 }
 
 /// The `cmd` service served by `dispatch`.
-pub fn service(dispatch: fn(&Req, &mut Out)) -> Factory {
+pub fn service(dispatch: fn(&Req, &mut Out), end_fields: EndFields) -> Factory {
     Arc::new(move |conn, open| {
         let hooks = conn.hooks();
+        let end_fields = end_fields.clone();
         std::thread::Builder::new()
             .name("makepad-remote-cmd".into())
             .spawn(move || {
                 (hooks.enter)();
-                serve(open.channel, dispatch);
+                serve(open.channel, dispatch, end_fields);
                 (hooks.exit)();
             })
             .map(|_| ())
@@ -261,7 +273,7 @@ pub fn service(dispatch: fn(&Req, &mut Out)) -> Factory {
     })
 }
 
-fn serve(ch: crate::conn::Channel, dispatch: fn(&Req, &mut Out)) {
+fn serve(ch: crate::conn::Channel, dispatch: fn(&Req, &mut Out), end_fields: EndFields) {
     let mut w = ChanWriter { tx: ch.tx(), buf: Vec::new() };
     while let Some(ev) = ch.recv() {
         let data = match ev {
@@ -283,7 +295,11 @@ fn serve(ch: crate::conn::Channel, dispatch: fn(&Req, &mut Out)) {
                 out.err("internal error in this command (inspect bug)");
             }
             let trunc = out.truncated;
-            out.always(&format!("{{\"end\":{},\"ms\":{}{}}}", json_str(&cmd), t.elapsed().as_millis(), if trunc { ",\"truncated\":true" } else { "" }));
+            let mut extra = String::new();
+            if let Some(fields) = *end_fields.lock().unwrap_or_else(|e| e.into_inner()) {
+                fields(&mut extra);
+            }
+            out.always(&format!("{{\"end\":{},\"ms\":{}{}{}}}", json_str(&cmd), t.elapsed().as_millis(), if trunc { ",\"truncated\":true" } else { "" }, extra));
             if !out.flush() {
                 ch.close(CLOSE_NORMAL, "");
                 return;

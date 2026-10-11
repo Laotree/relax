@@ -24,6 +24,9 @@ pub struct Hello {
     pub link_id: String,
     /// `service/version` of every service served (HELLO_OK only)
     pub caps: Vec<String>,
+    /// the shared secret of a loopback carrier (in HELLO; an endpoint's own value is the one it
+    /// requires)
+    pub token: String,
 }
 
 fn clean(s: &str) -> String {
@@ -32,6 +35,9 @@ fn clean(s: &str) -> String {
 
 fn encode(op: u8, h: &Hello) -> Vec<u8> {
     let mut s = format!("major={}\nminor={}\nrole={}\nname={}\nlink_id={}\n", h.major, h.minor, clean(&h.role), clean(&h.name), clean(&h.link_id));
+    if op == OP_HELLO && !h.token.is_empty() {
+        s.push_str(&format!("token={}\n", clean(&h.token)));
+    }
     for c in &h.caps {
         s.push_str(&format!("cap={}\n", clean(c)));
     }
@@ -51,6 +57,7 @@ fn decode(body: &[u8]) -> Hello {
             "role" => h.role = v.into(),
             "name" => h.name = v.into(),
             "link_id" => h.link_id = v.into(),
+            "token" => h.token = v.into(),
             "cap" => h.caps.push(v.into()),
             _ => {}
         }
@@ -156,6 +163,11 @@ pub fn client_handshake(r: &mut FrameReader, w: &mut dyn Write, hello: &Hello) -
     }
 }
 
+/// Equal, without stopping at the first difference.
+fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
+}
+
 /// Endpoint side: reads HELLO, answers HELLO_OK with `own` (its name and caps) or refuses a
 /// different major version with a message naming both.
 pub fn server_handshake(r: &mut FrameReader, w: &mut dyn Write, own: &Hello) -> Result<Hello, HandshakeError> {
@@ -170,7 +182,13 @@ pub fn server_handshake(r: &mut FrameReader, w: &mut dyn Write, own: &Hello) -> 
         let _ = w.flush();
         return Err(HandshakeError::Mismatch(msg));
     }
-    let mine = Hello { major: PROTO_MAJOR, minor: PROTO_MINOR, role: "endpoint".into(), link_id: peer.link_id.clone(), ..own.clone() };
+    if !own.token.is_empty() && !same_secret(&own.token, &peer.token) {
+        let msg = "this endpoint requires the token from its discovery file".to_string();
+        let _ = write_frame(w, 0, kind::DATA, 0, &encode_goodbye(&msg));
+        let _ = w.flush();
+        return Err(HandshakeError::Mismatch(msg));
+    }
+    let mine = Hello { major: PROTO_MAJOR, minor: PROTO_MINOR, role: "endpoint".into(), link_id: peer.link_id.clone(), token: String::new(), ..own.clone() };
     write_frame(w, 0, kind::DATA, 0, &encode(OP_HELLO_OK, &mine))?;
     w.flush()?;
     Ok(peer)
