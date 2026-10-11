@@ -1162,7 +1162,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // with its code; std::process::__relax_lang_start::<T>(main) does the same.
     // (a `#[no_main]` crate's `extern "C" fn main(argc, argv) -> c_int` is called as before)
     let main_ret = u.tcx.fn_sig(&u.prog, main_def).filter(|s| !s.header.abi.is_c_like()).map(|s| s.ret);
-    let r = match main_ret {
+    // a program that links the HAL (makepad_hal is provided: its ops are the host's) gives the
+    // process's main thread to the HAL's window system; its `main` runs on a thread of the host's
+    let hosted = MAIN_HOST.get().copied().filter(|_| u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_hal"));
+    let (start, arg) = match main_ret {
         Some(ret) if ret != u.tcx.tys.unit => {
             let start = (0..u.prog.defs.len() as u32)
                 .map(DefId)
@@ -1175,8 +1178,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             match start {
                 Some(sd) => {
                     let sid = u.fn_id(FnKey::Inst(sd, vec![ret]));
-                    let sentry = u.entry(sid);
-                    unsafe { jit::call_jit(up, sentry, entry) }
+                    (u.entry(sid), entry)
                 }
                 None => {
                     eprintln!("relax-run: `fn main` returns a value but std has no process::__relax_lang_start");
@@ -1187,8 +1189,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 }
             }
         }
-        _ => unsafe { jit::call_jit(up, entry, 0) },
+        _ => (entry, 0),
     };
+    let r = run_main(up, start, arg, hosted);
     let code = match r {
         Ok(_) => 0,
         Err(p) => {
@@ -1205,6 +1208,33 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // unit must outlive cmd_run (dropping it here freed it under them)
     std::mem::forget(u);
     code
+}
+
+/// How the host runs a program's `main`: it is handed the call and must run it to its end on a
+/// thread of its choosing, returning when it is done (the binary's HAL host: the process's main
+/// thread becomes the window system's, `main` runs on a thread of its own).
+pub type MainHost = fn(Box<dyn FnOnce() + Send>);
+
+static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
+
+/// Registers the host for programs that link the HAL (once, before `cmd_run`).
+pub fn set_main_host(host: MainHost) {
+    let _ = MAIN_HOST.set(host);
+}
+
+/// Calls the program's entry: here, or through the main host.
+fn run_main(up: *mut Unit, entry: u64, arg: u64, host: Option<MainHost>) -> Result<u64, crate::jit::PanicInfo> {
+    let Some(host) = host else { return unsafe { jit::call_jit(up, entry, arg) } };
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let out = slot.clone();
+    let up = up as usize;
+    host(Box::new(move || {
+        jit::ensure_altstack();
+        let r = unsafe { jit::call_jit(up as *mut Unit, entry, arg) };
+        *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    }));
+    let r = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    r.expect("the main host returned before the program's main ended")
 }
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
