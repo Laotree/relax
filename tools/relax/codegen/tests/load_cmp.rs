@@ -108,7 +108,7 @@ fn branch_fn(sz: u8, sx: bool) -> Func {
 
 #[test]
 fn branch_on_a_loaded_value_tests_its_bytes() {
-    let env = x64::Env { table_base: 0, thunk_base: 0, thunk_size: 0, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
+    let env = x64::Env { slots: relax_codegen::rir::SlotsPtr::NONE, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: true, syms: 0, sym_class: 0 };
     for sz in [1u8, 2, 4, 8] {
         for sx in [false, true] {
             let c = x64::compile(&relax_session::Options::default(), &branch_fn(sz, sx), &env).unwrap();
