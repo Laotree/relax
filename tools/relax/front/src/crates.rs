@@ -330,7 +330,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
     }
     std::thread::scope(|scope| {
         for _ in 0..threads {
-            scope.spawn(|| loop {
+            scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); loop {
                 let job = {
                     let mut s = state.lock().unwrap();
                     loop {
@@ -404,7 +404,7 @@ pub fn discover(sess: &std::sync::Arc<crate::Session>, crates: &[CrateUnit], cfg
                 s.files.push(SrcFile { crate_idx: job.crate_idx, path: job.path, edition: job.edition, src, mod_rs: job.mod_rs, active: job.active });
                 s.active -= 1;
                 cv.notify_all();
-            });
+            } });
         }
     });
     let s = state.into_inner().unwrap();

@@ -1700,7 +1700,7 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
     let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = std::thread::scope(|sc| {
         let mut hs = Vec::new();
         for _ in 0..jobs.min(sites.len()) {
-            hs.push(sc.spawn(|| {
+            hs.push(sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                 let mut out = Vec::new();
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

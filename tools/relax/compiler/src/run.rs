@@ -1273,7 +1273,7 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
 /// program's own execution, not with its compiles.
 fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
     let upn = up as usize;
-    std::thread::spawn(move || {
+    std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let up = upn as *mut Unit;
         let t = Instant::now();
         let mut n = 0;
@@ -1347,7 +1347,7 @@ fn spill_cache() {
     }) else { return };
     if let Some(s) = spill {
         // its own thread: the monitor loop's other duties (errors, trims) do not wait for the disk
-        std::thread::spawn(move || {
+        std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let t = Instant::now();
             let r = s.write();
             if !VERBOSE.load(Ordering::Relaxed) {
@@ -1433,7 +1433,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         };
         Some((drops, pending, spill, at, landmark, retired))
     }) else { return false };
-    std::thread::spawn(move || {
+    std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let result = spill.map(|s| s.write());
         // Borrowck already releases its body-owned queries at each completed check.
         let before = crate::memstat::process_rss();
@@ -1550,7 +1550,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     mid_last = main_ms;
                     let busy = mid_busy.clone();
                     let quiet = record || mid_quiet >= 20;
-                    let _ = std::thread::Builder::new().name("relax-cache-write".to_string()).spawn(move || {
+                    let _ = std::thread::Builder::new().name("relax-cache-write".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
                         let t = Instant::now();
                         let r = mid_flush(quiet, record);
@@ -1929,7 +1929,7 @@ pub(crate) extern "C" fn relax_quit_requested() {
     if jit::FIRST_PRESENT.load(Ordering::Acquire) {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
     }
-    let _ = std::thread::Builder::new().name("relax-quit-write".to_string()).spawn(|| {
+    let _ = std::thread::Builder::new().name("relax-quit-write".to_string()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let t = Instant::now();
         // the owner thread is busy while the app's shutdown compiles: retry for a bounded time

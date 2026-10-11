@@ -1,5 +1,6 @@
 //! `relax`: the plain-Rust command line (no embedder registrations).
 fn main() {
+    let _phase = relax_compiler::zone_alloc::compiler();
     relax_compiler::clock::mark_process_start();
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     // a build script's RUSTC (Relax itself) asked for its version

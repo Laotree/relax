@@ -335,7 +335,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
                 }
                 ScriptRole::Artefact => {}
             }
-            s.spawn(move || {
+            s.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let r = run_one(sess, bs, raw, &cenv, &dir, &pname, &ver, &name, target_dir);
                 results.lock().unwrap().push((bs.krate, r.0, r.1));
             });

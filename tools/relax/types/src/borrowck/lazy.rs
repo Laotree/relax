@@ -316,7 +316,7 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
     }
     if !STARTED.swap(true, Ordering::SeqCst) {
         let s = src.clone(); let verbose = options.verbose;
-        let _ = std::thread::Builder::new().name("gandalf".to_string()).spawn(move || worker(s, verbose));
+        let _ = std::thread::Builder::new().name("gandalf".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); worker(s, verbose) });
     }
     WAKE.notify_one();
 }

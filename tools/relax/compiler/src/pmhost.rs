@@ -216,7 +216,7 @@ fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
     for entry in entries { hosted |= crate::native_macros::find(&entry)?.is_none(); }
     if hosted && world_now().is_none() {
         let sess = sess.clone();
-        let _ = std::thread::Builder::new().name("relax-pm-world".to_string()).stack_size(64 << 20).spawn(move || {
+        let _ = std::thread::Builder::new().name("relax-pm-world".to_string()).stack_size(64 << 20).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let _ = world(&sess);
         });
     }

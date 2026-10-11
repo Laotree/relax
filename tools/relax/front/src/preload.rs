@@ -1284,7 +1284,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         for worker in 0..jobs {
             let p = pool.clone();
             let sess = sess.clone();
-            if let Ok(h) = std::thread::Builder::new().name(format!("relax-parse-{worker}")).spawn(move || {
+            if let Ok(h) = std::thread::Builder::new().name(format!("relax-parse-{worker}")).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::macro_reg::set_in_world(in_world);
                 let _mem = crate::memstat::tag(if in_world { crate::memstat::Tag::PmHost } else { crate::memstat::Tag::Parse });
                 p.work(&sess, worker)

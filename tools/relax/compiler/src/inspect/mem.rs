@@ -325,6 +325,18 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     let (committed, live, _) = crate::zone_alloc::burst_stats();
     s.add("relax/burst arena committed", committed as u64);
     s.add("relax/burst arena live", live as u64);
+    let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
+    s.add("relax/compiler arena committed", ccommitted as u64);
+    s.add("relax/compiler arena live", clive as u64);
+    s.add("relax/compiler arena/chunks (2 MB)", cchunks as u64);
+    let (touched, slots, large, listed) = crate::zone_alloc::compiler_detail();
+    s.add("relax/compiler arena/small chunks touched", touched as u64);
+    s.add("relax/compiler arena/small live slots", slots as u64);
+    s.add("relax/compiler arena/large blocks", large as u64);
+    s.add("relax/compiler arena/chunks listed for reuse", listed as u64);
+    let (mutexes, condvars) = crate::zone_alloc::compiler_pthread_boxes();
+    s.add("relax/compiler arena/pthread mutex boxes", mutexes as u64);
+    s.add("relax/compiler arena/pthread condvar boxes", condvars as u64);
     if crate::memstat::enabled() {
         for (i, name) in crate::memstat::TAG_NAMES.iter().enumerate() {
             let v = crate::memstat::live_of_index(i);
@@ -384,6 +396,27 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     }
     total.push('}');
     out.line(&total);
+    let ev = crate::zone_alloc::compiler_events();
+    // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
+    out.line(&format!(
+        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_pthread_mutex_boxes\":{},\"compiler_arena_pthread_condvar_boxes\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{}}}}}}}",
+        json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (RELAX_COMPILER_ARENA=0)" }),
+        mb(inuse),
+        mb(free),
+        mb(snap.get("relax/compiler arena committed")),
+        mb(snap.get("relax/compiler arena live")),
+        mb(snap.get("relax/JIT code (incl. thunks, stubs)")),
+        mb(snap.get("relax/JIT read-only data")),
+        mb(snap.get("relax/program statics")),
+        mb(snap.get("relax/burst arena committed")),
+        mb(snap.get("relax/compiler arena/small chunks touched")),
+        mb(snap.get("relax/compiler arena/small live slots")),
+        mb(snap.get("relax/compiler arena/large blocks")),
+        snap.get("relax/compiler arena/chunks listed for reuse"),
+        snap.get("relax/compiler arena/pthread mutex boxes"),
+        snap.get("relax/compiler arena/pthread condvar boxes"),
+        ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
+    ));
     // the tree: every node, ranked within its parent, top `n`
     let mut rows: Vec<&(String, u64)> = snap.nodes.iter().filter(|x| x.0.contains('/') && x.1 >= 1 << 20).collect();
     rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
@@ -398,9 +431,9 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     if free > 64 << 20 {
         f.push((free, format!("malloc holds {} MB freed but not returned (retention; {:.0}% of its in-use bytes): a trim returns it", mb(free), free as f64 * 100.0 / inuse.max(1) as f64)));
     }
-    let relax: u64 = snap.nodes.iter().filter(|x| x.0.starts_with("relax/") && !x.0["relax/".len()..].contains('/') && !x.0.contains("burst arena live")).map(|x| x.1).sum();
+    let relax: u64 = snap.nodes.iter().filter(|x| x.0.starts_with("relax/") && !x.0["relax/".len()..].contains('/') && !x.0.ends_with(" live")).map(|x| x.1).sum();
     if relax > 0 {
-        f.push((relax, format!("Relax's own reservations in use: {} MB (JIT code + data + statics + burst arena)", mb(relax))));
+        f.push((relax, format!("Relax's own reservations in use: {} MB (JIT code + data + statics + burst and compiler arenas)", mb(relax))));
     }
     if let Some(p) = &prev {
         let mut growth: Vec<(i64, &String)> = snap.nodes.iter().map(|(k, v)| (*v as i64 - p.iter().find(|x| &x.0 == k).map_or(0, |x| x.1 as i64), k)).filter(|x| x.0 >= 16 << 20 && x.1.contains('/')).collect();

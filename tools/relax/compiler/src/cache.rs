@@ -153,7 +153,7 @@ pub fn verify_front_images() {
     if used.is_empty() {
         return;
     }
-    let _ = std::thread::Builder::new().name("relax-cache-verify".to_string()).spawn(move || {
+    let _ = std::thread::Builder::new().name("relax-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         crate::os::thread::lower_priority(true);
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
         for (st, i) in &used {
@@ -696,7 +696,7 @@ impl Cache {
                 let hs: Vec<_> = (0..n)
                     .map(|_| {
                         let next = &next;
-                        sc.spawn(move || {
+                        sc.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                             let mut v = Vec::new();
                             loop {
                                 let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -757,7 +757,7 @@ impl Cache {
         // this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
             let r = root.clone();
-            let _ = std::thread::Builder::new().name("relax-cache-prune".to_string()).spawn(move || {
+            let _ = std::thread::Builder::new().name("relax-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::jit::lower_this_thread_priority(&runtime);
                 let (b, a) = prune_root(&r);
                 if verbose && std::env::var_os("RELAX_CACHE_TRACE").is_some() && b != a {
@@ -962,7 +962,7 @@ impl Cache {
             let hs: Vec<_> = (0..n)
                 .map(|_| {
                     let (sh, by, order, next) = (&sh, &by, &order, &next);
-                    sc.spawn(move || {
+                    sc.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                         let u = sh.0;
                         let mut out = Vec::new();
                         let mut files = HashMap::new();
@@ -3407,11 +3407,11 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     let out: Vec<std::sync::Mutex<Option<R>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
     std::thread::scope(|scope| {
         for _ in 0..crate::preload::jobs().min(items.len()).max(1) {
-            scope.spawn(|| loop {
+            scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); loop {
                 let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let Some(item) = items.get(i) else { break };
                 *out[i].lock().unwrap() = Some(f(item));
-            });
+            } });
         }
     });
     out.into_iter().map(|r| r.into_inner().unwrap().expect("par_map result")).collect()
@@ -3595,7 +3595,7 @@ impl FrontImages {
         cached.unwrap_or_else(|| {
             let chunk = inputs.len().div_ceil(crate::preload::jobs().clamp(1, 8)).max(1);
             std::thread::scope(|scope| {
-                let workers: Vec<_> = inputs.chunks(chunk).map(|v| scope.spawn(move || v.iter().all(|(p, h)| self.input_current(p, *h)))).collect();
+                let workers: Vec<_> = inputs.chunks(chunk).map(|v| scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread(); v.iter().all(|(p, h)| self.input_current(p, *h)) })).collect();
                 workers.into_iter().all(|w| w.join().unwrap_or(false))
             })
         })
@@ -3829,7 +3829,7 @@ impl crate::crate_image::CrateImages for FrontImages {
         if graph.stamps.len() != graph.inputs.len() { rejected("input stamps"); return; }
         let g = &graph;
         let probes_ok = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..jobs).map(|k| scope.spawn(move || {
+            let workers: Vec<_> = (0..jobs).map(|k| scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let range = |n: usize| (k * chunk).min(n)..((k + 1) * chunk).min(n);
                 let ok = g.probes[range(g.probes.len())].iter().all(|(p, exists)| self.probe_current(p, *exists));
                 // An input whose stat is the recorded one is unchanged: its recorded hash goes in
@@ -3970,7 +3970,7 @@ impl crate::crate_image::CrateImages for FrontImages {
                 let handles = keys.chunks(chunk).zip(crate_names.chunks(chunk)).map(|(keys, names)| {
                     let store = &store;
                     let image_dir = &image_dir;
-                    scope.spawn(move || keys.iter().zip(names).map(|(key, name)| {
+                    scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread(); keys.iter().zip(names).map(|(key, name)| {
                         let key = (*key)?;
                         let (kind, bytes) = store.as_ref()?.get(key)?;
                         if kind != KIND_DEMAND_PART { return None; }
@@ -3978,7 +3978,7 @@ impl crate::crate_image::CrateImages for FrontImages {
                         let part = crate::preload::DemandPart::read(key, bytes, &mut |name, key| images.get(image_dir, name, key));
                         if crates_profile && part.is_none() { eprintln!("rust-demand-part-invalid: {name} payload decode"); }
                         part.map(std::sync::Arc::new)
-                    }).collect::<Vec<_>>())
+                    }).collect::<Vec<_>>() })
                 }).collect::<Vec<_>>();
                 handles.into_iter().flat_map(|h| h.join().expect("demand part reader")).collect()
             })
@@ -4335,7 +4335,7 @@ impl ColdFront {
             // A write that cannot record yet stays queued for the post-present or exit writer.
             if deferred {
                 FRONT_GRAPH_WRITES.lock().unwrap().push(job);
-                let _ = std::thread::Builder::new().name("relax-front-graph".into()).spawn(|| {
+                let _ = std::thread::Builder::new().name("relax-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                     let t = std::time::Instant::now();
                     let r = flush_front_graphs();
                     if crate::preload::trace() {
@@ -4398,7 +4398,7 @@ impl FrontWriters {
         let mut writers = Self { queue: std::sync::Arc::new(Default::default()), workers: Vec::new() };
         for _ in 0..crate::preload::jobs() {
             let queue = writers.queue.clone();
-            writers.workers.push(std::thread::Builder::new().name("relax-front-writer".into()).spawn(move || {
+            writers.workers.push(std::thread::Builder::new().name("relax-front-writer".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let (queue, wake) = &*queue;
                 let mut recorded = Vec::new();
                 loop {

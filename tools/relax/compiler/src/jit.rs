@@ -613,7 +613,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    let _ = std::thread::Builder::new().name("relax-seed".to_string()).spawn(move || {
+    let _ = std::thread::Builder::new().name("relax-seed".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let runtime = &session.runtime;
         let p = p;
         let up = p.0;
@@ -719,7 +719,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             struct P(*mut Unit);
             unsafe impl Send for P {}
             let p = P(up);
-            let _ = std::thread::Builder::new().name("relax-ids".to_string()).spawn(move || {
+            let _ = std::thread::Builder::new().name("relax-ids".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let p = p;
                 let up = p.0;
                 IDS_EXEMPT.with(|e| e.set(true));
@@ -750,7 +750,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         struct P(*mut Unit);
         unsafe impl Send for P {}
         let p = P(up);
-        let _ = std::thread::Builder::new().name("relax-prelink-notes".to_string()).spawn(move || {
+        let _ = std::thread::Builder::new().name("relax-prelink-notes".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let p = p;
             let up = p.0;
             set_worker();
@@ -4059,6 +4059,8 @@ impl Unit {
 /// Calls JIT code `entry(arg)` under a fresh recovery context. No Rust borrow of the
 /// unit may be alive across this call; `u` becomes the runtime's unit pointer.
 pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
+    // JIT code and the runtime helpers it calls allocate in the program's heap (zone_alloc.rs)
+    let _kept = crate::zone_alloc::kept();
     // the runtime's unit for this call; the previous one comes back after it (a proc-macro call
     // into the macro world's unit must not leave the program's lazy stubs pointing there)
     let prev = UNIT;
@@ -4174,6 +4176,7 @@ unsafe fn cost_name(up: *mut Unit, id: u32) {
 /// Compiles one slot (type check, lower, optimise, codegen) and installs it. Called
 /// from the lazy stub on first call, and directly for eager compilation and patches.
 pub unsafe fn compile_slot(up: *mut Unit, id: u32) -> u64 {
+    let _z = crate::zone_alloc::compiler();
     // a slot of the startup image is built by its key
     ids_name(up, id);
     let _job = compile_job();
@@ -5487,7 +5490,7 @@ fn o2_on() -> bool {
 unsafe fn o2_start(up: *mut Unit) {
     let runtime = (&*up).prog.session.runtime.clone();
     O2_THREAD.call_once(move || {
-        let _ = std::thread::Builder::new().name("relax-O2".into()).spawn(move || o2_thread(&runtime));
+        let _ = std::thread::Builder::new().name("relax-O2".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); o2_thread(&runtime) });
     });
 }
 
@@ -7307,7 +7310,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
     if unsafe { (*up).prog.skipped_files.is_empty() } { return; }
     let upn = up as usize;
     let runtime = runtime.clone();
-    let _ = std::thread::Builder::new().name("relax-complete".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("relax-complete".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let up = upn as *mut Unit;
         while !FIRST_PRESENT.load(Ordering::Acquire) {
             if crate::preempt::is_stopped() { return; }
@@ -8795,7 +8798,7 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
     };
     for k in 0..max {
         let runtime = runtime.clone();
-        let _ = std::thread::Builder::new().name(format!("relax-o3-{}", k)).spawn(move || tier1_thread(&runtime, k, normal));
+        let _ = std::thread::Builder::new().name(format!("relax-o3-{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
     }
 }
 
@@ -9103,6 +9106,7 @@ rt_fn! {
 /// The count stub's hot path (no unit lock): stop counting, queue the slot, continue in
 /// O1.
 fn rt_hot(slot: u64) -> u64 {
+    let _z = crate::zone_alloc::compiler();
     let _keep = os::proc::KeepLastError::new();
     let up = TIER_UNIT.load(Ordering::Acquire);
     unsafe {
@@ -10708,7 +10712,7 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
         SPEC_START.call_once(|| {
             for k in 0..spec_jobs(options) {
                 let session = session.clone();
-            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || spec_worker(&session.runtime, &session.options));
+            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
             }
         });
         SPEC_WAKE.notify_all();
@@ -10772,7 +10776,7 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
-            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || spec_worker(&session.runtime, &session.options));
+            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
         }
     });
     SPEC_WAKE.notify_all();
@@ -10801,7 +10805,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     unsafe impl Send for P {}
     let p = P(up);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
-    let _ = std::thread::Builder::new().name("relax-teardown".to_string()).spawn(move || {
+    let _ = std::thread::Builder::new().name("relax-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let p = p;
         let up = p.0;
         ensure_altstack();
@@ -11389,7 +11393,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let helpers = threads.max(1).min(work_cells.len().max(1));
     std::thread::scope(|sc| {
         for _ in 0..helpers {
-            sc.spawn(|| {
+            sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                 // counted when this helper is done, also if it panics (the owner waits for all)
                 struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
                 impl Drop for Done<'_> {
@@ -12066,7 +12070,7 @@ fn set_shared_front(u: &mut Unit, core_crate: u32) {
     f.alive.store(true, Ordering::SeqCst);
     for i in 0..if startup_phase() { f.helpers } else { 0 } {
         let f = u.front.clone();
-        let _ = std::thread::Builder::new().name(format!("relax-ahead{}", i)).spawn(move || ahead_helper(f));
+        let _ = std::thread::Builder::new().name(format!("relax-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); ahead_helper(f) });
     }
 }
 
@@ -12775,7 +12779,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
-            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || spec_worker(&session.runtime, &session.options));
+            let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
         }
     });
     SPEC_WAKE.notify_all();
@@ -12864,7 +12868,7 @@ pub fn start_background_coherence(u: &Unit) {
         }
     }
     let front = u.front.clone();
-    let _ = std::thread::Builder::new().name("relax-coherence".into()).spawn(move || {
+    let _ = std::thread::Builder::new().name("relax-coherence".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
         lower_worker_priority(&front.session.runtime);
         while STARTUP_PHASE.load(Ordering::Acquire) != 0 && !SPEC_STOP.load(Ordering::SeqCst) {

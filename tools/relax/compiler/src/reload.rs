@@ -3640,6 +3640,7 @@ unsafe fn apply_stream_target(up: *mut Unit, target: StreamTarget, text: Vec<u8>
 /// Feed the entire text so far for one loaded source file. Calls within 16 ms coalesce;
 /// the next feed or the live watcher drains the newest pending prefix.
 pub unsafe fn apply_stream(up: *mut Unit, path: &str, text: Vec<u8>) -> Outcome {
+    let _z = crate::zone_alloc::compiler();
     let path = std::fs::canonicalize(path).map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| path.to_string());
     if let Err(error) = crate::native_macros::reload(&[(&path, Some(&text))], (&(*up).prog.session).runtime.profile) {
         let mut out = idle_outcome(None, &error); out.rung = Rung::Refuse; return out;
@@ -3738,7 +3739,7 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
     let p = P(up);
     std::thread::Builder::new()
         .name("relax-live".to_string())
-        .spawn(move || {
+        .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let runtime = &session.runtime;
             let p = p;
             jit::lower_this_thread_priority(runtime);

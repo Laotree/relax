@@ -543,8 +543,9 @@ pub fn print_tag(label: &str, tag: Tag) {
 pub fn report(label: &str) -> String {
     let (rss, hwm, extra) = process_rss();
     let (committed, live, chunks) = crate::zone_alloc::burst_stats();
+    let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     let mut out = format!(
-        "relax-mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}\n",
+        "relax-mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}\n",
         label,
         mb(rss),
         mb(hwm),
@@ -555,7 +556,10 @@ pub fn report(label: &str) -> String {
         CTRS.iter().map(|c| c.n.load(Relaxed)).sum::<u64>(),
         mb(committed as u64),
         mb(live as u64),
-        chunks
+        chunks,
+        mb(ccommitted as u64),
+        mb(clive as u64),
+        cchunks
     );
     if !enabled() {
         return out;
@@ -697,6 +701,7 @@ pub fn note_big(kind: &str, name: &str, s: PeakScope, what: impl FnOnce() -> Str
 /// pressure relief).
 pub fn trim() {
     crate::zone_alloc::burst_trim();
+    crate::zone_alloc::compiler_trim();
     #[cfg(target_os = "linux")]
     {
         extern "C" {

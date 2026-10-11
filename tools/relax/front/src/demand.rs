@@ -1452,7 +1452,7 @@ impl Names {
         let out: Vec<std::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
         std::thread::scope(|scope| {
             for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
-                scope.spawn(|| { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
+                scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let Some(cell) = work.get(k) else { break };
                     let (mut image, entries) = cell.lock().unwrap().take().unwrap();
@@ -1529,7 +1529,7 @@ impl Predecoded {
         let this = Arc::new(Self { parts, slots: std::sync::Mutex::new(slots), done: std::sync::Condvar::new() });
         for _ in 0..workers.min(this.parts.len()) {
             let this = this.clone();
-            std::thread::Builder::new().name("relax-namespace-decode".into()).spawn(move || {
+            std::thread::Builder::new().name("relax-namespace-decode".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 while let Some(ci) = this.claim(None) { this.decode(ci); }
             }).expect("namespace decode worker");
         }

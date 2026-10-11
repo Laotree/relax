@@ -70,7 +70,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     std::thread::scope(|sc| {
         for w in 0..jobs.min(items.len().max(1)) {
             let (next, out, f) = (&next, &out, &f);
-            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || {
+            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                 let mut local = Vec::new();
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -227,7 +227,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let (fns, next, results, check_one) = (&fns, &next, &results, &check_one);
         std::thread::scope(|sc| {
             for w in 0..jobs {
-                std::thread::Builder::new().name(format!("relax-check-ty-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || {
+                std::thread::Builder::new().name(format!("relax-check-ty-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                     let mut local = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -407,7 +407,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     std::thread::scope(|sc| {
         for w in 0..jobs {
             let (next, active, panics, compiled, settled_at, settled_rss) = (&next, &active, &panics, &compiled, &settled_at, &settled_rss);
-            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || {
+            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                 let up = upn as *mut Unit;
                 loop {
                     // the next slot not compiled yet; done when none is left and no worker is

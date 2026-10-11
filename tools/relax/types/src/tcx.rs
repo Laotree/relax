@@ -281,7 +281,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..jobs)
             .map(|_| {
-                sc.spawn(|| {
+                sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                     let mut out = Vec::new();
                     loop {
                         let k = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);

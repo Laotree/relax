@@ -185,7 +185,7 @@ impl Plan {
                 let contexts = &contexts;
                 let template = &names;
                 let next_crate = &next_crate;
-                scope.spawn(move || {
+                scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                     let _mem = crate::memstat::tag(crate::memstat::Tag::Planner);
                     let mut output = Vec::new();
                     loop {
@@ -297,7 +297,7 @@ impl Plan {
                 std::thread::scope(|scope| {
                     for _ in 0..jobs().min(inputs.len()) {
                         let (inputs, ready, next_input, base, context) = (&inputs, &ready, &next_input, &base, &contexts[*ci]);
-                        scope.spawn(move || {
+                        scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                             let _reads = context.bind_source_reads();
                             while let Some(input) = inputs.get(next_input.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) {
                                 let (path, module, scan) = input.lock().unwrap().take().expect("each input is expanded once");
@@ -443,7 +443,7 @@ impl Plan {
                     let chunk = files.len().div_ceil(jobs().max(1)).max(1);
                     let (names, contexts, expanded_indexes, sources) = (&names, &contexts, &expanded_indexes, &sources);
                     let mut flags = std::thread::scope(|scope| {
-                        let workers = files.chunks_mut(chunk).map(|files| scope.spawn(move || { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter_mut().map(|file| {
+                        let workers = files.chunks_mut(chunk).map(|files| scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread(); let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter_mut().map(|file| {
                             let source = sources.get(&(file.path.as_str(), file.module.as_str())).copied();
                             macro_surface(names, crates, contexts, expanded_indexes, profile, file, source.map(|(src, toks, _)| (src, toks)), source.map(|(_, _, parameters)| parameters))
                         }).collect::<Vec<_>>() })).collect::<Vec<_>>();
@@ -577,7 +577,7 @@ impl Plan {
             let handles = rust.chunks(chunk).map(|files| {
                 let names = &names;
                 let relevant = &relevant;
-                scope.spawn(move || { let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter().filter(|(ci, ..)| relevant.contains(ci)).map(|(ci, path, module, scan)| {
+                scope.spawn(move || { let _z = crate::zone_alloc::compiler_thread(); let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); files.iter().filter(|(ci, ..)| relevant.contains(ci)).map(|(ci, path, module, scan)| {
                     let (src, toks) = (&scan.src, &scan.toks);
                     let opaque = names.opaque_scopes(*ci, src, toks, module);
                     let references = BTreeSet::<String>::new();

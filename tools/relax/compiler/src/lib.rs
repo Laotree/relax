@@ -248,7 +248,7 @@ fn parse_all_mode(sess: &std::sync::Arc<crate::Session>, files: &[crates::SrcFil
     let t0 = Instant::now();
     std::thread::scope(|s| {
         for _ in 0..threads {
-            s.spawn(|| loop {
+            s.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= files.len() {
                     break;
@@ -257,7 +257,7 @@ fn parse_all_mode(sess: &std::sync::Arc<crate::Session>, files: &[crates::SrcFil
                 if parser::parse_source_mode(sess, &f.src, f.edition, lazy).is_err() {
                     errors.fetch_add(1, Ordering::Relaxed);
                 }
-            });
+            } });
         }
     });
     (t0.elapsed().as_secs_f64(), errors.load(Ordering::Relaxed))

@@ -204,7 +204,7 @@ pub fn start() {
         std::thread::Builder::new()
             .name("relax-owner".into())
             .stack_size(256 << 20)
-            .spawn(move || {
+            .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 IS_OWNER.with(|o| o.set(true));
                 OWNER_TID.store(me(), Ordering::SeqCst);
                 crate::waits::register();

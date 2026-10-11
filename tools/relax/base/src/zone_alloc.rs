@@ -17,13 +17,219 @@
 //!
 //! `scratch()` routes Rust compile working sets through a reserved-address burst arena.
 //! Arena pointers must come back through this allocator, never directly through C `free`.
+//!
+//! Two heaps, one allocator code path (arena.rs, compiled twice with different constants):
+//! - the **burst** arena: scratch for one compile, emptied chunks go straight back;
+//! - the **compiler** arena: everything the compiler allocates and keeps -- the program's tables,
+//!   the caches, the parse trees -- so the system heap holds only the program (JIT code's
+//!   malloc, provided crates, runtime helpers). Same size-class chunks as burst, plus a list of
+//!   chunks with free slots so a long-lived heap reuses what it frees.
+//!
+//! Routing is by a per-thread phase: `compiler()` opts a thread (or a stretch of one) in; the
+//! default, `kept`, is the system heap. A free is decided by the block's address, never by the
+//! phase, so a block can be freed from any thread in any phase. A realloc moves a compiler block
+//! to the system heap when it grows in the kept phase; a system block never moves into the
+//! compiler arena (a program block must not end up where a later destroy would take it).
+//! `RELAX_COMPILER_ARENA=0` turns the routing off (read once, without allocating).
 
-mod burst;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+#[allow(dead_code)]
+mod burst {
+    pub const COMPILER: bool = false;
+    pub const LABEL: &std::ffi::CStr = c"relax-burst";
+    include!("zone_alloc/arena.rs");
+    #[cfg(test)]
+    include!("zone_alloc/arena_tests.rs");
+}
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
+#[allow(dead_code)]
+mod compiler {
+    pub const COMPILER: bool = true;
+    pub const LABEL: &std::ffi::CStr = c"relax-compiler";
+    include!("zone_alloc/arena.rs");
+}
+
+// No TLS, reservation, environment read, or routing on wasm/unsupported targets.
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+#[allow(dead_code)]
+mod disabled {
+    use std::alloc::Layout;
+    pub struct ScratchGuard;
+    #[inline]
+    pub fn scratch(_: &crate::options::RuntimeOptions) -> ScratchGuard {
+        ScratchGuard
+    }
+    #[inline]
+    pub fn active() -> bool {
+        false
+    }
+    #[inline]
+    pub fn init() -> bool {
+        false
+    }
+    #[inline]
+    pub fn owns(_: *mut u8) -> bool {
+        false
+    }
+    pub fn stats() -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+    pub fn pthread_boxes() -> (usize, usize) {
+        (0, 0)
+    }
+    pub fn trim() {}
+    pub fn detach_thread() {}
+    pub unsafe fn alloc(_: Layout) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn alloc_zeroed(_: Layout) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn resize_in_place(_: *mut u8, _: Layout, _: usize) -> bool {
+        false
+    }
+    pub unsafe fn dealloc(_: *mut u8, _: Layout) {
+        unreachable!()
+    }
+}
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+use disabled as burst;
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+use disabled as compiler;
+
 pub use burst::{scratch, stats as burst_stats, trim as burst_trim, ScratchGuard};
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU8, Ordering};
 #[cfg(target_os = "macos")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+
+/// (committed bytes, live requested bytes, committed 2 MB chunk equivalents) of the compiler arena.
+pub fn compiler_stats() -> (usize, usize, usize) {
+    compiler::stats()
+}
+
+/// (touched bytes of small chunks, bytes in their live slots, bytes of large blocks, chunks listed for reuse).
+pub fn compiler_detail() -> (usize, usize, usize, usize) {
+    compiler::detail()
+}
+
+/// Slow-path event counts of the compiler arena: contended acquisitions of the chunk, pool, warm
+/// and partial locks, yields while waiting, chunk commits, decommits, partial-list pushes and pops.
+pub fn compiler_events() -> [usize; 9] {
+    compiler::events()
+}
+
+/// Decommits the compiler arena's warm chunks (settle's heap trim).
+pub fn compiler_trim() {
+    compiler::trim()
+}
+
+/// (pthread mutexes, condition variables) std boxed in the compiler arena (macOS; see arena.rs).
+pub fn compiler_pthread_boxes() -> (usize, usize) {
+    compiler::pthread_boxes()
+}
+
+/// Whether compiler-phase routing is on in this process (`RELAX_COMPILER_ARENA=0` turns it off).
+pub fn compiler_arena_enabled() -> bool {
+    enabled()
+}
+
+const KEPT: u8 = 0;
+const COMPILER: u8 = 1;
+const OFF: u8 = 0xff;
+
+thread_local! {
+    // const, no destructor: readable in the allocator at any point of a thread's life
+    static PHASE: Cell<u8> = const { Cell::new(KEPT) };
+}
+
+/// 0 = not read yet, 1 = on, 2 = off.
+static MODE: AtomicU8 = AtomicU8::new(0);
+
+#[cold]
+fn decide() -> bool {
+    #[cfg(unix)]
+    let off = unsafe {
+        extern "C" {
+            fn getenv(name: *const u8) -> *const u8;
+        }
+        // std::env would allocate, and this runs inside the allocator's first routed call
+        let p = getenv(c"RELAX_COMPILER_ARENA".as_ptr().cast());
+        !p.is_null() && *p == b'0' && *p.add(1) == 0
+    };
+    #[cfg(not(unix))]
+    let off = false;
+    let on = !off && compiler::init();
+    MODE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+    on
+}
+
+#[inline]
+fn enabled() -> bool {
+    match MODE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => decide(),
+    }
+}
+
+#[inline]
+fn in_compiler() -> bool {
+    PHASE.with(|p| p.get()) == COMPILER
+}
+
+/// Puts the calling thread in a phase until dropped. !Send: it restores this thread's TLS.
+pub struct PhaseGuard(u8, PhantomData<*mut ()>);
+
+impl Drop for PhaseGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if self.0 != OFF {
+            PHASE.with(|p| p.set(self.0));
+        }
+    }
+}
+
+#[inline]
+fn enter(phase: u8) -> PhaseGuard {
+    if !enabled() {
+        return PhaseGuard(OFF, PhantomData);
+    }
+    let prev = PHASE.with(|p| p.replace(phase));
+    PhaseGuard(prev, PhantomData)
+}
+
+/// Allocations of the calling thread go to the compiler arena until the guard drops. Compiler
+/// threads take it as their first statement; app threads take it around a compile entry.
+#[inline]
+pub fn compiler() -> PhaseGuard {
+    enter(COMPILER)
+}
+
+/// `compiler()` for the first statement of a thread that compiles: when the thread ends its
+/// chunks are handed back for reuse.
+pub struct ThreadGuard(#[allow(dead_code)] PhaseGuard);
+
+impl Drop for ThreadGuard {
+    fn drop(&mut self) {
+        compiler::detach_thread();
+    }
+}
+
+#[inline]
+pub fn compiler_thread() -> ThreadGuard {
+    ThreadGuard(enter(COMPILER))
+}
+
+/// Allocations go to the system heap (the program's) until the guard drops. JIT code and
+/// everything it calls runs in this phase.
+#[inline]
+pub fn kept() -> PhaseGuard {
+    enter(KEPT)
+}
 
 pub struct RelaxAlloc;
 
@@ -140,6 +346,12 @@ unsafe impl GlobalAlloc for RelaxAlloc {
                 return p;
             }
         }
+        if in_compiler() {
+            let p = compiler::alloc(l);
+            if !p.is_null() {
+                return p;
+            }
+        }
         #[cfg(target_os = "macos")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc(l.size(), l.align());
@@ -155,6 +367,12 @@ unsafe impl GlobalAlloc for RelaxAlloc {
                 return p;
             }
         }
+        if in_compiler() {
+            let p = compiler::alloc_zeroed(l);
+            if !p.is_null() {
+                return p;
+            }
+        }
         #[cfg(target_os = "macos")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::alloc_zeroed(l.size(), l.align());
@@ -166,6 +384,9 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         if burst::owns(p) {
             return burst::dealloc(p, l);
         }
+        if compiler::owns(p) {
+            return compiler::dealloc(p, l);
+        }
         #[cfg(target_os = "macos")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::dealloc(p);
@@ -174,7 +395,8 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     }
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
-        if burst::owns(p) || burst::active() {
+        let in_burst = burst::owns(p);
+        if in_burst || burst::active() {
             // The destination follows the current scope. On failure the old block stays valid.
             let n = self.alloc(Layout::from_size_align_unchecked(size, l.align()));
             if !n.is_null() {
@@ -183,10 +405,297 @@ unsafe impl GlobalAlloc for RelaxAlloc {
             }
             return n;
         }
+        if compiler::owns(p) {
+            if in_compiler() && compiler::resize_in_place(p, l, size) {
+                return p;
+            }
+            // grows (or shrinks) into the heap of the current phase; the old block stays valid on failure
+            let n = self.alloc(Layout::from_size_align_unchecked(size, l.align()));
+            if !n.is_null() {
+                std::ptr::copy_nonoverlapping(p, n, l.size().min(size));
+                compiler::dealloc(p, l);
+            }
+            return n;
+        }
         #[cfg(target_os = "macos")]
         if OWN_ZONE.load(Ordering::Relaxed) {
             return zone::realloc(p, l.size(), l.align(), size);
         }
         System.realloc(p, l, size)
+    }
+}
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
+mod routing_tests {
+    use super::*;
+
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    unsafe fn put(size: usize, align: usize, byte: u8) -> (*mut u8, Layout) {
+        let l = Layout::from_size_align(size, align).unwrap();
+        let p = RelaxAlloc.alloc(l);
+        assert!(!p.is_null());
+        std::ptr::write_bytes(p, byte, size);
+        (p, l)
+    }
+
+    unsafe fn all_eq(p: *mut u8, n: usize, byte: u8) -> bool {
+        std::slice::from_raw_parts(p, n).iter().all(|&b| b == byte)
+    }
+
+    #[test]
+    fn phase_routes_allocations_and_frees_follow_the_address() {
+        let _s = serial();
+        assert!(compiler_arena_enabled());
+        unsafe {
+            let (kept, kl) = put(100, 8, 1);
+            assert!(!compiler::owns(kept));
+            let (comp, cl) = {
+                let _g = compiler();
+                assert!(in_compiler());
+                put(100, 8, 2)
+            };
+            assert!(!in_compiler());
+            assert!(compiler::owns(comp));
+            {
+                let _outer = compiler();
+                let _inner = kept_guard_for_test();
+                assert!(!in_compiler());
+                let (p, l) = put(64, 8, 3);
+                assert!(!compiler::owns(p));
+                RelaxAlloc.dealloc(p, l);
+            }
+            assert!(!in_compiler());
+            // freed from the kept phase, by address
+            RelaxAlloc.dealloc(comp, cl);
+            RelaxAlloc.dealloc(kept, kl);
+        }
+    }
+
+    fn kept_guard_for_test() -> PhaseGuard {
+        kept()
+    }
+
+    #[test]
+    fn realloc_stays_in_place_in_a_class_and_moves_to_the_phase_heap() {
+        let _s = serial();
+        unsafe {
+            let (p, l) = {
+                let _g = compiler();
+                put(40, 8, 7)
+            };
+            assert!(compiler::owns(p));
+            let _g = compiler();
+            // 40 and 47 share the 48-byte class
+            let q = RelaxAlloc.realloc(p, l, 47);
+            assert_eq!(q, p);
+            assert!(all_eq(q, 40, 7));
+            let l2 = Layout::from_size_align(47, 8).unwrap();
+            let r = RelaxAlloc.realloc(q, l2, 5000);
+            assert!(compiler::owns(r));
+            assert!(all_eq(r, 40, 7));
+            let l3 = Layout::from_size_align(5000, 8).unwrap();
+            drop(_g);
+            // grown in the kept phase: the block leaves the compiler arena
+            let k = RelaxAlloc.realloc(r, l3, 9000);
+            assert!(!compiler::owns(k));
+            assert!(all_eq(k, 40, 7));
+            RelaxAlloc.dealloc(k, Layout::from_size_align(9000, 8).unwrap());
+        }
+    }
+
+    #[test]
+    fn freed_slots_of_full_chunks_are_reused() {
+        let _s = serial();
+        compiler_trim();
+        unsafe {
+            let _g = compiler();
+            let cap = compiler::CHUNK / 1024;
+            let mut blocks: Vec<(*mut u8, Layout)> = (0..2 * cap).map(|_| put(1000, 8, 9)).collect();
+            let committed = compiler_stats().0;
+            let first_chunk = (blocks[0].0 as usize) & !(compiler::CHUNK - 1);
+            let freed: Vec<usize> = blocks
+                .iter()
+                .filter(|(p, _)| (*p as usize) & !(compiler::CHUNK - 1) == first_chunk)
+                .take(100)
+                .map(|(p, _)| *p as usize)
+                .collect();
+            assert_eq!(freed.len(), 100);
+            blocks.retain(|(p, _)| !freed.contains(&(*p as usize)));
+            for &p in &freed {
+                RelaxAlloc.dealloc(p as *mut u8, Layout::from_size_align(1000, 8).unwrap());
+            }
+            let again: Vec<(*mut u8, Layout)> = (0..100).map(|_| put(1000, 8, 5)).collect();
+            assert_eq!(compiler_stats().0, committed, "no new chunk for slots that were free");
+            for (p, _) in &again {
+                assert!(freed.contains(&(*p as usize)));
+            }
+            for (p, l) in blocks.into_iter().chain(again) {
+                RelaxAlloc.dealloc(p, l);
+            }
+        }
+        compiler_trim();
+    }
+
+    #[test]
+    fn large_zeroed_blocks_read_zero_after_reuse() {
+        let _s = serial();
+        unsafe {
+            let _g = compiler();
+            for round in 0..3 {
+                let l = Layout::from_size_align(3 << 20, 16).unwrap();
+                let p = RelaxAlloc.alloc_zeroed(l);
+                assert!(!p.is_null() && compiler::owns(p));
+                assert!(all_eq(p, 3 << 20, 0), "round {round}");
+                std::ptr::write_bytes(p, 0xa5, 3 << 20);
+                RelaxAlloc.dealloc(p, l);
+            }
+            let l = Layout::from_size_align(200, 8).unwrap();
+            let p = RelaxAlloc.alloc_zeroed(l);
+            std::ptr::write_bytes(p, 0xff, 200);
+            RelaxAlloc.dealloc(p, l);
+            let p = RelaxAlloc.alloc_zeroed(l);
+            assert!(all_eq(p, 200, 0));
+            RelaxAlloc.dealloc(p, l);
+        }
+    }
+
+    #[test]
+    fn threads_allocate_and_free_each_others_blocks() {
+        let _s = serial();
+        let (tx, rx) = std::sync::mpsc::sync_channel::<(usize, usize, u8)>(256);
+        let freer = std::thread::spawn(move || {
+            for (p, size, byte) in rx {
+                unsafe {
+                    assert!(all_eq(p as *mut u8, size, byte));
+                    RelaxAlloc.dealloc(p as *mut u8, Layout::from_size_align(size, 8).unwrap());
+                }
+            }
+        });
+        let workers: Vec<_> = (0..4u8)
+            .map(|k| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let _g = compiler();
+                    let mut keep = Vec::new();
+                    for i in 0..20000usize {
+                        let size = 16usize << ((i + k as usize) % 10);
+                        let (p, l) = unsafe { put(size, 8, k + 1) };
+                        assert!(compiler::owns(p));
+                        if i % 3 == 0 {
+                            keep.push((p, l));
+                        } else {
+                            tx.send((p as usize, size, k + 1)).unwrap();
+                        }
+                        if keep.len() > 64 {
+                            for (p, l) in keep.drain(..32) {
+                                unsafe {
+                                    assert!(all_eq(p, l.size(), k + 1));
+                                    RelaxAlloc.dealloc(p, l);
+                                }
+                            }
+                        }
+                    }
+                    for (p, l) in keep {
+                        unsafe { RelaxAlloc.dealloc(p, l) };
+                    }
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().unwrap();
+        }
+        drop(tx);
+        freer.join().unwrap();
+    }
+
+    #[test]
+    fn fine_classes_pack_odd_sizes() {
+        let _s = serial();
+        compiler_trim();
+        unsafe {
+            let _g = compiler();
+            let before = compiler_stats().2;
+            // 72-byte blocks sit in an 80-byte slot: 100000 of them fit 4 chunks of 2 MB (a power of two would need 7)
+            let blocks: Vec<(*mut u8, Layout)> = (0..100_000).map(|_| put(72, 8, 3)).collect();
+            assert!(compiler_stats().2 - before <= 5, "chunks {}", compiler_stats().2 - before);
+            // a wider alignment takes the power-of-two class and keeps it
+            let (p, l) = put(72, 64, 4);
+            assert_eq!(p as usize % 64, 0);
+            RelaxAlloc.dealloc(p, l);
+            for (p, l) in blocks {
+                RelaxAlloc.dealloc(p, l);
+            }
+        }
+        compiler_trim();
+    }
+
+    #[test]
+    fn large_blocks_grow_inside_their_run_without_moving() {
+        let _s = serial();
+        unsafe {
+            let _g = compiler();
+            let (p, l) = put(300 << 10, 16, 6);
+            let committed = compiler_stats().0;
+            let q = RelaxAlloc.realloc(p, l, 1 << 20);
+            assert_eq!(q, p);
+            assert!(compiler_stats().0 > committed);
+            assert!(all_eq(q, 300 << 10, 6));
+            std::ptr::write_bytes(q, 8, 1 << 20);
+            let r = RelaxAlloc.realloc(q, Layout::from_size_align(1 << 20, 16).unwrap(), 400 << 10);
+            assert_eq!(r, q);
+            assert!(compiler_stats().0 <= committed + (200 << 10));
+            assert!(all_eq(r, 400 << 10, 8));
+            // past the run it moves, contents intact
+            let s2 = RelaxAlloc.realloc(r, Layout::from_size_align(400 << 10, 16).unwrap(), 5 << 20);
+            assert!(!s2.is_null() && compiler::owns(s2));
+            assert!(all_eq(s2, 400 << 10, 8));
+            RelaxAlloc.dealloc(s2, Layout::from_size_align(5 << 20, 16).unwrap());
+        }
+    }
+
+    #[test]
+    fn trim_releases_free_pages_and_keeps_the_free_list_sound() {
+        let _s = serial();
+        compiler_trim();
+        unsafe {
+            let _g = compiler();
+            let mut blocks: Vec<Option<(*mut u8, Layout)>> = (0..100_000usize)
+                .map(|i| Some(put(100, 8, (i % 251) as u8 + 1)))
+                .collect();
+            // free a long run (whole pages go) and every second block elsewhere (they stay)
+            for i in 1_000..60_000 {
+                let (p, l) = blocks[i].take().unwrap();
+                RelaxAlloc.dealloc(p, l);
+            }
+            for i in (60_000..100_000).step_by(2) {
+                let (p, l) = blocks[i].take().unwrap();
+                RelaxAlloc.dealloc(p, l);
+            }
+            compiler_trim();
+            for (i, b) in blocks.iter().enumerate() {
+                if let Some((p, _)) = b {
+                    assert!(all_eq(*p, 100, (i % 251) as u8 + 1), "live block {i} damaged by the trim");
+                }
+            }
+            // new blocks must not alias the live ones
+            let fresh: Vec<(*mut u8, Layout)> = (0..70_000).map(|_| put(100, 8, 0xee)).collect();
+            for (i, b) in blocks.iter().enumerate() {
+                if let Some((p, _)) = b {
+                    assert!(all_eq(*p, 100, (i % 251) as u8 + 1), "live block {i} overwritten");
+                }
+            }
+            for (p, l) in fresh {
+                RelaxAlloc.dealloc(p, l);
+            }
+            for b in blocks.into_iter().flatten() {
+                RelaxAlloc.dealloc(b.0, b.1);
+            }
+        }
+        compiler_trim();
     }
 }

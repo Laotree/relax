@@ -347,7 +347,7 @@ mod tests {
         let id = sources.source_id("/fake/source.rs");
         assert_eq!(id, 1);
         std::thread::scope(|scope| {
-            let jobs: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+            let jobs: Vec<_> = (0..8).map(|_| scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                 sources.register("/fake/source.rs", Arc::from("é value\n".as_bytes())).unwrap()
             })).collect();
             for job in jobs { assert_eq!(job.join().unwrap(), id); }

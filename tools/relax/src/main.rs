@@ -75,6 +75,8 @@ fn main() {
     if let Some(code) = cef::subprocess() {
         std::process::exit(code);
     }
+    // the boot thread compiles: its allocations go to the compiler arena (JIT calls switch back)
+    let _phase = relax_compiler::zone_alloc::compiler();
     relax_compiler::clock::mark_process_start();
     // a build script's RUSTC (Relax itself) asked for its version
     if relax_compiler::relax_as_rustc() {
