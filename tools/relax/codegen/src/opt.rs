@@ -2326,7 +2326,65 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     if recip_pow2_div(f) {
         dce(f);
     }
+    // branch on `c == 0` / `c != 0` / `c ^ 1` of a compare c: branch on c (swapping the targets)
+    if branch_on_compare(f) {
+        dce(f);
+    }
 
+}
+
+/// A block ending `d = !c; branch d, t, e` (d = `c == 0`, `c ^ 1`; `c != 0` is c itself) where c is
+/// a compare result (every definition of c an `ICmp` / `ICmpI` / `FCmp`, so 0 or 1) and d has no
+/// other use branches on c with the targets swapped. This is the only exact form for floats: `!(a <= b)`
+/// is not `a > b` on NaN, but the backends branch on a fused float compare with its unordered
+/// case handled, so the compare stays one compare + one jcc / b.cond (rustc's `if !(s <= z)`).
+fn branch_on_compare(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut cmp_only = vec![true; nv];
+    let mut uses = vec![0u32; nv];
+    for p in &f.params {
+        cmp_only[p.0 as usize] = false;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| {
+                if !matches!(i, Inst::ICmp(..) | Inst::ICmpI(..) | Inst::FCmp(..)) {
+                    cmp_only[d.0 as usize] = false;
+                }
+            });
+            for_uses(i, |u| uses[u.0 as usize] += 1);
+        }
+        tu.clear();
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            uses[u.0 as usize] += 1;
+        }
+    }
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let Term::Branch(d, t, e) = f.blocks[bi].term else { continue };
+        if t == e || uses[d.0 as usize] != 1 {
+            continue;
+        }
+        let Some(last) = f.blocks[bi].insts.last() else { continue };
+        let (c, invert) = match *last {
+            Inst::ICmpI(Cond::Eq, _, dd, c, 0) if dd == d => (c, true),
+            Inst::ICmpI(Cond::Ne, _, dd, c, 0) if dd == d => (c, false),
+            Inst::IBinI(IOp::Xor, _, dd, c, 1) if dd == d => (c, true),
+            _ => continue,
+        };
+        // c is not redefined by the removed instruction itself, and holds a 0 / 1 compare
+        if c == d || !cmp_only[c.0 as usize] || uses[c.0 as usize] != 1 {
+            continue;
+        }
+        let b = &mut f.blocks[bi];
+        b.insts.pop();
+        b.pos.pop();
+        b.term = if invert { Term::Branch(c, e, t) } else { Term::Branch(c, t, e) };
+        changed = true;
+    }
+    changed
 }
 
 /// The reciprocal of a power-of-two float constant (`bits` of an f32 / f64) when that is itself
