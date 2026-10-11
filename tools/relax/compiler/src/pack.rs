@@ -42,6 +42,7 @@ impl Drop for Bytes {
             extern "C" {
                 fn munmap(addr: *mut u8, len: usize) -> i32;
             }
+            forget_mapping(self.ptr as usize);
             unsafe { munmap(self.ptr as *mut u8, self.len) };
         }
     }
@@ -71,11 +72,58 @@ impl Bytes {
             if p.is_null() || p as isize == -1 {
                 return None;
             }
+            note_mapping(p as usize, len);
             return Some(Bytes { ptr: p, len, mapped: true, owned: Vec::new() });
         }
         #[allow(unreachable_code)]
         std::fs::read(path).ok().map(Bytes::from_vec)
     }
+}
+
+/// Every read-only cache file mapping of this process: (start, length).
+#[cfg(unix)]
+static MAPPINGS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn note_mapping(start: usize, len: usize) {
+    // kept heap: the list outlives every compiler generation
+    let _k = crate::zone_alloc::kept();
+    MAPPINGS.lock().unwrap_or_else(|e| e.into_inner()).push((start, len));
+}
+
+#[cfg(unix)]
+fn forget_mapping(start: usize) {
+    let mut m = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = m.iter().position(|&(s, _)| s == start) {
+        m.swap_remove(i);
+    }
+}
+
+/// Drops this process's resident pages of the cache file mappings (settle). Opening a warm
+/// cache touches pages all over the images (headers, indexes, and the kernel's fault-around
+/// maps up to 16 neighbouring page-cache pages per fault), and they stay counted in RSS/PSS for
+/// the rest of the run though few are read again. The mappings are read-only and private, so
+/// nothing is lost: a later read faults the page back from the page cache (a minor fault).
+/// Linux/Android only; macOS does not count clean file pages in the footprint. Returns bytes advised.
+pub fn release_resident() -> usize {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        extern "C" {
+            fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        }
+        const MADV_DONTNEED: i32 = 4;
+        // the lock is held across the calls: a mapping cannot be unmapped (and its range reused) meanwhile
+        let m = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0;
+        for &(start, len) in m.iter() {
+            if unsafe { madvise(start as *mut u8, len, MADV_DONTNEED) } == 0 {
+                n += len;
+            }
+        }
+        return n;
+    }
+    #[allow(unreachable_code)]
+    0
 }
 
 /// `len` bytes of `file` at `off`, mapped read-only for the rest of the process (unix: the
@@ -100,6 +148,7 @@ pub fn map_pinned(file: &std::fs::File, off: u64, len: usize) -> Option<&'static
     if p.is_null() || p as isize == -1 {
         return None;
     }
+    note_mapping(p as usize, span);
     Some(unsafe { std::slice::from_raw_parts(p.add((off - base) as usize), len) })
 }
 

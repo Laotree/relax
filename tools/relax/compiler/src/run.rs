@@ -1480,7 +1480,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         // Borrowck already releases its body-owned queries at each completed check.
         let before = crate::memstat::process_rss();
         let trim_start = Instant::now();
-        if trim { crate::memstat::trim(); }
+        if trim { crate::memstat::trim(); crate::pack::release_resident(); }
         let trim_ms = trim_start.elapsed().as_secs_f64() * 1e3;
         let after = crate::memstat::process_rss();
         if crate::memstat::enabled() || crate::preload::trace() {
