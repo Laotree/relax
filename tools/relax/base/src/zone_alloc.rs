@@ -40,6 +40,15 @@ pub fn use_own_zone() {
     }
 }
 
+/// Returns the free pages of Relax's own malloc zone to the system (macOS; nothing elsewhere).
+pub fn zone_relief() {
+    #[cfg(target_os = "macos")]
+    if OWN_ZONE.load(Ordering::Relaxed) {
+        extern "C" { fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize; }
+        unsafe { malloc_zone_pressure_relief(zone::get(), 0) };
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod zone {
     use std::sync::atomic::{AtomicPtr, Ordering};

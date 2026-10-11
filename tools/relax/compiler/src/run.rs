@@ -640,7 +640,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if crate::preload::trace() && crate::memstat::enabled() {
         eprintln!("boot-trace: pmhost heap {} KB before the free, {} KB after", pm0 >> 10, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 10);
     }
-    if freed {
+    // (freed or not: the loader's worker threads have finished, and glibc keeps what they freed in
+    // their own arenas, where the compile threads cannot reuse it)
+    let _ = freed;
+    {
         // its heap goes back to the system (freed chunks otherwise stay resident, scattered
         // between the program's allocations: ~70 MB on counter), off the boot path
         let trace = crate::preload::trace();

@@ -710,6 +710,8 @@ pub fn trim() {
             fn malloc_zone_pressure_relief(zone: *const u8, goal: usize) -> usize;
         }
         unsafe { malloc_zone_pressure_relief(std::ptr::null(), 0) };
+        // Relax's own zone (a program that swapped the default zone allocates there)
+        crate::zone_alloc::zone_relief();
     }
 }
 
