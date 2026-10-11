@@ -12,6 +12,8 @@ pub trait PlatformSocketStream: Send {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
     fn flush(&mut self) -> io::Result<()>;
+    /// SHA-256 of the TLS server's leaf certificate, once handshaken.
+    fn peer_fingerprint(&self) -> Option<[u8; 32]>;
     fn shutdown(&mut self);
 }
 
