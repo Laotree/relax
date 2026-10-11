@@ -11,7 +11,6 @@
 //! (0600, same user), keeps a pid file and exits 60 s after its last client. With a TCP listener
 //! (`serve(.., Some(addr))`, only on request) it stays until killed.
 
-use crate::carrier::Carrier;
 use crate::cmd::json_str;
 use crate::conn::{Channel, ChannelTx, Conn, Event, CLOSE_LINK_LOST, CLOSE_NORMAL, CLOSE_REFUSED};
 use crate::endpoint::{Endpoint, Factory};
@@ -214,7 +213,7 @@ impl Hub {
     /// Test seam: serves a carrier a relay named `name` dialled over and binds it (the TCP path
     /// binds by proved key instead).
     #[cfg(test)]
-    pub(crate) fn accept_dialed(&self, car: Carrier) -> Result<Conn, crate::hello::HandshakeError> {
+    pub(crate) fn accept_dialed(&self, car: crate::carrier::Carrier) -> Result<Conn, crate::hello::HandshakeError> {
         let conn = Endpoint::new("relax-hub").serve(car.reader, car.writer, car.shutdown)?;
         self.bind_link(&conn.peer().name.clone(), &conn);
         Ok(conn)
