@@ -7,6 +7,7 @@
 //!   in [lo, hi) (pcs: the pc and callers; selfs: the pc only), without allocating.
 //! - `close(h)`.
 //!
+//! Android: no sampler (the app sandbox gives no perf_event_open).
 //! macOS suspends the thread for a Mach thread_get_state; Linux reads a perf_event task-clock
 //! ring the kernel fills.
 
@@ -86,6 +87,15 @@ mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_GETTID: i64 = 186;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_PERF_EVENT_OPEN: i64 = 298;
+    // asm-generic/unistd.h (aarch64): __NR_gettid / __NR_perf_event_open.
+    #[cfg(target_arch = "aarch64")]
+    const SYS_GETTID: i64 = 178;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_PERF_EVENT_OPEN: i64 = 241;
     use crate::jit::{sample_periods, SAMPLE_CALLERS, SAMPLE_MS};
     /// perf_event fd and its mapped sample ring (header page + RING_PAGES data pages)
     pub type Handle = (i32, usize, std::cell::Cell<(u64, u64, usize)>);
@@ -101,7 +111,7 @@ mod imp {
     /// task-clock sampling of the calling thread every SAMPLE_MS of its CPU time, user ips only
     pub fn open_this_thread(_me: u64) -> Option<Handle> {
         unsafe {
-            let tid = syscall(186) as i32; // gettid
+            let tid = syscall(SYS_GETTID) as i32; // gettid
             let mut attr = [0u8; 128];
             attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // PERF_TYPE_SOFTWARE
             attr[4..8].copy_from_slice(&128u32.to_ne_bytes()); // size
@@ -112,7 +122,7 @@ mod imp {
             attr[24..32].copy_from_slice(&(1u64 | 32 | 256).to_ne_bytes()); // PERF_SAMPLE_IP | PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_PERIOD
             attr[108..110].copy_from_slice(&(SAMPLE_CALLERS as u16 + 2).to_ne_bytes()); // sample_max_stack
             attr[40..48].copy_from_slice(&((1u64 << 5) | (1u64 << 6)).to_ne_bytes()); // exclude_kernel | exclude_hv
-            let fd = syscall(298, attr.as_ptr(), tid, -1i32, -1i32, 0u64) as i32; // perf_event_open
+            let fd = syscall(SYS_PERF_EVENT_OPEN, attr.as_ptr(), tid, -1i32, -1i32, 0u64) as i32; // perf_event_open
             if fd < 0 {
                 return None;
             }
@@ -338,4 +348,13 @@ impl Drop for Wait {
             if self.period { timeEndPeriod(1); }
         }
     }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+    pub type Handle = ();
+    /// Perf sampling is unsupported in the Android app sandbox.
+    pub fn open_this_thread(_me: u64) -> Option<Handle> { None }
+    pub fn close(_h: Handle) {}
+    pub fn read(_h: &Handle, _out: &mut Vec<super::Sample>, _selfs: &mut Vec<super::Sample>, _lo: u64, _hi: u64, _weight: u32) {}
 }

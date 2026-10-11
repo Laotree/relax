@@ -36,13 +36,13 @@ impl fmt::Debug for PipeWriter {
 pub fn pipe() -> Result<(PipeReader, PipeWriter)> {
     let mut fds = [0 as c_int; 2];
     unsafe {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             if sys::pipe2(fds.as_mut_ptr(), sys::os::O_CLOEXEC) < 0 {
                 return Err(crate::io::Error::last_os_error());
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             if sys::pipe(fds.as_mut_ptr()) < 0 {
                 return Err(crate::io::Error::last_os_error());
@@ -50,7 +50,7 @@ pub fn pipe() -> Result<(PipeReader, PipeWriter)> {
         }
         let r = OwnedFd::from_raw_fd(fds[0]);
         let w = OwnedFd::from_raw_fd(fds[1]);
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             for fd in [fds[0], fds[1]] {
                 if sys::fcntl(fd, sys::F_SETFD, sys::FD_CLOEXEC) < 0 {

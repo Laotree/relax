@@ -157,7 +157,7 @@ unsafe fn mprotect(_addr: *mut u8, _len: usize, _prot: i32) -> i32 {
 }
 #[cfg(windows)]
 const MAP_ANON_PRIV: i32 = 0;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const MAP_ANON_PRIV: i32 = 0x22 | 0x4000; // MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
 #[cfg(target_os = "macos")]
 const MAP_ANON_PRIV: i32 = 0x1002;

@@ -8,7 +8,7 @@
 //! - `release(base, code, rest)`: unmaps a whole reservation (an auxiliary unit dropped mid-run).
 //! - `alloc_rw(len)`: zeroed read-write pages; `free(addr, len)` returns them.
 //! - `write_code(addr, bytes)`: copies machine code into code memory (macOS: through the
-//!   writable view, then the icache flush).
+//!   writable view; aarch64 Linux/Android: a plain copy, then the icache flush).
 //! - `stack_segment(len)` / `call_on_segment`: a fresh stack with a guard page at its low end
 //!   for the compiler's deep recursions (jit.rs ensure_sufficient_stack).
 
@@ -31,9 +31,9 @@ mod unix {
         pub fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
     }
     pub const PROT_RW: i32 = 3;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const PROT_RWX: i32 = 7;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const MAP_PRIVATE_ANON: i32 = 0x22;
     #[cfg(target_os = "macos")]
     pub const MAP_PRIVATE_ANON: i32 = 0x1002;
@@ -53,7 +53,7 @@ mod unix {
     /// can be taken for another unit's code (backend2's glyph_cache profile named the program's
     /// hot loop after the freed macro world's HashMap::resize at the same address).
     pub fn retire(addr: u64, len: usize) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x4000;
         #[cfg(target_os = "macos")]
         const MAP_FIXED_NORESERVE: i32 = 0x10 | 0x40;
@@ -91,7 +91,7 @@ mod unix {
     /// code and data). Linux 5.14+ (MADV_POPULATE_WRITE); elsewhere, or on an older kernel,
     /// the pages fault in as before.
     pub fn prefault(addr: u64, len: usize) {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             extern "C" {
                 fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
@@ -103,7 +103,7 @@ mod unix {
                 unsafe { madvise(lo as *mut u8, (hi - lo) as usize, MADV_POPULATE_WRITE) };
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         let _ = (addr, len);
     }
 
@@ -156,7 +156,7 @@ mod unix {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     pub use super::unix::{alloc_rw, call_on_segment, commit, free, free_segment, mem_fns, prefault, stack_segment, CODE_TAIL};
     use super::unix::{mprotect, PROT_RWX};
@@ -185,12 +185,26 @@ mod imp {
     /// Code memory is read-write-execute: a plain copy.
     pub unsafe fn write_code(addr: u64, b: &[u8]) {
         std::ptr::copy_nonoverlapping(b.as_ptr(), addr as *mut u8, b.len());
+        flush_icache(addr, b.len());
     }
 
     /// Writes `len` bytes of machine code at `addr` in place (`fill` gets them writable; what
     /// they hold before is unspecified), as `write_code` would.
     pub unsafe fn fill_code(addr: u64, len: usize, fill: impl FnOnce(&mut [u8])) {
         fill(std::slice::from_raw_parts_mut(addr as *mut u8, len));
+        flush_icache(addr, len);
+    }
+
+    /// aarch64 does not keep the instruction cache coherent with data writes (x86-64 does).
+    #[inline(always)]
+    unsafe fn flush_icache(addr: u64, len: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            extern "C" { fn __clear_cache(start: *mut u8, end: *mut u8); }
+            __clear_cache(addr as *mut u8, (addr as *mut u8).add(len));
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (addr, len);
     }
 }
 

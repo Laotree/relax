@@ -15,7 +15,7 @@ pub use posix::*;
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 pub mod os;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[path = "linux.rs"]
 pub mod os;
 #[cfg(windows)]

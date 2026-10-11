@@ -57,6 +57,9 @@ mod unix {
         extern "C" {
             #[cfg(target_os = "linux")]
             fn __errno_location() -> *mut i32;
+            #[cfg(target_os = "android")]
+            #[link_name = "__errno"]
+            fn __errno_location() -> *mut i32;
             #[cfg(target_os = "macos")]
             #[link_name = "__error"]
             fn __errno_location() -> *mut i32;
@@ -154,6 +157,59 @@ mod imp {
         best
     }
 
+
+    /// A battery that is discharging and no mains supply online (/sys/class/power_supply).
+    pub fn on_battery() -> bool {
+        let rd = |p: std::path::PathBuf| std::fs::read_to_string(p).map(|s| s.trim().to_string()).unwrap_or_default();
+        let mut mains_online = false;
+        let mut discharging = false;
+        if let Ok(dir) = std::fs::read_dir("/sys/class/power_supply") {
+            for e in dir.flatten() {
+                let p = e.path();
+                match rd(p.join("type")).as_str() {
+                    "Mains" | "USB" => mains_online |= rd(p.join("online")) == "1",
+                    "Battery" => discharging |= rd(p.join("status")) == "Discharging",
+                    _ => {}
+                }
+            }
+        }
+        discharging && !mains_online
+    }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+    pub use super::unix::{args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    use super::unix::{dlopen, dlsym};
+
+    // NDK r28 dlfcn.h:169 RTLD_DEFAULT = 0, :191 RTLD_NOW = 2,
+    // :204 RTLD_GLOBAL = 0x100 on LP64.
+    pub unsafe fn find(name: *const u8) -> *mut u8 {
+        dlsym(std::ptr::null_mut(), name)
+    }
+
+    /// The C math library is not necessarily loaded into the host.
+    pub unsafe fn find_system(name: *const u8) -> *mut u8 {
+        for lib in ["libc.so\0", "libm.so\0", "libdl.so\0"] {
+            let h = dlopen(lib.as_ptr(), 2);
+            if !h.is_null() {
+                let p = dlsym(h, name);
+                if !p.is_null() {
+                    return p;
+                }
+            }
+        }
+        std::ptr::null_mut()
+    }
+
+    pub fn load_library(name: &str, framework: bool) -> bool {
+        let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
+        // RTLD_NOW | RTLD_GLOBAL
+        unsafe { !dlopen(path.as_ptr(), 2 | 0x100).is_null() }
+    }
+
+    /// Bionic public libraries use plain sonames; never scan desktop library paths.
+    pub fn load_library_versioned(_name: &str) -> bool { false }
 
     /// A battery that is discharging and no mains supply online (/sys/class/power_supply).
     pub fn on_battery() -> bool {

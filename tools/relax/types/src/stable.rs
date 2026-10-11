@@ -478,12 +478,42 @@ pub fn build_id() -> u128 {
                 return h.finish128();
             }
         }
+        #[cfg(target_os = "android")]
+        let exe = android_runtime_image();
+        #[cfg(not(target_os = "android"))]
         let exe = std::env::current_exe().ok().and_then(|p| std::fs::read(p).ok()).unwrap_or_default();
         let mut h = Sip128::new();
         h.str("build-exe");
         h.write(&exe);
         h.finish128()
     })
+}
+
+/// In the Activity, current_exe is app_process64: hash Relax's loaded image instead.
+#[cfg(target_os = "android")]
+fn android_runtime_image() -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    // NDK r28 dlfcn.h: Dl_info consists of name/base/name/address pointers.
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const std::ffi::c_char,
+        base: *mut std::ffi::c_void,
+        sname: *const std::ffi::c_char,
+        saddr: *mut std::ffi::c_void,
+    }
+    extern "C" {
+        fn dladdr(addr: *const std::ffi::c_void, info: *mut DlInfo) -> i32;
+    }
+    unsafe {
+        let mut info: DlInfo = std::mem::zeroed();
+        if dladdr(build_id as *const () as *const std::ffi::c_void, &mut info) != 0 && !info.fname.is_null() {
+            let path = std::ffi::OsStr::from_bytes(std::ffi::CStr::from_ptr(info.fname).to_bytes());
+            if let Ok(bytes) = std::fs::read(path) {
+                return bytes;
+            }
+        }
+    }
+    panic!("cannot read Relax's Android runtime image for its build identity");
 }
 
 #[cfg(target_os = "macos")]

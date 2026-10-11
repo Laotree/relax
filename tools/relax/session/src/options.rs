@@ -8,13 +8,14 @@ pub enum Borrowck { Off, Moves, Full }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BorrowckAll { Default, Nongeneric, Std, All }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64 }
+pub enum CheckTarget { Host, MacosArm64, LinuxX64, WindowsX64, AndroidArm64 }
 impl CheckTarget {
     /// The targets Relax runs on (and checks for), by triple: `RELAX_CHECK_TARGET` and `relax host-gen`.
-    pub const TRIPLES: [(&'static str, CheckTarget); 3] = [
+    pub const TRIPLES: [(&'static str, CheckTarget); 4] = [
         ("aarch64-apple-darwin", CheckTarget::MacosArm64),
         ("x86_64-unknown-linux-gnu", CheckTarget::LinuxX64),
         ("x86_64-pc-windows-gnu", CheckTarget::WindowsX64),
+        ("aarch64-linux-android", CheckTarget::AndroidArm64),
     ];
     pub fn from_triple(triple: &str) -> Option<CheckTarget> {
         Self::TRIPLES.iter().find(|(t, _)| *t == triple).map(|(_, c)| *c)

@@ -39,7 +39,7 @@ pub struct BorrowedFd<'fd> {
 
 #[cfg(target_os = "macos")]
 const F_DUPFD_CLOEXEC: core::ffi::c_int = 67;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const F_DUPFD_CLOEXEC: core::ffi::c_int = 1030;
 
 impl OwnedFd {

@@ -24,7 +24,7 @@ mod unix {
         unsafe {
             pthread_key_create(&mut key, Some(dtor));
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let key = key as u32 as usize;
         key as u64
     }
@@ -61,6 +61,24 @@ mod imp {
             panic!("thread-local block cell is not in static TLS (offset {:#x})", off);
         }
         off as u64
+    }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+    pub use super::unix::{get, key_create};
+
+    pub fn set(key: u64, block: *mut u8) {
+        unsafe { super::unix::pthread_setspecific(key as usize, block); }
+    }
+
+    // Compiled thread-locals are NOT implemented on Android (codegen2, android lane item A5):
+    // codegen/arm64.rs tls_addr reads the Darwin TSD base from tpidrro_el0, which is 0 on
+    // Linux/Android (the thread pointer is tpidr_el0), so JIT code touching a thread-local
+    // would fault. Fail loudly here instead of handing it a bogus slot. Relax's own
+    // (rustc-built) code uses get/set above and is fine.
+    pub fn jit_offset(_key: u64, _emit: &dyn Fn(&[u8]) -> u64) -> u64 {
+        panic!("Android: compiled thread-locals are not implemented (arm64 tls_addr needs a tpidr_el0 / AAPCS64 TLS path in codegen)")
     }
 }
 

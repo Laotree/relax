@@ -1,5 +1,5 @@
-//! Linux (x86_64 glibc first; aarch64 differs only in the syscall number and stat layout,
-//! not handled yet) specifics.
+//! Linux and Android: architecture-specific layouts and glibc/bionic symbols.
+//! Android constants/layouts below refer to the installed NDK 28.2.13676358 headers.
 
 use core::ffi::{c_char, c_int, c_long, c_void};
 use core::sync::atomic::AtomicU32;
@@ -11,16 +11,31 @@ pub const CLOCK_MONOTONIC: clockid_t = 1;
 /// What real std's Instant uses on Linux.
 pub const CLOCK_INSTANT: clockid_t = 1;
 
+#[cfg(not(target_os = "android"))]
 pub const SC_NPROCESSORS_ONLN: c_int = 84;
+#[cfg(not(target_os = "android"))]
 pub const SC_PAGESIZE: c_int = 30;
+
+// bits/sysconf.h:114,210 (bionic values, distinct from glibc).
+#[cfg(target_os = "android")]
+pub const SC_PAGESIZE: c_int = 0x27;
+#[cfg(target_os = "android")]
+pub const SC_NPROCESSORS_ONLN: c_int = 0x61;
 
 pub const O_CREAT: c_int = 0x40;
 pub const O_EXCL: c_int = 0x80;
 pub const O_TRUNC: c_int = 0x200;
 pub const O_APPEND: c_int = 0x400;
 pub const O_NONBLOCK: c_int = 0x800;
+#[cfg(target_arch = "x86_64")]
 pub const O_DIRECTORY: c_int = 0x10000;
+#[cfg(target_arch = "x86_64")]
 pub const O_NOFOLLOW: c_int = 0x20000;
+// aarch64-linux-android/asm/fcntl.h:9-10 (octal 040000 / 0100000).
+#[cfg(target_arch = "aarch64")]
+pub const O_DIRECTORY: c_int = 0x4000;
+#[cfg(target_arch = "aarch64")]
+pub const O_NOFOLLOW: c_int = 0x8000;
 pub const O_CLOEXEC: c_int = 0x80000;
 
 pub const LOCK_SH: c_int = 1;
@@ -80,6 +95,7 @@ pub const ESTALE: i32 = 116;
 pub const EDQUOT: i32 = 122;
 
 /// struct stat, x86_64 (144 bytes).
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct stat_t {
@@ -103,6 +119,32 @@ pub struct stat_t {
     pub unused: [i64; 3],
 }
 
+/// asm-generic/stat.h:11-32, also sys/stat.h's aarch64 layout: 128 bytes.
+#[cfg(target_arch = "aarch64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct stat_t {
+    pub st_dev: u64,           // :12, offset 0
+    pub st_ino: u64,           // :13, offset 8
+    pub st_mode: u32,          // :14, offset 16
+    pub st_nlink: u32,         // :15, offset 20
+    pub st_uid: u32,           // :16, offset 24
+    pub st_gid: u32,           // :17, offset 28
+    pub st_rdev: u64,          // :18, offset 32
+    pub pad1: u64,             // :19, offset 40
+    pub st_size: i64,          // :20, offset 48
+    pub st_blksize: i32,        // :21, offset 56
+    pub pad2: i32,             // :22, offset 60
+    pub st_blocks: i64,        // :23, offset 64
+    pub st_atime: i64,         // :24, offset 72
+    pub st_atime_nsec: i64,    // :25, offset 80
+    pub st_mtime: i64,         // :26, offset 88
+    pub st_mtime_nsec: i64,    // :27, offset 96
+    pub st_ctime: i64,         // :28, offset 104
+    pub st_ctime_nsec: i64,    // :29, offset 112
+    pub unused: [u32; 2],      // :30-31, offset 120
+}
+
 impl stat_t {
     /// A stat of a file Relax's VFS serves (git runs): its type bits and size only.
     pub fn synthetic(mode: u32, size: i64) -> stat_t {
@@ -112,17 +154,25 @@ impl stat_t {
         st
     }
     pub fn zeroed() -> stat_t {
-        stat_t {
+        #[cfg(target_arch = "x86_64")]
+        return stat_t {
             st_dev: 0, st_ino: 0, st_nlink: 0, st_mode: 0, st_uid: 0, st_gid: 0, pad0: 0,
             st_rdev: 0, st_size: 0, st_blksize: 0, st_blocks: 0, st_atime: 0, st_atime_nsec: 0,
             st_mtime: 0, st_mtime_nsec: 0, st_ctime: 0, st_ctime_nsec: 0, unused: [0; 3],
-        }
+        };
+        #[cfg(target_arch = "aarch64")]
+        return stat_t {
+            st_dev: 0, st_ino: 0, st_mode: 0, st_nlink: 0, st_uid: 0, st_gid: 0,
+            st_rdev: 0, pad1: 0, st_size: 0, st_blksize: 0, pad2: 0, st_blocks: 0,
+            st_atime: 0, st_atime_nsec: 0, st_mtime: 0, st_mtime_nsec: 0,
+            st_ctime: 0, st_ctime_nsec: 0, unused: [0; 2],
+        };
     }
     pub fn mode(&self) -> u32 {
         self.st_mode
     }
     pub fn nlink(&self) -> u64 {
-        self.st_nlink
+        self.st_nlink as u64
     }
     pub fn dev(&self) -> u64 {
         self.st_dev
@@ -149,7 +199,9 @@ pub struct dirent_t {
 }
 
 extern "C" {
+    #[cfg_attr(target_os = "android", link_name = "__errno")] // errno.h:52
     fn __errno_location() -> *mut c_int;
+    #[cfg_attr(target_os = "android", link_name = "strerror_r")] // string.h:159 (XSI)
     fn __xpg_strerror_r(errnum: c_int, buf: *mut c_char, len: usize) -> c_int;
     pub fn stat(path: *const c_char, buf: *mut stat_t) -> c_int;
     pub fn lstat(path: *const c_char, buf: *mut stat_t) -> c_int;
@@ -163,7 +215,11 @@ extern "C" {
     fn readlink(path: *const c_char, buf: *mut c_char, size: usize) -> isize;
 }
 
+#[cfg(target_arch = "x86_64")]
 const SYS_FUTEX: c_long = 202;
+// asm-generic/unistd.h:138
+#[cfg(target_arch = "aarch64")]
+const SYS_FUTEX: c_long = 98;
 const FUTEX_WAIT_BITSET: c_int = 9;
 const FUTEX_WAKE: c_int = 1;
 const FUTEX_PRIVATE_FLAG: c_int = 128;

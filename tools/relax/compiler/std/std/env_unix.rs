@@ -377,7 +377,7 @@ where
 pub mod consts {
     pub const ARCH: &str = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
     pub const FAMILY: &str = "unix";
-    pub const OS: &str = if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    pub const OS: &str = if cfg!(target_os = "macos") { "macos" } else if cfg!(target_os = "android") { "android" } else { "linux" };
     pub const DLL_PREFIX: &str = "lib";
     pub const DLL_SUFFIX: &str = if cfg!(target_os = "macos") { ".dylib" } else { ".so" };
     pub const DLL_EXTENSION: &str = if cfg!(target_os = "macos") { "dylib" } else { "so" };

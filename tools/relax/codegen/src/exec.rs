@@ -82,12 +82,12 @@ impl Code {
             win::FlushInstructionCache(win::GetCurrentProcess(), ptr, len);
             return Some(Code { ptr: ptr as *mut u8, map_len, len: bytes.len() });
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android", windows)))]
         {
             let _ = bytes;
             return None;
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android"))]
         unsafe {
             let len = bytes.len().max(1);
             let map_len = (len + 16383) & !16383;

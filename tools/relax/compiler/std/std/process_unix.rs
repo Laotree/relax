@@ -485,6 +485,12 @@ impl Command {
     /// mount table (RELAX_VFS), which a Relax program's std and Relax itself serve paths from. A
     /// real current folder clears an inherited virtual one.
     fn spawn_with_mode(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
+        // NDK r28 spawn.h: addchdir_np requires API 34; spawning itself requires API 28.
+        // The launcher will provide --cwd; never change the Activity process's cwd or fork it.
+        #[cfg(target_os = "android")]
+        if self.cwd.is_some() || !self.closures.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, "Android posix_spawn does not support cwd or pre_exec"));
+        }
         let Some(dir) = self.cwd.clone() else {
             return self.spawn_now(default, exec);
         };
@@ -563,6 +569,7 @@ impl Command {
         let (stdout_child, stdout_parent) = setup_stdio(self.stdout.take(), default_piped, false)?;
         let (stderr_child, stderr_parent) = setup_stdio(self.stderr.take(), default_piped, false)?;
 
+        #[cfg(not(target_os = "android"))]
         if !self.closures.is_empty() {
             if exec {
                 // CommandExt::exec: real std runs the closures in this process before the exec
@@ -609,6 +616,7 @@ impl Command {
             if let Some(fd) = &stderr_child {
                 posix_spawn_file_actions_adddup2(&mut actions as *mut SpawnFileActions, fd.as_raw_fd(), 2);
             }
+            #[cfg(not(target_os = "android"))]
             if let Some(c) = &cwd {
                 posix_spawn_file_actions_addchdir_np(&mut actions as *mut SpawnFileActions, c.as_ptr());
             }
@@ -696,6 +704,7 @@ impl Command {
     /// fork + exec for commands with pre_exec closures (real std's do_exec order: stdio, cwd,
     /// process group, SIGPIPE default, closures, exec). Returns the child's pid, or the error the
     /// child reported through the CLOEXEC pipe (the child is reaped then).
+    #[cfg(not(target_os = "android"))]
     unsafe fn fork_exec(&mut self, prog: &CString, argv: &Vec<*const c_char>, envp: *const *const c_char, cwd: &Option<CString>, stdin_child: &Option<OwnedFd>, stdout_child: &Option<OwnedFd>, stderr_child: &Option<OwnedFd>) -> io::Result<sys::pid_t> {
         let (err_r, err_w) = anon_pipe()?;
         let pid = fork();
@@ -976,6 +985,7 @@ extern "C" {
     fn posix_spawn_file_actions_init(a: *mut SpawnFileActions) -> c_int;
     fn posix_spawn_file_actions_destroy(a: *mut SpawnFileActions) -> c_int;
     fn posix_spawn_file_actions_adddup2(a: *mut SpawnFileActions, fd: c_int, newfd: c_int) -> c_int;
+    #[cfg(not(target_os = "android"))]
     fn posix_spawn_file_actions_addchdir_np(a: *mut SpawnFileActions, path: *const c_char) -> c_int;
     fn posix_spawnattr_init(a: *mut SpawnAttr) -> c_int;
     fn posix_spawnattr_destroy(a: *mut SpawnAttr) -> c_int;
@@ -994,9 +1004,12 @@ extern "C" {
     #[cfg(not(target_os = "macos"))]
     fn execvpe(file: *const c_char, argv: *const *const c_char, envp: *const *const c_char) -> c_int;
     fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int;
+    #[cfg(not(target_os = "android"))]
     fn fork() -> sys::pid_t;
+    #[cfg(not(target_os = "android"))]
     #[link_name = "setpgid"]
     fn fork_setpgid(pid: sys::pid_t, pgid: sys::pid_t) -> c_int;
+    #[cfg(not(target_os = "android"))]
     #[link_name = "signal"]
     fn fork_signal(sig: c_int, handler: usize) -> usize;
     #[cfg(target_os = "macos")]

@@ -96,7 +96,7 @@ fn forget(cfg: &Config, pid: u32) {
 }
 
 /// The start time of a running process; None when there is no such process (or it is a zombie).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn proc_start(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // `pid (comm) state ...`: comm may hold spaces and parens, so count from the last `)`
@@ -130,7 +130,7 @@ pub fn proc_start(pid: u32) -> Option<u64> {
     Some(u64_at(120) * 1_000_000 + u64_at(128))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn proc_start(pid: u32) -> Option<u64> {
     crate::procs::is_alive(pid).then_some(0)
 }

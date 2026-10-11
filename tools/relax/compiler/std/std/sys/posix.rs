@@ -68,7 +68,7 @@ extern "C" {
     pub fn dup(fd: c_int) -> c_int;
     pub fn dup2(fd: c_int, fd2: c_int) -> c_int;
     pub fn pipe(fds: *mut c_int) -> c_int;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
     pub fn isatty(fd: c_int) -> c_int;
     pub fn flock(fd: c_int, op: c_int) -> c_int;

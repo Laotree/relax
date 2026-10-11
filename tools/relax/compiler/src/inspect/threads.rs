@@ -91,6 +91,7 @@ pub fn release_hold(s: &HoldSlot) {
 /// Up to `len` bytes of this process's memory at `addr`, or None where it is not readable (a
 /// read that fails instead of faulting: process_vm_readv / mach_vm_read_overwrite).
 pub fn read_mem(addr: u64, len: usize) -> Option<Vec<u8>> {
+    #[cfg_attr(any(windows, target_os = "android"), allow(unused_mut))]
     let mut v = vec![0u8; len];
     if len == 0 {
         return Some(v);
@@ -116,7 +117,7 @@ pub fn read_mem(addr: u64, len: usize) -> Option<Vec<u8>> {
         let r = unsafe { mach_vm_read_overwrite(mach_task_self_, addr, len as u64, v.as_mut_ptr() as u64, &mut got) };
         (r == 0 && got == len as u64).then_some(v)
     }
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "android"))]
     {
         let _ = addr;
         None
@@ -685,7 +686,7 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod imp {
     use super::{Raw, Thread};
     pub fn self_os_id() -> u64 {
@@ -698,6 +699,6 @@ mod imp {
         Vec::new()
     }
     pub fn capture(_t: &Thread, _raw: &mut Raw) -> Result<(), &'static str> {
-        Err("stack capture is not implemented on Windows")
+        Err("stack capture is not implemented on this target")
     }
 }

@@ -827,7 +827,7 @@ mod pause_imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod pause_imp {
     pub fn pause(_want: &'static (dyn Fn(&crate::inspect::threads::Thread) -> bool + Sync)) -> usize {
         0

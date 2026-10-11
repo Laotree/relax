@@ -55,6 +55,7 @@ impl Response {
 }
 
 /// The parts of an http(s) URL.
+#[cfg(not(target_os = "android"))]
 pub(crate) struct Url<'a> {
     pub https: bool,
     pub host: &'a str,
@@ -63,6 +64,7 @@ pub(crate) struct Url<'a> {
     pub target: &'a str,
 }
 
+#[cfg(not(target_os = "android"))]
 pub(crate) fn parse_url(url: &str) -> Result<Url<'_>, String> {
     let (https, rest) = if let Some(r) = url.strip_prefix("https://") {
         (true, r)
@@ -99,6 +101,7 @@ pub(crate) fn parse_url(url: &str) -> Result<Url<'_>, String> {
 }
 
 /// Sends `req`; the response body goes to `out`, `progress(received, expected)` follows it.
+#[cfg(not(target_os = "android"))]
 pub fn send(req: &Request, out: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response, String> {
     let url = parse_url(req.url)?;
     for (n, v) in req.headers {
@@ -136,6 +139,7 @@ pub fn fetch(req: &Request) -> Result<(Response, Vec<u8>), String> {
 }
 
 /// Writes into `out`, counting against the cap and reporting progress.
+#[cfg(not(target_os = "android"))]
 pub(crate) struct Sink<'a> {
     pub out: &'a mut dyn Write,
     pub progress: &'a mut dyn FnMut(u64, Option<u64>),
@@ -144,6 +148,7 @@ pub(crate) struct Sink<'a> {
     pub max: u64,
 }
 
+#[cfg(not(target_os = "android"))]
 impl Sink<'_> {
     pub fn put(&mut self, data: &[u8]) -> Result<(), String> {
         self.received += data.len() as u64;
@@ -158,3 +163,9 @@ impl Sink<'_> {
 
 #[cfg(test)]
 mod tests;
+
+/// Android networking is supplied by the Activity's JNI bridge (not system OpenSSL).
+#[cfg(target_os = "android")]
+pub fn send(_req: &Request, _out: &mut dyn Write, _progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response, String> {
+    Err("https on android goes through the JNI bridge".into())
+}

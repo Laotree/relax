@@ -8070,6 +8070,7 @@ pub(crate) fn sample_periods() -> &'static [u64] {
 }
 const SAMPLES_HOT: u32 = 5;
 /// callers credited with a sample too (a loop calling a hot callee is hot itself)
+#[cfg(not(target_os = "android"))]
 pub(crate) const SAMPLE_CALLERS: usize = 2;
 static EXEC_LO: AtomicU64 = AtomicU64::new(0);
 static EXEC_HI: AtomicU64 = AtomicU64::new(0);

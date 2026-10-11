@@ -14,6 +14,9 @@
 //! allocator) is tracked the same way with `host=1`: memstat calls the host tracker while it is
 //! set, and its samples carry the compiler category of the allocating thread.
 
+// The interposers exist on Linux x86-64 and macOS arm64 only (veneer returns None elsewhere).
+#![cfg_attr(not(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64"))), allow(dead_code))]
+
 use super::{json_str, now_ms, Out, Req};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};

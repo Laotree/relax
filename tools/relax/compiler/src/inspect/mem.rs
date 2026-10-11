@@ -84,7 +84,7 @@ pub fn take(compiler: bool, partial: &mut Vec<String>) -> Snap {
     s
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn os_regions(s: &mut Snap) {
     let text = std::fs::read_to_string("/proc/self/smaps").unwrap_or_default();
     let home = std::env::var("RELAX_HOME").unwrap_or_default();
@@ -123,13 +123,13 @@ fn os_regions(s: &mut Snap) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn kb(v: &str) -> u64 {
     v.split_whitespace().next().and_then(|x| x.parse::<u64>().ok()).unwrap_or(0) * 1024
 }
 
 /// What a mapping is, from its smaps name.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn classify_path(path: &str, home: &str) -> String {
     match path {
         "" => "unnamed (malloc arenas + large blocks, thread stacks, driver memory)".into(),
@@ -293,7 +293,8 @@ fn malloc_stats(s: &mut Snap) {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
+/// bionic has no mallinfo2 before API 34.
 fn malloc_stats(_s: &mut Snap) {}
 
 fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {

@@ -207,7 +207,7 @@ mod imp {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 mod imp {
     use super::Run;
     pub fn collect(threads: Vec<crate::inspect::threads::Thread>, secs: f64, hz: u64) -> Run {

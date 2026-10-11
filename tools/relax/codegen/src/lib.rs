@@ -27,9 +27,9 @@ pub fn cpu_ns() -> u64 {
     extern "C" {
         fn clock_gettime(clk: i32, ts: *mut Timespec) -> i32;
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     const CLOCK_THREAD_CPUTIME_ID: i32 = 3;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     const CLOCK_THREAD_CPUTIME_ID: i32 = 16;
     let mut ts = Timespec { sec: 0, nsec: 0 };
     unsafe {

@@ -73,7 +73,7 @@ mod unix {
     pub const SIGTRAP: i32 = 5;
     pub const SIGFPE: i32 = 8;
     pub const SIGSEGV: i32 = 11;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     pub const SIGBUS: i32 = 7;
     #[cfg(target_os = "macos")]
     pub const SIGBUS: i32 = 10;
@@ -86,7 +86,7 @@ mod unix {
             SIGILL => Kind::Ill,
             SIGFPE => Kind::Fpe,
             SIGTRAP => Kind::Trap,
-            s if s == super::SIG_WATCHDOG => Kind::Watchdog,
+            s if s == super::watchdog_signal() => Kind::Watchdog,
             _ => Kind::Other,
         }
     }
@@ -199,6 +199,187 @@ mod imp {
                     CHAINED[sig as usize][0].store(old.handler, Ordering::SeqCst);
                     CHAINED[sig as usize][1].store(old.flags as usize, Ordering::SeqCst);
                     let act = SigAction { handler: on_signal as *const () as usize, mask: [0; 16], flags: OUR_FLAGS, pad: 0, restorer: 0 };
+                    sigaction(sig, &act, std::ptr::null_mut());
+                }
+            }
+        }
+    }
+
+    /// Passes a signal that is not ours to the handler we replaced, if any. False: none.
+    unsafe fn chain(sig: i32, info: *mut u8, uc: *mut u8) -> bool {
+        let h = CHAINED[sig as usize][0].load(Ordering::SeqCst);
+        let flags = CHAINED[sig as usize][1].load(Ordering::SeqCst) as i32;
+        if h <= 1 {
+            // SIG_DFL / SIG_IGN
+            return false;
+        }
+        unsafe {
+            if flags & SA_SIGINFO != 0 {
+                let f: extern "C" fn(i32, *mut u8, *mut u8) = std::mem::transmute(h);
+                f(sig, info, uc);
+            } else {
+                let f: extern "C" fn(i32) = std::mem::transmute(h);
+                f(sig);
+            }
+        }
+        true
+    }
+}
+
+#[cfg(target_os = "android")]
+mod imp {
+    use super::unix::{kind, SIGBUS, SIGFPE, SIGILL, SIGSEGV};
+    use super::{Action, Fault, Hooks};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // ART uses SIGUSR1. Resolve bionic's available RT range at installation.
+    // NDK r28 signal.h declares __libc_current_sigrtmin / __libc_current_sigrtmax.
+    static WATCHDOG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    pub fn watchdog_signal() -> i32 { WATCHDOG.load(Ordering::Relaxed) }
+
+    /// LP64 bionic offsets, in bytes, derived from NDK 28.2.13676358 headers.
+    /// uc_mcontext is 16-byte aligned: 40-byte prefix + 128-byte signal mask,
+    /// rounded up to 176, followed by the sigcontext's fault_address.
+    const OFFSETS: [usize; 16] = [
+        0,   // 0 sa_flags: bits/signal_types.h:104
+        8,   // 1 sa_handler: bits/signal_types.h:105-108 (pointer alignment)
+        16,  // 2 sa_mask: bits/signal_types.h:109; asm-generic/signal.h:56-58
+        24,  // 3 sa_restorer: bits/signal_types.h:110
+        0,   // 4 ss_sp: asm-generic/signal.h:73
+        8,   // 5 ss_flags: asm-generic/signal.h:74
+        16,  // 6 ss_size: asm-generic/signal.h:75 (LP64 alignment)
+        16,  // 7 si_addr: asm-generic/siginfo.h:49,81 (union aligned to 8)
+        176, // 8 uc_mcontext: sys/ucontext.h:112-122; asm/sigcontext.h:17
+        184, // 9 x0: aarch64-linux-android/asm/sigcontext.h:12-13
+        192, // 10 x1: asm/sigcontext.h:13 (x0 + 8)
+        416, // 11 fp (x29): asm/sigcontext.h:13 (x0 + 29*8)
+        424, // 12 lr (x30): asm/sigcontext.h:13 (x0 + 30*8)
+        432, // 13 sp: asm/sigcontext.h:14
+        440, // 14 pc: asm/sigcontext.h:15
+        32,  // 15 sizeof(sigaction): bits/signal_types.h:103-110
+    ];
+    /// the watchdog's signal handler runs on the looping thread itself
+    pub const NEEDS_HANG_TRAMP: bool = false;
+
+    extern "C" {
+        fn sigaction(sig: i32, act: *const SigAction, old: *mut SigAction) -> i32;
+        fn sigaltstack(ss: *const StackT, old: *mut StackT) -> i32;
+    }
+
+    #[repr(C)]
+    struct SigAction {
+        flags: i32,
+        pad: i32,
+        handler: usize,
+        mask: u64,
+        restorer: usize,
+    }
+
+    #[repr(C)]
+    struct StackT {
+        sp: *mut u8,
+        flags: i32,
+        pad: i32,
+        size: usize,
+    }
+
+    fn default_action(sig: i32) {
+        let act = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
+        unsafe {
+            sigaction(sig, &act, std::ptr::null_mut());
+        }
+    }
+
+    extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
+        unsafe {
+            let reg = |i: usize| uc.add(OFFSETS[i]) as *mut u64;
+            // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
+            if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
+                let (pc, fp) = (*reg(14), *reg(11));
+                eprintln!("relax-watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
+                return;
+            }
+            let f = Fault { kind: kind(sig), sig, pc: *reg(14), sp: *reg(13), fp: *reg(11), addr: *(info.add(OFFSETS[7]) as *const u64) };
+            let chained = CHAINED[sig as usize][0].load(Ordering::SeqCst) > 1;
+            match crate::jit::on_fault(&f, &Hooks { prepare: &|| {}, chained, debug: &|| {} }) {
+                Action::Ignore => {}
+                Action::PassOn => {
+                    if !chain(sig, info, uc) {
+                        default_action(sig);
+                    }
+                }
+                Action::Die => default_action(sig),
+                Action::Resume { pc, a0, a1 } => {
+                    *reg(14) = pc;
+                    *reg(9) = a0;
+                    *reg(10) = a1;
+                }
+            }
+        }
+    }
+
+    /// sigaltstack for the calling thread (64 KB)
+    pub fn this_thread() {
+        unsafe {
+            let stack = crate::os::mem::alloc_rw(1 << 16);
+            let ss = StackT { sp: stack as *mut u8, flags: 0, pad: 0, size: 1 << 16 };
+            sigaltstack(&ss, std::ptr::null_mut());
+        }
+    }
+
+    fn our_signals() -> [i32; 5] { [SIGILL, SIGBUS, SIGFPE, watchdog_signal(), SIGSEGV] }
+    const _: () = {
+        assert!(std::mem::offset_of!(SigAction, flags) == OFFSETS[0]);
+        assert!(std::mem::offset_of!(SigAction, handler) == OFFSETS[1]);
+        assert!(std::mem::offset_of!(SigAction, mask) == OFFSETS[2]);
+        assert!(std::mem::offset_of!(SigAction, restorer) == OFFSETS[3]);
+        assert!(std::mem::offset_of!(StackT, sp) == OFFSETS[4]);
+        assert!(std::mem::offset_of!(StackT, flags) == OFFSETS[5]);
+        assert!(std::mem::offset_of!(StackT, size) == OFFSETS[6]);
+        assert!(std::mem::size_of::<SigAction>() == OFFSETS[15]);
+    };
+    const SA_SIGINFO: i32 = 4;
+    /// SA_SIGINFO | SA_ONSTACK | SA_NODEFER
+    const OUR_FLAGS: i32 = SA_SIGINFO | 0x0800_0000 | 0x4000_0000;
+
+    pub fn install() {
+        // sigaction is deliberately the public libc entry: ART's libsigchain intercepts it
+        // in an Activity process. Keep its chaining, then preserve prior user handlers.
+        extern "C" {
+            fn __libc_current_sigrtmin() -> i32;
+            fn __libc_current_sigrtmax() -> i32;
+        }
+        unsafe {
+            let signal = __libc_current_sigrtmin() + 4;
+            assert!(signal <= __libc_current_sigrtmax(), "no watchdog RT signal");
+            WATCHDOG.store(signal, Ordering::Relaxed);
+            for sig in our_signals() {
+                let act = SigAction { handler: on_signal as *const () as usize, mask: 0, flags: OUR_FLAGS, pad: 0, restorer: 0 };
+                let mut old = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
+                if sigaction(sig, &act, &mut old) == 0 && old.handler != on_signal as *const () as usize {
+                    CHAINED[sig as usize][0].store(old.handler, Ordering::SeqCst);
+                    CHAINED[sig as usize][1].store(old.flags as usize, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// Handlers a library of the program installed over ours (Chromium's in cef_initialize, as on
+    /// macOS): (handler, flags) per signal, called for signals that are not faults in JIT code.
+    static CHAINED: [[AtomicUsize; 2]; 65] = [const { [const { AtomicUsize::new(0) }; 2] }; 65];
+
+    /// Puts our handlers back on top where the program replaced them, keeping the replacement as
+    /// the next handler in the chain (the run monitor calls this every 100 ms). Without it a fault
+    /// in JIT code after CEF started was Chromium's (a bare core dump, no report).
+    pub fn reassert() {
+        unsafe {
+            for sig in our_signals() {
+                let mut old = SigAction { handler: 0, mask: 0, flags: 0, pad: 0, restorer: 0 };
+                sigaction(sig, std::ptr::null(), &mut old);
+                if old.handler != on_signal as *const () as usize {
+                    CHAINED[sig as usize][0].store(old.handler, Ordering::SeqCst);
+                    CHAINED[sig as usize][1].store(old.flags as usize, Ordering::SeqCst);
+                    let act = SigAction { handler: on_signal as *const () as usize, mask: 0, flags: OUR_FLAGS, pad: 0, restorer: 0 };
                     sigaction(sig, &act, std::ptr::null_mut());
                 }
             }
@@ -635,3 +816,6 @@ mod imp {
         }
     }
 }
+
+#[cfg(not(target_os = "android"))]
+pub fn watchdog_signal() -> i32 { SIG_WATCHDOG }

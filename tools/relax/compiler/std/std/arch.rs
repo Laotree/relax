@@ -173,7 +173,7 @@ pub mod detect {
             | bit(Feature::Avx512fp16, avx512 && e.edx & (1 << 23) != 0)
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(any(target_os = "linux", target_os = "android"), target_arch = "aarch64"))]
     fn detect_features() -> u64 {
         extern "C" { fn getauxval(kind: usize) -> usize; }
         let hw = unsafe { getauxval(16) }; // AT_HWCAP
@@ -223,7 +223,7 @@ pub mod detect {
         }
     }
 
-    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux", target_os = "windows")))))]
+    #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux", target_os = "android", target_os = "windows")))))]
     fn detect_features() -> u64 { 0 }
 
 }

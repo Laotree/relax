@@ -128,6 +128,8 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
         crate::options::CheckTarget::WindowsX64 => "x86_64-pc-windows-gnu",
         crate::options::CheckTarget::MacosArm64 => "aarch64-apple-darwin",
         crate::options::CheckTarget::LinuxX64 => "x86_64-unknown-linux-gnu",
+        crate::options::CheckTarget::AndroidArm64 => "aarch64-linux-android",
+        _ if cfg!(target_os = "android") => "aarch64-linux-android",
         _ if cfg!(all(target_os = "macos", target_arch = "aarch64")) => "aarch64-apple-darwin",
         _ if cfg!(windows) => "x86_64-pc-windows-gnu",
         _ => "x86_64-unknown-linux-gnu",

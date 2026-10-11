@@ -482,6 +482,15 @@ pub fn process_rss() -> (u64, u64, String) {
         );
         (kb("VmRSS:"), kb("VmHWM:"), extra)
     }
+    #[cfg(target_os = "android")]
+    {
+        // Bionic has no glibc mallinfo2; procfs remains the process RSS source.
+        let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let kb = |k: &str| -> u64 {
+            s.lines().find(|l| l.starts_with(k)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024
+        };
+        (kb("VmRSS:"), kb("VmHWM:"), format!("anon {} MB, file {} MB", mb(kb("RssAnon:")), mb(kb("RssFile:"))))
+    }
     #[cfg(target_os = "macos")]
     {
         extern "C" {
@@ -517,7 +526,7 @@ pub fn process_rss() -> (u64, u64, String) {
         );
         (buf[2], buf[3], extra)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     {
         (0, 0, String::new())
     }

@@ -11,7 +11,7 @@ pub type socklen_t = u32;
 pub const AF_UNIX: c_int = 1;
 #[cfg(target_os = "macos")]
 pub const AF_INET6: c_int = 30;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub const AF_INET6: c_int = 10;
 pub const SHUT_RD: c_int = 0;
 pub const SHUT_WR: c_int = 1;
@@ -42,7 +42,7 @@ mod k {
     pub const FIONBIO: u64 = 0x8004667e;
     pub const SUN_PATH_LEN: usize = 104;
 }
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod k {
     use core::ffi::c_int;
     pub const SOL_SOCKET: c_int = 1;
@@ -87,7 +87,8 @@ pub struct PollFd {
     pub revents: i16,
 }
 
-/// struct addrinfo: macOS has ai_canonname before ai_addr, glibc after.
+/// struct addrinfo: macOS/bionic put ai_canonname before ai_addr, glibc after.
+/// NDK r28 netdb.h:112-120.
 #[repr(C)]
 pub struct AddrInfo {
     pub ai_flags: c_int,
@@ -106,7 +107,7 @@ impl AddrInfo {
         AddrInfo { ai_flags: 0, ai_family: 0, ai_socktype: socktype, ai_protocol: 0, ai_addrlen: 0, ai_p1: core::ptr::null_mut(), ai_p2: core::ptr::null_mut(), ai_next: core::ptr::null_mut() }
     }
     pub fn addr(&self) -> *const u8 {
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "android")) {
             self.ai_p2 as *const u8
         } else {
             self.ai_p1 as *const u8

@@ -39,7 +39,7 @@ mod unix {
 
     pub fn kick(t: u64) {
         unsafe {
-            pthread_kill(t as usize, crate::os::fault::SIG_WATCHDOG);
+            pthread_kill(t as usize, crate::os::fault::watchdog_signal());
         }
     }
 
@@ -54,7 +54,7 @@ mod unix {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
     pub use super::unix::{at_fork, current, exit_now, kick, name};
     use super::unix::pthread_self;

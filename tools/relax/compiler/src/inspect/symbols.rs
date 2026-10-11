@@ -64,7 +64,7 @@ fn dladdr_name(pc: u64) -> Option<(String, u64)> {
     if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
         return None;
     }
-    let s = unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_string_lossy().into_owned();
+    let s = unsafe { std::ffi::CStr::from_ptr(info.sname.cast()) }.to_string_lossy().into_owned();
     Some((s, info.saddr as u64))
 }
 
@@ -151,7 +151,7 @@ fn enumerate() -> Vec<Image> {
     v
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "android"))]
 fn enumerate() -> Vec<Image> {
     Vec::new()
 }

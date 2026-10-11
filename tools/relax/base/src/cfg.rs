@@ -23,6 +23,7 @@ impl CfgSet {
             crate::options::CheckTarget::WindowsX64 => return CfgSet::windows_x64(sess, features),
             crate::options::CheckTarget::MacosArm64 => return CfgSet::macos_arm64(sess, features),
             crate::options::CheckTarget::LinuxX64 => return CfgSet::linux_x64(sess, features),
+            crate::options::CheckTarget::AndroidArm64 => return CfgSet::android_arm64(sess, features),
             crate::options::CheckTarget::Host => {}
         }
         CfgSet::machine(sess, features)
@@ -33,7 +34,9 @@ impl CfgSet {
     /// another target called that target's OS (Windows' FlsAlloc on Linux): every JIT derive
     /// failed, and `relax host-gen` wrote a short Windows table.
     pub fn machine(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
-        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        if cfg!(target_os = "android") {
+            CfgSet::android_arm64(sess, features)
+        } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             CfgSet::macos_arm64(sess, features)
         } else if cfg!(windows) {
             CfgSet::windows_x64(sess, features)
@@ -92,6 +95,23 @@ impl CfgSet {
         ] {
             set.push(s.to_string());
         }
+        for f in features {
+            set.push(format!("feature={}", f));
+        }
+        CfgSet { session: sess.clone(), set }
+    }
+
+    /// aarch64 Android, release, panic=abort, not test.
+    pub fn android_arm64(sess: &std::sync::Arc<crate::Session>, features: &[String]) -> CfgSet {
+        // rustc --print cfg --target aarch64-linux-android: neon is the only default
+        // target_feature (do not assume LSE/AES/SHA2).
+        let mut set: Vec<String> = [
+            "unix", "target_os=android", "target_family=unix", "target_env=",
+            "target_vendor=unknown", "target_arch=aarch64",
+            "target_pointer_width=64", "target_endian=little", "panic=abort",
+            "target_feature=neon", "target_has_atomic=8", "target_has_atomic=16",
+            "target_has_atomic=32", "target_has_atomic=64", "target_has_atomic=ptr",
+        ].iter().map(|s| s.to_string()).collect();
         for f in features {
             set.push(format!("feature={}", f));
         }
@@ -162,6 +182,8 @@ impl CfgSet {
     pub fn triple(&self) -> &'static str {
         if self.has("target_os=windows") {
             "x86_64-pc-windows-gnu"
+        } else if self.has("target_os=android") {
+            "aarch64-linux-android"
         } else if self.has("target_os=macos") {
             "aarch64-apple-darwin"
         } else {
