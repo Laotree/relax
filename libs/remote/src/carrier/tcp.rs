@@ -172,10 +172,16 @@ pub fn dial(addr: &str, creds: &ClientCredentials) -> io::Result<Carrier> {
     Ok(carrier(conn, crate::conn::Hooks::default(), |c: &mut TunnelConn| c.shutdown()))
 }
 
+/// The accepted keys, asked for on every accept (so a newly paired key works without a restart).
+pub type KeySource = Arc<dyn Fn() -> Vec<Psk> + Send + Sync>;
+
+/// Called with the key a peer proved and its connection, once the handshake is done.
+pub type Bound = Arc<dyn Fn(&Psk, &crate::conn::Conn) + Send + Sync>;
+
 /// Accepts paired peers on `bind` (`host:port`): each connection does the TLS handshake with
 /// `identity` and must prove one of `keys` before anything else is read. Peers that fail are
 /// dropped and logged. Returns the bound address.
-pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: Vec<Psk>) -> io::Result<std::net::SocketAddr> {
+pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: KeySource, bound: Option<Bound>) -> io::Result<std::net::SocketAddr> {
     let addr = bind.to_socket_addrs()?.next().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no address to bind"))?;
     let listener = TcpListener::bind(addr)?;
     let local = listener.local_addr()?;
@@ -187,12 +193,12 @@ pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: Vec<
         (hooks.enter)();
         for tcp in listener.incoming() {
             let Ok(tcp) = tcp else { continue };
-            let (ep, tls, keys) = (ep.clone(), tls.clone(), keys.clone());
+            let (ep, tls, keys, bound) = (ep.clone(), tls.clone(), keys.clone(), bound.clone());
             let _ = std::thread::Builder::new().name("makepad-remote-hello".into()).spawn(move || {
                 let hooks = ep.hooks();
                 (hooks.enter)();
                 let peer = tcp.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-                if let Err(e) = accept_one(&ep, &tls, &keys, &fingerprint, tcp) {
+                if let Err(e) = accept_one(&ep, &tls, &keys, bound.as_deref(), &fingerprint, tcp) {
                     eprintln!("makepad-remote: tcp peer {peer} dropped: {e}");
                 }
                 (hooks.exit)();
@@ -202,13 +208,17 @@ pub fn listen(endpoint: &Endpoint, bind: &str, identity: TlsIdentity, keys: Vec<
     Ok(local)
 }
 
-fn accept_one(ep: &Endpoint, tls: &TlsServer, keys: &[Psk], fingerprint: &[u8; 32], tcp: std::net::TcpStream) -> io::Result<()> {
+fn accept_one(ep: &Endpoint, tls: &TlsServer, keys: &KeySource, bound: Option<&(dyn Fn(&Psk, &crate::conn::Conn) + Send + Sync)>, fingerprint: &[u8; 32], tcp: std::net::TcpStream) -> io::Result<()> {
     tcp.set_read_timeout(Some(HANDSHAKE))?;
     tcp.set_write_timeout(Some(HANDSHAKE))?;
     let mut stream: TlsStream = tls.accept(tcp)?;
-    server_authenticate(&mut stream, keys, fingerprint).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    let proved = server_authenticate(&mut stream, &keys(), fingerprint).map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
     stream.set_write_timeout(Some(POLL))?;
     stream.set_read_timeout(Some(POLL))?;
     let c = carrier(stream, ep.hooks(), |s: &mut TlsStream| s.shutdown());
-    ep.serve(c.reader, c.writer, c.shutdown).map(|_| ()).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    let conn = ep.serve(c.reader, c.writer, c.shutdown).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+    if let Some(b) = bound {
+        b(&proved, &conn);
+    }
+    Ok(())
 }

@@ -75,7 +75,10 @@ impl HostLink {
     /// The live connection to the relay, dialling (ssh) or waiting for the device (dial).
     fn conn(&self, wait: Duration) -> Result<Conn, Error> {
         if let Some(c) = &self.client {
-            return c.conn();
+            return c.conn().map_err(|e| match e {
+                Error::LinkLost(w) => Error::LinkLost(format!("cannot reach host `{}` over ssh (BatchMode, 5 s connect timeout; needs a key that works without a prompt; see {}): {w}", self.host.name, log_path().display())),
+                e => e,
+            });
         }
         let end = Instant::now() + wait;
         loop {
@@ -96,9 +99,13 @@ impl HostLink {
 }
 
 struct Inner {
-    links: Vec<Arc<HostLink>>,
+    links: Mutex<Vec<Arc<HostLink>>>,
     clients: Mutex<Vec<Conn>>,
+    /// where the registry is re-read from when a request names a host the hub does not know yet
+    source: Mutex<Option<Source>>,
 }
+
+pub type Source = Arc<dyn Fn() -> Hosts + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Hub(Arc<Inner>);
@@ -113,11 +120,37 @@ pub fn parse_target(t: &str) -> (&str, Option<String>) {
 
 impl Hub {
     pub fn new(hosts: &Hosts) -> Hub {
-        Hub(Arc::new(Inner { links: hosts.hosts.iter().cloned().map(|h| Arc::new(HostLink::new(h))).collect(), clients: Mutex::new(Vec::new()) }))
+        let hub = Hub(Arc::new(Inner { links: Mutex::new(Vec::new()), clients: Mutex::new(Vec::new()), source: Mutex::new(None) }));
+        hub.sync(hosts);
+        hub
     }
 
     fn link(&self, host: &str) -> Option<Arc<HostLink>> {
-        self.0.links.iter().find(|l| l.host.name == host).cloned()
+        let find = || self.0.links.lock().unwrap().iter().find(|l| l.host.name == host).cloned();
+        find().or_else(|| {
+            let source = self.0.source.lock().unwrap().clone()?;
+            self.sync(&source());
+            find()
+        })
+    }
+
+    /// Sets where the registry is re-read from (hosts added while the hub runs).
+    pub fn set_source(&self, source: Source) {
+        *self.0.source.lock().unwrap() = Some(source);
+    }
+
+    fn links(&self) -> Vec<Arc<HostLink>> {
+        self.0.links.lock().unwrap().clone()
+    }
+
+    /// Adds the registry's hosts that have no link yet (hosts paired while the hub runs).
+    pub fn sync(&self, hosts: &Hosts) {
+        let mut links = self.0.links.lock().unwrap();
+        for h in &hosts.hosts {
+            if !links.iter().any(|l| l.host.name == h.name) {
+                links.push(Arc::new(HostLink::new(h.clone())));
+            }
+        }
     }
 
     /// Clients currently connected to the hub's socket.
@@ -138,40 +171,60 @@ impl Hub {
         ep
     }
 
-    /// The endpoint paired devices dial into: each connection that proves a key becomes the link
-    /// of the dial host it names.
-    pub fn dial_endpoint(&self) -> Endpoint {
+    /// Listens for paired devices on `bind`. The accepted keys and the host a key belongs to are
+    /// read from `source` (the registry) on every accept, so a host paired while the hub runs
+    /// works at once. A link is bound to the host its key was paired under; a peer claiming
+    /// another name is refused and logged.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn listen_dial(&self, bind: &str, identity: makepad_network::tls::TlsIdentity, source: Source) -> io::Result<std::net::SocketAddr> {
+        self.set_source(source.clone());
         let ep = Endpoint::new("relax-hub");
+        let s2 = source.clone();
+        let keys: crate::carrier::tcp::KeySource = Arc::new(move || s2().dial_keys());
         let hub = self.clone();
-        ep.set_accept(Arc::new(move |conn| {
-            let name = conn.peer().name.clone();
-            match hub.link(&name).filter(|l| l.client.is_none()) {
-                Some(link) => {
-                    let old = link.dialed.lock().unwrap().replace(conn.clone());
-                    if let Some(old) = old {
-                        old.close("the host dialled in again");
-                    }
-                }
-                None => conn.close(&format!("`{name}` is not a dial host of this hub's registry")),
+        let bound: crate::carrier::tcp::Bound = Arc::new(move |key, conn| {
+            let hosts = source();
+            hub.sync(&hosts);
+            let id = key.id();
+            let owner = hosts.hosts.iter().find(|h| matches!(&h.via, Via::Dial { key: k, .. } if makepad_network::tunnel::Psk::from_hex(k).is_some_and(|p| p.id() == id)));
+            let Some(owner) = owner else { return conn.close("this key belongs to no host of the registry") };
+            let claimed = conn.peer().name.clone();
+            if claimed != owner.name {
+                eprintln!("relax hub: a peer with the key of `{}` claimed to be `{claimed}`: refused", owner.name);
+                return conn.close(&format!("this key was paired for `{}`, not `{claimed}`", owner.name));
             }
-        }));
-        ep
+            hub.bind_link(&owner.name, conn);
+        });
+        crate::carrier::tcp::listen(&ep, bind, identity, keys, Some(bound))
     }
 
-    /// Hands the hub a carrier a dial host came in on (what the TCP listener does for each
-    /// accepted peer).
-    pub fn accept_dialed(&self, car: Carrier) -> Result<Conn, crate::hello::HandshakeError> {
-        let ep = self.dial_endpoint();
-        ep.serve(car.reader, car.writer, car.shutdown)
+    /// Makes `conn` the link of the dial host `name`.
+    fn bind_link(&self, name: &str, conn: &Conn) {
+        match self.link(name).filter(|l| l.client.is_none()) {
+            Some(link) => {
+                let old = link.dialed.lock().unwrap().replace(conn.clone());
+                if let Some(old) = old {
+                    old.close("the host dialled in again");
+                }
+            }
+            None => conn.close(&format!("`{name}` is not a dial host of this hub's registry")),
+        }
+    }
+
+    /// Test seam: serves a carrier a relay named `name` dialled over and binds it (the TCP path
+    /// binds by proved key instead).
+    #[cfg(test)]
+    pub(crate) fn accept_dialed(&self, car: Carrier) -> Result<Conn, crate::hello::HandshakeError> {
+        let conn = Endpoint::new("relax-hub").serve(car.reader, car.writer, car.shutdown)?;
+        self.bind_link(&conn.peer().name.clone(), &conn);
+        Ok(conn)
     }
 
     fn hosts_report(&self, out: &mut Vec<String>) {
         let rows: Vec<_> = self
-            .0
-            .links
-            .iter()
+            .links()
+            .into_iter()
             .map(|l| {
-                let l = l.clone();
                 std::thread::spawn(move || {
                     let target = match &l.host.via {
                         Via::Ssh { ssh, .. } => format!(",\"ssh\":{}", json_str(ssh)),
@@ -206,7 +259,7 @@ impl Hub {
 
     /// Ends the links (ssh children are killed).
     pub fn shutdown(&self) {
-        for l in &self.0.links {
+        for l in &self.links() {
             if let Some(c) = &l.client {
                 c.close();
             }
@@ -226,7 +279,8 @@ fn route_factory(hub: Hub) -> Factory {
             return Err((CLOSE_REFUSED, format!("route: expected `<host>[:<app>] <service> [args]`, got `{}`", open.args)));
         }
         let Some(link) = hub.link(host) else {
-            let known: Vec<&str> = hub.0.links.iter().map(|l| l.host.name.as_str()).collect();
+            let links = hub.links();
+            let known: Vec<&str> = links.iter().map(|l| l.host.name.as_str()).collect();
             return Err((CLOSE_REFUSED, format!("unknown host `{host}` (known: {})", if known.is_empty() { "none; see hosts.toml".to_string() } else { known.join(", ") })));
         };
         let service = service.to_string();
@@ -420,16 +474,17 @@ pub fn serve(hosts: Hosts, listen: Option<&str>) -> io::Result<bool> {
 #[cfg(unix)]
 fn serve_locked(hosts: Hosts, listen: Option<&str>) -> io::Result<()> {
     let hub = Hub::new(&hosts);
+    hub.set_source(Arc::new(|| Hosts::load(&crate::hosts::registry_path()).unwrap_or_default()));
     let ep = hub.client_endpoint();
     crate::carrier::unix::listen_at(&ep, &socket_path())?;
     if let Some(addr) = listen {
-        let keys = hosts.dial_keys();
-        if keys.is_empty() {
+        if hosts.dial_keys().is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "no paired dial host in the registry: run `relax remote pair <name>` first"));
         }
         let identity = makepad_network::tls::TlsIdentity::load_or_create(&crate::hosts::identity_dir(), "makepad-remote hub")?;
         let fp = identity.fingerprint_hex();
-        let bound = crate::carrier::tcp::listen(&hub.dial_endpoint(), addr, identity, keys)?;
+        let source: Arc<dyn Fn() -> Hosts + Send + Sync> = Arc::new(|| Hosts::load(&crate::hosts::registry_path()).unwrap_or_default());
+        let bound = hub.listen_dial(addr, identity, source)?;
         eprintln!("relax hub: listening on {bound}, identity {fp}");
     }
     let mut idle_since = Instant::now();

@@ -216,27 +216,57 @@ fn a_dropped_link_resumes_the_watch_feed_with_a_gap_marker() {
     let _keep = t.join().unwrap();
 }
 
+fn dial_host(name: &str, key: &makepad_network::tunnel::Psk) -> Host {
+    Host { name: name.into(), via: Via::Dial { key: key.to_hex(), fingerprint: String::new() } }
+}
+
+fn relay_named(name: &str) -> Endpoint {
+    relay::endpoint(relay::Config { name: name.into(), launch: vec![], env: vec![] })
+}
+
+fn dial_relay(ep: Endpoint, addr: &str, key: makepad_network::tunnel::Psk, fp: [u8; 32]) {
+    let addr = addr.to_string();
+    std::thread::spawn(move || {
+        let creds = makepad_network::tunnel::ClientCredentials { keys: vec![key], known_hosts: None, expect: Some(fp) };
+        relay::dial_forever(&ep, &addr, &creds)
+    });
+}
+
 #[test]
-fn dial_mode_over_loopback_tls() {
-    let _ = shared();
+fn dial_in_binds_the_key_to_its_host_and_reads_keys_live() {
     use makepad_network::tls::TlsIdentity;
-    use makepad_network::tunnel::{ClientCredentials, Psk};
+    use makepad_network::tunnel::Psk;
+    use std::sync::{Arc, Mutex};
+    let _ = shared();
     let dir = std::env::temp_dir().join(format!("makepad-remote-hub-tls-{}", std::process::id()));
     let identity = TlsIdentity::load_or_create(&dir, "makepad-remote-test").unwrap();
     let fp = identity.fingerprint;
-    let key = Psk::generate().unwrap();
-    let hosts = Hosts { hosts: vec![Host { name: "d".into(), via: Via::Dial { key: key.to_hex(), fingerprint: String::new() } }] };
-    let hub = Hub::new(&hosts);
-    let addr = crate::carrier::tcp::listen(&hub.dial_endpoint(), "127.0.0.1:0", identity, hosts.dial_keys()).unwrap().to_string();
-    let relay_ep = relay_endpoint();
-    let a2 = addr.clone();
-    std::thread::spawn(move || {
-        let creds = ClientCredentials { keys: vec![key], known_hosts: None, expect: Some(fp) };
-        relay::dial_forever(&relay_ep, &a2, &creds)
-    });
+    let (ka, kb, kc) = (Psk::generate().unwrap(), Psk::generate().unwrap(), Psk::generate().unwrap());
+    // the registry the hub reads on every accept: only A and B at first
+    let registry = Arc::new(Mutex::new(Hosts { hosts: vec![dial_host("a", &ka), dial_host("b", &kb)] }));
+    let hub = Hub::new(&registry.lock().unwrap().clone());
+    let r2 = registry.clone();
+    let addr = hub.listen_dial("127.0.0.1:0", identity, Arc::new(move || r2.lock().unwrap().clone())).unwrap().to_string();
     let c = client(&hub);
+
+    // A's key under B's name: refused, B stays unconnected
+    dial_relay(relay_named("b"), &addr, ka.clone(), fp);
+    // A's key under A's name works
+    dial_relay(relay_named("a"), &addr, ka.clone(), fp);
     let me = std::process::id();
-    let l = request(&c, "d list", "list");
+    let l = request(&c, "a list", "list");
+    assert!(l.iter().any(|l| l.contains(&format!("\"pid\":{me},"))), "{l:?}");
+    let ch = c.open("route", "b cmd").unwrap();
+    // (the impostor retries with backoff, never becomes b's link)
+    match ch.recv_timeout(WAIT) {
+        Ok(Event::Closed(_, why)) => assert!(why.contains("not connected"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+
+    // C is paired after the hub started: no restart needed
+    registry.lock().unwrap().set(dial_host("c", &kc));
+    dial_relay(relay_named("c"), &addr, kc, fp);
+    let l = request(&c, "c list", "list");
     assert!(l.iter().any(|l| l.contains(&format!("\"pid\":{me},"))), "{l:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }

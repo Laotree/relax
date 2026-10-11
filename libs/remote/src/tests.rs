@@ -341,7 +341,7 @@ fn tcp_loopback_with_tls_and_key_proof() {
     let key = Psk::generate().unwrap();
     let ep = Endpoint::new("tcp-test");
     ep.register_cmd(dispatch);
-    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, vec![key.clone()]).unwrap();
+    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, { let k = key.clone(); Arc::new(move || vec![k.clone()]) }, None).unwrap();
     let creds = |k: &Psk| ClientCredentials { keys: vec![k.clone()], known_hosts: None, expect: Some(fp) };
     let client = Client::connect_tcp(&addr.to_string(), creds(&key)).unwrap();
     let mut lines = client.cmd("ping").unwrap();
@@ -393,7 +393,7 @@ fn tcp_both_ends_send_8mb_at_once() {
         s2.lock().unwrap().push(blast(open.channel));
         Ok(())
     }));
-    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, vec![key.clone()]).unwrap();
+    let addr = crate::carrier::tcp::listen(&ep, "127.0.0.1:0", identity, { let k = key.clone(); Arc::new(move || vec![k.clone()]) }, None).unwrap();
     let creds = ClientCredentials { keys: vec![key], known_hosts: None, expect: Some(fp) };
     let client = Client::connect_tcp(&addr.to_string(), creds).unwrap();
     let t = std::time::Instant::now();
