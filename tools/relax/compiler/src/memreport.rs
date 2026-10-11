@@ -57,7 +57,9 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
         cap += vbytes(&a.exprs) + vbytes(&a.pats) + vbytes(&a.tys) + vbytes(&a.items) + vbytes(&a.blocks) + (f.toks.heap_bytes() as u64) + (f.src.heap_bytes() as u64);
     }
     let n_exprs: usize = p.files.iter().map(|f| f.ast.exprs.len()).sum();
-    out.push((format!("files: arenas+toks+src used (of {:.0} MB capacity)", cap as f64 / 1048576.0), used));
+    // the value is the HEAP share (owned arrays' capacity); `used` counts every array's logical
+    // bytes, mapped ones included (those are cache file pages, not malloc)
+    out.push((format!("files: arenas+toks+src on the heap (logical {:.0} MB incl. arrays mapped from the cache)", used as f64 / 1048576.0), cap));
     out.push((format!("  node sizes expr {} pat {} ty {} item {} block {} tok {}; {} exprs", std::mem::size_of::<crate::ast::Expr>(), std::mem::size_of::<crate::ast::Pat>(), std::mem::size_of::<crate::ast::Ty>(), std::mem::size_of::<crate::ast::Item>(), std::mem::size_of::<crate::ast::Block>(), std::mem::size_of::<crate::lexer::Tok>(), n_exprs), 0));
     out.push((format!("files: source ({} files)", p.files.len()), src));
     out.push(("files: tokens".to_string(), toks));
