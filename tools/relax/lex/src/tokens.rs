@@ -714,9 +714,20 @@ fn is_literal(k: T) -> bool {
     matches!(k, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::Colour | T::Duration)
 }
 
-/// Doc comments in a gap between tokens (the lexer drops comments), as rustc's proc_macro
-/// shows them: `#` [`!`] `[doc = "text"]` with the comment's span.
-fn gap_docs(gap: &[u8], base: u32, span_of: &dyn Fn(u32, u32) -> Span, out: &mut Vec<TokenTree>) {
+/// A doc comment found in a gap between tokens: byte range in the gap, inner (`//!`, `/*!`),
+/// and the text after the comment opener (and before a block comment's `*/`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GapDoc<'a> {
+    pub lo: usize,
+    pub hi: usize,
+    pub inner: bool,
+    pub text: &'a [u8],
+}
+
+/// The doc comments of a gap between tokens (the lexer drops comments), in order. `///x` (not
+/// `////`), `//!x`, `/**x*/` (not `/***`, not `/**/`) and `/*!x*/` are docs; other comments
+/// are skipped (block comments nest).
+pub fn for_each_gap_doc<'a>(gap: &'a [u8], mut f: impl FnMut(GapDoc<'a>)) {
     let n = gap.len();
     let mut i = 0;
     while i < n {
@@ -726,7 +737,6 @@ fn gap_docs(gap: &[u8], base: u32, span_of: &dyn Fn(u32, u32) -> Span, out: &mut
                 i += 1;
             }
             let c = &gap[s..i];
-            // `///x` (not `////`), `//!x`
             let (doc, inner) = if c.len() >= 3 && c[2] == b'/' && !(c.len() >= 4 && c[3] == b'/') {
                 (true, false)
             } else if c.len() >= 3 && c[2] == b'!' {
@@ -739,7 +749,7 @@ fn gap_docs(gap: &[u8], base: u32, span_of: &dyn Fn(u32, u32) -> Span, out: &mut
                 if text.last() == Some(&b'\r') {
                     text = &text[..text.len() - 1];
                 }
-                push_doc(text, inner, span_of(base + s as u32, base + i as u32), out);
+                f(GapDoc { lo: s, hi: i, inner, text });
             }
         } else if gap[i] == b'/' && i + 1 < n && gap[i + 1] == b'*' {
             let s = i;
@@ -757,19 +767,44 @@ fn gap_docs(gap: &[u8], base: u32, span_of: &dyn Fn(u32, u32) -> Span, out: &mut
                 }
             }
             let c = &gap[s..i];
-            // `/**x*/` (not `/***`, not `/**/`), `/*!x*/`
             if c.len() >= 5 {
                 let body = &c[3..c.len() - 2];
                 if c[2] == b'*' && c[3] != b'*' {
-                    push_doc(body, false, span_of(base + s as u32, base + i as u32), out);
+                    f(GapDoc { lo: s, hi: i, inner: false, text: body });
                 } else if c[2] == b'!' {
-                    push_doc(body, true, span_of(base + s as u32, base + i as u32), out);
+                    f(GapDoc { lo: s, hi: i, inner: true, text: body });
                 }
             }
         } else {
             i += 1;
         }
     }
+}
+
+/// A doc comment as macro input shows it to `macro_rules!`: `/// foo` is `#[doc = r"foo"]`,
+/// `//! foo` is `#![doc = r"foo"]`, the raw string with as many `#` as its text needs.
+/// rustc_ast tokenstream.rs:698 `desugar_doc_comments`, `desugared_tts` (:736-775).
+pub fn desugared_doc_attr(inner: bool, text: &[u8]) -> String {
+    let text = String::from_utf8_lossy(text);
+    // the longest `"#*` run in the text (tokenstream.rs:741-751)
+    let mut hashes = 0;
+    let mut count = 0;
+    for ch in text.chars() {
+        count = match ch {
+            '"' => 1,
+            '#' if count > 0 => count + 1,
+            _ => 0,
+        };
+        hashes = hashes.max(count);
+    }
+    let h = "#".repeat(hashes);
+    format!("#{}[doc = r{h}\"{text}\"{h}]", if inner { "!" } else { "" })
+}
+
+/// Doc comments in a gap between tokens, as rustc's proc_macro shows them: `#` [`!`]
+/// `[doc = "text"]` with the comment's span.
+fn gap_docs(gap: &[u8], base: u32, span_of: &dyn Fn(u32, u32) -> Span, out: &mut Vec<TokenTree>) {
+    for_each_gap_doc(gap, |d| push_doc(d.text, d.inner, span_of(base + d.lo as u32, base + d.hi as u32), out));
 }
 
 fn push_doc(text: &[u8], inner: bool, sp: Span, out: &mut Vec<TokenTree>) {

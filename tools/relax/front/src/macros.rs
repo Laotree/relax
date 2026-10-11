@@ -2249,11 +2249,69 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// The arguments [lo, hi) with their doc comments desugared as rustc does before matching
+    /// (`parser_from_cx`, rustc_expand mbe/macro_rules.rs:1808 `tts.desugar_doc_comments()`):
+    /// `/// x` is the tokens `#[doc = r"x"]`, `//! x` is `#![doc = r"x"]`. The lexer drops
+    /// comments, so they are read from the source gaps between the argument tokens. Without
+    /// doc comments the range is returned as it is; otherwise a copy is appended to the token
+    /// list and its range returned.
+    fn desugar_doc_comments(&mut self, lo: usize, hi: usize) -> (usize, usize) {
+        let base = self.src.len() as u32;
+        if lo == 0 || hi < lo || self.toks.at(hi).lo >= base {
+            return (lo, hi);
+        }
+        // (index of the token the docs precede, inner, text)
+        let mut docs: Vec<(usize, bool, Vec<u8>)> = Vec::new();
+        for j in lo..=hi {
+            let (prev, t) = (self.toks.at(j - 1), self.toks.at(j));
+            if prev.hi < t.lo && t.lo <= base {
+                let gap = &self.src[prev.hi as usize..t.lo as usize];
+                if gap.windows(2).any(|w| w == b"//" || w == b"/*") {
+                    crate::pm_tokens::for_each_gap_doc(gap, |d| docs.push((j, d.inner, d.text.to_vec())));
+                }
+            }
+        }
+        if docs.is_empty() {
+            return (lo, hi);
+        }
+        let mut text = String::new();
+        let mut spans = Vec::with_capacity(docs.len());
+        for (_, inner, t) in &docs {
+            let a = crate::pm_tokens::desugared_doc_attr(*inner, t);
+            spans.push((text.len(), text.len() + a.len()));
+            text.push_str(&a);
+            text.push(' ');
+        }
+        let ext_base = (self.src.len() + self.ext.len()) as u32;
+        self.ext.extend_from_slice(text.as_bytes());
+        let call_lo = self.toks.at(lo - 1).lo;
+        self.exp_map.push((ext_base, ext_base + text.len() as u32, call_lo));
+        let mut out = Vec::with_capacity(hi - lo + docs.len() * 7);
+        let mut d = 0;
+        for j in lo..=hi {
+            while d < docs.len() && docs[d].0 == j {
+                let (a, b) = spans[d];
+                let mut dt = Vec::new();
+                let _ = crate::lexer::lex(&text.as_bytes()[a..b], self.edition, &mut dt);
+                out.extend(dt.into_iter().filter(|t| t.kind != T::Eof).map(|t| Tok { kind: t.kind, lo: t.lo + a as u32 + ext_base, hi: t.hi + a as u32 + ext_base }));
+                d += 1;
+            }
+            out.push(self.toks.at(j));
+        }
+        let start = self.toks.len();
+        let n = out.len() - 1;
+        for t in out {
+            self.toks.push(t);
+        }
+        (start, start + n)
+    }
+
     /// Expands a call of macro `def` with arguments in tokens [lo, hi): the expansion text
     /// (tokens joined by spaces) and, per token substituted from a fragment, (offset in the
     /// text, the fragment token's position) -- or an error naming the macro.
     pub fn expand_rules(&mut self, def: &MacroDef, lo: usize, hi: usize) -> Result<(String, Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>), String> {
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules", &def.name);
+        let (lo, hi) = self.desugar_doc_comments(lo, hi);
         for (matcher, body) in &def.arms {
             let mut binds = HashMap::default();
             let mut i = lo;
