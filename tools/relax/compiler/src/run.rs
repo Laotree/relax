@@ -447,6 +447,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 eprintln!("relax-run: {}", e);
                 return 1;
             }
+        } else {
+            crate::provided::read_identity_files(&pkgs);
         }
     }
     phase("provided sources", ts);

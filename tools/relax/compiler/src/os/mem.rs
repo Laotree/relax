@@ -195,13 +195,35 @@ mod imp {
         flush_icache(addr, len);
     }
 
+    /// Makes the instruction cache see code just written at [start, end) (what libgcc's
+    /// __clear_cache does; bionic has no such symbol): clean the data cache to the point of
+    /// unification, then invalidate the instruction cache, by the line sizes CTR_EL0 reports.
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn clear_cache(start: usize, end: usize) {
+        let ctr: usize;
+        std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        let dline = 4usize << ((ctr >> 16) & 0xf);
+        let iline = 4usize << (ctr & 0xf);
+        let mut a = start & !(dline - 1);
+        while a < end {
+            std::arch::asm!("dc cvau, {}", in(reg) a, options(nostack, preserves_flags));
+            a += dline;
+        }
+        std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+        let mut a = start & !(iline - 1);
+        while a < end {
+            std::arch::asm!("ic ivau, {}", in(reg) a, options(nostack, preserves_flags));
+            a += iline;
+        }
+        std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+    }
+
     /// aarch64 does not keep the instruction cache coherent with data writes (x86-64 does).
     #[inline(always)]
     unsafe fn flush_icache(addr: u64, len: usize) {
         #[cfg(target_arch = "aarch64")]
         {
-            extern "C" { fn __clear_cache(start: *mut u8, end: *mut u8); }
-            __clear_cache(addr as *mut u8, (addr as *mut u8).add(len));
+            clear_cache(addr as usize, addr as usize + len);
         }
         #[cfg(not(target_arch = "aarch64"))]
         let _ = (addr, len);

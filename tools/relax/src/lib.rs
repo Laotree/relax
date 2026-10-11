@@ -81,6 +81,11 @@ pub fn main() {
 /// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path) {
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
+    // the program's argv[0] / current_exe: the embedder has no command line of its own
+    {
+        use std::os::unix::ffi::OsStrExt;
+        relax_compiler::os::proc::set_args(vec![exe.as_os_str().as_bytes().to_vec()]);
+    }
     std::env::set_var("RELAX_LOADER", exe);
     std::env::set_var("MAKEPAD_LOADER_STATE", fetch::home().join("relax_cache"));
     macros::register();

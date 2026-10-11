@@ -209,15 +209,32 @@ mod imp {
         HOST_LIBRARY.store(handle, std::sync::atomic::Ordering::Release);
     }
 
+    /// Handles of the libraries `load_library` opened.
+    static LOADED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
     // NDK r28 dlfcn.h:169 RTLD_DEFAULT = 0, :191 RTLD_NOW = 2,
     // :204 RTLD_GLOBAL = 0x100 on LP64.
     pub unsafe fn find(name: *const u8) -> *mut u8 {
         let p = dlsym(std::ptr::null_mut(), name);
-        let host = HOST_LIBRARY.load(std::sync::atomic::Ordering::Acquire);
-        if p.is_null() && !host.is_null() {
-            return dlsym(host, name);
+        if !p.is_null() {
+            return p;
         }
-        p
+        let host = HOST_LIBRARY.load(std::sync::atomic::Ordering::Acquire);
+        if !host.is_null() {
+            let p = dlsym(host, name);
+            if !p.is_null() {
+                return p;
+            }
+        }
+        // RTLD_GLOBAL does not put a library into the lookup of RTLD_DEFAULT from inside an app's
+        // linker namespace: ask the libraries the program's #[link] blocks loaded
+        for &h in LOADED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let p = dlsym(h as *mut u8, name);
+            if !p.is_null() {
+                return p;
+            }
+        }
+        std::ptr::null_mut()
     }
 
     /// The C math library is not necessarily loaded into the host.
@@ -237,7 +254,24 @@ mod imp {
     pub fn load_library(name: &str, framework: bool) -> bool {
         let path = if framework { format!("/System/Library/Frameworks/{}.framework/{}\0", name, name) } else { format!("lib{}.so\0", name) };
         // RTLD_NOW | RTLD_GLOBAL
-        unsafe { !dlopen(path.as_ptr(), 2 | 0x100).is_null() }
+        unsafe {
+            let h = dlopen(path.as_ptr(), 2 | 0x100);
+            if !h.is_null() {
+                let mut l = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+                if !l.contains(&(h as usize)) {
+                    l.push(h as usize);
+                }
+                return true;
+            }
+            extern "C" {
+                fn dlerror() -> *const std::ffi::c_char;
+            }
+            let e = dlerror();
+            if !e.is_null() {
+                eprintln!("relax: cannot load {}: {}", path.trim_end_matches('\0'), std::ffi::CStr::from_ptr(e).to_string_lossy());
+            }
+            false
+        }
     }
 
     /// Bionic public libraries use plain sonames; never scan desktop library paths.

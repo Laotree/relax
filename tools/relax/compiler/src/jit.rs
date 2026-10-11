@@ -3342,11 +3342,11 @@ impl Unit {
     /// Loads every library the program's extern blocks name with `#[link(name = ..)]`
     /// (frameworks on macOS), once: what the system linker would have linked.
     fn load_link_libs(&self) {
-        static DONE: AtomicBool = AtomicBool::new(false);
-        if DONE.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        for (fi, f) in self.prog.files.iter().enumerate() {
+        // files load lazily (a platform file with its #[link] blocks may be parsed after an
+        // earlier miss), so each call reads the files that came since the last
+        static SCANNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let from = SCANNED.swap(self.prog.files.len(), Ordering::SeqCst);
+        for (fi, f) in self.prog.files.iter().enumerate().skip(from) {
             for it in &f.ast.items {
                 // active blocks (cfg) are the ones whose items got definitions
                 let active = match &it.kind {

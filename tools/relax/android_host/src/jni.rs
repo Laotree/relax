@@ -127,20 +127,27 @@ unsafe fn asset_text(manager: *mut c_void, name: &str) -> Result<String, String>
 struct Conf {
     package: String,
     cargo_flags: Vec<String>,
+    /// environment of the process (`env=KEY=VALUE`: MAKEPAD_TRACE, SANDBOX_MUTE, ...)
+    env: Vec<(String, String)>,
 }
 
 fn parse_conf(text: &str) -> Result<Conf, String> {
     let mut package = None;
     let mut cargo_flags = Vec::new();
+    let mut env = Vec::new();
     for line in text.lines().filter(|l| !l.trim().is_empty()) {
         let (k, v) = line.split_once('=').ok_or_else(|| format!("{CONF_ASSET}: bad line {line:?}"))?;
         match k {
             "package" => package = Some(v.to_string()),
             "flag" => cargo_flags.push(v.to_string()),
+            "env" => {
+                let (k, val) = v.split_once('=').ok_or_else(|| format!("{CONF_ASSET}: env wants KEY=VALUE, got {v:?}"))?;
+                env.push((k.to_string(), val.to_string()));
+            }
             _ => return Err(format!("{CONF_ASSET}: unknown key {k:?}")),
         }
     }
-    Ok(Conf { package: package.ok_or_else(|| format!("{CONF_ASSET}: no package"))?, cargo_flags })
+    Ok(Conf { package: package.ok_or_else(|| format!("{CONF_ASSET}: no package"))?, cargo_flags, env })
 }
 
 /// `RunActivity.boot(Class nativeClass, String natives, String apkPath, String filesDir, String cacheDir,
@@ -209,11 +216,14 @@ fn boot_thread(
     // an Android app has no HOME and /tmp is not its own
     std::env::set_var("HOME", files);
     std::env::set_var("TMPDIR", cache);
-    std::env::set_var("RELAX_HOME", &relax_home);
+        std::env::set_var("RELAX_HOME", &relax_home);
     if let Some(mb) = boot::memory_budget_mb() {
         std::env::set_var("RELAX_MEM_BUDGET_MB", mb.to_string());
     }
     let conf = parse_conf(&unsafe { asset_text(manager, CONF_ASSET)? })?;
+    for (k, v) in &conf.env {
+        std::env::set_var(k, v);
+    }
     let (offset, len) = unsafe { asset_range(manager, ARCHIVE_ASSET)? };
     let b = Boot {
         package: conf.package,
