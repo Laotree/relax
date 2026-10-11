@@ -699,10 +699,12 @@ pub unsafe fn dealloc(p: *mut u8, l: Layout) {
         }
         s = lock(&h.state);
     }
+    // A chunk of any kind goes back to the shared pool, where a later large block expects zeros
+    // (alloc_zeroed skips the write): on macOS only the `zero` form guarantees that.
     // No live blocks and no allocation can pass this lock while decommitting. An old
     // TLS cache subsequently sees live == 0 or a different generation after reuse.
     event(E_DECOMMIT);
-    if !os::decommit(address as *mut u8, s.committed, COMPILER && s.stride == 0) {
+    if !os::decommit(address as *mut u8, s.committed, COMPILER) {
         // Quarantine an OS failure: do not claim reclaimed bytes or reuse this mapping.
         return;
     }
@@ -745,7 +747,7 @@ pub fn trim() {
         let address = BASE.load(Ordering::Relaxed) + index * CHUNK;
         // nothing live and not reachable from any TLS cache (live == 0): safe to drop pages
         event(E_DECOMMIT);
-        if !unsafe { os::decommit(address as *mut u8, s.committed, false) } {
+        if !unsafe { os::decommit(address as *mut u8, s.committed, COMPILER) } {
             continue; // quarantined, as in dealloc
         }
         COMMITTED.fetch_sub(s.committed, Ordering::Relaxed);

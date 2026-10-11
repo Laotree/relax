@@ -635,7 +635,15 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
                 .map(|m| m.to_string())
                 .or_else(|| lines.iter().find(|l| l.contains("panicked") || l.starts_with("error")).map(|l| l.to_string()))
                 .unwrap_or_else(|| lines.iter().rev().take(3).rev().cloned().collect::<Vec<_>>().join(" | "));
-            (Err(format!("{}: build script failed (exit {}): {}", bs.src_path, o.status.code().unwrap_or(-1), cause)), out_dir)
+            {
+                use std::os::unix::process::ExitStatusExt;
+                let how = match (o.status.code(), o.status.signal()) {
+                    (Some(c), _) => format!("exit {}", c),
+                    (None, Some(sig)) => format!("killed by signal {}", sig),
+                    _ => "exit -1".to_string(),
+                };
+                (Err(format!("{}: build script failed ({}): {}", bs.src_path, how, cause)), out_dir)
+            }
         }
         Err(e) => (Err(format!("{} (build script of {}): {}", exe.display(), name, e)), out_dir),
     }
