@@ -1440,6 +1440,8 @@ impl<'a> Gen<'a> {
             }
             _ => self.a.blr(IP0),
         }
+        // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
+        self.last_call_ret = self.a.pos();
         // C leaves a narrow integer result's upper bits undefined
         if let Some(it) = sig.ret_narrow {
             self.a.extend(0, 0, it.bits, it.signed);

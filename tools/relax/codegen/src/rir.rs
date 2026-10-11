@@ -530,6 +530,10 @@ pub struct CSig {
     /// a narrow integer result (i8..i32, u8..u32, bool): C leaves the register's upper bits
     /// undefined, so the backend re-extends it after the call
     pub ret_narrow: Option<IntTy>,
+    /// the callee's ABI lets a panic unwind through the call (`extern "C-unwind"` /
+    /// `"system-unwind"`; rustc FnAbi::can_unwind): the call has an unwind edge, as a Rust call
+    /// does. `extern "C"` and `"system"` calls do not (rustc aborts a panic leaving them).
+    pub unwinds: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1077,8 +1081,8 @@ impl Func {
                     if *t >= nb || *u >= nb {
                         return Err(format!("{}: bad invoke target", self.name));
                     }
-                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) {
-                        return Err(format!("{}: b{} invoke without a Relax-ABI call as its last instruction", self.name, bi));
+                    if !matches!(b.insts.last(), Some(Inst::Call(Callee::Fn(_) | Callee::Indirect(_) | Callee::Host(_), _, _))) && !matches!(b.insts.last(), Some(Inst::Call(Callee::CFn(_, s) | Callee::CIndirect(_, s), _, _)) if s.unwinds) {
+                        return Err(format!("{}: b{} invoke without a call that may unwind as its last instruction", self.name, bi));
                     }
                 }
             }

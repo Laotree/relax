@@ -2556,6 +2556,8 @@ pub fn may_unwind(c: &Callee, nounwind: &dyn Fn(u32) -> bool) -> bool {
     match c {
         Callee::Fn(id) => !nounwind(*id),
         Callee::Indirect(_) => true,
+        // a C-unwind call: a panic may cross it (callee facts are per Rust slot, not asked)
+        Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
         Callee::Host(a) => UNWIND_HOSTS.get().map_or(false, |v| v.contains(a)),
         _ => false,
     }

@@ -546,6 +546,7 @@ impl<'a> Lcx<'a> {
             // invokes of the build's inline candidates found nounwind (opt::demote_invokes)
             Callee::Fn(_) => true,
             Callee::Indirect(_) => true,
+            Callee::CFn(_, s) | Callee::CIndirect(_, s) => s.unwinds,
             Callee::Host(a) => *a == self.u.rs.panic_site || *a == self.u.rs.panic_bounds || *a == self.u.rs.panic_impl,
             _ => false,
         }
@@ -2200,7 +2201,8 @@ impl<'a> Lcx<'a> {
             let fixed = if header.c_variadic { Some(ps.len()) } else { None };
             let mut params = Vec::new();
             for (_, ty) in args { params.push(*ty); }
-            let cs = crate::cabi::c_sig(self.u, &params, ret, fixed);
+            let mut cs = crate::cabi::c_sig(self.u, &params, ret, fixed);
+            cs.unwinds = header.abi.unwinds();
             Callee::CIndirect(f, Box::new(cs))
         } else {
             Callee::Indirect(f)
@@ -8924,7 +8926,9 @@ impl<'a> Lcx<'a> {
                     let fixed = if sig.header.c_variadic { Some(sig.params.len()) } else { None };
                     Callee::CHost(address, Box::new(crate::cabi::c_sig(self.u, &types, ret, fixed)))
                 } else if sig.header.abi.is_c_like() {
-                    Callee::CFn(self.u.instance_fn_id(instance), Box::new(crate::cabi::c_sig(self.u, &types, ret, None)))
+                    let mut cs = crate::cabi::c_sig(self.u, &types, ret, None);
+                    cs.unwinds = sig.header.abi.unwinds();
+                    Callee::CFn(self.u.instance_fn_id(instance), Box::new(cs))
                 } else { Callee::Fn(self.u.instance_fn_id(instance)) };
                 let result = self.emit_call(callee, vals, ret);
                 if foreign && matches!(self.kind(ret), TyKind::Int(_) | TyKind::Bool | TyKind::Char) {

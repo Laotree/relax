@@ -1525,6 +1525,8 @@ impl<'a> Gen<'a> {
                 self.a.call_r(R11);
             }
         }
+        // a C-unwind call is invoked like a Relax one: its landing stub is keyed by this address
+        self.last_call_ret = self.a.pos();
         if stack_bytes > 0 {
             // add rsp, imm32
             self.a.byte(0x48);

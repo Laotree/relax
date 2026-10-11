@@ -187,6 +187,11 @@ impl Abi {
         }
     }
 
+    /// rustc FnAbi::can_unwind for the C family: the `-unwind` ABIs let a panic cross the call.
+    pub fn unwinds(self) -> bool {
+        matches!(self, Self::CUnwind | Self::SystemUnwind)
+    }
+
     pub fn is_c_like(self) -> bool {
         matches!(self, Self::C | Self::CUnwind | Self::System | Self::SystemUnwind | Self::RelaxIntrinsic)
     }
