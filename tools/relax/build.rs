@@ -22,6 +22,7 @@ const PROVIDED: &[&str] = &[
     "makepad-shader",
     "makepad-tween-script",
     "makepad-script-audio-aot",
+    "makepad-hal",
 ];
 
 fn main() {

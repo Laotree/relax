@@ -28,5 +28,6 @@ makepad-script-compute = { path = "../../platform/script/compute", features = ["
 makepad-shader = { path = "../../platform/shader", features = ["host-shims"] }
 makepad-tween-script = { path = "../../libs/tween/script", features = ["host-shims"] }
 makepad-script-audio-aot = { path = "../../platform/script/audio_aot", features = ["host-shims"] }
+makepad-hal = { path = "../../platform/hal", features = ["host-shims"] }
 
 makepad-script-census = { path = "../../platform/script/census", features = ["host-shims"] }

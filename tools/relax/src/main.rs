@@ -250,6 +250,7 @@ fn src(name: &str) -> u64 {
         "makepad_shader" => env!("RELAX_SRC_makepad_shader"),
         "makepad_tween_script" => env!("RELAX_SRC_makepad_tween_script"),
         "makepad_script_audio_aot" => env!("RELAX_SRC_makepad_script_audio_aot"),
+        "makepad_hal" => env!("RELAX_SRC_makepad_hal"),
         _ => panic!("unknown provided crate: {name}"),
     };
     u64::from_str_radix(v, 16).unwrap()
@@ -261,6 +262,7 @@ fn src(name: &str) -> u64 {
 // The provided crates: nothing here calls into them, but they must be in the link for their
 // `#[relax_api]` entries (rustc keeps a linked crate's #[used] statics; an unnamed dependency is
 // not linked at all)
+extern crate makepad_hal;
 extern crate makepad_live_id;
 extern crate makepad_script;
 extern crate makepad_script_audio_aot;
@@ -273,7 +275,7 @@ extern crate relax_provided_fixture;
 
 fn provided() {
     use std::collections::{HashMap, HashSet};
-    const CRATES: [&str; 9] = [
+    const CRATES: [&str; 10] = [
         "relax_provided_fixture",
         "makepad_live_id",
         "makepad_script",
@@ -283,6 +285,7 @@ fn provided() {
         "makepad_shader",
         "makepad_tween_script",
         "makepad_script_audio_aot",
+        "makepad_hal",
     ];
     for krate in CRATES {
         let mut shims = HashMap::new();
