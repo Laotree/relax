@@ -1878,8 +1878,9 @@ fn adopt_collected_tables() -> bool {
     true
 }
 
-/// The settle drops the program's name-resolution memo tables (Program::detach_caches): what
-/// resolving a path or a glob found refills on use, as in a warm run (which starts with none).
+/// The settle drops the program's name-resolution memo tables (Program::detach_caches) and the
+/// trait solver's caches (as a declaration edit does): what they held refills on use, as in a
+/// warm run (which starts with none).
 /// Retried while the locks are busy; true: done.
 fn drop_program_memos() -> bool {
     let up = unsafe { RUN_UNIT };
@@ -1889,12 +1890,14 @@ fn drop_program_memos() -> bool {
     let t = Instant::now();
     let Some(()) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
         let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
-        unsafe { (*up).prog.detach_caches(&mut retired) };
+        let u = unsafe { &mut *up };
+        unsafe { u.prog.detach_caches(&mut retired) };
+        retired.push(u.tcx.retire_solver_cache());
         Some(())
     }).flatten() else { return false };
     let held = t.elapsed().as_secs_f64() * 1e3;
     drop(retired);
-    verbose!("relax-mem: dropped the name-resolution memos at t={:.0} ms: counted heap {:.1} -> {:.1} MB; locks held {:.1} ms",
+    verbose!("relax-mem: dropped the name-resolution memos and solver caches at t={:.0} ms: counted heap {:.1} -> {:.1} MB; locks held {:.1} ms",
         crate::clock::ms_since_start(), before as f64 / 1048576.0, crate::memstat::live_total() as f64 / 1048576.0, held);
     true
 }

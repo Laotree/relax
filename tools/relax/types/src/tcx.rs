@@ -976,6 +976,13 @@ impl Tcx {
     }
 
     /// A single-writer check session discards answers tied to old bodies and definitions.
+    /// The trait solver's goal and proof caches are dropped, as a declaration edit drops them
+    /// (type_queries.rs `collected_with_solver`): everything in them is derived and refills on
+    /// use. Returned to be freed outside the caller's locks.
+    pub fn retire_solver_cache(&mut self) -> Box<dyn Send> {
+        Box::new(std::mem::take(&mut self.queries.solver))
+    }
+
     pub fn invalidate_check(&mut self, gone: &[DefId]) {
         self.declarations.invalidate(gone);
         self.alias_tys.clear();
