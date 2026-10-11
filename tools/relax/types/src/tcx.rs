@@ -630,6 +630,9 @@ impl Tcx {
     }
 
     /// Publish declaration changes under the exclusive front-end borrow.
+    /// See QueryCx::retire_settled.
+    pub fn retire_settled(&mut self) -> (usize, usize) { self.queries.retire_settled() }
+
     pub fn publish_collected(&mut self) {
         self.publish_declarations(None);
     }

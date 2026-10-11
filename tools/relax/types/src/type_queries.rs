@@ -167,6 +167,10 @@ impl QueryCx {
         p("lifetime_names Arc<LifetimeResolution>", self.lifetime_names.mem_stats(&|_, v| if std::sync::Arc::strong_count(&v.1) > 2 { 8 } else { 16 + v.1.heap_bytes() }));
         out.extend(self.solver.mem_lines());
         {
+            use std::sync::atomic::Ordering::Relaxed;
+            out.push((format!("qt settle retirement: {} values retired, {} derived again since", crate::query::RETIRED_VALUES.load(Relaxed), crate::query::RECOMPUTED_VALUES.load(Relaxed)), 0));
+        }
+        {
             // keys hold an interned list id: 4 B, no heap. A Vec<TyId> key (the previous layout)
             // was 20 B more inline plus an exact-size heap block (glibc chunk: len * 4 + 8 rounded
             // up to 16, at least 32), held twice: by the slot and by the shard's key index.
@@ -261,6 +265,25 @@ impl QueryCx {
         if retired.len() > 4096 {
             let _ = std::thread::Builder::new().name("relax-solver-free".into()).spawn(move || drop(retired));
         }
+    }
+
+    /// Settle-time retirement (caller: exclusive Tcx borrow, FRONT_RW written): the solver cache and the
+    /// values of the type-side query tables that a query derives again on demand. A body checked
+    /// ahead that something else still holds (a second Arc) is not retired. Returns the number of
+    /// table values and solver entries dropped.
+    pub(crate) fn retire_settled(&mut self) -> (usize, usize) {
+        // a body with errors is kept: recomputing it would report the taint message instead of its
+        // errors (the diagnostics context drops repeated reports)
+        let mut values = self.typeck.retire(&|_, v| std::sync::Arc::strong_count(&v.1) > 1 || !v.1.errors.is_empty());
+        values += self.resolved_bound_vars.retire(&|_, v| std::sync::Arc::strong_count(&v.1) > 1);
+        // after resolved_bound_vars: its values hold the lifetime resolutions
+        values += self.lifetime_names.retire(&|_, v| std::sync::Arc::strong_count(&v.1) > 1);
+        values += self.resolve_instance.retire(&|_, _| false);
+        values += self.codegen_select.retire(&|_, _| false);
+        let retired = std::mem::take(&mut self.solver);
+        let entries = retired.cached_len();
+        let _ = std::thread::Builder::new().name("relax-solver-free".into()).spawn(move || drop(retired));
+        (values, entries)
     }
 
     pub fn register_crates(&mut self, count: usize) {

@@ -54,7 +54,7 @@ const LIST_MAX_CHUNKS: usize = 1 << 13;
 /// A list id's low bits: its word count, or LONG when a length word precedes the words.
 const LEN_BITS: u32 = 3;
 const LONG: u32 = (1 << LEN_BITS) - 1;
-const LIST_BUCKET_BITS: u32 = 19;
+const LIST_BUCKET_BITS: u32 = 18;
 
 /// The list arena: each list is [next, words...], or [next, len, words...] from LONG words on
 /// (next: the following list in its hash bucket, 0 = none), named by `position of its first

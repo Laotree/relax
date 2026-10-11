@@ -340,8 +340,8 @@ const CHUNK_BITS: u32 = 14;
 const CHUNK: usize = 1 << CHUNK_BITS;
 /// Chunk table size: 2^26 types at most (a run uses ~10^5).
 const MAX_CHUNKS: usize = 1 << 12;
-/// Hash buckets of the intern table (fixed: chains grow gracefully past ~10^6 types).
-const BUCKET_BITS: u32 = 20;
+/// Hash buckets of the intern table (fixed; sized to the ~6*10^5 types of a settled app, chains of ~1-2 entries).
+const BUCKET_BITS: u32 = 19;
 /// Insert locks, by bucket.
 const LOCKS: usize = 64;
 

@@ -6045,6 +6045,14 @@ fn freed_since(before: i64) -> u64 {
     before.saturating_sub(crate::memstat::live_total()).max(0) as u64
 }
 
+/// Settle (the run is quiet after first present): drop the type side's solver cache and the
+/// query values nothing holds, which a query derives again on demand. Caller holds the unit
+/// lock; FRONT_RW excludes the off-lock checkers. None when a checker is busy (retried).
+pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
+    let _front = FRONT_RW.try_write().ok()?;
+    Some((*up).tcx.retire_settled())
+}
+
 /// Reclaim rebuildable compile state. Caller holds the unit lock, outside any compilation.
 /// FRONT_RW excludes off-lock typeck before memo nodes can be freed. Suspended fronts pin
 /// their own inputs, not the entire unit. MemoMap::get returns owned clones; no node borrow

@@ -1400,7 +1400,7 @@ impl SettleWatch {
 fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return false; }
-    let Some(Some((drops, pending, spill, at, landmark))) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+    let Some(Some((drops, pending, spill, at, landmark, retired))) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
         if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
             return None;
         }
@@ -1410,6 +1410,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         drops.rir += completed.rir;
         drops.typeck += completed.typeck;
         let drops = std::mem::take(drops);
+        let retired = unsafe { jit::retire_type_side(up) };
         let u = unsafe { &mut *up };
         let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
         let spill = u.cache.as_mut().and_then(|c| c.spill_take());
@@ -1418,7 +1419,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         let landmark = if present == 0 { "before first present".to_owned() } else {
             format!("first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
         };
-        Some((drops, pending, spill, at, landmark))
+        Some((drops, pending, spill, at, landmark, retired))
     }) else { return false };
     std::thread::spawn(move || {
         let result = spill.map(|s| s.write());
@@ -1430,13 +1431,15 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         let after = crate::memstat::process_rss();
         if crate::memstat::enabled() || crate::preload::trace() {
             let mb = |n: u64| n as f64 / 1048576.0;
-            eprintln!("relax-mem: settle at t={:.0} ms ({}): completed-body drops RIR of {} fns ({:.1} MB), typeck {:.1} MB, lower {:.1} MB, spec {:.1} MB (max sweep {:.1} ms), cache spill {:.1} MB ({:?}); trim{} rss {:.1} -> {:.1} MB in {:.1} ms; before [{}], after [{}]{}",
+            eprintln!("relax-mem: settle at t={:.0} ms ({}): completed-body drops RIR of {} fns ({:.1} MB), typeck {:.1} MB, lower {:.1} MB, spec {:.1} MB (max sweep {:.1} ms), cache spill {:.1} MB ({:?}); retired {} query values + {} solver entries (recomputed since: {} values); trim{} rss {:.1} -> {:.1} MB in {:.1} ms; before [{}], after [{}]{}",
                 at, landmark, drops.fns, mb(drops.rir), mb(drops.typeck), mb(drops.lower), mb(drops.spec),
-                drops.max_sweep_ns as f64 / 1e6, mb(pending as u64), result, if trim { "" } else { " disabled" }, mb(before.0), mb(after.0), trim_ms, before.2, after.2,
+                drops.max_sweep_ns as f64 / 1e6, mb(pending as u64), result, retired.map_or(0, |r| r.0), retired.map_or(0, |r| r.1), crate::query::RECOMPUTED_VALUES.load(Ordering::Relaxed), if trim { "" } else { " disabled" }, mb(before.0), mb(after.0), trim_ms, before.2, after.2,
                 if crate::memstat::enabled() { "" } else { " (RIR estimated; other heap bytes require RELAX_MEM_REPORT)" });
         }
     });
-    true
+    // a checker kept FRONT_RW busy: the type side was not retired, so this compile count is not
+    // settled yet (the next quiet period tries again)
+    retired.is_some()
 }
 
 fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::options::Options) {

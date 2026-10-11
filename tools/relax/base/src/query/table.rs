@@ -5,6 +5,10 @@ use std::sync::{OnceLock, RwLock};
 
 const SHARDS: usize = 32;
 
+/// Values dropped by `retire` and recomputed by a later `get` (a green node whose value was retired).
+pub static RETIRED_VALUES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static RECOMPUTED_VALUES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 struct Slot<K, V> {
     key: K,
     value: Option<V>,
@@ -122,9 +126,11 @@ impl<K: Hash + Eq + Clone, V: Clone> QueryTable<K, V> {
                 Some(&slot_index) => {
                     let slot = &shard.slots[slot_index as usize];
                     if slot.verified_at == engine.revision() {
-                        let value = slot.value.as_ref().unwrap().clone();
-                        engine.read_index(slot.node);
-                        return Ok(value);
+                        if let Some(value) = slot.value.as_ref() {
+                            let value = value.clone();
+                            engine.read_index(slot.node);
+                            return Ok(value);
+                        }
                     }
                     Some((slot_index, slot.node))
                 }
@@ -163,11 +169,35 @@ impl<K: Hash + Eq + Clone, V: Clone> QueryTable<K, V> {
         let value = {
             let mut shard = shard_lock.write().unwrap_or_else(|e| e.into_inner());
             let slot = &mut shard.slots[slot_index as usize];
-            let value = slot.value.as_ref().unwrap().clone();
             slot.verified_at = engine.revision();
-            value
+            slot.value.clone()
+        };
+        // A retired value (`retire`) on a green node: the node's fingerprint stands, the value is
+        // derived again from the same provider (its reads join the caller's, a superset).
+        let value = match value {
+            Some(value) => value,
+            None => {
+                let value = compute(key.clone())?;
+                RECOMPUTED_VALUES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                shard_lock.write().unwrap_or_else(|e| e.into_inner()).slots[slot_index as usize].value = Some(value.clone());
+                value
+            }
         };
         engine.read_index(node);
         Ok(value)
+    }
+
+    /// Drop the completed values `keep` does not want; the nodes stay green and `get` derives a
+    /// dropped value again on demand. Returns how many were dropped.
+    pub fn retire(&self, keep: &dyn Fn(&K, &V) -> bool) -> usize {
+        let mut n = 0;
+        for shard in self.shards() {
+            let mut shard = shard.write().unwrap_or_else(|e| e.into_inner());
+            for slot in shard.slots.iter_mut() {
+                if slot.value.as_ref().is_some_and(|v| !keep(&slot.key, v)) { slot.value = None; n += 1; }
+            }
+        }
+        RETIRED_VALUES.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        n
     }
 }
