@@ -2082,6 +2082,11 @@ impl Cache {
             }
             return;
         };
+        // the same code again (a hot slot rebuilt by every run): the entry and the startup
+        // image that holds it stay as they are, nothing is appended
+        if replace && existing && !self.pending_keys.contains(&key) && self.get(key).is_some_and(|(kind, p)| kind == KIND_CODE && p == &payload[..]) {
+            return;
+        }
         self.pending_keys.insert(key);
         if replace && (existing || self.linked.contains(&id)) {
             self.image_rewrite = true;

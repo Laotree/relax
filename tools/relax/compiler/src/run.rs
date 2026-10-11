@@ -2220,6 +2220,8 @@ fn summary_inner(why: &str) {
                     Ok(written)
                 });
                 exit_mark("flush");
+                // the generations the writes replaced go now: the rest of the exit can be cut short
+                if r.is_ok() { c.retire_replaced(); }
                 // the collected program, unless restored whole or written mid-run; never waits long
                 // for a reader: an app thread parked for good (EXITING) may hold one
                 if r.is_ok() && front_recordable() && !COLLECTED_CURRENT.load(Ordering::Relaxed) {
@@ -2231,7 +2233,6 @@ fn summary_inner(why: &str) {
                         verbose!("relax-collected: not recorded at exit: the front end is still read by another thread");
                     }
                 }
-                if r.is_ok() { c.retire_replaced(); }
                 if !options.verbose {
                     if let Err(e) = &r { eprintln!("relax-cache: write: {}", e); }
                 }
