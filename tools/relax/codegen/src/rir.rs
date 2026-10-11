@@ -2,7 +2,7 @@
 //! (mutable, not SSA, like wasm locals), explicit memory, explicit traps.
 //! Every instruction carries a source position for the PC -> source map.
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Cls {
     /// 64-bit integer / pointer register
     I,
@@ -314,7 +314,7 @@ pub enum Conv {
     FToBits(bool),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Mem {
     /// integer load/store of `bytes` (load extends by signedness)
     Int(u8, bool),

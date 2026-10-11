@@ -12,14 +12,14 @@ use crate::rir::{Cls, Mem};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Leaf {
     pub off: u32,
     pub mem: Mem,
     pub cls: Cls,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Layout {
     pub size: u32,
     pub align: u32,
@@ -46,7 +46,7 @@ pub struct Layout {
 
 /// A scalar of `bytes` at `off` whose valid values are `start..=end` (wrapping; rustc_abi
 /// Niche with its WrappingRange).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Niche {
     pub off: u32,
     pub bytes: u32,
@@ -134,7 +134,7 @@ impl Niche {
 }
 
 /// How an enum's tag field encodes the variant (rustc_abi TagEncoding).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum TagEnc {
     /// the tag holds the discriminant (or: not an enum)
     Direct,
@@ -149,6 +149,7 @@ pub const MAX_LEAVES: usize = 8;
 
 /// One computed layout; `too_big`: the type is 4 GiB or larger (layouts are u32, their sizes
 /// saturate and every use is an error in lowering, never a silent wrap).
+#[derive(PartialEq, Eq, Hash)]
 struct LEntry {
     layout: Layout,
     too_big: bool,
@@ -158,16 +159,17 @@ const LCHUNK_BITS: u32 = 12;
 const LCHUNK: usize = 1 << LCHUNK_BITS;
 const LMAX_CHUNKS: usize = 1 << 14;
 
-/// Per-TyId slots (TyIds are dense): computed layouts and the is_unsized answers. Readable
-/// without locks from every thread; an entry is complete before its slot publishes it.
-struct LTable {
-    chunks: Box<[std::sync::atomic::AtomicPtr<LSlot>]>,
-}
+/// A slot word: bits 0..30 the layout's entry index + 1 (0: not computed yet), bits 30..32 the
+/// is_unsized answer (0 unknown, 1 sized, 2 unsized).
+const SLOT_IDX: u32 = (1 << 30) - 1;
+const SLOT_UNSZ_SHIFT: u32 = 30;
 
-struct LSlot {
-    layout: std::sync::atomic::AtomicPtr<LEntry>,
-    /// 0 unknown, 1 sized, 2 unsized
-    unsz: std::sync::atomic::AtomicU8,
+/// Per-TyId slots (TyIds are dense): the index of the computed layout and the is_unsized
+/// answer, 4 bytes per type. Readable without locks from every thread; the entry is complete
+/// before its slot publishes it. The entries themselves are shared (`Layouts::ents`): a few
+/// thousand distinct layouts serve every type.
+struct LTable {
+    chunks: Box<[std::sync::atomic::AtomicPtr<std::sync::atomic::AtomicU32>]>,
 }
 
 impl LTable {
@@ -176,15 +178,15 @@ impl LTable {
     }
 
     /// The slot of `t` (its chunk allocated on first use).
-    fn slot(&self, t: TyId) -> &LSlot {
-        use std::sync::atomic::Ordering;
+    fn slot(&self, t: TyId) -> &std::sync::atomic::AtomicU32 {
+        use std::sync::atomic::{AtomicU32, Ordering};
         let i = t.0 as usize;
         let ci = i >> LCHUNK_BITS;
         assert!(ci < LMAX_CHUNKS, "relax: layout table full");
         let mut c = self.chunks[ci].load(Ordering::Acquire);
         if c.is_null() {
-            let fresh: Box<[LSlot]> = (0..LCHUNK).map(|_| LSlot { layout: Default::default(), unsz: Default::default() }).collect();
-            let p = Box::into_raw(fresh) as *mut LSlot;
+            let fresh: Box<[AtomicU32]> = (0..LCHUNK).map(|_| AtomicU32::new(0)).collect();
+            let p = Box::into_raw(fresh) as *mut AtomicU32;
             match self.chunks[ci].compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire) {
                 Ok(_) => c = p,
                 Err(other) => {
@@ -201,20 +203,21 @@ impl Drop for LTable {
     fn drop(&mut self) {
         for c in self.chunks.iter_mut() {
             let p = *c.get_mut();
-            if p.is_null() {
-                continue;
-            }
-            unsafe {
-                let chunk = Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, LCHUNK));
-                for s in chunk.iter() {
-                    let e = s.layout.load(std::sync::atomic::Ordering::Relaxed);
-                    if !e.is_null() {
-                        std::mem::drop(Box::from_raw(e));
-                    }
-                }
+            if !p.is_null() {
+                unsafe { drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, LCHUNK))) };
             }
         }
     }
+}
+
+/// The distinct layouts: an append-only array (entries never move) plus a hash chain index over
+/// it, so a layout equal to one already made is stored once.
+#[derive(Default)]
+struct LPool {
+    /// layout hash -> the first entry index with it
+    head: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<crate::fxhash::FxHasher>>,
+    /// entry index -> the next entry index with the same hash (u32::MAX: none)
+    next: Vec<u32>,
 }
 
 /// Per-evaluation layout effects, propagated through nested layouts instead of TLS.
@@ -239,6 +242,9 @@ pub struct Layouts {
     closure_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
     table: std::sync::atomic::AtomicPtr<LTable>,
     retired: std::sync::Mutex<Vec<Box<LTable>>>,
+    /// the distinct layouts, never freed before the Layouts (`of` hands out 'static references)
+    ents: crate::conc::AppendVec<LEntry>,
+    pool: std::sync::Mutex<LPool>,
     /// provided crates' opaque types (provided.rs): rustc's size and align, no fields Relax
     /// may read; set once when the unit is made
     pub opaque: std::collections::HashMap<crate::program::DefId, (u32, u32)>,
@@ -357,7 +363,7 @@ fn tz(x: u64) -> u64 {
 
 impl Layouts {
     pub fn new() -> Layouts {
-        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), opaque: Default::default() }
+        Layouts { closure_storage: Default::default(), table: std::sync::atomic::AtomicPtr::new(Box::into_raw(LTable::new())), retired: Default::default(), ents: crate::conc::AppendVec::with_capacity(1 << 24), pool: Default::default(), opaque: Default::default() }
     }
 
     pub fn closure_storage(&self, prog: &crate::program::Program, tcx: &Tcx, ty: TyId) -> ClosureStorage {
@@ -375,6 +381,70 @@ impl Layouts {
         let storage = self.closure_storage(lcx.prog, tcx, ty);
         let kind = if storage.fields.is_empty() { Kind::AlwaysSized } else { Kind::MaybeUnsized };
         self.struct_layout(lcx, tcx, &storage.fields, Repr { pack: 0, align: 0, reorder: true }, kind)
+    }
+
+    /// Memory report (RELAX_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
+    /// the shared layout entries with their vectors.
+    pub fn mem_lines(&self) -> Vec<(String, u64)> {
+        use std::sync::atomic::Ordering;
+        let mut out = Vec::new();
+        let ret = self.retired.lock().unwrap_or_else(|e| e.into_inner());
+        let mut tables: Vec<(&str, &LTable)> = vec![("live", self.table())];
+        for t in ret.iter() { tables.push(("retired", t)); }
+        for (name, t) in tables {
+            let (mut chunks, mut used) = (0u64, 0u64);
+            for c in t.chunks.iter() {
+                let p = c.load(Ordering::Acquire);
+                if p.is_null() { continue; }
+                chunks += 1;
+                for k in 0..LCHUNK {
+                    used += (unsafe { &*p.add(k) }.load(Ordering::Acquire) & SLOT_IDX != 0) as u64;
+                }
+            }
+            let bytes = chunks * (LCHUNK * 4) as u64 + (LMAX_CHUNKS * 8) as u64;
+            out.push((format!("layout {} table: slots ({} chunks of {} B; {} types with a layout)", name, chunks, LCHUNK * 4, used), bytes));
+        }
+        let (mut vb, mut nf, mut nvf, mut nl) = (0u64, 0u64, 0u64, 0u64);
+        for e in self.ents.iter() {
+            let l = &e.layout;
+            vb += (l.fields.capacity() * 4 + l.leaves.as_ref().map_or(0, |v| v.capacity() * std::mem::size_of::<Leaf>()) + l.variant_fields.capacity() * 24
+                + l.variant_fields.iter().map(|v| v.capacity() * 4).sum::<usize>()) as u64;
+            nf += !l.fields.is_empty() as u64;
+            nvf += !l.variant_fields.is_empty() as u64;
+            nl += l.leaves.is_some() as u64;
+        }
+        let n = self.ents.len() as u64;
+        out.push((format!("layout shared entries ({}; LEntry {} B; with fields {}, variant_fields {}, leaves {})", n, std::mem::size_of::<LEntry>(), nf, nvf, nl), n * std::mem::size_of::<LEntry>() as u64));
+        out.push(("layout shared entries: vector heap".to_string(), vb));
+        out
+    }
+
+    /// The entry made for `l` (equal layouts share one), `ents` index + 1.
+    fn intern(&self, l: Layout, too_big: bool) -> u32 {
+        use std::hash::{Hash, Hasher};
+        let e = LEntry { layout: l, too_big };
+        let mut h = crate::fxhash::FxHasher::default();
+        e.hash(&mut h);
+        let h = h.finish();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        let mut at = pool.head.get(&h).copied();
+        while let Some(i) = at {
+            if self.ents[i as usize] == e {
+                return i + 1;
+            }
+            at = Some(pool.next[i as usize]).filter(|n| *n != u32::MAX);
+        }
+        let i = self.ents.push(e) as u32;
+        assert!(i < SLOT_IDX, "relax: layout entries full");
+        let first = pool.head.insert(h, i);
+        pool.next.push(first.unwrap_or(u32::MAX));
+        i + 1
+    }
+
+    /// The entry of slot word `w`'s layout index (`w & SLOT_IDX` is not 0).
+    #[inline]
+    fn entry(&self, w: u32) -> &'static LEntry {
+        unsafe { &*(&self.ents[((w & SLOT_IDX) - 1) as usize] as *const LEntry) }
     }
 
     fn table(&self) -> &LTable {
@@ -404,15 +474,11 @@ impl Layouts {
                 let p = c.load(Ordering::Acquire);
                 if p.is_null() { continue; }
                 for k in 0..LCHUNK {
-                    let s = unsafe { &*p.add(k) };
-                    let e = s.layout.load(Ordering::Acquire);
-                    if e.is_null() { continue; }
+                    let w = unsafe { &*p.add(k) }.load(Ordering::Acquire);
+                    if w & SLOT_IDX == 0 { continue; }
                     let t = TyId(((ci << LCHUNK_BITS) | k) as u32);
                     if !keep(t) { continue; }
-                    let e = unsafe { &*e };
-                    let slot = fresh.slot(t);
-                    slot.unsz.store(s.unsz.load(Ordering::Acquire), Ordering::Release);
-                    slot.layout.store(Box::into_raw(Box::new(LEntry { layout: e.layout.clone(), too_big: e.too_big })), Ordering::Release);
+                    fresh.slot(t).store(w, Ordering::Release);
                 }
             }
         }
@@ -429,9 +495,9 @@ impl Layouts {
         let _mem = crate::memstat::tag(crate::memstat::Tag::Layout);
         use std::sync::atomic::Ordering;
         let slot = self.table().slot(t);
-        let e = slot.layout.load(Ordering::Acquire);
-        if !e.is_null() {
-            let e: &'static LEntry = unsafe { &*e };
+        let w = slot.load(Ordering::Acquire);
+        if w & SLOT_IDX != 0 {
+            let e = self.entry(w);
             if e.too_big {
                 lcx.overflowed.set(true);
             }
@@ -448,13 +514,16 @@ impl Layouts {
             // (Unit::layout_of lowers it and asks again)
             return Box::leak(Box::new(l));
         }
-        let p = Box::into_raw(Box::new(LEntry { layout: l, too_big: ov }));
-        match slot.layout.compare_exchange(std::ptr::null_mut(), p, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => unsafe { &(*(p as *const LEntry)).layout },
-            Err(other) => {
-                // another thread computed it meanwhile: the same layout; keep theirs
-                unsafe { std::mem::drop(Box::from_raw(p)) };
-                unsafe { &(*(other as *const LEntry)).layout }
+        let idx = self.intern(l, ov);
+        // publish; another thread may have computed the same type meanwhile (same layout, same entry)
+        let mut cur = slot.load(Ordering::Acquire);
+        loop {
+            if cur & SLOT_IDX != 0 {
+                return &self.entry(cur).layout;
+            }
+            match slot.compare_exchange(cur, cur | idx, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return &self.entry(idx).layout,
+                Err(now) => cur = now,
             }
         }
     }
@@ -494,8 +563,8 @@ impl Layouts {
 
     /// Is `t` 4 GiB or larger (its layout saturated)?
     pub fn is_too_big(&self, t: TyId) -> bool {
-        let e = self.table().slot(t).layout.load(std::sync::atomic::Ordering::Acquire);
-        !e.is_null() && unsafe { (*e).too_big }
+        let w = self.table().slot(t).load(std::sync::atomic::Ordering::Acquire);
+        w & SLOT_IDX != 0 && self.entry(w).too_big
     }
 
     fn rup(&self, lcx: &LayoutCx<'_>, x: u32, a: u32) -> u32 {
@@ -1136,7 +1205,7 @@ impl Layouts {
         let t = tcx.tys.erase_regions(t);
         use std::sync::atomic::Ordering;
         let slot = self.table().slot(t);
-        match slot.unsz.load(Ordering::Relaxed) {
+        match slot.load(Ordering::Relaxed) >> SLOT_UNSZ_SHIFT {
             1 => return false,
             2 => return true,
             _ => {}
@@ -1162,7 +1231,7 @@ impl Layouts {
             },
             _ => false,
         };
-        slot.unsz.store(if r { 2 } else { 1 }, Ordering::Relaxed);
+        slot.fetch_or((if r { 2 } else { 1 }) << SLOT_UNSZ_SHIFT, Ordering::Relaxed);
         r
     }
 

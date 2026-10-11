@@ -126,6 +126,7 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     out.extend(u.front.mem_lines());
     out.extend(u.prog.memo_mem_lines());
     out.extend(u.tcx.mem_lines());
+    out.extend(u.lay.mem_lines());
     {
         let t = u.code.read().unwrap_or_else(|e| e.into_inner());
         out.push((format!("code index ({})", t.index.len()), vbytes(&t.index)));
