@@ -381,6 +381,11 @@ pub struct Cache {
     pub manifest_uncached: usize,
     /// of the slots before the first present: how many had a code entry when it was recorded
     manifest_present_cached: usize,
+    /// the loaded manifest's code keys by the hash of their slot's identity bytes, when the
+    /// manifest was recorded from exactly this run's sources (manifest_sources_key): a slot's
+    /// code key is then taken as recorded instead of hashing the bodies it is made from again
+    /// (code_key_bytes). Empty otherwise.
+    manifest_keys: HashMap<u128, u128>,
     /// the manifest's prelinked startup image (the code of its slots before the first present,
     /// stored once relocatable against a table of this run's identities: `prelink`)
     image: Option<ManifestImage>,
@@ -598,6 +603,7 @@ impl Cache {
             manifest_present: 0,
             manifest_missing: 0,
             manifest_uncached: 0,
+            manifest_keys: HashMap::new(),
             manifest_present_cached: 0,
             image: None,
             image_ids: None,
@@ -1667,20 +1673,28 @@ impl Cache {
         crates.sort_unstable();
         crates.dedup();
         let dom = self.dominant(&crates);
-        let mut h = Sip128::new();
-        h.str("code");
-        h.u128(self.cfg);
-        h.write(&e.0);
-        for &c in &crates {
-            h.u128(*self.iface.get(c as usize)?);
-        }
-        // the bodies the code is made from: the definition's, a closure's enclosing fns'
-        for d in key_defs(u, key) {
-            h.u128(self.def_body(u, d));
-        }
-        // types defined in a fn body (their text is that body's)
-        self.local_bodies(u, &named, &mut h);
-        let k = h.finish128();
+        // a slot of the startup manifest, recorded from these sources and none edited since:
+        // its key as recorded (the bodies below hash to what they hashed to then)
+        let recorded = if self.manifest_keys.is_empty() || !crate::reload::edited_crates().is_empty() { None } else { self.manifest_keys.get(&identity_hash(&e.0)).copied() };
+        let k = match recorded {
+            Some(k) => k,
+            None => {
+                let mut h = Sip128::new();
+                h.str("code");
+                h.u128(self.cfg);
+                h.write(&e.0);
+                for &c in &crates {
+                    h.u128(*self.iface.get(c as usize)?);
+                }
+                // the bodies the code is made from: the definition's, a closure's enclosing fns'
+                for d in key_defs(u, key) {
+                    h.u128(self.def_body(u, d));
+                }
+                // types defined in a fn body (their text is that body's)
+                self.local_bodies(u, &named, &mut h);
+                h.finish128()
+            }
+        };
         self.key_crate.insert(k, dom);
         Some((k, crates, e.0))
     }
@@ -2270,6 +2284,26 @@ impl Cache {
         Some(h.finish128())
     }
 
+    /// Key of the entry naming the sources a startup manifest's code keys were made from.
+    fn manifest_sources_key(&self, manifest: u128) -> u128 {
+        let mut h = Sip128::new();
+        h.str("startup slots sources");
+        h.u128(manifest);
+        h.finish128()
+    }
+
+    /// Every crate's fingerprint (sources, cfg, dependencies) and the code configuration: equal
+    /// in two runs, the code key of every slot is equal too.
+    fn sources_fp(&self) -> u128 {
+        let mut h = Sip128::new();
+        h.str("sources");
+        h.u128(self.cfg);
+        for &fp in &self.fps {
+            h.u128(fp);
+        }
+        h.finish128()
+    }
+
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its
     /// prelinked startup image, if it has one).
     pub fn load_manifest(&mut self, root: u32) {
@@ -2278,6 +2312,7 @@ impl Cache {
             if let Some((KIND_MANIFEST, p)) = pk.get(key) {
                 let mut d = D { b: p, p: 0 };
                 let mut out = Vec::new();
+                let mut keys = Vec::new();
                 let (mut missing, mut uncached, mut present_cached) = (0, 0, 0);
                 let ok = (|| {
                     if d.u32()? != ENTRY_VERSION {
@@ -2287,7 +2322,9 @@ impl Cache {
                     let present = d.u32()? as usize;
                     for i in 0..n {
                         out.push(d.bytes()?.to_vec());
-                        match d.u128()? {
+                        let k = d.u128()?;
+                        keys.push(k);
+                        match k {
                             0 => uncached += 1,
                             k if !self.has_index(&k) => missing += 1,
                             _ => if i < present { present_cached += 1 },
@@ -2296,6 +2333,11 @@ impl Cache {
                     Some(present.min(n))
                 })();
                 if let Some(present) = ok {
+                    // recorded from these very sources: its keys are this run's keys
+                    let sources = self.manifest_sources_key(key);
+                    if missing == 0 && self.mode != Mode::Verify && pk.get(sources).is_some_and(|(kind, p)| kind == KIND_MANIFEST && D { b: p, p: 0 }.u128() == Some(self.sources_fp())) {
+                        self.manifest_keys = out.iter().zip(&keys).filter(|(_, k)| **k != 0).map(|(b, k)| (identity_hash(b), *k)).collect();
+                    }
                     self.manifest = out;
                     self.manifest_present = present;
                     self.manifest_missing = missing;
@@ -2387,6 +2429,11 @@ impl Cache {
             e.0.extend_from_slice(&img);
         }
         self.push_pending(root, NewEntry { key, kind: KIND_MANIFEST, payload: e.0 });
+        // the sources the keys above were made from (none after a live edit: this run's
+        // fingerprints describe its start, not the edited files)
+        let mut f = E::default();
+        f.u128(if crate::reload::edited_crates().is_empty() { self.sources_fp() } else { 0 });
+        self.push_pending(root, NewEntry { key: self.manifest_sources_key(key), kind: KIND_MANIFEST, payload: f.0 });
         self.image_rewrite = false;
         true
     }
@@ -2440,6 +2487,14 @@ impl Cache {
         }
         Ok(n)
     }
+}
+
+/// A slot identity's bytes (enc_fnkey) as a 128-bit hash: the manifest_keys index.
+fn identity_hash(b: &[u8]) -> u128 {
+    let mut h = Sip128::new();
+    h.str("identity");
+    h.write(b);
+    h.finish128()
 }
 
 /// Pending entries by the store they go to: (crate, front store) -- front images to the crate's
