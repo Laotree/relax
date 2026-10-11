@@ -208,7 +208,10 @@ impl<D: Delegate> ExprUseVisitor<'_, '_, D> {
                 } else { self.use_expr(x, Access::Mutate); self.consume_expr(y); }
             }
             ExprKind::AssignOp(_, x, y) => {
-                if let Some(m) = self.body.binops.get(&e.0) { self.receiver(x, e.0, m.derefs as usize, m.autoref); }
+                // rustc_hir_typeck/src/op.rs:283-291: an overloaded `a op= b` adjusts the left
+                // operand with `&mut` (the method takes `&mut self`), so the closure analysis
+                // sees a mutable borrow of the place, not a by-value use
+                if let Some(m) = self.body.binops.get(&e.0) { self.receiver(x, e.0, m.derefs as usize, 2); }
                 else { self.use_expr(x, Access::Mutate); }
                 self.consume_expr(y);
             }
