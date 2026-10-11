@@ -550,6 +550,76 @@ fn skip_tys(d: &mut D, depth: u32) -> Option<()> {
     Some(())
 }
 
+fn skip_region(d: &mut D) -> Option<()> {
+    match d.u8()? {
+        0 => {}
+        1 => {
+            d.u32()?;
+            d.u32()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn skip_regions(d: &mut D) -> Option<()> {
+    let n = d.u32()?;
+    for _ in 0..n {
+        skip_region(d)?;
+    }
+    Some(())
+}
+
+fn skip_const(d: &mut D, depth: u32) -> Option<()> {
+    if depth > 64 {
+        return None;
+    }
+    match d.u8()? {
+        0 => {
+            skip_ty(d, depth + 1)?;
+            match d.u8()? {
+                0 => {
+                    d.u8()?;
+                    d.u128()?;
+                }
+                1 => {
+                    let n = d.u32()?;
+                    for _ in 0..n {
+                        skip_const(d, depth + 1)?;
+                    }
+                }
+                _ => return None,
+            }
+        }
+        1 => {
+            d.u8()?;
+            d.u8()?;
+            skip_def(d)?;
+            let n = d.u32()?;
+            for _ in 0..n {
+                match d.u8()? {
+                    0 => skip_ty(d, depth + 1)?,
+                    1 => skip_const(d, depth + 1)?,
+                    2 => skip_region(d)?,
+                    _ => return None,
+                }
+            }
+        }
+        2 => {
+            d.u32()?;
+        }
+        3 => {
+            d.u32()?;
+            d.u32()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+// Mirrors Cache::enc_ty tag for tag: a skip that stops short or runs long cuts the key bytes of
+// every symbol and closure parent after it (the cache::tests::skip_matches_encoding test holds
+// the two together).
 fn skip_ty(d: &mut D, depth: u32) -> Option<()> {
     if depth > 64 {
         return None;
@@ -562,19 +632,21 @@ fn skip_ty(d: &mut D, depth: u32) -> Option<()> {
         7 => skip_tys(d, depth)?,
         8 => {
             skip_ty(d, depth + 1)?;
-            if d.u8()? == 1 {
-                skip_ty(d, depth + 1)?;
-            } else {
-                d.u64()?;
-            }
+            skip_const(d, depth + 1)?;
         }
         9 => skip_ty(d, depth + 1)?,
-        10 | 11 => {
+        10 => {
+            d.u8()?;
+            skip_region(d)?;
+            skip_ty(d, depth + 1)?;
+        }
+        11 => {
             d.u8()?;
             skip_ty(d, depth + 1)?;
         }
-        12 | 14 | 18 => {
+        12 | 14 => {
             skip_def(d)?;
+            skip_regions(d)?;
             skip_tys(d, depth)?;
         }
         13 => {
@@ -583,25 +655,33 @@ fn skip_ty(d: &mut D, depth: u32) -> Option<()> {
             d.u8()?;
             d.u8()?;
             d.u8()?;
+            d.u32()?;
         }
         17 => {
             skip_file(d)?;
             d.u32()?;
             d.u64()?;
+            skip_ty(d, depth + 1)?;
+            skip_ty(d, depth + 1)?;
+            skip_ty(d, depth + 1)?;
+            skip_ty(d, depth + 1)?;
+        }
+        18 => {
             d.u8()?;
-            skip_ty(d, depth + 1)?;
-            skip_ty(d, depth + 1)?;
-            skip_ty(d, depth + 1)?;
-            if d.u8()? != 0 {
-                d.u8()?;
-                skip_ty(d, depth + 1)?;
-            }
+            d.u8()?;
+            skip_def(d)?;
+            skip_regions(d)?;
+            skip_tys(d, depth)?;
         }
         19 => {
             skip_def(d)?;
+            skip_regions(d)?;
+            skip_region(d)?;
+            d.u32()?;
             skip_tys(d, depth)?;
             let n = d.u32()?;
             for _ in 0..n {
+                d.u32()?;
                 skip_def(d)?;
                 skip_ty(d, depth + 1)?;
             }
@@ -610,20 +690,14 @@ fn skip_ty(d: &mut D, depth: u32) -> Option<()> {
                 skip_def(d)?;
             }
         }
-        20 => {
-            d.u64()?;
-        }
-        21 => {
-            skip_def(d)?;
-            d.u32()?;
-            skip_tys(d, depth)?;
-        }
+        20 => skip_const(d, depth + 1)?,
+        27 => skip_def(d)?,
         _ => return None,
     }
     Some(())
 }
 
-fn skip_fnkey(d: &mut D, depth: u32) -> Option<()> {
+pub(super) fn skip_fnkey(d: &mut D, depth: u32) -> Option<()> {
     if depth > 32 {
         return None;
     }
@@ -641,6 +715,23 @@ fn skip_fnkey(d: &mut D, depth: u32) -> Option<()> {
         2 => {
             d.u8()?;
             skip_ty(d, 0)
+        }
+        3 => {
+            let tag = d.u8()?;
+            skip_def(d)?;
+            match tag {
+                0 => {}
+                1 => {
+                    d.u8()?;
+                }
+                2 | 4 | 5 => skip_ty(d, 0)?,
+                3 => {
+                    skip_def(d)?;
+                    d.u8()?;
+                }
+                _ => return None,
+            }
+            skip_tys(d, 0)
         }
         _ => None,
     }

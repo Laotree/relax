@@ -4800,7 +4800,11 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
                     name = format!("{}<{}>", name, a.join(", "));
                 }
             }
-            u.errors.push(format!("compile error in {}: {}", name, e));
+            // a startup image slot whose key does not decode is not the program's error: no
+            // identity to rebuild, only the stub that reports it if the slot is ever called
+            if !matches!(u.fns[id as usize].key, FnKey::Glue(GLUE_UNNAMED, _)) {
+                u.errors.push(format!("compile error in {}: {}", name, e));
+            }
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
             let (code, relocs) = error_stub(u, &msg);
@@ -7581,6 +7585,13 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
         n
     };
     trace("typeck", &fname);
+    // a startup image slot reached before its identity was decoded: decode it now
+    let key = if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
+        crate::cache::name_unnamed_unit(up, id);
+        (&*up).fns[id as usize].key.clone()
+    } else {
+        key
+    };
     if matches!(key, FnKey::Glue(GLUE_UNNAMED, _)) {
         return Err(format!("slot {} of the startup image has no identity (its key did not decode)", id));
     }

@@ -170,8 +170,9 @@ pub fn verify_front_images() {
 const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
 // symbol names which block of its entry it is (its ordinal), so two relocations to different
-// offsets of one block link to one block.
-const ENTRY_VERSION: u32 = 28;
+// offsets of one block link to one block. 29: image symbol and closure-parent key spans (image.rs
+// skip_*) follow the encoding again; images written before cut keys short.
+const ENTRY_VERSION: u32 = 29;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -5060,9 +5061,13 @@ mod data_tests {
         let early = u.tcx.tys.intern(TyKind::FnDef(named("early"), u.tcx.tys.mk_list(&[]), regions));
         let alias = u.tcx.tys.intern(TyKind::Alias(relax_types::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Free { def_id: named("Alias") }, args: u.tcx.tys.mk_list(&[]), regions }));
         let object = u.tcx.tys.intern(TyKind::Dyn(named("View"), crate::types::List::EMPTY, crate::types::List::EMPTY, regions, crate::types::RegionId::ERASED, 0, crate::types::List::EMPTY));
+        let reference = u.tcx.tys.intern(TyKind::Ref(false, borrowed, crate::types::RegionId::ERASED));
+        let array = u.tcx.tys.intern(TyKind::Array(u.tcx.tys.usize_, u.tcx.tys.const_usize(3)));
+        let tuple = u.tcx.tys.intern(TyKind::Tuple(u.tcx.tys.mk_list(&[array, reference])));
+        let slice = u.tcx.tys.intern(TyKind::Slice(tuple));
         let mut encoded = Vec::new();
         for kind in kinds {
-            let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object] });
+            let key = FnKey::Shim(crate::jit::ShimInstance { kind, args: vec![callable, pointer, borrowed, early, alias, object, reference, array, tuple, slice] });
             let mut bytes = E::default();
             assert!(cache.enc_fnkey(&u, &key, &mut bytes, &mut vec![], 0).is_some());
             assert!(!encoded.contains(&bytes.0), "colliding shim key");
@@ -5074,6 +5079,9 @@ mod data_tests {
             let mut decoder = D { b: &bytes, p: 0 };
             let key = unsafe { Linker::new(&mut cache).dec_fnkey(&mut u, &mut decoder, 0) }.unwrap();
             assert_eq!(decoder.p, bytes.len());
+            // the image's skip walks exactly the bytes the encoder wrote (a short skip cut thunk keys)
+            let mut skipped = D { b: &bytes, p: 0 };
+            assert!(image::skip_fnkey(&mut skipped, 0).is_some() && skipped.p == bytes.len(), "skip_fnkey stopped at {} of {}", skipped.p, bytes.len());
             let mut again = E::default();
             assert!(cache.enc_fnkey(&u, &key, &mut again, &mut vec![], 0).is_some());
             assert_eq!(bytes, again.0);
