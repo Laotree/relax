@@ -13,6 +13,8 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  App:    makepad-remote app <pid|app-name|socket> <command> [k=v ...]   (a running makepad app's endpoint; `help` lists its commands)");
     eprintln!("          makepad-remote app <app> grab [w=ID] [scale=F] out=<file>   (images are written by this client)");
+    eprintln!("          makepad-remote app <app> tools | call <service>.<tool> [instance] [json]   (its AI tools: the `app` service)");
+    eprintln!("  MCP:    makepad-remote mcp <pid|app-name|host:app> [--no-builtins] [--launch <program> [args...]]   (stdio MCP server)");
     eprintln!("  Server: makepad-remote --server [--port 8384] [--bind lan|<ip>] [--all]");
     eprintln!("                         [--keys <file>] [--identity <dir>] [--audit-log <file>] [--max-run <secs>]");
     eprintln!("          makepad-remote --init [--identity <dir>]     create the TLS identity, print its pin");
@@ -133,6 +135,21 @@ fn main() -> ExitCode {
             exit_with(client::probe(addr, &PathBuf::from(keys), &PathBuf::from(identity)).map(|_| 0))
         }
         "app" if args.len() >= 2 => run_app(&args[1], &args[2..]),
+        "mcp" if args.len() >= 2 => {
+            let mut opts = makepad_remote::mcp::Options { target: args[1].clone(), builtins: true, launch: Vec::new() };
+            let mut rest = args[2..].iter();
+            while let Some(a) = rest.next() {
+                match a.as_str() {
+                    "--no-builtins" => opts.builtins = false,
+                    "--launch" => opts.launch = rest.by_ref().cloned().collect(),
+                    other => {
+                        eprintln!("makepad-remote mcp: unknown option {other}");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+            ExitCode::from(makepad_remote::mcp::serve(opts) as u8)
+        }
         "keygen" if args.len() == 2 => exit_with(client::keygen(&args[1]).map(|_| 0)),
         "pin" if args.len() == 3 => exit_with(client::set_pin(&args[1], &args[2]).map(|_| 0)),
         "rotate" if args.len() == 2 => exit_with(client::rotate(&args[1]).map(|_| 0)),

@@ -24,6 +24,7 @@ pub mod lines;
 pub mod pair;
 pub mod program;
 pub mod link;
+pub mod mcp;
 #[cfg(unix)]
 pub mod relay;
 pub mod ring;
