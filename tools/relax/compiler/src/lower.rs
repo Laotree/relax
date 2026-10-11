@@ -2474,8 +2474,9 @@ impl<'a> Lcx<'a> {
     fn probe_before(&mut self, s: &Stmt) {
         let ast = self.ast();
         let pos = match s {
-            Stmt::Let { init: Some(e), .. } => ast.expr(*e).lo,
-            Stmt::Expr(e, _) | Stmt::Attrs(_, e, _) => ast.expr(*e).lo,
+            Stmt::Let(r) => match ast.row(*r).init { Some(e) => ast.expr(e).lo, None => return },
+            Stmt::Expr(e, _) => ast.expr(*e).lo,
+            Stmt::Attrs(r) => ast.expr(ast.row(*r).expr).lo,
             _ => return,
         };
         let line = self.u.prog.files[self.b.file as usize].line_col(pos).0 as u32;
