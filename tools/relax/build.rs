@@ -42,7 +42,7 @@ fn main() {
     if !matches!(os.as_str(), "windows" | "macos" | "ios") && std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("wasm32") {
         println!("cargo:rustc-link-arg-bins=-Wl,-z,nostart-stop-gc");
     }
-    // Linux: src/malloc_compat.rs's `mallinfo` must be in the dynamic symbol table, so the
+    // Linux: src/cef.rs's `mallinfo` (libs/cef/src/malloc_compat.rs) must be in the dynamic symbol table, so the
     // libraries the loader dlopens (libcef) bind their `mallinfo` import to it
     if os == "linux" {
         println!("cargo:rustc-link-arg-bins=-Wl,--export-dynamic-symbol=mallinfo");
