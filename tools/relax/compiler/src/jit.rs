@@ -7996,6 +7996,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
             crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
         }
     }
+    // iterator steps: the element pointer's accesses read the advanced cursor, one register
+    if cfg.fold {
+        crate::opt::fold_post_increments(func);
+    }
     // Rust min/max with an operand that is never NaN: one minss/maxss (bounding boxes)
     if cfg.fold {
         crate::opt::min_max_non_nan(func);

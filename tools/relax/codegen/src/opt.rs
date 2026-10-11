@@ -7145,6 +7145,229 @@ pub fn rotate_loops(f: &mut Func) {
     }
 }
 
+/// Post-increment pointers share one register: an iterator step `p = x; t = p + K; x = t`
+/// (or `t = x + K`, the same value there)
+/// (slice::Iter::next inlined into a loop: the element pointer p and the advanced cursor x) keeps
+/// p alive next to x for the element's field accesses, so every step copied the cursor (`mov p, x;
+/// add x, K`). Those accesses read x instead -- at offset `off - K` after the step (x = p + K
+/// there), unchanged before it -- when x has no other definition on any path from the step to
+/// them; p then dies and the step becomes `x = x + K` (`add x, K`, no copy). Only when every use
+/// of p is a load / store base with a constant offset (or the step's add itself).
+pub fn fold_post_increments(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let nb = f.blocks.len();
+    let mut ndef = vec![0u32; nv];
+    let mut nuse = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 2;
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+            for_uses(i, |u| nuse[u.0 as usize] += 1);
+        }
+        term_uses(&b.term, &mut tu);
+        for u in &tu {
+            nuse[u.0 as usize] += 1;
+        }
+    }
+    // candidates: (block, i0 = Mov(p, x), i1 = Add(t, p, K), i2 = Mov(x, t))
+    let mut cands: Vec<(usize, usize, usize, usize, VReg, VReg, VReg, i64)> = Vec::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (i0, inst) in b.insts.iter().enumerate() {
+            let Inst::Mov(p, x) = *inst else { continue };
+            if p == x || ndef[p.0 as usize] != 1 || ndef[x.0 as usize] < 2 || f.vregs[p.0 as usize] != Cls::I {
+                continue;
+            }
+            // the add of p and the move back into x, with no other write of p or x before them
+            let mut add: Option<(usize, VReg, i64)> = None;
+            let mut back: Option<usize> = None;
+            for (k, j) in b.insts.iter().enumerate().skip(i0 + 1) {
+                let mut hit = false;
+                for_defs(j, |d| hit |= d == x || d == p);
+                match *j {
+                    Inst::IBinI(IOp::Add, it, t, a, kk) if (a == p || a == x) && add.is_none() && it.bits == 64 && ndef[t.0 as usize] == 1 && nuse[t.0 as usize] == 1 && t != x => {
+                        add = Some((k, t, kk));
+                        continue;
+                    }
+                    Inst::Mov(d, s2) if d == x && add.is_some_and(|a| a.1 == s2) => {
+                        back = Some(k);
+                        break;
+                    }
+                    _ => {}
+                }
+                if hit {
+                    break;
+                }
+            }
+            if let (Some((i1, t, k)), Some(i2)) = (add, back) {
+                cands.push((bi, i0, i1, i2, p, x, t, k));
+            }
+        }
+    }
+    if cands.is_empty() {
+        return false;
+    }
+    let idom = idoms(f);
+    let dominates = |a: usize, b: usize| -> bool {
+        let mut y = b as u32;
+        for _ in 0..100000 {
+            if y as usize == a {
+                return true;
+            }
+            let q = idom[y as usize];
+            if q == u32::MAX || q == y {
+                return false;
+            }
+            y = q;
+        }
+        false
+    };
+    let mut dead: Vec<(usize, usize)> = Vec::new();
+    for (m, i0, i1, i2, p, x, _t, k) in cands {
+        // p's uses: (block, inst, case-2 = after the step)
+        let mut uses: Vec<(usize, usize, bool)> = Vec::new();
+        let mut ok = true;
+        'scan: for (bi, b) in f.blocks.iter().enumerate() {
+            term_uses(&b.term, &mut tu);
+            if tu.contains(&p) {
+                ok = false;
+                break;
+            }
+            for (ii, i) in b.insts.iter().enumerate() {
+                let mut reads = false;
+                for_uses(i, |u| reads |= u == p);
+                if !reads {
+                    continue;
+                }
+                if bi == m && ii == i1 {
+                    continue;
+                }
+                let base_only = match *i {
+                    Inst::Load(_, _, base, _) | Inst::VLoad(_, base, _) => base == p,
+                    Inst::Store(_, base, _, v) | Inst::VStore(base, _, v) => base == p && v != p,
+                    _ => false,
+                };
+                if !base_only {
+                    ok = false;
+                    break 'scan;
+                }
+                let after = if bi == m {
+                    if ii <= i0 {
+                        ok = false;
+                        break 'scan;
+                    }
+                    ii > i2
+                } else {
+                    if !dominates(m, bi) {
+                        ok = false;
+                        break 'scan;
+                    }
+                    true
+                };
+                if after {
+                    let off = match *i {
+                        Inst::Load(_, _, _, o) | Inst::VLoad(_, _, o) | Inst::Store(_, _, o, _) | Inst::VStore(_, o, _) => o as i64,
+                        _ => unreachable!(),
+                    };
+                    if i32::try_from(off - k).is_err() {
+                        ok = false;
+                        break 'scan;
+                    }
+                }
+                uses.push((bi, ii, after));
+            }
+        }
+        if !ok || uses.is_empty() {
+            continue;
+        }
+        // x written elsewhere: that value must not reach a use after the step
+        let mut ev: Vec<(u32, u32, u8)> = Vec::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            for (ii, i) in b.insts.iter().enumerate() {
+                let mut w = false;
+                for_defs(i, |d| w |= d == x);
+                if w && !(bi == m && ii == i2) {
+                    ev.push((bi as u32, ii as u32, 1));
+                }
+            }
+        }
+        ev.push((m as u32, i2 as u32, 3));
+        for &(bi, ii, after) in &uses {
+            if after {
+                ev.push((bi as u32, ii as u32, 2));
+            }
+        }
+        ev.sort_unstable();
+        let scan = |bk: u32, from: u32, mut dirty: bool| -> Option<bool> {
+            let lo = ev.partition_point(|e| (e.0, e.1) < (bk, from));
+            for e in &ev[lo..] {
+                if e.0 != bk {
+                    break;
+                }
+                match e.2 {
+                    1 => dirty = true,
+                    2 if dirty => return None,
+                    3 => dirty = false,
+                    _ => {}
+                }
+            }
+            Some(dirty)
+        };
+        let mut seen = vec![false; nb];
+        let mut work: Vec<u32> = Vec::new();
+        for e in ev.iter().filter(|e| e.2 == 1) {
+            match scan(e.0, e.1 + 1, true) {
+                None => ok = false,
+                Some(true) => work.push(e.0),
+                Some(false) => {}
+            }
+        }
+        while ok {
+            let Some(bx) = work.pop() else { break };
+            for s in f.blocks[bx as usize].term.succs() {
+                if seen[s as usize] {
+                    continue;
+                }
+                seen[s as usize] = true;
+                match scan(s, 0, true) {
+                    None => ok = false,
+                    Some(true) => work.push(s),
+                    Some(false) => {}
+                }
+            }
+        }
+        if !ok {
+            continue;
+        }
+        for (bi, ii, after) in uses {
+            let d = if after { -k } else { 0 };
+            match &mut f.blocks[bi].insts[ii] {
+                Inst::Load(_, _, base, o) | Inst::VLoad(_, base, o) | Inst::Store(_, base, o, _) | Inst::VStore(base, o, _) => {
+                    *base = x;
+                    *o = (*o as i64 + d) as i32;
+                }
+                _ => unreachable!(),
+            }
+        }
+        // the step in place where x took t: x = x + K (t had no other reader); p = x and the
+        // add into t have no reader left
+        let Inst::IBinI(_, it, ..) = f.blocks[m].insts[i1] else { unreachable!() };
+        f.blocks[m].insts[i2] = Inst::IBinI(IOp::Add, it, x, x, k);
+        dead.push((m, i0));
+        dead.push((m, i1));
+    }
+    dead.sort_unstable_by(|a, b| b.cmp(a));
+    for &(m, i0) in &dead {
+        f.blocks[m].insts.remove(i0);
+        if i0 < f.blocks[m].pos.len() {
+            f.blocks[m].pos.remove(i0);
+        }
+    }
+    !dead.is_empty()
+}
+
 /// Copy forwarding between stack slots: a slot whose one write is a whole-slot `Copy` from
 /// another slot, both never escaping, reads the source slot instead when no write to the
 /// source can come between the copy and a read (moves of a big value through inlined
@@ -12265,5 +12488,59 @@ mod float_identity_tests {
             let has_op = f.blocks[0].insts.iter().any(|i| matches!(i, Inst::FBin(..)));
             assert_eq!(!has_op, folds, "{op:?} {k}");
         }
+    }
+}
+
+#[cfg(test)]
+mod post_increment_tests {
+    use super::*;
+    const U64T: IntTy = IntTy { bits: 64, signed: false };
+
+    /// `for e in es { if e.f != 0 { e.g = 1 } }` with es a pointer pair: the element pointer's
+    /// accesses move to the cursor (offset - 424 after the step) and the copy goes.
+    fn walk(extra_def: bool) -> Func {
+        let mut f = Func::new("walk".into(), 0);
+        let (start, end) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        f.params.extend([start, end]);
+        let (x, c, p, t, v, z, one) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+        for _ in 0..5 {
+            f.block();
+        }
+        f.blocks[0].insts = vec![Inst::Mov(x, start), Inst::Iconst(one, 1)];
+        f.blocks[0].term = Term::Jump(1);
+        f.blocks[1].insts = vec![Inst::ICmp(Cond::Eq, false, c, x, end)];
+        f.blocks[1].term = Term::Branch(c, 4, 2);
+        f.blocks[2].insts = vec![Inst::Mov(p, x), Inst::Load(Mem::Int(8, false), v, p, 0), Inst::IBinI(IOp::Add, U64T, t, p, 424), Inst::Mov(x, t), Inst::Load(Mem::Int(1, false), z, p, 96)];
+        f.blocks[2].term = Term::Branch(z, 3, 1);
+        f.blocks[3].insts = vec![Inst::Store(Mem::Int(8, false), p, 8, one)];
+        if extra_def {
+            f.blocks[3].insts.push(Inst::Mov(x, start));
+            f.blocks[3].insts.push(Inst::Store(Mem::Int(8, false), p, 16, one));
+        }
+        f.blocks[3].term = Term::Jump(1);
+        f.blocks[4].term = Term::Ret(vec![]);
+        for b in &mut f.blocks {
+            b.pos = vec![0; b.insts.len()];
+        }
+        f
+    }
+
+    #[test]
+    fn element_pointer_reads_the_cursor() {
+        let mut f = walk(false);
+        assert!(fold_post_increments(&mut f));
+        f.verify().unwrap();
+        let x = f.blocks[0].insts.iter().find_map(|i| if let Inst::Mov(d, _) = i { Some(*d) } else { None }).unwrap();
+        // the element pointer's copy and the temporary went; the cursor steps in place
+        assert!(matches!(f.blocks[2].insts[0], Inst::Load(_, _, b, 0) if b == x));
+        assert!(matches!(f.blocks[2].insts[1], Inst::IBinI(IOp::Add, _, d, a, 424) if a == x && d == x));
+        assert!(matches!(f.blocks[2].insts[2], Inst::Load(_, _, b, -328) if b == x));
+        assert!(matches!(f.blocks[3].insts[0], Inst::Store(_, b, -416, _) if b == x));
+    }
+
+    #[test]
+    fn cursor_rewritten_before_a_use_keeps_the_pointer() {
+        let mut f = walk(true);
+        assert!(!fold_post_increments(&mut f));
     }
 }
