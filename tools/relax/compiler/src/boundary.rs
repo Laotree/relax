@@ -355,6 +355,20 @@ pub fn run(up: *mut Unit) -> String {
     for e in &entry_bad {
         let _ = writeln!(out, "{}", e);
     }
+    // ops no body of this program reaches (a mark the app could do without)
+    let mut unreached: Vec<String> = Vec::new();
+    for (_, pc) in u.provided.iter() {
+        for (k, sh) in pc.shims.iter() {
+            if !sh.sig.is_empty() && !a.bindings.get(k.as_str()).is_some_and(|(b, _)| *b) {
+                unreached.push(format!("entry-unreached\t{}\t{}", pc.name, k));
+            }
+        }
+    }
+    unreached.sort();
+    let _ = writeln!(out, "# relax_api ops no body reaches: {}", unreached.len());
+    for e in &unreached {
+        let _ = writeln!(out, "{}", e);
+    }
     let bound = a.bindings.values().filter(|(b, _)| *b).count();
     let _ = writeln!(out, "# bindings: {} rustc, {} from source, {} total distinct called functions", bound, a.bindings.len() - bound, a.bindings.len());
     for (key, (bound, reason)) in &a.bindings {
