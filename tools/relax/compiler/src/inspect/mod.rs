@@ -15,6 +15,8 @@ pub mod events;
 mod hang;
 pub mod heap;
 pub mod instrument;
+pub mod patches;
+pub mod probes;
 pub mod mem;
 mod prof;
 pub mod timeline;
@@ -302,6 +304,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("count", "<fn> [time=1]", "exact call counts (and inclusive time) of every slot of a fn: its code is rebuilt with probes and installed as a probe group G<n>"),
     ("break", "<fn>|<file>:<line>", "breakpoint: a hit parks the thread at the call (stack intact) and raises a `break` event K<n>"),
     ("restartable", "<fn>", "a panic through the fn can be resumed with `restart` (the fn runs again from its entry with its original arguments) or `return <value>` (the call returns the value; integer-class returns)"),
+    ("probe", "add <fn|file:line> <probe.rs|code> [mutate=1] | list | read P<n> | rm <P<n>|all>", "injected Rust probes: your `fn probe(<the hooked fn's params>)` runs at the hook; std::relax::probe::{emit, count, hist, sample, pause} record for it"),
     ("probes", "", "installed probes with hits and time, parked breakpoints, pause state"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
@@ -344,6 +347,7 @@ fn dispatch(req: &Req, out: &mut Out) {
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
+        "probe" => probes::cmd(req, out),
         "watch" => events::cmd_watch(req, out),
         "events" => events::cmd_events(req, out),
         "panics" => events::cmd_panics(out),

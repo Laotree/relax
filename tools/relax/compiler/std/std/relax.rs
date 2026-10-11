@@ -618,3 +618,47 @@ impl Module {
         unsafe { __relax_module_unload(self.0) }
     }
 }
+
+/// Relax-only: the API of relax inspect's injected probes (a probe is a fn an agent loads into the
+/// running program at a hook point: `relax inspect <app> probe add <fn|file:line> <probe.rs>`).
+/// Everything is recorded for the probe that runs on this thread now; outside a probe the calls
+/// do nothing.
+pub mod probe {
+    use crate::fmt::Debug;
+
+    extern "C" {
+        fn __relax_probe_emit(text: *const u8, len: usize);
+        fn __relax_probe_count(key: *const u8, klen: usize);
+        fn __relax_probe_hist(key: *const u8, klen: usize, x: f64);
+        fn __relax_probe_sample(key: *const u8, klen: usize, text: *const u8, len: usize, keep: usize);
+        fn __relax_probe_pause();
+    }
+
+    /// Sends `v` (its Debug form) to the agent as one `probe` event (rate-limited).
+    pub fn emit<T: Debug>(v: T) {
+        let s = crate::format!("{:?}", v);
+        unsafe { __relax_probe_emit(s.as_ptr(), s.len()) }
+    }
+
+    /// Counts one hit under `key`.
+    pub fn count(key: &str) {
+        unsafe { __relax_probe_count(key.as_ptr(), key.len()) }
+    }
+
+    /// Adds `x` to the histogram `key` (count, min, max, mean, log2 buckets).
+    pub fn hist(key: &str, x: f64) {
+        unsafe { __relax_probe_hist(key.as_ptr(), key.len(), x) }
+    }
+
+    /// Keeps a uniform sample of at most `keep` values (Debug forms) under `key`.
+    pub fn sample<T: Debug>(key: &str, v: T, keep: usize) {
+        let s = crate::format!("{:?}", v);
+        unsafe { __relax_probe_sample(key.as_ptr(), key.len(), s.as_ptr(), s.len(), keep) }
+    }
+
+    /// Parks this thread here as a breakpoint (an agent continues it): a conditional breakpoint
+    /// is `if cond { probe::pause() }`.
+    pub fn pause() {
+        unsafe { __relax_probe_pause() }
+    }
+}

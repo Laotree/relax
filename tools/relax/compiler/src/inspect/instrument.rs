@@ -46,14 +46,11 @@ struct Site {
 static SITES: Mutex<Vec<std::sync::Arc<Site>>> = Mutex::new(Vec::new());
 /// (group id, patch generation, slots, description)
 static GROUPS: Mutex<Vec<(u32, u32, Vec<u32>, String)>> = Mutex::new(Vec::new());
-/// slots with probes installed (checked by the O3 / O2 installs: few entries)
-static ACTIVE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 
 /// Is slot `id` instrumented now? (jit.rs: O3 / O2 installs keep its probes)
 pub fn active(id: u32) -> bool {
-    let a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-    !a.is_empty() && a.contains(&id)
+    super::patches::active(id)
 }
 
 fn site(i: u64) -> Option<std::sync::Arc<Site>> {
@@ -227,6 +224,14 @@ fn rt_inspect_break(i: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) {
         return;
     }
     s.hits.fetch_add(1, Relaxed);
+    let args = s.args.get().map(|plan| args_json(plan, &[a0, a1, a2, a3, a4])).unwrap_or_default();
+    park_here(i, &format!("B{}", i), &s.label, &args);
+}
+}
+
+/// Parks the calling thread as a breakpoint hit (site index `i`, u64::MAX for none) and raises
+/// the `break` event; returns once an agent continues it (or after 10 minutes).
+pub fn park_here(i: u64, site_tag: &str, label: &str, extra: &str) {
     let id = PARK_IDS.fetch_add(1, SeqCst) + 1;
     let p = std::sync::Arc::new(Parked { id, site: i, os_id: super::threads::self_os_id(), go: AtomicBool::new(false) });
     let me = crate::os::thread::current();
@@ -237,25 +242,23 @@ fn rt_inspect_break(i: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) {
         "break",
         &format!("K{}", id),
         &format!(
-            "\"id\":\"K{}\",\"site\":\"B{}\",\"at\":{},\"thread\":{},\"tid\":\"T{}\"{}{},\"more\":[\"stacks thread=T{}\",\"continue K{}\"]",
+            "\"id\":\"K{}\",\"site\":\"{}\",\"at\":{},\"thread\":{},\"tid\":\"T{}\"{}{},\"more\":[\"stacks thread=T{}\",\"continue K{}\"]",
             id,
-            i,
-            json_str(&s.label),
+            site_tag,
+            json_str(label),
             json_str(&thread),
             p.os_id,
-            s.args.get().map(|plan| args_json(plan, &[a0, a1, a2, a3, a4])).unwrap_or_default(),
+            extra,
             super::script_stack_field("script_stack", me),
             p.os_id,
             id
         ),
     );
-    // parked until `continue` (or 10 minutes)
     let t0 = std::time::Instant::now();
     while !p.go.load(SeqCst) && t0.elapsed().as_secs() < 600 {
         list = GO.wait_timeout(list, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
-}
 }
 
 // ------------------------------------------------------------------ finding slots
@@ -263,7 +266,7 @@ fn rt_inspect_break(i: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) {
 /// Slots matching a fn query (exact display name, else a suffix of it, else a substring) that
 /// have code, at most `max`; or the slots of `file:line` whose RIR has an instruction on that
 /// line. Run on the owner.
-fn find(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, Option<u32>, String)> {
+pub(super) fn find(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, Option<u32>, String)> {
     if let Some((file, line)) = query.rsplit_once(':').and_then(|(f, l)| l.parse::<u32>().ok().map(|l| (f, l))) {
         let files: Vec<u32> = u.prog.file_paths.iter().enumerate().filter(|(_, p)| p.ends_with(file)).map(|(i, _)| i as u32).collect();
         let mut out = Vec::new();
@@ -309,7 +312,7 @@ fn find(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, Option<u32>,
 }
 
 /// The line of a RIR position ((file << 32) | byte offset).
-fn pos_line(u: &crate::jit::Unit, p: u64) -> Option<u32> {
+pub(super) fn pos_line(u: &crate::jit::Unit, p: u64) -> Option<u32> {
     if p == 0 {
         return None;
     }
@@ -611,6 +614,32 @@ fn edit_restart(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64) -> Op
     }
 }
 
+/// `count`'s edit: entry (and with `time`, exit) calls.
+pub(super) fn edit_count(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64, time: bool) -> bool {
+    let mut hit = false;
+    edit(f, u, site, ("inspect_enter", rt_inspect_enter as *const () as u64), time.then_some(rt_inspect_exit as *const () as u64), None, false, &mut hit);
+    hit
+}
+
+/// `break`'s edit: the parking call with the fn's argument words at the entry or a line.
+pub(super) fn edit_break(f: &mut crate::rir::Func, u: &crate::jit::Unit, slot: u32, site: u64, line: Option<u32>) -> bool {
+    if let Some(s) = self::site(site) {
+        let _ = s.args.set(arg_plan(u, slot, f));
+    }
+    let mut hit = false;
+    edit(f, u, site, ("inspect_break", rt_inspect_break as *const () as u64), None, line, true, &mut hit);
+    hit
+}
+
+/// `restartable`'s edit.
+pub(super) fn edit_restart_site(f: &mut crate::rir::Func, u: &crate::jit::Unit, site: u64) -> bool {
+    let n = edit_restart(f, u, site);
+    if let Some(s) = self::site(site) {
+        let _ = s.returns.set(n);
+    }
+    true
+}
+
 /// Installs probes of `kind` for `query` (on the owner, within `ms`): (group, sites).
 fn add(kind: Kind, query: &str, time: bool) -> Result<(u32, Vec<(u64, String, u32)>), String> {
     add_to(kind, Target::Query(query.to_string()), time)
@@ -640,7 +669,6 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
         if found.is_empty() {
             return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch)", query));
         }
-        let gen = u.begin_patch();
         let mut out = Vec::new();
         for (id, line, name) in found {
             let si = {
@@ -648,41 +676,18 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
                 sites.push(std::sync::Arc::new(Site { kind, slot: id, label: match line { Some(l) => format!("{} (line {})", name, l), None => name.clone() }, args: std::sync::OnceLock::new(), returns: std::sync::OnceLock::new(), group, hits: AtomicU64::new(0), ns: AtomicU64::new(0), on: AtomicBool::new(true) }));
                 sites.len() as u64 - 1
             };
-            let (enter, exit) = match kind {
-                Kind::Count => (("inspect_enter", rt_inspect_enter as *const () as u64), time.then_some(rt_inspect_exit as *const () as u64)),
-                Kind::Break => (("inspect_break", rt_inspect_break as *const () as u64), None),
-                Kind::Restart => (("inspect_unwind_decide", rt_inspect_unwind_decide as *const () as u64), None),
+            let e = match kind {
+                Kind::Count => super::patches::Edit::Count { site: si, time },
+                Kind::Break => super::patches::Edit::Break { site: si, line },
+                Kind::Restart => super::patches::Edit::Restart { site: si },
             };
-            let mut hit = false;
-            let with_args = kind == Kind::Break;
-            let site_ref = site(si);
-            let r = unsafe {
-                crate::jit::install_instrumented(up, id, gen, &mut |f, u| {
-                    if with_args {
-                        if let Some(s) = &site_ref {
-                            let _ = s.args.set(arg_plan(u, id, f));
-                        }
-                    }
-                    if kind == Kind::Restart {
-                        let n = edit_restart(f, u, si);
-                        if let Some(s) = &site_ref {
-                            let _ = s.returns.set(n);
-                        }
-                        hit = true;
-                        return;
-                    }
-                    edit(f, u, si, enter, exit, line, with_args, &mut hit)
-                })
-            };
-            match r {
-                Ok(_) if hit => {
-                    ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).push(id);
-                    out.push((si, name, id));
-                }
-                Ok(_) => out.push((si, format!("{} (line not found in its code)", name), id)),
+            match unsafe { super::patches::add(up, id, super::patches::Owner::Group(group), e) } {
+                Ok(true) => out.push((si, name, id)),
+                Ok(false) => out.push((si, format!("{} (line not found in its code)", name), id)),
                 Err(e) => out.push((si, format!("{}: not instrumented: {}", name, e), id)),
             }
         }
+        let gen = 0;
         GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push((group, gen, out.iter().map(|x| x.2).collect(), query.clone()));
         Ok((group, out))
     });
@@ -718,18 +723,12 @@ fn remove(group: Option<u32>) -> Result<usize, String> {
         GO.notify_all();
     }
     let n = groups.len();
-    let gens: Vec<u32> = groups.iter().map(|g| g.1).collect();
-    let slots: Vec<u32> = groups.iter().flat_map(|g| g.2.iter().copied()).collect();
+    let ids: Vec<u32> = groups.iter().map(|g| g.0).collect();
     let r = crate::owner::call_within(crate::owner::Class::App, 10_000, move || {
-        let u = unsafe { &mut *up };
-        for g in gens {
-            u.rollback_gen(g);
+        for g in ids {
+            unsafe { super::patches::remove_owner(up, super::patches::Owner::Group(g)) };
         }
     });
-    {
-        let mut a = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
-        a.retain(|x| !slots.contains(x));
-    }
     r.map(|_| n).ok_or_else(|| format!("the owner did not take the request in 10 s ({}); the probes are off but still in the code", crate::owner::serving_note()))
 }
 

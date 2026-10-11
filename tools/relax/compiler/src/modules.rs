@@ -337,6 +337,12 @@ unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: 
     Ok((krate, root_file, defs))
 }
 
+/// relax inspect's probes: loads the module at `path` as a trusted crate depending on `deps`
+/// (owner thread): (crate, root file, its definitions).
+pub(crate) unsafe fn load_trusted(up: *mut Unit, name: &str, path: &str, deps: &[String]) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
+    load(up, name, path, deps, false)
+}
+
 /// How an export's parameter or result crosses into the sandbox (wrapper generation).
 enum Pass {
     /// a scalar, as is

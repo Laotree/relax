@@ -202,6 +202,60 @@ fn detail(b: u64) -> &'static str {
     unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p as *const u8, n)) }
 }
 
+// ---- the GPU lane: spans the platform reports when its command buffers complete (Metal:
+// GPUStartTime / GPUEndTime; Vulkan: timestamp queries calibrated to the CPU clock), in the
+// host's raw monotonic clock (Linux CLOCK_MONOTONIC, macOS CLOCK_UPTIME_RAW = mach_absolute_time)
+
+static GPU: Mutex<Vec<(u64, u64, &'static str)>> = Mutex::new(Vec::new());
+const GPU_MAX: usize = 1 << 16;
+
+/// The raw monotonic clock in ns (the domain of the platform's GPU span times).
+fn raw_now_ns() -> u64 {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct Ts {
+            s: i64,
+            ns: i64,
+        }
+        extern "C" {
+            fn clock_gettime(id: i32, ts: *mut Ts) -> i32;
+        }
+        #[cfg(target_os = "macos")]
+        let id = 8; // CLOCK_UPTIME_RAW
+        #[cfg(not(target_os = "macos"))]
+        let id = 1; // CLOCK_MONOTONIC
+        let mut ts = Ts { s: 0, ns: 0 };
+        unsafe { clock_gettime(id, &mut ts) };
+        ts.s as u64 * 1_000_000_000 + ts.ns as u64
+    }
+    #[cfg(not(unix))]
+    {
+        crate::clock::wall_ns()
+    }
+}
+
+/// makepad's GPU backends: a pass (`name`, static) ran on the GPU from `begin` to `end` (raw
+/// monotonic ns). Recorded only while the timeline records.
+pub extern "C" fn relax_gpu_span(name: *const u8, len: usize, begin: u64, end: u64) {
+    if !recording() || end < begin {
+        return;
+    }
+    let name = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(name, len)) };
+    // raw -> the timeline's clock (wall_ns): the offset between the two read now
+    let off = raw_now_ns() as i128 - crate::clock::wall_ns() as i128;
+    let map = |t: u64| (t as i128 - off).max(0) as u64;
+    let mut g = GPU.lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() < GPU_MAX {
+        g.push((map(begin), map(end), name));
+    }
+}
+
+/// GPU spans of the capture overlapping [t0, t1): (begin, end, name).
+fn gpu_spans(t0: u64, t1: u64) -> Vec<(u64, u64, &'static str)> {
+    GPU.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|g| g.1 > t0 && g.0 < t1).copied().collect()
+}
+
 /// Relax std's futex wakes (sync/raw.rs: a contended unlock, a notify, an unpark).
 pub extern "C" fn relax_wake(addr: usize) {
     if recording() {
@@ -311,6 +365,7 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
             EPOCH.fetch_add(1, AcqRel);
             STARTED_NS.store(crate::clock::wall_ns(), Relaxed);
             STOPPED_NS.store(0, Relaxed);
+            GPU.lock().unwrap_or_else(|e| e.into_inner()).clear();
             let f: fn(bool, &'static str, &'static str, u64) = wait_trace;
             crate::waits::TRACE.store(f as usize, Release);
             RINGS_ON.store(true, Release);
@@ -464,7 +519,7 @@ fn frames_cmd(req: &Req, out: &mut Out) {
         let work: u64 = ths.iter().map(|t| busy_in(t, t0, t1).0).sum();
         let cp: u64 = critical(&ths, ui, t0, t1).iter().filter(|p| p.3 == "run").map(|p| p.2 - p.1).sum();
         out.line(&format!(
-            "{{\"frame\":\"F{}\",\"ms\":{:.2},\"ui_busy_ms\":{:.2},\"ui_wait_ms\":{:.2},\"work_ms\":{:.2},\"critical_path_ms\":{:.2},\"achieved_parallelism\":{:.2},\"more\":\"timeline frame {}\"}}",
+            "{{\"frame\":\"F{}\",\"ms\":{:.2},\"ui_busy_ms\":{:.2},\"ui_wait_ms\":{:.2},\"work_ms\":{:.2},\"critical_path_ms\":{:.2},\"achieved_parallelism\":{:.2},\"gpu_ms\":{:.2},\"more\":\"timeline frame {}\"}}",
             i,
             durs[i],
             busy as f64 / 1e6,
@@ -472,6 +527,7 @@ fn frames_cmd(req: &Req, out: &mut Out) {
             work as f64 / 1e6,
             cp as f64 / 1e6,
             work as f64 / (t1 - t0).max(1) as f64,
+            gpu_spans(t0, t1).iter().map(|g| g.1.min(t1) - g.0.max(t0)).sum::<u64>() as f64 / 1e6,
             i
         ));
     }
@@ -544,6 +600,22 @@ fn frame_cmd(req: &Req, out: &mut Out) {
         .map(|(d, what, by)| format!("{{\"ms\":{:.2},\"what\":{}{}}}", *d as f64 / 1e6, json_str(&short(what, 100)), by.map(|b| format!(",\"ended_by\":\"T{}\"", b)).unwrap_or_default()))
         .collect();
     out.line(&format!("{{\"ui_waits\":[{}]}}", w.join(",")));
+    // the GPU lane: passes overlapping the frame
+    let g = gpu_spans(t0, t1);
+    if !g.is_empty() {
+        let busy: u64 = g.iter().map(|x| x.1.min(t1) - x.0.max(t0)).sum();
+        let mut per: Vec<(&str, u64)> = Vec::new();
+        for x in &g {
+            let d = x.1.min(t1) - x.0.max(t0);
+            match per.iter_mut().find(|p| p.0 == x.2) {
+                Some(p) => p.1 += d,
+                None => per.push((x.2, d)),
+            }
+        }
+        per.sort_by(|a, b| b.1.cmp(&a.1));
+        let ps: Vec<String> = per.iter().take(8).map(|(n, d)| format!("[{},{:.2}]", json_str(n), *d as f64 / 1e6)).collect();
+        out.line(&format!("{{\"gpu\":{{\"busy_ms\":{:.2},\"passes_ms\":[{}]}}}}", busy as f64 / 1e6, ps.join(",")));
+    }
     // per thread busy / wait in the frame
     let mut per: Vec<String> = Vec::new();
     for th in &ths {
@@ -580,6 +652,14 @@ fn save_cmd(out: &mut Out) {
                     ev.push(format!("{{\"ph\":\"f\",\"bp\":\"e\",\"pid\":{},\"tid\":{},\"ts\":{:.3},\"id\":{},\"name\":\"wake\",\"cat\":\"edge\"}}", pid, th.os_id, s.t1.saturating_sub(t0) as f64 / 1000.0, flow));
                 }
             }
+        }
+    }
+    // the GPU lane as its own track
+    let gpu = gpu_spans(0, u64::MAX);
+    if !gpu.is_empty() {
+        ev.push(format!("{{\"ph\":\"M\",\"pid\":{},\"tid\":1,\"name\":\"thread_name\",\"args\":{{\"name\":\"GPU\"}}}}", pid));
+        for (b, e, n) in gpu {
+            ev.push(format!("{{\"ph\":\"X\",\"pid\":{},\"tid\":1,\"ts\":{:.3},\"dur\":{:.3},\"name\":{},\"cat\":\"gpu\"}}", pid, b.saturating_sub(t0) as f64 / 1000.0, (e - b) as f64 / 1000.0, json_str(n)));
         }
     }
     let path = std::env::temp_dir().join(format!("relax-inspect-{}-timeline-{}.json", pid, now_ms()));

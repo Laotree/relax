@@ -217,7 +217,7 @@ pub fn panic_parked(os_id: u64) -> bool {
 }
 
 pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
-    if !super::STARTED.load(Relaxed) || crate::owner::is_owner() {
+    if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() {
         return;
     }
     let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed);

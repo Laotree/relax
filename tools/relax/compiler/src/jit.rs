@@ -1499,6 +1499,11 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
 
 /// relax inspect's restart / return: a frame's unwind landing ended the panic -- this thread
 /// is no longer unwinding and its panic is dropped.
+/// The message of the panic unwinding on this thread now (relax inspect: a probe's panic).
+pub(crate) fn take_panic_message() -> Option<String> {
+    PANIC.with(|p| p.borrow().as_ref().map(|i| i.message.clone()))
+}
+
 pub(crate) fn abandon_unwind() {
     CLEANING.with(|c| c.set(0));
     UNWINDING.with(|c| c.set(false));
@@ -3947,6 +3952,36 @@ impl Unit {
         self.exec_note(id, crate::exec_profile::AHEAD);
     }
 
+
+    /// relax inspect: slot `id` gets back the code it ran before its install of generation
+    /// `first` (the installs since then are popped off its saved versions).
+    pub fn restore_before(&mut self, id: u32, first: u32) {
+        let mut changed = false;
+        loop {
+            let f = &mut self.fns[id as usize];
+            if f.patch_gen < first || f.patch_gen == 0 {
+                break;
+            }
+            let Some(prev) = f.prev.pop() else { break };
+            f.code = prev.0;
+            f.code_len = prev.1;
+            f.pc_map = prev.2;
+            f.patch_gen = prev.3;
+            if prev.1 == 0 {
+                f.compiled = false;
+            }
+            changed = true;
+        }
+        if changed {
+            let f = &mut self.fns[id as usize];
+            f.version += 1;
+            let at = f.code;
+            unsafe {
+                let slot = (self.table_base + id as u64 * 8) as *const AtomicU64;
+                (*slot).store(at, Ordering::SeqCst);
+            }
+        }
+    }
 
     /// Rolls back every slot installed by patch group `gen`. Their cached RIR is dropped,
     /// so later inlining recompiles them from source (the agent's next edit).
@@ -11074,6 +11109,13 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         b"relax_retry_enter" => Some(crate::inspect::events::relax_retry_enter as *const () as usize),
         b"relax_retry_leave" => Some(crate::inspect::events::relax_retry_leave as *const () as usize),
         b"relax_retry_take" => Some(crate::inspect::events::relax_retry_take as *const () as usize),
+        // relax inspect's probes: std::relax::probe (Relax std relax.rs)
+        b"__relax_probe_emit" => Some(crate::inspect::probes::relax_probe_emit as *const () as usize),
+        b"__relax_probe_count" => Some(crate::inspect::probes::relax_probe_count as *const () as usize),
+        b"__relax_probe_hist" => Some(crate::inspect::probes::relax_probe_hist as *const () as usize),
+        b"__relax_probe_sample" => Some(crate::inspect::probes::relax_probe_sample as *const () as usize),
+        b"__relax_probe_pause" => Some(crate::inspect::probes::relax_probe_pause as *const () as usize),
+        b"relax_gpu_span" => Some(crate::inspect::timeline::relax_gpu_span as *const () as usize),
         b"relax_span_begin" => Some(crate::inspect::timeline::relax_span_begin as *const () as usize),
         b"relax_span_end" => Some(crate::inspect::timeline::relax_span_end as *const () as usize),
         b"__relax_wake" => Some(crate::inspect::timeline::relax_wake as *const () as usize),
