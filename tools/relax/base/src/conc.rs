@@ -319,6 +319,15 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         self.reclaim();
     }
 
+    /// `clear`, and the retired tables with it, handed back instead of freed: the entries are
+    /// freed when the returned value drops (outside the caller's locks). Same safety as `reclaim`.
+    pub unsafe fn detach(&self) -> Detached<K, V> {
+        let fresh = MemoTable::new(self.bits);
+        let mut all = vec![self.table.swap(fresh, std::sync::atomic::Ordering::AcqRel)];
+        all.extend(self.graveyard.lock().unwrap_or_else(|e| e.into_inner()).drain(..));
+        Detached(all)
+    }
+
     /// Frees the tables earlier clears retired. Safety: no reader may still be inside one of
     /// them (the caller excludes readers, e.g. holds the front-end write lock for a table only
     /// front-end code reads).
@@ -326,6 +335,15 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         for t in self.graveyard.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             MemoTable::free(t);
         }
+    }
+}
+
+/// Tables a `MemoMap` gave up (`detach`): their entries are freed when this drops.
+pub struct Detached<K, V>(Vec<*mut MemoTable<K, V>>);
+unsafe impl<K: Send, V: Send> Send for Detached<K, V> {}
+impl<K, V> Drop for Detached<K, V> {
+    fn drop(&mut self) {
+        for t in self.0.drain(..) { unsafe { MemoTable::free(t) } }
     }
 }
 
@@ -465,5 +483,22 @@ mod settle_tests {
         map.insert(41, values[1].clone());
         unsafe { map.retain_exclusive(|_, _| false); }
         assert!(values.iter().all(|v| Arc::strong_count(v) == 1));
+    }
+
+    #[test]
+    fn detach_empties_the_map_and_frees_the_entries_when_dropped() {
+        let map = MemoMap::with_bits(2);
+        let values: Vec<_> = (0..30).map(|_| Arc::new(vec![0u8; 100])).collect();
+        for (i, v) in values.iter().enumerate() { map.insert(i, v.clone()); }
+        map.clear(); // a retired table too
+        map.insert(99, values[0].clone());
+        let gone = unsafe { map.detach() };
+        assert!((0..30).all(|i| !map.contains(&i)) && !map.contains(&99));
+        assert_eq!(Arc::strong_count(&values[0]), 3, "detached, not freed");
+        map.insert(5, values[5].clone()); // the map works on
+        assert!(map.contains(&5));
+        drop(gone);
+        assert_eq!(Arc::strong_count(&values[0]), 1);
+        assert_eq!(Arc::strong_count(&values[5]), 2);
     }
 }

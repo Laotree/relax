@@ -1801,6 +1801,18 @@ impl Program {
         out
     }
 
+    /// The name-resolution memo tables (what resolving a path or a glob found, and the trait
+    /// scopes) are dropped: derived from the collected tables, they refill on use, as after a
+    /// restore. The entries go to `retired` (the caller frees them outside its locks). Safety
+    /// as for `reclaim_caches`.
+    pub unsafe fn detach_caches(&self, retired: &mut Vec<Box<dyn Send>>) {
+        retired.push(Box::new(self.glob_cache.detach()));
+        retired.push(Box::new(self.scope_cache.detach()));
+        retired.push(Box::new(self.path_seg_cache.detach()));
+        retired.push(Box::new(self.trait_bind_cache.detach()));
+        retired.push(Box::new(self.trait_scope.detach()));
+    }
+
     /// Frees the name-resolution cache tables earlier clears retired (hot reload and run-time
     /// loads clear them on every edit or load; each retired table is ~0.5 MB). Safety: no
     /// front-end reader may run (the caller holds the front-end write lock and the unit lock).

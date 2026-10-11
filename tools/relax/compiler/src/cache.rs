@@ -1589,6 +1589,40 @@ impl Cache {
         self.dir.join(format!("rt-{}.keys", name))
     }
 
+    /// memory report (RELAX_MEM_REPORT): the recorder's and linker's tables (capacity based)
+    pub(crate) fn mem_lines(&self) -> Vec<(String, u64)> {
+        fn map<K, V, S>(name: &str, m: &HashMap<K, V, S>, deep: impl Fn(&V) -> usize) -> (String, u64) {
+            let slot = std::mem::size_of::<(K, V)>() + 1;
+            (format!("cache {} ({})", name, m.len()), (m.capacity() * slot + m.values().map(deep).sum::<usize>()) as u64)
+        }
+        fn set<K, S>(name: &str, m: &HashSet<K, S>) -> (String, u64) {
+            (format!("cache {} ({})", name, m.len()), (m.capacity() * (std::mem::size_of::<K>() + 1)) as u64)
+        }
+        vec![
+            (format!("cache pending entries ({}; payload bytes)", self.pending.len()), self.pending_bytes as u64),
+            map("key_crate", &self.key_crate, |_| 0),
+            (format!("cache index ({})", self.index.len()), (self.index.capacity() * 41) as u64),
+            map("slot_crates", &self.slot_crates, |v| v.capacity() * 4),
+            map("def_bodies", &self.def_bodies, |_| 0),
+            map("def_maps", &self.def_maps, |m| m.capacity() * 21),
+            (format!("cache crate_defs ({})", self.crate_defs_n), self.crate_defs.iter().map(|v| v.capacity() * 4).sum::<usize>() as u64),
+            map("def_keys", &self.def_keys, |_| 0),
+            map("file_ids", &self.file_ids, |_| 0),
+            map("file_hash", &self.file_hash, |_| 0),
+            map("data_addr", &self.data_addr, |_| 0),
+            map("data_key", &self.data_key, |_| 0),
+            set("linked", &self.linked), set("missed", &self.missed),
+            map("linked_key", &self.linked_key, |_| 0),
+            map("slot_keys", &self.slot_keys, |_| 0),
+            map("fnkey_bytes", &self.fnkey_bytes, |v| v.as_ref().map_or(0, |b| b.capacity())),
+            map("slot_by_bytes", &self.slot_by_bytes, |_| 0),
+            (format!("cache slot_by_bytes key bytes"), self.slot_by_bytes.keys().map(|k| k.len()).sum::<usize>() as u64),
+            map("pending_verdicts", &self.pending_verdicts, |_| 0),
+            map("closure_fps", &self.closure_fps, |_| 0),
+            (format!("cache manifest ({})", self.manifest.len()), self.manifest.iter().map(|m| m.capacity() + 24).sum::<usize>() as u64),
+        ]
+    }
+
     /// Slot `id`'s key encoding (memo).
     fn slot_bytes(&mut self, u: &Unit, id: u32) -> Option<Vec<u8>> {
         if let Some(b) = self.fnkey_bytes.get(&id) {

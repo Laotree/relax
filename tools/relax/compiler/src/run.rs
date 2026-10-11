@@ -514,6 +514,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     // the whole program came from the collected store: it holds this program already
     COLLECTED_CURRENT.store(collected_restored, Ordering::Relaxed);
+    COLLECTED_RESTORED.store(collected_restored, Ordering::Relaxed);
     let collected_suffix = restored.as_ref().filter(|_| !collected_restored)
         .map(|(p, _, _)| (p.defs.len(), p.imports.len()));
     let mut cold_front = crate::cache::ColdFront::default();
@@ -1475,6 +1476,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let settle_on = runtime.settle_drop;
         // RELAX_ADOPT=0: the heap tables stay (the cold run's footprint, for comparison)
         let adopt_on = std::env::var("RELAX_ADOPT").map_or(true, |v| v != "0");
+        let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
@@ -1619,9 +1621,23 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 // once the settle ran and this run's collected image is written: the heap tables
                 // it was encoded from become views of it (what a warm run maps), then the freed
                 // pages go back
-                if settle_watch.settled.is_some() && runtime.mem_trim && adopt_on
-                    && COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() && adopt_collected_tables() {
+                let mut converged = false;
+                if settle_watch.settled.is_some() && runtime.mem_trim && adopt_on {
+                    if memos_pending {
+                        if COLLECTED_RESTORED.load(Ordering::Relaxed) { memos_pending = false; }
+                        else if drop_program_memos() { memos_pending = false; converged = true; }
+                    }
+                    if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() && adopt_collected_tables() { converged = true; }
+                }
+                if converged {
                     crate::memstat::trim();
+                    // RELAX_MEM_AT_TRIM=1 (with RELAX_MEM_REPORT): the report after the adoption's trim
+                    let up = unsafe { RUN_UNIT };
+                    if runtime.mem_at_trim && crate::memstat::enabled() && !up.is_null() {
+                        crate::owner::call(crate::owner::Class::App, || {
+                            crate::memstat::print("after the settle and the adoption", &crate::memreport::unit_sizes(unsafe { &*up }));
+                        });
+                    }
                 }
             }
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
@@ -1810,6 +1826,8 @@ fn exit_report() {
 /// 0.3-0.6 s of every exit (Calculator, Files) and rewrote the store whenever the run's type
 /// interner had grown.
 static COLLECTED_CURRENT: AtomicBool = AtomicBool::new(false);
+/// This run's program came from a collected image (a warm start): nothing converges.
+static COLLECTED_RESTORED: AtomicBool = AtomicBool::new(false);
 
 /// Run-time crates must not become part of the next boot's collected image. The caller
 /// holds the front-end write lock on the owner thread, before appending the first such crate. Publication
@@ -1857,6 +1875,27 @@ fn adopt_collected_tables() -> bool {
             if done.is_none() { " (image not the one written: unchanged)" } else { "" });
         if crate::memstat::enabled() { for (name, how) in &notes { verbose!("relax-mem:   adopt {} {:?}", name, how); } }
     }
+    true
+}
+
+/// The settle drops the program's name-resolution memo tables (Program::detach_caches): what
+/// resolving a path or a glob found refills on use, as in a warm run (which starts with none).
+/// Retried while the locks are busy; true: done.
+fn drop_program_memos() -> bool {
+    let up = unsafe { RUN_UNIT };
+    if up.is_null() { return true; }
+    let mut retired: Vec<Box<dyn Send>> = Vec::new();
+    let before = crate::memstat::live_total();
+    let t = Instant::now();
+    let Some(()) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
+        let Ok(_front) = jit::FRONT_RW.try_write() else { return None };
+        unsafe { (*up).prog.detach_caches(&mut retired) };
+        Some(())
+    }).flatten() else { return false };
+    let held = t.elapsed().as_secs_f64() * 1e3;
+    drop(retired);
+    verbose!("relax-mem: dropped the name-resolution memos at t={:.0} ms: counted heap {:.1} -> {:.1} MB; locks held {:.1} ms",
+        crate::clock::ms_since_start(), before as f64 / 1048576.0, crate::memstat::live_total() as f64 / 1048576.0, held);
     true
 }
 
