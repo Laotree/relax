@@ -3544,7 +3544,10 @@ pub struct FrontImages {
 }
 impl FrontImages {
     pub fn open(options: &crate::options::Options) -> Option<Self> {
-        if !crate::front::enabled() || mode_from_env(options).is_none() {
+        // A build script's run (its own small world: std plus the script's crates) keeps no
+        // front images: they are read only when a script runs again, which a cached build
+        // result makes rare, while they cost a second copy of the std world on disk.
+        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("RELAX_BUILD_SCRIPT").is_some() {
             return None;
         }
         let root = crate::dirs::relax_dir();
