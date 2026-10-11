@@ -166,8 +166,10 @@ pub fn verify_front_images() {
     });
 }
 const LEDGER_KEY: u128 = 0;
-// N01 types and closure arguments with baseline tiers and closure fingerprints.
-const ENTRY_VERSION: u32 = 25;
+// N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
+// symbol names which block of its entry it is (its ordinal), so two relocations to different
+// offsets of one block link to one block.
+const ENTRY_VERSION: u32 = 26;
 /// the level of a code entry's code (its tier byte)
 const TIER_O1: u8 = 0;
 const TIER_O3: u8 = 1;
@@ -1828,7 +1830,11 @@ impl Cache {
     }
 
     /// Encodes one symbol + offset as a stable reference; None when it cannot be stored.
-    fn enc_sym(&mut self, u: &Unit, s: Sym, e: &mut E) -> Option<()> {
+    /// `rw`: the writable blocks the entry named so far (their `Syms::rw_blocks` indices): a
+    /// block symbol is encoded with its position in it, so a decode that links the entry's symbols
+    /// in the same order gives every reloc to one block (a slice iterator's pointer and its end
+    /// pointer) the one block, not a fresh block per reloc.
+    fn enc_sym(&mut self, u: &Unit, s: Sym, e: &mut E, rw: &mut Vec<u32>) -> Option<()> {
         let k = u.syms.kind(s.id)?;
         match k {
             SymKind::Rt(n) => {
@@ -1891,6 +1897,11 @@ impl Cache {
                 e.u8(8);
                 e.u64(sz);
                 e.u64(al);
+                let ord = rw.iter().position(|b| *b == k).unwrap_or_else(|| {
+                    rw.push(k);
+                    rw.len() - 1
+                });
+                e.u32(ord as u32);
             }
             SymKind::Provided(n) => {
                 e.u8(9);
@@ -1949,9 +1960,10 @@ impl Cache {
             }
             e.bytes(&b);
             e.u32(ptrs.len() as u32);
+            let mut rw = Vec::new();
             for (o, t) in &ptrs {
                 e.u32(*o);
-                self.enc_sym(u, *t, &mut e)?;
+                self.enc_sym(u, *t, &mut e, &mut rw)?;
             }
             let key = {
                 let mut h = Sip128::new();
@@ -2209,12 +2221,13 @@ impl Cache {
         e.0.extend_from_slice(&cert);
         e.bytes(code);
         e.u32(relocs.len() as u32);
+        let mut rw = Vec::new();
         for rl in relocs {
             e.u32(rl.at);
             e.u8(kind_code(rl.kind));
             let r = &rl.target;
             let ok = match r {
-                Reloc::Sym(s) => self.enc_sym(u, *s, &mut e).is_some(),
+                Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
                 Reloc::Slot(x) | Reloc::Thunk(x) => {
                     e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
                     match self.slot_bytes(u, *x) {
@@ -3043,10 +3056,11 @@ impl Cache {
                 let rest = &cached[d.p..];
                 let n_cached = d.clone_u32_at_rest();
                 let mut missing = Vec::new();
+                let mut rw = Vec::new();
                 for rl in relocs {
                     let mut e = E::default();
                     let ok = match &rl.target {
-                        Reloc::Sym(s) => self.enc_sym(u, *s, &mut e).is_some(),
+                        Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
                         Reloc::Slot(x) | Reloc::Thunk(x) => self.slot_bytes(u, *x).map(|b| e.bytes(&b)).is_some(),
                         _ => false,
                     };
@@ -3073,13 +3087,14 @@ impl Cache {
         let n = d.u32().unwrap_or(0) as usize;
         let start = d.p;
         let _ = start;
+        let mut rw = Vec::new();
         for rl in relocs.iter().take(n) {
             let (o, r) = (&rl.at, &rl.target);
             let co = d.u32().unwrap_or(u32::MAX);
             let ck = d.u8().and_then(kind_of);
             let mut e = E::default();
             let ok = match r {
-                Reloc::Sym(s) => self.enc_sym(u, *s, &mut e).is_some(),
+                Reloc::Sym(s) => self.enc_sym(u, *s, &mut e, &mut rw).is_some(),
                 Reloc::Slot(x) | Reloc::Thunk(x) => {
                     e.u8(if matches!(r, Reloc::Slot(_)) { 20 } else { 21 });
                     match self.slot_bytes(u, *x) {
@@ -5853,14 +5868,15 @@ impl Linker {
         Some(s)
     }
 
-    fn link_sym(&mut self, u: &mut Unit, d: &mut D) -> Option<u64> {
-        let s = self.link_symbol(u, d)?;
+    fn link_sym(&mut self, u: &mut Unit, d: &mut D, rw: &mut Vec<Sym>) -> Option<u64> {
+        let s = self.link_symbol(u, d, rw)?;
         Some(u.syms.value(s))
     }
 
     /// Retain the encoded target's identity: reverse lookup by address loses aliases and
     /// cannot describe every linked symbol. Data folding must see the same target as cold code.
-    fn link_symbol(&mut self, u: &mut Unit, d: &mut D) -> Option<Sym> {
+    /// `rw`: the writable blocks the entry's earlier symbols made, by ordinal (enc_sym).
+    fn link_symbol(&mut self, u: &mut Unit, d: &mut D, rw: &mut Vec<Sym>) -> Option<Sym> {
         let tag = d.u8()?;
         let mut s = match tag {
             1 => u.syms.find_rt(d.str()?)?,
@@ -5909,7 +5925,11 @@ impl Linker {
             8 => {
                 let sz = d.u64()?;
                 let al = d.u64()?;
-                u.rw_sym(sz, al, None)
+                let ord = d.u32()? as usize;
+                if ord == rw.len() {
+                    rw.push(u.rw_sym(sz, al, None));
+                }
+                *rw.get(ord)?
             }
             9 => {
                 let name = d.str()?;
@@ -5946,13 +5966,14 @@ impl Linker {
         let n = d.u32()? as usize;
         let mut ptrs = Vec::new();
         let mut end = 0;
+        let mut rw = Vec::new();
         for _ in 0..n {
             let o = d.u32()?;
             let at = o as usize;
             if at < end || at.checked_add(8)? > bytes.len() {
                 return None;
             }
-            let s = self.link_symbol(u, &mut d)?;
+            let s = self.link_symbol(u, &mut d, &mut rw)?;
             bytes[at..at + 8].copy_from_slice(&u.syms.value(s).to_le_bytes());
             ptrs.push((o, s));
             end = at + 8;
@@ -6096,6 +6117,7 @@ impl Linker {
         let code = d.bytes()?.to_vec();
         let n = d.u32()? as usize;
         let mut relocs = Vec::with_capacity(n);
+        let mut rw = Vec::new();
         for _ in 0..n {
             let o = d.u32()? as usize;
             let kind = kind_of(d.u8()?)?;
@@ -6125,7 +6147,7 @@ impl Linker {
                     u.env.reloc_value(Reloc::Resume)
                 }
                 _ => {
-                    let v = self.link_sym(u, &mut d)?;
+                    let v = self.link_sym(u, &mut d, &mut rw)?;
                     if u.syms.data_at(v).is_some() {
                         data.push(v);
                     }

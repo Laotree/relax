@@ -318,6 +318,7 @@ impl ImageTables {
             8 => {
                 d.u64()?;
                 d.u64()?;
+                d.u32()?;
             }
             _ => return None,
         }
@@ -979,8 +980,9 @@ impl Linker {
     }
 
     /// Resolves image symbol `ix` for relocation `ri` (memo; a promoted temporary's writable block
-    /// -- tag 8 -- is made per relocation, as link_entry does: never shared between slots).
-    fn img_sym(&mut self, u: &mut Unit, im: &mut Img, ix: u32, ri: usize) -> Option<crate::rir::Sym> {
+    /// -- tag 8 -- is made once per ordinal of `rw`, the blocks of the slot (or data object) being
+    /// resolved, as link_entry does: never shared between slots).
+    fn img_sym(&mut self, u: &mut Unit, im: &mut Img, ix: u32, ri: usize, rw: &mut Vec<crate::rir::Sym>) -> Option<crate::rir::Sym> {
         let ix = ix as usize;
         let &b = im.syms.get(ix)?;
         if b.first() != Some(&8) {
@@ -989,7 +991,7 @@ impl Linker {
             }
         }
         let t = if im.timed { crate::jit::wall_ns() } else { 0 };
-        let r = self.link_symbol(u, &mut D { b, p: 0 });
+        let r = self.link_symbol(u, &mut D { b, p: 0 }, rw);
         if im.timed {
             let e = &mut im.t_tag[(b.first().copied().unwrap_or(0) as usize).min(9)];
             e.0 += crate::jit::wall_ns() - t; e.1 += 1;
@@ -1077,6 +1079,7 @@ impl Linker {
         for &(o, _) in &layout {
             let mut w = Vec::with_capacity((im.data[o].rel.1 - im.data[o].rel.0) / DREL_SIZE);
             let mut good = true;
+            let mut rw = Vec::new();
             for ri in (im.data[o].rel.0..im.data[o].rel.1).step_by(DREL_SIZE) {
                 let (off, t, x, add) = im.drel_at(ri);
                 if t == DATA_OBJ {
@@ -1086,7 +1089,7 @@ impl Linker {
                     }
                     w.push((off, t, x, add as i64, None));
                 } else {
-                    match self.img_sym(u, im, x, ri) {
+                    match self.img_sym(u, im, x, ri, &mut rw) {
                         Some(s) => w.push((off, t, x, 0, Some(s))),
                         None => {
                             good = false;
@@ -1227,6 +1230,7 @@ impl Linker {
             return Resolved::Lazy;
         }
         let mut needs = false;
+        let mut rw = Vec::new();
         for ri in (rel.0..rel.1).step_by(REL_SIZE) {
             let Some((_, _, t, ix)) = im.rel_at(ri) else {
                 im.failed += 1;
@@ -1238,7 +1242,7 @@ impl Linker {
                     needs = true;
                     true
                 }
-                IMG_SYM => self.img_sym(u, im, ix, ri).is_some(),
+                IMG_SYM => self.img_sym(u, im, ix, ri, &mut rw).is_some(),
                 IMG_TLS_KEY..=IMG_RESUME => true,
                 _ => false,
             };
