@@ -1185,7 +1185,8 @@ impl Tcx {
     pub(crate) fn impl_generics(&self, prog: &Program, d: DefId) -> Option<GenEnv> {
         let st = *self.impl_self.get(&d)?;
         let def = prog.def(d);
-        let ItemKind::Impl { generics, .. } = &prog.files[def.file as usize].ast.item(def.item).kind else { return None };
+        let ast = &prog.files[def.file as usize].ast;
+        let generics = &ast.as_impl(&ast.item(def.item).kind)?.generics;
         let mut env = self.impl_header_env(prog, d, def.file, generics);
         env.self_ty = Some(st);
         Some(env)
@@ -1196,7 +1197,8 @@ impl Tcx {
         if !self.impl_self.contains_key(&d) { return 0; }
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
-        let ItemKind::Impl { generics, .. } = &ast.item(def.item).kind else { return 0 };
+        let Some(imp) = ast.as_impl(&ast.item(def.item).kind) else { return 0 };
+        let generics = &imp.generics;
         ast.list(generics.params).iter().filter(|g| !matches!(g.kind, GenericParamKind::Lifetime(_))).count() as u32
     }
 
