@@ -23,7 +23,12 @@ impl FileDigest {
 
 fn text_range(pf: &ParsedFile) -> (u32, u32) {
     let lo = pf.toks.get(0).filter(|t| t.kind != T::Eof).map_or(0, |t| t.lo);
-    let hi = pf.toks.iter().find(|t| t.kind == T::Eof).map_or(pf.src_len, |t| t.lo).min(pf.src.len() as u32);
+    // The text includes what item-level macros expanded to (it follows the authored bytes in
+    // `src`): an item an invocation emits is keyed by its expansion's text like an authored
+    // one, so editing inside the invocation (a `script_mod!` body, a macro_rules! call)
+    // changes the keys of exactly the items it feeds. Only the authored end was used before,
+    // which left every expanded item out of the interface and out of its fns' body holes.
+    let hi = pf.src.len() as u32;
     (lo.min(hi), hi)
 }
 

@@ -20,5 +20,5 @@ fn unrelated() -> u32 { 42 }
 
 fn main() {
     let d = Dog;
-    println!("cache_items result {} {} {} {} {} {} {} {} {} {} {}", use_leaf(), use_shape(), use_const(), use_dyn(&d), use_loud(&d), unrelated(), untouched_user(), stable_after(), use_static(), local_size(), use_pad());
+    println!("cache_items result {} {} {} {} {} {} {} {} {} {} {} {} {} {}", use_leaf(), use_shape(), use_const(), use_dyn(&d), use_loud(&d), unrelated(), untouched_user(), stable_after(), use_static(), local_size(), use_pad(), from_mac(), MAC_LEVEL + 1, mac_body());
 }
