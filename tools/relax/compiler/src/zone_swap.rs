@@ -2,7 +2,7 @@
 //! settled, the compiler's heap (generation g of the compiler arena) is destroyed and the compile
 //! state is rebuilt, warm-sized, in generation g+1. What the running program needs to go on --
 //! slot identities, code, symbols, statics, sites, pc maps (the kept heap, `Unit` doc in jit.rs)
-//! -- is never touched. Only `RELAX_ZONE_SWAP=1` runs it.
+//! -- is never touched. On by default; `RELAX_ZONE_SWAP=0` turns it off.
 //!
 //! Protocol (driver: the run monitor, after the settle; abortable until step 6):
 //! 1. the watcher and the borrow-check worker end (they hold generation-g state for their whole
@@ -30,10 +30,10 @@ use super::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// RELAX_ZONE_SWAP=1.
+/// On unless RELAX_ZONE_SWAP=0.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_ZONE_SWAP").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("RELAX_ZONE_SWAP").map_or(true, |v| v != "0"))
 }
 
 /// RELAX_ZONE_VERIFY=1: the restored Program is compared table by table with the running one.

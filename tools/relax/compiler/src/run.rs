@@ -1858,7 +1858,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let (mut mid_quiet, mut mid_seen, mut mid_flushed, mut mid_last) = (0u32, u64::MAX, 0u64, 0u64);
         let mid_busy = std::sync::Arc::new(AtomicBool::new(false));
         let mut teardown_started = false;
-        // the settle swap (jit zone_swap, RELAX_ZONE_SWAP=1): finished or refused, the next try, tries so far
+        // the settle swap (jit zone_swap, on unless RELAX_ZONE_SWAP=0): finished or refused, the next try, tries so far
         let (mut swap_over, mut swap_next, mut swap_tries) = (!jit::zone_swap::enabled(), Instant::now(), 0u32);
         let mut swap_wait_said = "";
         loop {
