@@ -90,7 +90,9 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
         .name("relax-compile".into())
         .stack_size(8 << 20)
         .spawn(move || {
-            let _compiler = relax_compiler::zone_alloc::compiler_thread();
+            // this thread boots and, for an app without the HAL, runs its main (what the loader's
+            // main thread did): a compiler phase, not a swap-quiesced compiler worker
+            let _compiler = relax_compiler::zone_alloc::compiler();
             loop {
                 let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile()))
                     .unwrap_or(101);
