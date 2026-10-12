@@ -1936,13 +1936,7 @@ pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fa
 /// report that follows is the ordinary fault report).
 fn note_tombstone_fault(f: &os::fault::Fault) {
     if std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some() {
-        #[repr(C)]
-        struct DlInfo { fname: *const std::ffi::c_char, fbase: *mut u8, sname: *const std::ffi::c_char, saddr: *mut u8 }
-        extern "C" { fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32; }
-        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
-        let sym = if unsafe { dladdr(f.pc as *const u8, &mut info) } != 0 && !info.sname.is_null() {
-            unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_string_lossy().into_owned()
-        } else { "?".to_string() };
+        let sym = os::proc::symbol_at(f.pc).map_or_else(|| "?".to_string(), |s| s.0);
         eprintln!("makepad-run zone: fault: {} at {:#x}, pc {:#x} in {}, thread `{}`\n", f.label(), f.addr, f.pc, sym, std::thread::current().name().unwrap_or("?"));
     }
     if let Some(g) = crate::zone_alloc::compiler_tombstone_of(f.addr as usize) {

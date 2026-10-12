@@ -515,20 +515,37 @@ thread_local! {
 unsafe fn cx_ptr() -> *mut Cx {
     let cx = CX.with(|c| c.get());
     if (*cx).top.is_null() {
-        // reserved address space, touched as frames reach it (not the program's allocator)
-        extern "C" {
-            fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
-        }
-        #[cfg(target_vendor = "apple")]
-        const MAP_ANON: i32 = 0x1000;
-        #[cfg(not(target_vendor = "apple"))]
-        const MAP_ANON: i32 = 0x20;
-        let p = mmap(std::ptr::null_mut(), STACK_WORDS * 8, 3, 0x0002 | MAP_ANON, -1, 0) as *mut u64;
+        let p = interp_stack_map(STACK_WORDS * 8);
         assert!(!p.is_null() && p as isize != -1, "makepad-run interp: no memory for the interpreter stack");
         (*cx).top = p;
         (*cx).limit = p.add(STACK_WORDS);
     }
     cx
+}
+
+/// The interpreter stack's memory (not the program's allocator). Unix: reserved address space,
+/// touched as frames reach it. Windows: committed read-write (charged to the commit limit, pages
+/// still materialise on first touch).
+#[cfg(unix)]
+unsafe fn interp_stack_map(len: usize) -> *mut u64 {
+    extern "C" {
+        fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
+    }
+    #[cfg(target_vendor = "apple")]
+    const MAP_ANON: i32 = 0x1000;
+    #[cfg(not(target_vendor = "apple"))]
+    const MAP_ANON: i32 = 0x20;
+    mmap(std::ptr::null_mut(), len, 3, 0x0002 | MAP_ANON, -1, 0) as *mut u64
+}
+
+#[cfg(windows)]
+unsafe fn interp_stack_map(len: usize) -> *mut u64 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
+    }
+    // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+    VirtualAlloc(std::ptr::null_mut(), len, 0x1000 | 0x2000, 0x04) as *mut u64
 }
 
 #[inline(never)]

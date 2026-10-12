@@ -8,6 +8,7 @@
 //! - `lookup(handle, name)`: the system's own lookup in a library handle (the program's dlsym).
 //! - `exit(code)`: ends the process once Relax is done with the program (see the Windows half).
 //! - `on_battery()`.
+//! - `symbol_at(pc)`: the nearest exported symbol of the image holding `pc` (dladdr's view).
 //! - `args_bytes()`: the process arguments as bytes (`set_args`: an embedder names them).
 //! - `create_private(path)`: a new file only this user can read (O_EXCL); `ensure_private_dir`:
 //!   a directory that is safe to load code from (owned by this user, not writable by others).
@@ -46,6 +47,88 @@ impl KeepLastError {
 impl Drop for KeepLastError {
     fn drop(&mut self) {
         set_last_error(self.0);
+    }
+}
+
+/// The exported symbol nearest at or below `pc` in the loaded image that contains it: (name,
+/// symbol address, image path). Unix: dladdr. Windows: the module containing `pc`
+/// (GetModuleHandleExW from an address) and the nearest entry of its PE export table, which is
+/// what dladdr reports for a shared object (exported names only).
+pub fn symbol_at(pc: u64) -> Option<(String, u64, String)> {
+    symbol_at_imp(pc)
+}
+
+#[cfg(unix)]
+fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const std::ffi::c_char,
+        fbase: *mut u8,
+        sname: *const std::ffi::c_char,
+        saddr: *mut u8,
+    }
+    extern "C" {
+        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+    }
+    let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+    if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
+        return None;
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_string_lossy().into_owned();
+    let file = if info.fname.is_null() { String::new() } else { unsafe { std::ffi::CStr::from_ptr(info.fname) }.to_string_lossy().into_owned() };
+    Some((name, info.saddr as u64, file))
+}
+
+#[cfg(windows)]
+fn symbol_at_imp(pc: u64) -> Option<(String, u64, String)> {
+    use crate::os::win32::*;
+    // FROM_ADDRESS | UNCHANGED_REFCOUNT
+    let mut module: HANDLE = 0;
+    if unsafe { GetModuleHandleExW(0x4 | 0x2, pc as *const u16, &mut module) } == 0 || module == 0 {
+        return None;
+    }
+    let base = module as usize as *const u8;
+    let mut path = [0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), path.len() as u32) } as usize;
+    let file = String::from_utf16_lossy(&path[..n.min(path.len())]);
+    // SAFETY: a loaded module's headers and export directory are mapped readable for its life.
+    unsafe {
+        let rd32 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u32) as usize;
+        let rd16 = |off: usize| std::ptr::read_unaligned(base.add(off) as *const u16) as usize;
+        if rd16(0) != 0x5a4d {
+            return None;
+        }
+        let pe = rd32(0x3c);
+        if rd32(pe) != 0x4550 || rd16(pe + 24) != 0x20b {
+            return None; // not PE32+
+        }
+        // optional header (PE32+) at pe+24; data directory 0 (exports) at +112
+        let (exp, exp_size) = (rd32(pe + 24 + 112), rd32(pe + 24 + 116));
+        if exp == 0 {
+            return None;
+        }
+        let n_funcs = rd32(exp + 20);
+        let n_names = rd32(exp + 24);
+        let (funcs, names, ords) = (rd32(exp + 28), rd32(exp + 32), rd32(exp + 36));
+        let rva = (pc as usize).wrapping_sub(base as usize);
+        let mut best: Option<(usize, usize)> = None; // (function rva, name index)
+        for i in 0..n_names {
+            let ord = rd16(ords + 2 * i);
+            if ord >= n_funcs {
+                continue;
+            }
+            let f = rd32(funcs + 4 * ord);
+            // forwarders point into the export directory, not at code
+            if f > rva || (f >= exp && f < exp + exp_size) {
+                continue;
+            }
+            if best.is_none_or(|(b, _)| f > b) {
+                best = Some((f, i));
+            }
+        }
+        let (f, i) = best?;
+        let name = std::ffi::CStr::from_ptr(base.add(rd32(names + 4 * i)) as *const std::ffi::c_char).to_string_lossy().into_owned();
+        Some((name, base as u64 + f as u64, file))
     }
 }
 

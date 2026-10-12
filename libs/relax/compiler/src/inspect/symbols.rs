@@ -50,22 +50,7 @@ pub fn host_symbol(pc: u64) -> Option<(String, String, u64)> {
 }
 
 fn dladdr_name(pc: u64) -> Option<(String, u64)> {
-    #[repr(C)]
-    struct DlInfo {
-        fname: *const i8,
-        fbase: *mut u8,
-        sname: *const i8,
-        saddr: *mut u8,
-    }
-    extern "C" {
-        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
-    }
-    let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
-    if unsafe { dladdr(pc as *const u8, &mut info) } == 0 || info.sname.is_null() {
-        return None;
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(info.sname.cast()) }.to_string_lossy().into_owned();
-    Some((s, info.saddr as u64))
+    crate::os::proc::symbol_at(pc).map(|(name, addr, _)| (name, addr))
 }
 
 // ------------------------------------------------------------------ loaded images

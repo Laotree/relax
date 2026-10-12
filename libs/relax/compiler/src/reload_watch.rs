@@ -227,7 +227,6 @@ mod native {
         fn ReadDirectoryChangesW(dir: Handle, buf: *mut c_void, len: u32, subtree: i32, filter: u32, returned: *mut u32, overlapped: *mut Overlapped, routine: *mut c_void) -> i32;
         fn GetOverlappedResult(file: Handle, overlapped: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
         fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> i32;
-        fn CloseHandle(object: Handle) -> i32;
     }
     const STATUS_PENDING: usize = 0x103;
     // FILE_NAME, SIZE, LAST_WRITE, CREATION: renames, deletes, creates and writes
@@ -254,7 +253,7 @@ mod native {
                 let mut bytes = 0;
                 // wait for the cancelled read so the kernel no longer writes into the box
                 if CancelIoEx(self.handle, &mut self.overlapped) != 0 { GetOverlappedResult(self.handle, &mut self.overlapped, &mut bytes, 1); }
-                CloseHandle(self.handle);
+                crate::os::win32::CloseHandle(self.handle as crate::os::win32::HANDLE);
             }
         }
     }

@@ -198,6 +198,7 @@ pub fn print_slowest() {
     v.clear();
 }
 
+#[cfg(unix)]
 const LABELS: [&str; 10] = [
     "booting", "unit graph", "build scripts", "loading", "resolving", "signatures", "linking", "image", "starting", "compiling",
 ];
