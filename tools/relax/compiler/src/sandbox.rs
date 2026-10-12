@@ -1072,6 +1072,33 @@ pub fn alloca(size: u64, align: u64) -> u64 {
 
 // ------------------------------------------------------------------ runtime entries for twins
 
+// Rust and C program allocations must stay inside the same sandbox window. The layout
+// ABI preserves over-alignment on growth without trusting a caller's claimed old size.
+extern "C" fn sb_alloc(size: u64, align: u64) -> u64 {
+    let Some(a) = cur_arena() else { return 0 };
+    if !align.is_power_of_two() { return 0; }
+    a.heap.lock().unwrap_or_else(|e| e.into_inner()).alloc(a.base, size, align)
+}
+extern "C" fn sb_alloc_zeroed(size: u64, align: u64) -> u64 {
+    let p = sb_alloc(size, align);
+    if p != 0 { unsafe { std::ptr::write_bytes(p as *mut u8, 0, size as usize) }; }
+    p
+}
+extern "C" fn sb_dealloc(p: u64, _size: u64, _align: u64) {
+    sb_free(p);
+}
+extern "C" fn sb_resize(p: u64, _old: u64, align: u64, size: u64) -> u64 {
+    let Some(a) = cur_arena() else { return 0 };
+    let old = a.heap.lock().unwrap_or_else(|e| e.into_inner()).size_of((p & 0xffff_ffff) as u32);
+    let Some(old) = old else { return 0 };
+    let q = sb_alloc(size, align);
+    if q != 0 {
+        unsafe { std::ptr::copy_nonoverlapping(m(p) as *const u8, q as *mut u8, (old as u64).min(size) as usize) };
+        sb_free(p);
+    }
+    q
+}
+
 extern "C" fn sb_malloc(size: u64) -> u64 {
     let Some(a) = cur_arena() else { return 0 };
     a.heap.lock().unwrap_or_else(|e| e.into_inner()).alloc(a.base, size, 16)
@@ -1227,6 +1254,10 @@ fn rt_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
 fn c_policy(name: &str) -> Option<Option<(&'static str, u64)>> {
     let n = name.trim_start_matches('_');
     Some(match n {
+        "relax_alloc" => Some(("sb_alloc", sb_alloc as *const () as u64)),
+        "relax_alloc_zeroed" => Some(("sb_alloc_zeroed", sb_alloc_zeroed as *const () as u64)),
+        "relax_dealloc" => Some(("sb_dealloc", sb_dealloc as *const () as u64)),
+        "relax_realloc" => Some(("sb_resize", sb_resize as *const () as u64)),
         "malloc" => Some(("sb_malloc", sb_malloc as *const () as u64)),
         "calloc" => Some(("sb_calloc", sb_calloc as *const () as u64)),
         "realloc" => Some(("sb_realloc", sb_realloc as *const () as u64)),

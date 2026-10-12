@@ -410,7 +410,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     #[inline]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
-        if domain::dealloc(p) { return; }
+        if domain::dealloc_layout(p, l) { return; }
         if burst::owns(p) {
             return burst::dealloc(p, l);
         }
@@ -426,7 +426,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
     #[inline]
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
-        if let Some(q) = domain::realloc_owned(p, size) { return q; }
+        if let Some(q) = domain::realloc_layout(p, l, size) { return q; }
         let in_burst = burst::owns(p);
         if in_burst || burst::active() {
             // The destination follows the current scope. On failure the old block stays valid.

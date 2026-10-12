@@ -82,8 +82,8 @@ const NO_CURRENT: Current = Current {
 thread_local! {
     static DEPTH: Cell<usize> = const { Cell::new(0) };
     static CURRENT: Cell<[Current; CLASSES]> = const { Cell::new([NO_CURRENT; CLASSES]) };
-    /// The calling thread's current chunks in the runtime domain heap it is inside (domain.rs
-    /// `enter` empties it, handing the chunks back, whenever the thread's heap changes).
+    static DOMAIN_ARENA: Cell<usize> = const { Cell::new(0) };
+    /// Domain enter/exit hands these chunks back before changing the active arena.
     static DOMAIN_CURRENT: Cell<[Current; CLASSES]> = const { Cell::new([NO_CURRENT; CLASSES]) };
 }
 
@@ -171,15 +171,33 @@ pub fn active() -> bool {
     DEFAULT.base.load(Ordering::Relaxed) != 0 && DEPTH.try_with(|d| d.get() != 0).unwrap_or(false)
 }
 
+// Owner fields are touched only by the thread named in `owner`. Handoff holds state's
+// lock and closes the remote list before making these fields available to another thread.
+struct Owned {
+    free: usize,
+    bump: usize,
+    stride: usize,
+    live: usize,
+    bytes: usize,
+    account: usize,
+}
+#[repr(align(64))]
 struct Chunk {
+    owner: AtomicUsize,
+    remote: AtomicUsize, // NONE closes publication during handoff
+    account: AtomicUsize,
+    remote_bytes: AtomicUsize,
+    owned: UnsafeCell<Owned>,
     live: AtomicUsize,
     /// Mirrors membership of the PARTIAL list (compiler arena); written under the PARTIAL lock.
     in_part: AtomicBool,
     state: Mutex<State>,
 }
+unsafe impl Sync for Chunk {}
 struct State {
+    released: bool,
     generation: u64,
-    free: usize, // intrusive list in freed slots, protected even for remote frees
+    free: usize, // detached list; attached domain chunks use Owned instead
     bump: usize,
     stride: usize, // zero for an exclusive large allocation
     class: usize,
@@ -449,9 +467,15 @@ impl Arena {
             ),
             headers: [const {
                 Chunk {
+                    owner: AtomicUsize::new(0),
+                    remote: AtomicUsize::new(NONE),
+                    account: AtomicUsize::new(0),
+                    remote_bytes: AtomicUsize::new(0),
+                    owned: UnsafeCell::new(Owned { free: 0, bump: 0, stride: 0, live: 0, bytes: 0, account: 0 }),
                     live: AtomicUsize::new(0),
                     in_part: AtomicBool::new(false),
                     state: Mutex::new(State {
+                        released: true,
                         generation: 0,
                         free: 0,
                         bump: 0,
@@ -488,6 +512,10 @@ impl Arena {
             }
             let a = &mut *p;
             a.dynamic = true;
+            for h in &a.headers {
+                h.remote.store(NONE, Ordering::Relaxed);
+                (*h.state.value.get()).released = true;
+            }
             let pool = &mut *a.pool.value.get();
             pool.heads.fill(NONE);
             pool.heads[MAX_ORDER] = 0;
@@ -503,6 +531,7 @@ impl Arena {
             }
         }
     }
+    #[inline]
     fn with_current<R>(&self, f: impl FnOnce(&Cell<[Current; CLASSES]>) -> R) -> R {
         if self.dynamic {
             DOMAIN_CURRENT.with(f)
@@ -517,8 +546,84 @@ impl Arena {
             CURRENT.try_with(f)
         }
     }
+    #[inline]
     pub unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        self.alloc_inner(l)
+        self.alloc_counted(l, l.size())
+    }
+    #[inline]
+    pub unsafe fn alloc_counted(&self, l: Layout, requested: usize) -> *mut u8 {
+        self.alloc_inner(l, requested)
+    }
+    pub fn enter_thread(&self) {
+        DOMAIN_ARENA.with(|c| c.set(self as *const Self as usize));
+    }
+    #[inline]
+    fn thread_token(&self) -> usize {
+        DOMAIN_CURRENT.with(|c| c as *const _ as usize)
+    }
+    #[inline]
+    fn cache_here(&self) -> bool {
+        !self.dynamic || DOMAIN_ARENA.with(|c| c.get() == self as *const Self as usize)
+    }
+    pub fn requested_bytes(&self) -> usize {
+        // Separate owner stores and remote additions avoid an RMW on the owner's path.
+        // Counters are cumulative across handoffs, so a delayed remote free cannot hit a
+        // reset counter. Like other allocator stats, concurrent inspection is approximate.
+        (self.headers.iter().fold(0usize, |n, h| n.wrapping_add(
+            h.account.load(Ordering::Relaxed).wrapping_sub(h.remote_bytes.load(Ordering::Relaxed))
+        )) as isize).max(0) as usize
+    }
+    unsafe fn attach(&self, h: &Chunk, s: &State) {
+        *h.owned.get() = Owned { free: s.free, bump: s.bump, stride: s.stride,
+            live: h.live.load(Ordering::Relaxed), bytes: s.bytes,
+            account: h.account.load(Ordering::Relaxed) };
+        h.owner.store(self.thread_token(), Ordering::Release);
+        h.remote.store(0, Ordering::Release);
+    }
+    unsafe fn drain(&self, h: &Chunk, mut p: usize) {
+        let o = &mut *h.owned.get();
+        while p != 0 {
+            let next = *(p as *const usize);
+            o.bytes -= *((p as *const usize).add(1));
+            o.live -= 1;
+            *(p as *mut usize) = o.free;
+            o.free = p;
+            p = next;
+        }
+    }
+    unsafe fn handoff(&self, index: usize, s: &mut State) {
+        let h = &self.headers[index];
+        self.drain(h, h.remote.swap(NONE, Ordering::AcqRel));
+        let o = &*h.owned.get();
+        s.free = o.free;
+        s.bump = o.bump;
+        s.bytes = o.bytes;
+        h.live.store(o.live, Ordering::Relaxed);
+        h.owner.store(0, Ordering::Release);
+        s.attached = false;
+        if o.live == 0 {
+            self.release_empty(index, s);
+        } else if s.free != 0 || s.bump + s.stride <= CHUNK {
+            self.partial_push(index, s.class);
+        }
+    }
+    unsafe fn release_empty(&self, index: usize, s: &mut State) {
+        let h = &self.headers[index];
+        s.released = true;
+        if h.in_part.load(Ordering::Relaxed) {
+            lock(&self.partial).unlink(index, &self.headers);
+        }
+        if s.stride != 0 && s.bump <= WARM_TOUCHED_MAX && self.warm_put(index, s.bump) {
+            return;
+        }
+        event(E_DECOMMIT);
+        let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
+        if os::decommit(address as *mut u8, s.committed, COMPILER) {
+            self.committed.fetch_sub(s.committed, Ordering::Relaxed);
+            self.chunks.fetch_sub((s.committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
+            s.committed = 0;
+            lock(&self.pool).release(s.run, s.order);
+        }
     }
     pub fn committed(&self) -> usize {
         self.committed.load(Ordering::Relaxed)
@@ -607,10 +712,10 @@ impl Arena {
         Some(i)
     }
     /// Takes a slot from a listed chunk of `stride` and makes that chunk the thread's current one.
-    unsafe fn from_partial(&self, i: usize, stride: usize, class: usize, requested: usize) -> *mut u8 {
+    unsafe fn from_partial(&self, i: usize, stride: usize, class: usize, requested: usize, accounted: usize) -> *mut u8 {
         let h = &self.headers[i];
         let mut s = lock(&h.state);
-        if s.stride != stride || s.committed != CHUNK || h.live.load(Ordering::Relaxed) == 0 {
+        if s.stride != stride || s.committed != CHUNK || s.released || s.attached {
             return null_mut(); // reused for something else since it was listed
         }
         let p = if s.free != 0 {
@@ -628,22 +733,50 @@ impl Arena {
         s.bytes += requested;
         s.attached = true;
         let generation = s.generation;
+        if self.dynamic {
+            h.account.fetch_add(accounted, Ordering::Relaxed);
+            self.attach(h, &s);
+        }
         drop(s);
         self.with_current(|c| {
-            let mut slots = c.get();
-            slots[class] = Current { index: i, generation };
-            c.set(slots);
+            c.as_ptr().cast::<Current>().add(class).write(Current { index: i, generation });
         });
         p
     }
-    unsafe fn from_current(&self, c: Current, requested: usize) -> *mut u8 {
+    #[inline]
+    unsafe fn from_current(&self, c: Current, requested: usize, accounted: usize) -> *mut u8 {
         if c.index == NONE {
             return null_mut();
         }
         let h = &self.headers[c.index];
+        if self.dynamic {
+            if (*h.owned.get()).free == 0 && h.remote.load(Ordering::Relaxed) != 0 {
+                self.drain(h, h.remote.swap(0, Ordering::Acquire));
+            }
+            let o = &mut *h.owned.get();
+            let p = if o.free != 0 {
+                let p = o.free;
+                o.free = *(p as *const usize);
+                p
+            } else if o.bump + o.stride <= CHUNK {
+                let p = self.base.load(Ordering::Relaxed) + c.index * CHUNK + o.bump;
+                o.bump += o.stride;
+                p
+            } else {
+                let mut s = lock(&h.state);
+                self.handoff(c.index, &mut s);
+                self.with_current(|cache| cache.as_ptr().cast::<Current>().add(s.class).write(NO_CURRENT));
+                return null_mut();
+            };
+            o.live += 1;
+            o.bytes += requested;
+            o.account = o.account.wrapping_add(accounted);
+            h.account.store(o.account, Ordering::Relaxed);
+            return p as *mut u8;
+        }
         let mut s = lock(&h.state);
         // Even if the address was freed/reassigned, this permanent header is safe to read.
-        if s.generation != c.generation || h.live.load(Ordering::Relaxed) == 0 {
+        if s.generation != c.generation || s.released {
             return null_mut();
         }
         let p = if s.free != 0 {
@@ -663,19 +796,26 @@ impl Arena {
         s.bytes += requested;
         p
     }
-    unsafe fn alloc_inner(&self, l: Layout) -> *mut u8 {
+    #[inline]
+    unsafe fn alloc_inner(&self, l: Layout, requested: usize) -> *mut u8 {
         let need = l.size().max(l.align()).max(16);
         let small = need <= 1 << MAX_SHIFT;
         let (class, stride) = if small { self.class_of(l.size(), l.align()) } else { (0, 0) };
-        if small {
-            let c = self.with_current(|c| c.get()[class]);
-            let p = self.from_current(c, l.size());
+        if small && self.cache_here() {
+            let c = self.with_current(|c| c.as_ptr().cast::<Current>().add(class).read());
+            let p = self.from_current(c, l.size(), requested);
             if !p.is_null() {
                 return p;
             }
+        }
+        self.alloc_slow(l, small, class, stride, requested)
+    }
+    #[cold]
+    unsafe fn alloc_slow(&self, l: Layout, small: bool, class: usize, stride: usize, requested: usize) -> *mut u8 {
+        if small && self.cache_here() {
             if COMPILER {
                 while let Some(i) = self.partial_pop(class) {
-                    let p = self.from_partial(i, stride, class, l.size());
+                    let p = self.from_partial(i, stride, class, l.size(), requested);
                     if !p.is_null() {
                         return p;
                     }
@@ -723,12 +863,13 @@ impl Arena {
             let mut s = lock(&h.state);
             generation = s.generation.wrapping_add(1);
             *s = State {
+                released: false,
                 generation,
                 free: 0,
                 bump: stride,
                 stride,
                 class,
-                attached: true,
+                attached: small && self.cache_here(),
                 committed,
                 run,
                 order,
@@ -740,12 +881,14 @@ impl Arena {
                 self.chunks.fetch_add((committed + CHUNK - 1) / CHUNK, Ordering::Relaxed);
             }
             s.bytes = l.size();
+            if self.dynamic {
+                h.account.fetch_add(requested, Ordering::Relaxed);
+                if s.attached { self.attach(h, &s); }
+            }
         }
-        if small {
+        if small && self.cache_here() {
             self.with_current(|c| {
-                let mut slots = c.get();
-                slots[class] = Current { index, generation };
-                c.set(slots);
+                c.as_ptr().cast::<Current>().add(class).write(Current { index, generation });
             });
         }
         p
@@ -753,9 +896,10 @@ impl Arena {
     /// A thread is ending: its current chunks go back to the partial list, so what it left free in
     /// them is reused (compiler arena; a chunk is otherwise attached to its thread until it fills).
     pub fn detach_thread(&self) {
-        if !COMPILER {
+        if !COMPILER || !self.cache_here() {
             return;
         }
+        if self.dynamic { DOMAIN_ARENA.with(|c| c.set(0)); }
         let Ok(mut slots) = self.try_current(|c| c.replace([NO_CURRENT; CLASSES])) else {
             return;
         };
@@ -765,7 +909,11 @@ impl Arena {
             }
             let h = &self.headers[c.index];
             let mut s = lock(&h.state);
-            if s.generation == c.generation && s.stride != 0 && s.attached && h.live.load(Ordering::Relaxed) != 0 {
+            if self.dynamic {
+                unsafe { self.handoff(c.index, &mut s) };
+                continue;
+            }
+            if s.generation == c.generation && s.stride != 0 && s.attached && !s.released {
                 s.attached = false;
                 if (s.free != 0 || s.bump + s.stride <= CHUNK) && !h.in_part.load(Ordering::Relaxed) {
                     self.partial_push(c.index, class);
@@ -776,7 +924,10 @@ impl Arena {
     /// Like `alloc`, zeroed. A large block of the compiler arena is zero when it comes out of the
     /// pool (never committed, or decommitted with `zero`), so its pages stay untouched until used.
     pub unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        let p = self.alloc(l);
+        self.alloc_zeroed_counted(l, l.size())
+    }
+    pub unsafe fn alloc_zeroed_counted(&self, l: Layout, requested: usize) -> *mut u8 {
+        let p = self.alloc_counted(l, requested);
         if !p.is_null() && !(COMPILER && l.size().max(l.align()).max(16) > 1 << MAX_SHIFT) {
             std::ptr::write_bytes(p, 0, l.size());
         }
@@ -787,7 +938,19 @@ impl Arena {
     pub unsafe fn resize_in_place(&self, p: *mut u8, old: Layout, new_size: usize) -> bool {
         let address = (p as usize) & !(CHUNK - 1);
         let index = (address - self.base.load(Ordering::Relaxed)) / CHUNK;
-        let mut s = lock(&self.headers[index].state);
+        let h = &self.headers[index];
+        if self.dynamic && h.owner.load(Ordering::Acquire) == self.thread_token() {
+            let o = &mut *h.owned.get();
+            if new_size.max(old.align()) <= 1 << MAX_SHIFT && self.class_of(new_size, old.align()).1 == o.stride {
+                o.bytes = o.bytes - old.size() + new_size;
+                o.account = o.account.wrapping_sub(old.size()).wrapping_add(new_size);
+                h.account.store(o.account, Ordering::Relaxed);
+                return true;
+            }
+            return false;
+        }
+        let mut s = lock(&h.state);
+        if self.dynamic && s.attached { return false; }
         let need = new_size.max(old.align()).max(16);
         let same = if s.stride != 0 {
             need <= 1 << MAX_SHIFT && self.class_of(new_size, old.align()).1 == s.stride
@@ -823,6 +986,9 @@ impl Arena {
             }
         };
         if same {
+            if self.dynamic {
+                h.account.fetch_add(new_size.wrapping_sub(old.size()), Ordering::Relaxed);
+            }
             s.bytes = s.bytes.wrapping_sub(old.size()).wrapping_add(new_size);
         }
         same
@@ -859,11 +1025,60 @@ impl Arena {
         }
         (m, c)
     }
+    #[inline]
     pub unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        let address = (p as usize) & !(CHUNK - 1);
-        let index = (address - self.base.load(Ordering::Relaxed)) / CHUNK;
+        self.dealloc_counted(p, l, l.size());
+    }
+    #[inline]
+    pub unsafe fn dealloc_counted(&self, p: *mut u8, l: Layout, requested: usize) {
+        let index = (p as usize - self.base.load(Ordering::Relaxed)) / CHUNK;
         let h = &self.headers[index];
+        if self.dynamic {
+            if h.owner.load(Ordering::Acquire) == self.thread_token() {
+                let o = &mut *h.owned.get();
+                *(p as *mut usize) = o.free;
+                o.free = p as usize;
+                o.live -= 1;
+                o.bytes -= l.size();
+                o.account = o.account.wrapping_sub(requested);
+                h.account.store(o.account, Ordering::Relaxed);
+                return;
+            }
+        }
+        self.dealloc_slow(p, l, requested, index);
+    }
+    #[cold]
+    unsafe fn dealloc_slow(&self, p: *mut u8, l: Layout, requested: usize, index: usize) {
+        let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
+        let h = &self.headers[index];
+        if self.dynamic {
+            // Publish accounting before the block: after publication the owner may recycle
+            // the slot or even release its mapping, so this producer never touches it again.
+            h.remote_bytes.fetch_add(requested, Ordering::Relaxed);
+            let mut head = h.remote.load(Ordering::Acquire);
+            loop {
+                if head == NONE { break; }
+                *(p as *mut usize) = head;
+                *((p as *mut usize).add(1)) = l.size();
+                match h.remote.compare_exchange_weak(head, p as usize, Ordering::Release, Ordering::Acquire) {
+                    Ok(_) => return,
+                    Err(next) => head = next,
+                }
+            }
+        }
         let mut s = lock(&h.state);
+        // The owner may have attached while this free was waiting for the handoff lock.
+        if self.dynamic && h.owner.load(Ordering::Relaxed) != 0 {
+            let mut head = h.remote.load(Ordering::Relaxed);
+            loop {
+                *(p as *mut usize) = head;
+                *((p as *mut usize).add(1)) = l.size();
+                match h.remote.compare_exchange_weak(head, p as usize, Ordering::Release, Ordering::Relaxed) {
+                    Ok(_) => return,
+                    Err(next) => head = next,
+                }
+            }
+        }
         s.bytes -= l.size();
         if h.live.fetch_sub(1, Ordering::Relaxed) != 1 {
             *(p as *mut usize) = s.free;
@@ -873,11 +1088,16 @@ impl Arena {
             }
             return;
         }
+        if self.dynamic {
+            self.release_empty(index, &mut s);
+            return;
+        }
+        s.released = true;
         if COMPILER && h.in_part.load(Ordering::Relaxed) {
             lock(&self.partial).unlink(index, &self.headers);
         }
-        // No live blocks: no allocation passes from_current (live == 0) until the chunk is taken
-        // again under a new generation, so it can leave this lock for the warm list.
+        // Released chunks cannot be reached through an old current slot, even while their
+        // pages stay warm; only a new generation may allocate from them.
         if s.stride != 0 && s.committed == CHUNK && s.order == 0 && s.bump <= WARM_TOUCHED_MAX {
             let touched = s.bump;
             drop(s);
@@ -889,7 +1109,7 @@ impl Arena {
         // A chunk of any kind goes back to the shared pool, where a later large block expects zeros
         // (alloc_zeroed skips the write): on macOS only the `zero` form guarantees that.
         // No live blocks and no allocation can pass this lock while decommitting. An old
-        // TLS cache subsequently sees live == 0 or a different generation after reuse.
+        // TLS cache subsequently sees released or a different generation after reuse.
         event(E_DECOMMIT);
         if !os::decommit(address as *mut u8, s.committed, COMPILER) {
             // Quarantine an OS failure: do not claim reclaimed bytes or reuse this mapping.
@@ -929,7 +1149,7 @@ impl Arena {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
             let address = self.base.load(Ordering::Relaxed) + index * CHUNK;
-            // nothing live and not reachable from any TLS cache (live == 0): safe to drop pages
+            // Released, and not reachable from an owner cache: safe to drop pages.
             event(E_DECOMMIT);
             if !unsafe { os::decommit(address as *mut u8, s.committed, COMPILER) } {
                 continue; // quarantined, as in dealloc
@@ -958,7 +1178,7 @@ impl Arena {
         for index in 0..N {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
-            if s.stride == 0 || s.committed != CHUNK || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
+            if (self.dynamic && s.attached) || s.stride == 0 || s.committed != CHUNK || h.live.load(Ordering::Relaxed) == 0 || s.free == 0 {
                 continue;
             }
             let (stride, chunk) = (s.stride, base + index * CHUNK);
@@ -1018,6 +1238,7 @@ impl Arena {
         }
     }
     /// (class, stride) of a small request.
+    #[inline]
     fn class_of(&self, size: usize, align: usize) -> (usize, usize) {
         let need = size.max(align).max(16);
         let n = if COMPILER && align <= 16 { need } else { need.next_power_of_two() };

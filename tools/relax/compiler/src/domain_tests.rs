@@ -249,16 +249,32 @@ fn threads(f: fn() -> u64, n: usize) -> u64 {
     let mut acc = 0; for h in hs { acc ^= h.join().unwrap(); }
     acc
 }
+fn app_job() -> u64 {
+    let mut acc = 0u64;
+    for i in 0..10_000 {
+        let strings: Vec<String> = (0..50).map(|_| String::from("layout label")).collect();
+        let mut map = std::collections::HashMap::<u64, Vec<u8>>::new();
+        for j in 0..100u64 { map.insert(j, vec![(i + j as usize) as u8; 32]); }
+        std::hint::black_box(&strings);
+        std::hint::black_box(&map);
+        acc = acc.wrapping_add(strings[49].len() as u64 + map[&99][0] as u64);
+    }
+    acc
+}
+fn vecs_job() -> u64 { vecs(200_000) }
 fn churn_job() -> u64 { churn(1_000_000) }
 fn batch_job() -> u64 { batch(1_000_000) }
 fn bench(out: *mut u64) {
-    let out = unsafe { std::slice::from_raw_parts_mut(out, 5) };
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
     let t = Instant::now(); let a = churn(1_000_000); out[0] = t.elapsed().as_nanos() as u64;
     let t = Instant::now(); let b = vecs(200_000); out[1] = t.elapsed().as_nanos() as u64;
     let t = Instant::now(); let c = batch(1_000_000); out[2] = t.elapsed().as_nanos() as u64;
     let t = Instant::now(); let d = threads(churn_job, 4); out[3] = t.elapsed().as_nanos() as u64;
     let t = Instant::now(); let e = threads(batch_job, 4); out[4] = t.elapsed().as_nanos() as u64;
-    assert!(a + b + c + d + e > 0);
+    let t = Instant::now(); let f = threads(vecs_job, 4); out[5] = t.elapsed().as_nanos() as u64;
+    let t = Instant::now(); let g = app_job(); out[6] = t.elapsed().as_nanos() as u64;
+    let t = Instant::now(); let h = threads(app_job, 4); out[7] = t.elapsed().as_nanos() as u64;
+    assert!(a + b + c + d + e + f + g + h > 0);
 }
 "#;
 
@@ -267,12 +283,12 @@ fn bench(out: *mut u64) {
 fn domain_allocation_cost() {
     let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let (mut u, entry, root) = fixture_of(ALLOC_FIXTURE, "bench");
-    let names = ["box 1e6", "vec16 2e5", "mixed live 1e6", "box 1e6 x4 threads", "mixed live 1e6 x4 threads"];
+    let names = ["box 1e6", "vec16 2e5", "mixed live 1e6", "box 1e6 x4 threads", "mixed live 1e6 x4 threads", "vec16 2e5 x4 threads", "native app-like 1e4", "native app-like 1e4 x4 threads"];
     let up = &mut *u as *mut Unit;
     for round in 0..4 {
-        let d0 = [const { AtomicU64::new(0) }; 5];
+        let d0 = [const { AtomicU64::new(0) }; 8];
         unsafe { crate::jit::call_jit(up, entry, d0.as_ptr() as u64) }.unwrap_or_else(|p| panic!("{}", p.message));
-        let d1 = [const { AtomicU64::new(0) }; 5];
+        let d1 = [const { AtomicU64::new(0) }; 8];
         let (domain, _, main) = launch_with(&mut u, entry, None, d1.as_ptr() as u64);
         main.join().unwrap();
         wait(|| info(domain).unwrap().threads == 0);

@@ -1,6 +1,6 @@
 //! Program heap tracking by call stack, patched in on request (DESIGN.md §6).
 //!
-//! The program's allocator calls (Relax core heap.rs and std: malloc, calloc, realloc, free,
+//! The program's allocator calls (layout-aware Rust entries and C malloc/calloc/realloc/free/
 //! posix_memalign) resolve to veneers here: one indirect jump to the program allocator.
 //! `heap start` swaps the words to entry stubs that pass the JIT caller's frame pointer
 //! and return address to the trackers below; `heap stop` swaps them back. Domain ownership is
@@ -33,14 +33,18 @@ static REALLOC_T: AtomicUsize = AtomicUsize::new(0);
 static FREE_T: AtomicUsize = AtomicUsize::new(0);
 static MEMALIGN_T: AtomicUsize = AtomicUsize::new(0);
 /// Program allocator entries (domain routing stays active when sampling is off).
-static REAL: [AtomicUsize; 5] = [const { AtomicUsize::new(0) }; 5];
-const NAMES: [&str; 5] = ["malloc", "calloc", "realloc", "free", "posix_memalign"];
+static RUST_ALLOC_T: AtomicUsize = AtomicUsize::new(0);
+static RUST_ZERO_T: AtomicUsize = AtomicUsize::new(0);
+static RUST_FREE_T: AtomicUsize = AtomicUsize::new(0);
+static RUST_REALLOC_T: AtomicUsize = AtomicUsize::new(0);
+static REAL: [AtomicUsize; 9] = [const { AtomicUsize::new(0) }; 9];
+const NAMES: [&str; 9] = ["malloc", "calloc", "realloc", "free", "posix_memalign", "relax_alloc", "relax_alloc_zeroed", "relax_dealloc", "relax_realloc"];
 
-fn targets() -> [&'static AtomicUsize; 5] {
-    [&MALLOC_T, &CALLOC_T, &REALLOC_T, &FREE_T, &MEMALIGN_T]
+fn targets() -> [&'static AtomicUsize; 9] {
+    [&MALLOC_T, &CALLOC_T, &REALLOC_T, &FREE_T, &MEMALIGN_T, &RUST_ALLOC_T, &RUST_ZERO_T, &RUST_FREE_T, &RUST_REALLOC_T]
 }
 
-/// The address a program's call to C allocator function `name` binds to (jit.rs loader_symbol):
+/// The address a program's call to allocator function `name` binds to (jit.rs loader_symbol):
 /// its veneer, with the word set to the program allocator on first use. Targets without
 /// sampling veneers bind that allocator directly. None: not an allocator symbol.
 pub fn veneer(name: &[u8]) -> Option<usize> {
@@ -48,12 +52,16 @@ pub fn veneer(name: &[u8]) -> Option<usize> {
     {
         let k = NAMES.iter().position(|n| n.as_bytes() == name)?;
         init_real();
-        let v: [usize; 5] = [
+        let v: [usize; 9] = [
             imp::relax_heap_malloc as *const () as usize,
             imp::relax_heap_calloc as *const () as usize,
             imp::relax_heap_realloc as *const () as usize,
             imp::relax_heap_free as *const () as usize,
             imp::relax_heap_memalign as *const () as usize,
+            imp::rust_alloc as *const () as usize,
+            imp::rust_zero as *const () as usize,
+            imp::rust_dealloc as *const () as usize,
+            imp::rust_resize as *const () as usize,
         ];
         Some(v[k])
     }
@@ -125,6 +133,38 @@ mod imp {
     pub unsafe extern "C" fn relax_heap_memalign() {
         core::arch::naked_asm!("jmp qword ptr [rip + {t}]", t = sym MEMALIGN_T)
     }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_alloc() {
+        core::arch::naked_asm!("jmp qword ptr [rip + {t}]", t = sym RUST_ALLOC_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_alloc() {
+        core::arch::naked_asm!("mov rdx, rbp", "mov rcx, [rsp]", "jmp {f}", f = sym super::track_rust_alloc);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_zero() {
+        core::arch::naked_asm!("jmp qword ptr [rip + {t}]", t = sym RUST_ZERO_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_zero() {
+        core::arch::naked_asm!("mov rdx, rbp", "mov rcx, [rsp]", "jmp {f}", f = sym super::track_rust_zero);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_dealloc() {
+        core::arch::naked_asm!("jmp qword ptr [rip + {t}]", t = sym RUST_FREE_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_dealloc() {
+        core::arch::naked_asm!("mov rcx, rbp", "mov r8, [rsp]", "jmp {f}", f = sym super::track_rust_dealloc);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_resize() {
+        core::arch::naked_asm!("jmp qword ptr [rip + {t}]", t = sym RUST_REALLOC_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_resize() {
+        core::arch::naked_asm!("mov r8, rbp", "mov r9, [rsp]", "jmp {f}", f = sym super::track_rust_resize);
+    }
     // tracking entries: the JIT caller's frame pointer (rbp, untouched by the veneer) and return
     // address ([rsp]) as the trackers' extra arguments
     #[unsafe(naked)]
@@ -171,6 +211,38 @@ mod imp {
     #[unsafe(naked)]
     pub unsafe extern "C" fn relax_heap_memalign() {
         core::arch::naked_asm!("adrp x16, {t}@PAGE", "ldr x16, [x16, {t}@PAGEOFF]", "br x16", t = sym MEMALIGN_T)
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_alloc() {
+        core::arch::naked_asm!("adrp x16, {t}@PAGE", "ldr x16, [x16, {t}@PAGEOFF]", "br x16", t = sym RUST_ALLOC_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_alloc() {
+        core::arch::naked_asm!("mov x2, x29", "mov x3, x30", "b {f}", f = sym super::track_rust_alloc);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_zero() {
+        core::arch::naked_asm!("adrp x16, {t}@PAGE", "ldr x16, [x16, {t}@PAGEOFF]", "br x16", t = sym RUST_ZERO_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_zero() {
+        core::arch::naked_asm!("mov x2, x29", "mov x3, x30", "b {f}", f = sym super::track_rust_zero);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_dealloc() {
+        core::arch::naked_asm!("adrp x16, {t}@PAGE", "ldr x16, [x16, {t}@PAGEOFF]", "br x16", t = sym RUST_FREE_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_dealloc() {
+        core::arch::naked_asm!("mov x3, x29", "mov x4, x30", "b {f}", f = sym super::track_rust_dealloc);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn rust_resize() {
+        core::arch::naked_asm!("adrp x16, {t}@PAGE", "ldr x16, [x16, {t}@PAGEOFF]", "br x16", t = sym RUST_REALLOC_T);
+    }
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn entry_rust_resize() {
+        core::arch::naked_asm!("mov x4, x29", "mov x5, x30", "b {f}", f = sym super::track_rust_resize);
     }
     // tracking entries: the JIT caller's frame pointer (x29) and return address (x30, the veneer
     // branched without linking)
@@ -520,6 +592,29 @@ extern "C" fn track_memalign(out: *mut *mut u8, align: usize, size: usize, fp: u
     r
 }
 
+// Layout-aware entries use the same sampler and veneers as C allocations, so `heap
+// start/stop` neither changes ownership nor adds a tracking branch to an unsampled call.
+extern "C" fn track_rust_alloc(size: usize, align: usize, fp: u64, ra: u64) -> *mut u8 {
+    let p = unsafe { crate::zone_alloc::domain::program_alloc(size, align) };
+    record(p, size, fp, ra);
+    p
+}
+extern "C" fn track_rust_zero(size: usize, align: usize, fp: u64, ra: u64) -> *mut u8 {
+    let p = unsafe { crate::zone_alloc::domain::program_alloc_zeroed(size, align) };
+    record(p, size, fp, ra);
+    p
+}
+extern "C" fn track_rust_dealloc(p: *mut u8, size: usize, align: usize, _fp: u64, _ra: u64) {
+    forget(&PROGRAM, p);
+    unsafe { crate::zone_alloc::domain::program_dealloc(p, size, align) };
+}
+extern "C" fn track_rust_resize(p: *mut u8, old: usize, align: usize, size: usize, fp: u64, ra: u64) -> *mut u8 {
+    forget(&PROGRAM, p);
+    let q = unsafe { crate::zone_alloc::domain::program_resize(p, old, align, size) };
+    if q.is_null() { record(p, old, fp, ra); } else { record(q, size, fp, ra); }
+    q
+}
+
 /// memstat's allocator: a host block was allocated (tracking on).
 fn host_alloc(p: *mut u8, size: usize) {
     // (inspect's own threads set IN_HOST_SAMPLE for good: their answers are not Relax's heap)
@@ -613,12 +708,16 @@ fn start(host: bool, rate: u64) -> Result<(), &'static str> {
         PROGRAM.tables.store(new_tables(rate), Release);
         PROGRAM.dropped.store(0, Relaxed);
         PROGRAM.on.store(true, Release);
-        let e: [usize; 5] = [
+        let e: [usize; 9] = [
             imp::entry_malloc as *const () as usize,
             imp::entry_calloc as *const () as usize,
             imp::entry_realloc as *const () as usize,
             imp::entry_free as *const () as usize,
             imp::entry_memalign as *const () as usize,
+            imp::entry_rust_alloc as *const () as usize,
+            imp::entry_rust_zero as *const () as usize,
+            imp::entry_rust_dealloc as *const () as usize,
+            imp::entry_rust_resize as *const () as usize,
         ];
         for (k, w) in targets().iter().enumerate() {
             w.store(e[k], Release);

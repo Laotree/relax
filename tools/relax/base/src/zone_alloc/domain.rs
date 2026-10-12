@@ -2,7 +2,7 @@
 //! ABI does. This boundary keeps provided crates and runtime process-wide state shared, even
 //! when called by a domain thread; pointers are still freed according to their owning range.
 use super::compiler::Arena;
-use std::alloc::Layout;
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, UnsafeCell};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -13,7 +13,6 @@ pub struct DomainHeap {
 struct Heap {
     arena: Box<Arena>,
     next: UnsafeCell<*mut Heap>,
-    live: AtomicUsize,
 }
 unsafe impl Send for Heap {}
 unsafe impl Sync for Heap {}
@@ -50,7 +49,6 @@ impl DomainHeap {
             inner: Arc::new(Heap {
                 arena,
                 next: UnsafeCell::new(std::ptr::null_mut()),
-                live: AtomicUsize::new(0),
             }),
         });
         let (base, size) = heap.range();
@@ -65,7 +63,7 @@ impl DomainHeap {
         Some(heap)
     }
     pub fn stats(&self) -> (usize, usize) {
-        (self.inner.live.load(Ordering::Relaxed), self.inner.arena.committed())
+        (self.inner.arena.requested_bytes(), self.inner.arena.committed())
     }
     pub fn range(&self) -> (usize, usize) {
         self.inner.arena.range()
@@ -112,6 +110,9 @@ pub unsafe fn enter(heap: *const DomainHeap) {
         if let Some(old) = old.as_ref() {
             old.inner.arena.detach_thread();
         }
+        if let Some(heap) = heap.as_ref() {
+            heap.inner.arena.enter_thread();
+        }
     }
 }
 
@@ -133,24 +134,23 @@ unsafe fn allocate(heap: &Heap, size: usize, align: usize, zero: bool) -> *mut u
         return std::ptr::null_mut();
     };
     let raw = if zero {
-        heap.arena.alloc_zeroed(layout)
+        heap.arena.alloc_zeroed_counted(layout, size)
     } else {
-        heap.arena.alloc(layout)
+        heap.arena.alloc_counted(layout, size)
     };
     if raw.is_null() {
         return raw;
     }
     let p = raw.add(offset);
     p.cast::<Header>().sub(1).write(Header { size, align, offset });
-    heap.live.fetch_add(size, Ordering::Relaxed);
     p
 }
 unsafe fn release(heap: &Heap, p: *mut u8) {
     let h = p.cast::<Header>().sub(1).read();
-    heap.live.fetch_sub(h.size, Ordering::Relaxed);
-    heap.arena.dealloc(
+    heap.arena.dealloc_counted(
         p.sub(h.offset),
         Layout::from_size_align_unchecked(h.size.max(1) + h.offset, h.align),
+        h.size,
     );
 }
 
@@ -192,23 +192,82 @@ pub unsafe fn dealloc(p: *mut u8) -> bool {
     }
 }
 pub unsafe fn realloc_owned(p: *mut u8, size: usize) -> Option<*mut u8> {
+    if let Some(heap) = CURRENT.with(|c| c.get().as_ref()) {
+        if heap.inner.arena.owns(p) { return Some(reallocate(&heap.inner, p, size)); }
+    }
     let heap = owner(p)?;
+    Some(reallocate(&heap, p, size))
+}
+unsafe fn reallocate(heap: &Heap, p: *mut u8, size: usize) -> *mut u8 {
     let h = p.cast::<Header>().sub(1).read();
     let old = Layout::from_size_align_unchecked(h.size.max(1) + h.offset, h.align);
     if let Some(total) = size.max(1).checked_add(h.offset) {
-        if Layout::from_size_align(total, h.align).is_ok() && heap.arena.resize_in_place(p.sub(h.offset), old, total) {
+        if h.size != 0 && size != 0 && Layout::from_size_align(total, h.align).is_ok() && heap.arena.resize_in_place(p.sub(h.offset), old, total) {
             p.cast::<Header>().sub(1).write(Header { size, ..h });
-            heap.live.fetch_add(size, Ordering::Relaxed);
-            heap.live.fetch_sub(h.size, Ordering::Relaxed);
-            return Some(p);
+            return p;
         }
     }
-    let q = allocate(&heap, size, h.align, false);
+    let q = allocate(heap, size, h.align, false);
     if !q.is_null() {
         std::ptr::copy_nonoverlapping(p, q, h.size.min(size));
-        release(&heap, p);
+        release(heap, p);
     }
-    Some(q)
+    q
+}
+
+/// Rust's allocator ABI carries the layout, so its slots need no C header.
+#[inline]
+pub unsafe extern "C" fn program_alloc(size: usize, align: usize) -> *mut u8 {
+    let l = Layout::from_size_align_unchecked(size, align);
+    CURRENT.with(|c| match c.get().as_ref() {
+        Some(h) => h.inner.arena.alloc(l),
+        None => System.alloc(l),
+    })
+}
+pub unsafe extern "C" fn program_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    let l = Layout::from_size_align_unchecked(size, align);
+    CURRENT.with(|c| match c.get().as_ref() {
+        Some(h) => h.inner.arena.alloc_zeroed(l),
+        None => System.alloc_zeroed(l),
+    })
+}
+#[inline]
+pub unsafe fn dealloc_layout(p: *mut u8, l: Layout) -> bool {
+    if let Some(h) = CURRENT.with(|c| c.get().as_ref()) {
+        if h.inner.arena.owns(p) {
+            h.inner.arena.dealloc(p, l);
+            return true;
+        }
+    }
+    if let Some(h) = owner(p) {
+        h.arena.dealloc(p, l);
+        true
+    } else { false }
+}
+#[inline]
+pub unsafe extern "C" fn program_dealloc(p: *mut u8, size: usize, align: usize) {
+    let l = Layout::from_size_align_unchecked(size, align);
+    if !dealloc_layout(p, l) { System.dealloc(p, l); }
+}
+unsafe fn resize_layout(h: &Heap, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+    if h.arena.resize_in_place(p, l, size) { return p; }
+    let q = h.arena.alloc(Layout::from_size_align_unchecked(size, l.align()));
+    if !q.is_null() {
+        std::ptr::copy_nonoverlapping(p, q, l.size().min(size));
+        h.arena.dealloc(p, l);
+    }
+    q
+}
+pub unsafe fn realloc_layout(p: *mut u8, l: Layout, size: usize) -> Option<*mut u8> {
+    if let Some(h) = CURRENT.with(|c| c.get().as_ref()) {
+        if h.inner.arena.owns(p) { return Some(resize_layout(&h.inner, p, l, size)); }
+    }
+    let h = owner(p)?;
+    Some(resize_layout(&h, p, l, size))
+}
+pub unsafe extern "C" fn program_resize(p: *mut u8, old: usize, align: usize, size: usize) -> *mut u8 {
+    let l = Layout::from_size_align_unchecked(old, align);
+    realloc_layout(p, l, size).unwrap_or_else(|| System.realloc(p, l, size))
 }
 
 extern "C" {
@@ -299,6 +358,10 @@ pub unsafe extern "C" fn program_aligned_free(p: *mut u8) {
 /// The same targets are used by heap inspection with sampling on or off.
 pub fn symbol(name: &[u8]) -> Option<usize> {
     Some(match name {
+        b"relax_alloc" => program_alloc as *const () as usize,
+        b"relax_alloc_zeroed" => program_alloc_zeroed as *const () as usize,
+        b"relax_dealloc" => program_dealloc as *const () as usize,
+        b"relax_realloc" => program_resize as *const () as usize,
         b"malloc" => program_malloc as *const () as usize,
         b"calloc" => program_calloc as *const () as usize,
         b"realloc" => program_realloc as *const () as usize,

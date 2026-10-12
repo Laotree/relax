@@ -1,51 +1,18 @@
-//! Heap allocation over the C allocator (public as core::alloc / alloc::alloc).
-//! malloc/realloc give 16-byte alignment on the supported targets; larger alignments go
-//! through posix_memalign.
+//! Layout-aware program allocation (public as core::alloc / alloc::alloc).
+//! Passing the known layout avoids C allocation headers on Rust buffers. The loader keeps
+//! domain zero on the process heap and selects an arena only for hosted program allocations.
 
 use crate::fmt;
 
+#[cfg(not(relax_check))]
 mod sys {
     extern "C" {
-        pub fn malloc(size: usize) -> *mut u8;
-        pub fn calloc(n: usize, size: usize) -> *mut u8;
-        pub fn realloc(p: *mut u8, size: usize) -> *mut u8;
-        pub fn free(p: *mut u8);
-        #[cfg(unix)]
-        pub fn posix_memalign(out: *mut *mut u8, align: usize, size: usize) -> i32;
-        pub fn abort() -> !;
-        // the C runtime's aligned heap (msvcrt / ucrt): blocks from _aligned_malloc must be
-        // freed with _aligned_free (Windows has no posix_memalign)
-        #[cfg(windows)]
-        pub fn _aligned_malloc(size: usize, align: usize) -> *mut u8;
-        #[cfg(windows)]
-        pub fn _aligned_free(p: *mut u8);
+        pub fn relax_alloc(size: usize, align: usize) -> *mut u8;
+        pub fn relax_alloc_zeroed(size: usize, align: usize) -> *mut u8;
+        pub fn relax_dealloc(p: *mut u8, size: usize, align: usize);
+        pub fn relax_realloc(p: *mut u8, old: usize, align: usize, size: usize) -> *mut u8;
     }
 }
-
-/// Does `layout` need the over-aligned allocator? malloc gives MIN_ALIGN on every supported
-/// target; unix's posix_memalign path is also taken for blocks smaller than their alignment (as
-/// real std's System allocator does), Windows' malloc aligns those already.
-#[cfg(unix)]
-fn over_aligned(align: usize, size: usize) -> bool {
-    !(align <= MIN_ALIGN && align <= size)
-}
-#[cfg(windows)]
-fn over_aligned(align: usize, _size: usize) -> bool {
-    align > MIN_ALIGN
-}
-
-/// May the C realloc move this block? (unix: any malloc'd or posix_memalign'd block; Windows:
-/// not an _aligned_malloc one.)
-#[cfg(unix)]
-fn plain_realloc(align: usize, _old_size: usize, new_size: usize) -> bool {
-    !over_aligned(align, new_size)
-}
-#[cfg(windows)]
-fn plain_realloc(align: usize, old_size: usize, new_size: usize) -> bool {
-    !over_aligned(align, new_size) && !over_aligned(align, old_size)
-}
-
-const MIN_ALIGN: usize = 16;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(not(relax_check), lang = "alloc_layout")]
@@ -133,67 +100,31 @@ impl Layout {
 
 /// Allocates `layout` (size must be non-zero). Returns null on failure, as real alloc.
 pub unsafe fn alloc(layout: Layout) -> *mut u8 {
-    if !over_aligned(layout.align, layout.size) {
-        sys::malloc(layout.size)
-    } else {
-        aligned_alloc(layout)
-    }
-}
-
-#[cfg(unix)]
-unsafe fn aligned_alloc(layout: Layout) -> *mut u8 {
-    let mut out: *mut u8 = crate::ptr::null_mut();
-    let align = if layout.align < crate::mem::size_of::<usize>() { crate::mem::size_of::<usize>() } else { layout.align };
-    if sys::posix_memalign(&mut out, align, layout.size) != 0 {
-        return crate::ptr::null_mut();
-    }
-    out
-}
-
-#[cfg(windows)]
-unsafe fn aligned_alloc(layout: Layout) -> *mut u8 {
-    sys::_aligned_malloc(layout.size, layout.align)
+    #[cfg(not(relax_check))]
+    { sys::relax_alloc(layout.size, layout.align) }
+    #[cfg(relax_check)]
+    { std::alloc::alloc(std::alloc::Layout::from_size_align_unchecked(layout.size, layout.align)) }
 }
 
 pub unsafe fn alloc_zeroed(layout: Layout) -> *mut u8 {
-    if !over_aligned(layout.align, layout.size) {
-        sys::calloc(layout.size, 1)
-    } else {
-        let p = alloc(layout);
-        if !p.is_null() {
-            crate::ptr::write_bytes(p, 0, layout.size);
-        }
-        p
-    }
+    #[cfg(not(relax_check))]
+    { sys::relax_alloc_zeroed(layout.size, layout.align) }
+    #[cfg(relax_check)]
+    { std::alloc::alloc_zeroed(std::alloc::Layout::from_size_align_unchecked(layout.size, layout.align)) }
 }
 
-#[cfg(unix)]
-pub unsafe fn dealloc(ptr: *mut u8, _layout: Layout) {
-    sys::free(ptr)
-}
-
-#[cfg(windows)]
 pub unsafe fn dealloc(ptr: *mut u8, layout: Layout) {
-    if over_aligned(layout.align, layout.size) {
-        sys::_aligned_free(ptr)
-    } else {
-        sys::free(ptr)
-    }
+    #[cfg(not(relax_check))]
+    { sys::relax_dealloc(ptr, layout.size, layout.align) }
+    #[cfg(relax_check)]
+    { std::alloc::dealloc(ptr, std::alloc::Layout::from_size_align_unchecked(layout.size, layout.align)) }
 }
 
 pub unsafe fn realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-    if plain_realloc(layout.align, layout.size, new_size) {
-        sys::realloc(ptr, new_size)
-    } else {
-        let new_layout = Layout::from_size_align_unchecked(new_size, layout.align);
-        let new_ptr = alloc(new_layout);
-        if !new_ptr.is_null() {
-            let n = if layout.size < new_size { layout.size } else { new_size };
-            crate::ptr::copy_nonoverlapping(ptr, new_ptr, n);
-            dealloc(ptr, layout);
-        }
-        new_ptr
-    }
+    #[cfg(not(relax_check))]
+    { sys::relax_realloc(ptr, layout.size, layout.align, new_size) }
+    #[cfg(relax_check)]
+    { std::alloc::realloc(ptr, std::alloc::Layout::from_size_align_unchecked(layout.size, layout.align), new_size) }
 }
 
 pub fn handle_alloc_error(layout: Layout) -> ! {
@@ -234,7 +165,7 @@ pub(crate) fn free(ptr: *mut u8, layout: Layout) {
 }
 
 /// The global allocator interface (kept for source compatibility; Relax always uses the
-/// C allocator).
+/// program allocator).
 pub unsafe trait GlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8;
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);

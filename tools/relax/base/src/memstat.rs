@@ -7,7 +7,7 @@
 //! allocator's own totals (its free-but-held memory is the gap between RSS and live bytes).
 //! A block keeps the tag it was allocated with when it grows (realloc), so a table built at
 //! boot and grown later stays a boot table. The program's own heap (Relax's std calls
-//! malloc directly) is not counted; rustc-built provided crates allocate through here, as
+//! the program allocator ABI) is not counted; rustc-built provided crates allocate through here, as
 //! `other`.
 
 use std::alloc::{GlobalAlloc, Layout};
@@ -327,10 +327,10 @@ unsafe impl GlobalAlloc for Counting {
 
     #[inline(always)]
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        // JIT-owned buffers carry the domain allocator's header, never a native tag header.
+        // JIT-owned Rust buffers have unprefixed slots, never a native tag header.
         // A provided crate may take ownership of one and drop it through this allocator.
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
-        if on() && crate::zone_alloc::domain::dealloc(p) { return; }
+        if on() && crate::zone_alloc::domain::dealloc_layout(p, l) { return; }
         if !on() {
             if TRACK.load(Relaxed) {
                 track_free(p);
@@ -349,7 +349,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
         #[cfg(any(target_os = "macos", target_os = "linux", target_os = "android", windows))]
         if on() {
-            if let Some(q) = crate::zone_alloc::domain::realloc_owned(p, new) { return q; }
+            if let Some(q) = crate::zone_alloc::domain::realloc_layout(p, l, new) { return q; }
         }
         if !on() {
             if TRACK.load(Relaxed) {
