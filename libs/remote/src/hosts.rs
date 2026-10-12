@@ -4,7 +4,7 @@
 //! [host.149]
 //! via = "ssh"
 //! ssh = "arch@192.0.2.16"
-//! relax = "[path]/bin/relax"   # optional: the relax binary on that host
+//! relax = "[path]/bin/makepad"   # optional: the makepad binary on that host
 //! env = { DISPLAY = ":0" }          # optional: environment of the sessions launched there
 //!
 //! [host.phone]
@@ -120,7 +120,7 @@ impl Hosts {
             let via = match text("via").as_deref() {
                 Some("ssh") => Via::Ssh {
                     ssh: text("ssh").ok_or_else(|| format!("host `{name}`: via = \"ssh\" needs ssh = \"user@host\""))?,
-                    relax: text("relax").unwrap_or_else(|| "relax".into()),
+                    relax: text("relax").unwrap_or_else(|| "makepad".into()),
                     env: parse_env(name, t.get("env"))?,
                 },
                 Some("dial") if t.contains_key("env") => return Err(format!("host `{name}`: env applies to via = \"ssh\" hosts; a dialling relay takes `--env K=V` on its command line")),
@@ -137,13 +137,13 @@ impl Hosts {
     }
 
     pub fn to_text(&self) -> String {
-        let mut s = String::from("# makepad-remote hosts (relax hub). Keys in here are secrets: keep this file private.\n");
+        let mut s = String::from("# makepad-remote hosts (makepad hub). Keys in here are secrets: keep this file private.\n");
         for h in &self.hosts {
             s.push_str(&format!("\n[host.{}]\n", h.name));
             match &h.via {
                 Via::Ssh { ssh, relax, env } => {
                     s.push_str(&format!("via = \"ssh\"\nssh = {}\n", quote(ssh)));
-                    if relax != "relax" {
+                    if relax != "makepad" {
                         s.push_str(&format!("relax = {}\n", quote(relax)));
                     }
                     if !env.is_empty() {

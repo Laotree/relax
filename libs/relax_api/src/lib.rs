@@ -1,4 +1,4 @@
-//! `#[relax_api]`: the interface a provided crate (a crate rustc builds into the `relax` loader)
+//! `#[relax_api]`: the interface a provided crate (a crate rustc builds into the `makepad` loader)
 //! offers to code Relax compiles.
 //!
 //! The attribute marks, on the code itself:
@@ -87,7 +87,7 @@ impl core::hash::Hasher for RelaxHasher {
 }
 
 /// Every [`Entry`] linked into this binary (empty where the platform has no reader); feature
-/// `host-shims`, like the provided crates' (only the `relax` loader reads the table).
+/// `host-shims`, like the provided crates' (only the `makepad` loader reads the table).
 #[cfg(feature = "host-shims")]
 pub fn entries() -> &'static [Entry] {
     section::entries()

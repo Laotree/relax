@@ -16,7 +16,7 @@ makepad-live-id-macros = { path = "id_macros", version = "1.0.0" }
 
 
 [features]
-# the #[relax_api] wrappers and table entries; only the `relax` loader enables it (its id
+# the #[relax_api] wrappers and table entries; only the `makepad` loader enables it (its id
 # interner must be the one copy in the process)
 host-shims = []
 default = []

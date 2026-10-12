@@ -54,7 +54,7 @@ pub enum Target {
     /// `host:port` and the credentials of the pairing
     #[cfg(not(target_arch = "wasm32"))]
     Tcp(String, Arc<makepad_network::tunnel::ClientCredentials>),
-    /// a command whose stdin/stdout speak makepad-remote (`ssh host relax remote-relay`)
+    /// a command whose stdin/stdout speak makepad-remote (`ssh host makepad remote-relay`)
     Command(Vec<String>),
     /// an endpoint behind a hub (`<host>:<app|pid>`): every channel is the hub's `route` to it
     Routed(Client, String),

@@ -1,4 +1,4 @@
-//! A connection over a pipe pair: this process's own stdin/stdout (`ssh host relax remote-relay`
+//! A connection over a pipe pair: this process's own stdin/stdout (`ssh host makepad remote-relay`
 //! runs the far end), or a child process's.
 
 use super::Carrier;

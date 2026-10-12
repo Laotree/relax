@@ -1,4 +1,4 @@
-//! The `cmd` service: the inspect line protocol of `relax inspect` and native apps. One request per
+//! The `cmd` service: the inspect line protocol of `makepad inspect` and native apps. One request per
 //! DATA message (a message may hold several lines); the answer is JSON lines sent as DATA, ending
 //! with an `end` line. The host plugs in `dispatch`. Several cmd channels run at once, one thread
 //! each. `Req`, `Out`, `answer` and the size limit are the inspect protocol's own, unchanged.
@@ -20,7 +20,7 @@ pub fn now_ms() -> u64 {
 }
 
 /// Answers one request line in memory: the reply's JSON lines (no `end` line) and whether it was
-/// cut at the size limit. For hosts that call a program's commands directly (`relax inspect`).
+/// cut at the size limit. For hosts that call a program's commands directly (`makepad inspect`).
 pub fn answer(dispatch: fn(&Req, &mut Out), line: &str) -> (Vec<u8>, bool) {
     let mut buf: Vec<u8> = Vec::new();
     let truncated = answer_to(dispatch, line, &mut buf);

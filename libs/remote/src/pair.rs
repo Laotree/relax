@@ -31,7 +31,7 @@ pub fn pair(name: &str, hub: &str, delivery: Delivery) -> io::Result<String> {
     registry.set(Host { name: name.to_string(), via: Via::Dial { key: key.to_hex(), fingerprint: fp.clone() } });
     registry.save(&path)?;
     let key_text = key_file_text(&[key]);
-    let dial = |key_file: &str| format!("relax remote-relay --name {name} --dial {hub} --key-file {key_file} --fingerprint {fp}");
+    let dial = |key_file: &str| format!("makepad remote-relay --name {name} --dial {hub} --key-file {key_file} --fingerprint {fp}");
     match delivery {
         Delivery::Print => {
             let file = format!("~/.config/makepad/remote/{name}.key");
@@ -68,7 +68,7 @@ pub fn pair(name: &str, hub: &str, delivery: Delivery) -> io::Result<String> {
 }
 
 fn dial_with(name: &str, hub: &str, key_file: &str, fp: &str) -> String {
-    format!("relax remote-relay --name {name} --dial {hub} --key-file {key_file} --fingerprint {fp}")
+    format!("makepad remote-relay --name {name} --dial {hub} --key-file {key_file} --fingerprint {fp}")
 }
 
 fn run(c: &mut Command) -> io::Result<()> {

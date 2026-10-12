@@ -1,5 +1,5 @@
 //! Driving an app's remote commands from a command line: `makepad-remote app <pid|app|socket>
-//! <command> [k=v ...]` and `relax inspect <pid> <command> ...` are two front ends that only
+//! <command> [k=v ...]` and `makepad inspect <pid> <command> ...` are two front ends that only
 //! parse argv and call [`run`]. Every command is a `cmd` request; the ones that are images are
 //! answered here, client side, from the `frames` service, and the client writes the PNG files
 //! (default folder `$TMPDIR/makepad-remote/<app>-<pid>/`) and prints their paths:

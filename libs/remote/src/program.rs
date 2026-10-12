@@ -1,6 +1,6 @@
 //! Services a program registers on its process's endpoint through a C ABI: the same three
 //! functions whether the endpoint is the process's own (a native app, makepad-platform) or the
-//! Relax host's (a program under `relax run`). One channel = one producer: `open` gets the OPEN
+//! Relax host's (a program under `makepad run`). One channel = one producer: `open` gets the OPEN
 //! arguments and a sink, answers through the sink and ends the channel with its last sink call;
 //! `close` tells the producer the client went away.
 

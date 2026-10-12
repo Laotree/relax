@@ -1,4 +1,4 @@
-//! The hub: the dev-side router behind `relax inspect <host>:<app> ...`. It holds one link per
+//! The hub: the dev-side router behind `makepad inspect <host>:<app> ...`. It holds one link per
 //! host of the registry (an ssh child running `remote-relay`, or the TCP connection a paired
 //! device dialled in) and routes channels over them. A client opens the hub's `route` service
 //! with `<host>[:<app|pid>[#pid]] <service> [args]`; the hub opens the same service on the far
@@ -90,7 +90,7 @@ impl HostLink {
                 return Ok(c);
             }
             if Instant::now() >= end {
-                return Err(Error::LinkLost(format!("host `{}` is not connected: it dials in (run `relax remote-relay --dial ...` there)", self.host.name)));
+                return Err(Error::LinkLost(format!("host `{}` is not connected: it dials in (run `makepad remote-relay --dial ...` there)", self.host.name)));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -194,7 +194,7 @@ impl Hub {
             let Some(owner) = owner else { return conn.close("this key belongs to no host of the registry") };
             let claimed = conn.peer().name.clone();
             if claimed != owner.name {
-                eprintln!("relax hub: a peer with the key of `{}` claimed to be `{claimed}`: refused", owner.name);
+                eprintln!("makepad hub: a peer with the key of `{}` claimed to be `{claimed}`: refused", owner.name);
                 return conn.close(&format!("this key was paired for `{}`, not `{claimed}`", owner.name));
             }
             hub.bind_link(&owner.name, conn);
@@ -483,13 +483,13 @@ fn serve_locked(hosts: Hosts, listen: Option<&str>) -> io::Result<()> {
     crate::carrier::unix::listen_at(&ep, &socket_path())?;
     if let Some(addr) = listen {
         if hosts.dial_keys().is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no paired dial host in the registry: run `relax remote pair <name>` first"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "no paired dial host in the registry: run `makepad remote pair <name>` first"));
         }
         let identity = makepad_network::tls::TlsIdentity::load_or_create(&crate::hosts::identity_dir(), "makepad-remote hub")?;
         let fp = identity.fingerprint_hex();
         let source: Arc<dyn Fn() -> Hosts + Send + Sync> = Arc::new(|| Hosts::load(&crate::hosts::registry_path()).unwrap_or_default());
         let bound = hub.listen_dial(addr, identity, source)?;
-        eprintln!("relax hub: listening on {bound}, identity {fp}");
+        eprintln!("makepad hub: listening on {bound}, identity {fp}");
     }
     let mut idle_since = Instant::now();
     loop {
@@ -516,7 +516,7 @@ pub fn connect(start: Option<&std::path::Path>) -> Result<Client, String> {
     if client.conn().is_ok() {
         return Ok(client);
     }
-    let exe = start.ok_or_else(|| "no relax hub is running".to_string())?;
+    let exe = start.ok_or_else(|| "no makepad hub is running".to_string())?;
     let log = std::fs::File::create(log_path()).map_err(|e| format!("cannot write {}: {e}", log_path().display()))?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
     Command::new(exe).arg("hub").stdin(Stdio::null()).stdout(log).stderr(log2).process_group(0).spawn().map_err(|e| format!("cannot start `{} hub`: {e}", exe.display()))?;
@@ -527,7 +527,7 @@ pub fn connect(start: Option<&std::path::Path>) -> Result<Client, String> {
             return Ok(client);
         }
     }
-    Err(format!("the relax hub did not come up (see {})", log_path().display()))
+    Err(format!("the makepad hub did not come up (see {})", log_path().display()))
 }
 
 /// Opens `service` on `target` through the hub, sends `line`, and gives `each` every answer line

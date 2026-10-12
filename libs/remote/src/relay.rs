@@ -1,4 +1,4 @@
-//! The relay: what runs on a remote box (`ssh <host> relax remote-relay`, or `--dial` to a hub)
+//! The relay: what runs on a remote box (`ssh <host> makepad remote-relay`, or `--dial` to a hub)
 //! so the hub can reach the box's endpoints. It is an [`Endpoint`] serving, over the one link:
 //!
 //! - `list`: the box's endpoints from its discovery files, one JSON line each;
@@ -26,7 +26,7 @@ use std::time::Duration;
 pub struct Config {
     /// the endpoint name the relay reports in its hello (the host name for a dial relay)
     pub name: String,
-    /// the launcher's argv before the app, e.g. `["[path]/bin/relax", "run"]`
+    /// the launcher's argv before the app, e.g. `["[path]/bin/makepad", "run"]`
     pub launch: Vec<String>,
     /// environment of launched sessions (hidden windows, muted audio)
     pub env: Vec<(String, String)>,
@@ -361,7 +361,7 @@ fn kill(_: &State, _: u32, out: &mut Vec<String>) {
 #[cfg(unix)]
 fn relaunch(st: &State, pid: u32, out: &mut Vec<String>) {
     // A Relax process keeps its endpoint, window and device. Never signal or replace it.
-    // The configured `relax run` launcher is also authoritative before discovery starts.
+    // The configured `makepad run` launcher is also authoritative before discovery starts.
     // An unavailable inspect endpoint must never turn a warm relaunch into a process kill.
     if st.cfg.launch.get(1).is_some_and(|arg| arg == "run")
         || crate::discovery::apps().iter().any(|a| a.pid == pid && a.text("relax").is_some())

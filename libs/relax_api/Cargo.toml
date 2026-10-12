@@ -12,5 +12,5 @@ repository = "https://github.com/makepad/makepad/"
 makepad-relax-api-macro = { path = "macro", version = "1.0.0" }
 
 [features]
-# entries(): the table reader (only the `relax` loader enables it)
+# entries(): the table reader (only the `makepad` loader enables it)
 host-shims = []
