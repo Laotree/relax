@@ -40,15 +40,8 @@ fn std_digest(dir: &Path) -> String {
 }
 
 fn main() {
-    // Windows: Relax runs the program's main on the process's main thread; give it the 8 MiB
-    // macOS and Linux main threads have (a PE's default reserve is 1-2 MiB)
-    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
-            println!("cargo:rustc-link-arg-bins=/STACK:8388608");
-        } else {
-            println!("cargo:rustc-link-arg-bins=-Wl,--stack,8388608");
-        }
-    }
+    // (the Windows main-thread stack is the `makepad` binary's: tools/run/build.rs; a library
+    // has no bin to give link args to)
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../build_stamp.rs");
     let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());

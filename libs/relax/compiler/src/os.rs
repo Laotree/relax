@@ -29,4 +29,4 @@ pub mod thread;
 pub mod tls;
 #[cfg(windows)]
 #[path = "os/win32.rs"]
-mod win32;
+pub(crate) mod win32;
