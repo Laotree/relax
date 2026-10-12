@@ -12,7 +12,10 @@
 //! Readers take a shared lock, copy the active slot's index and map the file; payloads below a
 //! committed data end never change. A writer (exclusive lock) appends payloads past data end,
 //! writes the merged index into the inactive slot, then flips the header: a crash leaves the old
-//! header and index valid. When the merged index does not fit a slot, or dead bytes outgrow a
+//! header and index valid. Crash safety is ordering, not durability (the stores are a rebuildable
+//! cache: a lost commit is a cache miss): readers do not checksum payloads, so the payloads must
+//! reach the disk before a header that commits them -- one write barrier (`order_writes`) between
+//! them. The index and header carry checksums, so a torn index or header only invalidates the store. When the merged index does not fit a slot, or dead bytes outgrow a
 //! quarter of the live ones (or the store is stale), the store is rewritten whole as its next generation.
 //! The newest entry of a key wins.
 //!
@@ -635,17 +638,36 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool) -> s
     crate::memstat::print_tag("cache append", crate::memstat::Tag::CacheStore);
     let ib = encode_index(&ix);
     let next = 1 - h.active;
-    f.sync_data()?;
+    // the payloads before the index and header that commit them; nothing after the header (a
+    // commit lost to a power cut is a cache miss, and other processes read the page cache)
+    order_writes(&f)?;
     f.seek(SeekFrom::Start(h.slot_off(next)))?;
     f.write_all(&ib)?;
-    f.sync_data()?;
     let mut nh = Header { active: next, cap: h.cap, slots: h.slots };
     nh.slots[next as usize] = (ix.len() as u64, off, sum64(&ib));
     f.seek(SeekFrom::Start(0))?;
     f.write_all(&nh.bytes())?;
-    f.sync_data()?;
     let _ = f.unlock();
     Ok(())
+}
+
+/// Makes the bytes written to `f` so far reach the disk before anything written after: an
+/// ordering barrier, not a durability flush. macOS: `F_BARRIERFSYNC` -- std's `sync_data` is
+/// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a cold Stage launch made ~3.7k
+/// of them); elsewhere (and where the barrier is refused) `sync_data`.
+fn order_writes(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_vendor = "apple")]
+    {
+        use std::os::fd::AsRawFd;
+        extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        }
+        const F_BARRIERFSYNC: i32 = 85;
+        if unsafe { fcntl(f.as_raw_fd(), F_BARRIERFSYNC) } != -1 {
+            return Ok(());
+        }
+    }
+    f.sync_data()
 }
 
 /// Writes a fresh store with the live entries of `old` (read from `from`) plus `entries`, to a temp
@@ -694,6 +716,9 @@ fn rewrite<T: Entry>(base: &Path, dir: &Path, old: Vec<Ix>, from: Option<&std::f
         h.slots[0] = (ix.len() as u64, off, sum64(&ib));
         out.seek(SeekFrom::Start(h.slot_off(0)))?;
         out.write_all(&ib)?;
+        // the payloads before the header that commits them (as `append`)
+        out.flush()?;
+        order_writes(out.get_ref())?;
         out.seek(SeekFrom::Start(0))?;
         out.write_all(&h.bytes())?;
         out.flush()?;
@@ -833,7 +858,8 @@ impl RunStore {
         };
         ix.sort_by_key(|e| e.key);
         ix.dedup_by_key(|e| e.key);
-        self.file.sync_data()?;
+        // the payloads before the index and header that commit them (see `append`)
+        order_writes(&self.file)?;
         let ib = encode_index(&ix);
         let next = 1 - active;
         let mut h = Header { active: next, cap: self.cap, slots: [(0, 0, 0); 2] };
@@ -841,8 +867,7 @@ impl RunStore {
         self.file.lock()?;
         let r = (|| {
             write_at(&self.file, &ib, h.slot_off(next))?;
-            write_at(&self.file, &h.bytes(), 0)?;
-            self.file.sync_data()
+            write_at(&self.file, &h.bytes(), 0)
         })();
         let _ = self.file.unlock();
         r?;
