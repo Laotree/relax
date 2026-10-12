@@ -220,8 +220,8 @@ impl CfgSet {
                 v.push((format!("CARGO_CFG_{}", flag.to_uppercase()), String::new()));
             }
         }
-        // cargo gives a build script every `--cfg` of RUSTFLAGS the same way: `CARGO_CFG_HAL`
-        // (empty) for `--cfg hal`, `CARGO_CFG_KEY=value` for `--cfg key="value"` (several
+        // cargo gives a build script every `--cfg` of RUSTFLAGS the same way: `CARGO_CFG_CUSTOM`
+        // (empty) for `--cfg custom`, `CARGO_CFG_KEY=value` for `--cfg key="value"` (several
         // values of one key are joined by commas)
         for e in &self.session.options.cfgs {
             let (k, val) = e.split_once('=').unwrap_or((e.as_str(), ""));
@@ -434,7 +434,6 @@ pub fn attrs_before(p: Src, mut i: usize, cfg: &CfgSet) -> Vec<Attr> {
     attrs.reverse();
     expand_cfg_attr_list(p, &attrs, cfg)
 }
-
 
 /// `cfg!(pred)`: the predicate in tokens [lo, hi).
 pub fn eval_tokens(p: Src, lo: usize, hi: usize, cfg: &CfgSet) -> bool {

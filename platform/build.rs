@@ -146,32 +146,21 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
-    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
+    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
     // Every variable declared here rebuilds this crate and everything that
     // depends on it (draw, widgets, every app) when its value changes: keep
     // per-app inputs out (see src/app_meta.rs). MAKEPAD selects build options
-    // for the remaining mobile backends and diagnostics;
+    // for bundle packaging and diagnostics;
     // words that only concern a crate further up belong in a variable of
     // that crate's own.
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
-
-    // Apple targets (macOS, iOS, tvOS) and desktop Linux always use the HAL. Linux shell
-    // selection (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
-    let desktop_linux = target_os == "linux";
-    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android" | "windows") || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
-    if hal {
-        println!("cargo:rustc-cfg=hal");
-    }
 
     if let Ok(configs) = env::var("MAKEPAD") {
         for config in configs.split(['+', ',']) {
             match config {
                 "lines" => println!("cargo:rustc-cfg=lines"),
                 "apple_bundle" => println!("cargo:rustc-cfg=apple_bundle"),
-                "gpusim" => println!("cargo:rustc-cfg=gpusim"),
-                "use_gles_3" if !desktop_linux => println!("cargo:rustc-cfg=use_gles_3"),
-                "vulkan" | "use_vulkan" if !desktop_linux => println!("cargo:rustc-cfg=use_vulkan"),
                 _ => {}
             }
         }
@@ -188,9 +177,6 @@ fn main() {
             if target == "aarch64-apple-tvos-sim" {
                 println!("cargo:rustc-cfg=apple_sim");
             }
-        }
-        "android" => {
-            println!("cargo:rustc-cfg=use_gles_3");
         }
         _ => (),
     }

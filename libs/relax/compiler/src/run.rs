@@ -184,7 +184,6 @@ pub fn load_check_session(sess: &std::sync::Arc<crate::Session>, args: &[String]
     session.ok_or_else(|| format!("check could not load or initialize the package (status {})", code))
 }
 
-
 /// Who asks for a package's crate list: the boot of a run, or a domain started into a running
 /// unit (domain.rs `start`). The domain's graph is registered with the macro host additively and
 /// binds no provided crate (the unit's are bound).
@@ -457,7 +456,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         && !crate::vfs::is_virtual(&workspace_dir()) {
         driver_options.live = true;
     }
-    // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg hal`) or
+    // `--cfg <name>` / `--cfg=<name>` among the cargo flags (`makepad run <pkg> --cfg custom`) or
     // before the package: extra cfgs for the program's crates, not cargo flags
     let mut cargo_flags_in: Vec<String> = Vec::new();
     // `--domain <package>` (a test vehicle, any number): once the program has presented its first
@@ -2294,7 +2293,6 @@ fn exit_report() {
     let parts: Vec<String> = marks.iter().skip(1).map(|&(n, t)| { let d = t.saturating_sub(prev); prev = t; format!("{}={:.1}", n.replace(' ', "_"), d as f64 / 1e6) }).collect();
     eprintln!("makepad-run exit: total_ms={:.1} {} (thread {:?}, t={:.0} ms)", prev.saturating_sub(t0) as f64 / 1e6, parts.join(" "), std::thread::current().name().unwrap_or("?"), crate::clock::ms_since_start());
 }
-
 
 /// The boot's collected program is restored or recorded: neither the mid-run writes nor the
 /// exit encode it again. Runtime additions use zone_swap's separate image. Encoding it took
