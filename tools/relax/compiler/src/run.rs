@@ -2037,8 +2037,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     }
                 }
             }
-            // Swap after each compile burst or domain first frame settles and the boot image
-            // is current; the swap records any runtime additions in its own entry.
+            // One swap per first frame (the run's, then each domain's) once the compiles after it
+            // have settled; a later compile burst (tier-up) does not swap again: each swap stalls
+            // the compile gate for 0.3-0.6 s and the zone grown by tier-up is small.
             // Startup teardown must have been scheduled before the swap can quiesce its work.
             let settled = settle_watch.settled.filter(|&n| n == jit::COMPILED_FNS.load(Ordering::Relaxed));
             if settled.is_some() && swap_round != settled {
@@ -2047,7 +2048,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 swap_next = Instant::now();
                 swap_wait_said = "";
             }
-            let swap_block: Option<&'static str> = if swap_over || (settled.is_some() && swap_done == settled) || Instant::now() < swap_next { Some("") }
+            let swap_block: Option<&'static str> = if swap_over || swap_done.is_some() || Instant::now() < swap_next { Some("") }
                 else if settled.is_none() { Some(settle_note) }
                 else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
                 else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
