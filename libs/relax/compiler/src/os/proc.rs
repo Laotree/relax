@@ -226,6 +226,8 @@ mod imp {
     static POOL: relax_session::sync::Mutex<Option<Pool>> = relax_session::sync::Mutex::new(None);
 
     pub fn set_trampolines(base: u64, table: *mut u64, count: usize) {
+        // process state: kept heap (the settle swap destroys the compiler zone)
+        let _k = crate::zone_alloc::kept();
         *POOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pool { base, table, count, used: std::collections::HashMap::new() });
     }
 
@@ -238,6 +240,10 @@ mod imp {
         if let Some(&a) = pool.used.get(&target) {
             return a;
         }
+        // called while compiling (c_callable_hook): the map is process state, so its growth goes
+        // to the kept heap -- in the compiler zone it was gone after the settle swap and the
+        // first new C callback (a touch handler on the phone) faulted
+        let _k = crate::zone_alloc::kept();
         let i = pool.used.len();
         assert!(i < pool.count, "the host library's {} C-callable stubs are all in use", pool.count);
         unsafe { *pool.table.add(i) = target };
@@ -291,6 +297,7 @@ mod imp {
         unsafe {
             let h = dlopen(path.as_ptr(), 2 | 0x100);
             if !h.is_null() {
+                let _k = crate::zone_alloc::kept();
                 let mut l = LOADED.lock().unwrap_or_else(|e| e.into_inner());
                 if !l.contains(&(h as usize)) {
                     l.push(h as usize);
