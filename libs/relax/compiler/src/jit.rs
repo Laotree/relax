@@ -1120,7 +1120,7 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
         eprintln!("makepad: {} ({}, address {:#x}) in program code on thread '{}' at {}: the process ends (the fault may be the program's or a Relax miscompile; a crash report follows)\n  report: {}", info.kind, label, info.fault_addr, tname, at, r);
         return true;
     }
-    let note = format!("state may be corrupt after a {} at {:#x} on thread '{}' in {} (the frames it unwound ran no cleanups); restart recommended", info.kind, info.fault_addr, tname, at);
+    let note = crate::zone_alloc::kept_with(|| format!("state may be corrupt after a {} at {:#x} on thread '{}' in {} (the frames it unwound ran no cleanups); restart recommended", info.kind, info.fault_addr, tname, at));
     eprintln!("makepad: POISONED: {}", note);
     if let Ok(mut g) = POISONED.lock() {
         if g.is_none() {
@@ -3791,7 +3791,7 @@ impl Unit {
             // again into the same storage (its symbol already names that address)
             if DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).remove(&d.0) {
                 if self.run_init(d, Vec::new(), a).is_none() {
-                    if DEFERRED_ABORT.with(|f| f.get()) { DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0); }
+                    if DEFERRED_ABORT.with(|f| f.get()) { crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0)); }
                     return a;
                 }
                 let sym = self.syms.intern(crate::syms::SymKind::Static(d), a);
@@ -3827,7 +3827,7 @@ impl Unit {
             // needs a skipped module: evaluated again (same storage) once the outer compile
             // loaded it; the build using it fails meanwhile (DEFERRED_ABORT)
             if DEFERRED_ABORT.with(|a| a.get()) {
-                DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0);
+                crate::zone_alloc::kept_with(|| DEFERRED_STATICS.lock().unwrap_or_else(|e| e.into_inner()).insert(d.0));
                 return buf;
             }
             crate::zone_alloc::kept_with(|| self.statics.insert(d, 0));
@@ -4406,18 +4406,18 @@ pub fn watchdog(ms: u64) -> u64 {
         });
         }
     });
-    let call = std::sync::Arc::new(WatchdogCall {
+    let call = crate::zone_alloc::kept_with(|| std::sync::Arc::new(WatchdogCall {
         token: WATCHDOG_ID.fetch_add(1, Ordering::Relaxed),
         target: os::thread::current(),
         deadline: if ms == 0 { None } else { std::time::Instant::now().checked_add(std::time::Duration::from_millis(ms)) },
         parent: WATCHDOG_STACK.with(|s| s.borrow().last().cloned()),
         hit: AtomicBool::new(false),
-    });
+    }));
     let token = call.token;
     WATCHDOG_STACK.with(|s| s.borrow_mut().push(call.clone()));
     WATCHDOG_CURRENT.with(|c| c.set(std::sync::Arc::as_ptr(&call)));
     if call.deadline.is_some() {
-        WATCHDOG_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push(call);
+        crate::zone_alloc::kept_with(|| WATCHDOG_CALLS.lock().unwrap_or_else(|e| e.into_inner()).push(call));
         WATCHDOG_WAKE.notify_one();
     }
     token
@@ -4576,7 +4576,7 @@ pub fn is_realtime_thread() -> bool {
         return true;
     }
     static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| std::env::var("RELAX_RT_THREADS").map(|v| v.split(',').filter(|n| !n.is_empty()).map(|n| n.to_string()).collect()).unwrap_or_default());
+    let names = NAMES.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_RT_THREADS").map(|v| v.split(',').filter(|n| !n.is_empty()).map(|n| n.to_string()).collect()).unwrap_or_default()));
     if names.is_empty() {
         return false;
     }
@@ -5426,7 +5426,7 @@ fn dump_rir_match(name: &str, w: &str) -> bool {
 
 fn debug_env() -> &'static (Option<String>, Option<String>) {
     static E: std::sync::OnceLock<(Option<String>, Option<String>)> = std::sync::OnceLock::new();
-    E.get_or_init(|| (std::env::var("RELAX_DUMP_RIR").ok(), std::env::var("RELAX_INL_TRACE").ok()))
+    E.get_or_init(|| crate::zone_alloc::kept_with(|| (std::env::var("RELAX_DUMP_RIR").ok(), std::env::var("RELAX_INL_TRACE").ok())))
 }
 
 /// Bisection knobs for the block-order passes (relayout, rotate_loops): RELAX_NO_LAYOUT_FN=<pats>
@@ -5825,7 +5825,7 @@ unsafe fn base_sampled(up: *mut Unit, id: u32) {
     {
         let mut g = BASE.lock().unwrap_or_else(|e| e.into_inner());
         if !g.released {
-            g.hit.push((up as usize, id));
+            crate::zone_alloc::kept_with(|| g.hit.push((up as usize, id)));
             return;
         }
     }
@@ -5932,7 +5932,7 @@ unsafe fn o2_begin(up: *mut Unit, id: u32) -> Option<O2Work> {
     }
     if snapshot && (f.building || f.inflight || f.rir.as_ref().map_or(true, |r| r.full)) {
         // no RIR to copy yet (or a build open): its full build after the present
-        O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id));
+        crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
         return None;
     }
     // its back end runs off the unit for a lazy compile now: that build first (its finish is
@@ -6048,7 +6048,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     };
     let u = &mut *up;
     if snapshot {
-        O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id));
+        crate::zone_alloc::kept_with(|| O2_LATER.lock().unwrap_or_else(|e| e.into_inner()).push((up as usize, id)));
     } else if let Some(mut cache) = u.cache.take() {
         cache.record_o2(u, id, &c.code, &c.relocs, &c.pc_map);
         u.cache = Some(cache);
@@ -6540,7 +6540,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
     std::panic::set_hook(Box::new(|info| {
         if let Some(l) = info.location() {
             if let Ok(mut g) = ICE_AT.lock() {
-                *g = format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line());
+                *g = crate::zone_alloc::kept_with(|| format!("{}:{}", l.file().rsplit('/').next().unwrap_or(""), l.line()));
             }
         }
     }));
@@ -7199,6 +7199,7 @@ pub fn compile_watch(what: Option<(&str, usize)>) {
         let mut g = WATCH.lock().unwrap_or_else(|e| e.into_inner());
         match what {
             Some((name, insts)) => {
+                let _k = crate::zone_alloc::kept();
                 WATCH_STEPS.fetch_add(1, Ordering::Relaxed);
                 let e = (name.to_string(), insts, std::time::Instant::now(), os::thread::current());
                 match g.iter_mut().find(|x| x.0 == me) {
@@ -7412,6 +7413,7 @@ fn trace_on() -> bool {
 fn trace(phase: &str, name: &str) {
     static SPEC: std::sync::OnceLock<Vec<(String, String)>> = std::sync::OnceLock::new();
     let spec = SPEC.get_or_init(|| {
+        let _k = crate::zone_alloc::kept();
         let mut v = Vec::new();
         if let Ok(s) = std::env::var("RELAX_TRACE") {
             for part in s.split(',') {
@@ -7504,7 +7506,7 @@ unsafe fn build_rir_inner(up: *mut Unit, id: u32) -> Result<crate::rir::Func, St
                 // keyed by the outermost build of this thread: its compile loads them
                 let key = BUILD_STACK.try_with(|s| s.borrow().first().copied()).ok().flatten().unwrap_or(id);
                 let mut g = DEFERRED_MISSING.lock().unwrap_or_else(|e| e.into_inner());
-                for m in missing { let m = (key, m); if !g.contains(&m) { g.push(m); } }
+                for m in missing { let m = (key, m); if !g.contains(&m) { crate::zone_alloc::kept_with(|| g.push(m.clone())); } }
                 Err(format!("{DEFERRED_RETRY}: {e}"))
             }
         }
@@ -8385,6 +8387,7 @@ pub(crate) const SAMPLE_MS: u64 = 2;
 pub(crate) fn sample_periods() -> &'static [u64] {
     static PERIODS: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     PERIODS.get_or_init(|| {
+        let _k = crate::zone_alloc::kept();
         std::env::var("RELAX_SAMPLE_MS").ok().and_then(|s| {
             s.split(',').map(|v| v.trim().parse::<u64>().ok()
                 .filter(|v| (1..=1000).contains(v))).collect::<Option<Vec<_>>>()
@@ -8445,7 +8448,7 @@ fn sample_trace() -> bool {
 /// (tools: bench_rt/asmdiff.py)
 fn dump_base(name: &str) -> Option<String> {
     static DUMP: std::sync::OnceLock<Option<(Vec<String>, String)>> = std::sync::OnceLock::new();
-    let (wants, dir) = DUMP.get_or_init(|| std::env::var("RELAX_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("RELAX_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string())))).as_ref()?;
+    let (wants, dir) = DUMP.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_DUMP").ok().map(|w| (w.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect(), std::env::var("RELAX_DUMP_DIR").unwrap_or_else(|_| "/tmp".to_string()))))).as_ref()?;
     let w = wants.iter().find(|w| name.ends_with(w.as_str()))?;
     Some(format!("{}/relax_dump_{}", dir, w.replace("::", "_")))
 }
@@ -8470,7 +8473,7 @@ fn dump_o1(func: &crate::rir::Func, c: &x64::Compiled) {
 /// A profile of steady-state hot code for the asm-diff ranking (bench_rt/rank.py), not a timing.
 fn profile_path() -> Option<&'static str> {
     static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    P.get_or_init(|| std::env::var("RELAX_PROFILE").ok().filter(|s| !s.is_empty())).as_deref()
+    P.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_PROFILE").ok().filter(|s| !s.is_empty()))).as_deref()
 }
 
 /// RELAX_PROFILE_FROM_MS=<ms>: count samples only after that long since the first sample (steady state of
@@ -8570,9 +8573,10 @@ fn pc_source_pos(u: &Unit, pc: u64) -> Option<u64> {
 /// site's source line. A measurement of how scattered hot fields are (no timing, no counters).
 pub fn field_prof_on() -> bool {
     static E: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    E.get_or_init(|| std::env::var("RELAX_FIELD_PROF").ok().filter(|s| !s.is_empty())).is_some()
+    E.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_FIELD_PROF").ok().filter(|s| !s.is_empty()))).is_some()
 }
 
+#[derive(Clone)]
 pub struct FieldSite {
     pub func: String,
     pub file: u32,
@@ -8595,9 +8599,10 @@ static FIELD_SITES: relax_session::sync::Mutex<Option<std::collections::HashMap<
 static FIELD_HIST: relax_session::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = relax_session::sync::Mutex::new(None);
 
 pub fn field_note(s: FieldSite) {
+    let _k = crate::zone_alloc::kept();
     let mut g = FIELD_SITES.lock().unwrap();
     let m = g.get_or_insert_with(std::collections::HashMap::new);
-    m.entry((s.func.clone(), s.ty.clone(), s.field, s.file, s.line_lo)).or_insert(s);
+    m.entry((s.func.clone(), s.ty.clone(), s.field, s.file, s.line_lo)).or_insert_with(|| s.clone());
 }
 
 fn field_prof_write() {
@@ -8777,6 +8782,7 @@ fn sampler_thread() {
         }
         if profile_path().is_some() && !selfs.is_empty() && profile_started() && !TIER_STOP.load(Ordering::SeqCst) {
             owner::call_within(owner::Class::Background, 0, || {
+                let _k = crate::zone_alloc::kept();
                 let up = unsafe { UNIT };
                 if !up.is_null() {
                     let u = unsafe { &*up };
@@ -8965,6 +8971,7 @@ static TRACE_BUILDS: relax_session::sync::Mutex<std::collections::BTreeMap<u32, 
 fn trace_build(u: &Unit, id: u32, what: &str, build_ns: u64) {
     let (why, at) = TRACE_WHY.lock().unwrap().remove(&id).unwrap_or((255, 0));
     let n = {
+        let _k = crate::zone_alloc::kept();
         let mut b = TRACE_BUILDS.lock().unwrap();
         let n = b.entry(id).or_insert(0);
         *n += 1;
@@ -9160,7 +9167,7 @@ impl Tier1Active {
         let waited = wall_ns().saturating_sub(queued_at);
         let mut g = TIER1_STATS.lock().unwrap();
         let s = g.get_or_insert_with(Tier1Stats::default);
-        s.waits.push(waited);
+        crate::zone_alloc::kept_with(|| s.waits.push(waited));
         s.active += 1;
         s.max_active = s.max_active.max(s.active);
         Self
@@ -9213,7 +9220,7 @@ impl Drop for Tier1Measure {
         for i in 0..16 { s.passes[i] += self.passes[i]; }
         if self.installed {
             let bucket = (wall_ns() / 1_000_000_000) as usize;
-            s.installs.resize(s.installs.len().max(bucket + 1), 0);
+            crate::zone_alloc::kept_with(|| s.installs.resize(s.installs.len().max(bucket + 1), 0));
             s.installs[bucket] += 1;
         }
     }
@@ -9557,7 +9564,7 @@ fn tier1_thread(runtime: &crate::options::RuntimeOptions, k: usize, normal: usiz
         };
         let _active = TierActive(id);
         if tier1_trace() {
-            TRACE_WHY.lock().unwrap().insert(id, (why, queued_at));
+            crate::zone_alloc::kept_with(|| TRACE_WHY.lock().unwrap().insert(id, (why, queued_at)));
             eprintln!("O3p @{:.6} #{} worker={} phase=popped ready={} startup={} last_compile={:.6} demand={} last_demand={:.6}", wall_ns() as f64 / 1e9, id, k, tier1_workers_ready(), STARTUP_COMPILES.load(Ordering::SeqCst), COMPILE_LAST.load(Ordering::SeqCst) as f64 / 1e9, DEMAND_COMPILES.load(Ordering::SeqCst), DEMAND_LAST.load(Ordering::SeqCst) as f64 / 1e9);
         }
         let up = TIER_UNIT.load(Ordering::Acquire);
@@ -9618,6 +9625,7 @@ static T1PROF: relax_session::sync::Mutex<Option<T1Profile>> = relax_session::sy
 fn t1prof_on(options: &crate::options::Options) -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *E.get_or_init(|| {
+        let _k = crate::zone_alloc::kept();
         let Some(p) = options.tier1_profile.as_ref().and_then(|p| p.to_str()) else { return false };
         let p = p.to_string();
         let mut map = std::collections::HashMap::new();
@@ -9725,7 +9733,7 @@ fn t1prof_replay(options: &crate::options::Options) -> bool {
 
 fn t1prof_divergence(kind: &str, key: &str) {
     if let Some(p) = T1PROF.lock().unwrap().as_mut() {
-        p.differ.push(format!("{} {}", kind, key));
+        crate::zone_alloc::kept_with(|| p.differ.push(format!("{} {}", kind, key)));
     }
 }
 
@@ -9803,6 +9811,7 @@ static CHURN_QUEUED_AT: relax_session::sync::Mutex<Option<std::collections::Hash
 
 fn churn_queued(id: u32) {
     if churn_on() {
+        let _k = crate::zone_alloc::kept();
         let mut g = CHURN_QUEUED_AT.lock().unwrap();
         g.get_or_insert_with(std::collections::HashMap::new).entry(id).or_insert_with(std::time::Instant::now);
     }
@@ -9815,7 +9824,7 @@ unsafe fn churn_note(up: *mut Unit, id: u32, ns: u64, installed: bool) {
     let mut c = CHURN.lock().unwrap();
     let now = std::time::Instant::now();
     let start = *c.start.get_or_insert(now);
-    let e = c.per.entry(id).or_insert((0, 0, 0));
+    let e = crate::zone_alloc::kept_with(|| c.per.entry(id).or_insert((0, 0, 0)));
     e.0 += 1;
     e.1 += ns;
     if installed {
@@ -10300,6 +10309,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             // the optimised RIR (normalised) and the code size: code bytes hold slot numbers that
             // differ between runs
             let code = t1_norm_hash(&func) ^ (c.text_len as u64).rotate_left(48);
+            let _k = crate::zone_alloc::kept();
             let mut g = T1PROF.lock().unwrap();
             let p = g.as_mut().unwrap();
             match p.map.get(k) {
@@ -10308,7 +10318,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 _ => {}
             }
             if !p.replay {
-                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq), input, code });
+                profile_entry = Some(T1Entry { cold: t1_cold_keys.clone(), snap: t1_snap_keys.clone(), single: t1_single_keys.clone(), freq: freq.clone(), inline_freq: Some(inline_freq.clone()), input, code });
             }
         }
         note_frame(id, c.frame_size, slot_bytes(&func), true);
@@ -10483,7 +10493,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // Publish only installed builds. A rejected/stale build must not
                 // replace the profile of the code the program actually executes.
                 if let (Some(k), Some(entry)) = (&t1key, profile_entry) {
-                    T1PROF.lock().unwrap().as_mut().unwrap().map.insert(k.clone(), entry);
+                    crate::zone_alloc::kept_with(|| T1PROF.lock().unwrap().as_mut().unwrap().map.insert(k.clone(), entry));
                     t1prof_finish();
                 }
                 // never-run callees kept as calls: rebuilt when one first runs (or already has)
@@ -10509,6 +10519,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // deterministic O3, replay: installed (a build whose install was refused is retried
                 // by the next trigger)
                 if let Some(k) = &t1key {
+                    let _k = crate::zone_alloc::kept();
                     let mut g = T1PROF.lock().unwrap();
                     if let Some(p) = g.as_mut() {
                         if p.replay {
@@ -10659,7 +10670,7 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
     if !startup_phase() {
         return false;
     }
-    q.push((up as usize, id, depth));
+    crate::zone_alloc::kept_with(|| q.push((up as usize, id, depth)));
     true
 }
 
@@ -10768,6 +10779,7 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
         TIER_WAKE.notify_all();
         STARTUP_PHASE.store(0, Ordering::Release);
     };
+    let _k = crate::zone_alloc::kept();
     if std::thread::Builder::new()
         .name("relax-startup".into())
         .spawn(release)
@@ -13130,7 +13142,7 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     if startup_phase() && pipelined() {
         let mut q = STARTUP_CACHED.lock().unwrap();
         if startup_phase() {
-            q.push((up as usize, ids.to_vec(), depth));
+            crate::zone_alloc::kept_with(|| q.push((up as usize, ids.to_vec(), depth)));
             return;
         }
     }

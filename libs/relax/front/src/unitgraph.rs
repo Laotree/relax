@@ -336,7 +336,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
                 ScriptRole::ToRemove => {
                     let mut t = TO_REMOVE.lock().unwrap();
                     if !t.iter().any(|x| x.0 == pname) {
-                        t.push((pname.clone(), bs.src_path.clone()));
+                        crate::zone_alloc::kept_with(|| t.push((pname.clone(), bs.src_path.clone())));
                     }
                 }
                 ScriptRole::Artefact => {}
@@ -490,7 +490,7 @@ static SELF_EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::
 /// process is `app_process64`, and Relax's own executable is the PIE the APK carries next to the
 /// host library.
 pub fn set_self_exe(exe: std::path::PathBuf) {
-    let _ = SELF_EXE.set(exe);
+    let _ = SELF_EXE.set(crate::zone_alloc::kept_clone(&exe));
 }
 
 fn self_exe() -> std::io::Result<std::path::PathBuf> {

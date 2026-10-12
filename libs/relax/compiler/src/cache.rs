@@ -3127,7 +3127,7 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
     };
     let on_main = crate::owner::for_main();
     let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id));
-    TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line);
+    crate::zone_alloc::kept_with(|| TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line));
 }
 
 /// Writes RELAX_CACHE_TRACE (at exit).
@@ -3266,7 +3266,7 @@ impl Cache {
 /// RELAX_CACHE_DUMP=<name substring>: link details of matching entries (read once).
 fn dump_filter() -> Option<&'static str> {
     static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    F.get_or_init(|| std::env::var("RELAX_CACHE_DUMP").ok()).as_deref()
+    F.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_CACHE_DUMP").ok())).as_deref()
 }
 
 fn kind_code(k: RelocKind) -> u8 {

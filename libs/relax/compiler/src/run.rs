@@ -1126,7 +1126,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // after the cache is open: a validated warm start with the program's clean verdict stored skips the check
     jit::start_background_coherence(&u);
     *STARTUP_PATH.lock().unwrap() = crate::zone_alloc::kept_with(|| format!("{}/relax-run/{}.startup", target_dir, package));
-    if let Ok(p) = std::env::var("RELAX_RUN_REPORT") {
+    if let Ok(p) = crate::zone_alloc::kept_with(|| std::env::var("RELAX_RUN_REPORT")) {
         *REPORT_PATH.lock().unwrap() = p;
     }
     if crate::why::enabled() {
@@ -1321,13 +1321,13 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if exports_mode {
         // the exported fns' permanent addresses (lazy stubs: each compiles on its first call, on
         // whatever thread calls it); the unit outlives this call as it does for `main`
-        let mut addrs = Vec::with_capacity(export_defs.len());
+        let mut addrs = crate::zone_alloc::kept_with(|| Vec::with_capacity(export_defs.len()));
         for (name, d) in &export_defs {
             let en = crate::owner::call(crate::owner::Class::App, || {
                 let id = u.fn_id(FnKey::Inst(*d, Vec::new()));
                 u.entry_direct(id)
             });
-            addrs.push((name.clone(), en));
+            crate::zone_alloc::kept_with(|| addrs.push((name.clone(), en)));
         }
         *EXPORTS.lock().unwrap() = addrs;
         // the host calls these from its own threads, not through call_jit
@@ -2261,7 +2261,7 @@ pub(crate) fn exit_mark(name: &'static str) {
         let mut marks = EXIT_MARKS.lock().unwrap_or_else(|e| e.into_inner());
         // a cache flush during the run also marks: the exit's parts start at its own start
         if name == "start" { marks.clear(); }
-        marks.push((name, jit::wall_ns()));
+        crate::zone_alloc::kept_with(|| marks.push((name, jit::wall_ns())));
     }
 }
 fn exit_report() {

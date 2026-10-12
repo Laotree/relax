@@ -30,7 +30,7 @@ static DEFAULT: OnceLock<PathBuf> = OnceLock::new();
 /// The relax dir handed over by a parent run (`makepad run --relax-dir`). Set before anything
 /// asks for relax_dir().
 pub fn set_relax_dir(dir: PathBuf) {
-    let _ = SET.set(dir);
+    let _ = SET.set(crate::zone_alloc::kept_clone(&dir));
 }
 
 /// The workspace: RELAX_WORKSPACE (a git run's virtual folder, vfs.rs; it does not exist on disk,
@@ -51,7 +51,7 @@ pub fn relax_dir() -> PathBuf {
     if let Some(d) = override_dir() {
         return d;
     }
-    DEFAULT.get_or_init(|| relax_dir_for(&workspace_dir())).clone()
+    DEFAULT.get_or_init(|| crate::zone_alloc::kept_with(|| relax_dir_for(&workspace_dir()))).clone()
 }
 
 /// RELAX_CACHE_DIR when set (tests and measurement).

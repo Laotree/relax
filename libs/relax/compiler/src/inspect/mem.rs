@@ -57,6 +57,7 @@ pub fn tick(n: u64, rss: u64) {
     if n % step != 0 {
         return;
     }
+    let _k = crate::zone_alloc::kept();
     let mut r = RING.lock().unwrap_or_else(|e| e.into_inner());
     r.push((now_ms(), rss));
     if r.len() >= RING_MAX {
@@ -70,7 +71,7 @@ pub fn tick(n: u64, rss: u64) {
 pub fn mark(label: &str) {
     let mut m = MARKS.lock().unwrap_or_else(|e| e.into_inner());
     if m.len() < 1024 {
-        m.push((now_ms(), label.to_string()));
+        crate::zone_alloc::kept_with(|| m.push((now_ms(), label.to_string())));
     }
 }
 
@@ -364,12 +365,14 @@ static SNAPS: Mutex<Vec<(String, Snap)>> = Mutex::new(Vec::new());
 const SNAPS_MAX: usize = 32;
 
 fn keep(name: &str, s: Snap) {
+    let _k = crate::zone_alloc::kept();
     let mut v = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
     v.retain(|x| x.0 != name);
     if v.len() >= SNAPS_MAX {
         v.remove(0);
     }
-    v.push((name.to_string(), s));
+    // The snapshot may have been measured in the compiler phase; copy its owned nodes.
+    v.push((name.to_string(), Snap { at_ms: s.at_ms, nodes: s.nodes.clone() }));
 }
 
 /// `memory [compiler=1] [n=24]`: the snapshot as a ranked tree plus findings, and the growth since
