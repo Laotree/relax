@@ -624,12 +624,11 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
             let u = &mut *up;
             if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
         })));
-        // what the evaluation could not build is not the program's error (a foreign static the
-        // check does not link, code the type check reported already): only E0080 stays
+        // a foreign static the check does not link is not the program's error
         let u = unsafe { &mut *up };
         let mut i = before;
         while i < u.errors.len() {
-            if u.errors[i].starts_with("compile error in ") { u.errors.remove(i); } else { i += 1; }
+            if u.errors[i].starts_with("compile error in ") && u.errors[i].contains("not found in the loaded libraries") { u.errors.remove(i); } else { i += 1; }
         }
     }
 }

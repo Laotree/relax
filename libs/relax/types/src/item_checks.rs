@@ -36,6 +36,12 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let name = prog.syms.str(def.name);
         if name == "_" || name.is_empty() { continue; }
+        // a module file configured away by its own inner `#![cfg]` defines nothing
+        if def.kind == DefKind::Mod {
+            let m = &prog.mods[def.sub as usize];
+            let attrs: Vec<crate::ast::Attr> = prog.files[m.file as usize].ast.root_attrs.iter().copied().collect();
+            if m.file != def.file && !prog.active(m.file, &attrs) { continue; }
+        }
         let (ty_ns, value_ns) = namespaces(prog, d);
         for (ns, on) in [(true, ty_ns), (false, value_ns)] {
             if !on { continue; }

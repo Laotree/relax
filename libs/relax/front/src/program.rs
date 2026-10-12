@@ -2351,7 +2351,7 @@ impl Program {
         idx
     }
 
-    fn active(&self, file: u32, attrs: &[Attr]) -> bool {
+    pub fn active(&self, file: u32, attrs: &[Attr]) -> bool {
         let krate = self.file_crate[file as usize];
         crate::cfg::active(self.src(file), attrs, &self.crates[krate as usize].cfg)
     }
