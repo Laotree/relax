@@ -22,7 +22,7 @@
 use super::{json_str, now_ms, Out, Req};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering::{AcqRel, Acquire, Relaxed, Release}};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 // ------------------------------------------------------------------ veneers and entry stubs
 

@@ -44,7 +44,7 @@ pub struct ResolveBoundVars {
     pub(crate) generic_indices: GenericIndices,
 }
 
-static TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = std::sync::Mutex::new(None);
+static TRIVIAL: relax_session::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) struct ZoneTaken(Option<std::collections::HashMap<GenericIndices, std::sync::Arc<ResolveBoundVars>>>);
 

@@ -369,12 +369,12 @@ impl DemandPart {
 // Planning gives the writer the data it already owns. Namespace serialization,
 // identity hashing and part encoding all happen there.
 pub(crate) struct Recording {
-    pending: std::sync::Mutex<Option<(Vec<PreCrate>, Names, Vec<DemandPart>)>>,
-    ready: std::sync::Mutex<Vec<Arc<DemandPart>>>,
+    pending: relax_session::sync::Mutex<Option<(Vec<PreCrate>, Names, Vec<DemandPart>)>>,
+    ready: relax_session::sync::Mutex<Vec<Arc<DemandPart>>>,
 }
 impl Recording {
     pub(super) fn new(crates: &[PreCrate], names: Names, parts: Vec<DemandPart>) -> Self {
-        Self { pending: std::sync::Mutex::new(Some((crates.to_vec(), names, parts))), ready: std::sync::Mutex::new(Vec::new()) }
+        Self { pending: relax_session::sync::Mutex::new(Some((crates.to_vec(), names, parts))), ready: relax_session::sync::Mutex::new(Vec::new()) }
     }
 }
 impl DemandImage {

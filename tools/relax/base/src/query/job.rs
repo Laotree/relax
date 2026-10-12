@@ -1,5 +1,6 @@
 use super::{Cycle, DepNodeIndex, QueryEngine, QueryError, State};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use relax_session::sync::{Condvar, Mutex};
 
 /// Only live jobs occupy storage; a latch is allocated only on contention.
 /// rustc_middle/src/query/job.rs:17,35 uses the same lazy latch ownership.

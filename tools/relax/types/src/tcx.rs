@@ -263,7 +263,7 @@ pub struct Tcx {
     /// collection step ends)
     pub errors: Vec<String>,
     /// errors reported through `&self` (type lowering may run on any thread)
-    err_sink: std::sync::Mutex<Vec<String>>,
+    err_sink: relax_session::sync::Mutex<Vec<String>>,
     // Diagnostics at the declaration checkpoint, before runtime/speculative queries.
     collected_errors: Option<Vec<String>>,
 }

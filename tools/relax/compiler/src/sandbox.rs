@@ -30,7 +30,8 @@ use crate::program::DefKind;
 use crate::rir::{Callee, Cls, Cond, Conv, Func, IOp, Inst, Sym, Term, VReg, U32, U64};
 use crate::syms::SymKind;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use relax_session::sync::Mutex;
 
 #[cfg(target_arch = "aarch64")]
 use crate::arm64 as tgt;

@@ -8,9 +8,10 @@ use std::{
     io::Write,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
     },
 };
+use relax_session::sync::Mutex;
 pub const PHASES: [&str; 11] = [
     "other", "typeck", "borrowck", "lower", "opt", "codegen", "install", "lock", "wait",
     "regalloc", "emit",

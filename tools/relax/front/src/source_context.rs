@@ -1,6 +1,7 @@
 //! Immutable Rust source snapshots, outline reuse and parse diagnostics.
 use crate::{builtins::FileCtx, source::{SourceRegistry, SourceSpan}};
-use std::{collections::BTreeMap, path::{Path, PathBuf}, rc::Rc, sync::{Arc, Mutex, OnceLock}};
+use std::{collections::BTreeMap, path::{Path, PathBuf}, rc::Rc, sync::{Arc, OnceLock}};
+use relax_session::sync::Mutex;
 
 pub struct Context {
     sources: Arc<SourceRegistry>,

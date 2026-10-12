@@ -42,7 +42,7 @@ fn verify_on() -> bool {
 }
 
 /// The crate list of this launch (kept: the swap restores against it).
-static BOOT: std::sync::Mutex<Option<Vec<crate::preload::PreCrate>>> = std::sync::Mutex::new(None);
+static BOOT: relax_session::sync::Mutex<Option<Vec<crate::preload::PreCrate>>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn remember_boot(pre: &[crate::preload::PreCrate]) {
     *BOOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| pre.to_vec()));
@@ -156,7 +156,7 @@ struct Counts {
 /// The counts of the program the store's collected image describes (set when this run restored
 /// or recorded it, and by each swap): equal counts later mean nothing was added since, and the
 /// swap restores from the image as it is without encoding it again.
-static IMAGE_COUNTS: std::sync::Mutex<Option<Counts>> = std::sync::Mutex::new(None);
+static IMAGE_COUNTS: relax_session::sync::Mutex<Option<Counts>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn note_image(prog: &Program, tcx: &Tcx) {
     *IMAGE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(counts(prog, tcx));
@@ -411,7 +411,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     }
 
     // 6. the commit: no abort from here
-    trace(&format!("commit begins; std pthread objects boxed in the compiler arena (mutex, condvar): {:?}", crate::zone_alloc::compiler_pthread_boxes()));
+    trace("commit begins");
     let t = Instant::now();
     // The snapshot owns old-arena pointers: forget it on this thread before commit destroys them.
     taken.forget();
@@ -431,9 +431,9 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let rss1 = crate::memstat::resident();
     SWAPS.fetch_add(1, Ordering::Relaxed);
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
-    eprintln!("relax-zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); {} chunks left alone (pthread objects); rss {:.0} -> {:.0} MB",
+    eprintln!("relax-zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
         old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.quiesce, tl.front_images, tl.encode, tl.store, tl.restore, tl.cache, tl.commit, ms(t_all),
-        tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, crate::zone_alloc::compiler_pinned_chunks(), rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
+        tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
     Outcome::Done
 }
 
@@ -478,7 +478,6 @@ unsafe fn encode(up: *mut Unit) -> Result<((std::path::PathBuf, u128), crate::im
 fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode, before: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
     let u = unsafe { &*up };
     let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no boot record")?;
-    trace(&format!("signature census (stride, word, n): {:x?}", crate::zone_alloc::compiler_sig_census()));
     trace("build: opening the images");
     let images = crate::cache::FrontImages::open(&sess.options).ok_or("the front images cannot be opened")?;
     trace("build: restoring");
@@ -601,7 +600,7 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
     relax_session::gen_local::bump();
     trace("commit: destroying");
     let (chunks, touched) = crate::zone_alloc::compiler_destroy_older();
-    trace(&format!("commit: destroyed; {} chunks left alone", crate::zone_alloc::compiler_pinned_chunks()));
+    trace("commit: destroyed");
     (chunks, touched, (specs, spec_bytes))
 }
 

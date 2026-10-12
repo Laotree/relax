@@ -31,7 +31,7 @@ pub mod cfi {
 }
 
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// The inspect thread runs (a socket is listening).
 static STARTED: AtomicBool = AtomicBool::new(false);
@@ -557,7 +557,7 @@ fn cmd_owner(out: &mut Out) {
 
 /// The Splash VM registry's summaries (makepad-script, compiled into the relax binary: its
 /// main.rs sets the provider; relax-compiler cannot depend on the script crate).
-static VM_PROVIDER: std::sync::Mutex<Option<fn() -> Vec<String>>> = std::sync::Mutex::new(None);
+static VM_PROVIDER: relax_session::sync::Mutex<Option<fn() -> Vec<String>>> = relax_session::sync::Mutex::new(None);
 
 pub fn set_vm_provider(f: fn() -> Vec<String>) {
     *VM_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
@@ -571,7 +571,7 @@ pub fn vm_summaries() -> Vec<String> {
 
 /// The Splash script stack of a thread (makepad-script, set by main.rs): only valid for a thread
 /// that is stopped (parked at a panic or breakpoint, or paused).
-static SCRIPT_STACK_PROVIDER: std::sync::Mutex<Option<fn(u64, usize) -> Option<Vec<String>>>> = std::sync::Mutex::new(None);
+static SCRIPT_STACK_PROVIDER: relax_session::sync::Mutex<Option<fn(u64, usize) -> Option<Vec<String>>>> = relax_session::sync::Mutex::new(None);
 
 pub fn set_script_stack_provider(f: fn(u64, usize) -> Option<Vec<String>>) {
     *SCRIPT_STACK_PROVIDER.lock().unwrap_or_else(|e| e.into_inner()) = Some(f);
@@ -622,7 +622,7 @@ fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {
 /// it cut the reply at the limit.
 pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) -> bool;
 
-static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery, crate::domain::Callback)>> = std::sync::Mutex::new(Vec::new());
+static PROVIDERS: relax_session::sync::Mutex<Vec<(String, ProgramQuery, crate::domain::Callback)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The program registers the command `name` (makepad-platform's remote commands); a
 /// later registration replaces the earlier one.

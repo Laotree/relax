@@ -78,9 +78,6 @@ mod disabled {
     pub fn stats() -> (usize, usize, usize) {
         (0, 0, 0)
     }
-    pub fn pthread_boxes() -> (usize, usize) {
-        (0, 0)
-    }
     pub fn trim() {}
     pub fn detach_thread() {}
     pub fn generation() -> u64 {
@@ -109,8 +106,6 @@ mod disabled {
     }
     pub fn tombstone_hit(_: *mut u8, _: &str) {}
     pub fn tombstone_expected() {}
-    pub fn pinned_chunks() -> usize { 0 }
-    pub fn sig_census() -> Vec<(usize, usize, usize)> { Vec::new() }
     pub fn points_into(_: usize, _: u64) -> bool {
         false
     }
@@ -165,11 +160,6 @@ pub fn compiler_trim() {
     compiler::trim()
 }
 
-/// (pthread mutexes, condition variables) std boxed in the compiler arena (macOS; see arena.rs).
-pub fn compiler_pthread_boxes() -> (usize, usize) {
-    compiler::pthread_boxes()
-}
-
 /// The compiler arena's current generation (starts at 0).
 pub fn compiler_generation() -> u64 {
     compiler::generation()
@@ -219,16 +209,6 @@ pub fn compiler_points_into(p: usize, g: u64) -> bool {
 /// The arena's own statics (address ranges): its free lists and base address are not roots.
 pub fn compiler_internal_ranges() -> [(usize, usize); 2] {
     compiler::internal_ranges()
-}
-
-/// Debugging: (stride, first word, count) of the commonest small first words of 48 / 64 byte slots.
-pub fn compiler_sig_census() -> Vec<(usize, usize, usize)> {
-    compiler::sig_census()
-}
-
-/// Chunks the destroys left alone (macOS: they hold std's pthread mutexes and condvars).
-pub fn compiler_pinned_chunks() -> usize {
-    compiler::pinned_chunks()
 }
 
 /// Number of tombstoned chunks and runs.
@@ -604,9 +584,9 @@ unsafe impl GlobalAlloc for RelaxAlloc {
 mod routing_tests {
     use super::*;
 
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SERIAL: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
-    fn serial() -> std::sync::MutexGuard<'static, ()> {
+    fn serial() -> relax_session::sync::MutexGuard<'static, ()> {
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
     }
 

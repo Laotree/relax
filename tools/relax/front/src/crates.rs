@@ -5,7 +5,7 @@ use crate::ast::*;
 use crate::json;
 use crate::lexer::T;
 use crate::parser::ParsedFile;
-use std::sync::{Condvar, Mutex};
+use relax_session::sync::{Condvar, Mutex};
 
 pub struct CrateUnit {
     pub name: String,
@@ -460,7 +460,7 @@ pub fn join_path(base: &str, p: &str) -> String {
 /// Per crate (by name, as the parser knows it): the compile-time environment `env!`/`option_env!`
 /// see (cargo's per-crate variables and build-script rustc-env). Set by `relax run`; empty
 /// otherwise. Lookups fall back to the process environment like rustc.
-static CRATE_ENV: std::sync::Mutex<Vec<(String, Vec<(String, String)>)>> = std::sync::Mutex::new(Vec::new());
+static CRATE_ENV: relax_session::sync::Mutex<Vec<(String, Vec<(String, String)>)>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub fn set_crate_env(name: &str, env: Vec<(String, String)>) {
     // the table lives for the run: grown in the kept phase

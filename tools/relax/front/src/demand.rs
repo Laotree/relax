@@ -1447,9 +1447,9 @@ impl Names {
             if let Some(k) = owner(self.bindings.spelling(module)) { entries[k].extend(names.values().copied()); }
         }
         // each crate's bindings and encoding are independent: spread over the loader's workers
-        let work: Vec<std::sync::Mutex<Option<(NamespaceDelta, Vec<usize>)>>> = images.into_iter().zip(entries).map(|w| std::sync::Mutex::new(Some(w))).collect();
+        let work: Vec<relax_session::sync::Mutex<Option<(NamespaceDelta, Vec<usize>)>>> = images.into_iter().zip(entries).map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
         let next = std::sync::atomic::AtomicUsize::new(0);
-        let out: Vec<std::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
+        let out: Vec<relax_session::sync::Mutex<(Vec<u8>, u128)>> = (0..work.len()).map(|_| Default::default()).collect();
         std::thread::scope(|scope| {
             for _ in 0..crate::preload::jobs().clamp(1, work.len().max(1)) {
                 scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); let _mem = crate::memstat::tag(crate::memstat::Tag::Planner); loop {
@@ -1519,14 +1519,14 @@ fn decode_namespace(bytes: &[u8]) -> Option<NamespaceDelta> {
 /// planner discovers; `take` decodes a crate itself when no worker has reached it.
 pub(super) struct Predecoded {
     parts: Vec<Option<Arc<DemandPart>>>,
-    slots: std::sync::Mutex<Vec<Slot>>,
-    done: std::sync::Condvar,
+    slots: relax_session::sync::Mutex<Vec<Slot>>,
+    done: relax_session::sync::Condvar,
 }
 enum Slot { Free, Busy, Done(Option<NamespaceDelta>), Taken }
 impl Predecoded {
     pub(super) fn start(parts: Vec<Option<Arc<DemandPart>>>, workers: usize) -> Arc<Self> {
         let slots = parts.iter().map(|p| if p.as_ref().is_some_and(|p| !p.namespace.is_empty()) { Slot::Free } else { Slot::Taken }).collect();
-        let this = Arc::new(Self { parts, slots: std::sync::Mutex::new(slots), done: std::sync::Condvar::new() });
+        let this = Arc::new(Self { parts, slots: relax_session::sync::Mutex::new(slots), done: relax_session::sync::Condvar::new() });
         for _ in 0..workers.min(this.parts.len()) {
             let this = this.clone();
             std::thread::Builder::new().name("relax-namespace-decode".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();

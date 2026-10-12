@@ -2,8 +2,9 @@
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap},
-    sync::{Mutex, OnceLock},
+    sync::OnceLock,
 };
+use relax_session::sync::Mutex;
 
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

@@ -290,9 +290,9 @@ impl Plan {
                 // Each worker reads its scan in place and lets go of it before handing back the
                 // surface: publication then owns the scan alone (Arc::make_mut, no copy).
                 let inputs = scans.iter().filter_map(|(path, module, _, scan, ..)| scan.as_ref().map(|scan|
-                    std::sync::Mutex::new(Some((path.clone(), module.clone(), scan.clone()))))).collect::<Vec<_>>();
+                    relax_session::sync::Mutex::new(Some((path.clone(), module.clone(), scan.clone()))))).collect::<Vec<_>>();
                 let expected = scans.iter().filter(|entry| entry.3.is_some()).map(|(path, module, ..)| (path.clone(), module.clone())).collect::<BTreeSet<_>>();
-                let ready = (std::sync::Mutex::new(BTreeMap::new()), std::sync::Condvar::new());
+                let ready = (relax_session::sync::Mutex::new(BTreeMap::new()), relax_session::sync::Condvar::new());
                 let next_input = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|scope| {
                     for _ in 0..jobs().min(inputs.len()) {

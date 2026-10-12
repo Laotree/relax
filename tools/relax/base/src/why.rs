@@ -2,7 +2,8 @@
 //! /path/events.<pid>.jsonl (separate files across child processes and forks) and records
 //! reads separately from collection, lowering, body checking and code generation.
 //! A cause is a compiler request, not evidence that an application called a function.
-use std::{cell::RefCell, collections::BTreeMap, fs::File, io::Write, sync::{Mutex, OnceLock}};
+use std::{cell::RefCell, collections::BTreeMap, fs::File, io::Write, sync::OnceLock};
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Default)]
 pub struct Cause {

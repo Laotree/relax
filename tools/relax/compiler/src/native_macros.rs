@@ -7,7 +7,7 @@ pub fn report(profile: bool) {
     if profile { eprintln!("native-macro-validation: source_reads={} hashes=0", SOURCE_READS.load(std::sync::atomic::Ordering::Relaxed)); }
 }
 
-static UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static UPDATE: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 static GRAPH: std::sync::RwLock<Option<std::sync::Arc<Graph>>> = std::sync::RwLock::new(None);
 
 pub(crate) struct ZoneTaken(Option<std::sync::Arc<Graph>>);

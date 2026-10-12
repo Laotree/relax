@@ -1,5 +1,6 @@
 //! Machine diagnostics. Codes are an append-only public protocol; never reuse a code.
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity { Error, Warning, Note }

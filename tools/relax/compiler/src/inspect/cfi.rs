@@ -7,7 +7,7 @@
 //! caller's fault-free `read`.
 
 use std::sync::atomic::{AtomicPtr, Ordering::{Acquire, Release}};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Regs {

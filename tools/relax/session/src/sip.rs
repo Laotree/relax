@@ -143,7 +143,7 @@ pub fn hash_bytes(b: &[u8]) -> u128 {
 pub const LATE_FILE: u8 = 1;
 pub const LATE_ENV: u8 = 2;
 
-static LATE: std::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = std::sync::Mutex::new(None);
+static LATE: crate::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = crate::sync::Mutex::new(None);
 
 pub(crate) struct ZoneTaken(Option<std::collections::HashMap<(String, u8, String), u128>>);
 

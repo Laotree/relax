@@ -8,3 +8,4 @@ publish = false
 
 [dependencies]
 relax-front = { workspace = true }
+relax-session = { workspace = true }

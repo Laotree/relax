@@ -137,7 +137,7 @@ pub fn add_pre_wall(ns: u64) {
 /// Derive expansions that failed, distinct by (file, item position, derive): a failed derive
 /// leaves only a `compile_error!` at the item, so what it generates is missing from the program
 /// (rustc would reject the program). Reported by `relax run` / `--check` (run.rs).
-static DERIVE_FAILED: std::sync::Mutex<Option<(std::collections::HashSet<(String, u32, String)>, Vec<String>)>> = std::sync::Mutex::new(None);
+static DERIVE_FAILED: relax_session::sync::Mutex<Option<(std::collections::HashSet<(String, u32, String)>, Vec<String>)>> = relax_session::sync::Mutex::new(None);
 
 pub fn derive_failed(path: &str, item_lo: u32, line: u32, col: u32, name: &str, msg: &str) {
     if declaring() { return; }
@@ -180,7 +180,7 @@ thread_local! {
 }
 
 /// The registry and the stats are process-wide: files parse on worker threads too.
-pub struct Shared<T>(std::sync::Mutex<RefCell<Option<T>>>);
+pub struct Shared<T>(relax_session::sync::Mutex<RefCell<Option<T>>>);
 
 impl<T> Shared<T> {
     pub fn with<R>(&self, f: impl FnOnce(&RefCell<Option<T>>) -> R) -> R {
@@ -188,7 +188,7 @@ impl<T> Shared<T> {
     }
 }
 
-pub static REG: Shared<Reg> = Shared(std::sync::Mutex::new(RefCell::new(None)));
+pub static REG: Shared<Reg> = Shared(relax_session::sync::Mutex::new(RefCell::new(None)));
 
 pub(crate) struct ZoneTaken(Option<Reg>);
 
@@ -207,7 +207,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     std::mem::forget(std::mem::replace(reg.get_mut(), taken.0));
 }
 
-static STATS_CELL: Shared<HostStats> = Shared(std::sync::Mutex::new(RefCell::new(None)));
+static STATS_CELL: Shared<HostStats> = Shared(relax_session::sync::Mutex::new(RefCell::new(None)));
 
 /// `STATS.with(|s| ..)` over the shared stats (a copy in a Cell, written back).
 pub struct StatsAccess;

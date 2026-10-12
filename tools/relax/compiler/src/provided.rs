@@ -26,7 +26,7 @@ use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// A generated shim: arguments moved out of `args[i]`, the result written to `ret`; 0 = returned,
 /// 1 = panicked (the message is then read with the crate's LastPanicFn).

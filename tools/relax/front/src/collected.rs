@@ -1,7 +1,8 @@
 //! Collected graph encoding. Unlike a crate's parse record this preserves resolved IDs.
 //! Only the exact compiler build and a validated input certificate may restore it.
 use crate::crate_image::{Codec, Decode};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use relax_session::sync::Mutex;
 
 /// An immutable image component whose first reader may need owned strings/maps. Keeping
 /// its bytes mapped avoids eagerly rebuilding macro scopes that warm code never asks for.

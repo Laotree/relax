@@ -101,9 +101,9 @@ struct World {
     bridge: u64,
     /// unit index -> crate index in the world
     crate_of: Vec<u32>,
-    entries: std::sync::Mutex<Vec<((usize, String), u64)>>,
+    entries: relax_session::sync::Mutex<Vec<((usize, String), u64)>>,
     /// macro fns whose code does not compile: (unit, fn) -> the error (deterministic, not retried)
-    broken: std::sync::Mutex<Vec<((usize, String), String)>>,
+    broken: relax_session::sync::Mutex<Vec<((usize, String), String)>>,
     /// unit -> why the sandbox refused it
     refused: Vec<Option<String>>,
 }
@@ -146,9 +146,9 @@ pub static PH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::A
 /// The macro world while it exists: built on first need, freed once the program's files are
 /// loaded (free_world: no expansions until a hot reload or a run-time module loads source), then
 /// rebuilt on the next need -- from the disk cache, so a rebuild compiles nothing.
-static WORLD: std::sync::Mutex<Option<std::sync::Arc<Result<World, String>>>> = std::sync::Mutex::new(None);
+static WORLD: relax_session::sync::Mutex<Option<std::sync::Arc<Result<World, String>>>> = relax_session::sync::Mutex::new(None);
 /// held while the world is being built: other threads wait for that build
-static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static BUILDING: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
 fn world_now() -> Option<std::sync::Arc<Result<World, String>>> {
     WORLD.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -473,7 +473,7 @@ struct WatchSlot {
     start: std::sync::atomic::AtomicU64,
 }
 
-static WATCH: std::sync::Mutex<Vec<&'static WatchSlot>> = std::sync::Mutex::new(Vec::new());
+static WATCH: relax_session::sync::Mutex<Vec<&'static WatchSlot>> = relax_session::sync::Mutex::new(Vec::new());
 
 thread_local! {
     static MY_SLOT: Cell<Option<&'static WatchSlot>> = const { Cell::new(None) };

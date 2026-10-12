@@ -9,7 +9,7 @@
 
 use crate::crates::CrateUnit;
 pub use crate::resolve::{GraphUnit, Units};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 #[path = "unitgraph_noop.rs"]
 mod noop;
@@ -774,7 +774,7 @@ fn newest_mtime(p: &std::path::Path) -> u128 {
 /// At most SCRIPT_SLOTS build scripts run at once (each is a whole Relax process).
 const SCRIPT_SLOTS: usize = 4;
 static SCRIPT_RUNNING: Mutex<usize> = Mutex::new(0);
-static SCRIPT_FREE: std::sync::Condvar = std::sync::Condvar::new();
+static SCRIPT_FREE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 
 struct ScriptSlot;
 impl Drop for ScriptSlot {
@@ -794,7 +794,7 @@ fn script_slot() -> ScriptSlot {
 }
 
 /// A lock per output path, held while that file is written.
-fn path_lock(path: &str) -> std::sync::MutexGuard<'static, ()> {
+fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
     static LOCKS: Mutex<Vec<(String, &'static Mutex<()>)>> = Mutex::new(Vec::new());
     let m: &'static Mutex<()> = {
         // leaked locks and their table live for the process: the program's heap

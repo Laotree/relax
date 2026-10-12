@@ -13,7 +13,7 @@
 use super::{json_str, now_ms, Out, Req};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::{Relaxed, SeqCst}};
-use std::sync::{Condvar, Mutex};
+use relax_session::sync::{Condvar, Mutex};
 
 pub struct Event {
     pub seq: u64,

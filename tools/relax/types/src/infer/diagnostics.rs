@@ -1,6 +1,7 @@
 // ported from N:rustc_errors/src/lib.rs @8d1a764
 use crate::next_solver::fulfill::ObligationCause;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use relax_session::sync::Mutex;
 
 thread_local! { static THREAD_EMITTED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 #[derive(Clone, Debug)]

@@ -4,7 +4,8 @@
 //! declaration-only bucket. All state is diagnostic; no load decisions use it.
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use relax_session::sync::Mutex;
 
 pub const LOADED: u32 = 1;
 pub const PARSED: u32 = 2;

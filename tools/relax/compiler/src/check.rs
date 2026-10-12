@@ -66,7 +66,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let out: std::sync::Mutex<Vec<(usize, R)>> = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    let out: relax_session::sync::Mutex<Vec<(usize, R)>> = relax_session::sync::Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|sc| {
         for w in 0..jobs.min(items.len().max(1)) {
             let (next, out, f) = (&next, &out, &f);
@@ -223,7 +223,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let next = std::sync::atomic::AtomicUsize::new(0);
     let mut outcomes: Vec<(usize, Outcome)> = Vec::new();
     {
-        let results = std::sync::Mutex::new(Vec::with_capacity(fns.len()));
+        let results = relax_session::sync::Mutex::new(Vec::with_capacity(fns.len()));
         let (fns, next, results, check_one) = (&fns, &next, &results, &check_one);
         std::thread::scope(|sc| {
             for w in 0..jobs {
@@ -402,7 +402,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     let settled_rss = std::sync::atomic::AtomicU64::new(crate::memstat::resident() as u64);
     let next = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
-    let panics: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+    let panics: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
     let upn = up as usize;
     std::thread::scope(|sc| {
         for w in 0..jobs {

@@ -34,7 +34,7 @@ pub struct Interner {
     strs: Vec<String>,
     /// names first met after the load, through a shared reference (identifiers that only the
     /// macro expansions of lazily parsed fn bodies make): ids from LATE_SYM up
-    late: std::sync::Mutex<(HashMap<String, Sym>, Vec<&'static str>)>,
+    late: relax_session::sync::Mutex<(HashMap<String, Sym>, Vec<&'static str>)>,
     has_late: std::sync::atomic::AtomicBool,
 }
 
@@ -616,7 +616,7 @@ pub struct Program {
     /// macros an expansion in a later file defines or imports), else errors
     pending_macs: Vec<(u32, ItemId, u32)>,
     /// files whose lazily parsed part has its identifiers interned here (part_idents)
-    part_interned: std::sync::Mutex<crate::fxhash::HashSet<(u32, u32)>>,
+    part_interned: relax_session::sync::Mutex<crate::fxhash::HashSet<(u32, u32)>>,
     pub file_paths: Vec<String>,
     pub file_crate: Vec<u32>,
     pub crates: Vec<CrateInfo>,
@@ -4573,7 +4573,7 @@ pub struct SharedParse {
 
 /// The program's std parses by path, while its load runs (`share_std_begin` .. `share_std_end`)
 /// and after it (a world built again for hot reload takes them too).
-static SHARED_STD: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = std::sync::Mutex::new(None);
+static SHARED_STD: relax_session::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) struct ZoneTaken(Option<HashMap<String, std::sync::Arc<SharedParse>>>);
 
@@ -4589,7 +4589,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     let mut shared = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
     std::mem::forget(std::mem::replace(&mut *shared, taken.0));
 }
-static SHARED_CV: std::sync::Condvar = std::sync::Condvar::new();
+static SHARED_CV: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 /// the program's std load is running: the world waits for its files
 static SHARING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -5038,7 +5038,7 @@ fn push_missing(m: &mut Vec<(u32, String)>, w: u32, name: &str) {
 
 /// Signature collection runs on several threads: while it runs, misses are also gathered here.
 static COLLECTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static COLLECT_MISSES: std::sync::Mutex<Vec<(u32, String)>> = std::sync::Mutex::new(Vec::new());
+static COLLECT_MISSES: relax_session::sync::Mutex<Vec<(u32, String)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Start gathering the misses of a signature collection (any thread).
 pub fn collect_misses_begin() {

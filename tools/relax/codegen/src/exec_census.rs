@@ -5,7 +5,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use relax_session::sync::Mutex;
 
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

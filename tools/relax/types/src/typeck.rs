@@ -545,7 +545,7 @@ pub(crate) fn check_fn(prog: &Program, tcx: &Tcx, def: DefId) -> Body {
 }
 
 /// RELAX_LAZY_STATS: the fn defs whose bodies were type-checked (what a lazy parse would parse)
-pub static CHECKED_DEFS: std::sync::Mutex<Option<std::collections::HashSet<u32>>> = std::sync::Mutex::new(None);
+pub static CHECKED_DEFS: relax_session::sync::Mutex<Option<std::collections::HashSet<u32>>> = relax_session::sync::Mutex::new(None);
 
 fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
     let _why = crate::why::enabled().then(|| {

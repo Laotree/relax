@@ -257,7 +257,7 @@ mod imp {
     const CODE_REGIONS_CAP: usize = 64;
     static CODE_REGIONS: [[AtomicU64; 3]; CODE_REGIONS_CAP] = [const { [const { AtomicU64::new(0) }; 3] }; CODE_REGIONS_CAP];
     static CODE_REGIONS_N: AtomicUsize = AtomicUsize::new(0);
-    static CODE_REGIONS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CODE_REGIONS_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
     /// After fork() the child has its own copy-on-write copy of each RW view, but no RX view
     /// (it is mapped VM_INHERIT_NONE: an inherited alias would share or copy the parent's pages
@@ -461,7 +461,7 @@ mod imp {
     }
 
     /// reserve / release (a released slot is reused)
-    static RES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static RES_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
     pub fn reserve(code: usize, rest: usize) -> u64 {
         let total = code + rest;

@@ -22,7 +22,7 @@ struct Module {
     skipped: Vec<String>,
 }
 
-static MODULES: std::sync::Mutex<Vec<Module>> = std::sync::Mutex::new(Vec::new());
+static MODULES: relax_session::sync::Mutex<Vec<Module>> = relax_session::sync::Mutex::new(Vec::new());
 
 crate::gen_local! {
     static LAST_ERROR: std::cell::RefCell<String>;

@@ -16,7 +16,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Condvar, Mutex};
+use relax_session::sync::{Condvar, Mutex};
 
 /// Request classes, in service order.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]

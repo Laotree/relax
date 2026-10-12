@@ -8,7 +8,7 @@
 //! every crate's setting. Each relaxation only accepts programs strict rejects; each accepted site
 //! is recorded with the rustc error it replaces and, for write-back features, the edit.
 
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// The shipped relaxation features (spec names).
 pub const FEATURES: &[&str] = &["mut", "imports", "field-views", "two-phase"];

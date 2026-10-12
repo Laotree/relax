@@ -40,7 +40,7 @@ pub struct FileCtx {
 
 // Process-wide, by the file's directory: files parse on many worker threads, and the walk up
 // to the manifest (a stat per level) and the manifest reads are the same for every file.
-static BY_DIR: std::sync::Mutex<Option<crate::fxhash::HashMap<String, (String, String, String, String)>>> = std::sync::Mutex::new(None);
+static BY_DIR: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<String, (String, String, String, String)>>> = relax_session::sync::Mutex::new(None);
 
 /// Per crate root: (manifest dir, package name, version, workspace root).
 fn crate_meta(path: &str) -> (String, String, String, String) {
@@ -224,7 +224,7 @@ fn line_col(src: &[u8], ls: &[u32], pos: u32) -> LineColumn {
 /// Marker prefix of an `include_bytes!` literal whose bytes live in the payload table.
 pub const PAYLOAD_MARK: &str = "\\0relax-include:";
 
-static PAYLOADS: std::sync::Mutex<Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>> = std::sync::Mutex::new(None);
+static PAYLOADS: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) struct ZoneTaken {
     payloads: Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>,

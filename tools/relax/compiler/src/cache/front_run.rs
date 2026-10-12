@@ -8,7 +8,8 @@ use super::*;
 use crate::parser::{FilePart, ImageLoc, ImageSink, ParsedFile};
 use crate::store::{Appended, RunStore};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use relax_session::sync::Mutex;
 
 /// index entries per run store (a full one is followed by another)
 const RUN_CAP: u32 = 16384;

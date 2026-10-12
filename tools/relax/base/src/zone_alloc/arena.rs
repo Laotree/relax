@@ -1031,38 +1031,6 @@ impl Arena {
         }
         same
     }
-    /// macOS: counts the pthread mutexes and condition variables std boxed in this arena (its
-    /// Mutex/Condvar allocate the pthread object on first lock). Returns (mutexes, condvars);
-    /// zero where std uses futexes. A chunk of 64-byte slots is scanned for the initialised
-    /// signatures, so it is an estimate (a stale freed slot can keep its old signature).
-    pub fn pthread_boxes(&self) -> (usize, usize) {
-        #[allow(unused_mut)]
-        let (mut m, mut c) = (0, 0);
-        #[cfg(target_os = "macos")]
-        {
-            let base = self.base.load(Ordering::Relaxed);
-            if base == 0 {
-                return (0, 0);
-            }
-            for (i, h) in self.headers.iter().enumerate() {
-                let s = lock(&h.state);
-                if s.stride != 64 || h.live.load(Ordering::Relaxed) == 0 || s.committed != CHUNK {
-                    continue;
-                }
-                let mut off = 0;
-                while off < s.bump.min(CHUNK) {
-                    let sig = unsafe { *((base + i * CHUNK + off) as *const usize) };
-                    match sig {
-                        0x4D555458 => m += 1,
-                        0x434F4E44 => c += 1,
-                        _ => {}
-                    }
-                    off += 64;
-                }
-            }
-        }
-        (m, c)
-    }
     #[inline]
     pub unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         self.dealloc_counted(p, l, l.size());
@@ -1435,9 +1403,6 @@ pub unsafe fn alloc_zeroed(l: Layout) -> *mut u8 {
 }
 pub unsafe fn resize_in_place(p: *mut u8, old: Layout, new_size: usize) -> bool {
     DEFAULT.resize_in_place(p, old, new_size)
-}
-pub fn pthread_boxes() -> (usize, usize) {
-    DEFAULT.pthread_boxes()
 }
 pub unsafe fn dealloc(p: *mut u8, l: Layout) {
     DEFAULT.dealloc(p, l)

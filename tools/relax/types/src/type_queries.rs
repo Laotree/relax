@@ -146,7 +146,7 @@ const FILE_BODIES: u16 = 21;
 
 /// Memory report (RELAX_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
 /// reads more than 2 s after the first) -- who still reads a Body after its owner is lowered.
-static TYPECK_READS: std::sync::Mutex<Option<crate::fxhash::HashMap<u32, (u64, u64, u32, u32)>>> = std::sync::Mutex::new(None);
+static TYPECK_READS: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<u32, (u64, u64, u32, u32)>>> = relax_session::sync::Mutex::new(None);
 static TYPECK_READS_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 fn note_typeck_read(def: DefId) {

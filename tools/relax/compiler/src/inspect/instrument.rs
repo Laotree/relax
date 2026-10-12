@@ -15,7 +15,7 @@
 
 use super::{json_str, now_ms, short, Out, Req};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 include!("../rt_abi.rs");
 
@@ -102,7 +102,7 @@ struct Parked {
 }
 
 static PARKED: Mutex<Vec<std::sync::Arc<Parked>>> = Mutex::new(Vec::new());
-static GO: std::sync::Condvar = std::sync::Condvar::new();
+static GO: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static PARK_IDS: AtomicU64 = AtomicU64::new(0);
 
 /// How the words a breakpoint receives map to the hooked fn's parameters: per parameter its name,
@@ -763,7 +763,7 @@ fn program_thread(t: &super::threads::Thread) -> bool {
 
 #[cfg(target_os = "macos")]
 mod pause_imp {
-    static HELD: std::sync::Mutex<Vec<crate::inspect::threads::Thread>> = std::sync::Mutex::new(Vec::new());
+    static HELD: relax_session::sync::Mutex<Vec<crate::inspect::threads::Thread>> = relax_session::sync::Mutex::new(Vec::new());
     pub fn pause(want: &dyn Fn(&crate::inspect::threads::Thread) -> bool) -> usize {
         let skip = crate::inspect::SERVER_TIDS.lock().unwrap().clone();
         let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
@@ -790,7 +790,7 @@ mod pause_imp {
 #[cfg(target_os = "linux")]
 mod pause_imp {
     use std::sync::atomic::Ordering::Relaxed;
-    static HELD: std::sync::Mutex<Vec<(u64, &'static crate::inspect::threads::HoldSlot)>> = std::sync::Mutex::new(Vec::new());
+    static HELD: relax_session::sync::Mutex<Vec<(u64, &'static crate::inspect::threads::HoldSlot)>> = relax_session::sync::Mutex::new(Vec::new());
     /// Holds the running threads now and keeps holding threads as they start running (every
     /// 5 ms) until resume; blocked threads are never signalled.
     pub fn pause(want: &'static (dyn Fn(&crate::inspect::threads::Thread) -> bool + Sync)) -> usize {

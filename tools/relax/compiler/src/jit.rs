@@ -270,7 +270,7 @@ pub(crate) fn zone_take() -> ZoneTaken {
 }
 
 pub(crate) fn zone_put_back(taken: ZoneTaken) {
-    fn put<T>(slot: &std::sync::Mutex<T>, old: T) {
+    fn put<T>(slot: &relax_session::sync::Mutex<T>, old: T) {
         let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
         std::mem::forget(std::mem::replace(&mut *guard, old));
     }
@@ -318,16 +318,16 @@ pub struct Unit {
     pub fn_map: crate::conc::MemoMap<FnKey, u32>,
     /// the reload index of slots by definition / parent / file: built from the slots on the
     /// first query (a reload), kept current from then on; a run without a reload never builds it
-    reload_slots: std::sync::Mutex<Option<ReloadSlots>>,
+    reload_slots: relax_session::sync::Mutex<Option<ReloadSlots>>,
     pub(crate) reload_rir: Option<std::collections::HashSet<u32>>,
     pub(crate) reload_errors: std::collections::HashSet<u32>,
     pub(crate) reload_specs: std::collections::HashSet<u32>,
     /// serialises slot creation (one entry per key, dense ids)
-    fn_create: std::sync::Mutex<()>,
+    fn_create: relax_session::sync::Mutex<()>,
     pub consts: crate::fxhash::HashMap<(DefId, Vec<TyId>), u64>,
     /// hot reload: const -> the slots whose build read its value (folded into their code), so an
     /// edit of the const recompiles them (reload.rs)
-    pub const_readers: std::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<u32>>>,
+    pub const_readers: relax_session::sync::Mutex<crate::fxhash::HashMap<DefId, Vec<u32>>>,
     /// per slot: the slots whose optimised RIR its RIR took in this run -- inlined bodies and
     /// callees answering nounwind true (a false answer assumes nothing of the body). Grows
     /// over rebuilds, never shrinks: code made from an earlier RIR names them too. The disk
@@ -337,10 +337,10 @@ pub struct Unit {
     /// the statics' storage by address: start -> (static, size), so a pointer into a static
     /// (`&S.field`, `&S[3]`) in constant data is that static's symbol plus an offset
     pub static_spans: std::collections::BTreeMap<u64, (DefId, u64)>,
-    pub sites: std::sync::Mutex<Vec<Site>>,
+    pub sites: relax_session::sync::Mutex<Vec<Site>>,
     /// one site per (file, position, message): every inlined copy of a panic location is one
     /// site and one symbol, whatever the compile order (one constant pool word)
-    site_ix: std::sync::Mutex<HashMap<(u32, u32, String), u64>>,
+    site_ix: relax_session::sync::Mutex<HashMap<(u32, u32, String), u64>>,
     pub rt: Rt,
     /// the runtime entries as symbols (what compiled code calls; see syms.rs)
     pub rs: RtSyms,
@@ -359,7 +359,7 @@ pub struct Unit {
     /// the slot takes this RIR, so the layout callers saw and the code agree
     pub coro_rir: crate::conc::MemoMap<u32, crate::rir::Func>,
     /// coroutine types whose body is being lowered for its layout (on the owner thread)
-    pub coro_busy: std::sync::Mutex<Vec<TyId>>,
+    pub coro_busy: relax_session::sync::Mutex<Vec<TyId>>,
     /// slots queued for speculation whose code the disk cache has: their worker links it and
     /// skips the type check ahead (a warm run checked ~11k bodies ahead it never used)
     pub spec_cached: crate::conc::MemoMap<u32, ()>,
@@ -373,7 +373,7 @@ pub struct Unit {
     /// (concrete type, dyn type) -> vtable address
     pub vtables: crate::conc::MemoMap<(TyId, TyId), u64>,
     /// static `Location` data per (file, line, col) (#[track_caller] arguments)
-    pub locations: std::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
+    pub locations: relax_session::sync::Mutex<crate::fxhash::HashMap<(String, u32, u32), u64>>,
     /// constants whose evaluation failed (reported once, not re-run per use)
     pub const_failed: std::collections::HashSet<(DefId, Vec<TyId>)>,
     pub core_path_cache: crate::conc::MemoMap<String, Option<DefId>>,
@@ -395,7 +395,7 @@ pub struct Unit {
     data_next: AtomicU64,
     /// (bytes, align) of str / byte-string / C-string literals and promoted constants -> their
     /// one read-only copy
-    lit_data: std::sync::Mutex<crate::fxhash::HashMap<(Vec<u8>, u64), u64>>,
+    lit_data: relax_session::sync::Mutex<crate::fxhash::HashMap<(Vec<u8>, u64), u64>>,
     data_end: u64,
     /// immutable data range (consts, literals): loads from it fold at compile time
     pub ro_base: u64,
@@ -409,7 +409,7 @@ pub struct Unit {
     /// bytes of the per-thread block handed out by `tls_alloc`
     pub tls_next: u32,
     /// panicking stand-ins for foreign fns this host lacks, by symbol
-    missing_stubs: std::sync::Mutex<HashMap<String, u64>>,
+    missing_stubs: relax_session::sync::Mutex<HashMap<String, u64>>,
     /// tier-up policy (None: O1 only) and its per-slot records / hot glue
     pub tier1: Option<Tier1Cfg>,
     /// O3 left calls to callees that had never run (ATTR_COLD): callee -> those O3
@@ -422,7 +422,7 @@ pub struct Unit {
     /// state the type checks ahead share with this unit (no owner thread call needed to reach it)
     pub front: std::sync::Arc<FrontShared>,
     /// Instantiated const-fn bodies retained by the data evaluator at their declaration epoch.
-    pub ctfe_fn_bodies: std::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
+    pub ctfe_fn_bodies: relax_session::sync::Mutex<crate::fxhash::HashMap<(DefId, Vec<TyId>), (u64, std::sync::Arc<Body>)>>,
 
     /// this unit's own address (boxed): shared lowering reaches the unit-changing paths
     /// (constant evaluation) through it on the owner thread, as the runtime does through UNIT
@@ -578,7 +578,7 @@ fn tls_key() -> u64 {
     if k != u64::MAX {
         return k;
     }
-    static CREATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CREATE: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
     let _g = CREATE.lock().unwrap_or_else(|e| e.into_inner());
     if TLS_KEY.load(Ordering::Acquire) == u64::MAX {
         TLS_KEY.store(os::tls::key_create(tls_dtor), Ordering::Release);
@@ -666,8 +666,8 @@ struct WatchdogCall {
     parent: Option<std::sync::Arc<WatchdogCall>>,
     hit: AtomicBool,
 }
-static WATCHDOG_CALLS: std::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = std::sync::Mutex::new(Vec::new());
-static WATCHDOG_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static WATCHDOG_CALLS: relax_session::sync::Mutex<Vec<std::sync::Arc<WatchdogCall>>> = relax_session::sync::Mutex::new(Vec::new());
+static WATCHDOG_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 crate::gen_local! {
     static WATCHDOG_STACK: std::cell::RefCell<Vec<std::sync::Arc<WatchdogCall>>>;
 }
@@ -1067,7 +1067,7 @@ fn is_stack_fault(fault: u64, sp: u64) -> bool {
 pub static FAULTS_FATAL: AtomicBool = AtomicBool::new(false);
 
 /// Set by the first contained fault: what happened where (reported with every later error).
-static POISONED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static POISONED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
 /// The poisoned-state note, when a fault was contained earlier.
 pub fn poisoned_note() -> Option<String> {
@@ -1666,9 +1666,9 @@ thread_local! {
     static LAND_REGS: std::cell::UnsafeCell<[u64; REG_WORDS]> = const { std::cell::UnsafeCell::new([0; REG_WORDS]) };
 }
 
-static PROGRAM_ARGS: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+static PROGRAM_ARGS: relax_session::sync::Mutex<Vec<Vec<u8>>> = relax_session::sync::Mutex::new(Vec::new());
 /// (argc, argv) built for each domain that asked, by block base (the process's own: dom0's)
-static ARGV: std::sync::Mutex<Vec<(u64, usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static ARGV: relax_session::sync::Mutex<Vec<(u64, usize, usize)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Sets the program's argv (argv[0] first) before it starts; default: this process's args.
 pub fn set_program_args(args: Vec<Vec<u8>>) {
@@ -3086,7 +3086,7 @@ impl Unit {
     }
 
     /// The reload index, built from the slots made so far on first use.
-    fn reload_index(&self) -> std::sync::MutexGuard<'_, Option<ReloadSlots>> {
+    fn reload_index(&self) -> relax_session::sync::MutexGuard<'_, Option<ReloadSlots>> {
         // fn_create first (fn_id's order): no slot is made while the index is built, and fn_id
         // indexes the slots it makes once the index exists
         let _create = self.fn_create.lock().unwrap_or_else(|e| e.into_inner());
@@ -4478,7 +4478,7 @@ pub fn reclaim_generation() -> u64 {
     COMPILED_FNS.load(Ordering::Relaxed) + TIER1_INSTALLS.load(Ordering::Relaxed)
         + TIER1_FINISHED.load(Ordering::Relaxed) + BUILD_GEN.load(Ordering::Relaxed)
 }
-pub static MAIN_COMPILES: std::sync::Mutex<Vec<MainCompile>> = std::sync::Mutex::new(Vec::new());
+pub static MAIN_COMPILES: relax_session::sync::Mutex<Vec<MainCompile>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// One compile the main thread waited for (RELAX_MAIN_COMPILE_LOG): wall interval, the slot,
 /// how it was satisfied and where its wall time went (ns).
@@ -5050,7 +5050,7 @@ pub(crate) unsafe fn install_patched(up: *mut Unit, id: u32, code: &[u8], map: V
 }
 
 /// `relax check`: every failed build (slot, full error), collected while the check compiles.
-pub static CHECK_FAILURES: std::sync::Mutex<Option<Vec<(u32, String)>>> = std::sync::Mutex::new(None);
+pub static CHECK_FAILURES: relax_session::sync::Mutex<Option<Vec<(u32, String)>>> = relax_session::sync::Mutex::new(None);
 
 /// A slot whose build failed: the error is reported and the slot panics when called.
 unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
@@ -5089,12 +5089,12 @@ pub(crate) fn perf_map_on() -> bool {
 }
 
 fn perf_map(addr: u64, len: usize, name: &str) {
-    static MAP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static MAP: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     let f = MAP.get_or_init(|| {
         if std::env::var("RELAX_PERF_MAP").is_err() {
             return None;
         }
-        std::fs::File::create(format!("/tmp/perf-{}.map", std::process::id())).ok().map(std::sync::Mutex::new)
+        std::fs::File::create(format!("/tmp/perf-{}.map", std::process::id())).ok().map(relax_session::sync::Mutex::new)
     });
     if let Some(m) = f {
         use std::io::Write;
@@ -5275,7 +5275,7 @@ pub(crate) unsafe fn relower_with_probes(up: *mut Unit, id: u32, points: Vec<cra
 /// Stack frame bytes of each slot's latest code (O1, O3): the compile report's frame
 /// columns (kernel-worker threads have 2 MiB stacks; Relax frames larger than rustc's
 /// overflowed them)
-pub static FRAMES: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub static FRAMES: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 fn note_frame(id: u32, frame: u32, slots: u32, tier1: bool) {
     let _k = crate::zone_alloc::kept();
@@ -5303,7 +5303,7 @@ fn slot_bytes(f: &crate::rir::Func) -> u32 {
 }
 
 /// slot bytes of each slot's latest code (O1, O3) next to FRAMES
-pub static FRAME_SLOTS: std::sync::Mutex<Vec<(u32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub static FRAME_SLOTS: relax_session::sync::Mutex<Vec<(u32, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// RELAX_CODE_SIG=<file>: one line per compiled function (its stable name -- instance type
 /// arguments included, syms::stable_fn_name --, code bytes, RIR hash + allocation signature):
@@ -5327,9 +5327,9 @@ fn sig_dir() -> Option<std::ffi::OsString> {
 }
 
 fn code_sig(id: u32, f: &crate::rir::Func, code: &[u8], alloc: u64) {
-    static F: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
+    static F: std::sync::OnceLock<Option<relax_session::sync::Mutex<std::fs::File>>> = std::sync::OnceLock::new();
     if let Some(m) = F.get_or_init(|| {
-        let f = std::env::var("RELAX_CODE_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(std::sync::Mutex::new);
+        let f = std::env::var("RELAX_CODE_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(relax_session::sync::Mutex::new);
         crate::regalloc::SIG_ON.store(f.is_some(), Ordering::Relaxed);
         f
     }) {
@@ -5691,7 +5691,7 @@ thread_local! {
 }
 
 /// O2 slots built from snapshots (or skipped) before the first present: built in full after it
-static O2_LATER: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+static O2_LATER: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The first present released the O2 worker's full builds.
 fn o2_release_later() {
@@ -5707,10 +5707,10 @@ fn o2_build() -> bool {
 }
 
 /// `#[relax(O2)]` slots waiting for their O2 build: (unit, slot)
-static O2_QUEUE: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+static O2_QUEUE: relax_session::sync::Mutex<Vec<(usize, u32)>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots ever queued (each is built once; live patches rebuild through the usual paths)
-static O2_SEEN: std::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = std::sync::Mutex::new(None);
-static O2_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static O2_SEEN: relax_session::sync::Mutex<Option<std::collections::HashSet<(usize, u32)>>> = relax_session::sync::Mutex::new(None);
+static O2_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static O2_THREAD: std::sync::Once = std::sync::Once::new();
 /// O2 builds installed, their worker CPU ns (front + back end), dropped builds, the main
 /// thread's unit-lock wait ns while the O2 worker held it, and the number of such waits
@@ -5777,9 +5777,9 @@ struct BaseSlots {
     released: bool,
     hit: Vec<(usize, u32)>,
 }
-static BASE: std::sync::Mutex<BaseSlots> = std::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
+static BASE: relax_session::sync::Mutex<BaseSlots> = relax_session::sync::Mutex::new(BaseSlots { released: false, hit: Vec::new() });
 /// baseline slots waiting for their O2 build: served when O2_QUEUE is empty
-static O2_BASE: std::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = std::sync::Mutex::new(std::collections::VecDeque::new());
+static O2_BASE: relax_session::sync::Mutex<std::collections::VecDeque<(usize, u32)>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
 
 /// Slot `id` runs baseline code -- built so the cold start compiles fast, but every launch that
 /// links it from the cache runs it again (unoptimised RIR, no inlining of user fns: a warm
@@ -6505,7 +6505,7 @@ unsafe fn build_rir_mode(up: *mut Unit, id: u32, mode: RirMode) -> Result<(), St
         }
     }
     // record where an internal panic happened (no stderr noise; the report carries it)
-    static ICE_AT: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    static ICE_AT: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|info| {
         if let Some(l) = info.location() {
@@ -6919,7 +6919,7 @@ fn backend_bench_on() -> bool {
     static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *B.get_or_init(|| std::env::var_os("RELAX_BACKEND_BENCH").is_some())
 }
-static BENCH_CAPTURE: std::sync::Mutex<Vec<(crate::rir::Func, crate::opt::OptCfg, Option<crate::opt::RoReader>, bool)>> = std::sync::Mutex::new(Vec::new());
+static BENCH_CAPTURE: relax_session::sync::Mutex<Vec<(crate::rir::Func, crate::opt::OptCfg, Option<crate::opt::RoReader>, bool)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// Replays the captured back ends `reps` times; prints the best rep's cpu ms, per 1k fns
 /// and by function size (instructions entering the pipeline).
@@ -7180,7 +7180,7 @@ pub fn compile_watch(what: Option<(&str, usize)>) {
         }
     }
 }
-static WATCH: std::sync::Mutex<Vec<(u64, (String, usize, std::time::Instant, u64))>> = std::sync::Mutex::new(Vec::new());
+static WATCH: relax_session::sync::Mutex<Vec<(u64, (String, usize, std::time::Instant, u64))>> = relax_session::sync::Mutex::new(Vec::new());
 /// set while the watcher signals a stuck thread for its pc (the watchdog signal's handler)
 pub(crate) static WATCH_DUMP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static WATCH_STEPS: AtomicU64 = AtomicU64::new(0);
@@ -7413,13 +7413,13 @@ pub(crate) unsafe fn sandbox_source_rir(up: *mut Unit, id: u32) -> Result<crate:
 /// The skipped modules (Rust file selection) failed builds looked into: the post-boot loader
 /// loads them at the next outer compile (load_deferred).
 /// (outermost build on the failing thread, (skipped module, name)): misses of failed builds.
-static DEFERRED_MISSING: std::sync::Mutex<Vec<(u32, (u32, String))>> = std::sync::Mutex::new(Vec::new());
+static DEFERRED_MISSING: relax_session::sync::Mutex<Vec<(u32, (u32, String))>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The message of a build that needs a skipped module: no error stub is installed for it,
 /// its callers' builds fail too, and the outer compile loads the module and builds again.
 /// Statics whose initializer failed for a module not loaded yet (by DefId): their storage
 /// stays; static_addr runs the initializer again.
-static DEFERRED_STATICS: std::sync::Mutex<std::collections::BTreeSet<u32>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+static DEFERRED_STATICS: relax_session::sync::Mutex<std::collections::BTreeSet<u32>> = relax_session::sync::Mutex::new(std::collections::BTreeSet::new());
 
 /// Whether static `d`'s initializer is waiting for a module the post-boot loader has still to
 /// load (its storage holds no value yet). A cached entry naming it is not linked: the slot is
@@ -8368,7 +8368,7 @@ pub(crate) const SAMPLE_CALLERS: usize = 2;
 static EXEC_LO: AtomicU64 = AtomicU64::new(0);
 static EXEC_HI: AtomicU64 = AtomicU64::new(0);
 /// threads running JIT code: (thread id, call_jit nesting depth, OS sampling handle)
-static SAMPLED: std::sync::Mutex<Vec<(u64, u32, os::sample::Handle)>> = std::sync::Mutex::new(Vec::new());
+static SAMPLED: relax_session::sync::Mutex<Vec<(u64, u32, os::sample::Handle)>> = relax_session::sync::Mutex::new(Vec::new());
 static SAMPLER: std::sync::Once = std::sync::Once::new();
 
 fn sampler_enter(exec_base: u64, exec_size: u64) {
@@ -8560,9 +8560,9 @@ pub struct FieldSite {
 }
 
 /// field sites by (fn, type, field, line): one entry per distinct access per line
-static FIELD_SITES: std::sync::Mutex<Option<std::collections::HashMap<(String, String, u32, u32, u32), FieldSite>>> = std::sync::Mutex::new(None);
+static FIELD_SITES: relax_session::sync::Mutex<Option<std::collections::HashMap<(String, String, u32, u32, u32), FieldSite>>> = relax_session::sync::Mutex::new(None);
 /// steady samples per source position (file << 32 | byte), for RELAX_FIELD_PROF
-static FIELD_HIST: std::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = std::sync::Mutex::new(None);
+static FIELD_HIST: relax_session::sync::Mutex<Option<std::collections::HashMap<u64, u64>>> = relax_session::sync::Mutex::new(None);
 
 pub fn field_note(s: FieldSite) {
     let mut g = FIELD_SITES.lock().unwrap();
@@ -8622,11 +8622,11 @@ fn field_prof_write() {
 
 /// RELAX_PROFILE counts per fn name (a process can run several units: build scripts, proc-macro
 /// hosts, the program): (samples, O3?, code bytes)
-static PROFILE: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, bool, u32)>>> = std::sync::Mutex::new(None);
+static PROFILE: relax_session::sync::Mutex<Option<std::collections::HashMap<String, (u64, bool, u32)>>> = relax_session::sync::Mutex::new(None);
 /// (fn name, code start, code offset) -> samples, for the fns RELAX_DUMP names (written next to their dumps as .prof)
-static PC_PROFILE: std::sync::Mutex<Option<std::collections::HashMap<(String, u64, u32), u64>>> = std::sync::Mutex::new(None);
+static PC_PROFILE: relax_session::sync::Mutex<Option<std::collections::HashMap<(String, u64, u32), u64>>> = relax_session::sync::Mutex::new(None);
 /// current code start per dumped fn name (the .prof keeps the samples of that code only)
-static PC_CODE: std::sync::Mutex<Option<std::collections::HashMap<String, (u64, bool)>>> = std::sync::Mutex::new(None);
+static PC_CODE: relax_session::sync::Mutex<Option<std::collections::HashMap<String, (u64, bool)>>> = relax_session::sync::Mutex::new(None);
 
 /// Writes the RELAX_PROFILE table and the dumped fns' per-instruction samples.
 fn profile_write() {
@@ -8928,9 +8928,9 @@ pub unsafe fn retire_unit(up: *mut Unit) {
 }
 
 /// RELAX_O3_TRACE: why and when the build in flight for a slot was queued
-static TRACE_WHY: std::sync::Mutex<std::collections::BTreeMap<u32, (u8, u64)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TRACE_WHY: relax_session::sync::Mutex<std::collections::BTreeMap<u32, (u8, u64)>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 /// RELAX_O3_TRACE: builds per slot so far
-static TRACE_BUILDS: std::sync::Mutex<std::collections::BTreeMap<u32, u32>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TRACE_BUILDS: relax_session::sync::Mutex<std::collections::BTreeMap<u32, u32>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 
 fn trace_build(u: &Unit, id: u32, what: &str, build_ns: u64) {
     let (why, at) = TRACE_WHY.lock().unwrap().remove(&id).unwrap_or((255, 0));
@@ -9017,7 +9017,7 @@ static TIER_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::Atomic
 // Protected in queue -> active order: a popped job stays pinned through snapshot, codegen
 // and install (including unwinding). T_QUEUED also means already tiered, so it cannot be
 // used as the settle pin. The unit lock alone does not cover off-lock O3 work.
-static TIER_ACTIVE: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static TIER_ACTIVE: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 
 struct TierActive(u32);
 impl Drop for TierActive {
@@ -9030,7 +9030,7 @@ impl Drop for TierActive {
 }
 
 /// queued O3 builds: (slot, why: Q_*, queued at wall_ns, calls/sec at enqueue)
-static TIER_QUEUE: std::sync::Mutex<Vec<(u32, u8, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+static TIER_QUEUE: relax_session::sync::Mutex<Vec<(u32, u8, u64, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 const Q_CALLS: u8 = 0;
 const Q_SAMPLES: u8 = 1;
 const Q_RETIER: u8 = 2;
@@ -9038,7 +9038,7 @@ const Q_MARKED: u8 = 3;
 const Q_WHY: [&str; 4] = ["calls", "samples", "retier", "marked"];
 /// the sampler's recent samples per slot (halved every HEAT_HALF_NS): which queued build
 /// goes first
-static HEAT: std::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = std::sync::Mutex::new(None);
+static HEAT: relax_session::sync::Mutex<Option<std::collections::HashMap<u32, u32>>> = relax_session::sync::Mutex::new(None);
 const HEAT_HALF_NS: u64 = 1_000_000_000;
 
 fn tier1_trace() -> bool {
@@ -9076,7 +9076,7 @@ fn tier_pop(q: &mut Vec<(u32, u8, u64, u64)>) -> Option<(u32, u8, u64, u64)> {
     }).map(|(k, _)| k)?;
     Some(q.remove(best))
 }
-static TIER_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static TIER_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static TIER_THREAD: std::sync::Once = std::sync::Once::new();
 
 /// Three workers by default. RELAX_O3_ADAPTIVE=1 opts into additional low-priority
@@ -9122,7 +9122,7 @@ struct Tier1Stats {
     active: usize,
     max_active: usize,
 }
-static TIER1_STATS: std::sync::Mutex<Option<Tier1Stats>> = std::sync::Mutex::new(None);
+static TIER1_STATS: relax_session::sync::Mutex<Option<Tier1Stats>> = relax_session::sync::Mutex::new(None);
 
 struct Tier1Active;
 impl Tier1Active {
@@ -9583,7 +9583,7 @@ struct T1Profile {
     /// replay: keys installed already (later hot triggers do not rebuild them)
     done: std::collections::HashSet<String>,
 }
-static T1PROF: std::sync::Mutex<Option<T1Profile>> = std::sync::Mutex::new(None);
+static T1PROF: relax_session::sync::Mutex<Option<T1Profile>> = relax_session::sync::Mutex::new(None);
 
 fn t1prof_on(options: &crate::options::Options) -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9767,9 +9767,9 @@ struct Churn {
     last: Option<std::time::Instant>,
     start: Option<std::time::Instant>,
 }
-static CHURN: std::sync::LazyLock<std::sync::Mutex<Churn>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Churn { per: std::collections::HashMap::new(), period_builds: 0, period_ns: 0, period_installed: 0, period_dropped: 0, last: None, start: None }));
+static CHURN: std::sync::LazyLock<relax_session::sync::Mutex<Churn>> = std::sync::LazyLock::new(|| relax_session::sync::Mutex::new(Churn { per: std::collections::HashMap::new(), period_builds: 0, period_ns: 0, period_installed: 0, period_dropped: 0, last: None, start: None }));
 /// slot -> wall time it was queued (oldest-entry age; RELAX_O3_CHURN only)
-static CHURN_QUEUED_AT: std::sync::Mutex<Option<std::collections::HashMap<u32, std::time::Instant>>> = std::sync::Mutex::new(None);
+static CHURN_QUEUED_AT: relax_session::sync::Mutex<Option<std::collections::HashMap<u32, std::time::Instant>>> = relax_session::sync::Mutex::new(None);
 
 fn churn_queued(id: u32) {
     if churn_on() {
@@ -10582,9 +10582,9 @@ pub enum Split {
 static STARTUP_PHASE: AtomicU64 = AtomicU64::new(0);
 // Retain roots (not bodies) so code built during startup can seed its ordinary
 // speculation after the signal even when the app makes no more lazy calls.
-static STARTUP_ROOTS: std::sync::Mutex<Vec<(usize, u32, u8)>> = std::sync::Mutex::new(Vec::new());
-static STARTUP_CACHED: std::sync::Mutex<Vec<(usize, Vec<u32>, u8)>> =
-    std::sync::Mutex::new(Vec::new());
+static STARTUP_ROOTS: relax_session::sync::Mutex<Vec<(usize, u32, u8)>> = relax_session::sync::Mutex::new(Vec::new());
+static STARTUP_CACHED: relax_session::sync::Mutex<Vec<(usize, Vec<u32>, u8)>> =
+    relax_session::sync::Mutex::new(Vec::new());
 pub static FIRST_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static FIRST_PRESENT: AtomicBool = AtomicBool::new(false);
 // Live edits have their own admission gate: disabling speculative startup scheduling
@@ -10828,8 +10828,8 @@ fn spec_jobs(options: &crate::options::Options) -> usize {
 }
 
 static SPEC_UNIT: std::sync::atomic::AtomicPtr<Unit> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-static SPEC_Q: std::sync::Mutex<std::collections::VecDeque<u32>> = std::sync::Mutex::new(std::collections::VecDeque::new());
-static SPEC_WAKE: std::sync::Condvar = std::sync::Condvar::new();
+static SPEC_Q: relax_session::sync::Mutex<std::collections::VecDeque<u32>> = relax_session::sync::Mutex::new(std::collections::VecDeque::new());
+static SPEC_WAKE: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 static SPEC_START: std::sync::Once = std::sync::Once::new();
 /// times a worker's front gave the lock to a waiting thread
 pub static SPEC_YIELDS: AtomicU64 = AtomicU64::new(0);
@@ -11220,7 +11220,7 @@ pub static TIER1_RIR_REBUILT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::ne
 /// nobody called within RELAX_SPEC_TTL_MS (default 2000; 0 = keep forever) is dropped with its
 /// RIR (expire_spec): Stage builds ~10k slots ahead that are never called, and their code + RIR
 /// stayed resident for the whole run.
-static SPEC_BUILT: std::sync::Mutex<Vec<(u32, u64)>> = std::sync::Mutex::new(Vec::new());
+static SPEC_BUILT: relax_session::sync::Mutex<Vec<(u32, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// (results dropped, bytes of code + RIR freed)
 pub static SPEC_EXPIRED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
@@ -11366,8 +11366,8 @@ static BG_PAUSE: AtomicBool = AtomicBool::new(false);
 /// thread id (me()) of the thread that paused the jobs (0: none)
 static BG_PAUSER: AtomicU64 = AtomicU64::new(0);
 static BG_ACTIVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-static BG_MX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static BG_CV: std::sync::Condvar = std::sync::Condvar::new();
+static BG_MX: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
+static BG_CV: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 thread_local! {
     static JOB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -11744,8 +11744,8 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     // back ends, off the unit (on helper threads; the owner serves requests meanwhile)
     type Built = (u32, Result<(Option<(std::sync::Arc<crate::rir::Func>, Vec<(u32, usize)>, u64)>, Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>), String>, Vec<Deferred>);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: std::sync::Mutex<Vec<Built>> = std::sync::Mutex::new(Vec::new());
-    let work_cells: Vec<std::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| std::sync::Mutex::new(Some(w))).collect();
+    let results: relax_session::sync::Mutex<Vec<Built>> = relax_session::sync::Mutex::new(Vec::new());
+    let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
     let finished = std::sync::atomic::AtomicUsize::new(0);
     let helpers = threads.max(1).min(work_cells.len().max(1));
     std::thread::scope(|sc| {
@@ -12012,7 +12012,7 @@ impl BackWork {
         let BackWork { id, spec, front, slots, epoch, env, fold, rotate, session, name, w1 } = self;
         let options = &session.options;
         let runtime = &session.runtime;
-        let done_out: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+        let done_out: relax_session::sync::Mutex<Vec<Deferred>> = relax_session::sync::Mutex::new(Vec::new());
         let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_, String> {
             let t0 = cpu_ns();
             let (rir, opt) = match front {
@@ -12291,18 +12291,18 @@ pub struct FrontShared {
     /// checked bodies with the collect epoch they were checked at
     ahead: crate::conc::ShardMap<AheadKey, (u64, std::sync::Arc<Body>)>,
     /// Claims and the publish/take handoff share one short lock. No type checking under it.
-    inprog: std::sync::Mutex<crate::fxhash::HashSet<AheadKey>>,
+    inprog: relax_session::sync::Mutex<crate::fxhash::HashSet<AheadKey>>,
     /// Instances whose build consumed their body: no new ahead checks.
     built: crate::conc::MemoMap<AheadKey, ()>,
     /// A one-use handoff from lowering helpers. None reserves a slot; removing it lets the
     /// normal build take over without waiting. No slot's build state is owned by a helper.
-    lowered: std::sync::Mutex<HashMap<u32, Option<LoweredAhead>>>,
+    lowered: relax_session::sync::Mutex<HashMap<u32, Option<LoweredAhead>>>,
     /// Until the first present, `helpers` threads type-check every new slot's body ahead (queue
     /// of slots): a cold start's main thread finds most bodies it calls checked
     /// (RELAX_AHEAD_HELPERS=n; default ahead_helpers())
     helpers: u32,
-    queue: std::sync::Mutex<std::collections::VecDeque<AheadWork>>,
-    wake: std::sync::Condvar,
+    queue: relax_session::sync::Mutex<std::collections::VecDeque<AheadWork>>,
+    wake: relax_session::sync::Condvar,
 }
 
 impl FrontShared {
@@ -12340,7 +12340,7 @@ impl FrontShared {
 }
 
 /// The front state of the last unit set up (diagnostics: RELAX_CODE_SIG_CANON).
-static LAST_FRONT: std::sync::Mutex<Option<std::sync::Arc<FrontShared>>> = std::sync::Mutex::new(None);
+static LAST_FRONT: relax_session::sync::Mutex<Option<std::sync::Arc<FrontShared>>> = relax_session::sync::Mutex::new(None);
 
 /// RELAX_CODE_SIG_CANON=1: `Fn(slot)` in a RIR dump becomes the slot's instance (path and
 /// argument types as text), so signatures compare across runs whose slot numbering differs
@@ -12788,7 +12788,7 @@ pub unsafe fn typeck_ahead_slot(up: *mut Unit, id: u32) {
 }
 
 /// Signalled when a check ahead ends (typeck_ahead_slot waits for a helper's check in flight).
-static AHEAD_DONE: (std::sync::Mutex<()>, std::sync::Condvar) = (std::sync::Mutex::new(()), std::sync::Condvar::new());
+static AHEAD_DONE: (relax_session::sync::Mutex<()>, relax_session::sync::Condvar) = (relax_session::sync::Mutex::new(()), relax_session::sync::Condvar::new());
 
 fn inprog_end(f: &FrontShared, key: &AheadKey) {
     f.inprog.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
@@ -13485,11 +13485,11 @@ struct RealTime {
     loaded: bool,
 }
 
-static REALTIME: std::sync::Mutex<Option<RealTime>> = std::sync::Mutex::new(None);
+static REALTIME: relax_session::sync::Mutex<Option<RealTime>> = relax_session::sync::Mutex::new(None);
 /// any real-time trait-object type known (vtable() checks this before the mutex)
 static RT_DYNS: AtomicBool = AtomicBool::new(false);
 /// vtables made for a real-time trait-object type, waiting for realtime_drain
-static RT_PENDING: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+static RT_PENDING: relax_session::sync::Mutex<Vec<u64>> = relax_session::sync::Mutex::new(Vec::new());
 /// slots compiled ahead for real-time code, and the owner's wall ns spent on it
 pub static RT_AHEAD: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 

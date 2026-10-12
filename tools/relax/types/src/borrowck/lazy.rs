@@ -8,7 +8,8 @@ use crate::types::TyId;
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
+use relax_session::sync::{Condvar, Mutex};
 
 pub static WITHHELD: AtomicU64 = AtomicU64::new(0);
 pub fn reject_trap_allowed() -> bool { !APP_CRATES_ONLY }

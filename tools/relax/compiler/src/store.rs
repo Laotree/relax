@@ -225,7 +225,7 @@ fn decode_index(b: &[u8]) -> Vec<Ix> {
 /// Store files this process opened or wrote (generation 0 paths). The cap never evicts them,
 /// nor any of their generations (cache.rs prune_root): evicting a store the run just restored
 /// from made every dependent re-parse on the next run.
-static LIVE: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+static LIVE: relax_session::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = relax_session::sync::Mutex::new(None);
 
 /// Records the store `base` as used by this run. The first time, an opened store's file also
 /// gets its modification time stamped: the order the cap evicts in, and how another run sees it
@@ -240,7 +240,7 @@ fn mark_live(base: &Path, file: &Path, stamp: bool) {
 }
 
 /// The generation files this process opened (a stale generation it still reads is not deleted).
-static OPEN_FILES: std::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = std::sync::Mutex::new(None);
+static OPEN_FILES: relax_session::sync::Mutex<Option<std::collections::HashSet<PathBuf>>> = relax_session::sync::Mutex::new(None);
 
 /// The generation files this process opened.
 pub fn open_files() -> std::collections::HashSet<PathBuf> {
@@ -282,7 +282,7 @@ pub fn base_path(p: &Path) -> PathBuf {
 }
 
 /// Highest generation seen per store (generation 0 path), and the folders listed for it.
-static GENS: std::sync::Mutex<Option<(std::collections::HashMap<PathBuf, u32>, std::collections::HashSet<PathBuf>)>> = std::sync::Mutex::new(None);
+static GENS: relax_session::sync::Mutex<Option<(std::collections::HashMap<PathBuf, u32>, std::collections::HashSet<PathBuf>)>> = relax_session::sync::Mutex::new(None);
 
 /// Lists `dir` into GENS (each store's highest generation present).
 fn list_gens(dir: &Path, gens: &mut std::collections::HashMap<PathBuf, u32>) {
@@ -716,9 +716,9 @@ pub struct RunStore {
     pub path: PathBuf,
     file: std::fs::File,
     cap: u32,
-    state: std::sync::Mutex<RunState>,
+    state: relax_session::sync::Mutex<RunState>,
     /// serializes commits (slot alternation)
-    commit: std::sync::Mutex<()>,
+    commit: relax_session::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -764,8 +764,8 @@ impl RunStore {
         write_at(&file, &h.bytes(), 0)?;
         mark_live(&path, &path, false);
         Ok(RunStore { name: name.into(), path, file, cap,
-            state: std::sync::Mutex::new(RunState { end: h.data_start(), written: h.data_start(), ..Default::default() }),
-            commit: std::sync::Mutex::new(()) })
+            state: relax_session::sync::Mutex::new(RunState { end: h.data_start(), written: h.data_start(), ..Default::default() }),
+            commit: relax_session::sync::Mutex::new(()) })
     }
 
     /// Appends a `len`-byte payload streamed by `write` and maps it. Its key: `key` mixed with

@@ -84,7 +84,8 @@ mod native {
 }
 #[cfg(target_os = "macos")]
 mod native {
-    use std::{collections::HashMap, ffi::{c_char, c_void, CStr, CString}, os::unix::ffi::OsStrExt, path::Path, sync::Mutex};
+    use std::{collections::HashMap, ffi::{c_char, c_void, CStr, CString}, os::unix::ffi::OsStrExt, path::Path};
+    use relax_session::sync::Mutex;
     type Stream = *mut c_void;
     type Callback = extern "C" fn(Stream, *mut c_void, usize, *const *const c_char, *const u32, *const u64);
     #[repr(C)]

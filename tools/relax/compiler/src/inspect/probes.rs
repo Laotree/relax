@@ -12,7 +12,8 @@
 use super::{json_str, now_ms, short, Out, Req};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::{Relaxed, SeqCst}};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use relax_session::sync::Mutex;
 
 include!("../rt_abi.rs");
 

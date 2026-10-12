@@ -41,7 +41,7 @@ static ITEMS: [Slot; SLOTS] = [SLOT0; SLOTS];
 static NEXT_SLOT: AtomicU32 = AtomicU32::new(0);
 thread_local! { static MY_SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed) as usize % SLOTS; }
 /// Items that took long enough to list: (what, name, ms).
-static SLOW: std::sync::Mutex<Vec<(&'static str, String, f64)>> = std::sync::Mutex::new(Vec::new());
+static SLOW: relax_session::sync::Mutex<Vec<(&'static str, String, f64)>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub(crate) struct ZoneTaken(Vec<(&'static str, String, f64)>);
 
@@ -58,7 +58,7 @@ pub(crate) fn zone_put_back(taken: ZoneTaken) {
     std::mem::forget(std::mem::replace(&mut *slow, taken.0));
 }
 /// The crate being loaded and when it started.
-static LOADING: std::sync::Mutex<(String, f64)> = std::sync::Mutex::new((String::new(), 0.0));
+static LOADING: relax_session::sync::Mutex<(String, f64)> = relax_session::sync::Mutex::new((String::new(), 0.0));
 
 /// --verbose: keep the slowest-item lists too.
 pub fn track_for_verbose() {
@@ -230,7 +230,7 @@ pub fn compiling() {
 pub fn session_log_path() -> Option<std::path::PathBuf> {
     SESSION_LOG.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
-static SESSION_LOG: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static SESSION_LOG: relax_session::sync::Mutex<Option<std::path::PathBuf>> = relax_session::sync::Mutex::new(None);
 
 #[cfg(not(unix))]
 pub fn start(_progress: bool) {}
@@ -250,7 +250,7 @@ mod unix {
     use std::io::IsTerminal;
     use std::os::fd::IntoRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::sync::Mutex;
+    use relax_session::sync::Mutex;
 
     extern "C" {
         fn dup(fd: i32) -> i32;

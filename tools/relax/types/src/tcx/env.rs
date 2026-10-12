@@ -2,7 +2,7 @@ use super::{DefId, Tcx};
 use crate::next_solver::ParamEnv;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering::{Acquire, Relaxed, Release}};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// Tcx-local predicate identity. rustc_middle/src/ty/mod.rs:987 stores interned clauses.
 /// Identity hashing follows rustc_data_structures/src/intern.rs:95, using an arena id.

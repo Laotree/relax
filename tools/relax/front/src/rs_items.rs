@@ -437,7 +437,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
         parts[file.ci].boundary = part::Boundary::default();
     }
     // per crate (parts index), merged from the workers as each finishes
-    let accumulated: Vec<std::sync::Mutex<Accumulated>> = (0..parts.len()).map(|_| Default::default()).collect();
+    let accumulated: Vec<relax_session::sync::Mutex<Accumulated>> = (0..parts.len()).map(|_| Default::default()).collect();
     let n = files.len();
     // Splits/raw heads were built by outline workers and qualified as each
     // crate's namespace was prepared; each item list is moved, never cloned.

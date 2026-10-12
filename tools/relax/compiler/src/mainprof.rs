@@ -9,7 +9,7 @@
 
 #[cfg(target_os = "macos")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 const FRAMES: usize = 48;
 

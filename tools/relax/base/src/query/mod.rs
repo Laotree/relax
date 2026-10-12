@@ -22,7 +22,8 @@ use crate::fxhash::HashMap;
 use dep_graph::{DepGraph, TaskDeps, TaskGuard, TaskReads};
 use job::{ActiveJobGuard, QueryJob, QueryLatch, WaitGuard};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct QueryId {

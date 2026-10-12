@@ -4,7 +4,7 @@
 //! its whole percent changes (or, without a total, every 4 MB), at most every 250 ms, and always
 //! at the end.
 use std::collections::HashMap;
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 use std::time::Instant;
 
 struct Last {

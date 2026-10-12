@@ -140,15 +140,15 @@ const KIND_CONST: u32 = 9;
 const KIND_WARM_OUTCOME: u32 = 10;
 /// stores a front image was mapped from: kept for the rest of the process (the arrays point
 /// into their mappings)
-static FRONT_STORES: std::sync::Mutex<Vec<std::sync::Arc<Store>>> = std::sync::Mutex::new(Vec::new());
+static FRONT_STORES: relax_session::sync::Mutex<Vec<std::sync::Arc<Store>>> = relax_session::sync::Mutex::new(Vec::new());
 /// front images this run mapped (store, index entry): checksummed in the background
-static FRONT_USED: std::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = std::sync::Mutex::new(Vec::new());
+static FRONT_USED: relax_session::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub(crate) struct ZoneTaken {
     front_run: front_run::ZoneTaken,
     stores: Vec<std::sync::Arc<Store>>,
     used: Vec<(std::sync::Arc<Store>, usize)>,
-    paths: Option<HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>,
+    paths: Option<HashMap<PathBuf, std::sync::Weak<relax_session::sync::Mutex<()>>>>,
 }
 
 pub(crate) fn zone_take() -> ZoneTaken {
@@ -2684,14 +2684,14 @@ fn append_store(path: &std::path::Path, entries: Vec<NewEntry>, stale: bool, mar
 pub static SPILL_IO: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 // Weak entries coordinate concurrent compiler worlds without retaining old stores.
-static PATHS: std::sync::Mutex<Option<HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>> = std::sync::Mutex::new(None);
+static PATHS: relax_session::sync::Mutex<Option<HashMap<PathBuf, std::sync::Weak<relax_session::sync::Mutex<()>>>>> = relax_session::sync::Mutex::new(None);
 
-fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<std::sync::Mutex<()>> {
+fn front_store_lock(path: &std::path::Path) -> std::sync::Arc<relax_session::sync::Mutex<()>> {
     let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
     let paths = paths.get_or_insert_with(HashMap::new);
     paths.retain(|_, lock| lock.strong_count() != 0);
     if let Some(lock) = paths.get(path).and_then(std::sync::Weak::upgrade) { return lock; }
-    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let lock = std::sync::Arc::new(relax_session::sync::Mutex::new(()));
     paths.insert(path.to_owned(), std::sync::Arc::downgrade(&lock));
     lock
 }
@@ -3090,7 +3090,7 @@ fn def_kind_code(k: &DefKind) -> u32 {
 
 /// RELAX_CACHE_TRACE=<file>: one line per lookup (ms since start, hit/miss, thread, crate, slot
 /// name, stable name), kept in memory and written at exit (no I/O on the compile path).
-static TRACE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static TRACE: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn trace_on() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3425,7 +3425,7 @@ struct FrontGraphWrite {
     demand: Option<std::sync::Arc<crate::preload::DemandImage>>,
     profile: bool,
 }
-static FRONT_GRAPH_WRITES: std::sync::Mutex<Vec<FrontGraphWrite>> = std::sync::Mutex::new(Vec::new());
+static FRONT_GRAPH_WRITES: relax_session::sync::Mutex<Vec<FrontGraphWrite>> = relax_session::sync::Mutex::new(Vec::new());
 
 impl FrontGraphWrite {
     fn capture(prog: &crate::program::Program, dir: &std::path::Path, fps: &[Option<u128>]) -> Option<Self> {
@@ -3441,7 +3441,7 @@ impl FrontGraphWrite {
 /// or mid-run writer is writing) waits for that write instead of finding no pending job,
 /// recording the collected program against a graph not yet written ("graph certificate")
 /// and ending the process under the writer.
-static FRONT_GRAPH_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FRONT_GRAPH_WRITER: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
 fn flush_front_graphs() -> Result<(), String> {
     // Only the cache-writer threads wait here; queueing and pending probes
@@ -3469,7 +3469,7 @@ fn flush_front_graphs() -> Result<(), String> {
 /// lot, std's demand part is many times an app crate's), results in order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let out: Vec<std::sync::Mutex<Option<R>>> = items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let out: Vec<relax_session::sync::Mutex<Option<R>>> = items.iter().map(|_| relax_session::sync::Mutex::new(None)).collect();
     std::thread::scope(|scope| {
         for _ in 0..crate::preload::jobs().min(items.len()).max(1) {
             scope.spawn(|| { let _z = crate::zone_alloc::compiler_thread(); loop {
@@ -3595,18 +3595,18 @@ pub fn front_graph_pending() -> bool {
 #[derive(Default)]
 pub struct FrontImages {
     dir: PathBuf,
-    hashes: std::sync::Mutex<Option<HashMap<String, Option<u128>>>>,
+    hashes: relax_session::sync::Mutex<Option<HashMap<String, Option<u128>>>>,
     /// inputs whose contents this handle read and hashed to validate (an unchanged warm start: 0)
     content_hashes: std::sync::atomic::AtomicU64,
-    probes: std::sync::Mutex<Option<HashMap<String, bool>>>,
-    stores: std::sync::Mutex<HashMap<(String, String), PathBuf>>,
-    certificate: std::sync::Mutex<Option<crate::crate_image::GraphImage>>,
-    begun: std::sync::Mutex<Option<u128>>,
+    probes: relax_session::sync::Mutex<Option<HashMap<String, bool>>>,
+    stores: relax_session::sync::Mutex<HashMap<(String, String), PathBuf>>,
+    certificate: relax_session::sync::Mutex<Option<crate::crate_image::GraphImage>>,
+    begun: relax_session::sync::Mutex<Option<u128>>,
     /// the crates a partial collected restore kept (name, fingerprint): the crates loaded after
     /// them name them as dependencies (restore_collected, full_deps)
-    retained: std::sync::Mutex<Vec<(String, u128)>>,
+    retained: relax_session::sync::Mutex<Vec<(String, u128)>>,
     // A failed collected restore must hand its completed plan to ordinary preload.
-    pending_plan: std::sync::Mutex<Option<(u128, std::sync::Arc<crate::preload::DemandPlan>)>>,
+    pending_plan: relax_session::sync::Mutex<Option<(u128, std::sync::Arc<crate::preload::DemandPlan>)>>,
     /// writes the images of the files this run parses (None: a read-only cache)
     sink: Option<std::sync::Arc<FrontSink>>,
 }
@@ -4456,7 +4456,7 @@ struct FrontWriteQueue {
 /// holds at most one snapshot per eligible crate (metadata and image locations only).
 /// Same-path jobs retain submission order; distinct paths use any available worker.
 struct FrontWriters {
-    queue: std::sync::Arc<(std::sync::Mutex<FrontWriteQueue>, std::sync::Condvar)>,
+    queue: std::sync::Arc<(relax_session::sync::Mutex<FrontWriteQueue>, relax_session::sync::Condvar)>,
     workers: Vec<std::thread::JoinHandle<Vec<usize>>>,
 }
 
@@ -5087,7 +5087,7 @@ mod cold_tests {
 mod data_tests {
     use super::*;
 
-    static CACHE_UNIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static CACHE_UNIT: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
     std::thread_local! {
         // Run a nested lookup while an outer lookup owns its link guard, without

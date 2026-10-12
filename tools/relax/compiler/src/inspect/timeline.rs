@@ -18,7 +18,7 @@
 use super::{json_str, now_ms, short, Out, Req};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::{Acquire, Relaxed, Release}};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// The markers' flag (one relaxed load at each marker site; makepad and Relax std read it
 /// through the loader symbols `relax_recording` / `__relax_recording`): on while the timeline

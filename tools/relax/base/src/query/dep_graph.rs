@@ -5,7 +5,7 @@ use crate::sip::Sip128;
 use std::hash::{Hash, Hasher};
 use std::cell::{Cell, RefCell};
 use std::ops::{Index, IndexMut, Range};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// Stable encodings must use fixed widths, explicit endianness and length prefixes.
 /// rustc_middle/src/dep_graph/dep_node.rs:91 separates key and result fingerprints.

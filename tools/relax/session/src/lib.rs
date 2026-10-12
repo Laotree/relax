@@ -3,6 +3,7 @@ pub mod options;
 pub mod phase;
 pub mod sip;
 pub mod gen_local;
+pub mod sync;
 pub use options::{Options, RuntimeOptions};
 
 /// Compiler statics held for rollback; forget them before destroying their generations.

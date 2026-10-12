@@ -1,5 +1,6 @@
 //! Authored source identities. IDs belong to one load, never to parser byte offsets.
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use relax_session::sync::Mutex;
 
 /// The compact, file-aware part of a proc-macro span. File zero means the current file.
 #[repr(C)]
@@ -131,7 +132,7 @@ impl Entry {
     fn new(path: &str, snapshot: Option<SourceBytes>) -> Arc<Self> {
         Arc::new(Self { path: path.into(), state: Mutex::new(EntryState { source: None, snapshot }) })
     }
-    fn state(&self) -> std::sync::MutexGuard<'_, EntryState> { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
+    fn state(&self) -> relax_session::sync::MutexGuard<'_, EntryState> { self.state.lock().unwrap_or_else(|e| e.into_inner()) }
 }
 
 struct Registry {

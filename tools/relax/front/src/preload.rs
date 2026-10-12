@@ -6,7 +6,8 @@ use crate::lexer::{Tok, T};
 use crate::macros::{MacroRef, MacroTable, MacroUse};
 use crate::parser::ParsedFile;
 use crate::fxhash::{HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
+use relax_session::sync::{Condvar, Mutex};
 
 #[path = "lazy.rs"]
 mod lazy;
@@ -359,7 +360,7 @@ impl Pool {
 
     /// Publish complete prescans in load order. Only queue transfers hold st:
     /// hashing, source replay, macro snapshots and dependency ledgers do not.
-    fn publish<'a>(&'a self, mut st: std::sync::MutexGuard<'a, PoolState>) -> std::sync::MutexGuard<'a, PoolState> {
+    fn publish<'a>(&'a self, mut st: relax_session::sync::MutexGuard<'a, PoolState>) -> relax_session::sync::MutexGuard<'a, PoolState> {
         if st.publishing { return st; }
         st.publishing = true;
         self.resolve_images(&mut st);

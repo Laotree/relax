@@ -18,7 +18,8 @@ use crate::rir::{Mem, Sym, SymClass};
 use crate::types::{TyId, TyKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use relax_session::sync::Mutex;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum SymKind {

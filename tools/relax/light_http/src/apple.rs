@@ -6,7 +6,8 @@
 use crate::{Request, Response, Sink};
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::io::Read;
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::OnceLock;
+use relax_session::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 type Id = *mut c_void;

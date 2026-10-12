@@ -6,7 +6,7 @@
 //! All of it runs on the owner thread.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Owner {

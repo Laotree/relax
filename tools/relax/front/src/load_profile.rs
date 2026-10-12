@@ -1,7 +1,8 @@
 //! RELAX_PROFILE load timeline. Times share a process epoch; nested events are inclusive.
 //! Thread ids distinguish pools (including the proc-macro world's own parse pool).
 //! Buffer per thread: stderr contention must not become the measured critical path.
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use relax_session::sync::Mutex;
 use std::time::Instant;
 
 pub struct Span {

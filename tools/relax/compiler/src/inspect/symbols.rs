@@ -5,7 +5,7 @@
 //! shared cache (macOS system libraries) fall back to dladdr. Names are demangled (Rust legacy and
 //! v0). Used after a captured thread runs again: it allocates and locks freely.
 
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 struct Image {
     /// address range of its executable code (Linux: PT_LOAD with PF_X; macOS: __TEXT)

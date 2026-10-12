@@ -1403,7 +1403,7 @@ fn layout_edit(u: &Unit, d: DefId, fresh: &crate::tcx::AdtT, running_discriminan
 
 /// The crates of the files this session's edits changed (their code must never come from the
 /// disk cache, whose keys predate the edits).
-static EDITED_CRATES: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+static EDITED_CRATES: relax_session::sync::Mutex<Vec<u32>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub(crate) fn edited_crates() -> Vec<u32> {
     EDITED_CRATES.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -1917,7 +1917,7 @@ pub(crate) unsafe fn apply_full(up: *mut Unit, edits: Vec<Edit>) -> Outcome {
 
 unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool) -> Outcome {
     // one transaction at a time (its back ends run off the unit)
-    static PATCHING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PATCHING: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
     let transaction = TraceTransaction::begin(edits.len());
     let _p = PATCHING.lock().unwrap_or_else(|e| e.into_inner());
     let _reloading = jit::Reloading::begin();
@@ -3308,7 +3308,7 @@ fn ms(t0: Instant) -> f64 {
 static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// A restart is due (an edit needs one); the program polls this at its safe point.
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static RESTART_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (RELAX_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3473,7 +3473,7 @@ fn live_log_path() -> String {
 
 pub(crate) fn live_log(line: &str) {
     use std::io::Write;
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(live_log_path()) {
         let _ = writeln!(f, "{}", line);
@@ -3502,7 +3502,7 @@ fn unix_ms(t: std::time::SystemTime) -> f64 {
 }
 
 /// This process's edits: (rung name, ms from the save to the rung applied).
-static SESSION: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::new(Vec::new());
+static SESSION: relax_session::sync::Mutex<Vec<(&'static str, f64)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// One edit's record. `saved`: the newest edited file's modification time (the save).
 fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
@@ -3625,7 +3625,7 @@ enum StreamTarget {
     Path(String),
     Module(u64),
 }
-static STREAMS: std::sync::Mutex<Vec<(usize, StreamTarget, StreamFile)>> = std::sync::Mutex::new(Vec::new());
+static STREAMS: relax_session::sync::Mutex<Vec<(usize, StreamTarget, StreamFile)>> = relax_session::sync::Mutex::new(Vec::new());
 
 fn idle_outcome(file: Option<u32>, line: &str) -> Outcome {
     Outcome { kept: 0, pending: false, rung: Rung::Patch, files: file.into_iter().collect(), lines: vec![line.to_string()], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
@@ -3791,7 +3791,7 @@ pub use inputs::Inputs;
 
 /// The inputs the watcher started with (kept: the settle swap restarts the watcher with them),
 /// whether the watcher thread runs, and the swap's request that it ends.
-static WATCH_INPUTS: std::sync::Mutex<Option<Inputs>> = std::sync::Mutex::new(None);
+static WATCH_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
 static WATCH_RUNNING: AtomicBool = AtomicBool::new(false);
 static WATCH_STOP: AtomicBool = AtomicBool::new(false);
 

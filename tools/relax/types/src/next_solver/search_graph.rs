@@ -19,8 +19,8 @@ pub(crate) struct SolverCache {
     input_ids: IdIndex,
     results: crate::conc::AppendVec<(QueryResult, AccessedOpaques)>,
     result_ids: IdIndex,
-    intern: std::sync::Mutex<()>,
-    global_cache: Box<[std::sync::Mutex<graph::GlobalCache>]>,
+    intern: relax_session::sync::Mutex<()>,
+    global_cache: Box<[relax_session::sync::Mutex<graph::GlobalCache>]>,
 }
 /// hash -> arena index of an interned value: the value lives once, in its arena; a lookup
 /// compares against the arena entry (rustc's interner shape). Entries whose 64-bit hashes are
@@ -28,7 +28,7 @@ pub(crate) struct SolverCache {
 #[derive(Default)]
 struct IdIndex {
     first: crate::conc::ShardMap<u64, u32>,
-    more: std::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
+    more: relax_session::sync::Mutex<std::collections::HashMap<u64, Vec<u32>>>,
     has_more: std::sync::atomic::AtomicBool,
 }
 impl IdIndex {
@@ -103,7 +103,7 @@ impl SolverCache {
     }
     pub(crate) fn len(&self) -> usize { self.inputs.len() + self.proof_trees.len() }
     /// The global cache shard holding `input`'s entries.
-    fn global(&self, input: u32) -> std::sync::MutexGuard<'_, graph::GlobalCache> {
+    fn global(&self, input: u32) -> relax_session::sync::MutexGuard<'_, graph::GlobalCache> {
         crate::solver_work::count(crate::solver_work::SOLVER_GLOBAL_LOCKS);
         self.global_cache[input as usize % GLOBAL_SHARDS].lock().unwrap_or_else(|e| e.into_inner())
     }

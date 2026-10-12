@@ -241,10 +241,10 @@ impl<'p> LayoutCx<'p> {
 pub struct Layouts {
     closure_storage: crate::conc::MemoMap<TyId, ClosureStorage>,
     table: std::sync::atomic::AtomicPtr<LTable>,
-    retired: std::sync::Mutex<Vec<Box<LTable>>>,
+    retired: relax_session::sync::Mutex<Vec<Box<LTable>>>,
     /// the distinct layouts, never freed before the Layouts (`of` hands out 'static references)
     ents: crate::conc::AppendVec<LEntry>,
-    pool: std::sync::Mutex<LPool>,
+    pool: relax_session::sync::Mutex<LPool>,
     /// provided crates' opaque types (provided.rs): rustc's size and align, no fields Relax
     /// may read; set once when the unit is made
     pub opaque: std::collections::HashMap<crate::program::DefId, (u32, u32)>,

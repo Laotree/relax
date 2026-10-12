@@ -413,8 +413,8 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     errors
 }
 
-static FV_ONLY: std::sync::Mutex<Vec<event::BorrowError>> = std::sync::Mutex::new(Vec::new());
-static FV_RECORDS: std::sync::Mutex<Vec<export::FvRecord>> = std::sync::Mutex::new(Vec::new());
+static FV_ONLY: relax_session::sync::Mutex<Vec<event::BorrowError>> = relax_session::sync::Mutex::new(Vec::new());
+static FV_RECORDS: relax_session::sync::Mutex<Vec<export::FvRecord>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// `relax check`: remember a verdict's field-view-only acceptances (relaxed crates).
 pub fn note_verdict(v: &Verdict) {

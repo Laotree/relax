@@ -38,7 +38,7 @@ static ANY: AtomicBool = AtomicBool::new(false);
 // `f` a file whose bytes were read, `p` a path a probe (metadata, exists, is_file, is_dir) found,
 // `d` a folder that was listed. One relaxed load when off.
 static RECORDING: AtomicBool = AtomicBool::new(false);
-static RECORDED: std::sync::Mutex<Option<(std::collections::HashSet<(u8, String)>, std::fs::File)>> = std::sync::Mutex::new(None);
+static RECORDED: relax_session::sync::Mutex<Option<(std::collections::HashSet<(u8, String)>, std::fs::File)>> = relax_session::sync::Mutex::new(None);
 
 /// Starts the read log from RELAX_READ_LOG (the loader calls this at start, next to RELAX_VFS).
 pub fn record_from_env() -> Result<(), String> {
@@ -274,7 +274,7 @@ struct ReadBinding {
     thread: std::thread::ThreadId,
     snapshot: std::sync::Weak<ReadSnapshot>,
 }
-static READ_BINDINGS: std::sync::Mutex<Vec<std::sync::Weak<ReadBinding>>> = std::sync::Mutex::new(Vec::new());
+static READ_BINDINGS: relax_session::sync::Mutex<Vec<std::sync::Weak<ReadBinding>>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub struct ReadScope { _binding: Arc<ReadBinding> }
 
@@ -296,7 +296,7 @@ struct ReadPaths {
 /// same module file from a later lazy expansion reads the disk.
 #[derive(Default)]
 pub struct ReadSnapshot {
-    paths: std::sync::Mutex<ReadPaths>,
+    paths: relax_session::sync::Mutex<ReadPaths>,
     profile: bool,
 }
 impl ReadSnapshot {
@@ -784,7 +784,7 @@ pub fn mount_from_env() -> Result<(), String> {
 // ---- what a program running on Relax's std calls (std/fs.rs, std/process.rs; C ABI, found by
 // their names like the loader's other symbols, jit.rs loader_symbol)
 
-static HELD: std::sync::Mutex<Vec<(u64, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+static HELD: relax_session::sync::Mutex<Vec<(u64, Vec<u8>)>> = relax_session::sync::Mutex::new(Vec::new());
 static HELD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 unsafe fn path_arg<'a>(p: *const u8, n: usize) -> &'a str {
@@ -888,7 +888,7 @@ fn save_records(dir: &std::path::Path, r: &BTreeMap<String, Option<Oid>>) -> io:
     std::fs::rename(&tmp, dir.join(".relax-edits"))
 }
 
-static EDIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static EDIT_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
 
 /// What a write into a virtual path needs: the disk path to write (in the edits folder), its
 /// folder made, and on the first edit of a store file its record and base copy. `keep`: the

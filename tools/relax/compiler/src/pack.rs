@@ -82,7 +82,7 @@ impl Bytes {
 
 /// Every read-only cache file mapping of this process: (start, length).
 #[cfg(unix)]
-static MAPPINGS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static MAPPINGS: relax_session::sync::Mutex<Vec<(usize, usize)>> = relax_session::sync::Mutex::new(Vec::new());
 
 #[cfg(unix)]
 fn note_mapping(start: usize, len: usize) {

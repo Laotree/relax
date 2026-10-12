@@ -13,7 +13,7 @@
 //! resident-size ring the detector fills four times a second, with phase markers.
 
 use super::{json_str, now_ms, Out, Req};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 pub struct Snap {
     pub at_ms: u64,
@@ -335,9 +335,6 @@ fn relax_parts(s: &mut Snap, compiler: bool, partial: &mut Vec<String>) {
     s.add("relax/compiler arena/small live slots", slots as u64);
     s.add("relax/compiler arena/large blocks", large as u64);
     s.add("relax/compiler arena/chunks listed for reuse", listed as u64);
-    let (mutexes, condvars) = crate::zone_alloc::compiler_pthread_boxes();
-    s.add("relax/compiler arena/pthread mutex boxes", mutexes as u64);
-    s.add("relax/compiler arena/pthread condvar boxes", condvars as u64);
     if crate::memstat::enabled() {
         for (i, name) in crate::memstat::TAG_NAMES.iter().enumerate() {
             let v = crate::memstat::live_of_index(i);
@@ -406,7 +403,7 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
     let ev = crate::zone_alloc::compiler_events();
     // the three heaps apart (zone_alloc.rs): the program's malloc, the compiler's own arena, the JIT's mappings
     out.line(&format!(
-        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_pthread_mutex_boxes\":{},\"compiler_arena_pthread_condvar_boxes\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{},\"tombstone_frees\":{},\"generation\":{},\"tombstones\":{}}}{}}}}}",
+        "{{\"split\":{{\"routing\":{},\"program_heap_in_use_mb\":{},\"program_heap_held_free_mb\":{},\"compiler_arena_committed_mb\":{},\"compiler_arena_live_mb\":{},\"jit_code_mb\":{},\"jit_ro_data_mb\":{},\"program_statics_mb\":{},\"burst_arena_committed_mb\":{},\"compiler_arena_touched_mb\":{},\"compiler_arena_live_slots_mb\":{},\"compiler_arena_large_mb\":{},\"compiler_arena_chunks_listed\":{},\"compiler_arena_events\":{{\"contended_chunk\":{},\"contended_pool\":{},\"contended_warm\":{},\"contended_partial\":{},\"yields\":{},\"commits\":{},\"decommits\":{},\"pushes\":{},\"pops\":{},\"tombstone_frees\":{},\"generation\":{},\"tombstones\":{}}}{}}}}}",
         json_str(if crate::zone_alloc::compiler_arena_enabled() { "compiler arena" } else { "off (RELAX_COMPILER_ARENA=0)" }),
         mb(inuse),
         mb(free),
@@ -420,8 +417,6 @@ pub fn cmd_memory(req: &Req, out: &mut Out) {
         mb(snap.get("relax/compiler arena/small live slots")),
         mb(snap.get("relax/compiler arena/large blocks")),
         snap.get("relax/compiler arena/chunks listed for reuse"),
-        snap.get("relax/compiler arena/pthread mutex boxes"),
-        snap.get("relax/compiler arena/pthread condvar boxes"),
         ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7], ev[8],
         crate::zone_alloc::compiler_tombstone_frees(), crate::zone_alloc::compiler_generation(), crate::zone_alloc::compiler_tombstones(),
         match crate::jit::zone_scan::last_total() { Some(n) => format!(",\"kept_in_compiler\":{n}"), None => String::new() },

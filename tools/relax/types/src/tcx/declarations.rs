@@ -2,7 +2,8 @@
 use super::{DefId, Program, Sym, Tcx};
 use crate::next_solver::{Predicate, TraitRef};
 use crate::types::variance::GenericIndices;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use relax_session::sync::Mutex;
 
 #[derive(Default)]
 pub(crate) struct DeclarationQueries {

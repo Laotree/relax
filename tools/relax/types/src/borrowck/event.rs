@@ -1,7 +1,7 @@
 //! Structured borrow errors and the application's diagnostic scope.
 use crate::program::{DefId, Program};
 use crate::types::TyId;
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {

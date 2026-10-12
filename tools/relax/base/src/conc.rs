@@ -118,8 +118,8 @@ pub fn thread_id() -> u32 {
 /// where an RwLock's shared counter would bounce between cores.
 pub struct MemoMap<K, V> {
     table: std::sync::atomic::AtomicPtr<MemoTable<K, V>>,
-    graveyard: std::sync::Mutex<Vec<*mut MemoTable<K, V>>>,
-    locks: Box<[std::sync::Mutex<()>]>,
+    graveyard: relax_session::sync::Mutex<Vec<*mut MemoTable<K, V>>>,
+    locks: Box<[relax_session::sync::Mutex<()>]>,
     bits: u32,
     /// the table, its nodes and keys live in the kept heap (zone_alloc::kept), not the compiler arena
     kept: bool,
@@ -195,8 +195,8 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         let _k = if kept { Some(crate::zone_alloc::kept()) } else { None };
         MemoMap {
             table: std::sync::atomic::AtomicPtr::new(MemoTable::new(bits)),
-            graveyard: std::sync::Mutex::new(Vec::new()),
-            locks: (0..MEMO_LOCKS).map(|_| std::sync::Mutex::new(())).collect(),
+            graveyard: relax_session::sync::Mutex::new(Vec::new()),
+            locks: (0..MEMO_LOCKS).map(|_| relax_session::sync::Mutex::new(())).collect(),
             bits,
             kept,
         }
@@ -404,7 +404,7 @@ impl<K, V> Drop for Detached<K, V> {
 pub struct AppendVec<T> {
     chunks: Box<[std::sync::atomic::AtomicPtr<T>]>,
     len: std::sync::atomic::AtomicUsize,
-    grow: std::sync::Mutex<()>,
+    grow: relax_session::sync::Mutex<()>,
     /// its chunk table and chunks live in the kept heap (zone_alloc::kept)
     kept: bool,
 }

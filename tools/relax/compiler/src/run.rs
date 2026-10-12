@@ -38,16 +38,16 @@ static mut RUN_UNIT: *mut Unit = std::ptr::null_mut();
 pub(crate) fn running_unit() -> *mut Unit {
     unsafe { RUN_UNIT }
 }
-static PHASES: std::sync::Mutex<Vec<(String, f64)>> = std::sync::Mutex::new(Vec::new());
+static PHASES: relax_session::sync::Mutex<Vec<(String, f64)>> = relax_session::sync::Mutex::new(Vec::new());
 static MAIN_START_MS: AtomicU64 = AtomicU64::new(0);
 static ERRORS_SEEN: AtomicU64 = AtomicU64::new(0);
 static QUIET: AtomicBool = AtomicBool::new(false);
 static SILENT: AtomicBool = AtomicBool::new(false);
 pub(crate) static VERBOSE: AtomicBool = AtomicBool::new(false);
-static STARTUP_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
-static REPORT_PATH: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static STARTUP_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
+static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// The package's root crate and manifest dir (RELAX_MAIN_COMPILE_LOG's header).
-static ROOT_DIR: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+static ROOT_DIR: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 
 fn phase(name: &str, t: Instant) {
     let ms = t.elapsed().as_secs_f64() * 1e3;
@@ -88,7 +88,7 @@ fn phase(name: &str, t: Instant) {
 // The program gets RELAX_REPORT_TO=<path>: the makepad platform appends `present` (no time:
 // the launcher times every line on receipt) at its first frame on glass. Writes are whole lines with O_APPEND, so the
 // writers never interleave within a line.
-static REPORT_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+static REPORT_FILE: relax_session::sync::Mutex<Option<std::fs::File>> = relax_session::sync::Mutex::new(None);
 
 pub fn report_open(path: &str) -> Result<(), String> {
     let f = std::fs::OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("--report-to {}: {}", path, e))?;
@@ -123,7 +123,7 @@ fn usage() -> i32 {
     2
 }
 
-static GANDALF_CONSOLE: std::sync::Mutex<Option<crate::gandalf_out::Console>> = std::sync::Mutex::new(None);
+static GANDALF_CONSOLE: relax_session::sync::Mutex<Option<crate::gandalf_out::Console>> = relax_session::sync::Mutex::new(None);
 
 pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     let json = args.iter().any(|a| a == "--json") && args.iter().any(|a| a == "--check");
@@ -1722,7 +1722,7 @@ fn spill_cache() {
 
 static SETTLE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static FIRST_PRESENT_WALL: AtomicU64 = AtomicU64::new(0);
-static PRESENT_PATH: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+static PRESENT_PATH: relax_session::sync::Mutex<Option<std::path::PathBuf>> = relax_session::sync::Mutex::new(None);
 
 /// Observe the platform's existing `present\n` report, independently of whether a launcher
 /// requested progress. Only this small report goes through the private rendezvous; progress
@@ -2102,7 +2102,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
     }
 }
 
-static RUN_DIAGNOSTICS: std::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = std::sync::Mutex::new(None);
+static RUN_DIAGNOSTICS: relax_session::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) struct ZoneTaken(Option<relax_types::infer::diagnostics::DiagCtxt>);
 
@@ -2211,7 +2211,7 @@ fn exit_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RELAX_EXIT_TRACE").is_some())
 }
-static EXIT_MARKS: std::sync::Mutex<Vec<(&'static str, u64)>> = std::sync::Mutex::new(Vec::new());
+static EXIT_MARKS: relax_session::sync::Mutex<Vec<(&'static str, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 /// Ends the exit-work part `name` (the time since the previous mark).
 pub(crate) fn exit_mark(name: &'static str) {
     if exit_trace() {
@@ -2249,7 +2249,7 @@ pub(crate) fn preserve_collected_boot(u: &mut jit::Unit) {
 }
 /// The collected store entry this run wrote mid-run (not one a warm restore mapped): the
 /// settle makes the program's tables views of it (adopt_collected_tables).
-static COLLECTED_WRITTEN: std::sync::Mutex<Option<crate::cache::CollectedWritten>> = std::sync::Mutex::new(None);
+static COLLECTED_WRITTEN: relax_session::sync::Mutex<Option<crate::cache::CollectedWritten>> = relax_session::sync::Mutex::new(None);
 
 /// A cold run holds what a warm run maps: once the collected image is written and the program
 /// is quiet, the heap tables it was encoded from become views of it, decoded entry by entry on

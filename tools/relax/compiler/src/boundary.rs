@@ -18,7 +18,7 @@ use crate::jit::{FnKey, Unit};
 use crate::program::{DefId, DefKind};
 use crate::types::{TyId, TyKind};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 #[derive(Default)]
 struct Entry {
