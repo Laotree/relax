@@ -3731,6 +3731,10 @@ impl Parser<'_> {
 /// first; mark m is macro_rules expansion m of the file (empty: the root context).
 pub type HygCtxt = Vec<u32>;
 
+/// ParsedFile::expansion_kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpnKind { Root, LocalRules, ExternalRules, Builtin }
+
 /// A parsed file that owns its source, tokens and tree.
 pub struct ParsedFile {
     /// the file's source followed by the text of its macro expansions
@@ -4109,6 +4113,31 @@ impl ParsedFile {
                 let d = self.hyg_def_pos(*m);
                 d != u32::MAX && self.pos_before(bpos, d)
             })
+    }
+
+    /// Where the token at `pos` was written (rustc: the outer expansion of its span's context):
+    /// the file's own text or a fragment substituted from it, the body of a `macro_rules!`
+    /// defined in this file, of one defined elsewhere (another crate's: lints are not reported
+    /// in it), or the output of a built-in / derive / proc macro (compiler-generated).
+    pub fn expansion_kind(&self, mut pos: u32) -> ExpnKind {
+        for _ in 0..64 {
+            if pos < self.src_len {
+                return ExpnKind::Root;
+            }
+            let (to, _) = self.tables(pos);
+            if let Some(o) = origin_of(to, pos) {
+                pos = o;
+                continue;
+            }
+            let rules = self.part_at(pos).map_or(&self.rules_exp, |p| &p.rules_exp);
+            if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+                if pos < r.1 {
+                    return if r.2 != u32::MAX { ExpnKind::LocalRules } else { ExpnKind::ExternalRules };
+                }
+            }
+            return ExpnKind::Builtin;
+        }
+        ExpnKind::Root
     }
 
     /// The definition position of mark `m`'s macro (u32::MAX: another file).

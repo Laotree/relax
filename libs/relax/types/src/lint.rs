@@ -19,12 +19,17 @@ pub enum Level { Allow, Warn, Deny, Forbid }
 pub struct Lint {
     pub name: &'static str,
     pub default: Level,
+    /// the default level in edition 2024 code (rustc `@edition Edition2024 => level`)
+    pub default_2024: Level,
     /// the lint groups it belongs to (besides `warnings`)
     pub groups: &'static [&'static str],
 }
 
-pub const UNUSED_MUT: Lint = Lint { name: "unused_mut", default: Level::Warn, groups: &["unused"] };
-pub const OVERFLOWING_LITERALS: Lint = Lint { name: "overflowing_literals", default: Level::Deny, groups: &[] };
+pub const UNUSED_MUT: Lint = Lint { name: "unused_mut", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
+pub const OVERFLOWING_LITERALS: Lint = Lint { name: "overflowing_literals", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
+pub const UNUSED_UNSAFE: Lint = Lint { name: "unused_unsafe", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
+pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = Lint { name: "unsafe_op_in_unsafe_fn", default: Level::Allow, default_2024: Level::Warn, groups: &["rust_2024_compatibility"] };
+pub const STATIC_MUT_REFS: Lint = Lint { name: "static_mut_refs", default: Level::Warn, default_2024: Level::Deny, groups: &["rust_2024_compatibility"] };
 
 const LEVEL_ATTRS: &[(&[u8], Level)] = &[
     (b"allow", Level::Allow), (b"expect", Level::Allow), (b"warn", Level::Warn),
@@ -93,7 +98,7 @@ fn scopes(prog: &Program, def: DefId) -> Vec<(u32, Vec<Attr>)> {
 pub fn level(prog: &Program, def: DefId, lint: &Lint) -> Level {
     let scopes = scopes(prog, def);
     // outermost first; within a list, later attributes override earlier ones
-    let mut level = lint.default;
+    let mut level = if prog.files[prog.def(def).file as usize].edition >= 2024 { lint.default_2024 } else { lint.default };
     let mut warnings: Option<Level> = None;
     let mut forbidden = false;
     let mut forbid_warnings = false;

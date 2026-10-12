@@ -19,9 +19,9 @@ pub trait Copy: crate::clone::Clone {}
 impl Copy for ! {}
 // library/core/src/marker.rs:488: copying a shared reference does not copy its pointee.
 impl<T: PointeeSized> Copy for &T {}
-pub auto trait Send {}
+pub unsafe auto trait Send {}
 #[cfg_attr(not(relax_check), lang = "sync")]
-pub auto trait Sync {}
+pub unsafe auto trait Sync {}
 // library/core/src/marker.rs:105,537-538: a shared borrow transfers only
 // thread-safe access; a mutable borrow transfers exclusive access.
 unsafe impl<T: Sync + PointeeSized> Send for &T {}

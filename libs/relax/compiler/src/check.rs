@@ -114,7 +114,11 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     {
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
-        for e in par_map(&defs, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tcx.check_def_signature(prog, d)))
+        for e in par_map(&defs, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut e = tcx.check_def_signature(prog, d);
+                if prog.def(d).kind == DefKind::Impl { e.extend(relax_types::unsafety::check_impl(prog, tcx, d)); }
+                e
+            }))
             .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- makepad run bug, report it", prog.def_path(d))])) {
             errors.extend(e);
         }
@@ -187,6 +191,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 return (body.errors.to_vec(), Vec::new());
             }
             relax_types::lint::check_literals(prog, tcx, &body);
+            let unsafety = relax_types::unsafety::check_body(prog, tcx, &body);
+            if !unsafety.is_empty() {
+                return (unsafety, Vec::new());
+            }
             if !crate::borrowck::enabled(options) {
                 return (Vec::new(), Vec::new());
             }

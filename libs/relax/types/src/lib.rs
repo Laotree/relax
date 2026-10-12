@@ -49,6 +49,7 @@ pub mod const_fold;
 pub mod borrowck;
 pub mod lint;
 pub mod item_checks;
+pub mod unsafety;
 pub mod stable;
 pub mod mir;
 
