@@ -70,9 +70,19 @@ static HNAMES: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec:
 thread_local! {
     static THIST: std::cell::RefCell<std::collections::HashMap<u64, u64>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
+thread_local! {
+    static TPAIR: std::cell::RefCell<(u64, std::collections::HashMap<(u64, u64), u64>)> = std::cell::RefCell::new((0, std::collections::HashMap::new()));
+}
+static PAIRS: std::sync::Mutex<Vec<((u64, u64), u64)>> = std::sync::Mutex::new(Vec::new());
 #[inline(never)]
 fn hist_note(h: u64) {
     THIST.with(|t| *t.borrow_mut().entry(h).or_insert(0) += 1);
+    TPAIR.with(|t| {
+        let mut t = t.borrow_mut();
+        let prev = t.0;
+        t.0 = h;
+        *t.1.entry((prev, h)).or_insert(0) += 1;
+    });
 }
 fn hist_flush() {
     THIST.with(|t| {
@@ -81,6 +91,17 @@ fn hist_flush() {
             match g.iter_mut().find(|x| x.0 == h) {
                 Some(x) => x.1 += n,
                 None => g.push((h, n)),
+            }
+        }
+    });
+    TPAIR.with(|t| {
+        let mut t = t.borrow_mut();
+        t.0 = 0;
+        let mut g = PAIRS.lock().unwrap_or_else(|e| e.into_inner());
+        for (k, n) in t.1.drain() {
+            match g.iter_mut().find(|x| x.0 == k) {
+                Some(x) => x.1 += n,
+                None => g.push((k, n)),
             }
         }
     });
@@ -347,6 +368,17 @@ extern "C" fn print_stats() {
         by.sort_by(|a, b| b.1.cmp(&a.1));
         let total: u64 = by.iter().map(|x| x.1).sum::<u64>().max(1);
         eprintln!("relax-interp ops: {}", by.iter().take(24).map(|(n, c)| format!("{} {:.1}%", n, 100.0 * *c as f64 / total as f64)).collect::<Vec<_>>().join(", "));
+        let name = |h: u64| names.iter().find(|x| x.0 == h).map(|x| x.1.clone()).unwrap_or_else(|| if h == 0 { "(entry)".into() } else { format!("{:#x}", h) });
+        let mut pairs: Vec<(String, u64)> = Vec::new();
+        for ((a, b), n) in PAIRS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+            let k = format!("{} > {}", name(*a), name(*b));
+            match pairs.iter_mut().find(|x| x.0 == k) {
+                Some(x) => x.1 += n,
+                None => pairs.push((k, *n)),
+            }
+        }
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        eprintln!("relax-interp pairs: {}", pairs.iter().take(30).map(|(n, c)| format!("[{}] {:.1}%", n, 100.0 * *c as f64 / total as f64)).collect::<Vec<_>>().join(", "));
     }
     eprintln!(
         "makepad-run interp: {} fns interpreted ({} RIR insts -> {} KB threaded code, lowered in {:.1} ms), {} stayed native{}",
@@ -1254,6 +1286,71 @@ unsafe extern "C" fn h_storex<const Z: u8>(pc: *const u64, fp: *mut u64, cx: *mu
     st::<Z>(a, *c(fp, w, 2));
     next!(pc.add(3), fp, cx)
 }
+/// frame-relative forms (the base is a stack slot's address: fp + off)
+/// [h, d | off << 32]
+unsafe extern "C" fn h_load_fp<const K: u8>(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    *c(fp, w, 0) = ld::<K>(fp as u64 + (w >> 32));
+    next!(pc.add(2), fp, cx)
+}
+/// [h, src | off << 32]
+unsafe extern "C" fn h_store_fp<const Z: u8>(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    st::<Z>(fp as u64 + (w >> 32), *c(fp, w, 0));
+    next!(pc.add(2), fp, cx)
+}
+/// [h, d|idx|-|sh, off]
+unsafe extern "C" fn h_loadx_fp<const K: u8>(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    let a = (fp as u64).wrapping_add((*c(fp, w, 1)) << (w >> 48)).wrapping_add(*pc.add(2));
+    *c(fp, w, 0) = ld::<K>(a);
+    next!(pc.add(3), fp, cx)
+}
+/// [h, idx|src|-|sh, off]
+unsafe extern "C" fn h_storex_fp<const Z: u8>(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    let w = *pc.add(1);
+    let a = (fp as u64).wrapping_add((*c(fp, w, 0)) << (w >> 48)).wrapping_add(*pc.add(2));
+    st::<Z>(a, *c(fp, w, 1));
+    next!(pc.add(3), fp, cx)
+}
+fn pick_load_fp(k: u8, x: bool) -> H {
+    macro_rules! p {
+        ($k:expr) => {
+            if x {
+                h_loadx_fp::<{ $k }> as H
+            } else {
+                h_load_fp::<{ $k }> as H
+            }
+        };
+    }
+    match k {
+        0 => p!(0),
+        1 => p!(1),
+        2 => p!(2),
+        3 => p!(3),
+        4 => p!(4),
+        5 => p!(5),
+        _ => p!(6),
+    }
+}
+fn pick_store_fp(z: u8, x: bool) -> H {
+    macro_rules! p {
+        ($k:expr) => {
+            if x {
+                h_storex_fp::<{ $k }> as H
+            } else {
+                h_store_fp::<{ $k }> as H
+            }
+        };
+    }
+    match z {
+        1 => p!(1),
+        2 => p!(2),
+        4 => p!(4),
+        _ => p!(8),
+    }
+}
+
 /// [h, d|slot offset in bytes << 32]
 unsafe extern "C" fn h_slot_addr(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     let w = *pc.add(1);
@@ -1973,6 +2070,18 @@ unsafe extern "C" fn h_resume(_pc: *const u64, _fp: *mut u64, cx: *mut Cx) {
 
 /// Out of line: the handler that calls it keeps no frame, so its jump to the next handler stays
 /// a tail call (an inlined call frame turned it into call + return: native stack growth per call).
+/// A call argument's word: a cell, or (bit 31) a frame address fp + byte offset (a stack slot's
+/// address, folded from its SlotAddr).
+const ARG_FRAME: u32 = 1 << 31;
+#[inline(always)]
+unsafe fn arg_word(fp: *mut u64, x: u32) -> u64 {
+    if x & ARG_FRAME != 0 {
+        fp as u64 + (x & !ARG_FRAME) as u64
+    } else {
+        *fp.add(x as usize)
+    }
+}
+
 /// true: the callee unwound (results undefined)
 #[inline(never)]
 unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
@@ -1999,10 +2108,12 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
             (*cx).top = top;
             for (k, &(cell, cls)) in d.args.iter().enumerate() {
                 let dst = fp2.add(f.params[k].0 as usize);
-                let src = fp.add(cell as usize);
-                *dst = *src;
                 if cls == Cls::V128 {
+                    let src = fp.add(cell as usize);
+                    *dst = *src;
                     *dst.add(1) = *src.add(1);
+                } else {
+                    *dst = arg_word(fp, cell);
                 }
             }
             run(f, fp2, cx);
@@ -2044,18 +2155,18 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
         None => {
             let (mut ni, mut nf) = (0usize, 0usize);
             for &(cell, cls) in &d.args {
-                let src = fp.add(cell as usize);
                 if cls == Cls::I && ni < 8 {
-                    regs[ni] = *src;
+                    regs[ni] = arg_word(fp, cell);
                     ni += 1;
                 } else if cls != Cls::I && nf < 8 {
+                    let src = fp.add(cell as usize);
                     regs[RB_Q + 2 * nf] = *src;
                     if cls == Cls::V128 {
                         regs[RB_Q + 2 * nf + 1] = *src.add(1);
                     }
                     nf += 1;
                 } else {
-                    stack[nstack] = *src;
+                    stack[nstack] = arg_word(fp, cell);
                     nstack += 1;
                 }
             }
@@ -2090,7 +2201,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
                 PLoc::Stack(o) => std::ptr::copy_nonoverlapping(&v as *const u64 as *const u8, sbytes.add(o as usize), size.min(8) as usize),
             };
             for (j, ap) in plan.args.iter().enumerate() {
-                let v = *fp.add(d.args[skip + j].0 as usize);
+                let v = arg_word(fp, d.args[skip + j].0);
                 match ap {
                     ArgPlan::Scalar(loc, size) => put(&mut regs, *loc, v, *size),
                     ArgPlan::Parts(parts) => {
@@ -2105,7 +2216,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
                 }
             }
             nstack = (plan.stack_bytes as usize + 7) / 8;
-            let ret_addr = if skip == 1 { *fp.add(d.args[0].0 as usize) } else { 0 };
+            let ret_addr = if skip == 1 { arg_word(fp, d.args[0].0) } else { 0 };
             if matches!(plan.ret, RetPlan::Indirect) {
                 regs[RB_X8] = ret_addr;
             }
@@ -2162,6 +2273,10 @@ struct Lw<'a> {
     cur: String,
     /// the unwind block of the call being lowered (it ends an Invoke block)
     unwind_to: Option<u32>,
+    /// vregs whose only definition is a SlotAddr: the slot's frame offset (their uses as a
+    /// memory base or a call argument read fp + offset; the SlotAddr itself is only lowered when
+    /// another use needs the value in a cell)
+    frame: Vec<Option<u32>>,
 }
 
 fn mem_load_kind(m: Mem) -> u8 {
@@ -2221,6 +2336,9 @@ fn pick_store(z: u8, x: bool) -> H {
 }
 
 impl<'a> Lw<'a> {
+    fn frame_off(&self, v: VReg) -> Option<u32> {
+        self.frame[v.0 as usize]
+    }
     fn r(&self, v: VReg) -> u64 {
         self.cell[v.0 as usize] as u64
     }
@@ -2252,13 +2370,137 @@ impl<'a> Lw<'a> {
     }
 }
 
+/// Moves the interpreter can drop by sharing a cell (each costs a dispatch): (vreg -> vreg whose
+/// cell it uses, moves to skip as (block, index)).
+/// - forwarding: `t = op ..; d = Mov t` with t defined once and used only by that move, in one
+///   block, and d neither read nor written between the two: op writes d's cell directly;
+/// - copy propagation: `c = Mov s` with c defined only there and every use of c after it in the
+///   same block, s not written from the move to c's last use: c reads s's cell.
+/// Scalar classes only. Off with MAKEPAD_RUN_INTERP_NOCOALESCE.
+fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
+    let n = f.vregs.len();
+    let mut alias: Vec<u32> = (0..n as u32).collect();
+    let mut skip = std::collections::HashSet::new();
+    if std::env::var_os("MAKEPAD_RUN_INTERP_NOCOALESCE").is_some() {
+        return (alias, skip);
+    }
+    let (mut defs, mut uses) = (vec![0u32; n], vec![0u32; n]);
+    for p in &f.params {
+        defs[p.0 as usize] += 1;
+        uses[p.0 as usize] += 1; // a parameter is live in: never rename it away
+    }
+    let mut tu = Vec::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            crate::regalloc::for_defs(i, |v| defs[v.0 as usize] += 1);
+            crate::regalloc::for_uses(i, |v| uses[v.0 as usize] += 1);
+        }
+        tu.clear();
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for v in &tu {
+            uses[v.0 as usize] += 1;
+        }
+    }
+    let scalar = |v: VReg| f.vregs[v.0 as usize] != Cls::V128;
+    // the cell a vreg uses now (aliases resolved): reads and writes compare cells, not vregs
+    fn root(alias: &[u32], v: u32) -> u32 {
+        let mut r = v;
+        while alias[r as usize] != r {
+            r = alias[r as usize];
+        }
+        r
+    }
+    let reads = |alias: &[u32], i: &Inst, v: VReg| {
+        let rv = root(alias, v.0);
+        let mut r = false;
+        crate::regalloc::for_uses(i, |u| r |= root(alias, u.0) == rv);
+        r
+    };
+    let writes = |alias: &[u32], i: &Inst, v: VReg| {
+        let rv = root(alias, v.0);
+        let mut r = false;
+        crate::regalloc::for_defs(i, |u| r |= root(alias, u.0) == rv);
+        r
+    };
+    let single_def = |i: &Inst| {
+        let mut k = 0;
+        crate::regalloc::for_defs(i, |_| k += 1);
+        k == 1 && !matches!(i, Inst::Call(..) | Inst::Cpuid(..))
+    };
+    for (bi, b) in f.blocks.iter().enumerate() {
+        tu.clear();
+        crate::regalloc::term_uses(&b.term, &mut tu);
+        for (j, ins) in b.insts.iter().enumerate() {
+            let Inst::Mov(d, s) = *ins else { continue };
+            if d == s || !scalar(d) || f.vregs[d.0 as usize] != f.vregs[s.0 as usize] {
+                continue;
+            }
+            // forwarding: s defined once, used once (here), by an earlier inst of this block
+            if defs[s.0 as usize] == 1 && uses[s.0 as usize] == 1 && alias[s.0 as usize] == s.0 && alias[d.0 as usize] == d.0 {
+                if let Some(i) = (0..j).rev().find(|&i| writes(&alias, &b.insts[i], s)) {
+                    let constant = matches!(b.insts[i], Inst::Iconst(..) | Inst::Fconst(..) | Inst::Addr(..) | Inst::FnAddr(..) | Inst::VConst(..));
+                    let clean = !constant && single_def(&b.insts[i]) && (i + 1..j).all(|k| !reads(&alias, &b.insts[k], d) && !writes(&alias, &b.insts[k], d) && !skip.contains(&(bi as u32, k as u32)));
+                    if clean {
+                        alias[s.0 as usize] = d.0;
+                        skip.insert((bi as u32, j as u32));
+                        continue;
+                    }
+                }
+            }
+            // copy propagation: d defined only here; all its uses after j in this block; s not
+            // written from j to the last use
+            if defs[d.0 as usize] == 1 && alias[d.0 as usize] == d.0 && alias[s.0 as usize] == s.0 && !f.params.contains(&d) {
+                let mut seen = 0u32;
+                let mut last = None;
+                for k in j + 1..b.insts.len() {
+                    if reads(&alias, &b.insts[k], d) {
+                        seen += 1;
+                        last = Some(k);
+                    }
+                }
+                let in_term = tu.contains(&d);
+                if in_term {
+                    seen += 1;
+                }
+                if seen == uses[d.0 as usize] && seen > 0 {
+                    let end = if in_term { b.insts.len() } else { last.unwrap() };
+                    // s unchanged until d's last use (a write at `end` itself reads first)
+                    let ok = (j + 1..end).all(|k| !writes(&alias, &b.insts[k], s)) && (!in_term || (j + 1..b.insts.len()).all(|k| !writes(&alias, &b.insts[k], s)));
+                    if ok {
+                        alias[d.0 as usize] = s.0;
+                        skip.insert((bi as u32, j as u32));
+                    }
+                }
+            }
+        }
+    }
+    // chains: follow to the representative
+    for v in 0..n {
+        let mut r = alias[v];
+        let mut guard = 0;
+        while alias[r as usize] != r && guard < 64 {
+            r = alias[r as usize];
+            guard += 1;
+        }
+        alias[v] = r;
+    }
+    (alias, skip)
+}
+
 fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, &'static str> {
-    // frame: one cell per vreg (two for V128), then the stack slots, then C ABI buffers
-    let mut cell = Vec::with_capacity(f.vregs.len());
+    let (alias, skip) = coalesce(f);
+    // frame: one cell per vreg (two for V128), then the stack slots, then C ABI buffers; an
+    // aliased vreg shares its representative's cell
+    let mut cell = vec![0u32; f.vregs.len()];
     let mut n = 0u32;
-    for c in &f.vregs {
-        cell.push(n);
-        n += if *c == Cls::V128 { 2 } else { 1 };
+    for (v, c) in f.vregs.iter().enumerate() {
+        if alias[v] as usize == v {
+            cell[v] = n;
+            n += if *c == Cls::V128 { 2 } else { 1 };
+        }
+    }
+    for v in 0..f.vregs.len() {
+        cell[v] = cell[alias[v] as usize];
     }
     if n > 0xffff {
         return Err("more than 65535 frame cells");
@@ -2386,7 +2628,65 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         }
     }
     let preload: Vec<(u32, u64)> = (0..f.vregs.len()).filter(|v| hoist[*v]).filter_map(|v| konst[v].flatten().map(|k| (v as u32, k as u64))).collect();
-    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None };
+    // stack slot addresses folded into their uses (see Lw::frame)
+    let mut frame_of: Vec<Option<u32>> = vec![None; f.vregs.len()];
+    let mut needs_cell = vec![false; f.vregs.len()];
+    if std::env::var_os("MAKEPAD_RUN_INTERP_NOFRAMEFOLD").is_none() {
+        let mut defs = vec![0u32; f.vregs.len()];
+        for b in &f.blocks {
+            for i in &b.insts {
+                crate::regalloc::for_defs(i, |v| defs[v.0 as usize] += 1);
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::SlotAddr(d, s) = i {
+                    if defs[d.0 as usize] == 1 && !f.params.contains(d) {
+                        frame_of[d.0 as usize] = Some(slot_off[*s as usize]);
+                    }
+                }
+            }
+        }
+        // another vreg sharing the cell (coalescing) reads it: keep the cell written
+        for v in 0..f.vregs.len() {
+            let r = alias[v] as usize;
+            if r != v {
+                needs_cell[r] = true;
+            }
+        }
+        // uses other than a memory base or a call argument need the value in its cell
+        let mut tu = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                let mut foldable: Vec<VReg> = Vec::new();
+                match i {
+                    Inst::Load(_, _, base, _) => foldable.push(*base),
+                    Inst::LoadX(_, _, base, idx, _, _) if base != idx => foldable.push(*base),
+                    Inst::Store(_, base, _, src) if base != src => foldable.push(*base),
+                    Inst::StoreX(_, base, idx, _, _, src) if base != src && base != idx => foldable.push(*base),
+                    Inst::Call(c, args, _) => {
+                        for a in args {
+                            if f.vregs[a.0 as usize] == Cls::I && !matches!(c, Callee::Indirect(v) | Callee::CIndirect(v, _) if v == a) {
+                                foldable.push(*a);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                crate::regalloc::for_uses(i, |u| {
+                    if !foldable.contains(&u) {
+                        needs_cell[u.0 as usize] = true;
+                    }
+                });
+            }
+            tu.clear();
+            crate::regalloc::term_uses(&b.term, &mut tu);
+            for u in &tu {
+                needs_cell[u.0 as usize] = true;
+            }
+        }
+    }
+    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None, frame: frame_of };
     let mut block_at = vec![0usize; f.blocks.len()];
     if !preload.is_empty() {
         let mut ws = vec![preload.len() as u64];
@@ -2412,6 +2712,14 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
             }
             if let Inst::Iconst(d, _) | Inst::Fconst(d, _, _) | Inst::Addr(d, _) | Inst::FnAddr(d, _) = i {
                 if hoist[d.0 as usize] {
+                    continue;
+                }
+            }
+            if skip.contains(&(bi as u32, k as u32)) {
+                continue;
+            }
+            if let Inst::SlotAddr(d, _) = i {
+                if l.frame[d.0 as usize].is_some() && !needs_cell[d.0 as usize] {
                     continue;
                 }
             }
@@ -2625,13 +2933,33 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
                 }
             }
         }
+        Inst::Load(m, d, base, off) if l.frame_off(*base).is_some() => {
+            let o = l.frame_off(*base).unwrap() as i64 + *off as i64;
+            let w = l.r(*d) | (o as u64) << 32;
+            l.emit(pick_load_fp(mem_load_kind(*m), false), &[w]);
+        }
         Inst::Load(m, d, base, off) => {
             let w = l.w2(*d, *base) | (*off as u32 as u64) << 32;
             l.emit(pick_load(mem_load_kind(*m), false), &[w]);
         }
+        Inst::Store(m, base, off, src) if l.frame_off(*base).is_some() => {
+            let o = l.frame_off(*base).unwrap() as i64 + *off as i64;
+            let w = l.r(*src) | (o as u64) << 32;
+            l.emit(pick_store_fp(mem_size(*m), false), &[w]);
+        }
         Inst::Store(m, base, off, src) => {
             let w = l.w2(*base, *src) | (*off as u32 as u64) << 32;
             l.emit(pick_store(mem_size(*m), false), &[w]);
+        }
+        Inst::LoadX(m, d, base, idx, sh, off) if l.frame_off(*base).is_some() => {
+            let o = l.frame_off(*base).unwrap() as i64 + *off as i64;
+            let w = l.w2(*d, *idx) | (*sh as u64) << 48;
+            l.emit(pick_load_fp(mem_load_kind(*m), true), &[w, o as u64]);
+        }
+        Inst::StoreX(m, base, idx, sh, off, src) if l.frame_off(*base).is_some() => {
+            let o = l.frame_off(*base).unwrap() as i64 + *off as i64;
+            let w = l.w2(*idx, *src) | (*sh as u64) << 48;
+            l.emit(pick_store_fp(mem_size(*m), true), &[w, o as u64]);
         }
         Inst::LoadX(m, d, base, idx, sh, off) => {
             let w = l.w3(*d, *base, *idx) | (*sh as u64) << 48;
@@ -2705,7 +3033,10 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             }
             let d = Box::new(CallDesc {
                 target,
-                args: args.iter().map(|v| (l.cell[v.0 as usize], l.cls(*v))).collect(),
+                args: args.iter().map(|v| (match l.frame_off(*v) {
+                    Some(o) => ARG_FRAME | o,
+                    None => l.cell[v.0 as usize],
+                }, l.cls(*v))).collect(),
                 rets: rets.iter().map(|v| (l.cell[v.0 as usize], l.cls(*v))).collect(),
                 csig,
                 frame_words: l.frame_words,
