@@ -675,6 +675,11 @@ fn sync_arena(s: &Sb, a: &Arena) {
 // ------------------------------------------------------------------ arenas
 
 /// Creates a module's arena (`mem` bytes of heap budget). Returns its index.
+/// Does any sandbox module live (the settle swap is refused meanwhile)?
+pub fn any_live() -> bool {
+    SB.lock().map(|g| g.is_some()).unwrap_or(true) || ARENAS.iter().any(|a| !a.load(std::sync::atomic::Ordering::Acquire).is_null())
+}
+
 pub fn new_arena(module: u32, mem: u64, fuel: i64) -> Result<Arc<Arena>, String> {
     if cfg!(windows) {
         return Err("sandboxed run-time modules are not available on Windows yet".to_string());

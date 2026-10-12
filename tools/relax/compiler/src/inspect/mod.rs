@@ -768,6 +768,7 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
             };
             let ch = opened.channel;
             let service = active.clone();
+            { let _k = crate::zone_alloc::kept();
             if let Err(e) = std::thread::Builder::new().name("makepad-remote-service".into()).spawn(move || {
                 while let Some(ev) = ch.recv() {
                     if matches!(ev, makepad_remote::Event::Closed(..)) {
@@ -780,6 +781,7 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
                 active.close();
                 ACTIVE_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !std::sync::Arc::ptr_eq(c, &active));
                 return Err((makepad_remote::conn::CLOSE_REFUSED, e.to_string()));
+            }
             }
             Ok(())
         }),

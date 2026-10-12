@@ -4,20 +4,35 @@
 
 pub use relax_base::*;
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
-    program::zone_reset();
-    builtins::zone_reset();
-    macro_reg::zone_reset();
+/// Compiler statics held for rollback; forget them before destroying their generations.
+pub struct ZoneTaken {
+    program: program::ZoneTaken,
+    builtins: builtins::ZoneTaken,
+    macro_reg: macro_reg::ZoneTaken,
+}
+
+/// Takes this crate's compiler statics while every compiler thread is quiesced.
+pub fn zone_take() -> ZoneTaken {
+    ZoneTaken {
+        program: program::zone_take(),
+        builtins: builtins::zone_take(),
+        macro_reg: macro_reg::zone_take(),
+    }
+}
+
+/// Restores the statics after an aborted swap, forgetting the new generation's values.
+pub fn zone_put_back(taken: ZoneTaken) {
+    program::zone_put_back(taken.program);
+    builtins::zone_put_back(taken.builtins);
+    macro_reg::zone_put_back(taken.macro_reg);
 }
 
 #[test]
 fn zone_reset_fresh_process() {
     const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        zone_reset();
-        zone_reset();
+        std::mem::forget(zone_take());
+        std::mem::forget(zone_take());
         return;
     }
     // Other tests use these statics; the reset and its empty-state assertions need isolation.

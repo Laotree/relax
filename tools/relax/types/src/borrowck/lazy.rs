@@ -247,21 +247,73 @@ pub fn take_verdict_keys() -> Vec<(u128, StoredVerdict)> {
 
 static QUEUE: Mutex<Option<Queue>> = Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken {
+    verdicts: HashMap<DefId, HashMap<ItemKey, FnVerdict>>,
+    keys: Vec<(u128, StoredVerdict)>,
+    queue: Option<Queue>,
+}
+
+pub(crate) fn zone_take() -> ZoneTaken {
     // VERDICTS' LazyLock stays initialised; its mutex payload can be reset normally.
     let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *verdicts));
     let mut keys = VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *keys));
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *queue));
+    let taken = ZoneTaken {
+        verdicts: std::mem::take(&mut *verdicts),
+        keys: std::mem::take(&mut *keys),
+        queue: std::mem::take(&mut *queue),
+    };
     #[cfg(test)]
     { assert!(verdicts.is_empty()); assert!(keys.is_empty()); assert!(queue.is_none()); }
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *verdicts, taken.verdicts));
+    let mut keys = VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *keys, taken.keys));
+    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *queue, taken.queue));
 }
 
 static WAKE: Condvar = Condvar::new();
 static STARTED: AtomicBool = AtomicBool::new(false);
 static STOP: AtomicBool = AtomicBool::new(false);
+/// The settle swap asks the worker to end (it holds the old front for its whole life), and
+/// whether it runs.
+static SWAP_STOP: AtomicBool = AtomicBool::new(false);
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Ends the worker for the settle swap and waits up to `ms` for it (the check in flight
+/// finishes first). It starts again at the next enqueue, from the new front. false: it did not
+/// end in time (it keeps running).
+pub fn swap_stop(ms: u64) -> bool {
+    if !STARTED.load(Ordering::SeqCst) { return true; }
+    SWAP_STOP.store(true, Ordering::SeqCst);
+    let t = std::time::Instant::now();
+    loop {
+        {
+            let _q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+            WAKE.notify_all();
+        }
+        if !RUNNING.load(Ordering::SeqCst) {
+            // nothing queues between here and the swap's end: enqueue spawns a new worker
+            STARTED.store(false, Ordering::SeqCst);
+            SWAP_STOP.store(false, Ordering::SeqCst);
+            return true;
+        }
+        if t.elapsed().as_millis() as u64 > ms {
+            SWAP_STOP.store(false, Ordering::SeqCst);
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+}
+
+fn stopping() -> bool { STOP.load(Ordering::SeqCst) || SWAP_STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() }
+struct RunningGuard;
+impl Drop for RunningGuard { fn drop(&mut self) { RUNNING.store(false, Ordering::SeqCst); } }
 pub static CHECKED: AtomicU64 = AtomicU64::new(0);
 /// checks that failed inside the checker (a panic): those fns are NOT checked
 pub static PANICS: AtomicU64 = AtomicU64::new(0);
@@ -331,8 +383,11 @@ fn enqueue(options: &crate::options::Options, src: &Arc<dyn FrontSource>, def: D
         q.insert(Item { key, args, cache_key, src: src.clone(), discovery: 0 }, rank);
     }
     if !STARTED.swap(true, Ordering::SeqCst) {
+        RUNNING.store(true, Ordering::SeqCst);
         let s = src.clone(); let verbose = options.verbose;
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("gandalf".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); worker(s, verbose) });
+        }
     }
     WAKE.notify_one();
 }
@@ -423,10 +478,11 @@ fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[Ty
     }
 }
 fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
+    let _running = RunningGuard;
     let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
     src.lower_priority(); src.wait_start();
     loop {
-        if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
+        if stopping() { return; }
         let quiet = src.quiet_ns();
         if quiet < QUIET_NS {
             std::thread::sleep(std::time::Duration::from_millis(((QUIET_NS - quiet) / 1_000_000).clamp(20, 500)));
@@ -435,7 +491,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
         let (rank, item) = {
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             loop {
-                if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
+                if stopping() { return; }
                 settle_finished_check();
                 if let Some(item) = guard.as_mut().and_then(Queue::pop) { break item; }
                 if verbose && std::env::var_os("RELAX_GANDALF_STATS").is_some() && CHECKED.load(Ordering::Relaxed) > 0 && !IDLE_REPORTED.swap(true, Ordering::Relaxed) {
@@ -576,7 +632,7 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
             continue;
         }
         if preempted {
-            if STOP.load(Ordering::SeqCst) || crate::preempt::is_stopped() { return; }
+            if stopping() { return; }
             PREEMPTED.fetch_add(1, Ordering::Relaxed);
             let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
             if crate::preempt::is_stopped() { return; }

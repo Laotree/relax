@@ -145,11 +145,19 @@ pub const LATE_ENV: u8 = 2;
 
 static LATE: std::sync::Mutex<Option<std::collections::HashMap<(String, u8, String), u128>>> = std::sync::Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Option<std::collections::HashMap<(String, u8, String), u128>>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *late));
+    let taken = ZoneTaken(std::mem::take(&mut *late));
     #[cfg(test)]
     assert!(late.is_none());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut late = LATE.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *late, taken.0));
 }
 
 /// The content hash a late input is recorded with.

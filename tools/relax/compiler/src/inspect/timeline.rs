@@ -373,6 +373,7 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
             let max = req.num("max_s", 30);
             let e = EPOCH.load(Relaxed);
             // a forgotten recording stops itself
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name("relax-inspect-tl".into()).spawn(move || {
                 super::heap::exclude_this_thread();
                 std::thread::sleep(std::time::Duration::from_secs(max));
@@ -380,6 +381,7 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
                     stop();
                 }
             });
+            }
             super::mem::mark("timeline start");
             out.line(&format!("{{\"timeline\":\"recording\",\"max_s\":{},\"more\":[\"timeline stop\",\"timeline frames\",\"timeline frame slowest\",\"timeline save\"]}}", max));
         }

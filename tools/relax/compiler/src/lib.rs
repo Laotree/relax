@@ -45,15 +45,36 @@ pub mod inspect;
 pub mod memreport;
 pub mod registry_net;
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
-    owner::zone_reset();
-    native_macros::zone_reset();
-    cache::zone_reset();
-    jit::zone_reset();
-    run::zone_reset();
-    tui::zone_reset();
+/// Compiler statics held for rollback; forget them before destroying their generations.
+pub struct ZoneTaken {
+    owner: owner::ZoneTaken,
+    native_macros: native_macros::ZoneTaken,
+    cache: cache::ZoneTaken,
+    jit: jit::ZoneTaken,
+    run: run::ZoneTaken,
+    tui: tui::ZoneTaken,
+}
+
+/// Takes this crate's compiler statics while every compiler thread is quiesced.
+pub fn zone_take() -> ZoneTaken {
+    ZoneTaken {
+        owner: owner::zone_take(),
+        native_macros: native_macros::zone_take(),
+        cache: cache::zone_take(),
+        jit: jit::zone_take(),
+        run: run::zone_take(),
+        tui: tui::zone_take(),
+    }
+}
+
+/// Restores the statics after an aborted swap, forgetting the new generation's values.
+pub fn zone_put_back(taken: ZoneTaken) {
+    owner::zone_put_back(taken.owner);
+    native_macros::zone_put_back(taken.native_macros);
+    cache::zone_put_back(taken.cache);
+    jit::zone_put_back(taken.jit);
+    run::zone_put_back(taken.run);
+    tui::zone_put_back(taken.tui);
 }
 
 #[cfg(test)]

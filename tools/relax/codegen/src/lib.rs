@@ -16,22 +16,27 @@ pub mod regalloc;
 pub mod rir;
 pub mod x64;
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
+/// This crate has no movable compiler statics; opt::T remains a process-wide OnceLock.
+pub struct ZoneTaken;
+
+/// Takes this crate's compiler statics while every compiler thread is quiesced.
+pub fn zone_take() -> ZoneTaken {
     // opt::T is a OnceLock<Option<String>>: shared statics cannot reset OnceLock safely.
     // RELAX_TRACE_OPT's cached string therefore still needs kept allocation before swaps
     // are enabled with tracing; this reset deliberately does not initialise that lazy.
     #[cfg(test)]
     assert!(opt::T.get().is_none(), "trace_opt's OnceLock cannot be reset once initialised");
+    ZoneTaken
 }
+
+pub fn zone_put_back(_: ZoneTaken) {}
 
 #[test]
 fn zone_reset_fresh_process() {
     const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        zone_reset();
-        zone_reset();
+        std::mem::forget(zone_take());
+        std::mem::forget(zone_take());
         return;
     }
     // Other tests use these statics; the reset and its empty-state assertions need isolation.

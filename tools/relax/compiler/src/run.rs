@@ -302,6 +302,17 @@ pub(crate) fn resolve_package(
     Ok(Resolved { units, g, order, cfgs, live_inputs })
 }
 
+/// The warm front end, shared by boot and the settle swap (jit zone_swap): the program and type
+/// context restored from this launch's collected image, and the proof the cache opens with.
+/// None: no usable image (the caller loads the sources).
+pub(crate) fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Option<(crate::program::Program, crate::tcx::Tcx, Option<crate::cache::CollectedCache>)> {
+    images.restore_collected(sess, pre)
+}
+
+pub(crate) fn set_diagnostics(dcx: relax_types::infer::diagnostics::DiagCtxt) {
+    *RUN_DIAGNOSTICS.lock().unwrap() = Some(dcx);
+}
+
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
     PHASES.lock().unwrap().clear();
     ERRORS_SEEN.store(0, Ordering::Relaxed);
@@ -475,7 +486,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         a.extend(cargo_flags_in);
         a
     };
-    let frozen = std::sync::Arc::new(crate::Session { options: driver_options, runtime: sess.runtime.clone() });
+    // kept: the settle swap (jit zone_swap) destroys the compiler arena; the session outlives it
+    let frozen = crate::zone_alloc::kept_with(|| std::sync::Arc::new(crate::Session { options: driver_options.clone(), runtime: sess.runtime.clone() }));
     let sess = &frozen;
     let options = &sess.options;
     let runtime = &sess.runtime;
@@ -604,6 +616,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         verbose!("relax-run: gandalf app scope ({} crates): {}", app_roots.len(), app_roots.join(" "));
     }
     crate::borrowck::event::set_app_scope(app_roots);
+    jit::zone_swap::remember_boot(&pre);
     let front_images = crate::cache::FrontImages::open(options);
     prog.record_front = front_images.is_some();
     prog.front_sink = front_images.as_ref().and_then(|images| images.sink());
@@ -615,7 +628,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut collected_tcx = None;
     let mut collected_definitions = None;
     let restored = if check { None } else {
-        front_images.as_ref().and_then(|images| images.restore_collected(sess, &pre))
+        front_images.as_ref().and_then(|images| warm_front(images, sess, &pre))
     };
     let restored = if verify_collected {
         verification_graph = restored.filter(|(p, _, _)| p.crates.len() == pre.len());
@@ -783,6 +796,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         // its heap goes back to the system (freed chunks otherwise stay resident, scattered
         // between the program's allocations: ~70 MB on counter), off the boot path
         let trace = crate::preload::trace();
+        { let _k = crate::zone_alloc::kept();
         std::thread::spawn(move || {
             let (r0, t) = (if trace { crate::memstat::resident() } else { 0 }, Instant::now());
             crate::memstat::trim();
@@ -790,6 +804,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 eprintln!("boot-trace: macro world heap trimmed: rss {} -> {} MB in {:.1} ms", r0 >> 20, crate::memstat::resident() >> 20, t.elapsed().as_secs_f64() * 1e3);
             }
         });
+        }
     }
     if crate::preload::trace() {
         eprintln!("boot-trace: preload (scan) {:.1} ms; loader waited {:.1} ms for parses; parse cpu {:.1} ms; publish (under the pool lock) {:.1} ms", preload_ms, crate::preload::WAIT_NS.load(Ordering::Relaxed) as f64 / 1e6, crate::preload::PARSE_NS.load(Ordering::Relaxed) as f64 / 1e6, crate::preload::PUBLISH_NS.load(Ordering::Relaxed) as f64 / 1e6);
@@ -1057,6 +1072,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         saved_tcx.verify_collected(&saved_prog, &u.prog, &u.tcx);
         eprintln!("relax-collected: verified restored graph against rebuilt graph");
     }
+    if collected_restored { jit::zone_swap::note_image(&u.prog, &u.tcx); }
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
     if !enum_errors.is_empty() {
         for error in enum_errors {
@@ -1145,6 +1161,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if let Ok(v) = std::env::var("RELAX_MEM_AT_MS") {
         let mem_at_trim = runtime.mem_at_trim;
         let at: Vec<u64> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+        { let _k = crate::zone_alloc::kept();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
             for ms in at {
@@ -1169,14 +1186,17 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 }
             }
         });
+        }
     }
     // RELAX_STATS_AFTER_MS=n: print the compile totals and timeline n ms after boot (programs
     // that never exit: the counter's event loop)
     if let Some(ms) = std::env::var("RELAX_STATS_AFTER_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        { let _k = crate::zone_alloc::kept();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(ms));
             crate::owner::call(crate::owner::Class::App, || summary("stats"));
         });
+        }
     }
     jit::enable_pipelining(options);
     jit::MAIN_TID.store(jit::current_thread_id(), Ordering::Relaxed);
@@ -1342,10 +1362,25 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             101
         }
     };
+    // the boot frame's locals (compiler generation 0) are dropped on the way out: expected after a swap
+    crate::zone_alloc::tombstone_frees_expected();
     // threads the program spawned may still run (and compile) until the process exits, as
     // under rustc where returning from main exits with detached threads still running: the
     // unit must outlive cmd_run (dropping it here freed it under them)
     std::mem::forget(u);
+    if jit::zone_swap::swapped() {
+        // The frames above this one (main, cli_main, cmd_run) and this one hold compiler-phase
+        // locals of generation 0 (the arguments, the unit graph, the crate list, ...), whose
+        // blocks the swap destroyed: dropping them reads them. The process ends here, by what
+        // cmd_run does after this returns.
+        crate::tui::exit_code(code);
+        if let Some(exit) = EXIT_SUMMARY.get() {
+            let _ = exit.code.set(code);
+        } else if let Some(console) = GANDALF_CONSOLE.lock().unwrap().take() {
+            console.detach();
+        }
+        crate::os::proc::exit(code);
+    }
     code
 }
 
@@ -1594,6 +1629,7 @@ fn startup_defs(prog: &crate::program::Program, path: &str) -> Vec<DefId> {
 /// program's own execution, not with its compiles.
 fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
     let upn = up as usize;
+    { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let up = upn as *mut Unit;
         let t = Instant::now();
@@ -1613,6 +1649,7 @@ fn start_ahead(up: *mut Unit, defs: Vec<DefId>) {
         }
         verbose!("relax-run: ahead worker compiled {} fns in {:.0} ms (t={:.0} ms)", n, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
     });
+    }
 }
 
 /// Prints new compile errors as they happen (each failed fn panics only if it is called).
@@ -1668,6 +1705,7 @@ fn spill_cache() {
     }) else { return };
     if let Some(s) = spill {
         // its own thread: the monitor loop's other duties (errors, trims) do not wait for the disk
+        { let _k = crate::zone_alloc::kept();
         std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let t = Instant::now();
             let r = s.write();
@@ -1678,6 +1716,7 @@ fn spill_cache() {
                 verbose!("relax-cache: spilled {:?} entries in {:.1} ms at t={:.0} ms", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
             }
         });
+        }
     }
 }
 
@@ -1755,6 +1794,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         };
         Some((drops, pending, spill, at, landmark, retired))
     }) else { return false };
+    { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let result = spill.map(|s| s.write());
         // Borrowck already releases its body-owned queries at each completed check.
@@ -1771,6 +1811,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
                 if crate::memstat::enabled() { "" } else { " (RIR estimated; other heap bytes require RELAX_MEM_REPORT)" });
         }
     });
+    }
     // a checker kept FRONT_RW busy: the type side was not retired, so this compile count is not
     // settled yet (the next quiet period tries again)
     retired.is_some()
@@ -1782,8 +1823,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         Ok(file) => Some(file),
         Err(e) => { eprintln!("relax-run: first-present report: {}", e); None }
     };
-    let runtime = runtime.clone();
-    let options = options.clone();
+    let (runtime, options, present_forward) = crate::zone_alloc::kept_with(|| (runtime.clone(), options.clone(), present_forward.clone()));
+    let _k = crate::zone_alloc::kept();
+    { let _k = crate::zone_alloc::kept();
     std::thread::spawn(move || {
         let runtime = &runtime;
         let options = &options;
@@ -1810,6 +1852,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let (mut mid_quiet, mut mid_seen, mut mid_flushed, mut mid_last) = (0u32, u64::MAX, 0u64, 0u64);
         let mid_busy = std::sync::Arc::new(AtomicBool::new(false));
         let mut teardown_started = false;
+        // the settle swap (jit zone_swap, RELAX_ZONE_SWAP=1): finished or refused, the next try, tries so far
+        let (mut swap_over, mut swap_next, mut swap_tries) = (!jit::zone_swap::enabled(), Instant::now(), 0u32);
+        let mut swap_wait_said = "";
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if let Some(file) = present.as_mut() {
@@ -1958,6 +2003,36 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     }
                 }
             }
+            // the compiler arena's generation is swapped once the run has settled and this run's
+            // collected image is current (everything the swap restores from is on disk).
+            // Startup teardown must have been scheduled before the swap can quiesce its work.
+            let swap_block: Option<&'static str> = if swap_over || settle_watch.settled.is_none() || Instant::now() < swap_next { Some("") }
+                else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
+                else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
+                else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }
+                else if crate::cache::front_graph_pending() { Some("front graphs are pending") }
+                else if mid_busy.load(Ordering::SeqCst) { Some("a mid-run cache write is running") }
+                else if !teardown_started { Some("the teardown is not scheduled") }
+                else { None };
+            if let Some(why) = swap_block.filter(|w| !w.is_empty()) {
+                if swap_wait_said != why { swap_wait_said = why; verbose!("relax-zone: swap waits: {why}"); }
+            }
+            if !swap_over && swap_block.is_none()
+            {
+                let up = unsafe { RUN_UNIT };
+                if !up.is_null() {
+                    swap_tries += 1;
+                    match jit::zone_swap::run(up) {
+                        jit::zone_swap::Outcome::Done => swap_over = true,
+                        jit::zone_swap::Outcome::Refused(why) => { eprintln!("relax-zone: swap refused: {why}"); swap_over = true; }
+                        jit::zone_swap::Outcome::Retry(why) => {
+                            eprintln!("relax-zone: swap deferred (try {swap_tries}): {why}");
+                            swap_next = Instant::now() + std::time::Duration::from_secs(1);
+                            if swap_tries >= 40 { swap_over = true; }
+                        }
+                    }
+                }
+            }
             // speculative results nobody called within the TTL go (memory: jit::expire_spec)
             jit::expire_spec(options);
             // recorded disk-cache entries are written out as they pile up, not held to the exit
@@ -2024,15 +2099,24 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             }
         }
     });
+    }
 }
 
 static RUN_DIAGNOSTICS: std::sync::Mutex<Option<relax_types::infer::diagnostics::DiagCtxt>> = std::sync::Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Option<relax_types::infer::diagnostics::DiagCtxt>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut diagnostics = RUN_DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *diagnostics));
+    let taken = ZoneTaken(std::mem::take(&mut *diagnostics));
     #[cfg(test)]
     assert!(diagnostics.is_none());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut diagnostics = RUN_DIAGNOSTICS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *diagnostics, taken.0));
 }
 
 extern "C" fn at_exit() {
@@ -2241,7 +2325,7 @@ static MAIN_START_WALL: AtomicU64 = AtomicU64::new(0);
 /// Front images, crate records and the collected graph describe the sources the run booted
 /// from. A live session records them too, until its first edit: from then on the Program holds
 /// reloaded file versions that are not the crate versions its stores are named after.
-fn front_recordable() -> bool {
+pub(crate) fn front_recordable() -> bool {
     crate::front::enabled() && crate::reload::edited_crates().is_empty()
 }
 
@@ -2259,6 +2343,7 @@ pub(crate) extern "C" fn relax_quit_requested() {
     if jit::FIRST_PRESENT.load(Ordering::Acquire) {
         jit::ORDER_UNTIL_NS.fetch_min(jit::wall_ns(), Ordering::Relaxed);
     }
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-quit-write".to_string()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         let t = Instant::now();
@@ -2275,6 +2360,7 @@ pub(crate) extern "C" fn relax_quit_requested() {
         verbose!("relax-cache: quit write at t={:.0} ms: {:?} (entries, front images), collected {} in {:.1} ms",
             crate::clock::ms_since_start(), r, COLLECTED_CURRENT.load(Ordering::Relaxed), t.elapsed().as_secs_f64() * 1e3);
     });
+    }
 }
 
 /// A write of the disk cache while the program runs (front images, code, borrowck verdicts):
@@ -2316,7 +2402,7 @@ fn record_check_front(u: &mut Unit, options: &crate::options::Options) {
 /// References to the images of the program's files (and their parts) that their crate stores
 /// do not have yet (front.rs: each image was written when its file or part was published);
 /// the count queued.
-fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
+pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache) -> usize {
     let mut n = 0;
     for i in 0..prog.files.len() {
         let f = &prog.files[i];
@@ -2326,6 +2412,13 @@ fn push_front_images(prog: &crate::program::Program, c: &mut crate::cache::Cache
         n += c.push_front_refs(krate, path, f.source_hash(path), f.image.as_ref(), part);
     }
     n
+}
+
+/// Why a mid-run pass did not record the collected program, said once per distinct reason (verbose).
+fn collected_skip(why: &'static str) {
+    static LAST: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+    let mut l = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *l != why { *l = why; verbose!("relax-collected: not recorded: {why}"); }
 }
 
 /// `wait`: the warm record's writes (after first present, at a quit) wait for the owner thread to
@@ -2410,7 +2503,9 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
             let mut ready = None;
             let mut retired_boot = None;
             let t = Instant::now();
-            if let Some(_front) = jit::front_write_within(if jit::QUIT_SEEN.load(Ordering::Relaxed) { 1000 } else { 50 }) {
+            let front = jit::front_write_within(if jit::QUIT_SEEN.load(Ordering::Relaxed) { 1000 } else { 50 });
+            if front.is_none() { collected_skip("the front-end lock is busy"); }
+            if let Some(_front) = front {
                 let u = unsafe { &mut *up };
                 // files the post-boot loader loaded since this write took its front images (a
                 // run that did not restore loads for seconds after present): their images are
@@ -2426,11 +2521,12 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
                         if written { imaged_files = u.prog.files.len(); }
                     }
                 }
+                if u.prog.files.len() != imaged_files { collected_skip("files were loaded since the front images were taken"); }
                 if let Some(c) = u.cache.as_mut().filter(|_| u.prog.files.len() == imaged_files) {
                     let stop = || crate::owner::main_waiting() && !jit::QUIT_SEEN.load(Ordering::Relaxed);
                     match c.encode_collected(&u.prog, &u.tcx, &stop) {
-                        crate::cache::CollectedRecord::Ready(dest, payload) => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
-                        crate::cache::CollectedRecord::Current => { MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
+                        crate::cache::CollectedRecord::Ready(dest, payload) => { jit::zone_swap::note_image(&u.prog, &u.tcx); MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); ready = Some((u.prog.session.options.verbose.then_some(c.collected_crates(&u.prog)), dest, payload)); }
+                        crate::cache::CollectedRecord::Current => { jit::zone_swap::note_image(&u.prog, &u.tcx); MID_COLLECTED_TRIED.store(true, Ordering::Relaxed); COLLECTED_CURRENT.store(true, Ordering::Relaxed); retired_boot = Some(c.finish_collected()); }
                         crate::cache::CollectedRecord::Yielded => verbose!("relax-collected: record yielded to the main thread after {:.1} ms; retried later", t.elapsed().as_secs_f64() * 1e3),
                         crate::cache::CollectedRecord::Failed => MID_COLLECTED_TRIED.store(true, Ordering::Relaxed),
                     }

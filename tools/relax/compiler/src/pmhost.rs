@@ -194,6 +194,11 @@ fn world(sess: &std::sync::Arc<crate::Session>) -> Option<std::sync::Arc<Result<
 /// later need (hot reload, a run-time module) rebuilds it without compiling. Compile jobs are
 /// parked while the unit goes (a speculative worker may still hold the world's unit).
 /// Drops the macro world (the last holder frees it); true when there was one.
+/// Is the proc-macro world alive (an auxiliary unit: the settle swap is refused meanwhile)?
+pub fn world_alive() -> bool {
+    WORLD.lock().map(|g| g.is_some()).unwrap_or(true)
+}
+
 pub fn free_world() -> bool {
     let w = WORLD.lock().unwrap_or_else(|e| e.into_inner()).take();
     let Some(w) = w else { return false };
@@ -216,9 +221,11 @@ fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
     for entry in entries { hosted |= crate::native_macros::find(&entry)?.is_none(); }
     if hosted && world_now().is_none() {
         let sess = sess.clone();
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("relax-pm-world".to_string()).stack_size(64 << 20).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let _ = world(&sess);
         });
+        }
     }
     Ok(())
 }
@@ -480,7 +487,9 @@ fn watch_begin() -> &'static WatchSlot {
             m.set(Some(s));
             let mut v = WATCH.lock().unwrap();
             if v.is_empty() {
+                { let _k = crate::zone_alloc::kept();
                 let _ = std::thread::Builder::new().name("relax-pm-watch".to_string()).spawn(watch_loop);
+                }
             }
             v.push(s);
             s

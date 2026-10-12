@@ -64,6 +64,8 @@ fn event(i: usize) {
 /// `destroy_generation` tombstones one generation's chunks. Domain arenas are program memory
 /// (kept class): none of the generation/tombstone state below applies to them (`gen_on`).
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Lowest generation that may still own chunks; advanced only after a destroy sweep.
+static LOWEST_LIVE: AtomicU64 = AtomicU64::new(0);
 /// Number of tombstoned chunks (0: the free fast path skips the tombstone table).
 static TOMBS: AtomicUsize = AtomicUsize::new(0);
 /// Per chunk index of `DEFAULT`: generation + 1 of the destroyed run covering it, 0 = live address
@@ -1333,16 +1335,34 @@ impl Arena {
         if s.stride == 0 { off < s.committed } else { off < s.bump.min(CHUNK) }
     }
     fn destroy_generation(&self, g: u64) -> (usize, usize) {
-        if !self.gen_on() || g >= EPOCH.load(Ordering::Acquire) || self.base.load(Ordering::Relaxed) == 0 {
+        if !self.gen_on() || g >= EPOCH.load(Ordering::Acquire) {
             return (0, 0);
+        }
+        let (chunks, touched, _) = self.destroy_generations(g, g + 1);
+        (chunks, touched)
+    }
+    fn destroy_older(&self) -> (usize, usize) {
+        if !self.gen_on() {
+            return (0, 0);
+        }
+        let current = EPOCH.load(Ordering::Acquire);
+        let (chunks, touched, lowest) = self.destroy_generations(LOWEST_LIVE.load(Ordering::Acquire), current);
+        LOWEST_LIVE.store(lowest, Ordering::Release);
+        (chunks, touched)
+    }
+    /// One header walk for [first, end), returning the oldest retained generation (end if none).
+    fn destroy_generations(&self, first: u64, end: u64) -> (usize, usize, u64) {
+        if !self.gen_on() || first >= end || self.base.load(Ordering::Relaxed) == 0 {
+            return (0, 0, end);
         }
         self.warm_drain();
         let base = self.base.load(Ordering::Relaxed);
         let (mut chunks, mut touched) = (0, 0);
+        let mut lowest = end;
         for index in 0..N {
             let h = &self.headers[index];
             let mut s = lock(&h.state);
-            if s.committed == 0 || s.epoch != g || TOMB[index].load(Ordering::Relaxed) != 0 {
+            if s.committed == 0 || s.epoch < first || s.epoch >= end || TOMB[index].load(Ordering::Relaxed) != 0 {
                 continue;
             }
             if h.in_part.load(Ordering::Relaxed) {
@@ -1352,6 +1372,7 @@ impl Arena {
             event(E_DECOMMIT);
             // zeroing form: the range never reads old bytes again, whoever maps it later
             if !unsafe { os::decommit(address as *mut u8, s.committed, true) } {
+                lowest = lowest.min(s.epoch);
                 continue;
             }
             touched += if s.stride == 0 { s.committed } else { s.bump.min(CHUNK) };
@@ -1361,7 +1382,7 @@ impl Arena {
             // the whole run is spent: its tail past the committed part was reserved for this block
             let (run, order) = (s.run, s.order);
             for i in run..run + (1usize << order) {
-                TOMB[i].store(g as u32 + 1, Ordering::Release);
+                TOMB[i].store(s.epoch as u32 + 1, Ordering::Release);
             }
             TOMBS.fetch_add(1, Ordering::Release);
             s.committed = 0;
@@ -1371,7 +1392,7 @@ impl Arena {
             s.attached = false;
             h.live.store(0, Ordering::Relaxed);
         }
-        (chunks, touched)
+        (chunks, touched, lowest)
     }
     /// (class, stride) of a small request.
     #[inline]
@@ -1470,6 +1491,13 @@ pub fn tombstones() -> usize {
     TOMBS.load(Ordering::Relaxed)
 }
 
+/// Frees of tombstoned blocks no longer abort under RELAX_ZONE_CHECK (counted all the same).
+static TOMB_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+pub fn tombstone_expected() {
+    TOMB_EXPECTED.store(true, Ordering::Relaxed);
+}
+
 fn check_on() -> bool {
     match CHECK.load(Ordering::Relaxed) {
         1 => false,
@@ -1497,7 +1525,7 @@ fn check_on() -> bool {
 #[inline(never)]
 pub fn tombstone_hit(p: *mut u8, what: &str) {
     TOMB_FREES.fetch_add(1, Ordering::Relaxed);
-    if check_on() {
+    if check_on() && !TOMB_EXPECTED.load(Ordering::Relaxed) {
         let g = tombstone_of(p as usize).unwrap_or(0);
         let mut buf = [0u8; 160];
         let mut n = 0;
@@ -1558,4 +1586,10 @@ pub fn tombstone_hit(p: *mut u8, what: &str) {
 /// The current generation is refused (nothing is destroyed, (0, 0)).
 pub fn destroy_generation(g: u64) -> (usize, usize) {
     DEFAULT.destroy_generation(g)
+}
+
+/// Destroys all older generations, including ones retained by aborted swaps. Every user of
+/// those generations must be quiesced. Retained chunks keep their generation eligible to retry.
+pub fn destroy_older() -> (usize, usize) {
+    DEFAULT.destroy_older()
 }

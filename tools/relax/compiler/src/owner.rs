@@ -75,13 +75,21 @@ struct Queue {
 
 static Q: Mutex<Queue> = Mutex::new(Queue { lanes: [const { VecDeque::new() }; CLASSES] });
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Queue);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut queue = Q.lock().unwrap_or_else(|e| e.into_inner());
-    // Quiescence includes draining every request before forgetting the lanes' buffers.
+    // Quiescence includes draining every request before taking the lanes' buffers.
     assert!(queue.lanes.iter().all(VecDeque::is_empty), "memlane swap with queued owner requests");
-    std::mem::forget(std::mem::replace(&mut *queue, Queue { lanes: [const { VecDeque::new() }; CLASSES] }));
+    let taken = ZoneTaken(std::mem::replace(&mut *queue, Queue { lanes: [const { VecDeque::new() }; CLASSES] }));
     #[cfg(test)]
     assert!(queue.lanes.iter().all(|lane| lane.is_empty() && lane.capacity() == 0));
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut queue = Q.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *queue, taken.0));
 }
 
 static WAKE: Condvar = Condvar::new();
@@ -703,6 +711,11 @@ pub struct ExitParked;
 /// Ends the request being served without an answer: the process is ending on another thread.
 pub fn park_for_exit() -> ! {
     std::panic::resume_unwind(Box::new(ExitParked))
+}
+
+/// The owner serves nothing and nothing is queued (the settle swap's drain).
+pub fn idle() -> bool {
+    NOW_CLASS.load(Ordering::Acquire) == u8::MAX && QUEUED_N.load(Ordering::SeqCst) == 0
 }
 
 /// The owner is serving a request of another thread than `tid` now.

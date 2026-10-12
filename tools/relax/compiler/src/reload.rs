@@ -26,6 +26,7 @@ use crate::jit::{self, FnKey, Unit};
 use crate::program::{DefId, DefKind, Program};
 use crate::types::TyId;
 use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[path = "reload_watch.rs"]
 mod watch_events;
 
@@ -3328,7 +3329,8 @@ pub fn domain_stopping(id: u32) {
 
 pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
     *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
-    *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs;
+    // the swap (zone_swap) may destroy the compiler generation this was built in before the watcher takes it
+    *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs.as_ref().map(crate::zone_alloc::kept_clone);
     DOMAIN_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
     DOMAIN_LOADING.store(false, std::sync::atomic::Ordering::Release);
 }
@@ -3787,12 +3789,25 @@ pub extern "C" fn __relax_live_stream(p: *const u8, n: usize, t: *const u8, len:
 mod inputs;
 pub use inputs::Inputs;
 
+/// The inputs the watcher started with (kept: the settle swap restarts the watcher with them),
+/// whether the watcher thread runs, and the swap's request that it ends.
+static WATCH_INPUTS: std::sync::Mutex<Option<Inputs>> = std::sync::Mutex::new(None);
+static WATCH_RUNNING: AtomicBool = AtomicBool::new(false);
+static WATCH_STOP: AtomicBool = AtomicBool::new(false);
+
 pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
+    *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&inputs));
+    spawn_watcher(up, inputs, false);
+}
+
+fn spawn_watcher(up: *mut Unit, inputs: Inputs, quiet: bool) {
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
-    std::thread::Builder::new()
+    WATCH_STOP.store(false, Ordering::SeqCst);
+    WATCH_RUNNING.store(true, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new()
         .name("relax-live".to_string())
         .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let runtime = &session.runtime;
@@ -3800,13 +3815,38 @@ pub fn start_watcher(up: *mut Unit, inputs: Inputs) {
             jit::lower_this_thread_priority(runtime);
             // a panic here (the ICE hook is silent on the compiler's owner thread) would end
             // live editing without a word: say so
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs) }));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { watch(p.0, inputs, quiet) }));
             if let Err(e) = r {
                 let why = e.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| e.downcast_ref::<String>().cloned()).unwrap_or_default();
                 eprintln!("relax-live: the watcher stopped: {why}{}; saves are no longer applied -- restart `relax run`", jit::take_ice_location());
             }
-        })
-        .ok();
+            WATCH_RUNNING.store(false, Ordering::SeqCst);
+        });
+    if spawned.is_err() { WATCH_RUNNING.store(false, Ordering::SeqCst); }
+}
+
+/// The settle swap (jit zone_swap): ends the watcher thread, which holds compiler-generation
+/// state for its whole life, and waits for it (its locals are freed on the way out). Some(true):
+/// it ran and has ended, so `swap_restart_watcher` starts it again; Some(false): there was none;
+/// None: it did not end within `ms` (it is running again).
+pub fn swap_stop_watcher(ms: u64) -> Option<bool> {
+    if !WATCH_RUNNING.load(Ordering::SeqCst) { return Some(false); }
+    WATCH_STOP.store(true, Ordering::SeqCst);
+    let t = Instant::now();
+    while WATCH_RUNNING.load(Ordering::SeqCst) {
+        if t.elapsed().as_millis() as u64 > ms {
+            WATCH_STOP.store(false, Ordering::SeqCst);
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    Some(true)
+}
+
+/// Starts the watcher again with the inputs it started with, after `swap_stop_watcher` ended it.
+pub fn swap_restart_watcher(up: *mut Unit) {
+    let inputs = WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(inputs) = inputs { spawn_watcher(up, inputs, true); }
 }
 
 pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
@@ -3814,7 +3854,7 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
-unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
+unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -3844,7 +3884,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     // edit made before it is simply what the load read)
     let mut loads_seen = jit::DEFERRED_LOADS.load(std::sync::atomic::Ordering::Relaxed);
     let mut events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
-    eprintln!("relax-live: watching {} source files; session log {}", files.len(), live_log_path());
+    if !quiet { eprintln!("relax-live: watching {} source files; session log {}", files.len(), live_log_path()); }
     let mut undos: Vec<Undo> = Vec::new();
     // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
     // watched file (RELAX_LIVE_TRACE=1 prints its cost once)
@@ -3869,11 +3909,15 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let mut revision = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
+        if WATCH_STOP.load(Ordering::SeqCst) { return; }
         if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { continue; }
         let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
         if latest != revision {
             revision = latest;
-            if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() { inputs = next; }
+            if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                *WATCH_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&next));
+                inputs = next;
+            }
             let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
             files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
             for (path, file) in loaded {

@@ -20,15 +20,33 @@ static SINKS: Mutex<Option<HashMap<PathBuf, Arc<FrontSink>>>> = Mutex::new(None)
 /// Run stores opened to resolve references, and keys found missing in them.
 static OPEN: Mutex<Option<(HashMap<PathBuf, Arc<Store>>, HashSet<(PathBuf, u128)>)>> = Mutex::new(None);
 
-pub(super) fn zone_reset() {
+pub(super) struct ZoneTaken {
+    runs: Vec<Arc<RunStore>>,
+    sinks: Option<HashMap<PathBuf, Arc<FrontSink>>>,
+    open: Option<(HashMap<PathBuf, Arc<Store>>, HashSet<(PathBuf, u128)>)>,
+}
+
+pub(super) fn zone_take() -> ZoneTaken {
     let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *runs));
     let mut sinks = SINKS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *sinks));
     let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *open));
+    let taken = ZoneTaken {
+        runs: std::mem::take(&mut *runs),
+        sinks: std::mem::take(&mut *sinks),
+        open: std::mem::take(&mut *open),
+    };
     #[cfg(test)]
     { assert!(runs.is_empty()); assert!(sinks.is_none()); assert!(open.is_none()); }
+    taken
+}
+
+pub(super) fn zone_put_back(taken: ZoneTaken) {
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *runs, taken.runs));
+    let mut sinks = SINKS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *sinks, taken.sinks));
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *open, taken.open));
 }
 
 /// The images written so far, per run store of this process: what references made now can

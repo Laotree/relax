@@ -231,29 +231,58 @@ impl ReloadSlots {
 
 #[path = "zone_scan.rs"]
 pub(crate) mod zone_scan;
+#[path = "zone_swap.rs"]
+pub(crate) mod zone_swap;
 
-pub(crate) fn zone_reset() {
-    macro_rules! reset {
-        ($($name:ident => $empty:ident),* $(,)?) => { $(
-            {
-                let mut guard = $name.lock().unwrap_or_else(|e| e.into_inner());
-                std::mem::forget(std::mem::take(&mut *guard));
-                #[cfg(test)]
-                assert!(guard.$empty());
-            }
-        )* };
+pub(crate) struct ZoneTaken {
+    last_front: Option<std::sync::Arc<FrontShared>>,
+    main_compiles: Vec<MainCompile>,
+    tier_queue: Vec<(u32, u8, u64, u64)>,
+    tier_active: Vec<u32>,
+    spec_q: std::collections::VecDeque<u32>,
+    spec_built: Vec<(u32, u64)>,
+    o2_queue: Vec<(usize, u32)>,
+    o2_base: std::collections::VecDeque<(usize, u32)>,
+    o2_seen: Option<std::collections::HashSet<(usize, u32)>>,
+}
+
+pub(crate) fn zone_take() -> ZoneTaken {
+    macro_rules! take {
+        ($name:ident => $empty:ident) => {{
+            let mut guard = $name.lock().unwrap_or_else(|e| e.into_inner());
+            let taken = std::mem::take(&mut *guard);
+            #[cfg(test)]
+            assert!(guard.$empty());
+            taken
+        }};
     }
-    reset!(
-        LAST_FRONT => is_none,
-        MAIN_COMPILES => is_empty,
-        TIER_QUEUE => is_empty,
-        TIER_ACTIVE => is_empty,
-        SPEC_Q => is_empty,
-        SPEC_BUILT => is_empty,
-        O2_QUEUE => is_empty,
-        O2_BASE => is_empty,
-        O2_SEEN => is_none,
-    );
+    ZoneTaken {
+        last_front: take!(LAST_FRONT => is_none),
+        main_compiles: take!(MAIN_COMPILES => is_empty),
+        tier_queue: take!(TIER_QUEUE => is_empty),
+        tier_active: take!(TIER_ACTIVE => is_empty),
+        spec_q: take!(SPEC_Q => is_empty),
+        spec_built: take!(SPEC_BUILT => is_empty),
+        o2_queue: take!(O2_QUEUE => is_empty),
+        o2_base: take!(O2_BASE => is_empty),
+        o2_seen: take!(O2_SEEN => is_none),
+    }
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    fn put<T>(slot: &std::sync::Mutex<T>, old: T) {
+        let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::forget(std::mem::replace(&mut *guard, old));
+    }
+    put(&LAST_FRONT, taken.last_front);
+    put(&MAIN_COMPILES, taken.main_compiles);
+    put(&TIER_QUEUE, taken.tier_queue);
+    put(&TIER_ACTIVE, taken.tier_active);
+    put(&SPEC_Q, taken.spec_q);
+    put(&SPEC_BUILT, taken.spec_built);
+    put(&O2_QUEUE, taken.o2_queue);
+    put(&O2_BASE, taken.o2_base);
+    put(&O2_SEEN, taken.o2_seen);
 }
 
 /// Heap classes (memlane zones, DESIGN-zones.md F). KEPT (system heap; built and grown under
@@ -691,6 +720,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
     struct P(*mut Unit);
     unsafe impl Send for P {}
     let p = P(up);
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-seed".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let runtime = &session.runtime;
         let p = p;
@@ -713,6 +743,7 @@ pub unsafe fn spec_seed_manifest(up: *mut Unit) {
             });
         }
     });
+    }
 }
 
 /// Installs one slot of the startup image (on the owner thread): as install_compiled does for code
@@ -797,6 +828,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
             struct P(*mut Unit);
             unsafe impl Send for P {}
             let p = P(up);
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name("relax-ids".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let p = p;
                 let up = p.0;
@@ -818,6 +850,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                     }
                 }
             });
+            }
         }
         Some((n, notes))
     });
@@ -828,6 +861,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
         struct P(*mut Unit);
         unsafe impl Send for P {}
         let p = P(up);
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("relax-prelink-notes".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let p = p;
             let up = p.0;
@@ -849,6 +883,7 @@ pub unsafe fn prelink_startup(up: *mut Unit) -> usize {
                 });
             }
         });
+        }
     }
     n
 }
@@ -1865,6 +1900,16 @@ pub(crate) fn on_fault(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os::fa
 /// stale pointer into the compiler arena. Says so on stderr (one lock-free table lookup; the
 /// report that follows is the ordinary fault report).
 fn note_tombstone_fault(f: &os::fault::Fault) {
+    if std::env::var_os("RELAX_ZONE_TRACE").is_some() {
+        #[repr(C)]
+        struct DlInfo { fname: *const std::ffi::c_char, fbase: *mut u8, sname: *const std::ffi::c_char, saddr: *mut u8 }
+        extern "C" { fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32; }
+        let mut info = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+        let sym = if unsafe { dladdr(f.pc as *const u8, &mut info) } != 0 && !info.sname.is_null() {
+            unsafe { std::ffi::CStr::from_ptr(info.sname) }.to_string_lossy().into_owned()
+        } else { "?".to_string() };
+        eprintln!("relax-zone: fault: {} at {:#x}, pc {:#x} in {}, thread `{}`\n", f.label(), f.addr, f.pc, sym, std::thread::current().name().unwrap_or("?"));
+    }
     if let Some(g) = crate::zone_alloc::compiler_tombstone_of(f.addr as usize) {
         eprintln!("relax: use after compiler-zone destroy (generation {g}): {} at {:#x}, pc {:#x}", f.label(), f.addr, f.pc);
     }
@@ -4318,6 +4363,7 @@ unsafe fn call_jit_inner(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, Pani
 pub fn watchdog(ms: u64) -> u64 {
     static START: std::sync::Once = std::sync::Once::new();
     START.call_once(|| {
+        { let _k = crate::zone_alloc::kept();
         std::thread::spawn(|| {
             let mut calls = WATCHDOG_CALLS.lock().unwrap_or_else(|e| e.into_inner());
             loop {
@@ -4333,6 +4379,7 @@ pub fn watchdog(ms: u64) -> u64 {
                 calls = WATCHDOG_WAKE.wait_timeout(calls, std::time::Duration::from_millis(5)).unwrap_or_else(|e| e.into_inner()).0;
             }
         });
+        }
     });
     let call = std::sync::Arc::new(WatchdogCall {
         token: WATCHDOG_ID.fetch_add(1, Ordering::Relaxed),
@@ -5714,9 +5761,12 @@ fn o2_on() -> bool {
 }
 
 unsafe fn o2_start(up: *mut Unit) {
-    let runtime = (&*up).prog.session.runtime.clone();
+    // (kept: the thread outlives the compiler generation)
+    let runtime = crate::zone_alloc::kept_clone(&(&*up).prog.session.runtime);
     O2_THREAD.call_once(move || {
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("relax-O2".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); o2_thread(&runtime) });
+        }
     });
 }
 
@@ -7083,6 +7133,7 @@ pub fn compile_watch(what: Option<(&str, usize)>) {
     let secs = *ON.get_or_init(|| {
         let s = std::env::var("RELAX_COMPILE_WATCH").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         if s > 0 {
+            { let _k = crate::zone_alloc::kept();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(s));
                 let g = WATCH.lock().unwrap_or_else(|e| e.into_inner());
@@ -7107,6 +7158,7 @@ pub fn compile_watch(what: Option<(&str, usize)>) {
                     }
                 }
             });
+            }
         }
         s
     });
@@ -7541,7 +7593,8 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
     if std::env::var("RELAX_LAZY_COMPLETE").is_ok_and(|v| v == "0") { return; }
     if unsafe { (*up).prog.skipped_files.is_empty() } { return; }
     let upn = up as usize;
-    let runtime = runtime.clone();
+    let runtime = crate::zone_alloc::kept_clone(runtime);
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-complete".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let up = upn as *mut Unit;
         while !FIRST_PRESENT.load(Ordering::Acquire) {
@@ -7589,6 +7642,7 @@ pub fn start_completion(up: *mut Unit, runtime: &crate::options::RuntimeOptions)
             std::thread::yield_now();
         }
     });
+    }
 }
 
 /// `relax check` checks every body: the skipped files are loaded first (unit lock).
@@ -8333,7 +8387,9 @@ fn sampler_enter(exec_base: u64, exec_size: u64) {
         }
     }
     SAMPLER.call_once(|| {
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("relax-sampler".to_string()).spawn(sampler_thread);
+        }
     });
 }
 
@@ -8772,7 +8828,8 @@ fn sampler_thread() {
                     if sample_trace() {
                         eprintln!("sampler: {} hot", u.fns[id as usize].name);
                     }
-                    hot.push(id);
+                    // (the sampler's own vector grows here, on the owner: kept, it outlives the compiler arena)
+                    crate::zone_alloc::kept_with(|| hot.push(id));
                 }
             }
             // HEAT before TIER_QUEUE nowhere (tier_pop holds the queue, then reads HEAT)
@@ -9041,8 +9098,10 @@ fn spawn_tier1_threads(runtime: &crate::options::RuntimeOptions, options: &crate
         (3.min(cap), 3.min(cap))
     };
     for k in 0..max {
-        let runtime = runtime.clone();
+        let runtime = crate::zone_alloc::kept_clone(runtime);
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name(format!("relax-o3-{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); tier1_thread(&runtime, k, normal) });
+        }
     }
 }
 
@@ -10611,7 +10670,7 @@ extern "C" fn relax_first_present() {
 /// while this thread sleeps.
 pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
     let main_at = wall_ns();
-    let runtime = runtime.clone();
+    let runtime = crate::zone_alloc::kept_clone(runtime);
     let release = move || {
         lower_worker_priority(&runtime);
         let _ = STARTUP_THREAD.set(std::thread::current());
@@ -10960,7 +11019,9 @@ unsafe fn spec_enqueue_calls(up: *mut Unit, func: &crate::rir::Func, skip: &[u32
         SPEC_START.call_once(|| {
             for k in 0..spec_jobs(options) {
                 let session = session.clone();
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            }
             }
         });
         SPEC_WAKE.notify_all();
@@ -11024,7 +11085,9 @@ pub unsafe fn spec_seed(up: *mut Unit, ids: &[u32]) {
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            }
         }
     });
     SPEC_WAKE.notify_all();
@@ -11053,6 +11116,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
     unsafe impl Send for P {}
     let p = P(up);
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-teardown".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let p = p;
         let up = p.0;
@@ -11145,6 +11209,7 @@ pub unsafe fn prepare_teardown(up: *mut Unit) {
             eprintln!("relax-teardown: {} slots built ahead ({} looked at), cpu {:.0} ms{}", built, seen.len(), (cpu_ns() - c0) as f64 / 1e6, if stopped() { " (stopped at exit)" } else { "" });
         }
     });
+    }
 }
 
 /// O3 had to build a slot's RIR again (code linked from the disk cache has none):
@@ -11307,11 +11372,26 @@ thread_local! {
     static JOB_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
+/// The settle swap (zone_swap.rs) drains the compile jobs in two steps. DRAIN: no new outermost
+/// job starts (a job that waits for the owner and comes back is let through: it must finish),
+/// the owner serves everyone. HARD (the pause below, no 2 s escape): the owner serves only the
+/// swap's thread. Jobs that wait for the owner (JobIdle) are counted in BG_IDLE: a swap needs
+/// none, since such a job holds compiler state on its stack.
+static SWAP_DRAIN: AtomicBool = AtomicBool::new(false);
+static SWAP_HARD: AtomicBool = AtomicBool::new(false);
+static BG_IDLE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// wall ns since which the program's main thread waits at the job gate (0: it does not)
+static GATED_MAIN: AtomicU64 = AtomicU64::new(0);
+
 /// A compile job in progress (outermost guard per thread counts).
 pub struct JobGuard;
 
 /// Starts a compile job: waits while an allocator swap is in progress.
 pub fn compile_job() -> JobGuard {
+    job_gate(false)
+}
+
+fn job_gate(reenter: bool) -> JobGuard {
     if JOB_DEPTH.with(|d| {
         let n = d.get();
         d.set(n + 1);
@@ -11325,18 +11405,28 @@ pub fn compile_job() -> JobGuard {
         // the thread that paused the jobs compiles what it calls itself (its own swap or
         // fork code after the risky moment): it does not wait for its own resume; the owner
         // never waits here (while paused it serves only the pauser's requests: owner.rs pick)
-        if !BG_PAUSE.load(Ordering::SeqCst) || BG_PAUSER.load(Ordering::SeqCst) == me() || owner::is_owner() {
+        let closed = BG_PAUSE.load(Ordering::SeqCst) || SWAP_DRAIN.load(Ordering::SeqCst) && !reenter;
+        if !closed || BG_PAUSER.load(Ordering::SeqCst) == me() || owner::is_owner() {
             return JobGuard;
         }
         BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        let is_main = MAIN_TID.load(Ordering::Relaxed) == me();
+        if is_main {
+            let _ = GATED_MAIN.compare_exchange(0, wall_ns().max(1), Ordering::SeqCst, Ordering::SeqCst);
+        }
         // bounded: a swap (CefInitialize) may wait for a callback on this very thread, which
-        // needs this compile; after 2 s the job goes ahead (the swap's risky moment is long over)
+        // needs this compile; after 2 s the job goes ahead (the swap's risky moment is long over).
+        // The settle swap's gate is not: its pause ends with the swap.
         let t0 = std::time::Instant::now();
         let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
-        while BG_PAUSE.load(Ordering::SeqCst) && t0.elapsed().as_millis() < 2000 {
+        let shut = || BG_PAUSE.load(Ordering::SeqCst) || SWAP_DRAIN.load(Ordering::SeqCst) && !reenter;
+        while shut() && (t0.elapsed().as_millis() < 2000 || SWAP_HARD.load(Ordering::SeqCst) || SWAP_DRAIN.load(Ordering::SeqCst)) {
             g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
         }
-        if BG_PAUSE.load(Ordering::SeqCst) {
+        if is_main {
+            GATED_MAIN.store(0, Ordering::SeqCst);
+        }
+        if shut() {
             drop(g);
             BG_ACTIVE.fetch_add(1, Ordering::SeqCst);
             return JobGuard;
@@ -11354,6 +11444,7 @@ impl JobIdle {
         // only the outermost job of the thread counts (JOB_DEPTH 1): it is lifted for the wait
         let held = JOB_DEPTH.try_with(|d| d.get() == 1).unwrap_or(false);
         if held {
+            BG_IDLE.fetch_add(1, Ordering::SeqCst);
             BG_ACTIVE.fetch_sub(1, Ordering::SeqCst);
         }
         JobIdle(held)
@@ -11363,9 +11454,11 @@ impl JobIdle {
 impl Drop for JobIdle {
     fn drop(&mut self) {
         if self.0 {
-            // back through the job gate: a pause that began meanwhile holds this job too
+            // back through the job gate: a pause that began meanwhile holds this job too (the
+            // settle swap's drain lets it through: the job must finish before the swap)
             JOB_DEPTH.with(|d| d.set(d.get() - 1));
-            std::mem::forget(compile_job());
+            std::mem::forget(job_gate(true));
+            BG_IDLE.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -11374,7 +11467,7 @@ impl Drop for JobIdle {
 /// job gate is: after 2 s everyone is served again (a swap may wait for a callback on another
 /// thread that needs a compile).
 pub(crate) fn paused_for() -> u64 {
-    if BG_PAUSE.load(Ordering::SeqCst) && wall_ns().saturating_sub(BG_PAUSE_AT.load(Ordering::SeqCst)) < 2_000_000_000 { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
+    if BG_PAUSE.load(Ordering::SeqCst) && (SWAP_HARD.load(Ordering::SeqCst) || wall_ns().saturating_sub(BG_PAUSE_AT.load(Ordering::SeqCst)) < 2_000_000_000) { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
 }
 
 /// When the current pause began (wall ns).
@@ -12334,7 +12427,9 @@ fn set_shared_front(u: &mut Unit, core_crate: u32) {
     f.alive.store(true, Ordering::SeqCst);
     for i in 0..if startup_phase() { f.helpers } else { 0 } {
         let f = u.front.clone();
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name(format!("relax-ahead{}", i)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); ahead_helper(f) });
+        }
     }
 }
 
@@ -13045,7 +13140,9 @@ unsafe fn spec_enqueue_cached(up: *mut Unit, ids: &[u32], depth: u8) {
     SPEC_START.call_once(|| {
         for k in 0..spec_jobs(options) {
             let session = session.clone();
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name(format!("relax-spec{}", k)).spawn(move || { let _z = crate::zone_alloc::compiler_thread(); spec_worker(&session.runtime, &session.options) });
+            }
         }
     });
     SPEC_WAKE.notify_all();
@@ -13134,6 +13231,7 @@ pub fn start_background_coherence(u: &Unit) {
         }
     }
     let front = u.front.clone();
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-coherence".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         let _mem = crate::memstat::tag(crate::memstat::Tag::Borrowck);
         lower_worker_priority(&front.session.runtime);
@@ -13177,6 +13275,7 @@ pub fn start_background_coherence(u: &Unit) {
             }
         }
     });
+    }
 }
 
 /// RELAX_MEM_REPORT's size line of a function: instructions, vregs, blocks, slots.

@@ -1328,7 +1328,7 @@ pub fn compact_vregs(f: &mut Func) {
     f.vregs = cls;
 }
 
-// OnceLock cannot be reset through a shared static; see this crate's zone_reset.
+// OnceLock cannot be reset through a shared static; see this crate's zone_take.
 pub(crate) static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 fn trace_opt(f: &Func, tag: &str) {

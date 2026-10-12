@@ -14,7 +14,7 @@ pub(super) enum Kind {
     Std,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Inputs {
     pub(super) paths: BTreeMap<String, (Stamp, Kind)>,
 }

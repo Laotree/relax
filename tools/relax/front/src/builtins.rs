@@ -226,13 +226,25 @@ pub const PAYLOAD_MARK: &str = "\\0relax-include:";
 
 static PAYLOADS: std::sync::Mutex<Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>> = std::sync::Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken {
+    payloads: Option<crate::fxhash::HashMap<String, std::sync::Arc<Vec<u8>>>>,
+    dirs: Option<crate::fxhash::HashMap<String, (String, String, String, String)>>,
+}
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut payloads = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *payloads));
     let mut dirs = BY_DIR.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *dirs));
+    let taken = ZoneTaken { payloads: std::mem::take(&mut *payloads), dirs: std::mem::take(&mut *dirs) };
     #[cfg(test)]
     { assert!(payloads.is_none()); assert!(dirs.is_none()); }
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut payloads = PAYLOADS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *payloads, taken.payloads));
+    let mut dirs = BY_DIR.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *dirs, taken.dirs));
 }
 
 /// The payload's key: its hash and length (the same text whichever thread or order includes it;

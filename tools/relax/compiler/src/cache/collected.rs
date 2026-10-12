@@ -359,12 +359,24 @@ impl Cache {
     /// record never holds a frame up; the caller retries later. The store write
     /// (commit_collected) needs no lock.
     pub fn encode_collected(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
+        self.encode_collected_as(prog, tcx, stop, false)
+    }
+
+    /// `encode_collected` of the program as it is now: neither the committed mark nor the frozen
+    /// boot snapshot short-circuits it, so the image covers every type, definition and file
+    /// added since the first encode (the settle swap restores from it, and asserts the counts).
+    pub(crate) fn encode_collected_now(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool) -> CollectedRecord {
+        self.encode_collected_as(prog, tcx, stop, true)
+    }
+
+    fn encode_collected_as(&self, prog: &Program, tcx: &Tcx, stop: &dyn Fn() -> bool, fresh: bool) -> CollectedRecord {
         if !enabled() || self.mode == Mode::ReadOnly { return CollectedRecord::Failed; }
-        if self.collected_committed { return CollectedRecord::Current; }
+        if self.collected_committed && !fresh { return CollectedRecord::Current; }
         let mut why = "recipe";
         let mut yielded = false;
         let recorded = (|| {
-        let recipe = self.collected_boot.as_ref().map(|boot| &boot.recipe).or(prog.front_graph.as_ref())?;
+        let frozen = self.collected_boot.as_ref().filter(|_| !fresh);
+        let recipe = frozen.map(|boot| &boot.recipe).or(prog.front_graph.as_ref())?;
         why = "graph certificate";
         let graph = read_front_graph(&self.dir, recipe.identity)?;
         why = "fingerprints";
@@ -372,7 +384,7 @@ impl Cache {
             || graph.crates.iter().map(|(_, fp)| fp).ne(self.fps.iter()) { return None; }
         let mut check = || { yielded = yielded || stop(); (!yielded).then_some(()) };
         let captured;
-        let boot = match &self.collected_boot {
+        let boot = match frozen {
             Some(boot) => boot,
             None => { captured = self.capture_collected_boot(prog, tcx, stop, &mut why)?; &captured }
         };

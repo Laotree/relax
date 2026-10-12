@@ -463,6 +463,8 @@ fn intern(tr: &Tracker, t: &Tables, frames: &[u64; DEPTH], n: u8, tag: u8) -> Op
 
 /// Counts a sampled block against its stack and keeps the block's record.
 fn keep(tr: &Tracker, t: &Tables, p: *mut u8, size: usize, frames: &[u64; DEPTH], n: u8, tag: u8) {
+    // (the stack index grows here: kept, the tracker outlives the compiler arena)
+    let _k = crate::zone_alloc::kept();
     let Some(id) = intern(tr, t, frames, n, tag) else { return };
     let w = (size as u64).max(t.rate).min((1 << 40) - 1);
     let st = &t.stacks[id as usize];
@@ -654,7 +656,8 @@ fn host_free(p: *mut u8) {
 fn new_tables(rate: u64) -> *mut Tables {
     // the tracker's own tables are not the host heap's samples
     let was = IN_HOST_SAMPLE.with(|b| b.replace(true));
-    let t = new_tables_inner(rate);
+    // (kept: the tracker outlives the compiler arena)
+    let t = crate::zone_alloc::kept_with(|| new_tables_inner(rate));
     IN_HOST_SAMPLE.with(|b| b.set(was));
     t
 }

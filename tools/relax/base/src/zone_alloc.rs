@@ -92,6 +92,9 @@ mod disabled {
     pub fn destroy_generation(_: u64) -> (usize, usize) {
         (0, 0)
     }
+    pub fn destroy_older() -> (usize, usize) {
+        (0, 0)
+    }
     pub fn epoch_of(_: *const u8) -> Option<u64> {
         None
     }
@@ -105,6 +108,9 @@ mod disabled {
         0
     }
     pub fn tombstone_hit(_: *mut u8, _: &str) {}
+    pub fn tombstone_expected() {}
+    pub fn pinned_chunks() -> usize { 0 }
+    pub fn sig_census() -> Vec<(usize, usize, usize)> { Vec::new() }
     pub fn points_into(_: usize, _: u64) -> bool {
         false
     }
@@ -182,6 +188,12 @@ pub fn compiler_destroy_generation(g: u64) -> (usize, usize) {
     compiler::destroy_generation(g)
 }
 
+/// Destroys every generation older than the current one, including aborted swaps' arenas.
+/// Returns (chunks, touched bytes); every user of those generations must be quiesced.
+pub fn compiler_destroy_older() -> (usize, usize) {
+    compiler::destroy_older()
+}
+
 /// The generation of the live compiler block at `p` (None: not a live arena address).
 pub fn compiler_epoch_of(p: *const u8) -> Option<u64> {
     compiler::epoch_of(p)
@@ -207,6 +219,16 @@ pub fn compiler_points_into(p: usize, g: u64) -> bool {
 /// The arena's own statics (address ranges): its free lists and base address are not roots.
 pub fn compiler_internal_ranges() -> [(usize, usize); 2] {
     compiler::internal_ranges()
+}
+
+/// Debugging: (stride, first word, count) of the commonest small first words of 48 / 64 byte slots.
+pub fn compiler_sig_census() -> Vec<(usize, usize, usize)> {
+    compiler::sig_census()
+}
+
+/// Chunks the destroys left alone (macOS: they hold std's pthread mutexes and condvars).
+pub fn compiler_pinned_chunks() -> usize {
+    compiler::pinned_chunks()
 }
 
 /// Number of tombstoned chunks and runs.
@@ -256,17 +278,90 @@ pub fn compiler() -> PhaseGuard {
 
 /// `compiler()` for the first statement of a thread that compiles: when the thread ends its
 /// chunks are handed back for reuse.
-pub struct ThreadGuard(#[allow(dead_code)] PhaseGuard);
+pub struct ThreadGuard(#[allow(dead_code)] PhaseGuard, usize);
 
 impl Drop for ThreadGuard {
     fn drop(&mut self) {
+        live::leave(self.1);
         compiler::detach_thread();
     }
 }
 
 #[inline]
 pub fn compiler_thread() -> ThreadGuard {
-    ThreadGuard(compiler())
+    let phase = compiler();
+    ThreadGuard(phase, live::enter())
+}
+
+/// Every thread that took `compiler_thread()` and has not ended: the settle swap (jit zone_swap)
+/// may destroy the compiler generation only when the threads that are alive are all known to
+/// hold none of its blocks across the swap. Fixed table and a spin lock: no allocation, so it
+/// is safe to touch from a thread's first statement.
+mod live {
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const N: usize = 512;
+    const NAME: usize = 24;
+    struct Table {
+        lock: AtomicBool,
+        slots: UnsafeCell<[(bool, [u8; NAME]); N]>,
+    }
+    unsafe impl Sync for Table {}
+    static TABLE: Table = Table { lock: AtomicBool::new(false), slots: UnsafeCell::new([(false, [0; NAME]); N]) };
+
+    fn with<R>(f: impl FnOnce(&mut [(bool, [u8; NAME]); N]) -> R) -> R {
+        while TABLE.lock.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            std::hint::spin_loop();
+        }
+        let r = f(unsafe { &mut *TABLE.slots.get() });
+        TABLE.lock.store(false, Ordering::Release);
+        r
+    }
+
+    pub fn enter() -> usize {
+        let mut name = [0u8; NAME];
+        // (a spawned thread's name is already set: no allocation)
+        if let Some(n) = std::thread::current().name() {
+            let b = n.as_bytes();
+            let k = b.len().min(NAME);
+            name[..k].copy_from_slice(&b[..k]);
+        }
+        with(|t| match t.iter().position(|s| !s.0) {
+            Some(i) => {
+                t[i] = (true, name);
+                i
+            }
+            None => usize::MAX,
+        })
+    }
+
+    pub fn leave(i: usize) {
+        if i != usize::MAX {
+            with(|t| t[i].0 = false);
+        }
+    }
+
+    pub fn list() -> Vec<String> {
+        let names: Vec<[u8; NAME]> = with(|t| t.iter().filter(|s| s.0).map(|s| s.1).collect());
+        names.into_iter().map(|n| {
+            let k = n.iter().position(|b| *b == 0).unwrap_or(NAME);
+            String::from_utf8_lossy(&n[..k]).into_owned()
+        }).collect()
+    }
+}
+
+/// The names of the threads alive that took `compiler_thread()` (an unnamed thread: "").
+/// Allocates: call in the phase the result should live in.
+pub fn live_compiler_threads() -> Vec<String> {
+    live::list()
+}
+
+/// Frees of destroyed-generation blocks are expected from now on (the boot frame of the main
+/// thread drops its compiler-phase locals when the program's `main` returns): still counted,
+/// no longer fatal under RELAX_ZONE_CHECK.
+pub fn tombstone_frees_expected() {
+    compiler::tombstone_expected();
 }
 
 /// Allocations go to the system heap (the program's) until the guard drops. JIT code and

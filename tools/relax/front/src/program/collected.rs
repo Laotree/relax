@@ -221,7 +221,7 @@ impl Program {
 
     pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
         if !self.imports_done || !self.errors.is_empty() || !self.pending_macs.is_empty() {
-            if crate::preload::trace() { eprintln!("relax-collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); }
+            if crate::preload::trace() { eprintln!("relax-collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); if let Some(e) = self.errors.first() { eprintln!("relax-collected: first program error: {e}"); } }
             return None;
         }
         // Certify record relationships once, when publishing. The reader verifies the

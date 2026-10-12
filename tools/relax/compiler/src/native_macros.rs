@@ -10,14 +10,20 @@ pub fn report(profile: bool) {
 static UPDATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static GRAPH: std::sync::RwLock<Option<std::sync::Arc<Graph>>> = std::sync::RwLock::new(None);
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
+pub(crate) struct ZoneTaken(Option<std::sync::Arc<Graph>>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     // prepare (called when the front registry is installed) rebuilds this graph.
     let mut graph = GRAPH.write().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *graph));
+    let taken = ZoneTaken(std::mem::take(&mut *graph));
     #[cfg(test)]
     assert!(graph.is_none());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut graph = GRAPH.write().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *graph, taken.0));
 }
 
 #[derive(Clone, Debug)]

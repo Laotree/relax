@@ -4575,11 +4575,19 @@ pub struct SharedParse {
 /// and after it (a world built again for hot reload takes them too).
 static SHARED_STD: std::sync::Mutex<Option<HashMap<String, std::sync::Arc<SharedParse>>>> = std::sync::Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Option<HashMap<String, std::sync::Arc<SharedParse>>>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut shared = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *shared));
+    let taken = ZoneTaken(std::mem::take(&mut *shared));
     #[cfg(test)]
     assert!(shared.is_none());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut shared = SHARED_STD.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *shared, taken.0));
 }
 static SHARED_CV: std::sync::Condvar = std::sync::Condvar::new();
 /// the program's std load is running: the world waits for its files

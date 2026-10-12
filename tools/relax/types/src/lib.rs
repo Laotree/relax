@@ -4,19 +4,29 @@
 
 pub use relax_front::*;
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
-    borrowck::lazy::zone_reset();
-    tcx::resolve_bound_vars::zone_reset();
+/// Compiler statics held for rollback; forget them before destroying their generations.
+pub struct ZoneTaken {
+    lazy: borrowck::lazy::ZoneTaken,
+    bound_vars: tcx::resolve_bound_vars::ZoneTaken,
+}
+
+/// Takes this crate's compiler statics while every compiler thread is quiesced.
+pub fn zone_take() -> ZoneTaken {
+    ZoneTaken { lazy: borrowck::lazy::zone_take(), bound_vars: tcx::resolve_bound_vars::zone_take() }
+}
+
+/// Restores the statics after an aborted swap, forgetting the new generation's values.
+pub fn zone_put_back(taken: ZoneTaken) {
+    borrowck::lazy::zone_put_back(taken.lazy);
+    tcx::resolve_bound_vars::zone_put_back(taken.bound_vars);
 }
 
 #[test]
 fn zone_reset_fresh_process() {
     const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        zone_reset();
-        zone_reset();
+        std::mem::forget(zone_take());
+        std::mem::forget(zone_take());
         return;
     }
     // Other tests use these statics; the reset and its empty-state assertions need isolation.

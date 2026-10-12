@@ -124,6 +124,7 @@ fn all(line: &str, cmd: &str) -> i32 {
             seen.push(a.pid);
             let tx = tx.clone();
             let line = line.to_string();
+            { let _k = crate::zone_alloc::kept();
             std::thread::spawn(move || {
                 let _ = ask(&a, &line, &mut |l| {
                     // only events (watch answers are events; follow streams start with a header)
@@ -133,6 +134,7 @@ fn all(line: &str, cmd: &str) -> i32 {
                     true
                 });
             });
+            }
         }
         match rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(l) => {

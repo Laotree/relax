@@ -46,11 +46,19 @@ pub struct ResolveBoundVars {
 
 static TRIVIAL: std::sync::Mutex<Option<std::collections::HashMap<crate::types::variance::GenericIndices, std::sync::Arc<ResolveBoundVars>>>> = std::sync::Mutex::new(None);
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Option<std::collections::HashMap<GenericIndices, std::sync::Arc<ResolveBoundVars>>>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut trivial = TRIVIAL.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *trivial));
+    let taken = ZoneTaken(std::mem::take(&mut *trivial));
     #[cfg(test)]
     assert!(trivial.is_none());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut trivial = TRIVIAL.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *trivial, taken.0));
 }
 
 impl ResolveBoundVars {

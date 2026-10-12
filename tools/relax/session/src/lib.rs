@@ -5,18 +5,27 @@ pub mod sip;
 pub mod gen_local;
 pub use options::{Options, RuntimeOptions};
 
-/// memlane swap: forget the compiler generation's state held in this crate's statics;
-/// called with every compiler thread quiesced, right before the old generation is destroyed.
-pub fn zone_reset() {
-    sip::zone_reset();
+/// Compiler statics held for rollback; forget them before destroying their generations.
+pub struct ZoneTaken {
+    sip: sip::ZoneTaken,
+}
+
+/// Takes this crate's compiler statics while every compiler thread is quiesced.
+pub fn zone_take() -> ZoneTaken {
+    ZoneTaken { sip: sip::zone_take() }
+}
+
+/// Restores the statics after an aborted swap, forgetting the new generation's values.
+pub fn zone_put_back(taken: ZoneTaken) {
+    sip::zone_put_back(taken.sip);
 }
 
 #[test]
 fn zone_reset_fresh_process() {
     const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
-        zone_reset();
-        zone_reset();
+        std::mem::forget(zone_take());
+        std::mem::forget(zone_take());
         return;
     }
     // Other tests use these statics; the reset and its empty-state assertions need isolation.

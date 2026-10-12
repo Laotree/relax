@@ -426,10 +426,12 @@ pub fn auto_restartable(frames: &[u64]) {
     if SITES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s.kind == Kind::Restart && s.slot == slot && s.on.load(Relaxed)) {
         return;
     }
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-inspect-restartable".into()).spawn(move || {
         super::heap::exclude_this_thread();
         let _ = add_to(Kind::Restart, Target::Slot(slot), false);
     });
+    }
 }
 
 /// The innermost restartable frame among a panic's frames (lookup pcs): (slot, fn, return words
@@ -793,6 +795,7 @@ mod pause_imp {
     /// 5 ms) until resume; blocked threads are never signalled.
     pub fn pause(want: &'static (dyn Fn(&crate::inspect::threads::Thread) -> bool + Sync)) -> usize {
         let n = sweep(want);
+        { let _k = crate::zone_alloc::kept();
         let _ = std::thread::Builder::new().name("relax-inspect-pause".into()).spawn(move || {
             crate::inspect::heap::exclude_this_thread();
             while super::PAUSED.load(Relaxed) {
@@ -800,6 +803,7 @@ mod pause_imp {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
+        }
         n
     }
     fn sweep(want: &dyn Fn(&crate::inspect::threads::Thread) -> bool) -> usize {

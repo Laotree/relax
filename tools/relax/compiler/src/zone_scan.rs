@@ -8,15 +8,41 @@
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 
-/// Forgets compiler statics and invalidates compiler TLS before destroying the old arena.
+/// Old compiler statics, owned by the swap thread until rollback or commit.
+pub(crate) struct ZoneTaken {
+    compiler: crate::ZoneTaken,
+    types: relax_types::ZoneTaken,
+    front: relax_front::ZoneTaken,
+    codegen: relax_codegen::ZoneTaken,
+    session: relax_session::ZoneTaken,
+}
+
+impl ZoneTaken {
+    /// Restores the running generation's statics and forgets the aborted build's values.
+    pub(crate) fn put_back(self) {
+        crate::zone_put_back(self.compiler);
+        relax_types::zone_put_back(self.types);
+        relax_front::zone_put_back(self.front);
+        relax_codegen::zone_put_back(self.codegen);
+        relax_session::zone_put_back(self.session);
+    }
+
+    /// The old values may point into any older generation; never drop them at commit.
+    pub(crate) fn forget(self) {
+        std::mem::forget(self);
+    }
+}
+
+/// Takes compiler statics before a restore, keeping rollback possible and compiler TLS valid.
 /// Every compiler thread is quiesced; the caller is already in the new compiler generation.
-pub(crate) fn zone_reset_all() {
-    crate::zone_reset();
-    relax_types::zone_reset();
-    relax_front::zone_reset();
-    relax_codegen::zone_reset();
-    relax_session::zone_reset();
-    relax_session::gen_local::bump();
+pub(crate) fn zone_take_all() -> ZoneTaken {
+    ZoneTaken {
+        compiler: crate::zone_take(),
+        types: relax_types::zone_take(),
+        front: relax_front::zone_take(),
+        codegen: relax_codegen::zone_take(),
+        session: relax_session::zone_take(),
+    }
 }
 
 #[cfg(test)]
@@ -25,10 +51,10 @@ mod reset_tests {
     fn zone_reset_fresh_process() {
         const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            // Reset helpers assert their statics are empty. Repeat to cover an empty reset.
+            // Take helpers assert their statics are empty. Repeat to cover an empty take.
             let _phase = crate::zone_alloc::compiler();
-            super::zone_reset_all();
-            super::zone_reset_all();
+            super::zone_take_all().forget();
+            super::zone_take_all().forget();
             return;
         }
         // Other native tests use these process-wide caches: reset only in an isolated child.

@@ -466,6 +466,7 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
 /// a registry scan and one resident-size read: nothing the program pays for.
 pub fn start() {
     retry_update();
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-inspect-watch".into()).spawn(|| {
         super::heap::exclude_this_thread();
         let hang_ms: u64 = std::env::var("RELAX_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
@@ -531,4 +532,5 @@ pub fn start() {
             }
         }
     });
+    }
 }

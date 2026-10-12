@@ -43,11 +43,19 @@ thread_local! { static MY_SLOT: usize = NEXT_SLOT.fetch_add(1, Ordering::Relaxed
 /// Items that took long enough to list: (what, name, ms).
 static SLOW: std::sync::Mutex<Vec<(&'static str, String, f64)>> = std::sync::Mutex::new(Vec::new());
 
-pub(crate) fn zone_reset() {
+pub(crate) struct ZoneTaken(Vec<(&'static str, String, f64)>);
+
+pub(crate) fn zone_take() -> ZoneTaken {
     let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *slow));
+    let taken = ZoneTaken(std::mem::take(&mut *slow));
     #[cfg(test)]
     assert!(slow.is_empty());
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    let mut slow = SLOW.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *slow, taken.0));
 }
 /// The crate being loaded and when it started.
 static LOADING: std::sync::Mutex<(String, f64)> = std::sync::Mutex::new((String::new(), 0.0));
@@ -419,10 +427,12 @@ mod unix {
         // the hook lives as long as the process: the program's heap
         { let _k = crate::zone_alloc::kept(); std::panic::set_hook(Box::new(move |info| { abnormal(); previous(info); })); }
         unsafe { atexit(at_exit) };
+        { let _k = crate::zone_alloc::kept();
         if let Err(e) = std::thread::Builder::new().name("relax-progress".into()).spawn(forward) {
             eprintln!("relax-run: cannot forward session log: {e}");
             abnormal();
             finish(false);
+        }
         }
     }
 

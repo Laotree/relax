@@ -5,6 +5,7 @@ use std::thread::JoinHandle;
 pub struct Console { id: u64, join: JoinHandle<usize> }
 impl Console {
     pub fn start(json: bool, quiet: bool) -> Self {
+        let _k = crate::zone_alloc::kept();
         let (id, context) = lazy::subscribe();
         let join = std::thread::Builder::new().name("gandalf-out".into()).spawn(move || {
             let mut count = 0;

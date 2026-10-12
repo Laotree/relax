@@ -94,6 +94,35 @@ fn destroy_returns_the_touched_bytes_and_a_free_afterwards_is_a_counted_noop() {
 }
 
 #[test]
+fn destroy_older_reclaims_all_prior_generations_and_preserves_the_current_one() {
+    let _s = serial();
+    unsafe {
+        let g0 = compiler_begin_generation();
+        let old0 = put_in_compiler(100, 8, 1);
+        let g1 = compiler_begin_generation();
+        let old1 = put_in_compiler(3 << 20, 16, 2);
+        let g2 = compiler_begin_generation();
+        let current = put_in_compiler(100, 8, 3);
+        let (chunks, touched) = compiler_destroy_older();
+        assert!(chunks >= 2 && touched >= (3 << 20), "chunks {chunks} touched {touched}");
+        assert_eq!(compiler_tombstone_of(old0.0 as usize), Some(g0));
+        assert_eq!(compiler_tombstone_of(old1.0 as usize), Some(g1));
+        assert_eq!(compiler_epoch_of(old0.0), None);
+        assert_eq!(compiler_epoch_of(old1.0), None);
+        assert_eq!(compiler_epoch_of(current.0), Some(g2));
+        assert_eq!(compiler_tombstone_of(current.0 as usize), None);
+        assert!(all_eq(current.0, 100, 3));
+        assert_eq!(compiler_destroy_older(), (0, 0));
+        RelaxAlloc.dealloc(current.0, current.1);
+        // Empty generations also advance the sweep without disturbing tombstones.
+        compiler_begin_generation();
+        assert_eq!(compiler_destroy_older(), (0, 0));
+        compiler_begin_generation();
+        assert_eq!(compiler_destroy_older(), (0, 0));
+    }
+}
+
+#[test]
 fn a_realloc_of_an_old_block_moves_it_into_the_current_generation() {
     let _s = serial();
     unsafe {

@@ -144,17 +144,38 @@ static FRONT_STORES: std::sync::Mutex<Vec<std::sync::Arc<Store>>> = std::sync::M
 /// front images this run mapped (store, index entry): checksummed in the background
 static FRONT_USED: std::sync::Mutex<Vec<(std::sync::Arc<Store>, usize)>> = std::sync::Mutex::new(Vec::new());
 
-pub(crate) fn zone_reset() {
-    front_run::zone_reset();
-    // Forget the Arc owners too: their mappings may still back kept image views.
+pub(crate) struct ZoneTaken {
+    front_run: front_run::ZoneTaken,
+    stores: Vec<std::sync::Arc<Store>>,
+    used: Vec<(std::sync::Arc<Store>, usize)>,
+    paths: Option<HashMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>,
+}
+
+pub(crate) fn zone_take() -> ZoneTaken {
+    let front_run = front_run::zone_take();
+    // Retain the Arc owners too: their mappings may still back kept image views.
     let mut stores = FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *stores));
     let mut used = FRONT_USED.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *used));
     let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
-    std::mem::forget(std::mem::take(&mut *paths));
+    let taken = ZoneTaken {
+        front_run,
+        stores: std::mem::take(&mut *stores),
+        used: std::mem::take(&mut *used),
+        paths: std::mem::take(&mut *paths),
+    };
     #[cfg(test)]
     { assert!(stores.is_empty()); assert!(used.is_empty()); assert!(paths.is_none()); }
+    taken
+}
+
+pub(crate) fn zone_put_back(taken: ZoneTaken) {
+    front_run::zone_put_back(taken.front_run);
+    let mut stores = FRONT_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *stores, taken.stores));
+    let mut used = FRONT_USED.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *used, taken.used));
+    let mut paths = PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    std::mem::forget(std::mem::replace(&mut *paths, taken.paths));
 }
 
 /// Checksums the front images this run mapped, on a low-priority background thread (after the
@@ -166,6 +187,7 @@ pub fn verify_front_images() {
     if used.is_empty() {
         return;
     }
+    { let _k = crate::zone_alloc::kept();
     let _ = std::thread::Builder::new().name("relax-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         crate::os::thread::lower_priority(true);
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
@@ -179,6 +201,7 @@ pub fn verify_front_images() {
             let _ = std::fs::remove_file(crate::store::current(&p));
         }
     });
+    }
 }
 const LEDGER_KEY: u128 = 0;
 // N01 types and closure arguments with baseline tiers and closure fingerprints; 26: a writable block
@@ -220,7 +243,7 @@ pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct CacheStats {
     pub hits: u64,
     pub misses: u64,
@@ -771,6 +794,7 @@ impl Cache {
         // this run's stores are open (so marked live: store::live)
         if mode != Mode::ReadOnly {
             let r = root.clone();
+            { let _k = crate::zone_alloc::kept();
             let _ = std::thread::Builder::new().name("relax-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::jit::lower_this_thread_priority(&runtime);
                 let (b, a) = prune_root(&r);
@@ -778,6 +802,7 @@ impl Cache {
                     eprintln!("relax-cache: pruned {} -> {} MB", b >> 20, a >> 20);
                 }
             });
+            }
         }
         // A rejected store changes ordinal positions: use the ordinary index in that case.
         // (front stores only: they come first in `stores`, as the mapped table numbers them)
@@ -2398,6 +2423,31 @@ impl Cache {
 
     /// Reads the newest startup manifest of the program rooted at crate `root` (and its
     /// prelinked startup image, if it has one).
+    /// The settle swap's new cache (opened as a warm start opens it, from the same stores) takes
+    /// over what the old one learned about this process: which data objects and slots were
+    /// linked from which entries (a second link of the same data object must find its address,
+    /// not place a copy), the entries it rejected, the counters, and that the collected program
+    /// was committed (the exit does not encode it again). The old cache had nothing pending
+    /// (the swap spilled it).
+    pub(crate) fn inherit_run_state(&mut self, old: &Cache) {
+        self.data_addr = old.data_addr.clone();
+        self.data_key = old.data_key.clone();
+        self.linked = old.linked.clone();
+        self.linked_key = old.linked_key.clone();
+        self.base_linked = old.base_linked.clone();
+        self.cert_rejected = old.cert_rejected.clone();
+        self.pending_keys = old.pending_keys.clone();
+        self.pending_verdicts = old.pending_verdicts.clone();
+        self.manifest_done = old.manifest_done;
+        self.collected_committed = true;
+        self.stats = old.stats.clone();
+    }
+
+    /// Pending entries and verdicts: the swap leaves none behind.
+    pub(crate) fn swap_pending(&self) -> (usize, usize) {
+        (self.pending.len(), 0)
+    }
+
     pub fn load_manifest(&mut self, root: u32) {
         let Some(key) = self.manifest_key(root) else { return };
         if let Some(pk) = self.stores.iter().find(|st| st.path == self.code_path[root as usize]).cloned() {
@@ -4350,6 +4400,7 @@ impl ColdFront {
             // A write that cannot record yet stays queued for the post-present or exit writer.
             if deferred {
                 FRONT_GRAPH_WRITES.lock().unwrap().push(job);
+                { let _k = crate::zone_alloc::kept();
                 let _ = std::thread::Builder::new().name("relax-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                     let t = std::time::Instant::now();
                     let r = flush_front_graphs();
@@ -4357,6 +4408,7 @@ impl ColdFront {
                         eprintln!("relax-front: graph written after load: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
                     }
                 });
+                }
             }
             else { write_front_graph(&job); }
         }
