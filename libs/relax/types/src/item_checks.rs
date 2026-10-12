@@ -10,8 +10,10 @@ use crate::types::{TyId, TyKind};
 fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
     let def = prog.def(d);
     match def.kind {
-        DefKind::Mod | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::ForeignTy => (true, false),
-        DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::ForeignFn | DefKind::ForeignStatic => (false, true),
+        DefKind::Mod | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias => (true, false),
+        // (foreign items are left out: an `extern` block inside a fn body is collected into the
+        // enclosing module, not the body's block, so two bodies' declarations would collide)
+        DefKind::Fn | DefKind::Const | DefKind::Static => (false, true),
         DefKind::Struct => {
             // tuple and unit structs also live in the value namespace
             let ast = &prog.files[def.file as usize].ast;
