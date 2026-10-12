@@ -393,7 +393,11 @@ impl Boot {
             timeout_ns,
             &mut EventBuf {
                 session: HOST,
-                ..Default::default()
+                events: std::ptr::null_mut(),
+                cap: 0,
+                arena: std::ptr::null_mut(),
+                arena_cap: 0,
+                arena_len: 0,
             },
         );
         let mut queue = std::mem::take(&mut self.queue);

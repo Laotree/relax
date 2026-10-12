@@ -4,7 +4,7 @@ use crate::{
 };
 use makepad_hal::{CmdWriter, Id};
 use makepad_script::{
-    host::{ScriptHostOwner, ScriptVmHost},
+    host::ScriptVmHost,
     id, LiveId, NoTrap, ScriptHeap, ScriptMod, ScriptObject, ScriptObjectRef, ScriptValue,
     ScriptVm, ScriptVmBase,
 };
