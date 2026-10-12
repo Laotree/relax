@@ -119,6 +119,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             errors.extend(e);
         }
     }
+    errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
@@ -618,9 +619,17 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
     let _job = jit::compile_job();
     for (d, is_static) in items {
         if !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
+        let before = unsafe { (&*up).errors.len() };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
             let u = &mut *up;
             if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
         })));
+        // what the evaluation could not build is not the program's error (a foreign static the
+        // check does not link, code the type check reported already): only E0080 stays
+        let u = unsafe { &mut *up };
+        let mut i = before;
+        while i < u.errors.len() {
+            if u.errors[i].starts_with("compile error in ") { u.errors.remove(i); } else { i += 1; }
+        }
     }
 }

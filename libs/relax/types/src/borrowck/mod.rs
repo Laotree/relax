@@ -216,7 +216,17 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             let mut mc = moves::MoveCheck::new(tx, bir, &md);
             mc.run(&flow, &order);
             if crate::lint::enabled() && mc.diags.is_empty() && bir.closure_kind.is_none() && i == 0 {
-                lint_unused_mut(prog, body.def, bir, &mc.used_mut);
+                // rustc gather_used_muts: a `mut` local no reachable code assigns (declared in
+                // dead code, or never initialized) counts as used
+                let mut used = mc.used_mut.clone();
+                let mut assigned = moves::bits_new(bir.locals.len());
+                for (b, blk) in bir.blocks.iter().enumerate() {
+                    if flow.entry.get(b).map_or(true, |e| e.is_none()) { continue; }
+                    for st in &blk.stmts { if let bir::StmtKind::Assign(p, _) = &st.kind { moves::bit_set(&mut assigned, p.local as usize); } }
+                    if let Some(bir::Term { kind: bir::TermKind::Call { dest, .. }, .. }) = &blk.term { moves::bit_set(&mut assigned, dest.local as usize); }
+                }
+                for l in 0..bir.locals.len() { if !moves::bit_get(&assigned, l) && bir.locals[l].kind == bir::LocalKind::User { moves::bit_set(&mut used, l); } }
+                lint_unused_mut(prog, body.def, bir, &used);
             }
             let mut diags = mc.diags;
             for promoted in &promoteds[i] {
