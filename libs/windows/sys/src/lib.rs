@@ -17693,6 +17693,13 @@ impl ::core::default::Default for AVRT_TASK_HANDLE { fn default() -> Self {Self:
 impl ::core::cmp::PartialEq for AVRT_TASK_HANDLE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
 impl ::core::cmp::Eq for AVRT_TASK_HANDLE {}
 impl ::core::fmt::Debug for AVRT_TASK_HANDLE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+mod import_AvRevertMmThreadCharacteristics { #[link(name = "AVRT", kind = "raw-dylib")] extern "system" { #[link_name = "AvRevertMmThreadCharacteristics"] pub fn call(AvrtHandle: crate::Win32::System::Threading::AVRT_TASK_HANDLE) -> crate::core::BOOL; } }
+pub use import_AvRevertMmThreadCharacteristics::call as AvRevertMmThreadCharacteristics_raw;
+#[inline]
+pub unsafe fn AvRevertMmThreadCharacteristics(AvrtHandle: crate::Win32::System::Threading::AVRT_TASK_HANDLE) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_AvRevertMmThreadCharacteristics::call(AvrtHandle); hr__.ok()?;
+Ok(())
+}
 mod import_AvSetMmThreadCharacteristicsW { #[link(name = "AVRT", kind = "raw-dylib")] extern "system" { #[link_name = "AvSetMmThreadCharacteristicsW"] pub fn call(TaskName: crate::core::PCWSTR,TaskIndex: *mut u32) -> crate::Win32::System::Threading::AVRT_TASK_HANDLE; } }
 pub use import_AvSetMmThreadCharacteristicsW::call as AvSetMmThreadCharacteristicsW_raw;
 #[inline]
