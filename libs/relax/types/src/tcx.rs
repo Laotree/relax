@@ -1534,8 +1534,12 @@ impl Tcx {
         if def.kind == DefKind::Enum {
             errors.extend(self.adts[&did].check_discriminants(self, prog));
         }
+        if matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::representability(prog, self, did));
+        }
         if def.kind == DefKind::Impl {
             errors.extend(self.check_impl_items_against_trait(prog, did));
+            errors.extend(crate::item_checks::impl_trait_wf(prog, self, did));
         }
         errors
     }

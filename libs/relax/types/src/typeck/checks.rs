@@ -29,7 +29,7 @@ impl Fcx<'_> {
 
     /// rustc_hir_typeck/src/fn_ctxt/_impl.rs:495-503: do not create
     /// secondary obligations from a type already containing an error.
-    fn require_type_is_sized_deferred(&mut self, ty: TyId, lo: u32) {
+    pub(super) fn require_type_is_sized_deferred(&mut self, ty: TyId, lo: u32) {
         if !self.tcx.tys.has_error(ty) { self.deferred_sized_obligations.push((ty, lo)); }
     }
 

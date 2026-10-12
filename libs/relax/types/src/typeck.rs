@@ -2067,6 +2067,9 @@ impl<'a> Fcx<'a> {
                     expected
                 };
                 let li = self.b.locals.len() as u32;
+                // rustc GatherLocalsVisitor (gather_locals.rs): every binding's type is Sized
+                // (VariableType); checked by `makepad check` only (the run never pays for it)
+                if crate::lint::enabled() { self.require_type_is_sized_deferred(ty, name.lo); }
                 self.b.locals.push(Local { name: s, ty, mutable: *mutbl && !*by_ref, pat: p.0 });
                 self.b.pat_local.insert(p.0, li);
                 let pf = &self.prog.files[self.file as usize];
@@ -6229,14 +6232,31 @@ impl<'a> Fcx<'a> {
                 NextSolverError::Overflow(o) => ("E0275", o),
             };
             let predicate = &obligation.goal.predicate;
-            let detail = match &predicate.kind {
-                PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) => {
-                    let mut args = Vec::new();
-                    for arg in &p.trait_ref.args {
-                        args.push(match arg { crate::consts::GenericArg::Type(t) => self.ty_str(*t), crate::consts::GenericArg::Const(c) => self.tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
-                    }
-                    format!("{}<{}>", self.prog.def_path(p.trait_ref.def_id), args.join(", "))
+            // rustc's wording (rustc_trait_selection report_selection_error and core's
+            // #[rustc_on_unimplemented] messages) for an unmet trait bound
+            if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
+                let mut args = Vec::new();
+                for arg in &p.trait_ref.args {
+                    args.push(match arg { crate::consts::GenericArg::Type(t) => self.ty_str(*t), crate::consts::GenericArg::Const(c) => self.tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
                 }
+                let td = p.trait_ref.def_id;
+                let name = self.prog.name(td).to_string();
+                let core = Some(self.prog.def(td).krate) == self.prog.prelude_crate || matches!(self.prog.syms.str(self.prog.crates[self.prog.def(td).krate as usize].name), "core" | "alloc" | "std");
+                let self_ty = args.first().cloned().unwrap_or_default();
+                let tr = if args.len() > 1 { format!("{}<{}>", name, args[1..].join(", ")) } else { name.clone() };
+                let msg = match code {
+                    "E0277" if self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) == Some(td) => format!("the size for values of type `{}` cannot be known at compilation time", self_ty),
+                    "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
+                    "E0277" if core && name == "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
+                    "E0277" if core && name == "Iterator" => format!("`{}` is not an iterator", self_ty),
+                    "E0277" => format!("the trait bound `{}: {}` is not satisfied", self_ty, tr),
+                    "E0283" => format!("type annotations needed: cannot satisfy `{}: {}`", self_ty, tr),
+                    _ => format!("overflow evaluating the requirement `{}: {}`", self_ty, tr),
+                };
+                self.err(obligation.cause.span, format!("{code}: {msg}"));
+                continue;
+            }
+            let detail = match &predicate.kind {
                 PredicateKind::Clause(crate::next_solver::ClauseKind::Projection(crate::next_solver::ProjectionClause { projection_term: crate::next_solver::AliasTerm::Ty(a), term: crate::next_solver::Term::Ty(t) })) => {
                     format!("`{}` == `{}`", self.ty_str(*a), self.ty_str(*t))
                 }
