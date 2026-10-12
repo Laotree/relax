@@ -130,9 +130,14 @@ pub fn proc_start(pid: u32) -> Option<u64> {
     Some(u64_at(120) * 1_000_000 + u64_at(128))
 }
 
+/// Other Unix targets (iOS): no start time, only whether the process exists (signal 0 probe;
+/// the process list module is the server binary's, not this library's).
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn proc_start(pid: u32) -> Option<u64> {
-    crate::procs::is_alive(pid).then_some(0)
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    (unsafe { kill(pid as i32, 0) } == 0).then_some(0)
 }
 
 struct State {
