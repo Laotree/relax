@@ -14,6 +14,7 @@ pub use self::cursor::Cursor;
 mod pipe;
 pub use self::pipe::{pipe, PipeReader, PipeWriter};
 pub use self::error::{decode_error_kind, Error, ErrorKind, RawOsError, Result};
+pub(crate) use self::error::{const_error, SimpleMessage};
 pub use self::stdio::{_eprint, _print, cleanup, stderr, stdin, stdout, IsTerminal, Stderr, StderrLock, Stdin, StdinLock, Stdout, StdoutLock};
 
 pub mod prelude {

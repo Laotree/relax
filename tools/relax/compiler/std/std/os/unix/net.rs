@@ -34,7 +34,7 @@ impl SocketAddr {
         let mut buf = sn::zeroed();
         match sn::encode_unix(&mut buf, b) {
             Some(_) => Ok(SocketAddr { path: b.to_vec() }),
-            None => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "path must be shorter than SUN_LEN")),
+            None => Err(io::const_error!(io::ErrorKind::InvalidInput, "path must be shorter than SUN_LEN")),
         }
     }
 }
@@ -53,7 +53,7 @@ fn encode_addr(addr: &SocketAddr) -> io::Result<(sn::SockaddrStorage, sn::sockle
         let mut buf = sn::zeroed();
         return match sn::encode_unix_abstract(&mut buf, &addr.path[1..]) {
             Some(len) => Ok((buf, len)),
-            None => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "abstract name must be shorter than SUN_LEN")),
+            None => Err(io::const_error!(io::ErrorKind::InvalidInput, "abstract name must be shorter than SUN_LEN")),
         };
     }
     encode_path(Path::new(OsStr::from_raw_bytes(&addr.path)))
@@ -69,7 +69,7 @@ pub(crate) fn abstract_addr(name: &[u8]) -> io::Result<SocketAddr> {
             path.extend_from_slice(name);
             Ok(SocketAddr { path })
         }
-        None => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "abstract name must be shorter than SUN_LEN")),
+        None => Err(io::const_error!(io::ErrorKind::InvalidInput, "abstract name must be shorter than SUN_LEN")),
     }
 }
 
@@ -86,13 +86,13 @@ fn encode_path(path: &Path) -> io::Result<(sn::SockaddrStorage, sn::socklen_t)> 
     let b = path.as_os_str().as_encoded_bytes();
     for c in b {
         if *c == 0 {
-            return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "paths must not contain interior null bytes"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "paths must not contain interior null bytes"));
         }
     }
     let mut buf = sn::zeroed();
     match sn::encode_unix(&mut buf, b) {
         Some(len) => Ok((buf, len)),
-        None => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "path must be shorter than SUN_LEN")),
+        None => Err(io::const_error!(io::ErrorKind::InvalidInput, "path must be shorter than SUN_LEN")),
     }
 }
 

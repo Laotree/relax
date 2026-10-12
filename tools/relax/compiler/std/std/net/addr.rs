@@ -89,7 +89,7 @@ impl SocketAddr {
             let (ip, flow, scope) = sn::decode_v6(buf);
             Ok(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), sn::decode_port(buf), flow, scope)))
         } else {
-            Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "invalid argument"))
+            Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid argument"))
         }
     }
 }
@@ -271,11 +271,11 @@ impl ToSocketAddrs for str {
         }
         let (host, port_str) = match self.rsplit_once(':') {
             Some(hp) => hp,
-            None => return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "invalid socket address")),
+            None => return Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid socket address")),
         };
         let port: u16 = match port_str.parse() {
             Ok(p) => p,
-            Err(_) => return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "invalid port value")),
+            Err(_) => return Err(io::const_error!(io::ErrorKind::InvalidInput, "invalid port value")),
         };
         lookup(host, port)
     }
@@ -310,7 +310,7 @@ fn host_port(host: &str, port: u16) -> io::Result<alloc::vec::IntoIter<SocketAdd
 fn lookup(host: &str, port: u16) -> io::Result<alloc::vec::IntoIter<SocketAddr>> {
     let c_host = match CString::new(host) {
         Ok(c) => c,
-        Err(_) => return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "nul byte found in provided data")),
+        Err(_) => return Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte found in provided data")),
     };
     sn::init();
     let hints = sn::AddrInfo::hints(sn::SOCK_STREAM);

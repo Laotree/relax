@@ -471,7 +471,7 @@ impl Command {
     pub(crate) fn exec_replace(&mut self) -> io::Error {
         match self.spawn_with_mode(Stdio(StdioKind::Inherit), true) {
             Err(e) => e,
-            Ok(_) => io::Error::const_msg(io::ErrorKind::Other, "exec returned"),
+            Ok(_) => io::const_error!(io::ErrorKind::Other, "exec returned"),
         }
     }
 
@@ -771,7 +771,7 @@ impl Command {
         if got == 4 {
             Err(io::Error::from_raw_os_error(i32::from_be_bytes(buf)))
         } else {
-            Err(io::Error::const_msg(io::ErrorKind::Other, "short read on the CLOEXEC pipe"))
+            Err(io::const_error!(io::ErrorKind::Other, "short read on the CLOEXEC pipe"))
         }
     }
 }
@@ -878,7 +878,7 @@ impl fmt::Debug for Command {
 fn cstring(b: Vec<u8>) -> io::Result<CString> {
     match CString::new(b) {
         Ok(c) => Ok(c),
-        Err(_) => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "nul byte found in provided data")),
+        Err(_) => Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte found in provided data")),
     }
 }
 

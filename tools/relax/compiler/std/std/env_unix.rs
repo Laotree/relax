@@ -74,7 +74,7 @@ pub fn set_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
                 Err(io::Error::last_os_error())
             }
         }
-        _ => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+        _ => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
     };
     if let Err(e) = r {
         panic!("failed to set environment variable `{:?}` to `{:?}`: {}", key, value, e);
@@ -92,7 +92,7 @@ pub fn remove_var<K: AsRef<OsStr>>(key: K) {
                 Err(io::Error::last_os_error())
             }
         }
-        Err(_) => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+        Err(_) => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
     };
     if let Err(e) = r {
         panic!("failed to remove environment variable `{:?}`: {}", key, e);

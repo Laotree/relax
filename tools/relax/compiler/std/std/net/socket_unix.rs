@@ -209,7 +209,7 @@ impl Socket {
         loop {
             let elapsed = start.elapsed();
             if elapsed >= timeout {
-                return Err(io::Error::const_msg(io::ErrorKind::TimedOut, "connection timed out"));
+                return Err(io::const_error!(io::ErrorKind::TimedOut, "connection timed out"));
             }
             let left = timeout - elapsed;
             let mut ms = left.as_millis();
@@ -233,7 +233,7 @@ impl Socket {
                 // POLLERR | POLLHUP
                 match self.take_error()? {
                     Some(e) => return Err(e),
-                    None => return Err(io::Error::const_msg(io::ErrorKind::Uncategorized, "no error set after POLLHUP")),
+                    None => return Err(io::const_error!(io::ErrorKind::Uncategorized, "no error set after POLLHUP")),
                 }
             }
             return Ok(());

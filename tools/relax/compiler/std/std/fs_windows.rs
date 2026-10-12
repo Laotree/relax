@@ -355,7 +355,7 @@ fn intervals_from_system_time(t: SystemTime) -> io::Result<FILETIME> {
     let (secs, nanos) = t.unix_parts();
     let v = secs as i128 * INTERVALS_PER_SEC + (nanos / 100) as i128 + INTERVALS_TO_UNIX_EPOCH;
     if v < 0 || v > u64::MAX as i128 {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "file time is out of range"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "file time is out of range"));
     }
     let v = v as u64;
     Ok(FILETIME { dwLowDateTime: v as u32, dwHighDateTime: (v >> 32) as u32 })
@@ -677,10 +677,10 @@ impl File {
             }
         }
         if zero {
-            return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "cannot set file timestamp to 0"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "cannot set file timestamp to 0"));
         }
         if max {
-            return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "cannot set file timestamp to 0xFFFF_FFFF_FFFF_FFFF"));
         }
         let p = |t: &Option<FILETIME>| -> *const FILETIME {
             match t {
@@ -1392,7 +1392,7 @@ impl DirBuilder {
         }
         match path.parent() {
             Some(p) => self.create_dir_all(p)?,
-            None => return Err(io::Error::const_msg(io::ErrorKind::Uncategorized, "failed to create whole tree")),
+            None => return Err(io::const_error!(io::ErrorKind::Uncategorized, "failed to create whole tree")),
         }
         match self.mkdir(path) {
             Ok(()) => Ok(()),
@@ -1768,7 +1768,7 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     } else if tag == IO_REPARSE_TAG_MOUNT_POINT {
         (16usize, false)
     } else {
-        return Err(io::Error::const_msg(io::ErrorKind::Uncategorized, "Unsupported reparse point type"));
+        return Err(io::const_error!(io::ErrorKind::Uncategorized, "Unsupported reparse point type"));
     };
     let subst_off = rd16(8) as usize / 2;
     let subst_len = rd16(10) as usize / 2;

@@ -7,6 +7,15 @@ use core::fmt;
 use core::error::Error as StdError;
 use crate::sys;
 
+#[cfg(target_pointer_width = "64")]
+mod repr_bitpacked;
+#[cfg(target_pointer_width = "64")]
+use self::repr_bitpacked::Repr;
+#[cfg(not(target_pointer_width = "64"))]
+mod repr_unpacked;
+#[cfg(not(target_pointer_width = "64"))]
+use self::repr_unpacked::Repr;
+
 pub type Result<T> = core::result::Result<T, Error>;
 pub type RawOsError = i32;
 
@@ -14,13 +23,35 @@ pub struct Error {
     repr: Repr,
 }
 
-enum Repr {
-    Os(i32),
+enum ErrorData<C> {
+    Os(RawOsError),
     Simple(ErrorKind),
-    SimpleMessage(ErrorKind, &'static str),
-    Custom(Box<Custom>),
+    SimpleMessage(&'static SimpleMessage),
+    Custom(C),
 }
 
+// Both pointer variants reserve their low two bits for the packed tag.
+#[repr(align(4))]
+pub(crate) struct SimpleMessage {
+    pub(crate) kind: ErrorKind,
+    pub(crate) message: &'static str,
+}
+
+/// Creates a static-message error without allocating, including in const contexts.
+macro_rules! const_error {
+    ($kind:expr, $message:expr $(,)?) => {
+        $crate::io::Error::from_static_message({
+            const MESSAGE: $crate::io::SimpleMessage = $crate::io::SimpleMessage {
+                kind: $kind,
+                message: $message,
+            };
+            &MESSAGE
+        })
+    };
+}
+pub(crate) use const_error;
+
+#[repr(align(4))]
 struct Custom {
     kind: ErrorKind,
     error: Box<dyn StdError + Send + Sync>,
@@ -239,15 +270,15 @@ pub fn decode_error_kind(errno: i32) -> ErrorKind {
 }
 
 impl Error {
-    pub const INVALID_UTF8: Error = Error::const_msg(ErrorKind::InvalidData, "stream did not contain valid UTF-8");
-    pub const READ_EXACT_EOF: Error = Error::const_msg(ErrorKind::UnexpectedEof, "failed to fill whole buffer");
-    pub const WRITE_ALL_EOF: Error = Error::const_msg(ErrorKind::WriteZero, "failed to write whole buffer");
-    pub const ZERO_TIMEOUT: Error = Error::const_msg(ErrorKind::InvalidInput, "cannot set a 0 duration timeout");
-    pub const NO_ADDRESSES: Error = Error::const_msg(ErrorKind::InvalidInput, "could not resolve to any addresses");
+    pub const INVALID_UTF8: Error = const_error!(ErrorKind::InvalidData, "stream did not contain valid UTF-8");
+    pub const READ_EXACT_EOF: Error = const_error!(ErrorKind::UnexpectedEof, "failed to fill whole buffer");
+    pub const WRITE_ALL_EOF: Error = const_error!(ErrorKind::WriteZero, "failed to write whole buffer");
+    pub const ZERO_TIMEOUT: Error = const_error!(ErrorKind::InvalidInput, "cannot set a 0 duration timeout");
+    pub const NO_ADDRESSES: Error = const_error!(ErrorKind::InvalidInput, "could not resolve to any addresses");
 
-    /// std-internal `const_error!` equivalent.
-    pub(crate) const fn const_msg(kind: ErrorKind, message: &'static str) -> Error {
-        Error { repr: Repr::SimpleMessage(kind, message) }
+    /// Stores the aligned descriptor directly so static errors remain const and allocation-free.
+    pub(crate) const fn from_static_message(message: &'static SimpleMessage) -> Error {
+        Error { repr: Repr::new_simple_message(message) }
     }
 
     pub fn new<E: Into<Box<dyn StdError + Send + Sync>>>(kind: ErrorKind, error: E) -> Error {
@@ -260,7 +291,7 @@ impl Error {
     }
 
     fn from_box(kind: ErrorKind, error: Box<dyn StdError + Send + Sync>) -> Error {
-        Error { repr: Repr::Custom(Box::new(Custom { kind, error })) }
+        Error { repr: Repr::new_custom(Box::new(Custom { kind, error })) }
     }
 
     pub fn other<E: Into<Box<dyn StdError + Send + Sync>>>(error: E) -> Error {
@@ -272,63 +303,81 @@ impl Error {
     }
 
     pub fn from_raw_os_error(code: RawOsError) -> Error {
-        Error { repr: Repr::Os(code) }
+        Error { repr: Repr::new_os(code) }
     }
 
     pub fn raw_os_error(&self) -> Option<RawOsError> {
-        match &self.repr {
-            Repr::Os(c) => Some(*c),
+        match self.repr.data() {
+            ErrorData::Os(c) => Some(c),
             _ => None,
         }
     }
 
     pub fn get_ref(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
-        match &self.repr {
-            Repr::Custom(c) => Some(&*c.error),
+        match self.repr.data() {
+            ErrorData::Custom(c) => Some(&*c.error),
             _ => None,
         }
     }
 
     pub fn get_mut(&mut self) -> Option<&mut (dyn StdError + Send + Sync + 'static)> {
-        match &mut self.repr {
-            Repr::Custom(c) => Some(&mut *c.error),
+        match self.repr.data_mut() {
+            ErrorData::Custom(c) => Some(&mut *c.error),
             _ => None,
         }
     }
 
     pub fn into_inner(self) -> Option<Box<dyn StdError + Send + Sync>> {
-        match self.repr {
-            Repr::Custom(c) => Some(c.error),
+        match self.repr.into_data() {
+            ErrorData::Custom(c) => Some(c.error),
             _ => None,
         }
     }
 
+    /// Extracts a custom error of type `E`, returning this error unchanged on a mismatch.
+    pub fn downcast<E: StdError + Send + Sync + 'static>(self) -> core::result::Result<E, Self> {
+        match self.repr.data() {
+            ErrorData::Custom(c) if c.error.is::<E>() => {},
+            _ => return Err(self),
+        }
+        match self.repr.into_data() {
+            ErrorData::Custom(c) => {
+                let ptr = Box::into_raw(c.error);
+                // SAFETY: The type was checked above and into_data transferred the only owner.
+                Ok(unsafe { *Box::from_raw(ptr as *mut E) })
+            }
+            _ => unreachable!(),
+        }
+    }
+
     pub fn kind(&self) -> ErrorKind {
-        match &self.repr {
-            Repr::Os(code) => decode_error_kind(*code),
-            Repr::Simple(kind) => *kind,
-            Repr::SimpleMessage(kind, _) => *kind,
-            Repr::Custom(c) => c.kind,
+        match self.repr.data() {
+            ErrorData::Os(code) => decode_error_kind(code),
+            ErrorData::Simple(kind) => kind,
+            ErrorData::SimpleMessage(message) => message.kind,
+            ErrorData::Custom(c) => c.kind,
         }
     }
 
     pub(crate) fn is_interrupted(&self) -> bool {
-        match &self.repr {
-            Repr::Os(code) => *code == sys::os::EINTR,
-            _ => self.kind() == ErrorKind::Interrupted,
+        match self.repr.data() {
+            ErrorData::Os(code) => code == sys::os::EINTR,
+            ErrorData::Simple(kind) => kind == ErrorKind::Interrupted,
+            ErrorData::SimpleMessage(message) => message.kind == ErrorKind::Interrupted,
+            ErrorData::Custom(c) => c.kind == ErrorKind::Interrupted,
         }
     }
 }
 
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Error {
-        Error { repr: Repr::Simple(kind) }
+        Error { repr: Repr::new_simple(kind) }
     }
 }
 
 impl From<alloc::ffi::NulError> for Error {
     fn from(_: alloc::ffi::NulError) -> Error {
-        Error::const_msg(ErrorKind::InvalidInput, "data provided contains a nul byte")
+        const_error!(ErrorKind::InvalidInput, "data provided contains a nul byte")
     }
 }
 
@@ -343,35 +392,35 @@ impl fmt::Debug for OsMessage {
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match &self.repr {
-            Repr::Os(code) => f
+        match self.repr.data() {
+            ErrorData::Os(code) => f
                 .debug_struct("Os")
-                .field("code", code)
-                .field("kind", &decode_error_kind(*code))
-                .field("message", &OsMessage(*code))
+                .field("code", &code)
+                .field("kind", &decode_error_kind(code))
+                .field("message", &OsMessage(code))
                 .finish(),
-            Repr::Custom(c) => f.debug_struct("Custom").field("kind", &c.kind).field("error", &c.error).finish(),
-            Repr::Simple(kind) => f.debug_tuple("Kind").field(kind).finish(),
-            Repr::SimpleMessage(kind, message) => f.debug_struct("Error").field("kind", kind).field("message", message).finish(),
+            ErrorData::Custom(c) => f.debug_struct("Custom").field("kind", &c.kind).field("error", &c.error).finish(),
+            ErrorData::Simple(kind) => f.debug_tuple("Kind").field(&kind).finish(),
+            ErrorData::SimpleMessage(message) => f.debug_struct("Error").field("kind", &message.kind).field("message", &message.message).finish(),
         }
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match &self.repr {
-            Repr::Os(code) => write!(f, "{} (os error {})", sys::error_string(*code), code),
-            Repr::Custom(c) => fmt::Display::fmt(&*c.error, f),
-            Repr::Simple(kind) => f.write_str(kind.as_str()),
-            Repr::SimpleMessage(_, message) => fmt::Display::fmt(*message, f),
+        match self.repr.data() {
+            ErrorData::Os(code) => write!(f, "{} (os error {})", sys::error_string(code), code),
+            ErrorData::Custom(c) => fmt::Display::fmt(&*c.error, f),
+            ErrorData::Simple(kind) => f.write_str(kind.as_str()),
+            ErrorData::SimpleMessage(message) => fmt::Display::fmt(message.message, f),
         }
     }
 }
 
 impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match &self.repr {
-            Repr::Custom(c) => c.error.source(),
+        match self.repr.data() {
+            ErrorData::Custom(c) => c.error.source(),
             _ => None,
         }
     }

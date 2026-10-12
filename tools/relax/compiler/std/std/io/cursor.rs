@@ -55,7 +55,7 @@ impl<T: AsRef<[u8]>> Seek for Cursor<T> {
                 self.pos = n;
                 Ok(n)
             }
-            None => Err(Error::const_msg(ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position")),
+            None => Err(crate::io::const_error!(ErrorKind::InvalidInput, "invalid seek to a negative or overflowing position")),
         }
     }
 }

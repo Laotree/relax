@@ -883,7 +883,7 @@ fn resolve_exe(exe_path: &OsStr, child_paths: Option<&OsStr>) -> io::Result<Vec<
         None => false,
     };
     if bytes.is_empty() || trailing_slash {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "program path has no file name"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "program path has no file name"));
     }
     let has_exe_suffix = bytes.len() >= EXE_SUFFIX.len() && bytes[bytes.len() - EXE_SUFFIX.len()..].eq_ignore_ascii_case(EXE_SUFFIX.as_bytes());
     let is_file_name = !bytes.iter().any(|&c| is_sep_byte(c));
@@ -957,7 +957,7 @@ fn resolve_exe(exe_path: &OsStr, child_paths: Option<&OsStr>) -> io::Result<Vec<
             }
         }
     }
-    Err(io::Error::const_msg(io::ErrorKind::NotFound, "program not found"))
+    Err(io::const_error!(io::ErrorKind::NotFound, "program not found"))
 }
 
 /// The path (as to_user_path gives it) when a file is there (GetFileAttributesW, which does not
@@ -973,7 +973,7 @@ fn program_exists(path: &OsStr) -> Option<Vec<u16>> {
 
 fn ensure_no_nuls(s: &OsStr) -> io::Result<()> {
     if s.encode_wide().any(|c| c == 0) {
-        Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "nul byte found in provided data"))
+        Err(io::const_error!(io::ErrorKind::InvalidInput, "nul byte found in provided data"))
     } else {
         Ok(())
     }
@@ -1172,7 +1172,7 @@ fn make_bat_command_line(script: &[u16], args: &[Arg], force_quotes: bool) -> io
     cmd.push(b'"' as u16);
     let script = strip_nul(script);
     if script.contains(&(b'"' as u16)) || script.last() == Some(&(b'\\' as u16)) {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "Windows file names may not contain `\"` or end with `\\`"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "Windows file names may not contain `\"` or end with `\\`"));
     }
     cmd.extend_from_slice(script);
     cmd.push(b'"' as u16);
@@ -1182,7 +1182,7 @@ fn make_bat_command_line(script: &[u16], args: &[Arg], force_quotes: bool) -> io
             Arg::Regular(s) => {
                 // \r and \n could truncate the arguments
                 if s.as_encoded_bytes().iter().any(|&c| c == b'\r' || c == b'\n') {
-                    return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "batch file arguments are invalid"));
+                    return Err(io::const_error!(io::ErrorKind::InvalidInput, "batch file arguments are invalid"));
                 }
                 append_bat_arg(&mut cmd, s, force_quotes)?;
             }
@@ -1323,7 +1323,7 @@ fn read2(out: Option<ChildStdout>, err: Option<ChildStderr>) -> io::Result<(Vec<
             match t.join() {
                 Ok(Ok(v)) => err_buf = v,
                 Ok(Err(e)) => return Err(e),
-                Err(_) => return Err(io::Error::const_msg(io::ErrorKind::Other, "the stderr reader thread panicked")),
+                Err(_) => return Err(io::const_error!(io::ErrorKind::Other, "the stderr reader thread panicked")),
             }
             r?;
         }

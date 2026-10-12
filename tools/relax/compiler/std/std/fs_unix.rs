@@ -31,7 +31,7 @@ pub(crate) fn vfs_stat(k: &vfs::Kind) -> stat_t {
 pub(crate) fn cstr(path: &Path) -> io::Result<CString> {
     match CString::new(path.as_os_str().as_encoded_bytes()) {
         Ok(c) => Ok(c),
-        Err(_) => Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
+        Err(_) => Err(io::const_error!(io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte")),
     }
 }
 
@@ -134,7 +134,7 @@ impl OpenOptions {
                     let fd = cvt_r(|| unsafe { sys::open(null.as_ptr(), sys::os::O_CLOEXEC | sys::O_RDONLY, 0) })?;
                     Ok(File { fd: unsafe { OwnedFd::from_raw_fd(fd) }, mem: Some(Box::new(Mem { data: Arc::new(data), pos: core::sync::atomic::AtomicU64::new(0) })) })
                 }
-                vfs::Kind::Dir => Err(io::Error::const_msg(io::ErrorKind::IsADirectory, "is a directory")),
+                vfs::Kind::Dir => Err(io::const_error!(io::ErrorKind::IsADirectory, "is a directory")),
                 vfs::Kind::Missing => Err(io::Error::from(io::ErrorKind::NotFound)),
             };
         }
@@ -539,7 +539,7 @@ impl Metadata {
     pub fn created(&self) -> io::Result<SystemTime> {
         match self.st.created() {
             Some((s, n)) => time_or_unsupported(s, n),
-            None => Err(io::Error::const_msg(io::ErrorKind::Unsupported, "creation time is not available on this platform currently")),
+            None => Err(io::const_error!(io::ErrorKind::Unsupported, "creation time is not available on this platform currently")),
         }
     }
     pub(crate) fn stat(&self) -> &stat_t {
@@ -822,7 +822,7 @@ impl DirBuilder {
         }
         match path.parent() {
             Some(p) => self.create_dir_all(p)?,
-            None => return Err(io::Error::const_msg(io::ErrorKind::Uncategorized, "failed to create whole tree")),
+            None => return Err(io::const_error!(io::ErrorKind::Uncategorized, "failed to create whole tree")),
         }
         match self.mkdir(path) {
             Ok(()) => Ok(()),
@@ -938,7 +938,7 @@ pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Result<u64> {
     let mut reader = File::open(from)?;
     let meta = reader.metadata()?;
     if !meta.is_file() {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "the source path is neither a regular file nor a symlink to a regular file"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "the source path is neither a regular file nor a symlink to a regular file"));
     }
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);

@@ -35,7 +35,7 @@ impl UdpSocket {
     pub fn send_to<A: ToSocketAddrs>(&self, buf: &[u8], addr: A) -> io::Result<usize> {
         let addr = match addr.to_socket_addrs()?.next() {
             Some(a) => a,
-            None => return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "no addresses to send data to")),
+            None => return Err(io::const_error!(io::ErrorKind::InvalidInput, "no addresses to send data to")),
         };
         let mut storage = sn::zeroed();
         let len = addr.encode(&mut storage);

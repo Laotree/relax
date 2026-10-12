@@ -163,7 +163,7 @@ pub fn panicking() -> bool {
 pub fn available_parallelism() -> io::Result<NonZeroUsize> {
     match NonZeroUsize::new(sys::available_parallelism()) {
         Some(n) => Ok(n),
-        None => Err(io::Error::const_msg(io::ErrorKind::NotFound, "The number of hardware threads is not known for the target platform")),
+        None => Err(io::const_error!(io::ErrorKind::NotFound, "The number of hardware threads is not known for the target platform")),
     }
 }
 

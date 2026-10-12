@@ -1257,7 +1257,7 @@ impl<'a> fmt::Debug for Display<'a> {
 pub fn absolute<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "cannot make an empty path absolute"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "cannot make an empty path absolute"));
     }
     let mut out: Vec<u8> = Vec::new();
     let b = path.bytes();
@@ -1299,7 +1299,7 @@ pub fn absolute<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     use crate::os::windows::ffi::OsStringExt;
     let path = path.as_ref();
     if path.as_os_str().is_empty() {
-        return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "cannot make an empty path absolute"));
+        return Err(io::const_error!(io::ErrorKind::InvalidInput, "cannot make an empty path absolute"));
     }
     let verbatim = match parse_prefix(path.as_os_str()) {
         Some(p) => p.is_verbatim(),
@@ -1307,7 +1307,7 @@ pub fn absolute<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
     };
     if verbatim {
         if path.bytes().contains(&0) {
-            return Err(io::Error::const_msg(io::ErrorKind::InvalidInput, "strings passed to WinAPI cannot contain NULs"));
+            return Err(io::const_error!(io::ErrorKind::InvalidInput, "strings passed to WinAPI cannot contain NULs"));
         }
         return Ok(path.to_path_buf());
     }

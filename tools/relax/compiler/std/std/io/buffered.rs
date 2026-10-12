@@ -165,7 +165,7 @@ impl<W: Write> BufWriter<W> {
             self.panicked = false;
             match r {
                 Ok(0) => {
-                    ret = Err(Error::const_msg(ErrorKind::WriteZero, "failed to write the buffered data"));
+                    ret = Err(crate::io::const_error!(ErrorKind::WriteZero, "failed to write the buffered data"));
                     break;
                 }
                 Ok(n) => written += n,

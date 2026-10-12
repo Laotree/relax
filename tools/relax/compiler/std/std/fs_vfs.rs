@@ -133,5 +133,5 @@ pub(crate) fn mounts() -> String {
 }
 
 pub(crate) fn read_only() -> io::Error {
-    io::Error::const_msg(io::ErrorKind::PermissionDenied, "a file of a git repository run (Relax's VFS) is read-only")
+    io::const_error!(io::ErrorKind::PermissionDenied, "a file of a git repository run (Relax's VFS) is read-only")
 }

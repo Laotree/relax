@@ -245,7 +245,7 @@ impl Socket {
         let mut errorfds = fds;
         let n = cvt(unsafe { sn::select(1, core::ptr::null_mut(), &mut writefds as *mut sn::FdSet, &mut errorfds as *mut sn::FdSet, &tv as *const sn::Timeval) })?;
         if n == 0 {
-            return Err(io::Error::const_msg(io::ErrorKind::TimedOut, "connection timed out"));
+            return Err(io::const_error!(io::ErrorKind::TimedOut, "connection timed out"));
         }
         if writefds.fd_count != 1 {
             if let Some(e) = self.take_error()? {

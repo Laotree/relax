@@ -167,7 +167,7 @@ extern "system" {
 pub fn to_wide(s: &crate::ffi::OsStr) -> crate::io::Result<Vec<u16>> {
     let mut v: Vec<u16> = crate::os::windows::ffi::OsStrExt::encode_wide(s).collect();
     if v.iter().any(|&c| c == 0) {
-        return Err(crate::io::Error::const_msg(crate::io::ErrorKind::InvalidInput, "strings passed to WinAPI cannot contain NULs"));
+        return Err(crate::io::const_error!(crate::io::ErrorKind::InvalidInput, "strings passed to WinAPI cannot contain NULs"));
     }
     v.push(0);
     Ok(v)
