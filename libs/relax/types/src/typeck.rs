@@ -2534,6 +2534,41 @@ impl<'a> Fcx<'a> {
         self.b.struct_defaults.insert(e.0, out);
     }
 
+    /// `S { a: 1 }` without `..` or a base: every field needs a value (rustc_hir_typeck
+    /// expr.rs check_expr_struct_fields, StructTailExpr::None: E0063 report_missing_fields,
+    /// field names sorted, three named then "and N other fields"); a union literal names
+    /// exactly one field (E0784).
+    fn missing_fields(&mut self, adt_ty: TyId, vi: u32, given: &[u32], n_fields: usize, lo: u32) {
+        let t = self.shallow(adt_ty);
+        let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t).clone() else { return };
+        let Some(adt) = self.tcx.adts.get(&ad) else { return };
+        let Some(v) = adt.variants.get(vi as usize) else { return };
+        if adt.is_union {
+            if n_fields != 1 { self.err(lo, "E0784: union expressions should have exactly one field".to_string()); }
+            return;
+        }
+        let mut missing: Vec<String> = Vec::new();
+        for (i, f) in v.fields.iter().enumerate() {
+            if given.contains(&(i as u32)) { continue; }
+            let fname = self.prog.syms.str(f.name).to_string();
+            // a dead slot of a live layout edit (M10) and the fields an edit added (the extension
+            // block gives them their Default) need no value
+            if fname.starts_with("__relax_dead_") || adt.ext_from != u32::MAX && i as u32 >= adt.ext_from { continue; }
+            missing.push(fname);
+        }
+        if missing.is_empty() { return; }
+        missing.sort();
+        let len = missing.len();
+        let names = match &missing[..] {
+            [a] => format!("`{}`", a),
+            [a, b] => format!("`{}` and `{}`", a, b),
+            [a, b, c] => format!("`{}`, `{}` and `{}`", a, b, c),
+            _ => format!("{} and {} other field{}", missing[..3].iter().map(|n| format!("`{}`", n)).collect::<Vec<_>>().join(", "), len - 3, if len - 3 == 1 { "" } else { "s" }),
+        };
+        let ty_name = self.ty_str(t);
+        self.err(lo, format!("E0063: missing field{} {} in initializer of `{}`", if len == 1 { "" } else { "s" }, names, ty_name));
+    }
+
     fn field_ty(&mut self, adt_ty: TyId, vi: u32, name: Sym) -> Option<(u32, TyId)> {
         let t = self.shallow(adt_ty);
         if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(t).clone() {
@@ -4746,6 +4781,9 @@ impl<'a> Fcx<'a> {
                 }
                 if *rest {
                     self.struct_defaults(e, d, adt_ty, vi, &given, lo);
+                } else if base.is_none() {
+                    let n = self.ast().list(*fields).len();
+                    self.missing_fields(adt_ty, vi, &given, n, lo);
                 }
                 adt_ty
             }
