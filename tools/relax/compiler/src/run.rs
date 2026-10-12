@@ -1258,8 +1258,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // process's main thread to the HAL's window system; its `main` runs on a thread of the host's
     let main_host = MAIN_HOST.get().copied().filter(|_| u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_hal"));
     let r = match main_call(&mut u, main_def, entry) {
-        // (the host's hook around the app, e.g. the capabilities it grants: domain.rs)
-        Ok((target, arg)) => crate::domain::boot_around(|| run_main(up, target, arg, main_host)),
+        Ok((target, arg)) => run_main(up, target, arg, main_host),
         Err(e) => {
             eprintln!("relax-run: {e}");
             // Workers already hold this unit's pointer. Its Drop waits
@@ -1375,15 +1374,16 @@ pub fn set_main_host(host: MainHost) {
     let _ = MAIN_HOST.set(host);
 }
 
-/// Calls the program's entry: here, or through the main host.
+/// Calls the program's entry: here, or through the main host. The host's hook around the app (the
+/// capabilities it grants, domain.rs) wraps the call on the thread that runs it: they belong to it.
 fn run_main(up: *mut Unit, entry: u64, arg: u64, host: Option<MainHost>) -> Result<u64, crate::jit::PanicInfo> {
-    let Some(host) = host else { return unsafe { jit::call_jit(up, entry, arg) } };
+    let Some(host) = host else { return crate::domain::boot_around(|| unsafe { jit::call_jit(up, entry, arg) }) };
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let out = slot.clone();
     let up = up as usize;
     host(Box::new(move || {
         jit::ensure_altstack();
-        let r = unsafe { jit::call_jit(up as *mut Unit, entry, arg) };
+        let r = crate::domain::boot_around(|| unsafe { jit::call_jit(up as *mut Unit, entry, arg) });
         *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
     }));
     let r = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
