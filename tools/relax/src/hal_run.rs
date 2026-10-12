@@ -10,7 +10,9 @@ use relax_compiler::{
     domain::{AppSpec, DomainState},
     run_state::{self, Mode, ParkedPanic, Phase, State},
 };
-use relax_session::sync::{Condvar, Mutex, MutexGuard};
+#[cfg(target_os = "macos")]
+use relax_session::sync::Condvar;
+use relax_session::sync::{Mutex, MutexGuard};
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
