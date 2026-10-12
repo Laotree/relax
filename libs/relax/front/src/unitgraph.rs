@@ -53,6 +53,9 @@ pub struct Graph {
     /// libraries the build scripts link: (name, framework)
     pub link_libs: Vec<(String, bool)>,
     pub raw: Vec<RawUnit>,
+    /// `makepad check` of a package with several bins (and no --bin): every bin's crate (cargo
+    /// check checks all targets); the root is the first. Empty otherwise.
+    pub bins: Vec<usize>,
 }
 
 /// "path+file:///a/b/platform#makepad-platform@2.0.0" -> ("/a/b/platform", "makepad-platform", "2.0.0");
@@ -107,7 +110,7 @@ pub fn unit_graph(sess: &std::sync::Arc<crate::Session>, workspace: &str, packag
     crate::resolve::unit_graph(sess, workspace, package, cargo_flags)
 }
 
-pub fn load(g: &Units) -> Result<Graph, String> {
+pub fn load(g: &Units, check_all_bins: bool) -> Result<Graph, String> {
     let units = &g.units;
     let roots = &g.roots;
     let mut crates: Vec<CrateUnit> = Vec::new();
@@ -191,6 +194,7 @@ pub fn load(g: &Units) -> Result<Graph, String> {
         return Err("unit graph: the package has no bin or lib root".to_string());
     }
     // several bins (no --bin): the package's `default-run`, else cargo run's error
+    let mut bins = Vec::new();
     if root_bins.len() > 1 {
         let manifest = crate::vfs::read_to_string(format!("{}/Cargo.toml", root_bins[0].2)).unwrap_or_default();
         let default_run = manifest.lines().find_map(|l| {
@@ -200,6 +204,11 @@ pub fn load(g: &Units) -> Result<Graph, String> {
         });
         match default_run.and_then(|d| root_bins.iter().find(|b| b.1 == d)) {
             Some(b) => root = b.0,
+            // a check runs nothing: it checks every bin, as `cargo check` does
+            None if check_all_bins => {
+                root = root_bins[0].0;
+                bins = root_bins.iter().map(|b| b.0).collect();
+            }
             None => {
                 let names: Vec<&str> = root_bins.iter().map(|b| b.1.as_str()).collect();
                 return Err(format!("could not determine which binary to run: use --bin (available: {}) or set `default-run` in the manifest", names.join(", ")));
@@ -230,7 +239,7 @@ pub fn load(g: &Units) -> Result<Graph, String> {
     for (ci, c) in crates.iter().enumerate() {
         env[ci].push(("CARGO_CRATE_NAME".to_string(), c.name.clone()));
     }
-    Ok(Graph { crates, root, build_scripts, pkg, cfgs: vec![Vec::new(); n], env, link_libs: Vec::new(), raw })
+    Ok(Graph { crates, root, build_scripts, pkg, cfgs: vec![Vec::new(); n], env, link_libs: Vec::new(), raw, bins })
 }
 
 /// cargo's per-package compile-time environment (CARGO_MANIFEST_DIR, CARGO_PKG_*).

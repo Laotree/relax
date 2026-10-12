@@ -217,6 +217,7 @@ pub(crate) fn resolve_package(
     target_dir: &str,
     std_dir: &str,
     who: ResolveFor,
+    check_only: bool,
 ) -> Result<Resolved, String> {
     let boot = who == ResolveFor::Boot;
     let checkpoint = |name: &str| match who {
@@ -235,7 +236,7 @@ pub(crate) fn resolve_package(
         std::fs::read(units_json).map_err(|e| format!("{}: {}", units_json, e)).and_then(|d| unitgraph::Units::from_json(&d))
     }?;
     let t_load = Instant::now();
-    let mut g = unitgraph::load(&units)?;
+    let mut g = unitgraph::load(&units, check_only)?;
     // The graph is enough to choose the host. Open its window before build scripts, parsing,
     // source validation or JIT work; the process main thread is already serving the HAL.
     if boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal") {
@@ -260,8 +261,10 @@ pub(crate) fn resolve_package(
         // (MAKEPAD_RUN_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
         // makepad-windows-sys on Windows) and only type-checks: it never runs the crates' code,
         // so nothing binds and every provided crate is read from source.
+        // `makepad check` runs none of it either: every provided crate is read from source,
+        // whatever source the loader was built from (an identity mismatch refused to check)
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine {
+        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine && !check_only {
             crate::provided::check_sources(&pkgs)?;
         } else {
             crate::provided::read_identity_files(&pkgs);
@@ -579,7 +582,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         verbose!("makepad-run: package {} ({}), std {}", package, if cargo_flags.is_empty() { "default features".to_string() } else { cargo_flags.join(" ") }, std_dir);
     }
 
-    let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot) {
+    let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot, check) {
         Ok(r) => r,
         Err(e) => {
             if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
@@ -620,7 +623,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let tp = Instant::now();
     let root_dir = crate::unitgraph::manifest_dir_of(&g.crates[g.root].src_path);
     // the one app-crate rule (borrowck::event): check, serve and run share it
-    let app_roots = crate::reload::gandalf_app_roots(&units, &root_dir);
+    let mut app_roots = crate::reload::gandalf_app_roots(&units, &root_dir);
+    // a check of a package with several bins checks each of them
+    app_roots.extend(g.bins.iter().map(|&b| crate::vfs::normalize_path(&g.crates[b].src_path)));
     if crate::borrowck::lazy::gandalf_enabled(options) {
         verbose!("makepad-run: gandalf app scope ({} crates): {}", app_roots.len(), app_roots.join(" "));
     }
