@@ -8641,6 +8641,7 @@ impl ::core::ops::BitOr for BI_COMPRESSION { type Output = Self; fn bitor(self, 
 impl ::core::ops::BitAnd for BI_COMPRESSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for BI_COMPRESSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for BI_COMPRESSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const BI_RGB: crate::Win32::Graphics::Gdi::BI_COMPRESSION = crate::Win32::Graphics::Gdi::BI_COMPRESSION(0u64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CIEXYZ {
@@ -16993,6 +16994,7 @@ impl ::core::ops::Not for DROPEFFECT { type Output = Self; fn not(self) -> Self 
 pub const DROPEFFECT_COPY: crate::Win32::System::Ole::DROPEFFECT = crate::Win32::System::Ole::DROPEFFECT(1u64 as _);
 pub const DROPEFFECT_LINK: crate::Win32::System::Ole::DROPEFFECT = crate::Win32::System::Ole::DROPEFFECT(4u64 as _);
 pub const DROPEFFECT_MOVE: crate::Win32::System::Ole::DROPEFFECT = crate::Win32::System::Ole::DROPEFFECT(2u64 as _);
+pub const DROPEFFECT_NONE: crate::Win32::System::Ole::DROPEFFECT = crate::Win32::System::Ole::DROPEFFECT(0u64 as _);
 mod import_DoDragDrop { #[link(name = "OLE32", kind = "raw-dylib")] extern "system" { #[link_name = "DoDragDrop"] pub fn call(pDataObj: *mut ::core::ffi::c_void,pDropSource: *mut ::core::ffi::c_void,dwOKEffects: crate::Win32::System::Ole::DROPEFFECT,pdwEffect: *mut crate::Win32::System::Ole::DROPEFFECT) -> crate::core::HRESULT; } }
 pub use import_DoDragDrop::call as DoDragDrop_raw;
 #[inline]
@@ -17431,6 +17433,47 @@ let hr__ = import_CreatePipe::call(hReadPipe,hWritePipe,lpPipeAttributes.unwrap_
 Ok(())
 }
 }
+pub mod Registry {
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct HKEY(pub *mut ::core::ffi::c_void);
+impl HKEY { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for HKEY { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for HKEY { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for HKEY {}
+impl ::core::fmt::Debug for HKEY { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+pub const HKEY_CURRENT_USER: crate::Win32::System::Registry::HKEY = crate::Win32::System::Registry::HKEY(-2147483647i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct REG_ROUTINE_FLAGS(pub u32);
+impl REG_ROUTINE_FLAGS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for REG_ROUTINE_FLAGS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for REG_ROUTINE_FLAGS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for REG_ROUTINE_FLAGS {}
+impl ::core::fmt::Debug for REG_ROUTINE_FLAGS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for REG_ROUTINE_FLAGS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for REG_ROUTINE_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for REG_ROUTINE_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for REG_ROUTINE_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct REG_VALUE_TYPE(pub u32);
+impl REG_VALUE_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for REG_VALUE_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for REG_VALUE_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for REG_VALUE_TYPE {}
+impl ::core::fmt::Debug for REG_VALUE_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for REG_VALUE_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for REG_VALUE_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for REG_VALUE_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for REG_VALUE_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const RRF_RT_REG_DWORD: crate::Win32::System::Registry::REG_ROUTINE_FLAGS = crate::Win32::System::Registry::REG_ROUTINE_FLAGS(16u64 as _);
+mod import_RegGetValueW { #[link(name = "ADVAPI32", kind = "raw-dylib")] extern "system" { #[link_name = "RegGetValueW"] pub fn call(hkey: crate::Win32::System::Registry::HKEY,lpSubKey: crate::core::PCWSTR,lpValue: crate::core::PCWSTR,dwFlags: crate::Win32::System::Registry::REG_ROUTINE_FLAGS,pdwType: *mut crate::Win32::System::Registry::REG_VALUE_TYPE,pvData: *mut ::core::ffi::c_void,pcbData: *mut u32) -> crate::Win32::Foundation::WIN32_ERROR; } }
+pub use import_RegGetValueW::call as RegGetValueW_raw;
+#[inline]
+pub unsafe fn RegGetValueW(hkey: crate::Win32::System::Registry::HKEY,lpSubKey: Option<crate::core::PCWSTR>,lpValue: Option<crate::core::PCWSTR>,dwFlags: crate::Win32::System::Registry::REG_ROUTINE_FLAGS,pdwType: Option<*mut crate::Win32::System::Registry::REG_VALUE_TYPE>,pvData: Option<*mut ::core::ffi::c_void>,pcbData: Option<*mut u32>) -> crate::Win32::Foundation::WIN32_ERROR {
+import_RegGetValueW::call(hkey,lpSubKey.unwrap_or(unsafe { ::core::mem::zeroed() }),lpValue.unwrap_or(unsafe { ::core::mem::zeroed() }),dwFlags,pdwType.unwrap_or(::core::ptr::null_mut()),pvData.unwrap_or(::core::ptr::null_mut()),pcbData.unwrap_or(::core::ptr::null_mut()))}
+}
 pub mod RemoteDesktop {
 mod import_ProcessIdToSessionId { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "ProcessIdToSessionId"] pub fn call(dwProcessId: u32,pSessionId: *mut u32) -> crate::core::BOOL; } }
 pub use import_ProcessIdToSessionId::call as ProcessIdToSessionId_raw;
@@ -17614,6 +17657,7 @@ impl ::core::default::Default for MEMORYSTATUSEX { fn default() -> Self {Self::d
 pub mod SystemServices {
 pub const MK_CONTROL: crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS = crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(8u64 as _);
 pub const MK_LBUTTON: crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS = crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(1u64 as _);
+pub const MK_RBUTTON: crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS = crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(2u64 as _);
 pub const MK_SHIFT: crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS = crate::Win32::System::SystemServices::MODIFIERKEYS_FLAGS(4u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -18184,6 +18228,11 @@ pub use import_GetDpiForWindow::call as GetDpiForWindow_raw;
 #[inline]
 pub unsafe fn GetDpiForWindow(hwnd: crate::Win32::Foundation::HWND) -> u32 {
 import_GetDpiForWindow::call(hwnd)}
+mod import_GetSystemMetricsForDpi { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetSystemMetricsForDpi"] pub fn call(nIndex: crate::Win32::UI::WindowsAndMessaging::SYSTEM_METRICS_INDEX,dpi: u32) -> i32; } }
+pub use import_GetSystemMetricsForDpi::call as GetSystemMetricsForDpi_raw;
+#[inline]
+pub unsafe fn GetSystemMetricsForDpi(nIndex: crate::Win32::UI::WindowsAndMessaging::SYSTEM_METRICS_INDEX,dpi: u32) -> i32 {
+import_GetSystemMetricsForDpi::call(nIndex,dpi)}
 pub const MDT_EFFECTIVE_DPI: crate::Win32::UI::HiDpi::MONITOR_DPI_TYPE = crate::Win32::UI::HiDpi::MONITOR_DPI_TYPE(0i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -18244,6 +18293,7 @@ impl ::core::default::Default for HRAWINPUT { fn default() -> Self {Self::defaul
 impl ::core::cmp::PartialEq for HRAWINPUT { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
 impl ::core::cmp::Eq for HRAWINPUT {}
 impl ::core::fmt::Debug for HRAWINPUT { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+pub const MOUSE_MOVE_ABSOLUTE: crate::Win32::UI::Input::MOUSE_STATE = crate::Win32::UI::Input::MOUSE_STATE(1u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct MOUSE_STATE(pub u16);
@@ -18654,6 +18704,7 @@ pub const VK_OEM_PLUS: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = 
 pub const VK_P: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(80u64 as _);
 pub const VK_PAUSE: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(19u64 as _);
 pub const VK_PRIOR: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(33u64 as _);
+pub const VK_PROCESSKEY: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(229u64 as _);
 pub const VK_Q: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(81u64 as _);
 pub const VK_R: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(82u64 as _);
 pub const VK_RCONTROL: crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY = crate::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY(163u64 as _);
@@ -19853,6 +19904,14 @@ impl ::core::ops::BitOr for QUERY_USER_NOTIFICATION_STATE { type Output = Self; 
 impl ::core::ops::BitAnd for QUERY_USER_NOTIFICATION_STATE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for QUERY_USER_NOTIFICATION_STATE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for QUERY_USER_NOTIFICATION_STATE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+mod import_SHCreateItemFromParsingName { #[link(name = "SHELL32", kind = "raw-dylib")] extern "system" { #[link_name = "SHCreateItemFromParsingName"] pub fn call(pszPath: crate::core::PCWSTR,pbc: *mut ::core::ffi::c_void,riid: *const crate::core::GUID,ppv: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT; } }
+pub use import_SHCreateItemFromParsingName::call as SHCreateItemFromParsingName_raw;
+#[inline]
+pub unsafe fn SHCreateItemFromParsingName(pszPath: crate::core::PCWSTR,pbc: Option<&crate::Win32::System::Com::IBindCtx>,riid: *const crate::core::GUID) -> Result<*mut ::core::ffi::c_void, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = import_SHCreateItemFromParsingName::call(pszPath,match pbc { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() },riid,&mut result__); hr__.ok()?;
+Ok(result__)
+}
 mod import_SHCreateMemStream { #[link(name = "SHLWAPI", kind = "raw-dylib")] extern "system" { #[link_name = "SHCreateMemStream"] pub fn call(pInit: *const u8,cbInit: u32) -> *mut ::core::ffi::c_void; } }
 pub use import_SHCreateMemStream::call as SHCreateMemStream_raw;
 #[inline]
@@ -20109,6 +20168,13 @@ pub use import_DefWindowProcW::call as DefWindowProcW_raw;
 #[inline]
 pub unsafe fn DefWindowProcW(hWnd: crate::Win32::Foundation::HWND,Msg: u32,wParam: crate::Win32::Foundation::WPARAM,lParam: crate::Win32::Foundation::LPARAM) -> crate::Win32::Foundation::LRESULT {
 import_DefWindowProcW::call(hWnd,Msg,wParam,lParam)}
+mod import_DestroyIcon { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "DestroyIcon"] pub fn call(hIcon: crate::Win32::UI::WindowsAndMessaging::HICON) -> crate::core::BOOL; } }
+pub use import_DestroyIcon::call as DestroyIcon_raw;
+#[inline]
+pub unsafe fn DestroyIcon(hIcon: crate::Win32::UI::WindowsAndMessaging::HICON) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_DestroyIcon::call(hIcon); hr__.ok()?;
+Ok(())
+}
 mod import_DestroyMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "DestroyMenu"] pub fn call(hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU) -> crate::core::BOOL; } }
 pub use import_DestroyMenu::call as DestroyMenu_raw;
 #[inline]
@@ -20274,6 +20340,8 @@ pub const HTTOPRIGHT: u32 = 14;
 pub const HWND_MESSAGE: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-3i64 as _);
 pub const HWND_NOTOPMOST: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-2i64 as _);
 pub const HWND_TOPMOST: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-1i64 as _);
+pub const ICON_BIG: u32 = 1;
+pub const ICON_SMALL: u32 = 0;
 pub const IDC_ARROW: crate::core::PCWSTR = crate::core::PCWSTR(32512u64 as _);
 pub const IDC_CROSS: crate::core::PCWSTR = crate::core::PCWSTR(32515u64 as _);
 pub const IDC_HAND: crate::core::PCWSTR = crate::core::PCWSTR(32649u64 as _);
@@ -20429,6 +20497,7 @@ impl ::core::ops::Not for MENU_ITEM_TYPE { type Output = Self; fn not(self) -> S
 pub const MFS_CHECKED: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE(8u64 as _);
 pub const MFS_DISABLED: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE(3u64 as _);
 pub const MFT_SEPARATOR: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE(2048u64 as _);
+pub const MFT_STRING: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE(0u64 as _);
 pub const MIIM_FTYPE: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(256u64 as _);
 pub const MIIM_ID: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(2u64 as _);
 pub const MIIM_STATE: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(1u64 as _);
@@ -20688,8 +20757,10 @@ pub rcExclude: crate::Win32::Foundation::RECT,
 }
 impl TPMPARAMS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for TPMPARAMS { fn default() -> Self {Self::default()} }
+pub const TPM_LEFTALIGN: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(0u64 as _);
 pub const TPM_RETURNCMD: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(256u64 as _);
 pub const TPM_RIGHTBUTTON: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(2u64 as _);
+pub const TPM_TOPALIGN: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(0u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct TRACK_POPUP_MENU_FLAGS(pub u32);
@@ -20713,6 +20784,7 @@ pub use import_TranslateMessage::call as TranslateMessage_raw;
 pub unsafe fn TranslateMessage(lpMsg: *const crate::Win32::UI::WindowsAndMessaging::MSG) -> crate::core::BOOL {
 import_TranslateMessage::call(lpMsg)}
 pub const WA_ACTIVE: u32 = 1;
+pub const WA_INACTIVE: u32 = 0;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct WINDOWPLACEMENT {
@@ -20833,6 +20905,7 @@ pub const WM_RBUTTONDOWN: u32 = 516;
 pub const WM_RBUTTONUP: u32 = 517;
 pub const WM_SETCURSOR: u32 = 32;
 pub const WM_SETFOCUS: u32 = 7;
+pub const WM_SETICON: u32 = 128;
 pub const WM_SETTINGCHANGE: u32 = 26;
 pub const WM_SHOWWINDOW: u32 = 24;
 pub const WM_SIZE: u32 = 5;
