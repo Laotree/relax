@@ -15,7 +15,7 @@ use std::sync::Arc;
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
-#[cfg(any(not(target_arch = "wasm32"), test))]
+#[cfg(any(all(not(target_os = "windows"), not(target_arch = "wasm32")), test))]
 use std::time::Instant;
 
 #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
