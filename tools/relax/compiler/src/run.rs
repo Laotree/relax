@@ -1769,11 +1769,15 @@ impl SettleWatch {
 
 /// A successful settle takes pending cache entries even below the normal spill threshold.
 /// Disk IO and allocator relief run off the monitor and never hold the unit/front locks.
+/// Why the last `try_settle` failed: 1 a compile finished meanwhile, 2 a checker holds FRONT_RW.
+static SETTLE_WHY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     let up = unsafe { RUN_UNIT };
     if up.is_null() { return false; }
     let Some(Some((drops, pending, spill, at, landmark, retired))) = crate::owner::call_within(crate::owner::Class::Background, 0, || {
         if jit::COMPILED_FNS.load(Ordering::Relaxed) != compiled {
+            SETTLE_WHY.store(1, Ordering::Relaxed);
             return None;
         }
         // Immediate releases must be reported even when an ahead checker kept FRONT_RW busy.
@@ -1814,6 +1818,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
     }
     // a checker kept FRONT_RW busy: the type side was not retired, so this compile count is not
     // settled yet (the next quiet period tries again)
+    if retired.is_none() { SETTLE_WHY.store(2, Ordering::Relaxed); }
     retired.is_some()
 }
 
@@ -1838,6 +1843,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let adopt_on = std::env::var("RELAX_ADOPT").map_or(true, |v| v != "0");
         let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
+        let mut settle_note: &'static str = "";
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
         let mut reclaim_requested = false;
@@ -1977,9 +1983,14 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 if quiet || requested {
                     if try_settle(compiled, &mut drops, runtime.mem_trim) {
                         settle_watch.settled = Some(compiled);
-                    } else if requested {
-                        SETTLE_REQUESTED.store(true, Ordering::Release);
+                    } else {
+                        settle_note = if SETTLE_WHY.load(Ordering::Relaxed) == 2 { "the settle failed: a checker holds the front end (FRONT_RW)" } else { "the settle failed: a compile finished meanwhile" };
+                        if requested {
+                            SETTLE_REQUESTED.store(true, Ordering::Release);
+                        }
                     }
+                } else if settle_watch.settled.is_none() && FIRST_PRESENT_WALL.load(Ordering::Acquire) != 0 {
+                    settle_note = "compiles have not been quiet for 1 s since the first present";
                 }
                 // once the settle ran and this run's collected image is written: the heap tables
                 // it was encoded from become views of it (what a warm run maps), then the freed
@@ -2006,7 +2017,8 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             // the compiler arena's generation is swapped once the run has settled and this run's
             // collected image is current (everything the swap restores from is on disk).
             // Startup teardown must have been scheduled before the swap can quiesce its work.
-            let swap_block: Option<&'static str> = if swap_over || settle_watch.settled.is_none() || Instant::now() < swap_next { Some("") }
+            let swap_block: Option<&'static str> = if swap_over || Instant::now() < swap_next { Some("") }
+                else if settle_watch.settled.is_none() { Some(settle_note) }
                 else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
                 else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
                 else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }

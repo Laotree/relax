@@ -6371,7 +6371,10 @@ fn freed_since(before: i64) -> u64 {
 /// query values nothing holds, which a query derives again on demand. Caller holds the unit
 /// lock; FRONT_RW excludes the off-lock checkers. None when a checker is busy (retried).
 pub unsafe fn retire_type_side(up: *mut Unit) -> Option<(usize, usize)> {
-    let _front = FRONT_RW.try_write().ok()?;
+    // A settle-swap run waits (the owner serves while it does) for the readers that overlap
+    // without a gap in a big app (Scope cold: ahead checkers and the lazy file loader), which
+    // try_write never wins; writers waiting make new checks stop at their next point.
+    let _front = if zone_swap::enabled() { front_write_within(150)? } else { FRONT_RW.try_write().ok()? };
     Some((*up).tcx.retire_settled())
 }
 
@@ -13536,7 +13539,7 @@ unsafe fn realtime_mark(up: *mut Unit, root: u64, data: u64, meta: u64) {
         let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
         let rt = g.get_or_insert_with(Default::default);
         for d in dyns {
-            rt.dyns.insert(d);
+            crate::zone_alloc::kept_with(|| rt.dyns.insert(d));
             RT_DYNS.store(true, Ordering::Release);
         }
     }
@@ -13569,10 +13572,10 @@ pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &str) {
             {
                 let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
                 let rt = g.get_or_insert_with(Default::default);
-                if !rt.seen.insert(id) {
+                if !crate::zone_alloc::kept_with(|| rt.seen.insert(id)) {
                     continue;
                 }
-                rt.set.push(id);
+                crate::zone_alloc::kept_with(|| rt.set.push(id));
             }
             if !(&*up).fns[id as usize].compiled {
                 let _ = compile_slot_locked(up, id, false);
@@ -13588,10 +13591,10 @@ pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &str) {
         {
             let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
             let rt = g.get_or_insert_with(Default::default);
-            if !rt.seen.insert(id) {
+            if !crate::zone_alloc::kept_with(|| rt.seen.insert(id)) {
                 continue;
             }
-            rt.set.push(id);
+            crate::zone_alloc::kept_with(|| rt.set.push(id));
         }
         if (id as usize) >= (&*up).fns.len() {
             continue;
@@ -13608,14 +13611,14 @@ pub(crate) unsafe fn realtime_reach(up: *mut Unit, roots: Vec<u32>, why: &str) {
             let u = &*up;
             let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
             let rt = g.get_or_insert_with(Default::default);
-            let fresh: Vec<u32> = new_dyns.drain(..).filter(|d| rt.dyns.insert(*d)).collect();
+            let fresh: Vec<u32> = new_dyns.drain(..).filter(|d| crate::zone_alloc::kept_with(|| rt.dyns.insert(*d))).collect();
             if !fresh.is_empty() {
                 RT_DYNS.store(true, Ordering::Release);
             }
             let dyns = rt.dyns.clone();
             let addrs: Vec<u64> = u.vtables.snapshot().into_iter().filter(|((_, dy), a)| dyns.contains(&dy.0) && !rt.vtables.contains(a)).map(|(_, a)| a).collect();
             for a in addrs {
-                rt.vtables.insert(a);
+                crate::zone_alloc::kept_with(|| rt.vtables.insert(a));
                 crate::syms::data_thunks(u, a, &mut todo);
             }
         }
@@ -13743,7 +13746,7 @@ fn realtime_vtable(dy: TyId, addr: u64) {
     }
     let known = REALTIME.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|r| r.dyns.contains(&dy.0) && !r.vtables.contains(&addr));
     if known {
-        RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(addr);
+        crate::zone_alloc::kept_with(|| RT_PENDING.lock().unwrap_or_else(|e| e.into_inner()).push(addr));
     }
 }
 
@@ -13786,7 +13789,7 @@ pub(crate) fn realtime_drain() {
         let mut g = REALTIME.lock().unwrap_or_else(|e| e.into_inner());
         let rt = g.get_or_insert_with(Default::default);
         for a in addrs {
-            if rt.vtables.insert(a) {
+            if crate::zone_alloc::kept_with(|| rt.vtables.insert(a)) {
                 crate::syms::data_thunks(u, a, &mut roots);
             }
         }
