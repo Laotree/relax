@@ -162,6 +162,8 @@ fn observe(id: domain::DomainId, state: &DomainState) {
 /// Registers the host with the HAL and the observer with the domains.
 pub fn register() {
     let _kept = relax_compiler::zone_alloc::kept();
+    #[cfg(not(any(target_arch = "wasm32", target_os = "android", target_env = "ohos")))]
+    relax_compiler::inspect::register_host_inspect("gpu", makepad_hal::inspect::dispatch);
     Hal::global().set_domain_host(Arc::new(Host::default()));
     domain::set_observer(observe);
 }

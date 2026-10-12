@@ -117,7 +117,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
     ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
-    ("gpu", "[top [by=bytes|owner|site|churn]|idle [s=30]|snap <name>|diff <a> <b|now>|path G<id>]", "where the GPU memory is (native makepad apps: MAKEPAD_REMOTE=1): totals by kind and owner against the device, automatic findings; top / idle / snap / diff / path"),
+    ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
     ("threads", "", "every thread: name, role, state, CPU time, what it waits on"),
     ("stacks", "[thread=<name|tid|main|owner|all>] [depth=12]", "symbolised stacks (identical stacks folded)"),
@@ -162,7 +162,9 @@ fn dispatch(req: &Req, out: &mut Out) {
         "diff" => mem::cmd_diff(req, out),
         "heap" => heap::cmd_heap(req, out),
         "vms" => cmd_vms(out),
-        // commands the program registered (`relax_register_inspect`): the GPU ledger's `gpu`
+        // Host-native providers outlive app domains and never enter program code.
+        _ if cmd_host_provided(req, out) => {},
+        // Commands the program registered (`relax_register_inspect`), scoped to its domain.
         c if provider(c).is_some() => cmd_provided(req, out),
         "probe" => probes::cmd(req, out),
         "watch" => events::cmd_watch(req, out),
@@ -594,6 +596,24 @@ pub fn script_error_event(line: &str) {
     events::emit("scripterr", line, &format!("\"error\":{},\"more\":[\"vms\"]", json_str(&short(line, 400))));
 }
 
+/// A command answered directly by code linked into the host, without entering an app domain.
+pub type HostQuery = fn(&Req, &mut Out) -> bool;
+
+static HOST_PROVIDERS: Mutex<Vec<(&'static str, HostQuery)>> = Mutex::new(Vec::new());
+
+/// Registers a process-lifetime provider (for example the HAL's GPU ledger). The loader calls
+/// this before starting inspect or any app; domain teardown only removes program providers.
+pub fn register_host_inspect(name: &'static str, query: HostQuery) {
+    let mut providers = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
+    providers.retain(|(n, _)| *n != name);
+    providers.push((name, query));
+}
+
+fn cmd_host_provided(req: &Req, out: &mut Out) -> bool {
+    let query = HOST_PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(n, _)| *n == req.cmd).map(|(_, query)| *query);
+    query.is_some_and(|query| query(req, out))
+}
+
 /// A command the running program answers itself: `query(line, sink, ctx)` gets the request as the
 /// host received it (one flat JSON object), applies the request's own size rule (`full=1`) and
 /// writes the reply's JSON lines through `sink` as it produces them (chunks, not lines; called
@@ -603,7 +623,7 @@ pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern 
 
 static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery, crate::domain::Callback)>> = std::sync::Mutex::new(Vec::new());
 
-/// The program registers the command `name` (makepad-platform: `gpu` and the remote commands); a
+/// The program registers the command `name` (makepad-platform's remote commands); a
 /// later registration replaces the earlier one.
 pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: ProgramQuery) {
     let Some(scope) = crate::domain::callback() else { return };
