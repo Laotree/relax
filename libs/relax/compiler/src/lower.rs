@@ -13564,3 +13564,72 @@ pub(crate) fn intern_lazy_rt(u: &mut Unit, name: &str) -> Option<crate::rir::Sym
     };
     Some(u.syms.intern(crate::syms::SymKind::Rt(kind), addr))
 }
+
+/// rustc's AbortUnwindingCalls for a body that cannot unwind (an `extern "C"` / `"system"` fn
+/// called from C): a panic must not leave it. rustc_mir_transform/src/abort_unwinding_calls.rs:
+/// a call that would unwind straight out of the body (UnwindAction::Continue) gets
+/// UnwindAction::Terminate(Abi), and a cleanup pad's UnwindResume becomes UnwindTerminate(Abi),
+/// so the frame's own cleanups run first. Here, on the lowered RIR: every call that is not
+/// already an Invoke ends its block as one, with a terminate pad as its unwind edge;
+/// `Term::Resume` becomes the terminate call. The terminate pad calls `rt_cannot_unwind`, which
+/// reports and aborts as rustc's panic_cannot_unwind does. (Calls the optimiser learns cannot
+/// unwind go back to plain calls: opt::demote_invokes.)
+pub(crate) fn abort_unwinding_calls(f: &mut crate::rir::Func, terminate: crate::rir::Sym) {
+    use crate::rir::{Callee, Inst, Term};
+    let may_unwind = |i: &Inst| match i {
+        Inst::Call(Callee::Host(s), _, _) => *s != terminate,
+        Inst::Call(Callee::CHost(_, sig) | Callee::CIndirect(_, sig) | Callee::CFn(_, sig), _, _) => sig.unwinds,
+        Inst::Call(..) => true,
+        _ => false,
+    };
+    let mut pad: Option<u32> = None;
+    let mut work: Vec<usize> = (0..f.blocks.len()).collect();
+    while let Some(bi) = work.pop() {
+        if matches!(f.blocks[bi].term, Term::Resume) {
+            let pos = f.blocks[bi].term_pos;
+            f.blocks[bi].insts.push(Inst::Call(Callee::Host(terminate), Vec::new(), Vec::new()));
+            f.blocks[bi].pos.push(pos);
+            f.blocks[bi].term = Term::Unreachable;
+            continue;
+        }
+        let len = f.blocks[bi].insts.len();
+        let ends_invoke = matches!(f.blocks[bi].term, Term::Invoke(..));
+        // the first plain call that may unwind (an Invoke's own call keeps its pad)
+        let Some(i) = (0..len).find(|&i| !(ends_invoke && i + 1 == len) && may_unwind(&f.blocks[bi].insts[i])) else { continue };
+        let pos = f.blocks[bi].pos[i];
+        let p = *pad.get_or_insert_with(|| {
+            let b = f.block();
+            f.blocks[b as usize].insts.push(Inst::Call(Callee::Host(terminate), Vec::new(), Vec::new()));
+            f.blocks[b as usize].pos.push(pos);
+            f.blocks[b as usize].term = Term::Unreachable;
+            f.blocks[b as usize].term_pos = pos;
+            b
+        });
+        // bi: insts[..=i], then Invoke(rest, pad); rest: the remaining insts and bi's terminator
+        let rest = f.block();
+        let tail_insts = f.blocks[bi].insts.split_off(i + 1);
+        let tail_pos = f.blocks[bi].pos.split_off(i + 1);
+        let term = std::mem::replace(&mut f.blocks[bi].term, Term::Invoke(rest, p));
+        let term_pos = std::mem::replace(&mut f.blocks[bi].term_pos, pos);
+        let r = &mut f.blocks[rest as usize];
+        r.insts = tail_insts;
+        r.pos = tail_pos;
+        r.term = term;
+        r.term_pos = term_pos;
+        work.push(rest as usize);
+    }
+}
+
+rt_fn! {
+/// A panic reached the edge of a function that cannot unwind (an `extern "C"` body): rustc's
+/// panic_cannot_unwind -- the message, then abort.
+fn rt_cannot_unwind() {
+    eprintln!("panic in a function that cannot unwind");
+    std::process::abort();
+}
+}
+
+pub fn cannot_unwind_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_cannot_unwind;
+    f as usize as u64
+}

@@ -4,9 +4,8 @@
 usage: unwind_cmp.py <makepad binary> [test file ...]
 Default test files: the interp_unwind*.rs fixtures and the existing drop/unwind fixtures (relative to
 libs/relax/compiler); files named *_abort_* must abort the process everywhere.
-tests/interp_unwind_abort_ffi.rs is not in the default list: a panic leaving an `extern "C"` body that C
-called (qsort's comparator) aborts under rustc, but makepad run (the JIT, and so the interpreter)
-cuts back to catch_unwind instead -- an open JIT divergence (no abort pad for non-unwinding C bodies). Each file is built with
+tests/interp_unwind_abort_ffi.rs: a panic leaving an `extern "C"` body that C called (qsort's
+comparator) aborts, as under rustc (lower.rs abort_unwinding_calls). Each file is built with
 `rustc --test` and run (the reference), then run by `makepad test` with the JIT and with the
 interpreter in several mixes; the "| " lines must be identical (compared as sorted sets per run,
 since test threads may interleave). Exit status 1 on any difference.
@@ -16,7 +15,7 @@ import os, subprocess, sys, tempfile
 here = os.path.dirname(os.path.abspath(__file__))
 comp = os.path.normpath(os.path.join(here, "../.."))
 mk = os.path.abspath(sys.argv[1])
-files = sys.argv[2:] or ["tests/interp_unwind.rs", "tests/interp_unwind_abort_cleanup.rs", "tests/unwind_drops.rs", "tests/drop_order_scopes.rs", "tests/let_chain_drops.rs", "tests/jump_temp_drops.rs", "tests/drop_elab_flags.rs", "tests/thread_panic.rs", "tests/unwind_nested_catch_restore.rs"]
+files = sys.argv[2:] or ["tests/interp_unwind.rs", "tests/interp_unwind_abort_cleanup.rs", "tests/interp_unwind_abort_ffi.rs", "tests/unwind_drops.rs", "tests/drop_order_scopes.rs", "tests/let_chain_drops.rs", "tests/jump_temp_drops.rs", "tests/drop_elab_flags.rs", "tests/thread_panic.rs", "tests/unwind_nested_catch_restore.rs"]
 MODES = [
     ("jit", {}),
     ("interp-all", {"MAKEPAD_RUN_INTERP": "all"}),

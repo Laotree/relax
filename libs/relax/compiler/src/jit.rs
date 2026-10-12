@@ -2476,6 +2476,7 @@ impl Unit {
         // runtime symbols lowering interns on first use: a cached entry may name them before any
         // function of this run was lowered (the cache links them by name)
         let _ = u.syms.intern(crate::syms::SymKind::Rt("divrem128"), crate::lower::divrem128_addr());
+        let _ = u.syms.intern(crate::syms::SymKind::Rt("cannot_unwind"), crate::lower::cannot_unwind_addr());
         for (name, addr) in ["wide_f32", "wide_f64"].into_iter().zip(crate::lower::wide_float_addrs()) {
             let _ = u.syms.intern(crate::syms::SymKind::Rt(name), addr);
         }
@@ -8327,6 +8328,15 @@ fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(cr
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
     }
     lcx.finish();
+    // a body that cannot unwind (`extern "C"` / `"system"`, not `-unwind`): a panic aborts
+    // at its edge (rustc AbortUnwindingCalls)
+    if let FnKey::Inst(d, _) = key {
+        let nounwind_abi = u.tcx.fn_sig(&u.prog, *d).is_some_and(|s| matches!(s.header.abi, relax_types::types::Abi::C | relax_types::types::Abi::System));
+        if nounwind_abi && lcx.f.cabi.is_some() && u.prog.session.options.unwind && lcx.errors.is_empty() {
+            let t = u.syms.intern(crate::syms::SymKind::Rt("cannot_unwind"), crate::lower::cannot_unwind_addr());
+            crate::lower::abort_unwinding_calls(&mut lcx.f, t);
+        }
+    }
     if let Some(e) = lcx.errors.first() {
         return Err(e.clone());
     }
