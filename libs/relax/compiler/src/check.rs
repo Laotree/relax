@@ -195,6 +195,17 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             if !unsafety.is_empty() {
                 return (unsafety, Vec::new());
             }
+            // E0004 / E0005 and the pattern lints (rustc check_match: its errors stop the body
+            // before borrowck); an internal failure of the analysis reports nothing
+            let pats = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::pattern_analysis::check_body(prog, tcx, &body)));
+            match pats {
+                Ok(e) if !e.is_empty() => return (e, Vec::new()),
+                Ok(_) => {}
+                Err(p) if p.is::<crate::preempt::NeedsLoad>() || crate::preempt::is_preempted(&*p) => std::panic::resume_unwind(p),
+                Err(_) => {
+                    if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { std::eprintln!("makepad check: pattern analysis failed in {}", prog.def_path(d)); }
+                }
+            }
             if !crate::borrowck::enabled(options) {
                 return (Vec::new(), Vec::new());
             }

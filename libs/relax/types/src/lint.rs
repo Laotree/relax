@@ -30,6 +30,8 @@ pub const OVERFLOWING_LITERALS: Lint = Lint { name: "overflowing_literals", defa
 pub const UNUSED_UNSAFE: Lint = Lint { name: "unused_unsafe", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
 pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = Lint { name: "unsafe_op_in_unsafe_fn", default: Level::Allow, default_2024: Level::Warn, groups: &["rust_2024_compatibility"] };
 pub const STATIC_MUT_REFS: Lint = Lint { name: "static_mut_refs", default: Level::Warn, default_2024: Level::Deny, groups: &["rust_2024_compatibility"] };
+pub const UNREACHABLE_PATTERNS: Lint = Lint { name: "unreachable_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
+pub const IRREFUTABLE_LET_PATTERNS: Lint = Lint { name: "irrefutable_let_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &[] };
 
 const LEVEL_ATTRS: &[(&[u8], Level)] = &[
     (b"allow", Level::Allow), (b"expect", Level::Allow), (b"warn", Level::Warn),
@@ -96,7 +98,16 @@ fn scopes(prog: &Program, def: DefId) -> Vec<(u32, Vec<Attr>)> {
 
 /// The level of `lint` at `def`.
 pub fn level(prog: &Program, def: DefId, lint: &Lint) -> Level {
-    let scopes = scopes(prog, def);
+    level_in(prog, def, &[], lint)
+}
+
+/// The level of `lint` inside `def` under `inner`, the attributes of a node of its body (a
+/// match arm) in the definition's file.
+fn level_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Level {
+    let mut scopes = scopes(prog, def);
+    if !inner.is_empty() && def != NO_DEF {
+        scopes.insert(0, (prog.def(def).file, inner.to_vec()));
+    }
     // outermost first; within a list, later attributes override earlier ones
     let mut level = if prog.files[prog.def(def).file as usize].edition >= 2024 { lint.default_2024 } else { lint.default };
     let mut warnings: Option<Level> = None;
@@ -130,8 +141,13 @@ pub fn enabled() -> bool { ENABLED.load(Ordering::Relaxed) }
 
 /// Reports `lint` at `pos` of `file` in `def`'s scope: "path:line:col: error|warning: msg".
 pub fn emit(prog: &Program, def: DefId, lint: &Lint, file: u32, pos: u32, msg: &str) {
+    emit_in(prog, def, &[], lint, file, pos, msg)
+}
+
+/// `emit` under the attributes `inner` of a node inside `def`'s body.
+pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
     if !enabled() { return; }
-    let level = level(prog, def, lint);
+    let level = level_in(prog, def, inner, lint);
     if level == Level::Allow { return; }
     let (l, c) = prog.files[file as usize].line_col(pos);
     let kind = if level >= Level::Deny { "error" } else { "warning" };
