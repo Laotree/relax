@@ -431,7 +431,7 @@ fn selection() -> Option<&'static Sel> {
 
 /// The backends' hook: `Some(code)` when `f` runs in the interpreter -- the slot's code is then
 /// a jump to the function's entry thunk.
-pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64, resume: u64) -> Option<Vec<u8>> {
+pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64, resume: u64) -> Option<(Vec<u8>, Vec<RelocAt>)> {
     let sel = selection()?;
     // a pattern matches a name containing it; `=name` matches that name only
     let m = |p: &String| match p.strip_prefix('=') {
@@ -447,7 +447,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
     let t0 = std::time::Instant::now();
     let lowered = lower(f, slots, syms, sym_class);
     LOWER_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let ifunc = match lowered {
+    let (ifunc, persist) = match lowered {
         Ok(x) => x,
         Err(why) => {
             if no_codegen() {
@@ -457,24 +457,50 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
             return None;
         }
     };
-    let k = NEXT.fetch_add(1, Ordering::Relaxed);
-    if k >= POOL {
-        if no_codegen() {
-            panic!("makepad run: no-codegen mode: more than {} interpreted functions (the entry thunk pool)", POOL);
-        }
-        refuse("entry thunk pool exhausted");
-        return None;
-    }
-    TLS_GLUE.store(tls_slow, Ordering::Relaxed);
-    RESUME.store(resume, Ordering::Relaxed);
+    set_runtime(tls_slow, resume);
     SLOTS.store(slots.0 as usize, Ordering::Relaxed);
     if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
         print_stats();
     }
     N_WORDS.fetch_add(ifunc.code.len() as u64, Ordering::Relaxed);
     N_INSTS.fetch_add(f.blocks.iter().map(|b| b.insts.len() as u64 + 1).sum::<u64>(), Ordering::Relaxed);
-    FUNCS[k].store(Box::into_raw(Box::new(ifunc)), Ordering::Release);
-    Some(crate::arm64::jump_to(pool_base() + 8 * k as u64))
+    // the function's code is its relocatable form (blob.rs): the runtime links it like machine
+    // code (from the disk cache too) and installs it with `install_linked`
+    let out = blob::serialize(&ifunc, &persist);
+    free_lowered(ifunc, &persist);
+    Some(out)
+}
+
+/// Is `addr` an interpreted function's entry (an entry thunk of the pool)?
+pub fn is_entry(addr: u64) -> bool {
+    let p = pool_base();
+    cfg!(target_arch = "aarch64") && addr >= p && addr < p + 8 * POOL as u64
+}
+
+/// The runtime addresses the interpreter calls (the backends' Env): set before a function runs.
+pub fn set_runtime(tls_slow: u64, resume: u64) {
+    TLS_GLUE.store(tls_slow, Ordering::Relaxed);
+    RESUME.store(resume, Ordering::Relaxed);
+}
+
+/// Frees what lowering allocated for a function that is not installed as lowered (its call
+/// descriptors and vector ops).
+fn free_lowered(f: IFunc, p: &Persist) {
+    unsafe {
+        for &i in &p.desc {
+            drop(Box::from_raw(f.code[i] as *mut CallDesc));
+        }
+        for &(i, _) in &p.vx {
+            drop(Box::from_raw(f.code[i] as *mut VX));
+        }
+    }
+}
+
+/// An interpreted function's code as the runtime installs it: a blob whose relocated words the
+/// runtime has written (rir::link). Registers it and returns its entry.
+pub fn install_linked(code: &[u8], tls_slow: u64, resume: u64) -> Result<u64, String> {
+    set_runtime(tls_slow, resume);
+    blob::install(code)
 }
 
 // ---------------------------------------------------------------- thread state
@@ -661,6 +687,8 @@ macro_rules! next {
 
 #[cfg(target_arch = "aarch64")]
 mod vx;
+pub mod blob;
+use blob::{Persist, Prov};
 
 /// Cell `k` (0..4) of an operand word.
 #[inline(always)]
@@ -1988,6 +2016,8 @@ struct CallDesc {
     /// words of the caller's frame: callee frames start past it
     frame_words: usize,
     ic: AtomicPtr<Ic>,
+    /// what a Table / Addr target's value is (the slot or symbol), for the cached form
+    src: Option<Prov>,
 }
 
 /// The interpreted function a native code address leads to: a pool thunk, a jump to one
@@ -2273,6 +2303,8 @@ struct Lw<'a> {
     cur: String,
     /// the unwind block of the call being lowered (it ends an Invoke block)
     unwind_to: Option<u32>,
+    /// what the cached form of the code needs to relocate it (blob.rs)
+    persist: Persist,
     /// vregs whose only definition is a SlotAddr: the slot's frame offset (their uses as a
     /// memory base or a call argument read fp + offset; the SlotAddr itself is only lowered when
     /// another use needs the value in a cell)
@@ -2358,8 +2390,14 @@ impl<'a> Lw<'a> {
                 g.push((h as usize as u64, self.cur.clone()));
             }
         }
+        self.persist.handlers.push(self.code.len());
         self.code.push(h as usize as u64);
         self.code.extend_from_slice(ws);
+    }
+    /// The last word emitted holds `p`'s value.
+    fn mark_last(&mut self, p: Prov) {
+        let at = self.code.len() - 1;
+        self.persist.prov.push((at, p));
     }
     fn target(&mut self, b: u32) {
         self.fix.push((self.code.len(), b));
@@ -2487,7 +2525,7 @@ fn coalesce(f: &Func) -> (Vec<u32>, std::collections::HashSet<(u32, u32)>) {
     (alias, skip)
 }
 
-fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, &'static str> {
+fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<(IFunc, Persist), &'static str> {
     let (alias, skip) = coalesce(f);
     // frame: one cell per vreg (two for V128), then the stack slots, then C ABI buffers; an
     // aliased vreg shares its representative's cell
@@ -2558,6 +2596,8 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
     // a vreg whose every definition is the same integer constant (O1 leaves bounds-check flags
     // like this in non-SSA RIR): a branch on it is a jump
     let mut konst: Vec<Option<Option<i64>>> = vec![None; f.vregs.len()];
+    // where a constant's value comes from (a symbol or a slot: relocated when cached)
+    let mut kprov: Vec<Option<Prov>> = vec![None; f.vregs.len()];
     if std::env::var_os("MAKEPAD_RUN_INTERP_NOFOLD").is_none() {
         for p in &f.params {
             konst[p.0 as usize] = Some(None);
@@ -2565,35 +2605,39 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         for b in &f.blocks {
             for i in &b.insts {
                 let mut defs: Vec<VReg> = Vec::new();
-                let k = match i {
+                let (k, prov) = match i {
                     Inst::Iconst(d, v) => {
                         defs.push(*d);
-                        Some(*v)
+                        (Some(*v), None)
                     }
                     Inst::Fconst(d, bits, _) => {
                         defs.push(*d);
-                        Some(*bits as i64)
+                        (Some(*bits as i64), None)
                     }
                     Inst::Addr(d, sym) if SymClass::of(sym_class, sym.id) != SymClass::Domain => {
                         defs.push(*d);
-                        Some(unsafe { sym.value(syms) } as i64)
+                        (Some(unsafe { sym.value(syms) } as i64), Some(Prov::Sym(*sym)))
                     }
                     Inst::FnAddr(d, id) => {
                         defs.push(*d);
-                        Some(slots.callable(*id) as i64)
+                        (Some(slots.callable(*id) as i64), Some(Prov::Thunk(*id)))
                     }
                     _ => {
                         defs_of(i, &mut defs);
-                        None
+                        (None, None)
                     }
                 };
                 for d in defs {
+                    let first = konst[d.0 as usize].is_none();
                     let e = &mut konst[d.0 as usize];
                     *e = match (*e, k) {
                         (None, Some(v)) => Some(Some(v)),
-                        (Some(Some(a)), Some(v)) if a == v => Some(Some(a)),
+                        (Some(Some(a)), Some(v)) if a == v && kprov[d.0 as usize] == prov => Some(Some(a)),
                         _ => Some(None),
                     };
+                    if first {
+                        kprov[d.0 as usize] = prov;
+                    }
                 }
             }
         }
@@ -2686,7 +2730,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
             }
         }
     }
-    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None, frame: frame_of };
+    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None, frame: frame_of, persist: Persist::default() };
     let mut block_at = vec![0usize; f.blocks.len()];
     if !preload.is_empty() {
         let mut ws = vec![preload.len() as u64];
@@ -2695,7 +2739,13 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
             ws.push(*k);
         }
         l.cur = "const preload (entry)".into();
+        let at = l.code.len() + 1;
         l.emit(h_preload, &ws);
+        for (j, (v, _)) in preload.iter().enumerate() {
+            if let Some(p) = kprov[*v as usize] {
+                l.persist.prov.push((at + 2 + 2 * j, p));
+            }
+        }
     }
     let sym_val = |s: Sym| unsafe { s.value(syms) };
     for (bi, b) in f.blocks.iter().enumerate() {
@@ -2827,11 +2877,13 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
     }
     let mut code = l.code.into_boxed_slice();
     let base = code.as_ptr() as u64;
+    let mut persist = l.persist;
     for (at, b) in l.fix {
         code[at] = base + 8 * block_at[b as usize] as u64;
+        persist.targets.push(at);
     }
     let params = f.params.iter().map(|p| (l.cell[p.0 as usize], f.vregs[p.0 as usize])).collect();
-    Ok(IFunc { code, frame_words, params, cplan, name: f.name.clone(), align })
+    Ok((IFunc { code, frame_words, params, cplan, name: f.name.clone(), align }, persist))
 }
 
 fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &dyn Fn(Sym) -> u64) -> Result<(), &'static str> {
@@ -2977,17 +3029,21 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             let w = l.r(*d);
             if SymClass::of(sym_class, sym.id) == SymClass::Domain {
                 l.emit(h_dom_addr, &[w, sym_val(*sym)]);
+                l.mark_last(Prov::Sym(*sym));
             } else {
                 l.emit(h_const, &[w, sym_val(*sym)]);
+                l.mark_last(Prov::Sym(*sym));
             }
         }
         Inst::TlsAddr(d, sym) => {
             let w = l.r(*d);
             l.emit(h_tls_addr, &[w, sym_val(*sym)]);
+            l.mark_last(Prov::Sym(*sym));
         }
         Inst::FnAddr(d, id) => {
             let w = l.r(*d);
             l.emit(h_const, &[w, slots.callable(*id)]);
+            l.mark_last(Prov::Thunk(*id));
         }
         Inst::Copy(dst, src, size) => {
             let w = l.w2(*dst, *src);
@@ -3002,6 +3058,11 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
                 Callee::Fn(id) | Callee::CFn(id, _) => Target::Table(slots.table(*id)),
                 Callee::Indirect(v) | Callee::CIndirect(v, _) => Target::Cell(l.cell[v.0 as usize]),
                 Callee::Host(s) | Callee::CHost(s, _) => Target::Addr(sym_val(*s)),
+            };
+            let src = match callee {
+                Callee::Fn(id) | Callee::CFn(id, _) => Some(Prov::Slot(*id)),
+                Callee::Host(s) | Callee::CHost(s, _) => Some(Prov::Sym(*s)),
+                _ => None,
             };
             let csig = match callee {
                 Callee::CHost(_, s) | Callee::CIndirect(_, s) | Callee::CFn(_, s) => {
@@ -3041,8 +3102,11 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
                 csig,
                 frame_words: l.frame_words,
                 ic: AtomicPtr::new(std::ptr::null_mut()),
+                src,
             });
             l.emit(h_call, &[Box::into_raw(d) as u64]);
+            let at = l.code.len() - 1;
+            l.persist.desc.push(at);
             match l.unwind_to {
                 Some(u) => l.target(u),
                 None => l.code.push(0),
@@ -3136,11 +3200,15 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
         Inst::VX(op, d, a, b) => {
             let w = l.w3(*d, *a, *b);
             l.emit(vx::handlers().0, &[w, Box::into_raw(Box::new(*op)) as u64]);
+            let at = l.code.len() - 1;
+            l.persist.vx.push((at, *op));
         }
         #[cfg(target_arch = "aarch64")]
         Inst::VX3(op, d, a, b, c) => {
             let w = l.w4(*d, *a, *b, *c);
             l.emit(vx::handlers().1, &[w, Box::into_raw(Box::new(*op)) as u64]);
+            let at = l.code.len() - 1;
+            l.persist.vx.push((at, *op));
         }
         #[cfg(not(target_arch = "aarch64"))]
         Inst::VX(..) | Inst::VX3(..) => return Err("lane-typed vector op"),

@@ -143,7 +143,8 @@ pub struct Options {
     /// `MAKEPAD_RUN_NO_CODEGEN=1`: the process makes no machine code (the platforms without
     /// writable+executable memory, iOS): every function runs in the threaded interpreter
     /// (codegen interp.rs), the runtime glue is the precompiled set (jit/static_glue.rs), and any
-    /// write to code memory is an error. Implies no O3 and no code cache. Default `false`.
+    /// write to code memory is an error. Implies no O3; the code cache holds the interpreter's
+    /// relocatable form (codegen interp/blob.rs). Default `false`.
     pub no_codegen: bool,
     /// A live session (hot reload, watcher): `makepad run` of a working tree, `makepad live`; never
     /// from the environment. Default `false`.

@@ -3445,11 +3445,11 @@ pub(crate) fn jump_tables(options: &relax_session::Options, f: &Func, al: &Alloc
 }
 
 pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
-    // research prototype: the function runs in the threaded interpreter (interp.rs); its code
-    // is a jump to its entry thunk
-    if let Some(code) = crate::interp::maybe_compile(f, env.slots, env.syms, env.sym_class, env.tls_slow, env.resume) {
+    // the function runs in the threaded interpreter (interp.rs, MAKEPAD_RUN_INTERP /
+    // MAKEPAD_RUN_NO_CODEGEN): its "code" is the interpreter's relocatable form (interp/blob.rs)
+    if let Some((code, relocs)) = crate::interp::maybe_compile(f, env.slots, env.syms, env.sym_class, env.tls_slow, env.resume) {
         let n = code.len() as u32;
-        return Ok(Compiled { code, pc_map: Vec::new(), frame_size: 0, text_len: n, alloc_sig: 0, relocs: Vec::new(), rir_map: Vec::new(), rir_emitted: String::new() });
+        return Ok(Compiled { code, pc_map: Vec::new(), frame_size: 0, text_len: n, alloc_sig: 0, relocs, rir_map: Vec::new(), rir_emitted: String::new() });
     }
     compile_freq_timed(options, f, env, freq)
 }

@@ -2573,6 +2573,11 @@ impl Unit {
     /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
     /// relocations: an interpreter entry or a foreign function); other machine code is an error.
     fn no_codegen_target(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
+        if relax_codegen::interp::blob::is_blob(code) {
+            let mut c = code.to_vec();
+            crate::rir::link(&mut c, 0, relocs, &|r| self.env.reloc_value(r))?;
+            return relax_codegen::interp::install_linked(&c, self.env.tls_slow, self.env.resume);
+        }
         match relax_codegen::interp::redirect_target(code) {
             Some(t) if relocs.is_empty() => Ok(t),
             _ => Err(format!("makepad run: no-codegen mode: `{}` would need machine code ({} bytes)", what, code.len())),
@@ -2582,7 +2587,7 @@ impl Unit {
     /// Code for an address that is not a slot (error stubs): written to code memory, or in
     /// no-codegen mode the target of its jump.
     fn emit_or_redirect(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
-        if self.prog.session.options.no_codegen {
+        if self.prog.session.options.no_codegen || relax_codegen::interp::blob::is_blob(code) {
             self.no_codegen_target(code, relocs, what)
         } else {
             self.emit_linked(code, relocs)
@@ -4332,13 +4337,14 @@ impl Unit {
     fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = crate::fncost::phase(6);
         let options = &self.prog.session.clone().options;
+        // an interpreted function (its relocatable form) or, in no-codegen mode, a jump (a
+        // foreign function's veneer): the slot takes the entry itself, nothing is written
+        let interp = relax_codegen::interp::blob::is_blob(code);
         // the unwind trailer is kept beside the code, not in it
-        let (n, info) = crate::rir::split_unwind_info(code);
+        let (n, info) = if interp { (code.len(), None) } else { crate::rir::split_unwind_info(code) };
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
-        // no-codegen: the slot's "code" is a jump (to its interpreter entry thunk, or a foreign
-        // function's veneer): the slot takes the target itself, nothing is written
-        let redirect = if options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
+        let redirect = if interp || options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
         // a sandboxed twin's code goes to the sandbox code space (recycled as a whole)
         let at = match redirect {
             Some(t) => t,
@@ -6257,7 +6263,7 @@ unsafe fn o2_finish(up: *mut Unit, d: O2Done) {
     let u = &mut *up;
     let c = match built {
         Ok(Ok((func, inlined, c))) if !stale && {
-            let (n, _) = crate::rir::split_unwind_info(&c.code);
+            let n = if relax_codegen::interp::blob::is_blob(&c.code) { c.code.len() } else { crate::rir::split_unwind_info(&c.code).0 };
             u.link_check(&c.code[..n], &c.relocs)
         } => {
             // O3 starts from this RIR
@@ -10641,7 +10647,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
         u.stats.tier1_free_ns += t2 - t1;
         let ok = match built {
             Ok(Ok((code, map, relocs, (inlined, left_calls, cold_left, frame_size, self_call, nounwind_used, profile_entry)))) if PATCH_EPOCH.load(Ordering::SeqCst) == epoch && !PATCH_OPEN.load(Ordering::SeqCst) && u.fns[id as usize].version == version && !crate::inspect::instrument::active(id) && {
-                let (n, _) = crate::rir::split_unwind_info(&code);
+                let n = if relax_codegen::interp::blob::is_blob(&code) { code.len() } else { crate::rir::split_unwind_info(&code).0 };
                 u.link_check(&code[..n], &relocs)
             } => {
                 // Sign O3 machine bytes and symbolic relocations while the unit is locked.
@@ -10684,18 +10690,26 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     O3_FIRST_AT.with(|c| c.set(a));
                     true
                 } else {
-                let (n, info) = crate::rir::split_unwind_info(&code);
+                // an interpreted function's O3 build is its relocatable form (interp/blob.rs)
+                let blob = relax_codegen::interp::blob::is_blob(&code);
+                let (n, info) = if blob { (code.len(), None) } else { crate::rir::split_unwind_info(&code) };
                 let code = code[..n].to_vec();
                 let u = &mut *up;
-                let at = match if sandboxed { crate::sandbox::emit_twin(u, &code, &relocs) } else { None } {
-                    Some(at) => at,
-                    None => u.emit_linked(&code, &relocs).expect("O3 code links (checked)"),
+                let at = if blob {
+                    u.emit_or_redirect(&code, &relocs, "O3").expect("O3 interpreted code installs")
+                } else {
+                    match if sandboxed { crate::sandbox::emit_twin(u, &code, &relocs) } else { None } {
+                        Some(at) => at,
+                        None => u.emit_linked(&code, &relocs).expect("O3 code links (checked)"),
+                    }
                 };
                 if sandboxed {
                     crate::sandbox::note_dead(u.fns[id as usize].code_len as u64);
                 }
                 // Twin spaces can precede the last host code in the address index.
-                u.index_code(at, code.len() as u32, id, info);
+                if !blob {
+                    u.index_code(at, code.len() as u32, id, info);
+                }
                 if perf_map_on() {
                     perf_map(at, code.len(), &format!("{} [O3]", u.fns[id as usize].name));
                 }

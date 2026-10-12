@@ -227,14 +227,6 @@ pub enum Mode {
 
 /// MAKEPAD_RUN_CACHE: unset / `on` = on (the default), `off` / `0`, `verify`, `readonly`.
 pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
-    // no-codegen: the code cache holds machine code; a cache of threaded code is not built yet
-    if options.no_codegen {
-        static SAID: std::sync::Once = std::sync::Once::new();
-        if options.verbose {
-            SAID.call_once(|| eprintln!("makepad-run cache: off in no-codegen mode"));
-        }
-        return None;
-    }
     // A process-wide optimization budget depends on which functions ran before this one.
     // rustc: rustc_mir_transform/src/pass_manager.rs:298 (MIR optimization bisection).
     if std::env::var_os("MAKEPAD_RUN_THREAD_MAX").is_some() {

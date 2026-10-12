@@ -848,7 +848,7 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What makepad-platform's build.rs (platform/build.rs) gives the build, as makepad run knows it,
-/// for no-codegen mode, where the script does not run: its cfgs (`hal` on macOS or with
+/// for no-codegen mode, where the script does not run: its cfgs (`hal` on Apple targets or with
 /// `--cfg hal`; `use_vulkan`, `apple_sim`, `use_gles_3` from the target; the backend words of the
 /// MAKEPAD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
 /// identifier, from the folder that holds the target folder) and app_icon_gen.rs (the icons in
@@ -865,7 +865,8 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, out_
     let makepad: Vec<String> = std::env::var("MAKEPAD").map(|c| c.split(['+', ',']).map(str::to_string).collect()).unwrap_or_default();
     let mut lines = Vec::new();
     let mut cfg = |c: &str| lines.push(format!("cargo:rustc-cfg={}", c));
-    let hal = target_os == "macos" || get("CARGO_CFG_HAL").is_some();
+    // macOS, iOS and tvOS run on the HAL only (platform/build.rs with the hal-ios switch)
+    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos") || get("CARGO_CFG_HAL").is_some();
     if hal {
         cfg("hal");
     }

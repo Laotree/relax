@@ -33,6 +33,8 @@ impl Cache {
         let pend: HashMap<u128, usize> = self.pending.iter().enumerate().filter(|(_, e)| e.1.kind == KIND_CODE).map(|(i, e)| (e.1.key, i)).collect();
         for (i, &id) in ids.iter().enumerate() {
             if i % 256 == 255 && stop() { return Err(()); }
+            // interpreted slots link one by one (their code is not machine code to place)
+            if relax_codegen::interp::is_entry(u.fns[id as usize].code) { continue; }
             let Some(key0) = self.slot_key(u, id) else { continue };
             let crates = self.slot_crates.get(&id).cloned().unwrap_or_default();
             if let Some(k) = self.image_entry(id, key0, &pend) {
