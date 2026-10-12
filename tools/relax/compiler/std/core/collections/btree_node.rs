@@ -40,6 +40,7 @@ pub(crate) struct NodeLayout {
 }
 
 impl NodeLayout {
+    #[inline]
     pub fn new(ks: usize, ka: usize, vs: usize, va: usize) -> NodeLayout {
         let k = Layout::from_size_align(ks.checked_mul(CAPACITY).expect("capacity overflow"), ka).expect("capacity overflow");
         let v = Layout::from_size_align(vs.checked_mul(CAPACITY).expect("capacity overflow"), va).expect("capacity overflow");
@@ -116,33 +117,34 @@ impl NodeLayout {
     }
 }
 
+/// The optional root uses the null niche, keeping root and height to two words.
 pub(crate) struct Tree {
-    pub root: *mut Node,
-    pub layout: Option<NodeLayout>,
+    root: Option<ptr::NonNull<Node>>,
+    /// Height of the root; zero for a leaf or an unallocated tree.
+    height: usize,
 }
 
 impl Tree {
-    pub const fn new() -> Tree { Tree { root: 0 as *mut Node, layout: None } }
+    pub const fn new() -> Tree { Tree { root: None, height: 0 } }
     #[inline]
-    pub fn layout(&self) -> NodeLayout { self.layout.unwrap() }
-    #[inline]
-    pub fn key(&self, c: Cursor) -> *mut u8 { unsafe { self.layout().key(c) } }
-    #[inline]
-    pub fn val(&self, c: Cursor) -> *mut u8 { unsafe { self.layout().val(c) } }
-    pub fn first(&self) -> Cursor {
-        if self.root.is_null() { return NIL; }
+    pub fn root(&self) -> *mut Node {
+        match self.root {
+            Some(n) => n.as_ptr(),
+            None => ptr::null_mut(),
+        }
+    }
+    pub fn first(&self, l: &NodeLayout) -> Cursor {
+        if self.root().is_null() { return NIL; }
         unsafe {
-            let mut n = self.root;
-            let l = self.layout();
+            let mut n = self.root();
             while !(*n).leaf { n = l.child(n, 0); }
             if (*n).len == 0 { NIL } else { Cursor { node: n, idx: 0 } }
         }
     }
-    pub fn last(&self) -> Cursor {
-        if self.root.is_null() { return NIL; }
+    pub fn last(&self, l: &NodeLayout) -> Cursor {
+        if self.root().is_null() { return NIL; }
         unsafe {
-            let mut n = self.root;
-            let l = self.layout();
+            let mut n = self.root();
             while !(*n).leaf { n = l.child(n, (*n).len); }
             if (*n).len == 0 { NIL } else { Cursor { node: n, idx: (*n).len - 1 } }
         }
@@ -170,18 +172,16 @@ impl Tree {
             }
         }
     }
-    pub fn next(&self, c: Cursor) -> Cursor {
+    pub fn next(&self, c: Cursor, l: &NodeLayout) -> Cursor {
         unsafe {
             let mut edge = Cursor { node: c.node, idx: c.idx + 1 };
-            let l = self.layout();
             while !(*edge.node).leaf { edge = Cursor { node: l.child(edge.node, edge.idx), idx: 0 }; }
             self.next_kv(edge)
         }
     }
-    pub fn prev(&self, c: Cursor) -> Cursor {
+    pub fn prev(&self, c: Cursor, l: &NodeLayout) -> Cursor {
         unsafe {
             let mut edge = c;
-            let l = self.layout();
             while !(*edge.node).leaf {
                 let n = l.child(edge.node, edge.idx);
                 edge = Cursor { node: n, idx: (*n).len };
@@ -191,16 +191,16 @@ impl Tree {
     }
     /// Comparison has finished before entry here; the incoming bytes remain owned
     /// by the caller until this infallible (allocation failure aborts) move finishes.
-    pub unsafe fn insert(&mut self, at: Cursor, key: *const u8, val: *const u8) -> Cursor {
+    pub unsafe fn insert(&mut self, at: Cursor, key: *const u8, val: *const u8, l: &NodeLayout) -> Cursor {
         let mut at = at;
-        if self.root.is_null() {
-            self.root = self.layout().alloc(true);
-            at = Cursor { node: self.root, idx: 0 };
+        if self.root.is_none() {
+            let n = l.alloc(true);
+            self.root = Some(ptr::NonNull::new_unchecked(n));
+            at = Cursor { node: n, idx: 0 };
         }
-        self.insert_rec(at, key, val, ptr::null_mut())
+        self.insert_rec(at, key, val, ptr::null_mut(), l)
     }
-    unsafe fn insert_rec(&mut self, at: Cursor, key: *const u8, val: *const u8, right: *mut Node) -> Cursor {
-        let l = self.layout();
+    unsafe fn insert_rec(&mut self, at: Cursor, key: *const u8, val: *const u8, right: *mut Node, l: &NodeLayout) -> Cursor {
         let n = at.node;
         if (*n).len < CAPACITY {
             l.insert_fit(at, key, val, right);
@@ -220,12 +220,13 @@ impl Tree {
         if parent.is_null() {
             parent = l.alloc(false);
             l.set_child(parent, 0, n);
-            self.root = parent;
+            self.root = Some(ptr::NonNull::new_unchecked(parent));
+            self.height += 1;
         }
         // Promote before inserting into the left half, which may overwrite the
         // median's former bytes. Parent splits do not move child elements.
         let median = Cursor { node: n, idx: middle };
-        self.insert_rec(Cursor { node: parent, idx: (*n).parent_idx }, l.key(median), l.val(median), r);
+        self.insert_rec(Cursor { node: parent, idx: (*n).parent_idx }, l.key(median), l.val(median), r, l);
         let dst = if at.idx <= middle { at } else { Cursor { node: r, idx: at.idx - middle - 1 } };
         l.insert_fit(dst, key, val, right);
         dst
@@ -233,18 +234,17 @@ impl Tree {
 
     /// Caller has read the removed pair. Return its successor after fixing all
     /// ancestors, tracking the leaf edge through steals and merges.
-    pub unsafe fn remove(&mut self, at: Cursor) -> Cursor {
-        let l = self.layout();
+    pub unsafe fn remove(&mut self, at: Cursor, l: &NodeLayout) -> Cursor {
         let internal = !(*at.node).leaf;
         let mut edge = at;
         if internal {
-            let pred = self.prev(at);
+            let pred = self.prev(at, l);
             l.move_kv(pred, at, 1);
             edge = pred;
         }
         l.erase(edge);
         let mut n = edge.node;
-        while n != self.root && (*n).len < MIN_LEN {
+        while n != self.root() && (*n).len < MIN_LEN {
             let p = (*n).parent;
             let idx = (*n).parent_idx;
             let sep = if idx > 0 { idx - 1 } else { 0 };
@@ -292,30 +292,32 @@ impl Tree {
                 break;
             }
         }
-        if (*self.root).len == 0 && !(*self.root).leaf {
-            let old = self.root;
-            self.root = l.child(old, 0);
-            (*self.root).parent = ptr::null_mut();
-            (*self.root).parent_idx = 0;
+        if (*self.root()).len == 0 && !(*self.root()).leaf {
+            let old = self.root();
+            let n = l.child(old, 0);
+            self.root = Some(ptr::NonNull::new_unchecked(n));
+            self.height -= 1;
+            (*n).parent = ptr::null_mut();
+            (*n).parent_idx = 0;
             l.free(old);
         }
         let next = self.next_kv(edge);
         // The predecessor was moved into the removed internal KV's position.
-        if internal { self.next(next) } else { next }
+        if internal { self.next(next, l) } else { next }
     }
 
     /// Free allocations after the generic owner has dropped the live elements.
-    pub unsafe fn free_nodes(&mut self) {
-        if !self.root.is_null() {
-            self.free_subtree(self.root);
-            self.root = ptr::null_mut();
+    pub unsafe fn free_nodes(&mut self, l: &NodeLayout) {
+        if !self.root().is_null() {
+            self.free_subtree(self.root(), l);
+            self.root = None;
+            self.height = 0;
         }
     }
-    unsafe fn free_subtree(&self, n: *mut Node) {
-        let l = self.layout();
+    unsafe fn free_subtree(&self, n: *mut Node, l: &NodeLayout) {
         if !(*n).leaf {
             let mut i = 0;
-            while i <= (*n).len { self.free_subtree(l.child(n, i)); i += 1; }
+            while i <= (*n).len { self.free_subtree(l.child(n, i), l); i += 1; }
         }
         l.free(n);
     }

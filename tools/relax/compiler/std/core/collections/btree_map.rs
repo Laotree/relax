@@ -38,30 +38,47 @@ impl<K, V> BTreeMap<K, V> {
         drop(old);
     }
 
+    /// Derive node offsets and allocation layouts from K and V without storing them per map.
+    #[inline]
+    fn node_layout() -> NodeLayout {
+        NodeLayout::new(crate::mem::size_of::<K>(), crate::mem::align_of::<K>(), crate::mem::size_of::<V>(), crate::mem::align_of::<V>())
+    }
+
+    #[inline]
+    fn first_node(&self) -> Cursor {
+        if self.tree.root().is_null() { NIL } else { self.tree.first(&Self::node_layout()) }
+    }
+
+    #[inline]
+    fn last_node(&self) -> Cursor {
+        if self.tree.root().is_null() { NIL } else { self.tree.last(&Self::node_layout()) }
+    }
+
     fn drop_all(&mut self) {
         // Unlink each element before calling user Drop, so unwinding cannot
         // leave already-dropped elements reachable from a surviving map.
         if crate::mem::needs_drop::<(K, V)>() {
             while let Some(pair) = self.pop_first() { drop(pair); }
         }
-        unsafe { self.tree.free_nodes(); }
+        if !self.tree.root().is_null() {
+            unsafe { self.tree.free_nodes(&Self::node_layout()); }
+        }
     }
 
     #[inline]
     fn kv_at(&self, n: Cursor) -> (&K, &V) {
-        unsafe { (&*(self.tree.key(n) as *const K), &*(self.tree.val(n) as *const V)) }
+        let l = Self::node_layout();
+        unsafe { (&*(l.key(n) as *const K), &*(l.val(n) as *const V)) }
     }
 
     #[inline]
     fn kv_at_mut(&mut self, n: Cursor) -> (&K, &mut V) {
-        unsafe { (&*(self.tree.key(n) as *const K), &mut *(self.tree.val(n) as *mut V)) }
+        let l = Self::node_layout();
+        unsafe { (&*(l.key(n) as *const K), &mut *(l.val(n) as *mut V)) }
     }
 
     fn insert_at(&mut self, at: Cursor, key: K, value: V) -> Cursor {
-        if self.tree.layout.is_none() {
-            self.tree.layout = Some(NodeLayout::new(crate::mem::size_of::<K>(), crate::mem::align_of::<K>(), crate::mem::size_of::<V>(), crate::mem::align_of::<V>()));
-        }
-        let n = unsafe { self.tree.insert(at, &key as *const K as *const u8, &value as *const V as *const u8) };
+        let n = unsafe { self.tree.insert(at, &key as *const K as *const u8, &value as *const V as *const u8, &Self::node_layout()) };
         crate::mem::forget(key);
         crate::mem::forget(value);
         self.len += 1;
@@ -69,9 +86,10 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     fn remove_tracking(&mut self, n: Cursor) -> ((K, V), Cursor) {
+        let l = Self::node_layout();
         unsafe {
-            let pair = (crate::ptr::read(self.tree.key(n) as *const K), crate::ptr::read(self.tree.val(n) as *const V));
-            let next = self.tree.remove(n);
+            let pair = (crate::ptr::read(l.key(n) as *const K), crate::ptr::read(l.val(n) as *const V));
+            let next = self.tree.remove(n, &l);
             self.len -= 1;
             (pair, next)
         }
@@ -80,7 +98,7 @@ impl<K, V> BTreeMap<K, V> {
     fn remove_node(&mut self, n: Cursor) -> (K, V) { self.remove_tracking(n).0 }
 
     pub fn first_key_value(&self) -> Option<(&K, &V)> {
-        let n = self.tree.first();
+        let n = self.first_node();
         if n == NIL {
             None
         } else {
@@ -90,7 +108,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn last_key_value(&self) -> Option<(&K, &V)> {
-        let n = self.tree.last();
+        let n = self.last_node();
         if n == NIL {
             None
         } else {
@@ -100,7 +118,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn pop_first(&mut self) -> Option<(K, V)> {
-        let n = self.tree.first();
+        let n = self.first_node();
         if n == NIL {
             None
         } else {
@@ -109,7 +127,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn pop_last(&mut self) -> Option<(K, V)> {
-        let n = self.tree.last();
+        let n = self.last_node();
         if n == NIL {
             None
         } else {
@@ -118,7 +136,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn first_entry(&mut self) -> Option<OccupiedEntry<'_, K, V>> {
-        let n = self.tree.first();
+        let n = self.first_node();
         if n == NIL {
             None
         } else {
@@ -127,7 +145,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn last_entry(&mut self) -> Option<OccupiedEntry<'_, K, V>> {
-        let n = self.tree.last();
+        let n = self.last_node();
         if n == NIL {
             None
         } else {
@@ -136,12 +154,12 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn iter(&self) -> Iter<'_, K, V> {
-        Iter { map: self, front: self.tree.first(), back: self.tree.last(), remaining: self.len }
+        Iter { map: self, front: self.first_node(), back: self.last_node(), remaining: self.len }
     }
 
     pub fn iter_mut(&mut self) -> IterMut<'_, K, V> {
-        let front = self.tree.first();
-        let back = self.tree.last();
+        let front = self.first_node();
+        let back = self.last_node();
         let remaining = self.len;
         IterMut { map: self as *mut BTreeMap<K, V>, front, back, remaining, _m: PhantomData }
     }
@@ -168,11 +186,11 @@ impl<K, V> BTreeMap<K, V> {
 
     pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, f: F) {
         let mut f = f;
-        let mut n = self.tree.first();
+        let mut n = self.first_node();
         while n != NIL {
             let (k, v) = self.kv_at_mut(n);
             if f(k, v) {
-                n = self.tree.next(n);
+                n = self.tree.next(n, &Self::node_layout());
             } else {
                 let (pair, next) = self.remove_tracking(n);
                 n = next;
@@ -182,7 +200,7 @@ impl<K, V> BTreeMap<K, V> {
     }
 
     pub fn extract_if<F: FnMut(&K, &mut V) -> bool>(&mut self, pred: F) -> ExtractIf<'_, K, V, F> {
-        let first = self.tree.first();
+        let first = self.first_node();
         ExtractIf { map: self, cur: first, pred }
     }
 }
@@ -191,9 +209,9 @@ impl<K: Ord, V> BTreeMap<K, V> {
     fn search_key<Q: ?Sized + Ord>(&self, key: &Q) -> (Cursor, bool)
     where K: Borrow<Q>,
     {
-        let mut n = self.tree.root;
+        let mut n = self.tree.root();
         if n.is_null() { return (NIL, false); }
-        let layout = self.tree.layout();
+        let layout = Self::node_layout();
         unsafe {
             loop {
                 let mut i = 0;
@@ -223,13 +241,13 @@ impl<K: Ord, V> BTreeMap<K, V> {
     where K: Borrow<Q>,
     {
         let (key, included) = match bound {
-            Bound::Unbounded => return self.tree.first(),
+            Bound::Unbounded => return self.first_node(),
             Bound::Included(k) => (k, true),
             Bound::Excluded(k) => (k, false),
         };
         let (at, found) = self.search_key(key);
         if at == NIL { NIL }
-        else if found { if included { at } else { self.tree.next(at) } }
+        else if found { if included { at } else { self.tree.next(at, &Self::node_layout()) } }
         else { self.tree.next_kv(at) }
     }
 
@@ -237,13 +255,13 @@ impl<K: Ord, V> BTreeMap<K, V> {
     where K: Borrow<Q>,
     {
         let (key, included) = match bound {
-            Bound::Unbounded => return self.tree.last(),
+            Bound::Unbounded => return self.last_node(),
             Bound::Included(k) => (k, true),
             Bound::Excluded(k) => (k, false),
         };
         let (at, found) = self.search_key(key);
         if at == NIL { NIL }
-        else if found { if included { at } else { self.tree.prev(at) } }
+        else if found { if included { at } else { self.tree.prev(at, &Self::node_layout()) } }
         else { self.tree.prev_kv(at) }
     }
 
@@ -255,7 +273,7 @@ impl<K: Ord, V> BTreeMap<K, V> {
         // or cleared map returns an empty range without panicking).
         let start = range.start_bound();
         let end = range.end_bound();
-        if self.tree.root.is_null() {
+        if self.tree.root().is_null() {
             return (NIL, NIL);
         }
         match (start, end) {
@@ -400,7 +418,7 @@ impl<K: Ord, V> BTreeMap<K, V> {
     {
         let mut right = BTreeMap::new();
         loop {
-            let n = self.tree.last();
+            let n = self.last_node();
             if n == NIL || Q::lt(<K as Borrow<Q>>::borrow(self.kv_at(n).0), key) {
                 break;
             }
@@ -431,7 +449,7 @@ impl<K: Clone, V: Clone> Clone for BTreeMap<K, V> {
         for (k, v) in self.iter() {
             // Sorted insertion needs no Ord bound. A partially cloned map owns
             // every completed pair, including when K::clone or V::clone panics.
-            let last = out.tree.last();
+            let last = out.last_node();
             let at = if last == NIL { NIL } else { Cursor { node: last.node, idx: last.idx + 1 } };
             out.insert_at(at, k.clone(), v.clone());
         }
@@ -672,7 +690,7 @@ impl<'a, K, V> Iterator for Iter<'a, K, V> {
         let n = self.front;
         self.remaining -= 1;
         if self.remaining > 0 {
-            self.front = self.map.tree.next(n);
+            self.front = self.map.tree.next(n, &BTreeMap::<K, V>::node_layout());
         }
         let kv: (&'a K, &'a V) = self.map.kv_at(n);
         Some((kv.0, kv.1))
@@ -702,7 +720,7 @@ impl<'a, K, V> DoubleEndedIterator for Iter<'a, K, V> {
         let n = self.back;
         self.remaining -= 1;
         if self.remaining > 0 {
-            self.back = self.map.tree.prev(n);
+            self.back = self.map.tree.prev(n, &BTreeMap::<K, V>::node_layout());
         }
         let kv: (&'a K, &'a V) = self.map.kv_at(n);
         Some((kv.0, kv.1))
@@ -737,12 +755,13 @@ impl<'a, K, V> Iterator for IterMut<'a, K, V> {
             return None;
         }
         let map = unsafe { &mut *self.map };
+        let l = BTreeMap::<K, V>::node_layout();
         let n = self.front;
         self.remaining -= 1;
         if self.remaining > 0 {
-            self.front = map.tree.next(n);
+            self.front = map.tree.next(n, &l);
         }
-        let kv: (&'a K, &'a mut V) = unsafe { (&*(map.tree.key(n) as *const K), &mut *(map.tree.val(n) as *mut V)) };
+        let kv: (&'a K, &'a mut V) = unsafe { (&*(l.key(n) as *const K), &mut *(l.val(n) as *mut V)) };
         Some((kv.0, kv.1))
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -756,12 +775,13 @@ impl<'a, K, V> DoubleEndedIterator for IterMut<'a, K, V> {
             return None;
         }
         let map = unsafe { &mut *self.map };
+        let l = BTreeMap::<K, V>::node_layout();
         let n = self.back;
         self.remaining -= 1;
         if self.remaining > 0 {
-            self.back = map.tree.prev(n);
+            self.back = map.tree.prev(n, &l);
         }
-        let kv: (&'a K, &'a mut V) = unsafe { (&*(map.tree.key(n) as *const K), &mut *(map.tree.val(n) as *mut V)) };
+        let kv: (&'a K, &'a mut V) = unsafe { (&*(l.key(n) as *const K), &mut *(l.val(n) as *mut V)) };
         Some((kv.0, kv.1))
     }
 }
@@ -815,7 +835,7 @@ impl<'a, K, V> Iterator for Range<'a, K, V> {
         if n == self.back {
             self.done = true;
         } else {
-            self.front = self.map.tree.next(n);
+            self.front = self.map.tree.next(n, &BTreeMap::<K, V>::node_layout());
         }
         let kv: (&'a K, &'a V) = self.map.kv_at(n);
         Some((kv.0, kv.1))
@@ -835,7 +855,7 @@ impl<'a, K, V> DoubleEndedIterator for Range<'a, K, V> {
         if n == self.front {
             self.done = true;
         } else {
-            self.back = self.map.tree.prev(n);
+            self.back = self.map.tree.prev(n, &BTreeMap::<K, V>::node_layout());
         }
         let kv: (&'a K, &'a V) = self.map.kv_at(n);
         Some((kv.0, kv.1))
@@ -859,13 +879,14 @@ impl<'a, K, V> Iterator for RangeMut<'a, K, V> {
             return None;
         }
         let map = unsafe { &mut *self.map };
+        let l = BTreeMap::<K, V>::node_layout();
         let n = self.front;
         if n == self.back {
             self.done = true;
         } else {
-            self.front = map.tree.next(n);
+            self.front = map.tree.next(n, &l);
         }
-        let kv: (&'a K, &'a mut V) = unsafe { (&*(map.tree.key(n) as *const K), &mut *(map.tree.val(n) as *mut V)) };
+        let kv: (&'a K, &'a mut V) = unsafe { (&*(l.key(n) as *const K), &mut *(l.val(n) as *mut V)) };
         Some((kv.0, kv.1))
     }
 }
@@ -876,13 +897,14 @@ impl<'a, K, V> DoubleEndedIterator for RangeMut<'a, K, V> {
             return None;
         }
         let map = unsafe { &mut *self.map };
+        let l = BTreeMap::<K, V>::node_layout();
         let n = self.back;
         if n == self.front {
             self.done = true;
         } else {
-            self.back = map.tree.prev(n);
+            self.back = map.tree.prev(n, &l);
         }
-        let kv: (&'a K, &'a mut V) = unsafe { (&*(map.tree.key(n) as *const K), &mut *(map.tree.val(n) as *mut V)) };
+        let kv: (&'a K, &'a mut V) = unsafe { (&*(l.key(n) as *const K), &mut *(l.val(n) as *mut V)) };
         Some((kv.0, kv.1))
     }
 }
@@ -907,7 +929,7 @@ impl<'a, K, V, F: FnMut(&K, &mut V) -> bool> Iterator for ExtractIf<'a, K, V, F>
                 self.cur = next;
                 return Some(pair);
             }
-            self.cur = self.map.tree.next(n);
+            self.cur = self.map.tree.next(n, &BTreeMap::<K, V>::node_layout());
         }
         None
     }
