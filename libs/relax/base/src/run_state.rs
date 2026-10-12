@@ -60,6 +60,8 @@ pub struct State {
     pub phase_weight: f64,
     pub total_weight: f64,
     pub phase_elapsed: f64,
+    /// Resolve / parse / typecheck / codegen / link / first-frame timing weights.
+    pub phase_weights: [f64; 6],
     pub diagnostics: Arc<[Diagnostic]>,
     pub parked: Option<ParkedPanic>,
     pub domain: String,
