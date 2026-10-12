@@ -117,7 +117,7 @@ mod unix {
         }
         // a guard page at the low end: an overflow faults instead of writing below the segment
         unsafe { mprotect(seg, GUARD, 0) };
-        crate::memstat::name_mapping(seg as usize, len, c"relax-stack");
+        crate::memstat::name_mapping(seg as usize, len, c"makepad-run-stack");
         Some(super::Segment { base: seg as usize, len, lo: seg as usize + GUARD, top: (seg as usize + len) & !15 })
     }
 
@@ -164,13 +164,13 @@ mod imp {
     pub fn reserve(code: usize, rest: usize) -> u64 {
         let base = alloc_rw(code + rest);
         // perf names samples in anonymous memory from /tmp/perf-<pid>.map, but only for mappings
-        // it sees as anonymous ("//anon"): a prctl-named mapping ("[anon:relax-jit-code]") is a
+        // it sees as anonymous ("//anon"): a prctl-named mapping ("[anon:makepad-run-jit-code]") is a
         // DSO to it, and the JIT's names would never appear. With the perf map on, the code
         // stays unnamed.
         if !crate::jit::perf_map_on() {
-            crate::memstat::name_mapping(base as usize, code, c"relax-jit-code");
+            crate::memstat::name_mapping(base as usize, code, c"makepad-run-jit-code");
         }
-        crate::memstat::name_mapping(base as usize + code, rest, c"relax-jit-data");
+        crate::memstat::name_mapping(base as usize + code, rest, c"makepad-run-jit-data");
         if unsafe { mprotect(base as *mut u8, code, PROT_RWX) } != 0 {
             panic!("reservation: mprotect RWX failed");
         }

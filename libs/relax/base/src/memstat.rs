@@ -1,4 +1,4 @@
-//! Heap accounting by subsystem (RELAX_MEM_REPORT=1): which part of the compiler holds the
+//! Heap accounting by subsystem (MAKEPAD_RUN_MEM_REPORT=1): which part of the compiler holds the
 //! process's memory. Off (the default) the global allocator is the system allocator plus one
 //! relaxed load per call. On, every block carries a 16-byte header with the subsystem tag of
 //! the thread that allocated it (`tag` guards set it around parsing, type checking, lowering,
@@ -107,7 +107,7 @@ extern "C" {
 
 #[cold]
 fn decide() -> bool {
-    let v = unsafe { getenv(b"RELAX_MEM_REPORT\0".as_ptr()) };
+    let v = unsafe { getenv(b"MAKEPAD_RUN_MEM_REPORT\0".as_ptr()) };
     let on = !v.is_null() && unsafe { *v } != 0 && unsafe { *v } != b'0';
     STATE.store(if on { 2 } else { 1 }, Relaxed);
     on
@@ -122,7 +122,7 @@ fn on() -> bool {
     }
 }
 
-/// Accounting is on (RELAX_MEM_REPORT set).
+/// Accounting is on (MAKEPAD_RUN_MEM_REPORT set).
 #[inline(always)]
 pub fn enabled() -> bool {
     STATE.load(Relaxed) == 2
@@ -390,12 +390,12 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
-/// Live bytes charged to `t` (0 unless RELAX_MEM_REPORT).
+/// Live bytes charged to `t` (0 unless MAKEPAD_RUN_MEM_REPORT).
 pub fn live_of(t: Tag) -> i64 {
     CTRS[t as usize].live.load(Relaxed)
 }
 
-/// Live bytes charged to the tag with index `i` (TAG_NAMES order; 0 unless RELAX_MEM_REPORT).
+/// Live bytes charged to the tag with index `i` (TAG_NAMES order; 0 unless MAKEPAD_RUN_MEM_REPORT).
 pub fn live_of_index(i: usize) -> i64 {
     CTRS.get(i).map_or(0, |c| c.live.load(Relaxed))
 }
@@ -486,9 +486,9 @@ pub fn process_rss() -> (u64, u64, String) {
             fn mallinfo2() -> Mallinfo2;
         }
         let m = unsafe { mallinfo2() };
-        // RELAX_MEM_ARENAS_OUT=<file>: each report appends glibc's malloc_info XML (per arena:
+        // MAKEPAD_RUN_MEM_ARENAS_OUT=<file>: each report appends glibc's malloc_info XML (per arena:
         // heap size and free bytes), to see which threads' arenas hold the free-held bytes
-        if let Ok(path) = std::env::var("RELAX_MEM_ARENAS_OUT") {
+        if let Ok(path) = std::env::var("MAKEPAD_RUN_MEM_ARENAS_OUT") {
             extern "C" {
                 fn fopen(path: *const i8, mode: *const i8) -> *mut u8;
                 fn fclose(f: *mut u8) -> i32;
@@ -573,7 +573,7 @@ fn mbf(b: i64) -> f64 {
 pub fn print_tag(label: &str, tag: Tag) {
     if !enabled() { return; }
     let c = &CTRS[tag as usize];
-    eprintln!("relax-mem: {}: {} live {:.3} MB, peak {:.3} MB, allocated {:.3} MB",
+    eprintln!("makepad-run mem: {}: {} live {:.3} MB, peak {:.3} MB, allocated {:.3} MB",
         label, TAG_NAMES[tag as usize], mbf(c.live.load(Relaxed)), mbf(c.peak.load(Relaxed)), mbf(c.gross.load(Relaxed) as i64));
 }
 
@@ -583,7 +583,7 @@ pub fn report(label: &str) -> String {
     let (committed, live, chunks) = crate::zone_alloc::burst_stats();
     let (ccommitted, clive, cchunks) = crate::zone_alloc::compiler_stats();
     let mut out = format!(
-        "relax-mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}\n",
+        "makepad-run mem: {}: rss {} MB (peak {} MB; {}); counted heap live {:.0} MB, peak {:.0} MB, {:.0} MB allocated in {} blocks; burst arena: committed {} MB, live {} MB, chunks {}; compiler arena: committed {} MB, live {} MB, chunks {}\n",
         label,
         mb(rss),
         mb(hwm),
@@ -604,14 +604,14 @@ pub fn report(label: &str) -> String {
     }
     let mut ix: Vec<usize> = (0..N_TAGS).collect();
     ix.sort_by_key(|&i| std::cmp::Reverse(CTRS[i].live.load(Relaxed).max(AT_PEAK[i].load(Relaxed))));
-    out.push_str(&format!("relax-mem: {}:   {:<12} {:>9} {:>9} {:>9} {:>10} {:>10}\n", label, "tag", "live MB", "@peak MB", "peak MB", "alloc MB", "blocks"));
+    out.push_str(&format!("makepad-run mem: {}:   {:<12} {:>9} {:>9} {:>9} {:>10} {:>10}\n", label, "tag", "live MB", "@peak MB", "peak MB", "alloc MB", "blocks"));
     for i in ix {
         let c = &CTRS[i];
         if c.n.load(Relaxed) == 0 {
             continue;
         }
         out.push_str(&format!(
-            "relax-mem: {}:   {:<12} {:>9.1} {:>9.1} {:>9.1} {:>10.0} {:>10}\n",
+            "makepad-run mem: {}:   {:<12} {:>9.1} {:>9.1} {:>9.1} {:>10.0} {:>10}\n",
             label,
             TAG_NAMES[i],
             mbf(c.live.load(Relaxed)),
@@ -635,7 +635,7 @@ pub fn report(label: &str) -> String {
                 }
             })
             .collect();
-        out.push_str(&format!("relax-mem: {}:   blocks of {} by size: {}\n", label, TAG_NAMES[i], row.join(" ")));
+        out.push_str(&format!("makepad-run mem: {}:   blocks of {} by size: {}\n", label, TAG_NAMES[i], row.join(" ")));
     }
     out
 }
@@ -662,7 +662,7 @@ pub fn json(label: &str, extra: &[(String, u64)]) -> String {
         }
         let blocks: i64 = SIZE_LIVE[i].iter().map(|x| x.load(Relaxed)).sum();
         o.push_str(&format!(
-            "{}{{\"name\":\"relax.{}\",\"live\":{},\"live_blocks\":{},\"at_heap_peak\":{},\"peak\":{},\"allocated\":{},\"allocations\":{}}}",
+            "{}{{\"name\":\"makepad-run.{}\",\"live\":{},\"live_blocks\":{},\"at_heap_peak\":{},\"peak\":{},\"allocated\":{},\"allocations\":{}}}",
             if first { "" } else { "," },
             TAG_NAMES[i],
             c.live.load(Relaxed),
@@ -683,12 +683,12 @@ pub fn json(label: &str, extra: &[(String, u64)]) -> String {
 }
 
 /// Prints `report(label)` plus `extra` lines (structure sizes) to stderr when accounting is on;
-/// RELAX_MEM_JSON=<path> also appends the snapshot there as one JSON line.
+/// MAKEPAD_RUN_MEM_JSON=<path> also appends the snapshot there as one JSON line.
 pub fn print(label: &str, extra: &[(String, u64)]) {
     if !enabled() {
         return;
     }
-    if let Ok(path) = std::env::var("RELAX_MEM_JSON") {
+    if let Ok(path) = std::env::var("MAKEPAD_RUN_MEM_JSON") {
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
             let _ = f.write_all(json(label, extra).as_bytes());
@@ -697,7 +697,7 @@ pub fn print(label: &str, extra: &[(String, u64)]) {
     let mut s = report(label);
     sites::report(label);
     for (k, v) in extra {
-        s.push_str(&format!("relax-mem: {}:   size {:<40} {:>9.1} MB\n", label, k, *v as f64 / (1u64 << 20) as f64));
+        s.push_str(&format!("makepad-run mem: {}:   size {:<40} {:>9.1} MB\n", label, k, *v as f64 / (1u64 << 20) as f64));
     }
     eprint!("{}", s);
 }
@@ -722,16 +722,16 @@ pub fn peak_end(s: PeakScope) -> i64 {
     TL_PEAK.with(|p| p.get()) - s.0
 }
 
-/// RELAX_MEM_BIG=<MB> (default 16): calls whose working set reaches it are listed (`what`).
+/// MAKEPAD_RUN_MEM_BIG=<MB> (default 16): calls whose working set reaches it are listed (`what`).
 pub fn note_big(kind: &str, name: &str, s: PeakScope, what: impl FnOnce() -> String) {
     if !enabled() {
         return;
     }
     static LIM: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    let lim = *LIM.get_or_init(|| std::env::var("RELAX_MEM_BIG").ok().and_then(|v| v.parse().ok()).unwrap_or(16i64)) << 20;
+    let lim = *LIM.get_or_init(|| std::env::var("MAKEPAD_RUN_MEM_BIG").ok().and_then(|v| v.parse().ok()).unwrap_or(16i64)) << 20;
     let p = peak_end(s);
     if p >= lim {
-        eprintln!("relax-mem: big {} {:.0} MB: {} ({})", kind, mbf(p), name, what());
+        eprintln!("makepad-run mem: big {} {:.0} MB: {} ({})", kind, mbf(p), name, what());
     }
 }
 
@@ -787,11 +787,11 @@ pub fn name_mapping(addr: usize, len: usize, name: &'static std::ffi::CStr) {
     let _ = (addr, len, name);
 }
 
-/// Heap sites (RELAX_MEM_SITES=<KB>, with RELAX_MEM_REPORT): which call stacks hold the live
+/// Heap sites (MAKEPAD_RUN_MEM_SITES=<KB>, with MAKEPAD_RUN_MEM_REPORT): which call stacks hold the live
 /// heap. Each thread samples the allocation that crosses every <KB> of its allocated bytes
 /// (a block at least that large is always sampled); a sample stores its stack's site id in the
 /// block's header, and the site's estimated live bytes (max(size, interval) per live sampled
-/// block) drop when the block is freed. Reports go to RELAX_MEM_SITES_OUT (default
+/// block) drop when the block is freed. Reports go to MAKEPAD_RUN_MEM_SITES_OUT (default
 /// /tmp/relax-mem-sites-<pid>.txt) as raw return addresses relative to the executable's base,
 /// for offline symbolisation (nm). Linux only; off by default (no cost beyond one load).
 mod sites {
@@ -840,7 +840,7 @@ mod sites {
     #[cold]
     fn decide() -> i64 {
         extern "C" { fn getenv(name: *const u8) -> *const u8; }
-        let p = unsafe { getenv(b"RELAX_MEM_SITES\0".as_ptr()) };
+        let p = unsafe { getenv(b"MAKEPAD_RUN_MEM_SITES\0".as_ptr()) };
         let mut v: i64 = 0;
         if !p.is_null() && cfg!(target_os = "linux") {
             let mut q = p;
@@ -959,18 +959,18 @@ mod sites {
         d.fbase as usize
     }
 
-    /// Appends the sites with >= 1 MB (RELAX_MEM_SITES_MIN_KB) live or peak (estimated) to the sites file.
+    /// Appends the sites with >= 1 MB (MAKEPAD_RUN_MEM_SITES_MIN_KB) live or peak (estimated) to the sites file.
     pub fn report(label: &str) {
         if iv() <= 0 { return; }
         #[cfg(target_os = "linux")]
         {
             use std::io::Write;
             let _g = BUSY.with(|b| b.replace(true));
-            let path = std::env::var("RELAX_MEM_SITES_OUT").unwrap_or_else(|_| format!("/tmp/relax-mem-sites-{}.txt", std::process::id()));
+            let path = std::env::var("MAKEPAD_RUN_MEM_SITES_OUT").unwrap_or_else(|_| format!("/tmp/makepad-run-mem-sites-{}.txt", std::process::id()));
             let b = base();
             let mut rows: Vec<(i64, i64, i64, usize)> = Vec::new();
-            // RELAX_MEM_SITES_MIN_KB (default 1024): the smallest live / peak a listed site has
-            let min = std::env::var("RELAX_MEM_SITES_MIN_KB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1024) << 10;
+            // MAKEPAD_RUN_MEM_SITES_MIN_KB (default 1024): the smallest live / peak a listed site has
+            let min = std::env::var("MAKEPAD_RUN_MEM_SITES_MIN_KB").ok().and_then(|v| v.parse::<i64>().ok()).unwrap_or(1024) << 10;
             for i in 1..N {
                 let (l, p) = (LIVE[i].load(Relaxed), PEAK[i].load(Relaxed));
                 if l >= min || p >= min || COUNT[i].load(Relaxed) * iv() >= min { rows.push((l, p, COUNT[i].load(Relaxed), i)); }

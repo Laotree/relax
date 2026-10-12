@@ -222,7 +222,7 @@ fn prewarm(sess: &std::sync::Arc<crate::Session>) -> Result<(), String> {
     if hosted && world_now().is_none() {
         let sess = sess.clone();
         { let _k = crate::zone_alloc::kept();
-        let _ = std::thread::Builder::new().name("relax-pm-world".to_string()).stack_size(64 << 20).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+        let _ = std::thread::Builder::new().name("run-pm-world".to_string()).stack_size(64 << 20).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let _ = world(&sess);
         });
         }
@@ -335,7 +335,7 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let mut prog = crate::program::Program::new(sess);
     // core/alloc/std: the program's own parses (program::SharedParse), not a second copy
     prog.std_from_shared = true;
-    // macros run here: the machine's cfg, never RELAX_CHECK_TARGET's
+    // macros run here: the machine's cfg, never MAKEPAD_RUN_CHECK_TARGET's
     let host = |f: &[String]| crate::cfg::CfgSet::machine(sess, f);
     let core = prog.load_crate_deferred("core", &format!("{}/core/lib.rs", std_dir), 2021, host(&[]), Vec::new())?;
     let mut std_deps = vec![(prog.syms.intern("core"), core)];
@@ -414,7 +414,7 @@ fn build_world(sess: &std::sync::Arc<crate::Session>) -> Result<World, String> {
     let bridge = u.entry(id);
     if crate::preload::trace() {
         eprintln!("boot-trace: macro world: std {:.1} ms, + macro crates {:.1}, + resolve {:.1}, + collect {:.1}, + unit and cache {:.1} ms", t_std, t_crates, t_res, t_col, t0.elapsed().as_secs_f64() * 1e3);
-        eprintln!("boot-trace: macro world heap (RELAX_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
+        eprintln!("boot-trace: macro world heap (MAKEPAD_RUN_MEM_REPORT): std {} MB, + macro crates {}, + collect {}, + unit {} MB", m_std, m_crates, m_col, crate::memstat::live_of(crate::memstat::Tag::PmHost) >> 20);
     }
     let ns = t0.elapsed().as_nanos() as u64;
     STATS.with(|s| {
@@ -488,7 +488,7 @@ fn watch_begin() -> &'static WatchSlot {
             let mut v = WATCH.lock().unwrap();
             if v.is_empty() {
                 { let _k = crate::zone_alloc::kept();
-                let _ = std::thread::Builder::new().name("relax-pm-watch".to_string()).spawn(watch_loop);
+                let _ = std::thread::Builder::new().name("run-pm-watch".to_string()).spawn(watch_loop);
                 }
             }
             v.push(s);

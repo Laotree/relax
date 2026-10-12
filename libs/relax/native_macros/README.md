@@ -21,9 +21,9 @@ Expansion implementations have no features; the program's proc-macro helper must
 `relax-tokens` disabled. The live-id library is an unused dependency
 of the widget wrapper, retained for complete graph validation; it is not linked here.
 
-`RELAX_NATIVE_MACROS=0` selects the hosted path for comparisons.
-`RELAX_NATIVE_VERIFY=1` runs both paths and compares the entire encoded token stream,
-including every source span. `RELAX_PARSE_VERIFY=1` compares worker results with fresh
+`MAKEPAD_RUN_NATIVE_MACROS=0` selects the hosted path for comparisons.
+`MAKEPAD_RUN_NATIVE_VERIFY=1` runs both paths and compares the entire encoded token stream,
+including every source span. `MAKEPAD_RUN_PARSE_VERIFY=1` compares worker results with fresh
 collection-scope parses, including AST arrays, tokens, source/hygiene maps, macro
 publications, and file preparation. Use those flags for verification, not timing.
 

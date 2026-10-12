@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The live driver inside `makepad run` (a working tree runs live, reload.rs start_watcher), end to end.
 
-usage: run.py --relax <makepad binary> [--warm]   (RELAX_STD in the environment)
+usage: run.py --makepad <makepad binary> [--warm]   (MAKEPAD_RUN_STD in the environment)
 
 Copies pkg/ to a temporary dir, runs it (a working tree: live) and edits src/helper.rs while it runs:
   1. body edit: value() returns 2                  -> stdout shows 2, stderr "patched"
@@ -15,7 +15,7 @@ Each step waits up to 20 s. Prints PASS/FAIL per step; exit 1 on any FAIL.
 import os, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-relax = os.path.abspath(sys.argv[sys.argv.index("--relax") + 1])
+relax = os.path.abspath(sys.argv[sys.argv.index("--makepad") + 1])
 tmp = tempfile.mkdtemp(prefix="live-app-")
 pkg = os.path.join(tmp, "pkg")
 shutil.copytree(os.path.join(HERE, "pkg"), pkg)
@@ -25,13 +25,13 @@ base = open(helper).read()
 # cache; the edits below then run on a program restored from it (collected graph), not parsed.
 warm = "--warm" in sys.argv
 if warm:
-    env = dict(os.environ, RELAX_CACHE_DIR=os.path.join(tmp, "cache"), RELAX_TARGET_DIR=os.path.join(tmp, "target"))
+    env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=os.path.join(tmp, "cache"), MAKEPAD_RUN_TARGET_DIR=os.path.join(tmp, "target"))
     fill = subprocess.run([relax, "run", "--quiet", "relax-live-app"], cwd=pkg, env=dict(env, LIVE_APP_TICKS="1"), capture_output=True, text=True, timeout=600)
     print("%s warm-up run fills the cache (exit %d)" % ("PASS" if fill.returncode == 0 else "FAIL", fill.returncode))
     if fill.returncode != 0:
         print(fill.stderr[-3000:]); sys.exit(1)
 else:
-    env = dict(os.environ, RELAX_CACHE="0")
+    env = dict(os.environ, MAKEPAD_RUN_CACHE="0")
 p = subprocess.Popen([relax, "run", "--verbose" if warm else "--quiet", "relax-live-app"], cwd=pkg, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 out, err = [], []
 def pump(f, acc):
@@ -70,7 +70,7 @@ def step(name, ok):
 
 step("starts", wait(lambda: last_value() == 1 and any("watching" in l for l in err), 120))
 if warm:
-    step("live start restored the collected graph", any(l.startswith("relax-collected: restored") for l in err))
+    step("live start restored the collected graph", any(l.startswith("makepad-run collected: restored") for l in err))
 t = time.time()
 save(base.replace("conf().base\n", "conf().base + 1\n"))
 ok = wait(lambda: last_value() == 2)

@@ -1,4 +1,4 @@
-//! RELAX_PROFILE load timeline. Times share a process epoch; nested events are inclusive.
+//! MAKEPAD_RUN_PROFILE load timeline. Times share a process epoch; nested events are inclusive.
 //! Thread ids distinguish pools (including the proc-macro world's own parse pool).
 //! Buffer per thread: stderr contention must not become the measured critical path.
 use std::sync::Arc;

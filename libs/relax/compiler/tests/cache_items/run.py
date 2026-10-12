@@ -54,9 +54,9 @@ SCENARIOS = {
 
 
 def run(relax, d, cache, tag, extra_env=None):
-    env = dict(os.environ, RELAX_CACHE_DIR=os.path.join(cache, "cache"),
-               RELAX_STD=STD, RUSTC_BOOTSTRAP="1", RELAX_CACHE_TRACE=os.path.join(cache, tag + ".trace"))
-    env.pop("RELAX_CACHE", None)
+    env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=os.path.join(cache, "cache"),
+               MAKEPAD_RUN_STD=STD, RUSTC_BOOTSTRAP="1", MAKEPAD_RUN_CACHE_TRACE=os.path.join(cache, tag + ".trace"))
+    env.pop("MAKEPAD_RUN_CACHE", None)
     env.update(extra_env or {})
     p = subprocess.run([relax, "run", "--quiet", "cache-items"], cwd=os.path.join(d, "app"), env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
@@ -99,7 +99,7 @@ def scenario(relax, name):
         os.mkdir(cache, 0o700)
         want = list(BASE)
         # tier 0 inlines (into main) only past the startup phase
-        tier0 = {"RELAX_STARTUP_PHASE": "0"} if name == "inline" else None
+        tier0 = {"MAKEPAD_RUN_STARTUP_PHASE": "0"} if name == "inline" else None
         rc, res, out, cold = run(relax, tmp, cache, "1-cold", tier0)
         if rc != 0 or res != want:
             bad.append(f"cold run: exit {rc}, result {res}, want {want}")

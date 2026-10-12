@@ -75,7 +75,7 @@ pub fn rewrite(prog: &Program, records: &[FvRecord]) -> Vec<Rewrite> {
                 skipped.push(format!("{}: inside a macro expansion", at));
                 continue;
             }
-            if std::env::var_os("RELAX_FV_EXPORT_DEBUG").is_some() {
+            if std::env::var_os("MAKEPAD_RUN_FV_EXPORT_DEBUG").is_some() {
                 eprintln!("fv-export: {} place `{}` borrow {}..{} access {}..{}", at, place, sp.lo, sp.hi, r.access.lo, r.access.hi);
             }
             if let Some(t) = reborrow_after(&text, sp.lo as usize, place, r.access.lo as usize) {

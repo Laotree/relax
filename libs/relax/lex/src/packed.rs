@@ -187,13 +187,13 @@ mod tests {
     }
 
     /// get(i) against the 9 byte array, sequential and random:
-    /// RELAX_BENCH_DIR=<dir of .rs files> cargo test --release -p relax-lex bench -- --ignored --nocapture
+    /// MAKEPAD_RUN_BENCH_DIR=<dir of .rs files> cargo test --release -p relax-lex bench -- --ignored --nocapture
     #[test]
     #[ignore]
     fn bench_get() {
         use std::hint::black_box;
         use std::time::Instant;
-        let dir = std::env::var("RELAX_BENCH_DIR").expect("RELAX_BENCH_DIR");
+        let dir = std::env::var("MAKEPAD_RUN_BENCH_DIR").expect("MAKEPAD_RUN_BENCH_DIR");
         let mut toks: Vec<Tok> = Vec::new();
         let mut stack = vec![std::path::PathBuf::from(dir)];
         let mut files = Vec::new();

@@ -69,7 +69,7 @@ pub fn lower_legacy_const_generics(prog: &mut Program) -> usize {
 /// owner result (expr.rs:594-679, late.rs:5224-5283) stay exactly what a full pass computes.
 /// `None` re-lowers every owner.
 pub fn lower_legacy_const_generics_in(prog: &mut Program, visible: Option<&[bool]>) -> usize {
-    if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: legacy whole={} scoped={}", usize::from(visible.is_none()), usize::from(visible.is_some())); }
+    if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: legacy whole={} scoped={}", usize::from(visible.is_none()), usize::from(visible.is_some())); }
     let sees = |prog: &Program, d: DefId| visible.map_or(true, |v| v.get(prog.def(d).krate as usize).copied().unwrap_or(true));
     let mut owners: Vec<_> = Vec::new();
     for &owner in &prog.collected_definitions {
@@ -116,7 +116,7 @@ pub fn lower_legacy_const_generics_added(prog: &mut Program, first_def: usize, v
 /// after the suffix start (Program::retain_collected_prefix). They lower first, as the whole
 /// pass lowers its owners in definition order, so the definitions come out with the same ids.
 pub fn lower_legacy_const_generics_relinked(prog: &mut Program, first_def: usize, visible: &[bool], relinked: &[DefId]) -> usize {
-    if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: legacy added=1"); }
+    if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: legacy added=1"); }
     let mut owners: Vec<DefId> = Vec::new();
     for &owner in &prog.collected_definitions {
         if owner.0 as usize >= first_def { owners.push(owner); }

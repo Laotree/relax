@@ -4,7 +4,7 @@ use super::{GitError, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::str;
 
-const USER_AGENT: &str = "relax-git/0.1";
+const USER_AGENT: &str = "makepad-run/0.1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {

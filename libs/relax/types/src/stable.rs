@@ -513,7 +513,7 @@ fn android_runtime_image() -> Vec<u8> {
             }
         }
     }
-    panic!("cannot read Relax's Android runtime image for its build identity");
+    panic!("cannot read makepad run's Android runtime image for its build identity");
 }
 
 #[cfg(target_os = "macos")]
@@ -590,7 +590,7 @@ fn elf_build_id() -> Option<&'static [u8]> {
     }
 }
 
-/// RELAX_CACHE_FP=1: prints the build id, every crate's fingerprint and the cost (C0 check:
+/// MAKEPAD_RUN_CACHE_FP=1: prints the build id, every crate's fingerprint and the cost (C0 check:
 /// identical across runs of the same sources; must stay a few ms).
 pub fn report_fingerprints(prog: &Program) {
     if !prog.session.options.verbose { return; }
@@ -602,7 +602,7 @@ pub fn report_fingerprints(prog: &Program) {
     let tf = t.elapsed();
     let bytes: usize = prog.files.iter().map(|f| f.src.len()).sum();
     eprintln!(
-        "relax-cache: build id {:032x} ({:.2} ms); {} crates, {} files, {:.1} MB hashed in {:.2} ms",
+        "makepad-run cache: build id {:032x} ({:.2} ms); {} crates, {} files, {:.1} MB hashed in {:.2} ms",
         bid,
         tb.as_secs_f64() * 1e3,
         fps.len(),
@@ -610,13 +610,13 @@ pub fn report_fingerprints(prog: &Program) {
         bytes as f64 / 1e6,
         tf.as_secs_f64() * 1e3
     );
-    let mode = std::env::var("RELAX_CACHE_FP").unwrap_or_default();
-    if let Ok(want) = std::env::var("RELAX_CACHE_FP_CRATE") {
+    let mode = std::env::var("MAKEPAD_RUN_CACHE_FP").unwrap_or_default();
+    if let Ok(want) = std::env::var("MAKEPAD_RUN_CACHE_FP_CRATE") {
         // diagnostics: per-file hashes of one crate (why does a fingerprint differ?)
         for (i, f) in prog.files.iter().enumerate() {
             let c = prog.file_crate.get(i).copied().unwrap_or(u32::MAX) as usize;
             if prog.crates.get(c).map_or(false, |ci| prog.syms.str(ci.name) == want) {
-                eprintln!("relax-cache: file {} {:032x} src_len {} len {} {}", i, hash_bytes(&f.src), f.src_len, f.src.len(), prog.file_paths.get(i).map_or("", |p| p.as_str()));
+                eprintln!("makepad-run cache: file {} {:032x} src_len {} len {} {}", i, hash_bytes(&f.src), f.src_len, f.src.len(), prog.file_paths.get(i).map_or("", |p| p.as_str()));
             }
         }
     }
@@ -627,9 +627,9 @@ pub fn report_fingerprints(prog: &Program) {
                 let mut f: Vec<&str> = ci.cfg.set.iter().map(|x| x.as_str()).collect();
                 f.sort();
                 let deps: Vec<String> = ci.deps.iter().map(|(n, d)| format!("{}={}", prog.syms.str(*n), prog.syms.str(prog.crates[*d as usize].name))).collect();
-                eprintln!("relax-cache: crate {:032x} {} [{}] deps [{}]", fp, prog.syms.str(ci.name), f.join(" "), deps.join(" "));
+                eprintln!("makepad-run cache: crate {:032x} {} [{}] deps [{}]", fp, prog.syms.str(ci.name), f.join(" "), deps.join(" "));
             } else {
-                eprintln!("relax-cache: crate {:032x} {}", fp, prog.syms.str(ci.name));
+                eprintln!("makepad-run cache: crate {:032x} {}", fp, prog.syms.str(ci.name));
             }
         }
     }

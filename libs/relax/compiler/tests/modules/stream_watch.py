@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix="module-stream-watch-") as tmp:
     p = subprocess.run(
         [os.path.abspath(sys.argv[1]), "run", "--quiet", "module-stream-watch"],
         cwd=pkg,
-        env=dict(os.environ, RELAX_CACHE="0"),
+        env=dict(os.environ, MAKEPAD_RUN_CACHE="0"),
         capture_output=True, text=True, timeout=120,
     )
 lines = p.stderr.splitlines()

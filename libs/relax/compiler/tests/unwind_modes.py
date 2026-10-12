@@ -8,7 +8,7 @@ innermost first, on the way to the catch):
   park-return      `restartable work`; resumed `return 4242` (the call returns the value)
   (live sessions: live/unwind_guards, run by run_cases.py; `makepad test` recovery: unwind_nested_catch_restore.rs)
 
-usage: unwind_modes.py --relax <makepad binary> [--workspace <dir>]
+usage: unwind_modes.py --makepad <makepad binary> [--workspace <dir>]
 Output compared: the lines starting with "out ".
 """
 import json, os, subprocess, sys, tempfile, time
@@ -20,7 +20,7 @@ def args():
     v = sys.argv[1:]
     i = 0
     while i < len(v):
-        if v[i] == "--relax": a["relax"] = os.path.abspath(v[i + 1]); i += 2
+        if v[i] == "--makepad": a["relax"] = os.path.abspath(v[i + 1]); i += 2
         elif v[i] == "--workspace": a["ws"] = v[i + 1]; i += 2
         else: sys.exit(__doc__)
     if not a["relax"]: sys.exit(__doc__)
@@ -54,7 +54,7 @@ def run_plain(a, mode):
 def run_parked(a, mode):
     tmp = tempfile.mkdtemp()
     ready, go = os.path.join(tmp, "ready"), os.path.join(tmp, "go")
-    env = dict(os.environ, UNWIND_PROBE_READY=ready, UNWIND_PROBE_GO=go, RELAX_PANIC_PARK="120")
+    env = dict(os.environ, UNWIND_PROBE_READY=ready, UNWIND_PROBE_GO=go, MAKEPAD_RUN_PANIC_PARK="120")
     probe_mode = {"park-panic": "panic", "park-restart": "restart", "park-return": "return"}[mode]
     p = subprocess.Popen([a["relax"], "run", "--agent", *PKG, "--", probe_mode], cwd=a["ws"], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

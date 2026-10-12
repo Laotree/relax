@@ -5,13 +5,13 @@ use crate::program::Program;
 fn deferred_reexport_signatures() {
     // Forced selection and signature-miss collection are process-global. Each
     // case gets a fresh process, as do the runtime fixtures below.
-    const CHILD: &str = "RELAX_REEXPORT_SIGNATURE_TEST";
+    const CHILD: &str = "MAKEPAD_RUN_REEXPORT_SIGNATURE_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["plain", "partial"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::deferred_reexport_signatures", "--nocapture", "--test-threads=1"])
                 .env(CHILD, case)
-                .env("RELAX_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs")
+                .env("MAKEPAD_RUN_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs")
                 .output().unwrap();
             assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
         }
@@ -74,12 +74,12 @@ fn deferred_reexport_signatures() {
 fn gandalf_live_edit_guard_and_reporting() {
     // Unit/runtime and diagnostic sinks are process-global; each guard setting gets a
     // fresh runtime, and the parent observes the actual console and JSON streams.
-    const CHILD: &str = "RELAX_GANDALF_GATE_TEST";
+    const CHILD: &str = "MAKEPAD_RUN_GANDALF_GATE_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["app", "framework", "all", "std", "std_all"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "lazy_reload_tests::gandalf_live_edit_guard_and_reporting", "--nocapture", "--test-threads=1", "--format=terse"])
-                .env(CHILD, case).env("RELAX_GANDALF_ALL", if case.ends_with("all") { "1" } else { "0" })
+                .env(CHILD, case).env("MAKEPAD_RUN_GANDALF_ALL", if case.ends_with("all") { "1" } else { "0" })
                 .output().unwrap();
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -102,7 +102,7 @@ fn gandalf_live_edit_guard_and_reporting() {
     };
     crate::borrowck::lazy::disable_gandalf();
     crate::diag::enable();
-    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-gandalf-gate-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("app/src")).unwrap();
     let dependency = if case.starts_with("std") { "std" } else { "widgets" };
@@ -113,7 +113,7 @@ fn gandalf_live_edit_guard_and_reporting() {
         std::fs::write(dir.join(name).join("src/lib.rs"), "pub fn value(out: &mut u32) { *out = 11; }\n").unwrap();
     }
     let log = dir.join("live.jsonl");
-    std::env::set_var("RELAX_LIVE_LOG", &log);
+    std::env::set_var("MAKEPAD_RUN_LIVE_LOG", &log);
     let app = dir.join("app/src/lib.rs").to_string_lossy().into_owned();
     let framework = dir.join(dependency).join("src/lib.rs").to_string_lossy().into_owned();
     let session = Arc::new(crate::Session::default());
@@ -210,7 +210,7 @@ fn gandalf_scope_uses_package_source_and_project_boundaries() {
 
 #[test]
 fn app_scope_live_layout_edits() {
-    const CHILD: &str = "RELAX_APP_LAYOUT_TEST";
+    const CHILD: &str = "MAKEPAD_RUN_APP_LAYOUT_TEST";
     let Ok(case) = std::env::var(CHILD) else {
         for case in ["app_lib", "path_crate", "framework", "embedded", "generic_embedded", "pointer", "bound_template", "bound_template_embedded"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -222,7 +222,7 @@ fn app_scope_live_layout_edits() {
     };
     use crate::{jit::{self, FnKey}, program::DefId, reload::{self, Edit, Rung}, types::{TyKind, RegionArgsId}};
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-app-layout-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(if case == "path_crate" { "helper/lib.rs" } else { "lib.rs" });
@@ -395,7 +395,7 @@ fn gandalf_carry_keeps_only_crates_that_cannot_see_the_edit() {
 /// an edit that adds an item (collection of the new definitions makes the tables owned).
 #[test]
 fn restored_images_take_live_edits() {
-    const CHILD: &str = "RELAX_RESTORED_EDIT_TEST";
+    const CHILD: &str = "MAKEPAD_RUN_RESTORED_EDIT_TEST";
     if std::env::var(CHILD).is_err() {
         // the unit and its runtime are process-global
         let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -405,7 +405,7 @@ fn restored_images_take_live_edits() {
         return;
     }
     crate::borrowck::lazy::disable_gandalf();
-    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let dir = std::env::temp_dir().join(format!("relax-restored-edit-{}", std::process::id()));
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"restored\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();

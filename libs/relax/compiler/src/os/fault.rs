@@ -18,7 +18,7 @@ pub enum Kind {
     Fpe,
     Trap,
     Other,
-    /// the hang watchdog's / RELAX_COMPILE_WATCH's interrupt (thread::kick)
+    /// the hang watchdog's / MAKEPAD_RUN_COMPILE_WATCH's interrupt (thread::kick)
     Watchdog,
 }
 
@@ -63,7 +63,7 @@ pub struct Hooks<'a> {
     pub prepare: &'a dyn Fn(),
     /// a library's handler is chained (faults outside JIT code go to it first)
     pub chained: bool,
-    /// RELAX_FAULT_REGS: a register dump of a fault the policy handles
+    /// MAKEPAD_RUN_FAULT_REGS: a register dump of a fault the policy handles
     pub debug: &'a dyn Fn(),
 }
 
@@ -135,10 +135,10 @@ mod imp {
     extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
         unsafe {
             let gregs = uc.add(40) as *mut u64;
-            // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
+            // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == SIG_WATCHDOG && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*gregs.add(16), *gregs.add(10));
-                eprintln!("relax-watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
+                eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
             }
             let f = Fault { kind: kind(sig), sig, pc: *gregs.add(16), sp: *gregs.add(15), fp: *gregs.add(10), addr: *(info.add(16) as *const u64) };
@@ -293,10 +293,10 @@ mod imp {
     extern "C" fn on_signal(sig: i32, info: *mut u8, uc: *mut u8) {
         unsafe {
             let reg = |i: usize| uc.add(OFFSETS[i]) as *mut u64;
-            // RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
+            // MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is
             if sig == watchdog_signal() && crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
                 let (pc, fp) = (*reg(14), *reg(11));
-                eprintln!("relax-watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
+                eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", crate::os::thread::current(), pc, crate::jit::fn_name_at(pc), fp);
                 return;
             }
             let f = Fault { kind: kind(sig), sig, pc: *reg(14), sp: *reg(13), fp: *reg(11), addr: *(info.add(OFFSETS[7]) as *const u64) };
@@ -488,7 +488,7 @@ mod imp {
         }
     }
 
-    /// RELAX_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:
+    /// MAKEPAD_RUN_COMPILE_WATCH: the watcher asks a thread stuck in one step where it is (no lock:
     /// that thread is the one holding it, stuck)
     unsafe fn watch_dump(uc: *mut u8) {
         let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
@@ -496,22 +496,22 @@ mod imp {
         let (pc, lr, fp) = (reg(SS_PC), reg(SS + 240), reg(SS_FP));
         if !UNIT.is_null() {
             let nm = crate::jit::fn_name_at;
-            eprintln!("relax-watch: stuck thread {:#x} at pc {:#x} ({}) lr {:#x} ({}) fp {:#x}; on_signal at {:#x}", crate::os::thread::current(), pc, nm(pc), lr, nm(lr), fp, on_signal as *const () as usize);
+            eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) lr {:#x} ({}) fp {:#x}; on_signal at {:#x}", crate::os::thread::current(), pc, nm(pc), lr, nm(lr), fp, on_signal as *const () as usize);
             let mut f = fp;
             for _ in 0..12 {
                 if f == 0 || f % 8 != 0 {
                     break;
                 }
                 let ret = *((f + 8) as *const u64);
-                eprintln!("relax-watch:   frame ret {:#x} ({})", ret, nm(ret));
+                eprintln!("makepad-run watch:   frame ret {:#x} ({})", ret, nm(ret));
                 f = *(f as *const u64);
             }
         }
     }
 
-    /// RELAX_FAULT_REGS: registers and the call sequence around a fault (arm64 encodings).
+    /// MAKEPAD_RUN_FAULT_REGS: registers and the call sequence around a fault (arm64 encodings).
     unsafe fn fault_regs(uc: *mut u8) {
-        if std::env::var_os("RELAX_FAULT_REGS").is_none() {
+        if std::env::var_os("MAKEPAD_RUN_FAULT_REGS").is_none() {
             return;
         }
         let mc = *(uc.add(UC_MCONTEXT) as *const *mut u8);
@@ -530,10 +530,10 @@ mod imp {
             }
         }
         let ins = |a: u64| if a >= 8 { *((a) as *const u32) } else { 0 };
-        eprintln!("relax-fault-regs: pc {:#x} ({}) lr {:#x} ({}) fp {:#x} x16 {:#x} ({}) x17 {:#x}; table slots holding x16/pc: {:?}; insts at lr-12..lr: {:08x} {:08x} {:08x}", pc, nm(pc), lr, nm(lr), fp, x16, nm(x16), x17, slots, ins(lr - 12), ins(lr - 8), ins(lr - 4));
+        eprintln!("makepad-run fault-regs: pc {:#x} ({}) lr {:#x} ({}) fp {:#x} x16 {:#x} ({}) x17 {:#x}; table slots holding x16/pc: {:?}; insts at lr-12..lr: {:08x} {:08x} {:08x}", pc, nm(pc), lr, nm(lr), fp, x16, nm(x16), x17, slots, ins(lr - 12), ins(lr - 8), ins(lr - 4));
         if let Some(id) = u.find_fn(lr) {
             let f = &u.fns[id as usize];
-            eprintln!("relax-fault-regs: caller {} code {:#x} len {} lr off {:#x}", f.name, f.code, f.code_len, lr.wrapping_sub(f.code));
+            eprintln!("makepad-run fault-regs: caller {} code {:#x} len {} lr off {:#x}", f.name, f.code, f.code_len, lr.wrapping_sub(f.code));
         }
         // the call's slot address from the movz/movk sequence before `ldr x16, [x16]; blr x16`
         let mut a: u64 = 0;
@@ -553,9 +553,9 @@ mod imp {
             let id = id as usize;
             let t = *(a as *const u64);
             let f = &u.fns[id];
-            eprintln!("relax-fault-regs: called slot {} = {} (compiled {}, code {:#x}) table now {:#x} ({})", id, f.name, f.compiled, f.code, t, nm(t));
+            eprintln!("makepad-run fault-regs: called slot {} = {} (compiled {}, code {:#x}) table now {:#x} ({})", id, f.name, f.compiled, f.code, t, nm(t));
         } else {
-            eprintln!("relax-fault-regs: slot addr {:#x} not in the table", a);
+            eprintln!("makepad-run fault-regs: slot addr {:#x} not in the table", a);
         }
     }
 
@@ -731,7 +731,7 @@ mod imp {
         }
     }
 
-    /// RELAX_FAULT_TRACE=1: every exception the handlers see, with the module holding its pc
+    /// MAKEPAD_RUN_FAULT_TRACE=1: every exception the handlers see, with the module holding its pc
     /// (diagnostics for faults outside JIT code; no debugger needed).
     fn trace() -> bool {
         static T: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
@@ -739,7 +739,7 @@ mod imp {
         if t != 2 {
             return t == 1;
         }
-        let on = std::env::var_os("RELAX_FAULT_TRACE").is_some();
+        let on = std::env::var_os("MAKEPAD_RUN_FAULT_TRACE").is_some();
         T.store(on as u8, std::sync::atomic::Ordering::Relaxed);
         on
     }
@@ -753,7 +753,7 @@ mod imp {
             n = GetModuleFileNameW(m, name.as_mut_ptr(), 260) as usize;
         }
         let module = String::from_utf16_lossy(&name[..n]);
-        let msg = format!("relax-fault-trace: {} exception {:#x} at pc {:#x} = {}+{:#x}{}\n", if first { "first-chance" } else { "unhandled" }, code, pc, if n > 0 { module.as_str() } else { "?" }, pc.wrapping_sub(m as u64), if crate::jit::in_jit_code(pc) { " (JIT code)" } else { "" });
+        let msg = format!("makepad-run fault-trace: {} exception {:#x} at pc {:#x} = {}+{:#x}{}\n", if first { "first-chance" } else { "unhandled" }, code, pc, if n > 0 { module.as_str() } else { "?" }, pc.wrapping_sub(m as u64), if crate::jit::in_jit_code(pc) { " (JIT code)" } else { "" });
         let mut w = 0u32;
         WriteFile(GetStdHandle(-12i32 as u32), msg.as_ptr(), msg.len() as u32, &mut w, std::ptr::null_mut());
     }
@@ -783,7 +783,7 @@ mod imp {
 
     pub fn reassert() {}
 
-    /// Suspends thread `t` and reads its context. RELAX_COMPILE_WATCH: prints where it is. Hang
+    /// Suspends thread `t` and reads its context. MAKEPAD_RUN_COMPILE_WATCH: prints where it is. Hang
     /// watchdog: a thread running JIT code continues in jit::HANG_TRAMP as if the interrupted pc
     /// had called it (the return address pushed on its stack); there, on the thread itself, the
     /// policy decides as a watchdog signal's handler does.
@@ -798,7 +798,7 @@ mod imp {
                 if GetThreadContext(h, &mut *ctx) != 0 {
                     let (pc, fp, sp) = (ctx.get(CTX_RIP), ctx.get(CTX_RBP), ctx.get(CTX_RSP));
                     if crate::jit::WATCH_DUMP.load(std::sync::atomic::Ordering::Relaxed) {
-                        eprintln!("relax-watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", t, pc, crate::jit::fn_name_at(pc), fp);
+                        eprintln!("makepad-run watch: stuck thread {:#x} at pc {:#x} ({}) fp {:#x}", t, pc, crate::jit::fn_name_at(pc), fp);
                     } else {
                         let tramp = crate::jit::HANG_TRAMP.load(std::sync::atomic::Ordering::Relaxed);
                         if tramp != 0 && crate::jit::in_jit_code(pc) && pc != tramp {

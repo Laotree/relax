@@ -120,7 +120,7 @@ impl Cache {
         e.0.extend_from_slice(&slots.0);
         e.bytes(&blob);
         if self.verbose {
-            eprintln!("relax-cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code)", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024);
+            eprintln!("makepad-run cache: startup image of {} slots ({} keys, {} symbols, {} crates, {} KB code)", n, tab.keys.list.len(), tab.syms.list.len(), tab.crates.len(), blob.len() / 1024);
         }
         Ok(Some((e.0, n)))
     }
@@ -1534,9 +1534,9 @@ impl Linker {
         c.stats.prelink_failed += im.failed;
         c.stats.prelink_had_code += im.had_code;
         c.stats.prelink_ns += crate::jit::wall_ns() - t0;
-        if im.timed && std::env::var_os("RELAX_BOOT_TRACE").is_some() {
+        if im.timed && std::env::var_os("MAKEPAD_RUN_BOOT_TRACE").is_some() {
             let tags: Vec<String> = im.t_tag.iter().enumerate().filter(|(_, e)| e.1 != 0).map(|(k, e)| format!("tag{}={}/{:.1}ms", k, e.1, e.0 as f64 / 1e6)).collect();
-            eprintln!("relax-cache: prelink symbols: place_data {:.1} ms (incl. its symbols), {} symbols in the image; resolved by tag: {}; thunks decoded (not image keys) {} in {:.1} ms",
+            eprintln!("makepad-run cache: prelink symbols: place_data {:.1} ms (incl. its symbols), {} symbols in the image; resolved by tag: {}; thunks decoded (not image keys) {} in {:.1} ms",
                 im.t_place as f64 / 1e6, im.syms.len(), tags.join(" "), super::THUNK_DECODED.load(std::sync::atomic::Ordering::Relaxed), super::THUNK_DECODE_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6);
         }
         // what decides whether the next manifest carries a fresh image (record_manifest)
@@ -1703,6 +1703,6 @@ pub(crate) unsafe fn ids_report_unit(up: *mut Unit, by: &str) {
         return;
     }
     let s = &c.stats;
-    eprintln!("relax-cache: startup identities decoded: {} ({} in the background; {} duplicate, {} did not decode) in {:.1} ms, finished by {} (t={:.0} ms)",
+    eprintln!("makepad-run cache: startup identities decoded: {} ({} in the background; {} duplicate, {} did not decode) in {:.1} ms, finished by {} (t={:.0} ms)",
         s.ids_decoded, s.ids_bg, s.ids_dup, s.ids_failed, s.ids_ns as f64 / 1e6, by, crate::clock::ms_since_start());
 }

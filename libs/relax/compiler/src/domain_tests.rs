@@ -54,7 +54,7 @@ fn fixture_of(source: &str, entry_name: &str) -> (Box<Unit>, u64, std::path::Pat
     let path = root.join("fixture.rs");
     std::fs::write(&path, source).unwrap();
     // the std sources of this checkout (as lazy_reload_tests.rs does: a test binary is not next to them)
-    std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+    std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
     let sess = std::sync::Arc::new(crate::Session::default());
     let (prog, core, _) = crate::load_with_std(&sess, path.to_str().unwrap(), "teardown_fixture", false).unwrap();
     let mut tcx = crate::tcx::Tcx::new();

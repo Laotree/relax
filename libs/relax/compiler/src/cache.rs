@@ -14,9 +14,9 @@
 //! stores named by the interface fingerprint; front images in the run image stores
 //! (cache/front_run.rs), which the stores named by the crate fingerprint refer to (front.rs).
 //!
-//! RELAX_CACHE=on (default) | off | verify | readonly;
-//! The stores live in the workspace's `<target>/relax/cache` (dirs.rs; RELAX_CACHE_DIR replaces
-//! `<target>/relax` for tests and measurement); RELAX_CACHE_MAX (MB) caps them (default: twice
+//! MAKEPAD_RUN_CACHE=on (default) | off | verify | readonly;
+//! The stores live in the workspace's `<target>/relax/cache` (dirs.rs; MAKEPAD_RUN_CACHE_DIR replaces
+//! `<target>/relax` for tests and measurement); MAKEPAD_RUN_CACHE_MAX (MB) caps them (default: twice
 //! what the run uses, at least 4096; prune_root).
 
 use crate::borrowck::lazy::StoredVerdict;
@@ -188,7 +188,7 @@ pub fn verify_front_images() {
         return;
     }
     { let _k = crate::zone_alloc::kept();
-    let _ = std::thread::Builder::new().name("relax-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+    let _ = std::thread::Builder::new().name("run-cache-verify".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
         crate::os::thread::lower_priority(true);
         let mut bad: Vec<std::path::PathBuf> = Vec::new();
         for (st, i) in &used {
@@ -197,7 +197,7 @@ pub fn verify_front_images() {
             }
         }
         for p in bad {
-            eprintln!("relax-cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
+            eprintln!("makepad-run cache: a front image in {} does not match its checksum: the store is removed (the next run rebuilds it)", p.display());
             let _ = std::fs::remove_file(crate::store::current(&p));
         }
     });
@@ -225,17 +225,17 @@ pub enum Mode {
     ReadOnly,
 }
 
-/// RELAX_CACHE: unset / `on` = on (the default), `off` / `0`, `verify`, `readonly`.
+/// MAKEPAD_RUN_CACHE: unset / `on` = on (the default), `off` / `0`, `verify`, `readonly`.
 pub fn mode_from_env(options: &crate::options::Options) -> Option<Mode> {
     // A process-wide optimization budget depends on which functions ran before this one.
     // rustc: rustc_mir_transform/src/pass_manager.rs:298 (MIR optimization bisection).
-    if std::env::var_os("RELAX_THREAD_MAX").is_some() {
+    if std::env::var_os("MAKEPAD_RUN_THREAD_MAX").is_some() {
         if options.verbose {
-            eprintln!("relax-cache: disabled because RELAX_THREAD_MAX uses a process-wide optimization budget");
+            eprintln!("makepad-run cache: disabled because MAKEPAD_RUN_THREAD_MAX uses a process-wide optimization budget");
         }
         return None;
     }
-    match std::env::var("RELAX_CACHE").ok().as_deref() {
+    match std::env::var("MAKEPAD_RUN_CACHE").ok().as_deref() {
         Some("off") | Some("0") => None,
         Some("verify") => Some(Mode::Verify),
         Some("readonly") => Some(Mode::ReadOnly),
@@ -684,7 +684,7 @@ impl Cache {
         let t_if = std::time::Instant::now();
         // a restored collected program: the interfaces its recording run keyed code with (the
         // certified inputs are unchanged); file digests are made when a key needs one (def_body)
-        match collected.filter(|c| c.ifaces.len() == ncr && std::env::var_os("RELAX_CACHE_IFACE").is_none()) {
+        match collected.filter(|c| c.ifaces.len() == ncr && std::env::var_os("MAKEPAD_RUN_CACHE_IFACE").is_none()) {
             Some(cc) => {
                 c.digests = vec![None; prog.files.len()];
                 c.iface = cc.ifaces.clone();
@@ -696,9 +696,9 @@ impl Cache {
             }
         }
         c.stats.iface_ns = t_if.elapsed().as_nanos() as u64;
-        // RELAX_CACHE_IFACE=<file>: every file's interface hash and crate's interface
+        // MAKEPAD_RUN_CACHE_IFACE=<file>: every file's interface hash and crate's interface
         // fingerprint (which file made an edit's crate recompile)
-        if let Ok(path) = std::env::var("RELAX_CACHE_IFACE") {
+        if let Ok(path) = std::env::var("MAKEPAD_RUN_CACHE_IFACE") {
             let mut out = String::new();
             for (ci, v) in c.iface.iter().enumerate() {
                 out.push_str(&format!("crate\t{}\t{:032x}\n", prog.syms.str(prog.crates[ci].name), v));
@@ -709,8 +709,8 @@ impl Cache {
                 }
             }
             let _ = std::fs::write(&path, out);
-            // RELAX_CACHE_IFACE_FILE=<path suffix>: that file's interface text too
-            if let Ok(want) = std::env::var("RELAX_CACHE_IFACE_FILE") {
+            // MAKEPAD_RUN_CACHE_IFACE_FILE=<path suffix>: that file's interface text too
+            if let Ok(want) = std::env::var("MAKEPAD_RUN_CACHE_IFACE_FILE") {
                 for (i, p) in prog.file_paths.iter().enumerate() {
                     if p.ends_with(&want) {
                         let _ = std::fs::write(format!("{}.{}.txt", path, i), items::iface_text(&prog.files[i]));
@@ -797,11 +797,11 @@ impl Cache {
         if mode != Mode::ReadOnly {
             let r = root.clone();
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name("relax-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            let _ = std::thread::Builder::new().name("run-cache-prune".to_string()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::jit::lower_this_thread_priority(&runtime);
                 let (b, a) = prune_root(&r);
-                if verbose && std::env::var_os("RELAX_CACHE_TRACE").is_some() && b != a {
-                    eprintln!("relax-cache: pruned {} -> {} MB", b >> 20, a >> 20);
+                if verbose && std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() && b != a {
+                    eprintln!("makepad-run cache: pruned {} -> {} MB", b >> 20, a >> 20);
                 }
             });
             }
@@ -846,12 +846,12 @@ impl Cache {
         c.stats.open_ns = t0.elapsed().as_nanos() as u64;
         if crate::preload::trace() {
             if let Some(index) = &c.mapped_index {
-                eprintln!("relax-collected: mapped cache tables: {} stores, {} entries; definition tables {}",
+                eprintln!("makepad-run collected: mapped cache tables: {} stores, {} entries; definition tables {}",
                     index.stores.len(), index.len(), if c.mapped_definitions.is_some() { "mapped" } else { "rebuilt" });
             }
         }
-        if verbose && std::env::var_os("RELAX_CACHE_TRACE").is_some() {
-            eprintln!("relax-cache: open phases: fingerprints {:.1} ms (interfaces {:.1} ms), stores+index {:.1} ms ({} code stores), def maps {:.1} ms", t_fp.as_secs_f64() * 1e3, c.stats.iface_ns as f64 / 1e6, (t_packs - t_fp).as_secs_f64() * 1e3 - c.stats.iface_ns as f64 / 1e6, c.stats.code_stores, (t0.elapsed() - t_packs).as_secs_f64() * 1e3);
+        if verbose && std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some() {
+            eprintln!("makepad-run cache: open phases: fingerprints {:.1} ms (interfaces {:.1} ms), stores+index {:.1} ms ({} code stores), def maps {:.1} ms", t_fp.as_secs_f64() * 1e3, c.stats.iface_ns as f64 / 1e6, (t_packs - t_fp).as_secs_f64() * 1e3 - c.stats.iface_ns as f64 / 1e6, c.stats.code_stores, (t0.elapsed() - t_packs).as_secs_f64() * 1e3);
         }
         Ok(c)
     }
@@ -1093,7 +1093,7 @@ impl Cache {
         if !ok {
             self.stats.closure_mismatch += 1;
             if self.verbose && self.stats.closure_mismatch <= 8 {
-                eprintln!("relax-cache: entry rejected: it names expression {} of {} as a closure this program does not have there (made from another parse of the file)",
+                eprintln!("makepad-run cache: entry rejected: it names expression {} of {} as a closure this program does not have there (made from another parse of the file)",
                     expr & !crate::tcx::ASYNC_FN_BODY, u.prog.file_paths.get(file as usize).map_or("?", |p| p.as_str()));
             }
         }
@@ -1175,7 +1175,7 @@ impl Cache {
                 self.stats.def_collisions += 1;
             }
             if self.verbose && trace_on() {
-                eprintln!("relax-cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (crate::jit::cpu_ns() - t0) as f64 / 1e6);
+                eprintln!("makepad-run cache: def map of crate {} ({} defs) in {:.2} ms", u.prog.syms.str(u.prog.crates[c as usize].name), m.len(), (crate::jit::cpu_ns() - t0) as f64 / 1e6);
             }
             self.def_maps.insert(c, m);
         }
@@ -1623,8 +1623,8 @@ impl Cache {
                 n += 1;
             }
         }
-        if std::env::var_os("RELAX_RT_TRACE").is_some() {
-            eprintln!("relax-rt: recorded {} of {} slots", n, ids.len());
+        if std::env::var_os("MAKEPAD_RUN_RT_TRACE").is_some() {
+            eprintln!("makepad-run rt: recorded {} of {} slots", n, ids.len());
         }
         let path = self.rt_set_path(u, root);
         let tmp = path.with_extension("new");
@@ -1638,7 +1638,7 @@ impl Cache {
         self.dir.join(format!("rt-{}.keys", name))
     }
 
-    /// memory report (RELAX_MEM_REPORT): the recorder's and linker's tables (capacity based)
+    /// memory report (MAKEPAD_RUN_MEM_REPORT): the recorder's and linker's tables (capacity based)
     pub(crate) fn mem_lines(&self) -> Vec<(String, u64)> {
         fn map<K, V, S>(name: &str, m: &HashMap<K, V, S>, deep: impl Fn(&V) -> usize) -> (String, u64) {
             let slot = std::mem::size_of::<(K, V)>() + 1;
@@ -2054,7 +2054,7 @@ impl Cache {
                 if n.contains(w) {
                     let hex: String = e.0.iter().map(|b| format!("{:02x}", b)).collect();
                     let ws: Vec<String> = ptrs.iter().map(|(o, t)| format!("{}:{}+{}", o, crate::syms::describe(u, *t), t.off)).collect();
-                    eprintln!("relax-cache: DATA {} key {:032x} ptrs {:?} enc {}", n, key, ws, hex);
+                    eprintln!("makepad-run cache: DATA {} key {:032x} ptrs {:?} enc {}", n, key, ws, hex);
                 }
             }
             if self.mode != Mode::ReadOnly && !self.has_index(&key) && self.pending_keys.insert(key) {
@@ -2257,7 +2257,7 @@ impl Cache {
                         Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
-                    eprintln!("relax-cache: RELOCS rec {} {} {}", name, rl.at, t);
+                    eprintln!("makepad-run cache: RELOCS rec {} {} {}", name, rl.at, t);
                 }
             }
         }
@@ -2573,7 +2573,7 @@ impl Cache {
         let n_img = img.as_ref().map_or(0, |i| i.1 as usize);
         if crate::preempt::is_stopped() && self.image_slots > 0 && n_img * 50 < self.image_slots * 49 {
             if self.verbose {
-                eprintln!("relax-cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
+                eprintln!("makepad-run cache: startup manifest kept: at exit the image would cover {} of the {} slots the loaded one has", n_img, self.image_slots);
             }
             return true;
         }
@@ -2606,7 +2606,7 @@ impl Cache {
     pub fn flush(&mut self) -> Result<usize, String> {
         if self.verbose && self.mode == Mode::Verify {
             let s = &self.stats;
-            eprintln!("relax-cache: verify: {} identical, {} different", s.verify_same, s.verify_diff);
+            eprintln!("makepad-run cache: verify: {} identical, {} different", s.verify_same, s.verify_diff);
         }
         if self.mode == Mode::ReadOnly {
             return Ok(0);
@@ -2874,13 +2874,13 @@ pub fn app_store_files(dir: &std::path::Path, krate: &str) -> Vec<PathBuf> {
     files
 }
 
-/// The cap's floor (MB) when RELAX_CACHE_MAX is unset.
+/// The cap's floor (MB) when MAKEPAD_RUN_CACHE_MAX is unset.
 const CAP_FLOOR_MB: u64 = 4096;
 /// A store stamped this recently is taken to be in use by another run (every run stamps the
 /// stores it opens: store::mark_live).
 const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
-/// Keeps the cache under its cap: RELAX_CACHE_MAX megabytes, else twice what this run uses
+/// Keeps the cache under its cap: MAKEPAD_RUN_CACHE_MAX megabytes, else twice what this run uses
 /// (its live stores), at least CAP_FLOOR_MB. First every store's older generations go (store.rs:
 /// a rewrite leaves the generation it replaced for readers that still have it open), except
 /// one this process itself opened; a delete that fails (open elsewhere, on Windows) is
@@ -2890,7 +2890,7 @@ const IN_USE_BY_OTHERS: std::time::Duration = std::time::Duration::from_secs(10 
 /// wrote, nor one another run stamped in the last IN_USE_BY_OTHERS. Only checked store files
 /// are ever deleted. Returns (bytes before, after).
 pub fn prune_root(root: &std::path::Path) -> (u64, u64) {
-    let cap = std::env::var("RELAX_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
+    let cap = std::env::var("MAKEPAD_RUN_CACHE_MAX").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20);
     prune(root, &crate::store::live(), &crate::store::open_files(), cap)
 }
 
@@ -2970,7 +2970,7 @@ fn prune(root: &std::path::Path, live: &HashSet<PathBuf>, open: &HashSet<PathBuf
     }
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if total > cap && !REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("relax-cache: the stores in use ({} MB, this run's {} MB) exceed the cap ({} MB): kept", total >> 20, live_bytes >> 20, cap >> 20);
+        eprintln!("makepad-run cache: the stores in use ({} MB, this run's {} MB) exceed the cap ({} MB): kept", total >> 20, live_bytes >> 20, cap >> 20);
     }
     (before, total)
 }
@@ -3107,13 +3107,13 @@ fn def_kind_code(k: &DefKind) -> u32 {
     }
 }
 
-/// RELAX_CACHE_TRACE=<file>: one line per lookup (ms since start, hit/miss, thread, crate, slot
+/// MAKEPAD_RUN_CACHE_TRACE=<file>: one line per lookup (ms since start, hit/miss, thread, crate, slot
 /// name, stable name), kept in memory and written at exit (no I/O on the compile path).
 static TRACE: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn trace_on() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var_os("RELAX_CACHE_TRACE").is_some())
+    *T.get_or_init(|| std::env::var_os("MAKEPAD_RUN_CACHE_TRACE").is_some())
 }
 
 pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
@@ -3130,9 +3130,9 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
     crate::zone_alloc::kept_with(|| TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line));
 }
 
-/// Writes RELAX_CACHE_TRACE (at exit).
+/// Writes MAKEPAD_RUN_CACHE_TRACE (at exit).
 pub fn write_trace() {
-    if let Ok(p) = std::env::var("RELAX_CACHE_TRACE") {
+    if let Ok(p) = std::env::var("MAKEPAD_RUN_CACHE_TRACE") {
         if let Some(t) = TRACE.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = std::fs::write(p, t);
         }
@@ -3177,7 +3177,7 @@ impl Cache {
         let facts = u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice());
         let Some(encoded) = self.nounwind_bytes(u, facts) else { return false };
         if cached[start..end] != encoded {
-            eprintln!("relax-cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
+            eprintln!("makepad-run cache: VERIFY nounwind inputs differ: {}", crate::syms::stable_fn_name(u, id));
             return false;
         }
         let Some(ccode) = d.bytes() else { return false };
@@ -3191,7 +3191,7 @@ impl Cache {
                     diffs.push(format!("{}: {:08x}/{:08x}", k, u32::from_le_bytes(ccode[k..k + 4].try_into().unwrap()), u32::from_le_bytes(fz[k..k + 4].try_into().unwrap())));
                 }
             }
-            eprintln!("relax-cache: VERIFY code differs: {} ({} vs {} bytes) cached/fresh {:?}", name, ccode.len(), fz.len(), diffs);
+            eprintln!("makepad-run cache: VERIFY code differs: {} ({} vs {} bytes) cached/fresh {:?}", name, ccode.len(), fz.len(), diffs);
             // the fresh relocations whose encoding the cached entry does not hold (what the two
             // builds' constant pools disagree on)
             if dump_filter().map_or(false, |w| name.contains(w)) {
@@ -3214,14 +3214,14 @@ impl Cache {
                         });
                     }
                 }
-                eprintln!("relax-cache: VERIFY {}: cached {} relocations, fresh {}; fresh ones the cached entry lacks: {:?}", name, n_cached, relocs.len(), missing);
+                eprintln!("makepad-run cache: VERIFY {}: cached {} relocations, fresh {}; fresh ones the cached entry lacks: {:?}", name, n_cached, relocs.len(), missing);
                 for rl in relocs {
                     let t = match &rl.target {
                         Reloc::Sym(s) => format!("{} +{}", crate::syms::describe(u, *s), s.off),
                         Reloc::Slot(x) | Reloc::Thunk(x) => format!("slot {}", crate::syms::stable_fn_name(u, *x)),
                         r => format!("{:?}", r),
                     };
-                    eprintln!("relax-cache: RELOCS fresh {} {} {}", name, rl.at, t);
+                    eprintln!("makepad-run cache: RELOCS fresh {} {} {}", name, rl.at, t);
                 }
             }
             return false;
@@ -3254,7 +3254,7 @@ impl Cache {
             };
             let cbytes = d.b.get(d.p..d.p + e.0.len()).map(|x| x.to_vec());
             if co != *o || ck != Some(rl.kind) || !ok || cbytes.as_deref() != Some(&e.0[..]) {
-                eprintln!("relax-cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
+                eprintln!("makepad-run cache: VERIFY RELOC differs: {} at {} ({:?} -> {})", name, o, r, match r { Reloc::Sym(s) => crate::syms::describe(u, *s), Reloc::Slot(x) | Reloc::Thunk(x) => crate::syms::stable_fn_name(u, *x), _ => String::new() });
                 return false;
             }
             d.p += e.0.len();
@@ -3263,10 +3263,10 @@ impl Cache {
     }
 }
 
-/// RELAX_CACHE_DUMP=<name substring>: link details of matching entries (read once).
+/// MAKEPAD_RUN_CACHE_DUMP=<name substring>: link details of matching entries (read once).
 fn dump_filter() -> Option<&'static str> {
     static F: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    F.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("RELAX_CACHE_DUMP").ok())).as_deref()
+    F.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_CACHE_DUMP").ok())).as_deref()
 }
 
 fn kind_code(k: RelocKind) -> u8 {
@@ -3503,7 +3503,7 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 
 fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     let _profile = crate::load_profile::span(job.profile, "front-graph-write", "graph writer");
-    // RELAX_BOOT_TRACE: where a graph write's time goes (one line per recorded graph)
+    // MAKEPAD_RUN_BOOT_TRACE: where a graph write's time goes (one line per recorded graph)
     let t0 = std::time::Instant::now();
     let mut marks: Vec<(&str, f64)> = Vec::new();
     let mut mark = |name: &'static str| marks.push((name, t0.elapsed().as_secs_f64() * 1e3));
@@ -3601,7 +3601,7 @@ fn write_front_graph(job: &FrontGraphWrite) -> Option<()> {
     if crate::preload::trace() {
         let mut prev = 0.0;
         let parts: Vec<String> = marks.iter().map(|&(n, t)| { let d = t - prev; prev = t; format!("{}={:.0}", n, d) }).collect();
-        eprintln!("relax-front: graph recorded ({} crates, {} inputs) in {:.0} ms: {}", graph.crates.len(), graph.inputs.len(), prev, parts.join(" "));
+        eprintln!("makepad-run front: graph recorded ({} crates, {} inputs) in {:.0} ms: {}", graph.crates.len(), graph.inputs.len(), prev, parts.join(" "));
     }
     if let (Some(source), Some(written)) = (&job.demand, &graph.demand_image) { source.recording_written(written.parts.clone()); }
     Some(())
@@ -3634,7 +3634,7 @@ impl FrontImages {
         // A build script's run (its own small world: std plus the script's crates) keeps no
         // front images: they are read only when a script runs again, which a cached build
         // result makes rare, while they cost a second copy of the std world on disk.
-        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("RELAX_BUILD_SCRIPT").is_some() {
+        if !crate::front::enabled() || mode_from_env(options).is_none() || std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() {
             return None;
         }
         let root = crate::dirs::relax_dir();
@@ -3684,7 +3684,7 @@ impl FrontImages {
             })
         })
     }
-    /// `why`: the last check reached (RELAX_BOOT_TRACE names it when the image is not used)
+    /// `why`: the last check reached (MAKEPAD_RUN_BOOT_TRACE names it when the image is not used)
     fn candidate(&self, options: &crate::options::Options, c: &crate::preload::PreCrate, deps: &[u128], path: &std::path::Path, why: &std::cell::Cell<&'static str>, selection: Option<(u128, &[String])>) -> Option<crate::crate_image::CrateImage> {
         use crate::crate_image::{decode, CrateImage, Record};
         why.set("store open");
@@ -3901,7 +3901,7 @@ impl crate::crate_image::CrateImages for FrontImages {
         *self.probes.lock().unwrap() = Some(HashMap::new());
         self.stores.lock().unwrap().clear();
         let rejected = |why: &str| if crate::preload::trace() {
-            eprintln!("relax-front: graph certificate not restored: {}", why);
+            eprintln!("makepad-run front: graph certificate not restored: {}", why);
         };
         let Some(graph) = read_front_graph(&self.dir, recipe.identity) else { rejected("store"); return; };
         if graph.identity != recipe.identity || graph.crates.len() != recipe.crates.len()
@@ -3954,7 +3954,7 @@ impl crate::crate_image::CrateImages for FrontImages {
         }
         *self.certificate.lock().unwrap() = Some(graph);
         if crates.first().is_some_and(|c| c.cfg.session.runtime.profile) {
-            eprintln!("relax-front: graph certificate restored ({} crates)", crates.len());
+            eprintln!("makepad-run front: graph certificate restored ({} crates)", crates.len());
         }
     }
     fn end_load(&self) {
@@ -4420,11 +4420,11 @@ impl ColdFront {
             if deferred {
                 FRONT_GRAPH_WRITES.lock().unwrap().push(job);
                 { let _k = crate::zone_alloc::kept();
-                let _ = std::thread::Builder::new().name("relax-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+                let _ = std::thread::Builder::new().name("run-front-graph".into()).spawn(|| { let _z = crate::zone_alloc::compiler_thread();
                     let t = std::time::Instant::now();
                     let r = flush_front_graphs();
                     if crate::preload::trace() {
-                        eprintln!("relax-front: graph written after load: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
+                        eprintln!("makepad-run front: graph written after load: {:?} in {:.1} ms (t={:.0} ms)", r, t.elapsed().as_secs_f64() * 1e3, crate::clock::ms_since_start());
                     }
                 });
                 }
@@ -4449,7 +4449,7 @@ impl ColdFront {
         if !prog.session.options.verbose || !Self::enabled(&prog.session.options) { return; }
         use std::sync::atomic::Ordering::Relaxed;
         use crate::source::{MAPPED_SOURCES, MAPPED_SOURCE_MISMATCH, MAPPED_SOURCE_NOT_FOUND, MAPPED_SOURCE_NO_SNAPSHOT};
-        eprintln!("relax-front: {} crate records written at load; sources mapped {} mismatch {} not-found {} no-snapshot {}", self.records,
+        eprintln!("makepad-run front: {} crate records written at load; sources mapped {} mismatch {} not-found {} no-snapshot {}", self.records,
             MAPPED_SOURCES.load(Relaxed), MAPPED_SOURCE_MISMATCH.load(Relaxed), MAPPED_SOURCE_NOT_FOUND.load(Relaxed), MAPPED_SOURCE_NO_SNAPSHOT.load(Relaxed));
     }
 }
@@ -4484,7 +4484,7 @@ impl FrontWriters {
         let mut writers = Self { queue: std::sync::Arc::new(Default::default()), workers: Vec::new() };
         for _ in 0..crate::preload::jobs() {
             let queue = writers.queue.clone();
-            writers.workers.push(std::thread::Builder::new().name("relax-front-writer".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            writers.workers.push(std::thread::Builder::new().name("run-front-writer".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 let (queue, wake) = &*queue;
                 let mut recorded = Vec::new();
                 loop {
@@ -4505,8 +4505,8 @@ impl FrontWriters {
                     match result {
                         Ok(Ok(Some(ci))) => recorded.push(ci),
                         Ok(Ok(None)) => {}
-                        Ok(Err(e)) => eprintln!("relax-front: crate record: {}", e),
-                        Err(_) => eprintln!("relax-front: crate record writer panicked"),
+                        Ok(Err(e)) => eprintln!("makepad-run front: crate record: {}", e),
+                        Err(_) => eprintln!("makepad-run front: crate record writer panicked"),
                     }
                     queue.lock().unwrap_or_else(|e| e.into_inner()).active.remove(&path);
                     wake.notify_all();
@@ -4529,7 +4529,7 @@ impl FrontWriters {
         for worker in self.workers.drain(..) {
             match worker.join() {
                 Ok(cis) => recorded.extend(cis),
-                Err(_) => eprintln!("relax-front: crate record writer panicked"),
+                Err(_) => eprintln!("makepad-run front: crate record writer panicked"),
             }
         }
         recorded
@@ -6326,7 +6326,7 @@ impl Linker {
             }
             if let Some(w) = dump_filter().filter(|_| self.cache().verbose) {
                 if _name.contains(w) {
-                    eprintln!("relax-cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, v);
+                    eprintln!("makepad-run cache: link {} at {} {:?} tag {} = {:#x}", _name, o, kind, tag, v);
                 }
             }
             relocs.push(RelocAt { at: o as u32, kind, target: Reloc::Value(v) });
@@ -6334,7 +6334,7 @@ impl Linker {
         if let Some(w) = dump_filter().filter(|_| self.cache().verbose) {
             if _name.contains(w) {
                 let hex: String = code.iter().map(|b| format!("{:02x}", b)).collect();
-                eprintln!("relax-cache: code {} {}", _name, hex);
+                eprintln!("makepad-run cache: code {} {}", _name, hex);
             }
         }
         let raw = crate::jit::PcMap::decode(d.bytes()?);

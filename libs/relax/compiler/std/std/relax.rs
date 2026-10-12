@@ -166,7 +166,7 @@ pub fn live_log(json_line: &str) {
 
 /// After a restart: when the edit that caused it was saved (unix ms), for save -> back on screen.
 pub fn restart_saved_ms() -> Option<f64> {
-    crate::env::var("RELAX_RESTART_T0").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0)
+    crate::env::var("MAKEPAD_RUN_RESTART_T0").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0)
 }
 
 // ---- state-preserving restart (live sessions: an edit Relax cannot patch in place)

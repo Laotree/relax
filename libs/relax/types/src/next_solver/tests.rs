@@ -1401,7 +1401,7 @@ fn round50_resolve_weak_candidate_pairing() {
         let krate = prog.load_crate(name, &file, 2021, crate::cfg::CfgSet::host(&session, &[]), deps.clone()).unwrap();
         deps.push((prog.syms.intern(name), krate));
     }
-    let file = std::env::var("RELAX_BIDI_SOURCE").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../libs/unicode/unicode-bidi/src/lib.rs").into());
+    let file = std::env::var("MAKEPAD_RUN_BIDI_SOURCE").unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../../libs/unicode/unicode-bidi/src/lib.rs").into());
     prog.load_crate("unicode_bidi", &file, 2018, crate::cfg::CfgSet::host(&session, &[]), deps).unwrap();
     prog.prelude_crate = Some(0);
     prog.resolve_imports();

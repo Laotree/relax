@@ -2,8 +2,8 @@
 """Runtime ratio table: each kernel of src/main.rs under rustc --release and under `makepad run`,
 one process per kernel (a compile failure in one cannot hide the others), best of ROUNDS runs
 of each process's best-of-5. Usage: run.py <makepad binary> <target dir> [kernel ...]
-Env: O3_PROFILE_DIR (steady runs replay a recorded O3 profile per kernel: RELAX_O3_PROFILE), ROUNDS (default 2), STEADY_MS (also time after warming each kernel up for this long:
-the steady state once Relax's O3 has settled; default 2000, 0 = off), NATIVE (prebuilt rustc binary of this crate), RELAX_OPT etc. pass through to Relax."""
+Env: O3_PROFILE_DIR (steady runs replay a recorded O3 profile per kernel: MAKEPAD_RUN_O3_PROFILE), ROUNDS (default 2), STEADY_MS (also time after warming each kernel up for this long:
+the steady state once Relax's O3 has settled; default 2000, 0 = off), NATIVE (prebuilt rustc binary of this crate), MAKEPAD_RUN_OPT etc. pass through to Relax."""
 import os, re, subprocess, sys, platform
 
 here = os.path.dirname(os.path.abspath(__file__))
@@ -20,9 +20,9 @@ native = os.environ.get("NATIVE")
 if not native:
     subprocess.run(nice + ["cargo", "build", "--release", "-q", "-j", "4"], cwd=here, env=env, check=True)
     native = os.path.join(target, "rustc/release/relax-bench-rt")
-std = os.environ.get("RELAX_STD", os.path.join(here, "../std"))
+std = os.environ.get("MAKEPAD_RUN_STD", os.path.join(here, "../std"))
 os.environ.setdefault("BENCH_FONT", os.path.normpath(os.path.join(here, "../../../../widgets/resources/IBMPlexSans-Text.ttf")))
-renv = dict(os.environ, RELAX_STD=std)
+renv = dict(os.environ, MAKEPAD_RUN_STD=std)
 
 def one(cmd, e, name):
     best = None
@@ -68,7 +68,7 @@ for n in names:
         if pdir:
             os.makedirs(pdir, exist_ok=True)
             prof = os.path.join(pdir, n + ".prof")
-            senv["RELAX_O3_PROFILE"] = prof
+            senv["MAKEPAD_RUN_O3_PROFILE"] = prof
             if not os.path.exists(prof):
                 subprocess.run(nice + [runner, "run", "--quiet", "relax-bench-rt", "--", n], cwd=here, env=senv, capture_output=True, timeout=300)
         sb, _ = one(nice + [runner, "run", "--quiet", "relax-bench-rt", "--", n], senv, n)

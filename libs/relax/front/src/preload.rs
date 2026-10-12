@@ -617,25 +617,25 @@ fn parse_job(_sess: &std::sync::Arc<crate::Session>, job: Job, in_scope: bool) -
     ((krate, path), Preparsed { parsed, prep, mod_path, src_len, verify, error })
 }
 
-/// RELAX_BOOT_TRACE=1: boot-path timing and why files were parsed again (stderr `boot-trace`).
+/// MAKEPAD_RUN_BOOT_TRACE=1: boot-path timing and why files were parsed again (stderr `boot-trace`).
 pub fn trace() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::env::var("RELAX_BOOT_TRACE").is_ok())
+    *T.get_or_init(|| std::env::var("MAKEPAD_RUN_BOOT_TRACE").is_ok())
 }
 
-/// RELAX_TRACE, read once (parse workers ask per expansion; std::env::var takes the env lock and
+/// MAKEPAD_RUN_TRACE, read once (parse workers ask per expansion; std::env::var takes the env lock and
 /// allocates).
 pub fn relax_trace() -> Option<&'static str> {
     static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    T.get_or_init(|| std::env::var("RELAX_TRACE").ok()).as_deref()
+    T.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE").ok()).as_deref()
 }
 
-/// RELAX_DERIVES=0 (derives are not expanded; measurement baseline), read once.
+/// MAKEPAD_RUN_DERIVES=0 (derives are not expanded; measurement baseline), read once.
 pub fn derives_off(options: &crate::options::Options) -> bool {
     !options.derives
 }
 
-/// Parse-time split for RELAX_BOOT_TRACE: 0 fn bodies, 1 derives, 2 macro_rules transcription,
+/// Parse-time split for MAKEPAD_RUN_BOOT_TRACE: 0 fn bodies, 1 derives, 2 macro_rules transcription,
 /// 3 built-in macros (format family etc.), 4 hosted / native fn-like macros; outermost call per slot only.
 pub static PHASE_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
@@ -664,7 +664,7 @@ pub fn timed<R>(slot: usize, f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Per macro name: (calls, ns) for RELAX_BOOT_TRACE.
+/// Per macro name: (calls, ns) for MAKEPAD_RUN_BOOT_TRACE.
 pub static BY_NAME: Mutex<Vec<(String, u64, u64)>> = Mutex::new(Vec::new());
 
 pub fn timed_named<R>(slot: usize, name: &str, f: impl FnOnce() -> R) -> R {
@@ -702,7 +702,7 @@ pub fn jobs() -> usize {
     if SINGLE.with(|s| s.get()) {
         return 1;
     }
-    std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(crate::options::default_parse_jobs).clamp(1, 32)
+    std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(crate::options::default_parse_jobs).clamp(1, 32)
 }
 
 /// A scanned file's source bytes: its own, a mapped image's, or the registry's authored bytes
@@ -1219,9 +1219,9 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         let count = restored.iter().flatten().count();
         let files: usize = restored.iter().flatten().map(|i| i.files.len()).sum();
         if planning {
-            eprintln!("relax-front: {count} crate image candidates ({files} files); selection validation on planning worker");
+            eprintln!("makepad-run front: {count} crate image candidates ({files} files); selection validation on planning worker");
         } else {
-            eprintln!("relax-front: {} crates from crate images ({} files, no parse), {} crates parsed", count, files, n - count);
+            eprintln!("makepad-run front: {} crates from crate images ({} files, no parse), {} crates parsed", count, files, n - count);
         }
     }
     let pending_images = if planning { std::mem::replace(&mut restored, (0..n).map(|_| None).collect()) }
@@ -1285,7 +1285,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         for worker in 0..jobs {
             let p = pool.clone();
             let sess = sess.clone();
-            if let Ok(h) = std::thread::Builder::new().name(format!("relax-parse-{worker}")).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            if let Ok(h) = std::thread::Builder::new().name(format!("run-parse-{worker}")).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 crate::macro_reg::set_in_world(in_world);
                 let _mem = crate::memstat::tag(if in_world { crate::memstat::Tag::PmHost } else { crate::memstat::Tag::Parse });
                 p.work(&sess, worker)

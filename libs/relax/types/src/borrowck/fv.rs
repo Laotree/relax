@@ -142,7 +142,7 @@ pub fn summaries(prog: &Program, tcx: &Tcx, tx: &Tx, d: DefId, args: &[TyId], de
     let reach = Rc::new(reach);
     tx.fv.reached_by_callers(&reach);
     static DBG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *DBG.get_or_init(|| std::env::var_os("RELAX_FV_DEBUG").is_some()) {
+    if *DBG.get_or_init(|| std::env::var_os("MAKEPAD_RUN_FV_DEBUG").is_some()) {
         let v: Vec<String> = r.iter().map(|x| match x {
             Summary::Whole => "whole".to_string(),
             Summary::Parts(p) => format!("{:?}", p.iter().map(|(q, m)| (q.len(), *m)).collect::<Vec<_>>()),
@@ -438,11 +438,11 @@ fn op_note(note: &dyn Fn(&mut Vec<Summary>, &Place, bool), out: &mut Vec<Summary
     }
 }
 
-/// Relaxed Rust (field views on) for the crate of `d`: `[package.metadata.relax] relaxed =
-/// true` in its Cargo.toml, or RELAX_RELAXED=1 / `--relaxed` for every crate.
+/// Relaxed Rust (field views on) for the crate of `d`: `[package.metadata.makepad-run] relaxed =
+/// true` in its Cargo.toml, or MAKEPAD_RUN_RELAXED=1 / `--relaxed` for every crate.
 pub fn relaxed(prog: &Program, d: DefId) -> bool {
-    // the crate's relaxed-Rust setting (relaxed.rs: `[package.metadata.relax] relaxed = ..`,
-    // RELAX_RELAXED, --relaxed): field views and extended two-phase borrows
+    // the crate's relaxed-Rust setting (relaxed.rs: `[package.metadata.makepad-run] relaxed = ..`,
+    // MAKEPAD_RUN_RELAXED, --relaxed): field views and extended two-phase borrows
     let k = prog.def(d).krate as usize;
     prog.crates[k].relaxed(prog).iter().any(|f| f == "field-views" || f == "two-phase")
 }

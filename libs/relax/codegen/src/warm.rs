@@ -8,7 +8,7 @@ use relax_session::sync::Mutex;
 
 pub fn enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_WARM_STRICT").as_deref() == Ok("1"))
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_WARM_STRICT").as_deref() == Ok("1"))
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]

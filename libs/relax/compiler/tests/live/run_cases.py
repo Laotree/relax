@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hot-reload cases for `makepad live` (local/plans/hotreload.md section 8).
 
-usage: run_cases.py --relax <makepad binary> [--only name[,name..]] [--verbose] [--keep DIR]
+usage: run_cases.py --makepad <makepad binary> [--only name[,name..]] [--verbose] [--keep DIR]
 
 A case is a directory under tests/live/ (the files directly in tests/live/ are the case "body_edit"):
   v0.rs, v1.rs, ..           single-file crate: each edit replaces the crate root
@@ -17,7 +17,7 @@ A case is a directory under tests/live/ (the files directly in tests/live/ are t
                               note=<text>: the edit's output must contain <text> (rest of the line)
   expect-v0.out (optional)   what the v0 second run prints, if not what a fresh run of v0 prints
   env (optional)             KEY=VALUE lines for both the live session and the oracle runs
-                              RELAX_LIVE_STREAM=1 feeds single-file edits through apply_stream, 17 ms apart.
+                              MAKEPAD_RUN_LIVE_STREAM=1 feeds single-file edits through apply_stream, 17 ms apart.
   xfail (optional)           the case is expected to FAIL today; its first line names the gap (G1..G10)
   forbid (optional)          substrings (one per line) that must not appear in the live session's output from the
                               first edit on
@@ -44,7 +44,7 @@ def parse_args(argv):
     i = 0
     while i < len(argv):
         k = argv[i]
-        if k == "--relax":
+        if k == "--makepad":
             a["relax"] = argv[i + 1]; i += 2
         elif k == "--only":
             a["only"] = set(argv[i + 1].split(",")); i += 2
@@ -91,7 +91,7 @@ def versions(d):
 
 def read_env(d):
     env = dict(os.environ)
-    env.setdefault("RELAX_CACHE", "0")
+    env.setdefault("MAKEPAD_RUN_CACHE", "0")
     p = os.path.join(d, "env")
     if os.path.exists(p):
         for line in open(p):

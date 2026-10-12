@@ -4,7 +4,7 @@
 // the variable and the rigid alias as a new alias-relate goal, again and again, until overflow:
 // ambiguous, so not Copy) -- and a `&mut T` coerced to `&T` inside `Some(..)` on the right of
 // `==` is reborrowed, not moved. Generic bodies are checked polymorphically
-// (RELAX_BORROWCK_ALL=1 in run_live_regressions.sh), as Gandalf does while a program runs.
+// (MAKEPAD_RUN_BORROWCK_ALL=1 in run_live_regressions.sh), as Gandalf does while a program runs.
 use std::collections::HashMap;
 use std::path::PathBuf;
 

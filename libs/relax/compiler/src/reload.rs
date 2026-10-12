@@ -39,7 +39,7 @@ struct ReloadTrace {
     cpu_last: u64,
     cpu: std::collections::BTreeMap<&'static str, f64>,
     stages: std::collections::BTreeMap<&'static str, f64>,
-    // sub-stage wall times inside a stage (RELAX_RELOAD_TRACE: printed as sub.<name>_ms)
+    // sub-stage wall times inside a stage (MAKEPAD_RUN_RELOAD_TRACE: printed as sub.<name>_ms)
     sub_last: Option<Instant>,
     subs: std::collections::BTreeMap<&'static str, f64>,
     counts: std::collections::BTreeMap<&'static str, usize>,
@@ -51,7 +51,7 @@ thread_local! {
     static TRACE_INPUT: std::cell::Cell<(f64, f64, usize)> = const { std::cell::Cell::new((0.0, 0.0, 0)) };
 }
 pub(crate) fn trace_input(watch_ms: f64, read_ms: f64, scanned: usize) {
-    if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
+    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
         TRACE_INPUT.with(|s| s.set((watch_ms, read_ms, scanned)));
     }
 }
@@ -81,7 +81,7 @@ fn trace_sub(name: &'static str) {
         }
     });
 }
-/// A unit call for the reload transaction; RELAX_RELOAD_TRACE reports a wait over 5 ms with
+/// A unit call for the reload transaction; MAKEPAD_RUN_RELOAD_TRACE reports a wait over 5 ms with
 /// the holder seen when the wait began (whose hold delayed the edit).
 fn call_traced<R>(at: &'static str, f: impl FnOnce() -> R) -> R {
     let traced = TRACE.with(|s| s.borrow().started.is_some());
@@ -104,7 +104,7 @@ fn trace_count(name: &'static str, n: usize) {
 struct TraceTransaction;
 impl TraceTransaction {
     fn begin(files: usize) -> Self {
-        if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
+        if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
             let now = Instant::now();
             let (watch, read, scanned) = TRACE_INPUT.with(|s| s.replace((0.0, 0.0, 0)));
             let mut state = ReloadTrace { started: Some(now), last: Some(now), cpu_last: crate::clock::cpu_ns(), ..Default::default() };
@@ -892,8 +892,8 @@ fn compose_partial(prog: &Program, old_file: u32, new_src: &[u8]) -> Option<(Vec
         }
     }
     prog.parse_version(old_file, path, text.clone()).ok()?;
-    if std::env::var_os("RELAX_STREAM_TIMING").is_some() {
-        eprintln!("relax-stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
+    if std::env::var_os("MAKEPAD_RUN_STREAM_TIMING").is_some() {
+        eprintln!("makepad-run stream: compose_partial {} bytes {:.3} ms", new_src.len(), ms(started));
     }
     Some((text, kept))
 }
@@ -1170,7 +1170,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
                 let raw = |pf: &crate::parser::ParsedFile, lo: u32, hi: u32| -> Vec<u8> { norm_generated(&pf.src[lo as usize..hi as usize]).into_iter().filter(|c| !c.is_ascii_whitespace()).collect() };
                 let sig_same = if gen { raw(old, la, body_a) == raw(new, lb, body_b) } else { same_toks(old, la, body_a, &[], new, lb, body_b, &[]) };
                 if !attrs_same || !sig_same {
-                    if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
+                    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
                         eprintln!("reload: signature of `{}` (attrs same {}):\n  old: {}\n  new: {}", name, attrs_same, sh(toks_norm(old, la, body_a, &[])), sh(toks_norm(new, lb, body_b, &[])));
                         if !attrs_same {
@@ -1189,7 +1189,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
             (ItemKind::Const(_, ea), ItemKind::Const(_, eb)) if ea.is_some() && eb.is_some() => {
                 let (ea, eb) = (oa.expr(ea.get().unwrap()), na.expr(eb.get().unwrap()));
                 if !attrs_same || toks_norm(old, la, ea.lo, &[]) != toks_norm(new, lb, eb.lo, &[]) {
-                    if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
+                    if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
                         let sh = |v: Vec<Vec<u8>>| v.iter().map(|x| String::from_utf8_lossy(x).into_owned()).collect::<Vec<_>>().join(" ");
                         eprintln!("reload: type of const `{}` (attrs same {}; old {}..{} of {}, new {}..{} of {}):\n  old: {}\n  new: {}", name, attrs_same, la, ea.lo, old.src_len, lb, eb.lo, new.src_len,
                             sh(toks_norm(old, la, ea.lo, &[])).chars().take(600).collect::<String>(), sh(toks_norm(new, lb, eb.lo, &[])).chars().take(600).collect::<String>());
@@ -1245,7 +1245,7 @@ pub(crate) fn classify(prog: &crate::program::Program, old_file: u32, new: &crat
     if why.is_empty() {
         Ok(Plan { pairs, changes: out, added: plan_added, removed: plan_removed, removed_uses, attributes_changed })
     } else {
-        if std::env::var_os("RELAX_RELOAD_TRACE").is_some() {
+        if std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some() {
             // which items paired and which did not, with their keys (a restart that the
             // source does not explain is a difference between the two parses)
             let (ko, kn) = (item_keys(old), item_keys(new));
@@ -1765,7 +1765,7 @@ unsafe fn compile_guarded(up: *mut Unit, id: u32) -> Result<Code, String> {
             }
             let u = &mut *up;
             u.fns[id as usize].building = false;
-            Err(format!("internal compiler error in {}: {} -- Relax bug, report it", u.fns[id as usize].name, msg))
+            Err(format!("internal compiler error in {}: {} -- makepad run bug, report it", u.fns[id as usize].name, msg))
         }
     }
 }
@@ -2008,7 +2008,7 @@ unsafe fn apply_mode(up: *mut Unit, edits: Vec<Edit>, partial: u8, module: bool)
         Ok(r) => r,
         Err(p) => {
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default();
-            Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- Relax bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
+            Outcome { kept: 0, pending: false, rung: Rung::Restart, files, lines: vec![format!("internal compiler error applying the edit: {} -- makepad run bug, report it; restart the app", msg)], names: Vec::new(), changed: 0, group: 0, ms: [0.0; 4], undo: None, work: [0; 5] }
         }
     };
     crate::owner::call(crate::owner::Class::App, || {
@@ -2556,7 +2556,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     {
         let wait_from = jit::wall_ns();
         let fw = jit::front_write();
-        if std::env::var_os("RELAX_FRONT_TRACE").is_some() {
+        if std::env::var_os("MAKEPAD_RUN_FRONT_TRACE").is_some() {
             let now = jit::wall_ns();
             eprintln!("reload-front-wait: {:.1} ms (t={:.0}..{:.0} ms)", (now - wait_from) as f64 / 1e6, wait_from as f64 / 1e6, now as f64 / 1e6);
         }
@@ -2839,7 +2839,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
                     // the same body again)
                     checked_bodies.push(b);
                 }
-                Err(_) => errs.push(format!("internal compiler error type-checking {} -- Relax bug, report it", u.prog.def_path(d))),
+                Err(_) => errs.push(format!("internal compiler error type-checking {} -- makepad run bug, report it", u.prog.def_path(d))),
             }
         }
     }
@@ -3310,7 +3310,7 @@ static RESTART_SUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
-/// measures save -> back on screen from it (RELAX_RESTART_T0).
+/// measures save -> back on screen from it (MAKEPAD_RUN_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_SNAPSHOT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
@@ -3387,7 +3387,7 @@ pub extern "C" fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize {
     copy_out(&r, buf, cap)
 }
 
-/// The state the previous process left for this one (RELAX_RESTORE), read once.
+/// The state the previous process left for this one (MAKEPAD_RUN_RESTORE), read once.
 pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
         let state = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner());
@@ -3411,7 +3411,7 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
 }
 
 /// A hosted app queues a fresh domain with this state and returns for cooperative shutdown.
-/// A directly running program writes RELAX_RESTORE and replaces its process as before.
+/// A directly running program writes MAKEPAD_RUN_RESTORE and replaces its process as before.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
     if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
@@ -3438,7 +3438,7 @@ pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
         crate::run::summary("restart");
         eprintln!("makepad live: restarting with the program's state ({})", RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()));
         let t0 = RESTART_SAVED_MS.load(std::sync::atomic::Ordering::Relaxed);
-        let e = std::process::Command::new(exe).args(&args[1..]).env("RELAX_RESTORE", &path).env("RELAX_RESTART_T0", t0.to_string()).exec();
+        let e = std::process::Command::new(exe).args(&args[1..]).env("MAKEPAD_RUN_RESTORE", &path).env("MAKEPAD_RUN_RESTART_T0", t0.to_string()).exec();
         eprintln!("makepad live: restart failed: {}", e);
     }
 }
@@ -3458,16 +3458,16 @@ fn patch_refused_event(what: &str, refused: bool, lines: &[String]) {
 
 /// The session log: one JSON line per edit (rung, reasons, phase latencies) and per restart
 /// outcome (the program's kept/lost report, through std::relax::live_log), appended across the
-/// restarts of one session (the path travels in RELAX_LIVE_LOG; default: the temp dir).
+/// restarts of one session (the path travels in MAKEPAD_RUN_LIVE_LOG; default: the temp dir).
 fn live_log_path() -> String {
-    if let Ok(p) = std::env::var("RELAX_LIVE_LOG") {
+    if let Ok(p) = std::env::var("MAKEPAD_RUN_LIVE_LOG") {
         if !p.is_empty() {
             return p;
         }
     }
-    let p = std::env::temp_dir().join(format!("relax-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned();
+    let p = std::env::temp_dir().join(format!("makepad-run-live-{}.jsonl", std::process::id())).to_string_lossy().into_owned();
     // exec'd restarts inherit it: one session, one log
-    std::env::set_var("RELAX_LIVE_LOG", &p);
+    std::env::set_var("MAKEPAD_RUN_LIVE_LOG", &p);
     p
 }
 
@@ -3808,7 +3808,7 @@ fn spawn_watcher(up: *mut Unit, inputs: Inputs, quiet: bool) {
     WATCH_STOP.store(false, Ordering::SeqCst);
     WATCH_RUNNING.store(true, Ordering::SeqCst);
     let spawned = std::thread::Builder::new()
-        .name("relax-live".to_string())
+        .name("run-live".to_string())
         .spawn(move || { let _z = crate::zone_alloc::compiler_thread();
             let runtime = &session.runtime;
             let p = p;
@@ -3855,7 +3855,7 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
 }
 
 unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
-    let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
+    let std_dir = std::env::var("MAKEPAD_RUN_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
     let own_files = |u: &Unit| -> Vec<(String, u32)> {
@@ -3887,8 +3887,8 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
     if !quiet { eprintln!("makepad live: watching {} source files; session log {}", files.len(), live_log_path()); }
     let mut undos: Vec<Undo> = Vec::new();
     // a save is seen within 100 ms (a restart's whole budget is 1 s); one round is a stat per
-    // watched file (RELAX_LIVE_TRACE=1 prints its cost once)
-    let mut traced = std::env::var_os("RELAX_LIVE_TRACE").is_none();
+    // watched file (MAKEPAD_RUN_LIVE_TRACE=1 prints its cost once)
+    let mut traced = std::env::var_os("MAKEPAD_RUN_LIVE_TRACE").is_none();
     // the hot set: the program's own package (its root crate's directory) and every file saved
     // this session, polled every 5 ms (a few stats); every file is polled every 100 ms
     let mut hot: Vec<usize> = {
@@ -3952,7 +3952,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 else { added.push((path, file)); }
             }
             if !added.is_empty() {
-                if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
+                if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() { eprintln!("makepad live: watching {} more file(s) the post-boot loader loaded", added.len()); }
                 for (p, i) in added { let st = stamp(&p); files.push((p, i, st)); }
                 events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
                 rewatched = true;
@@ -4069,7 +4069,7 @@ unsafe fn watch(up: *mut Unit, mut inputs: Inputs, quiet: bool) {
                 stalled.clear();
                 continue;
             }
-            let package = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
+            let package = std::env::var("MAKEPAD_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             let message = format!("{} {what} changed: {reason}; restart `makepad run {package}` to pick them up; keeping the running code", changed.len());
             eprintln!("makepad live: {message}");
@@ -4187,18 +4187,18 @@ mod round32_tests {
 
     #[test]
     fn enum_reload_snapshots() {
-        const CHILD: &str = "RELAX_ENUM_RELOAD_CASE";
+        const CHILD: &str = "MAKEPAD_RUN_ENUM_RELOAD_CASE";
         let Ok(case) = std::env::var(CHILD) else {
             for case in ["same", "changed", "removed", "reordered", "added", "larger", "named", "executable", "callee", "named_code", "unrelated"] {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "reload::round32_tests::enum_reload_snapshots", "--nocapture", "--test-threads=1"])
-                    .env(CHILD, case).env("RELAX_CTFE", "0").env("RELAX_CACHE", "off").env("RELAX_GANDALF", "0")
+                    .env(CHILD, case).env("MAKEPAD_RUN_CTFE", "0").env("MAKEPAD_RUN_CACHE", "off").env("MAKEPAD_RUN_GANDALF", "0")
                     .output().unwrap();
                 assert!(output.status.success(), "{case}: {}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             }
             return;
         };
-        std::env::set_var("RELAX_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
+        std::env::set_var("MAKEPAD_RUN_STD", concat!(env!("CARGO_MANIFEST_DIR"), "/std"));
         crate::borrowck::lazy::disable_gandalf();
         let (old, new, accept) = match case.as_str() {
             "same" => ("enum E { A = 1, B }", "enum E { A = 1 + 0, B }", true),

@@ -522,17 +522,17 @@ impl Command {
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
     /// loader whose first argument is `run` is a launcher starting another program through it
-    /// (`$RELAX_LOADER run [flags] <package> ...`): that one runs as written. `program` is the
+    /// (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`): that one runs as written. `program` is the
     /// resolved executable (NUL-terminated UTF-16, with its `.exe`); the result is the argument
     /// list after argv[0] to run instead of this command's.
     fn self_exec_args(&self, program: &[u16]) -> Option<Vec<Arg>> {
-        let pre = crate::env::var("RELAX_SELF_EXEC").ok()?;
+        let pre = crate::env::var("MAKEPAD_RUN_SELF_EXEC").ok()?;
         if self.args.first().is_some_and(|a| a.as_os_str().as_encoded_bytes() == b"run") {
             return None;
         }
-        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
+        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::var_os("RELAX_AS_RUSTC").is_some() {
+        if crate::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
@@ -556,7 +556,7 @@ impl Command {
 
     /// A child started in a virtual folder of a git run (Relax's VFS) cannot get it as its
     /// working directory: it runs from the current one and finds its workspace through
-    /// RELAX_WORKSPACE + the mount table (RELAX_VFS), as on unix (process_unix.rs).
+    /// MAKEPAD_RUN_WORKSPACE + the mount table (MAKEPAD_RUN_VFS), as on unix (process_unix.rs).
     fn spawn_with(&mut self, default: StdioKind, needs_stdin: bool) -> io::Result<Child> {
         let Some(dir) = self.cwd.clone() else {
             return self.spawn_now(default, needs_stdin);
@@ -565,15 +565,15 @@ impl Command {
         let r = match crate::fs::vfs::kind(Path::new(&dir)) {
             Some((abs, _)) => {
                 self.cwd = None;
-                self.env("RELAX_WORKSPACE", abs.as_os_str());
-                self.env("RELAX_VFS", crate::fs::vfs::mounts());
+                self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
+                self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
                 let r = self.spawn_now(default, needs_stdin);
                 self.cwd = Some(dir);
                 r
             }
             None => {
-                if crate::env::var_os("RELAX_WORKSPACE").is_some() {
-                    self.env_remove("RELAX_WORKSPACE");
+                if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
+                    self.env_remove("MAKEPAD_RUN_WORKSPACE");
                 }
                 self.spawn_now(default, needs_stdin)
             }

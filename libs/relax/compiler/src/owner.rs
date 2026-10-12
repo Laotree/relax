@@ -222,7 +222,7 @@ pub fn start() {
         crate::query::set_wait_hook(crate::query::WaitHook { on_owner: is_owner, pump: pump_latch, wake, me });
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
-            .name("relax-owner".into())
+            .name("run-owner".into())
             .stack_size(256 << 20)
             .spawn(move || {
                 {
@@ -517,12 +517,12 @@ fn serve(r: usize) {
         Ok(()) if busy => Err(Box::new(crate::preempt::OwnerBusy) as Box<dyn Any + Send>),
         r => r,
     };
-    // RELAX_OWNER_TRACE: a request's panic, with where it happened on the owner (the compiler's
+    // MAKEPAD_RUN_OWNER_TRACE: a request's panic, with where it happened on the owner (the compiler's
     // panic hook is silent there; the requester resumes it)
     if let Err(p) = &res {
-        if std::env::var_os("RELAX_OWNER_TRACE").is_some() {
+        if std::env::var_os("MAKEPAD_RUN_OWNER_TRACE").is_some() {
             let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "(cancellation)".to_string());
-            eprintln!("relax-owner: a {:?} request of thread `{}` panicked on the owner: {}{}", req.class, crate::os::thread::name(req.from), msg, crate::jit::take_ice_location());
+            eprintln!("makepad-run owner: a {:?} request of thread `{}` panicked on the owner: {}{}", req.class, crate::os::thread::name(req.from), msg, crate::jit::take_ice_location());
         }
     }
     DEPTH.with(|d| d.set(d.get() - 1));

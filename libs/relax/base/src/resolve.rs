@@ -475,7 +475,7 @@ impl Resolver {
                     base_dir = self.ws.root.clone();
                 }
                 if st.contains_key("git") {
-                    return Err(format!("{}/Cargo.toml: `{}` is a git dependency; Relax resolves path and registry packages only", dir, key));
+                    return Err(format!("{}/Cargo.toml: `{}` is a git dependency; makepad run resolves path and registry packages only", dir, key));
                 }
                 let package = s(&st, "package").unwrap_or_else(|| key.clone());
                 let path = match s(&st, "path") {
@@ -509,7 +509,7 @@ impl Resolver {
         if registry {
             let build_deps: Vec<String> = deps.iter().filter(|d| d.build).map(|d| d.package.clone()).collect();
             if let Some(c) = crate::registry::c_build_dep(&build_deps) {
-                return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): Relax runs no C compiler", name, version, c));
+                return Err(format!("registry package `{}` {} compiles C or C++ (build-dependency `{}`): makepad run runs no C compiler", name, version, c));
             }
         }
         let i = self.manifests.len();
@@ -636,7 +636,7 @@ fn vendor_dir(dir: &str) -> Result<Option<(String, String)>, String> {
     };
     match s(src, "directory") {
         Some(p) => Ok(Some((join(d, &p), format!("{}/.cargo", d)))),
-        None => Err(format!("{}/.cargo: [source.{}] is not a `directory` source: Relax reads vendored crates only", d, with)),
+        None => Err(format!("{}/.cargo: [source.{}] is not a `directory` source: makepad run reads vendored crates only", d, with)),
     }
 }
 
@@ -833,7 +833,7 @@ pub fn parse_flags(flags: &[String]) -> Result<Options, String> {
                 } else if let Some(v) = f.strip_prefix("--bin=") {
                     o.bin = Some(v.to_string());
                 } else {
-                    return Err(format!("unit graph: flag `{}` is not supported by Relax's resolver", f));
+                    return Err(format!("unit graph: flag `{}` is not supported by makepad run's resolver", f));
                 }
             }
         }

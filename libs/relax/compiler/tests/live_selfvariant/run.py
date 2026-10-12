@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Live edits next to an impl that matches `Self::Variant { .. }` struct variants.
 
-usage: run.py --relax <makepad binary>   (RELAX_STD in the environment)
+usage: run.py --makepad <makepad binary>   (MAKEPAD_RUN_STD in the environment)
 
 Copies pkg/ to a temporary dir, runs it (a working tree: live) and edits src/main.rs while it runs.
 ease.rs (never edited) has `match self { Self::Pow { begin, end } => .. }`; makepad's
@@ -18,13 +18,13 @@ No step may report E0412. Prints PASS/FAIL per step; exit 1 on any FAIL.
 import os, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-relax = os.path.abspath(sys.argv[sys.argv.index("--relax") + 1])
+relax = os.path.abspath(sys.argv[sys.argv.index("--makepad") + 1])
 tmp = tempfile.mkdtemp(prefix="live-selfvariant-")
 pkg = os.path.join(tmp, "pkg")
 shutil.copytree(os.path.join(HERE, "pkg"), pkg)
 main = os.path.join(pkg, "src", "main.rs")
 base = open(main).read()
-env = dict(os.environ, RELAX_CACHE="0")
+env = dict(os.environ, MAKEPAD_RUN_CACHE="0")
 p = subprocess.Popen([relax, "run", "--quiet", "relax-live-selfvariant"], cwd=pkg, env=env, stdout=subprocess.PIPE,
                      stderr=subprocess.PIPE, text=True, start_new_session=True)
 out, err = [], []

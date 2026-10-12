@@ -49,7 +49,7 @@ pub fn eval_into(u: &mut Unit, d: crate::program::DefId, args: &[TyId], buf: u64
     };
     let epoch = Some(epoch);
     if let Some(f) = u.prog.exec_profile_file(body.file) { f.note(crate::exec_profile::CTFE); }
-    let mut cx = Ctx { u, steps: 0, depth: 0, trace: std::env::var_os("RELAX_CTFE_TRACE").is_some(), reason: None };
+    let mut cx = Ctx { u, steps: 0, depth: 0, trace: std::env::var_os("MAKEPAD_RUN_CTFE_TRACE").is_some(), reason: None };
     let mut env: Vec<Option<Vec<u8>>> = Vec::new();
     let v = match cx.eval(&body, &mut env, init) {
         Some(v) => v,
@@ -81,7 +81,7 @@ fn check_quiet(u: &mut Unit, d: crate::program::DefId, args: &[TyId]) -> Option<
     Some(b)
 }
 
-/// RELAX_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
+/// MAKEPAD_RUN_CTFE=check: evaluate here AND compile and run the initializer, compare the two values
 /// by type (pointers by what they point to, padding ignored); a difference is reported.
 pub fn check_mode(options: &crate::options::Options) -> bool {
     options.ctfe == crate::options::Ctfe::Check
@@ -274,7 +274,7 @@ pub fn zero_undefined(u: &mut Unit, t: TyId, a: u64) {
     }
 }
 
-/// RELAX_CTFE=0: every initializer is compiled and run (the reference behaviour).
+/// MAKEPAD_RUN_CTFE=0: every initializer is compiled and run (the reference behaviour).
 fn off(options: &crate::options::Options) -> bool {
     options.ctfe == crate::options::Ctfe::Off
 }

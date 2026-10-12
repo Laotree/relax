@@ -281,7 +281,7 @@ pub fn cmd_std_surface(sess: &std::sync::Arc<crate::Session>, args: &[String]) -
     let check = args.first().map(String::as_str) == Some("--check");
     let a = if check { &args[1..] } else { args };
     if a.len() != 3 {
-        eprintln!("usage: makepad std-surface [--check] <Relax std dir> <out dir> <std commit>");
+        eprintln!("usage: makepad std-surface [--check] <makepad run std dir> <out dir> <std commit>");
         return 2;
     }
     let (files, st) = match generate(sess, &a[0], &a[2]) {

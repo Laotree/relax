@@ -98,7 +98,7 @@ impl Inputs {
         for path in paths {
             match self.paths.get(path).map(|x| &x.1) {
                 Some(Kind::Provided) => return Some("the Splash VM or other provided sources changed: rebuild makepad"),
-                Some(Kind::Std) => reason = Some("Relax's std changed"),
+                Some(Kind::Std) => reason = Some("makepad run's std changed"),
                 Some(Kind::Manifest) => { if reason.is_none() { reason = Some("the Cargo graph changed"); } }
                 Some(Kind::Build) => { if reason.is_none() { reason = Some("a build script changed"); } }
                 Some(Kind::Source(package)) => { packages.insert(package); sources += 1; }

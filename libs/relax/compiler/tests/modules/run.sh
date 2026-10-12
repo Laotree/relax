@@ -4,7 +4,7 @@ D=$(cd "$(dirname "$0")" && pwd)
 # Instruction counts are identical with tiering disabled and after a low-threshold tier-up.
 BASE_BUDGET=""
 for TIER in 0 1; do
-OUT=$(RELAX_O3=$TIER RELAX_O3_CALLS=100 RELAX_O3_TRACE=1 "$1" test "$D/budget.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=100 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/budget.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$STATUS" != 0 ] || ! echo "$GOT" | grep -q '^out owned string results: true$'; then
@@ -24,14 +24,14 @@ OUT=$("$1" test "$D/$CASE.rs" 2>&1)
 STATUS=$?
 if [ "$STATUS" = 0 ]; then echo "modules $CASE: PASS"; else echo "modules $CASE: FAIL"; echo "$OUT" | tail -30; exit 1; fi
 done
-OUT=$(RELAX_SANDBOX_FUEL=0 python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], timeout=120).returncode)' "$1" test "$D/guard_threads.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 python3 -c 'import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], timeout=120).returncode)' "$1" test "$D/guard_threads.rs" 2>&1)
 STATUS=$?
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$STATUS" = 0 ] && [ "$GOT" = $'out concurrent guards: true\nout nested guards: true' ]; then echo "modules guard threads: PASS"; else echo "modules guard threads: FAIL"; echo "$OUT" | tail -30; exit 1; fi
 # Exercise the sandbox wrappers/twins and the trusted host-code inlining path.
 for TRUSTED in 0 1; do
 for TIER in 1 0; do
-    OUT=$(RELAX_MODULES_TRUSTED=$TRUSTED RELAX_O3=$TIER RELAX_O3_CALLS=2000 RELAX_O3_TRACE=1 "$1" test "$D/palette.rs" 2>&1)
+    OUT=$(MAKEPAD_RUN_MODULES_TRUSTED=$TRUSTED MAKEPAD_RUN_O3=$TIER MAKEPAD_RUN_O3_CALLS=2000 MAKEPAD_RUN_O3_TRACE=1 "$1" test "$D/palette.rs" 2>&1)
     STATUS=$?
     GOT=$(echo "$OUT" | grep '^out ')
     HOT=$(echo "$OUT" | grep -Ec '^tier1: (__sbw_palette_patch_0|palette_patch)::color installed')
@@ -54,17 +54,17 @@ if [ "$GOT" = "$(cat "$D/expect.out")" ]; then echo "modules: PASS ($(echo "$OUT
 OUT=$("$1" test "$D/scale.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-scale.out")" ]; then echo "modules scale: PASS ($(echo "$OUT" | grep -o 'scale: .*'))"; else echo "modules scale: FAIL"; echo "$OUT" | tail -8; exit 1; fi
-OUT=$(RELAX_SANDBOX_NOCHECK=1 "$1" test "$D/contain.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_SANDBOX_NOCHECK=1 "$1" test "$D/contain.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-contain.out")" ]; then echo "modules contain: PASS"; else echo "modules contain: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
 # This case compiles/edits 400 modules; its harness deadline includes compilation.
-OUT=$(RELAX_WATCHDOG_MS=120000 "$1" test "$D/recycle.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_WATCHDOG_MS=120000 "$1" test "$D/recycle.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-recycle.out")" ]; then echo "modules recycle: PASS ($(echo "$OUT" | grep -o 'recycle: .*'))"; else echo "modules recycle: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -8; exit 1; fi
-OUT=$(RELAX_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_MODULE_FUEL=1000000 "$1" test "$D/fuel.rs" 2>&1)
 GOT=$(echo "$OUT" | grep '^out ')
 if [ "$GOT" = "$(cat "$D/expect-fuel.out")" ]; then echo "modules fuel: PASS"; else echo "modules fuel: FAIL"; echo "$GOT"; echo "$OUT" | grep -v '^  report' | tail -6; exit 1; fi
 bash "$D/milk.sh" "$1" || exit 1
-OUT=$(RELAX_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
+OUT=$(MAKEPAD_RUN_SANDBOX_FUEL=0 "$1" test "$D/deadline.rs" 2>&1)
 STATUS=$?
 if [ "$STATUS" = 0 ] && echo "$OUT" | grep -q '^out deadlines: true$'; then echo "modules deadlines: PASS"; else echo "modules deadlines: FAIL"; echo "$OUT" | tail -30; exit 1; fi

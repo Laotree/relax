@@ -29,7 +29,7 @@ pub fn zone_put_back(taken: ZoneTaken) {
 
 #[test]
 fn zone_reset_fresh_process() {
-    const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
+    const CHILD: &str = "MAKEPAD_RUN_ZONE_RESET_TEST_CHILD";
     if std::env::var_os(CHILD).is_some() {
         std::mem::forget(zone_take());
         std::mem::forget(zone_take());

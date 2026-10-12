@@ -1529,7 +1529,7 @@ impl Predecoded {
         let this = Arc::new(Self { parts, slots: relax_session::sync::Mutex::new(slots), done: relax_session::sync::Condvar::new() });
         for _ in 0..workers.min(this.parts.len()) {
             let this = this.clone();
-            std::thread::Builder::new().name("relax-namespace-decode".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
+            std::thread::Builder::new().name("run-namespace-decode".into()).spawn(move || { let _z = crate::zone_alloc::compiler_thread();
                 while let Some(ci) = this.claim(None) { this.decode(ci); }
             }).expect("namespace decode worker");
         }
@@ -1586,7 +1586,7 @@ impl NamespaceDelta {
 /// A part's closure delta, always as the bytes it is stored as: the recorder encodes it once, a
 /// stored part reads those bytes without decoding them (a decoded delta is one owned spelling per
 /// name, 0.4 GB on a cold Stage), and only a load that applies the delta decodes it. The legacy
-/// size is RELAX_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
+/// size is MAKEPAD_RUN_PROFILE's report, taken from the delta at the record (0 unprofiled or read).
 pub(crate) struct ClosureDelta { image: Vec<u8>, legacy: usize }
 impl Codec for ClosureDelta {
     fn put(&self, w: &mut Vec<u8>) {

@@ -13,10 +13,6 @@ autotests = false
 name = "relax_compiler"
 path = "src/lib.rs"
 
-[[bin]]
-name = "relax-compiler"
-path = "src/main.rs"
-
 [dependencies]
 # the git store's deflate/inflate (src/inflate), the manifests' TOML (src/toml) and the
 # proc-macro token model (makepad's libs/relax/lex) need no registry dependencies.

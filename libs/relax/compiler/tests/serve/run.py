@@ -7,9 +7,9 @@ work = pathlib.Path(tempfile.mkdtemp(prefix='relax-serve-'))
 fixture = work / 'fixture'
 shutil.copytree(here / 'fixture', fixture)
 cache = work / 'cache'
-env = dict(os.environ, RELAX_CACHE_DIR=str(cache), RELAX_CACHE='off',
-           RELAX_STD=str(here.parents[1] / 'std'),
-           CARGO_NET_OFFLINE='true', RELAX_OFFLINE='1')
+env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=str(cache), MAKEPAD_RUN_CACHE='off',
+           MAKEPAD_RUN_STD=str(here.parents[1] / 'std'),
+           CARGO_NET_OFFLINE='true', MAKEPAD_RUN_OFFLINE='1')
 source = fixture / 'main.rs'
 original = source.read_text()
 fixed = original.replace('Missing', 'i32')

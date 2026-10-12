@@ -9,13 +9,13 @@
 use crate::regalloc::{for_defs, for_uses, reachable, term_uses, uses_defs};
 use std::cell::Cell;
 
-/// CPU ns per pass (all threads, RELAX_PASS_TIMES): 0 fold/copy-prop, 1 cse, 2 local copy-prop,
+/// CPU ns per pass (all threads, MAKEPAD_RUN_PASS_TIMES): 0 fold/copy-prop, 1 cse, 2 local copy-prop,
 /// 3 dce, 4 jumps+merge, 5 inline, 6 sink, 7 layout, 8 sroa, 9 live_dce (top level), 10 licm,
 /// 11 regalloc, 12 emit, 13 verify, 14 compact, 15 thread_known
 pub static PASS_NS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
-/// Per-pass timing is opt-in (RELAX_PASS_TIMES): the thread CPU clock is a syscall.
-/// RELAX_OPT diagnostic toggles beyond OptCfg's fields: `-freecap` (no size allowance for
+/// Per-pass timing is opt-in (MAKEPAD_RUN_PASS_TIMES): the thread CPU clock is a syscall.
+/// MAKEPAD_RUN_OPT diagnostic toggles beyond OptCfg's fields: `-freecap` (no size allowance for
 /// O3 free inlines: R13's 1.9 MB functions, to exercise arm64 branch relaxation),
 /// `-costmodel` (rustc MIR cost admission); `+single` turns the single-caller admission on;
 /// `-ic` disables the InstCombine subset (nonnull, phi compares, convs, niches, sinking).
@@ -40,21 +40,21 @@ pub fn pass_clock() -> u64 {
 
 fn fast_clock() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("RELAX_PASS_TIMES").map_or(false, |v| v == "wall"))
+    *F.get_or_init(|| std::env::var("MAKEPAD_RUN_PASS_TIMES").map_or(false, |v| v == "wall"))
 }
 
-/// RELAX_OPT=-ifconv: no if-conversion (bisection).
+/// MAKEPAD_RUN_OPT=-ifconv: no if-conversion (bisection).
 fn if_conv_on(options: &relax_session::Options) -> bool {
     !options.opt.iter().any(|p| p == "-ifconv")
 }
 
-/// RELAX_OPT=-thread: no jump threading over known values (bisection).
+/// MAKEPAD_RUN_OPT=-thread: no jump threading over known values (bisection).
 fn thread_on(options: &relax_session::Options) -> bool {
     !options.opt.iter().any(|p| p == "-thread")
 }
 
 thread_local! {
-    static PASS_ON: Cell<bool> = Cell::new(std::env::var("RELAX_PASS_TIMES").is_ok());
+    static PASS_ON: Cell<bool> = Cell::new(std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok());
     /// this thread's ns per pass (pass_local: one build's split)
     static PASS_LOCAL: Cell<[u64; 16]> = const { Cell::new([0; 16]) };
 }
@@ -82,7 +82,7 @@ pub fn pass_time(i: usize, t0: u64) {
     });
 }
 
-/// RELAX_OPT_HIST: opt-pipeline cpu ns (0..6) and function counts (6..12) by optimised size
+/// MAKEPAD_RUN_OPT_HIST: opt-pipeline cpu ns (0..6) and function counts (6..12) by optimised size
 pub static HIST: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 pub const PASS_NAMES: [&str; 16] = ["fold", "cse", "lcopy", "dce", "jumps", "inline", "sink", "layout", "sroa", "live_dce", "licm", "regalloc", "emit", "verify", "compact", "thread_known"];
 use crate::rir::*;
@@ -102,7 +102,7 @@ pub struct OptCfg {
 }
 
 impl OptCfg {
-    /// `RELAX_OPT=none` or a comma list of passes to disable (`-inline,-fold`).
+    /// `MAKEPAD_RUN_OPT=none` or a comma list of passes to disable (`-inline,-fold`).
     pub fn from_options(options: &relax_session::Options) -> OptCfg {
         let mut c = OptCfg { inline: true, inline_all: true, fold: true, cse: true, sroa: true, licm: true, imm: true, layout: true };
         {
@@ -137,7 +137,7 @@ pub const INLINE_HINT_INSTS: usize = 60;
 pub const INLINE_MAX_BLOCKS: usize = 8;
 pub const INLINE_BUDGET: usize = 600;
 
-/// Leaf-inlining budget (insts, blocks); RELAX_INLINE_LEAF=insts,blocks overrides.
+/// Leaf-inlining budget (insts, blocks); MAKEPAD_RUN_INLINE_LEAF=insts,blocks overrides.
 pub fn leaf_budget(options: &relax_session::Options) -> (usize, usize) {
     options.inline_leaf
 }
@@ -208,7 +208,7 @@ pub fn rustc_inline_cost(callee: &Func, _callee_id: u32) -> usize {
     penalty.saturating_sub(bonus)
 }
 
-/// LLVM's single-caller rule is opt-in (`RELAX_OPT=+single`) until html_parse's regression and
+/// LLVM's single-caller rule is opt-in (`MAKEPAD_RUN_OPT=+single`) until html_parse's regression and
 /// its O3 compile cost are fixed.
 pub fn single_on(options: &relax_session::Options) -> bool {
     options.opt.iter().any(|t| t.trim() == "+single")
@@ -272,7 +272,7 @@ pub struct InlineLimits {
 }
 
 impl InlineLimits {
-    /// O1 ("obviously inline"); RELAX_INLINE_LEAF=insts,blocks overrides the leaf rule
+    /// O1 ("obviously inline"); MAKEPAD_RUN_INLINE_LEAF=insts,blocks overrides the leaf rule
     pub fn tier0(options: &relax_session::Options) -> InlineLimits {
         let (leaf_insts, leaf_blocks) = leaf_budget(options);
         InlineLimits { budget: INLINE_BUDGET, leaf_insts, leaf_blocks, hint_insts: INLINE_HINT_INSTS, chain_insts: INLINE_CHAIN_INSTS, always_insts: 200, free_any: false, ordered: false, hot_insts: 0, growth_limit: None }
@@ -1332,7 +1332,7 @@ pub fn compact_vregs(f: &mut Func) {
 pub(crate) static T: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
 
 fn trace_opt(f: &Func, tag: &str) {
-    if let Some(t) = T.get_or_init(|| std::env::var("RELAX_TRACE_OPT").ok()) {
+    if let Some(t) = T.get_or_init(|| std::env::var("MAKEPAD_RUN_TRACE_OPT").ok()) {
         if f.name.contains(t.as_str()) {
             eprintln!("=== {} {}\n{}", tag, f.name, f.dump());
         }
@@ -3147,10 +3147,10 @@ fn thread_known(f: &mut Func) -> bool {
             continue;
         }
         {
-            // RELAX_THREAD_MAX=n: only the first n threads of the process (bisection)
+            // MAKEPAD_RUN_THREAD_MAX=n: only the first n threads of the process (bisection)
             static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let m = *MAX.get_or_init(|| std::env::var("RELAX_THREAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
+            let m = *MAX.get_or_init(|| std::env::var("MAKEPAD_RUN_THREAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX));
             if m != u64::MAX {
                 let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if k >= m {
@@ -5791,7 +5791,7 @@ pub fn sroa_post_inline(f: &mut Func) -> bool {
 
 fn sroa_with(f: &mut Func, tile: bool) -> bool {
     static STATS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let mut stats = STATS.get_or_init(|| std::env::var("RELAX_SROA_STATS").map_or(false, |v| v == "1"))
+    let mut stats = STATS.get_or_init(|| std::env::var("MAKEPAD_RUN_SROA_STATS").map_or(false, |v| v == "1"))
         .then(|| SroaStats { candidates: f.slots.len(), ..SroaStats::default() });
     let changed = sroa_inner(f, stats.as_mut(), tile);
     if let Some(s) = stats {
@@ -8695,9 +8695,9 @@ fn slot_colors_used(f: &Func, min: u32, addressed: &[bool]) -> Option<Vec<u32>> 
     } else {
         slot_live_intervals(f, &cand, &der, &acc, &ent, &ext)
     };
-    // RELAX_COLOR_TRACE=<name substring>: each slot of the matching fns, escaping or not
+    // MAKEPAD_RUN_COLOR_TRACE=<name substring>: each slot of the matching fns, escaping or not
     static TRACE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    if let Some(w) = TRACE.get_or_init(|| std::env::var("RELAX_COLOR_TRACE").ok()) {
+    if let Some(w) = TRACE.get_or_init(|| std::env::var("MAKEPAD_RUN_COLOR_TRACE").ok()) {
         if f.name.contains(w.as_str()) {
             for s in 0..ns {
                 if f.slots[s].size >= min && addressed[s] {
@@ -9124,7 +9124,7 @@ fn born_liveness(f: &Func, cand: &[usize], der: &[Vec<u32>], live: &mut [Vec<(u3
 /// below the frame's base); each slot something addresses gets the end of its storage
 /// (offset of its lowest byte below the base, its alignment respected), slots sharing storage
 /// (`slot_colors`) the same; unaddressed slots take no space. Returns the offsets and the new
-/// end of the area. `share` false (RELAX_OPT=-slotcolor): every slot keeps its own storage.
+/// end of the area. `share` false (MAKEPAD_RUN_OPT=-slotcolor): every slot keeps its own storage.
 pub fn slot_layout(f: &Func, mut off: i64, share: bool) -> (Vec<i64>, i64) {
     let ns = f.slots.len();
     if ns == 0 {

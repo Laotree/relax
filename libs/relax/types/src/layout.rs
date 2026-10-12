@@ -383,7 +383,7 @@ impl Layouts {
         self.struct_layout(lcx, tcx, &storage.fields, Repr { pack: 0, align: 0, reorder: true }, kind)
     }
 
-    /// Memory report (RELAX_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
+    /// Memory report (MAKEPAD_RUN_MEM_REPORT): exact bytes of the slot tables (live and retired) and of
     /// the shared layout entries with their vectors.
     pub fn mem_lines(&self) -> Vec<(String, u64)> {
         use std::sync::atomic::Ordering;

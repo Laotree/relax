@@ -20,7 +20,7 @@ mod openssl;
 mod winhttp;
 
 /// The User-Agent sent when the request names none.
-pub const USER_AGENT: &str = "relax-light-http/0.1";
+pub const USER_AGENT: &str = "makepad-run/0.1";
 
 pub struct Request<'a> {
     pub method: &'a str,

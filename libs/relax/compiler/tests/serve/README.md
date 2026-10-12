@@ -2,9 +2,9 @@
 
 `makepad serve [--workspace DIR] [--idle-min 30]` resolves and canonicalizes the workspace
 with Relax's resolver. It publishes `PORT TOKEN PID\n` in
-`<workspace>/target/relax/serve/<16 lowercase hex digits>/endpoint`. Cargo target-dir overrides
-select `<target>/relax`; `RELAX_CACHE_DIR` explicitly replaces the Relax directory. Run
-`makepad clean` from the workspace root or a member subdirectory to remove the entire Relax
+`<workspace>/target/makepad-run/serve/<16 lowercase hex digits>/endpoint`. Cargo target-dir overrides
+select `<target>/makepad-run`; `MAKEPAD_RUN_CACHE_DIR` explicitly replaces that directory. Run
+`makepad clean` from the workspace root or a member subdirectory to remove the entire makepad-run
 directory, including serve files and startup manifests. The directory key is the
 low 64 bits of Relax's Sip128 hash of the canonical root. The token is 32 OS-random bytes,
 hex encoded. The endpoint and lock are private files. An OS file lock prevents duplicate

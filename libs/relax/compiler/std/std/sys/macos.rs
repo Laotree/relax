@@ -216,7 +216,7 @@ pub fn fill_random(buf: &mut [u8]) {
 // <os/os_sync_wait_on_address.h> (macOS 14.4+) is used when the running macOS has it; it is
 // looked up with dlsym (no link-time dependency, so the binary still loads on older macOS).
 // Otherwise __ulock_wait/__ulock_wake. The choice is made once and cached;
-// RELAX_FORCE_ULOCK=1 forces the fallback (testing only).
+// MAKEPAD_RUN_FORCE_ULOCK=1 forces the fallback (testing only).
 
 type OsSyncWait = unsafe extern "C" fn(*mut c_void, u64, usize, u32) -> c_int;
 type OsSyncWaitTimeout = unsafe extern "C" fn(*mut c_void, u64, usize, u32, u32, u64) -> c_int;
@@ -242,7 +242,7 @@ fn lookup(name: &[u8]) -> usize {
 
 fn force_ulock() -> bool {
     unsafe {
-        let v = super::getenv(b"RELAX_FORCE_ULOCK\0".as_ptr() as *const c_char);
+        let v = super::getenv(b"MAKEPAD_RUN_FORCE_ULOCK\0".as_ptr() as *const c_char);
         !v.is_null() && *v == b'1' as c_char && *v.add(1) == 0
     }
 }

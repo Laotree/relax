@@ -2,7 +2,7 @@
 //! Refuse loads explicitly; never substitute the native oracle for runtime code.
 #![allow(dead_code)]
 
-const UNAVAILABLE: &str = "run-time modules require the Relax loader; run this fixture with makepad run";
+const UNAVAILABLE: &str = "run-time modules require makepad run; run this fixture with makepad run";
 
 #[derive(Clone, Copy)]
 pub struct Module { _private: () }

@@ -872,7 +872,7 @@ pub fn merge_stores(options: &relax_session::Options, f: &mut Func) -> bool {
         if replace.is_empty() {
             continue;
         }
-        if std::env::var("RELAX_MERGE_TRACE").is_ok() {
+        if std::env::var("MAKEPAD_RUN_MERGE_TRACE").is_ok() {
             for (_, i) in &replace {
                 eprintln!("merge_stores {}: b{} {:?}", f.name, bi, i);
             }
@@ -970,12 +970,12 @@ fn retarget(t: &mut Term, mut m: impl FnMut(u32) -> u32) {
 /// vreg each, so constant folding sees single definitions). Copy j's back edge enters copy j+1;
 /// the last copy's back edge enters the original loop with c restored (never taken: its compare
 /// folds to the exit). Exits from inside the body stay as they are. Run `simplify` after it.
-/// RELAX_NO_FULL_UNROLL=1 off. Returns whether anything changed.
+/// MAKEPAD_RUN_NO_FULL_UNROLL=1 off. Returns whether anything changed.
 pub fn unroll_const_loops(options: &relax_session::Options, f: &mut Func) -> bool {
     if !full_unroll_on(options) || f.blocks.len() < 2 {
         return false;
     }
-    let tr = std::env::var("RELAX_UNROLL_TRACE").map_or(false, |w| f.name.ends_with(w.as_str()));
+    let tr = std::env::var("MAKEPAD_RUN_UNROLL_TRACE").map_or(false, |w| f.name.ends_with(w.as_str()));
     let reach = crate::regalloc::reachable(f);
     let preds = crate::regalloc::preds_of(f, &reach);
     let loops = crate::regalloc::natural_loops(f, &reach, &preds, false);

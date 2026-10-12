@@ -293,7 +293,7 @@ impl<K: Hash + Eq, V: Clone> MemoMap<K, V> {
         v
     }
 
-    /// The kept-state scan (RELAX_ZONE_CHECK): `own` sees each allocation the map owns (tables,
+    /// The kept-state scan (MAKEPAD_RUN_ZONE_CHECK): `own` sees each allocation the map owns (tables,
     /// bucket arrays, nodes), `entry` each live entry's key and value. Quiescent callers only.
     pub fn scan(&self, mut own: impl FnMut(*const u8), mut entry: impl FnMut(&K, &V)) {
         let tables: Vec<*mut MemoTable<K, V>> = {
@@ -491,7 +491,7 @@ impl<T> AppendVec<T> {
     }
 
     /// Every allocation the vector itself owns (the chunk table, each chunk): the kept-state
-    /// scan (RELAX_ZONE_CHECK) asks the compiler arena whether any of them lies in it.
+    /// scan (MAKEPAD_RUN_ZONE_CHECK) asks the compiler arena whether any of them lies in it.
     pub fn alloc_ptrs(&self, mut f: impl FnMut(*const u8)) {
         f(self.chunks.as_ptr() as *const u8);
         for c in self.chunks.iter() {

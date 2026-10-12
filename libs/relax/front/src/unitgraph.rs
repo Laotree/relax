@@ -255,7 +255,7 @@ fn fnv(data: &[u8], mut h: u64) -> u64 {
     h
 }
 
-/// The triple the checked crate graph is read for (RELAX_CHECK_TARGET, else the machine).
+/// The triple the checked crate graph is read for (MAKEPAD_RUN_CHECK_TARGET, else the machine).
 fn target_triple(sess: &std::sync::Arc<crate::Session>) -> &'static str {
     crate::cfg::CfgSet::host(sess, &[]).triple()
 }
@@ -321,7 +321,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             let cenv = g.env[bs.krate].clone();
             let role = if noop::script(bs, raw) {
                 if sess.runtime.profile {
-                    eprintln!("relax-build-script: {} skipped (no effect under RELAX_BUILD_SCRIPT)", pname);
+                    eprintln!("makepad-run build-script: {} skipped (no effect under MAKEPAD_RUN_BUILD_SCRIPT)", pname);
                 }
                 ScriptRole::Answered(Vec::new())
             } else { script_role(&pname, &bs.features) };
@@ -503,7 +503,7 @@ fn self_exe() -> std::io::Result<std::path::PathBuf> {
 /// (stdout of the script, OUT_DIR). The script runs as a Relax program: this executable started
 /// again on the script's units (script_units) -- no rustc, no script binary; Relax re-running
 /// itself is the only process it starts. A script of a git run reads its package through the
-/// VFS (RELAX_VFS / RELAX_WORKSPACE for the child), and writes only OUT_DIR (on disk).
+/// VFS (MAKEPAD_RUN_VFS / MAKEPAD_RUN_WORKSPACE for the child), and writes only OUT_DIR (on disk).
 #[allow(clippy::too_many_arguments)]
 fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUnit], cenv: &[(String, String)], dir: &str, pname: &str, ver: &str, name: &str, target_dir: &str) -> (Result<String, String>, String) {
     if let Err(e) = crate::vfs::read(&bs.src_path) {
@@ -513,7 +513,7 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     if sess.runtime.profile {
         if let Some(rewrite) = &rewrite {
             for (dep, function) in &rewrite.calls {
-                eprintln!("relax-build-script: {} runs without {}::{}() (inert)", pname, dep, function);
+                eprintln!("makepad-run build-script: {} runs without {}::{}() (inert)", pname, dep, function);
             }
         }
     }
@@ -547,16 +547,16 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         Err(e) => return (Err(format!("this executable: {e}")), out_dir),
     };
     // nesting: a build-dependency's own script runs inside a script's run (depth 2); anything
-    // deeper is a loop (RELAX_SCRIPT_DEPTH counts the levels)
-    let depth: u32 = std::env::var("RELAX_SCRIPT_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(0) + 1;
+    // deeper is a loop (MAKEPAD_RUN_SCRIPT_DEPTH counts the levels)
+    let depth: u32 = std::env::var("MAKEPAD_RUN_SCRIPT_DEPTH").ok().and_then(|d| d.parse().ok()).unwrap_or(0) + 1;
     if depth > 2 {
         return (Err(format!("{}: build scripts nest {} deep (a script that runs itself again?); refused", bs.src_path, depth)), out_dir);
     }
     let mut cmd = std::process::Command::new(&exe);
-    cmd.args(["run", "--quiet", "--silent", "--relax-dir", target_dir, "--units", &units_path, "build-script-build"]);
+    cmd.args(["run", "--quiet", "--silent", "--run-dir", target_dir, "--units", &units_path, "build-script-build"]);
     cmd.env("OUT_DIR", &out_dir)
         // Build scripts may test this to skip work only rustc needs.
-        .env("RELAX_BUILD_SCRIPT", "1")
+        .env("MAKEPAD_RUN_BUILD_SCRIPT", "1")
         .env("TARGET", target_triple(sess))
         .env("HOST", host_triple(sess))
         .env("PROFILE", "release")
@@ -568,12 +568,12 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
         .env("CARGO_PKG_VERSION", ver)
         // cargo gives scripts RUSTC; theirs is Relax itself, answering `--version` (relax_as_rustc)
         .env("RUSTC", &exe)
-        .env("RELAX_AS_RUSTC", "1")
-        .env("RELAX_SCRIPT_DEPTH", depth.to_string())
-        .env_remove("RELAX_SELF_EXEC")
+        .env("MAKEPAD_RUN_AS_RUSTC", "1")
+        .env("MAKEPAD_RUN_SCRIPT_DEPTH", depth.to_string())
+        .env_remove("MAKEPAD_RUN_SELF_EXEC")
         // the script is compiled and run for the machine (cargo: build scripts are host
         // artifacts); the target it builds for reaches it only as TARGET / CARGO_CFG_TARGET_*
-        .env_remove("RELAX_CHECK_TARGET");
+        .env_remove("MAKEPAD_RUN_CHECK_TARGET");
     for (k, v) in crate::cfg::CfgSet::host(sess, &[]).build_script_env() {
         cmd.env(k, v);
     }
@@ -587,47 +587,47 @@ fn run_one(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, raw: &[RawUn
     // the package folder is the script's current folder (cargo runs scripts there); a virtual one
     // is handed over as the child's virtual workspace with the mount table
     if crate::vfs::is_virtual(dir) {
-        cmd.env("RELAX_WORKSPACE", dir).env("RELAX_VFS", crate::vfs::mounts_text());
+        cmd.env("MAKEPAD_RUN_WORKSPACE", dir).env("MAKEPAD_RUN_VFS", crate::vfs::mounts_text());
     } else {
         // a package on disk (a registry crate of a store run): its folder is the current folder,
         // not the run's virtual workspace (Relax's std resolves relative paths against
-        // RELAX_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
+        // MAKEPAD_RUN_WORKSPACE first: rustix's build.rs probed `src/backend/linux_raw/arch/x86_64.rs`
         // there, found nothing and chose its libc backend)
-        cmd.current_dir(dir).env_remove("RELAX_WORKSPACE");
+        cmd.current_dir(dir).env_remove("MAKEPAD_RUN_WORKSPACE");
     }
     // cargo's rerun rules: the previous output stands while the script's units, the environment
     // it was given and its `rerun-if-changed` / `rerun-if-env-changed` inputs are unchanged (a
     // script that names none: no file of its package changed)
     let mut env_key = format!("{:016x}", h);
     for (k, v) in cmd.get_envs() {
-        if k == "RELAX_VFS" {
+        if k == "MAKEPAD_RUN_VFS" {
             continue;
         }
         env_key.push_str(&format!("\n{}={}", k.to_string_lossy(), v.map(|v| v.to_string_lossy().into_owned()).unwrap_or_default()));
     }
     let build_dir = dir_of_path(&out_dir);
     let output_path = format!("{}/output", build_dir);
-    let key_path = format!("{}/relax-rerun", build_dir);
-    let env_path = format!("{}/relax-rerun-env", build_dir);
+    let key_path = format!("{}/makepad-run-rerun", build_dir);
+    let env_path = format!("{}/makepad-run-rerun-env", build_dir);
     let why = match (std::fs::read_to_string(&output_path), std::fs::read_to_string(&key_path)) {
         (Ok(old), Ok(key)) => {
             let now = rerun_key(&old, dir, &env_key).unwrap_or_default();
             if now == key {
-                if sess.runtime.profile { eprintln!("relax-build-script: {} cached", pname); }
+                if sess.runtime.profile { eprintln!("makepad-run build-script: {} cached", pname); }
                 return (Ok(old), out_dir);
             }
             rerun_reason(&key, &now, &std::fs::read_to_string(&env_path).unwrap_or_default(), &env_key)
         }
         _ => "no previous output".to_string(),
     };
-    // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with RELAX_PROFILE
-    if sess.runtime.profile { eprintln!("relax-build-script: {} runs: {}", pname, why); }
+    // why this script runs again, kept beside its output (relax-rerun-why: the last 20) and shown with MAKEPAD_RUN_PROFILE
+    if sess.runtime.profile { eprintln!("makepad-run build-script: {} runs: {}", pname, why); }
     note_rerun(&build_dir, &why);
     let _slot = script_slot();
     let started = std::time::Instant::now();
     let output = cmd.output();
     if sess.runtime.profile {
-        eprintln!("relax-build-script: {} executed {:.3} ms", pname, started.elapsed().as_secs_f64() * 1000.0);
+        eprintln!("makepad-run build-script: {} executed {:.3} ms", pname, started.elapsed().as_secs_f64() * 1000.0);
     }
     match output {
         Ok(o) if o.status.success() => {
@@ -696,7 +696,7 @@ fn rerun_reason(stored: &str, now: &str, stored_env: &str, env_key: &str) -> Str
 
 /// Appends `why` to <build dir>/relax-rerun-why, keeping the last 20 lines.
 fn note_rerun(build_dir: &str, why: &str) {
-    let path = format!("{}/relax-rerun-why", build_dir);
+    let path = format!("{}/makepad-run-rerun-why", build_dir);
     let mut lines: Vec<String> = std::fs::read_to_string(&path).unwrap_or_default().lines().map(str::to_string).collect();
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     lines.push(format!("{} pid {} {}", t, std::process::id(), why));

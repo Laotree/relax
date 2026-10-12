@@ -179,7 +179,7 @@ mod native {
                     drop(Box::from_raw(shared));
                     return None;
                 }
-                let queue = dispatch_queue_create(c"relax-watch".as_ptr(), std::ptr::null());
+                let queue = dispatch_queue_create(c"run-watch".as_ptr(), std::ptr::null());
                 let watch = Self { stream, queue, shared };
                 FSEventStreamSetDispatchQueue(stream, queue);
                 if FSEventStreamStart(stream) == 0 { return None; }

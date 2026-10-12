@@ -75,7 +75,7 @@ pub(super) struct ProofTreeCacheEntry {
     pub misses: std::sync::Arc<Vec<(u32, String)>>,
 }
 impl SolverCache {
-    /// memory report (RELAX_MEM_REPORT): exact bytes per solver structure
+    /// memory report (MAKEPAD_RUN_MEM_REPORT): exact bytes per solver structure
     pub(crate) fn mem_lines(&self) -> Vec<(String, u64)> {
         use std::mem::size_of;
         let mut out: Vec<(String, u64)> = Vec::new();

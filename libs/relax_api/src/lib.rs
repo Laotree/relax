@@ -12,7 +12,7 @@
 //!   handle -- rustc's size/align/drop (and the listed trait ops) cross, its fields never do.
 //!
 //! In a normal build the attribute leaves the item as it is. With the crate's `host-shims`
-//! feature (only the `relax` build enables it) it also emits, next to the item, an extern "C"
+//! feature (only the `makepad` loader build enables it) it also emits, next to the item, an extern "C"
 //! wrapper and one [`Entry`] in the `relax_api` link section; [`entries`] reads them all back.
 //! Nothing generated is checked in.
 

@@ -1,6 +1,6 @@
 // T12 (conform): pre-existing borrowck false positive, rustc accepts; found by N01 Gandalf audit
 // (round 52 OB, arch-n01-oB.REPORT.md). Known failure: not listed in run_live_regressions.sh;
-// `makepad check` with RELAX_BORROWCK=full (that script's settings) reports the errors named below,
+// `makepad check` with MAKEPAD_RUN_BORROWCK=full (that script's settings) reports the errors named below,
 // as does the pre-N01 tip (which does not check derived impl bodies, so it misses those). Do not
 // list it until conform fixes the cause.
 // Cause: a struct's inferred outlives predicates (rustc inferred_outlives_of: `K: 'a` from a

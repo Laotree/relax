@@ -620,8 +620,8 @@ fn x64_clobbers(options: &relax_session::Options, i: &Inst) -> u64 {
     }
 }
 
-/// BMI2 (shlx / shrx / sarx) on this CPU, unless RELAX_NO_BMI2: the JIT uses what the machine has.
-/// RELAX_CHECK_WINDOWS=1: every read of a spill window's register checks it against the value's
+/// BMI2 (shlx / shrx / sarx) on this CPU, unless MAKEPAD_RUN_NO_BMI2: the JIT uses what the machine has.
+/// MAKEPAD_RUN_CHECK_WINDOWS=1: every read of a spill window's register checks it against the value's
 /// slot and traps (ud2) when they differ -- finds a window whose register something clobbered.
 fn check_windows(options: &relax_session::Options) -> bool {
     options.check_windows
@@ -3352,7 +3352,7 @@ impl<'a> Gen<'a> {
             }
             Inst::VGather(d, base, idx) if !use_gather(options) => {
                 // per lane: pextrd / mov / pinsrd (faster than vpgatherdd for four lanes on the
-                // CPUs measured; RELAX_GATHER=1 selects the gather)
+                // CPUs measured; MAKEPAD_RUN_GATHER=1 selects the gather)
                 let rb = self.use_i(options, base, R11);
                 let xi = self.use_f(idx, XS2);
                 for l in 0..4u8 {
@@ -4217,7 +4217,7 @@ fn scalar_minmax(i: &Inst, a: VReg, b: VReg) -> Option<(bool, u8)> {
     }
 }
 
-/// Does this CPU (and the environment: RELAX_NO_AVX) allow VEX-encoded AVX instructions?
+/// Does this CPU (and the environment: MAKEPAD_RUN_NO_AVX) allow VEX-encoded AVX instructions?
 pub fn host_avx(options: &relax_session::Options) -> bool {
     options.cpu.avx
 }

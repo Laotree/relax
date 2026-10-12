@@ -21,7 +21,7 @@
 //! A compare the facts decide becomes a constant (`simplify` then folds its branch), and
 //! `d = (b + k) - b` becomes `k`. rustc's LLVM removes these checks the same way (correlated
 //! value propagation + instcombine); without it every masked index into a fixed array keeps its
-//! bounds check (deflate: four per hash-chain probe). RELAX_NO_RANGES=1 turns it off.
+//! bounds check (deflate: four per hash-chain probe). MAKEPAD_RUN_NO_RANGES=1 turns it off.
 use crate::regalloc::{for_defs, reachable};
 use crate::rir::*;
 /// Maps keyed by vreg numbers and block pairs: a multiply-rotate hash (SipHash's per-key cost
@@ -498,7 +498,7 @@ pub fn fold_ranges(options: &relax_session::Options, f: &mut Func) -> bool {
 
 fn iv_trace() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var("RELAX_IV_TRACE").is_ok())
+    *E.get_or_init(|| std::env::var("MAKEPAD_RUN_IV_TRACE").is_ok())
 }
 
 fn iv_off(options: &relax_session::Options) -> bool {

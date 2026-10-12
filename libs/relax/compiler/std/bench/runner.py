@@ -57,7 +57,7 @@ for name in names:
                 'target': {'kind': ['bin'], 'name': 'std_bench', 'src_path': str(source), 'edition': '2021'},
                 'mode': 'build', 'features': [], 'dependencies': []}]}))
             command = ['nice', '-n', '10', relax, 'run', '--quiet', '--units', str(units), 'std_bench']
-            env = dict(os.environ, RELAX_CACHE_DIR=str(Path(target) / 'relax' / name))
+            env = dict(os.environ, MAKEPAD_RUN_CACHE_DIR=str(Path(target) / 'relax' / name))
         else:
             command = ['nice', '-n', '10', binary, name]
             env = os.environ.copy()

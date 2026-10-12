@@ -73,7 +73,7 @@ static TOMBS: AtomicUsize = AtomicUsize::new(0);
 static TOMB: [AtomicU32; N] = [const { AtomicU32::new(0) }; N];
 /// Frees and reallocs that hit a tombstone (counted no-ops).
 static TOMB_FREES: AtomicUsize = AtomicUsize::new(0);
-/// 0 = not read, 1 = off, 2 = RELAX_ZONE_CHECK is set (a tombstone free aborts).
+/// 0 = not read, 1 = off, 2 = MAKEPAD_RUN_ZONE_CHECK is set (a tombstone free aborts).
 static CHECK: AtomicU8 = AtomicU8::new(0);
 
 /// Warm chunks: emptied small-class chunks kept committed for reuse (see the module doc).
@@ -660,7 +660,7 @@ impl Arena {
             if !*tried {
                 *tried = true;
                 self.base.store(
-                    unsafe { os::reserve(RESERVE, CHUNK, if self.dynamic { c"relax-domain" } else { LABEL }) },
+                    unsafe { os::reserve(RESERVE, CHUNK, if self.dynamic { c"makepad-run-domain" } else { LABEL }) },
                     Ordering::Release,
                 );
             }
@@ -1456,7 +1456,7 @@ pub fn tombstones() -> usize {
     TOMBS.load(Ordering::Relaxed)
 }
 
-/// Frees of tombstoned blocks no longer abort under RELAX_ZONE_CHECK (counted all the same).
+/// Frees of tombstoned blocks no longer abort under MAKEPAD_RUN_ZONE_CHECK (counted all the same).
 static TOMB_EXPECTED: AtomicBool = AtomicBool::new(false);
 
 pub fn tombstone_expected() {
@@ -1474,7 +1474,7 @@ fn check_on() -> bool {
                 extern "C" {
                     fn getenv(name: *const u8) -> *const u8;
                 }
-                !getenv(c"RELAX_ZONE_CHECK".as_ptr().cast()).is_null()
+                !getenv(c"MAKEPAD_RUN_ZONE_CHECK".as_ptr().cast()).is_null()
             };
             #[cfg(not(unix))]
             let on = false;
@@ -1484,7 +1484,7 @@ fn check_on() -> bool {
     }
 }
 
-/// A free or realloc of a block in a destroyed generation: counted, and with RELAX_ZONE_CHECK
+/// A free or realloc of a block in a destroyed generation: counted, and with MAKEPAD_RUN_ZONE_CHECK
 /// set an abort that names the address. Writes with `write(2)` and no allocation.
 #[cold]
 #[inline(never)]
@@ -1502,7 +1502,7 @@ pub fn tombstone_hit(p: *mut u8, what: &str) {
                 }
             }
         };
-        put(b"relax-zone: ");
+        put(b"makepad-run zone: ");
         put(what.as_bytes());
         put(b" of a block in the destroyed compiler generation ");
         let mut digits = [0u8; 20];

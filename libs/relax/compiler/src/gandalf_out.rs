@@ -16,7 +16,7 @@ impl Console {
                 let gate = ev.origin == Origin::Gate;
                 if !quiet && !gate {
                     if ev.origin == Origin::Background {
-                        eprintln!("makepad run: [t={:.0} ms] borrow check failed: {} at {}:{}: {}\n{}", crate::clock::ms_since_start(), ev.error.fn_path, ev.error.file, ev.error.line, ev.error.message, ev.error.render());
+                        eprintln!("makepad-run: [t={:.0} ms] borrow check failed: {} at {}:{}: {}\n{}", crate::clock::ms_since_start(), ev.error.fn_path, ev.error.file, ev.error.line, ev.error.message, ev.error.render());
                     } else { eprintln!("{}", ev.error.render()); }
                 }
                 if json && !gate { crate::diag::emit(&ev.error.to_diagnostic()); }

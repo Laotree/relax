@@ -62,7 +62,7 @@ pub struct Verdict {
     pub bodies: usize,
 }
 
-/// Mode from RELAX_BORROWCK: "off" disables the checker.
+/// Mode from MAKEPAD_RUN_BORROWCK: "off" disables the checker.
 pub fn enabled(options: &crate::options::Options) -> bool {
     options.borrowck != crate::options::Borrowck::Off
 }
@@ -143,7 +143,7 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
     for parent in &all {
         for child in &parent.closures { rty.closure_parents.borrow_mut().insert(*child, parent.closure_expr); }
     }
-    let dump = std::env::var("RELAX_BIR_DUMP").ok();
+    let dump = std::env::var("MAKEPAD_RUN_BIR_DUMP").ok();
     // closure types' skeletons: their captures and return types; their Copy-ness
     for bir in &all {
         if bir.closure_kind.is_some() {
@@ -263,7 +263,7 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
     v
 }
 
-/// RELAX_BORROWCK=moves: only the move / initialization checks (no regions).
+/// MAKEPAD_RUN_BORROWCK=moves: only the move / initialization checks (no regions).
 pub fn regions_enabled(options: &crate::options::Options) -> bool {
     options.borrowck != crate::options::Borrowck::Moves
 }
@@ -319,7 +319,7 @@ pub(super) fn empty() -> bir::Bir {
     }
 }
 
-/// Text form of a BIR (RELAX_BIR_DUMP=<name substring>).
+/// Text form of a BIR (MAKEPAD_RUN_BIR_DUMP=<name substring>).
 pub fn bir_dump(tx: &tyx::Tx, bir: &bir::Bir) -> String {
     let mut s = format!("bir {} ({} args)\n", bir.name, bir.n_args);
     for (i, l) in bir.locals.iter().enumerate() {
@@ -338,7 +338,7 @@ pub fn bir_dump(tx: &tyx::Tx, bir: &bir::Bir) -> String {
     s
 }
 
-/// `RELAX_BORROWCK_ALL=1 makepad check <pkg>`: type-check and borrow-check every fn with a body
+/// `MAKEPAD_RUN_BORROWCK_ALL=1 makepad check <pkg>`: type-check and borrow-check every fn with a body
 /// in every crate of the graph except Relax's std (generic ones polymorphically); prints the
 /// diagnostics and a summary. The makepad false-positive gate.
 pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
@@ -376,10 +376,10 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
         let body = match body {
             Ok(b) if b.errors.is_empty() => b,
             r => {
-                if std::env::var_os("RELAX_BORROWCK_TYFAIL").is_some() {
+                if std::env::var_os("MAKEPAD_RUN_BORROWCK_TYFAIL").is_some() {
                     match &r {
-                        Ok(b) => eprintln!("relax-borrowck: typeck failed polymorphically: {}: {}", prog.def_path(def), b.errors.first().map(|e| e.as_str()).unwrap_or("")),
-                        Err(_) => eprintln!("relax-borrowck: typeck panicked polymorphically: {}", prog.def_path(def)),
+                        Ok(b) => eprintln!("makepad-run borrowck: typeck failed polymorphically: {}: {}", prog.def_path(def), b.errors.first().map(|e| e.as_str()).unwrap_or("")),
+                        Err(_) => eprintln!("makepad-run borrowck: typeck panicked polymorphically: {}", prog.def_path(def)),
                     }
                 }
                 n_typeck_fail += 1;
@@ -402,11 +402,11 @@ pub fn check_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
         errors += v.errors.len();
     }
     if options.verbose {
-        eprintln!("relax-borrowck: {} owners ({} failed typeck polymorphically), {} bodies, {} errors; borrowck cpu {:.1} ms, total {:.1} ms", n_fns, n_typeck_fail, n_bodies, errors, bck_ns as f64 / 1e6, (crate::clock::cpu_ns() - t0) as f64 / 1e6);
+        eprintln!("makepad-run borrowck: {} owners ({} failed typeck polymorphically), {} bodies, {} errors; borrowck cpu {:.1} ms, total {:.1} ms", n_fns, n_typeck_fail, n_bodies, errors, bck_ns as f64 / 1e6, (crate::clock::cpu_ns() - t0) as f64 / 1e6);
         let ph: Vec<String> = nll::PHASE_NS.iter().map(|x| format!("{:.0}", x.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6)).collect();
-        eprintln!("relax-borrowck: nll phases ms (constraints, liveness, solve, loans, regions): {}", ph.join(" "));
+        eprintln!("makepad-run borrowck: nll phases ms (constraints, liveness, solve, loans, regions): {}", ph.join(" "));
         for (k, n) in &unchecked {
-            eprintln!("relax-borrowck: unchecked {:>6}  {}   e.g. {}", n, k, unchecked_ex.get(k).map_or("", |s| s.as_str()));
+            eprintln!("makepad-run borrowck: unchecked {:>6}  {}   e.g. {}", n, k, unchecked_ex.get(k).map_or("", |s| s.as_str()));
         }
     }
     finish_check(prog);
@@ -423,7 +423,7 @@ pub fn note_verdict(v: &Verdict) {
 }
 
 /// End of `makepad check`: the "accepted only with field views" report (what rustc would reject)
-/// and, with RELAX_FV_EXPORT=<dir>, the rewritten sources for rustc.
+/// and, with MAKEPAD_RUN_FV_EXPORT=<dir>, the rewritten sources for rustc.
 pub fn finish_check(prog: &Program) {
     let fvo = std::mem::take(&mut *FV_ONLY.lock().unwrap_or_else(|e| e.into_inner()));
     let recs = std::mem::take(&mut *FV_RECORDS.lock().unwrap_or_else(|e| e.into_inner()));
@@ -433,7 +433,7 @@ pub fn finish_check(prog: &Program) {
             eprintln!("{}", d.render());
         }
     }
-    if let Ok(dir) = std::env::var("RELAX_FV_EXPORT") {
+    if let Ok(dir) = std::env::var("MAKEPAD_RUN_FV_EXPORT") {
         for r in export::rewrite(prog, &recs) {
             let path = &prog.file_paths[r.file as usize];
             let rel = path.trim_start_matches('/');
@@ -443,12 +443,12 @@ pub fn finish_check(prog: &Program) {
             }
             let _ = std::fs::write(&out, &r.new_src);
             for a in &r.applied {
-                eprintln!("relax-fv-export: {}", a);
+                eprintln!("makepad-run fv-export: {}", a);
             }
             for s in &r.skipped {
-                eprintln!("relax-fv-export: skipped {}", s);
+                eprintln!("makepad-run fv-export: skipped {}", s);
             }
-            eprintln!("relax-fv-export: wrote {}", out.display());
+            eprintln!("makepad-run fv-export: wrote {}", out.display());
         }
     }
 }

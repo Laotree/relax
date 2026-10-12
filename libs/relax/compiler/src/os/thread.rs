@@ -4,7 +4,7 @@
 //! - `current()`: the calling thread's id (nonzero; pthread_t on unix).
 //! - `name(t)`: a thread's name for diagnostics.
 //! - `stack_lo()`: lowest usable address of the calling thread's stack (0: unknown).
-//! - `kick(t)`: interrupts thread `t` for the hang watchdog / RELAX_COMPILE_WATCH: the fault
+//! - `kick(t)`: interrupts thread `t` for the hang watchdog / MAKEPAD_RUN_COMPILE_WATCH: the fault
 //!   layer's handler then runs on that thread (jit::on_watchdog decides what it does).
 //! - `lower_priority(utility)`: background compile workers below the program's threads.
 //! - `interactive()`: the sampler thread asks not to have its timers coalesced.
@@ -192,7 +192,7 @@ mod imp {
         }
     }
 
-    /// The watchdog / RELAX_COMPILE_WATCH interrupt: the thread is suspended and its context read
+    /// The watchdog / MAKEPAD_RUN_COMPILE_WATCH interrupt: the thread is suspended and its context read
     /// from this (the watching) thread; the fault layer decides (os::fault::interrupt).
     pub fn kick(t: u64) {
         crate::os::fault::interrupt(t);

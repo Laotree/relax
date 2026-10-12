@@ -21,7 +21,7 @@ pub struct CollectedCache {
     pub(super) files: usize,
 }
 
-fn enabled() -> bool { std::env::var("RELAX_COLLECTED").map_or(true, |v| v != "0") }
+fn enabled() -> bool { std::env::var("MAKEPAD_RUN_COLLECTED").map_or(true, |v| v != "0") }
 fn key(identity: u128) -> u128 {
     let mut h = Sip128::new();
     h.str("collected-graph-v1"); h.u128(front_graph_key(identity)); h.finish128()
@@ -88,7 +88,7 @@ impl FrontImages {
         let mut why = "disabled";
         let started = std::time::Instant::now();
         let phase = |name: &str| if crate::preload::trace() {
-            eprintln!("relax-collected: {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
+            eprintln!("makepad-run collected: {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
         };
         let restored = std::thread::scope(|scope| (|| {
         if !enabled() || crate::syms::perturb(&session.options) != 0 { return None; }
@@ -111,7 +111,7 @@ impl FrontImages {
                     *self.pending_plan.lock().unwrap() = Some((GraphRecipe::new(pre).identity, pending.clone()));
                     let worker = pending.clone();
                     let in_world = crate::macro_reg::in_world();
-                    plan_task = Some(std::thread::Builder::new().name("relax-demand".into()).spawn_scoped(scope, move || {
+                    plan_task = Some(std::thread::Builder::new().name("run-demand".into()).spawn_scoped(scope, move || {
                         crate::macro_reg::set_in_world(in_world);
                         worker.complete();
                     }).ok()?);
@@ -197,11 +197,11 @@ impl FrontImages {
             lap(2, &mut at);
             Some(pf)
             })();
-            if restored.is_none() && crate::preload::trace() { eprintln!("relax-collected: file not restored: {}", meta.path); }
+            if restored.is_none() && crate::preload::trace() { eprintln!("makepad-run collected: file not restored: {}", meta.path); }
             restored
         })?;
         if crate::preload::trace() {
-            eprintln!("relax-collected: files lookup {:.1}, restore {:.1}, parts {:.1} ms",
+            eprintln!("makepad-run collected: files lookup {:.1}, restore {:.1}, parts {:.1} ms",
                 file_times[0].as_secs_f64() * 1e3, file_times[1].as_secs_f64() * 1e3, file_times[2].as_secs_f64() * 1e3);
         }
         phase("Program");
@@ -226,7 +226,7 @@ impl FrontImages {
         if prefix != pre.len() {
             let first = prog.retain_collected_prefix(prefix)?;
             tcx.retain_collected_prefix(first);
-            if session.options.verbose { eprintln!("relax-collected: retained {} crates; rebuilding {} changed/dependent crates", prefix, pre.len() - prefix); }
+            if session.options.verbose { eprintln!("makepad-run collected: retained {} crates; rebuilding {} changed/dependent crates", prefix, pre.len() - prefix); }
             // the crates loaded after them find these as their dependencies (full_deps)
             *self.retained.lock().unwrap() = graph.crates[..prefix].iter().map(|((name, _), fp)| (name.clone(), *fp)).collect();
         }
@@ -246,12 +246,12 @@ impl FrontImages {
         drop(cert);
         self.end_load();
         if session.options.verbose {
-            eprintln!("relax-collected: restored {} crates, {} definitions, {} types", prog.crates.len(), prog.defs.len(), tcx.tys.len());
+            eprintln!("makepad-run collected: restored {} crates, {} definitions, {} types", prog.crates.len(), prog.defs.len(), tcx.tys.len());
         }
         Some((prog, tcx, cache))
         })());
         if restored.is_none() && (crate::preload::trace() || session.runtime.profile) {
-            eprintln!("relax-collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
+            eprintln!("makepad-run collected: not restored: {}; demand plan retained={}", why, self.pending_plan.lock().unwrap().is_some());
         }
         restored
     }
@@ -317,10 +317,10 @@ impl Cache {
         self.collected_boot = self.capture_collected_boot(prog, tcx, &|| false, &mut why);
         if crate::preload::trace() {
             match &self.collected_boot {
-                Some(boot) => eprintln!("relax-collected: boot snapshot {} crates, {} definitions, {} types, {} files, {} bytes in {:.1} ms",
+                Some(boot) => eprintln!("makepad-run collected: boot snapshot {} crates, {} definitions, {} types, {} files, {} bytes in {:.1} ms",
                     boot.recipe.crates.len(), prog.defs.len(), tcx.tys.len(), boot.files.len(),
                     boot.program.len() + boot.types.len() + boot.definitions.len(), started.elapsed().as_secs_f64() * 1e3),
-                None => eprintln!("relax-collected: boot snapshot unavailable: {}", why),
+                None => eprintln!("makepad-run collected: boot snapshot unavailable: {}", why),
             }
         }
     }
@@ -469,7 +469,7 @@ impl Cache {
         })();
         recorded.unwrap_or_else(|| {
             if stop() { return CollectedRecord::Yielded; }
-            if crate::preload::trace() { eprintln!("relax-collected: swap not recorded: {why}"); }
+            if crate::preload::trace() { eprintln!("makepad-run collected: swap not recorded: {why}"); }
             CollectedRecord::Failed
         })
     }
@@ -511,7 +511,7 @@ impl Cache {
             None if yielded || stop() => CollectedRecord::Yielded,
             None => {
                 if crate::preload::trace() {
-                    eprintln!("relax-collected: not recorded: {} (errors {})", why, prog.errors.len());
+                    eprintln!("makepad-run collected: not recorded: {} (errors {})", why, prog.errors.len());
                 }
                 CollectedRecord::Failed
             }
@@ -528,10 +528,10 @@ impl Cache {
         let written = CollectedWritten { dest: dest.clone(), key, len, sum };
         if Store::open(&dest).is_some_and(|s| s.matches_sum(key, KIND_COLLECTED, len, sum)) { return Some(written); }
         if crate::store::append(&dest, vec![CollectedEntry { key, payload: &payload }], true).is_err() {
-            if crate::preload::trace() { eprintln!("relax-collected: not recorded: write"); }
+            if crate::preload::trace() { eprintln!("makepad-run collected: not recorded: write"); }
             return None;
         }
-        if let Some(n) = report { eprintln!("relax-collected: recorded {} crates", n); }
+        if let Some(n) = report { eprintln!("makepad-run collected: recorded {} crates", n); }
         Some(written)
     }
 

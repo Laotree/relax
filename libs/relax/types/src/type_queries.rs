@@ -144,7 +144,7 @@ pub(crate) const DECLARATIONS: QueryId = QueryId { kind: 0, key: ALL_CRATES };
 const ALL_CRATES: u32 = u32::MAX;
 const FILE_BODIES: u16 = 21;
 
-/// Memory report (RELAX_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
+/// Memory report (MAKEPAD_RUN_MEM_REPORT): per typeck owner (first read ms, last read ms, reads,
 /// reads more than 2 s after the first) -- who still reads a Body after its owner is lowered.
 static TYPECK_READS: relax_session::sync::Mutex<Option<crate::fxhash::HashMap<u32, (u64, u64, u32, u32)>>> = relax_session::sync::Mutex::new(None);
 static TYPECK_READS_T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -159,7 +159,7 @@ fn note_typeck_read(def: DefId) {
 }
 
 impl QueryCx {
-    /// memory report (RELAX_MEM_REPORT): the solver cache and the bound-vars tables
+    /// memory report (MAKEPAD_RUN_MEM_REPORT): the solver cache and the bound-vars tables
     pub fn mem_lines(&self, tys: &crate::types::Types) -> Vec<(String, u64)> {
         let mut out = Vec::new();
         let mut p = |name: &str, (n, b): (usize, usize)| out.push((format!("qt {} ({})", name, n), b as u64));
@@ -254,16 +254,16 @@ impl QueryCx {
         if keep_solver {
             let before = solver.cached_len();
             solver.remove_misses();
-            if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept={}", before - solver.cached_len(), solver.cached_len()); }
+            if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept={}", before - solver.cached_len(), solver.cached_len()); }
             return;
         }
         let retired = std::mem::take(solver);
-        if std::env::var_os("RELAX_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept=0", retired.cached_len()); }
+        if std::env::var_os("MAKEPAD_RUN_INVALIDATION_TRACE").is_some() { eprintln!("invalidation-trace: solver dropped={} kept=0", retired.cached_len()); }
         // Freeing a session's worth of solver entries took ~0.4 s of every declaration edit
         // (lead decision 52 R1); nothing reads the retired cache, so it is freed off the
         // edit's critical path. (rustc starts each incremental session with an empty cache.)
         if retired.len() > 4096 {
-            let _ = std::thread::Builder::new().name("relax-solver-free".into()).spawn(move || drop(retired));
+            let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
         }
     }
 
@@ -282,7 +282,7 @@ impl QueryCx {
         values += self.codegen_select.retire(&|_, _| false);
         let retired = std::mem::take(&mut self.solver);
         let entries = retired.cached_len();
-        let _ = std::thread::Builder::new().name("relax-solver-free".into()).spawn(move || drop(retired));
+        let _ = std::thread::Builder::new().name("run-solver-free".into()).spawn(move || drop(retired));
         (values, entries)
     }
 

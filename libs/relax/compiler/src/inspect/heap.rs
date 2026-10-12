@@ -705,7 +705,7 @@ fn start(host: bool, rate: u64) -> Result<(), &'static str> {
     #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))]
     {
         if REAL[0].load(Relaxed) == 0 {
-            return Err("the program has not called the allocator through Relax yet");
+            return Err("the program has not called the allocator through makepad run yet");
         }
         PROGRAM.on.store(false, Release);
         PROGRAM.tables.store(new_tables(rate), Release);
@@ -827,7 +827,7 @@ fn tag_name(t: &Tables, id: usize) -> &'static str {
 pub fn cmd_heap(req: &Req, out: &mut Out) {
     let host = req.get("host") == Some("1");
     let tr = if host { &HOST } else { &PROGRAM };
-    let what = if host { "Relax's own heap (compiler + compiled-in crates)" } else { "program heap" };
+    let what = if host { "makepad run's own heap (compiler + compiled-in crates)" } else { "program heap" };
     let pre = if host { "R" } else { "H" };
     match req.pos.first().map(String::as_str).unwrap_or("status") {
         "start" => {

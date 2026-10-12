@@ -220,7 +220,7 @@ pub fn input_stamp(path: &str, hash: u128, now_ns: u64) -> Option<crate::vfs::Fi
 }
 pub fn cmd_lex(args: &[String]) -> i32 {
     let Some(path) = args.first() else {
-        eprintln!("usage: makepad relax-lex <file>");
+        eprintln!("usage: makepad lex <file>");
         return 2;
     };
     let src = match crate::vfs::read(path) {

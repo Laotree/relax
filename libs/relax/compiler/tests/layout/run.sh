@@ -9,7 +9,7 @@ mkdir -p "$T/u"
 cat > "$T/u/units.json" <<J
 {"version":1,"roots":[0],"units":[{"pkg_id":"path+file://$T#layout_diff@0.0.0","target":{"kind":["bin"],"name":"layout_diff","src_path":"$H/layout_diff.rs","edition":"2021"},"mode":"build","features":[],"dependencies":[]}]}
 J
-RELAX_STD=$H/../../std RELAX_CACHE_DIR=$T/tgt "$1" run --quiet --units "$T/u/units.json" layout_diff > "$T/relax.out" 2>"$T/relax.err"
+MAKEPAD_RUN_STD=$H/../../std MAKEPAD_RUN_CACHE_DIR=$T/tgt "$1" run --quiet --units "$T/u/units.json" layout_diff > "$T/relax.out" 2>"$T/relax.err"
 if diff "$T/real.out" "$T/relax.out" > "$T/diff"; then
   echo "layout_diff: $(wc -l < "$T/real.out" | tr -d ' ') lines equal"
 else

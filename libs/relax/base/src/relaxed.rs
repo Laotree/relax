@@ -2,9 +2,9 @@
 //! notes an accepted relaxation leaves, and the write-back (`makepad fix --to-strict`) that turns
 //! the source into the plain Rust rustc accepts.
 //!
-//! Strict is the default. A crate opts in with `[package.metadata.relax] relaxed = true` (every
+//! Strict is the default. A crate opts in with `[package.metadata.makepad-run] relaxed = true` (every
 //! shipped feature) or `relaxed = ["mut", "imports"]`, minus `relaxed-deny = [..]`; the session
-//! override `RELAX_RELAXED=all|none|<list>` (also `makepad run/check --relaxed[=<list>]`) replaces
+//! override `MAKEPAD_RUN_RELAXED=all|none|<list>` (also `makepad run/check --relaxed[=<list>]`) replaces
 //! every crate's setting. Each relaxation only accepts programs strict rejects; each accepted site
 //! is recorded with the rustc error it replaces and, for write-back features, the edit.
 
@@ -40,7 +40,7 @@ pub fn finish_check() {
     if STRICT_REPORT.load(Ordering::Relaxed) {
         print_report(&notes);
     } else if !notes.is_empty() {
-        eprintln!("relax-relaxed: {} site(s) accepted only in relaxed mode (makepad check --strict-report lists them)", notes.len());
+        eprintln!("makepad-run relaxed: {} site(s) accepted only in relaxed mode (makepad check --strict-report lists them)", notes.len());
     }
     if FIX.load(Ordering::Relaxed) {
         match apply_fixes(&notes) {
@@ -58,7 +58,7 @@ fn parse_list(v: &str) -> Vec<String> {
 }
 
 /// The relaxation features crate `root` (its root source file) has on: the session override if
-/// any, else its manifest's `[package.metadata.relax]`.
+/// any, else its manifest's `[package.metadata.makepad-run]`.
 pub static FEATURES_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub fn crate_features(options: &crate::options::Options, root: &str) -> Vec<String> {
@@ -83,7 +83,7 @@ fn crate_features_t(options: &crate::options::Options, root: &str) -> Vec<String
     Vec::new()
 }
 
-/// `[package.metadata.relax]`: `relaxed = true | [..]`, `relaxed-deny = [..]`.
+/// `[package.metadata.makepad-run]`: `relaxed = true | [..]`, `relaxed-deny = [..]`.
 fn manifest_features(toml: &str) -> Vec<String> {
     let mut in_sec = false;
     let mut on: Vec<String> = Vec::new();
@@ -91,7 +91,7 @@ fn manifest_features(toml: &str) -> Vec<String> {
     for line in toml.lines() {
         let l = line.trim();
         if l.starts_with('[') {
-            in_sec = l.trim_start_matches('[').trim_end_matches(']').trim() == "package.metadata.relax";
+            in_sec = l.trim_start_matches('[').trim_end_matches(']').trim() == "package.metadata.makepad-run";
             continue;
         }
         if !in_sec {
@@ -142,7 +142,7 @@ pub fn print_report(notes: &[Note]) {
         }
     }
     let t: Vec<String> = totals.iter().map(|(f, c)| format!("{} {}", f, c)).collect();
-    eprintln!("relax-strict-report: {} site(s) rustc rejects{}{}", v.len(), if t.is_empty() { "" } else { ": " }, t.join(", "));
+    eprintln!("makepad-run strict-report: {} site(s) rustc rejects{}{}", v.len(), if t.is_empty() { "" } else { ": " }, t.join(", "));
 }
 
 /// `makepad fix --to-strict`: applies the write-back edits (each once, from the end of each file
@@ -170,7 +170,7 @@ pub fn apply_fixes(notes: &[Note]) -> std::io::Result<(usize, usize)> {
             src.splice(p..p, text.bytes());
             edits += 1;
         }
-        let tmp = format!("{}.relax-fix", f);
+        let tmp = format!("{}.makepad-run-fix", f);
         std::fs::write(&tmp, &src)?;
         std::fs::rename(&tmp, &f)?;
         files += 1;

@@ -8,7 +8,7 @@
 //! Panic parking: a panic in JIT code on a program thread waits at the panic point (its stack
 //! intact for `stacks`) while a watcher is attached or under `--agent`, until a client resumes it
 //! or the wait times out; then it unwinds as usual. With nobody watching, the first panic at a site
-//! parks briefly (RELAX_PANIC_PARK seconds, default 2) and says how to attach.
+//! parks briefly (MAKEPAD_RUN_PANIC_PARK seconds, default 2) and says how to attach.
 
 use super::{json_str, now_ms, Out, Req};
 use std::collections::VecDeque;
@@ -83,7 +83,7 @@ fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::
         fields
     );
     if super::AGENT.load(Relaxed) {
-        eprintln!("relax-event: {}", json);
+        eprintln!("makepad-run event: {}", json);
     }
     if let Some(w) = super::WATCH.get() {
         crate::zone_alloc::kept_with(|| w.emit(&json));
@@ -120,7 +120,7 @@ pub fn remote_watcher_closed() {
 
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
-    RELAX_RETRY_ON.store(watched() || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
+    MAKEPAD_RUN_RETRY_ON.store(watched() || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -221,7 +221,7 @@ struct Parked {
 
 /// boundaries may be set (makepad checks it through `relax_retry_on`): on while watched
 #[no_mangle]
-pub static RELAX_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static MAKEPAD_RUN_RETRY_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 thread_local! {
     /// retry boundaries open on this thread (their unit names, innermost last)
@@ -256,7 +256,7 @@ static PANIC_IDS: AtomicU64 = AtomicU64::new(0);
 static SITES_SEEN: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 
 fn park_secs_unwatched() -> u64 {
-    std::env::var("RELAX_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
+    std::env::var("MAKEPAD_RUN_PANIC_PARK").ok().and_then(|v| v.parse().ok()).unwrap_or(2)
 }
 
 /// A panic is about to unwind on this (program) thread: park it if someone may want to look
@@ -467,9 +467,9 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
 pub fn start() {
     retry_update();
     { let _k = crate::zone_alloc::kept();
-    let _ = std::thread::Builder::new().name("relax-inspect-watch".into()).spawn(|| {
+    let _ = std::thread::Builder::new().name("run-inspect-watch".into()).spawn(|| {
         super::heap::exclude_this_thread();
-        let hang_ms: u64 = std::env::var("RELAX_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        let hang_ms: u64 = std::env::var("MAKEPAD_RUN_INSPECT_HANG_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
         let mut last_cycle: Vec<u64> = Vec::new();
         let mut base_rss = 0u64;
         let mut tick = 0u64;

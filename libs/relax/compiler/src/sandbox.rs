@@ -300,7 +300,7 @@ pub fn maybe_recycle(up: *mut Unit) {
     unsafe impl Send for P {}
     let p = P(up);
     std::thread::Builder::new()
-        .name("relax-sandbox-recycle".to_string())
+        .name("run-sandbox-recycle".to_string())
         .spawn(move || {
             let runtime = &session.runtime;
             let p = p;
@@ -1546,11 +1546,11 @@ pub unsafe fn transform(up: *mut Unit, f: &mut Func, twin_id: u32) -> Result<(),
     with_sb(|s| s.refs.insert(twin_id, refs));
     f.verify().map_err(|e| format!("{}: sandbox transform made invalid RIR: {}", f.name, e))?;
     // the masks the transform added: common ones merged, loop-invariant ones hoisted. Only
-    // under O1 alone (RELAX_O3=0, O2 pipeline): with O3 on, O1 keeps
+    // under O1 alone (MAKEPAD_RUN_O3=0, O2 pipeline): with O3 on, O1 keeps
     // registers unoptimised and the hoisted masks cost more than they save (mini, particle
     // kernel: +25% with the clean-up, +0.5% without). Hot twins retain this confined RIR
     // for O3, whose full pipeline and register allocation perform the clean-up there.
-    // RELAX_SANDBOX_OPT=0/1 forces the O1 clean-up.
+    // MAKEPAD_RUN_SANDBOX_OPT=0/1 forces the O1 clean-up.
     let opt = options.sandbox_opt.unwrap_or(!jit::TIER1_ENABLED.load(std::sync::atomic::Ordering::Relaxed));
     if opt {
         crate::opt::simplify(options, f, None, true, true);
@@ -1663,8 +1663,8 @@ pub unsafe fn twin_rir(up: *mut Unit, id: u32, base: u32) -> Result<Func, String
     jit::build_rir(up, base)?;
     let mut f = jit::sandbox_source_rir(up, base)?;
     transform(up, &mut f, id)?;
-    // RELAX_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
-    if let Ok(pat) = std::env::var("RELAX_SANDBOX_DUMP") {
+    // MAKEPAD_RUN_SANDBOX_DUMP=<substring>: the transformed RIR of matching twins
+    if let Ok(pat) = std::env::var("MAKEPAD_RUN_SANDBOX_DUMP") {
         if f.name.contains(&pat) {
             eprintln!("sandbox twin {} ({} insts):\n{}", f.name, crate::opt::inst_count(&f), f.dump());
         }

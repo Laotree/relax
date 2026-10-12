@@ -973,7 +973,7 @@ impl<'a> Parser<'a> {
                     crate::builtins::Expansion::lexed(format!("compile_error!({:?}){}", format!("`{}!`: {}", def.name, m), semi)).map_err(|m| PErr { pos: call_lo, msg: m })?
                 }
             };
-            // RELAX_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
+            // MAKEPAD_RUN_TRACE=expand:<macro name> prints expansions (debugger-free macro debugging)
             if trace {
                 eprintln!("expand {}! => {}", def.name, x.text);
             }
@@ -4324,22 +4324,22 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
     Ok((pf, used))
 }
 
-/// RELAX_LAZY_STATS=1 (measurement): per fn body parsed, whether a lazy parse could skip it;
+/// MAKEPAD_RUN_LAZY_STATS=1 (measurement): per fn body parsed, whether a lazy parse could skip it;
 /// [n, arena bytes, nested bytes] for skippable bodies, then for the others
 pub static LAZY_STATS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
-/// RELAX_LAZY_STATS: the macros that kept bodies eager (`other macro`), by name
+/// MAKEPAD_RUN_LAZY_STATS: the macros that kept bodies eager (`other macro`), by name
 pub static LAZY_MACROS: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
-/// RELAX_LAZY_STATS: what made a file's skipped bodies parse (type-check origin, thread)
+/// MAKEPAD_RUN_LAZY_STATS: what made a file's skipped bodies parse (type-check origin, thread)
 pub static LAZY_WHY_PARSED: relax_session::sync::Mutex<std::collections::BTreeMap<String, u64>> = relax_session::sync::Mutex::new(std::collections::BTreeMap::new());
 /// why a body is parsed at load (Parser::body_outline)
 pub const LAZY_WHY: [&str; 8] = ["skippable", "macro output", "item inside", "macro_rules call", "array length", "fragment", "other macro", "no macro scope"];
 
 fn lazy_stats_on() -> bool {
     static E: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *E.get_or_init(|| std::env::var_os("RELAX_LAZY_STATS").is_some())
+    *E.get_or_init(|| std::env::var_os("MAKEPAD_RUN_LAZY_STATS").is_some())
 }
 
-/// RELAX_LAZY_BODIES (default on for `makepad run`; 0: off): fn bodies a later parse can do
+/// MAKEPAD_RUN_LAZY_BODIES (default on for `makepad run`; 0: off): fn bodies a later parse can do
 /// alone are skipped at load and parsed on the first need (ParsedFile::part). Set by the run
 /// driver before loading.
 pub static LAZY_AUTO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -4428,7 +4428,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
     if !p.ast.items.is_empty() {
         // body_outline let an item through: every body of the file fails loudly instead of
         // compiling against an item list that misses it
-        let msg = format!("{}: a lazily parsed fn body defined an item (relax bug; RELAX_LAZY_BODIES=0 works around it)", ctx.path);
+        let msg = format!("{}: a lazily parsed fn body defined an item (makepad run bug; MAKEPAD_RUN_LAZY_BODIES=0 works around it)", ctx.path);
         for b in bodies.iter_mut() {
             b.1 = Err(msg.clone());
         }
@@ -4462,7 +4462,7 @@ pub fn parse_part(pf: &ParsedFile, cfg: &crate::cfg::CfgSet) -> (FilePart, Ast) 
         next: Default::default(), ext: ext.into(), toks: toks.into(), exp_map, tok_origin, token_origins, bodies: PartBodies::Parsed(bodies), image: None }, ast)
 }
 
-/// RELAX_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.
+/// MAKEPAD_RUN_LAZY_MACRO_OUTPUT=0: fn bodies in macro output (derives) stay eager.
 
 
 #[cfg(test)]

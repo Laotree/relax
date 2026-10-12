@@ -9,10 +9,10 @@ min..max), the ratio to the rustc run of the same round (median of per-round rat
 time-to-steady, Relax's O3 coverage line, checksums equal across all runs. With more than one name a final
 A/B table gives new/base per workload (median of per-round ratios, spread) and the geomean of the medians.
 Env: WARM=1 (O3/code disk cache on, one dir per name, one untimed fill run per workload and name before the timed rounds; the O3 column then shows hot / installed / from the disk cache), ROUNDS (default 4), RW_MS (per-process iteration budget ms, default 4000), WORKLOADS ("a b": only those),
-RELAX_STD_<NAME> (that name's own std tree, e.g. its compiler tree's std; a Relax change that touches std must be measured with its own std), NATIVE (prebuilt rustc binary; else built here with cargo --release into <target dir>/rustc), RELAX_STD
+MAKEPAD_RUN_STD_<NAME> (that name's own std tree, e.g. its compiler tree's std; a Relax change that touches std must be measured with its own std), NATIVE (prebuilt rustc binary; else built here with cargo --release into <target dir>/rustc), MAKEPAD_RUN_STD
 (default ../std), RUN_PREFIX (default "nice -n 10", "none" on Windows), RW_ROOT (the tree holding the inputs).
 O3PROF=1 records an untimed profile per name/workload in <target>/o3-profiles, then replays it.
-RELAX_ENV_<NAME> supplies shell-quoted KEY=value overrides for that name.
+MAKEPAD_RUN_ENV_<NAME> supplies shell-quoted KEY=value overrides for that name.
 Timing belongs on a quiet machine; the spreads show how quiet it was."""
 import os, re, subprocess, sys, shlex, time, statistics
 from pathlib import Path
@@ -37,7 +37,7 @@ native = os.environ.get("NATIVE")
 if not native:
     subprocess.run(prefix + ["cargo", "build", "--release", "--offline", "-q", "-j", "8"], cwd=here, env=env, check=True)
     native = os.path.join(target, "rustc/release/relax-rwbench" + exe)
-std = os.environ.get("RELAX_STD", os.path.join(here, "../std"))
+std = os.environ.get("MAKEPAD_RUN_STD", os.path.join(here, "../std"))
 base = dict(os.environ, RW_MS=os.environ.get("RW_MS", "4000"))
 LINE = r"^\| (\w+) steady_ms=([\d.]+) tts_main_ms=([\d.]+) tts_proc_ms=([\d.]+) iters=(\d+) first_ms=([\d.]+) (\d+)$"
 
@@ -50,9 +50,9 @@ def one(cmd, e):
     m = re.search(LINE, out.stdout, re.M)
     if out.returncode != 0 or not m:
         return None, ("exit %d: " % out.returncode) + (out.stdout + out.stderr)[-300:].replace("\n", " ").replace("|", "/")
-    t1 = re.search(r"makepad run: O3: (\d+) hot, (\d+) installed.*?(\d+) from the disk cache", out.stderr, re.M)
+    t1 = re.search(r"makepad-run: O3: (\d+) hot, (\d+) installed.*?(\d+) from the disk cache", out.stderr, re.M)
     replay = "-"
-    profile = e.get("RELAX_O3_PROFILE")
+    profile = e.get("MAKEPAD_RUN_O3_PROFILE")
     if profile and os.path.isfile(profile + ".replay"):
         replay = Path(profile + ".replay").read_text().splitlines()[0]
     return dict(replay=replay, steady=float(m.group(2)), tts=float(m.group(4)), sum=m.group(7), tier1="%s hot / %s inst / %s cache" % t1.groups() if t1 else "-"), None
@@ -71,14 +71,14 @@ if profiled:
 
 def relax_env(n):
     suffix = n.upper().replace("-", "_")
-    nstd = os.environ.get("RELAX_STD_" + suffix, std)
-    e = dict(base, RELAX_CACHE="0", RELAX_STD=nstd, RELAX_CACHE_DIR=os.path.join(target, "relax-" + n))
+    nstd = os.environ.get("MAKEPAD_RUN_STD_" + suffix, std)
+    e = dict(base, MAKEPAD_RUN_CACHE="0", MAKEPAD_RUN_STD=nstd, MAKEPAD_RUN_CACHE_DIR=os.path.join(target, "relax-" + n))
     if warm:
-        e.update(RELAX_CACHE="on")
-    for item in shlex.split(os.environ.get("RELAX_ENV_" + suffix, "")):
+        e.update(MAKEPAD_RUN_CACHE="on")
+    for item in shlex.split(os.environ.get("MAKEPAD_RUN_ENV_" + suffix, "")):
         key, sep, value = item.partition("=")
         if not sep or not key:
-            raise ValueError("RELAX_ENV_" + suffix + " requires KEY=value entries")
+            raise ValueError("MAKEPAD_RUN_ENV_" + suffix + " requires KEY=value entries")
         e[key] = value
     return e
 def prepare(n, p, w):
@@ -86,7 +86,7 @@ def prepare(n, p, w):
     cmd = prefix + [p, "run", "--quiet", "relax-rwbench", "--", w]
     if profiled:
         profile = profile_dir / (n + "-" + w + ".t1")
-        renv["RELAX_O3_PROFILE"] = str(profile)
+        renv["MAKEPAD_RUN_O3_PROFILE"] = str(profile)
         if (w, n) not in recorded:
             # A stale profile (even under the same name) may belong to another binary.
             profile.unlink(missing_ok=True)
@@ -119,7 +119,7 @@ for r in range(rounds):
         for n, p in order:
             renv = prepare(n, p, w)
             if profiled:
-                Path(renv["RELAX_O3_PROFILE"] + ".replay").unlink(missing_ok=True)
+                Path(renv["MAKEPAD_RUN_O3_PROFILE"] + ".replay").unlink(missing_ok=True)
             b, eb = one(prefix + [p, "run", "--quiet", "relax-rwbench", "--", w], renv)
             runs[w][n].append(b)
             if eb: errs[(w, n)] = eb

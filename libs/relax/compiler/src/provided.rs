@@ -205,7 +205,7 @@ fn trusted_in(prog: &Program, tcx: &Tcx, krate: u32, t: TyId, depth: u32, field:
         TyKind::Array(e, _) => tr(*e),
         TyKind::Adt(d, a, _) => {
             // Box<T> (global allocator): both sides allocate with the system malloc, but a box
-            // OWNS its value: Relax-compiled code that drops it runs T's drop glue. That glue is
+            // OWNS its value: JIT-compiled code that drops it runs T's drop glue. That glue is
             // rustc's when T is marked `#[relax_api(handle)]` (its entry carries rustc's
             // drop_in_place) or `#[relax_api(plain)]` (layout checked); a private T has no entry, so
             // Relax would lay it out and drop it by its own rules (String/Vec fields: a bogus
@@ -495,12 +495,12 @@ pub fn opaque_candidate(prog: &Program, tcx: &Tcx, krate: u32, d: DefId) -> bool
     !trusted(prog, tcx, krate, t, 0)
 }
 
-/// The types whose values cross between the provided crates' rustc code and Relax-compiled code:
+/// The types whose values cross between the provided crates' rustc code and JIT-compiled code:
 /// reachable from the signatures of the bound fns (`bound`) through references, arrays, tuples,
 /// type arguments and the fields of provided-crate types (and Option/Box/PhantomData). The walk
 /// does not enter other std types: what a rustc-built Vec or String holds is reached only
 /// through bound fns, whose signatures are roots themselves. Every other type of a provided
-/// crate is made and laid out by Relax-compiled code alone (an inline shell's result, a type only
+/// crate is made and laid out by JIT-compiled code alone (an inline shell's result, a type only
 /// generic or unbound code builds): no opaque layout, no field guard.
 pub fn crossing_types(prog: &Program, tcx: &Tcx, krates: &[u32], bound: &dyn Fn(DefId) -> bool) -> std::collections::HashSet<TyId> {
     let mut out = std::collections::HashSet::new();

@@ -2,7 +2,7 @@
 //! the .crate archives (static.crates.io) checked against the index's SHA-256, unpacked with
 //! Relax's own gzip and tar readers into a content-addressed cache in the workspace's relax dir
 //! (`<target>/relax/registry`, dirs.rs), offline-first: a cached index and a cached package are used as they are,
-//! the network is asked only for what is missing (RELAX_OFFLINE=1: never). The network itself is
+//! the network is asked only for what is missing (MAKEPAD_RUN_OFFLINE=1: never). The network itself is
 //! the embedder's ([`set_fetch`]: the makepad binary and the loader install an HTTPS GET), so this
 //! module does no I/O beyond files.
 //!
@@ -27,12 +27,12 @@ const INDEX: &str = "https://index.crates.io";
 const DOWNLOAD: &str = "https://static.crates.io/crates";
 
 fn offline() -> bool {
-    std::env::var_os("RELAX_OFFLINE").is_some_and(|v| v != "0")
+    std::env::var_os("MAKEPAD_RUN_OFFLINE").is_some_and(|v| v != "0")
 }
 
 fn get(url: &str, what: &str) -> Result<Vec<u8>, String> {
     if offline() {
-        return Err(format!("{} is not cached and RELAX_OFFLINE is set", what));
+        return Err(format!("{} is not cached and MAKEPAD_RUN_OFFLINE is set", what));
     }
     let f = FETCH.get().ok_or_else(|| format!("{} is not cached and this process has no network access for registry packages", what))?;
     f(url).map_err(|e| format!("{}: {}: {}", what, url, e))
@@ -131,7 +131,7 @@ pub fn exact(name: &str, version: &str) -> Result<Release, String> {
 /// named by the package, its version and its checksum, holding `Cargo.toml`.
 pub fn sources(name: &str, r: &Release) -> Result<String, String> {
     let dir = root()?.join("src").join(format!("{}-{}-{}", name, r.version, &r.cksum[..16.min(r.cksum.len())]));
-    let done = dir.join(".relax-unpacked");
+    let done = dir.join(".makepad-run-unpacked");
     if !done.is_file() {
         let what = format!("`{}` {}", name, r.version);
         let body = get(&format!("{}/{}/{}-{}.crate", DOWNLOAD, name, name, r.version), &what)?;

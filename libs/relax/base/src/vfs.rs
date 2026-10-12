@@ -5,15 +5,15 @@
 //! served from the mount (the longest mount root wins: a repository mounted inside another);
 //! every other path is the disk. Paths stay plain strings everywhere else.
 //!
-//! EDITS (RELAX_EDITS=<folder>): the files a program writes into its own virtual folders (Stage's
+//! EDITS (MAKEPAD_RUN_EDITS=<folder>): the files a program writes into its own virtual folders (Stage's
 //! EDIT mode changing an app's sources) live in that disk folder, at the same path relative to
 //! the outermost mount, on top of the store: a file there is read instead of the store's. Only
-//! edited files exist there. `.relax-edits` in it records, per edited file, the store blob it
-//! was edited from (`new` for a file the store lacks), and `.relax-base/<path>` keeps that blob.
+//! edited files exist there. `.makepad-run-edits` in it records, per edited file, the store blob it
+//! was edited from (`new` for a file the store lacks), and `.makepad-run-base/<path>` keeps that blob.
 //! At a run's start (`reconcile_edits`) edits whose store file is unchanged carry over to the
 //! release being run; when the release changed the file too, the edit moves to
-//! `.relax-conflicts/<commit>/<path>` (beside it `<path>.base`) and the run reports it -- an edit
-//! is never dropped silently. Without RELAX_EDITS virtual files stay read-only.
+//! `.makepad-run-conflicts/<commit>/<path>` (beside it `<path>.base`) and the run reports it -- an edit
+//! is never dropped silently. Without MAKEPAD_RUN_EDITS virtual files stay read-only.
 use crate::gitstore::{self as store, Entry, Oid, Store};
 use std::collections::BTreeMap;
 use std::io;
@@ -33,19 +33,19 @@ struct Mount {
 
 static ANY: AtomicBool = AtomicBool::new(false);
 
-// ---- the read log (RELAX_READ_LOG=<file>): what `pack-src` records. Every process of a run (the
+// ---- the read log (MAKEPAD_RUN_READ_LOG=<file>): what `pack-src` records. Every process of a run (the
 // build-script children inherit the variable) appends `<kind>\t<path>` once per path and kind:
 // `f` a file whose bytes were read, `p` a path a probe (metadata, exists, is_file, is_dir) found,
 // `d` a folder that was listed. One relaxed load when off.
 static RECORDING: AtomicBool = AtomicBool::new(false);
 static RECORDED: relax_session::sync::Mutex<Option<(std::collections::HashSet<(u8, String)>, std::fs::File)>> = relax_session::sync::Mutex::new(None);
 
-/// Starts the read log from RELAX_READ_LOG (the loader calls this at start, next to RELAX_VFS).
+/// Starts the read log from MAKEPAD_RUN_READ_LOG (the loader calls this at start, next to MAKEPAD_RUN_VFS).
 pub fn record_from_env() -> Result<(), String> {
     // process state: built in the kept heap (the settle swap destroys the compiler zone)
     let _k = crate::zone_alloc::kept();
-    let Some(p) = std::env::var_os("RELAX_READ_LOG").filter(|p| !p.is_empty()) else { return Ok(()) };
-    let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("RELAX_READ_LOG {}: {e}", p.to_string_lossy()))?;
+    let Some(p) = std::env::var_os("MAKEPAD_RUN_READ_LOG").filter(|p| !p.is_empty()) else { return Ok(()) };
+    let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("MAKEPAD_RUN_READ_LOG {}: {e}", p.to_string_lossy()))?;
     *RECORDED.lock().unwrap() = Some((Default::default(), f));
     RECORDING.store(true, Ordering::Release);
     Ok(())
@@ -67,7 +67,7 @@ fn note(kind: u8, path: &std::path::Path) {
     }
 }
 static MOUNTS: RwLock<Vec<Arc<Mount>>> = RwLock::new(Vec::new());
-/// RELAX_EDITS: the disk folder holding the edited files (None: virtual files are read-only)
+/// MAKEPAD_RUN_EDITS: the disk folder holding the edited files (None: virtual files are read-only)
 static EDITS: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 // A verified binary std always reads the store bytes that were compared, even with app edits.
 static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
@@ -77,7 +77,7 @@ static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
 pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
     // process state: built in the kept heap (the settle swap destroys the compiler zone)
     let _k = crate::zone_alloc::kept();
-    let (m, rel) = find(path).ok_or("no Relax std mount")?;
+    let (m, rel) = find(path).ok_or("no makepad run std mount")?;
     let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
     let mut files = Vec::new();
     for e in m.files.iter().filter(|e| e.path.starts_with(&prefix)) {
@@ -88,7 +88,7 @@ pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
         files.push((e.path[prefix.len()..].to_string(), bytes));
     }
     if files.is_empty() {
-        return Err("mounted commit has no Relax std".into());
+        return Err("mounted commit has no makepad run std".into());
     }
     let actual = crate::std_digest::digest(files);
     if actual != expected {
@@ -247,13 +247,13 @@ fn edit_path(path: &str) -> Option<(std::path::PathBuf, String)> {
 /// The edited file for `path`, when there is one.
 fn edited_file(path: &str) -> Option<std::path::PathBuf> {
     let (p, rel) = edit_path(path)?;
-    if rel.starts_with(".relax-") {
+    if rel.starts_with(".makepad-run-") {
         return None;
     }
     p.is_file().then_some(p)
 }
 
-/// The edits folder from RELAX_EDITS (the runner sets it per licensed app).
+/// The edits folder from MAKEPAD_RUN_EDITS (the runner sets it per licensed app).
 pub fn set_edits(dir: Option<std::path::PathBuf>) {
     // process state: built in the kept heap (the settle swap destroys the compiler zone)
     let _k = crate::zone_alloc::kept();
@@ -374,9 +374,9 @@ impl ReadSnapshot {
         drop(paths);
         for (path, (c, o)) in &totals {
             calls += c; opens += o; max = max.max(*o); repeated += usize::from(*o > 1);
-            eprintln!("relax-source-read: calls={c} opens={o} path={path:?}");
+            eprintln!("makepad-run source-read: calls={c} opens={o} path={path:?}");
         }
-        eprintln!("relax-source-reads: calls={calls} paths={} opens={opens} repeated_paths={repeated} max_opens_per_path={max}", totals.len());
+        eprintln!("makepad-run source-reads: calls={calls} paths={} opens={opens} repeated_paths={repeated} max_opens_per_path={max}", totals.len());
     }
 }
 fn read_snapshot() -> Option<Arc<ReadSnapshot>> {
@@ -606,7 +606,7 @@ fn read_dir_inner(path: &std::path::Path) -> io::Result<Vec<(String, bool)>> {
                     .map(|d| {
                         d.flatten()
                             .map(|e| (e.file_name().to_string_lossy().into_owned(), e.file_type().map(|t| t.is_dir()).unwrap_or(false)))
-                            .filter(|(n, _)| !n.starts_with(".relax-"))
+                            .filter(|(n, _)| !n.starts_with(".makepad-run-"))
                             .collect()
                     })
                     .unwrap_or_default(),
@@ -755,18 +755,18 @@ pub fn mounts_text() -> String {
     out
 }
 
-/// Mounts what `mounts_text` wrote (RELAX_VFS).
+/// Mounts what `mounts_text` wrote (MAKEPAD_RUN_VFS).
 pub fn mount_text(text: &str) -> Result<(), String> {
     // process state: built in the kept heap (the settle swap destroys the compiler zone)
     let _k = crate::zone_alloc::kept();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let mut it = line.split('\t');
-        let (Some(root), Some(path), Some(commit)) = (it.next(), it.next(), it.next()) else { return Err(format!("RELAX_VFS: bad line {line}")) };
-        let commit = store::from_hex(commit).ok_or_else(|| format!("RELAX_VFS: bad commit in {line}"))?;
+        let (Some(root), Some(path), Some(commit)) = (it.next(), it.next(), it.next()) else { return Err(format!("MAKEPAD_RUN_VFS: bad line {line}")) };
+        let commit = store::from_hex(commit).ok_or_else(|| format!("MAKEPAD_RUN_VFS: bad commit in {line}"))?;
         let s = match it.next() {
             None => Store::open(std::path::Path::new(path)).map_err(|e| format!("{path}: {e}"))?,
             Some(range) => {
-                let (offset, len) = parse_range(range).ok_or_else(|| format!("RELAX_VFS: bad range in {line}"))?;
+                let (offset, len) = parse_range(range).ok_or_else(|| format!("MAKEPAD_RUN_VFS: bad range in {line}"))?;
                 Store::open_range(std::path::Path::new(path), offset, len).map_err(|e| format!("{path}: {e}"))?
             }
         };
@@ -781,15 +781,15 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
     Some((o.parse().ok()?, l.parse().ok()?))
 }
 
-/// RELAX_VFS from the environment, mounted once (the loader and `relax` call this at start).
+/// MAKEPAD_RUN_VFS from the environment, mounted once (the loader calls this at start).
 pub fn mount_from_env() -> Result<(), String> {
     // process state: built in the kept heap (the settle swap destroys the compiler zone)
     let _k = crate::zone_alloc::kept();
     record_from_env()?;
-    if let Some(d) = std::env::var_os("RELAX_EDITS").filter(|d| !d.is_empty()) {
+    if let Some(d) = std::env::var_os("MAKEPAD_RUN_EDITS").filter(|d| !d.is_empty()) {
         set_edits(Some(d.into()));
     }
-    match std::env::var("RELAX_VFS") {
+    match std::env::var("MAKEPAD_RUN_VFS") {
         Ok(t) if !t.is_empty() => mount_text(&t),
         _ => Ok(()),
     }
@@ -880,13 +880,13 @@ pub extern "C" fn relax_vfs_release(id: u64) {
 }
 
 
-// ---- edits (RELAX_EDITS): writes into virtual folders
+// ---- edits (MAKEPAD_RUN_EDITS): writes into virtual folders
 
 /// The edits folder's records: edited path -> the store blob it was edited from (None: a file
 /// the store did not have).
 fn load_records(dir: &std::path::Path) -> BTreeMap<String, Option<Oid>> {
     let mut out = BTreeMap::new();
-    if let Ok(t) = std::fs::read_to_string(dir.join(".relax-edits")) {
+    if let Ok(t) = std::fs::read_to_string(dir.join(".makepad-run-edits")) {
         for line in t.lines() {
             if let Some((rel, oid)) = line.split_once('\t') {
                 out.insert(rel.to_string(), if oid == "new" { None } else { store::from_hex(oid) });
@@ -898,9 +898,9 @@ fn load_records(dir: &std::path::Path) -> BTreeMap<String, Option<Oid>> {
 
 fn save_records(dir: &std::path::Path, r: &BTreeMap<String, Option<Oid>>) -> io::Result<()> {
     let text: String = r.iter().map(|(rel, oid)| format!("{}\t{}\n", rel, oid.as_ref().map(store::hex).unwrap_or_else(|| "new".into()))).collect();
-    let tmp = dir.join(".relax-edits.tmp");
+    let tmp = dir.join(".makepad-run-edits.tmp");
     std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, dir.join(".relax-edits"))
+    std::fs::rename(&tmp, dir.join(".makepad-run-edits"))
 }
 
 static EDIT_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::new(());
@@ -910,8 +910,8 @@ static EDIT_LOCK: relax_session::sync::Mutex<()> = relax_session::sync::Mutex::n
 /// write keeps the content (append, read-write): the store's bytes are copied first. Err when
 /// the path is not virtual or there is no edits folder (the file stays read-only).
 pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
-    let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no RELAX_EDITS)"))?;
-    if rel.is_empty() || rel.starts_with(".relax-") {
+    let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no MAKEPAD_RUN_EDITS)"))?;
+    if rel.is_empty() || rel.starts_with(".makepad-run-") {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not an editable path"));
     }
     let _g = EDIT_LOCK.lock().unwrap();
@@ -931,7 +931,7 @@ pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
                 Some((_, d)) => d,
                 None => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("{path}: object missing"))),
             };
-            let base = dir.join(".relax-base").join(&rel);
+            let base = dir.join(".makepad-run-base").join(&rel);
             if let Some(bp) = base.parent() {
                 std::fs::create_dir_all(bp)?;
             }
@@ -953,13 +953,13 @@ pub fn prepare_edit(path: &str, keep: bool) -> io::Result<std::path::PathBuf> {
 /// (removing or renaming an edited file).
 pub fn edited_disk_path(path: &str) -> Option<std::path::PathBuf> {
     let (p, rel) = edit_path(path)?;
-    (!rel.starts_with(".relax-") && p.exists()).then_some(p)
+    (!rel.starts_with(".makepad-run-") && p.exists()).then_some(p)
 }
 
 /// A folder made in a virtual folder: made in the edits folder.
 pub fn prepare_edit_dir(path: &str) -> io::Result<std::path::PathBuf> {
-    let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no RELAX_EDITS)"))?;
-    if rel.starts_with(".relax-") {
+    let (disk, rel) = edit_path(path).ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "read-only (no MAKEPAD_RUN_EDITS)"))?;
+    if rel.starts_with(".makepad-run-") {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "not an editable path"));
     }
     Ok(disk)
@@ -967,11 +967,11 @@ pub fn prepare_edit_dir(path: &str) -> io::Result<std::path::PathBuf> {
 
 /// At a run's start: the edits against the release being run. An edit whose store file is
 /// unchanged carries over; a file the release changed too (or now has, for a new file) moves
-/// to `.relax-conflicts/<commit>/` unless the edit equals the release's file (then it is done).
+/// to `.makepad-run-conflicts/<commit>/` unless the edit equals the release's file (then it is done).
 /// Returns one line per conflict (for the run's report); nothing when there are no edits.
 pub fn reconcile_edits() -> Vec<String> {
     let Some(dir) = EDITS.read().unwrap().clone() else { return Vec::new() };
-    if !dir.join(".relax-edits").is_file() {
+    if !dir.join(".makepad-run-edits").is_file() {
         return Vec::new();
     }
     let _g = EDIT_LOCK.lock().unwrap();
@@ -1013,12 +1013,12 @@ pub fn reconcile_edits() -> Vec<String> {
             continue;
         }
         let tag = &store::hex(&m.commit)[..12];
-        let keep = dir.join(".relax-conflicts").join(tag).join(&rel);
+        let keep = dir.join(".makepad-run-conflicts").join(tag).join(&rel);
         if let Some(p) = keep.parent() {
             let _ = std::fs::create_dir_all(p);
         }
         if std::fs::rename(&disk, &keep).is_ok() {
-            let base_copy = dir.join(".relax-base").join(&rel);
+            let base_copy = dir.join(".makepad-run-base").join(&rel);
             if base_copy.is_file() {
                 let mut b = keep.as_os_str().to_os_string();
                 b.push(".base");

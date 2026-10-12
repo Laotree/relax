@@ -6,8 +6,8 @@
 //! `makepad selftest`: a test of Relax itself on a package -- the same checks, then every
 //! non-generic function is compiled to machine code by the run's own per-function compile
 //! (`jit::compile_slot`), and so is every instance, closure and glue those reach (rustc's
-//! monomorphization collector for `build-pass`), on `RELAX_JOBS` threads. Every failure prints
-//! as one line (`file:line:col: error|internal: ..`); `internal` marks a Relax bug (a compiler
+//! monomorphization collector for `build-pass`), on `MAKEPAD_RUN_JOBS` threads. Every failure prints
+//! as one line (`file:line:col: error|internal: ..`); `internal` marks a makepad run bug (a compiler
 //! panic, an error without a user-facing code, or an error inside std or a dependency rustc
 //! builds). `--root-only` and the watch session's deep check (`collect_deep`) cover the root
 //! crate (and what it reaches) only.
@@ -35,7 +35,7 @@ pub fn own_errors(prog: &crate::program::Program, root: u32, errs: &[String], ph
 }
 
 /// The crates a one-shot `makepad check` covers: the root and every loaded crate whose root file
-/// is in the workspace, except std (RELAX_STD may live inside it) and proc-macro crates (their
+/// is in the workspace, except std (MAKEPAD_RUN_STD may live inside it) and proc-macro crates (their
 /// code runs in the macro host, never in the program).
 pub fn workspace_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     fn canon(p: &str) -> String {
@@ -61,16 +61,16 @@ pub fn app_crates(prog: &crate::program::Program, root: u32) -> Vec<u32> {
     (0..prog.crates.len() as u32).filter(|&k| k == root || crate::borrowck::event::app_crate(prog, k)).collect()
 }
 
-/// `f` over `items` on RELAX_JOBS threads (at most 16), results in `items` order.
+/// `f` over `items` on MAKEPAD_RUN_JOBS threads (at most 16), results in `items` order.
 fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+    let jobs = std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let out: relax_session::sync::Mutex<Vec<(usize, R)>> = relax_session::sync::Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|sc| {
         for w in 0..jobs.min(items.len().max(1)) {
             let (next, out, f) = (&next, &out, &f);
-            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
+            std::thread::Builder::new().name(format!("run-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                 let mut local = Vec::new();
                 loop {
                     let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -107,13 +107,13 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     for &k in crates {
         own[k as usize] = true;
     }
-    // every checked definition's signature, on RELAX_JOBS threads (queries over the shared
+    // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
     {
         let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).collect();
         let (prog, tcx) = (&u.prog, &u.tcx);
         for e in par_map(&defs, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tcx.check_def_signature(prog, d)))
-            .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- Relax bug, report it", prog.def_path(d))])) {
+            .unwrap_or_else(|_| vec![format!("internal compiler error while checking the signature of {} -- makepad run bug, report it", prog.def_path(d))])) {
             errors.extend(e);
         }
     }
@@ -165,18 +165,18 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(anon))),
         }
     }
-    // every body owner type- and borrow-checked on RELAX_JOBS threads: typeck and the borrow
+    // every body owner type- and borrow-checked on MAKEPAD_RUN_JOBS threads: typeck and the borrow
     // checker are queries over the shared program and type context (as the run's typeck-ahead
     // workers use them); results are merged in owner order
     struct Outcome { errors: Vec<String>, diags: Vec<crate::diag::Diagnostic>, seed: Option<crate::program::DefId>, retry: bool }
-    let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+    let jobs = std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(16));
     let upn = up as usize;
     let check_one = move |owner: &crate::borrowck::body::CheckedBody, generic: bool| -> Outcome {
         let uu = unsafe { &*(upn as *const Unit) };
         let (prog, tcx) = (&uu.prog, &uu.tcx);
         let d = owner.owner;
-        if std::env::var_os("RELAX_CHECK_TRACE").is_some() { std::eprintln!("makepad check: body {}", prog.def_path(d)); }
+        if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { std::eprintln!("makepad check: body {}", prog.def_path(d)); }
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, retry: false };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = tcx.typeck(prog, d);
@@ -188,7 +188,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             }
             let v = crate::borrowck::check_body(&crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &crate::tcx::EvalState::new()), prog, tcx, &body);
             crate::borrowck::note_verdict(&v);
-            if std::env::var_os("RELAX_BORROWCK_UNCHECKED").is_some() {
+            if std::env::var_os("MAKEPAD_RUN_BORROWCK_UNCHECKED").is_some() {
                 for x in &v.unchecked { eprintln!("makepad check: borrowck unchecked: {}", x); }
             }
             let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
@@ -212,7 +212,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             Err(_) => {
                 let def = prog.def(d);
                 let pos = prog.files[def.file as usize].ast.item(def.item).lo;
-                out.errors.push(prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- Relax bug, report it{}", prog.def_path(d), jit::take_ice_location())));
+                out.errors.push(prog.record_error(def.file, pos, "typeck", format!("internal compiler error while checking {} -- makepad run bug, report it{}", prog.def_path(d), jit::take_ice_location())));
             }
         }
         // an error may be a name in a file the app check left unloaded: settled with all loaded
@@ -227,7 +227,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let (fns, next, results, check_one) = (&fns, &next, &results, &check_one);
         std::thread::scope(|sc| {
             for w in 0..jobs {
-                std::thread::Builder::new().name(format!("relax-check-ty-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
+                std::thread::Builder::new().name(format!("run-check-ty-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                     let mut local = Vec::new();
                     loop {
                         let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -242,7 +242,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         });
         outcomes.extend(results.lock().unwrap().drain(..));
     }
-    if std::env::var_os("RELAX_CHECK_TIMES").is_some() { std::eprintln!("makepad check: owners {:.2} s, anon consts {:.2} s, bodies {:.2} s ({} jobs)", t_owners.as_secs_f64(), (t_par - t_owners).as_secs_f64(), (t_check.elapsed() - t_par).as_secs_f64(), jobs); }
+    if std::env::var_os("MAKEPAD_RUN_CHECK_TIMES").is_some() { std::eprintln!("makepad check: owners {:.2} s, anon consts {:.2} s, bodies {:.2} s ({} jobs)", t_owners.as_secs_f64(), (t_par - t_owners).as_secs_f64(), (t_check.elapsed() - t_par).as_secs_f64(), jobs); }
     outcomes.sort_by_key(|(i, _)| *i);
     // owners that failed or met an unloaded module: every skipped file loaded, checked again
     // (only when some other crate's file is still skipped: else the first answer stands)
@@ -293,7 +293,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let name = unsafe { (&(*up).fns)[id as usize].name.clone() };
         report(up, id, &name, &e, "compile", &own, &mut errors);
     }
-    // RELAX_BORROWCK_INSTANCES=1: every reached instance is borrow-checked too (the background
+    // MAKEPAD_RUN_BORROWCK_INSTANCES=1: every reached instance is borrow-checked too (the background
     // checker's view: concrete type arguments, all crates)
     if crate::borrowck::enabled(options) && options.borrowck_instances {
         for id in 0..unsafe { (&(*up).fns).len() } {
@@ -357,7 +357,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         eprintln!("makepad check: constant initializers: {} evaluated to data, {} compiled and run; evaluation cpu {:.1} ms", st.ctfe_data, st.ctfe_code, st.ctfe_ns as f64 / 1e6);
     }
     unsafe { crate::jit::backend_bench(up) };
-    if std::env::var("RELAX_PASS_TIMES").is_ok() || std::env::var("RELAX_OPT_HIST").is_ok() {
+    if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() || std::env::var("MAKEPAD_RUN_OPT_HIST").is_ok() {
         let mut passes = String::new();
         for i in 0..crate::opt::PASS_NAMES.len() {
             passes.push_str(&format!("{} {:.0}  ", crate::opt::PASS_NAMES[i], crate::opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
@@ -374,7 +374,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
 
 /// Compiles every seed fn, then every slot the compiled code creates (callees, closures, glue,
 /// vtable methods), each through the run's own per-fn compile (`jit::compile_slot`: front end
-/// on the owner thread, optimisation and code generation off it), on RELAX_JOBS threads until
+/// on the owner thread, optimisation and code generation off it), on MAKEPAD_RUN_JOBS threads until
 /// no slot is left. Returns every failed build: (slot, error).
 unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u32, String)> {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -389,7 +389,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
         }
     });
     // every in-flight build holds its front end's and back end's state: at most 8 by default
-    let jobs = std::env::var("RELAX_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
+    let jobs = std::env::var("MAKEPAD_RUN_JOBS").ok().and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0)
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(8));
     // the run's reclamation (jit::settle_drop: RIR, checked bodies, templates of compiled
     // slots) once the process grew SETTLE_GROWTH since the last one (looked at every 2,000
@@ -407,7 +407,7 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     std::thread::scope(|sc| {
         for w in 0..jobs {
             let (next, active, panics, compiled, settled_at, settled_rss) = (&next, &active, &panics, &compiled, &settled_at, &settled_rss);
-            std::thread::Builder::new().name(format!("relax-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
+            std::thread::Builder::new().name(format!("run-check-{}", w)).stack_size(256 << 20).spawn_scoped(sc, move || { let _z = crate::zone_alloc::compiler_thread();
                 let up = upn as *mut Unit;
                 loop {
                     // the next slot not compiled yet; done when none is left and no worker is
@@ -465,12 +465,12 @@ unsafe fn compile_all(up: *mut Unit, seeds: &[crate::program::DefId]) -> Vec<(u3
     out
 }
 
-/// Is a failure a Relax bug rather than an error rustc would report? A compiler panic, an
+/// Is a failure a makepad run bug rather than an error rustc would report? A compiler panic, an
 /// internal error, an error without an error code, or one located outside the checked crates
 /// (std or a dependency: rustc builds those).
 fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
     let first = e.lines().next().unwrap_or("");
-    if first.contains("internal compiler error") || first.contains("internal:") || first.contains("Relax bug") {
+    if first.contains("internal compiler error") || first.contains("internal:") || first.contains("makepad run bug") {
         return true;
     }
     // `path:line:col: E0123: ..`
@@ -490,7 +490,7 @@ fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
     }
 }
 
-/// `path:line:col: internal: msg` for a Relax bug (the error keeps its own text otherwise).
+/// `path:line:col: internal: msg` for a makepad run bug (the error keeps its own text otherwise).
 fn label_internal(e: &str) -> String {
     let mut it = e.splitn(4, ':');
     if let (Some(p), Some(l), Some(c), Some(rest)) = (it.next(), it.next(), it.next(), it.next()) {
@@ -502,7 +502,7 @@ fn label_internal(e: &str) -> String {
 }
 
 /// One failed build as an error line: its location (the error's own, else the fn's), the
-/// message's first line, the instance it failed for, and `internal` for a Relax bug.
+/// message's first line, the instance it failed for, and `internal` for a makepad run bug.
 fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, own: &[bool], errors: &mut Vec<String>) {
     let u = unsafe { &*up };
     let mut first = e.lines().next().unwrap_or("").to_string();
@@ -535,7 +535,7 @@ fn report(up: *mut Unit, id: u32, name: &str, e: &str, phase: &'static str, own:
     if crate::diag::enabled() {
         let mut d = crate::diag::recorded(e).or_else(|| crate::diag::recorded(&first)).unwrap_or_else(|| crate::diag::from_legacy(&first, phase));
         d.notes.push(format!("in {}", n));
-        if internal { d.notes.push("internal: a Relax bug, not an error in the program".to_string()); }
+        if internal { d.notes.push("internal: a makepad run bug, not an error in the program".to_string()); }
         crate::diag::record(line.clone(), d);
     }
     errors.push(line);

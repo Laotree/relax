@@ -3,7 +3,7 @@
 //! ParsedFile::part publishes it), into the run's image store (cache/front_run.rs), and from
 //! then on read through the mapping -- clean file pages instead of heap. Warm runs map the same
 //! images (crate stores refer to them) and read them through the same functions (restore,
-//! apply_part). RELAX_FRONT=0 disables front images; RELAX_FRONT_VERIFY=1 compares every
+//! apply_part). MAKEPAD_RUN_FRONT=0 disables front images; MAKEPAD_RUN_FRONT_VERIFY=1 compares every
 //! section with the parse it replaces.
 
 use crate::arena::Arena;
@@ -42,19 +42,19 @@ pub static MISMATCHED: AtomicU64 = AtomicU64::new(0);
 fn mismatch(path: &str, section: &str) -> bool {
     MISMATCHED.fetch_add(1, Ordering::Relaxed);
     if crate::preload::trace() {
-        eprintln!("relax-front mismatch: {} {}", path, section);
+        eprintln!("makepad-run front mismatch: {} {}", path, section);
     }
     false
 }
 
 pub fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_FRONT").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_FRONT").map_or(true, |v| v != "0"))
 }
 
 pub fn verify() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_FRONT_VERIFY").map_or(false, |v| v == "1"))
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_FRONT_VERIFY").map_or(false, |v| v == "1"))
 }
 
 /// The image of a loaded file (its arrays as they are after the load; the lazily parsed part
@@ -439,7 +439,7 @@ pub fn summary() -> Option<String> {
         return None;
     }
     Some(format!(
-        "relax-front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} mapped arrays copied back by a change ({:.1} MB)",
+        "makepad-run front: {} parts (lazily parsed bodies) mapped, {} recorded; {} files mapped from images ({:.1} MB of heap released), {} recorded ({:.1} MB), {} images not matching the parse, {} mapped arrays copied back by a change ({:.1} MB)",
         PARTS_MAPPED.load(Ordering::Relaxed),
         PARTS_RECORDED.load(Ordering::Relaxed),
         m,

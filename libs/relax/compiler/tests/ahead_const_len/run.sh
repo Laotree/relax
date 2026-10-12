@@ -9,7 +9,7 @@
 H=$(cd "$(dirname "$0")" && pwd)
 R=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 T=$(mktemp -d)
-export RELAX_CACHE=off RELAX_STD="$H/../../std" RELAX_CACHE_DIR="$T/cache"
+export MAKEPAD_RUN_CACHE=off MAKEPAD_RUN_STD="$H/../../std" MAKEPAD_RUN_CACHE_DIR="$T/cache"
 bad=()
 for k in 1 2 3; do
   (cd "$H" && ulimit -c 0 && "$R" check --root-only --no-serve ahead-const-len) > "$T/check$k.log" 2>&1

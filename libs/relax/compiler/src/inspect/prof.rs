@@ -32,7 +32,7 @@ pub fn collect(secs: f64, hz: u64, want: &dyn Fn(&super::threads::Thread) -> boo
     let skip = super::SERVER_TIDS.lock().unwrap().clone();
     let mut threads = super::threads::list();
     super::name_handles(&mut threads);
-    threads.retain(|t| !skip.contains(&t.os_id) && want(t) && !t.name.starts_with("relax-inspect") || t.name.starts_with("makepad-remote"));
+    threads.retain(|t| !skip.contains(&t.os_id) && want(t) && !t.name.starts_with("run-inspect") || t.name.starts_with("makepad-remote"));
     imp::collect(threads, secs, hz)
 }
 
@@ -233,11 +233,11 @@ fn activity(names: &[super::Frame]) -> &'static str {
     }
     match names.first() {
         Some(f) if f.module.starts_with("jit") => "program",
-        Some(f) if f.module == "relax" => {
+        Some(f) if f.module == "makepad" => {
             if jit_seen {
-                "relax runtime / compiled-in crates"
+                "makepad run runtime / compiled-in crates"
             } else {
-                "relax"
+                "makepad run"
             }
         }
         _ => {
@@ -259,8 +259,8 @@ fn pick(sel: &str) -> Box<dyn Fn(&super::threads::Thread) -> bool> {
         "all" | "" => true,
         "main" => (t.handle != 0 && t.handle == main) || t.os_id == pid,
         "owner" => t.handle != 0 && t.handle == owner,
-        "compiler" => t.name.starts_with("relax-") || t.handle == owner,
-        "program" => !t.name.starts_with("relax-") && !t.name.starts_with("gandalf") && t.handle != owner,
+        "compiler" => t.name.starts_with("run-") || t.handle == owner,
+        "program" => !t.name.starts_with("run-") && !t.name.starts_with("gandalf") && t.handle != owner,
         s => s.split(',').any(|s| s.trim_start_matches('T').parse::<u64>().map_or(false, |id| id == t.os_id) || t.name.starts_with(s)),
     })
 }
@@ -357,7 +357,7 @@ fn report(run: &Run, n: usize, save: bool, out: &mut Out) {
             parts.extend(f.iter().rev().map(|x| x.name.replace(';', ":")));
             *folded.entry(parts.join(";")).or_default() += 1;
         }
-        let path = std::env::temp_dir().join(format!("relax-inspect-{}-prof-{}.folded", std::process::id(), now_ms()));
+        let path = std::env::temp_dir().join(format!("makepad-run-inspect-{}-prof-{}.folded", std::process::id(), now_ms()));
         let text: String = folded.iter().map(|(k, v)| format!("{} {}\n", k, v)).collect();
         match std::fs::write(&path, text) {
             Ok(()) => out.line(&format!("{{\"saved\":{},\"format\":\"folded stacks (flamegraph.pl / speedscope)\"}}", json_str(&path.display().to_string()))),

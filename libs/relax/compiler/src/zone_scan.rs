@@ -1,4 +1,4 @@
-//! The kept-state scan (`RELAX_ZONE_CHECK=1`): a walk over the closed list of Unit state that
+//! The kept-state scan (`MAKEPAD_RUN_ZONE_CHECK=1`): a walk over the closed list of Unit state that
 //! must survive the destruction of the compiler arena (memlane step 1b), counting every owned
 //! heap allocation that lies inside that arena. A count above zero is a site that built kept
 //! state in the compiler phase (it needs `zone_alloc::kept()` around the allocation).
@@ -49,7 +49,7 @@ pub(crate) fn zone_take_all() -> ZoneTaken {
 mod reset_tests {
     #[test]
     fn zone_reset_fresh_process() {
-        const CHILD: &str = "RELAX_ZONE_RESET_TEST_CHILD";
+        const CHILD: &str = "MAKEPAD_RUN_ZONE_RESET_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
             // Take helpers assert their statics are empty. Repeat to cover an empty take.
             let _phase = crate::zone_alloc::compiler();
@@ -315,18 +315,18 @@ pub(crate) fn kept_scan(u: &Unit) -> Vec<(&'static str, usize)> {
     a.counts
 }
 
-/// `RELAX_ZONE_CHECK`: 0 off, 1 the kept-state scan at every settle, 2 that plus the static scan
+/// `MAKEPAD_RUN_ZONE_CHECK`: 0 off, 1 the kept-state scan at every settle, 2 that plus the static scan
 /// (writable data of the executable and the TLS of every thread, `static_scan`).
 fn level() -> u8 {
     static L: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *L.get_or_init(|| match std::env::var("RELAX_ZONE_CHECK").as_deref() {
+    *L.get_or_init(|| match std::env::var("MAKEPAD_RUN_ZONE_CHECK").as_deref() {
         Ok("1") => 1,
         Ok("2") => 2,
         _ => 0,
     })
 }
 
-/// Whether the kept-state scan runs (`RELAX_ZONE_CHECK=1` or 2).
+/// Whether the kept-state scan runs (`MAKEPAD_RUN_ZONE_CHECK=1` or 2).
 pub(crate) fn enabled() -> bool {
     level() >= 1
 }
@@ -336,7 +336,7 @@ pub(crate) fn report(u: &Unit) -> (usize, String) {
     let counts = kept_scan(u);
     let total: usize = counts.iter().map(|c| c.1).sum();
     let list: Vec<String> = counts.iter().map(|(n, c)| format!("{n}: {c}")).collect();
-    (total, format!("relax-zone: kept scan: {total} pointers into the compiler arena [{}]", list.join(", ")))
+    (total, format!("makepad-run zone: kept scan: {total} pointers into the compiler arena [{}]", list.join(", ")))
 }
 
 static LAST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -349,7 +349,7 @@ pub(crate) fn last_total() -> Option<usize> {
     }
 }
 
-/// Runs the scan and prints its line (a settle's owner call; silent unless RELAX_ZONE_CHECK=1).
+/// Runs the scan and prints its line (a settle's owner call; silent unless MAKEPAD_RUN_ZONE_CHECK=1).
 pub(crate) fn settle_check(u: &Unit) {
     if !enabled() {
         return;
@@ -378,11 +378,11 @@ struct Hit {
 }
 
 fn print_hits(what: &str, hits: &[Hit], extra: &str) {
-    eprintln!("relax-zone: {what}: {} words into the compiler arena{extra}", hits.len());
-    // up to 200 entries; RELAX_ZONE_SCAN_MAX raises it (the classification wants them all)
-    let max = std::env::var("RELAX_ZONE_SCAN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200usize);
+    eprintln!("makepad-run zone: {what}: {} words into the compiler arena{extra}", hits.len());
+    // up to 200 entries; MAKEPAD_RUN_ZONE_SCAN_MAX raises it (the classification wants them all)
+    let max = std::env::var("MAKEPAD_RUN_ZONE_SCAN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(200usize);
     for h in hits.iter().take(max) {
-        eprintln!("relax-zone:   {} -> {:#x}", h.place, h.target);
+        eprintln!("makepad-run zone:   {} -> {:#x}", h.place, h.target);
     }
 }
 
@@ -602,5 +602,5 @@ fn tls_scan(g: u64) {
 
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu")))]
 fn tls_scan(_g: u64) {
-    eprintln!("relax-zone: tls scan: not available on this target (statics only)");
+    eprintln!("makepad-run zone: tls scan: not available on this target (statics only)");
 }

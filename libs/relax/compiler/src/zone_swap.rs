@@ -2,7 +2,7 @@
 //! settled, the compiler's heap (generation g of the compiler arena) is destroyed and the compile
 //! state is rebuilt, warm-sized, in generation g+1. What the running program needs to go on --
 //! slot identities, code, symbols, statics, sites, pc maps (the kept heap, `Unit` doc in jit.rs)
-//! -- is never touched. On by default; `RELAX_ZONE_SWAP=0` turns it off.
+//! -- is never touched. On by default; `MAKEPAD_RUN_ZONE_SWAP=0` turns it off.
 //!
 //! Protocol (driver: the run monitor, after the settle; abortable until step 6):
 //! 1. the watcher and the borrow-check worker end (they hold generation-g state for their whole
@@ -30,15 +30,15 @@ use super::*;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-/// On unless RELAX_ZONE_SWAP=0.
+/// On unless MAKEPAD_RUN_ZONE_SWAP=0.
 pub(crate) fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_ZONE_SWAP").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_ZONE_SWAP").map_or(true, |v| v != "0"))
 }
 
-/// RELAX_ZONE_VERIFY=1: the restored Program is compared table by table with the running one.
+/// MAKEPAD_RUN_ZONE_VERIFY=1: the restored Program is compared table by table with the running one.
 fn verify_on() -> bool {
-    std::env::var("RELAX_ZONE_VERIFY").is_ok_and(|v| v == "1")
+    std::env::var("MAKEPAD_RUN_ZONE_VERIFY").is_ok_and(|v| v == "1")
 }
 
 /// The crate list of this launch (kept: the swap restores against it).
@@ -72,7 +72,7 @@ pub(crate) fn remember_runtime(prog: &Program, krate: u32) {
 /// time it holds some; the swap runs as one) and the workers that wait on a queue, popping an id
 /// before they pass the job gate (spec workers, O3, O2) or reading everything through the unit
 /// pointer (the post-boot loader).
-const ALLOWED: [&str; 5] = ["relax-owner", "relax-spec", "relax-o3-", "relax-O2", "relax-complete"];
+const ALLOWED: [&str; 5] = ["run-owner", "run-spec", "run-o3-", "run-O2", "run-complete"];
 
 fn unexpected_threads() -> Vec<String> {
     crate::zone_alloc::kept_with(|| {
@@ -332,8 +332,8 @@ fn not_now(up: *mut Unit) -> Option<String> {
 
 fn trace(what: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("RELAX_ZONE_TRACE").is_some()) {
-        eprintln!("relax-zone: trace: {what} (t={:.0} ms)", crate::clock::ms_since_start());
+    if *ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_ZONE_TRACE").is_some()) {
+        eprintln!("makepad-run zone: trace: {what} (t={:.0} ms)", crate::clock::ms_since_start());
     }
 }
 
@@ -465,7 +465,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let rss1 = crate::memstat::resident();
     SWAPS.fetch_add(1, Ordering::Relaxed);
     LAST_SWAP_MS.store(wall_ns() / 1_000_000, Ordering::Relaxed);
-    eprintln!("relax-zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
+    eprintln!("makepad-run zone: swap {}->{} at t={:.0} ms (attempt {}): quiesce {:.1} ms, front images {:.1} ms, encode {:.1} ms, store {:.1} ms, restore {:.1} ms (cache {:.1} ms), commit {:.1} ms, total {:.1} ms; destroyed {} chunks ({:.1} MB touched); {} speculative codes moved to the kept heap ({:.1} MB); rss {:.0} -> {:.0} MB",
         old_gen, old_gen + 1, crate::clock::ms_since_start(), n + 1, tl.quiesce, tl.front_images, tl.encode, tl.store, tl.restore, tl.cache, tl.commit, ms(t_all),
         tl.chunks, tl.touched as f64 / 1048576.0, tl.specs.0, tl.specs.1 as f64 / 1048576.0, rss0 as f64 / 1048576.0, rss1 as f64 / 1048576.0);
     Outcome::Done
@@ -503,7 +503,7 @@ unsafe fn encode(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate
         crate::cache::CollectedRecord::Ready(dest, payload) => Ok((dest, payload, counts(&u.prog, &u.tcx))),
         crate::cache::CollectedRecord::Current => Err("the store already holds the image (nothing to restore from)".into()),
         crate::cache::CollectedRecord::Yielded => Err("yielded to the main thread".into()),
-        crate::cache::CollectedRecord::Failed => Err("the program is not recordable (see RELAX_BOOT_TRACE)".into()),
+        crate::cache::CollectedRecord::Failed => Err("the program is not recordable (see MAKEPAD_RUN_BOOT_TRACE)".into()),
     }
 }
 
@@ -535,7 +535,7 @@ fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cach
     if verify_on() {
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.prog.verify_collected(&prog)));
         if r.is_err() {
-            return Err("RELAX_ZONE_VERIFY: the restored Program differs".into());
+            return Err("MAKEPAD_RUN_ZONE_VERIFY: the restored Program differs".into());
         }
     }
     // the cache, as the warm start opens it, and what the old one learned

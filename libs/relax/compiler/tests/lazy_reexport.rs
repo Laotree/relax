@@ -41,8 +41,8 @@ fn lazy_package_check_retries_the_type_namespace() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["check", "lazy_reexport"])
         .current_dir(&dir)
-        .env("RELAX_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs")
-        .env("RELAX_DEFERRED_TRACE", "1")
+        .env("MAKEPAD_RUN_LAZY_DEFER", "lazy_reexport/child.rs,lazy_reexport/other.rs")
+        .env("MAKEPAD_RUN_DEFERRED_TRACE", "1")
         .output().unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);

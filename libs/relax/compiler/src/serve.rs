@@ -210,7 +210,7 @@ impl Session {
                 let p = &self.unit.prog;
                 let def = p.def(d);
                 let pos = p.files[def.file as usize].ast.item(def.item).lo;
-                (vec![p.record_error(def.file, pos, "typeck", format!("internal compiler error while type-checking {} -- Relax bug, report it", p.def_path(d)))], Vec::new())
+                (vec![p.record_error(def.file, pos, "typeck", format!("internal compiler error while type-checking {} -- makepad run bug, report it", p.def_path(d)))], Vec::new())
             }
         };
         edges.sort_by_key(|d| d.0); edges.dedup();
@@ -275,7 +275,7 @@ impl Session {
         let sess = &self.unit.prog.session.clone();
         let options = &sess.options;
         let start = Instant::now();
-        let trace = std::env::var_os("RELAX_RELOAD_TRACE").is_some();
+        let trace = std::env::var_os("MAKEPAD_RUN_RELOAD_TRACE").is_some();
         if trace { crate::parse_work::begin(); }
         if crate::diag::enabled() {
             // Retained front-end errors still need their structured spans/suggestions
@@ -321,7 +321,7 @@ impl Session {
             let plan = crate::reload::classify(&self.unit.prog, file, &v.pf, &path);
             let pairs = match plan {
                 Ok(plan) => {
-                    if trace { eprintln!("relax-check plan: {}: {} changes, {} added, {} removed, {} uses removed", path, plan.changes.len(), plan.added.len(), plan.removed.len(), plan.removed_uses.len()); }
+                    if trace { eprintln!("makepad-run check plan: {}: {} changes, {} added, {} removed, {} uses removed", path, plan.changes.len(), plan.added.len(), plan.removed.len(), plan.removed_uses.len()); }
                     if !plan.added.is_empty() || !plan.removed.is_empty() || !plan.removed_uses.is_empty() || plan.attributes_changed { rebuild.insert(krate); }
                     for change in plan.changes {
                         match change {
@@ -346,7 +346,7 @@ impl Session {
                     plan.pairs
                 }
                 Err(why) => {
-                    if trace { eprintln!("relax-check rebuild: {}: {:?}", path, why); }
+                    if trace { eprintln!("makepad-run check rebuild: {}: {:?}", path, why); }
                     macro_rebuild |= why.iter().any(|e| e.contains("macro"));
                     rebuild.insert(krate);
                     crate::reload::pair_items(&self.unit.prog.files[file as usize], &v.pf).0
@@ -491,7 +491,7 @@ impl Session {
         self.ms = start.elapsed().as_secs_f64() * 1000.0;
         if trace {
             crate::parse_work::finish().print("check");
-            eprintln!("relax-check timing: parse/classify/commit {:.3}, invalidate/front {:.3}, check {:.3}, trim {:.3} ms",
+            eprintln!("makepad-run check timing: parse/classify/commit {:.3}, invalidate/front {:.3}, check {:.3}, trim {:.3} ms",
                 parsed_ms, invalidated_ms - parsed_ms, checked_ms - invalidated_ms, self.ms - checked_ms);
         }
     }

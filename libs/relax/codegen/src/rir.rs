@@ -1337,12 +1337,12 @@ pub fn split_unwind_info(code: &[u8]) -> (usize, Option<UnwindInfo>) {
     }
 }
 
-/// RELAX_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
+/// MAKEPAD_RUN_UNWIND_STATS: bytes of cleanup pads, landing stubs, unwind trailers; invoke count.
 pub static UNWIND_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 pub fn unwind_stats_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("RELAX_UNWIND_STATS").is_ok())
+    *ON.get_or_init(|| std::env::var("MAKEPAD_RUN_UNWIND_STATS").is_ok())
 }
 
 /// Per stack slot: whether any SlotAddr names it (the only way to reach a slot).

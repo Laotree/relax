@@ -24,14 +24,14 @@ use relax_session::sync::Mutex;
 /// through the loader symbols `relax_recording` / `__relax_recording`): on while the timeline
 /// records or a watcher wants frame spikes.
 #[no_mangle]
-pub static RELAX_RECORDING: AtomicBool = AtomicBool::new(false);
+pub static MAKEPAD_RUN_RECORDING: AtomicBool = AtomicBool::new(false);
 /// the timeline's rings record
 static RINGS_ON: AtomicBool = AtomicBool::new(false);
 /// frame spikes are watched (`watch`, `events follow=1`, `--agent`)
 static FRAME_WATCH: AtomicBool = AtomicBool::new(false);
 
 fn flag_update() {
-    RELAX_RECORDING.store(RINGS_ON.load(Relaxed) || FRAME_WATCH.load(Relaxed), Release);
+    MAKEPAD_RUN_RECORDING.store(RINGS_ON.load(Relaxed) || FRAME_WATCH.load(Relaxed), Release);
 }
 
 /// Frame-time spike detection on (a watcher attached) or off.
@@ -374,7 +374,7 @@ pub fn cmd_timeline(req: &Req, out: &mut Out) {
             let e = EPOCH.load(Relaxed);
             // a forgotten recording stops itself
             { let _k = crate::zone_alloc::kept();
-            let _ = std::thread::Builder::new().name("relax-inspect-tl".into()).spawn(move || {
+            let _ = std::thread::Builder::new().name("run-inspect-tl".into()).spawn(move || {
                 super::heap::exclude_this_thread();
                 std::thread::sleep(std::time::Duration::from_secs(max));
                 if EPOCH.load(Relaxed) == e && RINGS_ON.load(Relaxed) {
@@ -502,7 +502,7 @@ fn frames_cmd(req: &Req, out: &mut Out) {
     let stop = stopped_or_now();
     let ths = build(collect(), stop);
     let Some(ui) = ui_thread(&ths) else {
-        out.err("no records: `timeline start`, use the app, `timeline stop` (makepad's UI phases need the platform's relax hook)");
+        out.err("no records: `timeline start`, use the app, `timeline stop` (makepad's UI phases need the platform's makepad run hook)");
         return;
     };
     let fr = frames_of(&ths[ui]);
@@ -664,7 +664,7 @@ fn save_cmd(out: &mut Out) {
             ev.push(format!("{{\"ph\":\"X\",\"pid\":{},\"tid\":1,\"ts\":{:.3},\"dur\":{:.3},\"name\":{},\"cat\":\"gpu\"}}", pid, b.saturating_sub(t0) as f64 / 1000.0, (e - b) as f64 / 1000.0, json_str(n)));
         }
     }
-    let path = std::env::temp_dir().join(format!("relax-inspect-{}-timeline-{}.json", pid, now_ms()));
+    let path = std::env::temp_dir().join(format!("makepad-run-inspect-{}-timeline-{}.json", pid, now_ms()));
     match std::fs::write(&path, format!("{{\"traceEvents\":[{}]}}", ev.join(",\n"))) {
         Ok(()) => out.line(&format!("{{\"saved\":{},\"events\":{},\"format\":\"Chrome trace events (open in ui.perfetto.dev or chrome://tracing)\"}}", json_str(&path.display().to_string()), ev.len())),
         Err(e) => out.err(&format!("cannot write {}: {}", path.display(), e)),

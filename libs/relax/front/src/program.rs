@@ -544,7 +544,7 @@ pub struct Program {
     pub imports_done: bool,
     /// Rust file selection: imports left unresolved because their lookup stops in
     /// a skipped module (or one that depends on such an import), with the name
-    /// each would bind (None: a glob). Used only by RELAX_LAZY_VERIFY.
+    /// each would bind (None: a glob). Used only by MAKEPAD_RUN_LAZY_VERIFY.
     pub deferred_imports: Vec<(u32, Option<Sym>)>,
     /// Rust file selection: modules whose file was skipped -> (file, its children's directory,
     /// is a mod.rs). load_deferred_module loads one after boot.
@@ -1355,9 +1355,9 @@ impl Program {
                         .map(|(token, (a, b))| format!(" at token {}: lazy {a:?}, eager {b:?}", token + 1)).unwrap_or_default();
                     format!("\nfirst differing source: {}{difference}", complete.file_paths[i])
                 }).unwrap_or_default();
-            return Err(format!("RELAX_LAZY_VERIFY: complete program items, IDs, resolutions, or diagnostics differ from eager{detail}{source}"));
+            return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: complete program items, IDs, resolutions, or diagnostics differ from eager{detail}{source}"));
         }
-        if complete.file_paths != eager.file_paths { return Err("RELAX_LAZY_VERIFY: file order differs from eager".into()); }
+        if complete.file_paths != eager.file_paths { return Err("MAKEPAD_RUN_LAZY_VERIFY: file order differs from eager".into()); }
         for (left, right) in complete.files.iter().zip(&eager.files) { verify_file(left, right); }
         // Compare the actual lazy result as well. Completing the graph must not
         // mask a changed macro expansion, a missing import, or a different binding.
@@ -1367,7 +1367,7 @@ impl Program {
             let krate = self.file_crate[file_index];
             let occurrence = occurrences.entry((krate, path)).or_insert(0);
             let Some((i, _)) = eager.file_paths.iter().enumerate().filter(|(i, p)| *p == path && eager.file_crate[*i] == krate).nth(*occurrence) else {
-                return Err(format!("RELAX_LAZY_VERIFY: lazy-only file {path}"));
+                return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: lazy-only file {path}"));
             };
             *occurrence += 1;
             verify_file(file, &eager.files[i]);
@@ -1378,14 +1378,14 @@ impl Program {
         if actual != expected {
             let first = actual.iter().find(|(key, values)| expected.get(*key) != Some(*values));
             let detail = first.map(|(key, values)| format!("\n{key}\nlazy: {values:?}\neager: {:?}", expected.get(key))).unwrap_or_default();
-            return Err(format!("RELAX_LAZY_VERIFY: a reached module resolves differently from eager{detail}"));
+            return Err(format!("MAKEPAD_RUN_LAZY_VERIFY: a reached module resolves differently from eager{detail}"));
         }
         let errors: Vec<_> = eager.errors.iter().filter(|error| reached.iter().any(|path| error.starts_with(path))).collect();
         if self.errors.iter().collect::<Vec<_>>() != errors {
-            return Err("RELAX_LAZY_VERIFY: reached-file diagnostics differ from eager".into());
+            return Err("MAKEPAD_RUN_LAZY_VERIFY: reached-file diagnostics differ from eager".into());
         }
         if self.session.options.rs_lazy && self.language_snapshot() != eager.language_snapshot() {
-            return Err("RELAX_LAZY_VERIFY: global language items or their diagnostics differ from eager".into());
+            return Err("MAKEPAD_RUN_LAZY_VERIFY: global language items or their diagnostics differ from eager".into());
         }
         let (reached, total) = plan.counts();
         eprintln!("rust-lazy-verify: passed; reached={reached} total={total}; items, IDs, ASTs, resolutions, diagnostics and available indexes match");
@@ -3061,12 +3061,12 @@ impl Program {
     /// the missed name.
     pub fn misses_to_load(&self, misses: &[(u32, String)]) -> Vec<u32> {
         let mut mods = Vec::new();
-        let trace = std::env::var_os("RELAX_DEFERRED_TRACE").is_some();
+        let trace = std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some();
         for (m, name) in misses {
             let skipped = self.skipped_files.contains_key(m);
             let declares = skipped && self.skipped_declares(*m, name);
             if trace {
-                eprintln!("relax-deferred: miss `{}` in {} ({})", name, self.def_path(self.mods[*m as usize].def),
+                eprintln!("makepad-run deferred: miss `{}` in {} ({})", name, self.def_path(self.mods[*m as usize].def),
                     if !skipped { "not skipped" } else if declares { "load" } else { "outline does not bind it" });
             }
             if !mods.contains(m) && declares { mods.push(*m); }
@@ -3355,10 +3355,10 @@ impl Program {
         let trait_scope = retain_load_memos(&mut self.trait_scope, |m, v| !prelude_changed && !invalid.contains(m) && !v.is_empty());
         self.imports_done = true;
         self.load_graph = Some(graph);
-        if std::env::var_os("RELAX_DEFERRED_TRACE").is_some() {
+        if std::env::var_os("MAKEPAD_RUN_DEFERRED_TRACE").is_some() {
             let kept = scope.0 + glob.0 + path_seg.0 + trait_bind.0 + trait_scope.0;
             let dropped = scope.1 + glob.1 + path_seg.1 + trait_bind.1 + trait_scope.1;
-            eprintln!("relax-deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} path_seg={:?} trait_bind={:?} trait_scope={:?} index_built={}",
+            eprintln!("makepad-run deferred: front-load {} imports_retried={} imports_done={} settle_retries={} wait_modules={} modules_invalidated={} cache_kept={} cache_dropped={} prelude_changed={} scope={:?} glob={:?} path_seg={:?} trait_bind={:?} trait_scope={:?} index_built={}",
                 self.def_path(self.mods[m as usize].def), retried, completed, settled, affected.len(),
                 if prelude_changed { self.mods.len() } else { invalid.len() }, kept, dropped, prelude_changed,
                 scope, glob, path_seg, trait_bind, trait_scope, indexed);
@@ -4684,7 +4684,7 @@ impl ParseSnapshot {
             let _timing = crate::parse_work::time(1);
             old.part(&self.cfg);
         }
-        let verify = std::env::var("RELAX_PARSE_VERIFY").as_deref() == Ok("1");
+        let verify = std::env::var("MAKEPAD_RUN_PARSE_VERIFY").as_deref() == Ok("1");
         let full_src = verify.then(|| src.clone());
         let session = crate::parse_work::Session::new(self.reuse.clone());
         let mut v = self.parse_full(src)?;
@@ -5193,7 +5193,7 @@ mod deferred_load_tests {
     #[test]
     fn incremental_load_matches_full_resolution() {
         const SKIP: &str = "load_late.rs,load_other.rs,load_unrelated.rs,load_nested.rs,load_empty.rs";
-        if std::env::var("RELAX_LAZY_DEFER").as_deref() != Ok(SKIP) {
+        if std::env::var("MAKEPAD_RUN_LAZY_DEFER").as_deref() != Ok(SKIP) {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -5201,7 +5201,7 @@ mod deferred_load_tests {
                     "--nocapture",
                     "--test-threads=1",
                 ])
-                .env("RELAX_LAZY_DEFER", SKIP)
+                .env("MAKEPAD_RUN_LAZY_DEFER", SKIP)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));

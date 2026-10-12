@@ -81,7 +81,7 @@ pub fn zone_put_back(taken: ZoneTaken) {
 mod parse_work_bench;
 
 /// The system allocator (Relax's own malloc zone once a program swaps the default zone:
-/// zone_alloc.rs), with per-subsystem accounting when RELAX_MEM_REPORT is set (memstat.rs).
+/// zone_alloc.rs), with per-subsystem accounting when MAKEPAD_RUN_MEM_REPORT is set (memstat.rs).
 #[global_allocator]
 static GLOBAL_ALLOC: memstat::Counting = memstat::Counting;
 
@@ -94,7 +94,7 @@ pub use jit::PROVENANCE;
 
 /// The same, as a marker other binaries find in this one's bytes (provenance_of).
 #[used]
-static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("RELAX_PROVENANCE"), ">>");
+static PROVENANCE_MARK: &str = concat!("<<RELAX-PROVENANCE:", env!("MAKEPAD_RUN_PROVENANCE"), ">>");
 
 /// The compiler stamp a binary file carries (its PROVENANCE_MARK), if any.
 pub fn provenance_of(path: &std::path::Path) -> Option<String> {
@@ -109,10 +109,10 @@ pub fn provenance_of(path: &std::path::Path) -> Option<String> {
 /// script's RUSTC is Relax itself; asked `--version`, it answers this (relax_as_rustc).
 pub const RUSTC_VERSION: &str = "1.98.0";
 
-/// RELAX_AS_RUSTC=1 and `--version` / `-vV` / `-V`: answer as a rustc of RUSTC_VERSION would (build
+/// MAKEPAD_RUN_AS_RUSTC=1 and `--version` / `-vV` / `-V`: answer as a rustc of RUSTC_VERSION would (build
 /// scripts such as libc's read the minor version). Returns whether it answered.
 pub fn relax_as_rustc() -> bool {
-    if std::env::var_os("RELAX_AS_RUSTC").is_none() {
+    if std::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_none() {
         return false;
     }
     let args: Vec<String> = os::proc::args_bytes().iter().skip(1).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
@@ -122,9 +122,9 @@ pub fn relax_as_rustc() -> bool {
     }
     let sess = &session_from_env(&args);
     match args.iter().map(String::as_str).collect::<Vec<_>>().as_slice() {
-        ["--version"] | ["-V"] => println!("rustc {} (relax {})", RUSTC_VERSION, PROVENANCE),
+        ["--version"] | ["-V"] => println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE),
         ["-vV"] | ["--version", "--verbose"] => {
-            println!("rustc {} (relax {})", RUSTC_VERSION, PROVENANCE);
+            println!("rustc {} (makepad run {})", RUSTC_VERSION, PROVENANCE);
             println!("binary: rustc");
             println!("commit-hash: unknown");
             println!("commit-date: unknown");
@@ -174,14 +174,14 @@ pub fn session_from_env(args: &[String]) -> std::sync::Arc<crate::Session> {
 
 pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
     registry_net::install();
-    if std::env::var_os("RELAX_CODE_SIG").is_some() {
+    if std::env::var_os("MAKEPAD_RUN_CODE_SIG").is_some() {
         regalloc::SIG_ON.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     // a program's own arguments after `--` may be any bytes (`makepad run p -- $'\xff'`): Relax
     // reads its own options lossily, the program gets the bytes (run.rs)
     let args: Vec<String> = os::proc::args_bytes().iter().map(|a| String::from_utf8_lossy(a).into_owned()).collect();
     if args.get(1).map(String::as_str) == Some("--version") {
-        println!("relax {}", PROVENANCE);
+        println!("makepad run {}", PROVENANCE);
         std::process::exit(0);
     }
     if args.len() < 3 && !matches!(args.get(1).map(String::as_str), Some("serve" | "clean")) {
@@ -241,7 +241,7 @@ pub fn cli_main(sess: &std::sync::Arc<crate::Session>) {
             let code = surface::cmd_std_surface(sess, &args[2..]);
             std::process::exit(code);
         }
-        "relax-lex" => {
+        "lex" => {
             let code = source_context::cmd_lex(&args[2..]);
             std::process::exit(code);
         }
@@ -500,16 +500,16 @@ fn census_report(crates: &[crates::CrateUnit], per: &[census::Census], total: &c
 
 pub mod std_source;
 
-/// std sources: $RELAX_STD, else <repo>/libs/relax/compiler/std next to the binary's target dir
+/// std sources: $MAKEPAD_RUN_STD, else <repo>/libs/relax/compiler/std next to the binary's target dir
 pub fn std_dir() -> String {
-    match std::env::var("RELAX_STD") {
+    match std::env::var("MAKEPAD_RUN_STD") {
         Ok(d) => d,
         Err(_) => {
             let mut d = std::env::current_exe().unwrap_or_default();
             for _ in 0..3 {
                 d.pop();
             }
-            // <worktree>/<cargo target dir>/release/relax -> <worktree>/libs/relax/compiler/std; node's
+            // <worktree>/<cargo target dir>/release/makepad -> <worktree>/libs/relax/compiler/std; node's
             // layout keeps the sources under <dir>/src
             let direct = format!("{}/libs/relax/compiler/std", d.display());
             if std::path::Path::new(&direct).join("core/lib.rs").exists() {
@@ -751,7 +751,7 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
             rules.push_str(&format!("{} {}  ", n, u.stats.inline_rules[i]));
         }
         println!("inlined call sites by rule: {}", rules);
-        if std::env::var("RELAX_PASS_TIMES").is_ok() {
+        if std::env::var("MAKEPAD_RUN_PASS_TIMES").is_ok() {
             let mut passes = String::new();
             for i in 0..crate::opt::PASS_NAMES.len() {
                 passes.push_str(&format!("{} {:.2}  ", opt::PASS_NAMES[i], opt::PASS_NS[i].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6));
@@ -885,7 +885,7 @@ mod lazy_reload_tests;
 fn round18_rpit_diagnostic() {
     // `makepad test` is process-global (it installs the runtime and exits): run it in a child of
     // this test binary, as lazy_reload_tests does, instead of naming a built makepad binary.
-    const CHILD: &str = "RELAX_ROUND18_RPIT_CHILD";
+    const CHILD: &str = "MAKEPAD_RUN_ROUND18_RPIT_CHILD";
     let dir = env!("CARGO_MANIFEST_DIR");
     if std::env::var_os(CHILD).is_some() {
         let sess = session_from_env(&[]);
@@ -893,7 +893,7 @@ fn round18_rpit_diagnostic() {
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "round18_rpit_diagnostic", "--nocapture", "--test-threads=1"])
-        .env(CHILD, "1").env("RELAX_STD", format!("{dir}/std")).env("RELAX_CACHE", "off")
+        .env(CHILD, "1").env("MAKEPAD_RUN_STD", format!("{dir}/std")).env("MAKEPAD_RUN_CACHE", "off")
         .env("MAKEPAD_HIDE_WINDOWS", "1").env("SANDBOX_MUTE", "1").output().unwrap();
     let all = format!("{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     eprintln!("{all}");

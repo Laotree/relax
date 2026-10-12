@@ -4,13 +4,13 @@
   asmdiff.py [options] <fn path>          e.g.  asmdiff.py relax_bench_rt::sort_ints
 
 Relax side: runs the program under `makepad run` (default: this bench_rt crate, kernel --kernel, steady
-state BENCH_WARM_MS) with RELAX_DUMP=<fn> RELAX_PROFILE (per-instruction samples of the fn), and takes
+state BENCH_WARM_MS) with MAKEPAD_RUN_DUMP=<fn> MAKEPAD_RUN_PROFILE (per-instruction samples of the fn), and takes
 the O3 code (.t1.bin, else O1). rustc side: the symbol of that path in --native (a release build;
 default: built here into $CARGO_TARGET_DIR or <workspace>/target/asmdiff), with the same kernel profile
 unavailable (no profiler on macOS) -- only static code.
 
 Options:
-  --relax <bin>        makepad binary (default: env RELAX, else `makepad` on PATH)
+  --makepad <bin>        makepad binary (default: env MAKEPAD_RUN_BIN, else `makepad` on PATH)
   --native <bin>       rustc release binary holding the symbol
   --kernel <name>      bench_rt kernel to run (default: the fn's last path segment)
   --run "<args>"       instead of a kernel: `makepad run --quiet <args>` (cwd: --dir), e.g. "makepad-app-amp"
@@ -310,7 +310,7 @@ def relax_side(fn, a):
     d = a["dumps"]
     if not d:
         d = tempfile.mkdtemp(prefix="asmdiff-")
-        env = dict(os.environ, RELAX_DUMP=fn, RELAX_DUMP_DIR=d, RELAX_PROFILE=os.path.join(d, "profile.tsv"))
+        env = dict(os.environ, MAKEPAD_RUN_DUMP=fn, MAKEPAD_RUN_DUMP_DIR=d, MAKEPAD_RUN_PROFILE=os.path.join(d, "profile.tsv"))
         env.setdefault("SANDBOX_MUTE", "1")
         if a["run"]:
             cmd = [a["relax"], "run", "--quiet"] + a["run"].split()
@@ -318,7 +318,7 @@ def relax_side(fn, a):
             env["BENCH_WARM_MS"] = a["warm"]
             env.setdefault("BENCH_REPS", "20")
             env.setdefault("BENCH_FONT", os.path.normpath(os.path.join(HERE, "../../../../widgets/resources/IBMPlexSans-Text.ttf")))
-            env.setdefault("RELAX_STD", os.path.join(HERE, "../std"))
+            env.setdefault("MAKEPAD_RUN_STD", os.path.join(HERE, "../std"))
             cmd = [a["relax"], "run", "--quiet", "relax-bench-rt", "--", a["kernel"] or fn.split("::")[-1]]
         r = subprocess.run(["nice", "-n", "10"] + cmd, cwd=a["dir"], env=env, capture_output=True, text=True)
         if r.returncode != 0:
@@ -370,12 +370,12 @@ def tally(rows):
 
 def main():
     args = sys.argv[1:]
-    a = {"relax": os.environ.get("RELAX", "makepad"), "native": None, "kernel": None, "run": None, "dir": HERE, "dumps": None, "warm": "3000", "width": 64, "raw": False, "only": None}
+    a = {"relax": os.environ.get("MAKEPAD_RUN_BIN", "makepad"), "native": None, "kernel": None, "run": None, "dir": HERE, "dumps": None, "warm": "3000", "width": 64, "raw": False, "only": None}
     fn = None
     i = 0
     while i < len(args):
         x = args[i]
-        if x in ("--relax", "--native", "--kernel", "--run", "--dir", "--dumps", "--warm", "--only"):
+        if x in ("--makepad", "--native", "--kernel", "--run", "--dir", "--dumps", "--warm", "--only"):
             a[x[2:]] = args[i + 1]
             i += 2
         elif x == "--width":

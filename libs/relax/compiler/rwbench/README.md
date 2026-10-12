@@ -63,7 +63,7 @@ the binaries in alternating order (base, new / new, base / ...). Per name it pri
 of the steady ms with the [min..max] spread, the Relax/rustc ratio (median of the per-round ratios, so drift hits both
 sides) with its spread, time-to-steady, O3 coverage and whether all checksums agree. With several names a final A/B
 table gives new/base per workload (median of per-round ratios, spread) and the geomean. The first name is the base; the
-same binary under two names measures the noise floor. `RW_MS` (4000) is the per-process iteration budget, `RELAX_STD`
+same binary under two names measures the noise floor. `RW_MS` (4000) is the per-process iteration budget, `MAKEPAD_RUN_STD`
 defaults to `../std`, `RUN_PREFIX` defaults to `nice -n 10` (`none` on Windows). Timing belongs on the quiet machines
 through the bench queue:
 

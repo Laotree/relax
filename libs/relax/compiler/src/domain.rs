@@ -570,7 +570,7 @@ pub enum Stop {
 /// The HAL already delivered quit (or freed the session). Never terminate a thread: retain
 /// everything on timeout, because a late callback can still use its statics and leaked boxes.
 pub fn stop(id: DomainId, how: Stop) -> Result<(), String> {
-    let ms = std::env::var("RELAX_DOMAIN_JOIN_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5000);
+    let ms = std::env::var("MAKEPAD_RUN_DOMAIN_JOIN_MS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(5000);
     stop_for(id, std::time::Duration::from_millis(if how == Stop::Kill { ms / 5 } else { ms }))
 }
 
@@ -609,7 +609,7 @@ fn stop_for(id: DomainId, timeout: std::time::Duration) -> Result<(), String> {
                 // Publish while holding the same lock as the last-thread teardown decision.
                 d.info.state = DomainState::Leaked { threads: n };
                 drop(ds);
-                eprintln!("relax-domain: {id}: leaked {n} threads: {names}");
+                eprintln!("makepad-run domain: {id}: leaked {n} threads: {names}");
                 notify_state(id, &DomainState::Leaked { threads: n });
             } else {
                 // Compilation owns its temporary state until the next cancellation boundary.
@@ -1003,7 +1003,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     // the libraries the new crates link
     let (_, missing) = crate::run::link_libraries(unsafe { &(*up).prog }, &g.link_libs, first_file);
     if !missing.is_empty() && crate::run::VERBOSE.load(std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("relax-domain: libraries not found: {:?}", missing);
+        eprintln!("makepad-run domain: libraries not found: {:?}", missing);
     }
     // the macro world only the load needed goes again (hot reload and later loads rebuild it)
     if crate::pmhost::free_world() {
@@ -1238,8 +1238,8 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
             if crate::run_state::observed() {
                 for e in &added.errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
             }
-            let max: usize = std::env::var("RELAX_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-            eprintln!("relax-domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
+            let max: usize = std::env::var("MAKEPAD_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
+            eprintln!("makepad-run domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
             for e in added.errs.iter().take(max) {
                 eprintln!("  {}", e);
             }
@@ -1265,20 +1265,20 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
 /// later, and what its static block holds.
 pub(crate) fn run_vehicle(up: *mut Unit, packages: Vec<String>) {
     let upn = up as usize;
-    let _ = std::thread::Builder::new().name("relax-domains".to_string()).spawn(move || {
+    let _ = std::thread::Builder::new().name("run-domains".to_string()).spawn(move || {
         let up = upn as *mut Unit;
         let wait = std::time::Duration::from_secs(180);
         let primary = crate::run::app_domain().unwrap_or(0);
         let ff0 = wait_first_frame(primary, wait);
         let (rss, pss) = process_memory_kb();
-        eprintln!("relax-domain: id={primary} first_frame_ms={} rss_kb={} pss_kb={}", ff0.map_or("none".to_string(), |x| format!("{x:.0}")), rss, pss);
+        eprintln!("makepad-run domain: id={primary} first_frame_ms={} rss_kb={} pss_kb={}", ff0.map_or("none".to_string(), |x| format!("{x:.0}")), rss, pss);
         for pkg in packages {
             let (rss0, pss0) = process_memory_kb();
             let t = std::time::Instant::now();
             let id = match start(up, AppSpec { package: pkg.clone(), ..Default::default() }) {
                 Ok(id) => id,
                 Err(e) => {
-                    eprintln!("relax-domain: {pkg}: start failed: {}", e.join(" | "));
+                    eprintln!("makepad-run domain: {pkg}: start failed: {}", e.join(" | "));
                     continue;
                 }
             };
@@ -1289,13 +1289,13 @@ pub(crate) fn run_vehicle(up: *mut Unit, packages: Vec<String>) {
             let (rss2, pss2) = process_memory_kb();
             let i = info(id).unwrap();
             eprintln!(
-                "relax-domain: id={id} pkg={pkg} state={:?} crates={} reused={} new={} start_call_ms={started_ms:.0} resolve_ms={:.0} load_ms={:.0} spawn_ms={:.0} first_frame_ms={} block_committed_kb={} new_crates=[{}] rss_kb={rss0}/{rss1}/{rss2} pss_kb={pss0}/{pss1}/{pss2}",
+                "makepad-run domain: id={id} pkg={pkg} state={:?} crates={} reused={} new={} start_call_ms={started_ms:.0} resolve_ms={:.0} load_ms={:.0} spawn_ms={:.0} first_frame_ms={} block_committed_kb={} new_crates=[{}] rss_kb={rss0}/{rss1}/{rss2} pss_kb={pss0}/{pss1}/{pss2}",
                 i.state, i.crates, i.reused, i.loaded, i.resolve_ms, i.load_ms, i.spawn_ms,
                 ff.map_or("none".to_string(), |x| format!("{x:.0}")), block_committed(i.base) / 1024, i.new_crates.join(",")
             );
         }
         for d in list() {
-            eprintln!("relax-domain: list id={} pkg={} state={:?} first_frame_ms={:?}", d.id, d.package, d.state, d.first_frame_ms.map(|x| x.round()));
+            eprintln!("makepad-run domain: list id={} pkg={} state={:?} first_frame_ms={:?}", d.id, d.package, d.state, d.first_frame_ms.map(|x| x.round()));
         }
     });
 }

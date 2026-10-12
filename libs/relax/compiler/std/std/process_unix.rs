@@ -440,15 +440,15 @@ impl Command {
     /// Under `makepad run` the program's executable is Relax itself: spawning it runs this
     /// program again (Relax's command line up to `--`, then the new arguments). A spawn of the
     /// loader whose first argument is `run` is a launcher starting another program through it
-    /// (`$RELAX_LOADER run [flags] <package> ...`): that one runs as written.
+    /// (`$MAKEPAD_RUN_LOADER run [flags] <package> ...`): that one runs as written.
     fn self_exec_args(&self) -> Option<Vec<OsString>> {
-        let pre = crate::env::var("RELAX_SELF_EXEC").ok()?;
+        let pre = crate::env::var("MAKEPAD_RUN_SELF_EXEC").ok()?;
         if self.args.get(1).is_some_and(|a| a.as_encoded_bytes() == b"run") {
             return None;
         }
-        // inside a build script (RELAX_AS_RUSTC): its spawns of this executable are RUSTC
+        // inside a build script (MAKEPAD_RUN_AS_RUSTC): its spawns of this executable are RUSTC
         // questions, answered as written (relax_as_rustc); re-running the script would recurse
-        if crate::env::var_os("RELAX_AS_RUSTC").is_some() {
+        if crate::env::var_os("MAKEPAD_RUN_AS_RUSTC").is_some() {
             return None;
         }
         let parts: Vec<&str> = pre.split('\u{1f}').collect();
@@ -480,8 +480,8 @@ impl Command {
     }
 
     /// A current folder under Relax's VFS (a git repository run) is no folder the OS knows: the
-    /// child keeps this process's real folder and gets the virtual one as RELAX_WORKSPACE plus the
-    /// mount table (RELAX_VFS), which a Relax program's std and Relax itself serve paths from. A
+    /// child keeps this process's real folder and gets the virtual one as MAKEPAD_RUN_WORKSPACE plus the
+    /// mount table (MAKEPAD_RUN_VFS), which a Relax program's std and Relax itself serve paths from. A
     /// real current folder clears an inherited virtual one.
     fn spawn_with_mode(&mut self, default: Stdio, exec: bool) -> io::Result<Child> {
         // NDK r28 spawn.h: addchdir_np requires API 34; spawning itself requires API 28.
@@ -498,15 +498,15 @@ impl Command {
         let r = match virt {
             Some((abs, _)) => {
                 self.cwd = None;
-                self.env("RELAX_WORKSPACE", abs.as_os_str());
-                self.env("RELAX_VFS", crate::fs::vfs::mounts());
+                self.env("MAKEPAD_RUN_WORKSPACE", abs.as_os_str());
+                self.env("MAKEPAD_RUN_VFS", crate::fs::vfs::mounts());
                 let r = self.spawn_now(default, exec);
                 self.cwd = Some(dir);
                 r
             }
             None => {
-                if crate::env::var_os("RELAX_WORKSPACE").is_some() {
-                    self.env_remove("RELAX_WORKSPACE");
+                if crate::env::var_os("MAKEPAD_RUN_WORKSPACE").is_some() {
+                    self.env_remove("MAKEPAD_RUN_WORKSPACE");
                 }
                 self.spawn_now(default, exec)
             }
@@ -519,15 +519,15 @@ impl Command {
         let mut self_exec = self.self_exec_args();
         // replacing this process with the program again (an exec, not a spawn) continues the
         // live session: the `--silent` Relax added for re-runs (it ends live editing) goes
-        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::var_os("RELAX_SELF_EXEC_SILENT_ADDED").is_some()) {
+        if let Some(v) = self_exec.as_mut().filter(|_| exec && crate::env::var_os("MAKEPAD_RUN_SELF_EXEC_SILENT_ADDED").is_some()) {
             if v.get(2).is_some_and(|a| a.as_encoded_bytes() == b"--silent") {
                 v.remove(2);
             }
         }
         // ... and its clocks go on from this process's start (relax base clock.rs EXEC_ORIGIN_ENV)
         if exec && self_exec.is_some() {
-            if let Some(t0) = crate::env::var_os("RELAX_RUN_STARTUP_T0") {
-                self.env("RELAX_EXEC_ORIGIN_EPOCH", &t0);
+            if let Some(t0) = crate::env::var_os("MAKEPAD_RUN_STARTUP_T0") {
+                self.env("MAKEPAD_RUN_EXEC_ORIGIN_EPOCH", &t0);
             }
         }
         let prog = match &self_exec {

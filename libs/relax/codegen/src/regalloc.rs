@@ -37,7 +37,7 @@ pub enum Loc {
     None,
 }
 
-/// Set by drivers that compare builds (RELAX_CODE_SIG): backends then report `alloc_sig`.
+/// Set by drivers that compare builds (MAKEPAD_RUN_CODE_SIG): backends then report `alloc_sig`.
 pub static SIG_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Hash of an allocation (every vreg's location, frame, saves): address-independent, so
@@ -486,7 +486,7 @@ impl Ranges {
     }
 }
 
-/// RELAX_RA_PRIO: allocation order by weighted references (default: the values whose spilling
+/// MAKEPAD_RUN_RA_PRIO: allocation order by weighted references (default: the values whose spilling
 /// costs most go first; live-range splitting keeps long ones from blocking whole functions),
 /// `len` (per position of live range), `sqrt` (per square root of the length)
 fn ra_prio(options: &relax_session::Options) -> u8 {
@@ -1789,7 +1789,7 @@ fn block_weights(options: &relax_session::Options, f: &Func, reach: &[bool], fre
     }
 }
 
-/// RELAX_FREQ_MODE: how block weights use sampled frequencies -- sampled (0: samples dominate),
+/// MAKEPAD_RUN_FREQ_MODE: how block weights use sampled frequencies -- sampled (0: samples dominate),
 /// static (1: loop depth + cold paths, samples ignored), blend (2, default: static x up to 8 by samples)
 fn freq_mode(options: &relax_session::Options) -> u8 {
     options.freq_mode as u8
@@ -2050,7 +2050,7 @@ fn spill_weights(f: &Func, reach: &[bool], tab: &OpTab, ranges: &Ranges, wts: &[
     (refs, lens)
 }
 
-/// Allocation priority from weighted references and live-range length (RELAX_RA_PRIO).
+/// Allocation priority from weighted references and live-range length (MAKEPAD_RUN_RA_PRIO).
 fn prio(options: &relax_session::Options, refs: f32, len: u32) -> f32 {
     match ra_prio(options) {
         1 => refs,
@@ -2240,12 +2240,12 @@ fn build_ranges(f: &Func, reach: &[bool], tab: &OpTab, block_start: &[u32], bloc
 
 // ------------------------------------------------------------ live-range splitting at loops
 
-/// RELAX_NO_THROUGH=1: no passed-through loop pieces (split_loops)
+/// MAKEPAD_RUN_NO_THROUGH=1: no passed-through loop pieces (split_loops)
 fn through_on(options: &relax_session::Options) -> bool {
     !options.no_through
 }
 
-/// RELAX_NO_WINDOWS=1: no spill windows (Alloc::windows)
+/// MAKEPAD_RUN_NO_WINDOWS=1: no spill windows (Alloc::windows)
 fn windows_on(options: &relax_session::Options) -> bool {
     !options.no_windows
 }
@@ -2345,7 +2345,7 @@ fn allocate_split_inner(options: &relax_session::Options, f: &Func, cfg: &RegCon
 /// call -- an Rc drop_slow, a Vec grow inlined into the loop -- needs a callee-saved register for
 /// the whole loop or spills: x64 has five.) Returns the rewritten copy, or None.
 fn trace_on(f: &Func) -> bool {
-    match std::env::var("RELAX_RA_TRACE") {
+    match std::env::var("MAKEPAD_RUN_RA_TRACE") {
         Ok(w) => f.name.ends_with(w.as_str()),
         Err(_) => false,
     }
@@ -2577,7 +2577,7 @@ fn allocate_split_loops_inner(options: &relax_session::Options, f: &Func, al: Al
         }
         al2 = allocate_low(options, &g, cfg, true, gfreq, Some(&through), Some(&origin));
     }
-    if let Ok(w) = std::env::var("RELAX_RA_TRACE") {
+    if let Ok(w) = std::env::var("MAKEPAD_RUN_RA_TRACE") {
         if f.name.ends_with(w.as_str()) {
             let n1 = al.loc.iter().filter(|l| matches!(l, Loc::Stack(_))).count();
             let n2 = al2.loc.iter().filter(|l| matches!(l, Loc::Stack(_))).count();
@@ -3199,7 +3199,7 @@ fn pack_spill_slots(f: &Func, reach: &[bool], block_start: &[u32], loc: &mut [Lo
     bytes
 }
 
-/// RELAX_NO_SLOT_SHARE=1: every spilled value keeps a slot of its own
+/// MAKEPAD_RUN_NO_SLOT_SHARE=1: every spilled value keeps a slot of its own
 fn slot_share_on(options: &relax_session::Options) -> bool {
     !options.no_slot_share
 }

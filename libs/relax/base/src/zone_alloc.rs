@@ -30,7 +30,7 @@
 //! phase, so a block can be freed from any thread in any phase. A realloc moves a compiler block
 //! to the system heap when it grows in the kept phase; a system block never moves into the
 //! compiler arena (a program block must not end up where a later destroy would take it).
-//! `RELAX_COMPILER_ARENA=0` turns compiler routing off (read once, without allocating).
+//! `MAKEPAD_RUN_COMPILER_ARENA=0` turns compiler routing off (read once, without allocating).
 //!
 //! The JIT allocator ABI selects a domain heap through thread-local ownership (domain.rs).
 //! Native shims and runtime helpers use this global allocator and stay shared. Domain frees
@@ -40,7 +40,7 @@
 #[allow(dead_code)]
 mod burst {
     pub const COMPILER: bool = false;
-    pub const LABEL: &std::ffi::CStr = c"relax-burst";
+    pub const LABEL: &std::ffi::CStr = c"makepad-run-burst";
     include!("zone_alloc/arena.rs");
     #[cfg(test)]
     include!("zone_alloc/arena_tests.rs");
@@ -49,7 +49,7 @@ mod burst {
 #[allow(dead_code)]
 mod compiler {
     pub const COMPILER: bool = true;
-    pub const LABEL: &std::ffi::CStr = c"relax-compiler";
+    pub const LABEL: &std::ffi::CStr = c"makepad-run-compiler";
     include!("zone_alloc/arena.rs");
 }
 
@@ -216,7 +216,7 @@ pub fn compiler_tombstones() -> usize {
     compiler::tombstones()
 }
 
-/// Whether compiler-phase routing is on in this process (`RELAX_COMPILER_ARENA=0` turns it off).
+/// Whether compiler-phase routing is on in this process (`MAKEPAD_RUN_COMPILER_ARENA=0` turns it off).
 pub fn compiler_arena_enabled() -> bool {
     enabled()
 }
@@ -229,7 +229,7 @@ fn decide() -> bool {
             fn getenv(name: *const u8) -> *const u8;
         }
         // std::env would allocate, and this runs inside the allocator's first routed call
-        let p = getenv(c"RELAX_COMPILER_ARENA".as_ptr().cast());
+        let p = getenv(c"MAKEPAD_RUN_COMPILER_ARENA".as_ptr().cast());
         !p.is_null() && *p == b'0' && *p.add(1) == 0
     };
     #[cfg(not(unix))]
@@ -339,7 +339,7 @@ pub fn live_compiler_threads() -> Vec<String> {
 
 /// Frees of destroyed-generation blocks are expected from now on (the boot frame of the main
 /// thread drops its compiler-phase locals when the program's `main` returns): still counted,
-/// no longer fatal under RELAX_ZONE_CHECK.
+/// no longer fatal under MAKEPAD_RUN_ZONE_CHECK.
 pub fn tombstone_frees_expected() {
     compiler::tombstone_expected();
 }
@@ -367,7 +367,7 @@ pub fn kept_clone<T: Clone>(v: &T) -> T {
 }
 
 /// Does `p` lie in the compiler arena (a block there is destroyed by step 1b)? The check
-/// `RELAX_ZONE_CHECK=1` runs over the kept state.
+/// `MAKEPAD_RUN_ZONE_CHECK=1` runs over the kept state.
 #[inline]
 pub fn compiler_owns(p: *const u8) -> bool {
     compiler::owns(p as *mut u8)
@@ -432,7 +432,7 @@ mod zone {
             return z;
         }
         let z = unsafe { malloc_create_zone(0, 0) };
-        unsafe { malloc_set_zone_name(z, b"relax\0".as_ptr()) };
+        unsafe { malloc_set_zone_name(z, b"makepad-run\0".as_ptr()) };
         match ZONE.compare_exchange(std::ptr::null_mut(), z, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => z,
             Err(w) => w,
@@ -556,7 +556,7 @@ unsafe impl GlobalAlloc for RelaxAlloc {
         }
         if compiler::owns(p) {
             if compiler::tombstone_of(p as usize).is_some() {
-                // a destroyed block: counted (an abort under RELAX_ZONE_CHECK); its bytes are
+                // a destroyed block: counted (an abort under MAKEPAD_RUN_ZONE_CHECK); its bytes are
                 // gone, so the new block is not a copy
                 compiler::tombstone_hit(p, "realloc");
                 return self.alloc(Layout::from_size_align_unchecked(size, l.align()));

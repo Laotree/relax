@@ -414,7 +414,7 @@ pub struct Closure {
     pub reasons: Vec<(String, String)>,
     pub items: usize,
     pub used_items: usize,
-    /// RELAX_ITEMS_TRACE only: per reached file, the file whose evaluated
+    /// MAKEPAD_RUN_ITEMS_TRACE only: per reached file, the file whose evaluated
     /// reference first produced the name/member that reached it, and that key.
     pub parents: Vec<Option<(Option<usize>, String)>>,
 }
@@ -495,7 +495,7 @@ pub fn closure(names: &mut demand::Names, files: &mut [FileInput<'_>], seeds: BT
     let mut reasons = vec![(String::new(), String::new()); n];
     let mut item_used: Vec<Vec<bool>> = parsed.iter().map(|items| vec![false; items.len()]).collect();
     let mut member_used: Vec<Vec<Vec<bool>>> = parsed.iter().map(|items| items.iter().map(|i| vec![false; i.members.len()]).collect()).collect();
-    let trace = std::env::var_os("RELAX_ITEMS_TRACE").is_some();
+    let trace = std::env::var_os("MAKEPAD_RUN_ITEMS_TRACE").is_some();
     let started = std::time::Instant::now();
     if trace { eprintln!("rs-items-prep: {:?}", entry.elapsed()); }
     let mut causes = BTreeMap::<String, usize>::new();

@@ -58,16 +58,16 @@ fn server_thread_exit() {
     SERVER_TIDS.lock().unwrap().retain(|t| *t != me);
 }
 
-/// Starts the inspect thread for program `app` (once per process; RELAX_INSPECT=0: off).
+/// Starts the inspect thread for program `app` (once per process; MAKEPAD_RUN_INSPECT=0: off).
 pub fn start(app: &str) {
-    if std::env::var("RELAX_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
+    if std::env::var("MAKEPAD_RUN_INSPECT").map_or(false, |v| v == "0") || STARTED.swap(true, Relaxed) {
         return;
     }
     let _k = crate::zone_alloc::kept();
     *APP.lock().unwrap() = app.to_string();
     let pid = std::process::id();
     let log = crate::tui::session_log_path().map(|p| p.display().to_string()).unwrap_or_default();
-    let extra = format!(",\"session_log\":{},\"relax\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));
+    let extra = format!(",\"session_log\":{},\"run\":{},\"agent\":{}", json_str(&log), json_str(crate::jit::PROVENANCE), AGENT.load(Relaxed));
     let endpoint = makepad_remote::Endpoint::new(app);
     endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
     endpoint.register_cmd(dispatch);
@@ -95,14 +95,14 @@ pub fn start(app: &str) {
 pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("session", "relaunch", "restart the app domain in this process, keeping its host window and GPU device"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
-    ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / Relax runtime / system), its hot fns, the owner's service, other busy threads"),
+    ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / makepad run runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
     ("timeline", "start [max_s=30] | stop | frames [n=30] | frame <n|slowest> | save", "dataflow timeline: record UI phases, owner service, waits and wakes; per frame the critical path, work vs critical path vs wall, longest waits and who ended them; save = Chrome trace JSON"),
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
     ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
-    ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, Relax's own parts, findings, growth since the last `memory`"),
+    ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, makepad run's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
     ("heap", "start [rate=65536] [ttl_s=600] | top [by=live|alloc|freed|peak] | snap <name> | diff <a> <b|now> | path H<id> | stop | status", "program heap by allocation stack (JIT-patched allocator hooks, byte-sampled): live, allocated, freed; growth and leaks between snapshots"),
@@ -116,7 +116,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("probes", "", "installed probes with hits and time, parked breakpoints, pause state"),
     ("rm", "<G<n>|all>", "removes probe groups: the code they replaced comes back (no recompile)"),
     ("continue", "[K<n>|all]", "lets parked breakpoint hits go"),
-    ("pause", "", "stops the program's threads (Relax's and inspect's keep running); stacks work while paused"),
+    ("pause", "", "stops the program's threads (makepad run's and inspect's keep running); stacks work while paused"),
     ("resume", "", "after pause: the program runs again (`resume P<n> panic` releases a parked panic)"),
     ("gpu", "[top [by=bytes|owner|site|churn] [n=15]|idle [frames=1800] [n=15]|snap <name>|diff <a> <b|now>|path <session>:<kind>:<index>:<generation>]", "HAL GPU memory: totals per session, kind and owner against the device (native apps: MAKEPAD_INSPECT=1 or MAKEPAD_REMOTE=1)"),
     ("vms", "", "every live Splash VM: label, thread, heap objects / strings / arrays and bytes, GC runs and time, errors, evaluations"),
@@ -236,9 +236,9 @@ fn role(name: &str, os_id: u64, handle: u64) -> &'static str {
     }
     let _ = os_id;
     match name {
-        n if n.starts_with("relax-inspect") || n.starts_with("makepad-remote") => "inspect",
-        n if n.starts_with("relax-spec") || n.starts_with("relax-O2") || n.starts_with("relax-o3") || n.starts_with("relax-ahead") || n == "gandalf" || n.starts_with("relax-check") => "compiler",
-        n if n.starts_with("relax-") => "relax",
+        n if n.starts_with("run-inspect") || n.starts_with("makepad-remote") => "inspect",
+        n if n.starts_with("run-spec") || n.starts_with("run-O2") || n.starts_with("run-o3") || n.starts_with("run-ahead") || n == "gandalf" || n.starts_with("run-check") => "compiler",
+        n if n.starts_with("run-") => "makepad run",
         _ => "program",
     }
 }

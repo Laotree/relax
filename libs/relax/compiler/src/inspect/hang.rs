@@ -150,7 +150,7 @@ pub fn why_hung(req: &Req, out: &mut Out) {
         } else {
             let top = syms[m].first().map(|f| f.name.clone()).unwrap_or_default();
             verdict = "idle";
-            detail = format!("main is not in a Relax-visible wait and uses {}% CPU: waiting for events or sleeping in {}", busy, super::short(&top, 100));
+            detail = format!("main is not in a JIT-visible wait and uses {}% CPU: waiting for events or sleeping in {}", busy, super::short(&top, 100));
         }
     } else {
         verdict = "unknown";

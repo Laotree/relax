@@ -403,7 +403,7 @@ impl<'a> Lcx<'a> {
             let krate = self.u.prog.def(*d).krate;
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.relax_only_instance(t) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("a field of `{}` is read from Relax-compiled code, but `{}` lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: call a method of the crate instead", ts, ts));
+                self.err(self.pos, format!("a field of `{}` is read from JIT-compiled code, but `{}` lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: call a method of the crate instead", ts, ts));
             }
         }
     }
@@ -414,11 +414,11 @@ impl<'a> Lcx<'a> {
         let krate = self.u.prog.def(d).krate;
         if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) {
             let name = self.u.prog.def_path(d);
-            self.err(self.pos, format!("static `{}` is read from Relax-compiled code, but it lives in a provided crate (built by rustc into the loader), where its one copy is: call a fn of the crate instead", name));
+            self.err(self.pos, format!("static `{}` is read from JIT-compiled code, but it lives in a provided crate (built by rustc into the loader), where its one copy is: call a fn of the crate instead", name));
         }
     }
 
-    /// A type only Relax-compiled code makes: no bound fn's signature reaches it
+    /// A type only JIT-compiled code makes: no bound fn's signature reaches it
     /// (provided::crossing_types), e.g. an inline shell's result or `LiveIdMap<LiveId, X>`.
     /// A provided crate's type whose values reach its rustc code (a bound fn takes or returns
     /// it) cannot be built here: rustc would read Relax's layout of its non-C-shaped fields.
@@ -427,7 +427,7 @@ impl<'a> Lcx<'a> {
             let krate = self.u.prog.def(*d).krate;
             if self.u.provided.iter().any(|(k, _)| *k == krate) && !crate::provided::trusted(&self.u.prog, &self.u.tcx, krate, t, 0) && !self.relax_only_instance(t) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("`{}` is built in Relax-compiled code, but values of it reach the rustc-built code of its provided crate (a bound fn takes or returns it) and its layout is not C-shaped: build it with a fn of the crate, or keep it out of bound signatures", ts));
+                self.err(self.pos, format!("`{}` is built in JIT-compiled code, but values of it reach the rustc-built code of its provided crate (a bound fn takes or returns it) and its layout is not C-shaped: build it with a fn of the crate, or keep it out of bound signatures", ts));
             }
         }
     }
@@ -465,7 +465,7 @@ impl<'a> Lcx<'a> {
         let std_owner = path.starts_with("alloc::") || path.starts_with("std::") || path.starts_with("core::");
         if std_owner && RAW.iter().any(|r| path.ends_with(r)) {
             let key = crate::provided::key(&self.u.prog, &self.u.tcx, d);
-            self.err(self.pos, format!("`{}` calls `{}` in Relax-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with Relax's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
+            self.err(self.pos, format!("`{}` calls `{}` in JIT-compiled code, but `{}` lives in a provided crate: it works an object rustc allocated with makepad run's std, whose layout differs: mark it #[relax_api] (an op), or make it generic over the type JIT code allocates (an instance of a generic fn is compiled for its caller's type)", key, path, key));
         }
     }
 
@@ -474,12 +474,12 @@ impl<'a> Lcx<'a> {
     }
 
     /// An opaque provided enum (provided.rs; rustc's layout, no tag known to Relax) cannot be
-    /// matched on or built by variant in Relax-compiled code.
+    /// matched on or built by variant in JIT-compiled code.
     fn check_provided_opaque_enum(&mut self, t: TyId, what: &str) {
         if let TyKind::Adt(d, a, _) = self.kind(t) {
             if a.is_empty() && self.u.provided_types.contains_key(&d) {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("`{}` is {} by variant in Relax-compiled code, but it lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: use a method of the crate (e.g. a fieldless kind)", ts, what));
+                self.err(self.pos, format!("`{}` is {} by variant in JIT-compiled code, but it lives in a provided crate (built by rustc into the loader) and its layout is not C-shaped: use a method of the crate (e.g. a fieldless kind)", ts, what));
             }
         }
     }
@@ -788,7 +788,7 @@ impl<'a> Lcx<'a> {
         if too_big {
             let t = u.tcx.tys.erase_regions(t);
             let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-            self.err(self.pos, format!("type `{}` is 4 GiB or larger, which Relax does not lay out yet", ts));
+            self.err(self.pos, format!("type `{}` is 4 GiB or larger, which makepad run does not lay out yet", ts));
         }
         l
     }
@@ -1018,7 +1018,7 @@ impl<'a> Lcx<'a> {
                 // unreachable code after a diverging expression legitimately has no value
                 if self.errors.is_empty() && !self.cur_unreachable() {
                     let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- Relax bug, report it", ts, r.len(), leaves.len()));
+                    self.err(self.pos, format!("internal: value of `{}` has {} parts, expected {} -- makepad run bug, report it", ts, r.len(), leaves.len()));
                 }
                 for lf in &leaves[r.len()..] {
                     let d = self.f.vreg(lf.cls);
@@ -1103,7 +1103,7 @@ impl<'a> Lcx<'a> {
         }
     }
 
-    /// RELAX_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
+    /// MAKEPAD_RUN_FIELD_PROF: one field-access site of the body being lowered (jit.rs field_note).
     #[allow(clippy::too_many_arguments)]
     fn field_note(&mut self, t: TyId, adt: &crate::tcx::AdtT, fi: u32, off: u32, fsz: u32, ssz: u32, salign: u32) {
         let prog = &self.u.prog;
@@ -1149,13 +1149,13 @@ impl<'a> Lcx<'a> {
     /// fields not yet set taken from their `Default`, then the field's place in the block.
     fn ext_project(&mut self, p: &Place, t: TyId, fi: u32) -> (Place, TyId) {
         let Some((ext_off, fields, size, align)) = ext_fields(self.u, t) else {
-            self.err(self.pos, "internal: extension field of a struct without an extension word -- Relax bug, report it".to_string());
+            self.err(self.pos, "internal: extension field of a struct without an extension word -- makepad run bug, report it".to_string());
             return (Place::Regs(Vec::new()), self.u.tcx.tys.error);
         };
         let (base, boff) = match p {
             Place::Mem(r, o) => (*r, *o),
             Place::Regs(_) => {
-                self.err(self.pos, "internal: a live-editable struct in registers -- Relax bug, report it".to_string());
+                self.err(self.pos, "internal: a live-editable struct in registers -- makepad run bug, report it".to_string());
                 return (Place::Regs(Vec::new()), self.u.tcx.tys.error);
             }
         };
@@ -1262,7 +1262,7 @@ impl<'a> Lcx<'a> {
                 // ends here, so this is where it is refused (provided.rs)
                 if self.u.provided_types.contains_key(d) {
                     let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                    self.err(self.pos, format!("a field of `{}` is reached from Relax-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and its layout is rustc's alone: call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, ts));
+                    self.err(self.pos, format!("a field of `{}` is reached from JIT-compiled code (a field access, a pattern or a trait impl's body), but `{}` lives in a provided crate (built by rustc into the loader) and its layout is rustc's alone: call a fn of the crate, or route the impl to rustc's (jit.rs provided_fmt_hash)", ts, ts));
                     // the fn fails with the error above; lowering goes on over a scratch place of
                     // the field's type so nothing after it trips over a shapeless one
                     let ft = self.u.tcx.adts.get(d).and_then(|a| a.variants.get(vi as usize)).and_then(|v| v.fields.get(fi as usize)).map(|_| self.u.tcx.field_ty(&self.u.prog, crate::tcx::TypingEnv::fully_monomorphized(&self.u.prog), *d, vi, fi, self.u.tcx.tys.list(*args))).unwrap_or(self.u.tcx.tys.unit);
@@ -1279,7 +1279,7 @@ impl<'a> Lcx<'a> {
                 } else {
                     l.fields.get(fi as usize).copied()
                 };
-                // RELAX_FIELD_PROF: a struct field reached through memory, for the hot-field
+                // MAKEPAD_RUN_FIELD_PROF: a struct field reached through memory, for the hot-field
                 // layout measurement (jit.rs field_note)
                 if !adt.is_enum && !adt.is_union && matches!(p, Place::Mem(..)) && crate::jit::field_prof_on() {
                     if let (Some(o), Some(ft)) = (off, ft) {
@@ -1295,14 +1295,14 @@ impl<'a> Lcx<'a> {
                     (Some(off), Some(ft)) => (ft, off, var.fields.len()),
                     _ => {
                         let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- Relax bug, report it", fi, ts));
+                        self.err(self.pos, format!("internal: no field {} in the layout of `{}` -- makepad run bug, report it", fi, ts));
                         (self.u.tcx.tys.error, 0, var.fields.len())
                     }
                 }
             }
             _ => {
                 let ts = crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, t);
-                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- Relax bug, report it", fi, ts));
+                self.err(self.pos, format!("internal: field {} of non-aggregate `{}` -- makepad run bug, report it", fi, ts));
                 return (Place::Regs(Vec::new()), self.u.tcx.tys.error);
             }
         };
@@ -4789,7 +4789,7 @@ impl<'a> Lcx<'a> {
                 let cv = if matches!(k, TyKind::Ptr(..) | TyKind::FnPtr(..)) {
                     match self.const_ptr_val(cs, lf.off) {
                         Some(v) => v,
-                        None => return self.err(self.pos, "a pointer in a constant pattern whose target Relax cannot name".to_string()),
+                        None => return self.err(self.pos, "a pointer in a constant pattern whose target makepad run cannot name".to_string()),
                     }
                 } else {
                     let raw = unsafe { read_raw(c + lf.off as u64, lf.mem) };
@@ -4812,7 +4812,7 @@ impl<'a> Lcx<'a> {
                         let v = self.read_place(place, t);
                         let a = match self.const_ptr_val(cs, 0) {
                             Some(a) => a,
-                            None => return self.err(self.pos, "a string constant pattern whose bytes Relax cannot name".to_string()),
+                            None => return self.err(self.pos, "a string constant pattern whose bytes makepad run cannot name".to_string()),
                         };
                         let l = self.iconst(cl as i64);
                         let r = self.eq_vals(v, Val::L(vec![a, l]), t);
@@ -5666,7 +5666,7 @@ impl<'a> Lcx<'a> {
                 let st = self.body_ty(e);
                 let p = self.to_leaves(v, st);
                 if p.len() != 2 {
-                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- Relax bug, report it".to_string());
+                    self.err(self.pos, "internal: trait object upcast of a value without a vtable -- makepad run bug, report it".to_string());
                     return self.unit();
                 }
                 let Some(slot) = self.u.tcx.supertrait_vtable_slot(&self.u.prog, sd, dd) else { return Val::L(p) };
@@ -7302,7 +7302,7 @@ impl<'a> Lcx<'a> {
                 let (bv, bt) = self.prim_leaves(bv, bt);
                 if av.is_empty() || bv.is_empty() {
                     let (x, y) = (crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, at), crate::typeck::ty_to_string(false, &self.u.prog, &self.u.tcx, bt));
-                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- Relax bug, report it", x, y));
+                    self.err(self.pos, format!("internal: arithmetic on `{}` and `{}` without values -- makepad run bug, report it", x, y));
                     return self.dummy_val(t);
                 }
                 let r = self.arith(op, t, av[0], bv[0], bt);
@@ -12709,8 +12709,8 @@ fn coroutine_transform(f: &mut Func, c: &Coro) -> Result<(u32, u32, u64), String
         end = end.max(o);
     }
     let size = end;
-    // RELAX_CORO_TRACE: the saved slots and values of each coroutine
-    if std::env::var_os("RELAX_CORO_TRACE").is_some() {
+    // MAKEPAD_RUN_CORO_TRACE: the saved slots and values of each coroutine
+    if std::env::var_os("MAKEPAD_RUN_CORO_TRACE").is_some() {
         for s in 0..ns {
             if !saved_at[s].is_empty() {
                 eprintln!("coro {:?} slot {} size {} saved at {:?} variant {:?} offset {:?}", c.ct, s, f.slots[s].size, saved_at[s], variant_of[s], slot_off[s]);

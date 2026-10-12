@@ -120,7 +120,7 @@ impl Hosts {
             let via = match text("via").as_deref() {
                 Some("ssh") => Via::Ssh {
                     ssh: text("ssh").ok_or_else(|| format!("host `{name}`: via = \"ssh\" needs ssh = \"user@host\""))?,
-                    relax: text("relax").unwrap_or_else(|| "makepad".into()),
+                    relax: text("makepad").unwrap_or_else(|| "makepad".into()),
                     env: parse_env(name, t.get("env"))?,
                 },
                 Some("dial") if t.contains_key("env") => return Err(format!("host `{name}`: env applies to via = \"ssh\" hosts; a dialling relay takes `--env K=V` on its command line")),
@@ -144,7 +144,7 @@ impl Hosts {
                 Via::Ssh { ssh, relax, env } => {
                     s.push_str(&format!("via = \"ssh\"\nssh = {}\n", quote(ssh)));
                     if relax != "makepad" {
-                        s.push_str(&format!("relax = {}\n", quote(relax)));
+                        s.push_str(&format!("makepad = {}\n", quote(relax)));
                     }
                     if !env.is_empty() {
                         let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k} = {}", quote(v))).collect();

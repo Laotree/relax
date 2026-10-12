@@ -209,7 +209,7 @@ fn c_representable(s: &str) -> bool {
         || s.starts_with('&') && !s.starts_with("&dyn") && !s.starts_with("&other")
 }
 
-/// Lowers every Relax-side body reachable from the non-generic fns of crates other than the
+/// Lowers every JIT-side body reachable from the non-generic fns of crates other than the
 /// provided ones and std, to a fixpoint; then prints the report.
 pub fn run(up: *mut Unit) -> String {
     AUDIT_ON.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -253,7 +253,7 @@ pub fn run(up: *mut Unit) -> String {
                 FnKey::Inst(d, args) => {
                     let k = u.prog.def(*d).krate;
                     // with the crate registered as provided (provided.rs): its unbound fns are
-                    // Relax-side too
+                    // JIT-side too
                     // registered: bound when it has a shim (as Unit::new binds); else every fn of
                     // the audited crate is taken as rustc's
                     let bound = args.is_empty()
@@ -269,7 +269,7 @@ pub fn run(up: *mut Unit) -> String {
                 // closures are lowered from their parent's body (made while lowering it)
                 FnKey::Closure(..) => true,
                 // drop glue: a provided type's Drop impl (and what it calls) runs from here
-                // when Relax-compiled code drops a value of it (a handle's release, a guard)
+                // when JIT-compiled code drops a value of it (a handle's release, a guard)
                 FnKey::Glue(..) => true,
                 FnKey::Shim(_) | FnKey::Sandbox(_) => false,
             };
@@ -300,7 +300,7 @@ pub fn run(up: *mut Unit) -> String {
     let mut out = String::new();
     use std::fmt::Write;
     let _ = writeln!(out, "# boundary audit: provided crates {}", a.crates.iter().map(|c| u.prog.syms.str(u.prog.crates[*c as usize].name).to_string()).collect::<Vec<_>>().join(", "));
-    let _ = writeln!(out, "# lowered {} Relax-side bodies ({} failed to lower)", lowered, failed);
+    let _ = writeln!(out, "# lowered {} JIT-side bodies ({} failed to lower)", lowered, failed);
     fails.sort();
     for f in &fails {
         let _ = writeln!(out, "{}", f);

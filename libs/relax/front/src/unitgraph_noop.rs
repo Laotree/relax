@@ -61,7 +61,7 @@ fn inert_helper(script: &BuildScript, units: &[RawUnit], dependency: &str, funct
         .and_then(|(index, _)| units.get(*index)) else { return false };
     let Ok(manifest) = crate::vfs::read_to_string(format!("{}/Cargo.toml", unit.pkg.0)) else { return false };
     let Ok(manifest) = crate::toml::parse_toml(&manifest) else { return false };
-    let Some(inert) = manifest.get_path(&["package", "metadata", "relax", "build-script-noop"])
+    let Some(inert) = manifest.get_path(&["package", "metadata", "makepad-run", "build-script-noop"])
         .and_then(|value| value.as_array()) else { return false };
     inert.iter().any(|value| value.as_str() == Some(function))
 }
@@ -111,7 +111,7 @@ pub fn script(script: &BuildScript, units: &[RawUnit]) -> bool {
     // With an absolute std path this expression cannot resolve to a script's
     // own env module. Only inert statements precede it; the runner sets the variable.
     let guard = ["if", "::", "std", "::", "env", "::", "var_os", "(",
-        "\"RELAX_BUILD_SCRIPT\"", ")", ".", "is_some", "(", ")", "{", "return", ";", "}"];
+        "\"MAKEPAD_RUN_BUILD_SCRIPT\"", ")", ".", "is_some", "(", ")", "{", "return", ";", "}"];
     while !body.is_empty() {
         if before_guard && body.starts_with(&guard) { return true; }
         if let Some(len) = check_cfg(body).filter(|_| println) {
@@ -211,7 +211,7 @@ mod tests {
             std::fs::create_dir_all(dir.join("helper")).unwrap();
             std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"script\"\nversion = \"0.0.0\"\n").unwrap();
             std::fs::write(dir.join("helper/Cargo.toml"),
-                "[package]\nname = \"renamed-helper\"\n[package.metadata.relax]\nbuild-script-noop = [\"build\", \"empty\"]\n").unwrap();
+                "[package]\nname = \"renamed-helper\"\n[package.metadata.makepad-run]\nbuild-script-noop = [\"build\", \"empty\"]\n").unwrap();
             let mut f = Self {
                 script: BuildScript { krate: 0, src_path: dir.join("build.rs").display().to_string(), edition: 2021,
                     features: Vec::new(), build_deps: vec![(0, "helper".into())] },
@@ -249,7 +249,7 @@ mod tests {
                 assert!(script(&f.script, &f.units), "{body}");
             }
             f.write(&format!("use helper::Thing; use std::env; fn main() {{ {line} {line}
-                if ::std::env::var_os(\"RELAX_BUILD_SCRIPT\").is_some() {{ return; }}
+                if ::std::env::var_os(\"MAKEPAD_RUN_BUILD_SCRIPT\").is_some() {{ return; }}
                 helper::real_work(); println!(\"cargo:rerun-if-changed={{}}\", env::var(\"OUT_DIR\").unwrap());
             }}"));
             assert!(script(&f.script, &f.units));
@@ -271,7 +271,7 @@ mod tests {
             assert!(!script(&f.script, &f.units), "{statement}");
         }
         let body = r#"fn main() { println!("cargo:rustc-check-cfg=cfg(relax)");
-            if ::std::env::var_os("RELAX_BUILD_SCRIPT").is_some() { return; } }"#;
+            if ::std::env::var_os("MAKEPAD_RUN_BUILD_SCRIPT").is_some() { return; } }"#;
         for prefix in ["use custom::println;", "use custom::*;", "use custom::r#println;",
             "macro_rules! println { ($($tt:tt)*) => {}; }"] {
             f.write(&format!("{prefix} {body}"));

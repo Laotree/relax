@@ -846,13 +846,13 @@ fn has_enum(u: &Unit, t: TyId, depth: u32) -> bool {
     }
 }
 
-/// Every symbol and its kind (RELAX_SYMS diagnostics).
+/// Every symbol and its kind (MAKEPAD_RUN_SYMS diagnostics).
 pub fn dump(u: &Unit) -> Vec<(u32, SymKind, u64)> {
     u.syms.kinds.iter().enumerate().map(|(i, k)| (i as u32, k.clone(), unsafe { std::ptr::read((u.syms.vals as *const u64).add(i)) })).collect()
 }
 
 /// A stable description of a symbol (the same in every run of the same sources): what the
-/// RELAX_RELOC_SIG / RELAX_CODE_SIG dumps print instead of symbol ids, and what the disk cache
+/// MAKEPAD_RUN_RELOC_SIG / MAKEPAD_RUN_CODE_SIG dumps print instead of symbol ids, and what the disk cache
 /// will key relocations by.
 pub fn describe(u: &Unit, s: Sym) -> String {
     let base = match u.syms.kind(s.id) {
@@ -945,13 +945,13 @@ pub fn canon_dump(u: &Unit, d: &str) -> String {
     out
 }
 
-/// RELAX_RELOC_SIG=<file>: per compiled function, a hash of its machine code with the address
+/// MAKEPAD_RUN_RELOC_SIG=<file>: per compiled function, a hash of its machine code with the address
 /// pool zeroed, its relocations by stable description and its pc map by file path. Two runs of
-/// the same program (one with RELAX_PERTURB) must print the same lines: a difference is a
+/// the same program (one with MAKEPAD_RUN_PERTURB) must print the same lines: a difference is a
 /// run-dependent value that reached code without a relocation.
 pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: &[(u32, u64)]) {
     static F: std::sync::OnceLock<Option<Mutex<std::fs::File>>> = std::sync::OnceLock::new();
-    let m = match F.get_or_init(|| std::env::var("RELAX_RELOC_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(Mutex::new)) {
+    let m = match F.get_or_init(|| std::env::var("MAKEPAD_RUN_RELOC_SIG").ok().and_then(|p| std::fs::File::create(p).ok()).map(Mutex::new)) {
         Some(m) => m,
         None => return,
     };
@@ -983,7 +983,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
         h.u32(*pos as u32);
     }
     use std::io::Write;
-    if let Ok(want) = std::env::var("RELAX_RELOC_SIG_CODE") {
+    if let Ok(want) = std::env::var("MAKEPAD_RUN_RELOC_SIG_CODE") {
         if want == "*" || name.contains(want.as_str()) {
             let hex: String = c.iter().map(|b| format!("{:02x}", b)).collect();
             // the pool as compiled (values), for debugging relocations
@@ -998,7 +998,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
             let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(format!("CODE\t{}\t{}\t{}\n", name, hex, pcs.join(" ")).as_bytes());
         }
     }
-    let line = if std::env::var_os("RELAX_RELOC_SIG_VERBOSE").is_some() {
+    let line = if std::env::var_os("MAKEPAD_RUN_RELOC_SIG_VERBOSE").is_some() {
         format!("{}\t{}\t{:032x}\t{}\n", name, code.len(), h.finish128(), rs.join(" "))
     } else {
         format!("{}\t{}\t{:032x}\n", name, code.len(), h.finish128())
@@ -1006,7 +1006,7 @@ pub fn reloc_sig(u: &Unit, name: impl FnOnce() -> String, code: &[u8], relocs: &
     let _ = m.lock().unwrap_or_else(|e| e.into_inner()).write_all(line.as_bytes());
 }
 
-/// RELAX_PERTURB=<n>: shifts the per-run numbering compiled code must not depend on (dummy
+/// MAKEPAD_RUN_PERTURB=<n>: shifts the per-run numbering compiled code must not depend on (dummy
 /// sites and symbols; the data / static areas start later). 0 when unset.
 pub fn perturb(options: &crate::options::Options) -> u64 {
     options.perturb

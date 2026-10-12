@@ -1,5 +1,5 @@
 //! Amp's 20-parse medians (parse_work.rs timers) -- a test of the `relax` crate, not of relax-front's:
-//! with RELAX_PARSE_HOSTED=1 it registers the live-id macro host, which is the JIT's (pmhost).
+//! with MAKEPAD_RUN_PARSE_HOSTED=1 it registers the live-id macro host, which is the JIT's (pmhost).
 #![cfg(test)]
 
 #[test]
@@ -20,7 +20,7 @@ fn amp_parse_medians() {
     let app_source = format!("mod amp_source {{\n{source}\n}}\n");
     // Optional real native macro host, built solely from existing local sources.
     // No Cargo graph resolution, downloads, app code execution or windows.
-    let hosted = std::env::var("RELAX_PARSE_HOSTED").as_deref() == Ok("1");
+    let hosted = std::env::var("MAKEPAD_RUN_PARSE_HOSTED").as_deref() == Ok("1");
     if hosted {
         let roots = [
             ("makepad_micro_proc_macro", "libs/micro_proc_macro/src/lib.rs", false, vec![]),
@@ -68,7 +68,7 @@ fn amp_parse_medians() {
                 }
                 crate::parse_work::begin();
                 let start = std::time::Instant::now();
-                let v = if std::env::var("RELAX_PARSE_REUSE").as_deref() == Ok("0") {
+                let v = if std::env::var("MAKEPAD_RUN_PARSE_REUSE").as_deref() == Ok("0") {
                     snapshot.parse_full(text).unwrap()
                 } else { snapshot.parse(text).unwrap() };
                 let elapsed = start.elapsed().as_secs_f64() * 1000.;
@@ -94,8 +94,8 @@ fn amp_parse_medians() {
     // Optional controlled scaling probe, separate from the real-file medians above.
     // It uses the real hosted input but seeds unrelated expansion bytes; PROFILE=1
     // reports the old implementation too, isolating expansion-buffer scan cost.
-    if let Ok(mb) = std::env::var("RELAX_PARSE_EXT_MB") {
-        assert!(hosted, "expansion-buffer probe needs RELAX_PARSE_HOSTED=1");
+    if let Ok(mb) = std::env::var("MAKEPAD_RUN_PARSE_EXT_MB") {
+        assert!(hosted, "expansion-buffer probe needs MAKEPAD_RUN_PARSE_HOSTED=1");
         let bytes = mb.parse::<usize>().unwrap() * 1024 * 1024;
         let mut samples = Vec::new();
         for i in 0..21 {

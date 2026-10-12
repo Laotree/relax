@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cold startup and SIGINT shutdown regression; run on the test node via x64run.
 
-Pass --relax, --workspace, --out and the package to run. RELAX_STD and the
+Pass --makepad, --workspace, --out and the package to run. MAKEPAD_RUN_STD and the
 headless display environment come from the caller. Each launch gets a new cache.
 Optional --gdb captures only this harness's child, before forcibly stopping it.
 """
@@ -27,7 +27,7 @@ def permit_debugger():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--relax", required=True, type=Path)
+    parser.add_argument("--makepad", required=True, type=Path)
     parser.add_argument("--workspace", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--runs", type=int, default=10)
@@ -46,10 +46,10 @@ def main():
     results = []
     for cycle in range(1, args.runs + 1):
         log = out / f"{cycle}.log"
-        env = dict(os.environ, RELAX_CACHE="on", RELAX_CACHE_DIR=str(out / f"cache-{cycle}"))
+        env = dict(os.environ, MAKEPAD_RUN_CACHE="on", MAKEPAD_RUN_CACHE_DIR=str(out / f"cache-{cycle}"))
         with log.open("w") as stream:
             child = subprocess.Popen(
-                [str(args.relax.resolve()), "run", "--verbose", args.package],
+                [str(args.makepad.resolve()), "run", "--verbose", args.package],
                 cwd=args.workspace, env=env, stdout=stream, stderr=subprocess.STDOUT,
                 start_new_session=True, preexec_fn=permit_debugger if args.gdb else None,
             )

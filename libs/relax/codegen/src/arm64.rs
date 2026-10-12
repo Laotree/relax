@@ -44,7 +44,7 @@ const X8: u8 = 8;
 const INT_ARGS: usize = 8;
 const FLT_ARGS: usize = 8;
 
-/// arm64 isel switches for measurements: `RELAX_A64=none` or `-fuse,-fconst`.
+/// arm64 isel switches for measurements: `MAKEPAD_RUN_A64=none` or `-fuse,-fconst`.
 const A64_FUSE: u8 = 1;
 const A64_FCONST: u8 = 2;
 

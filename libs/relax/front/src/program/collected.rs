@@ -221,7 +221,7 @@ impl Program {
 
     pub fn collected_writer(&self) -> Option<crate::image::Writer<'_>> {
         if !self.imports_done || !self.errors.is_empty() || !self.pending_macs.is_empty() {
-            if crate::preload::trace() { eprintln!("relax-collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); if let Some(e) = self.errors.first() { eprintln!("relax-collected: first program error: {e}"); } }
+            if crate::preload::trace() { eprintln!("makepad-run collected: Program not recordable: imports {}, errors {}, macros {}", self.imports_done, self.errors.len(), self.pending_macs.len()); if let Some(e) = self.errors.first() { eprintln!("makepad-run collected: first program error: {e}"); } }
             return None;
         }
         // Certify record relationships once, when publishing. The reader verifies the
@@ -321,7 +321,7 @@ impl Program {
     ) -> Option<Self> {
         let started = std::time::Instant::now();
         let phase = |name: &str| if crate::preload::trace() {
-            eprintln!("relax-collected: Program {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
+            eprintln!("makepad-run collected: Program {} at {:.1} ms", name, started.elapsed().as_secs_f64() * 1e3);
         };
         let image = crate::image::Reader::new(bytes)?;
         let mut r = Decode::new(image.bytes(0, 0)?);

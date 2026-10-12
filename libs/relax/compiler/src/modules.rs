@@ -208,7 +208,7 @@ pub(crate) struct Added {
 /// the declarations are collected whatever the diagnostics.
 pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool, domain: Option<crate::domain::DomainId>) -> Result<Added, Vec<String>> {
     let u = &mut *up;
-    let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
+    let tr = std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
     let d0 = u.prog.defs.len();
     let i0 = u.prog.imports.len();
@@ -290,7 +290,7 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
     }
     marks.push(("collect", std::time::Instant::now()));
     if tr {
-        let mut line = format!("relax-module: {} crate(s) front:", new.len());
+        let mut line = format!("makepad-run module: {} crate(s) front:", new.len());
         for w in marks.windows(2) {
             line.push_str(&format!(" {} {:.2}", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3));
         }
@@ -320,7 +320,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
         c.set.push("relax".to_string());
         c
     };
-    let tr = std::env::var_os("RELAX_MODULE_TRACE").is_some();
+    let tr = std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some();
     let mut marks: Vec<(&str, std::time::Instant)> = vec![("", std::time::Instant::now())];
     let added = add_crates(up, &[NewCrate { name: name.to_string(), path: path.to_string(), edition: 2021, cfg, deps: dep_list, proc_macro: false }], false, None)?;
     let u = &mut *up;
@@ -348,7 +348,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
                         }
                         bodies.push(b);
                     }
-                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- Relax bug, report it", u.prog.def_path(d))),
+                    Err(_) => errs.push(format!("internal compiler error type-checking {} -- makepad run bug, report it", u.prog.def_path(d))),
                 }
             }
         }
@@ -359,7 +359,7 @@ unsafe fn front(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox:
     }
     marks.push(("check", std::time::Instant::now()));
     if tr {
-        let mut line = format!("relax-module: {} front:", name);
+        let mut line = format!("makepad-run module: {} front:", name);
         for w in marks.windows(2) {
             line.push_str(&format!(" {} {:.2}", w[1].0, (w[1].1 - w[0].1).as_secs_f64() * 1e3));
         }
@@ -405,7 +405,7 @@ fn root_fns(u: &Unit, defs: &[DefId]) -> Vec<DefId> {
     defs.iter().copied().filter(|d| matches!(u.prog.def(*d).kind, DefKind::Fn | DefKind::AssocFn) && u.tcx.fn_sig(&u.prog, *d).map_or(false, |s| s.n_generics == 0)).collect()
 }
 
-/// Loads a trusted module (RELAX_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
+/// Loads a trusted module (MAKEPAD_RUN_MODULES_TRUSTED=1; on the owner thread): it runs as host code.
 unsafe fn load(up: *mut Unit, name: &str, path: &str, deps: &[String], sandbox: bool) -> Result<(u32, u32, Vec<DefId>), Vec<String>> {
     let (krate, root_file, defs) = front(up, name, path, deps, sandbox)?;
     let u = &mut *up;
@@ -679,7 +679,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
     let sess = &session;
     let runtime = &sess.runtime;
     let options = &sess.options;
-    // RELAX_SANDBOX_NOCHECK=1 (tests of the memory confinement alone): no compile-time refusal
+    // MAKEPAD_RUN_SANDBOX_NOCHECK=1 (tests of the memory confinement alone): no compile-time refusal
     let check = !options.sandbox_nocheck;
     let t0 = std::time::Instant::now();
     let (krate, root_file, mut defs) = front(up, name, path, deps, check)?;
@@ -714,7 +714,7 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
         Err(e) => {
             crate::sandbox::free_arena(&arena);
             let mut e = e;
-            e.insert(0, format!("{}: the generated wrapper did not compile (Relax bug, report it):", path));
+            e.insert(0, format!("{}: the generated wrapper did not compile (makepad run bug, report it):", path));
             return Err(fail(up, &defs, e));
         }
     };
@@ -729,10 +729,10 @@ unsafe fn load_sandboxed(up: *mut Unit, idx: u32, name: &str, path: &str, deps: 
         crate::sandbox::free_arena(&arena);
         return Err(fail(up, &defs, e));
     }
-    // RELAX_MODULE_TRACE=1: where a load's time goes
-    if std::env::var_os("RELAX_MODULE_TRACE").is_some() {
+    // MAKEPAD_RUN_MODULE_TRACE=1: where a load's time goes
+    if std::env::var_os("MAKEPAD_RUN_MODULE_TRACE").is_some() {
         eprintln!(
-            "relax-module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots)",
+            "makepad-run module: {} loaded in {:.2} ms: front {:.2} (parse, resolve, typeck, check), wrapper {:.2}, compile {:.2} ({} slots)",
             name,
             t0.elapsed().as_secs_f64() * 1e3,
             t_front.as_secs_f64() * 1e3,
@@ -855,7 +855,7 @@ pub extern "C" fn __relax_module_load_src(name: *const u8, nlen: usize, path: *c
         Ok(h) => h,
         Err(p) => {
             let msg = p.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| p.downcast_ref::<String>().cloned()).unwrap_or_else(|| "panic".to_string());
-            set_error(format!("internal compiler error loading a module: {}{} -- Relax bug, report it", msg, jit::take_ice_location()));
+            set_error(format!("internal compiler error loading a module: {}{} -- makepad run bug, report it", msg, jit::take_ice_location()));
             0
         }
     }
@@ -893,7 +893,7 @@ fn load_src_inner(name: *const u8, nlen: usize, path: *const u8, plen: usize, sr
     }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let options = &session.options;
-    // RELAX_MODULES_TRUSTED=1: a trusted module (host code, no sandbox; diagnosis only)
+    // MAKEPAD_RUN_MODULES_TRUSTED=1: a trusted module (host code, no sandbox; diagnosis only)
     let trusted = options.modules_trusted;
     let fix = |t: String| -> String {
         match &temp {
