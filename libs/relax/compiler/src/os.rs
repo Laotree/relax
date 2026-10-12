@@ -14,7 +14,7 @@
 //! - [`proc`]: foreign symbols and libraries, power state, process arguments, private files.
 
 // explicit paths: the file is also loaded through #[path] by the bring-up driver, where nested
-// modules would otherwise resolve next to it
+// modules would otherwise resolve next to it (the Win32 declarations are not here: relax_session::win32)
 #[path = "os/fault.rs"]
 pub mod fault;
 #[path = "os/mem.rs"]
@@ -28,5 +28,4 @@ pub mod thread;
 #[path = "os/tls.rs"]
 pub mod tls;
 #[cfg(windows)]
-#[path = "os/win32.rs"]
-pub(crate) mod win32;
+pub(crate) use relax_session::win32;

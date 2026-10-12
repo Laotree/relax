@@ -1,5 +1,8 @@
-//! The Win32 API surface the runtime's Windows halves use: small explicit `extern "system"`
-//! declarations hard-linked against kernel32 (no bindings crate), and the x64 CONTEXT record.
+//! The Win32 API surface of makepad run, for every relax crate (session, base, codegen,
+//! compiler): small explicit `extern "system"` declarations hard-linked against the system
+//! libraries (no bindings crate, no COM), one signature per function (HANDLE = isize, BOOL = i32,
+//! DWORD = u32, SIZE_T = usize, BOOLEAN = u8, memory addresses `*mut u8`), and the x64 CONTEXT
+//! record. Nothing else in the relax crates declares a Win32 function.
 
 #![allow(non_snake_case, clippy::upper_case_acronyms)]
 
@@ -56,6 +59,84 @@ extern "system" {
     pub fn K32EnumProcessModules(process: HANDLE, modules: *mut HANDLE, bytes: u32, needed: *mut u32) -> i32;
     // power
     pub fn GetSystemPowerStatus(status: *mut SystemPowerStatus) -> i32;
+    // memory queries
+    pub fn VirtualQuery(addr: *const u8, info: *mut MemoryBasicInformation, size: usize) -> usize;
+    pub fn K32GetProcessMemoryInfo(process: HANDLE, counters: *mut u8, cb: u32) -> i32;
+    // thread times
+    pub fn QueryThreadCycleTime(thread: HANDLE, cycles: *mut u64) -> i32;
+    pub fn GetThreadTimes(thread: HANDLE, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
+    // processes, console
+    pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> HANDLE;
+    pub fn GetExitCodeProcess(process: HANDLE, code: *mut u32) -> i32;
+    pub fn SetConsoleCtrlHandler(handler: Option<extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    // files, directory change notification
+    pub fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut u8, disposition: u32, flags: u32, template: HANDLE) -> HANDLE;
+    pub fn ReadDirectoryChangesW(dir: HANDLE, buf: *mut u8, len: u32, subtree: i32, filter: u32, returned: *mut u32, overlapped: *mut Overlapped, routine: *mut u8) -> i32;
+    pub fn GetOverlappedResult(file: HANDLE, overlapped: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
+    pub fn CancelIoEx(file: HANDLE, overlapped: *mut Overlapped) -> i32;
+    pub fn CreateDirectoryW(name: *const u16, attributes: *const SecurityAttributes) -> i32;
+    pub fn GetDriveTypeW(root: *const u16) -> u32;
+    pub fn CompareStringOrdinal(a: *const u16, a_len: i32, b: *const u16, b_len: i32, ignore_case: i32) -> i32;
+}
+
+#[link(name = "ntdll")]
+extern "system" {
+    pub fn RtlAddFunctionTable(table: *const u32, count: u32, base: u64) -> u8;
+    pub fn RtlDeleteFunctionTable(table: *const u32) -> u8;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    pub fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
+    pub fn GetTokenInformation(token: HANDLE, class: u32, info: *mut u8, size: u32, needed: *mut u32) -> i32;
+    pub fn GetNamedSecurityInfoW(name: *const u16, kind: u32, info: u32, owner: *mut *mut u8,
+        group: *mut *mut u8, dacl: *mut *mut u8, sacl: *mut *mut u8, sd: *mut *mut u8) -> u32;
+    pub fn SetNamedSecurityInfoW(name: *mut u16, kind: u32, info: u32, owner: *mut u8,
+        group: *mut u8, dacl: *mut u8, sacl: *mut u8) -> u32;
+    pub fn EqualSid(a: *const u8, b: *const u8) -> i32;
+    pub fn IsValidSid(sid: *const u8) -> i32;
+    pub fn IsValidAcl(acl: *const u8) -> i32;
+    pub fn GetAce(acl: *const u8, index: u32, ace: *mut *mut u8) -> i32;
+    pub fn InitializeAcl(acl: *mut u8, size: u32, revision: u32) -> i32;
+    pub fn AddAccessAllowedAceEx(acl: *mut u8, revision: u32, flags: u32, mask: u32, sid: *const u8) -> i32;
+    pub fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> i32;
+    pub fn SetSecurityDescriptorDacl(sd: *mut u8, present: i32, acl: *mut u8, defaulted: i32) -> i32;
+    pub fn SetSecurityDescriptorControl(sd: *mut u8, bits: u16, value: u16) -> i32;
+}
+
+#[link(name = "bcryptprimitives", kind = "raw-dylib")]
+extern "system" {
+    pub fn ProcessPrng(buf: *mut u8, len: usize) -> i32;
+}
+
+/// winnt.h MEMORY_BASIC_INFORMATION (x64)
+#[repr(C)]
+pub struct MemoryBasicInformation {
+    pub base: *mut u8,
+    pub allocation_base: *mut u8,
+    pub allocation_protect: u32,
+    pub region_size: usize,
+    pub state: u32,
+    pub protect: u32,
+    pub kind: u32,
+}
+
+/// minwinbase.h OVERLAPPED
+#[repr(C)]
+pub struct Overlapped {
+    pub internal: usize,
+    pub internal_high: usize,
+    pub offset: u32,
+    pub offset_high: u32,
+    pub event: HANDLE,
+}
+
+/// minwinbase.h SECURITY_ATTRIBUTES
+#[repr(C)]
+pub struct SecurityAttributes {
+    pub length: u32,
+    pub descriptor: *mut u8,
+    pub inherit: i32,
 }
 
 pub const MEM_COMMIT: u32 = 0x1000;

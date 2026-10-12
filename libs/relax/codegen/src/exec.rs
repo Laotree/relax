@@ -35,19 +35,11 @@ mod sys {
 
 #[cfg(windows)]
 mod win {
-    use std::ffi::c_void;
-    pub const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
-    pub const MEM_RELEASE: u32 = 0x8000;
-    pub const PAGE_READWRITE: u32 = 0x04;
+    pub use relax_session::win32::{
+        FlushInstructionCache, GetCurrentProcess, VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE,
+        MEM_RESERVE, PAGE_READWRITE,
+    };
     pub const PAGE_EXECUTE_READ: u32 = 0x20;
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
-        pub fn VirtualProtect(addr: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
-        pub fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
-        pub fn FlushInstructionCache(process: isize, addr: *const c_void, size: usize) -> i32;
-        pub fn GetCurrentProcess() -> isize;
-    }
 }
 
 /// Machine code in its own executable mapping. Immutable once built; unmapped on drop.
@@ -69,7 +61,7 @@ impl Code {
         unsafe {
             let len = bytes.len().max(1);
             let map_len = (len + 65535) & !65535;
-            let ptr = win::VirtualAlloc(std::ptr::null_mut(), map_len, win::MEM_COMMIT_RESERVE, win::PAGE_READWRITE);
+            let ptr = win::VirtualAlloc(std::ptr::null_mut(), map_len, win::MEM_COMMIT | win::MEM_RESERVE, win::PAGE_READWRITE);
             if ptr.is_null() {
                 return None;
             }

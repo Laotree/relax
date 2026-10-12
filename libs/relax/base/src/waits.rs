@@ -71,10 +71,7 @@ pub fn me() -> u64 {
 
 #[cfg(windows)]
 pub fn me() -> u64 {
-    extern "system" {
-        fn GetCurrentThreadId() -> u32;
-    }
-    unsafe { GetCurrentThreadId() as u64 }
+    unsafe { relax_session::win32::GetCurrentThreadId() as u64 }
 }
 
 struct Mine(Cell<usize>);

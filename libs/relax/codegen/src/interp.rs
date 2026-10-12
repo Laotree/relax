@@ -540,12 +540,8 @@ unsafe fn interp_stack_map(len: usize) -> *mut u64 {
 
 #[cfg(windows)]
 unsafe fn interp_stack_map(len: usize) -> *mut u64 {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn VirtualAlloc(addr: *mut std::ffi::c_void, size: usize, kind: u32, protect: u32) -> *mut std::ffi::c_void;
-    }
     // MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
-    VirtualAlloc(std::ptr::null_mut(), len, 0x1000 | 0x2000, 0x04) as *mut u64
+    relax_session::win32::VirtualAlloc(std::ptr::null_mut(), len, 0x1000 | 0x2000, 0x04) as *mut u64
 }
 
 #[inline(never)]

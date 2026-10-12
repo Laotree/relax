@@ -26,9 +26,7 @@ pub fn token() -> std::io::Result<String> {
     }
     #[cfg(windows)]
     {
-        #[link(name = "bcryptprimitives", kind = "raw-dylib")]
-        extern "system" { fn ProcessPrng(p: *mut u8, n: usize) -> u8; }
-        if unsafe { ProcessPrng(bytes.as_mut_ptr(), bytes.len()) } == 0 { return Err(std::io::Error::last_os_error()); }
+        if unsafe { relax_session::win32::ProcessPrng(bytes.as_mut_ptr(), bytes.len()) } == 0 { return Err(std::io::Error::last_os_error()); }
     }
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
@@ -42,12 +40,7 @@ pub fn alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
-            fn GetExitCodeProcess(h: isize, code: *mut u32) -> i32;
-            fn CloseHandle(h: isize) -> i32;
-        }
+        use relax_session::win32::{CloseHandle, GetExitCodeProcess, OpenProcess};
         unsafe {
             let h = OpenProcess(0x1000, 0, pid);
             if h == 0 { return false; }
@@ -72,9 +65,7 @@ pub fn signals() {
         extern "system" fn stop(kind: u32) -> i32 {
             if matches!(kind, 0 | 1 | 2 | 5 | 6) { STOP.store(true, Ordering::Relaxed); 1 } else { 0 }
         }
-        #[link(name = "kernel32")]
-        extern "system" { fn SetConsoleCtrlHandler(f: extern "system" fn(u32) -> i32, add: i32) -> i32; }
-        SetConsoleCtrlHandler(stop, 1);
+        relax_session::win32::SetConsoleCtrlHandler(Some(stop), 1);
     }
 }
 

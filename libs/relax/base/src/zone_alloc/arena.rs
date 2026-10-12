@@ -411,12 +411,7 @@ mod os {
 
 #[cfg(windows)]
 mod os {
-    use std::ffi::c_void;
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn VirtualAlloc(addr: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
-        fn VirtualFree(addr: *mut c_void, size: usize, kind: u32) -> i32;
-    }
+    use relax_session::win32::{MemoryBasicInformation, VirtualAlloc, VirtualFree, VirtualQuery};
     pub unsafe fn reserve(size: usize, align: usize, _label: &'static std::ffi::CStr) -> usize {
         let raw = VirtualAlloc(std::ptr::null_mut(), size + align, 0x2000, 1) as usize;
         if raw == 0 {
@@ -426,21 +421,8 @@ mod os {
         (raw + align - 1) & !(align - 1)
     }
     pub unsafe fn unreserve(base: usize, _size: usize) {
-        #[repr(C)]
-        struct Info {
-            base: *mut c_void,
-            allocation_base: *mut c_void,
-            protect: u32,
-            region: usize,
-            state: u32,
-            protection: u32,
-            kind: u32,
-        }
-        extern "system" {
-            fn VirtualQuery(p: *const c_void, info: *mut Info, size: usize) -> usize;
-        }
-        let mut info: Info = std::mem::zeroed();
-        if VirtualQuery(base as *const c_void, &mut info, std::mem::size_of::<Info>()) != 0 {
+        let mut info: MemoryBasicInformation = std::mem::zeroed();
+        if VirtualQuery(base as *const u8, &mut info, std::mem::size_of::<MemoryBasicInformation>()) != 0 {
             VirtualFree(info.allocation_base, 0, 0x8000);
         }
     }

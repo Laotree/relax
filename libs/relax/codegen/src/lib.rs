@@ -77,12 +77,7 @@ pub fn cpu_ns() -> u64 {
 /// must use wall time, never this clock.
 #[cfg(windows)]
 pub fn cpu_ns() -> u64 {
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetCurrentThread() -> isize;
-        fn QueryThreadCycleTime(t: isize, cycles: *mut u64) -> i32;
-        fn GetThreadTimes(t: isize, creation: *mut u64, exit: *mut u64, kernel: *mut u64, user: *mut u64) -> i32;
-    }
+    use relax_session::win32::{GetCurrentThread, GetThreadTimes, QueryThreadCycleTime};
     static NS_PER_CYCLE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
     let scale = NS_PER_CYCLE.get_or_init(|| unsafe {
         let thread = GetCurrentThread();

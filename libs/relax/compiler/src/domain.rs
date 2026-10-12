@@ -882,19 +882,13 @@ pub fn block_committed(base: u64) -> u64 {
     }
     #[cfg(windows)]
     {
-        #[repr(C)]
-        struct MemoryInfo {
-            address: usize, allocation_base: usize, allocation_protect: u32,
-            region_size: usize, state: u32, protect: u32, kind: u32,
-        }
-        #[link(name = "kernel32")]
-        extern "system" { fn VirtualQuery(address: *const u8, info: *mut MemoryInfo, size: usize) -> usize; }
+        use crate::os::win32::{MemoryBasicInformation, VirtualQuery};
         let (mut at, end) = (base as usize, base as usize + BLOCK_SIZE);
         let mut committed = 0;
         while at < end {
-            let mut info: MemoryInfo = unsafe { std::mem::zeroed() };
-            if unsafe { VirtualQuery(at as *const u8, &mut info, std::mem::size_of::<MemoryInfo>()) } == 0 { break; }
-            let next = info.address.saturating_add(info.region_size).min(end);
+            let mut info: MemoryBasicInformation = unsafe { std::mem::zeroed() };
+            if unsafe { VirtualQuery(at as *const u8, &mut info, std::mem::size_of::<MemoryBasicInformation>()) } == 0 { break; }
+            let next = (info.base as usize).saturating_add(info.region_size).min(end);
             if next <= at { break; }
             if info.state == crate::os::win32::MEM_COMMIT { committed += next - at; }
             at = next;

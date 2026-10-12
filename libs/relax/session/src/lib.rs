@@ -4,6 +4,9 @@ pub mod phase;
 pub mod sip;
 pub mod gen_local;
 pub mod sync;
+/// The one Win32 declaration module of makepad run; every relax crate depends on relax-session.
+#[cfg(windows)]
+pub mod win32;
 pub use options::{Options, RuntimeOptions};
 
 /// Compiler statics held for rollback; forget them before destroying their generations.

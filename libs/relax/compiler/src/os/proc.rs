@@ -576,39 +576,6 @@ mod imp {
         // FILE_DELETE_CHILD, DELETE, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE, GENERIC_ALL.
         const WRITE_RIGHTS: u32 = 0x2 | 0x4 | 0x40 | 0x10000 | 0x40000 | 0x80000 | 0x4000_0000 | 0x1000_0000;
 
-        #[repr(C)]
-        struct SecurityAttributes {
-            length: u32,
-            descriptor: *mut u8,
-            inherit: i32,
-        }
-
-        #[link(name = "advapi32")]
-        extern "system" {
-            fn OpenProcessToken(process: HANDLE, access: u32, token: *mut HANDLE) -> i32;
-            fn GetTokenInformation(token: HANDLE, class: u32, info: *mut u8, size: u32, needed: *mut u32) -> i32;
-            fn GetNamedSecurityInfoW(name: *const u16, kind: u32, info: u32, owner: *mut *mut u8,
-                group: *mut *mut u8, dacl: *mut *mut u8, sacl: *mut *mut u8, sd: *mut *mut u8) -> u32;
-            fn SetNamedSecurityInfoW(name: *mut u16, kind: u32, info: u32, owner: *mut u8,
-                group: *mut u8, dacl: *mut u8, sacl: *mut u8) -> u32;
-            fn EqualSid(a: *const u8, b: *const u8) -> i32;
-            fn IsValidSid(sid: *const u8) -> i32;
-            fn IsValidAcl(acl: *const u8) -> i32;
-            fn GetAce(acl: *const u8, index: u32, ace: *mut *mut u8) -> i32;
-            fn InitializeAcl(acl: *mut u8, size: u32, revision: u32) -> i32;
-            fn AddAccessAllowedAceEx(acl: *mut u8, revision: u32, flags: u32, mask: u32, sid: *const u8) -> i32;
-            fn InitializeSecurityDescriptor(sd: *mut u8, revision: u32) -> i32;
-            fn SetSecurityDescriptorDacl(sd: *mut u8, present: i32, acl: *mut u8, defaulted: i32) -> i32;
-            fn SetSecurityDescriptorControl(sd: *mut u8, bits: u16, value: u16) -> i32;
-        }
-
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn CreateDirectoryW(name: *const u16, attributes: *const SecurityAttributes) -> i32;
-            fn GetDriveTypeW(root: *const u16) -> u32;
-            fn CompareStringOrdinal(a: *const u16, a_len: i32, b: *const u16, b_len: i32, ignore_case: i32) -> i32;
-        }
-
         struct Token(HANDLE);
         impl Drop for Token {
             fn drop(&mut self) { unsafe { CloseHandle(self.0); } }

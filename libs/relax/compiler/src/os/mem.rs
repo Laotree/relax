@@ -516,10 +516,6 @@ mod imp {
     /// resumes in a frame above JIT code would need them; Rust panics never cross JIT frames)
     /// and the first 4 bytes of each prologue / frameless glue (there the walk skips one frame).
     fn register_unwind(base: u64, code: usize) {
-        #[link(name = "ntdll")]
-        extern "system" {
-            fn RtlAddFunctionTable(table: *const u32, count: u32, base: u64) -> u8;
-        }
         // [RUNTIME_FUNCTION { begin, end, unwind rva }][UNWIND_INFO]: in the last page of the code
         // area, which the unit's code allocator leaves alone (CODE_TAIL)
         let at = base + code as u64 - 4096;
@@ -578,10 +574,6 @@ mod imp {
     /// Gives a reservation back (an auxiliary unit dropped mid-run): its unwind table entry,
     /// its slot (emptied, reused by the next reservation) and its address space.
     pub fn release(base: u64, code: usize, _rest: usize) {
-        #[link(name = "ntdll")]
-        extern "system" {
-            fn RtlDeleteFunctionTable(table: *const u32) -> u8;
-        }
         let _g = RES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = RES_N.load(Ordering::Acquire);
         for r in 0..n {

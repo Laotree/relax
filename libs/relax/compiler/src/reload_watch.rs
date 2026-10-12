@@ -217,17 +217,9 @@ mod native {
 mod native {
     //! ReadDirectoryChangesW per directory, overlapped: `changed` only reads the completion
     //! status of each pending read and re-arms the ones that completed.
-    use std::{collections::HashMap, ffi::c_void, os::windows::ffi::OsStrExt, path::Path};
-    type Handle = *mut c_void;
-    #[repr(C)]
-    struct Overlapped { internal: usize, internal_high: usize, offset: u32, offset_high: u32, event: Handle }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn CreateFileW(name: *const u16, access: u32, share: u32, security: *mut c_void, disposition: u32, flags: u32, template: Handle) -> Handle;
-        fn ReadDirectoryChangesW(dir: Handle, buf: *mut c_void, len: u32, subtree: i32, filter: u32, returned: *mut u32, overlapped: *mut Overlapped, routine: *mut c_void) -> i32;
-        fn GetOverlappedResult(file: Handle, overlapped: *mut Overlapped, bytes: *mut u32, wait: i32) -> i32;
-        fn CancelIoEx(file: Handle, overlapped: *mut Overlapped) -> i32;
-    }
+    use crate::os::win32::{CancelIoEx, CloseHandle, CreateFileW, GetOverlappedResult, ReadDirectoryChangesW, Overlapped, HANDLE};
+    use std::{collections::HashMap, os::windows::ffi::OsStrExt, path::Path};
+    type Handle = HANDLE;
     const STATUS_PENDING: usize = 0x103;
     // FILE_NAME, SIZE, LAST_WRITE, CREATION: renames, deletes, creates and writes
     const FILTER: u32 = 0x1 | 0x8 | 0x10 | 0x40;
@@ -242,7 +234,7 @@ mod native {
     }
     impl Dir {
         fn arm(&mut self) -> bool {
-            self.overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() };
+            self.overlapped = Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 };
             let len = std::mem::size_of_val(&self.buf) as u32;
             unsafe { ReadDirectoryChangesW(self.handle, self.buf.as_mut_ptr().cast(), len, 0, FILTER, std::ptr::null_mut(), &mut self.overlapped, std::ptr::null_mut()) != 0 }
         }
@@ -253,7 +245,7 @@ mod native {
                 let mut bytes = 0;
                 // wait for the cancelled read so the kernel no longer writes into the box
                 if CancelIoEx(self.handle, &mut self.overlapped) != 0 { GetOverlappedResult(self.handle, &mut self.overlapped, &mut bytes, 1); }
-                crate::os::win32::CloseHandle(self.handle as crate::os::win32::HANDLE);
+                CloseHandle(self.handle);
             }
         }
     }
@@ -273,9 +265,9 @@ mod native {
                     let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
                     // FILE_LIST_DIRECTORY; share read/write/delete so saves and renames proceed;
                     // OPEN_EXISTING; BACKUP_SEMANTICS (a directory) | OVERLAPPED
-                    let handle = unsafe { CreateFileW(wide.as_ptr(), 0x1, 0x7, std::ptr::null_mut(), 3, 0x0200_0000 | 0x4000_0000, std::ptr::null_mut()) };
-                    if handle as isize == -1 { return None; }
-                    let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: std::ptr::null_mut() }, buf: [0; 16384], names: HashMap::new(), own_index: None });
+                    let handle = unsafe { CreateFileW(wide.as_ptr(), 0x1, 0x7, std::ptr::null_mut(), 3, 0x0200_0000 | 0x4000_0000, 0) };
+                    if handle == -1 { return None; }
+                    let mut entry = Box::new(Dir { handle, overlapped: Overlapped { internal: 0, internal_high: 0, offset: 0, offset_high: 0, event: 0 }, buf: [0; 16384], names: HashMap::new(), own_index: None });
                     if !entry.arm() { return None; }
                     dirs.push(entry);
                     index.insert(key, dirs.len() - 1);
