@@ -18557,6 +18557,11 @@ impl ::core::ops::BitXor for NOTIFY_IME_INDEX { type Output = Self; fn bitxor(se
 impl ::core::ops::Not for NOTIFY_IME_INDEX { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 }
 pub mod KeyboardAndMouse {
+mod import_GetCapture { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetCapture"] pub fn call() -> crate::Win32::Foundation::HWND; } }
+pub use import_GetCapture::call as GetCapture_raw;
+#[inline]
+pub unsafe fn GetCapture() -> crate::Win32::Foundation::HWND {
+import_GetCapture::call()}
 mod import_GetKeyState { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetKeyState"] pub fn call(nVirtKey: i32) -> i16; } }
 pub use import_GetKeyState::call as GetKeyState_raw;
 #[inline]
