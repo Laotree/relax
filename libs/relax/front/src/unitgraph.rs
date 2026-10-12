@@ -883,7 +883,7 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, out_
     }
     for c in &makepad {
         match c.as_str() {
-            "lines" | "linux_direct" | "no_android_choreographer" | "apple_bundle" | "ohos_sim" | "gpusim" | "use_gles_3" => cfg(c),
+            "lines" | "linux_direct" | "no_android_choreographer" | "apple_bundle" | "gpusim" | "use_gles_3" => cfg(c),
             "quest" => {
                 cfg("quest");
                 cfg("use_gles_3");

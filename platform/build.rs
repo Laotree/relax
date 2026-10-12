@@ -146,7 +146,7 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
-    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,quest,no_android_choreographer,ohos_sim,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
+    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,quest,no_android_choreographer,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
     // Every variable declared here rebuilds this crate and everything that
     // depends on it (draw, widgets, every app) when its value changes: keep
     // per-app inputs out (see src/app_meta.rs). MAKEPAD selects build options
@@ -158,8 +158,7 @@ fn main() {
 
     // Desktop Linux and macOS always use the HAL. Linux shell selection
     // (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let desktop_linux = target_os == "linux" && target_env != "ohos";
+    let desktop_linux = target_os == "linux";
     let hal = target_os == "macos" || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
         println!("cargo:rustc-cfg=hal");
@@ -176,7 +175,6 @@ fn main() {
                     println!("cargo:rustc-cfg=use_vulkan");
                 }
                 "apple_bundle" => println!("cargo:rustc-cfg=apple_bundle"),
-                "ohos_sim" => println!("cargo:rustc-cfg=ohos_sim"),
                 "gpusim" => println!("cargo:rustc-cfg=gpusim"),
                 "use_gles_3" if !desktop_linux => println!("cargo:rustc-cfg=use_gles_3"),
                 "vulkan" | "use_vulkan" if !desktop_linux => println!("cargo:rustc-cfg=use_vulkan"),
@@ -201,10 +199,6 @@ fn main() {
             }
             println!("cargo:rustc-link-lib=framework=MetalKit");
             println!("cargo:rustc-link-lib=framework=GameController");
-        }
-        "linux" if target_env == "ohos" => {
-            println!("cargo:rustc-cfg=use_gles_3");
-            println!("cargo:rustc-link-lib=xkbcommon");
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");
