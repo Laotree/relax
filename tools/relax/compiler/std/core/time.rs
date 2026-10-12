@@ -12,43 +12,66 @@ const NANOS_PER_MICRO: u32 = 1_000;
 const MILLIS_PER_SEC: u64 = 1_000;
 const MICROS_PER_SEC: u64 = 1_000_000;
 
+/// The normalized fractional second, with the same scalar niche as core's Nanoseconds.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[cfg_attr(not(relax_check), rustc_layout_scalar_valid_range_end(999_999_999))]
+struct Nanoseconds(u32);
+
+impl Nanoseconds {
+    /// # Safety: `nanos` must be less than NANOS_PER_SEC.
+    const unsafe fn new(nanos: u32) -> Nanoseconds {
+        Nanoseconds(nanos)
+    }
+
+    const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl Default for Nanoseconds {
+    fn default() -> Nanoseconds {
+        unsafe { Nanoseconds::new(0) }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Duration {
     secs: u64,
-    nanos: u32, // always < NANOS_PER_SEC
+    nanos: Nanoseconds,
 }
 
 impl Duration {
-    pub const SECOND: Duration = Duration { secs: 1, nanos: 0 };
-    pub const MILLISECOND: Duration = Duration { secs: 0, nanos: NANOS_PER_MILLI };
-    pub const MICROSECOND: Duration = Duration { secs: 0, nanos: NANOS_PER_MICRO };
-    pub const NANOSECOND: Duration = Duration { secs: 0, nanos: 1 };
-    pub const ZERO: Duration = Duration { secs: 0, nanos: 0 };
-    pub const MAX: Duration = Duration { secs: u64::MAX, nanos: NANOS_PER_SEC - 1 };
+    pub const SECOND: Duration = Duration::new(1, 0);
+    pub const MILLISECOND: Duration = Duration::new(0, NANOS_PER_MILLI);
+    pub const MICROSECOND: Duration = Duration::new(0, NANOS_PER_MICRO);
+    pub const NANOSECOND: Duration = Duration::new(0, 1);
+    pub const ZERO: Duration = Duration::new(0, 0);
+    pub const MAX: Duration = Duration::new(u64::MAX, NANOS_PER_SEC - 1);
 
     pub const fn new(secs: u64, nanos: u32) -> Duration {
         if nanos < NANOS_PER_SEC {
-            Duration { secs, nanos }
+            Duration { secs, nanos: unsafe { Nanoseconds::new(nanos) } }
         } else {
             let extra = (nanos / NANOS_PER_SEC) as u64;
             let secs = match secs.checked_add(extra) {
                 Some(s) => s,
                 None => panic!("overflow in Duration::new"),
             };
-            Duration { secs, nanos: nanos % NANOS_PER_SEC }
+            Duration { secs, nanos: unsafe { Nanoseconds::new(nanos % NANOS_PER_SEC) } }
         }
     }
     pub const fn from_secs(secs: u64) -> Duration {
-        Duration { secs, nanos: 0 }
+        Duration { secs, nanos: unsafe { Nanoseconds::new(0) } }
     }
     pub const fn from_millis(millis: u64) -> Duration {
-        Duration { secs: millis / MILLIS_PER_SEC, nanos: ((millis % MILLIS_PER_SEC) as u32) * NANOS_PER_MILLI }
+        Duration { secs: millis / MILLIS_PER_SEC, nanos: unsafe { Nanoseconds::new(((millis % MILLIS_PER_SEC) as u32) * NANOS_PER_MILLI) } }
     }
     pub const fn from_micros(micros: u64) -> Duration {
-        Duration { secs: micros / MICROS_PER_SEC, nanos: ((micros % MICROS_PER_SEC) as u32) * NANOS_PER_MICRO }
+        Duration { secs: micros / MICROS_PER_SEC, nanos: unsafe { Nanoseconds::new(((micros % MICROS_PER_SEC) as u32) * NANOS_PER_MICRO) } }
     }
     pub const fn from_nanos(nanos: u64) -> Duration {
-        Duration { secs: nanos / (NANOS_PER_SEC as u64), nanos: (nanos % (NANOS_PER_SEC as u64)) as u32 }
+        Duration { secs: nanos / (NANOS_PER_SEC as u64), nanos: unsafe { Nanoseconds::new((nanos % (NANOS_PER_SEC as u64)) as u32) } }
     }
     pub const fn from_mins(mins: u64) -> Duration {
         if mins > u64::MAX / 60 {
@@ -63,28 +86,28 @@ impl Duration {
         Duration::from_secs(hours * 3600)
     }
     pub const fn is_zero(&self) -> bool {
-        self.secs == 0 && self.nanos == 0
+        self.secs == 0 && self.nanos.get() == 0
     }
     pub const fn as_secs(&self) -> u64 {
         self.secs
     }
     pub const fn subsec_millis(&self) -> u32 {
-        self.nanos / NANOS_PER_MILLI
+        self.nanos.get() / NANOS_PER_MILLI
     }
     pub const fn subsec_micros(&self) -> u32 {
-        self.nanos / NANOS_PER_MICRO
+        self.nanos.get() / NANOS_PER_MICRO
     }
     pub const fn subsec_nanos(&self) -> u32 {
-        self.nanos
+        self.nanos.get()
     }
     pub const fn as_millis(&self) -> u128 {
-        self.secs as u128 * MILLIS_PER_SEC as u128 + (self.nanos / NANOS_PER_MILLI) as u128
+        self.secs as u128 * MILLIS_PER_SEC as u128 + (self.nanos.get() / NANOS_PER_MILLI) as u128
     }
     pub const fn as_micros(&self) -> u128 {
-        self.secs as u128 * MICROS_PER_SEC as u128 + (self.nanos / NANOS_PER_MICRO) as u128
+        self.secs as u128 * MICROS_PER_SEC as u128 + (self.nanos.get() / NANOS_PER_MICRO) as u128
     }
     pub const fn as_nanos(&self) -> u128 {
-        self.secs as u128 * NANOS_PER_SEC as u128 + self.nanos as u128
+        self.secs as u128 * NANOS_PER_SEC as u128 + self.nanos.get() as u128
     }
     pub const fn abs_diff(self, other: Duration) -> Duration {
         if let Some(res) = self.checked_sub(other) {
@@ -100,7 +123,7 @@ impl Duration {
         let Some(mut secs) = self.secs.checked_add(rhs.secs) else {
             return None;
         };
-        let mut nanos = self.nanos + rhs.nanos;
+        let mut nanos = self.nanos.get() + rhs.nanos.get();
         if nanos >= NANOS_PER_SEC {
             nanos -= NANOS_PER_SEC;
             let Some(s) = secs.checked_add(1) else {
@@ -108,7 +131,7 @@ impl Duration {
             };
             secs = s;
         }
-        Some(Duration { secs, nanos })
+        Some(Duration { secs, nanos: unsafe { Nanoseconds::new(nanos) } })
     }
     pub const fn saturating_add(self, rhs: Duration) -> Duration {
         match self.checked_add(rhs) {
@@ -120,15 +143,15 @@ impl Duration {
         let Some(mut secs) = self.secs.checked_sub(rhs.secs) else {
             return None;
         };
-        let nanos = if self.nanos >= rhs.nanos {
-            self.nanos - rhs.nanos
+        let nanos = if self.nanos.get() >= rhs.nanos.get() {
+            self.nanos.get() - rhs.nanos.get()
         } else if let Some(s) = secs.checked_sub(1) {
             secs = s;
-            self.nanos + NANOS_PER_SEC - rhs.nanos
+            self.nanos.get() + NANOS_PER_SEC - rhs.nanos.get()
         } else {
             return None;
         };
-        Some(Duration { secs, nanos })
+        Some(Duration { secs, nanos: unsafe { Nanoseconds::new(nanos) } })
     }
     pub const fn saturating_sub(self, rhs: Duration) -> Duration {
         match self.checked_sub(rhs) {
@@ -137,12 +160,12 @@ impl Duration {
         }
     }
     pub const fn checked_mul(self, rhs: u32) -> Option<Duration> {
-        let total_nanos = self.nanos as u64 * rhs as u64;
+        let total_nanos = self.nanos.get() as u64 * rhs as u64;
         let extra_secs = total_nanos / (NANOS_PER_SEC as u64);
         let nanos = (total_nanos % (NANOS_PER_SEC as u64)) as u32;
         if let Some(s) = self.secs.checked_mul(rhs as u64) {
             if let Some(secs) = s.checked_add(extra_secs) {
-                return Some(Duration { secs, nanos });
+                return Some(Duration { secs, nanos: unsafe { Nanoseconds::new(nanos) } });
             }
         }
         None
@@ -159,22 +182,22 @@ impl Duration {
         }
         let secs = self.secs / (rhs as u64);
         let extra_secs = self.secs % (rhs as u64);
-        let mut nanos = self.nanos / rhs;
-        let extra_nanos = self.nanos % rhs;
+        let mut nanos = self.nanos.get() / rhs;
+        let extra_nanos = self.nanos.get() % rhs;
         nanos += ((extra_secs * (NANOS_PER_SEC as u64) + extra_nanos as u64) / (rhs as u64)) as u32;
-        Some(Duration { secs, nanos })
+        Some(Duration { secs, nanos: unsafe { Nanoseconds::new(nanos) } })
     }
     pub const fn as_secs_f64(&self) -> f64 {
-        (self.secs as f64) + (self.nanos as f64) / (NANOS_PER_SEC as f64)
+        (self.secs as f64) + (self.nanos.get() as f64) / (NANOS_PER_SEC as f64)
     }
     pub const fn as_secs_f32(&self) -> f32 {
-        (self.secs as f32) + (self.nanos as f32) / (NANOS_PER_SEC as f32)
+        (self.secs as f32) + (self.nanos.get() as f32) / (NANOS_PER_SEC as f32)
     }
     pub const fn as_millis_f64(&self) -> f64 {
-        (self.secs as f64) * (MILLIS_PER_SEC as f64) + (self.nanos as f64) / (NANOS_PER_MILLI as f64)
+        (self.secs as f64) * (MILLIS_PER_SEC as f64) + (self.nanos.get() as f64) / (NANOS_PER_MILLI as f64)
     }
     pub const fn as_millis_f32(&self) -> f32 {
-        (self.secs as f32) * (MILLIS_PER_SEC as f32) + (self.nanos as f32) / (NANOS_PER_MILLI as f32)
+        (self.secs as f32) * (MILLIS_PER_SEC as f32) + (self.nanos.get() as f32) / (NANOS_PER_MILLI as f32)
     }
     pub fn from_secs_f64(secs: f64) -> Duration {
         match Duration::try_from_secs_f64(secs) {
@@ -201,13 +224,13 @@ impl Duration {
         Duration::from_secs_f64(self.as_secs_f64() / rhs as f64)
     }
     pub const fn div_duration_f64(self, rhs: Duration) -> f64 {
-        let self_nanos = (self.secs as f64) * (NANOS_PER_SEC as f64) + (self.nanos as f64);
-        let rhs_nanos = (rhs.secs as f64) * (NANOS_PER_SEC as f64) + (rhs.nanos as f64);
+        let self_nanos = (self.secs as f64) * (NANOS_PER_SEC as f64) + (self.nanos.get() as f64);
+        let rhs_nanos = (rhs.secs as f64) * (NANOS_PER_SEC as f64) + (rhs.nanos.get() as f64);
         self_nanos / rhs_nanos
     }
     pub const fn div_duration_f32(self, rhs: Duration) -> f32 {
-        let self_nanos = (self.secs as f32) * (NANOS_PER_SEC as f32) + (self.nanos as f32);
-        let rhs_nanos = (rhs.secs as f32) * (NANOS_PER_SEC as f32) + (rhs.nanos as f32);
+        let self_nanos = (self.secs as f32) * (NANOS_PER_SEC as f32) + (self.nanos.get() as f32);
+        let rhs_nanos = (rhs.secs as f32) * (NANOS_PER_SEC as f32) + (rhs.nanos.get() as f32);
         self_nanos / rhs_nanos
     }
 
@@ -376,14 +399,14 @@ fn sum_step(total_secs: &mut u64, total_nanos: &mut u64, d: &Duration) {
         Some(s) => s,
         None => panic!("overflow in iter::sum over durations"),
     };
-    *total_nanos = match total_nanos.checked_add(d.nanos as u64) {
+    *total_nanos = match total_nanos.checked_add(d.nanos.get() as u64) {
         Some(n) => n,
         None => {
             *total_secs = match total_secs.checked_add(*total_nanos / NANOS_PER_SEC as u64) {
                 Some(s) => s,
                 None => panic!("overflow in iter::sum over durations"),
             };
-            (*total_nanos % NANOS_PER_SEC as u64) + d.nanos as u64
+            (*total_nanos % NANOS_PER_SEC as u64) + d.nanos.get() as u64
         }
     };
 }
@@ -421,14 +444,15 @@ impl<'a> Sum<&'a Duration> for Duration {
 impl fmt::Debug for Duration {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let prefix = if f.sign_plus() { "+" } else { "" };
+        let nanos = self.nanos.get();
         if self.secs > 0 {
-            fmt_decimal(f, self.secs, self.nanos, NANOS_PER_SEC / 10, prefix, "s")
-        } else if self.nanos >= NANOS_PER_MILLI {
-            fmt_decimal(f, (self.nanos / NANOS_PER_MILLI) as u64, self.nanos % NANOS_PER_MILLI, NANOS_PER_MILLI / 10, prefix, "ms")
-        } else if self.nanos >= NANOS_PER_MICRO {
-            fmt_decimal(f, (self.nanos / NANOS_PER_MICRO) as u64, self.nanos % NANOS_PER_MICRO, NANOS_PER_MICRO / 10, prefix, "µs")
+            fmt_decimal(f, self.secs, nanos, NANOS_PER_SEC / 10, prefix, "s")
+        } else if nanos >= NANOS_PER_MILLI {
+            fmt_decimal(f, (nanos / NANOS_PER_MILLI) as u64, nanos % NANOS_PER_MILLI, NANOS_PER_MILLI / 10, prefix, "ms")
+        } else if nanos >= NANOS_PER_MICRO {
+            fmt_decimal(f, (nanos / NANOS_PER_MICRO) as u64, nanos % NANOS_PER_MICRO, NANOS_PER_MICRO / 10, prefix, "µs")
         } else {
-            fmt_decimal(f, self.nanos as u64, 0, 1, prefix, "ns")
+            fmt_decimal(f, nanos as u64, 0, 1, prefix, "ns")
         }
     }
 }

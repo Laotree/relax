@@ -15,9 +15,30 @@ use crate::intrinsics_mem as im;
 use crate::ops::{Deref, DerefMut, Index, IndexMut, RangeBounds};
 use crate::slice::SliceIndex;
 
+/// RawVec's stored capacity: the high bit stays unused, including for ZSTs.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+#[cfg_attr(all(not(relax_check), target_pointer_width = "64"), rustc_layout_scalar_valid_range_end(0x7fff_ffff_ffff_ffff))]
+#[cfg_attr(all(not(relax_check), target_pointer_width = "32"), rustc_layout_scalar_valid_range_end(0x7fff_ffff))]
+pub(crate) struct Cap(usize);
+
+impl Cap {
+    pub(crate) const ZERO: Cap = unsafe { Cap::new::<u8>(0) };
+
+    /// ZSTs report usize::MAX capacity without storing it.
+    /// # Safety: for non-ZSTs, `cap` must be at most isize::MAX.
+    pub(crate) const unsafe fn new<T>(cap: usize) -> Cap {
+        Cap(if crate::mem::size_of::<T>() == 0 { 0 } else { cap })
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 pub struct Vec<T> {
     ptr: crate::ptr::NonNull<T>,
-    cap: usize,
+    cap: Cap,
     len: usize,
 }
 
@@ -45,7 +66,7 @@ fn capacity_overflow() -> ! {
 
 impl<T> Vec<T> {
     pub const fn new() -> Vec<T> {
-        Vec { ptr: crate::ptr::NonNull::dangling(), cap: 0, len: 0 }
+        Vec { ptr: crate::ptr::NonNull::dangling(), cap: Cap::ZERO, len: 0 }
     }
 
     pub fn with_capacity(capacity: usize) -> Vec<T> {
@@ -56,20 +77,23 @@ impl<T> Vec<T> {
         v
     }
 
+    /// # Safety: `ptr` must be non-null and aligned, with `length` initialized elements.
+    /// For non-ZSTs it must own an allocation for `capacity` elements, fitting in
+    /// isize::MAX bytes, and `length` must not exceed `capacity`.
     pub unsafe fn from_raw_parts(ptr: *mut T, length: usize, capacity: usize) -> Vec<T> {
-        Vec { ptr: crate::ptr::NonNull::new_unchecked(ptr), cap: capacity, len: length }
+        Vec { ptr: crate::ptr::NonNull::new_unchecked(ptr), cap: Cap::new::<T>(capacity), len: length }
     }
 
     pub fn into_raw_parts(self) -> (*mut T, usize, usize) {
         let me = crate::mem::ManuallyDrop::new(self);
-        (me.ptr.as_ptr(), me.len, me.cap)
+        (me.ptr.as_ptr(), me.len, me.capacity())
     }
 
     pub fn capacity(&self) -> usize {
         if is_zst::<T>() {
             usize::MAX
         } else {
-            self.cap
+            self.cap.get()
         }
     }
 
@@ -82,31 +106,48 @@ impl<T> Vec<T> {
 
     /// Reallocates to exactly `new_cap` (>= len). Not for ZSTs.
     fn grow_to(&mut self, new_cap: usize) {
-        let new_layout = Vec::<T>::layout_for(new_cap);
-        if new_layout.size() > isize::MAX as usize {
+        if self.try_grow_to(new_cap).is_err() {
             capacity_overflow();
         }
-        let p = if self.cap == 0 {
+    }
+
+    fn try_grow_to(&mut self, new_cap: usize) -> Result<(), crate::collections::TryReserveError> {
+        let new_layout = match Layout::array::<T>(new_cap) {
+            Ok(l) => l,
+            Err(_) => return Err(crate::collections::TryReserveError::capacity_overflow()),
+        };
+        let p = if self.cap.get() == 0 {
             heap::alloc_or_abort(new_layout)
         } else {
-            heap::realloc_or_abort(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap), new_layout.size())
+            heap::realloc_or_abort(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap.get()), new_layout.size())
         };
         self.ptr = unsafe { crate::ptr::NonNull::new_unchecked(p as *mut T) };
-        self.cap = new_cap;
+        // Layout::array checked that the non-ZST allocation fits in isize::MAX bytes.
+        self.cap = unsafe { Cap::new::<T>(new_cap) };
+        Ok(())
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        if is_zst::<T>() {
-            return;
+        if self.try_reserve(additional).is_err() {
+            capacity_overflow();
         }
-        if self.cap - self.len >= additional {
-            return;
+    }
+
+    pub fn reserve_exact(&mut self, additional: usize) {
+        if self.try_reserve_exact(additional).is_err() {
+            capacity_overflow();
+        }
+    }
+
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), crate::collections::TryReserveError> {
+        if self.capacity() - self.len >= additional {
+            return Ok(());
         }
         let required = match self.len.checked_add(additional) {
             Some(r) => r,
-            None => capacity_overflow(),
+            None => return Err(crate::collections::TryReserveError::capacity_overflow()),
         };
-        let mut cap = self.cap * 2;
+        let mut cap = self.cap.get() * 2;
         if cap < required {
             cap = required;
         }
@@ -114,37 +155,18 @@ impl<T> Vec<T> {
         if cap < min {
             cap = min;
         }
-        self.grow_to(cap);
-    }
-
-    pub fn reserve_exact(&mut self, additional: usize) {
-        if is_zst::<T>() {
-            return;
-        }
-        if self.cap - self.len >= additional {
-            return;
-        }
-        let required = match self.len.checked_add(additional) {
-            Some(r) => r,
-            None => capacity_overflow(),
-        };
-        self.grow_to(required);
-    }
-
-    pub fn try_reserve(&mut self, additional: usize) -> Result<(), crate::collections::TryReserveError> {
-        if self.len.checked_add(additional).is_none() {
-            return Err(crate::collections::TryReserveError::capacity_overflow());
-        }
-        self.reserve(additional);
-        Ok(())
+        self.try_grow_to(cap)
     }
 
     pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), crate::collections::TryReserveError> {
-        if self.len.checked_add(additional).is_none() {
-            return Err(crate::collections::TryReserveError::capacity_overflow());
+        if self.capacity() - self.len >= additional {
+            return Ok(());
         }
-        self.reserve_exact(additional);
-        Ok(())
+        let required = match self.len.checked_add(additional) {
+            Some(r) => r,
+            None => return Err(crate::collections::TryReserveError::capacity_overflow()),
+        };
+        self.try_grow_to(required)
     }
 
     pub fn shrink_to_fit(&mut self) {
@@ -156,21 +178,21 @@ impl<T> Vec<T> {
             return;
         }
         let target = if self.len > min_capacity { self.len } else { min_capacity };
-        if target >= self.cap {
+        if target >= self.cap.get() {
             return;
         }
         if target == 0 {
-            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap));
+            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap.get()));
             self.ptr = crate::ptr::NonNull::dangling();
-            self.cap = 0;
+            self.cap = Cap::ZERO;
         } else {
             let p = heap::realloc_or_abort(
                 self.ptr.as_ptr() as *mut u8,
-                Vec::<T>::layout_for(self.cap),
+                Vec::<T>::layout_for(self.cap.get()),
                 Vec::<T>::layout_for(target).size(),
             );
             self.ptr = unsafe { crate::ptr::NonNull::new_unchecked(p as *mut T) };
-            self.cap = target;
+            self.cap = unsafe { Cap::new::<T>(target) };
         }
     }
 
@@ -550,7 +572,7 @@ pub fn from_elem<T: Clone>(elem: T, n: usize) -> Vec<T> {
         if p.is_null() {
             heap::handle_alloc_error(layout);
         }
-        return Vec { ptr: unsafe { crate::ptr::NonNull::new_unchecked(p as *mut T) }, cap: n, len: n };
+        return Vec { ptr: unsafe { crate::ptr::NonNull::new_unchecked(p as *mut T) }, cap: unsafe { Cap::new::<T>(n) }, len: n };
     }
     let mut v = Vec::with_capacity(n);
     v.extend_with(n, elem);
@@ -593,8 +615,8 @@ impl<T> Drop for Vec<T> {
                 im::drop_in_place(s);
             }
         }
-        if !is_zst::<T>() && self.cap != 0 {
-            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap));
+        if !is_zst::<T>() && self.cap.get() != 0 {
+            heap::free(self.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(self.cap.get()));
         }
     }
 }
@@ -998,8 +1020,8 @@ impl<T, const N: usize> TryFrom<Vec<T>> for [T; N] {
         }
         let me = crate::mem::ManuallyDrop::new(vec);
         let arr = unsafe { im::ptr_read(me.ptr.as_ptr() as *const [T; N]) };
-        if !is_zst::<T>() && me.cap != 0 {
-            heap::free(me.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(me.cap));
+        if !is_zst::<T>() && me.cap.get() != 0 {
+            heap::free(me.ptr.as_ptr() as *mut u8, Vec::<T>::layout_for(me.cap.get()));
         }
         Ok(arr)
     }

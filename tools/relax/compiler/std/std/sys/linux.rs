@@ -286,7 +286,7 @@ pub fn futex_wait(futex: &AtomicU32, expected: u32, timeout: Option<Duration>) -
             return true;
         }
         let ts = match deadline {
-            Some(t) => super::timespec { tv_sec: t.secs, tv_nsec: t.nanos as c_long },
+            Some(t) => super::timespec { tv_sec: t.secs, tv_nsec: t.nanos() as c_long },
             None => super::timespec { tv_sec: 0, tv_nsec: 0 },
         };
         let tsp = match deadline {

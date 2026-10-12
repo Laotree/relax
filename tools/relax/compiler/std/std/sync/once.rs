@@ -3,6 +3,8 @@
 
 use core::cell::{Cell, UnsafeCell};
 use core::fmt;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
@@ -164,7 +166,10 @@ impl fmt::Debug for Once {
 
 pub struct OnceLock<T> {
     once: Once,
-    value: UnsafeCell<Option<T>>,
+    /// The completed state publishes this initialized value to readers with acquire/release.
+    value: UnsafeCell<MaybeUninit<T>>,
+    /// Keeps ownership of T visible to drop checking.
+    _marker: PhantomData<T>,
 }
 
 unsafe impl<T: Sync + Send> Sync for OnceLock<T> {}
@@ -172,27 +177,28 @@ unsafe impl<T: Send> Send for OnceLock<T> {}
 
 impl<T> OnceLock<T> {
     pub const fn new() -> OnceLock<T> {
-        OnceLock { once: Once::new(), value: UnsafeCell::new(None) }
+        OnceLock { once: Once::new(), value: UnsafeCell::new(MaybeUninit::uninit()), _marker: PhantomData }
     }
 
     pub fn get(&self) -> Option<&T> {
         if self.once.is_completed() {
-            unsafe { (*self.value.get()).as_ref() }
+            Some(unsafe { (*self.value.get()).assume_init_ref() })
         } else {
             None
         }
     }
 
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.value.get_mut().as_mut()
+        if self.once.is_completed() {
+            Some(unsafe { self.value.get_mut().assume_init_mut() })
+        } else {
+            None
+        }
     }
 
     pub fn wait(&self) -> &T {
         self.once.wait_force();
-        match unsafe { (*self.value.get()).as_ref() } {
-            Some(v) => v,
-            None => panic!("OnceLock completed without a value"),
-        }
+        unsafe { (*self.value.get()).assume_init_ref() }
     }
 
     pub fn set(&self, value: T) -> Result<(), T> {
@@ -219,20 +225,14 @@ impl<T> OnceLock<T> {
             return v;
         }
         self.initialize(f);
-        match unsafe { (*self.value.get()).as_ref() } {
-            Some(v) => v,
-            None => panic!("OnceLock completed without a value"),
-        }
+        unsafe { (*self.value.get()).assume_init_ref() }
     }
 
     pub fn get_mut_or_init<F: FnOnce() -> T>(&mut self, f: F) -> &mut T {
         if self.get().is_none() {
             self.initialize(f);
         }
-        match self.value.get_mut().as_mut() {
-            Some(v) => v,
-            None => panic!("OnceLock completed without a value"),
-        }
+        unsafe { self.value.get_mut().assume_init_mut() }
     }
 
     pub fn get_or_try_init<E, F: FnOnce() -> Result<T, E>>(&self, f: F) -> Result<&T, E> {
@@ -249,7 +249,7 @@ impl<T> OnceLock<T> {
             };
             match f() {
                 Ok(value) => unsafe {
-                    *slot.get() = Some(value);
+                    (*slot.get()).write(value);
                 },
                 Err(e) => {
                     res = Err(e);
@@ -258,10 +258,7 @@ impl<T> OnceLock<T> {
             }
         });
         match res {
-            Ok(()) => match unsafe { (*self.value.get()).as_ref() } {
-                Some(v) => Ok(v),
-                None => panic!("OnceLock completed without a value"),
-            },
+            Ok(()) => Ok(unsafe { (*self.value.get()).assume_init_ref() }),
             Err(e) => Err(e),
         }
     }
@@ -273,7 +270,7 @@ impl<T> OnceLock<T> {
     pub fn take(&mut self) -> Option<T> {
         if self.once.is_completed() {
             self.once = Once::new();
-            self.value.get_mut().take()
+            Some(unsafe { self.value.get_mut().assume_init_read() })
         } else {
             None
         }
@@ -287,10 +284,18 @@ impl<T> OnceLock<T> {
             if let Some(f) = f.take() {
                 let value = f();
                 unsafe {
-                    *slot.get() = Some(value);
+                    (*slot.get()).write(value);
                 }
             }
         });
+    }
+}
+
+impl<T> Drop for OnceLock<T> {
+    fn drop(&mut self) {
+        if self.once.is_completed() {
+            unsafe { self.value.get_mut().assume_init_drop() };
+        }
     }
 }
 

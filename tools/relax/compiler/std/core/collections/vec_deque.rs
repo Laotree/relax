@@ -1,6 +1,6 @@
 //! VecDeque: a growable ring buffer.
 
-use crate::vec::Vec;
+use crate::vec::{Cap, Vec};
 use super::resolve_range;
 use crate::cmp::Ordering;
 use crate::fmt;
@@ -12,7 +12,7 @@ use crate::ptr;
 
 pub struct VecDeque<T> {
     buf: crate::ptr::NonNull<T>,
-    cap: usize,
+    cap: Cap,
     head: usize,
     len: usize,
     _m: PhantomData<T>,
@@ -34,15 +34,12 @@ fn min_non_zero_cap(elem_size: usize) -> usize {
 
 impl<T> VecDeque<T> {
     pub const fn new() -> VecDeque<T> {
-        VecDeque { buf: ptr::NonNull::dangling(), cap: 0, head: 0, len: 0, _m: PhantomData }
+        VecDeque { buf: ptr::NonNull::dangling(), cap: Cap::ZERO, head: 0, len: 0, _m: PhantomData }
     }
 
     pub fn with_capacity(capacity: usize) -> VecDeque<T> {
         let mut d = VecDeque::new();
-        if crate::mem::size_of::<T>() == 0 {
-            d.cap = usize::MAX;
-            d.buf = ptr::NonNull::<T>::dangling();
-        } else if capacity > 0 {
+        if !Self::is_zst() && capacity > 0 {
             d.alloc_exact(capacity);
         }
         d
@@ -51,7 +48,7 @@ impl<T> VecDeque<T> {
     fn alloc_exact(&mut self, capacity: usize) {
         let mut v: Vec<T> = Vec::with_capacity(capacity);
         self.buf = unsafe { ptr::NonNull::new_unchecked(v.as_mut_ptr()) };
-        self.cap = v.capacity();
+        self.cap = unsafe { Cap::new::<T>(v.capacity()) };
         crate::mem::forget(v);
     }
 
@@ -63,8 +60,8 @@ impl<T> VecDeque<T> {
     #[inline]
     fn phys(&self, idx: usize) -> usize {
         let i = self.head.wrapping_add(idx);
-        if i >= self.cap {
-            i.wrapping_sub(self.cap)
+        if i >= self.capacity() {
+            i.wrapping_sub(self.capacity())
         } else {
             i
         }
@@ -90,15 +87,15 @@ impl<T> VecDeque<T> {
         }
         self.free_buf();
         self.buf = unsafe { ptr::NonNull::new_unchecked(dst) };
-        self.cap = new_cap;
+        self.cap = unsafe { Cap::new::<T>(new_cap) };
         self.head = 0;
     }
 
     fn free_buf(&mut self) {
-        if !Self::is_zst() && self.cap > 0 {
-            unsafe { drop(Vec::from_raw_parts(self.buf.as_ptr(), 0, self.cap)) };
+        if !Self::is_zst() && self.cap.get() > 0 {
+            unsafe { drop(Vec::from_raw_parts(self.buf.as_ptr(), 0, self.cap.get())) };
         }
-        self.cap = 0;
+        self.cap = Cap::ZERO;
         self.buf = ptr::NonNull::dangling();
     }
 
@@ -107,33 +104,22 @@ impl<T> VecDeque<T> {
         if self.len == 0 {
             return ((0, 0), (0, 0));
         }
-        let tail_room = self.cap - self.head;
+        let tail_room = self.capacity() - self.head;
         if self.len <= tail_room {
             ((self.head, self.head + self.len), (0, 0))
         } else {
-            ((self.head, self.cap), (0, self.len - tail_room))
+            ((self.head, self.capacity()), (0, self.len - tail_room))
         }
     }
 
     fn grow_for(&mut self, additional: usize) {
-        let required = match self.len.checked_add(additional) {
-            Some(r) => r,
-            None => crate::panicking::panic_str("capacity overflow"),
-        };
-        if required <= self.cap {
-            return;
+        if self.try_reserve(additional).is_err() {
+            crate::panicking::panic_str("capacity overflow");
         }
-        let doubled = self.cap.saturating_mul(2);
-        let mut new_cap = if doubled > required { doubled } else { required };
-        let min = min_non_zero_cap(crate::mem::size_of::<T>());
-        if new_cap < min {
-            new_cap = min;
-        }
-        self.realloc(new_cap);
     }
 
     pub fn capacity(&self) -> usize {
-        self.cap
+        if Self::is_zst() { usize::MAX } else { self.cap.get() }
     }
     pub fn reserve(&mut self, additional: usize) {
         self.grow_for(additional);
@@ -143,12 +129,28 @@ impl<T> VecDeque<T> {
             Some(r) => r,
             None => crate::panicking::panic_str("capacity overflow"),
         };
-        if required > self.cap {
+        if required > self.capacity() {
             self.realloc(required);
         }
     }
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), super::TryReserveError> {
-        self.reserve(additional);
+        let required = match self.len.checked_add(additional) {
+            Some(r) => r,
+            None => return Err(super::TryReserveError::capacity_overflow()),
+        };
+        if required <= self.capacity() {
+            return Ok(());
+        }
+        let doubled = self.cap.get() * 2;
+        let mut new_cap = if doubled > required { doubled } else { required };
+        let min = min_non_zero_cap(crate::mem::size_of::<T>());
+        if new_cap < min {
+            new_cap = min;
+        }
+        if crate::heap::Layout::array::<T>(new_cap).is_err() {
+            return Err(super::TryReserveError::capacity_overflow());
+        }
+        self.realloc(new_cap);
         Ok(())
     }
     pub fn shrink_to_fit(&mut self) {
@@ -159,7 +161,7 @@ impl<T> VecDeque<T> {
             return;
         }
         let target = if min_capacity > self.len { min_capacity } else { self.len };
-        if target < self.cap {
+        if target < self.cap.get() {
             if target == 0 {
                 self.free_buf();
                 self.head = 0;
@@ -213,17 +215,17 @@ impl<T> VecDeque<T> {
     }
 
     pub fn push_back(&mut self, value: T) {
-        if self.len == self.cap {
+        if self.len == self.capacity() {
             self.grow_for(1);
         }
         unsafe { ptr::write(self.slot(self.len), value) };
         self.len += 1;
     }
     pub fn push_front(&mut self, value: T) {
-        if self.len == self.cap {
+        if self.len == self.capacity() {
             self.grow_for(1);
         }
-        self.head = if self.head == 0 { self.cap - 1 } else { self.head - 1 };
+        self.head = if self.head == 0 { self.capacity() - 1 } else { self.head - 1 };
         unsafe { ptr::write(self.buf.as_ptr().add(self.head), value) };
         self.len += 1;
     }
@@ -280,12 +282,12 @@ impl<T> VecDeque<T> {
         if index > self.len {
             crate::panicking::panic_str("index out of bounds");
         }
-        if self.len == self.cap {
+        if self.len == self.capacity() {
             self.grow_for(1);
         }
         if index < self.len - index {
             // shift the front part one to the left
-            self.head = if self.head == 0 { self.cap - 1 } else { self.head - 1 };
+            self.head = if self.head == 0 { self.capacity() - 1 } else { self.head - 1 };
             let mut i = 0;
             while i < index {
                 unsafe { ptr::copy_nonoverlapping(self.slot(i + 1), self.slot(i), 1) };
@@ -379,7 +381,7 @@ impl<T> VecDeque<T> {
     }
 
     pub fn make_contiguous(&mut self) -> &mut [T] {
-        if self.head + self.len > self.cap && !Self::is_zst() {
+        if !Self::is_zst() && self.head + self.len > self.capacity() {
             // read out in order, write back from the start of the buffer
             let mut tmp: Vec<T> = Vec::with_capacity(self.len);
             let mut i = 0;
@@ -718,11 +720,11 @@ impl<T> From<Vec<T>> for VecDeque<T> {
         let cap = v.capacity();
         let buf = v.as_mut_ptr();
         if crate::mem::size_of::<T>() == 0 {
-            VecDeque { buf: ptr::NonNull::<T>::dangling(), cap: usize::MAX, head: 0, len, _m: PhantomData }
+            VecDeque { buf: ptr::NonNull::<T>::dangling(), cap: Cap::ZERO, head: 0, len, _m: PhantomData }
         } else if cap == 0 {
             VecDeque::new()
         } else {
-            VecDeque { buf: unsafe { ptr::NonNull::new_unchecked(buf) }, cap, head: 0, len, _m: PhantomData }
+            VecDeque { buf: unsafe { ptr::NonNull::new_unchecked(buf) }, cap: unsafe { Cap::new::<T>(cap) }, head: 0, len, _m: PhantomData }
         }
     }
 }
@@ -737,7 +739,7 @@ impl<T> From<VecDeque<T>> for Vec<T> {
             }
             return v;
         }
-        if other.cap == 0 {
+        if other.cap.get() == 0 {
             return Vec::new();
         }
         other.make_contiguous();
@@ -747,9 +749,9 @@ impl<T> From<VecDeque<T>> for Vec<T> {
             if other.head != 0 {
                 ptr::copy(other.buf.as_ptr().add(other.head), other.buf.as_ptr(), len);
             }
-            let v = Vec::from_raw_parts(other.buf.as_ptr(), len, other.cap);
+            let v = Vec::from_raw_parts(other.buf.as_ptr(), len, other.cap.get());
             other.buf = ptr::NonNull::dangling();
-            other.cap = 0;
+            other.cap = Cap::ZERO;
             other.len = 0;
             other.head = 0;
             v

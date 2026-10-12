@@ -224,7 +224,7 @@ pub fn now(clock: clockid_t) -> super::time::Timespec {
         let t = ft as i128 - UNIX_EPOCH_FT as i128;
         let secs = t.div_euclid(10_000_000) as i64;
         let nanos = (t.rem_euclid(10_000_000) * 100) as u32;
-        return super::time::Timespec { secs, nanos };
+        return super::time::Timespec::new(secs, nanos as i64);
     }
     let (mut c, mut f) = (0i64, 0i64);
     unsafe {
@@ -233,7 +233,7 @@ pub fn now(clock: clockid_t) -> super::time::Timespec {
     }
     let secs = c / f;
     let nanos = ((c % f) as i128 * 1_000_000_000 / f as i128) as u32;
-    super::time::Timespec { secs, nanos }
+    super::time::Timespec::new(secs, nanos as i64)
 }
 
 /// Sleeps for `d`: a high-resolution waitable timer (real std's thread::sleep), else Sleep in ms
@@ -438,7 +438,7 @@ pub mod portable {
         unsafe { GetCurrentThreadId() as usize }
     }
 
-    /// A started thread (its handle), for join / detach.
+    /// An owned thread handle, closed after joining or when detached by Drop.
     pub struct NativeThread(HANDLE);
     unsafe impl Send for NativeThread {}
     unsafe impl Sync for NativeThread {}
@@ -485,13 +485,14 @@ pub mod portable {
     pub fn join_thread(t: NativeThread) {
         unsafe {
             WaitForSingleObject(t.0, INFINITE);
-            CloseHandle(t.0);
         }
     }
 
-    pub fn detach_thread(t: NativeThread) {
-        unsafe {
-            CloseHandle(t.0);
+    impl Drop for NativeThread {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
     }
 

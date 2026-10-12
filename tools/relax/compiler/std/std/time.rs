@@ -91,14 +91,14 @@ impl Sub<Instant> for Instant {
 
 impl fmt::Debug for Instant {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Instant").field("tv_sec", &self.0.secs).field("tv_nsec", &self.0.nanos).finish()
+        f.debug_struct("Instant").field("tv_sec", &self.0.secs).field("tv_nsec", &self.0.nanos()).finish()
     }
 }
 
 impl SystemTime {
     /// (seconds, nanoseconds) since the epoch, for futimens (fs.rs File::set_times)
     pub(crate) fn unix_parts(&self) -> (i64, u32) {
-        (self.0.secs, self.0.nanos)
+        (self.0.secs, self.0.nanos())
     }
     pub const UNIX_EPOCH: SystemTime = UNIX_EPOCH;
 
@@ -128,7 +128,7 @@ impl SystemTime {
     }
     /// From a stat-style (seconds, nanoseconds) pair (fs::Metadata times).
     pub(crate) fn from_parts(secs: i64, nanos: i64) -> SystemTime {
-        SystemTime(Timespec { secs, nanos: nanos as u32 })
+        SystemTime(Timespec::new(secs, nanos))
     }
 }
 
@@ -163,7 +163,7 @@ impl SubAssign<Duration> for SystemTime {
 
 impl fmt::Debug for SystemTime {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("SystemTime").field("tv_sec", &self.0.secs).field("tv_nsec", &self.0.nanos).finish()
+        f.debug_struct("SystemTime").field("tv_sec", &self.0.secs).field("tv_nsec", &self.0.nanos()).finish()
     }
 }
 

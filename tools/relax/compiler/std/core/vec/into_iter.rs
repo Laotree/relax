@@ -19,7 +19,7 @@ unsafe impl<T: Sync> Sync for IntoIter<T> {}
 
 pub(super) fn new<T>(v: Vec<T>) -> IntoIter<T> {
     let me = crate::mem::ManuallyDrop::new(v);
-    IntoIter { buf: me.ptr, cap: me.cap, start: 0, end: me.len }
+    IntoIter { buf: me.ptr, cap: me.cap.get(), start: 0, end: me.len }
 }
 
 impl<T> IntoIter<T> {

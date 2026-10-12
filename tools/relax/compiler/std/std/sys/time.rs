@@ -2,10 +2,16 @@
 
 use core::time::Duration;
 
+/// A normalized fractional second, matching the niche used by Duration.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+#[cfg_attr(not(relax_check), rustc_layout_scalar_valid_range_end(999_999_999))]
+struct Nanoseconds(u32);
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Timespec {
     pub secs: i64,
-    pub nanos: u32, // < 1e9
+    nanos: Nanoseconds,
 }
 
 const NSEC_PER_SEC: u32 = 1_000_000_000;
@@ -20,23 +26,33 @@ pub fn now(clock: super::os::clockid_t) -> Timespec {
     if r != 0 {
         panic!("clock_gettime failed: {}", super::error_string(super::errno()));
     }
-    Timespec { secs: t.tv_sec, nanos: t.tv_nsec as u32 }
+    Timespec::new(t.tv_sec, t.tv_nsec as i64)
 }
 
 impl Timespec {
-    pub const ZERO: Timespec = Timespec { secs: 0, nanos: 0 };
+    pub const ZERO: Timespec = Timespec::new(0, 0);
+
+    /// Checks OS nanoseconds before narrowing or storing the restricted scalar.
+    pub const fn new(secs: i64, nanos: i64) -> Timespec {
+        assert!(nanos >= 0 && nanos < NSEC_PER_SEC as i64, "invalid timespec nanoseconds");
+        Timespec { secs, nanos: unsafe { Nanoseconds(nanos as u32) } }
+    }
+
+    pub const fn nanos(&self) -> u32 {
+        self.nanos.0
+    }
 
     pub fn checked_add(&self, d: Duration) -> Option<Timespec> {
         if d.as_secs() > i64::MAX as u64 {
             return None;
         }
         let mut secs = self.secs.checked_add(d.as_secs() as i64)?;
-        let mut nanos = self.nanos + d.subsec_nanos();
+        let mut nanos = self.nanos() + d.subsec_nanos();
         if nanos >= NSEC_PER_SEC {
             nanos -= NSEC_PER_SEC;
             secs = secs.checked_add(1)?;
         }
-        Some(Timespec { secs, nanos })
+        Some(Timespec::new(secs, nanos as i64))
     }
 
     pub fn checked_sub(&self, d: Duration) -> Option<Timespec> {
@@ -44,22 +60,22 @@ impl Timespec {
             return None;
         }
         let mut secs = self.secs.checked_sub(d.as_secs() as i64)?;
-        let nanos = if self.nanos >= d.subsec_nanos() {
-            self.nanos - d.subsec_nanos()
+        let nanos = if self.nanos() >= d.subsec_nanos() {
+            self.nanos() - d.subsec_nanos()
         } else {
             secs = secs.checked_sub(1)?;
-            self.nanos + NSEC_PER_SEC - d.subsec_nanos()
+            self.nanos() + NSEC_PER_SEC - d.subsec_nanos()
         };
-        Some(Timespec { secs, nanos })
+        Some(Timespec::new(secs, nanos as i64))
     }
 
     /// `self - other` as a Duration: Ok if self >= other, else Err(other - self).
     pub fn sub_timespec(&self, other: &Timespec) -> Result<Duration, Duration> {
         if self >= other {
-            let (secs, nanos) = if self.nanos >= other.nanos {
-                ((self.secs as i128 - other.secs as i128) as u64, self.nanos - other.nanos)
+            let (secs, nanos) = if self.nanos() >= other.nanos() {
+                ((self.secs as i128 - other.secs as i128) as u64, self.nanos() - other.nanos())
             } else {
-                ((self.secs as i128 - other.secs as i128 - 1) as u64, self.nanos + NSEC_PER_SEC - other.nanos)
+                ((self.secs as i128 - other.secs as i128 - 1) as u64, self.nanos() + NSEC_PER_SEC - other.nanos())
             };
             Ok(Duration::new(secs, nanos))
         } else {

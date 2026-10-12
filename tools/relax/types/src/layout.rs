@@ -614,6 +614,11 @@ impl Layouts {
                 let mut l = if self.is_unsized(lcx, tcx, inner) && !matches!(tcx.tys.kind(self.struct_tail_for_codegen(lcx, tcx, inner)), TyKind::Foreign(_)) {
                     let mut l = plain(16, 8, Some(vec![Leaf { off: 0, mem: ptr, cls: Cls::I }, Leaf { off: 8, mem: ptr, cls: Cls::I }]));
                     l.fields = vec![0, 8];
+                    // A dyn pointer's vtable is non-null even when its data pointer is raw.
+                    // Slice metadata is a length and has no invalid values.
+                    if matches!(tcx.tys.kind(self.struct_tail_for_codegen(lcx, tcx, inner)), TyKind::Dyn(..)) {
+                        l.niche = nonnull(8);
+                    }
                     l
                 } else {
                     scalar(8, ptr, Cls::I)

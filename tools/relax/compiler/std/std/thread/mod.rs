@@ -251,7 +251,7 @@ impl Builder {
         let finish: Box<dyn FnOnce(bool) + Send + 'static> = core::mem::transmute(finish);
         let start = Box::new(ThreadStart { thread: their_thread, main: Some(main), finish: Some(finish) });
         match spawn_native(stack_size, start) {
-            Ok(native) => Ok(JoinInner { native: Some(native), thread: my_thread, packet: my_packet }),
+            Ok(native) => Ok(JoinInner { native, thread: my_thread, packet: my_packet }),
             Err(e) => {
                 if let Some(scope) = &my_packet.scope {
                     scope.decrement_num_running_threads(false);
@@ -347,16 +347,14 @@ impl<'scope, T> Drop for Packet<'scope, T> {
 }
 
 struct JoinInner<'scope, T> {
-    native: Option<sys::NativeThread>,
+    native: sys::NativeThread,
     thread: Thread,
     packet: Arc<Packet<'scope, T>>,
 }
 
 impl<'scope, T> JoinInner<'scope, T> {
-    fn join(mut self) -> Result<T> {
-        if let Some(t) = self.native.take() {
-            sys::join_thread(t);
-        }
+    fn join(self) -> Result<T> {
+        sys::join_thread(self.native);
         let packet = &self.packet;
         match unsafe { (*packet.result.get()).take() } {
             Some(r) => r,
@@ -365,14 +363,6 @@ impl<'scope, T> JoinInner<'scope, T> {
     }
     fn is_finished(&self) -> bool {
         Arc::strong_count(&self.packet) == 1
-    }
-}
-
-impl<'scope, T> Drop for JoinInner<'scope, T> {
-    fn drop(&mut self) {
-        if let Some(t) = self.native.take() {
-            sys::detach_thread(t);
-        }
     }
 }
 
