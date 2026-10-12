@@ -107,6 +107,7 @@ pub(super) fn check_with_scopes(prog: &Program, tcx: &Tcx, body: &Body, regions:
     cx.result
 }
 
+
 fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) {
     struct Check<'a> { tcx: &'a Tcx, body: &'a Body, stops: &'a mut Vec<&'static str> }
     impl Check<'_> { fn stop(&mut self, s: &'static str) { if !self.stops.contains(&s) { self.stops.push(s); } } }

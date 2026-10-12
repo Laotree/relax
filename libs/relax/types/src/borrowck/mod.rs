@@ -215,6 +215,9 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             let flow = moves::init_flow(&md, bir, &order);
             let mut mc = moves::MoveCheck::new(tx, bir, &md);
             mc.run(&flow, &order);
+            if crate::lint::enabled() && mc.diags.is_empty() && bir.closure_kind.is_none() && i == 0 {
+                lint_unused_mut(prog, body.def, bir, &mc.used_mut);
+            }
             let mut diags = mc.diags;
             for promoted in &promoteds[i] {
                 let md = moves::MoveData::new(tx, promoted);
@@ -509,3 +512,26 @@ mod settle_tests {
 mod implied_bounds_tests;
 #[cfg(test)]
 mod type_check_tests;
+
+/// rustc_borrowck lib.rs lint_unused_mut: a user binding (or argument) declared `mut` that no
+/// write or mutable borrow needed -- `unused_mut`. Bindings named `_..` are left out, and so is
+/// a binding whose declaration text is not `mut <name>` (macro expansions).
+fn lint_unused_mut(prog: &Program, owner: crate::program::DefId, bir: &bir::Bir, used: &moves::Bits) {
+    let Some(f) = prog.files.get(bir.file as usize) else { return };
+    let src = &f.src;
+    for (i, ld) in bir.locals.iter().enumerate() {
+        if !ld.mutable || moves::bit_get(used, i) || ld.is_ref_binding { continue; }
+        if !matches!(ld.kind, bir::LocalKind::User | bir::LocalKind::Arg) { continue; }
+        let Some(name) = ld.name.as_deref() else { continue };
+        if name.starts_with('_') { continue; }
+        let (lo, hi) = (ld.span.lo as usize, (ld.span.hi as usize).min(src.len()));
+        if lo >= hi { continue; }
+        let word = |j: usize| j + name.len() <= src.len() && &src[j..j + name.len()] == name.as_bytes()
+            && (j == 0 || !(src[j - 1] == b'_' || src[j - 1].is_ascii_alphanumeric()))
+            && (j + name.len() >= src.len() || !(src[j + name.len()] == b'_' || src[j + name.len()].is_ascii_alphanumeric()));
+        let Some(pos) = (lo..hi).find(|&j| word(j)) else { continue };
+        if pos < 4 || &src[pos - 4..pos] != b"mut " { continue; }
+        crate::lint::emit(prog, owner, &crate::lint::UNUSED_MUT, bir.file, (pos - 4) as u32,
+            &format!("variable does not need to be mutable -- help: remove this `mut` (`{}`)", name));
+    }
+}

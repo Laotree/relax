@@ -395,11 +395,14 @@ pub struct MoveCheck<'a> {
     reported_moves: Vec<u32>,
     /// Binding declaration span -> (diagnostic, number of attempted mutable borrows).
     buffered_mut_errors: HashMap<(u32, u32), (Diag, usize)>,
+    /// rustc MirBorrowckCtxt::used_mut: locals whose `mut` a write or mutable borrow needed
+    /// (the `unused_mut` lint's input)
+    pub used_mut: Bits,
 }
 
 impl<'a> MoveCheck<'a> {
     pub fn new(tx: &'a Tx<'a>, bir: &'a Bir, md: &'a MoveData) -> MoveCheck<'a> {
-        MoveCheck { tx, bir, md, diags: Vec::new(), reported: Vec::new(), reported_moves: Vec::new(), buffered_mut_errors: HashMap::default() }
+        MoveCheck { tx, bir, md, diags: Vec::new(), reported: Vec::new(), reported_moves: Vec::new(), buffered_mut_errors: HashMap::default(), used_mut: bits_new(bir.locals.len()) }
     }
 
     pub fn run(&mut self, flow: &InitFlow, order: &[u32]) {
@@ -469,7 +472,19 @@ impl<'a> MoveCheck<'a> {
     fn consume_rvalue(&mut self, b: u32, si: u32, rv: &Rvalue, span: Span, u: &Bits, e: &Bits) {
         match rv {
             Rvalue::Use(o) | Rvalue::Cast(_, o, _) | Rvalue::Repeat(o) => self.consume_op(b, si, o, span, u),
-            Rvalue::Aggregate(_, ops) | Rvalue::Op(_, ops) => {
+            Rvalue::Aggregate(kind, ops) => {
+                // a value moved into a closure that may mutate it there needs the binding's `mut`
+                // (rustc used_mut_upvars): every local a closure captures by value counts
+                if matches!(kind, AggKind::Closure(_)) {
+                    for o in ops {
+                        if let Operand::Move(p) | Operand::Copy(p) = o { if (p.local as usize) < self.bir.locals.len() { bit_set(&mut self.used_mut, p.local as usize); } }
+                    }
+                }
+                for o in ops {
+                    self.consume_op(b, si, o, span, u);
+                }
+            }
+            Rvalue::Op(_, ops) => {
                 for o in ops {
                     self.consume_op(b, si, o, span, u);
                 }
@@ -818,6 +833,9 @@ impl<'a> MoveCheck<'a> {
 
     /// check_access_permissions for a write: E0384 (immutable local assigned twice), E0594.
     fn check_mutate(&mut self, p: &Place, span: Span, e: &Bits) {
+        // a reassignment (or a write into its fields) needs the local's `mut`; its first
+        // initialization does not
+        if !p.proj.is_empty() || bit_get(e, p.local as usize) { self.note_used_mut(p); }
         if let Err(errp) = self.is_mutable(p, false) {
             if !bit_get(e, p.local as usize) {
                 return;
@@ -842,6 +860,7 @@ impl<'a> MoveCheck<'a> {
     }
 
     fn check_mutable(&mut self, p: &Place, span: Span, e: &Bits, borrow: bool) {
+        self.note_used_mut(p);
         // a binding mutated inside its match guard (rustc: the guard sees `&binding`)
         if let Some((_, name)) = self.bir.guard_locals.iter().find(|x| x.0 == p.local) {
             // (edition < 2021 closures capture the whole binding by unique borrow)
@@ -946,6 +965,18 @@ impl<'a> MoveCheck<'a> {
         let mut d = Diag::new(code, format!("{}{}", verb, reason), span);
         d.label(span, if borrow { "cannot borrow as mutable".to_string() } else { "cannot assign".to_string() }, true);
         d
+    }
+
+    /// rustc add_used_mut: the local whose `mut` writing / mutably borrowing `p` relies on --
+    /// none when the path goes through a `&mut` reference or a raw pointer (their referent's
+    /// mutability is the reference's, not the binding's).
+    fn note_used_mut(&mut self, p: &Place) {
+        for (i, pr) in p.proj.iter().enumerate() {
+            if matches!(pr, Proj::Deref) && matches!(self.tx.kind(place_ty_n(self.tx, self.bir, p, i)), TyKind::Ref(..) | TyKind::Ptr(..)) {
+                return;
+            }
+        }
+        if (p.local as usize) < self.bir.locals.len() { bit_set(&mut self.used_mut, p.local as usize); }
     }
 
     /// rustc is_mutable: Ok when `p` may be written / borrowed mutably.

@@ -102,6 +102,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let t_check = std::time::Instant::now();
     // a constant that cannot be evaluated is one reported failure, not the end of the check
     jit::COMPILE_ERRORS_FATAL.store(false, std::sync::atomic::Ordering::Relaxed);
+    // lints (rustc's deny-by-default ones are errors; warn-level ones are printed)
+    relax_types::lint::enable();
     crate::layout::set_root_crate(root);
     let mut own = vec![false; u.prog.crates.len()];
     for &k in crates {
@@ -183,6 +185,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             if !body.errors.is_empty() {
                 return (body.errors.to_vec(), Vec::new());
             }
+            relax_types::lint::check_literals(prog, tcx, &body);
             if !crate::borrowck::enabled(options) {
                 return (Vec::new(), Vec::new());
             }
@@ -263,6 +266,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         if let Some(d) = o.seed { seeds.push(d); }
     }
     let checked = seeds.len();
+    // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
+    // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an
+    // E0080 (the unit notes it, reported below with the builds' other notes)
+    eval_items(up, &own);
     let t_front = t_check.elapsed();
     // the type/borrow check's freed memory goes back before the compile starts (Stage: 4.6 GB
     // of malloc free pages held after it)
@@ -332,6 +339,13 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         eprintln!("makepad check: {} crates checked, {} fns compiled from {} seeds, {} failed builds; type/borrow check {:.1} s, compile {:.1} s", crates.len(), unsafe { (&(*up).fns).len() }, seeds.len(), n_failed, t_front.as_secs_f64(), t_compile.as_secs_f64());
     } else {
         eprintln!("makepad check: {} crates type- and borrow-checked in {:.1} s", crates.len(), t_front.as_secs_f64());
+    }
+    let (lint_errors, mut lint_warnings) = relax_types::lint::take();
+    errors.extend(lint_errors);
+    lint_warnings.sort_by_cached_key(|e| error_position(e));
+    lint_warnings.dedup();
+    if emit && !crate::diag::enabled() {
+        for w in &lint_warnings { std::eprintln!("{}", w); }
     }
     // rustc's order: by file, then position (a plain string sort put line 10 before line 3)
     errors.sort_by_cached_key(|e| error_position(e));
@@ -585,4 +599,28 @@ fn is_follow_on(e: &str) -> bool {
     first.contains("type checking failed due to previous errors")
         || first.contains("signature has unresolved types -- fix the signature errors first")
         || first.contains("has unresolved types in its signature -- fix its signature errors first")
+}
+
+/// Evaluates the checked crates' statics and non-generic const items (rustc evaluates them in
+/// `cargo check`, used or not). A body with type errors is skipped: those errors are reported.
+fn eval_items(up: *mut Unit, own: &[bool]) {
+    let u = unsafe { &mut *up };
+    let items: Vec<(crate::program::DefId, bool)> = (0..u.prog.defs.len())
+        .filter(|&i| own[u.prog.defs[i].krate as usize])
+        .map(|i| crate::program::DefId(i as u32))
+        .filter_map(|d| match u.prog.def(d).kind {
+            DefKind::Static => Some((d, true)),
+            DefKind::Const if u.tcx.generic_indices_of(&u.prog, d).types_consts.is_empty() => Some((d, false)),
+            _ => None,
+        })
+        .filter(|(d, _)| relax_types::const_eval::const_body(&u.prog, *d).is_some())
+        .collect();
+    let _job = jit::compile_job();
+    for (d, is_static) in items {
+        if !u.tcx.typeck(&u.prog, d).errors.is_empty() { continue; }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::owner::call(crate::owner::Class::App, || unsafe {
+            let u = &mut *up;
+            if is_static { u.static_addr(d); } else { u.const_addr(d, Vec::new()); }
+        })));
+    }
 }

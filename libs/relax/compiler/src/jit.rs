@@ -3996,8 +3996,11 @@ impl Unit {
                 DEFERRED_ABORT.with(|a| a.set(true));
                 None
             }
+            // the initializer did not compile (its type check failed): that error is reported
+            // already, and rustc reports no evaluation error for it
+            Err(p) if p.message.starts_with("compile error in ") => None,
             Err(p) => {
-                let m = format!("E0080: constant {} panicked: {}", self.prog.def_path(d), p.message);
+                let m = format!("{}: E0080: {} [in {}]", self.ctfe_error_location(d, id, &p), ctfe_error_message(&p.message), self.prog.def_path(d));
                 // rustc rejects a program whose constant or static cannot be evaluated (E0080);
                 // `makepad run` ends here instead of running on with a zeroed or null value
                 // (`makepad test` / `live` keep it recoverable, as for compile errors)
@@ -4012,6 +4015,28 @@ impl Unit {
                 self.note_error(m);
                 None
             }
+        }
+    }
+
+    /// Where a failed initializer of const/static `d` is reported (rustc E0080's span: the
+    /// failing expression in the initializer): the panic's site when it is in `d`'s file, else
+    /// the const item itself (the failure was in a const fn or std it called).
+    fn ctfe_error_location(&self, d: DefId, init: u32, p: &PanicInfo) -> String {
+        // the initializer's own frame: where it called the failing const fn (rustc's span; the
+        // const fn's frames are its notes)
+        for &pc in &p.frames {
+            for at in [pc, pc.wrapping_sub(1)] {
+                if self.find_fn(at) == Some(init) {
+                    if let Some((_, loc)) = self.pc_to_src(at) { if loc.matches(':').count() >= 2 { return loc; } }
+                }
+            }
+        }
+        let def = self.prog.def(d);
+        let site = self.sites.lock().unwrap_or_else(|e| e.into_inner()).get(p.site as usize).map(|st| (st.file, st.pos));
+        match site {
+            Some((f, pos)) if f == def.file => self.pos_str(f, pos),
+            _ if !p.location.is_empty() && self.prog.file_paths.get(def.file as usize).is_some_and(|f| p.location.starts_with(&format!("{}:", f))) => p.location.clone(),
+            _ => self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo),
         }
     }
 
@@ -13900,4 +13925,13 @@ pub(crate) fn realtime_drain() {
     if !roots.is_empty() {
         unsafe { realtime_reach(up, roots, "new vtable") };
     }
+}
+
+/// rustc's E0080 message for a failed evaluation (rustc_const_eval errors.rs): the checks the
+/// compiler inserts keep their text (overflow, bounds, division); a panic of the program is
+/// "evaluation panicked: <message>".
+fn ctfe_error_message(m: &str) -> String {
+    let builtin = ["attempt to ", "index out of bounds", "divide by zero", "remainder by zero", "misaligned pointer", "null pointer"];
+    // (core's runtime text says `len`; the evaluator's says `length`)
+    if builtin.iter().any(|b| m.starts_with(b)) { m.replacen("the len is", "the length is", 1) } else { format!("evaluation panicked: {}", m) }
 }
