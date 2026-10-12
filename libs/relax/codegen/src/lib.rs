@@ -7,6 +7,7 @@ pub mod arm64;
 pub mod cabi;
 pub mod exec;
 pub mod fncost;
+pub mod interp;
 pub mod exec_census;
 pub mod warm;
 pub mod loops;

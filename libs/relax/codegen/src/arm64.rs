@@ -3346,6 +3346,21 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
     compile_freq(options, f, env, None)
 }
 
+/// research (ios-interp): RELAX_INTERP_STATS=1 also sums the machine-code backend's time and
+/// output for functions compiled natively, to compare with the interpreter's lowering
+fn compile_freq_timed(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("RELAX_INTERP_STATS").is_some()) {
+        return compile_freq_inner(options, f, env, freq);
+    }
+    let t = std::time::Instant::now();
+    let r = compile_freq_inner(options, f, env, freq);
+    if let Ok(c) = &r {
+        crate::interp::note_native(t.elapsed().as_nanos() as u64, c.code.len() as u64, f.blocks.iter().map(|b| b.insts.len() as u64 + 1).sum());
+    }
+    r
+}
+
 /// `compile` with measured block frequencies of `f` (0..=1 of its hottest block, per block), which
 /// the register allocator weighs uses by instead of loop depth.
 /// Chains of blocks testing one value against constants -- `c = x == k (or !=); branch c` with
@@ -3430,6 +3445,16 @@ pub(crate) fn jump_tables(options: &relax_session::Options, f: &Func, al: &Alloc
 }
 
 pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
+    // research prototype: the function runs in the threaded interpreter (interp.rs); its code
+    // is a jump to its entry thunk
+    if let Some(code) = crate::interp::maybe_compile(f, env.slots, env.syms, env.sym_class, env.tls_slow) {
+        let n = code.len() as u32;
+        return Ok(Compiled { code, pc_map: Vec::new(), frame_size: 0, text_len: n, alloc_sig: 0, relocs: Vec::new(), rir_map: Vec::new(), rir_emitted: String::new() });
+    }
+    compile_freq_timed(options, f, env, freq)
+}
+
+fn compile_freq_inner(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
     let _warm = crate::warm::Scope::backend(&f.name);
     let _cost_codegen = crate::fncost::phase(5);
     crate::fncost::size(false, f);

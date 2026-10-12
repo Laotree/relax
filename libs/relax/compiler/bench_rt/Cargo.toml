@@ -16,5 +16,9 @@ makepad-fast-inflate = { path = "../../../../libs/fast_inflate" }
 
 [workspace]
 
+# makepad run resolves inherited deps against this workspace (micro_proc_macro's optional relax-lex)
+[workspace.dependencies]
+relax-lex = { path = "../../lex" }
+
 [profile.release]
 opt-level = 3
