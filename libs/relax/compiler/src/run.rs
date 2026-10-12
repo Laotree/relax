@@ -383,6 +383,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 i += 1;
             }
             "--quiet" => QUIET.store(true, Ordering::Relaxed),
+            // non-lazy Gandalf: no body runs before the borrow checker accepted it (jit::CHECK_FIRST)
+            "--check-first" => jit::CHECK_FIRST.store(true, Ordering::Relaxed),
             // the parent run's relax dir (dirs.rs): a build script it runs shares it
             "--run-dir" if i + 1 < args.len() => {
                 crate::dirs::set_relax_dir(std::path::PathBuf::from(&args[i + 1]));

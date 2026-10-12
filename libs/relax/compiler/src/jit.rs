@@ -1754,6 +1754,11 @@ fn rt_args() -> ArgsRet {
 /// waiting on it hung). `makepad test` / `makepad live` keep it a per-test / recoverable failure.
 pub static COMPILE_ERRORS_FATAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// `makepad run --check-first` (opt-in, non-lazy Gandalf): every app fn is borrow-checked before
+/// its first code is installed (Unit::refused_by_check); a rejected body gets the error stub.
+/// Off by default: the run never waits for the checker, which reports in the background.
+pub static CHECK_FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn fatal_compile_error(p: &PanicInfo, report: &str) {
     if COMPILE_ERRORS_FATAL.load(std::sync::atomic::Ordering::Relaxed) && p.message.starts_with("compile error in ") {
         eprintln!("makepad-run: {} -- the program cannot run past it (rustc rejects it)\n  report: {}", p.message, report);
@@ -4128,9 +4133,10 @@ impl Unit {
     /// `gen` > 0 marks the install as part of patch group `gen`.
     /// Links `code` (emitted with its relocated fields zeroed) where it lands, then installs it.
     pub fn install(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
-        // check-before-run: a body's first code is installed only once its checker accepts it
-        // (a live patch, gen > 0, passed reload's gate instead)
-        if gen == 0 && !self.fns[id as usize].compiled {
+        // `makepad run --check-first`: a body's first code is installed only once its checker
+        // accepts it (a live patch, gen > 0, passed reload's gate instead). Off by default:
+        // Gandalf checks lazily in the background and the JIT never waits for it.
+        if gen == 0 && CHECK_FIRST.load(Ordering::Relaxed) && !self.fns[id as usize].compiled {
             if let Some(e) = self.refused_by_check(id) {
                 return Ok(unsafe { install_error(self, id, &e) });
             }
@@ -4975,7 +4981,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
     let _cost_install = crate::fncost::phase(6);
     // check-before-run (Unit::install), before the code is recorded: a refused body's code
     // never reaches the disk cache or the startup image (a warm start would run it unchecked)
-    if (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
+    if CHECK_FIRST.load(Ordering::Relaxed) && (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
         if let Some(e) = (&mut *up).refused_by_check(id) {
             return install_error(up, id, &e);
         }
