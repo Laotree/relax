@@ -1,109 +1,113 @@
-// A boot document returns mod.boot.App with main_window and a RunView. RunView
-// binds the named controls below; it emits plain actions to Relax. All layout,
-// colours, animation and progress easing are editable here, including on reload.
-use mod.prelude.widgets.*
+// Text and shader passes only. The host supplies run data and a unit quad;
+// this document owns layout, colours, the phase target and progress easing.
+use mod.pod.*
+use mod.math.*
+use mod.shader.*
 
-mod.boot.App{
-    ui: Root{
-        main_window := Window{
-            window.inner_size: vec2(1280, 800)
-            body +: {
-                run := mod.boot.RunView{
-                    width: Fill height: Fill
-                    flow: Down
-                    padding: Inset{left: 32 right: 32 top: 48 bottom: 24}
-                    spacing: 16
-                    show_bg: true
-                    draw_bg +: {color: theme.color_bg_app}
-                    animator: Animator{
-                        mode: {
-                            default: @boot
-                            boot: AnimatorState{
-                                from: {all: Snap}
-                                apply: {
-                                    width: Fill height: Fill
-                                    margin: Inset{}
-                                    padding: Inset{left: 32 right: 32 top: 48 bottom: 24}
-                                    spacing: 16
-                                }
-                            }
-                            overlay: AnimatorState{
-                                from: {all: Snap}
-                                apply: {
-                                    width: Fill{max: 720} height: Fill{max: 480}
-                                    margin: Inset{left: 24 right: 24 top: 24 bottom: 24}
-                                    padding: Inset{left: 20 right: 20 top: 20 bottom: 20}
-                                    spacing: 10
-                                }
-                            }
-                        }
-                    }
-                    app_name := Label{
-                        text: "Starting"
-                        draw_text.text_style.font_size: 28
-                    }
-                    progress := View{
-                        width: Fill height: 12
-                        show_bg: true
-                        draw_bg +: {
-                            from: instance(0.0)
-                            target: instance(0.0)
-                            changed: instance(0.0)
-                            track: uniform(theme.color_bg_app)
-                            ink: uniform(theme.color_makepad)
-                            pixel: fn() {
-                                let t = max(0.0, self.draw_pass.time - self.changed)
-                                let eased = mix(self.from, self.target, 1.0 - exp(-9.0 * t))
-                                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
-                                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 6.0)
-                                sdf.fill(mix(self.track, self.ink, 0.14))
-                                let width = max(0.0, eased * self.rect_size.x)
-                                if width > 0.0 {
-                                    sdf.box(0.0, 0.0, width, self.rect_size.y, min(6.0, width * 0.5))
-                                    let shimmer = 0.5 + 0.5 * sin(self.pos.x * 18.0 - self.draw_pass.time * 3.0)
-                                    sdf.fill(mix(self.ink, vec4(1.0), shimmer * 0.2))
-                                }
-                                return sdf.result
-                            }
-                        }
-                    }
-                    status := Label{width: Fill text: "resolve · cold"}
-                    domain_state := Label{width: Fill text: "Compiling"}
-                    controls := View{
-                        width: Fill height: Fit flow: Right{wrap: true} spacing: 8
-                        retry := Button{text: "Retry compile"}
-                        restart := Button{text: "Restart app"}
-                        dismiss := Button{text: "Dismiss" visible: false}
-                    }
-                    panic := View{
-                        width: Fill height: Fit flow: Down spacing: 8 visible: false
-                        panic_message := Label{width: Fill text: "Parked panic"}
-                        View{
-                            width: Fill height: Fit flow: Right{wrap: true} spacing: 8
-                            panic_restart := Button{text: "Restart"}
-                            panic_retry := Button{text: "Retry boundary"}
-                            resume := Button{text: "Resume unwinding"}
-                            return_value := TextInput{width: Fill empty_text: "Return value"}
-                            panic_return := Button{text: "Return"}
-                        }
-                    }
-                    diagnostics := PortalList{
-                        width: Fill height: Fill
-                        flow: Down
-                        scan: [@Diagnostic]
-                        Diagnostic := View{
-                            width: Fill height: Fit flow: Down spacing: 6
-                            padding: Inset{top: 12 bottom: 12}
-                            View{
-                                width: Fill height: Fit flow: Right{wrap: true} spacing: 8
-                                open := Button{width: Fill text: "Source"}
-                                copy := Button{text: "Copy"}
-                            }
-                            message := Label{width: Fill text: "Diagnostic"}
-                        }
-                    }
-                }
+let phase_target = fn(previous, completed, weight, total_weight, done, total, elapsed) {
+    let fraction = if total > 0.0 {
+        clamp(done / total, 0.0, 1.0)
+    } else {
+        elapsed / max(weight + elapsed, 0.000001)
+    }
+    return max(previous, min(0.999999, (completed + weight * fraction) / max(total_weight, 0.000001)))
+}
+let ease = fn(from, target, seconds) {
+    return mix(from, target, 1.0 - exp(-9.0 * max(0.0, seconds)))
+}
+let Quad = {
+    geom: vertex_buffer(vec2f)
+    rect: instance(vec4(0.0))
+    viewport: uniform(vec2(1.0))
+    pos: varying(vec2f)
+    vertex_pos: vertex_position(vec4f)
+    fb0: fragment_output(0, vec4f)
+    vertex: fn() {
+        self.pos = self.geom
+        let p = self.rect.xy + self.geom * self.rect.zw
+        self.vertex_pos = vec4(p.x / self.viewport.x * 2.0 - 1.0, 1.0 - p.y / self.viewport.y * 2.0, 0.0, 1.0)
+    }
+    fragment: fn() { self.fb0 = self.pixel() }
+}
+{
+    phase_target: phase_target
+    ease: ease
+    boot: {margin: 0 padding: 32 top: 48 max_width: 0 max_height: 0}
+    overlay: {margin: 24 padding: 20 top: 20 max_width: 720 max_height: 480}
+    // Repeated roles expand to ordinary text lines; long lines wrap at clusters.
+    lines: [
+        {role: @app size: 28 height: 36 gap: 16 color: #edf1f7}
+        {role: @progress height: 12 gap: 16}
+        {role: @status size: 14 height: 20 gap: 10 color: #aebccd}
+        {role: @domain size: 14 height: 20 gap: 10 color: #cbd5e3}
+        {role: @errors size: 14 height: 20 gap: 8 color: #ffc7bf}
+        {role: @panic size: 14 height: 20 gap: 8 color: #ffc7bf}
+        {role: @hints size: 13 height: 19 gap: 0 color: #aebccd}
+    ]
+    hints: {
+        restart: "R restart"
+        retry: "R retry compile"
+        copy: "C copy error"
+        open: "E open in editor"
+        dismiss: "Esc dismiss"
+        errors: "Up/Down select error"
+        scroll: "PgUp/PgDn scroll"
+        return_value: "Return value: "
+        submit: "Enter submit · Esc cancel"
+    }
+    background: Quad{
+        color: uniform(#18202b)
+        pixel: fn() { return self.color }
+    }
+    progress: Quad{
+        from: uniform(0.0)
+        previous: uniform(0.0)
+        changed: uniform(0.0)
+        time: uniform(0.0)
+        completed: uniform(0.0)
+        weight: uniform(1.0)
+        total_weight: uniform(6.0)
+        done: uniform(0.0)
+        total: uniform(0.0)
+        phase_elapsed: uniform(0.0)
+        track: uniform(#293b50)
+        ink: uniform(#55b9f3)
+        pixel: fn() {
+            let target = phase_target(self.previous, self.completed, self.weight, self.total_weight, self.done, self.total, self.phase_elapsed)
+            let fill = ease(self.from, target, self.time - self.changed)
+            let edge = max(fwidth(self.pos.x), 0.00001)
+            let coverage = 1.0 - smoothstep(fill - edge, fill + edge, self.pos.x)
+            let shimmer = 0.5 + 0.5 * sin(self.pos.x * 18.0 - self.time * 3.0)
+            return mix(self.track, mix(self.ink, vec4(1.0), shimmer * 0.2), coverage)
+        }
+    }
+    error_band: Quad{
+        color: uniform(#512d36)
+        pixel: fn() { return self.color }
+    }
+    glyph: Quad{
+        ..mod.glyph_coverage.AtlasCoverage
+        uv: instance(vec4(0.0))
+        atlas_plane: instance(0.0)
+        color_glyph: instance(0.0)
+        color: instance(#fff)
+        grayscale_texture: texture_2d(float)
+        radius: uniform(8.0)
+        cutoff: uniform(0.25)
+        sdf_sharpness: uniform(1.0)
+        sdf_luma_bias: uniform(0.03)
+        pixel: fn() {
+            let t = mix(self.uv.xy, self.uv.zw, self.pos)
+            let tex_size = self.grayscale_texture.size()
+            let half_texel = vec2(0.5) / tex_size
+            let p = clamp(t, self.uv.xy + half_texel, self.uv.zw - half_texel)
+            if self.color_glyph > 0.5 {
+                let c = self.grayscale_texture.sample(p)
+                return vec4(c.rgb * c.a, c.a)
             }
+            let scale = (length(dFdx(t) * tex_size) + length(dFdy(t) * tex_size)) * 0.5
+            let coverage = self.sdf(scale, p, self.color)
+            return coverage * vec4(self.color.rgb * self.color.a, self.color.a)
         }
     }
 }

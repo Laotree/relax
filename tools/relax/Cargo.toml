@@ -37,6 +37,8 @@ makepad-hal = { path = "../../platform/hal", features = ["host-shims"] }
 
 makepad-script-census = { path = "../../platform/script/census", features = ["host-shims"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
 relax-boot = { path = "boot" }
 makepad-filesystem-watcher = { path = "../../libs/filesystem_watcher" }
+# Host keyboard codes and the existing Studio JumpToFile transport; no UI client.
+makepad-studio-protocol = { path = "../../platform/studio" }
+makepad-network = { path = "../../platform/network" }

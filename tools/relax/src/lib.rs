@@ -15,6 +15,7 @@ pub mod fetch;
 mod hal_host;
 mod hal_run;
 mod boot_progress;
+mod boot_editor;
 mod help;
 mod macros;
 mod remote;

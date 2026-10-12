@@ -55,7 +55,11 @@ pub struct State {
     pub current: String,
     pub warm: bool,
     pub elapsed: f64,
-    pub progress: f64,
+    /// Raw timing inputs; the boot document computes its phase-weighted target.
+    pub completed_weight: f64,
+    pub phase_weight: f64,
+    pub total_weight: f64,
+    pub phase_elapsed: f64,
     pub diagnostics: Arc<[Diagnostic]>,
     pub parked: Option<ParkedPanic>,
     pub domain: String,

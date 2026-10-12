@@ -1,5 +1,5 @@
-//! Per-app cold/warm timing metadata and monotone phase accounting. Shader easing
-//! belongs to the boot document; this module only reports measured/estimated work.
+//! Per-app cold/warm timing metadata. The boot document owns the weighted target
+//! and easing; this module only reports measured work and previous phase durations.
 use relax_compiler::run_state::{Phase, State};
 use std::{
     path::{Path, PathBuf},
@@ -68,7 +68,6 @@ pub struct Progress {
     phase: Phase,
     measured: [f64; 6],
     complete: [bool; 6],
-    high_water: f64,
 }
 
 impl Progress {
@@ -81,7 +80,6 @@ impl Progress {
             phase: Phase::Resolve,
             measured: [0.0; 6],
             complete: [false; 6],
-            high_water: 0.0,
         }
     }
     pub fn reset(&mut self) {
@@ -104,22 +102,14 @@ impl Progress {
         } else {
             self.history.cold
         };
-        let total: f64 = weights.iter().sum();
-        let phase = self.phase as usize;
-        let elapsed = self.entered.elapsed().as_secs_f64();
-        let fraction = match (state.done, state.total) {
-            (Some(done), Some(total)) if total > 0 => (done as f64 / total as f64).min(1.0),
-            _ => elapsed / (weights[phase].max(f64::EPSILON) + elapsed),
-        };
-        let finished: f64 = weights
+        state.total_weight = weights.iter().sum();
+        state.phase_weight = weights[self.phase as usize];
+        state.phase_elapsed = self.entered.elapsed().as_secs_f64();
+        state.completed_weight = weights
             .iter()
             .zip(self.complete)
-            .filter_map(|(w, done)| done.then_some(*w))
+            .filter_map(|(weight, done)| done.then_some(*weight))
             .sum();
-        // first_frame is not complete until the HAL confirms a physical presentation.
-        let value = (finished + weights[phase] * fraction) / total;
-        self.high_water = self.high_water.max(value.min(1.0 - f64::EPSILON));
-        state.progress = self.high_water;
     }
     pub fn finish(&mut self, warm: bool) -> (PathBuf, String) {
         self.measured[self.phase as usize] += self.entered.elapsed().as_secs_f64();

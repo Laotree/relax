@@ -1,43 +1,28 @@
-//! A native Makepad app hosted by Relax's session 0. Layout and shaders live in the
-//! document; this crate only binds plain run data and returns plain user actions.
-pub use makepad_widgets;
-use makepad_widgets::*;
+//! Session 0's text/pass renderer. No platform client, draw tree, widgets or Cx.
+mod document;
+mod gpu;
+mod text;
+
+use document::{Program, Role, BACKGROUND, ERROR_BAND, GLYPH, PROGRESS};
+use makepad_hal::{
+    backend_id, buffer_kind, dialect, font::wire, lifecycle, pass_load, session::HOST, target,
+    window_kind, Attr, CmdWriter, EventBuf, EventQueue, FrameMeta, Hal, HalEvent, HalInfo, Id,
+    Pass, RawEvent,
+};
+use makepad_script::{id, LiveId};
 pub use relax_base::{
     diag::Diagnostic,
-    run_state::{Mode, ParkedPanic, Phase, State},
+    run_state::{Mode, State},
 };
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{path::PathBuf, sync::Arc, time::Instant};
 
 pub const DEFAULT_DOCUMENT: &str = include_str!("../resources/boot.splash");
-
-#[derive(Clone, Debug)]
-pub enum Action {
-    Dismiss,
-    RetryCompile,
-    RestartDomain,
-    Resume {
-        panic: String,
-        choice: String,
-        value: String,
-    },
-    Copy(String),
-    OpenFile {
-        file: String,
-        line: u32,
-        col: u32,
-    },
-    DocumentErrors(Vec<Diagnostic>),
-}
 
 #[derive(Clone)]
 pub struct Document {
     pub path: PathBuf,
     pub source: Arc<str>,
 }
-
 impl Document {
     pub fn bundled() -> Self {
         Self {
@@ -47,538 +32,824 @@ impl Document {
     }
 }
 
-struct Bridge {
-    state: Arc<State>,
-    document: Document,
-    actions: Vec<Action>,
-    value: Option<ScriptObjectRef>,
-    geometry: [f32; 4],
-    window: Option<WindowId>,
-    document_errors: Vec<Diagnostic>,
-    overlay: Option<[f32; 4]>,
+/// Input is interpreted by Relax itself, never by the document or renderer.
+pub enum Event {
+    KeyDown(RawEvent),
+    Text(String),
+    DocumentErrors(Vec<Diagnostic>),
 }
 
-fn overlay(cx: &mut Cx, rect: Option<[f32; 4]>) {
-    let bridge = cx.get_global::<Bridge>();
-    if bridge.overlay == rect { return; }
-    let Some(window) = bridge.window else { return };
-    bridge.overlay = rect;
-    let mut cmd = makepad_hal::CmdWriter::new(makepad_hal::session::HOST);
-    cmd.window_overlay(makepad_hal::Id::new(window.0 as u32, window.1 as u32),
-        rect.is_some(), rect.unwrap_or_default());
-    makepad_hal::Hal::global().submit(&cmd.buf());
-}
-
-fn script_diagnostics(errors: Vec<ScriptErrorRecord>) -> Vec<Diagnostic> {
-    errors
-        .into_iter()
-        .map(|e| {
-            let (file, line, col) = e
-                .loc
-                .map_or((String::new(), 0, 0), |at| (at.file, at.line, at.col));
-            Diagnostic::new("parse", file, line, col, e.message)
-        })
-        .collect()
-}
-
-script_mod! {
-    use mod.prelude.widgets_internal.*
-    mod.boot = {
-        App: #(App::script_component(vm))
-        RunView: set_type_default() do #(RunView::register_widget(vm)){
-            width: Fill height: Fill
-        }
-    }
-}
-
-#[derive(Script, ScriptHook)]
-struct App {
-    #[live]
-    ui: WidgetRef,
-}
-
-impl AppMain for App {
-    fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
-        makepad_widgets::script_mod(vm);
-        self::script_mod(vm);
-        let document = vm.cx_mut().get_global::<Bridge>().document.clone();
-        let eval = |vm: &mut ScriptVm, source: &str, path: &std::path::Path| {
-            vm.eval(ScriptMod::new(
-                path.parent()
-                    .unwrap_or(std::path::Path::new(""))
-                    .to_str()
-                    .unwrap_or(""),
-                "relax_boot_document",
-                &path.to_string_lossy(),
-                0,
-                0,
-                source,
-                &[],
-            ))
-        };
-        let previous_sink = vm.bx.captured_errors.replace(Vec::new());
-        let mut value = eval(vm, &document.source, &document.path);
-        vm.drain_errors();
-        let mut errors = script_diagnostics(vm.bx.captured_errors.take().unwrap_or_default());
-        vm.bx.captured_errors = previous_sink;
-        // A document must supply the host window; a successful evaluation returning
-        // nil or an unrelated object must not leave the compiler waiting forever.
-        let valid = value.as_object().is_some_and(|app| {
-            use makepad_widgets::makepad_script::object_heap::OBJ_GET_VALUE;
-            let heap = vm.heap();
-            if !heap.type_matches_id(app, App::script_type_id_static()) {
-                return false;
-            }
-            let Some(root) = heap
-                .obj_get(OBJ_GET_VALUE, app, id!(ui).into(), NoTrap)
-                .value
-                .as_object()
-            else {
-                return false;
-            };
-            heap.obj_get(OBJ_GET_VALUE, root, id!(main_window).into(), NoTrap)
-                .value
-                .as_object()
-                .is_some_and(|window| heap.type_matches_id(window, Window::script_type_id_static()))
-        });
-        if !valid {
-            errors.push(Diagnostic::new(
-                "parse",
-                document.path.to_string_lossy(),
-                1,
-                1,
-                "Boot document must return mod.boot.App with ui.main_window := Window{…}",
-            ));
-        }
-        let bridge = vm.cx_mut().get_global::<Bridge>();
-        bridge.document_errors = errors.clone();
-        bridge.actions.push(Action::DocumentErrors(errors.clone()));
-        if !errors.is_empty() {
-            if let Some(previous) = vm.cx_mut().get_global::<Bridge>().value.as_ref() {
-                return previous.as_object().into();
-            }
-            value = eval(vm, DEFAULT_DOCUMENT, &Document::bundled().path);
-        }
-        if let Some(object) = value.as_object() {
-            let root = vm.heap_mut().new_object_ref(object);
-            vm.cx_mut().get_global::<Bridge>().value = Some(root);
-        }
-        value
-    }
-
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        if matches!(event, Event::Startup) {
-            let bridge = cx.get_global::<Bridge>();
-            let geometry = bridge.geometry;
-            let title = bridge.state.app.clone();
-            let mut window = self.ui.window(cx, ids!(main_window));
-            let size = dvec2(geometry[2] as f64, geometry[3] as f64);
-            script_apply_eval!(cx, window, {window.inner_size: #(size)});
-            if geometry[0].is_finite() && geometry[1].is_finite() {
-                let position = dvec2(geometry[0] as f64, geometry[1] as f64);
-                script_apply_eval!(cx, window, {window.position: #(position)});
-            }
-            window.set_title(cx, &title);
-            cx.get_global::<Bridge>().window = window.window_id();
-        }
-        self.ui.handle_event(cx, event, &mut Scope::empty());
-    }
-}
-
-#[derive(Script, ScriptHook, Widget)]
-pub struct RunView {
-    #[deref]
-    view: View,
-    #[rust]
-    applied: Option<Arc<State>>,
-    #[rust]
-    progress: f64,
-    #[rust]
-    next: NextFrame,
-    #[rust]
-    drawn: Arc<[Diagnostic]>,
-}
-
-fn diagnostic_text(d: &Diagnostic) -> String {
-    let severity = match d.severity {
-        relax_base::diag::Severity::Error => "error",
-        relax_base::diag::Severity::Warning => "warning",
-        relax_base::diag::Severity::Note => "note",
+pub fn diagnostic_text(diagnostic: &Diagnostic) -> String {
+    let mut text = if diagnostic.file.is_empty() {
+        diagnostic.message.clone()
+    } else {
+        format!(
+            "{}:{}:{} {}",
+            diagnostic.file, diagnostic.line, diagnostic.col, diagnostic.message
+        )
     };
-    let mut text = format!("{severity} {}", d.code);
-    if !d.file.is_empty() {
-        text.push_str(&format!(" · {}:{}:{}", d.file, d.line, d.col));
-    }
-    text.push('\n');
-    text.push_str(&d.message);
-    if let Some(item) = &d.item {
+    if let Some(item) = &diagnostic.item {
         text.push('\n');
         text.push_str(item);
     }
-    for note in &d.notes {
+    for note in &diagnostic.notes {
         text.push_str("\nnote: ");
         text.push_str(note);
     }
-    if let Some(suggestion) = &d.suggestion {
+    if let Some(help) = &diagnostic.suggestion {
         text.push_str("\nhelp: ");
-        text.push_str(&suggestion.message);
+        text.push_str(&help.message);
     }
     text
 }
 
-impl RunView {
-    fn bind(&mut self, cx: &mut Cx) {
-        let state = cx.get_global::<Bridge>().state.clone();
-        if self
-            .applied
-            .as_ref()
-            .is_some_and(|old| Arc::ptr_eq(old, &state))
-        {
-            return;
-        }
-        if self.applied.as_ref().is_none_or(|old| old.mode != state.mode) {
-            self.view.animator_cut(cx, if state.mode == Mode::Overlay {
-                ids!(mode.overlay)
-            } else {
-                ids!(mode.boot)
-            });
-            self.next = if state.mode == Mode::Boot { cx.new_next_frame() } else { NextFrame::default() };
-        }
-        let is_overlay = state.mode == Mode::Overlay;
-        self.view.button(cx, ids!(dismiss)).set_visible(cx, is_overlay);
-        self.view.view(cx, ids!(progress)).set_visible(cx, !is_overlay);
-        self.view.label(cx, ids!(status)).set_visible(cx, !is_overlay);
-        self.view.label(cx, ids!(app_name)).set_text(cx, &state.app);
-        let units = match (state.done, state.total) {
-            (Some(done), Some(total)) => format!(" · {done}/{total}"),
-            (Some(done), None) => format!(" · {done}"),
-            _ => String::new(),
-        };
-        self.view.label(cx, ids!(status)).set_text(
-            cx,
-            &format!(
-                "{}{} · {} · {:.1}s · {}",
-                state.phase.name(),
-                units,
-                if state.warm { "warm" } else { "cold" },
-                state.elapsed,
-                state.current
-            ),
-        );
-        self.view
-            .label(cx, ids!(domain_state))
-            .set_text(cx, if is_overlay {
-                if state.parked.is_some() { "Panic parked" } else { "Patch not applied · previous code is running" }
-            } else { &state.domain });
-        self.view
-            .button(cx, ids!(retry))
-            .set_visible(cx, state.can_retry);
-        self.view
-            .button(cx, ids!(restart))
-            .set_visible(cx, state.can_restart);
-        self.view
-            .view(cx, ids!(panic))
-            .set_visible(cx, state.parked.is_some());
-        if let Some(panic) = &state.parked {
-            self.view.label(cx, ids!(panic_message)).set_text(
-                cx,
-                &format!("{} · {}\n{}", panic.id, panic.location, panic.message),
-            );
-            for (id, choice) in [
-                (id!(resume), "panic"),
-                (id!(panic_retry), "retry"),
-                (id!(panic_restart), "restart"),
-                (id!(panic_return), "return"),
-            ] {
-                self.view
-                    .button(cx, &[id])
-                    .set_visible(cx, panic.choices.iter().any(|c| c == choice));
-            }
-            self.view
-                .text_input(cx, ids!(return_value))
-                .set_visible(cx, panic.choices.iter().any(|c| c == "return"));
-        }
-        if state.progress != self.progress || self.applied.is_none() {
-            let mut progress = self.view.view(cx, ids!(progress));
-            // A new compile starts a new bar; easing itself lives only in Splash.
-            let from = self.progress.min(state.progress) as f32;
-            let target = state.progress as f32;
-            let changed = cx.seconds_since_app_start() as f32;
-            script_apply_eval!(cx, progress, {draw_bg +: {from: #(from) target: #(target) changed: #(changed)}});
-            self.progress = state.progress;
-        }
-        self.applied = Some(state);
-        self.view.redraw(cx);
-    }
+struct TextLine {
+    run: Arc<text::Shaped>,
+    position: [f32; 2],
+    style: document::Line,
+    error: Option<usize>,
+    fixed: bool,
 }
 
-impl Widget for RunView {
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-        if matches!(event, Event::Startup | Event::Signal | Event::LiveEdit) {
-            if matches!(event, Event::LiveEdit) {
-                self.applied = None;
-            }
-            self.bind(cx);
-        }
-        if (matches!(event, Event::Startup) || self.next.is_event(event).is_some())
-            && cx.get_global::<Bridge>().state.mode == Mode::Boot {
-            self.view.view(cx, ids!(progress)).redraw(cx);
-            self.next = cx.new_next_frame();
-        }
-        self.view.handle_event(cx, event, scope);
-        let Event::Actions(actions) = event else {
-            return;
-        };
-        let Some(state) = self.applied.clone() else {
-            return;
-        };
-        let mut out = Vec::new();
-        if self.view.button(cx, ids!(dismiss)).clicked(actions) {
-            out.push(Action::Dismiss);
-        }
-        if self.view.button(cx, ids!(retry)).clicked(actions) {
-            out.push(Action::RetryCompile);
-        }
-        if self.view.button(cx, ids!(restart)).clicked(actions) {
-            out.push(Action::RestartDomain);
-        }
-        if let Some(panic) = &state.parked {
-            for (id, choice) in [
-                (id!(resume), "panic"),
-                (id!(panic_retry), "retry"),
-                (id!(panic_restart), "restart"),
-                (id!(panic_return), "return"),
-            ] {
-                if panic.choices.iter().any(|c| c == choice)
-                    && self.view.button(cx, &[id]).clicked(actions)
-                {
-                    out.push(Action::Resume {
-                        panic: panic.id.clone(),
-                        choice: choice.into(),
-                        value: self.view.text_input(cx, ids!(return_value)).text(),
-                    });
-                }
-            }
-        }
-        for (index, item) in self
-            .view
-            .portal_list(cx, ids!(diagnostics))
-            .items_with_actions(actions)
-        {
-            let Some(d) = self.drawn.get(index) else {
-                continue;
-            };
-            if item.button(cx, ids!(copy)).clicked(actions) {
-                out.push(Action::Copy(diagnostic_text(d)));
-            }
-            if item.button(cx, ids!(open)).clicked(actions) && !d.file.is_empty() {
-                out.push(Action::OpenFile {
-                    file: d.file.clone(),
-                    line: d.line,
-                    col: d.col,
-                });
-            }
-        }
-        cx.get_global::<Bridge>().actions.extend(out);
-    }
-
-    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-        let state = cx.get_global::<Bridge>().state.clone();
-        self.drawn = state.diagnostics.clone();
-        while let Some(step) = self.view.draw_walk(cx, scope, walk).step() {
-            if let Some(mut list) = step.as_portal_list().borrow_mut() {
-                list.set_item_range(cx, 0, state.diagnostics.len());
-                while let Some(index) = list.next_visible_item(cx) {
-                    let Some(d) = state.diagnostics.get(index) else {
-                        continue;
-                    };
-                    let item = list.item(cx, index, id!(Diagnostic));
-                    item.button(cx, ids!(open))
-                        .set_text(cx, &format!("{}:{}:{}", d.file, d.line, d.col));
-                    item.button(cx, ids!(open))
-                        .set_visible(cx, !d.file.is_empty());
-                    item.label(cx, ids!(message))
-                        .set_text(cx, &diagnostic_text(d));
-                    item.draw_all(cx, scope);
-                }
-            }
-        }
-        if state.mode == Mode::Overlay {
-            let rect = self.view.area().clipped_rect(cx);
-            if rect.size.x > 0.0 && rect.size.y > 0.0 {
-                overlay(cx, Some([rect.pos.x as f32, rect.pos.y as f32,
-                    rect.size.x as f32, rect.size.y as f32]));
-            }
-        }
-        DrawStep::done()
-    }
+#[derive(Default)]
+struct Layout {
+    panel: [f32; 4],
+    clip: [f32; 4],
+    text: Vec<TextLine>,
+    progress: Option<[f32; 4]>,
+    content_height: f32,
 }
 
-/// Own this on one host UI thread. The OS loop stays on the process main thread.
+struct Renderer {
+    active: Option<Program>,
+    pending: Option<Program>,
+    generation: u32,
+    text: text::Text,
+    layout: Layout,
+    dirty: bool,
+    redraw: bool,
+    from: f32,
+    target: f32,
+    changed: f32,
+    began: Instant,
+    input: Option<String>,
+    selected: usize,
+    reveal_selection: bool,
+    scroll: f32,
+    dialect: u32,
+    bundled: bool,
+    clear_errors_on_install: bool,
+    function_failed: bool,
+}
+
 pub struct Boot {
-    cx: Cx,
-    updates: DocumentUpdates,
-}
-
-/// A worker owns the watcher, including its blocking startup/shutdown. The UI
-/// only takes the latest source from a briefly held slot.
-#[derive(Clone)]
-pub struct DocumentUpdates {
-    document: Document,
-    changed: Arc<Mutex<Option<Arc<str>>>>,
-}
-
-impl DocumentUpdates {
-    pub fn watch(&self) -> Option<makepad_live_reload_core::LiveReloadWatcherHandle> {
-        let document = &self.document;
-        document
-            .path
-            .parent()
-            .filter(|p| p.is_dir())
-            .and_then(|root| {
-                use makepad_live_reload_core::*;
-                let path = normalize_path_string(&document.path);
-                let root_name = normalize_path_string(root);
-                let plan = LiveReloadWatchPlan {
-                    roots: vec![WatchRoot {
-                        mount: root_name.clone(),
-                        path: root.into(),
-                    }],
-                    files_by_root: [(root_name, vec![path.clone()])].into(),
-                    initial_contents: [(path, document.source.to_string())].into(),
-                };
-                let changed = self.changed.clone();
-                match start_live_reload_watcher(
-                    plan,
-                    move |change| {
-                        let source = Arc::from(change.content);
-                        let old = changed
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .replace(source);
-                        drop(old);
-                        makepad_hal::Hal::global().wake_session(makepad_hal::session::HOST);
-                        Ok(())
-                    },
-                    LiveReloadLogger::new(|_| {}, |e| eprintln!("relax boot: {e}")),
-                ) {
-                    Ok(w) => Some(w),
-                    Err(e) => {
-                        eprintln!("relax boot: {e}");
-                        None
-                    }
-                }
-            })
-    }
+    window: Option<Id>,
+    geometry: [f32; 4],
+    dpi: f32,
+    frame: u64,
+    queue: EventQueue,
+    events: Vec<Event>,
+    state: State,
+    renderer: Option<Renderer>,
+    overlay: Option<[f32; 4]>,
 }
 
 impl Boot {
     pub fn new(
-        info: makepad_hal::HalInfo,
+        info: HalInfo,
         document: Document,
         state: State,
         geometry: [f32; 4],
-    ) -> Self {
-        let mut cx = Cx::new(makepad_widgets::makepad_platform::_app_main_event_closure!(
-            App
-        ));
-        cx.set_font_set(FontSet::International);
-        cx.freeze_font_set();
-        cx.set_global(Bridge {
-            state: Arc::new(state),
-            document: document.clone(),
-            actions: Vec::new(),
-            value: None,
-            geometry,
+    ) -> Result<Self, String> {
+        let mut boot = Self {
             window: None,
-            document_errors: Vec::new(),
+            geometry,
+            dpi: info.dpi.max(1.0),
+            frame: 0,
+            queue: EventQueue::new(),
+            events: Vec::new(),
+            state,
+            renderer: None,
             overlay: None,
-        });
-        cx.init_cx_os();
-        cx.init_websockets(&makepad_widgets::makepad_platform::resolve_studio_http());
-        cx.hal_attach_session(info);
-        Self {
-            cx,
-            updates: DocumentUpdates {
-                document,
-                changed: Arc::new(Mutex::new(None)),
-            },
+        };
+        // A backend without a shader dialect has no native HAL window to draw into.
+        // In particular Linux/Windows do not manufacture a clear-only fake window.
+        if info.backend == backend_id::HEADLESS || info.dialect == dialect::NONE {
+            return Ok(boot);
         }
+        let (program, bundled, clear_errors_on_install) =
+            match Program::compile(&document, info.dialect, 0, 1) {
+                Ok(program) => (program, document.source.as_ref() == DEFAULT_DOCUMENT, true),
+                Err(errors) => {
+                    boot.events.push(Event::DocumentErrors(errors));
+                    (
+                        Program::compile(&Document::bundled(), info.dialect, 0, 1).map_err(
+                            |errors| {
+                                errors
+                                    .iter()
+                                    .map(diagnostic_text)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            },
+                        )?,
+                        true,
+                        false,
+                    )
+                }
+            };
+        let hal = Hal::global();
+        let window = hal.with_world(|world| world.host_window(geometry));
+        let mut writer = CmdWriter::new(HOST);
+        writer.window_create(window, window_kind::NORMAL, Id::NONE, geometry, false);
+        writer.str_def(1, boot.state.app.as_bytes());
+        writer.window_title(window, 1);
+        let vertices: Vec<u8> = [0.0_f32, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let indices: Vec<u8> = [0_u32, 1, 2, 0, 2, 3]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        writer.buffer_create(
+            gpu::VERTICES,
+            buffer_kind::VERTEX,
+            vertices.len() as u64,
+            Attr::default(),
+        );
+        writer.buffer_update(gpu::VERTICES, 0, &vertices);
+        writer.buffer_create(
+            gpu::INDICES,
+            buffer_kind::INDEX,
+            indices.len() as u64,
+            Attr::default(),
+        );
+        writer.buffer_update(gpu::INDICES, 0, &indices);
+        let text = text::Text::new(&mut writer)?;
+        program.create(&mut writer, info.dialect);
+        hal.submit(&writer.buf());
+        boot.window = Some(window);
+        boot.renderer = Some(Renderer {
+            active: None,
+            pending: Some(program),
+            generation: 1,
+            text,
+            layout: Layout::default(),
+            dirty: true,
+            redraw: true,
+            from: 0.0,
+            target: 0.0,
+            changed: 0.0,
+            began: Instant::now(),
+            input: None,
+            selected: 0,
+            reveal_selection: false,
+            scroll: 0.0,
+            dialect: info.dialect,
+            bundled,
+            clear_errors_on_install,
+            function_failed: false,
+        });
+        Ok(boot)
     }
 
-    pub fn document_updates(&self) -> DocumentUpdates {
-        self.updates.clone()
+    pub fn window(&self) -> Option<Id> {
+        self.window
+    }
+    pub fn events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.events)
+    }
+
+    pub fn reload(&mut self, document: Document) {
+        self.replace_document(document, true);
+    }
+
+    fn replace_document(&mut self, document: Document, clear_errors: bool) {
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        renderer.generation += 1;
+        let bank = renderer
+            .active
+            .as_ref()
+            .map_or(0, |p| if p.pipes[0].id.index == 0 { 4 } else { 0 });
+        match Program::compile(&document, renderer.dialect, bank, renderer.generation) {
+            Ok(program) => {
+                let mut writer = CmdWriter::new(HOST);
+                if let Some(old) = renderer.pending.take() {
+                    old.destroy(&mut writer);
+                }
+                renderer.bundled = document.source.as_ref() == DEFAULT_DOCUMENT;
+                program.create(&mut writer, renderer.dialect);
+                renderer.pending = Some(program);
+                renderer.clear_errors_on_install = clear_errors;
+                Hal::global().submit(&writer.buf());
+            }
+            Err(errors) => {
+                // A newer invalid edit supersedes any earlier pending reload.
+                // At startup, keep the only renderable document as the fallback.
+                if renderer.active.is_some() {
+                    if let Some(old) = renderer.pending.take() {
+                        let mut writer = CmdWriter::new(HOST);
+                        old.destroy(&mut writer);
+                        Hal::global().submit(&writer.buf());
+                    }
+                }
+                renderer.clear_errors_on_install = false;
+                self.events.push(Event::DocumentErrors(errors));
+            }
+        }
     }
 
     pub fn update(&mut self, state: State) {
-        if state.mode != Mode::Overlay { overlay(&mut self.cx, None); }
-        self.cx.get_global::<Bridge>().state = Arc::new(state);
+        if state.mode != Mode::Overlay {
+            self.set_overlay(None);
+        }
+        if let Some(renderer) = &mut self.renderer {
+            let reset = state.elapsed < self.state.elapsed;
+            if reset {
+                renderer.from = 0.0;
+                renderer.target = 0.0;
+                renderer.changed = 0.0;
+                renderer.began = Instant::now();
+                renderer.scroll = 0.0;
+            }
+            if let Some(program) = renderer
+                .active
+                .as_mut()
+                .filter(|_| !renderer.function_failed)
+            {
+                let now = renderer.began.elapsed().as_secs_f32();
+                let values = [
+                    renderer.target as f64,
+                    state.completed_weight,
+                    state.phase_weight,
+                    state.total_weight,
+                    state.done.unwrap_or(0) as f64,
+                    state.total.unwrap_or(0) as f64,
+                    state.phase_elapsed,
+                ];
+                match program.call(id!(phase_target), &values) {
+                    Ok(target) if target != renderer.target => {
+                        match program.call(
+                            id!(ease),
+                            &[
+                                renderer.from as f64,
+                                renderer.target as f64,
+                                (now - renderer.changed) as f64,
+                            ],
+                        ) {
+                            Ok(from) => renderer.from = from,
+                            Err(errors) => {
+                                renderer.function_failed = true;
+                                self.events.push(Event::DocumentErrors(errors));
+                            }
+                        }
+                        renderer.target = target;
+                        renderer.changed = now;
+                    }
+                    Ok(_) => {}
+                    Err(errors) => {
+                        renderer.function_failed = true;
+                        self.events.push(Event::DocumentErrors(errors));
+                    }
+                }
+            }
+            renderer.dirty |= state.mode != self.state.mode
+                || state.app != self.state.app
+                || state.phase != self.state.phase
+                || state.done != self.state.done
+                || state.total != self.state.total
+                || state.current != self.state.current
+                || state.warm != self.state.warm
+                || state.domain != self.state.domain
+                || state.parked != self.state.parked
+                || state.can_retry != self.state.can_retry
+                || state.can_restart != self.state.can_restart
+                || !Arc::ptr_eq(&state.diagnostics, &self.state.diagnostics);
+        }
+        self.state = state;
     }
-    pub fn window(&mut self) -> Option<makepad_hal::Id> {
-        self.cx
-            .get_global::<Bridge>()
-            .window
-            .map(|id| makepad_hal::Id::new(id.0 as u32, id.1 as u32))
+
+    pub fn select(&mut self, diagnostic: usize) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.selected = diagnostic;
+            renderer.reveal_selection = true;
+            renderer.dirty = true;
+        }
     }
+
+    pub fn scroll(&mut self, pages: f32) {
+        if let Some(renderer) = &mut self.renderer {
+            renderer.scroll = (renderer.scroll + pages * renderer.layout.clip[3]).max(0.0);
+            renderer.redraw = true;
+        }
+    }
+
+    pub fn input(&mut self, input: Option<String>) {
+        if let Some(renderer) = &mut self.renderer {
+            if renderer.input.is_some() != input.is_some() {
+                if let Some(window) = self.window {
+                    let mut writer = CmdWriter::new(HOST);
+                    if input.is_some() {
+                        writer.ime_show(window, renderer.layout.panel, 0);
+                    } else {
+                        writer.ime_hide(window);
+                    }
+                    Hal::global().submit(&writer.buf());
+                }
+            }
+            renderer.input = input;
+            renderer.dirty = true;
+        }
+    }
+
+    fn set_overlay(&mut self, rect: Option<[f32; 4]>) {
+        if self.overlay == rect {
+            return;
+        }
+        self.overlay = rect;
+        if let Some(window) = self.window {
+            let mut writer = CmdWriter::new(HOST);
+            writer.window_overlay(window, rect.is_some(), rect.unwrap_or_default());
+            if rect.is_some()
+                && self
+                    .renderer
+                    .as_ref()
+                    .is_some_and(|renderer| renderer.input.is_none())
+            {
+                writer.ime_hide(window);
+            }
+            Hal::global().submit(&writer.buf());
+        }
+    }
+
     pub fn turn(&mut self, timeout_ns: u64, present: bool) -> bool {
-        let source = self
-            .updates
-            .changed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(source) = source {
-            self.cx.get_global::<Bridge>().document.source = source;
-            self.cx.request_live_edit();
-        }
-        let previous_sink = self
-            .cx
-            .with_vm(|vm| vm.bx.captured_errors.replace(Vec::new()));
-        let alive = self.cx.hal_session_turn(timeout_ns, present);
-        let mut errors = self.cx.with_vm(|vm| {
-            vm.drain_errors();
-            let errors = script_diagnostics(vm.bx.captured_errors.take().unwrap_or_default());
-            vm.bx.captured_errors = previous_sink;
-            errors
-        });
-        if let Some(error) = makepad_widgets::makepad_platform::shader_error::take() {
-            let path = self
-                .cx
-                .get_global::<Bridge>()
-                .document
-                .path
-                .to_string_lossy()
-                .into_owned();
-            errors.push(Diagnostic::new("codegen", path, 0, 0, error));
-        }
-        if !errors.is_empty() {
-            let bridge = self.cx.get_global::<Bridge>();
-            bridge.document_errors.extend(errors);
-            bridge
-                .actions
-                .push(Action::DocumentErrors(bridge.document_errors.clone()));
-        }
-        alive
-    }
-    pub fn actions(&mut self) -> Vec<Action> {
-        std::mem::take(&mut self.cx.get_global::<Bridge>().actions)
-    }
-    pub fn copy(&mut self, text: &str) {
-        self.cx.copy_to_clipboard(text);
-    }
-    pub fn open_file(&mut self, file: String, line: u32, col: u32) -> Result<(), String> {
-        if !Cx::has_studio_web_socket() {
-            return Err("Connect an editor through Studio to open source locations".into());
-        }
-        Cx::send_studio_message(
-            makepad_widgets::makepad_platform::studio::AppToStudio::JumpToFile(
-                makepad_widgets::makepad_platform::studio::JumpToFile {
-                    file_name: file,
-                    line,
-                    column: col,
-                },
-            ),
+        let hal = Hal::global();
+        // Pump backend completions, then take session 0's owned queue. A zero-cap
+        // pump leaves the events queued. Taking the arena avoids truncating large
+        // diagnostics/pastes at an arbitrary EventStore capacity.
+        hal.pump(
+            timeout_ns,
+            &mut EventBuf {
+                session: HOST,
+                ..Default::default()
+            },
         );
-        Ok(())
+        let mut queue = std::mem::take(&mut self.queue);
+        let live = hal.with_world(|world| {
+            let Some(session) = world.session_mut(HOST) else {
+                return false;
+            };
+            std::mem::swap(&mut queue, &mut session.events);
+            true
+        });
+        if !live {
+            return false;
+        }
+        let mut alive = true;
+        queue.drain_with(|mut raw, payload| {
+            raw.data.off = 0;
+            let Some(event) = raw.decode(payload) else {
+                return;
+            };
+            if let Some(renderer) = &mut self.renderer {
+                match renderer.text.event(&event) {
+                    Ok(changed) => renderer.redraw |= changed,
+                    Err(error) => {
+                        eprintln!("relax boot: {error}");
+                        alive = false;
+                    }
+                }
+            }
+            match event {
+                HalEvent::KeyDown { window, .. } if Some(window) == self.window => {
+                    self.events.push(Event::KeyDown(raw))
+                }
+                HalEvent::Text { window, text, .. } if Some(window) == self.window => self
+                    .events
+                    .push(Event::Text(String::from_utf8_lossy(text).into_owned())),
+                HalEvent::Ime {
+                    window,
+                    kind: makepad_hal::input::ime::COMMIT,
+                    text,
+                    ..
+                } if Some(window) == self.window => self
+                    .events
+                    .push(Event::Text(String::from_utf8_lossy(text).into_owned())),
+                HalEvent::Geom {
+                    window,
+                    x,
+                    y,
+                    w,
+                    h,
+                    dpi,
+                    ..
+                } if Some(window) == self.window => {
+                    self.geometry = [x as f32, y as f32, w as f32, h as f32];
+                    self.dpi = dpi.max(f32::MIN_POSITIVE);
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.dirty = true;
+                    }
+                }
+                HalEvent::PipelineReady { pipeline } => {
+                    if let Some(renderer) = &mut self.renderer {
+                        if let Some(program) = &mut renderer.pending {
+                            for pipe in &mut program.pipes {
+                                if pipe.id == pipeline {
+                                    pipe.ready = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                HalEvent::PipelineFailed { pipeline, log } => {
+                    let Some(renderer) = &mut self.renderer else {
+                        return;
+                    };
+                    if renderer
+                        .pending
+                        .as_ref()
+                        .is_some_and(|p| p.pipes.iter().any(|p| p.id == pipeline))
+                    {
+                        let program = renderer.pending.take().unwrap();
+                        let mut writer = CmdWriter::new(HOST);
+                        program.destroy(&mut writer);
+                        hal.submit(&writer.buf());
+                        self.events.push(Event::DocumentErrors(vec![Diagnostic::new(
+                            "codegen",
+                            program.path.to_string_lossy(),
+                            1,
+                            1,
+                            String::from_utf8_lossy(log),
+                        )]));
+                        if renderer.active.is_none() {
+                            if renderer.bundled {
+                                alive = false;
+                            } else {
+                                self.replace_document(Document::bundled(), false);
+                            }
+                        }
+                    }
+                }
+                HalEvent::CloseRequested { window } | HalEvent::Closed { window }
+                    if Some(window) == self.window =>
+                {
+                    alive = false
+                }
+                HalEvent::Lifecycle {
+                    kind: lifecycle::QUIT_REQUESTED,
+                }
+                | HalEvent::DeviceLost {} => alive = false,
+                _ => {}
+            }
+        });
+        self.queue = queue;
+        if !alive {
+            return false;
+        }
+        if let Some(renderer) = &mut self.renderer {
+            if renderer.pending.as_ref().is_some_and(Program::ready) {
+                let mut writer = CmdWriter::new(HOST);
+                if let Some(old) = renderer.active.take() {
+                    old.destroy(&mut writer);
+                }
+                renderer.active = renderer.pending.take();
+                renderer.dirty = true;
+                renderer.function_failed = false;
+                hal.submit(&writer.buf());
+                if renderer.clear_errors_on_install {
+                    self.events.push(Event::DocumentErrors(Vec::new()));
+                }
+            }
+        }
+        if present {
+            self.present();
+        }
+        true
     }
+
+    fn present(&mut self) {
+        let Some(window) = self.window else { return };
+        let Some(renderer) = &mut self.renderer else {
+            return;
+        };
+        if renderer.active.is_none() {
+            return;
+        }
+        if self.state.mode == Mode::Overlay && !renderer.redraw && !renderer.dirty {
+            return;
+        }
+        if renderer.dirty {
+            renderer.layout(&self.state, [self.geometry[2], self.geometry[3]]);
+            renderer.dirty = false;
+        }
+        let rect = (self.state.mode == Mode::Overlay).then_some(renderer.layout.panel);
+        self.set_overlay(rect);
+        let renderer = self.renderer.as_mut().unwrap();
+        let program = renderer.active.as_ref().unwrap();
+        let build_start_ns = makepad_hal::clock_ns();
+        let mut writer = CmdWriter::new(HOST);
+        let mut data: [Vec<f32>; 4] = Default::default();
+        program.pipes[BACKGROUND].instances.write(
+            &[(id!(rect), &renderer.layout.panel)],
+            &mut data[BACKGROUND],
+        );
+        let max_scroll = (renderer.layout.content_height - renderer.layout.clip[3]).max(0.0);
+        renderer.scroll = renderer.scroll.min(max_scroll);
+        let scroll = renderer.scroll;
+        let clip = renderer.layout.clip;
+        if let Some(mut rect) = renderer.layout.progress {
+            rect[1] -= scroll;
+            program.pipes[PROGRESS]
+                .instances
+                .write(&[(id!(rect), &rect)], &mut data[PROGRESS]);
+        }
+        renderer.text.begin_frame();
+        let mut requests = Vec::new();
+        // The validated document ends in the fixed hint line. Content lines are
+        // ordered vertically, so a large diagnostic list costs only a binary
+        // search plus its visible lines per frame.
+        let (hints, content) = renderer.layout.text.split_last().unwrap();
+        let start = content.partition_point(|line| {
+            line.position[1] + line.run.rows as f32 * line.style.height < clip[1] + scroll
+        });
+        let visible = content[start..]
+            .iter()
+            .take_while(|line| line.position[1] <= clip[1] + clip[3] + scroll);
+        for line in visible.chain(std::iter::once(hints)) {
+            let y = line.position[1] - if line.fixed { 0.0 } else { scroll };
+            let height = line.run.rows as f32 * line.style.height;
+            if !line.fixed && (y + height < clip[1] || y > clip[1] + clip[3]) {
+                continue;
+            }
+            if line.error == Some(renderer.selected) {
+                let rect = [clip[0], y, clip[2], height];
+                program.pipes[ERROR_BAND]
+                    .instances
+                    .write(&[(id!(rect), &rect)], &mut data[ERROR_BAND]);
+            }
+            let bounds = if line.fixed {
+                renderer.layout.panel
+            } else {
+                clip
+            };
+            for glyph in line.run.visible(
+                bounds[1] - y,
+                bounds[1] + bounds[3] - y,
+                line.style.size,
+                line.style.height,
+            ) {
+                let baseline = [line.position[0] + glyph.x, y + glyph.y];
+                if !line.fixed
+                    && (baseline[1] + line.style.size < clip[1]
+                        || baseline[1] - line.style.size > clip[1] + clip[3])
+                {
+                    continue;
+                }
+                let Some(entry) =
+                    renderer
+                        .text
+                        .lookup(glyph.id, line.style.size, self.dpi, &mut requests)
+                else {
+                    continue;
+                };
+                if entry.atlas_kind == wire::glyph::EMPTY {
+                    continue;
+                }
+                let (rect, uv) = renderer.text.quad(entry, baseline, line.style.size);
+                // Clip in the vertex shader's coordinate space by cropping rect
+                // and UV together, so fixed key hints can share one glyph draw.
+                let (rect, uv) = crop(rect, uv, bounds);
+                if rect[2] <= 0.0 || rect[3] <= 0.0 {
+                    continue;
+                }
+                program.pipes[GLYPH].instances.write(
+                    &[
+                        (id!(rect), &rect),
+                        (id!(uv), &uv),
+                        (id!(color), &line.style.color),
+                        (id!(atlas_plane), &[entry.plane as f32]),
+                        (
+                            id!(color_glyph),
+                            &[if entry.atlas_kind == wire::glyph::COLOR {
+                                1.0
+                            } else {
+                                0.0
+                            }],
+                        ),
+                    ],
+                    &mut data[GLYPH],
+                );
+            }
+        }
+        let ready = renderer.text.finish_frame(&mut writer, &requests);
+        if !ready {
+            // Submit glyph requests without a FramePacket; retain the last image
+            // and retry on later turns while input and completions keep flowing.
+            Hal::global().submit(&writer.buf());
+            return;
+        }
+        let viewport = [self.geometry[2], self.geometry[3]];
+        let mut uniforms: [Vec<f32>; 4] = Default::default();
+        let sdf = makepad_font_core::raster::Settings::default().sdfer;
+        for (i, pipe) in program.pipes.iter().enumerate() {
+            pipe.uniforms.write(
+                &[
+                    (id!(viewport), &viewport),
+                    (id!(time), &[renderer.began.elapsed().as_secs_f32()]),
+                    (id!(from), &[renderer.from]),
+                    (id!(previous), &[renderer.target]),
+                    (id!(changed), &[renderer.changed]),
+                    (id!(completed), &[self.state.completed_weight as f32]),
+                    (id!(weight), &[self.state.phase_weight as f32]),
+                    (id!(total_weight), &[self.state.total_weight as f32]),
+                    (id!(done), &[self.state.done.unwrap_or(0) as f32]),
+                    (id!(total), &[self.state.total.unwrap_or(0) as f32]),
+                    (id!(phase_elapsed), &[self.state.phase_elapsed as f32]),
+                    (id!(radius), &[sdf.radius]),
+                    (id!(cutoff), &[sdf.cutoff]),
+                ],
+                &mut uniforms[i],
+            );
+        }
+        self.frame += 1;
+        writer.frame_begin(
+            self.frame,
+            FrameMeta {
+                build_start_ns,
+                ..Default::default()
+            },
+        );
+        writer.pass(Pass {
+            load: [pass_load::CLEAR; 5],
+            clear: [[0.0; 4]; 4],
+            viewport: [0.0, 0.0, viewport[0] * self.dpi, viewport[1] * self.dpi],
+            dpi: self.dpi,
+            ..Default::default()
+        });
+        for i in 0..program.pipes.len() {
+            let rect = if i == PROGRESS || i == ERROR_BAND {
+                clip
+            } else {
+                renderer.layout.panel
+            };
+            program.pipes[i].draw(
+                &mut writer,
+                &data[i],
+                &uniforms[i],
+                renderer.text.atlas(),
+                rect.map(|v| v * self.dpi),
+            );
+        }
+        writer.frame_set_build_end(makepad_hal::clock_ns());
+        writer.frame_end(window, target::WINDOW);
+        Hal::global().submit(&writer.buf());
+        renderer.redraw = false;
+    }
+}
+
+impl Renderer {
+    fn layout(&mut self, state: &State, size: [f32; 2]) {
+        let program = self.active.as_ref().unwrap();
+        let style = program.layout(state.mode);
+        let margin = style
+            .margin
+            .min((size[0].min(size[1]) * 0.5 - 1.0).max(0.0));
+        let width = (size[0] - margin * 2.0).max(1.0);
+        let height = (size[1] - margin * 2.0).max(1.0);
+        let panel = [
+            margin,
+            margin,
+            if style.max_width > 0.0 {
+                width.min(style.max_width)
+            } else {
+                width
+            },
+            if style.max_height > 0.0 {
+                height.min(style.max_height)
+            } else {
+                height
+            },
+        ];
+        let padding = style
+            .padding
+            .min((panel[2].min(panel[3]) * 0.5 - 1.0).max(0.0));
+        let x = panel[0] + padding;
+        let top = panel[1] + style.top.min((panel[3] - padding - 1.0).max(0.0));
+        let width = (panel[2] - 2.0 * padding).max(1.0);
+        let mut y = top;
+        let mut text = Vec::new();
+        let mut progress = None;
+        let mut hints_height = 0.0;
+        self.text.begin_layout();
+        for line in &program.lines {
+            let lines: Vec<(String, Option<usize>)> = match line.role {
+                Role::App => vec![(state.app.clone(), None)],
+                Role::Progress => {
+                    if state.mode == Mode::Boot {
+                        progress = Some([x, y, width, line.height]);
+                        y += line.height + line.gap;
+                    }
+                    continue;
+                }
+                Role::Status if state.mode == Mode::Overlay => continue,
+                Role::Status => vec![(
+                    format!(
+                        "{} · {} · {}{}",
+                        state.phase.name(),
+                        if state.warm { "warm" } else { "cold" },
+                        state.current,
+                        match (state.done, state.total) {
+                            (Some(done), Some(total)) => format!(" · {done}/{total}"),
+                            _ => String::new(),
+                        }
+                    ),
+                    None,
+                )],
+                Role::Domain => vec![(
+                    if state.mode == Mode::Overlay {
+                        if state.parked.is_some() {
+                            "Panic parked".into()
+                        } else {
+                            state.domain.clone()
+                        }
+                    } else {
+                        state.domain.clone()
+                    },
+                    None,
+                )],
+                Role::Errors => state
+                    .diagnostics
+                    .iter()
+                    .enumerate()
+                    .map(|(i, d)| (diagnostic_text(d), Some(i)))
+                    .collect(),
+                Role::Panic => state
+                    .parked
+                    .as_ref()
+                    .map(|p| vec![(format!("{} {}\n{}", p.id, p.location, p.message), None)])
+                    .unwrap_or_default(),
+                Role::Hints => vec![(program.hints(state, self.input.as_deref()), None)],
+            };
+            for (value, error) in lines {
+                let run = self.text.shape(&value, line.size, width, line.height);
+                let height = run.rows as f32 * line.height;
+                let fixed = matches!(line.role, Role::Hints);
+                let at = if fixed {
+                    (panel[1] + panel[3] - padding - height).max(panel[1])
+                } else {
+                    y
+                };
+                text.push(TextLine {
+                    run,
+                    position: [x, at],
+                    style: *line,
+                    error,
+                    fixed,
+                });
+                if fixed {
+                    hints_height += height + line.gap;
+                } else {
+                    y += height + line.gap;
+                }
+            }
+        }
+        self.text.end_layout();
+        let clip = [
+            x,
+            top,
+            width,
+            (panel[1] + panel[3] - padding - hints_height - top).max(0.0),
+        ];
+        if self.reveal_selection {
+            if let Some(line) = text.iter().find(|line| line.error == Some(self.selected)) {
+                self.scroll = (line.position[1] - top).max(0.0);
+            }
+            self.reveal_selection = false;
+        }
+        self.layout = Layout {
+            panel,
+            clip,
+            text,
+            progress,
+            content_height: y - top,
+        };
+    }
+}
+
+fn crop(mut rect: [f32; 4], mut uv: [f32; 4], clip: [f32; 4]) -> ([f32; 4], [f32; 4]) {
+    if rect[2] <= 0.0 || rect[3] <= 0.0 {
+        return (rect, uv);
+    }
+    for axis in 0..2 {
+        let start = rect[axis].max(clip[axis]);
+        let end = (rect[axis] + rect[axis + 2]).min(clip[axis] + clip[axis + 2]);
+        let scale = (uv[axis + 2] - uv[axis]) / rect[axis + 2];
+        uv[axis + 2] = uv[axis] + (end - rect[axis]) * scale;
+        uv[axis] += (start - rect[axis]) * scale;
+        rect[axis] = start;
+        rect[axis + 2] = (end - start).max(0.0);
+    }
+    (rect, uv)
 }

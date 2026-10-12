@@ -1,18 +1,15 @@
 //! The permanent window of `relax run`. Session 0 presents the boot document on
-//! macOS and a theme-colour clear elsewhere; compilation and app domains are guests.
+//! any native HAL backend; compilation and app domains are guests.
 //! Only ending the run closes the physical window.
 use crate::boot_progress::{History, Progress};
-#[cfg(not(target_os = "macos"))]
-use clear_window::HostWindow;
 use makepad_hal::{domain_stop, open_flags, session::HOST, CmdWriter, Hal, Id, OpenReq};
-#[cfg(target_os = "macos")]
-use relax_boot::{Action, Boot as HostWindow, Document};
+use makepad_studio_protocol::KeyCode;
+use relax_boot::{Boot as HostWindow, Document, Event as BootEvent};
 use relax_compiler::{
     diag::Diagnostic,
     domain::{AppSpec, DomainState},
     run_state::{self, Mode, ParkedPanic, Phase, State},
 };
-#[cfg(target_os = "macos")]
 use std::sync::Condvar;
 use std::{
     collections::{HashSet, VecDeque},
@@ -33,7 +30,6 @@ struct Run {
     relaunch: Option<Instant>,
     baseline: u64,
     initial_failed: bool,
-    #[cfg(target_os = "macos")]
     retry: bool,
 }
 
@@ -42,15 +38,18 @@ enum Update {
     Domain(DomainState),
     Begin { warm: bool },
     Failure(String),
-    #[cfg(target_os = "macos")]
     Message(String),
-    #[cfg(target_os = "macos")]
     SourcesChanged,
+    Document(Document),
 }
 
 enum Work {
     Save(PathBuf, String),
-    #[cfg(target_os = "macos")]
+    OpenFile {
+        file: String,
+        line: u32,
+        col: u32,
+    },
     Resume {
         panic: String,
         choice: String,
@@ -59,7 +58,6 @@ enum Work {
 }
 
 static RUN: Mutex<Option<Run>> = Mutex::new(None);
-#[cfg(target_os = "macos")]
 static RETRY: Condvar = Condvar::new();
 static UPDATES: Mutex<VecDeque<Update>> = Mutex::new(VecDeque::new());
 static PUMP: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
@@ -109,9 +107,8 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
                     return;
                 }
                 EXIT.store(code, Ordering::Release);
-                #[cfg(not(target_os = "macos"))]
-                {
-                    // The clear-only host has no retry UI: retain M4a's exit behaviour.
+                if run.window.is_none() {
+                    // No native window backend: there is no run UI to retry from.
                     QUIT.store(true, Ordering::Release);
                     Hal::global().wake_session(HOST);
                     if PUMP.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -119,7 +116,6 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
                     }
                     return;
                 }
-                #[cfg(target_os = "macos")]
                 {
                     // With a unit already installed, retries go through domain relaunch.
                     run.initial_failed = run.spec.is_none();
@@ -127,7 +123,8 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
                     if run.spec.is_some() {
                         return;
                     }
-                    while !QUIT.load(Ordering::Acquire) && !guard.as_ref().is_some_and(|r| r.retry) {
+                    while !QUIT.load(Ordering::Acquire) && !guard.as_ref().is_some_and(|r| r.retry)
+                    {
                         guard = RETRY.wait(guard).unwrap_or_else(|e| e.into_inner());
                     }
                     if QUIT.load(Ordering::Acquire) {
@@ -148,7 +145,6 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
         makepad_hal::run_main_loop();
     }
     QUIT.store(true, Ordering::Release);
-    #[cfg(target_os = "macos")]
     RETRY.notify_all();
     Hal::global().wake_session(HOST);
     if thread.join().is_err() {
@@ -162,7 +158,6 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
     EXIT.load(Ordering::Acquire)
 }
 
-#[cfg(target_os = "macos")]
 fn document(package_dir: &str) -> Result<Document, String> {
     let manifest = format!("{package_dir}/Cargo.toml");
     let text =
@@ -189,7 +184,7 @@ fn document(package_dir: &str) -> Result<Document, String> {
 }
 
 /// Called after graph resolution, before build scripts or application sources.
-pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
+pub fn open(package: &str, package_dir: &str) -> Result<(), String> {
     if state().is_some() {
         return Ok(());
     }
@@ -200,11 +195,7 @@ pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
         .any(|a| a == b"--remote")
         || std::env::var_os("MAKEPAD_REMOTE").is_some();
     let flags = open_flags::RETAIN_WINDOWS
-        | if cfg!(target_os = "macos") {
-            open_flags::HIDDEN_UNTIL_PRESENT
-        } else {
-            0
-        }
+        | open_flags::HIDDEN_UNTIL_PRESENT
         | if remote { open_flags::NO_FOCUS } else { 0 };
     let info = hal.open_host(&OpenReq::from_env(0, flags, 0.0));
     if info.backend == makepad_hal::backend_id::NONE {
@@ -236,8 +227,7 @@ pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
             .join("boot")
             .join(format!("{key:016x}.timings")),
     );
-    #[cfg(target_os = "macos")]
-    let document = document(_package_dir).unwrap_or_else(|e| {
+    let document = document(package_dir).unwrap_or_else(|e| {
         post(Update::Message(e));
         Document::bundled()
     });
@@ -250,20 +240,21 @@ pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
         relaunch: None,
         baseline: 0,
         initial_failed: false,
-        #[cfg(target_os = "macos")]
         retry: false,
     });
     run_state::set_observer(|event| post(Update::Compiler(event)));
     relax_compiler::tui::track_for_host();
     relax_compiler::inspect::events::set_run_state_observer(panic_changed);
-    relax_compiler::inspect::events::run_state_available(cfg!(target_os = "macos"));
+    relax_compiler::inspect::events::run_state_available(
+        info.dialect != makepad_hal::dialect::NONE,
+    );
     let initial = State {
         app: package.into(),
         domain: "Compiling".into(),
         ..State::default()
     };
-    #[cfg(target_os = "macos")]
-    let package_dir = PathBuf::from(_package_dir);
+    let package_dir = PathBuf::from(package_dir);
+    let watched_document = document.clone();
     let (ready, first) = std::sync::mpsc::sync_channel(1);
     *PUMP.lock().unwrap_or_else(|e| e.into_inner()) = Some(
         std::thread::Builder::new()
@@ -278,17 +269,20 @@ pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
                 }
                 let _stop = StopLoop;
                 let _kept = relax_compiler::zone_alloc::kept();
-                #[cfg(target_os = "macos")]
-                let host = HostWindow::new(info, document, initial.clone(), geometry);
-                #[cfg(not(target_os = "macos"))]
-                let host = HostWindow::new(info.dpi, &initial.app, geometry);
+                let host = match HostWindow::new(info, document, initial.clone(), geometry) {
+                    Ok(host) => host,
+                    Err(error) => {
+                        let _ = ready.try_send(Err(error));
+                        return;
+                    }
+                };
                 pump(
                     host,
                     initial,
                     history,
                     state_path,
-                    #[cfg(target_os = "macos")]
                     package_dir,
+                    watched_document,
                     ready,
                 );
             })
@@ -372,7 +366,6 @@ pub fn observe(id: u32, next: &DomainState) {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn retry() -> Result<(), String> {
     {
         let mut guard = state();
@@ -386,44 +379,85 @@ fn retry() -> Result<(), String> {
     relaunch()
 }
 
-fn work(
-    rx: std::sync::mpsc::Receiver<Work>,
-    #[cfg(target_os = "macos")] package_dir: PathBuf,
-    #[cfg(target_os = "macos")] document: relax_boot::DocumentUpdates,
-) {
+fn work(rx: std::sync::mpsc::Receiver<Work>, package_dir: PathBuf, document: Document) {
     let _kept = relax_compiler::zone_alloc::kept();
-    #[cfg(target_os = "macos")]
-    let _document_watcher = document.watch();
-    #[cfg(target_os = "macos")]
-    let _source_watcher = if package_dir.is_dir() {
-        use makepad_filesystem_watcher::{FileSystemWatcher, WatchRoot};
-        FileSystemWatcher::start(
-            vec![WatchRoot {
-                mount: "run".into(),
-                path: package_dir,
-            }],
-            |event| {
-                if matches!(
+    let document_path = document.path.clone();
+    let mut roots = Vec::new();
+    if package_dir.is_dir() {
+        roots.push(makepad_filesystem_watcher::WatchRoot {
+            mount: "run".into(),
+            path: package_dir.clone(),
+        });
+    }
+    if let Some(parent) = document_path
+        .parent()
+        .filter(|p| p.is_dir() && !document_path.starts_with(&package_dir))
+    {
+        roots.push(makepad_filesystem_watcher::WatchRoot {
+            mount: "boot".into(),
+            path: parent.into(),
+        });
+    }
+    let contents = std::sync::Arc::new(Mutex::new(document.source));
+    let _watcher = if roots.is_empty() {
+        None
+    } else {
+        use makepad_filesystem_watcher::FileSystemWatcher;
+        FileSystemWatcher::start(roots, move |event| {
+            // Watch roots catch atomic saves and backend rescan notifications too.
+            if event.path == document_path || event.path.is_dir() {
+                match relax_compiler::vfs::read_to_string(&document_path) {
+                    Ok(source) => {
+                        let source: std::sync::Arc<str> = source.into();
+                        let mut old = contents.lock().unwrap_or_else(|e| e.into_inner());
+                        if *old != source {
+                            *old = source.clone();
+                            drop(old);
+                            post(Update::Document(Document {
+                                path: document_path.clone(),
+                                source,
+                            }));
+                        }
+                    }
+                    Err(error) => post(Update::Message(format!(
+                        "{}: {error}",
+                        document_path.display()
+                    ))),
+                }
+            }
+            if event.path.is_dir()
+                || matches!(
                     event.path.extension().and_then(|e| e.to_str()),
                     Some("rs" | "toml")
-                ) {
-                    post(Update::SourcesChanged);
-                }
-            },
-        )
-        .map_err(|e| eprintln!("relax: source retry watcher: {e}"))
+                )
+            {
+                post(Update::SourcesChanged);
+            }
+        })
+        .map_err(|e| eprintln!("relax: run source watcher: {e}"))
         .ok()
-    } else {
-        None
     };
-    for work in rx {
+    let mut editor = crate::boot_editor::Editor::new();
+    loop {
+        for error in editor.poll() {
+            post(Update::Message(error));
+        }
+        let work = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(work) => work,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match work {
             Work::Save(path, text) => {
                 if let Err(e) = crate::boot_progress::save(&path, &text) {
                     eprintln!("relax: cannot remember {}: {e}", path.display());
                 }
             }
-            #[cfg(target_os = "macos")]
+            Work::OpenFile { file, line, col } => {
+                if let Err(error) = editor.open_file(file, line, col) {
+                    post(Update::Message(error));
+                }
+            }
             Work::Resume {
                 panic,
                 choice,
@@ -491,8 +525,7 @@ fn enqueue(queue: &mut VecDeque<Work>, work: Work) {
                 }
             }
         }
-        #[cfg(target_os = "macos")]
-        Work::Resume { .. } => {}
+        Work::Resume { .. } | Work::OpenFile { .. } => {}
     }
     queue.push_back(work);
 }
@@ -502,31 +535,31 @@ fn pump(
     mut data: State,
     history: History,
     geometry_path: PathBuf,
-    #[cfg(target_os = "macos")] package_dir: PathBuf,
+    package_dir: PathBuf,
+    document: Document,
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
 ) {
     let hal = Hal::global();
     let (send, recv) = std::sync::mpsc::sync_channel(1);
-    #[cfg(target_os = "macos")]
-    let document = host.document_updates();
     let worker = std::thread::Builder::new()
         .name("relax-run-actions".into())
-        .spawn(move || {
-            work(
-                recv,
-                #[cfg(target_os = "macos")]
-                package_dir,
-                #[cfg(target_os = "macos")]
-                document,
-            )
-        })
+        .spawn(move || work(recv, package_dir, document))
         .expect("run action worker");
     let mut work_pending = VecDeque::new();
     let mut work_full = false;
-    let mut ready = Some(ready);
+    let has_window = host.window().is_some();
+    let mut ready = if has_window {
+        Some(ready)
+    } else {
+        let _ = ready.try_send(Ok(()));
+        None
+    };
+    let mut selected = 0usize;
+    let mut return_entry: Option<(String, String)> = None;
     let mut progress = Progress::new(history);
     let mut failed = false;
     let mut patch_failed = false;
+    let mut action_failed = false;
     let mut overlay_dismissed = false;
     let mut active = true;
     let mut relaunched = false;
@@ -534,7 +567,6 @@ fn pump(
     let mut diagnostics = Vec::new();
     let mut diagnostic_keys = HashSet::new();
     let mut diagnostics_dirty = true;
-    #[cfg(target_os = "macos")]
     let mut document_errors = Vec::new();
     let mut saved_geometry = None;
     let mut next_frame = Instant::now();
@@ -559,7 +591,9 @@ fn pump(
         }
         if pending {
             let mut cmd = CmdWriter::new(HOST);
-            if !window.is_none() { cmd.window_overlay(window, false, [0.0; 4]); }
+            if !window.is_none() {
+                cmd.window_overlay(window, false, [0.0; 4]);
+            }
             cmd.domain_relaunch(domain);
             hal.submit(&cmd.buf());
         }
@@ -574,7 +608,9 @@ fn pump(
                     data.total = None;
                     data.current.clear();
                     data.warm = warm;
-                    data.progress = 0.0;
+                    data.elapsed = 0.0;
+                    data.completed_weight = 0.0;
+                    data.phase_elapsed = 0.0;
                     data.parked = None;
                     data.domain = "Compiling".into();
                     diagnostics.clear();
@@ -582,6 +618,7 @@ fn pump(
                     diagnostics_dirty = true;
                     failed = false;
                     patch_failed = false;
+                    action_failed = false;
                     overlay_dismissed = false;
                     active = true;
                     relaunched |= warm;
@@ -598,12 +635,13 @@ fn pump(
                         r.stopping = false;
                     }
                 }
-                #[cfg(target_os = "macos")]
                 Update::Message(message) => {
                     diagnostics.push(Diagnostic::new("run", "", 0, 0, message));
                     diagnostics_dirty = true;
+                    overlay_dismissed = false;
+                    action_failed = true;
                 }
-                #[cfg(target_os = "macos")]
+                Update::Document(document) => host.reload(document),
                 Update::SourcesChanged => {
                     if failed && !stopping && restartable {
                         match retry() {
@@ -635,7 +673,7 @@ fn pump(
                         data.done = None;
                         data.total = None;
                     }
-                    DomainState::Exited(code) if code == 0 || !cfg!(target_os = "macos") => {
+                    DomainState::Exited(code) if code == 0 || !has_window => {
                         EXIT.store(code, Ordering::Release);
                         QUIT.store(true, Ordering::Release);
                     }
@@ -677,6 +715,7 @@ fn pump(
                             if !active && record.severity == relax_compiler::diag::Severity::Error {
                                 patch_failed = true;
                                 overlay_dismissed = false;
+                                data.domain = "Patch not applied · previous code is running".into();
                             }
                             diagnostics.push(record);
                             diagnostics_dirty = true;
@@ -688,7 +727,18 @@ fn pump(
                         records,
                     } if id.is_none() || id == Some(domain) => {
                         patch_failed = !applied;
-                        overlay_dismissed = applied;
+                        action_failed = false;
+                        if !applied {
+                            overlay_dismissed = false;
+                        }
+                        if !active {
+                            data.domain = if applied {
+                                "Running"
+                            } else {
+                                "Patch not applied · previous code is running"
+                            }
+                            .into();
+                        }
                         diagnostic_keys = records.iter().map(Diagnostic::to_json).collect();
                         diagnostics = records.to_vec();
                         diagnostics_dirty = true;
@@ -703,13 +753,22 @@ fn pump(
         if PANICS_CHANGED.swap(false, Ordering::AcqRel) {
             if let Some(parked) = parked(domain) {
                 if data.parked.as_ref().map(|p| &p.id) != parked.as_ref().map(|p| &p.id) {
-                    overlay_dismissed = parked.is_none();
+                    if parked.is_some() {
+                        overlay_dismissed = false;
+                    }
                 }
                 data.parked = parked;
                 dirty = true;
             } else {
                 PANICS_CHANGED.store(true, Ordering::Release);
             }
+        }
+        if return_entry
+            .as_ref()
+            .is_some_and(|(id, _)| data.parked.as_ref().map(|p| &p.id) != Some(id))
+        {
+            return_entry = None;
+            host.input(None);
         }
         let physical = hal.with_world(|w| {
             w.session(HOST)
@@ -728,11 +787,7 @@ fn pump(
         let mut app_frame = false;
         if let Some((geom, borrower_frame, presentations, presenter, lent)) = physical {
             app_frame = borrower_frame && lent == domain && domain != 0 && !stopping && !pending;
-            may_present = if cfg!(target_os = "macos") {
-                !borrower_frame || lent == 0
-            } else {
-                presentations == 0 && lent == 0
-            };
+            may_present = !borrower_frame || lent == 0;
             if saved_geometry != Some(geom)
                 && geom.iter().all(|v| v.is_finite())
                 && geom[2] > 0.0
@@ -763,7 +818,6 @@ fn pump(
             {
                 active = false;
                 failed = false;
-                data.progress = 1.0;
                 data.domain = "Running".into();
                 EXIT.store(0, Ordering::Release);
                 let (path, contents) = progress.finish(data.warm);
@@ -781,16 +835,27 @@ fn pump(
         }
         // Errors reveal immediately. Otherwise a warm relaunch preserves the last app
         // image for 300 ms, then uses exactly the same document/context as cold boot.
-        let overlay = cfg!(target_os = "macos") && app_frame && !overlay_dismissed
-            && (patch_failed || data.parked.is_some());
+        let overlay = has_window
+            && app_frame
+            && !overlay_dismissed
+            && (patch_failed
+                || action_failed
+                || failed
+                || !document_errors.is_empty()
+                || data.parked.is_some());
         let mode = if overlay { Mode::Overlay } else { Mode::Boot };
-        if data.mode != mode { data.mode = mode; dirty = true; }
-        let visible = overlay || (cfg!(target_os = "macos")
-            && may_present
-            && (failed
-                || data.parked.is_some()
-                || (active && relaunch.is_none_or(|t| t.elapsed() >= Duration::from_millis(300)))));
-        if active && Instant::now() >= next_status {
+        if data.mode != mode {
+            data.mode = mode;
+            dirty = true;
+        }
+        let visible = overlay
+            || (has_window
+                && may_present
+                && (failed
+                    || data.parked.is_some()
+                    || (active
+                        && relaunch.is_none_or(|t| t.elapsed() >= Duration::from_millis(300)))));
+        if active && (dirty || Instant::now() >= next_status) {
             progress.tick(&mut data);
             if matches!(data.phase, Phase::Codegen | Phase::FirstFrame) {
                 if let Some(item) = relax_compiler::tui::current_item() {
@@ -802,16 +867,19 @@ fn pump(
         }
         if diagnostics_dirty {
             let records = diagnostics.iter().cloned();
-            #[cfg(target_os = "macos")]
             let records = records.chain(document_errors.iter().cloned());
             data.diagnostics = records.collect::<Vec<_>>().into();
+            let next = selected.min(data.diagnostics.len().saturating_sub(1));
+            if next != selected {
+                selected = next;
+                host.select(selected);
+            }
             diagnostics_dirty = false;
             dirty = true;
         }
         if dirty {
             data.can_retry = restartable && (initial_failed || (failed && domain != 0));
             data.can_restart = restartable && domain != 0 && !stopping;
-            #[cfg(target_os = "macos")]
             host.update(data.clone());
             dirty = false;
         }
@@ -820,7 +888,7 @@ fn pump(
             next_frame
                 .saturating_duration_since(Instant::now())
                 .as_nanos() as u64
-        } else if (cfg!(target_os = "macos") && active)
+        } else if (has_window && active)
             || !work_pending.is_empty()
             || PANICS_CHANGED.load(Ordering::Acquire)
         {
@@ -828,7 +896,7 @@ fn pump(
         } else {
             u64::MAX
         };
-        let alive = host.turn(timeout, draw || (!cfg!(target_os = "macos") && may_present));
+        let alive = host.turn(timeout, draw);
         if window.is_none() {
             if let Some(window) = host.window() {
                 if let Some(r) = state().as_mut() {
@@ -843,36 +911,155 @@ fn pump(
         if draw {
             next_frame = Instant::now() + Duration::from_nanos(16_666_667);
         }
-        #[cfg(target_os = "macos")]
-        for action in host.actions() {
-            match action {
-                Action::Dismiss => {
-                    overlay_dismissed = true;
-                    dirty = true;
-                }
-                Action::RetryCompile | Action::RestartDomain => match retry() {
-                    Ok(()) => failed = false,
-                    Err(e) => post(Update::Message(e)),
-                },
-                Action::Resume {
-                    panic,
-                    choice,
-                    value,
-                } => work_pending.push_back(Work::Resume {
-                    panic,
-                    choice,
-                    value,
-                }),
-                Action::Copy(text) => host.copy(&text),
-                Action::OpenFile { file, line, col } => {
-                    if let Err(e) = host.open_file(file, line, col) {
-                        post(Update::Message(e));
+        for event in host.events() {
+            match event {
+                BootEvent::DocumentErrors(errors) => {
+                    if !errors.is_empty() {
+                        overlay_dismissed = false;
                     }
-                }
-                Action::DocumentErrors(errors) => {
                     document_errors = errors;
                     diagnostics_dirty = true;
                 }
+                BootEvent::Text(text) if return_entry.is_some() => {
+                    if let Some((_, value)) = &mut return_entry {
+                        value.push_str(&text.replace(['\r', '\n'], " "));
+                        host.input(Some(value.clone()));
+                    }
+                }
+                BootEvent::KeyDown(raw) if visible => {
+                    let Some(makepad_hal::HalEvent::KeyDown {
+                        key, repeat, mods, ..
+                    }) = raw.decode(&[])
+                    else {
+                        continue;
+                    };
+                    let key = KeyCode::from_index(key);
+                    if return_entry.is_some() {
+                        match key {
+                            KeyCode::Escape => {
+                                return_entry = None;
+                                host.input(None);
+                            }
+                            KeyCode::Backspace => {
+                                if let Some((_, value)) = &mut return_entry {
+                                    value.pop();
+                                    host.input(Some(value.clone()));
+                                }
+                            }
+                            KeyCode::ReturnKey | KeyCode::NumpadEnter if !repeat => {
+                                let (panic, value) = return_entry.take().unwrap();
+                                enqueue(
+                                    &mut work_pending,
+                                    Work::Resume {
+                                        panic,
+                                        choice: "return".into(),
+                                        value,
+                                    },
+                                );
+                                host.input(None);
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    if mods
+                        & (makepad_hal::input::MOD_CONTROL
+                            | makepad_hal::input::MOD_ALT
+                            | makepad_hal::input::MOD_LOGO)
+                        != 0
+                    {
+                        continue;
+                    }
+                    match key {
+                        KeyCode::Escape if overlay && !repeat => {
+                            overlay_dismissed = true;
+                            dirty = true;
+                        }
+                        KeyCode::KeyR if !repeat && (data.can_retry || data.can_restart) => {
+                            match retry() {
+                                Ok(()) => failed = false,
+                                Err(error) => post(Update::Message(error)),
+                            }
+                        }
+                        KeyCode::KeyC if !repeat => {
+                            let text = data
+                                .diagnostics
+                                .get(selected)
+                                .map(relax_boot::diagnostic_text)
+                                .or_else(|| {
+                                    data.parked
+                                        .as_ref()
+                                        .map(|p| format!("{} {}\n{}", p.id, p.location, p.message))
+                                });
+                            if let Some(text) = text {
+                                let mut cmd = CmdWriter::new(HOST);
+                                cmd.clip_set(text.as_bytes());
+                                hal.submit(&cmd.buf());
+                            }
+                        }
+                        KeyCode::KeyE if !repeat => {
+                            if let Some(d) = data
+                                .diagnostics
+                                .get(selected)
+                                .filter(|d| !d.file.is_empty())
+                            {
+                                enqueue(
+                                    &mut work_pending,
+                                    Work::OpenFile {
+                                        file: d.file.clone(),
+                                        line: d.line,
+                                        col: d.col,
+                                    },
+                                );
+                            }
+                        }
+                        KeyCode::ArrowUp => {
+                            selected = selected.saturating_sub(1);
+                            host.select(selected);
+                        }
+                        KeyCode::ArrowDown => {
+                            selected = (selected + 1).min(data.diagnostics.len().saturating_sub(1));
+                            host.select(selected);
+                        }
+                        KeyCode::PageUp => host.scroll(-1.0),
+                        KeyCode::PageDown => host.scroll(1.0),
+                        key if !repeat => {
+                            let number: usize = match key {
+                                KeyCode::Key1 => 1,
+                                KeyCode::Key2 => 2,
+                                KeyCode::Key3 => 3,
+                                KeyCode::Key4 => 4,
+                                KeyCode::Key5 => 5,
+                                KeyCode::Key6 => 6,
+                                KeyCode::Key7 => 7,
+                                KeyCode::Key8 => 8,
+                                KeyCode::Key9 => 9,
+                                _ => 0,
+                            };
+                            if let Some(panic) = &data.parked {
+                                if let Some(choice) =
+                                    number.checked_sub(1).and_then(|i| panic.choices.get(i))
+                                {
+                                    if choice == "return" {
+                                        return_entry = Some((panic.id.clone(), String::new()));
+                                        host.input(Some(String::new()));
+                                    } else {
+                                        enqueue(
+                                            &mut work_pending,
+                                            Work::Resume {
+                                                panic: panic.id.clone(),
+                                                choice: choice.clone(),
+                                                value: String::new(),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
         }
         while let Some(work) = work_pending.pop_front() {
@@ -901,7 +1088,6 @@ fn pump(
         }
     }
     relax_compiler::inspect::events::run_state_available(false);
-    #[cfg(target_os = "macos")]
     RETRY.notify_all();
     if let Some(ready) = ready {
         let _ = ready.try_send(Err("run closed before its first frame".into()));
@@ -924,157 +1110,5 @@ fn pump(
     drop(send);
     if worker.join().is_err() {
         eprintln!("relax: run action worker panicked");
-    }
-}
-
-/// Until another platform migrates its client, keep the M4a presenter: one
-/// theme-colour clear, then let the physical window retain the app's last frame.
-#[cfg(not(target_os = "macos"))]
-mod clear_window {
-    use makepad_hal::{
-        lifecycle, pass_load, session::HOST, target, window_kind, CmdWriter, EventStore, FrameMeta,
-        Hal, HalEvent, Id, Pass,
-    };
-
-    pub(super) struct HostWindow {
-        window: Id,
-        events: EventStore,
-        geometry: [f32; 4],
-        dpi: f32,
-        frame: u64,
-        dirty: bool,
-        color: [f32; 4],
-    }
-
-    impl HostWindow {
-        pub(super) fn new(dpi: f32, title: &str, geometry: [f32; 4]) -> Self {
-            let hal = Hal::global();
-            let window = hal.with_world(|w| w.host_window(geometry));
-            let mut cmd = CmdWriter::new(HOST);
-            cmd.window_create(window, window_kind::NORMAL, Id::NONE, geometry, false);
-            cmd.str_def(1, title.as_bytes());
-            cmd.window_title(window, 1);
-            hal.submit(&cmd.buf());
-            Self {
-                window,
-                events: EventStore::new(HOST, 64, 65536),
-                geometry,
-                dpi,
-                frame: 0,
-                dirty: false,
-                color: background(),
-            }
-        }
-
-        pub(super) fn window(&mut self) -> Option<Id> {
-            Some(self.window)
-        }
-
-        pub(super) fn turn(&mut self, timeout_ns: u64, present: bool) -> bool {
-            let hal = Hal::global();
-            let mut out = self.events.buf();
-            let n = hal.pump(timeout_ns, &mut out);
-            for (_, event) in self.events.reader(n, out.arena_len) {
-                match event {
-                    HalEvent::Geom {
-                        window, x, y, w, h, dpi, ..
-                    } if window == self.window => {
-                        self.geometry = [x as f32, y as f32, w as f32, h as f32];
-                        self.dpi = dpi;
-                        self.dirty = true;
-                    }
-                    HalEvent::FrameDone { .. } => self.dirty = true,
-                    HalEvent::FrameReady { window, .. } if window == self.window => {
-                        self.dirty = true;
-                    }
-                    HalEvent::CloseRequested { window } | HalEvent::Closed { window }
-                        if window == self.window =>
-                    {
-                        return false;
-                    }
-                    HalEvent::Lifecycle {
-                        kind: lifecycle::QUIT_REQUESTED,
-                    } => return false,
-                    _ => {}
-                }
-            }
-            if present && self.dirty {
-                let may_clear = hal.with_world(|w| {
-                    w.session(HOST)
-                        .and_then(|s| s.windows.get(HOST, self.window).ok())
-                        .is_some_and(|w| w.lent_to == 0 && w.val.presentations == 0)
-                });
-                if may_clear {
-                    self.frame += 1;
-                    let mut cmd = CmdWriter::new(HOST);
-                    cmd.frame_begin(self.frame, FrameMeta::default());
-                    cmd.pass(Pass {
-                        viewport: [
-                            0.0,
-                            0.0,
-                            self.geometry[2] * self.dpi,
-                            self.geometry[3] * self.dpi,
-                        ],
-                        dpi: self.dpi,
-                        load: [pass_load::CLEAR; 5],
-                        clear: [self.color; 4],
-                        clear_depth: 1.0,
-                        ..Default::default()
-                    });
-                    cmd.frame_end(self.window, target::WINDOW);
-                    hal.submit(&cmd.buf());
-                }
-                self.dirty = false;
-            }
-            true
-        }
-    }
-
-    /// The default desktop theme's ground, or the launcher's literal theme ground.
-    fn background() -> [f32; 4] {
-        let sheet = std::env::var_os("MAKEPAD_WIDGET_STYLE_FILE")
-            .and_then(|p| std::fs::read(p).ok())
-            .and_then(|b| relax_compiler::json::parse(&b).ok())
-            .and_then(|j| {
-                j.get("makepad_style")?
-                    .get("theme")
-                    .map(|t| t.str().to_string())
-            })
-            .or_else(|| {
-                let name = std::env::var("MAKEPAD_WIDGET_STYLE").ok()?;
-                let path = format!(
-                    "{}/widgets/themes/{name}/theme.splash",
-                    relax_compiler::run::workspace_dir(),
-                );
-                relax_compiler::vfs::read_to_string(&path).ok()
-            });
-        sheet
-            .and_then(|s| {
-                s.lines().rev().find_map(|line| {
-                    let hex = line
-                        .trim()
-                        .strip_prefix("mod.theme.color_bg_app")?
-                        .trim_start()
-                        .strip_prefix('=')?
-                        .split("//")
-                        .next()?
-                        .trim()
-                        .strip_prefix('#')?;
-                    let hex = hex.strip_prefix('x').unwrap_or(hex);
-                    let n = u32::from_str_radix(hex, 16).ok()?;
-                    let rgba = match hex.len() {
-                        6 => (n << 8) | 255,
-                        8 => n,
-                        _ => return None,
-                    };
-                    Some([
-                        ((rgba >> 24) & 255) as f32 / 255.0,
-                        ((rgba >> 16) & 255) as f32 / 255.0,
-                        ((rgba >> 8) & 255) as f32 / 255.0,
-                        (rgba & 255) as f32 / 255.0,
-                    ])
-                })
-            })
-            .unwrap_or([0.3, 0.3, 0.3, 1.0])
     }
 }
