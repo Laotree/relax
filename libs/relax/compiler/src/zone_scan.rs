@@ -417,7 +417,7 @@ pub(crate) fn static_scan() {
 
 /// (module, load base, start, len) of every writable data range of the executable and, when
 /// Relax is a library, of libmakepad.
-#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+#[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
 fn data_regions() -> Vec<(String, usize, usize, usize)> {
     use crate::inspect::symbols::{dl_iterate_phdr, PhdrInfo};
     use std::ffi::CStr;
@@ -441,7 +441,7 @@ fn data_regions() -> Vec<(String, usize, usize, usize)> {
 }
 
 /// ELF64 program header.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[repr(C)]
 struct Phdr {
     kind: u32,
@@ -477,7 +477,7 @@ fn data_regions() -> Vec<(String, usize, usize, usize)> {
     out
 }
 
-#[cfg(not(any(all(target_os = "linux", target_pointer_width = "64"), target_os = "macos")))]
+#[cfg(not(any(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"), target_os = "macos")))]
 fn data_regions() -> Vec<(String, usize, usize, usize)> {
     Vec::new()
 }

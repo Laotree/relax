@@ -71,7 +71,7 @@ fn dladdr_name(pc: u64) -> Option<(String, u64)> {
 // ------------------------------------------------------------------ loaded images
 
 /// glibc's `struct dl_phdr_info` (the members used)
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[repr(C)]
 pub(crate) struct PhdrInfo {
     pub addr: u64,
@@ -80,7 +80,7 @@ pub(crate) struct PhdrInfo {
     pub phnum: u16,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 extern "C" {
     pub(crate) fn dl_iterate_phdr(cb: extern "C" fn(*const PhdrInfo, usize, *mut u8) -> i32, data: *mut u8) -> i32;
 }
