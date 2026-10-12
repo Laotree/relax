@@ -48,6 +48,9 @@ struct V<'a> {
     assignment: bool,
     in_union_destructure: bool,
     op_in_unsafe_fn_allowed: bool,
+    /// the end of the call expression being checked (0: none): a call a macro of another file
+    /// builds (`$func($args)`) starts at a call-site token but ends inside the expansion
+    call_hi: u32,
     unused_unsafe_allowed: bool,
     body_features: Vec<&'static str>,
     errors: Vec<String>,
@@ -70,6 +73,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
         prog, tcx, body, pf, ast, ctx,
         assignment: false, in_union_destructure: false,
         op_in_unsafe_fn_allowed: lint::level(prog, body.def, &lint::UNSAFE_OP_IN_UNSAFE_FN) == Level::Allow,
+        call_hi: 0,
         unused_unsafe_allowed: lint::level(prog, body.def, &lint::UNUSED_UNSAFE) == Level::Allow,
         body_features: sig.map_or(Vec::new(), |s| s.target_features.iter().map(|f| f.name).collect()),
         errors: Vec::new(), unused: Vec::new(),
@@ -141,7 +145,7 @@ impl V<'_> {
             Ctx::Block { ref mut used, .. } => *used = true,
             Ctx::UnsafeFn if self.op_in_unsafe_fn_allowed => {}
             Ctx::UnsafeFn => {
-                if self.deprecated_safe(op) || self.external(pos) { return; }
+                if self.deprecated_safe(op) || self.external(pos) || (self.call_hi > 0 && self.external(self.call_hi - 1)) { return; }
                 let msg = format!("E0133: {} is unsafe and requires unsafe block", self.what(op));
                 lint::emit(self.prog, self.body.def, &lint::UNSAFE_OP_IN_UNSAFE_FN, self.body.file, pos, &msg);
             }
@@ -318,11 +322,13 @@ impl V<'_> {
                 if !self.body.call_traits.contains_key(&e.0) {
                     let mut t = self.body.ty(f);
                     while let TyKind::Ref(_, p, _) = self.tcx.tys.kind(t) { t = *p; }
+                    self.call_hi = self.ast.expr(e).hi;
                     match *self.tcx.tys.kind(t) {
                         TyKind::FnDef(d, _, _) => self.call_def(lo, d),
                         TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe => self.requires_unsafe(lo, Op::CallToUnsafeFunction(None)),
                         _ => {}
                     }
+                    self.call_hi = 0;
                 }
                 self.expr(f);
                 self.exprs(args);

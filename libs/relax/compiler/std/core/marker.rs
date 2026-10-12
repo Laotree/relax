@@ -55,6 +55,19 @@ impl<T: PointeeSized> crate::hash::Hash for PhantomData<T> {
 }
 
 pub struct PhantomPinned;
+// core's #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)] (the ones bytemuck's
+// `unsafe impl Pod for PhantomPinned` needs: Pod: Copy)
+impl crate::clone::Clone for PhantomPinned {
+    fn clone(&self) -> PhantomPinned {
+        PhantomPinned
+    }
+}
+impl Copy for PhantomPinned {}
+impl crate::default::Default for PhantomPinned {
+    fn default() -> PhantomPinned {
+        PhantomPinned
+    }
+}
 
 #[cfg_attr(not(relax_check), lang = "tuple_trait")]
 pub trait Tuple {}
