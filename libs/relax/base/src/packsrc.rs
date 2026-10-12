@@ -179,7 +179,8 @@ fn package_of<'a>(rel: &str, pkgs: &'a BTreeSet<String>) -> Option<&'a str> {
 
 pub fn run(opts: Options) -> Result<(), String> {
     let root = workspace_root()?;
-    let root_s = root.to_string_lossy().trim_end_matches('/').to_string();
+    // the read log's spelling (vfs::normalize_path: `/` separators, no verbatim prefix, lowercase drive)
+    let root_s = crate::vfs::normalize_path(&root.to_string_lossy()).trim_end_matches('/').to_string();
     let work = PathBuf::from(format!("{}.pack-work", opts.out.display()));
     if work.exists() {
         std::fs::remove_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
@@ -187,7 +188,8 @@ pub fn run(opts: Options) -> Result<(), String> {
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
     let log = work.join("reads.log");
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let work_s = work.canonicalize().map_err(|e| e.to_string())?.to_string_lossy().into_owned();
+    let work_s = crate::vfs::normalize_path(&work.canonicalize().map_err(|e| e.to_string())?.to_string_lossy());
+    let work_plain = crate::vfs::normalize_path(&work.to_string_lossy());
     let t0 = std::time::Instant::now();
     for (pkg, flags) in &opts.packages {
         let out_log = work.join(format!("check-{pkg}.log"));
@@ -221,7 +223,7 @@ pub fn run(opts: Options) -> Result<(), String> {
     for line in reads.lines() {
         let Some((kind, path)) = line.split_once('\t') else { continue };
         // the child's own scratch folder (cache, build script outputs) is not a source
-        if path.starts_with(&format!("{work_s}/")) || path.starts_with(&format!("{}/", work.display())) {
+        if path.starts_with(&format!("{work_s}/")) || path.starts_with(&format!("{work_plain}/")) {
             continue;
         }
         let Some(rel) = path.strip_prefix(&format!("{root_s}/")).or_else(|| (path == root_s).then_some("")) else {
