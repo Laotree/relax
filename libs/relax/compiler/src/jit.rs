@@ -3739,8 +3739,8 @@ impl Unit {
     /// not load new libraries or manufacture missing-function stubs just to search for a name.
     pub(crate) fn loaded_foreign_addr(&self, d: DefId) -> Option<u64> {
         let link = self.link_name(d);
-        if link == "dlsym" {
-            return Some(relax_dlsym as *const () as usize as u64);
+        if let Some(a) = lookup_interposer(&link) {
+            return Some(a);
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
@@ -3757,9 +3757,9 @@ impl Unit {
     /// on a miss).
     pub fn foreign_addr(&self, d: DefId) -> Option<u64> {
         let link = self.link_name(d);
-        // dlsym answers the symbols the loader provides to programs (loader_symbol) first
-        if link == "dlsym" {
-            return Some(relax_dlsym as *const () as usize as u64);
+        // dlsym / GetProcAddress answer the symbols the loader provides to programs (loader_symbol) first
+        if let Some(a) = lookup_interposer(&link) {
+            return Some(a);
         }
         if let Some(a) = loader_symbol(link.as_bytes()) {
             return Some(a as u64);
@@ -11948,6 +11948,30 @@ pub extern "C" fn __relax_guard_leave(token: u64) {
 /// The unit the program runs in (run-time module loading, modules.rs).
 pub fn current_unit() -> *mut Unit {
     unsafe { UNIT }
+}
+
+/// The program's own symbol lookups (dlsym; Windows: GetProcAddress) go through the loader, which
+/// answers its loader symbols first: a program finds the loader's hooks with the platform's usual
+/// call, and a rustc build of it finds none.
+fn lookup_interposer(link: &str) -> Option<u64> {
+    match link {
+        "dlsym" => Some(relax_dlsym as *const () as usize as u64),
+        #[cfg(windows)]
+        "GetProcAddress" => Some(relax_get_proc_address as *const () as usize as u64),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+extern "system" fn relax_get_proc_address(module: os::win32::HANDLE, name: *const u8) -> *mut u8 {
+    // an ordinal (MAKEINTRESOURCE) is not a name
+    if name as usize > 0xffff {
+        let n = unsafe { std::ffi::CStr::from_ptr(name as *const std::ffi::c_char) }.to_bytes();
+        if let Some(a) = loader_symbol(n) {
+            return a as *mut u8;
+        }
+    }
+    unsafe { os::win32::GetProcAddress(module, name) }
 }
 
 extern "C" fn relax_dlsym(handle: *mut u8, name: *const u8) -> *mut u8 {
