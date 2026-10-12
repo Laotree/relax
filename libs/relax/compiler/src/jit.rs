@@ -2239,7 +2239,7 @@ impl Unit {
         // identity state below (the provided crates' shims, the slot table, the unit itself) is
         // built in the kept heap; the compile state (prog, tcx, layouts, front) stays as built
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
-        let (mut provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
+        let (provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let provided_shared = {
             let ks: Vec<u32> = provided.iter().map(|(k, _)| *k).collect();
