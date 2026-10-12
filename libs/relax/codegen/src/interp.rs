@@ -116,7 +116,6 @@ macro_rules! gsym {
     };
 }
 #[cfg(not(target_vendor = "apple"))]
-#[allow(unused_macros)] // only the aarch64 asm below uses it
 macro_rules! gsym {
     ($s:literal) => {
         $s
@@ -232,6 +231,24 @@ std::arch::global_asm!(
     "  ret",
     enter = sym relax_interp_enter,
     resume_target = sym resume_target,
+);
+
+// x86_64 has no interpreter glue (the threaded interpreter is aarch64-only); the symbols exist so
+// the shared code links; calling any of them traps (ud2).
+#[cfg(target_arch = "x86_64")]
+std::arch::global_asm!(
+    ".text",
+    concat!(".globl ", gsym!("relax_interp_pool")),
+    concat!(gsym!("relax_interp_pool"), ":"),
+    concat!(".globl ", gsym!("relax_interp_call")),
+    concat!(gsym!("relax_interp_call"), ":"),
+    concat!(".globl ", gsym!("relax_interp_call_ret")),
+    concat!(gsym!("relax_interp_call_ret"), ":"),
+    concat!(".globl ", gsym!("relax_interp_call_land")),
+    concat!(gsym!("relax_interp_call_land"), ":"),
+    concat!(".globl ", gsym!("relax_interp_tls")),
+    concat!(gsym!("relax_interp_tls"), ":"),
+    "  ud2",
 );
 
 extern "C" {
