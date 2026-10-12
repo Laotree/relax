@@ -89,14 +89,14 @@ fn scalar_select_bits_and_aliases() {
                                         let (x, y) = if swap_cmp { (b, a) } else { (a, b) };
                                         let take = compare(cc, x, y) != swap_select;
                                         if w {
-                                            let run: extern "C" fn(f64, f64, i64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
+                                            let run: extern "sysv64" fn(f64, f64, i64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
                                             assert_eq!(
                                                 run(a, b, 7).to_bits(),
                                                 (if take { a } else { b }).to_bits(),
                                                 "{cc:?} {swap_cmp} {swap_select} {shared} {alias} {regs}"
                                             );
                                         } else {
-                                            let run: extern "C" fn(f32, f32, i64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
+                                            let run: extern "sysv64" fn(f32, f32, i64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
                                             assert_eq!(
                                                 run(a as f32, b as f32, 7).to_bits(),
                                                 (if take { a as f32 } else { b as f32 }).to_bits(),
@@ -128,10 +128,10 @@ fn generic_and_integer_compare_selects() {
                             _ => flag != 0,
                         };
                         if w {
-                            let run: extern "C" fn(f64, f64, i64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
+                            let run: extern "sysv64" fn(f64, f64, i64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
                             assert_eq!(run(-0.0, f64::NAN, flag).to_bits(), (if take { -0.0f64 } else { f64::NAN }).to_bits());
                         } else {
-                            let run: extern "C" fn(f32, f32, i64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
+                            let run: extern "sysv64" fn(f32, f32, i64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
                             assert_eq!(run(-0.0, f32::NAN, flag).to_bits(), (if take { -0.0f32 } else { f32::NAN }).to_bits());
                         }
                     }
@@ -173,7 +173,7 @@ fn unrelated_float_compare_and_redefined_input() {
             };
             let compiled = x64::compile(&relax_session::Options::default(), &f, &env).unwrap();
             let code = Code::new(&compiled.code).unwrap();
-            let run: extern "C" fn(f64, f64, f64, f64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
+            let run: extern "sysv64" fn(f64, f64, f64, f64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
             for x in [0.0, -0.0, 1.0, f64::NAN] {
                 for y in [0.0, -1.0, 1.0, f64::NAN] {
                     let expected = if redefine {
@@ -221,7 +221,7 @@ fn f64_compare_selects_f32() {
     };
     let compiled = x64::compile(&relax_session::Options::default(), &f, &env).unwrap();
     let code = Code::new(&compiled.code).unwrap();
-    let run: extern "C" fn(f32, f32, f64, f64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
+    let run: extern "sysv64" fn(f32, f32, f64, f64) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
     for (x, y) in [(2.0, 1.0), (1.0, 2.0), (f64::NAN, 0.0), (0.0, f64::NAN), (0.0, -0.0)] {
         assert_eq!(run(-0.0, f32::NAN, x, y).to_bits(), (if x > y { -0.0f32 } else { f32::NAN }).to_bits());
     }

@@ -51,7 +51,7 @@ fn branch_at_block_start_compares_again() {
     let c = x64::compile(&relax_session::Options::default(), &f, &env).unwrap();
     assert!(c.relocs.is_empty());
     let code = relax_codegen::exec::Code::new(&c.code).unwrap();
-    let run: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+    let run: extern "sysv64" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
     // the None path: v == 0 must take the branch whatever the flags it jumped in with
     assert_eq!(run(5, 0), 111);
     assert_eq!(run(5, 1), 17);

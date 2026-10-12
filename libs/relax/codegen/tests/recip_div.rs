@@ -69,7 +69,7 @@ fn f32_power_of_two_divisors() {
         let (f, divides) = build(false, c.to_bits() as u64);
         assert_eq!(!divides, folds, "f32 {c:e}");
         let code = run(&f);
-        let go: extern "C" fn(f32) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
+        let go: extern "sysv64" fn(f32) -> f32 = unsafe { std::mem::transmute(code.ptr()) };
         let mut xs: Vec<f32> = vec![0.0, -0.0, 1.0, -1.0, 3.0, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, f32::MIN, f32::MIN_POSITIVE, f32::from_bits(1), f32::from_bits(3), f32::from_bits(0x007fffff), f32::from_bits(0x00800001), f32::from_bits(0x7f7fffff)];
         for _ in 0..4000 {
             xs.push(f32::from_bits(next(&mut s) as u32));
@@ -107,7 +107,7 @@ fn f64_power_of_two_divisors() {
         let (f, divides) = build(true, c.to_bits());
         assert_eq!(!divides, folds, "f64 {c:e}");
         let code = run(&f);
-        let go: extern "C" fn(f64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
+        let go: extern "sysv64" fn(f64) -> f64 = unsafe { std::mem::transmute(code.ptr()) };
         let mut xs: Vec<f64> = vec![0.0, -0.0, 1.0, -1.0, 3.0, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, f64::MIN, f64::MIN_POSITIVE, f64::from_bits(1), f64::from_bits(3), f64::from_bits(0x000fffffffffffff), f64::from_bits(0x0010000000000001)];
         for _ in 0..4000 {
             xs.push(f64::from_bits(next(&mut s)));

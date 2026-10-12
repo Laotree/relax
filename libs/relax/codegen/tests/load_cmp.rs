@@ -72,7 +72,7 @@ fn load_compare_branches_as_the_extended_value() {
                         let f = cmp_fn(sz, sx, cond, signed, k);
                         let c = x64::compile(&relax_session::Options::default(), &f, &env).unwrap();
                         let code = relax_codegen::exec::Code::new(&c.code).unwrap();
-                        let run: extern "C" fn(*const u8) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+                        let run: extern "sysv64" fn(*const u8) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
                         for &v in &vals {
                             let mut buf = [0xa5u8; 16];
                             buf[8..16].copy_from_slice(&v.to_le_bytes());
@@ -113,7 +113,7 @@ fn branch_on_a_loaded_value_tests_its_bytes() {
         for sx in [false, true] {
             let c = x64::compile(&relax_session::Options::default(), &branch_fn(sz, sx), &env).unwrap();
             let code = relax_codegen::exec::Code::new(&c.code).unwrap();
-            let run: extern "C" fn(*const u8) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+            let run: extern "sysv64" fn(*const u8) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
             for v in [0u64, 1, 0x80, 0x100, 0x1_0000, 0x1_0000_0000, u64::MAX] {
                 let mut buf = [0u8; 16];
                 buf[8..16].copy_from_slice(&v.to_le_bytes());

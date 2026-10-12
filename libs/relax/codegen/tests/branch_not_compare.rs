@@ -88,10 +88,10 @@ fn negated_compare_branches_on_the_flags() {
                                 let taken_b1 = if negated { !cmp } else { cmp } == order;
                                 let want: u64 = if taken_b1 { 11 } else { 22 };
                                 let got = if w {
-                                    let run: extern "C" fn(f64, f64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+                                    let run: extern "sysv64" fn(f64, f64) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
                                     run(a, b)
                                 } else {
-                                    let run: extern "C" fn(f32, f32) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
+                                    let run: extern "sysv64" fn(f32, f32) -> u64 = unsafe { std::mem::transmute(code.ptr()) };
                                     run(a as f32, b as f32)
                                 };
                                 assert_eq!(got, want, "w={w} {cc:?} form={form} order={order} regs={regs} a={a} b={b}");

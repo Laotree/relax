@@ -555,7 +555,23 @@ pub fn process_rss() -> (u64, u64, String) {
         );
         (buf[2], buf[3], extra)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
+    #[cfg(windows)]
+    {
+        // PROCESS_MEMORY_COUNTERS_EX (80 bytes): cb + PageFaultCount (u32 each), PeakWorkingSetSize,
+        // WorkingSetSize, 4 quota sizes, PagefileUsage, PeakPagefileUsage, PrivateUsage
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(process: isize, counters: *mut usize, cb: u32) -> i32;
+        }
+        let mut c = [0usize; 10];
+        c[0] = std::mem::size_of_val(&c);
+        if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), c.as_mut_ptr(), std::mem::size_of_val(&c) as u32) } == 0 {
+            return (0, 0, String::new());
+        }
+        (c[2] as u64, c[1] as u64, format!("private {} MB", c[9] / (1024 * 1024)))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android", windows)))]
     {
         (0, 0, String::new())
     }
