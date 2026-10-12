@@ -97,6 +97,14 @@ pub struct IFunc {
     /// offset of the buffer it is rebuilt in; the result buffer (register-returned aggregate)
     pub cplan: Option<(Box<CSig>, cabi::Plan, Vec<u32>, u32)>,
     pub name: String,
+    /// the frame's alignment in bytes (64, or a stack slot's larger alignment)
+    pub align: usize,
+}
+
+/// `p` rounded up to `align` bytes (a power of two).
+#[inline(always)]
+fn align_frame(p: *mut u64, align: usize) -> *mut u64 {
+    ((p as usize + align - 1) & !(align - 1)) as *mut u64
 }
 
 // ---------------------------------------------------------------- precompiled glue
@@ -340,10 +348,18 @@ struct Sel {
     skip: Vec<String>,
 }
 
+/// `MAKEPAD_RUN_NO_CODEGEN=1`: the process makes no machine code at all (the platforms without
+/// writable+executable memory): every function runs in the interpreter, and a function the
+/// interpreter cannot run is an error, not a JIT fallback.
+pub fn no_codegen() -> bool {
+    static N: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var_os("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0"))
+}
+
 fn selection() -> Option<&'static Sel> {
     static S: std::sync::OnceLock<Option<Sel>> = std::sync::OnceLock::new();
     S.get_or_init(|| {
-        let v = std::env::var("MAKEPAD_RUN_INTERP").ok().filter(|v| !v.is_empty() && v != "0")?;
+        let v = if no_codegen() { "all".to_string() } else { std::env::var("MAKEPAD_RUN_INTERP").ok().filter(|v| !v.is_empty() && v != "0")? };
         let split = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
         let skip = std::env::var("MAKEPAD_RUN_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
         if std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
@@ -355,6 +371,10 @@ fn selection() -> Option<&'static Sel> {
             }
         }
         TRACE.store(std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some(), Ordering::Relaxed);
+        if std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some() || std::env::var_os("MAKEPAD_RUN_INTERP_POOL").is_some() {
+            // (to symbolize native pcs: nm's address of relax_interp_pool + the slide)
+            eprintln!("interp: relax_interp_pool at {:#x}", pool_base());
+        }
         Some(Sel { all: v == "all", pats: if v == "all" { Vec::new() } else { split(&v) }, skip })
     })
     .as_ref()
@@ -381,12 +401,18 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
     let ifunc = match lowered {
         Ok(x) => x,
         Err(why) => {
+            if no_codegen() {
+                panic!("makepad run: no-codegen mode: `{}` cannot run in the interpreter ({})", f.name, why);
+            }
             refuse(why);
             return None;
         }
     };
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
     if k >= POOL {
+        if no_codegen() {
+            panic!("makepad run: no-codegen mode: more than {} interpreted functions (the entry thunk pool)", POOL);
+        }
         refuse("entry thunk pool exhausted");
         return None;
     }
@@ -453,7 +479,8 @@ unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8
     if TRACE.load(Ordering::Relaxed) {
         eprintln!("interp: enter {} {} top {:p} regs {:x?}", k, f.name, (*cx).top, std::slice::from_raw_parts(regs, 4));
     }
-    let fp = (*cx).top;
+    let saved_top = (*cx).top;
+    let fp = align_frame(saved_top, f.align);
     let top = fp.add(f.frame_words);
     if top > (*cx).limit {
         overflow();
@@ -536,7 +563,7 @@ unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8
     }
     if (*cx).unwinding != 0 {
         (*cx).unwinding = 0;
-        (*cx).top = fp;
+        (*cx).top = saved_top;
         return 1;
     }
     let r = &(*cx).ret;
@@ -565,7 +592,7 @@ unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8
             }
         }
     }
-    (*cx).top = fp;
+    (*cx).top = saved_top;
     0
 }
 
@@ -582,6 +609,9 @@ macro_rules! next {
         return h(p, $fp, $cx);
     }};
 }
+
+#[cfg(target_arch = "aarch64")]
+mod vx;
 
 /// Cell `k` (0..4) of an operand word.
 #[inline(always)]
@@ -1262,9 +1292,91 @@ unsafe extern "C" fn h_sel16(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
 #[inline(always)]
 unsafe fn tls_block(cx: *mut Cx) -> u64 {
     if (*cx).tls_block == 0 {
-        (*cx).tls_block = relax_interp_tls(TLS_GLUE.load(Ordering::Relaxed));
+        tls_block_first(cx);
     }
     (*cx).tls_block
+}
+
+/// The thread's first ask (out of line: the handlers that inline `tls_block` keep no frame, so
+/// their dispatch stays a tail jump).
+#[cold]
+#[inline(never)]
+unsafe fn tls_block_first(cx: *mut Cx) {
+    let glue = TLS_GLUE.load(Ordering::Relaxed);
+    (*cx).tls_block = if glue != 0 {
+        relax_interp_tls(glue)
+    } else {
+        let f = TLS_FN.load(Ordering::Acquire);
+        assert!(f != 0, "makepad run interp: no thread-local block source");
+        let f: extern "C" fn() -> u64 = std::mem::transmute(f);
+        f()
+    };
+}
+
+static TLS_FN: AtomicUsize = AtomicUsize::new(0);
+/// No-codegen mode has no `tls_slow` glue: the interpreter asks the runtime for the thread's
+/// block through this function.
+pub fn set_tls_fn(f: extern "C" fn() -> u64) {
+    TLS_FN.store(f as usize, Ordering::Release);
+}
+
+/// The runtime's precompiled slot thunks (no-codegen mode): thunk k at `base + stride * k`
+/// loads slot k's table word at `table + 8 * k`.
+static STATIC_THUNKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+pub fn set_static_thunks(base: u64, stride: u64, count: u64, table: u64) {
+    STATIC_THUNKS[1].store(stride, Ordering::Relaxed);
+    STATIC_THUNKS[2].store(count, Ordering::Relaxed);
+    STATIC_THUNKS[3].store(table, Ordering::Relaxed);
+    STATIC_THUNKS[0].store(base, Ordering::Release);
+}
+
+/// `jump_to(target)` code (a foreign function's veneer, an interpreted function's slot code):
+/// its target. No-codegen mode installs the target in the slot instead of the code.
+pub fn redirect_target(code: &[u8]) -> Option<u64> {
+    if code.len() != 20 {
+        return None;
+    }
+    let w: Vec<u32> = code.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+    if w[0] & 0xFFE0_001F != 0xD280_0010 || w[4] != 0xD61F_0200 {
+        return None;
+    }
+    let mut v = ((w[0] >> 5) & 0xffff) as u64;
+    for k in 1..4 {
+        if w[k] & 0xFFE0_001F != (0xF280_0010 | (k as u32) << 21) {
+            return None;
+        }
+        v |= (((w[k] >> 5) & 0xffff) as u64) << (16 * k);
+    }
+    Some(v)
+}
+
+/// An interpreted stub that calls `target` (a runtime entry such as a panic site) with x0 =
+/// `arg0` and the caller's other arguments: no-codegen mode's form of `jump_with_arg0`. Returns
+/// its entry (a pool thunk).
+pub fn const_call_entry(target: u64, arg0: u64) -> u64 {
+    let code = vec![h_const_call as *const () as usize as u64, target, arg0, h_ret0 as *const () as usize as u64].into_boxed_slice();
+    let k = NEXT.fetch_add(1, Ordering::Relaxed);
+    assert!(k < POOL, "makepad run interp: entry thunk pool exhausted");
+    let f = IFunc { code, frame_words: 8, params: Vec::new(), cplan: None, name: format!("const_call {:#x}", target), align: 64 };
+    FUNCS[k].store(Box::into_raw(Box::new(f)), Ordering::Release);
+    pool_base() + 8 * k as u64
+}
+
+/// [h, target, arg0]: calls target with x0 = arg0 (it does not return: a panic site)
+unsafe extern "C" fn h_const_call(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
+    if const_call(*pc.add(1), *pc.add(2)) {
+        (*cx).unwinding = 1;
+        return;
+    }
+    next!(pc.add(3), fp, cx)
+}
+
+/// (out of line: its register buffer would otherwise keep h_const_call from tail-jumping)
+#[inline(never)]
+unsafe fn const_call(target: u64, arg0: u64) -> bool {
+    let mut regs = [0u64; RB_WORDS];
+    regs[0] = arg0;
+    relax_interp_call(target, regs.as_mut_ptr(), std::ptr::null(), 0) != 0
 }
 /// d = this thread's domain static block + value. [h, d, value]
 unsafe extern "C" fn h_dom_addr(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
@@ -1428,6 +1540,42 @@ unsafe fn vput(p: *mut u64, v: [u32; 4]) {
 fn fl(x: u32) -> f32 {
     f32::from_bits(x)
 }
+/// NEON fmin / fmax (the backend's instructions for FMinNeon / FMaxNeon)
+#[inline(always)]
+fn fmin_neon(a: f32, b: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        vgetq_lane_f32::<0>(vminq_f32(vdupq_n_f32(a), vdupq_n_f32(b)))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    nan_min(a, b, false)
+}
+#[inline(always)]
+fn fmax_neon(a: f32, b: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use core::arch::aarch64::*;
+        vgetq_lane_f32::<0>(vmaxq_f32(vdupq_n_f32(a), vdupq_n_f32(b)))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    nan_min(a, b, true)
+}
+/// SSE's NaN result (arm64.rs `intel_nan`): a NaN result is the negative default NaN, unless an
+/// input is NaN: then the first NaN input, quieted.
+#[inline(always)]
+fn intel_nan(r: u32, a: u32, b: u32) -> u32 {
+    let nan = |x: u32| f32::from_bits(x).is_nan();
+    let mut r = if nan(r) { 0xffc0_0000 } else { r };
+    if nan(b) {
+        r = b | 0x0040_0000;
+    }
+    if nan(a) {
+        r = a | 0x0040_0000;
+    }
+    r
+}
+#[allow(dead_code)]
 #[inline(always)]
 fn nan_min(a: f32, b: f32, max: bool) -> f32 {
     if a.is_nan() || b.is_nan() {
@@ -1457,8 +1605,12 @@ unsafe extern "C" fn h_vbin(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
             1 => (fl(x) - fl(y)).to_bits(),
             2 => (fl(x) * fl(y)).to_bits(),
             3 => (fl(x) / fl(y)).to_bits(),
-            4 => nan_min(fl(x), fl(y), false).to_bits(),
-            5 => nan_min(fl(x), fl(y), true).to_bits(),
+            4 => fmin_neon(fl(x), fl(y)).to_bits(),
+            5 => fmax_neon(fl(x), fl(y)).to_bits(),
+            21 => intel_nan((fl(x) + fl(y)).to_bits(), x, y),
+            22 => intel_nan((fl(x) - fl(y)).to_bits(), x, y),
+            23 => intel_nan((fl(x) * fl(y)).to_bits(), x, y),
+            24 => intel_nan((fl(x) / fl(y)).to_bits(), x, y),
             6 => if fl(x) < fl(y) { x } else { y },
             7 => if fl(x) > fl(y) { x } else { y },
             8 => x.wrapping_add(y),
@@ -1481,10 +1633,14 @@ unsafe extern "C" fn h_vbin(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
 }
 fn vop_code(op: VOp) -> u64 {
     match op {
-        VOp::FAdd | VOp::FAddIntel | VOp::FAddNeon => 0,
-        VOp::FSub | VOp::FSubIntel | VOp::FSubNeon => 1,
-        VOp::FMul | VOp::FMulIntel | VOp::FMulNeon => 2,
-        VOp::FDiv | VOp::FDivIntel | VOp::FDivNeon => 3,
+        VOp::FAdd | VOp::FAddNeon => 0,
+        VOp::FSub | VOp::FSubNeon => 1,
+        VOp::FMul | VOp::FMulNeon => 2,
+        VOp::FDiv | VOp::FDivNeon => 3,
+        VOp::FAddIntel => 21,
+        VOp::FSubIntel => 22,
+        VOp::FMulIntel => 23,
+        VOp::FDivIntel => 24,
         VOp::FMinNeon => 4,
         VOp::FMaxNeon => 5,
         VOp::FMinLt => 6,
@@ -1516,6 +1672,7 @@ unsafe extern "C" fn h_vun(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
             0 => (-fl(x)).to_bits(),
             1 => fl(x).abs().to_bits(),
             2 => fl(x).sqrt().to_bits(),
+            11 => intel_nan(fl(x).sqrt().to_bits(), x, x),
             3 => fl(x).floor().to_bits(),
             4 => fl(x).ceil().to_bits(),
             5 => fl(x).trunc().to_bits(),
@@ -1532,7 +1689,8 @@ fn vun_code(op: VUn) -> u64 {
     match op {
         VUn::FNeg => 0,
         VUn::FAbs => 1,
-        VUn::FSqrt | VUn::FSqrtIntel | VUn::FSqrtNeon => 2,
+        VUn::FSqrt | VUn::FSqrtNeon => 2,
+        VUn::FSqrtIntel => 11,
         VUn::FFloor => 3,
         VUn::FCeil => 4,
         VUn::FTrunc => 5,
@@ -1722,9 +1880,18 @@ struct CallDesc {
 /// (the slot's code), or a slot thunk whose table word is one of those.
 unsafe fn decode(mut a: u64) -> *const IFunc {
     let pool = pool_base();
+    let sbase = STATIC_THUNKS[0].load(Ordering::Acquire);
     for _ in 0..3 {
         if a >= pool && a < pool + 8 * POOL as u64 {
             return FUNCS[((a - pool) / 8) as usize].load(Ordering::Acquire);
+        }
+        if sbase != 0 {
+            let stride = STATIC_THUNKS[1].load(Ordering::Relaxed);
+            if a >= sbase && a < sbase + stride * STATIC_THUNKS[2].load(Ordering::Relaxed) {
+                // a precompiled slot thunk: its slot's table word
+                a = *((STATIC_THUNKS[3].load(Ordering::Relaxed) + 8 * ((a - sbase) / stride)) as *const u64);
+                continue;
+            }
         }
         if a == 0 || a & 3 != 0 {
             return std::ptr::null();
@@ -1807,6 +1974,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
                 (*cx).n[1] += 1;
             }
             let f = &*f;
+            let fp2 = align_frame(fp2, f.align);
             let top = fp2.add(f.frame_words);
             if top > (*cx).limit {
                 overflow();
@@ -2079,11 +2247,13 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         return Err("more than 65535 frame cells");
     }
     let mut bytes = (n as u64 * 8 + 15) & !15;
+    let mut align = 64usize;
     let mut slot_off = Vec::with_capacity(f.slots.len());
     for s in &f.slots {
-        if s.align > 64 {
-            return Err("stack slot aligned beyond 64 bytes");
+        if s.align > 1 << 16 {
+            return Err("stack slot aligned beyond 64 KB");
         }
+        align = align.max(s.align as usize);
         let a = s.align.max(1) as u64;
         bytes = (bytes + a - 1) / a * a;
         slot_off.push(bytes as u32);
@@ -2336,7 +2506,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         code[at] = base + 8 * block_at[b as usize] as u64;
     }
     let params = f.params.iter().map(|p| (l.cell[p.0 as usize], f.vregs[p.0 as usize])).collect();
-    Ok(IFunc { code, frame_words, params, cplan, name: f.name.clone() })
+    Ok(IFunc { code, frame_words, params, cplan, name: f.name.clone(), align })
 }
 
 fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &dyn Fn(Sym) -> u64) -> Result<(), &'static str> {
@@ -2614,6 +2784,17 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
             let w = l.w3(*d, *base, *idx);
             l.emit(h_vgather, &[w]);
         }
+        #[cfg(target_arch = "aarch64")]
+        Inst::VX(op, d, a, b) => {
+            let w = l.w3(*d, *a, *b);
+            l.emit(vx::handlers().0, &[w, Box::into_raw(Box::new(*op)) as u64]);
+        }
+        #[cfg(target_arch = "aarch64")]
+        Inst::VX3(op, d, a, b, c) => {
+            let w = l.w4(*d, *a, *b, *c);
+            l.emit(vx::handlers().1, &[w, Box::into_raw(Box::new(*op)) as u64]);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
         Inst::VX(..) | Inst::VX3(..) => return Err("lane-typed vector op"),
     }
     Ok(())

@@ -321,6 +321,25 @@ pub static TO_REMOVE: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, target_dir: &str) -> Result<(), String> {
     let results: Mutex<Vec<(usize, Result<String, String>, String)>> = Mutex::new(Vec::new());
+    // no-codegen mode (the platforms that run no generated code, iOS): no build script runs.
+    // makepad-platform's is answered by makepad run itself (`platform_answer`); any other crate
+    // with a build script is an error.
+    if sess.options.no_codegen {
+        for bs in &g.build_scripts {
+            let (_, pname, _) = &g.pkg[bs.krate];
+            if pname != "makepad-platform" {
+                return Err(format!("build scripts are not supported in no-codegen mode: {} ({})", pname, bs.src_path));
+            }
+        }
+        for bs in &g.build_scripts {
+            let name = g.crates[bs.krate].name.clone();
+            let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
+            std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
+            let lines = platform_answer(sess, bs, &out_dir)?;
+            results.lock().unwrap().push((bs.krate, Ok(lines.join("\n")), out_dir));
+        }
+        return apply_script_results(g, results.into_inner().unwrap());
+    }
     std::thread::scope(|s| {
         for bs in &g.build_scripts {
             let results = &results;
@@ -356,7 +375,12 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             });
         }
     });
-    for (k, r, out_dir) in results.into_inner().unwrap() {
+    apply_script_results(g, results.into_inner().unwrap())
+}
+
+/// The scripts' `cargo:` lines into the graph: cfgs, link libraries, env (OUT_DIR included).
+fn apply_script_results(g: &mut Graph, results: Vec<(usize, Result<String, String>, String)>) -> Result<(), String> {
+    for (k, r, out_dir) in results {
         let stdout = r?;
         g.env[k].push(("OUT_DIR".to_string(), out_dir));
         for line in stdout.lines() {
@@ -822,3 +846,87 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
 }
 
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What makepad-platform's build.rs (platform/build.rs) gives the build, as makepad run knows it,
+/// for no-codegen mode, where the script does not run: its cfgs (`hal` on macOS or with
+/// `--cfg hal`; `use_vulkan`, `apple_sim`, `use_gles_3` from the target; the backend words of the
+/// MAKEPAD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
+/// identifier, from the folder that holds the target folder) and app_icon_gen.rs (the icons in
+/// that folder's resources/). Its link lines are the host binary's: in this mode nothing is
+/// linked at run time. Its side files (makepad-platform.path, a target-folder Info.plist) are for
+/// cargo runs only.
+fn platform_answer(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, out_dir: &str) -> Result<Vec<String>, String> {
+    let env: Vec<(String, String)> = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
+    let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+    let target_os = get("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = get("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_arch = get("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target = target_triple(sess);
+    let makepad: Vec<String> = std::env::var("MAKEPAD").map(|c| c.split(['+', ',']).map(str::to_string).collect()).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut cfg = |c: &str| lines.push(format!("cargo:rustc-cfg={}", c));
+    let hal = target_os == "macos" || get("CARGO_CFG_HAL").is_some();
+    if hal {
+        cfg("hal");
+    }
+    let names_gpu_api = hal || makepad.iter().any(|c| matches!(c.as_str(), "gl" | "vulkan" | "use_vulkan" | "gpusim" | "quest"));
+    let windowed_desktop_linux = target_os == "linux" && target_env == "gnu" && matches!(target_arch.as_str(), "x86_64" | "aarch64") && !makepad.iter().any(|c| c == "linux_direct");
+    if windowed_desktop_linux && bs.features.iter().any(|f| f == "vulkan") && !names_gpu_api {
+        cfg("use_vulkan");
+    }
+    for c in &makepad {
+        match c.as_str() {
+            "lines" | "linux_direct" | "no_android_choreographer" | "apple_bundle" | "ohos_sim" | "gpusim" | "use_gles_3" => cfg(c),
+            "quest" => {
+                cfg("quest");
+                cfg("use_gles_3");
+                cfg("use_vulkan");
+            }
+            "vulkan" | "use_vulkan" => cfg("use_vulkan"),
+            _ => {}
+        }
+    }
+    match target_os.as_str() {
+        "ios" if target == "aarch64-apple-ios-sim" => cfg("apple_sim"),
+        "tvos" if target == "aarch64-apple-tvos-sim" => cfg("apple_sim"),
+        "linux" | "android" => cfg("use_gles_3"),
+        _ => {}
+    }
+    // app_meta_gen.rs: the folder that holds the target folder names the app (detect_app_name)
+    let root = std::path::Path::new(out_dir).ancestors().nth(5).map(|p| p.to_path_buf());
+    let bundle_name = root
+        .as_ref()
+        .and_then(|r| r.file_name())
+        .and_then(|n| n.to_str())
+        .filter(|n| !n.is_empty())
+        .map(|n| {
+            let mut c = n.chars();
+            let first = c.next().unwrap();
+            first.to_uppercase().collect::<String>() + c.as_str()
+        })
+        .unwrap_or_else(|| "Makepad App".to_string());
+    let bundle_id = format!("dev.makepad.{}", bundle_name.to_lowercase().replace(' ', "-"));
+    let meta = format!(
+        "/// The bundle name when the app's build sets no MAKEPAD_BUNDLE_NAME.\npub const DEFAULT_BUNDLE_NAME: &str = {:?};\n/// The identifier that goes with [`DEFAULT_BUNDLE_NAME`].\npub const DEFAULT_BUNDLE_IDENTIFIER: &str = {:?};\n",
+        bundle_name, bundle_id
+    );
+    // app_icon_gen.rs: the icons in <root>/resources
+    let icons = [("icon_32.png", "CUSTOM_ICON_PNG_32"), ("icon_64.png", "CUSTOM_ICON_PNG_64"), ("icon_128.png", "CUSTOM_ICON_PNG_128"), ("icon_256.png", "CUSTOM_ICON_PNG_256"), ("icon_512.png", "CUSTOM_ICON_PNG_512"), ("icon_1024.png", "CUSTOM_ICON_PNG_1024"), ("icon.ico", "CUSTOM_ICON_ICO")];
+    let mut icon_gen = String::new();
+    for (file, name) in icons {
+        let p = root.as_ref().map(|r| r.join("resources").join(file)).filter(|p| p.is_file());
+        let value = match p {
+            Some(p) => format!("include_bytes!(r#\"{}\"#)", p.to_string_lossy()),
+            None => "&[]".to_string(),
+        };
+        icon_gen.push_str(&format!("#[allow(dead_code)] pub static {}: &'static [u8] = {};\n", name, value));
+    }
+    for (f, text) in [("app_meta_gen.rs", meta), ("app_icon_gen.rs", icon_gen)] {
+        let path = format!("{}/{}", out_dir, f);
+        // unchanged files stay as they are (their stamps decide what is reparsed)
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            std::fs::write(&path, text).map_err(|e| format!("{}: {}", path, e))?;
+        }
+    }
+    Ok(lines)
+}

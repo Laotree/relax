@@ -20,8 +20,15 @@ for line in dis.splitlines():
         parts = line.split("\t")
         if len(parts) > 1:
             fns[cur].append(parts[1].strip() if sys.platform == "darwin" else parts[-1].split()[0] if parts[-1].split() else "")
-hs = {n: o for n, o in fns.items() if re.search(r"6interp\d+h_", n)}
-bad = [n for n, o in hs.items() if "blr" in o or not re.search(r"h_ret|h_trap|h_resume", n) and "br" not in o]
+hs = {n: o for n, o in fns.items() if re.search(r"6interp(\d+vx)?\d+h_", n)}
+# a handler that does not end the chain must reach the next one with `br`; one that also
+# calls something (`bl` / `blr`, a frame) must still not dispatch by call: no `blr` to the next
+# handler is visible statically, so require the tail `br` and no `ret` outside the known exits
+bad = [n for n, o in hs.items() if not re.search(r"h_ret|h_trap|h_resume|h_call$|h_const_call$", n) and ("br" not in o or "ret" in o)]
+bad += [n for n, o in hs.items() if re.search(r"h_call$|h_const_call$", n) and "br" not in o]
+# no handler calls through a register: that is how a lost tail dispatch looks (`blr` to the next
+# handler); out-of-line helpers are called with `bl`
+bad += [n for n, o in hs.items() if "blr" in o and n not in bad]
 sizes = sorted(len(o) for o in hs.values())
 print("%d handlers, median %d instructions; not tail-calling: %s" % (len(hs), sizes[len(sizes) // 2] if sizes else 0, bad or "none"))
 sys.exit(1 if bad or not hs else 0)

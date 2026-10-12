@@ -2205,6 +2205,32 @@ impl Unit {
         // host / C symbols are outside it. The function slots (thunks, stubs, table words,
         // tier records) are in segments of their own, reserved as ids reach them: code calls
         // through full 64-bit addresses.
+        // no-codegen mode: nothing below maps executable memory or writes code (os::mem refuses)
+        let no_codegen = options.no_codegen;
+        if no_codegen {
+            if !cfg!(all(target_arch = "aarch64", target_vendor = "apple")) {
+                panic!("makepad run: MAKEPAD_RUN_NO_CODEGEN is supported on arm64 Apple targets only");
+            }
+            os::mem::set_no_codegen();
+        }
+        // at exit: no executable memory that no image backs (anything that generated code);
+        // MAKEPAD_RUN_EXEC_CHECK=1 runs the same check in JIT mode (where it must find the JIT)
+        if no_codegen || std::env::var_os("MAKEPAD_RUN_EXEC_CHECK").is_some() {
+            EXEC_CHECK.store(true, Ordering::Relaxed);
+            #[cfg(target_os = "macos")]
+            {
+                extern "C" fn at_exit_check() {
+                    exec_check();
+                }
+                extern "C" {
+                    fn atexit(f: extern "C" fn()) -> i32;
+                }
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| unsafe {
+                    atexit(at_exit_check);
+                });
+            }
+        }
         let exec_size: u64 = 768 << 20;
         let data_size: u64 = UNIT_DATA_SIZE;
         let rw_size: u64 = UNIT_RW_SIZE;
@@ -2252,7 +2278,23 @@ impl Unit {
             }
         };
         let provided_shared = crate::zone_alloc::kept_clone(&provided_shared);
-        let slots = crate::zone_alloc::kept_with(|| Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64)));
+        let slots = crate::zone_alloc::kept_with(|| {
+            if no_codegen {
+                Box::new(crate::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
+            } else {
+                Box::new(crate::rir::SlotTable::new(THUNK_SIZE as u64, STUB_SIZE as u64, 8, TIER_REC as u64))
+            }
+        });
+        // no-codegen: segment 0 is the precompiled thunk and stub pools and the static table
+        // (no further segments)
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+        if no_codegen {
+            let g = static_glue::glue();
+            let tier = os::mem::alloc_rw(static_glue::SLOTS * TIER_REC);
+            slots.install(0, g.thunks, g.stubs, g.table, tier);
+            relax_codegen::interp::set_static_thunks(g.thunks, NC_STRIDE as u64, static_glue::SLOTS as u64, g.table);
+            relax_codegen::interp::set_tls_fn(static_glue::tls_block_c);
+        }
         let slots_ptr = crate::rir::SlotsPtr(&*slots);
         let unit = Unit {
             prog,
@@ -2335,13 +2377,24 @@ impl Unit {
             self_ptr: UnitPtr(std::ptr::null_mut()),
         };
         let mut u = crate::zone_alloc::kept_with(|| Box::new(unit));
-        let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
-        u.lazy_entry = u.emit_code(&lazy);
-        let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
-        u.hot_entry = u.emit_code(&hot);
-        let (el, leave_off) = x64::enter_leave();
-        u.enter = u.emit_code(&el);
-        u.leave = u.enter + leave_off as u64;
+        if no_codegen {
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            {
+                let g = static_glue::glue();
+                u.lazy_entry = g.lazy_entry;
+                u.hot_entry = g.hot_entry;
+                u.enter = g.enter;
+                u.leave = g.leave;
+            }
+        } else {
+            let lazy = x64::lazy_entry(rt_compile as *const () as usize as u64);
+            u.lazy_entry = u.emit_code(&lazy);
+            let hot = x64::lazy_entry(rt_hot as *const () as usize as u64);
+            u.hot_entry = u.emit_code(&hot);
+            let (el, leave_off) = x64::enter_leave();
+            u.enter = u.emit_code(&el);
+            u.leave = u.enter + leave_off as u64;
+        }
         let ps = panic_tramp(rt_panic_site as *const () as usize as u64);
         let pb = panic_tramp(rt_panic_bounds as *const () as usize as u64);
         let pi = panic_tramp(rt_panic_impl as *const () as usize as u64);
@@ -2369,14 +2422,27 @@ impl Unit {
             panicking: rt_panicking as *const () as usize as u64,
             rethrow: rt_rethrow as *const () as usize as u64,
         };
-        u.rt.panic_site = u.emit_code(&ps);
-        u.rt.panic_bounds = u.emit_code(&pb);
-        u.rt.panic_impl = u.emit_code(&pi);
-        let rs = panic_tramp(rt_resume_unwind as *const () as usize as u64);
-        u.rt.resume = u.emit_code(&rs);
+        if no_codegen {
+            #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+            {
+                let g = static_glue::glue();
+                u.rt.panic_site = g.panic_site;
+                u.rt.panic_bounds = g.panic_bounds;
+                u.rt.panic_impl = g.panic_impl;
+                u.rt.resume = g.resume;
+                u.rt.land = g.land;
+            }
+            let _ = (ps, pb, pi);
+        } else {
+            u.rt.panic_site = u.emit_code(&ps);
+            u.rt.panic_bounds = u.emit_code(&pb);
+            u.rt.panic_impl = u.emit_code(&pi);
+            let rs = panic_tramp(rt_resume_unwind as *const () as usize as u64);
+            u.rt.resume = u.emit_code(&rs);
+            let ld = x64::land();
+            u.rt.land = u.emit_code(&ld);
+        }
         u.env.resume = u.rt.resume;
-        let ld = x64::land();
-        u.rt.land = u.emit_code(&ld);
         if os::fault::NEEDS_HANG_TRAMP {
             HANG_TRAMP.store(u.emit_code(&crate::x64::hang_tramp(rt_hang as *const () as usize as u64)), Ordering::Relaxed);
         }
@@ -2503,6 +2569,25 @@ impl Unit {
     }
 
     /// Code at a fresh address with its relocated fields linked for that address.
+    /// no-codegen mode: the address a slot takes for `code` (which must be a plain jump with no
+    /// relocations: an interpreter entry or a foreign function); other machine code is an error.
+    fn no_codegen_target(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
+        match relax_codegen::interp::redirect_target(code) {
+            Some(t) if relocs.is_empty() => Ok(t),
+            _ => Err(format!("makepad run: no-codegen mode: `{}` would need machine code ({} bytes)", what, code.len())),
+        }
+    }
+
+    /// Code for an address that is not a slot (error stubs): written to code memory, or in
+    /// no-codegen mode the target of its jump.
+    fn emit_or_redirect(&self, code: &[u8], relocs: &[crate::rir::RelocAt], what: &str) -> Result<u64, String> {
+        if self.prog.session.options.no_codegen {
+            self.no_codegen_target(code, relocs, what)
+        } else {
+            self.emit_linked(code, relocs)
+        }
+    }
+
     fn emit_linked(&self, code: &[u8], relocs: &[crate::rir::RelocAt]) -> Result<u64, String> {
         let at = bump(&self.code_next, code.len() as u64, 16, self.exec_base + self.exec_size - os::mem::CODE_TAIL, "out of code memory");
         let mut c = code.to_vec();
@@ -2708,6 +2793,13 @@ impl Unit {
     /// Thread-local blocks: one OS key per process holds each thread's block; compiled code
     /// reads it through the OS's fast path (os::tls::jit_offset), else calls tls_slow.
     fn init_tls(&mut self) {
+        // no-codegen: no inline TLS fast path and no tls_slow glue; the interpreter asks
+        // tls_block (static_glue::tls_block_c)
+        if self.prog.session.options.no_codegen {
+            self.env.tls_key = 0;
+            self.env.tls_slow = 0;
+            return;
+        }
         let key = tls_key();
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b));
         self.env.tls_key = off;
@@ -3255,10 +3347,13 @@ impl Unit {
         let stub_addr = self.slots.stub(id);
         let stub = x64::stub(id, self.lazy_entry);
         let slot_addr = self.slots.table(id);
-        let thunk = x64::thunk(slot_addr, THUNK_SIZE);
         unsafe {
-            os::mem::write_code(stub_addr, &stub);
-            os::mem::write_code(self.slots.thunk(id), &thunk);
+            // (no-codegen: the precompiled pools already hold slot `id`'s thunk and stub)
+            if !self.prog.session.options.no_codegen {
+                let thunk = x64::thunk(slot_addr, THUNK_SIZE);
+                os::mem::write_code(stub_addr, &stub);
+                os::mem::write_code(self.slots.thunk(id), &thunk);
+            }
             *(slot_addr as *mut u64) = stub_addr;
         }
         self.slot_named(id, &key);
@@ -3355,6 +3450,13 @@ impl Unit {
             panic!("more than 4 billion function instances");
         }
         let (last_seg, _) = crate::rir::SlotTable::locate(last as u32);
+        // no-codegen: segment 0 is precompiled and static (installed by Unit::new)
+        if self.prog.session.options.no_codegen {
+            if last_seg > 0 {
+                panic!("makepad run: no-codegen mode: more than {} function slots (the precompiled thunk pool)", crate::rir::SlotTable::seg_slots(0));
+            }
+            return;
+        }
         for seg in 0..=last_seg {
             if self.slots.has_seg(seg) {
                 continue;
@@ -3392,7 +3494,7 @@ impl Unit {
         self.ensure_slots(first, n);
         let unnamed = FnKey::Glue(GLUE_UNNAMED, TyId(0));
         let stub_len = x64::stub(first, self.lazy_entry).len();
-        unsafe {
+        if !self.prog.session.options.no_codegen { unsafe {
             // a run per segment: its slots are contiguous
             let mut id = first as usize;
             while id < first as usize + n {
@@ -3413,7 +3515,7 @@ impl Unit {
                 });
                 id += run;
             }
-        }
+        } }
         // (the entries' memory mapped in one go: thousands of them)
         self.fns.reserve(first as usize + n, |p, len| os::mem::prefault(p as u64, len));
         for i in 0..n as u32 {
@@ -3679,6 +3781,24 @@ impl Unit {
         }
         let name = format!("{}\0", link);
         let mut p = unsafe { os::proc::find(name.as_ptr()) };
+        // no-codegen mode: only what the host exports (no libraries loaded at run time); a
+        // symbol it lacks is reported with its crate, and calling it panics
+        if self.prog.session.options.no_codegen {
+            if !p.is_null() {
+                return Some(p as u64);
+            }
+            if self.prog.def(d).kind == DefKind::ForeignFn {
+                static SAID: relax_session::sync::Mutex<Vec<String>> = relax_session::sync::Mutex::new(Vec::new());
+                let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+                if !said.contains(&link) {
+                    let krate = self.prog.crates.get(self.prog.def(d).krate as usize).map(|c| self.prog.syms.str(c.name).to_string()).unwrap_or_default();
+                    eprintln!("makepad run: no-codegen mode: crate `{}` uses extern `{}`, which the host binary does not export (calls to it panic)", krate, link);
+                    crate::zone_alloc::kept_with(|| said.push(link.clone()));
+                }
+                return Some(self.missing_foreign_stub(d));
+            }
+            return None;
+        }
         if p.is_null() {
             // Library initializers and their once-only load stay on the ordinary path.
             lower_ahead_needs_unit();
@@ -3711,8 +3831,14 @@ impl Unit {
         let def = self.prog.def(d);
         let (file, pos) = (def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
         let site = self.site(file, pos, &format!("foreign function `{}` is not available on this host -- cfg the call out or link its library", name));
-        let code = x64::jump_with_arg0(site, self.rt.panic_site);
-        let a = self.emit_code(&code);
+        // no-codegen: an interpreted stub makes the same call (the precompiled glue has no
+        // per-site code)
+        let a = if self.prog.session.options.no_codegen {
+            relax_codegen::interp::const_call_entry(self.rt.panic_site, site)
+        } else {
+            let code = x64::jump_with_arg0(site, self.rt.panic_site);
+            self.emit_code(&code)
+        };
         crate::zone_alloc::kept_with(|| m.insert(name.clone(), a));
         a
     }
@@ -4209,12 +4335,20 @@ impl Unit {
         let (n, info) = crate::rir::split_unwind_info(code);
         let code = &code[..n];
         let twin = matches!(self.fns[id as usize].key, FnKey::Sandbox(_));
+        // no-codegen: the slot's "code" is a jump (to its interpreter entry thunk, or a foreign
+        // function's veneer): the slot takes the target itself, nothing is written
+        let redirect = if options.no_codegen { Some(self.no_codegen_target(code, relocs, &self.fns[id as usize].name)?) } else { None };
         // a sandboxed twin's code goes to the sandbox code space (recycled as a whole)
-        let at = match if twin { crate::sandbox::emit_twin(self, code, relocs) } else { None } {
-            Some(a) => a,
-            None => self.emit_linked(code, relocs)?,
+        let at = match redirect {
+            Some(t) => t,
+            None => match if twin { crate::sandbox::emit_twin(self, code, relocs) } else { None } {
+                Some(a) => a,
+                None => self.emit_linked(code, relocs)?,
+            },
         };
-        self.index_code(at, code.len() as u32, id, info);
+        if redirect.is_none() {
+            self.index_code(at, code.len() as u32, id, info);
+        }
         let f = &mut self.fns[id as usize];
         if twin && f.compiled {
             crate::sandbox::note_dead(f.code_len as u64);
@@ -4725,7 +4859,7 @@ unsafe fn compile_slot_on_stack_inner(up: *mut Unit, id: u32) -> u64 {
                 BUSY_PENDING.with(|b| b.set(true));
                 let u = &mut *up;
                 let (code, relocs) = error_stub(u, "the compiler's owner thread is busy with an earlier request (the request is cancelled)");
-                u.emit_linked(&code, &relocs).unwrap_or(0)
+                u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
             }
             Err(p) => std::panic::resume_unwind(p),
         };
@@ -4992,7 +5126,7 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
         Err(e) if !outer && e.starts_with(DEFERRED_RETRY) => {
             let u = &mut *up;
             let (code, relocs) = error_stub(u, DEFERRED_RETRY);
-            u.emit_linked(&code, &relocs).unwrap_or(0)
+            u.emit_or_redirect(&code, &relocs, "error stub").unwrap_or(0)
         }
         Err(e) => install_error(up, id, &e),
     })
@@ -10765,6 +10899,9 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
 extern "C" fn relax_first_present() {
     crate::domain::first_present();
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {
+        if EXEC_CHECK.load(Ordering::Relaxed) {
+            exec_check_now("first frame");
+        }
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
         crate::solver_work::report();
         crate::exec_census::first_present();
@@ -13577,6 +13714,39 @@ impl PcMap {
 #[cfg(test)]
 #[path = "settle_tests.rs"]
 mod settle_tests;
+
+static EXEC_CHECK: AtomicBool = AtomicBool::new(false);
+
+/// No-codegen mode (or MAKEPAD_RUN_EXEC_CHECK=1): reports, once, whether the process has
+/// executable memory that no loaded image backs -- code anything generated. Called when the run
+/// ends (run.rs finish_run) and at exit.
+pub fn exec_check() {
+    static DONE: AtomicBool = AtomicBool::new(false);
+    if EXEC_CHECK.load(Ordering::Relaxed) && !DONE.swap(true, Ordering::AcqRel) {
+        exec_check_now("at exit");
+    }
+}
+
+fn exec_check_now(when: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let r = os::mem::anonymous_exec_regions();
+        if r.is_empty() {
+            eprintln!("makepad-run exec check ({}): no generated executable memory in the process", when);
+        } else {
+            eprintln!("makepad-run exec check ({}): {} executable regions no image backs: {}", when, r.len(), r.iter().map(|(a, n, p)| format!("{:#x}+{:#x} prot {}", a, n, p)).collect::<Vec<_>>().join(", "));
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = when;
+}
+
+/// no-codegen mode's precompiled runtime glue (MAKEPAD_RUN_NO_CODEGEN)
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[path = "static_glue.rs"]
+mod static_glue;
+/// bytes per precompiled slot thunk / stub (no-codegen mode)
+const NC_STRIDE: usize = 16;
 
 fn present_files() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

@@ -16,6 +16,8 @@ modes = {
     "jit-o1": dict(MAKEPAD_RUN_O3="0", MAKEPAD_RUN_O1="0"),
     "jit-o3": dict(BENCH_WARM_MS="2500"),
     "interp": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", MAKEPAD_RUN_O3="0", MAKEPAD_RUN_O1="0"),
+    # no machine code at all: precompiled glue, every function interpreted
+    "nocodegen": dict(MAKEPAD_RUN_NO_CODEGEN="1", MAKEPAD_RUN_INTERP_STATS="1"),
     # A/B of the lowering's own clean-ups: no constant-branch folding and no loop-constant preload
     "interp-plain": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", MAKEPAD_RUN_O3="0", MAKEPAD_RUN_O1="0", MAKEPAD_RUN_INTERP_NOFOLD="1"),
 }
@@ -24,6 +26,7 @@ if want:
     modes = {k: v for k, v in modes.items() if k in want.split(",")}
 else:
     modes.pop("interp-plain")
+    modes.pop("nocodegen")
 def one(mode, n):
     if modes[mode] is None:
         cmd, env = ["nice", "-n", "5", native, n], base

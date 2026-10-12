@@ -140,6 +140,11 @@ pub struct Options {
     pub tyck_ahead: bool,
     /// `MAKEPAD_RUN_UNWIND`; default `true`.
     pub unwind: bool,
+    /// `MAKEPAD_RUN_NO_CODEGEN=1`: the process makes no machine code (the platforms without
+    /// writable+executable memory, iOS): every function runs in the threaded interpreter
+    /// (codegen interp.rs), the runtime glue is the precompiled set (jit/static_glue.rs), and any
+    /// write to code memory is an error. Implies no O3 and no code cache. Default `false`.
+    pub no_codegen: bool,
     /// A live session (hot reload, watcher): `makepad run` of a working tree, `makepad live`; never
     /// from the environment. Default `false`.
     pub live: bool,
@@ -270,6 +275,7 @@ impl Default for Options {
             tier1: true,
             tyck_ahead: true,
             unwind: true,
+            no_codegen: false,
             live: false,
             modules_trusted: false,
             sandbox_nocheck: false,
@@ -355,7 +361,11 @@ impl Options {
             no_unroll: { let os = get("MAKEPAD_RUN_NO_UNROLL"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_vectorize: { let os = get("MAKEPAD_RUN_NO_VECTORIZE"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
             no_windows: { let os = get("MAKEPAD_RUN_NO_WINDOWS"); let v = os.and_then(|v| v.into_string().ok()); v.is_some() },
+            // no-codegen: no baseline startup tier -- its O2 upgrade is driven by the sampler
+            // finding baseline machine code, and interpreted code has none, so it would stay
+            // unoptimised for good
             t0_baseline: match get("MAKEPAD_RUN_O1").and_then(|v| v.into_string().ok()).as_deref() {
+                _ if get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0") => Tier0Baseline::Off,
                 Some("0") => Tier0Baseline::Off,
                 Some("always") => Tier0Baseline::Always,
                 _ => Tier0Baseline::Startup,
@@ -375,9 +385,10 @@ impl Options {
             sandbox_fuel: { let os = get("MAKEPAD_RUN_SANDBOX_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec: { let os = get("MAKEPAD_RUN_SPEC"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             spec_yield: { let os = get("MAKEPAD_RUN_SPEC_YIELD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
-            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
+            tier1: { let os = get("MAKEPAD_RUN_O3"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") && !get("MAKEPAD_RUN_NO_CODEGEN").is_some_and(|v| !v.is_empty() && v != "0") },
             tyck_ahead: { let os = get("MAKEPAD_RUN_TYCK_AHEAD"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
             unwind: { let os = get("MAKEPAD_RUN_UNWIND"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() != Some("0") },
+            no_codegen: { let os = get("MAKEPAD_RUN_NO_CODEGEN"); let v = os.and_then(|v| v.into_string().ok()); v.is_some_and(|v| !v.is_empty() && v != "0") },
             live: false,
             modules_trusted: { let os = get("MAKEPAD_RUN_MODULES_TRUSTED"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
             sandbox_nocheck: { let os = get("MAKEPAD_RUN_SANDBOX_NOCHECK"); let v = os.and_then(|v| v.into_string().ok()); v.as_deref() == Some("1") },
@@ -469,6 +480,7 @@ impl Options {
             tier1,
             tyck_ahead,
             unwind,
+            no_codegen,
             live,
             modules_trusted,
             sandbox_nocheck,
@@ -596,6 +608,8 @@ impl Options {
         h.u8(*tyck_ahead as u8);
         h.str("unwind");
         h.u8(*unwind as u8);
+        h.str("no_codegen");
+        h.u8(*no_codegen as u8);
         h.str("live");
         h.u8(*live as u8);
         h.str("modules_trusted");

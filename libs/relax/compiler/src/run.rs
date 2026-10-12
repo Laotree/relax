@@ -1454,6 +1454,11 @@ fn exported_fns(prog: &crate::program::Program, prefixes: &[String]) -> Result<V
 /// `first_file` on name: (how many, the ones not found).
 pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(String, bool)], first_file: usize) -> (usize, Vec<String>) {
     let mut missing = Vec::new();
+    // no-codegen mode: nothing is linked at run time -- native code is the host binary's, and
+    // the program reaches only the symbols the host exports (jit.rs foreign_addr)
+    if prog.session.options.no_codegen {
+        return (0, missing);
+    }
     for (name, fw) in link_libs {
         if !crate::os::proc::load_library(name, *fw) && (*fw || !crate::os::proc::load_library_versioned(name)) {
             missing.push(name.clone());
@@ -2231,6 +2236,7 @@ fn start_exit_summary() {
 }
 
 fn finish_run(why: &'static str, code: Option<i32>) {
+    jit::exec_check();
     crate::borrowck::lazy::stop();
     let Some(exit) = EXIT_SUMMARY.get() else { return };
     // Only the first caller requests cleanup. In particular the later atexit hook

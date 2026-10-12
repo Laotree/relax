@@ -23,6 +23,7 @@ MODES = [
     ("interp-xi", {"MAKEPAD_RUN_INTERP": "::xi_"}),
     ("interp-xj", {"MAKEPAD_RUN_INTERP": "::xj_,{closure"}),
     ("interp-std", {"MAKEPAD_RUN_INTERP": "std::,core::,alloc::"}),
+    ("nocodegen", {"MAKEPAD_RUN_NO_CODEGEN": "1"}),
 ]
 if os.environ.get("MODES"):
     MODES = [m for m in MODES if m[0] in os.environ["MODES"].split(",")]

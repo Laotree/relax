@@ -15,6 +15,81 @@
 include!("../rt_abi.rs");
 pub use imp::*;
 
+/// no-codegen mode (MAKEPAD_RUN_NO_CODEGEN): reservations get no executable view, and any code
+/// write is an error naming its caller -- the process must run without machine code of its own.
+static NO_CODEGEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_no_codegen() {
+    NO_CODEGEN.store(true, std::sync::atomic::Ordering::Release);
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn no_codegen() -> bool {
+    NO_CODEGEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The process's executable memory that no loaded image backs (macOS): (start, size, prot) per
+/// region. No-codegen mode checks it is empty when the process ends -- generated code anywhere
+/// in the process (the JIT, a kernel compiler, a library) shows up here.
+#[cfg(target_os = "macos")]
+pub fn anonymous_exec_regions() -> Vec<(u64, u64, i32)> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicInfo64 {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        shared: u32,
+        reserved: u32,
+        offset: u64,
+        behavior: i32,
+        user_wired_count: u16,
+    }
+    #[repr(C)]
+    struct DlInfo {
+        fname: *const std::ffi::c_char,
+        fbase: *mut u8,
+        sname: *const std::ffi::c_char,
+        saddr: *mut u8,
+    }
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn mach_vm_region(task: u32, addr: *mut u64, size: *mut u64, flavor: i32, info: *mut BasicInfo64, count: *mut u32, object: *mut u32) -> i32;
+        fn dladdr(addr: *const u8, info: *mut DlInfo) -> i32;
+    }
+    const VM_REGION_BASIC_INFO_64: i32 = 9;
+    const VM_PROT_EXECUTE: i32 = 4;
+    let mut out = Vec::new();
+    let mut addr: u64 = 0;
+    unsafe {
+        loop {
+            let mut size: u64 = 0;
+            let mut info = BasicInfo64::default();
+            let mut count = (std::mem::size_of::<BasicInfo64>() / 4) as u32;
+            let mut object = 0u32;
+            if mach_vm_region(mach_task_self(), &mut addr, &mut size, VM_REGION_BASIC_INFO_64, &mut info, &mut count, &mut object) != 0 {
+                break;
+            }
+            if info.protection & VM_PROT_EXECUTE != 0 {
+                let mut d = DlInfo { fname: std::ptr::null(), fbase: std::ptr::null_mut(), sname: std::ptr::null(), saddr: std::ptr::null_mut() };
+                // an image's text (or the shared cache) is backed; anything else is generated
+                if dladdr(addr as *const u8, &mut d) == 0 || d.fname.is_null() {
+                    out.push((addr, size, info.protection));
+                }
+            }
+            addr += size;
+        }
+    }
+    out
+}
+
+#[track_caller]
+#[cold]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn refuse_code(what: &str, addr: u64, len: usize) -> ! {
+    panic!("makepad run: no-codegen mode: {} of {} bytes at {:#x} (machine code is not allowed in this mode)", what, len, addr)
+}
+
 /// A stack segment: usable [lo, top), mapped [base, base + len).
 pub struct Segment {
     pub base: usize,
@@ -297,6 +372,10 @@ mod imp {
             if mach_vm_allocate(task, &mut base, (code + rest) as u64, VM_FLAGS_ANYWHERE) != 0 {
                 panic!("reservation: mach_vm_allocate failed");
             }
+            // no-codegen: the code part stays plain read-write memory (never executed)
+            if super::no_codegen() {
+                return base;
+            }
             let at = code_alloc_at(code, base);
             assert_eq!(at, base, "reservation: code view not at the base");
             base
@@ -379,7 +458,11 @@ mod imp {
 
     /// Writes machine code: copies through the RW view, then invalidates the instruction cache
     /// for the RX range.
+    #[track_caller]
     pub unsafe fn write_code(addr: u64, b: &[u8]) {
+        if super::no_codegen() {
+            super::refuse_code("write_code", addr, b.len());
+        }
         let w = match code_rw_of(addr) {
             Some(w) => w,
             None => panic!("write_code: {:#x} is not code memory", addr),
@@ -391,7 +474,11 @@ mod imp {
     /// Writes `len` bytes of machine code at `addr` in place through the RW view (`fill` gets
     /// them writable; what they hold before is unspecified), then invalidates the instruction
     /// cache for the RX range, as `write_code` does.
+    #[track_caller]
     pub unsafe fn fill_code(addr: u64, len: usize, fill: impl FnOnce(&mut [u8])) {
+        if super::no_codegen() {
+            super::refuse_code("fill_code", addr, len);
+        }
         let w = match code_rw_of(addr) {
             Some(w) => w,
             None => panic!("fill_code: {:#x} is not code memory", addr),
