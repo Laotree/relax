@@ -154,11 +154,13 @@ impl Program {
                 }
             }
             let mut lines = Vec::new();
-            let entries = object(vm.heap(), root, id!(lines))?;
-            for i in 0..vm.heap().vec_len(entries) {
+            let entries = get(vm.heap(), root, id!(lines))
+                .as_array()
+                .ok_or("Boot document needs a lines array")?;
+            for i in 0..vm.heap().array_len(entries) {
                 let line = vm
                     .heap()
-                    .vec_value(entries, i, NoTrap)
+                    .array_index(entries, i, NoTrap)
                     .as_object()
                     .ok_or("Each boot line must be an object")?;
                 let role = match get(vm.heap(), line, id!(role)).as_id() {

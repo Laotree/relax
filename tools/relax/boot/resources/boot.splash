@@ -75,7 +75,7 @@ let Quad = {
         pixel: fn() {
             let target = phase_target(self.previous, self.completed, self.weight, self.total_weight, self.done, self.total, self.phase_elapsed)
             let fill = ease(self.from, target, self.time - self.changed)
-            let edge = max(fwidth(self.pos.x), 0.00001)
+            let edge = max(abs(dFdx(self.pos.x)) + abs(dFdy(self.pos.x)), 0.00001)
             let coverage = 1.0 - smoothstep(fill - edge, fill + edge, self.pos.x)
             let shimmer = 0.5 + 0.5 * sin(self.pos.x * 18.0 - self.time * 3.0)
             return mix(self.track, mix(self.ink, vec4(1.0), shimmer * 0.2), coverage)
