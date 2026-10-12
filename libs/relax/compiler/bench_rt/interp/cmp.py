@@ -2,7 +2,7 @@
 """Interpreter vs JIT vs rustc on bench_rt kernels (ios-interp research prototype).
 Usage: cmp.py <makepad binary> <rustc bench binary> [kernel ...]; ROUNDS (default 3) interleaved rounds,
 best per mode. Modes: rustc; jit-o1 (RELAX_O3=0 RELAX_O1=0); jit-o3 (default tiers, BENCH_WARM_MS=2500);
-interp (RELAX_INTERP=all, O3/O1 off). Prints a markdown table of best ms and ratios, checksums compared."""
+interp (MAKEPAD_RUN_INTERP=all, O3/O1 off). Prints a markdown table of best ms and ratios, checksums compared."""
 import os, re, subprocess, sys
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 mk, native = sys.argv[1], sys.argv[2]
@@ -15,9 +15,9 @@ modes = {
     "rustc": None,
     "jit-o1": dict(RELAX_O3="0", RELAX_O1="0"),
     "jit-o3": dict(BENCH_WARM_MS="2500"),
-    "interp": dict(RELAX_INTERP="all", RELAX_INTERP_STATS="1", RELAX_O3="0", RELAX_O1="0"),
+    "interp": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", RELAX_O3="0", RELAX_O1="0"),
     # A/B of the lowering's own clean-ups: no constant-branch folding and no loop-constant preload
-    "interp-plain": dict(RELAX_INTERP="all", RELAX_INTERP_STATS="1", RELAX_O3="0", RELAX_O1="0", RELAX_INTERP_NOFOLD="1"),
+    "interp-plain": dict(MAKEPAD_RUN_INTERP="all", MAKEPAD_RUN_INTERP_STATS="1", RELAX_O3="0", RELAX_O1="0", MAKEPAD_RUN_INTERP_NOFOLD="1"),
 }
 want = os.environ.get("MODES")
 if want:

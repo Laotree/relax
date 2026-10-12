@@ -3346,11 +3346,11 @@ pub fn compile(options: &relax_session::Options, f: &Func, env: &Env) -> Result<
     compile_freq(options, f, env, None)
 }
 
-/// research (ios-interp): RELAX_INTERP_STATS=1 also sums the machine-code backend's time and
+/// research (ios-interp): MAKEPAD_RUN_INTERP_STATS=1 also sums the machine-code backend's time and
 /// output for functions compiled natively, to compare with the interpreter's lowering
 fn compile_freq_timed(options: &relax_session::Options, f: &Func, env: &Env, freq: Option<&[f32]>) -> Result<Compiled, String> {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("RELAX_INTERP_STATS").is_some()) {
+    if !*ON.get_or_init(|| std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some()) {
         return compile_freq_inner(options, f, env, freq);
     }
     let t = std::time::Instant::now();

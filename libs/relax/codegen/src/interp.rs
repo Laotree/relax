@@ -21,9 +21,9 @@
 //!   thunk) to the callee's interpreter code once (inline cache) and runs it on the same
 //!   interpreter stack without leaving the interpreter.
 //!
-//! Selection: `RELAX_INTERP=all` or a comma list of name substrings (`RELAX_INTERP_SKIP` for
+//! Selection: `MAKEPAD_RUN_INTERP=all` or a comma list of name substrings (`MAKEPAD_RUN_INTERP_SKIP` for
 //! exclusions). Functions using operations this prototype does not cover stay native (counted:
-//! `RELAX_INTERP_STATS=1` prints a summary at exit).
+//! `MAKEPAD_RUN_INTERP_STATS=1` prints a summary at exit).
 //! Not covered: unwinding through interpreted frames (a panic below one cuts back to the
 //! recovery point without running the interpreted frames' cleanups), most lane-typed vector
 //! ops (`VX`, `VX3`), x86-only instructions.
@@ -49,13 +49,13 @@ pub struct Cx {
     pub limit: *mut u64,
     /// this thread's thread-local block (0 = not asked yet)
     pub tls_block: u64,
-    /// dispatch counts (builds with RELAX_INTERP_COUNT set at compile time): handlers run,
+    /// dispatch counts (builds with MAKEPAD_RUN_INTERP_COUNT set at compile time): handlers run,
     /// interpreted -> interpreted calls, interpreted -> native calls, native -> interpreted entries
     pub n: [u64; 4],
 }
 
 /// Count dispatches and calls (a build-time switch: the counting costs time in every handler).
-const COUNT: bool = option_env!("RELAX_INTERP_COUNT").is_some();
+const COUNT: bool = option_env!("MAKEPAD_RUN_INTERP_COUNT").is_some();
 /// counting builds: dispatches per handler, and the RIR operation each handler was emitted for
 static HIST: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 static HNAMES: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
@@ -100,6 +100,7 @@ macro_rules! gsym {
     };
 }
 #[cfg(not(target_vendor = "apple"))]
+#[allow(unused_macros)] // only the aarch64 asm below uses it
 macro_rules! gsym {
     ($s:literal) => {
         $s
@@ -214,7 +215,7 @@ static FUNCS: [AtomicPtr<IFunc>; POOL] = [const { AtomicPtr::new(std::ptr::null_
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static TLS_GLUE: AtomicU64 = AtomicU64::new(0);
 static SLOTS: AtomicUsize = AtomicUsize::new(0);
-/// RELAX_INTERP_TRACE: every entry and native call to stderr (debugging the prototype)
+/// MAKEPAD_RUN_INTERP_TRACE: every entry and native call to stderr (debugging the prototype)
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ---------------------------------------------------------------- statistics
@@ -286,10 +287,10 @@ struct Sel {
 fn selection() -> Option<&'static Sel> {
     static S: std::sync::OnceLock<Option<Sel>> = std::sync::OnceLock::new();
     S.get_or_init(|| {
-        let v = std::env::var("RELAX_INTERP").ok().filter(|v| !v.is_empty() && v != "0")?;
+        let v = std::env::var("MAKEPAD_RUN_INTERP").ok().filter(|v| !v.is_empty() && v != "0")?;
         let split = |s: &str| s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect::<Vec<_>>();
-        let skip = std::env::var("RELAX_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
-        if std::env::var_os("RELAX_INTERP_STATS").is_some() {
+        let skip = std::env::var("MAKEPAD_RUN_INTERP_SKIP").map(|s| split(&s)).unwrap_or_default();
+        if std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
             extern "C" {
                 fn atexit(f: extern "C" fn()) -> i32;
             }
@@ -297,7 +298,7 @@ fn selection() -> Option<&'static Sel> {
                 atexit(print_stats);
             }
         }
-        TRACE.store(std::env::var_os("RELAX_INTERP_TRACE").is_some(), Ordering::Relaxed);
+        TRACE.store(std::env::var_os("MAKEPAD_RUN_INTERP_TRACE").is_some(), Ordering::Relaxed);
         Some(Sel { all: v == "all", pats: if v == "all" { Vec::new() } else { split(&v) }, skip })
     })
     .as_ref()
@@ -335,7 +336,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
     }
     TLS_GLUE.store(tls_slow, Ordering::Relaxed);
     SLOTS.store(slots.0 as usize, Ordering::Relaxed);
-    if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && std::env::var_os("RELAX_INTERP_STATS").is_some() {
+    if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
         print_stats();
     }
     N_WORDS.fetch_add(ifunc.code.len() as u64, Ordering::Relaxed);
@@ -2039,7 +2040,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
     // a vreg whose every definition is the same integer constant (O1 leaves bounds-check flags
     // like this in non-SSA RIR): a branch on it is a jump
     let mut konst: Vec<Option<Option<i64>>> = vec![None; f.vregs.len()];
-    if std::env::var_os("RELAX_INTERP_NOFOLD").is_none() {
+    if std::env::var_os("MAKEPAD_RUN_INTERP_NOFOLD").is_none() {
         for p in &f.params {
             konst[p.0 as usize] = Some(None);
         }
@@ -2094,7 +2095,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         }
     }
     let mut hoist = vec![false; f.vregs.len()];
-    if std::env::var_os("RELAX_INTERP_NOPRELOAD").is_none() {
+    if std::env::var_os("MAKEPAD_RUN_INTERP_NOPRELOAD").is_none() {
         for (bi, b) in f.blocks.iter().enumerate() {
             if !in_loop[bi] {
                 continue;
