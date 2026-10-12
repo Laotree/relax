@@ -222,7 +222,9 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
         // parsed on this thread (no parse workers for one small crate)
         crate::preload::SINGLE.with(|s| s.set(true));
         let mut failed = None;
-        for nc in new {
+        for (done, nc) in new.iter().enumerate() {
+            if domain.is_some() { crate::run_state::progress(domain, crate::run_state::Phase::Parse,
+                Some(done as u64), Some(new.len() as u64), &nc.name); }
             let mut dep_list = Vec::new();
             for (n, d) in &nc.deps {
                 let k = match d {

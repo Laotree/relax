@@ -1,0 +1,83 @@
+// A boot document returns mod.boot.App with main_window and a RunView. RunView
+// binds the named controls below; it emits plain actions to Relax. All layout,
+// colours, animation and progress easing are editable here, including on reload.
+use mod.prelude.widgets.*
+
+mod.boot.App{
+    ui: Root{
+        main_window := Window{
+            window.inner_size: vec2(1280, 800)
+            body +: {
+                run := mod.boot.RunView{
+                    width: Fill height: Fill
+                    flow: Down
+                    padding: Inset{left: 32 right: 32 top: 48 bottom: 24}
+                    spacing: 16
+                    app_name := Label{
+                        text: "Starting"
+                        draw_text.text_style.font_size: 28
+                    }
+                    progress := View{
+                        width: Fill height: 12
+                        show_bg: true
+                        draw_bg +: {
+                            from: instance(0.0)
+                            target: instance(0.0)
+                            changed: instance(0.0)
+                            track: uniform(theme.color_bg_app)
+                            ink: uniform(theme.color_makepad)
+                            pixel: fn() {
+                                let t = max(0.0, self.draw_pass.time - self.changed)
+                                let eased = mix(self.from, self.target, 1.0 - exp(-9.0 * t))
+                                let sdf = Sdf2d.viewport(self.pos * self.rect_size)
+                                sdf.box(0.0, 0.0, self.rect_size.x, self.rect_size.y, 6.0)
+                                sdf.fill(mix(self.track, self.ink, 0.14))
+                                let width = max(0.0, eased * self.rect_size.x)
+                                if width > 0.0 {
+                                    sdf.box(0.0, 0.0, width, self.rect_size.y, min(6.0, width * 0.5))
+                                    let shimmer = 0.5 + 0.5 * sin(self.pos.x * 18.0 - self.draw_pass.time * 3.0)
+                                    sdf.fill(mix(self.ink, vec4(1.0), shimmer * 0.2))
+                                }
+                                return sdf.result
+                            }
+                        }
+                    }
+                    status := Label{width: Fill text: "resolve · cold"}
+                    domain_state := Label{width: Fill text: "Compiling"}
+                    controls := View{
+                        width: Fill height: Fit flow: Right{wrap: true} spacing: 8
+                        retry := Button{text: "Retry compile"}
+                        restart := Button{text: "Restart app"}
+                    }
+                    panic := View{
+                        width: Fill height: Fit flow: Down spacing: 8 visible: false
+                        panic_message := Label{width: Fill text: "Parked panic"}
+                        View{
+                            width: Fill height: Fit flow: Right{wrap: true} spacing: 8
+                            panic_restart := Button{text: "Restart"}
+                            panic_retry := Button{text: "Retry boundary"}
+                            resume := Button{text: "Resume unwinding"}
+                            return_value := TextInput{width: Fill empty_text: "Return value"}
+                            panic_return := Button{text: "Return"}
+                        }
+                    }
+                    diagnostics := PortalList{
+                        width: Fill height: Fill
+                        flow: Down
+                        scan: [@Diagnostic]
+                        Diagnostic := View{
+                            width: Fill height: Fit flow: Down spacing: 6
+                            padding: Inset{top: 12 bottom: 12}
+                            View{
+                                width: Fill height: Fit flow: Right{wrap: true} spacing: 8
+                                open := Button{width: Fill text: "Source"}
+                                copy := Button{text: "Copy"}
+                            }
+                            message := Label{width: Fill text: "Diagnostic"}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

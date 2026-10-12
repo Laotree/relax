@@ -20,7 +20,7 @@ pub struct Event {
     pub kind: &'static str,
     key: String,
     /// the whole event as one JSON object
-    pub json: String,
+    pub json: std::sync::Arc<str>,
     at: std::time::Instant,
 }
 
@@ -30,16 +30,44 @@ static NEW: Condvar = Condvar::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 /// sessions in `watch` / `events follow=1` now
 pub static WATCHERS: AtomicU32 = AtomicU32::new(0);
+static RUN_STATE_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RUN_STATE_OBSERVER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_run_state_observer(observer: fn()) { let _ = RUN_STATE_OBSERVER.set(observer); }
+pub fn run_state_visible(visible: bool) {
+    RUN_STATE_VISIBLE.store(visible, SeqCst);
+    retry_update();
+}
+fn parked_changed() { if let Some(observer) = RUN_STATE_OBSERVER.get() { observer(); } }
+
+/// The same records returned by `panics`, retained for the lifetime of the park
+/// even if the inspect event history rolls over. No owner-thread/symbol lookup.
+pub fn parked_events(domain: u32) -> Option<Vec<std::sync::Arc<str>>> {
+    // Panic collection and inspect commands can hold this lock while doing
+    // symbol work. A UI retries on its next turn rather than waiting for them.
+    let list = match PARKED.try_lock() {
+        Ok(list) => list,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return None,
+    };
+    Some(list.iter()
+        .filter(|p| p.domain == Some(domain) && p.decision.load(SeqCst) == 0)
+        .map(|p| p.event.clone()).collect())
+}
 
 pub const KINDS: &[&str] = &["panic", "hang", "deadlock", "mem", "spike", "rtstall", "scripterr", "patchrefused"];
 
 /// Records an event (`fields`: the kind-specific JSON members, without braces). Returns its seq,
 /// or 0 when it repeated one sent in the last 30 s.
 pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
+    emit_record(kind, key, fields).0
+}
+
+fn emit_record(kind: &'static str, key: &str, fields: &str) -> (u64, std::sync::Arc<str>) {
     let mut q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = q.iter().rev().find(|e| e.kind == kind && e.key == key) {
         if e.at.elapsed().as_secs() < 30 {
-            return 0;
+            return (0, e.json.clone());
         }
     }
     let seq = SEQ.fetch_add(1, SeqCst) + 1;
@@ -58,12 +86,13 @@ pub fn emit(kind: &'static str, key: &str, fields: &str) -> u64 {
     if let Some(w) = super::WATCH.get() {
         w.emit(&json);
     }
-    q.push_back(Event { seq, kind, key: key.to_string(), json, at: std::time::Instant::now() });
+    let json: std::sync::Arc<str> = json.into();
+    q.push_back(Event { seq, kind, key: key.to_string(), json: json.clone(), at: std::time::Instant::now() });
     while q.len() > KEEP {
         q.pop_front();
     }
     NEW.notify_all();
-    seq
+    (seq, json)
 }
 
 /// Someone may want events now (a watcher, a stream, `--agent`): detectors with a cost on the
@@ -89,7 +118,7 @@ pub fn remote_watcher_closed() {
 
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
-    RELAX_RETRY_ON.store(watched(), Relaxed);
+    RELAX_RETRY_ON.store(watched() || RUN_STATE_VISIBLE.load(Relaxed), Relaxed);
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -147,7 +176,7 @@ pub fn cmd_events(req: &Req, out: &mut Out) {
         retry_update();
     }
     loop {
-        let batch: Vec<(u64, String)> = {
+        let batch: Vec<(u64, std::sync::Arc<str>)> = {
             let q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
             q.iter().filter(|e| e.seq > since && wanted(&on, e.kind)).map(|e| (e.seq, e.json.clone())).collect()
         };
@@ -181,6 +210,7 @@ struct Parked {
     /// 4 make it return `words`
     decision: AtomicU32,
     words: Mutex<Vec<u64>>,
+    event: std::sync::Arc<str>,
 }
 
 // ---- retry boundaries (DESIGN.md §10b): makepad's event dispatch runs inside one while an agent
@@ -246,7 +276,9 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() {
         return;
     }
-    let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed);
+    let domain = crate::domain::current_app_domain();
+    let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)
+        || (RUN_STATE_VISIBLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain());
     let key = format!("{}|{}|{}", info.site, info.location, info.message);
     if !watched {
         let mut seen = SITES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -267,7 +299,6 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     let me = crate::os::thread::current();
     let thread = if me == crate::jit::MAIN_TID.load(Relaxed) { "main".to_string() } else { crate::os::thread::name(me) };
     let wait_s = if watched { 600 } else { park_secs_unwatched() };
-    let domain = crate::domain::current_app_domain();
     let primary = domain.is_some() && domain == crate::run::app_domain();
     let boundary = innermost_boundary();
     // a restartable frame (`restartable <fn>`) on the stack: restart / return are offered
@@ -307,9 +338,10 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     // Stop may have released the old parked list while this panic collected its stack.
     // Do not park a new cleanup panic after that release.
     if domain.is_some_and(crate::domain::cancelled) { return; }
-    let seq = emit("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()) });
+    let (seq, event) = emit_record("panic", &format!("P{}", id), &fields);
+    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()), event });
     list.push(p.clone());
+    parked_changed();
     if !watched {
         eprintln!(
             "relax: panic parked on thread {} ({}) for {} s -- attach: relax inspect {} panics (resume P{} panic)",
@@ -326,6 +358,8 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
         list = RESUME.wait_timeout(list, std::time::Duration::from_millis(200)).unwrap_or_else(|e| e.into_inner()).0;
     }
     list.retain(|x| x.id != id);
+    drop(list);
+    parked_changed();
     let decision = p.decision.load(SeqCst);
     if decision == 2 && boundary.is_some() {
         let _ = RETRY.try_with(|r| r.set(true));
@@ -358,13 +392,8 @@ fn panic_site(site: u64) -> String {
 pub fn cmd_panics(out: &mut Out) {
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     out.measured("parked panics", "event queue", &[]);
-    let q = EVENTS.lock().unwrap_or_else(|e| e.into_inner());
     for p in list.iter() {
-        if let Some(e) = q.iter().find(|e| e.seq == p.seq) {
-            out.line(&e.json);
-        } else {
-            out.line(&format!("{{\"id\":\"P{}\"}}", p.id));
-        }
+        out.line(&p.event);
     }
 }
 

@@ -872,6 +872,9 @@ pub fn block_committed(base: u64) -> u64 {
 // ---- start
 
 fn fail(id: DomainId, e: Vec<String>) -> Result<DomainId, Vec<String>> {
+    if crate::run_state::observed() && !cancelled(id) {
+        for error in &e { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(error, "run")); }
+    }
     if cancelled(id) { set_state(id, DomainState::Stopped); return Ok(id); }
     else { set_state(id, DomainState::Crashed(e.first().cloned().unwrap_or_default())); }
     Err(e)
@@ -952,6 +955,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         Ok(x) => x,
         Err(e) => return fail(id, e),
     };
+    crate::run_state::emit(crate::run_state::Event::Warm { domain: Some(id), warm: new_names.is_empty() });
     let load_ms = t1.elapsed().as_secs_f64() * 1e3;
     if compile_phase(id, "link").is_err() { return Ok(id); }
     let t2 = std::time::Instant::now();
@@ -1186,6 +1190,9 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
         // As for a boot: unresolved imports and signature errors are reported, the load goes on
         // (only a crate that does not parse is refused).
         if !added.errs.is_empty() {
+            if crate::run_state::observed() {
+                for e in &added.errs { crate::run_state::diagnostic(Some(id), crate::diag::from_legacy(e, "typeck")); }
+            }
             let max: usize = std::env::var("RELAX_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
             eprintln!("relax-domain: {} diagnostics in the loaded crates (first {}):", added.errs.len(), max.min(added.errs.len()));
             for e in added.errs.iter().take(max) {

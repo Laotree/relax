@@ -51,6 +51,14 @@ pub fn track_for_verbose() {
     VERBOSE_LIST.store(true, Ordering::Relaxed);
 }
 
+/// The native run window uses the existing atomically published item slots.
+pub fn track_for_host() { TRACK.store(true, Ordering::Relaxed); }
+
+pub fn current_item() -> Option<String> {
+    let loading = LOADING.lock().unwrap_or_else(|e| e.into_inner()).0.clone();
+    if !loading.is_empty() { Some(loading) } else { longest_item().map(|(name, _)| name) }
+}
+
 /// A thread starts compiling `name` (jit.rs compile_watch). One relaxed load when nothing tracks.
 pub fn item_begin(name: &str) {
     if !TRACK.load(Ordering::Relaxed) {

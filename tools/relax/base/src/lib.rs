@@ -25,6 +25,7 @@ pub mod gitstore;
 pub mod vfs;
 pub mod packsrc;
 pub mod progress;
+pub mod run_state;
 pub mod dirs;
 pub use relax_lex::tokens as pm_tokens;
 pub mod pm;

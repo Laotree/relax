@@ -58,6 +58,16 @@ fn phase(name: &str, t: Instant) {
     report("phase", name.split(" (").next().unwrap_or(name));
     PHASES.lock().unwrap().push((name.to_string(), ms));
     crate::tui::phase_done(name);
+    use crate::run_state::{self, Phase};
+    let next = match name.split(" (").next().unwrap_or(name) {
+        "build scripts" => Some(Phase::Parse),
+        "load+parse" => Some(Phase::Resolve),
+        "resolve" => Some(Phase::Typecheck),
+        "signatures" => Some(Phase::Link),
+        "image" => Some(Phase::Codegen),
+        _ => None,
+    };
+    if let Some(next) = next { run_state::progress(None, next, None, None, ""); }
     // relax inspect's memory timeline: the boot phase that just ended
     crate::inspect::mem::mark(&format!("{} done", name.split(" (").next().unwrap_or(name)));
 }
@@ -89,6 +99,9 @@ pub fn report_open(path: &str) -> Result<(), String> {
 }
 
 pub(crate) fn report(kind: &str, text: &str) {
+    if kind == "error" && crate::run_state::observed() {
+        crate::run_state::diagnostic(app_domain(), crate::diag::from_legacy(text, "codegen"));
+    }
     use std::io::Write;
     let mut g = REPORT_FILE.lock().unwrap();
     if let Some(f) = g.as_mut() {
@@ -225,7 +238,7 @@ pub(crate) fn resolve_package(
     // The graph is enough to choose the host. Open its window before build scripts, parsing,
     // source validation or JIT work; the process main thread is already serving the HAL.
     if boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal") {
-        (MAIN_HOST.get().expect("run host").open)(package)?;
+        (MAIN_HOST.get().expect("run host").open)(package, &g.pkg[g.root].0)?;
         HAL_RUN.store(true, Ordering::Release);
     }
     // provided crates bind only to their own source (before substitution rewrites deps)
@@ -289,6 +302,8 @@ pub(crate) fn resolve_package(
 }
 
 fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session: Option<&mut Option<crate::serve::Session>>) -> i32 {
+    PHASES.lock().unwrap().clear();
+    ERRORS_SEEN.store(0, Ordering::Relaxed);
     crate::clock::mark_process_start();
     jit::begin_startup_phase();
     let mut driver_options = sess.options.clone();
@@ -545,6 +560,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let Resolved { units, g, order, cfgs, live_inputs } = match resolve_package(sess, &workspace, &package, &cargo_flags, &units_json, &target_dir, &std_dir, ResolveFor::Boot) {
         Ok(r) => r,
         Err(e) => {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
             eprintln!("relax-run: {e}");
             return 1;
         }
@@ -621,6 +637,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // first live edit that expands builds it).
     if !collected_restored {
         if let Err(e) = crate::macro_reg::prewarm(sess) {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "macro")); }
             eprintln!("relax-run: {e}");
             return 1;
         }
@@ -662,7 +679,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let (loaded_core, std_deps) = if restored_crates == 0 {
             match crate::load_std_crates_with(sess, &mut prog, |p, k| cold_front.loaded(p, k)) {
                 Ok(x) => x,
-                Err(e) => { eprintln!("relax-run: std: {}", e); return 1; }
+                Err(e) => {
+                    if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "parse")); }
+                    eprintln!("relax-run: std: {}", e); return 1;
+                }
             }
         } else {
             (prog.prelude_crate.expect("collected graph prelude"),
@@ -670,7 +690,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         };
         core = loaded_core;
         crate::tui::LOAD_TOTAL.store(order.len() as u32, Ordering::Relaxed);
-        for &ci in &order {
+        for (done, &ci) in order.iter().enumerate() {
+            crate::run_state::progress(None, crate::run_state::Phase::Parse, Some(done as u64), Some(order.len() as u64), &g.crates[ci].name);
             crate::tui::LOAD_DONE.fetch_add(1, Ordering::Relaxed);
             if pre_index[ci] < restored_crates { continue; }
             let c = &g.crates[ci];
@@ -689,6 +710,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 
                 }
                 Err(e) => {
+                    if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "parse")); }
                     if watch {
                         // A syntax error at startup must still leave an editable session. The
                         // loader has already allocated this crate's root module. Give an
@@ -791,6 +813,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // never silent; --check counts them as errors
     let derive_failures = crate::macro_reg::derive_failures();
     if !derive_failures.is_empty() {
+        if crate::run_state::observed() {
+            for m in &derive_failures { crate::run_state::diagnostic(None, crate::diag::from_legacy(m, "macro")); }
+        }
         eprintln!("relax-run: derive failures: {} (their generated items are missing)", derive_failures.len());
         for m in derive_failures.iter().take(std::env::var("RELAX_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20)) {
             eprintln!("  {}", m);
@@ -836,6 +861,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let max_err: usize = std::env::var("RELAX_RUN_ERRORS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     if !prog.errors.is_empty() {
+        for e in &prog.errors {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "resolve")); }
+        }
         eprintln!("relax-run: {} unresolved imports (first {}):", prog.errors.len(), max_err.min(prog.errors.len()));
         for e in prog.errors.iter().take(max_err) {
             eprintln!("  {}", e);
@@ -879,6 +907,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     phase("signatures", t);
     if !tcx.errors.is_empty() {
+        for e in &tcx.errors {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(e, "typeck")); }
+        }
         eprintln!("relax-run: {} signature errors (first {}):", tcx.errors.len(), max_err.min(tcx.errors.len()));
         for e in tcx.errors.iter().take(max_err) {
             eprintln!("  {}", e);
@@ -973,6 +1004,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         match find_main(&prog, root) {
             Some(d) => Some(d),
             None => {
+                if crate::run_state::observed() {
+                    crate::run_state::diagnostic(None, crate::diag::Diagnostic::new("resolve", "", 0, 0,
+                        format!("no `fn main` at the root of {}", g.crates[g.root].name)));
+                }
                 eprintln!("relax-run: no `fn main` at the root of {}", g.crates[g.root].name);
                 return 1;
             }
@@ -1023,7 +1058,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     }
     let enum_errors = u.tcx.check_enum_discriminants(&u.prog, root_crate);
     if !enum_errors.is_empty() {
-        for error in enum_errors { eprintln!("error: {}", error); }
+        for error in enum_errors {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&error, "typeck")); }
+            eprintln!("error: {}", error);
+        }
         return 1;
     }
     jit::set_program_args(prog_args.clone());
@@ -1042,6 +1080,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
                 c.load_manifest(root_crate);
                 let warm = c.startup_manifest_valid() && c.stats.packs_rejected == 0 && c.stats.packs as usize == u.prog.crates.len() && (!u.prog.record_front || u.prog.front_restored.iter().all(|r| *r));
                 crate::warm::classify(warm);
+                crate::run_state::emit(crate::run_state::Event::Warm { domain: None, warm });
                 u.front.warm_cache.store(warm, Ordering::Relaxed);
                 if warm {
                     warm_start = Some((c.manifest.len(), c.manifest_present, c.manifest_uncached));
@@ -1389,8 +1428,8 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
 /// The native run host: the OS loop starts before compilation, the graph opens a host window,
 /// and the compiled program starts as an ordinary domain. No HAL dependency in the compiler.
 pub struct MainHost {
-    pub run: fn(Box<dyn FnOnce() -> i32 + Send>) -> i32,
-    pub open: fn(&str) -> Result<(), String>,
+    pub run: fn(Box<dyn FnMut() -> i32 + Send>) -> i32,
+    pub open: fn(&str, &str) -> Result<(), String>,
     pub start: fn(crate::domain::AppSpec) -> Result<(), String>,
     pub relaunch: fn() -> Result<(), String>,
 }
@@ -1591,7 +1630,7 @@ fn flush_errors(block: bool) {
             }
         }
         // the report file may be a FIFO a slow reader drains: written after the owner thread releases it
-        let to_report: Vec<String> = if u.errors.len() > seen && reporting() { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
+        let to_report: Vec<String> = if u.errors.len() > seen && (reporting() || crate::run_state::observed()) { u.errors.iter().skip(seen).map(|e| e.to_string()).collect() } else { Vec::new() };
         ERRORS_SEEN.store(u.errors.len() as u64, Ordering::Relaxed);
         to_report
     };

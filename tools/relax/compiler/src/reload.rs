@@ -176,6 +176,7 @@ fn report_gandalf_refusal(ev: &crate::borrowck::event::GandalfEvent) {
     eprintln!("borrow check failed: {} at {}:{}:{}: {} (live edit refused)", e.fn_path, e.file, e.line, e.col, e.message);
     let mut d = e.to_diagnostic();
     d.notes.push(format!("live edit refused in {}", e.fn_path));
+    if crate::run_state::observed() { crate::run_state::diagnostic(crate::run::app_domain(), d.clone()); }
     if crate::diag::enabled() {
         crate::diag::emit(&d);
         // Pipes used by agents/serve must receive each line before the next check.
@@ -3501,6 +3502,15 @@ static SESSION: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::n
 
 /// One edit's record. `saved`: the newest edited file's modification time (the save).
 fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
+    if crate::run_state::observed() {
+        if o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:")) {
+            for line in &o.lines {
+                crate::run_state::diagnostic(crate::run::app_domain(), crate::diag::from_legacy(line, "typeck"));
+            }
+        } else {
+            crate::run_state::emit(crate::run_state::Event::Diagnostics { domain: crate::run::app_domain(), records: Vec::new().into() });
+        }
+    }
     let now = std::time::SystemTime::now();
     let detect = saved.map_or(0.0, |t| unix_ms(now) - unix_ms(t) - seen.elapsed().as_secs_f64() * 1e3).max(0.0);
     let work: f64 = o.ms.iter().sum();

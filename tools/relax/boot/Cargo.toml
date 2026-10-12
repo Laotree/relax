@@ -1,0 +1,14 @@
+[package]
+name = "relax-boot"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+makepad-widgets = { path = "../../../widgets", default-features = false }
+makepad-draw = { path = "../../../draw" }
+# Match Relax's provided HAL so both use the same process session registry.
+makepad-hal = { path = "../../../platform/hal", features = ["host-shims"] }
+makepad-live-reload-core = { path = "../../../libs/live_reload_core" }
+relax-base = { workspace = true }
