@@ -4128,6 +4128,50 @@ impl Unit {
     /// `gen` > 0 marks the install as part of patch group `gen`.
     /// Links `code` (emitted with its relocated fields zeroed) where it lands, then installs it.
     pub fn install(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
+        // check-before-run: a body's first code is installed only once its checker accepts it
+        // (a live patch, gen > 0, passed reload's gate instead)
+        if gen == 0 && !self.fns[id as usize].compiled {
+            if let Some(e) = self.refused_by_check(id) {
+                return Ok(unsafe { install_error(self, id, &e) });
+            }
+        }
+        self.install_unchecked(id, code, relocs, pc_map, gen)
+    }
+
+    /// check-before-run: whether slot `id` (an app fn instance about to get its first code) may
+    /// run. Its owner's borrow-check verdict comes from this run, the disk cache or a synchronous
+    /// check now (borrowck::lazy::check_before_run): `makepad run` never executes a body its
+    /// checker rejects, whatever the background checker reached. Some(error) refuses it: the
+    /// errors are printed here and the slot gets the error stub (the call ends the run).
+    fn refused_by_check(&mut self, id: u32) -> Option<String> {
+        let options = &self.prog.session.clone().options;
+        if !crate::borrowck::lazy::gandalf_enabled(options) { return None; }
+        let d = match &self.fns[id as usize].key {
+            FnKey::Inst(d, _) if crate::borrowck::event::admit(&self.prog, self.prog.def(*d).krate) => *d,
+            _ => return None,
+        };
+        crate::borrowck::body::CheckedBody::item(&self.prog, d)?;
+        let mut c = self.cache.take();
+        let key = c.as_mut().and_then(|c| c.borrowck_key(self, id));
+        let cached = match (&c, key) {
+            (Some(c), Some(k)) => c.borrowck_stored(k),
+            _ => None,
+        };
+        self.cache = c;
+        let epoch = self.tcx.collect_epoch.load(Ordering::SeqCst);
+        if let Some(c) = &self.cache {
+            if !self.front.owner_verdicts.contains_key(&epoch) {
+                self.front.owner_verdicts.insert(epoch, std::sync::Arc::new(c.owner_verdicts(epoch)));
+            }
+        }
+        let src: std::sync::Arc<dyn crate::borrowck::lazy::FrontSource> = std::sync::Arc::new(BorrowckFront(self.front.clone()));
+        let events = crate::borrowck::lazy::check_before_run(&self.prog, &self.tcx, &src, d, epoch, key, cached);
+        let first = events.first()?;
+        for ev in &events { eprintln!("{}", ev.error.render()); }
+        Some(format!("{} (the borrow checker rejects this body, so makepad run does not execute it)", first.error.one_line()))
+    }
+
+    fn install_unchecked(&mut self, id: u32, code: &[u8], relocs: &[crate::rir::RelocAt], pc_map: Vec<(u32, u64)>, gen: u32) -> Result<u64, String> {
         let _cost_install = crate::fncost::phase(6);
         let options = &self.prog.session.clone().options;
         // the unwind trailer is kept beside the code, not in it
@@ -4929,6 +4973,13 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
 /// stores it -- false for code that came from the cache).
 unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u64)>, relocs: &[crate::rir::RelocAt], record: bool) -> u64 {
     let _cost_install = crate::fncost::phase(6);
+    // check-before-run (Unit::install), before the code is recorded: a refused body's code
+    // never reaches the disk cache or the startup image (a warm start would run it unchecked)
+    if (&*up).fns[id as usize].patch_gen == 0 && !(&*up).fns[id as usize].compiled {
+        if let Some(e) = (&mut *up).refused_by_check(id) {
+            return install_error(up, id, &e);
+        }
+    }
     // built while an earlier request's slot was open (it was left out): no cache record
     if record && TAINTED.with(|t| t.get()) { crate::cache::trace_lookup(&*up, id, "norecord:tainted"); }
     let record = record && !TAINTED.with(|t| t.get());
@@ -4968,7 +5019,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
                     ORDER_PRESENT_LEN.store(u.start_order.len(), Ordering::Relaxed);
                 }
             }
-            let a = match u.install(id, code, relocs, map, 0) {
+            let a = match u.install_unchecked(id, code, relocs, map, 0) {
                 Ok(a) => a,
                 Err(e) => return install_error(up, id, &format!("link: {}", e)),
             };
@@ -5109,7 +5160,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
             // a body that failed to compile panics when called, with the error's first line
             let msg = format!("compile error in {}: {}", name, e.lines().next().unwrap_or(""));
             let (code, relocs) = error_stub(u, &msg);
-            u.install(id, &code, &relocs, Vec::new(), 0).expect("error stub links")
+            u.install_unchecked(id, &code, &relocs, Vec::new(), 0).expect("error stub links")
         }
     }
 }

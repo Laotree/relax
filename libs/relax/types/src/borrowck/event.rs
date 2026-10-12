@@ -16,7 +16,7 @@ pub struct BorrowError {
     pub labels: Vec<Label>, pub notes: Vec<String>, pub helps: Vec<String>, pub fv_only: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Origin { Background, Gate, Check, Serve }
+pub enum Origin { Background, Gate, Check, Serve, Run }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GandalfEvent {
     pub seq: u64, pub origin: Origin, pub src: usize, pub epoch: u64,

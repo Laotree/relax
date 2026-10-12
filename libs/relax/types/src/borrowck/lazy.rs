@@ -667,6 +667,64 @@ fn worker(src: Arc<dyn FrontSource>, verbose: bool) {
     }
 }
 
+/// `makepad run` never executes a body its checker rejects (check-before-run): the verdict of
+/// `def`'s owner before its first code is installed -- from this run's verdicts, the disk cache
+/// (`cached`: the instance's stored verdict), the driver's stored owner verdict, or a synchronous
+/// check here, on the installing thread. A body still queued for the background is checked now
+/// and taken off the queue. Returns the (admitted) errors that refuse running it; an Unchecked
+/// verdict (the checker could not certify the body, or failed on it) does not refuse it.
+/// The caller holds the program (`prog`, `tcx` are the running unit's), so no front lock is taken.
+pub fn check_before_run(prog: &Program, tcx: &Tcx, src: &Arc<dyn FrontSource>, def: DefId, epoch: u64, cache_key: Option<u128>, cached: Option<StoredVerdict>) -> Vec<GandalfEvent> {
+    let identity = src.identity();
+    let key = {
+        let mut guard = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        let q = guard.get_or_insert_with(Queue::default);
+        let epoch = q.canon(identity, epoch);
+        // a newer program is being checked: this install is for a superseded epoch
+        if !q.advance(identity, epoch) { return Vec::new(); }
+        let key = (identity, def, epoch);
+        match VERDICTS.lock().unwrap_or_else(|e| e.into_inner()).get(&def).and_then(|i| i.get(&key)) {
+            Some(FnVerdict::Clean | FnVerdict::Unchecked(_)) => return Vec::new(),
+            Some(FnVerdict::Errors(evs)) => return evs.iter().filter(|e| admit(prog, e.error.krate)).cloned().collect(),
+            Some(FnVerdict::Pending) | None => {}
+        }
+        // queued for the background (Pending): checked here instead
+        if let Some(at) = q.rank_of.remove(&key) { q.order.remove(&at); q.items.remove(&at); }
+        q.seen.insert(key, ());
+        if let Some(v) = cached { v.reuse(key); return Vec::new(); }
+        key
+    };
+    let (owner_key, stored) = src.owner_verdict(prog, def, key.2);
+    if let Some(v) = stored { v.reuse(key); return Vec::new(); }
+    let Some(owner) = super::body::CheckedBody::item(prog, def) else { record(key, FnVerdict::Unchecked("no body".into())); return Vec::new(); };
+    let args = owner.identity_args(prog, tcx);
+    let t0 = crate::clock::cpu_ns();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let state = crate::tcx::EvalState::new();
+        let cx = crate::tcx::EvalCx::new(prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
+        let body = tcx.typeck(prog, def);
+        if !body.errors.is_empty() { return None; }
+        Some(super::check_body(&cx, prog, tcx, &body))
+    })).map_err(|e| panic_message(&e));
+    CHECK_NS.fetch_add(crate::clock::cpu_ns() - t0, Ordering::Relaxed);
+    CHECKED.fetch_add(1, Ordering::Relaxed);
+    if let Err(msg) = &result {
+        PANICS.fetch_add(1, Ordering::Relaxed);
+        let mut notes = PANIC_NOTES.lock().unwrap_or_else(|e| e.into_inner());
+        if notes.len() < 5 { notes.push(format!("{}: {}", prog.def_path(def), msg)); }
+    }
+    let storable = match &result {
+        Ok(Some(v)) if v.errors.is_empty() => Some(v.unchecked.first().map_or(StoredVerdict::Clean, |why| StoredVerdict::Unchecked(why.clone()))),
+        Ok(None) => Some(StoredVerdict::Unchecked("typeck".into())),
+        _ => None,
+    };
+    if let Some(v) = storable {
+        let mut keys = VERDICT_KEYS.lock().unwrap_or_else(|e| e.into_inner());
+        keys.extend(cache_key.into_iter().chain(owner_key).map(|k| (k, v.clone())));
+    }
+    finish_verdict(prog, identity, key.2, def, &args, result, Origin::Run)
+}
+
 pub struct Growth<'a> {
     pub changed_insts: &'a [(DefId, Vec<TyId>)], pub before: &'a [Vec<super::fv::Summary>], pub visible_crates: &'a [bool],
 }

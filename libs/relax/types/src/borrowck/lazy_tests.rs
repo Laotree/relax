@@ -171,6 +171,35 @@ fn guard_filters_non_app() {
 }
 
 #[test]
+fn check_before_run_decides_before_the_background() {
+    if child("check_before_run_decides_before_the_background") { return; }
+    // the worker stays gated (never quiet): every verdict below comes from check_before_run
+    let front = TestFront::new(0);
+    let src: Arc<dyn FrontSource> = front.clone();
+    let (id, rx) = subscribe();
+    let bad = front.enqueue("bad", false);
+    assert_eq!(verdict(front.identity(), bad, &[], front.epoch()), FnVerdict::Pending);
+    let refused = check_before_run(&front.prog, &front.tcx, &src, bad, front.epoch(), None, None);
+    assert_eq!(refused.len(), 1); assert_eq!(refused[0].error.code, "E0502"); assert_eq!(refused[0].origin, Origin::Run);
+    assert_eq!(event(&rx), refused[0]);
+    assert!(matches!(verdict(front.identity(), bad, &[], front.epoch()), FnVerdict::Errors(_)));
+    // asked again (another instance of the same owner): the recorded errors, no second check
+    assert_eq!(check_before_run(&front.prog, &front.tcx, &src, bad, front.epoch(), None, None), refused);
+    assert!(rx.try_recv().is_err());
+    let clean = named(&front.prog, "clean");
+    assert!(check_before_run(&front.prog, &front.tcx, &src, clean, front.epoch(), None, None).is_empty());
+    assert_eq!(verdict(front.identity(), clean, &[], front.epoch()), FnVerdict::Clean);
+    // a body the checker cannot certify (type errors) runs: rustc's verdict on it is typeck's
+    let fail = named(&front.prog, "typefail");
+    assert!(check_before_run(&front.prog, &front.tcx, &src, fail, front.epoch(), None, None).is_empty());
+    // a stored clean verdict is trusted without a check
+    let a = named(&front.prog, "a");
+    assert!(check_before_run(&front.prog, &front.tcx, &src, a, front.epoch(), None, Some(StoredVerdict::Clean)).is_empty());
+    assert_eq!(verdict(front.identity(), a, &[], front.epoch()), FnVerdict::Clean);
+    unsubscribe(id); stop();
+}
+
+#[test]
 fn verdict_states() {
     if child("verdict_states") { return; }
     let front = TestFront::new(0);

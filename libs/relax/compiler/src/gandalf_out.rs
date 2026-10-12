@@ -14,7 +14,8 @@ impl Console {
                 // A live-edit gate refusal is printed and emitted once, by reload's
                 // report_gandalf_refusal, before the transaction returns.
                 let gate = ev.origin == Origin::Gate;
-                if !quiet && !gate {
+                // check-before-run (Origin::Run) printed its refusal on the installing thread
+                if !quiet && !gate && ev.origin != Origin::Run {
                     if ev.origin == Origin::Background {
                         eprintln!("makepad-run: [t={:.0} ms] borrow check failed: {} at {}:{}: {}\n{}", crate::clock::ms_since_start(), ev.error.fn_path, ev.error.file, ev.error.line, ev.error.message, ev.error.render());
                     } else { eprintln!("{}", ev.error.render()); }
