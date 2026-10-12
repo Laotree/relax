@@ -10,13 +10,12 @@ use relax_compiler::{
     domain::{AppSpec, DomainState},
     run_state::{self, Mode, ParkedPanic, Phase, State},
 };
-use std::sync::Condvar;
+use relax_session::sync::{Condvar, Mutex, MutexGuard};
 use std::{
     collections::{HashSet, VecDeque},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicI32, Ordering},
-        Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };

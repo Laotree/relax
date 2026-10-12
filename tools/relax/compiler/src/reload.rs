@@ -3312,10 +3312,10 @@ static RESTART_REASON: relax_session::sync::Mutex<String> = relax_session::sync:
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (RELAX_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-static DOMAIN_RESTORED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-static DOMAIN_SNAPSHOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DOMAIN_RESTORED: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
+static DOMAIN_SNAPSHOT: relax_session::sync::Mutex<Option<String>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static DOMAIN_INPUTS: std::sync::Mutex<Option<Inputs>> = std::sync::Mutex::new(None);
+static DOMAIN_INPUTS: relax_session::sync::Mutex<Option<Inputs>> = relax_session::sync::Mutex::new(None);
 static DOMAIN_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// End native callbacks into the outgoing domain before its static block can be reclaimed.
@@ -3354,7 +3354,7 @@ pub extern "C" fn __relax_live_edit_enabled() -> bool {
 /// The program's wake for its event loop (std::relax::on_patch): called from the watcher
 /// thread after a patch is installed, off the unit, so an idle app polls the new
 /// generation at once instead of at its next idle tick.
-static PATCH_WAKER: std::sync::Mutex<Option<(crate::domain::Callback, extern "C" fn())>> = std::sync::Mutex::new(None);
+static PATCH_WAKER: relax_session::sync::Mutex<Option<(crate::domain::Callback, extern "C" fn())>> = relax_session::sync::Mutex::new(None);
 
 pub extern "C" fn __relax_on_patch(f: usize) {
     let wake = if f == 0 { None } else { crate::domain::callback().map(|scope| (scope, unsafe { std::mem::transmute(f) })) };

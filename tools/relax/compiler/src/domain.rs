@@ -35,7 +35,7 @@ use crate::rir::Sym;
 use crate::sandbox::{initial_bytes, provenance_words};
 use crate::syms::SymKind;
 use std::collections::HashSet;
-use std::sync::Mutex;
+use relax_session::sync::Mutex;
 
 /// The address of constant data object `addr` as every domain must see it: unchanged when its
 /// image (and the data it points to) holds no address inside the compile domain's block; else a
@@ -428,11 +428,11 @@ pub(crate) fn args_of(base: u64) -> Option<Vec<Vec<u8>>> {
 }
 
 static DOMAINS: Mutex<Vec<Domain>> = Mutex::new(Vec::new());
-static CHANGED: std::sync::Condvar = std::sync::Condvar::new();
+static CHANGED: relax_session::sync::Condvar = relax_session::sync::Condvar::new();
 type Observer = std::sync::Arc<dyn Fn(DomainId, &DomainState) + Send + Sync>;
 static OBSERVER: Mutex<Option<Observer>> = Mutex::new(None);
 
-fn domains() -> std::sync::MutexGuard<'static, Vec<Domain>> {
+fn domains() -> relax_session::sync::MutexGuard<'static, Vec<Domain>> {
     DOMAINS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
