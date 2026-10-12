@@ -333,8 +333,14 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     } else {
         eprintln!("makepad check: {} crates type- and borrow-checked in {:.1} s", crates.len(), t_front.as_secs_f64());
     }
-    errors.sort();
+    // rustc's order: by file, then position (a plain string sort put line 10 before line 3)
+    errors.sort_by_cached_key(|e| error_position(e));
     errors.dedup();
+    // a follow-on failure (a body or signature that could not be checked because of an error
+    // already reported) is no error of its own: rustc reports only the cause
+    if errors.iter().any(|e| !is_follow_on(e)) {
+        errors.retain(|e| !is_follow_on(e));
+    }
     for e in errors.iter().filter(|_| emit) {
         if crate::diag::enabled() {
             crate::diag::emit(&crate::diag::from_legacy(e, "typeck"));
@@ -557,4 +563,26 @@ fn function_origin(u: &Unit, mut id: u32) -> Option<(u32,u32)> {
         }
     }
     None
+}
+
+/// (path, line, col, text) of an error line `path:line:col: ...` (no location: sorts first).
+fn error_position(e: &str) -> (String, u32, u32, String) {
+    let first = e.lines().next().unwrap_or("");
+    for (i, _) in first.match_indices(':') {
+        let mut it = first[i + 1..].splitn(3, ':');
+        if let (Some(l), Some(c)) = (it.next(), it.next()) {
+            if let (Ok(l), Ok(c)) = (l.trim().parse::<u32>(), c.trim().parse::<u32>()) {
+                return (first[..i].to_string(), l, c, e.to_string());
+            }
+        }
+    }
+    (String::new(), 0, 0, e.to_string())
+}
+
+/// A check that could not run because of an error reported elsewhere (typeck's cascade notes).
+fn is_follow_on(e: &str) -> bool {
+    let first = e.lines().next().unwrap_or("");
+    first.contains("type checking failed due to previous errors")
+        || first.contains("signature has unresolved types -- fix the signature errors first")
+        || first.contains("has unresolved types in its signature -- fix its signature errors first")
 }

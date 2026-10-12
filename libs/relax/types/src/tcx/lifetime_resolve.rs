@@ -131,7 +131,7 @@ impl LifetimeResolver<'_> {
                 _ => {}
             }
         }
-        self.error(span, "use of undeclared lifetime");
+        self.error(span, &format!("E0261: use of undeclared lifetime name `{}`", text));
         self.record_lifetime_use(key, LifetimeRes::Error);
     }
 
@@ -140,7 +140,7 @@ impl LifetimeResolver<'_> {
             match self.ribs[i].kind {
                 LifetimeRibKind::AnonymousCreateParameter { binder, report_in_path } => {
                     if in_path && report_in_path {
-                        self.error(span, "implicit elided lifetime not allowed in this path");
+                        self.error(span, "E0726: implicit elided lifetime not allowed here");
                         self.record_lifetime_use(key, LifetimeRes::Error);
                     } else {
                         let id = self.declare(binder, None, span);
@@ -150,13 +150,13 @@ impl LifetimeResolver<'_> {
                 }
                 LifetimeRibKind::Elided { res, error_in_path } => {
                     if in_path && error_in_path {
-                        self.error(span, "implicit elided lifetime not allowed in this path");
+                        self.error(span, "E0726: implicit elided lifetime not allowed here");
                         self.record_lifetime_use(key, LifetimeRes::Error);
                     } else { self.record_lifetime_use(key, res); }
                     return;
                 }
                 LifetimeRibKind::AnonymousReportError | LifetimeRibKind::ElisionFailure => {
-                    self.error(span, "missing lifetime specifier");
+                    self.error(span, "E0106: missing lifetime specifier");
                     self.record_lifetime_use(key, LifetimeRes::Error);
                     return;
                 }
@@ -165,7 +165,7 @@ impl LifetimeResolver<'_> {
                 LifetimeRibKind::ConcreteAnonConst => panic!("anonymous constant has no inference lifetime rib"),
             }
         }
-        self.error(span, "missing lifetime specifier");
+        self.error(span, "E0106: missing lifetime specifier");
         self.record_lifetime_use(key, LifetimeRes::Error);
     }
 
@@ -174,10 +174,10 @@ impl LifetimeResolver<'_> {
         for p in self.prog.files[self.file as usize].ast.list(params) {
             if !matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
             let name = self.prog.files[self.file as usize].text(p.name).to_owned();
-            if name == "'static" || name == "'_" { self.error(p.name.lo, "invalid lifetime parameter name"); }
-            if bindings.iter().any(|(n, _)| *n == name) { self.error(p.name.lo, "lifetime parameter declared twice"); }
+            if name == "'static" || name == "'_" { self.error(p.name.lo, &format!("E0262: invalid lifetime parameter name: `{}`", name)); }
+            if bindings.iter().any(|(n, _)| *n == name) { self.error(p.name.lo, &format!("E0403: the name `{}` is already used for a generic parameter in this item's generic parameters", name)); }
             if self.ribs.iter().any(|r| r.bindings.iter().any(|(n, _)| *n == name)) {
-                self.error(p.name.lo, "lifetime name shadows a lifetime name already in scope");
+                self.error(p.name.lo, &format!("E0496: lifetime name `{}` shadows a lifetime name that is already in scope", name));
             }
             let id = self.declare(binder, Some(p.name), p.name.lo);
             self.resolution.uses.insert(LifetimeKey::Named(p.name.lo, p.name.hi), LifetimeRes::Param(id));

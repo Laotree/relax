@@ -2560,7 +2560,15 @@ impl Tcx {
                 self.lower_dyn(cx, prog, file, module, env, &[b], p.lo, source_ty)
             }
             _ => {
-                self.err(cx, prog, file, p.lo, format!("`{}` is not a type", path_str(prog, file, p)));
+                {
+                // rustc: a trait in type position without `dyn` (2021+) is E0782; any other
+                // non-type item is E0573 "expected type, found <kind> `X`"
+                let msg = match prog.def(d).kind {
+                    DefKind::Trait => "E0782: expected a type, found a trait".to_string(),
+                    k => format!("E0573: expected type, found {} `{}`", def_kind_descr(k), path_str(prog, file, p)),
+                };
+                self.err(cx, prog, file, p.lo, msg);
+            }
                 self.tys.error
             }
         }
@@ -3560,5 +3568,15 @@ fn collect_argument_impl_traits(ast: &ast::Ast, t: ast::TyId, out: &mut Vec<ast:
             }
         }
         _ => {}
+    }
+}
+
+/// rustc's DefKind::descr for the kinds a type path can wrongly name (E0573).
+fn def_kind_descr(k: DefKind) -> &'static str {
+    match k {
+        DefKind::Fn => "function", DefKind::AssocFn => "associated function", DefKind::Const => "constant",
+        DefKind::AssocConst => "associated constant", DefKind::Static => "static", DefKind::Mod => "module",
+        DefKind::Variant => "variant", DefKind::MacroRules => "macro", DefKind::ForeignFn => "foreign function",
+        DefKind::ForeignStatic => "foreign static", DefKind::Field => "field", _ => "item",
     }
 }

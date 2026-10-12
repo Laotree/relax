@@ -1109,7 +1109,7 @@ impl<'a> Fcx<'a> {
             None => {
                 let expected = self.ty_str(prev_ty);
                 let found = self.ty_str(new_ty);
-                self.err(lo, format!("mismatched types: expected `{expected}`, found `{found}`"));
+                self.err(lo, format!("E0308: mismatched types: expected `{expected}`, found `{found}`"));
                 self.tcx.tys.error
             }
         }
@@ -1462,7 +1462,7 @@ impl<'a> Fcx<'a> {
         } else {
             (sx, sa)
         };
-        self.err(pos, format!("mismatched types: expected `{}`, found `{}`", sx, sa));
+        self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", sx, sa));
         false
     }
 
@@ -1724,7 +1724,7 @@ impl<'a> Fcx<'a> {
             self.b.coerce.insert(ex.0, Coerce::Upcast(sd, dd));
         } else if !self.eq(sa, sx) {
             let (p, q) = (self.ty_str(sx), self.ty_str(sa));
-            self.err(pos, format!("mismatched types: expected `{}`, found `{}`", p, q));
+            self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", p, q));
         }
     }
 
@@ -2150,7 +2150,7 @@ impl<'a> Fcx<'a> {
                     _ => {
                         if !matches!(self.tcx.tys.kind(et), TyKind::Error | TyKind::Infer(_)) {
                             let ts = self.ty_str(et);
-                            self.err(self.last_lo, format!("slice pattern on `{}` -- match an array or a slice", ts));
+                            self.err(self.last_lo, format!("E0529: expected an array or slice, found `{}`", ts));
                         }
                         (self.tcx.tys.error, None)
                     }
@@ -2224,7 +2224,8 @@ impl<'a> Fcx<'a> {
                             }
                             None => {
                                 bad = true;
-                                self.err(fp.name.lo, format!("no field `{}`", self.text(fp.name)))
+                                let what = self.adt_field_owner(adt_ty, vi);
+                                self.err(fp.name.lo, format!("E0026: {} does not have a field named `{}`", what, self.text(fp.name)))
                             }
                         }
                     }
@@ -2286,7 +2287,7 @@ impl<'a> Fcx<'a> {
                     };
                     match tys.get(fi) {
                         Some(ft) => self.check_assignee(*x, *ft, lo),
-                        None => self.err(lo, format!("mismatched types: the tuple has {} elements", m)),
+                        None => self.err(lo, format!("E0308: mismatched types: the tuple has {} elements", m)),
                     }
                 }
             }
@@ -2357,7 +2358,7 @@ impl<'a> Fcx<'a> {
                         };
                         match self.field_ty(adt_ty, vi, fname) {
                             Some((_, ft)) => self.check_assignee(fe.expr, ft, lo),
-                            None => self.err(fe.name.lo, format!("no field `{}`", self.text(fe.name))),
+                            None => { let what = self.adt_field_owner(adt_ty, vi); self.err(fe.name.lo, format!("E0026: {} does not have a field named `{}`", what, self.text(fe.name))) }
                         }
                     }
                 }
@@ -2569,6 +2570,38 @@ impl<'a> Fcx<'a> {
         self.err(lo, format!("E0063: missing field{} {} in initializer of `{}`", if len == 1 { "" } else { "s" }, names, ty_name));
     }
 
+    /// rustc's name of the struct / variant / union a field list belongs to: "struct `S`",
+    /// "variant `E::V`", "union `U`" (E0026, E0559, E0560).
+    fn adt_field_owner(&mut self, adt_ty: TyId, vi: u32) -> String {
+        let t = self.shallow(adt_ty);
+        let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(t).clone() else { return format!("`{}`", self.ty_str(t)) };
+        let Some(adt) = self.tcx.adts.get(&ad) else { return format!("`{}`", self.ty_str(t)) };
+        let name = self.prog.syms.str(self.prog.def(ad).name).to_string();
+        if adt.is_enum {
+            let v = adt.variants.get(vi as usize).map_or(String::new(), |v| self.prog.syms.str(v.name).to_string());
+            format!("variant `{}::{}`", name, v)
+        } else if adt.is_union {
+            format!("union `{}`", name)
+        } else {
+            format!("struct `{}`", name)
+        }
+    }
+
+    /// rustc's Ty::prefix_string before a type in E0599: "struct ", "enum ", "union ",
+    /// "type parameter ", else "type ".
+    fn ty_prefix(&mut self, t: TyId) -> &'static str {
+        let t = self.shallow(t);
+        match self.tcx.tys.kind(t) {
+            TyKind::Adt(d, _, _) => match self.tcx.adts.get(d) {
+                Some(a) if a.is_enum => "enum ",
+                Some(a) if a.is_union => "union ",
+                _ => "struct ",
+            },
+            TyKind::Param(_) => "type parameter ",
+            _ => "type ",
+        }
+    }
+
     fn field_ty(&mut self, adt_ty: TyId, vi: u32, name: Sym) -> Option<(u32, TyId)> {
         let t = self.shallow(adt_ty);
         if let TyKind::Adt(d, args, regions) = self.tcx.tys.kind(t).clone() {
@@ -2646,7 +2679,7 @@ impl<'a> Fcx<'a> {
                     return Res::Def(d);
                 }
             }
-            self.err(path.lo, format!("unresolved struct `{}`", crate::tcx::path_str(prog, self.file, path)));
+            self.err(path.lo, format!("E0422: cannot find struct, variant or union type `{}` in this scope", crate::tcx::path_str(prog, self.file, path)));
             return Res::Err;
         }
         // module::Struct, then Enum::Variant / Self::Variant
@@ -2881,7 +2914,8 @@ impl<'a> Fcx<'a> {
             return r;
         }
         let ts = self.ty_str(st);
-        self.err(lo, format!("no item `{}` on `{}` -- name the trait: `<{} as Trait>::{}`", self.prog.syms.str(name), ts, ts, self.prog.syms.str(name)));
+        let kind = self.ty_prefix(st);
+        self.err(lo, format!("E0599: no function or associated item named `{}` found for {}`{}` in the current scope -- name the trait: `<{} as Trait>::{}`", self.prog.syms.str(name), kind, ts, ts, self.prog.syms.str(name)));
         (Res::Err, error)
     }
 
@@ -3117,7 +3151,7 @@ impl<'a> Fcx<'a> {
                 // (rustc_resolve late.rs resolve_qpath, "required for backward compatibility")
                 let prim_first = n == 2 && !path.global() && crate::program::PRIMS.iter().any(|(nm, _)| prog.syms.get(nm) == Some(segs[0].1));
                 if pk != DefKind::Enum && pk != DefKind::Trait && !prim_first {
-                    self.err(path.lo, format!("cannot find value `{}`", crate::tcx::path_str(prog, self.file, path)));
+                    self.err(path.lo, format!("E0425: cannot find value `{}` in this scope", crate::tcx::path_str(prog, self.file, path)));
                     return (Res::Err, error);
                 }
             }
@@ -3128,8 +3162,9 @@ impl<'a> Fcx<'a> {
             None => {
                 // a missing first segment: where it exists (E0433, rustc's "failed to resolve")
                 let help = if n == 2 && !path.global() { import_help(prog, self.module, self.sym(self.ast().segs(path.segs)[0].name), true) } else { String::new() };
-                let code = if help.is_empty() { "" } else { "E0433: " };
-                self.err(path.lo, format!("{}cannot resolve `{}`{}", code, crate::tcx::path_str(prog, self.file, path), help));
+                let first = crate::tcx::path_str(prog, self.file, path);
+                let first = first.rsplit_once("::").map_or(first.as_str(), |(a, _)| a).to_string();
+                self.err(path.lo, format!("E0433: failed to resolve: use of undeclared type `{}`{}", first, help));
                 return (Res::Err, error);
             }
         };
@@ -3227,7 +3262,8 @@ impl<'a> Fcx<'a> {
                     return r;
                 }
                 let ts = self.ty_str(self_ty);
-                self.err(path.lo, format!("no associated item `{}` on `{}`", prog.syms.str(name), ts));
+                let kind = self.ty_prefix(self_ty);
+                self.err(path.lo, format!("E0599: no function or associated item named `{}` found for {}`{}` in the current scope", prog.syms.str(name), kind, ts));
                 (Res::Err, error)
             }
         }
@@ -4034,7 +4070,7 @@ impl<'a> Fcx<'a> {
                         Some(i) => i,
                         None => {
                             let s = self.ty_str(t);
-                            self.err(lo, format!("cannot deref `{}`", s));
+                            self.err(lo, format!("E0614: type `{}` cannot be dereferenced", s));
                             error
                         }
                     }
@@ -4358,7 +4394,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Break(label, x) => {
                 if self.in_loop_condition && label.is_none() {
-                    self.err(lo, "unlabeled `break` in the condition of a `while` loop".to_string());
+                    self.err(lo, "E0590: `break` or `continue` with no label in the condition of a `while` loop".to_string());
                 }
                 let l = label.map(|x| self.sym_lifetime(x));
                 let t = match &x.get() {
@@ -4387,13 +4423,13 @@ impl<'a> Fcx<'a> {
                         }
                     }
                 } else {
-                    self.err(lo, "`break` outside of a loop".to_string());
+                    self.err(lo, "E0268: `break` outside of a loop or labeled block".to_string());
                 }
                 self.tcx.tys.never
             }
             ExprKind::Continue(label) => {
                 if self.in_loop_condition && label.is_none() {
-                    self.err(lo, "unlabeled `continue` in the condition of a `while` loop".to_string());
+                    self.err(lo, "E0590: `break` or `continue` with no label in the condition of a `while` loop".to_string());
                 }
                 self.tcx.tys.never
             }
@@ -4570,7 +4606,7 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 let s = self.ty_str(t);
-                self.err(lo, format!("no field `{}` on `{}`", idx, s));
+                self.err(lo, format!("E0609: no field `{}` on type `{}`", idx, s));
                 error
             }
             ExprKind::Index(a, i) => {
@@ -4689,7 +4725,7 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 let s = self.ty_str(ta);
-                self.err(lo, format!("cannot index `{}`", s));
+                self.err(lo, format!("E0608: cannot index into a value of type `{}`", s));
                 error
             }
             ExprKind::AddrOf(raw, m, x) => {
@@ -4771,7 +4807,9 @@ impl<'a> Fcx<'a> {
                             self.coerce_or_unify(t, ft, Some(fx), fe.name.lo);
                         }
                         None => {
-                            self.err(fe.name.lo, format!("no field `{}`", self.text(fe.name)));
+                            let what = self.adt_field_owner(adt_ty, vi);
+                            let code = if what.starts_with("variant") { "E0559" } else { "E0560" };
+                            self.err(fe.name.lo, format!("{}: {} has no field named `{}`", code, what, self.text(fe.name)));
                         }
                     }
                 }
@@ -5126,7 +5164,7 @@ impl<'a> Fcx<'a> {
                     }
                 } else if !self.eq(ta, tb) {
                     let (sa, sb) = (self.ty_str(ta), self.ty_str(tb));
-                    self.err(lo, format!("cannot compare `{}` with `{}`", sa, sb));
+                    self.err(lo, format!("E0308: mismatched types: expected `{}`, found `{}`", sa, sb));
                 }
                 bool_
             }
@@ -5189,7 +5227,10 @@ impl<'a> Fcx<'a> {
                 // primitive arithmetic: both sides the same type
                 if !self.eq(sa, sb) {
                     let (x, y) = (self.ty_str(sa), self.ty_str(sb));
-                    self.err(lo, format!("no binary operator for `{}` and `{}`", x, y));
+                    // rustc: the operand's mismatch (E0308), then the unmet `X: Op<Y>` (E0277, core's
+                    // on_unimplemented message for the operator)
+                    self.err(lo, format!("E0308: mismatched types: expected `{}`, found `{}`", x, y));
+                    self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
                 }
                 ta
             }
@@ -5261,7 +5302,7 @@ impl<'a> Fcx<'a> {
             }
         }
         let ts = self.ty_str(t);
-        self.err(lo, format!("no field `{}` on `{}`", self.text(name), ts));
+        self.err(lo, format!("E0609: no field `{}` on type `{}`", self.text(name), ts));
         self.tcx.tys.error
     }
 
@@ -5395,7 +5436,7 @@ impl<'a> Fcx<'a> {
             }
             _ => {
                 let s = self.ty_str(fs);
-                self.err(lo, format!("`{}` is not callable", s));
+                self.err(lo, format!("E0618: expected function, found `{}`", s));
                 return error;
             }
         };
@@ -5924,7 +5965,7 @@ impl<'a> Fcx<'a> {
         let ta = self.infcx.deeply_resolve_ignoring_regions(ta);
         if matches!(self.select_trait(td, ta, &[tb]), Err(_)) {
             let (x, y) = (self.ty_str(ta), self.ty_str(tb));
-            self.err(lo, format!("no `{}` impl for `{}` and `{}`", tr, x, y));
+            self.err(lo, op_trait_unimplemented(&tr, &x, &y));
             return error;
         }
         let args = vec![ta, tb];
@@ -6698,3 +6739,47 @@ pub fn type_dependencies(tcx: &Tcx, ty: TyId, out: &mut impl Extend<DefId>) {
 
 #[cfg(test)]
 mod solve;
+
+/// core's `#[rustc_on_unimplemented]` message of a binary operator trait (`i32: Add<u8>`
+/// unmet, rustc E0277): library/core/src/ops/arith.rs, bit.rs, cmp.rs.
+fn binop_unimplemented(op: crate::ast::BinOp, x: &str, y: &str) -> String {
+    use crate::ast::BinOp::*;
+    match op {
+        Add => format!("cannot add `{}` to `{}`", y, x),
+        Sub => format!("cannot subtract `{}` from `{}`", y, x),
+        Mul => format!("cannot multiply `{}` by `{}`", x, y),
+        Div => format!("cannot divide `{}` by `{}`", x, y),
+        Rem => format!("cannot calculate the remainder of `{}` divided by `{}`", x, y),
+        BitAnd => format!("no implementation for `{} & {}`", x, y),
+        BitOr => format!("no implementation for `{} | {}`", x, y),
+        BitXor => format!("no implementation for `{} ^ {}`", x, y),
+        Shl => format!("no implementation for `{} << {}`", x, y),
+        Shr => format!("no implementation for `{} >> {}`", x, y),
+        Eq | Ne => format!("can't compare `{}` with `{}`", x, y),
+        Lt | Le | Gt | Ge => format!("can't compare `{}` with `{}`", x, y),
+        And | Or => format!("mismatched types: expected `bool`, found `{}`", y),
+    }
+}
+
+/// An operator trait with no impl for the operands (rustc op.rs report_binop_failure): E0368
+/// for a compound assignment, else E0369 with the operator's wording.
+fn op_trait_unimplemented(tr: &str, x: &str, y: &str) -> String {
+    let assign = |op: &str| format!("E0368: binary assignment operation `{}` cannot be applied to type `{}`", op, x);
+    match tr {
+        "Add" => format!("E0369: cannot add `{}` to `{}`", y, x),
+        "Sub" => format!("E0369: cannot subtract `{}` from `{}`", y, x),
+        "Mul" => format!("E0369: cannot multiply `{}` by `{}`", x, y),
+        "Div" => format!("E0369: cannot divide `{}` by `{}`", x, y),
+        "Rem" => format!("E0369: cannot calculate the remainder of `{}` divided by `{}`", x, y),
+        "BitAnd" => format!("E0369: no implementation for `{} & {}`", x, y),
+        "BitOr" => format!("E0369: no implementation for `{} | {}`", x, y),
+        "BitXor" => format!("E0369: no implementation for `{} ^ {}`", x, y),
+        "Shl" => format!("E0369: no implementation for `{} << {}`", x, y),
+        "Shr" => format!("E0369: no implementation for `{} >> {}`", x, y),
+        "AddAssign" => assign("+="), "SubAssign" => assign("-="), "MulAssign" => assign("*="),
+        "DivAssign" => assign("/="), "RemAssign" => assign("%="), "BitAndAssign" => assign("&="),
+        "BitOrAssign" => assign("|="), "BitXorAssign" => assign("^="), "ShlAssign" => assign("<<="),
+        "ShrAssign" => assign(">>="),
+        _ => format!("E0277: the trait bound `{}: {}<{}>` is not satisfied", x, tr, y),
+    }
+}
