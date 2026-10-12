@@ -438,7 +438,7 @@ pub unsafe fn rollback(up: *mut Unit, undo: Undo) -> Vec<String> {
         let u = &mut *up;
         jit::bump_patch_epoch();
         let ids = u.rollback_gen(undo.group);
-        let names = ids.iter().map(|id| u.fns[*id as usize].name.clone()).collect();
+        let names = ids.iter().map(|id| u.fns[*id as usize].name.to_string()).collect();
         {
             let fw = jit::front_write();
             u.tcx.collect_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2356,8 +2356,8 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     let mut inlining_callers: Vec<u32> = Vec::new();
     let mut work: Vec<u32> = slots.iter().chain(fresh.iter()).copied().collect();
     while let Some(s) = work.pop() {
-        let inl = u.fns[s as usize].inlined_into.len();
-        let mut deps = u.fns[s as usize].inlined_into.clone();
+        let inl = u.fns[s as usize].history().inlined_into.len();
+        let mut deps = u.fns[s as usize].history().inlined_into.clone();
         deps.extend(crate::sandbox::twin_of(s));
         for (k, d) in deps.into_iter().enumerate() {
             if slots.contains(&d) || fresh.contains(&d) {
@@ -2909,7 +2909,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         for &id in slots.iter().chain(fresh.iter()) {
             let f = &mut u.fns[id as usize];
             f.rir = None;
-            f.inlined_into.clear();
+            if let Some(h) = &mut f.history { h.inlined_into.clear(); }
             f.build_err = None;
             f.spec = None;
             u.reload_errors.remove(&id);
@@ -3235,7 +3235,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
         match jit::install_patched(up, id, &c.0, c.1, &c.2, gen) {
             Ok(_) => {
                 let u = &*up;
-                out.names.push(u.fns[id as usize].name.clone());
+                out.names.push(u.fns[id as usize].name.to_string());
             }
             // linking cannot fail for code that compiled (a full code region is fatal anyway)
             Err(e) => out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e)),
@@ -3244,7 +3244,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     for (id, c) in rebind_code {
         match jit::install_patched(up, id, &c.0, c.1, &c.2, gen) {
             Ok(_) => {
-                out.names.push((&*up).fns[id as usize].name.clone());
+                out.names.push((&*up).fns[id as usize].name.to_string());
             }
             Err(e) => out.lines.push(format!("link error in {}: {}", (&*up).fns[id as usize].name, e)),
         }
@@ -3278,7 +3278,7 @@ unsafe fn apply_locked(up: *mut Unit, edits: Vec<Edit>, mut pre: Vec<Option<Resu
     if let Some(fv_cx) = fv_cx { fv_session_keep(transaction, fv_cx); }
     trace_count("inlining_callers", inlining_callers.len());
     if !inlining_callers.is_empty() {
-        let mut names: Vec<&str> = inlining_callers.iter().take(3).map(|&d| u.fns[d as usize].name.as_str()).collect();
+        let mut names: Vec<&str> = inlining_callers.iter().take(3).map(|&d| u.fns[d as usize].name.as_ref()).collect();
         if inlining_callers.len() > 3 { names.push("..."); }
         out.lines.push(format!(
             "kept: {} fn(s) that inlined the edited code ({}) are rebuilt for their next call; a call of them already running (a loop that never returns) keeps the old code -- restart the app to apply it there",

@@ -2789,7 +2789,7 @@ fn summary_inner(why: &str) {
                 let (name, hint) = if (r.slot as usize) < u.fns.len() {
                     let f = &u.fns[r.slot as usize];
                     let hint = jit::slot_key(u, r.slot);
-                    (f.name.as_str(), hint)
+                    (f.name.as_ref(), hint)
                 } else {
                     ("-", "-".to_string())
                 };
@@ -2875,12 +2875,12 @@ fn summary_inner(why: &str) {
                     FnKey::Inst(d, args) if args.is_empty() => crate::program::hint_path(&u.prog.defs, &u.prog.syms, &u.prog.files, *d),
                     _ => "-".to_string(),
                 };
-                out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", kind, krate, generic as u8, f.compiled as u8, (f.rir.is_some() || f.build_ns > 0) as u8, f.inlined_into.len(), f.build_ns, f.cg_ns, src as i64, f.name, f.spec_state, if f.spec_depth == u8::MAX { -1 } else { f.spec_depth as i32 }, origin, tr, selfty, hint, if f.compiled { f.code_len } else { 0 }, !f.retired.is_empty() as u8, frames.get(idx).map_or(0, |x| x.0), frames.get(idx).map_or(0, |x| x.1), fslots.get(idx).map_or(0, |x| x.0), fslots.get(idx).map_or(0, |x| x.1)));
+                out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", kind, krate, generic as u8, f.compiled as u8, (f.rir.is_some() || f.build_ns > 0) as u8, f.history().inlined_into.len(), f.build_ns, f.cg_ns, src as i64, f.name, f.spec_state, if f.spec_depth == u8::MAX { -1 } else { f.spec_depth as i32 }, origin, tr, selfty, hint, if f.compiled { f.code_len } else { 0 }, !f.history().retired.is_empty() as u8, frames.get(idx).map_or(0, |x| x.0), frames.get(idx).map_or(0, |x| x.1), fslots.get(idx).map_or(0, |x| x.0), fslots.get(idx).map_or(0, |x| x.1)));
             }
             let _ = std::fs::write(&p, out);
             // code-size sanity: the largest O3 functions (an inliner gone wild shows here first;
             // R13's parser function was 1.9 MB)
-            let mut t1: Vec<(u32, &str)> = u.fns.iter().filter(|f| f.compiled && !f.retired.is_empty()).map(|f| (f.code_len, f.name.as_str())).collect();
+            let mut t1: Vec<(u32, &str)> = u.fns.iter().filter(|f| f.compiled && !f.history().retired.is_empty()).map(|f| (f.code_len, f.name.as_ref())).collect();
             t1.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(b.1)));
             let top: Vec<String> = t1.iter().take(5).map(|(n, name)| format!("{} {} KB", name, n / 1024)).collect();
             verbose!("relax-run: largest O3 functions: {}", if top.is_empty() { "none".to_string() } else { top.join(", ") });
@@ -2889,10 +2889,10 @@ fn summary_inner(why: &str) {
             for (idx, f) in u.fns.iter().enumerate() {
                 if let Some(&(a, b)) = frames.get(idx) {
                     if a > 0 {
-                        fr.push((a, "t0", f.name.as_str()));
+                        fr.push((a, "t0", f.name.as_ref()));
                     }
                     if b > 0 {
-                        fr.push((b, "t1", f.name.as_str()));
+                        fr.push((b, "t1", f.name.as_ref()));
                     }
                 }
             }

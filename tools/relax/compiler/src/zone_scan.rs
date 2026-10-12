@@ -204,21 +204,25 @@ pub(crate) fn kept_scan(u: &Unit) -> Vec<(&'static str, usize)> {
         a.field("fn.key");
         a.fn_key(&f.key);
         a.field("fn.name");
-        a.string(&f.name);
+        a.boxed(&f.name);
         a.field("fn.pc_map");
         f.pc_map.scan(&mut a);
-        a.field("fn.prev");
-        a.vec(&f.prev);
-        for p in &f.prev {
-            p.2.scan(&mut a);
+        if let Some(h) = &f.history {
+            a.field("fn.history");
+            a.boxed(h);
+            a.field("fn.prev");
+            a.vec(&h.prev);
+            for p in &h.prev {
+                p.2.scan(&mut a);
+            }
+            a.field("fn.retired");
+            a.vec(&h.retired);
+            for p in &h.retired {
+                p.2.scan(&mut a);
+            }
+            a.field("fn.inlined_into");
+            a.vec(&h.inlined_into);
         }
-        a.field("fn.retired");
-        a.vec(&f.retired);
-        for p in &f.retired {
-            p.2.scan(&mut a);
-        }
-        a.field("fn.inlined_into");
-        a.vec(&f.inlined_into);
     }
     a.field("fn_map");
     {

@@ -283,7 +283,7 @@ pub(super) fn find(u: &crate::jit::Unit, query: &str, max: usize) -> Vec<(u32, O
             let item = file.ast.item(def.item);
             let (lo, hi) = (file.line_col(item.lo).0 as u32, file.line_col(item.hi).0 as u32);
             if lo <= line && line <= hi && matches!(item.kind, crate::ast::ItemKind::Fn(..)) {
-                out.push((id as u32, Some(line), f.name.clone()));
+                out.push((id as u32, Some(line), f.name.to_string()));
             }
             if out.len() >= max {
                 break;
@@ -671,7 +671,7 @@ fn add_to(kind: Kind, target: Target, time: bool) -> Result<(u32, Vec<(u64, Stri
         let u = unsafe { &mut *up };
         let found = match target {
             Target::Query(ref q) => find(u, q, if kind == Kind::Break { 4 } else { 32 }),
-            Target::Slot(id) => vec![(id, None, u.fns[id as usize].name.clone())],
+            Target::Slot(id) => vec![(id, None, u.fns[id as usize].name.to_string())],
         };
         if found.is_empty() {
             return Err(format!("no compiled fn or line matches `{}` (a fn not called yet has no code to patch)", query));

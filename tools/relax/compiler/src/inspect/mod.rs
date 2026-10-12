@@ -369,7 +369,7 @@ fn jit_names(pcs: &[u64], partial: &mut Vec<String>, ms: u64) -> Vec<(String, St
                 Some((id, at)) => {
                     let f = &u.fns[id as usize];
                     let cur = pc >= f.code && pc < f.code + f.code_len as u64;
-                    let tier = if !cur && f.retired.iter().any(|r| pc >= r.0 && pc < r.0 + r.1 as u64) {
+                    let tier = if !cur && f.history().retired.iter().any(|r| pc >= r.0 && pc < r.0 + r.1 as u64) {
                         "jit/retired"
                     } else if !cur {
                         "jit/old"
@@ -416,7 +416,7 @@ fn display_name(u: &crate::jit::Unit, id: u32, depth: u32) -> String {
             s
         }
         crate::jit::FnKey::Closure(_, _, p) if depth < 8 && (*p as usize) < u.fns.len() => format!("{{closure}} in {}", display_name(u, *p, depth + 1)),
-        _ => f.name.clone(),
+        _ => f.name.to_string(),
     }
 }
 

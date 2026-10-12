@@ -1,6 +1,50 @@
 //! Settling must be invisible to generated O1 code and to later closure rebuilds.
 use super::*;
 
+#[test]
+fn fn_entry_size() {
+    // The original layout measures the inline cost on the same target as FnEntry.
+    #[allow(dead_code)]
+    struct InlineFnEntry {
+        key: FnKey,
+        name: String,
+        code: u64,
+        code_len: u32,
+        pc_map: PcMap,
+        file: u32,
+        prev: Vec<(u64, u32, PcMap, u32)>,
+        compiled: bool,
+        patch_gen: u32,
+        rir: Option<std::sync::Arc<crate::rir::Func>>,
+        refs: u32,
+        rir_refs: Box<[u32]>,
+        entry_ref: AtomicBool,
+        entry_ref_counted: bool,
+        building: bool,
+        build_err: Option<String>,
+        inlined_into: Vec<u32>,
+        build_ns: u64,
+        cg_ns: u64,
+        version: u32,
+        retired: Vec<(u64, u32, PcMap)>,
+        inflight: bool,
+        spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>, bool)>,
+        spec_state: u8,
+        spec_depth: u8,
+        baseline_hint: AtomicBool,
+        hot_hint: AtomicBool,
+        o3: AtomicBool,
+        base_code: AtomicBool,
+        calls: Box<[u32]>,
+    }
+    let before = std::mem::size_of::<InlineFnEntry>();
+    let after = std::mem::size_of::<FnEntry>();
+    eprintln!("size_of::<FnEntry>(): {before} -> {after} bytes");
+    assert!(after < before);
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(before - after, 152);
+}
+
 // Rounds 49-50: restarting leaves the running solver answers and native code intact.
 #[test]
 fn round47_const_fn_body_invalidates_solver_answer() {

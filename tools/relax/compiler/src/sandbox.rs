@@ -349,8 +349,10 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         let u = &mut *up;
         u.unindex_range(tbase, tbase + tsize);
         for f in u.fns.iter_mut() {
-            f.prev.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
-            f.retired.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
+            if let Some(h) = &mut f.history {
+                h.prev.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
+                h.retired.retain(|p| p.0 < tbase || p.0 >= tbase + tsize);
+            }
         }
     }
     // build everything first: nothing changes unless every live twin rebuilt
@@ -376,8 +378,11 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         u.index_code(at, code.len() as u32, t, info);
         let f = &mut u.fns[t as usize];
         let old = (f.code, f.code_len, std::mem::take(&mut f.pc_map), f.patch_gen);
-        f.retired.push((old.0, old.1, old.2));
-        f.prev.clear();
+        crate::zone_alloc::kept_with(|| {
+            let h = f.history.get_or_insert_with(Default::default);
+            h.retired.push((old.0, old.1, old.2));
+            h.prev.clear();
+        });
         f.code = at;
         f.code_len = code.len() as u32;
         f.pc_map = crate::jit::PcMap::new(&map);
@@ -392,7 +397,7 @@ unsafe fn recycle_locked(up: *mut Unit) -> Result<(usize, u64), String> {
         f.compiled = false;
         f.rir = None;
         f.version += 1;
-        f.prev.clear();
+        if let Some(h) = &mut f.history { h.prev.clear(); }
         let slot = u.slots.table(t) as *const std::sync::atomic::AtomicU64;
         (*slot).store(stub, std::sync::atomic::Ordering::SeqCst);
     }

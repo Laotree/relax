@@ -63,54 +63,52 @@ pub const GLUE_UNNAMED: u8 = 15;
 
 /// A slot. Heap classes (memlane zones, DESIGN-zones.md F): identity fields are KEPT (built and
 /// grown under `zone_alloc::kept`, they survive a destroy of the compiler arena): key, name,
-/// code/code_len, pc_map, file, prev, compiled, patch_gen, refs, entry_ref*, inlined_into,
-/// version, retired, the flags, spec_state/spec_depth, build_ns/cg_ns. Compile-generation fields
+/// code/code_len, pc_map, file, history, compiled, patch_gen, refs, entry_ref*,
+/// version, the flags, spec_state/spec_depth, build_ns/cg_ns. Compile-generation fields
 /// live in the compiler arena and are forgotten at the swap: rir, rir_refs, build_err, spec,
-/// calls, building, inflight.
+/// calls, building, inflight (rir_refs and uncalled spec code are copied to the kept heap).
 pub struct FnEntry {
     pub key: FnKey,
-    pub name: String,
+    /// Fixed after naming; an unnamed startup slot gets its whole name replaced on decode.
+    pub name: Box<str>,
     pub code: u64,
-    pub code_len: u32,
     pub pc_map: PcMap,
-    pub file: u32,
-    /// previous code versions (for rollback), newest last
-    pub prev: Vec<(u64, u32, PcMap, u32)>,
-    pub compiled: bool,
-    pub patch_gen: u32,
+    /// Allocated on the kept heap only when code history or an inlining caller is recorded.
+    pub history: Option<Box<SlotHistory>>,
     /// optimised RIR (input to inlining into callers, tier-up, recompiles)
     /// shared: O3 builds snapshot callees' RIR and optimise off the unit
     pub rir: Option<std::sync::Arc<crate::rir::Func>>,
-    /// Referencing Call(Fn) / FnAddr sites in every built O1 body, plus one
-    /// permanent reference for an escaping entry address. Updated on the owner thread.
-    pub refs: u32,
     /// One slot per site (duplicates matter). Kept when RIR is evicted/invalidated so
     /// a rebuild subtracts the old body's contributions before adding its new ones.
     rir_refs: Box<[u32]>,
+    /// the last build's error (a failed build is not retried until the source changes:
+    /// callers inlining it would otherwise rebuild it over and over)
+    pub build_err: Option<Box<str>>,
+    /// cpu ns of this slot's own RIR build (type check, lower, opt; nested builds excluded)
+    /// and of its codegen -- RELAX_COMPILE_REPORT
+    pub build_ns: u64,
+    pub cg_ns: u64,
+    /// code a speculative build made ahead of the first call, installed by that call
+    pub spec: Option<Box<SpecCode>>,
+    /// the slots this fn's lowered body calls (before inlining; set by its preparation): a
+    /// callee that calls its caller back is never inlined into it (inline_cycle)
+    pub calls: Box<[u32]>,
+    pub code_len: u32,
+    pub file: u32,
+    pub patch_gen: u32,
+    /// Referencing Call(Fn) / FnAddr sites in every built O1 body, plus one
+    /// permanent reference for an escaping entry address. Updated on the owner thread.
+    pub refs: u32,
+    /// bumped by every install and rollback: a O3 build of an older version is dropped
+    pub version: u32,
+    pub compiled: bool,
     /// entry() is also used by concurrent lowering (vtables), so it publishes the
     /// extra reference atomically; sync_entry_ref folds it into refs under the lock.
     entry_ref: AtomicBool,
     entry_ref_counted: bool,
     pub building: bool,
-    /// the last build's error (a failed build is not retried until the source changes:
-    /// callers inlining it would otherwise rebuild it over and over)
-    pub build_err: Option<String>,
-    /// slots that inlined this function (recompiled when it is patched)
-    pub inlined_into: Vec<u32>,
-    /// cpu ns of this slot's own RIR build (type check, lower, opt; nested builds excluded)
-    /// and of its codegen -- RELAX_COMPILE_REPORT
-    pub build_ns: u64,
-    pub cg_ns: u64,
-    /// bumped by every install and rollback: a O3 build of an older version is dropped
-    pub version: u32,
-    /// code replaced by O3 code (frames may still run in it): for PC lookups only
-    pub retired: Vec<(u64, u32, PcMap)>,
     /// a pipelined build is optimising / generating this slot off the unit (compile_split)
     pub inflight: bool,
-    /// code a speculative build made ahead of the first call, installed by that call
-    /// (unlinked code, pc map, its relocations, whether the disk cache records it: false for
-    /// code that came from the cache)
-    pub spec: Option<(Vec<u8>, Vec<(u32, u64)>, Vec<crate::rir::RelocAt>, bool)>,
     /// speculation: 0 none, 1 built ahead and not called (yet), 2 built ahead and called
     pub spec_state: u8,
     /// speculation depth this slot was queued at (u8::MAX: not queued)
@@ -123,9 +121,35 @@ pub struct FnEntry {
     pub o3: AtomicBool,
     /// its installed code is baseline code (note_base) the sampler has not found running yet
     pub base_code: AtomicBool,
-    /// the slots this fn's lowered body calls (before inlining; set by its preparation): a
-    /// callee that calls its caller back is never inlined into it (inline_cycle)
-    pub calls: Box<[u32]>,
+}
+
+/// Uninstalled speculative code; boxed so slots without it only retain one pointer.
+#[derive(Clone)]
+pub struct SpecCode {
+    pub code: Vec<u8>,
+    pub map: Vec<(u32, u64)>,
+    pub relocs: Vec<crate::rir::RelocAt>,
+    /// Whether the disk cache records it: false for code that came from the cache.
+    pub record: bool,
+}
+
+/// Kept state needed only by slots with replaced code or inlining callers.
+#[derive(Default)]
+pub struct SlotHistory {
+    /// previous code versions (for rollback), newest last
+    pub prev: Vec<(u64, u32, PcMap, u32)>,
+    /// code replaced by O3 code (frames may still run in it): for PC lookups only
+    pub retired: Vec<(u64, u32, PcMap)>,
+    /// slots that inlined this function (recompiled when it is patched)
+    pub inlined_into: Vec<u32>,
+}
+
+impl FnEntry {
+    /// Reading an untouched slot's history never allocates.
+    pub fn history(&self) -> &SlotHistory {
+        static EMPTY: SlotHistory = SlotHistory { prev: Vec::new(), retired: Vec::new(), inlined_into: Vec::new() };
+        self.history.as_deref().unwrap_or(&EMPTY)
+    }
 }
 
 pub struct Rt {
@@ -1879,7 +1903,7 @@ pub(crate) fn fn_name_at(pc: u64) -> String {
             return "-".to_string();
         }
         let u = &*UNIT;
-        u.find_fn(pc).map(|id| u.fns[id as usize].name.clone()).unwrap_or("-".to_string())
+        u.find_fn(pc).map(|id| u.fns[id as usize].name.to_string()).unwrap_or("-".to_string())
     }
 }
 
@@ -2876,7 +2900,7 @@ impl Unit {
             Err(e) => {
                 if u.fns[id as usize].build_err.is_none() {
                     u.reload_errors.insert(id);
-                    u.fns[id as usize].build_err = Some(e);
+                    u.fns[id as usize].build_err = Some(e.into_boxed_str());
                 }
             }
         }
@@ -3276,7 +3300,8 @@ impl Unit {
         // definition's own entry/export markers are read only by single_ref (declared_entry):
         // most slots (the startup image's thousands) are never asked.
         let entry_ref = matches!(key, FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_)) && !matches!(key, FnKey::Glue(GLUE_UNNAMED, _));
-        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, prev: Vec::new(), compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, inlined_into: Vec::new(), build_ns: 0, cg_ns: 0, version: 0, retired: Vec::new(), inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), calls: Box::default() }
+        let name = crate::zone_alloc::kept_with(|| name.into_boxed_str());
+        FnEntry { key, name, code: stub_addr, code_len: stub_len, pc_map: PcMap::default(), file, history: None, compiled: false, patch_gen: 0, rir: None, refs: u32::from(entry_ref), rir_refs: Box::default(), entry_ref: AtomicBool::new(entry_ref), entry_ref_counted: entry_ref, building: false, build_err: None, build_ns: 0, cg_ns: 0, version: 0, inflight: false, spec: None, spec_state: 0, spec_depth: u8::MAX, baseline_hint: AtomicBool::new(false), hot_hint: AtomicBool::new(false), o3: AtomicBool::new(false), base_code: AtomicBool::new(false), calls: Box::default() }
     }
 
     /// Slot `id` has its key: the front's slot keys and its ahead check (before the slot is
@@ -3394,7 +3419,7 @@ impl Unit {
     /// function (its code and callers stay; the reload index finds both), the map the first.
     pub(crate) fn name_slot(&mut self, id: u32, key: FnKey) -> bool {
         let key = self.slot_key_form(key);
-        let name = crate::zone_alloc::kept_with(|| fn_name(self, &key));
+        let name = crate::zone_alloc::kept_with(|| fn_name(self, &key).into_boxed_str());
         let file = self.key_file(&key);
         self.slot_named(id, &key);
         let f = &mut self.fns[id as usize];
@@ -3999,12 +4024,12 @@ impl Unit {
             (f.code, &f.pc_map)
         } else {
             let mut found = (f.code, &f.pc_map);
-            for (c, l, m, _) in &f.prev {
+            for (c, l, m, _) in &f.history().prev {
                 if pc >= *c && pc < *c + *l as u64 {
                     found = (*c, m);
                 }
             }
-            for (c, l, m) in &f.retired {
+            for (c, l, m) in &f.history().retired {
                 if pc >= *c && pc < *c + *l as u64 {
                     found = (*c, m);
                 }
@@ -4039,7 +4064,7 @@ impl Unit {
                     // the frame size of the code the pc is in (O3 when it is the current code of a
                     // slot that tiered up): a stack overflow's report then shows where the stack went
                     let fe = &self.fns[id as usize];
-                    let t1 = !fe.retired.is_empty() && *f >= fe.code && *f < fe.code + fe.code_len as u64;
+                    let t1 = !fe.history().retired.is_empty() && *f >= fe.code && *f < fe.code + fe.code_len as u64;
                     let fr = FRAMES.lock().unwrap_or_else(|e| e.into_inner()).get(id as usize).map_or(0, |x| if t1 { x.1 } else { x.0 });
                     s.push_str(&format!("{{\"fn\":{:?},\"at\":{:?},\"off\":{},\"patch_gen\":{},\"tier\":{},\"frame\":{}}}", fe.name, loc, f.wrapping_sub(fe.code), fe.patch_gen, t1 as u8, fr))
                 }
@@ -4115,11 +4140,11 @@ impl Unit {
         }
         if f.compiled {
             let old_map = std::mem::take(&mut f.pc_map);
-            crate::zone_alloc::kept_with(|| f.prev.push((f.code, f.code_len, old_map, f.patch_gen)));
+            crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, f.code_len, old_map, f.patch_gen)));
         } else if gen > 0 {
             // a patch group's first code for a slot: rolling it back restores the lazy stub
             // (length 0 marks it), so the slot builds again from the restored source
-            crate::zone_alloc::kept_with(|| f.prev.push((f.code, 0, PcMap::default(), 0)));
+            crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).prev.push((f.code, 0, PcMap::default(), 0)));
         }
         f.code = at;
         f.code_len = code.len() as u32;
@@ -4235,7 +4260,7 @@ impl Unit {
             if f.patch_gen < first || f.patch_gen == 0 {
                 break;
             }
-            let Some(prev) = f.prev.pop() else { break };
+            let Some(prev) = f.history.as_mut().and_then(|h| h.prev.pop()) else { break };
             f.code = prev.0;
             f.code_len = prev.1;
             f.pc_map = prev.2;
@@ -4265,7 +4290,7 @@ impl Unit {
                 continue;
             }
             let f = &mut self.fns[id];
-            let prev = match f.prev.pop() {
+            let prev = match f.history.as_mut().and_then(|h| h.prev.pop()) {
                 Some(p) => p,
                 None => continue,
             };
@@ -4728,8 +4753,8 @@ unsafe fn cached_tier1(up: *mut Unit, id: u32, inlined: &[u32]) {
     }
     for &c in inlined {
         u.exec_event(c, "inline");
-        if c != id && !u.fns[c as usize].inlined_into.contains(&id) {
-            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
+        if c != id && !u.fns[c as usize].history().inlined_into.contains(&id) {
+            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
         }
     }
     u.stats.tier1_cached += 1;
@@ -4745,8 +4770,9 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
     }
     SPEC_UNIT.store(up, Ordering::Release);
     // linked from the disk cache ahead by a speculative worker: install it as it is
-    if matches!(u.fns[id as usize].spec, Some((_, _, _, false))) && !matches!(u.cache.as_ref().map(|c| c.mode), Some(crate::cache::Mode::Verify)) {
-        if let Some((code, map, relocs, _)) = u.fns[id as usize].spec.take() {
+    if u.fns[id as usize].spec.as_ref().is_some_and(|s| !s.record) && !matches!(u.cache.as_ref().map(|c| c.mode), Some(crate::cache::Mode::Verify)) {
+        if let Some(spec) = u.fns[id as usize].spec.take() {
+            let SpecCode { code, map, relocs, .. } = *spec;
             u.reload_specs.remove(&id);
             u.fns[id as usize].spec_state = 2;
             main_how(1);
@@ -4789,7 +4815,8 @@ unsafe fn ready_code_locked(up: *mut Unit, id: u32) -> Option<u64> {
         return Some(a);
     }
     // built ahead by a speculative worker: the first call installs it
-    if let Some((code, map, relocs, record)) = u.fns[id as usize].spec.take() {
+    if let Some(spec) = u.fns[id as usize].spec.take() {
+        let SpecCode { code, map, relocs, record } = *spec;
         u.reload_specs.remove(&id);
         u.fns[id as usize].spec_state = 2;
         main_how(2);
@@ -4982,7 +5009,7 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
 /// A slot's name in the perf map: impl methods' names lack the self type, so the source line and
 /// the type arguments are added.
 fn perf_name(u: &Unit, id: u32) -> String {
-    let mut name = u.fns[id as usize].name.clone();
+    let mut name = u.fns[id as usize].name.to_string();
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
         let def = u.prog.def(*d);
         let pf = &u.prog.files[def.file as usize];
@@ -5060,7 +5087,7 @@ unsafe fn install_error(up: *mut Unit, id: u32, e: &str) -> u64 {
     {
         {
             let u = &mut *up;
-            let mut name = u.fns[id as usize].name.clone();
+            let mut name = u.fns[id as usize].name.to_string();
             // the instance a generic body failed for (its args decide most such errors)
             if let FnKey::Inst(_, args) = &u.fns[id as usize].key {
                 if !args.is_empty() && !name.contains('<') {
@@ -6562,7 +6589,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
             lowered = Some((**r).clone());
         }
         if let Some(e) = &u.fns[id as usize].build_err {
-            return Err(e.clone());
+            return Err(e.to_string());
         }
     }
     if let FnKey::Sandbox(base) = (&*up).fns[id as usize].key {
@@ -6575,7 +6602,7 @@ unsafe fn build_rir_unguarded(up: *mut Unit, id: u32, mode: RirMode) -> Result<(
         return Ok(());
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {
-        return Err(e.clone());
+        return Err(e.to_string());
     }
     begin_build(up, id)?;
     // `building` stays set until the RIR is stored: inlining builds callees, which may lead
@@ -6643,7 +6670,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
     let r = match lowered { Some(f) => Ok(f), None => build_rir_inner(up, id) };
     if let Err(e) = &r {
         (&mut *up).reload_errors.insert(id);
-        (&mut *up).fns[id as usize].build_err = Some(e.clone());
+        (&mut *up).fns[id as usize].build_err = Some(e.as_str().into());
     }
     let mut func = r?;
     crate::fncost::size(true, &func);
@@ -6896,7 +6923,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
             let _ = write!(f, "== {}\n{}", me, t);
         }
     }
-    let name = u.fns[id as usize].name.clone();
+    let name = u.fns[id as usize].name.to_string();
     let relayout = layout_for(options, &name);
     let prep_ns = (cpu_ns() - t0).saturating_sub(nested_ns);
     Ok((Prep { func, cfg, callees: snap, ro: u.ro_reader(), relayout, name, deferred }, prep_ns))
@@ -7105,8 +7132,8 @@ unsafe fn store_rir(up: *mut Unit, id: u32, func: crate::rir::Func, inlined: Vec
             }
         }
         u.stats.inline_rules[rule] += 1;
-        if !u.fns[c as usize].inlined_into.contains(&id) {
-            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
+        if !u.fns[c as usize].history().inlined_into.contains(&id) {
+            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
         }
     }
     u.stats.opt_ns += opt_ns;
@@ -7792,7 +7819,7 @@ unsafe fn provided_fmt_hash(u: &mut Unit, d: DefId, args: &[TyId], id: u32) -> R
     let ps: Vec<TyId> = sig.params.iter().map(|p| u.tcx.tys.subst_erasing_regions(*p, args)).collect();
     let ret = u.tcx.tys.subst_erasing_regions(sig.ret, args);
     let callee = u.fn_id(FnKey::Inst(helper, hargs));
-    let name = u.fns[id as usize].name.clone();
+    let name = u.fns[id as usize].name.to_string();
     Ok(Some(crate::lower::forward_func(u, &ps, ret, name, callee)))
 }
 
@@ -7860,7 +7887,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
     let key = (&*up).fns[id as usize].key.clone();
     let fname = {
         let u = &*up;
-        let mut n = u.fns[id as usize].name.clone();
+        let mut n = u.fns[id as usize].name.to_string();
         if let FnKey::Inst(_, args) = &key {
             if !args.is_empty() && trace_on() {
                 let a: Vec<String> = args.iter().map(|t| crate::typeck::ty_to_string(false, &u.prog, &u.tcx, *t)).collect();
@@ -7921,7 +7948,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
         {
             let t0 = cpu_ns();
             let body = Body::empty(d, args.clone(), u.prog.def(d).file, u.tcx.tys.unit);
-            let name = u.fns[id as usize].name.clone();
+            let name = u.fns[id as usize].name.to_string();
             let (func, errors) = {
                 let mut lcx = Lcx::new(u, &body, name, id);
                 lcx.lower_clone_shim(args[0]);
@@ -8067,7 +8094,7 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
 /// The same unoptimised RIR on the locked path and the ahead helpers. Publishing a helper's
 /// result does not optimise it: prepare_rir still applies the caller's normal inline policy.
 fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(crate::rir::Func, bool), String> {
-    let name = u.fns[id as usize].name.clone();
+    let name = u.fns[id as usize].name.to_string();
     trace("lower", &name);
     let mut lcx = Lcx::new(u, body, name, id);
     match key {
@@ -8530,7 +8557,7 @@ fn pc_source_pos(u: &Unit, pc: u64) -> Option<u64> {
     let map = if pc >= f.code && pc < f.code + f.code_len as u64 {
         &f.pc_map
     } else {
-        &f.retired.iter().find(|r| pc >= r.0 && pc < r.0 + r.1 as u64)?.2
+        &f.history().retired.iter().find(|r| pc >= r.0 && pc < r.0 + r.1 as u64)?.2
     };
     let off = (pc - start) as u32;
     map.lookup(off)
@@ -8772,15 +8799,15 @@ fn sampler_thread() {
                         for &os::sample::Sample { pc, weight } in &selfs {
                             if let Some(id) = u.find_fn(pc) {
                                 let f = &u.fns[id as usize];
-                                let t1 = !f.retired.is_empty();
-                                let e = m.entry(f.name.clone()).or_insert((0, t1, f.code_len));
+                                let t1 = !f.history().retired.is_empty();
+                                let e = m.entry(f.name.to_string()).or_insert((0, t1, f.code_len));
                                 e.0 += weight as u64;
                                 e.1 = t1;
                                 e.2 = f.code_len;
                                 // per-instruction counts of the dumped fns' current code
                                 if pc >= f.code && pc < f.code + f.code_len as u64 && dump_base(&f.name).is_some() {
-                                    *pm.entry((f.name.clone(), f.code, (pc - f.code) as u32)).or_insert(0) += weight as u64;
-                                    pcm.insert(f.name.clone(), (f.code, t1));
+                                    *pm.entry((f.name.to_string(), f.code, (pc - f.code) as u32)).or_insert(0) += weight as u64;
+                                    pcm.insert(f.name.to_string(), (f.code, t1));
                                 }
                             }
                         }
@@ -10033,7 +10060,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 // Cost-model admissions also expose calls in never-run bodies.
                 let never_run = match &t1_rec {
                     Some((cold, _, _)) => cold.contains(&t1_key(up, c)),
-                    None => !cf.compiled && cf.inlined_into.is_empty(),
+                    None => !cf.compiled && cf.history().inlined_into.is_empty(),
                 };
                 let cost_admits = !crate::opt::opt_off(options, "-costmodel")
                     && callee_attrs(&u.prog, &u.tcx, &u.fns, u.core_crate, c, inline_all, true)
@@ -10096,7 +10123,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
             Some(a) => a,
             None => continue,
         };
-        let live_cold = !f.compiled && f.inlined_into.is_empty();
+        let live_cold = !f.compiled && f.history().inlined_into.is_empty();
         if let Some(r) = &f.rir {
             let cold = match &t1key {
                 Some(k) => {
@@ -10176,7 +10203,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
     let ro = u.ro_reader();
     let env = x64::Env { slots: u.env.slots, tls_key: u.env.tls_key, tls_slow: u.env.tls_slow, resume: u.env.resume, opt_regs: !t1_quick_ra(options), syms: u.env.syms, sym_class: u.env.sym_class };
     let cfg = u.tier1.as_ref().unwrap().opt;
-    let name = u.fns[id as usize].name.clone();
+    let name = u.fns[id as usize].name.to_string();
     // One immutable sample input for register allocation. Both inlining rounds
     // use structural frequencies from their current CFG, independent of when
     // the sampler reaches this evidence threshold.
@@ -10405,8 +10432,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                     }
                     for &c in &inlined {
                         u.exec_event(c, "inline");
-                        if c != id && !u.fns[c as usize].inlined_into.contains(&id) {
-                            crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
+                        if c != id && !u.fns[c as usize].history().inlined_into.contains(&id) {
+                            crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
                         }
                     }
                     u.stats.tier1_installed += 1;
@@ -10432,7 +10459,7 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 }
                 let f = &mut u.fns[id as usize];
                 let old_map = std::mem::take(&mut f.pc_map);
-                crate::zone_alloc::kept_with(|| f.retired.push((f.code, f.code_len, old_map)));
+                crate::zone_alloc::kept_with(|| f.history.get_or_insert_with(Default::default).retired.push((f.code, f.code_len, old_map)));
                 f.code = at;
                 f.code_len = code.len() as u32;
                 f.pc_map = PcMap::new(&map);
@@ -10443,8 +10470,8 @@ pub unsafe fn compile_tier1(up: *mut Unit, id: u32) -> bool {
                 let n_inl = inlined.len();
                 for c in inlined {
                     u.exec_event(c, "inline");
-                    if !u.fns[c as usize].inlined_into.contains(&id) {
-                        crate::zone_alloc::kept_with(|| u.fns[c as usize].inlined_into.push(id));
+                    if !u.fns[c as usize].history().inlined_into.contains(&id) {
+                        crate::zone_alloc::kept_with(|| u.fns[c as usize].history.get_or_insert_with(Default::default).inlined_into.push(id));
                     }
                 }
                 if !options.no_block_freq && !t1prof_replay(options) {
@@ -11272,12 +11299,13 @@ pub fn expire_spec(options: &crate::options::Options) {
                 if f.compiled || f.spec_state != 1 || f.inflight || f.building {
                     continue;
                 }
-                if let Some((code, map, relocs, _)) = f.spec.take() {
+                if let Some(spec) = f.spec.take() {
+                    let SpecCode { code, map, relocs, .. } = *spec;
                     u.reload_specs.remove(&id);
-                    bytes += (code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<crate::rir::RelocAt>()) as u64;
+                    bytes += (std::mem::size_of::<SpecCode>() + code.capacity() + map.capacity() * 16 + relocs.capacity() * std::mem::size_of::<crate::rir::RelocAt>()) as u64;
                     f.spec_state = 3;
                     n += 1;
-                    if f.inlined_into.is_empty() {
+                    if f.history().inlined_into.is_empty() {
                         if let Some(r) = f.rir.take() {
                             bytes += crate::opt::inst_count(&r) as u64 * 80;
                         }
@@ -11733,7 +11761,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                         BATCH_FLIGHT.with(|b| b.borrow_mut().push(x));
                     }
                 }
-                work.push((id, f, u.fns[id as usize].name.clone()));
+                work.push((id, f, u.fns[id as usize].name.to_string()));
             }
             Err(e) => out.push((id, Err(e))),
         }
@@ -11818,7 +11846,7 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
                 }
                 Err(e) => {
                     (&mut *up).reload_errors.insert(c);
-                    (&mut *up).fns[c as usize].build_err = Some(e);
+                    (&mut *up).fns[c as usize].build_err = Some(e.into_boxed_str());
                 },
             }
         }
@@ -11851,14 +11879,14 @@ unsafe fn split_front(up: *mut Unit, id: u32) -> Result<Front, String> {
             return Ok(Front::Codegen(r.clone()));
         }
         if let Some(e) = &u.fns[id as usize].build_err {
-            return Err(e.clone());
+            return Err(e.to_string());
         }
     }
     if let Some(r) = &(&*up).fns[id as usize].rir {
         return Ok(Front::Codegen(r.clone()));
     }
     if let Some(e) = &(&*up).fns[id as usize].build_err {
-        return Err(e.clone());
+        return Err(e.to_string());
     }
     begin_build(up, id)?;
     let depth0 = BUILD_STACK.try_with(|s| s.borrow().len()).unwrap_or(0);
@@ -11958,7 +11986,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
                 }
                 let u = &mut *up;
                 u.reload_specs.insert(id);
-                u.fns[id as usize].spec = Some((code, map, crelocs, false));
+                u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs: crelocs, record: false }));
                 u.fns[id as usize].spec_state = 1;
                 u.exec_note(id, crate::exec_profile::SPEC);
                 note_spec_built(options, id);
@@ -11996,7 +12024,7 @@ unsafe fn split_begin(up: *mut Unit, id: u32, spec: bool) -> Begin {
     let e = &u.env;
     let env = x64::Env { slots: e.slots, tls_key: e.tls_key, tls_slow: e.tls_slow, resume: e.resume, opt_regs: !TIER1_ENABLED.load(Ordering::Relaxed), syms: e.syms, sym_class: e.sym_class };
     let (fold, rotate) = (u.opt.fold, u.opt.layout);
-    let name = u.fns[id as usize].name.clone();
+    let name = u.fns[id as usize].name.to_string();
     let w1 = wall_ns();
     SPLIT_NS[k].fetch_add(w1 - w0, Ordering::Relaxed);
     if !spec {
@@ -12102,7 +12130,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 }
                 Err(e) => {
                     (&mut *up).reload_errors.insert(c);
-                    (&mut *up).fns[c as usize].build_err = Some(e);
+                    (&mut *up).fns[c as usize].build_err = Some(e.into_boxed_str());
                 },
             }
         }
@@ -12144,7 +12172,7 @@ unsafe fn split_finish(up: *mut Unit, d: BackDone) -> Split {
                 let u = &mut *up;
                 if u.fns[id as usize].spec.is_none() {
                     u.reload_specs.insert(id);
-                    u.fns[id as usize].spec = Some((code, map, relocs, true));
+                    u.fns[id as usize].spec = Some(Box::new(SpecCode { code, map, relocs, record: true }));
                     u.fns[id as usize].spec_state = 1;
                     u.exec_note(id, crate::exec_profile::SPEC);
                     note_spec_built(options, id);

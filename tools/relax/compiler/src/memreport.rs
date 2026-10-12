@@ -85,13 +85,18 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
     out.push((format!("item_defs map ({})", p.item_defs.len()), (p.item_defs.capacity() * 13) as u64));
     out.push((format!("fn sigs ({})", u.tcx.signature_count()), u.tcx.signature_bytes() as u64));
     let (mut n_rir, mut rir, mut spec, mut pcm, mut names) = (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut history = 0u64;
     let mut n_fns = 0u64;
     let (mut rir_by, mut rir_n) = ([0u64; 3], [0u64; 3]);
     let mut parts = [0u64; 4];
     for f in u.fns.iter() {
         n_fns += 1;
-        names += f.name.capacity() as u64;
+        names += f.name.len() as u64;
         pcm += f.pc_map.bytes() as u64;
+        if let Some(h) = &f.history {
+            history += std::mem::size_of::<crate::jit::SlotHistory>() as u64 + vbytes(&h.prev) + vbytes(&h.retired) + vbytes(&h.inlined_into);
+            pcm += h.prev.iter().map(|p| p.2.bytes() as u64).sum::<u64>() + h.retired.iter().map(|p| p.2.bytes() as u64).sum::<u64>();
+        }
         if let Some(r) = &f.rir {
             n_rir += 1;
             let b = rir_bytes(r);
@@ -106,11 +111,12 @@ pub fn unit_sizes(u: &crate::jit::Unit) -> Vec<(String, u64)> {
             rir_n[k] += 1;
         }
         if let Some(s) = &f.spec {
-            spec += vbytes(&s.0) + vbytes(&s.1) + vbytes(&s.2);
+            spec += std::mem::size_of::<crate::jit::SpecCode>() as u64 + vbytes(&s.code) + vbytes(&s.map) + vbytes(&s.relocs);
         }
     }
     out.push((format!("slots ({}; FnEntry)", n_fns), n_fns * std::mem::size_of::<crate::jit::FnEntry>() as u64));
     out.push(("slot names".to_string(), names));
+    out.push(("slot histories".to_string(), history));
     out.push(("slot pc maps".to_string(), pcm));
     out.push((format!("slot RIR kept ({} fns; inst {} B, block {} B, func {} B)", n_rir, std::mem::size_of::<crate::rir::Inst>(), std::mem::size_of::<crate::rir::Block>(), std::mem::size_of::<crate::rir::Func>()), rir));
     out.push((format!("  RIR insts used (of {:.1} MB capacity)", parts[1] as f64 / 1048576.0), parts[0]));

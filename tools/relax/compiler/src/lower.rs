@@ -1116,7 +1116,7 @@ impl<'a> Lcx<'a> {
         let (line, _) = prog.files[file].line_col(self.pos);
         let fname = adt.variants[0].fields.get(fi as usize).map_or(String::new(), |f| prog.syms.str(f.name).to_string());
         let site = crate::jit::FieldSite {
-            func: if (self.cur_fn as usize) < self.u.fns.len() { self.u.fns[self.cur_fn as usize].name.clone() } else { String::from("?") },
+            func: if (self.cur_fn as usize) < self.u.fns.len() { self.u.fns[self.cur_fn as usize].name.to_string() } else { String::from("?") },
             file: self.b.file,
             line_lo: lo as u32,
             line_hi: hi as u32,

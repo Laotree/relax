@@ -2506,7 +2506,7 @@ impl Cache {
     pub fn record_manifest(&mut self, u: &Unit, root: u32, order: &[u32], present: usize, stop: &dyn Fn() -> bool) -> bool {
         if !crate::preempt::is_stopped() && crate::warm::enabled() {
             for (id, f) in u.fns.iter().enumerate() {
-                if !f.compiled && !f.inlined_into.is_empty() {
+                if !f.compiled && !f.history().inlined_into.is_empty() {
                     self.remember_outcome(u, id as u32, None, "cold inlined-only; no standalone code entry");
                 }
             }

@@ -579,9 +579,9 @@ unsafe fn commit(up: *mut Unit, f: Fresh) -> (usize, usize, (usize, usize)) {
         if e.spec.is_some() {
             // code built ahead and not yet called (teardown): kept until it is
             let spec = crate::zone_alloc::kept_clone(&e.spec);
-            if let Some((code, _, relocs, _)) = &spec {
+            if let Some(s) = &spec {
                 specs += 1;
-                spec_bytes += code.len() + relocs.len() * std::mem::size_of::<crate::rir::RelocAt>();
+                spec_bytes += std::mem::size_of::<SpecCode>() + s.code.len() + s.relocs.len() * std::mem::size_of::<crate::rir::RelocAt>();
             }
             put(&mut e.spec, spec);
         }

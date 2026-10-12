@@ -336,7 +336,7 @@ fn app_scope_live_layout_edits() {
         call(value, old_value.as_mut_ptr() as u64);
         assert_eq!(old_value[layout.fields[0] as usize / 8], 44);
         // The previously compiled drop entry was rebuilt in the same transaction.
-        assert!(patch.names.contains(&u.fns[drop_id as usize].name));
+        assert!(patch.names.contains(&u.fns[drop_id as usize].name.to_string()));
         call(drop_entry, old_value.as_mut_ptr() as u64);
         // A layout-only edit must publish even when no function entry changed.
         let dormant = before.replace("pub n: u32 }", "pub n: u32, pub added: bool }");
