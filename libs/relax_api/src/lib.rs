@@ -54,6 +54,40 @@ pub struct Entry {
     pub drop: Option<DropFn>,
 }
 
+/// An owned buffer in flight across the boundary: pointer, capacity and length (in elements).
+/// Both sides allocate with the system allocator, so the buffer moves as is, but each side keeps
+/// its own `Vec`/`String` layout: an op never returns a `Vec` or `String`, it writes these
+/// words (or returns them) and a plain wrapper, which the caller's side compiles, rebuilds the
+/// value with its own `from_raw_parts`. Elements must be plain data (`#[relax_api(plain)]`, or
+/// primitives) with an alignment of at most 16.
+pub type Words = [usize; 3];
+
+/// Hands a `Vec`'s buffer over (nothing is freed, the receiver owns it now).
+pub fn vec_to_words<T>(v: Vec<T>) -> Words {
+    debug_assert!(core::mem::align_of::<T>() <= 16);
+    let mut v = core::mem::ManuallyDrop::new(v);
+    [v.as_mut_ptr() as usize, v.capacity(), v.len()]
+}
+
+/// Takes the buffer back as a `Vec`.
+///
+/// # Safety
+/// `w` came from [`vec_to_words`] of a `Vec<T>` for this `T` (or is empty), taken once.
+pub unsafe fn vec_from_words<T>(w: Words) -> Vec<T> {
+    if w[1] == 0 { return Vec::new(); }
+    Vec::from_raw_parts(w[0] as *mut T, w[2], w[1])
+}
+
+pub fn string_to_words(s: String) -> Words {
+    vec_to_words(s.into_bytes())
+}
+
+/// # Safety
+/// `w` came from [`string_to_words`] (valid UTF-8), taken once.
+pub unsafe fn string_from_words(w: Words) -> String {
+    String::from_utf8_unchecked(vec_from_words::<u8>(w))
+}
+
 thread_local! { static LAST_PANIC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 
 /// A wrapper's caught panic: its text is kept for [`last_panic`]; returns 1.
