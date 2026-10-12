@@ -257,8 +257,12 @@ impl LiveId {
         if n == usize::MAX {
             return f(None);
         }
-        let mut buf = vec![0u8; n];
-        let m = Self::lut_name_copy(*self, &mut buf);
+        // A stack buffer for ordinary names: ids are printed per frame
+        // (labels, logs, script keys) and a heap copy per call added up.
+        let mut stack = [0u8; 128];
+        let mut heap;
+        let buf: &mut [u8] = if n <= stack.len() { &mut stack[..n] } else { heap = vec![0u8; n]; &mut heap };
+        let m = Self::lut_name_copy(*self, buf);
         f(Some(std::str::from_utf8(&buf[..m]).unwrap_or("")))
     }
 
