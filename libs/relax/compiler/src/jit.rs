@@ -11685,13 +11685,13 @@ fn job_gate(reenter: bool) -> JobGuard {
         if is_main {
             let _ = GATED_MAIN.compare_exchange(0, wall_ns().max(1), Ordering::SeqCst, Ordering::SeqCst);
         }
-        // bounded: a swap (CefInitialize) may wait for a callback on this very thread, which
-        // needs this compile; after 2 s the job goes ahead (the swap's risky moment is long over).
-        // The settle swap's gate is not: its pause ends with the swap.
-        let t0 = std::time::Instant::now();
+        // A job never starts while an allocator swap is in progress, however long the swap
+        // takes: it would allocate from the zone the swap is re-registering (a wall-clock
+        // escape here turned a slow machine into a crash). The thread that began the swap
+        // passes above (a callback into its own swap code), so the swap can finish.
         let mut g = BG_MX.lock().unwrap_or_else(|e| e.into_inner());
         let shut = || BG_PAUSE.load(Ordering::SeqCst) || SWAP_DRAIN.load(Ordering::SeqCst) && !reenter;
-        while shut() && (t0.elapsed().as_millis() < 2000 || SWAP_HARD.load(Ordering::SeqCst) || SWAP_DRAIN.load(Ordering::SeqCst)) {
+        while shut() {
             g = BG_CV.wait_timeout(g, std::time::Duration::from_millis(50)).map(|x| x.0).unwrap_or_else(|e| e.into_inner().0);
         }
         if is_main {
@@ -11734,15 +11734,12 @@ impl Drop for JobIdle {
     }
 }
 
-/// The thread compile jobs are paused for (an allocator swap, a fork), 0: none. Bounded as the
-/// job gate is: after 2 s everyone is served again (a swap may wait for a callback on another
-/// thread that needs a compile).
+/// The thread compile jobs are paused for (an allocator swap, a fork), 0: none.
 pub(crate) fn paused_for() -> u64 {
-    if BG_PAUSE.load(Ordering::SeqCst) && (SWAP_HARD.load(Ordering::SeqCst) || wall_ns().saturating_sub(BG_PAUSE_AT.load(Ordering::SeqCst)) < 2_000_000_000) { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
+    // Only the pauser's requests are served while the jobs are paused, for as long as the pause
+    // lasts: serving others after a time limit ran compile work inside the swap.
+    if BG_PAUSE.load(Ordering::SeqCst) { BG_PAUSER.load(Ordering::SeqCst) } else { 0 }
 }
-
-/// When the current pause began (wall ns).
-static BG_PAUSE_AT: AtomicU64 = AtomicU64::new(0);
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
@@ -11759,18 +11756,22 @@ impl Drop for JobGuard {
 
 /// phase 0: an allocator swap begins (park compile jobs); 1: it is done (resume). Called by
 /// the program on its own thread, outside any compile job of that thread.
-/// Holds new compile jobs at their start and waits (up to 5 s) for running ones to finish.
+/// Holds new compile jobs at their start and waits for running ones to finish (no time limit).
 fn pause_compile_jobs(trace: bool) {
     let t0 = std::time::Instant::now();
     BG_PAUSER.store(me(), Ordering::SeqCst);
-    BG_PAUSE_AT.store(wall_ns(), Ordering::SeqCst);
     BG_PAUSE.store(true, Ordering::SeqCst);
     let mine = if JOB_DEPTH.with(|d| d.get()) > 0 { 1 } else { 0 };
     // the jobs running, and the request the owner serves now (unless it is the pauser's own)
+    // Every running job must reach its end before the swap goes on: a job that frees memory
+    // while the zone is re-registered corrupts the heap. Waiting is the only safe answer, so a
+    // long wait is logged (the jobs, what they wait for), never cut short.
+    let mut next_log = 5000u128;
     while BG_ACTIVE.load(Ordering::SeqCst) > mine || owner::busy_for_other(me()) {
-        if t0.elapsed().as_millis() > 5000 {
-            eprintln!("makepad: compile jobs still running after 5 s -- going ahead");
-            break;
+        if t0.elapsed().as_millis() >= next_log {
+            next_log += 5000;
+            eprintln!("makepad: the allocator swap waits for compile jobs ({:.0} s): jobs active {}, waiting for the owner {}, owner busy for another thread {}",
+                t0.elapsed().as_secs_f64(), BG_ACTIVE.load(Ordering::SeqCst), BG_IDLE.load(Ordering::SeqCst), owner::busy_for_other(me()));
         }
         std::thread::sleep(std::time::Duration::from_micros(200));
     }
@@ -13717,6 +13718,49 @@ impl PcMap {
 #[cfg(test)]
 #[path = "settle_tests.rs"]
 mod settle_tests;
+
+#[cfg(test)]
+mod allocator_swap_tests {
+    use super::*;
+
+    /// The swap waits for a running compile job however long it runs. A job that outlives the
+    /// old 5 s cap (a slow machine, a big O3 build) must still be finished when the swap goes on;
+    /// a job that starts during the swap waits for its end, however long that takes.
+    #[test]
+    fn the_swap_waits_for_a_job_longer_than_five_seconds() {
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let job_over = std::sync::Arc::new(AtomicBool::new(false));
+        let (running_tx, running_rx) = std::sync::mpsc::channel();
+        let flag = job_over.clone();
+        let job = std::thread::spawn(move || {
+            let guard = compile_job();
+            running_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5600));
+            flag.store(true, Ordering::SeqCst);
+            drop(guard);
+        });
+        running_rx.recv().unwrap();
+        let begun = std::time::Instant::now();
+        allocator_swap(0);
+        let waited = begun.elapsed();
+        assert!(job_over.load(Ordering::SeqCst), "the swap went ahead with a compile job still running ({waited:?})");
+        assert!(waited.as_millis() >= 5000, "it did not wait the job out ({waited:?})");
+        // a job that starts during the swap is held until the swap ends, however long
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let s2 = started.clone();
+        let late = std::thread::spawn(move || {
+            let _guard = compile_job();
+            s2.store(true, Ordering::SeqCst);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2600));
+        assert!(!started.load(Ordering::SeqCst), "a job started inside the swap after 2 s");
+        allocator_swap(1);
+        late.join().unwrap();
+        assert!(started.load(Ordering::SeqCst));
+        job.join().unwrap();
+    }
+}
 
 static EXEC_CHECK: AtomicBool = AtomicBool::new(false);
 

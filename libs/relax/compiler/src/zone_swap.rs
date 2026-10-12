@@ -152,7 +152,6 @@ fn quiesce(deadline: Duration) -> Result<Gate, String> {
     };
     wait("drain")?;
     BG_PAUSER.store(me(), Ordering::SeqCst);
-    BG_PAUSE_AT.store(wall_ns(), Ordering::SeqCst);
     SWAP_HARD.store(true, Ordering::SeqCst);
     BG_PAUSE.store(true, Ordering::SeqCst);
     SWAP_DRAIN.store(false, Ordering::SeqCst);
