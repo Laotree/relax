@@ -151,6 +151,24 @@ pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
     out
 }
 
+/// As [`take_for`], for the crates of `prog` named by `only` (indices a run-time load added) that
+/// are not bound yet.
+pub fn take_for_crates(prog: &Program, only: &[u32]) -> Vec<(u32, ProvidedCrate)> {
+    let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for p in REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        if !matched.contains(&p.name) {
+            continue;
+        }
+        for &i in only {
+            if prog.syms.str(prog.crates[i as usize].name) == p.name {
+                out.push((i, p.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Is crate `krate` of `prog` a registered provided crate?
 fn is_provided(prog: &Program, krate: u32) -> bool {
     let name = prog.syms.str(prog.crates[krate as usize].name);

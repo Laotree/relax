@@ -2239,22 +2239,7 @@ impl Unit {
         // identity state below (the provided crates' shims, the slot table, the unit itself) is
         // built in the kept heap; the compile state (prog, tcx, layouts, front) stays as built
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
-        let mut provided_types = HashMap::new();
-        let mut opaque_layouts = HashMap::new();
-        let mut check_layouts = Vec::new();
-        for (k, pc) in &provided {
-            for (i, def) in prog.defs.iter().enumerate() {
-                if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
-                    let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
-                    if let Some((size, align, drop)) = pc.types.get(path.as_str()) {
-                        provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
-                        opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
-                    } else if let Some((size, align, offs)) = pc.layouts.get(path.as_str()) {
-                        check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs));
-                    }
-                }
-            }
-        }
+        let (mut provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
         let provided_shared = {
             let ks: Vec<u32> = provided.iter().map(|(k, _)| *k).collect();
@@ -14122,4 +14107,71 @@ fn ctfe_error_message(m: &str) -> String {
     let builtin = ["attempt to ", "index out of bounds", "divide by zero", "remainder by zero", "misaligned pointer", "null pointer"];
     // (core's runtime text says `len`; the evaluator's says `length`)
     if builtin.iter().any(|b| m.starts_with(b)) { m.replacen("the len is", "the length is", 1) } else { format!("evaluation panicked: {}", m) }
+}
+
+/// Per provided crate present in `provided`: its opaque (handle) types with rustc's drop, their
+/// layouts, and the plain types whose layout must be checked against rustc's.
+fn provided_type_tables(prog: &Program, provided: &[(u32, crate::provided::ProvidedCrate)])
+    -> (HashMap<DefId, u64>, HashMap<DefId, (u32, u32)>, Vec<(DefId, u32, u32, String, &'static [u64])>)
+{
+    let mut provided_types = HashMap::new();
+    let mut opaque_layouts = HashMap::new();
+    let mut check_layouts = Vec::new();
+    for (k, pc) in provided {
+        for (i, def) in prog.defs.iter().enumerate() {
+            if def.krate == *k && matches!(def.kind, DefKind::Struct | DefKind::Enum) {
+                let path = crate::provided::norm(&prog.def_path(DefId(i as u32)));
+                if let Some((size, align, drop)) = pc.types.get(path.as_str()) {
+                    provided_types.insert(DefId(i as u32), drop.map_or(0, |f| f as usize as u64));
+                    opaque_layouts.insert(DefId(i as u32), (*size as u32, *align as u32));
+                } else if let Some((size, align, offs)) = pc.layouts.get(path.as_str()) {
+                    check_layouts.push((DefId(i as u32), *size as u32, *align as u32, path, *offs));
+                }
+            }
+        }
+    }
+    (provided_types, opaque_layouts, check_layouts)
+}
+
+impl Unit {
+    /// Binds the provided crates among `new` (crate indices a run-time load just added, e.g. the
+    /// crates an app domain brings that the booted program did not have): the same tables
+    /// `Unit::new` builds for the boot program's provided crates, so their `#[relax_api]` ops are
+    /// ops here too, not compiled from source. Only crates whose source matched
+    /// (`provided::check_sources`) bind. On the owner thread, with the front-end write lock.
+    pub(crate) unsafe fn bind_added_provided(&mut self, new: &[u32]) {
+        let added = crate::provided::take_for_crates(&self.prog, new);
+        if added.is_empty() { return; }
+        let (types, opaque, check_layouts) = provided_type_tables(&self.prog, &added);
+        crate::zone_alloc::kept_with(|| {
+            self.provided.extend(added.iter().cloned());
+            self.provided_types.extend(types);
+        });
+        self.lay.opaque.extend(opaque);
+        // rustc's layout must be Relax's for a plain type, else it is used through the crate's fns only
+        let probe = crate::layout::Layouts::new();
+        for (d, size, align, path, offs) in check_layouts {
+            let t = self.tcx.tys.intern(TyKind::Adt(d, crate::types::List::EMPTY, crate::types::RegionArgsId::EMPTY));
+            let l = probe.of(&crate::layout::LayoutCx::new(&self.prog), &self.tcx, t);
+            let offs_ok = offs.is_empty() || (offs.len() == l.fields.len() && offs.iter().zip(&l.fields).all(|(a, b)| *a == *b as u64));
+            if l.size != size || l.align != align || !offs_ok {
+                eprintln!("makepad: provided type {}: rustc lays it out in {} bytes (align {}, field offsets {:?}), makepad run in {} (align {}, {:?}): opaque, used through the crate's fns only", path, size, align, offs, l.size, l.align, l.fields);
+                self.lay.opaque.insert(d, (size, align));
+                crate::zone_alloc::kept_with(|| self.provided_types.insert(d, 0));
+            }
+        }
+        let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
+        let shared = {
+            let pt = &self.provided_types;
+            let provided = &self.provided;
+            crate::provided::crossing_types(&self.prog, &self.tcx, &ks, &|d| {
+                let k = self.prog.def(d).krate;
+                crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
+                    let key = crate::provided::key(&self.prog, &self.tcx, d);
+                    provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
+                }
+            })
+        };
+        crate::zone_alloc::kept_with(|| self.provided_shared.extend(shared));
+    }
 }

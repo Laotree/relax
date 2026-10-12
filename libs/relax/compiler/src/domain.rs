@@ -1248,6 +1248,9 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
             crate_of[ci] = added.crates[b];
             record_loaded(idents[ci], added.crates[b], &g.crates[ci], &cfgs[ci]);
         }
+        // provided crates (rustc-built into the loader) that only this app brings, like the
+        // compute crate for Stage, bind their ops now, as the booted program's do
+        { let _fw = crate::jit::front_write(); u.bind_added_provided(&added.crates); }
     }
     if cancelled(id) { return Err(vec!["domain compilation cancelled".into()]); }
     let root = crate_of[g.root];
