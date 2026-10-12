@@ -424,7 +424,7 @@ fn data_regions() -> Vec<(String, usize, usize, usize)> {
     extern "C" fn cb(info: *const PhdrInfo, _size: usize, data: *mut u8) -> i32 {
         let out = unsafe { &mut *(data as *mut Vec<(String, usize, usize, usize)>) };
         let info = unsafe { &*info };
-        let name = if info.name.is_null() { String::new() } else { unsafe { CStr::from_ptr(info.name) }.to_string_lossy().into_owned() };
+        let name = if info.name.is_null() { String::new() } else { unsafe { CStr::from_ptr(info.name.cast()) }.to_string_lossy().into_owned() };
         let module = if name.is_empty() { "exe".to_string() } else if name.contains("makepad") || name.contains("relax") { name.rsplit('/').next().unwrap_or("lib").to_string() } else { return 0 };
         for i in 0..info.phnum as usize {
             let p = unsafe { &*(info.phdr as *const Phdr).add(i) };
