@@ -47,7 +47,20 @@ fn exit_with(result: std::io::Result<i32>) -> ExitCode {
 /// `makepad-remote app <pid|app|socket> <command> [k=v ...]`: prints the answer's lines; exit
 /// status 1 when the answer had an error, 2 when the app cannot be reached.
 fn run_app(spec: &str, argv: &[String]) -> ExitCode {
-    let client = match makepad_remote::Client::connect(spec) {
+    // `<host>:<app|pid>` goes through the hub to an app on another machine (a phone that dials in)
+    #[cfg(unix)]
+    let routed = (spec.contains(':') && !spec.contains('/')).then(|| {
+        let bin = std::env::var_os("MAKEPAD_RUN_BIN").map(PathBuf::from);
+        makepad_remote::hub::connect(bin.as_deref()).map(|hub| makepad_remote::Client::routed(&hub, spec))
+    });
+    #[cfg(not(unix))]
+    let routed: Option<Result<makepad_remote::Client, String>> = None;
+    let connected = match routed {
+        Some(Ok(c)) => Ok(c),
+        Some(Err(e)) => { eprintln!("makepad-remote app: {e}"); return ExitCode::from(2); }
+        None => makepad_remote::Client::connect(spec),
+    };
+    let client = match connected {
         Ok(c) => c,
         Err(e) => {
             eprintln!("makepad-remote app: {e}");

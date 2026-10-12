@@ -146,7 +146,7 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
-    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,quest,no_android_choreographer,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
+    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
     // Every variable declared here rebuilds this crate and everything that
     // depends on it (draw, widgets, every app) when its value changes: keep
     // per-app inputs out (see src/app_meta.rs). MAKEPAD selects build options
@@ -159,7 +159,7 @@ fn main() {
     // Desktop Linux and macOS always use the HAL. Linux shell selection
     // (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
     let desktop_linux = target_os == "linux";
-    let hal = target_os == "macos" || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
+    let hal = target_os == "macos" || target_os == "android" || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
         println!("cargo:rustc-cfg=hal");
     }
@@ -168,12 +168,6 @@ fn main() {
         for config in configs.split(['+', ',']) {
             match config {
                 "lines" => println!("cargo:rustc-cfg=lines"),
-                "no_android_choreographer" => println!("cargo:rustc-cfg=no_android_choreographer"),
-                "quest" if !desktop_linux => {
-                    println!("cargo:rustc-cfg=quest");
-                    println!("cargo:rustc-cfg=use_gles_3");
-                    println!("cargo:rustc-cfg=use_vulkan");
-                }
                 "apple_bundle" => println!("cargo:rustc-cfg=apple_bundle"),
                 "gpusim" => println!("cargo:rustc-cfg=gpusim"),
                 "use_gles_3" if !desktop_linux => println!("cargo:rustc-cfg=use_gles_3"),
