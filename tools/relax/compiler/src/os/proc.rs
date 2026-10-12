@@ -20,6 +20,8 @@ static ARGS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 /// host library started from a loader (Android: bionic hands a cdylib's std no argv, the APK's
 /// executable passes its own).
 pub fn set_args(args: Vec<Vec<u8>>) {
+    // process state: rebuilt in the kept heap (the settle swap destroys the compiler arena's generation)
+    let args = crate::zone_alloc::kept_with(|| args.clone());
     let _ = ARGS.set(args);
 }
 

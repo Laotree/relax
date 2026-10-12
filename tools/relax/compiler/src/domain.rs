@@ -167,6 +167,7 @@ pub extern "C" fn relax_domain_id() -> u32 {
 
 /// For Relax std (`__relax_domain_enter`): the first thing a started thread does.
 pub extern "C" fn relax_domain_enter(base: u64, token: u64) {
+    let _kept = crate::zone_alloc::kept();
     unsafe {
         let t = crate::domain_threads::data(crate::jit::tls_block());
         if token != 0 { t.registrations.push((base, token)); }
@@ -176,6 +177,7 @@ pub extern "C" fn relax_domain_enter(base: u64, token: u64) {
 
 fn register_current(base: u64) {
     if base == 0 { return; }
+    let _kept = crate::zone_alloc::kept();
     let t = unsafe { crate::domain_threads::data(crate::jit::tls_block()) };
     if t.registrations.iter().any(|r| r.0 == base) { return; }
     let token = relax_domain_reserve(base);
@@ -305,7 +307,10 @@ pub fn create(u: &Unit) -> u64 {
     for id in ids {
         materialize_in(u, base, id, &mut seen);
     }
-    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+    {
+        let _kept = crate::zone_alloc::kept();
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(base);
+    }
     base
 }
 
@@ -432,8 +437,35 @@ static CHANGED: relax_session::sync::Condvar = relax_session::sync::Condvar::new
 type Observer = std::sync::Arc<dyn Fn(DomainId, &DomainState) + Send + Sync>;
 static OBSERVER: Mutex<Option<Observer>> = Mutex::new(None);
 
-fn domains() -> relax_session::sync::MutexGuard<'static, Vec<Domain>> {
-    DOMAINS.lock().unwrap_or_else(|e| e.into_inner())
+/// The registry lock, held in the kept phase: the registry is process state that outlives the
+/// settle swap (zone_swap destroys the compiler arena generation), so whatever a mutator
+/// allocates while holding it (records, names, strings) lands in the kept heap, whichever
+/// phase the calling thread is in. Values built before the lock is taken are copied in with
+/// `kept_clone`.
+struct Registry {
+    guard: relax_session::sync::MutexGuard<'static, Vec<Domain>>,
+    _kept: crate::zone_alloc::PhaseGuard,
+}
+impl std::ops::Deref for Registry {
+    type Target = Vec<Domain>;
+    fn deref(&self) -> &Vec<Domain> { &self.guard }
+}
+impl std::ops::DerefMut for Registry {
+    fn deref_mut(&mut self) -> &mut Vec<Domain> { &mut self.guard }
+}
+impl Registry {
+    fn wait(self) -> Self {
+        let Registry { guard, _kept } = self;
+        Registry { guard: CHANGED.wait(guard).unwrap_or_else(|e| e.into_inner()), _kept }
+    }
+    fn wait_timeout(self, left: std::time::Duration) -> Self {
+        let Registry { guard, _kept } = self;
+        Registry { guard: CHANGED.wait_timeout(guard, left).unwrap_or_else(|e| e.into_inner()).0, _kept }
+    }
+}
+fn domains() -> Registry {
+    let kept = crate::zone_alloc::kept();
+    Registry { guard: DOMAINS.lock().unwrap_or_else(|e| e.into_inner()), _kept: kept }
 }
 
 /// The host's callback for state changes (compiling phases, running, crashed, exited).
@@ -521,7 +553,7 @@ pub fn wait_first_frame(id: DomainId, timeout: std::time::Duration) -> Option<f6
         if left.is_zero() {
             return None;
         }
-        d = CHANGED.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+        d = d.wait_timeout(left);
     }
 }
 
@@ -565,7 +597,7 @@ fn stop_for(id: DomainId, timeout: std::time::Duration) -> Result<(), String> {
             continue;
         }
         if d.reclaiming {
-            ds = CHANGED.wait(ds).unwrap_or_else(|e| e.into_inner());
+            ds = ds.wait();
             continue;
         }
         let left = deadline.saturating_duration_since(std::time::Instant::now());
@@ -585,7 +617,7 @@ fn stop_for(id: DomainId, timeout: std::time::Duration) -> Result<(), String> {
             }
             return Ok(());
         }
-        ds = CHANGED.wait_timeout(ds, left).unwrap_or_else(|e| e.into_inner()).0;
+        ds = ds.wait_timeout(left);
     }
 }
 
@@ -657,6 +689,7 @@ pub(crate) fn compile_phase(id: DomainId, phase: &str) -> Result<(), String> {
 // keys for native callback threads; every ThreadData holds only its own values.
 static TLS_KEYS: Mutex<Vec<(u64, Vec<Option<usize>>)>> = Mutex::new(Vec::new());
 pub(crate) fn tls_key_create(base: u64, dtor: usize) -> u32 {
+    let _kept = crate::zone_alloc::kept();
     let mut keys = TLS_KEYS.lock().unwrap_or_else(|e| e.into_inner());
     let i = match keys.iter().position(|k| k.0 == base) {
         Some(i) => i,
@@ -711,6 +744,8 @@ pub(crate) fn identities(g: &crate::unitgraph::Graph, cfgs: &[crate::cfg::CfgSet
 }
 
 pub(crate) fn record_loaded(ident: u64, krate: u32, c: &crate::crates::CrateUnit, cfg: &crate::cfg::CfgSet) {
+    // the record is process state (see `Registry`): all of it is built in the kept heap
+    let _kept = crate::zone_alloc::kept();
     let mut set = cfg.set.clone();
     set.sort();
     let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
@@ -983,7 +1018,9 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         Ok(x) => x,
         Err(e) => return fail(id, vec![e]),
     };
-    let heap = match crate::zone_alloc::domain::DomainHeap::new() {
+    // the domain's arena is program memory: the kept heap (the compiler arena's generation is
+    // destroyed by the settle swap; a domain heap is never touched by it)
+    let heap = match crate::zone_alloc::kept_with(crate::zone_alloc::domain::DomainHeap::new) {
         Some(h) => h,
         None => { destroy(base); return fail(id, vec!["reserving domain heap".into()]); }
     };
@@ -995,7 +1032,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
             x.info.crates = g.crates.len();
             x.info.reused = n_reused;
             x.info.loaded = new_names.len();
-            x.info.new_crates = new_names;
+            x.info.new_crates = crate::zone_alloc::kept_clone(&new_names);
             x.info.resolve_ms = resolve_ms;
             x.info.load_ms = load_ms;
             x.info.spawn_ms = t2.elapsed().as_secs_f64() * 1e3;
@@ -1005,7 +1042,9 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if crate::run::app_domain() == Some(id) {
         crate::reload::domain_loaded(live_inputs);
     }
-    if let Err(e) = launch_main(upn, id, base, target, arg, &spec.package, spec.around.clone()) {
+    // the domain's main thread (its name, its handle) outlives any compiler generation
+    let launched = crate::zone_alloc::kept_with(|| launch_main(upn, id, base, target, arg, &spec.package, spec.around.clone()));
+    if let Err(e) = launched {
         return fail(id, vec![e]);
     }
     Ok(id)
@@ -1107,12 +1146,15 @@ pub fn wait_thread_done(id: DomainId, timeout: std::time::Duration) -> bool {
         if left.is_zero() {
             return false;
         }
-        d = CHANGED.wait_timeout(d, left).unwrap_or_else(|e| e.into_inner()).0;
+        d = d.wait_timeout(left);
     }
 }
 
 /// The host starts an app as a domain of the program `relax run` booted (`start` on its unit).
 pub fn start_prepared_in_run(spec: AppSpec, id: DomainId) -> Result<DomainId, Vec<String>> {
+    // the loader thread compiles (resolve, load) like the boot thread: a compiler thread, so the
+    // settle swap waits for it and its compile state belongs to the compiler generation
+    let _z = crate::zone_alloc::compiler_thread();
     let up = crate::run::running_unit();
     if up.is_null() { let _loading = Loading(id); return fail(id, vec!["no program is running".into()]); }
     start_prepared(up, spec, id)

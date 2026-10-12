@@ -34,6 +34,7 @@ struct Run {
     retry: bool,
 }
 
+#[derive(Clone)]
 enum Update {
     Compiler(run_state::Event),
     Domain(DomainState),
@@ -70,8 +71,25 @@ fn state() -> MutexGuard<'static, Option<Run>> {
     RUN.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+impl Update {
+    /// A copy built in the kept heap (the caller is in the kept phase). An update crosses from
+    /// the compiler's threads to the window pump, which holds its parts for the whole run: none
+    /// of it may live in the compiler arena, whose generation the settle swap destroys.
+    fn kept(self) -> Update {
+        match self {
+            Update::Compiler(run_state::Event::Patch { domain, applied, records }) => Update::Compiler(run_state::Event::Patch {
+                domain,
+                applied,
+                records: records.iter().cloned().collect::<Vec<_>>().into(),
+            }),
+            other => other.clone(),
+        }
+    }
+}
+
 fn post(update: Update) {
     let _kept = relax_compiler::zone_alloc::kept();
+    let update = update.kept();
     UPDATES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -86,7 +104,9 @@ fn panic_changed() {
 
 pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
     makepad_hal::expect_main_loop();
-    let thread = std::thread::Builder::new()
+    // the handle (thread record, result packet) is joined at the end of the run, after the settle swap
+    // may have destroyed the compiler generation this frame runs in: it lives in the kept heap
+    let thread = relax_compiler::zone_alloc::kept_with(move || std::thread::Builder::new()
         .name("relax-compile".into())
         .stack_size(8 << 20)
         .spawn(move || {
@@ -142,7 +162,7 @@ pub fn run(mut compile: Box<dyn FnMut() -> i32 + Send>) -> i32 {
                 }
             }
         })
-        .expect("the compiler thread");
+        .expect("the compiler thread"));
     {
         let _kept = relax_compiler::zone_alloc::kept();
         makepad_hal::run_main_loop();
@@ -296,6 +316,8 @@ pub fn open(package: &str, package_dir: &str) -> Result<(), String> {
 
 pub fn start(spec: AppSpec) -> Result<(), String> {
     let _kept = relax_compiler::zone_alloc::kept();
+    // the spec is built by the boot in the compiler phase; the run state keeps it for the whole run
+    let spec = spec.clone();
     if QUIT.load(Ordering::Acquire) {
         return Err("run closed during compilation".into());
     }
