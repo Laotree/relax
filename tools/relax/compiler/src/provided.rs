@@ -101,21 +101,22 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Compares every registered crate present in the program against its embedded library
 /// closure. Any mismatch fails with file and feature/version differences; absent crates skip.
 pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
-    let reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
-    matched.clear();
+    let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
-    for p in reg.iter() {
-        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == p.name) {
+    for (name, source, manifest) in &reg {
+        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
             let current = crate::srchash::closure_manifest(pkgs, root);
-            if crate::srchash::manifest_hash(&current) != p.source {
-                let built = crate::srchash::decode_manifest(p.manifest)?;
-                return Err(crate::srchash::diff_message(&p.name, &built, &current));
+            if crate::srchash::manifest_hash(&current) != *source {
+                let built = crate::srchash::decode_manifest(manifest)?;
+                return Err(crate::srchash::diff_message(name, &built, &current));
             }
-            if !verified.contains(&p.name) { verified.push(p.name.clone()); }
+            if !verified.contains(name) { verified.push(name.clone()); }
         }
     }
-    *matched = verified;
+    let mut matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
+    for name in verified {
+        if !matched.contains(&name) { matched.push(name); }
+    }
     Ok(())
 }
 

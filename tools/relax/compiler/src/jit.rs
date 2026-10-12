@@ -533,6 +533,25 @@ fn tls_key() -> u64 {
     TLS_KEY.load(Ordering::Acquire)
 }
 
+/// A short callback from a long-lived native worker gets a scoped app TLS block. In
+/// particular, the live-edit watcher must not keep an old domain registered until it exits.
+pub(crate) fn domain_callback<R>(base: u64, token: u64, f: impl FnOnce() -> R) -> R {
+    let _kept = crate::zone_alloc::kept();
+    let previous = tls_block();
+    struct Restore(u64);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            tls_dtor(os::tls::get(tls_key()));
+            os::tls::set(tls_key(), self.0 as *mut u8);
+            crate::domain::enter(unsafe { *(self.0 as *const u64) });
+        }
+    }
+    os::tls::set(tls_key(), std::ptr::null_mut());
+    let _restore = Restore(previous);
+    crate::domain::relax_domain_enter(base, token);
+    f()
+}
+
 thread_local! {
     static ALTSTACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

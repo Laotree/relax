@@ -202,8 +202,9 @@ pub fn restart_reason() -> String {
     }
 }
 
-/// Restarts the program with `state` (a fresh run of the same command line, which reads it
-/// with `restored_state`). Returns only if the restart failed.
+/// Restarts the program with `state`, which its fresh run reads with `restored_state`.
+/// A hosted app queues a domain relaunch and returns so its event loop can finish shutdown;
+/// a directly running program replaces its process and returns only on failure.
 pub fn restart_now(state: &str) {
     unsafe { __relax_restart_now(state.as_ptr(), state.len()) }
 }

@@ -85,6 +85,12 @@ impl Inputs {
     /// Sources of more packages than this in one settled batch is a bulk change.
     pub(super) const BULK_PACKAGES: usize = 4;
 
+    /// Native bindings and the compile unit's std are shared by every domain. A fresh app
+    /// domain cannot replace them; keep the current app and report the host restart instead.
+    pub(super) fn host_restart_required<'a>(&self, paths: impl Iterator<Item = &'a str>) -> bool {
+        paths.into_iter().any(|path| matches!(self.paths.get(path).map(|x| &x.1), Some(Kind::Provided | Kind::Std)))
+    }
+
     pub(super) fn restart_reason<'a>(&self, paths: impl Iterator<Item = &'a str>) -> Option<&'static str> {
         let mut packages = BTreeSet::new();
         let mut sources = 0usize;

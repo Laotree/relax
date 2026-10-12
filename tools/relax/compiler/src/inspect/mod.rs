@@ -71,8 +71,8 @@ pub fn start(app: &str) {
     endpoint.set_hooks(makepad_remote::Hooks { enter: server_thread_enter, exit: server_thread_exit });
     endpoint.register_cmd(dispatch);
     let _ = WATCH.set(endpoint.register_watch_with(events::remote_watcher_opened, events::remote_watcher_closed));
-    for (name, version, open, close) in SERVICES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
-        serve_program_service(&endpoint, name, *version, *open, *close);
+    for (name, version, open, close, scope) in SERVICES.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        serve_program_service(&endpoint, name, *version, *open, *close, *scope);
     }
     *ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()) = Some(endpoint.clone());
     let sock = match endpoint.listen_unix(&extra) {
@@ -92,6 +92,7 @@ pub fn start(app: &str) {
 
 /// The commands: (name, arguments, what it answers).
 pub const COMMANDS: &[(&str, &str, &str)] = &[
+    ("session", "relaunch", "restart the app domain in this process, keeping its host window and GPU device"),
     ("why-hung", "[probe_ms=200]", "is it stuck and why: verdict (deadlock / blocked / busy / idle), the wait chain or cycle, stacks of the threads in it"),
     ("why-slow", "[s=3]", "where the time goes: ranked findings -- the main thread's CPU split (program / compiles / Relax runtime / system), its hot fns, the owner's service, other busy threads"),
     ("prof", "[s=3] [hz=200] [threads=all|main|owner|program|compiler|<name>] [n=15] [save=1]", "sampling CPU profile of JIT and host frames: per-thread CPU, activity split, top fns by self time with their hottest line, inclusive fns; save=1 writes folded stacks"),
@@ -99,7 +100,7 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
     ("watch", "[on=panic,hang,...] [since=<seq>] [timeout_s=N]", "block until the next event (panic, hang, ...) and answer it as one JSON line; re-arm with since=<seq>"),
     ("events", "[follow=1] [since=<seq>] [on=...]", "the recent events (follow=1: stream one JSON line per new event)"),
     ("panics", "", "panics parked now, waiting for a decision"),
-    ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind as usual, re-run the retry boundary's unit, restart the restartable fn, or make it return the values"),
+    ("resume", "<panic id> panic|retry|restart|return <v>[,<v>]", "decide a parked panic: unwind, retry, restart the hosted app domain (otherwise its restartable fn), or return the values"),
     ("memory", "[compiler=1] [n=24]", "where the memory is and why: RSS by mapping kind, malloc in use vs held free, Relax's own parts, findings, growth since the last `memory`"),
     ("diff", "<snap a> <snap b|now>", "memory growth between two snapshots, largest first"),
     ("mem", "snap <name> | timeline [from_ms= to_ms=]", "keep a named memory snapshot; resident size over time with phase markers and the peak's phase"),
@@ -127,6 +128,13 @@ pub const COMMANDS: &[(&str, &str, &str)] = &[
 
 fn dispatch(req: &Req, out: &mut Out) {
     match req.cmd.as_str() {
+        "session" => match req.pos.first().map(String::as_str) {
+            Some("relaunch") => match crate::run::relaunch() {
+                Ok(()) => out.line(&format!("{{\"relaunch\":\"queued\",\"pid\":{},\"window_kept\":true}}", std::process::id())),
+                Err(e) => out.err(&e),
+            },
+            _ => out.err("session relaunch"),
+        },
         "help" => help(req, out),
         "ping" => out.line(&format!("{{\"pid\":{},\"app\":{},\"ms\":{}}}", std::process::id(), json_str(&APP.lock().unwrap()), now_ms())),
         "threads" => cmd_threads(out),
@@ -593,19 +601,20 @@ pub fn script_error_event(line: &str) {
 /// it cut the reply at the limit.
 pub type ProgramQuery = extern "C" fn(line: *const u8, len: usize, sink: extern "C" fn(*const u8, usize, *mut std::ffi::c_void), ctx: *mut std::ffi::c_void) -> bool;
 
-static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery)>> = std::sync::Mutex::new(Vec::new());
+static PROVIDERS: std::sync::Mutex<Vec<(String, ProgramQuery, crate::domain::Callback)>> = std::sync::Mutex::new(Vec::new());
 
 /// The program registers the command `name` (makepad-platform: `gpu` and the remote commands); a
 /// later registration replaces the earlier one.
 pub extern "C" fn relax_register_inspect(name: *const u8, len: usize, query: ProgramQuery) {
+    let Some(scope) = crate::domain::callback() else { return };
     let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
     let mut p = PROVIDERS.lock().unwrap_or_else(|e| e.into_inner());
     p.retain(|x| x.0 != name);
-    p.push((name, query));
+    p.push((name, query, scope));
 }
 
-fn provider(cmd: &str) -> Option<ProgramQuery> {
-    PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == cmd).map(|x| x.1)
+fn provider(cmd: &str) -> Option<(ProgramQuery, crate::domain::Callback)> {
+    PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|x| x.0 == cmd).map(|x| (x.1, x.2))
 }
 
 /// What the sink of [`cmd_provided`] writes into: the reply, cut into lines.
@@ -615,7 +624,7 @@ struct ProvidedReply<'a, 'b> {
 }
 
 fn cmd_provided(req: &Req, out: &mut Out) {
-    let Some(query) = provider(&req.cmd) else { return };
+    let Some((query, scope)) = provider(&req.cmd) else { return };
     let mut words = vec![req.cmd.clone()];
     words.extend(req.pos.iter().cloned());
     let line = makepad_remote::app::request_line(&words, &req.kv);
@@ -629,7 +638,10 @@ fn cmd_provided(req: &Req, out: &mut Out) {
         }
     }
     let mut reply = ProvidedReply { out, pending: Vec::new() };
-    let truncated = query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void);
+    let Some(truncated) = scope.call(|| query(line.as_ptr(), line.len(), sink, &mut reply as *mut ProvidedReply as *mut std::ffi::c_void)) else {
+        reply.out.err("the app domain is not running");
+        return;
+    };
     if !reply.pending.is_empty() {
         let rest = String::from_utf8_lossy(&reply.pending).into_owned();
         reply.out.always(&rest);
@@ -673,9 +685,41 @@ extern "C" fn service_sink(ctx: *mut std::ffi::c_void, kind: u32, ptr: *const u8
 }
 
 static ENDPOINT: Mutex<Option<makepad_remote::Endpoint>> = Mutex::new(None);
-static SERVICES: Mutex<Vec<(String, u32, ServiceOpen, ServiceClose)>> = Mutex::new(Vec::new());
+static SERVICES: Mutex<Vec<(String, u32, ServiceOpen, ServiceClose, crate::domain::Callback)>> = Mutex::new(Vec::new());
+static ACTIVE_SERVICES: Mutex<Vec<std::sync::Arc<ActiveService>>> = Mutex::new(Vec::new());
 
-fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, version: u32, open: ServiceOpen, close: ServiceClose) {
+struct ActiveService {
+    scope: crate::domain::Callback,
+    close: ServiceClose,
+    handle: usize,
+    channel: std::sync::Arc<ServiceChannel>,
+    closed: AtomicBool,
+}
+
+impl ActiveService {
+    fn close(&self) {
+        if !self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            self.channel.tx.close(makepad_remote::conn::CLOSE_NORMAL, "app service closed");
+            let _ = self.scope.cleanup(|| (self.close)(self.handle));
+        }
+    }
+}
+
+/// The inspect endpoint is host-owned. Retire app handlers and cancel their producers before
+/// joining a domain; old endpoint factories reject calls through their incarnation's scope.
+pub fn stop_domain(id: u32) {
+    PROVIDERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.2.domain() != id);
+    SERVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|x| x.4.domain() != id);
+    let channels: Vec<_> = {
+        let mut active = ACTIVE_SERVICES.lock().unwrap_or_else(|e| e.into_inner());
+        let channels = active.iter().filter(|c| c.scope.domain() == id).cloned().collect();
+        active.retain(|c| c.scope.domain() != id);
+        channels
+    };
+    for channel in channels { channel.close(); }
+}
+
+fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, version: u32, open: ServiceOpen, close: ServiceClose, scope: crate::domain::Callback) {
     endpoint.register(
         name,
         version,
@@ -683,20 +727,38 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
             let channel = std::sync::Arc::new(ServiceChannel { tx: opened.channel.tx(), reason: Mutex::new(None) });
             // one reference for the program (freed by its end call), one kept here
             let for_program = std::sync::Arc::into_raw(channel.clone()) as *mut std::ffi::c_void;
-            let handle = open(opened.args.as_ptr(), opened.args.len(), service_sink, for_program);
-            if handle == 0 {
+            let active = scope.call(|| {
+                let handle = open(opened.args.as_ptr(), opened.args.len(), service_sink, for_program);
+                if handle == 0 { return None; }
+                let active = std::sync::Arc::new(ActiveService { scope, close, handle, channel: channel.clone(), closed: AtomicBool::new(false) });
+                ACTIVE_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).push(active.clone());
+                // Stop can race an open already in flight: it either drains this entry or this
+                // check closes it. The callback's registration keeps the domain alive throughout.
+                if !scope.running() { active.close(); }
+                Some(active)
+            });
+            if active.is_none() {
+                drop(unsafe { std::sync::Arc::from_raw(for_program as *const ServiceChannel) });
+            }
+            let Some(active) = active.flatten() else {
                 let why = channel.reason.lock().unwrap().take().unwrap_or_else(|| "the program refused".into());
                 return Err((makepad_remote::conn::CLOSE_REFUSED, why));
-            }
+            };
             let ch = opened.channel;
-            let _ = std::thread::Builder::new().name("makepad-remote-service".into()).spawn(move || {
+            let service = active.clone();
+            if let Err(e) = std::thread::Builder::new().name("makepad-remote-service".into()).spawn(move || {
                 while let Some(ev) = ch.recv() {
                     if matches!(ev, makepad_remote::Event::Closed(..)) {
                         break;
                     }
                 }
-                close(handle);
-            });
+                service.close();
+                ACTIVE_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !std::sync::Arc::ptr_eq(c, &service));
+            }) {
+                active.close();
+                ACTIVE_SERVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !std::sync::Arc::ptr_eq(c, &active));
+                return Err((makepad_remote::conn::CLOSE_REFUSED, e.to_string()));
+            }
             Ok(())
         }),
     );
@@ -706,13 +768,14 @@ fn serve_program_service(endpoint: &makepad_remote::Endpoint, name: &str, versio
 /// its endpoint, each channel a producer the program runs. The same mechanism as
 /// [`relax_register_inspect`], for streams.
 pub extern "C" fn relax_register_remote_service(name: *const u8, len: usize, version: u32, open: ServiceOpen, close: ServiceClose) {
+    let Some(scope) = crate::domain::callback() else { return };
     let name = unsafe { String::from_utf8_lossy(std::slice::from_raw_parts(name, len)).into_owned() };
     let mut services = SERVICES.lock().unwrap_or_else(|e| e.into_inner());
     services.retain(|x| x.0 != name);
-    services.push((name.clone(), version, open, close));
+    services.push((name.clone(), version, open, close, scope));
     // the endpoint may be up already; otherwise `start` serves what is registered by then
     if let Some(endpoint) = ENDPOINT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-        serve_program_service(endpoint, &name, version, open, close);
+        serve_program_service(endpoint, &name, version, open, close, scope);
     }
 }
 

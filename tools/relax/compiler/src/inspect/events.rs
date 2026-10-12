@@ -176,6 +176,7 @@ struct Parked {
     id: u64,
     seq: u64,
     os_id: u64,
+    domain: Option<crate::domain::DomainId>,
     /// 0 waiting, 1 resume as a panic, 2 retry the boundary's unit, 3 restart the restartable fn,
     /// 4 make it return `words`
     decision: AtomicU32,
@@ -233,6 +234,14 @@ pub fn panic_parked(os_id: u64) -> bool {
     PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p.os_id == os_id)
 }
 
+/// A domain is stopping: let its parked panics unwind so its ordinary cleanup can run.
+pub fn release_domain(domain: crate::domain::DomainId) {
+    for p in PARKED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.domain == Some(domain)) {
+        p.decision.store(1, SeqCst);
+    }
+    RESUME.notify_all();
+}
+
 pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     if !super::STARTED.load(Relaxed) || crate::owner::is_owner() || super::probes::in_probe() {
         return;
@@ -258,6 +267,8 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     let me = crate::os::thread::current();
     let thread = if me == crate::jit::MAIN_TID.load(Relaxed) { "main".to_string() } else { crate::os::thread::name(me) };
     let wait_s = if watched { 600 } else { park_secs_unwatched() };
+    let domain = crate::domain::current_app_domain();
+    let primary = domain.is_some() && domain == crate::run::app_domain();
     let boundary = innermost_boundary();
     // a restartable frame (`restartable <fn>`) on the stack: restart / return are offered
     let restartable = if unwinds && info.kind == "panic" { super::instrument::restartable_in(&info.frames) } else { None };
@@ -275,25 +286,29 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
             Some(b) => format!("{{\"reruns\":{},\"note\":\"side effects since it began may repeat\"}}", json_str(b)),
             None => "null".into(),
         },
-        match &restartable {
+        if primary { format!(",\"restart\":{{\"domain\":{},\"window_kept\":true}}", domain.unwrap()) } else { match &restartable {
             Some((_, name, rets)) => format!(
                 ",\"restart\":{{\"fn\":{},\"return_words\":{}}}",
                 json_str(&super::short(name, 160)),
                 rets.map_or("null".to_string(), |n| n.to_string())
             ),
             None => String::new(),
-        },
+        } },
         if boundary.is_some() { format!("\"resume P{} retry\",", id) } else { String::new() },
         match &restartable {
             Some((_, _, Some(_))) => format!("\"resume P{} restart\",\"resume P{} return <value>\",", id, id),
             Some(_) => format!("\"resume P{} restart\",", id),
+            None if primary => format!("\"resume P{} restart\",", id),
             None => String::new(),
         },
         id
     );
     let mut list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
+    // Stop may have released the old parked list while this panic collected its stack.
+    // Do not park a new cleanup panic after that release.
+    if domain.is_some_and(crate::domain::cancelled) { return; }
     let seq = emit("panic", &format!("P{}", id), &fields);
-    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), decision: AtomicU32::new(0), words: Mutex::new(Vec::new()) });
+    let p = std::sync::Arc::new(Parked { id, seq, os_id: super::threads::self_os_id(), domain, decision: AtomicU32::new(0), words: Mutex::new(Vec::new()) });
     list.push(p.clone());
     if !watched {
         eprintln!(
@@ -393,6 +408,17 @@ pub fn cmd_resume(req: &Req, out: &mut Out) {
     let list = PARKED.lock().unwrap_or_else(|e| e.into_inner());
     match list.iter().find(|p| p.id == id) {
         Some(p) => {
+            if decision == 3 && p.domain.is_some() && p.domain == crate::run::app_domain() {
+                match crate::run::relaunch() {
+                    Ok(()) => {
+                        p.decision.store(1, SeqCst);
+                        RESUME.notify_all();
+                        out.line(&format!("{{\"resumed\":\"P{}\",\"as\":\"domain relaunch\",\"window_kept\":true}}", id));
+                    }
+                    Err(e) => out.err(&e),
+                }
+                return;
+            }
             *p.words.lock().unwrap_or_else(|e| e.into_inner()) = words;
             p.decision.store(decision, SeqCst);
             RESUME.notify_all();

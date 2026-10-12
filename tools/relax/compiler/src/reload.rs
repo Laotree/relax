@@ -3308,6 +3308,39 @@ static RESTART_REASON: std::sync::Mutex<String> = std::sync::Mutex::new(String::
 /// When the edit that asked for the restart was saved (unix ms): the restarted run's report
 /// measures save -> back on screen from it (RELAX_RESTART_T0).
 static RESTART_SAVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static DOMAIN_RESTORED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DOMAIN_SNAPSHOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static DOMAIN_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DOMAIN_INPUTS: std::sync::Mutex<Option<Inputs>> = std::sync::Mutex::new(None);
+static DOMAIN_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// End native callbacks into the outgoing domain before its static block can be reclaimed.
+pub fn domain_stopping(id: u32) {
+    if crate::run::app_domain() != Some(id) { return; }
+    DOMAIN_LOADING.store(true, std::sync::atomic::Ordering::Release);
+    *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    RESTART_SUPPORTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(crate) fn domain_loaded(inputs: Option<Inputs>) {
+    *DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner()) = DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()).take();
+    *DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()) = inputs;
+    DOMAIN_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    DOMAIN_LOADING.store(false, std::sync::atomic::Ordering::Release);
+}
+
+fn restart_domain(reason: String) -> bool {
+    if crate::run::app_domain().is_none() { return false; }
+    *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = reason;
+    if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) {
+        RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+        wake_program();
+    } else if let Err(e) = crate::run::relaunch() {
+        eprintln!("relax-live: relaunch: {e}");
+    }
+    true
+}
 
 pub extern "C" fn __relax_live_edit_enabled() -> bool {
     crate::layout::LIVE_SESSION.load(std::sync::atomic::Ordering::Relaxed)
@@ -3316,18 +3349,16 @@ pub extern "C" fn __relax_live_edit_enabled() -> bool {
 /// The program's wake for its event loop (std::relax::on_patch): called from the watcher
 /// thread after a patch is installed, off the unit, so an idle app polls the new
 /// generation at once instead of at its next idle tick.
-static PATCH_WAKER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PATCH_WAKER: std::sync::Mutex<Option<(crate::domain::Callback, extern "C" fn())>> = std::sync::Mutex::new(None);
 
 pub extern "C" fn __relax_on_patch(f: usize) {
-    PATCH_WAKER.store(f, std::sync::atomic::Ordering::SeqCst);
+    let wake = if f == 0 { None } else { crate::domain::callback().map(|scope| (scope, unsafe { std::mem::transmute(f) })) };
+    *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = wake;
 }
 
 fn wake_program() {
-    let f = PATCH_WAKER.load(std::sync::atomic::Ordering::SeqCst);
-    if f != 0 {
-        let f: extern "C" fn() = unsafe { std::mem::transmute(f) };
-        f();
-    }
+    let wake = *PATCH_WAKER.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((scope, wake)) = wake { let _ = scope.call(|| wake()); }
 }
 
 pub extern "C" fn __relax_restart_supported() {
@@ -3353,6 +3384,10 @@ pub extern "C" fn __relax_restart_reason(buf: *mut u8, cap: usize) -> usize {
 
 /// The state the previous process left for this one (RELAX_RESTORE), read once.
 pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
+    if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
+        let state = DOMAIN_RESTORED.lock().unwrap_or_else(|e| e.into_inner());
+        return state.as_ref().map_or(usize::MAX, |s| copy_out(s, buf, cap));
+    }
     let up = jit::current_unit();
     if up.is_null() { return usize::MAX; }
     let session = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
@@ -3370,10 +3405,17 @@ pub extern "C" fn __relax_restored_state(buf: *mut u8, cap: usize) -> usize {
     }
 }
 
-/// Writes `state` and replaces this process with a fresh run of the same command line, which
-/// finds the state through RELAX_RESTORE. Returns only when the exec failed.
+/// A hosted app queues a fresh domain with this state and returns for cooperative shutdown.
+/// A directly running program writes RELAX_RESTORE and replaces its process as before.
 pub extern "C" fn __relax_restart_now(state: *const u8, len: usize) {
     let st = unsafe { if state.is_null() { &[][..] } else { std::slice::from_raw_parts(state, len) } };
+    if crate::domain::current_app_domain().is_some() && crate::domain::current_app_domain() == crate::run::app_domain() {
+        *DOMAIN_SNAPSHOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(String::from_utf8_lossy(st).into_owned());
+        RESTART_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = crate::run::relaunch() { eprintln!("relax-live: relaunch: {e}"); }
+        // The queued HAL quit runs the app's normal cleanup after this event returns.
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("relax-restart-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("state");
@@ -3468,7 +3510,7 @@ fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen:
         Rung::Patch if o.lines.iter().any(|l| l.starts_with("incomplete:")) => "partial",
         Rung::Patch if o.changed == 0 => "unchanged",
         Rung::Patch => "patch",
-        Rung::Restart if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => "restart",
+        Rung::Restart if crate::run::app_domain().is_some() || RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => "restart",
         Rung::Restart => "restart-unsupported",
         Rung::Refuse => "refuse",
     };
@@ -3759,7 +3801,7 @@ pub(crate) fn stamp(path: &str) -> Option<(std::time::SystemTime, u64)> {
     Some((m.modified().ok()?, m.len()))
 }
 
-unsafe fn watch(up: *mut Unit, inputs: Inputs) {
+unsafe fn watch(up: *mut Unit, mut inputs: Inputs) {
     let std_dir = std::env::var("RELAX_STD").unwrap_or_default();
     // (path, running file index, last stamp)
     // the program's own source files (not std, registry or git dependencies), loaded so far
@@ -3811,8 +3853,27 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
     let mut tick: u32 = 0;
     let mut startup_scan = true;
     let mut restart_required = false;
+    let mut revision = 0;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(5));
+        if DOMAIN_LOADING.load(std::sync::atomic::Ordering::Acquire) { continue; }
+        let latest = DOMAIN_REVISION.load(std::sync::atomic::Ordering::Acquire);
+        if latest != revision {
+            revision = latest;
+            if let Some(next) = DOMAIN_INPUTS.lock().unwrap_or_else(|e| e.into_inner()).take() { inputs = next; }
+            let loaded = crate::owner::call_quick(crate::owner::Class::App, || own_files(&*up));
+            files = inputs.paths.iter().map(|(p, (s, _))| (p.clone(), u32::MAX, *s)).collect();
+            for (path, file) in loaded {
+                if let Some(f) = files.iter_mut().find(|f| f.0 == path) { f.1 = file; }
+                else { let s = stamp(&path); files.push((path, file, s)); }
+            }
+            events = watch_events::Watch::new(files.iter().map(|f| f.0.as_str()));
+            hot.clear();
+            stalled.clear();
+            undos.clear();
+            restart_required = false;
+            startup_scan = true;
+        }
         // Keep the original stamps and queued OS notifications intact until startup
         // finishes. In particular, do not acquire Reloading or drain streamed edits:
         // either can compete with the cold compiler before the first frame.
@@ -3945,6 +4006,12 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
                 .then_some("sources outside the loaded program changed")
         });
         if let Some(reason) = reason {
+            if !inputs.host_restart_required(changed.iter().map(|&k| files[k].0.as_str())) && restart_domain(reason.to_string()) {
+                eprintln!("relax-live: {reason}; relaunching the app domain (window kept)");
+                restart_required = true;
+                stalled.clear();
+                continue;
+            }
             let package = std::env::var("RELAX_RUN_PACKAGE").unwrap_or_else(|_| "<pkg>".into());
             let what = if changed.iter().any(|&k| std::path::Path::new(&files[k].0).is_dir()) { "source inputs" } else { "files" };
             let message = format!("{} {what} changed: {reason}; restart `relax run {package}` to pick them up; keeping the running code", changed.len());
@@ -4024,6 +4091,10 @@ unsafe fn watch(up: *mut Unit, inputs: Inputs) {
                 o.ms.iter().sum::<f64>()
             ),
             Rung::Refuse => eprintln!("relax-live: {}: NOT applied (errors below); the app runs the previous code", what),
+            Rung::Restart if restart_domain(format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default())) => {
+                restart_required = true;
+                eprintln!("relax-live: {what}: relaunching the app domain (window kept)");
+            }
             Rung::Restart if RESTART_SUPPORTED.load(std::sync::atomic::Ordering::SeqCst) => {
                 // the program restarts itself at its next safe point, carrying its state over
                 *RESTART_REASON.lock().unwrap_or_else(|e| e.into_inner()) = format!("{}: {}", what, o.lines.first().cloned().unwrap_or_default());

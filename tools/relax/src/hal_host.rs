@@ -6,8 +6,8 @@
 //! domain's progress, crash and exit go back to the HAL through [`observe`] as
 //! `Hal::report_domain`, which tells the parent.
 //!
-//! Domain control is these commands only. Privilege is granted here, by the host, around the
-//! boot app's main (`--privileged`, [`boot_privileged`]); JIT code cannot claim it.
+//! The primary app of `relax run` follows the same path as children of a window manager.
+//! Privilege is granted by the host (`--privileged`); JIT code cannot claim it.
 
 use makepad_hal::{domain_state, domain_stop, with_caps, with_launch, Caps, DomainHost, DomainLaunch, Hal};
 use relax_compiler::domain::{self, AppSpec, Around, DomainState};
@@ -24,12 +24,15 @@ impl Host {
     fn launch(&self, launch: DomainLaunch) -> Result<(), String> {
         let domain = launch.domain;
         let hook = launch.clone();
-        let around: Around = Arc::new(move |run: &mut dyn FnMut()| with_launch(&hook, || run()));
-        let spec = AppSpec {
-            package: launch.app.clone(),
-            args: launch.args.split_whitespace().map(str::to_string).collect(),
-            parent: Some(launch.parent), id: Some(domain), around: Some(around), ..Default::default()
-        };
+        let primary = crate::hal_run::spec(domain);
+        let privileged = primary.is_some() && crate::PRIVILEGED.load(std::sync::atomic::Ordering::Relaxed);
+        let around: Around = Arc::new(move |run: &mut dyn FnMut()| with_caps(Caps { privileged }, || with_launch(&hook, || run())));
+        let mut spec = primary.unwrap_or_else(|| AppSpec {
+            package: launch.app.clone(), args: launch.args.split_whitespace().map(str::to_string).collect(), ..Default::default()
+        });
+        spec.parent = (launch.parent != 0).then_some(launch.parent);
+        spec.id = Some(domain);
+        spec.around = Some(around);
         domain::prepare(&spec).map_err(|e| e.join(" | "))?;
         // The registry exists before returning to HAL, so stop can cancel the loader even
         // before it is scheduled. Never join the compiling thread ahead of cancellation.
@@ -53,6 +56,10 @@ impl DomainHost for Host {
     }
 
     fn stop(&self, domain: u32, mode: u32) {
+        domain::begin_stop(domain);
+        relax_compiler::reload::domain_stopping(domain);
+        relax_compiler::inspect::stop_domain(domain);
+        relax_compiler::inspect::events::release_domain(domain);
         let how = if mode == domain_stop::KILL { domain::Stop::Kill } else { domain::Stop::Quit };
         if let Err(e) = domain::stop(domain, how) { eprintln!("relax-domain: {domain}: {e}"); }
         report_stop(domain);
@@ -60,7 +67,14 @@ impl DomainHost for Host {
 
     // The HAL stopped the old run (`stop(QUIT)` returned) and freed its session: start again.
     fn relaunch(&self, launch: DomainLaunch) -> Result<(), String> {
-        self.launch(launch)
+        let id = launch.domain;
+        crate::hal_run::restarting(id);
+        let result = self.launch(launch);
+        if let Err(e) = &result {
+            eprintln!("relax-domain: {id}: {e}");
+            crate::hal_run::observe(id, &DomainState::Crashed(e.clone()));
+        }
+        result
     }
 }
 
@@ -115,6 +129,8 @@ fn report_stop(id: domain::DomainId) {
 
 /// A domain changed state (`domain::set_observer`): the HAL tells the parent.
 fn observe(id: domain::DomainId, state: &DomainState) {
+    let _kept = relax_compiler::zone_alloc::kept();
+    crate::hal_run::observe(id, state);
     let hal = Hal::global();
     match state {
         DomainState::Compiling(phase) => {
@@ -128,9 +144,11 @@ fn observe(id: domain::DomainId, state: &DomainState) {
             hal.report_domain(id, domain_state::RUNNING, 0, 100.0, "");
         }
         DomainState::Crashed(msg) => {
+            relax_compiler::reload::domain_stopping(id);
             hal.report_domain(id, domain_state::CRASHED, 0, 0.0, msg);
         }
         DomainState::Exited(code) => {
+            relax_compiler::reload::domain_stopping(id);
             hal.report_domain(id, domain_state::EXITED, 0, 100.0, &code.to_string());
         }
         // the HAL freed the session before it asked to stop
@@ -143,12 +161,11 @@ fn observe(id: domain::DomainId, state: &DomainState) {
 
 /// Registers the host with the HAL and the observer with the domains.
 pub fn register() {
+    let _kept = relax_compiler::zone_alloc::kept();
     Hal::global().set_domain_host(Arc::new(Host::default()));
     domain::set_observer(observe);
 }
 
-/// `relax run --privileged`: the boot app's main runs with the capabilities of a window manager
-/// (it may use the HAL's domain control commands).
-pub fn boot_privileged() {
-    domain::set_boot_around(Arc::new(|run: &mut dyn FnMut()| with_caps(Caps { privileged: true }, || run())));
+pub fn start(launch: DomainLaunch) -> Result<(), String> {
+    Host.launch(launch)
 }

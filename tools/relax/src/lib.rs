@@ -13,6 +13,7 @@ mod lexer {
 mod cef;
 pub mod fetch;
 mod hal_host;
+mod hal_run;
 mod help;
 mod macros;
 mod remote;
@@ -474,9 +475,6 @@ fn provided() {
     use std::collections::HashMap;
     // the HAL starts and stops apps as domains through this host; the boot app's privilege is the host's grant
     hal_host::register();
-    if PRIVILEGED.load(std::sync::atomic::Ordering::Relaxed) {
-        hal_host::boot_privileged();
-    }
     const CRATES: [&str; 10] = [
         "relax_provided_fixture",
         "makepad_live_id",
@@ -522,36 +520,10 @@ fn provided() {
     relax_compiler::inspect::set_vm_provider(makepad_script::inspect_registry::summaries);
     relax_compiler::inspect::set_script_stack_provider(makepad_script::inspect_registry::script_stack);
     makepad_script::inspect_registry::set_error_hook(relax_compiler::inspect::script_error_event);
-    // a program that links the HAL runs its main off the main thread (the HAL's window system has it)
-    relax_compiler::run::set_main_host(hal_main_host);
-}
-
-/// Runs a HAL program's `main` the way a native cfg(hal) build does (platform run_app): the
-/// process's main thread goes to the HAL (on macOS the `NSApp` loop; elsewhere it only waits),
-/// the program's `main` runs on a thread of its own with the native run's 8 MB stack, and the
-/// loop ends when `main` does, however it does. One path on every OS; the program's heap is the
-/// host's `kept` one, as for the program's own threads.
-fn hal_main_host(main: Box<dyn FnOnce() + Send>) {
-    struct Done;
-    impl Drop for Done {
-        fn drop(&mut self) {
-            makepad_hal::stop_main_loop();
-        }
-    }
-    makepad_hal::expect_main_loop();
-    let thread = std::thread::Builder::new()
-        .name("makepad-app".into())
-        .stack_size(8 << 20)
-        .spawn(move || {
-            let _done = Done;
-            main();
-        })
-        .expect("the program's main thread");
-    {
-        let _kept = relax_compiler::zone_alloc::kept();
-        makepad_hal::run_main_loop();
-    }
-    if thread.join().is_err() {
-        std::process::exit(101);
-    }
+    relax_compiler::run::set_main_host(relax_compiler::run::MainHost {
+        run: hal_run::run,
+        open: hal_run::open,
+        start: hal_run::start,
+        relaunch: hal_run::relaunch,
+    });
 }

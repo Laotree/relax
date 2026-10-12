@@ -3,8 +3,8 @@
 //!
 //! - `list`: the box's endpoints from its discovery files, one JSON line each;
 //! - `session`: `launch [cwd=<dir>] <app> [args...]` starts the configured launcher (hidden, muted)
-//!   and reports its PID, `kill <pid>` ends a launched session, `relaunch <pid>` kills it and starts
-//!   the same app again (same args and cwd; process level until HAL sessions exist), `launched`
+//!   and reports its PID, `kill <pid>` ends a launched session, `relaunch <pid>` restarts its
+//!   Relax domain in place (native programs restart as processes), `launched`
 //!   lists them. Launches are recorded in a ledger on the host (see [`Config::ledger`]), so a
 //!   relay that starts later (the hub exited, ssh was re-run) still knows the sessions and can
 //!   kill or relaunch them;
@@ -181,7 +181,7 @@ fn session(st: &State, line: &str, out: &mut Vec<String>) {
                 out.push(format!("{{\"pid\":{},\"app\":{},\"state\":{},\"log\":{}}}", l.pid, json_str(&l.app), json_str(&state), json_str(&l.log.display().to_string())));
             }
         }
-        _ => err(out, "session: launch [cwd=<dir>] <app> [args...] | kill <pid> | relaunch <pid> (kill, then launch again; process level) | launched"),
+        _ => err(out, "session: launch [cwd=<dir>] <app> [args...] | kill <pid> | relaunch <pid> (restart its app domain, keeping the window) | launched"),
     }
 }
 
@@ -357,9 +357,37 @@ fn kill(_: &State, _: u32, out: &mut Vec<String>) {
     err(out, "session kill is not available on Windows yet");
 }
 
-/// Kill (as `kill` does), wait for the exit, launch the same app, args and cwd again.
+/// Relax owns its domain lifecycle. Native processes retain their process-level lifecycle.
 #[cfg(unix)]
 fn relaunch(st: &State, pid: u32, out: &mut Vec<String>) {
+    // A Relax process keeps its endpoint, window and device. Never signal or replace it.
+    // The configured `relax run` launcher is also authoritative before discovery starts.
+    // An unavailable inspect endpoint must never turn a warm relaunch into a process kill.
+    if st.cfg.launch.get(1).is_some_and(|arg| arg == "run")
+        || crate::discovery::apps().iter().any(|a| a.pid == pid && a.text("relax").is_some())
+    {
+        adopt(st);
+        {
+            let launched = st.launched.lock().unwrap();
+            match launched.iter().find(|r| r.pid == pid) {
+                Some(r) if r.ended(&st.cfg).is_none() => {},
+                Some(_) => return err(out, &format!("pid {pid} has already exited")),
+                None => return err(out, &format!("pid {pid} was not launched by a relay on this host")),
+            }
+        }
+        let client = match Client::connect(&pid.to_string()) {
+            Ok(c) => c,
+            Err(e) => return err(out, &e.to_string()),
+        };
+        match client.cmd("session relaunch") {
+            Ok(lines) => for line in lines {
+                match line { Ok(line) => out.push(line), Err(e) => { err(out, &e.to_string()); break; } }
+            }
+            Err(e) => err(out, &e.to_string()),
+        }
+        client.close();
+        return;
+    }
     let spec = {
         adopt(st);
         let l = st.launched.lock().unwrap();

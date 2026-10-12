@@ -122,7 +122,18 @@ pub fn cmd_run(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
     if !args.iter().any(|a| a == "--check") {
         *GANDALF_CONSOLE.lock().unwrap() = Some(crate::gandalf_out::Console::start(crate::diag::enabled(), args.iter().any(|a| a == "--quiet")));
     }
-    let code = cmd_run_inner(sess, args, None);
+    let host = MAIN_HOST.get().filter(|_| {
+        !sess.runtime.boot_only && std::env::var_os("RELAX_SCRIPT_DEPTH").is_none()
+            && !args.iter().take_while(|a| a.as_str() != "--").any(|a| matches!(a.as_str(), "--check" | "--watch" | "--entry" | "--exports"))
+    });
+    let code = if let Some(host) = host {
+        HOSTED_RUN.store(true, Ordering::Release);
+        let sess = sess.clone();
+        let args = args.to_vec();
+        (host.run)(Box::new(move || cmd_run_inner(&sess, &args, None)))
+    } else {
+        cmd_run_inner(sess, args, None)
+    };
     crate::tui::exit_code(code);
     if let Some(exit) = EXIT_SUMMARY.get() {
         // atexit runs after application TLS destructors. Do not quiesce earlier:
@@ -211,6 +222,12 @@ pub(crate) fn resolve_package(
     }?;
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units)?;
+    // The graph is enough to choose the host. Open its window before build scripts, parsing,
+    // source validation or JIT work; the process main thread is already serving the HAL.
+    if boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal") {
+        (MAIN_HOST.get().expect("run host").open)(package)?;
+        HAL_RUN.store(true, Ordering::Release);
+    }
     // provided crates bind only to their own source (before substitution rewrites deps)
     let ts = Instant::now();
     let pkgs: Vec<crate::srchash::SrcPkg> = g
@@ -219,10 +236,11 @@ pub(crate) fn resolve_package(
         .zip(g.pkg.iter())
         .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
         .collect();
-    let live_inputs = (boot && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
+    let watches = boot || matches!(who, ResolveFor::Domain(id) if app_domain() == Some(id));
+    let live_inputs = (watches && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
     // Validate native macros before any overlapping provided-crate identity error.
     crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;
-    if boot {
+    {
         // The loader's provided crates are host code built for the machine: their shims bind
         // only where the program is read for the machine too. A program read for another target
         // (RELAX_CHECK_TARGET) has a different crate graph (makepad-script-std reaches
@@ -234,7 +252,7 @@ pub(crate) fn resolve_package(
         } else {
             crate::provided::read_identity_files(&pkgs);
         }
-        phase("provided sources", ts);
+        if boot { phase("provided sources", ts); }
     }
     if crate::preload::trace() {
         eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
@@ -1008,7 +1026,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         for error in enum_errors { eprintln!("error: {}", error); }
         return 1;
     }
-    jit::set_program_args(prog_args);
+    jit::set_program_args(prog_args.clone());
     drop(mem_g);
     let mem_g = crate::memstat::tag(crate::memstat::Tag::CacheLoad);
     // Classify the disk cache before workers add newly compiled entries.
@@ -1076,7 +1094,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     };
     let up: *mut Unit = &mut *u;
     unsafe { RUN_UNIT = up };
-    crate::domain::register_boot(&package, u.syms.dom0());
+    if !HAL_RUN.load(Ordering::Acquire) { crate::domain::register_boot(&package, u.syms.dom0()); }
     start_exit_summary();
     *RUN_DIAGNOSTICS.lock().unwrap() = Some(u.tcx.dcx.clone());
     unsafe { atexit(at_exit) };
@@ -1251,14 +1269,20 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         return 0;
     }
     let main_def = main_def.expect("a run without --exports has main");
-    if !domain_packages.is_empty() {
-        crate::domain::run_vehicle(up, domain_packages);
+    if HAL_RUN.load(Ordering::Acquire) {
+        unsafe { jit::set_runtime_unit(up) };
+        let spec = crate::domain::AppSpec { package, cargo_flags, units_json, argv: Some(prog_args), ..Default::default() };
+        let result = (MAIN_HOST.get().expect("run host").start)(spec);
+        if result.is_ok() && !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }
+        std::mem::forget(u);
+        return match result {
+            Ok(()) => 0,
+            Err(e) => { eprintln!("relax-run: {e}"); 1 }
+        };
     }
-    // a program that links the HAL (makepad_hal is provided: its ops are the host's) gives the
-    // process's main thread to the HAL's window system; its `main` runs on a thread of the host's
-    let main_host = MAIN_HOST.get().copied().filter(|_| u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_hal"));
+    if !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }
     let r = match main_call(&mut u, main_def, entry) {
-        Ok((target, arg)) => run_main(up, target, arg, main_host),
+        Ok((target, arg)) => unsafe { jit::call_jit(up, target, arg) },
         Err(e) => {
             eprintln!("relax-run: {e}");
             // Workers already hold this unit's pointer. Its Drop waits
@@ -1362,32 +1386,35 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
     (n_link, missing)
 }
 
-/// How the host runs a program's `main`: it is handed the call and must run it to its end on a
-/// thread of its choosing, returning when it is done (the binary's HAL host: the process's main
-/// thread becomes the window system's, `main` runs on a thread of its own).
-pub type MainHost = fn(Box<dyn FnOnce() + Send>);
+/// The native run host: the OS loop starts before compilation, the graph opens a host window,
+/// and the compiled program starts as an ordinary domain. No HAL dependency in the compiler.
+pub struct MainHost {
+    pub run: fn(Box<dyn FnOnce() -> i32 + Send>) -> i32,
+    pub open: fn(&str) -> Result<(), String>,
+    pub start: fn(crate::domain::AppSpec) -> Result<(), String>,
+    pub relaunch: fn() -> Result<(), String>,
+}
 
 static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
+static HOSTED_RUN: AtomicBool = AtomicBool::new(false);
+static HAL_RUN: AtomicBool = AtomicBool::new(false);
+static APP_DOMAIN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_app_domain(id: u32) { APP_DOMAIN.store(id, Ordering::Release); }
+pub fn app_domain() -> Option<u32> {
+    let id = APP_DOMAIN.load(Ordering::Acquire);
+    (id != 0).then_some(id)
+}
+
+/// All whole-app restart requests use the native host's existing HAL domain relaunch path.
+pub fn relaunch() -> Result<(), String> {
+    if app_domain().is_none() { return Err("no hosted app domain is running".into()); }
+    (MAIN_HOST.get().ok_or("no run host")?.relaunch)()
+}
 
 /// Registers the host for programs that link the HAL (once, before `cmd_run`).
 pub fn set_main_host(host: MainHost) {
     let _ = MAIN_HOST.set(host);
-}
-
-/// Calls the program's entry: here, or through the main host. The host's hook around the app (the
-/// capabilities it grants, domain.rs) wraps the call on the thread that runs it: they belong to it.
-fn run_main(up: *mut Unit, entry: u64, arg: u64, host: Option<MainHost>) -> Result<u64, crate::jit::PanicInfo> {
-    let Some(host) = host else { return crate::domain::boot_around(|| unsafe { jit::call_jit(up, entry, arg) }) };
-    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let out = slot.clone();
-    let up = up as usize;
-    host(Box::new(move || {
-        jit::ensure_altstack();
-        let r = crate::domain::boot_around(|| unsafe { jit::call_jit(up as *mut Unit, entry, arg) });
-        *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
-    }));
-    let r = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
-    r.expect("the main host returned before the program's main ended")
 }
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
