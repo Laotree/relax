@@ -541,3 +541,71 @@ pub fn check_impl(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::program::{DefId, Program};
+    use crate::tcx::Tcx;
+
+    fn collect(source: &str) -> (Program, Tcx) {
+        let sess = &std::sync::Arc::new(crate::Session::default());
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("relax-unsafety-{}-{n}.rs", std::process::id()));
+        std::fs::write(&root, source).unwrap();
+        let mut prog = Program::new(sess);
+        prog.load_crate("custom", root.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+        std::fs::remove_file(root).unwrap();
+        prog.resolve_imports();
+        let mut tcx = Tcx::new();
+        tcx.collect(&prog);
+        (prog, tcx)
+    }
+
+    fn named(prog: &Program, name: &str) -> DefId {
+        (0..prog.defs.len()).map(|i| DefId(i as u32)).find(|&d| prog.name(d) == name).unwrap()
+    }
+
+    #[test]
+    fn unsafety_e0133_and_impls() {
+        crate::lint::enable();
+        let (prog, tcx) = collect(r#"
+            unsafe fn f() -> i32 { 1 }
+            static mut S: i32 = 0;
+            union U { a: u32, b: u32 }
+            unsafe trait T {}
+            trait Q {}
+            struct X;
+            impl T for X {}
+            unsafe impl Q for X {}
+            fn bad(p: *const i32) {
+                f();
+                let _ = *p;
+                S = 1;
+                let u = U { a: 1 };
+                let _ = u.a;
+                let U { b } = u;
+                let _ = b;
+            }
+            fn good(p: *const i32) {
+                let mut u = U { a: 1 };
+                u.a = 2;
+                let U { a: _ } = u;
+                let _ = &raw const S;
+                let _ = &raw const *p;
+                unsafe { f(); }
+            }
+            unsafe fn in_unsafe_fn(p: *const i32) -> i32 { *p + f() }
+        "#);
+        let errs = |name: &str| super::check_body(&prog, &tcx, &tcx.typeck(&prog, named(&prog, name)));
+        let bad = errs("bad");
+        assert_eq!(bad.iter().filter(|e| e.contains("E0133")).count(), 5, "{bad:?}");
+        assert!(errs("good").is_empty());
+        assert!(errs("in_unsafe_fn").is_empty());
+        let x = named(&prog, "X");
+        let impls: Vec<String> = (0..prog.defs.len()).map(|i| DefId(i as u32))
+            .filter(|&d| prog.def(d).kind == crate::program::DefKind::Impl && prog.def(d).krate == prog.def(x).krate)
+            .flat_map(|d| super::check_impl(&prog, &tcx, d)).collect();
+        assert!(impls.iter().any(|e| e.contains("E0200")) && impls.iter().any(|e| e.contains("E0199")), "{impls:?}");
+    }
+}
