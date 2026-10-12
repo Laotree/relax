@@ -91,6 +91,10 @@ fn main() {
             <string>ExtendedGamepad</string>
         </dict>
     </array>
+    <key>NSCameraUsageDescription</key>
+    <string>Used to capture camera video when you request it.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Used to capture microphone audio when you request it.</string>
     <key>NSLocationUsageDescription</key>
     <string>Used to show your position on the map.</string>
     <key>NSLocationWhenInUseUsageDescription</key>
@@ -171,12 +175,11 @@ fn main() {
     let makepad_configs: Vec<String> = env::var("MAKEPAD")
         .map(|configs| configs.split(['+', ',']).map(str::to_string).collect())
         .unwrap_or_default();
-    // `RUSTFLAGS=--cfg hal` builds the HAL client (os/hal). Until the cut it is a build with no
-    // native os backend, so it takes every `cfg(gpusim)` classification of this crate (what
-    // exists and what does not); os/mod.rs and the raster callers tell the two apart by `hal`.
-    let hal = env::var_os("CARGO_CFG_HAL").is_some();
+    // macOS has one backend: the HAL. Other targets opt into the client while their native
+    // backends are being moved. HAL is independent of the simulated GPU selection.
+    let hal = target_os == "macos" || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
-        println!("cargo:rustc-cfg=gpusim");
+        println!("cargo:rustc-cfg=hal");
     }
     let names_gpu_api = hal || makepad_configs
         .iter()
@@ -217,12 +220,6 @@ fn main() {
     }
 
     match target_os.as_str() {
-        "macos" => {
-            println!("cargo:rustc-link-lib=framework=GameController");
-            println!("cargo:rustc-link-lib=framework=CoreHaptics");
-            println!("cargo:rustc-link-lib=framework=CoreLocation");
-            println!("cargo:rustc-link-lib=framework=AudioToolbox");
-        }
         "ios" => {
             if target == "aarch64-apple-ios-sim" {
                 println!("cargo:rustc-cfg=apple_sim");

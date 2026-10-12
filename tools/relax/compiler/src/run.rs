@@ -1254,9 +1254,12 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if !domain_packages.is_empty() {
         crate::domain::run_vehicle(up, domain_packages);
     }
+    // a program that links the HAL (makepad_hal is provided: its ops are the host's) gives the
+    // process's main thread to the HAL's window system; its `main` runs on a thread of the host's
+    let main_host = MAIN_HOST.get().copied().filter(|_| u.prog.crates.iter().any(|c| u.prog.syms.str(c.name) == "makepad_hal"));
     let r = match main_call(&mut u, main_def, entry) {
         // (the host's hook around the app, e.g. the capabilities it grants: domain.rs)
-        Ok((target, arg)) => crate::domain::boot_around(|| unsafe { jit::call_jit(up, target, arg) }),
+        Ok((target, arg)) => crate::domain::boot_around(|| run_main(up, target, arg, main_host)),
         Err(e) => {
             eprintln!("relax-run: {e}");
             // Workers already hold this unit's pointer. Its Drop waits
@@ -1358,6 +1361,33 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
         }
     }
     (n_link, missing)
+}
+
+/// How the host runs a program's `main`: it is handed the call and must run it to its end on a
+/// thread of its choosing, returning when it is done (the binary's HAL host: the process's main
+/// thread becomes the window system's, `main` runs on a thread of its own).
+pub type MainHost = fn(Box<dyn FnOnce() + Send>);
+
+static MAIN_HOST: std::sync::OnceLock<MainHost> = std::sync::OnceLock::new();
+
+/// Registers the host for programs that link the HAL (once, before `cmd_run`).
+pub fn set_main_host(host: MainHost) {
+    let _ = MAIN_HOST.set(host);
+}
+
+/// Calls the program's entry: here, or through the main host.
+fn run_main(up: *mut Unit, entry: u64, arg: u64, host: Option<MainHost>) -> Result<u64, crate::jit::PanicInfo> {
+    let Some(host) = host else { return unsafe { jit::call_jit(up, entry, arg) } };
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let out = slot.clone();
+    let up = up as usize;
+    host(Box::new(move || {
+        jit::ensure_altstack();
+        let r = unsafe { jit::call_jit(up as *mut Unit, entry, arg) };
+        *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    }));
+    let r = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    r.expect("the main host returned before the program's main ended")
 }
 
 /// (name, framework) of every `#[link(name = .., kind = ..)]` on an extern block whose items
