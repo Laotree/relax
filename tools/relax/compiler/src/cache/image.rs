@@ -1273,6 +1273,13 @@ impl Linker {
         if !in_range || !im.flat[s.crates.0..s.crates.1].iter().all(|&c| im.crate_ok.get(c as usize) == Some(&true)) || !self.cache().has_index(&s.entry) {
             return false;
         }
+        // an O2/O3 build of the slot replaced its entry after this image was made: the slot is
+        // left lazy, the first call links the entry (O2 code, marked: no build of it again).
+        // Prelinking the image's lower-tier code would run it and build the entry's code again
+        // on every launch (the image is made again past 2% of such slots: record_manifest).
+        if matches!(s.tier, TIER_O1 | TIER_BASE) && self.cache().entry_tier(s.entry).is_some_and(|t| t == TIER_O2 || t == TIER_O3) {
+            return false;
+        }
         let nk = need.len();
         let mut mark = |k: u32| (k as usize) < nk && { need[k as usize] = true; true };
         if !mark(s.key) || !im.flat[s.inl.0..s.inl.1].iter().all(|&k| mark(k)) {

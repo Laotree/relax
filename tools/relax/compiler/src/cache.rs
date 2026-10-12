@@ -914,6 +914,16 @@ impl Cache {
     }
     fn has_index(&self, key: &u128) -> bool { self.index_at(*key).is_some() }
 
+    /// The tier of code entry `key` as stored (its payload's tier byte).
+    fn entry_tier(&self, key: u128) -> Option<u8> {
+        let (kind, p) = self.get(key)?;
+        if kind != KIND_CODE { return None; }
+        let mut d = D { b: p, p: 0 };
+        if d.u32()? != ENTRY_VERSION { return None; }
+        d.str()?;
+        d.u8()
+    }
+
     fn get(&self, key: u128) -> Option<(u32, &[u8])> {
         let (p, e) = self.index_at(key)?;
         self.stores[p as usize].get_at(e as usize, key)
@@ -2513,6 +2523,13 @@ impl Cache {
         }
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         if self.mode == Mode::ReadOnly || order.is_empty() || (self.manifest_done && !self.image_rewrite) {
+            return true;
+        }
+        // at exit the slots' keys can no longer be made: after the mid-run manifest the exit
+        // keeps the image (a rewrite there covers only the slots already keyed, and the
+        // next start would prelink a few dozen slots instead of ~20,000). Slots whose entry
+        // an O2/O3 build replaced since stay lazy at the next start (image.rs img_live).
+        if self.manifest_done && crate::preempt::is_stopped() {
             return true;
         }
         let Some(key) = self.manifest_key(root) else { self.manifest_done = true; return true };
