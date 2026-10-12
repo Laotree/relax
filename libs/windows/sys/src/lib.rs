@@ -848,6 +848,12 @@ pub use import_GetLastError::call as GetLastError_raw;
 #[inline]
 pub unsafe fn GetLastError() -> crate::Win32::Foundation::WIN32_ERROR {
 import_GetLastError::call()}
+mod import_GlobalFree { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GlobalFree"] pub fn call(hMem: crate::Win32::Foundation::HGLOBAL) -> crate::Win32::Foundation::HGLOBAL; } }
+pub use import_GlobalFree::call as GlobalFree_raw;
+#[inline]
+pub unsafe fn GlobalFree(hMem: Option<crate::Win32::Foundation::HGLOBAL>) -> Result<crate::Win32::Foundation::HGLOBAL, crate::core::HRESULT> {
+let hr__ = import_GlobalFree::call(hMem.unwrap_or(unsafe { ::core::mem::zeroed() })); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct HANDLE(pub *mut ::core::ffi::c_void);
@@ -1053,6 +1059,7 @@ impl ::core::ops::BitOr for D3D_DRIVER_TYPE { type Output = Self; fn bitor(self,
 impl ::core::ops::BitAnd for D3D_DRIVER_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D_DRIVER_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D_DRIVER_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D_DRIVER_TYPE_HARDWARE: crate::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE = crate::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE(1i64 as _);
 pub const D3D_DRIVER_TYPE_UNKNOWN: crate::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE = crate::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE(0i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -1067,6 +1074,7 @@ impl ::core::ops::BitAnd for D3D_FEATURE_LEVEL { type Output = Self; fn bitand(s
 impl ::core::ops::BitXor for D3D_FEATURE_LEVEL { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D_FEATURE_LEVEL { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D_FEATURE_LEVEL_11_0: crate::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL = crate::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL(45056i64 as _);
+pub const D3D_FEATURE_LEVEL_11_1: crate::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL = crate::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL(45312i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D_INCLUDE_TYPE(pub i32);
@@ -1111,6 +1119,9 @@ impl ::core::ops::BitOr for D3D_SRV_DIMENSION { type Output = Self; fn bitor(sel
 impl ::core::ops::BitAnd for D3D_SRV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D_SRV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D_SRV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D_SRV_DIMENSION_BUFFER: crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION = crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION(1i64 as _);
+pub const D3D_SRV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION = crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION(4i64 as _);
+pub const D3D_SRV_DIMENSION_TEXTURE2DARRAY: crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION = crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION(5i64 as _);
 pub const D3D_SRV_DIMENSION_TEXTURECUBE: crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION = crate::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION(9i64 as _);
 pub const IID_ID3DBlob: crate::core::GUID = crate::core::GUID { data1: 2342910728, data2: 20885, data3: 16610, data4: [172,88,13,152,156,58,1,2,] };
 #[repr(C)]
@@ -1160,6 +1171,7 @@ pub struct ID3DInclude(pub *mut ::core::ffi::c_void);
 impl ID3DInclude { pub fn as_raw(&self) -> *mut ::core::ffi::c_void {self.0} }
 pub mod Fxc {
 pub const D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY: u32 = 4096;
+pub const D3DCOMPILE_OPTIMIZATION_LEVEL3: u32 = 32768;
 pub const D3DCOMPILE_SKIP_OPTIMIZATION: u32 = 4;
 mod import_D3DCompile { #[link(name = "D3DCOMPILER_47", kind = "raw-dylib")] extern "system" { #[link_name = "D3DCompile"] pub fn call(pSrcData: *const ::core::ffi::c_void,SrcDataSize: usize,pSourceName: crate::core::PCSTR,pDefines: *const crate::Win32::Graphics::Direct3D::D3D_SHADER_MACRO,pInclude: *mut ::core::ffi::c_void,pEntrypoint: crate::core::PCSTR,pTarget: crate::core::PCSTR,Flags1: u32,Flags2: u32,ppCode: *mut *mut ::core::ffi::c_void,ppErrorMsgs: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT; } }
 pub use import_D3DCompile::call as D3DCompile_raw;
@@ -1256,6 +1268,7 @@ impl ::core::ops::BitXor for D3D11_BLEND_OP { type Output = Self; fn bitxor(self
 impl ::core::ops::Not for D3D11_BLEND_OP { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_BLEND_OP_ADD: crate::Win32::Graphics::Direct3D11::D3D11_BLEND_OP = crate::Win32::Graphics::Direct3D11::D3D11_BLEND_OP(1i64 as _);
 pub const D3D11_BLEND_OP_MAX: crate::Win32::Graphics::Direct3D11::D3D11_BLEND_OP = crate::Win32::Graphics::Direct3D11::D3D11_BLEND_OP(5i64 as _);
+pub const D3D11_BLEND_ZERO: crate::Win32::Graphics::Direct3D11::D3D11_BLEND = crate::Win32::Graphics::Direct3D11::D3D11_BLEND(1i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3D11_BOX {
@@ -1387,6 +1400,9 @@ impl ::core::ops::BitAnd for D3D11_COLOR_WRITE_ENABLE { type Output = Self; fn b
 impl ::core::ops::BitXor for D3D11_COLOR_WRITE_ENABLE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_COLOR_WRITE_ENABLE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_COLOR_WRITE_ENABLE_ALL: crate::Win32::Graphics::Direct3D11::D3D11_COLOR_WRITE_ENABLE = crate::Win32::Graphics::Direct3D11::D3D11_COLOR_WRITE_ENABLE(15i64 as _);
+pub const D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT: u32 = 14;
+pub const D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT: u32 = 128;
+pub const D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT: u32 = 16;
 pub const D3D11_COMPARISON_ALWAYS: crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC = crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC(8i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -1400,7 +1416,9 @@ impl ::core::ops::BitOr for D3D11_COMPARISON_FUNC { type Output = Self; fn bitor
 impl ::core::ops::BitAnd for D3D11_COMPARISON_FUNC { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_COMPARISON_FUNC { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_COMPARISON_FUNC { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_COMPARISON_LESS: crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC = crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC(2i64 as _);
 pub const D3D11_COMPARISON_LESS_EQUAL: crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC = crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC(4i64 as _);
+pub const D3D11_COMPARISON_NEVER: crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC = crate::Win32::Graphics::Direct3D11::D3D11_COMPARISON_FUNC(1i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_COUNTER(pub i32);
@@ -1456,6 +1474,7 @@ impl ::core::ops::BitXor for D3D11_CPU_ACCESS_FLAG { type Output = Self; fn bitx
 impl ::core::ops::Not for D3D11_CPU_ACCESS_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_CPU_ACCESS_READ: crate::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(131072i64 as _);
 pub const D3D11_CPU_ACCESS_WRITE: crate::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_CPU_ACCESS_FLAG(65536i64 as _);
+pub const D3D11_CREATE_DEVICE_BGRA_SUPPORT: crate::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG(32u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_CREATE_DEVICE_FLAG(pub u32);
@@ -1468,6 +1487,7 @@ impl ::core::ops::BitOr for D3D11_CREATE_DEVICE_FLAG { type Output = Self; fn bi
 impl ::core::ops::BitAnd for D3D11_CREATE_DEVICE_FLAG { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_CREATE_DEVICE_FLAG { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_CREATE_DEVICE_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_CREATE_DEVICE_VIDEO_SUPPORT: crate::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_CREATE_DEVICE_FLAG(2048u64 as _);
 pub const D3D11_CULL_BACK: crate::Win32::Graphics::Direct3D11::D3D11_CULL_MODE = crate::Win32::Graphics::Direct3D11::D3D11_CULL_MODE(3i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -1567,6 +1587,7 @@ impl ::core::ops::BitAnd for D3D11_DSV_DIMENSION { type Output = Self; fn bitand
 impl ::core::ops::BitXor for D3D11_DSV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_DSV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_DSV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION(3i64 as _);
+pub const D3D11_DSV_DIMENSION_TEXTURE2DARRAY: crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION(4i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_FEATURE(pub i32);
@@ -1604,6 +1625,28 @@ impl ::core::ops::BitOr for D3D11_FILTER { type Output = Self; fn bitor(self, rh
 impl ::core::ops::BitAnd for D3D11_FILTER { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_FILTER { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_FILTER { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR: crate::Win32::Graphics::Direct3D11::D3D11_FILTER = crate::Win32::Graphics::Direct3D11::D3D11_FILTER(149i64 as _);
+pub const D3D11_FILTER_COMPARISON_MIN_MAG_MIP_POINT: crate::Win32::Graphics::Direct3D11::D3D11_FILTER = crate::Win32::Graphics::Direct3D11::D3D11_FILTER(128i64 as _);
+pub const D3D11_FILTER_MIN_MAG_MIP_LINEAR: crate::Win32::Graphics::Direct3D11::D3D11_FILTER = crate::Win32::Graphics::Direct3D11::D3D11_FILTER(21i64 as _);
+pub const D3D11_FILTER_MIN_MAG_MIP_POINT: crate::Win32::Graphics::Direct3D11::D3D11_FILTER = crate::Win32::Graphics::Direct3D11::D3D11_FILTER(0i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_FORMAT_SUPPORT(pub i32);
+impl D3D11_FORMAT_SUPPORT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_FORMAT_SUPPORT { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_FORMAT_SUPPORT { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_FORMAT_SUPPORT {}
+impl ::core::fmt::Debug for D3D11_FORMAT_SUPPORT { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_FORMAT_SUPPORT { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_FORMAT_SUPPORT { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_FORMAT_SUPPORT { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_FORMAT_SUPPORT { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_FORMAT_SUPPORT_BLENDABLE: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(32768i64 as _);
+pub const D3D11_FORMAT_SUPPORT_DEPTH_STENCIL: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(65536i64 as _);
+pub const D3D11_FORMAT_SUPPORT_MIP_AUTOGEN: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(8192i64 as _);
+pub const D3D11_FORMAT_SUPPORT_RENDER_TARGET: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(16384i64 as _);
+pub const D3D11_FORMAT_SUPPORT_SHADER_SAMPLE: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(512i64 as _);
+pub const D3D11_FORMAT_SUPPORT_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT = crate::Win32::Graphics::Direct3D11::D3D11_FORMAT_SUPPORT(32i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_INPUT_CLASSIFICATION(pub i32);
@@ -1663,8 +1706,22 @@ pub DepthPitch: u32,
 }
 impl D3D11_MAPPED_SUBRESOURCE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for D3D11_MAPPED_SUBRESOURCE { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_MAP_FLAG(pub i32);
+impl D3D11_MAP_FLAG { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_MAP_FLAG { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_MAP_FLAG { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_MAP_FLAG {}
+impl ::core::fmt::Debug for D3D11_MAP_FLAG { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_MAP_FLAG { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_MAP_FLAG { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_MAP_FLAG { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_MAP_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_MAP_FLAG_DO_NOT_WAIT: crate::Win32::Graphics::Direct3D11::D3D11_MAP_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_MAP_FLAG(1048576i64 as _);
 pub const D3D11_MAP_READ: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(1i64 as _);
 pub const D3D11_MAP_WRITE_DISCARD: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(4i64 as _);
+pub const D3D11_MAP_WRITE_NO_OVERWRITE: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(5i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_QUERY(pub i32);
@@ -1782,6 +1839,8 @@ pub Texture3D: crate::Win32::Graphics::Direct3D11::D3D11_TEX3D_RTV,
 }
 impl D3D11_RENDER_TARGET_VIEW_DESC_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for D3D11_RENDER_TARGET_VIEW_DESC_0 { fn default() -> Self {Self::default()} }
+pub const D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT: u32 = 4096;
+pub const D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION: u32 = 16384;
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_RESOURCE_DIMENSION(pub i32);
@@ -1806,6 +1865,7 @@ impl ::core::ops::BitOr for D3D11_RESOURCE_MISC_FLAG { type Output = Self; fn bi
 impl ::core::ops::BitAnd for D3D11_RESOURCE_MISC_FLAG { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_RESOURCE_MISC_FLAG { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_RESOURCE_MISC_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_RESOURCE_MISC_GENERATE_MIPS: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(1i64 as _);
 pub const D3D11_RESOURCE_MISC_SHARED: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(2i64 as _);
 pub const D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(256i64 as _);
 pub const D3D11_RESOURCE_MISC_SHARED_NTHANDLE: crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_RESOURCE_MISC_FLAG(2048i64 as _);
@@ -1822,6 +1882,7 @@ impl ::core::ops::BitOr for D3D11_RTV_DIMENSION { type Output = Self; fn bitor(s
 impl ::core::ops::BitAnd for D3D11_RTV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_RTV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_RTV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_RTV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_RTV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_RTV_DIMENSION(4i64 as _);
 pub const D3D11_RTV_DIMENSION_TEXTURE2DARRAY: crate::Win32::Graphics::Direct3D11::D3D11_RTV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_RTV_DIMENSION(5i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1890,6 +1951,7 @@ impl ::core::ops::BitOr for D3D11_STENCIL_OP { type Output = Self; fn bitor(self
 impl ::core::ops::BitAnd for D3D11_STENCIL_OP { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_STENCIL_OP { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_STENCIL_OP { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_STENCIL_OP_KEEP: crate::Win32::Graphics::Direct3D11::D3D11_STENCIL_OP = crate::Win32::Graphics::Direct3D11::D3D11_STENCIL_OP(1i64 as _);
 pub const D3D11_STENCIL_OP_REPLACE: crate::Win32::Graphics::Direct3D11::D3D11_STENCIL_OP = crate::Win32::Graphics::Direct3D11::D3D11_STENCIL_OP(3i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -2166,6 +2228,9 @@ pub MiscFlags: u32,
 }
 impl D3D11_TEXTURE3D_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for D3D11_TEXTURE3D_DESC { fn default() -> Self {Self::default()} }
+pub const D3D11_TEXTURE_ADDRESS_BORDER: crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE = crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE(4i64 as _);
+pub const D3D11_TEXTURE_ADDRESS_CLAMP: crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE = crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE(3i64 as _);
+pub const D3D11_TEXTURE_ADDRESS_MIRROR: crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE = crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE(2i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_TEXTURE_ADDRESS_MODE(pub i32);
@@ -2178,6 +2243,7 @@ impl ::core::ops::BitOr for D3D11_TEXTURE_ADDRESS_MODE { type Output = Self; fn 
 impl ::core::ops::BitAnd for D3D11_TEXTURE_ADDRESS_MODE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_TEXTURE_ADDRESS_MODE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_TEXTURE_ADDRESS_MODE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_TEXTURE_ADDRESS_WRAP: crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE = crate::Win32::Graphics::Direct3D11::D3D11_TEXTURE_ADDRESS_MODE(1i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_UAV_DIMENSION(pub i32);
@@ -5689,6 +5755,7 @@ pub const DWMWA_BORDER_COLOR: crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE = 
 pub const DWMWA_COLOR_NONE: u32 = 4294967294;
 pub const DWMWA_NCRENDERING_POLICY: crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE = crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(2i64 as _);
 pub const DWMWA_SYSTEMBACKDROP_TYPE: crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE = crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(38i64 as _);
+pub const DWMWA_USE_IMMERSIVE_DARK_MODE: crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE = crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(20i64 as _);
 pub const DWMWA_WINDOW_CORNER_PREFERENCE: crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE = crate::Win32::Graphics::Dwm::DWMWINDOWATTRIBUTE(33i64 as _);
 pub const DWMWCP_ROUND: crate::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE = crate::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE(2i64 as _);
 pub const DWMWCP_ROUNDSMALL: crate::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE = crate::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE(3i64 as _);
@@ -5916,6 +5983,7 @@ impl ::core::ops::BitOr for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn b
 impl ::core::ops::BitAnd for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_MEMORY_SEGMENT_GROUP { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const DXGI_MEMORY_SEGMENT_GROUP_LOCAL: crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP = crate::Win32::Graphics::Dxgi::DXGI_MEMORY_SEGMENT_GROUP(0i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct DXGI_MWA_FLAGS(pub u32);
@@ -5928,6 +5996,18 @@ impl ::core::ops::BitOr for DXGI_MWA_FLAGS { type Output = Self; fn bitor(self, 
 impl ::core::ops::BitAnd for DXGI_MWA_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for DXGI_MWA_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_MWA_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct DXGI_OFFER_RESOURCE_PRIORITY(pub i32);
+impl DXGI_OFFER_RESOURCE_PRIORITY { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for DXGI_OFFER_RESOURCE_PRIORITY { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for DXGI_OFFER_RESOURCE_PRIORITY { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for DXGI_OFFER_RESOURCE_PRIORITY {}
+impl ::core::fmt::Debug for DXGI_OFFER_RESOURCE_PRIORITY { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for DXGI_OFFER_RESOURCE_PRIORITY { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for DXGI_OFFER_RESOURCE_PRIORITY { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for DXGI_OFFER_RESOURCE_PRIORITY { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for DXGI_OFFER_RESOURCE_PRIORITY { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DXGI_OUTPUT_DESC {
@@ -5962,6 +6042,7 @@ pub pScrollOffset: *mut crate::Win32::Foundation::POINT,
 }
 impl DXGI_PRESENT_PARAMETERS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for DXGI_PRESENT_PARAMETERS { fn default() -> Self {Self::default()} }
+pub const DXGI_PRESENT_TEST: crate::Win32::Graphics::Dxgi::DXGI_PRESENT = crate::Win32::Graphics::Dxgi::DXGI_PRESENT(1u64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DXGI_QUERY_VIDEO_MEMORY_INFO {
@@ -6019,6 +6100,7 @@ impl ::core::ops::BitAnd for DXGI_SCALING { type Output = Self; fn bitand(self, 
 impl ::core::ops::BitXor for DXGI_SCALING { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_SCALING { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const DXGI_SCALING_NONE: crate::Win32::Graphics::Dxgi::DXGI_SCALING = crate::Win32::Graphics::Dxgi::DXGI_SCALING(1i64 as _);
+pub const DXGI_SCALING_STRETCH: crate::Win32::Graphics::Dxgi::DXGI_SCALING = crate::Win32::Graphics::Dxgi::DXGI_SCALING(0i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DXGI_SHARED_RESOURCE {
@@ -6651,6 +6733,116 @@ impl Drop for IDXGIDevice1 { fn drop(&mut self) { unsafe { crate::core::release(
 impl ::core::cmp::PartialEq for IDXGIDevice1 { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
 unsafe impl Send for IDXGIDevice1 {}
 unsafe impl Sync for IDXGIDevice1 {}
+pub const IID_IDXGIDevice2: crate::core::GUID = crate::core::GUID { data1: 83920407, data2: 64509, data3: 16465, data4: [167,144,20,72,132,180,246,169,] };
+#[repr(C)]
+pub struct IDXGIDevice2_Vtbl {
+pub base__: crate::Win32::Graphics::Dxgi::IDXGIDevice1_Vtbl,
+pub OfferResources: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,NumResources: u32,ppResources: *const *mut ::core::ffi::c_void,Priority: crate::Win32::Graphics::Dxgi::DXGI_OFFER_RESOURCE_PRIORITY) -> crate::core::HRESULT,
+pub ReclaimResources: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,NumResources: u32,ppResources: *const *mut ::core::ffi::c_void,pDiscarded: *mut crate::core::BOOL) -> crate::core::HRESULT,
+pub EnqueueSetEvent: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,hEvent: crate::Win32::Foundation::HANDLE) -> crate::core::HRESULT,
+}
+#[repr(transparent)]
+pub struct IDXGIDevice2(::core::ptr::NonNull<::core::ffi::c_void>);
+impl IDXGIDevice2 {
+pub const IID: crate::core::GUID = IID_IDXGIDevice2;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &IDXGIDevice2_Vtbl { unsafe { &**(self.as_raw() as *const *const IDXGIDevice2_Vtbl) } }
+pub fn as_IDXGIDevice1(&self) -> &crate::Win32::Graphics::Dxgi::IDXGIDevice1 { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Dxgi::IDXGIDevice1) } }
+pub fn as_IDXGIDevice(&self) -> &crate::Win32::Graphics::Dxgi::IDXGIDevice { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Dxgi::IDXGIDevice) } }
+pub fn as_IDXGIObject(&self) -> &crate::Win32::Graphics::Dxgi::IDXGIObject { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Dxgi::IDXGIObject) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn OfferResources(&self,ppResources: &[Option<crate::Win32::Graphics::Dxgi::IDXGIResource>],Priority: crate::Win32::Graphics::Dxgi::DXGI_OFFER_RESOURCE_PRIORITY) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().OfferResources)(self.as_raw(),ppResources.len() as _,ppResources.as_ptr() as _,Priority); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn ReclaimResources(&self,NumResources: u32,ppResources: *const Option<crate::Win32::Graphics::Dxgi::IDXGIResource>,pDiscarded: Option<*mut crate::core::BOOL>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().ReclaimResources)(self.as_raw(),NumResources,ppResources as _,pDiscarded.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn EnqueueSetEvent(&self,hEvent: crate::Win32::Foundation::HANDLE) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().EnqueueSetEvent)(self.as_raw(),hEvent); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetMaximumFrameLatency(&self,MaxLatency: u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetMaximumFrameLatency)(self.as_raw(),MaxLatency); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetMaximumFrameLatency(&self) -> Result<u32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().base__.GetMaximumFrameLatency)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetAdapter(&self) -> Result<crate::Win32::Graphics::Dxgi::IDXGIAdapter, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().base__.base__.GetAdapter)(self.as_raw(),&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Dxgi::IDXGIAdapter::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateSurface(&self,pDesc: *const crate::Win32::Graphics::Dxgi::DXGI_SURFACE_DESC,Usage: crate::Win32::Graphics::Dxgi::DXGI_USAGE,pSharedResource: Option<*const crate::Win32::Graphics::Dxgi::DXGI_SHARED_RESOURCE>,ppSurface: &mut [Option<crate::Win32::Graphics::Dxgi::IDXGISurface>]) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.CreateSurface)(self.as_raw(),pDesc,ppSurface.len() as _,Usage,pSharedResource.unwrap_or(::core::ptr::null()),ppSurface.as_mut_ptr() as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryResourceResidency(&self,ppResources: *const Option<crate::Win32::System::Com::IUnknown>,pResidencyStatus: *mut crate::Win32::Graphics::Dxgi::DXGI_RESIDENCY,NumResources: u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.QueryResourceResidency)(self.as_raw(),ppResources as _,pResidencyStatus,NumResources); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetGPUThreadPriority(&self,Priority: i32) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetGPUThreadPriority)(self.as_raw(),Priority); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetGPUThreadPriority(&self) -> Result<i32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().base__.base__.GetGPUThreadPriority)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,Name: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.base__.SetPrivateData)(self.as_raw(),Name,DataSize,pData); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,Name: *const crate::core::GUID,pUnknown: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.base__.SetPrivateDataInterface)(self.as_raw(),Name,match pUnknown { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,Name: *const crate::core::GUID,pDataSize: *mut u32,pData: *mut ::core::ffi::c_void) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.base__.GetPrivateData)(self.as_raw(),Name,pDataSize,pData); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetParent(&self,riid: *const crate::core::GUID) -> Result<*mut ::core::ffi::c_void, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().base__.base__.base__.GetParent)(self.as_raw(),riid,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.base__.base__.Release)(self.as_raw())}
+}
+impl Clone for IDXGIDevice2 { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for IDXGIDevice2 { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for IDXGIDevice2 { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for IDXGIDevice2 {}
+unsafe impl Sync for IDXGIDevice2 {}
 pub const IID_IDXGIDeviceSubObject: crate::core::GUID = crate::core::GUID { data1: 1027474297, data2: 63966, data3: 19800, data4: [187,108,24,214,41,146,241,166,] };
 #[repr(C)]
 pub struct IDXGIDeviceSubObject_Vtbl {
@@ -8262,6 +8454,7 @@ impl ::core::ops::BitAnd for DXGI_ALPHA_MODE { type Output = Self; fn bitand(sel
 impl ::core::ops::BitXor for DXGI_ALPHA_MODE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_ALPHA_MODE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const DXGI_ALPHA_MODE_IGNORE: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE = crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE(3i64 as _);
+pub const DXGI_ALPHA_MODE_PREMULTIPLIED: crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE = crate::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE(1i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct DXGI_FORMAT(pub i32);
@@ -8275,10 +8468,21 @@ impl ::core::ops::BitAnd for DXGI_FORMAT { type Output = Self; fn bitand(self, r
 impl ::core::ops::BitXor for DXGI_FORMAT { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for DXGI_FORMAT { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(87i64 as _);
+pub const DXGI_FORMAT_BC5_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(83i64 as _);
+pub const DXGI_FORMAT_BC7_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(98i64 as _);
+pub const DXGI_FORMAT_D24_UNORM_S8_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(45i64 as _);
 pub const DXGI_FORMAT_D32_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(40i64 as _);
 pub const DXGI_FORMAT_NV12: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(103i64 as _);
 pub const DXGI_FORMAT_R16G16B16A16_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(10i64 as _);
+pub const DXGI_FORMAT_R16G16_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(34i64 as _);
+pub const DXGI_FORMAT_R16G16_SINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(38i64 as _);
+pub const DXGI_FORMAT_R16G16_SNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(37i64 as _);
+pub const DXGI_FORMAT_R16G16_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(36i64 as _);
+pub const DXGI_FORMAT_R16G16_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(35i64 as _);
 pub const DXGI_FORMAT_R16_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(54i64 as _);
+pub const DXGI_FORMAT_R16_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(57i64 as _);
+pub const DXGI_FORMAT_R24G8_TYPELESS: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(44i64 as _);
+pub const DXGI_FORMAT_R24_UNORM_X8_TYPELESS: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(46i64 as _);
 pub const DXGI_FORMAT_R32G32B32A32_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(2i64 as _);
 pub const DXGI_FORMAT_R32G32B32A32_SINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(4i64 as _);
 pub const DXGI_FORMAT_R32G32B32A32_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(3i64 as _);
@@ -8292,10 +8496,12 @@ pub const DXGI_FORMAT_R32_FLOAT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORM
 pub const DXGI_FORMAT_R32_SINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(43i64 as _);
 pub const DXGI_FORMAT_R32_TYPELESS: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(39i64 as _);
 pub const DXGI_FORMAT_R32_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(42i64 as _);
+pub const DXGI_FORMAT_R8G8B8A8_SNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(31i64 as _);
 pub const DXGI_FORMAT_R8G8B8A8_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(28i64 as _);
 pub const DXGI_FORMAT_R8G8_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(49i64 as _);
 pub const DXGI_FORMAT_R8_UNORM: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(61i64 as _);
 pub const DXGI_FORMAT_UNKNOWN: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(0i64 as _);
+pub const DXGI_FORMAT_X24_TYPELESS_G8_UINT: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(47i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DXGI_GAMMA_CONTROL {
@@ -8392,6 +8598,72 @@ impl ::core::default::Default for DXGI_SAMPLE_DESC { fn default() -> Self {Self:
 }
 }
 pub mod Gdi {
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct BITMAPV5HEADER {
+pub bV5Size: u32,
+pub bV5Width: i32,
+pub bV5Height: i32,
+pub bV5Planes: u16,
+pub bV5BitCount: u16,
+pub bV5Compression: crate::Win32::Graphics::Gdi::BI_COMPRESSION,
+pub bV5SizeImage: u32,
+pub bV5XPelsPerMeter: i32,
+pub bV5YPelsPerMeter: i32,
+pub bV5ClrUsed: u32,
+pub bV5ClrImportant: u32,
+pub bV5RedMask: u32,
+pub bV5GreenMask: u32,
+pub bV5BlueMask: u32,
+pub bV5AlphaMask: u32,
+pub bV5CSType: u32,
+pub bV5Endpoints: crate::Win32::Graphics::Gdi::CIEXYZTRIPLE,
+pub bV5GammaRed: u32,
+pub bV5GammaGreen: u32,
+pub bV5GammaBlue: u32,
+pub bV5Intent: u32,
+pub bV5ProfileData: u32,
+pub bV5ProfileSize: u32,
+pub bV5Reserved: u32,
+}
+impl BITMAPV5HEADER { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for BITMAPV5HEADER { fn default() -> Self {Self::default()} }
+pub const BI_BITFIELDS: crate::Win32::Graphics::Gdi::BI_COMPRESSION = crate::Win32::Graphics::Gdi::BI_COMPRESSION(3u64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct BI_COMPRESSION(pub u32);
+impl BI_COMPRESSION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for BI_COMPRESSION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for BI_COMPRESSION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for BI_COMPRESSION {}
+impl ::core::fmt::Debug for BI_COMPRESSION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for BI_COMPRESSION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for BI_COMPRESSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for BI_COMPRESSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for BI_COMPRESSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CIEXYZ {
+pub ciexyzX: i32,
+pub ciexyzY: i32,
+pub ciexyzZ: i32,
+}
+impl CIEXYZ { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for CIEXYZ { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CIEXYZTRIPLE {
+pub ciexyzRed: crate::Win32::Graphics::Gdi::CIEXYZ,
+pub ciexyzGreen: crate::Win32::Graphics::Gdi::CIEXYZ,
+pub ciexyzBlue: crate::Win32::Graphics::Gdi::CIEXYZ,
+}
+impl CIEXYZTRIPLE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for CIEXYZTRIPLE { fn default() -> Self {Self::default()} }
+mod import_ClientToScreen { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "ClientToScreen"] pub fn call(hWnd: crate::Win32::Foundation::HWND,lpPoint: *mut crate::Win32::Foundation::POINT) -> crate::core::BOOL; } }
+pub use import_ClientToScreen::call as ClientToScreen_raw;
+#[inline]
+pub unsafe fn ClientToScreen(hWnd: crate::Win32::Foundation::HWND,lpPoint: *mut crate::Win32::Foundation::POINT) -> crate::core::BOOL {
+import_ClientToScreen::call(hWnd,lpPoint)}
 mod import_CreateSolidBrush { #[link(name = "GDI32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateSolidBrush"] pub fn call(color: crate::Win32::Foundation::COLORREF) -> crate::Win32::Graphics::Gdi::HBRUSH; } }
 pub use import_CreateSolidBrush::call as CreateSolidBrush_raw;
 #[inline]
@@ -16236,6 +16508,13 @@ Ok(())
 }
 }
 pub mod DataExchange {
+mod import_AddClipboardFormatListener { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "AddClipboardFormatListener"] pub fn call(hwnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_AddClipboardFormatListener::call as AddClipboardFormatListener_raw;
+#[inline]
+pub unsafe fn AddClipboardFormatListener(hwnd: crate::Win32::Foundation::HWND) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_AddClipboardFormatListener::call(hwnd); hr__.ok()?;
+Ok(())
+}
 mod import_CloseClipboard { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CloseClipboard"] pub fn call() -> crate::core::BOOL; } }
 pub use import_CloseClipboard::call as CloseClipboard_raw;
 #[inline]
@@ -16256,11 +16535,35 @@ pub use import_GetClipboardData::call as GetClipboardData_raw;
 pub unsafe fn GetClipboardData(uFormat: u32) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
 let hr__ = import_GetClipboardData::call(uFormat); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
 }
+mod import_GetClipboardSequenceNumber { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetClipboardSequenceNumber"] pub fn call() -> u32; } }
+pub use import_GetClipboardSequenceNumber::call as GetClipboardSequenceNumber_raw;
+#[inline]
+pub unsafe fn GetClipboardSequenceNumber() -> u32 {
+import_GetClipboardSequenceNumber::call()}
+mod import_IsClipboardFormatAvailable { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsClipboardFormatAvailable"] pub fn call(format: u32) -> crate::core::BOOL; } }
+pub use import_IsClipboardFormatAvailable::call as IsClipboardFormatAvailable_raw;
+#[inline]
+pub unsafe fn IsClipboardFormatAvailable(format: u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_IsClipboardFormatAvailable::call(format); hr__.ok()?;
+Ok(())
+}
 mod import_OpenClipboard { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "OpenClipboard"] pub fn call(hWndNewOwner: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
 pub use import_OpenClipboard::call as OpenClipboard_raw;
 #[inline]
 pub unsafe fn OpenClipboard(hWndNewOwner: Option<crate::Win32::Foundation::HWND>) -> Result<(), crate::core::HRESULT> {
 let hr__ = import_OpenClipboard::call(hWndNewOwner.unwrap_or(unsafe { ::core::mem::zeroed() })); hr__.ok()?;
+Ok(())
+}
+mod import_RegisterClipboardFormatW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "RegisterClipboardFormatW"] pub fn call(lpszFormat: crate::core::PCWSTR) -> u32; } }
+pub use import_RegisterClipboardFormatW::call as RegisterClipboardFormatW_raw;
+#[inline]
+pub unsafe fn RegisterClipboardFormatW(lpszFormat: crate::core::PCWSTR) -> u32 {
+import_RegisterClipboardFormatW::call(lpszFormat)}
+mod import_RemoveClipboardFormatListener { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "RemoveClipboardFormatListener"] pub fn call(hwnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_RemoveClipboardFormatListener::call as RemoveClipboardFormatListener_raw;
+#[inline]
+pub unsafe fn RemoveClipboardFormatListener(hwnd: crate::Win32::Foundation::HWND) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_RemoveClipboardFormatListener::call(hwnd); hr__.ok()?;
 Ok(())
 }
 mod import_SetClipboardData { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetClipboardData"] pub fn call(uFormat: u32,hMem: crate::Win32::Foundation::HANDLE) -> crate::Win32::Foundation::HANDLE; } }
@@ -16549,6 +16852,7 @@ impl ::core::ops::BitAnd for GLOBAL_ALLOC_FLAGS { type Output = Self; fn bitand(
 impl ::core::ops::BitXor for GLOBAL_ALLOC_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for GLOBAL_ALLOC_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const GMEM_FIXED: crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS = crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS(0u64 as _);
+pub const GMEM_MOVEABLE: crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS = crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS(2u64 as _);
 pub const GMEM_ZEROINIT: crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS = crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS(64u64 as _);
 mod import_GlobalAlloc { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GlobalAlloc"] pub fn call(uFlags: crate::Win32::System::Memory::GLOBAL_ALLOC_FLAGS,dwBytes: usize) -> crate::Win32::Foundation::HGLOBAL; } }
 pub use import_GlobalAlloc::call as GlobalAlloc_raw;
@@ -16658,6 +16962,8 @@ pub rgbounds: [crate::Win32::System::Com::SAFEARRAYBOUND; 1],
 }
 impl ARRAYDESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for ARRAYDESC { fn default() -> Self {Self::default()} }
+pub const CF_DIB: crate::Win32::System::Ole::CLIPBOARD_FORMAT = crate::Win32::System::Ole::CLIPBOARD_FORMAT(8u64 as _);
+pub const CF_DIBV5: crate::Win32::System::Ole::CLIPBOARD_FORMAT = crate::Win32::System::Ole::CLIPBOARD_FORMAT(17u64 as _);
 pub const CF_HDROP: crate::Win32::System::Ole::CLIPBOARD_FORMAT = crate::Win32::System::Ole::CLIPBOARD_FORMAT(15u64 as _);
 pub const CF_UNICODETEXT: crate::Win32::System::Ole::CLIPBOARD_FORMAT = crate::Win32::System::Ole::CLIPBOARD_FORMAT(13u64 as _);
 #[repr(transparent)]
@@ -16965,6 +17271,11 @@ pub unsafe fn OleInitialize(pvReserved: *const ::core::ffi::c_void) -> Result<()
 let hr__ = import_OleInitialize::call(pvReserved); hr__.ok()?;
 Ok(())
 }
+mod import_OleUninitialize { #[link(name = "OLE32", kind = "raw-dylib")] extern "system" { #[link_name = "OleUninitialize"] pub fn call() -> (); } }
+pub use import_OleUninitialize::call as OleUninitialize_raw;
+#[inline]
+pub unsafe fn OleUninitialize() -> () {
+import_OleUninitialize::call()}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PARAMDESC {
@@ -17005,6 +17316,13 @@ pub use import_ReleaseStgMedium::call as ReleaseStgMedium_raw;
 #[inline]
 pub unsafe fn ReleaseStgMedium(param0: *mut crate::Win32::System::Com::STGMEDIUM) -> () {
 import_ReleaseStgMedium::call(param0)}
+mod import_RevokeDragDrop { #[link(name = "OLE32", kind = "raw-dylib")] extern "system" { #[link_name = "RevokeDragDrop"] pub fn call(hwnd: crate::Win32::Foundation::HWND) -> crate::core::HRESULT; } }
+pub use import_RevokeDragDrop::call as RevokeDragDrop_raw;
+#[inline]
+pub unsafe fn RevokeDragDrop(hwnd: crate::Win32::Foundation::HWND) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_RevokeDragDrop::call(hwnd); hr__.ok()?;
+Ok(())
+}
 }
 pub mod Performance {
 #[repr(transparent)]
@@ -17343,6 +17661,12 @@ pub use import_CreateEventA::call as CreateEventA_raw;
 pub unsafe fn CreateEventA(lpEventAttributes: Option<*const crate::Win32::Security::SECURITY_ATTRIBUTES>,bManualReset: bool,bInitialState: bool,lpName: Option<crate::core::PCSTR>) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
 let hr__ = import_CreateEventA::call(lpEventAttributes.unwrap_or(::core::ptr::null()),crate::core::BOOL(bManualReset as i32),crate::core::BOOL(bInitialState as i32),lpName.unwrap_or(unsafe { ::core::mem::zeroed() })); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
 }
+mod import_CreateEventW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateEventW"] pub fn call(lpEventAttributes: *const crate::Win32::Security::SECURITY_ATTRIBUTES,bManualReset: crate::core::BOOL,bInitialState: crate::core::BOOL,lpName: crate::core::PCWSTR) -> crate::Win32::Foundation::HANDLE; } }
+pub use import_CreateEventW::call as CreateEventW_raw;
+#[inline]
+pub unsafe fn CreateEventW(lpEventAttributes: Option<*const crate::Win32::Security::SECURITY_ATTRIBUTES>,bManualReset: bool,bInitialState: bool,lpName: Option<crate::core::PCWSTR>) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
+let hr__ = import_CreateEventW::call(lpEventAttributes.unwrap_or(::core::ptr::null()),crate::core::BOOL(bManualReset as i32),crate::core::BOOL(bInitialState as i32),lpName.unwrap_or(unsafe { ::core::mem::zeroed() })); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
 mod import_CreateMutexW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateMutexW"] pub fn call(lpMutexAttributes: *const crate::Win32::Security::SECURITY_ATTRIBUTES,bInitialOwner: crate::core::BOOL,lpName: crate::core::PCWSTR) -> crate::Win32::Foundation::HANDLE; } }
 pub use import_CreateMutexW::call as CreateMutexW_raw;
 #[inline]
@@ -17548,6 +17872,11 @@ pub unsafe fn UpdateProcThreadAttribute(lpAttributeList: crate::Win32::System::T
 let hr__ = import_UpdateProcThreadAttribute::call(lpAttributeList,dwFlags,Attribute,lpValue.unwrap_or(::core::ptr::null()),cbSize,lpPreviousValue.unwrap_or(::core::ptr::null_mut()),lpReturnSize.unwrap_or(::core::ptr::null())); hr__.ok()?;
 Ok(())
 }
+mod import_WaitForMultipleObjects { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "WaitForMultipleObjects"] pub fn call(nCount: u32,lpHandles: *const crate::Win32::Foundation::HANDLE,bWaitAll: crate::core::BOOL,dwMilliseconds: u32) -> crate::Win32::Foundation::WAIT_EVENT; } }
+pub use import_WaitForMultipleObjects::call as WaitForMultipleObjects_raw;
+#[inline]
+pub unsafe fn WaitForMultipleObjects(lpHandles: &[crate::Win32::Foundation::HANDLE],bWaitAll: bool,dwMilliseconds: u32) -> crate::Win32::Foundation::WAIT_EVENT {
+import_WaitForMultipleObjects::call(lpHandles.len() as _,lpHandles.as_ptr() as _,crate::core::BOOL(bWaitAll as i32),dwMilliseconds)}
 mod import_WaitForSingleObject { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "WaitForSingleObject"] pub fn call(hHandle: crate::Win32::Foundation::HANDLE,dwMilliseconds: u32) -> crate::Win32::Foundation::WAIT_EVENT; } }
 pub use import_WaitForSingleObject::call as WaitForSingleObject_raw;
 #[inline]
@@ -17845,6 +18174,11 @@ pub unsafe fn GetDpiForMonitor(hmonitor: crate::Win32::Graphics::Gdi::HMONITOR,d
 let hr__ = import_GetDpiForMonitor::call(hmonitor,dpiType,dpiX,dpiY); hr__.ok()?;
 Ok(())
 }
+mod import_GetDpiForSystem { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetDpiForSystem"] pub fn call() -> u32; } }
+pub use import_GetDpiForSystem::call as GetDpiForSystem_raw;
+#[inline]
+pub unsafe fn GetDpiForSystem() -> u32 {
+import_GetDpiForSystem::call()}
 mod import_GetDpiForWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetDpiForWindow"] pub fn call(hwnd: crate::Win32::Foundation::HWND) -> u32; } }
 pub use import_GetDpiForWindow::call as GetDpiForWindow_raw;
 #[inline]
@@ -17897,6 +18231,164 @@ pub unsafe fn SetThreadDpiAwarenessContext(dpiContext: crate::Win32::UI::HiDpi::
 import_SetThreadDpiAwarenessContext::call(dpiContext)}
 }
 pub mod Input {
+mod import_GetRawInputData { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetRawInputData"] pub fn call(hRawInput: crate::Win32::UI::Input::HRAWINPUT,uiCommand: crate::Win32::UI::Input::RAW_INPUT_DATA_COMMAND_FLAGS,pData: *mut ::core::ffi::c_void,pcbSize: *mut u32,cbSizeHeader: u32) -> u32; } }
+pub use import_GetRawInputData::call as GetRawInputData_raw;
+#[inline]
+pub unsafe fn GetRawInputData(hRawInput: crate::Win32::UI::Input::HRAWINPUT,uiCommand: crate::Win32::UI::Input::RAW_INPUT_DATA_COMMAND_FLAGS,pData: Option<*mut ::core::ffi::c_void>,pcbSize: *mut u32,cbSizeHeader: u32) -> u32 {
+import_GetRawInputData::call(hRawInput,uiCommand,pData.unwrap_or(::core::ptr::null_mut()),pcbSize,cbSizeHeader)}
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct HRAWINPUT(pub *mut ::core::ffi::c_void);
+impl HRAWINPUT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for HRAWINPUT { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for HRAWINPUT { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for HRAWINPUT {}
+impl ::core::fmt::Debug for HRAWINPUT { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct MOUSE_STATE(pub u16);
+impl MOUSE_STATE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for MOUSE_STATE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for MOUSE_STATE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for MOUSE_STATE {}
+impl ::core::fmt::Debug for MOUSE_STATE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for MOUSE_STATE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for MOUSE_STATE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for MOUSE_STATE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for MOUSE_STATE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWHID {
+pub dwSizeHid: u32,
+pub dwCount: u32,
+pub bRawData: [u8; 1],
+}
+impl RAWHID { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWHID { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWINPUT {
+pub header: crate::Win32::UI::Input::RAWINPUTHEADER,
+pub data: crate::Win32::UI::Input::RAWINPUT_0,
+}
+impl RAWINPUT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWINPUT { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWINPUTDEVICE {
+pub usUsagePage: u16,
+pub usUsage: u16,
+pub dwFlags: crate::Win32::UI::Input::RAWINPUTDEVICE_FLAGS,
+pub hwndTarget: crate::Win32::Foundation::HWND,
+}
+impl RAWINPUTDEVICE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWINPUTDEVICE { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct RAWINPUTDEVICE_FLAGS(pub u32);
+impl RAWINPUTDEVICE_FLAGS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for RAWINPUTDEVICE_FLAGS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for RAWINPUTDEVICE_FLAGS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for RAWINPUTDEVICE_FLAGS {}
+impl ::core::fmt::Debug for RAWINPUTDEVICE_FLAGS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for RAWINPUTDEVICE_FLAGS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for RAWINPUTDEVICE_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for RAWINPUTDEVICE_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for RAWINPUTDEVICE_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWINPUTHEADER {
+pub dwType: u32,
+pub dwSize: u32,
+pub hDevice: crate::Win32::Foundation::HANDLE,
+pub wParam: crate::Win32::Foundation::WPARAM,
+}
+impl RAWINPUTHEADER { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWINPUTHEADER { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union RAWINPUT_0 {
+pub mouse: crate::Win32::UI::Input::RAWMOUSE,
+pub keyboard: crate::Win32::UI::Input::RAWKEYBOARD,
+pub hid: crate::Win32::UI::Input::RAWHID,
+}
+impl RAWINPUT_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWINPUT_0 { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWKEYBOARD {
+pub MakeCode: u16,
+pub Flags: u16,
+pub Reserved: u16,
+pub VKey: u16,
+pub Message: u32,
+pub ExtraInformation: u32,
+}
+impl RAWKEYBOARD { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWKEYBOARD { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWMOUSE {
+pub usFlags: crate::Win32::UI::Input::MOUSE_STATE,
+pub Anonymous: crate::Win32::UI::Input::RAWMOUSE_0,
+pub ulRawButtons: u32,
+pub lLastX: i32,
+pub lLastY: i32,
+pub ulExtraInformation: u32,
+}
+impl RAWMOUSE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWMOUSE { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union RAWMOUSE_0 {
+pub ulButtons: u32,
+pub Anonymous: crate::Win32::UI::Input::RAWMOUSE_0_0,
+}
+impl RAWMOUSE_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWMOUSE_0 { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RAWMOUSE_0_0 {
+pub usButtonFlags: u16,
+pub usButtonData: u16,
+}
+impl RAWMOUSE_0_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for RAWMOUSE_0_0 { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct RAW_INPUT_DATA_COMMAND_FLAGS(pub u32);
+impl RAW_INPUT_DATA_COMMAND_FLAGS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for RAW_INPUT_DATA_COMMAND_FLAGS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for RAW_INPUT_DATA_COMMAND_FLAGS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for RAW_INPUT_DATA_COMMAND_FLAGS {}
+impl ::core::fmt::Debug for RAW_INPUT_DATA_COMMAND_FLAGS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for RAW_INPUT_DATA_COMMAND_FLAGS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for RAW_INPUT_DATA_COMMAND_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for RAW_INPUT_DATA_COMMAND_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for RAW_INPUT_DATA_COMMAND_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const RIDEV_INPUTSINK: crate::Win32::UI::Input::RAWINPUTDEVICE_FLAGS = crate::Win32::UI::Input::RAWINPUTDEVICE_FLAGS(256u64 as _);
+pub const RIDEV_REMOVE: crate::Win32::UI::Input::RAWINPUTDEVICE_FLAGS = crate::Win32::UI::Input::RAWINPUTDEVICE_FLAGS(1u64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct RID_DEVICE_INFO_TYPE(pub u32);
+impl RID_DEVICE_INFO_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for RID_DEVICE_INFO_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for RID_DEVICE_INFO_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for RID_DEVICE_INFO_TYPE {}
+impl ::core::fmt::Debug for RID_DEVICE_INFO_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for RID_DEVICE_INFO_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for RID_DEVICE_INFO_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for RID_DEVICE_INFO_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for RID_DEVICE_INFO_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const RID_INPUT: crate::Win32::UI::Input::RAW_INPUT_DATA_COMMAND_FLAGS = crate::Win32::UI::Input::RAW_INPUT_DATA_COMMAND_FLAGS(268435459u64 as _);
+pub const RIM_TYPEMOUSE: crate::Win32::UI::Input::RID_DEVICE_INFO_TYPE = crate::Win32::UI::Input::RID_DEVICE_INFO_TYPE(0u64 as _);
+mod import_RegisterRawInputDevices { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "RegisterRawInputDevices"] pub fn call(pRawInputDevices: *const crate::Win32::UI::Input::RAWINPUTDEVICE,uiNumDevices: u32,cbSize: u32) -> crate::core::BOOL; } }
+pub use import_RegisterRawInputDevices::call as RegisterRawInputDevices_raw;
+#[inline]
+pub unsafe fn RegisterRawInputDevices(pRawInputDevices: &[crate::Win32::UI::Input::RAWINPUTDEVICE],cbSize: u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_RegisterRawInputDevices::call(pRawInputDevices.as_ptr() as _,pRawInputDevices.len() as _,cbSize); hr__.ok()?;
+Ok(())
+}
 pub mod Ime {
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -17919,7 +18411,12 @@ pub rcArea: crate::Win32::Foundation::RECT,
 }
 impl COMPOSITIONFORM { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for COMPOSITIONFORM { fn default() -> Self {Self::default()} }
+pub const CPS_CANCEL: crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX = crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX(4u64 as _);
+pub const CPS_COMPLETE: crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX = crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX(1u64 as _);
+pub const GCS_COMPATTR: crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING = crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING(16u64 as _);
+pub const GCS_COMPCLAUSE: crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING = crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING(32u64 as _);
 pub const GCS_COMPSTR: crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING = crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING(8u64 as _);
+pub const GCS_CURSORPOS: crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING = crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING(128u64 as _);
 pub const GCS_RESULTSTR: crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING = crate::Win32::UI::Input::Ime::IME_COMPOSITION_STRING(2048u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -17956,6 +18453,11 @@ pub use import_ImmGetContext::call as ImmGetContext_raw;
 #[inline]
 pub unsafe fn ImmGetContext(param0: crate::Win32::Foundation::HWND) -> crate::Win32::UI::Input::Ime::HIMC {
 import_ImmGetContext::call(param0)}
+mod import_ImmNotifyIME { #[link(name = "IMM32", kind = "raw-dylib")] extern "system" { #[link_name = "ImmNotifyIME"] pub fn call(param0: crate::Win32::UI::Input::Ime::HIMC,dwAction: crate::Win32::UI::Input::Ime::NOTIFY_IME_ACTION,dwIndex: crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX,dwValue: u32) -> crate::core::BOOL; } }
+pub use import_ImmNotifyIME::call as ImmNotifyIME_raw;
+#[inline]
+pub unsafe fn ImmNotifyIME(param0: crate::Win32::UI::Input::Ime::HIMC,dwAction: crate::Win32::UI::Input::Ime::NOTIFY_IME_ACTION,dwIndex: crate::Win32::UI::Input::Ime::NOTIFY_IME_INDEX,dwValue: u32) -> crate::core::BOOL {
+import_ImmNotifyIME::call(param0,dwAction,dwIndex,dwValue)}
 mod import_ImmReleaseContext { #[link(name = "IMM32", kind = "raw-dylib")] extern "system" { #[link_name = "ImmReleaseContext"] pub fn call(param0: crate::Win32::Foundation::HWND,param1: crate::Win32::UI::Input::Ime::HIMC) -> crate::core::BOOL; } }
 pub use import_ImmReleaseContext::call as ImmReleaseContext_raw;
 #[inline]
@@ -17971,6 +18473,31 @@ pub use import_ImmSetCompositionWindow::call as ImmSetCompositionWindow_raw;
 #[inline]
 pub unsafe fn ImmSetCompositionWindow(param0: crate::Win32::UI::Input::Ime::HIMC,lpCompForm: *const crate::Win32::UI::Input::Ime::COMPOSITIONFORM) -> crate::core::BOOL {
 import_ImmSetCompositionWindow::call(param0,lpCompForm)}
+pub const NI_COMPOSITIONSTR: crate::Win32::UI::Input::Ime::NOTIFY_IME_ACTION = crate::Win32::UI::Input::Ime::NOTIFY_IME_ACTION(21u64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct NOTIFY_IME_ACTION(pub u32);
+impl NOTIFY_IME_ACTION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for NOTIFY_IME_ACTION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for NOTIFY_IME_ACTION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for NOTIFY_IME_ACTION {}
+impl ::core::fmt::Debug for NOTIFY_IME_ACTION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for NOTIFY_IME_ACTION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for NOTIFY_IME_ACTION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for NOTIFY_IME_ACTION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for NOTIFY_IME_ACTION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct NOTIFY_IME_INDEX(pub u32);
+impl NOTIFY_IME_INDEX { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for NOTIFY_IME_INDEX { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for NOTIFY_IME_INDEX { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for NOTIFY_IME_INDEX {}
+impl ::core::fmt::Debug for NOTIFY_IME_INDEX { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for NOTIFY_IME_INDEX { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for NOTIFY_IME_INDEX { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for NOTIFY_IME_INDEX { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for NOTIFY_IME_INDEX { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 }
 pub mod KeyboardAndMouse {
 mod import_GetKeyState { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetKeyState"] pub fn call(nVirtKey: i32) -> i16; } }
@@ -18230,6 +18757,11 @@ pub fWide: crate::core::BOOL,
 }
 impl DROPFILES { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for DROPFILES { fn default() -> Self {Self::default()} }
+mod import_DragQueryFileW { #[link(name = "SHELL32", kind = "raw-dylib")] extern "system" { #[link_name = "DragQueryFileW"] pub fn call(hDrop: crate::Win32::UI::Shell::HDROP,iFile: u32,lpszFile: crate::core::PWSTR,cch: u32) -> u32; } }
+pub use import_DragQueryFileW::call as DragQueryFileW_raw;
+#[inline]
+pub unsafe fn DragQueryFileW(hDrop: crate::Win32::UI::Shell::HDROP,iFile: u32,lpszFile: Option<crate::core::PWSTR>,cch: u32) -> u32 {
+import_DragQueryFileW::call(hDrop,iFile,lpszFile.unwrap_or(unsafe { ::core::mem::zeroed() }),cch)}
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct FDAP(pub i32);
@@ -18286,6 +18818,14 @@ pub const FOS_OVERWRITEPROMPT: crate::Win32::UI::Shell::FILEOPENDIALOGOPTIONS = 
 pub const FOS_PICKFOLDERS: crate::Win32::UI::Shell::FILEOPENDIALOGOPTIONS = crate::Win32::UI::Shell::FILEOPENDIALOGOPTIONS(32u64 as _);
 pub const FileOpenDialog: crate::core::GUID = crate::core::GUID { data1: 3692845724, data2: 59530, data3: 19934, data4: [165,161,96,248,42,32,174,247,] };
 pub const FileSaveDialog: crate::core::GUID = crate::core::GUID { data1: 3233080051, data2: 47649, data3: 18291, data4: [141,186,51,94,201,70,235,139,] };
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct HDROP(pub *mut ::core::ffi::c_void);
+impl HDROP { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for HDROP { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for HDROP { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for HDROP {}
+impl ::core::fmt::Debug for HDROP { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
 pub const IID_IEnumShellItems: crate::core::GUID = crate::core::GUID { data1: 1885507635, data2: 58211, data3: 18984, data4: [165,103,13,183,128,6,230,215,] };
 #[repr(C)]
 pub struct IEnumShellItems_Vtbl {
@@ -19359,6 +19899,11 @@ impl ::core::ops::BitAnd for SIGDN { type Output = Self; fn bitand(self, rhs: Se
 impl ::core::ops::BitXor for SIGDN { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for SIGDN { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const SIGDN_FILESYSPATH: crate::Win32::UI::Shell::SIGDN = crate::Win32::UI::Shell::SIGDN(-2147123200i64 as _);
+mod import_ShellExecuteW { #[link(name = "SHELL32", kind = "raw-dylib")] extern "system" { #[link_name = "ShellExecuteW"] pub fn call(hwnd: crate::Win32::Foundation::HWND,lpOperation: crate::core::PCWSTR,lpFile: crate::core::PCWSTR,lpParameters: crate::core::PCWSTR,lpDirectory: crate::core::PCWSTR,nShowCmd: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD) -> crate::Win32::Foundation::HINSTANCE; } }
+pub use import_ShellExecuteW::call as ShellExecuteW_raw;
+#[inline]
+pub unsafe fn ShellExecuteW(hwnd: Option<crate::Win32::Foundation::HWND>,lpOperation: Option<crate::core::PCWSTR>,lpFile: crate::core::PCWSTR,lpParameters: Option<crate::core::PCWSTR>,lpDirectory: Option<crate::core::PCWSTR>,nShowCmd: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD) -> crate::Win32::Foundation::HINSTANCE {
+import_ShellExecuteW::call(hwnd.unwrap_or(unsafe { ::core::mem::zeroed() }),lpOperation.unwrap_or(unsafe { ::core::mem::zeroed() }),lpFile,lpParameters.unwrap_or(unsafe { ::core::mem::zeroed() }),lpDirectory.unwrap_or(unsafe { ::core::mem::zeroed() }),nShowCmd)}
 pub mod Common {
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -19502,8 +20047,33 @@ pub unsafe fn AllowSetForegroundWindow(dwProcessId: u32) -> Result<(), crate::co
 let hr__ = import_AllowSetForegroundWindow::call(dwProcessId); hr__.ok()?;
 Ok(())
 }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CREATESTRUCTW {
+pub lpCreateParams: *mut ::core::ffi::c_void,
+pub hInstance: crate::Win32::Foundation::HINSTANCE,
+pub hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU,
+pub hwndParent: crate::Win32::Foundation::HWND,
+pub cy: i32,
+pub cx: i32,
+pub y: i32,
+pub x: i32,
+pub style: i32,
+pub lpszName: crate::core::PCWSTR,
+pub lpszClass: crate::core::PCWSTR,
+pub dwExStyle: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE,
+}
+impl CREATESTRUCTW { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for CREATESTRUCTW { fn default() -> Self {Self::default()} }
 pub const CS_OWNDC: crate::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES = crate::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(32u64 as _);
 pub const CW_USEDEFAULT: i32 = -2147483648;
+mod import_ClipCursor { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "ClipCursor"] pub fn call(lpRect: *const crate::Win32::Foundation::RECT) -> crate::core::BOOL; } }
+pub use import_ClipCursor::call as ClipCursor_raw;
+#[inline]
+pub unsafe fn ClipCursor(lpRect: Option<*const crate::Win32::Foundation::RECT>) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_ClipCursor::call(lpRect.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
 mod import_CloseWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CloseWindow"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
 pub use import_CloseWindow::call as CloseWindow_raw;
 #[inline]
@@ -19517,6 +20087,18 @@ pub use import_CreateIcon::call as CreateIcon_raw;
 pub unsafe fn CreateIcon(hInstance: Option<crate::Win32::Foundation::HINSTANCE>,nWidth: i32,nHeight: i32,cPlanes: u8,cBitsPixel: u8,lpbANDbits: *const u8,lpbXORbits: *const u8) -> Result<crate::Win32::UI::WindowsAndMessaging::HICON, crate::core::HRESULT> {
 let hr__ = import_CreateIcon::call(hInstance.unwrap_or(unsafe { ::core::mem::zeroed() }),nWidth,nHeight,cPlanes,cBitsPixel,lpbANDbits,lpbXORbits); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
 }
+mod import_CreateMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateMenu"] pub fn call() -> crate::Win32::UI::WindowsAndMessaging::HMENU; } }
+pub use import_CreateMenu::call as CreateMenu_raw;
+#[inline]
+pub unsafe fn CreateMenu() -> Result<crate::Win32::UI::WindowsAndMessaging::HMENU, crate::core::HRESULT> {
+let hr__ = import_CreateMenu::call(); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
+mod import_CreatePopupMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CreatePopupMenu"] pub fn call() -> crate::Win32::UI::WindowsAndMessaging::HMENU; } }
+pub use import_CreatePopupMenu::call as CreatePopupMenu_raw;
+#[inline]
+pub unsafe fn CreatePopupMenu() -> Result<crate::Win32::UI::WindowsAndMessaging::HMENU, crate::core::HRESULT> {
+let hr__ = import_CreatePopupMenu::call(); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
 mod import_CreateWindowExW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateWindowExW"] pub fn call(dwExStyle: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE,lpClassName: crate::core::PCWSTR,lpWindowName: crate::core::PCWSTR,dwStyle: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE,X: i32,Y: i32,nWidth: i32,nHeight: i32,hWndParent: crate::Win32::Foundation::HWND,hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU,hInstance: crate::Win32::Foundation::HINSTANCE,lpParam: *const ::core::ffi::c_void) -> crate::Win32::Foundation::HWND; } }
 pub use import_CreateWindowExW::call as CreateWindowExW_raw;
 #[inline]
@@ -19527,6 +20109,13 @@ pub use import_DefWindowProcW::call as DefWindowProcW_raw;
 #[inline]
 pub unsafe fn DefWindowProcW(hWnd: crate::Win32::Foundation::HWND,Msg: u32,wParam: crate::Win32::Foundation::WPARAM,lParam: crate::Win32::Foundation::LPARAM) -> crate::Win32::Foundation::LRESULT {
 import_DefWindowProcW::call(hWnd,Msg,wParam,lParam)}
+mod import_DestroyMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "DestroyMenu"] pub fn call(hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU) -> crate::core::BOOL; } }
+pub use import_DestroyMenu::call as DestroyMenu_raw;
+#[inline]
+pub unsafe fn DestroyMenu(hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_DestroyMenu::call(hMenu); hr__.ok()?;
+Ok(())
+}
 mod import_DestroyWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "DestroyWindow"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
 pub use import_DestroyWindow::call as DestroyWindow_raw;
 #[inline]
@@ -19539,6 +20128,13 @@ pub use import_DispatchMessageW::call as DispatchMessageW_raw;
 #[inline]
 pub unsafe fn DispatchMessageW(lpMsg: *const crate::Win32::UI::WindowsAndMessaging::MSG) -> crate::Win32::Foundation::LRESULT {
 import_DispatchMessageW::call(lpMsg)}
+mod import_DrawMenuBar { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "DrawMenuBar"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_DrawMenuBar::call as DrawMenuBar_raw;
+#[inline]
+pub unsafe fn DrawMenuBar(hWnd: crate::Win32::Foundation::HWND) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_DrawMenuBar::call(hWnd); hr__.ok()?;
+Ok(())
+}
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct GDI_IMAGE_TYPE(pub u32);
@@ -19566,6 +20162,20 @@ pub unsafe fn GetClientRect(hWnd: crate::Win32::Foundation::HWND,lpRect: *mut cr
 let hr__ = import_GetClientRect::call(hWnd,lpRect); hr__.ok()?;
 Ok(())
 }
+mod import_GetClipCursor { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetClipCursor"] pub fn call(lpRect: *mut crate::Win32::Foundation::RECT) -> crate::core::BOOL; } }
+pub use import_GetClipCursor::call as GetClipCursor_raw;
+#[inline]
+pub unsafe fn GetClipCursor(lpRect: *mut crate::Win32::Foundation::RECT) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetClipCursor::call(lpRect); hr__.ok()?;
+Ok(())
+}
+mod import_GetCursorPos { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetCursorPos"] pub fn call(lpPoint: *mut crate::Win32::Foundation::POINT) -> crate::core::BOOL; } }
+pub use import_GetCursorPos::call as GetCursorPos_raw;
+#[inline]
+pub unsafe fn GetCursorPos(lpPoint: *mut crate::Win32::Foundation::POINT) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetCursorPos::call(lpPoint); hr__.ok()?;
+Ok(())
+}
 mod import_GetDesktopWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetDesktopWindow"] pub fn call() -> crate::Win32::Foundation::HWND; } }
 pub use import_GetDesktopWindow::call as GetDesktopWindow_raw;
 #[inline]
@@ -19576,6 +20186,11 @@ pub use import_GetForegroundWindow::call as GetForegroundWindow_raw;
 #[inline]
 pub unsafe fn GetForegroundWindow() -> crate::Win32::Foundation::HWND {
 import_GetForegroundWindow::call()}
+mod import_GetMessageTime { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetMessageTime"] pub fn call() -> i32; } }
+pub use import_GetMessageTime::call as GetMessageTime_raw;
+#[inline]
+pub unsafe fn GetMessageTime() -> i32 {
+import_GetMessageTime::call()}
 mod import_GetMessageW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetMessageW"] pub fn call(lpMsg: *mut crate::Win32::UI::WindowsAndMessaging::MSG,hWnd: crate::Win32::Foundation::HWND,wMsgFilterMin: u32,wMsgFilterMax: u32) -> crate::core::BOOL; } }
 pub use import_GetMessageW::call as GetMessageW_raw;
 #[inline]
@@ -19586,6 +20201,11 @@ pub use import_GetShellWindow::call as GetShellWindow_raw;
 #[inline]
 pub unsafe fn GetShellWindow() -> crate::Win32::Foundation::HWND {
 import_GetShellWindow::call()}
+mod import_GetSystemMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetSystemMenu"] pub fn call(hWnd: crate::Win32::Foundation::HWND,bRevert: crate::core::BOOL) -> crate::Win32::UI::WindowsAndMessaging::HMENU; } }
+pub use import_GetSystemMenu::call as GetSystemMenu_raw;
+#[inline]
+pub unsafe fn GetSystemMenu(hWnd: crate::Win32::Foundation::HWND,bRevert: bool) -> crate::Win32::UI::WindowsAndMessaging::HMENU {
+import_GetSystemMenu::call(hWnd,crate::core::BOOL(bRevert as i32))}
 mod import_GetSystemMetrics { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetSystemMetrics"] pub fn call(nIndex: crate::Win32::UI::WindowsAndMessaging::SYSTEM_METRICS_INDEX) -> i32; } }
 pub use import_GetSystemMetrics::call as GetSystemMetrics_raw;
 #[inline]
@@ -19645,11 +20265,13 @@ pub const HTBOTTOMRIGHT: u32 = 17;
 pub const HTCAPTION: u32 = 2;
 pub const HTCLIENT: u32 = 1;
 pub const HTLEFT: u32 = 10;
+pub const HTMAXBUTTON: u32 = 9;
 pub const HTRIGHT: u32 = 11;
 pub const HTSYSMENU: u32 = 3;
 pub const HTTOP: u32 = 12;
 pub const HTTOPLEFT: u32 = 13;
 pub const HTTOPRIGHT: u32 = 14;
+pub const HWND_MESSAGE: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-3i64 as _);
 pub const HWND_NOTOPMOST: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-2i64 as _);
 pub const HWND_TOPMOST: crate::Win32::Foundation::HWND = crate::Win32::Foundation::HWND(-1i64 as _);
 pub const IDC_ARROW: crate::core::PCWSTR = crate::core::PCWSTR(32512u64 as _);
@@ -19663,6 +20285,7 @@ pub const IDC_SIZENESW: crate::core::PCWSTR = crate::core::PCWSTR(32643u64 as _)
 pub const IDC_SIZENS: crate::core::PCWSTR = crate::core::PCWSTR(32645u64 as _);
 pub const IDC_SIZENWSE: crate::core::PCWSTR = crate::core::PCWSTR(32642u64 as _);
 pub const IDC_SIZEWE: crate::core::PCWSTR = crate::core::PCWSTR(32644u64 as _);
+pub const IDC_WAIT: crate::core::PCWSTR = crate::core::PCWSTR(32514u64 as _);
 pub const IDI_WINLOGO: crate::core::PCWSTR = crate::core::PCWSTR(32517u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -19677,6 +20300,13 @@ impl ::core::ops::BitAnd for IMAGE_FLAGS { type Output = Self; fn bitand(self, r
 impl ::core::ops::BitXor for IMAGE_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for IMAGE_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const IMAGE_ICON: crate::Win32::UI::WindowsAndMessaging::GDI_IMAGE_TYPE = crate::Win32::UI::WindowsAndMessaging::GDI_IMAGE_TYPE(1u64 as _);
+mod import_InsertMenuItemW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "InsertMenuItemW"] pub fn call(hmenu: crate::Win32::UI::WindowsAndMessaging::HMENU,item: u32,fByPosition: crate::core::BOOL,lpmi: *const crate::Win32::UI::WindowsAndMessaging::MENUITEMINFOW) -> crate::core::BOOL; } }
+pub use import_InsertMenuItemW::call as InsertMenuItemW_raw;
+#[inline]
+pub unsafe fn InsertMenuItemW(hmenu: crate::Win32::UI::WindowsAndMessaging::HMENU,item: u32,fByPosition: bool,lpmi: *const crate::Win32::UI::WindowsAndMessaging::MENUITEMINFOW) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_InsertMenuItemW::call(hmenu,item,crate::core::BOOL(fByPosition as i32),lpmi); hr__.ok()?;
+Ok(())
+}
 mod import_IsGUIThread { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsGUIThread"] pub fn call(bConvert: crate::core::BOOL) -> crate::core::BOOL; } }
 pub use import_IsGUIThread::call as IsGUIThread_raw;
 #[inline]
@@ -19692,6 +20322,16 @@ pub use import_IsProcessDPIAware::call as IsProcessDPIAware_raw;
 #[inline]
 pub unsafe fn IsProcessDPIAware() -> crate::core::BOOL {
 import_IsProcessDPIAware::call()}
+mod import_IsWindowVisible { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsWindowVisible"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_IsWindowVisible::call as IsWindowVisible_raw;
+#[inline]
+pub unsafe fn IsWindowVisible(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL {
+import_IsWindowVisible::call(hWnd)}
+mod import_IsZoomed { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "IsZoomed"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
+pub use import_IsZoomed::call as IsZoomed_raw;
+#[inline]
+pub unsafe fn IsZoomed(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL {
+import_IsZoomed::call(hWnd)}
 mod import_KillTimer { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "KillTimer"] pub fn call(hWnd: crate::Win32::Foundation::HWND,uIDEvent: usize) -> crate::core::BOOL; } }
 pub use import_KillTimer::call as KillTimer_raw;
 #[inline]
@@ -19731,6 +20371,80 @@ pub use import_LoadImageW::call as LoadImageW_raw;
 pub unsafe fn LoadImageW(hInst: Option<crate::Win32::Foundation::HINSTANCE>,name: crate::core::PCWSTR,r#type: crate::Win32::UI::WindowsAndMessaging::GDI_IMAGE_TYPE,cx: i32,cy: i32,fuLoad: crate::Win32::UI::WindowsAndMessaging::IMAGE_FLAGS) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
 let hr__ = import_LoadImageW::call(hInst.unwrap_or(unsafe { ::core::mem::zeroed() }),name,r#type,cx,cy,fuLoad); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
 }
+pub const MA_NOACTIVATE: u32 = 3;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MENUITEMINFOW {
+pub cbSize: u32,
+pub fMask: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK,
+pub fType: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE,
+pub fState: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE,
+pub wID: u32,
+pub hSubMenu: crate::Win32::UI::WindowsAndMessaging::HMENU,
+pub hbmpChecked: crate::Win32::Graphics::Gdi::HBITMAP,
+pub hbmpUnchecked: crate::Win32::Graphics::Gdi::HBITMAP,
+pub dwItemData: usize,
+pub dwTypeData: crate::core::PWSTR,
+pub cch: u32,
+pub hbmpItem: crate::Win32::Graphics::Gdi::HBITMAP,
+}
+impl MENUITEMINFOW { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for MENUITEMINFOW { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct MENU_ITEM_MASK(pub u32);
+impl MENU_ITEM_MASK { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for MENU_ITEM_MASK { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for MENU_ITEM_MASK { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for MENU_ITEM_MASK {}
+impl ::core::fmt::Debug for MENU_ITEM_MASK { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for MENU_ITEM_MASK { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for MENU_ITEM_MASK { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for MENU_ITEM_MASK { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for MENU_ITEM_MASK { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct MENU_ITEM_STATE(pub u32);
+impl MENU_ITEM_STATE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for MENU_ITEM_STATE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for MENU_ITEM_STATE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for MENU_ITEM_STATE {}
+impl ::core::fmt::Debug for MENU_ITEM_STATE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for MENU_ITEM_STATE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for MENU_ITEM_STATE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for MENU_ITEM_STATE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for MENU_ITEM_STATE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct MENU_ITEM_TYPE(pub u32);
+impl MENU_ITEM_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for MENU_ITEM_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for MENU_ITEM_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for MENU_ITEM_TYPE {}
+impl ::core::fmt::Debug for MENU_ITEM_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for MENU_ITEM_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for MENU_ITEM_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for MENU_ITEM_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for MENU_ITEM_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const MFS_CHECKED: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE(8u64 as _);
+pub const MFS_DISABLED: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_STATE(3u64 as _);
+pub const MFT_SEPARATOR: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_TYPE(2048u64 as _);
+pub const MIIM_FTYPE: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(256u64 as _);
+pub const MIIM_ID: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(2u64 as _);
+pub const MIIM_STATE: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(1u64 as _);
+pub const MIIM_STRING: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(64u64 as _);
+pub const MIIM_SUBMENU: crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK = crate::Win32::UI::WindowsAndMessaging::MENU_ITEM_MASK(4u64 as _);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MINMAXINFO {
+pub ptReserved: crate::Win32::Foundation::POINT,
+pub ptMaxSize: crate::Win32::Foundation::POINT,
+pub ptMaxPosition: crate::Win32::Foundation::POINT,
+pub ptMinTrackSize: crate::Win32::Foundation::POINT,
+pub ptMaxTrackSize: crate::Win32::Foundation::POINT,
+}
+impl MINMAXINFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for MINMAXINFO { fn default() -> Self {Self::default()} }
 pub const MONITORINFOF_PRIMARY: u32 = 1;
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -19803,6 +20517,11 @@ pub unsafe fn PostMessageW(hWnd: Option<crate::Win32::Foundation::HWND>,Msg: u32
 let hr__ = import_PostMessageW::call(hWnd.unwrap_or(unsafe { ::core::mem::zeroed() }),Msg,wParam,lParam); hr__.ok()?;
 Ok(())
 }
+mod import_PostQuitMessage { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "PostQuitMessage"] pub fn call(nExitCode: i32) -> (); } }
+pub use import_PostQuitMessage::call as PostQuitMessage_raw;
+#[inline]
+pub unsafe fn PostQuitMessage(nExitCode: i32) -> () {
+import_PostQuitMessage::call(nExitCode)}
 mod import_PostThreadMessageW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "PostThreadMessageW"] pub fn call(idThread: u32,Msg: u32,wParam: crate::Win32::Foundation::WPARAM,lParam: crate::Win32::Foundation::LPARAM) -> crate::core::BOOL; } }
 pub use import_PostThreadMessageW::call as PostThreadMessageW_raw;
 #[inline]
@@ -19828,6 +20547,11 @@ pub use import_RegisterClassExW::call as RegisterClassExW_raw;
 #[inline]
 pub unsafe fn RegisterClassExW(param0: *const crate::Win32::UI::WindowsAndMessaging::WNDCLASSEXW) -> u16 {
 import_RegisterClassExW::call(param0)}
+pub const SC_CLOSE: u32 = 61536;
+pub const SC_MAXIMIZE: u32 = 61488;
+pub const SC_MINIMIZE: u32 = 61472;
+pub const SC_MOVE: u32 = 61456;
+pub const SC_RESTORE: u32 = 61728;
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct SET_WINDOW_POS_FLAGS(pub u32);
@@ -19862,10 +20586,12 @@ pub const SWP_NOACTIVATE: crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_
 pub const SWP_NOMOVE: crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS = crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(2u64 as _);
 pub const SWP_NOSIZE: crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS = crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(1u64 as _);
 pub const SWP_NOZORDER: crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS = crate::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS(4u64 as _);
+pub const SW_HIDE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(0i64 as _);
 pub const SW_MAXIMIZE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(3i64 as _);
 pub const SW_MINIMIZE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(6i64 as _);
 pub const SW_RESTORE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(9i64 as _);
 pub const SW_SHOW: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(5i64 as _);
+pub const SW_SHOWNOACTIVATE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(4i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct SYSTEM_METRICS_INDEX(pub i32);
@@ -19888,6 +20614,13 @@ pub use import_SetCursor::call as SetCursor_raw;
 #[inline]
 pub unsafe fn SetCursor(hCursor: Option<crate::Win32::UI::WindowsAndMessaging::HCURSOR>) -> crate::Win32::UI::WindowsAndMessaging::HCURSOR {
 import_SetCursor::call(hCursor.unwrap_or(unsafe { ::core::mem::zeroed() }))}
+mod import_SetCursorPos { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetCursorPos"] pub fn call(X: i32,Y: i32) -> crate::core::BOOL; } }
+pub use import_SetCursorPos::call as SetCursorPos_raw;
+#[inline]
+pub unsafe fn SetCursorPos(X: i32,Y: i32) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_SetCursorPos::call(X,Y); hr__.ok()?;
+Ok(())
+}
 mod import_SetForegroundWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetForegroundWindow"] pub fn call(hWnd: crate::Win32::Foundation::HWND) -> crate::core::BOOL; } }
 pub use import_SetForegroundWindow::call as SetForegroundWindow_raw;
 #[inline]
@@ -19898,6 +20631,13 @@ pub use import_SetLayeredWindowAttributes::call as SetLayeredWindowAttributes_ra
 #[inline]
 pub unsafe fn SetLayeredWindowAttributes(hwnd: crate::Win32::Foundation::HWND,crKey: crate::Win32::Foundation::COLORREF,bAlpha: u8,dwFlags: crate::Win32::UI::WindowsAndMessaging::LAYERED_WINDOW_ATTRIBUTES_FLAGS) -> Result<(), crate::core::HRESULT> {
 let hr__ = import_SetLayeredWindowAttributes::call(hwnd,crKey,bAlpha,dwFlags); hr__.ok()?;
+Ok(())
+}
+mod import_SetMenu { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetMenu"] pub fn call(hWnd: crate::Win32::Foundation::HWND,hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU) -> crate::core::BOOL; } }
+pub use import_SetMenu::call as SetMenu_raw;
+#[inline]
+pub unsafe fn SetMenu(hWnd: crate::Win32::Foundation::HWND,hMenu: Option<crate::Win32::UI::WindowsAndMessaging::HMENU>) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_SetMenu::call(hWnd,hMenu.unwrap_or(unsafe { ::core::mem::zeroed() })); hr__.ok()?;
 Ok(())
 }
 mod import_SetProcessDPIAware { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "SetProcessDPIAware"] pub fn call() -> crate::core::BOOL; } }
@@ -19940,6 +20680,33 @@ pub use import_ShowWindow::call as ShowWindow_raw;
 pub unsafe fn ShowWindow(hWnd: crate::Win32::Foundation::HWND,nCmdShow: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD) -> crate::core::BOOL {
 import_ShowWindow::call(hWnd,nCmdShow)}
 pub type TIMERPROC = Option<unsafe extern "system" fn(crate::Win32::Foundation::HWND,u32,usize,u32) -> ()>;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TPMPARAMS {
+pub cbSize: u32,
+pub rcExclude: crate::Win32::Foundation::RECT,
+}
+impl TPMPARAMS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for TPMPARAMS { fn default() -> Self {Self::default()} }
+pub const TPM_RETURNCMD: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(256u64 as _);
+pub const TPM_RIGHTBUTTON: crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS = crate::Win32::UI::WindowsAndMessaging::TRACK_POPUP_MENU_FLAGS(2u64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct TRACK_POPUP_MENU_FLAGS(pub u32);
+impl TRACK_POPUP_MENU_FLAGS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for TRACK_POPUP_MENU_FLAGS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for TRACK_POPUP_MENU_FLAGS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for TRACK_POPUP_MENU_FLAGS {}
+impl ::core::fmt::Debug for TRACK_POPUP_MENU_FLAGS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for TRACK_POPUP_MENU_FLAGS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for TRACK_POPUP_MENU_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for TRACK_POPUP_MENU_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for TRACK_POPUP_MENU_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+mod import_TrackPopupMenuEx { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "TrackPopupMenuEx"] pub fn call(hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU,uFlags: u32,x: i32,y: i32,hwnd: crate::Win32::Foundation::HWND,lptpm: *const crate::Win32::UI::WindowsAndMessaging::TPMPARAMS) -> crate::core::BOOL; } }
+pub use import_TrackPopupMenuEx::call as TrackPopupMenuEx_raw;
+#[inline]
+pub unsafe fn TrackPopupMenuEx(hMenu: crate::Win32::UI::WindowsAndMessaging::HMENU,uFlags: u32,x: i32,y: i32,hwnd: crate::Win32::Foundation::HWND,lptpm: Option<*const crate::Win32::UI::WindowsAndMessaging::TPMPARAMS>) -> crate::core::BOOL {
+import_TrackPopupMenuEx::call(hMenu,uFlags,x,y,hwnd,lptpm.unwrap_or(::core::ptr::null()))}
 mod import_TranslateMessage { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "TranslateMessage"] pub fn call(lpMsg: *const crate::Win32::UI::WindowsAndMessaging::MSG) -> crate::core::BOOL; } }
 pub use import_TranslateMessage::call as TranslateMessage_raw;
 #[inline]
@@ -20020,37 +20787,62 @@ impl ::core::ops::BitAnd for WINDOW_STYLE { type Output = Self; fn bitand(self, 
 impl ::core::ops::BitXor for WINDOW_STYLE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for WINDOW_STYLE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const WM_ACTIVATE: u32 = 6;
+pub const WM_ACTIVATEAPP: u32 = 28;
+pub const WM_APP: u32 = 32768;
 pub const WM_CANCELMODE: u32 = 31;
+pub const WM_CAPTURECHANGED: u32 = 533;
 pub const WM_CHAR: u32 = 258;
+pub const WM_CLIPBOARDUPDATE: u32 = 797;
 pub const WM_CLOSE: u32 = 16;
+pub const WM_COMMAND: u32 = 273;
 pub const WM_DESTROY: u32 = 2;
+pub const WM_DISPLAYCHANGE: u32 = 126;
 pub const WM_DPICHANGED: u32 = 736;
 pub const WM_ENTERSIZEMOVE: u32 = 561;
 pub const WM_ERASEBKGND: u32 = 20;
 pub const WM_EXITSIZEMOVE: u32 = 562;
+pub const WM_GETMINMAXINFO: u32 = 36;
 pub const WM_IME_CHAR: u32 = 646;
 pub const WM_IME_COMPOSITION: u32 = 271;
 pub const WM_IME_ENDCOMPOSITION: u32 = 270;
 pub const WM_IME_STARTCOMPOSITION: u32 = 269;
+pub const WM_INPUT: u32 = 255;
 pub const WM_KEYDOWN: u32 = 256;
 pub const WM_KEYUP: u32 = 257;
+pub const WM_KILLFOCUS: u32 = 8;
+pub const WM_LBUTTONDBLCLK: u32 = 515;
 pub const WM_LBUTTONDOWN: u32 = 513;
 pub const WM_LBUTTONUP: u32 = 514;
 pub const WM_MBUTTONDOWN: u32 = 519;
 pub const WM_MBUTTONUP: u32 = 520;
+pub const WM_MOUSEACTIVATE: u32 = 33;
+pub const WM_MOUSEHWHEEL: u32 = 526;
 pub const WM_MOUSEMOVE: u32 = 512;
 pub const WM_MOUSEWHEEL: u32 = 522;
 pub const WM_MOVE: u32 = 3;
 pub const WM_NCCALCSIZE: u32 = 131;
+pub const WM_NCCREATE: u32 = 129;
+pub const WM_NCDESTROY: u32 = 130;
 pub const WM_NCHITTEST: u32 = 132;
+pub const WM_NCLBUTTONDOWN: u32 = 161;
+pub const WM_NCMOUSELEAVE: u32 = 674;
+pub const WM_NCRBUTTONDOWN: u32 = 164;
+pub const WM_NCRBUTTONUP: u32 = 165;
 pub const WM_QUIT: u32 = 18;
 pub const WM_RBUTTONDOWN: u32 = 516;
 pub const WM_RBUTTONUP: u32 = 517;
 pub const WM_SETCURSOR: u32 = 32;
+pub const WM_SETFOCUS: u32 = 7;
+pub const WM_SETTINGCHANGE: u32 = 26;
+pub const WM_SHOWWINDOW: u32 = 24;
 pub const WM_SIZE: u32 = 5;
 pub const WM_SIZING: u32 = 532;
+pub const WM_SYSCHAR: u32 = 262;
+pub const WM_SYSCOMMAND: u32 = 274;
 pub const WM_SYSKEYDOWN: u32 = 260;
 pub const WM_SYSKEYUP: u32 = 261;
+pub const WM_TIMER: u32 = 275;
+pub const WM_UNICHAR: u32 = 265;
 pub const WM_USER: u32 = 1024;
 pub const WM_XBUTTONDOWN: u32 = 523;
 pub const WM_XBUTTONUP: u32 = 524;
@@ -20092,6 +20884,7 @@ pub const WS_CLIPSIBLINGS: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE =
 pub const WS_EX_ACCEPTFILES: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(16u64 as _);
 pub const WS_EX_APPWINDOW: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(262144u64 as _);
 pub const WS_EX_LAYERED: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(524288u64 as _);
+pub const WS_EX_NOACTIVATE: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(134217728u64 as _);
 pub const WS_EX_TOOLWINDOW: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(128u64 as _);
 pub const WS_EX_TOPMOST: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(8u64 as _);
 pub const WS_EX_WINDOWEDGE: crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(256u64 as _);
@@ -20099,6 +20892,7 @@ pub const WS_MAXIMIZE: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = cra
 pub const WS_OVERLAPPEDWINDOW: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(13565952u64 as _);
 pub const WS_POPUP: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(2147483648u64 as _);
 pub const WS_THICKFRAME: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(262144u64 as _);
+pub const WS_VISIBLE: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(268435456u64 as _);
 pub const XBUTTON1: u16 = 1;
 pub const XBUTTON2: u16 = 2;
 }
