@@ -170,7 +170,7 @@ fn document(package_dir: &str) -> Result<Document, String> {
     let manifest = relax_compiler::toml::parse_toml(&text).map_err(|e| e.to_string())?;
     let Some(value) = manifest.get_path(&["package", "metadata", "makepad", "bootloader"]) else {
         let mut document = Document::bundled();
-        if let Ok(source) = relax_compiler::vfs::read_to_string(&document.path.to_string_lossy()) {
+        if let Ok(source) = relax_compiler::vfs::read_to_string(&document.path) {
             document.source = source.into();
         }
         return Ok(document);
@@ -180,7 +180,7 @@ fn document(package_dir: &str) -> Result<Document, String> {
         .filter(|s| !s.is_empty())
         .ok_or("package.metadata.makepad.bootloader must name a Splash document")?;
     let path = PathBuf::from(package_dir).join(relative);
-    let source = relax_compiler::vfs::read_to_string(&path.to_string_lossy())
+    let source = relax_compiler::vfs::read_to_string(&path)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Document {
         path,

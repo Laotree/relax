@@ -158,7 +158,7 @@ impl AppMain for App {
             let bridge = cx.get_global::<Bridge>();
             let geometry = bridge.geometry;
             let title = bridge.state.app.clone();
-            let window = self.ui.window(cx, ids!(main_window));
+            let mut window = self.ui.window(cx, ids!(main_window));
             let size = dvec2(geometry[2] as f64, geometry[3] as f64);
             script_apply_eval!(cx, window, {window.inner_size: #(size)});
             if geometry[0].is_finite() && geometry[1].is_finite() {
@@ -272,7 +272,7 @@ impl RunView {
                 .set_visible(cx, panic.choices.iter().any(|c| c == "return"));
         }
         if state.progress != self.progress || self.applied.is_none() {
-            let progress = self.view.view(cx, ids!(progress));
+            let mut progress = self.view.view(cx, ids!(progress));
             // A new compile starts a new bar; easing itself lives only in Splash.
             let from = self.progress.min(state.progress) as f32;
             let target = state.progress as f32;
