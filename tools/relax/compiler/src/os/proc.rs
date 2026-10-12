@@ -210,7 +210,7 @@ mod imp {
     }
 
     /// Handles of the libraries `load_library` opened.
-    static LOADED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static LOADED: relax_session::sync::Mutex<Vec<usize>> = relax_session::sync::Mutex::new(Vec::new());
 
     /// The stub pool of the host library: `count` stubs of 16 bytes from `base`, each jumping to
     /// the address in its word of `table` (android_host/src/trampolines.rs).
@@ -221,7 +221,7 @@ mod imp {
         used: std::collections::HashMap<u64, u64>,
     }
     unsafe impl Send for Pool {}
-    static POOL: std::sync::Mutex<Option<Pool>> = std::sync::Mutex::new(None);
+    static POOL: relax_session::sync::Mutex<Option<Pool>> = relax_session::sync::Mutex::new(None);
 
     pub fn set_trampolines(base: u64, table: *mut u64, count: usize) {
         *POOL.lock().unwrap_or_else(|e| e.into_inner()) = Some(Pool { base, table, count, used: std::collections::HashMap::new() });

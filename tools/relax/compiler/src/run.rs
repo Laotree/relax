@@ -1385,7 +1385,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
 }
 
 /// What `--exports` published: (symbol, address) of each exported fn, in program order.
-static EXPORTS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
+static EXPORTS: relax_session::sync::Mutex<Vec<(String, u64)>> = relax_session::sync::Mutex::new(Vec::new());
 
 /// The symbols (and their callable addresses) a `cmd_run` with `--exports` published.
 pub fn exports() -> Vec<(String, u64)> {
@@ -2416,7 +2416,7 @@ pub(crate) fn push_front_images(prog: &crate::program::Program, c: &mut crate::c
 
 /// Why a mid-run pass did not record the collected program, said once per distinct reason (verbose).
 fn collected_skip(why: &'static str) {
-    static LAST: std::sync::Mutex<&'static str> = std::sync::Mutex::new("");
+    static LAST: relax_session::sync::Mutex<&'static str> = relax_session::sync::Mutex::new("");
     let mut l = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if *l != why { *l = why; verbose!("relax-collected: not recorded: {why}"); }
 }
