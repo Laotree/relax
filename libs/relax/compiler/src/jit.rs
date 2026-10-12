@@ -10899,6 +10899,9 @@ fn defer_startup_root(up: *mut Unit, id: u32, depth: u8) -> bool {
     true
 }
 
+/// Whether the program has presented its first frame (the boot screen goes away then).
+pub fn first_present_seen() -> bool { FIRST_PRESENT.load(Ordering::Acquire) }
+
 extern "C" fn relax_first_present() {
     crate::domain::first_present();
     if !FIRST_PRESENT.swap(true, Ordering::AcqRel) {

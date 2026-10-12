@@ -15,6 +15,11 @@
 
 pub use imp::*;
 
+/// The status an embedded run (the Android host) ended with when it failed; 0: it has not.
+pub static EMBEDDED_FAILURE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+/// Whether a host owns this process (it named its library): a failed run then must not exit().
+pub static EMBEDDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 static ARGS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
 
 /// The arguments Relax runs under, when the process's own are not what it was started with: a
@@ -148,6 +153,17 @@ mod unix {
     /// exit(): the main thread's pthread key destructors do not run (the program's thread locals
     /// are left as they are, as in a rustc build).
     pub fn exit(code: i32) -> ! {
+        // An embedded run (the Android host: its library handle is named) failed: exit() would run the
+        // process's atexit/static destructors on this thread while the host's UI thread still locks
+        // the mutexes they destroy (FORTIFY abort, no message). The host owns the process: the failure
+        // is already reported through its status, so this thread just stays out of the way.
+        if code != 0 && super::EMBEDDED.load(std::sync::atomic::Ordering::Acquire) {
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+            super::EMBEDDED_FAILURE.store(code, std::sync::atomic::Ordering::Release);
+            loop { std::thread::park(); }
+        }
         std::process::exit(code)
     }
 
@@ -281,7 +297,7 @@ mod imp {
 
 #[cfg(target_os = "android")]
 mod imp {
-    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, lookup, set_last_error};
+    pub use super::unix::{os_args_bytes, create_private, ensure_private_dir, exit, last_error, set_last_error};
     use super::unix::{dlopen, dlsym};
 
     /// The library Relax itself is (libmakepad.so): System.loadLibrary loads it into a scope of its
@@ -292,6 +308,7 @@ mod imp {
     /// Names the loaded host library's handle (dlopen of its soname with RTLD_NOLOAD).
     pub fn set_host_library(handle: *mut u8) {
         HOST_LIBRARY.store(handle, std::sync::atomic::Ordering::Release);
+        super::EMBEDDED.store(!handle.is_null(), std::sync::atomic::Ordering::Release);
     }
 
     /// Handles of the libraries `load_library` opened.
@@ -333,6 +350,14 @@ mod imp {
         let a = pool.base + 16 * i as u64;
         pool.used.insert(target, a);
         a
+    }
+
+    /// dlsym for the program: RTLD_DEFAULT (a null handle) does not see the host library from inside an
+    /// app's linker namespace, so the host library and the libraries the program loaded are asked too
+    /// (the program's `dlsym(RTLD_DEFAULT, "makepad_run_first_present")` finds the host's hooks).
+    pub unsafe fn lookup(handle: *mut u8, name: *const u8) -> *mut u8 {
+        let p = dlsym(handle, name);
+        if p.is_null() && handle.is_null() { find(name) } else { p }
     }
 
     // NDK r28 dlfcn.h:169 RTLD_DEFAULT = 0, :191 RTLD_NOW = 2,

@@ -194,7 +194,12 @@ pub fn run(opts: Options) -> Result<(), String> {
     for (pkg, flags) in &opts.packages {
         let out_log = work.join(format!("check-{pkg}.log"));
         let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("check").arg("--no-serve").arg(pkg).args(flags).current_dir(&root);
+        cmd.arg("check").arg("--no-serve");
+        // the phone runs every program on the HAL (cfg hal): the files that cfg reaches belong in the archive
+        if opts.target.as_deref().is_some_and(|t| t.contains("android")) {
+            cmd.arg("--cfg").arg("hal");
+        }
+        cmd.arg(pkg).args(flags).current_dir(&root);
         cmd.env("MAKEPAD_RUN_CACHE_DIR", work.join("cache"));
         cmd.env("MAKEPAD_RUN_READ_LOG", &log);
         cmd.env_remove("MAKEPAD_RUN_VFS").env_remove("MAKEPAD_RUN_WORKSPACE").env_remove("MAKEPAD_RUN_EDITS").env_remove("MAKEPAD_RUN_CHECK_TARGET");
@@ -208,6 +213,12 @@ pub fn run(opts: Options) -> Result<(), String> {
         let text = std::fs::read_to_string(&out_log).unwrap_or_default();
         let diag = text.lines().filter(|l| l.contains(": E0") || l.starts_with("error")).count();
         eprintln!("pack-src: check {pkg}{}: {} ({diag} diagnostic lines, {:.0} s)", opts.target.as_ref().map_or(String::new(), |t| format!(" --target {t}")), st, t0.elapsed().as_secs_f64());
+        // an archive of a tree that does not compile is a broken app on the phone (found on the device, minutes
+        // later): the build stops here with the first errors
+        if diag > 0 {
+            let errs: Vec<&str> = text.lines().filter(|l| l.contains(": E0") || l.starts_with("error")).take(8).collect();
+            return Err(format!("check of {pkg} found {diag} error line(s); log {}:\n{}", out_log.display(), errs.join("\n")));
+        }
         // a check that failed to run to the end read fewer files than a run needs
         if st.code().is_none() || !text.contains("makepad check:") {
             let tail: Vec<&str> = text.lines().rev().take(8).collect();

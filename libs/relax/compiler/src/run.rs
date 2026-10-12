@@ -241,7 +241,7 @@ pub(crate) fn resolve_package(
     // source validation or JIT work; the process main thread is already serving the HAL.
     if boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal") {
         (MAIN_HOST.get().expect("run host").open)(package, &g.pkg[g.root].0)?;
-        HAL_RUN.store(true, Ordering::Release);
+        HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
     }
     // provided crates bind only to their own source (before substitution rewrites deps)
     let ts = Instant::now();
@@ -1483,6 +1483,8 @@ pub(crate) fn link_libraries(prog: &crate::program::Program, link_libs: &[(Strin
 /// The native run host: the OS loop starts before compilation, the graph opens a host window,
 /// and the compiled program starts as an ordinary domain. No HAL dependency in the compiler.
 pub struct MainHost {
+    /// Android lends the Activity directly to the process app until the WM hosts child domains.
+    pub domain_zero: bool,
     pub run: fn(Box<dyn FnMut() -> i32 + Send>) -> i32,
     pub open: fn(&str, &str) -> Result<(), String>,
     pub start: fn(crate::domain::AppSpec) -> Result<(), String>,
