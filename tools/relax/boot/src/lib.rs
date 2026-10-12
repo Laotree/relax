@@ -4,7 +4,7 @@ pub use makepad_widgets;
 use makepad_widgets::*;
 pub use relax_base::{
     diag::Diagnostic,
-    run_state::{ParkedPanic, Phase, State},
+    run_state::{Mode, ParkedPanic, Phase, State},
 };
 use std::{
     path::PathBuf,
@@ -15,6 +15,7 @@ pub const DEFAULT_DOCUMENT: &str = include_str!("../resources/boot.splash");
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Dismiss,
     RetryCompile,
     RestartDomain,
     Resume {
@@ -54,6 +55,18 @@ struct Bridge {
     geometry: [f32; 4],
     window: Option<WindowId>,
     document_errors: Vec<Diagnostic>,
+    overlay: Option<[f32; 4]>,
+}
+
+fn overlay(cx: &mut Cx, rect: Option<[f32; 4]>) {
+    let bridge = cx.get_global::<Bridge>();
+    if bridge.overlay == rect { return; }
+    let Some(window) = bridge.window else { return };
+    bridge.overlay = rect;
+    let mut cmd = makepad_hal::CmdWriter::new(makepad_hal::session::HOST);
+    cmd.window_overlay(makepad_hal::Id::new(window.0 as u32, window.1 as u32),
+        rect.is_some(), rect.unwrap_or_default());
+    makepad_hal::Hal::global().submit(&cmd.buf());
 }
 
 fn script_diagnostics(errors: Vec<ScriptErrorRecord>) -> Vec<Diagnostic> {
@@ -223,6 +236,18 @@ impl RunView {
         {
             return;
         }
+        if self.applied.as_ref().is_none_or(|old| old.mode != state.mode) {
+            self.view.animator_cut(cx, if state.mode == Mode::Overlay {
+                ids!(mode.overlay)
+            } else {
+                ids!(mode.boot)
+            });
+            self.next = if state.mode == Mode::Boot { cx.new_next_frame() } else { NextFrame::default() };
+        }
+        let is_overlay = state.mode == Mode::Overlay;
+        self.view.button(cx, ids!(dismiss)).set_visible(cx, is_overlay);
+        self.view.view(cx, ids!(progress)).set_visible(cx, !is_overlay);
+        self.view.label(cx, ids!(status)).set_visible(cx, !is_overlay);
         self.view.label(cx, ids!(app_name)).set_text(cx, &state.app);
         let units = match (state.done, state.total) {
             (Some(done), Some(total)) => format!(" · {done}/{total}"),
@@ -242,7 +267,9 @@ impl RunView {
         );
         self.view
             .label(cx, ids!(domain_state))
-            .set_text(cx, &state.domain);
+            .set_text(cx, if is_overlay {
+                if state.parked.is_some() { "Panic parked" } else { "Patch not applied · previous code is running" }
+            } else { &state.domain });
         self.view
             .button(cx, ids!(retry))
             .set_visible(cx, state.can_retry);
@@ -293,7 +320,8 @@ impl Widget for RunView {
             }
             self.bind(cx);
         }
-        if matches!(event, Event::Startup) || self.next.is_event(event).is_some() {
+        if (matches!(event, Event::Startup) || self.next.is_event(event).is_some())
+            && cx.get_global::<Bridge>().state.mode == Mode::Boot {
             self.view.view(cx, ids!(progress)).redraw(cx);
             self.next = cx.new_next_frame();
         }
@@ -305,6 +333,9 @@ impl Widget for RunView {
             return;
         };
         let mut out = Vec::new();
+        if self.view.button(cx, ids!(dismiss)).clicked(actions) {
+            out.push(Action::Dismiss);
+        }
         if self.view.button(cx, ids!(retry)).clicked(actions) {
             out.push(Action::RetryCompile);
         }
@@ -370,6 +401,13 @@ impl Widget for RunView {
                         .set_text(cx, &diagnostic_text(d));
                     item.draw_all(cx, scope);
                 }
+            }
+        }
+        if state.mode == Mode::Overlay {
+            let rect = self.view.area().clipped_rect(cx);
+            if rect.size.x > 0.0 && rect.size.y > 0.0 {
+                overlay(cx, Some([rect.pos.x as f32, rect.pos.y as f32,
+                    rect.size.x as f32, rect.size.y as f32]));
             }
         }
         DrawStep::done()
@@ -454,6 +492,7 @@ impl Boot {
             geometry,
             window: None,
             document_errors: Vec::new(),
+            overlay: None,
         });
         cx.init_cx_os();
         cx.init_websockets(&makepad_widgets::makepad_platform::resolve_studio_http());
@@ -472,6 +511,7 @@ impl Boot {
     }
 
     pub fn update(&mut self, state: State) {
+        if state.mode != Mode::Overlay { overlay(&mut self.cx, None); }
         self.cx.get_global::<Bridge>().state = Arc::new(state);
     }
     pub fn window(&mut self) -> Option<makepad_hal::Id> {

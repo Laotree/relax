@@ -3503,13 +3503,14 @@ static SESSION: std::sync::Mutex<Vec<(&'static str, f64)>> = std::sync::Mutex::n
 /// One edit's record. `saved`: the newest edited file's modification time (the save).
 fn log_edit(what: &str, o: &Outcome, saved: Option<std::time::SystemTime>, seen: std::time::Instant) {
     if crate::run_state::observed() {
-        if o.rung == Rung::Refuse || o.lines.iter().any(|l| l.starts_with("incomplete:")) {
-            for line in &o.lines {
-                crate::run_state::diagnostic(crate::run::app_domain(), crate::diag::from_legacy(line, "typeck"));
-            }
-        } else {
-            crate::run_state::emit(crate::run_state::Event::Diagnostics { domain: crate::run::app_domain(), records: Vec::new().into() });
-        }
+        let applied = o.rung == Rung::Patch && !o.pending
+            && !o.lines.iter().any(|l| l.starts_with("incomplete:"));
+        let records = if applied { Vec::new() } else {
+            o.lines.iter().map(|line| crate::diag::from_legacy(line, "typeck")).collect()
+        };
+        crate::run_state::emit(crate::run_state::Event::Patch {
+            domain: crate::run::app_domain(), applied, records: records.into(),
+        });
     }
     let now = std::time::SystemTime::now();
     let detect = saved.map_or(0.0, |t| unix_ms(now) - unix_ms(t) - seen.elapsed().as_secs_f64() * 1e3).max(0.0);

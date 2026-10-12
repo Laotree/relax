@@ -10,7 +10,7 @@ use relax_boot::{Action, Boot as HostWindow, Document};
 use relax_compiler::{
     diag::Diagnostic,
     domain::{AppSpec, DomainState},
-    run_state::{self, ParkedPanic, Phase, State},
+    run_state::{self, Mode, ParkedPanic, Phase, State},
 };
 #[cfg(target_os = "macos")]
 use std::sync::Condvar;
@@ -256,7 +256,7 @@ pub fn open(package: &str, _package_dir: &str) -> Result<(), String> {
     run_state::set_observer(|event| post(Update::Compiler(event)));
     relax_compiler::tui::track_for_host();
     relax_compiler::inspect::events::set_run_state_observer(panic_changed);
-    relax_compiler::inspect::events::run_state_visible(cfg!(target_os = "macos"));
+    relax_compiler::inspect::events::run_state_available(cfg!(target_os = "macos"));
     let initial = State {
         app: package.into(),
         domain: "Compiling".into(),
@@ -526,6 +526,8 @@ fn pump(
     let mut ready = Some(ready);
     let mut progress = Progress::new(history);
     let mut failed = false;
+    let mut patch_failed = false;
+    let mut overlay_dismissed = false;
     let mut active = true;
     let mut relaunched = false;
     let mut restartable = true;
@@ -557,6 +559,7 @@ fn pump(
         }
         if pending {
             let mut cmd = CmdWriter::new(HOST);
+            if !window.is_none() { cmd.window_overlay(window, false, [0.0; 4]); }
             cmd.domain_relaunch(domain);
             hal.submit(&cmd.buf());
         }
@@ -578,6 +581,8 @@ fn pump(
                     diagnostic_keys.clear();
                     diagnostics_dirty = true;
                     failed = false;
+                    patch_failed = false;
+                    overlay_dismissed = false;
                     active = true;
                     relaunched |= warm;
                     restartable = true;
@@ -669,14 +674,21 @@ fn pump(
                         if id.is_none() || id == Some(domain) =>
                     {
                         if diagnostic_keys.insert(record.to_json()) {
+                            if !active && record.severity == relax_compiler::diag::Severity::Error {
+                                patch_failed = true;
+                                overlay_dismissed = false;
+                            }
                             diagnostics.push(record);
                             diagnostics_dirty = true;
                         }
                     }
-                    run_state::Event::Diagnostics {
+                    run_state::Event::Patch {
                         domain: id,
+                        applied,
                         records,
                     } if id.is_none() || id == Some(domain) => {
+                        patch_failed = !applied;
+                        overlay_dismissed = applied;
                         diagnostic_keys = records.iter().map(Diagnostic::to_json).collect();
                         diagnostics = records.to_vec();
                         diagnostics_dirty = true;
@@ -690,6 +702,9 @@ fn pump(
         }
         if PANICS_CHANGED.swap(false, Ordering::AcqRel) {
             if let Some(parked) = parked(domain) {
+                if data.parked.as_ref().map(|p| &p.id) != parked.as_ref().map(|p| &p.id) {
+                    overlay_dismissed = parked.is_none();
+                }
                 data.parked = parked;
                 dirty = true;
             } else {
@@ -710,7 +725,9 @@ fn pump(
                 })
         });
         let mut may_present = true;
+        let mut app_frame = false;
         if let Some((geom, borrower_frame, presentations, presenter, lent)) = physical {
+            app_frame = borrower_frame && lent == domain && domain != 0 && !stopping && !pending;
             may_present = if cfg!(target_os = "macos") {
                 !borrower_frame || lent == 0
             } else {
@@ -764,12 +781,15 @@ fn pump(
         }
         // Errors reveal immediately. Otherwise a warm relaunch preserves the last app
         // image for 300 ms, then uses exactly the same document/context as cold boot.
-        let visible = cfg!(target_os = "macos")
+        let overlay = cfg!(target_os = "macos") && app_frame && !overlay_dismissed
+            && (patch_failed || data.parked.is_some());
+        let mode = if overlay { Mode::Overlay } else { Mode::Boot };
+        if data.mode != mode { data.mode = mode; dirty = true; }
+        let visible = overlay || (cfg!(target_os = "macos")
             && may_present
             && (failed
                 || data.parked.is_some()
-                || (active && relaunch.is_none_or(|t| t.elapsed() >= Duration::from_millis(300))));
-        relax_compiler::inspect::events::run_state_visible(visible);
+                || (active && relaunch.is_none_or(|t| t.elapsed() >= Duration::from_millis(300)))));
         if active && Instant::now() >= next_status {
             progress.tick(&mut data);
             if matches!(data.phase, Phase::Codegen | Phase::FirstFrame) {
@@ -826,6 +846,10 @@ fn pump(
         #[cfg(target_os = "macos")]
         for action in host.actions() {
             match action {
+                Action::Dismiss => {
+                    overlay_dismissed = true;
+                    dirty = true;
+                }
                 Action::RetryCompile | Action::RestartDomain => match retry() {
                     Ok(()) => failed = false,
                     Err(e) => post(Update::Message(e)),
@@ -876,7 +900,7 @@ fn pump(
             }
         }
     }
-    relax_compiler::inspect::events::run_state_visible(false);
+    relax_compiler::inspect::events::run_state_available(false);
     #[cfg(target_os = "macos")]
     RETRY.notify_all();
     if let Some(ready) = ready {

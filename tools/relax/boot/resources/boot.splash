@@ -13,6 +13,31 @@ mod.boot.App{
                     flow: Down
                     padding: Inset{left: 32 right: 32 top: 48 bottom: 24}
                     spacing: 16
+                    show_bg: true
+                    draw_bg +: {color: theme.color_bg_app}
+                    animator: Animator{
+                        mode: {
+                            default: @boot
+                            boot: AnimatorState{
+                                from: {all: Snap}
+                                apply: {
+                                    width: Fill height: Fill
+                                    margin: Inset{}
+                                    padding: Inset{left: 32 right: 32 top: 48 bottom: 24}
+                                    spacing: 16
+                                }
+                            }
+                            overlay: AnimatorState{
+                                from: {all: Snap}
+                                apply: {
+                                    width: Fill{max: 720} height: Fill{max: 480}
+                                    margin: Inset{left: 24 right: 24 top: 24 bottom: 24}
+                                    padding: Inset{left: 20 right: 20 top: 20 bottom: 20}
+                                    spacing: 10
+                                }
+                            }
+                        }
+                    }
                     app_name := Label{
                         text: "Starting"
                         draw_text.text_style.font_size: 28
@@ -48,6 +73,7 @@ mod.boot.App{
                         width: Fill height: Fit flow: Right{wrap: true} spacing: 8
                         retry := Button{text: "Retry compile"}
                         restart := Button{text: "Restart app"}
+                        dismiss := Button{text: "Dismiss" visible: false}
                     }
                     panic := View{
                         width: Fill height: Fit flow: Down spacing: 8 visible: false

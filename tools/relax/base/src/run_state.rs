@@ -36,9 +36,18 @@ pub struct ParkedPanic {
     pub choices: Vec<String>,
 }
 
+/// Layout of the same run-state document before and after window handover.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Boot,
+    Overlay,
+}
+
 /// Target-neutral snapshot consumed by native run presenters.
 #[derive(Clone, Debug, Default)]
 pub struct State {
+    pub mode: Mode,
     pub app: String,
     pub phase: Phase,
     pub done: Option<u64>,
@@ -71,9 +80,11 @@ pub enum Event {
         domain: Option<u32>,
         record: Diagnostic,
     },
-    /// An edit replaces the previous edit's diagnostics, including an empty successful result.
-    Diagnostics {
+    /// The final outcome of a live edit. Only a completely applied patch clears
+    /// the previous error; partial edits and restart requests retain the panel.
+    Patch {
         domain: Option<u32>,
+        applied: bool,
         records: Arc<[Diagnostic]>,
     },
 }

@@ -30,12 +30,14 @@ static NEW: Condvar = Condvar::new();
 static SEQ: AtomicU64 = AtomicU64::new(0);
 /// sessions in `watch` / `events follow=1` now
 pub static WATCHERS: AtomicU32 = AtomicU32::new(0);
-static RUN_STATE_VISIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static RUN_STATE_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static RUN_STATE_OBSERVER: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 pub fn set_run_state_observer(observer: fn()) { let _ = RUN_STATE_OBSERVER.set(observer); }
-pub fn run_state_visible(visible: bool) {
-    RUN_STATE_VISIBLE.store(visible, SeqCst);
+/// The native presenter can reveal a parked panic even while its document is
+/// hidden behind the running app. Availability lasts until the host pump exits.
+pub fn run_state_available(available: bool) {
+    RUN_STATE_AVAILABLE.store(available, SeqCst);
     retry_update();
 }
 fn parked_changed() { if let Some(observer) = RUN_STATE_OBSERVER.get() { observer(); } }
@@ -118,7 +120,7 @@ pub fn remote_watcher_closed() {
 
 /// Retry boundaries are worth setting while someone may resume a panic with `retry`.
 fn retry_update() {
-    RELAX_RETRY_ON.store(watched() || RUN_STATE_VISIBLE.load(Relaxed), Relaxed);
+    RELAX_RETRY_ON.store(watched() || RUN_STATE_AVAILABLE.load(Relaxed), Relaxed);
 }
 
 fn wanted(on: &Option<Vec<String>>, kind: &str) -> bool {
@@ -278,7 +280,7 @@ pub fn on_panic(info: &crate::jit::PanicInfo, unwinds: bool) {
     }
     let domain = crate::domain::current_app_domain();
     let watched = WATCHERS.load(SeqCst) > 0 || super::AGENT.load(Relaxed)
-        || (RUN_STATE_VISIBLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain());
+        || (RUN_STATE_AVAILABLE.load(SeqCst) && domain.is_some() && domain == crate::run::app_domain());
     let key = format!("{}|{}|{}", info.site, info.location, info.message);
     if !watched {
         let mut seen = SITES_SEEN.lock().unwrap_or_else(|e| e.into_inner());
