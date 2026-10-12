@@ -43,9 +43,28 @@ fn verify_on() -> bool {
 
 /// The crate list of this launch (kept: the swap restores against it).
 static BOOT: relax_session::sync::Mutex<Option<Vec<crate::preload::PreCrate>>> = relax_session::sync::Mutex::new(None);
+/// Appended crates, in Program order. Their recipes must outlive every compiler generation.
+static RUNTIME: relax_session::sync::Mutex<Vec<crate::preload::PreCrate>> = relax_session::sync::Mutex::new(Vec::new());
 
 pub(crate) fn remember_boot(pre: &[crate::preload::PreCrate]) {
     *BOOT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_with(|| pre.to_vec()));
+    RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The owner records even a failed load's published crate: its ids remain in the Program.
+pub(crate) fn remember_runtime(prog: &Program, krate: u32) {
+    let _k = crate::zone_alloc::kept();
+    let c = &prog.crates[krate as usize];
+    let deps: Vec<_> = c.deps.iter().map(|&(name, k)|
+        (prog.syms.str(name).to_owned(), prog.syms.str(prog.crates[k as usize].name).to_owned())).collect();
+    let mut cfg = c.cfg.clone();
+    cfg.session = prog.session.clone();
+    RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).push(crate::preload::PreCrate {
+        name: prog.syms.str(c.name).to_owned(), root: c.root_path().to_owned(), edition: c.edition,
+        cfg, deps: deps.clone(), proc_macro: c.proc_macro,
+        image_deps: c.deps.iter().map(|&(_, k)| k as usize).collect(), image_dep_names: deps,
+    });
 }
 
 /// Threads that took `compiler_thread()`, may be alive at the swap and are known to hold no
@@ -155,11 +174,16 @@ struct Counts {
 
 /// The counts of the program the store's collected image describes (set when this run restored
 /// or recorded it, and by each swap): equal counts later mean nothing was added since, and the
-/// swap restores from the image as it is without encoding it again.
-static IMAGE_COUNTS: relax_session::sync::Mutex<Option<Counts>> = relax_session::sync::Mutex::new(None);
+/// swap restores without encoding again. The optional entry names a kept, swap-only image;
+/// None names the boot image, whose counts are recorded only before runtime crates arrive.
+static IMAGE: relax_session::sync::Mutex<Option<(Counts, Option<crate::cache::CollectedWritten>)>> = relax_session::sync::Mutex::new(None);
 
 pub(crate) fn note_image(prog: &Program, tcx: &Tcx) {
-    *IMAGE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()) = Some(counts(prog, tcx));
+    // A mid-run writer may publish the frozen boot after runtime crates were appended.
+    // Its image then describes the boot snapshot, not these live counts.
+    if RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).is_empty() {
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((counts(prog, tcx), None));
+    }
 }
 
 fn counts(prog: &Program, tcx: &Tcx) -> Counts {
@@ -275,10 +299,6 @@ fn refuse(up: *mut Unit) -> Option<String> {
     if BOOT.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
         return Some("no boot record".into());
     }
-    let recipe = u.prog.front_graph.as_ref().map_or(0, |r| r.crates.len());
-    if recipe == 0 || recipe != u.prog.crates.len() {
-        return Some(format!("a run-time crate was added ({} crates, {} in the recipe)", u.prog.crates.len(), recipe));
-    }
     if u.retired {
         return Some("a retired unit".into());
     }
@@ -322,6 +342,8 @@ fn ms(t: Instant) -> f64 {
 }
 
 fn swap(up: *mut Unit, n: u32) -> Outcome {
+    // Recipes and image descriptors on this stack remain live across arena destruction.
+    let _k = crate::zone_alloc::kept();
     let t_all = Instant::now();
     let rss0 = crate::memstat::resident();
     let mut tl = Timeline::default();
@@ -356,27 +378,37 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
 
     // 4. the collected image of the program as it is now (unless the store's is that already)
     let before = now;
-    if *IMAGE_COUNTS.lock().unwrap_or_else(|e| e.into_inner()) == Some(now) {
+    let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap();
+    let extra = RUNTIME.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if pre.len() + extra.len() != now.crates {
+        return abort(format!("recipe has {} crates, program has {}", pre.len() + extra.len(), now.crates));
+    }
+    let saved = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone().filter(|(c, _)| *c == now);
+    let mut swap_image = saved.as_ref().and_then(|(_, image)| image.clone());
+    if saved.is_some() {
         trace("the collected image is current: not encoded again");
     } else {
         let t = Instant::now();
-        let encoded = owner::call(owner::Class::App, || unsafe { encode(up) });
+        let encoded = owner::call(owner::Class::App, || unsafe { encode(up, &pre, &extra) });
         let (dest, payload, _) = match encoded {
             Ok(x) => x,
             Err(e) => return abort(format!("encode: {e}")),
         };
         tl.encode = ms(t);
         let t = Instant::now();
-        let written = crate::cache::Cache::commit_collected(None, dest, payload);
-        if written.is_none() {
+        let Some(written) = crate::cache::Cache::commit_collected(None, dest, payload) else {
             return abort("the collected image could not be written".into());
-        }
+        };
+        if !extra.is_empty() { swap_image = Some(written); }
         tl.store = ms(t);
     }
     if hurry() {
         return abort("too slow before the restore".into());
     }
 
+    // Runtime inputs have no crate-store ledger. Carry the current union even when the
+    // collected tables' counts still match an older image (a body can add only a late input).
+    let late = if extra.is_empty() { Vec::new() } else { crate::sip::late_inputs() };
     trace("encoded and stored");
     // 5. the next generation
     let old_gen = crate::zone_alloc::compiler_generation();
@@ -387,7 +419,7 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     trace("statics taken");
     let fresh = {
         let _c = crate::zone_alloc::compiler();
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, before, &mut tl)));
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(up, &options, mode, &pre, &extra, swap_image.as_ref(), &late, before, &mut tl)));
         match built {
             Ok(Ok(f)) => f,
             Ok(Err(e)) => {
@@ -418,7 +450,9 @@ fn swap(up: *mut Unit, n: u32) -> Outcome {
     let (chunks, touched, specs) = owner::call(owner::Class::App, || unsafe { commit(up, fresh) });
     tl.commit = ms(t);
     trace("commit done");
-    unsafe { note_image(&(*up).prog, &(*up).tcx) };
+    crate::zone_alloc::kept_with(|| {
+        *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((before, swap_image.clone()));
+    });
     tl.chunks = chunks;
     tl.touched = touched;
     tl.specs = specs;
@@ -460,12 +494,12 @@ unsafe fn prepare(up: *mut Unit) -> Result<(Option<crate::cache::Spill>, Counts)
 }
 
 /// Owner request: the collected image of the program now, and its counts.
-unsafe fn encode(up: *mut Unit) -> Result<((std::path::PathBuf, u128), crate::image::Writer<'static>, Counts), String> {
+unsafe fn encode(up: *mut Unit, pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate]) -> Result<((std::path::PathBuf, u128), crate::image::Writer<'static>, Counts), String> {
     let _front = super::front_write_within(200).ok_or("the front end is busy")?;
     let u = &*up;
     let c = u.cache.as_ref().ok_or("no cache")?;
     let stop = || GATED_MAIN.load(Ordering::SeqCst) != 0;
-    match c.encode_collected_now(&u.prog, &u.tcx, &stop) {
+    match c.encode_collected_now(&u.prog, &u.tcx, pre, extra, &stop) {
         crate::cache::CollectedRecord::Ready(dest, payload) => Ok((dest, payload, counts(&u.prog, &u.tcx))),
         crate::cache::CollectedRecord::Current => Err("the store already holds the image (nothing to restore from)".into()),
         crate::cache::CollectedRecord::Yielded => Err("yielded to the main thread".into()),
@@ -475,13 +509,20 @@ unsafe fn encode(up: *mut Unit) -> Result<((std::path::PathBuf, u128), crate::im
 
 /// Builds the next generation's compile state from the committed image (this thread, in the
 /// compiler phase of generation g+1). The running state is only read.
-fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode, before: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
+fn build(up: *mut Unit, sess: &std::sync::Arc<crate::Session>, mode: crate::cache::Mode,
+    pre: &[crate::preload::PreCrate], extra: &[crate::preload::PreCrate], swap_image: Option<&crate::cache::CollectedWritten>,
+    late: &[(String, u8, String, u128)], before: Counts, tl: &mut Timeline) -> Result<Fresh, String> {
     let u = unsafe { &*up };
-    let pre = BOOT.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no boot record")?;
     trace("build: opening the images");
     let images = crate::cache::FrontImages::open(&sess.options).ok_or("the front images cannot be opened")?;
     trace("build: restoring");
-    let (prog, tcx, collected) = crate::run::warm_front(&images, sess, &pre).ok_or("the collected image was not restored")?;
+    let (prog, tcx, collected) = crate::run::warm_front(&images, sess, pre, extra, swap_image).ok_or("the collected image was not restored")?;
+    for (c, kind, name, hash) in late {
+        let content = if *kind == crate::sip::LATE_FILE { crate::vfs::read(name).ok() }
+            else { crate::crates::crate_env_named(c, name).map(String::into_bytes) };
+        if crate::sip::late_hash(content.as_deref()) != *hash { return Err(format!("a late input changed: {name}")); }
+        crate::sip::note_late_input(c, *kind, name, content.as_deref());
+    }
     trace("build: restored");
     crate::program::share_std_end();
     let collected = collected.ok_or("only a prefix of the program was restored")?;

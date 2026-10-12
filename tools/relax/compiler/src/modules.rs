@@ -233,9 +233,14 @@ pub(crate) unsafe fn add_crates(up: *mut Unit, new: &[NewCrate], tolerant: bool,
                 };
                 dep_list.push((u.prog.syms.intern(n), k));
             }
-            match u.prog.load_crate_deferred(&nc.name, &nc.path, nc.edition, nc.cfg.clone(), dep_list) {
+            let first = u.prog.crates.len();
+            let loaded = u.prog.load_crate_deferred(&nc.name, &nc.path, nc.edition, nc.cfg.clone(), dep_list);
+            for k in first..u.prog.crates.len() {
+                u.prog.crates[k].proc_macro = nc.proc_macro;
+                if up == crate::run::running_unit() { jit::zone_swap::remember_runtime(&u.prog, k as u32); }
+            }
+            match loaded {
                 Ok(k) => {
-                    u.prog.crates[k as usize].proc_macro = nc.proc_macro;
                     crates.push(k);
                 }
                 Err(e) => {

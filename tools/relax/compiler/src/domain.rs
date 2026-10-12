@@ -505,6 +505,7 @@ pub(crate) fn first_present() {
         let mut d = domains();
         if let Some(x) = d.iter_mut().find(|x| x.info.base == base && x.info.first_frame_ms.is_none()) {
             x.info.first_frame_ms = Some(x.started.elapsed().as_secs_f64() * 1e3);
+            crate::run::domain_present();
         }
     }
     CHANGED.notify_all();
@@ -912,7 +913,8 @@ fn fail(id: DomainId, e: Vec<String>) -> Result<DomainId, Vec<String>> {
     }
     if cancelled(id) { set_state(id, DomainState::Stopped); return Ok(id); }
     else { set_state(id, DomainState::Crashed(e.first().cloned().unwrap_or_default())); }
-    Err(e)
+    // The host can read these after the loader's compiler-thread guard has ended.
+    Err(crate::zone_alloc::kept_clone(&e))
 }
 
 /// Starts an app as a domain of the running unit `up` (the `relax run` unit, or any unit that
@@ -966,6 +968,10 @@ impl Drop for Loading {
 }
 
 fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId, Vec<String>> {
+    // New loaders wait outside the compiler phase while a swap has the gate shut. Every
+    // entry path registers active loaders so the swap waits for their compile state.
+    let _job = crate::jit::compile_job();
+    let _z = crate::zone_alloc::compiler_thread();
     let _loading = Loading(id);
     let t0 = std::time::Instant::now();
     if cancelled(id) { return Ok(id); }
@@ -1152,9 +1158,6 @@ pub fn wait_thread_done(id: DomainId, timeout: std::time::Duration) -> bool {
 
 /// The host starts an app as a domain of the program `relax run` booted (`start` on its unit).
 pub fn start_prepared_in_run(spec: AppSpec, id: DomainId) -> Result<DomainId, Vec<String>> {
-    // the loader thread compiles (resolve, load) like the boot thread: a compiler thread, so the
-    // settle swap waits for it and its compile state belongs to the compiler generation
-    let _z = crate::zone_alloc::compiler_thread();
     let up = crate::run::running_unit();
     if up.is_null() { let _loading = Loading(id); return fail(id, vec!["no program is running".into()]); }
     start_prepared(up, spec, id)

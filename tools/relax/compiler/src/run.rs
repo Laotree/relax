@@ -305,8 +305,15 @@ pub(crate) fn resolve_package(
 /// The warm front end, shared by boot and the settle swap (jit zone_swap): the program and type
 /// context restored from this launch's collected image, and the proof the cache opens with.
 /// None: no usable image (the caller loads the sources).
-pub(crate) fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::Session>, pre: &[crate::preload::PreCrate]) -> Option<(crate::program::Program, crate::tcx::Tcx, Option<crate::cache::CollectedCache>)> {
-    images.restore_collected(sess, pre)
+pub(crate) fn warm_front(images: &crate::cache::FrontImages, sess: &std::sync::Arc<crate::Session>, pre: &[crate::preload::PreCrate],
+    extra: &[crate::preload::PreCrate], swap_image: Option<&crate::cache::CollectedWritten>) -> Option<(crate::program::Program, crate::tcx::Tcx, Option<crate::cache::CollectedCache>)> {
+    if !extra.is_empty() && swap_image.is_none() { return None; }
+    let recipe;
+    let pre = if extra.is_empty() { pre } else {
+        recipe = pre.iter().chain(extra).cloned().collect::<Vec<_>>();
+        &recipe
+    };
+    images.restore_collected(sess, pre, swap_image)
 }
 
 pub(crate) fn set_diagnostics(dcx: relax_types::infer::diagnostics::DiagCtxt) {
@@ -628,7 +635,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut collected_tcx = None;
     let mut collected_definitions = None;
     let restored = if check { None } else {
-        front_images.as_ref().and_then(|images| warm_front(images, sess, &pre))
+        front_images.as_ref().and_then(|images| warm_front(images, sess, &pre, &[], None))
     };
     let restored = if verify_collected {
         verification_graph = restored.filter(|(p, _, _)| p.crates.len() == pre.len());
@@ -1722,6 +1729,13 @@ fn spill_cache() {
 
 static SETTLE_REQUESTED: AtomicBool = AtomicBool::new(false);
 static FIRST_PRESENT_WALL: AtomicU64 = AtomicU64::new(0);
+/// A domain's first frame re-arms settlement even when its code was already installed.
+static DOMAIN_PRESENT_WALL: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn domain_present() {
+    DOMAIN_PRESENT_WALL.fetch_max(jit::wall_ns().max(1), Ordering::Release);
+}
+
 static PRESENT_PATH: relax_session::sync::Mutex<Option<std::path::PathBuf>> = relax_session::sync::Mutex::new(None);
 
 /// Observe the platform's existing `present\n` report, independently of whether a launcher
@@ -1792,9 +1806,9 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         let pending = u.cache.as_ref().map_or(0, |c| c.pending_bytes());
         let spill = u.cache.as_mut().and_then(|c| c.spill_take());
         let at = crate::clock::ms_since_start();
-        let present = FIRST_PRESENT_WALL.load(Ordering::Acquire);
+        let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
         let landmark = if present == 0 { "before first present".to_owned() } else {
-            format!("first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
+            format!("latest first present +{:.0} ms", jit::wall_ns().saturating_sub(present) as f64 / 1e6)
         };
         Some((drops, pending, spill, at, landmark, retired))
     }) else { return false };
@@ -1843,6 +1857,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let adopt_on = std::env::var("RELAX_ADOPT").map_or(true, |v| v != "0");
         let mut memos_pending = true;
         let mut settle_watch = SettleWatch::default();
+        let mut settle_present = 0;
         let mut settle_note: &'static str = "";
         let mut drops = jit::SettleDrops::default();
         let mut reclaimed = None;
@@ -1858,8 +1873,9 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
         let (mut mid_quiet, mut mid_seen, mut mid_flushed, mut mid_last) = (0u32, u64::MAX, 0u64, 0u64);
         let mid_busy = std::sync::Arc::new(AtomicBool::new(false));
         let mut teardown_started = false;
-        // the settle swap (jit zone_swap, on unless RELAX_ZONE_SWAP=0): finished or refused, the next try, tries so far
+        // The settle swap retries each quiet compile count; only refusal disables later rounds.
         let (mut swap_over, mut swap_next, mut swap_tries) = (!jit::zone_swap::enabled(), Instant::now(), 0u32);
+        let (mut swap_round, mut swap_done) = (None, None);
         let mut swap_wait_said = "";
         loop {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -1948,6 +1964,13 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
             jit::reassert_signals();
             flush_errors(false);
             if settle_on {
+                let present = FIRST_PRESENT_WALL.load(Ordering::Acquire).max(DOMAIN_PRESENT_WALL.load(Ordering::Acquire));
+                if present != settle_present {
+                    settle_present = present;
+                    settle_watch.settled = None;
+                    swap_round = None;
+                    swap_done = None;
+                }
                 let requested = SETTLE_REQUESTED.swap(false, Ordering::AcqRel);
                 reclaim_requested |= requested;
                 let compiled = jit::COMPILED_FNS.load(Ordering::Relaxed);
@@ -1979,7 +2002,7 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                         reclaim_requested = false;
                     }
                 }
-                let quiet = settle_watch.ready(jit::wall_ns(), FIRST_PRESENT_WALL.load(Ordering::Acquire), compiled);
+                let quiet = settle_watch.ready(jit::wall_ns(), present, compiled);
                 if quiet || requested {
                     if try_settle(compiled, &mut drops, runtime.mem_trim) {
                         settle_watch.settled = Some(compiled);
@@ -2014,11 +2037,18 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                     }
                 }
             }
-            // the compiler arena's generation is swapped once the run has settled and this run's
-            // collected image is current (everything the swap restores from is on disk).
+            // Swap after each compile burst or domain first frame settles and the boot image
+            // is current; the swap records any runtime additions in its own entry.
             // Startup teardown must have been scheduled before the swap can quiesce its work.
-            let swap_block: Option<&'static str> = if swap_over || Instant::now() < swap_next { Some("") }
-                else if settle_watch.settled.is_none() { Some(settle_note) }
+            let settled = settle_watch.settled.filter(|&n| n == jit::COMPILED_FNS.load(Ordering::Relaxed));
+            if settled.is_some() && swap_round != settled {
+                swap_round = settled;
+                swap_tries = 0;
+                swap_next = Instant::now();
+                swap_wait_said = "";
+            }
+            let swap_block: Option<&'static str> = if swap_over || (settled.is_some() && swap_done == settled) || Instant::now() < swap_next { Some("") }
+                else if settled.is_none() { Some(settle_note) }
                 else if !(COLLECTED_CURRENT.load(Ordering::Relaxed) || COLLECTED_RESTORED.load(Ordering::Relaxed)) { Some("the collected image is not current") }
                 else if COLLECTED_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).is_some() { Some("the collected image's tables are not adopted yet") }
                 else if !MID_MANIFEST_DONE.load(Ordering::Relaxed) { Some("the mid-run manifest is not written") }
@@ -2035,12 +2065,12 @@ fn start_monitor(runtime: &crate::options::RuntimeOptions, options: &crate::opti
                 if !up.is_null() {
                     swap_tries += 1;
                     match jit::zone_swap::run(up) {
-                        jit::zone_swap::Outcome::Done => swap_over = true,
+                        jit::zone_swap::Outcome::Done => swap_done = settled,
                         jit::zone_swap::Outcome::Refused(why) => { eprintln!("relax-zone: swap refused: {why}"); swap_over = true; }
                         jit::zone_swap::Outcome::Retry(why) => {
                             eprintln!("relax-zone: swap deferred (try {swap_tries}): {why}");
                             swap_next = Instant::now() + std::time::Duration::from_secs(1);
-                            if swap_tries >= 40 { swap_over = true; }
+                            if swap_tries >= 40 { swap_done = settled; }
                         }
                     }
                 }
@@ -2243,12 +2273,12 @@ fn exit_report() {
 }
 
 
-/// The collected-program store holds this run's program (restored whole from it, or recorded
-/// by this run): neither the mid-run writes nor the exit encode it again. Encoding it took
+/// The boot's collected program is restored or recorded: neither the mid-run writes nor the
+/// exit encode it again. Runtime additions use zone_swap's separate image. Encoding it took
 /// 0.3-0.6 s of every exit (Calculator, Files) and rewrote the store whenever the run's type
 /// interner had grown.
 static COLLECTED_CURRENT: AtomicBool = AtomicBool::new(false);
-/// This run's program came from a collected image (a warm start): nothing converges.
+/// This run's boot came from a collected image (a warm start): nothing converges.
 static COLLECTED_RESTORED: AtomicBool = AtomicBool::new(false);
 
 /// Run-time crates must not become part of the next boot's collected image. The caller
@@ -2259,7 +2289,7 @@ pub(crate) fn preserve_collected_boot(u: &mut jit::Unit) {
         if let Some(c) = u.cache.as_mut() { c.preserve_collected_boot(&u.prog, &u.tcx); }
     }
 }
-/// The collected store entry this run wrote mid-run (not one a warm restore mapped): the
+/// The boot collected entry this run wrote mid-run (not one a warm restore mapped): the
 /// settle makes the program's tables views of it (adopt_collected_tables).
 static COLLECTED_WRITTEN: relax_session::sync::Mutex<Option<crate::cache::CollectedWritten>> = relax_session::sync::Mutex::new(None);
 

@@ -561,13 +561,15 @@ impl Cache {
         let dir = root.join("cache");
         pack::ensure_private_dir(&dir)?;
         let prog = &u.prog;
-        let collected = collected.filter(|c| c.fps.len() == prog.crates.len()
+        let collected = collected.filter(|c| c.fps.len() <= prog.crates.len()
             && c.defs == prog.defs.len() && c.files == prog.files.len());
         let fps = collected.map_or_else(|| crate::stable::crate_fingerprints(prog), |c| c.fps.clone());
+        // A swap preserves the original cache prefix; runtime crates stay outside boot stores.
+        let ncr = fps.len();
         let t_fp = t0.elapsed();
-        let mut crate_ident = Vec::with_capacity(prog.crates.len());
+        let mut crate_ident = Vec::with_capacity(ncr);
         let mut crate_by_ident = HashMap::new();
-        for c in 0..prog.crates.len() {
+        for c in 0..ncr {
             let mut h = Sip128::new();
             h.str("crate-ident");
             h.str(prog.syms.str(prog.crates[c].name));
@@ -674,7 +676,7 @@ impl Cache {
         // entry's key names the crates it depends on)
         let present: HashSet<String> = prog.crates.iter().map(|ci| prog.syms.str(ci.name).to_string()).collect();
         // each crate's store file: <crate>-<hash of Relax build, target, crate fingerprint>.rcs
-        for ci in 0..prog.crates.len() {
+        for ci in 0..ncr {
             let name = front_store_name(options, prog.syms.str(prog.crates[ci].name), c.fps[ci]);
             c.crate_path.push(dir.join(name));
         }
@@ -682,7 +684,7 @@ impl Cache {
         let t_if = std::time::Instant::now();
         // a restored collected program: the interfaces its recording run keyed code with (the
         // certified inputs are unchanged); file digests are made when a key needs one (def_body)
-        match collected.filter(|c| c.ifaces.len() == prog.crates.len() && std::env::var_os("RELAX_CACHE_IFACE").is_none()) {
+        match collected.filter(|c| c.ifaces.len() == ncr && std::env::var_os("RELAX_CACHE_IFACE").is_none()) {
             Some(cc) => {
                 c.digests = vec![None; prog.files.len()];
                 c.iface = cc.ifaces.clone();
@@ -690,6 +692,7 @@ impl Cache {
             None => {
                 c.digests = items::file_digests(prog);
                 c.iface = items::crate_ifaces(prog, &c.fps, &c.digests);
+                c.iface.truncate(ncr);
             }
         }
         c.stats.iface_ns = t_if.elapsed().as_nanos() as u64;
@@ -715,10 +718,9 @@ impl Cache {
                 }
             }
         }
-        for ci in 0..prog.crates.len() {
+        for ci in 0..ncr {
             c.code_path.push(dir.join(code_store_name(options, prog.syms.str(prog.crates[ci].name), c.iface[ci])));
         }
-        let ncr = prog.crates.len();
         c.depth = crate_depths(prog);
         c.stale = vec![false; ncr];
         c.code_stale = vec![false; ncr];
@@ -4730,7 +4732,7 @@ mod cold_tests {
         assert!(matches!(cache.encode_collected(&unit.prog, &unit.tcx, &|| false), CollectedRecord::Current));
 
         let images = FrontImages { dir: store.clone(), ..Default::default() };
-        let (saved, saved_tcx, proof) = images.restore_collected(sess, &pre).expect("restore only the boot");
+        let (saved, saved_tcx, proof) = images.restore_collected(sess, &pre, None).expect("restore only the boot");
         assert_eq!(saved.crates.len(), pre.len());
         assert_eq!(saved.defs.len(), boot_defs);
         assert_eq!(saved.file_paths, boot_files);
@@ -4815,21 +4817,21 @@ mod cold_tests {
             cache.record_collected(&unit.prog, &unit.tcx).expect("record collected graph");
         };
         record(&images);
-        let (whole, _, proof) = images.restore_collected(sess, &pre).expect("unchanged sources restore");
+        let (whole, _, proof) = images.restore_collected(sess, &pre, None).expect("unchanged sources restore");
         assert_eq!(whole.crates.len(), names.len());
         assert!(proof.is_some());
         // a body edit of the top crate: everything below it stays, `top` and the clean `late`
         // after it are collected again
         std::fs::write(&pre[5].root, "pub fn top() -> u32 { mid::mid() + 2 }").unwrap();
-        let (kept, _, proof) = images.restore_collected(sess, &pre).expect("prefix restore");
+        let (kept, _, proof) = images.restore_collected(sess, &pre, None).expect("prefix restore");
         assert_eq!(kept.crates.len(), 5, "crates below the edited one");
         assert!(proof.is_none(), "a partial restore has no whole-graph proof");
         // the next run after recording the edited sources restores everything again
         record(&images);
-        assert_eq!(images.restore_collected(sess, &pre).unwrap().0.crates.len(), names.len());
+        assert_eq!(images.restore_collected(sess, &pre, None).unwrap().0.crates.len(), names.len());
         // a signature change in a lower crate: it and everything above it are collected again
         std::fs::write(&pre[3].root, "pub fn value() -> u64 { 7 }").unwrap();
-        let (kept, _, _) = images.restore_collected(sess, &pre).expect("prefix restore");
+        let (kept, _, _) = images.restore_collected(sess, &pre, None).expect("prefix restore");
         assert_eq!(kept.crates.len(), 3, "only the crates below the changed one");
         std::fs::remove_dir_all(dir).unwrap();
     }
