@@ -20208,6 +20208,13 @@ pub unsafe fn DrawMenuBar(hWnd: crate::Win32::Foundation::HWND) -> Result<(), cr
 let hr__ = import_DrawMenuBar::call(hWnd); hr__.ok()?;
 Ok(())
 }
+mod import_EnumWindows { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "EnumWindows"] pub fn call(lpEnumFunc: crate::Win32::UI::WindowsAndMessaging::WNDENUMPROC,lParam: crate::Win32::Foundation::LPARAM) -> crate::core::BOOL; } }
+pub use import_EnumWindows::call as EnumWindows_raw;
+#[inline]
+pub unsafe fn EnumWindows(lpEnumFunc: crate::Win32::UI::WindowsAndMessaging::WNDENUMPROC,lParam: crate::Win32::Foundation::LPARAM) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_EnumWindows::call(lpEnumFunc,lParam); hr__.ok()?;
+Ok(())
+}
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct GDI_IMAGE_TYPE(pub u32);
@@ -20220,9 +20227,22 @@ impl ::core::ops::BitOr for GDI_IMAGE_TYPE { type Output = Self; fn bitor(self, 
 impl ::core::ops::BitAnd for GDI_IMAGE_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for GDI_IMAGE_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for GDI_IMAGE_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct GET_WINDOW_CMD(pub u32);
+impl GET_WINDOW_CMD { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for GET_WINDOW_CMD { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for GET_WINDOW_CMD { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for GET_WINDOW_CMD {}
+impl ::core::fmt::Debug for GET_WINDOW_CMD { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for GET_WINDOW_CMD { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for GET_WINDOW_CMD { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for GET_WINDOW_CMD { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for GET_WINDOW_CMD { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const GWLP_USERDATA: crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX = crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(-21i64 as _);
 pub const GWL_EXSTYLE: crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX = crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(-20i64 as _);
 pub const GWL_STYLE: crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX = crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX(-16i64 as _);
+pub const GW_OWNER: crate::Win32::UI::WindowsAndMessaging::GET_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::GET_WINDOW_CMD(4u64 as _);
 mod import_GetClassNameW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetClassNameW"] pub fn call(hWnd: crate::Win32::Foundation::HWND,lpClassName: crate::core::PWSTR,nMaxCount: i32) -> i32; } }
 pub use import_GetClassNameW::call as GetClassNameW_raw;
 #[inline]
@@ -20284,6 +20304,11 @@ pub use import_GetSystemMetrics::call as GetSystemMetrics_raw;
 #[inline]
 pub unsafe fn GetSystemMetrics(nIndex: crate::Win32::UI::WindowsAndMessaging::SYSTEM_METRICS_INDEX) -> i32 {
 import_GetSystemMetrics::call(nIndex)}
+mod import_GetWindow { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetWindow"] pub fn call(hWnd: crate::Win32::Foundation::HWND,uCmd: crate::Win32::UI::WindowsAndMessaging::GET_WINDOW_CMD) -> crate::Win32::Foundation::HWND; } }
+pub use import_GetWindow::call as GetWindow_raw;
+#[inline]
+pub unsafe fn GetWindow(hWnd: crate::Win32::Foundation::HWND,uCmd: crate::Win32::UI::WindowsAndMessaging::GET_WINDOW_CMD) -> crate::Win32::Foundation::HWND {
+import_GetWindow::call(hWnd,uCmd)}
 mod import_GetWindowLongPtrW { #[link(name = "USER32", kind = "raw-dylib")] extern "system" { #[link_name = "GetWindowLongPtrW"] pub fn call(hWnd: crate::Win32::Foundation::HWND,nIndex: crate::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX) -> isize; } }
 pub use import_GetWindowLongPtrW::call as GetWindowLongPtrW_raw;
 #[inline]
@@ -20668,6 +20693,7 @@ pub const SW_MINIMIZE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = 
 pub const SW_RESTORE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(9i64 as _);
 pub const SW_SHOW: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(5i64 as _);
 pub const SW_SHOWNOACTIVATE: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(4i64 as _);
+pub const SW_SHOWNORMAL: crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD = crate::Win32::UI::WindowsAndMessaging::SHOW_WINDOW_CMD(1i64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct SYSTEM_METRICS_INDEX(pub i32);
@@ -20956,6 +20982,7 @@ impl ::core::ops::BitOr for WNDCLASS_STYLES { type Output = Self; fn bitor(self,
 impl ::core::ops::BitAnd for WNDCLASS_STYLES { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for WNDCLASS_STYLES { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for WNDCLASS_STYLES { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub type WNDENUMPROC = Option<unsafe extern "system" fn(crate::Win32::Foundation::HWND,crate::Win32::Foundation::LPARAM) -> crate::core::BOOL>;
 pub type WNDPROC = Option<unsafe extern "system" fn(crate::Win32::Foundation::HWND,u32,crate::Win32::Foundation::WPARAM,crate::Win32::Foundation::LPARAM) -> crate::Win32::Foundation::LRESULT>;
 pub const WS_BORDER: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(8388608u64 as _);
 pub const WS_CAPTION: crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE = crate::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(12582912u64 as _);

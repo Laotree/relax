@@ -159,7 +159,7 @@ fn main() {
     // Apple targets (macOS, iOS, tvOS) and desktop Linux always use the HAL. Linux shell
     // selection (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
     let desktop_linux = target_os == "linux";
-    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android") || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
+    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android" | "windows") || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
         println!("cargo:rustc-cfg=hal");
     }
