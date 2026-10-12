@@ -250,6 +250,7 @@ static TLS_GLUE: AtomicU64 = AtomicU64::new(0);
 /// the runtime's resume (`Env::resume`): continues an unwind from the frame that calls it
 static RESUME: AtomicU64 = AtomicU64::new(0);
 
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))] // only the aarch64 asm calls it
 extern "C" fn resume_target() -> u64 {
     RESUME.load(Ordering::Relaxed)
 }
