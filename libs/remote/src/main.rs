@@ -14,7 +14,7 @@ fn print_usage() {
     eprintln!("  App:    makepad-remote app <pid|app-name|socket> <command> [k=v ...]   (a running makepad app's endpoint; `help` lists its commands)");
     eprintln!("          makepad-remote app <app> grab [w=ID] [scale=F] out=<file>   (images are written by this client)");
     eprintln!("          makepad-remote app <app> tools | call <service>.<tool> [instance] [json]   (its AI tools: the `app` service)");
-    eprintln!("  MCP:    makepad-remote mcp <pid|app-name|host:app> [--no-builtins] [--launch <program> [args...]]   (stdio MCP server)");
+    eprintln!("  MCP:    makepad-remote mcp <pid|app-name|host:app> [--no-builtins] [--caller-env NAME] [--launch <program> [args...]]   (stdio MCP server)");
     eprintln!("  Server: makepad-remote --server [--port 8384] [--bind lan|<ip>] [--all]");
     eprintln!("                         [--keys <file>] [--identity <dir>] [--audit-log <file>] [--max-run <secs>]");
     eprintln!("          makepad-remote --init [--identity <dir>]     create the TLS identity, print its pin");
@@ -136,11 +136,18 @@ fn main() -> ExitCode {
         }
         "app" if args.len() >= 2 => run_app(&args[1], &args[2..]),
         "mcp" if args.len() >= 2 => {
-            let mut opts = makepad_remote::mcp::Options { target: args[1].clone(), builtins: true, launch: Vec::new() };
+            let mut opts = makepad_remote::mcp::Options { target: args[1].clone(), builtins: true, launch: Vec::new(), caller: None };
             let mut rest = args[2..].iter();
             while let Some(a) = rest.next() {
                 match a.as_str() {
                     "--no-builtins" => opts.builtins = false,
+                    "--caller-env" => match rest.next().map(|name| std::env::var(name)) {
+                        Some(Ok(token)) if !token.trim().is_empty() && !token.contains(char::is_whitespace) => opts.caller = Some(token),
+                        _ => {
+                            eprintln!("makepad-remote mcp: --caller-env NAME needs NAME set to one token");
+                            return ExitCode::from(1);
+                        }
+                    },
                     "--launch" => opts.launch = rest.by_ref().cloned().collect(),
                     other => {
                         eprintln!("makepad-remote mcp: unknown option {other}");

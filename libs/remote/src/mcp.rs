@@ -7,6 +7,9 @@
 //! commands (`ui__grab`, `ui__gseq`, `edit__tweak_grab`) run here and return the PNG as an
 //! image. Approvals are the MCP client's: it sees each tool's risk in its description.
 //!
+//! `--caller-env NAME` passes the capability in that environment variable with every call (an
+//! agent lane's `MAKEPAD_SCOPE_MCP_TOKEN`); the app checks it.
+//!
 //! The target is a pid, an app name or `<host>:<app|pid>` (through the hub). With `--launch
 //! <program> [args..]` an app that is not running is started (detached) when a request needs it.
 
@@ -33,6 +36,9 @@ pub struct Options {
     pub target: String,
     pub builtins: bool,
     pub launch: Vec<String>,
+    /// A capability passed with every call (`caller=` of the `app` request): the app that
+    /// issued it (Scope, per agent lane) decides what the caller may do.
+    pub caller: Option<String>,
 }
 
 /// One tool as listed.
@@ -194,7 +200,11 @@ impl Adapter {
         if CLIENT_SIDE.contains(&(service, tool)) {
             return client_side(&client, &tool.replace('_', " "), args);
         }
-        let lines = app_request(&client, &format!("call {service}.{tool}\n{args}"))?;
+        let caller = match &self.opts.caller {
+            Some(c) => format!(" caller={c}"),
+            None => String::new(),
+        };
+        let lines = app_request(&client, &format!("call {service}.{tool}{caller}\n{args}"))?;
         let result = lines.iter().find_map(|l| l.get("Result").and_then(|r| match r {
             Value::Arr(a) => a.first().cloned(),
             other => Some(other.clone()),
@@ -212,7 +222,13 @@ impl Adapter {
         if outcome != "Ok" {
             text = format!("{}: {text}", outcome.to_lowercase());
         }
-        Ok(json::obj(vec![("content", Value::Arr(vec![json::obj(vec![("type", json::s("text")), ("text", json::s(text))])])), ("isError", Value::Bool(outcome != "Ok"))]))
+        let mut content = vec![json::obj(vec![("type", json::s("text")), ("text", json::s(text))])];
+        if let Some(images) = r.get("images").and_then(Value::as_arr) {
+            for image in images.iter().filter_map(Value::as_str) {
+                content.push(json::obj(vec![("type", json::s("image")), ("data", json::s(image)), ("mimeType", json::s("image/png"))]));
+            }
+        }
+        Ok(json::obj(vec![("content", Value::Arr(content)), ("isError", Value::Bool(outcome != "Ok"))]))
     }
 }
 
@@ -347,7 +363,7 @@ mod tests {
 
     #[test]
     fn the_handshake_and_errors_need_no_app() {
-        let mut a = Adapter { opts: Options { target: "nobody-runs-this-app".into(), builtins: true, launch: Vec::new() }, client: None };
+        let mut a = Adapter { opts: Options { target: "nobody-runs-this-app".into(), builtins: true, launch: Vec::new(), caller: None }, client: None };
         let init = a.handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}"#).unwrap();
         assert!(init.contains(r#""protocolVersion":"2025-03-26""#) && init.contains(r#""tools":{}"#), "{init}");
         assert!(a.handle(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).is_none());
