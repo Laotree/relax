@@ -42,6 +42,8 @@ static RECORDED: relax_session::sync::Mutex<Option<(std::collections::HashSet<(u
 
 /// Starts the read log from RELAX_READ_LOG (the loader calls this at start, next to RELAX_VFS).
 pub fn record_from_env() -> Result<(), String> {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     let Some(p) = std::env::var_os("RELAX_READ_LOG").filter(|p| !p.is_empty()) else { return Ok(()) };
     let f = std::fs::OpenOptions::new().create(true).append(true).open(&p).map_err(|e| format!("RELAX_READ_LOG {}: {e}", p.to_string_lossy()))?;
     *RECORDED.lock().unwrap() = Some((Default::default(), f));
@@ -54,6 +56,7 @@ fn note(kind: u8, path: &std::path::Path) {
         return;
     }
     let p = normalize_path(&path.to_string_lossy());
+    let _k = crate::zone_alloc::kept();
     let mut g = RECORDED.lock().unwrap();
     if let Some((seen, file)) = g.as_mut() {
         if seen.insert((kind, p.clone())) {
@@ -72,6 +75,8 @@ static FROZEN: RwLock<Vec<String>> = RwLock::new(Vec::new());
 /// Verify a complete subtree directly from the store (no disk/edits reads), then protect it
 /// from the app's edit overlay. Paths and bytes use the same digest as the compiler build.
 pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     let (m, rel) = find(path).ok_or("no Relax std mount")?;
     let prefix = if rel.is_empty() { String::new() } else { format!("{rel}/") };
     let mut files = Vec::new();
@@ -103,6 +108,8 @@ pub fn verify_std(path: &str, expected: &str) -> Result<(), String> {
 
 /// Serves `root` (a folder that does not exist on disk) from `store` at `commit`.
 pub fn mount(root: &str, store: Arc<Store>, commit: &Oid) -> Result<(), String> {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     let files: Arc<[Entry]> = store.index.table(commit).ok_or_else(|| format!("{}: commit {} is not kept", store.path.display(), store::hex(commit)))?.to_vec().into();
     let root = normalize_path(root);
     let mut m = MOUNTS.write().unwrap();
@@ -248,6 +255,8 @@ fn edited_file(path: &str) -> Option<std::path::PathBuf> {
 
 /// The edits folder from RELAX_EDITS (the runner sets it per licensed app).
 pub fn set_edits(dir: Option<std::path::PathBuf>) {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     *EDITS.write().unwrap() = dir;
 }
 
@@ -256,7 +265,8 @@ impl Mount {
         self.files.binary_search_by(|e| e.path.as_str().cmp(rel)).ok().map(|i| &self.files[i])
     }
     fn folders(&self) -> &BTreeMap<String, Vec<(String, bool)>> {
-        self.folders.get_or_init(|| store::folders(&self.files))
+        // the mount is process state: its folder index too (kept heap)
+        self.folders.get_or_init(|| crate::zone_alloc::kept_with(|| store::folders(&self.files)))
     }
     fn is_dir(&self, rel: &str) -> bool {
         self.folders().contains_key(rel)
@@ -747,6 +757,8 @@ pub fn mounts_text() -> String {
 
 /// Mounts what `mounts_text` wrote (RELAX_VFS).
 pub fn mount_text(text: &str) -> Result<(), String> {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     for line in text.lines().filter(|l| !l.is_empty()) {
         let mut it = line.split('\t');
         let (Some(root), Some(path), Some(commit)) = (it.next(), it.next(), it.next()) else { return Err(format!("RELAX_VFS: bad line {line}")) };
@@ -771,6 +783,8 @@ pub fn parse_range(s: &str) -> Option<(u64, u64)> {
 
 /// RELAX_VFS from the environment, mounted once (the loader and `relax` call this at start).
 pub fn mount_from_env() -> Result<(), String> {
+    // process state: built in the kept heap (the settle swap destroys the compiler zone)
+    let _k = crate::zone_alloc::kept();
     record_from_env()?;
     if let Some(d) = std::env::var_os("RELAX_EDITS").filter(|d| !d.is_empty()) {
         set_edits(Some(d.into()));
@@ -793,6 +807,7 @@ unsafe fn path_arg<'a>(p: *const u8, n: usize) -> &'a str {
 
 fn hold(data: Vec<u8>, out: *mut *const u8, out_len: *mut usize) -> u64 {
     let id = HELD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let _k = crate::zone_alloc::kept();
     let mut h = HELD.lock().unwrap();
     h.push((id, data));
     let d = &h.last().unwrap().1;
