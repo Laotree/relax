@@ -446,9 +446,18 @@ pub mod portable {
     struct StartArg {
         f: fn(*mut u8),
         arg: *mut u8,
+        /// the starting thread's domain static block (relax domain.rs): the new thread runs in it
+        domain: u64,
+    }
+
+    extern "C" {
+        fn __relax_domain_base() -> u64;
+        fn __relax_domain_enter(base: u64);
     }
 
     extern "system" fn windows_thread_start(p: *mut c_void) -> DWORD {
+        // first, before anything that may name a static
+        unsafe { __relax_domain_enter((*(p as *const StartArg)).domain) };
         let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
         (a.f)(a.arg);
         0
@@ -457,7 +466,7 @@ pub mod portable {
     /// CreateThread with `stack_size` reserved (STACK_SIZE_PARAM_IS_A_RESERVATION, as real std).
     pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<NativeThread, i32> {
         const STACK_SIZE_PARAM_IS_A_RESERVATION: DWORD = 0x0001_0000;
-        let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg })) as *mut c_void;
+        let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain: unsafe { __relax_domain_base() } })) as *mut c_void;
         let h = unsafe { CreateThread(core::ptr::null_mut(), stack_size, windows_thread_start, start, STACK_SIZE_PARAM_IS_A_RESERVATION, core::ptr::null_mut()) };
         if h.is_null() {
             let e = errno();

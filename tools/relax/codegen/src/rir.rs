@@ -357,6 +357,9 @@ pub enum SymClass {
     Far = 1,
     /// a per-run number, not an address (fits in 32 bits): an immediate field
     Imm = 2,
+    /// an offset into the running thread's domain static block (fits in 32 bits): `Inst::Addr`
+    /// of it is the thread's domain base (slot 0 of its thread-local block) + the symbol's value
+    Domain = 3,
 }
 
 impl SymClass {
@@ -367,6 +370,7 @@ impl SymClass {
         match unsafe { std::ptr::read((table as *const u8).add(id as usize)) } {
             0 => SymClass::Near,
             2 => SymClass::Imm,
+            3 => SymClass::Domain,
             _ => SymClass::Far,
         }
     }

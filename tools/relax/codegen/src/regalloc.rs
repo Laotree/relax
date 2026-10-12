@@ -23,6 +23,9 @@ pub struct RegConfig {
     /// variable shifts): bit r = int register r, bit 32 + x = float register x. No value live at
     /// such an instruction (operands, result, or live across) is placed in them.
     pub clobbers: Option<fn(&relax_session::Options, &Inst) -> u64>,
+    /// `Env::sym_class` (0: none): an address of a domain symbol is a thread-local block read
+    /// and an add, not a constant, so it is never rematerialised
+    pub sym_class: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1702,7 +1705,7 @@ fn remat_values(options: &relax_session::Options, f: &Func, reach: &[bool], cfg:
                 match i {
                     Inst::Iconst(d, k) => cand.push((d.0, Remat::Const(*k))),
                     Inst::SlotAddr(d, n) => cand.push((d.0, Remat::Slot(*n))),
-                    Inst::Addr(d, a) => cand.push((d.0, Remat::Addr(*a))),
+                    Inst::Addr(d, a) if crate::rir::SymClass::of(cfg.sym_class, a.id) != crate::rir::SymClass::Domain => cand.push((d.0, Remat::Addr(*a))),
                     Inst::FnAddr(d, n) => cand.push((d.0, Remat::FnAddr(*n))),
                     Inst::Mov(d, s2) => movs.push((d.0, s2.0)),
                     Inst::Call(c, a, _) => {

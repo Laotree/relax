@@ -609,7 +609,7 @@ pub(crate) fn capture_initial_data(u: &Unit, root: Sym) {
             _ => continue,
         };
         // identity state (the declared initial bytes): the program's heap, not the compiler arena's
-        let bytes = crate::zone_alloc::kept_with(|| unsafe { std::slice::from_raw_parts(u.syms.value(Sym::new(sym.id)) as *const u8, size).to_vec() });
+        let bytes = crate::zone_alloc::kept_with(|| unsafe { std::slice::from_raw_parts(u.syms.addr(Sym::new(sym.id)) as *const u8, size).to_vec() });
         // the data objects its words point into: what provenance_words would attribute to a
         // data object (only those are captured; the thunk / static / runtime / C attributions
         // it tries after are never data, and its C declaration scan is not needed here)
@@ -619,14 +619,14 @@ pub(crate) fn capture_initial_data(u: &Unit, root: Sym) {
     }
 }
 
-fn initial_bytes(u: &Unit, sym: u32) -> Result<Vec<u8>, String> {
+pub(crate) fn initial_bytes(u: &Unit, sym: u32) -> Result<Vec<u8>, String> {
     u.syms.initial_data.lock().unwrap_or_else(|e| e.into_inner()).get(&sym).cloned()
         .ok_or_else(|| format!("sandbox: missing declared initializer for {}", crate::syms::describe(u, Sym::new(sym))))
 }
 
 /// Pointer words of initializer bytes by provenance (a word equal to the address of a
 /// known data object, static or thunk). Never inspect a running host static here.
-fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
+pub(crate) fn provenance_words(u: &Unit, b: &[u8]) -> Vec<(u32, Sym)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i + 8 <= b.len() {

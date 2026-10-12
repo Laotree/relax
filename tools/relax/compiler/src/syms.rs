@@ -14,7 +14,7 @@
 
 use crate::jit::Unit;
 use crate::program::DefId;
-use crate::rir::{Mem, Sym};
+use crate::rir::{Mem, Sym, SymClass};
 use crate::types::{TyId, TyKind};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -92,6 +92,9 @@ pub struct Syms {
     /// the writable blocks lowering made, by address: start -> (size, the value's type)
     /// (promoted_copy)
     pub rw_starts: Mutex<BTreeMap<u64, (u64, TyId)>>,
+    /// start address -> symbol of each anonymous mutable block (`Unit::rw_sym`): a constant
+    /// re-homed per domain (domain.rs rehome_const) is one, and lowering finds its symbol by address
+    pub rw_syms: Mutex<BTreeMap<u64, Sym>>,
     /// Declared initial bytes of statics and their promoted data, before host execution.
     pub initial_data: Mutex<HashMap<u32, Vec<u8>>>,
     /// the definition behind each Foreign / Missing symbol
@@ -99,6 +102,10 @@ pub struct Syms {
     /// Reverse attribution is lazy and shared by every pointer word in this Unit.
     rt_by_addr: OnceLock<HashMap<u64, Sym>>,
     foreign_by_addr: Mutex<ForeignIndex>,
+    /// The compile domain's static block (domain 0): the address its offsets are relative to.
+    /// A domain symbol (a static, a writable block: `SymClass::Domain`) is interned with its
+    /// address in that block and holds the offset; `addr` gives the address back.
+    dom0: u64,
 }
 
 #[derive(Default)]
@@ -122,8 +129,8 @@ struct DataIndex {
 }
 
 impl Syms {
-    pub fn new(vals: u64) -> Syms {
-        Syms { vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
+    pub fn new(vals: u64, dom0: u64) -> Syms {
+        Syms { dom0, vals, classes: crate::jit::alloc_rw(SYM_CAP), kinds: crate::conc::AppendVec::new_kept(SYM_CAP), inner: Mutex::new(SymsInner::default()), data: Mutex::new(DataIndex::default()), rw_blocks: Mutex::new(Vec::new()), rw_starts: Mutex::new(BTreeMap::new()), rw_syms: Mutex::new(BTreeMap::new()), initial_data: Mutex::new(HashMap::new()), foreign_defs: Mutex::new(HashMap::new()), rt_by_addr: OnceLock::new(), foreign_by_addr: Mutex::new(ForeignIndex::default()) }
     }
 
     /// The kept-state scan (jit/zone_scan.rs): the owned allocations of the symbol table.
@@ -206,6 +213,8 @@ impl Syms {
     }
 
     fn push(&self, kind: SymKind, value: u64) -> Sym {
+        // a domain symbol's table value is its offset in the domain static block (0: no storage)
+        let value = if class_of(&kind) == crate::rir::SymClass::Domain && value != 0 { value - self.dom0 } else { value };
         let id = self.kinds.push(kind) as u32;
         if id as usize >= SYM_CAP {
             panic!("symbol table full");
@@ -224,8 +233,28 @@ impl Syms {
         }
     }
 
+    /// The symbol's table value: what code relocated against it holds. For a domain symbol that
+    /// is the offset in a domain's static block; use `addr` for a pointer to it.
     pub fn value(&self, s: Sym) -> u64 {
         unsafe { s.value(self.vals) }
+    }
+
+    /// The address a pointer to the symbol holds in memory the compile domain (domain 0) owns:
+    /// its value, in the domain static block for a domain symbol.
+    pub fn addr(&self, s: Sym) -> u64 {
+        let v = self.value(s);
+        // a static whose storage failed has the value 0 (no offset is 0: the block starts later)
+        let base = v.wrapping_sub(s.off as u64);
+        if SymClass::of(self.classes, s.id) == SymClass::Domain && base != 0 {
+            v.wrapping_add(self.dom0)
+        } else {
+            v
+        }
+    }
+
+    /// The compile domain's static block.
+    pub fn dom0(&self) -> u64 {
+        self.dom0
     }
 
     pub fn len(&self) -> usize {
@@ -261,6 +290,35 @@ impl Syms {
             d.by_start.insert(*start, first + i as u32);
         }
         syms
+    }
+
+    /// The anonymous mutable block (`Unit::rw_sym`) containing `addr`, as its symbol + offset.
+    pub(crate) fn rw_sym_at(&self, addr: u64) -> Option<Sym> {
+        let (start, sym) = {
+            let m = self.rw_syms.lock().unwrap_or_else(|e| e.into_inner());
+            let (&start, &sym) = m.range(..=addr).next_back()?;
+            (start, sym)
+        };
+        let Some(SymKind::Rw(k)) = self.kind(sym.id) else { return None };
+        let size = self.rw_blocks.lock().unwrap_or_else(|e| e.into_inner()).get(k as usize)?.0;
+        (addr < start + size.max(1)).then(|| Sym { id: sym.id, off: (addr - start) as i64 })
+    }
+
+    /// The data object containing `addr`: (start, len, align, mutable).
+    pub(crate) fn object_of(&self, addr: u64) -> Option<(u64, u64, u64, bool)> {
+        if addr <= 0x10000 {
+            return None;
+        }
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        let (&start, &i) = d.by_start.range(..=addr).next_back()?;
+        let o = &d.objs[i as usize];
+        (addr < start + o.len.max(1)).then(|| (o.start, o.len, o.align, o.mutable))
+    }
+
+    /// What the data object starting at `start` holds (`Bytes` when unknown).
+    pub(crate) fn kind_at(&self, start: u64) -> DataKind {
+        let d = self.data.lock().unwrap_or_else(|e| e.into_inner());
+        d.by_start.get(&start).map(|&i| d.objs[i as usize].kind.clone()).unwrap_or(DataKind::Bytes)
     }
 
     /// The symbol of the data object starting exactly at `start`.
@@ -550,6 +608,11 @@ fn provenance(u: &Unit, v: u64) -> Option<Sym> {
         return Some(u.syms.intern(SymKind::Thunk(id), v));
     }
     if let Some(s) = u.static_sym_at(v) {
+        return Some(s);
+    }
+    // an anonymous mutable block (a promoted temporary, a per-domain constant): per-domain storage
+    // like a static, so a word pointing into it is rebased in every domain's copy (domain.rs)
+    if let Some(s) = u.syms.rw_sym_at(v) {
         return Some(s);
     }
     // Runtime entries are all installed at Unit creation. Prefer their stable names over
@@ -1020,7 +1083,9 @@ pub fn class_of(k: &SymKind) -> crate::rir::SymClass {
             "panic_site" | "panic_bounds" | "panic_impl" | "resume" | "land" => SymClass::Near,
             _ => SymClass::Far,
         },
-        SymKind::Data(_) | SymKind::Static(_) | SymKind::Rw(_) | SymKind::Thunk(_) | SymKind::Asm(_) | SymKind::Missing(_) => SymClass::Near,
+        // storage every domain has its own copy of, at the same offset of its static block
+        SymKind::Static(_) | SymKind::Rw(_) => SymClass::Domain,
+        SymKind::Data(_) | SymKind::Thunk(_) | SymKind::Asm(_) | SymKind::Missing(_) => SymClass::Near,
         SymKind::Foreign(_) | SymKind::Provided(_) => SymClass::Far,
         SymKind::Site(_) => SymClass::Imm,
     }

@@ -5749,22 +5749,22 @@ mod data_tests {
         u.syms.set_data_name(child, "test:child".to_string());
         let target = Sym { id: u.data_sym(child).id, off: 2 };
         let rt = u.syms.find_rt("memcpy").unwrap();
-        let a = typed(&u, u.syms.value(rt));
+        let a = typed(&u, u.syms.addr(rt));
         assert_eq!(crate::syms::obj_pointer_words(&u, index(&u, a)).unwrap(), vec![(0, rt)]);
         assert!(c.data_entry(&u, index(&u, a)).is_some());
 
         let foreign = u.foreign_sym(abs_b).unwrap();
-        let a = typed(&u, u.syms.value(foreign));
+        let a = typed(&u, u.syms.addr(foreign));
         assert_eq!(crate::syms::obj_pointer_words(&u, index(&u, a)).unwrap(), vec![(0, foreign)]);
         let foreign_key = c.data_entry(&u, index(&u, a)).unwrap();
         u.syms.foreign_defs.lock().unwrap().insert(foreign.id, abs_a);
-        let a = typed(&u, u.syms.value(foreign));
+        let a = typed(&u, u.syms.addr(foreign));
         assert_eq!(c.data_entry(&u, index(&u, a)), Some(foreign_key));
         let static_sym = u.static_sym(value);
         let id = u.fn_id(FnKey::Inst(function, Vec::new()));
         let thunk = u.syms.intern(SymKind::Thunk(id), u.entry(id));
         for sym in [static_sym, thunk] {
-            let a = typed(&u, u.syms.value(sym));
+            let a = typed(&u, u.syms.addr(sym));
             assert_eq!(crate::syms::obj_pointer_words(&u, index(&u, a)).unwrap(), vec![(0, sym)]);
             assert!(c.data_entry(&u, index(&u, a)).is_some());
         }
@@ -5772,7 +5772,7 @@ mod data_tests {
         // a pointer into a static is the static plus an offset; one past its end may be the
         // next block's start and is not attributed
         let pair_sym = u.static_sym(pair);
-        let at = u.syms.value(pair_sym);
+        let at = u.syms.addr(pair_sym);
         let a = typed(&u, at + 8);
         assert_eq!(crate::syms::obj_pointer_words(&u, index(&u, a)).unwrap(), vec![(0, Sym { id: pair_sym.id, off: 8 })]);
         assert!(c.data_entry(&u, index(&u, a)).is_some());
@@ -5783,9 +5783,9 @@ mod data_tests {
         // (pointers relocated) by its type; a `*mut` to it, and an untyped block, stay unattributed
         let block_ty = u.tcx.tys.intern(TyKind::Array(ptr_ty, u.tcx.tys.const_usize(2)));
         let block = u.rw_sym(16, 8, Some(block_ty));
-        let b = u.syms.value(block);
+        let b = u.syms.addr(block);
         unsafe {
-            *(b as *mut u64) = u.syms.value(static_sym);
+            *(b as *mut u64) = u.syms.addr(static_sym);
             *((b + 8) as *mut u64) = 0;
         }
         let a = typed(&u, b + 8);
@@ -5798,7 +5798,7 @@ mod data_tests {
         let mut_ty = u.tcx.tys.intern(TyKind::Ptr(true, u.tcx.tys.intern(TyKind::Bool)));
         let a = u.data(&(b + 8).to_le_bytes(), 8, DataKind::Typed(mut_ty));
         assert!(crate::syms::obj_pointer_words(&u, index(&u, a)).is_none());
-        let untyped = u.syms.value(u.rw_sym(16, 8, None));
+        let untyped = u.syms.addr(u.rw_sym(16, 8, None));
         let a = typed(&u, untyped);
         assert!(crate::syms::obj_pointer_words(&u, index(&u, a)).is_none());
 
@@ -5807,7 +5807,7 @@ mod data_tests {
         let mut bytes = vec![0x5a; 42];
         let relocs = vec![(1, target), (9, rt), (17, static_sym), (25, thunk), (33, foreign)];
         for (off, sym) in &relocs {
-            bytes[*off as usize..*off as usize + 8].copy_from_slice(&u.syms.value(*sym).to_le_bytes());
+            bytes[*off as usize..*off as usize + 8].copy_from_slice(&u.syms.addr(*sym).to_le_bytes());
         }
         let a = u.data(&bytes, 1, DataKind::Relocs(relocs.clone()));
         u.syms.set_data_name(a, "test:parent".to_string());
@@ -6056,7 +6056,7 @@ impl Linker {
                 return None;
             }
             let s = self.link_symbol(u, &mut d, &mut rw)?;
-            bytes[at..at + 8].copy_from_slice(&u.syms.value(s).to_le_bytes());
+            bytes[at..at + 8].copy_from_slice(&u.syms.addr(s).to_le_bytes());
             ptrs.push((o, s));
             end = at + 8;
         }

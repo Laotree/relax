@@ -505,6 +505,8 @@ unsafe fn write_bytes(addr: u64, b: &[u8]) {
 
 /// Size of each thread's thread-local block (virtual; pages are touched on use).
 const TLS_CAP: usize = 1 << 20;
+/// Offset of the first thread-local variable: slot 0 holds the thread's domain static block base.
+const TLS_FIRST_FREE: u32 = 16;
 static TLS_KEY: AtomicU64 = AtomicU64::new(u64::MAX);
 
 extern "C" fn tls_dtor(p: *mut u8) {
@@ -556,6 +558,9 @@ fn rt_tls_block() -> u64 {
         return b as u64;
     }
     let b = os::mem::alloc_rw(TLS_CAP);
+    // a thread nothing assigned a domain to (one native code started, or the first use of a
+    // thread JIT code started before its start put it in its parent's domain): the default
+    unsafe { *(b as *mut u64) = crate::domain::default_base() };
     os::tls::set(key, b as *mut u8);
     b
 }
@@ -1609,7 +1614,8 @@ rt_fn! {
 fn rt_thread_run(entry: u64, arg: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
-    match unsafe { call_jit(u, entry, arg) } {
+    // runs on the calling thread, in the domain it is in
+    match unsafe { call_jit_in(u, crate::domain::current(), entry, arg) } {
         Ok(_) => 0,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
@@ -1628,7 +1634,8 @@ rt_fn! {
 fn rt_catch_panic(f: u64, data: u64) -> u64 {
     ensure_altstack();
     let u = unsafe { UNIT };
-    match unsafe { call_jit(u, f, data) } {
+    // a recovery point inside running code: the domain of that code, not the unit's own
+    match unsafe { call_jit_in(u, crate::domain::current(), f, data) } {
         Ok(_) => 0,
         Err(p) => {
             let r = owner::call(owner::Class::Job, || unsafe { (&*u).report(&p) });
@@ -1926,7 +1933,7 @@ fn cyc_leave(depth: usize) -> bool {
 
 /// A unit's data and statics parts of its reservation.
 const UNIT_DATA_SIZE: u64 = 768 << 20;
-const UNIT_RW_SIZE: u64 = 256 << 20;
+pub(crate) const UNIT_RW_SIZE: u64 = 256 << 20;
 
 // queries.rs:58-108: evaluate the resolved instance through the registered
 // compiler provider; the final result is independent of its executable storage.
@@ -2085,7 +2092,7 @@ impl Unit {
             sites: Default::default(),
             site_ix: Default::default(),
             rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
-            syms: crate::syms::Syms::new(syms_base),
+            syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
             start_order: Vec::new(),
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
@@ -2116,14 +2123,16 @@ impl Unit {
             lit_data: Default::default(),
             data_end: data_base + data_size,
             ro_base: data_base,
-            rw_next: AtomicU64::new(rw_base),
+            // the first bytes stay unused: no domain symbol has the offset 0 (0 marks a static that failed)
+            rw_next: AtomicU64::new(rw_base + 64),
             rw_end: rw_base + rw_size,
             opt: crate::opt::OptCfg::from_options(options),
             env: x64::Env { slots: slots_ptr, tls_key: 0, tls_slow: 0, resume: 0, opt_regs: false, syms: 0, sym_class: 0 },
             stats: Stats::default(),
             patch_log: Vec::new(),
             patch_gen: 0,
-            tls_next: 0,
+            // slot 0 of the block: the thread's domain static block (domain.rs)
+            tls_next: TLS_FIRST_FREE,
             missing_stubs: Default::default(),
             tier1: {
                 let t = Tier1Cfg::from_options(options);
@@ -2362,7 +2371,7 @@ impl Unit {
 
     /// The symbol of the data object at `addr` (an address `data` / `lit_data` returned).
     pub fn data_sym(&self, addr: u64) -> crate::rir::Sym {
-        match self.syms.data_at(addr) {
+        match self.syms.data_at(addr).or_else(|| self.syms.rw_syms.lock().unwrap_or_else(|e| e.into_inner()).get(&addr).copied()) {
             Some(s) => s,
             None => panic!("relax: {:#x} is not the start of a data object (unsymbolised address)", addr),
         }
@@ -2471,7 +2480,9 @@ impl Unit {
         if let Some(t) = ty {
             self.syms.rw_starts.lock().unwrap_or_else(|e| e.into_inner()).insert(a, (size, t));
         }
-        self.syms.intern(crate::syms::SymKind::Rw(k), a)
+        let s = self.syms.intern(crate::syms::SymKind::Rw(k), a);
+        self.syms.rw_syms.lock().unwrap_or_else(|e| e.into_inner()).insert(a, s);
+        s
     }
 
     /// Mutable data (statics).
@@ -2516,7 +2527,7 @@ impl Unit {
         let key = tls_key();
         let off = os::tls::jit_offset(key, &|b| self.emit_code(b));
         self.env.tls_key = off;
-        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64));
+        self.env.tls_slow = self.emit_code(&x64::tls_slow(rt_tls_block as *const () as usize as u64, off));
     }
 
     pub fn site(&self, file: u32, pos: u32, msg: &str) -> u64 {
@@ -3560,6 +3571,8 @@ impl Unit {
             return None;
         }
         if let Some(a) = unsafe { crate::cache::const_value(self.self_ptr.0, d, &args) } {
+            // the cached image is the shared read-only one: per domain where it reaches a static
+            let a = crate::domain::rehome_const(self, a);
             self.put_const(d, args, a);
             return Some(a);
         }
@@ -3569,6 +3582,9 @@ impl Unit {
                     cache.record_const(self, d, &args, a);
                     self.cache = Some(cache);
                 }
+                // the cache keeps the shared read-only image; the unit uses the per-domain one
+                // where the value reaches a static (domain.rs rehome_const)
+                let a = crate::domain::rehome_const(self, a);
                 self.put_const(d, args, a);
                 Some(a)
             }
@@ -3606,6 +3622,7 @@ impl Unit {
                 }
                 let sym = self.syms.intern(crate::syms::SymKind::Static(d), a);
                 crate::sandbox::capture_initial_data(self, sym);
+                crate::domain::materialize(self, sym);
             }
             return a;
         }
@@ -3646,6 +3663,8 @@ impl Unit {
         }
         let sym = self.syms.intern(crate::syms::SymKind::Static(d), buf);
         crate::sandbox::capture_initial_data(self, sym);
+        // every other live domain gets its own copy of the new static (none: nothing to do)
+        crate::domain::materialize(self, sym);
         buf
     }
 
@@ -4143,6 +4162,13 @@ fn c_callable_hook(ctx: usize, id: u32, thunk: u64) -> u64 {
 /// Calls JIT code `entry(arg)` under a fresh recovery context. No Rust borrow of the
 /// unit may be alive across this call; `u` becomes the runtime's unit pointer.
 pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
+    // the unit's own domain (its compile domain: statics laid out, initializers run)
+    call_jit_in(u, (&*u).syms.dom0(), entry, arg)
+}
+
+/// `call_jit` in the domain whose static block is at `domain` (domain.rs): the code runs on the
+/// calling thread, whose domain comes back after the call.
+pub unsafe fn call_jit_in(u: *mut Unit, domain: u64, entry: u64, arg: u64) -> Result<u64, PanicInfo> {
     // JIT code and the runtime helpers it calls allocate in the program's heap (zone_alloc.rs)
     let _kept = crate::zone_alloc::kept();
     // the runtime's unit for this call; the previous one comes back after it (a proc-macro call
@@ -4153,7 +4179,10 @@ pub unsafe fn call_jit(u: *mut Unit, entry: u64, arg: u64) -> Result<u64, PanicI
     if sampled {
         sampler_enter((&*u).exec_base, (&*u).exec_size);
     }
+    // a nested call (into another unit's world) leaves the thread's domain as it found it
+    let prev_domain = crate::domain::enter(domain);
     let r = call_jit_inner(u, entry, arg);
+    crate::domain::enter(prev_domain);
     if sampled {
         sampler_leave();
     }
@@ -11373,6 +11402,9 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
         // relax inspect's wait registry: program lock / condvar / park waits (Relax's std sync/raw.rs)
         b"__relax_wait_enter" => Some(crate::inspect::relax_wait_enter as *const () as usize),
         b"__relax_wait_leave" => Some(crate::inspect::relax_wait_leave as *const () as usize),
+        // the domain a thread runs in (domain.rs): a thread std starts inherits its parent's
+        b"__relax_domain_base" => Some(crate::domain::relax_domain_base as *const () as usize),
+        b"__relax_domain_enter" => Some(crate::domain::relax_domain_enter as *const () as usize),
         // run-time modules (modules.rs; Relax's std::relax); the C allocator through relax
         // inspect's heap veneers (one indirect jump; tracking patches the word)
         _ => crate::inspect::heap::veneer(name).or_else(|| crate::modules::symbol(name)),

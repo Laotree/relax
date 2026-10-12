@@ -69,6 +69,7 @@ pub fn reg_config() -> RegConfig {
         flt_callee: vec![8, 9, 10, 11, 12, 13, 14, 15],
         slot_index_free: false,
         clobbers: None,
+        sym_class: 0,
     }
 }
 
@@ -618,6 +619,10 @@ struct Gen<'a> {
     vpool: Vec<(usize, u32)>,
     /// address pool: (ldr x word index, relocated value)
     apool: Vec<(usize, Reloc)>,
+    /// `Env::sym_class`: how each symbol is encoded (SymClass::Domain: an offset in the domain block)
+    sym_class: u64,
+    /// sp offset of the frame word holding the domain base (-1: the function names no domain symbol)
+    dom_slot: i64,
     relocs: Vec<RelocAt>,
     text_words: usize,
     pc_map: Vec<(u32, u64)>,
@@ -883,8 +888,18 @@ impl<'a> Gen<'a> {
         }
         off += 8 * cells;
         let stage_fp = off;
+        // the domain base, read once in the prologue when the function names a domain static
+        let dom_fp = if uses_domain(self.f, self.sym_class) {
+            off += 8;
+            off
+        } else {
+            -1
+        };
         let frame = (off + out + 15) / 16 * 16;
         self.frame = frame;
+        if dom_fp >= 0 {
+            self.dom_slot = frame - dom_fp;
+        }
         for x in slot_fp {
             self.slot_off.push(frame - x);
         }
@@ -900,6 +915,9 @@ impl<'a> Gen<'a> {
         self.stack_probe(frame);
         self.a.add_any(SP, SP, -frame);
         self.callee_saves(true);
+        if self.dom_slot >= 0 {
+            self.dom_base_prologue();
+        }
         if self.cplan.is_some() {
             self.c_prologue();
         } else {
@@ -1613,27 +1631,50 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// d = this thread's thread-local block + off. Fast path: the block pointer sits in a
-    /// word of the thread's slot array (macOS: pthread TSD slot `key` at tpidrro_el0; Android:
-    /// bionic TLS_SLOT_APP at tpidr_el0, os/tls.rs); a null slot calls `tls_slow`.
-    fn tls_addr(&mut self, d: VReg, off: Sym) {
+    /// x16 = this thread's thread-local block. Fast path: the block pointer sits in a word of
+    /// the thread's slot array (macOS: pthread TSD slot `key` at tpidrro_el0; Android: bionic
+    /// TLS_SLOT_APP at tpidr_el0, os/tls.rs); a null slot calls `tls_slow`, which keeps every
+    /// register but x16/x17 (glue), so no saves here; lr is preserved by the frame record.
+    fn tls_block_ip0(&mut self) {
         // mrs x16, <thread slot base>; and x16, x16, #~7; ldr x17, =key*8; ldr x16, [x16, x17]
         self.a.e(MRS_SLOT_BASE | IP0 as u32);
         self.a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
         self.ldr_reloc(IP1, Reloc::TlsKey);
         self.a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
         let p = self.a.cbnz(IP0);
-        // slow path keeps every register but x16/x17 (glue), so no saves here; lr is
-        // preserved by the frame record
         self.ldr_reloc(IP1, Reloc::TlsSlow);
         self.a.blr(IP1);
         let skip = self.a.pos();
         self.a.patch(p, skip);
+    }
+
+    /// d = this thread's thread-local block + off.
+    fn tls_addr(&mut self, d: VReg, off: Sym) {
+        self.tls_block_ip0();
         // the variable's offset in the block (a symbol: it is assigned per run)
         self.ldr_reloc(IP1, Reloc::Sym(off));
         let rd = self.def_i(d, S0);
         self.a.rrr(0x8B00_0000, rd, IP0, IP1);
         self.fin_i(d, rd);
+    }
+
+    /// Prologue of a function that names domain statics: the running thread's domain base
+    /// (slot 0 of its thread-local block) into the frame's domain slot, read once per call.
+    fn dom_base_prologue(&mut self) {
+        // the shared TLS routine (fast path inside), not the inline sequence: one call per entry
+        self.ldr_reloc(IP1, Reloc::TlsSlow);
+        self.a.blr(IP1);
+        // ldr x16, [x16]: the domain base
+        self.a.e(0xF940_0000 | (IP0 as u32) << 5 | IP0 as u32);
+        self.a.ldst(STRX, 8, IP0, SP, self.dom_slot);
+    }
+
+    /// rd = the running thread's domain static block + `off` (a domain symbol: the offset in
+    /// the block, assigned per run): the base the prologue stored + the offset.
+    fn dom_addr(&mut self, rd: u8, off: Sym) {
+        self.a.ldst(LDRX, 8, IP0, SP, self.dom_slot);
+        self.ldr_reloc(IP1, Reloc::Sym(off));
+        self.a.rrr(0x8B00_0000, rd, IP0, IP1);
     }
 
     /// `ldr xd, =<relocated value>` from the address pool after the code.
@@ -2870,7 +2911,11 @@ impl<'a> Gen<'a> {
             }
             Inst::Addr(d, sym) => {
                 let rd = self.def_i(*d, S0);
-                self.ldr_reloc(rd, Reloc::Sym(*sym));
+                if SymClass::of(self.sym_class, sym.id) == SymClass::Domain {
+                    self.dom_addr(rd, *sym);
+                } else {
+                    self.ldr_reloc(rd, Reloc::Sym(*sym));
+                }
                 self.fin_i(*d, rd);
             }
             Inst::FnAddr(d, id) => {
@@ -3409,7 +3454,7 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // indexed accesses with displacements on one base and index: one address register
     let shared = regalloc::share_index_bases(f);
     let f = shared.as_ref().unwrap_or(f);
-    let (split, mut al0) = regalloc::allocate_split(options, f, &reg_config(), env.opt_regs || f.full, freq);
+    let (split, mut al0) = regalloc::allocate_split(options, f, &RegConfig { sym_class: env.sym_class, ..reg_config() }, env.opt_regs || f.full, freq);
     let f = split.as_ref().unwrap_or(f);
     crate::opt::pass_time(11, t_ra);
     drop(_cost_ra);
@@ -3452,6 +3497,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         fpool: Vec::new(),
         vpool: Vec::new(),
         apool: Vec::new(),
+        sym_class: env.sym_class,
+        dom_slot: -1,
         relocs: Vec::new(),
         text_words: 0,
         pc_map: Vec::new(),
@@ -3662,10 +3709,20 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
     words_to_bytes(&a.w)
 }
 
-/// Slow path of `TlsAddr`: calls `host() -> block` and returns the block in x16,
-/// preserving every other register JIT code may hold (x0-x15, d0-d7, d16-d29).
-pub fn tls_slow(host: u64) -> Vec<u8> {
+/// This thread's thread-local block in x16, preserving every other register JIT code may hold
+/// (x0-x15, d0-d7, d16-d29): the fast path `tls_addr` inlines (slot `key` of the thread's slot
+/// array), and when the slot is still null `host() -> block`. `tls_addr` calls it after its own
+/// fast path found null; a prologue that needs the domain base calls it directly.
+pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     let mut a = Asm { w: Vec::new() };
+    // mrs x16, <slot base>; and x16, x16, #~7; mov x17, #key*8; ldr x16, [x16, x17]
+    a.e(MRS_SLOT_BASE | IP0 as u32);
+    a.e(0x9243_F000 | (IP0 as u32) << 5 | IP0 as u32);
+    a.mov_imm(IP1, (key * 8) as i64);
+    a.e(0xF860_6800 | (IP1 as u32) << 16 | (IP0 as u32) << 5 | IP0 as u32);
+    // cbz x16, +2 (past the ret): the block exists, return it
+    a.e(0xB400_0000 | 2 << 5 | IP0 as u32);
+    a.ret();
     a.stp_pre(FP, LR, SP, -16);
     a.mov_sp(FP, SP);
     a.sub_imm(SP, SP, 320);
@@ -3698,6 +3755,11 @@ pub fn tls_slow(host: u64) -> Vec<u8> {
 
 /// `read_tsd(key) -> value`: this thread's TSD slot through tpidrro_el0, exactly the
 /// sequence `tls_addr` inlines (checked against pthread_getspecific at startup).
+/// Whether `f` takes the address of a domain symbol (a static: its code reads the domain base).
+fn uses_domain(f: &Func, sym_class: u64) -> bool {
+    sym_class != 0 && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Addr(_, s) if SymClass::of(sym_class, s.id) == SymClass::Domain)))
+}
+
 /// `mrs xN, <register holding the thread's slot array>` (N or-ed in). macOS: tpidrro_el0 (the
 /// pthread TSD base; its low 3 bits carry the cpu number, masked off after). Android: tpidr_el0,
 /// bionic's thread pointer = its TLS slot array (bionic libc/platform/bionic/tls_defines.h).

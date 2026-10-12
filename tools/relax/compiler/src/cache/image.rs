@@ -1235,7 +1235,7 @@ impl Linker {
                 } else {
                     s?
                 };
-                let v = u.syms.value(s);
+                let v = u.syms.addr(s);
                 unsafe { ((addr[o] + off as u64) as *mut u64).write_unaligned(v) };
                 Some((off, s))
             }).collect()

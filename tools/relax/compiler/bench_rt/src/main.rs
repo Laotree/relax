@@ -544,13 +544,60 @@ fn splash_vm() -> u64 {
     (acc + xs.len() as f64 * 1000.0).to_bits()
 }
 
+// ---- statics: domain-local statics cost one base load per static address (domain.rs)
+static mut ST_COUNTER: u64 = 0;
+static mut ST_TABLE: [u32; 256] = [0; 256];
+
+/// A tight loop over statics in one function: the statics' addresses are computed once.
+fn statics_loop() -> u64 {
+    unsafe {
+        ST_COUNTER = 0;
+        for i in 0..256 {
+            ST_TABLE[i] = i as u32;
+        }
+        for r in 0..20_000u32 {
+            for i in 0..256usize {
+                let v = ST_TABLE[i].wrapping_mul(31).wrapping_add(ST_COUNTER as u32 ^ r);
+                ST_TABLE[i] = v;
+                ST_COUNTER = ST_COUNTER.wrapping_add(v as u64);
+            }
+        }
+        ST_COUNTER
+    }
+}
+
+#[inline(never)]
+fn st_tick(x: u32) -> u32 {
+    unsafe {
+        ST_COUNTER = ST_COUNTER.wrapping_add(x as u64);
+        let k = (x & 255) as usize;
+        ST_TABLE[k] ^= x;
+        ST_TABLE[k]
+    }
+}
+
+/// One static access per call: the worst case, every call computes the statics' addresses.
+fn statics_calls() -> u64 {
+    unsafe {
+        ST_COUNTER = 0;
+        for i in 0..256 {
+            ST_TABLE[i] = 0;
+        }
+    }
+    let mut acc = 0u64;
+    for i in 0..3_000_000u32 {
+        acc = acc.wrapping_add(st_tick(black_box(i)) as u64);
+    }
+    acc ^ unsafe { ST_COUNTER }
+}
+
 fn main() {
     let only: Vec<String> = std::env::args().skip(1).collect();
     if only.iter().any(|o| o == "shape_dump") {
         shape_dump();
         return;
     }
-    let all: [(&str, fn() -> u64); 21] = [
+    let all: [(&str, fn() -> u64); 23] = [
         ("det_trig", det_trig),
         ("det_explog", det_explog),
         ("hash_bytes", hash_bytes),
@@ -572,6 +619,8 @@ fn main() {
         ("inflate", inflate),
         ("adler32", adler32),
         ("splash_vm", splash_vm),
+        ("statics_loop", statics_loop),
+        ("statics_calls", statics_calls),
     ];
     for (n, f) in all.iter() {
         if only.is_empty() || only.iter().any(|o| o == n) {

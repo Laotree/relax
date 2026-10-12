@@ -246,6 +246,12 @@ impl Asm {
         self.byte(0x8b);
         self.modrm_mem(dst, base, disp);
     }
+    /// add dst, [base + disp] (64-bit)
+    fn add_load64(&mut self, dst: u8, base: u8, disp: i32) {
+        self.rex(true, dst, 0, base, false);
+        self.byte(0x03);
+        self.modrm_mem(dst, base, disp);
+    }
     fn store64(&mut self, base: u8, disp: i32, src: u8) {
         self.rex(true, src, 0, base, false);
         self.byte(0x89);
@@ -635,7 +641,7 @@ pub fn reg_config(options: &relax_session::Options) -> RegConfig {
         int_caller.push(RCX);
         int_caller.push(RDX);
     }
-    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers) }
+    RegConfig { int_caller, int_callee: CALLEE_SAVED.to_vec(), flt_caller: flt, flt_callee: Vec::new(), slot_index_free: true, clobbers: Some(x64_clobbers), sym_class: 0 }
 }
 
 // ------------------------------------------------------------ code generation
@@ -658,6 +664,10 @@ struct Gen<'a> {
     vpool: Vec<(usize, u32)>,
     /// address pool: (disp32 patch offset, relocated value), 8-byte entries
     apool: Vec<(usize, Reloc)>,
+    /// `Env::sym_class`: how each symbol is encoded (SymClass::Domain: an offset in the domain block)
+    sym_class: u64,
+    /// rbp offset of the frame word holding the domain base (0: the function names no domain symbol)
+    dom_slot: i32,
     relocs: Vec<RelocAt>,
     /// emission order successor of each block (u32::MAX for the last)
     next_block: Vec<u32>,
@@ -962,6 +972,11 @@ impl<'a> Gen<'a> {
         }
         off += 8 * cells;
         self.stage = -(self.saved + off);
+        // the domain base, read once in the prologue when the function names a domain static
+        if uses_domain(self.f, self.sym_class) {
+            off += 8;
+            self.dom_slot = -(self.saved + off);
+        }
         let mut frame = (off + 7) / 8 * 8;
         // keep rsp 16-aligned at calls
         while (self.saved + frame) % 16 != 0 {
@@ -970,6 +985,9 @@ impl<'a> Gen<'a> {
         self.frame = frame;
         self.stack_probe(frame);
         self.a.sub_rsp(frame as u32);
+        if self.dom_slot != 0 {
+            self.dom_base_prologue();
+        }
         if self.cplan.is_some() {
             self.win64_saves(true);
             self.c_prologue(options);
@@ -1802,9 +1820,9 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// d = this thread's thread-local block + off: `mov r11, fs:[key]` (the runtime's
-    /// static-TLS block pointer), slow path `tls_slow` when it is still null.
-    fn tls_addr(&mut self, d: VReg, off: Sym) {
+    /// r11 = this thread's thread-local block: `mov r11, fs:[key]` (the runtime's static-TLS
+    /// block pointer), slow path `tls_slow` when it is still null (keeps every register but rax/r11).
+    fn tls_block_r11(&mut self) {
         // mov rax, [rip + key]; mov r11, fs:[rax] (gs on Windows)
         self.mov_reloc(RAX, Reloc::TlsKey);
         self.a.b.extend_from_slice(&[TLS_SEG, 0x4c, 0x8b, 0x18]);
@@ -1814,11 +1832,34 @@ impl<'a> Gen<'a> {
         self.a.call_r(RAX);
         let skip = self.a.pos();
         self.a.patch(p, skip);
+    }
+
+    /// d = this thread's thread-local block + off.
+    fn tls_addr(&mut self, d: VReg, off: Sym) {
+        self.tls_block_r11();
         // the variable's offset in the block (a symbol: it is assigned per run)
         let rd = self.def_i(d, R10);
         self.mov_reloc(rd, Reloc::Sym(off));
         self.a.alu_rr(0x01, rd, R11);
         self.fin_i(d, rd);
+    }
+
+    /// Prologue of a function that names domain statics: the running thread's domain base
+    /// (slot 0 of its thread-local block) into the frame's domain slot, read once per call.
+    fn dom_base_prologue(&mut self) {
+        // the shared TLS routine (fast path inside), not the inline sequence: one call per entry
+        self.mov_reloc(RAX, Reloc::TlsSlow);
+        self.a.call_r(RAX);
+        // mov r11, [r11]: the domain base
+        self.a.load64(R11, R11, 0);
+        self.a.store64(RBP, self.dom_slot, R11);
+    }
+
+    /// rd = the running thread's domain static block + `off` (a domain symbol: the offset in
+    /// the block, assigned per run): the base the prologue stored + the offset.
+    fn dom_addr(&mut self, rd: u8, off: Sym) {
+        self.mov_reloc(rd, Reloc::Sym(off));
+        self.a.add_load64(rd, RBP, self.dom_slot);
     }
 
     /// `mov rd, [rip + pool]`: a relocated value from the address pool after the code.
@@ -2528,7 +2569,11 @@ impl<'a> Gen<'a> {
             }
             Inst::Addr(d, sym) => {
                 let rd = self.def_i(*d, R10);
-                self.mov_reloc(rd, Reloc::Sym(*sym));
+                if SymClass::of(self.sym_class, sym.id) == SymClass::Domain {
+                    self.dom_addr(rd, *sym);
+                } else {
+                    self.mov_reloc(rd, Reloc::Sym(*sym));
+                }
                 self.fin_i(*d, rd);
             }
             Inst::FnAddr(d, id) => {
@@ -4232,7 +4277,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     // compares next to the selects that read them (the cmov takes the flags)
     let sunk = if env.opt_regs || f.full { regalloc::sink_compares(f) } else { None };
     let f = sunk.as_ref().unwrap_or(f);
-    let cfg = reg_config(options);
+    let mut cfg = reg_config(options);
+    cfg.sym_class = env.sym_class;
     let _cost_ra = crate::fncost::phase(9);
     let t_ra = crate::opt::pass_clock();
     let (split, al) = regalloc::allocate_split(options, f, &cfg, env.opt_regs || f.full, freq);
@@ -4304,6 +4350,8 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
         sel_flags: None,
         vpool: Vec::new(),
         apool: Vec::new(),
+        sym_class: env.sym_class,
+        dom_slot: 0,
         relocs: Vec::new(),
         cplan: None,
         cbuf: Vec::new(),
@@ -4350,10 +4398,24 @@ pub fn jump_with_arg0(arg: u64, target: u64) -> Vec<u8> {
     a.b
 }
 
-/// Slow path of `TlsAddr`: calls `host() -> block` and returns it in r11, preserving
-/// every other register JIT code may hold. Entered with rsp = 8 mod 16.
-pub fn tls_slow(host: u64) -> Vec<u8> {
+/// Whether `f` takes the address of a domain symbol (a static: its code reads the domain base).
+fn uses_domain(f: &Func, sym_class: u64) -> bool {
+    sym_class != 0 && f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Addr(_, s) if SymClass::of(sym_class, s.id) == SymClass::Domain)))
+}
+
+/// This thread's thread-local block in r11, preserving every other register JIT code may hold:
+/// the fast path `tls_addr` inlines (`mov r11, fs:[key]`, gs on Windows), and when the cell is
+/// still null `host() -> block`. `tls_addr` calls it after its own fast path found null; a
+/// prologue that needs the domain base calls it directly. Entered with rsp = 8 mod 16.
+pub fn tls_slow(host: u64, key: u64) -> Vec<u8> {
     let mut a = Asm { b: Vec::new(), sib: None };
+    // mov r11, seg:[disp32]: modrm 00/011/100 + SIB 0x25 (no base, no index)
+    a.b.extend_from_slice(&[TLS_SEG, 0x4c, 0x8b, 0x1c, 0x25]);
+    a.u32(key as i64 as i32 as u32);
+    a.test_rr(R11, R11);
+    // jz +1 (past the ret)
+    a.b.extend_from_slice(&[0x74, 0x01]);
+    a.ret();
     a.push(RBP);
     a.mov_rr(RBP, RSP);
     let regs = [RCX, RDX, RSI, RDI, R8, R9, R10];

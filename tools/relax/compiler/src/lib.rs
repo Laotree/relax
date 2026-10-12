@@ -12,6 +12,7 @@ pub mod live;
 pub mod reload;
 pub mod modules;
 pub mod sandbox;
+pub mod domain;
 pub mod jit;
 pub mod owner;
 mod nounwind;
@@ -660,7 +661,22 @@ fn cmd_test(sess: &std::sync::Arc<crate::Session>, args: &[String]) -> i32 {
         let ts = Instant::now();
         jit::watchdog(runtime.watchdog_ms);
         let up: *mut jit::Unit = &mut *u;
-        let r = unsafe { jit::call_jit(up, entry, 0) };
+        let r = if runtime.test_domains <= 1 {
+            unsafe { jit::call_jit(up, entry, 0) }
+        } else {
+            // the same test at the same time in N domains of this unit (domain 0 + N-1 new
+            // blocks), each on its own thread: a static shared between them fails its asserts
+            let bases: Vec<u64> = std::iter::once(u.syms.dom0()).chain((1..runtime.test_domains).map(|_| crate::owner::call(crate::owner::Class::App, || crate::domain::create(&u)))).collect();
+            let upa = up as usize;
+            let rs: Vec<_> = std::thread::scope(|sc| {
+                let hs: Vec<_> = bases.iter().map(|&b| sc.spawn(move || unsafe { jit::call_jit_in(upa as *mut jit::Unit, b, entry, 0) })).collect();
+                hs.into_iter().map(|h| h.join().expect("domain test thread")).collect()
+            });
+            for &b in &bases[1..] {
+                crate::domain::destroy(b);
+            }
+            rs.into_iter().find(|r| r.is_err()).unwrap_or(Ok(0))
+        };
         jit::watchdog_done();
         let dt = ts.elapsed().as_secs_f64() * 1e3;
         if !last_round {

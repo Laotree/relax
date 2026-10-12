@@ -714,6 +714,9 @@ pub struct RuntimeOptions {
     pub module_mem_mb: u64,
     /// `RELAX_REPEAT`; default `1`.
     pub repeat: usize,
+    /// `RELAX_TEST_DOMAINS`: `relax test` runs each test at the same time in this many domains
+    /// (each its own thread and static block); default `1`.
+    pub test_domains: usize,
     /// `RELAX_WATCHDOG_MS`; default `20_000`.
     pub watchdog_ms: u64,
     /// `RELAX_O3_THREADS`; default `None`.
@@ -742,6 +745,7 @@ impl Default for RuntimeOptions {
             module_fuel: 4_000_000_000,
             module_mem_mb: 256,
             repeat: 1,
+            test_domains: 1,
             watchdog_ms: 20_000,
             tier1_threads: None,
             restore: None,
@@ -782,6 +786,7 @@ impl RuntimeOptions {
             module_fuel: { let os = get("RELAX_MODULE_FUEL"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(4_000_000_000) },
             module_mem_mb: { let os = get("RELAX_MODULE_MEM_MB"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(256) },
             repeat: { let os = get("RELAX_REPEAT"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(1) },
+            test_domains: { let os = get("RELAX_TEST_DOMAINS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 1).unwrap_or(1) },
             watchdog_ms: { let os = get("RELAX_WATCHDOG_MS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()).unwrap_or(20_000) },
             tier1_threads: { let os = get("RELAX_O3_THREADS"); let v = os.and_then(|v| v.into_string().ok()); v.and_then(|v| v.parse().ok()) },
             restore: { let os = get("RELAX_RESTORE"); let v = os.and_then(|v| v.into_string().ok()); v },

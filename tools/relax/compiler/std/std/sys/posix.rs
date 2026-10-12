@@ -201,9 +201,18 @@ pub type NativeThread = pthread_t;
 struct StartArg {
     f: fn(*mut u8),
     arg: *mut u8,
+    /// the starting thread's domain static block (relax domain.rs): the new thread runs in it
+    domain: u64,
+}
+
+extern "C" {
+    fn __relax_domain_base() -> u64;
+    fn __relax_domain_enter(base: u64);
 }
 
 extern "C" fn posix_thread_start(p: *mut c_void) -> *mut c_void {
+    // first, before anything that may name a static
+    unsafe { __relax_domain_enter((*(p as *const StartArg)).domain) };
     let a = unsafe { alloc::boxed::Box::from_raw(p as *mut StartArg) };
     (a.f)(a.arg);
     core::ptr::null_mut()
@@ -211,7 +220,7 @@ extern "C" fn posix_thread_start(p: *mut c_void) -> *mut c_void {
 
 /// Starts a thread running `f(arg)` with a stack of at least `stack_size` bytes; Err(os error).
 pub fn spawn_thread(stack_size: usize, f: fn(*mut u8), arg: *mut u8) -> Result<NativeThread, i32> {
-    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg })) as *mut c_void;
+    let start = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(StartArg { f, arg, domain: unsafe { __relax_domain_base() } })) as *mut c_void;
     let mut native: pthread_t = 0;
     let mut attr = pthread_attr_t { storage: [0; 8] };
     unsafe {
