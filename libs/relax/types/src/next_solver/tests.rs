@@ -1416,3 +1416,21 @@ fn round50_resolve_weak_candidate_pairing() {
     assert_eq!(entered, finished, "unpaired native solver candidates");
     eprintln!("resolve_weak: {entered} candidate entries, {finished} finishes");
 }
+
+#[test]
+fn drop_glue_of_a_type_parameter_is_too_generic_not_unmet() {
+    // rustc_ty_utils instance.rs: a type that may need drop but is no ADT/tuple/closure/... (a
+    // parameter, a projection) resolves to Ok(None) -- too generic -- not an unmet obligation
+    // (borrowck's resolve_trait_method turned Unimplemented into a delayed bug: the
+    // `resolving core::ptr::drop_in_place failed` ICE on every generic drop_in_place::<T>)
+    use crate::next_solver::codegen::CodegenObligationError;
+    let (p, t) = program(r#"#[lang = "drop_glue"] fn drop_in_place<T>(_: *mut T) {} fn generic<T>() {}"#, "dropglue_param");
+    let glue = named(&p, "drop_in_place");
+    assert_eq!(t.lang_items.get(crate::lang_items::LangItem::DropGlue), Some(glue));
+    let generic = named(&p, "generic");
+    let env = crate::tcx::TypingEnv { limit: Default::default(), param_env: t.intern_param_env(ParamEnv { clauses: t.clauses_of(&p, generic).into() }), mode: TypingMode::non_body_analysis() };
+    let param = t.tys.intern(TyKind::Param(0));
+    assert_eq!(t.resolve_instance_raw(&p, env, glue, &[param]), Err(CodegenObligationError::Ambiguity));
+    // a type without drop glue still resolves (the trivial glue)
+    assert!(t.resolve_instance_raw(&p, crate::tcx::TypingEnv::fully_monomorphized(&p), glue, &[t.tys.u8_]).is_ok());
+}

@@ -38,7 +38,10 @@ impl Tcx {
             let ty = if self.needs_drop(prog, typing_env, ty) {
                 match self.tys.kind(ty) {
                     TyKind::Closure(..) | TyKind::Tuple(..) | TyKind::Adt(..) | TyKind::Dyn(..) | TyKind::Array(..) | TyKind::Slice(..) => Some(ty),
-                    _ => return Err(CodegenObligationError::Unimplemented),
+                    // rustc instance.rs:61 "Drop shims can only be built from ADTs": `return Ok(None)`,
+                    // too generic to resolve (a type parameter or projection that may need drop) --
+                    // not an unmet obligation (a generic body's `drop_in_place::<T>` was a delayed bug)
+                    _ => return Err(CodegenObligationError::Ambiguity),
                 }
             } else { None };
             InstanceKind::Shim(ShimKind::DropGlue(def, ty))
