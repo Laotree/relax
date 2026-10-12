@@ -226,10 +226,12 @@ impl V<'_> {
                 _ => { known = false; break; }
             };
         }
+        // the base type is known: a tuple or struct field is no union field
         if known {
-            if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(t) {
-                return self.tcx.adts.get(d).is_some_and(|a| a.is_union);
-            }
+            return match self.tcx.tys.kind(t) {
+                TyKind::Adt(d, _, _) => self.tcx.adts.get(d).is_some_and(|a| a.is_union),
+                _ => false,
+            };
         }
         // through an overloaded deref: the ADT the body names this field of
         let name = name.map(|n| self.pf.text(n));
