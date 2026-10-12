@@ -405,6 +405,27 @@ pub fn live_total() -> i64 {
     TOTAL.live.load(Relaxed)
 }
 
+/// The process's physical footprint in bytes where the OS reports one (macOS `phys_footprint`,
+/// the figure Activity Monitor shows: resident private memory plus compressed); None elsewhere.
+pub fn footprint() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            static mach_task_self_: u32;
+            fn task_info(task: u32, flavor: i32, info: *mut u64, count: *mut u32) -> i32;
+        }
+        // TASK_VM_INFO (22), rev0 count = 38 natural_t: phys_footprint @144
+        let mut buf = [0u64; 24];
+        let mut count: u32 = 38;
+        let r = unsafe { task_info(mach_task_self_, 22, buf.as_mut_ptr(), &mut count) };
+        if r == 0 { Some(buf[18]) } else { None }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The process's resident size in bytes, cheaply: no allocator statistics (process_rss's
 /// mallinfo2 walks every malloc arena -- Linux, the monitor thread's 500 ms growth check spent
 /// ~0.4 of a core in it under the sandbox game leap; macOS's malloc_zone_statistics walks the

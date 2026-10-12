@@ -684,15 +684,15 @@ fn lookup_loaded(ident: u64) -> Option<u32> {
 
 // ---- measurements
 
-/// (resident set, proportional set) of the process in KB (0 where /proc has none).
+/// (resident set, proportional set) of the process in KB. Linux: /proc (statm, smaps_rollup);
+/// macOS: the resident size and, as the proportional figure, the physical footprint (task_info,
+/// what Activity Monitor shows); 0 where neither exists.
 pub fn process_memory_kb() -> (u64, u64) {
-    let rss = std::fs::read_to_string("/proc/self/statm")
-        .ok()
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
-        .map_or(0, |pages| pages * 4);
+    let rss = crate::memstat::resident() / 1024;
     let pss = std::fs::read_to_string("/proc/self/smaps_rollup")
         .ok()
         .and_then(|s| s.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok())))
+        .or_else(|| crate::memstat::footprint().map(|b| b / 1024))
         .unwrap_or(0);
     (rss, pss)
 }
@@ -761,6 +761,11 @@ pub fn process_breakdown() -> String {
             out.push_str("| anon regions rss/size: ");
             for (rss, size, range) in anon.iter().take(24) { out.push_str(&format!("{rss}/{size}@{} ", range.split('-').next().unwrap_or(""))); }
         }
+    }
+    // elsewhere the OS's own figures (macOS: physical footprint, compressed, malloc zones)
+    #[cfg(not(target_os = "linux"))]
+    {
+        out.push_str(&crate::memstat::process_rss().2);
     }
     out
 }
