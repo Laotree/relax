@@ -156,10 +156,10 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
 
-    // Desktop Linux and macOS always use the HAL. Linux shell selection
-    // (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
+    // Apple targets (macOS, iOS, tvOS) and desktop Linux always use the HAL. Linux shell
+    // selection (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
     let desktop_linux = target_os == "linux";
-    let hal = target_os == "macos" || target_os == "android" || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
+    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android") || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
         println!("cargo:rustc-cfg=hal");
     }
@@ -178,21 +178,16 @@ fn main() {
     }
 
     match target_os.as_str() {
+        // the frameworks are linked by the HAL's and the Apple bindings' own `#[link]`s
         "ios" => {
             if target == "aarch64-apple-ios-sim" {
                 println!("cargo:rustc-cfg=apple_sim");
             }
-            println!("cargo:rustc-link-lib=framework=MetalKit");
-            println!("cargo:rustc-link-lib=framework=GameController");
-            println!("cargo:rustc-link-lib=framework=CoreLocation");
-            println!("cargo:rustc-link-lib=framework=AudioToolbox");
         }
         "tvos" => {
             if target == "aarch64-apple-tvos-sim" {
                 println!("cargo:rustc-cfg=apple_sim");
             }
-            println!("cargo:rustc-link-lib=framework=MetalKit");
-            println!("cargo:rustc-link-lib=framework=GameController");
         }
         "android" => {
             println!("cargo:rustc-cfg=use_gles_3");
