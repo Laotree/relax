@@ -1603,6 +1603,12 @@ unsafe fn unwind_walk(regs: *const u64) -> ! {
         if fp == 0 || fp & 7 != 0 {
             break;
         }
+        // the threaded interpreter's call boundary: a frame with a landing that hands the unwind
+        // to the interpreter (it runs the interpreted frames' cleanups, then resumes here)
+        if let Some((land_pc, sp_below)) = relax_codegen::interp::unwind_boundary(ret) {
+            target = Some((fp, fp - sp_below, land_pc));
+            break;
+        }
         let pc = ret.wrapping_sub(1);
         let Some((start, _, _)) = tables.entry_at(pc) else { break };
         let image_info;

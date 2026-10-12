@@ -24,9 +24,14 @@
 //! Selection: `MAKEPAD_RUN_INTERP=all` or a comma list of name substrings (`MAKEPAD_RUN_INTERP_SKIP` for
 //! exclusions). Functions using operations this prototype does not cover stay native (counted:
 //! `MAKEPAD_RUN_INTERP_STATS=1` prints a summary at exit).
-//! Not covered: unwinding through interpreted frames (a panic below one cuts back to the
-//! recovery point without running the interpreted frames' cleanups), most lane-typed vector
-//! ops (`VX`, `VX3`), x86-only instructions.
+//! Unwinding: a panic below an interpreted frame lands in `relax_interp_call` (the runtime's
+//! unwinder treats its return address as a frame with a landing, `unwind_boundary`); the call
+//! returns 1, the interpreter continues at the call's `Invoke` unwind block (the cleanup pad) or
+//! ends the frame as unwinding, `Term::Resume` does the same, and an interpreted function entered
+//! from native code that ends unwinding re-raises in its native caller through the runtime's
+//! resume (the entry glue restores the caller's frame first). Drop order equals the JIT's and
+//! rustc's (bench_rt/interp/unwind_cmp.py).
+//! Not covered: the lane-typed vector ops (`VX`, `VX3`), x86-only instructions.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -49,6 +54,9 @@ pub struct Cx {
     pub limit: *mut u64,
     /// this thread's thread-local block (0 = not asked yet)
     pub tls_block: u64,
+    /// set when the function that just ended did so by unwinding (a panic passed through it after
+    /// its cleanups ran); whoever ran it clears it
+    pub unwinding: u64,
     /// dispatch counts (builds with MAKEPAD_RUN_INTERP_COUNT set at compile time): handlers run,
     /// interpreted -> interpreted calls, interpreted -> native calls, native -> interpreted entries
     pub n: [u64; 4],
@@ -138,11 +146,21 @@ std::arch::global_asm!(
     "  mov x1, sp",
     "  add x2, x29, #16",
     "  bl {enter}",
+    "  cbnz x0, 5f",
     "  ldp x0, x1, [sp, #0]",
     "  ldp q0, q1, [sp, #64]",
     "  mov sp, x29",
     "  ldp x29, x30, [sp], #16",
     "  ret",
+    // the interpreted function unwound: continue the unwind in the native caller, as if the
+    // call it made had raised (the runtime's resume walks on from x29/x30 = the caller's
+    // frame and return address; every callee-saved register still holds the caller's value)
+    "5:",
+    "  bl {resume_target}",
+    "  mov x16, x0",
+    "  mov sp, x29",
+    "  ldp x29, x30, [sp], #16",
+    "  br x16",
     "",
     // relax_interp_call(target, regs, stack, nstack_words)
     ".p2align 2",
@@ -176,12 +194,23 @@ std::arch::global_asm!(
     "  ldp x4, x5, [x20, #32]",
     "  ldp x6, x7, [x20, #48]",
     "  blr x19",
+    // the return address the runtime's unwinder recognises as this boundary frame
+    concat!(".globl ", gsym!("relax_interp_call_ret")),
+    concat!(gsym!("relax_interp_call_ret"), ":"),
     "  stp x0, x1, [x20, #0]",
     "  stp q0, q1, [x20, #64]",
+    "  mov x0, #0",
+    "6:",
     "  sub sp, x29, #16",
     "  ldp x19, x20, [sp], #16",
     "  ldp x29, x30, [sp], #16",
     "  ret",
+    // landing: a panic unwound out of the callee; the unwinder restored x19..x28, d8..d15 and
+    // x29 (this frame) -- return 1 to the interpreter, which runs the interpreted cleanups
+    concat!(".globl ", gsym!("relax_interp_call_land")),
+    concat!(gsym!("relax_interp_call_land"), ":"),
+    "  mov x0, #1",
+    "  b 6b",
     "",
     // relax_interp_tls(glue): the backends' tls_slow glue returns the block in x16
     ".p2align 2",
@@ -194,11 +223,15 @@ std::arch::global_asm!(
     "  ldp x29, x30, [sp], #16",
     "  ret",
     enter = sym relax_interp_enter,
+    resume_target = sym resume_target,
 );
 
 extern "C" {
     static relax_interp_pool: u8;
-    fn relax_interp_call(target: u64, regs: *mut u64, stack: *const u64, nstack: u64);
+    /// 0: returned; 1: a panic unwound out of the callee (landed at the boundary)
+    fn relax_interp_call(target: u64, regs: *mut u64, stack: *const u64, nstack: u64) -> u64;
+    static relax_interp_call_ret: u8;
+    static relax_interp_call_land: u8;
     fn relax_interp_tls(glue: u64) -> u64;
 }
 
@@ -214,6 +247,28 @@ const RB_WORDS: usize = 26;
 static FUNCS: [AtomicPtr<IFunc>; POOL] = [const { AtomicPtr::new(std::ptr::null_mut()) }; POOL];
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 static TLS_GLUE: AtomicU64 = AtomicU64::new(0);
+/// the runtime's resume (`Env::resume`): continues an unwind from the frame that calls it
+static RESUME: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn resume_target() -> u64 {
+    RESUME.load(Ordering::Relaxed)
+}
+
+/// The runtime's unwinder asks this for a frame it does not know: `ret` is the frame's return
+/// address. The interpreter's call boundary (`relax_interp_call`) is a frame with a landing:
+/// `Some((landing pc, sp below the frame pointer))`. The landing returns 1 from the call, and the
+/// interpreter runs the interpreted frames' cleanups (their `Invoke` unwind blocks) itself.
+pub fn unwind_boundary(ret: u64) -> Option<(u64, u64)> {
+    if !cfg!(target_arch = "aarch64") {
+        return None;
+    }
+    unsafe {
+        if ret == &relax_interp_call_ret as *const u8 as u64 {
+            return Some((&relax_interp_call_land as *const u8 as u64, 16));
+        }
+    }
+    None
+}
 static SLOTS: AtomicUsize = AtomicUsize::new(0);
 /// MAKEPAD_RUN_INTERP_TRACE: every entry and native call to stderr (debugging the prototype)
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -233,7 +288,7 @@ pub fn note_native(ns: u64, bytes: u64, insts: u64) {
     NATIVE[2].fetch_add(bytes, Ordering::Relaxed);
     NATIVE[3].fetch_add(insts, Ordering::Relaxed);
     if NATIVE[0].fetch_add(1, Ordering::Relaxed) % 2000 == 1999 {
-        eprintln!("relax-native: {} fns compiled to machine code ({} RIR insts -> {} KB, backend {:.1} ms)", NATIVE[0].load(Ordering::Relaxed), NATIVE[3].load(Ordering::Relaxed), NATIVE[2].load(Ordering::Relaxed) / 1024, NATIVE[1].load(Ordering::Relaxed) as f64 / 1e6);
+        eprintln!("makepad-run native: {} fns compiled to machine code ({} RIR insts -> {} KB, backend {:.1} ms)", NATIVE[0].load(Ordering::Relaxed), NATIVE[3].load(Ordering::Relaxed), NATIVE[2].load(Ordering::Relaxed) / 1024, NATIVE[1].load(Ordering::Relaxed) as f64 / 1e6);
     }
 }
 static REFUSALS: std::sync::Mutex<Vec<(String, u64)>> = std::sync::Mutex::new(Vec::new());
@@ -268,7 +323,7 @@ extern "C" fn print_stats() {
         eprintln!("relax-interp ops: {}", by.iter().take(24).map(|(n, c)| format!("{} {:.1}%", n, 100.0 * *c as f64 / total as f64)).collect::<Vec<_>>().join(", "));
     }
     eprintln!(
-        "relax-interp: {} fns interpreted ({} RIR insts -> {} KB threaded code, lowered in {:.1} ms), {} stayed native{}",
+        "makepad-run interp: {} fns interpreted ({} RIR insts -> {} KB threaded code, lowered in {:.1} ms), {} stayed native{}",
         N_INTERP.load(Ordering::Relaxed),
         N_INSTS.load(Ordering::Relaxed),
         N_WORDS.load(Ordering::Relaxed) * 8 / 1024,
@@ -306,7 +361,7 @@ fn selection() -> Option<&'static Sel> {
 
 /// The backends' hook: `Some(code)` when `f` runs in the interpreter -- the slot's code is then
 /// a jump to the function's entry thunk.
-pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64) -> Option<Vec<u8>> {
+pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_slow: u64, resume: u64) -> Option<Vec<u8>> {
     let sel = selection()?;
     // a pattern matches a name containing it; `=name` matches that name only
     let m = |p: &String| match p.strip_prefix('=') {
@@ -335,6 +390,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
         return None;
     }
     TLS_GLUE.store(tls_slow, Ordering::Relaxed);
+    RESUME.store(resume, Ordering::Relaxed);
     SLOTS.store(slots.0 as usize, Ordering::Relaxed);
     if N_INTERP.fetch_add(1, Ordering::Relaxed) % 2000 == 1999 && std::env::var_os("MAKEPAD_RUN_INTERP_STATS").is_some() {
         print_stats();
@@ -350,7 +406,7 @@ pub fn maybe_compile(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64, tls_s
 const STACK_WORDS: usize = 8 << 20; // 64 MB of interpreter stack per thread (reserved lazily)
 
 thread_local! {
-    static CX: std::cell::UnsafeCell<Cx> = const { std::cell::UnsafeCell::new(Cx { ret: [0; 6], top: std::ptr::null_mut(), limit: std::ptr::null_mut(), tls_block: 0, n: [0; 4] }) };
+    static CX: std::cell::UnsafeCell<Cx> = const { std::cell::UnsafeCell::new(Cx { ret: [0; 6], top: std::ptr::null_mut(), limit: std::ptr::null_mut(), tls_block: 0, unwinding: 0, n: [0; 4] }) };
 }
 
 #[inline(always)]
@@ -366,7 +422,7 @@ unsafe fn cx_ptr() -> *mut Cx {
         #[cfg(not(target_vendor = "apple"))]
         const MAP_ANON: i32 = 0x20;
         let p = mmap(std::ptr::null_mut(), STACK_WORDS * 8, 3, 0x0002 | MAP_ANON, -1, 0) as *mut u64;
-        assert!(!p.is_null() && p as isize != -1, "relax-interp: no memory for the interpreter stack");
+        assert!(!p.is_null() && p as isize != -1, "makepad-run interp: no memory for the interpreter stack");
         (*cx).top = p;
         (*cx).limit = p.add(STACK_WORDS);
     }
@@ -376,7 +432,7 @@ unsafe fn cx_ptr() -> *mut Cx {
 #[inline(never)]
 #[cold]
 fn overflow() -> ! {
-    eprintln!("relax-interp: interpreter stack overflow");
+    eprintln!("makepad-run interp: interpreter stack overflow");
     std::process::abort()
 }
 
@@ -388,7 +444,9 @@ unsafe fn run(f: &IFunc, fp: *mut u64, cx: *mut Cx) {
 
 /// Native -> interpreted (the pool's common entry).
 #[no_mangle]
-unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8) {
+/// Returns 0, or 1 when the function ended by unwinding (the entry glue continues the unwind in
+/// the native caller).
+unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8) -> u64 {
     let f = &*FUNCS[k as usize].load(Ordering::Acquire);
     let cx = cx_ptr();
     if TRACE.load(Ordering::Relaxed) {
@@ -475,6 +533,11 @@ unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8
         }
         hist_flush();
     }
+    if (*cx).unwinding != 0 {
+        (*cx).unwinding = 0;
+        (*cx).top = fp;
+        return 1;
+    }
     let r = &(*cx).ret;
     match &f.cplan {
         Some((_, plan, _, retbuf)) if matches!(plan.ret, RetPlan::Parts(_)) => {
@@ -502,6 +565,7 @@ unsafe extern "C" fn relax_interp_enter(k: u32, regs: *mut u64, stack: *const u8
         }
     }
     (*cx).top = fp;
+    0
 }
 
 // ---------------------------------------------------------------- handlers
@@ -1620,12 +1684,8 @@ unsafe extern "C" fn h_ret(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
         }
     }
 }
-unsafe extern "C" fn h_trap(pc: *const u64, _fp: *mut u64, _cx: *mut Cx) {
-    let what = match *pc.add(1) {
-        0 => "unreachable code",
-        _ => "unwinding resumed in interpreted code (not supported by the prototype)",
-    };
-    eprintln!("relax-interp: {}", what);
+unsafe extern "C" fn h_trap(_pc: *const u64, _fp: *mut u64, _cx: *mut Cx) {
+    eprintln!("makepad-run interp: reached unreachable code");
     std::process::abort();
 }
 
@@ -1705,17 +1765,32 @@ unsafe fn resolve(d: &CallDesc, word: u64) -> *const IFunc {
     f
 }
 
-/// [h, desc]
+/// [h, desc, unwind block or 0]
 unsafe extern "C" fn h_call(pc: *const u64, fp: *mut u64, cx: *mut Cx) {
     let d = &*(*pc.add(1) as *const CallDesc);
-    do_call(d, fp, cx);
-    next!(pc.add(2), fp, cx)
+    if do_call(d, fp, cx) {
+        // the callee unwound: this frame's cleanup pad (the call's Invoke unwind edge), or,
+        // with none, this frame unwinds too
+        let pad = *pc.add(2);
+        if pad != 0 {
+            next!(pad as *const u64, fp, cx)
+        }
+        (*cx).unwinding = 1;
+        return;
+    }
+    next!(pc.add(3), fp, cx)
+}
+
+/// Term::Resume: the cleanup pad is done; the frame unwinds into its caller
+unsafe extern "C" fn h_resume(_pc: *const u64, _fp: *mut u64, cx: *mut Cx) {
+    (*cx).unwinding = 1;
 }
 
 /// Out of line: the handler that calls it keeps no frame, so its jump to the next handler stays
 /// a tail call (an inlined call frame turned it into call + return: native stack growth per call).
+/// true: the callee unwound (results undefined)
 #[inline(never)]
-unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
+unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) -> bool {
     let word = match d.target {
         Target::Table(t) => *(t as *const u64),
         Target::Cell(k) => *fp.add(k as usize),
@@ -1746,6 +1821,10 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
             }
             run(f, fp2, cx);
             (*cx).top = saved_top;
+            if (*cx).unwinding != 0 {
+                (*cx).unwinding = 0;
+                return true;
+            }
             let (mut ni, mut nf) = (0usize, 0usize);
             for &(cell, cls) in &d.rets {
                 let dst = fp.add(cell as usize);
@@ -1760,7 +1839,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
                     nf += 1;
                 }
             }
-            return;
+            return false;
         }
     }
     // interpreted -> native through the call glue; native code that calls back into the
@@ -1794,7 +1873,10 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
                     nstack += 1;
                 }
             }
-            relax_interp_call(word, regs.as_mut_ptr(), stack.as_ptr(), nstack as u64);
+            if relax_interp_call(word, regs.as_mut_ptr(), stack.as_ptr(), nstack as u64) != 0 {
+                (*cx).top = saved_top;
+                return true;
+            }
             let (mut ni, mut nf) = (0usize, 0usize);
             for &(cell, cls) in &d.rets {
                 let dst = fp.add(cell as usize);
@@ -1841,7 +1923,10 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
             if matches!(plan.ret, RetPlan::Indirect) {
                 regs[RB_X8] = ret_addr;
             }
-            relax_interp_call(word, regs.as_mut_ptr(), stack.as_ptr(), nstack as u64);
+            if relax_interp_call(word, regs.as_mut_ptr(), stack.as_ptr(), nstack as u64) != 0 {
+                (*cx).top = saved_top;
+                return true;
+            }
             match &plan.ret {
                 RetPlan::Parts(parts) => {
                     for p in parts {
@@ -1874,6 +1959,7 @@ unsafe fn do_call(d: &CallDesc, fp: *mut u64, cx: *mut Cx) {
         }
     }
     (*cx).top = saved_top;
+    false
 }
 
 // ---------------------------------------------------------------- lowering RIR -> threaded code
@@ -1888,6 +1974,8 @@ struct Lw<'a> {
     frame_words: usize,
     /// counting builds: the RIR operation being lowered
     cur: String,
+    /// the unwind block of the call being lowered (it ends an Invoke block)
+    unwind_to: Option<u32>,
 }
 
 fn mem_load_kind(m: Mem) -> u8 {
@@ -2110,7 +2198,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
         }
     }
     let preload: Vec<(u32, u64)> = (0..f.vregs.len()).filter(|v| hoist[*v]).filter_map(|v| konst[v].flatten().map(|k| (v as u32, k as u64))).collect();
-    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new() };
+    let mut l = Lw { f, code: Vec::new(), fix: Vec::new(), cell, slot_off, frame_words, cur: String::new(), unwind_to: None };
     let mut block_at = vec![0usize; f.blocks.len()];
     if !preload.is_empty() {
         let mut ws = vec![preload.len() as u64];
@@ -2152,6 +2240,11 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
                     l.cur = "Mov".into();
                 }
             }
+            // the call that ends an Invoke block continues at the unwind block when it unwinds
+            l.unwind_to = match (&b.term, k + 1 == ni) {
+                (Term::Invoke(_, u), true) => Some(*u),
+                _ => None,
+            };
             lower_inst(&mut l, i, slots, sym_class, &sym_val)?;
         }
         if COUNT {
@@ -2225,8 +2318,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
                     l.emit(h_ret, &ws);
                 }
             }
-            // the call is the block's last instruction; the unwind edge is not taken by the
-            // prototype (a panic below cuts back to the recovery point)
+            // the call is the block's last instruction (its unwind edge is in the call's word)
             Term::Invoke(t, _) => {
                 if *t as usize != bi + 1 {
                     l.emit(h_jump, &[]);
@@ -2234,7 +2326,7 @@ fn lower(f: &Func, slots: SlotsPtr, syms: u64, sym_class: u64) -> Result<IFunc, 
                 }
             }
             Term::Unreachable => l.emit(h_trap, &[0]),
-            Term::Resume => l.emit(h_trap, &[1]),
+            Term::Resume => l.emit(h_resume, &[]),
         }
     }
     let mut code = l.code.into_boxed_slice();
@@ -2432,6 +2524,10 @@ fn lower_inst(l: &mut Lw, i: &Inst, slots: SlotsPtr, sym_class: u64, sym_val: &d
                 ic: AtomicPtr::new(std::ptr::null_mut()),
             });
             l.emit(h_call, &[Box::into_raw(d) as u64]);
+            match l.unwind_to {
+                Some(u) => l.target(u),
+                None => l.code.push(0),
+            }
         }
         Inst::AtomicLoad(m, ord, d, a) => {
             let _ = ord;
