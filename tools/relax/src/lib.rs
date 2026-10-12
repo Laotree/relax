@@ -420,6 +420,14 @@ pub fn run_checkout(opts: Vec<String>, rest: Vec<String>) -> i32 {
 }
 
 fn boot_package(opts: Vec<String>, rest: Vec<String>) -> i32 {
+    // an embedder's boot thread (the Android host) compiles like the loader's main thread: the
+    // allocations go to the compiler arena, std's mpmc context is entered in the kept heap first
+    {
+        let _k = relax_compiler::zone_alloc::kept();
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let _ = rx.recv_timeout(std::time::Duration::ZERO);
+    }
+    let _phase = relax_compiler::zone_alloc::compiler();
     provided();
     let mut a = opts;
     a.extend(rest);
