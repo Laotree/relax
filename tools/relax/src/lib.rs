@@ -74,6 +74,7 @@ fn same_binary(a: &std::path::Path, b: &std::path::Path) -> bool {
 
 /// The loader's command line: `std::env::args` of this process.
 pub fn main() {
+    relax_compiler::memstat::tune_malloc();
     run(relax_compiler::os::proc::args_bytes())
 }
 
@@ -81,6 +82,7 @@ pub fn main() {
 /// loader's executable (the Android host library in an Activity's process): `exe` is Relax's own
 /// executable, which build scripts and `RELAX_LOADER` programs run as.
 pub fn init_embedded(exe: &std::path::Path) {
+    relax_compiler::memstat::tune_malloc();
     relax_compiler::unitgraph::set_self_exe(exe.to_path_buf());
     // the program's argv[0] / current_exe: the embedder has no command line of its own
     {

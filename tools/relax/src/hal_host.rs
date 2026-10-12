@@ -103,11 +103,13 @@ fn report_stop(id: domain::DomainId) {
         "relax-domain-stop: id={id} pkg={} state={:?} threads={} arena_in_use={} arena_committed={} static_committed={} freed_by_teardown={} rss_kb={rss} pss_kb={pss}",
         i.package, i.state, i.threads, i.arena_in_use, i.arena_committed, i.static_committed, domain::freed_by_teardown()
     );
+    eprintln!("relax-domain-stop-heaps: id={id} {}", domain::process_breakdown());
     // the process's memory once the stop's own work and the next frames have settled
     let _ = std::thread::Builder::new().name(format!("domain-report-{id}")).spawn(move || {
         std::thread::sleep(Duration::from_secs(8));
         let (rss, pss) = domain::process_memory_kb();
         eprintln!("relax-domain-after-stop: id={id} 8s later rss_kb={rss} pss_kb={pss}");
+        eprintln!("relax-domain-after-stop-heaps: id={id} {}", domain::process_breakdown());
     });
 }
 

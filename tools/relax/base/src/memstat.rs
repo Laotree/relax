@@ -714,6 +714,23 @@ pub fn note_big(kind: &str, name: &str, s: PeakScope, what: impl FnOnce() -> Str
     }
 }
 
+/// glibc malloc keeps freed memory at the top of each thread arena until the top exceeds the trim
+/// threshold, which grows by itself (to 32 MB) whenever a large mapped block is freed. With the
+/// compiler's and the apps' threads each using an arena, a domain's start/stop cycles left ~5 MB
+/// per cycle of such free-but-resident tops (and `malloc_trim` does not release an arena's top).
+/// A fixed 1 MB threshold (which also turns the dynamic adjustment off) returns them as they
+/// are freed. Call once at process start, before threads exist. Other platforms: nothing.
+pub fn tune_malloc() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_TRIM_THRESHOLD: i32 = -1;
+        unsafe { mallopt(M_TRIM_THRESHOLD, 1 << 20) };
+    }
+}
+
 /// Returns the malloc allocator's free pages to the system (glibc malloc_trim; macOS zone
 /// pressure relief).
 pub fn trim() {

@@ -572,6 +572,9 @@ fn teardown(id: DomainId) {
         drop(heap);
     }
     drop((args, threads, crates));
+    // The process heap keeps what the domain's threads freed in their malloc arenas (free but
+    // held, growing every cycle): hand it back before the stop completes.
+    crate::memstat::trim();
     let mut ds = domains();
     let d = ds.iter_mut().find(|d| d.info.id == id).expect("reclaiming domain");
     d.thread_done = true;
@@ -692,6 +695,74 @@ pub fn process_memory_kb() -> (u64, u64) {
         .and_then(|s| s.lines().find(|l| l.starts_with("Pss:")).and_then(|l| l.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok())))
         .unwrap_or(0);
     (rss, pss)
+}
+
+/// Where the process's memory sits, for the stop report: glibc malloc (in use / free but held /
+/// mmapped), thread count, and the proportional set by mapping kind (the biggest ones).
+pub fn process_breakdown() -> String {
+    let mut out = String::new();
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct MallInfo2 { arena: usize, ordblks: usize, smblks: usize, hblks: usize, hblkhd: usize, usmblks: usize, fsmblks: usize, uordblks: usize, fordblks: usize, keepcost: usize }
+        extern "C" { fn mallinfo2() -> MallInfo2; }
+        let m = unsafe { mallinfo2() };
+        let kb = |x: usize| x / 1024;
+        out.push_str(&format!("malloc_kb: arena={} in_use={} free_held={} mmapped={} | ", kb(m.arena), kb(m.uordblks), kb(m.fordblks), kb(m.hblkhd)));
+        let (cc, cl, _) = crate::zone_alloc::compiler_stats();
+        let (touched, slots, large, _) = crate::zone_alloc::compiler_detail();
+        out.push_str(&format!("compiler_zone_kb: committed={} live={} small_touched={} small_slots={} large={} | ", cc / 1024, cl / 1024, touched / 1024, slots / 1024, large / 1024));
+        let up = crate::run::running_unit();
+        if !up.is_null() {
+            let u = unsafe { &*up };
+            out.push_str(&format!("unit: fns={} bodies={} consts={} statics={} body_deps={} files={} crates={} | ", u.fns.len(), u.bodies.len(), u.consts.len(), u.statics.len(), u.body_deps.len(), u.prog.files.len(), u.prog.crates.len()));
+        }
+        let threads = std::fs::read_to_string("/proc/self/status").ok()
+            .and_then(|s| s.lines().find(|l| l.starts_with("Threads:")).and_then(|l| l.split_whitespace().nth(1).map(str::to_string)))
+            .unwrap_or_default();
+        let roll = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default();
+        let field = |n: &str| roll.lines().find(|l| l.starts_with(n)).and_then(|l| l.split_whitespace().nth(1).map(str::to_string)).unwrap_or_default();
+        out.push_str(&format!("threads={threads} anon_kb={} file_rss_kb={} | pss_kb/size_kb x count by mapping: ", field("Anonymous:"), field("Rss:").parse::<u64>().unwrap_or(0).saturating_sub(field("Anonymous:").parse::<u64>().unwrap_or(0))));
+        if let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") {
+            let mut by: std::collections::HashMap<String, (u64, u64, u32)> = Default::default();
+            let mut cur = String::new();
+            // the unnamed anonymous regions (malloc arenas, thread stacks): size/resident kB, biggest resident first
+            let mut anon: Vec<(u64, u64, String)> = Vec::new();
+            let mut cur_size = 0u64;
+            let mut cur_range = String::new();
+            for l in smaps.lines() {
+                let first = l.split_whitespace().next().unwrap_or("");
+                if first.contains('-') && !first.ends_with(':') {
+                    let mut it = l.split_whitespace();
+                    let range = it.next().unwrap_or("");
+                    let name = it.nth(4).unwrap_or("[anon]");
+                    let (a, b) = range.split_once('-').unwrap_or(("0", "0"));
+                    let size = u64::from_str_radix(b, 16).unwrap_or(0).saturating_sub(u64::from_str_radix(a, 16).unwrap_or(0)) / 1024;
+                    cur = name.rsplit('/').next().unwrap_or(name).to_string();
+                    cur_size = size;
+                    cur_range = range.to_string();
+                    let e = by.entry(cur.clone()).or_default();
+                    e.1 += size;
+                    e.2 += 1;
+                } else if let Some(v) = l.strip_prefix("Pss:") {
+                    let pss: u64 = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    by.entry(cur.clone()).or_default().0 += pss;
+                } else if let Some(v) = l.strip_prefix("Rss:") {
+                    let rss: u64 = v.split_whitespace().next().and_then(|x| x.parse().ok()).unwrap_or(0);
+                    if cur == "[anon]" && rss >= 1024 { anon.push((rss, cur_size, cur_range.clone())); }
+                }
+            }
+            let mut v: Vec<_> = by.into_iter().collect();
+            v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+            for (n, (pss, size, count)) in v.into_iter().take(8) {
+                out.push_str(&format!("{n}={pss}/{size}x{count} "));
+            }
+            anon.sort_by(|a, b| b.0.cmp(&a.0));
+            out.push_str("| anon regions rss/size: ");
+            for (rss, size, range) in anon.iter().take(24) { out.push_str(&format!("{rss}/{size}@{} ", range.split('-').next().unwrap_or(""))); }
+        }
+    }
+    out
 }
 
 /// Bytes resident on Unix (mincore), or committed on Windows (VirtualQuery).
