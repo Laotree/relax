@@ -146,61 +146,31 @@ fn main() {
     }
     std::fs::write(Path::new(&out_dir).join("app_icon_gen.rs"), icon_gen).unwrap();
 
-    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,linux_direct,quest,no_android_choreographer,ohos_sim,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio,use_unstable_unix_socket_ancillary_data_2021)");
+    println!("cargo:rustc-check-cfg=cfg(apple_bundle,apple_sim,lines,use_gles_3,use_vulkan,quest,no_android_choreographer,ohos_sim,gpusim,hal,makepad_precompiled_shaders,makepad_shader_pack,makepad_no_studio)");
     // Every variable declared here rebuilds this crate and everything that
     // depends on it (draw, widgets, every app) when its value changes: keep
-    // per-app inputs out (see src/app_meta.rs). MAKEPAD selects the backend
-    // (gpusim, gl, vulkan, lines, ...), which this crate is compiled for;
+    // per-app inputs out (see src/app_meta.rs). MAKEPAD selects build options
+    // for the remaining mobile backends and diagnostics;
     // words that only concern a crate further up belong in a variable of
     // that crate's own.
     println!("cargo:rerun-if-env-changed=MAKEPAD");
     println!("cargo:rerun-if-env-changed=IPHONEOS_DEPLOYMENT_TARGET");
 
-    // The GPU API on desktop Linux. The `vulkan` feature builds both
-    // renderers into the binary; it picks between them at startup (see
-    // os/linux/gpu_preference.rs), so the feature is a capability, not a
-    // choice of API. `MAKEPAD=gl` wins over it and produces an OpenGL-only
-    // binary; `MAKEPAD=vulkan` is the workspace-wide switch; the simulated
-    // GPU (`MAKEPAD=gpusim`) is never combined with either.
-    //
-    // The feature only reaches the windowed desktop backend, which is what
-    // has the runtime fallback. It must not follow from `target_os` alone:
-    // OpenHarmony (`*-unknown-linux-ohos`) reports Linux too, and neither it
-    // nor a Linux target outside the two tables that carry `naga` (see
-    // Cargo.toml) can compile the Vulkan renderer at all. `linux_direct`
-    // (DRM/KMS) can, but it drives the display exclusively and has no OpenGL
-    // fallback of its own, so it stays opt-in through
-    // `MAKEPAD=linux_direct+vulkan`.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_VULKAN");
-    let makepad_configs: Vec<String> = env::var("MAKEPAD")
-        .map(|configs| configs.split(['+', ',']).map(str::to_string).collect())
-        .unwrap_or_default();
-    // macOS has one backend: the HAL. Other targets opt into the client while their native
-    // backends are being moved. HAL is independent of the simulated GPU selection.
-    let hal = target_os == "macos" || env::var_os("CARGO_CFG_HAL").is_some();
+    // Desktop Linux and macOS always use the HAL. Linux shell selection
+    // (including MAKEPAD=linux_direct) happens at runtime; Vulkan is the HAL core.
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let desktop_linux = target_os == "linux" && target_env != "ohos";
+    let hal = target_os == "macos" || desktop_linux || env::var_os("CARGO_CFG_HAL").is_some();
     if hal {
         println!("cargo:rustc-cfg=hal");
-    }
-    let names_gpu_api = hal || makepad_configs
-        .iter()
-        .any(|config| matches!(config.as_str(), "gl" | "vulkan" | "use_vulkan" | "gpusim" | "quest"));
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    let windowed_desktop_linux = target_os == "linux"
-        && target_env == "gnu"
-        && matches!(target_arch.as_str(), "x86_64" | "aarch64")
-        && !makepad_configs.iter().any(|config| config == "linux_direct");
-    if windowed_desktop_linux && env::var("CARGO_FEATURE_VULKAN").is_ok() && !names_gpu_api {
-        println!("cargo:rustc-cfg=use_vulkan");
     }
 
     if let Ok(configs) = env::var("MAKEPAD") {
         for config in configs.split(['+', ',']) {
             match config {
                 "lines" => println!("cargo:rustc-cfg=lines"),
-                "linux_direct" => println!("cargo:rustc-cfg=linux_direct"),
                 "no_android_choreographer" => println!("cargo:rustc-cfg=no_android_choreographer"),
-                "quest" => {
+                "quest" if !desktop_linux => {
                     println!("cargo:rustc-cfg=quest");
                     println!("cargo:rustc-cfg=use_gles_3");
                     println!("cargo:rustc-cfg=use_vulkan");
@@ -208,12 +178,8 @@ fn main() {
                 "apple_bundle" => println!("cargo:rustc-cfg=apple_bundle"),
                 "ohos_sim" => println!("cargo:rustc-cfg=ohos_sim"),
                 "gpusim" => println!("cargo:rustc-cfg=gpusim"),
-                "use_gles_3" => println!("cargo:rustc-cfg=use_gles_3"),
-                "vulkan" | "use_vulkan" => println!("cargo:rustc-cfg=use_vulkan"),
-                // The OpenGL-only build; the word overrides the `vulkan` cargo
-                // feature above, so an app that enables it can still be built
-                // without the Vulkan renderer.
-                "gl" => {}
+                "use_gles_3" if !desktop_linux => println!("cargo:rustc-cfg=use_gles_3"),
+                "vulkan" | "use_vulkan" if !desktop_linux => println!("cargo:rustc-cfg=use_vulkan"),
                 _ => {}
             }
         }
@@ -236,7 +202,7 @@ fn main() {
             println!("cargo:rustc-link-lib=framework=MetalKit");
             println!("cargo:rustc-link-lib=framework=GameController");
         }
-        "linux" => {
+        "linux" if target_env == "ohos" => {
             println!("cargo:rustc-cfg=use_gles_3");
             println!("cargo:rustc-link-lib=xkbcommon");
         }
