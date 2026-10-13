@@ -651,6 +651,12 @@ fn append_inner<T: Entry>(base: &Path, mut entries: Vec<T>, drop_all: bool) -> s
     Ok(())
 }
 
+/// MAKEPAD_RUN_PROFILE is set: the load timeline's spans for the image writes.
+pub fn profiling() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("MAKEPAD_RUN_PROFILE").is_some())
+}
+
 /// Makes the bytes written to `f` so far reach the disk before anything written after: an
 /// ordering barrier, not a durability flush. macOS: `F_BARRIERFSYNC` -- std's `sync_data` is
 /// `F_FULLFSYNC` there, a full flush of the drive's cache per call (a cold Stage launch made ~3.7k
@@ -806,9 +812,12 @@ impl RunStore {
             off
         };
         let r = (|| -> std::io::Result<(u64, &'static [u8])> {
+            let s = crate::load_profile::span(profiling(), "run-store-write", "");
             let mut out = PosWriter { file: &self.file, off, buf: Vec::with_capacity(64 * 1024), sum: Sum64::new() };
             write(&mut out)?;
             out.flush()?;
+            drop(s);
+            let _s = crate::load_profile::span(profiling(), "run-store-map", "");
             if out.sum.len != len as u64 {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "run store payload length"));
             }

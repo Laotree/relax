@@ -138,9 +138,17 @@ impl ImageSink for FrontSink {
     fn file(&self, path: &str, pf: &mut ParsedFile) -> bool {
         if pf.src.is_mapped() { return false; }
         let key = Cache::front_key(path, pf.source_hash(path));
+        let p = crate::store::profiling();
+        let s = crate::load_profile::span(p, "front-image-encode", path);
         let w = crate::front::image(pf);
+        drop(s);
+        let s = crate::load_profile::span(p, "front-image-append", path);
         let Some((loc, img)) = self.write(key, &w) else { return false };
+        drop(s);
+        let s = crate::load_profile::span(p, "front-image-free", path);
         drop(w);
+        drop(s);
+        let _s = crate::load_profile::span(p, "front-image-apply", path);
         if !crate::front::apply(path, pf, img) { return false; }
         crate::front::RECORDED_FILES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         pf.image = Some(loc);
