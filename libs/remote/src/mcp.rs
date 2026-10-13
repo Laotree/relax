@@ -30,7 +30,7 @@ const DEPTH: u32 = 32;
 /// The built-in services every app has.
 const BUILT_IN: [&str; 4] = ["ui", "edit", "logs", "inspect"];
 /// Built-in tools run here: they read the `frames` service.
-const CLIENT_SIDE: [(&str, &str); 3] = [("ui", "grab"), ("ui", "gseq"), ("edit", "tweak_grab")];
+const CLIENT_SIDE: [(&str, &str); 4] = [("ui", "grab"), ("ui", "gseq"), ("ui", "rec"), ("edit", "tweak_grab")];
 
 pub struct Options {
     pub target: String,

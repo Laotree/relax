@@ -74,6 +74,7 @@ fn run_inner(client: &Client, argv: &[String], each: &mut dyn FnMut(&str) -> boo
     let reply = match (first, second) {
         ("grab", _) | ("tweak", Some("grab")) => grab(client, &kv),
         ("gseq", _) => gseq(client, &kv),
+        ("rec", _) => rec(client, &kv),
         ("gq", _) => gq(client, &kv),
         ("tweak", Some("final")) => return tweak_final(client, &words, &kv, each),
         ("tools", _) => return app_request(client, "list", each),
@@ -246,7 +247,7 @@ fn grab_json(r: &Record, path: &Path) -> String {
 
 /// One frame of `window`, written to `out` or the next file of the grab folder.
 fn grab_one(client: &Client, window: Option<usize>, scale: f64, out: Option<&str>) -> Result<(Record, PathBuf), String> {
-    let req = frames::Request { window, scale: Some(scale), raw: false, n: Some(1), fps: None };
+    let req = frames::Request { window, scale: Some(scale), raw: false, codec: None, n: Some(1), fps: None, cap: false };
     let mut got = None;
     frames::fetch(client, &req, &mut |r| {
         got = Some(r);
@@ -268,6 +269,78 @@ fn grab(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
     Ok(grab_json(&record, &path))
 }
 
+/// `rec [out=DIR] [seconds=5] [fps=30] [codec=png|raw] [w=ID]`: capture by streaming. The app reads every
+/// presented frame back and sends it here; this side writes `frame_<slot>.png` (or `.rgba`) into DIR and
+/// counts the slots that never arrived, so a capture is checkable (`frames`, `missing`) and needs no
+/// video encoder on the device. Encode the folder to a video with any encoder.
+fn rec(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
+    let seconds: f64 = get(kv, &["seconds", "s"]).unwrap_or("5").parse().map_err(|_| "rec seconds must be a number".to_string())?;
+    let fps: f64 = get(kv, &["fps"]).unwrap_or("30").parse().map_err(|_| "rec fps must be a number".to_string())?;
+    let codec = get(kv, &["codec"]).unwrap_or("rle");
+    if !matches!(codec, "rle" | "png" | "raw") { return Err("rec codec must be rle, png or raw".into()); }
+    let raw = codec == "raw";
+    let dir = match get(kv, &["out"]) {
+        Some(d) => { std::fs::create_dir_all(d).map_err(|e| format!("rec out: {e}"))?; PathBuf::from(d) }
+        None => grab_dir(client)?,
+    };
+    let req = frames::Request { window: window_of(kv), scale: Some(get(kv, &["scale"]).and_then(|v| v.parse().ok()).unwrap_or(0.5)), raw, codec: (codec == "rle").then_some("rle"), n: None, fps: Some(fps), cap: true };
+    let started = std::time::Instant::now();
+    let (mut count, mut first, mut last, mut size, mut dropped) = (0u64, None::<u64>, 0u64, (0u32, 0u32), 0u64);
+    let (mut t_first, mut t_last) = (None::<f64>, 0f64);
+    let result = frames::fetch(client, &req, &mut |r| {
+        let slot = r.num("seq").unwrap_or(0.0) as u64;
+        first.get_or_insert(slot);
+        last = slot;
+        size = (r.num("w").unwrap_or(0.0) as u32, r.num("h").unwrap_or(0.0) as u32);
+        dropped = r.num("dropped").unwrap_or(0.0) as u64;
+        let t = r.num("t_ns").unwrap_or(0.0);
+        t_first.get_or_insert(t);
+        t_last = t;
+        let (name, bytes) = match codec {
+            "rle" => (format!("frame_{slot:06}.bmp"), rle_to_bmp(size.0, size.1, &r.bytes)?),
+            "raw" => (format!("frame_{slot:06}.rgba"), r.bytes.clone()),
+            _ => (format!("frame_{slot:06}.png"), r.bytes.clone()),
+        };
+        std::fs::write(dir.join(name), bytes).map_err(|e| format!("rec write: {e}"))?;
+        count += 1;
+        if started.elapsed().as_secs_f64() >= seconds { return Err("\u{0}done".into()); }
+        Ok(())
+    });
+    match result {
+        Ok(()) => {}
+        Err(e) if e == "\u{0}done" => {}
+        Err(e) => return Err(format!("rec: {e}")),
+    }
+    let span = first.map_or(0, |f| last - f + 1);
+    Ok(format!("{{\"dir\":{},\"frames\":{count},\"missing\":{},\"slots\":{span},\"fps\":{fps},\"sz\":[{},{}],\"device_dropped\":{dropped},\"device_ms\":{:.0}}}", crate::json_str(&dir.display().to_string()), span.saturating_sub(count), size.0, size.1, (t_last - t_first.unwrap_or(t_last)) / 1e6))
+}
+
+/// Run-length RGBA (see the app's `rle_encode`) to a 32-bit top-down BMP.
+fn rle_to_bmp(w: u32, h: u32, rle: &[u8]) -> Result<Vec<u8>, String> {
+    let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+    let mut i = 0;
+    while i + 6 <= rle.len() {
+        let run = u16::from_le_bytes([rle[i], rle[i + 1]]) as usize;
+        let (r, g, b, a) = (rle[i + 2], rle[i + 3], rle[i + 4], rle[i + 5]);
+        for _ in 0..run { px.extend_from_slice(&[b, g, r, a]); }
+        i += 6;
+    }
+    if px.len() != w as usize * h as usize * 4 { return Err(format!("rec: a frame decoded to {} bytes, expected {}", px.len(), w as usize * h as usize * 4)); }
+    let mut out = Vec::with_capacity(54 + px.len());
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&((54 + px.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(w as i32).to_le_bytes());
+    out.extend_from_slice(&(-(h as i32)).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]);
+    out.extend_from_slice(&px);
+    Ok(out)
+}
+
 fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
     let n = match get(kv, &["n"]).unwrap_or("8").parse::<usize>() {
         Ok(n @ 1..=64) => n,
@@ -284,7 +357,7 @@ fn gseq(client: &Client, kv: &[(String, String)]) -> Result<String, String> {
         }
         None => grab_dir(client)?,
     };
-    let req = frames::Request { window: window_of(kv), scale: Some(scale_of(kv)), raw: false, n: Some(n), fps: Some(1000.0 / every_ms as f64) };
+    let req = frames::Request { window: window_of(kv), scale: Some(scale_of(kv)), raw: false, codec: None, n: Some(n), fps: Some(1000.0 / every_ms as f64), cap: false };
     let (mut paths, mut frame_json, mut pinned) = (Vec::new(), Vec::new(), Vec::new());
     frames::fetch(client, &req, &mut |r| {
         let index = frame_json.len();

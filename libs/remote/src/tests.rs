@@ -487,8 +487,8 @@ fn frames_records_round_trip_and_reject_truncation() {
 #[test]
 fn frames_request_arguments_match_the_services_vocabulary() {
     use crate::frames::Request;
-    assert_eq!(Request { window: Some(2), scale: Some(0.5), raw: false, n: Some(1), fps: None }.args(), "window=2 scale=0.5 codec=png once=1");
-    assert_eq!(Request { window: None, scale: None, raw: true, n: Some(8), fps: Some(20.0) }.args(), "codec=raw n=8 fps=20");
+    assert_eq!(Request { window: Some(2), scale: Some(0.5), raw: false, codec: None, n: Some(1), fps: None, cap: false }.args(), "window=2 scale=0.5 codec=png once=1");
+    assert_eq!(Request { window: None, scale: None, raw: true, codec: None, n: Some(8), fps: Some(20.0), cap: false }.args(), "codec=raw n=8 fps=20");
     assert_eq!(Request::default().args(), "codec=png");
 }
 

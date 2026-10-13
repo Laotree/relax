@@ -51,9 +51,13 @@ pub struct Request {
     pub window: Option<usize>,
     pub scale: Option<f64>,
     pub raw: bool,
+    /// the codec when not png/raw (`rle`): set by `rec`
+    pub codec: Option<&'static str>,
     /// a fixed number of frames; none = until the channel is closed
     pub n: Option<usize>,
     pub fps: Option<f64>,
+    /// every presented frame, streamed until the client closes (`cap=1`); `fps` caps the rate
+    pub cap: bool,
 }
 
 impl Request {
@@ -66,7 +70,7 @@ impl Request {
         if let Some(s) = self.scale {
             a.push(format!("scale={s}"));
         }
-        a.push(format!("codec={}", if self.raw { "raw" } else { "png" }));
+        a.push(format!("codec={}", self.codec.unwrap_or(if self.raw { "raw" } else { "png" })));
         match self.n {
             Some(1) => a.push("once=1".into()),
             Some(n) => a.push(format!("n={n}")),
@@ -74,6 +78,9 @@ impl Request {
         }
         if let Some(f) = self.fps {
             a.push(format!("fps={f}"));
+        }
+        if self.cap {
+            a.push("cap=1".into());
         }
         a.join(" ")
     }
