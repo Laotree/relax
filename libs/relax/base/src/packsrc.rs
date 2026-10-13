@@ -195,10 +195,6 @@ pub fn run(opts: Options) -> Result<(), String> {
         let out_log = work.join(format!("check-{pkg}.log"));
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("check").arg("--no-serve");
-        // the phone runs every program on the HAL (cfg hal): the files that cfg reaches belong in the archive
-        if opts.target.as_deref().is_some_and(|t| t.contains("android")) {
-            cmd.arg("--cfg").arg("hal");
-        }
         cmd.arg(pkg).args(flags).current_dir(&root);
         cmd.env("MAKEPAD_RUN_CACHE_DIR", work.join("cache"));
         cmd.env("MAKEPAD_RUN_READ_LOG", &log);

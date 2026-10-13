@@ -854,9 +854,8 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What makepad-platform's build.rs (platform/build.rs) gives the build, as makepad run knows it,
-/// for no-codegen mode, where the script does not run: its cfgs (`hal` on Apple targets, Android
-/// and Linux or with `--cfg hal`; `apple_sim`, `use_gles_3` from the target; the words of the
-/// MAKEPAD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
+/// for no-codegen mode, where the script does not run: its cfgs (`apple_sim` from the target, the
+/// `lines` / `apple_bundle` words of the MAKEPAD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
 /// identifier, from the folder that holds the target folder) and app_icon_gen.rs (the icons in
 /// that folder's resources/). Its link lines are the host binary's: in this mode nothing is
 /// linked at run time. Its side files (makepad-platform.path, a target-folder Info.plist) are for
@@ -869,24 +868,15 @@ fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Resu
     let makepad: Vec<String> = std::env::var("MAKEPAD").map(|c| c.split(['+', ',']).map(str::to_string).collect()).unwrap_or_default();
     let mut lines = Vec::new();
     let mut cfg = |c: &str| lines.push(format!("cargo:rustc-cfg={}", c));
-    // platform/build.rs: Apple targets, Android and desktop Linux always use the HAL
-    let desktop_linux = target_os == "linux";
-    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android") || desktop_linux || get("CARGO_CFG_HAL").is_some();
-    if hal {
-        cfg("hal");
-    }
+    // platform/build.rs: MAKEPAD's build options, the Apple simulator flag
     for c in &makepad {
-        match c.as_str() {
-            "lines" | "apple_bundle" | "gpusim" => cfg(c),
-            "use_gles_3" if !desktop_linux => cfg(c),
-            "vulkan" | "use_vulkan" if !desktop_linux => cfg("use_vulkan"),
-            _ => {}
+        if matches!(c.as_str(), "lines" | "apple_bundle") {
+            cfg(c);
         }
     }
     match target_os.as_str() {
         "ios" if target == "aarch64-apple-ios-sim" => cfg("apple_sim"),
         "tvos" if target == "aarch64-apple-tvos-sim" => cfg("apple_sim"),
-        "android" => cfg("use_gles_3"),
         _ => {}
     }
     // app_meta_gen.rs: the folder that holds the target folder names the app (detect_app_name)
