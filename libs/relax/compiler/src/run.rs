@@ -1219,7 +1219,14 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     jit::ORDER_UNTIL_NS.store(jit::wall_ns() + 5_000_000_000, Ordering::Relaxed);
     // the manifest's slots before the first present: installed now, from its prelinked image
     let t_pre = Instant::now();
-    if unsafe { jit::prelink_startup(up) } > 0 {
+    let prelinked = unsafe { jit::prelink_startup(up) };
+    if prelinked == 0 && warm_start.is_some() {
+        if let Some(c) = unsafe { (*up).cache.as_ref() } {
+            verbose!("makepad-run cache: warm start without a prelinked startup image (image {}, {} stale, {} unresolved, {} had code)",
+                if c.has_startup_image() { "present" } else { "missing" }, c.stats.prelink_changed, c.stats.prelink_failed, c.stats.prelink_had_code);
+        }
+    }
+    if prelinked > 0 {
         if let Some(c) = unsafe { (*up).cache.as_ref() } {
             let s = &c.stats;
             let ms = |ns: u64| ns as f64 / 1e6;

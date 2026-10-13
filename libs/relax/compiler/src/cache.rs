@@ -2391,6 +2391,11 @@ impl Cache {
     }
 
     /// This program's startup manifest was loaded: an earlier run of it reached main with this cache.
+    /// The loaded startup manifest carries a startup image (prelink's input).
+    pub fn has_startup_image(&self) -> bool {
+        self.image.is_some()
+    }
+
     pub fn has_startup_manifest(&self) -> bool {
         !self.manifest.is_empty()
     }
