@@ -60,9 +60,7 @@ pub use makepad_error_log;
 
 #[cfg(target_os = "android")]
 pub use crate::backend::{
-    clear_platform_backend as clear_android_backend_shim,
     clear_platform_socket_factory as clear_android_socket_stream_factory_shim,
-    register_platform_backend as register_android_backend_shim,
     register_platform_socket_factory as register_android_socket_stream_factory_shim,
     PlatformSocketFactory as AndroidSocketStreamFactory,
     PlatformSocketStream as AndroidSocketStream,
