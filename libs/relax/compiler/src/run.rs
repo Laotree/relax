@@ -2393,6 +2393,12 @@ pub(crate) fn front_recordable() -> bool {
 /// A cold app's shutdown compiles for seconds before the exit write; a harness that kills it
 /// 5 s after SIGTERM left no manifest and no collected program, so every relaunch was cold.
 /// The exit write still runs and adds what came after.
+/// The host's quit request (a signal to the `makepad run` host process, whose app domain has no
+/// termination handler of its own): the same quit write the platform's hook starts.
+pub fn quit_requested() {
+    relax_quit_requested();
+}
+
 pub(crate) extern "C" fn relax_quit_requested() {
     crate::tui::abnormal();
     static ONCE: AtomicBool = AtomicBool::new(false);
