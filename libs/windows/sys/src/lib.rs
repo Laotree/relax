@@ -979,6 +979,15 @@ pub bottom: i32,
 }
 impl RECT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for RECT { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SIZE {
+pub cx: i32,
+pub cy: i32,
+}
+impl SIZE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for SIZE { fn default() -> Self {Self::default()} }
+pub const STILL_ACTIVE: crate::Win32::Foundation::NTSTATUS = crate::Win32::Foundation::NTSTATUS(259i64 as _);
 pub const SUCCESS: u32 = 0;
 pub const S_FALSE: crate::core::HRESULT = crate::core::HRESULT(1i64 as _);
 pub const S_OK: crate::core::HRESULT = crate::core::HRESULT(0i64 as _);
@@ -1203,6 +1212,29 @@ impl ::core::ops::BitOr for D3D11_ASYNC_GETDATA_FLAG { type Output = Self; fn bi
 impl ::core::ops::BitAnd for D3D11_ASYNC_GETDATA_FLAG { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for D3D11_ASYNC_GETDATA_FLAG { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for D3D11_ASYNC_GETDATA_FLAG { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_AUTHENTICATED_CHANNEL_TYPE(pub i32);
+impl D3D11_AUTHENTICATED_CHANNEL_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_AUTHENTICATED_CHANNEL_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_AUTHENTICATED_CHANNEL_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_AUTHENTICATED_CHANNEL_TYPE {}
+impl ::core::fmt::Debug for D3D11_AUTHENTICATED_CHANNEL_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_AUTHENTICATED_CHANNEL_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_AUTHENTICATED_CHANNEL_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_AUTHENTICATED_CHANNEL_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_AUTHENTICATED_CHANNEL_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_AUTHENTICATED_CONFIGURE_OUTPUT {
+pub omac: crate::Win32::Graphics::Direct3D11::D3D11_OMAC,
+pub ConfigureType: crate::core::GUID,
+pub hChannel: crate::Win32::Foundation::HANDLE,
+pub SequenceNumber: u32,
+pub ReturnCode: crate::core::HRESULT,
+}
+impl D3D11_AUTHENTICATED_CONFIGURE_OUTPUT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_AUTHENTICATED_CONFIGURE_OUTPUT { fn default() -> Self {Self::default()} }
 pub const D3D11_BIND_CONSTANT_BUFFER: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(4i64 as _);
 pub const D3D11_BIND_DECODER: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(512i64 as _);
 pub const D3D11_BIND_DEPTH_STENCIL: crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG = crate::Win32::Graphics::Direct3D11::D3D11_BIND_FLAG(64i64 as _);
@@ -1588,6 +1620,15 @@ impl ::core::ops::BitXor for D3D11_DSV_DIMENSION { type Output = Self; fn bitxor
 impl ::core::ops::Not for D3D11_DSV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
 pub const D3D11_DSV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION(3i64 as _);
 pub const D3D11_DSV_DIMENSION_TEXTURE2DARRAY: crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_DSV_DIMENSION(4i64 as _);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_ENCRYPTED_BLOCK_INFO {
+pub NumEncryptedBytesAtBeginning: u32,
+pub NumBytesInSkipPattern: u32,
+pub NumBytesInEncryptPattern: u32,
+}
+impl D3D11_ENCRYPTED_BLOCK_INFO { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_ENCRYPTED_BLOCK_INFO { fn default() -> Self {Self::default()} }
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_FEATURE(pub i32);
@@ -1722,6 +1763,13 @@ pub const D3D11_MAP_FLAG_DO_NOT_WAIT: crate::Win32::Graphics::Direct3D11::D3D11_
 pub const D3D11_MAP_READ: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(1i64 as _);
 pub const D3D11_MAP_WRITE_DISCARD: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(4i64 as _);
 pub const D3D11_MAP_WRITE_NO_OVERWRITE: crate::Win32::Graphics::Direct3D11::D3D11_MAP = crate::Win32::Graphics::Direct3D11::D3D11_MAP(5i64 as _);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_OMAC {
+pub Omac: [u8; 16],
+}
+impl D3D11_OMAC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_OMAC { fn default() -> Self {Self::default()} }
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct D3D11_QUERY(pub i32);
@@ -2112,6 +2160,15 @@ impl D3D11_TEX2D_ARRAY_UAV { pub fn default() -> Self { unsafe { ::core::mem::ze
 impl ::core::default::Default for D3D11_TEX2D_ARRAY_UAV { fn default() -> Self {Self::default()} }
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct D3D11_TEX2D_ARRAY_VPOV {
+pub MipSlice: u32,
+pub FirstArraySlice: u32,
+pub ArraySize: u32,
+}
+impl D3D11_TEX2D_ARRAY_VPOV { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_TEX2D_ARRAY_VPOV { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
 pub struct D3D11_TEX2D_DSV {
 pub MipSlice: u32,
 }
@@ -2139,6 +2196,28 @@ pub MipSlice: u32,
 }
 impl D3D11_TEX2D_UAV { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for D3D11_TEX2D_UAV { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_TEX2D_VDOV {
+pub ArraySlice: u32,
+}
+impl D3D11_TEX2D_VDOV { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_TEX2D_VDOV { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_TEX2D_VPIV {
+pub MipSlice: u32,
+pub ArraySlice: u32,
+}
+impl D3D11_TEX2D_VPIV { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_TEX2D_VPIV { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_TEX2D_VPOV {
+pub MipSlice: u32,
+}
+impl D3D11_TEX2D_VPOV { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_TEX2D_VPOV { fn default() -> Self {Self::default()} }
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3D11_TEX3D_RTV {
@@ -2292,6 +2371,371 @@ impl ::core::ops::Not for D3D11_USAGE { type Output = Self; fn not(self) -> Self
 pub const D3D11_USAGE_DEFAULT: crate::Win32::Graphics::Direct3D11::D3D11_USAGE = crate::Win32::Graphics::Direct3D11::D3D11_USAGE(0i64 as _);
 pub const D3D11_USAGE_DYNAMIC: crate::Win32::Graphics::Direct3D11::D3D11_USAGE = crate::Win32::Graphics::Direct3D11::D3D11_USAGE(2i64 as _);
 pub const D3D11_USAGE_STAGING: crate::Win32::Graphics::Direct3D11::D3D11_USAGE = crate::Win32::Graphics::Direct3D11::D3D11_USAGE(3i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VDOV_DIMENSION(pub i32);
+impl D3D11_VDOV_DIMENSION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VDOV_DIMENSION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VDOV_DIMENSION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VDOV_DIMENSION {}
+impl ::core::fmt::Debug for D3D11_VDOV_DIMENSION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VDOV_DIMENSION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VDOV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VDOV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VDOV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_COLOR {
+pub Anonymous: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_0,
+}
+impl D3D11_VIDEO_COLOR { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_COLOR { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3D11_VIDEO_COLOR_0 {
+pub YCbCr: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_YCbCrA,
+pub RGBA: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR_RGBA,
+}
+impl D3D11_VIDEO_COLOR_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_COLOR_0 { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_COLOR_RGBA {
+pub R: f32,
+pub G: f32,
+pub B: f32,
+pub A: f32,
+}
+impl D3D11_VIDEO_COLOR_RGBA { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_COLOR_RGBA { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_COLOR_YCbCrA {
+pub Y: f32,
+pub Cb: f32,
+pub Cr: f32,
+pub A: f32,
+}
+impl D3D11_VIDEO_COLOR_YCbCrA { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_COLOR_YCbCrA { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_CONTENT_PROTECTION_CAPS {
+pub Caps: u32,
+pub KeyExchangeTypeCount: u32,
+pub BlockAlignmentSize: u32,
+pub ProtectedMemorySize: u64,
+}
+impl D3D11_VIDEO_CONTENT_PROTECTION_CAPS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_CONTENT_PROTECTION_CAPS { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_BUFFER_DESC {
+pub BufferType: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_TYPE,
+pub BufferIndex: u32,
+pub DataOffset: u32,
+pub DataSize: u32,
+pub FirstMBaddress: u32,
+pub NumMBsInBuffer: u32,
+pub Width: u32,
+pub Height: u32,
+pub Stride: u32,
+pub ReservedBits: u32,
+pub pIV: *mut ::core::ffi::c_void,
+pub IVSize: u32,
+pub PartialEncryption: crate::core::BOOL,
+pub EncryptedBlockInfo: crate::Win32::Graphics::Direct3D11::D3D11_ENCRYPTED_BLOCK_INFO,
+}
+impl D3D11_VIDEO_DECODER_BUFFER_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_BUFFER_DESC { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_BUFFER_TYPE(pub i32);
+impl D3D11_VIDEO_DECODER_BUFFER_TYPE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_BUFFER_TYPE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_DECODER_BUFFER_TYPE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_DECODER_BUFFER_TYPE {}
+impl ::core::fmt::Debug for D3D11_VIDEO_DECODER_BUFFER_TYPE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_DECODER_BUFFER_TYPE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_DECODER_BUFFER_TYPE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_DECODER_BUFFER_TYPE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_DECODER_BUFFER_TYPE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_CONFIG {
+pub guidConfigBitstreamEncryption: crate::core::GUID,
+pub guidConfigMBcontrolEncryption: crate::core::GUID,
+pub guidConfigResidDiffEncryption: crate::core::GUID,
+pub ConfigBitstreamRaw: u32,
+pub ConfigMBcontrolRasterOrder: u32,
+pub ConfigResidDiffHost: u32,
+pub ConfigSpatialResid8: u32,
+pub ConfigResid8Subtraction: u32,
+pub ConfigSpatialHost8or9Clipping: u32,
+pub ConfigSpatialResidInterleaved: u32,
+pub ConfigIntraResidUnsigned: u32,
+pub ConfigResidDiffAccelerator: u32,
+pub ConfigHostInverseScan: u32,
+pub ConfigSpecificIDCT: u32,
+pub Config4GroupedCoefs: u32,
+pub ConfigMinRenderTargetBuffCount: u16,
+pub ConfigDecoderSpecific: u16,
+}
+impl D3D11_VIDEO_DECODER_CONFIG { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_CONFIG { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_DESC {
+pub Guid: crate::core::GUID,
+pub SampleWidth: u32,
+pub SampleHeight: u32,
+pub OutputFormat: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+}
+impl D3D11_VIDEO_DECODER_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_DESC { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_EXTENSION {
+pub Function: u32,
+pub pPrivateInputData: *mut ::core::ffi::c_void,
+pub PrivateInputDataSize: u32,
+pub pPrivateOutputData: *mut ::core::ffi::c_void,
+pub PrivateOutputDataSize: u32,
+pub ResourceCount: u32,
+pub ppResourceList: *mut *mut ::core::ffi::c_void,
+}
+impl D3D11_VIDEO_DECODER_EXTENSION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_EXTENSION { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC {
+pub DecodeProfile: crate::core::GUID,
+pub ViewDimension: crate::Win32::Graphics::Direct3D11::D3D11_VDOV_DIMENSION,
+pub Anonymous: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC_0,
+}
+impl D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC_0 {
+pub Texture2D: crate::Win32::Graphics::Direct3D11::D3D11_TEX2D_VDOV,
+}
+impl D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC_0 { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_FRAME_FORMAT(pub i32);
+impl D3D11_VIDEO_FRAME_FORMAT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_FRAME_FORMAT { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_FRAME_FORMAT { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_FRAME_FORMAT {}
+impl ::core::fmt::Debug for D3D11_VIDEO_FRAME_FORMAT { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_FRAME_FORMAT { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_FRAME_FORMAT { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_FRAME_FORMAT { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_FRAME_FORMAT { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT = crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT(0i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE(pub i32);
+impl D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_CAPS {
+pub DeviceCaps: u32,
+pub FeatureCaps: u32,
+pub FilterCaps: u32,
+pub InputFormatCaps: u32,
+pub AutoStreamCaps: u32,
+pub StereoCaps: u32,
+pub RateConversionCapsCount: u32,
+pub MaxInputStreams: u32,
+pub MaxStreamStates: u32,
+}
+impl D3D11_VIDEO_PROCESSOR_CAPS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_CAPS { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_COLOR_SPACE {
+pub _bitfield: u32,
+}
+impl D3D11_VIDEO_PROCESSOR_COLOR_SPACE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_COLOR_SPACE { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
+pub InputFrameFormat: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT,
+pub InputFrameRate: crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,
+pub InputWidth: u32,
+pub InputHeight: u32,
+pub OutputFrameRate: crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,
+pub OutputWidth: u32,
+pub OutputHeight: u32,
+pub Usage: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_USAGE,
+}
+impl D3D11_VIDEO_PROCESSOR_CONTENT_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_CONTENT_DESC { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_CUSTOM_RATE {
+pub CustomRate: crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,
+pub OutputFrames: u32,
+pub InputInterlaced: crate::core::BOOL,
+pub InputFramesOrFields: u32,
+}
+impl D3D11_VIDEO_PROCESSOR_CUSTOM_RATE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_CUSTOM_RATE { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_FILTER(pub i32);
+impl D3D11_VIDEO_PROCESSOR_FILTER { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_FILTER { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_FILTER { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_FILTER {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_FILTER { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_FILTER { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_FILTER { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_FILTER { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_FILTER { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_FILTER_RANGE {
+pub Minimum: i32,
+pub Maximum: i32,
+pub Default: i32,
+pub Multiplier: f32,
+}
+impl D3D11_VIDEO_PROCESSOR_FILTER_RANGE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_FILTER_RANGE { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC {
+pub FourCC: u32,
+pub ViewDimension: crate::Win32::Graphics::Direct3D11::D3D11_VPIV_DIMENSION,
+pub Anonymous: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+}
+impl D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 {
+pub Texture2D: crate::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPIV,
+}
+impl D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0 { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_OUTPUT_RATE(pub i32);
+impl D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_OUTPUT_RATE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
+pub ViewDimension: crate::Win32::Graphics::Direct3D11::D3D11_VPOV_DIMENSION,
+pub Anonymous: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+}
+impl D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
+pub Texture2D: crate::Win32::Graphics::Direct3D11::D3D11_TEX2D_VPOV,
+pub Texture2DArray: crate::Win32::Graphics::Direct3D11::D3D11_TEX2D_ARRAY_VPOV,
+}
+impl D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 { fn default() -> Self {Self::default()} }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS {
+pub PastFrames: u32,
+pub FutureFrames: u32,
+pub ProcessorCaps: u32,
+pub ITelecineCaps: u32,
+pub CustomRateCount: u32,
+}
+impl D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_ROTATION(pub i32);
+impl D3D11_VIDEO_PROCESSOR_ROTATION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_ROTATION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_ROTATION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_ROTATION {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_ROTATION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_ROTATION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_ROTATION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_ROTATION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_ROTATION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE(pub i32);
+impl D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_STEREO_FORMAT(pub i32);
+impl D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT {}
+impl ::core::fmt::Debug for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_PROCESSOR_STEREO_FORMAT { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_PROCESSOR_STREAM {
+pub Enable: crate::core::BOOL,
+pub OutputIndex: u32,
+pub InputFrameOrField: u32,
+pub PastFrames: u32,
+pub FutureFrames: u32,
+pub ppPastSurfaces: *mut *mut ::core::ffi::c_void,
+pub pInputSurface: *mut ::core::ffi::c_void,
+pub ppFutureSurfaces: *mut *mut ::core::ffi::c_void,
+pub ppPastSurfacesRight: *mut *mut ::core::ffi::c_void,
+pub pInputSurfaceRight: *mut ::core::ffi::c_void,
+pub ppFutureSurfacesRight: *mut *mut ::core::ffi::c_void,
+}
+impl D3D11_VIDEO_PROCESSOR_STREAM { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
+impl ::core::default::Default for D3D11_VIDEO_PROCESSOR_STREAM { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VIDEO_USAGE(pub i32);
+impl D3D11_VIDEO_USAGE { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VIDEO_USAGE { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VIDEO_USAGE { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VIDEO_USAGE {}
+impl ::core::fmt::Debug for D3D11_VIDEO_USAGE { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VIDEO_USAGE { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VIDEO_USAGE { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VIDEO_USAGE { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VIDEO_USAGE { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_VIDEO_USAGE_OPTIMAL_QUALITY: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_USAGE = crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_USAGE(2i64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct D3D11_VIEWPORT {
@@ -2304,6 +2748,32 @@ pub MaxDepth: f32,
 }
 impl D3D11_VIEWPORT { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } }
 impl ::core::default::Default for D3D11_VIEWPORT { fn default() -> Self {Self::default()} }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VPIV_DIMENSION(pub i32);
+impl D3D11_VPIV_DIMENSION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VPIV_DIMENSION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VPIV_DIMENSION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VPIV_DIMENSION {}
+impl ::core::fmt::Debug for D3D11_VPIV_DIMENSION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VPIV_DIMENSION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VPIV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VPIV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VPIV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_VPIV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_VPIV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_VPIV_DIMENSION(1i64 as _);
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct D3D11_VPOV_DIMENSION(pub i32);
+impl D3D11_VPOV_DIMENSION { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for D3D11_VPOV_DIMENSION { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for D3D11_VPOV_DIMENSION { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for D3D11_VPOV_DIMENSION {}
+impl ::core::fmt::Debug for D3D11_VPOV_DIMENSION { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for D3D11_VPOV_DIMENSION { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for D3D11_VPOV_DIMENSION { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for D3D11_VPOV_DIMENSION { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for D3D11_VPOV_DIMENSION { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const D3D11_VPOV_DIMENSION_TEXTURE2D: crate::Win32::Graphics::Direct3D11::D3D11_VPOV_DIMENSION = crate::Win32::Graphics::Direct3D11::D3D11_VPOV_DIMENSION(1i64 as _);
 pub const IID_ID3D11Asynchronous: crate::core::GUID = crate::core::GUID { data1: 1261818061, data2: 7701, data3: 16984, data4: [156,152,27,19,51,246,221,59,] };
 #[repr(C)]
 pub struct ID3D11Asynchronous_Vtbl {
@@ -2360,6 +2830,76 @@ impl Drop for ID3D11Asynchronous { fn drop(&mut self) { unsafe { crate::core::re
 impl ::core::cmp::PartialEq for ID3D11Asynchronous { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
 unsafe impl Send for ID3D11Asynchronous {}
 unsafe impl Sync for ID3D11Asynchronous {}
+pub const IID_ID3D11AuthenticatedChannel: crate::core::GUID = crate::core::GUID { data1: 806724360, data2: 56509, data3: 18346, data4: [167,71,25,36,134,209,77,74,] };
+#[repr(C)]
+pub struct ID3D11AuthenticatedChannel_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetCertificateSize: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCertificateSize: *mut u32) -> crate::core::HRESULT,
+pub GetCertificate: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,CertificateSize: u32,pCertificate: *mut u8) -> crate::core::HRESULT,
+pub GetChannelHandle: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pChannelHandle: *mut crate::Win32::Foundation::HANDLE) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11AuthenticatedChannel(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11AuthenticatedChannel {
+pub const IID: crate::core::GUID = IID_ID3D11AuthenticatedChannel;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11AuthenticatedChannel_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11AuthenticatedChannel_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetCertificateSize(&self) -> Result<u32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetCertificateSize)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetCertificate(&self,CertificateSize: u32) -> Result<u8, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetCertificate)(self.as_raw(),CertificateSize,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetChannelHandle(&self,pChannelHandle: *mut crate::Win32::Foundation::HANDLE) -> () {
+(self.vtable().GetChannelHandle)(self.as_raw(),pChannelHandle)}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11AuthenticatedChannel { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11AuthenticatedChannel { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11AuthenticatedChannel { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11AuthenticatedChannel {}
+unsafe impl Sync for ID3D11AuthenticatedChannel {}
 pub const IID_ID3D11BlendState: crate::core::GUID = crate::core::GUID { data1: 1974898602, data2: 13437, data3: 16729, data4: [143,69,160,100,15,1,205,154,] };
 #[repr(C)]
 pub struct ID3D11BlendState_Vtbl {
@@ -2847,6 +3387,84 @@ impl Drop for ID3D11Counter { fn drop(&mut self) { unsafe { crate::core::release
 impl ::core::cmp::PartialEq for ID3D11Counter { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
 unsafe impl Send for ID3D11Counter {}
 unsafe impl Sync for ID3D11Counter {}
+pub const IID_ID3D11CryptoSession: crate::core::GUID = crate::core::GUID { data1: 2603809197, data2: 48588, data3: 16550, data4: [163,157,213,200,101,132,87,32,] };
+#[repr(C)]
+pub struct ID3D11CryptoSession_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetCryptoType: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoType: *mut crate::core::GUID) -> (),
+pub GetDecoderProfile: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoderProfile: *mut crate::core::GUID) -> (),
+pub GetCertificateSize: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCertificateSize: *mut u32) -> crate::core::HRESULT,
+pub GetCertificate: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,CertificateSize: u32,pCertificate: *mut u8) -> crate::core::HRESULT,
+pub GetCryptoSessionHandle: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSessionHandle: *mut crate::Win32::Foundation::HANDLE) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11CryptoSession(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11CryptoSession {
+pub const IID: crate::core::GUID = IID_ID3D11CryptoSession;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11CryptoSession_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11CryptoSession_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetCryptoType(&self,pCryptoType: *mut crate::core::GUID) -> () {
+(self.vtable().GetCryptoType)(self.as_raw(),pCryptoType)}
+#[inline]
+pub unsafe fn GetDecoderProfile(&self,pDecoderProfile: *mut crate::core::GUID) -> () {
+(self.vtable().GetDecoderProfile)(self.as_raw(),pDecoderProfile)}
+#[inline]
+pub unsafe fn GetCertificateSize(&self) -> Result<u32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetCertificateSize)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetCertificate(&self,CertificateSize: u32) -> Result<u8, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetCertificate)(self.as_raw(),CertificateSize,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetCryptoSessionHandle(&self,pCryptoSessionHandle: *mut crate::Win32::Foundation::HANDLE) -> () {
+(self.vtable().GetCryptoSessionHandle)(self.as_raw(),pCryptoSessionHandle)}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11CryptoSession { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11CryptoSession { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11CryptoSession { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11CryptoSession {}
+unsafe impl Sync for ID3D11CryptoSession {}
 pub const IID_ID3D11DepthStencilState: crate::core::GUID = crate::core::GUID { data1: 58867451, data2: 36239, data3: 19996, data4: [154,162,246,75,178,203,253,241,] };
 #[repr(C)]
 pub struct ID3D11DepthStencilState_Vtbl {
@@ -5621,6 +6239,864 @@ impl Drop for ID3D11VertexShader { fn drop(&mut self) { unsafe { crate::core::re
 impl ::core::cmp::PartialEq for ID3D11VertexShader { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
 unsafe impl Send for ID3D11VertexShader {}
 unsafe impl Sync for ID3D11VertexShader {}
+pub const IID_ID3D11VideoContext: crate::core::GUID = crate::core::GUID { data1: 1643256901, data2: 15374, data3: 19060, data4: [156,234,103,16,13,154,213,228,] };
+#[repr(C)]
+pub struct ID3D11VideoContext_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetDecoderBuffer: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void,Type: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_TYPE,pBufferSize: *mut u32,ppBuffer: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub ReleaseDecoderBuffer: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void,Type: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_TYPE) -> crate::core::HRESULT,
+pub DecoderBeginFrame: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void,pView: *mut ::core::ffi::c_void,ContentKeySize: u32,pContentKey: *const ::core::ffi::c_void) -> crate::core::HRESULT,
+pub DecoderEndFrame: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub SubmitDecoderBuffers: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void,NumBuffers: u32,pBufferDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_DESC) -> crate::core::HRESULT,
+pub DecoderExtension: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoder: *mut ::core::ffi::c_void,pExtensionData: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_EXTENSION) -> i32,
+pub VideoProcessorSetOutputTargetRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,Enable: crate::core::BOOL,pRect: *const crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorSetOutputBackgroundColor: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,YCbCr: crate::core::BOOL,pColor: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR) -> (),
+pub VideoProcessorSetOutputColorSpace: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pColorSpace: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> (),
+pub VideoProcessorSetOutputAlphaFillMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,AlphaFillMode: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE,StreamIndex: u32) -> (),
+pub VideoProcessorSetOutputConstriction: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,Enable: crate::core::BOOL,Size: crate::Win32::Foundation::SIZE) -> (),
+pub VideoProcessorSetOutputStereoMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,Enable: crate::core::BOOL) -> (),
+pub VideoProcessorSetOutputExtension: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> i32,
+pub VideoProcessorGetOutputTargetRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,Enabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorGetOutputBackgroundColor: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pYCbCr: *mut crate::core::BOOL,pColor: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR) -> (),
+pub VideoProcessorGetOutputColorSpace: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pColorSpace: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> (),
+pub VideoProcessorGetOutputAlphaFillMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pAlphaFillMode: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE,pStreamIndex: *mut u32) -> (),
+pub VideoProcessorGetOutputConstriction: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pEnabled: *mut crate::core::BOOL,pSize: *mut crate::Win32::Foundation::SIZE) -> (),
+pub VideoProcessorGetOutputStereoMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pEnabled: *mut crate::core::BOOL) -> (),
+pub VideoProcessorGetOutputExtension: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *mut ::core::ffi::c_void) -> i32,
+pub VideoProcessorSetStreamFrameFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,FrameFormat: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT) -> (),
+pub VideoProcessorSetStreamColorSpace: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pColorSpace: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> (),
+pub VideoProcessorSetStreamOutputRate: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,OutputRate: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_RATE,RepeatFrame: crate::core::BOOL,pCustomRate: *const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> (),
+pub VideoProcessorSetStreamSourceRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,pRect: *const crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorSetStreamDestRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,pRect: *const crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorSetStreamAlpha: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,Alpha: f32) -> (),
+pub VideoProcessorSetStreamPalette: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Count: u32,pEntries: *const u32) -> (),
+pub VideoProcessorSetStreamPixelAspectRatio: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,pSourceAspectRatio: *const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,pDestinationAspectRatio: *const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> (),
+pub VideoProcessorSetStreamLumaKey: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,Lower: f32,Upper: f32) -> (),
+pub VideoProcessorSetStreamStereoFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,Format: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FORMAT,LeftViewFrame0: crate::core::BOOL,BaseViewFrame0: crate::core::BOOL,FlipMode: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE,MonoOffset: i32) -> (),
+pub VideoProcessorSetStreamAutoProcessingMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL) -> (),
+pub VideoProcessorSetStreamFilter: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER,Enable: crate::core::BOOL,Level: i32) -> (),
+pub VideoProcessorSetStreamExtension: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> i32,
+pub VideoProcessorGetStreamFrameFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pFrameFormat: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT) -> (),
+pub VideoProcessorGetStreamColorSpace: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pColorSpace: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> (),
+pub VideoProcessorGetStreamOutputRate: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pOutputRate: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_RATE,pRepeatFrame: *mut crate::core::BOOL,pCustomRate: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> (),
+pub VideoProcessorGetStreamSourceRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorGetStreamDestRect: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> (),
+pub VideoProcessorGetStreamAlpha: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pAlpha: *mut f32) -> (),
+pub VideoProcessorGetStreamPalette: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Count: u32,pEntries: *mut u32) -> (),
+pub VideoProcessorGetStreamPixelAspectRatio: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pSourceAspectRatio: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,pDestinationAspectRatio: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> (),
+pub VideoProcessorGetStreamLumaKey: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pLower: *mut f32,pUpper: *mut f32) -> (),
+pub VideoProcessorGetStreamStereoFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnable: *mut crate::core::BOOL,pFormat: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FORMAT,pLeftViewFrame0: *mut crate::core::BOOL,pBaseViewFrame0: *mut crate::core::BOOL,pFlipMode: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE,MonoOffset: *mut i32) -> (),
+pub VideoProcessorGetStreamAutoProcessingMode: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnabled: *mut crate::core::BOOL) -> (),
+pub VideoProcessorGetStreamFilter: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER,pEnabled: *mut crate::core::BOOL,pLevel: *mut i32) -> (),
+pub VideoProcessorGetStreamExtension: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *mut ::core::ffi::c_void) -> i32,
+pub VideoProcessorBlt: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,pView: *mut ::core::ffi::c_void,OutputFrame: u32,StreamCount: u32,pStreams: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STREAM) -> crate::core::HRESULT,
+pub NegotiateCryptoSessionKeyExchange: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void,DataSize: u32,pData: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub EncryptionBlt: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void,pSrcSurface: *mut ::core::ffi::c_void,pDstSurface: *mut ::core::ffi::c_void,IVSize: u32,pIV: *mut ::core::ffi::c_void) -> (),
+pub DecryptionBlt: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void,pSrcSurface: *mut ::core::ffi::c_void,pDstSurface: *mut ::core::ffi::c_void,pEncryptedBlockInfo: *const crate::Win32::Graphics::Direct3D11::D3D11_ENCRYPTED_BLOCK_INFO,ContentKeySize: u32,pContentKey: *const ::core::ffi::c_void,IVSize: u32,pIV: *mut ::core::ffi::c_void) -> (),
+pub StartSessionKeyRefresh: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void,RandomNumberSize: u32,pRandomNumber: *mut ::core::ffi::c_void) -> (),
+pub FinishSessionKeyRefresh: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void) -> (),
+pub GetEncryptionBltKey: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoSession: *mut ::core::ffi::c_void,KeySize: u32,pReadbackKey: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub NegotiateAuthenticatedChannelKeyExchange: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pChannel: *mut ::core::ffi::c_void,DataSize: u32,pData: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub QueryAuthenticatedChannel: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pChannel: *mut ::core::ffi::c_void,InputSize: u32,pInput: *const ::core::ffi::c_void,OutputSize: u32,pOutput: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub ConfigureAuthenticatedChannel: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pChannel: *mut ::core::ffi::c_void,InputSize: u32,pInput: *const ::core::ffi::c_void,pOutput: *mut crate::Win32::Graphics::Direct3D11::D3D11_AUTHENTICATED_CONFIGURE_OUTPUT) -> crate::core::HRESULT,
+pub VideoProcessorSetStreamRotation: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,Enable: crate::core::BOOL,Rotation: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION) -> (),
+pub VideoProcessorGetStreamRotation: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoProcessor: *mut ::core::ffi::c_void,StreamIndex: u32,pEnable: *mut crate::core::BOOL,pRotation: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11VideoContext(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoContext {
+pub const IID: crate::core::GUID = IID_ID3D11VideoContext;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoContext_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoContext_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetDecoderBuffer(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder,Type: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_TYPE,pBufferSize: *mut u32,ppBuffer: *mut *mut ::core::ffi::c_void) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().GetDecoderBuffer)(self.as_raw(),pDecoder.as_raw(),Type,pBufferSize,ppBuffer); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn ReleaseDecoderBuffer(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder,Type: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_TYPE) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().ReleaseDecoderBuffer)(self.as_raw(),pDecoder.as_raw(),Type); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn DecoderBeginFrame(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder,pView: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoderOutputView,ContentKeySize: u32,pContentKey: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().DecoderBeginFrame)(self.as_raw(),pDecoder.as_raw(),pView.as_raw(),ContentKeySize,pContentKey.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn DecoderEndFrame(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().DecoderEndFrame)(self.as_raw(),pDecoder.as_raw()); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SubmitDecoderBuffers(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder,pBufferDesc: &[crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_BUFFER_DESC]) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().SubmitDecoderBuffers)(self.as_raw(),pDecoder.as_raw(),pBufferDesc.len() as _,pBufferDesc.as_ptr() as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn DecoderExtension(&self,pDecoder: &crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder,pExtensionData: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_EXTENSION) -> i32 {
+(self.vtable().DecoderExtension)(self.as_raw(),pDecoder.as_raw(),pExtensionData)}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputTargetRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,Enable: bool,pRect: Option<*const crate::Win32::Foundation::RECT>) -> () {
+(self.vtable().VideoProcessorSetOutputTargetRect)(self.as_raw(),pVideoProcessor.as_raw(),crate::core::BOOL(Enable as i32),pRect.unwrap_or(::core::ptr::null()))}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputBackgroundColor(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,YCbCr: bool,pColor: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR) -> () {
+(self.vtable().VideoProcessorSetOutputBackgroundColor)(self.as_raw(),pVideoProcessor.as_raw(),crate::core::BOOL(YCbCr as i32),pColor)}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputColorSpace(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pColorSpace: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> () {
+(self.vtable().VideoProcessorSetOutputColorSpace)(self.as_raw(),pVideoProcessor.as_raw(),pColorSpace)}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputAlphaFillMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,AlphaFillMode: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE,StreamIndex: u32) -> () {
+(self.vtable().VideoProcessorSetOutputAlphaFillMode)(self.as_raw(),pVideoProcessor.as_raw(),AlphaFillMode,StreamIndex)}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputConstriction(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,Enable: bool,Size: crate::Win32::Foundation::SIZE) -> () {
+(self.vtable().VideoProcessorSetOutputConstriction)(self.as_raw(),pVideoProcessor.as_raw(),crate::core::BOOL(Enable as i32),Size)}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputStereoMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,Enable: bool) -> () {
+(self.vtable().VideoProcessorSetOutputStereoMode)(self.as_raw(),pVideoProcessor.as_raw(),crate::core::BOOL(Enable as i32))}
+#[inline]
+pub unsafe fn VideoProcessorSetOutputExtension(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> i32 {
+(self.vtable().VideoProcessorSetOutputExtension)(self.as_raw(),pVideoProcessor.as_raw(),pExtensionGuid,DataSize,pData)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputTargetRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,Enabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> () {
+(self.vtable().VideoProcessorGetOutputTargetRect)(self.as_raw(),pVideoProcessor.as_raw(),Enabled,pRect)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputBackgroundColor(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pYCbCr: *mut crate::core::BOOL,pColor: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_COLOR) -> () {
+(self.vtable().VideoProcessorGetOutputBackgroundColor)(self.as_raw(),pVideoProcessor.as_raw(),pYCbCr,pColor)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputColorSpace(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pColorSpace: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> () {
+(self.vtable().VideoProcessorGetOutputColorSpace)(self.as_raw(),pVideoProcessor.as_raw(),pColorSpace)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputAlphaFillMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pAlphaFillMode: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ALPHA_FILL_MODE,pStreamIndex: *mut u32) -> () {
+(self.vtable().VideoProcessorGetOutputAlphaFillMode)(self.as_raw(),pVideoProcessor.as_raw(),pAlphaFillMode,pStreamIndex)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputConstriction(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pEnabled: *mut crate::core::BOOL,pSize: *mut crate::Win32::Foundation::SIZE) -> () {
+(self.vtable().VideoProcessorGetOutputConstriction)(self.as_raw(),pVideoProcessor.as_raw(),pEnabled,pSize)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputStereoMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pEnabled: *mut crate::core::BOOL) -> () {
+(self.vtable().VideoProcessorGetOutputStereoMode)(self.as_raw(),pVideoProcessor.as_raw(),pEnabled)}
+#[inline]
+pub unsafe fn VideoProcessorGetOutputExtension(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *mut ::core::ffi::c_void) -> i32 {
+(self.vtable().VideoProcessorGetOutputExtension)(self.as_raw(),pVideoProcessor.as_raw(),pExtensionGuid,DataSize,pData)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamFrameFormat(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,FrameFormat: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT) -> () {
+(self.vtable().VideoProcessorSetStreamFrameFormat)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,FrameFormat)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamColorSpace(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pColorSpace: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> () {
+(self.vtable().VideoProcessorSetStreamColorSpace)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pColorSpace)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamOutputRate(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,OutputRate: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_RATE,RepeatFrame: bool,pCustomRate: Option<*const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL>) -> () {
+(self.vtable().VideoProcessorSetStreamOutputRate)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,OutputRate,crate::core::BOOL(RepeatFrame as i32),pCustomRate.unwrap_or(::core::ptr::null()))}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamSourceRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,pRect: Option<*const crate::Win32::Foundation::RECT>) -> () {
+(self.vtable().VideoProcessorSetStreamSourceRect)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),pRect.unwrap_or(::core::ptr::null()))}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamDestRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,pRect: Option<*const crate::Win32::Foundation::RECT>) -> () {
+(self.vtable().VideoProcessorSetStreamDestRect)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),pRect.unwrap_or(::core::ptr::null()))}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamAlpha(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,Alpha: f32) -> () {
+(self.vtable().VideoProcessorSetStreamAlpha)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),Alpha)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamPalette(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEntries: Option<&[u32]>) -> () {
+(self.vtable().VideoProcessorSetStreamPalette)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,match &pEntries { Some(v) => v.len() as _, None => 0 },match pEntries { Some(v) => v.as_ptr() as _, None => ::core::ptr::null_mut() })}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamPixelAspectRatio(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,pSourceAspectRatio: Option<*const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL>,pDestinationAspectRatio: Option<*const crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL>) -> () {
+(self.vtable().VideoProcessorSetStreamPixelAspectRatio)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),pSourceAspectRatio.unwrap_or(::core::ptr::null()),pDestinationAspectRatio.unwrap_or(::core::ptr::null()))}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamLumaKey(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,Lower: f32,Upper: f32) -> () {
+(self.vtable().VideoProcessorSetStreamLumaKey)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),Lower,Upper)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamStereoFormat(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,Format: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FORMAT,LeftViewFrame0: bool,BaseViewFrame0: bool,FlipMode: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE,MonoOffset: i32) -> () {
+(self.vtable().VideoProcessorSetStreamStereoFormat)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),Format,crate::core::BOOL(LeftViewFrame0 as i32),crate::core::BOOL(BaseViewFrame0 as i32),FlipMode,MonoOffset)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamAutoProcessingMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool) -> () {
+(self.vtable().VideoProcessorSetStreamAutoProcessingMode)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32))}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamFilter(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER,Enable: bool,Level: i32) -> () {
+(self.vtable().VideoProcessorSetStreamFilter)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,Filter,crate::core::BOOL(Enable as i32),Level)}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamExtension(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> i32 {
+(self.vtable().VideoProcessorSetStreamExtension)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pExtensionGuid,DataSize,pData)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamFrameFormat(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pFrameFormat: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_FRAME_FORMAT) -> () {
+(self.vtable().VideoProcessorGetStreamFrameFormat)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pFrameFormat)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamColorSpace(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pColorSpace: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_COLOR_SPACE) -> () {
+(self.vtable().VideoProcessorGetStreamColorSpace)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pColorSpace)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamOutputRate(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pOutputRate: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_RATE,pRepeatFrame: *mut crate::core::BOOL,pCustomRate: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> () {
+(self.vtable().VideoProcessorGetStreamOutputRate)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pOutputRate,pRepeatFrame,pCustomRate)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamSourceRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> () {
+(self.vtable().VideoProcessorGetStreamSourceRect)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled,pRect)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamDestRect(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pRect: *mut crate::Win32::Foundation::RECT) -> () {
+(self.vtable().VideoProcessorGetStreamDestRect)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled,pRect)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamAlpha(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pAlpha: *mut f32) -> () {
+(self.vtable().VideoProcessorGetStreamAlpha)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled,pAlpha)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamPalette(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEntries: &mut [u32]) -> () {
+(self.vtable().VideoProcessorGetStreamPalette)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEntries.len() as _,pEntries.as_mut_ptr() as _)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamPixelAspectRatio(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pSourceAspectRatio: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL,pDestinationAspectRatio: *mut crate::Win32::Graphics::Dxgi::Common::DXGI_RATIONAL) -> () {
+(self.vtable().VideoProcessorGetStreamPixelAspectRatio)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled,pSourceAspectRatio,pDestinationAspectRatio)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamLumaKey(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL,pLower: *mut f32,pUpper: *mut f32) -> () {
+(self.vtable().VideoProcessorGetStreamLumaKey)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled,pLower,pUpper)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamStereoFormat(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnable: *mut crate::core::BOOL,pFormat: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FORMAT,pLeftViewFrame0: *mut crate::core::BOOL,pBaseViewFrame0: *mut crate::core::BOOL,pFlipMode: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STEREO_FLIP_MODE,MonoOffset: *mut i32) -> () {
+(self.vtable().VideoProcessorGetStreamStereoFormat)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnable,pFormat,pLeftViewFrame0,pBaseViewFrame0,pFlipMode,MonoOffset)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamAutoProcessingMode(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnabled: *mut crate::core::BOOL) -> () {
+(self.vtable().VideoProcessorGetStreamAutoProcessingMode)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnabled)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamFilter(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER,pEnabled: *mut crate::core::BOOL,pLevel: *mut i32) -> () {
+(self.vtable().VideoProcessorGetStreamFilter)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,Filter,pEnabled,pLevel)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamExtension(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pExtensionGuid: *const crate::core::GUID,DataSize: u32,pData: *mut ::core::ffi::c_void) -> i32 {
+(self.vtable().VideoProcessorGetStreamExtension)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pExtensionGuid,DataSize,pData)}
+#[inline]
+pub unsafe fn VideoProcessorBlt(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,pView: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorOutputView,OutputFrame: u32,pStreams: &[crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_STREAM]) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().VideoProcessorBlt)(self.as_raw(),pVideoProcessor.as_raw(),pView.as_raw(),OutputFrame,pStreams.len() as _,pStreams.as_ptr() as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn NegotiateCryptoSessionKeyExchange(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession,DataSize: u32,pData: *mut ::core::ffi::c_void) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().NegotiateCryptoSessionKeyExchange)(self.as_raw(),pCryptoSession.as_raw(),DataSize,pData); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn EncryptionBlt(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession,pSrcSurface: &crate::Win32::Graphics::Direct3D11::ID3D11Texture2D,pDstSurface: &crate::Win32::Graphics::Direct3D11::ID3D11Texture2D,IVSize: u32,pIV: Option<*mut ::core::ffi::c_void>) -> () {
+(self.vtable().EncryptionBlt)(self.as_raw(),pCryptoSession.as_raw(),pSrcSurface.as_raw(),pDstSurface.as_raw(),IVSize,pIV.unwrap_or(::core::ptr::null_mut()))}
+#[inline]
+pub unsafe fn DecryptionBlt(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession,pSrcSurface: &crate::Win32::Graphics::Direct3D11::ID3D11Texture2D,pDstSurface: &crate::Win32::Graphics::Direct3D11::ID3D11Texture2D,pEncryptedBlockInfo: Option<*const crate::Win32::Graphics::Direct3D11::D3D11_ENCRYPTED_BLOCK_INFO>,ContentKeySize: u32,pContentKey: Option<*const ::core::ffi::c_void>,IVSize: u32,pIV: Option<*mut ::core::ffi::c_void>) -> () {
+(self.vtable().DecryptionBlt)(self.as_raw(),pCryptoSession.as_raw(),pSrcSurface.as_raw(),pDstSurface.as_raw(),pEncryptedBlockInfo.unwrap_or(::core::ptr::null()),ContentKeySize,pContentKey.unwrap_or(::core::ptr::null()),IVSize,pIV.unwrap_or(::core::ptr::null_mut()))}
+#[inline]
+pub unsafe fn StartSessionKeyRefresh(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession,RandomNumberSize: u32,pRandomNumber: *mut ::core::ffi::c_void) -> () {
+(self.vtable().StartSessionKeyRefresh)(self.as_raw(),pCryptoSession.as_raw(),RandomNumberSize,pRandomNumber)}
+#[inline]
+pub unsafe fn FinishSessionKeyRefresh(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession) -> () {
+(self.vtable().FinishSessionKeyRefresh)(self.as_raw(),pCryptoSession.as_raw())}
+#[inline]
+pub unsafe fn GetEncryptionBltKey(&self,pCryptoSession: &crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession,KeySize: u32) -> Result<::core::ffi::c_void, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetEncryptionBltKey)(self.as_raw(),pCryptoSession.as_raw(),KeySize,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn NegotiateAuthenticatedChannelKeyExchange(&self,pChannel: &crate::Win32::Graphics::Direct3D11::ID3D11AuthenticatedChannel,DataSize: u32,pData: *mut ::core::ffi::c_void) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().NegotiateAuthenticatedChannelKeyExchange)(self.as_raw(),pChannel.as_raw(),DataSize,pData); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryAuthenticatedChannel(&self,pChannel: &crate::Win32::Graphics::Direct3D11::ID3D11AuthenticatedChannel,InputSize: u32,pInput: *const ::core::ffi::c_void,OutputSize: u32) -> Result<::core::ffi::c_void, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().QueryAuthenticatedChannel)(self.as_raw(),pChannel.as_raw(),InputSize,pInput,OutputSize,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn ConfigureAuthenticatedChannel(&self,pChannel: &crate::Win32::Graphics::Direct3D11::ID3D11AuthenticatedChannel,InputSize: u32,pInput: *const ::core::ffi::c_void) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_AUTHENTICATED_CONFIGURE_OUTPUT, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().ConfigureAuthenticatedChannel)(self.as_raw(),pChannel.as_raw(),InputSize,pInput,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn VideoProcessorSetStreamRotation(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,Enable: bool,Rotation: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION) -> () {
+(self.vtable().VideoProcessorSetStreamRotation)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,crate::core::BOOL(Enable as i32),Rotation)}
+#[inline]
+pub unsafe fn VideoProcessorGetStreamRotation(&self,pVideoProcessor: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor,StreamIndex: u32,pEnable: *mut crate::core::BOOL,pRotation: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_ROTATION) -> () {
+(self.vtable().VideoProcessorGetStreamRotation)(self.as_raw(),pVideoProcessor.as_raw(),StreamIndex,pEnable,pRotation)}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoContext { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoContext { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoContext { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoContext {}
+unsafe impl Sync for ID3D11VideoContext {}
+pub const IID_ID3D11VideoDecoder: crate::core::GUID = crate::core::GUID { data1: 1016879953, data2: 39261, data3: 18641, data4: [155,141,250,92,174,222,214,92,] };
+#[repr(C)]
+pub struct ID3D11VideoDecoder_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetCreationParameters: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,pConfig: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG) -> crate::core::HRESULT,
+pub GetDriverHandle: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDriverHandle: *mut crate::Win32::Foundation::HANDLE) -> crate::core::HRESULT,
+}
+#[repr(transparent)]
+pub struct ID3D11VideoDecoder(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoDecoder {
+pub const IID: crate::core::GUID = IID_ID3D11VideoDecoder;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoDecoder_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoDecoder_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetCreationParameters(&self,pVideoDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,pConfig: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().GetCreationParameters)(self.as_raw(),pVideoDesc,pConfig); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn GetDriverHandle(&self) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetDriverHandle)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoDecoder { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoDecoder { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoDecoder { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoDecoder {}
+unsafe impl Sync for ID3D11VideoDecoder {}
+pub const IID_ID3D11VideoDecoderOutputView: crate::core::GUID = crate::core::GUID { data1: 3264420586, data2: 10885, data3: 20256, data4: [134,15,251,161,253,37,110,24,] };
+#[repr(C)]
+pub struct ID3D11VideoDecoderOutputView_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11View_Vtbl,
+pub GetDesc: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11VideoDecoderOutputView(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoDecoderOutputView {
+pub const IID: crate::core::GUID = IID_ID3D11VideoDecoderOutputView;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoDecoderOutputView_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoDecoderOutputView_Vtbl) } }
+pub fn as_ID3D11View(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11View { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11View) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetDesc(&self,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC) -> () {
+(self.vtable().GetDesc)(self.as_raw(),pDesc)}
+#[inline]
+pub unsafe fn GetResource(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Resource, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetResource)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoDecoderOutputView { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoDecoderOutputView { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoDecoderOutputView { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoDecoderOutputView {}
+unsafe impl Sync for ID3D11VideoDecoderOutputView {}
+pub const IID_ID3D11VideoDevice: crate::core::GUID = crate::core::GUID { data1: 283921755, data2: 38746, data3: 18057, data4: [185,228,208,170,195,15,227,51,] };
+#[repr(C)]
+pub struct ID3D11VideoDevice_Vtbl {
+pub base__: crate::Win32::System::Com::IUnknown_Vtbl,
+pub CreateVideoDecoder: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pVideoDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,pConfig: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG,ppDecoder: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVideoProcessor: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pEnum: *mut ::core::ffi::c_void,RateConversionIndex: u32,ppVideoProcessor: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateAuthenticatedChannel: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,ChannelType: crate::Win32::Graphics::Direct3D11::D3D11_AUTHENTICATED_CHANNEL_TYPE,ppAuthenticatedChannel: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateCryptoSession: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoType: *const crate::core::GUID,pDecoderProfile: *const crate::core::GUID,pKeyExchangeType: *const crate::core::GUID,ppCryptoSession: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVideoDecoderOutputView: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pResource: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC,ppVDOVView: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVideoProcessorInputView: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pResource: *mut ::core::ffi::c_void,pEnum: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,ppVPIView: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVideoProcessorOutputView: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pResource: *mut ::core::ffi::c_void,pEnum: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,ppVPOView: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub CreateVideoProcessorEnumerator: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC,ppEnum: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+pub GetVideoDecoderProfileCount: unsafe extern "system" fn(this: *mut ::core::ffi::c_void) -> u32,
+pub GetVideoDecoderProfile: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,Index: u32,pDecoderProfile: *mut crate::core::GUID) -> crate::core::HRESULT,
+pub CheckVideoDecoderFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDecoderProfile: *const crate::core::GUID,Format: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,pSupported: *mut crate::core::BOOL) -> crate::core::HRESULT,
+pub GetVideoDecoderConfigCount: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,pCount: *mut u32) -> crate::core::HRESULT,
+pub GetVideoDecoderConfig: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,Index: u32,pConfig: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG) -> crate::core::HRESULT,
+pub GetContentProtectionCaps: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoType: *const crate::core::GUID,pDecoderProfile: *const crate::core::GUID,pCaps: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_CONTENT_PROTECTION_CAPS) -> crate::core::HRESULT,
+pub CheckCryptoKeyExchange: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCryptoType: *const crate::core::GUID,pDecoderProfile: *const crate::core::GUID,Index: u32,pKeyExchangeType: *mut crate::core::GUID) -> crate::core::HRESULT,
+pub SetPrivateData: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,guid: *const crate::core::GUID,DataSize: u32,pData: *const ::core::ffi::c_void) -> crate::core::HRESULT,
+pub SetPrivateDataInterface: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,guid: *const crate::core::GUID,pData: *mut ::core::ffi::c_void) -> crate::core::HRESULT,
+}
+#[repr(transparent)]
+pub struct ID3D11VideoDevice(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoDevice {
+pub const IID: crate::core::GUID = IID_ID3D11VideoDevice;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoDevice_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoDevice_Vtbl) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn CreateVideoDecoder(&self,pVideoDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,pConfig: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateVideoDecoder)(self.as_raw(),pVideoDesc,pConfig,&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoder::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateVideoProcessor(&self,pEnum: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator,RateConversionIndex: u32) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateVideoProcessor)(self.as_raw(),pEnum.as_raw(),RateConversionIndex,&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessor::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateAuthenticatedChannel(&self,ChannelType: crate::Win32::Graphics::Direct3D11::D3D11_AUTHENTICATED_CHANNEL_TYPE) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11AuthenticatedChannel, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateAuthenticatedChannel)(self.as_raw(),ChannelType,&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Direct3D11::ID3D11AuthenticatedChannel::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateCryptoSession(&self,pCryptoType: *const crate::core::GUID,pDecoderProfile: Option<*const crate::core::GUID>,pKeyExchangeType: *const crate::core::GUID) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateCryptoSession)(self.as_raw(),pCryptoType,pDecoderProfile.unwrap_or(::core::ptr::null()),pKeyExchangeType,&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Direct3D11::ID3D11CryptoSession::from_raw(result__)
+}
+#[inline]
+pub unsafe fn CreateVideoDecoderOutputView(&self,pResource: &crate::Win32::Graphics::Direct3D11::ID3D11Resource,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC,ppVDOVView: Option<*mut Option<crate::Win32::Graphics::Direct3D11::ID3D11VideoDecoderOutputView>>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().CreateVideoDecoderOutputView)(self.as_raw(),pResource.as_raw(),pDesc,ppVDOVView.unwrap_or(::core::ptr::null_mut()) as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn CreateVideoProcessorInputView(&self,pResource: &crate::Win32::Graphics::Direct3D11::ID3D11Resource,pEnum: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,ppVPIView: Option<*mut Option<crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorInputView>>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().CreateVideoProcessorInputView)(self.as_raw(),pResource.as_raw(),pEnum.as_raw(),pDesc,ppVPIView.unwrap_or(::core::ptr::null_mut()) as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn CreateVideoProcessorOutputView(&self,pResource: &crate::Win32::Graphics::Direct3D11::ID3D11Resource,pEnum: &crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,ppVPOView: Option<*mut Option<crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorOutputView>>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().CreateVideoProcessorOutputView)(self.as_raw(),pResource.as_raw(),pEnum.as_raw(),pDesc,ppVPOView.unwrap_or(::core::ptr::null_mut()) as _); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn CreateVideoProcessorEnumerator(&self,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CreateVideoProcessorEnumerator)(self.as_raw(),pDesc,&mut result__); hr__.ok()?;
+crate::Win32::Graphics::Direct3D11::ID3D11VideoProcessorEnumerator::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetVideoDecoderProfileCount(&self) -> u32 {
+(self.vtable().GetVideoDecoderProfileCount)(self.as_raw())}
+#[inline]
+pub unsafe fn GetVideoDecoderProfile(&self,Index: u32) -> Result<crate::core::GUID, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoDecoderProfile)(self.as_raw(),Index,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn CheckVideoDecoderFormat(&self,pDecoderProfile: *const crate::core::GUID,Format: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> Result<crate::core::BOOL, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CheckVideoDecoderFormat)(self.as_raw(),pDecoderProfile,Format,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoDecoderConfigCount(&self,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC) -> Result<u32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoDecoderConfigCount)(self.as_raw(),pDesc,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoDecoderConfig(&self,pDesc: *const crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_DESC,Index: u32) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_DECODER_CONFIG, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoDecoderConfig)(self.as_raw(),pDesc,Index,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetContentProtectionCaps(&self,pCryptoType: Option<*const crate::core::GUID>,pDecoderProfile: Option<*const crate::core::GUID>) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_CONTENT_PROTECTION_CAPS, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetContentProtectionCaps)(self.as_raw(),pCryptoType.unwrap_or(::core::ptr::null()),pDecoderProfile.unwrap_or(::core::ptr::null()),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn CheckCryptoKeyExchange(&self,pCryptoType: *const crate::core::GUID,pDecoderProfile: Option<*const crate::core::GUID>,Index: u32) -> Result<crate::core::GUID, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CheckCryptoKeyExchange)(self.as_raw(),pCryptoType,pDecoderProfile.unwrap_or(::core::ptr::null()),Index,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoDevice { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoDevice { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoDevice { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoDevice {}
+unsafe impl Sync for ID3D11VideoDevice {}
+pub const IID_ID3D11VideoProcessor: crate::core::GUID = crate::core::GUID { data1: 494601810, data2: 6239, data3: 16838, data4: [133,206,12,91,227,212,174,108,] };
+#[repr(C)]
+pub struct ID3D11VideoProcessor_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetContentDesc: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC) -> (),
+pub GetRateConversionCaps: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCaps: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11VideoProcessor(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoProcessor {
+pub const IID: crate::core::GUID = IID_ID3D11VideoProcessor;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoProcessor_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoProcessor_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetContentDesc(&self,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC) -> () {
+(self.vtable().GetContentDesc)(self.as_raw(),pDesc)}
+#[inline]
+pub unsafe fn GetRateConversionCaps(&self,pCaps: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS) -> () {
+(self.vtable().GetRateConversionCaps)(self.as_raw(),pCaps)}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoProcessor { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoProcessor { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoProcessor { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoProcessor {}
+unsafe impl Sync for ID3D11VideoProcessor {}
+pub const IID_ID3D11VideoProcessorEnumerator: crate::core::GUID = crate::core::GUID { data1: 828534839, data2: 21419, data3: 16896, data4: [144,97,5,250,169,171,69,249,] };
+#[repr(C)]
+pub struct ID3D11VideoProcessorEnumerator_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild_Vtbl,
+pub GetVideoProcessorContentDesc: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pContentDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC) -> crate::core::HRESULT,
+pub CheckVideoProcessorFormat: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,Format: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,pFlags: *mut u32) -> crate::core::HRESULT,
+pub GetVideoProcessorCaps: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pCaps: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CAPS) -> crate::core::HRESULT,
+pub GetVideoProcessorRateConversionCaps: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,TypeIndex: u32,pCaps: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS) -> crate::core::HRESULT,
+pub GetVideoProcessorCustomRate: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,TypeIndex: u32,CustomRateIndex: u32,pRate: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CUSTOM_RATE) -> crate::core::HRESULT,
+pub GetVideoProcessorFilterRange: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER,pRange: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER_RANGE) -> crate::core::HRESULT,
+}
+#[repr(transparent)]
+pub struct ID3D11VideoProcessorEnumerator(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoProcessorEnumerator {
+pub const IID: crate::core::GUID = IID_ID3D11VideoProcessorEnumerator;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoProcessorEnumerator_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoProcessorEnumerator_Vtbl) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetVideoProcessorContentDesc(&self) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CONTENT_DESC, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoProcessorContentDesc)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn CheckVideoProcessorFormat(&self,Format: crate::Win32::Graphics::Dxgi::Common::DXGI_FORMAT) -> Result<u32, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().CheckVideoProcessorFormat)(self.as_raw(),Format,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoProcessorCaps(&self) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CAPS, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoProcessorCaps)(self.as_raw(),&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoProcessorRateConversionCaps(&self,TypeIndex: u32) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_RATE_CONVERSION_CAPS, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoProcessorRateConversionCaps)(self.as_raw(),TypeIndex,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoProcessorCustomRate(&self,TypeIndex: u32,CustomRateIndex: u32) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_CUSTOM_RATE, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoProcessorCustomRate)(self.as_raw(),TypeIndex,CustomRateIndex,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetVideoProcessorFilterRange(&self,Filter: crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER) -> Result<crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_FILTER_RANGE, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+let hr__ = (self.vtable().GetVideoProcessorFilterRange)(self.as_raw(),Filter,&mut result__); hr__.ok()?;
+Ok(result__)
+}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoProcessorEnumerator { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoProcessorEnumerator { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoProcessorEnumerator { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoProcessorEnumerator {}
+unsafe impl Sync for ID3D11VideoProcessorEnumerator {}
+pub const IID_ID3D11VideoProcessorInputView: crate::core::GUID = crate::core::GUID { data1: 300702303, data2: 20956, data3: 18757, data4: [171,52,110,140,33,48,14,165,] };
+#[repr(C)]
+pub struct ID3D11VideoProcessorInputView_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11View_Vtbl,
+pub GetDesc: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11VideoProcessorInputView(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoProcessorInputView {
+pub const IID: crate::core::GUID = IID_ID3D11VideoProcessorInputView;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoProcessorInputView_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoProcessorInputView_Vtbl) } }
+pub fn as_ID3D11View(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11View { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11View) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetDesc(&self,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC) -> () {
+(self.vtable().GetDesc)(self.as_raw(),pDesc)}
+#[inline]
+pub unsafe fn GetResource(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Resource, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetResource)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoProcessorInputView { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoProcessorInputView { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoProcessorInputView { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoProcessorInputView {}
+unsafe impl Sync for ID3D11VideoProcessorInputView {}
+pub const IID_ID3D11VideoProcessorOutputView: crate::core::GUID = crate::core::GUID { data1: 2689083486, data2: 9641, data3: 17703, data4: [189,147,214,139,104,196,66,84,] };
+#[repr(C)]
+pub struct ID3D11VideoProcessorOutputView_Vtbl {
+pub base__: crate::Win32::Graphics::Direct3D11::ID3D11View_Vtbl,
+pub GetDesc: unsafe extern "system" fn(this: *mut ::core::ffi::c_void,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC) -> (),
+}
+#[repr(transparent)]
+pub struct ID3D11VideoProcessorOutputView(::core::ptr::NonNull<::core::ffi::c_void>);
+impl ID3D11VideoProcessorOutputView {
+pub const IID: crate::core::GUID = IID_ID3D11VideoProcessorOutputView;
+pub fn as_raw(&self) -> *mut ::core::ffi::c_void { self.0.as_ptr() }
+pub fn into_raw(self) -> *mut ::core::ffi::c_void { let p = self.as_raw(); ::core::mem::forget(self); p }
+pub unsafe fn from_raw(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { match ::core::ptr::NonNull::new(raw) { Some(p) => Ok(Self(p)), None => Err(crate::core::HRESULT(-2147467261)) } }
+pub unsafe fn query(raw: *mut ::core::ffi::c_void) -> Result<Self, crate::core::HRESULT> { Self::from_raw(crate::core::query(raw, &Self::IID)?) }
+pub fn vtable(&self) -> &ID3D11VideoProcessorOutputView_Vtbl { unsafe { &**(self.as_raw() as *const *const ID3D11VideoProcessorOutputView_Vtbl) } }
+pub fn as_ID3D11View(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11View { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11View) } }
+pub fn as_ID3D11DeviceChild(&self) -> &crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild { unsafe { &*(self as *const Self as *const crate::Win32::Graphics::Direct3D11::ID3D11DeviceChild) } }
+pub fn as_IUnknown(&self) -> &crate::Win32::System::Com::IUnknown { unsafe { &*(self as *const Self as *const crate::Win32::System::Com::IUnknown) } }
+#[inline]
+pub unsafe fn GetDesc(&self,pDesc: *mut crate::Win32::Graphics::Direct3D11::D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC) -> () {
+(self.vtable().GetDesc)(self.as_raw(),pDesc)}
+#[inline]
+pub unsafe fn GetResource(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Resource, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.GetResource)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetDevice(&self) -> Result<crate::Win32::Graphics::Direct3D11::ID3D11Device, crate::core::HRESULT> {
+let mut result__ = ::core::mem::zeroed();
+(self.vtable().base__.base__.GetDevice)(self.as_raw(),&mut result__);
+crate::Win32::Graphics::Direct3D11::ID3D11Device::from_raw(result__)
+}
+#[inline]
+pub unsafe fn GetPrivateData(&self,guid: *const crate::core::GUID,pDataSize: *mut u32,pData: Option<*mut ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.GetPrivateData)(self.as_raw(),guid,pDataSize,pData.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateData(&self,guid: *const crate::core::GUID,DataSize: u32,pData: Option<*const ::core::ffi::c_void>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateData)(self.as_raw(),guid,DataSize,pData.unwrap_or(::core::ptr::null())); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn SetPrivateDataInterface(&self,guid: *const crate::core::GUID,pData: Option<&crate::Win32::System::Com::IUnknown>) -> Result<(), crate::core::HRESULT> {
+let hr__ = (self.vtable().base__.base__.SetPrivateDataInterface)(self.as_raw(),guid,match pData { Some(v) => v.as_raw(), None => ::core::ptr::null_mut() }); hr__.ok()?;
+Ok(())
+}
+#[inline]
+pub unsafe fn QueryInterface(&self,riid: *const crate::core::GUID,ppvObject: *mut *mut ::core::ffi::c_void) -> crate::core::HRESULT {
+(self.vtable().base__.base__.base__.QueryInterface)(self.as_raw(),riid,ppvObject)}
+#[inline]
+pub unsafe fn AddRef(&self) -> u32 {
+(self.vtable().base__.base__.base__.AddRef)(self.as_raw())}
+#[inline]
+pub unsafe fn Release(&self) -> u32 {
+(self.vtable().base__.base__.base__.Release)(self.as_raw())}
+}
+impl Clone for ID3D11VideoProcessorOutputView { fn clone(&self) -> Self { unsafe { crate::core::add_ref(self.as_raw()); Self(self.0) } } }
+impl Drop for ID3D11VideoProcessorOutputView { fn drop(&mut self) { unsafe { crate::core::release(self.as_raw()); } } }
+impl ::core::cmp::PartialEq for ID3D11VideoProcessorOutputView { fn eq(&self, other: &Self) -> bool { self.as_raw() == other.as_raw() } }
+unsafe impl Send for ID3D11VideoProcessorOutputView {}
+unsafe impl Sync for ID3D11VideoProcessorOutputView {}
 pub const IID_ID3D11View: crate::core::GUID = crate::core::GUID { data1: 2208109078, data2: 47918, data3: 16683, data4: [183,244,169,219,235,224,142,209,] };
 #[repr(C)]
 pub struct ID3D11View_Vtbl {
@@ -8787,6 +10263,11 @@ pub const MM_MIM_LONGDATA: u32 = 964;
 pub const MM_MIM_LONGERROR: u32 = 966;
 pub const MM_MIM_MOREDATA: u32 = 972;
 pub const MM_MIM_OPEN: u32 = 961;
+mod import_timeBeginPeriod { #[link(name = "WINMM", kind = "raw-dylib")] extern "system" { #[link_name = "timeBeginPeriod"] pub fn call(uPeriod: u32) -> u32; } }
+pub use import_timeBeginPeriod::call as timeBeginPeriod_raw;
+#[inline]
+pub unsafe fn timeBeginPeriod(uPeriod: u32) -> u32 {
+import_timeBeginPeriod::call(uPeriod)}
 pub mod Audio {
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -16839,6 +18320,7 @@ impl ::core::ops::BitOr for FILE_MAP { type Output = Self; fn bitor(self, rhs: S
 impl ::core::ops::BitAnd for FILE_MAP { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for FILE_MAP { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for FILE_MAP { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const FILE_MAP_ALL_ACCESS: crate::Win32::System::Memory::FILE_MAP = crate::Win32::System::Memory::FILE_MAP(983071u64 as _);
 pub const FILE_MAP_READ: crate::Win32::System::Memory::FILE_MAP = crate::Win32::System::Memory::FILE_MAP(4u64 as _);
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -17731,6 +19213,12 @@ pub unsafe fn CreateProcessW(lpApplicationName: Option<crate::core::PCWSTR>,lpCo
 let hr__ = import_CreateProcessW::call(lpApplicationName.unwrap_or(unsafe { ::core::mem::zeroed() }),lpCommandLine.unwrap_or(unsafe { ::core::mem::zeroed() }),lpProcessAttributes.unwrap_or(::core::ptr::null()),lpThreadAttributes.unwrap_or(::core::ptr::null()),crate::core::BOOL(bInheritHandles as i32),dwCreationFlags,lpEnvironment.unwrap_or(::core::ptr::null()),lpCurrentDirectory.unwrap_or(unsafe { ::core::mem::zeroed() }),lpStartupInfo,lpProcessInformation); hr__.ok()?;
 Ok(())
 }
+mod import_CreateSemaphoreW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "CreateSemaphoreW"] pub fn call(lpSemaphoreAttributes: *const crate::Win32::Security::SECURITY_ATTRIBUTES,lInitialCount: i32,lMaximumCount: i32,lpName: crate::core::PCWSTR) -> crate::Win32::Foundation::HANDLE; } }
+pub use import_CreateSemaphoreW::call as CreateSemaphoreW_raw;
+#[inline]
+pub unsafe fn CreateSemaphoreW(lpSemaphoreAttributes: Option<*const crate::Win32::Security::SECURITY_ATTRIBUTES>,lInitialCount: i32,lMaximumCount: i32,lpName: Option<crate::core::PCWSTR>) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
+let hr__ = import_CreateSemaphoreW::call(lpSemaphoreAttributes.unwrap_or(::core::ptr::null()),lInitialCount,lMaximumCount,lpName.unwrap_or(unsafe { ::core::mem::zeroed() })); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
 mod import_DeleteProcThreadAttributeList { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "DeleteProcThreadAttributeList"] pub fn call(lpAttributeList: crate::Win32::System::Threading::LPPROC_THREAD_ATTRIBUTE_LIST) -> (); } }
 pub use import_DeleteProcThreadAttributeList::call as DeleteProcThreadAttributeList_raw;
 #[inline]
@@ -17752,6 +19240,13 @@ pub use import_GetCurrentThreadId::call as GetCurrentThreadId_raw;
 #[inline]
 pub unsafe fn GetCurrentThreadId() -> u32 {
 import_GetCurrentThreadId::call()}
+mod import_GetExitCodeProcess { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GetExitCodeProcess"] pub fn call(hProcess: crate::Win32::Foundation::HANDLE,lpExitCode: *mut u32) -> crate::core::BOOL; } }
+pub use import_GetExitCodeProcess::call as GetExitCodeProcess_raw;
+#[inline]
+pub unsafe fn GetExitCodeProcess(hProcess: crate::Win32::Foundation::HANDLE,lpExitCode: *mut u32) -> Result<(), crate::core::HRESULT> {
+let hr__ = import_GetExitCodeProcess::call(hProcess,lpExitCode); hr__.ok()?;
+Ok(())
+}
 mod import_GetProcessTimes { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "GetProcessTimes"] pub fn call(hProcess: crate::Win32::Foundation::HANDLE,lpCreationTime: *mut crate::Win32::Foundation::FILETIME,lpExitTime: *mut crate::Win32::Foundation::FILETIME,lpKernelTime: *mut crate::Win32::Foundation::FILETIME,lpUserTime: *mut crate::Win32::Foundation::FILETIME) -> crate::core::BOOL; } }
 pub use import_GetProcessTimes::call as GetProcessTimes_raw;
 #[inline]
@@ -17791,6 +19286,12 @@ pub use import_OpenProcess::call as OpenProcess_raw;
 #[inline]
 pub unsafe fn OpenProcess(dwDesiredAccess: crate::Win32::System::Threading::PROCESS_ACCESS_RIGHTS,bInheritHandle: bool,dwProcessId: u32) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
 let hr__ = import_OpenProcess::call(dwDesiredAccess,crate::core::BOOL(bInheritHandle as i32),dwProcessId); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
+}
+mod import_OpenSemaphoreW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "OpenSemaphoreW"] pub fn call(dwDesiredAccess: crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS,bInheritHandle: crate::core::BOOL,lpName: crate::core::PCWSTR) -> crate::Win32::Foundation::HANDLE; } }
+pub use import_OpenSemaphoreW::call as OpenSemaphoreW_raw;
+#[inline]
+pub unsafe fn OpenSemaphoreW(dwDesiredAccess: crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS,bInheritHandle: bool,lpName: crate::core::PCWSTR) -> Result<crate::Win32::Foundation::HANDLE, crate::core::HRESULT> {
+let hr__ = import_OpenSemaphoreW::call(dwDesiredAccess,crate::core::BOOL(bInheritHandle as i32),lpName); if hr__.is_invalid() {return Err(crate::core::HRESULT::from_thread());} return Ok(hr__);
 }
 #[repr(transparent)]
 #[derive(Clone, Copy)]
@@ -17838,6 +19339,7 @@ impl ::core::ops::BitOr for PROCESS_NAME_FORMAT { type Output = Self; fn bitor(s
 impl ::core::ops::BitAnd for PROCESS_NAME_FORMAT { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for PROCESS_NAME_FORMAT { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for PROCESS_NAME_FORMAT { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const PROCESS_QUERY_LIMITED_INFORMATION: crate::Win32::System::Threading::PROCESS_ACCESS_RIGHTS = crate::Win32::System::Threading::PROCESS_ACCESS_RIGHTS(4096u64 as _);
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: u32 = 131094;
 mod import_QueryFullProcessImageNameW { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "QueryFullProcessImageNameW"] pub fn call(hProcess: crate::Win32::Foundation::HANDLE,dwFlags: crate::Win32::System::Threading::PROCESS_NAME_FORMAT,lpExeName: crate::core::PWSTR,lpdwSize: *mut u32) -> crate::core::BOOL; } }
 pub use import_QueryFullProcessImageNameW::call as QueryFullProcessImageNameW_raw;
@@ -17853,6 +19355,7 @@ pub unsafe fn ReleaseSemaphore(hSemaphore: crate::Win32::Foundation::HANDLE,lRel
 let hr__ = import_ReleaseSemaphore::call(hSemaphore,lReleaseCount,lpPreviousCount.unwrap_or(::core::ptr::null_mut())); hr__.ok()?;
 Ok(())
 }
+pub const SEMAPHORE_MODIFY_STATE: crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS = crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(2u64 as _);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct STARTUPINFOEXW {
@@ -17897,6 +19400,19 @@ impl ::core::ops::BitOr for STARTUPINFOW_FLAGS { type Output = Self; fn bitor(se
 impl ::core::ops::BitAnd for STARTUPINFOW_FLAGS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
 impl ::core::ops::BitXor for STARTUPINFOW_FLAGS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
 impl ::core::ops::Not for STARTUPINFOW_FLAGS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub struct SYNCHRONIZATION_ACCESS_RIGHTS(pub u32);
+impl SYNCHRONIZATION_ACCESS_RIGHTS { pub fn default() -> Self { unsafe { ::core::mem::zeroed() } } pub fn is_invalid(self) -> bool { self.0 as isize == 0 || self.0 as isize == -1 } }
+impl ::core::default::Default for SYNCHRONIZATION_ACCESS_RIGHTS { fn default() -> Self {Self::default()} }
+impl ::core::cmp::PartialEq for SYNCHRONIZATION_ACCESS_RIGHTS { fn eq(&self, other: &Self) -> bool { self.0 == other.0 } }
+impl ::core::cmp::Eq for SYNCHRONIZATION_ACCESS_RIGHTS {}
+impl ::core::fmt::Debug for SYNCHRONIZATION_ACCESS_RIGHTS { fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result { ::core::fmt::Debug::fmt(&self.0, f) } }
+impl ::core::ops::BitOr for SYNCHRONIZATION_ACCESS_RIGHTS { type Output = Self; fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) } }
+impl ::core::ops::BitAnd for SYNCHRONIZATION_ACCESS_RIGHTS { type Output = Self; fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) } }
+impl ::core::ops::BitXor for SYNCHRONIZATION_ACCESS_RIGHTS { type Output = Self; fn bitxor(self, rhs: Self) -> Self { Self(self.0 ^ rhs.0) } }
+impl ::core::ops::Not for SYNCHRONIZATION_ACCESS_RIGHTS { type Output = Self; fn not(self) -> Self { Self(!self.0) } }
+pub const SYNCHRONIZATION_SYNCHRONIZE: crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS = crate::Win32::System::Threading::SYNCHRONIZATION_ACCESS_RIGHTS(1048576u64 as _);
 mod import_SetEvent { #[link(name = "KERNEL32", kind = "raw-dylib")] extern "system" { #[link_name = "SetEvent"] pub fn call(hEvent: crate::Win32::Foundation::HANDLE) -> crate::core::BOOL; } }
 pub use import_SetEvent::call as SetEvent_raw;
 #[inline]
