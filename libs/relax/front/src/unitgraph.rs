@@ -335,7 +335,7 @@ pub fn run_build_scripts(sess: &std::sync::Arc<crate::Session>, g: &mut Graph, t
             let name = g.crates[bs.krate].name.clone();
             let out_dir = format!("{}/build/{}-answered/out", target_dir, name);
             std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {}", out_dir, e))?;
-            let lines = platform_answer(sess, bs, &out_dir)?;
+            let lines = platform_answer(sess, &out_dir)?;
             results.lock().unwrap().push((bs.krate, Ok(lines.join("\n")), out_dir));
         }
         return apply_script_results(g, results.into_inner().unwrap());
@@ -854,49 +854,39 @@ fn path_lock(path: &str) -> relax_session::sync::MutexGuard<'static, ()> {
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// What makepad-platform's build.rs (platform/build.rs) gives the build, as makepad run knows it,
-/// for no-codegen mode, where the script does not run: its cfgs (`hal` on Apple targets or with
-/// `--cfg hal`; `use_vulkan`, `apple_sim`, `use_gles_3` from the target; the backend words of the
+/// for no-codegen mode, where the script does not run: its cfgs (`hal` on Apple targets, Android
+/// and Linux or with `--cfg hal`; `apple_sim`, `use_gles_3` from the target; the words of the
 /// MAKEPAD variable) and its two OUT_DIR files, app_meta_gen.rs (the default bundle name and
 /// identifier, from the folder that holds the target folder) and app_icon_gen.rs (the icons in
 /// that folder's resources/). Its link lines are the host binary's: in this mode nothing is
 /// linked at run time. Its side files (makepad-platform.path, a target-folder Info.plist) are for
 /// cargo runs only.
-fn platform_answer(sess: &std::sync::Arc<crate::Session>, bs: &BuildScript, out_dir: &str) -> Result<Vec<String>, String> {
+fn platform_answer(sess: &std::sync::Arc<crate::Session>, out_dir: &str) -> Result<Vec<String>, String> {
     let env: Vec<(String, String)> = crate::cfg::CfgSet::host(sess, &[]).build_script_env();
     let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
     let target_os = get("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = get("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    let target_arch = get("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target = target_triple(sess);
     let makepad: Vec<String> = std::env::var("MAKEPAD").map(|c| c.split(['+', ',']).map(str::to_string).collect()).unwrap_or_default();
     let mut lines = Vec::new();
     let mut cfg = |c: &str| lines.push(format!("cargo:rustc-cfg={}", c));
-    // macOS, iOS and tvOS run on the HAL only (platform/build.rs with the hal-ios switch)
-    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos") || get("CARGO_CFG_HAL").is_some();
+    // platform/build.rs: Apple targets, Android and desktop Linux always use the HAL
+    let desktop_linux = target_os == "linux";
+    let hal = matches!(target_os.as_str(), "macos" | "ios" | "tvos" | "android") || desktop_linux || get("CARGO_CFG_HAL").is_some();
     if hal {
         cfg("hal");
     }
-    let names_gpu_api = hal || makepad.iter().any(|c| matches!(c.as_str(), "gl" | "vulkan" | "use_vulkan" | "gpusim" | "quest"));
-    let windowed_desktop_linux = target_os == "linux" && target_env == "gnu" && matches!(target_arch.as_str(), "x86_64" | "aarch64") && !makepad.iter().any(|c| c == "linux_direct");
-    if windowed_desktop_linux && bs.features.iter().any(|f| f == "vulkan") && !names_gpu_api {
-        cfg("use_vulkan");
-    }
     for c in &makepad {
         match c.as_str() {
-            "lines" | "linux_direct" | "no_android_choreographer" | "apple_bundle" | "gpusim" | "use_gles_3" => cfg(c),
-            "quest" => {
-                cfg("quest");
-                cfg("use_gles_3");
-                cfg("use_vulkan");
-            }
-            "vulkan" | "use_vulkan" => cfg("use_vulkan"),
+            "lines" | "apple_bundle" | "gpusim" => cfg(c),
+            "use_gles_3" if !desktop_linux => cfg(c),
+            "vulkan" | "use_vulkan" if !desktop_linux => cfg("use_vulkan"),
             _ => {}
         }
     }
     match target_os.as_str() {
         "ios" if target == "aarch64-apple-ios-sim" => cfg("apple_sim"),
         "tvos" if target == "aarch64-apple-tvos-sim" => cfg("apple_sim"),
-        "linux" | "android" => cfg("use_gles_3"),
+        "android" => cfg("use_gles_3"),
         _ => {}
     }
     // app_meta_gen.rs: the folder that holds the target folder names the app (detect_app_name)
