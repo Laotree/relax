@@ -351,6 +351,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let mut boundary: Option<Vec<String>> = None;
     let mut root_only = false;
     let mut selftest = false;
+    // `makepad check --workspace`: every workspace crate the package reaches, not only its app crates
+    let mut workspace_check = false;
     let mut i = 0;
     while i < args.len() && args[i].starts_with("--") {
         match args[i].as_str() {
@@ -363,6 +365,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             "--root-only" => root_only = true,
             // `makepad selftest` (lib.rs): the check, then every fn compiled (check.rs)
             "--selftest" => selftest = true,
+            "--workspace" => workspace_check = true,
             "--verbose" => driver_options.verbose = true,
             "--report-to" if i + 1 < args.len() => {
                 if let Err(e) = report_open(&args[i + 1]) {
@@ -953,7 +956,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         let mut pre = crate::macro_reg::derive_failures();
         pre.extend(watch_load_errors);
         // the watch session reports its root crate's; a one-shot check every workspace crate's
-        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
+        let checked = if watch || root_only || session.is_some() { vec![root] } else if selftest || workspace_check { crate::check::workspace_crates(&prog, root) } else { crate::check::app_crates(&prog, root) };
         // A run checks coherence in the background; a check needs its errors now: the app
         // check its own crates' impls (cargo check), every other check all of them.
         let t = Instant::now();
@@ -974,7 +977,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         if selftest || watch || root_only || session.is_some() {
             unsafe { jit::load_all_skipped(&mut *u) };
         } else {
-            let crates = crate::check::app_crates(&u.prog, root);
+            let crates = if workspace_check { crate::check::workspace_crates(&u.prog, root) } else { crate::check::app_crates(&u.prog, root) };
             unsafe { jit::load_skipped_of(&mut *u, &crates) };
         }
         phase("load checked files", t);
@@ -1002,7 +1005,7 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
             let mut session = crate::serve::Session::new(u, root, pre);
             return session.watch(deep);
         }
-        let code = crate::check::check_crate(&mut u, root, pre, root_only, selftest);
+        let code = crate::check::check_crate(&mut u, root, pre, root_only, selftest, workspace_check);
         // the parsed files go to the cache's front images as a run's do (one store shared with
         // `makepad run`): the next check (or run) of the package maps them instead of parsing
         // every file again (Stage: 6 s of a warm check was parsing)

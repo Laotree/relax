@@ -195,6 +195,11 @@ pub fn run(opts: Options) -> Result<(), String> {
         let out_log = work.join(format!("check-{pkg}.log"));
         let mut cmd = std::process::Command::new(&exe);
         cmd.arg("check").arg("--no-serve");
+        // every workspace crate the package reaches (platform, widgets, its families ...), for the
+        // target: an app check covers only the app's own crates, and an error in a shared crate under
+        // the target's cfgs (video.rs on Android) otherwise first shows up as a JIT compile error on
+        // the device. About 12-17 s per package on the Mac with the shared cache.
+        cmd.arg("--workspace");
         cmd.arg(pkg).args(flags).current_dir(&root);
         cmd.env("MAKEPAD_RUN_CACHE_DIR", work.join("cache"));
         cmd.env("MAKEPAD_RUN_READ_LOG", &log);

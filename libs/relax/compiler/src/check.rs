@@ -88,8 +88,8 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
 
 /// `selftest`: every workspace crate, then every function compiled (see the module doc); else
 /// the app check of the application's crates.
-pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool, selftest: bool) -> i32 {
-    let crates = if root_only { vec![root] } else if selftest { workspace_crates(&u.prog, root) } else { app_crates(&u.prog, root) };
+pub fn check_crate(u: &mut Unit, root: u32, errors: Vec<String>, root_only: bool, selftest: bool, workspace: bool) -> i32 {
+    let crates = if root_only { vec![root] } else if selftest || workspace { workspace_crates(&u.prog, root) } else { app_crates(&u.prog, root) };
     check_crate_impl(u, root, &crates, errors, true, selftest).0
 }
 
