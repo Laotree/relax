@@ -53,7 +53,10 @@ impl Bytes {
         Bytes { ptr: std::ptr::null(), len: v.len(), mapped: false, owned: v }
     }
 
-    /// The file mapped read-only and private (packs are immutable: written whole, then renamed).
+    /// The file mapped read-only, shared: the page cache's pages (packs are immutable: written whole,
+    /// then renamed; a store's committed payloads never change). Not MAP_PRIVATE: macOS sets up a
+    /// private file mapping slowly (~1.9 ms each on an M4, ~0.002 ms shared), and read-only the two
+    /// read the same bytes.
     pub fn map(path: &Path) -> Option<Bytes> {
         #[cfg(unix)]
         {
@@ -67,8 +70,8 @@ impl Bytes {
                 return None;
             }
             const PROT_READ: i32 = 1;
-            const MAP_PRIVATE: i32 = 2;
-            let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_PRIVATE, f.as_raw_fd(), 0) };
+            const MAP_SHARED: i32 = 1;
+            let p = unsafe { mmap(std::ptr::null_mut(), len, PROT_READ, MAP_SHARED, f.as_raw_fd(), 0) };
             if p.is_null() || p as isize == -1 {
                 return None;
             }
@@ -102,7 +105,7 @@ fn forget_mapping(start: usize) {
 /// Drops this process's resident pages of the cache file mappings (settle). Opening a warm
 /// cache touches pages all over the images (headers, indexes, and the kernel's fault-around
 /// maps up to 16 neighbouring page-cache pages per fault), and they stay counted in RSS/PSS for
-/// the rest of the run though few are read again. The mappings are read-only and private, so
+/// the rest of the run though few are read again. The mappings are read-only file pages, so
 /// nothing is lost: a later read faults the page back from the page cache (a minor fault).
 /// Linux/Android only; macOS does not count clean file pages in the footprint. Returns bytes advised.
 pub fn release_resident() -> usize {
@@ -143,8 +146,11 @@ pub fn map_pinned(file: &std::fs::File, off: u64, len: usize) -> Option<&'static
     let base = off & !(page - 1);
     let span = (off - base) as usize + len;
     const PROT_READ: i32 = 1;
-    const MAP_PRIVATE: i32 = 2;
-    let p = unsafe { mmap(std::ptr::null_mut(), span, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), base as i64) };
+    // shared, not private: a private file mapping costs ~1.9 ms to set up on macOS (an M4, while
+    // the file is being appended to), and a cold Stage maps ~3.5k images on the load thread (6.5 s);
+    // read-only, both read the page cache's bytes, and an appended payload never changes
+    const MAP_SHARED: i32 = 1;
+    let p = unsafe { mmap(std::ptr::null_mut(), span, PROT_READ, MAP_SHARED, file.as_raw_fd(), base as i64) };
     if p.is_null() || p as isize == -1 {
         return None;
     }
