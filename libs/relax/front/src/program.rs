@@ -259,6 +259,9 @@ pub struct Def {
     pub scope: u32,
 }
 
+pub const IMPORT_PUB: u8 = 1;
+pub const IMPORT_EXTERN: u8 = 2;
+
 pub struct Module {
     pub def: DefId,
     /// lexical parent for anonymous block modules (lookups fall through)
@@ -275,9 +278,9 @@ pub struct Module {
     pub globs: Vec<(DefId, bool)>,
     /// traits imported `as _` (in scope for method calls, no name)
     pub anon_traits: Vec<(DefId, bool)>,
-    /// visibility of import bindings (name, type ns) -> `pub use`; an item's own binding has
-    /// its item's visibility
-    pub import_pub: HashMap<(Sym, bool), bool>,
+    /// import bindings (name, type ns) -> IMPORT_PUB (`pub use`) | IMPORT_EXTERN (`extern crate`);
+    /// an item's own binding has its item's visibility
+    pub import_pub: HashMap<(Sym, bool), u8>,
 }
 
 /// How good an import path is to suggest: this crate's, then std's facade, then other crates',
@@ -376,6 +379,10 @@ pub struct Import {
     pub done: bool,
     pub file: u32,
     pub pos: u32,
+    /// `extern crate` (not `use`)
+    pub ext: bool,
+    /// namespaces this import has bound so far (bit 0 types, bit 1 values)
+    pub bound: u8,
 }
 
 /// Module indexes of the std prelude (Program::prelude_ids).
@@ -1208,7 +1215,7 @@ impl Program {
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root_mod as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root_mod && i.bind == Some(inj));
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
-                self.imports.push(Import { module: root_mod, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0 });
+                self.imports.push(Import { module: root_mod, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: 4 });
             }
         }
         // files no module loads (cfg'd out in ways the scan does not see)
@@ -1444,7 +1451,7 @@ impl Program {
             }
             for (def, public) in &m.globs { if !skip_globs || self.def(*def).kind != DefKind::Mod || files.contains(self.file_paths.get(self.mods[self.def(*def).sub as usize].file as usize).map_or("", String::as_str)) { bindings.push(format!("glob {public} {}", key(*def))); } }
             for (def, public) in &m.anon_traits { bindings.push(format!("trait {public} {}", key(*def))); }
-            for ((name, types), public) in &m.import_pub { if kept(*name, None) { bindings.push(format!("visibility {} {types} {public}", self.syms.str(*name))); } }
+            for ((name, types), public) in &m.import_pub { if kept(*name, None) { bindings.push(format!("visibility {} {types} {}", self.syms.str(*name), public & IMPORT_PUB != 0)); } }
             bindings.sort();
             out.entry(module).or_default().push(format!("{bindings:?}"));
         }
@@ -2131,7 +2138,7 @@ impl Program {
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root && i.bind == Some(inj));
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
-                self.imports.push(Import { module: root, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0 });
+                self.imports.push(Import { module: root, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: 4 });
             }
         }
         self.expand_pending(krate, self.crates[krate as usize].edition);
@@ -2617,9 +2624,9 @@ impl Program {
                     // written against `makepad_draw::..` also compiles inside makepad-draw)
                     let this = self.syms.str(name) == "self";
                     if this {
-                        self.imports.push(Import { module, global: false, segs: vec![(SegKind::Crate, name)], bind: Some(bind), glob: false, is_pub, done: false, file, pos });
+                        self.imports.push(Import { module, global: false, segs: vec![(SegKind::Crate, name)], bind: Some(bind), glob: false, is_pub, done: false, file, pos, ext: true, bound: 0 });
                     } else {
-                        self.imports.push(Import { module, global: true, segs: vec![(SegKind::Ident, name)], bind: Some(bind), glob: false, is_pub, done: false, file, pos });
+                        self.imports.push(Import { module, global: true, segs: vec![(SegKind::Ident, name)], bind: Some(bind), glob: false, is_pub, done: false, file, pos, ext: true, bound: 0 });
                     }
                     // at the crate root it also names the crate in the extern prelude (rustc:
                     // `extern crate alloc_no_stdlib as alloc;` makes `alloc::..` that crate in
@@ -2793,10 +2800,10 @@ impl Program {
                         None => s,
                     };
                 }
-                self.imports.push(Import { module, global, segs, bind: Some(bind), glob: false, is_pub, done: false, file, pos });
+                self.imports.push(Import { module, global, segs, bind: Some(bind), glob: false, is_pub, done: false, file, pos, ext: false, bound: 0 });
             }
             UseTree::Glob => {
-                self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub, done: false, file, pos });
+                self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub, done: false, file, pos, ext: false, bound: 0 });
             }
             UseTree::Group(v) => {
                 for x in self.files[file as usize].ast.list(*v).to_vec() {
@@ -3572,18 +3579,27 @@ impl Program {
         if self.imports_done && (tdef.is_some() || vdef.is_some()) {
             self.scope_cache.clear();
         }
-        if let Some(d) = tdef {
+        let (ext, ipos, ifile, injected) = (self.imports[i].ext, self.imports[i].pos, self.imports[i].file, self.imports[i].bound & 4 != 0);
+        let flags = is_pub as u8 | if ext { IMPORT_EXTERN } else { 0 };
+        for (ns_type, found) in [(true, tdef), (false, vdef)] {
+            let Some(d) = found else { continue };
+            let bit = if ns_type { 1 } else { 2 };
             let m = &mut self.mods[module as usize];
-            if !m.types.contains_key(&bind) {
-                m.types.insert(bind, d);
-                m.import_pub.insert((bind, true), is_pub);
-            }
-        }
-        if let Some(d) = vdef {
-            let m = &mut self.mods[module as usize];
-            if !m.values.contains_key(&bind) {
-                m.values.insert(bind, d);
-                m.import_pub.insert((bind, false), is_pub);
+            let taken = if ns_type { m.types.get(&bind).copied() } else { m.values.get(&bind).copied() };
+            match taken {
+                None => {
+                    if ns_type { m.types.insert(bind, d); } else { m.values.insert(bind, d); }
+                    m.import_pub.insert((bind, ns_type), flags);
+                    self.imports[i].bound |= bit;
+                }
+                Some(old) => {
+                    // the name is bound twice (rustc_resolve diagnostics.rs `report_conflict`)
+                    if self.imports[i].bound & bit == 0 && !injected {
+                        let old_flags = m.import_pub.get(&(bind, ns_type)).copied();
+                        self.imports[i].bound |= bit;
+                        self.report_name_clash(bind, ns_type, old, old_flags, (ext, ipos, ifile));
+                    }
+                }
             }
         }
         // one namespace found while an import into the source module that binds the same name
@@ -3604,6 +3620,41 @@ impl Program {
             }
         }
         true
+    }
+
+    /// E0252/E0254/E0255/E0259/E0260 (rustc_resolve diagnostics.rs `report_conflict`): the import
+    /// `new` binds a name that `old` already bound in the module (`old_flags`: the import's flags,
+    /// None for an item). The error is on the later of the two bindings.
+    fn report_name_clash(&mut self, name: Sym, ns_type: bool, old: DefId, old_flags: Option<u8>, new: (bool, u32, u32)) {
+        let (n_ext, npos, nfile) = new;
+        let o_ext = old_flags.map_or(false, |f| f & IMPORT_EXTERN != 0);
+        let o_item = old_flags.is_none();
+        let code = if o_ext && n_ext {
+            "E0259"
+        } else if o_ext || n_ext {
+            if o_item { "E0260" } else { "E0254" }
+        } else if o_item {
+            "E0255"
+        } else {
+            "E0252"
+        };
+        // an item bound earlier than the import resolved may come later in the source
+        let (file, pos) = if o_item {
+            let od = self.def(old);
+            let item = od.item;
+            let f = od.file;
+            match self.files.get(f as usize).and_then(|pf| pf.ast.items.get(item.0 as usize)) {
+                Some(it) if item.0 != u32::MAX && f == nfile && it.lo > npos => (f, it.lo),
+                _ => (nfile, npos),
+            }
+        } else {
+            (nfile, npos)
+        };
+        let ns = if ns_type { "type" } else { "value" };
+        let n = self.syms.str(name).to_string();
+        let msg = format!("{code}: the name `{n}` is defined multiple times -- note: `{n}` must be defined only once in the {ns} namespace of this module");
+        let e = self.record_error(file, pos, "resolve", msg);
+        self.errors.push(e);
     }
 
     /// Whether module `src` or a module its resolved globs reach (transitively) has an open
@@ -3676,7 +3727,7 @@ impl Program {
     fn binding_vis(&self, m: u32, name: Sym, ns_type: bool, d: DefId) -> BindVis {
         let md = &self.mods[m as usize];
         let is_pub = match md.import_pub.get(&(name, ns_type)) {
-            Some(p) => *p,
+            Some(p) => p & IMPORT_PUB != 0,
             None => self.def(d).is_pub,
         };
         if is_pub {
