@@ -1591,6 +1591,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     crate::lint_late2::check_eq_impls(prog, tcx, own);
     crate::lint_late2::check_use_deprecations(prog, tcx, own);
     crate::lint_late2::check_signature_deprecations(prog, tcx, own);
+    crate::lint_late2::check_refining_impls(prog, tcx, own);
 }
 
 /// rustc_ast::util::unicode TEXT_FLOW_CONTROL_CHARS.
@@ -2079,7 +2080,7 @@ fn ty_children(tcx: &Tcx, ty: TyId) -> Vec<TyId> {
 }
 
 /// Position of a syntax type (the first path or nested element), when it has one.
-fn ast_ty_pos(ast: &Ast, t: crate::ast::TyId) -> Option<u32> {
+pub(crate) fn ast_ty_pos(ast: &Ast, t: crate::ast::TyId) -> Option<u32> {
     match *ast.ty(t) {
         Ty::Path(p) => Some(p.lo),
         Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => ast_ty_pos(ast, x),
@@ -2324,13 +2325,17 @@ impl<'a> Dp<'a> {
         let mut since = None;
         let mut note = None;
         let unq = |t: &[u8]| String::from_utf8_lossy(t).trim_matches('"').to_string();
+        // a value that is no string literal is a malformed attribute (an error): it deprecates nothing
+        let is_str = |t: &[u8]| t.first() == Some(&b'"') || t.first() == Some(&b'r');
         let mut i = lo + 1;
         if i < hi && crate::cfg::tok_str(p, i) == b"=" && i + 1 < hi {
+            if !is_str(crate::cfg::tok_str(p, i + 1)) { return None; }
             note = Some(unq(crate::cfg::tok_str(p, i + 1)));
         } else {
             while i + 2 < hi {
                 let name = crate::cfg::tok_str(p, i);
                 if crate::cfg::tok_str(p, i + 1) == b"=" {
+                    if !is_str(crate::cfg::tok_str(p, i + 2)) { return None; }
                     let v = unq(crate::cfg::tok_str(p, i + 2));
                     if name == b"since" { since = Some(v); } else if name == b"note" { note = Some(v); }
                     i += 3;

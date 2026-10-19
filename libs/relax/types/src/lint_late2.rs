@@ -1653,3 +1653,59 @@ impl<'a> L2<'a> {
         self.emit(&CONST_ITEM_INTERIOR_MUTATIONS, ast.expr(e).lo, &format!("mutation of an interior mutable `const` item with call to `{}`", name));
     }
 }
+
+// ---------------------------------------------------------------- refining_impl_trait (compare_impl_item/refine.rs)
+
+pub const REFINING_IMPL_TRAIT_REACHABLE: Lint = lint::lint("refining_impl_trait_reachable", Level::Warn, &["refining_impl_trait"]);
+pub const REFINING_IMPL_TRAIT_INTERNAL: Lint = lint::lint("refining_impl_trait_internal", Level::Warn, &["refining_impl_trait"]);
+
+/// The impl methods whose return-position `impl Trait` in the trait is implemented by a type that is
+/// not an opaque of the impl method itself ("the hidden type is not an opaque": the first
+/// refinement test of `check_refining_return_position_impl_trait_in_trait`). The bound-set and
+/// capture comparisons are not ported.
+pub fn check_refining_impls(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    for i in 0..prog.defs.len() {
+        let d = prog.defs[i];
+        if d.kind != DefKind::AssocFn || !own.get(d.krate as usize).copied().unwrap_or(false) || d.parent == crate::program::NO_DEF { continue; }
+        if prog.def(d.parent).kind != DefKind::Impl || tcx.impl_trait.get(&d.parent).is_none() { continue; }
+        let id = DefId(i as u32);
+        let Some(&trait_m) = prog.trait_item_def_id.get(&id) else { continue };
+        // the trait method has return-position impl trait: some RPITIT synthesized for it
+        let has_rpitit = prog.impl_trait_in_trait_data.iter().any(|(_, v)| matches!(v, relax_front::assoc::ImplTraitInTraitData::Trait { fn_def_id, .. } if *fn_def_id == trait_m));
+        if !has_rpitit { continue; }
+        let Ok(hidden) = tcx.collect_return_position_impl_trait_in_trait_tys(prog, id) else { continue };
+        if hidden.iter().any(|&(_, t)| tcx.tys.has_error(t)) { continue; }
+        let mut refined = false;
+        for &(_, t) in &hidden {
+            match *tcx.tys.kind(t) {
+                TyKind::Alias(_, crate::types::AliasTy { kind: crate::types::AliasTyKind::Opaque { def_id }, .. }) => {
+                    // an opaque of some other item: a TAIT
+                    let od = prog.def(def_id);
+                    let mut p = od.parent;
+                    let mut ok = false;
+                    for _ in 0..8 { if p == id { ok = true; break; } if p == crate::program::NO_DEF { break; } p = prog.def(p).parent; }
+                    if !ok { refined = true; }
+                }
+                _ => refined = true,
+            }
+        }
+        if !refined { continue; }
+        let ast = &prog.files[d.file as usize].ast;
+        let item = *ast.item(d.item);
+        let ItemKind::Fn(sig, _, _) = item.kind else { continue };
+        let sig = *ast.fn_sig(sig);
+        let pos = match sig.ret {
+            Some(r) => match *ast.ty(r) {
+                Ty::ImplTrait(bs) => ast.list(bs).iter().find_map(|b| if let Bound::Trait { path, .. } = *b { Some(path.lo) } else { None }).unwrap_or(item.name.lo),
+                _ => crate::lint_late::ast_ty_pos(ast, r).unwrap_or(item.name.lo),
+            },
+            None => item.lo,
+        };
+        if lint::external(prog, d.file, pos) { continue; }
+        // `is_internal`: the trait is not reachable
+        let trait_def = prog.def(prog.def(trait_m).parent);
+        let internal = !trait_def.is_pub;
+        let lint_ = if internal { &REFINING_IMPL_TRAIT_INTERNAL } else { &REFINING_IMPL_TRAIT_REACHABLE };
+        lint::emit(prog, id, lint_, d.file, pos, "impl trait in impl method signature does not match trait method signature");
+    }
+}
