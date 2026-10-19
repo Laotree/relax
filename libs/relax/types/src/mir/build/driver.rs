@@ -111,10 +111,11 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
             let kind = super::owner_kind_name(b.kind);
             let slot = by_kind.entry(kind).or_insert((0, 0));
             slot.0 += 1;
+            let mut loc = String::new();
             let at = if let BodyKind::Closure(e) = b.kind {
                 let lo = prog.files[typeck_body.file as usize].ast.expr(e).lo;
-                let line = line_of(prog, typeck_body.file, lo);
-                format!("{path}::{{closure#{}}} ({}:{line})", e.0, prog.file_paths[typeck_body.file as usize])
+                loc = format!(" ({}:{})", prog.file_paths[typeck_body.file as usize], line_of(prog, typeck_body.file, lo));
+                format!("{path}::{{closure#{}}}", e.0)
             } else {
                 path.clone()
             };
@@ -128,12 +129,12 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                     let errors = crate::mir::validate::validate(&mir, tcx);
                     if let Some(first) = errors.first() {
                         validate_fail += 1;
-                        invalid.note(format!("{} (bb{:?} stmt{:?})", first.message, first.bb.map(|b| b.0), first.statement_index), at);
+                        invalid.note(format!("{} (bb{:?} stmt{:?})", first.message, first.bb.map(|b| b.0), first.statement_index), format!("{at}{loc}"));
                     }
                 }
                 Ok(Err(err)) => {
                     let line = line_of(prog, err.span.file, err.span.lo);
-                    unbuilt.note(reason_key(&err.reason), format!("{at} @ {}:{line}", prog.file_paths[err.span.file as usize]))
+                    unbuilt.note(reason_key(&err.reason), format!("{at}{loc} @ {}:{line}", prog.file_paths[err.span.file as usize]))
                 }
                 Err(p) => {
                     if crate::preempt::is_cancelled(&*p) {
@@ -141,7 +142,7 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                     }
                     panics += 1;
                     let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
-                    panicked.note(msg, at);
+                    panicked.note(msg, format!("{at}{loc}"));
                 }
             }
         }
