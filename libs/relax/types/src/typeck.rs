@@ -501,6 +501,10 @@ pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std
 pub fn try_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Option<std::sync::Arc<Body>> {
     let _cost_typeck = crate::fncost::phase(1);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
+    // an instance with the wrong number of type/const arguments (`fn main<T>()`, E0131) has no body to monomorphize
+    if args.len() != tcx.generic_indices_of(prog, def).types_consts.len() {
+        return None;
+    }
     let body = tcx.typeck(prog, def);
     instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args).ok()
 }
