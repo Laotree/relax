@@ -822,6 +822,16 @@ impl<'a> Cx<'a> {
                 text.parse::<f64>().ok()
             }
             ExprKind::Unary(UnOp::Neg, x) => Some(-self.float_expr(x)?),
+            // a named float constant
+            ExprKind::Path(_) => {
+                let Some(Res::Def(d)) = self.body.res.get(&e.0).copied() else { return None };
+                if !matches!(self.prog.def(d).kind, DefKind::Const | DefKind::AssocConst) { return None; }
+                let t = self.tcx.type_of(self.prog, d).ok()?;
+                let TyKind::Float(p) = self.kind(t) else { return None };
+                let leaf = self.const_value(d, e.0, t)?.try_to_leaf()?;
+                let bits = leaf.to_bits(leaf.size());
+                match p { Prim::F32 => Some(f32::from_bits(bits as u32) as f64), Prim::F64 => Some(f64::from_bits(bits as u64)), _ => None }
+            }
             _ => None,
         }
     }
@@ -876,6 +886,14 @@ impl<'a> Cx<'a> {
             TyKind::Float(_) => {
                 let lo = match a { Some(e) => self.float_expr(e), None => Some(f64::NEG_INFINITY) };
                 let hi = match b { Some(e) => self.float_expr(e), None => Some(f64::INFINITY) };
+                if lo.is_some_and(f64::is_nan) || hi.is_some_and(f64::is_nan) {
+                    // (a NaN endpoint: const_to_pat NaNPattern)
+                    if let Some(p) = pos {
+                        let e = self.prog.record_uncoded_error(self.body.file, p, "typeck", "cannot use NaN in patterns".to_string());
+                        self.const_errors.push(e);
+                    }
+                    return Some(self.opaque(t, pos));
+                }
                 match (lo, hi) {
                     (Some(lo), Some(hi)) => Some(Ctor::FloatRange(lo, hi, end)),
                     _ => None,
