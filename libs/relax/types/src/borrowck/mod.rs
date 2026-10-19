@@ -4,6 +4,7 @@
 pub mod bir;
 pub mod borrowck_errors;
 pub mod check;
+pub mod check_consts;
 pub mod mir_nll;
 pub mod polonius;
 pub mod root_cx;
@@ -181,6 +182,17 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
                 bir.unsupported = Some(format!("promotion query blocked: {}", why.0));
                 promoteds.push(Vec::new());
             }
+        }
+    }
+    // rustc_const_eval check_consts: const contexts among the body and its const children
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_consts::check(tx, &queries, &all))) {
+        Ok(Ok(diags)) => {
+            for d in diags { v.errors.push(diag::to_error(prog, all[0].file, body.def, &d)); }
+        }
+        Ok(Err(why)) => v.unchecked.push(format!("{}: const check blocked: {}", prog.def_path(body.def), why.0)),
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+            v.unchecked.push(format!("{}: internal error in the const checker", prog.def_path(body.def)));
         }
     }
     let regions = regions_enabled(options);
