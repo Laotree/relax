@@ -425,6 +425,8 @@ pub struct Fcx<'a> {
     diverges: bool,
     ret_stack: Vec<TyId>,
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
+    /// checking a const / static initializer or an anonymous constant (no `return` outside a closure)
+    in_const: bool,
     /// > 0 inside an async block or async fn body (where `.await` is allowed); a closure
     /// inside resets it
     async_depth: u32,
@@ -684,6 +686,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         diverges: false,
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
+        in_const: false,
         async_depth: 0,
         await_count: 0,
         cur_binop: 0,
@@ -746,6 +749,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         }
         fcx.b.ret = ct;
         fcx.ret_stack.push(ct);
+        fcx.in_const = true;
         let t = fcx.check_expr(init, Some(ct));
         fcx.coerce_or_unify(t, ct, Some(init), ast.expr(init).lo);
         fcx.finish();
@@ -763,6 +767,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             fcx.register_wf(ct, ast.expr(*init).lo);
             fcx.b.ret = ct;
             fcx.ret_stack.push(ct);
+            fcx.in_const = true;
             let t = fcx.check_expr(*init, Some(ct));
             fcx.coerce_or_unify(t, ct, Some(*init), ast.expr(*init).lo);
             fcx.finish();
@@ -4959,6 +4964,9 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Return(x) => {
+                if self.in_const && self.closure_depth.is_empty() {
+                    self.err(lo, "E0572: return statement outside of function body".to_string());
+                }
                 let rt = *self.ret_stack.last().unwrap();
                 match &x.get() {
                     Some(v) => {
