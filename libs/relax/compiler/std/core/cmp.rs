@@ -19,6 +19,10 @@ pub trait PartialEq<Rhs: crate::marker::PointeeSized = Self>: crate::marker::Poi
 pub trait Eq: PartialEq<Self> + crate::marker::PointeeSized {
     #[doc(hidden)]
     fn assert_fields_are_eq(&self) {}
+    #[doc(hidden)]
+    #[deprecated(note = "implementation detail of `#[derive(Eq)]`")]
+    #[rustc_diagnostic_item = "assert_receiver_is_total_eq"]
+    fn assert_receiver_is_total_eq(&self) {}
 }
 // :395: field-bound assertions emitted by derive(Eq).
 pub struct AssertParamIsEq<T: Eq + crate::marker::PointeeSized> { _field: crate::marker::PhantomData<T> }

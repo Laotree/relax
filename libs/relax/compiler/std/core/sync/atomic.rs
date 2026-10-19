@@ -470,8 +470,11 @@ impl<T> fmt::Debug for AtomicPtr<T> {
 }
 
 /// Deprecated initializers still used by vendored code (objc-sys class!/sel! statics).
+#[deprecated(since = "1.34.0", note = "the `new` function is now preferred")]
 pub const ATOMIC_USIZE_INIT: AtomicUsize = AtomicUsize::new(0);
+#[deprecated(since = "1.34.0", note = "the `new` function is now preferred")]
 pub const ATOMIC_ISIZE_INIT: AtomicIsize = AtomicIsize::new(0);
+#[deprecated(since = "1.34.0", note = "the `new` function is now preferred")]
 pub const ATOMIC_BOOL_INIT: AtomicBool = AtomicBool::new(false);
 
 #[rustc_diagnostic_item = "fence"]

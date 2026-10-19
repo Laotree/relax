@@ -1681,6 +1681,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     improper_ctypes(prog, tcx, own);
     crate::lint_nonlocal::check(prog, tcx, own);
     crate::lint_late2::check_items(prog, own);
+    crate::lint_late2::check_eq_impls(prog, tcx, own);
 }
 
 /// rustc_ast::util::unicode TEXT_FLOW_CONTROL_CHARS.

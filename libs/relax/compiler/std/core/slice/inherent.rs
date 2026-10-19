@@ -464,6 +464,13 @@ impl<T> [T] {
     {
         Join::join(self, sep)
     }
+    #[deprecated(since = "1.3.0", note = "renamed to join")]
+    pub fn connect<Separator>(&self, sep: Separator) -> <[T] as Join<Separator>>::Output
+    where
+        [T]: Join<Separator>,
+    {
+        Join::join(self, sep)
+    }
     pub const fn first_chunk<const N: usize>(&self) -> Option<&[T; N]> {
         if self.len() < N {
             None

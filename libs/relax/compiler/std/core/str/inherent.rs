@@ -190,9 +190,11 @@ impl str {
     pub fn trim_end(&self) -> &str {
         trim_end(self)
     }
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_start`")]
     pub fn trim_left(&self) -> &str {
         trim_start(self)
     }
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_end`")]
     pub fn trim_right(&self) -> &str {
         trim_end(self)
     }
@@ -211,9 +213,11 @@ impl str {
     {
         trim_end_matches(self, pat)
     }
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_start_matches`")]
     pub fn trim_left_matches<'a, P: Pattern<'a>>(&'a self, pat: P) -> &'a str {
         trim_start_matches(self, pat)
     }
+    #[deprecated(since = "1.33.0", note = "superseded by `trim_end_matches`")]
     pub fn trim_right_matches<'a, P: Pattern<'a>>(&'a self, pat: P) -> &'a str
     where
         P::Searcher: ReverseSearcher<'a>,

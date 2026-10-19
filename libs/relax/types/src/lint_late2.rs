@@ -1366,3 +1366,23 @@ impl<'a> L2<'a> {
         }
     }
 }
+
+// ---------------------------------------------------------------- internal_eq_trait_method_impls
+
+pub const INTERNAL_EQ_TRAIT_METHOD_IMPLS: Lint = lint::lint("internal_eq_trait_method_impls", Level::Warn, &[]);
+
+/// `InternalEqTraitMethodImpls::check_impl_item`: a hand-written `Eq::assert_receiver_is_total_eq`.
+pub fn check_eq_impls(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    for i in 0..prog.defs.len() {
+        let d = prog.defs[i];
+        if d.kind != DefKind::AssocFn || !own.get(d.krate as usize).copied().unwrap_or(false) || d.parent == crate::program::NO_DEF { continue; }
+        if prog.def(d.parent).kind != DefKind::Impl || prog.syms.str(d.name) != "assert_receiver_is_total_eq" { continue; }
+        let Some(&tr) = tcx.impl_trait.get(&d.parent) else { continue };
+        let item = prog.traits[prog.def(tr).sub as usize].iter().copied().find(|&it| prog.def(it).name == d.name);
+        if !item.is_some_and(|it| diag_name(prog, it).as_deref() == Some("assert_receiver_is_total_eq")) { continue; }
+        let ast = &prog.files[d.file as usize].ast;
+        let pos = ast.item(d.item).lo;
+        if lint::external(prog, d.file, pos) { continue; }
+        lint::emit(prog, DefId(i as u32), &INTERNAL_EQ_TRAIT_METHOD_IMPLS, d.file, pos, "`Eq::assert_receiver_is_total_eq` should never be implemented by hand");
+    }
+}
