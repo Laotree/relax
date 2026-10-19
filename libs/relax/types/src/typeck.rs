@@ -1202,7 +1202,9 @@ impl<'a> Fcx<'a> {
         let (a, d) = (self.shallow(a), self.shallow(d));
         if a == d || !matches!(self.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
         // the same object type up to lifetimes is subtyping, not an upcast
-        if self.tcx.tys.erase_regions(a) == self.tcx.tys.erase_regions(d) { return None; }
+        // (a pointer keeps the coercion: extending a trait object's lifetime must prove `'a: 'b`
+        // through the Unsize goal; a smart pointer's clone of the same type is plain subtyping)
+        if self.tcx.tys.erase_regions(a) == self.tcx.tys.erase_regions(d) && !matches!(ka, TyKind::Ref(..) | TyKind::Ptr(..)) { return None; }
         let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
         // through a struct tail the whole pointee pair must unsize (rustc: `S<dyn A>: Unsize<S<dyn B>>`,
         // the last-field rule), not just the trait objects at its end
