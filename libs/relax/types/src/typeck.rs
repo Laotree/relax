@@ -161,6 +161,8 @@ pub struct Body {
     /// patterns of enums with uninhabited variants (ExprUseVisitor::walk_pat).
     /// These are capture uses even when runtime lowering needs no discriminant test.
     pub pat_discriminant_reads: SideTable<u32, ()>,
+    /// casts that are coercions (rustc `set_coercion_cast`); recorded only while the lint sink is on
+    pub coercion_casts: SideTable<u32, ()>,
     /// The two lang-item calls of the `?` desugaring, with their inferred types.
     pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
     pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
@@ -233,6 +235,7 @@ impl Body {
             pat_derefs: SideTable::new(),
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
+            coercion_casts: SideTable::new(),
             try_branch: SideTable::new(),
             try_from_residual: SideTable::new(),
             locals: ThinVec::new(),
@@ -644,6 +647,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             pat_derefs: SideTable::new(),
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
+            coercion_casts: SideTable::new(),
             locals: ThinVec::new(),
             param_pats: ThinVec::new(),
             ret: error,

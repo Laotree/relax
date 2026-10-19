@@ -15,6 +15,14 @@ use crate::types::{AliasTyKind, TyId, TyKind};
 pub const UNUSED_MUST_USE: Lint = lint::lint("unused_must_use", Level::Warn, &["unused"]);
 pub const UNUSED_RESULTS: Lint = lint::lint("unused_results", Level::Allow, &[]);
 pub const PATH_STATEMENTS: Lint = lint::lint("path_statements", Level::Warn, &["unused"]);
+pub const DROPPING_REFERENCES: Lint = lint::lint("dropping_references", Level::Warn, &[]);
+pub const FORGETTING_REFERENCES: Lint = lint::lint("forgetting_references", Level::Warn, &[]);
+pub const DROPPING_COPY_TYPES: Lint = lint::lint("dropping_copy_types", Level::Warn, &[]);
+pub const FORGETTING_COPY_TYPES: Lint = lint::lint("forgetting_copy_types", Level::Warn, &[]);
+pub const UNDROPPED_MANUALLY_DROPS: Lint = lint::lint("undropped_manually_drops", Level::Deny, &[]);
+pub const INVALID_ATOMIC_ORDERING: Lint = lint::lint("invalid_atomic_ordering", Level::Deny, &[]);
+pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts", Level::Allow, &[]);
+pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts", Level::Allow, &[]);
 
 /// Body-level passes over one typed body owner.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
@@ -22,7 +30,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
-    let mut w = Late { prog, tcx, body, ast, stack: Vec::new(), pcx: pattern_analysis::body_cx(prog, tcx, body) };
+    let mut w = Late { prog, tcx, body, ast, stack: Vec::new(), pcx: pattern_analysis::body_cx(prog, tcx, body), arm_body: None };
     match ast.item(d.item).kind {
         ItemKind::Fn(s, _, _) => {
             let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
@@ -45,6 +53,8 @@ struct Late<'a> {
     /// the attributes of the enclosing statements, arms, ..., outermost first
     stack: Vec<Attr>,
     pcx: PCx<'a>,
+    /// the body of the match arm being visited (`is_single_call_in_arm`)
+    arm_body: Option<ExprId>,
 }
 
 // ---------------------------------------------------------------- must_use machinery
@@ -84,6 +94,12 @@ impl<'a> Late<'a> {
     fn kind(&self, t: TyId) -> TyKind { *self.tcx.tys.kind(t) }
 
     fn emit(&self, lint: &Lint, pos: u32, msg: &str) {
+        if lint::external(self.prog, self.body.file, pos) { return; }
+        lint::emit_in(self.prog, self.body.def, &self.stack, lint, self.body.file, pos, msg);
+    }
+
+    /// Lints declared `report_in_external_macro`.
+    fn emit_ext(&self, lint: &Lint, pos: u32, msg: &str) {
         lint::emit_in(self.prog, self.body.def, &self.stack, lint, self.body.file, pos, msg);
     }
 
@@ -230,13 +246,13 @@ impl<'a> Late<'a> {
             MustUsePath::Array(p, n) => self.emit_must_use(p, &format!("{pre}array{plural} of "), post, plural_len.saturating_add(*n as usize)),
             MustUsePath::Closure(pos) => {
                 let plural = if plural_len == 1 { "closure" } else { "closures" };
-                self.emit(&UNUSED_MUST_USE, *pos, &format!("unused {pre}{plural}{post} that must be used"));
+                self.emit_ext(&UNUSED_MUST_USE, *pos, &format!("unused {pre}{plural}{post} that must be used"));
             }
             MustUsePath::Coroutine(pos) => {
-                self.emit(&UNUSED_MUST_USE, *pos, &format!("unused {pre}coroutine{post} that must be used"));
+                self.emit_ext(&UNUSED_MUST_USE, *pos, &format!("unused {pre}coroutine{post} that must be used"));
             }
             MustUsePath::Def(pos, d) => {
-                self.emit(&UNUSED_MUST_USE, *pos, &format!("unused {pre}`{}`{post} that must be used", self.def_path_str(*d)));
+                self.emit_ext(&UNUSED_MUST_USE, *pos, &format!("unused {pre}`{}`{post} that must be used", self.def_path_str(*d)));
             }
         }
     }
@@ -316,7 +332,7 @@ impl<'a> Late<'a> {
         };
         let op_warned = match op {
             Some(op) => {
-                self.emit(&UNUSED_MUST_USE, pos, &format!("unused {op} that must be used"));
+                self.emit_ext(&UNUSED_MUST_USE, pos, &format!("unused {op} that must be used"));
                 true
             }
             None => false,
@@ -340,6 +356,176 @@ impl<'a> Late<'a> {
     }
 }
 
+// ---------------------------------------------------------------- expression passes
+
+impl<'a> Late<'a> {
+    /// `#[rustc_diagnostic_item = "name"]` of a definition.
+    fn diag_item(&self, d: DefId) -> Option<String> {
+        let def = self.prog.def(d);
+        if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Fn | DefKind::AssocFn | DefKind::TypeAlias) { return None; }
+        let ast = &self.prog.files[def.file as usize].ast;
+        let p = self.prog.src(def.file);
+        for a in ast.list(ast.item(def.item).attrs) {
+            if lint::attr_path(self.prog, def.file, a) != b"rustc_diagnostic_item" { continue; }
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            let mut i = lo;
+            while i < hi && crate::cfg::tok_str(p, i) != b"=" { i += 1; }
+            if i + 1 < hi {
+                let t = crate::cfg::tok_str(p, i + 1);
+                return Some(String::from_utf8_lossy(t).trim_matches('"').to_string());
+            }
+        }
+        None
+    }
+
+    /// The definition a path expression resolves to.
+    fn path_def(&self, e: ExprId) -> Option<DefId> {
+        let e = unparen(self.ast, e);
+        if !matches!(self.ast.expr(e).kind, ExprKind::Path(_)) { return None; }
+        match self.body.res.get(&e.0) { Some(Res::Def(d)) => Some(*d), _ => None }
+    }
+
+    /// `Expr::can_have_side_effects`.
+    fn can_have_side_effects(&self, e: ExprId) -> bool {
+        let ast = self.ast;
+        match ast.expr(e).kind {
+            ExprKind::Paren(x) => self.can_have_side_effects(x),
+            ExprKind::Path(_) | ExprKind::Lit(_) | ExprKind::Underscore => false,
+            ExprKind::Unary(_, b) | ExprKind::Field(b, _) | ExprKind::TupleField(b, _) | ExprKind::Index(b, _) | ExprKind::AddrOf(_, _, b) | ExprKind::Cast(b, _) => self.can_have_side_effects(b),
+            ExprKind::Binary(_, l, r) => self.can_have_side_effects(l) || self.can_have_side_effects(r),
+            ExprKind::Struct(row) => {
+                let s = *ast.row(row);
+                ast.list(s.fields).iter().any(|f| self.can_have_side_effects(f.expr)) || s.base.get().is_some_and(|b| self.can_have_side_effects(b))
+            }
+            ExprKind::Array(xs) | ExprKind::Tuple(xs) => ast.list(xs).iter().any(|&x| self.can_have_side_effects(x)),
+            ExprKind::Repeat(x, _) => self.can_have_side_effects(x),
+            ExprKind::Call(f, args) => {
+                // a tuple struct / variant constructor call
+                match self.path_def(f) {
+                    Some(d) if matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Variant) => ast.list(args).iter().any(|&x| self.can_have_side_effects(x)),
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn check_expr(&mut self, e: ExprId) {
+        let ex = *self.ast.expr(e);
+        match ex.kind {
+            ExprKind::Call(f, args) => {
+                self.check_drop_forget(e, f, args);
+                self.check_memory_fence(f, args);
+            }
+            ExprKind::MethodCall(..) => {
+                self.check_atomic_load_store(e);
+                self.check_atomic_compare_exchange(e);
+            }
+            ExprKind::Cast(x, _) => self.check_trivial_cast(e, x),
+            _ => {}
+        }
+    }
+
+    // ---- drop_forget_useless.rs
+    fn check_drop_forget(&self, e: ExprId, f: ExprId, args: List<ExprId>) {
+        let args = self.ast.list(args);
+        if args.len() != 1 { return; }
+        let Some(d) = self.path_def(f) else { return };
+        let Some(name) = self.diag_item(d) else { return };
+        let arg = args[0];
+        let Some(arg_ty) = self.expr_ty(arg) else { return };
+        let is_copy = self.tcx.is_copy_modulo_regions(self.prog, self.pcx.typing_env(), arg_ty);
+        let is_ref = matches!(self.kind(arg_ty), TyKind::Ref(..));
+        let single_call_in_arm = self.can_have_side_effects(arg) && self.arm_body == Some(e);
+        let lo = self.ast.expr(e).lo;
+        match name.as_str() {
+            "mem_drop" if is_ref && !single_call_in_arm => self.emit(&DROPPING_REFERENCES, lo, "calls to `std::mem::drop` with a reference instead of an owned value does nothing"),
+            "mem_forget" if is_ref => self.emit(&FORGETTING_REFERENCES, lo, "calls to `std::mem::forget` with a reference instead of an owned value does nothing"),
+            "mem_drop" if is_copy && !single_call_in_arm => self.emit(&DROPPING_COPY_TYPES, lo, "calls to `std::mem::drop` with a value that implements `Copy` does nothing"),
+            "mem_forget" if is_copy => self.emit(&FORGETTING_COPY_TYPES, lo, "calls to `std::mem::forget` with a value that implements `Copy` does nothing"),
+            "mem_drop" => {
+                if let TyKind::Adt(a, _, _) = self.kind(arg_ty) {
+                    if self.diag_item(a).as_deref() == Some("ManuallyDrop") {
+                        self.emit(&UNDROPPED_MANUALLY_DROPS, lo, "calls to `std::mem::drop` with `std::mem::ManuallyDrop` instead of the inner value does nothing");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // ---- types.rs InvalidAtomicOrdering
+    /// An inherent method of the standard `Atomic` types: its name and arguments.
+    fn inherent_atomic_method_call(&self, e: ExprId, names: &[&str]) -> Option<(String, Vec<ExprId>)> {
+        let ExprKind::MethodCall(_, row) = self.ast.expr(e).kind else { return None };
+        let m = *self.ast.row(row);
+        let name = self.prog.files[self.body.file as usize].text(m.name).to_string();
+        if !names.contains(&name.as_str()) { return None; }
+        let md = self.body.methods.get(&e.0)?.def;
+        let parent = self.prog.def(md).parent;
+        if parent == crate::program::NO_DEF || self.prog.def(parent).kind != DefKind::Impl { return None; }
+        // an inherent impl
+        if self.tcx.impl_trait.contains_key(&parent) { return None; }
+        let st = *self.tcx.impl_self.get(&parent)?;
+        let TyKind::Adt(adt, ..) = self.kind(st) else { return None };
+        if self.diag_item(adt).as_deref() != Some("Atomic") { return None; }
+        Some((name, self.ast.list(m.args).to_vec()))
+    }
+
+    fn match_ordering(&self, arg: ExprId) -> Option<&'static str> {
+        let d = self.path_def(arg)?;
+        let name = self.prog.name(d);
+        let parent = self.prog.def(d).parent;
+        let is_ordering = |p: DefId| p != crate::program::NO_DEF && self.diag_item(p).as_deref() == Some("Ordering");
+        if !(is_ordering(parent)) { return None; }
+        ["Relaxed", "Release", "Acquire", "AcqRel", "SeqCst"].into_iter().find(|o| *o == name)
+    }
+
+    fn check_atomic_load_store(&self, e: ExprId) {
+        let Some((method, args)) = self.inherent_atomic_method_call(e, &["load", "store"]) else { return };
+        let (idx, invalid) = if method == "load" { (0, "Release") } else { (1, "Acquire") };
+        let Some(&arg) = args.get(idx) else { return };
+        let Some(ordering) = self.match_ordering(arg) else { return };
+        if ordering == invalid || ordering == "AcqRel" {
+            let lo = self.ast.expr(arg).lo;
+            if method == "load" {
+                self.emit(&INVALID_ATOMIC_ORDERING, lo, "atomic loads cannot have `Release` or `AcqRel` ordering");
+            } else {
+                self.emit(&INVALID_ATOMIC_ORDERING, lo, "atomic stores cannot have `Acquire` or `AcqRel` ordering");
+            }
+        }
+    }
+
+    fn check_memory_fence(&self, f: ExprId, args: List<ExprId>) {
+        let Some(d) = self.path_def(f) else { return };
+        if !matches!(self.diag_item(d).as_deref(), Some("fence" | "compiler_fence")) { return; }
+        let Some(&arg) = self.ast.list(args).first() else { return };
+        if self.match_ordering(arg) == Some("Relaxed") {
+            self.emit(&INVALID_ATOMIC_ORDERING, self.ast.expr(arg).lo, "memory fences cannot have `Relaxed` ordering");
+        }
+    }
+
+    fn check_atomic_compare_exchange(&self, e: ExprId) {
+        let Some((method, args)) = self.inherent_atomic_method_call(e, &["update", "try_update", "fetch_update", "compare_exchange", "compare_exchange_weak"]) else { return };
+        let idx = match method.as_str() { "update" | "try_update" | "fetch_update" => 1, _ => 3 };
+        let Some(&arg) = args.get(idx) else { return };
+        let Some(fail) = self.match_ordering(arg) else { return };
+        if matches!(fail, "Release" | "AcqRel") {
+            self.emit(&INVALID_ATOMIC_ORDERING, self.ast.expr(arg).lo, &format!("`{method}`'s failure ordering may not be `Release` or `AcqRel`, since a failed `{method}` does not result in a write"));
+        }
+    }
+
+    // ---- rustc_hir_typeck cast.rs trivial_cast_lint
+    fn check_trivial_cast(&self, e: ExprId, x: ExprId) {
+        if self.body.coercion_casts.get(&e.0).is_none() { return; }
+        let (Some(et), Some(ct)) = (self.expr_ty(x), self.expr_ty(e)) else { return };
+        let numeric = |t: TyId| matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_));
+        let (is_num, lint) = if numeric(ct) && numeric(et) { (true, &TRIVIAL_NUMERIC_CASTS) } else { (false, &TRIVIAL_CASTS) };
+        let (es, cs) = (crate::typeck::ty_to_string(false, self.prog, self.tcx, et), crate::typeck::ty_to_string(false, self.prog, self.tcx, ct));
+        self.emit(lint, self.ast.expr(e).lo, &format!("trivial {}cast: `{}` as `{}`", if is_num { "numeric " } else { "" }, es, cs));
+    }
+}
+
 fn unparen(ast: &Ast, mut e: ExprId) -> ExprId {
     while let ExprKind::Paren(x) = ast.expr(e).kind { e = x; }
     e
@@ -351,6 +537,17 @@ impl<'a> Visitor<'a> for Late<'a> {
     fn leave_attrs(&mut self, attrs: List<Attr>) {
         let n = self.ast.list(attrs).len();
         self.stack.truncate(self.stack.len() - n);
+    }
+
+    fn expr(&mut self, e: ExprId) {
+        self.check_expr(e);
+        ast_visit::walk_expr(self, e);
+    }
+
+    fn arm(&mut self, a: &Arm) {
+        let saved = self.arm_body.replace(a.body);
+        ast_visit::walk_arm(self, a);
+        self.arm_body = saved;
     }
 
     fn stmt(&mut self, s: &Stmt, _b: BlockId) {
