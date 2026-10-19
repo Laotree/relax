@@ -27,6 +27,8 @@ mod cast;
 mod pat_bindings;
 mod instantiate;
 mod side_table;
+pub mod adjustments;
+pub mod user_types;
 pub use side_table::{BitSet, SideTable, ThinVec};
 pub use call::CallTrait;
 pub use closure::ClosureSignatures;
@@ -125,9 +127,17 @@ pub struct Body {
     pub methods: SideTable<u32, MethodRes>,
     /// binary operators on non-primitive types: expr -> operator trait method call
     pub binops: SideTable<u32, MethodRes>,
-    pub coerce: SideTable<u32, Coerce>,
-    /// Reference coercions, including equal-type reborrows (rustc coerce_to_ref).
-    pub reborrows: SideTable<u32, bool>,
+    /// The adjustments of each expression node, one list (typeck/adjustments.rs): coercions,
+    /// reference reborrows (rustc coerce_to_ref, including equal-type ones) and autoderef steps,
+    /// overloaded ones with their `Deref::deref` call.
+    pub adjustments: SideTable<u32, adjustments::Adjustments>,
+    /// rustc `user_provided_types`: the canonical user type annotations (written lifetimes kept,
+    /// holes canonical variables) of let annotations, casts, generic paths, struct literals and
+    /// patterns, method calls with explicit arguments.
+    pub user_provided_types: SideTable<user_types::UserTypeKey, std::sync::Arc<crate::types::user_type::CanonicalUserType>>,
+    /// rustc `user_provided_sigs`: the signature a closure expression wrote, canonicalized before
+    /// it is merged with the expected one; keyed by the closure expression.
+    pub user_provided_sigs: SideTable<u32, std::sync::Arc<crate::next_solver::canonical::Canonical<TyId>>>,
     pub min_captures: SideTable<u32, crate::upvar::ClosureCaptures>,
     pub hidden_types: SideTable<DefId, TyId>,
     pub field_idx: SideTable<u32, (u32, u32)>,
@@ -136,8 +146,6 @@ pub struct Body {
     pub field_uses: ThinVec<(DefId, u32)>,
     /// Resolved definitions read while checking; deduplicated by the warm session.
     pub dependencies: ThinVec<DefId>,
-    /// overloaded deref steps: (expr, step index) -> `Deref::deref` with [Self]
-    pub ov_derefs: SideTable<(u32, usize), (DefId, crate::types::TyList)>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
     pub ov_index: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> `Iterator::next` with [Iter].
@@ -145,9 +153,6 @@ pub struct Body {
     /// Every checked `for` head -> (`IntoIterator::into_iter`, [Self], iterator type).
     /// The head is passed by value with identity adjustment (no method receiver coercion).
     pub for_into: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
-    pub index_derefs: SideTable<u32, usize>,
-    /// call expr -> deref steps from the callee expression to the callable
-    pub call_derefs: SideTable<u32, usize>,
     /// Fn-family selection in the generic body, before instance substitution.
     pub call_traits: SideTable<u32, CallTrait>,
     /// calls of `#[rustc_legacy_const_generics]` fns: the argument positions that are const
@@ -215,19 +220,17 @@ impl Body {
             pat_local: SideTable::new(),
             methods: SideTable::new(),
             binops: SideTable::new(),
-            coerce: SideTable::new(),
-            reborrows: SideTable::new(),
+            adjustments: SideTable::new(),
+            user_provided_types: SideTable::new(),
+            user_provided_sigs: SideTable::new(),
             min_captures: SideTable::new(),
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
             dependencies: ThinVec::new(),
-            ov_derefs: SideTable::new(),
             ov_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
-            index_derefs: SideTable::new(),
-            call_derefs: SideTable::new(),
             call_traits: SideTable::new(),
             legacy_args: SideTable::new(),
             pat_derefs: SideTable::new(),
@@ -303,8 +306,8 @@ impl Body {
     /// The results are final: every table and array holds exactly its entries.
     pub fn freeze(&mut self) {
         macro_rules! shrink { ($($f:ident),*) => { $( self.$f.shrink_to_fit(); )* } }
-        shrink!(res, res_args, pat_res, pat_local, methods, binops, coerce, reborrows, min_captures, hidden_types,
-            field_idx, ov_derefs, ov_index, for_next, for_into, index_derefs, call_derefs, call_traits, legacy_args,
+        shrink!(res, res_args, pat_res, pat_local, methods, binops, adjustments, user_provided_types, user_provided_sigs, min_captures, hidden_types,
+            field_idx, ov_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
@@ -336,11 +339,11 @@ impl Body {
         }
         let l = |x: crate::types::TyList| tys.list(x).len() * 4;
         let mut n = 1304;
-        n += t(&self.res) + t(&self.pat_res) + t(&self.pat_local) + t(&self.coerce) + t(&self.reborrows) + t(&self.hidden_types) + t(&self.index_derefs) + t(&self.call_derefs) + t(&self.call_traits) + t(&self.pat_derefs) + t(&self.pat_bind_ref) + t(&self.pat_discriminant_reads) + t(&self.fmt_named) + t(&self.closure_expected_kinds) + t(&self.closure_sigs) + t(&self.inline_const_types) + t(&self.legacy_args) + t(&self.closure_locals) + t(&self.struct_defaults) + t(&self.min_captures);
+        n += t(&self.res) + t(&self.pat_res) + t(&self.pat_local) + t(&self.hidden_types) + t(&self.call_traits) + t(&self.pat_derefs) + t(&self.pat_bind_ref) + t(&self.pat_discriminant_reads) + t(&self.fmt_named) + t(&self.closure_expected_kinds) + t(&self.closure_sigs) + t(&self.inline_const_types) + t(&self.legacy_args) + t(&self.closure_locals) + t(&self.struct_defaults) + t(&self.min_captures);
         // entries that held a Vec<TyId> (24 B) or a usize where they now hold a list id or a u32
-        n += m(self.res_args.len(), 32) + m(self.methods.len(), 48) + m(self.binops.len(), 48) + m(self.ov_derefs.len(), 48) + m(self.ov_index.len(), 40) + m(self.for_next.len(), 40) + m(self.for_into.len(), 40) + m(self.try_branch.len(), 40) + m(self.try_from_residual.len(), 40) + m(self.field_idx.len(), 24);
+        n += m(self.res_args.len(), 32) + m(self.methods.len(), 48) + m(self.binops.len(), 48) + m(self.ov_index.len(), 40) + m(self.for_next.len(), 40) + m(self.for_into.len(), 40) + m(self.try_branch.len(), 40) + m(self.try_from_residual.len(), 40) + m(self.field_idx.len(), 24);
         n += self.res_args.values().map(|&x| l(x)).sum::<usize>() + self.methods.values().chain(self.binops.values()).map(|x| l(x.args)).sum::<usize>();
-        n += self.ov_derefs.values().chain(self.ov_index.values()).chain(self.for_next.values()).chain(self.try_from_residual.values()).map(|x| l(x.1)).sum::<usize>();
+        n += self.ov_index.values().chain(self.for_next.values()).chain(self.try_from_residual.values()).map(|x| l(x.1)).sum::<usize>();
         n += self.for_into.values().chain(self.try_branch.values()).map(|x| l(x.1)).sum::<usize>();
         n += self.legacy_args.values().map(v).sum::<usize>() + self.closure_locals.values().map(v).sum::<usize>() + self.struct_defaults.values().map(v).sum::<usize>();
         n += self.min_captures.values().map(|c| v(&c.captures) + v(&c.fake_reads) + v(&c.errors) + c.captures.iter().map(|x| v(&x.place.projections)).sum::<usize>() + c.fake_reads.iter().map(|x| v(&x.0.projections)).sum::<usize>()).sum::<usize>();
@@ -372,7 +375,12 @@ impl Body {
         add("pat_ty", self.pat_ty.len(), t(&self.pat_ty));
         add("pat_typed", self.pat_typed.len(), self.pat_typed.heap_bytes());
         macro_rules! maps { ($($f:ident),*) => { $( add(stringify!($f), self.$f.len(), m(&self.$f)); )* } }
-        maps!(res, res_args, methods, binops, ov_derefs, ov_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, coerce, reborrows, hidden_types, field_idx, index_derefs, call_derefs, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
+        maps!(res, res_args, methods, binops, ov_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, hidden_types, field_idx, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
+        add("adjustments", self.adjustments.len(), m(&self.adjustments) + self.adjustments.values().map(|a| a.heap_bytes()).sum::<usize>());
+        add("user_provided_types", self.user_provided_types.len(), m(&self.user_provided_types) + self.user_provided_types.values().map(|user| {
+            std::mem::size_of_val(&**user) + user.var_kinds.capacity() * std::mem::size_of::<crate::next_solver::canonical::CanonicalVarKind>()
+        }).sum::<usize>());
+        add("user_provided_sigs", self.user_provided_sigs.len(), m(&self.user_provided_sigs) + self.user_provided_sigs.values().map(|sig| std::mem::size_of_val(&**sig) + sig.var_kinds.capacity() * std::mem::size_of::<crate::next_solver::canonical::CanonicalVarKind>()).sum::<usize>());
         add("legacy_args", self.legacy_args.len(), m(&self.legacy_args) + self.legacy_args.values().map(v).sum::<usize>());
         add("closure_locals", self.closure_locals.len(), m(&self.closure_locals) + self.closure_locals.values().map(v).sum::<usize>());
         add("struct_defaults", self.struct_defaults.len(), m(&self.struct_defaults) + self.struct_defaults.values().map(v).sum::<usize>());
@@ -624,19 +632,17 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             pat_local: SideTable::new(),
             methods: SideTable::new(),
             binops: SideTable::new(),
-            coerce: SideTable::new(),
-            reborrows: SideTable::new(),
+            adjustments: SideTable::new(),
+            user_provided_types: SideTable::new(),
+            user_provided_sigs: SideTable::new(),
             min_captures: SideTable::new(),
             hidden_types: SideTable::new(),
             field_idx: SideTable::new(),
             field_uses: ThinVec::new(),
             dependencies: ThinVec::new(),
-            ov_derefs: SideTable::new(),
             ov_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
-            index_derefs: SideTable::new(),
-            call_derefs: SideTable::new(),
             call_traits: SideTable::new(),
             legacy_args: SideTable::new(),
             try_branch: SideTable::new(),
@@ -1049,28 +1055,14 @@ impl<'a> Fcx<'a> {
     fn try_coerce_inner(&mut self, a: TyId, x: TyId, e: Option<ExprId>, pos: u32, use_lub: bool) -> Option<TyId> {
         let snap = self.start_snapshot();
         let n_dd = self.deferred_dyn.len();
-        let old = e.and_then(|e| self.b.coerce.get(&e.0).copied());
-        let old_reborrow = e.and_then(|e| self.b.reborrows.get(&e.0).copied());
+        let old = e.map(|e| self.save_value_adjustments(e.0));
         if let Some(target) = self.coerce(a, x, e, pos, use_lub) {
             self.commit_from(snap);
             return Some(target);
         }
         self.rollback_to(snap);
         self.deferred_dyn.truncate(n_dd);
-        if let Some(e) = e {
-            match old_reborrow {
-                Some(value) => { self.b.reborrows.insert(e.0, value); }
-                None => { self.b.reborrows.remove(&e.0); }
-            }
-            match old {
-                Some(c) => {
-                    self.b.coerce.insert(e.0, c);
-                }
-                None => {
-                    self.b.coerce.remove(&e.0);
-                }
-            }
-        }
+        if let (Some(e), Some(old)) = (e, old) { self.restore_value_adjustments(e.0, old); }
         None
     }
 
@@ -1152,11 +1144,11 @@ impl<'a> Fcx<'a> {
             b = self.norm(b);
             let ty = self.unify_coercion(a, b, true, false)?;
             let adjustment = if matches!(self.tcx.tys.kind(prev_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn };
-            for e in prev { self.b.coerce.insert(e.0, adjustment); }
-            self.b.coerce.insert(new_e.0, if matches!(self.tcx.tys.kind(new_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn });
+            for e in prev { self.set_coerce(e.0, adjustment); }
+            self.set_coerce(new_e.0, if matches!(self.tcx.tys.kind(new_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn });
             return Some(ty);
         }
-        if !self.b.coerce.contains_key(&new_e.0) {
+        if !self.b.coerce(new_e.0).is_some() {
             if let Some(ty) = self.try_coerce_inner(new_ty, prev_ty, Some(new_e), self.last_lo, true) { return Some(ty); }
         }
         // A single coercion determines the adjustments for all previous arms.
@@ -1164,19 +1156,7 @@ impl<'a> Fcx<'a> {
         let first = prev.first().copied();
         let ty = self.try_coerce_inner(prev_ty, new_ty, first, self.last_lo, true)?;
         if let Some(first) = first {
-            let adjustment = self.b.coerce.get(&first.0).copied();
-            let reborrow = self.b.reborrows.get(&first.0).copied();
-            for e in &prev[1..] {
-                if let Some(adjustment) = adjustment { self.b.coerce.insert(e.0, adjustment); }
-                if let Some(reborrow) = reborrow { self.b.reborrows.insert(e.0, reborrow); }
-                if let Some(Coerce::DerefRef(n)) = adjustment {
-                    for step in 0..n {
-                        if let Some(deref) = self.b.ov_derefs.get(&(first.0 | DEREF_COERCE_KEY, step)).cloned() {
-                            self.b.ov_derefs.insert((e.0 | DEREF_COERCE_KEY, step), deref);
-                        }
-                    }
-                }
-            }
+            for e in &prev[1..] { self.copy_value_adjustments(first.0, e.0); }
         }
         Some(ty)
     }
@@ -1431,7 +1411,7 @@ impl<'a> Fcx<'a> {
 
 
     /// Autoderef steps from `a` to `x` (both pointees of references), if any.
-    fn deref_coercion(&mut self, e: ExprId, a: TyId, x: TyId) -> Option<usize> {
+    fn deref_coercion(&mut self, a: TyId, x: TyId) -> Option<Vec<Option<adjustments::OverloadedDeref>>> {
         let xs = self.shallow(x);
         // an open target takes the source as is; an integer / float variable is no reference,
         // so `&&{integer}` to `&{integer}` derefs (rustc coerce_borrowed_pointer autoderefs
@@ -1440,13 +1420,15 @@ impl<'a> Fcx<'a> {
             return None;
         }
         let mut cur = self.shallow(a);
-        let key = e.0 | DEREF_COERCE_KEY;
-        for step in 0..8usize {
-            cur = self.deref_step(key, step, cur)?;
+        let mut derefs = Vec::new();
+        for _ in 0..8usize {
+            let (next, overloaded) = self.deref_step_raw(cur)?;
+            cur = next;
+            derefs.push(overloaded);
             let save = self.start_snapshot();
             if self.eq(cur, xs) {
                 self.commit_from(save);
-                return Some(step + 1);
+                return Some(derefs);
             }
             self.rollback_to(save);
         }
@@ -1486,7 +1468,7 @@ impl<'a> Fcx<'a> {
         let x = self.shallow(expected);
         if a == x {
             if let (Some(e), TyKind::Ref(true, _, _)) = (e, self.tcx.tys.kind(x)) {
-                self.b.reborrows.insert(e.0, true);
+                self.set_reborrow(e.0, true);
             }
             return Some(x);
         }
@@ -1494,7 +1476,7 @@ impl<'a> Fcx<'a> {
         let kx = self.tcx.tys.kind(x).clone();
         if let TyKind::Never = ka {
             if let Some(e) = e {
-                self.b.coerce.insert(e.0, Coerce::Never);
+                self.set_coerce(e.0, Coerce::Never);
             }
             if matches!(kx, TyKind::Infer(_)) {
                 self.diverging.push(x);
@@ -1503,15 +1485,15 @@ impl<'a> Fcx<'a> {
         }
         if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
             if let Some(e) = e {
-                self.b.coerce.insert(e.0, Coerce::ToDyn(src, dy));
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
+                self.set_coerce(e.0, Coerce::ToDyn(src, dy));
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
             }
             return Some(x);
         }
         if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
             if let Some(e) = e {
-                self.b.coerce.insert(e.0, Coerce::Upcast(sd, dd));
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
+                self.set_coerce(e.0, Coerce::Upcast(sd, dd));
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
             }
             return Some(x);
         }
@@ -1530,21 +1512,20 @@ impl<'a> Fcx<'a> {
                 let reborrow = self.tcx.tys.intern(TyKind::Ref(*m2, *ia, *region));
                 if let Some(target) = self.unify_coercion(reborrow, x, use_lub, false) {
                     self.commit_from(save);
-                    if *m1 { self.b.reborrows.insert(ex.0, *m2); }
+                    if *m1 { self.set_reborrow(ex.0, *m2); }
                     return Some(target);
                 }
                 self.rollback_to(save);
-                if let Some(n) = self.deref_coercion(ex, *ia, *ix) {
-                    self.b.coerce.insert(ex.0, Coerce::DerefRef(n));
-                    self.b.reborrows.insert(ex.0, *m2);
+                if let Some(derefs) = self.deref_coercion(*ia, *ix) {
+                    self.set_deref_ref(ex.0, derefs, Some(*m2));
                     return Some(x);
                 }
             }
         }
         if self.unsize_coercion(&ka, &kx) {
             if let Some(e) = e {
-                self.b.coerce.insert(e.0, Coerce::Unsize);
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.b.reborrows.insert(e.0, *m); }
+                self.set_coerce(e.0, Coerce::Unsize);
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
             }
             return Some(x);
         }
@@ -1561,7 +1542,7 @@ impl<'a> Fcx<'a> {
                     if header.can_coerce_to(*target) {
                         let pointer = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, *target, bound));
                         if let Some(target) = self.unify_coercion(pointer, x, use_lub, true) {
-                            if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::ReifyFn); }
+                            if let Some(e) = e { self.set_coerce(e.0, Coerce::ReifyFn); }
                             return Some(target);
                         }
                     }
@@ -1572,7 +1553,7 @@ impl<'a> Fcx<'a> {
                 let unsafe_ty = self.tcx.tys.intern(TyKind::FnPtr(ps.clone(), *r,
                     FnHeader { safety: Safety::Unsafe, ..*header }, *bound));
                 if let Some(target) = self.unify_coercion(unsafe_ty, x, use_lub, true) {
-                    if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::UnsafeFn); }
+                    if let Some(e) = e { self.set_coerce(e.0, Coerce::UnsafeFn); }
                     return Some(target);
                 }
             }
@@ -1587,7 +1568,7 @@ impl<'a> Fcx<'a> {
                 };
                 if !captures { if let Some(target) = self.unify_coercion(pointer, x, use_lub, false) {
                     if let Some(e) = e {
-                        self.b.coerce.insert(e.0, Coerce::ClosureFn);
+                        self.set_coerce(e.0, Coerce::ClosureFn);
                     }
                     return Some(target);
                 } }
@@ -1597,7 +1578,7 @@ impl<'a> Fcx<'a> {
                 let ix = self.shallow(*ix);
                 if *m1 && !*m2 && self.unify_raw(ia, ix, false) {
                     if let Some(e) = e {
-                        self.b.coerce.insert(e.0, Coerce::MutToConst);
+                        self.set_coerce(e.0, Coerce::MutToConst);
                     }
                     return Some(x);
                 }
@@ -1607,7 +1588,7 @@ impl<'a> Fcx<'a> {
                 let ia = *ia;
                 let source = self.tcx.tys.intern(TyKind::Ptr(*m2, ia));
                 if let Some(target) = self.unify_coercion(source, x, use_lub, false) {
-                    if let Some(e) = e { self.b.coerce.insert(e.0, Coerce::RefToRaw(*m2)); }
+                    if let Some(e) = e { self.set_coerce(e.0, Coerce::RefToRaw(*m2)); }
                     return Some(target);
                 }
             }
@@ -1615,7 +1596,7 @@ impl<'a> Fcx<'a> {
                 let ia = *ia;
                 if self.unify_raw(ia, *ix, false) {
                     if let Some(e) = e {
-                        self.b.coerce.insert(e.0, Coerce::MutToConst);
+                        self.set_coerce(e.0, Coerce::MutToConst);
                     }
                     return Some(x);
                 }
@@ -1636,16 +1617,16 @@ impl<'a> Fcx<'a> {
         let TyKind::Ref(sm, inner, _) = self.tcx.tys.kind(source).clone() else { return };
         match self.tcx.tys.kind(target).clone() {
             TyKind::Ptr(tm, pointee) if sm || !tm => {
-                if self.b.coerce.contains_key(&e.0) {
+                if self.b.coerce(e.0).is_some() {
                     // Unsizing / trait-object coercions borrow before the pointer conversion.
-                    self.b.reborrows.insert(e.0, tm);
+                    self.set_reborrow(e.0, tm);
                 } else {
                     let pointee = self.shallow(pointee);
                     if matches!(self.tcx.tys.kind(pointee), TyKind::Infer(_)) { return; }
                     let snap = self.start_snapshot();
                     if self.eq(inner, pointee) {
                         self.commit_from(snap);
-                        self.b.coerce.insert(e.0, Coerce::RefToRaw(tm));
+                        self.set_coerce(e.0, Coerce::RefToRaw(tm));
                     } else {
                         self.rollback_to(snap);
                         // rustc check_ref_cast: &[T; N] -> *const T first coerces
@@ -1655,7 +1636,7 @@ impl<'a> Fcx<'a> {
                             let snap = self.start_snapshot();
                             if self.eq(element, pointee) {
                                 self.commit_from(snap);
-                                self.b.coerce.insert(e.0, Coerce::RefToRaw(sm));
+                                self.set_coerce(e.0, Coerce::RefToRaw(sm));
                             } else { self.rollback_to(snap); }
                         }
                     }
@@ -1724,7 +1705,7 @@ impl<'a> Fcx<'a> {
             return t;
         }
         let v = self.fresh(0);
-        self.b.coerce.insert(x.0, Coerce::Never);
+        self.set_coerce(x.0, Coerce::Never);
         self.diverging.push(v);
         v
     }
@@ -1734,9 +1715,9 @@ impl<'a> Fcx<'a> {
         let (sa, sx) = (self.shallow(a), self.shallow(x));
         let (ka, kx) = (self.tcx.tys.kind(sa).clone(), self.tcx.tys.kind(sx).clone());
         if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
-            self.b.coerce.insert(ex.0, Coerce::ToDyn(src, dy));
+            self.set_coerce(ex.0, Coerce::ToDyn(src, dy));
         } else if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
-            self.b.coerce.insert(ex.0, Coerce::Upcast(sd, dd));
+            self.set_coerce(ex.0, Coerce::Upcast(sd, dd));
         } else if !self.eq(sa, sx) {
             let (p, q) = (self.ty_str(sx), self.ty_str(sa));
             self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", p, q));
@@ -1755,10 +1736,15 @@ impl<'a> Fcx<'a> {
             let args = self.tcx.tys.list(self.b.methods[&k].args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
             self.b.methods.get_mut(&k).unwrap().args = self.tcx.tys.mk_list(&args);
         }
-        for k in self.b.ov_derefs.keys().copied().collect::<Vec<_>>() {
-            let (method, args) = self.b.ov_derefs[&k];
-            let args = self.tcx.tys.list(args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
-            self.b.ov_derefs.insert(k, (method, self.tcx.tys.mk_list(&args)));
+        for key in self.b.adjustments.keys().copied().collect::<Vec<_>>() {
+            let mut adj = self.b.adjustments[&key].clone();
+            for a in adj.operand.iter_mut().chain(adj.value.iter_mut()) {
+                if let adjustments::Adjust::Deref(Some((method, args))) = *a {
+                    let args = self.tcx.tys.list(args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
+                    *a = adjustments::Adjust::Deref(Some((method, self.tcx.tys.mk_list(&args))));
+                }
+            }
+            self.b.adjustments.insert(key, adj);
         }
         for pending in std::mem::take(&mut self.pending_captures) {
             crate::upvar::analyze(&self.cx.with_infcx(&self.infcx), self.prog, self.tcx, &mut self.b, &pending);
@@ -1844,7 +1830,7 @@ impl<'a> Fcx<'a> {
                         let snapshot = self.start_snapshot();
                         if self.eq(element, pointee) {
                             self.commit_from(snapshot);
-                            self.b.coerce.insert(x.0, Coerce::RefToRaw(source_mut));
+                            self.set_coerce(x.0, Coerce::RefToRaw(source_mut));
                         } else { self.rollback_to(snapshot); }
                     }
                 }
@@ -1877,7 +1863,7 @@ impl<'a> Fcx<'a> {
         let mut captures = std::mem::take(&mut self.b.min_captures);
         for c in captures.values_mut() {
             for capture in &mut c.captures { self.resolve_capture_place(&mut capture.place); }
-            for (place, _) in &mut c.fake_reads { self.resolve_capture_place(place); }
+            for (place, _, _) in &mut c.fake_reads { self.resolve_capture_place(place); }
         }
         self.b.min_captures = captures;
         crate::upvar::coroutine_closure_views(self.prog, self.tcx, &mut self.b);
@@ -2290,6 +2276,7 @@ impl<'a> Fcx<'a> {
                     let (adt_ty, vi) = self.adt_of_ctor(dd);
                     let adt_ty = self.instantiate_adt(adt_ty);
                     let adt_ty = if self.prog.def(dd).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
+                    self.write_adt_user_type(p.0 | PAT_KEY, adt_ty);
                     self.coerce_or_unify(adt_ty, expected, None, path.lo);
                     let et = self.shallow(expected);
                     let mut mentioned: Vec<u32> = Vec::new();
@@ -2408,6 +2395,7 @@ impl<'a> Fcx<'a> {
                 if let Res::Def(d) = r {
                     let (adt_ty, vi) = self.adt_of_ctor(d);
                     let adt_ty = self.instantiate_adt(adt_ty);
+                    self.write_adt_user_type(a.0, adt_ty);
                     self.eq(adt_ty, t);
                     let n = args.len();
                     let r = self.ast().list(args).iter().position(|x| is_rest(*x));
@@ -2437,6 +2425,7 @@ impl<'a> Fcx<'a> {
                 if let Res::Def(d) = r {
                     let (adt_ty, vi) = self.adt_of_ctor(d);
                     let adt_ty = self.instantiate_adt(adt_ty);
+                    self.write_adt_user_type(a.0, adt_ty);
                     self.eq(adt_ty, t);
                     for fe in self.ast().list(fields) {
                         let fname = self.sym(fe.name);
@@ -2795,6 +2784,12 @@ impl<'a> Fcx<'a> {
 
     /// Type of a value def used as an expression (fn items get fresh generic args).
     fn value_def_ty(&mut self, d: DefId, explicit: Option<Vec<TyId>>, key: u32) -> TyId {
+        self.value_def_ty_with_self(d, explicit, key, None)
+    }
+
+    /// `user_self_ty`: the written receiver of an inherent associated item (`Foo::<'a>::f`), which
+    /// has no Self argument to carry it (rustc fn_ctxt/_impl.rs:1034-1094 UserSelfTy).
+    fn value_def_ty_with_self(&mut self, d: DefId, explicit: Option<Vec<TyId>>, key: u32, user_self_ty: Option<crate::types::user_type::UserSelfTy>) -> TyId {
         self.b.dependencies.push(d);
         let parent_regions = std::mem::take(&mut self.value_path_parent_regions);
         let def = self.prog.def(d);
@@ -2845,6 +2840,7 @@ impl<'a> Fcx<'a> {
                 // add_required_obligations_for_hir): the path's args are created once
                 // and its predicates registered with exactly those args.
                 let full = self.tcx.complete_args(self.prog, d, &args, regions);
+                self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
                 self.apply_fn_bounds(d, &full, self.last_lo);
                 self.tcx.tys.intern(TyKind::FnDef(d, self.tcx.tys.mk_list(&args), regions))
             }
@@ -2862,6 +2858,7 @@ impl<'a> Fcx<'a> {
                             let regions: Vec<_> = indices.lifetimes.iter().map(|_| self.fresh_region()).collect();
                             let regions = self.tcx.tys.intern_region_args(&regions);
                             let full = self.tcx.complete_args(self.prog, d, &v, regions);
+                            self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
                             self.apply_fn_bounds(d, &full, self.last_lo);
                         }
                         self.tcx.tys.subst(t, &v)
@@ -2901,6 +2898,7 @@ impl<'a> Fcx<'a> {
                 }
                 self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
                 let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
+                self.write_user_type_annotation_from_args(key, d, &full, user_self_ty);
                 self.apply_fn_bounds(adt_def, &full, self.last_lo);
                 let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), regions));
                 let v = &adt.variants[vi as usize];
@@ -2957,7 +2955,8 @@ impl<'a> Fcx<'a> {
             for i in 0..own as usize {
                 args.push(given.get(i).copied().unwrap_or_else(|| self.fresh_arg(item, args.len())));
             }
-            let t = self.value_def_ty(item, Some(args), key);
+            let user_self = crate::types::user_type::UserSelfTy { impl_def_id: imp, self_ty: self_t };
+            let t = self.value_def_ty_with_self(item, Some(args), key, Some(user_self));
             return (Res::Def(item), t);
         }
         // `<*mut Object>::encode()`: like `T::item`, items of traits in scope count too
@@ -3316,7 +3315,8 @@ impl<'a> Fcx<'a> {
                         args.push(self.fresh_arg(item, args.len()));
                     }
                 }
-                let t = self.value_def_ty(item, Some(args), key);
+                let user_self = crate::types::user_type::UserSelfTy { impl_def_id: imp, self_ty };
+                let t = self.value_def_ty_with_self(item, Some(args), key, Some(user_self));
                 (Res::Def(item), t)
             }
             None => {
@@ -3590,11 +3590,18 @@ impl<'a> Fcx<'a> {
     }
 
     /// One autoderef step from `t`: built-in for references and raw pointers, through
-    /// `Deref` for other types. Records overloaded steps under (expr, step).
+    /// `Deref` for other types. Records the step in the operand adjustments of node `e`.
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
+        let (next, overloaded) = self.deref_step_raw(t)?;
+        self.set_operand_deref(e, step, overloaded);
+        Some(next)
+    }
+
+    /// The step itself: the target type, and the `Deref::deref` call of an overloaded one.
+    fn deref_step_raw(&mut self, t: TyId) -> Option<(TyId, Option<adjustments::OverloadedDeref>)> {
         let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
-            TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow(i)),
+            TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some((self.shallow(i), None)),
             // (a param / rigid projection with a Deref bound derefs to its `Target` binding,
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
@@ -3610,8 +3617,7 @@ impl<'a> Fcx<'a> {
                 let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: self.tcx.tys.mk_list(&[dt]), regions: crate::types::RegionArgsId::EMPTY }));
                 let r = self.norm(proj);
                 let m = self.trait_fn(td, "deref")?;
-                self.b.ov_derefs.insert((e, step), (m, self.tcx.tys.mk_list(&[dt])));
-                Some(r)
+                Some((r, Some((m, self.tcx.tys.mk_list(&[dt])))))
             }
             _ => None,
         }
@@ -3657,7 +3663,7 @@ impl<'a> Fcx<'a> {
     fn methods_of(&mut self, t: TyId) -> Vec<(Sym, Option<DefId>)> {
         let mut out: Vec<(Sym, Option<DefId>)> = Vec::new();
         let mut cur = self.shallow(t);
-        for step in 0..6usize {
+        for _ in 0..6usize {
             let key = crate::tcx::ty_key(&self.tcx.tys, cur);
             if let Some(list) = self.tcx.inherent.get(&key) {
                 for &imp in list {
@@ -3680,13 +3686,11 @@ impl<'a> Fcx<'a> {
                     }
                 }
             }
-            match self.deref_step(u32::MAX - 1, step, cur) {
-                Some(n) => cur = self.shallow(n),
+            match self.deref_step_raw(cur) {
+                Some((n, _)) => cur = self.shallow(n),
                 None => break,
             }
         }
-        // (deref_step records the deref calls it found: none are part of this body)
-        self.b.ov_derefs.retain(|k, _| k.0 != u32::MAX - 1);
         out
     }
 
@@ -4068,7 +4072,7 @@ impl<'a> Fcx<'a> {
                     // `&<(Wrap<?0>,) as Indirect>::Out` is `&?1` with that projection pending
                     let decl = match ty {
                         Some(t) => {
-                            let d = self.lower_ty(*t);
+                            let d = self.lower_let_ty_saving_user_provided_ty(*t);
                             Some(if self.tcx.tys.has_assoc(d) { self.norm(d) } else { d })
                         }
                         None => None,
@@ -4117,7 +4121,7 @@ impl<'a> Fcx<'a> {
                             // `RefCell<dyn FnMut()>` keeps the closure type
                             let unsized_x = self.is_unsized_ty(sx);
                             if st == sx && matches!(self.tcx.tys.kind(st), TyKind::Ref(true, _, _)) {
-                                self.b.reborrows.insert(e.0, true);
+                                self.set_reborrow(e.0, true);
                             }
                             if !unsized_x && st != sx && !matches!(self.tcx.tys.kind(st), TyKind::Never | TyKind::Infer(_)) && !matches!(self.tcx.tys.kind(sx), TyKind::Infer(_)) {
                                 // the expectation may be a mere hint (an if's other branch):
@@ -4264,7 +4268,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::Cast(x, t) => {
                 let deferred_before = self.deferred_casts.len();
-                let target = self.lower_ty(*t);
+                let target = self.lower_ty_saving_user_provided_ty(*t);
                 let st = self.shallow(target);
                 // ExpectCastableToType: an unsuffixed integer literal takes the cast's integer
                 // type, `u8` for `char`, `usize` for pointers and fn pointers (check_lit)
@@ -4291,12 +4295,12 @@ impl<'a> Fcx<'a> {
                 if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
                     self.deferred_casts.push((*x, xt, target));
                 } else if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
-                    self.b.coerce.insert(x.0, Coerce::ToDyn(src, dy));
+                    self.set_coerce(x.0, Coerce::ToDyn(src, dy));
                 } else if let Some((sd, dd)) = self.dyn_upcast(&kx, &kt) {
-                    self.b.coerce.insert(x.0, Coerce::Upcast(sd, dd));
+                    self.set_coerce(x.0, Coerce::Upcast(sd, dd));
                 } else if self.unsize_coercion(&kx, &kt) {
                     // rustc check_cast: a cast that is a coercion is one (`&mut [1] as *mut [i32]`)
-                    self.b.coerce.insert(x.0, Coerce::Unsize);
+                    self.set_coerce(x.0, Coerce::Unsize);
                 } else if let (TyKind::Ref(..) | TyKind::Ptr(..), TyKind::Ptr(..), true) = (&kx, &kt, {
                     // an open source pointee against a known target pointee (`&data as *const
                     // *const ()` with data: *const ?T): the cast is the coercion, T = ()
@@ -4334,8 +4338,8 @@ impl<'a> Fcx<'a> {
                     // try_coercion_cast): `&s as &str` is a deref coercion of &String
                     let (sa, sb) = (self.shallow(*a), self.shallow(*bt));
                     if (*m1 || !*m2) && sa != sb && !matches!(self.tcx.tys.kind(sb), TyKind::Infer(_) | TyKind::Dyn(..)) {
-                        if let Some(n) = self.deref_coercion(*x, sa, sb) {
-                            self.b.coerce.insert(x.0, Coerce::DerefRef(n));
+                        if let Some(derefs) = self.deref_coercion(sa, sb) {
+                            self.set_deref_ref(x.0, derefs, None);
                         }
                     }
                 }
@@ -4786,7 +4790,7 @@ impl<'a> Fcx<'a> {
                 loop {
                     match self.tcx.tys.kind(cur).clone() {
                         TyKind::Array(el, _) | TyKind::Slice(el) => {
-                            self.b.index_derefs.insert(e.0, derefs);
+                            self.set_operand_derefs(e.0, derefs);
                             // an index type of the program's own (`impl<T> Index<TableIndex> for
                             // [T]`): the overloaded Index of the array, else of the slice it
                             // unsizes to (rustc method/probe.rs lookup_indexing: unsize step)
@@ -4824,7 +4828,7 @@ impl<'a> Fcx<'a> {
                             return el;
                         }
                         TyKind::Str if idx_is_range => {
-                            self.b.index_derefs.insert(e.0, derefs);
+                            self.set_operand_derefs(e.0, derefs);
                             return self.tcx.tys.str_;
                         }
                         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {
@@ -4859,7 +4863,7 @@ impl<'a> Fcx<'a> {
                                     }
                                 }
                                 if !matches!(found, Err(_)) {
-                                    self.b.index_derefs.insert(e.0, derefs);
+                                    self.set_operand_derefs(e.0, derefs);
                                     let m = self.trait_fn(td, "index").unwrap();
                                     let index = coerced_idx.unwrap_or(ti2);
                                     self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[dc, index])));
@@ -4935,6 +4939,7 @@ impl<'a> Fcx<'a> {
                 let (adt_ty, vi) = self.adt_of_ctor(d);
                 let adt_ty = self.instantiate_adt(adt_ty);
                 let adt_ty = if self.prog.def(d).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
+                self.write_adt_user_type(e.0, adt_ty);
                 // N:rustc_hir_typeck/src/expr.rs:1823 and fn_ctxt/_impl.rs:1293-1301:
                 // obligations belong to the instantiated path, including explicit args.
                 self.register_wf(adt_ty, lo);
@@ -5544,7 +5549,7 @@ impl<'a> Fcx<'a> {
                 None => break,
             }
         }
-        if steps > 0 { self.b.call_derefs.insert(e.0, steps); }
+        if steps > 0 { self.set_operand_derefs(e.0, steps); }
         if let Some((td, tuple, _, _)) = &overloaded {
             self.record_call_trait(e, *td, fs, steps, *tuple);
         }
@@ -5816,7 +5821,7 @@ impl<'a> Fcx<'a> {
         self.in_loop_condition = save_condition;
         self.coerce_or_unify(bt, rt, Some(body), self.ast().expr(body).lo);
         // a coerced body keeps its own type: lowering converts it to the return type
-        if !self.b.coerce.contains_key(&body.0) {
+        if !self.b.coerce(body.0).is_some() {
             self.set_ty(body, rt);
         }
         self.ret_stack.pop();
@@ -5957,6 +5962,7 @@ impl<'a> Fcx<'a> {
         // lifetimes are fresh.
         let mut full = self.infer_item_args(item, &gargs);
         full[..impl_full.len()].copy_from_slice(&impl_full);
+        self.write_method_user_type(e.0, item, &full);
         let (ps, ret) = self.instantiate_call_signature(item, &full, &sig);
         // method/confirm.rs:150-160 (add_obligations): registered once with the
         // instantiated args, before the arguments are checked.
@@ -6257,6 +6263,7 @@ impl<'a> Fcx<'a> {
                 if matches!(known, crate::consts::GenericArg::Lifetime(_)) { *arg = known; }
             }
         }
+        self.write_method_user_type(e.0, item, &full);
         let (ps, r) = self.instantiate_call_signature(item, &full, &sig);
         // A probe only establishes that the trait may hold, even when it found
         // one impl. Confirm the pick by retaining its trait obligation (nightly

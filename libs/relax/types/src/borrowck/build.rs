@@ -997,7 +997,7 @@ impl<'a> Build<'a> {
                     // `let _ = place;`: evaluates the place, neither reads nor moves it
                     let p = self.as_place(init, false);
                     self.push(StmtKind::PlaceMention(p));
-                } else if self.is_place_expr(init) && !self.b.coerce.contains_key(&init.0) {
+                } else if self.is_place_expr(init) && !self.b.coerce(init.0).is_some() {
                     let mutbl = self.pat_binds_mut_ref(pat);
                     let p = self.as_place(init, mutbl);
                     self.push(StmtKind::PlaceMention(p.clone()));
@@ -1030,7 +1030,7 @@ impl<'a> Build<'a> {
             }
             (_, Some(eb)) => {
                 self.declare_bindings_in(pat, block_scope);
-                let p = if self.is_place_expr(init) && !self.b.coerce.contains_key(&init.0) {
+                let p = if self.is_place_expr(init) && !self.b.coerce(init.0).is_some() {
                     let mutbl = self.pat_binds_mut_ref(pat);
                     self.as_place(init, mutbl)
                 } else {
@@ -1125,7 +1125,7 @@ impl<'a> Build<'a> {
             // Box derefs are builtin (a place of its own, movable)
             return base.deref();
         }
-        if let Some((m, args)) = self.b.ov_derefs.get(&(key, k)).cloned() {
+        if let Some((m, args)) = self.b.ov_deref(key, k) {
             return self.overloaded_deref(m, self.tx.list(args).to_vec(), base, bt, mutbl);
         }
         base.deref()
@@ -1134,7 +1134,7 @@ impl<'a> Build<'a> {
     /// The type after autoderef step (key, k) of a value of type `t` (no code).
     pub(super) fn deref_target_ty(&self, key: u32, k: usize, t: TyId) -> TyId {
         if self.tx.box_inner(t).is_none() {
-            if let Some((m, _)) = self.b.ov_derefs.get(&(key, k)) {
+            if let Some((m, _)) = &self.b.ov_deref(key, k) {
                 let tx = self.tx;
                 let td = tx.prog.def(*m).parent;
                 let tsym = tx.prog.syms.get("Target").unwrap_or(u32::MAX);
@@ -1400,7 +1400,7 @@ impl<'a> Build<'a> {
                 _ => self.rvalue_place(e, t),
             },
             ExprKind::Unary(UnOp::Deref, x) => {
-                if self.b.ov_derefs.contains_key(&(e.0, 0)) && self.tx.box_inner(self.ty(*x)).is_none() {
+                if self.b.ov_deref(e.0, 0).is_some() && self.tx.box_inner(self.ty(*x)).is_none() {
                     let xt = self.ty(*x);
                     let base = self.as_place(*x, mutbl);
                     self.deref_step(e.0, 0, base, xt, mutbl)
@@ -1442,7 +1442,7 @@ impl<'a> Build<'a> {
                 pl.project(Proj::Field(fi as u32, ft))
             }
             ExprKind::Index(a, i) => {
-                let derefs = self.b.index_derefs.get(&e.0).copied().unwrap_or(0);
+                let derefs = self.b.index_derefs(e.0);
                 // the index is builtin unless typeck chose an Index impl or it is a range
                 let builtin = !self.b.ov_index.contains_key(&e.0) && !self.is_range_ty(self.ty(*i));
                 let outermost = !self.inner_index.contains(&e.0);
@@ -1693,7 +1693,7 @@ impl<'a> Build<'a> {
     /// `reborrow`: a `&mut` place passed where a reference is expected is reborrowed).
     pub(super) fn as_operand_coerced(&mut self, e: ExprId, target: TyId, reborrow: bool) -> Operand {
         let src = self.ty(e);
-        match self.b.coerce.get(&e.0).copied() {
+        match self.b.coerce(e.0) {
             None => {
                 if reborrow && self.is_mut_ref(src) && matches!(self.tx.kind(target), TyKind::Ref(..)) && self.is_place_expr(e) {
                     let tm = matches!(self.tx.kind(target), TyKind::Ref(true, _, _));
@@ -1828,7 +1828,7 @@ impl<'a> Build<'a> {
     }
 
     pub(super) fn into_coerced_rb(&mut self, dest: Place, e: ExprId, target: TyId, reborrow: bool) {
-        if self.b.coerce.contains_key(&e.0) && !matches!(self.b.coerce.get(&e.0), Some(Coerce::Never)) || (reborrow && self.is_mut_ref(self.ty(e)) && self.is_place_expr(e)) {
+        if self.b.coerce(e.0).is_some() && !matches!(self.b.coerce(e.0), Some(Coerce::Never)) || (reborrow && self.is_mut_ref(self.ty(e)) && self.is_place_expr(e)) {
             let sp = self.set_span(e);
             let op = self.as_operand_coerced(e, target, reborrow);
             self.assign(dest, Rvalue::Use(op));
@@ -1982,7 +1982,7 @@ impl<'a> Build<'a> {
                 if dest.proj.is_empty() && ast_ty_has_ref(self.ast, *cast_at, 0) {
                     self.ascribe_place(&dest.clone(), *cast_at);
                 }
-                match self.b.coerce.get(&x.0) {
+                match &self.b.coerce(x.0) {
                     Some(Coerce::ToDyn(..) | Coerce::Upcast(..) | Coerce::Unsize | Coerce::DerefRef(_) | Coerce::ReifyFn | Coerce::ClosureFn | Coerce::UnsafeFn | Coerce::MutToConst | Coerce::RefToRaw(_)) => {
                         let op = self.as_operand_coerced(*x, t, false);
                         self.assign(dest, Rvalue::Use(op));
@@ -2359,7 +2359,7 @@ impl<'a> Build<'a> {
     pub(super) fn cond_let(&mut self, p: PatId, x: ExprId, yes: Bb, no: Bb) {
         let sp = self.set_span(x);
         let t = self.ty(x);
-        let place = if self.is_place_expr(x) && !self.b.coerce.contains_key(&x.0) {
+        let place = if self.is_place_expr(x) && !self.b.coerce(x.0).is_some() {
             let mutbl = self.pat_binds_mut_ref(p);
             self.as_place(x, mutbl)
         } else {
@@ -2502,7 +2502,7 @@ impl<'a> Build<'a> {
         let t = self.ty(e);
         let diverges = matches!(self.tx.kind(t), TyKind::Never);
         let selection = self.b.call_traits.get(&e.0).copied();
-        let call_derefs = selection.map(|s| s.derefs).or_else(|| self.b.call_derefs.get(&e.0).copied()).or_else(|| if matches!(self.tx.kind(ft), TyKind::Dyn(..)) { Some(0) } else { None });
+        let call_derefs = selection.map(|s| s.derefs).or_else(|| self.b.call_derefs(e.0)).or_else(|| if matches!(self.tx.kind(ft), TyKind::Dyn(..)) { Some(0) } else { None });
         if let Some(n) = call_derefs {
             // the callable's type after the derefs decides whether the derefs are mutable
             // (calling a `RefMut<dyn FnMut>` derefs it mutably)
@@ -2585,7 +2585,7 @@ impl<'a> Build<'a> {
                     // typeck coerced the argument to the expected reference (rustc
                     // check_argument_types coerces to the expected input: `x == Some(path)`
                     // with `path: &mut T` reborrows `&*path` as the `&T` the comparison expects)
-                    let rb = !self.declared_field_is_param(t, vi, Some(i as u32)) || self.b.reborrows.contains_key(&a.0);
+                    let rb = !self.declared_field_is_param(t, vi, Some(i as u32)) || self.b.reborrow(a.0).is_some();
                     ops.push(self.as_operand_coerced(*a, pt, rb));
                 }
                 // a constructor value (`f(x)` with `let f = S::<&'a u32>`): the aggregate's
@@ -2832,7 +2832,7 @@ impl<'a> Build<'a> {
             };
             // a generic param field takes the value unless typeck coerced it (as for tuple
             // constructors above)
-            let rb = !self.declared_field_is_param(t, vi, fi) || self.b.reborrows.contains_key(&f.expr.0);
+            let rb = !self.declared_field_is_param(t, vi, fi) || self.b.reborrow(f.expr.0).is_some();
             let op = self.as_operand_coerced(f.expr, ft, rb);
             match fi {
                 Some(fi) if (fi as usize) < n => {
