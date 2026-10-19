@@ -1220,7 +1220,6 @@ pub fn check_imports(prog: &Program, krate: u32) -> Vec<String> {
         if imp.ext || prog.file_crate.get(imp.file as usize) != Some(&krate) { continue; }
         let pf = &*prog.files[imp.file as usize];
         if !matches!(pf.expansion_kind(imp.pos), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules) { continue; }
-        let n = imp.segs.len();
         let names: Vec<&str> = imp.segs.iter().map(|sg| prog.syms.str(sg.1)).collect();
         if !imp.global && !matches!(names.first(), Some(&"std" | &"core" | &"alloc")) { continue; }
         if let Some((feature, reason)) = table_entry(&names) {
