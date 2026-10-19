@@ -40,6 +40,9 @@ impl ConstContext {
 fn const_context(tx: &Tx, bir: &Bir) -> Option<ConstContext> {
     let cb = bir.checked_body?;
     if bir.closure_kind.is_some() { return None; }
+    // `#[rust(expr)]` field initial values are generated consts holding arbitrary run-time
+    // expressions (front derive.rs default_consts): not constants of the program
+    if prog_name_is_generated_default(tx, cb.owner) { return None; }
     match cb.kind {
         BodyKind::Const | BodyKind::AssocConst | BodyKind::InlineConst(_) | BodyKind::AnonConst(_) => Some(ConstContext::Const),
         BodyKind::Static => {
@@ -286,4 +289,8 @@ impl<Q: Queries> Checker<'_, '_, Q> {
         }
         Ok(())
     }
+}
+
+fn prog_name_is_generated_default(tx: &Tx, d: crate::program::DefId) -> bool {
+    tx.prog.name(d).starts_with("__relax_default_")
 }
