@@ -11151,6 +11151,11 @@ pub fn close_patch() {
     }
 }
 
+/// The patch epoch: moves on every live edit, rollback and reload (a source text changed).
+pub(crate) fn patch_epoch() -> u64 {
+    PATCH_EPOCH.load(Ordering::SeqCst)
+}
+
 pub fn bump_patch_epoch() {
     PATCH_EPOCH.fetch_add(1, Ordering::SeqCst);
 }

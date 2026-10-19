@@ -327,6 +327,14 @@ pub(crate) struct PendingRecord {
     nounwind: Vec<(u32, bool)>,
     baseline: bool,
     deps: Vec<u32>,
+    /// jit::patch_epoch() at the install: a record is encoded only against the sources it was built from
+    epoch: u64,
+}
+
+/// Is a deferred record still describing the sources its code was built from?
+fn pending_current(u: &Unit, p: &PendingRecord) -> bool {
+    let f = &u.fns[p.id as usize];
+    p.epoch == crate::jit::patch_epoch() && f.patch_gen == 0 && !u.prog.is_edit_version(f.file)
 }
 
 /// The slots whose RIR the code of `id` took in (`Unit::body_deps` from `id` and `extra`,
@@ -2146,11 +2154,17 @@ impl Cache {
             nounwind: rir.map_or_else(Vec::new, |r| r.nounwind_inputs.clone()),
             baseline: rir.is_some_and(|r| r.baseline),
             deps: record_deps(u, id, &[]),
+            epoch: crate::jit::patch_epoch(),
         })
     }
 
     /// Encodes a deferred record: `record`, from the install-time inputs.
     pub(crate) fn record_pending(&mut self, u: &Unit, p: &PendingRecord) {
+        if !pending_current(u, p) {
+            // a source changed (or the slot was patched) since the install: its key would name
+            // the new text for old code. A lost entry is harmless; a stale one is not.
+            return;
+        }
         let previous = std::mem::replace(&mut self.recording_pending, true);
         self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, None, false, Some(p));
         self.recording_pending = previous;
