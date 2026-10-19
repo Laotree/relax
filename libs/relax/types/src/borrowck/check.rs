@@ -99,7 +99,7 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
     let mut result = MirBorrowckResult { errors: vec![], used_mut: BitSet::new_empty(body.local_decls.len()),
         unsupported: vec![], used_mut_upvars: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors,
         fv_only: vec![], fv_records: vec![] };
-    check_supported(tcx, body, nested, &mut result.unsupported);
+    check_supported(tcx, body, Some(nested), &mut result.unsupported);
     if !result.unsupported.is_empty() { return result; }
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
     let borrows = BorrowSet::build(tcx, body, invalidated, moves);
@@ -139,8 +139,8 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
 }
 
 
-fn check_supported(tcx: &Tcx, body: &Body, nested: &NestedUsedMut, unsupported: &mut Vec<&'static str>) {
-    struct Check<'a> { tcx: &'a Tcx, body: &'a Body, nested: &'a NestedUsedMut, stops: &'a mut Vec<&'static str> }
+fn check_supported(tcx: &Tcx, body: &Body, nested: Option<&NestedUsedMut>, unsupported: &mut Vec<&'static str>) {
+    struct Check<'a> { tcx: &'a Tcx, body: &'a Body, nested: Option<&'a NestedUsedMut>, stops: &'a mut Vec<&'static str> }
     impl Check<'_> { fn stop(&mut self, s: &'static str) { if !self.stops.contains(&s) { self.stops.push(s); } } }
     impl Visitor for Check<'_> {
         fn visit_place(&mut self, place: &Place, context: crate::mir::visit::PlaceContext, at: Location) {
@@ -154,7 +154,7 @@ fn check_supported(tcx: &Tcx, body: &Body, nested: &NestedUsedMut, unsupported: 
         }
         fn visit_rvalue(&mut self, rv: &Rvalue, at: Location) {
             match rv {
-                Rvalue::Aggregate(kind, _) if matches!(&**kind, AggregateKind::Closure(id, _) | AggregateKind::Coroutine(id, _) if self.nested.get(*id).is_none()) =>
+                Rvalue::Aggregate(kind, _) if matches!(&**kind, AggregateKind::Closure(id, _) | AggregateKind::Coroutine(id, _) if self.nested.is_some_and(|n| n.get(*id).is_none())) =>
                     self.stop("closure aggregate without its nested body's used-mut upvars"),
                 Rvalue::CopyForDeref(_) => self.stop("runtime rvalue in borrowck MIR"),
                 _ => {}
@@ -953,7 +953,8 @@ fn check_promoted_moves(tcx: &Tcx, body: &Body, result: &mut MirBorrowckResult) 
         }
     }
     for promoted in &body.promoted {
-        check_supported(tcx, promoted, &NestedUsedMut::default(), &mut result.unsupported);
+        // A promoted body is only searched for illegal moves: what the closures it creates mutate is not asked.
+        check_supported(tcx, promoted, None, &mut result.unsupported);
         if !result.unsupported.is_empty() { continue; }
         let mut visitor = Moves { tcx, body: promoted, errors: vec![] };
         for (b, block) in promoted.basic_blocks.iter().enumerate() { visitor.visit_basic_block_data(BasicBlock(b as u32), block); }

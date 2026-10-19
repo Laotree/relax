@@ -283,3 +283,12 @@ fn a_const_block_declaring_an_item_and_asserting_layout() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_promoted_closure_is_not_a_missing_nested_body() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn run(cancel: &dyn Fn() -> bool) -> bool { cancel() }
+        pub fn f() -> bool { run(&|| false) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
