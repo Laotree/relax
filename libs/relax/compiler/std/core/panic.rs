@@ -7,7 +7,8 @@ use crate::fmt;
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(not(relax_check), lang = "panic_location")]
 pub struct Location<'a> {
-    file: &'a str,
+    // the file name and its terminating nul (rustc Location::file_bytes_with_nul)
+    file_bytes_with_nul: &'a [u8],
     line: u32,
     col: u32,
 }
@@ -19,11 +20,15 @@ impl<'a> Location<'a> {
         unsafe { crate::intrinsics_rt::caller_location() }
     }
     /// Built by Relax's lowering for panics and `Location::caller()`.
-    pub const fn internal_constructor(file: &'a str, line: u32, col: u32) -> Location<'a> {
-        Location { file, line, col }
+    pub const fn internal_constructor(file_bytes_with_nul: &'a [u8], line: u32, col: u32) -> Location<'a> {
+        Location { file_bytes_with_nul, line, col }
     }
     pub const fn file(&self) -> &'a str {
-        self.file
+        let bytes = self.file_bytes_with_nul;
+        unsafe { crate::str::from_utf8_unchecked(crate::slice::from_raw_parts(bytes.as_ptr(), bytes.len() - 1)) }
+    }
+    pub const fn file_as_c_str(&self) -> &'a crate::ffi::CStr {
+        unsafe { crate::ffi::CStr::from_bytes_with_nul_unchecked(self.file_bytes_with_nul) }
     }
     pub const fn line(&self) -> u32 {
         self.line
@@ -35,7 +40,7 @@ impl<'a> Location<'a> {
 
 impl<'a> fmt::Display for Location<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}:{}", self.file, self.line, self.col)
+        write!(f, "{}:{}:{}", self.file(), self.line, self.col)
     }
 }
 

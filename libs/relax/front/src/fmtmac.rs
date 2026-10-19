@@ -397,7 +397,7 @@ impl<'a> Parser<'a> {
                         Src::Val("file!()".to_string()),
                         Src::Val("line!()".to_string()),
                         Src::Val("column!()".to_string()),
-                        Src::Ref("&__relax_tmp".to_string()),
+                        Src::Ref("&&__relax_tmp".to_string()),
                     ];
                     self.gen_pieces(&mut g, pieces, srcs, lo)?;
                     g.p("); __relax_tmp } }");

@@ -477,16 +477,17 @@ impl<'a> Parser<'a> {
             name.as_slice(),
             b"format" | b"print" | b"println" | b"eprint" | b"eprintln" | b"write" | b"writeln" | b"panic" | b"format_args"
                 | b"vec" | b"assert" | b"assert_eq" | b"assert_ne" | b"debug_assert" | b"debug_assert_eq" | b"debug_assert_ne"
-                | b"matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
+                | b"matches" | b"assert_matches" | b"debug_assert_matches" | b"unreachable" | b"todo" | b"unimplemented" | b"dbg" | b"asm"
         );
         if !known {
             return NO_MAC_ARGS;
         }
-        let is_matches = name == b"matches";
+        let is_matches = matches!(name.as_slice(), b"matches" | b"assert_matches" | b"debug_assert_matches");
+        let has_msg = name != b"matches" && is_matches;
         let is_vec = name == b"vec";
         let save = self.pos;
         self.pos = toks.lo as usize;
-        let r = if name == b"asm" { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, is_vec, toks.hi as usize) };
+        let r = if name == b"asm" { self.asm_args(toks.hi as usize) } else { self.mac_args_inner(is_matches, has_msg, is_vec, toks.hi as usize) };
         self.pos = save;
         match r {
             Ok(a) => {
@@ -497,7 +498,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn mac_args_inner(&mut self, is_matches: bool, is_vec: bool, hi: usize) -> PResult<MacArgs> {
+    fn mac_args_inner(&mut self, is_matches: bool, has_msg: bool, is_vec: bool, hi: usize) -> PResult<MacArgs> {
         let mut a = MacArgs { exprs: List::EMPTY, repeat: false, pat: None, guard: None, asm: None };
         let mut exprs = Vec::new();
         if is_matches {
@@ -507,7 +508,15 @@ impl<'a> Parser<'a> {
             if self.eat(T::KwIf) {
                 a.guard = Some(self.expr()?);
             }
-            self.eat(T::Comma);
+            // `assert_matches!(e, pat if guard, "message {}", args)`: the format arguments follow
+            if self.eat(T::Comma) && has_msg {
+                while self.pos < hi {
+                    exprs.push(self.expr()?);
+                    if !self.eat(T::Comma) {
+                        break;
+                    }
+                }
+            }
         } else {
             while self.pos < hi {
                 exprs.push(self.expr()?);

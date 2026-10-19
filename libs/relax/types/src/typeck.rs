@@ -6352,7 +6352,7 @@ impl<'a> Fcx<'a> {
                 self.check_fmt_args(e, mexprs);
                 never
             }
-            "matches" => {
+            "matches" | "assert_matches" | "debug_assert_matches" => {
                 if let (Some(&x), Some(p)) = (mexprs.first(), margs.pat) {
                     let t = self.check_expr(x, None);
                     let saved = self.scopes.len();
@@ -6362,7 +6362,13 @@ impl<'a> Fcx<'a> {
                     }
                     self.scopes.truncate(saved);
                 }
-                bool_
+                if name == "matches" {
+                    bool_
+                } else {
+                    self.check_fmt_args(e, &mexprs[1.min(mexprs.len())..]);
+                    self.diverges = false;
+                    unit
+                }
             }
             _ => {
                 let _ = expected;

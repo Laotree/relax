@@ -32,7 +32,7 @@ pub use join::{concat_str, concat_vec, join_str, join_vec};
 use crate::cmp::Ordering;
 use crate::intrinsics_mem as im;
 
-pub unsafe fn from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T] {
+pub const unsafe fn from_raw_parts<'a, T>(data: *const T, len: usize) -> &'a [T] {
     im::slice_from_raw(data, len)
 }
 
