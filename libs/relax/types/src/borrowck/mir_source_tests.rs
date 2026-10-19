@@ -445,3 +445,11 @@ fn an_opaque_outliving_every_lifetime_captures_no_live_region() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn an_async_fn_body_is_ordered_among_its_closures_by_its_block() {
+    // (the coroutine body itself is not yet qualified: the check stops, it does not panic)
+    let (errors, _unchecked) = borrowck_source("
+        pub async fn f(v: Vec<String>) -> usize { v.into_iter().map(|s| s.len()).sum() }");
+    assert!(errors.is_empty(), "{errors:?}");
+}
