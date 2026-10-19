@@ -246,6 +246,7 @@ impl<T: ?Sized> Drop for Arc<T> {
     }
 }
 
+impl<T: ?Sized> crate::ops::LegacyReceiver for Arc<T> {}
 impl<T: ?Sized> Deref for Arc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -343,6 +344,19 @@ impl<T, const N: usize> From<[T; N]> for Arc<[T]> {
             ptr::copy_nonoverlapping(&v as *const [T; N] as *const T, p, N);
             crate::mem::forget(v);
             Arc::from_parts(ptr::slice_from_raw_parts_mut(p, N))
+        }
+    }
+}
+
+/// `Arc<[T]>` of exactly N elements as `Arc<[T; N]>`, else the pointer back (alloc/src/arc.rs).
+impl<T, const N: usize> crate::convert::TryFrom<Arc<[T]>> for Arc<[T; N]> {
+    type Error = Arc<[T]>;
+    fn try_from(boxed_slice: Arc<[T]>) -> Result<Arc<[T; N]>, Arc<[T]>> {
+        if boxed_slice.len() == N {
+            let ptr = Arc::into_raw(boxed_slice) as *mut [T; N];
+            Ok(unsafe { Arc::from_raw(ptr) })
+        } else {
+            Err(boxed_slice)
         }
     }
 }

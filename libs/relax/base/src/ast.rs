@@ -819,7 +819,7 @@ pub enum GenericArg {
     /// `Item = T`
     Binding(Ident, GenericArgsId, TyId),
     /// `Item: Bound`
-    Constraint(Ident, List<Bound>),
+    Constraint(Ident, GenericArgsId, List<Bound>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -829,6 +829,8 @@ pub enum Bound {
         hrtb: List<GenericParam>,
         maybe: bool,
         konst: bool,
+        /// `async Fn()` (async_trait_bounds)
+        async_: bool,
         path: Path,
     },
     /// `use<'a, T>` precise capture
@@ -1097,6 +1099,8 @@ pub struct ForRow {
 pub struct ClosureRow {
     pub is_move: bool,
     pub is_async: bool,
+    /// `static || ..` (coroutine syntax)
+    pub is_static: bool,
     pub params: List<ClosureParam>,
     pub ret: Option<TyId>,
     pub body: ExprId,
@@ -1479,6 +1483,9 @@ pub struct Ast {
     pub impl_items: crate::arena::Arena<ImplItem>,
     pub foreign_mods: crate::arena::Arena<ForeignModItem>,
     pub vis_paths: crate::arena::Arena<Path>,
+    /// lint-level attributes (`#[allow(..)]` ..) of expression statements: cfg stripping drops the
+    /// statement wrapper, this keeps the attributes for the lint passes (expression -> attributes)
+    pub stmt_attrs: Vec<(ExprId, List<Attr>)>,
     /// first id of each arena (in `ends` order): 0 for a file's tree; a file's lazily parsed
     /// fn bodies (`part`) continue its ids
     pub base: Bases,
@@ -1768,6 +1775,14 @@ impl Ast {
                 Some((a.expr, a.semi))
             }
             _ => None,
+        }
+    }
+    /// The lint-level attributes an expression statement was written with.
+    pub fn stmt_attrs(&self, e: ExprId) -> List<Attr> {
+        if let Some((_, l)) = self.stmt_attrs.iter().find(|(x, _)| *x == e) { return *l; }
+        match self.part.get() {
+            Some(p) => p.stmt_attrs(e),
+            None => List::EMPTY,
         }
     }
     /// A block's statements.
