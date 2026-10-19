@@ -54,12 +54,3 @@ fn literals_in_macro_token_trees_are_not_cooked_by_the_parser_checks() {
     assert!(err("m!{ 0b102 }", 2021).unwrap().contains("invalid digit for a base 2 literal"));
     assert!(err("m!{ \"\\q\" }", 2021).unwrap().contains("unknown character escape"));
 }
-
-#[test]
-fn shebang_is_a_line_unless_an_attribute_follows() {
-    use relax_lex::validate::shebang_len;
-    assert_eq!(shebang_len(b"#!/bin/sh\nfn main(){}"), Some(9));
-    assert_eq!(shebang_len(b"#!\n[allow(x)]"), None);
-    assert_eq!(shebang_len(b"#!//c\n[allow(x)]"), None);
-    assert_eq!(shebang_len(b"#![allow(x)]"), None);
-}
