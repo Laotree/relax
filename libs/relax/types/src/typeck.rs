@@ -1005,6 +1005,11 @@ impl<'a> Fcx<'a> {
         let (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) = (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) else { return false };
         if d1 != d2 || a == d || self.prog.def(d1).kind != DefKind::Struct || self.tcx.tys.list(xs).is_empty() || self.tcx.tys.list(xs).len() != self.tcx.tys.list(ys).len() { return false; }
         let Some(unsize) = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize) else { return false };
+        // types that can be equal are related, not unsized (`W<?x>` -> `W<T>`)
+        let probe = self.start_snapshot();
+        let same = self.eq(a, d);
+        self.rollback_to(probe);
+        if same { return false; }
         matches!(self.select_trait(unsize, a, &[d]), Ok(Some(_)))
     }
 
