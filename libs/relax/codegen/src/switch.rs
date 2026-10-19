@@ -360,8 +360,10 @@ impl Emit<'_> {
     }
 }
 
-/// Switch lowering of every chain of `f` (see the module comment). None when nothing changed.
-pub fn lower_switches(options: &relax_session::Options, f: &Func) -> Option<Func> {
+/// Switch lowering of every chain of `f` (see the module comment). None when nothing changed; else
+/// the new function and, per its block, the block of `f` whose execution frequency it shares (the
+/// blocks are renumbered, and block frequencies are by number).
+pub fn lower_switches(options: &relax_session::Options, f: &Func) -> Option<(Func, Vec<u32>)> {
     if options.no_jump_tables || f.baseline {
         return None;
     }
@@ -448,6 +450,8 @@ pub fn lower_switches(options: &relax_session::Options, f: &Func) -> Option<Func
         }
     }
     let mut out: Option<Func> = None;
+    // per block of the result: the block of `f` whose execution frequency it shares
+    let mut origin: Vec<u32> = (0..nb as u32).collect();
     for head in 0..nb {
         let Some(h) = tests[head] else { continue };
         if is_link[head] {
@@ -510,12 +514,16 @@ pub fn lower_switches(options: &relax_session::Options, f: &Func) -> Option<Func
         hb.insts.pop();
         hb.pos.pop();
         let mut em = Emit { f: g, x: h.x, signed, pos };
+        let before = em.f.blocks.len();
         em.fill(head as u32, node);
+        for _ in before..em.f.blocks.len() {
+            origin.push(head as u32);
+        }
     }
-    if let Some(g) = &mut out {
-        crate::opt::relayout(g);
-    }
-    out
+    let mut g = out?;
+    let order = crate::opt::relayout_order(&mut g);
+    let origin: Vec<u32> = order.iter().map(|b| origin[*b as usize]).collect();
+    Some((g, origin))
 }
 
 fn swap(c: Cond) -> Cond {

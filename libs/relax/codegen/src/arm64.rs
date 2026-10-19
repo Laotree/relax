@@ -3395,7 +3395,11 @@ fn compile_freq_inner(options: &relax_session::Options, f: &Func, env: &Env, fre
     }
     // chains of compares of one value against constants: jump tables, bit tests, binary search
     let switched = crate::switch::lower_switches(options, f);
-    let f = switched.as_ref().unwrap_or(f);
+    let (f, freq_sw) = match &switched {
+        Some((g, origin)) => (g, freq.map(|fr| origin.iter().map(|b| fr.get(*b as usize).copied().unwrap_or(0.0)).collect::<Vec<f32>>())),
+        None => (f, None),
+    };
+    let freq = if switched.is_some() { freq_sw.as_deref() } else { freq };
     let _cost_ra = crate::fncost::phase(9);
     let t_ra = crate::opt::pass_clock();
     // immediates arm64 cannot encode, inside loops: registers set up once

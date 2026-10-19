@@ -1508,10 +1508,9 @@ fn loop_headers(f: &Func, depth: &[u32]) -> Vec<bool> {
             _ => {
                 state[b] = 1;
                 work.push((b, true));
-                let mut succs = f.blocks[b].term.succs();
-                for s in [succs.next(), succs.next()].into_iter().rev().flatten() {
-                    work.push((s as usize, false));
-                }
+                let at = work.len();
+                work.extend(f.blocks[b].term.succs().map(|s| (s as usize, false)));
+                work[at..].reverse();
             }
         }
     }
@@ -3408,9 +3407,14 @@ fn thread_jumps(f: &mut Func) {
 /// Reorders reachable blocks so a block's jump/false-branch target follows it, drops
 /// unreachable blocks and puts panic paths (blocks ending in `Unreachable`) last.
 pub fn relayout(f: &mut Func) {
+    relayout_order(f);
+}
+
+/// `relayout`, returning the new order: per new block, the block it was.
+pub fn relayout_order(f: &mut Func) -> Vec<u32> {
     let n = f.blocks.len();
     if n <= 1 {
-        return;
+        return (0..n as u32).collect();
     }
     let reach = reachable(f);
     // blocks only reachable through unwind edges (cleanup pads) are cold
@@ -3479,6 +3483,7 @@ pub fn relayout(f: &mut Func) {
         blk.term.map_succs(|t| map[t as usize]);
         f.blocks.push(blk);
     }
+    order
 }
 
 pub fn inst_count(f: &Func) -> usize {
@@ -4498,13 +4503,9 @@ pub fn idoms(f: &Func) -> Vec<u32> {
             seen[b as usize] = true;
             stack.push((b, 1));
             // pushed in reverse: the first successor is visited first
-            let succ: [Option<u32>; 2] = {
-                let mut it = f.blocks[b as usize].term.succs();
-                [it.next(), it.next()]
-            };
-            for t in succ.iter().rev().flatten() {
-                stack.push((*t, 0));
-            }
+            let at = stack.len();
+            stack.extend(f.blocks[b as usize].term.succs().map(|t| (t, 0)));
+            stack[at..].reverse();
         } else {
             rpo.push(b);
         }

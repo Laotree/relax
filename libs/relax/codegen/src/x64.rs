@@ -4276,7 +4276,11 @@ pub fn compile_freq(options: &relax_session::Options, f: &Func, env: &Env, freq:
     };
     // chains of compares of one value against constants: jump tables, bit tests, binary search
     let switched = crate::switch::lower_switches(options, f);
-    let f = switched.as_ref().unwrap_or(f);
+    let (f, freq_sw) = match &switched {
+        Some((g, origin)) => (g, freq.map(|fr| origin.iter().map(|b| fr.get(*b as usize).copied().unwrap_or(0.0)).collect::<Vec<f32>>())),
+        None => (f, None),
+    };
+    let freq = if switched.is_some() { freq_sw.as_deref() } else { freq };
     // constants used in loops defined once at the entry (the allocator keeps them in registers
     // or recomputes them); constant operands that fit an imm32 become immediates
     // (hot code only: the rewrite copies the function, +15% back-end time at O1)
