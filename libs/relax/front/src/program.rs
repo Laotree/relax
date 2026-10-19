@@ -389,6 +389,9 @@ pub struct CrateInfo {
     pub cfg: CfgSet,
     /// a proc-macro crate: other crates see only its macros (rustc exports nothing else)
     pub proc_macro: bool,
+    /// the crate's errors are reported (set by the check for its checked crates): validation-only
+    /// checks run for it and for no other crate
+    pub validate: bool,
     /// relaxed-Rust features this crate opts in to (relaxed.rs; empty = strict), read on first
     /// use (only a relaxable error or the borrow checker asks; strict programs never read it)
     relaxed: std::sync::OnceLock<Vec<String>>,
@@ -1101,7 +1104,7 @@ impl Program {
         let root_mod = self.new_module(root_def, None, None, krate, 0);
         self.defs[root_def.0 as usize].sub = root_mod;
         self.defs[root_def.0 as usize].scope = root_mod;
-        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, relaxed: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
+        self.crates.push(CrateInfo { name: cname, root_mod, edition, recursion_limit: 128, deps, cfg, proc_macro: false, validate: false, relaxed: Default::default(), root_path: root.to_string(), context: crate::source_context::Context::new(root, self.sources.clone(), &self.session) });
         let kname = self.syms.str(cname).to_string();
         let akey = (kname.clone(), root.to_string());
         if !self.ahead.contains_key(&akey) {

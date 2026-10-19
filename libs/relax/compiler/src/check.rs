@@ -108,6 +108,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let mut own = vec![false; u.prog.crates.len()];
     for &k in crates {
         own[k as usize] = true;
+        u.prog.crates[k as usize].validate = true;
     }
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order

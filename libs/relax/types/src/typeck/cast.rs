@@ -155,7 +155,7 @@ impl Fcx<'_> {
             return;
         }
         if self.cast_is_coercion(e, expr_ty, cast_ty) { return; }
-        match self.do_cast_check(e, expr_ty, cast_ty) {
+        match self.do_cast_check(e, expr_ty, cast_ty, lo) {
             Ok(()) => {}
             Err(err) => self.report_cast_error(err, &es, &cs, lo),
         }
@@ -183,7 +183,7 @@ impl Fcx<'_> {
         }
     }
 
-    fn do_cast_check(&mut self, e: ExprId, expr_ty: TyId, cast_ty: TyId) -> Result<(), CastError> {
+    fn do_cast_check(&mut self, e: ExprId, expr_ty: TyId, cast_ty: TyId, lo: u32) -> Result<(), CastError> {
         use CastTy::*;
         let (t_from, t_cast) = match (self.cast_ty_of(expr_ty), self.cast_ty_of(cast_ty)) {
             (Some(f), Some(c)) => (f, c),
@@ -254,7 +254,7 @@ impl Fcx<'_> {
                 if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(expr_ty).clone() {
                     if self.tcx.adt_destructor(d).is_some() {
                         let (es, cs) = (self.cast_ty_str(expr_ty), self.cast_ty_str(cast_ty));
-                        self.err(self.last_lo, format!("E0604: cannot cast enum `{}` into integer `{}` because it implements `Drop`", es, cs));
+                        self.err(lo, format!("E0604: cannot cast enum `{}` into integer `{}` because it implements `Drop`", es, cs));
                     }
                 }
                 Ok(())

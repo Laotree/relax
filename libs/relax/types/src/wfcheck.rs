@@ -89,7 +89,10 @@ impl Tcx {
 
     /// `identify_constrained_generic_params` / `setup_constraining_predicates`: parameters that a
     /// projection predicate `<..> = Term` fixes once all of its inputs are known.
-    fn identify_constrained_generic_params(&self, indices: &GenericIndices, predicates: &[Predicate], impl_trait_ref: Option<&crate::next_solver::TraitRef>, input: &mut HashSet<Parameter>) {
+    /// The trait an associated item belongs to.
+    fn assoc_trait(&self, prog: &Program, item: DefId) -> DefId { prog.def(item).parent }
+
+    fn identify_constrained_generic_params(&self, prog: &Program, indices: &GenericIndices, predicates: &[Predicate], impl_trait_ref: Option<&crate::next_solver::TraitRef>, input: &mut HashSet<Parameter>) {
         let mut remaining: Vec<&Predicate> = predicates.iter().filter(|p| matches!(&p.kind, PredicateKind::Clause(ClauseKind::Projection(_)))).collect();
         let mut changed = true;
         while changed {
@@ -100,6 +103,7 @@ impl Tcx {
                 let (inputs, same_trait) = match &projection.projection_term {
                     AliasTerm::Ty(alias) => {
                         let TyKind::Alias(_, a) = self.tys.kind(*alias).clone() else { j += 1; continue };
+                        // (`prog` for the trait of the projected item)
                         let inputs: Vec<Parameter> = {
                             let mut c = Collector { tcx: self, indices, include_nonconstraining: true, out: Vec::new() };
                             c.ty(*alias);
@@ -107,8 +111,16 @@ impl Tcx {
                         };
                         // an attempt to project out an associated type of the impl's own trait ref
                         let same = impl_trait_ref.is_some_and(|tr| {
-                            let tys: Vec<TyId> = tr.args.iter().filter_map(|x| if let GenericArg::Type(t) = x { Some(*t) } else { None }).collect();
-                            self.tys.list(a.args).len() >= tys.len() && self.tys.list(a.args)[..tys.len()] == tys[..] && tr.def_id == a.kind.def_id()
+                            // the whole trait ref: type and const arguments, then lifetimes
+                            let tc: Vec<TyId> = tr.args.iter().filter_map(|x| match *x {
+                                GenericArg::Type(t) => Some(t),
+                                GenericArg::Const(c) => Some(self.tys.intern(TyKind::Const(c))),
+                                GenericArg::Lifetime(_) => None,
+                            }).collect();
+                            let lts: Vec<crate::types::RegionId> = tr.args.iter().filter_map(|x| if let GenericArg::Lifetime(r) = *x { Some(r) } else { None }).collect();
+                            let regions = self.tys.region_args(a.regions);
+                            tr.def_id == self.assoc_trait(prog, a.kind.def_id()) && self.tys.list(a.args).len() >= tc.len() && self.tys.list(a.args)[..tc.len()] == tc[..]
+                                && regions.len() >= lts.len() && regions[..lts.len()] == lts[..]
                         });
                         (inputs, same)
                     }
@@ -147,7 +159,7 @@ impl Tcx {
             None => self.parameters_for_ty(&indices, self_ty, false),
         }.into_iter().collect();
         let predicates = self.own_clauses_of(prog, imp).to_vec();
-        self.identify_constrained_generic_params(&indices, &predicates, trait_ref, &mut input);
+        self.identify_constrained_generic_params(prog, &indices, &predicates, trait_ref, &mut input);
         // lifetimes used by an associated type's value
         let mut in_assoc: HashSet<Parameter> = HashSet::default();
         let mut lifetimes_checked = false;
@@ -190,7 +202,7 @@ impl Tcx {
         let variances = self.variances_of(prog, d);
         let indices = self.generic_indices_of(prog, d).clone();
         let mut constrained: HashSet<Parameter> = variances.iter().enumerate().filter(|(_, v)| **v != V::Bi).map(|(i, _)| i as u32).collect();
-        self.identify_constrained_generic_params(&indices, self.own_clauses_of(prog, d), None, &mut constrained);
+        self.identify_constrained_generic_params(prog, &indices, self.own_clauses_of(prog, d), None, &mut constrained);
         // an error deep in a field type: the unused parameter is not reported
         if self.adts.get(&d).is_some_and(|adt| adt.variants.iter().any(|v| v.fields.iter().any(|f| self.tys.has_error(f.ty)))) { return Vec::new(); }
         let mut errors = Vec::new();

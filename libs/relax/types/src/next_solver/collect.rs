@@ -379,7 +379,7 @@ impl Tcx {
                         continue;
                     };
                     // lower_assoc_item_constraint: the constraint's own arguments against the item's
-                    let errs = self.check_generic_arg_count(prog, ad, ast.gargs(own_args), ast, self.own_generic_counts(prog, ad, None), crate::tcx::arg_count::ArgPosition::AssocType, false, false);
+                    let errs = if !self.validates(prog, def.file) { Vec::new() } else { self.check_generic_arg_count(prog, ad, ast.gargs(own_args), ast, self.own_generic_counts(prog, ad, None), crate::tcx::arg_count::ArgPosition::AssocType, false, false) };
                     if !errs.is_empty() || self.prohibit_constraints(cx, prog, def.file, own_args) {
                         let lo = match *arg { ast::GenericArg::Binding(n, _, _) | ast::GenericArg::Constraint(n, _) => n.lo, _ => 0 };
                         for e in errs { self.err(cx, prog, def.file, lo, e); }

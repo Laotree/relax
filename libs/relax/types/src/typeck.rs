@@ -1828,19 +1828,16 @@ impl<'a> Fcx<'a> {
             let st = self.shallow(target);
             if let (TyKind::Ref(source_mut, inner, _), TyKind::Ptr(target_mut, pointee)) =
                 (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone()) {
-                let mut array_cast = false;
                 if source_mut || !target_mut {
                     if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
                         let snapshot = self.start_snapshot();
                         if self.eq(element, pointee) {
                             self.commit_from(snapshot);
                             self.b.coerce.insert(x.0, Coerce::RefToRaw(source_mut));
-                            array_cast = true;
                         } else { self.rollback_to(snapshot); }
                     }
                 }
-                // (a reference that is no array pointer cast: the cast check's E0606)
-                let _ = array_cast;
+                // (a reference that is no array pointer cast is the cast check's E0606)
             }
             self.record_cast_borrow(x, xt, target);
         }
@@ -3748,9 +3745,11 @@ impl<'a> Fcx<'a> {
 
     /// hir_ty_lowering check_generic_arg_count of a written segment against `def`'s own generics.
     /// False (reported) when the number of arguments is wrong.
-    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32, is_method_call: bool) -> bool {
+    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32) -> bool {
         use crate::tcx::arg_count::ArgPosition;
         let prog = self.prog;
+        // (only a crate whose errors are reported validates; a call without written arguments has nothing to count)
+        if !matches!(self.ast().gargs(args), Some(GenericArgs::Angle(_))) || !self.tcx.validates(prog, self.file) { return true; }
         let mut def = def;
         let mut kind = prog.def(def).kind;
         if kind == DefKind::Variant { def = prog.def(def).parent; kind = prog.def(def).kind; }
@@ -3769,7 +3768,6 @@ impl<'a> Fcx<'a> {
         let ast = self.ast();
         let counts = self.tcx.own_generic_counts(prog, def, early);
         let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
-        let _ = is_method_call;
         for e in &errs { self.err(lo, e.clone()); }
         let mut ok = errs.is_empty();
         // associated item constraints belong to trait paths only
@@ -3786,7 +3784,7 @@ impl<'a> Fcx<'a> {
         let seg = self.ast().segs(path.segs).get(i)?;
         let a = self.ast().gargs(seg.args())?;
         let (args_id, lo) = (seg.args(), seg.name.lo);
-        if !self.check_seg_arg_count(args_id, def, lo, false) { return None; }
+        if !self.check_seg_arg_count(args_id, def, lo) { return None; }
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
             for g in self.ast().list(*v) {
@@ -4203,7 +4201,7 @@ impl<'a> Fcx<'a> {
                     }
                 } else { None };
                 let xt = self.check_expr(*x, hint);
-                self.cast_checks.push((*x, xt, target, lo));
+                if self.tcx.validates(self.prog, self.file) { self.cast_checks.push((*x, xt, target, lo)); }
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
@@ -5848,7 +5846,7 @@ impl<'a> Fcx<'a> {
         for arg in &impl_full { match *arg { crate::consts::GenericArg::Type(t) => gargs.push(t), crate::consts::GenericArg::Const(c) => gargs.push(self.tcx.tys.intern(TyKind::Const(c))), _ => {} } }
         let own = sig.n_generics - sig.n_parent_generics;
         let mut tf = Vec::new();
-        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo);
         if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
@@ -6141,7 +6139,7 @@ impl<'a> Fcx<'a> {
     fn check_trait_method_call(&mut self, e: ExprId, item: DefId, imp: DefId, self_ty: TyId, derefs: usize, turbofish: GenericArgsId, args: &[ExprId], lo: u32, method_expected: Option<TyId>) -> TyId {
         let error = self.tcx.tys.error;
         let mut tf = Vec::new();
-        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo);
         if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {

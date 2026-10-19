@@ -484,17 +484,14 @@ impl<'a> Cx<'a> {
             }
             DefKind::Const | DefKind::AssocConst => match self.const_value(d, p.0 | PAT_KEY, t) {
                 Some(v) => {
-                    self.const_pattern_structural(Some(&v), t, pos);
+                    self.const_pattern_structural(&v, t, pos);
                     match self.valtree_to_pat(&v, t, pos, 0) {
                         Some(x) => Some(x),
                         None => Some(self.opaque(t, pos)),
                     }
                 }
-                None => {
-                    // (no value tree to walk: the constant's own type is still checked)
-                    self.const_pattern_structural(None, t, pos);
-                    Some(self.opaque(t, pos))
-                }
+                // (no value tree to walk: nothing is judged)
+                None => Some(self.opaque(t, pos)),
             },
             _ => None,
         }
@@ -512,12 +509,9 @@ impl<'a> Cx<'a> {
 
     /// const_to_pat.rs valtree_to_pat's check on every ADT of the constant's value: it must be
     /// structural, else "constant of non-structural type `T` in a pattern".
-    fn const_pattern_structural(&mut self, v: Option<&crate::consts::ValTree>, t: TyId, pos: Option<u32>) {
+    fn const_pattern_structural(&mut self, v: &crate::consts::ValTree, t: TyId, pos: Option<u32>) {
         let before = self.const_errors.len();
-        match v {
-            Some(v) => self.structural_walk(v, t, pos, 0),
-            None => self.structural_type_walk(t, pos, 0),
-        }
+        self.structural_walk(v, t, pos, 0);
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
         if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
             let t = self.tcx.tys.erase_all_regions(t);
@@ -526,18 +520,6 @@ impl<'a> Cx<'a> {
                 let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
                 if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
             }
-        }
-    }
-
-    /// Without a value to take apart: the constant's type down to its first ADTs (references,
-    /// slices, arrays, tuples hold values of their element types).
-    fn structural_type_walk(&mut self, t: TyId, pos: Option<u32>, depth: u32) {
-        if depth > 16 { return; }
-        match self.kind(t) {
-            TyKind::Adt(..) => if !self.type_marked_structural(t) { self.not_structural(t, pos) },
-            TyKind::Ref(_, i, _) | TyKind::Array(i, _) | TyKind::Slice(i) => { let i = self.reveal(i); self.structural_type_walk(i, pos, depth + 1) }
-            TyKind::Tuple(l) => for x in self.tcx.tys.list(l).to_vec() { self.structural_type_walk(x, pos, depth + 1) },
-            _ => {}
         }
     }
 

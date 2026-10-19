@@ -587,6 +587,14 @@ impl Tcx {
         FnHeader { safety: if unsafe_ { Safety::Unsafe } else { Safety::Safe }, abi, c_variadic }
     }
 
+    /// Whether the errors of code in `file` are reported (a checked crate): the validation-only
+    /// checks (generic argument counts, cast validation) skip every other crate -- std, provided
+    /// and framework code -- so `makepad run` does no extra work there.
+    #[inline]
+    pub fn validates(&self, prog: &Program, file: u32) -> bool {
+        prog.file_crate.get(file as usize).is_some_and(|&k| prog.crates[k as usize].validate)
+    }
+
     pub(crate) fn err(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, pos: u32, msg: String) {
         let m = prog.record_error(file, pos, "typeck", msg);
         if let Some(m) = match cx.state.errors.borrow_mut().as_mut() {
@@ -1531,7 +1539,7 @@ impl Tcx {
         errors.extend_from_slice(self.signature_errors(prog, did));
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
-            crate::lint::check_unsafe_attrs(prog, did);
+            errors.extend(crate::item_checks::attribute_safety(prog, did));
         }
         // predicates_of: the bounds and where-clauses of every item are lowered, used or not
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
@@ -2365,7 +2373,7 @@ impl Tcx {
             self.report_indeterminate_object_default(cx, prog, file, outer_env, region, source_ty, lo);
             let last = f.ast.segs(path.segs).last().unwrap();
             if !matches!(f.ast.gargs(last.args()), Some(GenericArgs::Paren(..))) {
-                let errs = self.check_generic_arg_count(prog, td, f.ast.gargs(last.args()), &f.ast, self.own_generic_counts(prog, td, None), arg_count::ArgPosition::Type, false, false);
+                let errs = if !self.validates(prog, file) { Vec::new() } else { self.check_generic_arg_count(prog, td, f.ast.gargs(last.args()), &f.ast, self.own_generic_counts(prog, td, None), arg_count::ArgPosition::Type, false, false) };
                 if !errs.is_empty() {
                     for e in errs { self.err(cx, prog, file, last.name.lo, e); }
                     return self.tys.error;
@@ -2576,7 +2584,7 @@ impl Tcx {
         if source_ty.is_some() && matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias) {
             if let Some(seg) = prog.files[file as usize].ast.segs(p.segs).last() {
                 let ast = &prog.files[file as usize].ast;
-                let errs = self.check_generic_arg_count(prog, d, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, d, None), arg_count::ArgPosition::Type, false, false);
+                let errs = if !self.validates(prog, file) { Vec::new() } else { self.check_generic_arg_count(prog, d, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, d, None), arg_count::ArgPosition::Type, false, false) };
                 if !errs.is_empty() {
                     for e in errs { self.err(cx, prog, file, seg.name.lo, e); }
                     return self.tys.error;
@@ -2773,7 +2781,7 @@ impl Tcx {
             // check_generic_arg_count of a trait path (bounds, trait refs, `<T as Trait>::x`)
             if let Some((d, _)) = &declaration {
                 if prog.def(*d).kind == DefKind::Trait {
-                    let errs = self.check_generic_arg_count(prog, *d, ast.gargs(last.args()), ast, self.own_generic_counts(prog, *d, None), arg_count::ArgPosition::Type, false, false);
+                    let errs = if !self.validates(prog, file) { Vec::new() } else { self.check_generic_arg_count(prog, *d, ast.gargs(last.args()), ast, self.own_generic_counts(prog, *d, None), arg_count::ArgPosition::Type, false, false) };
                     if !errs.is_empty() {
                         for e in errs { self.err(cx, prog, file, last.name.lo, e); }
                         return vec![self.tys.error; self.trait_generic_count(prog, *d)];
@@ -2894,6 +2902,7 @@ impl Tcx {
     /// prohibit_generic_args on a segment that names no generic definition (a type parameter,
     /// `Self`): arguments are E0109, associated item constraints E0229.
     fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
+        if !self.validates(prog, file) { return false; }
         let ast = &prog.files[file as usize].ast;
         if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
             let args = ast.list(*v);
@@ -2908,6 +2917,7 @@ impl Tcx {
 
     /// prohibit_assoc_item_constraint: `Foo<Item = T>` where no trait is named (E0229).
     pub fn prohibit_constraints(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, args: ast::GenericArgsId) -> bool {
+        if !self.validates(prog, file) { return false; }
         let ast = &prog.files[file as usize].ast;
         if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
             if let Some(c) = ast.list(*v).iter().find_map(|a| match a { GenericArg::Binding(n, _, _) | GenericArg::Constraint(n, _) => Some(*n), _ => None }) {
@@ -3172,7 +3182,7 @@ impl Tcx {
     fn check_assoc_ty_args(&self, cx: &EvalCx<'_>, prog: &Program, file: u32, item: DefId, p: &ast::Path, infer_args: bool) -> bool {
         let ast = &prog.files[file as usize].ast;
         let Some(seg) = ast.segs(p.segs).last() else { return true };
-        let errs = self.check_generic_arg_count(prog, item, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, item, None), arg_count::ArgPosition::AssocType, infer_args, false);
+        let errs = if !self.validates(prog, file) { Vec::new() } else { self.check_generic_arg_count(prog, item, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, item, None), arg_count::ArgPosition::AssocType, infer_args, false) };
         for e in &errs { self.err(cx, prog, file, seg.name.lo, e.clone()); }
         errs.is_empty() && !self.prohibit_constraints(cx, prog, file, seg.args())
     }
