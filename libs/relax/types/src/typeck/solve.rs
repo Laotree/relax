@@ -109,6 +109,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         deferred_call_resolutions: Vec::new(),
         deferred_sized_obligations: Vec::new(),
         pat_decl_irrefutable: false,
+        item_blocks: Vec::new(),
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
         extra_arg: None,
