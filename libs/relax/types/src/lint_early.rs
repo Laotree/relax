@@ -778,6 +778,9 @@ impl<'a> W<'a> {
                         && !self.pf.bytes(v.lo, v.hi).contains(&b'\n')
                         && !self.from_exp(v.lo)
                         && !self.from_exp(blk.lo)
+                        // braces substituted into a macro_rules body (`Ok($b)` with `$b:block`) are the
+                        // macro's: rustc never lints them
+                        && !(v.lo >= self.pf.src_len && matches!(self.pf.expansion_region_kind(v.lo), ExpnKind::LocalRules | ExpnKind::ExternalRules))
                     {
                         self.emit_delims(&UNUSED_BRACES, v.lo, "braces", ctx.name());
                     }

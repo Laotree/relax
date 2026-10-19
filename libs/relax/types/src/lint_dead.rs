@@ -355,7 +355,16 @@ fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
         }
         ItemKind::Impl(r) => {
             let i = *ast.row(r);
-            if let Some(tp) = i.trait_ { w.path(&tp, true); }
+            if let Some(tp) = i.trait_ {
+                w.path(&tp, true);
+                // the associated types of a trait impl are part of what the impl exposes
+                // (`Index::Output`, `IntoIterator::IntoIter`)
+                for &it in ast.list(i.items) {
+                    if let ItemKind::TypeAlias(r) = ast.item(it).kind {
+                        if let Some(t) = ast.row(r).ty { w.ty(t); }
+                    }
+                }
+            }
             w.ty(i.self_ty);
         }
         ItemKind::Const(t, e) => {
@@ -507,16 +516,6 @@ impl<'a> BodyRefs<'a> {
     }
 
     /// An assignment target: fields written to are not reads (`handle_assign`).
-    fn assign_target(&mut self, l: ExprId) {
-        let ast = self.ast;
-        let derefs = self.body.field_idx.get(&l.0).map_or(0, |x| x.0);
-        match ast.expr(l).kind {
-            ExprKind::Paren(x) => self.assign_target(x),
-            ExprKind::Field(x, _) | ExprKind::TupleField(x, _) if derefs == 0 => self.assign_target(x),
-            _ => self.expr(l),
-        }
-    }
-
     fn variant_of(&self, d: DefId) -> (DefId, u32) {
         let def = self.prog.def(d);
         if def.kind == DefKind::Variant { (def.parent, def.sub) } else { (d, 0) }
@@ -727,7 +726,9 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
             ExprKind::Repeat(_, n) => self.tw.const_expr(n),
             ExprKind::Assign(l, r) => {
                 self.self_assign(e, l, r);
-                self.assign_target(l);
+                // rustc dead.rs handle_assign visits the target and then `walk_expr` visits it again
+                // with its field accesses: a field written to is live
+                self.expr(l);
                 self.expr(r);
                 return;
             }

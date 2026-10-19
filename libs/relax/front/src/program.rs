@@ -5208,10 +5208,9 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
                 let AttrsStmt { attrs, expr, semi } = *ast.row(*r);
                 if crate::cfg::active(src, ast.list(attrs), cfg) {
                     out.push(Stmt::Expr(expr, semi));
-                    // lint levels written on the statement are kept for the lint passes
-                    if ast.list(attrs).iter().any(|a| matches!(crate::cfg::tok_str(src, a.toks.lo as usize), b"allow" | b"warn" | b"deny" | b"forbid" | b"expect")) {
-                        kept_attrs.push((expr, attrs));
-                    }
+                    // the statement's attributes are kept for the lint passes (lint levels, and the
+                    // fact that a value had attributes: `#[cfg(..)] { x }` is not an unused-braces case)
+                    kept_attrs.push((expr, attrs));
                 }
             }
             Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
