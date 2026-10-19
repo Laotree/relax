@@ -2007,6 +2007,9 @@ pub fn cfg_holds(pred: &[TokenTree], cfg: Option<&CfgSet>) -> bool {
                 _ => false,
             }
         }
+        // `cfg(true)` / `cfg(false)` (boolean literals, stable since 1.88)
+        [TokenTree::Ident(n)] if n.to_string() == "true" => true,
+        [TokenTree::Ident(n)] if n.to_string() == "false" => false,
         [TokenTree::Ident(n)] => cfg.set.iter().any(|x| *x == n.to_string()),
         [TokenTree::Ident(n), TokenTree::Punct(e), TokenTree::Literal(v)] if e.as_char() == '=' => {
             let v = v.to_string();
