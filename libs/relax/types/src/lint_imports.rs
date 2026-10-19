@@ -56,19 +56,11 @@ struct Ident {
 struct FileTokens {
     /// identifiers by site position (outside `use` items)
     idents: Vec<Ident>,
-    /// the first path segment of every `use` item, with its site
-    use_firsts: Vec<(u32, String)>,
-    /// (segment before, name) of every path written inside a `use` item
-    use_pairs: Vec<(u32, String, String)>,
 }
 
 fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
     let pf = &prog.files[file as usize];
     let mut idents = Vec::new();
-    let mut use_firsts = Vec::new();
-    let mut use_pairs: Vec<(u32, String, String)> = Vec::new();
-    let mut use_site = 0u32;
-    let mut group_prefix: Vec<Option<String>> = Vec::new();
     let mut kinds: Vec<(T, u32, u32)> = Vec::new();
     let mut i = 0u32;
     loop {
@@ -106,37 +98,13 @@ fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
                 attr_end = e;
             }
         }
+        // the paths of a `use` item are no uses
         if in_use {
-            match kind {
-                T::Semi => { in_use = false; group_prefix.clear(); }
-                T::OpenBrace => {
-                    // `a::b::{..}`: the group's prefix is `b`
-                    let p = if k >= 2 && kinds[k - 1].0 == T::PathSep { Some(text(k - 2)) } else { None };
-                    group_prefix.push(p);
-                }
-                T::CloseBrace => { group_prefix.pop(); }
-                T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => {
-                    let prev = kinds[k - 1].0;
-                    let prefix = if prev == T::PathSep && k >= 2 { Some(text(k - 2)) }
-                        else if matches!(prev, T::OpenBrace | T::Comma) { group_prefix.last().cloned().flatten() }
-                        else { None };
-                    if let Some(p) = prefix { use_pairs.push((use_site, p, text(k))); }
-                }
-                _ => {}
-            }
+            if kind == T::Semi { in_use = false; }
             continue;
         }
         match kind {
-            T::KwUse => {
-                in_use = true;
-                use_site = pf.diagnostic_pos(lo);
-                // `use a::b` / `use ::a::b` / `use {a, b}`: the first segment
-                let mut j = k + 1;
-                if j < kinds.len() && kinds[j].0 == T::PathSep { j += 1; }
-                if j < kinds.len() && matches!(kinds[j].0, T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate) {
-                    use_firsts.push((pf.diagnostic_pos(lo), text(j)));
-                }
-            }
+            T::KwUse => in_use = true,
             T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => {
                 let prev = if k > 0 { Some(kinds[k - 1].0) } else { None };
                 if prev == Some(T::Dot) && k >= mac_end { continue; }
@@ -179,7 +147,7 @@ fn scan_tokens(prog: &Program, file: u32) -> FileTokens {
         }
     }
     idents.sort_by_key(|i| i.site);
-    FileTokens { idents, use_firsts, use_pairs }
+    FileTokens { idents }
 }
 
 /// A leaf of a use tree: what it imports and the source range of the tree node.
@@ -291,7 +259,7 @@ fn macro_closure(prog: &Program, names: &mut HashSet<String>) {
     }
 }
 
-pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::Reach, module_used: &HashMap<u32, HashSet<DefId>>) {
+pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::Reach) {
     if !lint::enabled() { return; }
     let traits = METHOD_TRAITS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let mut scopes: Vec<Scope> = Vec::new();
