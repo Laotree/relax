@@ -163,6 +163,8 @@ pub struct Body {
     pub pat_discriminant_reads: SideTable<u32, ()>,
     /// casts that are coercions (rustc `set_coercion_cast`); recorded only while the lint sink is on
     pub coercion_casts: SideTable<u32, ()>,
+    /// type-relative value paths (`Ty::item`, `<Ty>::item`) that resolved to an item of a trait, not an inherent one; recorded only while the lint sink is on (prelude collision lints)
+    pub trait_item_paths: SideTable<u32, DefId>,
     /// The two lang-item calls of the `?` desugaring, with their inferred types.
     pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
     pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
@@ -236,6 +238,7 @@ impl Body {
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             try_branch: SideTable::new(),
             try_from_residual: SideTable::new(),
             locals: ThinVec::new(),
@@ -663,6 +666,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             locals: ThinVec::new(),
             param_pats: ThinVec::new(),
             ret: error,
@@ -3248,6 +3252,7 @@ impl<'a> Fcx<'a> {
             let imp = if ambiguous { crate::program::NO_DEF } else { imp };
             let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
             let given = self.explicit_args(path, item, offset).unwrap_or_default();
+            if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
             let args = self.trait_call_args(item, imp, st, &given);
             let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
@@ -3612,6 +3617,7 @@ impl<'a> Fcx<'a> {
                 for i in 0..own as usize {
                     args.push(if i < la.len() { la[i] } else { self.fresh_arg(item, args.len()) });
                 }
+                if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                 let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
@@ -3648,6 +3654,7 @@ impl<'a> Fcx<'a> {
                     // Box..): leave the trait args open; the impl is chosen once they are known
                     let ambiguous = cands.iter().filter(|c| c.0 == item).count() > 1;
                     let imp = if ambiguous { crate::program::NO_DEF } else { imp };
+                    if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                     let args = self.trait_call_args(item, imp, self_ty, &la);
                     let t = self.value_def_ty(item, Some(args), key);
                     return (Res::Def(item), t);
