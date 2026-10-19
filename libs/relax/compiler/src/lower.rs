@@ -10508,7 +10508,7 @@ impl<'a> Lcx<'a> {
                 self.switch(ok);
                 self.unit()
             }
-            "debug_assert" | "debug_assert_eq" | "debug_assert_ne" => self.unit(),
+            "debug_assert" | "debug_assert_eq" | "debug_assert_ne" | "debug_assert_matches" => self.unit(),
             "assert_eq" | "assert_ne" => {
                 let a = mexprs[0];
                 let b2 = mexprs[1];
@@ -10570,6 +10570,69 @@ impl<'a> Lcx<'a> {
                 }
                 self.panic_here("");
                 self.dead();
+                self.unit()
+            }
+            "assert_matches" => {
+                // rustc core panicking::assert_matches_failed: the value in Debug and the
+                // pattern's source text
+                let x = mexprs[0];
+                let xt = self.body_ty(x);
+                let v = self.lower_expr(x);
+                let place = self.val_to_place(v.clone());
+                let ok = self.f.block();
+                let bad = self.f.block();
+                if let Some(p) = margs.pat {
+                    self.test_pat(p, &place, xt, bad);
+                    self.bind_pat_place(p, &place, xt);
+                    if let Some(g) = margs.guard {
+                        let g_ok = self.f.block();
+                        self.lower_cond(g, g_ok, bad);
+                        self.switch(g_ok);
+                    }
+                }
+                self.goto(ok);
+                self.switch(bad);
+                // the pattern's tokens: after the first top-level comma up to its `if` / comma
+                let u = self.u;
+                let src = u.prog.src(self.b.file);
+                let mut depth = 0;
+                let mut start = None;
+                let mut end = m.toks.hi as usize;
+                let mut i = m.toks.lo as usize;
+                while i < m.toks.hi as usize {
+                    match src.tok(i).kind {
+                        crate::lexer::T::OpenParen | crate::lexer::T::OpenBracket | crate::lexer::T::OpenBrace => depth += 1,
+                        crate::lexer::T::CloseParen | crate::lexer::T::CloseBracket | crate::lexer::T::CloseBrace => depth -= 1,
+                        crate::lexer::T::Comma if depth == 0 => {
+                            if start.is_none() {
+                                start = Some(i + 1);
+                            } else {
+                                end = i;
+                                break;
+                            }
+                        }
+                        crate::lexer::T::KwIf if depth == 0 && start.is_some() => {
+                            end = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let pat_text = match start {
+                    Some(s) if s < end => self.src_text(src.tok(s).lo, src.tok(end - 1).hi).into_owned(),
+                    _ => String::new(),
+                };
+                self.fmt_lit("assertion `left matches right` failed");
+                if mexprs.len() > 1 {
+                    self.fmt_lit(": ");
+                    self.lower_fmt(e, &mexprs[1..]);
+                }
+                self.fmt_lit("\n  left: ");
+                self.fmt_value(v, xt, b'?');
+                self.fmt_lit(&format!("\n right: {}", pat_text));
+                self.panic_here("");
+                self.switch(ok);
                 self.unit()
             }
             "matches" => {
