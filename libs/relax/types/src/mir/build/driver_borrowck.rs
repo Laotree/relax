@@ -223,13 +223,8 @@ fn check_root(prog: &Program, tcx: &Tcx, owner: CheckedBody, tb: &crate::typeck:
         let item_lo = prog.files[tb.file as usize].ast.item(prog.def(tb.def).item).lo;
         let def_span = Span { file: tb.file, lo: item_lo, hi: item_lo };
         let nested_flag = closure.is_some();
-        // renumber ahead of configure_mir (type_check_body renumbers again; the first set of variables stays unconstrained).
         let typeck = {
             let input = MirNllInput { sig: &sig, nested: nested_flag, def_span, moves: &moves, has_loans };
-            // SAFETY: mir_body is only read by type operations that run after the renumbering inside type_check_body,
-            // while `mir` is not mutated.
-            let body_ref: &'static Body = unsafe { &*(&mir as *const Body) };
-            infcx.mir_body = Some(body_ref);
             type_check_body(tcx, prog, &mut infcx, &mut mir, &input)
         };
         for bug in &typeck.summary.mir_bugs {

@@ -11,6 +11,11 @@ use crate::tcx::{Tcx, TypingMode};
 use crate::types::{RegionId, RegionKind, TyId, TyKind};
 use std::cell::RefCell;
 
+/// The part of a body that type ops read: dense point numbering (statements then terminator, per block),
+/// the span of each point, and the allocations constants refer to.
+#[derive(Clone, Debug)]
+pub struct MirView { offsets: Vec<usize>, spans: Vec<Span>, allocs: crate::mir::AllocMap }
+
 pub struct BorrowckInferCtxt<'tcx> {
     pub infcx: InferCtxt<'tcx>,
     pub prog: &'tcx Program,
@@ -21,7 +26,8 @@ pub struct BorrowckInferCtxt<'tcx> {
     encountered_re_error: std::cell::Cell<bool>,
     pub universal_regions: Option<super::universal_regions::UniversalRegions>,
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
-    pub mir_body: Option<&'tcx crate::mir::Body>,
+    /// What location-aware type ops need of the body being checked, recorded by `observe_body`.
+    pub mir_view: Option<MirView>,
     pub reg_var_to_origin: RefCell<HashMap<RegionVid, RegionCtxt>>,
 }
 
@@ -44,7 +50,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_body: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -94,24 +100,38 @@ use crate::next_solver::type_op::{Normalize, ProvePredicate, CustomTypeOp, Ascri
 impl<'tcx> BorrowckInferCtxt<'tcx> {
     /// type_check/mod.rs: the driver supplies the renumbered body's universal
     /// region map and implied bounds before location-aware operations begin.
-    pub fn configure_mir(&mut self, body: &'tcx Body, universals: super::universal_regions::UniversalRegions, region_bound_pairs: Vec<(TyId, RegionId)>) {
-        self.mir_body = Some(body);
+    pub fn configure_mir(&mut self, body: &Body, universals: super::universal_regions::UniversalRegions, region_bound_pairs: Vec<(TyId, RegionId)>) {
+        self.observe_body(body);
         self.universal_regions = Some(universals);
         self.region_bound_pairs = region_bound_pairs;
     }
 
-    pub(crate) fn location_point(&self, at: Location) -> usize {
-        let body = self.mir_body.expect("MIR type ops require configure_mir");
-        let mut offset = 0;
-        for (b, block) in body.basic_blocks.iter().enumerate() {
-            if b == at.block.0 as usize { assert!(at.statement_index <= block.statements.len()); return offset + at.statement_index; }
-            offset += block.statements.len() + 1;
+    /// Records the (renumbered) body's location numbering, spans and allocations. Called by the driver
+    /// after renumbering, before any location-aware type op runs.
+    pub fn observe_body(&mut self, body: &Body) {
+        let mut offsets = vec![0];
+        let mut spans = vec![];
+        for block in &body.basic_blocks {
+            spans.extend(block.statements.iter().map(|s| s.source_info.span));
+            spans.push(block.terminator.as_ref().map_or(Span::default(), |t| t.source_info.span));
+            offsets.push(spans.len());
         }
-        panic!("MIR location outside body")
+        self.mir_view = Some(MirView { offsets, spans, allocs: body.allocs.clone() });
+    }
+    fn view(&self) -> &MirView { self.mir_view.as_ref().expect("MIR type ops require observe_body") }
+    pub(crate) fn location_point(&self, at: Location) -> usize {
+        let v = self.view();
+        let (start, end) = (v.offsets[at.block.0 as usize], v.offsets[at.block.0 as usize + 1]);
+        assert!(start + at.statement_index < end, "MIR location outside body");
+        start + at.statement_index
+    }
+    pub(crate) fn location_span(&self, at: Location) -> Span { self.view().spans[self.location_point(at)] }
+    pub(crate) fn locations_span(&self, locations: Locations) -> Span {
+        match locations { Locations::All(s) => s, Locations::Single(l) => self.location_span(l) }
     }
 
     fn fully_perform_op<Op: TypeOp>(&self, out: &mut MirTypeckRegionConstraints, locations: Locations, category: ConstraintCategory, op: Op) -> Result<Op::Output, NoSolution> {
-        let span = match locations { Locations::All(s) => s, Locations::Single(_) => locations.span(self.mir_body.expect("MIR type ops require configure_mir")) };
+        let span = self.locations_span(locations);
         let before = self.infcx.universe();
         let input = op.input();
         let result = super::type_check::canonical::fully_perform_op_raw(self,
@@ -211,7 +231,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     fn normalize_and_prove_instantiated_clauses(&mut self, out: &mut MirTypeckRegionConstraints, owner: ClauseOwner, args: &[GenericArg], locations: Locations) {
         let def = self.clause_owner(owner); let env = self.param_env_id();
-        let _ = self.fully_perform_op(out, locations, ConstraintCategory::Predicate(locations.span(self.mir_body.expect("MIR type ops require configure_mir")), def), CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
+        let _ = self.fully_perform_op(out, locations, ConstraintCategory::Predicate(self.locations_span(locations), def), CustomTypeOp::new(|ocx: &mut crate::next_solver::fulfill::ObligationCtxt<'_, '_>| {
             for p in ocx.infcx.tcx.clauses_of(ocx.prog, def) {
                 let p = ocx.infcx.tcx.instantiate_predicate(ocx.prog, def, args, &p);
                 let predicate = ocx.normalize_predicate(&env, &p);
@@ -415,7 +435,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
     }
     /// `ConstOperand::check_static_ptr` over the body's allocation table.
     fn static_ptr(&self, constant: &ConstOperand) -> Option<DefId> {
-        constant.const_.check_static_ptr(&self.mir_body.expect("MIR type ops require configure_mir").allocs)
+        constant.const_.check_static_ptr(&self.view().allocs)
     }
     fn static_ty(&mut self, out: &mut MirTypeckRegionConstraints, def: DefId, locations: Locations) -> TyId {
         let ty = self.tcx.const_ty(self.prog, def).expect("static declaration type");
