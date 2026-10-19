@@ -37,11 +37,11 @@ fn line_of(prog: &Program, file: u32, pos: u32) -> usize {
     1 + src[..(pos as usize).min(src.len())].iter().filter(|&&c| c == b'\n').count()
 }
 
-/// `mir_const_qualif` of another constant's value: build its MIR and const-check it (memoised; a cycle blocks).
-struct BuildProvider<'a> {
-    prog: &'a Program,
-    tcx: &'a Tcx,
-    memo: std::cell::RefCell<std::collections::HashMap<crate::program::DefId, Result<crate::mir::transform::qualifs::ConstQualifs, crate::mir::transform::qualifs::Blocked>>>,
+/// `mir_const_qualif` of another constant's value (S11: use this as the `ConstQualifsProvider`, construct with `Default` memo): build its MIR and const-check it (memoised; a cycle blocks).
+pub struct BuildProvider<'a> {
+    pub prog: &'a Program,
+    pub tcx: &'a Tcx,
+    pub memo: std::cell::RefCell<std::collections::HashMap<crate::program::DefId, Result<crate::mir::transform::qualifs::ConstQualifs, crate::mir::transform::qualifs::Blocked>>>,
 }
 impl crate::mir::transform::qualifs::ConstQualifsProvider for BuildProvider<'_> {
     fn mir_const_qualif(&self, def: crate::program::DefId) -> Result<crate::mir::transform::qualifs::ConstQualifs, crate::mir::transform::qualifs::Blocked> {
