@@ -4461,12 +4461,14 @@ impl<'a> Fcx<'a> {
                         None => None,
                     };
                     let t = self.check_expr(*x, ex);
-                    if let Some(et) = ex {
-                        self.coerce_or_unify(t, et, Some(*x), lo);
-                        ts.push(et);
-                    } else {
-                        ts.push(t);
-                    }
+                    // expr.rs check_expr_tuple: every element is coerced to the expected element type
+                    // or to a fresh variable (`(loop {},)` is `(?T,)`, its `!` coerced to the variable)
+                    let et = match ex {
+                        Some(et) => et,
+                        None => self.fresh(0),
+                    };
+                    self.coerce_or_unify(t, et, Some(*x), lo);
+                    ts.push(et);
                 }
                 self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&ts)))
             }
