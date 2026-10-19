@@ -552,7 +552,10 @@ fn doc_attr(prog: &Program, n: &AttrNode, file: u32, apos: u32, args: &Args, emi
     match args {
         Args::None => {}
         Args::Value { pos, tok } => {
-            if string_value(tok).is_none() { invalid(*pos, "malformed `doc` attribute input"); }
+            // (`doc = include_str!(..)` / `concat!(..)`: a macro call, expanded to a string literal before the check)
+            let literal_prefix = tok.starts_with(b"r\"") || tok.starts_with(b"r#") || tok.starts_with(b"b\"") || tok.starts_with(b"b'") || tok.starts_with(b"br");
+            let macro_call = tok.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && !literal_prefix;
+            if !macro_call && string_value(tok).is_none() { invalid(*pos, "malformed `doc` attribute input"); }
         }
         Args::List { items, .. } => {
             let mut aliases: Vec<String> = Vec::new();
@@ -904,6 +907,25 @@ pub fn finish(prog: &Program, own: &[bool]) {
     if !lint::enabled() { return; }
     let (defs, used) = crate::macros::uses::take();
     if defs.is_empty() { return; }
+    // Bodies nothing demanded are never expanded, so an invocation inside one leaves no record:
+    // a macro whose `name!` is written anywhere in the checked crates counts as used.
+    let written = |name: &str| -> bool {
+        let n = name.as_bytes();
+        prog.files.iter().enumerate().any(|(i, f)| {
+            if !own.get(prog.file_crate.get(i).copied().unwrap_or(u32::MAX) as usize).copied().unwrap_or(false) { return false; }
+            let s = &f.src[..(f.src_len as usize).min(f.src.len())];
+            let mut from = 0;
+            while let Some(k) = s[from..].windows(n.len()).position(|w| w == n) {
+                let at = from + k;
+                from = at + 1;
+                if at > 0 && (s[at - 1].is_ascii_alphanumeric() || s[at - 1] == b'_') { continue; }
+                let mut j = at + n.len();
+                while j < s.len() && s[j].is_ascii_whitespace() { j += 1; }
+                if j < s.len() && s[j] == b'!' && s.get(j + 1) != Some(&b'=') { return true; }
+            }
+            false
+        })
+    };
     for d in defs {
         if d.exported || d.file.is_empty() || d.name.starts_with('_') { continue; }
         let Some(file) = prog.file_paths.iter().position(|p| *p == d.file) else { continue };
@@ -919,6 +941,7 @@ pub fn finish(prog: &Program, own: &[bool]) {
         let resolved = used.contains(&(d.file.clone(), d.pos, crate::macros::uses::RESOLVED));
         let any_rule = (0..d.rules.len() as u32).any(|i| used.contains(&(d.file.clone(), d.pos, i)));
         if !resolved && !any_rule {
+            if written(&d.name) { continue; }
             if pf.expansion_kind(d.pos) == crate::parser::ExpnKind::ExternalRules { continue; }
             emit(prog, def, &UNUSED_MACROS, file as u32, d.pos, &format!("unused macro definition: `{}`", d.name));
             continue;
