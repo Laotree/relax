@@ -4489,11 +4489,13 @@ impl<'a> Fcx<'a> {
                     let t = self.check_expr(*x, ex);
                     // expr.rs check_expr_tuple: every element is coerced to the expected element type
                     // or to a fresh variable (`(loop {},)` is `(?T,)`, its `!` coerced to the variable)
+                    // (to a variable only a diverging element differs from the element's own type)
                     let et = match ex {
                         Some(et) => et,
-                        None => self.fresh(0),
+                        None if matches!(self.tcx.tys.kind(self.shallow(t)), TyKind::Never) => self.fresh(0),
+                        None => t,
                     };
-                    self.coerce_or_unify(t, et, Some(*x), lo);
+                    if et != t { self.coerce_or_unify(t, et, Some(*x), lo); }
                     ts.push(et);
                 }
                 self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&ts)))
