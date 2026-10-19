@@ -3862,17 +3862,6 @@ impl<'a> Fcx<'a> {
                     out.push(lt);
                 }
             }
-            // hir_ty_lowering/generics.rs check_generic_arg_count: arguments beyond the item's
-            // parameters are an error (E0107) and are not lowered further
-            if matches!(self.prog.def(def).kind, DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Fn | DefKind::AssocFn) {
-                let declared = self.tcx.declaration_env(self.prog, def).names.len().saturating_sub(offset);
-                if out.len() > declared {
-                    let kind = match self.prog.def(def).kind { DefKind::Fn | DefKind::AssocFn => "function", DefKind::Enum => "enum", DefKind::Union => "union", _ => "struct" };
-                    self.err(self.last_lo, format!("E0107: {} takes {} generic argument{} but {} generic argument{} supplied",
-                        kind, declared, if declared == 1 { "" } else { "s" }, out.len(), if out.len() == 1 { " was" } else { "s were" }));
-                    out.truncate(declared);
-                }
-            }
         }
         Some(out)
     }
