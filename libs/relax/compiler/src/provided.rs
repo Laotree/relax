@@ -100,10 +100,37 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// Compares every registered crate present in the program against its embedded library
 /// closure. Any mismatch fails with file and feature/version differences; absent crates skip.
+const IDENTITY_THREADS: usize = 4;
+
 pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
     let mut files = std::collections::HashMap::new();
+    // the identity files of every package folder the registered crates reach, read and hashed
+    // by a few threads (a folder is hashed once whatever number of closures reach it)
+    let mut dirs: Vec<String> = Vec::new();
+    for (name, _, _) in &reg {
+        for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
+            for d in crate::srchash::closure_dirs(pkgs, root) { if !dirs.contains(&d) { dirs.push(d); } }
+        }
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Mutex<Option<Vec<(String, u64)>>>> = dirs.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..dirs.len().min(IDENTITY_THREADS) {
+            scope.spawn(|| {
+                let _z = crate::zone_alloc::compiler_thread();
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(dir) = dirs.get(k) else { break };
+                    *done[k].lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::srchash::identity_files(std::path::Path::new(dir)));
+                }
+            });
+        }
+    });
+    for (dir, list) in dirs.iter().zip(done) {
+        if let Some(list) = list.into_inner().unwrap_or_else(|e| e.into_inner()) { files.insert(dir.clone(), list); }
+    }
     for (name, source, manifest) in &reg {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
             let current = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
@@ -134,7 +161,10 @@ pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>) {
     let _k = crate::zone_alloc::kept();
     let spawned = std::thread::Builder::new().name("run-provided-sources".into()).spawn(move || {
         let _z = crate::zone_alloc::compiler_thread();
-        check_sources(&pkgs)
+        let t = std::time::Instant::now();
+        let verdict = check_sources(&pkgs);
+        if crate::preload::trace() { eprintln!("boot-trace: provided sources checked in {:.1} ms (beside the load)", t.elapsed().as_secs_f64() * 1e3); }
+        verdict
     });
     match spawned {
         Ok(h) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(h),
