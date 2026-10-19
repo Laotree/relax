@@ -398,3 +398,44 @@ pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
     has_attr(prog, def.file, ast.list(item.attrs), "automatically_derived")
         || prog.files[def.file as usize].expansion_kind(item.lo) == crate::parser::ExpnKind::Builtin
 }
+
+/// The attributes of the parameters, statements and arms around the binding written at `pos` in
+/// the body of `owner` (outermost first).
+pub fn attrs_at_binding(prog: &Program, owner: DefId, pos: u32) -> Vec<Attr> {
+    use crate::ast::*;
+    use crate::ast_visit::{self, Visitor};
+    struct Find<'a> { ast: &'a Ast, pos: u32, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn ast(&self) -> &'a Ast { self.ast }
+        fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+        fn leave_attrs(&mut self, attrs: List<Attr>) {
+            let n = self.ast.list(attrs).len();
+            self.stack.truncate(self.stack.len() - n);
+        }
+        fn pat(&mut self, p: PatId) {
+            if self.found.is_some() { return; }
+            if let Pat::Ident { name, .. } = *self.ast.pat(p) {
+                if name.lo == self.pos { self.found = Some(self.stack.clone()); return; }
+            }
+            ast_visit::walk_pat(self, p);
+        }
+    }
+    let od = prog.def(owner);
+    let ast = &prog.files[od.file as usize].ast;
+    let mut f = Find { ast, pos, stack: Vec::new(), found: None };
+    match ast.item(od.item).kind {
+        ItemKind::Fn(sig, _, _) => {
+            for p in ast.list(ast.fn_sig(sig).params) {
+                f.enter_attrs(p.attrs);
+                f.pat(p.pat);
+                f.leave_attrs(p.attrs);
+            }
+            if f.found.is_none() { if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); } }
+        }
+        ItemKind::Const(..) | ItemKind::Static(..) => {
+            if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
+        }
+        _ => {}
+    }
+    f.found.unwrap_or_default()
+}
