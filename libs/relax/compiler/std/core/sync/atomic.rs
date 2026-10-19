@@ -154,6 +154,15 @@ impl<T: AtomicPrimitive> Atomic<T> {
             }
         }
     }
+    pub fn try_update<F: FnMut(T) -> Option<T>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<T, T> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(T) -> T>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> T {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
 }
 
 impl<T: AtomicPrimitive + Default> Default for Atomic<T> {
@@ -256,6 +265,15 @@ impl AtomicBool {
             }
         }
     }
+    pub fn try_update<F: FnMut(bool) -> Option<bool>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<bool, bool> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(bool) -> bool>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> bool {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
 }
 
 impl Default for AtomicBool {
@@ -336,6 +354,15 @@ impl<T> AtomicPtr<T> {
                 },
                 None => return Err(prev),
             }
+        }
+    }
+    pub fn try_update<F: FnMut(*mut T) -> Option<*mut T>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<*mut T, *mut T> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(*mut T) -> *mut T>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> *mut T {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
         }
     }
 }
