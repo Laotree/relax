@@ -2536,10 +2536,6 @@ impl Tcx {
         }
     }
 
-    fn core_crate(&self, prog: &Program) -> u32 {
-        prog.prelude_crate.unwrap_or(u32::MAX)
-    }
-
     pub fn lower_path_ty(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path, source_ty: Option<ast::TyId>) -> TyId {
         let f = &prog.files[file as usize];
         // `<T as Trait>::Name`

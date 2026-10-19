@@ -274,10 +274,6 @@ pub mod obligations {
             self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
-        fn goal(&self, kind: PredicateKind) -> Goal {
-            Goal { param_env: self.env.clone(), predicate: Predicate::dummy(kind) }
-        }
-
         /// wfcheck.rs WfCheckingCtxt::deeply_normalize. A type that cannot be normalized stays as
         /// written: its own well-formedness reports the unmet bound.
         fn normalize(&mut self, ty: TyId) -> TyId {
