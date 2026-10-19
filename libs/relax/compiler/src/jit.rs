@@ -1496,6 +1496,23 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     }
 }
 
+/// A constant's initializer is being evaluated on this thread (run_init_code).
+pub(crate) fn in_const_eval() -> bool {
+    CONST_EVAL_DEPTH.with(|g| g.get()) > 0 && unsafe { *ctx_ptr() } != 0
+}
+
+/// Ends the run of the calling thread's `call_jit_in` with the panic recorded for it already
+/// (PANIC): a panic that reached the edge of a function that cannot unwind, in a constant's
+/// evaluation, fails the evaluation (rustc's interpreter has no unwinding ABI to abort at).
+pub(crate) fn leave_pending_panic() -> ! {
+    CLEANING.with(|c| c.set(0));
+    UNWINDING.with(|c| c.set(false));
+    unsafe {
+        let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
+        leave(ctx_ptr(), 1)
+    }
+}
+
 /// Ends the run of the calling thread's `call_jit_in` without a panic report: it returns
 /// `Err(PanicInfo { kind, message })` to its caller (a domain's `process::exit`, domain.rs). The
 /// frames in between run no cleanups. A thread with no recovery point (native code called into
@@ -2028,7 +2045,7 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         }
         // a fault at the recovery entry itself, or an instruction fetch fault in code memory
         // (the code is not executable): resuming would fault again forever -- report and end
-        if pc == u.leave || (fault == pc && in_jit_code(pc)) {
+        if pc == u.leave || (fault == pc && matches!(f.kind, Kind::Segv | Kind::Bus) && in_jit_code(pc)) {
             fatal_report(f);
         }
     }
@@ -4197,14 +4214,19 @@ impl Unit {
     fn ctfe_error_location(&self, d: DefId, init: u32, p: &PanicInfo) -> String {
         // the initializer's own frame: where it called the failing const fn (rustc's span; the
         // const fn's frames are its notes)
+        let def = self.prog.def(d);
+        // (a location in another file is a const fn inlined into the initializer: rustc's span
+        // is in the constant itself)
+        let own = self.prog.file_paths.get(def.file as usize).map(|f| format!("{}:", f));
         for &pc in &p.frames {
             for at in [pc, pc.wrapping_sub(1)] {
                 if self.find_fn(at) == Some(init) {
-                    if let Some((_, loc)) = self.pc_to_src(at) { if loc.matches(':').count() >= 2 { return loc; } }
+                    if let Some((_, loc)) = self.pc_to_src(at) {
+                        if loc.matches(':').count() >= 2 && own.as_ref().map_or(true, |o| loc.starts_with(o)) { return loc; }
+                    }
                 }
             }
         }
-        let def = self.prog.def(d);
         let site = self.sites.lock().unwrap_or_else(|e| e.into_inner()).get(p.site as usize).map(|st| (st.file, st.pos));
         match site {
             Some((f, pos)) if f == def.file => self.pos_str(f, pos),
