@@ -568,6 +568,40 @@ fn no_main_error(prog: &Program, root: u32, file: u32) -> String {
     prog.record_error(file, 0, "typeck", format!("E0601: `main` function not found in crate `{}`", name))
 }
 
+/// rustc_monomorphize: a binary exporting a second `main` symbol (`#[no_mangle]`, `#[export_name
+/// = "main"]` or a foreign `main` declaration) clashes with the entry symbol.
+pub fn entry_symbol_conflict(prog: &Program, own: &[bool], root: u32) -> Vec<String> {
+    let Some(main) = entry_main(prog, root) else { return Vec::new() };
+    let mut clash = false;
+    for (i, def) in prog.defs.iter().enumerate() {
+        if def.krate != root || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        let d = DefId(i as u32);
+        match def.kind {
+            DefKind::ForeignFn => clash |= prog.name(d) == "main",
+            DefKind::Fn | DefKind::AssocFn | DefKind::Static => {
+                if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
+                let ast = &prog.files[def.file as usize].ast;
+                let p = prog.src(def.file);
+                for a in ast.list(ast.item(def.item).attrs) {
+                    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                    if hi <= lo { continue; }
+                    let first = if crate::cfg::tok_str(p, lo) == b"unsafe" && hi > lo + 2 { lo + 2 } else { lo };
+                    match crate::cfg::tok_str(p, first) {
+                        b"no_mangle" => clash |= prog.name(d) == "main",
+                        b"export_name" if first + 2 < hi && crate::cfg::tok_str(p, first + 1) == b"=" => clash |= crate::cfg::tok_str(p, first + 2) == b"\"main\"",
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if !clash { return Vec::new(); }
+    let def = prog.def(main);
+    let at = prog.files[def.file as usize].ast.item(def.item).name.lo;
+    vec![prog.record_error(def.file, at, "typeck", "entry symbol `main` declared multiple times".to_string())]
+}
+
 /// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
 /// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
 /// 2024), and a safety qualifier on an item of a plain block.
@@ -643,8 +677,11 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                         errors.push(prog.record_error(file, ast.item(it).lo, "parse", "incorrect `static` inside `extern` block".to_string()));
                     }
                 }
-                if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
+                if let ItemKind::Fn(sig, body, _) = ast.item(it).kind {
                     let sig = ast.fn_sig(sig);
+                    if body.is_some() || sig.lazy_body.is_some() {
+                        errors.push(prog.record_error(file, ast.item(it).lo, "parse", "incorrect function inside `extern` block".to_string()));
+                    }
                     if let Some(g) = ast.list(sig.generics.params).iter().find(|g| !matches!(g.kind, crate::ast::GenericParamKind::Lifetime(_))) {
                         let what = if matches!(g.kind, crate::ast::GenericParamKind::Const(..)) { "const" } else { "type" };
                         errors.push(prog.record_error(file, g.name.lo, "typeck", format!("E0044: foreign items may not have {} parameters", what)));
@@ -1176,4 +1213,10 @@ pub fn attribute_shapes(prog: &Program, d: DefId) -> Vec<String> {
         }
     }
     errors
+}
+
+fn entry_main(prog: &Program, root: u32) -> Option<DefId> {
+    let sym = prog.syms.get("main")?;
+    let d = prog.lookup_in_module(prog.crates[root as usize].root_mod, sym, false, &mut Vec::new())?;
+    (prog.def(d).kind == DefKind::Fn).then_some(d)
 }
