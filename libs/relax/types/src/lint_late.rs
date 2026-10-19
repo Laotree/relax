@@ -34,12 +34,14 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     match ast.item(d.item).kind {
         ItemKind::Fn(s, _, _) => {
             let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
-            let _ = s;
+            let params: Vec<PatId> = ast.list(ast.fn_sig(s).params).iter().map(|p| p.pat).collect();
             w.block(block);
+            known_panics(prog, tcx, body, Some(block), None, &params);
         }
         ItemKind::Const(..) | ItemKind::Static(..) => {
             let Ok(Some(e)) = prog.const_body(body.file, d.item) else { return };
             w.expr(e);
+            known_panics(prog, tcx, body, None, Some(e), &[]);
         }
         _ => {}
     }
@@ -569,4 +571,680 @@ impl<'a> Visitor<'a> for Late<'a> {
         }
         ast_visit::walk_stmt(self, s);
     }
+}
+
+// ---------------------------------------------------------------- known_panics_lint
+//
+// rustc_mir_transform known_panics_lint.rs: constant propagation over the body's MIR with
+// lint checks at the arithmetic operations, divisions and index operations. The port follows the
+// propagation over the typed syntax tree in MIR evaluation order: operands are known when they
+// are literals, constants, the operations on known operands that do not fail, and locals that
+// are assigned exactly once and never borrowed (rustc `FullConstProp`); a conditional whose
+// condition is known visits only the taken branch, and code after a diverging expression is not
+// visited. Locals with several assignments (`OnlyInsideOwnBlock`) are not propagated.
+
+pub const ARITHMETIC_OVERFLOW: Lint = lint::lint("arithmetic_overflow", Level::Deny, &[]);
+pub const UNCONDITIONAL_PANIC: Lint = lint::lint("unconditional_panic", Level::Deny, &[]);
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum V {
+    Unknown,
+    /// the bits of an integer (sign-extended to 128 bits for a signed value)
+    Int(u128),
+    Bool(bool),
+    Float(f64),
+    /// an array or tuple whose element values are in `Kp::aggs`
+    Agg(u32),
+}
+
+#[derive(Clone, Copy, Default)]
+struct LocalInfo {
+    assigns: u32,
+    borrowed: bool,
+}
+
+/// rustc `CanConstProp`: how often each local is assigned and whether its address is taken.
+struct Scan<'a> {
+    body: &'a Body,
+    ast: &'a Ast,
+    info: Vec<LocalInfo>,
+    in_closure: u32,
+}
+
+impl<'a> Scan<'a> {
+    fn root_local(&self, e: ExprId) -> Option<u32> {
+        let mut e = e;
+        loop {
+            match self.ast.expr(e).kind {
+                ExprKind::Paren(x) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Index(x, _) => e = x,
+                ExprKind::Path(_) => return match self.body.res.get(&e.0) { Some(Res::Local(l)) => Some(*l), _ => None },
+                _ => return None,
+            }
+        }
+    }
+    fn borrow(&mut self, e: ExprId) {
+        if let Some(l) = self.root_local(e) { if let Some(i) = self.info.get_mut(l as usize) { i.borrowed = true; } }
+    }
+    fn assign(&mut self, e: ExprId) {
+        if let Some(l) = self.root_local(e) { if let Some(i) = self.info.get_mut(l as usize) { i.assigns += 1; } }
+    }
+    fn pat_by_ref(&self, p: PatId) -> bool {
+        struct R<'b> { ast: &'b Ast, body: &'b Body, found: bool }
+        impl<'b> Visitor<'b> for R<'b> {
+            fn ast(&self) -> &'b Ast { self.ast }
+            fn pat(&mut self, p: PatId) {
+                if let Pat::Ident { by_ref, .. } = *self.ast.pat(p) {
+                    if by_ref || self.body.pat_bind_ref.get(&p.0).is_some() { self.found = true; }
+                }
+                ast_visit::walk_pat(self, p);
+            }
+        }
+        let mut r = R { ast: self.ast, body: self.body, found: false };
+        r.pat(p);
+        r.found
+    }
+}
+
+impl<'a> Visitor<'a> for Scan<'a> {
+    fn ast(&self) -> &'a Ast { self.ast }
+    fn pat(&mut self, p: PatId) {
+        if let Pat::Ident { .. } = *self.ast.pat(p) {
+            if let Some(&l) = self.body.pat_local.get(&p.0) {
+                if let Some(i) = self.info.get_mut(l as usize) { i.assigns += 1; }
+            }
+        }
+        ast_visit::walk_pat(self, p);
+    }
+    fn stmt(&mut self, s: &Stmt, b: BlockId) {
+        if let Stmt::Let(r) = *s {
+            let l = *self.ast.row(r);
+            if let Some(x) = l.init { if self.pat_by_ref(l.pat) { self.borrow(x); } }
+        }
+        let _ = b;
+        ast_visit::walk_stmt(self, s);
+    }
+    fn expr(&mut self, e: ExprId) {
+        match self.ast.expr(e).kind {
+            ExprKind::AddrOf(_, _, x) => self.borrow(x),
+            ExprKind::Assign(l, _) | ExprKind::AssignOp(_, l, _) => self.assign(l),
+            ExprKind::MethodCall(recv, _) => {
+                if self.body.methods.get(&e.0).is_some_and(|m| m.autoref != 0) { self.borrow(recv); }
+            }
+            ExprKind::Mac(m) => {
+                let m = *self.ast.row(m);
+                if m.args != NO_MAC_ARGS {
+                    let args = *self.ast.mac_arg(m.args);
+                    for &x in self.ast.list(args.exprs) { self.borrow(x); }
+                }
+            }
+            ExprKind::Match(x, arms) => {
+                if self.ast.list(arms).iter().any(|a| self.pat_by_ref(a.pat)) { self.borrow(x); }
+            }
+            ExprKind::Let(p, x) => { if self.pat_by_ref(p) { self.borrow(x); } }
+            ExprKind::Path(_) => {
+                if self.in_closure > 0 { self.borrow(e); }
+            }
+            ExprKind::Closure(_) => {
+                self.in_closure += 1;
+                ast_visit::walk_expr(self, e);
+                self.in_closure -= 1;
+                return;
+            }
+            _ => {}
+        }
+        ast_visit::walk_expr(self, e);
+    }
+}
+
+struct Kp<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    body: &'a Body,
+    ast: &'a Ast,
+    stack: Vec<Attr>,
+    info: Vec<LocalInfo>,
+    env: std::collections::HashMap<u32, V>,
+    aggs: Vec<Vec<V>>,
+    /// the code being visited is unreachable (after a diverging expression)
+    dead: bool,
+}
+
+fn mask(bytes: u32) -> u128 { if bytes >= 16 { u128::MAX } else { (1u128 << (bytes * 8)) - 1 } }
+
+/// The sign-extended value of `bits` of an integer type of `bytes` bytes.
+fn signed_of(bits: u128, bytes: u32) -> i128 {
+    let shift = 128 - bytes * 8;
+    if shift == 0 { bits as i128 } else { ((bits << shift) as i128) >> shift }
+}
+
+impl<'a> Kp<'a> {
+    fn emit(&self, lint: &Lint, pos: u32, msg: &str) {
+        if lint::external(self.prog, self.body.file, pos) { return; }
+        lint::emit_in(self.prog, self.body.def, &self.stack, lint, self.body.file, pos, msg);
+    }
+    fn overflow(&self, pos: u32) { self.emit(&ARITHMETIC_OVERFLOW, pos, "this arithmetic operation will overflow"); }
+    fn panics(&self, pos: u32) { self.emit(&UNCONDITIONAL_PANIC, pos, "this operation will panic at runtime"); }
+
+    fn ty_of(&self, e: ExprId) -> Option<TyKind> {
+        let i = self.body.expr_ix(e);
+        if i < self.body.expr_ty.len() && self.body.expr_typed.get(i) { Some(*self.tcx.tys.kind(self.body.expr_ty[i])) } else { None }
+    }
+    /// (bytes, signed) of an integer-typed expression.
+    fn int_of(&self, e: ExprId) -> Option<(u32, bool)> {
+        match self.ty_of(e)? { TyKind::Int(p) => Some(crate::types::Types::int_info(p)), _ => None }
+    }
+    fn is_never(&self, e: ExprId) -> bool { matches!(self.ty_of(e), Some(TyKind::Never)) }
+
+    fn enter(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+    fn leave(&mut self, attrs: List<Attr>) {
+        let n = self.ast.list(attrs).len();
+        self.stack.truncate(self.stack.len() - n);
+    }
+
+    fn block(&mut self, b: BlockId) -> V {
+        let blk = *self.ast.block(b);
+        self.enter(blk.attrs);
+        let mut last = V::Unknown;
+        let stmts = self.ast.stmts(b);
+        for s in stmts {
+            if self.dead { break; }
+            last = V::Unknown;
+            match *s {
+                Stmt::Let(r) => {
+                    let l = *self.ast.row(r);
+                    self.enter(l.attrs);
+                    if let Some(x) = l.init {
+                        let v = self.eval(x);
+                        if let Some(eb) = l.else_ {
+                            let d = self.dead;
+                            self.block(eb);
+                            self.dead = d;
+                        }
+                        if let Pat::Ident { by_ref: false, sub: None, .. } = *self.ast.pat(l.pat) {
+                            if let Some(&loc) = self.body.pat_local.get(&l.pat.0) {
+                                if let Some(i) = self.info.get(loc as usize) {
+                                    if i.assigns == 1 && !i.borrowed && v != V::Unknown { self.env.insert(loc, v); }
+                                }
+                            }
+                        }
+                    }
+                    self.leave(l.attrs);
+                }
+                Stmt::Expr(e, semi) => { let v = self.eval(e); if !semi { last = v; } }
+                Stmt::Attrs(r) => {
+                    let a = *self.ast.row(r);
+                    self.enter(a.attrs);
+                    self.eval(a.expr);
+                    self.leave(a.attrs);
+                }
+                Stmt::Item(_) | Stmt::Empty => {}
+            }
+        }
+        self.leave(blk.attrs);
+        last
+    }
+
+    /// Visits `f` as an alternative path: the dead state starts clean and its end is returned.
+    fn branch(&mut self, f: impl FnOnce(&mut Self)) -> bool {
+        let saved = self.dead;
+        self.dead = false;
+        f(self);
+        let d = self.dead;
+        self.dead = saved;
+        d
+    }
+
+    fn eval(&mut self, e: ExprId) -> V {
+        if self.dead { return V::Unknown; }
+        let ex = *self.ast.expr(e);
+        let v = self.eval_kind(e, ex);
+        if self.is_never(e) { self.dead = true; }
+        v
+    }
+
+    fn eval_kind(&mut self, e: ExprId, ex: Expr) -> V {
+        let ast = self.ast;
+        match ex.kind {
+            ExprKind::Lit(LitKind::Bool(b)) => V::Bool(b),
+            ExprKind::Lit(LitKind::Int) => {
+                let Some(TyKind::Int(p)) = self.ty_of(e) else { return V::Unknown };
+                let (bytes, signed) = crate::types::Types::int_info(p);
+                let text = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(ex.lo, ex.hi)).unwrap_or("");
+                match crate::const_fold::parse_int_lit(text) {
+                    Some(v) => { let v = v & mask(bytes); V::Int(if signed { signed_of(v, bytes) as u128 } else { v }) }
+                    None => V::Unknown,
+                }
+            }
+            ExprKind::Lit(LitKind::Float) => {
+                let text = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(ex.lo, ex.hi)).unwrap_or("");
+                let digits: String = text.chars().filter(|c| *c != '_').collect();
+                let digits = digits.trim_end_matches("f32").trim_end_matches("f64");
+                digits.parse::<f64>().map_or(V::Unknown, V::Float)
+            }
+            ExprKind::Lit(_) | ExprKind::Underscore | ExprKind::Continue(_) => V::Unknown,
+            ExprKind::Paren(x) => self.eval(x),
+            ExprKind::Path(_) => self.eval_path(e),
+            ExprKind::Unary(op, x) => {
+                let v = self.eval(x);
+                if self.body.binops.get(&e.0).is_some() { return V::Unknown; }
+                match (op, v) {
+                    (UnOp::Neg, V::Int(b)) => {
+                        let Some((bytes, true)) = self.int_of(x) else { return V::Unknown };
+                        let s = signed_of(b, bytes);
+                        let min = if bytes == 16 { i128::MIN } else { -(1i128 << (bytes * 8 - 1)) };
+                        if s == min { self.overflow(ex.lo); V::Unknown } else { V::Int((-s) as u128) }
+                    }
+                    (UnOp::Neg, V::Float(f)) => V::Float(-f),
+                    (UnOp::Not, V::Bool(b)) => V::Bool(!b),
+                    (UnOp::Not, V::Int(b)) => match self.int_of(x) {
+                        Some((bytes, signed)) => { let r = !b & mask(bytes); V::Int(if signed { signed_of(r, bytes) as u128 } else { r }) }
+                        None => V::Unknown,
+                    },
+                    _ => V::Unknown,
+                }
+            }
+            ExprKind::Binary(op, a, b) => self.eval_binary(e, ex.lo, op, a, b),
+            ExprKind::Assign(l, r) => {
+                self.eval(r);
+                self.eval(l);
+                V::Unknown
+            }
+            ExprKind::AssignOp(op, l, r) => {
+                let rv = self.eval(r);
+                let lv = self.eval(l);
+                if self.body.binops.get(&e.0).is_none() {
+                    self.int_binop(ex.lo, op, lv, rv, self.int_of(l), self.int_of(r));
+                }
+                V::Unknown
+            }
+            ExprKind::Cast(x, _) => {
+                let v = self.eval(x);
+                self.eval_cast(e, x, v)
+            }
+            ExprKind::Index(base, idx) => {
+                let bv = self.eval(base);
+                let iv = self.eval(idx);
+                if self.body.ov_index.get(&e.0).is_some() { return V::Unknown; }
+                let mut bt = self.body.expr_ty.get(self.body.expr_ix(base)).copied();
+                while let Some(t) = bt {
+                    if let TyKind::Ref(_, inner, _) = *self.tcx.tys.kind(t) { bt = Some(inner); } else { break; }
+                }
+                if let (Some(t), V::Int(i), Some((8, false))) = (bt, iv, self.int_of(idx)) {
+                    if let TyKind::Array(_, len) = *self.tcx.tys.kind(t) {
+                        if let Some(n) = len.try_to_target_usize(&self.tcx.tys) {
+                            if i >= n as u128 { self.panics(ex.lo); return V::Unknown; }
+                        }
+                    }
+                }
+                match (bv, iv) {
+                    (V::Agg(a), V::Int(i)) => self.aggs[a as usize].get(i as usize).copied().unwrap_or(V::Unknown),
+                    _ => V::Unknown,
+                }
+            }
+            ExprKind::If(c, then, els) => {
+                let cv = self.eval(c);
+                if self.dead { return V::Unknown; }
+                let take_then = !matches!(cv, V::Bool(false));
+                let take_else = !matches!(cv, V::Bool(true));
+                let mut d1 = false;
+                let mut d2 = false;
+                if take_then { d1 = self.branch(|s| { s.block(then); }); } else { d1 = true; }
+                match els.get() {
+                    Some(x) => { if take_else { d2 = self.branch(|s| { s.eval(x); }); } else { d2 = true; } }
+                    None => { d2 = !take_else; }
+                }
+                self.dead = d1 && d2;
+                V::Unknown
+            }
+            ExprKind::Let(_, x) => { self.eval(x); V::Unknown }
+            ExprKind::Match(x, arms) => {
+                let sv = self.eval(x);
+                if self.dead { return V::Unknown; }
+                let arms: Vec<Arm> = ast.list(arms).to_vec();
+                let mut all_dead = true;
+                if matches!(sv, V::Int(_) | V::Bool(_)) {
+                    // a known scrutinee: only the arm it selects is visited; when the selection cannot
+                    // be decided no arm is visited (a missed lint rather than a false one)
+                    for a in &arms {
+                        match self.pat_matches(a.pat, sv) {
+                            Some(false) => continue,
+                            Some(true) => {
+                                if let Some(g) = a.guard {
+                                    match self.eval(g) {
+                                        V::Bool(false) => continue,
+                                        V::Bool(true) => {}
+                                        _ => { all_dead = false; break; }
+                                    }
+                                }
+                                self.enter(a.attrs);
+                                all_dead = self.branch(|s| { s.eval(a.body); });
+                                self.leave(a.attrs);
+                                break;
+                            }
+                            None => { all_dead = false; break; }
+                        }
+                    }
+                } else {
+                    for a in &arms {
+                        self.enter(a.attrs);
+                        let d = self.branch(|s| {
+                            if let Some(g) = a.guard { s.eval(g); }
+                            s.eval(a.body);
+                        });
+                        self.leave(a.attrs);
+                        all_dead &= d;
+                    }
+                    if arms.is_empty() { all_dead = true; }
+                }
+                self.dead = all_dead;
+                V::Unknown
+            }
+            ExprKind::While(row) => {
+                let w = *ast.row(row);
+                let cv = self.eval(w.cond);
+                if !matches!(cv, V::Bool(false)) && !self.dead { self.branch(|s| { s.block(w.body); }); }
+                self.dead = false;
+                V::Unknown
+            }
+            ExprKind::Loop(b, _) => { self.branch(|s| { s.block(b); }); self.dead = false; V::Unknown }
+            ExprKind::For(row) => {
+                let f = *ast.row(row);
+                self.eval(f.iter);
+                if !self.dead { self.branch(|s| { s.block(f.body); }); }
+                self.dead = false;
+                V::Unknown
+            }
+            ExprKind::Block(b, _) | ExprKind::Unsafe(b) => self.block(b),
+            ExprKind::Async(..) | ExprKind::ConstBlock(_) => V::Unknown,
+            ExprKind::Closure(row) => {
+                let c = *ast.row(row);
+                let env = std::mem::take(&mut self.env);
+                let d = self.dead;
+                self.dead = false;
+                self.eval(c.body);
+                self.dead = d;
+                self.env = env;
+                V::Unknown
+            }
+            ExprKind::Call(f, args) => {
+                self.eval(f);
+                for &a in ast.list(args) { self.eval(a); }
+                V::Unknown
+            }
+            ExprKind::MethodCall(recv, row) => {
+                self.eval(recv);
+                for &a in ast.list(ast.row(row).args) { self.eval(a); }
+                V::Unknown
+            }
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => {
+                let vals: Vec<V> = ast.list(xs).iter().map(|&x| self.eval(x)).collect();
+                self.aggs.push(vals);
+                V::Agg(self.aggs.len() as u32 - 1)
+            }
+            ExprKind::Struct(row) => {
+                let s = *ast.row(row);
+                for f in ast.list(s.fields) { self.eval(f.expr); }
+                if let Some(b) = s.base.get() { self.eval(b); }
+                V::Unknown
+            }
+            ExprKind::Repeat(x, _) => { self.eval(x); V::Unknown }
+            ExprKind::Range(a, b, _) => {
+                if let Some(x) = a.get() { self.eval(x); }
+                if let Some(x) = b.get() { self.eval(x); }
+                V::Unknown
+            }
+            ExprKind::TupleField(x, i) => {
+                match self.eval(x) {
+                    V::Agg(a) => self.aggs[a as usize].get(i as usize).copied().unwrap_or(V::Unknown),
+                    _ => V::Unknown,
+                }
+            }
+            ExprKind::Field(x, _) | ExprKind::AddrOf(_, _, x) | ExprKind::Try(x)
+            | ExprKind::Await(x) | ExprKind::Box(x) => { self.eval(x); V::Unknown }
+            ExprKind::Break(_, x) | ExprKind::Return(x) | ExprKind::Yield(x) => {
+                if let Some(x) = x.get() { self.eval(x); }
+                V::Unknown
+            }
+            ExprKind::Mac(m) => {
+                let m = *ast.row(m);
+                if m.args != NO_MAC_ARGS {
+                    let args = *ast.mac_arg(m.args);
+                    for &x in ast.list(args.exprs) { self.eval(x); }
+                }
+                V::Unknown
+            }
+        }
+    }
+
+    fn eval_path(&mut self, e: ExprId) -> V {
+        match self.body.res.get(&e.0) {
+            Some(Res::Local(l)) => self.env.get(l).copied().unwrap_or(V::Unknown),
+            Some(Res::Def(d)) => {
+                let d = *d;
+                match self.prog.def(d).kind {
+                    DefKind::Const | DefKind::AssocConst => self.eval_const(e, d),
+                    DefKind::Variant => self.variant_discr(d),
+                    _ => V::Unknown,
+                }
+            }
+            _ => V::Unknown,
+        }
+    }
+
+    /// A unit variant's discriminant (the operand of an `as` cast).
+    fn variant_discr(&self, d: DefId) -> V {
+        let parent = self.prog.def(d).parent;
+        let Some(a) = self.tcx.adts.get(&parent) else { return V::Unknown };
+        let Some(idx) = a.variants.iter().position(|v| v.def == d) else { return V::Unknown };
+        if a.variants[idx].shape != 0 { return V::Unknown; }
+        match a.discriminant_for_variant(self.tcx, self.prog, idx as u32) {
+            Some(disc) => V::Int(disc.signed_value() as u128),
+            None => V::Unknown,
+        }
+    }
+
+    fn eval_const(&self, e: ExprId, d: DefId) -> V {
+        let Some((bytes, signed)) = self.int_of(e) else { return V::Unknown };
+        let args: Vec<crate::consts::GenericArg> = match self.body.res_args.get(&e.0) {
+            Some(l) => {
+                let l = self.tcx.tys.list(*l);
+                for &x in l {
+                    let f = self.tcx.tys.flags(x);
+                    if f.intersects(crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_INFER) || self.tcx.tys.has_infer(x) { return V::Unknown; }
+                }
+                l.iter().map(|x| match self.tcx.tys.kind(*x) {
+                    TyKind::Const(c) => crate::consts::GenericArg::Const(*c),
+                    _ => crate::consts::GenericArg::Type(*x),
+                }).collect()
+            }
+            None => Vec::new(),
+        };
+        let env = crate::tcx::TypingEnv::fully_monomorphized(self.prog);
+        match self.tcx.const_eval_resolve(self.prog, env, d, &args) {
+            Ok(v) => match v.try_to_leaf() {
+                Some(s) if s.size() as u32 == bytes => { let b = s.to_bits(bytes as u8); V::Int(if signed { signed_of(b, bytes) as u128 } else { b }) }
+                _ => V::Unknown,
+            },
+            Err(_) => V::Unknown,
+        }
+    }
+
+    fn eval_binary(&mut self, e: ExprId, pos: u32, op: BinOp, a: ExprId, b: ExprId) -> V {
+        match op {
+            BinOp::And | BinOp::Or => {
+                let lv = self.eval(a);
+                let short = if op == BinOp::And { V::Bool(false) } else { V::Bool(true) };
+                if lv == short { return lv; }
+                let d = self.dead;
+                let rv = self.eval(b);
+                // the right operand is a path of its own: a diverging right operand does not make the join dead
+                self.dead = d;
+                match (lv, rv) {
+                    (V::Bool(_), r) => r,
+                    _ => V::Unknown,
+                }
+            }
+            _ => {
+                let lv = self.eval(a);
+                let rv = self.eval(b);
+                if self.dead || self.body.binops.get(&e.0).is_some() { return V::Unknown; }
+                match self.ty_of(a) {
+                    Some(TyKind::Int(_)) => self.int_binop(pos, op, lv, rv, self.int_of(a), self.int_of(b)),
+                    Some(TyKind::Bool) => match (op, lv, rv) {
+                        (BinOp::Eq, V::Bool(x), V::Bool(y)) => V::Bool(x == y),
+                        (BinOp::Ne, V::Bool(x), V::Bool(y)) => V::Bool(x != y),
+                        (BinOp::BitAnd, V::Bool(x), V::Bool(y)) => V::Bool(x & y),
+                        (BinOp::BitOr, V::Bool(x), V::Bool(y)) => V::Bool(x | y),
+                        (BinOp::BitXor, V::Bool(x), V::Bool(y)) => V::Bool(x ^ y),
+                        _ => V::Unknown,
+                    },
+                    _ => V::Unknown,
+                }
+            }
+        }
+    }
+
+    /// check_binary_op / the division assertions, then the operation's value.
+    fn int_binop(&mut self, pos: u32, op: BinOp, l: V, r: V, lt: Option<(u32, bool)>, rt: Option<(u32, bool)>) -> V {
+        let Some((lb, ls)) = lt else { return V::Unknown };
+        let li = if let V::Int(x) = l { Some(x) } else { None };
+        let ri = if let V::Int(x) = r { Some(x) } else { None };
+        match op {
+            BinOp::Shl | BinOp::Shr => {
+                let Some((rb, _)) = rt else { return V::Unknown };
+                if let Some(rx) = ri {
+                    // the shift amount as an unsigned number of its own width
+                    if (rx & mask(rb)) >= (lb * 8) as u128 { self.overflow(pos); return V::Unknown; }
+                    if let Some(lx) = li {
+                        let amt = (rx & mask(rb)) as u32;
+                        let res = if op == BinOp::Shl { (lx << amt) & mask(lb) } else if ls { (signed_of(lx, lb) >> amt) as u128 & mask(lb) } else { (lx & mask(lb)) >> amt };
+                        return V::Int(if ls { signed_of(res, lb) as u128 } else { res });
+                    }
+                }
+                V::Unknown
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                let (Some(lx), Some(rx)) = (li, ri) else { return V::Unknown };
+                let (res, over) = if ls {
+                    let (a, b) = (lx as i128, rx as i128);
+                    let (v, o) = match op { BinOp::Add => a.overflowing_add(b), BinOp::Sub => a.overflowing_sub(b), _ => a.overflowing_mul(b) };
+                    let fits = lb == 16 || { let min = -(1i128 << (lb * 8 - 1)); let max = (1i128 << (lb * 8 - 1)) - 1; v >= min && v <= max };
+                    (v as u128, o || !fits)
+                } else {
+                    let (a, b) = (lx, rx);
+                    let (v, o) = match op { BinOp::Add => a.overflowing_add(b), BinOp::Sub => a.overflowing_sub(b), _ => a.overflowing_mul(b) };
+                    (v, o || (lb < 16 && v > mask(lb)))
+                };
+                if over { self.overflow(pos); return V::Unknown; }
+                V::Int(res)
+            }
+            BinOp::Div | BinOp::Rem => {
+                if ri == Some(0) { self.panics(pos); return V::Unknown; }
+                if ls {
+                    if let (Some(lx), Some(rx)) = (li, ri) {
+                        let min = if lb == 16 { i128::MIN } else { -(1i128 << (lb * 8 - 1)) };
+                        if rx as i128 == -1 && lx as i128 == min { self.panics(pos); return V::Unknown; }
+                    }
+                }
+                let (Some(lx), Some(rx)) = (li, ri) else { return V::Unknown };
+                if ls {
+                    let (a, b) = (lx as i128, rx as i128);
+                    V::Int(if op == BinOp::Div { a.wrapping_div(b) } else { a.wrapping_rem(b) } as u128)
+                } else {
+                    V::Int(if op == BinOp::Div { lx / rx } else { lx % rx })
+                }
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => match (li, ri) {
+                (Some(a), Some(b)) => {
+                    let v = match op { BinOp::BitAnd => a & b, BinOp::BitOr => a | b, _ => a ^ b };
+                    V::Int(if ls { signed_of(v & mask(lb), lb) as u128 } else { v & mask(lb) })
+                }
+                _ => V::Unknown,
+            },
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => match (li, ri) {
+                (Some(a), Some(b)) => V::Bool(if ls {
+                    let (a, b) = (a as i128, b as i128);
+                    match op { BinOp::Eq => a == b, BinOp::Ne => a != b, BinOp::Lt => a < b, BinOp::Le => a <= b, BinOp::Gt => a > b, _ => a >= b }
+                } else {
+                    match op { BinOp::Eq => a == b, BinOp::Ne => a != b, BinOp::Lt => a < b, BinOp::Le => a <= b, BinOp::Gt => a > b, _ => a >= b }
+                }),
+                _ => V::Unknown,
+            },
+            BinOp::And | BinOp::Or => V::Unknown,
+        }
+    }
+
+    fn eval_cast(&mut self, e: ExprId, x: ExprId, v: V) -> V {
+        let Some(dest) = self.ty_of(e) else { return V::Unknown };
+        let src = self.ty_of(x);
+        match (dest, v) {
+            (TyKind::Int(p), V::Int(b)) => {
+                let (db, ds) = crate::types::Types::int_info(p);
+                // an integer or a (sign-extended) enum discriminant: the value is already extended
+                match src {
+                    Some(TyKind::Int(_)) | Some(TyKind::Adt(..)) => { let t = b & mask(db); V::Int(if ds { signed_of(t, db) as u128 } else { t }) }
+                    _ => V::Unknown,
+                }
+            }
+            (TyKind::Int(p), V::Bool(b)) => { let _ = p; V::Int(b as u128) }
+            (TyKind::Int(p), V::Float(f)) => {
+                let (db, ds) = crate::types::Types::int_info(p);
+                if f.is_nan() { return V::Int(0); }
+                let r = if ds {
+                    let min = if db == 16 { i128::MIN } else { -(1i128 << (db * 8 - 1)) };
+                    let max = if db == 16 { i128::MAX } else { (1i128 << (db * 8 - 1)) - 1 };
+                    (f as i128).clamp(min, max) as u128
+                } else {
+                    let max = mask(db);
+                    if f <= 0.0 { 0 } else { (f as u128).min(max) }
+                };
+                V::Int(r)
+            }
+            (TyKind::Float(_), V::Int(b)) => match src {
+                Some(TyKind::Int(p)) => { let (sb, ss) = crate::types::Types::int_info(p); V::Float(if ss { signed_of(b, sb) as f64 } else { (b & mask(sb)) as f64 }) }
+                _ => V::Unknown,
+            },
+            (TyKind::Float(_), V::Float(f)) => V::Float(f),
+            _ => V::Unknown,
+        }
+    }
+
+    /// Whether the pattern matches the known scrutinee value (None: cannot tell).
+    fn pat_matches(&mut self, p: PatId, v: V) -> Option<bool> {
+        match *self.ast.pat(p) {
+            Pat::Wild => Some(true),
+            Pat::Paren(x) => self.pat_matches(x, v),
+            Pat::Ident { by_ref: false, sub: None, .. } => if self.body.pat_local.get(&p.0).is_some() { Some(true) } else { None },
+            Pat::Lit(e) => {
+                let lv = self.eval(e);
+                match (lv, v) { (V::Int(a), V::Int(b)) => Some(a == b), (V::Bool(a), V::Bool(b)) => Some(a == b), _ => None }
+            }
+            Pat::Or(ps) => {
+                let ps: Vec<PatId> = self.ast.list(ps).to_vec();
+                let mut undecided = false;
+                for q in ps {
+                    match self.pat_matches(q, v) { Some(true) => return Some(true), Some(false) => {} None => undecided = true }
+                }
+                if undecided { None } else { Some(false) }
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Runs the known-panics lint over a function or associated constant body.
+fn known_panics(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>, expr: Option<ExprId>, params: &[PatId]) {
+    let d = prog.def(body.def);
+    // only functions, methods, closures and associated constants (a `const` item or a static is
+    // evaluated by the interpreter anyway)
+    if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::AssocConst) { return; }
+    let ast = &prog.files[body.file as usize].ast;
+    let mut sc = Scan { body, ast, info: vec![LocalInfo::default(); body.locals.len()], in_closure: 0 };
+    for &p in params { sc.pat(p); }
+    if let Some(b) = block { sc.block(b); }
+    if let Some(e) = expr { sc.expr(e); }
+    // arguments are assigned on entry
+    let mut kp = Kp { prog, tcx, body, ast, stack: Vec::new(), info: sc.info, env: Default::default(), aggs: Vec::new(), dead: false };
+    if let Some(b) = block { kp.block(b); }
+    if let Some(e) = expr { kp.eval(e); }
 }
