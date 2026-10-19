@@ -698,6 +698,20 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                 _ => false,
             };
             if !mine { return Vec::new(); }
+            // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
+            // be allocated for real)
+            if let FnKey::Inst(d, args) = &(&*up).fns[id as usize].key {
+                let (d, args) = (*d, args.clone());
+                let uu = &mut *up;
+                if let Some(sig) = uu.tcx.fn_sig(&uu.prog, d).cloned() {
+                    let env = crate::tcx::TypingEnv::fully_monomorphized(&uu.prog);
+                    for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                        let t = uu.tcx.tys.subst_erasing_regions(*t, &args);
+                        let Ok(t) = uu.tcx.try_normalize_erasing_regions(&uu.prog, env, t) else { return Vec::new() };
+                        if uu.layout_of(t).size > (1 << 28) { return Vec::new(); }
+                    }
+                }
+            }
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::build_rir(up, id)));
             if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
             let mut out = Vec::new();
@@ -705,7 +719,7 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
                 for b in &f.blocks {
                     for i in &b.insts {
                         match i {
-                            crate::rir::Inst::Call(crate::rir::Callee::Fn(c) | crate::rir::Callee::CFn(c, _), _, _) | crate::rir::Inst::FnAddr(_, c) => out.push(*c),
+                            crate::rir::Inst::Call(crate::rir::Callee::Fn(c) | crate::rir::Callee::CFn(c, _), _, _) => out.push(*c),
                             _ => {}
                         }
                     }
