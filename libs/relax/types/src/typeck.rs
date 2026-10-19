@@ -4422,9 +4422,12 @@ impl<'a> Fcx<'a> {
                         let ts = self.shallow(tt);
                         let es = self.shallow(et);
                         if ts == self.tcx.tys.never {
+                            // the `!` then-branch is `NeverToAny` to the else type
+                            if let Some(crate::ast::Stmt::Expr(t2, false)) = self.ast().stmts(*then).last() { self.set_coerce(t2.0, Coerce::Never, et); }
                             return et;
                         }
                         if es == self.tcx.tys.never {
+                            self.set_coerce(x.0, Coerce::Never, tt);
                             return tt;
                         }
                         // the then-branch's value is its block's tail expression
@@ -4466,6 +4469,7 @@ impl<'a> Fcx<'a> {
                 let mut any_value = false;
                 let mut all_div = !arms.is_empty();
                 let mut seen: Vec<ExprId> = Vec::new();
+                let mut never_arms: Vec<ExprId> = Vec::new();
                 for arm in self.ast().list(*arms) {
                     if !self.active(arm.attrs) {
                         continue;
@@ -4489,6 +4493,7 @@ impl<'a> Fcx<'a> {
                     let div = self.diverges;
                     all_div = all_div && div;
                     let bs = self.shallow(bt);
+                    if bs == self.tcx.tys.never { never_arms.push(arm.body); }
                     if bs != self.tcx.tys.never {
                         any_value = true;
                         match result {
@@ -4503,6 +4508,10 @@ impl<'a> Fcx<'a> {
                     self.scopes.truncate(saved);
                 }
                 self.diverges = all_div;
+                // coercion.rs CoerceMany: a `!` arm is `NeverToAny` to the match's type
+                if let (true, Some(r)) = (any_value, result) {
+                    for body in never_arms { self.set_coerce(body.0, Coerce::Never, r); }
+                }
                 match result {
                     Some(r) if any_value => r,
                     _ => self.tcx.tys.never,

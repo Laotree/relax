@@ -241,4 +241,13 @@ mod tests {
         assert_eq!(deref_steps(&tcx.typeck(&prog, def)), vec![false]);
         crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(None));
     }
+
+    #[test]
+    fn a_diverging_match_arm_gets_never_to_any() {
+        // bytemuck from_bytes: `match r { Ok(t) => t, Err(e) => fail(e) }` with `fn fail() -> !`
+        let (prog, body) = body_of("enum Res<T> { Ok(T), Err(u8) } fn fail(_: u8) -> ! { loop {} } fn f(r: Res<&u8>) -> &u8 { match r { Res::Ok(t) => t, Res::Err(e) => fail(e) } }");
+        let never = body.adjustments.iter().filter(|(_, a)| a.value.iter().any(|s| s.kind == Adjust::Coerce(Coerce::Never))).count();
+        assert_eq!(never, 1, "{:?}", body.adjustments);
+        let _ = prog;
+    }
 }

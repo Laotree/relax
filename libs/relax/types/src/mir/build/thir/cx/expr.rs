@@ -90,6 +90,10 @@ impl Cx<'_> {
         list
     }
 
+    fn is_box_ty(&self, ty: TyId) -> bool {
+        matches!(self.tcx().tys.kind(ty), TyKind::Adt(def, ..) if self.tcx().adts.get(def).is_some_and(|a| a.is_box()))
+    }
+
     fn is_mut_method(&self, def: DefId) -> bool {
         matches!(self.prog().syms.str(self.prog().def(def).name), "deref_mut" | "index_mut")
     }
@@ -124,6 +128,9 @@ impl Cx<'_> {
                 Coerce::DerefRef(_) => return self.unresolved(span, "DerefRef is a view, not a step"),
             },
             Adjust::Deref(None) => ExprKind::Deref { arg: self.push(expr) },
+            // a `Box` is dereferenced by the compiler, not through `Deref::deref` (rustc
+            // `builtin_deref(explicit = false)`): typeck records its step as overloaded for codegen
+            Adjust::Deref(Some(_)) if self.is_box_ty(expr.ty) => ExprKind::Deref { arg: self.push(expr) },
             Adjust::Deref(Some((def, args))) => {
                 // `*Deref::deref(&expr)`
                 // rustc `OverloadedDeref.mutbl`: the step calls `DerefMut::deref_mut`
@@ -278,6 +285,7 @@ impl Cx<'_> {
                     _ => None,
                 });
                 let arg = self.mirror_expr(x)?;
+                let overloaded = overloaded.filter(|_| !self.is_box_ty(self.thir.exprs[arg.0 as usize].ty));
                 match overloaded {
                     Some((def, args)) => {
                         let arg = self.autoref(e, arg, self.is_mut_method(def));
