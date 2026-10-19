@@ -3884,7 +3884,7 @@ impl<'a> Fcx<'a> {
     /// `Deref` for other types. Records overloaded steps under (expr, step).
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
         // rustc autoderef.rs: the recursion limit ends the walk with E0055
-        if step >= 128 && e != u32::MAX - 1 {
+        if step >= self.infcx.recursion_limit(self.prog) && e != u32::MAX - 1 {
             let ts = self.ty_str(t);
             self.err(self.last_lo, format!("E0055: reached the recursion limit while auto-dereferencing `{}`", ts));
             return None;
