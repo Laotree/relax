@@ -6,7 +6,7 @@
 //! restricts the owners to those whose path contains the substring, and `MAKEPAD_RUN_MIR_BUILD_DUMP=<substr>`
 //! prints the pretty MIR (`mir::pretty`) of each built body whose path contains the substring.
 use super::{build_mir, BuildCx, BuildRoot, UnsupportedReason};
-use crate::ast::{ExprId, ExprKind};
+use crate::ast::{ExprId, ExprKind, ItemKind as ExprKindItem};
 use crate::borrowck::body::{self, BodyKind, CheckedBody};
 use crate::program::Program;
 use crate::tcx::{EvalCx, EvalState, RecursionLimit, Tcx, TypingEnv, TypingMode};
@@ -17,6 +17,12 @@ use std::collections::BTreeMap;
 pub fn closure_children(prog: &Program, tcx: &Tcx, body: &typeck::Body) -> Vec<CheckedBody> {
     let ast = &prog.files[body.file as usize].ast;
     let mut out = Vec::new();
+    // An async fn's body is a coroutine of its own, identified by `ASYNC_FN_BODY | body block`.
+    if let ExprKindItem::Fn(sig, _, _) = ast.item(prog.def(body.def).item).kind {
+        if let (true, Some(block)) = (ast.fn_sig(sig).asyncness, body.body) {
+            out.push(CheckedBody { owner: body.def, kind: BodyKind::Closure(ExprId(crate::tcx::ASYNC_FN_BODY | block.0)) });
+        }
+    }
     for i in 0..body.expr_ty.len() {
         if body.expr_ty[i] == tcx.tys.error {
             continue;
@@ -155,7 +161,8 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
             slot.0 += 1;
             let mut loc = String::new();
             let at = if let BodyKind::Closure(e) = b.kind {
-                let lo = prog.files[typeck_body.file as usize].ast.expr(e).lo;
+                let ast = &prog.files[typeck_body.file as usize].ast;
+                let lo = if e.0 & crate::tcx::ASYNC_FN_BODY != 0 { ast.block(crate::ast::BlockId(e.0 & !crate::tcx::ASYNC_FN_BODY)).lo } else { ast.expr(e).lo };
                 loc = format!(" ({}:{})", prog.file_paths[typeck_body.file as usize], line_of(prog, typeck_body.file, lo));
                 format!("{path}::{{closure#{}}}", e.0)
             } else {

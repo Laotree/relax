@@ -321,7 +321,7 @@ impl Visitor for Checker<'_> {
         let ccx = self.ccx;
 
         match &terminator.kind {
-            TerminatorKind::Call { func, fn_span, call_source, .. } => {
+            TerminatorKind::Call { func, fn_span, call_source, args, .. } => {
                 let fn_ty = super::super::qualifs::operand_ty(ccx, func);
                 let fn_span = if fn_span.lo == 0 && fn_span.hi == 0 { self.span } else { *fn_span };
 
@@ -333,7 +333,7 @@ impl Visitor for Checker<'_> {
                     }
                     _ => return,
                 };
-                self.check_call(callee, fn_span, *call_source);
+                self.check_call(callee, args, fn_span, *call_source);
             }
 
             // Forbid all `Drop` terminators unless the place being dropped is a local with no
@@ -361,9 +361,31 @@ impl Visitor for Checker<'_> {
 
 impl Checker<'_> {
     /// A call whose callee is a known function (a `FnDef`).
-    fn check_call(&mut self, callee: crate::program::DefId, span: Span, call_source: CallSource) {
+    fn check_call(&mut self, callee: crate::program::DefId, args: &[Operand], span: Span, call_source: CallSource) {
         let ccx = self.ccx;
         let (prog, tcx) = (ccx.prog, ccx.tcx);
+        // `begin_panic` and `panic_display` accept generic types other than str; const eval of them
+        // assumes `&str` / `&&str`. Both calls are otherwise allowed.
+        if let Some(item) = tcx.lang_items.by_def.get(&callee).copied() {
+            let ref_str = |ty: crate::types::TyId| matches!(*tcx.tys.kind(ty), TyKind::Ref(_, inner, _) if matches!(tcx.tys.kind(inner), TyKind::Str));
+            let arg_ty = args.first().map(|a| super::super::qualifs::operand_ty(ccx, a));
+            match item {
+                crate::lang_items::LangItem::BeginPanic => {
+                    if !arg_ty.is_some_and(ref_str) {
+                        self.check_op(ops::panic_non_str(span));
+                    }
+                    return;
+                }
+                crate::lang_items::LangItem::PanicDisplay => {
+                    let ok = arg_ty.is_some_and(|t| matches!(*tcx.tys.kind(t), TyKind::Ref(_, inner, _) if ref_str(inner)));
+                    if !ok {
+                        self.check_op(ops::panic_non_str(span));
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let def = prog.def(callee);
         if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn) {
             return;

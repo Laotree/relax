@@ -90,6 +90,10 @@ impl Cx<'_> {
         list
     }
 
+    pub(super) fn is_box(&self, ty: TyId) -> bool {
+        matches!(self.tcx().tys.kind(ty), TyKind::Adt(d, ..) if self.tcx().adts[d].is_box())
+    }
+
     fn is_mut_method(&self, def: DefId) -> bool {
         matches!(self.prog().syms.str(self.prog().def(def).name), "deref_mut" | "index_mut")
     }
@@ -124,6 +128,8 @@ impl Cx<'_> {
                 Coerce::DerefRef(_) => return self.unresolved(span, "DerefRef is a view, not a step"),
             },
             Adjust::Deref(None) => ExprKind::Deref { arg: self.push(expr) },
+            // `Box` dereferences are builtin (rustc `builtin_deref` includes it)
+            Adjust::Deref(Some(_)) if self.is_box(expr.ty) => ExprKind::Deref { arg: self.push(expr) },
             Adjust::Deref(Some((def, args))) => {
                 // `*Deref::deref(&expr)`
                 let mutable = self.is_mut_method(def);
@@ -170,6 +176,59 @@ impl Cx<'_> {
         let callee_ty = self.fn_def_ty(m.def, self.tcx().tys.list(m.args));
         let fun = self.push(self.mk(e, ExprKind::ZstLiteral { user_ty: None }, callee_ty));
         Ok(self.mk_at(e, span, ExprKind::Call { ty: callee_ty, fun, args, from_hir_call: false, fn_span: span }, ty))
+    }
+
+    /// A binary operator on primitives where an operand is a reference (`1 << i` with `i: &usize`,
+    /// `x += &y`): typeck treats it as builtin, but rustc only has the builtin operation on two
+    /// primitives, so this is the operator trait's method (`<i32 as Shl<&usize>>::shl`).
+    fn ref_operand_operator(&mut self, e: ast::ExprId, op: ast::BinOp, l: ExprId, r: ExprId, assign: bool, ty: TyId) -> BuildResult<Option<Expr>> {
+        use ast::BinOp as B;
+        let tcx = self.tcx();
+        let (lt, rt) = (self.thir.exprs[l.0 as usize].ty, self.thir.exprs[r.0 as usize].ty);
+        if !matches!(tcx.tys.kind(lt), TyKind::Ref(..)) && !matches!(tcx.tys.kind(rt), TyKind::Ref(..)) {
+            return Ok(None);
+        }
+        let span = self.espan(e);
+        let (item, name, compare) = match (op, assign) {
+            (B::Add, false) => (LangItem::Add, "add", false),
+            (B::Sub, false) => (LangItem::Sub, "sub", false),
+            (B::Mul, false) => (LangItem::Mul, "mul", false),
+            (B::Div, false) => (LangItem::Div, "div", false),
+            (B::Rem, false) => (LangItem::Rem, "rem", false),
+            (B::BitXor, false) => (LangItem::BitXor, "bitxor", false),
+            (B::BitAnd, false) => (LangItem::BitAnd, "bitand", false),
+            (B::BitOr, false) => (LangItem::BitOr, "bitor", false),
+            (B::Shl, false) => (LangItem::Shl, "shl", false),
+            (B::Shr, false) => (LangItem::Shr, "shr", false),
+            (B::Add, true) => (LangItem::AddAssign, "add_assign", false),
+            (B::Sub, true) => (LangItem::SubAssign, "sub_assign", false),
+            (B::Mul, true) => (LangItem::MulAssign, "mul_assign", false),
+            (B::Div, true) => (LangItem::DivAssign, "div_assign", false),
+            (B::Rem, true) => (LangItem::RemAssign, "rem_assign", false),
+            (B::BitXor, true) => (LangItem::BitXorAssign, "bitxor_assign", false),
+            (B::BitAnd, true) => (LangItem::BitAndAssign, "bitand_assign", false),
+            (B::BitOr, true) => (LangItem::BitOrAssign, "bitor_assign", false),
+            (B::Shl, true) => (LangItem::ShlAssign, "shl_assign", false),
+            (B::Shr, true) => (LangItem::ShrAssign, "shr_assign", false),
+            (B::Eq, _) => (LangItem::PartialEq, "eq", true),
+            (B::Ne, _) => (LangItem::PartialEq, "ne", true),
+            (B::Lt, _) => (LangItem::PartialOrd, "lt", true),
+            (B::Le, _) => (LangItem::PartialOrd, "le", true),
+            (B::Gt, _) => (LangItem::PartialOrd, "gt", true),
+            (B::Ge, _) => (LangItem::PartialOrd, "ge", true),
+            _ => return Ok(None),
+        };
+        let Some(def) = self.trait_method(item, name) else { return self.unresolved(span, "operator trait method") };
+        let callee_ty = self.fn_def_ty(def, &[lt, rt]);
+        let fun = self.push(self.mk(e, ExprKind::ZstLiteral { user_ty: None }, callee_ty));
+        let args: Box<[ExprId]> = if compare {
+            Box::new([self.autoref(e, l, false), self.autoref(e, r, false)])
+        } else if assign {
+            Box::new([self.autoref_two_phase(e, l), r])
+        } else {
+            Box::new([l, r])
+        };
+        Ok(Some(self.mk_at(e, span, ExprKind::Call { ty: callee_ty, fun, args, from_hir_call: false, fn_span: span }, ty)))
     }
 
     /// `&expr` / `&mut expr` of an already built operand (an autoref).
@@ -232,8 +291,12 @@ impl Cx<'_> {
                     let rhs = self.mirror_arg(rhs)?;
                     return self.overloaded_operator(e, m, Box::new([lhs, rhs]), expr_ty);
                 }
-                let Some(op) = bin_op(op) else { return self.unresolved(span, "assignment operator") };
-                ExprKind::AssignOp { op: AssignOp(op), lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? }
+                let Some(mop) = bin_op(op) else { return self.unresolved(span, "assignment operator") };
+                let (l, r) = (self.mirror_expr(lhs)?, self.mirror_expr(rhs)?);
+                if let Some(call) = self.ref_operand_operator(e, op, l, r, true, expr_ty)? {
+                    return Ok(call);
+                }
+                ExprKind::AssignOp { op: AssignOp(mop), lhs: l, rhs: r }
             }
             A::Lit(_) => ExprKind::Literal { expr: e, neg: false },
             A::Binary(op, lhs, rhs) => {
@@ -251,8 +314,12 @@ impl Cx<'_> {
                     ast::BinOp::And => ExprKind::LogicalOp { op: LogicalOp::And, lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? },
                     ast::BinOp::Or => ExprKind::LogicalOp { op: LogicalOp::Or, lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? },
                     _ => {
-                        let Some(op) = bin_op(op) else { return self.unresolved(span, "binary operator") };
-                        ExprKind::Binary { op, lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? }
+                        let Some(mop) = bin_op(op) else { return self.unresolved(span, "binary operator") };
+                        let (l, r) = (self.mirror_expr(lhs)?, self.mirror_expr(rhs)?);
+                        if let Some(call) = self.ref_operand_operator(e, op, l, r, false, expr_ty)? {
+                            return Ok(call);
+                        }
+                        ExprKind::Binary { op: mop, lhs: l, rhs: r }
                     }
                 }
             }
@@ -268,6 +335,18 @@ impl Cx<'_> {
                 }
                 let base = self.mirror_expr(lhs)?;
                 let base = self.apply_operand_adjustments_id(e, base)?;
+                // builtin indexing is `usize` into an array or slice; typeck leaves ranges (and the
+                // like) on arrays, slices and `str` to the std `Index` impls without recording them
+                let base_ty = self.thir.exprs[base.0 as usize].ty;
+                let index_ty = self.ety_adjusted(index)?;
+                let builtin = matches!(tcx.tys.kind(base_ty), TyKind::Array(..) | TyKind::Slice(_)) && index_ty == tcx.tys.usize_;
+                if !builtin {
+                    let Some(def) = self.trait_method(LangItem::Index, "index") else { return self.unresolved(span, "Index lang item") };
+                    let base = self.autoref(e, base, false);
+                    let index = self.mirror_expr(index)?;
+                    let callee_ty = self.fn_def_ty(def, &[base_ty, index_ty]);
+                    return self.overloaded_place(e, self.temp_scope(e), expr_ty, callee_ty, Box::new([base, index]), span);
+                }
                 ExprKind::Index { lhs: base, index: self.mirror_expr(index)? }
             }
             A::Unary(ast::UnOp::Deref, x) => {
@@ -277,6 +356,7 @@ impl Cx<'_> {
                 });
                 let arg = self.mirror_expr(x)?;
                 match overloaded {
+                    Some(_) if self.is_box(self.thir.exprs[arg.0 as usize].ty) => ExprKind::Deref { arg },
                     Some((def, args)) => {
                         let arg = self.autoref(e, arg, self.is_mut_method(def));
                         let callee_ty = self.fn_def_ty(def, tcx.tys.list(args));
@@ -739,19 +819,28 @@ impl Cx<'_> {
 
     /// thir/cx/expr.rs `Closure`: the captured places as expressions in the creating body.
     fn closure_expr(&mut self, e: ast::ExprId, row: ast::ClosureRow, expr_ty: TyId) -> BuildResult<Expr> {
-        let span = self.espan(e);
+        let mut aggregate = self.closure_aggregate(e, expr_ty, None)?;
         if row.is_async {
-            return self.not_built(span, "async closure");
+            // `async |..| ..`: a coroutine closure whose body creates the coroutine
+            if let ExprKind::Closure(c) = &mut aggregate.kind {
+                c.kind = super::ClosureExprKind::CoroutineClosure;
+            }
         }
-        self.closure_aggregate(e, expr_ty, None)
+        Ok(aggregate)
     }
 
     /// The aggregate of a closure or coroutine: the captured places (by value or borrowed).
     fn closure_aggregate(&mut self, e: ast::ExprId, expr_ty: TyId, movability: Option<crate::mir::Movability>) -> BuildResult<Expr> {
+        let (temp, span) = (self.temp_scope(e), self.espan(e));
+        self.closure_aggregate_at(e.0, temp, span, expr_ty, movability)
+    }
+
+    /// The aggregate of the closure / coroutine `ce` created at a site with temporary scope `temp`
+    /// (an async fn creates its body coroutine at no expression).
+    pub(super) fn closure_aggregate_at(&mut self, ce: u32, temp: Option<crate::region_scope::ScopeId>, span: Span, expr_ty: TyId, movability: Option<crate::mir::Movability>) -> BuildResult<Expr> {
         let (tb, tcx) = (self.tb(), self.tcx());
-        let span = self.espan(e);
         let (closure, args, kind, tupled) = self.closure_parts(expr_ty, span)?;
-        let Some(caps) = tb.min_captures.get(&e.0) else { return self.unresolved(span, "closure captures") };
+        let Some(caps) = tb.min_captures.get(&ce) else { return self.unresolved(span, "closure captures") };
         let upvar_tys: Vec<TyId> = match *tcx.tys.kind(tupled) {
             TyKind::Tuple(l) => tcx.tys.list(l).to_vec(),
             _ => return self.unresolved(span, "closure upvar types"),
@@ -761,7 +850,7 @@ impl Cx<'_> {
         }
         let mut upvars = Vec::new();
         for (capture, &ty) in caps.captures.iter().zip(&upvar_tys) {
-            let place = self.captured_place_expr(e, &capture.place);
+            let place = self.captured_place_expr(temp, span, &capture.place);
             let kind = match capture.info.kind {
                 crate::upvar::CaptureKind::ByValue => {
                     upvars.push(self.push(place));
@@ -772,27 +861,27 @@ impl Cx<'_> {
                 crate::upvar::CaptureKind::ByRef(crate::expr_use::BorrowKind::Mut) => BorrowKind::Mut { kind: MutBorrowKind::Default },
             };
             let arg = self.push(place);
-            upvars.push(self.push(self.mk(e, ExprKind::Borrow { borrow_kind: kind, arg }, ty)));
+            upvars.push(self.push(Expr { kind: ExprKind::Borrow { borrow_kind: kind, arg }, ty, temp_scope: temp, span }));
         }
         let mut fake_reads = Vec::new();
         for (place, cause, node) in &caps.fake_reads {
-            let expr = self.captured_place_expr(e, place);
+            let expr = self.captured_place_expr(temp, span, place);
             let cause = match cause {
                 crate::expr_use::FakeReadCause::Let => FakeReadCause::ForLet(None),
                 crate::expr_use::FakeReadCause::Matched => FakeReadCause::ForMatchedPlace(None),
             };
             fake_reads.push((self.push(expr), cause, *node));
         }
-        Ok(self.mk(e, ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability, fake_reads, kind })), expr_ty))
+        Ok(Expr { kind: ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability, fake_reads, kind })), ty: expr_ty, temp_scope: temp, span })
     }
 
     /// The place a closure captures, as an expression of the creating body (starting from the
     /// variable, which may itself be an upvar of this body).
-    fn captured_place_expr(&mut self, closure: ast::ExprId, place: &crate::expr_use::Place) -> Expr {
+    fn captured_place_expr(&mut self, temp: Option<crate::region_scope::ScopeId>, span: Span, place: &crate::expr_use::Place) -> Expr {
         use crate::expr_use::Projection;
         let var = LocalVarId(place.root);
         let kind = if self.is_upvar(place.root) { ExprKind::UpvarRef { var } } else { ExprKind::VarRef { id: var } };
-        let mut expr = self.mk(closure, kind, place.root_ty);
+        let mut expr = Expr { kind, ty: place.root_ty, temp_scope: temp, span };
         for (proj, ty) in &place.projections {
             let kind = match *proj {
                 Projection::Deref => ExprKind::Deref { arg: self.push(expr) },
@@ -800,12 +889,28 @@ impl Cx<'_> {
                 // we don't capture these projections, so we can ignore them here
                 Projection::Index | Projection::Subslice => continue,
             };
-            expr = self.mk(closure, kind, *ty);
+            expr = Expr { kind, ty: *ty, temp_scope: temp, span };
         }
         expr
     }
 
     // ---------------------------------------------------------------- casts
+
+    /// The fn pointer type a fn item / capture-free closure coerces to (typeck's `fn_ptr_of`).
+    fn fn_ptr_of(&self, ty: TyId) -> Option<TyId> {
+        let (tcx, prog) = (self.tcx(), self.prog());
+        match tcx.tys.kind(ty).clone() {
+            TyKind::FnPtr(..) => Some(ty),
+            TyKind::FnDef(d, args, regions) => {
+                let sig = tcx.fn_item_sig(prog, d).cloned()?;
+                let poly = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
+                let args = tcx.complete_args(prog, d, tcx.tys.list(args), regions);
+                Some(tcx.tys.erase_regions(tcx.instantiate_ty(prog, d, &args, poly)))
+            }
+            TyKind::Closure(_, _, closure_args) => Some(closure_args.closure_sig_as_fn_ptr_ty),
+            _ => None,
+        }
+    }
 
     fn cast_expr(&mut self, e: ast::ExprId, source: ast::ExprId, cast_ty: ast::TyId, expr_ty: TyId) -> BuildResult<Expr> {
         let (tb, tcx, prog, ast) = (self.tb(), self.tcx(), self.prog(), self.ast());
@@ -815,8 +920,17 @@ impl Cx<'_> {
         let saved = self.cast_source.replace(source);
         let mirrored = self.mirror_expr(source);
         self.cast_source = saved;
-        let mirrored = mirrored?;
-        let kind = if adjusted == expr_ty {
+        let mut mirrored = mirrored?;
+        // `f as *mut ()` / `f as usize` on a fn item (or capture-free closure): rustc's cast check
+        // first reifies it to a fn pointer
+        if matches!(tcx.tys.kind(adjusted), TyKind::FnDef(..) | TyKind::Closure(..)) && !matches!(tcx.tys.kind(expr_ty), TyKind::FnPtr(..) | TyKind::FnDef(..) | TyKind::Closure(..)) {
+            if let Some(fn_ptr) = self.fn_ptr_of(adjusted) {
+                let TyKind::FnPtr(_, _, header, _) = *tcx.tys.kind(fn_ptr) else { unreachable!() };
+                let cast = if matches!(tcx.tys.kind(adjusted), TyKind::Closure(..)) { PointerCoercion::ClosureFnPointer(header.safety) } else { PointerCoercion::ReifyFnPointer(header.safety) };
+                mirrored = self.push(self.mk(e, ExprKind::PointerCoercion { cast, source: mirrored, is_from_as_cast: true }, fn_ptr));
+            }
+        }
+        let kind = if adjusted == expr_ty || tcx.tys.erase_regions(adjusted) == tcx.tys.erase_regions(expr_ty) {
             // a coercion cast (or a no-op): the value converted by the coercion
             ExprKind::Use { source: mirrored }
         } else if matches!(tcx.tys.kind(source_ty), TyKind::Ref(..)) {

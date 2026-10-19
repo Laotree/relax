@@ -240,10 +240,23 @@ impl<'a> Cx<'a> {
             OwnerKind::Function => {
                 let ast::ItemKind::Fn(sig, _, _) = item.kind else { return self.unresolved(span, "function item") };
                 let sig = ast.fn_sig(sig);
-                if sig.asyncness {
-                    return self.not_built(item_span, "async fn");
-                }
                 let Some(body) = tb.body else { return self.unresolved(item_span, "function body") };
+                if sig.asyncness {
+                    // an async fn is two bodies: this one builds the body coroutine, capturing every
+                    // parameter by value; the coroutine's own body is `OwnerKind::Closure` with the
+                    // expression id `ASYNC_FN_BODY | body block`
+                    let params = self.fn_params(sig, item.lo)?;
+                    let b = ast.block(body);
+                    let scopes = fn_scopes(&self, Node::Block(body.0), item_span)?;
+                    let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::AsyncReturn(def.item))) else { return self.unresolved(item_span, "async fn return type") };
+                    let Some(&coroutine_ty) = tb.hidden_types.get(&opaque) else { return self.unresolved(item_span, "async fn coroutine type") };
+                    let body_span = self.span(b.lo, b.hi);
+                    let root = self.closure_aggregate_at(crate::tcx::ASYNC_FN_BODY | body.0, None, body_span, coroutine_ty, Some(crate::mir::Movability::Static))?;
+                    let expr = self.push(root);
+                    self.fix_mutable_places();
+                    let ret_span = self.span(b.lo, b.lo);
+                    return Ok(ThirBody { thir: self.thir, params, expr, body_ty: BodyTy::Fn { output: tb.ret, rust_call: false }, span: item_span, ret_span, coroutine: None, fn_scopes: scopes });
+                }
                 let b = ast.block(body);
                 let params = self.fn_params(sig, item.lo)?;
                 let block = self.mirror_block(body)?;
@@ -280,6 +293,28 @@ impl<'a> Cx<'a> {
                 let root = Expr { kind: ExprKind::Block { block }, ty, temp_scope: None, span: self.span(blk.lo, blk.hi) };
                 (Vec::new(), self.push(root), BodyTy::Const(ty), self.espan(e), self.espan(e), None)
             }
+            OwnerKind::Closure(ce) if ce.0 & crate::tcx::ASYNC_FN_BODY != 0 => {
+                // the body coroutine of an async fn: the body block, the parameters captured
+                let b = ast::BlockId(ce.0 & !crate::tcx::ASYNC_FN_BODY);
+                let blk = ast.block(b);
+                let body_span = self.span(blk.lo, blk.hi);
+                let scopes = fn_scopes(&self, Node::Block(b.0), item_span)?;
+                let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::AsyncReturn(def.item))) else { return self.unresolved(item_span, "async fn return type") };
+                let Some(&coroutine_ty) = tb.hidden_types.get(&opaque) else { return self.unresolved(item_span, "async fn coroutine type") };
+                let TyKind::Closure(_, _, closure_args) = *tcx.tys.kind(coroutine_ty) else { return self.unresolved(item_span, "coroutine type") };
+                let TyKind::FnPtr(_, output, _, _) = *tcx.tys.kind(closure_args.closure_sig_as_fn_ptr_ty) else { return self.unresolved(item_span, "coroutine signature") };
+                let resume_ty = self.resume_ty(item_span)?;
+                let env = self.thir.alloc_param(Param { pat: None, ty: coroutine_ty, ty_span: None, self_kind: None, node: None });
+                let task_context = self.synthetic_binding(scopes.expect("scopes").1);
+                self.task_context = Some(task_context);
+                let pat = self.binding_pat(task_context, "_task_context", resume_ty, true, item_span);
+                let resume = self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty: resume_ty, ty_span: None, self_kind: None, node: None });
+                let block = self.mirror_block(b)?;
+                let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, span: body_span };
+                let kind = crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Fn);
+                coroutine = Some(CoroutineThir { kind, yield_ty: tcx.tys.unit, resume_ty });
+                (vec![env, resume], self.push(root), BodyTy::Fn { output, rust_call: false }, item_span, self.span(blk.lo, blk.lo), scopes)
+            }
             OwnerKind::Closure(ce) => {
                 if let ast::ExprKind::Async(_, b) = ast.expr(ce).kind {
                     // an `async` block: the coroutine takes itself and the resume argument `_task_context`
@@ -304,9 +339,6 @@ impl<'a> Cx<'a> {
                 let ast::ExprKind::Closure(row) = ast.expr(ce).kind else { return self.not_built(self.espan(ce), "coroutine body") };
                 let row = *ast.row(row);
                 let ce_span = self.espan(ce);
-                if row.is_async {
-                    return self.not_built(ce_span, "async closure");
-                }
                 let Some(sigs) = tb.closure_sigs.get(&ce.0) else { return self.unresolved(ce_span, "closure signature") };
                 let TyKind::FnPtr(inputs, output, _, _) = *tcx.tys.kind(sigs.liberated) else { return self.unresolved(ce_span, "closure signature type") };
                 let inputs: Vec<TyId> = tcx.tys.list(inputs).to_vec();
@@ -323,7 +355,90 @@ impl<'a> Cx<'a> {
                 }
             }
         };
+        self.fix_mutable_places();
         Ok(ThirBody { thir: self.thir, params, expr, body_ty, span: body_span, ret_span, coroutine, fn_scopes: scopes })
+    }
+
+    /// The method `name` of the lang-item trait `item`.
+    pub(super) fn trait_method(&self, item: crate::lang_items::LangItem, name: &str) -> Option<DefId> {
+        let (tcx, prog) = (self.tcx(), self.prog());
+        let td = tcx.lang_items.get(item)?;
+        prog.traits[prog.def(td).sub as usize].iter().copied().find(|&it| prog.name(it) == name)
+    }
+
+    /// rustc `convert_place_derefs_to_mutable`: typeck records the shared `Deref::deref` / `Index::index`
+    /// of an overloaded place; where the place is used mutably (a `&mut` borrow, an assignment, a
+    /// `ref mut` pattern) the call becomes `deref_mut` / `index_mut` with a `&mut` borrow of its base.
+    fn fix_mutable_places(&mut self) {
+        let mut roots: Vec<ExprId> = Vec::new();
+        for e in &self.thir.exprs {
+            match &e.kind {
+                ExprKind::Borrow { borrow_kind: crate::mir::BorrowKind::Mut { .. }, arg } | ExprKind::RawBorrow { mutability: Mutability::Mut, arg } => roots.push(*arg),
+                ExprKind::Assign { lhs, .. } | ExprKind::AssignOp { lhs, .. } => roots.push(*lhs),
+                ExprKind::Match { scrutinee, arms, .. } => {
+                    if arms.iter().any(|a| has_ref_mut(&self.thir.arms[a.0 as usize].pattern)) {
+                        roots.push(*scrutinee);
+                    }
+                }
+                ExprKind::Let { expr, pat } if has_ref_mut(pat) => roots.push(*expr),
+                _ => {}
+            }
+        }
+        for stmt in &self.thir.stmts {
+            if let StmtKind::Let { pattern, initializer: Some(init), .. } = &stmt.kind {
+                if has_ref_mut(pattern) {
+                    roots.push(*init);
+                }
+            }
+        }
+        for root in roots {
+            self.make_place_mutable(root);
+        }
+    }
+
+    fn make_place_mutable(&mut self, mut id: ExprId) {
+        let tcx = self.tcx();
+        loop {
+            let kind = self.thir.exprs[id.0 as usize].kind.clone();
+            match kind {
+                ExprKind::Scope { value, .. } => id = value,
+                ExprKind::Field { lhs, .. } | ExprKind::Index { lhs, .. } => id = lhs,
+                ExprKind::PlaceTypeAscription { source, .. } => id = source,
+                ExprKind::Deref { arg } => {
+                    // an overloaded deref / index: `*Trait::method(&base, ..)`
+                    let call = self.thir.exprs[arg.0 as usize].clone();
+                    let ExprKind::Call { ty: callee_ty, fun, args, from_hir_call, fn_span } = call.kind else {
+                        id = arg;
+                        continue;
+                    };
+                    let TyKind::FnDef(def, fargs, regions) = *tcx.tys.kind(callee_ty) else { return };
+                    let (item, name) = match self.prog().syms.str(self.prog().def(def).name) {
+                        "deref" => (crate::lang_items::LangItem::DerefMut, "deref_mut"),
+                        "index" => (crate::lang_items::LangItem::IndexMut, "index_mut"),
+                        _ => return,
+                    };
+                    let Some(mut_def) = self.trait_method(item, name) else { return };
+                    let new_callee = tcx.tys.intern(TyKind::FnDef(mut_def, fargs, regions));
+                    let TyKind::Ref(_, pointee, region) = *tcx.tys.kind(call.ty) else { return };
+                    let new_ref = tcx.tys.intern(TyKind::Ref(true, pointee, region));
+                    let borrow = args[0];
+                    let base = match self.thir.exprs[borrow.0 as usize].kind {
+                        ExprKind::Borrow { arg, .. } => arg,
+                        _ => return,
+                    };
+                    let b = &mut self.thir.exprs[borrow.0 as usize];
+                    let TyKind::Ref(_, borrowed, borrow_region) = *tcx.tys.kind(b.ty) else { return };
+                    b.kind = ExprKind::Borrow { borrow_kind: crate::mir::BorrowKind::Mut { kind: crate::mir::MutBorrowKind::Default }, arg: base };
+                    b.ty = tcx.tys.intern(TyKind::Ref(true, borrowed, borrow_region));
+                    self.thir.exprs[fun.0 as usize].ty = new_callee;
+                    let c = &mut self.thir.exprs[arg.0 as usize];
+                    c.kind = ExprKind::Call { ty: new_callee, fun, args, from_hir_call, fn_span };
+                    c.ty = new_ref;
+                    id = base;
+                }
+                _ => return,
+            }
+        }
     }
 
     /// `core::future::ResumeTy`, the resume argument type of an async coroutine.
@@ -385,6 +500,10 @@ impl<'a> Cx<'a> {
 
     pub(super) fn is_upvar(&self, local: u32) -> bool {
         match self.owner.kind {
+            // an async fn's coroutine captures its parameters; `closure_locals` lists every local of the fn
+            OwnerKind::Closure(ce) if ce.0 & crate::tcx::ASYNC_FN_BODY != 0 => {
+                self.tb().min_captures.get(&ce.0).is_some_and(|c| c.captures.iter().any(|capture| capture.place.root == local))
+            }
             OwnerKind::Closure(ce) => self.tb().closure_locals.get(&ce.0).is_some_and(|caps| caps.contains(&local)),
             _ => false,
         }
@@ -423,4 +542,15 @@ pub(super) fn strip_paren(ast: &ast::Ast, mut e: ast::ExprId) -> ast::ExprId {
         e = *x;
     }
     e
+}
+
+/// Does the pattern bind by `ref mut`?
+fn has_ref_mut(pat: &Pat) -> bool {
+    let mut found = false;
+    pat.walk_always(|p| {
+        if let PatKind::Binding { mode: BindingMode(ByRef::Yes(Mutability::Mut), _), .. } = p.kind {
+            found = true;
+        }
+    });
+    found
 }

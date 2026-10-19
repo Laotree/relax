@@ -63,6 +63,11 @@ pub(super) fn fn_call_non_const(cx: &ConstCx<'_>, callee: DefId, span: Span, cal
     error("E0015", message, span, Importance::Primary)
 }
 
+/// A call to a `panic()` lang item where the first argument is _not_ a `&str`.
+pub(super) fn panic_non_str(span: Span) -> ConstError {
+    error("E0015", "argument to `panic!()` in a const context must have type `&str`".to_string(), span, Importance::Primary)
+}
+
 /// A live drop of a value that needs a non-const destructor.
 pub(super) fn live_drop(cx: &ConstCx<'_>, dropped_ty: TyId, span: Span) -> ConstError {
     error(
