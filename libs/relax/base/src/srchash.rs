@@ -243,6 +243,13 @@ fn identity_files(dir: &std::path::Path) -> Vec<(String, u64)> {
 pub type Manifest = std::collections::BTreeMap<(String, String), String>;
 
 pub fn closure_manifest(pkgs: &[SrcPkg], root: usize) -> Manifest {
+    closure_manifest_with(pkgs, root, &mut std::collections::HashMap::new())
+}
+
+/// As `closure_manifest`; `files` holds the identity files read per package folder, so a
+/// package that several closures reach is read and hashed once (the caller's scope: sources
+/// that change between calls are not seen through it).
+pub fn closure_manifest_with(pkgs: &[SrcPkg], root: usize, files: &mut std::collections::HashMap<String, Vec<(String, u64)>>) -> Manifest {
     let mut seen = vec![[false; 2]; pkgs.len()];
     let mut stack = vec![(root, false)];
     let mut out = Manifest::new();
@@ -260,8 +267,9 @@ pub fn closure_manifest(pkgs: &[SrcPkg], root: usize) -> Manifest {
         out.insert((key.clone(), "\0version".into()), p.version.clone());
         out.insert((key.clone(), "\0features".into()), feats.join(", "));
         if !immutable(&p.dir) {
-            for (rel, hash) in identity_files(std::path::Path::new(&p.dir)) {
-                out.insert((key.clone(), rel), format!("{hash:016x}"));
+            let list = files.entry(p.dir.clone()).or_insert_with(|| identity_files(std::path::Path::new(&p.dir)));
+            for (rel, hash) in list.iter() {
+                out.insert((key.clone(), rel.clone()), format!("{hash:016x}"));
             }
         }
         stack.extend(p.deps.iter().map(|d| (*d, host)));
