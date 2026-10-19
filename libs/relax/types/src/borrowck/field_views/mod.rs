@@ -549,6 +549,8 @@ pub fn describe_summary(prog: &Program, tcx: &Tcx, d: DefId, k: usize, s: &Summa
     }
 }
 
+pub mod edit;
+
 /// One conflict accepted only with field views / extended two-phase borrows, as the checker
 /// found it. `render_records` (diagnostics) turns these into `export::FvRecord`s (source text).
 #[derive(Clone, Debug)]
