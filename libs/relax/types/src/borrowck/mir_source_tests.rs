@@ -5,6 +5,7 @@ use crate::tcx::{EvalCx, EvalState, Tcx, TypingEnv};
 
 /// Error codes (or messages) and unchecked reasons of every fn of `source`.
 pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
+    crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
     let std_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../compiler/std");
@@ -289,6 +290,79 @@ fn a_promoted_closure_is_not_a_missing_nested_body() {
     let (errors, unchecked) = borrowck_source("
         pub fn run(cancel: &dyn Fn() -> bool) -> bool { cancel() }
         pub fn f() -> bool { run(&|| false) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn an_array_indexed_by_a_user_type_through_the_slice_impl() {
+    let (errors, unchecked) = borrowck_source("
+        #[derive(Clone, Copy)] pub enum T { A, B }
+        impl<V> core::ops::Index<T> for [V] { type Output = V; fn index(&self, t: T) -> &V { &self[t as usize] } }
+        pub struct M { found: [bool; 2] }
+        impl M { pub fn found_script(&self, t: T) -> bool { self.found[t] } }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_static_array_of_inline_const_atomics() {
+    let (errors, unchecked) = borrowck_source("
+        use core::sync::atomic::{AtomicUsize, Ordering};
+        static FRAMES: [AtomicUsize; 4] = [const { AtomicUsize::new(0) }; 4];
+        pub fn f(i: usize) -> usize { FRAMES[i].load(Ordering::Relaxed) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_turbofish_on_a_tuple_struct_constructor_is_a_user_type_annotation() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct SomeStruct<T>(pub T);
+        pub fn bad() { let c = 66; SomeStruct::<&'static u32>(&c); }
+        pub fn ok() { let c = 66; SomeStruct::<&u32>(&c); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("E0597"), "{errors:?}");
+}
+
+/// Probe: `UI_FILES=a.rs:b.rs cargo test zz_probe_files -- --nocapture` prints what the pipeline says about each.
+#[test]
+fn zz_probe_files() {
+    let Some(files) = std::env::var_os("UI_FILES") else { return };
+    for f in files.to_string_lossy().split(':') {
+        let src = std::fs::read_to_string(f).unwrap();
+        let r = std::panic::catch_unwind(|| borrowck_source(&src));
+        match r { Ok((e, u)) => eprintln!("PROBE {f}: errors {} {:?} unchecked {:?}", e.len(), e.iter().map(|x| x.chars().take(60).collect::<String>()).collect::<Vec<_>>(), u),
+                  Err(_) => eprintln!("PROBE {f}: harness panic (typeck/front errors?)") }
+    }
+}
+
+#[test]
+fn a_higher_ranked_where_clause_on_an_associated_type_is_a_verify_bound() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn csv<V>(value: &V) -> Result<String, &str>
+        where V: 'static, for<'a> &'a V: IntoIterator, for<'a> <&'a V as IntoIterator>::Item: ToString + 'static,
+        { let s: String = value.into_iter().map(|e| e.to_string()).collect::<String>(); Ok(s) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_move_out_of_a_promoted_array_element_is_e0508() {
+    let (errors, unchecked) = borrowck_source("
+        #[derive(Clone)] struct S1(S2);
+        #[derive(Clone)] struct S2;
+        pub fn f() { const C: [S2; 1] = [S2]; let _ = S1(C[0]).clone(); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("E0508"), "{errors:?}");
+}
+
+#[test]
+fn closures_in_a_promoted_constant_use_the_parents_user_type_annotations() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn f<'a, T: 'a>(x: &'a T) -> usize { let g = |y: &'a T| -> usize { let _z: &'a T = y; 1 }; g(x) }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }

@@ -118,7 +118,16 @@ impl TypeOp for ParamEnvAnd<AscribeUserType> {
                 UserTypeKind::TypeOf(def, user_args) => {
                     let tcx = ocx.infcx.tcx;
                     let args = &user_args.args;
-                    let ty = user_type_of(tcx, prog, *def, args);
+                    let mut ty = user_type_of(tcx, prog, *def, args);
+                    // Relax has one DefId for a tuple struct and its constructor (rustc has two): an annotation
+                    // that names the constructor is related to a `FnDef`, one that names the ADT (a constructor
+                    // call's aggregate) to the ADT type.
+                    if let TyKind::FnDef(d, a, r) = *tcx.tys.kind(ty) {
+                        if matches!(prog.def(d).kind, crate::program::DefKind::Struct | crate::program::DefKind::Variant) && !matches!(tcx.tys.kind(mir_ty), TyKind::FnDef(..)) {
+                            let adt = if prog.def(d).kind == crate::program::DefKind::Variant { prog.def(d).parent } else { d };
+                            ty = tcx.tys.intern(TyKind::Adt(adt, a, r));
+                        }
+                    }
                     let ty = ocx.normalize_ty(&env, ty);
                     ocx.eq(&env, mir_ty, ty)?;
                     // the predicates that come with `def`, normalized

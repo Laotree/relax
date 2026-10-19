@@ -322,3 +322,17 @@ mod tests {
         crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(None));
     }
 }
+#[cfg(test)]
+mod ctor_tests {
+    use crate::typeck::solve::program;
+    #[test]
+    fn a_turbofish_on_a_tuple_struct_constructor_call_is_saved() {
+        crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
+        let (prog, tcx) = program("#![no_std]\nstruct S<T>(T); fn f() { let c = 1u32; S::<&'static u32>(&c); }");
+        let def = prog.defs.iter().enumerate().find(|(_, d)| prog.syms.str(d.name) == "f").map(|(i, _)| crate::program::DefId(i as u32)).unwrap();
+        let body = tcx.typeck(&prog, def);
+        assert!(body.errors.is_empty(), "{:?}", body.errors);
+        assert!(!body.user_provided_types.is_empty(), "the constructor path's turbofish is an annotation");
+        crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(None));
+    }
+}

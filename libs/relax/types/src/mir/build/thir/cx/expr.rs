@@ -332,6 +332,21 @@ impl Cx<'_> {
                     let base = self.mirror_expr(lhs)?;
                     let base = self.apply_operand_adjustments_id(e, base)?;
                     let base = self.autoref(e, base, self.is_mut_method(def));
+                    // rustc try_index_step: an array indexed through an impl for the slice is unsized first
+                    // (`[Adjust::Borrow, Adjust::Pointer(Unsize)]`).
+                    let base = {
+                        let ty = self.thir.exprs[base.0 as usize].ty;
+                        let self_ty = tcx.tys.list(args).first().copied();
+                        match (tcx.tys.kind(ty).clone(), self_ty.map(|t| tcx.tys.kind(t).clone())) {
+                            (TyKind::Ref(m, inner, r), Some(TyKind::Slice(_))) if matches!(tcx.tys.kind(inner), TyKind::Array(..)) => {
+                                let TyKind::Array(elem, _) = *tcx.tys.kind(inner) else { unreachable!() };
+                                let target = tcx.tys.intern(TyKind::Ref(m, tcx.tys.intern(TyKind::Slice(elem)), r));
+                                let span = self.thir.exprs[base.0 as usize].span;
+                                self.push(self.mk_at(e, span, ExprKind::PointerCoercion { cast: PointerCoercion::Unsize, source: base, is_from_as_cast: false }, target))
+                            }
+                            _ => base,
+                        }
+                    };
                     let index = self.mirror_expr(index)?;
                     let callee_ty = self.fn_def_ty(def, tcx.tys.list(args));
                     return self.overloaded_place(e, self.temp_scope(e), expr_ty, callee_ty, Box::new([base, index]), span);

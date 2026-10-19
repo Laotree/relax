@@ -135,8 +135,10 @@ impl<'a, 'tcx> ConstraintConversion<'a, 'tcx> {
     fn fold_to_region_vids(&self, ty: TyId) -> TyId {
         let tys = &self.infcx.tcx.tys;
         let universal_regions = self.universal_regions;
-        tys.map_regions(ty, &|r, depth| match tys.region_kind(r) {
-            RegionKind::ReBound(debruijn, _) if debruijn < depth => r,
+        tys.map_regions(ty, &|r, _| match tys.region_kind(r) {
+            // Bound regions stay: those inside the type are its own binders, and those escaping it are the
+            // variables of the `IfEq` pattern's binder, which the region solver matches against.
+            RegionKind::ReBound(..) => r,
             _ => tys.intern_region(RegionKind::ReVar(universal_regions.to_region_vid(tys, r) as u32)),
         }, 0)
     }

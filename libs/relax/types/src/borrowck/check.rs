@@ -958,7 +958,11 @@ fn check_promoted_moves(tcx: &Tcx, body: &Body, result: &mut MirBorrowckResult) 
         if !result.unsupported.is_empty() { continue; }
         let mut visitor = Moves { tcx, body: promoted, errors: vec![] };
         for (b, block) in promoted.basic_blocks.iter().enumerate() { visitor.visit_basic_block_data(BasicBlock(b as u32), block); }
+        let first = result.errors.len();
         report_move_errors(promoted, None, visitor.errors, &mut result.errors);
+        // The places of these errors are in the promoted body's local numbering; the diagnostics of the
+        // parent cannot describe them, so they keep their code and span only.
+        for error in &mut result.errors[first..] { error.detail = Detail::None; }
         check_promoted_moves(tcx, promoted, result);
     }
 }
