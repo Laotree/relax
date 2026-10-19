@@ -2197,7 +2197,17 @@ impl Tcx {
                 self.tys.mk_array(inner, lt)
             }
             ast::Ty::Fn(f) => self.lower_fn_pointer(cx, prog, file, module, env, ast.fn_ptr(*f), resolve_bound_vars::BinderId::FnPointer(t.0)),
-            ast::Ty::Infer => cx.infcx.map_or(self.tys.error, |infcx| infcx.next_ty_var()),
+            ast::Ty::Infer => match cx.infcx {
+                Some(infcx) => infcx.next_ty_var(),
+                None => {
+                    // ItemCtxt::ty_infer: no `_` in an item's signature (types carry no position here: the item's)
+                    if self.validates(prog, file) {
+                        let pos = env.owner.filter(|o| prog.def(*o).file == file).map_or(0, |o| ast.item(prog.def(o).item).lo);
+                        self.err(cx, prog, file, pos, "E0121: the placeholder `_` is not allowed within types on item signatures".to_string());
+                    }
+                    self.tys.error
+                }
+            },
             ast::Ty::Path(p) => self.lower_path_ty(cx, prog, file, module, env, p, Some(t)),
             ast::Ty::DynTrait(bounds, _) => self.lower_dyn(cx, prog, file, module, env, ast.list(*bounds), 0, Some(t)),
             ast::Ty::ImplTrait(_) if env.impl_params.iter().any(|x| x.0 == t.0) => {

@@ -639,6 +639,14 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             for &it in ast.list(fm.items) {
                 if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
                     let sig = ast.fn_sig(sig);
+                    // check_abi: a C-variadic foreign function has a C-like calling convention
+                    if sig.variadic {
+                        let abi = fm.abi.map_or(&b"\"C\""[..], |a| pf.bytes(a.lo, a.hi));
+                        let abi = abi.strip_prefix(b"\"").and_then(|a| a.strip_suffix(b"\"")).unwrap_or(abi);
+                        if !matches!(abi, b"C" | b"C-unwind" | b"cdecl" | b"cdecl-unwind" | b"system" | b"system-unwind" | b"aapcs" | b"aapcs-unwind" | b"win64" | b"win64-unwind" | b"sysv64" | b"sysv64-unwind" | b"efiapi") {
+                            errors.push(prog.record_error(file, ast.item(it).lo, "typeck", format!("E0045: C-variadic functions with the \"{}\" calling convention are not supported", String::from_utf8_lossy(abi))));
+                        }
+                    }
                     if let Some(g) = ast.list(sig.generics.params).iter().find(|g| !matches!(g.kind, crate::ast::GenericParamKind::Lifetime(_))) {
                         let what = if matches!(g.kind, crate::ast::GenericParamKind::Const(..)) { "const" } else { "type" };
                         errors.push(prog.record_error(file, g.name.lo, "typeck", format!("E0044: foreign items may not have {} parameters", what)));
@@ -846,11 +854,13 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
     let mut ints: Vec<Vec<u8>> = Vec::new();
     let (mut c, mut transparent, mut packed, mut aligned, mut other) = (false, false, Vec::<u32>::new(), false, false);
     let mut first_pos = item.lo;
+    let mut first_repr: Option<u32> = None;
     for a in ast.list(item.attrs) {
         let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
         if hi <= lo || crate::cfg::tok_str(p, lo) != b"repr" { continue; }
         let pos = p.tok(lo).lo;
         first_pos = pos;
+        first_repr.get_or_insert(pos);
         if hi < lo + 3 || crate::cfg::tok_str(p, lo + 1) != b"(" {
             err(pos, "E0539: malformed `repr` attribute input".to_string());
             continue;
@@ -907,6 +917,10 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
         }
     }
     let _ = other;
+    // check_enum: a zero-variant enum takes no representation
+    if let (ItemKind::Enum(r), Some(pos)) = (item.kind, first_repr) {
+        if ast.list(ast.row(r).variants).is_empty() { err(pos, "E0084: unsupported representation for zero-variant enum".to_string()); }
+    }
     if transparent && (c || !packed.is_empty() || aligned || !ints.is_empty()) {
         err(first_pos, "E0692: transparent struct cannot have other repr hints".to_string());
     }
