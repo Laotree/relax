@@ -10,30 +10,30 @@
 //! and parameters so lint levels follow rustc's lint level builder.
 
 use crate::ast::*;
-use crate::lint::{self, Level, Lint};
+use crate::lint::{self, Lint};
 use crate::parser::{ExpnKind, ParsedFile};
 use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::typeck::Body;
 use std::collections::HashMap;
 
-pub const UNUSED_PARENS: Lint = lint::lint("unused_parens", Level::Warn, &["unused"]);
-pub const UNUSED_BRACES: Lint = lint::lint("unused_braces", Level::Warn, &["unused"]);
-pub const WHILE_TRUE: Lint = lint::lint("while_true", Level::Warn, &[]);
-pub const REDUNDANT_SEMICOLONS: Lint = lint::lint("redundant_semicolons", Level::Warn, &["unused"]);
-pub const UNUSED_LABELS: Lint = lint::lint("unused_labels", Level::Warn, &["unused"]);
-pub const KEYWORD_IDENTS_2018: Lint = lint::lint("keyword_idents_2018", Level::Allow, &["keyword_idents", "rust_2018_compatibility", "future_incompatible"]);
-pub const KEYWORD_IDENTS_2024: Lint = lint::lint("keyword_idents_2024", Level::Allow, &["keyword_idents", "rust_2024_compatibility", "future_incompatible"]);
-pub const NON_ASCII_IDENTS: Lint = lint::lint("non_ascii_idents", Level::Allow, &[]);
-pub const ELLIPSIS_INCLUSIVE_RANGE_PATTERNS: Lint = lint::lint("ellipsis_inclusive_range_patterns", Level::Warn, &["rust_2018_idioms", "rust_2021_compatibility", "future_incompatible"]);
-pub const NO_MANGLE_CONST_ITEMS: Lint = lint::lint("no_mangle_const_items", Level::Deny, &[]);
-pub const NO_MANGLE_GENERIC_ITEMS: Lint = lint::lint("no_mangle_generic_items", Level::Warn, &[]);
-pub const SPECIAL_MODULE_NAME: Lint = lint::lint("special_module_name", Level::Warn, &[]);
-pub const UNUSED_ATTRIBUTES: Lint = lint::lint("unused_attributes", Level::Warn, &["unused"]);
-pub const BARE_TRAIT_OBJECTS: Lint = lint::lint("bare_trait_objects", Level::Warn, &["rust_2018_idioms", "rust_2021_compatibility", "future_incompatible"]);
-pub const UNUSED_LIFETIMES: Lint = lint::lint("unused_lifetimes", Level::Allow, &[]);
-pub const SINGLE_USE_LIFETIMES: Lint = lint::lint("single_use_lifetimes", Level::Allow, &[]);
-pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities", Level::Warn, &["unused"]);
+pub const UNUSED_PARENS: Lint = lint::lint("unused_parens");
+pub const UNUSED_BRACES: Lint = lint::lint("unused_braces");
+pub const WHILE_TRUE: Lint = lint::lint("while_true");
+pub const REDUNDANT_SEMICOLONS: Lint = lint::lint("redundant_semicolons");
+pub const UNUSED_LABELS: Lint = lint::lint("unused_labels");
+pub const KEYWORD_IDENTS_2018: Lint = lint::lint("keyword_idents_2018");
+pub const KEYWORD_IDENTS_2024: Lint = lint::lint("keyword_idents_2024");
+pub const NON_ASCII_IDENTS: Lint = lint::lint("non_ascii_idents");
+pub const ELLIPSIS_INCLUSIVE_RANGE_PATTERNS: Lint = lint::lint("ellipsis_inclusive_range_patterns");
+pub const NO_MANGLE_CONST_ITEMS: Lint = lint::lint("no_mangle_const_items");
+pub const NO_MANGLE_GENERIC_ITEMS: Lint = lint::lint("no_mangle_generic_items");
+pub const SPECIAL_MODULE_NAME: Lint = lint::lint("special_module_name");
+pub const UNUSED_ATTRIBUTES: Lint = lint::lint("unused_attributes");
+pub const BARE_TRAIT_OBJECTS: Lint = lint::lint("bare_trait_objects");
+pub const UNUSED_LIFETIMES: Lint = lint::lint("unused_lifetimes");
+pub const SINGLE_USE_LIFETIMES: Lint = lint::lint("single_use_lifetimes");
+pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities");
 
 /// Item-level passes over the definitions of the checked crates marked in `own`.
 pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {

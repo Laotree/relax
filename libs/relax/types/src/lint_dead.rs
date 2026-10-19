@@ -21,8 +21,8 @@ use crate::types::TyKind;
 use relax_session::sync::Mutex;
 use std::collections::{HashMap, HashSet};
 
-pub const DEAD_CODE: Lint = lint::lint("dead_code", Level::Warn, &["unused"]);
-pub const DEAD_CODE_PUB_IN_BINARY: Lint = lint::lint("dead_code_pub_in_binary", Level::Allow, &[]);
+pub const DEAD_CODE: Lint = lint::lint("dead_code");
+pub const DEAD_CODE_PUB_IN_BINARY: Lint = lint::lint("dead_code_pub_in_binary");
 
 /// A field of a struct, union or enum variant: (ADT, variant index, field index).
 type FieldKey = (DefId, u32, u32);

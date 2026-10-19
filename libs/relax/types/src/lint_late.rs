@@ -5,34 +5,34 @@
 use crate::ast::*;
 use crate::ast_visit::{self, Visitor};
 use crate::lang_items::LangItem;
-use crate::lint::{self, Level, Lint};
+use crate::lint::{self, Lint};
 use crate::pattern_analysis::{self, Cx as PCx};
 use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::typeck::{Body, Res};
 use crate::types::{AliasTyKind, TyId, TyKind};
 
-pub const UNUSED_MUST_USE: Lint = lint::lint("unused_must_use", Level::Warn, &["unused"]);
-pub const UNUSED_RESULTS: Lint = lint::lint("unused_results", Level::Allow, &[]);
-pub const PATH_STATEMENTS: Lint = lint::lint("path_statements", Level::Warn, &["unused"]);
-pub const DROPPING_REFERENCES: Lint = lint::lint("dropping_references", Level::Warn, &[]);
-pub const FORGETTING_REFERENCES: Lint = lint::lint("forgetting_references", Level::Warn, &[]);
-pub const DROPPING_COPY_TYPES: Lint = lint::lint("dropping_copy_types", Level::Warn, &[]);
-pub const FORGETTING_COPY_TYPES: Lint = lint::lint("forgetting_copy_types", Level::Warn, &[]);
-pub const UNDROPPED_MANUALLY_DROPS: Lint = lint::lint("undropped_manually_drops", Level::Deny, &[]);
-pub const INVALID_ATOMIC_ORDERING: Lint = lint::lint("invalid_atomic_ordering", Level::Deny, &[]);
-pub const LET_UNDERSCORE_DROP: Lint = lint::lint("let_underscore_drop", Level::Allow, &[]);
-pub const LET_UNDERSCORE_LOCK: Lint = lint::lint("let_underscore_lock", Level::Deny, &[]);
-pub const FOR_LOOPS_OVER_FALLIBLES: Lint = lint::lint("for_loops_over_fallibles", Level::Warn, &[]);
-pub const MAP_UNIT_FN: Lint = lint::lint("map_unit_fn", Level::Warn, &["unused"]);
-pub const UNUSED_ALLOCATION: Lint = lint::lint("unused_allocation", Level::Warn, &["unused"]);
-pub const DEPRECATED: Lint = lint::lint("deprecated", Level::Warn, &[]);
-pub const DEPRECATED_IN_FUTURE: Lint = lint::lint("deprecated_in_future", Level::Allow, &[]);
-pub const NOOP_METHOD_CALL: Lint = lint::lint("noop_method_call", Level::Warn, &[]);
-pub const SUSPICIOUS_DOUBLE_REF_OP: Lint = lint::lint("suspicious_double_ref_op", Level::Warn, &[]);
-pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr", Level::Deny, &[]);
-pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts", Level::Allow, &[]);
-pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts", Level::Allow, &[]);
+pub const UNUSED_MUST_USE: Lint = lint::lint("unused_must_use");
+pub const UNUSED_RESULTS: Lint = lint::lint("unused_results");
+pub const PATH_STATEMENTS: Lint = lint::lint("path_statements");
+pub const DROPPING_REFERENCES: Lint = lint::lint("dropping_references");
+pub const FORGETTING_REFERENCES: Lint = lint::lint("forgetting_references");
+pub const DROPPING_COPY_TYPES: Lint = lint::lint("dropping_copy_types");
+pub const FORGETTING_COPY_TYPES: Lint = lint::lint("forgetting_copy_types");
+pub const UNDROPPED_MANUALLY_DROPS: Lint = lint::lint("undropped_manually_drops");
+pub const INVALID_ATOMIC_ORDERING: Lint = lint::lint("invalid_atomic_ordering");
+pub const LET_UNDERSCORE_DROP: Lint = lint::lint("let_underscore_drop");
+pub const LET_UNDERSCORE_LOCK: Lint = lint::lint("let_underscore_lock");
+pub const FOR_LOOPS_OVER_FALLIBLES: Lint = lint::lint("for_loops_over_fallibles");
+pub const MAP_UNIT_FN: Lint = lint::lint("map_unit_fn");
+pub const UNUSED_ALLOCATION: Lint = lint::lint("unused_allocation");
+pub const DEPRECATED: Lint = lint::lint("deprecated");
+pub const DEPRECATED_IN_FUTURE: Lint = lint::lint("deprecated_in_future");
+pub const NOOP_METHOD_CALL: Lint = lint::lint("noop_method_call");
+pub const SUSPICIOUS_DOUBLE_REF_OP: Lint = lint::lint("suspicious_double_ref_op");
+pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr");
+pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts");
+pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts");
 
 /// Body-level passes over one typed body owner.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
@@ -971,8 +971,8 @@ impl<'a> Visitor<'a> for Late<'a> {
 // condition is known visits only the taken branch, and code after a diverging expression is not
 // visited. Locals with several assignments (`OnlyInsideOwnBlock`) are not propagated.
 
-pub const ARITHMETIC_OVERFLOW: Lint = lint::lint("arithmetic_overflow", Level::Deny, &[]);
-pub const UNCONDITIONAL_PANIC: Lint = lint::lint("unconditional_panic", Level::Deny, &[]);
+pub const ARITHMETIC_OVERFLOW: Lint = lint::lint("arithmetic_overflow");
+pub const UNCONDITIONAL_PANIC: Lint = lint::lint("unconditional_panic");
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum V {
@@ -1691,8 +1691,8 @@ fn known_panics(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>, 
 
 // ---------------------------------------------------------------- item-level passes
 
-pub const TEXT_DIRECTION_CODEPOINT_IN_COMMENT: Lint = lint::lint("text_direction_codepoint_in_comment", Level::Deny, &[]);
-pub const TEXT_DIRECTION_CODEPOINT_IN_LITERAL: Lint = lint::lint("text_direction_codepoint_in_literal", Level::Deny, &[]);
+pub const TEXT_DIRECTION_CODEPOINT_IN_COMMENT: Lint = lint::lint("text_direction_codepoint_in_comment");
+pub const TEXT_DIRECTION_CODEPOINT_IN_LITERAL: Lint = lint::lint("text_direction_codepoint_in_literal");
 
 /// Item-level passes over the definitions of the checked crates marked in `own`.
 pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
@@ -1761,8 +1761,8 @@ fn text_direction(prog: &Program, own: &[bool]) {
 // (`improper_ctypes`) and of `extern "C" fn` definitions (`improper_ctypes_definitions`), and of
 // the extern fn pointer types anywhere else.
 
-pub const IMPROPER_CTYPES: Lint = lint::lint("improper_ctypes", Level::Warn, &[]);
-pub const IMPROPER_CTYPES_DEFINITIONS: Lint = lint::lint("improper_ctypes_definitions", Level::Warn, &[]);
+pub const IMPROPER_CTYPES: Lint = lint::lint("improper_ctypes");
+pub const IMPROPER_CTYPES_DEFINITIONS: Lint = lint::lint("improper_ctypes_definitions");
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CItemKind { Declaration, Definition }

@@ -13,10 +13,10 @@ use crate::lint_table::{self, LevelK};
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use relax_session::sync::Mutex;
 
-pub const UNKNOWN_LINTS: Lint = lint::lint("unknown_lints", Level::Warn, &[]);
-pub const RENAMED_AND_REMOVED_LINTS: Lint = lint::lint("renamed_and_removed_lints", Level::Warn, &[]);
-pub const FORBIDDEN_LINT_GROUPS: Lint = lint::lint("forbidden_lint_groups", Level::Warn, &["future_incompatible"]);
-pub const UNFULFILLED_LINT_EXPECTATIONS: Lint = lint::lint("unfulfilled_lint_expectations", Level::Warn, &[]);
+pub const UNKNOWN_LINTS: Lint = lint::lint("unknown_lints");
+pub const RENAMED_AND_REMOVED_LINTS: Lint = lint::lint("renamed_and_removed_lints");
+pub const FORBIDDEN_LINT_GROUPS: Lint = lint::lint("forbidden_lint_groups");
+pub const UNFULFILLED_LINT_EXPECTATIONS: Lint = lint::lint("unfulfilled_lint_expectations");
 
 /// The lints the check reports completely: an expectation of one of them that never fires is
 /// unfulfilled. (Lints the check reports only in part are left out: it would call fulfilled

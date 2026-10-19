@@ -25,24 +25,58 @@ pub struct Lint {
     pub groups: &'static [&'static str],
 }
 
-pub const fn lint(name: &'static str, default: Level, groups: &'static [&'static str]) -> Lint {
-    Lint { name, default, default_2024: default, groups }
+const fn level_of(k: crate::lint_table::LevelK) -> Level {
+    match k {
+        crate::lint_table::LevelK::Allow => Level::Allow,
+        crate::lint_table::LevelK::Warn => Level::Warn,
+        crate::lint_table::LevelK::Deny => Level::Deny,
+        crate::lint_table::LevelK::Forbid => Level::Forbid,
+    }
 }
 
-pub const UNUSED_MUT: Lint = Lint { name: "unused_mut", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
-pub const OVERFLOWING_LITERALS: Lint = Lint { name: "overflowing_literals", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
-pub const UNUSED_UNSAFE: Lint = Lint { name: "unused_unsafe", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
-pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = Lint { name: "unsafe_op_in_unsafe_fn", default: Level::Allow, default_2024: Level::Warn, groups: &["rust_2024_compatibility"] };
-pub const STATIC_MUT_REFS: Lint = Lint { name: "static_mut_refs", default: Level::Warn, default_2024: Level::Deny, groups: &["rust_2024_compatibility"] };
-pub const UNREACHABLE_PATTERNS: Lint = Lint { name: "unreachable_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
-pub const IRREFUTABLE_LET_PATTERNS: Lint = Lint { name: "irrefutable_let_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &[] };
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() { return false; }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    true
+}
 
-pub const BINDINGS_WITH_VARIANT_NAME: Lint = Lint { name: "bindings_with_variant_name", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
-pub const LONG_RUNNING_CONST_EVAL: Lint = Lint { name: "long_running_const_eval", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
-pub const UNSAFE_CODE: Lint = Lint { name: "unsafe_code", default: Level::Allow, default_2024: Level::Allow, groups: &[] };
-pub const MISSING_UNSAFE_ON_EXTERN: Lint = Lint { name: "missing_unsafe_on_extern", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
-pub const DEPRECATED_SAFE_2024: Lint = Lint { name: "deprecated_safe_2024", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
-pub const UNSAFE_ATTR_OUTSIDE_UNSAFE: Lint = Lint { name: "unsafe_attr_outside_unsafe", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
+/// The lint `name` of the generated rustc table (lint_table.rs): its default level, its level
+/// from edition 2024 on and its groups are rustc's. A name the table lacks does not compile.
+pub const fn lint(name: &'static str) -> Lint {
+    let mut i = 0;
+    while i < crate::lint_table::LINTS.len() {
+        let l = &crate::lint_table::LINTS[i];
+        if same(l.0, name) {
+            let default = level_of(l.1);
+            let default_2024 = match l.2 {
+                Some((ed, k)) if ed <= 2024 => level_of(k),
+                _ => default,
+            };
+            return Lint { name, default, default_2024, groups: l.3 };
+        }
+        i += 1;
+    }
+    panic!("lint missing from lint_table.rs")
+}
+
+pub const UNUSED_MUT: Lint = lint("unused_mut");
+pub const OVERFLOWING_LITERALS: Lint = lint("overflowing_literals");
+pub const UNUSED_UNSAFE: Lint = lint("unused_unsafe");
+pub const UNSAFE_OP_IN_UNSAFE_FN: Lint = lint("unsafe_op_in_unsafe_fn");
+pub const STATIC_MUT_REFS: Lint = lint("static_mut_refs");
+pub const UNREACHABLE_PATTERNS: Lint = lint("unreachable_patterns");
+pub const IRREFUTABLE_LET_PATTERNS: Lint = lint("irrefutable_let_patterns");
+pub const BINDINGS_WITH_VARIANT_NAME: Lint = lint("bindings_with_variant_name");
+pub const LONG_RUNNING_CONST_EVAL: Lint = lint("long_running_const_eval");
+pub const UNSAFE_CODE: Lint = lint("unsafe_code");
+pub const MISSING_UNSAFE_ON_EXTERN: Lint = lint("missing_unsafe_on_extern");
+pub const DEPRECATED_SAFE_2024: Lint = lint("deprecated_safe_2024");
+pub const UNSAFE_ATTR_OUTSIDE_UNSAFE: Lint = lint("unsafe_attr_outside_unsafe");
 
 const LEVEL_ATTRS: &[(&[u8], Level, bool)] = &[
     (b"allow", Level::Allow, false), (b"expect", Level::Allow, true), (b"warn", Level::Warn, false),
@@ -295,6 +329,16 @@ pub fn emit(prog: &Program, def: DefId, lint: &Lint, file: u32, pos: u32, msg: &
     emit_in(prog, def, &[], lint, file, pos, msg)
 }
 
+/// A hard error of the check that is no lint (rustc's attribute parsing errors, `E0539` ..): no
+/// level applies to it.
+pub fn hard_error(prog: &Program, file: u32, pos: u32, msg: &str) {
+    if !enabled() { return; }
+    let (l, c) = prog.files[file as usize].line_col(pos);
+    let line = format!("{}:{}:{}: error: {}", prog.file_paths[file as usize], l, c, msg);
+    let _k = crate::zone_alloc::kept();
+    SINK.lock().unwrap_or_else(|e| e.into_inner()).push((Level::Deny, line));
+}
+
 /// `emit` under the attributes `inner` of a node inside `def`'s body.
 pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
     if !enabled() { return; }
@@ -433,12 +477,12 @@ pub fn attr_args(prog: &Program, file: u32, a: &Attr) -> Vec<String> {
 // ---------------------------------------------------------------- lint definitions
 // (rustc_lint_defs builtin.rs, rustc_lint: name, default level, groups; `warnings` applies to all)
 
-pub const NON_CAMEL_CASE_TYPES: Lint = lint("non_camel_case_types", Level::Warn, &["nonstandard_style"]);
-pub const NON_SNAKE_CASE: Lint = lint("non_snake_case", Level::Warn, &["nonstandard_style"]);
-pub const NON_UPPER_CASE_GLOBALS: Lint = lint("non_upper_case_globals", Level::Warn, &["nonstandard_style"]);
-pub const UNREACHABLE_CODE: Lint = lint("unreachable_code", Level::Warn, &["unused"]);
-pub const UNUSED_VARIABLES: Lint = lint("unused_variables", Level::Warn, &["unused"]);
-pub const UNUSED_ASSIGNMENTS: Lint = lint("unused_assignments", Level::Warn, &["unused"]);
+pub const NON_CAMEL_CASE_TYPES: Lint = lint("non_camel_case_types");
+pub const NON_SNAKE_CASE: Lint = lint("non_snake_case");
+pub const NON_UPPER_CASE_GLOBALS: Lint = lint("non_upper_case_globals");
+pub const UNREACHABLE_CODE: Lint = lint("unreachable_code");
+pub const UNUSED_VARIABLES: Lint = lint("unused_variables");
+pub const UNUSED_ASSIGNMENTS: Lint = lint("unused_assignments");
 
 /// The attributes of the statements, arms and blocks around the item `item` declared in the body
 /// of `owner` (outermost first), as rustc's lint level builder sees them.
