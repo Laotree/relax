@@ -929,7 +929,7 @@ impl Cx<'_> {
         }
         // rustc cast.rs: a raw-pointer to raw-pointer cast is never turned into a coercion, because the
         // pointee types may differ only in regions, which HIR typeck cannot see (borrowck must check them)
-        let ptr_to_ptr = matches!(tcx.tys.kind(adjusted), TyKind::Ptr(..)) && matches!(tcx.tys.kind(expr_ty), TyKind::Ptr(..));
+        let ptr_to_ptr = matches!(tcx.tys.kind(source_ty), TyKind::Ptr(..)) && matches!(tcx.tys.kind(expr_ty), TyKind::Ptr(..));
         let kind = if !ptr_to_ptr && (adjusted == expr_ty || tcx.tys.erase_regions(adjusted) == tcx.tys.erase_regions(expr_ty)) {
             // a coercion cast (or a no-op): the value converted by the coercion
             ExprKind::Use { source: mirrored }
