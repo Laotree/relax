@@ -934,8 +934,14 @@ fn resolve_path<'b, S: AsRef<str>>(r: &Res<'b>, k: &'b str, m: &'b str, path: &'
     } else if let Some(c) = s0.strip_prefix("__relax_crate_") {
         (r.crate_root(c), &path[1..])
     } else if s0.is_empty() {
-        // `::dep` (2018: the extern prelude)
-        (r.extern_crate(k, path.get(1)?.as_ref())?, &path[2.min(path.len())..])
+        // `::dep` (2018: the extern prelude); 2015: `::` is the crate root, `::m` its item `m`
+        match path.get(1) {
+            None => (r.crate_root(k), &path[1..]),
+            Some(n) => match r.extern_crate(k, n.as_ref()) {
+                Some(c) => (c, &path[2..]),
+                None => (r.crate_root(k), &path[1..]),
+            },
+        }
     } else {
         let first = match type_in(k, m, s0) {
             Some(x) => x,
@@ -1518,7 +1524,10 @@ impl ImportLookup<'_> {
             "crate" => (ids(r.crate_root(ks)), &path[1..]),
             "self" => ((k, m), &path[1..]),
             "super" => ((k, names.id(ms.rsplit_once("::")?.0)), &path[1..]),
-            "" => (ids(r.extern_crate(ks, names.str(*path.get(1)?))?), &path[2..]),
+            "" => match path.get(1).and_then(|&n| r.extern_crate(ks, names.str(n))) {
+                Some(c) => (ids(c), &path[2..]),
+                None => (ids(r.crate_root(ks)), &path[1..]),
+            },
             _ => {
                 let at = if let Some(defining) = first.strip_prefix("__relax_crate_") {
                     ids(r.crate_root(defining))

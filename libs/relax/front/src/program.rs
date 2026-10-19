@@ -3466,9 +3466,15 @@ impl Program {
         let edition = self.crates[self.mods[module as usize].krate as usize].edition;
         let my_crate = self.mods[module as usize].krate;
         if glob {
-            let target = match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
-                Some(t) => t,
-                None => return false,
+            // `use *;` / `use ::*;` (2015): the path is just the `{{root}}` segment, the crate root
+            // (rustc_resolve build_reduced_graph: an empty prefix imports the crate root)
+            let target = if segs.is_empty() && edition < 2018 {
+                self.mods[self.crates[my_crate as usize].root_mod as usize].def
+            } else {
+                match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
+                    Some(t) => t,
+                    None => return false,
+                }
             };
             // a proc-macro crate exports only macros: a glob over it brings in no items
             let tk = self.def(target).krate;
