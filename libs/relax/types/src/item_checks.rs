@@ -673,6 +673,64 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
     errors
 }
 
+/// rustc_attr_parsing: the argument shapes of `inline`, `must_use`, `deprecated`, `link_name` and
+/// `link_ordinal`. Some((token, code)): the token to blame and the code (E0539 malformed, E0538
+/// repeated key, E0565 literal where a key is expected, E0805 wrong number of arguments).
+fn attribute_args_error(p: crate::cfg::Src<'_>, lo: usize, hi: usize, name: &[u8]) -> Option<(usize, &'static str)> {
+    use crate::cfg::tok_str;
+    let t = |i: usize| if i < hi { tok_str(p, i) } else { b"" };
+    let is_str = |i: usize| { let s = t(i); s.starts_with(b"\"") || s.starts_with(b"r\"") || s.starts_with(b"r#") };
+    let is_int = |i: usize| t(i).first().is_some_and(|c| c.is_ascii_digit());
+    let is_word = |i: usize| t(i).first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
+    let n = lo + 1;
+    let list = t(n) == b"(" && hi >= n + 2 && t(hi - 1) == b")";
+    let mut entries: Vec<(usize, usize)> = Vec::new();
+    if list {
+        let (mut start, mut depth) = (n + 1, 0i32);
+        for i in n + 1..hi - 1 {
+            match t(i) {
+                b"(" | b"[" | b"{" => depth += 1,
+                b")" | b"]" | b"}" => depth -= 1,
+                b"," if depth == 0 => { entries.push((start, i)); start = i + 1; }
+                _ => {}
+            }
+        }
+        if start < hi - 1 { entries.push((start, hi - 1)); }
+    }
+    match name {
+        b"inline" if list => {
+            if entries.len() != 1 { return Some((lo, "E0805")); }
+            let (a, b) = entries[0];
+            if !(b == a + 1 && matches!(t(a), b"always" | b"never")) { return Some((a, "E0539")); }
+        }
+        b"must_use" if list => return Some((lo, "E0539")),
+        b"link_name" if list || t(n) != b"=" => return Some((lo, "E0539")),
+        b"link_ordinal" => {
+            if !list { return Some((lo, "E0539")); }
+            if entries.len() != 1 { return Some((lo, "E0805")); }
+            let (a, b) = entries[0];
+            if !(b == a + 1 && is_int(a)) { return Some((a, "E0539")); }
+        }
+        b"deprecated" => {
+            if t(n) == b"=" {
+                if !(hi == n + 2 && is_str(n + 1)) { return Some((n + 1, "E0539")); }
+            } else if list {
+                let mut seen: Vec<&[u8]> = Vec::new();
+                for &(a, b) in &entries {
+                    if b == a + 1 && is_str(a) { return Some((a, "E0565")); }
+                    let key = t(a);
+                    if !is_word(a) || !matches!(key, b"since" | b"note" | b"suggestion") { return Some((a, "E0539")); }
+                    if !(b == a + 3 && t(a + 1) == b"=" && is_str(a + 2)) { return Some((a, "E0539")); }
+                    if seen.contains(&key) { return Some((a, "E0538")); }
+                    seen.push(key);
+                }
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 /// rustc_attr_parsing `check_attribute_safety`, on the attributes of an item that survived cfg
 /// stripping. An unsafe builtin attribute (`no_mangle`, `export_name`, `link_section`; also
 /// `naked`, `force_target_feature`, `ffi_const`, `ffi_pure`) is written `unsafe(..)` (an error
@@ -708,6 +766,9 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
             continue;
         }
         if from_source {
+            if let Some(m) = attribute_args_error(p, lo, hi, &name) {
+                errors.push(prog.record_error(def.file, p.tok(m.0).lo, "typeck", format!("{}: malformed `{}` attribute input", m.1, String::from_utf8_lossy(&name))));
+            }
             if let Some(what) = attribute_target_error(prog, d, &name) {
                 errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`#[{}]` attribute cannot be used on {}", String::from_utf8_lossy(&name), what)));
             }
