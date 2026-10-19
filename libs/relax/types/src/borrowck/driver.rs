@@ -200,7 +200,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         let tc = p.typeck.as_mut().unwrap();
         let errors = std::mem::take(&mut tc.summary.errors);
         for bug in std::mem::take(&mut tc.summary.mir_bugs) {
-            v.unchecked.push(format!("{name}: MIR bug: {}", strip_ids(&bug.message)));
+            v.unchecked.push(format!("{name}: MIR bug: {}", render_ids(prog, tcx, &bug.message)));
         }
         let borrows = BorrowSet::build(tcx, &p.mir, false, &p.moves);
         let regions_stub = None::<()>;
@@ -263,16 +263,17 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
     }
 }
 
-/// A MIR-bug text without interned ids (`TyId(12)` -> `TyId`), so equal bugs group in the burn-down histogram.
-fn strip_ids(text: &str) -> String {
+/// A MIR-bug text with its interned type ids (`TyId(12)`) written out as types, so the unchecked
+/// histogram says which types the failing operation was about.
+fn render_ids(prog: &Program, tcx: &Tcx, text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(i) = rest.find("Id(") {
-        let (head, tail) = rest.split_at(i + 2);
-        out.push_str(head);
-        match tail.find(')') {
-            Some(j) if tail[1..j].bytes().all(|b| b.is_ascii_digit()) => rest = &tail[j + 1..],
-            _ => rest = tail,
+    while let Some(i) = rest.find("TyId(") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 5..];
+        match tail.find(')').and_then(|j| tail[..j].parse::<u32>().ok().map(|n| (j, n))) {
+            Some((j, n)) => { out.push_str(&crate::typeck::ty_to_string(false, prog, tcx, TyId(n))); rest = &tail[j + 1..]; }
+            None => { out.push_str("TyId("); rest = tail; }
         }
     }
     out.push_str(rest);

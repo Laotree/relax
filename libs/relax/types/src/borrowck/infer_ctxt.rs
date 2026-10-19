@@ -28,8 +28,6 @@ pub struct BorrowckInferCtxt<'tcx> {
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
     /// What location-aware type ops need of the body being checked, recorded by `observe_body`.
     pub mir_view: Option<MirView>,
-    /// The views of the bodies enclosing the promoted body being checked.
-    saved_views: Vec<Option<MirView>>,
     pub reg_var_to_origin: RefCell<HashMap<RegionVid, RegionCtxt>>,
 }
 
@@ -52,7 +50,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, saved_views: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()) }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -136,10 +134,22 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         let span = self.locations_span(locations);
         let before = self.infcx.universe();
         let input = op.input();
+        let input_dbg = input.clone();
         let result = super::type_check::canonical::fully_perform_op_raw(self,
             self.universal_regions.as_ref().expect("MIR type ops require universal regions"), &self.region_bound_pairs,
             &self.param_env.clauses, out, locations, span, category, op);
-        if result.is_err() { self.tainted_by_errors.set(true); }
+        if result.is_err() {
+            self.tainted_by_errors.set(true);
+            if std::env::var_os("MAKEPAD_RUN_NOSOLUTION_TRACE").is_some() {
+                let show = |t| crate::typeck::ty_to_string(false, self.prog, &self.tcx, t);
+                let what = match &input_dbg {
+                    crate::next_solver::type_op::TypeOpInput::Normalize(_, t) => format!("normalize {}", show(*t)),
+                    crate::next_solver::type_op::TypeOpInput::ProvePredicate(_, p) => format!("prove {:?}", p.kind),
+                    other => format!("{other:?}"),
+                };
+                eprintln!("NOSOLUTION {} @ {:?}: {what}", self.prog.def_path(self.root_def_id), span);
+            }
+        }
         if self.infcx.universe().0 > before.0 {
             let info = std::sync::Arc::new(super::type_check::TypeOpErrorInfo { base_universe: before, input });
             for u in before.0 + 1..=self.infcx.universe().0 { out.universe_causes.push((UniverseIndex(u), super::type_check::UniverseInfo::TypeOp(info.clone()))); }
@@ -200,12 +210,6 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
 }
 
 impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
-    fn enter_promoted(&mut self, promoted: &Body) {
-        let parent = self.mir_view.take();
-        self.saved_views.push(parent);
-        self.observe_body(promoted);
-    }
-    fn leave_promoted(&mut self) { self.mir_view = self.saved_views.pop().expect("leave_promoted without enter_promoted"); }
     fn universe(&self) -> UniverseIndex { self.infcx.universe() }
     fn create_next_universe(&mut self) -> UniverseIndex { self.infcx.create_next_universe() }
     fn next_nll_region_var(&mut self, origin: NllRegionVariableOrigin, universe: UniverseIndex) -> RegionId { self.infcx.next_nll_region_var_in_universe(origin, universe) }
