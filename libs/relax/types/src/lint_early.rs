@@ -31,6 +31,8 @@ pub const NO_MANGLE_GENERIC_ITEMS: Lint = lint::lint("no_mangle_generic_items", 
 pub const SPECIAL_MODULE_NAME: Lint = lint::lint("special_module_name", Level::Warn, &[]);
 pub const UNUSED_ATTRIBUTES: Lint = lint::lint("unused_attributes", Level::Warn, &["unused"]);
 pub const BARE_TRAIT_OBJECTS: Lint = lint::lint("bare_trait_objects", Level::Warn, &["rust_2018_idioms", "rust_2021_compatibility", "future_incompatible"]);
+pub const UNUSED_LIFETIMES: Lint = lint::lint("unused_lifetimes", Level::Allow, &[]);
+pub const SINGLE_USE_LIFETIMES: Lint = lint::lint("single_use_lifetimes", Level::Allow, &[]);
 pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities", Level::Warn, &["unused"]);
 
 /// Item-level passes over the definitions of the checked crates marked in `own`.
@@ -40,6 +42,7 @@ pub fn check_items(prog: &Program, _tcx: &Tcx, own: &[bool]) {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         attr_lints(prog, DefId(i as u32));
+        if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
         if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
             | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
             | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic) { continue; }
@@ -78,6 +81,36 @@ pub fn check_def(prog: &Program, def: DefId) {
 }
 
 // ---------------------------------------------------------------- item attributes
+
+/// `unused_lifetimes` / `single_use_lifetimes` (rustc_resolve late.rs `maybe_report_lifetime_uses`)
+/// of the lifetime parameters of one fn, impl block or foreign fn.
+fn lifetime_lints(prog: &Program, d: DefId) {
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    let item = *pf.ast.item(def.item);
+    // a lifetime is written with a quote; the code a derive writes is not the user's
+    if !pf.bytes(item.lo, item.hi).contains(&b'\'') || lint::external(prog, def.file, item.lo) { return; }
+    let mut w = W::new(prog, def.file, d);
+    w.lt = Some(LtCx { ribs: vec![LRib::Item], scopes: Vec::new(), next: 0 });
+    match def.kind {
+        DefKind::Fn | DefKind::ForeignFn => w.lt_fn(def.item),
+        DefKind::Impl => w.lt_impl(d, def.item),
+        DefKind::Trait => w.lt_trait(d, def.item),
+        // the types of the other items hold fn pointer types, binders of their own
+        DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static => {
+            let g = pf.ast.kind_generics(&item.kind).map(|g| g.params).unwrap_or(List::EMPTY);
+            w.lt_scope(g, false);
+            w.item(def.item, def.kind);
+            if let Ok(Some(e)) = prog.const_body(def.file, def.item) {
+                w.lt_rib(LRib::Fail);
+                w.expr(e);
+                w.lt_pop();
+            }
+            w.lt_end_scope();
+        }
+        _ => {}
+    }
+}
 
 /// The name an attribute sets: `no_mangle` of `#[no_mangle]` and of `#[unsafe(no_mangle)]`.
 fn attr_name(prog: &Program, file: u32, a: &Attr) -> Vec<u8> {
@@ -373,6 +406,37 @@ struct LabelScope {
     barrier: bool,
 }
 
+enum LRib {
+    /// a binder's generics (transparent)
+    Generics,
+    Item,
+    /// the anonymous lifetimes of a binder (a fn's parameters, an impl header, a fn pointer's)
+    Anon(u32),
+    /// elision failure, report-only and elided ribs: a named lifetime written here is not a
+    /// place an anonymous lifetime of the declaring binder could stand
+    Fail,
+    ImplTrait,
+}
+
+struct LtParam {
+    name: Vec<u8>,
+    pos: u32,
+    /// 0 unused, 1 used once (where an anonymous lifetime could stand), 2 otherwise
+    state: u8,
+}
+
+struct LtScope {
+    params: Vec<LtParam>,
+    linted: bool,
+    binder: u32,
+}
+
+struct LtCx {
+    ribs: Vec<LRib>,
+    scopes: Vec<LtScope>,
+    next: u32,
+}
+
 struct W<'a> {
     prog: &'a Program,
     pf: &'a ParsedFile,
@@ -390,6 +454,8 @@ struct W<'a> {
     cur: u32,
     /// inside `&a...b`: no further `...` warnings
     ellipsis_off: bool,
+    /// the lifetime use analysis (unused_lifetimes / single_use_lifetimes), when it runs
+    lt: Option<LtCx>,
 }
 
 fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
@@ -397,10 +463,12 @@ fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
 impl<'a> W<'a> {
     fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
         let pf: &'a ParsedFile = &prog.files[file as usize];
-        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false }
+        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None }
     }
 
     fn emit(&self, l: &Lint, pos: u32, msg: &str) {
+        // the lifetime analysis walks the same trees: the other lints are not its business
+        if self.lt.is_some() { return; }
         if lint::external(self.prog, self.file, pos) { return; }
         lint::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
     }
@@ -1218,7 +1286,11 @@ impl<'a> W<'a> {
         self.ty_pre(t, ty);
         match ty {
             Ty::Path(p) => self.path(&p),
-            Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Paren(x) => self.ty(x),
+            Ty::Ref(lt, _, x) => {
+                if let Some(l) = lt { self.lt_use(l); }
+                self.ty(x);
+            }
+            Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Paren(x) => self.ty(x),
             Ty::Array(x, e) => {
                 self.ty(x);
                 self.expr(e);
@@ -1226,11 +1298,23 @@ impl<'a> W<'a> {
             Ty::Tuple(l) => for &x in ast.list(l) { self.ty(x); },
             Ty::Fn(f) => {
                 let f = *ast.fn_ptr(f);
+                // a binder of its own: the parameters are its anonymous lifetimes
+                let binder = self.lt_scope(f.hrtb, true);
                 self.generic_params(f.hrtb);
+                self.lt_rib(LRib::Anon(binder));
                 for &x in ast.list(f.params) { self.ty(x); }
+                self.lt_rib(LRib::Fail);
                 if let Some(r) = f.ret { self.ty(r); }
+                self.lt_pop();
+                self.lt_pop();
+                self.lt_end_scope();
             }
-            Ty::ImplTrait(b) | Ty::DynTrait(b, _) => self.bounds(b),
+            Ty::ImplTrait(b) => {
+                self.lt_rib(LRib::ImplTrait);
+                self.bounds(b);
+                self.lt_pop();
+            }
+            Ty::DynTrait(b, _) => self.bounds(b),
             Ty::Never | Ty::Infer | Ty::Mac(_) | Ty::ImplicitSelf | Ty::CVarArgs => {}
         }
     }
@@ -1306,10 +1390,13 @@ impl<'a> W<'a> {
 
     fn bound(&mut self, b: &Bound) {
         match *b {
-            Bound::Lifetime(_) => {}
+            Bound::Lifetime(l) => self.lt_use(l),
             Bound::Trait { hrtb, path, .. } => {
+                // a poly trait ref is a binder (not one the lints report)
+                self.lt_scope(hrtb, false);
                 self.generic_params(hrtb);
                 self.path(&path);
+                self.lt_end_scope();
             }
             Bound::Use(_) => {}
         }
@@ -1333,7 +1420,7 @@ impl<'a> W<'a> {
             GenericArgs::Angle(l) => {
                 for a in ast.list(l) {
                     match *a {
-                        GenericArg::Lifetime(_) => {}
+                        GenericArg::Lifetime(l) => self.lt_use(l),
                         GenericArg::Type(t) => self.ty(t),
                         GenericArg::Const(e) => {
                             self.delims(false, e, Ctx::AnonConst, false);
@@ -1348,8 +1435,14 @@ impl<'a> W<'a> {
                 }
             }
             GenericArgs::Paren(tys, ret) => {
+                // `Fn(A) -> B`: the inputs are the anonymous lifetimes of a binder of the sugar
+                let binder = self.lt_fresh();
+                self.lt_rib(LRib::Anon(binder));
                 for &t in ast.list(tys) { self.ty(t); }
+                self.lt_pop();
+                self.lt_rib(LRib::Fail);
                 if let Some(r) = ret { self.ty(r); }
+                self.lt_pop();
             }
         }
     }
@@ -1359,7 +1452,7 @@ impl<'a> W<'a> {
         for p in ast.list(l) {
             self.enter(p.attrs);
             match p.kind {
-                GenericParamKind::Lifetime(_) => {}
+                GenericParamKind::Lifetime(bounds) => for &l in ast.list(bounds) { self.lt_use(l); },
                 GenericParamKind::Type(b, d) => {
                     self.bounds(b);
                     if let Some(t) = d { self.ty(t); }
@@ -1380,13 +1473,185 @@ impl<'a> W<'a> {
             match *w {
                 WherePred::Bound { hrtb, ty, bounds } => {
                     if matches!(*ast.ty(ty), Ty::Paren(_)) && ast.list(hrtb).is_empty() { self.self_ty_parens = true; }
+                    self.lt_scope(hrtb, true);
                     self.generic_params(hrtb);
                     self.ty(ty);
                     self.bounds(bounds);
+                    self.lt_end_scope();
                 }
-                WherePred::Lifetime(..) => {}
+                WherePred::Lifetime(l, bounds) => {
+                    self.lt_use(l);
+                    for &b in ast.list(bounds) { self.lt_use(b); }
+                }
             }
         }
+    }
+
+    // ------------------------------------------------------------ lifetime uses
+
+    fn lt_fresh(&mut self) -> u32 {
+        match self.lt.as_mut() {
+            Some(c) => { c.next += 1; c.next }
+            None => 0,
+        }
+    }
+
+    fn lt_rib(&mut self, r: LRib) { if let Some(c) = self.lt.as_mut() { c.ribs.push(r); } }
+    fn lt_pop(&mut self) { if let Some(c) = self.lt.as_mut() { c.ribs.pop(); } }
+
+    /// Opens a binder declaring the lifetime parameters of `params`: its scope and its generics
+    /// rib. Returns the binder.
+    fn lt_scope(&mut self, params: List<GenericParam>, linted: bool) -> u32 {
+        if self.lt.is_none() { return 0; }
+        let binder = self.lt_fresh();
+        let ast = self.ast;
+        let mut ps = Vec::new();
+        for p in ast.list(params) {
+            if let GenericParamKind::Lifetime(_) = p.kind {
+                ps.push(LtParam { name: self.pf.bytes(p.name.lo, p.name.hi).to_vec(), pos: p.name.lo, state: 0 });
+            }
+        }
+        let c = self.lt.as_mut().unwrap();
+        c.scopes.push(LtScope { params: ps, linted, binder });
+        c.ribs.push(LRib::Generics);
+        binder
+    }
+
+    /// Closes the innermost binder's scope: its unused and single-use parameters are reported.
+    /// (Its generics rib is popped here too.)
+    fn lt_end_scope(&mut self) {
+        let Some(c) = self.lt.as_mut() else { return };
+        c.ribs.pop();
+        let Some(scope) = c.scopes.pop() else { return };
+        if !scope.linted { return; }
+        for p in scope.params {
+            let name = String::from_utf8_lossy(&p.name).into_owned();
+            match p.state {
+                0 => {
+                    // a parameter written by a macro cannot be removed: no report
+                    if self.pf.expansion_kind(p.pos) == ExpnKind::Root {
+                        lint::emit_in(self.prog, self.def, &self.stack, &UNUSED_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` never used", name));
+                    }
+                }
+                1 => {
+                    if !lint::external(self.prog, self.file, p.pos) {
+                        lint::emit_in(self.prog, self.def, &self.stack, &SINGLE_USE_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` only used once", name));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// rustc_resolve `resolve_lifetime`: a use of a named lifetime. The first use of a parameter
+    /// is a single use when the innermost rib that decides says an anonymous lifetime could stand
+    /// in its place (the parameters of the fn / impl / fn pointer type that declares it); any
+    /// other use makes it used many times.
+    fn lt_use(&mut self, id: Ident) {
+        let Some(c) = self.lt.as_mut() else { return };
+        let name = self.pf.bytes(id.lo, id.hi);
+        let Some(si) = c.scopes.iter().rposition(|s| s.params.iter().any(|p| p.name == name)) else { return };
+        let binder = c.scopes[si].binder;
+        let pj = c.scopes[si].params.iter().position(|p| p.name == name).unwrap();
+        if c.scopes[si].params[pj].state != 0 {
+            c.scopes[si].params[pj].state = 2;
+            return;
+        }
+        let mut state = 2;
+        for r in c.ribs.iter().rev() {
+            match r {
+                LRib::Generics => continue,
+                LRib::Anon(b) => { state = if *b == binder { 1 } else { 2 }; break; }
+                LRib::Item | LRib::Fail | LRib::ImplTrait => { state = 2; break; }
+            }
+        }
+        c.scopes[si].params[pj].state = state;
+    }
+
+    /// The lifetime analysis of one fn: its generics, signature and body.
+    fn lt_fn(&mut self, id: ItemId) {
+        let ast = self.ast;
+        let item = *ast.item(id);
+        let ItemKind::Fn(sig_id, _, _) = item.kind else { return };
+        let sig = *ast.fn_sig(sig_id);
+        let binder = self.lt_scope(sig.generics.params, true);
+        self.generics(sig.generics);
+        self.lt_rib(LRib::Anon(binder));
+        if let Some(sp) = sig.self_param {
+            match sp {
+                SelfParam::Ref(Some(l), _) => self.lt_use(l),
+                SelfParam::Typed(_, t) => self.ty(t),
+                _ => {}
+            }
+        }
+        for p in ast.list(sig.params) {
+            self.pat(p.pat, item.lo);
+            self.ty(p.ty);
+        }
+        self.lt_rib(LRib::Fail);
+        if let Some(r) = sig.ret { self.ty(r); }
+        self.lt_pop();
+        self.lt_pop();
+        // the body: lifetimes written in it are used many times
+        self.lt_rib(LRib::Fail);
+        if let Ok(Some(b)) = self.prog.fn_body(self.file, id) { self.block(b); }
+        self.lt_pop();
+        self.lt_end_scope();
+    }
+
+    /// The lifetime analysis of an impl block: its header, generics and associated items.
+    fn lt_impl(&mut self, d: DefId, id: ItemId) {
+        let ast = self.ast;
+        let ItemKind::Impl(r) = ast.item(id).kind else { return };
+        let i = *ast.row(r);
+        let binder = self.lt_scope(i.generics.params, true);
+        self.lt_rib(LRib::Anon(binder));
+        if let Some(p) = i.trait_ { self.path(&p); }
+        self.ty(i.self_ty);
+        self.generics(i.generics);
+        let outer = self.def;
+        for &it in ast.list(i.items) {
+            let child = (0..self.prog.defs.len()).map(|k| DefId(k as u32)).find(|&k| { let c = self.prog.def(k); c.parent == d && c.file == self.file && c.item == it });
+            if let Some(c) = child { self.def = c; }
+            match ast.item(it).kind {
+                ItemKind::Fn(..) => self.lt_fn(it),
+                ItemKind::Const(t, _) => {
+                    self.lt_rib(LRib::Fail);
+                    if let Some(t) = t.get() { self.ty(t); }
+                    if let Ok(Some(e)) = self.prog.const_body(self.file, it) { self.expr(e); }
+                    self.lt_pop();
+                }
+                ItemKind::TypeAlias(tr) => {
+                    self.lt_rib(LRib::Fail);
+                    let a = *ast.row(tr);
+                    self.generics(a.generics);
+                    if let Some(t) = a.ty { self.ty(t); }
+                    self.lt_pop();
+                }
+                _ => {}
+            }
+            self.def = outer;
+        }
+        self.lt_pop();
+        self.lt_end_scope();
+    }
+
+    /// The lifetime analysis of a trait: its methods (the trait's own lifetimes are no
+    /// business of the lints).
+    fn lt_trait(&mut self, d: DefId, id: ItemId) {
+        let ast = self.ast;
+        let ItemKind::Trait(r) = ast.item(id).kind else { return };
+        let t = *ast.row(r);
+        self.lt_scope(t.generics.params, false);
+        let outer = self.def;
+        for &it in ast.list(t.items) {
+            if !matches!(ast.item(it).kind, ItemKind::Fn(..)) { continue; }
+            let child = (0..self.prog.defs.len()).map(|k| DefId(k as u32)).find(|&k| { let c = self.prog.def(k); c.parent == d && c.file == self.file && c.item == it });
+            if let Some(c) = child { self.def = c; }
+            self.lt_fn(it);
+            self.def = outer;
+        }
+        self.lt_end_scope();
     }
 
     // ------------------------------------------------------------ items
