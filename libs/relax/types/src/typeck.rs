@@ -3804,6 +3804,12 @@ impl<'a> Fcx<'a> {
     /// One autoderef step from `t`: built-in for references and raw pointers, through
     /// `Deref` for other types. Records overloaded steps under (expr, step).
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
+        // rustc autoderef.rs: the recursion limit ends the walk with E0055
+        if step >= 128 && e != u32::MAX - 1 {
+            let ts = self.ty_str(t);
+            self.err(self.last_lo, format!("E0055: reached the recursion limit while auto-dereferencing `{}`", ts));
+            return None;
+        }
         let t = self.shallow(t);
         match self.tcx.tys.kind(t).clone() {
             TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow(i)),
