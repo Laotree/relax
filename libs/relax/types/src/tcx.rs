@@ -2494,6 +2494,9 @@ impl Tcx {
                     args = filled;
                 }
             }
+            // an argument list of the wrong length is E0107 / E0393; the object type still
+            // carries one argument per declared parameter (error for the missing, none extra)
+            args.resize(n, self.tys.error);
             let bound = u16::try_from(bound).expect("dyn principal bound-region count");
             return self.tys.intern(TyKind::Dyn(td, self.tys.mk_list(&args), self.tys.mk_list(&binds), regions, region, bound, self.tys.mk_list(&autos)));
         }
@@ -2536,9 +2539,12 @@ impl Tcx {
                         let mut args = vec![self_t];
                         args.extend(self.fill_trait_defaults(cx, prog, td, self_t, explicit));
                         let tr = if prog.def(ad).parent == td { tr } else { RegionArgsId::EMPTY };
-                        let own = self.lower_region_args(cx.infcx, prog, file, module, env, p);
+                        let mut own_regions = self.written_lifetimes(cx.infcx, prog, file, env, p);
+                        let mut own_args = self.lower_generic_args_of_item(cx, prog, file, module, env, p, Some(ad));
+                        self.fit_assoc_own_args(prog, ad, &mut own_args, &mut own_regions);
+                        args.extend(own_args);
                         let mut rs = self.tys.region_args(tr).to_vec();
-                        rs.extend_from_slice(&self.tys.region_args(own));
+                        rs.extend(own_regions);
                         return self.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&rs) }));
                     }
                 }
@@ -2718,7 +2724,8 @@ impl Tcx {
         }
         // no args at all: in a type, `Foo` with `struct Foo<A = (isize, char)>` is
         // `Foo<(isize, char)>` when every param has a default (else the args are inferred)
-        if args.is_empty() && !params.iter().all(|p| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)))) {
+        // (item signatures have nothing to infer from: a missing list is E0107 there, error arguments)
+        if args.is_empty() && cx.infcx.is_some() && !params.iter().all(|p| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)))) {
             return;
         }
         let mut env = self.item_env(prog, d);
@@ -2836,8 +2843,59 @@ impl Tcx {
         t
     }
 
+    /// The (type/const, lifetime) parameters a path's last segment can name for the type-like item
+    /// `d` it resolves to; `None` for items whose last segment is not this item's own arguments
+    /// (variants, functions, modules ...).
+    pub(crate) fn own_param_counts(&self, prog: &Program, d: DefId) -> Option<(usize, usize)> {
+        let def = prog.def(d);
+        if !matches!(def.kind, DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Trait | DefKind::AssocTy) { return None; }
+        let ast = &prog.files[def.file as usize].ast;
+        let generics = ast.kind_generics(&ast.item(def.item).kind)?;
+        let lifetimes = ast.list(generics.params).iter().filter(|p| matches!(p.kind, GenericParamKind::Lifetime(_))).count();
+        Some((ast.list(generics.params).len() - lifetimes, lifetimes))
+    }
+
+    /// An associated type path's own arguments are exactly the declared parameters of the
+    /// associated type (hir_ty_lowering/generics.rs: missing ones are error terms, extra ones
+    /// are dropped; E0107 reports either).
+    pub(crate) fn fit_assoc_own_args(&self, prog: &Program, ad: DefId, args: &mut Vec<TyId>, regions: &mut Vec<RegionId>) {
+        let def = prog.def(ad);
+        let ast = &prog.files[def.file as usize].ast;
+        let Some(generics) = ast.kind_generics(&ast.item(def.item).kind) else { return; };
+        let params = ast.list(generics.params);
+        let lifetimes = params.iter().filter(|p| matches!(p.kind, GenericParamKind::Lifetime(_))).count();
+        regions.resize(lifetimes, self.tys.intern_region(RegionKind::ReError));
+        let mut own = params.iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_)));
+        let mut fitted = Vec::new();
+        for _ in 0..params.len() - lifetimes {
+            let param = own.next().unwrap();
+            fitted.push(match args.get(fitted.len()) {
+                Some(&t) => t,
+                None if matches!(param.kind, GenericParamKind::Const(..)) => self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))),
+                None => self.tys.error,
+            });
+        }
+        *args = fitted;
+    }
+
     pub fn lower_generic_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path) -> Vec<TyId> {
-        let declaration = self.resolve_type_path_def(prog, file, module, p).map(|d| (d, self.declaration_env(prog, d)));
+        self.lower_generic_args_of_item(cx, prog, file, module, env, p, self.resolve_type_path_def(prog, file, module, p))
+    }
+
+    /// The compact arguments a declaration's own parameters follow: `Self` and the trait's
+    /// parameters for a trait or one of its associated types.
+    fn inherited_arg_count(&self, prog: &Program, d: DefId) -> usize {
+        match prog.def(d).kind {
+            DefKind::Trait => 1,
+            DefKind::AssocTy => 1 + self.trait_generic_count(prog, prog.def(d).parent),
+            _ => 0,
+        }
+    }
+
+    /// `lower_generic_args` for a path whose last segment's arguments belong to `item` (a path
+    /// with a qualified self type resolves to nothing by itself).
+    pub(crate) fn lower_generic_args_of_item(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path, item: Option<DefId>) -> Vec<TyId> {
+        let declaration = item.map(|d| (d, self.declaration_env(prog, d)));
         let mut out = Vec::new();
         let ast = &prog.files[file as usize].ast;
         if let Some(last) = ast.segs(p.segs).last() {
@@ -2858,7 +2916,7 @@ impl Tcx {
             }
             if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args()) {
                 for g in ast.list(*v) {
-                    let index = out.len() + usize::from(declaration.as_ref().is_some_and(|(d, _)| prog.def(*d).kind == DefKind::Trait));
+                    let index = out.len() + declaration.as_ref().map_or(0, |(d, _)| self.inherited_arg_count(prog, *d));
                     match g {
                         GenericArg::Type(t) => {
                             // `Foo<(_)>`: parentheses do not change what the argument is
@@ -2917,6 +2975,10 @@ impl Tcx {
                 }
             }
         }
+        // hir_ty_lowering/mod.rs lower_generic_args_of_path: arguments beyond the declared
+        // parameters are not lowered (E0107 reports them); the lowered list never exceeds the
+        // declaration.
+        if let Some((count, _)) = declaration.as_ref().and_then(|(d, _)| self.own_param_counts(prog, *d)) { out.truncate(count); }
         out
     }
 
@@ -3299,9 +3361,12 @@ impl Tcx {
             if !self.check_assoc_ty_args(cx, prog, file, def_id, path, source_ty.is_none()) { return self.tys.error; }
         }
         let mut args = self.tys.list(alias.args).to_vec();
-        args.extend(self.lower_generic_args(cx, prog, file, module, env, path));
+        let mut own_regions = self.written_lifetimes(cx.infcx, prog, file, env, path);
+        let mut own_args = self.lower_generic_args_of_item(cx, prog, file, module, env, path, Some(alias.kind.def_id()));
+        self.fit_assoc_own_args(prog, alias.kind.def_id(), &mut own_args, &mut own_regions);
+        args.extend(own_args);
         let mut regions = self.tys.region_args(alias.regions).to_vec();
-        regions.extend_from_slice(&self.tys.region_args(self.lower_region_args(cx.infcx, prog, file, module, env, path)));
+        regions.extend(own_regions);
         self.tys.intern(TyKind::Alias(*rigid, AliasTy { kind: alias.kind, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&regions) }))
     }
 
@@ -3830,7 +3895,7 @@ fn collect_argument_impl_traits(ast: &ast::Ast, t: ast::TyId, out: &mut Vec<ast:
 }
 
 /// rustc's DefKind::descr for the kinds a type path can wrongly name (E0573).
-fn def_kind_descr(k: DefKind) -> &'static str {
+pub(crate) fn def_kind_descr(k: DefKind) -> &'static str {
     match k {
         DefKind::Struct => "struct", DefKind::Enum => "enum", DefKind::Union => "union", DefKind::TypeAlias => "type alias",
         DefKind::Trait => "trait", DefKind::AssocTy => "associated type", DefKind::Prim(_) => "builtin type",

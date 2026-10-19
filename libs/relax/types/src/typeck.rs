@@ -2934,6 +2934,13 @@ impl<'a> Fcx<'a> {
             }
         }
         let (r, _) = self.resolve_value_path(path, u32::MAX, false);
+        // rustc_resolve E0574: only a struct, variant or union names a struct literal / pattern
+        if let Res::Def(d) = r {
+            if !matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Union | DefKind::Variant) {
+                self.err(path.lo, format!("E0574: expected struct, variant or union type, found {} `{}`", crate::tcx::def_kind_descr(self.prog.def(d).kind), crate::tcx::path_str(prog, self.file, path)));
+                return Res::Err;
+            }
+        }
         r
     }
 
@@ -2995,7 +3002,10 @@ impl<'a> Fcx<'a> {
             DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic => {
                 let t = self.tcx.const_ty(self.prog, d).unwrap_or(self.tcx.tys.error);
                 match explicit {
-                    Some(v) => {
+                    Some(mut v) => {
+                        let expected = self.tcx.generic_indices_of(self.prog, d).types_consts.len();
+                        v.truncate(expected);
+                        for _ in v.len()..expected { v.push(self.fresh_arg(d, v.len())); }
                         // the args pick the impl of a trait's const at evaluation (`T::ZERO`)
                         self.b.res_args.insert(key, self.tcx.tys.mk_list(&v));
                         // typeck-audit 1.9 / fn_ctxt/_impl.rs:1293-1301: every value path
@@ -3034,8 +3044,12 @@ impl<'a> Fcx<'a> {
                         // their defaults (`Uwu::<N>` for `Uwu<const N: u32 = 1, const M: u32 = N>`)
                         if args.len() < adt.n_generics as usize {
                             let cx = self.cx.with_infcx(&self.infcx);
-                            self.tcx.fill_type_defaults(&cx, self.prog, adt_def, &mut args, Some(regions));
+                            let _ = self.tcx.fill_type_defaults(&cx, self.prog, adt_def, &mut args, Some(regions));
                         }
+                        // a written list of the wrong length is E0107 (item checks); the ADT still
+                        // takes exactly its declared parameters
+                        args.truncate(adt.n_generics as usize);
+                        for _ in args.len()..adt.n_generics as usize { args.push(self.fresh_arg(d, args.len())); }
                     }
                     None => {
                         for _ in 0..adt.n_generics {
