@@ -25,6 +25,10 @@ pub struct Lint {
     pub groups: &'static [&'static str],
 }
 
+const fn lint(name: &'static str, default: Level, groups: &'static [&'static str]) -> Lint {
+    Lint { name, default, default_2024: default, groups }
+}
+
 pub const UNUSED_MUT: Lint = Lint { name: "unused_mut", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
 pub const OVERFLOWING_LITERALS: Lint = Lint { name: "overflowing_literals", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
 pub const UNUSED_UNSAFE: Lint = Lint { name: "unused_unsafe", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
@@ -119,6 +123,15 @@ fn level_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Level {
     let mut warnings: Option<Level> = None;
     let mut forbidden = false;
     let mut forbid_warnings = false;
+    // the command line's levels (`-A unused`, `-D warnings`) come below every attribute
+    for (l, n) in cmdline_levels() {
+        if n == lint.name || lint.groups.contains(&n.as_str()) {
+            if !forbidden { level = *l; forbidden = *l == Level::Forbid; }
+        } else if n == "warnings" && !forbid_warnings {
+            warnings = Some(*l);
+            forbid_warnings = *l == Level::Forbid;
+        }
+    }
     for (file, attrs) in scopes.iter().rev() {
         for a in attrs {
             let Some((l, names)) = level_attr(prog, *file, a) else { continue };
@@ -136,6 +149,35 @@ fn level_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Level {
         (Level::Warn, Some(w)) => w,
         (l, _) => l,
     }
+}
+
+/// The lint levels of the command line, from `MAKEPAD_RUN_LINT_FLAGS` (rustc's `-A/-W/-D/-F`
+/// flags, e.g. `-A unused -D warnings`), in order. The UI test harness passes `-A unused`, as
+/// rustc's compiletest does.
+fn cmdline_levels() -> &'static [(Level, String)] {
+    static FLAGS: std::sync::OnceLock<Vec<(Level, String)>> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let Ok(v) = std::env::var("MAKEPAD_RUN_LINT_FLAGS") else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut it = v.split_whitespace();
+        while let Some(w) = it.next() {
+            let (level, rest) = match w {
+                "-A" | "--allow" => (Level::Allow, None),
+                "-W" | "--warn" => (Level::Warn, None),
+                "-D" | "--deny" => (Level::Deny, None),
+                "-F" | "--forbid" => (Level::Forbid, None),
+                _ if w.starts_with("-A") => (Level::Allow, Some(&w[2..])),
+                _ if w.starts_with("-W") => (Level::Warn, Some(&w[2..])),
+                _ if w.starts_with("-D") => (Level::Deny, Some(&w[2..])),
+                _ if w.starts_with("-F") => (Level::Forbid, Some(&w[2..])),
+                _ => continue,
+            };
+            if let Some(name) = rest.map(str::to_string).or_else(|| it.next().map(str::to_string)) {
+                out.push((level, name));
+            }
+        }
+        out
+    })
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -232,3 +274,55 @@ pub fn check_literals(prog: &Program, tcx: &crate::tcx::Tcx, body: &crate::typec
         }
     }
 }
+
+// ---------------------------------------------------------------- shared helpers
+
+/// Whether the code at `pos` is expanded from a macro of another crate, a built-in macro or a
+/// derive: rustc does not report lints there (`Span::in_external_macro`).
+pub fn external(prog: &Program, file: u32, pos: u32) -> bool {
+    matches!(prog.files[file as usize].expansion_kind(pos), crate::parser::ExpnKind::ExternalRules | crate::parser::ExpnKind::Builtin)
+}
+
+/// The attribute list's leading path (`allow`, `repr`, `doc`, `rustfmt::skip`) as bytes.
+pub fn attr_path(prog: &Program, file: u32, a: &Attr) -> Vec<u8> {
+    let p = prog.src(file);
+    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+    let mut name: Vec<u8> = Vec::new();
+    let mut i = lo;
+    while i < hi && !matches!(crate::cfg::tok_str(p, i), b"(" | b"=" | b"[" | b"{") {
+        name.extend_from_slice(crate::cfg::tok_str(p, i));
+        i += 1;
+    }
+    name
+}
+
+/// Whether one of `attrs` is the attribute `name` (a plain path).
+pub fn has_attr(prog: &Program, file: u32, attrs: &[Attr], name: &str) -> bool {
+    attrs.iter().any(|a| attr_path(prog, file, a) == name.as_bytes())
+}
+
+/// The words inside an attribute's parentheses (`repr(C, packed)`: `C`, `packed`), flat.
+pub fn attr_args(prog: &Program, file: u32, a: &Attr) -> Vec<String> {
+    let p = prog.src(file);
+    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+    let mut out = Vec::new();
+    let mut i = lo;
+    while i < hi && crate::cfg::tok_str(p, i) != b"(" { i += 1; }
+    i += 1;
+    while i < hi {
+        let t = crate::cfg::tok_str(p, i);
+        if !matches!(t, b"," | b")" | b"(") { out.push(String::from_utf8_lossy(t).into_owned()); }
+        i += 1;
+    }
+    out
+}
+
+// ---------------------------------------------------------------- lint definitions
+// (rustc_lint_defs builtin.rs, rustc_lint: name, default level, groups; `warnings` applies to all)
+
+pub const NON_CAMEL_CASE_TYPES: Lint = lint("non_camel_case_types", Level::Warn, &["nonstandard_style"]);
+pub const NON_SNAKE_CASE: Lint = lint("non_snake_case", Level::Warn, &["nonstandard_style"]);
+pub const NON_UPPER_CASE_GLOBALS: Lint = lint("non_upper_case_globals", Level::Warn, &["nonstandard_style"]);
+pub const UNREACHABLE_CODE: Lint = lint("unreachable_code", Level::Warn, &["unused"]);
+pub const UNUSED_VARIABLES: Lint = lint("unused_variables", Level::Warn, &["unused"]);
+pub const UNUSED_ASSIGNMENTS: Lint = lint("unused_assignments", Level::Warn, &["unused"]);

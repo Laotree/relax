@@ -126,6 +126,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
+    relax_types::lint_pass::check_items(&u.prog, &u.tcx, &own);
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
@@ -193,6 +194,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
                 return (body.errors.to_vec(), Vec::new());
             }
             relax_types::lint::check_literals(prog, tcx, &body);
+            relax_types::lint_pass::check_body(prog, tcx, &body);
             let unsafety = relax_types::unsafety::check_body(prog, tcx, &body);
             if !unsafety.is_empty() {
                 return (unsafety, Vec::new());
