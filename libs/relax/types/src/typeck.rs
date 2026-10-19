@@ -23,6 +23,7 @@ mod writeback;
 mod opaque_types;
 mod call;
 mod checks;
+mod cast;
 mod instantiate;
 mod side_table;
 pub use side_table::{BitSet, SideTable, ThinVec};
@@ -465,6 +466,8 @@ pub struct Fcx<'a> {
     deferred_dyn: Vec<(ExprId, TyId, TyId, u32)>,
     /// Reference-to-pointer casts and casts whose target pointee was open.
     deferred_casts: Vec<(ExprId, TyId, TyId)>,
+    /// every `e as T` (cast expression's position), validated after fallback (cast.rs)
+    cast_checks: Vec<(ExprId, TyId, TyId, u32)>,
     /// inference variables a `!` value was coerced to (rustc diverging type variables): left
     /// unconstrained, they fall back to `()` (`!` from edition 2024) at the end
     diverging: Vec<TyId>,
@@ -670,6 +673,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         diverging: Vec::new(),
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),
+        cast_checks: Vec::new(),
         bind_mode: 0,
         pat_path_pre: None,
         extra_arg: None,
@@ -1835,10 +1839,12 @@ impl<'a> Fcx<'a> {
                         } else { self.rollback_to(snapshot); }
                     }
                 }
-                if !array_cast { self.err(self.ast().expr(x).lo, "E0606: casting reference to an incompatible pointer is invalid".into()); }
+                // (a reference that is no array pointer cast: the cast check's E0606)
+                let _ = array_cast;
             }
             self.record_cast_borrow(x, xt, target);
         }
+        for (x, xt, target, lo) in std::mem::take(&mut self.cast_checks) { self.check_cast_final(x, xt, target, lo); }
         // pending pointer-to-dyn coercions, now that their pointees are known
         for (ex, a, x, pos) in std::mem::take(&mut self.deferred_dyn) {
             self.finish_dyn_coercion(ex, a, x, pos);
@@ -2744,9 +2750,6 @@ impl<'a> Fcx<'a> {
                 let parent_lifetimes = if def.kind == DefKind::AssocFn { self.tcx.generic_indices_of(self.prog, parent).lifetimes.len() } else { 0 };
                 let own = indices.lifetimes.len() - parent_lifetimes;
                 let late_bound = self.tcx.fn_item_sig(self.prog, d).map_or(0, |s| s.bound_regions) > 0;
-                if !written.is_empty() && !late_bound && written.len() != own {
-                    self.err(self.last_lo, format!("E0107: function takes {} lifetime argument{} but {} lifetime argument{} supplied", own, if own == 1 { "" } else { "s" }, written.len(), if written.len() == 1 { " was" } else { "s were" }));
-                }
                 let use_written = !written.is_empty() && !late_bound && written.len() == own;
                 let parent_regions = parent_regions;
                 let mut regions = Vec::new();
@@ -3721,9 +3724,39 @@ impl<'a> Fcx<'a> {
         self.seg_args(path, n - 1, def, offset)
     }
 
+    /// hir_ty_lowering check_generic_arg_count of a written segment against `def`'s own generics.
+    /// False (reported) when the number of arguments is wrong.
+    fn check_seg_arg_count(&mut self, args: GenericArgsId, def: DefId, lo: u32, is_method_call: bool) -> bool {
+        use crate::tcx::arg_count::ArgPosition;
+        let prog = self.prog;
+        let mut def = def;
+        let mut kind = prog.def(def).kind;
+        if kind == DefKind::Variant { def = prog.def(def).parent; kind = prog.def(def).kind; }
+        let (pos, early, late_bound) = match kind {
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
+                let indices = self.tcx.generic_indices_of(prog, def);
+                let parent = prog.def(def).parent;
+                let parent_lifetimes = if kind == DefKind::AssocFn { self.tcx.generic_indices_of(prog, parent).lifetimes.len() } else { 0 };
+                let own = indices.lifetimes.len() - parent_lifetimes;
+                let late = self.tcx.fn_item_sig(prog, def).map_or(0, |s| s.bound_regions) > 0;
+                (ArgPosition::Value, Some(own), late)
+            }
+            DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::Trait => (ArgPosition::Type, None, false),
+            _ => return true,
+        };
+        let ast = self.ast();
+        let counts = self.tcx.own_generic_counts(prog, def, early);
+        let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
+        let _ = is_method_call;
+        for e in &errs { self.err(lo, e.clone()); }
+        errs.is_empty()
+    }
+
     fn seg_args(&mut self, path: &Path, i: usize, def: DefId, offset: usize) -> Option<Vec<TyId>> {
         let seg = self.ast().segs(path.segs).get(i)?;
         let a = self.ast().gargs(seg.args())?;
+        let (args_id, lo) = (seg.args(), seg.name.lo);
+        if !self.check_seg_arg_count(args_id, def, lo, false) { return None; }
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
             for g in self.ast().list(*v) {
@@ -4123,6 +4156,7 @@ impl<'a> Fcx<'a> {
                 let target = self.lower_ty(*t);
                 let st = self.shallow(target);
                 let xt = self.check_expr(*x, None);
+                self.cast_checks.push((*x, xt, target, lo));
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);
                 let (kx, kt) = (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone());
@@ -4160,11 +4194,13 @@ impl<'a> Fcx<'a> {
                     // `Arc<dyn Send + Sync>` is the unsizing coercion
                     self.deferred_casts.push((*x, xt, target));
                 } else if matches!(kt, TyKind::FnPtr(..)) && matches!(kx, TyKind::FnDef(..) | TyKind::Closure(..) | TyKind::FnPtr(..)) {
-                    self.coerce_or_unify(xt, target, Some(*x), lo);
+                    // (a failed coercion is the cast check's E0605)
+                    self.try_coerce(xt, target, Some(*x));
                 } else if matches!(kt, TyKind::Adt(..) | TyKind::Tuple(_) | TyKind::Array(..)) {
                     // no primitive cast has these targets: only a coercion (a trivial cast `Some(4u32)
-                    // as Option<u32>`, `(1, 2) as (u32, u32)` types its literals)
-                    self.coerce_or_unify(xt, target, Some(*x), lo);
+                    // as Option<u32>`, `(1, 2) as (u32, u32)` types its literals); when none applies
+                    // the cast check reports E0605
+                    self.try_coerce(xt, target, Some(*x));
                 } else if let (TyKind::Ref(m1, a, _), TyKind::Ref(m2, bt, _)) = (&kx, &kt) {
                     // a cast is first a coercion when one applies (rustc cast.rs
                     // try_coercion_cast): `&s as &str` is a deref coercion of &String
@@ -5765,7 +5801,8 @@ impl<'a> Fcx<'a> {
         for arg in &impl_full { match *arg { crate::consts::GenericArg::Type(t) => gargs.push(t), crate::consts::GenericArg::Const(c) => gargs.push(self.tcx.tys.intern(TyKind::Const(c))), _ => {} } }
         let own = sig.n_generics - sig.n_parent_generics;
         let mut tf = Vec::new();
-        if let Some(GenericArgs::Angle(v)) = self.ast().gargs(turbofish) {
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
+        if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
                     tf.push(lt);
@@ -6057,7 +6094,8 @@ impl<'a> Fcx<'a> {
     fn check_trait_method_call(&mut self, e: ExprId, item: DefId, imp: DefId, self_ty: TyId, derefs: usize, turbofish: GenericArgsId, args: &[ExprId], lo: u32, method_expected: Option<TyId>) -> TyId {
         let error = self.tcx.tys.error;
         let mut tf = Vec::new();
-        if let Some(GenericArgs::Angle(v)) = self.ast().gargs(turbofish) {
+        let turbofish_ok = self.check_seg_arg_count(turbofish, item, lo, true);
+        if let (true, Some(GenericArgs::Angle(v))) = (turbofish_ok, self.ast().gargs(turbofish)) {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, item, self.tcx.fn_sig(self.prog, item).unwrap().n_parent_generics as usize + tf.len()) {
                     tf.push(lt);

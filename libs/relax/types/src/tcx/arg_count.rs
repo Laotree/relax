@@ -6,7 +6,7 @@ use crate::ast::{self, GenericArg, GenericArgs, GenericParamKind, ItemKind};
 
 /// rustc GenericArgPosition: a type/trait path, or a value path (fn, method, ctor).
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ArgPosition { Type, Value }
+pub enum ArgPosition { Type, /** a type-relative associated type segment: its lifetimes are never elided in */ AssocType, Value }
 
 /// `ty::Generics::own_counts` / `own_defaults` of one definition.
 #[derive(Clone, Copy, Default, Debug)]
@@ -43,6 +43,14 @@ impl Tcx {
         }
         if let Some(n) = early_lifetimes { c.lifetimes = n; }
         c
+    }
+
+    /// rustc `def_path_str` of a type or associated item (`Trait::Item`).
+    pub fn def_path_str(&self, prog: &Program, d: DefId) -> String {
+        let def = prog.def(d);
+        if matches!(def.kind, DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst) {
+            format!("{}::{}", prog.name(def.parent), prog.name(d))
+        } else { prog.name(d).to_string() }
     }
 
     /// rustc `def_descr`.
@@ -86,11 +94,12 @@ impl Tcx {
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let was = |n: usize| if n == 1 { "was" } else { "were" };
         let message = |quantifier: &str, expected: usize, kind: &str, provided: usize| {
+            if !has_brackets { return format!("E0107: missing generics for {} `{}`", descr, self.def_path_str(prog, d)); }
             format!("E0107: {} takes {}{} {} argument{} but {} {} argument{} {} supplied", descr, quantifier, expected, kind, plural(expected), provided, kind, plural(provided), was(provided))
         };
         // (lifetimes) elided lifetimes of a type path are inserted by lowering (E0106 is the
         // resolver's): only written ones are counted; `infer_lifetimes` for a value path
-        let infer_lifetimes = (pos != ArgPosition::Type || infer_args) && lifetime_args == 0;
+        let infer_lifetimes = (pos == ArgPosition::Value || infer_args) && lifetime_args == 0;
         let min_lifetimes = if infer_lifetimes { 0 } else { counts.lifetimes };
         let provided_lifetimes = if lifetime_args == 0 && pos == ArgPosition::Type { counts.lifetimes } else { lifetime_args };
         let mut errs = Vec::new();
@@ -100,9 +109,7 @@ impl Tcx {
         let expected_max = counts.types + counts.consts;
         let expected_min = if infer_args { 0 } else { expected_max - counts.defaults };
         if !(expected_min..=expected_max).contains(&generic_args) {
-            errs.push(if !has_brackets && generic_args == 0 {
-                format!("E0107: missing generics for {} `{}`", descr, prog.name(d))
-            } else if generic_args > expected_max {
+            errs.push(if generic_args > expected_max {
                 let q = if counts.defaults == 0 { "" } else { "at most " };
                 message(q, expected_max, "generic", generic_args)
             } else {

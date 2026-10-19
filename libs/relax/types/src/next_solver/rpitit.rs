@@ -99,7 +99,12 @@ impl Tcx {
     }
 
     pub fn own_clauses_of(&self, prog: &Program, def: DefId) -> &[Predicate] {
-        self.declaration_queries(prog, def).own_clauses.get_or_init(|| self.own_clauses_uncached(prog, def))
+        &self.declaration_queries(prog, def).own_clauses.get_or_init(|| self.own_clauses_uncached(prog, def)).0
+    }
+
+    /// The errors of lowering the definition's clauses (see `own_clauses_uncached`).
+    pub fn own_clauses_errors(&self, prog: &Program, def: DefId) -> &[String] {
+        &self.declaration_queries(prog, def).own_clauses.get_or_init(|| self.own_clauses_uncached(prog, def)).1
     }
 
     /// rustc_hir_analysis/src/collect/item_bounds.rs: elaboration belongs to the provider.
