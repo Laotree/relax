@@ -3,6 +3,7 @@
 //! Type properties on the shared query engine. Tcx owns tables; providers borrow the
 //! collected program. rustc_middle/src/ty/context.rs:258 and query/plumbing.rs:25.
 
+pub(crate) mod place_types;
 use crate::types::AliasTyKind;
 use crate::types::AliasTy;
 use crate::fxhash::HashSet;

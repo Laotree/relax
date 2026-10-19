@@ -2667,7 +2667,7 @@ impl<'a> Build<'a> {
 
     /// Capture analysis and BIR use the same typeck selection, never an assumed Fn.
     fn callable_kind(&mut self, e: ExprId, t: TyId) -> Option<ClosureKind> {
-        let kind = self.b.call_kind(&self.tx, e, t).map(|k| match k {
+        let kind = self.b.call_kind(self.tx.tcx, &self.tx.cx, e, t).map(|k| match k {
             crate::upvar::ClosureKind::Fn => ClosureKind::Fn,
             crate::upvar::ClosureKind::FnMut => ClosureKind::FnMut,
             crate::upvar::ClosureKind::FnOnce => ClosureKind::FnOnce,
