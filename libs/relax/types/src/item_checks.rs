@@ -339,6 +339,32 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            // #[link(name = "..", kind = "..")] (rustc_attr_parsing link_attrs.rs)
+            {
+                let sp = prog.src(file);
+                for a in &attrs {
+                    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                    if hi < lo + 3 || crate::cfg::tok_str(sp, lo) != b"link" || crate::cfg::tok_str(sp, lo + 1) != b"(" { continue; }
+                    let pos = sp.tok(lo).lo;
+                    let (mut name, mut kind_bad) = (None::<&[u8]>, false);
+                    let mut i = lo + 2;
+                    while i + 2 < hi {
+                        let key = crate::cfg::tok_str(sp, i);
+                        if crate::cfg::tok_str(sp, i + 1) == b"=" {
+                            let val = crate::cfg::tok_str(sp, i + 2);
+                            if key == b"name" { name = Some(val); }
+                            if key == b"kind" && !matches!(val, b"\"static\"" | b"\"dylib\"" | b"\"framework\"" | b"\"raw-dylib\"" | b"\"link-arg\"") { kind_bad = true; }
+                            i += 3;
+                        } else { i += 1; }
+                    }
+                    if kind_bad { errors.push(prog.record_error(file, pos, "typeck", "E0539: malformed `link` attribute input".to_string())); }
+                    match name {
+                        None => errors.push(prog.record_error(file, pos, "typeck", "E0459: `#[link]` attribute requires a `name = \"string\"` argument".to_string())),
+                        Some(b"\"\"") => errors.push(prog.record_error(file, pos, "typeck", "E0454: link name must not be empty".to_string())),
+                        _ => {}
+                    }
+                }
+            }
             // (declarations of an extern block, plain or unsafe)
             for &it in ast.list(fm.items) {
                 if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
