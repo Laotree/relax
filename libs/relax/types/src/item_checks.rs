@@ -500,10 +500,10 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                 crate::lint::emit_in(prog, def, &attrs, &crate::lint::MISSING_UNSAFE_ON_EXTERN, file, item.lo, "extern blocks should be unsafe");
             }
             for &it in ast.list(fm.items) {
-                // (a foreign fn is unsafe by default: look for the written qualifier)
-                if let ItemKind::Fn(..) = ast.item(it).kind {
+                // (a foreign fn or static is unsafe by default: look for the written qualifier)
+                if let ItemKind::Fn(..) | ItemKind::Static(..) = ast.item(it).kind {
                     let written = pf.bytes(ast.item(it).lo, ast.item(it).name.lo);
-                    if written.split(|c| !c.is_ascii_alphanumeric() && *c != b'_').any(|w| w == b"unsafe") {
+                    if written.split(|c| !c.is_ascii_alphanumeric() && *c != b'_').any(|w| w == b"unsafe" || w == b"safe") {
                         errors.push(prog.record_uncoded_error(file, ast.item(it).lo, "typeck", "items in `extern` blocks without an `unsafe` qualifier cannot have safety qualifiers".to_string()));
                     }
                 }

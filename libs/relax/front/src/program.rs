@@ -4204,6 +4204,9 @@ impl Program {
             let gv = if gpub { None } else { Some(md.normal) };
             let inner = self.module_trait_bindings_pass(gd.sub, q);
             for &(d, v) in inner.iter() {
+                // a glob-imported trait whose name an explicit binding of this module shadows
+                // is not in scope (rustc: its methods are unavailable)
+                if md.types.get(&self.def(d).name).is_some_and(|x| *x != d) { continue; }
                 if self.vis_visible(v, m) {
                     let v = self.vis_min(gv, v);
                     // one entry per trait, the most visible binding

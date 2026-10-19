@@ -208,12 +208,12 @@ pub mod isize {
     pub const MAX: isize = 9223372036854775807;
 }
 
-/// The preludes (library/core/src/prelude): `v1` is Rust 2015's and 2018's, `rust_2021` adds
+/// The preludes (library/core/src/prelude): `rust_2015` is also 2018's (`prelude::v1` is a builtin path), `rust_2021` adds
 /// `FromIterator`, `TryFrom` and `TryInto`, `rust_2024` adds `Future` and `IntoFuture`. The
 /// resolver injects the module of the crate's edition. Relax puts std's prelude (a superset of
 /// core's; harmless for no_std crates since user items shadow it) in every crate.
 pub mod prelude {
-    pub mod v1 {
+    pub mod rust_2015 {
         pub use crate::borrow::ToOwned;
         pub use crate::boxed::Box;
         pub use crate::clone::Clone;
@@ -229,19 +229,16 @@ pub mod prelude {
         pub use crate::string::{String, ToString};
         pub use crate::vec::Vec;
     }
-    pub mod rust_2015 {
-        pub use super::v1::*;
-    }
     pub mod rust_2018 {
-        pub use super::v1::*;
+        pub use super::rust_2015::*;
     }
     pub mod rust_2021 {
-        pub use super::v1::*;
+        pub use super::rust_2015::*;
         pub use crate::convert::{TryFrom, TryInto};
         pub use crate::iter::FromIterator;
     }
     pub mod rust_2024 {
-        pub use super::v1::*;
+        pub use super::rust_2015::*;
         pub use crate::convert::{TryFrom, TryInto};
         pub use crate::future::{Future, IntoFuture};
         pub use crate::iter::FromIterator;
