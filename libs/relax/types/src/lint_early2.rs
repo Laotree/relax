@@ -139,7 +139,7 @@ impl Collector<'_, '_> {
                     for a in ast.list(*l) {
                         match *a {
                             GenericArg::Binding(_, _, t) => self.ty(t),
-                            GenericArg::Constraint(_, b) => self.bounds(b, owner),
+                            GenericArg::Constraint(_, _, b) => self.bounds(b, owner),
                             _ => {}
                         }
                     }
