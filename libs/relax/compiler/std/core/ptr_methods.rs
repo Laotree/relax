@@ -183,7 +183,7 @@ impl<T: crate::marker::PointeeSized> *mut T {
         unsafe { *a = (*a).wrapping_sub(count) };
         p
     }
-    pub unsafe fn drop_in_place(self) {
+    pub const unsafe fn drop_in_place(self) {
         im::drop_in_place(self)
     }
 }

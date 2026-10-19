@@ -15,7 +15,7 @@ impl Fcx<'_> {
         let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() else { return };
         let Some(sig) = self.tcx.fn_item_sig(self.prog, def).cloned() else { return };
         let args = self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions);
-        let unsized_fn_params = self.prog.crates[self.prog.def(self.b.def).krate as usize].unsized_fn_params(self.prog);
+        let unsized_fn_params = self.prog.crates[self.prog.def(self.b.def).krate as usize].features(self.prog).has("unsized_fn_params");
         for i in 0..sig.params.len() + 1 {
             if i < sig.params.len() && unsized_fn_params { continue; }
             let ty = if i < sig.params.len() { sig.params[i] } else { sig.ret };
@@ -35,6 +35,8 @@ impl Fcx<'_> {
 
     // fn_ctxt/checks.rs:229-235: each call input must be well formed.
     pub(super) fn register_wf(&mut self, ty: TyId, lo: u32) {
+        // (a crash guard of the checked crates: a path with a wrong argument count reaches the solver)
+        if self.tcx.validates(self.prog, self.file) && !crate::wfcheck::obligations::arity_ok(self.tcx, self.prog, ty) { return; }
         self.register_goal(Goal { param_env: self.param_env, predicate: Predicate::dummy(
             PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }, lo);
     }

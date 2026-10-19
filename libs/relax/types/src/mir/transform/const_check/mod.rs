@@ -74,8 +74,8 @@ impl<'a> ConstCx<'a> {
         let owner = body.source.owner;
         let krate = &prog.crates[prog.def(owner).krate as usize];
         let features = ConstFeatures {
-            const_traits: krate.feature_enabled(prog, "const_trait_impl"),
-            const_drops: krate.feature_enabled(prog, "const_destruct") || krate.feature_enabled(prog, "const_precise_live_drops"),
+            const_traits: krate.features(prog).has("const_trait_impl"),
+            const_drops: krate.features(prog).has("const_destruct") || krate.features(prog).has("const_precise_live_drops"),
         };
         let const_kind = Self::body_const_context(prog, tcx, body);
         ConstCx { body, prog, tcx, env, const_kind, features, provider, blocked: RefCell::new(None) }

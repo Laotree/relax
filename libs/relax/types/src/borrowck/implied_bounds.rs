@@ -223,7 +223,7 @@ impl ImpliedBounds {
     }
     fn required_to_be_wf(&mut self, tcx: &Tcx, prog: &Program, ty: TyId, visiting: &mut Vec<crate::program::DefId>, out: &mut Vec<OutlivesPredicate>) {
         let tys = &tcx.tys;
-        let mut push = |p: OutlivesPredicate, out: &mut Vec<OutlivesPredicate>| if !out.contains(&p) { out.push(p) };
+        let push = |p: OutlivesPredicate, out: &mut Vec<OutlivesPredicate>| if !out.contains(&p) { out.push(p) };
         match tys.kind(ty).clone() {
             TyKind::Adt(d, args, rs) => {
                 if let Some(adt) = tcx.adts.get(&d) {

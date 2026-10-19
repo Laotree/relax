@@ -237,7 +237,7 @@ impl<T: ?Sized> Clone for Arc<T> {
     }
 }
 
-impl<#[cfg_attr(not(relax_check), may_dangle)] T: ?Sized> Drop for Arc<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Arc<T> {
     fn drop(&mut self) {
         let old = unsafe { ia::atomic_fetch_sub(strong_ptr(header_of(self.ptr.as_ptr())), 1usize, RELEASE) };
         if old != 1 {
@@ -248,6 +248,7 @@ impl<#[cfg_attr(not(relax_check), may_dangle)] T: ?Sized> Drop for Arc<T> {
     }
 }
 
+impl<T: ?Sized> crate::ops::LegacyReceiver for Arc<T> {}
 impl<T: ?Sized> Deref for Arc<T> {
     type Target = T;
     fn deref(&self) -> &T {
@@ -345,6 +346,19 @@ impl<T, const N: usize> From<[T; N]> for Arc<[T]> {
             ptr::copy_nonoverlapping(&v as *const [T; N] as *const T, p, N);
             crate::mem::forget(v);
             Arc::from_parts(ptr::slice_from_raw_parts_mut(p, N))
+        }
+    }
+}
+
+/// `Arc<[T]>` of exactly N elements as `Arc<[T; N]>`, else the pointer back (alloc/src/arc.rs).
+impl<T, const N: usize> crate::convert::TryFrom<Arc<[T]>> for Arc<[T; N]> {
+    type Error = Arc<[T]>;
+    fn try_from(boxed_slice: Arc<[T]>) -> Result<Arc<[T; N]>, Arc<[T]>> {
+        if boxed_slice.len() == N {
+            let ptr = Arc::into_raw(boxed_slice) as *mut [T; N];
+            Ok(unsafe { Arc::from_raw(ptr) })
+        } else {
+            Err(boxed_slice)
         }
     }
 }
@@ -494,7 +508,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
-impl<#[cfg_attr(not(relax_check), may_dangle)] T: ?Sized> Drop for Weak<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Weak<T> {
     fn drop(&mut self) {
         if is_dangling(self.ptr.as_ptr()) {
             return;

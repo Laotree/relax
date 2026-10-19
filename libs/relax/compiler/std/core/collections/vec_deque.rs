@@ -593,7 +593,7 @@ fn split_range<'a, T>(a: &'a [T], b: &'a [T], start: usize, end: usize) -> (&'a 
     }
 }
 
-impl<#[cfg_attr(not(relax_check), may_dangle)] T> Drop for VecDeque<T> {
+unsafe impl<#[may_dangle] T> Drop for VecDeque<T> {
     fn drop(&mut self) {
         self.truncate(0);
         self.free_buf();
@@ -624,14 +624,57 @@ impl<T: PartialEq> PartialEq for VecDeque<T> {
 
 impl<T: Eq> Eq for VecDeque<T> {}
 
-impl<T: PartialEq> PartialEq<Vec<T>> for VecDeque<T> {
-    fn eq(&self, other: &Vec<T>) -> bool {
+// rustc alloc/src/collections/vec_deque/mod.rs: __impl_slice_eq1! over Vec, slices and arrays
+impl<T, U> PartialEq<Vec<U>> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &Vec<U>) -> bool {
         self.len == other.len() && self.iter().eq(other.iter())
     }
 }
 
-impl<'a, T: PartialEq> PartialEq<&'a [T]> for VecDeque<T> {
-    fn eq(&self, other: &&'a [T]) -> bool {
+impl<'a, T, U> PartialEq<&'a [U]> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&'a [U]) -> bool {
+        self.len == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<'a, T, U> PartialEq<&'a mut [U]> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&'a mut [U]) -> bool {
+        self.len == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<T, U, const N: usize> PartialEq<[U; N]> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &[U; N]) -> bool {
+        self.len == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<'a, T, U, const N: usize> PartialEq<&'a [U; N]> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&'a [U; N]) -> bool {
+        self.len == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl<'a, T, U, const N: usize> PartialEq<&'a mut [U; N]> for VecDeque<T>
+where
+    T: PartialEq<U>,
+{
+    fn eq(&self, other: &&'a mut [U; N]) -> bool {
         self.len == other.len() && self.iter().eq(other.iter())
     }
 }
@@ -870,6 +913,9 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 impl<T> ExactSizeIterator for IntoIter<T> {}
 impl<T> FusedIterator for IntoIter<T> {}
 
+// library/alloc/src/collections/vec_deque/drain.rs
+unsafe impl<T: Send> Send for Drain<'_, T> {}
+unsafe impl<T: Sync> Sync for Drain<'_, T> {}
 pub struct Drain<'a, T: 'a> {
     deque: *mut VecDeque<T>,
     start: usize,
