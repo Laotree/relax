@@ -5,7 +5,7 @@
 
 use crate::ast::*;
 use crate::ast_visit::{self, Visitor};
-use crate::lint::{self, Level, Lint};
+use crate::lint::{self, Lint};
 use crate::lang_items::LangItem;
 use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
@@ -13,9 +13,9 @@ use crate::typeck::{Body, Res};
 use crate::types::{TyId, TyKind};
 use std::collections::HashMap;
 
-pub const DANGLING_POINTERS_FROM_TEMPORARIES: Lint = lint::lint("dangling_pointers_from_temporaries", Level::Warn, &[]);
-pub const DANGLING_POINTERS_FROM_LOCALS: Lint = lint::lint("dangling_pointers_from_locals", Level::Warn, &[]);
-pub const CONST_ITEM_MUTATION: Lint = lint::lint("const_item_mutation", Level::Warn, &[]);
+pub const DANGLING_POINTERS_FROM_TEMPORARIES: Lint = lint::lint("dangling_pointers_from_temporaries");
+pub const DANGLING_POINTERS_FROM_LOCALS: Lint = lint::lint("dangling_pointers_from_locals");
+pub const CONST_ITEM_MUTATION: Lint = lint::lint("const_item_mutation");
 
 /// Runs the passes over one body owner (`block`: a fn body, `expr`: a const / static initialiser).
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>, expr: Option<ExprId>) {
@@ -568,10 +568,10 @@ impl<'a> Visitor<'a> for L2<'a> {
 
 // ---------------------------------------------------------------- prelude collisions
 
-pub const RUST_2021_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2021_prelude_collisions", Level::Allow, &[]);
-pub const RUST_2024_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2024_prelude_collisions", Level::Allow, &[]);
-pub const ARRAY_INTO_ITER: Lint = lint::lint("array_into_iter", Level::Warn, &[]);
-pub const BOXED_SLICE_INTO_ITER: Lint = lint::lint("boxed_slice_into_iter", Level::Warn, &[]);
+pub const RUST_2021_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2021_prelude_collisions");
+pub const RUST_2024_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2024_prelude_collisions");
+pub const ARRAY_INTO_ITER: Lint = lint::lint("array_into_iter");
+pub const BOXED_SLICE_INTO_ITER: Lint = lint::lint("boxed_slice_into_iter");
 
 impl<'a> L2<'a> {
     fn edition(&self) -> u16 { self.prog.files[self.body.file as usize].edition as u16 }
@@ -724,7 +724,7 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- if_let_rescope
 
-pub const IF_LET_RESCOPE: Lint = lint::lint("if_let_rescope", Level::Allow, &[]);
+pub const IF_LET_RESCOPE: Lint = lint::lint("if_let_rescope");
 
 impl<'a> L2<'a> {
     fn norm(&self, t: TyId) -> TyId { self.tcx.try_normalize_erasing_regions(self.prog, self.env, t).unwrap_or(t) }
@@ -910,10 +910,10 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- comparison lints (rustc_lint types.rs)
 
-pub const UNUSED_COMPARISONS: Lint = lint::lint("unused_comparisons", Level::Warn, &[]);
-pub const INVALID_NAN_COMPARISONS: Lint = lint::lint("invalid_nan_comparisons", Level::Warn, &[]);
-pub const AMBIGUOUS_WIDE_POINTER_COMPARISONS: Lint = lint::lint("ambiguous_wide_pointer_comparisons", Level::Warn, &[]);
-pub const UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS: Lint = lint::lint("unpredictable_function_pointer_comparisons", Level::Warn, &[]);
+pub const UNUSED_COMPARISONS: Lint = lint::lint("unused_comparisons");
+pub const INVALID_NAN_COMPARISONS: Lint = lint::lint("invalid_nan_comparisons");
+pub const AMBIGUOUS_WIDE_POINTER_COMPARISONS: Lint = lint::lint("ambiguous_wide_pointer_comparisons");
+pub const UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS: Lint = lint::lint("unpredictable_function_pointer_comparisons");
 
 #[derive(Clone, Copy, PartialEq)]
 enum CmpOp { Bin(BinOp), Other }
@@ -1088,7 +1088,7 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- closure_returning_async_block
 
-pub const CLOSURE_RETURNING_ASYNC_BLOCK: Lint = lint::lint("closure_returning_async_block", Level::Allow, &[]);
+pub const CLOSURE_RETURNING_ASYNC_BLOCK: Lint = lint::lint("closure_returning_async_block");
 
 impl<'a> L2<'a> {
     /// `AsyncClosureUsage::check_expr` (rustc_lint async_closures.rs).
@@ -1113,8 +1113,8 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- ptr_nulls (rustc_lint ptr_nulls.rs)
 
-pub const USELESS_PTR_NULL_CHECKS: Lint = lint::lint("useless_ptr_null_checks", Level::Warn, &[]);
-pub const INVALID_NULL_ARGUMENTS: Lint = lint::lint("invalid_null_arguments", Level::Deny, &[]);
+pub const USELESS_PTR_NULL_CHECKS: Lint = lint::lint("useless_ptr_null_checks");
+pub const INVALID_NULL_ARGUMENTS: Lint = lint::lint("invalid_null_arguments");
 
 impl<'a> L2<'a> {
     fn call_def(&self, f: ExprId) -> Option<DefId> {
@@ -1245,9 +1245,9 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- transmute.rs
 
-pub const PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS: Lint = lint::lint("ptr_to_integer_transmute_in_consts", Level::Warn, &[]);
-pub const UNNECESSARY_TRANSMUTES: Lint = lint::lint("unnecessary_transmutes", Level::Warn, &[]);
-pub const INTEGER_TO_PTR_TRANSMUTES: Lint = lint::lint("integer_to_ptr_transmutes", Level::Warn, &[]);
+pub const PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS: Lint = lint::lint("ptr_to_integer_transmute_in_consts");
+pub const UNNECESSARY_TRANSMUTES: Lint = lint::lint("unnecessary_transmutes");
+pub const INTEGER_TO_PTR_TRANSMUTES: Lint = lint::lint("integer_to_ptr_transmutes");
 
 impl<'a> L2<'a> {
     /// `CheckTransmutes::check_expr` (rustc_lint transmute.rs).
@@ -1384,7 +1384,7 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- internal_eq_trait_method_impls
 
-pub const INTERNAL_EQ_TRAIT_METHOD_IMPLS: Lint = lint::lint("internal_eq_trait_method_impls", Level::Warn, &[]);
+pub const INTERNAL_EQ_TRAIT_METHOD_IMPLS: Lint = lint::lint("internal_eq_trait_method_impls");
 
 /// `InternalEqTraitMethodImpls::check_impl_item`: a hand-written `Eq::assert_receiver_is_total_eq`.
 pub fn check_eq_impls(prog: &Program, tcx: &Tcx, own: &[bool]) {
@@ -1499,7 +1499,7 @@ pub fn check_signature_deprecations(prog: &Program, tcx: &Tcx, own: &[bool]) {
 
 // ---------------------------------------------------------------- invalid_value (rustc_lint builtin.rs InvalidValue)
 
-pub const INVALID_VALUE: Lint = lint::lint("invalid_value", Level::Warn, &[]);
+pub const INVALID_VALUE: Lint = lint::lint("invalid_value");
 
 #[derive(Clone, Copy, PartialEq)]
 enum InitKind { Zeroed, Uninit }
@@ -1623,7 +1623,7 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- const_item_interior_mutations (rustc_lint interior_mutable_consts.rs)
 
-pub const CONST_ITEM_INTERIOR_MUTATIONS: Lint = lint::lint("const_item_interior_mutations", Level::Warn, &[]);
+pub const CONST_ITEM_INTERIOR_MUTATIONS: Lint = lint::lint("const_item_interior_mutations");
 
 impl<'a> L2<'a> {
     fn lint_interior_mutable_consts(&self, e: ExprId) {
@@ -1656,8 +1656,8 @@ impl<'a> L2<'a> {
 
 // ---------------------------------------------------------------- refining_impl_trait (compare_impl_item/refine.rs)
 
-pub const REFINING_IMPL_TRAIT_REACHABLE: Lint = lint::lint("refining_impl_trait_reachable", Level::Warn, &["refining_impl_trait"]);
-pub const REFINING_IMPL_TRAIT_INTERNAL: Lint = lint::lint("refining_impl_trait_internal", Level::Warn, &["refining_impl_trait"]);
+pub const REFINING_IMPL_TRAIT_REACHABLE: Lint = lint::lint("refining_impl_trait_reachable");
+pub const REFINING_IMPL_TRAIT_INTERNAL: Lint = lint::lint("refining_impl_trait_internal");
 
 /// The impl methods whose return-position `impl Trait` in the trait is implemented by a type that is
 /// not an opaque of the impl method itself ("the hidden type is not an opaque": the first

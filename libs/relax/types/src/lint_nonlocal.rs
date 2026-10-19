@@ -2,11 +2,11 @@
 //! and trait do not name an item declared at the impl's own level. Check-only.
 
 use crate::ast::*;
-use crate::lint::{self, Level, Lint};
+use crate::lint::{self, Lint};
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 
-pub const NON_LOCAL_DEFINITIONS: Lint = lint::lint("non_local_definitions", Level::Warn, &[]);
+pub const NON_LOCAL_DEFINITIONS: Lint = lint::lint("non_local_definitions");
 
 /// The definition that encloses `d` as rustc's `tcx.parent` sees it: a body's block module is
 /// its owner.
@@ -64,7 +64,7 @@ impl<'a> Paths<'a> {
                         match *a {
                             GenericArg::Type(t) => self.ty(t),
                             GenericArg::Binding(_, _, t) => self.ty(t),
-                            GenericArg::Constraint(_, bs) => self.bounds(bs),
+                            GenericArg::Constraint(_, _, bs) => self.bounds(bs),
                             _ => {}
                         }
                     },

@@ -12,13 +12,13 @@
 //! Check-only.
 
 use crate::ast::*;
-use crate::lint::{self, Level, Lint};
+use crate::lint::{self, Lint};
 use crate::program::{DefId, DefKind, Program};
 use crate::tcx::Tcx;
 use crate::typeck::{Body, Res};
 use crate::types::{TyId, TyKind};
 
-pub const UNCONDITIONAL_RECURSION: Lint = lint::lint("unconditional_recursion", Level::Warn, &[]);
+pub const UNCONDITIONAL_RECURSION: Lint = lint::lint("unconditional_recursion");
 
 struct LoopCx {
     label: Option<String>,
