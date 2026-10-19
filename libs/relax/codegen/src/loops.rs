@@ -289,6 +289,10 @@ enum Sv {
     Addr(VReg, i64),
     /// a 32-bit constant (its low 32 bits)
     K(u32),
+    /// `(root + off) << shift`: a counter scaled to bytes
+    Scaled(VReg, i64, u8),
+    /// the address `base + ((counter + off) << shift)` of an indexed stream: (base, counter, off bytes, shift)
+    Ptr(VReg, VReg, i64, u8),
     /// the vector value computed by operation `k` of the widened body
     Lane(usize),
 }
@@ -310,11 +314,29 @@ impl Lane {
     }
 }
 
+/// Where a stream loop's memory access goes: the current element of a pointer that walks one element
+/// per iteration (`iv` None), or an element of the array at `root` indexed by the counter `iv`;
+/// `disp` bytes further on.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Stream {
+    root: VReg,
+    iv: Option<VReg>,
+    sh: u8,
+    disp: i64,
+}
+
+/// A loop bound: a loop-invariant register or a constant.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Bound {
+    Reg(VReg),
+    Imm(i64),
+}
+
 /// One operation of a widened body.
 #[derive(Clone, Copy)]
 enum WOp {
-    /// a vector load of the pointer root
-    Load(VReg),
+    /// a vector load of a stream
+    Load(Stream),
     Bin(VOp, usize, usize),
     Int(VX, usize, usize),
     Un(VUn, usize),
@@ -324,12 +346,13 @@ enum WOp {
     Const(u32),
 }
 
-/// Widen straight-line element maps over pointer/count streams: a loop whose iteration loads
-/// elements (u8, f32 or 32-bit integers) at the current position of one or more streams,
+/// Widen straight-line element maps over pointer/count/index streams: a loop whose iteration loads
+/// elements (u8, f32 or 32-bit integers) at the current position of one or more streams (a pointer
+/// stepping one element per iteration, or `base[i + c]` of a counter `i` stepping by one),
 /// computes on them with lane-wise operations and loop-invariant scalars, and stores one result
 /// element at the current position of a stream. Streams advance by one element per iteration; the
-/// loop's exits are guards on a down-counting length (`n != 0`), a pointer reaching an end pointer
-/// (`p == end`) or a pointer being null (an iterator's niche test). The scalar loop remains the tail
+/// loop's exits are guards on a down-counting length (`n != 0`), a pointer or counter reaching an end
+/// (`p == end`), a counter below a bound (`i < n`) or a pointer being null (an iterator's niche test). The scalar loop remains the tail
 /// and fallback, including its exact short-circuit exhaustion behavior. A vector iteration (one
 /// 16-byte vector per stream) is admitted only when every scalar guard succeeds for all of its
 /// elements; runtime distance checks exclude dependencies within a vector (equal pointers are OK).
@@ -394,9 +417,11 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
         let mut zero_guards: Vec<(VReg, i64)> = Vec::new();
         // equality tests of two inputs: (a, offset, b, offset)
         let mut end_guards: Vec<(VReg, i64, VReg, i64)> = Vec::new();
-        let mut loads: Vec<(VReg, VReg, usize)> = Vec::new(); // (value, pointer root, op index)
+        // order tests `a + off < bound` that keep the loop going: (a, off, bound, signed)
+        let mut lt_guards: Vec<(VReg, i64, Bound, bool)> = Vec::new();
+        let mut loads: Vec<(Stream, usize)> = Vec::new(); // (stream, op index)
         let mut wops: Vec<WOp> = Vec::new();
-        let mut store: Option<(VReg, usize)> = None;
+        let mut store: Option<(Stream, usize)> = None;
         // the operand of a lane operation: a computed vector or a loop-invariant scalar
         macro_rules! operand {
             ($v:expr, $k:expr) => {{
@@ -414,10 +439,20 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
                 }
             }};
         }
+        // the stream an access `[p + off]` goes to
+        macro_rules! stream_at {
+            ($p:expr, $off:expr) => {{
+                match sv[$p.0 as usize] {
+                    Sv::Addr(r, o) if roots.contains(&r) => o.checked_add($off as i64).filter(|d| d.abs() < 1 << 20).map(|disp| Stream { root: r, iv: None, sh: 0, disp }),
+                    Sv::Ptr(base, iv, o, sh) => o.checked_add($off as i64).filter(|d| d.abs() < 1 << 20).map(|disp| Stream { root: base, iv: Some(iv), sh, disp }),
+                    _ => None,
+                }
+            }};
+        }
         for &b in &chain {
             let block = &f.blocks[b as usize];
             if let Term::Branch(c, ..) = block.term {
-                if !matches!(block.insts.last(), Some(Inst::ICmpI(Cond::Eq | Cond::Ne, false, d, _, 0) | Inst::ICmp(Cond::Eq | Cond::Ne, false, d, _, _)) if *d == c) {
+                if !matches!(block.insts.last(), Some(Inst::ICmpI(Cond::Eq | Cond::Ne, false, d, _, 0) | Inst::ICmpI(Cond::Lt | Cond::Ge, _, d, _, _) | Inst::ICmp(Cond::Eq | Cond::Ne | Cond::Lt | Cond::Ge, _, d, _, _)) if *d == c) {
                     continue 'candidate;
                 }
             }
@@ -434,6 +469,39 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
                         let Sv::Addr(r, off) = sv[s.0 as usize] else { continue 'candidate };
                         let Some(off) = (if op == IOp::Add { off.checked_add(k) } else { off.checked_sub(k) }) else { continue 'candidate };
                         sv[d.0 as usize] = Sv::Addr(r, off);
+                    }
+                    Inst::IBinI(IOp::Shl, it, d, s, k @ 1..=3) if it == U64_TY => {
+                        let Sv::Addr(r, off) = sv[s.0 as usize] else { continue 'candidate };
+                        if !roots.contains(&r) { continue 'candidate; }
+                        sv[d.0 as usize] = Sv::Scaled(r, off, k as u8);
+                    }
+                    Inst::IBin(IOp::Add, it, d, a, b2) if it == U64_TY && (matches!(sv[a.0 as usize], Sv::Scaled(..)) || matches!(sv[b2.0 as usize], Sv::Scaled(..))) => {
+                        let (Sv::Addr(base, 0), Sv::Scaled(iv, off, sh)) = (match (sv[a.0 as usize], sv[b2.0 as usize]) {
+                            (x @ Sv::Addr(..), y @ Sv::Scaled(..)) => (x, y),
+                            (y @ Sv::Scaled(..), x @ Sv::Addr(..)) => (x, y),
+                            _ => continue 'candidate,
+                        }) else { continue 'candidate };
+                        let Some(disp) = off.checked_mul(1 << sh) else { continue 'candidate };
+                        if !roots.contains(&base) || base == iv { continue 'candidate; }
+                        sv[d.0 as usize] = Sv::Ptr(base, iv, disp, sh);
+                    }
+                    Inst::ICmp(c @ (Cond::Lt | Cond::Ge), sg, d, a, b2) => {
+                        let Term::Branch(cv, t, e) = block.term else { continue 'candidate };
+                        if cv != d || (if c == Cond::Lt { !members[t as usize] || members[e as usize] } else { members[t as usize] || !members[e as usize] }) {
+                            continue 'candidate;
+                        }
+                        let (Sv::Addr(ra, oa), Sv::Addr(rb, 0)) = (sv[a.0 as usize], sv[b2.0 as usize]) else { continue 'candidate };
+                        if !roots.contains(&ra) || !roots.contains(&rb) { continue 'candidate; }
+                        lt_guards.push((ra, oa, Bound::Reg(rb), sg));
+                    }
+                    Inst::ICmpI(c @ (Cond::Lt | Cond::Ge), sg, d, a, k) => {
+                        let Term::Branch(cv, t, e) = block.term else { continue 'candidate };
+                        if cv != d || (if c == Cond::Lt { !members[t as usize] || members[e as usize] } else { members[t as usize] || !members[e as usize] }) {
+                            continue 'candidate;
+                        }
+                        let Sv::Addr(ra, oa) = sv[a.0 as usize] else { continue 'candidate };
+                        if !roots.contains(&ra) { continue 'candidate; }
+                        lt_guards.push((ra, oa, Bound::Imm(k), sg));
                     }
                     Inst::ICmpI(c @ (Cond::Eq | Cond::Ne), false, d, s, 0) => {
                         let Term::Branch(cv, t, e) = block.term else { continue 'candidate };
@@ -461,10 +529,9 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
                         let k = match m { Mem::Int(1, false) => Lane::Byte, Mem::F32 => Lane::F32, Mem::Int(4, _) => Lane::I32, _ => continue 'candidate };
                         if kind.is_some_and(|o| o != k) { continue 'candidate; }
                         kind = Some(k);
-                        let Sv::Addr(r, o) = sv[p.0 as usize] else { continue 'candidate };
-                        if o.checked_add(off as i64) != Some(0) || !roots.contains(&r) { continue 'candidate; }
-                        wops.push(WOp::Load(r));
-                        loads.push((d, r, wops.len() - 1));
+                        let Some(st) = stream_at!(p, off) else { continue 'candidate };
+                        wops.push(WOp::Load(st));
+                        loads.push((st, wops.len() - 1));
                         sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
                     }
                     Inst::IBin(op @ (IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul), it, d, a, b2) if store.is_none() && matches!(kind, Some(Lane::Byte | Lane::I32)) && it.bits as i64 == 8 * kind.unwrap().bytes() => {
@@ -499,10 +566,9 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
                     Inst::Store(m, p, off, s) if store.is_none() => {
                         let k = match m { Mem::Int(1, false) => Lane::Byte, Mem::F32 => Lane::F32, Mem::Int(4, _) => Lane::I32, _ => continue 'candidate };
                         if kind != Some(k) { continue 'candidate; }
-                        let Sv::Addr(r, o) = sv[p.0 as usize] else { continue 'candidate };
+                        let Some(st) = stream_at!(p, off) else { continue 'candidate };
                         let Sv::Lane(w) = sv[s.0 as usize] else { continue 'candidate };
-                        if o.checked_add(off as i64) != Some(0) || !roots.contains(&r) { continue 'candidate; }
-                        store = Some((r, w));
+                        store = Some((st, w));
                     }
                     _ => continue 'candidate,
                 }
@@ -515,42 +581,65 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
         if loads.is_empty() { continue; }
         let sz = kind.bytes();
         let lanes = 16 / sz;
-        // The loop inputs: pointers that step one element per iteration, counters that step -1,
-        // loop-invariant values (end pointers, scalars the body computes with).
-        let mut pointers: Vec<VReg> = loads.iter().map(|x| x.1).collect();
-        pointers.push(dst);
-        pointers.sort_unstable_by_key(|v| v.0);
-        pointers.dedup();
+        let shift = sz.trailing_zeros() as i64;
+        let streams: Vec<Stream> = loads.iter().map(|x| x.0).chain(std::iter::once(dst)).collect();
+        // indexed streams scale by the element size
+        if streams.iter().any(|s| s.iv.is_some() && 1i64 << s.sh != sz) { continue; }
+        let ptr_roots: Vec<VReg> = streams.iter().filter(|s| s.iv.is_none()).map(|s| s.root).collect();
+        let base_roots: Vec<VReg> = streams.iter().filter(|s| s.iv.is_some()).map(|s| s.root).collect();
+        let mut iv_roots: Vec<VReg> = streams.iter().filter_map(|s| s.iv).collect();
+        iv_roots.extend(lt_guards.iter().map(|g| g.0));
+        // an order test of a pointer or an equality test with the wrong roles: leave the loop
+        if lt_guards.iter().any(|g| ptr_roots.contains(&g.0)) { continue; }
+        let walks = |v: VReg| matches!(sv[v.0 as usize], Sv::Addr(r, s) if r == v && (s == sz || s == 1));
         for g in end_guards.iter_mut() {
-            let walks = |v: VReg| matches!(sv[v.0 as usize], Sv::Addr(r, s) if r == v && s == sz);
             if walks(g.2) && !walks(g.0) {
                 *g = (g.2, g.3, g.0, g.1);
             }
         }
+        // The loop inputs: pointers that step one element per iteration, counters that step +1
+        // (indices) or -1 (lengths), loop-invariant values (bases, bounds, end pointers, scalars
+        // the body computes with).
         let mut counts: Vec<VReg> = Vec::new();
         let mut walkers: Vec<VReg> = Vec::new();
+        let mut ivs: Vec<VReg> = Vec::new();
         for &v in &roots {
             let fin = sv[v.0 as usize];
+            let is_i = f.vregs[v.0 as usize] == Cls::I;
+            let guarded_end = end_guards.iter().any(|g| g.0 == v);
+            let guarded_zero = zero_guards.iter().any(|g| g.0 == v);
             match fin {
-                Sv::Addr(r, step) if r == v && step == sz && (pointers.contains(&v) || end_guards.iter().any(|g| g.0 == v) || zero_guards.iter().any(|g| g.0 == v)) && f.vregs[v.0 as usize] == Cls::I => walkers.push(v),
-                Sv::Addr(r, -1) if r == v && zero_guards.iter().any(|g| g.0 == v) && !pointers.contains(&v) && f.vregs[v.0 as usize] == Cls::I => counts.push(v),
+                Sv::Addr(r, -1) if r == v && is_i && guarded_zero && !ptr_roots.contains(&v) && !iv_roots.contains(&v) && !base_roots.contains(&v) => counts.push(v),
+                Sv::Addr(r, step) if r == v && is_i && ptr_roots.contains(&v) && !iv_roots.contains(&v) && !base_roots.contains(&v) && step == sz => walkers.push(v),
+                Sv::Addr(r, 1) if r == v && is_i && iv_roots.contains(&v) && !ptr_roots.contains(&v) && !base_roots.contains(&v) => ivs.push(v),
+                // a pointer or index only the guards look at
+                Sv::Addr(r, step) if r == v && is_i && step == sz && (guarded_end || guarded_zero) && !iv_roots.contains(&v) && !base_roots.contains(&v) => walkers.push(v),
+                Sv::Addr(r, 1) if r == v && is_i && guarded_end && !base_roots.contains(&v) => ivs.push(v),
                 // invariant: never defined in the loop
-                Sv::Addr(r, 0) if r == v && definitions[v.0 as usize] == 0 && !pointers.contains(&v) => {}
+                Sv::Addr(r, 0) if r == v && definitions[v.0 as usize] == 0 && !ptr_roots.contains(&v) && !iv_roots.contains(&v) => {}
                 _ => continue 'candidate,
             }
         }
-        if pointers.iter().any(|p| !walkers.contains(p)) { continue; }
         // a zero test of a counter or a pointer: fine; of an invariant it is a loop that never ends
         // or exits at once. Offsets: a counter is tested after its steps (<= 0), a pointer ahead
         for &(r, o) in &zero_guards {
             if !(counts.contains(&r) && o <= 0 || walkers.contains(&r) && o >= 0) { continue 'candidate; }
         }
-        // every end guard compares a walking pointer (ahead of its entry value, whole elements)
-        // with an invariant
+        // every end guard compares a walking pointer or index (ahead of its entry value, whole
+        // elements) with an invariant
         for &(a, oa, b2, ob) in &end_guards {
-            if !(walkers.contains(&a) && !walkers.contains(&b2) && !counts.contains(&b2) && ob == 0 && oa >= 0 && oa % sz == 0) { continue 'candidate; }
+            let step = if walkers.contains(&a) { sz } else { 1 };
+            if !((walkers.contains(&a) || ivs.contains(&a)) && !walkers.contains(&b2) && !ivs.contains(&b2) && !counts.contains(&b2) && ob == 0 && oa >= 0 && oa % step == 0) { continue 'candidate; }
         }
-        if counts.is_empty() && end_guards.is_empty() { continue; }
+        for &(a, oa, b2, _) in &lt_guards {
+            if !(ivs.contains(&a) && oa >= 0 && match b2 { Bound::Reg(r) => !walkers.contains(&r) && !ivs.contains(&r) && !counts.contains(&r), Bound::Imm(_) => true }) { continue 'candidate; }
+        }
+        if counts.is_empty() && end_guards.is_empty() && lt_guards.is_empty() { continue; }
+        // dependencies between the store and the loads that a vector would reorder, when their
+        // distance is known
+        for l in loads.iter().map(|x| x.0) {
+            if l.root == dst.root && l.iv == dst.iv && l.sh == dst.sh && dst.disp - l.disp > 0 && dst.disp - l.disp < 16 { continue 'candidate; }
+        }
         // The scalar temporaries are not produced by the widened body. All observable
         // loop-carried values must be precisely the pointer and length recurrences.
         for (b, block) in f.blocks.iter().enumerate() {
@@ -567,7 +656,6 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
             bad |= uses.iter().any(|v| (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize] && !redefined[v.0 as usize]);
             if bad { continue 'candidate; }
         }
-        let shift = sz.trailing_zeros() as i64;
         let entry = f.blocks.len() as u32;
         let body = entry + 1;
         let pos = f.blocks[head as usize].term_pos;
@@ -580,42 +668,75 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
         };
         let ok = f.vreg(Cls::I);
         init.push(Inst::Iconst(ok, 1));
+        // `ok &= cond` for a compare of `a` with a constant / register
+        let and_ok = |f: &mut Func, init: &mut Vec<Inst>, ok: VReg, i: Inst| {
+            let _ = f;
+            let (Inst::ICmp(_, _, c, ..) | Inst::ICmpI(_, _, c, ..)) = i else { unreachable!() };
+            init.push(i);
+            init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, c));
+        };
         // a counter tested after `-o` steps must have them to give
         for &(c, o) in &zero_guards {
             if !counts.contains(&c) { continue; }
             if o < 0 {
                 let (enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I));
-                init.push(Inst::ICmpI(Cond::Ge, false, enough, c, -o));
-                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, c, -o));
                 init.push(Inst::IBinI(IOp::Add, U64_TY, left, c, o));
                 min_into(f, &mut init, trip, left);
             } else {
                 min_into(f, &mut init, trip, c);
             }
         }
-        // a pointer that reaches its end pointer in whole elements (the scalar guard is `==`),
-        // `oa` bytes ahead of its entry value
+        // a pointer or index that reaches its end in whole elements (the scalar guard is `==`),
+        // `oa` bytes (elements for an index) ahead of its entry value
         for &(p, oa, e, _) in &end_guards {
-            let (diff, cnt, ord, rem, aligned, enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            let (step, sh) = if walkers.contains(&p) { (sz, shift) } else { (1, 0) };
+            let (diff, cnt, rem, left) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            let (ord, aligned, enough) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
             init.push(Inst::IBin(IOp::Sub, U64_TY, diff, e, p));
-            init.push(Inst::ICmp(Cond::Le, false, ord, p, e));
-            init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, ord));
-            if sz > 1 {
-                init.push(Inst::IBinI(IOp::And, U64_TY, rem, diff, sz - 1));
-                init.push(Inst::ICmpI(Cond::Eq, false, aligned, rem, 0));
-                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, aligned));
-                init.push(Inst::IBinI(IOp::Shr, U64_TY, cnt, diff, shift));
+            and_ok(f, &mut init, ok, Inst::ICmp(Cond::Le, false, ord, p, e));
+            if step > 1 {
+                init.push(Inst::IBinI(IOp::And, U64_TY, rem, diff, step - 1));
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Eq, false, aligned, rem, 0));
+                init.push(Inst::IBinI(IOp::Shr, U64_TY, cnt, diff, sh));
             } else {
                 init.push(Inst::Mov(cnt, diff));
             }
-            let ahead = oa / sz;
+            let ahead = oa / step;
             if ahead > 0 {
-                init.push(Inst::ICmpI(Cond::Ge, false, enough, cnt, ahead));
-                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, cnt, ahead));
                 init.push(Inst::IBinI(IOp::Sub, U64_TY, left, cnt, ahead));
                 min_into(f, &mut init, trip, left);
             } else {
                 min_into(f, &mut init, trip, cnt);
+            }
+        }
+        // an index below its bound: the loop goes on for `bound - index - o` more elements
+        for &(iv, o, nb, signed) in &lt_guards {
+            let n = match nb {
+                Bound::Reg(r) => r,
+                Bound::Imm(k) => {
+                    let n = f.vreg(Cls::I);
+                    init.push(Inst::Iconst(n, k));
+                    n
+                }
+            };
+            let (ord, avail, enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            if signed {
+                // both non-negative: the signed order is the unsigned one
+                let (any, hi, pos0) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+                init.push(Inst::IBin(IOp::Or, U64_TY, any, iv, n));
+                init.push(Inst::IBinI(IOp::Shr, U64_TY, hi, any, 63));
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Eq, false, pos0, hi, 0));
+            }
+            and_ok(f, &mut init, ok, Inst::ICmp(Cond::Le, false, ord, iv, n));
+            init.push(Inst::IBin(IOp::Sub, U64_TY, avail, n, iv));
+            if o > 0 {
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, avail, o));
+                init.push(Inst::IBinI(IOp::Sub, U64_TY, left, avail, o));
+                min_into(f, &mut init, trip, left);
+            } else {
+                min_into(f, &mut init, trip, avail);
             }
         }
         // A pointer guard may stop at zero. Cap the fast run before any pointer
@@ -627,8 +748,7 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
             init.push(Inst::INeg(U64_TY, until_zero, p));
             let from = if ahead > 0 {
                 let (enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I));
-                init.push(Inst::ICmpI(Cond::Ge, false, enough, until_zero, ahead));
-                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, until_zero, ahead));
                 init.push(Inst::IBinI(IOp::Sub, U64_TY, left, until_zero, ahead));
                 left
             } else {
@@ -642,37 +762,86 @@ fn vectorize_stream_maps(f: &mut Func) -> bool {
             min_into(f, &mut init, trip, elems);
         }
         let enough = f.vreg(Cls::I);
-        init.push(Inst::ICmpI(Cond::Ge, false, enough, trip, lanes));
-        init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
-        for &src in &pointers {
-            if src == dst { continue; }
+        and_ok(f, &mut init, ok, Inst::ICmpI(Cond::Ge, false, enough, trip, lanes));
+        // the address of each stream's first element
+        let mut eff: Vec<(Stream, VReg)> = Vec::new();
+        let mut eff_of = |f: &mut Func, init: &mut Vec<Inst>, st: Stream| -> VReg {
+            if let Some(e) = eff.iter().find(|e| e.0 == st) {
+                return e.1;
+            }
+            let mut a = st.root;
+            if let Some(iv) = st.iv {
+                let (t, u) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                init.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
+                init.push(Inst::IBin(IOp::Add, U64_TY, u, st.root, t));
+                a = u;
+            }
+            if st.disp != 0 {
+                let u = f.vreg(Cls::I);
+                init.push(Inst::IBinI(IOp::Add, U64_TY, u, a, st.disp));
+                a = u;
+            }
+            eff.push((st, a));
+            a
+        };
+        let d_eff = eff_of(f, &mut init, dst);
+        for l in loads.iter().map(|x| x.0) {
+            if l == dst { continue; }
+            let s_eff = eff_of(f, &mut init, l);
             let (distance, far, same, safe) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
             // Only forward dependencies matter: loads precede the store and a
             // destination behind the source cannot overwrite a later input.
-            init.push(Inst::IBin(IOp::Sub, U64_TY, distance, dst, src));
+            init.push(Inst::IBin(IOp::Sub, U64_TY, distance, d_eff, s_eff));
             init.push(Inst::ICmpI(Cond::Ge, false, far, distance, 16));
-            init.push(Inst::ICmp(Cond::Eq, false, same, dst, src));
+            init.push(Inst::ICmp(Cond::Eq, false, same, d_eff, s_eff));
             init.push(Inst::IBin(IOp::Or, U64_TY, safe, far, same));
             init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, safe));
         }
-        // the invariant scalars in every lane (once per entry)
+        // the invariant scalars in every lane (once per entry); per iteration the addresses of
+        // the indexed streams
         let mut vectors: Vec<VReg> = Vec::new();
         let mut wide = Vec::new();
+        let mut scaled: Vec<(VReg, u8, VReg)> = Vec::new();
+        let mut bases: Vec<(VReg, VReg, u8, VReg)> = Vec::new();
+        let mut addr_of = |f: &mut Func, wide: &mut Vec<Inst>, st: Stream| -> VReg {
+            let Some(iv) = st.iv else { return st.root };
+            if let Some(b) = bases.iter().find(|b| b.0 == st.root && b.1 == iv && b.2 == st.sh) {
+                return b.3;
+            }
+            let t = match scaled.iter().find(|x| x.0 == iv && x.1 == st.sh) {
+                Some(x) => x.2,
+                None => {
+                    let t = f.vreg(Cls::I);
+                    wide.push(Inst::IBinI(IOp::Shl, U64_TY, t, iv, st.sh as i64));
+                    scaled.push((iv, st.sh, t));
+                    t
+                }
+            };
+            let u = f.vreg(Cls::I);
+            wide.push(Inst::IBin(IOp::Add, U64_TY, u, st.root, t));
+            bases.push((st.root, iv, st.sh, u));
+            u
+        };
         for w in &wops {
             let v = f.vreg(Cls::V128);
             vectors.push(v);
             match *w {
                 WOp::Splat(r) => init.push(Inst::VSplat(v, r)),
                 WOp::Const(c) => init.push(Inst::VConst(v, c)),
-                WOp::Load(p) => wide.push(Inst::VLoad(v, p, 0)),
+                WOp::Load(st) => {
+                    let a = addr_of(f, &mut wide, st);
+                    wide.push(Inst::VLoad(v, a, st.disp as i32));
+                }
                 WOp::Bin(o, a, b2) => wide.push(Inst::VBin(o, v, vectors[a], vectors[b2])),
                 WOp::Int(o, a, b2) => wide.push(Inst::VX(o, v, vectors[a], vectors[b2])),
                 WOp::Un(o, a) => wide.push(Inst::VUn(o, v, vectors[a])),
             }
         }
-        wide.push(Inst::VStore(dst, 0, vectors[value]));
+        let a = addr_of(f, &mut wide, dst);
+        wide.push(Inst::VStore(a, dst.disp as i32, vectors[value]));
         for &p in &walkers { wide.push(Inst::IBinI(IOp::Add, U64_TY, p, p, 16)); }
         for &c in &counts { wide.push(Inst::IBinI(IOp::Sub, U64_TY, c, c, lanes)); }
+        for &i in &ivs { wide.push(Inst::IBinI(IOp::Add, U64_TY, i, i, lanes)); }
         wide.push(Inst::IBinI(IOp::Sub, U64_TY, trip, trip, lanes));
         let again = f.vreg(Cls::I);
         wide.push(Inst::ICmpI(Cond::Ge, false, again, trip, lanes));

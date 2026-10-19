@@ -63,6 +63,64 @@ unsafe fn stream_ref(dst: *mut f32, src: *const f32, n: usize) {
     }
 }
 
+/// index loops: `a[i] += b[i] * c[i]`, displaced reads, and the in-place shifted forms
+#[inline(never)]
+fn idx_mad(a: &mut [f32], b: &[f32], c: &[f32]) {
+    let n = a.len().min(b.len()).min(c.len());
+    let (a, b, c) = (&mut a[..n], &b[..n], &c[..n]);
+    for i in 0..n {
+        a[i] += b[i] * c[i];
+    }
+}
+#[inline(never)]
+fn idx_mad_ref(a: &mut [f32], b: &[f32], c: &[f32]) {
+    let n = a.len().min(b.len()).min(c.len());
+    for i in 0..n {
+        let t = black_box(b[i] * c[i]);
+        a[i] = a[i] + t;
+    }
+}
+#[inline(never)]
+fn idx_disp(a: &mut [f32], b: &[f32], c: &[f32], k: f32) {
+    let n = a.len().min(b.len()).min(c.len());
+    for i in 1..n.saturating_sub(1) {
+        a[i] = b[i - 1] + c[i + 1] * k;
+    }
+}
+#[inline(never)]
+fn idx_disp_ref(a: &mut [f32], b: &[f32], c: &[f32], k: f32) {
+    let n = a.len().min(b.len()).min(c.len());
+    for i in 1..n.saturating_sub(1) {
+        a[i] = b[i - 1] + black_box(c[i + 1] * k);
+    }
+}
+/// `v[i] = v[i + 1] * 2` reads ahead of its writes (vector-safe); `v[i + 1] = v[i] * 2 + 1` feeds
+/// each result into the next element (must stay in order)
+#[inline(never)]
+fn shift_down(v: &mut [i32]) {
+    for i in 0..v.len().saturating_sub(1) {
+        v[i] = v[i + 1].wrapping_mul(3);
+    }
+}
+#[inline(never)]
+fn shift_down_ref(v: &mut [i32]) {
+    for i in 0..v.len().saturating_sub(1) {
+        v[i] = black_box(v[i + 1].wrapping_mul(3));
+    }
+}
+#[inline(never)]
+fn carry_up(v: &mut [i32]) {
+    for i in 0..v.len().saturating_sub(1) {
+        v[i + 1] = v[i].wrapping_mul(3) ^ 1;
+    }
+}
+#[inline(never)]
+fn carry_up_ref(v: &mut [i32]) {
+    for i in 0..v.len().saturating_sub(1) {
+        v[i + 1] = black_box(v[i].wrapping_mul(3)) ^ 1;
+    }
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -92,6 +150,29 @@ fn vectorized_maps() {
                 let mut a2 = isrc.clone();
                 mix_i32(&mut a1[lo..hi], &isrc[lo..hi], black_box(ki));
                 mix_i32_ref(&mut a2[lo..hi], &isrc[lo..hi], ki);
+                fails += (a1 != a2) as u32;
+            }
+            for lo in 0..3usize {
+                let hi = (lo + n).min(64);
+                let mut y1 = src.clone();
+                let mut y2 = src.clone();
+                idx_mad(&mut y1[lo..hi], &src[lo..hi], &src[3..]);
+                idx_mad_ref(&mut y2[lo..hi], &src[lo..hi], &src[3..]);
+                fails += (bits(&y1) != bits(&y2)) as u32;
+                let mut y1 = vec![1.0f32; 64];
+                let mut y2 = vec![1.0f32; 64];
+                idx_disp(&mut y1[lo..hi], &src[lo..hi], &src[1 + lo..], black_box(k));
+                idx_disp_ref(&mut y2[lo..hi], &src[lo..hi], &src[1 + lo..], k);
+                fails += (bits(&y1) != bits(&y2)) as u32;
+                let mut a1 = isrc.clone();
+                let mut a2 = isrc.clone();
+                shift_down(&mut a1[lo..hi]);
+                shift_down_ref(&mut a2[lo..hi]);
+                fails += (a1 != a2) as u32;
+                let mut a1 = isrc.clone();
+                let mut a2 = isrc.clone();
+                carry_up(&mut a1[lo..hi]);
+                carry_up_ref(&mut a2[lo..hi]);
                 fails += (a1 != a2) as u32;
             }
             // overlapping streams inside one buffer
