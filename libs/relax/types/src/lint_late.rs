@@ -2436,6 +2436,8 @@ pub fn missing_copy_implementations(prog: &Program, tcx: &Tcx, own: &[bool], rea
         if adt.n_generics != 0 || adt.flags.contains(crate::tcx::AdtFlags::IS_VARIANT_LIST_NON_EXHAUSTIVE) { continue; }
         if tcx.adt_destructor(d).is_some() { continue; }
         if adt.variants.iter().any(|v| v.fields.iter().any(|f| matches!(tcx.tys.kind(f.ty), TyKind::Ptr(..)))) { continue; }
+        let bad = crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ALIAS | crate::types::TypeFlags::HAS_ERROR;
+        if adt.variants.iter().any(|v| v.fields.iter().any(|f| tcx.tys.flags(f.ty).intersects(bad))) { continue; }
         let ty = tcx.tys.intern(TyKind::Adt(d, tcx.tys.mk_list(&[]), adt.region_params));
         let env = tcx.param_env_id(prog, d);
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), d);

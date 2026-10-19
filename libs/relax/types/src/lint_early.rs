@@ -1772,7 +1772,7 @@ impl<'a> W<'a> {
                     self.ty(p.ty);
                     self.leave(p.attrs);
                 }
-                if let Some(r) = sig.ret { self.ty(r); }
+                if let Some(r) = sig.ret { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
             }
             ItemKind::Struct(r) => {
                 let s = *ast.row(r);
