@@ -24,6 +24,8 @@ pub struct MirBorrowckResult {
     pub used_mut: BitSet,
     /// Missing MIR contracts are a stopped check, never an acceptance verdict.
     pub unsupported: Vec<&'static str>,
+    /// Fields of the closure environment this (closure) body mutated through, to be marked `mut` by its creator.
+    pub used_mut_upvars: Vec<FieldIdx>,
     pub region_errors: Vec<super::region_infer::RegionErrorKind>,
     pub tainted_by_errors: bool,
     /// Relaxed crates: conflicts accepted only with field views / extended two-phase borrows
@@ -44,12 +46,25 @@ pub fn mir_borrowck(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirReg
 
 /// `mir_borrowck` with relaxed-Rust field views (field_views/check_hook.rs).
 pub fn mir_borrowck_fv(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>) -> MirBorrowckResult {
-    let nll = check_with_scopes_fv(prog, tcx, body, regions, moves, fv);
+    mir_borrowck_nested(tcx, prog, body, regions, moves, fv, &NestedUsedMut::default())
+}
+
+/// What the nested bodies of a body reported: the closure fields each mutated through (`used_mut_upvars`),
+/// which the creator turns into uses of the captured variables.
+#[derive(Default)]
+pub struct NestedUsedMut(pub Vec<(ClosureId, Vec<FieldIdx>)>);
+impl NestedUsedMut {
+    fn get(&self, id: ClosureId) -> Option<&[FieldIdx]> { self.0.iter().find(|(c, _)| *c == id).map(|(_, f)| &f[..]) }
+}
+
+/// `mir_borrowck_fv` for a body that creates closures: `nested` has their results.
+pub fn mir_borrowck_nested(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>, nested: &NestedUsedMut) -> MirBorrowckResult {
+    let nll = check_with_scopes_fv(prog, tcx, body, regions, moves, fv, nested);
     if !nll.unsupported.is_empty() { return nll; }
     let verify = nll.accepted() && verify_polonius_sample();
     if nll.accepted() && !verify { return nll; }
     *regions = compute_polonius_regions(tcx, prog, body, regions, moves);
-    let polonius = check_with_scopes_fv(prog, tcx, body, regions, moves, fv);
+    let polonius = check_with_scopes_fv(prog, tcx, body, regions, moves, fv, nested);
     if verify { assert!(polonius.accepted(), "Polonius must accept NLL-accepted MIR: {polonius:?}"); }
     polonius
 }
@@ -77,14 +92,14 @@ fn compute_polonius_regions(tcx: &Tcx, prog: &Program, body: &Body, regions: &Mi
 
 #[cfg(test)]
 pub(super) fn check_with_scopes(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
-    check_with_scopes_fv(prog, tcx, body, regions, moves, None)
+    check_with_scopes_fv(prog, tcx, body, regions, moves, None, &NestedUsedMut::default())
 }
-fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>) -> MirBorrowckResult {
+fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>, nested: &NestedUsedMut) -> MirBorrowckResult {
     assert!(regions.locations.matches(body), "region locations belong to another MIR layout");
     let mut result = MirBorrowckResult { errors: vec![], used_mut: BitSet::new_empty(body.local_decls.len()),
-        unsupported: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors,
+        unsupported: vec![], used_mut_upvars: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors,
         fv_only: vec![], fv_records: vec![] };
-    check_supported(tcx, body, &mut result.unsupported);
+    check_supported(tcx, body, nested, &mut result.unsupported);
     if !result.unsupported.is_empty() { return result; }
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
     let borrows = BorrowSet::build(tcx, body, invalidated, moves);
@@ -94,7 +109,7 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
     let mut cx = MirBorrowckCtxt { tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,
         access_errors: vec![], reservation_errors: vec![], uninitialized_errors: BitSet::new_empty(body.local_decls.len()),
         move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![],
-        fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None };
+        fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None, nested };
     for b in cx.cfg.reverse_postorder.clone() {
         let block = &body.basic_blocks[b];
         let block_id = BasicBlock(b as u32);
@@ -124,17 +139,14 @@ fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirReg
 }
 
 
-fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) {
-    struct Check<'a> { tcx: &'a Tcx, body: &'a Body, stops: &'a mut Vec<&'static str> }
+fn check_supported(tcx: &Tcx, body: &Body, nested: &NestedUsedMut, unsupported: &mut Vec<&'static str>) {
+    struct Check<'a> { tcx: &'a Tcx, body: &'a Body, nested: &'a NestedUsedMut, stops: &'a mut Vec<&'static str> }
     impl Check<'_> { fn stop(&mut self, s: &'static str) { if !self.stops.contains(&s) { self.stops.push(s); } } }
     impl Visitor for Check<'_> {
         fn visit_place(&mut self, place: &Place, context: crate::mir::visit::PlaceContext, at: Location) {
             let mut ty = PlaceTy::from_ty(self.body.local_decls[place.local.0 as usize].ty);
             for elem in &place.projection {
                 if matches!(elem, PlaceElem::Subtype(_)) { self.stop("Subtype must be removed before borrowck"); return; }
-                if matches!(elem, PlaceElem::Field(..)) && matches!(self.tcx.tys.kind(ty.ty), TyKind::Closure(..)) {
-                    self.stop("closure field access needs MIR capture metadata"); return;
-                }
                 let Some(next) = ty.projection_ty(self.tcx, elem) else { self.stop("MIR projected type is unavailable"); return; };
                 ty = next;
             }
@@ -142,8 +154,8 @@ fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) 
         }
         fn visit_rvalue(&mut self, rv: &Rvalue, at: Location) {
             match rv {
-                Rvalue::Aggregate(kind, _) if matches!(**kind, AggregateKind::Closure(..) | AggregateKind::Coroutine(..)) =>
-                    self.stop("closure aggregate needs nested used-mut capture metadata"),
+                Rvalue::Aggregate(kind, _) if matches!(&**kind, AggregateKind::Closure(id, _) | AggregateKind::Coroutine(id, _) if self.nested.get(*id).is_none()) =>
+                    self.stop("closure aggregate without its nested body's used-mut upvars"),
                 Rvalue::CopyForDeref(_) => self.stop("runtime rvalue in borrowck MIR"),
                 _ => {}
             }
@@ -158,11 +170,11 @@ fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) 
         }
         fn visit_terminator(&mut self, term: &Terminator, at: Location) {
             if matches!(term.kind, TerminatorKind::InlineAsm(_)) { self.stop("MIR has no inline-asm operands"); }
-            if matches!(term.kind, TerminatorKind::Yield { .. }) { self.stop("Yield needs coroutine movability metadata"); }
+            if matches!(term.kind, TerminatorKind::Yield { .. }) && self.body.coroutine.is_none() { self.stop("Yield outside a coroutine body"); }
             self.super_terminator(term, at);
         }
     }
-    let mut check = Check { tcx, body, stops: unsupported };
+    let mut check = Check { tcx, body, nested, stops: unsupported };
     for (b, block) in body.basic_blocks.iter().enumerate() { check.visit_basic_block_data(BasicBlock(b as u32), block); }
 }
 
@@ -204,6 +216,8 @@ struct MirBorrowckCtxt<'a> {
     /// Relaxed-Rust field views (field_views/check_hook.rs) and the loan the access being
     /// checked creates (its parts are narrowed by the callee's summary).
     fv: Option<fv_hook::FvRun<'a>>, fv_own: Option<usize>,
+    /// The nested bodies' `used_mut_upvars`.
+    nested: &'a NestedUsedMut,
 }
 impl MirBorrowckCtxt<'_> {
     fn error_with(&mut self, kind: ErrorKind, span: Span, detail: Detail) {
@@ -271,7 +285,11 @@ impl MirBorrowckCtxt<'_> {
             && matches!(self.borrows.locals_state_at_exit(), LocalsStateAtExit::AllAreInvalidated) {
             for i in state.borrows.iter() { self.check_for_invalidation_at_exit(&self.borrows[i], at, term.source_info.span); }
         }
-        // STOP: movable-coroutine Yield checking requires arch's movability metadata.
+        // lib.rs visit_terminator_after_primary_effect: a movable coroutine may be moved at a yield,
+        // so no borrow of its local data may be live across it.
+        if matches!(term.kind, TerminatorKind::Yield { .. }) && self.movable_coroutine() {
+            for i in state.borrows.iter() { self.check_for_local_borrow(&self.borrows[i], at, term.source_info.span); }
+        }
     }
     fn consume_rvalue(&mut self, value: &Rvalue, at: Location, span: Span, state: BorrowckDomain<'_>) {
         match value {
@@ -305,7 +323,13 @@ impl MirBorrowckCtxt<'_> {
                 self.access_place(place, Shallow(None), Read(ReadKind::Copy), false, at, span, state);
                 self.check_if_path_or_subpath_is_moved(place, InitAction::Use, at, span, state);
             }
-            Rvalue::Aggregate(_, ops) => for op in ops { self.consume_operand(op, at, span, state); },
+            Rvalue::Aggregate(kind, ops) => {
+                // Report back which mutable upvars were moved into the closure and mutated by it.
+                if let AggregateKind::Closure(id, _) | AggregateKind::Coroutine(id, _) = &**kind {
+                    for &field in self.nested.get(*id).unwrap_or(&[]) { self.propagate_closure_used_mut_upvar(&ops[field.0 as usize]); }
+                }
+                for op in ops { self.consume_operand(op, at, span, state); }
+            }
             Rvalue::ThreadLocalRef(_) => {}
             Rvalue::CopyForDeref(_) => unreachable!("preflight rejected runtime rvalue"),
         }
@@ -449,6 +473,19 @@ impl MirBorrowckCtxt<'_> {
         let span = if kind == TemporaryDropped { decl.source_info.span } else { self.span_at(borrow.reserve_location) };
         self.error_with(kind, span, Detail::Lifetime { borrow: BorrowInfo::from(borrow), dropped_place: dropped.clone(), location: at });
     }
+    /// lib.rs `movable_coroutine`: the body is a coroutine whose movability is `Movable`.
+    fn movable_coroutine(&self) -> bool {
+        self.body.coroutine.as_ref().is_some_and(|c| c.kind.movability() == Movability::Movable)
+    }
+    /// lib.rs `check_for_local_borrow` (E0626): `borrow` of local data live at a yield.
+    fn check_for_local_borrow(&mut self, borrow: &BorrowData, yield_location: Location, _yield_span: Span) {
+        if !super::path_utils::borrow_of_local_data(&borrow.borrowed_place) { return; }
+        let span = self.span_at(borrow.reserve_location);
+        let key = (Place::local(borrow.borrowed_place.local), span);
+        if self.access_errors.contains(&key) { return; }
+        self.access_errors.push(key);
+        self.error_with(BorrowAcrossYield, span, Detail::BorrowAcrossYield { borrow: BorrowInfo::from(borrow), yield_location });
+    }
     fn check_for_invalidation_at_exit(&mut self, borrow: &BorrowData, at: Location, span: Span) {
         let mut root = Place::local(borrow.borrowed_place.local);
         let thread_local = matches!(self.body.local_decls[root.local.0 as usize].local_info, LocalInfo::StaticRef { is_thread_local: true, .. });
@@ -461,10 +498,55 @@ impl MirBorrowckCtxt<'_> {
         self.moves.init_path_map[path].iter().copied().find(|&i| state.ever_inits.contains(i))
     }
     fn add_used_mut(&mut self, root: &Place, allow: bool, state: BorrowckDomain<'_>) {
-        if root.projection.is_empty() && !allow && self.first_reaching_init(root.local, state).is_some() {
-            self.result.used_mut.insert(root.local.0 as usize);
+        if root.projection.is_empty() {
+            // If the local may have been initialized and is now being mutated, the mutation may be a
+            // reassignment, which justifies the `mut`.
+            if !allow && self.first_reaching_init(root.local, state).is_some() { self.result.used_mut.insert(root.local.0 as usize); }
+        } else if !allow {
+            if let Some(field) = self.upvar_field(root) { self.note_used_mut_upvar(field); }
         }
-        // Upvar roots are stopped before checking, until MIR owns capture metadata.
+    }
+    fn upvar_field(&self, place: &Place) -> Option<FieldIdx> { super::path_utils::is_upvar_field_projection(self.tcx, self.body, place) }
+    fn note_used_mut_upvar(&mut self, field: FieldIdx) {
+        if !self.result.used_mut_upvars.contains(&field) { self.result.used_mut_upvars.push(field); }
+    }
+    /// lib.rs `propagate_closure_used_mut_upvar`: a mutable upvar moved into a closure that mutates it
+    /// marks the variable it came from as used mutably.
+    fn propagate_closure_used_mut_upvar(&mut self, operand: &Operand) {
+        let (Operand::Move(place) | Operand::Copy(place)) = operand else { return };
+        if place.projection.is_empty() && !self.body.local_decls[place.local.0 as usize].is_user_variable() {
+            if matches!(self.tcx.tys.kind(self.body.local_decls[place.local.0 as usize].ty), TyKind::Ref(true, ..) | TyKind::Ptr(true, _)) {
+                // The variable will be marked as mutable by the borrow.
+                return;
+            }
+            // A `move` closure inside a non-move closure whose body mutates: the capture may be copied from
+            // a shared reference, so search the local the capture comes from.
+            // `let mut i = 0; || { move || { i += 1; }; };`
+            let path = self.moves.rev_lookup.find_local(place.local).expect("temporary should be tracked");
+            let [init_index] = self.moves.init_path_map[path][..] else { panic!("temporary should be initialized exactly once") };
+            let crate::mir::move_paths::InitLocation::Statement(loc) = self.moves.inits[init_index].location else { panic!("temporary initialized in arguments") };
+            let stmt = &self.body.basic_blocks[loc.block.0 as usize].statements[loc.statement_index];
+            match &stmt.kind {
+                StatementKind::Assign(_, Rvalue::Ref(_, _, source) | Rvalue::Use(Operand::Copy(source) | Operand::Move(source))) => {
+                    let source = source.clone();
+                    self.propagate_used_mut_place(&source);
+                }
+                _ => panic!("closures should only capture user variables or references to user variables"),
+            }
+        } else {
+            self.propagate_used_mut_place(place);
+        }
+    }
+    fn propagate_used_mut_place(&mut self, place: &Place) {
+        // (a) modifying something through a mut-ref, (b) something local to our parent, (c) a nested
+        // closure modifying a path starting from a place captured by its parent.
+        if let Some(field) = self.upvar_field(place) { self.note_used_mut_upvar(field); return; }
+        for i in (0..place.projection.len()).rev() {
+            let base = Place { local: place.local, projection: place.projection[..i].to_vec() };
+            if place.projection[i] == PlaceElem::Deref && matches!(self.tcx.tys.kind(self.ty(&base)), TyKind::Ref(true, ..)) { return; }
+            if let Some(field) = self.upvar_field(&base) { self.note_used_mut_upvar(field); return; }
+        }
+        self.result.used_mut.insert(place.local.0 as usize);
     }
     fn check_access_permissions(&mut self, place: &Place, access: ReadOrWrite, allow: bool, at: Location, span: Span, state: BorrowckDomain<'_>) -> bool {
         let (borrow, allow) = match access {
@@ -514,10 +596,23 @@ impl MirBorrowckCtxt<'_> {
         if elem == PlaceElem::Deref {
             match self.tcx.tys.kind(self.ty(&base)) {
                 TyKind::Ref(false, ..) | TyKind::Ptr(false, _) => Err(place.clone()),
-                TyKind::Ref(true, ..) => self.is_mutable(&base, true),
+                TyKind::Ref(true, ..) => {
+                    // Mutably borrowed data is mutable, but only with a unique path to the `&mut`: a by-reference
+                    // upvar keeps the mode of the access.
+                    let mode = match self.upvar_field(place) { Some(field) if self.body.upvars[field.0 as usize].is_by_ref() => allow, _ => true };
+                    self.is_mutable(&base, mode)
+                }
                 TyKind::Ptr(true, _) => Ok((place.clone(), allow)),
                 TyKind::Adt(def, ..) if self.tcx.adts[def].is_box() => self.is_mutable(&base, allow),
                 _ => panic!("invalid MIR dereference"),
+            }
+        } else if let Some(field) = self.upvar_field(place) {
+            // An upvar field of a closure environment: it is mutable if it was declared so (or its variable's
+            // mutation is allowed), and if the environment itself is (not an `Fn` closure). The mutability is
+            // blamed on `place` so that the outer variable is registered as mutable.
+            match (self.body.upvars[field.0 as usize].mutability, allow) {
+                (Mutability::Not, false) => Err(place.clone()),
+                (Mutability::Not, true) | (Mutability::Mut, _) => { self.is_mutable(&base, allow)?; Ok((place.clone(), allow)) }
             }
         } else { self.is_mutable(&base, allow) }
     }
@@ -858,7 +953,7 @@ fn check_promoted_moves(tcx: &Tcx, body: &Body, result: &mut MirBorrowckResult) 
         }
     }
     for promoted in &body.promoted {
-        check_supported(tcx, promoted, &mut result.unsupported);
+        check_supported(tcx, promoted, &NestedUsedMut::default(), &mut result.unsupported);
         if !result.unsupported.is_empty() { continue; }
         let mut visitor = Moves { tcx, body: promoted, errors: vec![] };
         for (b, block) in promoted.basic_blocks.iter().enumerate() { visitor.visit_basic_block_data(BasicBlock(b as u32), block); }

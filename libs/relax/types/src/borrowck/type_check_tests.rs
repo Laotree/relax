@@ -147,7 +147,6 @@ impl BorrowckTypeOps for Fake<'_> {
     fn static_ty(&mut self, _: &mut MirTypeckRegionConstraints, _: DefId, _: Locations) -> TyId { unreachable!() }
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool { !matches!(self.tcx.tys.kind(ty), TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..)) }
     fn is_privately_uninhabited(&mut self, ty: TyId) -> bool { ty == self.tcx.tys.never }
-    fn is_upvar_field_projection(&self, _: &Body, _: &Place) -> Option<FieldIdx> { None }
     fn simd_const_arg(&self, _: DefId) -> Option<(usize, &'static str)> { None }
     fn closure_parent_args(&self, _: ClauseOwner, _: &[GenericArg]) -> (Vec<GenericArg>, Vec<GenericArg>) { (vec![], vec![]) }
     fn unsized_fn_params(&self) -> bool { false }

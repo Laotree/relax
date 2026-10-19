@@ -117,8 +117,6 @@ pub trait BorrowckTypeOps: liveness::LivenessOps {
     fn static_ty(&mut self, out: &mut MirTypeckRegionConstraints, def: DefId, locations: Locations) -> TyId;
     fn type_is_sized_modulo_regions(&mut self, ty: TyId) -> bool;
     fn is_privately_uninhabited(&mut self, ty: TyId) -> bool;
-    /// N:path_utils.rs is_upvar_field_projection (needs MIR capture metadata).
-    fn is_upvar_field_projection(&self, body: &Body, place: &Place) -> Option<FieldIdx>;
     /// `(argument index, name)` of simd_shuffle/simd_insert/simd_extract.
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)>;
     /// (identity args of the typeck root, the closure's parent args) for #98589.
@@ -570,7 +568,7 @@ impl<'a> TypeChecker<'a> {
     /// Constraints of a borrow `&'a P` at `location`: reborrowing through a
     /// reference requires its region to outlive the borrow's.
     fn add_reborrow_constraint(&mut self, location: Location, borrow_region: Region, borrowed_place: &Place) {
-        let category = match self.infcx.is_upvar_field_projection(self.body, borrowed_place) {
+        let category = match crate::borrowck::path_utils::is_upvar_field_projection(self.tcx, self.body, borrowed_place) {
             Some(field) => ConstraintCategory::ClosureUpvar(field),
             None => ConstraintCategory::Boring,
         };
