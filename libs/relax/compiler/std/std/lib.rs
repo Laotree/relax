@@ -64,12 +64,14 @@ pub mod collections {
     pub use core::collections::btree_set;
     pub use core::collections::hash_map;
     pub use core::collections::hash_set;
+    pub use core::collections::linked_list;
     pub use core::collections::vec_deque;
     pub use core::collections::BTreeMap;
     pub use core::collections::BTreeSet;
     pub use core::collections::BinaryHeap;
     pub use core::collections::HashMap;
     pub use core::collections::HashSet;
+    pub use core::collections::LinkedList;
     pub use core::collections::TryReserveError;
     pub use core::collections::VecDeque;
 }
