@@ -144,7 +144,7 @@ pub struct Tok {
 
 pub struct LexError {
     pub pos: u32,
-    pub msg: &'static str,
+    pub msg: std::borrow::Cow<'static, str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,13 +181,13 @@ pub fn lex_with(src: &[u8], opts: &LexOptions, out: &mut Vec<Tok>) -> Result<(),
         return result.map_err(|e| TokenLexError {
             code: 2,
             lo: e.pos,
-            hi: if matches!(e.msg, "unexpected character" | "bad char literal" | "bad quote") {
+            hi: if matches!(&*e.msg, "unexpected character" | "bad char literal" | "bad quote") {
                 (e.pos as usize + src.get(e.pos as usize).map_or(0, |&c| utf8_len(c)))
                     .min(src.len()) as u32
             } else {
                 src.len() as u32
             },
-            msg: e.msg.into(),
+            msg: e.msg.into_owned(),
         });
     }
     let source = std::str::from_utf8(src).map_err(|e| TokenLexError {
@@ -270,7 +270,7 @@ trait ScanError {
 
 impl ScanError for LexError {
     fn ordinary(lo: usize, _hi: usize, msg: &'static str) -> Self {
-        Self { pos: lo as u32, msg }
+        Self { pos: lo as u32, msg: msg.into() }
     }
 
     fn dialect(_code: u16, _lo: usize, _hi: usize, _msg: String) -> Self {
@@ -376,6 +376,27 @@ fn is_ident_cont(c: u8) -> bool {
     IDENT_BYTES[c as usize] & 2 != 0
 }
 
+/// Byte length of the non-ASCII Pattern_White_Space character at `src[i]` (U+0085, U+200E,
+/// U+200F, U+2028, U+2029: rustc_lexer `is_whitespace`), else 0.
+#[inline]
+fn pattern_whitespace_len(src: &[u8], i: usize) -> usize {
+    match src[i] {
+        0xC2 if src.get(i + 1) == Some(&0x85) => 2,
+        0xE2 if src.get(i + 1) == Some(&0x80) && matches!(src.get(i + 2), Some(0x8E | 0x8F | 0xA8 | 0xA9)) => 3,
+        _ => 0,
+    }
+}
+
+/// End of the identifier-continue run starting at `j`: non-ASCII bytes continue it except
+/// Pattern_White_Space characters.
+#[inline]
+fn ident_run_end(src: &[u8], mut j: usize) -> usize {
+    while j < src.len() && is_ident_cont(src[j]) && (src[j] < 0x80 || pattern_whitespace_len(src, j) == 0) {
+        j += 1;
+    }
+    j
+}
+
 pub fn keyword(s: &[u8], edition: u16) -> Option<T> {
     let k = match s {
         b"as" => T::KwAs,
@@ -424,6 +445,24 @@ pub fn keyword(s: &[u8], edition: u16) -> Option<T> {
     Some(k)
 }
 
+/// The diagnostic validation of the literals and identifiers of a written source file's tokens
+/// (rustc_parse's lexer cooking): `makepad check` only. Macro text lexed on the side is not held to it.
+pub fn validate_file(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), LexError> {
+    if !crate::validate::enabled() {
+        return Ok(());
+    }
+    crate::validate::validate(src, toks, edition).map_err(|(pos, msg)| LexError { pos, msg })
+}
+
+pub fn validation_enabled() -> bool {
+    crate::validate::enabled()
+}
+
+/// Turns the diagnostic validation of literals and identifiers on (`makepad check`).
+pub fn set_validation(on: bool) {
+    crate::validate::set_enabled(on);
+}
+
 pub fn lex(src: &[u8], edition: u16, out: &mut Vec<Tok>) -> Result<(), LexError> {
     scan::<false, false, true, LexError>(src, "", edition, out)
 }
@@ -442,6 +481,23 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
         let mut j = i + 2;
         while !RX && j < n && (src[j] == b' ' || src[j] == b'\t') {
             j += 1;
+        }
+        // rustc strip_shebang: `#!` starts an inner attribute when the next token after
+        // whitespace and plain comments is `[`
+        if !RX {
+            loop {
+                while j < n && matches!(src[j], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) { j += 1; }
+                if src[j..].starts_with(b"//") && !((src[j..].starts_with(b"///") && !src[j..].starts_with(b"////")) || src[j..].starts_with(b"//!")) {
+                    while j < n && src[j] != b'\n' { j += 1; }
+                } else if src[j..].starts_with(b"/*") && !((src[j..].starts_with(b"/**") && !src[j..].starts_with(b"/***") && !src[j..].starts_with(b"/**/")) || src[j..].starts_with(b"/*!")) {
+                    let mut depth = 0usize;
+                    while j < n {
+                        if src[j..].starts_with(b"/*") { depth += 1; j += 2; } else if src[j..].starts_with(b"*/") { depth -= 1; j += 2; if depth == 0 { break; } } else { j += 1; }
+                    }
+                } else {
+                    break;
+                }
+            }
         }
         if j >= n || src[j] != b'[' {
             let lo = i;
@@ -462,6 +518,10 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
             continue;
         }
         let kind = match c {
+            _ if c >= 0x80 && !RX && pattern_whitespace_len(src, i) > 0 => {
+                i += pattern_whitespace_len(src, i);
+                continue;
+            }
             b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => {
                 i += 1;
                 // Indentation and other whitespace runs need no token dispatch
@@ -545,9 +605,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                         if j + 2 < n && src[j] == b'r' && src[j + 1] == b'#' && is_ident_start(src[j + 2]) {
                             j += 2;
                         }
-                        while j < n && is_ident_cont(src[j]) {
-                            j += 1;
-                        }
+                        j = ident_run_end(src, j);
                         i = j;
                         T::Lifetime
                     } else {
@@ -766,7 +824,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     i = lex_quoted_mode::<RX>(src, i + 2, b'\'').ok_or_else(|| err(lo, "bad byte"))?;
                     if !RX { i = lex_suffix(src, i); }
                     T::Byte
-                } else if (c == b'b' || c == b'c') && i + 1 < n && src[i + 1] == b'"' {
+                } else if (c == b'b' || (c == b'c' && edition >= 2021)) && i + 1 < n && src[i + 1] == b'"' {
                     i = lex_quoted_mode::<RX>(src, i + 2, b'"').ok_or_else(|| err(lo, "bad string"))?;
                     if !RX { i = lex_suffix(src, i); }
                     if c == b'b' {
@@ -774,7 +832,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     } else {
                         T::CStr
                     }
-                } else if let Some(j) = raw_string_start(src, i) {
+                } else if let Some(j) = raw_string_start(src, i).filter(|_| c != b'c' || edition >= 2021) {
                     i = lex_raw_string(src, j).ok_or_else(|| err(lo, "unterminated raw string"))?;
                     if !RX { i = lex_suffix(src, i); }
                     // br".." is a raw byte string, cr".." a raw C string
@@ -793,18 +851,18 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     i = rx_suffix(source, i);
                     if raw { T::RawIdent } else { keyword(&src[lo..i], edition).unwrap_or(T::Ident) }
                 } else if c == b'r' && i + 2 < n && src[i + 1] == b'#' && is_ident_start(src[i + 2]) {
-                    let mut j = i + 2;
-                    while j < n && is_ident_cont(src[j]) {
-                        j += 1;
-                    }
+                    let j = ident_run_end(src, i + 2);
                     i = j;
                     T::RawIdent
                 } else {
-                    let mut j = i + 1;
-                    while j < n && is_ident_cont(src[j]) {
-                        j += 1;
-                    }
+                    let j = ident_run_end(src, i + 1);
                     let k = keyword(&src[i..j], edition).unwrap_or(T::Ident);
+                    // rustc_lexer `ident_or_unknown_prefix`: an identifier right before `#`, `"` or
+                    // `'` is a reserved prefix, an error from edition 2021 (the known prefixes
+                    // `b`, `br`, `c`, `cr`, `r` were taken above)
+                    if VALIDATE && edition >= 2021 && j < n && matches!(src[j], b'#' | b'"' | b'\'') {
+                        return Err(err(i, "prefix is unknown"));
+                    }
                     if k == T::Ident && is_raw_body(&src[i..j]) {
                         // `name! {` of a registered raw-body macro: hand the body over untokenised
                         let mut m = j;
@@ -898,11 +956,9 @@ fn lex_quoted_mode<const RX: bool>(src: &[u8], mut i: usize, q: u8) -> Option<us
     None
 }
 
-fn lex_suffix(src: &[u8], mut i: usize) -> usize {
-    if i < src.len() && is_ident_start(src[i]) {
-        while i < src.len() && is_ident_cont(src[i]) {
-            i += 1;
-        }
+fn lex_suffix(src: &[u8], i: usize) -> usize {
+    if i < src.len() && is_ident_start(src[i]) && (src[i] < 0x80 || pattern_whitespace_len(src, i) == 0) {
+        return ident_run_end(src, i);
     }
     i
 }

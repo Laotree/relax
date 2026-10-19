@@ -104,13 +104,17 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         cast_checks: Vec::new(),
         pat_nest: 0,
         bind_mode: 0,
+        pat_depth: 0,
         pat_path_pre: None,
         pending_captures: Vec::new(),
         deferred_call_resolutions: Vec::new(),
         deferred_sized_obligations: Vec::new(),
+        pat_decl_irrefutable: false,
+        item_blocks: Vec::new(),
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
         extra_arg: None,
+        soft: false,
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
@@ -128,6 +132,8 @@ fn program(source: &str) -> (Program, Tcx) {
     let mut prog = Program::new(&std::sync::Arc::new(crate::Session::default()));
     let cfg = crate::cfg::CfgSet::host(&prog.session, &[]);
     prog.load_crate("native_fcx", path.to_str().unwrap(), 2021, cfg, vec![]).unwrap();
+    // the checks that report only in a checked crate (casts, ...) run in this crate
+    for c in prog.crates.iter_mut() { c.validate = true; }
     let mut tcx = Tcx::new(); tcx.collect(&prog);
     assert!(prog.errors.is_empty(), "{:?}", prog.errors);
     assert!(tcx.errors.is_empty(), "{:?}", tcx.errors);
