@@ -57,7 +57,7 @@ fn reason_key(reason: &UnsupportedReason) -> String {
 /// unbuilt bodies are counted per reason and are not failures.
 pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
     let only = std::env::var("MAKEPAD_RUN_MIR_BUILD_ONLY").ok();
-    let dump = std::env::var("MAKEPAD_RUN_MIR_BUILD_DUMP").ok();
+    let dump: Vec<String> = std::env::var("MAKEPAD_RUN_MIR_BUILD_DUMP").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
     let std_crates: Vec<u32> = ["core", "alloc", "std"].iter().filter_map(|n| prog.crates.iter().position(|c| prog.syms.str(c.name) == *n).map(|i| i as u32)).collect();
     let (mut owners, mut typeck_fail, mut built, mut validate_fail, mut panics) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut unbuilt = Histogram::default();
@@ -106,12 +106,19 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
             let kind = super::owner_kind_name(b.kind);
             let slot = by_kind.entry(kind).or_insert((0, 0));
             slot.0 += 1;
-            let at = if let BodyKind::Closure(e) = b.kind { format!("{path}::{{closure#{}}}", e.0) } else { path.clone() };
+            let at = if let BodyKind::Closure(e) = b.kind {
+                let pf = &prog.files[typeck_body.file as usize];
+                let lo = pf.ast.expr(e).lo;
+                let line = 1 + pf.bytes(0, lo).iter().filter(|&&c| c == b'\n').count();
+                format!("{path}::{{closure#{}}} ({}:{line})", e.0, prog.file_paths[typeck_body.file as usize])
+            } else {
+                path.clone()
+            };
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_mir(&root, b))) {
                 Ok(Ok(mir)) => {
                     built += 1;
                     slot.1 += 1;
-                    if dump.as_ref().is_some_and(|s| at.contains(s.as_str())) {
+                    if dump.iter().any(|s| at.contains(s.as_str())) {
                         println!("{}", crate::mir::pretty::print_body(prog, tcx, &at, &mir));
                     }
                     let errors = crate::mir::validate::validate(&mir, tcx);
