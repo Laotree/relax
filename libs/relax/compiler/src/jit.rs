@@ -1139,6 +1139,13 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
     let u = &*UNIT;
     let tname = os::thread::name(os::thread::current());
     let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| format!("{:#x}", info.frames.first().copied().unwrap_or(0))));
+    // a fault while a constant is evaluated in a check (a null or dangling dereference, a stack
+    // overflow from unbounded recursion, an abort): the evaluation fails, which rustc reports
+    // as E0080 (the interpreter rejects the same accesses); the initializer's caller reports it.
+    // In `makepad run` it can only be a miscompile (or a generated const): the crash report stays
+    if CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) > 0 && u.prog.session.options.const_fuel {
+        return false;
+    }
     // a guarded run-time module call (std::relax::guard): the fault is contained to the call
     // and reported; the caller marks the module failed
     if GUARD_DEPTH.with(|g| g.get()) > 0 {
@@ -1484,6 +1491,72 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     if !regs.is_null() {
         unsafe { unwind_walk(regs) }
     }
+    CLEANING.with(|c| c.set(0));
+    UNWINDING.with(|c| c.set(false));
+    unsafe {
+        let leave: rt_fn_ty!(fn(*mut u64, u64) -> !) = std::mem::transmute((&*UNIT).leave as usize);
+        leave(ctx_ptr(), 1)
+    }
+}
+
+/// Loop iterations one constant's evaluation may run before rustc's `long_running_const_eval`
+/// error (rustc_const_eval machine.rs LINT_TERMINATOR_LIMIT counts MIR terminators: each
+/// iteration has at least one, so a loop within the interpreter's limit is within this one).
+const LINT_TERMINATOR_LIMIT: u64 = 2_000_000;
+pub(crate) const LONG_RUNNING_CONST_EVAL: &str = "constant evaluation is taking a long time";
+/// The panic kind of that stop (a distinct kind, not a message).
+pub(crate) const LONG_RUNNING_KIND: &str = "long_running_const_eval";
+
+thread_local! {
+    /// (iterations so far, the iteration at which the evaluation stops) of the constant being
+    /// evaluated on this thread; each evaluation counts separately (rustc: one interpreter each)
+    static CONST_FUEL: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, LINT_TERMINATOR_LIMIT)) };
+}
+
+/// A loop head of the checked program ran: while a constant is evaluated, the evaluation ends
+/// as `long_running_const_eval` after the limit (none when the lint is allowed at the constant).
+pub(crate) fn const_fuel_tick() {
+    if !in_const_eval() { return; }
+    let Ok((n, limit)) = CONST_FUEL.try_with(|c| { let (n, l) = c.get(); c.set((n + 1, l)); (n + 1, l) }) else { return };
+    if n == limit {
+        leave_thread(LONG_RUNNING_KIND, LONG_RUNNING_CONST_EVAL.to_string());
+    }
+}
+
+/// One evaluation's own counter: the enclosing evaluation's is saved and comes back.
+struct ConstEvalScope { saved_fuel: (u64, u64) }
+
+impl ConstEvalScope {
+    fn enter(prog: &Program, d: DefId) -> ConstEvalScope {
+        let level = relax_types::lint::level(prog, d, &relax_types::lint::LONG_RUNNING_CONST_EVAL);
+        let limit = if level >= relax_types::lint::Level::Deny { LINT_TERMINATOR_LIMIT } else { u64::MAX };
+        let saved_fuel = CONST_FUEL.try_with(|c| c.replace((0, limit))).unwrap_or((0, LINT_TERMINATOR_LIMIT));
+        let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get() + 1));
+        ConstEvalScope { saved_fuel }
+    }
+}
+
+impl Drop for ConstEvalScope {
+    fn drop(&mut self) {
+        let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1)));
+        let _ = CONST_FUEL.try_with(|c| c.set(self.saved_fuel));
+    }
+}
+
+/// A constant's initializer is being evaluated on this thread (run_init_code).
+pub(crate) fn in_const_eval() -> bool {
+    CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) > 0 && unsafe { *ctx_ptr() } != 0
+}
+
+/// A constant's evaluation inside a `makepad check`: its failures are diagnostics.
+pub(crate) fn in_checked_const_eval() -> bool {
+    in_const_eval() && unsafe { !UNIT.is_null() && (&*UNIT).prog.session.options.const_fuel }
+}
+
+/// Ends the run of the calling thread's `call_jit_in` with the panic recorded for it already
+/// (PANIC): a panic that reached the edge of a function that cannot unwind, in a constant's
+/// evaluation, fails the evaluation (rustc's interpreter has no unwinding ABI to abort at).
+pub(crate) fn leave_pending_panic() -> ! {
     CLEANING.with(|c| c.set(0));
     UNWINDING.with(|c| c.set(false));
     unsafe {
@@ -2024,7 +2097,7 @@ unsafe fn on_fault_locked(f: &os::fault::Fault, hooks: &os::fault::Hooks) -> os:
         }
         // a fault at the recovery entry itself, or an instruction fetch fault in code memory
         // (the code is not executable): resuming would fault again forever -- report and end
-        if pc == u.leave || (fault == pc && in_jit_code(pc)) {
+        if pc == u.leave || (fault == pc && matches!(f.kind, Kind::Segv | Kind::Bus) && in_jit_code(pc)) {
             fatal_report(f);
         }
     }
@@ -2531,12 +2604,19 @@ impl Unit {
     fn crossing_of(&self, ks: &[u32]) -> std::collections::HashSet<TyId> {
         let pt = &self.provided_types;
         let provided = &self.provided;
+        // A bound fn has a shim under its key, and a key ends in the fn's own name. Only the
+        // fns of those names are keyed, and only the ones a shim names get their signature
+        // worked out (it drags in lifetime resolution): the provided crates have thousands of
+        // fns the shims do not name, and this ran on the first lowering of a provided type.
+        let names: std::collections::HashSet<&str> = provided.iter().filter(|(pk, _)| ks.contains(pk)).flat_map(|(_, pc)| pc.shims.keys()).filter_map(|k| k.rsplit("::").next()).collect();
         crate::provided::crossing_types(&self.prog, &self.tcx, ks, &|d| {
-            let k = self.prog.def(d).krate;
-            crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
-                let key = crate::provided::key(&self.prog, &self.tcx, d);
-                provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
+            let def = self.prog.def(d);
+            if !names.contains(self.prog.syms.str(def.name)) {
+                return false;
             }
+            let key = crate::provided::key(&self.prog, &self.tcx, d);
+            provided.iter().any(|(pk, pc)| *pk == def.krate && pc.shims.contains_key(key.as_str()))
+                && crate::provided::unbound_reason(&self.prog, &self.tcx, def.krate, d, &|a| pt.contains_key(&a)).is_none()
         })
     }
 
@@ -3968,7 +4048,21 @@ impl Unit {
             self.put_const(d, args, a);
             return Some(a);
         }
-        match self.eval_init(d, args.clone(), false) {
+        // a constant whose initializer needs its own value (directly or through other constants):
+        // rustc's E0391 (the query cycle of const evaluation), not unbounded recursion
+        if CONST_STACK.try_with(|s| s.borrow().iter().any(|(sd, sa)| *sd == d && *sa == args)).unwrap_or(false) {
+            let def = self.prog.def(d);
+            let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
+            self.note_error(format!("{}: E0391: cycle detected when evaluating the initializer of `{}`", at, self.prog.def_path(d)));
+            self.const_failed.insert((d, args));
+            return None;
+        }
+        // (popped also when the evaluation unwinds: a cancelled request is retried)
+        struct Pop;
+        impl Drop for Pop { fn drop(&mut self) { let _ = CONST_STACK.try_with(|s| { s.borrow_mut().pop(); }); } }
+        let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone())));
+        let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
+        match evaluated {
             Some(a) => {
                 if let Some(mut cache) = self.cache.take() {
                     cache.record_const(self, d, &args, a);
@@ -4052,12 +4146,23 @@ impl Unit {
             return 0;
         } else {
             self.record_static(d, t, buf);
+            self.validate_final(d, t, buf);
         }
         let sym = self.syms.intern(crate::syms::SymKind::Static(d), buf);
         crate::sandbox::capture_initial_data(self, sym);
         // every other live domain gets its own copy of the new static (none: nothing to do)
         crate::domain::materialize(self, sym);
         buf
+    }
+
+    /// A check validates the final value of a constant or static (rustc: validity of the result).
+    fn validate_final(&mut self, d: DefId, t: TyId, buf: u64) {
+        if !self.prog.session.options.const_fuel { return; }
+        if let Some(msg) = crate::ctfe::invalid_scalar(self, t, buf, 0) {
+            let def = self.prog.def(d);
+            let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
+            self.note_error(format!("{}: E0080: {} [in {}]", at, msg, self.prog.def_path(d)));
+        }
     }
 
     fn eval_init(&mut self, d: DefId, args: Vec<TyId>, mutable: bool) -> Option<u64> {
@@ -4071,7 +4176,8 @@ impl Unit {
             self.syms.set_data_name(b, const_name(self, d, &args));
             b
         };
-        let r = self.run_init(d, args, buf);
+        let r = self.run_init(d, args.clone(), buf);
+        if r.is_some() { self.validate_final(d, t, buf); }
         // a constant's undefined bytes are 0 whichever way its initializer ran
         if r.is_some() && !mutable {
             crate::ctfe::zero_undefined(self, t, buf);
@@ -4182,7 +4288,7 @@ impl Unit {
             self.exec_note(id, crate::exec_profile::CALL);
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
-            r = unsafe { call_jit(self as *mut Unit, entry, buf) };
+            r = { let _scope = ConstEvalScope::enter(&self.prog, d); unsafe { call_jit(self as *mut Unit, entry, buf) } };
             compile_watch(None);
             // a compile the code reached was cancelled (a nested request blocked by an earlier
             // one): no value and no error -- the request is cancelled here, in Rust frames
@@ -4207,7 +4313,9 @@ impl Unit {
             // already, and rustc reports no evaluation error for it
             Err(p) if p.message.starts_with("compile error in ") => None,
             Err(p) => {
-                let m = format!("{}: E0080: {} [in {}]", self.ctfe_error_location(d, id, &p), ctfe_error_message(&p.message), self.prog.def_path(d));
+                // the deny-by-default lint, not an evaluation error: no code
+                let code = if p.kind == LONG_RUNNING_KIND { "" } else { "E0080: " };
+                let m = format!("{}: {}{} [in {}]", self.ctfe_error_location(d, id, &p), code, if p.kind == LONG_RUNNING_KIND { p.message.clone() } else { ctfe_error_message(&p.message) }, self.prog.def_path(d));
                 // rustc rejects a program whose constant or static cannot be evaluated (E0080);
                 // `makepad run` ends here instead of running on with a zeroed or null value
                 // (`makepad test` / `live` keep it recoverable, as for compile errors)
@@ -4231,14 +4339,19 @@ impl Unit {
     fn ctfe_error_location(&self, d: DefId, init: u32, p: &PanicInfo) -> String {
         // the initializer's own frame: where it called the failing const fn (rustc's span; the
         // const fn's frames are its notes)
+        let def = self.prog.def(d);
+        // (a location in another file is a const fn inlined into the initializer: rustc's span
+        // is in the constant itself)
+        let own = self.prog.file_paths.get(def.file as usize).map(|f| format!("{}:", f));
         for &pc in &p.frames {
             for at in [pc, pc.wrapping_sub(1)] {
                 if self.find_fn(at) == Some(init) {
-                    if let Some((_, loc)) = self.pc_to_src(at) { if loc.matches(':').count() >= 2 { return loc; } }
+                    if let Some((_, loc)) = self.pc_to_src(at) {
+                        if loc.matches(':').count() >= 2 && own.as_ref().map_or(true, |o| loc.starts_with(o)) { return loc; }
+                    }
                 }
             }
         }
-        let def = self.prog.def(d);
         let site = self.sites.lock().unwrap_or_else(|e| e.into_inner()).get(p.site as usize).map(|st| (st.file, st.pos));
         match site {
             Some((f, pos)) if f == def.file => self.pos_str(f, pos),
@@ -8404,6 +8517,9 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
             }
         }
     }
+    // (a check evaluates a constant where the lowering reaches its use: one named only in a branch
+    // that is never taken is not collected, as in rustc's monomorphization)
+    if (&*up).prog.session.options.const_fuel { const_uses.clear(); }
     for (d, args, kind) in const_uses {
         // a const used inside its own initializer is an error rustc already reports
         if let FnKey::Inst(me, _) = &key {
@@ -8441,13 +8557,26 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
 fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(crate::rir::Func, bool), String> {
     let name = u.fns[id as usize].name.to_string();
     trace("lower", &name);
-    let mut lcx = Lcx::new(u, body, name, id);
+    let mut lcx = Lcx::new(u, body, name.clone(), id);
     match key {
         FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
         FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
     }
     lcx.finish();
+    // A branch on a known constant was folded (check only) on the strength of registers written
+    // once so far; registers are not SSA, so a later write (a loop assigning the variable) voids
+    // the proof: the body is lowered again as written.
+    if lcx.fold && lcx.fold_regs.borrow().iter().any(|v| crate::lower::rir_writes(&lcx.f, &[], *v) != 1) {
+        lcx = Lcx::new(u, body, name, id);
+        lcx.fold = false;
+        match key {
+            FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
+            FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
+            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
+        }
+        lcx.finish();
+    }
     // a body that cannot unwind (C-family ABIs without `-unwind`): a panic aborts
     // at its edge (rustc AbortUnwindingCalls)
     if let FnKey::Inst(d, _) = key {
@@ -8718,6 +8847,10 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
     // byte stores of one value's bytes -> one wide store (before address modes)
     relax_codegen::loops::merge_stores(options, func);
     if cfg.fold {
+        // steps of an unrolled copy hang off the first value (offsets fold into address modes)
+        if relax_codegen::loops::flatten_step_chains(func) {
+            crate::opt::live_dce(func);
+        }
         crate::opt::addr_modes(func);
         // results computed early for one later use move next to it (O3)
         crate::opt::sink_single_uses(func);
@@ -11070,6 +11203,7 @@ extern "C" fn relax_first_present() {
             exec_check_now("first frame");
         }
         FIRST_PRESENT_NS.store(wall_ns(), Ordering::Release);
+        for i in 0..8 { AHEAD_AT_PRESENT[i].store(AHEAD_STATS[i].load(Ordering::Relaxed), Ordering::Relaxed); }
         crate::solver_work::report();
         crate::exec_census::first_present();
         crate::tcx::Tcx::report_declaration_counters();
@@ -12125,6 +12259,10 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
 }
 
 thread_local! {
+    /// the constants (and their arguments) whose initializers this thread is evaluating, outermost first
+    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// const/static initializers this thread is evaluating (run_init_code)
+    static CONST_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// guarded run-time module calls this thread is inside (std::relax::guard)
     static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -12263,9 +12401,9 @@ pub(crate) unsafe fn compile_batch_off_lock(up: *mut Unit, ids: &[u32], threads:
     let work_cells: Vec<relax_session::sync::Mutex<Option<(u32, Front, String)>>> = work.into_iter().map(|w| relax_session::sync::Mutex::new(Some(w))).collect();
     let finished = std::sync::atomic::AtomicUsize::new(0);
     let helpers = threads.max(1).min(work_cells.len().max(1));
-    std::thread::scope(|sc| {
+    crate::pool::scope(|sc| {
         for _ in 0..helpers {
-            sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+            sc.spawn(|| {
                 // counted when this helper is done, also if it panics (the owner waits for all)
                 struct Done<'a>(&'a std::sync::atomic::AtomicUsize);
                 impl Drop for Done<'_> {
@@ -13111,7 +13249,8 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         LOWERING_AHEAD.with(|a| a.set(true));
         let _guard = LowerAheadGuard;
-        let body = crate::typeck::codegen_body(&u.prog, &u.tcx, d, &key.1);
+        // an instance that does not normalize is the locked build's to report
+        let Some(body) = crate::typeck::try_codegen_body(&u.prog, &u.tcx, d, &key.1) else { return Err("body does not normalize".to_string()) };
         let (func, closures) = lower_checked_body(u, id, &fn_key, &body)?;
         let callees = LOWER_AHEAD_IDS.with(|a| std::mem::take(&mut a.borrow_mut().keys));
         Ok::<_, String>(LoweredAhead { epoch, file: body.file, func, body: closures.then_some(body), callees })
@@ -13130,6 +13269,8 @@ fn lower_ahead(f: &FrontShared, id: u32) {
     if std::env::var_os("MAKEPAD_RUN_AHEAD_TRACE").is_some() {
         eprintln!("ahead-lower {} {} us: {}", if ready.is_some() { "ready" } else { "deferred" }, (cpu_ns() - t0) / 1000, u.prog.def_path(d));
     }
+    AHEAD_STATS[7].fetch_add(cpu_ns() - t0, Ordering::Relaxed);
+    if ready.is_some() { AHEAD_STATS[5].fetch_add(1, Ordering::Relaxed); }
     let mut pending = f.lowered.lock().unwrap_or_else(|e| e.into_inner());
     if f.built.contains(&key) {
         pending.remove(&id);
@@ -13146,6 +13287,7 @@ fn take_lowered_ahead(u: &mut Unit, id: u32) -> Option<crate::rir::Func> {
         || lowered.epoch != u.tcx.collect_epoch.load(Ordering::SeqCst)
         || lowered.file != u.fns[id as usize].file
     { return None; }
+    AHEAD_STATS[6].fetch_add(1, Ordering::Relaxed);
     if let FnKey::Inst(d, args) = &u.fns[id as usize].key {
         let key = (*d, args.clone());
         u.front.built.insert(key.clone(), ());
@@ -13204,8 +13346,11 @@ fn publish_ahead(f: &FrontShared, key: AheadKey, epoch: u64, body: std::sync::Ar
 }
 
 /// bodies checked ahead, taken by a build, checked with errors (dropped); cpu ns of the
-/// checks ahead on callers' threads and on the speculative workers
-pub static AHEAD_STATS: [AtomicU64; 5] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// checks ahead on callers' threads and on the speculative workers; bodies lowered ahead,
+/// lowered bodies a build took (the other builds lowered their own or never ran), cpu ns lowering
+pub static AHEAD_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// AHEAD_STATS as they stood at the first present (the helpers end there).
+pub static AHEAD_AT_PRESENT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn ahead_on(options: &crate::options::Options) -> bool {
     options.tyck_ahead
@@ -13371,7 +13516,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
         };
         // Discover only direct inline candidates; publish before checking any of them.
         let callees = if depth > 0 {
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b, true))) {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body_callees(prog, tcx, &b, true, Some(core)))) {
                 Ok(c) => c,
                 Err(_) => Vec::new(),
             }
@@ -13422,7 +13567,7 @@ fn typeck_ahead(f: &FrontShared, d: DefId, args: Vec<TyId>, depth: u32, queued: 
 /// miss only means the build checks that body itself. `warm_only`: calls inside a diverging
 /// call's expression (`panic!(..)`'s formatting, `unwrap_failed(..)`) are left out, as
 /// prepare_rir_from leaves the callees of cold blocks out of its inline candidates.
-pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool) -> Vec<(DefId, Vec<TyId>)> {
+pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool, only_krate: Option<u32>) -> Vec<(DefId, Vec<TyId>)> {
     use crate::ast::ExprKind;
     let ast = &prog.files[b.file as usize].ast;
     let cold: Vec<(u32, u32)> = if warm_only {
@@ -13444,6 +13589,12 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool)
     };
     let mut out: Vec<(DefId, Vec<TyId>)> = Vec::new();
     let mut add = |k: u32, d: DefId, args: &[TyId]| {
+        // `only_krate`: an instance in that crate is reached through a declaration in it (an impl
+        // of a trait sits in the trait's crate or the type's, never in a crate below both), so
+        // the other declarations are not resolved at all
+        if only_krate.is_some_and(|kr| prog.def(d).krate != kr) {
+            return;
+        }
         // rustc_ty_utils/src/instance.rs:187-198 @8d1a764: instance
         // discovery is a codegen boundary, including non-trait callees.
         let mut erased = Vec::with_capacity(args.len());

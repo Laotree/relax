@@ -4,6 +4,7 @@
 pub mod bir;
 pub mod borrowck_errors;
 pub mod check;
+pub mod check_consts;
 pub mod mir_nll;
 pub mod polonius;
 pub mod root_cx;
@@ -103,6 +104,32 @@ pub fn check_body_in(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, bod
     result
 }
 
+/// An anonymous constant that is a body owner of its own (typeck-audit 1.27) is const-checked
+/// alone: rustc_const_eval check_consts on its MIR.
+pub fn check_anon_const(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &Body, expr: crate::ast::ExprId) -> Vec<event::BorrowError> {
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
+    let tx = tyx::Tx::new(prog, tcx, env, cx.state);
+    if body.args.iter().any(|a| matches!(tcx.tys.kind(*a), crate::types::TyKind::Param(_))) {
+        tx.set_generic_env(body.def, body.args.len());
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut b = build::Build::new(&tx, body, prog.def_path(body.def));
+        b.build_anon_const_root(expr);
+        let query_store = qualifs::Store::default();
+        let queries = qualifs::Provider::new(&tx, body, &query_store);
+        check_consts::check(&tx, &queries, std::slice::from_ref(&b.out))
+            .map(|ds| ds.iter().map(|d| diag::to_error(prog, body.file, body.def, d)).collect::<Vec<_>>())
+    }));
+    match result {
+        Ok(Ok(errors)) => errors,
+        Ok(Err(_)) => Vec::new(),
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+            Vec::new()
+        }
+    }
+}
+
 fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body: &Body) -> Verdict {
     let options = &prog.session.clone().options;
     tx.obligation_owner.set(body.def);
@@ -183,6 +210,17 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             }
         }
     }
+    // rustc_const_eval check_consts: const contexts among the body and its const children
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| check_consts::check(tx, &queries, &all))) {
+        Ok(Ok(diags)) => {
+            for d in diags { v.errors.push(diag::to_error(prog, all[0].file, body.def, &d)); }
+        }
+        Ok(Err(why)) => v.unchecked.push(format!("{}: const check blocked: {}", prog.def_path(body.def), why.0)),
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+            v.unchecked.push(format!("{}: internal error in the const checker", prog.def_path(body.def)));
+        }
+    }
     let regions = regions_enabled(options);
     let relaxed = fv::relaxed(prog, body.def);
     // field views of closure captures (what each closure does through a captured reference)
@@ -215,7 +253,7 @@ fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body
             let flow = moves::init_flow(&md, bir, &order);
             let mut mc = moves::MoveCheck::new(tx, bir, &md);
             mc.run(&flow, &order);
-            if crate::lint::enabled() && mc.diags.is_empty() && bir.closure_kind.is_none() && i == 0 {
+            if crate::lint::enabled() && mc.diags.is_empty() {
                 // rustc gather_used_muts: a `mut` local no reachable code assigns (declared in
                 // dead code, or never initialized) counts as used
                 let mut used = mc.used_mut.clone();
@@ -541,7 +579,8 @@ fn lint_unused_mut(prog: &Program, owner: crate::program::DefId, bir: &bir::Bir,
             && (j + name.len() >= src.len() || !(src[j + name.len()] == b'_' || src[j + name.len()].is_ascii_alphanumeric()));
         let Some(pos) = (lo..hi).find(|&j| word(j)) else { continue };
         if pos < 4 || &src[pos - 4..pos] != b"mut " { continue; }
-        crate::lint::emit(prog, owner, &crate::lint::UNUSED_MUT, bir.file, (pos - 4) as u32,
+        let inner = crate::lint::attrs_at_binding(prog, owner, pos as u32);
+        crate::lint::emit_in(prog, owner, &inner, &crate::lint::UNUSED_MUT, bir.file, (pos - 4) as u32,
             &format!("variable does not need to be mutable -- help: remove this `mut` (`{}`)", name));
     }
 }

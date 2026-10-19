@@ -2,6 +2,7 @@
 //! rustc_resolve build_reduced_graph / report_conflict) and recursive types without
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
+use crate::ast;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -205,48 +206,156 @@ pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
         if items.len() == 1 { "" } else { "s" }, list, if items.len() == 1 { "has" } else { "have" })))
 }
 
-/// rustc_hir_analysis wfcheck.rs check_impl: a trait impl's trait reference is well formed --
-/// the trait's own where-clauses and supertraits hold for it, in the impl's environment
-/// (`trait Foo: Send {}` + `impl Foo for Rc<i8> {}`: E0277 "`Rc<i8>` cannot be sent between
-/// threads safely"). Ambiguous goals are left to the rest of the check.
-pub fn impl_trait_wf(prog: &Program, tcx: &Tcx, imp: DefId) -> Vec<String> {
-    use crate::consts::GenericArg;
-    use crate::next_solver::{ClauseKind, Goal, PredicateKind};
-    let Some(&td) = tcx.impl_trait.get(&imp) else { return Vec::new() };
-    let def = prog.def(imp);
+/// E0391 for a bound that equates an associated type with another of the same parameter
+/// (`fn f<T: Trait<A = T::B>>()`): lowering `T::B` needs T's bounds, which are being lowered
+/// (rustc: cycle detected when computing the bounds for type parameter `T`).
+pub fn bound_assoc_cycles(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
-    if ast.as_impl(&ast.item(def.item).kind).is_some_and(|i| i.negative) { return Vec::new(); }
-    let indices = tcx.generic_indices_of(prog, imp);
-    let trait_ref = tcx.impl_trait_ref(prog, imp, &indices.identity_args(&tcx.tys));
-    if trait_ref.args.iter().any(|a| matches!(*a, GenericArg::Type(t) if tcx.tys.has_error(t))) { return Vec::new(); }
-    let env = tcx.param_env_id(prog, imp);
-    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
-    let mut errors = Vec::new();
-    for p in tcx.clauses_of(prog, td) {
-        let p = tcx.instantiate_predicate(prog, td, &trait_ref.args, &p);
-        let PredicateKind::Clause(ClauseKind::Trait(t)) = &p.kind else { continue };
-        // the trait's own `Self: Trait` predicate holds through this impl
-        if t.trait_ref.def_id == td { continue; }
-        let tr = t.trait_ref.clone();
-        let r = infcx.evaluate_obligation(prog, Goal { param_env: env, predicate: p.clone() });
-        if r.may_apply() { continue; }
-        let args: Vec<String> = tr.args.iter().map(|a| match a {
-            GenericArg::Type(t) => crate::typeck::ty_to_string(false, prog, tcx, *t),
-            GenericArg::Const(c) => tcx.tys.const_to_string(*c),
-            GenericArg::Lifetime(_) => "'_".to_string(),
-        }).collect();
-        let name = prog.name(tr.def_id).to_string();
-        let self_ty = args.first().cloned().unwrap_or_default();
-        let msg = match name.as_str() {
-            "Sized" => format!("the size for values of type `{}` cannot be known at compilation time", self_ty),
-            "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
-            "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
-            _ if args.len() > 1 => format!("the trait bound `{}: {}<{}>` is not satisfied", self_ty, name, args[1..].join(", ")),
-            _ => format!("the trait bound `{}: {}` is not satisfied", self_ty, name),
-        };
-        errors.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0277: {}", msg)));
+    let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return Vec::new() };
+    let mut out = Vec::new();
+    let mut check = |param: &str, bounds: &[ast::Bound], pos: u32| {
+        for b in bounds {
+            let ast::Bound::Trait { path, .. } = b else { continue };
+            let Some(bt) = tcx.resolve_type_path_def(prog, def.file, def.scope, path) else { continue };
+            for seg in ast.segs(path.segs) {
+                let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) else { continue };
+                for a in ast.list(*v) {
+                    let ast::GenericArg::Binding(_, _, t) = a else { continue };
+                    let ast::Ty::Path(p) = ast.ty(*t) else { continue };
+                    let segs = ast.segs(p.segs);
+                    if segs.len() == 2 && p.no_qself() && prog.files[def.file as usize].text(segs[0].name) == param {
+                        let sym = prog.syms.get(prog.files[def.file as usize].text(segs[1].name)).unwrap_or(u32::MAX);
+                        if tcx.trait_assoc(prog, bt, sym).is_some() {
+                            out.push(prog.record_error(def.file, pos, "typeck", format!("E0391: cycle detected when computing the bounds for type parameter `{}`", param)));
+                        }
+                    }
+                }
+            }
+        }
+    };
+    for p in ast.list(g.params) {
+        if let ast::GenericParamKind::Type(bounds, _) = &p.kind {
+            let name = prog.files[def.file as usize].text(p.name).to_string();
+            check(&name, ast.list(*bounds), p.name.lo);
+        }
     }
-    errors
+    for w in ast.list(g.where_) {
+        if let ast::WherePred::Bound { ty, bounds, .. } = w {
+            if let ast::Ty::Path(p) = ast.ty(*ty) {
+                let segs = ast.segs(p.segs);
+                if segs.len() == 1 && p.no_qself() {
+                    let name = prog.files[def.file as usize].text(segs[0].name).to_string();
+                    check(&name, ast.list(*bounds), segs[0].name.lo);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// E0391 for a trait's supertrait bounds (rustc_hir_analysis collect/predicates_of.rs
+/// super_predicates_of): a trait that is its own supertrait, directly or through others, and a
+/// bound that names an associated type through `Self` (`trait T: Iterator<Item = Self::Item>`),
+/// which asks for the super traits that define it while they are being computed.
+pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
+    let def = prog.def(td);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(ast::TraitItem { supers, .. }) = ast.as_trait(&ast.item(def.item).kind) else { return Vec::new() };
+    let mut out = Vec::new();
+    // a cycle through the super bounds: reported once, at its lowest member
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = tcx.trait_supers(prog, td);
+    let mut cyclic = false;
+    let mut members = vec![td];
+    while let Some(t) = stack.pop() {
+        if t == td { cyclic = true; continue; }
+        if !seen.insert(t) { continue; }
+        members.push(t);
+        stack.extend(tcx.trait_supers(prog, t));
+    }
+    if cyclic {
+        // members that are on the cycle: those that reach `td` again
+        let on_cycle = |m: DefId| -> bool {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = tcx.trait_supers(prog, m);
+            while let Some(t) = stack.pop() {
+                if t == m { return true; }
+                if !seen.insert(t) { continue; }
+                stack.extend(tcx.trait_supers(prog, t));
+            }
+            false
+        };
+        if members.iter().copied().filter(|m| on_cycle(*m)).all(|m| m.0 >= td.0) {
+            out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+                format!("E0391: cycle detected when computing the super predicates of `{}`", prog.def_path(td))));
+        }
+    }
+    // `Self::X` in the arguments of a super bound whose trait (or its supertraits) defines an
+    // associated type X: resolving it asks for exactly the bounds being lowered
+    // `trait B: A<T: B>`: an associated type bounded by the trait being defined (implied predicates)
+    for b in ast.list(*supers) {
+        if let ast::Bound::Trait { path, .. } = b {
+            for seg in ast.segs(path.segs) {
+                let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) else { continue };
+                for a in ast.list(*v) {
+                    let ast::GenericArg::Constraint(_, _, cbs) = a else { continue };
+                    for cb in ast.list(*cbs) {
+                        if let ast::Bound::Trait { path: cp, .. } = cb {
+                            if tcx.resolve_type_path_def(prog, def.file, def.scope, cp) == Some(td) {
+                                out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+                                    format!("E0391: cycle detected when computing the implied predicates of `{}`", prog.def_path(td))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut self_assoc = false;
+    for b in ast.list(*supers) {
+        if let ast::Bound::Trait { path, .. } = b {
+            let Some(bt) = tcx.resolve_type_path_def(prog, def.file, def.scope, path) else { continue };
+            let mut names = Vec::new();
+            for seg in ast.segs(path.segs) {
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(t) | ast::GenericArg::Binding(_, _, t) = g { self_assoc_names(ast, *t, 0, &mut names); }
+                    }
+                }
+            }
+            for n in names {
+                let sym = prog.syms.get(prog.files[def.file as usize].text(n)).unwrap_or(u32::MAX);
+                if tcx.trait_assoc(prog, bt, sym).is_some() { self_assoc = true; }
+            }
+        }
+    }
+    if self_assoc {
+        out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+            format!("E0391: cycle detected when computing the super traits of `{}` with an associated type name", prog.def_path(td))));
+    }
+    out
+}
+
+/// The names of the associated types the type reaches through `Self` (`Self::Item`).
+fn self_assoc_names(ast: &ast::Ast, t: ast::TyId, depth: u32, out: &mut Vec<ast::Ident>) {
+    if depth > 16 { return; }
+    match ast.ty(t) {
+        ast::Ty::Path(p) => {
+            let segs = ast.segs(p.segs);
+            if segs.len() >= 2 && p.no_qself() && segs[0].kind() == ast::SegKind::SelfType { out.push(segs[1].name); }
+            for s in segs {
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(s.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(x) | ast::GenericArg::Binding(_, _, x) = g { self_assoc_names(ast, *x, depth + 1, out); }
+                    }
+                }
+            }
+        }
+        ast::Ty::Ref(_, _, x) | ast::Ty::Ptr(_, x) | ast::Ty::Slice(x) | ast::Ty::Array(x, _) | ast::Ty::Paren(x) => self_assoc_names(ast, *x, depth + 1, out),
+        ast::Ty::Tuple(v) => for x in ast.list(*v) { self_assoc_names(ast, *x, depth + 1, out); },
+        _ => {}
+    }
 }
 
 /// rustc_hir_analysis coherence/builtin.rs `visit_implementation_of_copy`: `impl Copy for T`
@@ -279,7 +388,7 @@ pub fn copy_impl(prog: &Program, tcx: &Tcx, imp: DefId) -> Vec<String> {
             let ft = tcx.tys.subst(f.ty, &args);
             if tcx.tys.has_error(ft) { continue; }
             let predicate = crate::next_solver::collect::trait_predicate(td, vec![GenericArg::Type(ft)]);
-            if !infcx.evaluate_obligation(prog, Goal { param_env: env, predicate }).may_apply() {
+            if !infcx.evaluate_obligation(prog, Goal { param_env: env, predicate }).must_apply_modulo_regions() {
                 return vec![report("E0204", "the trait `Copy` cannot be implemented for this type")];
             }
         }
@@ -335,10 +444,75 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
     for (&file, &def) in &scope {
         let pf = &prog.files[file as usize];
         let ast = &pf.ast;
+        // the blocks of the module tree that survive cfg stripping (the item arena also holds the
+        // items of cfg'd-out code, which have no definitions)
+        let mut stack: Vec<crate::ast::ItemId> = ast.root_items.iter().copied().collect();
+        let mut blocks: Vec<&crate::ast::Item> = Vec::new();
+        while let Some(id) = stack.pop() {
+            let item = ast.item(id);
+            let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            if !prog.active(file, &attrs) { continue; }
+            match item.kind {
+                ItemKind::ForeignMod(_) => blocks.push(item),
+                ItemKind::Mod(Some(l)) => stack.extend(ast.list(l).iter().copied()),
+                _ => {}
+            }
+        }
+        // and the non-empty blocks inside fn bodies that survive cfg stripping: their items have
+        // definitions (the arena also holds those of cfg'd-out code, which do not)
         for item in ast.items.iter() {
+            let ItemKind::ForeignMod(r) = item.kind else { continue };
+            if blocks.iter().any(|b| b.lo == item.lo) { continue; }
+            if ast.list(ast.row(r).items).iter().any(|it| prog.item_defs.contains_key(&(file, it.0))) { blocks.push(item); }
+        }
+        blocks.sort_by_key(|i| i.lo);
+        for item in blocks {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            // #[link(name = "..", kind = "..")] (rustc_attr_parsing link_attrs.rs)
+            {
+                let sp = prog.src(file);
+                for a in &attrs {
+                    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+                    if hi < lo + 3 || crate::cfg::tok_str(sp, lo) != b"link" || crate::cfg::tok_str(sp, lo + 1) != b"(" { continue; }
+                    let pos = sp.tok(lo).lo;
+                    let (mut name, mut kind_bad, mut wasm_module) = (None::<&[u8]>, false, false);
+                    let mut i = lo + 2;
+                    while i + 2 < hi {
+                        let key = crate::cfg::tok_str(sp, i);
+                        if crate::cfg::tok_str(sp, i + 1) == b"=" {
+                            let val = crate::cfg::tok_str(sp, i + 2);
+                            if key == b"name" { name = Some(val); }
+                            if key == b"wasm_import_module" { wasm_module = true; }
+                            if key == b"kind" && !matches!(val, b"\"static\"" | b"\"dylib\"" | b"\"framework\"" | b"\"raw-dylib\"" | b"\"link-arg\"") { kind_bad = true; }
+                            i += 3;
+                        } else { i += 1; }
+                    }
+                    if kind_bad { errors.push(prog.record_error(file, pos, "typeck", "E0539: malformed `link` attribute input".to_string())); }
+                    match name {
+                        None if wasm_module => {}
+                        None => errors.push(prog.record_error(file, pos, "typeck", "E0459: `#[link]` attribute requires a `name = \"string\"` argument".to_string())),
+                        Some(b"\"\"") => errors.push(prog.record_error(file, pos, "typeck", "E0454: link name must not be empty".to_string())),
+                        _ => {}
+                    }
+                }
+            }
+            // (declarations of an extern block, plain or unsafe)
+            for &it in ast.list(fm.items) {
+                if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
+                    let sig = ast.fn_sig(sig);
+                    if let Some(g) = ast.list(sig.generics.params).iter().find(|g| !matches!(g.kind, crate::ast::GenericParamKind::Lifetime(_))) {
+                        let what = if matches!(g.kind, crate::ast::GenericParamKind::Const(..)) { "const" } else { "type" };
+                        errors.push(prog.record_error(file, g.name.lo, "typeck", format!("E0044: foreign items may not have {} parameters", what)));
+                    }
+                    for prm in ast.list(sig.params) {
+                        if !matches!(ast.pat(prm.pat), crate::ast::Pat::Wild | crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }) {
+                            errors.push(prog.record_error(file, ast.item(it).lo, "typeck", "E0130: patterns aren't allowed in foreign function declarations".to_string()));
+                        }
+                    }
+                }
+            }
             if fm.unsafe_ != 0 {
                 crate::lint::emit_in(prog, def, &attrs, &crate::lint::UNSAFE_CODE, file, item.lo, "usage of an `unsafe extern` block");
                 continue;
@@ -349,10 +523,10 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                 crate::lint::emit_in(prog, def, &attrs, &crate::lint::MISSING_UNSAFE_ON_EXTERN, file, item.lo, "extern blocks should be unsafe");
             }
             for &it in ast.list(fm.items) {
-                // (a foreign fn is unsafe by default: look for the written qualifier)
-                if let ItemKind::Fn(..) = ast.item(it).kind {
+                // (a foreign fn or static is unsafe by default: look for the written qualifier)
+                if let ItemKind::Fn(..) | ItemKind::Static(..) = ast.item(it).kind {
                     let written = pf.bytes(ast.item(it).lo, ast.item(it).name.lo);
-                    if written.split(|c| !c.is_ascii_alphanumeric() && *c != b'_').any(|w| w == b"unsafe") {
+                    if written.split(|c| !c.is_ascii_alphanumeric() && *c != b'_').any(|w| w == b"unsafe" || w == b"safe") {
                         errors.push(prog.record_uncoded_error(file, ast.item(it).lo, "typeck", "items in `extern` blocks without an `unsafe` qualifier cannot have safety qualifiers".to_string()));
                     }
                 }
@@ -370,16 +544,7 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
 /// The edition is the attribute path's: attributes a macro expansion wrote are not judged (the
 /// expansion's tokens carry no edition).
 pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
-    // (name, unsafe since edition 2024 only)
-    const UNSAFE_ATTRS: &[(&[u8], bool)] = &[(b"no_mangle", true), (b"export_name", true), (b"link_section", true),
-        (b"force_target_feature", false), (b"ffi_const", false), (b"ffi_pure", false), (b"naked", false)];
-    const NORMAL_ATTRS: &[&[u8]] = &[b"cfg", b"cfg_attr", b"test", b"ignore", b"should_panic", b"bench", b"macro_use", b"macro_export", b"repr", b"derive",
-        b"inline", b"doc", b"allow", b"warn", b"deny", b"forbid", b"expect", b"must_use", b"deprecated", b"path", b"automatically_derived", b"cold",
-        b"track_caller", b"target_feature", b"non_exhaustive", b"diagnostic::on_unimplemented", b"diagnostic::do_not_recommend", b"link", b"link_name",
-        b"used", b"global_allocator", b"panic_handler", b"proc_macro", b"proc_macro_derive", b"proc_macro_attribute", b"no_std", b"no_implicit_prelude",
-        b"recursion_limit", b"type_length_limit", b"no_main", b"crate_type", b"crate_name", b"windows_subsystem", b"feature", b"macro_escape", b"no_link",
-        b"export_stable", b"thread_local", b"unstable", b"stable", b"coverage", b"optimize", b"instruction_set", b"debugger_visualizer",
-        b"collapse_debuginfo", b"rustc_builtin_macro", b"cfi_encoding"];
+    use crate::builtin_attrs::{attr_safety, AttrSafety};
     let def = prog.def(d);
     let pf = &prog.files[def.file as usize];
     let ast = &pf.ast;
@@ -400,12 +565,17 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         }
         let pos = p.tok(lo).lo;
         if wrapped {
-            if NORMAL_ATTRS.contains(&name.as_slice()) {
+            if attr_safety(&String::from_utf8_lossy(&name)) == AttrSafety::Normal {
                 errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`{}` is not an unsafe attribute", String::from_utf8_lossy(&name))));
             }
             continue;
         }
-        let Some(&(_, since_2024)) = UNSAFE_ATTRS.iter().find(|(n, _)| *n == name.as_slice()) else { continue };
+        if from_source {
+            if let Some(what) = attribute_target_error(prog, d, &name) {
+                errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`#[{}]` attribute cannot be used on {}", String::from_utf8_lossy(&name), what)));
+            }
+        }
+        let AttrSafety::Unsafe { since_2024 } = attr_safety(&String::from_utf8_lossy(&name)) else { continue };
         if !since_2024 || pf.edition >= 2024 {
             if from_source { errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "unsafe attribute used without unsafe".to_string())); }
         } else {
@@ -413,4 +583,218 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
         }
     }
     errors
+}
+
+/// check_union_fields: a union field is `Copy` or otherwise guaranteed not to need dropping
+/// (rustc `BikeshedGuaranteedNoDrop`: `ManuallyDrop<_>`, references, tuples and arrays of such)
+/// -- E0740.
+pub fn union_fields(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    use crate::consts::GenericArg;
+    use crate::next_solver::Goal;
+    let Some(adt) = tcx.adts.get(&d) else { return Vec::new() };
+    if !adt.is_union { return Vec::new(); }
+    let Some(copy) = tcx.copy_trait else { return Vec::new() };
+    let env = tcx.param_env_id(prog, d);
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), d);
+    fn no_drop(prog: &Program, tcx: &Tcx, infcx: &crate::infer::InferCtxt, env: crate::tcx::ParamEnvId, copy: DefId, t: TyId, depth: u32) -> bool {
+        if depth > 16 { return true; }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Error => true,
+            TyKind::Ref(..) | TyKind::Ptr(..) => true,
+            // (Relax's ManuallyDrop is an ordinary union of core)
+            TyKind::Adt(d, _, _) if prog.name(d) == "ManuallyDrop" && matches!(prog.syms.str(prog.crates[prog.def(d).krate as usize].name), "core" | "std") => true,
+            TyKind::Tuple(l) => tcx.tys.list(l).iter().all(|&x| no_drop(prog, tcx, infcx, env, copy, x, depth + 1)),
+            TyKind::Array(e, _) => no_drop(prog, tcx, infcx, env, copy, e, depth + 1),
+            _ => {
+                let t = tcx.try_normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t).unwrap_or(t);
+                let predicate = crate::next_solver::collect::trait_predicate(copy, vec![GenericArg::Type(t)]);
+                infcx.evaluate_obligation(prog, Goal { param_env: env, predicate }).may_apply()
+            }
+        }
+    }
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    for f in &adt.variants[0].fields {
+        if !no_drop(prog, tcx, &infcx, env, copy, f.ty, 0) {
+            return vec![prog.record_error(def.file, ast.item(def.item).name.lo, "typeck", "E0740: field must implement `Copy` or be wrapped in `ManuallyDrop<...>` to be used in a union".to_string())];
+        }
+    }
+    Vec::new()
+}
+
+/// rustc_passes check_attr.rs `check_repr` (and the packed/align checks of check/check.rs):
+/// the `#[repr(..)]` hints of an item against its kind and against each other.
+pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    use crate::ast::ItemKind;
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    let ast = &pf.ast;
+    let p = prog.src(def.file);
+    let item = ast.item(def.item);
+    let mut errors = Vec::new();
+    let mut err = |pos: u32, msg: String| errors.push(prog.record_error(def.file, pos, "typeck", msg));
+    const INTS: &[&[u8]] = &[b"u8", b"u16", b"u32", b"u64", b"u128", b"usize", b"i8", b"i16", b"i32", b"i64", b"i128", b"isize"];
+    let (is_struct, is_enum, is_union) = (matches!(item.kind, ItemKind::Struct(_)), matches!(item.kind, ItemKind::Enum(_)), matches!(item.kind, ItemKind::Union(_)));
+    let mut ints: Vec<Vec<u8>> = Vec::new();
+    let (mut c, mut transparent, mut packed, mut aligned, mut other) = (false, false, Vec::<u32>::new(), false, false);
+    let mut first_pos = item.lo;
+    for a in ast.list(item.attrs) {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        if hi <= lo || crate::cfg::tok_str(p, lo) != b"repr" { continue; }
+        let pos = p.tok(lo).lo;
+        first_pos = pos;
+        if hi < lo + 3 || crate::cfg::tok_str(p, lo + 1) != b"(" {
+            err(pos, "E0539: malformed `repr` attribute input".to_string());
+            continue;
+        }
+        let mut i = lo + 2;
+        while i < hi {
+            let name = crate::cfg::tok_str(p, i);
+            if name == b")" { break; }
+            if name == b"," { i += 1; continue; }
+            let hpos = p.tok(i).lo;
+            i += 1;
+            // the hint's argument: `(..)` or `= ..`
+            let mut args: Vec<&[u8]> = Vec::new();
+            let mut assign = false;
+            if i < hi && crate::cfg::tok_str(p, i) == b"(" {
+                i += 1;
+                while i < hi && crate::cfg::tok_str(p, i) != b")" { args.push(crate::cfg::tok_str(p, i)); i += 1; }
+                i += 1;
+            } else if i < hi && crate::cfg::tok_str(p, i) == b"=" {
+                assign = true;
+                i += 2;
+            }
+            match name {
+                b"C" => { c = true; if !(is_struct || is_enum || is_union) { err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string()); } }
+                b"transparent" => {
+                    transparent = true;
+                    if !(is_struct || is_enum || is_union) { err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string()); }
+                }
+                b"packed" => {
+                    packed.push(args.first().and_then(|a| std::str::from_utf8(a).ok()).and_then(|a| a.parse().ok()).unwrap_or(1));
+                    if !(is_struct || is_union) { err(hpos, "E0517: attribute should be applied to a struct or union".to_string()); }
+                }
+                b"align" => {
+                    aligned = true;
+                    if assign {
+                        err(hpos, "E0693: incorrect `repr(align)` attribute format".to_string());
+                    } else if args.len() == 1 {
+                        let t = args[0];
+                        match std::str::from_utf8(t).ok().filter(|s| crate::const_fold::int_suffix(s).is_none()).and_then(|s| crate::const_fold::parse_int_lit(s)).map(|v| v as u128) {
+                            None => err(hpos, "E0589: invalid `repr(align)` attribute: not an unsuffixed integer".to_string()),
+                            Some(v) if v == 0 || !v.is_power_of_two() => err(hpos, "E0589: invalid `repr(align)` attribute: not a power of two".to_string()),
+                            Some(v) if v > (1 << 29) => err(hpos, "E0589: invalid `repr(align)` attribute: larger than 2^29".to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                n if INTS.contains(&n) => {
+                    if !ints.iter().any(|x| x == n) { ints.push(n.to_vec()); }
+                    if !is_enum { err(hpos, "E0517: attribute should be applied to an enum".to_string()); }
+                }
+                b"Rust" | b"simd" => other = other || name == b"simd",
+                _ => {}
+            }
+        }
+    }
+    let _ = other;
+    if transparent && (c || !packed.is_empty() || aligned || !ints.is_empty()) {
+        err(first_pos, "E0692: transparent struct cannot have other repr hints".to_string());
+    }
+    if transparent && is_enum {
+        if let ItemKind::Enum(r) = item.kind {
+            let n = ast.list(ast.row(r).variants).len();
+            if n != 1 { err(item.name.lo, format!("E0731: transparent enum needs exactly one variant, but has {}", n)); }
+        }
+    }
+    if ints.len() > 1 { err(first_pos, "E0566: conflicting representation hints".to_string()); }
+    // `repr(C, u64)` on a fieldless enum
+    if c && !ints.is_empty() && is_enum {
+        if let Some(adt) = tcx.adts.get(&d) {
+            if adt.variants.iter().all(|v| v.fields.is_empty()) { err(first_pos, "E0566: conflicting representation hints".to_string()); }
+        }
+    }
+    if !packed.is_empty() && aligned { err(first_pos, "E0587: type has conflicting packed and align representation hints".to_string()); }
+    if packed.len() > 1 && packed.iter().any(|x| *x != packed[0]) { err(first_pos, "E0634: type has conflicting packed representation hints".to_string()); }
+    // a packed type holds no `repr(align)` type, however deep
+    if !packed.is_empty() && (is_struct || is_union) {
+        fn holds_align(tcx: &Tcx, t: TyId, seen: &mut Vec<DefId>, depth: u32) -> bool {
+            if depth > 16 { return false; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Adt(d, args, _) => {
+                    if seen.contains(&d) { return false; }
+                    seen.push(d);
+                    let Some(a) = tcx.adts.get(&d) else { return false };
+                    if a.repr_align > 0 { return true; }
+                    let args = tcx.tys.list(args).to_vec();
+                    a.variants.iter().any(|v| v.fields.iter().any(|f| holds_align(tcx, tcx.tys.subst(f.ty, &args), seen, depth + 1)))
+                }
+                TyKind::Tuple(l) => tcx.tys.list(l).iter().any(|&x| holds_align(tcx, x, seen, depth + 1)),
+                TyKind::Array(e, _) => holds_align(tcx, e, seen, depth + 1),
+                _ => false,
+            }
+        }
+        if let Some(adt) = tcx.adts.get(&d) {
+            let mut seen = vec![d];
+            if adt.variants.iter().any(|v| v.fields.iter().any(|f| holds_align(tcx, f.ty, &mut seen, 0))) {
+                err(item.name.lo, "E0588: packed type cannot transitively contain a `#[repr(align)]` type".to_string());
+            }
+        }
+    }
+    // a variant takes no repr
+    if let ItemKind::Enum(r) = item.kind {
+        for v in ast.list(ast.row(r).variants) {
+            for a in ast.list(v.attrs) {
+                if a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"repr" {
+                    err(p.tok(a.toks.lo as usize).lo, "E0517: attribute should be applied to an enum".to_string());
+                }
+            }
+        }
+    }
+    errors
+}
+
+/// rustc_attr_parsing `AllowedTargets::AllowList`: the targets a builtin attribute may be written
+/// on (a `Warn` target is only the `unused_attributes` lint and is accepted here). Returns the
+/// plural target name when the attribute is not allowed on definition `d`.
+fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'static str> {
+    use crate::program::DefKind as K;
+    use crate::ast::ItemKind;
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    // (plural name, is a fn-like target with/without body, is static-like ...)
+    let (what, fn_like, trait_fn_no_body, static_like): (&'static str, bool, bool, bool) = match def.kind {
+        K::Fn | K::AssocFn => {
+            let body = matches!(item.kind, ItemKind::Fn(_, Some(_), _));
+            let in_trait = def.kind == K::AssocFn && prog.def(def.parent).kind == K::Trait;
+            ("functions", true, in_trait && !body, false)
+        }
+        K::ForeignFn => ("foreign functions", true, false, false),
+        K::Static => ("statics", false, false, true),
+        K::ForeignStatic => ("foreign statics", false, false, true),
+        K::Struct => ("structs", false, false, false),
+        K::Enum => ("enums", false, false, false),
+        K::Union => ("unions", false, false, false),
+        K::Const => ("constants", false, false, false),
+        K::AssocConst => ("associated constants", false, false, false),
+        K::Trait => ("traits", false, false, false),
+        K::Impl => ("implementation blocks", false, false, false),
+        K::TypeAlias => ("type aliases", false, false, false),
+        K::AssocTy => ("associated types", false, false, false),
+        K::Mod => ("modules", false, false, false),
+        _ => return None,
+    };
+    let ok = match name {
+        // Fn, Method, Closure, Delegation (+ Warn: trait fn without body, foreign fn, assoc const, ...)
+        b"inline" => fn_like || def.kind == K::AssocConst,
+        b"track_caller" => fn_like,
+        b"target_feature" => fn_like && def.kind != K::ForeignFn && !trait_fn_no_body,
+        b"used" => def.kind == K::Static,
+        b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
+        b"debugger_visualizer" => def.kind == K::Mod,
+        _ => return None,
+    };
+    if ok { None } else { Some(what) }
 }

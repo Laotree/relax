@@ -459,6 +459,15 @@ impl<'a> Build<'a> {
         }
     }
 
+    /// An anonymous constant outside every body (array length, const argument, enum
+    /// discriminant in a signature): a typeck root and body owner of its own.
+    pub fn build_anon_const_root(&mut self, e: ExprId) {
+        self.out.checked_body = Some(super::body::CheckedBody { owner: self.b.def, kind: super::body::BodyKind::AnonConst(e) });
+        self.out.args = self.b.args.to_vec();
+        let ret = self.b.ty(e);
+        self.build_const_expr(e, ret);
+    }
+
     /// rustc_mir_build::builder::construct_const: zero arguments, typed return
     /// place, independent CFG and the ordinary lexical drop scopes.
     fn build_const_expr(&mut self, init: ExprId, ret: TyId) {
@@ -517,8 +526,23 @@ impl<'a> Build<'a> {
         let mut pi = 0usize;
         if fsig.self_param.is_some() {
             let t = self.b.locals.get(0).map_or(self.tx.unit(), |l| l.ty);
-            let mutable = self.b.locals.get(0).map_or(false, |l| l.mutable);
+            let mutable = self.b.locals.get(0).map_or(false, |l| l.mutable) || matches!(fsig.self_param, Some(crate::ast::SelfParam::Value(true) | crate::ast::SelfParam::Typed(true, _)));
             let a = self.new_local(t, LocalKind::Arg, mutable, Some("self".to_string()));
+            // the `self` token of the parameter list: where `mut self` is written (the check's
+            // unused_mut lint reads it; a run never needs it)
+            if crate::lint::enabled() {
+                let pf = &self.tx.prog.files[self.b.file as usize];
+                let mut i = 0u32;
+                loop {
+                    let t = pf.tok(i);
+                    if t.kind == crate::lexer::T::Eof { break; }
+                    if t.lo >= it.name.hi && t.kind == crate::lexer::T::KwSelfValue {
+                        self.out.locals[a as usize].span = Span { lo: t.lo, hi: t.hi };
+                        break;
+                    }
+                    i += 1;
+                }
+            }
             self.out.locals[a as usize].can_be_made_mutable = matches!(fsig.self_param, Some(crate::ast::SelfParam::Value(false) | crate::ast::SelfParam::Typed(false, _)));
             self.out.n_args += 1;
             self.locals.insert(0, Place::local(a));
@@ -2658,7 +2682,7 @@ impl<'a> Build<'a> {
 
     /// Capture analysis and BIR use the same typeck selection, never an assumed Fn.
     fn callable_kind(&mut self, e: ExprId, t: TyId) -> Option<ClosureKind> {
-        let kind = self.b.call_kind(&self.tx, e, t).map(|k| match k {
+        let kind = self.b.call_kind(self.tx.tcx, &self.tx.cx, e, t).map(|k| match k {
             crate::upvar::ClosureKind::Fn => ClosureKind::Fn,
             crate::upvar::ClosureKind::FnMut => ClosureKind::FnMut,
             crate::upvar::ClosureKind::FnOnce => ClosureKind::FnOnce,

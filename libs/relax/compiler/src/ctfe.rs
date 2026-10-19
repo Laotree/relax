@@ -21,6 +21,11 @@ use crate::types::{TyId, TyKind};
 const STEP_BUDGET: u32 = 4_000_000;
 const CALL_DEPTH: u32 = 32;
 
+thread_local! {
+    /// the constants whose data this thread's nested evaluations are reading (const_data)
+    static CONSTS_READING: std::cell::RefCell<Vec<(crate::program::DefId, Vec<TyId>)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 struct Ctx<'a> {
     u: &'a mut Unit,
     steps: u32,
@@ -252,6 +257,50 @@ pub fn defined_mask(u: &mut Unit, t: TyId, a: u64, mask: &mut [u8], off: usize, 
             }
         }
         _ => all(mask),
+    }
+}
+
+/// rustc_const_eval interpret/validity.rs, the scalar part: a constant's final value holds only
+/// valid bools and chars (arrays, tuples and structs are walked). The message on the first invalid one.
+pub fn invalid_scalar(u: &mut Unit, t: TyId, a: u64, depth: u32) -> Option<String> {
+    if depth > 16 { return None; }
+    let t = u.tcx.normalize_erasing_regions(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), t);
+    let l = u.layout_of(t);
+    match u.tcx.tys.kind(t).clone() {
+        TyKind::Bool => {
+            let v = unsafe { *(a as *const u8) };
+            (v > 1).then(|| format!("constructing invalid value of type bool: encountered {:#04x}, but expected a boolean", v))
+        }
+        TyKind::Char => {
+            let v = unsafe { (a as *const u32).read_unaligned() };
+            (char::from_u32(v).is_none()).then(|| format!("constructing invalid value of type char: encountered {:#x}, but expected a valid unicode scalar value (in `0..=0x10FFFF` but not in `0xD800..=0xDFFF`)", v))
+        }
+        TyKind::Array(et, n) => {
+            let n = n.try_to_target_usize(&u.tcx.tys)?;
+            let es = u.layout_of(et).size as u64;
+            for i in 0..n.min(1 << 16) {
+                if let Some(m) = invalid_scalar(u, et, a + i * es, depth + 1) { return Some(m); }
+            }
+            None
+        }
+        TyKind::Tuple(ts) => {
+            for (i, ft) in u.tcx.tys.list(ts).to_vec().into_iter().enumerate() {
+                let fo = l.fields.get(i).copied().unwrap_or(0) as u64;
+                if let Some(m) = invalid_scalar(u, ft, a + fo, depth + 1) { return Some(m); }
+            }
+            None
+        }
+        TyKind::Adt(d, args, _) => {
+            let adt = u.tcx.adts.get(&d).cloned()?;
+            if adt.is_enum || adt.is_union { return None; }
+            for fi in 0..adt.variants[0].fields.len() {
+                let ft = u.tcx.field_ty(&u.prog, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), d, 0, fi as u32, u.tcx.tys.list(args));
+                let fo = l.fields.get(fi).copied()? as u64;
+                if let Some(m) = invalid_scalar(u, ft, a + fo, depth + 1) { return Some(m); }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -1225,8 +1274,17 @@ impl<'a> Ctx<'a> {
         let l = u.layout_of(t);
         let buf = u.data(&vec![0u8; l.size.max(1) as usize], l.align.max(8) as u64, crate::syms::DataKind::Typed(t));
         u.syms.set_data_name(buf, crate::jit::const_name(u, d, &args));
+        // a constant that reads itself, directly or through others, is outside the subset (the
+        // code path reports the cycle); each nested evaluation has a Ctx of its own, so
+        // `depth` alone does not bound this recursion
+        if CONSTS_READING.try_with(|c| c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)).unwrap_or(false) {
+            return None;
+        }
+        struct Pop;
+        impl Drop for Pop { fn drop(&mut self) { let _ = CONSTS_READING.try_with(|c| { c.borrow_mut().pop(); }); } }
+        let _ = CONSTS_READING.try_with(|c| c.borrow_mut().push((d, args.clone())));
         self.depth += 1;
-        let ok = eval_into(self.u, d, &args, buf);
+        let ok = { let _pop = Pop; eval_into(self.u, d, &args, buf) };
         self.depth -= 1;
         if !ok {
             return None;

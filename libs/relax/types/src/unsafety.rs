@@ -122,6 +122,39 @@ impl V<'_> {
         }
     }
 
+    /// rustc_mir_transform check_packed_ref: `&place` where the place is a field reached through a
+    /// packed ADT (after the last dereference) whose alignment exceeds the packing (E0793).
+    fn packed_ref(&mut self, pos: u32, place: ExprId) {
+        let mut pack: Option<(u32, bool)> = None;
+        let mut cur = place;
+        loop {
+            cur = self.peel(cur);
+            let base = match self.ast.expr(cur).kind {
+                ExprKind::Field(b, _) | ExprKind::TupleField(b, _) | ExprKind::Index(b, _) => b,
+                _ => break,
+            };
+            let bt = self.body.ty(base);
+            // an implicit or explicit dereference ends the place
+            if matches!(self.tcx.tys.kind(bt), TyKind::Ref(..) | TyKind::Ptr(..)) { break; }
+            if matches!(self.ast.expr(cur).kind, ExprKind::Index(..)) && !matches!(self.tcx.tys.kind(bt), TyKind::Array(..)) { break; }
+            if let TyKind::Adt(d, _, _) = self.tcx.tys.kind(bt) {
+                if let Some(a) = self.tcx.adts.get(d) {
+                    if a.repr_packed > 0 && pack.map_or(true, |(p, _)| a.repr_packed < p) { pack = Some((a.repr_packed, a.is_union)); }
+                }
+            }
+            cur = base;
+        }
+        let Some((pack, union)) = pack else { return };
+        let ty = self.body.ty(place);
+        if self.tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_ALIAS) { return; }
+        let lay = crate::layout::Layouts::new();
+        let l = lay.of(&crate::layout::LayoutCx::new(self.prog), self.tcx, ty);
+        if l.align > pack {
+            let msg = format!("E0793: reference to field of packed {} is unaligned", if union { "union" } else { "struct" });
+            self.errors.push(self.prog.record_error(self.body.file, pos, "typeck", msg));
+        }
+    }
+
     fn fn_path(&self, d: DefId) -> String {
         let def = self.prog.def(d);
         let parent = self.prog.def(def.parent);
@@ -331,7 +364,18 @@ impl V<'_> {
                     while let TyKind::Ref(_, p, _) = self.tcx.tys.kind(t) { t = *p; }
                     self.call_hi = self.ast.expr(e).hi;
                     match *self.tcx.tys.kind(t) {
-                        TyKind::FnDef(d, _, _) => self.call_def(lo, d),
+                        TyKind::FnDef(d, args, _) => {
+                            self.call_def(lo, d);
+                            // intrinsicck: both sides of a transmute have one size
+                            if crate::transmute::is_transmute(self.prog, d) {
+                                if let [from, to] = self.tcx.tys.list(args) {
+                                    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(self.prog, self.body.def), param_env: self.body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::PostAnalysis };
+                                    if let Some(msg) = crate::transmute::check_transmute(self.prog, self.tcx, env, *from, *to) {
+                                        self.errors.push(self.prog.record_error(self.body.file, lo, "typeck", msg));
+                                    }
+                                }
+                            }
+                        }
                         TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe => self.requires_unsafe(lo, Op::CallToUnsafeFunction(None)),
                         _ => {}
                     }
@@ -365,6 +409,7 @@ impl V<'_> {
                     return self.expr(peeled);
                 }
                 self.static_mut_ref(lo, x, m);
+                self.packed_ref(lo, x);
                 self.expr(x);
             }
             ExprKind::Unary(UnOp::Deref, x) => {
