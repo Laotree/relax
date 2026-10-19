@@ -235,3 +235,16 @@ fn a_method_closure_with_an_erased_signature_region_maps_it_to_the_creators_vari
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn bodies_naming_constants_are_checked_with_their_qualifs() {
+    let (errors, unchecked) = borrowck_source("
+        pub const N: usize = 3;
+        pub const NAME: &str = \"x\";
+        pub struct P { pub v: [u8; 2] }
+        pub const EMPTY: P = P { v: [0; 2] };
+        pub fn f() -> ([u8; N], &'static str, P) { ([0; N], NAME, EMPTY) }
+        pub fn g() -> &'static P { &EMPTY }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

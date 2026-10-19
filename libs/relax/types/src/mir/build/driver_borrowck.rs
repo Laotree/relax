@@ -159,7 +159,7 @@ fn check_root(prog: &Program, tcx: &Tcx, owner: CheckedBody, tb: &crate::typeck:
         at: String,
     }
     let mut prepared: Vec<Prepared> = Vec::new();
-    let provider = crate::mir::transform::qualifs::NoProvider;
+    let provider = super::driver::BuildProvider { prog, tcx, memo: Default::default() };
     let mut all: Vec<CheckedBody> = nested.clone();
     all.push(owner);
     for b in all {
