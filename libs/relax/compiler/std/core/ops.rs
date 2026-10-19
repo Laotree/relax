@@ -32,6 +32,7 @@ pub trait DerefMut: Deref + PointeeSized {
 
 impl<'a, T: ?Sized> Deref for &'a T {
     type Target = T;
+    #[rustc_diagnostic_item = "noop_method_deref"]
     fn deref(&self) -> &T {
         *self
     }

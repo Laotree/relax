@@ -26,6 +26,8 @@ pub const LET_UNDERSCORE_LOCK: Lint = lint::lint("let_underscore_lock", Level::D
 pub const FOR_LOOPS_OVER_FALLIBLES: Lint = lint::lint("for_loops_over_fallibles", Level::Warn, &[]);
 pub const MAP_UNIT_FN: Lint = lint::lint("map_unit_fn", Level::Warn, &["unused"]);
 pub const UNUSED_ALLOCATION: Lint = lint::lint("unused_allocation", Level::Warn, &["unused"]);
+pub const NOOP_METHOD_CALL: Lint = lint::lint("noop_method_call", Level::Warn, &[]);
+pub const SUSPICIOUS_DOUBLE_REF_OP: Lint = lint::lint("suspicious_double_ref_op", Level::Warn, &[]);
 pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr", Level::Deny, &[]);
 pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts", Level::Allow, &[]);
 pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts", Level::Allow, &[]);
@@ -430,6 +432,7 @@ impl<'a> Late<'a> {
             ExprKind::MethodCall(..) => {
                 self.check_map_unit_fn(e);
                 self.check_unused_allocation(e);
+                self.check_noop_method_call(e);
                 self.check_atomic_load_store(e);
                 self.check_atomic_compare_exchange(e);
             }
@@ -634,6 +637,60 @@ impl<'a> Late<'a> {
         if m.autoref == 0 || m.derefs == 0 { return; }
         let msg = if m.autoref == 1 { "unnecessary allocation, use `&` instead" } else { "unnecessary allocation, use `&mut` instead" };
         self.emit(&UNUSED_ALLOCATION, self.ast.expr(recv).lo, msg);
+    }
+
+    // ---- noop_method_call.rs
+    fn check_noop_method_call(&self, e: ExprId) {
+        let ExprKind::MethodCall(recv, row) = self.ast.expr(e).kind else { return };
+        let m = *self.ast.row(row);
+        if lint::external(self.prog, self.body.file, m.name.lo) { return; }
+        let Some(mr) = self.body.methods.get(&e.0) else { return };
+        let did = mr.def;
+        let d = self.prog.def(did);
+        if d.kind != DefKind::AssocFn || d.parent == crate::program::NO_DEF { return; }
+        // the trait of the method (the trait itself, or the trait an impl method implements)
+        let parent = self.prog.def(d.parent);
+        let trait_id = match parent.kind {
+            DefKind::Trait => d.parent,
+            DefKind::Impl => match self.tcx.impl_trait.get(&d.parent) { Some(t) => *t, None => return },
+            _ => return,
+        };
+        let trait_ = if Some(trait_id) == self.lang(LangItem::Clone) { "Clone" }
+            else if Some(trait_id) == self.lang(LangItem::Deref) { "Deref" }
+            else if self.diag_item(trait_id).as_deref() == Some("Borrow") { "Borrow" }
+            else { return };
+        // resolve the trait method to the impl's method
+        let resolved = if parent.kind == DefKind::Trait {
+            let args = self.tcx.tys.list(mr.args).to_vec();
+            if args.iter().any(|&a| self.tcx.tys.has_infer(a) || self.tcx.tys.flags(a).intersects(crate::types::TypeFlags::HAS_PARAM)) { return; }
+            let env = crate::tcx::TypingEnv::fully_monomorphized(self.prog);
+            match self.tcx.resolve_instance_raw(self.prog, env, did, &args) {
+                Ok(i) => match i.def { crate::instance::InstanceKind::Item(r) => r, _ => return },
+                Err(_) => return,
+            }
+        } else { did };
+        let Some(name) = self.diag_item(resolved) else { return };
+        if !matches!(name.as_str(), "noop_method_borrow" | "noop_method_clone" | "noop_method_deref") { return; }
+        let (Some(rt), Some(et)) = (self.expr_ty(recv), self.expr_ty(e)) else { return };
+        // an overloaded deref among the receiver's adjustments: not linted
+        if (0..mr.derefs as usize).any(|i| [e.0, recv.0, unparen(self.ast, recv).0].iter().any(|k| self.body.ov_derefs.get(&(*k, i)).is_some())) { return; }
+        let pos = self.ast.expr(recv).hi;
+        let (rt, et) = (self.tcx.tys.erase_all_regions(rt), self.tcx.tys.erase_all_regions(et));
+        let method = self.prog.files[self.body.file as usize].text(m.name).to_string();
+        if rt == et {
+            let mut orig = et;
+            while let TyKind::Ref(_, i, _) = self.kind(orig) { orig = i; }
+            self.emit(&NOOP_METHOD_CALL, pos, &format!("call to `.{method}()` on a reference in this situation does nothing"));
+            let _ = (trait_, orig);
+        } else {
+            let ts = crate::typeck::ty_to_string(false, self.prog, self.tcx, et);
+            match name.as_str() {
+                "noop_method_borrow" => {}
+                "noop_method_clone" => self.emit(&SUSPICIOUS_DOUBLE_REF_OP, pos, &format!("using `.clone()` on a double reference, which returns `{ts}` instead of cloning the inner type")),
+                "noop_method_deref" => self.emit(&SUSPICIOUS_DOUBLE_REF_OP, pos, &format!("using `.deref()` on a double reference, which returns `{ts}` instead of dereferencing the inner type")),
+                _ => {}
+            }
+        }
     }
 
     // ---- for_loops_over_fallibles.rs
