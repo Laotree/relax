@@ -73,6 +73,7 @@ pub const UNREACHABLE_PATTERNS: Lint = lint("unreachable_patterns");
 pub const IRREFUTABLE_LET_PATTERNS: Lint = lint("irrefutable_let_patterns");
 pub const BINDINGS_WITH_VARIANT_NAME: Lint = lint("bindings_with_variant_name");
 pub const LONG_RUNNING_CONST_EVAL: Lint = lint("long_running_const_eval");
+pub const ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT: Lint = lint("elided_lifetimes_in_associated_constant");
 pub const UNSAFE_CODE: Lint = lint("unsafe_code");
 pub const MISSING_UNSAFE_ON_EXTERN: Lint = lint("missing_unsafe_on_extern");
 pub const DEPRECATED_SAFE_2024: Lint = lint("deprecated_safe_2024");
