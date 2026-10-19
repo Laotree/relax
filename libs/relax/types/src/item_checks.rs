@@ -435,6 +435,13 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                 _ => {}
             }
         }
+        // and the non-empty blocks inside fn bodies that survive cfg stripping: their items have
+        // definitions (the arena also holds those of cfg'd-out code, which do not)
+        for item in ast.items.iter() {
+            let ItemKind::ForeignMod(r) = item.kind else { continue };
+            if blocks.iter().any(|b| b.lo == item.lo) { continue; }
+            if ast.list(ast.row(r).items).iter().any(|it| prog.item_defs.contains_key(&(file, it.0))) { blocks.push(item); }
+        }
         blocks.sort_by_key(|i| i.lo);
         for item in blocks {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
