@@ -429,7 +429,12 @@ impl<'c, 'a> Unit<'c, 'a> {
             ExprKind::Call(f, args) => {
                 self.expr(f);
                 self.exprs(args);
-                self.after_call(e);
+                // a tuple-struct or variant constructor is an aggregate, not a call (THIR `Adt`)
+                let ctor = match ast.expr(f).kind {
+                    ExprKind::Path(_) => matches!(self.cx.body.res.get(&f.0), Some(Res::Def(d)) if matches!(self.cx.prog.def(*d).kind, DefKind::Struct | DefKind::Variant)),
+                    _ => false,
+                };
+                if !ctor { self.after_call(e); }
             }
             ExprKind::MethodCall(recv, row) => {
                 self.expr(recv);
