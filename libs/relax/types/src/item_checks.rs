@@ -1037,3 +1037,82 @@ pub fn duplicate_symbols(prog: &Program, own: &[bool]) -> Vec<String> {
     }
     errors
 }
+
+/// rustc_attr_parsing: the shape of a few built-in attributes' arguments (the `template!` each
+/// parser checks): E0539 "expected this to be of the form ..", E0805 a wrong number of
+/// arguments, E0565 a literal where a meta item belongs.
+pub fn attribute_shapes(prog: &Program, d: DefId) -> Vec<String> {
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let p = prog.src(def.file);
+    let mut errors = Vec::new();
+    for a in ast.list(ast.item(def.item).attrs) {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        if hi <= lo { continue; }
+        // `unsafe(name ..)` wraps
+        let first = if crate::cfg::tok_str(p, lo) == b"unsafe" && hi > lo + 2 && crate::cfg::tok_str(p, lo + 1) == b"(" { lo + 2 } else { lo };
+        let name = crate::cfg::tok_str(p, first).to_vec();
+        let name_str = String::from_utf8_lossy(&name).into_owned();
+        if !matches!(name.as_slice(), b"inline" | b"must_use" | b"deprecated" | b"link_name" | b"link_ordinal" | b"link") { continue; }
+        let pos = p.tok(lo).lo;
+        let end = if first > lo { hi.saturating_sub(1) } else { hi };
+        let next = if first + 1 < end { crate::cfg::tok_str(p, first + 1) } else { b"" };
+        // the arguments of `name(..)`: top-level comma separated token runs
+        let mut args: Vec<Vec<usize>> = Vec::new();
+        let mut list = false;
+        let mut eq_value: Option<usize> = None;
+        if next == b"(" {
+            list = true;
+            let mut depth = 0;
+            let mut cur: Vec<usize> = Vec::new();
+            let mut i = first + 2;
+            while i < end {
+                let t = crate::cfg::tok_str(p, i);
+                if t == b"(" { depth += 1; }
+                if t == b")" { if depth == 0 { break; } depth -= 1; }
+                if t == b"," && depth == 0 { args.push(std::mem::take(&mut cur)); } else { cur.push(i); }
+                i += 1;
+            }
+            if !cur.is_empty() { args.push(cur); }
+        } else if next == b"=" && first + 2 < end { eq_value = Some(first + 2); }
+        let is_str = |i: usize| p.tok(i).kind == crate::lexer::T::Str || p.tok(i).kind == crate::lexer::T::RawStr;
+        let mut bad = |code: &str| errors.push(prog.record_error(def.file, pos, "typeck", format!("{}: malformed `{}` attribute input", code, name_str)));
+        match name.as_slice() {
+            b"inline" => {
+                if list {
+                    if args.len() != 1 { bad("E0805"); }
+                    else if !(args[0].len() == 1 && matches!(crate::cfg::tok_str(p, args[0][0]), b"always" | b"never")) { bad("E0539"); }
+                }
+            }
+            b"must_use" => {
+                if list { bad("E0539"); }
+                else if let Some(v) = eq_value { if !is_str(v) { bad("E0539"); } }
+            }
+            b"link_name" => {
+                if eq_value.map_or(true, |v| !is_str(v)) { bad("E0539"); }
+            }
+            b"link" => {
+                if !list { bad("E0539"); }
+            }
+            b"link_ordinal" => {
+                if !list || args.is_empty() { bad("E0805"); }
+                else if args.len() > 1 { bad("E0805"); }
+                else if !(args[0].len() == 1 && p.tok(args[0][0]).kind == crate::lexer::T::Int) { bad("E0539"); }
+            }
+            b"deprecated" => {
+                if list {
+                    for arg in &args {
+                        // a bare literal where `key = value` belongs
+                        if arg.len() == 1 && matches!(p.tok(arg[0]).kind, crate::lexer::T::Str | crate::lexer::T::RawStr | crate::lexer::T::Int | crate::lexer::T::Float) { bad("E0565"); break; }
+                        let key = arg.first().map(|&i| crate::cfg::tok_str(p, i)).unwrap_or(b"");
+                        let ok_key = matches!(key, b"since" | b"note" | b"suggestion");
+                        let valued = arg.len() == 3 && crate::cfg::tok_str(p, arg[1]) == b"=" && is_str(arg[2]);
+                        if !ok_key || !valued { bad("E0539"); break; }
+                    }
+                } else if let Some(v) = eq_value { if !is_str(v) { bad("E0539"); } }
+            }
+            _ => {}
+        }
+    }
+    errors
+}
