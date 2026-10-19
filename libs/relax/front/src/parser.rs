@@ -32,6 +32,13 @@ enum BodyOutline {
     Mismatched(u32),
 }
 
+/// MAKEPAD_RUN_VERIFY_TOKENS: every macro_rules expansion's transcribed tokens are compared with the
+/// lexed text.
+fn verify_tokens() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("MAKEPAD_RUN_VERIFY_TOKENS").is_some())
+}
+
 /// Text with the tokens over it, built piece by piece (no lexing).
 #[derive(Default)]
 struct TokText {
@@ -1305,6 +1312,17 @@ impl<'a> Parser<'a> {
         if same_file {
             for (off, bp, n) in bodies {
                 self.body_origin.push((base + off, bp, n));
+            }
+        }
+        if verify_tokens() {
+            let mut lexed = Vec::new();
+            let ok = crate::lexer::lex(text.as_bytes(), self.edition, &mut lexed).is_ok();
+            lexed.retain(|t| t.kind != T::Eof);
+            let same = ok && lexed.len() == rtoks.len() && lexed.iter().zip(&rtoks).all(|(a, b)| a.kind == b.kind && a.lo == b.lo && a.hi == b.hi);
+            if !same {
+                let at = lexed.iter().zip(&rtoks).position(|(a, b)| !(a.kind == b.kind && a.lo == b.lo && a.hi == b.hi)).unwrap_or(lexed.len().min(rtoks.len()));
+                panic!("macro_rules tokens differ from the lexed text of `{}!` at token {} (lexed {} tokens, transcribed {}): lexed {:?} transcribed {:?} near `{}`", def.name, at, lexed.len(), rtoks.len(),
+                    lexed.get(at).map(|t| (t.kind, t.lo, t.hi)), rtoks.get(at).map(|t| (t.kind, t.lo, t.hi)), &text[(text.len().min(rtoks.get(at).map_or(0, |t| t.lo as usize))).saturating_sub(30)..text.len().min(rtoks.get(at).map_or(0, |t| t.hi as usize) + 30)]);
             }
         }
         Ok(self.expand_toks(&text, &rtoks, call_lo))

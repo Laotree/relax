@@ -2594,7 +2594,7 @@ impl<'a> Parser<'a> {
                 // `$crate` names the defining crate itself, even where the caller reaches the macro
                 // only through a re-export (no dependency of that name)
                 let krate_path = if def.krate == self.krate { "crate".to_string() } else { format!("::__relax_crate_{}", def.krate) };
-                let mut out = Transcript::default();
+                let mut out = Transcript { edition: self.edition, ..Default::default() };
                 self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out)?;
                 out.s.push(' ');
                 return Ok((out.s, out.toks, out.origins, out.bodies, out.groups));
@@ -2610,6 +2610,8 @@ impl<'a> Parser<'a> {
 /// body (offset, its position in the definition).
 #[derive(Default)]
 pub struct Transcript {
+    /// the edition the text is read in: the expanding parser's, whichever edition a token was lexed in
+    edition: u16,
     s: String,
     toks: Vec<Tok>,
     origins: Vec<(u32, u32, u32)>,
@@ -2619,6 +2621,11 @@ pub struct Transcript {
 
 impl Transcript {
     fn push(&mut self, kind: T, t: &str, origin: Option<u32>, bp: u32) {
+        // an identifier or keyword is classified by the edition of the expansion (`dyn`, `async`,
+        // `try` are keywords from 2018), as lexing the text would
+        let kind = if kind == T::Ident || (kind as u8 >= T::KwAs as u8 && kind as u8 <= T::KwTry as u8) {
+            crate::lexer::keyword(t.as_bytes(), self.edition).unwrap_or(T::Ident)
+        } else { kind };
         self.s.push(' ');
         let at = self.s.len() as u32;
         if let Some(o) = origin {
