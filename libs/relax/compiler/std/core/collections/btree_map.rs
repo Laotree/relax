@@ -436,7 +436,7 @@ impl<'a, K, V> Drop for DropRemaining<'a, K, V> {
     fn drop(&mut self) { self.map.drop_all(); }
 }
 
-impl<K, V> Drop for BTreeMap<K, V> {
+impl<#[cfg_attr(not(relax_check), may_dangle)] K, #[cfg_attr(not(relax_check), may_dangle)] V> Drop for BTreeMap<K, V> {
     fn drop(&mut self) {
         let guard = DropRemaining { map: self };
         guard.map.drop_all();

@@ -930,7 +930,10 @@ impl Cx<'_> {
                 mirrored = self.push(self.mk(e, ExprKind::PointerCoercion { cast, source: mirrored, is_from_as_cast: true }, fn_ptr));
             }
         }
-        let kind = if adjusted == expr_ty || tcx.tys.erase_regions(adjusted) == tcx.tys.erase_regions(expr_ty) {
+        // rustc cast.rs (#113257): a raw pointer to raw pointer cast is never turned into a coercion cast,
+        // because the pointee types may differ only in regions, which HIR typeck cannot tell apart.
+        let raw_ptr_cast = matches!(tcx.tys.kind(adjusted), TyKind::Ptr(..)) && matches!(tcx.tys.kind(expr_ty), TyKind::Ptr(..));
+        let kind = if adjusted == expr_ty || (!raw_ptr_cast && tcx.tys.erase_regions(adjusted) == tcx.tys.erase_regions(expr_ty)) {
             // a coercion cast (or a no-op): the value converted by the coercion
             ExprKind::Use { source: mirrored }
         } else if matches!(tcx.tys.kind(source_ty), TyKind::Ref(..)) {

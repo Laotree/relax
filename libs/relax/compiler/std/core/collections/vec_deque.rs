@@ -593,7 +593,7 @@ fn split_range<'a, T>(a: &'a [T], b: &'a [T], start: usize, end: usize) -> (&'a 
     }
 }
 
-impl<T> Drop for VecDeque<T> {
+impl<#[cfg_attr(not(relax_check), may_dangle)] T> Drop for VecDeque<T> {
     fn drop(&mut self) {
         self.truncate(0);
         self.free_buf();

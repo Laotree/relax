@@ -299,7 +299,7 @@ impl<T: ?Sized> Clone for Rc<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Rc<T> {
+impl<#[cfg_attr(not(relax_check), may_dangle)] T: ?Sized> Drop for Rc<T> {
     fn drop(&mut self) {
         unsafe {
             (*header_of(self.ptr.as_ptr())).strong -= 1;
@@ -562,7 +562,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Weak<T> {
+impl<#[cfg_attr(not(relax_check), may_dangle)] T: ?Sized> Drop for Weak<T> {
     fn drop(&mut self) {
         if is_dangling(self.ptr.as_ptr()) {
             return;

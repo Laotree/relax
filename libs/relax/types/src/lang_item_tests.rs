@@ -166,3 +166,19 @@ fn relax_std_provides_coerce_unsized_for_pointers_and_smart_pointers() {
     assert!(holds(adt(boxed, array), adt(boxed, slice)));
     assert!(!holds(adt(boxed, slice), adt(boxed, array)));
 }
+
+#[test]
+fn relax_std_marks_container_drops_may_dangle() {
+    use crate::next_solver::dropck_outlives::adt_dtorck_constraint;
+    let sess = &std::sync::Arc::new(crate::Session::default());
+    let mut prog = Program::new(sess);
+    prog.load_crate("core", concat!(env!("CARGO_MANIFEST_DIR"), "/../compiler/std/core/lib.rs"), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
+    prog.prelude_crate = Some(0);
+    prog.resolve_imports();
+    let mut tcx = Tcx::new();
+    tcx.collect(&prog);
+    // `Vec<&T>` may be dropped while `T` is borrowed: the element type is not among what the destructor touches.
+    let vec = named(&prog, "Vec");
+    let constraint = adt_dtorck_constraint(&tcx, &prog, vec, 256);
+    assert!(constraint.outlives.is_empty(), "{constraint:?}");
+}

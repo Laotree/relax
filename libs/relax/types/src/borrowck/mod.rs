@@ -248,3 +248,5 @@ mod implied_bounds_tests;
 mod type_check_tests;
 #[cfg(test)]
 mod root_cx_tests;
+#[cfg(test)]
+mod mir_source_tests;
