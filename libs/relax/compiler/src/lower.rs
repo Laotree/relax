@@ -13665,7 +13665,7 @@ rt_fn! {
 /// A panic reached the edge of a function that cannot unwind (an `extern "C"` body): rustc's
 /// panic_cannot_unwind -- the message, then abort.
 fn rt_cannot_unwind() {
-    if crate::jit::in_const_eval() { crate::jit::leave_pending_panic(); }
+    if crate::jit::in_checked_const_eval() { crate::jit::leave_pending_panic(); }
     eprintln!("panic in a function that cannot unwind");
     std::process::abort();
 }
