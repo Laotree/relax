@@ -2283,30 +2283,23 @@ impl<'a> Fcx<'a> {
                     ExprKind::Path(p) => p.clone(),
                     _ => return,
                 };
-                let r = self.resolve_struct_path(&path);
+                // the path resolves like a tuple-struct pattern's (aliases keep their written arguments)
+                let (r, _) = self.resolve_value_path(&path, a.0 | PAT_KEY, true);
                 self.b.res.insert(a.0, r);
-                if let Res::Def(d) = r {
-                    let (adt_ty, vi) = self.adt_of_ctor(d);
-                    let adt_ty = self.instantiate_adt(adt_ty);
-                    self.eq(adt_ty, t);
-                    let n = args.len();
-                    let r = self.ast().list(args).iter().position(|x| is_rest(*x));
-                    let sat = self.shallow(adt_ty);
-                    let nf = match self.tcx.tys.kind(sat).clone() {
-                        TyKind::Adt(ad, _, _) => self.tcx.adts.get(&ad).map_or(0, |x| x.variants.get(vi as usize).map_or(0, |v| v.fields.len())),
-                        _ => 0,
+                let ftys = self.ctor_fields_with(r, t, path.lo, Some(a.0 | PAT_KEY));
+                let n = args.len();
+                let rest = self.ast().list(args).iter().position(|x| is_rest(*x));
+                let nf = ftys.len();
+                for (i, x) in self.ast().list(args).iter().enumerate() {
+                    if Some(i) == rest {
+                        continue;
+                    }
+                    let fi = match rest {
+                        Some(r) if i > r => nf.wrapping_sub(n - i),
+                        _ => i,
                     };
-                    for (i, x) in self.ast().list(args).iter().enumerate() {
-                        if Some(i) == r {
-                            continue;
-                        }
-                        let fi = match r {
-                            Some(r) if i > r => nf.wrapping_sub(n - i),
-                            _ => i,
-                        };
-                        if let Some((_, ft)) = self.field_ty(adt_ty, vi, (fi as u32) | 0x8000_0000) {
-                            self.check_assignee(*x, ft, lo);
-                        }
+                    if let Some(ft) = ftys.get(fi) {
+                        self.check_assignee(*x, *ft, lo);
                     }
                 }
             }
@@ -2428,6 +2421,31 @@ impl<'a> Fcx<'a> {
     fn variant_path_ty(&mut self, path: &Path, variant: DefId, fresh_adt: TyId) -> TyId {
         let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() else { return fresh_adt };
         let n = path.segs.len();
+        // `Alias::<A>::Variant { .. }`: the type alias instantiated with its written (else fresh)
+        // arguments is the enum type (rustc resolves the alias path as a type)
+        if n >= 2 && !path.has_qself() {
+            let segs = crate::program::path_segs(self.prog, self.file, path);
+            let alias = if n == 2 && segs[0].0 == SegKind::Ident { self.prog.lookup_in_scope(self.module, segs[0].1, true) } else { None };
+            if let Some(alias) = alias {
+                if self.prog.def(alias).kind == DefKind::TypeAlias {
+                    let at = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), self.prog, alias);
+                    let count = self.tcx.item_env(self.prog, alias).names.len();
+                    let mut args = self.seg_args(path, n - 2, alias, 0).unwrap_or_default();
+                    while args.len() < count { args.push(self.fresh_arg(alias, args.len())); }
+                    args.truncate(count);
+                    let nregions = self.tcx.generic_indices_of(self.prog, alias).lifetimes.len();
+                    let regions: Vec<_> = (0..nregions).map(|_| self.fresh_region()).collect();
+                    let regions = self.tcx.tys.intern_region_args(&regions);
+                    let args = self.tcx.complete_args(self.prog, alias, &args, regions);
+                    let t = self.tcx.instantiate_ty(self.prog, alias, &args, at);
+                    if matches!(self.tcx.tys.kind(t), TyKind::Adt(a, _, _) if *a == d) {
+                        // the fresh arguments made for the enum are this type's
+                        self.eq(fresh_adt, t);
+                        return t;
+                    }
+                }
+            }
+        }
         let written = if n >= 2 { self.seg_args(path, n - 2, d, 0) } else { None };
         let Some(a) = written.or_else(|| self.explicit_args(path, variant, 0)) else { return fresh_adt };
         if a.is_empty() || a.len() > self.tcx.tys.list(fa).len() { return fresh_adt; }
