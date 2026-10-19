@@ -41,11 +41,14 @@ struct Fake<'t> {
     /// `dropck_outlives` answers by dropped type; the locations the query constraints were pushed at.
     dropck: std::collections::HashMap<TyId, liveness::DropckData>,
     pushed: Vec<Locations>,
+    /// The declaration's implied bounds (`RegionDriverOps::implied_bounds`) and what was installed.
+    implied: super::implied_bounds::ImpliedBounds,
+    installed: Option<(UniversalRegions, Vec<(TyId, RegionId)>)>,
 }
 impl<'t> Fake<'t> {
     fn new(tcx: &'t Tcx, first_var: usize) -> Self {
         Self { tcx, universe: UniverseIndex::ROOT, regions: vec![(Origin::Existential, UniverseIndex::ROOT); first_var],
-            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![] }
+            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), installed: None }
     }
 }
 impl liveness::LivenessOps for Fake<'_> {
@@ -59,6 +62,32 @@ impl liveness::LivenessOps for Fake<'_> {
     fn push_region_constraints(&mut self, _: &mut MirTypeckRegionConstraints, l: Locations, _: Cat, _: &crate::next_solver::type_op::QueryRegionConstraints) {
         self.pushed.push(l);
     }
+}
+impl super::mir_nll::RegionDriverOps for Fake<'_> {
+    fn num_region_vars(&self) -> usize { self.regions.len() }
+    fn region_var_info(&self, vid: usize) -> (Origin, UniverseIndex) { self.regions[vid] }
+    fn renumber(&mut self, body: &mut Body) {
+        struct R<'a, 'b>(&'a mut Fake<'b>);
+        impl crate::mir::visit::MutVisitor for R<'_, '_> {
+            fn visit_ty(&mut self, ty: &mut TyId) {
+                let tys = &self.0.tcx.tys;
+                let free = |r: RegionId, depth: u32| !matches!(tys.region_kind(r), RegionKind::ReBound(d, _) if d < depth);
+                let n = std::cell::Cell::new(0);
+                tys.map_regions(*ty, &|r, depth| { if free(r, depth) { n.set(n.get() + 1); } r }, 0);
+                let fresh: Vec<RegionId> = (0..n.get()).map(|_| self.0.next_nll_region_var(Origin::Existential, UniverseIndex::ROOT)).collect();
+                let i = std::cell::Cell::new(0);
+                *ty = tys.map_regions(*ty, &|r, depth| if free(r, depth) { i.set(i.get() + 1); fresh[i.get() - 1] } else { r }, 0);
+            }
+            fn visit_region(&mut self, region: &mut Region) {
+                let RegionKind::ReVar(v) = self.0.tcx.tys.region_kind(self.0.next_nll_region_var(Origin::Existential, UniverseIndex::ROOT)) else { unreachable!() };
+                *region = Region(v);
+            }
+        }
+        crate::mir::visit::MutVisitor::visit_body(&mut R(self), body);
+    }
+    fn install_universals(&mut self, u: &UniversalRegions, pairs: &[(TyId, RegionId)]) { self.installed = Some((u.clone(), pairs.to_vec())); }
+    fn implied_bounds(&mut self, _: &super::universal_regions::SignatureRegions, _: bool) -> (super::implied_bounds::ImpliedBounds, Vec<TyId>) { (self.implied.clone(), vec![]) }
+    fn normalize_signature_ty(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Span) -> TyId { ty }
 }
 impl BorrowckTypeOps for Fake<'_> {
     fn universe(&self) -> UniverseIndex { self.universe }
@@ -714,6 +743,60 @@ fn deferred_locals_wait_for_loans_and_register_constraints_eagerly() {
     assert_eq!(live(&c), [1]);
     assert_eq!(fake.pushed, [Locations::Single(at(0, 1))]);
     let _ = t;
+}
+
+// --- the driver: signature -> universals -> renumber -> type_check -> solved regions ---
+mod driver {
+    use super::*;
+    use crate::borrowck::check::mir_borrowck;
+    use crate::borrowck::mir_nll::{compute_regions, type_check_body, MirNllInput};
+    use crate::borrowck::universal_regions::SignatureRegions;
+
+    /// `fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32`, returning local `ret` (1 = x, 2 = y).
+    /// Every region in the body is erased, as the builder emits it.
+    fn solve(src: &str, ret: u32, outlives: &[(&str, &str)]) -> (super::super::check::MirBorrowckResult, MirTypeckSummary2) {
+        let (prog, tcx) = collect(src);
+        let f = named(&prog, "f");
+        let sig = SignatureRegions::function(&tcx, &prog, f).unwrap();
+        let t = tcx.tys.i32_;
+        let erased = rf(&tcx, RegionId::ERASED, t, false);
+        let mut b = body(&[erased, erased, erased], vec![block(vec![assign(0, copy(ret))], TerminatorKind::Return)]);
+        b.arg_count = 2;
+        b.source.owner = f;
+        let moves = MoveData::gather_moves(&b, &prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &|_| true);
+        let mut fake = Fake::new(&tcx, 0);
+        let _ = outlives;
+        // The declaration's implied bounds, from the real query.
+        let raw: Vec<TyId> = sig.inputs.iter().copied().chain([sig.output]).collect();
+        let (mut bounds, _) = crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(&tcx, &prog, f, crate::tcx::TypingMode::non_body_analysis(),
+            &tcx.param_env_id(&prog, f), false, &sig.contract.predicates, &raw, &sig.contract.assumed_wf).unwrap();
+        bounds.instantiate_query_bounds(&tcx, &[]);
+        fake.implied = bounds;
+        let (input, summary) = type_check_body(&tcx, &prog, &mut fake, &mut b, &MirNllInput { sig: &sig, nested: false, def_span: span(1), moves: &moves, has_loans: false });
+        let mut regions = compute_regions(&tcx, &prog, &b, input, false);
+        (mir_borrowck(&tcx, &prog, &b, &mut regions, &moves), MirTypeckSummary2 { bugs: summary.mir_bugs.len() })
+    }
+    struct MirTypeckSummary2 { bugs: usize }
+
+    #[test]
+    fn returning_the_argument_with_the_return_lifetime_is_accepted() {
+        let (r, s) = solve("fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32 { x }", 1, &[]);
+        assert_eq!(s.bugs, 0);
+        assert!(r.region_errors.is_empty() && r.accepted(), "{r:?}");
+    }
+
+    #[test]
+    fn returning_an_unrelated_lifetime_is_a_universal_region_error() {
+        let (r, s) = solve("fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32 { y }", 2, &[]);
+        assert_eq!(s.bugs, 0);
+        assert_eq!(r.region_errors.len(), 1, "{r:?}");
+    }
+
+    #[test]
+    fn a_where_clause_makes_the_other_lifetime_usable() {
+        let (r, _) = solve("fn f<'a, 'b: 'a>(x: &'a i32, y: &'b i32) -> &'a i32 { y }", 2, &[]);
+        assert!(r.accepted(), "{r:?}");
+    }
 }
 
 fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }
