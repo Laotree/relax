@@ -4463,7 +4463,10 @@ pub fn blocks_in_gargs(ast: &Ast, id: GenericArgsId, out: &mut Vec<BlockId>) {
                         blocks_in_gargs(ast, *ga, out);
                         blocks_in_ty(ast, *t, out);
                     }
-                    GenericArg::Constraint(_, b) => blocks_in_bounds(ast, *b, out),
+                    GenericArg::Constraint(_, ga, b) => {
+                        blocks_in_gargs(ast, *ga, out);
+                        blocks_in_bounds(ast, *b, out);
+                    }
                     GenericArg::Lifetime(_) => {}
                 }
             }
