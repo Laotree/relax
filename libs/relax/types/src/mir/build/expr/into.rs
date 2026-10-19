@@ -291,6 +291,12 @@ impl Builder<'_> {
                 Ok(block.unit())
             }
 
+            // Control never continues (the end of a diverging builtin macro): no destination.
+            ExprKind::Unreachable => {
+                self.cfg.terminate(block, source_info, TerminatorKind::Unreachable);
+                Ok(self.cfg.start_new_block().unit())
+            }
+
             ExprKind::Yield { value } => {
                 let scope = self.local_temp_lifetime();
                 let BlockAnd(b, value) = self.as_operand(block, scope, value, LocalInfo::Boring, false)?;
