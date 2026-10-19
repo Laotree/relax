@@ -221,7 +221,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             Ok(e) => {
                 // rustc evaluates every array length / const argument written in a signature (used
                 // or not): one that fails is reported there (E0080)
-                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && u.prog.def(u.prog.def(anon).parent).kind != DefKind::Trait {
+                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && !matches!(u.prog.def(u.prog.def(anon).parent).kind, DefKind::Trait | DefKind::TypeAlias) {
                     let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
                     let before = u.tcx.dcx.err_count();
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
