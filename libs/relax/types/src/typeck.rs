@@ -27,6 +27,7 @@ mod cast;
 mod pat_bindings;
 mod instantiate;
 mod side_table;
+mod place_op;
 pub mod adjustments;
 pub mod user_types;
 pub use side_table::{BitSet, SideTable, ThinVec};
@@ -148,6 +149,9 @@ pub struct Body {
     pub dependencies: ThinVec<DefId>,
     /// overloaded indexing: expr -> `Index::index` with [Self, Idx]
     pub ov_index: SideTable<u32, (DefId, crate::types::TyList)>,
+    /// `IndexMut::index_mut` with [Self, Idx] for an overloaded index used as a mutable place
+    /// (place_op.rs): rustc replaces the type-dependent def; `ov_index` keeps naming `Index::index`.
+    pub mutable_index: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> `Iterator::next` with [Iter].
     pub for_next: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> (`IntoIterator::into_iter`, [Self], iterator type).
@@ -229,6 +233,7 @@ impl Body {
             field_uses: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
+            mutable_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
             call_traits: SideTable::new(),
@@ -307,7 +312,7 @@ impl Body {
     pub fn freeze(&mut self) {
         macro_rules! shrink { ($($f:ident),*) => { $( self.$f.shrink_to_fit(); )* } }
         shrink!(res, res_args, pat_res, pat_local, methods, binops, adjustments, user_provided_types, user_provided_sigs, min_captures, hidden_types,
-            field_idx, ov_index, for_next, for_into, call_traits, legacy_args,
+            field_idx, ov_index, mutable_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
@@ -375,7 +380,7 @@ impl Body {
         add("pat_ty", self.pat_ty.len(), t(&self.pat_ty));
         add("pat_typed", self.pat_typed.len(), self.pat_typed.heap_bytes());
         macro_rules! maps { ($($f:ident),*) => { $( add(stringify!($f), self.$f.len(), m(&self.$f)); )* } }
-        maps!(res, res_args, methods, binops, ov_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, hidden_types, field_idx, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
+        maps!(res, res_args, methods, binops, ov_index, mutable_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, hidden_types, field_idx, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
         add("adjustments", self.adjustments.len(), m(&self.adjustments) + self.adjustments.values().map(|a| a.heap_bytes()).sum::<usize>());
         add("user_provided_types", self.user_provided_types.len(), m(&self.user_provided_types) + self.user_provided_types.values().map(|user| {
             std::mem::size_of_val(&**user) + user.var_kinds.capacity() * std::mem::size_of::<crate::next_solver::canonical::CanonicalVarKind>()
@@ -644,6 +649,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             field_uses: ThinVec::new(),
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
+            mutable_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
             call_traits: SideTable::new(),
@@ -1848,6 +1854,7 @@ impl<'a> Fcx<'a> {
         for (ex, a, x, pos) in std::mem::take(&mut self.deferred_dyn) {
             self.finish_dyn_coercion(ex, a, x, pos);
         }
+        self.finish_mutable_places();
         self.analyze_closures();
         for call in std::mem::take(&mut self.deferred_call_resolutions) { call.resolve(self); }
         // rustc_hir_typeck/src/lib.rs:244-247: closure analysis precedes
@@ -4415,9 +4422,12 @@ impl<'a> Fcx<'a> {
                         let ts = self.shallow(tt);
                         let es = self.shallow(et);
                         if ts == self.tcx.tys.never {
+                            // the `!` then-branch is `NeverToAny` to the else type
+                            if let Some(crate::ast::Stmt::Expr(t2, false)) = self.ast().stmts(*then).last() { self.set_coerce(t2.0, Coerce::Never, et); }
                             return et;
                         }
                         if es == self.tcx.tys.never {
+                            self.set_coerce(x.0, Coerce::Never, tt);
                             return tt;
                         }
                         // the then-branch's value is its block's tail expression
@@ -4459,6 +4469,7 @@ impl<'a> Fcx<'a> {
                 let mut any_value = false;
                 let mut all_div = !arms.is_empty();
                 let mut seen: Vec<ExprId> = Vec::new();
+                let mut never_arms: Vec<ExprId> = Vec::new();
                 for arm in self.ast().list(*arms) {
                     if !self.active(arm.attrs) {
                         continue;
@@ -4482,6 +4493,7 @@ impl<'a> Fcx<'a> {
                     let div = self.diverges;
                     all_div = all_div && div;
                     let bs = self.shallow(bt);
+                    if bs == self.tcx.tys.never { never_arms.push(arm.body); }
                     if bs != self.tcx.tys.never {
                         any_value = true;
                         match result {
@@ -4496,6 +4508,10 @@ impl<'a> Fcx<'a> {
                     self.scopes.truncate(saved);
                 }
                 self.diverges = all_div;
+                // coercion.rs CoerceMany: a `!` arm is `NeverToAny` to the match's type
+                if let (true, Some(r)) = (any_value, result) {
+                    for body in never_arms { self.set_coerce(body.0, Coerce::Never, r); }
+                }
                 match result {
                     Some(r) if any_value => r,
                     _ => self.tcx.tys.never,

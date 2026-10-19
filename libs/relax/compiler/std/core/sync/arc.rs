@@ -237,7 +237,7 @@ impl<T: ?Sized> Clone for Arc<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Arc<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Arc<T> {
     fn drop(&mut self) {
         let old = unsafe { ia::atomic_fetch_sub(strong_ptr(header_of(self.ptr.as_ptr())), 1usize, RELEASE) };
         if old != 1 {
@@ -494,7 +494,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     }
 }
 
-impl<T: ?Sized> Drop for Weak<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Weak<T> {
     fn drop(&mut self) {
         if is_dangling(self.ptr.as_ptr()) {
             return;
