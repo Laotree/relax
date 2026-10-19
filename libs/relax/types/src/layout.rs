@@ -691,6 +691,12 @@ impl Layouts {
                 let el = self.of(lcx, tcx, e);
                 let stride = self.rup(lcx, el.size, el.align);
                 let full = (stride as u64).saturating_mul(n);
+                // rustc_abi obj_size_bound: 2^61 bytes on a 64-bit target; a larger value type has no
+                // layout (E0080 "values of the type `..` are too big for the target architecture")
+                if (stride as u128) * (n as u128) >= 1u128 << 61 {
+                    tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: crate::program::NO_DEF, span: 0 },
+                        format!("E0080: values of the type `{}` are too big for the target architecture", crate::typeck::ty_to_string(false, lcx.prog, tcx, t)));
+                }
                 if full > u32::MAX as u64 {
                     lcx.overflowed.set(true);
                 }
