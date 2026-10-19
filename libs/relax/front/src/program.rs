@@ -2729,7 +2729,9 @@ impl Program {
         let mut blocks = Vec::new();
         {
             let ast = &self.files[file as usize].ast;
-            match &ast.item(iid).kind {
+            let kind = &ast.item(iid).kind;
+            blocks_in_item_signature(ast, kind, &mut blocks);
+            match kind {
                 ItemKind::Fn(_, Some(b), _) => blocks.push(*b),
                 // `const _: () = { impl X { .. } };` (bitflags and friends put impls there)
                 ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { blocks_in_expr(ast, e, &mut blocks) },
@@ -4365,6 +4367,161 @@ fn item_tag(k: &ItemKind) -> Tag {
     }
 }
 
+/// Blocks inside a type: array lengths and const generic arguments (`[u8; { const N: usize = 1; N }]`,
+/// `S<{ .. }>`), which rustc's resolver visits like any expression.
+pub fn blocks_in_ty(ast: &Ast, t: TyId, out: &mut Vec<BlockId>) {
+    match ast.ty(t) {
+        Ty::Path(p) => blocks_in_path(ast, p, out),
+        Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Paren(x) => blocks_in_ty(ast, *x, out),
+        Ty::Array(x, len) => {
+            blocks_in_ty(ast, *x, out);
+            blocks_in_expr(ast, *len, out);
+        }
+        Ty::Tuple(v) => {
+            for x in ast.list(*v) { blocks_in_ty(ast, *x, out); }
+        }
+        Ty::Fn(f) => {
+            let f = ast.fn_ptr(*f);
+            for x in ast.list(f.params) { blocks_in_ty(ast, *x, out); }
+            if let Some(r) = f.ret { blocks_in_ty(ast, r, out); }
+        }
+        Ty::ImplTrait(b) | Ty::DynTrait(b, _) => blocks_in_bounds(ast, *b, out),
+        Ty::Never | Ty::Infer | Ty::Mac(_) | Ty::ImplicitSelf | Ty::CVarArgs => {}
+    }
+}
+
+pub fn blocks_in_bounds(ast: &Ast, bounds: List<Bound>, out: &mut Vec<BlockId>) {
+    for b in ast.list(bounds) {
+        match b {
+            Bound::Trait { path, .. } => blocks_in_path(ast, path, out),
+            Bound::Lifetime(_) | Bound::Use(_) => {}
+        }
+    }
+}
+
+pub fn blocks_in_path(ast: &Ast, p: &Path, out: &mut Vec<BlockId>) {
+    if let Some(q) = ast.qself(p) {
+        blocks_in_ty(ast, q.ty, out);
+        if let Some(tp) = &q.trait_path { blocks_in_path(ast, tp, out); }
+    }
+    for seg in ast.segs(p.segs) {
+        blocks_in_gargs(ast, seg.args(), out);
+    }
+}
+
+pub fn blocks_in_gargs(ast: &Ast, id: GenericArgsId, out: &mut Vec<BlockId>) {
+    match ast.gargs(id) {
+        Some(GenericArgs::Angle(v)) => {
+            for a in ast.list(*v) {
+                match a {
+                    GenericArg::Type(t) => blocks_in_ty(ast, *t, out),
+                    GenericArg::Const(e) => blocks_in_expr(ast, *e, out),
+                    GenericArg::Binding(_, ga, t) => {
+                        blocks_in_gargs(ast, *ga, out);
+                        blocks_in_ty(ast, *t, out);
+                    }
+                    GenericArg::Constraint(_, b) => blocks_in_bounds(ast, *b, out),
+                    GenericArg::Lifetime(_) => {}
+                }
+            }
+        }
+        Some(GenericArgs::Paren(ps, r)) => {
+            for x in ast.list(*ps) { blocks_in_ty(ast, *x, out); }
+            if let Some(r) = r { blocks_in_ty(ast, *r, out); }
+        }
+        None => {}
+    }
+}
+
+fn blocks_in_generics(ast: &Ast, g: &Generics, out: &mut Vec<BlockId>) {
+    for p in ast.list(g.params) {
+        match p.kind {
+            GenericParamKind::Lifetime(_) => {}
+            GenericParamKind::Type(b, d) => {
+                blocks_in_bounds(ast, b, out);
+                if let Some(d) = d { blocks_in_ty(ast, d, out); }
+            }
+            GenericParamKind::Const(t, d) => {
+                blocks_in_ty(ast, t, out);
+                if let Some(d) = d { blocks_in_expr(ast, d, out); }
+            }
+        }
+    }
+    for w in ast.list(g.where_) {
+        if let WherePred::Bound { ty, bounds, .. } = w {
+            blocks_in_ty(ast, *ty, out);
+            blocks_in_bounds(ast, *bounds, out);
+        }
+    }
+}
+
+fn blocks_in_fields(ast: &Ast, fields: List<FieldDef>, out: &mut Vec<BlockId>) {
+    for f in ast.list(fields) {
+        blocks_in_ty(ast, f.ty, out);
+        if let Some(d) = f.default { blocks_in_expr(ast, d, out); }
+    }
+}
+
+fn blocks_in_variant_data(ast: &Ast, d: &VariantData, out: &mut Vec<BlockId>) {
+    match d {
+        VariantData::Unit => {}
+        VariantData::Tuple(f) | VariantData::Struct(f) => blocks_in_fields(ast, *f, out),
+    }
+}
+
+/// Blocks in an item's signature positions (not its body): parameter and return types, generics,
+/// fields, enum discriminants, aliased types, impl headers, constant types.
+pub fn blocks_in_item_signature(ast: &Ast, kind: &ItemKind, out: &mut Vec<BlockId>) {
+    match kind {
+        ItemKind::Fn(s, _, _) => {
+            let sig = ast.fn_sig(*s);
+            blocks_in_generics(ast, &sig.generics, out);
+            for p in ast.list(sig.params) { blocks_in_ty(ast, p.ty, out); }
+            if let Some(r) = sig.ret { blocks_in_ty(ast, r, out); }
+        }
+        ItemKind::Struct(_) => {
+            let Some(it) = ast.as_struct(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            blocks_in_variant_data(ast, &it.data, out);
+        }
+        ItemKind::Union(_) => {
+            let Some(it) = ast.as_union(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            blocks_in_fields(ast, it.fields, out);
+        }
+        ItemKind::Enum(_) => {
+            let Some(it) = ast.as_enum(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            for v in ast.list(it.variants) {
+                blocks_in_variant_data(ast, &v.data, out);
+                if let Some(d) = v.disc { blocks_in_expr(ast, d, out); }
+            }
+        }
+        ItemKind::TypeAlias(_) => {
+            let Some(it) = ast.as_alias(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            blocks_in_bounds(ast, it.bounds, out);
+            if let Some(t) = it.ty { blocks_in_ty(ast, t, out); }
+        }
+        ItemKind::Const(t, _) => {
+            if let Some(t) = t.get() { blocks_in_ty(ast, t, out); }
+        }
+        ItemKind::Static(_, t, _) => blocks_in_ty(ast, *t, out),
+        ItemKind::Impl(_) => {
+            let Some(it) = ast.as_impl(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            if let Some(tp) = &it.trait_ { blocks_in_path(ast, tp, out); }
+            blocks_in_ty(ast, it.self_ty, out);
+        }
+        ItemKind::Trait(_) => {
+            let Some(it) = ast.as_trait(kind) else { return };
+            blocks_in_generics(ast, &it.generics, out);
+            blocks_in_bounds(ast, it.supers, out);
+        }
+        _ => {}
+    }
+}
+
 /// Blocks directly reachable from an expression (not through nested blocks' statements).
 pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
     match &ast.expr(e).kind {
@@ -4394,7 +4551,14 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
                 blocks_in_expr(ast, a.body, out);
             }
         }
-        ExprKind::Closure(row) => blocks_in_expr(ast, ast.row(*row).body, out),
+        ExprKind::Closure(row) => {
+            let ClosureRow { params, ret, body, .. } = ast.row(*row);
+            for p in ast.list(*params) {
+                if let Some(t) = p.ty { blocks_in_ty(ast, t, out); }
+            }
+            if let Some(r) = ret { blocks_in_ty(ast, *r, out); }
+            blocks_in_expr(ast, *body, out)
+        }
         ExprKind::Call(f, args) => {
             blocks_in_expr(ast, *f, out);
             for a in ast.list(*args) {
@@ -4403,11 +4567,17 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
         }
         ExprKind::MethodCall(recv, row) => {
             blocks_in_expr(ast, *recv, out);
+            blocks_in_gargs(ast, ast.row(*row).turbofish, out);
             for a in ast.list(ast.row(*row).args) {
                 blocks_in_expr(ast, *a, out);
             }
         }
-        ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::AddrOf(_, _, x) | ExprKind::Try(x) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) | ExprKind::Cast(x, _) => {
+        ExprKind::Cast(x, t) => {
+            blocks_in_expr(ast, *x, out);
+            blocks_in_ty(ast, *t, out);
+        }
+        ExprKind::Path(p) => blocks_in_path(ast, p, out),
+        ExprKind::Paren(x) | ExprKind::Unary(_, x) | ExprKind::AddrOf(_, _, x) | ExprKind::Try(x) | ExprKind::Field(x, _) | ExprKind::TupleField(x, _) => {
             blocks_in_expr(ast, *x, out)
         }
         // rustc_ast/src/visit.rs walk_expr: repeat counts contain lexical blocks too.
@@ -4426,7 +4596,8 @@ pub fn blocks_in_expr(ast: &Ast, e: ExprId, out: &mut Vec<BlockId>) {
             }
         }
         ExprKind::Struct(row) => {
-            let StructRow { fields, base, .. } = ast.row(*row);
+            let StructRow { path, fields, base, .. } = ast.row(*row);
+            blocks_in_path(ast, path, out);
             for f in ast.list(*fields) {
                 blocks_in_expr(ast, f.expr, out);
             }
@@ -4809,9 +4980,15 @@ fn body_blocks(pf: &mut ParsedFile, cfg: &CfgSet) -> BodyBlocks {
             // a #[test] fn outside a test build is not compiled: the items and imports in its
             // body do not exist (rustc removes it before resolution)
             ItemKind::Fn(..) if !testing && crate::cfg::is_test(pf.src_view(), pf.ast.list(it.attrs)) => {}
-            ItemKind::Fn(_, Some(b), _) => roots.push(*b),
-            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => if let Some(e) = e.get() { blocks_in_expr(&pf.ast, e, &mut roots) },
-            _ => {}
+            ItemKind::Fn(_, Some(b), _) => {
+                blocks_in_item_signature(&pf.ast, &it.kind, &mut roots);
+                roots.push(*b)
+            }
+            ItemKind::Const(_, e) | ItemKind::Static(_, _, e) => {
+                blocks_in_item_signature(&pf.ast, &it.kind, &mut roots);
+                if let Some(e) = e.get() { blocks_in_expr(&pf.ast, e, &mut roots) }
+            }
+            _ => blocks_in_item_signature(&pf.ast, &it.kind, &mut roots),
         }
     }
     let ParsedFile { src, toks, ast, .. } = pf;
@@ -4840,7 +5017,10 @@ fn walk_body_block(ast_m: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId, out: &mu
                 Stmt::Item(i) => items.push(*i),
                 Stmt::Expr(e, _) => blocks_in_expr(ast, *e, &mut sub_blocks),
                 Stmt::Let(r) => {
-                    let LetStmt { init, else_, .. } = ast.row(*r);
+                    let LetStmt { init, else_, ty, .. } = ast.row(*r);
+                    if let Some(t) = ty {
+                        blocks_in_ty(ast, *t, &mut sub_blocks);
+                    }
                     if let Some(e) = init {
                         blocks_in_expr(ast, *e, &mut sub_blocks);
                     }
