@@ -2665,6 +2665,9 @@ impl<'a> Fcx<'a> {
         };
         let Some(m) = self.trait_fn(td, "index") else { return };
         let self_ty = if matches!(self.tcx.tys.kind(base), TyKind::Array(..)) { base } else { slice };
+        // rustc registers `Base: Index<Idx>`: selection types an integer-literal range (`..2`) as usize
+        let goal = self.trait_goal(td, self_ty, &[index]);
+        self.register_goal(goal, self.last_lo);
         self.b.std_index.insert(node, (m, self.tcx.tys.mk_list(&[self_ty, index])));
     }
 

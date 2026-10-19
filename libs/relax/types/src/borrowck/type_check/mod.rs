@@ -1066,6 +1066,9 @@ impl<'a> TypeChecker<'a> {
                         self.mirbug(format!("bad promoted type ({ty:?}: {promoted_ty:?}): {terr:?}"));
                     }
                 }
+                // An anonymous constant (array length, inline const) has no declared type: its type is the one
+                // typeck inferred for its body, which is `ty` itself, so there is nothing to relate.
+                Const::Unevaluated { def, promoted: None, .. } if self.prog.def(*def).kind == crate::program::DefKind::AnonConst => {}
                 Const::Unevaluated { def, args, promoted: None, .. } => {
                     let span = locations.span(self.body);
                     self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::new(UserTypeKind::TypeOf(*def, UserArgs { args: args.clone(), user_self_ty: None })), span);

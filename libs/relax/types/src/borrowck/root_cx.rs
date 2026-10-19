@@ -105,7 +105,9 @@ impl BorrowCheckRootCtxt<'_> {
             let mut depends_on_opaques = body.infcx.has_opaque_types_in_storage();
             let mut kept = vec![];
             for use_ in std::mem::take(&mut body.typeck.summary.deferred_closure_requirements) {
-                let j = keys.iter().position(|k| *k == use_.def).expect("a nested body is checked with its root");
+                // An inline constant the driver has not built as a body of its own imposes no requirement here
+                // (rustc checks it as a nested body; the driver does not yet).
+                let Some(j) = keys.iter().position(|k| *k == use_.def) else { continue };
                 assert!(j < i, "nested MIR bodies must precede their parent");
                 let requirements = match &finished[j] {
                     Some(done) => done.requirements.clone(),
@@ -160,7 +162,7 @@ impl BorrowCheckRootCtxt<'_> {
         for i in 0..n {
             let Some(mut body) = bodies[i].take() else { continue };
             for use_ in std::mem::take(&mut body.typeck.summary.deferred_closure_requirements) {
-                let j = keys.iter().position(|k| *k == use_.def).expect("a nested body is checked with its root");
+                let Some(j) = keys.iter().position(|k| *k == use_.def) else { continue };
                 let requirements = finished[j].as_ref().expect("nested bodies are finished before their parent").requirements.clone();
                 self.apply_closure_requirements(&mut body, &info[j], requirements.as_ref(), &use_);
             }

@@ -176,7 +176,7 @@ pub fn user_type_of(tcx: &crate::tcx::Tcx, prog: &Program, def: DefId, args: &[G
         }
         DefKind::Enum => tcx.tys.intern(TyKind::Adt(def, list, regions)),
         _ => {
-            let ty = tcx.type_of(prog, def).expect("annotated definition has a declared type");
+            let ty = tcx.type_of(prog, def).unwrap_or_else(|e| panic!("annotated definition has a declared type: {e:?} {:?} {}", prog.def(def).kind, prog.def_path(def)));
             tcx.instantiate_ty(prog, def, args, ty)
         }
     }
