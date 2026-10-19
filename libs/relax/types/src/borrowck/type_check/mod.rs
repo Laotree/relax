@@ -73,6 +73,10 @@ pub struct MirBug { pub span: Span, pub message: String }
 /// N:type_check/constraint_conversion.rs at the given locations and category), and the
 /// typed queries of rustc_middle that need region-preserving native answers.
 pub trait BorrowckTypeOps: liveness::LivenessOps {
+    /// A promoted body is checked in the root's context but has its own location numbering, spans and
+    /// allocations: location-aware ops read those of the innermost entered body.
+    fn enter_promoted(&mut self, _promoted: &Body) {}
+    fn leave_promoted(&mut self) {}
     fn universe(&self) -> UniverseIndex;
     fn create_next_universe(&mut self) -> UniverseIndex;
     /// `next_nll_region_var_in_universe`; the result is a `ReVar` region.
@@ -343,7 +347,9 @@ impl<'a> TypeChecker<'a> {
             std::mem::swap(&mut this.deferred_closure_requirements, d);
         };
         swap(self, &mut constraints, &mut liveness_constraints, &mut deferred);
+        self.infcx.enter_promoted(promoted_body);
         self.visit_body(promoted_body);
+        self.infcx.leave_promoted();
         self.body = parent_body;
         self.location_map = parent_map;
         swap(self, &mut constraints, &mut liveness_constraints, &mut deferred);

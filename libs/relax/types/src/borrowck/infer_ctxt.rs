@@ -28,6 +28,8 @@ pub struct BorrowckInferCtxt<'tcx> {
     pub region_bound_pairs: Vec<(TyId, RegionId)>,
     /// What location-aware type ops need of the body being checked, recorded by `observe_body`.
     pub mir_view: Option<MirView>,
+    /// The views of the bodies enclosing the promoted body being checked.
+    saved_views: Vec<Option<MirView>>,
     pub reg_var_to_origin: RefCell<HashMap<RegionVid, RegionCtxt>>,
 }
 
@@ -50,7 +52,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         for p in &*result.clauses { clauses.push(tcx.instantiate_predicate(prog, def_id, &full, p)); }
         let param_env = ParamEnv { clauses: clauses.into() };
         let param_env_id = std::cell::OnceCell::new();
-        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, reg_var_to_origin: RefCell::new(HashMap::default()) }
+        BorrowckInferCtxt { infcx, prog, root_def_id, param_env, param_env_id, tainted_by_errors: std::cell::Cell::new(false), encountered_re_error: std::cell::Cell::new(false), universal_regions: None, region_bound_pairs: Vec::new(), mir_view: None, saved_views: Vec::new(), reg_var_to_origin: RefCell::new(HashMap::default()) }
     }
 
     pub(crate) fn param_env_id(&self) -> crate::tcx::ParamEnvId {
@@ -198,6 +200,12 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
 }
 
 impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
+    fn enter_promoted(&mut self, promoted: &Body) {
+        let parent = self.mir_view.take();
+        self.saved_views.push(parent);
+        self.observe_body(promoted);
+    }
+    fn leave_promoted(&mut self) { self.mir_view = self.saved_views.pop().expect("leave_promoted without enter_promoted"); }
     fn universe(&self) -> UniverseIndex { self.infcx.universe() }
     fn create_next_universe(&mut self) -> UniverseIndex { self.infcx.create_next_universe() }
     fn next_nll_region_var(&mut self, origin: NllRegionVariableOrigin, universe: UniverseIndex) -> RegionId { self.infcx.next_nll_region_var_in_universe(origin, universe) }
