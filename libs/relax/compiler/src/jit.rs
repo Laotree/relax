@@ -1548,7 +1548,7 @@ pub(crate) fn in_const_eval() -> bool {
 
 /// A constant's evaluation inside a `makepad check`: its failures are diagnostics.
 pub(crate) fn in_checked_const_eval() -> bool {
-    in_const_eval() && !UNIT.is_null() && unsafe { (&*UNIT).prog.session.options.const_fuel }
+    in_const_eval() && unsafe { !UNIT.is_null() && (&*UNIT).prog.session.options.const_fuel }
 }
 
 /// Ends the run of the calling thread's `call_jit_in` with the panic recorded for it already
