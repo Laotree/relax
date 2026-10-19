@@ -85,6 +85,19 @@ impl Builder<'_> {
                     block = b;
                     (source, source_ty)
                 };
+                // A fn item or capture-free closure cast to a pointer or integer is reified to its fn
+                // pointer first (rustc cast.rs: the source is coerced to a fn pointer, then cast).
+                let (source, ty) = match tcx.tys.kind(ty) {
+                    TyKind::FnDef(..) | TyKind::Closure(..) => {
+                        let fn_ptr = self.fn_ptr_of(ty, expr_span)?;
+                        let safety = match tcx.tys.kind(fn_ptr) { TyKind::FnPtr(_, _, header, _) => header.safety, _ => crate::types::Safety::Safe };
+                        let cast = if matches!(tcx.tys.kind(ty), TyKind::Closure(..)) { crate::mir::PointerCoercion::ClosureFnPointer(safety) } else { crate::mir::PointerCoercion::ReifyFnPointer(safety) };
+                        let temp = self.temp(fn_ptr, expr_span);
+                        self.cfg.push_assign(block, source_info, temp.clone(), Rvalue::Cast(CastKind::PointerCoercion(cast, CoercionSource::AsCast), source, fn_ptr));
+                        (Operand::Move(temp), fn_ptr)
+                    }
+                    _ => (source, ty),
+                };
                 let cast_kind = self.mir_cast_kind(ty, expr_ty, expr_span)?;
                 Ok(block.and(Rvalue::Cast(cast_kind, source, expr_ty)))
             }
@@ -265,7 +278,18 @@ impl Builder<'_> {
                 // the equivalent unsigned type and do the same comparison: a negative value is *at
                 // least* 128 after the cast (that's i8::MIN), an overflowing amount for every type.
                 let lhs_size = self.int_size(ty, span)?;
-                let rhs_ty = self.operand_ty(&rhs);
+                let mut rhs = rhs;
+                let mut rhs_ty = self.operand_ty(&rhs);
+                // `1 << &n`: the by-reference impls (`Shl<&T> for T`) read the amount through the reference.
+                // rustc keeps an overloaded call; here the amount is copied out of the reference.
+                if let (TyKind::Ref(_, inner, _), Operand::Copy(p) | Operand::Move(p)) = (tcx.tys.kind(rhs_ty).clone(), &rhs) {
+                    let mut q = p.clone();
+                    q.projection.push(PlaceElem::Deref);
+                    let amount = self.temp(inner, span);
+                    self.cfg.push_assign(block, source_info, amount.clone(), Rvalue::Use(Operand::Copy(q)));
+                    rhs = Operand::Move(amount);
+                    rhs_ty = inner;
+                }
                 let rhs_prim = match tcx.tys.kind(rhs_ty) {
                     TyKind::Int(p) => *p,
                     _ => return Err(self.error(span, UnsupportedReason::UnresolvedFact("shift by a non-integer"))),
@@ -446,6 +470,22 @@ impl Builder<'_> {
     fn minval_literal(&self, span: Span, ty: TyId) -> Operand {
         let size = match self.root.cx.tcx.tys.kind(ty) { TyKind::Int(p) => Types::int_info(*p).0, _ => 4 };
         self.int_literal(span, ty, 1u128 << (size * 8 - 1))
+    }
+
+    /// The fn pointer type of a fn item / capture-free closure (typeck `fn_ptr_of`).
+    fn fn_ptr_of(&self, t: TyId, span: Span) -> BuildResult<TyId> {
+        let tcx = self.root.cx.tcx;
+        let prog = self.root.cx.prog;
+        match tcx.tys.kind(t).clone() {
+            TyKind::FnDef(d, args, regions) => {
+                let Some(sig) = tcx.fn_item_sig(prog, d).cloned() else { return Err(self.error(span, UnsupportedReason::UnresolvedFact("fn item without a signature"))) };
+                let poly = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
+                let args = tcx.complete_args(prog, d, tcx.tys.list(args), regions);
+                Ok(tcx.instantiate_ty(prog, d, &args, poly))
+            }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => Ok(sig),
+            _ => Err(self.error(span, UnsupportedReason::UnresolvedFact("not a fn item"))),
+        }
     }
 
     /// ty/cast.rs:`mir_cast_kind`.
