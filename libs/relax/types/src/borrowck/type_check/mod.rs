@@ -442,7 +442,7 @@ impl<'a> TypeChecker<'a> {
             if let Some((idx, _name)) = self.infcx.simd_const_arg(def) {
                 if !matches!(args.get(idx), Some(Operand::Constant(_))) {
                     let span = source_info(self.body, term_location).span;
-                    self.errors.push(BorrowckError { kind: ErrorKind::SimdIntrinsicArgConst, span });
+                    self.errors.push(BorrowckError::new(ErrorKind::SimdIntrinsicArgConst, span));
                 }
             }
         }
@@ -521,7 +521,7 @@ impl<'a> TypeChecker<'a> {
         if !self.infcx.type_is_sized_modulo_regions(erased_ty) && !self.reported_errors.contains(&(ty, span)) {
             // Every unsized rvalue evaluates through a temp, return slot or local.
             self.reported_errors.push((ty, span));
-            self.errors.push(BorrowckError { kind: ErrorKind::UnsizedMove, span });
+            self.errors.push(BorrowckError::new(ErrorKind::UnsizedMove, span));
         }
     }
 
