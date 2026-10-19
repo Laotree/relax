@@ -682,6 +682,38 @@ impl<'a, T: crate::marker::PointeeSized + UpperExp> UpperExp for &'a T {
     }
 }
 
+// rustc core/src/fmt/mod.rs fmt_refs!: the radix and exp traits also for `&mut T`
+impl<'a, T: crate::marker::PointeeSized + LowerHex> LowerHex for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        LowerHex::fmt(&**self, f)
+    }
+}
+impl<'a, T: crate::marker::PointeeSized + UpperHex> UpperHex for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        UpperHex::fmt(&**self, f)
+    }
+}
+impl<'a, T: crate::marker::PointeeSized + Octal> Octal for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Octal::fmt(&**self, f)
+    }
+}
+impl<'a, T: crate::marker::PointeeSized + Binary> Binary for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        Binary::fmt(&**self, f)
+    }
+}
+impl<'a, T: crate::marker::PointeeSized + LowerExp> LowerExp for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        LowerExp::fmt(&**self, f)
+    }
+}
+impl<'a, T: crate::marker::PointeeSized + UpperExp> UpperExp for &'a mut T {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        UpperExp::fmt(&**self, f)
+    }
+}
+
 // ---------------------------------------------------------------- impls for core types
 
 impl Debug for bool {
