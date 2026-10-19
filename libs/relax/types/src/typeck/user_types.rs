@@ -287,4 +287,16 @@ mod tests {
         let UserTypeKind::Ty(ty) = all[0].1.value.kind else { panic!() };
         assert!(tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS), "the annotation keeps a free region");
     }
+
+    /// rustc rejects this in borrowck (`'a: 'static`): the annotation must keep the alias with
+    /// its written lifetime, because normalizing it to `u32` would erase the constraint.
+    #[test]
+    fn projection_annotation_is_saved_unnormalized() {
+        let (_, tcx, body) = body_of("#![no_std]\ntrait Tr { type A; } impl Tr for &'static u8 { type A = u32; } fn f<'a>(x: &'a u8) { let _y: <&'a u8 as Tr>::A; }", "f");
+        let all = annotations(&body);
+        assert_eq!(all.len(), 1, "the unnormalized annotation is saved: {all:?}");
+        let UserTypeKind::Ty(ty) = all[0].1.value.kind else { panic!() };
+        assert!(matches!(tcx.tys.kind(ty), TyKind::Alias(..)), "kept as the projection");
+        assert!(tcx.tys.flags(ty).intersects(crate::types::TypeFlags::HAS_FREE_REGIONS), "with its 'a");
+    }
 }

@@ -61,7 +61,8 @@ impl Fcx<'_> {
         for (_, args, ty) in body.try_branch.values_mut() { wbcx.resolve_list(args); wbcx.resolve(ty); }
         for (_, args) in body.try_from_residual.values_mut() { wbcx.resolve_list(args); }
         for adjust in body.adjust_payloads_mut() {
-            match adjust {
+            wbcx.resolve(&mut adjust.target);
+            match &mut adjust.kind {
                 adjustments::Adjust::Deref(Some((_, args))) => wbcx.resolve_list(args),
                 adjustments::Adjust::Coerce(Coerce::ToDyn(a, b) | Coerce::Upcast(a, b)) => { wbcx.resolve(a); wbcx.resolve(b); }
                 _ => {}

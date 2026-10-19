@@ -1144,8 +1144,8 @@ impl<'a> Fcx<'a> {
             b = self.norm(b);
             let ty = self.unify_coercion(a, b, true, false)?;
             let adjustment = if matches!(self.tcx.tys.kind(prev_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn };
-            for e in prev { self.set_coerce(e.0, adjustment); }
-            self.set_coerce(new_e.0, if matches!(self.tcx.tys.kind(new_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn });
+            for e in prev { self.set_coerce(e.0, adjustment, ty); }
+            self.set_coerce(new_e.0, if matches!(self.tcx.tys.kind(new_ty), TyKind::Closure(..)) { Coerce::ClosureFn } else { Coerce::ReifyFn }, ty);
             return Some(ty);
         }
         if !self.b.coerce(new_e.0).is_some() {
@@ -1411,7 +1411,7 @@ impl<'a> Fcx<'a> {
 
 
     /// Autoderef steps from `a` to `x` (both pointees of references), if any.
-    fn deref_coercion(&mut self, a: TyId, x: TyId) -> Option<Vec<Option<adjustments::OverloadedDeref>>> {
+    fn deref_coercion(&mut self, a: TyId, x: TyId) -> Option<Vec<(Option<adjustments::OverloadedDeref>, TyId)>> {
         let xs = self.shallow(x);
         // an open target takes the source as is; an integer / float variable is no reference,
         // so `&&{integer}` to `&{integer}` derefs (rustc coerce_borrowed_pointer autoderefs
@@ -1424,7 +1424,7 @@ impl<'a> Fcx<'a> {
         for _ in 0..8usize {
             let (next, overloaded) = self.deref_step_raw(cur)?;
             cur = next;
-            derefs.push(overloaded);
+            derefs.push((overloaded, cur));
             let save = self.start_snapshot();
             if self.eq(cur, xs) {
                 self.commit_from(save);
@@ -1468,7 +1468,7 @@ impl<'a> Fcx<'a> {
         let x = self.shallow(expected);
         if a == x {
             if let (Some(e), TyKind::Ref(true, _, _)) = (e, self.tcx.tys.kind(x)) {
-                self.set_reborrow(e.0, true);
+                self.set_reborrow(e.0, true, x);
             }
             return Some(x);
         }
@@ -1476,7 +1476,7 @@ impl<'a> Fcx<'a> {
         let kx = self.tcx.tys.kind(x).clone();
         if let TyKind::Never = ka {
             if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::Never);
+                self.set_coerce(e.0, Coerce::Never, x);
             }
             if matches!(kx, TyKind::Infer(_)) {
                 self.diverging.push(x);
@@ -1485,15 +1485,15 @@ impl<'a> Fcx<'a> {
         }
         if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
             if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::ToDyn(src, dy));
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
+                self.set_coerce(e.0, Coerce::ToDyn(src, dy), x);
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
             }
             return Some(x);
         }
         if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
             if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::Upcast(sd, dd));
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
+                self.set_coerce(e.0, Coerce::Upcast(sd, dd), x);
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
             }
             return Some(x);
         }
@@ -1512,20 +1512,20 @@ impl<'a> Fcx<'a> {
                 let reborrow = self.tcx.tys.intern(TyKind::Ref(*m2, *ia, *region));
                 if let Some(target) = self.unify_coercion(reborrow, x, use_lub, false) {
                     self.commit_from(save);
-                    if *m1 { self.set_reborrow(ex.0, *m2); }
+                    if *m1 { self.set_reborrow(ex.0, *m2, reborrow); }
                     return Some(target);
                 }
                 self.rollback_to(save);
                 if let Some(derefs) = self.deref_coercion(*ia, *ix) {
-                    self.set_deref_ref(ex.0, derefs, Some(*m2));
+                    self.set_deref_ref(ex.0, derefs, Some((*m2, x)));
                     return Some(x);
                 }
             }
         }
         if self.unsize_coercion(&ka, &kx) {
             if let Some(e) = e {
-                self.set_coerce(e.0, Coerce::Unsize);
-                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { self.set_reborrow(e.0, *m); }
+                self.set_coerce(e.0, Coerce::Unsize, x);
+                if let (TyKind::Ref(..), TyKind::Ref(m, _, _) | TyKind::Ptr(m, _)) = (&ka, &kx) { let b = self.borrow_target(a, *m); self.set_reborrow(e.0, *m, b); }
             }
             return Some(x);
         }
@@ -1542,7 +1542,7 @@ impl<'a> Fcx<'a> {
                     if header.can_coerce_to(*target) {
                         let pointer = self.tcx.tys.intern(TyKind::FnPtr(ps, ret, *target, bound));
                         if let Some(target) = self.unify_coercion(pointer, x, use_lub, true) {
-                            if let Some(e) = e { self.set_coerce(e.0, Coerce::ReifyFn); }
+                            if let Some(e) = e { self.set_coerce(e.0, Coerce::ReifyFn, target); }
                             return Some(target);
                         }
                     }
@@ -1553,7 +1553,7 @@ impl<'a> Fcx<'a> {
                 let unsafe_ty = self.tcx.tys.intern(TyKind::FnPtr(ps.clone(), *r,
                     FnHeader { safety: Safety::Unsafe, ..*header }, *bound));
                 if let Some(target) = self.unify_coercion(unsafe_ty, x, use_lub, true) {
-                    if let Some(e) = e { self.set_coerce(e.0, Coerce::UnsafeFn); }
+                    if let Some(e) = e { self.set_coerce(e.0, Coerce::UnsafeFn, target); }
                     return Some(target);
                 }
             }
@@ -1568,7 +1568,7 @@ impl<'a> Fcx<'a> {
                 };
                 if !captures { if let Some(target) = self.unify_coercion(pointer, x, use_lub, false) {
                     if let Some(e) = e {
-                        self.set_coerce(e.0, Coerce::ClosureFn);
+                        self.set_coerce(e.0, Coerce::ClosureFn, target);
                     }
                     return Some(target);
                 } }
@@ -1578,7 +1578,7 @@ impl<'a> Fcx<'a> {
                 let ix = self.shallow(*ix);
                 if *m1 && !*m2 && self.unify_raw(ia, ix, false) {
                     if let Some(e) = e {
-                        self.set_coerce(e.0, Coerce::MutToConst);
+                        self.set_coerce(e.0, Coerce::MutToConst, x);
                     }
                     return Some(x);
                 }
@@ -1588,7 +1588,7 @@ impl<'a> Fcx<'a> {
                 let ia = *ia;
                 let source = self.tcx.tys.intern(TyKind::Ptr(*m2, ia));
                 if let Some(target) = self.unify_coercion(source, x, use_lub, false) {
-                    if let Some(e) = e { self.set_coerce(e.0, Coerce::RefToRaw(*m2)); }
+                    if let Some(e) = e { self.set_coerce(e.0, Coerce::RefToRaw(*m2), target); }
                     return Some(target);
                 }
             }
@@ -1596,7 +1596,7 @@ impl<'a> Fcx<'a> {
                 let ia = *ia;
                 if self.unify_raw(ia, *ix, false) {
                     if let Some(e) = e {
-                        self.set_coerce(e.0, Coerce::MutToConst);
+                        self.set_coerce(e.0, Coerce::MutToConst, x);
                     }
                     return Some(x);
                 }
@@ -1619,14 +1619,15 @@ impl<'a> Fcx<'a> {
             TyKind::Ptr(tm, pointee) if sm || !tm => {
                 if self.b.coerce(e.0).is_some() {
                     // Unsizing / trait-object coercions borrow before the pointer conversion.
-                    self.set_reborrow(e.0, tm);
+                    let b = self.borrow_target(source, tm);
+                    self.set_reborrow(e.0, tm, b);
                 } else {
                     let pointee = self.shallow(pointee);
                     if matches!(self.tcx.tys.kind(pointee), TyKind::Infer(_)) { return; }
                     let snap = self.start_snapshot();
                     if self.eq(inner, pointee) {
                         self.commit_from(snap);
-                        self.set_coerce(e.0, Coerce::RefToRaw(tm));
+                        self.set_coerce(e.0, Coerce::RefToRaw(tm), target);
                     } else {
                         self.rollback_to(snap);
                         // rustc check_ref_cast: &[T; N] -> *const T first coerces
@@ -1636,7 +1637,7 @@ impl<'a> Fcx<'a> {
                             let snap = self.start_snapshot();
                             if self.eq(element, pointee) {
                                 self.commit_from(snap);
-                                self.set_coerce(e.0, Coerce::RefToRaw(sm));
+                                self.set_coerce(e.0, Coerce::RefToRaw(sm), target);
                             } else { self.rollback_to(snap); }
                         }
                     }
@@ -1705,7 +1706,7 @@ impl<'a> Fcx<'a> {
             return t;
         }
         let v = self.fresh(0);
-        self.set_coerce(x.0, Coerce::Never);
+        self.set_coerce(x.0, Coerce::Never, v);
         self.diverging.push(v);
         v
     }
@@ -1715,9 +1716,9 @@ impl<'a> Fcx<'a> {
         let (sa, sx) = (self.shallow(a), self.shallow(x));
         let (ka, kx) = (self.tcx.tys.kind(sa).clone(), self.tcx.tys.kind(sx).clone());
         if let Some((src, dy)) = self.dyn_coercion(&ka, &kx) {
-            self.set_coerce(ex.0, Coerce::ToDyn(src, dy));
+            self.set_coerce(ex.0, Coerce::ToDyn(src, dy), x);
         } else if let Some((sd, dd)) = self.dyn_upcast(&ka, &kx) {
-            self.set_coerce(ex.0, Coerce::Upcast(sd, dd));
+            self.set_coerce(ex.0, Coerce::Upcast(sd, dd), x);
         } else if !self.eq(sa, sx) {
             let (p, q) = (self.ty_str(sx), self.ty_str(sa));
             self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", p, q));
@@ -1739,9 +1740,9 @@ impl<'a> Fcx<'a> {
         for key in self.b.adjustments.keys().copied().collect::<Vec<_>>() {
             let mut adj = self.b.adjustments[&key].clone();
             for a in adj.operand.iter_mut().chain(adj.value.iter_mut()) {
-                if let adjustments::Adjust::Deref(Some((method, args))) = *a {
+                if let adjustments::Adjust::Deref(Some((method, args))) = a.kind {
                     let args = self.tcx.tys.list(args).iter().map(|&t| self.norm(t)).collect::<Vec<_>>();
-                    *a = adjustments::Adjust::Deref(Some((method, self.tcx.tys.mk_list(&args))));
+                    a.kind = adjustments::Adjust::Deref(Some((method, self.tcx.tys.mk_list(&args))));
                 }
             }
             self.b.adjustments.insert(key, adj);
@@ -1830,7 +1831,7 @@ impl<'a> Fcx<'a> {
                         let snapshot = self.start_snapshot();
                         if self.eq(element, pointee) {
                             self.commit_from(snapshot);
-                            self.set_coerce(x.0, Coerce::RefToRaw(source_mut));
+                            self.set_coerce(x.0, Coerce::RefToRaw(source_mut), target);
                         } else { self.rollback_to(snapshot); }
                     }
                 }
@@ -3593,7 +3594,7 @@ impl<'a> Fcx<'a> {
     /// `Deref` for other types. Records the step in the operand adjustments of node `e`.
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
         let (next, overloaded) = self.deref_step_raw(t)?;
-        self.set_operand_deref(e, step, overloaded);
+        self.set_operand_deref(e, step, overloaded, next);
         Some(next)
     }
 
@@ -4121,7 +4122,7 @@ impl<'a> Fcx<'a> {
                             // `RefCell<dyn FnMut()>` keeps the closure type
                             let unsized_x = self.is_unsized_ty(sx);
                             if st == sx && matches!(self.tcx.tys.kind(st), TyKind::Ref(true, _, _)) {
-                                self.set_reborrow(e.0, true);
+                                self.set_reborrow(e.0, true, st);
                             }
                             if !unsized_x && st != sx && !matches!(self.tcx.tys.kind(st), TyKind::Never | TyKind::Infer(_)) && !matches!(self.tcx.tys.kind(sx), TyKind::Infer(_)) {
                                 // the expectation may be a mere hint (an if's other branch):
@@ -4217,8 +4218,12 @@ impl<'a> Fcx<'a> {
                 }
                 UnOp::Deref => {
                     let t = self.check_expr(*x, None);
-                    match self.deref_step(e.0, 0, t) {
-                        Some(i) => i,
+                    // (a built-in `*` is no adjustment; an overloaded one is the operand's Deref::deref)
+                    match self.deref_step_raw(t) {
+                        Some((i, overloaded)) => {
+                            if overloaded.is_some() { self.set_operand_deref(e.0, 0, overloaded, i); }
+                            i
+                        }
                         None => {
                             let s = self.ty_str(t);
                             self.err(lo, format!("E0614: type `{}` cannot be dereferenced", s));
@@ -4295,12 +4300,12 @@ impl<'a> Fcx<'a> {
                 if matches!((&kx, &kt), (TyKind::Ref(..), TyKind::Ptr(..))) {
                     self.deferred_casts.push((*x, xt, target));
                 } else if let Some((src, dy)) = self.dyn_coercion(&kx, &kt) {
-                    self.set_coerce(x.0, Coerce::ToDyn(src, dy));
+                    self.set_coerce(x.0, Coerce::ToDyn(src, dy), target);
                 } else if let Some((sd, dd)) = self.dyn_upcast(&kx, &kt) {
-                    self.set_coerce(x.0, Coerce::Upcast(sd, dd));
+                    self.set_coerce(x.0, Coerce::Upcast(sd, dd), target);
                 } else if self.unsize_coercion(&kx, &kt) {
                     // rustc check_cast: a cast that is a coercion is one (`&mut [1] as *mut [i32]`)
-                    self.set_coerce(x.0, Coerce::Unsize);
+                    self.set_coerce(x.0, Coerce::Unsize, target);
                 } else if let (TyKind::Ref(..) | TyKind::Ptr(..), TyKind::Ptr(..), true) = (&kx, &kt, {
                     // an open source pointee against a known target pointee (`&data as *const
                     // *const ()` with data: *const ?T): the cast is the coercion, T = ()
@@ -4733,6 +4738,7 @@ impl<'a> Fcx<'a> {
                     match self.tcx.tys.kind(cur).clone() {
                         TyKind::Tuple(v) => {
                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
+                            self.set_operand_derefs(e.0, derefs);
                             return self.tcx.tys.list(v).get(*idx as usize).copied().unwrap_or(error);
                         }
                         TyKind::Adt(d, args, regions) => {
@@ -4742,6 +4748,7 @@ impl<'a> Fcx<'a> {
                                     if let Some(f) = adt.variants[0].fields.get(*idx as usize) {
                                         if self.field_visible(d, f) {
                                             self.b.field_idx.insert(e.0, (derefs as u32, *idx));
+                                            self.set_operand_derefs(e.0, derefs);
                                             return self.instantiate_field_type(f.ty, adt.region_params, regions, self.tcx.tys.list(args));
                                         }
                                     }
@@ -4833,6 +4840,7 @@ impl<'a> Fcx<'a> {
                         }
                         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {
                             cur = self.shallow(x);
+                            self.set_operand_deref(e.0, derefs, None, cur);
                             derefs += 1;
                         }
                         TyKind::Adt(..) => {
@@ -5442,6 +5450,7 @@ impl<'a> Fcx<'a> {
                             // continues (`rc.0` on Rc<Shared> is Shared's field)
                             if f.name == s && self.field_visible(d, f) {
                                 self.b.field_idx.insert(e.0, (derefs as u32, i as u32));
+                                self.set_operand_derefs(e.0, derefs);
                                 if !self.b.field_uses.contains(&(d, i as u32)) {
                                     self.b.field_uses.push((d, i as u32));
                                     self.b.dependencies.push(d);

@@ -6,10 +6,33 @@
 //! consumers already use (the node that consumes the value) and two sites per node:
 //!
 //! * `operand`: the autoderef of the node's operand -- the method receiver of a `MethodCall`,
-//!   the base of an `Index`, the callee of a `Call`, the operand of a unary `*`.
+//!   the base of an `Index`, the field base of a `Field`, the callee of a `Call`, the operand
+//!   of an overloaded unary `*`. Every step is recorded, built-in or overloaded, in order.
 //! * `value`: the node's own value converted to the type its context expects (a coercion site):
-//!   `[Deref*, Borrow?, Coerce?]` in application order, as rustc's `coerce_borrowed_pointer`
-//!   (derefs + autoref) followed by the pointer coercion.
+//!   `[Deref*, Borrow?, Coerce?]` in application order.
+//!
+//! Every `Adjustment` carries `target`, the type of the value after the step (rustc
+//! `Adjustment::target`), resolved by writeback.
+//!
+//! Mapping to rustc, exactly (the one place Relax is coarser):
+//! * operand site: identical to rustc's autoderef adjustments of the receiver / base / callee
+//!   (`Deref(None)` for a reference or raw pointer step, `Deref(Some)` for `Deref::deref`).
+//!   rustc's trailing autoref / unsize of a method receiver stays in `MethodRes`
+//!   (`autoref`, `unsize`), not in this list.
+//! * value site, reference coercions: rustc's `coerce_borrowed_pointer` is
+//!   `[Deref(None) (the source reference itself), Deref(..)*, Borrow]`. Relax **omits the leading
+//!   built-in `Deref(None)`** that peels the source reference: `&String -> &str` is
+//!   `[Deref(Some), Borrow]` (rustc `[Deref(None), Deref(Some), Borrow]`); an equal-type or
+//!   `&mut -> &` reborrow is `[Borrow]` (rustc `[Deref(None), Borrow]`); `&&T -> &T` is
+//!   `[Deref(None), Borrow]`. A builder that mirrors rustc inserts the leading `Deref(None)` when
+//!   the list starts a reference coercion, i.e. whenever the value site contains a `Borrow`
+//!   and the source type is a reference (the `target` of the first step is the pointee after
+//!   the first listed deref, the source type is `expr_ty`).
+//! * value site, unsizing and pointer casts: `[Borrow(source ref -> reborrowed ref),
+//!   Coerce(kind)]`, rustc `[Deref(None), Borrow, Pointer(Unsize)]` with the same omission;
+//!   `Coerce::{ReifyFn, ClosureFn, UnsafeFn, MutToConst, Unsize, ToDyn, Upcast, RefToRaw}` are
+//!   rustc's `Pointer(..)` kinds, `Never` is `NeverToAny`.
+//! * `Coerce::DerefRef(n)` is a view over the list (n `Deref`s), never stored.
 use super::*;
 use crate::types::TyList;
 
@@ -29,10 +52,17 @@ pub enum Adjust {
     Coerce(Coerce),
 }
 
+/// One step and the type of the value after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Adjustment {
+    pub kind: Adjust,
+    pub target: TyId,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Adjustments {
-    pub operand: ThinVec<Adjust>,
-    pub value: ThinVec<Adjust>,
+    pub operand: ThinVec<Adjustment>,
+    pub value: ThinVec<Adjustment>,
 }
 
 impl Adjustments {
@@ -54,8 +84,8 @@ impl Body {
         let value = &self.adjustments.get(&node)?.value;
         let mut derefs = 0;
         for a in value.iter() {
-            match a {
-                Adjust::Coerce(c) => return Some(*c),
+            match a.kind {
+                Adjust::Coerce(c) => return Some(c),
                 Adjust::Deref(_) => derefs += 1,
                 Adjust::Borrow(_) => {}
             }
@@ -65,7 +95,7 @@ impl Body {
 
     /// The mutability of the reborrow of the value of `node`, if it is reborrowed.
     pub fn reborrow(&self, node: u32) -> Option<bool> {
-        self.adjustments.get(&node)?.value.iter().find_map(|a| match a { Adjust::Borrow(m) => Some(*m), _ => None })
+        self.adjustments.get(&node)?.value.iter().find_map(|a| match a.kind { Adjust::Borrow(m) => Some(m), _ => None })
     }
 
     /// The overloaded deref at `step` of the autoderef addressed by `key`: the node of a
@@ -74,7 +104,7 @@ impl Body {
         let (node, value) = split_key(key);
         let adj = self.adjustments.get(&node)?;
         match (if value { &adj.value } else { &adj.operand }).get(step) {
-            Some(Adjust::Deref(Some(ov))) => Some(*ov),
+            Some(Adjustment { kind: Adjust::Deref(Some(ov)), .. }) => Some(*ov),
             _ => None,
         }
     }
@@ -92,8 +122,8 @@ impl Body {
     /// Every overloaded deref of the body: (key, step, call), keys as `ov_deref` takes them.
     pub fn overloaded_derefs(&self) -> impl Iterator<Item = (u32, usize, OverloadedDeref)> + '_ {
         self.adjustments.iter().flat_map(|(&node, adj)| {
-            let operand = adj.operand.iter().enumerate().filter_map(move |(i, a)| match a { Adjust::Deref(Some(ov)) => Some((node, i, *ov)), _ => None });
-            let value = adj.value.iter().enumerate().filter_map(move |(i, a)| match a { Adjust::Deref(Some(ov)) => Some((node | DEREF_COERCE_KEY, i, *ov)), _ => None });
+            let operand = adj.operand.iter().enumerate().filter_map(move |(i, a)| match a.kind { Adjust::Deref(Some(ov)) => Some((node, i, ov)), _ => None });
+            let value = adj.value.iter().enumerate().filter_map(move |(i, a)| match a.kind { Adjust::Deref(Some(ov)) => Some((node | DEREF_COERCE_KEY, i, ov)), _ => None });
             operand.chain(value)
         })
     }
@@ -106,9 +136,9 @@ impl Body {
         self.ov_deref(node, 0)
     }
 
-    /// Mutable access to every list of overloaded-deref and coercion payload types (writeback,
-    /// instantiation): the substitution applies to the arguments and the pointee types.
-    pub fn adjust_payloads_mut(&mut self) -> impl Iterator<Item = &mut Adjust> {
+    /// Mutable access to every step (writeback, instantiation): the substitution applies to the
+    /// arguments, the coercion payload types and the targets.
+    pub fn adjust_payloads_mut(&mut self) -> impl Iterator<Item = &mut Adjustment> {
         self.adjustments.values_mut().flat_map(|a| a.operand.iter_mut().chain(a.value.iter_mut()))
     }
 }
@@ -116,42 +146,56 @@ impl Body {
 impl Fcx<'_> {
     fn adj_mut(&mut self, node: u32) -> &mut Adjustments { self.b.adjustments.get_or_insert_with(node, Adjustments::default) }
 
-    /// Apply the coercion to the value of `node` (the previous one is replaced).
-    pub(super) fn set_coerce(&mut self, node: u32, coerce: Coerce) {
+    /// The reference type `source` has after being reborrowed with mutability `mutable`
+    /// (the `target` of a `Borrow` step): `&'a T` -> `&'a mut T`, a raw pointer or anything
+    /// else keeps its type.
+    pub(super) fn borrow_target(&mut self, source: TyId, mutable: bool) -> TyId {
+        let source = self.shallow(source);
+        match *self.tcx.tys.kind(source) {
+            TyKind::Ref(_, inner, region) => self.tcx.tys.intern(TyKind::Ref(mutable, inner, region)),
+            _ => source,
+        }
+    }
+
+    /// Apply the coercion to the value of `node` (the previous one is replaced); `target` is the
+    /// type after it.
+    pub(super) fn set_coerce(&mut self, node: u32, coerce: Coerce, target: TyId) {
         debug_assert!(!matches!(coerce, Coerce::DerefRef(_)));
         let value = &mut self.adj_mut(node).value;
-        value.retain(|a| !matches!(a, Adjust::Coerce(_)));
-        value.push(Adjust::Coerce(coerce));
+        value.retain(|a| !matches!(a.kind, Adjust::Coerce(_)));
+        value.push(Adjustment { kind: Adjust::Coerce(coerce), target });
     }
 
-    /// `derefs.len()` autoderef steps, then a borrow of mutability `mutable` (an existing borrow
-    /// stays when `None`): `&&T -> &T`, `&String -> &str`.
-    pub(super) fn set_deref_ref(&mut self, node: u32, derefs: Vec<Option<OverloadedDeref>>, mutable: Option<bool>) {
+    /// The autoderef steps (`(overloaded call, type after the step)`) then a borrow of
+    /// mutability `mutable` of type `borrowed` (an existing borrow stays when `None`):
+    /// `&&T -> &T`, `&String -> &str`.
+    pub(super) fn set_deref_ref(&mut self, node: u32, derefs: Vec<(Option<OverloadedDeref>, TyId)>, mutable: Option<(bool, TyId)>) {
         let value = &mut self.adj_mut(node).value;
-        let old = value.iter().find_map(|a| match a { Adjust::Borrow(m) => Some(*m), _ => None });
+        let old = value.iter().find_map(|a| match a.kind { Adjust::Borrow(m) => Some((m, a.target)), _ => None });
         value.clear();
-        for d in derefs { value.push(Adjust::Deref(d)); }
-        if let Some(m) = mutable.or(old) { value.push(Adjust::Borrow(m)); }
+        for (d, target) in derefs { value.push(Adjustment { kind: Adjust::Deref(d), target }); }
+        if let Some((m, target)) = mutable.or(old) { value.push(Adjustment { kind: Adjust::Borrow(m), target }); }
     }
 
-    /// Reborrow the value of `node` (kept in front of a pointer coercion).
-    pub(super) fn set_reborrow(&mut self, node: u32, mutable: bool) {
+    /// Reborrow the value of `node` as `target` (kept in front of a pointer coercion).
+    pub(super) fn set_reborrow(&mut self, node: u32, mutable: bool, target: TyId) {
         let value = &mut self.adj_mut(node).value;
-        match value.iter_mut().find(|a| matches!(a, Adjust::Borrow(_))) {
-            Some(a) => *a = Adjust::Borrow(mutable),
+        let step = Adjustment { kind: Adjust::Borrow(mutable), target };
+        match value.iter_mut().find(|a| matches!(a.kind, Adjust::Borrow(_))) {
+            Some(a) => *a = step,
             None => {
-                let at = value.iter().position(|a| matches!(a, Adjust::Coerce(_))).unwrap_or(value.len());
-                value.insert(at, Adjust::Borrow(mutable));
+                let at = value.iter().position(|a| matches!(a.kind, Adjust::Coerce(_))).unwrap_or(value.len());
+                value.insert(at, step);
             }
         }
     }
 
     /// The `value` site of `node`, to restore after a coercion attempt fails.
-    pub(super) fn save_value_adjustments(&self, node: u32) -> ThinVec<Adjust> {
+    pub(super) fn save_value_adjustments(&self, node: u32) -> ThinVec<Adjustment> {
         self.b.adjustments.get(&node).map_or_else(ThinVec::new, |a| a.value.clone())
     }
 
-    pub(super) fn restore_value_adjustments(&mut self, node: u32, saved: ThinVec<Adjust>) {
+    pub(super) fn restore_value_adjustments(&mut self, node: u32, saved: ThinVec<Adjustment>) {
         if saved.is_empty() {
             if let Some(adj) = self.b.adjustments.get_mut(&node) {
                 adj.value.clear();
@@ -168,27 +212,23 @@ impl Fcx<'_> {
         if !saved.is_empty() { self.adj_mut(to).value = saved; }
     }
 
-    /// Record the step `step` of the operand autoderef of `node`: only overloaded steps are
-    /// stored; a built-in step erases what an earlier attempt left there.
-    pub(super) fn set_operand_deref(&mut self, node: u32, step: usize, deref: Option<OverloadedDeref>) {
-        match deref {
-            Some(_) => {
-                let operand = &mut self.adj_mut(node).operand;
-                while operand.len() <= step { operand.push(Adjust::Deref(None)); }
-                operand[step] = Adjust::Deref(deref);
-            }
-            None => {
-                if let Some(slot) = self.b.adjustments.get_mut(&node).and_then(|a| a.operand.get_mut(step)) { *slot = Adjust::Deref(None); }
-            }
-        }
+    /// Record step `step` of the operand autoderef of `node` (built-in or overloaded), leaving
+    /// `target` as the type after it. Steps are recorded in order as they are taken; a step
+    /// overwrites what an earlier attempt left there.
+    pub(super) fn set_operand_deref(&mut self, node: u32, step: usize, deref: Option<OverloadedDeref>, target: TyId) {
+        let placeholder = self.tcx.tys.error;
+        let operand = &mut self.adj_mut(node).operand;
+        while operand.len() <= step { operand.push(Adjustment { kind: Adjust::Deref(None), target: placeholder }); }
+        operand[step] = Adjustment { kind: Adjust::Deref(deref), target };
     }
 
-    /// The operand autoderef of `node` has exactly `n` steps.
+    /// The operand autoderef of `node` has exactly `n` steps (all recorded already).
     pub(super) fn set_operand_derefs(&mut self, node: u32, n: usize) {
-        if n == 0 && !self.b.adjustments.contains_key(&node) { return; }
-        let operand = &mut self.adj_mut(node).operand;
-        operand.truncate(n);
-        while operand.len() < n { operand.push(Adjust::Deref(None)); }
+        if let Some(adj) = self.b.adjustments.get_mut(&node) {
+            debug_assert!(adj.operand.len() >= n, "operand autoderef of {node} recorded {} of {n} steps", adj.operand.len());
+            adj.operand.truncate(n);
+            if adj.is_empty() { self.b.adjustments.remove(&node); }
+        }
     }
 }
 
@@ -221,7 +261,10 @@ mod tests {
         let e = tail(&prog, &body);
         assert_eq!(body.coerce(e), Some(Coerce::DerefRef(1)));
         assert_eq!(body.reborrow(e), Some(false));
-        assert_eq!(body.adjustments(e).unwrap().value.as_slice(), &[Adjust::Deref(None), Adjust::Borrow(false)]);
+        let kinds: Vec<_> = body.adjustments(e).unwrap().value.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [Adjust::Deref(None), Adjust::Borrow(false)]);
+        // the borrow's target is the coerced value's type, the return type
+        assert_eq!(body.adjustments(e).unwrap().value[1].target, body.ret);
     }
 
     #[test]
@@ -249,7 +292,8 @@ mod tests {
         let (prog, body) = body_of("fn f(x: &[u8; 2]) -> &[u8] { x }", "f");
         let e = tail(&prog, &body);
         assert_eq!(body.coerce(e), Some(Coerce::Unsize));
-        assert_eq!(body.adjustments(e).unwrap().value.as_slice(), &[Adjust::Borrow(false), Adjust::Coerce(Coerce::Unsize)]);
+        let kinds: Vec<_> = body.adjustments(e).unwrap().value.iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [Adjust::Borrow(false), Adjust::Coerce(Coerce::Unsize)]);
     }
 
     #[test]
@@ -265,6 +309,10 @@ mod tests {
         let (_, body) = body_of("fn f(v: &&[u8], n: usize) -> u8 { v[n] }", "f");
         let index = body.adjustments.iter().find(|(_, a)| !a.operand.is_empty()).expect("an indexed base");
         assert_eq!(body.index_derefs(*index.0), 2);
+        // v: &&[u8]: after the first step `&[u8]`, after the second `[u8]`; no step is left unresolved
+        let targets: Vec<_> = index.1.operand.iter().map(|a| a.target).collect();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0] != targets[1] && targets.iter().all(|&t| t != body.ret));
         let (_, body) = body_of("fn g(f: &fn() -> u8) -> u8 { f() }", "g");
         let call = body.adjustments.iter().find(|(_, a)| !a.operand.is_empty()).expect("a callee");
         assert_eq!(body.call_derefs(*call.0), Some(1));

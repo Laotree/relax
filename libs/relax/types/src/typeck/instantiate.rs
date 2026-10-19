@@ -52,7 +52,8 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, env: crate::tcx::Typ
     for method in b.methods.values_mut() { sl(&mut method.args, &mut s)?; }
     for method in b.binops.values_mut() { sl(&mut method.args, &mut s)?; }
     for adjust in b.adjust_payloads_mut() {
-        match adjust {
+        adjust.target = s(adjust.target)?;
+        match &mut adjust.kind {
             adjustments::Adjust::Deref(Some((_, args))) => sl(args, &mut s)?,
             adjustments::Adjust::Coerce(Coerce::ToDyn(a, d) | Coerce::Upcast(a, d)) => { *a = s(*a)?; *d = s(*d)?; }
             _ => {}

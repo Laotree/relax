@@ -479,7 +479,7 @@ mod tests {
         let state = crate::tcx::EvalState::new();
         let cx = crate::tcx::EvalCx::new(&prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &state);
         for reborrow in [false, true] {
-            if reborrow { b.adjustments.insert(id.0, crate::typeck::adjustments::Adjustments { operand: Default::default(), value: vec![crate::typeck::adjustments::Adjust::Borrow(true)].into() }); }
+            if reborrow { b.adjustments.insert(id.0, crate::typeck::adjustments::Adjustments { operand: Default::default(), value: vec![crate::typeck::adjustments::Adjustment { kind: crate::typeck::adjustments::Adjust::Borrow(true), target: t }].into() }); }
             let mut v = ExprUseVisitor { tcx: &tcx, cx: &cx, body: &b, delegate: Events::default(), errors: Vec::new() };
             v.consume_expr(id);
             assert!(v.errors.is_empty());
