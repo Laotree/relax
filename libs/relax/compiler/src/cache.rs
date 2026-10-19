@@ -3227,7 +3227,10 @@ pub(crate) fn trace_lookup(u: &Unit, id: u32, what: &str) {
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => "-".to_string(),
     };
     let on_main = crate::owner::for_main();
-    let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id));
+    // the code key and the identity of the fn (its key bytes without interfaces and bodies): the same
+    // identity under another key in two runs is a function the cache failed to share
+    let (key, ident) = u.cache.as_ref().map_or((0, 0), |c| (c.slot_keys.get(&id).copied().flatten().unwrap_or(0), c.fnkey_bytes.get(&id).and_then(|b| b.as_ref()).map_or(0, |b| identity_hash(b))));
+    let line = format!("{:.1}\t{}\t{}\t{}\t{}\t{}\t{:032x}\t{:032x}\n", crate::jit::wall_ns() as f64 / 1e6, what, if on_main { "main" } else { "worker" }, krate, u.fns[id as usize].name, crate::syms::stable_fn_name(u, id), key, ident);
     crate::zone_alloc::kept_with(|| TRACE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(String::new).push_str(&line));
 }
 
