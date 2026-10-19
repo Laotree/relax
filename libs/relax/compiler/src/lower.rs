@@ -8397,8 +8397,12 @@ impl<'a> Lcx<'a> {
             let (x, y) = if signed { (x as i64 as i128, y as i64 as i128) } else { (x as u64 as i128, y as u64 as i128) };
             match c { Cond::Eq => x == y, Cond::Ne => x != y, Cond::Lt => x < y, Cond::Le => x <= y, Cond::Gt => x > y, Cond::Ge => x >= y }
         }
-        let all: Vec<&Inst> = self.f.blocks.iter().flat_map(|b| b.insts.iter()).chain(self.entry_inits.iter()).collect();
-        value(&all, c, 0).map(|k| k != 0)
+        // Only under a check (the post-monomorphization walk): RIR registers are not SSA, so a
+        // definition found by search is a proof only within the branch's own block; the code a
+        // run executes is lowered as written.
+        if !self.u.prog.session.options.const_fuel { return None; }
+        let local: Vec<&Inst> = self.entry_inits.iter().chain(blk.insts.iter()).collect();
+        value(&local, c, 0).map(|k| k != 0)
     }
 
     fn lower_if(&mut self, c: ExprId, then: BlockId, els: Option<ExprId>, t: TyId) -> Val {
