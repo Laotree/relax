@@ -24,6 +24,7 @@ mod opaque_types;
 mod call;
 mod checks;
 mod cast;
+mod pat_bindings;
 mod instantiate;
 mod side_table;
 pub use side_table::{BitSet, SideTable, ThinVec};
@@ -468,6 +469,8 @@ pub struct Fcx<'a> {
     deferred_casts: Vec<(ExprId, TyId, TyId)>,
     /// every `e as T` (cast expression's position), validated after fallback (cast.rs)
     cast_checks: Vec<(ExprId, TyId, TyId, u32)>,
+    /// how many patterns enclose the one being checked
+    pat_nest: u32,
     /// inference variables a `!` value was coerced to (rustc diverging type variables): left
     /// unconstrained, they fall back to `()` (`!` from edition 2024) at the end
     diverging: Vec<TyId>,
@@ -674,6 +677,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),
         cast_checks: Vec::new(),
+        pat_nest: 0,
         bind_mode: 0,
         pat_path_pre: None,
         extra_arg: None,
@@ -1941,6 +1945,14 @@ impl<'a> Fcx<'a> {
     // ------------------------------------------------------------ patterns
 
     pub fn check_pat(&mut self, p: PatId, expected: TyId) {
+        // a whole pattern (not a part of one): its bindings are checked once
+        if self.pat_nest == 0 && self.tcx.validates(self.prog, self.file) { self.check_pattern_bindings(p); }
+        self.pat_nest += 1;
+        self.check_pat_nested(p, expected);
+        self.pat_nest -= 1;
+    }
+
+    fn check_pat_nested(&mut self, p: PatId, expected: TyId) {
         let ast = self.ast();
         // the pattern's type is the matched value's (lowering peels pat_derefs itself)
         let pi = self.b.pat_ix(p);
@@ -2056,6 +2068,36 @@ impl<'a> Fcx<'a> {
                             let t = self.value_def_ty(d, None, p.0 | PAT_KEY);
                             self.coerce_or_unify(t, expected, None, name.lo);
                             return;
+                        }
+                    }
+                }
+                // a binding cannot take the name of a static or a tuple struct/variant (E0530)
+                if self.tcx.validates(self.prog, self.file) {
+                    if self.env.consts.iter().any(|c| self.env.names.get(c.0 as usize) == Some(&s)) {
+                        self.err(name.lo, "E0530: match bindings cannot shadow const parameters".to_string());
+                    }
+                    if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
+                        let what = match self.prog.def(d).kind {
+                            DefKind::Static | DefKind::ForeignStatic => Some("statics"),
+                            // (reached only with `mut`, `ref` or `@`: otherwise the name is a path)
+                            DefKind::Const | DefKind::AssocConst => Some("constants"),
+                            DefKind::Variant | DefKind::Struct => Some("unit variants or structs"),
+                            _ => None,
+                        };
+                        if let Some(what) = what {
+                            self.err(name.lo, format!("E0530: match bindings cannot shadow {}", what));
+                        }
+                    }
+                }
+                // check_match: a by-value binding named like a unit variant of the matched enum
+                if sub.is_none() && !*by_ref && !*mutbl && self.tcx.validates(self.prog, self.file) {
+                    let mut t = self.shallow(expected);
+                    while let TyKind::Ref(_, i, _) = self.tcx.tys.kind(t).clone() { t = self.shallow(i); }
+                    if let TyKind::Adt(ed, _, _) = self.tcx.tys.kind(t).clone() {
+                        if self.tcx.adts.get(&ed).is_some_and(|a| a.is_enum && a.variants.iter().any(|v| v.name == s && v.shape == 0)) {
+                            let en = crate::typeck::ty_to_string(false, self.prog, self.tcx, t);
+                            crate::lint::emit(self.prog, self.b.def, &crate::lint::BINDINGS_WITH_VARIANT_NAME, self.file, name.lo,
+                                &format!("E0170: pattern binding `{}` is named the same as one of the variants of the type `{}`", self.text(*name), en));
                         }
                     }
                 }
@@ -2195,6 +2237,11 @@ impl<'a> Fcx<'a> {
                     None => self.resolve_value_path(path, p.0 | PAT_KEY, true),
                 };
                 self.b.pat_res.insert(p.0, r);
+                if let Res::Def(pd) = r {
+                    if self.tcx.validates(self.prog, self.file) && matches!(self.prog.def(pd).kind, DefKind::Static | DefKind::ForeignStatic) {
+                        self.err(path.lo, format!("E0532: expected unit struct, unit variant or constant, found static `{}`", crate::tcx::path_str(self.prog, self.file, path)));
+                    }
+                }
                 self.coerce_or_unify(t, expected, None, path.lo);
             }
             Pat::TupleStruct(path, v) => {
@@ -2215,6 +2262,10 @@ impl<'a> Fcx<'a> {
                     };
                     if let Some((what, adt, vi)) = tuple_ctor {
                         if let Some(variant) = self.tcx.adts.get(&adt).and_then(|a| a.variants.get(vi)) {
+                            if variant.shape != 1 && self.tcx.validates(self.prog, self.file) {
+                                let found = match (variant.shape, what) { (0, "variant") => "unit variant", (0, _) => "unit struct", (_, "variant") => "struct variant", _ => "struct" };
+                                self.err(path.lo, format!("E0532: expected tuple struct or tuple variant, found {} `{}`", found, crate::tcx::path_str(self.prog, self.file, path)));
+                            }
                             if variant.shape == 1 && !(if has_rest { n <= variant.fields.len() } else { n == variant.fields.len() }) {
                                 let want = variant.fields.len();
                                 let msg = format!("E0023: this pattern has {} field{}, but the corresponding tuple {} has {} field{}", n, if n == 1 { "" } else { "s" }, what, want, if want == 1 { "" } else { "s" });
@@ -2247,6 +2298,9 @@ impl<'a> Fcx<'a> {
                         let ft = self.field_ty(et, vi, fname);
                         match ft {
                             Some((fi, t)) => {
+                                if mentioned.contains(&fi) {
+                                    self.err(fp.name.lo, format!("E0025: field `{}` bound multiple times in the pattern", self.text(fp.name)));
+                                }
                                 mentioned.push(fi);
                                 self.check_pat(fp.pat, t)
                             }

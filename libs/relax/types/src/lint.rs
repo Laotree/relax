@@ -33,6 +33,7 @@ pub const STATIC_MUT_REFS: Lint = Lint { name: "static_mut_refs", default: Level
 pub const UNREACHABLE_PATTERNS: Lint = Lint { name: "unreachable_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
 pub const IRREFUTABLE_LET_PATTERNS: Lint = Lint { name: "irrefutable_let_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &[] };
 
+pub const BINDINGS_WITH_VARIANT_NAME: Lint = Lint { name: "bindings_with_variant_name", default: Level::Deny, default_2024: Level::Deny, groups: &[] };
 pub const UNSAFE_CODE: Lint = Lint { name: "unsafe_code", default: Level::Allow, default_2024: Level::Allow, groups: &[] };
 pub const MISSING_UNSAFE_ON_EXTERN: Lint = Lint { name: "missing_unsafe_on_extern", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
 pub const DEPRECATED_SAFE_2024: Lint = Lint { name: "deprecated_safe_2024", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
