@@ -411,6 +411,28 @@ impl<T> AtomicPtr<T> {
             }
         }
     }
+    // rustc AtomicPtr: strict-provenance read-modify-write on the pointer's address
+    pub fn fetch_byte_add(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_add(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_byte_sub(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_sub(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_ptr_add(&self, val: usize, order: Ordering) -> *mut T {
+        self.fetch_byte_add(val.wrapping_mul(crate::mem::size_of::<T>()), order)
+    }
+    pub fn fetch_ptr_sub(&self, val: usize, order: Ordering) -> *mut T {
+        self.fetch_byte_sub(val.wrapping_mul(crate::mem::size_of::<T>()), order)
+    }
+    pub fn fetch_and(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_and(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_or(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_or(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_xor(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_xor(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
     pub fn fetch_update<F: FnMut(*mut T) -> Option<*mut T>>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<*mut T, *mut T> {
         let mut prev = self.load(fetch_order);
         loop {
