@@ -191,6 +191,8 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         if std::env::var_os("MAKEPAD_RUN_CHECK_TRACE").is_some() { std::eprintln!("makepad check: body {}", prog.def_path(d)); }
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, retry: false };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // the syntax-level lints do not wait for the types (rustc runs them before analysis)
+            relax_types::lint_early::check_def(prog, d);
             let body = tcx.typeck(prog, d);
             if !body.errors.is_empty() {
                 return (body.errors.to_vec(), Vec::new());

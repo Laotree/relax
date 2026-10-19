@@ -316,7 +316,6 @@ fn snake_pat_idents(site: &Site, ast: &Ast, p: PatId) {
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
     crate::lint_dead::collect_body(prog, tcx, body);
-    crate::lint_early::check_body(prog, tcx, body);
     crate::lint_late::check_body(prog, tcx, body);
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
@@ -408,3 +407,31 @@ impl<'a> Visitor<'a> for Late<'a> {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snake_case_names() {
+        assert!(is_snake_case("foo_bar"));
+        assert!(is_snake_case("_foo"));
+        assert!(is_snake_case("'a"));
+        assert!(!is_snake_case("fooBar"));
+        assert!(!is_snake_case("foo__bar"));
+        assert_eq!(to_snake_case("FooBar"), "foo_bar");
+        assert_eq!(to_snake_case("_FooBar"), "_foo_bar");
+        assert_eq!(to_snake_case("HTTPServer"), "httpserver");
+    }
+
+    #[test]
+    fn camel_case_names() {
+        assert!(is_upper_camel_case("FooBar"));
+        assert!(is_upper_camel_case("_Foo"));
+        assert!(is_upper_camel_case("X86_64"));
+        assert!(!is_upper_camel_case("foo_bar"));
+        assert!(!is_upper_camel_case("Foo__Bar"));
+        assert_eq!(to_upper_camel_case("foo_bar"), "FooBar");
+        assert_eq!(to_upper_camel_case("_foo_bar_"), "FooBar");
+    }
+}

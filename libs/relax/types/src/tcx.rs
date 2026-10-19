@@ -2613,7 +2613,11 @@ impl Tcx {
             }
             // a bare trait in a type (`&mut FnMut(&mut [u8])`): edition 2015's trait object
             // (rustc: `dyn` is implied there; later editions reject it, E0782)
-            DefKind::Trait if prog.crates[prog.mods[module as usize].krate as usize].edition == 2015 => {
+            DefKind::Trait if prog.crates[prog.mods[module as usize].krate as usize].edition <= 2018 => {
+                if crate::lint::enabled() && self.validates(prog, file) {
+                    let at = crate::lint::def_at(prog, file, p.lo);
+                    crate::lint::emit(prog, at, &crate::lint_early::BARE_TRAIT_OBJECTS, file, p.lo, "trait objects without an explicit `dyn` are deprecated");
+                }
                 let b = ast::Bound::Trait { hrtb: ast::List::EMPTY, maybe: false, konst: false, path: p.clone() };
                 self.lower_dyn(cx, prog, file, module, env, &[b], p.lo, source_ty)
             }

@@ -528,3 +528,47 @@ pub fn attrs_at_binding(prog: &Program, owner: DefId, pos: u32) -> Vec<Attr> {
     }
     f.found.unwrap_or_default()
 }
+
+/// The innermost item of `file` whose source contains `pos` (the scope a lint reported from a
+/// context without a definition belongs to); the crate root module when none does.
+pub fn def_at(prog: &Program, file: u32, pos: u32) -> DefId {
+    let ast = &prog.files[file as usize].ast;
+    let mut best: Option<(u32, DefId)> = None;
+    for i in 0..prog.defs.len() {
+        let d = &prog.defs[i];
+        if d.file != file || matches!(d.kind, DefKind::Mod | DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules) { continue; }
+        let it = ast.item(d.item);
+        if pos >= it.lo && pos < it.hi {
+            let size = it.hi - it.lo;
+            if best.map_or(true, |(s, _)| size < s) { best = Some((size, DefId(i as u32))); }
+        }
+    }
+    match best {
+        Some((_, d)) => d,
+        None => {
+            let c = prog.file_crate[file as usize];
+            prog.mods[prog.crates[c as usize].root_mod as usize].def
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renamed_lints_resolve_to_their_new_name() {
+        assert_eq!(current_name("bare_trait_object"), "bare_trait_objects");
+        assert_eq!(current_name("bad_style"), "nonstandard_style");
+        assert_eq!(current_name("dead_code"), "dead_code");
+    }
+
+    #[test]
+    fn the_lint_table_knows_groups() {
+        let l = crate::lint_table::LINTS.iter().find(|l| l.0 == "unused_imports").unwrap();
+        assert!(l.3.contains(&"unused"));
+        let f = crate::lint_table::LINTS.iter().find(|l| l.0 == "ambiguous_glob_imports").unwrap();
+        assert!(f.3.contains(&"future_incompatible"));
+        assert!(crate::lint_table::GROUPS.contains(&"nonstandard_style"));
+    }
+}

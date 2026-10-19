@@ -997,7 +997,15 @@ impl<'a> Dead<'a> {
             match *r {
                 Ref::Use(d) => self.check_def(d),
                 Ref::Live(d) => self.insert_def(d),
-                Ref::Field(k) => { self.live_fields.insert(k); }
+                Ref::Field(k) => {
+                    // read in the scope of an allowed / expected item: a field that is allowed too
+                    // is not made live by it
+                    if self.propagated {
+                        let (attrs, _) = field_ast(self.prog, k.0, k.1 as usize, k.2 as usize);
+                        if lint::level_with(self.prog, k.0, &attrs, &DEAD_CODE) == Level::Allow { continue; }
+                    }
+                    self.live_fields.insert(k);
+                }
             }
         }
     }
@@ -1457,7 +1465,7 @@ impl<'a, 'b> Reporter<'a, 'b> {
                         if !self.should_warn_field(d, vi as u32, fi as u32, live_fields) { continue; }
                         // a field of a reachable type that is `pub` is live
                         if self.reach.fields.contains(&(d, vi as u32, fi as u32)) { continue; }
-                        let (fattrs, fpos) = self.field_ast(d, vi, fi);
+                        let (fattrs, fpos) = field_ast(prog, d, vi, fi);
                         let mut inner = vattrs.clone();
                         inner.extend(fattrs);
                         let fname = if var.shape == 1 { fi.to_string() } else { prog.syms.str(f.name).to_string() };
@@ -1470,22 +1478,23 @@ impl<'a, 'b> Reporter<'a, 'b> {
         }
     }
 
-    fn field_ast(&self, adt: DefId, vi: usize, fi: usize) -> (Vec<Attr>, u32) {
-        let prog = self.s.prog;
-        let def = prog.def(adt);
-        let ast = &prog.files[def.file as usize].ast;
-        let list = match ast.item(def.item).kind {
-            ItemKind::Struct(r) => match ast.row(r).data { VariantData::Struct(l) | VariantData::Tuple(l) => Some(l), _ => None },
-            ItemKind::Union(r) => Some(ast.row(r).fields),
-            ItemKind::Enum(r) => match ast.list(ast.row(r).variants)[vi].data { VariantData::Struct(l) | VariantData::Tuple(l) => Some(l), _ => None },
-            _ => None,
-        };
-        match list {
-            Some(l) => {
-                let f = ast.list(l)[fi];
-                (ast.list(f.attrs).to_vec(), f.name.map_or(f.ty_span.0, |n| n.lo))
-            }
-            None => (Vec::new(), ast.item(def.item).name.lo),
+
+}
+
+fn field_ast(prog: &Program, adt: DefId, vi: usize, fi: usize) -> (Vec<Attr>, u32) {
+    let def = prog.def(adt);
+    let ast = &prog.files[def.file as usize].ast;
+    let list = match ast.item(def.item).kind {
+        ItemKind::Struct(r) => match ast.row(r).data { VariantData::Struct(l) | VariantData::Tuple(l) => Some(l), _ => None },
+        ItemKind::Union(r) => Some(ast.row(r).fields),
+        ItemKind::Enum(r) => match ast.list(ast.row(r).variants)[vi].data { VariantData::Struct(l) | VariantData::Tuple(l) => Some(l), _ => None },
+        _ => None,
+    };
+    match list {
+        Some(l) => {
+            let f = ast.list(l)[fi];
+            (ast.list(f.attrs).to_vec(), f.name.map_or(f.ty_span.0, |n| n.lo))
         }
+        None => (Vec::new(), ast.item(def.item).name.lo),
     }
 }
