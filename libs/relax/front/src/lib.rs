@@ -81,3 +81,5 @@ pub mod origin_table;
 
 pub mod lang_items;
 pub mod target_features;
+pub mod feature_tables;
+pub mod features;
