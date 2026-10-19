@@ -200,8 +200,8 @@ enum Node {
 }
 
 const MIN_TABLE_CLUSTERS: usize = 4;
-/// jump table density: values covered per table entry, in percent
-const MIN_TABLE_DENSITY: u128 = 25;
+/// jump table density: at most this many table entries per cluster
+const MAX_SPAN_PER_CLUSTER: u128 = 4;
 const MAX_TABLE: u128 = 4096;
 
 struct Planner {
@@ -236,17 +236,16 @@ impl Planner {
             }
             return Node::Bits { lo, span: span as u64, groups, default: self.default };
         }
-        if n >= MIN_TABLE_CLUSTERS && span <= MAX_TABLE {
-            let covered: u128 = cl.iter().map(|c| c.hi as u128 - c.lo as u128 + 1).sum();
-            if covered * 100 >= span * MIN_TABLE_DENSITY {
-                let mut targets = vec![self.default; span as usize];
-                for c in cl {
-                    for v in c.lo..=c.hi {
-                        targets[(v - lo) as usize] = c.to;
-                    }
+        // a table pays when its entries are mostly distinct clusters: few clusters over a wide span
+        // (identifier characters, say) are cheaper as range compares or bit tests
+        if n >= MIN_TABLE_CLUSTERS && span <= MAX_TABLE && span <= MAX_SPAN_PER_CLUSTER * n as u128 {
+            let mut targets = vec![self.default; span as usize];
+            for c in cl {
+                for v in c.lo..=c.hi {
+                    targets[(v - lo) as usize] = c.to;
                 }
-                return Node::Table { lo, targets, default: self.default };
             }
+            return Node::Table { lo, targets, default: self.default };
         }
         if n <= 3 {
             let mut node = Node::Goto(self.default);
