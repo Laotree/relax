@@ -2873,8 +2873,19 @@ impl<'a> Fcx<'a> {
                     None => return self.tcx.tys.error,
                 };
                 let mut args = Vec::new();
+                let mut regions = Vec::new();
+                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
+                let regions = self.tcx.tys.intern_region_args(&regions);
                 match explicit {
-                    Some(v) => args = v,
+                    Some(v) => {
+                        args = v;
+                        // hir_ty_lowering/generics.rs: parameters left out of explicit arguments take
+                        // their defaults (`Uwu::<N>` for `Uwu<const N: u32 = 1, const M: u32 = N>`)
+                        if args.len() < adt.n_generics as usize {
+                            let cx = self.cx.with_infcx(&self.infcx);
+                            self.tcx.fill_type_defaults(&cx, self.prog, adt_def, &mut args, Some(regions));
+                        }
+                    }
                     None => {
                         for _ in 0..adt.n_generics {
                             args.push(self.fresh_arg(d, args.len()));
@@ -2882,9 +2893,6 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
-                let mut regions = Vec::new();
-                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
-                let regions = self.tcx.tys.intern_region_args(&regions);
                 let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
                 self.apply_fn_bounds(adt_def, &full, self.last_lo);
                 let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), regions));
@@ -3844,6 +3852,17 @@ impl<'a> Fcx<'a> {
             for g in self.ast().list(*v) {
                 if let Some(lt) = self.generic_arg(g, def, offset + out.len()) {
                     out.push(lt);
+                }
+            }
+            // hir_ty_lowering/generics.rs check_generic_arg_count: arguments beyond the item's
+            // parameters are an error (E0107) and are not lowered further
+            if matches!(self.prog.def(def).kind, DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::Fn | DefKind::AssocFn) {
+                let declared = self.tcx.declaration_env(self.prog, def).names.len().saturating_sub(offset);
+                if out.len() > declared {
+                    let kind = match self.prog.def(def).kind { DefKind::Fn | DefKind::AssocFn => "function", DefKind::Enum => "enum", DefKind::Union => "union", _ => "struct" };
+                    self.err(self.last_lo, format!("E0107: {} takes {} generic argument{} but {} generic argument{} supplied",
+                        kind, declared, if declared == 1 { "" } else { "s" }, out.len(), if out.len() == 1 { " was" } else { "s were" }));
+                    out.truncate(declared);
                 }
             }
         }

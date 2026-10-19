@@ -1193,6 +1193,17 @@ impl Tcx {
                 env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
             ItemKind::TypeAlias(r) => push_generics(prog, def.file, &ast.row(*r).generics, &mut env),
+            // a trait's own parameters (defaults of `trait Tr<const N: u8 = 1, const M: u8 = N>`
+            // name earlier ones): `Self` is param 0, as for the trait's items
+            ItemKind::Trait(_) => {
+                if let Some(TraitItem { generics, .. }) = ast.as_trait(&it.kind) {
+                    env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
+                    env.regions.next_param += 1;
+                    push_generics(prog, def.file, generics, &mut env);
+                    env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
+                    env.trait_def = Some(d);
+                }
+            }
             ItemKind::Impl(r) => {
                 // collect/generics_of.rs: impl parameters are available while
                 // lowering the impl header, before its self type is collected.
@@ -2550,7 +2561,8 @@ impl Tcx {
             let name = f.text(seg.name);
             if let Some(s) = prog.syms.get(name) {
                 for (i, n) in env.names.iter().enumerate() {
-                    if *n == s {
+                    // a const parameter lives in the value namespace: a type path never names it
+                    if *n == s && !env.consts.iter().any(|c| c.0 as usize == i) {
                         // a type parameter takes no generic arguments (E0109), no constraints (E0229)
                         if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "type parameter", name) { return self.tys.error; }
                         return self.tys.intern(TyKind::Param(i as u32));
@@ -2818,7 +2830,24 @@ impl Tcx {
                                     out.push(ty); continue;
                                 }
                             }
-                            out.push(self.type_or_const_arg(cx, prog, file, module, env, *t));
+                            let arg = self.type_or_const_arg(cx, prog, file, module, env, *t);
+                            // rustc hir_ty_lowering generic_arg_mismatch_err (E0747): an argument of
+                            // the other kind than its parameter is an error, recovered as an error value
+                            if let Some((_, declaration)) = &declaration {
+                                let wants_const = declaration.consts.iter().any(|c| c.0 as usize == index);
+                                let is_const = matches!(self.tys.kind(arg), TyKind::Const(_));
+                                if wants_const && !is_const && index < declaration.names.len() {
+                                    self.err(cx, prog, file, p.lo, "E0747: type provided when a constant was expected".into());
+                                    out.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                    continue;
+                                }
+                                if !wants_const && is_const && index < declaration.names.len() {
+                                    self.err(cx, prog, file, p.lo, "E0747: constant provided when a type was expected".into());
+                                    out.push(self.tys.error);
+                                    continue;
+                                }
+                            }
+                            out.push(arg);
                         }
                         GenericArg::Const(e) => {
                             let ct = if let Some((d, declaration)) = &declaration {
