@@ -484,6 +484,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_comparisons(e);
         self.lint_ptr_nulls(e);
         self.lint_transmutes(e);
+        self.lint_unsafe_block(e);
         self.lint_closure_returning_async_block(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
@@ -1291,6 +1292,77 @@ impl<'a> L2<'a> {
             }
             if self.layout_1zst(inner, 0) != Some(false) { return; }
             self.emit(&INTEGER_TO_PTR_TRANSMUTES, pos, "transmuting an integer to a pointer creates a pointer without provenance");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- unsafe_code (rustc_lint builtin.rs UnsafeCode)
+
+/// The first attribute named `name` of an item: the position of its `#`.
+fn attr_pos(prog: &Program, file: u32, attrs: &[Attr], name: &str) -> Option<u32> {
+    let a = attrs.iter().find(|a| lint::attr_path(prog, file, a) == name.as_bytes())?;
+    let p = prog.src(file);
+    let at = a.toks.lo as usize;
+    Some(p.tok(at.saturating_sub(if a.inner { 3 } else { 2 })).lo)
+}
+
+/// The item-level `unsafe_code` checks over the definitions of the checked crates marked in `own`.
+pub fn check_items(prog: &Program, own: &[bool]) {
+    const NOTE_MANGLE: &str = "";
+    let _ = NOTE_MANGLE;
+    for i in 0..prog.defs.len() {
+        let d = prog.defs[i];
+        if !own.get(d.krate as usize).copied().unwrap_or(false) { continue; }
+        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Static | DefKind::Trait | DefKind::Impl) { continue; }
+        let id = DefId(i as u32);
+        let ast = &prog.files[d.file as usize].ast;
+        let item = *ast.item(d.item);
+        let attrs = ast.list(item.attrs);
+        let emit = |pos: u32, msg: &str| {
+            if lint::external(prog, d.file, pos) { return; }
+            lint::emit(prog, id, &lint::UNSAFE_CODE, d.file, pos, msg);
+        };
+        let in_impl = d.parent != crate::program::NO_DEF && prog.def(d.parent).kind == DefKind::Impl;
+        match item.kind {
+            ItemKind::Trait(r) => if ast.row(r).unsafe_ { emit(item.lo, "declaration of an `unsafe` trait"); },
+            ItemKind::Impl(r) => {
+                let imp = *ast.row(r);
+                if imp.unsafe_ && imp.trait_.is_some() { emit(item.lo, "implementation of an `unsafe` trait"); }
+            }
+            ItemKind::Fn(sig, body, _) => {
+                let sig = *ast.fn_sig(sig);
+                if d.kind == DefKind::AssocFn && in_impl {
+                    if let Some(p) = attr_pos(prog, d.file, attrs, "no_mangle") { emit(p, "declaration of a `no_mangle` method"); }
+                    if let Some(p) = attr_pos(prog, d.file, attrs, "export_name") { emit(p, "declaration of a method with `export_name`"); }
+                } else if d.kind == DefKind::Fn {
+                    if let Some(p) = attr_pos(prog, d.file, attrs, "no_mangle") { emit(p, "declaration of a `no_mangle` function"); }
+                    if let Some(p) = attr_pos(prog, d.file, attrs, "export_name") { emit(p, "declaration of a function with `export_name`"); }
+                    if let Some(p) = attr_pos(prog, d.file, attrs, "link_section") { emit(p, "declaration of a function with `link_section`"); }
+                }
+                if sig.unsafe_ {
+                    let has_body = body.is_some() || sig.lazy_body.is_some();
+                    match d.kind {
+                        DefKind::Fn => emit(item.lo, "declaration of an `unsafe` function"),
+                        DefKind::AssocFn if !has_body => emit(item.lo, "declaration of an `unsafe` method"),
+                        DefKind::AssocFn => emit(item.lo, "implementation of an `unsafe` method"),
+                        _ => {}
+                    }
+                }
+            }
+            ItemKind::Static(..) => {
+                if let Some(p) = attr_pos(prog, d.file, attrs, "no_mangle") { emit(p, "declaration of a `no_mangle` static"); }
+                if let Some(p) = attr_pos(prog, d.file, attrs, "export_name") { emit(p, "declaration of a static with `export_name`"); }
+                if let Some(p) = attr_pos(prog, d.file, attrs, "link_section") { emit(p, "declaration of a static with `link_section`"); }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl<'a> L2<'a> {
+    fn lint_unsafe_block(&self, e: ExprId) {
+        if let ExprKind::Unsafe(_) = self.ast.expr(e).kind {
+            self.emit(&lint::UNSAFE_CODE, self.ast.expr(e).lo, "usage of an `unsafe` block");
         }
     }
 }

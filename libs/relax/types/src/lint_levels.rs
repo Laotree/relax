@@ -34,6 +34,10 @@ const IMPLEMENTED: &[&str] = &[
     "unused_must_use", "unused_mut", "unused_parens", "unused_results", "unused_unsafe", "unused_variables", "while_true",
     "mismatched_lifetime_syntaxes", "elided_lifetimes_in_paths", "explicit_outlives_requirements", 
     "absolute_paths_not_starting_with_crate", "unknown_diagnostic_attributes",
+    "dangling_pointers_from_locals", "dangling_pointers_from_temporaries", "const_item_mutation", "unconditional_recursion", "array_into_iter",
+    "boxed_slice_into_iter", "if_let_rescope", "unused_comparisons", "invalid_nan_comparisons", "ambiguous_wide_pointer_comparisons",
+    "unpredictable_function_pointer_comparisons", "useless_ptr_null_checks", "invalid_null_arguments", "closure_returning_async_block",
+    "unnecessary_transmutes", "integer_to_ptr_transmutes", "ptr_to_integer_transmute_in_consts", "unsafe_code",
 ];
 
 /// A recorded `#[expect(name)]`.
