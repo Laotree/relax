@@ -166,7 +166,7 @@ pub mod implied_outlives_bounds;
 
 mod object;
 
-mod dyn_compatibility;
+pub(crate) mod dyn_compatibility;
 
 mod type_of;
 

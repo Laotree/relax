@@ -222,6 +222,10 @@ pub struct Lcx<'a> {
     decl_depth: Vec<Option<usize>>,
     /// instructions run at function entry (drop flag initialisation)
     entry_inits: Vec<Inst>,
+    /// fold branches on known constants (a check only); the registers a fold relied on, which must
+    /// be written exactly once by the finished function (checked in lower_checked_body)
+    pub(crate) fold: bool,
+    pub(crate) fold_regs: std::cell::RefCell<Vec<VReg>>,
     /// rvalue temporaries to drop at the end of the current statement (with a drop flag
     /// when parts may have been moved out)
     stmt_temps: Vec<(VReg, TyId, Option<VReg>)>,
@@ -357,6 +361,8 @@ impl<'a> Lcx<'a> {
             drop_flags: vec![None; n],
             decl_depth: vec![None; n],
             entry_inits: Vec::new(),
+            fold: u.prog.session.options.const_fuel,
+            fold_regs: std::cell::RefCell::new(Vec::new()),
             caller_loc: None,
             stmt_temps: Vec::new(),
             match_root: None,
@@ -2371,6 +2377,14 @@ impl<'a> Lcx<'a> {
                 if let TyKind::Ref(true, inner, _) = self.kind(t) {
                     if !self.unsized_ty(inner) && regs.len() == 1 && self.u.is_unpin(inner) {
                         self.f.noalias.push(regs[0]);
+                    }
+                }
+                // a reference's (or fat reference's data) pointer is never null (rustc `nonnull`
+                // on reference parameters): the niche tests of iterators over a slice parameter
+                // fold
+                if let TyKind::Ref(_, inner, _) = self.kind(t) {
+                    if !regs.is_empty() && self.f.vregs[regs[0].0 as usize] == Cls::I && (regs.len() == 1 || self.unsized_ty(inner)) {
+                        self.f.nonnull.push(regs[0]);
                     }
                 }
                 // `&T` / `&mut T` of a sized T: dereferenceable for the call (rustc
@@ -8369,6 +8383,50 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// The way the `Branch` that ends block `b` (to `tb` / `eb`) goes when its condition is a
+    /// constant computed in that block from constants (a const parameter's value, comparisons,
+    /// negation); None when it is not known.
+    fn known_branch(&self, b: u32, tb: u32, eb: u32) -> Option<bool> {
+        let blk = self.f.blocks.get(b as usize)?;
+        let Term::Branch(c, t, e) = blk.term else { return None };
+        if (t, e) != (tb, eb) { return None; }
+        // A register is a constant only if the whole function writes it exactly once (RIR
+        // registers are not SSA: a loop or a join may assign the same one again); the walk goes
+        // only through such registers.
+        fn value(f: &Func, insts: &[&Inst], writes: &dyn Fn(VReg) -> u32, used: &mut Vec<VReg>, v: VReg, depth: u32) -> Option<i128> {
+            if depth > 8 || writes(v) != 1 { return None; }
+            used.push(v);
+            let def = insts.iter().rev().copied().find(|i| matches!(i, Inst::Iconst(d, _) | Inst::Mov(d, _) | Inst::ICmpI(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) if *d == v))?;
+            match def {
+                Inst::Iconst(_, k) => Some(*k as i128),
+                Inst::Mov(_, a) => value(f, insts, writes, used, *a, depth + 1),
+                Inst::ICmpI(cond, signed, _, a, k) => {
+                    let (x, k) = (value(f, insts, writes, used, *a, depth + 1)?, *k as i128);
+                    Some(cmp(*cond, *signed, x, k) as i128)
+                }
+                Inst::ICmp(cond, signed, _, a, b) => {
+                    let (x, y) = (value(f, insts, writes, used, *a, depth + 1)?, value(f, insts, writes, used, *b, depth + 1)?);
+                    Some(cmp(*cond, *signed, x, y) as i128)
+                }
+                _ => None,
+            }
+        }
+        fn cmp(c: Cond, signed: bool, x: i128, y: i128) -> bool {
+            let (x, y) = if signed { (x as i64 as i128, y as i64 as i128) } else { (x as u64 as i128, y as u64 as i128) };
+            match c { Cond::Eq => x == y, Cond::Ne => x != y, Cond::Lt => x < y, Cond::Le => x <= y, Cond::Gt => x > y, Cond::Ge => x >= y }
+        }
+        // Only under a check (the post-monomorphization walk): RIR registers are not SSA, so a
+        // definition found by search is a proof only within the branch's own block; the code a
+        // run executes is lowered as written.
+        if !self.fold { return None; }
+        let local: Vec<&Inst> = self.entry_inits.iter().chain(blk.insts.iter()).collect();
+        let writes = |v: VReg| -> u32 { rir_writes(&self.f, &self.entry_inits, v) };
+        let mut used = Vec::new();
+        let known = value(&self.f, &local, &writes, &mut used, c, 0).map(|k| k != 0);
+        if known.is_some() { self.fold_regs.borrow_mut().extend(used); }
+        known
+    }
+
     fn lower_if(&mut self, c: ExprId, then: BlockId, els: Option<ExprId>, t: TyId) -> Val {
         let tb = self.f.block();
         let eb = self.f.block();
@@ -8392,13 +8450,23 @@ impl<'a> Lcx<'a> {
         }
         self.lower_cond(c, tb, eb);
         self.cond_rescope = saved_rescope;
+        // rustc_mir_transform SimplifyConstCondition: a branch on a constant (`if N != 0` once the
+        // const parameter has its value) is taken one way, and its dead successor is not
+        // lowered -- what it names (a constant that cannot be evaluated, a closure) is never
+        // instantiated, as rustc's monomorphization collector never sees it
+        let known = if let_scope { None } else { self.known_branch(self.cur, tb, eb) };
         self.switch(tb);
         // the body of an `if` and its `else` block are temporary scopes (Reference
         // destructors.scope.temporary: "The body of an if ... expression", "The else block")
         let mark = self.stmt_temps.len();
-        let v = self.lower_block(then);
-        if !self.is_never(t) {
-            self.write_place(&res, t, v);
+        if known == Some(false) {
+            self.term(Term::Unreachable);
+            self.dead();
+        } else {
+            let v = self.lower_block(then);
+            if !self.is_never(t) {
+                self.write_place(&res, t, v);
+            }
         }
         self.drop_stmt_temps_from(mark);
         if let_scope {
@@ -8417,7 +8485,10 @@ impl<'a> Lcx<'a> {
             self.scope_marks.truncate(depth);
             self.tail_marks.truncate(depth);
         }
-        if let Some(x) = els {
+        if known == Some(true) {
+            self.term(Term::Unreachable);
+            self.dead();
+        } else if let Some(x) = els {
             let mark = self.stmt_temps.len();
             let v = self.lower_expr_coerced(x, t);
             if !self.is_never(t) {
@@ -10519,7 +10590,7 @@ impl<'a> Lcx<'a> {
                 self.switch(ok);
                 self.unit()
             }
-            "debug_assert" | "debug_assert_eq" | "debug_assert_ne" => self.unit(),
+            "debug_assert" | "debug_assert_eq" | "debug_assert_ne" | "debug_assert_matches" => self.unit(),
             "assert_eq" | "assert_ne" => {
                 let a = mexprs[0];
                 let b2 = mexprs[1];
@@ -10581,6 +10652,69 @@ impl<'a> Lcx<'a> {
                 }
                 self.panic_here("");
                 self.dead();
+                self.unit()
+            }
+            "assert_matches" => {
+                // rustc core panicking::assert_matches_failed: the value in Debug and the
+                // pattern's source text
+                let x = mexprs[0];
+                let xt = self.body_ty(x);
+                let v = self.lower_expr(x);
+                let place = self.val_to_place(v.clone());
+                let ok = self.f.block();
+                let bad = self.f.block();
+                if let Some(p) = margs.pat {
+                    self.test_pat(p, &place, xt, bad);
+                    self.bind_pat_place(p, &place, xt);
+                    if let Some(g) = margs.guard {
+                        let g_ok = self.f.block();
+                        self.lower_cond(g, g_ok, bad);
+                        self.switch(g_ok);
+                    }
+                }
+                self.goto(ok);
+                self.switch(bad);
+                // the pattern's tokens: after the first top-level comma up to its `if` / comma
+                let u = self.u;
+                let src = u.prog.src(self.b.file);
+                let mut depth = 0;
+                let mut start = None;
+                let mut end = m.toks.hi as usize;
+                let mut i = m.toks.lo as usize;
+                while i < m.toks.hi as usize {
+                    match src.tok(i).kind {
+                        crate::lexer::T::OpenParen | crate::lexer::T::OpenBracket | crate::lexer::T::OpenBrace => depth += 1,
+                        crate::lexer::T::CloseParen | crate::lexer::T::CloseBracket | crate::lexer::T::CloseBrace => depth -= 1,
+                        crate::lexer::T::Comma if depth == 0 => {
+                            if start.is_none() {
+                                start = Some(i + 1);
+                            } else {
+                                end = i;
+                                break;
+                            }
+                        }
+                        crate::lexer::T::KwIf if depth == 0 && start.is_some() => {
+                            end = i;
+                            break;
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let pat_text = match start {
+                    Some(s) if s < end => self.src_text(src.tok(s).lo, src.tok(end - 1).hi).into_owned(),
+                    _ => String::new(),
+                };
+                self.fmt_lit("assertion `left matches right` failed");
+                if mexprs.len() > 1 {
+                    self.fmt_lit(": ");
+                    self.lower_fmt(e, &mexprs[1..]);
+                }
+                self.fmt_lit("\n  left: ");
+                self.fmt_value(v, xt, b'?');
+                self.fmt_lit(&format!("\n right: {}", pat_text));
+                self.panic_here("");
+                self.switch(ok);
                 self.unit()
             }
             "matches" => {
@@ -10895,7 +11029,10 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
     }
     let shown = crate::builtins::file_macro_path(path);
     let path = shown.as_str();
-    let fa = u.lit_data(path.as_bytes());
+    // `file_bytes_with_nul` (rustc Location::file_as_c_str): the name plus its terminating nul
+    let mut file_bytes = path.as_bytes().to_vec();
+    file_bytes.push(0);
+    let fa = u.lit_data(&file_bytes);
     let mut blob = vec![0u8; lay.size as usize];
     let put = |blob: &mut Vec<u8>, off: u32, b: &[u8]| {
         let o = off as usize;
@@ -10904,7 +11041,7 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
         }
     };
     put(&mut blob, lay.fields[0], &fa.to_le_bytes());
-    put(&mut blob, lay.fields[0] + 8, &(path.len() as u64).to_le_bytes());
+    put(&mut blob, lay.fields[0] + 8, &(file_bytes.len() as u64).to_le_bytes());
     put(&mut blob, lay.fields[1], &line.to_le_bytes());
     put(&mut blob, lay.fields[2], &col.to_le_bytes());
     // pointer words: the file name's bytes; the rest integers
@@ -13683,7 +13820,47 @@ pub fn const_fuel_addr() -> u64 {
     f as usize as u64
 }
 
+/// How many times the function (every block, the entry initialisations, its parameters) writes `v`.
+pub(crate) fn rir_writes(f: &Func, entry_inits: &[Inst], v: VReg) -> u32 {
+    let mut n = f.params.iter().filter(|p| **p == v).count() as u32;
+    for i in entry_inits.iter().chain(f.blocks.iter().flat_map(|b| b.insts.iter())) {
+        i.defs(&mut |d| if d == v { n += 1; });
+    }
+    n
+}
+
 pub fn cannot_unwind_addr() -> u64 {
     let f: rt_fn_ty!(fn()) = rt_cannot_unwind;
     f as usize as u64
+}
+
+#[cfg(test)]
+mod fold_soundness_tests {
+    use super::*;
+
+    /// RIR registers are not SSA: a register a loop assigns again is not a constant, however
+    /// constant its first definition looks (`rir_writes` counts every block, the parameters).
+    #[test]
+    fn a_register_assigned_in_a_loop_is_written_more_than_once() {
+        let mut f = Func::new("t".to_string(), 0);
+        let x = f.vreg(Cls::I);
+        let y = f.vreg(Cls::I);
+        let c = f.vreg(Cls::I);
+        let entry = f.block();
+        let head = f.block();
+        let body = f.block();
+        f.blocks[entry as usize].insts.push(Inst::Iconst(x, 0));
+        f.blocks[entry as usize].term = Term::Jump(head);
+        f.blocks[head as usize].insts.push(Inst::ICmpI(Cond::Ne, false, c, x, 0));
+        f.blocks[head as usize].term = Term::Branch(c, body, entry);
+        f.blocks[body as usize].insts.push(Inst::Iconst(y, 1));
+        f.blocks[body as usize].insts.push(Inst::Mov(x, y));
+        assert_eq!(rir_writes(&f, &[], x), 2, "x: Iconst in the entry block, Mov in the loop");
+        assert_eq!(rir_writes(&f, &[], y), 1);
+        assert_eq!(rir_writes(&f, &[], c), 1);
+        f.params.push(y);
+        assert_eq!(rir_writes(&f, &[], y), 2, "a parameter is a definition");
+        let entry_inits = [Inst::Iconst(c, 1)];
+        assert_eq!(rir_writes(&f, &entry_inits, c), 2, "the entry initialisations count");
+    }
 }
