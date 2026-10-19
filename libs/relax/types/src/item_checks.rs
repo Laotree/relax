@@ -243,19 +243,23 @@ pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
                 format!("E0391: cycle detected when computing the super predicates of `{}`", prog.def_path(td))));
         }
     }
+    // `Self::X` in the arguments of a super bound whose trait (or its supertraits) defines an
+    // associated type X: resolving it asks for exactly the bounds being lowered
     let mut self_assoc = false;
     for b in ast.list(*supers) {
         if let ast::Bound::Trait { path, .. } = b {
+            let Some(bt) = tcx.resolve_type_path_def(prog, def.file, def.scope, path) else { continue };
+            let mut names = Vec::new();
             for seg in ast.segs(path.segs) {
-                match ast.gargs(seg.args()) {
-                    Some(ast::GenericArgs::Angle(v)) => for g in ast.list(*v) {
-                        match g {
-                            ast::GenericArg::Type(t) | ast::GenericArg::Binding(_, _, t) => self_assoc |= names_self_assoc(ast, *t, 0),
-                            _ => {}
-                        }
-                    },
-                    _ => {}
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(t) | ast::GenericArg::Binding(_, _, t) = g { self_assoc_names(ast, *t, 0, &mut names); }
+                    }
                 }
+            }
+            for n in names {
+                let sym = prog.syms.get(prog.files[def.file as usize].text(n)).unwrap_or(u32::MAX);
+                if tcx.trait_assoc(prog, bt, sym).is_some() { self_assoc = true; }
             }
         }
     }
@@ -266,21 +270,24 @@ pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
     out
 }
 
-/// Does the type name an associated type through `Self` (`Self::Item`)?
-fn names_self_assoc(ast: &ast::Ast, t: ast::TyId, depth: u32) -> bool {
-    if depth > 16 { return false; }
+/// The names of the associated types the type reaches through `Self` (`Self::Item`).
+fn self_assoc_names(ast: &ast::Ast, t: ast::TyId, depth: u32, out: &mut Vec<ast::Ident>) {
+    if depth > 16 { return; }
     match ast.ty(t) {
         ast::Ty::Path(p) => {
             let segs = ast.segs(p.segs);
-            if segs.len() >= 2 && p.no_qself() && segs[0].kind() == ast::SegKind::SelfType { return true; }
-            segs.iter().any(|s| match ast.gargs(s.args()) {
-                Some(ast::GenericArgs::Angle(v)) => ast.list(*v).iter().any(|g| matches!(g, ast::GenericArg::Type(x) | ast::GenericArg::Binding(_, _, x) if names_self_assoc(ast, *x, depth + 1))),
-                _ => false,
-            })
+            if segs.len() >= 2 && p.no_qself() && segs[0].kind() == ast::SegKind::SelfType { out.push(segs[1].name); }
+            for s in segs {
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(s.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(x) | ast::GenericArg::Binding(_, _, x) = g { self_assoc_names(ast, *x, depth + 1, out); }
+                    }
+                }
+            }
         }
-        ast::Ty::Ref(_, _, x) | ast::Ty::Ptr(_, x) | ast::Ty::Slice(x) | ast::Ty::Array(x, _) | ast::Ty::Paren(x) => names_self_assoc(ast, *x, depth + 1),
-        ast::Ty::Tuple(v) => ast.list(*v).iter().any(|x| names_self_assoc(ast, *x, depth + 1)),
-        _ => false,
+        ast::Ty::Ref(_, _, x) | ast::Ty::Ptr(_, x) | ast::Ty::Slice(x) | ast::Ty::Array(x, _) | ast::Ty::Paren(x) => self_assoc_names(ast, *x, depth + 1, out),
+        ast::Ty::Tuple(v) => for x in ast.list(*v) { self_assoc_names(ast, *x, depth + 1, out); },
+        _ => {}
     }
 }
 

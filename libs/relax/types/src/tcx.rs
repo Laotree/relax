@@ -2833,6 +2833,9 @@ impl Tcx {
                     let index = out.len() + usize::from(declaration.as_ref().is_some_and(|(d, _)| prog.def(*d).kind == DefKind::Trait));
                     match g {
                         GenericArg::Type(t) => {
+                            // `Foo<(_)>`: parentheses do not change what the argument is
+                            let mut t = t;
+                            while let ast::Ty::Paren(inner) = ast.ty(*t) { t = inner; }
                             if matches!(ast.ty(*t), ast::Ty::Infer) {
                                 if let (Some(infcx), Some((_, declaration))) = (cx.infcx, &declaration) {
                                     let ty = if declaration.consts.iter().any(|c| c.0 as usize == index) {
