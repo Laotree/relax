@@ -96,13 +96,14 @@ pub fn compute_regions(tcx: &Tcx, prog: &Program, body: &Body, input: RegionInpu
 use super::constraints::RegionVid;
 use super::implied_bounds::ImpliedBounds;
 use super::region_infer::NllRegionVariableOrigin;
-use super::type_check::{self, BorrowckTypeOps, MirTypeckRegionConstraints, TypeckInputs};
+use super::type_check::{self, BorrowckTypeOps, MirTypeckRegionConstraints, MirTypeckResults, TypeckInputs};
+use super::polonius::PoloniusContext;
 use super::type_check::liveness::DropckOverflow;
 use super::universal_regions::{SignatureRegions, UniversalRegions};
 use super::borrowck_errors::BorrowckError;
 use crate::mir::move_paths::MoveData;
-use crate::mir::Span;
-use crate::types::{RegionId, RegionKind, TyId, UniverseIndex};
+use crate::mir::{BodyKind, Span};
+use crate::types::{RegionId, RegionKind, TyId, TyKind, UniverseIndex};
 
 /// What the driver needs of N01's inference context beyond the type operations.
 pub trait RegionDriverOps: BorrowckTypeOps {
@@ -137,7 +138,48 @@ pub struct MirTypeckSummary {
     pub mir_bugs: Vec<super::type_check::MirBug>,
     pub dropck_overflows: Vec<DropckOverflow>,
     pub deferred_closure_requirements: Vec<super::type_check::DeferredClosureRequirement>,
-    pub universe_causes: Vec<(UniverseIndex, super::type_check::UniverseInfo)>,
+}
+
+/// N:CollectRegionConstraintsResult without its inference context: the type check of one body,
+/// before its region constraints are solved. The root applies nested bodies' requirements and
+/// defining opaque uses to `constraints` first.
+pub struct MirTypeck {
+    pub universals: UniversalRegions,
+    /// Relations known to hold between universals, as variables.
+    pub known: Vec<(RegionVid, RegionVid)>,
+    pub constraints: MirTypeckRegionConstraints,
+    pub polonius: PoloniusContext,
+    pub tainted_by_errors: bool,
+    pub summary: MirTypeckSummary,
+    /// The free regions of a closure body's environment type (the closure type's region slots),
+    /// as written before renumbering. A nested use maps them to its instantiation by position.
+    pub closure_slots: Vec<RegionId>,
+}
+impl MirTypeck {
+    /// The inputs of region inference: the definitions of every variable that exists now.
+    pub fn region_input(&self, infcx: &dyn RegionDriverOps) -> RegionInput { self.clone_for_regions().into_region_input(infcx) }
+    fn clone_for_regions(&self) -> MirTypeck {
+        MirTypeck { universals: self.universals.clone(), known: self.known.clone(), constraints: self.constraints.clone(),
+            polonius: self.polonius.clone(), tainted_by_errors: self.tainted_by_errors,
+            summary: MirTypeckSummary { errors: vec![], mir_bugs: vec![], dropck_overflows: vec![], deferred_closure_requirements: vec![] },
+            closure_slots: vec![] }
+    }
+    pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
+        let n = infcx.num_region_vars();
+        let definitions = (0..n).map(|vid| {
+            let (origin, universe) = infcx.region_var_info(vid);
+            let external_name = match origin {
+                NllRegionVariableOrigin::FreeRegion => self.universals.indices.iter().find(|(_, v)| *v == vid).map(|x| x.0),
+                NllRegionVariableOrigin::Placeholder(p) => Some(p),
+                NllRegionVariableOrigin::Existential => None,
+            };
+            RegionDefinition { origin, universe, external_name }
+        }).collect::<Vec<_>>();
+        let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, .. } = self.constraints;
+        let relations = super::type_check::free_region_relations::UniversalRegionRelations::create(self.universals, n, &self.known);
+        RegionInput { polonius: self.polonius, tainted_by_errors: self.tainted_by_errors, definitions, outlives: outlives_constraints,
+            relations, liveness: liveness_constraints, type_tests }
+    }
 }
 
 /// Replace the regions of `ty` by the variables of the universal regions they name; a region
@@ -173,10 +215,9 @@ fn map_to_vids(tcx: &Tcx, universals: &UniversalRegions, infcx: &mut dyn Borrowc
 }
 
 /// N:nll.rs `compute_regions` up to the region inference solve: `UniversalRegions::new`,
-/// `free_region_relations::create`, `renumber_mir`, `type_check` and its liveness, and the
-/// region definitions of every variable that exists afterwards. `body` is renumbered in place.
-pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOps, body: &mut Body, input: &MirNllInput<'_>)
-    -> (RegionInput, MirTypeckSummary) {
+/// `free_region_relations::create`, `renumber_mir`, and `type_check` with its liveness.
+/// `body` is renumbered in place.
+pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOps, body: &mut Body, input: &MirNllInput<'_>) -> MirTypeck {
     let sig = input.sig;
     // Universal regions precede every other region variable.
     let universals = UniversalRegions::from_signature(tcx, sig, || {
@@ -202,30 +243,27 @@ pub fn type_check_body(tcx: &Tcx, prog: &Program, infcx: &mut dyn RegionDriverOp
         let vid = |r| universals.indices.iter().find(|(o, _)| *o == r).map(|x| x.1);
         Some((vid(a)?, vid(b)?))
     }).collect();
+    let closure_slots = if matches!(body.source.kind, BodyKind::Closure(_)) { body.local_decls.get(1).map_or(vec![], |env| {
+        let env = match tcx.tys.kind(env.ty) { TyKind::Ref(_, t, _) => *t, _ => env.ty };
+        free_regions_in_order(tcx, env)
+    }) } else { vec![] };
 
     infcx.renumber(body);
-    let results = type_check::type_check(tcx, prog, infcx, body, &TypeckInputs {
+    let results = type_check::type_check(tcx, prog, infcx, body, TypeckInputs {
         normalized_inputs_and_output: &normalized_inputs_and_output, universal_yield_resume,
-        universals: &universals, moves: input.moves, has_loans: input.has_loans });
-
-    let n = infcx.num_region_vars();
-    let definitions: Vec<RegionDefinition> = (0..n).map(|vid| {
-        let (origin, universe) = infcx.region_var_info(vid);
-        let external_name = match origin {
-            NllRegionVariableOrigin::FreeRegion => universals.indices.iter().find(|(_, v)| *v == vid).map(|x| x.0),
-            NllRegionVariableOrigin::Placeholder(p) => Some(p),
-            NllRegionVariableOrigin::Existential => None,
-        };
-        RegionDefinition { origin, universe, external_name }
-    }).collect();
+        universals: &universals, moves: input.moves, has_loans: input.has_loans, constraints });
     let MirTypeckResults { constraints, polonius, tainted_by_errors, errors, mir_bugs, dropck_overflows, deferred_closure_requirements } = results;
-    let MirTypeckRegionConstraints { placeholder_indices, outlives_constraints, liveness_constraints, universe_causes, type_tests, .. } = constraints;
-    let _ = placeholder_indices;
-    let relations = super::type_check::free_region_relations::UniversalRegionRelations::create(universals, n, &known);
-    (RegionInput { polonius, tainted_by_errors, definitions, outlives: outlives_constraints, relations, liveness: liveness_constraints, type_tests },
-        MirTypeckSummary { errors, mir_bugs, dropck_overflows, deferred_closure_requirements, universe_causes })
+    MirTypeck { universals, known, constraints, polonius, tainted_by_errors,
+        summary: MirTypeckSummary { errors, mir_bugs, dropck_overflows, deferred_closure_requirements }, closure_slots }
 }
-use super::type_check::MirTypeckResults;
+
+/// `tcx.for_each_free_region`: the regions of `ty` not bound inside it, in visiting order.
+pub fn free_regions_in_order(tcx: &Tcx, ty: TyId) -> Vec<RegionId> {
+    let tys = &tcx.tys;
+    let found = std::cell::RefCell::new(vec![]);
+    tys.map_regions(ty, &|r, depth| { if !matches!(tys.region_kind(r), RegionKind::ReBound(d, _) if d < depth) { found.borrow_mut().push(r); } r }, 0);
+    found.into_inner()
+}
 
 impl RegionDriverOps for super::infer_ctxt::BorrowckInferCtxt<'_> {
     fn num_region_vars(&self) -> usize { self.infcx.num_region_vars() }

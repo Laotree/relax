@@ -176,8 +176,8 @@ fn check_in<'t>(tcx: &'t Tcx, prog: &Program, fake: &mut Fake<'t>, b: &Body) -> 
 fn run<'t>(tcx: &'t Tcx, prog: &Program, fake: &mut Fake<'t>, b: &Body, io: &[TyId], yield_resume: Option<(TyId, TyId)>) -> MirTypeckResults {
     let universals = UniversalRegions::new(0, None, vec![(0, RegionClassification::Global)]);
     let moves = MoveData::gather_moves(b, prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &|_| true);
-    type_check(tcx, prog, fake, b, &TypeckInputs { normalized_inputs_and_output: io, universal_yield_resume: yield_resume,
-        universals: &universals, moves: &moves, has_loans: false })
+    type_check(tcx, prog, fake, b, TypeckInputs { normalized_inputs_and_output: io, universal_yield_resume: yield_resume,
+        universals: &universals, moves: &moves, has_loans: false, constraints: MirTypeckRegionConstraints::new(LocationMap::new(b).num_points()) })
 }
 /// (sup, sub, point, category) of the constraints, without the I/O equalities
 /// (Locations::All with BoringNoLocation).
@@ -843,9 +843,10 @@ mod driver {
             &tcx.param_env_id(&prog, f), false, &sig.contract.predicates, &raw, &sig.contract.assumed_wf).unwrap();
         bounds.instantiate_query_bounds(&tcx, &[]);
         fake.implied = bounds;
-        let (input, summary) = type_check_body(&tcx, &prog, &mut fake, &mut b, &MirNllInput { sig: &sig, nested: false, def_span: span(1), moves: &moves, has_loans: false });
-        let mut regions = compute_regions(&tcx, &prog, &b, input, false);
-        (mir_borrowck(&tcx, &prog, &b, &mut regions, &moves), MirTypeckSummary2 { bugs: summary.mir_bugs.len() })
+        let typeck = type_check_body(&tcx, &prog, &mut fake, &mut b, &MirNllInput { sig: &sig, nested: false, def_span: span(1), moves: &moves, has_loans: false });
+        let bugs = typeck.summary.mir_bugs.len();
+        let mut regions = compute_regions(&tcx, &prog, &b, typeck.into_region_input(&fake), false);
+        (mir_borrowck(&tcx, &prog, &b, &mut regions, &moves), MirTypeckSummary2 { bugs })
     }
     struct MirTypeckSummary2 { bugs: usize }
 

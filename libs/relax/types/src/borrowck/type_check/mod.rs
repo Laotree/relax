@@ -213,15 +213,17 @@ pub struct TypeckInputs<'a> {
     pub moves: &'a MoveData,
     /// `borrow_set.len() != 0`.
     pub has_loans: bool,
+    /// The constraints so far: normalizing the signature (`free_region_relations::create`) comes first.
+    pub constraints: MirTypeckRegionConstraints,
 }
 
 /// `type_check` (mod.rs:97).
-pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, body: &Body, inputs: &TypeckInputs<'_>) -> MirTypeckResults {
+pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, body: &Body, inputs: TypeckInputs<'_>) -> MirTypeckResults {
     let location_map = LocationMap::new(body);
     let mut typeck = TypeChecker {
         tcx, prog, infcx, last_span: Span::default(), body, promoted: &body.promoted, defining: body.source.clone(),
         location_map: location_map.clone(), reported_errors: vec![],
-        constraints: MirTypeckRegionConstraints::new(location_map.num_points()),
+        constraints: inputs.constraints,
         deferred_closure_requirements: vec![], errors: vec![], mir_bugs: vec![], tainted_by_errors: false,
     };
     typeck.check_user_type_annotations();
