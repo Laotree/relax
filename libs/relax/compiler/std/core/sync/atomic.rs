@@ -11,6 +11,7 @@ use crate::intrinsics_atomic as ia;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
+#[rustc_diagnostic_item = "Ordering"]
 pub enum Ordering {
     Relaxed,
     Release,
@@ -58,6 +59,7 @@ impl AtomicPrimitive for isize {}
 
 /// An integer shared between threads.
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct Atomic<T: AtomicPrimitive> {
     v: UnsafeCell<T>,
 }
@@ -152,6 +154,15 @@ impl<T: AtomicPrimitive> Atomic<T> {
             }
         }
     }
+    pub fn try_update<F: FnMut(T) -> Option<T>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<T, T> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(T) -> T>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> T {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
 }
 
 impl<T: AtomicPrimitive + Default> Default for Atomic<T> {
@@ -174,6 +185,7 @@ impl<T: AtomicPrimitive + fmt::Debug> fmt::Debug for Atomic<T> {
 
 /// A boolean shared between threads (one byte, 0 or 1).
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct AtomicBool {
     v: UnsafeCell<u8>,
 }
@@ -253,6 +265,15 @@ impl AtomicBool {
             }
         }
     }
+    pub fn try_update<F: FnMut(bool) -> Option<bool>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<bool, bool> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(bool) -> bool>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> bool {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
 }
 
 impl Default for AtomicBool {
@@ -275,6 +296,7 @@ impl fmt::Debug for AtomicBool {
 
 /// A raw pointer shared between threads.
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct AtomicPtr<T> {
     p: UnsafeCell<*mut T>,
 }
@@ -334,6 +356,15 @@ impl<T> AtomicPtr<T> {
             }
         }
     }
+    pub fn try_update<F: FnMut(*mut T) -> Option<*mut T>>(&self, set_order: Ordering, fetch_order: Ordering, f: F) -> Result<*mut T, *mut T> {
+        self.fetch_update(set_order, fetch_order, f)
+    }
+    pub fn update<F: FnMut(*mut T) -> *mut T>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> *mut T {
+        match self.fetch_update(set_order, fetch_order, |x| Some(f(x))) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
 }
 
 impl<T> Default for AtomicPtr<T> {
@@ -359,6 +390,7 @@ pub const ATOMIC_USIZE_INIT: AtomicUsize = AtomicUsize::new(0);
 pub const ATOMIC_ISIZE_INIT: AtomicIsize = AtomicIsize::new(0);
 pub const ATOMIC_BOOL_INIT: AtomicBool = AtomicBool::new(false);
 
+#[rustc_diagnostic_item = "fence"]
 pub fn fence(order: Ordering) {
     match order {
         Ordering::Relaxed => panic!("there is no such thing as a relaxed fence"),
@@ -366,6 +398,7 @@ pub fn fence(order: Ordering) {
     }
 }
 
+#[rustc_diagnostic_item = "compiler_fence"]
 pub fn compiler_fence(order: Ordering) {
     match order {
         Ordering::Relaxed => panic!("there is no such thing as a relaxed fence"),

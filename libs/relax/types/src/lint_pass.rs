@@ -15,6 +15,7 @@ use crate::typeck::{Body, Res};
 pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
     crate::lint_early::check_items(prog, tcx, own);
+    crate::lint_late::check_items(prog, tcx, own);
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
