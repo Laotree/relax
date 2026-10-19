@@ -2756,8 +2756,6 @@ impl Tcx {
         }
         cx.state.alias_inprog.borrow_mut().insert(ik.clone());
         let read0 = cx.state.impl_read.replace(false);
-        let def = prog.def(d);
-        let module = self.item_module(prog, d);
         let t = self.lower_alias_rhs(cx, prog, d);
         cx.state.alias_inprog.borrow_mut().remove(&ik);
         let read = cx.state.impl_read.get();
