@@ -3347,14 +3347,6 @@ impl Tcx {
                     env.regions.next_param += 1;
                     push_generics(prog, pd.file, &generics, &mut env);
                     env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
-                    // type_of of a parameter default that needs itself: E0391
-                    if cx.state.default_inprog.borrow().contains(&(td, k)) {
-                        self.err(cx, prog, pd.file, g.name.lo, format!("E0391: cycle detected when computing the default of generic parameter `{}`", prog.def_path(td)));
-                        out.push(self.tys.error);
-                        k += 1;
-                        continue;
-                    }
-                    cx.state.default_inprog.borrow_mut().push((td, k));
                     let lt = match (tdef, cdef) {
                         (Some(dt), _) => self.lower_ty(cx, prog, pd.file, pd.scope, &env, dt),
                         (_, Some(de)) => {
@@ -3364,7 +3356,6 @@ impl Tcx {
                         },
                         _ => self.tys.error,
                     };
-                    cx.state.default_inprog.borrow_mut().pop();
                     let mut sub = vec![self_t];
                     sub.extend(out.iter().copied());
                     self.tys.subst(lt, &sub)
@@ -3848,8 +3839,6 @@ pub struct EvalState {
     alias_inprog: std::cell::RefCell<crate::fxhash::HashSet<(TypingEnv, DefId)>>,
     /// generic parameter defaults being lowered: (item, parameter position)
     default_inprog: std::cell::RefCell<Vec<(DefId, usize)>>,
-    /// types of const parameters being lowered: (item, parameter position)
-    const_param_ty_inprog: std::cell::RefCell<Vec<(DefId, usize)>>,
     pub tc_depth: std::cell::Cell<u32>,
 }
 
