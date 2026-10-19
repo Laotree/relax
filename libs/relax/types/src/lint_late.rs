@@ -830,7 +830,7 @@ impl<'a> Visitor<'a> for Late<'a> {
             for f in self.ast.list(fs) {
                 if f.shorthand { continue; }
                 if let Pat::Ident { name, sub: None, .. } = *self.ast.pat(f.pat) {
-                    if self.body.pat_local.contains_key(&f.pat.0) && pf.text(name) == pf.text(f.name) {
+                    if self.body.pat_local.contains_key(&f.pat.0) && pf.text(name) == pf.text(f.name) && pf.expansion_kind(name.lo) == pf.expansion_kind(f.name.lo) {
                         self.emit(&NON_SHORTHAND_FIELD_PATTERNS, f.name.lo, &format!("the `{}:` in this pattern is redundant", pf.text(f.name)));
                     }
                 }
@@ -2452,7 +2452,12 @@ pub fn missing_copy_implementations(prog: &Program, tcx: &Tcx, own: &[bool], rea
         let all_copy = adt.variants.iter().all(|v| v.fields.iter().all(|f| implements(copy, f.ty)));
         if !all_copy { continue; }
         let ast = &prog.files[def.file as usize].ast;
-        if lint::external(prog, def.file, ast.item(def.item).lo) { continue; }
+        let item = ast.item(def.item);
+        if lint::has_attr(prog, def.file, ast.list(item.attrs), "non_exhaustive") { continue; }
+        if let ItemKind::Enum(r) = item.kind {
+            if ast.list(ast.row(r).variants).iter().any(|v| lint::has_attr(prog, def.file, ast.list(v.attrs), "non_exhaustive")) { continue; }
+        }
+        if lint::external(prog, def.file, item.lo) { continue; }
         lint::emit(prog, d, &MISSING_COPY_IMPLEMENTATIONS, def.file, ast.item(def.item).lo, "type could implement `Copy`; consider adding `impl Copy`");
     }
 }
