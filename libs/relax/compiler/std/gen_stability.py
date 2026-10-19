@@ -52,6 +52,8 @@ def scan(crate, root, f, out):
             if ']' in s and attr.count('[') <= attr.count(']'):
                 pending = file_attr(attr, base, stack, out) or pending
                 attr = None
+        elif s.startswith('#[stable'):
+            pending = ('', '')
         elif s.startswith('#[unstable') or s.startswith('#![unstable'):
             attr = s
             if attr.count('[') <= attr.count(']'):
@@ -84,9 +86,16 @@ def scan(crate, root, f, out):
                     pending = None
                 elif pending and re.match(r'^(?:pub(?:\([^)]*\))?\s+)?use\b', s):
                     # a re-export carries its own stability: `pub use a::b::c [as d];`
-                    mu = re.match(r'^(?:pub(?:\([^)]*\))?\s+)?use\s+[A-Za-z0-9_:]*?([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;', s)
+                    mu = re.match(r'^(?:pub(?:\([^)]*\))?\s+)?use\s+([A-Za-z0-9_:]*?([A-Za-z_][A-Za-z0-9_]*))(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;', s)
                     if mu and not in_trait_impl:
-                        out.append(('::'.join(base + [n for _, k, n in stack if k in ('mod', 'type', 'trait')] + [mu.group(2) or mu.group(1)]), pending[0], pending[1]))
+                        where = '::'.join(base + [n for _, k, n in stack if k in ('mod', 'type', 'trait')] + [mu.group(3) or mu.group(2)])
+                        if pending[0]:
+                            out.append((where, pending[0], pending[1]))
+                        else:
+                            # a stable re-export takes the stability of its target (rustc resolves to the definition)
+                            tgt = mu.group(1)
+                            if tgt.split('::')[0] in ('core', 'alloc', 'std'):
+                                out.append((where, '', 'reexport ' + tgt))
                     pending = None
                 elif pending and (MACRO.match(line) or s.startswith('macro_rules!') or s.startswith('#')):
                     pass

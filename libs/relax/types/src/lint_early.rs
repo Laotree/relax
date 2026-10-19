@@ -19,6 +19,11 @@ use std::sync::Arc;
 use crate::typeck::Body;
 use std::collections::HashMap;
 
+pub const UNUSED_IMPORT_BRACES: Lint = lint::lint("unused_import_braces");
+pub const BREAK_WITH_LABEL_AND_LOOP: Lint = lint::lint("break_with_label_and_loop");
+pub const AMBIGUOUS_NEGATIVE_LITERALS: Lint = lint::lint("ambiguous_negative_literals");
+pub const DROP_BOUNDS: Lint = lint::lint("drop_bounds");
+pub const DYN_DROP: Lint = lint::lint("dyn_drop");
 pub const UNUSED_PARENS: Lint = lint::lint("unused_parens");
 pub const UNUSED_BRACES: Lint = lint::lint("unused_braces");
 pub const WHILE_TRUE: Lint = lint::lint("while_true");
@@ -469,6 +474,11 @@ pub(crate) struct W<'a> {
     lt: Option<LtCx>,
     /// the lifetime resolution of the definition (hidden lifetimes of paths)
     names: Option<std::sync::Arc<crate::tcx::lifetime_resolve::LifetimeResolution>>,
+    /// the type a bound under walk constrains (`T` in `T: Drop`), for the `drop_bounds` text
+    bound_self: String,
+    /// inside `dyn ..` bounds / the return type (an opaque `impl Drop` is allowed)
+    in_dyn: bool,
+    in_ret: bool,
 }
 
 fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
@@ -476,7 +486,7 @@ fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
 impl<'a> W<'a> {
     pub(crate) fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
         let pf: &'a ParsedFile = &prog.files[file as usize];
-        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None, names: None }
+        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None, names: None, bound_self: String::new(), in_dyn: false, in_ret: false }
     }
 
     fn emit(&self, l: &Lint, pos: u32, msg: &str) {
@@ -841,10 +851,26 @@ impl<'a> W<'a> {
 
     // ------------------------------------------------------------ expressions
 
+    /// rustc `Precedence`: `-1i32.abs()` negates the method call's result.
+    fn ambiguous_negative_literal(&self, _e: ExprId, ex: Expr, operand: ExprId) {
+        let mut arg = operand;
+        let mut at_least_one = false;
+        while let ExprKind::MethodCall(recv, _) = self.kind(arg) {
+            at_least_one = true;
+            arg = recv;
+        }
+        if at_least_one {
+            if let ExprKind::Lit(LitKind::Int | LitKind::Float) = self.kind(arg) {
+                self.emit(&AMBIGUOUS_NEGATIVE_LITERALS, ex.lo, "`-` has lower precedence than method calls, which might be unexpected");
+            }
+        }
+    }
+
     fn expr(&mut self, e: ExprId) {
         let ast = self.ast;
         let ex = *ast.expr(e);
         self.cur = ex.lo;
+        if let ExprKind::Unary(UnOp::Neg, operand) = ex.kind { self.ambiguous_negative_literal(e, ex, operand); }
         let cast_lt = self.cast_followed_by_lt(e);
         if let Some(t) = cast_lt { self.cast_lt.push(t); }
         self.expr_pre(e, ex);
@@ -992,7 +1018,24 @@ impl<'a> W<'a> {
             }
             ExprKind::Break(l, x) => {
                 self.use_label(l);
-                if let Some(x) = x.get() { self.expr(x); }
+                if let Some(x) = x.get() {
+                    // rustc_parse: `break 'l loop {..}` reads as an unlabeled break of a labeled value
+                    if !l.is_none() {
+                        let bare = match self.kind(x) {
+                            ExprKind::While(r) => ast.row(r).label.is_none(),
+                            ExprKind::For(r) => ast.row(r).label.is_none(),
+                            ExprKind::Loop(_, lb) => lb.is_none(),
+                            ExprKind::Block(_, lb) => lb.is_none(),
+                            _ => false,
+                        };
+                        if bare && !lint::external(self.prog, self.file, ex.lo) {
+                            let krate = self.prog.def(self.def).krate;
+                            let root = crate_root_def(self.prog, krate);
+                            emit(self.prog, root, &BREAK_WITH_LABEL_AND_LOOP, self.file, ex.lo, "this labeled break expression is easy to confuse with an unlabeled break with a labeled value expression");
+                        }
+                    }
+                    self.expr(x);
+                }
             }
             ExprKind::Return(x) | ExprKind::Yield(x) => if let Some(x) = x.get() { self.expr(x); },
             ExprKind::Closure(row) => {
@@ -1117,6 +1160,7 @@ impl<'a> W<'a> {
                 let item = *ast.item(it);
                 if matches!(item.kind, ItemKind::Use(_)) && self.lt.is_none() {
                     absolute_use_paths(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
+                    unused_import_braces(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
                 }
             }
             Stmt::Empty => {}
@@ -1299,10 +1343,12 @@ impl<'a> W<'a> {
             }
             Ty::ImplTrait(b) => {
                 self.lt_rib(LRib::ImplTrait);
+                let s = std::mem::replace(&mut self.bound_self, "impl Drop".to_string());
                 self.bounds(b);
+                self.bound_self = s;
                 self.lt_pop();
             }
-            Ty::DynTrait(b, _) => self.bounds(b),
+            Ty::DynTrait(b, _) => { let s = std::mem::replace(&mut self.in_dyn, true); self.bounds(b); self.in_dyn = s; }
             Ty::Never | Ty::Infer | Ty::Mac(_) | Ty::ImplicitSelf | Ty::CVarArgs => {}
         }
     }
@@ -1380,6 +1426,16 @@ impl<'a> W<'a> {
         match *b {
             Bound::Lifetime(l) => self.lt_use(l),
             Bound::Trait { hrtb, path, .. } => {
+                if let Some(d) = crate::lint_dead::resolve_trait_path(self.prog, self.def, &path) {
+                    if lint::is_diagnostic_item(self.prog, d, "Drop") {
+                        if self.in_dyn {
+                            self.emit(&DYN_DROP, path.lo, "types that do not implement `Drop` can still have drop glue, consider instead using `std::mem::needs_drop` to detect whether a type is trivially dropped");
+                        } else if !(self.in_ret && self.bound_self == "impl Drop") {
+                            let ty = self.bound_self.clone();
+                            self.emit(&DROP_BOUNDS, path.lo, &format!("bounds on `{}: Drop` are most likely incorrect, consider instead using `std::mem::needs_drop::<{}>()` to detect whether a type is trivially dropped", ty, ty));
+                        }
+                    }
+                }
                 // a poly trait ref is a binder (not one the lints report)
                 self.lt_scope(hrtb, false);
                 self.generic_params(hrtb);
@@ -1472,7 +1528,9 @@ impl<'a> W<'a> {
             match p.kind {
                 GenericParamKind::Lifetime(bounds) => for &l in ast.list(bounds) { self.lt_use(l); },
                 GenericParamKind::Type(b, d) => {
+                    let s = std::mem::replace(&mut self.bound_self, self.pf.text(p.name).to_string());
                     self.bounds(b);
+                    self.bound_self = s;
                     if let Some(t) = d { self.ty(t); }
                 }
                 GenericParamKind::Const(t, d) => {
@@ -1494,7 +1552,13 @@ impl<'a> W<'a> {
                     self.lt_scope(hrtb, true);
                     self.generic_params(hrtb);
                     self.ty(ty);
+                    let text = match *ast.ty(ty) {
+                        Ty::Path(p) => crate::program::path_segs(self.prog, self.file, &p).iter().map(|s| self.prog.syms.str(s.1).to_string()).collect::<Vec<_>>().join("::"),
+                        _ => "_".to_string(),
+                    };
+                    let s = std::mem::replace(&mut self.bound_self, text);
                     self.bounds(bounds);
+                    self.bound_self = s;
                     self.lt_end_scope();
                 }
                 WherePred::Lifetime(l, bounds) => {
@@ -1607,7 +1671,7 @@ impl<'a> W<'a> {
             self.ty(p.ty);
         }
         self.lt_rib(LRib::Fail);
-        if let Some(r) = sig.ret { self.ty(r); }
+        if let Some(r) = sig.ret { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
         self.lt_pop();
         self.lt_pop();
         // the body: lifetimes written in it are used many times
@@ -1708,7 +1772,7 @@ impl<'a> W<'a> {
                     self.ty(p.ty);
                     self.leave(p.attrs);
                 }
-                if let Some(r) = sig.ret { self.ty(r); }
+                if let Some(r) = sig.ret { let s = std::mem::replace(&mut self.in_ret, true); self.ty(r); self.in_ret = s; }
             }
             ItemKind::Struct(r) => {
                 let s = *ast.row(r);
@@ -1750,7 +1814,9 @@ impl<'a> W<'a> {
             ItemKind::Trait(r) => {
                 let t = *ast.row(r);
                 self.generics(t.generics);
+                let s = std::mem::replace(&mut self.bound_self, "Self".to_string());
                 self.bounds(t.supers);
+                self.bound_self = s;
             }
             ItemKind::Impl(r) => {
                 let i = *ast.row(r);
@@ -2405,7 +2471,7 @@ pub fn check_module_items(prog: &Program, own: &[bool]) {
             if !matches!(item.kind, ItemKind::Use(_) | ItemKind::ExternCrate(_)) { continue; }
             let attrs: Vec<(u32, Attr)> = ast.list(item.attrs).iter().map(|a| (file, *a)).collect();
             let own_attrs: Vec<Attr> = ast.list(item.attrs).to_vec();
-            if matches!(item.kind, ItemKind::Use(_)) { absolute_use_paths(prog, d, file, item, &own_attrs); }
+            if matches!(item.kind, ItemKind::Use(_)) { absolute_use_paths(prog, d, file, item, &own_attrs); unused_import_braces(prog, d, file, item, &own_attrs); }
             if attrs.is_empty() { continue; }
             attr_checks(prog, &AttrNode { d, inner: &own_attrs, attrs: &attrs, is_crate: false, macro_use_target: matches!(item.kind, ItemKind::ExternCrate(_)) });
         }
@@ -2745,6 +2811,36 @@ pub(crate) fn absolute_path(prog: &Program, d: DefId, inner: &[Attr], file: u32,
             emit_in(prog, d, inner, &ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE, file, p.lo, ABSOLUTE_PATHS_MSG);
         }
     }
+}
+
+/// rustc `UnusedImportBraces`: `use a::{b};` (a single non-`self` item in braces).
+pub(crate) fn unused_import_braces(prog: &Program, d: DefId, file: u32, item: &Item, attrs: &[Attr]) {
+    let pf = &prog.files[file as usize];
+    let ast = &pf.ast;
+    let ItemKind::Use(r) = item.kind else { return };
+    fn walk(prog: &Program, d: DefId, file: u32, ast: &Ast, t: UseTree, item: &Item, attrs: &[Attr]) {
+        match t {
+            UseTree::Path(_, c) => walk(prog, d, file, ast, *ast.use_tree(c), item, attrs),
+            UseTree::Group(l) => {
+                let items = ast.list(l);
+                for c in items { walk(prog, d, file, ast, *c, item, attrs); }
+                let [one] = items else { return };
+                let pf = &prog.files[file as usize];
+                let node = match *one {
+                    UseTree::Name(seg, rename) => {
+                        if seg.kind() == SegKind::SelfValue { return; }
+                        pf.text(rename.unwrap_or(seg.name)).to_string()
+                    }
+                    UseTree::Glob => "*".to_string(),
+                    _ => return,
+                };
+                if lint::external(prog, file, item.lo) { return; }
+                emit_in(prog, d, attrs, &UNUSED_IMPORT_BRACES, file, item.lo, &format!("braces around {} is unnecessary", node));
+            }
+            _ => {}
+        }
+    }
+    walk(prog, d, file, ast, ast.row(r).tree, item, attrs);
 }
 
 /// The same lint on a `use` item of a 2015 crate: its path implicitly starts at the crate root.
