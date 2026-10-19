@@ -341,7 +341,7 @@ fn record_regular_live_regions(cx: &mut LivenessCx<'_>) {
         fn visit_ty(&mut self, ty: &TyId) { self.record(*ty, V::Co); }
         fn visit_aggregate_kind(&mut self, kind: &AggregateKind) {
             match kind {
-                AggregateKind::Adt(_, _, args, _, _) | AggregateKind::Closure(_, args) | AggregateKind::Coroutine(_, args) => {
+                AggregateKind::Adt(_, _, args, _, _) | AggregateKind::Closure(_, args) | AggregateKind::Coroutine(_, args) | AggregateKind::CoroutineClosure(_, args) => {
                     for &arg in args { self.record_arg(arg); }
                 }
                 AggregateKind::Array(ty) | AggregateKind::RawPtr(ty, _) => self.record(*ty, V::Co),
@@ -350,7 +350,7 @@ fn record_regular_live_regions(cx: &mut LivenessCx<'_>) {
         }
         fn visit_const(&mut self, value: &Const, _: Location) {
             match value {
-                Const::Val(_, ty) => self.record(*ty, V::Co),
+                Const::Val(_, ty) | Const::Ty(ty, _) => self.record(*ty, V::Co),
                 Const::Unevaluated { args, .. } => { for &arg in args { self.record_arg(arg); } }
             }
         }

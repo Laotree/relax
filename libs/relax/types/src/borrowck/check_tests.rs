@@ -23,7 +23,7 @@ fn body(tys: &[TyId], blocks: Vec<BasicBlockData>) -> Body {
         basic_blocks: blocks, local_decls: tys.iter().enumerate().map(|(i, &ty)| LocalDecl { ty,
             mutability: Mutability::Mut, source_info: SourceInfo::default(), user_ty: vec![], local_info: LocalInfo::Boring,
             kind: if i == 0 { LocalKind::Return } else { LocalKind::UserVar } }).collect(),
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![],
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], span: Span::default(), upvars: Vec::new(), allocs: AllocMap::default(),
         var_debug_info: vec![], arg_count: 1, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn reference(tcx: &Tcx, t: TyId, mutable: bool) -> TyId { tcx.tys.intern(TyKind::Ref(mutable, t, RegionId::ERASED)) }
@@ -438,7 +438,7 @@ mod polonius_tests;
 
 // --- re-audit restorations (parity/reaudit.REPORT.md) ---
 fn user(can_be_made_mutable: bool, match_place: Option<(Option<Place>, Span)>) -> LocalInfo {
-    LocalInfo::User { is_ref_binding: false, can_be_made_mutable, match_place }
+    LocalInfo::user_var(BindingMode(if can_be_made_mutable { ByRef::No } else { ByRef::Yes(Mutability::Not) }, Mutability::Not), match_place, Span::default())
 }
 fn call(unit: TyId, args: Vec<Operand>, arg_spans: Vec<Span>, destination: Place) -> TerminatorKind {
     TerminatorKind::Call { func: val(unit), args, destination, target: Some(BasicBlock(1)),

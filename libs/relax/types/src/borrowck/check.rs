@@ -128,7 +128,7 @@ fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) 
             match rv {
                 Rvalue::Aggregate(kind, _) if matches!(**kind, AggregateKind::Closure(..) | AggregateKind::Coroutine(..)) =>
                     self.stop("closure aggregate needs nested used-mut capture metadata"),
-                Rvalue::CopyForDeref(_) | Rvalue::ShallowInitBox(..) => self.stop("runtime rvalue in borrowck MIR"),
+                Rvalue::CopyForDeref(_) => self.stop("runtime rvalue in borrowck MIR"),
                 _ => {}
             }
             self.super_rvalue(rv, at);
@@ -263,19 +263,18 @@ impl MirBorrowckCtxt<'_> {
             Rvalue::BinaryOp(_, ops) => {
                 self.consume_operand(&ops.0, at, span, state); self.consume_operand(&ops.1, at, span, state);
             }
-            Rvalue::Discriminant(place) | Rvalue::Len(place) => {
-                let field = if matches!(value, Rvalue::Len(_)) { Some(ArtificialField::ArrayLength) } else { None };
-                self.access_place(place, Shallow(field), Read(ReadKind::Copy), false, at, span, state);
+            Rvalue::Discriminant(place) => {
+                self.access_place(place, Shallow(None), Read(ReadKind::Copy), false, at, span, state);
                 self.check_if_path_or_subpath_is_moved(place, at, span, state);
             }
             Rvalue::Aggregate(_, ops) => for op in ops { self.consume_operand(op, at, span, state); },
-            Rvalue::ThreadLocalRef(_) | Rvalue::NullaryOp(..) => {}
-            Rvalue::CopyForDeref(_) | Rvalue::ShallowInitBox(..) => unreachable!("preflight rejected runtime rvalue"),
+            Rvalue::ThreadLocalRef(_) => {}
+            Rvalue::CopyForDeref(_) => unreachable!("preflight rejected runtime rvalue"),
         }
     }
     fn consume_operand(&mut self, op: &Operand, at: Location, span: Span, state: BorrowckDomain<'_>) {
         let (place, access, allow) = match op {
-            Operand::Constant(_) => return,
+            Operand::Constant(_) | Operand::RuntimeChecks(_) => return,
             Operand::Copy(place) => (place, Read(ReadKind::Copy), false),
             Operand::Move(place) => { self.check_movable_place(place, at); (place, Write(WriteKind::Move), true) }
         };
@@ -421,7 +420,7 @@ impl MirBorrowckCtxt<'_> {
     // immutable binding joins the first error, whose primary span becomes the binding.
     fn report_mutable_borrow_error(&mut self, the_place_err: &Place, span: Span) {
         let decl = &self.body.local_decls[the_place_err.local.0 as usize];
-        let can_be_made_mutable = matches!(decl.local_info, LocalInfo::User { can_be_made_mutable: true, .. });
+        let can_be_made_mutable = decl.can_be_made_mutable();
         if !the_place_err.projection.is_empty() || !can_be_made_mutable {
             self.result.errors.push(BorrowckError { kind: BorrowImmutable, span });
             return;
@@ -631,7 +630,7 @@ fn report_move_errors(body: &Body, moves: Option<&MoveData>, errors: Vec<MoveErr
         let stmt = block.statements.get(location.statement_index);
         if let Some(Statement { kind: StatementKind::Assign(place, Rvalue::Use(Operand::Move(move_from))), source_info }) = stmt {
             if place.projection.is_empty() {
-                if let LocalInfo::User { match_place: Some((opt_match_place, match_span)), .. } = &body.local_decls[place.local.0 as usize].local_info {
+                if let LocalInfo::User(BindingForm::Var(VarBindingForm { opt_match_place: Some((opt_match_place, match_span)), .. })) = &body.local_decls[place.local.0 as usize].local_info {
                     let moves = moves.expect("promoted MIR has no user bindings");
                     append_binding_error(&mut grouped, moves, kind, move_from, opt_match_place.as_ref(), *match_span, source_info.span);
                     continue;

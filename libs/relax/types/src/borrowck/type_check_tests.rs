@@ -31,7 +31,6 @@ pub(crate) struct Fake<'t> {
     pub(crate) regions: Vec<(Origin, UniverseIndex)>,
     pub(crate) ops: Vec<Op>,
     pub(crate) fn_sig: Option<PolyFnSig>,
-    pub(crate) annotations: Vec<(Span, TyId)>,
     pub(crate) closure_sig: Option<FnSig>,
     /// The M2b answer of `rvalue_query_ty` (e.g. a closure aggregate's type).
     pub(crate) query_ty: Option<TyId>,
@@ -54,7 +53,7 @@ pub(crate) struct Fake<'t> {
 impl<'t> Fake<'t> {
     pub(crate) fn new(tcx: &'t Tcx, first_var: usize) -> Self {
         Self { tcx, universe: UniverseIndex::ROOT, regions: vec![(Origin::Existential, UniverseIndex::ROOT); first_var],
-            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), fields: vec![], installed: None, opaques: vec![], non_defining: vec![], equated: vec![] }
+            ops: vec![], fn_sig: None, closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), fields: vec![], installed: None, opaques: vec![], non_defining: vec![], equated: vec![] }
     }
 }
 impl liveness::LivenessOps for Fake<'_> {
@@ -133,9 +132,9 @@ impl BorrowckTypeOps for Fake<'_> {
     fn normalize(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Locations) -> TyId { ty }
     fn deeply_normalize_sig(&mut self, _: &mut MirTypeckRegionConstraints, sig: &FnSig, _: Location) -> Result<FnSig, ()> { Ok(sig.clone()) }
     fn struct_tail(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Location) -> TyId { ty }
+    fn instantiate_canonical_user_type(&mut self, _: Span, user: &CanonicalUserType) -> UserType { user.value.clone() }
     fn ascribe_user_type(&mut self, _: &mut MirTypeckRegionConstraints, t: TyId, u: UserType, s: Span) { self.ops.push(Op::Ascribe(t, u, s)); }
     fn ascribe_user_type_skip_wf(&mut self, _: &mut MirTypeckRegionConstraints, t: TyId, u: TyId, s: Span) { self.ops.push(Op::AscribeSkipWf(t, u, s)); }
-    fn user_type_annotation(&self, id: UserTypeId) -> (Span, TyId) { self.annotations[id.0 as usize] }
     fn closure_user_provided_sig(&mut self, _: &Body) -> Option<FnSig> { self.closure_sig.clone() }
     fn fn_def_sig(&self, _: DefId, _: &[TyId], _: RegionArgsId) -> PolyFnSig { self.fn_sig.clone().unwrap() }
     fn field_ty(&self, _: PlaceTy, f: FieldIdx) -> Option<TyId> { self.fields.get(f.0 as usize).copied() }
@@ -167,9 +166,9 @@ fn body(tys: &[TyId], blocks: Vec<BasicBlockData>) -> Body {
     Body { phase: MirPhase::Analysis(AnalysisPhase::Initial), source: MirSource { owner: DefId(0), kind: BodyKind::Fn },
         basic_blocks: blocks, local_decls: tys.iter().enumerate().map(|(i, &ty)| LocalDecl { ty,
             mutability: Mutability::Mut, source_info: SourceInfo { span: span(50 + i as u32), ..SourceInfo::default() }, user_ty: vec![],
-            local_info: if i == 0 { LocalInfo::Boring } else { LocalInfo::User { is_ref_binding: false, can_be_made_mutable: false, match_place: None } },
+            local_info: if i == 0 { LocalInfo::Boring } else { LocalInfo::user_var(BindingMode(ByRef::No, Mutability::Mut), None, Span::default()) },
             kind: match i { 0 => LocalKind::Return, 1 => LocalKind::Arg, _ => LocalKind::UserVar } }).collect(),
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![],
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], span: Span::default(), upvars: Vec::new(), allocs: AllocMap::default(),
         var_debug_info: vec![], arg_count: 1, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn re(tcx: &Tcx, v: u32) -> RegionId { tcx.tys.intern_region(RegionKind::ReVar(v)) }
@@ -294,7 +293,7 @@ fn return_and_yield_categories() {
     let (r0, r1) = (rf(&tcx, re(&tcx, 0), t, false), rf(&tcx, re(&tcx, 1), t, false));
     let mut b = body(&[r0, r1, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![assign(0, copy(1))],
         TerminatorKind::Yield { value: Operand::Copy(p(1)), resume: BasicBlock(1), resume_arg: p(2), drop: None }), block(vec![], TerminatorKind::Return)]);
-    b.coroutine = Some(CoroutineInfo { yield_ty: rf(&tcx, re(&tcx, 3), t, false), resume_ty: rf(&tcx, re(&tcx, 4), t, false), kind: CoroutineKind::Coroutine });
+    b.coroutine = Some(CoroutineInfo { yield_ty: rf(&tcx, re(&tcx, 3), t, false), resume_ty: rf(&tcx, re(&tcx, 4), t, false), kind: CoroutineKind::Coroutine(Movability::Movable) });
     let mut fake = Fake::new(&tcx, 7);
     let io = [r1, r0];
     let r = run(&tcx, &test_prog(), &mut fake, &b, &io, Some((rf(&tcx, re(&tcx, 5), t, false), rf(&tcx, re(&tcx, 6), t, false)))); clean(&r);
@@ -340,7 +339,7 @@ fn reify_and_closure_fn_pointer_casts() {
     // A higher-ranked fn item reified to `fn(&'2 i32)`: the instantiated signature is proven WF.
     let item = tcx.tys.intern(TyKind::FnDef(DefId(9), tcx.tys.mk_list(&[]), RegionArgsId::EMPTY));
     let target = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 2), t, false)], tcx.tys.unit, 0);
-    let b = body(&[tcx.tys.unit, item, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, CoercionSource::Implicit), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
+    let b = body(&[tcx.tys.unit, item, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(Safety::Safe), CoercionSource::Implicit), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![rf(&tcx, bound(&tcx, 0), t, false)], output: tcx.tys.unit, header: FnHeader::RUST }, bound_regions: 1 });
     let r = check(&tcx, &mut fake, &b); clean(&r);
@@ -353,7 +352,7 @@ fn reify_and_closure_fn_pointer_casts() {
     // A closure's signature becomes a fn pointer of the target's safety.
     let sig = fn_ptr(&tcx, vec![rf(&tcx, re(&tcx, 1), t, false)], tcx.tys.unit, 0);
     let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: item, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8), closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tcx.tys.unit }));
-    let b = body(&[tcx.tys.unit, closure, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer, CoercionSource::AsCast), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
+    let b = body(&[tcx.tys.unit, closure, target], vec![block(vec![assign(2, Rvalue::Cast(CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(Safety::Safe), CoercionSource::AsCast), Operand::Copy(p(1)), target))], TerminatorKind::Return)]);
     let r = check(&tcx, &mut Fake::new(&tcx, 3), &b); clean(&r);
     assert_eq!(edges(&r)[0], (2, 1, Some(0), Cat::Cast { is_raw_ptr_dyn_type_cast: false, is_implicit_coercion: false, unsize_to: None }));
 }
@@ -485,13 +484,12 @@ fn user_annotations_hold_everywhere() {
     let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![
         StatementKind::AscribeUserType(p(2), UserTypeProjection { base: UserTypeAnnotationIndex(0), projection: vec![] }, Variance::Covariant),
     ], TerminatorKind::Return)]);
-    b.user_type_annotations = vec![UserTypeId(0)];
+    b.user_type_annotations = vec![CanonicalUserTypeAnnotation::for_test(annotated, span(40))];
     b.local_decls[2].user_ty = vec![UserTypeProjection { base: UserTypeAnnotationIndex(0), projection: vec![] }];
     let mut fake = Fake::new(&tcx, 3);
-    fake.annotations = vec![(span(40), annotated)];
     let r = check(&tcx, &mut fake, &b); clean(&r);
     // The canonical annotation is ascribed first, then the declaration (invariant) and the statement (covariant).
-    assert_eq!(fake.ops[0], Op::Ascribe(annotated, UserType::Annotation(UserTypeId(0)), span(40)));
+    assert_eq!(fake.ops[0], Op::Ascribe(annotated, annotation_value(annotated), span(40)));
     let all: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category != Cat::BoringNoLocation)
         .map(|c| (c.sup, c.sub, c.location, c.category, c.span)).collect();
     let decl = Cat::TypeAnnotation(AnnotationSource::Declaration);
@@ -507,7 +505,7 @@ fn promoted_constraints_move_to_the_use_location() {
     let mut promoted = body(&[promoted_ty, t, rf(&tcx, re(&tcx, 6), t, false)], vec![block(vec![StatementKind::Nop, assign(0, copy(2))], TerminatorKind::Return)]);
     promoted.arg_count = 0; promoted.source.kind = BodyKind::Promoted(DefId(0), PromotedId(0));
     let use_promoted = Operand::Constant(Box::new(ConstOperand { span: span(30), user_ty: None,
-        const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)) } }));
+        const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)), ty: t } }));
     let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![StatementKind::Nop, StatementKind::Nop, assign(2, Rvalue::Use(use_promoted))], TerminatorKind::Return)]);
     b.promoted = vec![promoted];
     let mut fake = Fake::new(&tcx, 7);
@@ -569,12 +567,12 @@ fn reaudit_inline_const_bounds_follow_the_constant_checks() {
     // ascription) before the inline const's closure bounds are proven.
     let tcx = Tcx::new(); let t = tcx.tys.i32_;
     let konst = Operand::Constant(Box::new(ConstOperand { span: Span::default(), user_ty: None,
-        const_: Const::Unevaluated { def: DefId(5), args: vec![], promoted: None } }));
+        const_: Const::Unevaluated { def: DefId(5), args: vec![], promoted: None, ty: t } }));
     let b = body(&[tcx.tys.unit, t, t], vec![block(vec![assign(2, Rvalue::Use(konst))], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.inline_const = true; fake.const_ty = Some(t);
     let r = check(&tcx, &mut fake, &b); clean(&r);
-    let ascribe = fake.ops.iter().position(|o| matches!(o, Op::Ascribe(_, UserType::TypeOf(DefId(5), _), _))).unwrap();
+    let ascribe = fake.ops.iter().position(|o| matches!(o, Op::Ascribe(_, UserType { kind: UserTypeKind::TypeOf(DefId(5), _), .. }, _))).unwrap();
     let clauses = fake.ops.iter().position(|o| matches!(o, Op::Clauses(ClauseOwner::Def(DefId(5)), _, _))).unwrap();
     assert!(ascribe < clauses, "{:?}", fake.ops);
     assert_eq!(r.deferred_closure_requirements.len(), 1);
@@ -944,3 +942,5 @@ mod driver {
 }
 
 fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }
+
+fn annotation_value(ty: TyId) -> UserType { UserType::new(UserTypeKind::Ty(ty)) }
