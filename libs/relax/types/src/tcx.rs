@@ -2494,6 +2494,11 @@ impl Tcx {
                 if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t);
                 }
+                // an associated type of a bound the item's where clauses put on `Self`
+                // (`where Self: TryInto<T>` makes `Self::Error`; Self is param 0 of a trait)
+                if let Some(t) = self.param_assoc(cx, prog, module, env, 0, name) {
+                    return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t);
+                }
             }
         }
         // `T::Name` on a generic param: the associated type of one of its bounds
