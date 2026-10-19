@@ -127,6 +127,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
+    errors.extend(relax_types::item_checks::duplicate_symbols(&u.prog, &own));
     if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
     relax_types::lint_pass::check_items(&u.prog, &u.tcx, &own);
@@ -358,12 +359,13 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     let checked = seeds.len();
     relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root);
-    relax_types::lint_early2::finish(&u.prog, &own);
+    relax_types::lint_early::finish(&u.prog, &own);
     errors.extend(static_self_access(up, &own));
     // the feature gates (E0658 and friends): items and signatures, then the loaded bodies
     for &k in crates {
         errors.extend(relax_types::feature_gate::check_crate(unsafe { &(*up).prog }, unsafe { &(*up).tcx }, k));
         errors.extend(relax_types::feature_gate::check_bodies(unsafe { &(*up).prog }, unsafe { &(*up).tcx }, k));
+        errors.extend(relax_types::feature_gate::check_imports(unsafe { &(*up).prog }, k));
     }
     // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an

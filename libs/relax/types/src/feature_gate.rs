@@ -1143,8 +1143,55 @@ pub fn check_stability(prog: &Program, body: &crate::typeck::Body) -> Vec<String
 /// `#[unstable(feature = "name", reason = "..")]` on a definition's item: (feature, reason).
 fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
     let def = prog.def(d);
-    // (the other definitions -- primitives, modules, locals -- have no item of their own)
-    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::AssocTy) { return None; }
+    // (the other definitions -- primitives, locals -- have no item of their own)
+    if !matches!(def.kind, DefKind::Mod | DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::AssocTy) { return None; }
+    unstable_in_attrs(prog, d)
+}
+
+/// The library's table entry for a path as written (`std::intrinsics::copy`): a re-export has
+/// its own stability, so the key is the written path, not the defining one.
+fn table_entry(path: &str) -> Option<(String, Option<String>)> {
+    let &(f, r) = stability_table().get(path)?;
+    Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) }))
+}
+
+/// `path -> (feature, reason)` of the library's unstable definitions (std/stability.tsv).
+fn stability_table() -> &'static std::collections::HashMap<&'static str, (&'static str, &'static str)> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<&'static str, (&'static str, &'static str)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        include_str!("../../compiler/std/stability.tsv").lines().filter_map(|l| {
+            let mut it = l.splitn(3, '\t');
+            Some((it.next()?, (it.next()?, it.next().unwrap_or(""))))
+        }).collect()
+    })
+}
+
+/// rustc_passes stability.rs `check_path` on `use` declarations: every module and item a checked
+/// crate's import names must be stable or have its feature enabled.
+pub fn check_imports(prog: &Program, krate: u32) -> Vec<String> {
+    let feats = prog.crates[krate as usize].features(prog);
+    let mut out = Vec::new();
+    for imp in prog.imports.iter() {
+        if imp.ext || prog.file_crate.get(imp.file as usize) != Some(&krate) { continue; }
+        let pf = &*prog.files[imp.file as usize];
+        if !matches!(pf.expansion_kind(imp.pos), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules) { continue; }
+        let n = imp.segs.len();
+        let names: Vec<&str> = imp.segs.iter().map(|sg| prog.syms.str(sg.1)).collect();
+        if !imp.global && !matches!(names.first(), Some(&"std" | &"core" | &"alloc")) { continue; }
+        for k in 1..=n {
+            if let Some((feature, reason)) = table_entry(&names[..k].join("::")) {
+                if feats.has(&feature) { continue; }
+                let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
+                out.push(prog.record_error(imp.file, imp.pos, "typeck", msg));
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn unstable_in_attrs(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
+    let def = prog.def(d);
     let pf = &*prog.files[def.file as usize];
     let src = prog.src(def.file);
     let item = pf.ast.item(def.item);
