@@ -577,6 +577,8 @@ pub mod obligations {
     fn check_static(w: &mut Wfcx<'_, '_>, ast: &ast::Ast, item: &ast::Item) {
         let ItemKind::Static(mutable, _, _) = &item.kind else { return };
         let Some(ty) = w.tcx.const_ty(w.prog, w.def) else { return };
+        // (a type with an unevaluated constant, `[u8; len(NAME)]`, is evaluated by the constant check)
+        if w.tcx.tys.flags(ty).contains(crate::types::TypeFlags::HAS_ALIAS) { return; }
         let ty = w.normalize(ty);
         w.register_wf(ty, item.name.lo);
         w.sized(ty, item.name.lo);
