@@ -200,7 +200,7 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         let tc = p.typeck.as_mut().unwrap();
         let errors = std::mem::take(&mut tc.summary.errors);
         for bug in std::mem::take(&mut tc.summary.mir_bugs) {
-            v.unchecked.push(format!("{name}: MIR bug: {}", bug.message));
+            v.unchecked.push(format!("{name}: MIR bug: {}", strip_ids(&bug.message)));
         }
         let borrows = BorrowSet::build(tcx, &p.mir, false, &p.moves);
         let regions_stub = None::<()>;
@@ -261,6 +261,22 @@ fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &
         v.fv_only.extend(diagnostics::render_fv_only(&dcx, &checked.result));
         v.fv_records.extend(checked.result.fv_records.iter().cloned());
     }
+}
+
+/// A MIR-bug text without interned ids (`TyId(12)` -> `TyId`), so equal bugs group in the burn-down histogram.
+fn strip_ids(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("Id(") {
+        let (head, tail) = rest.split_at(i + 2);
+        out.push_str(head);
+        match tail.find(')') {
+            Some(j) if tail[1..j].bytes().all(|b| b.is_ascii_digit()) => rest = &tail[j + 1..],
+            _ => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn describe_build_error(reason: &crate::mir::build::UnsupportedReason) -> String {
