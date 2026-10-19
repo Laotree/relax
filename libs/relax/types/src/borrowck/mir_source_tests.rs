@@ -5,6 +5,10 @@ use crate::tcx::{EvalCx, EvalState, Tcx, TypingEnv};
 
 /// Error codes (or messages) and unchecked reasons of every fn of `source`.
 pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
+    borrowck_source_in(source, std::env::var("PROBE_EDITION").ok().and_then(|e| e.parse().ok()).unwrap_or(2021))
+}
+
+pub(super) fn borrowck_source_in(source: &str, edition: u16) -> (Vec<String>, Vec<String>) {
     crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
@@ -20,7 +24,7 @@ pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("lib.rs");
     std::fs::write(&path, source).unwrap();
-    let user = prog.load_crate("repro", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
+    let user = prog.load_crate("repro", path.to_str().unwrap(), edition, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
     std::fs::remove_file(&path).unwrap(); std::fs::remove_dir(&dir).unwrap();
     prog.prelude_crate = Some(0);
     prog.resolve_imports();
@@ -462,4 +466,14 @@ fn a_type_test_in_a_closure_is_promoted_to_the_lowest_universal_region_of_its_cl
         pub fn foo<E>() -> B { Box::new(|e| Box::new(e.is::<E>())) }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0310"), "{errors:?}");
+}
+
+#[test]
+fn the_anonymous_lifetimes_of_a_bare_fn_trait_object_are_late_bound() {
+    let (errors, unchecked) = borrowck_source_in("
+        use std::fmt;
+        pub fn new_format<F>(_f: F) where F: FnMut(i32, &mut FnMut(&fmt::Display) -> fmt::Result) -> fmt::Result {}
+        pub fn main() { new_format(|i, f| f(&format_args!(\"0x{:x}\", i))); }", 2015);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
 }
