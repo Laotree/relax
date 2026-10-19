@@ -52,6 +52,12 @@ pub use ::alloc::rc;
 pub use ::alloc::string;
 pub use ::alloc::vec;
 
+/// std::intrinsics (unstable module): the intrinsics stabilized under `ptr` stay reachable here
+/// (rustc library/core/src/intrinsics/mod.rs: `pub use crate::ptr::{copy, copy_nonoverlapping, write_bytes}`).
+pub mod intrinsics {
+    pub use core::ptr::{copy, copy_nonoverlapping, write_bytes};
+}
+
 pub mod collections {
     pub use core::collections::binary_heap;
     pub use core::collections::btree_map;
