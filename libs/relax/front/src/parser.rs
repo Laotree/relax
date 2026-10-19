@@ -1057,6 +1057,22 @@ impl<'a> Parser<'a> {
     }
 
     /// The `macro_rules!` macro a call path names, if any.
+    /// Is `name` mentioned in a `use` item of this file (a macro can be imported by path)? Text scan, only
+    /// reached for a call of a macro defined further down.
+    fn name_imported(&self, name: &str) -> bool {
+        let text = String::from_utf8_lossy(self.src);
+        let mut from = 0;
+        while let Some(i) = text[from..].find(name) {
+            let at = from + i;
+            let line_start = text[..at].rfind('\n').map_or(0, |x| x + 1);
+            if text[line_start..at].contains("use ") || text[..at].rfind("use ").is_some_and(|u| !text[u..at].contains(';')) {
+                return true;
+            }
+            from = at + name.len();
+        }
+        false
+    }
+
     fn rules_macro(&self, path: &Path) -> Option<crate::macros::MacroRef> {
         let m = self.macros.as_ref()?;
         let seg = self.ast.segs(path.segs).last()?;
@@ -1092,7 +1108,7 @@ impl<'a> Parser<'a> {
         // code, not an expansion)
         if let Some(d) = &r {
             if qual.is_none() && d.builtin == 0 && !d.exported && crate::lexer::validation_enabled() && (seg.name.lo as usize) < self.src.len()
-                && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos {
+                && self.bctx.as_ref().is_some_and(|c| c.path == d.def_file) && seg.name.lo < d.def_pos && (d.def_pos as usize) < self.src.len() && !self.name_imported(&name) {
                 r = None;
             }
         }

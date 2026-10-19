@@ -707,7 +707,7 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
             }
             continue;
         }
-        if from_source && matches!(name.as_slice(), b"track_caller" | b"target_feature") && def.kind == DefKind::Fn && prog.def(def.parent).kind == DefKind::Mod && prog.mods[prog.def(def.parent).sub as usize].parent_mod.is_none() && crate::wfcheck::obligations::is_entry_main(prog, d) {
+        if from_source && matches!(name.as_slice(), b"track_caller" | b"target_feature") && def.kind == DefKind::Fn && prog.syms.str(def.name) == "main" && prog.def(def.parent).kind == DefKind::Mod && prog.mods[prog.def(def.parent).sub as usize].parent_mod.is_none() && crate::wfcheck::obligations::is_entry_main(prog, d) {
             let what = if name == b"track_caller" { "be `#[track_caller]`" } else { "have `#[target_feature]`" };
             errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`main` function is not allowed to {what}")));
         }
