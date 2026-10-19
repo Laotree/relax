@@ -403,3 +403,11 @@ fn lifetimes_written_on_the_trait_of_a_qualified_path_are_kept() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].contains("lifetime may not live long enough"), "{errors:?}");
 }
+
+#[test]
+fn a_promoted_fn_item_keeps_its_turbofish_annotation() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn foo<'a>() { let x = 0; let f = &drop::<&'a i32>; f(&x); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
