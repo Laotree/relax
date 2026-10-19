@@ -505,6 +505,10 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     };
     // a check runs code only to evaluate constants: their loops count iterations (long_running_const_eval)
     driver_options.const_fuel = check;
+    // MAKEPAD_RUN_CHECK_EAGER=1 (check only): load every file of the provided crates instead of the demand
+    // plan's selection, so their front images do not depend on the checked crate (a sweep shares one
+    // read-only image cache)
+    driver_options.source_eager = check && std::env::var("MAKEPAD_RUN_CHECK_EAGER").is_ok_and(|v| v == "1");
     // kept: the settle swap (jit zone_swap) destroys the compiler arena; the session outlives it
     let frozen = crate::zone_alloc::kept_with(|| std::sync::Arc::new(crate::Session { options: driver_options.clone(), runtime: sess.runtime.clone() }));
     let sess = &frozen;
