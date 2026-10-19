@@ -1629,7 +1629,21 @@ impl Tcx {
                 _ => {}
             }
         }
-        state.errors.take().unwrap_or_default()
+        // the types the where clauses bound name existing types (rustc resolves them whether or
+        // not the item is used: late resolution of the generics' predicates)
+        let mut found = state.errors.replace(Some(Vec::new())).unwrap_or_default();
+        if matches!(def.kind, DefKind::Fn | DefKind::Impl) {
+            for w in ast.list(generics.where_) {
+                if let ast::WherePred::Bound { ty, .. } = w {
+                    self.lower_ty(&cx, prog, def.file, def.scope, &env, *ty);
+                }
+            }
+        }
+        // (a plain name that resolves to nothing; paths through `Self` and projections wait for the item's bounds)
+        found.extend(state.errors.take().unwrap_or_default().into_iter().filter(|e| {
+            e.contains("E0412: cannot find type `") && e.split('`').nth(1).map_or(false, |n| !n.contains("::"))
+        }));
+        found
     }
 
     pub fn signature_count(&self) -> usize {
@@ -2534,10 +2548,7 @@ impl Tcx {
         }
         // `Self::Name`: inside an impl the impl's own associated type, inside a trait a projection
         if p.segs.len() == 2 && prog.files[file as usize].ast.segs(p.segs)[0].kind() == SegKind::SelfType {
-            if env.self_ty.is_none() && env.impl_def.is_none() && env.trait_def.is_none() {
-                self.err(cx, prog, file, p.lo, "E0433: failed to resolve: cannot find `Self` in this scope".to_string());
-                return self.tys.error;
-            }
+
             let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[1].name)).unwrap_or(u32::MAX);
             if let Some(imp) = env.impl_def {
                 if self.impl_trait.contains_key(&imp) && env.self_ty.is_some() {

@@ -32,13 +32,17 @@ impl Program {
             // none: they define nothing)
             let mut ranges: Vec<Attr> = f.ast.root_attrs.iter().copied().collect();
             let n_root = ranges.len();
+            // what each attribute is on: 0 the crate, 1 a struct / enum / union, 2 another item, 3 a field or variant
+            let mut targets: Vec<u8> = vec![0; n_root];
             for &d in &by_file[fi] {
                 let def = self.def(d);
                 if def.item.0 == u32::MAX || self.item_defs.get(&(def.file, def.item.0)) != Some(&d) {
                     continue;
                 }
                 let it = f.ast.item(def.item);
+                let tgt = if matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) { 1 } else { 2 };
                 ranges.extend_from_slice(f.ast.list(it.attrs));
+                targets.resize(ranges.len(), tgt);
                 let fields = |data: VariantData, out: &mut Vec<Attr>| {
                     if let VariantData::Tuple(l) | VariantData::Struct(l) = data {
                         for fd in f.ast.list(l) {
@@ -56,6 +60,7 @@ impl Program {
                         fields(v.data, &mut ranges);
                     }
                 }
+                targets.resize(ranges.len(), 3);
             }
             // registered tools; derive helpers of non-std derives are not tracked: such a file
             // keeps its inert attributes
@@ -124,6 +129,14 @@ impl Program {
                     continue;
                 }
                 let pos = f.tok(first_i).lo;
+                if segs.len() == 1 && !global {
+                    let target = targets.get(ai).copied().unwrap_or(3);
+                    match (segs[0], target) {
+                        ("derive", 2) => out.push(self.record_error(fi as u32, pos, "parse", "E0774: `derive` may only be applied to `struct`s, `enum`s and `union`s".into())),
+                        ("derive" | "test" | "test_case" | "bench" | "global_allocator", 0) => out.push(self.record_error(fi as u32, pos, "parse", format!("`{}` attribute cannot be used at crate level", segs[0]))),
+                        _ => {}
+                    }
+                }
                 // the attribute's shape (rustc_attr_parsing): `name` alone, or `name = "string"`
                 if segs.len() == 1 && !global {
                     let wrapped = first_i != lo;

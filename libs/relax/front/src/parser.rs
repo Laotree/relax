@@ -944,8 +944,14 @@ impl<'a> Parser<'a> {
         let n = String::from_utf8_lossy(self.bytes(name.lo, name.hi)).trim_start_matches("r#").to_string();
         let mt = crate::macros::mtoks(self, &self.toks.range(toks.lo as usize, toks.hi as usize));
         let file = self.bctx.as_ref().map_or("", |c| c.path.as_str());
-        self.macros.as_mut().unwrap().define_tokens(&n, &self.krate, file, name.lo, exported, local_inner, &mt)
-            .map_err(|msg| PErr { pos: name.lo, msg })
+        let edition = self.edition;
+        let scope = self.macros.as_mut().unwrap();
+        scope.define_tokens(&n, &self.krate, file, name.lo, exported, local_inner, &mt)
+            .map_err(|msg| PErr { pos: name.lo, msg })?;
+        if let Some(d) = scope.local.last() {
+            crate::macros::check_rules(d, edition).map_err(|msg| PErr { pos: name.lo, msg })?;
+        }
+        Ok(())
     }
 
     /// A `use` item's bindings for macro lookups in this parse (MacroScope::add_use).
