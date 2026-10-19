@@ -48,6 +48,8 @@ pub mod layout;
 pub mod const_fold;
 pub mod borrowck;
 pub mod lint;
+pub mod lint_table;
+pub mod lint_levels;
 pub mod ast_visit;
 pub mod lint_pass;
 pub mod lint_unreachable;

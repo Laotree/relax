@@ -43,37 +43,74 @@ pub const MISSING_UNSAFE_ON_EXTERN: Lint = Lint { name: "missing_unsafe_on_exter
 pub const DEPRECATED_SAFE_2024: Lint = Lint { name: "deprecated_safe_2024", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
 pub const UNSAFE_ATTR_OUTSIDE_UNSAFE: Lint = Lint { name: "unsafe_attr_outside_unsafe", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
 
-const LEVEL_ATTRS: &[(&[u8], Level)] = &[
-    (b"allow", Level::Allow), (b"expect", Level::Allow), (b"warn", Level::Warn),
-    (b"deny", Level::Deny), (b"forbid", Level::Forbid),
+const LEVEL_ATTRS: &[(&[u8], Level, bool)] = &[
+    (b"allow", Level::Allow, false), (b"expect", Level::Allow, true), (b"warn", Level::Warn, false),
+    (b"deny", Level::Deny, false), (b"forbid", Level::Forbid, false),
 ];
 
-/// The lint names a level attribute (`deny(a, b)`) sets, with its level; tool lints
-/// (`clippy::x`, `rustdoc::x`) are left out.
-fn level_attr(prog: &Program, file: u32, a: &Attr) -> Option<(Level, Vec<String>)> {
+/// A lint level attribute: its level, whether it only expects, the names it lists with the
+/// position of each, and its identity.
+pub struct LevelAttr {
+    pub level: Level,
+    pub expect: bool,
+    /// (name as written, position); tool lints keep their `::` path
+    pub names: Vec<(String, u32)>,
+    pub key: (u32, u32),
+    pub reason: bool,
+}
+
+/// Identifies one name of one level attribute: (file, attribute token, name index).
+pub type AttrKey = (u32, u32, u32);
+
+pub fn parse_level_attr(prog: &Program, file: u32, a: &Attr) -> Option<LevelAttr> {
     let p = prog.src(file);
     let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
     if hi <= lo + 2 { return None; }
     let head = crate::cfg::tok_str(p, lo);
-    let level = LEVEL_ATTRS.iter().find(|(n, _)| *n == head)?.1;
+    let (level, expect) = LEVEL_ATTRS.iter().find(|(n, _, _)| *n == head).map(|x| (x.1, x.2))?;
     if crate::cfg::tok_str(p, lo + 1) != b"(" { return None; }
-    let mut names = Vec::new();
-    let mut path: Vec<String> = Vec::new();
+    let mut names: Vec<(String, u32)> = Vec::new();
+    let mut cur = String::new();
+    let mut start = 0u32;
+    let mut reason = false;
     let mut i = lo + 2;
-    let mut done = |path: &mut Vec<String>| {
-        if path.len() == 1 { names.push(std::mem::take(&mut path[0])); }
-        path.clear();
-    };
+    let mut skip_value = false;
     while i < hi {
         let t = crate::cfg::tok_str(p, i);
         match t {
-            b")" | b"," => { done(&mut path); if t == b")" { break; } }
-            b"::" | b":" => {}
-            _ => path.push(String::from_utf8_lossy(t).into_owned()),
+            b")" | b"," => {
+                if !cur.is_empty() && !skip_value { names.push((std::mem::take(&mut cur), start)); }
+                cur.clear();
+                skip_value = false;
+                if t == b")" { break; }
+            }
+            b"=" => {
+                // `reason = "..."`
+                if cur == "reason" { reason = true; }
+                cur.clear();
+                skip_value = true;
+            }
+            b"::" => cur.push_str("::"),
+            _ => {
+                if cur.is_empty() { start = p.tok(i).lo; }
+                if !skip_value { cur.push_str(&String::from_utf8_lossy(t)); }
+            }
         }
         i += 1;
     }
-    Some((level, names))
+    Some(LevelAttr { level, expect, names, key: (file, a.toks.lo), reason })
+}
+
+/// The groups a lint belongs to: the table's (rustc) and the ones its definition names.
+fn groups_of(lint: &Lint) -> impl Iterator<Item = &'static str> {
+    let table = crate::lint_table::LINTS.iter().find(|l| l.0 == lint.name).map(|l| l.3).unwrap_or(&[]);
+    table.iter().copied().chain(lint.groups.iter().copied())
+}
+
+/// The name a lint is known by now (`bare_trait_object` was renamed `bare_trait_objects`).
+pub fn current_name(n: &str) -> &str {
+    if n == "bad_style" { return "nonstandard_style"; }
+    crate::lint_table::RENAMED.iter().find(|(old, _)| *old == n).map_or(n, |(_, new)| new)
 }
 
 /// The attribute lists that apply at `def`, innermost first: the definition's own, then each
@@ -131,41 +168,89 @@ pub fn level_with(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Le
 /// The level of `lint` inside `def` under `inner`, the attributes of a node of its body (a
 /// match arm) in the definition's file.
 fn level_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Level {
+    resolve(prog, def, inner, lint, None).level
+}
+
+/// A lint's level at a node, and where it came from.
+pub struct Resolved {
+    pub level: Level,
+    /// the `expect` attribute (name) that put the lint at this level
+    pub expect: Option<AttrKey>,
+    /// the level was set by `forbid` naming a group, or on the command line
+    pub forbid_from_group: bool,
+    /// the attribute name that last set the level, as written
+    pub source: Option<String>,
+}
+
+/// rustc_lint levels.rs `LintLevelsBuilder`: the level of `lint` at `def` inside `inner`, every
+/// attribute from the crate root inwards applied in order. `until` stops before that attribute
+/// (the state an attribute sees).
+pub fn resolve(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, until: Option<(u32, u32)>) -> Resolved {
     let mut scopes = scopes(prog, def);
     if !inner.is_empty() && def != NO_DEF {
         scopes.insert(0, (prog.def(def).file, inner.to_vec()));
     }
-    // outermost first; within a list, later attributes override earlier ones
-    let mut level = if prog.files[prog.def(def).file as usize].edition >= 2024 { lint.default_2024 } else { lint.default };
+    let edition = prog.files[prog.def(def).file as usize].edition;
+    let mut spec = Resolved { level: if edition >= 2024 { lint.default_2024 } else { lint.default }, expect: None, forbid_from_group: false, source: None };
     let mut warnings: Option<Level> = None;
-    let mut forbidden = false;
     let mut forbid_warnings = false;
+    let in_groups: Vec<&str> = groups_of(lint).collect();
+    let matches = |n: &str| n == lint.name || in_groups.contains(&n);
+    // rustc `insert_spec`
+    let insert = |spec: &mut Resolved, level: Level, expect: Option<AttrKey>, is_group: bool, name: &str| {
+        // a deny inside a forbid is ignored; any other lowering of a forbid is an error that
+        // leaves it (or a future-compatibility warning for a forbidden group, which applies)
+        if level == Level::Deny && spec.level == Level::Forbid { return; }
+        // the lint cannot be expected: it would silence itself
+        if expect.is_some() && lint.name == "unfulfilled_lint_expectations" { return; }
+        if level != Level::Forbid && spec.level == Level::Forbid && !spec.forbid_from_group { return; }
+        spec.level = level;
+        spec.expect = expect;
+        spec.forbid_from_group = level == Level::Forbid && is_group;
+        spec.source = Some(name.to_string());
+    };
     // the command line's levels (`-A unused`, `-D warnings`) come below every attribute
     for (l, n) in cmdline_levels() {
-        if n == lint.name || lint.groups.contains(&n.as_str()) {
-            if !forbidden { level = *l; forbidden = *l == Level::Forbid; }
+        let n = current_name(n);
+        if matches(n) {
+            insert(&mut spec, *l, None, n != lint.name, n);
         } else if n == "warnings" && !forbid_warnings {
             warnings = Some(*l);
             forbid_warnings = *l == Level::Forbid;
         }
     }
-    for (file, attrs) in scopes.iter().rev() {
+    'outer: for (file, attrs) in scopes.iter().rev() {
         for a in attrs {
-            let Some((l, names)) = level_attr(prog, *file, a) else { continue };
-            for n in &names {
-                if n == lint.name || lint.groups.contains(&n.as_str()) {
-                    if !forbidden { level = l; forbidden = l == Level::Forbid; }
+            if until == Some((*file, a.toks.lo)) { break 'outer; }
+            let Some(la) = parse_level_attr(prog, *file, a) else { continue };
+            for (idx, (name, _)) in la.names.iter().enumerate() {
+                let n = current_name(name);
+                if matches(n) {
+                    let key = if la.expect { Some((*file, a.toks.lo, idx as u32)) } else { None };
+                    insert(&mut spec, la.level, key, n != lint.name, n);
                 } else if n == "warnings" && !forbid_warnings {
-                    warnings = Some(l);
-                    forbid_warnings = l == Level::Forbid;
+                    warnings = Some(la.level);
+                    forbid_warnings = la.level == Level::Forbid;
                 }
             }
         }
     }
-    match (level, warnings) {
-        (Level::Warn, Some(w)) => w,
-        (l, _) => l,
+    // `-D warnings` / `forbid(warnings)` raise the lints that would only warn (but for the few
+    // that opt out)
+    if let (Level::Warn, Some(w)) = (spec.level, warnings) {
+        if !matches!(lint.name, "forbidden_lint_groups" | "linker_messages") {
+            spec.level = w;
+            spec.forbid_from_group = w == Level::Forbid;
+        }
     }
+    spec
+}
+
+static FULFILLED: Mutex<Vec<AttrKey>> = Mutex::new(Vec::new());
+
+/// The expectations (`#[expect(..)]` names) a lint was reported under.
+pub fn fulfilled_expectations() -> Vec<AttrKey> {
+    std::mem::take(&mut *FULFILLED.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// The lint levels of the command line, from `MAKEPAD_RUN_LINT_FLAGS` (rustc's `-A/-W/-D/-F`
@@ -212,8 +297,12 @@ pub fn emit(prog: &Program, def: DefId, lint: &Lint, file: u32, pos: u32, msg: &
 /// `emit` under the attributes `inner` of a node inside `def`'s body.
 pub fn emit_in(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
     if !enabled() { return; }
-    let level = level_in(prog, def, inner, lint);
-    if level == Level::Allow { return; }
+    let spec = resolve(prog, def, inner, lint, None);
+    let level = spec.level;
+    if level == Level::Allow {
+        if let Some(k) = spec.expect { FULFILLED.lock().unwrap_or_else(|e| e.into_inner()).push(k); }
+        return;
+    }
     let (l, c) = prog.files[file as usize].line_col(pos);
     let kind = if level >= Level::Deny { "error" } else { "warning" };
     let line = format!("{}:{}:{}: {}: {} [{}]", prog.file_paths[file as usize], l, c, kind, msg, lint.name);

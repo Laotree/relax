@@ -305,6 +305,7 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
     let mut resolved: Vec<(u32, String, u32)> = Vec::new();
     for (si, sc) in scopes.iter().enumerate() {
         let _ = si;
+        if sc.module == u32::MAX { continue; }
         let toks = &tokens[&sc.file];
         let md = &prog.mods[sc.module as usize];
         let normal = md.normal;
