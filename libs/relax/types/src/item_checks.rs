@@ -451,3 +451,136 @@ pub fn union_fields(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
     }
     Vec::new()
 }
+
+/// rustc_passes check_attr.rs `check_repr` (and the packed/align checks of check/check.rs):
+/// the `#[repr(..)]` hints of an item against its kind and against each other.
+pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    use crate::ast::ItemKind;
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    let ast = &pf.ast;
+    let p = prog.src(def.file);
+    let item = ast.item(def.item);
+    let mut errors = Vec::new();
+    let mut err = |pos: u32, msg: String| errors.push(prog.record_error(def.file, pos, "typeck", msg));
+    const INTS: &[&[u8]] = &[b"u8", b"u16", b"u32", b"u64", b"u128", b"usize", b"i8", b"i16", b"i32", b"i64", b"i128", b"isize"];
+    let (is_struct, is_enum, is_union) = (matches!(item.kind, ItemKind::Struct(_)), matches!(item.kind, ItemKind::Enum(_)), matches!(item.kind, ItemKind::Union(_)));
+    let mut ints: Vec<Vec<u8>> = Vec::new();
+    let (mut c, mut transparent, mut packed, mut aligned, mut other) = (false, false, Vec::<u32>::new(), false, false);
+    let mut first_pos = item.lo;
+    for a in ast.list(item.attrs) {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        if hi <= lo || crate::cfg::tok_str(p, lo) != b"repr" { continue; }
+        let pos = p.tok(lo).lo;
+        first_pos = pos;
+        if hi < lo + 3 || crate::cfg::tok_str(p, lo + 1) != b"(" {
+            err(pos, "E0539: malformed `repr` attribute input".to_string());
+            continue;
+        }
+        let mut i = lo + 2;
+        while i < hi {
+            let name = crate::cfg::tok_str(p, i);
+            if name == b")" { break; }
+            if name == b"," { i += 1; continue; }
+            let hpos = p.tok(i).lo;
+            i += 1;
+            // the hint's argument: `(..)` or `= ..`
+            let mut args: Vec<&[u8]> = Vec::new();
+            let mut assign = false;
+            if i < hi && crate::cfg::tok_str(p, i) == b"(" {
+                i += 1;
+                while i < hi && crate::cfg::tok_str(p, i) != b")" { args.push(crate::cfg::tok_str(p, i)); i += 1; }
+                i += 1;
+            } else if i < hi && crate::cfg::tok_str(p, i) == b"=" {
+                assign = true;
+                i += 2;
+            }
+            match name {
+                b"C" => { c = true; if !(is_struct || is_enum || is_union) { err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string()); } }
+                b"transparent" => {
+                    transparent = true;
+                    if !(is_struct || is_enum || is_union) { err(hpos, "E0517: attribute should be applied to a struct, enum, or union".to_string()); }
+                }
+                b"packed" => {
+                    packed.push(args.first().and_then(|a| std::str::from_utf8(a).ok()).and_then(|a| a.parse().ok()).unwrap_or(1));
+                    if !(is_struct || is_union) { err(hpos, "E0517: attribute should be applied to a struct or union".to_string()); }
+                }
+                b"align" => {
+                    aligned = true;
+                    if assign {
+                        err(hpos, "E0693: incorrect `repr(align)` attribute format".to_string());
+                    } else if args.len() == 1 {
+                        let t = args[0];
+                        match std::str::from_utf8(t).ok().filter(|s| crate::const_fold::int_suffix(s).is_none()).and_then(|s| crate::const_fold::parse_int_lit(s)).map(|v| v as u128) {
+                            None => err(hpos, "E0589: invalid `repr(align)` attribute: not an unsuffixed integer".to_string()),
+                            Some(v) if v == 0 || !v.is_power_of_two() => err(hpos, "E0589: invalid `repr(align)` attribute: not a power of two".to_string()),
+                            Some(v) if v > (1 << 29) => err(hpos, "E0589: invalid `repr(align)` attribute: larger than 2^29".to_string()),
+                            _ => {}
+                        }
+                    }
+                }
+                n if INTS.contains(&n) => {
+                    if !ints.iter().any(|x| x == n) { ints.push(n.to_vec()); }
+                    if !is_enum { err(hpos, "E0517: attribute should be applied to an enum".to_string()); }
+                }
+                b"Rust" | b"simd" => other = other || name == b"simd",
+                _ => {}
+            }
+        }
+    }
+    let _ = other;
+    if transparent && (c || !packed.is_empty() || aligned || !ints.is_empty()) {
+        err(first_pos, "E0692: transparent struct cannot have other repr hints".to_string());
+    }
+    if transparent && is_enum {
+        if let ItemKind::Enum(r) = item.kind {
+            let n = ast.list(ast.row(r).variants).len();
+            if n != 1 { err(item.name.lo, format!("E0731: transparent enum needs exactly one variant, but has {}", n)); }
+        }
+    }
+    if ints.len() > 1 { err(first_pos, "E0566: conflicting representation hints".to_string()); }
+    // `repr(C, u64)` on a fieldless enum
+    if c && !ints.is_empty() && is_enum {
+        if let Some(adt) = tcx.adts.get(&d) {
+            if adt.variants.iter().all(|v| v.fields.is_empty()) { err(first_pos, "E0566: conflicting representation hints".to_string()); }
+        }
+    }
+    if !packed.is_empty() && aligned { err(first_pos, "E0587: type has conflicting packed and align representation hints".to_string()); }
+    if packed.len() > 1 && packed.iter().any(|x| *x != packed[0]) { err(first_pos, "E0634: type has conflicting packed representation hints".to_string()); }
+    // a packed type holds no `repr(align)` type, however deep
+    if !packed.is_empty() && (is_struct || is_union) {
+        fn holds_align(tcx: &Tcx, t: TyId, seen: &mut Vec<DefId>, depth: u32) -> bool {
+            if depth > 16 { return false; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Adt(d, args, _) => {
+                    if seen.contains(&d) { return false; }
+                    seen.push(d);
+                    let Some(a) = tcx.adts.get(&d) else { return false };
+                    if a.repr_align > 0 { return true; }
+                    let args = tcx.tys.list(args).to_vec();
+                    a.variants.iter().any(|v| v.fields.iter().any(|f| holds_align(tcx, tcx.tys.subst(f.ty, &args), seen, depth + 1)))
+                }
+                TyKind::Tuple(l) => tcx.tys.list(l).iter().any(|&x| holds_align(tcx, x, seen, depth + 1)),
+                TyKind::Array(e, _) => holds_align(tcx, e, seen, depth + 1),
+                _ => false,
+            }
+        }
+        if let Some(adt) = tcx.adts.get(&d) {
+            let mut seen = vec![d];
+            if adt.variants.iter().any(|v| v.fields.iter().any(|f| holds_align(tcx, f.ty, &mut seen, 0))) {
+                err(item.name.lo, "E0588: packed type cannot transitively contain a `#[repr(align)]` type".to_string());
+            }
+        }
+    }
+    // a variant takes no repr
+    if let ItemKind::Enum(r) = item.kind {
+        for v in ast.list(ast.row(r).variants) {
+            for a in ast.list(v.attrs) {
+                if a.toks.hi > a.toks.lo && crate::cfg::tok_str(p, a.toks.lo as usize) == b"repr" {
+                    err(p.tok(a.toks.lo as usize).lo, "E0517: attribute should be applied to an enum".to_string());
+                }
+            }
+        }
+    }
+    errors
+}

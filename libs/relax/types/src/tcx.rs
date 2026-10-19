@@ -1539,6 +1539,7 @@ impl Tcx {
         errors.extend_from_slice(self.signature_errors(prog, did));
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
+            errors.extend(crate::item_checks::repr_checks(prog, self, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
         }
         // predicates_of: the bounds and where-clauses of every item are lowered, used or not
