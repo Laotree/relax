@@ -2021,6 +2021,10 @@ fn first_of(nodes: &[MNode]) -> (Vec<Follow>, bool) {
 }
 
 fn follow_ok(frag: Frag, fol: &Follow, edition: u16) -> bool {
+    // (a fragment follower is judged by its first tokens; only `tt` starts with anything)
+    if let Follow::Frag(f) = fol {
+        return !(*f == Frag::Tt && !matches!(frag, Frag::Ident | Frag::Tt | Frag::Item | Frag::Lifetime | Frag::Literal | Frag::Meta | Frag::Block));
+    }
     let tok_in = |set: &[&str]| matches!(fol, Follow::Tok(t) if set.contains(&t.as_str()));
     match frag {
         Frag::Expr | Frag::Stmt => matches!(fol, Follow::End) || tok_in(&["=>", ",", ";"]),
@@ -2029,12 +2033,12 @@ fn follow_ok(frag: Frag, fol: &Follow, edition: u16) -> bool {
         Frag::PatParam => matches!(fol, Follow::End) || tok_in(&["=>", ",", "=", "|", "if", "in"]),
         Frag::Path | Frag::Ty => {
             matches!(fol, Follow::End | Follow::Frag(Frag::Block)) || matches!(fol, Follow::Open(o) if o == "{" || o == "[")
-                || tok_in(&["{", "[", "=>", ",", ">", "=", ":", ";", "|", "as", "where"])
+                || tok_in(&["{", "[", "=>", ",", ">", "=", ":", ";", "|", "as", "where", ">>", ">=", ">>="])
         }
         Frag::Vis => match fol {
             Follow::End | Follow::Open(_) => true,
             Follow::Tok(t) => t != "priv" && (t == "," || t.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_' || "&*!<:".contains(c)) || t == "::"),
-            Follow::Frag(f) => matches!(f, Frag::Ident | Frag::Ty | Frag::Path | Frag::Lifetime | Frag::Literal | Frag::Block | Frag::Item | Frag::Tt | Frag::Meta | Frag::Vis | Frag::Expr | Frag::Pat | Frag::PatParam | Frag::Stmt),
+            Follow::Frag(_) => true,
         },
         _ => true,
     }
@@ -2064,8 +2068,10 @@ fn check_seq(nodes: &[MNode], after: &[Follow], edition: u16) -> Result<(), Stri
                 }
             }
             MNode::Group(_, _, inner) => check_seq(inner, &[Follow::End], edition)?,
-            MNode::Rep(inner, sep, _) => {
+            MNode::Rep(inner, sep, op) => {
+                // (`?` repeats at most once: nothing of it follows itself)
                 let mut inner_after: Vec<Follow> = match sep {
+                    _ if *op == b'?' => Vec::new(),
                     Some(t) => vec![Follow::Tok(t.text.clone())],
                     None => first_of(inner).0,
                 };

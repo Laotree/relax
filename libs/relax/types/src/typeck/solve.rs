@@ -104,6 +104,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         cast_checks: Vec::new(),
         pat_nest: 0,
         bind_mode: 0,
+        pat_depth: 0,
         pat_path_pre: None,
         pending_captures: Vec::new(),
         deferred_call_resolutions: Vec::new(),

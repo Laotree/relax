@@ -424,10 +424,25 @@ pub fn keyword(s: &[u8], edition: u16) -> Option<T> {
     Some(k)
 }
 
+/// The diagnostic validation of the literals and identifiers of a written source file's tokens
+/// (rustc_parse's lexer cooking): `makepad check` only. Macro text lexed on the side is not held to it.
+pub fn validate_file(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), LexError> {
+    if !crate::validate::enabled() {
+        return Ok(());
+    }
+    crate::validate::validate(src, toks, edition).map_err(|(pos, msg)| LexError { pos, msg })
+}
+
+/// Turns the diagnostic validation of literals and identifiers on (`makepad check`).
+pub fn set_validation(on: bool) {
+    crate::validate::set_enabled(on);
+}
+
 pub fn lex(src: &[u8], edition: u16, out: &mut Vec<Tok>) -> Result<(), LexError> {
     let start = out.len();
     scan::<false, false, true, LexError>(src, "", edition, out)?;
-    crate::validate::validate(src, &out[start..], edition).map_err(|(pos, msg)| LexError { pos, msg })
+    let _ = start;
+    Ok(())
 }
 
 fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(

@@ -3486,6 +3486,10 @@ impl Program {
                 Some(t) => t,
                 None => return false,
             };
+            // only a module or an enum can be glob-imported (`use Alias::*` is unresolved)
+            if !matches!(self.def(target).kind, DefKind::Mod | DefKind::Enum) {
+                return false;
+            }
             // a proc-macro crate exports only macros: a glob over it brings in no items
             let tk = self.def(target).krate;
             if tk != my_crate && self.crates[tk as usize].proc_macro {
@@ -3572,6 +3576,12 @@ impl Program {
         }
         if hidden(self, vdef) {
             vdef = None;
+        }
+        // a tuple struct with a field this module cannot see is imported without its constructor
+        if let Some(d) = vdef {
+            if self.def(d).krate == my_crate && self.tuple_ctor_hidden(d, module) {
+                vdef = None;
+            }
         }
         if tdef.is_none() && vdef.is_none() {
             return true;

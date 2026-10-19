@@ -254,20 +254,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `..` may appear once in a tuple / tuple struct / slice pattern (rustc_ast_passes
-    /// check_pat: "`..` can only be used once per ... pattern").
-    fn check_single_rest(&self, v: &[PatId], what: &str) -> PResult<()> {
-        let rests = v.iter().filter(|p| match self.ast.pat(**p) {
-            Pat::Rest => true,
-            Pat::Ident { sub: Some(s), .. } => matches!(self.ast.pat(*s), Pat::Rest),
-            _ => false,
-        }).count();
-        if rests > 1 {
-            return self.err(&format!("`..` can only be used once per {what} pattern"));
-        }
-        Ok(())
-    }
-
     fn ident_tok(&mut self) -> PResult<Ident> {
         match self.kind() {
             T::Ident | T::RawIdent => {
@@ -1443,7 +1429,15 @@ impl<'a> Parser<'a> {
                 break;
             }
             if self.kind() == T::Semi {
-                return self.err("expected item, found `;`");
+                // `m! { .. };` : a macro item in braces may be followed by its `;`
+                let after_mac = items.last().map_or(false, |id: &ItemId| matches!(self.ast.item(*id).kind, ItemKind::Mac(_) | ItemKind::MacroRules(_)))
+                    && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace;
+                // (generated text -- derive output -- is not held to the syntax of written code)
+                if !after_mac && (self.tok().lo as usize) < self.src.len() {
+                    return self.err("expected item, found `;`");
+                }
+                self.pos += 1;
+                continue;
             }
             let item_tok = self.pos;
             let attrs = self.outer_attrs()?;
@@ -2996,7 +2990,6 @@ impl<'a> Parser<'a> {
                     trailing = true;
                 }
                 self.expect(T::CloseParen)?;
-                self.check_single_rest(&v, "tuple")?;
                 if v.len() == 1 && !trailing {
                     Pat::Paren(v[0])
                 } else {
@@ -3013,7 +3006,6 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(T::CloseBracket)?;
-                self.check_single_rest(&v, "slice")?;
                 Pat::Slice(self.ast.push_list(v))
             }
             T::KwRef | T::KwMut => {
@@ -3072,8 +3064,7 @@ impl<'a> Parser<'a> {
                                     }
                                 }
                                 self.expect(T::CloseParen)?;
-                                self.check_single_rest(&v, "tuple struct")?;
-                                Pat::TupleStruct(path, self.ast.push_list(v))
+                                                Pat::TupleStruct(path, self.ast.push_list(v))
                             }
                             T::OpenBrace => self.struct_pat(path)?,
                             T::DotDot | T::DotDotEq | T::DotDotDot => {
@@ -3950,6 +3941,7 @@ pub fn parse_source<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8],
 pub fn parse_source_mode<'a>(sess: &'a std::sync::Arc<crate::Session>, src: &'a [u8], edition: u16, lazy: bool) -> Result<Parser<'a>, (u32, String)> {
     let mut toks = Vec::with_capacity(src.len() / 4);
     crate::lexer::lex(src, edition, &mut toks).map_err(|e| (e.pos, e.msg.to_string()))?;
+    crate::lexer::validate_file(src, &toks, edition).map_err(|e| (e.pos, e.msg.to_string()))?;
     let mut p = Parser::new(sess, src, toks, edition);
     p.lazy_bodies = lazy;
     p.parse_file().map_err(|e| (e.pos, e.msg))?;
@@ -4628,6 +4620,9 @@ pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: 
                 toks
             }
         }};
+        if !token_input {
+            crate::lexer::validate_file(&src, &toks, edition).map_err(|e| (SourceSpan { file: 0, lo: e.pos, hi: e.pos }, e.msg.to_string()))?;
+        }
         let mut p = Parser::new(sess, &src, toks, edition);
         if let Some(input) = input {
             p.ext = input.text.into_bytes().into();

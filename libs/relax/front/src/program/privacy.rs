@@ -21,7 +21,9 @@ impl Program {
         if !md.import_pub.contains_key(&(name, ns_type)) {
             let def = self.def(d);
             if def.krate == md.krate && def.scope == m && def.item.0 != u32::MAX {
-                if let Some(it) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)) {
+                if let Some((f, it)) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize).map(|it| (f, it))) {
+                    // (generated text -- macro output -- declares what its macro says it does)
+                    if it.lo >= f.src_len { return None; }
                     return self.vis_module(def.file, def.scope, &it.vis);
                 }
             }
@@ -211,10 +213,24 @@ impl Program {
         out
     }
 
+    /// A tuple struct whose constructor module `from` cannot call: a field of it is invisible there
+    /// (an import brings only the struct's type namespace then).
+    pub fn tuple_ctor_hidden(&self, d: DefId, from: u32) -> bool {
+        let def = self.def(d);
+        if def.kind != DefKind::Struct || def.item.0 == u32::MAX {
+            return false;
+        }
+        let Some(f) = self.files.get(def.file as usize) else { return false };
+        let Some(it) = f.ast.items.get(def.item.0 as usize) else { return false };
+        let Some(st) = f.ast.as_struct(&it.kind) else { return false };
+        let VariantData::Tuple(l) = st.data else { return false };
+        f.ast.list(l).iter().any(|fd| !self.vis_visible(self.vis_module(def.file, def.scope, &fd.vis), from))
+    }
+
     /// `use self::*;` / `use crate::m::*;` inside `m`: a module cannot glob-import itself.
     fn glob_of_own_module(&self, im: &Import, segs: &[(SegKind, Sym)], edition: u16) -> bool {
         match self.resolve_mod_path(im.module, im.global, segs, edition < 2018, true) {
-            Some(t) => self.def(t).kind == DefKind::Mod && self.def(t).sub == self.mods[im.module as usize].normal,
+            Some(t) => self.mods[im.module as usize].lexical_parent.is_none() && self.def(t).kind == DefKind::Mod && self.def(t).sub == self.mods[im.module as usize].normal,
             None => false,
         }
     }
@@ -223,7 +239,8 @@ impl Program {
     pub fn def_item_vis(&self, d: DefId) -> BindVis {
         let def = self.def(d);
         if def.item.0 != u32::MAX {
-            if let Some(it) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)) {
+            if let Some((f, it)) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize).map(|it| (f, it))) {
+                if it.lo >= f.src_len { return None; }
                 return self.vis_module(def.file, def.scope, &it.vis);
             }
         }

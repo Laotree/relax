@@ -43,6 +43,17 @@ fn char_at(src: &[u8], i: usize) -> Option<char> {
     std::str::from_utf8(src.get(i..i + n)?).ok()?.chars().next()
 }
 
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Literal validation is a diagnostic: `makepad check` turns it on; a run never pays for it.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn enabled() -> bool {
+    ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Validates the tokens `toks[from..]` of `src`; the first error is returned.
 pub fn validate(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), VErr> {
     for (k, t) in toks.iter().enumerate() {

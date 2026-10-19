@@ -147,11 +147,11 @@ impl Program {
                 }
                 // `#[name = value]`: the value is a literal (a macro call only where it expands)
                 if f.tok(i).kind == T::Eq {
-                    if let Some(m) = attr_value_error(f, i + 1, hi, ai < n_root && matches!(segs[0], "crate_name" | "crate_type")) {
+                    if let Some(m) = attr_value_error(f, i + 1, if first_i != lo { hi - 1 } else { hi }, ai < n_root && matches!(segs[0], "crate_name" | "crate_type")) {
                         out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", m));
                     }
                 } else if matches!(f.tok(i).kind, T::OpenParen) && is_builtin_attr(segs[0]) && segs.len() == 1 && !matches!(segs[0], "cfg_attr" | "derive" | "macro_use" | "test" | "bench" | "rustc_on_unimplemented" | "link") {
-                    if let Some(m) = attr_list_error(f, i + 1, hi) {
+                    if let Some(m) = attr_list_error(f, i + 1, if first_i != lo { hi - 1 } else { hi }) {
                         out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", m));
                     }
                 }

@@ -2083,6 +2083,17 @@ impl<'a> Fcx<'a> {
                 }
             }
             Pat::TupleStruct(_, l) | Pat::Tuple(l) | Pat::Slice(l) => {
+                // `..` may appear once (rustc_ast_passes check_pat)
+                let rests = ast.list(*l).iter().filter(|c| match ast.pat(**c) {
+                    Pat::Rest => true,
+                    Pat::Ident { sub: Some(s), .. } => matches!(ast.pat(*s), Pat::Rest),
+                    _ => false,
+                }).count();
+                if report && rests > 1 {
+                    let what = match ast.pat(p) { Pat::Tuple(_) => "tuple", Pat::Slice(_) => "slice", _ => "tuple struct" };
+                    let lo = ast.list(*l).iter().find_map(|c| if let Pat::Ident { name, .. } = ast.pat(*c) { Some(name.lo) } else { None }).unwrap_or(0);
+                    self.err(lo, format!("`..` can only be used once per {what} pattern"));
+                }
                 for &c in ast.list(*l) {
                     let more = self.pat_bindings(c, report);
                     add(self, &mut out, more);
@@ -4743,6 +4754,8 @@ impl<'a> Fcx<'a> {
                             None => self.loops[i].break_ty = Some(bt),
                         }
                     }
+                } else if let Some((_, _)) = l {
+                    self.err(lo, format!("E0426: use of undeclared label `{}`", self.text(label.get().unwrap())));
                 } else {
                     self.err(lo, "E0268: `break` outside of a loop or labeled block".to_string());
                 }
@@ -4751,6 +4764,13 @@ impl<'a> Fcx<'a> {
             ExprKind::Continue(label) => {
                 if self.in_loop_condition && label.is_none() {
                     self.err(lo, "E0590: `break` or `continue` with no label in the condition of a `while` loop".to_string());
+                }
+                let l = label.map(|x| self.sym_lifetime(x));
+                if self.loop_index(l).is_none() {
+                    match label.get() {
+                        Some(x) => self.err(lo, format!("E0426: use of undeclared label `{}`", self.text(x))),
+                        None => self.err(lo, "E0268: `continue` outside of a loop".to_string()),
+                    }
                 }
                 self.tcx.tys.never
             }
@@ -5642,7 +5662,7 @@ impl<'a> Fcx<'a> {
     /// E0624: an item of an inherent impl is private to the impl's module.
     fn check_assoc_privacy(&mut self, item: DefId, pos: u32) {
         let def = self.prog.def(item);
-        if self.prog.def(def.parent).kind != DefKind::Impl {
+        if self.prog.def(def.parent).kind != DefKind::Impl || !self.prog.own_crates.get(def.krate as usize).copied().unwrap_or(false) {
             return;
         }
         let vis = self.prog.def_item_vis(item);
@@ -6138,7 +6158,6 @@ impl<'a> Fcx<'a> {
             self.known_method_args = Some(pick.args);
             return self.check_trait_method_call(e, item, imp, self_ty, derefs, turbofish, args, lo, method_expected);
         }
-        self.check_assoc_privacy(item, lo);
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
         let indices = self.tcx.generic_indices_of(self.prog, imp);
         let impl_full = pick.args[..indices.types_consts.len() + indices.lifetimes.len()].to_vec();
