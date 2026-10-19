@@ -549,7 +549,11 @@ impl<'a> Visitor<'a> for L2<'a> {
                 self.active = act;
                 self.inside_call_args = saved;
             }
-            ExprKind::ConstBlock(_) => {}
+            ExprKind::ConstBlock(_) => {
+                let act = std::mem::replace(&mut self.active, false);
+                ast_visit::walk_expr(self, e);
+                self.active = act;
+            }
             ExprKind::Return(x) => {
                 if let Some(x) = x.get() { self.lint_addr_of_local(x); }
                 ast_visit::walk_expr(self, e);
