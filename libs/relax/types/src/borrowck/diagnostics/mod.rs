@@ -36,10 +36,12 @@ pub struct Diag {
     pub labels: Vec<(Span, String, bool)>,
     pub notes: Vec<String>,
     pub helps: Vec<String>,
+    /// accepted only in relaxed Rust (field views / extended two-phase borrows)
+    pub fv_only: bool,
 }
 impl Diag {
     pub fn new(code: &'static str, span: Span, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), span, labels: Vec::new(), notes: Vec::new(), helps: Vec::new() }
+        Self { code, message: message.into(), span, labels: Vec::new(), notes: Vec::new(), helps: Vec::new(), fv_only: false }
     }
     pub fn span_label(&mut self, span: Span, text: impl Into<String>) -> &mut Self {
         let primary = span == self.span;
@@ -102,8 +104,71 @@ pub fn render_errors(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<BorrowE
     out
 }
 
+/// The relaxed-Rust acceptances of one body (`makepad check`'s "accepted only in relaxed Rust"
+/// report): the conflicts rustc would reject.
+pub fn render_fv_only(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<BorrowError> {
+    result.fv_only.iter().map(|e| capture(cx.prog, cx.owner, &render_error(cx, e))).collect()
+}
+
+/// The export records (source text of the field-level borrows) of one body, for
+/// `borrowck::export::rewrite`.
+pub fn render_fv_records(cx: &DiagCx<'_>, result: &MirBorrowckResult) -> Vec<super::export::FvRecord> {
+    let sp = |s: Span| super::bir::Span { lo: s.lo, hi: s.hi };
+    result.fv_records.iter().map(|r| super::export::FvRecord {
+        file: r.span.file, span: sp(r.span),
+        place: r.place.as_ref().and_then(|p| cx.describe_place(p)).unwrap_or_default(),
+        default: r.default, access: sp(r.access), hoist: r.hoist.as_ref().map(|h| h.iter().map(|s| sp(*s)).collect()),
+    }).collect()
+}
+
+/// What the callees of a narrowed borrow touch: "`m` uses mutably `a` and shared `b`".
+fn fv_explain(cx: &DiagCx<'_>, why: &[super::borrowck_errors::FvWho]) -> String {
+    let mut out = Vec::new();
+    for w in why {
+        let who = match (w.callee, w.is_closure) {
+            (Some(d), _) => format!("`{}`", cx.prog.name(d)),
+            (None, true) => "the closure".to_string(),
+            (None, false) => "the call".to_string(),
+        };
+        let (mut muts, mut refs) = (Vec::new(), Vec::new());
+        for (q, m) in &w.parts {
+            let d = cx.describe_place(q).unwrap_or_else(|| "value".to_string());
+            if *m { muts.push(format!("`{d}`")); } else { refs.push(format!("`{d}`")); }
+        }
+        let mut s = format!("{who} uses");
+        if !muts.is_empty() { s.push_str(&format!(" mutably {}", muts.join(", "))); }
+        if !refs.is_empty() {
+            if !muts.is_empty() { s.push_str(" and"); }
+            s.push_str(&format!(" shared {}", refs.join(", ")));
+        }
+        if muts.is_empty() && refs.is_empty() { s.push_str(" nothing of it"); }
+        out.push(s);
+    }
+    out.join("; ")
+}
+
 /// One access/move/mutability error with its rustc message and labels.
 pub fn render_error(cx: &DiagCx<'_>, error: &BorrowckError) -> Diag {
+    let mut d = render_error_plain(cx, error);
+    if let Some(note) = &error.fv {
+        use super::borrowck_errors::FvNote::*;
+        match &**note {
+            TwoPhase { reserved } => {
+                d.fv_only = true;
+                d.labels.push((*reserved, "reserved here for the call, not used before it".to_string(), false));
+                d.note("accepted with extended two-phase borrows (relaxed Rust): the reserved borrow is only used by the call, after this");
+            }
+            Narrowed { why } => {
+                d.fv_only = true;
+                d.note(format!("accepted with field views (relaxed Rust): {}", fv_explain(cx, why)));
+            }
+            Remaining { why } => { d.note(format!("field views: {}", fv_explain(cx, why))); }
+        }
+    }
+    d
+}
+
+fn render_error_plain(cx: &DiagCx<'_>, error: &BorrowckError) -> Diag {
     use super::borrowck_errors::ErrorKind::*;
     match (&error.detail, error.kind) {
         (Detail::Moved { .. }, Moved | Uninitialized) => conflict_errors::report_use_of_moved_or_uninitialized(cx, error),
@@ -128,7 +193,7 @@ pub fn capture(prog: &Program, owner: DefId, d: &Diag) -> BorrowError {
         code: d.code, message: d.message.clone(), file: prog.file_paths[d.span.file as usize].clone(),
         line: primary.line, col: primary.col, end_line: primary.end_line, end_col: primary.end_col,
         labels: labels.into_iter().map(|(s, t, p)| snapshot(prog, s, t, p)).collect(),
-        notes: d.notes.clone(), helps: d.helps.clone(), fv_only: false,
+        notes: d.notes.clone(), helps: d.helps.clone(), fv_only: d.fv_only,
     }
 }
 

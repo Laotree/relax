@@ -1,5 +1,6 @@
 // ported from N:rustc_borrowck/src/lib.rs @8d1a764 (MirBorrowckCtxt)
 use super::borrow_set::{BorrowData, BorrowSet, LocalsStateAtExit};
+use super::field_views::FieldViews;
 use super::borrowck_errors::{AccessKind, BorrowInfo, BorrowckError, Detail, ErrorKind, InitAction, MoveSite};
 use super::dataflow::{Borrowck, BorrowckDomain};
 use super::mir_nll::MirRegionResult;
@@ -25,6 +26,10 @@ pub struct MirBorrowckResult {
     pub unsupported: Vec<&'static str>,
     pub region_errors: Vec<super::region_infer::RegionErrorKind>,
     pub tainted_by_errors: bool,
+    /// Relaxed crates: conflicts accepted only with field views / extended two-phase borrows
+    /// (rustc would reject them), and the records the export to rustc rewrites.
+    pub fv_only: Vec<BorrowckError>,
+    pub fv_records: Vec<super::field_views::FvRecordRaw>,
 }
 impl MirBorrowckResult {
     pub fn accepted(&self) -> bool { self.errors.is_empty() && self.unsupported.is_empty() && self.region_errors.is_empty() && !self.tainted_by_errors }
@@ -34,12 +39,17 @@ impl MirBorrowckResult {
 /// MoveData is the same body-owned, Copy-filtered arena used by MIR type checking.
 /// C-NLL5 supplies it and the region input; this entry never invokes BIR borrowck.
 pub fn mir_borrowck(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
-    let nll = check_with_scopes(prog, tcx, body, regions, moves);
+    mir_borrowck_fv(tcx, prog, body, regions, moves, None)
+}
+
+/// `mir_borrowck` with relaxed-Rust field views (field_views/check_hook.rs).
+pub fn mir_borrowck_fv(tcx: &Tcx, prog: &Program, body: &Body, regions: &mut MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>) -> MirBorrowckResult {
+    let nll = check_with_scopes_fv(prog, tcx, body, regions, moves, fv);
     if !nll.unsupported.is_empty() { return nll; }
     let verify = nll.accepted() && verify_polonius_sample();
     if nll.accepted() && !verify { return nll; }
     *regions = compute_polonius_regions(tcx, prog, body, regions, moves);
-    let polonius = check_with_scopes(prog, tcx, body, regions, moves);
+    let polonius = check_with_scopes_fv(prog, tcx, body, regions, moves, fv);
     if verify { assert!(polonius.accepted(), "Polonius must accept NLL-accepted MIR: {polonius:?}"); }
     polonius
 }
@@ -65,10 +75,15 @@ fn compute_polonius_regions(tcx: &Tcx, prog: &Program, body: &Body, regions: &Mi
         polonius: regions.polonius.clone(), nested: regions.nested, tainted_by_errors: regions.tainted_by_errors }
 }
 
+#[cfg(test)]
 pub(super) fn check_with_scopes(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData) -> MirBorrowckResult {
+    check_with_scopes_fv(prog, tcx, body, regions, moves, None)
+}
+fn check_with_scopes_fv(prog: &Program, tcx: &Tcx, body: &Body, regions: &MirRegionResult, moves: &MoveData, fv: Option<&FieldViews<'_>>) -> MirBorrowckResult {
     assert!(regions.locations.matches(body), "region locations belong to another MIR layout");
     let mut result = MirBorrowckResult { errors: vec![], used_mut: BitSet::new_empty(body.local_decls.len()),
-        unsupported: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors };
+        unsupported: vec![], region_errors: regions.regioncx.errors.clone(), tainted_by_errors: regions.tainted_by_errors,
+        fv_only: vec![], fv_records: vec![] };
     check_supported(tcx, body, &mut result.unsupported);
     if !result.unsupported.is_empty() { return result; }
     let invalidated = matches!(body.source.kind, BodyKind::Fn | BodyKind::Closure(_) | BodyKind::Shim(_));
@@ -78,7 +93,8 @@ pub(super) fn check_with_scopes(prog: &Program, tcx: &Tcx, body: &Body, regions:
     let mut cursor = results.cursor();
     let mut cx = MirBorrowckCtxt { tcx, body, moves, borrows: &borrows, cfg: CheckCfg::new(body), result,
         access_errors: vec![], reservation_errors: vec![], uninitialized_errors: BitSet::new_empty(body.local_decls.len()),
-        move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![] };
+        move_errors: vec![], buffered_move_errors: vec![], buffered_mut_errors: vec![],
+        fv: fv.map(|v| fv_hook::FvRun::new(v, body, &borrows)), fv_own: None };
     for b in cx.cfg.reverse_postorder.clone() {
         let block = &body.basic_blocks[b];
         let block_id = BasicBlock(b as u32);
@@ -185,6 +201,9 @@ struct MirBorrowckCtxt<'a> {
     buffered_move_errors: Vec<(Vec<usize>, Place, BorrowckError)>,
     /// diagnostics/mod.rs:164 buffered_mut_errors: (binding span, index into errors, count).
     buffered_mut_errors: Vec<(Span, usize, usize)>,
+    /// Relaxed-Rust field views (field_views/check_hook.rs) and the loan the access being
+    /// checked creates (its parts are narrowed by the callee's summary).
+    fv: Option<fv_hook::FvRun<'a>>, fv_own: Option<usize>,
 }
 impl MirBorrowckCtxt<'_> {
     fn error_with(&mut self, kind: ErrorKind, span: Span, detail: Detail) {
@@ -263,7 +282,9 @@ impl MirBorrowckCtxt<'_> {
                     BorrowKind::Mut { kind: MutBorrowKind::TwoPhaseBorrow } => (Deep, Reservation(WriteKind::MutableBorrow(*kind))),
                     BorrowKind::Mut { .. } => (Deep, Write(WriteKind::MutableBorrow(*kind))),
                 };
+                self.fv_own = self.fv_own_loan(at, place);
                 self.access_place(place, depth, access, false, at, span, state);
+                self.fv_own = None;
                 let action = if *kind == BorrowKind::Fake(FakeBorrowKind::Shallow) { InitAction::MatchOn } else { InitAction::Borrow };
                 self.check_if_path_or_subpath_is_moved(place, action, at, span, state);
             }
@@ -314,8 +335,22 @@ impl MirBorrowckCtxt<'_> {
         let conflict = self.check_access_for_conflict(place, depth, access, at, span, state);
         if permission || conflict { self.access_errors.push((place.clone(), span)); }
     }
+    /// Whether `access` of `place` conflicts with the borrow `i` of `bplace`/`bkind`: the place
+    /// overlap and the access/borrow kind rules (rustc check_access_for_conflict's filter).
+    fn pair_conflicts(&self, place: &Place, depth: AccessDepth, access: ReadOrWrite, bplace: &Place, bkind: BorrowKind, i: usize, at: Location) -> bool {
+        if !borrow_conflicts_with_place(self.tcx, self.body, bplace, bkind, place, depth, PlaceConflictBias::Overlap) { return false; }
+        match (access, bkind) {
+            (Activation(_, activating), _) if i == activating => false,
+            (Read(_), BorrowKind::Shared | BorrowKind::Fake(_))
+            | (Read(ReadKind::Borrow(BorrowKind::Fake(FakeBorrowKind::Shallow))), BorrowKind::Mut { .. })
+            | (Reservation(_), BorrowKind::Shared | BorrowKind::Fake(_))
+            | (Write(WriteKind::Move), BorrowKind::Fake(FakeBorrowKind::Shallow)) => false,
+            (Read(_), BorrowKind::Mut { .. }) => is_active(|a, b| self.cfg.dominates(a, b), &self.borrows[i], at),
+            _ => true,
+        }
+    }
     fn check_access_for_conflict(&mut self, place: &Place, depth: AccessDepth, access: ReadOrWrite, at: Location, span: Span, state: BorrowckDomain<'_>) -> bool {
-        let mut conflict = None;
+        let mut candidates = vec![];
         each_borrow_involving_path(self.tcx, self.body, (depth, place), self.borrows,
             |i| state.borrows.contains(i), |i, borrow| {
                 match (access, borrow.kind) {
@@ -327,28 +362,44 @@ impl MirBorrowckCtxt<'_> {
                     (Read(_), BorrowKind::Mut { .. }) if !is_active(|a, b| self.cfg.dominates(a, b), borrow, at) => return ControlFlow::Continue(()),
                     _ => {}
                 }
-                conflict = Some(i); ControlFlow::Break(())
+                candidates.push(i);
+                // Without field views the first conflicting borrow is the error.
+                if self.fv.is_none() { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
             });
-        let Some(i) = conflict else { return false; };
-        let borrow = &self.borrows[i];
-        // diagnostics/conflict_errors.rs:1701,1766: E0505 and E0503 take their primary span
-        // from move_spans at the location (the statement, or the whole terminator), not
-        // from the operand; the access-error key above keeps the operand span.
-        let mut span = span;
-        let kind = match access {
-            Read(ReadKind::Copy) => { span = self.span_at(at); UseWhileMutablyBorrowed }
-            Read(ReadKind::Borrow(kind)) => self.conflicting_borrow_kind(kind, borrow),
-            Write(kind) | Reservation(kind) | Activation(kind, _) => match kind {
-                WriteKind::MutableBorrow(kind) => self.conflicting_borrow_kind(kind, borrow),
-                WriteKind::Move => { span = self.span_at(at); MoveWhileBorrowed }
-                WriteKind::Mutate | WriteKind::Replace => if matches!(borrow.kind, BorrowKind::Fake(_)) && self.immutable_section(&borrow.assigned_place) { MutateInGuard } else { AssignWhileBorrowed },
-                WriteKind::StorageDeadOrDrop => { self.lifetime_error(borrow, place, at, span); return true; }
-            },
-        };
-        if matches!(access, Reservation(_)) { self.reservation_errors.push(place.clone()); }
-        let detail = Detail::Conflict { place: place.clone(), access: access.access_kind(), location: at, borrow: BorrowInfo::from(borrow) };
-        self.error_with(kind, span, detail);
-        true
+        for i in candidates {
+            let borrow = &self.borrows[i];
+            // diagnostics/conflict_errors.rs:1701,1766: E0505 and E0503 take their primary span
+            // from move_spans at the location (the statement, or the whole terminator), not
+            // from the operand; the access-error key above keeps the operand span.
+            let mut span = span;
+            let kind = match access {
+                Read(ReadKind::Copy) => { span = self.span_at(at); UseWhileMutablyBorrowed }
+                Read(ReadKind::Borrow(kind)) => self.conflicting_borrow_kind(kind, borrow),
+                Write(kind) | Reservation(kind) | Activation(kind, _) => match kind {
+                    WriteKind::MutableBorrow(kind) => self.conflicting_borrow_kind(kind, borrow),
+                    WriteKind::Move => { span = self.span_at(at); MoveWhileBorrowed }
+                    WriteKind::Mutate | WriteKind::Replace => if matches!(borrow.kind, BorrowKind::Fake(_)) && self.immutable_section(&borrow.assigned_place) { MutateInGuard } else { AssignWhileBorrowed },
+                    WriteKind::StorageDeadOrDrop => { self.lifetime_error(borrow, place, at, span); return true; }
+                },
+            };
+            let detail = Detail::Conflict { place: place.clone(), access: access.access_kind(), location: at, borrow: BorrowInfo::from(borrow) };
+            // Relaxed Rust: the conflict may disappear under the callees' field views.
+            let mut error = BorrowckError::with(kind, span, detail);
+            if let Some(outcome) = self.fv_outcome(i, place, depth, access, at, span) {
+                error.fv = outcome.note.map(Box::new);
+                if let Some(record) = outcome.record { self.result.fv_records.push(record); }
+                if outcome.accepted {
+                    if self.fv.as_ref().is_some_and(|f| f.views.relaxed) {
+                        if !self.result.fv_only.contains(&error) { self.result.fv_only.push(error); }
+                        continue;
+                    }
+                }
+            }
+            if matches!(access, Reservation(_)) { self.reservation_errors.push(place.clone()); }
+            if !self.result.errors.contains(&error) { self.result.errors.push(error); }
+            return true;
+        }
+        false
     }
     fn immutable_section(&self, place: &Place) -> bool {
         let cause = self.body.basic_blocks.iter().flat_map(|b| &b.statements).filter_map(|s| match &s.kind {
@@ -815,3 +866,8 @@ fn check_promoted_moves(tcx: &Tcx, body: &Body, result: &mut MirBorrowckResult) 
         check_promoted_moves(tcx, promoted, result);
     }
 }
+
+// Relaxed-Rust field views and extended two-phase borrows (a child module: it extends the
+// private checker state).
+#[path = "field_views/check_hook.rs"]
+mod fv_hook;

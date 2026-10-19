@@ -109,13 +109,27 @@ impl From<&super::borrow_set::BorrowData> for BorrowInfo {
         Self { reserve_location: b.reserve_location, kind: b.kind, region: b.region, borrowed_place: b.borrowed_place.clone(), assigned_place: b.assigned_place.clone() }
     }
 }
+/// Why a conflict was accepted or narrowed by field views (relaxed Rust A1/A3): the callee or
+/// closure whose summary touches only some parts of the borrowed place.
+#[derive(Clone, Debug)]
+pub enum FvNote {
+    /// accepted with extended two-phase borrows: the borrow reserved here is only used by the call, after
+    TwoPhase { reserved: Span },
+    /// accepted with field views: what the borrows' callees use
+    Narrowed { why: Vec<FvWho> },
+    /// the conflict remains through field views: what the callees touch
+    Remaining { why: Vec<FvWho> },
+}
+#[derive(Clone, Debug)]
+pub struct FvWho { pub callee: Option<crate::program::DefId>, pub is_closure: bool, pub parts: Vec<(Place, bool)> }
+
 /// Equality is the error's identity for de-duplication: kind and primary span.
 #[derive(Clone, Debug)]
-pub struct BorrowckError { pub kind: ErrorKind, pub span: Span, pub detail: Detail }
+pub struct BorrowckError { pub kind: ErrorKind, pub span: Span, pub detail: Detail, pub fv: Option<Box<FvNote>> }
 impl PartialEq for BorrowckError { fn eq(&self, o: &Self) -> bool { self.kind == o.kind && self.span == o.span } }
 impl Eq for BorrowckError {}
 impl BorrowckError {
-    pub fn new(kind: ErrorKind, span: Span) -> Self { Self { kind, span, detail: Detail::None } }
-    pub fn with(kind: ErrorKind, span: Span, detail: Detail) -> Self { Self { kind, span, detail } }
+    pub fn new(kind: ErrorKind, span: Span) -> Self { Self { kind, span, detail: Detail::None, fv: None } }
+    pub fn with(kind: ErrorKind, span: Span, detail: Detail) -> Self { Self { kind, span, detail, fv: None } }
     pub fn code(&self) -> &'static str { self.kind.code() }
 }
