@@ -203,20 +203,23 @@ impl Tcx {
         errors
     }
 
-    /// check_type_alias_type_params_are_used: a type parameter the aliased type never mentions (E0091).
-    pub fn check_type_alias_params_used(&self, prog: &Program, d: DefId) -> Vec<String> {
+    /// The type a type alias is declared as, lowered afresh: its errors are the alias's own
+    /// (rustc `type_of` of every item), `alias_ty` caches the first lowering for users.
+    pub fn check_type_alias(&self, prog: &Program, d: DefId) -> Vec<String> {
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
         let ItemKind::TypeAlias(_) = ast.item(def.item).kind else { return Vec::new() };
         let Some(generics) = ast.kind_generics(&ast.item(def.item).kind) else { return Vec::new() };
-        if !ast.list(generics.params).iter().any(|p| matches!(p.kind, GenericParamKind::Type(..))) { return Vec::new(); }
         let state = crate::tcx::EvalState::new();
+        state.errors.replace(Some(Vec::new()));
         let cx = crate::tcx::EvalCx::new(prog, self, crate::tcx::TypingEnv::fully_monomorphized(prog), &state);
-        let ty = self.alias_ty(&cx, prog, d);
-        if self.tys.has_error(ty) { return Vec::new(); }
+        let ty = self.lower_alias_rhs(&cx, prog, d);
+        let mut errors = state.errors.take().unwrap_or_default();
+        if !errors.is_empty() || self.tys.has_error(ty) { return errors; }
+        // check_type_alias_type_params_are_used: a type parameter the aliased type never
+        // mentions (E0091)
         let indices = self.generic_indices_of(prog, d).clone();
         let used: HashSet<Parameter> = self.parameters_for_ty(&indices, ty, true).into_iter().collect();
-        let mut errors = Vec::new();
         for (index, p) in ast.list(generics.params).iter().enumerate() {
             if matches!(p.kind, GenericParamKind::Type(..)) && !used.contains(&(index as u32)) {
                 let name = prog.files[def.file as usize].text(p.name);

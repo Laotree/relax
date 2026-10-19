@@ -2204,6 +2204,28 @@ impl<'a> Fcx<'a> {
                 let (r, _) = self.resolve_value_path(path, p.0 | PAT_KEY, true);
                 self.b.pat_res.insert(p.0, r);
                 let fields = self.ctor_fields_with(r, expected, path.lo, Some(p.0 | PAT_KEY));
+                // check_pat_tuple_struct: the sub-patterns cover the fields exactly, or a `..`
+                // stands for the rest (E0023)
+                if let Res::Def(cd) = r {
+                    let ast = self.ast();
+                    let subs = ast.list(*v);
+                    let has_rest = subs.iter().any(|x| matches!(ast.pat(*x), Pat::Rest));
+                    let n = subs.len() - has_rest as usize;
+                    let tuple_ctor = match self.prog.def(cd).kind {
+                        DefKind::Variant => Some(("variant", self.prog.def(cd).parent, self.prog.def(cd).sub as usize)),
+                        DefKind::Struct => Some(("struct", cd, 0)),
+                        _ => None,
+                    };
+                    if let Some((what, adt, vi)) = tuple_ctor {
+                        if let Some(variant) = self.tcx.adts.get(&adt).and_then(|a| a.variants.get(vi)) {
+                            if variant.shape == 1 && !(if has_rest { n <= variant.fields.len() } else { n == variant.fields.len() }) {
+                                let want = variant.fields.len();
+                                let msg = format!("E0023: this pattern has {} field{}, but the corresponding tuple {} has {} field{}", n, if n == 1 { "" } else { "s" }, what, want, if want == 1 { "" } else { "s" });
+                                self.err(path.lo, msg);
+                            }
+                        }
+                    }
+                }
                 self.check_seq_pats(self.ast().list(*v), &fields);
             }
             Pat::Struct(path, fields, rest) => {

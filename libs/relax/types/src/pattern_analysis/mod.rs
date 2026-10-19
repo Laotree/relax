@@ -515,7 +515,7 @@ impl<'a> Cx<'a> {
         let before = self.const_errors.len();
         match v {
             Some(v) => self.structural_walk(v, t, pos, 0),
-            None => if matches!(self.kind(t), TyKind::Adt(..)) && !self.type_marked_structural(t) { self.not_structural(t, pos); },
+            None => self.structural_type_walk(t, pos, 0),
         }
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
         if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
@@ -524,6 +524,18 @@ impl<'a> Cx<'a> {
                 let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
                 if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
             }
+        }
+    }
+
+    /// Without a value to take apart: the constant's type down to its first ADTs (references,
+    /// slices, arrays, tuples hold values of their element types).
+    fn structural_type_walk(&mut self, t: TyId, pos: Option<u32>, depth: u32) {
+        if depth > 16 { return; }
+        match self.kind(t) {
+            TyKind::Adt(..) => if !self.type_marked_structural(t) { self.not_structural(t, pos) },
+            TyKind::Ref(_, i, _) | TyKind::Array(i, _) | TyKind::Slice(i) => { let i = self.reveal(i); self.structural_type_walk(i, pos, depth + 1) }
+            TyKind::Tuple(l) => for x in self.tcx.tys.list(l).to_vec() { self.structural_type_walk(x, pos, depth + 1) },
+            _ => {}
         }
     }
 

@@ -1535,6 +1535,11 @@ impl Tcx {
             for e in self.own_clauses_errors(prog, did) {
                 if !errors.contains(e) { errors.push(e.clone()); }
             }
+            if def.kind == DefKind::AssocTy {
+                for e in self.assoc_item_bounds_errors(prog, did) {
+                    if !errors.contains(&e) { errors.push(e); }
+                }
+            }
         }
         if def.kind == DefKind::Enum {
             errors.extend(self.adts[&did].check_discriminants(self, prog));
@@ -1545,7 +1550,7 @@ impl Tcx {
             if errors.is_empty() { errors.extend(self.check_type_defn_variances(prog, did)); }
         }
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
-            if errors.is_empty() { errors.extend(self.check_type_alias_params_used(prog, did)); }
+            for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
         }
         if def.kind == DefKind::Impl {
             if errors.is_empty() { errors.extend(self.check_impl_params_constrained(prog, did)); }
@@ -2717,6 +2722,19 @@ impl Tcx {
         result
     }
 
+    /// The type a type alias is declared as (not cached).
+    pub(crate) fn lower_alias_rhs(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> TyId {
+        let def = prog.def(d);
+        let module = self.item_module(prog, d);
+        let mut env = self.item_env(prog, d);
+        env.regions.enabled = true;
+        let ast = &prog.files[def.file as usize].ast;
+        match ast.as_alias(&ast.item(def.item).kind) {
+            Some(TypeAliasItem { ty: Some(t), .. }) => self.lower_ty(cx, prog, def.file, module, &env, *t),
+            _ => self.tys.error,
+        }
+    }
+
     pub fn alias_ty(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId) -> TyId {
         if let Some(t) = self.alias_tys.get(&(cx.typing_env, d)) {
             return t;
@@ -2729,13 +2747,7 @@ impl Tcx {
         let read0 = cx.state.impl_read.replace(false);
         let def = prog.def(d);
         let module = self.item_module(prog, d);
-        let mut env = self.item_env(prog, d);
-        env.regions.enabled = true;
-        let ast = &prog.files[def.file as usize].ast;
-        let t = match ast.as_alias(&ast.item(def.item).kind) {
-            Some(TypeAliasItem { ty: Some(t), .. }) => self.lower_ty(cx, prog, def.file, module, &env, *t),
-            _ => self.tys.error,
-        };
+        let t = self.lower_alias_rhs(cx, prog, d);
         cx.state.alias_inprog.borrow_mut().remove(&ik);
         let read = cx.state.impl_read.get();
         cx.state.impl_read.set(read0 || read);
