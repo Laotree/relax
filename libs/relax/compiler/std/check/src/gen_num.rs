@@ -282,6 +282,23 @@ fn gen_int(o: &mut String, t: &Int) {
     }
     let _ = writeln!(o, "    pub const fn wrapping_shl(self, rhs: u32) -> {n} {{ self.overflowing_shl(rhs).0 }}");
     let _ = writeln!(o, "    pub const fn wrapping_shr(self, rhs: u32) -> {n} {{ self.overflowing_shr(rhs).0 }}");
+    // rustc int_macros.rs / uint_macros.rs: wrapping_{div,rem}_euclid, unchecked_*, unbounded_sh*
+    let _ = writeln!(o, "    pub const fn wrapping_div_euclid(self, rhs: {n}) -> {n} {{ self.overflowing_div_euclid(rhs).0 }}");
+    let _ = writeln!(o, "    pub const fn wrapping_rem_euclid(self, rhs: {n}) -> {n} {{ self.overflowing_rem_euclid(rhs).0 }}");
+    for op in ["add", "sub", "mul"] {
+        let _ = writeln!(o, "    pub const unsafe fn unchecked_{op}(self, rhs: {n}) -> {n} {{ self.wrapping_{op}(rhs) }}");
+    }
+    if t.signed {
+        let _ = writeln!(o, "    pub const unsafe fn unchecked_neg(self) -> {n} {{ self.wrapping_neg() }}");
+    }
+    let _ = writeln!(o, "    pub const unsafe fn unchecked_shl(self, rhs: u32) -> {n} {{ self.wrapping_shl(rhs) }}");
+    let _ = writeln!(o, "    pub const unsafe fn unchecked_shr(self, rhs: u32) -> {n} {{ self.wrapping_shr(rhs) }}");
+    let _ = writeln!(o, "    pub const fn unbounded_shl(self, rhs: u32) -> {n} {{ if rhs < {n}::BITS {{ self.wrapping_shl(rhs) }} else {{ 0 }} }}");
+    if t.signed {
+        let _ = writeln!(o, "    pub const fn unbounded_shr(self, rhs: u32) -> {n} {{ if rhs < {n}::BITS {{ self.wrapping_shr(rhs) }} else {{ self.wrapping_shr({n}::BITS - 1) }} }}");
+    } else {
+        let _ = writeln!(o, "    pub const fn unbounded_shr(self, rhs: u32) -> {n} {{ if rhs < {n}::BITS {{ self.wrapping_shr(rhs) }} else {{ 0 }} }}");
+    }
     if t.signed {
         let _ = writeln!(o, "    pub const fn wrapping_abs(self) -> {n} {{ self.overflowing_abs().0 }}");
     }
