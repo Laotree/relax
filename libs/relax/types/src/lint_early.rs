@@ -36,12 +36,13 @@ pub const SINGLE_USE_LIFETIMES: Lint = lint::lint("single_use_lifetimes", Level:
 pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities", Level::Warn, &["unused"]);
 
 /// Item-level passes over the definitions of the checked crates marked in `own`.
-pub fn check_items(prog: &Program, _tcx: &Tcx, own: &[bool]) {
+pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         attr_lints(prog, DefId(i as u32));
+        crate::lint_early2::check_def_item(prog, tcx, DefId(i as u32));
         if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
         if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
             | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
@@ -437,10 +438,10 @@ struct LtCx {
     next: u32,
 }
 
-struct W<'a> {
+pub(crate) struct W<'a> {
     prog: &'a Program,
-    pf: &'a ParsedFile,
-    ast: &'a Ast,
+    pub(crate) pf: &'a ParsedFile,
+    pub(crate) ast: &'a Ast,
     file: u32,
     def: DefId,
     /// the attributes of the enclosing statements, arms, fields, parameters, outermost first
@@ -451,7 +452,7 @@ struct W<'a> {
     self_ty_parens: bool,
     labels: Vec<LabelScope>,
     /// the last position the walk named: where a node without a position of its own is reported
-    cur: u32,
+    pub(crate) cur: u32,
     /// inside `&a...b`: no further `...` warnings
     ellipsis_off: bool,
     /// the lifetime use analysis (unused_lifetimes / single_use_lifetimes), when it runs
@@ -461,7 +462,7 @@ struct W<'a> {
 fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
 
 impl<'a> W<'a> {
-    fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
+    pub(crate) fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
         let pf: &'a ParsedFile = &prog.files[file as usize];
         W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None }
     }
@@ -623,7 +624,7 @@ impl<'a> W<'a> {
     }
 
     /// Where a type starts, when its tree names a position.
-    fn ty_start(&self, t: TyId) -> Option<u32> {
+    pub(crate) fn ty_start(&self, t: TyId) -> Option<u32> {
         let ast = self.ast;
         match *ast.ty(t) {
             Ty::Path(p) => Some(p.lo),
