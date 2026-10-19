@@ -1420,7 +1420,7 @@ mod tests {
         std::fs::write(&source, r#"
             const N: usize = 5;
             static TABLE: [u8; N] = [3, 1, 4, 1, 5];
-            fn sum(out: *mut u64) { let mut s = 0u64; for i in 0..N { s = s * 10 + TABLE[i] as u64; } unsafe { *out = s; } }
+            fn sum(out: *mut u64) { let mut s = 0u64; let mut i = 0; while i < N { s = s * 10 + TABLE[i] as u64; i += 1; } unsafe { *out = s; } }
         "#).unwrap();
         let mut prog = crate::program::Program::new(sess);
         prog.load_crate("fixture", source.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), Vec::new()).unwrap();
