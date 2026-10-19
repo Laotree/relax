@@ -308,7 +308,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     eval_items(up, &own);
     // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
     // generic code evaluates there (post-monomorphization E0080) -- in a check of a program
-    if options.const_fuel && !compile { mono_check(up, &own, root); }
+    if options.const_fuel && !compile && errors.is_empty() && borrow_diagnostics.is_empty() && unsafe { (&*up).errors.is_empty() } { mono_check(up, &own, root); }
     let t_front = t_check.elapsed();
     // the type/borrow check's freed memory goes back before the compile starts (Stage: 4.6 GB
     // of malloc free pages held after it)
@@ -694,24 +694,37 @@ fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
             let u = &*up;
             let mine = match &u.fns[id as usize].key {
                 FnKey::Inst(d, _) => own[u.prog.def(*d).krate as usize],
-                FnKey::Closure(file, _, _) => u.prog.file_crate.get(*file as usize).is_some_and(|&k| own[k as usize]),
                 _ => false,
             };
             if !mine { return Vec::new(); }
             // (a fn taking or returning a value of hundreds of MB is not lowered: its frame would
             // be allocated for real)
-            if let FnKey::Inst(d, args) = &(&*up).fns[id as usize].key {
-                let (d, args) = (*d, args.clone());
-                let uu = &mut *up;
-                if let Some(sig) = uu.tcx.fn_sig(&uu.prog, d).cloned() {
-                    let env = crate::tcx::TypingEnv::fully_monomorphized(&uu.prog);
-                    for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
-                        let t = uu.tcx.tys.subst_erasing_regions(*t, &args);
-                        let Ok(t) = uu.tcx.try_normalize_erasing_regions(&uu.prog, env, t) else { return Vec::new() };
-                        if uu.layout_of(t).size > (1 << 28) { return Vec::new(); }
+            // (instances over deeply nested types -- closures wrapped in closures -- cost more to
+            // lower than a constants check is worth)
+            if let FnKey::Inst(_, args) = &(&*up).fns[id as usize].key {
+                if args.iter().any(|t| (&*up).tcx.tys.depth(*t) > 6) { return Vec::new(); }
+            }
+            if let FnKey::Inst(d, _) = &(&*up).fns[id as usize].key {
+                let uu = &*up;
+                if uu.tcx.typeck(&uu.prog, *d).expr_ty.iter().any(|t| uu.tcx.tys.depth(*t) > 8) { return Vec::new(); }
+            }
+            let huge = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let FnKey::Inst(d, args) = &(&*up).fns[id as usize].key {
+                    let (d, args) = (*d, args.clone());
+                    let uu = &mut *up;
+                    if let Some(sig) = uu.tcx.fn_sig(&uu.prog, d).cloned() {
+                        let env = crate::tcx::TypingEnv::fully_monomorphized(&uu.prog);
+                        for t in sig.params.iter().chain(std::iter::once(&sig.ret)) {
+                            let t = uu.tcx.tys.subst_erasing_regions(*t, &args);
+                            let Ok(t) = uu.tcx.try_normalize_erasing_regions(&uu.prog, env, t) else { return true };
+                            if uu.tcx.is_coroutine(t) { continue; }
+                            if uu.layout_of(t).size > (1 << 28) { return true; }
+                        }
                     }
                 }
-            }
+                false
+            })).unwrap_or(true);
+            if huge { return Vec::new(); }
             let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::build_rir(up, id)));
             if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
             let mut out = Vec::new();
