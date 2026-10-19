@@ -294,9 +294,10 @@ impl<'a> Builder<'a> {
         let Some(captures) = self.root.typeck.min_captures.get(&closure.0) else {
             return Err(self.error(self.body_span, UnsupportedReason::UnresolvedFact("closure without captured places")));
         };
-        if captures.coroutine.is_some() {
-            return Err(self.error(self.body_span, UnsupportedReason::NotYetBuilt("async closure environment")));
-        }
+        // An async closure is two bodies: the closure (whose environment holds `captures.captures`; its body
+        // just creates the coroutine) and the coroutine, an ordinary coroutine body with its own entry in
+        // `min_captures` (the closure's by-ref upvars and the parameters). `captures.coroutine` only
+        // describes the AsyncFnOnce by-move shim, which is not built from THIR.
         if captures.captures.len() != capture_tys.len() {
             return Err(self.error(self.body_span, UnsupportedReason::UnresolvedFact("capture count disagrees with the closure's upvar tuple")));
         }

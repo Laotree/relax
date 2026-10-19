@@ -24,8 +24,8 @@ pub fn closure_children(prog: &Program, tcx: &Tcx, body: &typeck::Body) -> Vec<C
         let e = ExprId(if i < body.expr_n1 as usize { body.expr_lo + i as u32 } else { body.expr_lo2 + i as u32 - body.expr_n1 });
         match ast.expr(e).kind {
             ExprKind::Closure(_) => out.push(CheckedBody { owner: body.def, kind: BodyKind::Closure(e) }),
-            // An async closure's body is built with its closure.
-            ExprKind::Async(mode, _) if mode != crate::ast::ASYNC_CLOSURE_BODY => out.push(CheckedBody { owner: body.def, kind: BodyKind::Closure(e) }),
+            // Async blocks and an async closure's coroutine are bodies of their own.
+            ExprKind::Async(..) => out.push(CheckedBody { owner: body.def, kind: BodyKind::Closure(e) }),
             _ => {}
         }
     }
