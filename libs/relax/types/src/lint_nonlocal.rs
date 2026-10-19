@@ -35,19 +35,19 @@ fn is_body_owner(k: DefKind) -> bool {
     matches!(k, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::AssocConst | DefKind::Static | DefKind::AnonConst | DefKind::Closure)
 }
 
-struct Paths<'a> {
-    prog: &'a Program,
-    tcx: &'a Tcx,
-    file: u32,
-    module: u32,
-    ast: &'a Ast,
-    /// the impl's type parameter names
-    params: Vec<String>,
-    out: Vec<DefId>,
+pub(crate) struct Paths<'a> {
+    pub(crate) prog: &'a Program,
+    pub(crate) tcx: &'a Tcx,
+    pub(crate) file: u32,
+    pub(crate) module: u32,
+    pub(crate) ast: &'a Ast,
+    /// the type parameter names
+    pub(crate) params: Vec<String>,
+    pub(crate) out: Vec<(DefId, u32)>,
 }
 
 impl<'a> Paths<'a> {
-    fn path(&mut self, p: &Path) {
+    pub(crate) fn path(&mut self, p: &Path) {
         let ast = self.ast;
         if let Some(q) = ast.qself(p) {
             let (ty, tp) = (q.ty, q.trait_path);
@@ -86,16 +86,16 @@ impl<'a> Paths<'a> {
                 self.tcx.resolve_type_path_def(self.prog, self.file, self.module, &sub)
             } else { None }
         });
-        if let Some(d) = d { self.out.push(d); }
+        if let Some(d) = d { self.out.push((d, p.lo)); }
     }
 
-    fn bounds(&mut self, l: List<Bound>) {
+    pub(crate) fn bounds(&mut self, l: List<Bound>) {
         for b in self.ast.list(l) {
             if let Bound::Trait { path, .. } = *b { self.path(&path); }
         }
     }
 
-    fn ty(&mut self, t: crate::ast::TyId) {
+    pub(crate) fn ty(&mut self, t: crate::ast::TyId) {
         let ast = self.ast;
         match *ast.ty(t) {
             Ty::Path(p) => self.path(&p),
@@ -141,7 +141,7 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool]) {
         c.ty(imp.self_ty);
         if let Some(t) = imp.trait_ { c.path(&t); }
         let outermost = peel(prog, impl_parent);
-        let has_local_parent = c.out.iter().any(|&did| {
+        let has_local_parent = c.out.iter().any(|&(did, _)| {
             if prog.def(did).krate != d.krate { return false; }
             let pd = parent(prog, did);
             if pd == NO_DEF { return false; }
@@ -152,5 +152,58 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool]) {
         });
         if has_local_parent { continue; }
         lint::emit(prog, id, &NON_LOCAL_DEFINITIONS, d.file, item.lo, "non-local `impl` definition, `impl` blocks should be written at the same level as their item");
+    }
+}
+
+impl<'a> Paths<'a> {
+    pub(crate) fn generics(&mut self, g: Generics) {
+        let ast = self.ast;
+        for p in ast.list(g.params) {
+            match p.kind {
+                GenericParamKind::Type(bs, def) => { self.bounds(bs); if let Some(t) = def { self.ty(t); } }
+                GenericParamKind::Const(t, _) => self.ty(t),
+                GenericParamKind::Lifetime(_) => {}
+            }
+        }
+        for w in ast.list(g.where_) {
+            if let WherePred::Bound { ty, bounds, .. } = *w { self.ty(ty); self.bounds(bounds); }
+        }
+    }
+
+    fn fields(&mut self, d: VariantData) {
+        if let VariantData::Struct(l) | VariantData::Tuple(l) = d {
+            for f in self.ast.list(l) { self.ty(f.ty); }
+        }
+    }
+
+    /// Every type path written in the signature (and fields) of an item.
+    pub(crate) fn item_signature(&mut self, item: &Item) {
+        let ast = self.ast;
+        match item.kind {
+            ItemKind::Fn(sig, _, _) => {
+                let sig = *ast.fn_sig(sig);
+                self.generics(sig.generics);
+                for p in ast.list(sig.params) { self.ty(p.ty); }
+                if let Some(r) = sig.ret { self.ty(r); }
+            }
+            ItemKind::Struct(r) => { let s = *ast.row(r); self.generics(s.generics); self.fields(s.data); }
+            ItemKind::Union(r) => { let s = *ast.row(r); self.generics(s.generics); for f in ast.list(s.fields) { self.ty(f.ty); } }
+            ItemKind::Enum(r) => {
+                let e = *ast.row(r);
+                self.generics(e.generics);
+                for v in ast.list(e.variants) { self.fields(v.data); }
+            }
+            ItemKind::TypeAlias(r) => { let t = *ast.row(r); self.generics(t.generics); self.bounds(t.bounds); if let Some(x) = t.ty { self.ty(x); } }
+            ItemKind::Trait(r) => { let t = *ast.row(r); self.generics(t.generics); self.bounds(t.supers); }
+            ItemKind::Impl(r) => {
+                let i = *ast.row(r);
+                self.generics(i.generics);
+                self.ty(i.self_ty);
+                if let Some(t) = i.trait_ { self.path(&t); }
+            }
+            ItemKind::Const(t, _) => { if let Some(t) = t.get() { self.ty(t); } }
+            ItemKind::Static(_, t, _) => self.ty(t),
+            _ => {}
+        }
     }
 }

@@ -1386,3 +1386,98 @@ pub fn check_eq_impls(prog: &Program, tcx: &Tcx, own: &[bool]) {
         lint::emit(prog, DefId(i as u32), &INTERNAL_EQ_TRAIT_METHOD_IMPLS, d.file, pos, "`Eq::assert_receiver_is_total_eq` should never be implemented by hand");
     }
 }
+
+// ---------------------------------------------------------------- deprecated: `use` declarations and signatures
+
+use crate::lint_late::Dp;
+
+fn use_leaves(ast: &Ast, prog: &Program, file: u32, t: &UseTree, prefix: &mut Vec<(crate::ast::SegKind, crate::program::Sym)>, out: &mut Vec<Vec<(crate::ast::SegKind, crate::program::Sym)>>) {
+    let sym = |seg: &PathSeg| prog.syms.get(prog.files[file as usize].text(seg.name)).map(|s| (seg.kind(), s));
+    match *t {
+        UseTree::Name(seg, _) => {
+            if let Some(s) = sym(&seg) { prefix.push(s); out.push(prefix.clone()); prefix.pop(); }
+        }
+        UseTree::Path(seg, sub) => {
+            if let Some(s) = sym(&seg) {
+                prefix.push(s);
+                use_leaves(ast, prog, file, ast.use_tree(sub), prefix, out);
+                prefix.pop();
+            }
+        }
+        UseTree::Group(l) => for c in ast.list(l) { use_leaves(ast, prog, file, c, prefix, out); },
+        UseTree::Glob => {}
+    }
+}
+
+fn first_use_pos(ast: &Ast, t: &UseTree) -> Option<u32> {
+    match *t {
+        UseTree::Name(seg, _) | UseTree::Path(seg, _) => Some(seg.name.lo),
+        UseTree::Group(l) => ast.list(l).first().and_then(|c| first_use_pos(ast, c)),
+        UseTree::Glob => None,
+    }
+}
+
+/// `use` declarations of deprecated items (rustc stability `visit_path` of the use paths).
+pub fn check_use_deprecations(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    let dp = Dp { prog, tcx };
+    for (m, md) in prog.mods.iter().enumerate() {
+        if !own.get(md.krate as usize).copied().unwrap_or(false) || md.lexical_parent.is_some() { continue; }
+        let (file, items) = crate::lint_dead::module_items(prog, m as u32);
+        let ast = &prog.files[file as usize].ast;
+        for &it in &items {
+            let item = ast.item(it);
+            let ItemKind::Use(row) = item.kind else { continue };
+            let u = *ast.row(row);
+            let Some(pos) = first_use_pos(ast, &u.tree) else { continue };
+            if lint::external(prog, file, pos) { continue; }
+            let mut leaves = Vec::new();
+            use_leaves(ast, prog, file, &u.tree, &mut Vec::new(), &mut leaves);
+            let attrs = ast.list(item.attrs).to_vec();
+            for segs in leaves {
+                if segs.len() < 2 { continue; }
+                let Some(parent) = prog.resolve_mod_path(m as u32, u.global, &segs[..segs.len() - 1], false, true) else { continue };
+                let last = segs[segs.len() - 1].1;
+                for ns_type in [true, false] {
+                    let Some(d) = prog.lookup_in_container(parent, last, ns_type) else { continue };
+                    if let Some((future, msg)) = dp.message(d, md.def) {
+                        lint::emit_in(prog, md.def, &attrs, if future { &crate::lint_late::DEPRECATED_IN_FUTURE } else { &crate::lint_late::DEPRECATED }, file, pos, &msg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deprecated items named in item signatures (rustc stability `visit_path` of the types and bounds).
+pub fn check_signature_deprecations(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    let dp = Dp { prog, tcx };
+    for i in 0..prog.defs.len() {
+        let d = prog.defs[i];
+        if !own.get(d.krate as usize).copied().unwrap_or(false) { continue; }
+        if !matches!(d.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::Trait | DefKind::Impl | DefKind::Const | DefKind::AssocConst | DefKind::Static) { continue; }
+        let ast = &prog.files[d.file as usize].ast;
+        let item = *ast.item(d.item);
+        let mut c = crate::lint_nonlocal::Paths { prog, tcx, file: d.file, module: d.scope, ast, params: Vec::new(), out: Vec::new() };
+        // the type parameters of the item and of the impl / trait around it
+        let mut p = DefId(i as u32);
+        while p != crate::program::NO_DEF {
+            let pd = prog.def(p);
+            if matches!(pd.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::Trait | DefKind::Impl) {
+                let pa = &prog.files[pd.file as usize].ast;
+                if let Some(g) = pa.kind_generics(&pa.item(pd.item).kind) {
+                    for gp in pa.list(g.params) {
+                        if !matches!(gp.kind, GenericParamKind::Lifetime(_)) { c.params.push(prog.files[pd.file as usize].text(gp.name).to_string()); }
+                    }
+                }
+            }
+            p = pd.parent;
+        }
+        c.item_signature(&item);
+        for (target, pos) in std::mem::take(&mut c.out) {
+            if lint::external(prog, d.file, pos) { continue; }
+            if let Some((future, msg)) = dp.message(target, DefId(i as u32)) {
+                lint::emit(prog, DefId(i as u32), if future { &crate::lint_late::DEPRECATED_IN_FUTURE } else { &crate::lint_late::DEPRECATED }, d.file, pos, &msg);
+            }
+        }
+    }
+}

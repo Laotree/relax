@@ -635,103 +635,10 @@ impl<'a> Late<'a> {
     }
 
     // ---- middle/stability.rs: deprecation
-    /// The definition enclosing `d` for the deprecation inheritance (a block module's owner).
-    fn depr_parent(&self, d: DefId) -> Option<DefId> {
-        let def = self.prog.def(d);
-        if def.parent == crate::program::NO_DEF { return None; }
-        let p = self.prog.def(def.parent);
-        if p.kind == DefKind::Mod {
-            if let Some(&owner) = self.prog.block_owner.get(&p.sub) { return Some(owner); }
-        }
-        Some(def.parent)
-    }
-
-    /// `#[deprecated]` among the attributes of the definition itself: (since, note).
-    fn own_deprecation(&self, d: DefId) -> Option<(Option<String>, Option<String>)> {
-        let def = self.prog.def(d);
-        let ast = &self.prog.files[def.file as usize].ast;
-        let attrs: &[Attr] = match def.kind {
-            DefKind::Mod => {
-                if def.parent == crate::program::NO_DEF || self.prog.block_owner.get(&def.sub).is_some() { return None; }
-                ast.list(ast.item(def.item).attrs)
-            }
-            DefKind::Variant => match ast.item(def.item).kind {
-                ItemKind::Enum(r) => ast.list(ast.list(ast.row(r).variants).get(def.sub as usize)?.attrs),
-                _ => return None,
-            },
-            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait
-            | DefKind::TypeAlias | DefKind::Const | DefKind::AssocConst | DefKind::AssocTy | DefKind::Static | DefKind::ForeignStatic | DefKind::Impl => ast.list(ast.item(def.item).attrs),
-            _ => return None,
-        };
-        let a = attrs.iter().find(|a| lint::attr_path(self.prog, def.file, a) == b"deprecated")?;
-        // `#[deprecated]`, `#[deprecated = "note"]`, `#[deprecated(since = "..", note = "..")]`
-        let p = self.prog.src(def.file);
-        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-        let mut since = None;
-        let mut note = None;
-        let unq = |t: &[u8]| String::from_utf8_lossy(t).trim_matches('"').to_string();
-        let mut i = lo + 1;
-        if i < hi && crate::cfg::tok_str(p, i) == b"=" && i + 1 < hi {
-            note = Some(unq(crate::cfg::tok_str(p, i + 1)));
-        } else {
-            while i + 2 < hi {
-                let name = crate::cfg::tok_str(p, i);
-                if crate::cfg::tok_str(p, i + 1) == b"=" {
-                    let v = unq(crate::cfg::tok_str(p, i + 2));
-                    if name == b"since" { since = Some(v); } else if name == b"note" { note = Some(v); }
-                    i += 3;
-                } else { i += 1; }
-            }
-        }
-        Some((since, note))
-    }
-
-    /// `lookup_deprecation_entry`: the nearest `#[deprecated]` at or above the definition:
-    /// (the definition carrying it, since, note).
-    fn deprecation_entry(&self, d: DefId) -> Option<(DefId, Option<String>, Option<String>)> {
-        let mut cur = d;
-        for _ in 0..64 {
-            if let Some((since, note)) = self.own_deprecation(cur) { return Some((cur, since, note)); }
-            cur = self.depr_parent(cur)?;
-        }
-        None
-    }
-
-    fn depr_descr(&self, d: DefId) -> &'static str {
-        let def = self.prog.def(d);
-        let shape = |adt: DefId, vi: usize| self.tcx.adts.get(&adt).and_then(|a| a.variants.get(vi)).map(|v| v.shape);
-        match def.kind {
-            DefKind::Struct => match shape(d, 0) { Some(0) => "unit struct", Some(1) => "tuple struct", _ => "struct" },
-            DefKind::Variant => match shape(def.parent, def.sub as usize) { Some(0) => "unit variant", Some(1) => "tuple variant", _ => "variant" },
-            DefKind::Mod => "module",
-            DefKind::Static | DefKind::ForeignStatic => "static",
-            DefKind::MacroRules => "macro",
-            _ => self.tcx.def_descr(self.prog, d),
-        }
-    }
-
     fn check_deprecated(&self, d: DefId, pos: u32) {
         if lint::external(self.prog, self.body.file, pos) { return; }
-        let Some((origin, since, note)) = self.deprecation_entry(d) else { return };
-        // a use inside an item deprecated at the same origin is silent
-        if self.deprecation_entry(self.body.def).is_some_and(|(o, _, _)| o == origin) { return; }
-        // `since` a version later than this compiler's (or "TBD"): deprecated_in_future
-        let future = since.as_deref().is_some_and(|s| {
-            if s == "TBD" { return true; }
-            let v: Vec<u32> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
-            v.len() == 3 && (v[0], v[1], v[2]) > (1, 97, 1)
-        });
-        let path = {
-            let full = self.prog.def_path(d);
-            match full.split_once("::") { Some((_, rest)) if self.prog.def(d).krate == self.prog.def(self.body.def).krate => rest.to_string(), _ => full }
-        };
-        let kind = self.depr_descr(d);
-        let msg = match (&note, future) {
-            (Some(n), false) => format!("use of deprecated {kind} `{path}`: {n}"),
-            (None, false) => format!("use of deprecated {kind} `{path}`"),
-            (Some(n), true) => format!("use of {kind} `{path}` that will be deprecated in a future Rust version: {n}"),
-            (None, true) => format!("use of {kind} `{path}` that will be deprecated in a future Rust version"),
-        };
+        let dp = Dp { prog: self.prog, tcx: self.tcx };
+        let Some((future, msg)) = dp.message(d, self.body.def) else { return };
         self.emit(if future { &DEPRECATED_IN_FUTURE } else { &DEPRECATED }, pos, &msg);
     }
 
@@ -1682,6 +1589,8 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     crate::lint_nonlocal::check(prog, tcx, own);
     crate::lint_late2::check_items(prog, own);
     crate::lint_late2::check_eq_impls(prog, tcx, own);
+    crate::lint_late2::check_use_deprecations(prog, tcx, own);
+    crate::lint_late2::check_signature_deprecations(prog, tcx, own);
 }
 
 /// rustc_ast::util::unicode TEXT_FLOW_CONTROL_CHARS.
@@ -2370,5 +2279,113 @@ fn improper_ctypes(prog: &Program, tcx: &Tcx, own: &[bool]) {
             }
             _ => {}
         }
+    }
+}
+
+/// Deprecation lookups (rustc_middle middle/stability.rs) for the bodies and the signatures.
+pub struct Dp<'a> {
+    pub prog: &'a Program,
+    pub tcx: &'a Tcx,
+}
+
+impl<'a> Dp<'a> {
+    /// The definition enclosing `d` for the deprecation inheritance (a block module's owner).
+    pub fn depr_parent(&self, d: DefId) -> Option<DefId> {
+        let def = self.prog.def(d);
+        if def.parent == crate::program::NO_DEF { return None; }
+        let p = self.prog.def(def.parent);
+        if p.kind == DefKind::Mod {
+            if let Some(&owner) = self.prog.block_owner.get(&p.sub) { return Some(owner); }
+        }
+        Some(def.parent)
+    }
+
+    /// `#[deprecated]` among the attributes of the definition itself: (since, note).
+    pub fn own_deprecation(&self, d: DefId) -> Option<(Option<String>, Option<String>)> {
+        let def = self.prog.def(d);
+        let ast = &self.prog.files[def.file as usize].ast;
+        let attrs: &[Attr] = match def.kind {
+            DefKind::Mod => {
+                if def.parent == crate::program::NO_DEF || self.prog.block_owner.get(&def.sub).is_some() { return None; }
+                ast.list(ast.item(def.item).attrs)
+            }
+            DefKind::Variant => match ast.item(def.item).kind {
+                ItemKind::Enum(r) => ast.list(ast.list(ast.row(r).variants).get(def.sub as usize)?.attrs),
+                _ => return None,
+            },
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait
+            | DefKind::TypeAlias | DefKind::Const | DefKind::AssocConst | DefKind::AssocTy | DefKind::Static | DefKind::ForeignStatic | DefKind::Impl => ast.list(ast.item(def.item).attrs),
+            _ => return None,
+        };
+        let a = attrs.iter().find(|a| lint::attr_path(self.prog, def.file, a) == b"deprecated")?;
+        // `#[deprecated]`, `#[deprecated = "note"]`, `#[deprecated(since = "..", note = "..")]`
+        let p = self.prog.src(def.file);
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        let mut since = None;
+        let mut note = None;
+        let unq = |t: &[u8]| String::from_utf8_lossy(t).trim_matches('"').to_string();
+        let mut i = lo + 1;
+        if i < hi && crate::cfg::tok_str(p, i) == b"=" && i + 1 < hi {
+            note = Some(unq(crate::cfg::tok_str(p, i + 1)));
+        } else {
+            while i + 2 < hi {
+                let name = crate::cfg::tok_str(p, i);
+                if crate::cfg::tok_str(p, i + 1) == b"=" {
+                    let v = unq(crate::cfg::tok_str(p, i + 2));
+                    if name == b"since" { since = Some(v); } else if name == b"note" { note = Some(v); }
+                    i += 3;
+                } else { i += 1; }
+            }
+        }
+        Some((since, note))
+    }
+
+    /// `lookup_deprecation_entry`: the nearest `#[deprecated]` at or above the definition:
+    /// (the definition carrying it, since, note).
+    pub fn deprecation_entry(&self, d: DefId) -> Option<(DefId, Option<String>, Option<String>)> {
+        let mut cur = d;
+        for _ in 0..64 {
+            if let Some((since, note)) = self.own_deprecation(cur) { return Some((cur, since, note)); }
+            cur = self.depr_parent(cur)?;
+        }
+        None
+    }
+
+    pub fn depr_descr(&self, d: DefId) -> &'static str {
+        let def = self.prog.def(d);
+        let shape = |adt: DefId, vi: usize| self.tcx.adts.get(&adt).and_then(|a| a.variants.get(vi)).map(|v| v.shape);
+        match def.kind {
+            DefKind::Struct => match shape(d, 0) { Some(0) => "unit struct", Some(1) => "tuple struct", _ => "struct" },
+            DefKind::Variant => match shape(def.parent, def.sub as usize) { Some(0) => "unit variant", Some(1) => "tuple variant", _ => "variant" },
+            DefKind::Mod => "module",
+            DefKind::Static | DefKind::ForeignStatic => "static",
+            DefKind::MacroRules => "macro",
+            _ => self.tcx.def_descr(self.prog, d),
+        }
+    }
+
+    /// The lint message for a use of `d` inside the definition `scope`: (deprecated_in_future, message).
+    pub fn message(&self, d: DefId, scope: DefId) -> Option<(bool, String)> {
+        let (origin, since, note) = self.deprecation_entry(d)?;
+        // a use inside an item deprecated at the same origin is silent
+        if self.deprecation_entry(scope).is_some_and(|(o, _, _)| o == origin) { return None; }
+        // `since` a version later than this compiler's (or "TBD"): deprecated_in_future
+        let future = since.as_deref().is_some_and(|s| {
+            if s == "TBD" { return true; }
+            let v: Vec<u32> = s.split('.').map(|x| x.parse().unwrap_or(0)).collect();
+            v.len() == 3 && (v[0], v[1], v[2]) > (1, 97, 1)
+        });
+        let path = {
+            let full = self.prog.def_path(d);
+            match full.split_once("::") { Some((_, rest)) if self.prog.def(d).krate == self.prog.def(scope).krate => rest.to_string(), _ => full }
+        };
+        let kind = self.depr_descr(d);
+        let msg = match (&note, future) {
+            (Some(n), false) => format!("use of deprecated {kind} `{path}`: {n}"),
+            (None, false) => format!("use of deprecated {kind} `{path}`"),
+            (Some(n), true) => format!("use of {kind} `{path}` that will be deprecated in a future Rust version: {n}"),
+            (None, true) => format!("use of {kind} `{path}` that will be deprecated in a future Rust version"),
+        };
+        Some((future, msg))
     }
 }
