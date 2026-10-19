@@ -3453,31 +3453,10 @@ impl Tcx {
 
     /// Direct supertraits of a trait (resolved from its `: A + B` bounds).
     /// Does trait `td` require `Self: Sized` (a `Sized` supertrait, directly or through its
-    /// supertraits: `Clone`, `Copy`)? Such a trait is not dyn compatible (rustc E0038).
     /// The signature of a fn item type's def: a fn's, or a tuple constructor's.
     #[inline]
     pub fn fn_item_sig(&self, prog: &Program, d: DefId) -> Option<&FnSigT> {
         self.fn_sig(prog, d).or_else(|| self.ctor_sigs.get(&d))
-    }
-
-    /// Is trait `td` `Sized` itself or does it require it through its supertraits?
-    pub fn trait_entails_sized(&self, prog: &Program, td: DefId) -> bool {
-        let core = self.core_crate(prog);
-        let mut seen: Vec<DefId> = vec![td];
-        let mut i = 0;
-        while i < seen.len() && i < 64 {
-            let cur = seen[i];
-            if prog.name(cur) == "Sized" && prog.def(cur).krate == core {
-                return true;
-            }
-            for s in self.trait_supers(prog, cur) {
-                if !seen.contains(&s) {
-                    seen.push(s);
-                }
-            }
-            i += 1;
-        }
-        false
     }
 
     /// dyn_trait.rs: the associated types of the principal and its supertraits that a trait

@@ -761,7 +761,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     };
     // rustc_hir_typeck check_fn / gather_locals: every parameter's type is Sized (SizedArgumentType),
     // unless `unsized_fn_params`; checked by `makepad check` only (the run never pays for it)
-    if crate::lint::enabled() && !prog.crates[d.krate as usize].unsized_fn_params(prog) {
+    if tcx.validates(prog, file) && !prog.crates[d.krate as usize].unsized_fn_params(prog) {
         for &p in &params { fcx.require_type_is_sized_deferred(p, ast.item(d.item).lo); }
     }
     let mut pi = 0;
@@ -1502,10 +1502,9 @@ impl<'a> Fcx<'a> {
     }
 
     /// A `&`/`&mut` pattern against a scrutinee of another shape: E0308.
-    fn demand_pat_eq(&mut self, scrutinee: TyId, m: bool, inner: TyId) {
+    fn demand_pat_eq(&mut self, scrutinee: TyId, m: bool) {
         let x = self.infcx.deeply_resolve_ignoring_regions(scrutinee);
         let sx = ty_to_string(false, self.prog, self.tcx, x);
-        let _ = inner;
         self.err(self.last_lo, format!("E0308: mismatched types: expected `{}`, found `&{}_`", sx, if m { "mut " } else { "" }));
     }
 
@@ -2357,7 +2356,7 @@ impl<'a> Fcx<'a> {
                 let et = self.shallow(expected);
                 let inner = match self.tcx.tys.kind(et).clone() {
                     TyKind::Ref(em, i, _) => {
-                        if em != *m { self.demand_pat_eq(expected, *m, i); }
+                        if em != *m { self.demand_pat_eq(expected, *m); }
                         i
                     }
                     TyKind::Infer(_) => {
@@ -2367,7 +2366,7 @@ impl<'a> Fcx<'a> {
                         i
                     }
                     TyKind::Error => self.tcx.tys.error,
-                    _ => { self.demand_pat_eq(expected, *m, self.tcx.tys.error); self.tcx.tys.error }
+                    _ => { self.demand_pat_eq(expected, *m); self.tcx.tys.error }
                 };
                 self.check_pat(*x, inner);
             }
@@ -4160,7 +4159,7 @@ impl<'a> Fcx<'a> {
                 let clean = errors.is_empty();
                 for error in errors { if !self.b.errors.contains(&error) { self.b.errors.push(error); } }
                 // FnCtxt::lower_ty: every explicit type argument is well formed
-                if crate::lint::enabled() && clean && !matches!(self.tcx.tys.kind(lt), TyKind::Const(_)) && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
+                if self.tcx.validates(self.prog, self.file) && clean && !matches!(self.tcx.tys.kind(lt), TyKind::Const(_)) && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
                 // hir_ty_lowering/generics.rs:21-136,244-310: kind mismatch
                 // recovery keeps the parameter's kind, including unresolved args.
                 let declaration = self.tcx.declaration_env(prog, def);
@@ -4209,7 +4208,7 @@ impl<'a> Fcx<'a> {
         }
         type_dependencies(self.tcx, lt, &mut self.b.dependencies);
         // rustc_hir_typeck/src/fn_ctxt/mod.rs lower_ty: every written type must be well formed
-        if crate::lint::enabled() && lowered_clean && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
+        if self.tcx.validates(self.prog, self.file) && lowered_clean && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
         lt
     }
 
@@ -6803,7 +6802,7 @@ impl<'a> Fcx<'a> {
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
             }
-            if let Some(msg) = crate::item_wf::fulfillment_message(&self.infcx, self.prog, code, &obligation.goal) {
+            if let Some(msg) = crate::wfcheck::obligations::fulfillment_message(&self.infcx, self.prog, code, &obligation.goal) {
                 self.err(obligation.cause.span, msg);
                 continue;
             }

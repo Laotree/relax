@@ -870,6 +870,9 @@ impl<T> DoubleEndedIterator for IntoIter<T> {
 impl<T> ExactSizeIterator for IntoIter<T> {}
 impl<T> FusedIterator for IntoIter<T> {}
 
+// library/alloc/src/collections/vec_deque/drain.rs
+unsafe impl<T: Send> Send for Drain<'_, T> {}
+unsafe impl<T: Sync> Sync for Drain<'_, T> {}
 pub struct Drain<'a, T: 'a> {
     deque: *mut VecDeque<T>,
     start: usize,
