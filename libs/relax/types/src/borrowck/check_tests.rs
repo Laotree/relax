@@ -306,12 +306,79 @@ fn external_input(b: &Body) -> RegionInput {
         relations:UniversalRegionRelations::create(UniversalRegions::new(0,None,vec![(0,Class::Global),(1,Class::External),(2,Class::External)]),3,&[]),
         liveness:LivenessValues::new(3,LocationMap::new(b).num_points()),type_tests:vec![] }
 }
+/// `_1: i32` borrowed as `_2 = &_1` (region living across the yield), then a yield: a coroutine body.
+fn yielding(tcx: &Tcx, movability: Movability, borrowed: Place) -> Body {
+    let t = tcx.tys.i32_; let r = reference(tcx, t, false);
+    let mut b = body(&[tcx.tys.unit, t, r], vec![block(vec![assign(1, val(t)), borrow(2, borrowed, 1, BorrowKind::Shared)],
+        TerminatorKind::Yield { value: val(tcx.tys.unit), resume: BasicBlock(1), resume_arg: p(0), drop: None }),
+        block(vec![assign(0, Operand::Copy(Place { local: Local(2), projection: vec![PlaceElem::Deref] }))], TerminatorKind::Return)]);
+    b.arg_count = 0;
+    b.coroutine = Some(CoroutineInfo { yield_ty: tcx.tys.unit, resume_ty: tcx.tys.unit, kind: CoroutineKind::Coroutine(movability) });
+    b
+}
 #[test]
-fn movable_coroutine_yield_is_an_explicit_stop() {
-    let tcx=Tcx::new(); let mut b=body(&[tcx.tys.unit],vec![block(vec![],TerminatorKind::Return)]); b.arg_count=0;
-    b.basic_blocks[0].terminator.as_mut().unwrap().kind=TerminatorKind::Yield {value:val(tcx.tys.unit),resume:BasicBlock(1),resume_arg:p(0),drop:None};
-    b.basic_blocks.push(block(vec![],TerminatorKind::Return));
-    let result=check(&tcx,&b,&[]); assert!(!result.accepted()); assert!(result.unsupported[0].contains("movability"));
+fn borrow_of_local_data_across_a_movable_coroutine_yield_is_e0626() {
+    let tcx = Tcx::new();
+    // `let r = &x; yield; *r`: the coroutine may be moved at the yield, so `x` cannot be borrowed across it.
+    let b = yielding(&tcx, Movability::Movable, p(1));
+    let result = check(&tcx, &b, &[points(3), points(3)]);
+    assert_eq!(codes(&result), ["E0626"]);
+    // A `static` (immovable) coroutine may keep the borrow.
+    let b = yielding(&tcx, Movability::Static, p(1));
+    assert!(check(&tcx, &b, &[points(3), points(3)]).accepted());
+}
+
+/// A closure body `|| { (*_1).0 = 1 }` over a one-field environment.
+fn closure_assigning_upvar(tcx: &Tcx, mutability: Mutability, env_mutable: bool) -> Body {
+    let t = tcx.tys.i32_;
+    let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8),
+        closure_sig_as_fn_ptr_ty: tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, crate::types::FnHeader::RUST, 0)),
+        tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t]))) }));
+    let env = tcx.tys.intern(TyKind::Ref(env_mutable, closure, RegionId::ERASED));
+    let field = Place { local: Local(1), projection: vec![PlaceElem::Deref, PlaceElem::Field(FieldIdx(0), t)] };
+    let mut b = body(&[tcx.tys.unit, env], vec![block(vec![StatementKind::Assign(field, Rvalue::Use(val(t)))], TerminatorKind::Return)]);
+    b.local_decls[1].kind = LocalKind::Arg; b.source.kind = BodyKind::Closure(1);
+    b.upvars = vec![CapturedPlace { name: "x".into(), var: 0, root_ty: t, projection: vec![], ty: t, capture: UpvarCapture::ByValue, mutability,
+        path_span: Span::default(), kind_span: Span::default() }];
+    b
+}
+#[test]
+fn assigning_a_mutable_upvar_is_reported_back_to_the_creator() {
+    let tcx = Tcx::new();
+    let b = closure_assigning_upvar(&tcx, Mutability::Mut, true);
+    let result = check(&tcx, &b, &[]);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    assert_eq!(result.used_mut_upvars, [FieldIdx(0)]);
+    // An immutable binding cannot be assigned through the closure (E0594).
+    let b = closure_assigning_upvar(&tcx, Mutability::Not, true);
+    assert_eq!(codes(&check(&tcx, &b, &[])), ["E0594"]);
+    // And a mutable upvar of an `Fn` closure (shared environment) neither.
+    let b = closure_assigning_upvar(&tcx, Mutability::Mut, false);
+    assert_eq!(codes(&check(&tcx, &b, &[])), ["E0594"]);
+}
+#[test]
+fn a_variable_mutated_by_the_closure_it_is_moved_into_is_used_mut() {
+    use super::check::{mir_borrowck_nested, NestedUsedMut};
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let id = ClosureId { file: 7, expr: 1 };
+    let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8),
+        closure_sig_as_fn_ptr_ty: tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&[]), tcx.tys.unit, crate::types::FnHeader::RUST, 0)),
+        tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[t]))) }));
+    // `let mut x = 0; let c = move || x += 1;` : `_2 = Closure(move _1)`.
+    let mut b = body(&[tcx.tys.unit, t, closure], vec![block(vec![assign(1, val(t)),
+        StatementKind::Assign(p(2), Rvalue::Aggregate(Box::new(AggregateKind::Closure(id, vec![])), vec![Operand::Move(p(1))]))], TerminatorKind::Return)]);
+    b.arg_count = 0;
+    b.local_decls[1].local_info = LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: BindingMode(ByRef::No, Mutability::Mut), opt_ty_info: None,
+        opt_match_place: None, pat_span: Span::default(), introductions: vec![] }));
+    let moves = gather(&tcx, &b);
+    let run = |nested: NestedUsedMut| {
+        let mut regions = compute_regions(&tcx, &test_prog(), &b, input(&b, &[]), false);
+        mir_borrowck_nested(&tcx, &test_prog(), &b, &mut regions, &moves, None, &nested)
+    };
+    assert!(run(NestedUsedMut(vec![(id, vec![FieldIdx(0)])])).used_mut.contains(1));
+    assert!(!run(NestedUsedMut(vec![(id, vec![])])).used_mut.contains(1));
+    // Without the nested body's result the aggregate is an explicit stop.
+    assert!(!run(NestedUsedMut::default()).unsupported.is_empty());
 }
 #[test]
 fn subslice_reads_only_overlapping_moved_elements() {

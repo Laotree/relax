@@ -2,7 +2,7 @@
 //! The shared context of a typeck root and all its nested bodies (closures, coroutines, inline
 //! consts): the two-phase schedule that applies nested bodies' region and type requirements and
 //! the root-wide handling of opaque type uses, then solves and checks every body.
-use super::check::{mir_borrowck, MirBorrowckResult};
+use super::check::{mir_borrowck_nested, MirBorrowckResult, NestedUsedMut};
 use super::constraints::{OutlivesConstraint, RegionVid};
 use super::mir_nll::{compute_regions, free_regions_in_order, LocationMap, MirRegionResult, MirTypeck, RegionDriverOps};
 use super::region_infer::opaque_types::{self, DeferredOpaqueTypeError, HiddenTypes, OpaqueOps};
@@ -47,6 +47,9 @@ pub struct CheckedBody {
     pub requirements: Option<ClosureRequirements>,
     /// Reported only when there are no region errors: with them these are likely consequences.
     pub deferred_opaque_type_errors: Vec<DeferredOpaqueTypeError>,
+    /// What the closure-like bodies created in this body were written as, by closure expression: for
+    /// `DiagCx::coroutine_kinds` (the noun in E0373 and friends).
+    pub coroutine_kinds: Vec<(u32, crate::mir::CoroutineKind)>,
 }
 
 pub struct RootResult {
@@ -72,6 +75,20 @@ impl BorrowCheckRootCtxt<'_> {
         let n = bodies.len();
         let info: Vec<NestedInfo> = bodies.iter().map(|b| NestedInfo { universals: b.typeck.universals.clone(), closure_slots: b.typeck.closure_slots.clone() }).collect();
         let keys: Vec<ClauseOwner> = bodies.iter().map(|b| b.key).collect();
+        // The nested bodies each body creates, and what they were written as.
+        let created: Vec<Vec<usize>> = bodies.iter().map(|b| b.typeck.summary.deferred_closure_requirements.iter()
+            .filter_map(|u| keys.iter().position(|k| *k == u.def)).collect()).collect();
+        let kinds: Vec<Option<crate::mir::CoroutineKind>> = bodies.iter().map(|b| b.body.coroutine.as_ref().map(|c| c.kind)).collect();
+        let nested_info = |i: usize, finished: &[Option<CheckedBody>]| {
+            let mut used = NestedUsedMut::default();
+            let mut coroutine_kinds = vec![];
+            for &j in &created[i] {
+                let (ClauseOwner::Closure(id) | ClauseOwner::Coroutine(id)) = keys[j] else { continue };
+                if let Some(done) = &finished[j] { used.0.push((id, done.result.used_mut_upvars.clone())); }
+                if let Some(kind) = kinds[j] { coroutine_kinds.push((id.expr, kind)); }
+            }
+            (used, coroutine_kinds)
+        };
         let mut bodies: Vec<Option<RootBody<'_>>> = bodies.into_iter().map(Some).collect();
         let mut finished: Vec<Option<CheckedBody>> = (0..n).map(|_| None).collect();
         let mut modulo_opaques: Vec<Option<Option<ClosureRequirements>>> = vec![None; n];
@@ -105,7 +122,7 @@ impl BorrowCheckRootCtxt<'_> {
                 bodies[i] = Some(body);
             } else {
                 assert!(body.typeck.summary.deferred_closure_requirements.is_empty());
-                finished[i] = Some(self.check_region_constraints(body, vec![]));
+                { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, vec![], nested)); }
             }
         }
 
@@ -144,7 +161,7 @@ impl BorrowCheckRootCtxt<'_> {
                 let requirements = finished[j].as_ref().expect("nested bodies are finished before their parent").requirements.clone();
                 self.apply_closure_requirements(&mut body, &info[j], requirements.as_ref(), &use_);
             }
-            finished[i] = Some(self.check_region_constraints(body, std::mem::take(&mut deferred_errors[i])));
+            { let nested = nested_info(i, &finished); finished[i] = Some(self.check_region_constraints(body, std::mem::take(&mut deferred_errors[i]), nested)); }
         }
 
         let mut bodies: Vec<CheckedBody> = finished.into_iter().map(|b| b.expect("every body is checked")).collect();
@@ -165,15 +182,16 @@ impl BorrowCheckRootCtxt<'_> {
     }
 
     /// `borrowck_check_region_constraints`: solve the regions and check the body.
-    fn check_region_constraints(&self, body: RootBody<'_>, deferred_opaque_type_errors: Vec<DeferredOpaqueTypeError>) -> CheckedBody {
+    fn check_region_constraints(&self, body: RootBody<'_>, deferred_opaque_type_errors: Vec<DeferredOpaqueTypeError>,
+        (nested_used_mut, coroutine_kinds): (NestedUsedMut, Vec<(u32, crate::mir::CoroutineKind)>)) -> CheckedBody {
         assert!(body.typeck.summary.deferred_closure_requirements.is_empty());
         let RootBody { body: mir, moves, infcx, typeck, nested, .. } = body;
         let input = typeck.into_region_input(&*infcx);
         let mut regions = compute_regions(self.tcx, self.prog, mir, input, nested);
-        let mut result = mir_borrowck(self.tcx, self.prog, mir, &mut regions, moves);
+        let mut result = mir_borrowck_nested(self.tcx, self.prog, mir, &mut regions, moves, None, &nested_used_mut);
         if regions.regioncx.errors.is_empty() && !deferred_opaque_type_errors.is_empty() { result.tainted_by_errors = true; }
         let requirements = requirements_of(&regions);
-        CheckedBody { regions, result, requirements, deferred_opaque_type_errors }
+        CheckedBody { regions, result, requirements, deferred_opaque_type_errors, coroutine_kinds }
     }
 
     /// `apply_closure_requirements`: instantiates the "extra" requirements computed for a nested

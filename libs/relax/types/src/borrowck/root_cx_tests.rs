@@ -171,3 +171,24 @@ fn a_failed_body_taints_the_whole_root() {
     ]);
     assert!(result.bodies.iter().all(|c| c.result.tainted_by_errors && !c.result.accepted()));
 }
+
+#[test]
+fn the_creator_learns_what_its_nested_bodies_were_written_as() {
+    let tcx = Tcx::new();
+    let mut child_body = empty_body(&tcx);
+    let kind = CoroutineKind::Desugared(CoroutineDesugaring::Async, CoroutineSource::Block);
+    child_body.coroutine = Some(CoroutineInfo { yield_ty: tcx.tys.unit, resume_ty: tcx.tys.unit, kind });
+    let body = empty_body(&tcx); let moves = MoveData::gather_moves(&body, &test_prog(), &tcx, crate::tcx::TypingEnv::fully_monomorphized(&test_prog()), &|_| true);
+    let stat = tcx.tys.intern_region(RegionKind::ReStatic);
+    let (child, mut cf) = typeck(&tcx, &child_body, &[(stat, Class::Global)], vec![]);
+    let (mut parent, mut pf) = typeck(&tcx, &body, &[(stat, Class::Global)], vec![]);
+    parent.summary.deferred_closure_requirements = vec![DeferredClosureRequirement { def: ClauseOwner::Coroutine(CHILD), args: vec![], locations: Locations::Single(at(0, 0)) }];
+    pf.query_ty = Some(tcx.tys.i32_);
+    let prog = test_prog();
+    let result = BorrowCheckRootCtxt { tcx: &tcx, prog: &prog }.do_mir_borrowck(vec![
+        RootBody { key: ClauseOwner::Coroutine(CHILD), body: &child_body, moves: &moves, infcx: &mut cf, typeck: child, nested: true },
+        RootBody { key: ClauseOwner::Def(DefId(0)), body: &body, moves: &moves, infcx: &mut pf, typeck: parent, nested: false },
+    ]);
+    assert_eq!(result.bodies[1].coroutine_kinds, vec![(CHILD.expr, kind)]);
+    assert!(result.bodies[0].coroutine_kinds.is_empty());
+}

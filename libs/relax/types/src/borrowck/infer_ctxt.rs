@@ -84,7 +84,7 @@ impl<'tcx> std::ops::Deref for BorrowckInferCtxt<'tcx> {
 use super::type_check::{BorrowckTypeOps, ClauseOwner, FnSig, PolyFnSig, Locations, MirTypeckRegionConstraints, UserType};
 use super::constraints::ConstraintCategory;
 use crate::consts::GenericArg;
-use crate::mir::{self, Location, Span, Body, Place, PlaceTy, FieldIdx, AggregateKind, Rvalue, ConstOperand};
+use crate::mir::{self, Location, Span, Body, PlaceTy, FieldIdx, AggregateKind, Rvalue, ConstOperand};
 use crate::lang_items::LangItem;
 use crate::types::{UniverseIndex, AliasTyKind};
 use crate::types::variance::V;
@@ -401,7 +401,6 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         let def = self.tcx.lang_items.get(LangItem::Sized).expect("Sized lang item");
         self.infcx.evaluate_obligation(self.prog, Goal { param_env: self.param_env_id(), predicate: crate::next_solver::collect::trait_predicate(def, vec![GenericArg::Type(ty)]) }).must_apply_modulo_regions()
     }
-    fn is_upvar_field_projection(&self, _: &Body, _: &Place) -> Option<FieldIdx> { panic!("M2b: MIR capture metadata for upvar field projections") }
     fn simd_const_arg(&self, def: DefId) -> Option<(usize, &'static str)> {
         if !self.tcx.fn_item_sig(self.prog, def).is_some_and(|s| s.header.abi == crate::types::Abi::RelaxIntrinsic) { return None; }
         match self.prog.name(def) { "simd_shuffle" => Some((2, "simd_shuffle")), "simd_insert" => Some((1, "simd_insert")), "simd_extract" => Some((1, "simd_extract")), _ => None }
