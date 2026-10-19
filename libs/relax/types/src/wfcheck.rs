@@ -197,6 +197,28 @@ impl Tcx {
         errors
     }
 
+    /// rustc `HasErrorDeep`: an error in a field type, through the fields of the ADTs it names.
+    fn error_deep(&self, d: DefId, seen: &mut Vec<DefId>) -> bool {
+        fn walk(tcx: &Tcx, t: TyId, seen: &mut Vec<DefId>, depth: u32) -> bool {
+            if depth > 32 { return false; }
+            if tcx.tys.has_error(t) { return true; }
+            match tcx.tys.kind(t).clone() {
+                TyKind::Adt(d, args, _) => {
+                    let mut hit = tcx.tys.list(args).iter().any(|&a| walk(tcx, a, seen, depth + 1));
+                    if !hit && !seen.contains(&d) {
+                        seen.push(d);
+                        if let Some(a) = tcx.adts.get(&d) { hit = a.variants.iter().any(|v| v.fields.iter().any(|f| walk(tcx, f.ty, seen, depth + 1))); }
+                    }
+                    hit
+                }
+                TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) | TyKind::Slice(i) | TyKind::Array(i, _) => walk(tcx, i, seen, depth + 1),
+                TyKind::Tuple(l) => tcx.tys.list(l).iter().any(|&a| walk(tcx, a, seen, depth + 1)),
+                _ => false,
+            }
+        }
+        self.adts.get(&d).is_some_and(|adt| adt.variants.iter().any(|v| v.fields.iter().any(|f| walk(self, f.ty, seen, 0))))
+    }
+
     /// check_variances_for_type_defn: a parameter of a struct, enum or union that no field uses
     /// and no projection predicate constrains (E0392).
     pub fn check_type_defn_variances(&self, prog: &Program, d: DefId) -> Vec<String> {
@@ -209,7 +231,7 @@ impl Tcx {
         let mut constrained: HashSet<Parameter> = variances.iter().enumerate().filter(|(_, v)| **v != V::Bi).map(|(i, _)| i as u32).collect();
         self.identify_constrained_generic_params(prog, &indices, self.own_clauses_of(prog, d), None, &mut constrained);
         // an error deep in a field type: the unused parameter is not reported
-        if self.adts.get(&d).is_some_and(|adt| adt.variants.iter().any(|v| v.fields.iter().any(|f| self.tys.has_error(f.ty)))) { return Vec::new(); }
+        if self.error_deep(d, &mut vec![d]) { return Vec::new(); }
         let mut errors = Vec::new();
         for (index, p) in ast.list(generics.params).iter().enumerate() {
             if constrained.contains(&(index as u32)) || variances.get(index).is_none() { continue; }
