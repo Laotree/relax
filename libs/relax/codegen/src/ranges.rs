@@ -752,8 +752,30 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
             }
             let mut ds: Vec<u32> = Vec::new();
             for_defs(i, |d| ds.push(d.0));
+            // a copy `d = s` holds what is known of s's order against other values: a later
+            // redefinition of s (the counter's increment) leaves the facts about the copy, which
+            // is the value the bounds check after the step reads
+            let copied: Vec<(Cond, bool, u32, Opnd)> = match &*i {
+                Inst::Mov(d, x) if d != x => st
+                    .rel
+                    .iter()
+                    .filter_map(|&(c, sg, a, b)| {
+                        if a == x.0 && b != Opnd::V(d.0) {
+                            Some((c, sg, d.0, b))
+                        } else if b == Opnd::V(x.0) && a != d.0 {
+                            Some((c, sg, a, Opnd::V(d.0)))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             for d in &ds {
                 st.kill(*d);
+            }
+            for c in copied {
+                push_capped(&mut st.rel, c);
             }
             if let [d] = ds[..] {
                 let r = match &*i {

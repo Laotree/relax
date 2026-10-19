@@ -500,7 +500,13 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
     let nb0 = f.blocks.len();
     let mut ndef = vec![0u32; f.vregs.len()];
     let mut nuse = vec![0u32; f.vregs.len()];
-    for b in &f.blocks {
+    // uses in blocks nothing reaches (a bounds check's panic call once the check folded) count
+    // for nothing
+    let reach = crate::regalloc::reachable(f);
+    for (bk, b) in f.blocks.iter().enumerate() {
+        if !reach[bk] {
+            continue;
+        }
         for i in &b.insts {
             for_defs(i, |d| ndef[d.0 as usize] += 1);
             for_uses(i, |u| nuse[u.0 as usize] += 1);
@@ -557,6 +563,7 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
         let mut used: Vec<bool> = vec![false; n];
         used[n - 1] = true;
         used[idefs[0]] = true;
+        let mut inc_at = idefs[0];
         let it = match b.insts[idefs[0]] {
             Inst::IBinI(IOp::Add, it, d, a, 1) if d == iv && a == iv => it,
             Inst::Mov(d, t) if d == iv => match b.insts[..idefs[0]].iter().enumerate().rev().find(|(_, i)| {
@@ -566,6 +573,7 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
             }) {
                 Some((ti, Inst::IBinI(IOp::Add, it, _, a, 1))) if *a == iv && ndef[t.0 as usize] == 1 && nuse[t.0 as usize] == 1 => {
                     used[ti] = true;
+                    inc_at = ti;
                     *it
                 }
                 _ => continue,
@@ -581,13 +589,32 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
             for_defs(&b.insts[*k], |x| d |= x == v);
             d
         });
+        // the counter's value before the step: the counter itself (`Some(None)`) or a copy of it
+        // taken before the step (`j = i; i = i + 1; load [j]`, an iterator's next inlined: the
+        // Mov to mark used)
+        let counter_copy = |ix: VReg| -> Option<Option<usize>> {
+            if ix == iv {
+                return Some(None);
+            }
+            if ndef[ix.0 as usize] != 1 || nuse[ix.0 as usize] != 1 {
+                return None;
+            }
+            match def_at(ix) {
+                Some(mk) if mk < inc_at && matches!(b.insts[mk], Inst::Mov(d2, s2) if d2 == ix && s2 == iv) => Some(Some(mk)),
+                _ => None,
+            }
+        };
         let mut load: Option<(usize, VReg, VReg, u8)> = None; // (index, x, base, size bytes)
         for (k, i) in b.insts.iter().enumerate() {
             match *i {
-                Inst::LoadX(Mem::Int(sz @ (4 | 8), sg), x, base, ix, sh, 0) if ix == iv && (1u32 << sh) == sz as u32 && !(sz == 4 && sg) && !defined_in(base) => {
+                Inst::LoadX(Mem::Int(sz @ (4 | 8), sg), x, base, ix, sh, 0) if (1u32 << sh) == sz as u32 && !(sz == 4 && sg) && !defined_in(base) => {
+                    let Some(copy) = counter_copy(ix) else { continue };
                     if load.is_some() {
                         load = None;
                         break;
+                    }
+                    if let Some(mk) = copy {
+                        used[mk] = true;
                     }
                     load = Some((k, x, base, sz));
                     used[k] = true;
@@ -619,10 +646,14 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
                         Some(sk) if ndef[s.0 as usize] == 1 && nuse[s.0 as usize] == 1 => sk,
                         _ => continue,
                     };
-                    let ok = matches!(b.insts[sk], Inst::IBinI(IOp::Shl, it2, _, a2, k2) if a2 == iv && k2 == sh && it2.bits == 64)
-                        || matches!(b.insts[sk], Inst::IBinI(IOp::Mul, it2, _, a2, k2) if a2 == iv && k2 == sz as i64 && it2.bits == 64);
-                    if !ok {
-                        continue;
+                    let idx = match b.insts[sk] {
+                        Inst::IBinI(IOp::Shl, it2, _, a2, k2) if k2 == sh && it2.bits == 64 => counter_copy(a2),
+                        Inst::IBinI(IOp::Mul, it2, _, a2, k2) if k2 == sz as i64 && it2.bits == 64 => counter_copy(a2),
+                        _ => None,
+                    };
+                    let Some(idx) = idx else { continue };
+                    if let Some(mk) = idx {
+                        used[mk] = true;
                     }
                     load = Some((k, x, base, sz));
                     used[k] = true;
