@@ -3375,7 +3375,9 @@ impl<'a> Fcx<'a> {
     /// (ambiguity is a match). A rigid opaque or param self type is proven through its
     /// alias bounds / where-clauses by the solver like any other type.
     fn extension_candidates(&mut self, t: TyId, name: Sym, kind: DefKind) -> Vec<(DefId, DefId)> {
-        if matches!(self.tcx.tys.kind(t), TyKind::Infer(_) | TyKind::Error) { return Vec::new(); }
+        // (Mode::Path probes an unresolved self type too -- `<_>::try_from(x)`: probe_op has no
+        // bad-type check there, every trait in scope with the item may apply)
+        if matches!(self.tcx.tys.kind(t), TyKind::Error) { return Vec::new(); }
         let mut traits = self.traits_in_scope();
         traits.extend(self.param_bound_traits(t));
         traits.sort_by_key(|d| d.0);
