@@ -14,6 +14,7 @@ use crate::lang_items::{LangItem, LangItems};
 mod collected;
 mod declarations;
 mod regions;
+pub mod arg_count;
 pub(crate) mod lifetime_resolve;
 pub(crate) mod resolve_bound_vars;
 mod discriminant;
@@ -2544,6 +2545,18 @@ impl Tcx {
             for (pn, pr) in crate::program::PRIMS {
                 if pn == name {
                     return self.tys.prim(pr);
+                }
+            }
+        }
+        // hir_ty_lowering check_generic_arg_count (a written type; an expression path's prefix
+        // infers what is left out): the error type for a wrong number of arguments
+        if source_ty.is_some() && matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias) {
+            if let Some(seg) = prog.files[file as usize].ast.segs(p.segs).last() {
+                let ast = &prog.files[file as usize].ast;
+                let errs = self.check_generic_arg_count(prog, d, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, d, None), arg_count::ArgPosition::Type, false, false);
+                if !errs.is_empty() {
+                    for e in errs { self.err(cx, prog, file, seg.name.lo, e); }
+                    return self.tys.error;
                 }
             }
         }
