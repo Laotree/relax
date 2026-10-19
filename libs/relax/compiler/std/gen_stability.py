@@ -63,7 +63,9 @@ def scan(crate, root, f, out):
             in_trait_impl = any(k == 'impl_for' for _, k, _ in stack)
             if m:
                 kind, name = m.group(1), m.group(2)
-                if pending and not in_trait_impl:
+                # `pub mod x {}` under cfg(doc ..): a documentation placeholder, not the module
+                placeholder = kind == 'mod' and re.search(r'\{\s*\}', line)
+                if pending and not in_trait_impl and not placeholder:
                     path = '::'.join(base + [n for _, k, n in stack if k in ('mod', 'type', 'trait')] + [name])
                     out.append((path, pending[0], pending[1]))
                 if kind == 'mod' and '{' in line: opened = ('mod', name)
@@ -80,8 +82,16 @@ def scan(crate, root, f, out):
                         tn = re.match(r'\s*[&*]?\s*(?:mut\s+|const\s+)?(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Za-z_][A-Za-z0-9_]*)', body)
                         opened = ('type', tn.group(1) if tn else '') if '{' in line else None
                     pending = None
-                elif pending and not s.startswith('pub use') and not MACRO.match(line) and not s.startswith('#'):
+                elif pending and re.match(r'^(?:pub(?:\([^)]*\))?\s+)?use\b', s):
+                    # a re-export carries its own stability: `pub use a::b::c [as d];`
+                    mu = re.match(r'^(?:pub(?:\([^)]*\))?\s+)?use\s+[A-Za-z0-9_:]*?([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?\s*;', s)
+                    if mu and not in_trait_impl:
+                        out.append(('::'.join(base + [n for _, k, n in stack if k in ('mod', 'type', 'trait')] + [mu.group(2) or mu.group(1)]), pending[0], pending[1]))
+                    pending = None
+                elif pending and (MACRO.match(line) or s.startswith('macro_rules!') or s.startswith('#')):
                     pass
+                elif pending:
+                    pending = None   # a field, a statement ..: the attribute was not on an item
         o, c = line.count('{'), line.count('}')
         if opened and o > 0:
             stack.append((depth + 1, opened[0], opened[1]))

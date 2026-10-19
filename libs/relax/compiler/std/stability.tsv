@@ -3,7 +3,6 @@ alloc::alloc::Global	allocator_api
 alloc::alloc::__alloc_error_handler	alloc_internals	
 alloc::borrow::Cow::is_borrowed	cow_is_borrowed	
 alloc::borrow::Cow::is_owned	cow_is_borrowed	
-alloc::boxed::Box	thin_box	
 alloc::boxed::Box::allocator	allocator_api	
 alloc::boxed::Box::as_mut_ptr	box_as_ptr	
 alloc::boxed::Box::as_ptr	box_as_ptr	
@@ -18,7 +17,6 @@ alloc::boxed::Box::into_inner	box_into_inner
 alloc::boxed::Box::into_non_null	box_vec_non_null	
 alloc::boxed::Box::into_non_null_with_allocator	allocator_api	
 alloc::boxed::Box::into_raw_with_allocator	allocator_api	
-alloc::boxed::Box::into_unique	ptr_internals	use `Box::leak(b).into()` or `Unique::from(Box::leak(b))` instead
 alloc::boxed::Box::map	smart_pointer_try_map	
 alloc::boxed::Box::new_in	allocator_api	
 alloc::boxed::Box::new_uninit_in	allocator_api	
@@ -40,14 +38,13 @@ alloc::boxed::Box::try_new_zeroed	allocator_api
 alloc::boxed::Box::try_new_zeroed_in	allocator_api	
 alloc::boxed::Box::try_new_zeroed_slice	allocator_api	
 alloc::boxed::Box::try_new_zeroed_slice_in	allocator_api	
+alloc::boxed::ThinBox	thin_box	
 alloc::boxed::box_assume_init_into_vec_unsafe	liballoc_internals	
-alloc::boxed::box_new_uninit	allocator_api	
 alloc::boxed::convert::Box::downcast_unchecked	downcast_unchecked	
 alloc::boxed::thin::ThinBox	thin_box	
 alloc::bstr	bstr	
+alloc::bstr::ByteStr	bstr	
 alloc::bstr::ByteString	bstr	
-alloc::collections::TryReserveError::kind	try_reserve_kind	Uncertain how much info should be exposed
-alloc::collections::TryReserveErrorKind	try_reserve_kind	Uncertain how much info should be exposed
 alloc::collections::binary_heap::BinaryHeap::allocator	allocator_api	
 alloc::collections::binary_heap::BinaryHeap::as_mut_slice	binary_heap_as_mut_slice	
 alloc::collections::binary_heap::BinaryHeap::drain_sorted	binary_heap_drain_sorted	
@@ -62,7 +59,6 @@ alloc::collections::binary_heap::DrainSorted::allocator	allocator_api
 alloc::collections::binary_heap::IntoIter::allocator	allocator_api	
 alloc::collections::binary_heap::IntoIterSorted	binary_heap_into_iter_sorted	
 alloc::collections::binary_heap::IntoIterSorted::allocator	allocator_api	
-alloc::collections::binary_heap::PeekMut	allocator_api	
 alloc::collections::binary_heap::PeekMut::refresh	binary_heap_peek_mut_refresh	
 alloc::collections::btree::map::BTreeMap::lower_bound	btree_cursors	
 alloc::collections::btree::map::BTreeMap::lower_bound_mut	btree_cursors	
@@ -101,10 +97,8 @@ alloc::collections::btree::map::CursorMutKey::peek_prev	btree_cursors
 alloc::collections::btree::map::CursorMutKey::prev	btree_cursors	
 alloc::collections::btree::map::CursorMutKey::remove_next	btree_cursors	
 alloc::collections::btree::map::CursorMutKey::remove_prev	btree_cursors	
-alloc::collections::btree::map::ExtractIfInner	allocator_api	
 alloc::collections::btree::map::UnorderedKeyError	btree_cursors	
 alloc::collections::btree::map::entry::OccupiedError	map_try_insert	
-alloc::collections::btree::set::BTreeSet	btree_set_entry	
 alloc::collections::btree::set::BTreeSet::entry	btree_set_entry	
 alloc::collections::btree::set::BTreeSet::get_or_insert	btree_set_entry	
 alloc::collections::btree::set::BTreeSet::get_or_insert_with	btree_set_entry	
@@ -143,9 +137,7 @@ alloc::collections::btree::set::CursorMutKey::peek_prev	btree_cursors
 alloc::collections::btree::set::CursorMutKey::prev	btree_cursors	
 alloc::collections::btree::set::CursorMutKey::remove_next	btree_cursors	
 alloc::collections::btree::set::CursorMutKey::remove_prev	btree_cursors	
-alloc::collections::btree::set::DifferenceInner	allocator_api	
-alloc::collections::btree::set::IntersectionInner	allocator_api	
-alloc::collections::btree::set::Range	allocator_api	
+alloc::collections::btree::set::UnorderedKeyError	btree_cursors	
 alloc::collections::btree::set::entry::Entry	btree_set_entry	
 alloc::collections::btree::set::entry::Entry::get	btree_set_entry	
 alloc::collections::btree::set::entry::Entry::insert	btree_set_entry	
@@ -157,7 +149,6 @@ alloc::collections::btree::set::entry::VacantEntry	btree_set_entry
 alloc::collections::btree::set::entry::VacantEntry::get	btree_set_entry	
 alloc::collections::btree::set::entry::VacantEntry::insert	btree_set_entry	
 alloc::collections::btree::set::entry::VacantEntry::into_value	btree_set_entry	
-alloc::collections::btree::set::tests	btree_cursors	
 alloc::collections::linked_list::Cursor	linked_list_cursors	
 alloc::collections::linked_list::Cursor::as_list	linked_list_cursors	
 alloc::collections::linked_list::Cursor::back	linked_list_cursors	
@@ -200,7 +191,8 @@ alloc::collections::linked_list::LinkedList::cursor_front_mut	linked_list_cursor
 alloc::collections::linked_list::LinkedList::new_in	allocator_api	
 alloc::collections::linked_list::LinkedList::remove	linked_list_remove	
 alloc::collections::linked_list::LinkedList::retain	linked_list_retain	
-alloc::collections::linked_list::Node	allocator_api	
+alloc::collections::vec_deque::ExtractIf	vec_deque_extract_if	
+alloc::collections::vec_deque::Splice	deque_extend_front	
 alloc::collections::vec_deque::VecDeque::allocator	allocator_api	
 alloc::collections::vec_deque::VecDeque::extend_from_within	deque_extend_front	
 alloc::collections::vec_deque::VecDeque::extend_front	deque_extend_front	
@@ -212,16 +204,12 @@ alloc::collections::vec_deque::VecDeque::splice	deque_extend_front
 alloc::collections::vec_deque::VecDeque::truncate_front	vec_deque_truncate_front	
 alloc::collections::vec_deque::VecDeque::try_with_capacity	try_with_capacity	
 alloc::collections::vec_deque::VecDeque::with_capacity_in	allocator_api	
-alloc::collections::vec_deque::extract_if	vec_deque_extract_if	
-alloc::collections::vec_deque::extract_if::ExtractIf	vec_deque_extract_if	
 alloc::collections::vec_deque::extract_if::ExtractIf::allocator	allocator_api	
 alloc::collections::vec_deque::iter::Iter::as_slices	vec_deque_iter_as_slices	
 alloc::collections::vec_deque::iter_mut::IterMut::as_mut_slices	vec_deque_iter_as_slices	
 alloc::collections::vec_deque::iter_mut::IterMut::as_slices	vec_deque_iter_as_slices	
 alloc::collections::vec_deque::iter_mut::IterMut::into_slices	vec_deque_iter_as_slices	
-alloc::collections::vec_deque::splice	deque_extend_front	
 alloc::collections::vec_deque::splice::Splice	deque_extend_front	
-alloc::fmt::format	formatting_options	
 alloc::intrinsics	liballoc_internals	
 alloc::raw_vec	raw_vec_internals	unstable const warnings
 alloc::rc::Rc::allocator	allocator_api	
@@ -331,6 +319,7 @@ alloc::task::LocalWake::wake	local_waker
 alloc::task::LocalWake::wake_by_ref	local_waker	
 alloc::task::local_waker_fn	waker_fn	
 alloc::task::waker_fn	waker_fn	
+alloc::vec::PeekMut	vec_peek_mut	
 alloc::vec::Vec::allocator	allocator_api	
 alloc::vec::Vec::as_non_null	box_vec_non_null	
 alloc::vec::Vec::const_make_global	const_heap	
@@ -359,7 +348,6 @@ alloc::vec::extract_if::ExtractIf::allocator	allocator_api
 alloc::vec::from_elem_in	allocator_api	
 alloc::vec::into_iter::IntoIter::allocator	allocator_api	
 alloc::vec::into_iter::NonDrop	std_internals	
-alloc::vec::peek_mut	vec_peek_mut	
 alloc::vec::peek_mut::PeekMut	vec_peek_mut	
 alloc::vec::peek_mut::PeekMut::pop	vec_peek_mut	
 alloc::vec::with_capacity_in	allocator_api	
@@ -379,10 +367,6 @@ core::any::dyn::downcast_unchecked_ref	downcast_unchecked
 core::any::try_as_dyn	try_as_dyn	
 core::any::try_as_dyn_mut	try_as_dyn	
 core::arch::breakpoint	breakpoint	
-core::array::::rsplit_array_mut	split_array	return type should have array as 2nd element
-core::array::::rsplit_array_ref	split_array	return type should have array as 2nd element
-core::array::::split_array_mut	split_array	return type should have array as 2nd element
-core::array::::split_array_ref	split_array	return type should have array as 2nd element
 core::array::::try_map	array_try_map	
 core::array::ascii::::as_ascii	ascii_char	
 core::array::ascii::::as_ascii_unchecked	ascii_char	
@@ -391,7 +375,7 @@ core::array::iter::IntoIter::empty	array_into_iter_constructors
 core::array::iter::IntoIter::new_unchecked	array_into_iter_constructors	
 core::array::iter::NonDrop	std_internals	
 core::array::try_from_fn	array_try_from_fn	
-core::ascii::EscapeDefault	ascii_char	
+core::ascii::Char	ascii_char	
 core::ascii::ascii_char::::as_bytes	ascii_char	
 core::ascii::ascii_char::::as_str	ascii_char	
 core::ascii::ascii_char::AsciiChar	ascii_char	
@@ -449,6 +433,9 @@ core::bstr::ByteStr::as_mut_byte_str	bstr
 core::bstr::ByteStr::from_bytes	bstr_internals	
 core::bstr::ByteStr::from_bytes_mut	bstr_internals	
 core::bstr::ByteStr::new	bstr	
+core::bstr::traits::impl_partial_eq	bstr_internals	
+core::bstr::traits::impl_partial_eq_n	bstr_internals	
+core::bstr::traits::impl_partial_eq_ord	bstr_internals	
 core::cell::CloneFromCell	cell_get_cloned	
 core::cell::Ref::leak	cell_leak	
 core::cell::Ref::try_map	refcell_try_map	
@@ -464,9 +451,8 @@ core::cell::once::OnceCell::get_mut_or_init	once_cell_get_mut
 core::cell::once::OnceCell::get_mut_or_try_init	once_cell_get_mut	
 core::cell::once::OnceCell::get_or_try_init	once_cell_try	
 core::cell::once::OnceCell::try_insert	once_cell_try_insert	
-core::char::CaseMappingIter	titlecase	
 core::char::CharCase	titlecase	
-core::char::TAG_CONT	char_internals	exposed only for libstd
+core::char::encode_utf16_raw	char_internals	exposed only for libstd
 core::char::methods::char::as_ascii	ascii_char	
 core::char::methods::char::as_ascii_unchecked	ascii_char	
 core::char::methods::char::case	titlecase	
@@ -478,12 +464,8 @@ core::char::methods::char::is_case_ignorable	case_ignorable
 core::char::methods::char::is_cased	titlecase	
 core::char::methods::char::is_titlecase	titlecase	
 core::char::methods::char::to_titlecase	titlecase	
-core::clone::AssertParamIsClone	derive_clone_copy_internals	deriving hack, should not be public
-core::clone::AssertParamIsCopy	derive_clone_copy_internals	deriving hack, should not be public
 core::clone::CloneToUninit	clone_to_uninit	
-core::clone::TrivialClone	trivial_clone	this isn't part of any API guarantee
 core::clone::UseCloned	ergonomic_clones	
-core::cmp::AssertParamIsEq	derive_eq_internals	deriving hack, should not be public
 core::cmp::Eq::assert_fields_are_eq	derive_eq_internals	
 core::cmp::__chaining_ge	partial_ord_chaining_methods	
 core::cmp::__chaining_gt	partial_ord_chaining_methods	
@@ -494,13 +476,13 @@ core::cmp::minmax_by	cmp_minmax
 core::cmp::minmax_by_key	cmp_minmax	
 core::contracts	contracts	
 core::contracts::build_check_ensures	contracts_internals	
-core::convert::identity	convert_float_to_int	
+core::convert::FloatToInt	convert_float_to_int	
 core::convert::num::FloatToInt	convert_float_to_int	
 core::convert::num::FloatToInt::to_int_unchecked	convert_float_to_int	
 core::convert::num::private::Sealed	convert_float_to_int	
 core::core_simd	portable_simd	
+core::derive	derive_macro_global_path	
 core::error::Error::provide	error_generic_member_access	
-core::error::Error::type_id	error_type_id	this is memory-unsafe to override in user code
 core::error::Request	error_generic_member_access	
 core::error::Request::provide_ref	error_generic_member_access	
 core::error::Request::provide_ref_with	error_generic_member_access	
@@ -516,10 +498,7 @@ core::error::request_value	error_generic_member_access
 core::ffi::c_str::Bytes	cstr_bytes	
 core::ffi::c_str::CStr::as_c_str	str_as_str	
 core::ffi::c_str::CStr::bytes	cstr_bytes	
-core::ffi::c_str::CStr::display	cstr_display	
 core::ffi::c_str::strlen	cstr_internals	
-core::ffi::c_void	c_size_t	
-core::ffi::primitives	c_variadic	the `c_variadic` feature has not been properly tested on all supported platforms
 core::ffi::primitives::c_ptrdiff_t	c_size_t	
 core::ffi::primitives::c_size_t	c_size_t	
 core::ffi::primitives::c_ssize_t	c_size_t	
@@ -565,7 +544,6 @@ core::fmt::FormattingOptions::precision	formatting_options
 core::fmt::FormattingOptions::sign	formatting_options	
 core::fmt::FormattingOptions::sign_aware_zero_pad	formatting_options	
 core::fmt::FormattingOptions::width	formatting_options	
-core::fmt::Result	int_format_into	
 core::fmt::Sign	formatting_options	
 core::fmt::builders::DebugList::entry_with	debug_closure_helpers	
 core::fmt::builders::DebugMap::key_with	debug_closure_helpers	
@@ -573,10 +551,8 @@ core::fmt::builders::DebugMap::value_with	debug_closure_helpers
 core::fmt::builders::DebugSet::entry_with	debug_closure_helpers	
 core::fmt::builders::DebugStruct::field_with	debug_closure_helpers	
 core::fmt::builders::DebugTuple::field_with	debug_closure_helpers	
-core::fmt::num::::_fmt	fmt_internals	specialized method meant to only be used by `SpecToString` implementation
 core::fmt::num::::format_into	int_format_into	
 core::fmt::num::i128::format_into	int_format_into	
-core::fmt::num::u128::_fmt	fmt_internals	specialized method meant to only be used by `SpecToString` implementation
 core::fmt::num::u128::format_into	int_format_into	
 core::fmt::num_buffer::NumBuffer	int_format_into	
 core::fmt::num_buffer::NumBuffer::capacity	int_format_into	
@@ -584,15 +560,16 @@ core::fmt::num_buffer::NumBuffer::new	int_format_into
 core::fmt::num_buffer::NumBufferTrait	int_format_into	
 core::fmt::rt	fmt_internals	internal to format_args!
 core::from	derive_from	
+core::from::From	derive_from	
 core::future::ResumeTy	gen_future	
 core::future::async_drop	async_drop	
 core::future::async_drop::AsyncDrop	async_drop	
 core::future::get_context	gen_future	
+core::future::join	future_join	
 core::future::join::MaybeDone	future_join	
 core::hash::Hasher::write_length_prefix	hasher_prefixfree_extras	
 core::hash::Hasher::write_str	hasher_prefixfree_extras	
-core::hash::sip	hashmap_internals	
-core::hash::sip::SipHasher13	hashmap_internals	use `std::hash::DefaultHasher` instead
+core::hash::SipHasher13	hashmap_internals	
 core::hash::sip::SipHasher13::new	hashmap_internals	
 core::hash::sip::SipHasher13::new_with_keys	hashmap_internals	
 core::hash::sip::SipHasher24	hashmap_internals	
@@ -608,7 +585,6 @@ core::hint::unlikely	likely_unlikely
 core::index	sliceindex_wrappers	
 core::index::Clamp	sliceindex_wrappers	
 core::index::Last	sliceindex_wrappers	
-core::internal_macros	derive_macro_global_path	
 core::intrinsics	core_intrinsics	intrinsics are unlikely to ever be stabilized, instead they should be used through stabilized interfaces in the rest of the standard library
 core::intrinsics::aggregate_raw_ptr	core_intrinsics	
 core::intrinsics::align_of	core_intrinsics	
@@ -644,6 +620,9 @@ core::intrinsics::variant_count	core_intrinsics
 core::intrinsics::vtable_align	core_intrinsics	
 core::intrinsics::vtable_size	core_intrinsics	
 core::io	core_io	
+core::io::Cursor	core_io	
+core::io::ErrorKind	core_io	
+core::io::RawOsError	raw_os_error_ty	
 core::io::borrowed_buf	core_io_borrowed_buf	
 core::io::borrowed_buf::BorrowedBuf::is_init	borrowed_buf_init	
 core::io::borrowed_buf::BorrowedBuf::set_init	borrowed_buf_init	
@@ -659,10 +638,23 @@ core::io::error::ErrorKind::from_prim	core_io_internals	exposed only for libstd
 core::io::error::RawOsError	raw_os_error_ty	
 core::io::util::Take::position	seek_io_take_position	
 core::io::util::chain	core_io_internals	exposed only for libstd
-core::io::util::repeat	core_io_internals	exposed only for libstd
 core::io::util::take	core_io_internals	exposed only for libstd
-core::iter::adapters	trusted_step	
+core::iter::ArrayChunks	iter_array_chunks	
+core::iter::ByRefSized	std_internals	
+core::iter::InPlaceIterable	inplace_iteration	
+core::iter::MapWindows	iter_map_windows	
+core::iter::SourceIter	inplace_iteration	
+core::iter::TrustedFused	trusted_fused	
+core::iter::TrustedLen	trusted_len	
+core::iter::TrustedRandomAccess	trusted_random_access	
+core::iter::TrustedRandomAccessNoCoerce	trusted_random_access	
+core::iter::TrustedStep	trusted_step	
+core::iter::adapters::ArrayChunks	iter_array_chunks	
+core::iter::adapters::ByRefSized	std_internals	
+core::iter::adapters::MapWindows	iter_map_windows	
 core::iter::adapters::SourceIter	inplace_iteration	
+core::iter::adapters::TrustedRandomAccess	trusted_random_access	
+core::iter::adapters::TrustedRandomAccessNoCoerce	trusted_random_access	
 core::iter::adapters::array_chunks::ArrayChunks	iter_array_chunks	
 core::iter::adapters::array_chunks::into_remainder	iter_array_chunks	
 core::iter::adapters::by_ref_sized::ByRefSized	std_internals	
@@ -675,9 +667,14 @@ core::iter::adapters::map_windows::MapWindows	iter_map_windows
 core::iter::adapters::rev::Rev::into_inner	rev_into_inner	
 core::iter::adapters::zip::TrustedRandomAccess	trusted_random_access	
 core::iter::adapters::zip::TrustedRandomAccessNoCoerce	trusted_random_access	
+core::iter::iter	iter_macro	generators are unstable
 core::iter::range::Step	step_trait	
 core::iter::sources::from_coroutine::FromCoroutine	iter_from_coroutine	coroutines are unstable
 core::iter::sources::from_coroutine::from_coroutine	iter_from_coroutine	coroutines are unstable
+core::iter::sources::iter	iter_macro	generators are unstable
+core::iter::traits::InPlaceIterable	inplace_iteration	
+core::iter::traits::TrustedFused	trusted_fused	
+core::iter::traits::TrustedStep	trusted_step	
 core::iter::traits::collect::Extend::extend_one	extend_one	
 core::iter::traits::collect::Extend::extend_one_unchecked	extend_one_unchecked	
 core::iter::traits::collect::Extend::extend_reserve	extend_one	
@@ -707,19 +704,16 @@ core::marker::BikeshedGuaranteedNoDrop	bikeshed_guaranteed_no_drop
 core::marker::CoercePointeeValidated	coerce_pointee_validated	
 core::marker::CoerceShared	reborrow	
 core::marker::ConstParamTy_	const_param_ty_trait	
-core::marker::Copy	structural_match	
 core::marker::Destruct	const_destruct	
-core::marker::DiscriminantKind	discriminant_kind	this trait is unlikely to ever be stabilized, use `mem::discriminant` instead
-core::marker::FnPtr	fn_ptr_trait	internal trait for implementing various traits for all function pointers
-core::marker::MetaSized	sized_hierarchy	
-core::marker::PhantomPinned	unsafe_unpin	
-core::marker::PointeeSized	sized_hierarchy	
 core::marker::Reborrow	reborrow	
 core::marker::StructuralPartialEq	structural_match	
 core::marker::Tuple	tuple_trait	
 core::marker::Unsize	unsize	
 core::marker::_	adt_const_params	
 core::marker::variance	phantom_variance_markers	
+core::mem::Alignment	ptr_alignment_type	
+core::mem::DropGuard	drop_guard	
+core::mem::MaybeDangling	maybe_dangling	
 core::mem::SizedTypeProperties	sized_type_properties	
 core::mem::SizedTypeProperties::ALIGN	sized_type_properties	
 core::mem::SizedTypeProperties::ALIGNMENT	ptr_alignment_type	
@@ -730,7 +724,6 @@ core::mem::SizedTypeProperties::SIZE	sized_type_properties
 core::mem::align_of_val_raw	layout_for_ptr	
 core::mem::alignment::Alignment	ptr_alignment_type	
 core::mem::alignment::Alignment::MIN	ptr_alignment_type	
-core::mem::alignment::Alignment::as_nonzero	ptr_alignment_type	
 core::mem::alignment::Alignment::as_nonzero_usize	ptr_alignment_type	
 core::mem::alignment::Alignment::as_usize	ptr_alignment_type	
 core::mem::alignment::Alignment::log2	ptr_alignment_type	
@@ -742,12 +735,10 @@ core::mem::alignment::Alignment::of_val	ptr_alignment_type
 core::mem::alignment::Alignment::of_val_raw	ptr_alignment_type	
 core::mem::conjure_zst	mem_conjure_zst	
 core::mem::copy	mem_copy_fn	
-core::mem::drop_guard	transmutability	
 core::mem::drop_guard::DropGuard	drop_guard	
 core::mem::drop_guard::dismiss	drop_guard	
 core::mem::drop_guard::new	drop_guard	
 core::mem::forget_unsized	forget_unsized	
-core::mem::manually_drop	ptr_alignment_type	
 core::mem::maybe_dangling	maybe_dangling	
 core::mem::maybe_uninit::::as_bytes	maybe_uninit_as_bytes	
 core::mem::maybe_uninit::::as_bytes_mut	maybe_uninit_as_bytes	
@@ -760,7 +751,6 @@ core::mem::maybe_uninit::MaybeUninit::as_bytes	maybe_uninit_as_bytes
 core::mem::maybe_uninit::MaybeUninit::as_bytes_mut	maybe_uninit_as_bytes	
 core::mem::maybe_uninit::MaybeUninit::transpose	maybe_uninit_uninit_array_transpose	
 core::mem::size_of_val_raw	layout_for_ptr	
-core::mem::transmutability	maybe_dangling	
 core::mem::transmutability::Assume	transmutability	
 core::mem::transmutability::Assume::ALIGNMENT	transmutability	
 core::mem::transmutability::Assume::LIFETIMES	transmutability	
@@ -905,7 +895,6 @@ core::num::f128::f128::is_sign_positive	f128
 core::num::f128::f128::is_subnormal	f128	
 core::num::f128::f128::max	f128	
 core::num::f128::f128::maximum	f128	
-core::num::f128::f128::midpoint	f128	
 core::num::f128::f128::min	f128	
 core::num::f128::f128::minimum	f128	
 core::num::f128::f128::mul_add	f128	
@@ -1004,7 +993,6 @@ core::num::f16::f16::is_sign_positive	f16
 core::num::f16::f16::is_subnormal	f16	
 core::num::f16::f16::max	f16	
 core::num::f16::f16::maximum	f16	
-core::num::f16::f16::midpoint	f16	
 core::num::f16::f16::min	f16	
 core::num::f16::f16::minimum	f16	
 core::num::f16::f16::mul_add	f16	
@@ -1080,7 +1068,6 @@ core::num::f64::f64::clamp_magnitude	clamp_magnitude
 core::num::f64::f64::maximum	float_minimum_maximum	
 core::num::f64::f64::minimum	float_minimum_maximum	
 core::num::f64::math	core_float_math	
-core::num::f64::math::abs_sub	core_float_math	
 core::num::f64::math::cbrt	core_float_math	
 core::num::f64::math::ceil	core_float_math	
 core::num::f64::math::div_euclid	core_float_math	
@@ -1093,55 +1080,25 @@ core::num::f64::math::round	core_float_math
 core::num::f64::math::round_ties_even	core_float_math	
 core::num::f64::math::sqrt	core_float_math	
 core::num::f64::math::trunc	core_float_math	
-core::num::imp	num_internals	internal routines only exposed for testing
 core::num::imp::bignum	core_private_bignum	internal routines only exposed for testing
 core::num::imp::dec2flt	dec2flt	internal routines only exposed for testing
 core::num::imp::diy_float	core_private_diy_float	internal routines only exposed for testing
 core::num::imp::flt2dec	flt2dec	internal routines only exposed for testing
 core::num::imp::fmt	numfmt	internal routines only exposed for testing
 core::num::imp::traits	num_internals	internal routines only exposed for testing
-core::num::int_macros::borrowing_sub	signed_bigint_helpers	
-core::num::int_macros::carrying_add	signed_bigint_helpers	
-core::num::int_macros::carrying_mul	signed_bigint_helpers	
-core::num::int_macros::carrying_mul_add	signed_bigint_helpers	
-core::num::int_macros::checked_cast_unsigned	integer_cast_extras	
-core::num::int_macros::checked_div_exact	exact_div	
-core::num::int_macros::checked_next_multiple_of	int_roundings	
 core::num::int_macros::checked_truncate	integer_widen_truncate	
 core::num::int_macros::clamp_magnitude	clamp_magnitude	
-core::num::int_macros::div_ceil	int_roundings	
-core::num::int_macros::div_exact	exact_div	
-core::num::int_macros::div_floor	int_roundings	
-core::num::int_macros::next_multiple_of	int_roundings	
-core::num::int_macros::saturating_cast_unsigned	integer_cast_extras	
 core::num::int_macros::saturating_truncate	integer_widen_truncate	
-core::num::int_macros::shl_exact	exact_bitshifts	
-core::num::int_macros::shr_exact	exact_bitshifts	
-core::num::int_macros::strict_cast_unsigned	integer_cast_extras	
 core::num::int_macros::truncate	integer_widen_truncate	
-core::num::int_macros::unchecked_div_exact	exact_div	
-core::num::int_macros::unchecked_shl_exact	exact_bitshifts	
-core::num::int_macros::unchecked_shr_exact	exact_bitshifts	
 core::num::int_macros::widen	integer_widen_truncate	
-core::num::midpoint	nonzero_internals	implementation detail which may disappear or be replaced at any time
 core::num::niche_types	temporary_niche_types	for core, alloc, and std internals until pattern types are further along
 core::num::nonzero::NonZero::from_ascii	int_from_ascii	
 core::num::nonzero::NonZero::from_ascii_radix	int_from_ascii	
 core::num::nonzero::NonZero::from_be	nonzero_bitwise	
 core::num::nonzero::NonZero::from_le	nonzero_bitwise	
 core::num::nonzero::NonZero::from_str_radix	nonzero_from_str_radix	
-core::num::nonzero::NonZero::reverse_bits	nonzero_bitwise	
-core::num::nonzero::NonZero::rotate_left	nonzero_bitwise	
-core::num::nonzero::NonZero::rotate_right	nonzero_bitwise	
-core::num::nonzero::NonZero::swap_bytes	nonzero_bitwise	
-core::num::nonzero::NonZero::to_be	nonzero_bitwise	
-core::num::nonzero::NonZero::to_le	nonzero_bitwise	
-core::num::nonzero::NonZero::unchecked_mul	nonzero_ops	
-core::num::nonzero::ZeroablePrimitive	nonzero_internals	implementation detail which may disappear or be replaced at any time
 core::num::nonzero::from_mut	nonzero_from_mut	
 core::num::nonzero::from_mut_unchecked	nonzero_from_mut	
-core::num::nonzero::private::Sealed	nonzero_internals	implementation detail which may disappear or be replaced at any time
-core::num::nonzero::unchecked_add	nonzero_ops	
 core::num::traits::TruncateTarget	num_internals	internal implementation detail
 core::num::traits::WidenTarget	num_internals	internal implementation detail
 core::num::u8::::from_ascii	int_from_ascii	
@@ -1151,32 +1108,11 @@ core::num::u8::as_ascii_unchecked	ascii_char
 core::num::u8::can_not_overflow	std_internals	
 core::num::u8::is_ascii_octdigit	is_ascii_octdigit	
 core::num::u8::u16::is_utf16_surrogate	utf16_extra	
-core::num::uint_macros::carryless_mul	uint_carryless_mul	
-core::num::uint_macros::checked_cast_signed	integer_cast_extras	
-core::num::uint_macros::checked_div_exact	exact_div	
 core::num::uint_macros::checked_truncate	integer_widen_truncate	
-core::num::uint_macros::deposit_bits	uint_gather_scatter_bits	
-core::num::uint_macros::div_exact	exact_div	
-core::num::uint_macros::div_floor	int_roundings	
-core::num::uint_macros::extract_bits	uint_gather_scatter_bits	
-core::num::uint_macros::funnel_shl	funnel_shifts	
-core::num::uint_macros::funnel_shr	funnel_shifts	
-core::num::uint_macros::saturating_cast_signed	integer_cast_extras	
 core::num::uint_macros::saturating_truncate	integer_widen_truncate	
-core::num::uint_macros::shl_exact	exact_bitshifts	
-core::num::uint_macros::shr_exact	exact_bitshifts	
-core::num::uint_macros::strict_cast_signed	integer_cast_extras	
 core::num::uint_macros::truncate	integer_widen_truncate	
 core::num::uint_macros::unchecked_disjoint_bitor	disjoint_bitor	
-core::num::uint_macros::unchecked_div_exact	exact_div	
-core::num::uint_macros::unchecked_funnel_shl	funnel_shifts	
-core::num::uint_macros::unchecked_funnel_shr	funnel_shifts	
-core::num::uint_macros::unchecked_shl_exact	exact_bitshifts	
-core::num::uint_macros::unchecked_shr_exact	exact_bitshifts	
 core::num::uint_macros::widen	integer_widen_truncate	
-core::num::uint_macros::wrapping_next_power_of_two	wrapping_next_power_of_two	needs decision on wrapping behavior
-core::num::widening_carryless_mul	uint_carryless_mul	
-core::num::widening_mul	widening_mul	
 core::num::wrapping::Wrapping::BITS	wrapping_int_impl	
 core::num::wrapping::Wrapping::MAX	wrapping_int_impl	
 core::num::wrapping::Wrapping::MIN	wrapping_int_impl	
@@ -1189,7 +1125,6 @@ core::num::wrapping::Wrapping::is_negative	wrapping_int_impl
 core::num::wrapping::Wrapping::is_positive	wrapping_int_impl	
 core::num::wrapping::Wrapping::is_power_of_two	wrapping_int_impl	
 core::num::wrapping::Wrapping::leading_zeros	wrapping_int_impl	
-core::num::wrapping::Wrapping::next_power_of_two	wrapping_next_power_of_two	needs decision on wrapping behavior
 core::num::wrapping::Wrapping::pow	wrapping_int_impl	
 core::num::wrapping::Wrapping::rotate_left	wrapping_int_impl	
 core::num::wrapping::Wrapping::rotate_right	wrapping_int_impl	
@@ -1198,6 +1133,14 @@ core::num::wrapping::Wrapping::swap_bytes	wrapping_int_impl
 core::num::wrapping::Wrapping::to_be	wrapping_int_impl	
 core::num::wrapping::Wrapping::to_le	wrapping_int_impl	
 core::num::wrapping::Wrapping::trailing_zeros	wrapping_int_impl	
+core::ops::CoerceUnsized	coerce_unsized	
+core::ops::DerefPure	deref_pure_trait	
+core::ops::DispatchFromDyn	dispatch_from_dyn	
+core::ops::IntoBounds	range_into_bounds	
+core::ops::LegacyReceiver	legacy_receiver_trait	
+core::ops::Receiver	arbitrary_self_types	
+core::ops::Residual	try_trait_v2_residual	
+core::ops::Yeet	try_trait_v2_yeet	
 core::ops::async_function::AsyncFn::async_call	async_fn_traits	
 core::ops::async_function::AsyncFnMut::CallRefFuture	async_fn_traits	
 core::ops::async_function::AsyncFnMut::async_call_mut	async_fn_traits	
@@ -1226,13 +1169,11 @@ core::ops::try_trait::FromResidual	try_trait_v2
 core::ops::try_trait::FromResidual::from_residual	try_trait_v2	
 core::ops::try_trait::Residual	try_trait_v2_residual	
 core::ops::try_trait::Residual::TryType	try_trait_v2_residual	
-core::ops::try_trait::Try	try_trait_v2	
 core::ops::try_trait::Try::Output	try_trait_v2	
 core::ops::try_trait::Try::Residual	try_trait_v2	
 core::ops::try_trait::Try::branch	try_trait_v2	
 core::ops::try_trait::Try::from_output	try_trait_v2	
 core::ops::try_trait::Yeet	try_trait_v2_yeet	
-core::ops::try_trait::from_yeet	yeet_desugar_details	just here to simplify the desugaring; will never be stabilized
 core::ops::try_trait::residual_into_try_type	try_trait_v2_residual	
 core::ops::unsize::CoerceUnsized	coerce_unsized	
 core::ops::unsize::DispatchFromDyn	dispatch_from_dyn	
@@ -1247,18 +1188,14 @@ core::option::Option::zip_with	option_zip
 core::option::OptionFlatten	option_into_flat_iter	
 core::os	darwin_objc	
 core::os::darwin	darwin_objc	
-core::os::darwin	std_internals	
 core::os::darwin::objc	darwin_objc	
 core::panic::PanicPayload	std_internals	
 core::panic::abort_unwind	abort_unwind	
-core::panic::do_panic	panic_internals	
 core::panic::panic_info::PanicInfo::can_unwind	panic_can_unwind	
-core::panic::panic_info::PanicInfo::force_no_backtrace	panic_internals	internal details of the implementation of the `panic!` and related macros
 core::panicking	panic_internals	internal details of the implementation of the `panic!` and related macros
 core::pat	pattern_type_macro	
-core::pat::RangePattern	pattern_type_range_trait	
-core::pin::Pin	unsafe_pinned	
 core::pin::PinCoerceUnsized	pin_coerce_unsized_trait	
+core::pin::UnsafePinned	unsafe_pinned	
 core::pin::helper::PinDerefMutHelper	pin_derefmut_internals	
 core::pin::helper::PinHelper	pin_derefmut_internals	
 core::pin::unreachable_pin_macro_type_constraint	pin_macro_internals	
@@ -1271,16 +1208,17 @@ core::pin::unsafe_pinned::UnsafePinned::new	unsafe_pinned
 core::pin::unsafe_pinned::UnsafePinned::raw_get	unsafe_pinned	
 core::pin::unsafe_pinned::UnsafePinned::raw_get_mut	unsafe_pinned	
 core::prelude::rust_future	prelude_future	
-core::primitive_docs::prim_f128	f128	
-core::primitive_docs::prim_f16	f16	
-core::primitive_docs::prim_never	never_type	
+core::prelude::v1::const_format_args	const_format_args	
+core::prelude::v1::derive_const	derive_const	
+core::prelude::v1::eii_declaration	eii_internals	
+core::prelude::v1::pattern_type	pattern_type_macro	
 core::process	abort_immediate	
 core::process::abort_immediate	abort_immediate	
 core::profiling	profiling_marker_api	
 core::profiling::compiler_copy	profiling_marker_api	
 core::profiling::compiler_move	profiling_marker_api	
 core::ptr::Alignment	ptr_alignment_type	
-core::ptr::const_ptr	ptr_internals	
+core::ptr::Unique	ptr_internals	
 core::ptr::const_ptr::MaybeUninit::cast_init	cast_maybe_uninit	
 core::ptr::const_ptr::T::as_uninit_ref	ptr_as_uninit	
 core::ptr::const_ptr::T::cast_array	ptr_cast_array	
@@ -1291,7 +1229,6 @@ core::ptr::const_ptr::T::guaranteed_ne	const_raw_ptr_comparison
 core::ptr::const_ptr::T::is_aligned_to	pointer_is_aligned_to	
 core::ptr::const_ptr::T::mask	ptr_mask	
 core::ptr::const_ptr::T::to_raw_parts	ptr_metadata	
-core::ptr::const_ptr::T::try_cast_aligned	pointer_try_cast_aligned	
 core::ptr::const_ptr::T::with_metadata_of	set_ptr_value	
 core::ptr::const_ptr::const::as_ptr	array_ptr_get	
 core::ptr::const_ptr::const::as_ptr	slice_ptr_get	
@@ -1313,7 +1250,6 @@ core::ptr::mut_ptr::T::guaranteed_ne	const_raw_ptr_comparison
 core::ptr::mut_ptr::T::is_aligned_to	pointer_is_aligned_to	
 core::ptr::mut_ptr::T::mask	ptr_mask	
 core::ptr::mut_ptr::T::to_raw_parts	ptr_metadata	
-core::ptr::mut_ptr::T::try_cast_aligned	pointer_try_cast_aligned	
 core::ptr::mut_ptr::T::with_metadata_of	set_ptr_value	
 core::ptr::mut_ptr::mut::as_mut_ptr	array_ptr_get	
 core::ptr::mut_ptr::mut::as_mut_ptr	slice_ptr_get	
@@ -1323,7 +1259,6 @@ core::ptr::mut_ptr::mut::as_uninit_slice_mut	ptr_as_uninit
 core::ptr::mut_ptr::mut::get_unchecked_mut	slice_ptr_get	
 core::ptr::mut_ptr::mut::split_at_mut	raw_slice_split	
 core::ptr::mut_ptr::mut::split_at_mut_unchecked	raw_slice_split	
-core::ptr::non_null	ptr_metadata	
 core::ptr::non_null::NonNull::as_mut_ptr	slice_ptr_get	
 core::ptr::non_null::NonNull::as_non_null_ptr	slice_ptr_get	
 core::ptr::non_null::NonNull::as_uninit_mut	ptr_as_uninit	
@@ -1337,9 +1272,6 @@ core::ptr::non_null::NonNull::cast_uninit	cast_maybe_uninit
 core::ptr::non_null::NonNull::from_raw_parts	ptr_metadata	
 core::ptr::non_null::NonNull::get_unchecked_mut	slice_ptr_get	
 core::ptr::non_null::NonNull::is_aligned_to	pointer_is_aligned_to	
-core::ptr::non_null::NonNull::to_raw_parts	ptr_metadata	
-core::ptr::non_null::NonNull::try_cast_aligned	pointer_try_cast_aligned	
-core::ptr::unique::Unique	ptr_internals	use `NonNull` instead and consider `PhantomData<T>` (if you also use `#[may_dangle]`), `Send`, and/or `Sync`
 core::random	random	
 core::random::Distribution	random	
 core::random::RandomSource	random	
@@ -1350,7 +1282,6 @@ core::range::legacy	new_range_api_legacy
 core::result::Result::into_err	unwrap_infallible	
 core::result::Result::into_ok	unwrap_infallible	
 core::result::Result::map_or_default	result_option_map_or_default	
-core::sealed	derive_from	
 core::sealed::Sealed	sealed	
 core::simd	portable_simd	
 core::slice::::align_to_uninit_mut	align_to_uninit_mut	
@@ -1387,16 +1318,14 @@ core::slice::index::SliceIndex::index	slice_index_methods
 core::slice::index::SliceIndex::index_mut	slice_index_methods	
 core::slice::index::range	slice_range	
 core::slice::index::try_range	slice_range	
+core::slice::is_ascii_simple	str_internals	
 core::slice::is_in_bounds	get_disjoint_mut_helpers	
 core::slice::is_overlapping	get_disjoint_mut_helpers	
 core::slice::iter::IterMut::as_mut_slice	slice_iter_mut_as_mut_slice	
 core::slice::iter::bool::as_slice	split_as_slice	
-core::slice::memchr	slice_internals	exposed from core to be reused in std; use the memchr crate
 core::slice::private_get_disjoint_mut_index::Sealed	get_disjoint_mut_helpers	
 core::slice::raw::from_mut_ptr_range	slice_from_ptr_range	
 core::slice::raw::from_ptr_range	slice_from_ptr_range	
-core::slice::sort	slice_internals	exposed from core to be reused in std;
-core::slice::split_point_of	slice_from_ptr_range	
 core::str::converts::from_raw_parts	str_from_raw_parts	
 core::str::converts::from_raw_parts_mut	str_from_raw_parts	
 core::str::iter::Lines::remainder	str_lines_remainder	
@@ -1412,7 +1341,6 @@ core::str::iter::SplitWhitespace::remainder	str_split_whitespace_remainder
 core::str::lossy::Debug	str_internals	
 core::str::lossy::Utf8Chunks::debug	str_internals	
 core::str::pattern	pattern	API not fully fleshed out and ready to be stabilized
-core::str::slice_error_fail	str_internals	
 core::str::str::as_ascii	ascii_char	
 core::str::str::as_ascii_unchecked	ascii_char	
 core::str::str::as_str	str_as_str	
@@ -1422,6 +1350,7 @@ core::str::str::trim_prefix	trim_prefix_suffix
 core::str::str::trim_suffix	trim_prefix_suffix	
 core::str::validations::next_code_point	str_internals	
 core::str::validations::utf8_char_width	str_internals	
+core::sync::SyncView	exclusive_wrapper	
 core::sync::atomic::::from_mut	atomic_from_mut	
 core::sync::atomic::::from_mut_slice	atomic_from_mut	
 core::sync::atomic::::get_mut_slice	atomic_from_mut	
@@ -1429,13 +1358,11 @@ core::sync::atomic::Atomic	generic_atomic
 core::sync::atomic::AtomicBool::from_mut	atomic_from_mut	
 core::sync::atomic::AtomicBool::from_mut_slice	atomic_from_mut	
 core::sync::atomic::AtomicBool::get_mut_slice	atomic_from_mut	
-core::sync::atomic::AtomicPrimitive	atomic_internals	implementation detail which may disappear or be replaced at any time
 core::sync::atomic::AtomicPtr::from_mut	atomic_from_mut	
 core::sync::atomic::AtomicPtr::from_mut_slice	atomic_from_mut	
 core::sync::atomic::AtomicPtr::get_mut_slice	atomic_from_mut	
 core::sync::atomic::AtomicPtr::null	atomic_ptr_null	
 core::sync::atomic::atomic_compare_exchange	core_intrinsics	
-core::sync::atomic::private	atomic_internals	implementation detail which may disappear or be replaced at any time
 core::sync::sync_view::SyncView	exclusive_wrapper	
 core::sync::sync_view::SyncView::as_pin	exclusive_wrapper	
 core::sync::sync_view::SyncView::as_pin_mut	exclusive_wrapper	
@@ -1470,53 +1397,47 @@ core::time::Duration::NANOSECOND	duration_constants
 core::time::Duration::SECOND	duration_constants	
 core::time::Duration::as_millis_f32	duration_millis_float	
 core::time::Duration::as_millis_f64	duration_millis_float	
-core::time::Duration::div_duration_ceil	duration_integer_division	
-core::time::Duration::div_duration_floor	duration_integer_division	
 core::time::Duration::from_days	duration_constructors	
 core::time::Duration::from_weeks	duration_constructors	
 core::time::HOURS_PER_DAY	duration_units	
 core::time::MINS_PER_HOUR	duration_units	
 core::time::SECS_PER_MINUTE	duration_units	
 core::ub_checks	ub_checks	
-core::ub_checks::check_language_ub	ub_checks	
-core::ub_checks::precondition_check	ub_checks	
+core::ub_checks::assert_unsafe_precondition	ub_checks	
+core::ub_checks::check_library_ub	ub_checks	
 core::unicode	unicode_internals	
 core::unsafe_binder	unsafe_binders	
 core::wtf8	wtf8_internals	this is internal code for representing OsStr on some platforms and not a public API
-std::__restricted_std_workaround	restricted_std	
 std::alloc::__default_lib_allocator	alloc_internals	
 std::alloc::rust_oom	alloc_internals	
 std::alloc::set_alloc_error_hook	alloc_error_hook	
 std::alloc::take_alloc_error_hook	alloc_error_hook	
-std::ascii::AsciiExt	ascii_char	
+std::arch::is_arm_feature_detected	stdarch_arm_feature_detection	
+std::arch::is_loongarch_feature_detected	is_loongarch_feature_detected	
+std::arch::is_riscv_feature_detected	is_riscv_feature_detected	
+std::ascii::Char	ascii_char	
+std::async_iter	async_iterator	
 std::autodiff	autodiff	
 std::backtrace::Backtrace::frames	backtrace_frames	
 std::backtrace::BacktraceFrame	backtrace_frames	
 std::bstr	bstr	
-std::collections::hash	try_reserve_kind	Uncertain how much info should be exposed
 std::collections::hash::map::HashMap::new_in	allocator_api	
 std::collections::hash::map::HashMap::with_capacity_and_hasher_in	allocator_api	
 std::collections::hash::map::HashMap::with_capacity_in	allocator_api	
 std::collections::hash::map::HashMap::with_hasher_in	allocator_api	
 std::collections::hash::map::OccupiedError	map_try_insert	
-std::collections::hash::map::ValuesMut	allocator_api	
 std::collections::hash::map::try_insert	map_try_insert	
-std::collections::hash::set::Difference	allocator_api	
 std::collections::hash::set::Entry	hash_set_entry	
 std::collections::hash::set::Entry::get	hash_set_entry	
 std::collections::hash::set::Entry::insert	hash_set_entry	
 std::collections::hash::set::Entry::or_insert	hash_set_entry	
-std::collections::hash::set::ExtractIf	allocator_api	
 std::collections::hash::set::HashSet::new_in	allocator_api	
 std::collections::hash::set::HashSet::with_capacity_and_hasher_in	allocator_api	
 std::collections::hash::set::HashSet::with_capacity_in	allocator_api	
 std::collections::hash::set::HashSet::with_hasher_in	allocator_api	
-std::collections::hash::set::Intersection	allocator_api	
 std::collections::hash::set::OccupiedEntry	hash_set_entry	
 std::collections::hash::set::OccupiedEntry::get	hash_set_entry	
 std::collections::hash::set::OccupiedEntry::remove	hash_set_entry	
-std::collections::hash::set::SymmetricDifference	allocator_api	
-std::collections::hash::set::Union	allocator_api	
 std::collections::hash::set::VacantEntry	hash_set_entry	
 std::collections::hash::set::VacantEntry::get	hash_set_entry	
 std::collections::hash::set::VacantEntry::insert	hash_set_entry	
@@ -1524,20 +1445,21 @@ std::collections::hash::set::VacantEntry::into_value	hash_set_entry
 std::collections::hash::set::entry	hash_set_entry	
 std::collections::hash::set::get_or_insert	hash_set_entry	
 std::collections::hash::set::get_or_insert_with	hash_set_entry	
+std::derive	derive_macro_global_path	
 std::error::Report	error_reporter	
 std::error::Report::pretty	error_reporter	
 std::error::Report::show_backtrace	error_reporter	
 std::error::fmt_multiline	error_reporter	
 std::error::fmt_singleline	error_reporter	
 std::error::new	error_reporter	
-std::f128	unsafe_binders	
-std::ffi::os_str	c_size_t	
 std::ffi::os_str::OsStr::as_os_str	str_as_str	
 std::ffi::os_str::OsStr::slice_encoded_bytes	os_str_slice	
 std::ffi::os_str::OsStr::split_at	os_str_split_at	
 std::ffi::os_str::OsStr::split_at_checked	os_str_split_at	
 std::ffi::os_str::OsString::truncate	os_string_truncate	
+std::field	field_projections	
 std::from	derive_from	
+std::from::From	derive_from	
 std::fs::Dir	dirfd	
 std::fs::Dir::open	dirfd	
 std::fs::Dir::open_file	dirfd	
@@ -1549,28 +1471,27 @@ std::fs::set_times_nofollow	fs_set_times
 std::io::BufRead::has_data_left	buf_read_has_data_left	
 std::io::IoSlice::as_slice	io_slice_as_bytes	
 std::io::IoSliceMut::into_slice	io_slice_as_bytes	
+std::io::RawOsError	raw_os_error_ty	
 std::io::Read::is_read_vectored	can_vector	
 std::io::Read::read_array	read_array	
 std::io::Read::read_buf	read_buf	
 std::io::Read::read_buf_exact	read_buf	
 std::io::Seek::stream_len	seek_stream_len	
+std::io::SimpleMessage	io_const_error_internals	
 std::io::Write::is_write_vectored	can_vector	
 std::io::Write::write_all_vectored	write_all_vectored	
-std::io::buffered	internal_output_capture	
 std::io::buffered::bufreader::BufReader::peek	bufreader_peek	
-std::io::error::Custom	io_const_error	
+std::io::const_error	io_const_error	
 std::io::error::Error::from_static_message	io_const_error_internals	
+std::io::error::RawOsError	raw_os_error_ty	
 std::io::error::SimpleMessage	io_const_error_internals	
-std::io::error::repr_bitpacked	raw_os_error_ty	
-std::io::stdio::_eprint	print_internals	implementation detail which may disappear or be replaced at any time
-std::io::stdio::_print	print_internals	implementation detail which may disappear or be replaced at any time
-std::io::stdio::set_output_capture	internal_output_capture	this function is meant for use in the test crate and may disappear in the future
 std::io::stdio::stderr_raw	libstd_sys_internals	
 std::io::stdio::stdin_raw	libstd_sys_internals	
 std::io::stdio::stdout_raw	libstd_sys_internals	
-std::io::stdio::try_set_output_capture	internal_output_capture	this function is meant for use in the test crate and may disappear in the future
-std::net::hostname	tcplistener_into_incoming	
+std::net::IntoIncoming	tcplistener_into_incoming	
+std::net::hostname	gethostname	
 std::net::hostname::hostname	gethostname	
+std::net::ip_addr::Ipv6MulticastScope	ip	
 std::net::tcp::IntoIncoming	tcplistener_into_incoming	
 std::net::tcp::TcpListener::into_incoming	tcplistener_into_incoming	
 std::net::tcp::TcpStream::keepalive	tcp_keepalive	
@@ -1578,6 +1499,7 @@ std::net::tcp::TcpStream::linger	tcp_linger
 std::net::tcp::TcpStream::set_keepalive	tcp_keepalive	
 std::net::tcp::TcpStream::set_linger	tcp_linger	
 std::num::f128	f128	
+std::num::f128::consts	f128	
 std::num::f128::f128::acos	f128	
 std::num::f128::f128::acosh	f128	
 std::num::f128::f128::asin	f128	
@@ -1608,6 +1530,7 @@ std::num::f128::f128::sinh	f128
 std::num::f128::f128::tan	f128	
 std::num::f128::f128::tanh	f128	
 std::num::f16	f16	
+std::num::f16::consts	f16	
 std::num::f16::f16::acos	f16	
 std::num::f16::f16::acosh	f16	
 std::num::f16::f16::asin	f16	
@@ -1644,7 +1567,8 @@ std::num::f64::f64::erf	float_erf
 std::num::f64::f64::erfc	float_erf	
 std::num::f64::f64::gamma	float_gamma	
 std::num::f64::f64::ln_gamma	float_gamma	
-std::os::darwin	std_internals	
+std::os::android::net::UnixSocketExt	unix_socket_ancillary_data	
+std::os::cygwin::net::UnixSocketExt	unix_socket_ancillary_data	
 std::os::darwin::objc	darwin_objc	
 std::os::fd::stdio::STDERR	stdio_fd_consts	
 std::os::fd::stdio::STDIN	stdio_fd_consts	
@@ -1676,7 +1600,7 @@ std::os::illumos::net	unix_socket_exclbind
 std::os::illumos::net::UnixSocketExt	unix_socket_exclbind	
 std::os::illumos::net::UnixSocketExt::exclbind	unix_socket_exclbind	
 std::os::illumos::net::UnixSocketExt::so_exclbind	unix_socket_exclbind	
-std::os::linux	std_internals	
+std::os::linux::net::UnixSocketExt	unix_socket_ancillary_data	
 std::os::linux::process	linux_pidfd	
 std::os::motor	motor_ext	
 std::os::motor::ffi	motor_ext	
@@ -1700,7 +1624,6 @@ std::os::solaris::net::UnixSocketExt::so_exclbind	unix_socket_exclbind
 std::os::solid::io	solid_ext	
 std::os::uefi	uefi_std	
 std::os::uefi::env	uefi_std	
-std::os::unix	std_internals	
 std::os::unix::fs::DirEntryExt2	dir_entry_ext2	
 std::os::unix::fs::FileExt::read_buf_at	read_buf_at	
 std::os::unix::fs::FileExt::read_buf_exact_at	read_buf_at	
@@ -1739,21 +1662,19 @@ std::os::unix::net::datagram::UnixDatagram::send_vectored_with_ancillary	unix_so
 std::os::unix::net::datagram::UnixDatagram::send_vectored_with_ancillary_to	unix_socket_ancillary_data	
 std::os::unix::net::datagram::UnixDatagram::set_mark	unix_set_mark	
 std::os::unix::net::stream::UnixStream::peek	unix_socket_peek	
-std::os::unix::net::stream::UnixStream::peer_cred	peer_credentials_unix_socket	
 std::os::unix::net::stream::UnixStream::recv_vectored_with_ancillary	unix_socket_ancillary_data	
 std::os::unix::net::stream::UnixStream::send_vectored_with_ancillary	unix_socket_ancillary_data	
 std::os::unix::net::stream::UnixStream::set_mark	unix_set_mark	
 std::os::unix::net::ucred::UCred	peer_credentials_unix_socket	
+std::os::unix::prelude::ChildExt	unix_send_signal	
 std::os::unix::process::ChildExt	unix_send_signal	
 std::os::unix::process::ChildExt::kill_process_group	unix_kill_process_group	
 std::os::unix::process::ChildExt::send_process_group_signal	unix_send_signal	
 std::os::unix::process::CommandExt::chroot	process_chroot	
 std::os::unix::process::CommandExt::groups	setgroups	
 std::os::unix::process::CommandExt::setsid	process_setsid	
-std::os::wasi	std_internals	
 std::os::wasi::fs	wasi_ext	
 std::os::wasi::net	wasi_ext	
-std::os::windows	std_internals	
 std::os::windows::fs::FileExt::seek_read_buf	read_buf_at	
 std::os::windows::fs::MetadataExt::change_time	windows_change_time	
 std::os::windows::fs::MetadataExt::file_index	windows_by_handle	
@@ -1787,12 +1708,12 @@ std::os::windows::process::ProcThreadAttributeList	windows_process_extensions_ra
 std::os::windows::process::ProcThreadAttributeListBuilder	windows_process_extensions_raw_attribute	
 std::panic::BacktraceStyle	panic_backtrace_config	
 std::panic::PanicHookInfo::can_unwind	panic_can_unwind	
-std::panic::PanicHookInfo::force_no_backtrace	panic_internals	internal details of the implementation of the `panic!` and related macros
+std::panic::abort_unwind	abort_unwind	
 std::panic::always_abort	panic_always_abort	
-std::panic::catch_unwind	abort_unwind	
 std::panic::get_backtrace_style	panic_backtrace_config	
-std::panic::panic_any	panic_update_hook	
+std::panic::panic_2021	edition_panic	use panic!() instead
 std::panic::set_backtrace_style	panic_backtrace_config	
+std::panic::update_hook	panic_update_hook	
 std::panicking::EMPTY_PANIC	libstd_sys_internals	used by the panic! macro
 std::panicking::begin_panic	libstd_sys_internals	used by the panic! macro
 std::panicking::panic_count	update_panic_count	
@@ -1814,16 +1735,19 @@ std::path::PathBuf::set_trailing_sep	path_trailing_sep
 std::path::SEPARATORS	const_path_separators	
 std::path::SEPARATORS_STR	const_path_separators	
 std::prelude::rust_future	prelude_future	
+std::prelude::rust_future::panic	prelude_next	
+std::prelude::v1::const_format_args	const_format_args	
+std::prelude::v1::derive_const	derive_const	
+std::prelude::v1::eii_declaration	eii_internals	
 std::process::Command::get_env_clear	command_resolved_envs	
 std::process::Command::get_resolved_envs	command_resolved_envs	
+std::process::CommandResolvedEnvs	command_resolved_envs	
 std::process::ExitCode::exit_process	exitcode_exit_method	
-std::process::ExitCode::to_i32	process_exitcode_internals	exposed only for libstd
 std::process::ExitStatus::exit_ok	exit_status_error	
 std::process::ExitStatusError	exit_status_error	
-std::process::Output	command_resolved_envs	
 std::process::Output::exit_ok	exit_status_error	
 std::process::Stdio::makes_pipe	stdio_makes_pipe	
-std::process::id	abort_immediate	
+std::process::abort_immediate	abort_immediate	
 std::random	random	
 std::random::DefaultRandomSource	random	
 std::random::random	random	
@@ -1831,7 +1755,8 @@ std::rt	rt	this public module should not exist and is highly likely to disappear
 std::sealed::Sealed	sealed	
 std::simd	portable_simd	
 std::std_float	portable_simd	
-std::sync::WaitTimeoutResult	mapped_lock_guards	
+std::sync::SyncView	exclusive_wrapper	
+std::sync::UniqueArc	unique_rc_arc	
 std::sync::lazy_lock::T::into_inner	lazy_cell_into_inner	
 std::sync::mpmc	mpmc_channel	
 std::sync::mpmc::IntoIter	mpmc_channel	
@@ -1869,9 +1794,10 @@ std::sync::mpsc::Receiver::recv_deadline	deadline_api
 std::sync::mpsc::Sender::is_disconnected	mpsc_is_disconnected	
 std::sync::mpsc::SyncSender::send_timeout	std_internals	
 std::sync::nonpoison	sync_nonpoison	
+std::sync::nonpoison::Condvar	nonpoison_condvar	
+std::sync::nonpoison::MappedMutexGuard	mapped_lock_guards	
 std::sync::nonpoison::TryLockResult	sync_nonpoison	
 std::sync::nonpoison::WouldBlock	sync_nonpoison	
-std::sync::nonpoison::condvar	nonpoison_rwlock	
 std::sync::nonpoison::condvar::Condvar	nonpoison_condvar	
 std::sync::nonpoison::condvar::Condvar::new	nonpoison_condvar	
 std::sync::nonpoison::condvar::Condvar::notify_all	nonpoison_condvar	
@@ -1940,7 +1866,7 @@ std::sync::oneshot::Sender::send	oneshot_channel
 std::sync::oneshot::TryRecvError	oneshot_channel	
 std::sync::oneshot::channel	oneshot_channel	
 std::sync::poison	sync_poison_mod	
-std::sync::poison::condvar	mapped_lock_guards	
+std::sync::poison::MappedMutexGuard	mapped_lock_guards	
 std::sync::poison::mutex::MappedMutexGuard	mapped_lock_guards	
 std::sync::poison::mutex::MappedMutexGuard::filter_map	mapped_lock_guards	
 std::sync::poison::mutex::MappedMutexGuard::map	mapped_lock_guards	
@@ -1968,7 +1894,6 @@ std::sync::reentrant_lock::ReentrantLock	reentrant_lock
 std::sync::reentrant_lock::ReentrantLock::data_ptr	reentrant_lock_data_ptr	
 std::sync::reentrant_lock::ReentrantLock::try_lock	std_internals	
 std::sync::reentrant_lock::ReentrantLockGuard	reentrant_lock	
-std::sys	stdarch_powerpc_feature_detection	
 std::sys::fd::hermit	fd	not public
 std::sys::fd::motor	fd	not public
 std::sys::fd::unix	fd	not public
@@ -1988,17 +1913,16 @@ std::sys::pal::sgx::abi::usercalls::alloc::UserSafe	sgx_platform
 std::sys::pal::sgx::abi::usercalls::alloc::UserSafeCopyDestination	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::alloc::UserSafeSized	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::bind_stream	sgx_platform	
-std::sys::pal::sgx::abi::usercalls::check_os_error	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::close	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::connect_stream	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::exit	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::flush	sgx_platform	
+std::sys::pal::sgx::abi::usercalls::free	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::insecure_time	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::launch_thread	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::raw::Register	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::raw::RegisterArgument	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::raw::ReturnValue	sgx_platform	
-std::sys::pal::sgx::abi::usercalls::raw::UsercallReturn	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::raw::Usercalls	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::raw::do_usercall	sgx_platform	
 std::sys::pal::sgx::abi::usercalls::read	sgx_platform	
@@ -2010,23 +1934,21 @@ std::sys::pal::sgx::abi::usercalls::wait_timeout	sgx_platform
 std::sys::pal::sgx::abi::usercalls::write	sgx_platform	
 std::sys::pal::windows::c	windows_c	
 std::sys::pal::windows::handle	windows_handle	
+std::sys::process::CommandResolvedEnvs	command_resolved_envs	
 std::sys::process::env::CommandResolvedEnvs	command_resolved_envs	
-std::sys::process::output	command_resolved_envs	
 std::sys::process::windows	process_internals	
 std::sys::stdio::windows	windows_stdio	
 std::sys::thread_local	thread_local_internals	internal details of the thread_local macro
-std::sys::thread_local::native::__RUST_STD_INTERNAL_INIT	thread_local_internals	
-std::sys::thread_local::no_threads::__RUST_STD_INTERNAL_INIT	thread_local_internals	
-std::sys::thread_local::os::__rust_std_internal_init_fn	thread_local_internals	
+std::thread::add_spawn_hook	thread_spawn_hook	
 std::thread::builder::Builder::no_hooks	thread_spawn_hook	
 std::thread::current::current_id	current_thread_id	
+std::thread::current_id	current_thread_id	
 std::thread::functions::sleep_until	thread_sleep_until	
 std::thread::id::ThreadId::as_u64	thread_id_value	
 std::thread::local	thread_local_internals	
-std::thread::local::AccessError	thread_local_internals	
-std::thread::local::LocalKey::new	thread_local_internals	recently added to create a key
 std::thread::local::LocalKey::update	local_key_cell_update	
 std::thread::local_impl	thread_local_internals	
+std::thread::sleep_until	thread_sleep_until	
 std::thread::spawnhook::add_spawn_hook	thread_spawn_hook	
 std::thread::thread::Thread::from_raw	thread_raw	
 std::thread::thread::Thread::into_raw	thread_raw	
@@ -2035,3 +1957,4 @@ std::time::SystemTime::MIN	time_systemtime_limits
 std::time::SystemTime::saturating_add	time_saturating_systemtime	
 std::time::SystemTime::saturating_duration_since	time_saturating_systemtime	
 std::time::SystemTime::saturating_sub	time_saturating_systemtime	
+std::unsafe_binder	unsafe_binders	

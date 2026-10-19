@@ -1145,22 +1145,14 @@ fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Opti
     let def = prog.def(d);
     // (the other definitions -- primitives, locals -- have no item of their own)
     if !matches!(def.kind, DefKind::Mod | DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::AssocTy) { return None; }
-    if let Some(found) = unstable_in_attrs(prog, d) { return Some(found); }
-    // the library's own table (gen_stability.py over rustc's library): Relax's std mirrors its module
-    // layout, a definition of `std` may be one of `core` / `alloc` there
-    let krate_name = prog.syms.str(prog.crates[def.krate as usize].name);
-    if !matches!(krate_name, "core" | "alloc" | "std") { return None; }
-    let path = prog.def_path(d);
-    let tail = path.split_once("::").map_or("", |x| x.1);
-    if tail.is_empty() { return None; }
-    let table = stability_table();
-    for root in ["core", "alloc", "std"] {
-        let key = if tail.is_empty() { root.to_string() } else { format!("{}::{}", root, tail) };
-        if let Some(&(f, r)) = table.get(key.as_str()) {
-            return Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) }));
-        }
-    }
-    None
+    unstable_in_attrs(prog, d)
+}
+
+/// The library's table entry for a path as written (`std::intrinsics::copy`): a re-export has
+/// its own stability, so the key is the written path, not the defining one.
+fn table_entry(path: &str) -> Option<(String, Option<String>)> {
+    let &(f, r) = stability_table().get(path)?;
+    Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) }))
 }
 
 /// `path -> (feature, reason)` of the library's unstable definitions (std/stability.tsv).
@@ -1184,15 +1176,10 @@ pub fn check_imports(prog: &Program, krate: u32) -> Vec<String> {
         let pf = &*prog.files[imp.file as usize];
         if !matches!(pf.expansion_kind(imp.pos), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules) { continue; }
         let n = imp.segs.len();
+        let names: Vec<&str> = imp.segs.iter().map(|sg| prog.syms.str(sg.1)).collect();
+        if !imp.global && !matches!(names.first(), Some(&"std" | &"core" | &"alloc")) { continue; }
         for k in 1..=n {
-            let d = if k < n || imp.glob {
-                prog.resolve_mod_path(imp.module, imp.global, &imp.segs[..k], false, true)
-            } else {
-                let parent = if k == 1 { Some(prog.mods[imp.module as usize].def) } else { prog.resolve_mod_path(imp.module, imp.global, &imp.segs[..k - 1], false, true) };
-                parent.and_then(|m| prog.lookup_in_container(m, imp.segs[k - 1].1, true).or_else(|| prog.lookup_in_container(m, imp.segs[k - 1].1, false)))
-            };
-            let Some(d) = d else { break };
-            if let Some((feature, reason)) = unstable_of(prog, d) {
+            if let Some((feature, reason)) = table_entry(&names[..k].join("::")) {
                 if feats.has(&feature) { continue; }
                 let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
                 out.push(prog.record_error(imp.file, imp.pos, "typeck", msg));
