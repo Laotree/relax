@@ -16,10 +16,12 @@ pub struct RwLock<T: ?Sized> {
 unsafe impl<T: Send> Send for RwLock<T> {}
 unsafe impl<T: Send + Sync> Sync for RwLock<T> {}
 
+#[rustc_diagnostic_item = "RwLockReadGuard"]
 pub struct RwLockReadGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,
 }
 
+#[rustc_diagnostic_item = "RwLockWriteGuard"]
 pub struct RwLockWriteGuard<'a, T: ?Sized + 'a> {
     lock: &'a RwLock<T>,
     poison: poison::Guard,

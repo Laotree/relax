@@ -1788,10 +1788,10 @@ pub fn pre_expand_derives(files: &[(&str, &[u8], &[Tok])], cfg: &CfgSet, edition
     let t_wall = std::time::Instant::now();
     let jobs = crate::preload::jobs();
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = std::thread::scope(|sc| {
+    let results: Vec<Vec<(usize, Result<ItemOut, (u32, String)>)>> = crate::pool::scope(|sc| {
         let mut hs = Vec::new();
         for _ in 0..jobs.min(sites.len()) {
-            hs.push(sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+            hs.push(sc.spawn(|| {
                 let mut out = Vec::new();
                 loop {
                     let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

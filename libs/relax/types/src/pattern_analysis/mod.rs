@@ -1127,6 +1127,17 @@ enum LetSource {
     Chain,
 }
 
+/// The analysis context of a body (also the lint passes' inhabitedness queries).
+pub fn body_cx<'a>(prog: &'a Program, tcx: &'a Tcx, body: &'a Body) -> Cx<'a> {
+    let d = prog.def(body.def);
+    let env = TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::non_body_analysis() };
+    Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::new()), const_errors: Vec::new() }
+}
+
+impl Cx<'_> {
+    pub fn typing_env(&self) -> TypingEnv { self.env }
+}
+
 struct Checker<'a> {
     cx: Cx<'a>,
     errors: Vec<String>,
@@ -1135,9 +1146,7 @@ struct Checker<'a> {
 /// Checks the matches, lets and parameters of a type-checked body: the errors (E0004 /
 /// E0005, located); lints go to the lint sink.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) -> Vec<String> {
-    let d = prog.def(body.def);
-    let env = TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::non_body_analysis() };
-    let cx = Cx { prog, tcx, body, env, module: d.scope, krate: d.krate, pats: Vec::new(), next_opaque: 0, inhabited: RefCell::new(HashMap::new()), const_errors: Vec::new() };
+    let cx = body_cx(prog, tcx, body);
     let mut ck = Checker { cx, errors: Vec::new() };
     ck.run();
     let mut const_errors = std::mem::take(&mut ck.cx.const_errors);

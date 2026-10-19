@@ -3617,6 +3617,19 @@ impl Program {
             } else {
                 tdef = self.lookup_in_container(parent, last, true);
                 vdef = self.lookup_in_container(parent, last, false);
+                // rustc ignores a namespace whose binding this module cannot see when the other
+                // namespace is accessible (`use validate::validate;` where `validate` also holds
+                // a private glob-imported module of that name); with neither accessible the
+                // privacy error is reported
+                if self.def(parent).kind == DefKind::Mod && tdef.is_some() && vdef.is_some() {
+                    let sub = self.def(parent).sub;
+                    let seen = |p: &Program, ns: bool| {
+                        let mut q = GlobQuery { precise: true, ..Default::default() };
+                        p.lookup_in_module_vis(sub, last, ns, &mut q).map_or(true, |(_, v)| p.vis_visible(v, module))
+                    };
+                    let (tv, vv) = (seen(self, true), seen(self, false));
+                    if tv && !vv { vdef = None; } else if vv && !tv { tdef = None; }
+                }
             }
             if tdef.is_none() && vdef.is_none() {
                 // macros only (e.g. `use crate::log;` for macro_rules) count as resolved
@@ -5201,12 +5214,16 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
         return;
     }
     let mut out = Vec::with_capacity(blk.stmts.len());
+    let mut kept_attrs = Vec::new();
     for s in ast.list(blk.stmts) {
         match s {
             Stmt::Attrs(r) => {
-                let AttrsStmt { attrs, expr, semi } = ast.row(*r);
-                if crate::cfg::active(src, ast.list(*attrs), cfg) {
-                    out.push(Stmt::Expr(*expr, *semi));
+                let AttrsStmt { attrs, expr, semi } = *ast.row(*r);
+                if crate::cfg::active(src, ast.list(attrs), cfg) {
+                    out.push(Stmt::Expr(expr, semi));
+                    // the statement's attributes are kept for the lint passes (lint levels, and the
+                    // fact that a value had attributes: `#[cfg(..)] { x }` is not an unused-braces case)
+                    kept_attrs.push((expr, attrs));
                 }
             }
             Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
@@ -5215,6 +5232,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
     }
     let l = ast.push_list(out);
     ast.block_mut(b).stmts = l;
+    ast.stmt_attrs.extend(kept_attrs);
 }
 
 /// Closures in an owner's expression ranges, including its lazily materialized body.

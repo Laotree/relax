@@ -11,6 +11,7 @@ use crate::intrinsics_atomic as ia;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[non_exhaustive]
+#[rustc_diagnostic_item = "Ordering"]
 pub enum Ordering {
     Relaxed,
     Release,
@@ -69,6 +70,7 @@ impl AtomicPrimitive for isize {}
 
 /// An integer shared between threads.
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct Atomic<T: AtomicPrimitive> {
     v: UnsafeCell<T>,
 }
@@ -211,6 +213,7 @@ impl<T: AtomicPrimitive + fmt::Debug> fmt::Debug for Atomic<T> {
 
 /// A boolean shared between threads (one byte, 0 or 1).
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct AtomicBool {
     v: UnsafeCell<u8>,
 }
@@ -338,6 +341,7 @@ impl fmt::Debug for AtomicBool {
 
 /// A raw pointer shared between threads.
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Atomic"]
 pub struct AtomicPtr<T> {
     p: UnsafeCell<*mut T>,
 }
@@ -470,6 +474,7 @@ pub const ATOMIC_USIZE_INIT: AtomicUsize = AtomicUsize::new(0);
 pub const ATOMIC_ISIZE_INIT: AtomicIsize = AtomicIsize::new(0);
 pub const ATOMIC_BOOL_INIT: AtomicBool = AtomicBool::new(false);
 
+#[rustc_diagnostic_item = "fence"]
 pub fn fence(order: Ordering) {
     match order {
         Ordering::Relaxed => panic!("there is no such thing as a relaxed fence"),
@@ -477,6 +482,7 @@ pub fn fence(order: Ordering) {
     }
 }
 
+#[rustc_diagnostic_item = "compiler_fence"]
 pub fn compiler_fence(order: Ordering) {
     match order {
         Ordering::Relaxed => panic!("there is no such thing as a relaxed fence"),

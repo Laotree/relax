@@ -19,9 +19,11 @@ pub const fn align_of_val<T: ?Sized>(val: &T) -> usize {
 pub const fn needs_drop<T>() -> bool {
     unsafe { im::needs_drop::<T>() }
 }
+#[rustc_diagnostic_item = "mem_forget"]
 pub const fn forget<T>(t: T) {
     unsafe { im::forget(t) }
 }
+#[rustc_diagnostic_item = "mem_drop"]
 pub fn drop<T>(_x: T) {}
 
 pub fn replace<T>(dest: &mut T, src: T) -> T {
@@ -97,6 +99,7 @@ impl<T> crate::fmt::Debug for Discriminant<T> {
 /// Inhibits the compiler from calling `T`'s destructor: a union, whose fields never get drop
 /// glue (so the compiler needs no special case).
 #[repr(C)]
+#[rustc_diagnostic_item = "ManuallyDrop"]
 pub union ManuallyDrop<T: ?Sized> {
     value: T,
 }

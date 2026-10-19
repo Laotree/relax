@@ -155,7 +155,12 @@ impl Fcx<'_> {
             self.err(lo, format!("E0620: cast to unsized type: `{}` as `{}`", es, cs));
             return;
         }
-        if self.cast_is_coercion(e, expr_ty, cast_ty) { return; }
+        if self.cast_is_coercion(e, expr_ty, cast_ty) {
+            // cast.rs: a raw pointer to raw pointer cast is not recorded as a coercion
+            let raw = |t: TyId| matches!(self.tcx.tys.kind(t), TyKind::Ptr(..));
+            if crate::lint::enabled() && !(raw(expr_ty) && raw(cast_ty)) { self.b.coercion_casts.insert(e.0, ()); }
+            return;
+        }
         match self.do_cast_check(e, expr_ty, cast_ty, lo) {
             Ok(()) => {}
             Err(err) => self.report_cast_error(err, &es, &cs, lo),

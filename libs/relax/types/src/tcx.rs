@@ -282,10 +282,10 @@ fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> 
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     const CHUNK: usize = 64;
-    let mut parts: Vec<(usize, Vec<R>)> = std::thread::scope(|sc| {
+    let mut parts: Vec<(usize, Vec<R>)> = crate::pool::scope(|sc| {
         let hs: Vec<_> = (0..jobs)
             .map(|_| {
-                sc.spawn(|| { let _z = crate::zone_alloc::compiler_thread();
+                sc.spawn(|| {
                     let mut out = Vec::new();
                     loop {
                         let k = next.fetch_add(CHUNK, std::sync::atomic::Ordering::Relaxed);
@@ -1597,6 +1597,9 @@ impl Tcx {
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
         }
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::bound_assoc_cycles(prog, self, did));
+        }
         if def.kind == DefKind::Trait && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
         }
@@ -2759,7 +2762,11 @@ impl Tcx {
             }
             // a bare trait in a type (`&mut FnMut(&mut [u8])`): edition 2015's trait object
             // (rustc: `dyn` is implied there; later editions reject it, E0782)
-            DefKind::Trait if prog.crates[prog.mods[module as usize].krate as usize].edition == 2015 => {
+            DefKind::Trait if prog.crates[prog.mods[module as usize].krate as usize].edition <= 2018 => {
+                if crate::lint::enabled() && self.validates(prog, file) {
+                    let at = crate::lint::def_at(prog, file, p.lo);
+                    crate::lint::emit(prog, at, &crate::lint_early::BARE_TRAIT_OBJECTS, file, p.lo, "trait objects without an explicit `dyn` are deprecated");
+                }
                 let b = ast::Bound::Trait { hrtb: ast::List::EMPTY, maybe: false, konst: false, async_: false, path: p.clone() };
                 self.lower_dyn(cx, prog, file, module, env, &[b], p.lo, source_ty)
             }

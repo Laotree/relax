@@ -4,10 +4,12 @@
 use crate::intrinsics_mem as im;
 
 #[rustc_promotable]
+#[rustc_diagnostic_item = "ptr_null"]
 pub const fn null<T>() -> *const T {
     0 as *const T
 }
 #[rustc_promotable]
+#[rustc_diagnostic_item = "ptr_null_mut"]
 pub const fn null_mut<T>() -> *mut T {
     0 as *mut T
 }
@@ -110,6 +112,7 @@ pub const fn from_mut<T: crate::marker::PointeeSized>(r: &mut T) -> *mut T {
 /// A non-null `*mut T` (gives `Option<NonNull<T>>` the null niche).
 #[repr(transparent)]
 #[rustc_layout_scalar_valid_range_start(1)]
+#[rustc_nonnull_optimization_guaranteed]
 #[cfg_attr(not(relax_check), lang = "non_null")]
 pub struct NonNull<T: crate::marker::PointeeSized> {
     pointer: *const T,
