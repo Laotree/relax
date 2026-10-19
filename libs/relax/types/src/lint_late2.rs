@@ -24,7 +24,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>
     let ast = &pf.ast;
     let mut w = L2 {
         prog, tcx, body, ast, stack: Vec::new(), fns: Vec::new(), owner: HashMap::new(), init: HashMap::new(), names: HashMap::new(),
-        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false,
+        inside_call_args: false, reset_block: false, closure: u32::MAX, active: false, env: crate::pattern_analysis::body_cx(prog, tcx, body).typing_env(),
     };
     // pre-pass: which closure declares each local, the initialisers of plain bindings
     {
@@ -85,6 +85,7 @@ struct L2<'a> {
     inside_call_args: bool,
     /// the next `block` call is the block of a block expression (statements reset the flag)
     reset_block: bool,
+    env: crate::tcx::TypingEnv,
     /// the closure being walked
     closure: u32,
     /// inside a fn or closure body (rustc `check_fn`; const and static initialisers are not searched)
@@ -463,6 +464,9 @@ impl<'a> Visitor<'a> for L2<'a> {
         let ast = self.ast;
         if self.active && !self.inside_call_args { self.lint_temporary(e); }
         self.lint_const_mutation(e);
+        self.lint_prelude_dot_call(e);
+        self.lint_shadowed_into_iter(e);
+        if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
             ExprKind::Call(f, args) => {
                 self.expr(f);
@@ -533,5 +537,148 @@ impl<'a> Visitor<'a> for L2<'a> {
             }
             _ => ast_visit::walk_expr(self, e),
         }
+    }
+}
+
+// ---------------------------------------------------------------- prelude collisions
+
+pub const RUST_2021_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2021_prelude_collisions", Level::Allow, &[]);
+pub const RUST_2024_PRELUDE_COLLISIONS: Lint = lint::lint("rust_2024_prelude_collisions", Level::Allow, &[]);
+pub const ARRAY_INTO_ITER: Lint = lint::lint("array_into_iter", Level::Warn, &[]);
+pub const BOXED_SLICE_INTO_ITER: Lint = lint::lint("boxed_slice_into_iter", Level::Warn, &[]);
+
+impl<'a> L2<'a> {
+    fn edition(&self) -> u16 { self.prog.files[self.body.file as usize].edition as u16 }
+
+    /// Whether `d` comes from a standard library crate (`STDLIB_STABLE_CRATES`).
+    fn in_std(&self, d: DefId) -> bool {
+        matches!(self.prog.syms.str(self.prog.crates[self.prog.def(d).krate as usize].name), "core" | "std" | "alloc")
+    }
+
+    /// `lint_edition_dependent_dot_call` (rustc_hir_typeck method/prelude_edition_lints.rs).
+    fn lint_prelude_dot_call(&self, e: ExprId) {
+        let ExprKind::MethodCall(recv, row) = self.ast.expr(e).kind else { return };
+        let ed = self.edition();
+        if ed >= 2024 { return; }
+        let name = self.prog.files[self.body.file as usize].text(self.ast.row(row).name);
+        if !matches!(name, "try_into" | "poll" | "into_future" | "into_iter") { return; }
+        let Some(self_ty) = self.expr_ty(recv) else { return };
+        let (lint, edition) = match name {
+            "try_into" if ed < 2021 => (&RUST_2021_PRELUDE_COLLISIONS, "2021"),
+            "poll" => {
+                let TyKind::Adt(d, args, _) = self.kind(self_ty) else { return };
+                if Some(d) != self.lang(LangItem::Pin) { return; }
+                let Some(&a0) = self.tcx.tys.list(args).first() else { return };
+                if !matches!(self.kind(a0), TyKind::Ref(true, ..)) { return; }
+                (&RUST_2024_PRELUDE_COLLISIONS, "2024")
+            }
+            "into_future" => (&RUST_2024_PRELUDE_COLLISIONS, "2024"),
+            "into_iter" => {
+                if matches!(self.kind(self_ty), TyKind::Array(..)) && ed < 2021 {
+                    (&ARRAY_INTO_ITER, "2021")
+                } else if self.boxed_slice(self_ty) {
+                    (&BOXED_SLICE_INTO_ITER, "2024")
+                } else { return }
+            }
+            _ => return,
+        };
+        let Some(m) = self.body.methods.get(&e.0).copied() else { return };
+        if self.in_std(m.def) { return; }
+        let parent = self.prog.def(m.def).parent;
+        // the receiver after the autoderefs is a trait object: an ObjectPick
+        let mut t = self_ty;
+        for _ in 0..m.derefs {
+            t = match self.kind(t) {
+                TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => i,
+                TyKind::Adt(d, args, _) if Some(d) == self.lang(LangItem::OwnedBox) => match self.tcx.tys.list(args).first() { Some(&i) => i, None => break },
+                _ => break,
+            };
+        }
+        let object = matches!(self.kind(t), TyKind::Dyn(..));
+        let inherent_like = object || (parent != crate::program::NO_DEF && self.prog.def(parent).kind == DefKind::Impl && self.tcx.impl_trait.get(&parent).is_none());
+        if inherent_like {
+            // avoid repeatedly adding unneeded `&*`s
+            if m.derefs == 1 && m.autoref != 0 && matches!(self.kind(self_ty), TyKind::Ref(..)) { return; }
+            // an inherent `self` method takes precedence over the trait's
+            if m.derefs == 0 && m.autoref == 0 { return; }
+        }
+        let pos = self.ast.expr(recv).lo;
+        // an inherent pick lints at the receiver, a trait pick at the whole call (whose span is not the macro-expanded receiver's)
+        let check = if inherent_like { pos } else { self.ast.row(row).name.lo };
+        if lint::external(self.prog, self.body.file, check) { return; }
+        lint::emit_in(self.prog, self.body.def, &self.stack, lint, self.body.file, pos, &format!("trait method `{}` will become ambiguous in Rust {}", name, edition));
+    }
+
+    fn boxed_slice(&self, t: TyId) -> bool {
+        match self.kind(t) {
+            TyKind::Adt(d, args, _) if Some(d) == self.lang(LangItem::OwnedBox) =>
+                self.tcx.tys.list(args).first().is_some_and(|&i| matches!(self.kind(i), TyKind::Slice(_))),
+            _ => false,
+        }
+    }
+
+    /// `lint_fully_qualified_call_from_2018`.
+    fn lint_prelude_path(&self, e: ExprId) {
+        if self.edition() >= 2021 { return; }
+        let Some(&item) = self.body.trait_item_paths.get(&e.0) else { return };
+        let name = self.prog.syms.str(self.prog.def(item).name);
+        if !matches!(name, "try_into" | "try_from" | "from_iter") { return; }
+        if self.in_std(item) { return; }
+        self.emit(&RUST_2021_PRELUDE_COLLISIONS, self.ast.expr(e).lo, &format!("trait-associated function `{}` will become ambiguous in Rust 2021", name));
+    }
+}
+
+// ---------------------------------------------------------------- shadowed_into_iter
+
+impl<'a> L2<'a> {
+    /// `ShadowedIntoIter::check_expr` (rustc_lint shadowed_into_iter.rs).
+    fn lint_shadowed_into_iter(&self, e: ExprId) {
+        let ExprKind::MethodCall(recv, row) = self.ast.expr(e).kind else { return };
+        let Some(m) = self.body.methods.get(&e.0).copied() else { return };
+        if Some(m.def) != self.lang(LangItem::IntoIterIntoIter) { return; }
+        let Some(rt) = self.expr_ty(recv) else { return };
+        // the receiver type and the targets of its adjustments
+        let mut chain = vec![rt];
+        let mut t = rt;
+        for step in 0..m.derefs as usize {
+            let ov = [e.0, recv.0, unparen(self.ast, recv).0].iter().any(|k| self.body.ov_derefs.get(&(*k, step)).is_some());
+            t = match self.kind(t) {
+                TyKind::Ref(_, i, _) if !ov => i,
+                TyKind::Adt(d, args, _) if !ov && Some(d) == self.lang(LangItem::OwnedBox) => match self.tcx.tys.list(args).first() { Some(&i) => i, None => return },
+                _ => match self.deref_target(t) { Some(i) => i, None => return },
+            };
+            chain.push(t);
+        }
+        if m.autoref != 0 {
+            let r = self.tcx.tys.intern(TyKind::Ref(m.autoref == 2, t, crate::types::RegionId::ERASED));
+            chain.push(r);
+        }
+        let is_ref_to = |ty: TyId, f: &dyn Fn(TyId) -> bool| matches!(self.kind(ty), TyKind::Ref(_, p, _) if f(p));
+        let is_array = |ty: TyId| matches!(self.kind(ty), TyKind::Array(..));
+        let last = *chain.last().unwrap();
+        let (lint, target, edition, ufcs) = if is_ref_to(last, &is_array) {
+            let Some(idx) = chain.iter().copied().take_while(|&ty| !is_ref_to(ty, &is_array)).position(|ty| is_array(ty)) else { return };
+            (&ARRAY_INTO_ITER, "[T; N]", "2021", idx == 0)
+        } else if is_ref_to(last, &|p| self.boxed_slice(p)) {
+            let Some(idx) = chain.iter().copied().take_while(|&ty| !is_ref_to(ty, &|p| self.boxed_slice(p))).position(|ty| self.boxed_slice(ty)) else { return };
+            (&BOXED_SLICE_INTO_ITER, "Box<[T]>", "2024", idx == 0)
+        } else { return };
+        let _ = ufcs;
+        let pos = self.ast.row(row).name.lo;
+        self.emit(lint, pos, &format!("this method call resolves to `<&{target} as IntoIterator>::into_iter` (due to backwards compatibility), but will resolve to `<{target} as IntoIterator>::into_iter` in Rust {edition}"));
+    }
+}
+
+impl<'a> L2<'a> {
+    /// `<t as Deref>::Target`, normalised.
+    fn deref_target(&self, t: TyId) -> Option<TyId> {
+        let td = self.lang(LangItem::Deref)?;
+        let target = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Target")?)?;
+        let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy {
+            kind: crate::types::AliasTyKind::Projection { def_id: target },
+            args: self.tcx.tys.mk_list(&[t]),
+            regions: crate::types::RegionArgsId::EMPTY,
+        }));
+        self.tcx.try_normalize_erasing_regions(self.prog, self.env, proj).ok()
     }
 }
