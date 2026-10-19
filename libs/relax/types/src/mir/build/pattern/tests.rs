@@ -17,7 +17,7 @@ pub(crate) fn program(source: &str) -> (Program, Tcx) {
         "relax-mir-build-{}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        crate::unique_test_id()
     ));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("lib.rs");
