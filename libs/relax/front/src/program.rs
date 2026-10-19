@@ -2706,6 +2706,14 @@ impl Program {
                     // `extern crate alloc_no_stdlib as alloc;` makes `alloc::..` that crate in
                     // every module, ahead of a sysroot crate of the same name)
                     if rename.is_some() && self.crates[krate as usize].root_mod == module {
+                        // build_reduced_graph_for_extern_crate: a macro-expanded `extern crate x as n;`
+                        // at the root must not shadow an extern prelude name from `--extern`
+                        if !this && self.syms.str(bind) != "_" && pos >= self.files[file as usize].src_len
+                            && self.crates[krate as usize].deps.iter().any(|x| x.0 == bind)
+                            && !self.imports.iter().any(|i| i.module == module && i.bind == Some(bind) && i.ext && i.pos < self.files[i.file as usize].src_len && i.file == file) {
+                            let e = self.record_error(file, pos, "resolve", "macro-expanded `extern crate` items cannot shadow names passed with `--extern`".to_string());
+                            self.errors.push(e);
+                        }
                         if this {
                             self.crates[krate as usize].deps.insert(0, (bind, krate));
                         } else if let Some(&(_, c)) = self.crates[krate as usize].deps.iter().find(|x| x.0 == name) {

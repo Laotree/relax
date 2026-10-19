@@ -15,6 +15,9 @@ fn namespaces(prog: &Program, d: DefId) -> (bool, bool) {
         // (foreign items are left out: an `extern` block inside a fn body is collected into the
         // enclosing module, not the body's block, so two bodies' declarations would collide)
         DefKind::Fn | DefKind::Const | DefKind::Static => (false, true),
+        // the items of a trait (`duplicate_items` only asks for those of traits)
+        DefKind::AssocFn | DefKind::AssocConst => (false, true),
+        DefKind::AssocTy => (true, false),
         DefKind::Struct => {
             // tuple and unit structs also live in the value namespace
             let ast = &prog.files[def.file as usize].ast;
@@ -34,7 +37,7 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
         let d = DefId(i as u32);
         let def = prog.def(d);
         if !own.get(def.krate as usize).copied().unwrap_or(false) || def.parent == NO_DEF { continue; }
-        if prog.def(def.parent).kind != DefKind::Mod { continue; }
+        if !matches!(prog.def(def.parent).kind, DefKind::Mod | DefKind::Trait) { continue; }
         // only items the module's source declares (not the compiler's own definitions)
         if prog.item_defs.get(&(def.file, def.item.0)) != Some(&d) { continue; }
         let name = prog.syms.str(def.name);
@@ -53,7 +56,7 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
                     let ast = &prog.files[def.file as usize].ast;
                     let pos = ast.item(def.item).name.lo;
                     let ns_name = if ns { "type" } else { "value" };
-                    let module = if prog.block_owner.get(&prog.def(def.parent).sub).is_some() { "this block" } else { "this module" };
+                    let module = if prog.def(def.parent).kind == DefKind::Trait { "this trait" } else if prog.block_owner.get(&prog.def(def.parent).sub).is_some() { "this block" } else { "this module" };
                     errors.push(prog.record_error(def.file, pos, "resolve", format!(
                         "E0428: the name `{}` is defined multiple times -- note: `{}` must be defined only once in the {} namespace of {}",
                         name, name, ns_name, module)));
