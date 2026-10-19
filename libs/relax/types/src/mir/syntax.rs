@@ -60,6 +60,15 @@ pub enum Operand {
     Copy(Place),
     Move(Place),
     Constant(Box<ConstOperand>),
+    /// rustc_middle/src/mir/syntax.rs:1329: a session flag, not a constant (differs per crate).
+    RuntimeChecks(RuntimeChecks),
+}
+/// rustc_middle/src/mir/syntax.rs:1574.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum RuntimeChecks {
+    UbChecks,
+    ContractChecks,
+    OverflowChecks,
 }
 #[derive(Clone, Debug)]
 pub struct ConstOperand {
@@ -157,7 +166,8 @@ pub enum CastKind {
     IntToFloat,
     Transmute,
 }
-/// rustc_middle/src/mir/syntax.rs:1358. NullaryOp retains its type operand (SizeOf/AlignOf/OffsetOf).
+/// rustc_middle/src/mir/syntax.rs:1358 (1.97.1: no Len/NullaryOp/ShallowInitBox; bounds checks use
+/// a constant length or `UnOp::PtrMetadata`, runtime flags are `Operand::RuntimeChecks`).
 #[derive(Clone, Debug)]
 pub enum Rvalue {
     Use(Operand),
@@ -165,23 +175,12 @@ pub enum Rvalue {
     Ref(Region, BorrowKind, Place),
     ThreadLocalRef(DefId),
     RawPtr(RawPtrKind, Place),
-    Len(Place),
     Cast(CastKind, Operand, TyId),
     BinaryOp(BinOp, Box<(Operand, Operand)>),
-    NullaryOp(NullOp, TyId),
     UnaryOp(UnOp, Operand),
     Discriminant(Place),
     Aggregate(Box<AggregateKind>, Vec<Operand>),
-    ShallowInitBox(Operand, TyId),
     CopyForDeref(Place),
-}
-#[derive(Clone, Debug)]
-pub enum NullOp {
-    SizeOf,
-    AlignOf,
-    OffsetOf(Vec<(VariantIdx, FieldIdx)>),
-    UbChecks,
-    ContractChecks,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnOp {

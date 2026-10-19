@@ -271,9 +271,9 @@ pub trait Visitor {
                 };
                 self.visit_place(place, context, at)
             }
-            Rvalue::Len(place) | Rvalue::Discriminant(place) => self.visit_place(place, Read(R::Inspect), at),
+            Rvalue::Discriminant(place) => self.visit_place(place, Read(R::Inspect), at),
             Rvalue::CopyForDeref(place) => self.visit_place(place, Read(R::Inspect), at),
-            Rvalue::Cast(_, op, ty) | Rvalue::ShallowInitBox(op, ty) => {
+            Rvalue::Cast(_, op, ty) => {
                 self.visit_operand(op, at);
                 self.visit_ty(ty);
             }
@@ -281,7 +281,6 @@ pub trait Visitor {
                 self.visit_operand(&ops.0, at);
                 self.visit_operand(&ops.1, at);
             }
-            Rvalue::NullaryOp(_, ty) => self.visit_ty(ty),
             Rvalue::ThreadLocalRef(def) => self.visit_def(def),
             Rvalue::Aggregate(kind, ops) => {
                 self.visit_aggregate_kind(kind);
@@ -327,6 +326,7 @@ pub trait Visitor {
         match op {
             Operand::Copy(place) => self.visit_place(place, Read(R::Copy), at),
             Operand::Move(place) => self.visit_place(place, Read(R::Move), at),
+            Operand::RuntimeChecks(_) => {}
             Operand::Constant(c) => {
                 self.visit_span(&c.span);
                 if let Some(user) = &c.user_ty {
@@ -651,9 +651,9 @@ pub trait MutVisitor {
                 };
                 self.visit_place(place, context, at)
             }
-            Rvalue::Len(place) | Rvalue::Discriminant(place) => self.visit_place(place, Read(R::Inspect), at),
+            Rvalue::Discriminant(place) => self.visit_place(place, Read(R::Inspect), at),
             Rvalue::CopyForDeref(place) => self.visit_place(place, Read(R::Inspect), at),
-            Rvalue::Cast(_, op, ty) | Rvalue::ShallowInitBox(op, ty) => {
+            Rvalue::Cast(_, op, ty) => {
                 self.visit_operand(op, at);
                 self.visit_ty(ty);
             }
@@ -661,7 +661,6 @@ pub trait MutVisitor {
                 self.visit_operand(&mut ops.0, at);
                 self.visit_operand(&mut ops.1, at);
             }
-            Rvalue::NullaryOp(_, ty) => self.visit_ty(ty),
             Rvalue::ThreadLocalRef(def) => self.visit_def(def),
             Rvalue::Aggregate(kind, ops) => {
                 self.visit_aggregate_kind(kind);
@@ -707,6 +706,7 @@ pub trait MutVisitor {
         match op {
             Operand::Copy(place) => self.visit_place(place, Read(R::Copy), at),
             Operand::Move(place) => self.visit_place(place, Read(R::Move), at),
+            Operand::RuntimeChecks(_) => {}
             Operand::Constant(c) => {
                 self.visit_span(&mut c.span);
                 if let Some(user) = &mut c.user_ty {

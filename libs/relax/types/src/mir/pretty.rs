@@ -126,6 +126,7 @@ impl Printer<'_> {
         match op {
             Operand::Copy(place) => format!("copy {}", self.place(place)),
             Operand::Move(place) => format!("move {}", self.place(place)),
+            Operand::RuntimeChecks(checks) => format!("{checks:?}"),
             Operand::Constant(c) => format!("const {}", self.constant(&c.const_)),
         }
     }
@@ -159,14 +160,11 @@ impl Printer<'_> {
             Rvalue::Ref(region, kind, place) => format!("&{:?} {kind:?} {}", region, self.place(place)),
             Rvalue::ThreadLocalRef(def) => format!("ThreadLocalRef(def#{})", def.0),
             Rvalue::RawPtr(kind, place) => format!("&raw {kind:?} {}", self.place(place)),
-            Rvalue::Len(place) => format!("Len({})", self.place(place)),
             Rvalue::Cast(kind, op, ty) => format!("{} as {} ({kind:?})", self.operand(op), self.ty(*ty)),
             Rvalue::BinaryOp(op, args) => format!("{op:?}({}, {})", self.operand(&args.0), self.operand(&args.1)),
-            Rvalue::NullaryOp(op, ty) => format!("{op:?}::<{}>()", self.ty(*ty)),
             Rvalue::UnaryOp(op, arg) => format!("{op:?}({})", self.operand(arg)),
             Rvalue::Discriminant(place) => format!("discriminant({})", self.place(place)),
             Rvalue::Aggregate(kind, ops) => format!("{}({})", self.aggregate(kind), self.operands(ops)),
-            Rvalue::ShallowInitBox(op, ty) => format!("ShallowInitBox({}, {})", self.operand(op), self.ty(*ty)),
             Rvalue::CopyForDeref(place) => format!("CopyForDeref({})", self.place(place)),
         }
     }

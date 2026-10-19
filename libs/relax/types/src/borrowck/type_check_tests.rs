@@ -67,6 +67,7 @@ impl BorrowckTypeOps for Fake<'_> {
     fn normalize(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Locations) -> TyId { ty }
     fn deeply_normalize_sig(&mut self, _: &mut MirTypeckRegionConstraints, sig: &FnSig, _: Location) -> Result<FnSig, ()> { Ok(sig.clone()) }
     fn struct_tail(&mut self, _: &mut MirTypeckRegionConstraints, ty: TyId, _: Location) -> TyId { ty }
+    fn instantiate_canonical_user_type(&mut self, _: Span, user: &CanonicalUserType) -> UserType { user.value.clone() }
     fn ascribe_user_type(&mut self, _: &mut MirTypeckRegionConstraints, t: TyId, u: UserType, s: Span) { self.ops.push(Op::Ascribe(t, u, s)); }
     fn ascribe_user_type_skip_wf(&mut self, _: &mut MirTypeckRegionConstraints, t: TyId, u: TyId, s: Span) { self.ops.push(Op::AscribeSkipWf(t, u, s)); }
     fn closure_user_provided_sig(&mut self, _: &Body) -> Option<FnSig> { self.closure_sig.clone() }
@@ -100,7 +101,7 @@ fn body(tys: &[TyId], blocks: Vec<BasicBlockData>) -> Body {
             mutability: Mutability::Mut, source_info: SourceInfo { span: span(50 + i as u32), ..SourceInfo::default() }, user_ty: vec![],
             local_info: if i == 0 { LocalInfo::Boring } else { LocalInfo::user_var(BindingMode(ByRef::No, Mutability::Mut), None, Span::default()) },
             kind: match i { 0 => LocalKind::Return, 1 => LocalKind::Arg, _ => LocalKind::UserVar } }).collect(),
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], upvars: Vec::new(), allocs: AllocMap::default(),
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], span: Span::default(), upvars: Vec::new(), allocs: AllocMap::default(),
         var_debug_info: vec![], arg_count: 1, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn re(tcx: &Tcx, v: u32) -> RegionId { tcx.tys.intern_region(RegionKind::ReVar(v)) }
@@ -218,7 +219,7 @@ fn return_and_yield_categories() {
     let (r0, r1) = (rf(&tcx, re(&tcx, 0), t, false), rf(&tcx, re(&tcx, 1), t, false));
     let mut b = body(&[r0, r1, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![assign(0, copy(1))],
         TerminatorKind::Yield { value: Operand::Copy(p(1)), resume: BasicBlock(1), resume_arg: p(2), drop: None }), block(vec![], TerminatorKind::Return)]);
-    b.coroutine = Some(CoroutineInfo { yield_ty: rf(&tcx, re(&tcx, 3), t, false), resume_ty: rf(&tcx, re(&tcx, 4), t, false), kind: CoroutineKind::Coroutine, movability: Movability::Movable });
+    b.coroutine = Some(CoroutineInfo { yield_ty: rf(&tcx, re(&tcx, 3), t, false), resume_ty: rf(&tcx, re(&tcx, 4), t, false), kind: CoroutineKind::Coroutine(Movability::Movable) });
     let mut fake = Fake::new(&tcx, 7);
     let io = [r1, r0];
     let r = type_check(&tcx, &test_prog(), &mut fake, &b, &io, Some((rf(&tcx, re(&tcx, 5), t, false), rf(&tcx, re(&tcx, 6), t, false)))); clean(&r);
@@ -414,7 +415,7 @@ fn user_annotations_hold_everywhere() {
     let mut fake = Fake::new(&tcx, 3);
     let r = check(&tcx, &mut fake, &b); clean(&r);
     // The canonical annotation is ascribed first, then the declaration (invariant) and the statement (covariant).
-    assert_eq!(fake.ops[0], Op::Ascribe(annotated, UserType::Annotation(UserTypeAnnotationIndex(0)), span(40)));
+    assert_eq!(fake.ops[0], Op::Ascribe(annotated, annotation_value(annotated), span(40)));
     let all: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category != Cat::BoringNoLocation)
         .map(|c| (c.sup, c.sub, c.location, c.category, c.span)).collect();
     let decl = Cat::TypeAnnotation(AnnotationSource::Declaration);
@@ -497,7 +498,7 @@ fn reaudit_inline_const_bounds_follow_the_constant_checks() {
     let mut fake = Fake::new(&tcx, 3);
     fake.inline_const = true; fake.const_ty = Some(t);
     let r = check(&tcx, &mut fake, &b); clean(&r);
-    let ascribe = fake.ops.iter().position(|o| matches!(o, Op::Ascribe(_, UserType::TypeOf(DefId(5), _), _))).unwrap();
+    let ascribe = fake.ops.iter().position(|o| matches!(o, Op::Ascribe(_, UserType { kind: UserTypeKind::TypeOf(DefId(5), _), .. }, _))).unwrap();
     let clauses = fake.ops.iter().position(|o| matches!(o, Op::Clauses(ClauseOwner::Def(DefId(5)), _, _))).unwrap();
     assert!(ascribe < clauses, "{:?}", fake.ops);
     assert_eq!(r.deferred_closure_requirements.len(), 1);
@@ -537,3 +538,5 @@ fn reaudit_closure_parent_arguments_are_related_first() {
 }
 
 fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }
+
+fn annotation_value(ty: TyId) -> UserType { UserType::new(UserTypeKind::Ty(ty)) }

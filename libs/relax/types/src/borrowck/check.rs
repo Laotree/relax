@@ -128,7 +128,7 @@ fn check_supported(tcx: &Tcx, body: &Body, unsupported: &mut Vec<&'static str>) 
             match rv {
                 Rvalue::Aggregate(kind, _) if matches!(**kind, AggregateKind::Closure(..) | AggregateKind::Coroutine(..)) =>
                     self.stop("closure aggregate needs nested used-mut capture metadata"),
-                Rvalue::CopyForDeref(_) | Rvalue::ShallowInitBox(..) => self.stop("runtime rvalue in borrowck MIR"),
+                Rvalue::CopyForDeref(_) => self.stop("runtime rvalue in borrowck MIR"),
                 _ => {}
             }
             self.super_rvalue(rv, at);
@@ -263,19 +263,18 @@ impl MirBorrowckCtxt<'_> {
             Rvalue::BinaryOp(_, ops) => {
                 self.consume_operand(&ops.0, at, span, state); self.consume_operand(&ops.1, at, span, state);
             }
-            Rvalue::Discriminant(place) | Rvalue::Len(place) => {
-                let field = if matches!(value, Rvalue::Len(_)) { Some(ArtificialField::ArrayLength) } else { None };
-                self.access_place(place, Shallow(field), Read(ReadKind::Copy), false, at, span, state);
+            Rvalue::Discriminant(place) => {
+                self.access_place(place, Shallow(None), Read(ReadKind::Copy), false, at, span, state);
                 self.check_if_path_or_subpath_is_moved(place, at, span, state);
             }
             Rvalue::Aggregate(_, ops) => for op in ops { self.consume_operand(op, at, span, state); },
-            Rvalue::ThreadLocalRef(_) | Rvalue::NullaryOp(..) => {}
-            Rvalue::CopyForDeref(_) | Rvalue::ShallowInitBox(..) => unreachable!("preflight rejected runtime rvalue"),
+            Rvalue::ThreadLocalRef(_) => {}
+            Rvalue::CopyForDeref(_) => unreachable!("preflight rejected runtime rvalue"),
         }
     }
     fn consume_operand(&mut self, op: &Operand, at: Location, span: Span, state: BorrowckDomain<'_>) {
         let (place, access, allow) = match op {
-            Operand::Constant(_) => return,
+            Operand::Constant(_) | Operand::RuntimeChecks(_) => return,
             Operand::Copy(place) => (place, Read(ReadKind::Copy), false),
             Operand::Move(place) => { self.check_movable_place(place, at); (place, Write(WriteKind::Move), true) }
         };

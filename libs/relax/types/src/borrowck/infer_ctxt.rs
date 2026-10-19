@@ -169,6 +169,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
                 mir::Const::Val(_, ty) | mir::Const::Ty(ty, _) => *ty,
                 mir::Const::Unevaluated { def, args, .. } => BorrowckTypeOps::unevaluated_const_ty(self, *def, args),
             },
+            mir::Operand::RuntimeChecks(_) => self.tcx.tys.bool_,
         }
     }
 }
@@ -247,6 +248,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             crate::typeck::ty_to_string(false, self.prog, self.tcx, ty), suggested));
         self.tainted_by_errors.set(true); self.tcx.tys.error
     }
+    fn instantiate_canonical_user_type(&mut self, _: Span, _: &crate::types::user_type::CanonicalUserType) -> UserType { panic!("M2b: canonical user-type annotations on MIR Body") }
     fn ascribe_user_type(&mut self, _: &mut MirTypeckRegionConstraints, _: TyId, _: UserType, _: Span) { panic!("M2b: canonical user-type annotations on MIR Body") }
     fn ascribe_user_type_skip_wf(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: TyId, span: Span) {
         let env = self.param_env_id();
@@ -353,14 +355,6 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                 }
             }
             Rvalue::BinaryOp(mir::BinOp::Cmp, _) => self.nominal_ty(match self.require_lang_item(LangItem::OrderingEnum) { Some(def) => def, None => return tys.error }, &[]),
-            Rvalue::ShallowInitBox(_, ty) => {
-                let def = match self.require_lang_item(LangItem::OwnedBox) { Some(def) => def, None => return tys.error };
-                let mut args = vec![*ty];
-                let state = crate::tcx::EvalState::new();
-                let cx = crate::tcx::EvalCx::new(self.prog, &self.tcx, crate::tcx::TypingEnv::fully_monomorphized(self.prog), &state);
-                self.tcx.fill_type_defaults(&cx, self.prog, def, &mut args, None);
-                tys.intern(TyKind::Adt(def, tys.mk_list(&args), crate::types::RegionArgsId::EMPTY))
-            }
             Rvalue::Repeat(op, count) => {
                 let ct = match count {
                     mir::Const::Val(mir::ConstValue::Scalar(mir::Scalar::Int { bits, .. }), _) => tys.const_usize(u64::try_from(*bits).expect("usize length")),

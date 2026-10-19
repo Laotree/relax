@@ -133,22 +133,49 @@ pub struct CoroutineInfo {
     pub yield_ty: TyId,
     pub resume_ty: TyId,
     pub kind: CoroutineKind,
-    /// rustc_borrowck/src/lib.rs (check_movable_place): only movable coroutines must reject
-    /// references into their own frame that live across a suspension point.
-    pub movability: Movability,
 }
-/// rustc_hir/src/hir.rs Movability (`static` coroutines are Static).
+/// rustc_hir/src/hir.rs Movability (`static` coroutines are Static). Only movable coroutines
+/// reject references into their own frame across a suspension (rustc_borrowck check_movable_place);
+/// read it through `CoroutineKind::movability`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Movability {
     Movable,
     Static,
 }
+/// rustc_hir/src/hir.rs:2308 CoroutineKind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CoroutineKind {
-    Coroutine,
+    /// A coroutine from a desugaring (async/gen block, or the body of an async/gen fn or closure).
+    Desugared(CoroutineDesugaring, CoroutineSource),
+    /// A coroutine literal created via a `yield` inside a closure.
+    Coroutine(Movability),
+}
+impl CoroutineKind {
+    /// hir.rs:2317.
+    pub fn movability(self) -> Movability {
+        match self {
+            CoroutineKind::Desugared(CoroutineDesugaring::Async | CoroutineDesugaring::AsyncGen, _) => Movability::Static,
+            CoroutineKind::Desugared(CoroutineDesugaring::Gen, _) => Movability::Movable,
+            CoroutineKind::Coroutine(movability) => movability,
+        }
+    }
+}
+/// hir.rs:2381.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroutineDesugaring {
     Async,
     Gen,
     AsyncGen,
+}
+/// hir.rs:2358: what the desugared coroutine was written as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoroutineSource {
+    /// An explicit `async`/`gen` block.
+    Block,
+    /// An explicit `async`/`gen` closure.
+    Closure,
+    /// The block generated as the body of an async/gen fn.
+    Fn,
 }
 
 /// rustc_middle/src/mir/mod.rs:967. Region skeletons belong to borrowck, not local declarations.
@@ -387,6 +414,8 @@ pub struct Body {
     pub basic_blocks: Vec<BasicBlockData>,
     pub local_decls: Vec<LocalDecl>,
     pub source_scopes: Vec<SourceScopeData>,
+    /// The span of the whole body (rustc_middle Body::span).
+    pub span: Span,
     pub user_type_annotations: Vec<CanonicalUserTypeAnnotation>,
     /// Captured places of a closure/coroutine body, in upvar field order (empty otherwise).
     pub upvars: Vec<CapturedPlace>,

@@ -45,6 +45,7 @@ fn body(tcx: &Tcx) -> Body {
         local_decls: locals,
         source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }],
         user_type_annotations: vec![CanonicalUserTypeAnnotation::for_test(TyId(0), Span::default())],
+        span: Span::default(),
         upvars: Vec::new(),
         allocs: AllocMap::default(),
         var_debug_info: Vec::new(),
@@ -319,7 +320,7 @@ fn yield_and_coroutine_drop_phase_rules() {
         let mut b = body(&tcx);
         term(&mut b, kind);
         bad(&b, &tcx, "outside coroutine");
-        b.coroutine = Some(CoroutineInfo { yield_ty: tcx.tys.i32_, resume_ty: tcx.tys.i32_, kind: CoroutineKind::Coroutine, movability: Movability::Movable });
+        b.coroutine = Some(CoroutineInfo { yield_ty: tcx.tys.i32_, resume_ty: tcx.tys.i32_, kind: CoroutineKind::Coroutine(Movability::Movable) });
         good(&b, &tcx);
         for phase in [RuntimePhase::Initial, RuntimePhase::PostCleanup, RuntimePhase::Optimized] {
             b.phase = MirPhase::Runtime(phase);

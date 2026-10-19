@@ -92,6 +92,27 @@ impl Checker<'_> {
         if !self.body.upvars.is_empty() && !matches!(self.body.source.kind, BodyKind::Closure(_)) {
             self.fail("upvars outside a closure body");
         }
+        // The upvar list names exactly the fields of the closure's tupled upvar type (the
+        // environment is the closure itself or a reference to it).
+        if matches!(self.body.source.kind, BodyKind::Closure(_)) && self.body.arg_count >= 1 {
+            let mut env = self.body.local_decls.get(1).map(|d| d.ty);
+            while let Some(ty) = env.filter(|t| (t.0 as usize) < self.tcx.tys.len()) {
+                match self.tcx.tys.kind(ty) {
+                    TyKind::Ref(_, inner, _) => env = Some(*inner),
+                    TyKind::Closure(_, _, args) => {
+                        let fields = match self.tcx.tys.kind(args.tupled_upvars_ty) {
+                            TyKind::Tuple(ts) => Some(self.tcx.tys.list(*ts).len()),
+                            _ => None,
+                        };
+                        if fields.is_some_and(|n| n != self.body.upvars.len()) {
+                            self.fail("upvar count disagrees with the closure's tupled upvar type");
+                        }
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
         // Promoted bodies have independent local/block/scope indices.
         self.super_body(self.body);
     }
@@ -102,6 +123,7 @@ impl Checker<'_> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self.place_ty(place),
             Operand::Constant(c) => Some(c.const_.ty(&self.tcx.tys)),
+            Operand::RuntimeChecks(_) => Some(self.tcx.tys.bool_),
         }
     }
     fn rvalue_ty(&self, rv: &Rvalue) -> Option<TyId> {
@@ -109,8 +131,6 @@ impl Checker<'_> {
             Rvalue::Use(op) | Rvalue::UnaryOp(UnOp::Not | UnOp::Neg, op) => self.operand_ty(op),
             Rvalue::CopyForDeref(place) => self.place_ty(place),
             Rvalue::Cast(_, _, ty) => Some(*ty),
-            Rvalue::Len(_) | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_), _) => Some(self.tcx.tys.usize_),
-            Rvalue::NullaryOp(NullOp::UbChecks | NullOp::ContractChecks, _) => Some(self.tcx.tys.bool_),
             Rvalue::BinaryOp(op, args) => match op {
                 BinOp::Eq | BinOp::Lt | BinOp::Le | BinOp::Ne | BinOp::Ge | BinOp::Gt => Some(self.tcx.tys.bool_),
                 BinOp::AddWithOverflow | BinOp::SubWithOverflow | BinOp::MulWithOverflow | BinOp::Cmp => None,

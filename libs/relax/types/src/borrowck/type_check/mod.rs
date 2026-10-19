@@ -36,14 +36,7 @@ pub struct FnSig { pub inputs: Vec<TyId>, pub output: TyId, pub header: FnHeader
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PolyFnSig { pub sig: FnSig, pub bound_regions: u32 }
 
-/// The user type of an `ascribe_user_type` operation (rustc UserType).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UserType {
-    /// A canonical annotation of the body, instantiated by N01's `instantiate_canonical`.
-    Annotation(UserTypeAnnotationIndex),
-    /// `UserTypeKind::TypeOf(def, UserArgs { args, user_self_ty: None })`.
-    TypeOf(DefId, Vec<GenericArg>),
-}
+pub use crate::types::user_type::{CanonicalUserType, UserArgs, UserType, UserTypeKind};
 
 /// The definitions whose clauses `normalize_and_prove_instantiated_clauses` instantiates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +88,9 @@ pub trait BorrowckTypeOps {
     /// Err is an ErrorGuaranteed already reported by the operation.
     fn deeply_normalize_sig(&mut self, out: &mut MirTypeckRegionConstraints, sig: &FnSig, location: Location) -> Result<FnSig, ()>;
     fn struct_tail(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, location: Location) -> TyId;
+    /// rustc_infer `instantiate_canonical`: the canonical annotation's variables become fresh
+    /// inference variables (regions: NLL variables in `out`'s universe).
+    fn instantiate_canonical_user_type(&mut self, span: Span, user: &CanonicalUserType) -> UserType;
     fn ascribe_user_type(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: UserType, span: Span);
     fn ascribe_user_type_skip_wf(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: TyId, span: Span);
     /// `closure_user_provided_sig` of a closure-like body, canonical vars and binder
@@ -262,8 +258,9 @@ impl<'a> TypeChecker<'a> {
     /// Equate the inferred type and the annotated type for user type annotations.
     fn check_user_type_annotations(&mut self) {
         let body = self.body;
-        for (i, annotation) in body.user_type_annotations.iter().enumerate() {
-            self.infcx.ascribe_user_type(&mut self.constraints, annotation.inferred_ty, UserType::Annotation(UserTypeAnnotationIndex(i as u32)), annotation.span);
+        for annotation in &body.user_type_annotations {
+            let user = self.infcx.instantiate_canonical_user_type(annotation.span, &annotation.user_ty);
+            self.infcx.ascribe_user_type(&mut self.constraints, annotation.inferred_ty, user, annotation.span);
         }
     }
 
@@ -344,6 +341,7 @@ impl<'a> TypeChecker<'a> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self.place_ty(place).ty,
             Operand::Constant(c) => self.const_ty(c),
+            Operand::RuntimeChecks(_) => self.tcx.tys.bool_,
         }
     }
     fn const_ty(&self, c: &ConstOperand) -> TyId {
@@ -370,8 +368,6 @@ impl<'a> TypeChecker<'a> {
                 tys.intern(TyKind::Ref(matches!(kind, BorrowKind::Mut { .. }), self.place_ty(place).ty, r))
             }
             Rvalue::RawPtr(kind, place) => tys.intern(TyKind::Ptr(*kind == RawPtrKind::Mut, self.place_ty(place).ty)),
-            Rvalue::Len(_) | Rvalue::NullaryOp(NullOp::SizeOf | NullOp::AlignOf | NullOp::OffsetOf(_), _) => tys.usize_,
-            Rvalue::NullaryOp(NullOp::UbChecks | NullOp::ContractChecks, _) => tys.bool_,
             Rvalue::Cast(_, _, ty) => *ty,
             Rvalue::BinaryOp(op, ops) => {
                 let lhs = self.operand_ty(&ops.0);
@@ -388,8 +384,7 @@ impl<'a> TypeChecker<'a> {
                 AggregateKind::Tuple => tys.intern(TyKind::Tuple(tys.mk_list(&ops.iter().map(|op| self.operand_ty(op)).collect::<Vec<_>>()))),
                 _ => self.infcx.rvalue_query_ty(self.body, rv),
             },
-            Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::UnaryOp(UnOp::PtrMetadata, _)
-            | Rvalue::ShallowInitBox(..) => self.infcx.rvalue_query_ty(self.body, rv),
+            Rvalue::ThreadLocalRef(_) | Rvalue::Discriminant(_) | Rvalue::UnaryOp(UnOp::PtrMetadata, _) => self.infcx.rvalue_query_ty(self.body, rv),
         }
     }
 
@@ -995,8 +990,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             Rvalue::Use(_) | Rvalue::UnaryOp(..) | Rvalue::CopyForDeref(_) | Rvalue::BinaryOp(..) | Rvalue::RawPtr(..)
-            | Rvalue::ThreadLocalRef(..) | Rvalue::Discriminant(..) | Rvalue::Len(_) | Rvalue::NullaryOp(..)
-            | Rvalue::ShallowInitBox(..) => {}
+            | Rvalue::ThreadLocalRef(..) | Rvalue::Discriminant(..) => {}
         }
     }
 
@@ -1042,7 +1036,7 @@ impl<'a> TypeChecker<'a> {
                 }
                 Const::Unevaluated { def, args, promoted: None, .. } => {
                     let span = locations.span(self.body);
-                    self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::TypeOf(*def, args.clone()), span);
+                    self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::new(UserTypeKind::TypeOf(*def, UserArgs { args: args.clone(), user_self_ty: None })), span);
                 }
                 // Const generic parameters are ascribed below.
                 Const::Ty(..) => {}

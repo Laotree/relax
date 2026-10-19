@@ -23,7 +23,7 @@ fn body(tys: &[TyId], blocks: Vec<BasicBlockData>) -> Body {
         basic_blocks: blocks, local_decls: tys.iter().enumerate().map(|(i, &ty)| LocalDecl { ty,
             mutability: Mutability::Mut, source_info: SourceInfo::default(), user_ty: vec![], local_info: LocalInfo::Boring,
             kind: if i == 0 { LocalKind::Return } else { LocalKind::UserVar } }).collect(),
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], upvars: Vec::new(), allocs: AllocMap::default(),
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], span: Span::default(), upvars: Vec::new(), allocs: AllocMap::default(),
         var_debug_info: vec![], arg_count: 1, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn reference(tcx: &Tcx, t: TyId, mutable: bool) -> TyId { tcx.tys.intern(TyKind::Ref(mutable, t, RegionId::ERASED)) }
