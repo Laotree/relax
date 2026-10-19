@@ -4057,7 +4057,11 @@ impl<'a> Fcx<'a> {
         if !self.check_seg_arg_count(args_id, def, lo) { return None; }
         let mut out = Vec::new();
         if let GenericArgs::Angle(v) = a {
+            // hir_ty_lowering/generics.rs: arguments beyond the declared parameters are not
+            // lowered (E0107 reports them)
+            let declared = self.tcx.generic_indices_of(self.prog, def).types_consts.len();
             for g in self.ast().list(*v) {
+                if offset + out.len() >= declared && !matches!(g, GenericArg::Lifetime(_) | GenericArg::Binding(..) | GenericArg::Constraint(..)) { break; }
                 if let Some(lt) = self.generic_arg(g, def, offset + out.len()) {
                     out.push(lt);
                 }

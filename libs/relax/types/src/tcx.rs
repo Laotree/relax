@@ -2185,7 +2185,7 @@ impl Tcx {
                 self.tys.error
             }
             ast::Ty::ImplTrait(_) => {
-                self.err(cx, prog, file, 0, "`impl Trait` in this position is not supported".to_string());
+                self.err(cx, prog, file, 0, "E0562: `impl Trait` is not allowed in paths or in this position".to_string());
                 self.tys.error
             }
             _ => {
@@ -2531,7 +2531,13 @@ impl Tcx {
         let f = &prog.files[file as usize];
         // `<T as Trait>::Name`
         if let Some(q) = prog.files[file as usize].ast.qself(p) {
-            let self_t = self.lower_ty(cx, prog, file, module, env, q.ty);
+            // rustc_ast_lowering path.rs:41,88: `impl Trait` in a qualified path's self type or
+            // trait path is ImplTraitPosition::Path (E0562)
+            let self_t = if env.opaque_owner.is_some() || !env.impl_params.is_empty() {
+                let mut path_env = env.clone();
+                path_env.opaque_owner = None; path_env.impl_params.clear();
+                self.lower_ty(cx, prog, file, module, &path_env, q.ty)
+            } else { self.lower_ty(cx, prog, file, module, env, q.ty) };
             if let Some(tp) = &q.trait_path {
                 if let Some(td) = self.resolve_type_path_def(prog, file, module, tp) {
                     let name = prog.syms.get(f.text(prog.files[file as usize].ast.segs(p.segs)[p.segs.len() - 1].name)).unwrap_or(u32::MAX);
@@ -3540,6 +3546,8 @@ impl Tcx {
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
         env.trait_def = Some(td);
+        // (`P::Assoc` in a supertrait's arguments resolves through the trait's own bounds)
+        env.regions.owner = Some(td);
         let module = self.item_module(prog, td);
         let mut sub = vec![self_t];
         sub.extend(targs.iter().copied());
@@ -3620,6 +3628,7 @@ impl Tcx {
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
         env.trait_def = Some(td);
+        env.regions.owner = Some(td);
         let module = self.item_module(prog, td);
         let mut sub = vec![self_t];
         sub.extend(targs.iter().copied());
@@ -3703,6 +3712,7 @@ impl Tcx {
         }
         env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
         env.trait_def = Some(td);
+        env.regions.owner = Some(td);
         let module = self.item_module(prog, td);
         let mut out = Vec::new();
         if !maybe_sized { if let Some(sized) = self.lang_items.get(LangItem::Sized) { out.push((sized, Vec::new())); } }
