@@ -3482,6 +3482,21 @@ impl Program {
         // `use std::eprintln;` / `use alloc::format;`: built-in macros need no import
         if !im.glob {
             if let Some((_, last)) = im.segs.last() {
+                // a macro is named by the module that holds it: `use m::assert;` of a module of
+                // this crate that has no such macro (only `std`'s root and the crate root have
+                // macros by name) is unresolved however the name is known elsewhere
+                if im.segs.len() > 1 {
+                    let krate = self.mods[im.module as usize].krate;
+                    let edition = self.crates[krate as usize].edition;
+                    if let Some(parent) = self.resolve_mod_path(im.module, im.global, &im.segs[..im.segs.len() - 1], edition < 2018, true) {
+                        let pd = self.def(parent);
+                        if pd.kind == DefKind::Mod && pd.krate == krate && self.crates[krate as usize].root_mod != pd.sub
+                            && !self.mods[pd.sub as usize].macros.contains_key(last)
+                            && !macro_binds.get_or_insert_with(|| self.macro_import_binds()).contains(last) {
+                            return true;
+                        }
+                    }
+                }
                 if BUILTIN_MACROS.contains(&self.syms.str(*last)) {
                     return false;
                 }
