@@ -178,6 +178,11 @@ impl Tcx {
                         for &it in &prog.impls[def.sub as usize].items {
                             let d = prog.def(it);
                             if d.kind != DefKind::AssocTy { continue; }
+                            // the associated type of a fn returning `impl Trait` in the trait is the fn's output
+                            if let Some(relax_front::assoc::ImplTraitInTraitData::Impl { fn_def_id }) = prog.impl_trait_in_trait_data.get(&it) {
+                                if let Some(sig) = self.fn_sig(prog, *fn_def_id) { in_assoc.extend(self.parameters_for_ty(&indices, sig.ret, true)); }
+                                continue;
+                            }
                             if let Some(t) = self.impl_assoc_ty(&cx, prog, imp, d.name) {
                                 in_assoc.extend(self.parameters_for_ty(&indices, t, true));
                             }
