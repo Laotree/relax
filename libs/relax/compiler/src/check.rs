@@ -347,7 +347,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     let checked = seeds.len();
     relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root);
-    relax_types::lint_early2::finish(&u.prog, &own);
+    relax_types::lint_early::finish(&u.prog, &own);
     errors.extend(static_self_access(up, &own));
     // the feature gates (E0658 and friends): items and signatures, then the loaded bodies
     for &k in crates {
