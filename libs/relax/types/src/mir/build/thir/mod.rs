@@ -10,7 +10,6 @@ use crate::types::TyId;
 use std::sync::Arc;
 
 pub mod cx;
-pub mod pattern;
 pub use cx::Cx;
 
 macro_rules! thir_ids {
@@ -55,8 +54,9 @@ macro_rules! thir_index_only {
 }
 thir_index_only!(ArmId => arms: Arm, BlockId => blocks: Block, ExprId => exprs: Expr, StmtId => stmts: Stmt, ParamId => params: Param);
 
-/// The identity of a local variable binding: the pattern node id of the binding (typeck `pat_local`).
-/// rustc LocalVarId(HirId).
+/// The identity of a local variable binding: its typeck local index (`Body.pat_local[pat]`, the same
+/// for every alternative of an or-pattern; `Body.locals[index].pat` is the primary binding's pattern id).
+/// Also what `ScopeTree::var_scope` is keyed by. rustc LocalVarId(HirId).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LocalVarId(pub u32);
 
@@ -283,13 +283,13 @@ pub enum DerefPatBorrowMode {
     Borrow(Mutability),
     Box,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PatRangeBoundary {
     Finite(crate::consts::ValTree),
     NegInfinity,
     PosInfinity,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatRange {
     pub lo: PatRangeBoundary,
     pub hi: PatRangeBoundary,
