@@ -4480,27 +4480,10 @@ pub fn parse_token_input(input: crate::builtins::Expansion, path: &str, edition:
     parse_owned_input(&ctx.cfg.session, own.src.to_vec(), None, edition, macros, &ctx.krate, Some(ctx.clone()), lazy, Some(input), Some(sources))
 }
 
-pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, mut src: Vec<u8>, mut pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
+pub(crate) fn parse_owned_input(sess: &std::sync::Arc<crate::Session>, src: Vec<u8>, pre: Option<Vec<Tok>>, edition: u16, macros: Option<crate::macros::MacroScope>, krate: &str, bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>, lazy: bool,
     input: Option<crate::builtins::Expansion>, sources: Option<std::sync::Arc<SourceRegistry>>,
 ) -> Result<(ParsedFile, Option<crate::macros::MacroUse>), (SourceSpan, String)> {
     let sources = Some(sources.unwrap_or_default());
-    // identifiers are compared in NFC (rustc_parse lexer nfc_normalize) and a raw lifetime is its
-    // plain one: a file that spells one otherwise is parsed with it rewritten, its tokens moved
-    // along
-    if input.is_none() {
-        let mut toks = match pre.take() {
-            Some(t) => t,
-            None => {
-                let mut toks = Vec::with_capacity(src.len() / 4);
-                crate::lexer::lex(&src, edition, &mut toks).map_err(|e| (SourceSpan { file: 0, lo: e.pos, hi: e.pos }, e.msg.to_string()))?;
-                toks
-            }
-        };
-        if let Some(normal) = crate::nfc::normalize_identifiers(&src, &mut toks) {
-            src = normal;
-        }
-        pre = Some(toks);
-    }
     let src_len = src.len() as u32;
     let token_input = input.is_some();
     let (toks, ast, ext, exp_map, tok_origin, token_origins, rules_exp, body_origin, used, lazy) = {

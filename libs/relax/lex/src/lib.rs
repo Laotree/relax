@@ -3,7 +3,5 @@
 //! (TokenStream/Group/Ident/Punct/Literal/Span). Std only; this directory is copied verbatim into Relax.
 
 pub mod lexer;
-pub mod nfc;
-mod nfc_tables;
 pub mod packed;
 pub mod tokens;
