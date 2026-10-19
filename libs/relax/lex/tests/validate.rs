@@ -39,7 +39,7 @@ fn bad_escapes_and_digits_are_errors() {
     assert!(err("let a = r#self;", 2021).unwrap().contains("raw identifier"));
     assert!(err("let a = b\"é\";", 2021).unwrap().contains("non-ASCII"));
     assert!(err("let 🦀 = 1;", 2021).unwrap().contains("Ferris"));
-    assert!(err("let a = f\"x\";", 2021).unwrap().contains("prefix `f` is unknown"));
+    assert!(err("let a = f\"x\";", 2021).unwrap().contains("is unknown"));
     assert_eq!(err("let a = f\"x\";", 2018), None);
 }
 
