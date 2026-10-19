@@ -566,7 +566,7 @@ pub(super) mod tests {
     use crate::program::Program;
     use crate::tcx::{EvalCx, EvalState, Tcx, TypingEnv};
 
-    const SRC: &str = "static S: i32 = 1;\nconst C: i32 = 2;\nfn f() { let _ = (42, 7i64, 3u8, true, 'x', 2.5f32, \"hi\", b\"ab\", c\"c\"); }\n";
+    const SRC: &str = "struct P { a: i32, b: i32 }\nstatic S: i32 = 1;\nconst C: i32 = 2;\nfn f() { let _ = (42, 7i64, 3u8, true, 'x', 2.5f32, \"hi\", b\"ab\", c\"c\"); }\n";
 
     pub(crate) struct Fx { pub thir: Thir, pub lits: Vec<(String, AstExprId)>, pub builder_parts: (&'static Program, &'static Tcx, &'static BuildRoot<'static>, CheckedBody) }
     pub(crate) fn fixture() -> Fx {
