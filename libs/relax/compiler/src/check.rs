@@ -127,6 +127,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
+    if u.prog.crates[root as usize].is_bin { errors.extend(relax_types::item_checks::entry_point(&u.prog, root)); }
     errors.extend(relax_types::lint_levels::check(&u.prog, &own));
     relax_types::lint_pass::check_items(&u.prog, &u.tcx, &own);
     relax_types::lint_dead::reset();
@@ -346,7 +347,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     }
     let checked = seeds.len();
     relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root);
-    relax_types::lint_early2::finish(&u.prog, &own);
+    relax_types::lint_early::finish(&u.prog, &own);
     errors.extend(static_self_access(up, &own));
     // the feature gates (E0658 and friends): items and signatures, then the loaded bodies
     for &k in crates {
@@ -414,8 +415,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     unsafe {
         // a delayed bug no error explains (rustc: an ICE at session end) is one internal failure
         // of the check, never the end of it
+        // rustc DiagCtxt::flush_delayed: delayed bugs are ICEs only when no error was emitted
+        let explained = !errors.is_empty() || !borrow_diagnostics.is_empty() || !(*up).errors.is_empty() || (*up).query_errors.has_errors();
         for bug in (*up).query_errors.take_delayed() {
-            errors.push(format!("internal: delayed bug at the end of the check: {}", bug));
+            if !explained { errors.push(format!("internal: delayed bug at the end of the check: {}", bug)); }
         }
         if !errors.is_empty() { (*up).query_errors.note_reported_error(); }
         (*up).flush_query_errors(true);

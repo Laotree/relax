@@ -98,7 +98,7 @@ pub struct Parser<'a> {
     /// inside a cfg'd-out item (parse_cfg_out): nothing is generated
     cfg_out: u32,
     /// attributes whose shape is checked once their item is known to be configured in (check only)
-    pending_shape: Vec<TokRange>,
+    pending_shape: Vec<(TokRange, Option<PErr>)>,
 }
 
 // precedence levels
@@ -772,13 +772,16 @@ impl<'a> Parser<'a> {
         if first == b"cfg" || first == b"cfg_attr" {
             return self.check_attr_shape(toks);
         }
-        self.pending_shape.push(toks);
+        self.pending_shape.push((toks, None));
         Ok(())
     }
 
     fn check_pending_attrs(&mut self) -> PResult<()> {
         let pending = std::mem::take(&mut self.pending_shape);
-        for toks in pending {
+        for (toks, err) in pending {
+            if let Some(e) = err {
+                return Err(e);
+            }
             self.check_attr_shape(toks)?;
         }
         Ok(())
@@ -2805,6 +2808,17 @@ impl<'a> Parser<'a> {
                 }
                 _ => GenericArg::Type(self.ty_plus()?),
             };
+            // rustc_ast_passes: generic arguments come before the first constraint
+            if crate::lexer::validation_enabled()
+                && !matches!(arg, GenericArg::Binding(..) | GenericArg::Constraint(..))
+                && v.iter().any(|a| matches!(a, GenericArg::Binding(..) | GenericArg::Constraint(..)))
+            {
+                // an AST validation error: only reported once the enclosing item is configured in
+                if self.cfg_out == 0 {
+                    let e = self.err::<()>("generic arguments must come before the first constraint").unwrap_err();
+                    self.pending_shape.push((TokRange { lo: 0, hi: 0 }, Some(e)));
+                }
+            }
             v.push(arg);
             if !self.eat(T::Comma) {
                 self.expect_gt()?;
@@ -4119,15 +4133,25 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr(ExprKind::If(cond, then, OptExprId::from(els)), lo))
     }
 
+    /// rustc parse_expr_loop: a loop takes no `else`.
+    fn no_loop_else(&mut self, what: &str) -> PResult<()> {
+        if self.kind() == T::KwElse {
+            return self.err(&format!("`{}...else` loops are not supported", what));
+        }
+        Ok(())
+    }
+
     fn loop_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwLoop)?;
         let b = self.block()?;
+        self.no_loop_else("loop")?;
         Ok(self.mk_expr(ExprKind::Loop(b, OptIdent::from(label)), lo))
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
         let c = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
         Ok(self.mk_expr(ExprKind::While(row), lo))
     }
@@ -4137,6 +4161,7 @@ impl<'a> Parser<'a> {
         self.expect(T::KwIn)?;
         let it = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("for")?;
         let row = self.ast.push_row(ForRow { pat: p, iter: it, body: b, label });
         Ok(self.mk_expr(ExprKind::For(row), lo))
     }
