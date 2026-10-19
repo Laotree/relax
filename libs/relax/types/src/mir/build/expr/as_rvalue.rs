@@ -148,7 +148,7 @@ impl Builder<'_> {
                         Some(Category::Place) => {
                             let BlockAnd(b, place) = self.as_place(block, upvar)?;
                             block = b;
-                            self.consume_by_copy_or_move(place)
+                            self.capture_operand(place)?
                         }
                         // Turn mutable borrow captures into unique borrow captures when capturing an
                         // immutable variable. This is sound because the mutation that caused the
@@ -420,31 +420,31 @@ impl Builder<'_> {
             Operand::RuntimeChecks(_) => tcx.tys.bool_,
         }
     }
-    /// builder/misc.rs:`consume_by_copy_or_move`.
-    fn consume_by_copy_or_move(&self, place: Place) -> Operand {
+    /// misc.rs:`consume_by_copy_or_move` (lane C's is module-private; same rule).
+    fn capture_operand(&self, place: Place) -> BuildResult<Operand> {
         let ty = self.operand_ty(&Operand::Copy(place.clone()));
         let cx = &self.root.cx;
-        if cx.tcx.is_copy_modulo_regions(cx.prog, cx.env, ty) { Operand::Copy(place) } else { Operand::Move(place) }
+        Ok(if cx.tcx.type_is_copy_modulo_regions(cx.prog, cx.eval, self.owner.owner, ty) { Operand::Copy(place) } else { Operand::Move(place) })
     }
-    fn literal_operand(&self, span: Span, ty: TyId, bits: u128) -> Operand {
+    fn int_literal(&self, span: Span, ty: TyId, bits: u128) -> Operand {
         let size = match self.root.cx.tcx.tys.kind(ty) { TyKind::Int(p) => Types::int_info(*p).0 as u8, _ => 1 };
         const_from_scalar(ty, bits, size, span)
     }
     /// A `0` value of the integer type.
     fn zero_literal(&self, span: Span, ty: TyId) -> BuildResult<Operand> {
         self.int_size(ty, span)?;
-        Ok(self.literal_operand(span, ty, 0))
+        Ok(self.int_literal(span, ty, 0))
     }
     /// A `-1` value of the integer type (all bits set).
     fn neg_1_literal(&self, span: Span, ty: TyId) -> BuildResult<Operand> {
         let size = self.int_size(ty, span)?;
         let bits = if size == 16 { u128::MAX } else { (1u128 << (size * 8)) - 1 };
-        Ok(self.literal_operand(span, ty, bits))
+        Ok(self.int_literal(span, ty, bits))
     }
     /// The minimum value of the signed integer type.
     fn minval_literal(&self, span: Span, ty: TyId) -> Operand {
         let size = match self.root.cx.tcx.tys.kind(ty) { TyKind::Int(p) => Types::int_info(*p).0, _ => 4 };
-        self.literal_operand(span, ty, 1u128 << (size * 8 - 1))
+        self.int_literal(span, ty, 1u128 << (size * 8 - 1))
     }
 
     /// ty/cast.rs:`mir_cast_kind`.
@@ -496,27 +496,10 @@ fn const_from_scalar(ty: TyId, bits: u128, size: u8, span: Span) -> Operand {
     Operand::Constant(Box::new(ConstOperand { span, user_ty: None, const_: Const::Val(ConstValue::Scalar(Scalar::Int { bits, size }), ty) }))
 }
 
-// PROVISIONAL (lane E): scope.rs / builder.rs (lane B) own these; delete this block when B lands them.
 impl Builder<'_> {
-    /// scope.rs:`local_scope`: the innermost region scope.
-    pub fn local_scope(&self) -> ScopeId {
-        self.scopes.scopes.last().expect("a scope is open while expressions are lowered").region_scope
-    }
     /// `tcx.sess.overflow_checks()`: overflow checks are on in checked (dev) builds.
     pub fn check_overflow(&self) -> bool {
         true
-    }
-    /// scope.rs:`diverge_from`: give the terminator of `start` its unwind path.
-    pub fn diverge_from(&mut self, _start: BasicBlock) -> BuildResult<()> {
-        Ok(())
-    }
-    /// scope.rs:`assert`: `Assert { cond, expected, msg }` terminating `block`, continuing in a new block.
-    pub fn assert(&mut self, block: BasicBlock, cond: Operand, expected: bool, msg: AssertKind, span: Span) -> BuildResult<BasicBlock> {
-        let source_info = self.source_info(span);
-        let success_block = self.cfg.start_new_block();
-        self.cfg.terminate(block, source_info, TerminatorKind::Assert { cond, expected, msg, target: success_block, unwind: UnwindAction::Continue });
-        self.diverge_from(block)?;
-        Ok(success_block)
     }
 }
 
@@ -570,13 +553,13 @@ mod tests {
         let (_, tcx, root, owner) = fx.builder_parts;
         let thir: &'static ThirBody = Box::leak(Box::new(ThirBody { thir: fx.thir, params: Vec::new(), expr: ExprId(0) }));
         let mut scopes = Scopes::default();
-        scopes.scopes.push(Scope { source_scope: SourceScope(0), region_scope: ScopeId(0), drops: Vec::new(), moved_locals: Vec::new() });
+        scopes.scopes.push(Scope::new(SourceScope(0), ScopeId(0)));
         let b = Builder {
             root, thir, owner, source: MirSource { owner: owner.owner, kind: BodyKind::Fn }, body_span: Span::default(), arg_count: 0, coroutine: None,
             cfg: Default::default(), scopes, source_scopes: vec![crate::mir::SourceScopeData { span: Span::default(), parent_scope: None }],
             source_scope: SourceScope(0), guard_context: Vec::new(), fixed_temps: Default::default(), fixed_temps_scope: None, var_indices: Default::default(),
             local_decls: Vec::new(), canonical_user_type_annotations: Vec::new(), upvars: Vec::new(), upvar_env: None, var_debug_info: Vec::new(),
-            unit_temp: None, allocs: Default::default(),
+            unit_temp: None, allocs: Default::default(), block_context: Vec::new(),
         };
         (b, tcx)
     }
