@@ -1509,7 +1509,8 @@ impl<'a> Fcx<'a> {
             ExprKind::Field(..) | ExprKind::TupleField(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) => true,
             ExprKind::Path(_) => match self.b.res.get(&e.0) {
                 Some(Res::Local(_)) | Some(Res::Err) | None => true,
-                Some(Res::Def(d)) => matches!(self.prog.def(*d).kind, DefKind::Static | DefKind::ForeignStatic),
+                // (a unit struct or variant is a destructuring-assignment pattern)
+                Some(Res::Def(d)) => matches!(self.prog.def(*d).kind, DefKind::Static | DefKind::ForeignStatic | DefKind::Struct | DefKind::Variant),
                 Some(_) => false,
             },
             ExprKind::Underscore => true,
