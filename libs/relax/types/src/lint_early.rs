@@ -19,6 +19,7 @@ use std::sync::Arc;
 use crate::typeck::Body;
 use std::collections::HashMap;
 
+pub const UNUSED_IMPORT_BRACES: Lint = lint::lint("unused_import_braces");
 pub const UNUSED_PARENS: Lint = lint::lint("unused_parens");
 pub const UNUSED_BRACES: Lint = lint::lint("unused_braces");
 pub const WHILE_TRUE: Lint = lint::lint("while_true");
@@ -1117,6 +1118,7 @@ impl<'a> W<'a> {
                 let item = *ast.item(it);
                 if matches!(item.kind, ItemKind::Use(_)) && self.lt.is_none() {
                     absolute_use_paths(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
+                    unused_import_braces(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
                 }
             }
             Stmt::Empty => {}
@@ -2405,7 +2407,7 @@ pub fn check_module_items(prog: &Program, own: &[bool]) {
             if !matches!(item.kind, ItemKind::Use(_) | ItemKind::ExternCrate(_)) { continue; }
             let attrs: Vec<(u32, Attr)> = ast.list(item.attrs).iter().map(|a| (file, *a)).collect();
             let own_attrs: Vec<Attr> = ast.list(item.attrs).to_vec();
-            if matches!(item.kind, ItemKind::Use(_)) { absolute_use_paths(prog, d, file, item, &own_attrs); }
+            if matches!(item.kind, ItemKind::Use(_)) { absolute_use_paths(prog, d, file, item, &own_attrs); unused_import_braces(prog, d, file, item, &own_attrs); }
             if attrs.is_empty() { continue; }
             attr_checks(prog, &AttrNode { d, inner: &own_attrs, attrs: &attrs, is_crate: false, macro_use_target: matches!(item.kind, ItemKind::ExternCrate(_)) });
         }
@@ -2745,6 +2747,36 @@ pub(crate) fn absolute_path(prog: &Program, d: DefId, inner: &[Attr], file: u32,
             emit_in(prog, d, inner, &ABSOLUTE_PATHS_NOT_STARTING_WITH_CRATE, file, p.lo, ABSOLUTE_PATHS_MSG);
         }
     }
+}
+
+/// rustc `UnusedImportBraces`: `use a::{b};` (a single non-`self` item in braces).
+pub(crate) fn unused_import_braces(prog: &Program, d: DefId, file: u32, item: &Item, attrs: &[Attr]) {
+    let pf = &prog.files[file as usize];
+    let ast = &pf.ast;
+    let ItemKind::Use(r) = item.kind else { return };
+    fn walk(prog: &Program, d: DefId, file: u32, ast: &Ast, t: UseTree, item: &Item, attrs: &[Attr]) {
+        match t {
+            UseTree::Path(_, c) => walk(prog, d, file, ast, *ast.use_tree(c), item, attrs),
+            UseTree::Group(l) => {
+                let items = ast.list(l);
+                for c in items { walk(prog, d, file, ast, *c, item, attrs); }
+                let [one] = items else { return };
+                let pf = &prog.files[file as usize];
+                let node = match *one {
+                    UseTree::Name(seg, rename) => {
+                        if seg.kind() == SegKind::SelfValue { return; }
+                        pf.text(rename.unwrap_or(seg.name)).to_string()
+                    }
+                    UseTree::Glob => "*".to_string(),
+                    _ => return,
+                };
+                if lint::external(prog, file, item.lo) { return; }
+                emit_in(prog, d, attrs, &UNUSED_IMPORT_BRACES, file, item.lo, &format!("braces around {} is unnecessary", node));
+            }
+            _ => {}
+        }
+    }
+    walk(prog, d, file, ast, ast.row(r).tree, item, attrs);
 }
 
 /// The same lint on a `use` item of a 2015 crate: its path implicitly starts at the crate root.
