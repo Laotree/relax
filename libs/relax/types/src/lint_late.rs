@@ -517,7 +517,7 @@ impl<'a> Late<'a> {
 
     // ---- rustc_hir_typeck cast.rs trivial_cast_lint
     fn check_trivial_cast(&self, e: ExprId, x: ExprId) {
-        if self.body.coercion_casts.get(&e.0).is_none() { return; }
+        if self.body.coercion_casts.get(&x.0).is_none() { return; }
         let (Some(et), Some(ct)) = (self.expr_ty(x), self.expr_ty(e)) else { return };
         let numeric = |t: TyId| matches!(self.kind(t), TyKind::Int(_) | TyKind::Float(_) | TyKind::IntVar(_) | TyKind::FloatVar(_));
         let (is_num, lint) = if numeric(ct) && numeric(et) { (true, &TRIVIAL_NUMERIC_CASTS) } else { (false, &TRIVIAL_CASTS) };
