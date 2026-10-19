@@ -258,6 +258,21 @@ macro_rules! addr_of_mut {
         &raw mut $place
     };
 }
+/// `mem::offset_of!(Type, field.path)` (core/src/mem/mod.rs): the field's byte offset, from a
+/// raw borrow of the field of an uninitialized value (no reads). An inline const, as rustc's
+/// builtin is a constant: `&[Field { offset: offset_of!(T, f), .. }]` is promoted to 'static.
+#[macro_export]
+macro_rules! offset_of {
+    ($T:ty, $($field:tt).+ $(,)?) => {
+        const {
+            let u = $crate::mem::MaybeUninit::<$T>::uninit();
+            let base = u.as_ptr();
+            #[allow(unused_unsafe)]
+            let f = unsafe { &raw const (*base).$($field).+ };
+            f as *const u8 as usize - base as *const u8 as usize
+        }
+    };
+}
 /// `try!(e)` (2015 edition; `?` since 2018)
 #[macro_export]
 macro_rules! r#try {
