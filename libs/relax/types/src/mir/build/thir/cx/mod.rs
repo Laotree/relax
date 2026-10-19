@@ -437,17 +437,10 @@ impl<'a> Cx<'a> {
     pub(super) fn closure_parts(&self, ty: TyId, span: Span) -> BuildResult<(crate::mir::ClosureId, Vec<GenericArg>, ClosureExprKind, TyId)> {
         let tcx = self.tcx();
         let TyKind::Closure(file, ce, args) = *tcx.tys.kind(ty) else { return self.unresolved(span, "closure type") };
-        let TyKind::FnDef(_, parent, regions) = *tcx.tys.kind(args.parent_args) else { return self.unresolved(span, "closure parent arguments") };
-        let mut out = Vec::new();
-        for &arg in tcx.tys.list(parent) {
-            out.push(match tcx.tys.kind(arg) {
-                TyKind::Const(c) => GenericArg::Const(*c),
-                _ => GenericArg::Type(arg),
-            });
-        }
-        for &r in tcx.tys.region_args(regions).iter() {
-            out.push(GenericArg::Lifetime(r));
-        }
+        let TyKind::FnDef(owner, parent, regions) = *tcx.tys.kind(args.parent_args) else { return self.unresolved(span, "closure parent arguments") };
+        // The owner's arguments in declaration order (lifetimes and types interleaved), as every consumer
+        // of the closure's arguments instantiates them.
+        let mut out = tcx.complete_args(self.root.cx.prog, owner, tcx.tys.list(parent), regions);
         out.push(GenericArg::Type(args.closure_kind_ty));
         out.push(GenericArg::Type(args.closure_sig_as_fn_ptr_ty));
         out.push(GenericArg::Type(args.tupled_upvars_ty));

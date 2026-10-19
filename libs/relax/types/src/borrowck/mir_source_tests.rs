@@ -248,3 +248,38 @@ fn bodies_naming_constants_are_checked_with_their_qualifs() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn a_generic_with_a_lifetime_bounded_type_parameter_is_instantiated_in_declaration_order() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait Item<'a>: Sized { fn parse(tag: u32, data: &'a [u8]) -> Option<Self>; }
+        pub struct List<'a, T: Item<'a>> { data: &'a [u8], tags: &'a [u32], ty: core::marker::PhantomData<T> }
+        impl<'a, T: Item<'a>> List<'a, T> {
+            pub fn get(&self, index: usize) -> Option<T> {
+                let tag = *self.tags.get(index)?;
+                self.data.get(index..).and_then(|data| T::parse(tag, data))
+            }
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_const_block_declaring_an_item_and_asserting_layout() {
+    let (errors, unchecked) = borrowck_source("
+        #[repr(C)] pub struct V { pub x: f32, pub y: f32 }
+        pub trait Pod {} impl Pod for f32 {}
+        const _: () = {
+            let mut end = 0;
+            assert!(core::mem::offset_of!(V, x) == end);
+            end += core::mem::size_of::<f32>();
+            assert!(core::mem::size_of::<V>() == 2 * end);
+            fn fields_are_pod(value: &V) {
+                fn pod<T: Pod>(_: &T) {}
+                let field: &f32 = &value.x; pod(field);
+            }
+            let _ = fields_are_pod;
+        };");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
