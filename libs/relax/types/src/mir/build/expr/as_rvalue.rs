@@ -421,7 +421,7 @@ impl Builder<'_> {
         }
     }
     /// misc.rs:`consume_by_copy_or_move` (lane C's is module-private; same rule).
-    fn capture_operand(&self, place: Place) -> BuildResult<Operand> {
+    pub(super) fn capture_operand(&self, place: Place) -> BuildResult<Operand> {
         let ty = self.operand_ty(&Operand::Copy(place.clone()));
         let cx = &self.root.cx;
         Ok(if cx.tcx.type_is_copy_modulo_regions(cx.prog, cx.eval, self.owner.owner, ty) { Operand::Copy(place) } else { Operand::Move(place) })
@@ -504,7 +504,7 @@ impl Builder<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::ast::{ExprId as AstExprId, ExprKind as AstKind};
     use crate::borrowck::body::{BodyKind as OwnerKind, CheckedBody};
@@ -517,8 +517,8 @@ mod tests {
 
     const SRC: &str = "static S: i32 = 1;\nconst C: i32 = 2;\nfn f() { let _ = (42, 7i64, 3u8, true, 'x', 2.5f32, \"hi\", b\"ab\", c\"c\"); }\n";
 
-    struct Fx { thir: Thir, lits: Vec<(String, AstExprId)>, builder_parts: (&'static Program, &'static Tcx, &'static BuildRoot<'static>, CheckedBody) }
-    fn fixture() -> Fx {
+    pub(crate) struct Fx { pub thir: Thir, pub lits: Vec<(String, AstExprId)>, pub builder_parts: (&'static Program, &'static Tcx, &'static BuildRoot<'static>, CheckedBody) }
+    pub(crate) fn fixture() -> Fx {
         let session = std::sync::Arc::new(crate::Session::default());
         let path = std::env::temp_dir().join(format!("relax-asrv-{}-{:?}.rs", std::process::id(), std::thread::current().id()));
         std::fs::write(&path, SRC).unwrap();
@@ -545,11 +545,11 @@ mod tests {
         }
         Fx { thir: Thir::default(), lits, builder_parts: (prog, tcx, root, CheckedBody { owner: f, kind: OwnerKind::Function }) }
     }
-    fn lit(fx: &mut Fx, text: &str, ty: TyId, neg: bool) -> ExprId {
+    pub(crate) fn lit(fx: &mut Fx, text: &str, ty: TyId, neg: bool) -> ExprId {
         let ast = fx.lits.iter().find(|(t, _)| t == text).unwrap_or_else(|| panic!("no literal {text}")).1;
         fx.thir.alloc_expr(Expr { kind: ExprKind::Literal { expr: ast, neg }, ty, temp_scope: None, span: Span::default() })
     }
-    fn builder(fx: Fx) -> (Builder<'static>, &'static Tcx) {
+    pub(crate) fn builder(fx: Fx) -> (Builder<'static>, &'static Tcx) {
         let (_, tcx, root, owner) = fx.builder_parts;
         let thir: &'static ThirBody = Box::leak(Box::new(ThirBody { thir: fx.thir, params: Vec::new(), expr: ExprId(0) }));
         let mut scopes = Scopes::default();

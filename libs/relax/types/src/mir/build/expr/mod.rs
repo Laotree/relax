@@ -9,15 +9,3 @@ pub mod as_temp;
 pub mod into;
 pub mod stmt;
 pub mod category;
-
-use super::builder::Builder;
-use super::thir::ExprId;
-use super::{BuildResult, UnsupportedReason};
-
-impl Builder<'_> {
-    /// Skeleton stop for a lowering function not written yet (removed as S3 fills the files in).
-    pub(crate) fn expr_not_yet<T>(&self, expr: ExprId, what: &'static str) -> BuildResult<T> {
-        let span = self.thir.thir[expr].span;
-        Err(self.error(span, UnsupportedReason::NotYetBuilt(what)))
-    }
-}
