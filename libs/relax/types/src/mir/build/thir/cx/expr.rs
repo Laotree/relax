@@ -84,14 +84,14 @@ impl Cx<'_> {
         let mut list: Vec<Adjustment> = adj.value.iter().copied().collect();
         if list.iter().any(|a| matches!(a.kind, Adjust::Borrow(_))) {
             if let TyKind::Ref(_, pointee, _) = *self.tcx().tys.kind(source_ty) {
-                list.insert(0, Adjustment { kind: Adjust::Deref(None), target: pointee });
+                list.insert(0, Adjustment { kind: Adjust::Deref(None), target: pointee, mutbl: false });
             }
         }
         list
     }
 
-    pub(super) fn is_box(&self, ty: TyId) -> bool {
-        matches!(self.tcx().tys.kind(ty), TyKind::Adt(d, ..) if self.tcx().adts[d].is_box())
+    fn is_box_ty(&self, ty: TyId) -> bool {
+        matches!(self.tcx().tys.kind(ty), TyKind::Adt(def, ..) if self.tcx().adts.get(def).is_some_and(|a| a.is_box()))
     }
 
     fn is_mut_method(&self, def: DefId) -> bool {
@@ -128,11 +128,14 @@ impl Cx<'_> {
                 Coerce::DerefRef(_) => return self.unresolved(span, "DerefRef is a view, not a step"),
             },
             Adjust::Deref(None) => ExprKind::Deref { arg: self.push(expr) },
-            // `Box` dereferences are builtin (rustc `builtin_deref` includes it)
-            Adjust::Deref(Some(_)) if self.is_box(expr.ty) => ExprKind::Deref { arg: self.push(expr) },
+            // a `Box` is dereferenced by the compiler, not through `Deref::deref` (rustc
+            // `builtin_deref(explicit = false)`): typeck records its step as overloaded for codegen
+            Adjust::Deref(Some(_)) if self.is_box_ty(expr.ty) => ExprKind::Deref { arg: self.push(expr) },
             Adjust::Deref(Some((def, args))) => {
                 // `*Deref::deref(&expr)`
-                let mutable = self.is_mut_method(def);
+                // rustc `OverloadedDeref.mutbl`: the step calls `DerefMut::deref_mut`
+                let mutable = adjustment.mutbl;
+                let def = if mutable { self.tcx().mutable_place_op(self.prog(), def).unwrap_or(def) } else { def };
                 let callee_ty = self.fn_def_ty(def, tcx.tys.list(args));
                 let ref_ty = self.ref_ty(mutable, expr.ty);
                 let borrow_kind = if mutable { mut_borrow(false) } else { BorrowKind::Shared };
@@ -324,7 +327,7 @@ impl Cx<'_> {
                 }
             }
             A::Index(lhs, index) => {
-                if let Some(&(def, args)) = tb.ov_index.get(&e.0) {
+                if let Some(&(def, args)) = tb.mutable_index.get(&e.0).or_else(|| tb.ov_index.get(&e.0)) {
                     // `*Index::index(&lhs, index)`
                     let base = self.mirror_expr(lhs)?;
                     let base = self.apply_operand_adjustments_id(e, base)?;
@@ -351,12 +354,12 @@ impl Cx<'_> {
             }
             A::Unary(ast::UnOp::Deref, x) => {
                 let overloaded = tb.adjustments(e.0).and_then(|a| a.operand.first()).and_then(|a| match a.kind {
-                    Adjust::Deref(Some(ov)) => Some(ov),
+                    Adjust::Deref(Some((def, args))) => Some((if a.mutbl { self.tcx().mutable_place_op(self.prog(), def).unwrap_or(def) } else { def }, args)),
                     _ => None,
                 });
                 let arg = self.mirror_expr(x)?;
+                let overloaded = overloaded.filter(|_| !self.is_box_ty(self.thir.exprs[arg.0 as usize].ty));
                 match overloaded {
-                    Some(_) if self.is_box(self.thir.exprs[arg.0 as usize].ty) => ExprKind::Deref { arg },
                     Some((def, args)) => {
                         let arg = self.autoref(e, arg, self.is_mut_method(def));
                         let callee_ty = self.fn_def_ty(def, tcx.tys.list(args));

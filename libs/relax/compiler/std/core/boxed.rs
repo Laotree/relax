@@ -122,7 +122,7 @@ impl<T, const N: usize> crate::convert::TryFrom<Box<[T]>> for Box<[T; N]> {
     }
 }
 
-impl<T: ?Sized> Drop for Box<T> {
+unsafe impl<#[may_dangle] T: ?Sized> Drop for Box<T> {
     fn drop(&mut self) {
         unsafe {
             let layout = Layout::for_value(&*self.ptr.as_ptr());
