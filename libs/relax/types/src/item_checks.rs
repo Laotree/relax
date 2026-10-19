@@ -414,3 +414,40 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
     }
     errors
 }
+
+/// check_union_fields: a union field is `Copy` or otherwise guaranteed not to need dropping
+/// (rustc `BikeshedGuaranteedNoDrop`: `ManuallyDrop<_>`, references, tuples and arrays of such)
+/// -- E0740.
+pub fn union_fields(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
+    use crate::consts::GenericArg;
+    use crate::next_solver::Goal;
+    let Some(adt) = tcx.adts.get(&d) else { return Vec::new() };
+    if !adt.is_union { return Vec::new(); }
+    let Some(copy) = tcx.copy_trait else { return Vec::new() };
+    let env = tcx.param_env_id(prog, d);
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), d);
+    fn no_drop(prog: &Program, tcx: &Tcx, infcx: &crate::infer::InferCtxt, env: crate::tcx::ParamEnvId, copy: DefId, t: TyId, depth: u32) -> bool {
+        if depth > 16 { return true; }
+        match tcx.tys.kind(t).clone() {
+            TyKind::Error => true,
+            TyKind::Ref(..) | TyKind::Ptr(..) => true,
+            // (Relax's ManuallyDrop is an ordinary union of core)
+            TyKind::Adt(d, _, _) if prog.name(d) == "ManuallyDrop" && matches!(prog.syms.str(prog.crates[prog.def(d).krate as usize].name), "core" | "std") => true,
+            TyKind::Tuple(l) => tcx.tys.list(l).iter().all(|&x| no_drop(prog, tcx, infcx, env, copy, x, depth + 1)),
+            TyKind::Array(e, _) => no_drop(prog, tcx, infcx, env, copy, e, depth + 1),
+            _ => {
+                let t = tcx.try_normalize_erasing_regions(prog, crate::tcx::TypingEnv::fully_monomorphized(prog), t).unwrap_or(t);
+                let predicate = crate::next_solver::collect::trait_predicate(copy, vec![GenericArg::Type(t)]);
+                infcx.evaluate_obligation(prog, Goal { param_env: env, predicate }).may_apply()
+            }
+        }
+    }
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    for f in &adt.variants[0].fields {
+        if !no_drop(prog, tcx, &infcx, env, copy, f.ty, 0) {
+            return vec![prog.record_error(def.file, ast.item(def.item).name.lo, "typeck", "E0740: field must implement `Copy` or be wrapped in `ManuallyDrop<...>` to be used in a union".to_string())];
+        }
+    }
+    Vec::new()
+}

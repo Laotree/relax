@@ -1559,6 +1559,7 @@ impl Tcx {
             errors.extend(crate::item_checks::representability(prog, self, did));
             // (a definition with errors has no meaningful variances)
             if errors.is_empty() { errors.extend(self.check_type_defn_variances(prog, did)); }
+            if def.kind == DefKind::Union && errors.is_empty() { errors.extend(crate::item_checks::union_fields(prog, self, did)); }
         }
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
