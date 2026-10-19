@@ -299,7 +299,7 @@ pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
             for seg in ast.segs(path.segs) {
                 let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) else { continue };
                 for a in ast.list(*v) {
-                    let ast::GenericArg::Constraint(_, cbs) = a else { continue };
+                    let ast::GenericArg::Constraint(_, _, cbs) = a else { continue };
                     for cb in ast.list(*cbs) {
                         if let ast::Bound::Trait { path: cp, .. } = cb {
                             if tcx.resolve_type_path_def(prog, def.file, def.scope, cp) == Some(td) {
