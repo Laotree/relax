@@ -1817,9 +1817,6 @@ impl<'a> Parser<'a> {
             }
             self.pos += 1;
         }
-        if konst && asyncness {
-            return self.err("functions cannot be both `const` and `async`");
-        }
         self.expect(T::KwFn)?;
         let name = self.ident_tok()?;
         let mut generics = self.generics()?;
