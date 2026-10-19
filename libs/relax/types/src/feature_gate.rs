@@ -749,13 +749,10 @@ impl<'a> Gates<'a> {
                 }
             }
         }
-        for k in 1..=names.len() {
-            if let Some((feature, reason)) = table_entry(&names[..k].join("::")) {
-                if self.feats.has(&feature) { continue; }
-                let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
-                self.errors.push(self.prog.record_error(self.file, p.lo, "typeck", msg));
-                return;
-            }
+        if let Some((feature, reason)) = table_entry(&names) {
+            if self.feats.has(&feature) { return; }
+            let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
+            self.errors.push(self.prog.record_error(self.file, p.lo, "typeck", msg));
         }
     }
 
@@ -1176,13 +1173,29 @@ fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Opti
 
 /// The library's table entry for a path as written (`std::intrinsics::copy`): a re-export has
 /// its own stability, so the key is the written path, not the defining one.
-fn table_entry(path: &str) -> Option<(String, Option<String>)> {
-    let mut key = path.to_string();
+fn table_entry(names: &[&str]) -> Option<(String, Option<String>)> {
+    // a stable re-export of a module or item is the definition it names (rustc checks the
+    // stability of the path's final definition): rewrite the longest re-exported prefix
+    let mut key: Vec<String> = names.iter().map(|s| s.to_string()).collect();
     for _ in 0..4 {
-        let &(f, r) = stability_table().get(key.as_str())?;
-        if !f.is_empty() { return Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) })); }
-        // a stable re-export has the stability of what it re-exports
-        key = r.strip_prefix("reexport ")?.to_string();
+        let joined = key.join("::");
+        if let Some(&(f, r)) = stability_table().get(joined.as_str()) {
+            if !f.is_empty() { return Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) })); }
+        }
+        let mut rewritten = false;
+        for k in (1..=key.len()).rev() {
+            let prefix = key[..k].join("::");
+            if let Some(&("", r)) = stability_table().get(prefix.as_str()) {
+                if let Some(target) = r.strip_prefix("reexport ") {
+                    let mut nk: Vec<String> = target.split("::").map(|s| s.to_string()).collect();
+                    nk.extend(key[k..].iter().cloned());
+                    key = nk;
+                    rewritten = true;
+                    break;
+                }
+            }
+        }
+        if !rewritten { return None; }
     }
     None
 }
@@ -1210,13 +1223,10 @@ pub fn check_imports(prog: &Program, krate: u32) -> Vec<String> {
         let n = imp.segs.len();
         let names: Vec<&str> = imp.segs.iter().map(|sg| prog.syms.str(sg.1)).collect();
         if !imp.global && !matches!(names.first(), Some(&"std" | &"core" | &"alloc")) { continue; }
-        for k in 1..=n {
-            if let Some((feature, reason)) = table_entry(&names[..k].join("::")) {
-                if feats.has(&feature) { continue; }
-                let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
-                out.push(prog.record_error(imp.file, imp.pos, "typeck", msg));
-                break;
-            }
+        if let Some((feature, reason)) = table_entry(&names) {
+            if feats.has(&feature) { continue; }
+            let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
+            out.push(prog.record_error(imp.file, imp.pos, "typeck", msg));
         }
     }
     out
