@@ -323,7 +323,90 @@ impl<'a> Cx<'a> {
                 }
             }
         };
+        self.fix_mutable_places();
         Ok(ThirBody { thir: self.thir, params, expr, body_ty, span: body_span, ret_span, coroutine, fn_scopes: scopes })
+    }
+
+    /// The method `name` of the lang-item trait `item`.
+    pub(super) fn trait_method(&self, item: crate::lang_items::LangItem, name: &str) -> Option<DefId> {
+        let (tcx, prog) = (self.tcx(), self.prog());
+        let td = tcx.lang_items.get(item)?;
+        prog.traits[prog.def(td).sub as usize].iter().copied().find(|&it| prog.name(it) == name)
+    }
+
+    /// rustc `convert_place_derefs_to_mutable`: typeck records the shared `Deref::deref` / `Index::index`
+    /// of an overloaded place; where the place is used mutably (a `&mut` borrow, an assignment, a
+    /// `ref mut` pattern) the call becomes `deref_mut` / `index_mut` with a `&mut` borrow of its base.
+    fn fix_mutable_places(&mut self) {
+        let mut roots: Vec<ExprId> = Vec::new();
+        for e in &self.thir.exprs {
+            match &e.kind {
+                ExprKind::Borrow { borrow_kind: crate::mir::BorrowKind::Mut { .. }, arg } | ExprKind::RawBorrow { mutability: Mutability::Mut, arg } => roots.push(*arg),
+                ExprKind::Assign { lhs, .. } | ExprKind::AssignOp { lhs, .. } => roots.push(*lhs),
+                ExprKind::Match { scrutinee, arms, .. } => {
+                    if arms.iter().any(|a| has_ref_mut(&self.thir.arms[a.0 as usize].pattern)) {
+                        roots.push(*scrutinee);
+                    }
+                }
+                ExprKind::Let { expr, pat } if has_ref_mut(pat) => roots.push(*expr),
+                _ => {}
+            }
+        }
+        for stmt in &self.thir.stmts {
+            if let StmtKind::Let { pattern, initializer: Some(init), .. } = &stmt.kind {
+                if has_ref_mut(pattern) {
+                    roots.push(*init);
+                }
+            }
+        }
+        for root in roots {
+            self.make_place_mutable(root);
+        }
+    }
+
+    fn make_place_mutable(&mut self, mut id: ExprId) {
+        let tcx = self.tcx();
+        loop {
+            let kind = self.thir.exprs[id.0 as usize].kind.clone();
+            match kind {
+                ExprKind::Scope { value, .. } => id = value,
+                ExprKind::Field { lhs, .. } | ExprKind::Index { lhs, .. } => id = lhs,
+                ExprKind::PlaceTypeAscription { source, .. } => id = source,
+                ExprKind::Deref { arg } => {
+                    // an overloaded deref / index: `*Trait::method(&base, ..)`
+                    let call = self.thir.exprs[arg.0 as usize].clone();
+                    let ExprKind::Call { ty: callee_ty, fun, args, from_hir_call, fn_span } = call.kind else {
+                        id = arg;
+                        continue;
+                    };
+                    let TyKind::FnDef(def, fargs, regions) = *tcx.tys.kind(callee_ty) else { return };
+                    let (item, name) = match self.prog().syms.str(self.prog().def(def).name) {
+                        "deref" => (crate::lang_items::LangItem::DerefMut, "deref_mut"),
+                        "index" => (crate::lang_items::LangItem::IndexMut, "index_mut"),
+                        _ => return,
+                    };
+                    let Some(mut_def) = self.trait_method(item, name) else { return };
+                    let new_callee = tcx.tys.intern(TyKind::FnDef(mut_def, fargs, regions));
+                    let TyKind::Ref(_, pointee, region) = *tcx.tys.kind(call.ty) else { return };
+                    let new_ref = tcx.tys.intern(TyKind::Ref(true, pointee, region));
+                    let borrow = args[0];
+                    let base = match self.thir.exprs[borrow.0 as usize].kind {
+                        ExprKind::Borrow { arg, .. } => arg,
+                        _ => return,
+                    };
+                    let b = &mut self.thir.exprs[borrow.0 as usize];
+                    let TyKind::Ref(_, borrowed, borrow_region) = *tcx.tys.kind(b.ty) else { return };
+                    b.kind = ExprKind::Borrow { borrow_kind: crate::mir::BorrowKind::Mut { kind: crate::mir::MutBorrowKind::Default }, arg: base };
+                    b.ty = tcx.tys.intern(TyKind::Ref(true, borrowed, borrow_region));
+                    self.thir.exprs[fun.0 as usize].ty = new_callee;
+                    let c = &mut self.thir.exprs[arg.0 as usize];
+                    c.kind = ExprKind::Call { ty: new_callee, fun, args, from_hir_call, fn_span };
+                    c.ty = new_ref;
+                    id = base;
+                }
+                _ => return,
+            }
+        }
     }
 
     /// `core::future::ResumeTy`, the resume argument type of an async coroutine.
@@ -423,4 +506,15 @@ pub(super) fn strip_paren(ast: &ast::Ast, mut e: ast::ExprId) -> ast::ExprId {
         e = *x;
     }
     e
+}
+
+/// Does the pattern bind by `ref mut`?
+fn has_ref_mut(pat: &Pat) -> bool {
+    let mut found = false;
+    pat.walk_always(|p| {
+        if let PatKind::Binding { mode: BindingMode(ByRef::Yes(Mutability::Mut), _), .. } = p.kind {
+            found = true;
+        }
+    });
+    found
 }

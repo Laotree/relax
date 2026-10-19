@@ -90,6 +90,10 @@ impl Cx<'_> {
         list
     }
 
+    pub(super) fn is_box(&self, ty: TyId) -> bool {
+        matches!(self.tcx().tys.kind(ty), TyKind::Adt(d, ..) if self.tcx().adts[d].is_box())
+    }
+
     fn is_mut_method(&self, def: DefId) -> bool {
         matches!(self.prog().syms.str(self.prog().def(def).name), "deref_mut" | "index_mut")
     }
@@ -124,6 +128,8 @@ impl Cx<'_> {
                 Coerce::DerefRef(_) => return self.unresolved(span, "DerefRef is a view, not a step"),
             },
             Adjust::Deref(None) => ExprKind::Deref { arg: self.push(expr) },
+            // `Box` dereferences are builtin (rustc `builtin_deref` includes it)
+            Adjust::Deref(Some(_)) if self.is_box(expr.ty) => ExprKind::Deref { arg: self.push(expr) },
             Adjust::Deref(Some((def, args))) => {
                 // `*Deref::deref(&expr)`
                 let mutable = self.is_mut_method(def);
@@ -268,6 +274,18 @@ impl Cx<'_> {
                 }
                 let base = self.mirror_expr(lhs)?;
                 let base = self.apply_operand_adjustments_id(e, base)?;
+                // builtin indexing is `usize` into an array or slice; typeck leaves ranges (and the
+                // like) on arrays, slices and `str` to the std `Index` impls without recording them
+                let base_ty = self.thir.exprs[base.0 as usize].ty;
+                let index_ty = self.ety_adjusted(index)?;
+                let builtin = matches!(tcx.tys.kind(base_ty), TyKind::Array(..) | TyKind::Slice(_)) && index_ty == tcx.tys.usize_;
+                if !builtin {
+                    let Some(def) = self.trait_method(LangItem::Index, "index") else { return self.unresolved(span, "Index lang item") };
+                    let base = self.autoref(e, base, false);
+                    let index = self.mirror_expr(index)?;
+                    let callee_ty = self.fn_def_ty(def, &[base_ty, index_ty]);
+                    return self.overloaded_place(e, self.temp_scope(e), expr_ty, callee_ty, Box::new([base, index]), span);
+                }
                 ExprKind::Index { lhs: base, index: self.mirror_expr(index)? }
             }
             A::Unary(ast::UnOp::Deref, x) => {
@@ -277,6 +295,7 @@ impl Cx<'_> {
                 });
                 let arg = self.mirror_expr(x)?;
                 match overloaded {
+                    Some(_) if self.is_box(self.thir.exprs[arg.0 as usize].ty) => ExprKind::Deref { arg },
                     Some((def, args)) => {
                         let arg = self.autoref(e, arg, self.is_mut_method(def));
                         let callee_ty = self.fn_def_ty(def, tcx.tys.list(args));

@@ -502,34 +502,49 @@ impl Cx<'_> {
         }
         let margs = *ast.mac_arg(m.args);
         let xs: Vec<ast::ExprId> = ast.list(margs.exprs).to_vec();
-        match name {
-            "matches" => self.matches_macro(e, &xs, margs.pat, margs.guard, expr_ty),
-            "assert" | "debug_assert" => {
+        // `debug_assert*!(..)` is `if cfg!(debug_assertions) { assert*!(..) }`
+        let debug = name.starts_with("debug_assert");
+        let base = if debug { &name["debug_".len()..] } else { name };
+        let inner_ty = if debug { self.unit_ty() } else { expr_ty };
+        let inner = match base {
+            "matches" => return self.matches_macro(e, &xs, margs.pat, margs.guard, expr_ty),
+            "assert" => {
                 let Some(&cond) = xs.first() else { return self.unresolved(span, "assert without a condition") };
-                let branch = self.synthetic_scope(e, Synthetic::MacroBranch, ScopeData::Node, span)?;
-                let branch_blocks = self.synthetic_scope(e, Synthetic::MacroBranch, ScopeData::Destruction, span)?;
+                let branch = self.synthetic_scope(e, Synthetic::MacroBranch, ScopeData::Destruction, span)?;
+                let branch_block = self.synthetic_scope(e, Synthetic::MacroBranch, ScopeData::Node, span)?;
                 let stmt_scope = self.synthetic_scope(e, Synthetic::MacroStatement, ScopeData::Node, span)?;
                 let cond = self.mirror_expr(cond)?;
                 let not = self.push(self.mk(e, ExprKind::Unary { op: crate::mir::UnOp::Not, arg: cond }, self.bool_ty()));
                 let unit = self.unit_ty();
-                let then = self.fmt_block(e, &xs[1..], stmt_scope, branch_blocks, true, unit)?;
-                Ok(self.mk(e, ExprKind::If { if_then_scope: branch, cond: not, then, else_opt: None }, expr_ty))
+                let then = self.fmt_block(e, &xs[1..], stmt_scope, branch_block, true, unit)?;
+                self.mk(e, ExprKind::If { if_then_scope: branch, cond: not, then, else_opt: None }, inner_ty)
             }
-            "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne" => {
+            "assert_eq" | "assert_ne" => {
                 let stmt_scope = self.synthetic_scope(e, Synthetic::MacroStatement, ScopeData::Node, span)?;
                 let blocks = self.synthetic_scope(e, Synthetic::MacroStatement, ScopeData::Destruction, span)?;
-                let block = self.fmt_block(e, &xs, stmt_scope, blocks, false, expr_ty)?;
-                Ok(self.mk(e, ExprKind::Use { source: block }, expr_ty).with_kind_of(&self.thir, block))
+                let block = self.fmt_block(e, &xs, stmt_scope, blocks, false, inner_ty)?;
+                self.thir.exprs[block.0 as usize].clone()
             }
             "print" | "println" | "eprint" | "eprintln" | "panic" | "unreachable" | "todo" | "unimplemented" => {
-                let diverges = matches!(name, "panic" | "unreachable" | "todo" | "unimplemented");
+                let diverges = matches!(base, "panic" | "unreachable" | "todo" | "unimplemented");
                 let stmt_scope = self.synthetic_scope(e, Synthetic::MacroStatement, ScopeData::Node, span)?;
                 let blocks = self.synthetic_scope(e, Synthetic::MacroStatement, ScopeData::Destruction, span)?;
-                let block = self.fmt_block(e, &xs, stmt_scope, blocks, diverges, expr_ty)?;
-                Ok(self.thir.exprs[block.0 as usize].clone())
+                let block = self.fmt_block(e, &xs, stmt_scope, blocks, diverges, inner_ty)?;
+                self.thir.exprs[block.0 as usize].clone()
             }
-            _ => self.unresolved(span, "unsupported builtin macro"),
+            _ => return self.unresolved(span, "unsupported builtin macro"),
+        };
+        if !debug {
+            return Ok(inner);
         }
+        let unit = self.unit_ty();
+        let branch = self.synthetic_scope(e, Synthetic::DebugBranch, ScopeData::Destruction, span)?;
+        let branch_block = self.synthetic_scope(e, Synthetic::DebugBranch, ScopeData::Node, span)?;
+        let cond = self.push(self.lit_bool(e, true, span));
+        let inner = self.push(inner);
+        let block = self.thir.alloc_block(Block { targeted_by_break: false, region_scope: branch_block, span, stmts: Box::new([]), expr: Some(inner), safety_mode: BlockSafety::Safe });
+        let then = self.push(self.mk(e, ExprKind::Block { block }, unit));
+        Ok(self.mk(e, ExprKind::If { if_then_scope: branch, cond, then, else_opt: None }, expr_ty))
     }
 
     /// `{ &arg; &arg; ..; <unreachable>? }`: the format arguments are borrowed (`format_args!` takes
