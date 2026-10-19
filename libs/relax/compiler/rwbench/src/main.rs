@@ -95,6 +95,25 @@ fn run(name: &str, setup: fn() -> Box<dyn FnMut() -> u64>, t0: Instant, proc_ms_
             assert_eq!(black_box(iter()), expected, "{}: warm-up checksum differs", name);
             warmed += 1;
         }
+        // RW_O3_PROGRESS: go on warming until the JIT reports its optimised code settled (5 quiet iterations), so the counted
+        // iterations run optimised code only
+        if let Ok(path) = std::env::var("RW_O3_PROGRESS") {
+            let (mut quiet, mut last) = (0usize, u64::MAX);
+            let limit = Instant::now();
+            while quiet < 5 && limit.elapsed().as_secs() < 120 {
+                assert_eq!(black_box(iter()), expected, "{}: warm-up checksum differs", name);
+                let t = std::fs::read_to_string(&path).unwrap_or_default();
+                let mut it = t.split_whitespace().map(|x| x.parse::<u64>().ok());
+                match (it.next().flatten(), it.next().flatten()) {
+                    (Some(0), Some(i)) if i == last => quiet += 1,
+                    (_, Some(i)) => {
+                        quiet = 0;
+                        last = i;
+                    }
+                    _ => quiet = 0,
+                }
+            }
+        }
         let control = std::env::var("RW_PERF_CTL").ok();
         let perf = |command: &str| {
             if let Some(paths) = &control {
