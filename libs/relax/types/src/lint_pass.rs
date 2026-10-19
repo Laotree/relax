@@ -12,8 +12,9 @@ use crate::typeck::{Body, Res};
 // ---------------------------------------------------------------- item-level passes
 
 /// Runs the passes over the definitions of the crates marked in `own`.
-pub fn check_items(prog: &Program, _tcx: &Tcx, own: &[bool]) {
+pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
+    crate::lint_early::check_items(prog, tcx, own);
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
@@ -311,6 +312,8 @@ fn snake_pat_idents(site: &Site, ast: &Ast, p: PatId) {
 /// Runs the body passes over one typed body owner.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
+    crate::lint_early::check_body(prog, tcx, body);
+    crate::lint_late::check_body(prog, tcx, body);
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;

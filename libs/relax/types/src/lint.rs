@@ -25,7 +25,7 @@ pub struct Lint {
     pub groups: &'static [&'static str],
 }
 
-const fn lint(name: &'static str, default: Level, groups: &'static [&'static str]) -> Lint {
+pub const fn lint(name: &'static str, default: Level, groups: &'static [&'static str]) -> Lint {
     Lint { name, default, default_2024: default, groups }
 }
 
