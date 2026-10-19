@@ -55,6 +55,7 @@ pub mod lint_pass;
 pub mod lint_unreachable;
 pub mod lint_liveness;
 pub mod lint_early;
+pub mod lint_early2;
 pub mod lint_dead;
 pub mod lint_imports;
 pub mod lint_late;

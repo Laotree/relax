@@ -3,7 +3,7 @@ use super::*;
 use super::resolve_bound_vars::{BinderId, LifetimeId, LifetimeKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum LifetimeRes { Param(LifetimeId), Static, Infer, Error }
+pub(crate) enum LifetimeRes { Param(LifetimeId), Static, Infer, Error }
 
 #[derive(Clone, Debug)]
 pub(super) struct LifetimeDecl {
@@ -22,6 +22,14 @@ pub(crate) struct LifetimeResolution {
 }
 
 impl LifetimeResolution {
+    /// The resolution of the elided lifetime of the reference type `ty` (`&T`).
+    pub(crate) fn reference(&self, ty: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Reference(ty)).copied() }
+    /// The resolution of the lifetime written at `lo..hi` (`'a`, `'_`, `'static`).
+    pub(crate) fn named(&self, lo: u32, hi: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Named(lo, hi)).copied() }
+    /// The resolution of the elided lifetime of an `&self` receiver.
+    pub(crate) fn self_reference(&self) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::SelfReference).copied() }
+    /// The resolution of the `index`th hidden lifetime of path segment `seg` (`Foo` for `Foo<'a>`).
+    pub(crate) fn path(&self, seg: u32, index: u32) -> Option<LifetimeRes> { self.uses.get(&LifetimeKey::Path(seg, index)).copied() }
     /// No lifetime declared, inherited or used anywhere in the owner (most items).
     fn is_empty(&self) -> bool { self.inherited.is_empty() && self.declarations.is_empty() && self.uses.is_empty() && self.binders.is_empty() }
     /// The answer to share: every empty resolution is the same value, kept once.

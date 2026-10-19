@@ -32,6 +32,8 @@ const IMPLEMENTED: &[&str] = &[
     "undropped_manually_drops", "unreachable_code", "unreachable_patterns", "unsafe_attr_outside_unsafe", "unsafe_op_in_unsafe_fn",
     "unused_allocation", "unused_assignments", "unused_braces", "unused_imports", "unused_labels", "unused_lifetimes",
     "unused_must_use", "unused_mut", "unused_parens", "unused_results", "unused_unsafe", "unused_variables", "while_true",
+    "mismatched_lifetime_syntaxes", "elided_lifetimes_in_paths", "explicit_outlives_requirements", "unused_macros", "unused_macro_rules",
+    "absolute_paths_not_starting_with_crate", "unknown_diagnostic_attributes",
 ];
 
 /// A recorded `#[expect(name)]`.

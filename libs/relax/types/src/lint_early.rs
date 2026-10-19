@@ -36,38 +36,42 @@ pub const SINGLE_USE_LIFETIMES: Lint = lint::lint("single_use_lifetimes", Level:
 pub const UNUSED_VISIBILITIES: Lint = lint::lint("unused_visibilities", Level::Warn, &["unused"]);
 
 /// Item-level passes over the definitions of the checked crates marked in `own`.
-pub fn check_items(prog: &Program, _tcx: &Tcx, own: &[bool]) {
+pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         if lint::generated(prog, DefId(i as u32)) { continue; }
         attr_lints(prog, DefId(i as u32));
+        crate::lint_early2::check_def_item(prog, tcx, DefId(i as u32));
         if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
         if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
             | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
             | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic) { continue; }
         let d = DefId(i as u32);
         let mut w = W::new(prog, def.file, d);
+        w.names = Some(crate::lint_early2::names(prog, tcx, d));
         w.item(def.item, def.kind);
         item_lints(prog, d);
     }
     for (k, o) in own.iter().enumerate() {
         if *o { special_module_name(prog, k as u32); }
     }
+    crate::lint_early2::check_module_items(prog, own);
     token_lints(prog, own);
 }
 
 /// Body-level passes over one typed body owner.
-pub fn check_body(prog: &Program, _tcx: &Tcx, body: &Body) { check_def(prog, body.def) }
+pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) { check_def(prog, tcx, body.def) }
 
 /// The syntax-level passes over the body of one fn / const / static definition (they need no
 /// types, so they also apply to a body whose type check failed).
-pub fn check_def(prog: &Program, def: DefId) {
+pub fn check_def(prog: &Program, tcx: &Tcx, def: DefId) {
     if !lint::enabled() || lint::generated(prog, def) { return; }
     let d = prog.def(def);
     let ast = &prog.files[d.file as usize].ast;
     let mut w = W::new(prog, d.file, def);
+    w.names = Some(crate::lint_early2::names(prog, tcx, def));
     match ast.item(d.item).kind {
         ItemKind::Fn(..) => {
             let Ok(Some(block)) = prog.fn_body(d.file, d.item) else { return };
@@ -146,18 +150,18 @@ fn item_lints(prog: &Program, d: DefId) {
                 if let Some(i) = pa.as_impl(&pa.item(parent.item).kind) { requires |= pa.list(i.generics.params).iter().any(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))); }
             }
             if requires && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &NO_MANGLE_GENERIC_ITEMS, def.file, item.lo, "functions generic over types or consts must be mangled");
+                crate::lint_early2::emit(prog, d, &NO_MANGLE_GENERIC_ITEMS, def.file, item.lo, "functions generic over types or consts must be mangled");
             }
         }
         DefKind::Const => {
             if attrs.iter().any(|a| attr_name(prog, def.file, a) == b"no_mangle") && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &NO_MANGLE_CONST_ITEMS, def.file, item.lo, "const items should never be `#[no_mangle]`");
+                crate::lint_early2::emit(prog, d, &NO_MANGLE_CONST_ITEMS, def.file, item.lo, "const items should never be `#[no_mangle]`");
             }
             // `pub const _: () = ..;`: the visibility has no effect
             if pf.text(item.name) == "_" && !matches!(item.vis, Vis::Private)
                 && pf.hyg_ctxt(item.name.lo) == pf.hyg_ctxt(item.lo)
                 && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &UNUSED_VISIBILITIES, def.file, item.lo, "visibility qualifiers have no effect on `const _` declarations");
+                crate::lint_early2::emit(prog, d, &UNUSED_VISIBILITIES, def.file, item.lo, "visibility qualifiers have no effect on `const _` declarations");
             }
         }
         _ => {}
@@ -165,7 +169,7 @@ fn item_lints(prog: &Program, d: DefId) {
 }
 
 /// The position of the `#` of an attribute (its tokens are the ones inside `#[` ... `]`).
-fn attr_pos(pf: &ParsedFile, a: &Attr) -> u32 {
+pub(crate) fn attr_pos(pf: &ParsedFile, a: &Attr) -> u32 {
     let back = if a.inner { 3 } else { 2 };
     let i = (a.toks.lo as usize).saturating_sub(back);
     pf.tok(i as u32).lo
@@ -179,51 +183,43 @@ fn attr_lints(prog: &Program, d: DefId) {
     const CRATE_LEVEL: &[&[u8]] = &[b"crate_name", b"crate_type", b"recursion_limit", b"type_length_limit", b"move_size_limit",
         b"pattern_complexity_limit", b"no_std", b"no_core", b"no_main", b"no_builtins", b"windows_subsystem", b"feature", b"register_tool"];
     let def = prog.def(d);
+    let is_root = def.kind == DefKind::Mod && def.parent == crate::program::NO_DEF;
     let named_mod = def.kind == DefKind::Mod && def.parent != crate::program::NO_DEF && prog.block_owner.get(&def.sub).is_none();
-    if !(named_mod || matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
+    if !(is_root || named_mod || matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
         | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
         | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic | DefKind::MacroRules)) { return; }
     let pf = &prog.files[def.file as usize];
     let ast = &pf.ast;
-    let item = *ast.item(def.item);
-    let p = prog.src(def.file);
-    let mut lists: Vec<Vec<Attr>> = vec![ast.list(item.attrs).to_vec()];
-    // the inner attributes of an out-of-line module are its file's
-    if named_mod {
+    // the node's attributes: the item's outer ones, then the inner ones of an out-of-line module's file
+    let mut all: Vec<(u32, Attr)> = Vec::new();
+    if !is_root { all.extend(ast.list(ast.item(def.item).attrs).iter().map(|a| (def.file, *a))); }
+    if is_root || named_mod {
         let m = &prog.mods[def.sub as usize];
-        if m.file != def.file { lists.push(prog.files[m.file as usize].ast.root_attrs.iter().copied().collect()); }
+        if is_root || m.file != def.file { all.extend(prog.files[m.file as usize].ast.root_attrs.iter().map(|a| (m.file, *a))); }
     }
-    for (li, attrs) in lists.iter().enumerate() {
-        let file = if li == 0 { def.file } else { prog.mods[def.sub as usize].file };
+    let item = if is_root { None } else { Some(*ast.item(def.item)) };
+    for &(file, a) in &all {
         let pf = &prog.files[file as usize];
-        for a in attrs {
-            let name = lint::attr_path(prog, file, a);
-            let pos = attr_pos(pf, a);
-            let emit = |msg: &str| {
-                if !lint::external(prog, file, pos) { lint::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
-            };
-            if CRATE_LEVEL.contains(&&name[..]) {
-                let n = String::from_utf8_lossy(&name).into_owned();
-                if a.inner { emit(&format!("the `#![{}]` attribute can only be used at the crate root", n)); }
-                else { emit(&format!("crate-level attribute should be an inner attribute: add an exclamation mark: `#![{}]`", n)); }
-                continue;
-            }
-            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            // `#[allow(reason = "..")]`: no lint named
-            if matches!(&name[..], b"allow" | b"warn" | b"deny" | b"forbid" | b"expect")
-                && (hi == lo + 6 || hi == lo + 7)
-                && crate::cfg::tok_str(p, lo + 1) == b"(" && crate::cfg::tok_str(p, lo + 2) == b"reason" && crate::cfg::tok_str(p, lo + 3) == b"=" {
-                emit("unused attribute");
-                continue;
-            }
-            if name == b"inline" {
-                let bodiless_trait_method = def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait
-                    && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
-                if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
-                else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
-            }
+        let name = lint::attr_path(prog, file, &a);
+        let pos = attr_pos(pf, &a);
+        let emit = |msg: &str| {
+            if !lint::external(prog, file, pos) { crate::lint_early2::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
+        };
+        if !is_root && CRATE_LEVEL.contains(&&name[..]) {
+            let n = String::from_utf8_lossy(&name).into_owned();
+            if a.inner { emit(&format!("the `#![{}]` attribute can only be used at the crate root", n)); }
+            else { emit(&format!("crate-level attribute should be an inner attribute: add an exclamation mark: `#![{}]`", n)); }
+            continue;
+        }
+        if name == b"inline" {
+            let Some(item) = item else { continue };
+            let bodiless_trait_method = def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait
+                && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
+            if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
+            else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
         }
     }
+    crate::lint_early2::attr_checks(prog, &crate::lint_early2::AttrNode { d, inner: &[], attrs: &all, is_crate: is_root, macro_use_target: is_root || named_mod });
 }
 
 fn ty_has_impl_trait(ast: &Ast, t: TyId) -> bool {
@@ -251,7 +247,7 @@ fn special_module_name(prog: &Program, krate: u32) {
             "main" => "found module declaration for main.rs",
             _ => continue,
         };
-        lint::emit(prog, root, &SPECIAL_MODULE_NAME, m.file, item.lo, msg);
+        crate::lint_early2::emit(prog, root, &SPECIAL_MODULE_NAME, m.file, item.lo, msg);
     }
 }
 
@@ -307,10 +303,10 @@ fn token_lints(prog: &Program, own: &[bool]) {
                         }
                         if let (Some((l, ed)), false) = (kw, after_dollar) {
                             let kwname = String::from_utf8_lossy(name);
-                            lint::emit(prog, def, l, f as u32, t.lo, &format!("`{}{}` is a keyword in the {} edition", prefix, kwname, ed));
+                            crate::lint_early2::emit(prog, def, l, f as u32, t.lo, &format!("`{}{}` is a keyword in the {} edition", prefix, kwname, ed));
                         }
                         if non_ascii && seen_non_ascii.insert((krate, raw.to_vec())) {
-                            lint::emit(prog, rt, &NON_ASCII_IDENTS, f as u32, t.lo, "identifier contains non-ASCII characters");
+                            crate::lint_early2::emit(prog, rt, &NON_ASCII_IDENTS, f as u32, t.lo, "identifier contains non-ASCII characters");
                         }
                     }
                 }
@@ -324,6 +320,18 @@ fn token_lints(prog: &Program, own: &[bool]) {
 fn tk(pf: &ParsedFile, i: usize) -> crate::lexer::Tok {
     pf.toks.get(i).unwrap_or(crate::lexer::Tok { kind: crate::lexer::T::Eof, lo: u32::MAX, hi: u32::MAX })
 }
+
+/// The innermost definition whose item contains `pos` of `file` (the crate root: none does).
+pub(crate) fn enclosing_def(prog: &Program, file: u32, pos: u32, krate: u32) -> DefId {
+    let mut best = crate_root(prog, krate);
+    let mut size = u32::MAX;
+    for (lo, hi, d) in def_spans(prog, file) {
+        if lo <= pos && pos < hi && hi - lo < size { size = hi - lo; best = d; }
+    }
+    best
+}
+
+pub(crate) fn crate_root_def(prog: &Program, krate: u32) -> DefId { crate_root(prog, krate) }
 
 fn crate_root(prog: &Program, krate: u32) -> DefId {
     DefId((0..prog.defs.len()).find(|&i| { let d = prog.defs[i]; d.kind == DefKind::Mod && d.parent == crate::program::NO_DEF && d.krate == krate }).unwrap_or(0) as u32)
@@ -438,10 +446,10 @@ struct LtCx {
     next: u32,
 }
 
-struct W<'a> {
+pub(crate) struct W<'a> {
     prog: &'a Program,
-    pf: &'a ParsedFile,
-    ast: &'a Ast,
+    pub(crate) pf: &'a ParsedFile,
+    pub(crate) ast: &'a Ast,
     file: u32,
     def: DefId,
     /// the attributes of the enclosing statements, arms, fields, parameters, outermost first
@@ -452,26 +460,28 @@ struct W<'a> {
     self_ty_parens: bool,
     labels: Vec<LabelScope>,
     /// the last position the walk named: where a node without a position of its own is reported
-    cur: u32,
+    pub(crate) cur: u32,
     /// inside `&a...b`: no further `...` warnings
     ellipsis_off: bool,
     /// the lifetime use analysis (unused_lifetimes / single_use_lifetimes), when it runs
     lt: Option<LtCx>,
+    /// the lifetime resolution of the definition (hidden lifetimes of paths)
+    names: Option<std::sync::Arc<crate::tcx::lifetime_resolve::LifetimeResolution>>,
 }
 
 fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
 
 impl<'a> W<'a> {
-    fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
+    pub(crate) fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
         let pf: &'a ParsedFile = &prog.files[file as usize];
-        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None }
+        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None, names: None }
     }
 
     fn emit(&self, l: &Lint, pos: u32, msg: &str) {
         // the lifetime analysis walks the same trees: the other lints are not its business
         if self.lt.is_some() { return; }
         if lint::external(self.prog, self.file, pos) { return; }
-        lint::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
+        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
     }
 
     fn enter(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
@@ -479,35 +489,6 @@ impl<'a> W<'a> {
         let n = self.ast.list(attrs).len();
         let len = self.stack.len();
         self.stack.truncate(len - n);
-    }
-
-    /// The outer attributes written right before the statement at `pos` (token ranges of the
-    /// file's own source): Program loading turns `Stmt::Attrs` into plain statements, so the
-    /// lint levels they set are read back from the tokens.
-    fn recover_attrs(&self, pos: u32) -> Vec<Attr> {
-        let pf = self.pf;
-        let mut out = Vec::new();
-        if pos >= pf.src_len { return out; }
-        let src = pf.src_view();
-        let mut end = pf.toks.partition_point(|t| t.lo < pos);
-        while end > 0 && crate::cfg::tok_str(src, end - 1) == b"]" {
-            let (mut depth, mut k, mut open) = (0i32, end - 1, None);
-            loop {
-                match crate::cfg::tok_str(src, k) {
-                    b"]" => depth += 1,
-                    b"[" => { depth -= 1; if depth == 0 { open = Some(k); break; } }
-                    _ => {}
-                }
-                if k == 0 { break; }
-                k -= 1;
-            }
-            let Some(o) = open else { break };
-            if o == 0 || crate::cfg::tok_str(src, o - 1) != b"#" { break; }
-            out.push(Attr { inner: false, toks: TokRange { lo: o as u32 + 1, hi: end as u32 - 1 } });
-            end = o - 1;
-        }
-        out.reverse();
-        out
     }
 
     /// `Span::from_expansion` of the node starting at `pos`.
@@ -624,7 +605,7 @@ impl<'a> W<'a> {
     }
 
     /// Where a type starts, when its tree names a position.
-    fn ty_start(&self, t: TyId) -> Option<u32> {
+    pub(crate) fn ty_start(&self, t: TyId) -> Option<u32> {
         let ast = self.ast;
         match *ast.ty(t) {
             Ty::Path(p) => Some(p.lo),
@@ -1116,15 +1097,13 @@ impl<'a> W<'a> {
                 self.leave(l.attrs);
             }
             Stmt::Expr(e, semi) => {
-                // the loader dropped the attributes of expression statements: read them back
-                let rec = self.recover_attrs(ast.expr(e).lo);
-                let n = rec.len();
-                self.stack.extend(rec);
+                // the lint attributes of an expression statement survive cfg stripping
+                let attrs = ast.stmt_attrs(e);
+                self.enter(attrs);
                 // (`#[cfg(..)]` stays on the node in rustc: a value with attributes is not linted)
-                if !semi && n == 0 { self.both(e, Ctx::BlockRetValue, false); }
+                if !semi && attrs.len() == 0 { self.both(e, Ctx::BlockRetValue, false); }
                 self.expr(e);
-                let len = self.stack.len();
-                self.stack.truncate(len - n);
+                self.leave(attrs);
             }
             Stmt::Attrs(r) => {
                 let a = *ast.row(r);
@@ -1133,7 +1112,13 @@ impl<'a> W<'a> {
                 self.expr(a.expr);
                 self.leave(a.attrs);
             }
-            Stmt::Item(_) | Stmt::Empty => {}
+            Stmt::Item(it) => {
+                let item = *ast.item(it);
+                if matches!(item.kind, ItemKind::Use(_)) && self.lt.is_none() {
+                    crate::lint_early2::absolute_use_paths(self.prog, self.def, self.file, &item, &ast.list(item.attrs).to_vec());
+                }
+            }
+            Stmt::Empty => {}
         }
     }
 
@@ -1409,10 +1394,40 @@ impl<'a> W<'a> {
         if p.has_qself() {
             if let Some(q) = ast.qself(p) {
                 self.ty(q.ty);
-                if let Some(tp) = q.trait_path { self.path(&tp); }
+                if let Some(tp) = q.trait_path {
+                    self.path(&tp);
+                    // rustc resolves the trait part of a qualified path twice
+                    if self.lt.is_none() { crate::lint_early2::absolute_path(self.prog, self.def, &self.stack, self.file, &tp, 1); }
+                }
             }
         }
         for seg in ast.segs(p.segs) { self.generic_args(seg.args()); }
+        self.hidden_lifetimes(p);
+        if lint::enabled() && self.lt.is_none() { crate::lint_early2::absolute_path(self.prog, self.def, &self.stack, self.file, p, 1); }
+    }
+
+    /// rustc_resolve `resolve_elided_lifetimes_in_path`: `elided_lifetimes_in_paths` for each
+    /// segment of a type path that names a type with lifetime parameters and gives none (the
+    /// paths of expressions and patterns infer them).
+    fn hidden_lifetimes(&self, p: &Path) {
+        use crate::tcx::lifetime_resolve::LifetimeRes;
+        let Some(names) = &self.names else { return };
+        let ast = self.ast;
+        for (i, seg) in ast.segs(p.segs).iter().enumerate() {
+            match names.path(p.segs.lo + i as u32, 0) {
+                None | Some(LifetimeRes::Infer) | Some(LifetimeRes::Error) => continue,
+                Some(_) => {}
+            }
+            // with generic arguments written (`Foo<>`, `Foo<u8>`) the opening `<`, else the name
+            let mut pos = seg.name.lo;
+            if ast.gargs(seg.args()).is_some() {
+                let mut at = seg.name.hi;
+                let n = self.pf.src_len;
+                while at < n && self.pf.bytes(at, at + 1) != b"<" { at += 1; }
+                if at < n { pos = at; }
+            }
+            self.emit(&crate::lint_early2::ELIDED_LIFETIMES_IN_PATHS, pos, "hidden lifetime parameters in types are deprecated");
+        }
     }
 
     fn generic_args(&mut self, id: GenericArgsId) {
@@ -1532,12 +1547,12 @@ impl<'a> W<'a> {
                 0 => {
                     // a parameter written by a macro cannot be removed: no report
                     if self.pf.expansion_kind(p.pos) == ExpnKind::Root {
-                        lint::emit_in(self.prog, self.def, &self.stack, &UNUSED_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` never used", name));
+                        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, &UNUSED_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` never used", name));
                     }
                 }
                 1 => {
                     if !lint::external(self.prog, self.file, p.pos) {
-                        lint::emit_in(self.prog, self.def, &self.stack, &SINGLE_USE_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` only used once", name));
+                        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, &SINGLE_USE_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` only used once", name));
                     }
                 }
                 _ => {}

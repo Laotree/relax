@@ -984,7 +984,7 @@ impl<'a> Parser<'a> {
         }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules-output", &def.name);
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
-        let (text, origins, bodies) = if let Some(x) = crate::parse_work::get_rules(&key) { x } else {
+        let (text, origins, bodies) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| PErr { pos: call_lo, msg: m })?;
             crate::parse_work::put_rules(key, &x);
             x
@@ -4172,6 +4172,36 @@ impl ParsedFile {
             }
         }
         ExpnKind::Builtin
+    }
+
+    /// Where rustc reports a lint about the token at `pos`: a token written in the body of a
+    /// `macro_rules!` defined in this file stays at its place in the definition, a substituted
+    /// fragment is at the call's argument, anything else maps to the call site as in
+    /// `diagnostic_pos`.
+    pub fn lint_pos(&self, mut pos: u32) -> u32 {
+        for _ in 0..64 {
+            if pos < self.src_len { return pos; }
+            let (to, em) = self.tables(pos);
+            if let Some(o) = origin_of(to, pos) {
+                pos = o;
+                continue;
+            }
+            let part = self.part_at(pos);
+            let (rules, bodies) = part.map_or((&self.rules_exp, &self.body_origin), |p| (&p.rules_exp, &p.body_origin));
+            if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+                if pos < r.1 {
+                    if let Some(d) = origin_of(bodies, pos) {
+                        pos = d;
+                        continue;
+                    }
+                }
+            }
+            match region_of(em, pos) {
+                Some(c) if c != pos => pos = c,
+                _ => break,
+            }
+        }
+        pos.min(self.src_len)
     }
 
     /// The definition position of mark `m`'s macro (u32::MAX: another file).
