@@ -4,6 +4,7 @@
 use super::constraints::{AnnotationSource, ConstraintCategory as Cat, OutlivesConstraint, ReturnConstraint};
 use super::region_infer::NllRegionVariableOrigin as Origin;
 use super::type_check::*;
+use super::mir_nll::LocationMap;
 use super::universal_regions::{RegionClassification, UniversalRegions};
 use crate::mir::move_paths::MoveData;
 use crate::lang_items::LangItem;
@@ -561,6 +562,158 @@ fn reaudit_closure_parent_arguments_are_related_first() {
     let r = check(&tcx, &mut Fake::new(&tcx, 7), &b); clean(&r);
     let firsts: Vec<_> = edges(&r).into_iter().map(|e| e.0.min(e.1)).collect();
     assert_eq!(firsts, [1, 1, 3, 3, 5, 5]);
+}
+
+// --- liveness (C-NLL5 §2 / trace.rs): dropck through LivenessOps ---
+fn drop_term(place: u32, target: u32) -> TerminatorKind {
+    TerminatorKind::Drop { place: p(place), target: BasicBlock(target), unwind: UnwindAction::Continue, replace: false }
+}
+fn dropck(kinds: &[RegionId]) -> liveness::DropckData {
+    liveness::DropckData { kinds: kinds.iter().map(|&r| GenericArg::Lifetime(r)).collect(), ..Default::default() }
+}
+fn query_constraints() -> crate::next_solver::type_op::QueryRegionConstraints {
+    use crate::next_solver::type_op::{QueryRegionConstraint, RegionConstraint};
+    crate::next_solver::type_op::QueryRegionConstraints { constraints: vec![QueryRegionConstraint {
+        constraint: RegionConstraint::Eq(RegionId::ERASED, RegionId::ERASED), category: Cat::Boring, visible_for_leak_check: false }] }
+}
+fn live_points(r: &MirTypeckResults, vid: usize) -> Vec<usize> {
+    r.constraints.liveness_constraints.point_liveness(vid).map_or(vec![], |b| b.iter().collect())
+}
+/// `_1: &'1 i32` is the argument; `_2: &'3 i32` is dropped at the terminator of bb0 (point 1).
+fn drop_fixture(tcx: &Tcx) -> (Body, TyId) {
+    let t = tcx.tys.i32_;
+    let dropped = rf(tcx, re(tcx, 3), t, false);
+    (body(&[tcx.tys.unit, rf(tcx, re(tcx, 1), t, false), dropped],
+        vec![block(vec![assign(2, copy(1))], drop_term(2, 1)), block(vec![], TerminatorKind::Return)]), dropped)
+}
+
+#[test]
+fn may_dangle_components_are_not_live_at_the_drop() {
+    // dropck_outlives of the local's type lists what its destructor may touch: with a
+    // `#[may_dangle]` parameter the region is absent, and the drop does not keep it alive.
+    let tcx = Tcx::new();
+    let (b, dropped) = drop_fixture(&tcx);
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, dropck(&[]));
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    assert_eq!(live_points(&r, 3), Vec::<usize>::new());
+    // Without may_dangle the destructor needs the region: live at the drop (point 1), and not
+    // before it, where the local is only assigned.
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, dropck(&[re(&tcx, 3)]));
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    assert_eq!(live_points(&r, 3), [1]);
+    // A different component than the type's own region is what gets live.
+    let mut fake = Fake::new(&tcx, 5);
+    fake.dropck.insert(dropped, dropck(&[re(&tcx, 4)]));
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    assert_eq!((live_points(&r, 3), live_points(&r, 4)), (vec![], vec![1]));
+}
+
+#[test]
+fn dropck_constraints_are_registered_at_every_initialized_drop_location() {
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let dropped = rf(&tcx, re(&tcx, 3), t, false);
+    // bb0 assigns _2 and branches; both arms drop it; the third arm leaves it uninitialized.
+    let b = body(&[tcx.tys.unit, rf(&tcx, re(&tcx, 1), t, false), dropped, tcx.tys.bool_], vec![
+        block(vec![assign(2, copy(1))], TerminatorKind::SwitchInt { discr: Operand::Copy(p(3)),
+            targets: SwitchTargets { values: vec![0], targets: vec![BasicBlock(1)], otherwise: BasicBlock(2) } }),
+        block(vec![], drop_term(2, 3)), block(vec![], drop_term(2, 3)), block(vec![], TerminatorKind::Return)]);
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, liveness::DropckData { kinds: vec![GenericArg::Lifetime(re(&tcx, 3))], overflows: vec![],
+        region_constraint_data: Some(query_constraints()) });
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    // The last drop first (LocalUseMap's appearance lists are LIFO), each once.
+    assert_eq!(fake.pushed, [Locations::Single(at(2, 0)), Locations::Single(at(1, 0))]);
+    // Drop-live from the assignment (point 0, a def) to both drops: the switch (1), bb1 (2), bb2 (3).
+    assert_eq!(live_points(&r, 3), [1, 2, 3]);
+    // Never dropped: dropck is not even asked for a local without a drop-live point.
+    let mut b2 = b.clone();
+    b2.basic_blocks[1].terminator.as_mut().unwrap().kind = TerminatorKind::Goto { target: BasicBlock(3) };
+    b2.basic_blocks[2].terminator.as_mut().unwrap().kind = TerminatorKind::Goto { target: BasicBlock(3) };
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, liveness::DropckData { kinds: vec![GenericArg::Lifetime(re(&tcx, 3))], overflows: vec![], region_constraint_data: Some(query_constraints()) });
+    let r = check(&tcx, &mut fake, &b2); clean(&r);
+    assert!(fake.pushed.is_empty() && live_points(&r, 3).is_empty());
+}
+
+#[test]
+fn partially_initialized_locals_drop_only_where_initialized() {
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let dropped = rf(&tcx, re(&tcx, 3), t, false);
+    // _2 is assigned only on the arm through bb1, and dropped in the join block bb3.
+    let b = body(&[tcx.tys.unit, rf(&tcx, re(&tcx, 1), t, false), dropped, tcx.tys.bool_], vec![
+        block(vec![], TerminatorKind::SwitchInt { discr: Operand::Copy(p(3)),
+            targets: SwitchTargets { values: vec![0], targets: vec![BasicBlock(1)], otherwise: BasicBlock(2) } }),
+        block(vec![assign(2, copy(1))], TerminatorKind::Goto { target: BasicBlock(3) }),
+        block(vec![], TerminatorKind::Goto { target: BasicBlock(3) }),
+        block(vec![], drop_term(2, 4)), block(vec![], TerminatorKind::Return)]);
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, dropck(&[re(&tcx, 3)]));
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    // Maybe-initialized at the drop (point 4): drop-live there and at the end of the initializing
+    // arm (point 2; point 1 is the assignment), but not in the arm that never assigns it (3).
+    assert_eq!(live_points(&r, 3), [2, 4]);
+}
+
+#[test]
+fn boring_locals_still_run_dropck_for_overflows() {
+    // `_2: &'0 i32` mentions only the universal 'static: boring, no liveness, but dropck runs
+    // (eager detection of unbounded drop-glue recursion) and its overflow is reported at the local.
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let stat = rf(&tcx, re(&tcx, 0), t, false);
+    let b = body(&[tcx.tys.unit, rf(&tcx, re(&tcx, 1), t, false), stat], vec![block(vec![assign(2, copy(1))], TerminatorKind::Return)]);
+    let mut fake = Fake::new(&tcx, 2);
+    fake.dropck.insert(stat, liveness::DropckData { kinds: vec![], overflows: vec![t], region_constraint_data: None });
+    let r = check(&tcx, &mut fake, &b);
+    assert_eq!(r.dropck_overflows, [liveness::DropckOverflow { span: span(52), ty: stat, overflow_ty: t }]);
+}
+
+#[test]
+fn relevant_local_overflows_are_reported_at_the_last_initialized_drop() {
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let (b, dropped) = drop_fixture(&tcx);
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, liveness::DropckData { kinds: vec![], overflows: vec![t], region_constraint_data: None });
+    let r = check(&tcx, &mut fake, &b);
+    // The drop terminator of bb0 carries span 99.
+    assert_eq!(r.dropck_overflows, [liveness::DropckOverflow { span: span(99), ty: dropped, overflow_ty: t }]);
+}
+
+#[test]
+fn deferred_locals_wait_for_loans_and_register_constraints_eagerly() {
+    // `_2: &'3 i32` outlives the universal 'static (3: 0): NLL-boring, but Polonius-relevant
+    // (its region is not universal). With loans it is deferred; its drop components are kept.
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let (b, dropped) = drop_fixture(&tcx);
+    let universals = UniversalRegions::new(0, None, vec![(0, RegionClassification::Global)]);
+    let run_with = |fake: &mut Fake<'_>, loans: bool| {
+        let moves = MoveData::gather_moves(&b, &test_prog(), &tcx, crate::tcx::TypingEnv::fully_monomorphized(&test_prog()), &|_| true);
+        let mut c = MirTypeckRegionConstraints::new(LocationMap::new(&b).num_points());
+        c.outlives_constraints.push(OutlivesConstraint { sup: 3, sub: 0, location: None, span: Span::default(), category: Cat::Boring, from_closure: false });
+        let mut polonius = Default::default(); let mut overflows = vec![];
+        liveness::generate(liveness::LivenessCx { tcx: &tcx, prog: &test_prog(), infcx: fake, body: &b, moves: &moves, universals: &universals,
+            locations: &LocationMap::new(&b), has_loans: loans, constraints: &mut c, polonius: &mut polonius, overflows: &mut overflows });
+        (c, polonius)
+    };
+    let live = |c: &MirTypeckRegionConstraints| c.liveness_constraints.point_liveness(3).map_or(vec![], |b| b.iter().collect::<Vec<_>>());
+    // Without loans nothing is deferred, and the local is boring: not live anywhere.
+    let mut fake = Fake::new(&tcx, 4); fake.dropck.insert(dropped, dropck(&[re(&tcx, 3)]));
+    let (c, polonius) = run_with(&mut fake, false);
+    assert!(live(&c).is_empty() && polonius.boring_nll_locals.is_empty());
+    // With loans it is deferred: still no liveness until the loan traversal asks for it.
+    let mut fake = Fake::new(&tcx, 4); fake.dropck.insert(dropped, dropck(&[re(&tcx, 3)]));
+    let (c, polonius) = run_with(&mut fake, true);
+    assert!(live(&c).is_empty() && fake.pushed.is_empty());
+    assert!(polonius.boring_nll_locals.contains(&Local(2)));
+    // Dropck constraints make it eager: liveness now, constraints at its drop location only.
+    let mut fake = Fake::new(&tcx, 4);
+    fake.dropck.insert(dropped, liveness::DropckData { kinds: vec![GenericArg::Lifetime(re(&tcx, 3))], overflows: vec![],
+        region_constraint_data: Some(query_constraints()) });
+    let (c, _) = run_with(&mut fake, true);
+    assert_eq!(live(&c), [1]);
+    assert_eq!(fake.pushed, [Locations::Single(at(0, 1))]);
+    let _ = t;
 }
 
 fn test_prog() -> crate::program::Program { crate::program::Program::new(&std::sync::Arc::new(crate::Session::default())) }
