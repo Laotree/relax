@@ -180,6 +180,9 @@ pub struct GenEnv {
     pub consts: Vec<(u32, u32, ast::TyId)>,
     /// lowering this fn's return type: `impl Trait` there is its opaque type
     pub opaque_owner: Option<DefId>,
+    /// the item whose generics these are (rustc ribs: items of the owner's body blocks are
+    /// innermost, so they shadow its type parameters)
+    pub owner: Option<DefId>,
 }
 
 /// Expression id of an async fn's body coroutine: ASYNC_FN_BODY | the body block's id.
@@ -1145,6 +1148,7 @@ impl Tcx {
             }
         }
         env.parent_bounds = env.bounds.len();
+        env.owner = Some(d);
         let ast = &prog.files[def.file as usize].ast;
         let it = ast.item(def.item);
         match &it.kind {
@@ -2500,7 +2504,9 @@ impl Tcx {
             }
             let name = f.text(seg.name);
             if let Some(s) = prog.syms.get(name) {
-                for (i, n) in env.names.iter().enumerate() {
+                // an item of the owner's body blocks shadows its type parameters (late.rs ribs)
+                let shadowed = env.owner.is_some_and(|o| prog.lookup_in_body_blocks(module, o, s, true).is_some());
+                for (i, n) in env.names.iter().enumerate().filter(|_| !shadowed) {
                     if *n == s {
                         return self.tys.intern(TyKind::Param(i as u32));
                     }

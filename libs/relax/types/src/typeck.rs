@@ -414,6 +414,9 @@ pub struct Fcx<'a> {
     param_env: crate::next_solver::ParamEnvId,
     loops: Vec<Loop>,
     in_loop_condition: bool,
+    /// the item-holding block modules being checked, with how many locals were in scope when each
+    /// began: its items sit inside those locals' ribs and outside the later ones
+    item_blocks: Vec<(u32, usize)>,
     diverges: bool,
     ret_stack: Vec<TyId>,
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
@@ -662,6 +665,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         param_env: Default::default(),
         loops: Vec::new(),
         in_loop_condition: false,
+        item_blocks: Vec::new(),
         diverges: false,
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
@@ -1845,6 +1849,11 @@ impl<'a> Fcx<'a> {
         while i > 0 {
             i -= 1;
             if self.scopes[i].0 == s {
+                // a local declared before an item-holding block began is outside that block's
+                // item rib: the block's item of that name shadows it (late.rs ribs)
+                if self.item_blocks.iter().any(|&(m, entry)| entry > i && self.prog.lookup_in_module(m, s, false, &mut Vec::new()).is_some()) {
+                    return None;
+                }
                 let li = self.scopes[i].1;
                 let (bc, bpos) = match self.local_hyg.get(li as usize) {
                     Some(x) => x,
@@ -3877,8 +3886,10 @@ impl<'a> Fcx<'a> {
         let blk = ast.block(b);
         let saved_scope = self.scopes.len();
         let saved_module = self.module;
+        let saved_blocks = self.item_blocks.len();
         if let Some(&m) = self.prog.block_mods.get(&(self.file, b.0)) {
             self.module = m;
+            self.item_blocks.push((m, saved_scope));
         }
         let mut result = self.tcx.tys.unit;
         let n = blk.stmts.len();
@@ -3981,6 +3992,7 @@ impl<'a> Fcx<'a> {
         }
         self.scopes.truncate(saved_scope);
         self.module = saved_module;
+        self.item_blocks.truncate(saved_blocks);
         if diverged {
             self.diverges = true;
             let tail_is_expr = n > 0 && matches!(self.ast().list(blk.stmts)[n - 1], Stmt::Expr(_, false));

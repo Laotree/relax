@@ -4250,6 +4250,20 @@ impl Program {
         }
     }
 
+    /// `name` among the items of the body blocks of `owner` that `module` sits in (the anonymous
+    /// modules from `module` up to where the owner's body starts): what rustc's innermost Item
+    /// ribs hold, ahead of the owner's generic parameters.
+    pub fn lookup_in_body_blocks(&self, module: u32, owner: DefId, name: Sym, ns_type: bool) -> Option<DefId> {
+        let mut m = module;
+        while self.block_owner.get(&m) == Some(&owner) {
+            if let Some(d) = self.lookup_in_module(m, name, ns_type, &mut Vec::new()) {
+                return Some(d);
+            }
+            m = self.mods[m as usize].lexical_parent?;
+        }
+        None
+    }
+
     fn lookup_in_scope_uncached(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
         let mut m = module;
         loop {
