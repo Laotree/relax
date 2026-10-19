@@ -7685,7 +7685,7 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 verify_pass(func, "simplify");
             }
             let t = crate::opt::pass_clock();
-            let l = cfg.licm && crate::opt::licm(func);
+            let l = cfg.licm && (crate::opt::licm(func) | crate::opt::promote_loop_memory(func));
             crate::opt::pass_time(10, t);
             verify_pass(func, "licm");
             if l {
@@ -7703,7 +7703,7 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
-            if cfg.licm && crate::opt::licm(func) {
+            if cfg.licm && (crate::opt::licm(func) | crate::opt::promote_loop_memory(func)) {
                 verify_pass(func, "licm");
                 crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
