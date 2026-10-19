@@ -220,3 +220,54 @@ fn spans_cover_the_pattern() {
 
 #[allow(dead_code)]
 fn _unused(_: BindingMode) {}
+
+fn ascriptions(source: &str) -> Vec<Vec<(crate::mir::Variance, String)>> {
+    with_cx(source, "f", |cx, body| {
+        let tops = top_patterns(cx.root.cx.prog, body);
+        let mut out = Vec::new();
+        for p in tops {
+            let pat = cx.lower_pattern(p).unwrap_or_else(|e| panic!("{e:?}"));
+            let mut here = Vec::new();
+            pat.walk_always(|p| {
+                for a in p.extra.iter().flat_map(|e| e.ascriptions.iter()) {
+                    here.push((a.variance, format!("{:?}", a.annotation.user_ty.value.kind)));
+                }
+            });
+            out.push(here);
+        }
+        out
+    })
+}
+
+#[test]
+fn struct_pattern_with_explicit_args_is_ascribed_to_the_adt() {
+    let r = ascriptions("pub struct W<T> { t: T } pub enum O<T> { N, S(T) } pub fn f(w: W<O<u8>>) { let W::<O<_>> { t: _ } = w; match O::S(1u8) { O::<u8>::S(_) => {} O::N => {} } }");
+    assert_eq!(r[0].len(), 1, "{r:?}");
+    assert_eq!(r[0][0].0, crate::mir::Variance::Covariant);
+    assert!(r[0][0].1.starts_with("TypeOf("), "{r:?}");
+}
+
+#[test]
+fn let_annotation_becomes_a_covariant_ascription() {
+    with_cx("pub fn f<'a>(x: &'a u8) { let _y: &'a u8 = x; }", "f", |cx, body| {
+        let p = top_patterns(cx.root.cx.prog, body)[0];
+        // find the annotated type node: the (only) `Type` key of the body
+        let ty = body
+            .user_provided_types
+            .iter()
+            .find_map(|(k, _)| if let crate::typeck::user_types::UserTypeKey::Type(t) = k { Some(*t) } else { None })
+            .expect("the let annotation");
+        let span = cx.pat_span(p);
+        let pat = cx.lower_pattern_for_let(p, Some((crate::ast::TyId(ty), span))).unwrap();
+        let ascriptions = &pat.extra.as_ref().unwrap().ascriptions;
+        assert_eq!(ascriptions.len(), 1);
+        assert_eq!(ascriptions[0].variance, crate::mir::Variance::Covariant);
+        assert_eq!(ascriptions[0].annotation.inferred_ty, pat.ty);
+    });
+}
+
+#[test]
+fn unannotated_patterns_have_no_ascriptions() {
+    let r = ascriptions("pub fn f(x: (u8, bool)) { let (a, b) = x; match a { 0..=3 => {} _ => {} } }");
+    assert!(r.iter().all(|a| a.is_empty()), "{r:?}");
+}

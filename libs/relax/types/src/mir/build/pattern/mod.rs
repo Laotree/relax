@@ -11,11 +11,13 @@
 //! - The `Pat::Ident` of a unit struct / variant / const is a path pattern (`Body.pat_res`).
 use crate::ast::{Ast, ExprId, Pat as AstPat, PatId};
 use crate::consts::{GenericArg, Value};
-use crate::mir::build::thir::{Cx, DerefPatBorrowMode, ErrorGuaranteed, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary, Pinnedness, RangeEnd};
+use crate::mir::build::thir::{Ascription, Cx, DerefPatBorrowMode, ErrorGuaranteed, FieldPat, LocalVarId, Pat, PatKind, PatRange, PatRangeBoundary, Pinnedness, RangeEnd};
 use crate::mir::build::{BuildResult, UnsupportedReason};
-use crate::mir::{BindingMode, ByRef, FieldIdx, Mutability, Span, VariantIdx};
+use crate::mir::{BindingMode, ByRef, CanonicalUserTypeAnnotation, FieldIdx, Mutability, Span, Variance, VariantIdx};
 use crate::program::{DefId, DefKind};
+use crate::typeck::user_types::UserTypeKey;
 use crate::typeck::{Res, PAT_KEY};
+use crate::types::user_type::UserTypeKind;
 use crate::types::{TyId, TyKind, TypeFlags};
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -49,6 +51,49 @@ impl<'a> Cx<'a> {
             return Err(self.error(span, UnsupportedReason::TypeckTainted));
         }
         Ok(t)
+    }
+
+    /// The annotation `key` names, with the span and inferred type of the annotated node.
+    fn annotation(&self, key: UserTypeKey, span: Span, inferred_ty: TyId) -> Option<CanonicalUserTypeAnnotation> {
+        let user_ty = self.root.typeck.user_provided_types.get(&key)?;
+        Some(CanonicalUserTypeAnnotation { user_ty: Box::new((**user_ty).clone()), span, inferred_ty })
+    }
+
+    /// thir/util.rs:`user_args_applied_to_ty_of_hir_id`: the annotation of `key` for a node of type
+    /// `ty`; the annotation of a constructor path names the ADT itself.
+    fn user_args_applied_to_ty(&self, key: UserTypeKey, span: Span, ty: TyId) -> Option<CanonicalUserTypeAnnotation> {
+        let mut annotation = self.annotation(key, span, ty)?;
+        match *self.root.cx.tcx.tys.kind(ty) {
+            TyKind::Adt(adt, ..) => {
+                // `type_of(ctor_did)` is a FnDef, but the ADT itself is annotated; consts and fns
+                // keep their own definition
+                if let UserTypeKind::TypeOf(did, _) = &mut annotation.user_ty.value.kind {
+                    *did = adt;
+                }
+                Some(annotation)
+            }
+            TyKind::FnDef(..) => Some(annotation),
+            _ => None,
+        }
+    }
+
+    /// Pushes an ascription for the annotation `key` names, if any.
+    fn ascribe(&self, pat: &mut Pat, annotation: Option<CanonicalUserTypeAnnotation>, variance: Variance) {
+        if let Some(annotation) = annotation {
+            pat.extra.get_or_insert_default().ascriptions.push(Ascription { annotation, variance });
+        }
+    }
+
+    /// pattern/mod.rs:`pat_from_hir`: the pattern of a `let`, with the user type of its explicit type
+    /// annotation (`let x: T = ..`) as an ascription. `let_ty` is the annotation's syntax node and span.
+    pub fn lower_pattern_for_let(&mut self, p: PatId, let_ty: Option<(crate::ast::TyId, Span)>) -> BuildResult<Pat> {
+        let mut pat = self.lower_pattern(p)?;
+        if let Some((ty, span)) = let_ty {
+            let inferred_ty = self.matched_ty(p, span)?;
+            let annotation = self.annotation(UserTypeKey::Type(ty.0), span, inferred_ty);
+            self.ascribe(&mut pat, annotation, Variance::Covariant);
+        }
+        Ok(pat)
     }
 
     /// pattern/mod.rs:`lower_pattern`: the pattern and its implicit dereferences.
@@ -117,7 +162,7 @@ impl<'a> Cx<'a> {
     }
 
     /// pattern/mod.rs:`lower_variant_or_leaf`: a variant (or struct) constructor pattern of the ADT `ty`.
-    fn lower_variant_or_leaf(&self, ty: TyId, res: Option<DefId>, subpatterns: Vec<FieldPat>, span: Span) -> BuildResult<Pat> {
+    fn lower_variant_or_leaf(&self, key: UserTypeKey, ty: TyId, res: Option<DefId>, subpatterns: Vec<FieldPat>, span: Span) -> BuildResult<Pat> {
         let (prog, tcx) = (self.root.cx.prog, self.root.cx.tcx);
         let TyKind::Adt(adt, args, _) = *tcx.tys.kind(ty) else { return self.pat_unresolved(span, "constructor pattern of a non-ADT type") };
         let Some(a) = tcx.adts.get(&adt) else { return self.pat_unresolved(span, "constructor pattern of an unknown ADT") };
@@ -129,15 +174,26 @@ impl<'a> Cx<'a> {
         } else {
             PatKind::Leaf { subpatterns }
         };
-        Ok(Pat { ty, span, extra: None, kind })
+        let mut pat = Pat { ty, span, extra: None, kind };
+        let annotation = self.user_args_applied_to_ty(key, span, ty);
+        self.ascribe(&mut pat, annotation, Variance::Covariant);
+        Ok(pat)
     }
 
     /// pattern/mod.rs:`lower_path`: a path (or identifier) pattern that names a constant, unit
     /// variant or unit struct.
     fn lower_path_pat(&self, key: u32, d: DefId, ty: TyId, span: Span) -> BuildResult<Pat> {
+        let user_key = UserTypeKey::of_node(key);
         match self.root.cx.prog.def(d).kind {
-            DefKind::Const | DefKind::AssocConst => self.const_path_to_pat(d, key, ty, span),
-            DefKind::Variant | DefKind::Struct => self.lower_variant_or_leaf(ty, Some(d), Vec::new(), span),
+            DefKind::Const | DefKind::AssocConst => {
+                let mut pat = self.const_path_to_pat(d, key, ty, span)?;
+                // an associated constant with an explicit user-written type (`<Foo<'a> as Tr>::C`);
+                // note the variance (see `Ascription::variance`)
+                let annotation = self.annotation(user_key, span, ty);
+                self.ascribe(&mut pat, annotation, Variance::Contravariant);
+                Ok(pat)
+            }
+            DefKind::Variant | DefKind::Struct => self.lower_variant_or_leaf(user_key, ty, Some(d), Vec::new(), span),
             // statics and others are errors E0532 (reported by typeck)
             _ => Err(self.error(span, UnsupportedReason::TypeckTainted)),
         }
@@ -174,7 +230,18 @@ impl<'a> Cx<'a> {
             // an empty range is an error (E0030 / E0579), reported nowhere else in Relax yet
             _ => kind = PatKind::Error(ErrorGuaranteed),
         }
-        Ok(Pat { ty, span, extra: None, kind })
+        let mut pat = Pat { ty, span, extra: None, kind };
+        // associated constants with explicit user-written types (`Foo::<'a>::A..=Foo::B`): their
+        // ascriptions go on the range pattern
+        let ast = self.ast();
+        for e in [lo, hi].into_iter().flatten() {
+            let e = crate::lit::strip_paren(ast, e);
+            if matches!(ast.expr(e).kind, crate::ast::ExprKind::Path(_)) {
+                let annotation = self.annotation(UserTypeKey::Expr(e.0), span, ty);
+                self.ascribe(&mut pat, annotation, Variance::Contravariant);
+            }
+        }
+        Ok(pat)
     }
 
     fn lower_slice_pattern(&mut self, subs: &[PatId], ty: TyId, span: Span) -> BuildResult<Pat> {
@@ -280,7 +347,7 @@ impl<'a> Cx<'a> {
                 let variant = if self.root.cx.prog.def(d).kind == DefKind::Variant { self.root.cx.prog.def(d).sub } else { 0 };
                 let arity = self.adt_variant_fields(adt, variant);
                 let subpatterns = self.lower_seq_subpats(ast.list(subs), arity, span)?;
-                self.lower_variant_or_leaf(ty, Some(d), subpatterns, span)
+                self.lower_variant_or_leaf(UserTypeKey::Pattern(p.0), ty, Some(d), subpatterns, span)
             }
             AstPat::Struct(_, fields, _) => {
                 let Some(Res::Def(d)) = tb.pat_res.get(&p.0).copied() else { return self.pat_unresolved(span, "unresolved struct pattern") };
@@ -295,7 +362,7 @@ impl<'a> Cx<'a> {
                     }
                     subpatterns.push(FieldPat { field: FieldIdx(field), pattern });
                 }
-                self.lower_variant_or_leaf(ty, Some(d), subpatterns, span)
+                self.lower_variant_or_leaf(UserTypeKey::Pattern(p.0), ty, Some(d), subpatterns, span)
             }
             AstPat::Tuple(subs) => {
                 let TyKind::Tuple(l) = *tcx.tys.kind(ty) else { return self.pat_unresolved(span, "tuple pattern of a non-tuple type") };
