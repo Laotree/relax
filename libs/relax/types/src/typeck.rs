@@ -1485,6 +1485,34 @@ impl<'a> Fcx<'a> {
         false
     }
 
+    /// rustc_hir_typeck expr.rs check_lhs_assignable: the left side of an assignment is a place expression
+    /// (a local or static, a field, an index, a dereference); else E0070 (E0067 for `op=`).
+    fn check_lhs_assignable(&mut self, a: ExprId, compound: bool) {
+        if !self.tcx.validates(self.prog, self.file) { return; }
+        let mut e = a;
+        loop {
+            match self.ast().expr(e).kind {
+                ExprKind::Paren(i) => e = i,
+                _ => break,
+            }
+        }
+        let ok = match &self.ast().expr(e).kind {
+            ExprKind::Field(..) | ExprKind::TupleField(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) => true,
+            ExprKind::Path(_) => match self.b.res.get(&e.0) {
+                Some(Res::Local(_)) | Some(Res::Err) | None => true,
+                Some(Res::Def(d)) => matches!(self.prog.def(*d).kind, DefKind::Static | DefKind::ForeignStatic),
+                Some(_) => false,
+            },
+            ExprKind::Underscore => true,
+            _ => false,
+        };
+        if !ok {
+            let pos = self.ast().expr(a).lo;
+            if compound { self.err(pos, "E0067: invalid left-hand side of compound assignment".to_string()); }
+            else { self.err(pos, "E0070: invalid left-hand side of assignment".to_string()); }
+        }
+    }
+
     /// A `&`/`&mut` pattern against a scrutinee of another shape: E0308.
     fn demand_pat_eq(&mut self, scrutinee: TyId, m: bool) {
         let x = self.infcx.deeply_resolve_ignoring_regions(scrutinee);
@@ -2642,6 +2670,7 @@ impl<'a> Fcx<'a> {
             }
             _ => {
                 let ta = self.check_expr(a, None);
+                self.check_lhs_assignable(a, false);
                 self.coerce_or_unify(t, ta, None, lo);
                 return;
             }
@@ -4627,6 +4656,7 @@ impl<'a> Fcx<'a> {
                     return unit;
                 }
                 let ta = self.check_expr(*a, None);
+                self.check_lhs_assignable(*a, false);
                 // rustc check_expr_assign: the assigned place is Sized (AssignmentLhsSized)
                 if self.tcx.validates(self.prog, self.file) { let apos = self.ast().expr(*a).lo; self.require_type_is_sized_deferred(ta, apos); }
                 let tb = self.check_expr(*b, Some(ta));
@@ -4635,6 +4665,7 @@ impl<'a> Fcx<'a> {
             }
             ExprKind::AssignOp(op, a, b) => {
                 let ta = self.check_expr(*a, None);
+                self.check_lhs_assignable(*a, true);
                 let sa = self.shallow(ta);
                 // rustc_hir_typeck/src/op.rs:29-44: parameters and aliases keep
                 // the overloaded decision, even when an instance is primitive.
