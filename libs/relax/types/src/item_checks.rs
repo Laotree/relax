@@ -582,6 +582,12 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             }
             // (declarations of an extern block, plain or unsafe)
             for &it in ast.list(fm.items) {
+                if let ItemKind::Const(_, init) = ast.item(it).kind {
+                    errors.push(prog.record_error(file, ast.item(it).lo, "parse", "extern items cannot be `const`".to_string()));
+                    if init.is_some() {
+                        errors.push(prog.record_error(file, ast.item(it).lo, "parse", "incorrect `static` inside `extern` block".to_string()));
+                    }
+                }
                 if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
                     let sig = ast.fn_sig(sig);
                     if let Some(g) = ast.list(sig.generics.params).iter().find(|g| !matches!(g.kind, crate::ast::GenericParamKind::Lifetime(_))) {
