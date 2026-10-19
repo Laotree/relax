@@ -198,7 +198,7 @@ fn attr_lints(prog: &Program, d: DefId) {
         for a in attrs {
             let name = lint::attr_path(prog, file, a);
             let pos = attr_pos(pf, a);
-            let mut emit = |msg: &str| {
+            let emit = |msg: &str| {
                 if !lint::external(prog, file, pos) { lint::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
             };
             if CRATE_LEVEL.contains(&&name[..]) {
