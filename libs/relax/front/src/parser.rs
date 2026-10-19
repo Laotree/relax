@@ -204,6 +204,9 @@ impl<'a> Parser<'a> {
     }
     fn expect(&mut self, k: T) -> PResult<Tok> {
         if self.kind() == k {
+            if k == T::CloseBrace && self.doc_before() {
+                return self.err("E0585: found a documentation comment that doesn't document anything");
+            }
             Ok(self.bump())
         } else {
             self.err(&format!("expected {:?}", k))
@@ -232,16 +235,94 @@ impl<'a> Parser<'a> {
         let i = self.pos + n;
         i < self.toks.len() && self.toks.at(i).kind == T::Ident && self.text_of(self.toks.at(i)) == w
     }
+    /// rustc_span symbol.rs: the reserved-for-future-use keywords are no identifiers (a raw
+    /// identifier is); `_` names nothing but a pattern, a const or a rename.
+    fn reserved_ident(&self, t: Tok) -> Option<String> {
+        if t.kind != T::Ident {
+            return None;
+        }
+        let text = self.tok_text(t);
+        let reserved = match text {
+            b"abstract" | b"become" | b"do" | b"final" | b"macro" | b"override" | b"priv" | b"typeof" | b"unsized" | b"virtual" => true,
+            b"gen" => self.edition >= 2024,
+            _ => false,
+        };
+        if reserved {
+            Some(format!("expected identifier, found reserved keyword `{}`", String::from_utf8_lossy(text)))
+        } else {
+            None
+        }
+    }
+
     fn ident_tok(&mut self) -> PResult<Ident> {
         match self.kind() {
             T::Ident | T::RawIdent => {
-                let t = self.bump();
+                let t = self.tok();
+                if let Some(m) = self.reserved_ident(t) {
+                    return Err(PErr { pos: t.lo, msg: m });
+                }
+                if t.kind == T::Ident && self.tok_text(t) == b"_" {
+                    return Err(PErr { pos: t.lo, msg: "expected identifier, found reserved identifier `_`".into() });
+                }
+                self.pos += 1;
                 Ok(Ident { lo: t.lo, hi: t.hi })
             }
             // edition 2015: async/await/dyn/try are idents; they lex as idents there.
             _ => self.err("expected identifier"),
         }
     }
+    /// Does an outer doc comment (`/// ..`, `/** .. */`) sit between the previous token and the
+    /// current one? Such a comment documents the next item, field or statement; before a closing
+    /// brace, a `;`, a `,` or the end of the file it documents nothing (E0584 / E0585).
+    fn doc_before(&self) -> bool {
+        let cur = self.tok();
+        let lo = cur.lo as usize;
+        if lo > self.src.len() {
+            return false;
+        }
+        let prev_hi = if self.pos == 0 { 0 } else { self.toks.at(self.pos - 1).hi as usize };
+        if prev_hi > lo {
+            return false;
+        }
+        let g = &self.src[prev_hi..lo];
+        let mut i = 0;
+        while i < g.len() {
+            match g[i] {
+                b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+                b'/' if g.get(i + 1) == Some(&b'/') => {
+                    if g.get(i + 2) == Some(&b'/') && g.get(i + 3) != Some(&b'/') {
+                        return true;
+                    }
+                    while i < g.len() && g[i] != b'\n' {
+                        i += 1;
+                    }
+                }
+                b'/' if g.get(i + 1) == Some(&b'*') => {
+                    if g.get(i + 2) == Some(&b'*') && !matches!(g.get(i + 3), Some(b'*') | Some(b'/')) {
+                        return true;
+                    }
+                    let mut depth = 0;
+                    while i < g.len() {
+                        if g[i] == b'/' && g.get(i + 1) == Some(&b'*') {
+                            depth += 1;
+                            i += 2;
+                        } else if g[i] == b'*' && g.get(i + 1) == Some(&b'/') {
+                            depth -= 1;
+                            i += 2;
+                            if depth == 0 {
+                                break;
+                            }
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                _ => return false,
+            }
+        }
+        false
+    }
+
     fn is_ident(&self) -> bool {
         matches!(self.kind(), T::Ident | T::RawIdent)
     }
@@ -1212,10 +1293,13 @@ impl<'a> Parser<'a> {
         let mut items = Vec::new();
         loop {
             if self.kind() == end {
+                if end == T::Eof && self.doc_before() {
+                    return self.err("expected item after doc comment");
+                }
                 break;
             }
-            if self.eat(T::Semi) {
-                continue;
+            if self.kind() == T::Semi {
+                return self.err("expected item, found `;`");
             }
             let item_tok = self.pos;
             let attrs = self.outer_attrs()?;
@@ -1641,6 +1725,9 @@ impl<'a> Parser<'a> {
                 self.pos += 2;
                 name = self.ident_tok()?;
                 let (d, toks) = self.delim_tt()?;
+                if toks.hi <= toks.lo {
+                    return Err(PErr { pos: self.toks.at(toks.lo as usize).lo, msg: "macros must contain at least one rule".into() });
+                }
                 if d != b'{' {
                     self.eat(T::Semi);
                 }
@@ -1684,6 +1771,11 @@ impl<'a> Parser<'a> {
     }
 
     fn ident_or_underscore(&mut self) -> PResult<Ident> {
+        let t = self.tok();
+        if t.kind == T::Ident && self.tok_text(t) == b"_" {
+            self.pos += 1;
+            return Ok(Ident { lo: t.lo, hi: t.hi });
+        }
         self.ident_tok()
     }
 
@@ -1747,6 +1839,10 @@ impl<'a> Parser<'a> {
         let mut stage = 0;
         loop {
             let this = match self.kind() {
+        // (rustc_parse parse_fn_front_matter: `const async unsafe|safe extern "abi" fn`, in this order)
+        let mut stage = 0;
+        loop {
+            let at = match self.kind() {
                 T::KwConst => 1,
                 T::KwAsync => 2,
                 T::KwUnsafe => 3,
@@ -1771,10 +1867,28 @@ impl<'a> Parser<'a> {
                 2 => asyncness = true,
                 3 => if self.kind() == T::KwUnsafe { unsafe_ = true },
                 _ => {
+            if at <= stage {
+                let t = self.tok();
+                let found = String::from_utf8_lossy(self.tok_text(t)).into_owned();
+                let expect = match stage {
+                    1 => "`async`, `safe`, `unsafe`, `extern`, or `fn`",
+                    2 => "`safe`, `unsafe`, `extern`, or `fn`",
+                    3 => "`extern` or `fn`",
+                    _ => "`fn`",
+                };
+                return Err(PErr { pos: t.lo, msg: format!("expected one of {expect}, found keyword `{found}`") });
+            }
+            stage = at;
+            match self.kind() {
+                T::KwConst => konst = true,
+                T::KwAsync => asyncness = true,
+                T::KwUnsafe => unsafe_ = true,
+                T::KwExtern => {
                     self.pos += 1;
                     abi = Some(self.abi());
                     continue;
                 }
+                _ => {}
             }
             self.pos += 1;
         }
@@ -1987,6 +2101,9 @@ impl<'a> Parser<'a> {
             let ty_span = (ty_lo, self.prev_hi());
             let default = if self.eat(T::Eq) { Some(self.expr()?) } else { None };
             v.push(FieldDef { attrs: self.ast.push_list(attrs), vis, name: Some(name), ty, default, ty_span });
+            if self.kind() == T::Comma && self.doc_before() {
+                return self.err("E0585: found a documentation comment that doesn't document anything");
+            }
             if !self.eat(T::Comma) {
                 break;
             }
@@ -2124,6 +2241,9 @@ impl<'a> Parser<'a> {
 
     fn path_seg_name(&mut self) -> PResult<PathSeg> {
         let t = self.tok();
+        if let Some(m) = self.reserved_ident(t) {
+            return Err(PErr { pos: t.lo, msg: m });
+        }
         let kind = match t.kind {
             T::Ident | T::RawIdent => SegKind::Ident,
             T::KwSelfValue => SegKind::SelfValue,
@@ -2885,6 +3005,9 @@ impl<'a> Parser<'a> {
             }
             self.block_stmts_step(&mut stmts)?;
         }
+        if self.doc_before() {
+            return self.err("E0585: found a documentation comment that doesn't document anything");
+        }
         for id in std::mem::take(&mut self.extra_items) {
             stmts.insert(0, Stmt::Item(id));
         }
@@ -2898,6 +3021,9 @@ impl<'a> Parser<'a> {
     }
 
     fn stmt(&mut self) -> PResult<Stmt> {
+        if self.kind() == T::Semi && self.doc_before() {
+            return self.err("E0585: found a documentation comment that doesn't document anything");
+        }
         if self.eat(T::Semi) {
             return Ok(Stmt::Empty);
         }

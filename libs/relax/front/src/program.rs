@@ -3704,7 +3704,7 @@ impl Program {
         }
     }
 
-    fn vis_visible(&self, v: BindVis, to: u32) -> bool {
+    pub fn vis_visible(&self, v: BindVis, to: u32) -> bool {
         match v {
             None => true,
             Some(x) => self.in_module(to, x),

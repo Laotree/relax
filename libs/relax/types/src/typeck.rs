@@ -2434,6 +2434,7 @@ impl<'a> Fcx<'a> {
                                     self.err(fp.name.lo, format!("E0025: field `{}` bound multiple times in the pattern", self.text(fp.name)));
                                 }
                                 mentioned.push(fi);
+                                self.check_field_privacy(adt_ty, vi, fi, fp.name.lo);
                                 self.check_pat(fp.pat, t)
                             }
                             None => {
@@ -3175,6 +3176,28 @@ impl<'a> Fcx<'a> {
 
     /// Resolves a value path. `key`: expr or pat id for recording generic args.
     fn resolve_value_path(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
+        let r = self.resolve_value_path_inner(path, key, is_pat);
+        if let Res::Def(d) = r.0 {
+            self.check_ctor_privacy(d, path.lo);
+        }
+        r
+    }
+
+    /// A tuple struct's constructor is as private as its most private field (rustc_resolve
+    /// build_reduced_graph: ctor visibility; a path to it is E0603, a call E0423).
+    fn check_ctor_privacy(&mut self, d: DefId, pos: u32) {
+        if self.prog.def(d).kind != DefKind::Struct || self.value_ctor_shape(d) != Some(1) {
+            return;
+        }
+        let Some(adt) = self.tcx.adts.get(&d) else { return };
+        let hidden = adt.variants.first().map_or(false, |v| v.fields.iter().any(|f| !self.field_visible(d, f)));
+        if hidden {
+            let msg = format!("E0603: tuple struct constructor `{}` is private", self.prog.name(d));
+            self.err(pos, msg);
+        }
+    }
+
+    fn resolve_value_path_inner(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
         let prog = self.prog;
         // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
         // lifetime arguments (last segment).
@@ -3438,6 +3461,7 @@ impl<'a> Fcx<'a> {
         }
         match self.assemble_inherent_impl_probe(self_ty, name) {
             Some((item, imp)) => {
+                self.check_assoc_privacy(item, path.lo);
                 // impl generic args from matching the impl self type against self_ty
                 let impl_args = self.impl_args_for_value_path(imp, self_ty);
                 let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
@@ -5093,6 +5117,7 @@ impl<'a> Fcx<'a> {
                     match self.field_ty(adt_ty, vi, fname) {
                         Some((fi, ft)) => {
                             given.push(fi);
+                            self.check_field_privacy(adt_ty, vi, fi, fe.name.lo);
                             let t = self.check_expr(fx, Some(ft));
                             self.coerce_or_unify(t, ft, Some(fx), fe.name.lo);
                         }
@@ -5106,6 +5131,17 @@ impl<'a> Fcx<'a> {
                 if let Some(bx) = base {
                     let t = self.check_expr(bx, Some(adt_ty));
                     self.eq(t, adt_ty);
+                    // the fields taken from the base must be visible too (rustc_hir_typeck
+                    // check_expr_struct_fields: private fields of a functional update)
+                    if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                        if let Some(n) = self.tcx.adts.get(&ad).and_then(|a| a.variants.get(vi as usize)).map(|v| v.fields.len()) {
+                            for fi in 0..n as u32 {
+                                if !given.contains(&fi) {
+                                    self.check_field_privacy(adt_ty, vi, fi, lo);
+                                }
+                            }
+                        }
+                    }
                 }
                 if *rest {
                     self.struct_defaults(e, d, adt_ty, vi, &given, lo);
@@ -5596,6 +5632,41 @@ impl<'a> Fcx<'a> {
         self.tcx.tys.error
     }
 
+    /// E0624: an item of an inherent impl is private to the impl's module.
+    fn check_assoc_privacy(&mut self, item: DefId, pos: u32) {
+        let def = self.prog.def(item);
+        if self.prog.def(def.parent).kind != DefKind::Impl {
+            return;
+        }
+        let vis = self.prog.def_item_vis(item);
+        if self.prog.vis_visible(vis, self.module) {
+            return;
+        }
+        let what = match def.kind {
+            DefKind::AssocFn if self.tcx.fn_sig(self.prog, item).map_or(false, |s| s.self_kind != 0) => "method",
+            DefKind::AssocFn => "associated function",
+            DefKind::AssocConst => "associated constant",
+            _ => "associated item",
+        };
+        let msg = format!("E0624: {} `{}` is private", what, self.prog.syms.str(def.name));
+        self.err(pos, msg);
+    }
+
+    /// E0451: a field named in a struct expression or pattern must be visible here.
+    fn check_field_privacy(&mut self, adt_ty: TyId, vi: u32, fi: u32, pos: u32) {
+        let st = self.shallow(adt_ty);
+        let TyKind::Adt(d, _, _) = self.tcx.tys.kind(st).clone() else { return };
+        let Some(adt) = self.tcx.adts.get(&d) else { return };
+        let Some(f) = adt.variants.get(vi as usize).and_then(|v| v.fields.get(fi as usize)) else { return };
+        if adt.is_enum || self.field_visible(d, f) {
+            return;
+        }
+        let what = match self.prog.def(d).kind { DefKind::Union => "union", _ => "struct" };
+        let fname = if f.name & 0x8000_0000 != 0 { (f.name & 0x7fff_ffff).to_string() } else { self.prog.syms.str(f.name).to_string() };
+        let msg = format!("E0451: field `{}` of {} `{}` is private", fname, what, self.prog.name(d));
+        self.err(pos, msg);
+    }
+
     /// Is a field of ADT `d` visible here: `pub`, or we are inside the ADT's module (or below it).
     fn field_visible(&self, d: DefId, f: &crate::tcx::FieldT) -> bool {
         // (`pub` / `pub(in path)`: inside that module only)
@@ -6060,6 +6131,7 @@ impl<'a> Fcx<'a> {
             self.known_method_args = Some(pick.args);
             return self.check_trait_method_call(e, item, imp, self_ty, derefs, turbofish, args, lo, method_expected);
         }
+        self.check_assoc_privacy(item, lo);
         let sig = self.tcx.fn_sig(self.prog, item).cloned().unwrap();
         let indices = self.tcx.generic_indices_of(self.prog, imp);
         let impl_full = pick.args[..indices.types_consts.len() + indices.lifetimes.len()].to_vec();

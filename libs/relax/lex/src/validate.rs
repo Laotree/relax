@@ -54,7 +54,7 @@ pub fn validate(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), VErr> {
             T::ByteStr | T::CStr | T::RawStr => raw(src, lo, hi, t.kind)?,
             T::Char => quoted(src, lo, hi, 0, b'\'', Mode::Char)?,
             T::Byte => quoted(src, lo, hi, 1, b'\'', Mode::Byte)?,
-            T::Int | T::Float => number(src, lo, hi)?,
+            T::Int | T::Float => number(src, lo, hi, t.kind == T::Float)?,
             T::Ident | T::RawIdent => {
                 if src[lo..hi].is_ascii() {
                     // an ASCII identifier directly followed by a quote is a reserved prefix
@@ -68,6 +68,9 @@ pub fn validate(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), VErr> {
                     }
                 } else {
                     ident(src, lo, hi, t.kind == T::RawIdent)?;
+                }
+                if t.kind == T::RawIdent && matches!(&src[lo + 2..hi], b"self" | b"super" | b"crate" | b"Self" | b"_") {
+                    return err(lo, format!("`{}` cannot be a raw identifier", String::from_utf8_lossy(&src[lo + 2..hi])));
                 }
             }
             _ => {}
@@ -113,20 +116,25 @@ fn is_emoji_approx(c: char) -> bool {
         | 0x2139 | 0xFE0F | 0x20E3 | 0xE0020..=0xE007F)
 }
 
-fn number(src: &[u8], lo: usize, hi: usize) -> Result<(), VErr> {
+const NUMBER_SUFFIXES: &[&str] = &["i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f16", "f32", "f64", "f128"];
+
+fn number(src: &[u8], lo: usize, hi: usize, float: bool) -> Result<(), VErr> {
     let b = &src[lo..hi];
+    // the digits of the literal (suffix excluded) and, for an integer, its value
+    let body_end;
+    let mut radix = 10u32;
     if b.len() >= 2 && b[0] == b'0' && matches!(b[1], b'b' | b'o' | b'x') {
-        let base = match b[1] {
+        radix = match b[1] {
             b'b' => 2,
             b'o' => 8,
             _ => 16,
         };
         let mut j = 2;
         let mut digits = 0;
-        while j < b.len() && (b[j] == b'_' || b[j].is_ascii_digit() || (base == 16 && b[j].is_ascii_hexdigit())) {
+        while j < b.len() && (b[j] == b'_' || b[j].is_ascii_digit() || (radix == 16 && b[j].is_ascii_hexdigit())) {
             if b[j] != b'_' {
-                if b[j].is_ascii_digit() && (b[j] - b'0') as u32 >= base {
-                    return err(lo + j, format!("invalid digit for a base {base} literal"));
+                if b[j].is_ascii_digit() && (b[j] - b'0') as u32 >= radix {
+                    return err(lo + j, format!("invalid digit for a base {radix} literal"));
                 }
                 digits += 1;
             }
@@ -135,30 +143,55 @@ fn number(src: &[u8], lo: usize, hi: usize) -> Result<(), VErr> {
         if digits == 0 {
             return err(lo, "E0768: no valid digits found for number");
         }
-        return Ok(());
-    }
-    // decimal: digits, optional fraction and exponent, then the suffix; a suffix that starts
-    // with `e`/`E` is an exponent without digits
-    let mut j = 0;
-    while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'_') {
-        j += 1;
-    }
-    if j < b.len() && b[j] == b'.' {
-        j += 1;
+        body_end = j;
+    } else {
+        // decimal: digits, optional fraction and exponent, then the suffix; a suffix that starts
+        // with `e`/`E` is an exponent without digits
+        let mut j = 0;
         while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'_') {
             j += 1;
         }
+        if j < b.len() && b[j] == b'.' {
+            j += 1;
+            while j < b.len() && (b[j].is_ascii_digit() || b[j] == b'_') {
+                j += 1;
+            }
+        }
+        if j < b.len() && matches!(b[j], b'e' | b'E') {
+            let mut k = j + 1;
+            if k < b.len() && matches!(b[k], b'+' | b'-') {
+                k += 1;
+            }
+            while k < b.len() && b[k] == b'_' {
+                k += 1;
+            }
+            if !(k < b.len() && b[k].is_ascii_digit()) {
+                return err(lo + j, "expected at least one digit in exponent");
+            }
+            while k < b.len() && (b[k].is_ascii_digit() || b[k] == b'_') {
+                k += 1;
+            }
+            j = k;
+        }
+        body_end = j;
     }
-    if j < b.len() && matches!(b[j], b'e' | b'E') {
-        let mut k = j + 1;
-        if k < b.len() && matches!(b[k], b'+' | b'-') {
-            k += 1;
-        }
-        while k < b.len() && b[k] == b'_' {
-            k += 1;
-        }
-        if !(k < b.len() && b[k].is_ascii_digit()) {
-            return err(lo + j, "expected at least one digit in exponent");
+    // (an integer's digits are all the literal holds before the suffix)
+    let suffix = std::str::from_utf8(&b[body_end..]).unwrap_or("?");
+    if !suffix.is_empty() && !NUMBER_SUFFIXES.contains(&suffix) {
+        return err(lo + body_end, format!("invalid suffix `{suffix}` for {} literal", if float { "float" } else { "number" }));
+    }
+    if !float {
+        let digits = if radix == 10 { &b[..body_end] } else { &b[2..body_end] };
+        let mut v: u128 = 0;
+        for &c in digits {
+            if c == b'_' {
+                continue;
+            }
+            let d = (c as char).to_digit(radix).unwrap_or(0) as u128;
+            match v.checked_mul(radix as u128).and_then(|x| x.checked_add(d)) {
+                Some(x) => v = x,
+                None => return err(lo, "integer literal is too large"),
+            }
         }
     }
     Ok(())
@@ -211,6 +244,13 @@ fn quoted(src: &[u8], lo: usize, hi: usize, prefix: usize, q: u8, mode: Mode) ->
         end -= 1;
     }
     let body_hi = end.saturating_sub(1).max(body_lo);
+    if end < hi {
+        let suffix = String::from_utf8_lossy(&src[end..hi]).into_owned();
+        if suffix == "_" {
+            return err(end, "underscore literal suffix is not allowed");
+        }
+        return err(end, format!("suffixes on {} literals are invalid", if mode.is_single() { "char" } else { "string" }));
+    }
     // fast path: nothing to check in plain ASCII text without escapes
     let body = &src[body_lo..body_hi];
     if !mode.is_single() && !body.iter().any(|&c| c == b'\\' || c == b'\r' || c >= 0x80 || c == 0) {

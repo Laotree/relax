@@ -71,6 +71,32 @@ impl Program {
                 DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::TypeAlias => {
                     self.body_required(ast, &mut err, it, None);
                 }
+                // an `extern` block's items (rustc_ast_passes check_foreign_item_*)
+                DefKind::ForeignFn => {
+                    if let ItemKind::Fn(sig, ..) = it.kind {
+                        let sig = ast.fn_sig(sig);
+                        if sig.konst {
+                            err(it.lo, "functions in `extern` blocks cannot have `const` qualifier".into());
+                        }
+                        if sig.asyncness {
+                            err(it.lo, "functions in `extern` blocks cannot have `async` qualifier".into());
+                        }
+                    }
+                }
+                DefKind::ForeignStatic => {
+                    if let ItemKind::Static(_, _, e) = it.kind {
+                        if e.get().is_some() {
+                            err(it.lo, "incorrect `static` inside `extern` block".into());
+                        }
+                    }
+                }
+                DefKind::ForeignTy => {
+                    if let ItemKind::TypeAlias(r) = it.kind {
+                        if ast.row(r).ty.is_some() {
+                            err(it.lo, "incorrect `type` inside `extern` block".into());
+                        }
+                    }
+                }
                 _ => {}
             }
         }

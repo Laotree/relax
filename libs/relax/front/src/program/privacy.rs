@@ -210,7 +210,7 @@ impl Program {
     }
 
     /// The visibility of an item definition as written (None: `pub`).
-    fn def_item_vis(&self, d: DefId) -> BindVis {
+    pub fn def_item_vis(&self, d: DefId) -> BindVis {
         let def = self.def(d);
         if def.item.0 != u32::MAX {
             if let Some(it) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)) {
