@@ -476,7 +476,8 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
     if n >= 3 && &src[0..3] == b"\xEF\xBB\xBF" {
         i = 3;
     }
-    // shebang (not an inner attribute)
+    // shebang (rustc_lexer::strip_shebang: `#!` unless the next token past whitespace and plain
+    // comments is `[`)
     if (!RX || i == 0) && n >= i + 2 && src[i] == b'#' && src[i + 1] == b'!' {
         let mut j = i + 2;
         while !RX && j < n && (src[j] == b' ' || src[j] == b'\t') {
@@ -501,9 +502,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
         }
         if j >= n || src[j] != b'[' {
             let lo = i;
-            while i < n && src[i] != b'\n' {
-                i += 1;
-            }
+            i = end.min(n);
             if TRIVIA {
                 out.push(Tok { kind: T::Comment, lo: lo as u32, hi: i as u32 });
             }
@@ -606,6 +605,10 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                             j += 2;
                         }
                         j = ident_run_end(src, j);
+                        // rustc_lexer `UnknownPrefixLifetime`: `'foo#` (an error from edition 2021)
+                        if VALIDATE && edition >= 2021 && j < n && src[j] == b'#' {
+                            return Err(err(lo, "prefix is unknown"));
+                        }
                         i = j;
                         T::Lifetime
                     } else {

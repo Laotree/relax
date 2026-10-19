@@ -42,3 +42,24 @@ fn bad_escapes_and_digits_are_errors() {
     assert!(err("let a = f\"x\";", 2021).unwrap().contains("prefix `f` is unknown"));
     assert_eq!(err("let a = f\"x\";", 2018), None);
 }
+
+#[test]
+fn literals_in_macro_token_trees_are_not_cooked_by_the_parser_checks() {
+    // rustc judges a literal's suffix and size when the parser consumes it, never inside a macro
+    // invocation's tokens (Splash colours: `#1a1b26`); the lexer's own errors still apply there
+    for s in ["m!{ x: #1a1b26 }", "m!(1x, \"a\"b, 'c'd, 340282366920938463463374607431768211456)", "macro_rules! m { () => { 1x } }", "#[a(1x)] fn f() {}"] {
+        assert_eq!(err(s, 2021), None, "{s}");
+    }
+    assert!(err("let a = 1x;", 2021).unwrap().contains("invalid suffix"));
+    assert!(err("m!{ 0b102 }", 2021).unwrap().contains("invalid digit for a base 2 literal"));
+    assert!(err("m!{ \"\\q\" }", 2021).unwrap().contains("unknown character escape"));
+}
+
+#[test]
+fn shebang_is_a_line_unless_an_attribute_follows() {
+    use relax_lex::validate::shebang_len;
+    assert_eq!(shebang_len(b"#!/bin/sh\nfn main(){}"), Some(9));
+    assert_eq!(shebang_len(b"#!\n[allow(x)]"), None);
+    assert_eq!(shebang_len(b"#!//c\n[allow(x)]"), None);
+    assert_eq!(shebang_len(b"#![allow(x)]"), None);
+}
