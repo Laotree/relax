@@ -43,12 +43,14 @@ struct Fake<'t> {
     pushed: Vec<Locations>,
     /// The declaration's implied bounds (`RegionDriverOps::implied_bounds`) and what was installed.
     implied: super::implied_bounds::ImpliedBounds,
+    /// The declared field types of whatever ADT/closure is projected or aggregated.
+    fields: Vec<TyId>,
     installed: Option<(UniversalRegions, Vec<(TyId, RegionId)>)>,
 }
 impl<'t> Fake<'t> {
     fn new(tcx: &'t Tcx, first_var: usize) -> Self {
         Self { tcx, universe: UniverseIndex::ROOT, regions: vec![(Origin::Existential, UniverseIndex::ROOT); first_var],
-            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), installed: None }
+            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), fields: vec![], installed: None }
     }
 }
 impl liveness::LivenessOps for Fake<'_> {
@@ -120,8 +122,10 @@ impl BorrowckTypeOps for Fake<'_> {
     fn user_type_annotation(&self, id: UserTypeId) -> (Span, TyId) { self.annotations[id.0 as usize] }
     fn closure_user_provided_sig(&mut self, _: &Body) -> Option<FnSig> { self.closure_sig.clone() }
     fn fn_def_sig(&self, _: DefId, _: &[TyId], _: RegionArgsId) -> PolyFnSig { self.fn_sig.clone().unwrap() }
-    fn field_ty(&self, _: PlaceTy, _: FieldIdx) -> Option<TyId> { None }
-    fn aggregate_field_ty(&mut self, _: &mut MirTypeckRegionConstraints, _: &AggregateKind, _: FieldIdx, _: Location) -> Result<TyId, usize> { Err(0) }
+    fn field_ty(&self, _: PlaceTy, f: FieldIdx) -> Option<TyId> { self.fields.get(f.0 as usize).copied() }
+    fn aggregate_field_ty(&mut self, _: &mut MirTypeckRegionConstraints, _: &AggregateKind, f: FieldIdx, _: Location) -> Result<TyId, usize> {
+        self.fields.get(f.0 as usize).copied().ok_or(self.fields.len())
+    }
     fn rvalue_query_ty(&self, _: &Body, _: &Rvalue) -> TyId { self.query_ty.unwrap() }
     fn unevaluated_const_ty(&self, _: DefId, _: &[GenericArg]) -> TyId { self.const_ty.unwrap() }
     fn static_ptr(&self, _: &ConstOperand) -> Option<DefId> { None }
@@ -745,6 +749,67 @@ fn deferred_locals_wait_for_loans_and_register_constraints_eagerly() {
     let _ = t;
 }
 
+// --- C-NLL5 §6 witnesses ---
+#[test]
+fn unique_and_mutable_captured_references_stay_invariant() {
+    // A closure capturing `&'1 mut &'3 i32` by move into a field `&'2 mut &'4 i32`: the
+    // referent is invariant (unique-borrows-are-invariant); a shared capture is covariant.
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let id = ClosureId { file: 7, expr: 3 };
+    let closure = tcx.tys.intern(TyKind::Closure(7, 3, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8),
+        closure_sig_as_fn_ptr_ty: fn_ptr(&tcx, vec![], tcx.tys.unit, 0), tupled_upvars_ty: tcx.tys.unit }));
+    for (mutable, expected) in [(true, vec![(1, 2), (3, 4), (4, 3)]), (false, vec![(1, 2), (3, 4)])] {
+        let capture = |a, b| rf(&tcx, re(&tcx, a), rf(&tcx, re(&tcx, b), t, false), mutable);
+        let b = body(&[tcx.tys.unit, capture(1, 3), closure], vec![block(vec![assign(2, Rvalue::Aggregate(Box::new(AggregateKind::Closure(id, vec![])), vec![Operand::Move(p(1))]))], TerminatorKind::Return)]);
+        let mut fake = Fake::new(&tcx, 5);
+        fake.query_ty = Some(closure); fake.fields = vec![capture(2, 4)];
+        let r = check(&tcx, &mut fake, &b); clean(&r);
+        let mut e: Vec<_> = edges(&r).into_iter().map(|e| (e.0, e.1)).collect(); e.sort();
+        assert_eq!(e, expected, "mutable={mutable}");
+    }
+}
+
+#[test]
+fn dead_annotations_are_still_ascribed_and_projections_follow_fields() {
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    // Two annotations; nothing refers to the first (written in dead code), the second is
+    // projected through field 0 of the annotated pair `(&'4 i32, i32)`.
+    let (dead, live) = (rf(&tcx, re(&tcx, 3), t, false), tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[rf(&tcx, re(&tcx, 4), t, false), t]))));
+    let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false)], vec![block(vec![StatementKind::AscribeUserType(p(2),
+        UserTypeProjection { base: UserTypeAnnotationIndex(1), projection: vec![PlaceElem::Field(FieldIdx(0), rf(&tcx, re(&tcx, 4), t, false))] }, Variance::Covariant)], TerminatorKind::Return)]);
+    b.user_type_annotations = vec![UserTypeId(0), UserTypeId(1)];
+    let mut fake = Fake::new(&tcx, 5);
+    fake.annotations = vec![(span(40), dead), (span(41), live)];
+    fake.fields = vec![rf(&tcx, re(&tcx, 4), t, false), t];
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    assert_eq!(fake.ops[..2], [Op::Ascribe(dead, UserType::Annotation(UserTypeId(0)), span(40)), Op::Ascribe(live, UserType::Annotation(UserTypeId(1)), span(41))]);
+    // `_2 <: field 0` of the live annotation: '2: '4 at the statement span, everywhere.
+    let asc = Cat::TypeAnnotation(AnnotationSource::Ascription);
+    let all: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category != Cat::BoringNoLocation).map(|c| (c.sup, c.sub, c.location, c.category)).collect();
+    assert_eq!(all, [(2, 4, None, asc)]);
+}
+
+#[test]
+fn promoted_uses_at_two_parent_locations_get_their_own_points() {
+    let tcx = Tcx::new(); let t = tcx.tys.i32_;
+    let promoted_ty = rf(&tcx, re(&tcx, 5), t, false);
+    let mut promoted = body(&[promoted_ty, t, rf(&tcx, re(&tcx, 6), t, false)], vec![block(vec![StatementKind::Nop], TerminatorKind::Return)]);
+    promoted.arg_count = 0; promoted.source.kind = BodyKind::Promoted(DefId(0), PromotedId(0));
+    promoted.basic_blocks[0].statements = vec![Statement { kind: assign(0, copy(2)), source_info: SourceInfo { span: span(7), ..SourceInfo::default() } }];
+    let uses = || Operand::Constant(Box::new(ConstOperand { span: span(30), user_ty: None, const_: Const::Unevaluated { def: DefId(0), args: vec![], promoted: Some(PromotedId(0)) } }));
+    let mut b = body(&[tcx.tys.unit, t, rf(&tcx, re(&tcx, 2), t, false), rf(&tcx, re(&tcx, 3), t, false)],
+        vec![block(vec![assign(2, Rvalue::Use(uses())), assign(3, Rvalue::Use(uses()))], TerminatorKind::Return)]);
+    b.promoted = vec![promoted];
+    let mut fake = Fake::new(&tcx, 7);
+    let r = check(&tcx, &mut fake, &b); clean(&r);
+    let at_point = |c: &OutlivesConstraint| (c.sup, c.sub, c.location);
+    let cs: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.span == span(7)).map(at_point).collect();
+    // The promoted body is checked once per use, its constraints moved to that use's point.
+    assert_eq!(cs.iter().map(|c| c.2).collect::<Vec<_>>(), [Some(0), Some(1)], "{cs:?}");
+    // And the region the promoted's type mentions is live at both uses.
+    assert_eq!(live_points(&r, 5), [0, 1]);
+}
+
 // --- the driver: signature -> universals -> renumber -> type_check -> solved regions ---
 mod driver {
     use super::*;
@@ -755,17 +820,23 @@ mod driver {
     /// `fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32`, returning local `ret` (1 = x, 2 = y).
     /// Every region in the body is erased, as the builder emits it.
     fn solve(src: &str, ret: u32, outlives: &[(&str, &str)]) -> (super::super::check::MirBorrowckResult, MirTypeckSummary2) {
+        let _ = outlives;
+        solve_with(src, |tcx| {
+            let erased = rf(tcx, RegionId::ERASED, tcx.tys.i32_, false);
+            (vec![erased, erased, erased], 2, vec![assign(0, copy(ret))])
+        })
+    }
+    /// The body of `f`: its local types (return place first), argument count and statements.
+    fn solve_with(src: &str, build: impl FnOnce(&Tcx) -> (Vec<TyId>, usize, Vec<StatementKind>)) -> (super::super::check::MirBorrowckResult, MirTypeckSummary2) {
         let (prog, tcx) = collect(src);
         let f = named(&prog, "f");
         let sig = SignatureRegions::function(&tcx, &prog, f).unwrap();
-        let t = tcx.tys.i32_;
-        let erased = rf(&tcx, RegionId::ERASED, t, false);
-        let mut b = body(&[erased, erased, erased], vec![block(vec![assign(0, copy(ret))], TerminatorKind::Return)]);
-        b.arg_count = 2;
+        let (tys, arg_count, stmts) = build(&tcx);
+        let mut b = body(&tys, vec![block(stmts, TerminatorKind::Return)]);
+        b.arg_count = arg_count as u32;
         b.source.owner = f;
         let moves = MoveData::gather_moves(&b, &prog, &tcx, crate::tcx::TypingEnv::fully_monomorphized(&prog), &|_| true);
         let mut fake = Fake::new(&tcx, 0);
-        let _ = outlives;
         // The declaration's implied bounds, from the real query.
         let raw: Vec<TyId> = sig.inputs.iter().copied().chain([sig.output]).collect();
         let (mut bounds, _) = crate::borrowck::implied_bounds::mir_borrowck_implied_outlives_bounds(&tcx, &prog, f, crate::tcx::TypingMode::non_body_analysis(),
@@ -790,6 +861,27 @@ mod driver {
         let (r, s) = solve("fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32 { y }", 2, &[]);
         assert_eq!(s.bugs, 0);
         assert_eq!(r.region_errors.len(), 1, "{r:?}");
+    }
+
+    /// `fn f(x: fn(&'static i32)) -> for<'x> fn(&'x i32)` returning its argument: the
+    /// placeholder of the return type's binder would have to outlive 'static.
+    fn higher_ranked(src: &str, arg_hr: bool) -> super::super::check::MirBorrowckResult {
+        solve_with(src, |tcx| {
+            let t = tcx.tys.i32_;
+            let hr = fn_ptr(tcx, vec![rf(tcx, bound(tcx, 0), t, false)], tcx.tys.unit, 1);
+            let mono = fn_ptr(tcx, vec![rf(tcx, RegionId::ERASED, t, false)], tcx.tys.unit, 0);
+            let (arg, ret) = if arg_hr { (hr, mono) } else { (mono, hr) };
+            (vec![ret, arg], 1, vec![assign(0, Rvalue::Use(Operand::Move(p(1))))])
+        }).0
+    }
+    #[test]
+    fn a_higher_ranked_function_pointer_is_not_a_monomorphic_one_in_disguise() {
+        // for<'x> fn(&'x i32) <: fn(&'static i32): fine, the binder is instantiated with 'static.
+        let r = higher_ranked("fn f(x: for<'x> fn(&'x i32)) -> fn(&'static i32) { x }", true);
+        assert!(r.accepted(), "{r:?}");
+        // fn(&'static i32) <: for<'x> fn(&'x i32): the placeholder must outlive 'static -- a leak.
+        let r = higher_ranked("fn f(x: fn(&'static i32)) -> for<'x> fn(&'x i32) { x }", false);
+        assert!(matches!(r.region_errors[..], [crate::borrowck::region_infer::RegionErrorKind::PlaceholderOutlivesIllegalRegion { longer_fr: 3, illegally_outlived_r: 0 }]), "{r:?}");
     }
 
     #[test]
