@@ -254,6 +254,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `..` may appear once in a tuple / tuple struct / slice pattern (rustc_ast_passes
+    /// check_pat: "`..` can only be used once per ... pattern").
+    fn check_single_rest(&self, v: &[PatId], what: &str) -> PResult<()> {
+        let rests = v.iter().filter(|p| match self.ast.pat(**p) {
+            Pat::Rest => true,
+            Pat::Ident { sub: Some(s), .. } => matches!(self.ast.pat(*s), Pat::Rest),
+            _ => false,
+        }).count();
+        if rests > 1 {
+            return self.err(&format!("`..` can only be used once per {what} pattern"));
+        }
+        Ok(())
+    }
+
     fn ident_tok(&mut self) -> PResult<Ident> {
         match self.kind() {
             T::Ident | T::RawIdent => {
@@ -736,9 +750,132 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
+            self.check_attr_shape(toks)?;
             v.push(Attr { inner: false, toks });
         }
         Ok(self.expand_cfg_attrs(v))
+    }
+
+    /// The shape of `cfg`, `cfg_attr` and `derive` attributes (rustc_attr_parsing cfg.rs
+    /// `parse_cfg_entry`, `parse_cfg_attr`): a cfg predicate is `name`, `name = "str"`,
+    /// `all(..)`, `any(..)`, `not(..)` or a boolean.
+    fn check_attr_shape(&self, toks: TokRange) -> PResult<()> {
+        let (lo, hi) = (toks.lo as usize, toks.hi as usize);
+        if hi <= lo || hi > self.toks.len() || self.toks.at(lo).kind != T::Ident {
+            return Ok(());
+        }
+        let name = self.tok_text(self.toks.at(lo));
+        let which = match name {
+            b"cfg" => 0,
+            b"cfg_attr" => 1,
+            b"derive" => 2,
+            _ => return Ok(()),
+        };
+        let bad = |this: &Self, at: usize, what: &str| -> PResult<()> {
+            Err(PErr { pos: this.toks.at(at.min(hi - 1)).lo, msg: format!("E0539: malformed `{}` attribute input -- {}", String::from_utf8_lossy(this.tok_text(this.toks.at(lo))), what) })
+        };
+        let kind = |i: usize| if i < hi { self.toks.at(i).kind } else { T::Eof };
+        if kind(lo + 1) != T::OpenParen {
+            return bad(self, lo, "expected this to be a list");
+        }
+        let close = hi - 1;
+        if self.toks.at(close).kind != T::CloseParen {
+            return Ok(());
+        }
+        if which == 2 {
+            return Ok(());
+        }
+        let mut i = lo + 2;
+        if i >= close {
+            return bad(self, lo, "expected an argument here");
+        }
+        self.cfg_entry(&mut i, close).or_else(|m| bad(self, i, &m))?;
+        if which == 0 {
+            if kind(i) == T::Comma && i + 1 < close || (kind(i) == T::Comma && i + 1 == close && false) {
+                return bad(self, i, "expected a single argument here");
+            }
+            if i < close && !(kind(i) == T::Comma && i + 1 == close) {
+                return bad(self, i, "expected a single argument here");
+            }
+            return Ok(());
+        }
+        // cfg_attr: `pred , attr (, attr)* ,?`
+        if kind(i) != T::Comma {
+            return Err(PErr { pos: self.toks.at(i.min(hi - 1)).lo, msg: "expected `,`, found end of `cfg_attr`".into() });
+        }
+        i += 1;
+        while i < close {
+            // an attribute: an identifier path (or `unsafe(..)`), then its arguments
+            if !matches!(kind(i), T::Ident | T::RawIdent | T::KwUnsafe | T::PathSep) {
+                return Err(PErr { pos: self.toks.at(i).lo, msg: "expected identifier".into() });
+            }
+            let mut depth = 0;
+            while i < close {
+                match kind(i) {
+                    T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                    T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
+                    T::Comma if depth == 0 => break,
+                    _ => {}
+                }
+                i += 1;
+            }
+            if kind(i) == T::Comma {
+                i += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// One cfg predicate at `*i` (bounded by `end`); Err is the note.
+    fn cfg_entry(&self, i: &mut usize, end: usize) -> Result<(), String> {
+        let k = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+        match k {
+            T::KwTrue | T::KwFalse => {
+                *i += 1;
+                Ok(())
+            }
+            T::Ident | T::RawIdent => {
+                let name = self.tok_text(self.toks.at(*i)).to_vec();
+                *i += 1;
+                let next = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+                match next {
+                    T::PathSep => Err("expected a valid identifier here".into()),
+                    T::Eq => {
+                        *i += 1;
+                        if *i < end && matches!(self.toks.at(*i).kind, T::Str | T::RawStr) {
+                            *i += 1;
+                            Ok(())
+                        } else {
+                            Err("expected a string literal here".into())
+                        }
+                    }
+                    T::OpenParen if matches!(name.as_slice(), b"all" | b"any" | b"not") => {
+                        *i += 1;
+                        let mut n = 0;
+                        while *i < end && self.toks.at(*i).kind != T::CloseParen {
+                            self.cfg_entry(i, end)?;
+                            n += 1;
+                            if *i < end && self.toks.at(*i).kind == T::Comma {
+                                *i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if *i >= end || self.toks.at(*i).kind != T::CloseParen {
+                            return Err("expected `)`".into());
+                        }
+                        *i += 1;
+                        if name.as_slice() == b"not" && n != 1 {
+                            return Err("expected a single argument here".into());
+                        }
+                        Ok(())
+                    }
+                    T::OpenParen => Err("invalid predicate".into()),
+                    _ => Ok(()),
+                }
+            }
+            _ => Err("expected a valid identifier here".into()),
+        }
     }
 
     /// Raw identifiers in an attribute are its plain names (`#[r#repr(r#C, r#packed)]` is
@@ -756,6 +893,7 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
+            self.check_attr_shape(toks)?;
             new.push(Attr { inner: true, toks });
         }
         v.extend(self.expand_cfg_attrs(new));
@@ -2852,6 +2990,7 @@ impl<'a> Parser<'a> {
                     trailing = true;
                 }
                 self.expect(T::CloseParen)?;
+                self.check_single_rest(&v, "tuple")?;
                 if v.len() == 1 && !trailing {
                     Pat::Paren(v[0])
                 } else {
@@ -2868,6 +3007,7 @@ impl<'a> Parser<'a> {
                     }
                 }
                 self.expect(T::CloseBracket)?;
+                self.check_single_rest(&v, "slice")?;
                 Pat::Slice(self.ast.push_list(v))
             }
             T::KwRef | T::KwMut => {
@@ -2926,6 +3066,7 @@ impl<'a> Parser<'a> {
                                     }
                                 }
                                 self.expect(T::CloseParen)?;
+                                self.check_single_rest(&v, "tuple struct")?;
                                 Pat::TupleStruct(path, self.ast.push_list(v))
                             }
                             T::OpenBrace => self.struct_pat(path)?,
@@ -3167,6 +3308,9 @@ impl<'a> Parser<'a> {
         let lhs = if matches!(self.kind(), T::DotDot | T::DotDotEq) {
             let incl = self.bump().kind == T::DotDotEq;
             let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
+            if incl && rhs.is_none() {
+                return self.err("E0586: inclusive range with no end");
+            }
             self.mk_expr(ExprKind::Range(OptExprId::NONE, OptExprId::from(rhs), incl), lo)
         } else {
             self.unary(r)?
@@ -3214,6 +3358,10 @@ impl<'a> Parser<'a> {
             if prec < min {
                 break;
             }
+            // a `let` in a condition chains with `&&` only
+            if prec == P_OROR && self.has_let_chain(lhs) {
+                return self.err("`||` operators are not supported in let chain conditions");
+            }
             self.pos += 1;
             if prec == P_ASSIGN {
                 let rhs = self.expr_bp(P_ASSIGN, r)?;
@@ -3223,7 +3371,15 @@ impl<'a> Parser<'a> {
                 };
             } else if prec == P_RANGE {
                 let incl = k == T::DotDotEq;
+                // ranges do not chain (`1..2..3`)
+                if matches!(self.ast.expr(lhs).kind, ExprKind::Range(..)) {
+                    self.pos -= 1;
+                    return self.err("expected one of `.`, `;`, `?`, `else`, or an operator, found `..`");
+                }
                 let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
+                if incl && rhs.is_none() {
+                    return self.err("E0586: inclusive range with no end");
+                }
                 lhs = self.mk_expr(ExprKind::Range(OptExprId::from(Some(lhs)), OptExprId::from(rhs), incl), lo);
             } else if prec == P_AS {
                 let ty = self.ty()?;
@@ -3234,6 +3390,14 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(lhs)
+    }
+
+    fn has_let_chain(&self, e: ExprId) -> bool {
+        match self.ast.expr(e).kind {
+            ExprKind::Let(..) => true,
+            ExprKind::Binary(BinOp::And, a, b) => self.has_let_chain(a) || self.has_let_chain(b),
+            _ => false,
+        }
     }
 
     fn unary(&mut self, r: u8) -> PResult<ExprId> {

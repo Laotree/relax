@@ -2812,6 +2812,10 @@ impl Program {
                 self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub, done: false, file, pos, ext: false, bound: 0 });
             }
             UseTree::Group(v) => {
+                // `use a::b::{};` imports nothing, but its prefix is resolved (and privacy-checked)
+                if v.is_empty() && !prefix.is_empty() {
+                    self.imports.push(Import { module, global, segs: prefix.clone(), bind: None, glob: true, is_pub: false, done: false, file, pos, ext: false, bound: 8 });
+                }
                 for x in self.files[file as usize].ast.list(*v).to_vec() {
                     self.flatten_use(file, module, global, &x, prefix, is_pub, pos);
                 }
@@ -3485,6 +3489,10 @@ impl Program {
             // a proc-macro crate exports only macros: a glob over it brings in no items
             let tk = self.def(target).krate;
             if tk != my_crate && self.crates[tk as usize].proc_macro {
+                return true;
+            }
+            // (a prefix of an empty group: resolved, binds nothing)
+            if self.imports[i].bound & 8 != 0 {
                 return true;
             }
             let is_pub = self.imports[i].is_pub;

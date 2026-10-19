@@ -12,6 +12,12 @@ impl Program {
     /// E0433 / "cannot find attribute" for the attributes of the own crates' files.
     pub fn attribute_errors(&self, own: &[bool]) -> Vec<String> {
         let mut out = Vec::new();
+        let mut by_file: Vec<Vec<DefId>> = vec![Vec::new(); self.files.len()];
+        for (i, d) in self.defs.iter().enumerate() {
+            if own.get(d.krate as usize).copied().unwrap_or(false) && (d.file as usize) < by_file.len() {
+                by_file[d.file as usize].push(DefId(i as u32));
+            }
+        }
         for (fi, f) in self.files.iter().enumerate() {
             let krate = self.file_crate.get(fi).copied().unwrap_or(u32::MAX);
             if !own.get(krate as usize).copied().unwrap_or(false) || f.token_input || fi == 0 {
@@ -22,11 +28,40 @@ impl Program {
                 None => continue,
             };
             let text = |i: u32| f.tok_text(i).trim_start_matches("r#");
-            let ranges: Vec<Attr> = f.ast.root_attrs.iter().chain(f.ast.attrs.iter()).copied().collect();
+            // the attributes of the file and of the definitions it holds (cfg-stripped items own
+            // none: they define nothing)
+            let mut ranges: Vec<Attr> = f.ast.root_attrs.iter().copied().collect();
+            let n_root = ranges.len();
+            for &d in &by_file[fi] {
+                let def = self.def(d);
+                if def.item.0 == u32::MAX || self.item_defs.get(&(def.file, def.item.0)) != Some(&d) {
+                    continue;
+                }
+                let it = f.ast.item(def.item);
+                ranges.extend_from_slice(f.ast.list(it.attrs));
+                let fields = |data: VariantData, out: &mut Vec<Attr>| {
+                    if let VariantData::Tuple(l) | VariantData::Struct(l) = data {
+                        for fd in f.ast.list(l) {
+                            out.extend_from_slice(f.ast.list(fd.attrs));
+                        }
+                    }
+                };
+                if let Some(st) = f.ast.as_struct(&it.kind) {
+                    fields(st.data, &mut ranges);
+                } else if let Some(u) = f.ast.as_union(&it.kind) {
+                    fields(VariantData::Struct(u.fields), &mut ranges);
+                } else if let Some(e) = f.ast.as_enum(&it.kind) {
+                    for v in f.ast.list(e.variants) {
+                        ranges.extend_from_slice(f.ast.list(v.attrs));
+                        fields(v.data, &mut ranges);
+                    }
+                }
+            }
             // registered tools; derive helpers of non-std derives are not tracked: such a file
             // keeps its inert attributes
             let mut tools: Vec<&str> = Vec::new();
             let mut helpers = false;
+            let mut std_helpers: Vec<&str> = Vec::new();
             for a in &ranges {
                 let (lo, hi) = (a.toks.lo, a.toks.hi);
                 if hi <= lo || hi as usize > f.toks.len() {
@@ -42,6 +77,9 @@ impl Program {
                     }
                     "derive" => {
                         for i in lo + 1..hi {
+                            if f.tok(i).kind == T::Ident && text(i) == "Default" {
+                                std_helpers.push("default");
+                            }
                             if f.tok(i).kind == T::Ident && !STD_DERIVES.contains(&text(i)) && f.tok(i + 1).kind != T::PathSep {
                                 // (`std::fmt::Debug` and the like name their last segment)
                                 if f.tok(i.wrapping_sub(1)).kind != T::PathSep || !matches!(text(i), "Debug") {
@@ -56,7 +94,7 @@ impl Program {
             if helpers {
                 continue;
             }
-            for a in &ranges {
+            for (ai, a) in ranges.iter().enumerate() {
                 let (lo, hi) = (a.toks.lo, a.toks.hi);
                 if hi <= lo || hi as usize > f.toks.len() {
                     continue;
@@ -86,10 +124,28 @@ impl Program {
                     continue;
                 }
                 let pos = f.tok(first_i).lo;
+                // the attribute's shape (rustc_attr_parsing): `name` alone, or `name = "string"`
+                if segs.len() == 1 && !global {
+                    let wrapped = first_i != lo;
+                    let end = if wrapped { hi - 1 } else { hi };
+                    if let Some(m) = attr_shape_error(f, segs[0], i, end) {
+                        out.push(self.record_error(fi as u32, pos, "parse", m));
+                    }
+                }
+                // `#[name = value]`: the value is a literal (a macro call only where it expands)
+                if f.tok(i).kind == T::Eq {
+                    if let Some(m) = attr_value_error(f, i + 1, hi, ai < n_root && matches!(segs[0], "crate_name" | "crate_type")) {
+                        out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", m));
+                    }
+                } else if matches!(f.tok(i).kind, T::OpenParen) && is_builtin_attr(segs[0]) && segs.len() == 1 && !matches!(segs[0], "cfg_attr" | "derive" | "macro_use" | "test" | "bench" | "rustc_on_unimplemented" | "link") {
+                    if let Some(m) = attr_list_error(f, i + 1, hi) {
+                        out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", m));
+                    }
+                }
                 let tool = |n: &str| BUILTIN_TOOLS.contains(&n) || tools.contains(&n);
                 let msg = if segs.len() == 1 && !global {
                     let n = segs[0];
-                    if is_builtin_attr(n) || crate::macro_reg::has_attr(n) {
+                    if is_builtin_attr(n) || std_helpers.contains(&n) || crate::macro_reg::has_attr(n) {
                         continue;
                     }
                     format!("cannot find attribute `{n}` in this scope")
@@ -140,4 +196,110 @@ impl Program {
         }
         out
     }
+}
+
+fn is_lit_tok(k: T) -> bool {
+    matches!(k, T::Int | T::Float | T::Str | T::ByteStr | T::CStr | T::RawStr | T::Char | T::Byte | T::KwTrue | T::KwFalse)
+}
+
+/// The value tokens `[lo, hi)` of `#[name = value]`: one literal (or `-` and a number), or a macro
+/// call outside the crate's inner attributes (it expands to the literal).
+fn attr_value_error(f: &ParsedFile, lo: u32, hi: u32, crate_level: bool) -> Option<String> {
+    let n = hi.saturating_sub(lo);
+    if n == 0 {
+        return None;
+    }
+    if n == 1 && is_lit_tok(f.tok(lo).kind) {
+        return None;
+    }
+    if n == 2 && f.tok(lo).kind == T::Minus && matches!(f.tok(lo + 1).kind, T::Int | T::Float) {
+        return None;
+    }
+    if !crate_level {
+        // path `!` group
+        let mut i = lo;
+        while i < hi && matches!(f.tok(i).kind, T::Ident | T::RawIdent | T::PathSep | T::KwCrate | T::KwSelfValue | T::KwSuper) {
+            i += 1;
+        }
+        if i > lo && i + 1 < hi && f.tok(i).kind == T::Not && matches!(f.tok(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(f.tok(hi - 1).kind, T::CloseParen | T::CloseBracket | T::CloseBrace) {
+            return None;
+        }
+    }
+    Some("attribute value must be a literal".to_string())
+}
+
+/// The entries of a builtin attribute's `( .. )` list at tokens `[lo, hi)` (the closing `)` is
+/// the last): `name = value` entries hold a literal (rustc_attr_parsing ArgParser).
+fn attr_list_error(f: &ParsedFile, lo: u32, hi: u32) -> Option<String> {
+    let end = hi.saturating_sub(1); // the `)`
+    let mut depth = 0u32;
+    let mut entry = lo;
+    let mut i = lo;
+    while i <= end {
+        let k = if i == end { T::Comma } else { f.tok(i).kind };
+        match k {
+            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+            T::CloseParen | T::CloseBracket | T::CloseBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if k == T::Comma && depth == 0 {
+            // the entry [entry, i): `path = value`
+            let mut j = entry;
+            while j < i && matches!(f.tok(j).kind, T::Ident | T::RawIdent | T::PathSep) {
+                j += 1;
+            }
+            if j > entry && j < i && f.tok(j).kind == T::Eq {
+                let v = j + 1;
+                if i > v && !(i - v == 1 && is_lit_tok(f.tok(v).kind)) {
+                    let found = if f.tok(v).kind == T::Ident && i > v + 1 && f.tok(v + 1).kind == T::Not { "macro call" } else { "expression" };
+                    return Some(format!("expected a literal (`1u8`, `1.0f32`, `\"string\"`, etc.) here, found {found}"));
+                }
+            }
+            entry = i + 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Attributes that take no arguments.
+const WORD_ATTRS: &[&str] = &[
+    "cold", "no_mangle", "track_caller", "non_exhaustive", "no_std", "no_main", "no_implicit_prelude",
+    "automatically_derived", "no_link", "no_core", "thread_local", "ffi_pure", "ffi_const", "no_builtins",
+];
+/// Attributes that take a string: `#[name = "value"]`.
+const NAME_VALUE_STR_ATTRS: &[&str] = &[
+    "crate_name", "crate_type", "recursion_limit", "type_length_limit", "windows_subsystem", "link_section",
+    "export_name", "link_name",
+];
+
+/// The tokens `[i, end)` after the path of `#[name ..]` against the attribute's template.
+fn attr_shape_error(f: &ParsedFile, name: &str, i: u32, end: u32) -> Option<String> {
+    if WORD_ATTRS.contains(&name) {
+        if i < end {
+            return Some(format!("E0565: malformed `{name}` attribute input"));
+        }
+        return None;
+    }
+    if NAME_VALUE_STR_ATTRS.contains(&name) {
+        let malformed = || Some(format!("E0539: malformed `{name}` attribute input"));
+        if !(i + 2 == end && f.tok(i).kind == T::Eq) {
+            // `name = macro!(..)` is the literal check's business
+            if i < end && f.tok(i).kind == T::Eq {
+                return None;
+            }
+            return malformed();
+        }
+        let v = f.tok(i + 1);
+        if !matches!(v.kind, T::Str | T::RawStr) {
+            return malformed();
+        }
+        if name == "windows_subsystem" {
+            let t = f.tok_text(i + 1);
+            if t != "\"console\"" && t != "\"windows\"" {
+                return Some(format!("invalid windows subsystem {t}, only `windows` and `console` are allowed"));
+            }
+        }
+    }
+    None
 }

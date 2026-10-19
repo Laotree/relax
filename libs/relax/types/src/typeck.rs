@@ -2056,9 +2056,14 @@ impl<'a> Fcx<'a> {
     fn pat_bindings(&mut self, p: PatId, report: bool) -> Vec<(Sym, u32)> {
         let ast = self.ast();
         let mut out: Vec<(Sym, u32)> = Vec::new();
+        // (names written by different macro expansions are different bindings)
+        let same = |this: &Self, a: (Sym, u32), b: (Sym, u32)| a.0 == b.0 && {
+            let pf = &this.prog.files[this.file as usize];
+            pf.hyg_ctxt(a.1) == pf.hyg_ctxt(b.1)
+        };
         let add = |this: &mut Self, out: &mut Vec<(Sym, u32)>, more: Vec<(Sym, u32)>| {
             for (n, pos) in more {
-                if out.iter().any(|(m, _)| *m == n) {
+                if out.iter().any(|m| same(this, *m, (n, pos))) {
                     if report {
                         this.err(pos, format!("E0416: identifier `{}` is bound more than once in the same pattern", this.prog.syms.str(n)));
                     }
@@ -2094,14 +2099,9 @@ impl<'a> Fcx<'a> {
                 let sets: Vec<Vec<(Sym, u32)>> = ast.list(*alts).iter().map(|&a| self.pat_bindings(a, report)).collect();
                 for (i, set) in sets.iter().enumerate() {
                     for &(n, pos) in set {
-                        if !out.iter().any(|(m, _)| *m == n) {
-                            if report {
-                                if let Some((j, _)) = sets.iter().enumerate().find(|(j, other)| *j != i && !other.iter().any(|(m, _)| *m == n)) {
-                                    // reported at the alternative that lacks it, like rustc (the
-                                    // binding's own span is the label)
-                                    let _ = j;
-                                    self.err(pos, format!("E0408: variable `{}` is not bound in all patterns", self.prog.syms.str(n)));
-                                }
+                        if !out.iter().any(|m| same(self, *m, (n, pos))) {
+                            if report && sets.iter().enumerate().any(|(j, other)| j != i && !other.iter().any(|m| same(self, *m, (n, pos)))) {
+                                self.err(pos, format!("E0408: variable `{}` is not bound in all patterns", self.prog.syms.str(n)));
                             }
                             out.push((n, pos));
                         }
@@ -2115,13 +2115,14 @@ impl<'a> Fcx<'a> {
 
     /// E0415: a parameter name bound more than once in one parameter list.
     pub(crate) fn check_param_names(&mut self, pats: &[PatId]) {
-        let mut seen: Vec<Sym> = Vec::new();
+        let mut seen: Vec<(Sym, u32)> = Vec::new();
         for &p in pats {
             for (n, pos) in self.pat_bindings(p, false) {
-                if seen.contains(&n) {
+                let pf = &self.prog.files[self.file as usize];
+                if seen.iter().any(|(m, mp)| *m == n && pf.hyg_ctxt(*mp) == pf.hyg_ctxt(pos)) {
                     self.err(pos, format!("E0415: identifier `{}` is bound more than once in this parameter list", self.prog.syms.str(n)));
                 } else {
-                    seen.push(n);
+                    seen.push((n, pos));
                 }
             }
         }
@@ -2878,6 +2879,12 @@ impl<'a> Fcx<'a> {
             return Res::Err;
         }
         if segs.len() == 1 {
+            // a generic parameter shadows an item of the same name
+            if segs[0].0 == SegKind::Ident && !path.global() && self.env.names.iter().take(self.b.args.len()).any(|n| *n == segs[0].1) {
+                let msg = format!("E0574: expected struct, variant or union type, found type parameter `{}`", prog.syms.str(segs[0].1));
+                self.err(path.lo, msg);
+                return Res::Err;
+            }
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, true) {
                 if matches!(prog.def(d).kind, DefKind::Struct | DefKind::Union) {
                     return Res::Def(d);

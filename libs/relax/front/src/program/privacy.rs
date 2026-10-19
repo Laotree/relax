@@ -200,6 +200,8 @@ impl Program {
             };
             if let Some(e) = single.or_else(|| self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true)) {
                 out.push(self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e)));
+            } else if im.glob && im.bound & 8 == 0 && self.glob_of_own_module(im, segs, edition) {
+                out.push(self.record_error(im.file, im.pos, "resolve", "E0432: unresolved import -- cannot glob-import a module into itself".to_string()));
             } else if !im.glob && im.is_pub && !im.ext {
                 if let Some(msg) = self.cannot_reexport(im, segs, edition) {
                     out.push(self.record_error(im.file, im.pos, "resolve", msg));
@@ -207,6 +209,14 @@ impl Program {
             }
         }
         out
+    }
+
+    /// `use self::*;` / `use crate::m::*;` inside `m`: a module cannot glob-import itself.
+    fn glob_of_own_module(&self, im: &Import, segs: &[(SegKind, Sym)], edition: u16) -> bool {
+        match self.resolve_mod_path(im.module, im.global, segs, edition < 2018, true) {
+            Some(t) => self.def(t).kind == DefKind::Mod && self.def(t).sub == self.mods[im.module as usize].normal,
+            None => false,
+        }
     }
 
     /// The visibility of an item definition as written (None: `pub`).
