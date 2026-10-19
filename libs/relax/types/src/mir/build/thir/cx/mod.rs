@@ -374,7 +374,13 @@ impl<'a> Cx<'a> {
     /// The env parameter of a closure body: the closure by reference or by value, per its kind.
     fn closure_env_param(&mut self, ce: ast::ExprId) -> BuildResult<ParamId> {
         let ty = self.ety(ce)?;
-        let kind = self.tb().min_captures.get(&ce.0).map(|c| c.kind);
+        // rustc: the closure type's kind (fixed from the expected `F: FnOnce` bound when there is one),
+        // else what capture analysis inferred
+        let kind = match *self.tcx().tys.kind(ty) {
+            TyKind::Closure(_, _, args) => self.tcx().tys.to_opt_closure_kind(args.kind_ty()),
+            _ => None,
+        }
+        .or_else(|| self.tb().min_captures.get(&ce.0).map(|c| c.kind));
         let env = match kind {
             Some(crate::upvar::ClosureKind::Fn) => self.ref_ty(false, ty),
             Some(crate::upvar::ClosureKind::FnMut) => self.ref_ty(true, ty),
