@@ -289,3 +289,35 @@ pub fn copy_impl(prog: &Program, tcx: &Tcx, imp: DefId) -> Vec<String> {
     }
     Vec::new()
 }
+
+/// rustc_resolve late resolution of generic parameter ribs: a type or const parameter named
+/// like an earlier one of the same list, or like one of the enclosing trait or impl, is E0403.
+/// (Lifetime parameters are checked by the lifetime resolution.)
+pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::GenericParamKind;
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return Vec::new() };
+    let f = &prog.files[def.file as usize];
+    let mut outer: Vec<&str> = Vec::new();
+    let parent = prog.def(def.parent);
+    if def.parent != NO_DEF && matches!(parent.kind, DefKind::Trait | DefKind::Impl) {
+        let pf = &prog.files[parent.file as usize];
+        if let Some(pg) = pf.ast.kind_generics(&pf.ast.item(parent.item).kind) {
+            for p in pf.ast.list(pg.params) {
+                if !matches!(p.kind, GenericParamKind::Lifetime(_)) { outer.push(pf.text(p.name)); }
+            }
+        }
+    }
+    let mut errors = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for p in ast.list(g.params) {
+        if matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
+        let name = f.text(p.name);
+        if seen.contains(&name) || outer.contains(&name) {
+            errors.push(prog.record_error(def.file, p.name.lo, "resolve", format!("E0403: the name `{}` is already used for a generic parameter in this item's generic parameters", name)));
+        }
+        seen.push(name);
+    }
+    errors
+}

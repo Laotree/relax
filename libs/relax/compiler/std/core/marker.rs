@@ -80,6 +80,7 @@ impl<T: PointeeSized> Unpin for *mut T {}
 impl !Unpin for PhantomPinned {}
 
 // :257: implemented by the PartialEq derive with its exact generic bounds.
+#[cfg_attr(not(relax_check), lang = "structural_peq")]
 pub trait StructuralPartialEq {}
 
 // library/core/src/marker.rs:880-887,904-906,1059-1063.

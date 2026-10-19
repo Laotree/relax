@@ -1244,19 +1244,7 @@ impl Tcx {
         env.self_ty = Some(st);
         let trait_regions = trait_.as_ref().map(|p| self.lower_region_args(cx.infcx, prog, im.file, im.module, &env, p)).unwrap_or(RegionArgsId::EMPTY);
         let tr = trait_.as_ref().map(|tp| {
-            self.resolve_type_path_def(prog, im.file, im.module, tp).and_then(|td| {
-                // `impl Struct<T> for Trait<T>`: the trait position names no trait (rustc E0404)
-                let k = prog.def(td).kind;
-                if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias) {
-                    let what = match k {
-                        DefKind::Struct => "struct",
-                        DefKind::Enum => "enum",
-                        DefKind::Union => "union",
-                        _ => "type alias",
-                    };
-                    self.err(cx, prog, im.file, tp.lo, format!("E0404: expected trait, found {} `{}`", what, prog.name(td)));
-                    return None;
-                }
+            self.resolve_trait_path(cx, prog, im.file, im.module, &env, tp).and_then(|td| {
                 // rustc_hir_analysis/src/coherence/mod.rs:73-94. Freeze impls,
                 // specialization-trait attrs and impl restrictions are feature-gated cuts.
                 let trait_def = prog.def(td);
@@ -1265,6 +1253,8 @@ impl Tcx {
                     self.err(cx, prog, im.file, tp.lo, format!("{}: explicit impls for the `{}` trait are not permitted", if self.lang_items.get(crate::lang_items::LangItem::Unsize) == Some(td) { "E0328" } else { "E0322" }, prog.name(td)));
                     return None;
                 }
+                // (an impl header's trait ref takes no associated item constraints)
+                if let Some(last) = prog.files[im.file as usize].ast.segs(tp.segs).last() { self.prohibit_constraints(cx, prog, im.file, last.args()); }
                 let explicit = self.lower_generic_args(cx, prog, im.file, im.module, &env, tp);
                 Some((td, self.fill_trait_defaults(cx, prog, td, st, explicit)))
             })
@@ -1539,6 +1529,7 @@ impl Tcx {
             errors.extend(self.check_item_type_defaults(prog, did));
         }
         errors.extend_from_slice(self.signature_errors(prog, did));
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) { errors.extend(crate::item_checks::duplicate_generic_params(prog, did)); }
         // predicates_of: the bounds and where-clauses of every item are lowered, used or not
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.own_clauses_errors(prog, did) {
@@ -2338,7 +2329,7 @@ impl Tcx {
         let mut principals = 0;
         for b in bounds {
             if let ast::Bound::Trait { path, maybe: false, .. } = b {
-                let Some(td) = self.resolve_trait_path(cx, prog, file, module, path) else { continue };
+                let Some(td) = self.resolve_trait_path(cx, prog, file, module, env, path) else { continue };
                 if autos.contains(&td) { continue; }
                 principals += 1;
                 if principals == 2 {
@@ -2518,12 +2509,15 @@ impl Tcx {
         if p.no_qself() && p.segs.len() == 1 {
             let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
             if seg.kind() == SegKind::SelfType {
+                if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "self type", "Self") { return self.tys.error; }
                 return env.self_ty.unwrap_or(self.tys.error);
             }
             let name = f.text(seg.name);
             if let Some(s) = prog.syms.get(name) {
                 for (i, n) in env.names.iter().enumerate() {
                     if *n == s {
+                        // a type parameter takes no generic arguments (E0109), no constraints (E0229)
+                        if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "type parameter", name) { return self.tys.error; }
                         return self.tys.intern(TyKind::Param(i as u32));
                     }
                 }
@@ -2579,6 +2573,7 @@ impl Tcx {
                     for e in errs { self.err(cx, prog, file, seg.name.lo, e); }
                     return self.tys.error;
                 }
+                if self.prohibit_constraints(cx, prog, file, seg.args()) { return self.tys.error; }
             }
         }
         match def.kind {
@@ -2847,10 +2842,28 @@ impl Tcx {
 
     /// The trait a bound's path names. Reports what rustc_resolve does for a path in trait
     /// position: E0405 for a name that is nothing, E0404 for one that is not a trait.
-    pub fn resolve_trait_path(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, p: &ast::Path) -> Option<DefId> {
+    pub fn resolve_trait_path(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, p: &ast::Path) -> Option<DefId> {
+        let single = p.segs.len() == 1 && p.no_qself() && !p.global();
+        // a generic parameter shadows the trait of that name in the type namespace
+        if single {
+            let name = prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name);
+            if prog.syms.get(name).is_some_and(|s| env.names.contains(&s)) && prog.files[file as usize].ast.segs(p.segs)[0].kind() == SegKind::Ident {
+                self.err(cx, prog, file, p.lo, format!("E0404: expected trait, found type parameter `{}`", name));
+                return None;
+            }
+        }
         let Some(td) = self.resolve_type_path_def(prog, file, module, p) else {
-            if p.segs.len() == 1 && p.no_qself() && !p.global() {
+            if single {
                 self.err(cx, prog, file, p.lo, format!("E0405: cannot find trait `{}` in this scope", path_str(prog, file, p)));
+            } else if p.segs.len() > 1 && p.no_qself() && !p.global() {
+                // the module exists, the name is not in it
+                let ast = &prog.files[file as usize].ast;
+                let segs = crate::program::path_segs(prog, file, p);
+                if prog.resolve_mod_path(module, false, &segs[..segs.len() - 1], false, false).is_some() {
+                    let last = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 1].name);
+                    let parent = prog.files[file as usize].text(ast.segs(p.segs)[p.segs.len() - 2].name);
+                    self.err(cx, prog, file, p.lo, format!("E0405: cannot find trait `{}` in `{}`", last, parent));
+                }
             }
             return None;
         };
@@ -2861,6 +2874,33 @@ impl Tcx {
             self.err(cx, prog, file, p.lo, format!("E0404: expected trait, found {} `{}`", def_kind_descr(k), path_str(prog, file, p)));
         }
         None
+    }
+
+    /// prohibit_generic_args on a segment that names no generic definition (a type parameter,
+    /// `Self`): arguments are E0109, associated item constraints E0229.
+    fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
+        let ast = &prog.files[file as usize].ast;
+        if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+            let args = ast.list(*v);
+            if let Some(a) = args.iter().find(|a| matches!(a, GenericArg::Lifetime(_) | GenericArg::Type(_) | GenericArg::Const(_))) {
+                let kind = match a { GenericArg::Lifetime(_) => "lifetime", GenericArg::Const(_) => "const", _ => "type" };
+                self.err(cx, prog, file, seg.name.lo, format!("E0109: {} arguments are not allowed on {} `{}`", kind, what, name));
+                return true;
+            }
+        }
+        self.prohibit_constraints(cx, prog, file, seg.args())
+    }
+
+    /// prohibit_assoc_item_constraint: `Foo<Item = T>` where no trait is named (E0229).
+    pub fn prohibit_constraints(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, args: ast::GenericArgsId) -> bool {
+        let ast = &prog.files[file as usize].ast;
+        if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
+            if let Some(c) = ast.list(*v).iter().find_map(|a| match a { GenericArg::Binding(n, _, _) | GenericArg::Constraint(n, _) => Some(*n), _ => None }) {
+                self.err(cx, prog, file, c.lo, "E0229: associated item constraints are not allowed here".to_string());
+                return true;
+            }
+        }
+        false
     }
 
     /// Resolves a path in the type namespace to a def.
@@ -3119,7 +3159,7 @@ impl Tcx {
         let Some(seg) = ast.segs(p.segs).last() else { return true };
         let errs = self.check_generic_arg_count(prog, item, ast.gargs(seg.args()), ast, self.own_generic_counts(prog, item, None), arg_count::ArgPosition::AssocType, infer_args, false);
         for e in &errs { self.err(cx, prog, file, seg.name.lo, e.clone()); }
-        errs.is_empty()
+        errs.is_empty() && !self.prohibit_constraints(cx, prog, file, seg.args())
     }
 
     fn lower_generic_args_of_assoc_item(&self, cx: &EvalCx<'_>, prog: &Program, file: u32, module: u32, env: &GenEnv, path: &ast::Path, parent: TyId, source_ty: Option<ast::TyId>) -> TyId {

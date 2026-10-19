@@ -3749,7 +3749,15 @@ impl<'a> Fcx<'a> {
         let errs = self.tcx.check_generic_arg_count(prog, def, ast.gargs(args), ast, counts, pos, !matches!(ast.gargs(args), Some(GenericArgs::Angle(_))), late_bound);
         let _ = is_method_call;
         for e in &errs { self.err(lo, e.clone()); }
-        errs.is_empty()
+        let mut ok = errs.is_empty();
+        // associated item constraints belong to trait paths only
+        if let Some(GenericArgs::Angle(v)) = ast.gargs(args) {
+            if ast.list(*v).iter().any(|a| matches!(a, GenericArg::Binding(..) | GenericArg::Constraint(..))) {
+                self.err(lo, "E0229: associated item constraints are not allowed here".to_string());
+                ok = false;
+            }
+        }
+        ok
     }
 
     fn seg_args(&mut self, path: &Path, i: usize, def: DefId, offset: usize) -> Option<Vec<TyId>> {
