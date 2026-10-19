@@ -36,6 +36,17 @@ fn store_order(order: Ordering) -> u8 {
     }
 }
 
+/// rustc core/src/sync/atomic.rs `strongest_failure_ordering`
+fn strongest_failure_ordering(order: Ordering) -> Ordering {
+    match order {
+        Ordering::Release => Ordering::Relaxed,
+        Ordering::Relaxed => Ordering::Relaxed,
+        Ordering::SeqCst => Ordering::SeqCst,
+        Ordering::Acquire => Ordering::Acquire,
+        Ordering::AcqRel => Ordering::Acquire,
+    }
+}
+
 fn failure_order(order: Ordering) -> u8 {
     match order {
         Ordering::Release => panic!("there is no such thing as a release failure ordering"),
@@ -141,6 +152,32 @@ impl<T: AtomicPrimitive> Atomic<T> {
     }
     pub fn fetch_min(&self, val: T, order: Ordering) -> T {
         unsafe { ia::atomic_fetch_min(self.v.get(), val, order as u8) }
+    }
+    #[deprecated(since = "1.50.0", note = "Use `compare_exchange` or `compare_exchange_weak` instead")]
+    pub fn compare_and_swap(&self, current: T, new: T, order: Ordering) -> T {
+        match self.compare_exchange(current, new, order, strongest_failure_ordering(order)) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
+    pub fn try_update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(T) -> Option<T>) -> Result<T, T> {
+        let mut prev = self.load(fetch_order);
+        while let Some(next) = f(prev) {
+            match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
+                x @ Ok(_) => return x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+        Err(prev)
+    }
+    pub fn update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(T) -> T) -> T {
+        let mut prev = self.load(fetch_order);
+        loop {
+            match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                Ok(x) => break x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
     }
     pub fn fetch_update<F: FnMut(T) -> Option<T>>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<T, T> {
         let mut prev = self.load(fetch_order);
@@ -253,6 +290,32 @@ impl AtomicBool {
     pub fn fetch_not(&self, order: Ordering) -> bool {
         self.fetch_xor(true, order)
     }
+    #[deprecated(since = "1.50.0", note = "Use `compare_exchange` or `compare_exchange_weak` instead")]
+    pub fn compare_and_swap(&self, current: bool, new: bool, order: Ordering) -> bool {
+        match self.compare_exchange(current, new, order, strongest_failure_ordering(order)) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
+    pub fn try_update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(bool) -> Option<bool>) -> Result<bool, bool> {
+        let mut prev = self.load(fetch_order);
+        while let Some(next) = f(prev) {
+            match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
+                x @ Ok(_) => return x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+        Err(prev)
+    }
+    pub fn update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(bool) -> bool) -> bool {
+        let mut prev = self.load(fetch_order);
+        loop {
+            match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                Ok(x) => break x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+    }
     pub fn fetch_update<F: FnMut(bool) -> Option<bool>>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<bool, bool> {
         let mut prev = self.load(fetch_order);
         loop {
@@ -343,6 +406,54 @@ impl<T> AtomicPtr<T> {
         } else {
             Err(prev)
         }
+    }
+    #[deprecated(since = "1.50.0", note = "Use `compare_exchange` or `compare_exchange_weak` instead")]
+    pub fn compare_and_swap(&self, current: *mut T, new: *mut T, order: Ordering) -> *mut T {
+        match self.compare_exchange(current, new, order, strongest_failure_ordering(order)) {
+            Ok(x) => x,
+            Err(x) => x,
+        }
+    }
+    pub fn try_update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(*mut T) -> Option<*mut T>) -> Result<*mut T, *mut T> {
+        let mut prev = self.load(fetch_order);
+        while let Some(next) = f(prev) {
+            match self.compare_exchange_weak(prev, next, set_order, fetch_order) {
+                x @ Ok(_) => return x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+        Err(prev)
+    }
+    pub fn update(&self, set_order: Ordering, fetch_order: Ordering, mut f: impl FnMut(*mut T) -> *mut T) -> *mut T {
+        let mut prev = self.load(fetch_order);
+        loop {
+            match self.compare_exchange_weak(prev, f(prev), set_order, fetch_order) {
+                Ok(x) => break x,
+                Err(next_prev) => prev = next_prev,
+            }
+        }
+    }
+    // rustc AtomicPtr: strict-provenance read-modify-write on the pointer's address
+    pub fn fetch_byte_add(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_add(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_byte_sub(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_sub(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_ptr_add(&self, val: usize, order: Ordering) -> *mut T {
+        self.fetch_byte_add(val.wrapping_mul(crate::mem::size_of::<T>()), order)
+    }
+    pub fn fetch_ptr_sub(&self, val: usize, order: Ordering) -> *mut T {
+        self.fetch_byte_sub(val.wrapping_mul(crate::mem::size_of::<T>()), order)
+    }
+    pub fn fetch_and(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_and(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_or(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_or(self.p.get() as *mut usize, val, order as u8) as *mut T }
+    }
+    pub fn fetch_xor(&self, val: usize, order: Ordering) -> *mut T {
+        unsafe { ia::atomic_fetch_xor(self.p.get() as *mut usize, val, order as u8) as *mut T }
     }
     pub fn fetch_update<F: FnMut(*mut T) -> Option<*mut T>>(&self, set_order: Ordering, fetch_order: Ordering, mut f: F) -> Result<*mut T, *mut T> {
         let mut prev = self.load(fetch_order);

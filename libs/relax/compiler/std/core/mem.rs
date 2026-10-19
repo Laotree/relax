@@ -46,6 +46,11 @@ pub const fn swap<T>(x: &mut T, y: &mut T) {
 pub fn take<T: Default>(dest: &mut T) -> T {
     replace(dest, T::default())
 }
+/// rustc library/core/src/mem/mod.rs `uninitialized` (deprecated since 1.39).
+#[deprecated(since = "1.39.0", note = "use `mem::MaybeUninit` instead")]
+pub unsafe fn uninitialized<T>() -> T {
+    MaybeUninit::<T>::uninit().assume_init()
+}
 pub const unsafe fn zeroed<T>() -> T {
     im::zeroed::<T>()
 }
@@ -95,7 +100,7 @@ impl<T> crate::fmt::Debug for Discriminant<T> {
 /// glue (so the compiler needs no special case).
 #[repr(C)]
 #[rustc_diagnostic_item = "ManuallyDrop"]
-pub union ManuallyDrop<T> {
+pub union ManuallyDrop<T: ?Sized> {
     value: T,
 }
 

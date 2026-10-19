@@ -204,7 +204,9 @@ impl<'a, T: crate::marker::PointeeSized> From<&'a mut T> for NonNull<T> {
         NonNull { pointer: r as *mut T as *const T }
     }
 }
-unsafe impl<T: crate::marker::PointeeSized> Send for NonNull<T> where T: Send {}
+// library/core/src/ptr/non_null.rs:81-86
+impl<T: crate::marker::PointeeSized> !Send for NonNull<T> {}
+impl<T: crate::marker::PointeeSized> !Sync for NonNull<T> {}
 
 // ported from library/core/src/ptr/metadata.rs:56-68,158-169 @8d1a764
 #[cfg_attr(not(relax_check), lang = "pointee_trait")]

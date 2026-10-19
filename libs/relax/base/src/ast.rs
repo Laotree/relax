@@ -819,7 +819,7 @@ pub enum GenericArg {
     /// `Item = T`
     Binding(Ident, GenericArgsId, TyId),
     /// `Item: Bound`
-    Constraint(Ident, List<Bound>),
+    Constraint(Ident, GenericArgsId, List<Bound>),
 }
 
 #[derive(Debug, Clone, Copy)]

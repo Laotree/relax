@@ -259,7 +259,10 @@ impl Names {
                     if public { self.public.insert(name); }
                 }
             }
-            if text == "macro_rules" && i + 3 < toks.len() {
+            // `macro_rules ! name { .. }` (a bare `macro_rules`, `macro_rules! {}` and `tests!(macro_rules)` define nothing)
+            if text == "macro_rules" && i + 3 < toks.len() && toks[i + 1].kind == T::Not
+                && matches!(toks[i + 2].kind, T::Ident | T::RawIdent)
+                && matches!(toks[i + 3].kind, T::OpenBrace | T::OpenParen | T::OpenBracket) {
                 let name = word(src, &toks[i + 2]);
                 self.symbols.insert(format!("{module}::{name}"));
                 let end = close(toks, i + 3);
@@ -608,7 +611,7 @@ impl Names {
             kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo,
         }).collect::<Vec<_>>();
         let c = &self.crates[ci];
-        let Ok(def) = crate::macros::parse_def(&name, &c.name, &mtoks) else { return None; };
+        let Ok(def) = crate::macros::parse_def(&name, &c.name, c.edition, &mtoks) else { return None; };
         fn names_only(nodes: &[crate::macros::MNode]) -> bool {
             use crate::macros::{Frag, MNode};
             nodes.iter().all(|n| match n {
@@ -620,7 +623,7 @@ impl Names {
         if !def.arms.iter().all(|(matcher, _)| names_only(matcher)) { return None; }
         let mut parser = crate::parser::Parser::new(&c.cfg.session, src, toks, c.edition);
         parser.krate = c.name.clone();
-        let Ok((expanded, _, _)) = parser.expand_rules(&def, open + 1, end) else { return None; };
+        let Ok((expanded, _, _, _)) = parser.expand_rules(&def, open + 1, end) else { return None; };
         let mut tokens = Vec::new();
         if crate::lexer::lex(expanded.as_bytes(), c.edition, &mut tokens).is_err() { return None; }
         let bytes = expanded.as_bytes();
@@ -746,10 +749,12 @@ impl Names {
             "result", "option", "boxed", "string", "vec", "ffi::CStr", "cell::UnsafeCell", "hint", "intrinsics", "mem", "ptr", "slice", "str"] {
             out.extend(self.resolve(ci, "core", &path.split("::").map(str::to_owned).collect::<Vec<_>>()));
         }
-        if let Some(prelude) = self.bindings.id("core::prelude") {
-            for (_, &id) in self.bindings.modules.get(&prelude).into_iter().flatten() {
-                let binding = &self.bindings.values[id];
-                out.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
+        for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
+            if let Some(prelude) = self.bindings.id(&format!("core::prelude::{edition}")) {
+                for (_, &id) in self.bindings.modules.get(&prelude).into_iter().flatten() {
+                    let binding = &self.bindings.values[id];
+                    out.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
+                }
             }
         }
         // Operators, comparisons, formatting, iteration, conversions, hashing
