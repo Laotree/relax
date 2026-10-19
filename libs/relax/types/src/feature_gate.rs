@@ -734,7 +734,33 @@ impl<'a> Gates<'a> {
 
     // ---------------------------------------------------------------- types and paths
 
+    /// rustc_passes stability `check_path` for a path as written: `std::intrinsics::copy` names
+    /// the library's unstable definitions by the written path (a re-export has its own stability).
+    fn path_stability(&mut self, p: &Path) {
+        if p.has_qself() || !matches!(self.pf.expansion_kind(p.lo), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules) { return; }
+        let segs = self.ast.segs(p.segs);
+        let names: Vec<&str> = segs.iter().map(|sg| self.pf.text(sg.name)).collect();
+        if !matches!(names.first(), Some(&"std" | &"core" | &"alloc")) { return; }
+        // (a local item or crate of that name shadows the library's)
+        if !p.global() {
+            if let Some(s0) = self.prog.syms.get(names[0]) {
+                if let Some(d) = self.prog.lookup_in_scope(self.scope, s0, true) {
+                    if self.prog.def(d).krate == self.krate { return; }
+                }
+            }
+        }
+        for k in 1..=names.len() {
+            if let Some((feature, reason)) = table_entry(&names[..k].join("::")) {
+                if self.feats.has(&feature) { continue; }
+                let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
+                self.errors.push(self.prog.record_error(self.file, p.lo, "typeck", msg));
+                return;
+            }
+        }
+    }
+
     fn path(&mut self, p: &Path) {
+        self.path_stability(p);
         if let Some(q) = self.ast.qself(p).copied() {
             self.ty(q.ty);
             if let Some(tp) = q.trait_path {
@@ -1151,8 +1177,14 @@ fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Opti
 /// The library's table entry for a path as written (`std::intrinsics::copy`): a re-export has
 /// its own stability, so the key is the written path, not the defining one.
 fn table_entry(path: &str) -> Option<(String, Option<String>)> {
-    let &(f, r) = stability_table().get(path)?;
-    Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) }))
+    let mut key = path.to_string();
+    for _ in 0..4 {
+        let &(f, r) = stability_table().get(key.as_str())?;
+        if !f.is_empty() { return Some((f.to_string(), if r.is_empty() { None } else { Some(r.to_string()) })); }
+        // a stable re-export has the stability of what it re-exports
+        key = r.strip_prefix("reexport ")?.to_string();
+    }
+    None
 }
 
 /// `path -> (feature, reason)` of the library's unstable definitions (std/stability.tsv).
