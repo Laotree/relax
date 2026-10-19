@@ -3062,6 +3062,20 @@ impl<'a> Fcx<'a> {
                         let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
                         return (Res::Def(d), t);
                     }
+                } else if let Some(imp) = self.env.owner.and_then(|o| outer_impl(prog, o)) {
+                    // Res::SelfCtor of an enclosing impl, reached from a nested item (rustc never
+                    // validates it in resolve; hir_typeck fn_ctxt/_impl.rs: an error when the
+                    // impl's self type has parameters, else the self_constructor_from_outer_item lint)
+                    if let Some(&st) = self.tcx.impl_self.get(&imp) {
+                        if self.tcx.has_param(st) {
+                            self.err(path.lo, "E0401: can't reference `Self` constructor from outer item".to_string());
+                            return (Res::Err, error);
+                        }
+                        if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
+                            let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
+                            return (Res::Def(d), t);
+                        }
+                    }
                 }
             }
             if let Some(d) = prog.lookup_in_scope(self.module, s, false) {
@@ -6576,6 +6590,20 @@ fn dyn_trait_names(d: DefId, autos: &[DefId], path: impl Fn(DefId) -> String) ->
     names.sort();
     let head = if auto_only { names.remove(0) } else { path(d) };
     (head, names)
+}
+
+/// The impl whose body (through nested fn bodies) declares `owner`: the impl `Self` constructors
+/// of nested items refer to.
+fn outer_impl(prog: &Program, owner: DefId) -> Option<DefId> {
+    let mut d = owner;
+    loop {
+        let o = *prog.block_owner.get(&prog.def(d).scope)?;
+        let parent = prog.def(o).parent;
+        if parent != crate::program::NO_DEF && prog.def(parent).kind == DefKind::Impl {
+            return Some(parent);
+        }
+        d = o;
+    }
 }
 
 /// An item's path as rustc's type_name prints it: an item in a fn body is under that fn
