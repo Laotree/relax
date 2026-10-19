@@ -2393,6 +2393,8 @@ impl<'a> Fcx<'a> {
                 };
                 let r = self.resolve_struct_path(&path);
                 self.b.res.insert(a.0, r);
+                // the constructor path is pattern syntax: region analysis reads its resolution
+                self.b.res.insert(f.0, r);
                 if let Res::Def(d) = r {
                     let (adt_ty, vi) = self.adt_of_ctor(d);
                     let adt_ty = self.instantiate_adt(adt_ty);

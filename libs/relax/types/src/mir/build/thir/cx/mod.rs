@@ -13,11 +13,11 @@
 //!   scopes of `region_scope.rs`' synthetic nodes; their bindings (`iter`, `val`, `residual`) are
 //!   synthetic locals with ids from `Body.locals.len()` up and a drop scope in `Thir::var_scopes`.
 //!
-//! Not built (`BuildError`): async fn / blocks / closures, `.await`, `yield`, destructuring assignment,
-//! `box`, default field values, asm. They match what the BIR checker leaves unchecked.
+//! Not built (`BuildError`): async fn (the region tree has one body for the wrapper and the coroutine,
+//! so the wrapper has no scopes of its own) and async closures, `yield` (typeck rejects it), `box`, asm. They match what the BIR checker leaves unchecked.
 use super::{
     Arm, ArmId, Block, BlockId, BlockSafety, ClosureExpr, ClosureExprKind, Expr, ExprId, ExprKind, LocalVarId, Param, ParamId, Pat, PatKind, Stmt, StmtId, StmtKind,
-    Thir, ThirBody, BodyTy,
+    Thir, ThirBody, BodyTy, CoroutineThir,
 };
 use crate::ast;
 use crate::borrowck::body::{BodyKind as OwnerKind, CheckedBody};
@@ -60,12 +60,14 @@ pub struct Cx<'a> {
     pub(super) two_phase: bool,
     /// The source of the `Cast` being lowered: its pointer coercions are "from an `as` cast".
     pub(super) cast_source: Option<ast::ExprId>,
+    /// The `_task_context` parameter of the coroutine body being built (`.await` polls with it).
+    pub(super) task_context: Option<LocalVarId>,
 }
 
 impl<'a> Cx<'a> {
     pub fn new(root: &'a BuildRoot<'a>, owner: CheckedBody) -> Self {
         let next_synthetic = root.typeck.locals.len() as u32;
-        Self { root, owner, thir: Thir::default(), pat_hint: 0, breakables: Vec::new(), next_synthetic, two_phase: false, cast_source: None }
+        Self { root, owner, thir: Thir::default(), pat_hint: 0, breakables: Vec::new(), next_synthetic, two_phase: false, cast_source: None, task_context: None }
     }
     pub fn error(&self, span: Span, reason: UnsupportedReason) -> BuildError {
         BuildError::new(self.owner, span, reason)
@@ -233,6 +235,7 @@ impl<'a> Cx<'a> {
                 _ => this.unresolved(at, "function region scopes"),
             }
         };
+        let mut coroutine = None;
         let (params, expr, body_ty, body_span, ret_span, scopes) = match self.owner.kind {
             OwnerKind::Function => {
                 let ast::ItemKind::Fn(sig, _, _) = item.kind else { return self.unresolved(span, "function item") };
@@ -278,6 +281,26 @@ impl<'a> Cx<'a> {
                 (Vec::new(), self.push(root), BodyTy::Const(ty), self.espan(e), self.espan(e), None)
             }
             OwnerKind::Closure(ce) => {
+                if let ast::ExprKind::Async(_, b) = ast.expr(ce).kind {
+                    // an `async` block: the coroutine takes itself and the resume argument `_task_context`
+                    let ce_span = self.espan(ce);
+                    let scopes = fn_scopes(&self, Node::Block(b.0), ce_span)?;
+                    let coroutine_ty = self.ety(ce)?;
+                    let TyKind::Closure(_, _, closure_args) = *tcx.tys.kind(coroutine_ty) else { return self.unresolved(ce_span, "coroutine type") };
+                    let TyKind::FnPtr(_, output, _, _) = *tcx.tys.kind(closure_args.closure_sig_as_fn_ptr_ty) else { return self.unresolved(ce_span, "coroutine signature") };
+                    let resume_ty = self.resume_ty(ce_span)?;
+                    let env = self.thir.alloc_param(Param { pat: None, ty: coroutine_ty, ty_span: None, self_kind: None, node: None });
+                    let task_context = self.synthetic_binding(scopes.expect("scopes").1);
+                    self.task_context = Some(task_context);
+                    let pat = self.binding_pat(task_context, "_task_context", resume_ty, true, ce_span);
+                    let resume = self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty: resume_ty, ty_span: None, self_kind: None, node: None });
+                    let block = self.mirror_block(b)?;
+                    let blk = ast.block(b);
+                    let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, span: self.span(blk.lo, blk.hi) };
+                    let kind = crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Block);
+                    coroutine = Some(CoroutineThir { kind, yield_ty: tcx.tys.unit, resume_ty });
+                    (vec![env, resume], self.push(root), BodyTy::Fn { output, rust_call: false }, ce_span, self.span(blk.lo, blk.lo), scopes)
+                } else {
                 let ast::ExprKind::Closure(row) = ast.expr(ce).kind else { return self.not_built(self.espan(ce), "coroutine body") };
                 let row = *ast.row(row);
                 let ce_span = self.espan(ce);
@@ -297,9 +320,17 @@ impl<'a> Cx<'a> {
                 let expr = self.mirror_expr(row.body)?;
                 let scopes = fn_scopes(&self, Node::Expr(row.body.0), ce_span)?;
                 (params, expr, BodyTy::Fn { output, rust_call: false }, ce_span, self.espan(row.body), scopes)
+                }
             }
         };
-        Ok(ThirBody { thir: self.thir, params, expr, body_ty, span: body_span, ret_span, coroutine: None, fn_scopes: scopes })
+        Ok(ThirBody { thir: self.thir, params, expr, body_ty, span: body_span, ret_span, coroutine, fn_scopes: scopes })
+    }
+
+    /// `core::future::ResumeTy`, the resume argument type of an async coroutine.
+    pub(super) fn resume_ty(&self, span: Span) -> BuildResult<TyId> {
+        let tcx = self.tcx();
+        let Some(def) = tcx.lang_items.get(crate::lang_items::LangItem::ResumeTy) else { return self.unresolved(span, "ResumeTy lang item") };
+        Ok(tcx.tys.intern(TyKind::Adt(def, tcx.tys.mk_list(&[]), RegionArgsId::EMPTY)))
     }
 
     /// The env parameter of a closure body: the closure by reference or by value, per its kind.

@@ -220,7 +220,7 @@ impl Cx<'_> {
             A::Unsafe(b) => ExprKind::Block { block: self.mirror_block_with(b, super::BlockSafety::ExplicitUnsafe(b.0), false)? },
             A::Assign(lhs, rhs) => {
                 if crate::lit::is_assignee_pattern(ast, lhs) {
-                    return self.not_built(span, "destructuring assignment");
+                    return self.destructuring_assign(e, lhs, rhs, expr_ty);
                 }
                 ExprKind::Assign { lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? }
             }
@@ -365,8 +365,8 @@ impl Cx<'_> {
             A::Tuple(fields) => ExprKind::Tuple { fields: self.mirror_exprs(ast.list(fields))? },
             A::Array(fields) => ExprKind::Array { fields: self.mirror_exprs(ast.list(fields))? },
             A::Range(a, b, inclusive) => return self.range_expr(e, a, b, inclusive, expr_ty),
-            A::Async(..) => return self.not_built(span, "async block"),
-            A::Await(_) => return self.not_built(span, ".await"),
+            A::Async(..) => return self.closure_aggregate(e, expr_ty, Some(crate::mir::Movability::Static)),
+            A::Await(x) => return self.await_expr(e, x, expr_ty),
             A::Yield(_) => return self.not_built(span, "yield"),
             A::Box(_) => return self.not_built(span, "box expression"),
             A::Underscore => return self.unresolved(span, "`_` expression"),
@@ -672,13 +672,27 @@ impl Cx<'_> {
             Some(Res::Def(d)) if prog.def(d).kind == DefKind::Variant => VariantIdx(prog.def(d).sub),
             _ => VariantIdx(0),
         };
-        if row.rest {
-            return self.not_built(span, "default field values");
-        }
         let mut fields = Vec::new();
         for f in ast.list(row.fields) {
             let Some(idx) = self.field_index(adt_def, variant_index.0, f.name) else { return self.unresolved(span, "unknown field") };
             fields.push(FieldExpr { name: FieldIdx(idx), expr: self.mirror_expr(f.expr)? });
+        }
+        // `S { a, .. }`: each omitted field takes the const holding its declared default
+        // (rustc builds `AdtExprBase::DefaultFields`, whose operands are exactly these consts)
+        if row.rest {
+            let field_args = tcx.tys.list(match *tcx.tys.kind(expr_ty) {
+                TyKind::Adt(_, a, _) => a,
+                _ => unreachable!(),
+            });
+            for &(index, def) in tb.struct_defaults.get(&e.0).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if fields.iter().any(|f: &FieldExpr| f.name.0 == index) {
+                    continue;
+                }
+                let ty = tcx.field_ty(prog, self.root.cx.env, adt_def, variant_index.0, index, field_args);
+                let args = self.full_args(def, &[], span)?;
+                let expr = self.push(self.mk(e, ExprKind::NamedConst { def, args, user_ty: None }, ty));
+                fields.push(FieldExpr { name: FieldIdx(index), expr });
+            }
         }
         let base = match row.base.get() {
             Some(base) => {
@@ -725,11 +739,17 @@ impl Cx<'_> {
 
     /// thir/cx/expr.rs `Closure`: the captured places as expressions in the creating body.
     fn closure_expr(&mut self, e: ast::ExprId, row: ast::ClosureRow, expr_ty: TyId) -> BuildResult<Expr> {
-        let (tb, tcx) = (self.tb(), self.tcx());
         let span = self.espan(e);
         if row.is_async {
             return self.not_built(span, "async closure");
         }
+        self.closure_aggregate(e, expr_ty, None)
+    }
+
+    /// The aggregate of a closure or coroutine: the captured places (by value or borrowed).
+    fn closure_aggregate(&mut self, e: ast::ExprId, expr_ty: TyId, movability: Option<crate::mir::Movability>) -> BuildResult<Expr> {
+        let (tb, tcx) = (self.tb(), self.tcx());
+        let span = self.espan(e);
         let (closure, args, kind, tupled) = self.closure_parts(expr_ty, span)?;
         let Some(caps) = tb.min_captures.get(&e.0) else { return self.unresolved(span, "closure captures") };
         let upvar_tys: Vec<TyId> = match *tcx.tys.kind(tupled) {
@@ -763,7 +783,7 @@ impl Cx<'_> {
             };
             fake_reads.push((self.push(expr), cause, *node));
         }
-        Ok(self.mk(e, ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability: None, fake_reads, kind })), expr_ty))
+        Ok(self.mk(e, ExprKind::Closure(Box::new(ClosureExpr { closure, args, upvars: upvars.into_boxed_slice(), movability, fake_reads, kind })), expr_ty))
     }
 
     /// The place a closure captures, as an expression of the creating body (starting from the
