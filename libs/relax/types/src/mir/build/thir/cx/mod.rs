@@ -240,10 +240,23 @@ impl<'a> Cx<'a> {
             OwnerKind::Function => {
                 let ast::ItemKind::Fn(sig, _, _) = item.kind else { return self.unresolved(span, "function item") };
                 let sig = ast.fn_sig(sig);
-                if sig.asyncness {
-                    return self.not_built(item_span, "async fn");
-                }
                 let Some(body) = tb.body else { return self.unresolved(item_span, "function body") };
+                if sig.asyncness {
+                    // an async fn is two bodies: this one builds the body coroutine, capturing every
+                    // parameter by value; the coroutine's own body is `OwnerKind::Closure` with the
+                    // expression id `ASYNC_FN_BODY | body block`
+                    let params = self.fn_params(sig, item.lo)?;
+                    let b = ast.block(body);
+                    let scopes = fn_scopes(&self, Node::Block(body.0), item_span)?;
+                    let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::AsyncReturn(def.item))) else { return self.unresolved(item_span, "async fn return type") };
+                    let Some(&coroutine_ty) = tb.hidden_types.get(&opaque) else { return self.unresolved(item_span, "async fn coroutine type") };
+                    let body_span = self.span(b.lo, b.hi);
+                    let root = self.closure_aggregate_at(crate::tcx::ASYNC_FN_BODY | body.0, None, body_span, coroutine_ty, Some(crate::mir::Movability::Static))?;
+                    let expr = self.push(root);
+                    self.fix_mutable_places();
+                    let ret_span = self.span(b.lo, b.lo);
+                    return Ok(ThirBody { thir: self.thir, params, expr, body_ty: BodyTy::Fn { output: tb.ret, rust_call: false }, span: item_span, ret_span, coroutine: None, fn_scopes: scopes });
+                }
                 let b = ast.block(body);
                 let params = self.fn_params(sig, item.lo)?;
                 let block = self.mirror_block(body)?;
@@ -280,6 +293,28 @@ impl<'a> Cx<'a> {
                 let root = Expr { kind: ExprKind::Block { block }, ty, temp_scope: None, span: self.span(blk.lo, blk.hi) };
                 (Vec::new(), self.push(root), BodyTy::Const(ty), self.espan(e), self.espan(e), None)
             }
+            OwnerKind::Closure(ce) if ce.0 & crate::tcx::ASYNC_FN_BODY != 0 => {
+                // the body coroutine of an async fn: the body block, the parameters captured
+                let b = ast::BlockId(ce.0 & !crate::tcx::ASYNC_FN_BODY);
+                let blk = ast.block(b);
+                let body_span = self.span(blk.lo, blk.hi);
+                let scopes = fn_scopes(&self, Node::Block(b.0), item_span)?;
+                let Some(&opaque) = prog.node_id_to_def_id.get(&(def.file, relax_front::def_collector::NodeId::AsyncReturn(def.item))) else { return self.unresolved(item_span, "async fn return type") };
+                let Some(&coroutine_ty) = tb.hidden_types.get(&opaque) else { return self.unresolved(item_span, "async fn coroutine type") };
+                let TyKind::Closure(_, _, closure_args) = *tcx.tys.kind(coroutine_ty) else { return self.unresolved(item_span, "coroutine type") };
+                let TyKind::FnPtr(_, output, _, _) = *tcx.tys.kind(closure_args.closure_sig_as_fn_ptr_ty) else { return self.unresolved(item_span, "coroutine signature") };
+                let resume_ty = self.resume_ty(item_span)?;
+                let env = self.thir.alloc_param(Param { pat: None, ty: coroutine_ty, ty_span: None, self_kind: None, node: None });
+                let task_context = self.synthetic_binding(scopes.expect("scopes").1);
+                self.task_context = Some(task_context);
+                let pat = self.binding_pat(task_context, "_task_context", resume_ty, true, item_span);
+                let resume = self.thir.alloc_param(Param { pat: Some(Box::new(pat)), ty: resume_ty, ty_span: None, self_kind: None, node: None });
+                let block = self.mirror_block(b)?;
+                let root = Expr { kind: ExprKind::Block { block }, ty: output, temp_scope: None, span: body_span };
+                let kind = crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Fn);
+                coroutine = Some(CoroutineThir { kind, yield_ty: tcx.tys.unit, resume_ty });
+                (vec![env, resume], self.push(root), BodyTy::Fn { output, rust_call: false }, item_span, self.span(blk.lo, blk.lo), scopes)
+            }
             OwnerKind::Closure(ce) => {
                 if let ast::ExprKind::Async(_, b) = ast.expr(ce).kind {
                     // an `async` block: the coroutine takes itself and the resume argument `_task_context`
@@ -304,9 +339,6 @@ impl<'a> Cx<'a> {
                 let ast::ExprKind::Closure(row) = ast.expr(ce).kind else { return self.not_built(self.espan(ce), "coroutine body") };
                 let row = *ast.row(row);
                 let ce_span = self.espan(ce);
-                if row.is_async {
-                    return self.not_built(ce_span, "async closure");
-                }
                 let Some(sigs) = tb.closure_sigs.get(&ce.0) else { return self.unresolved(ce_span, "closure signature") };
                 let TyKind::FnPtr(inputs, output, _, _) = *tcx.tys.kind(sigs.liberated) else { return self.unresolved(ce_span, "closure signature type") };
                 let inputs: Vec<TyId> = tcx.tys.list(inputs).to_vec();
@@ -468,6 +500,10 @@ impl<'a> Cx<'a> {
 
     pub(super) fn is_upvar(&self, local: u32) -> bool {
         match self.owner.kind {
+            // an async fn's coroutine captures its parameters; `closure_locals` lists every local of the fn
+            OwnerKind::Closure(ce) if ce.0 & crate::tcx::ASYNC_FN_BODY != 0 => {
+                self.tb().min_captures.get(&ce.0).is_some_and(|c| c.captures.iter().any(|capture| capture.place.root == local))
+            }
             OwnerKind::Closure(ce) => self.tb().closure_locals.get(&ce.0).is_some_and(|caps| caps.contains(&local)),
             _ => false,
         }
