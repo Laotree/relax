@@ -15,7 +15,7 @@ use crate::mir::move_paths::MoveData;
 use crate::next_solver::type_op::QueryRegionConstraints;
 use crate::program::Program;
 use crate::tcx::Tcx;
-use crate::types::{RegionId, RegionKind, TyId, variance::V};
+use crate::types::{RegionId, TyId, variance::V};
 use super::{Locations, MirTypeckRegionConstraints};
 
 /// `DropckOutlivesResult` plus the region constraints of the `DropckOutlives` type op
@@ -383,31 +383,3 @@ fn record_regular_live_regions(cx: &mut LivenessCx<'_>) {
     for (b, block) in body.basic_blocks.iter().enumerate() { regular.visit_basic_block_data(BasicBlock(b as u32), block); }
 }
 
-// N01's context. The dropck type op and the alias-aware region visitor are lane S6's
-// (`next_solver/{dropck_outlives,outlives_for_liveness}`); until they land only the
-// operations that need neither are real.
-impl LivenessOps for crate::borrowck::infer_ctxt::BorrowckInferCtxt<'_> {
-    fn dropck_outlives(&mut self, _: TyId, _: Span) -> DropckData {
-        unimplemented!("S6: native DropckOutlives type op (rustc_trait_selection traits/query/dropck_outlives.rs)")
-    }
-    fn free_regions_for_liveness(&mut self, value: GenericArg) -> Vec<RegionId> {
-        let tys = &self.tcx.tys;
-        let found = std::cell::RefCell::new(vec![]);
-        let visit = |r: RegionId| if !matches!(tys.region_kind(r), RegionKind::ReBound(..)) { found.borrow_mut().push(r) };
-        let ty = match value {
-            GenericArg::Lifetime(r) => { visit(r); return found.into_inner(); }
-            GenericArg::Type(ty) => ty,
-            GenericArg::Const(c) => tys.intern(crate::types::TyKind::Const(c)),
-        };
-        // Aliases may skip components their environment implies; that needs S6's visitor.
-        assert!(!tys.flags(ty).intersects(crate::types::TypeFlags::HAS_ALIAS), "S6: FreeRegionsVisitor over alias types");
-        tys.map_regions(ty, &|r, _| { visit(r); r }, 0);
-        found.into_inner()
-    }
-    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations, span: Span, category: ConstraintCategory,
-        data: &QueryRegionConstraints) {
-        let universals = self.universal_regions.as_ref().expect("MIR type ops require universal regions");
-        super::constraint_conversion::ConstraintConversion::new(self, universals, &self.region_bound_pairs, &self.param_env.clauses,
-            locations, span, category, out).convert_all(data);
-    }
-}

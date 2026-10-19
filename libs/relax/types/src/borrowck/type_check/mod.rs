@@ -52,7 +52,16 @@ pub struct DeferredClosureRequirement { pub def: ClauseOwner, pub args: Vec<Gene
 
 /// N:diagnostics/bound_region_errors.rs UniverseInfo: why a universe was created.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UniverseInfo { RelateTys { expected: TyId, found: TyId }, TypeOp, Other }
+pub enum UniverseInfo {
+    RelateTys { expected: TyId, found: TyId },
+    /// rustc `UniverseInfo::TypeOp(Rc<dyn TypeOpInfo>)`: the type op that created the universe,
+    /// with the universe it started in (`base_universe`), for the higher-ranked error rerun.
+    TypeOp(std::sync::Arc<TypeOpErrorInfo>),
+    Other,
+}
+/// rustc `TypeOpInfo` data: the op's input and the universe the rerun's placeholders start from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypeOpErrorInfo { pub base_universe: UniverseIndex, pub input: crate::next_solver::type_op::TypeOpInput }
 
 /// A `span_mirbug!`: the MIR is ill-typed. It taints the body, never accepts it.
 #[derive(Clone, Debug, PartialEq, Eq)]
