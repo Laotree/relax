@@ -38,7 +38,7 @@ if not native:
     subprocess.run(prefix + ["cargo", "build", "--release", "--offline", "-q", "-j", "8"], cwd=here, env=env, check=True)
     native = os.path.join(target, "rustc/release/relax-rwbench" + exe)
 std = os.environ.get("MAKEPAD_RUN_STD", os.path.join(here, "../std"))
-base = dict(os.environ, RW_MS=os.environ.get("RW_MS", "4000"))
+base = dict(os.environ, RW_MS=os.environ.get("RW_MS", "8000"))
 LINE = r"^\| (\w+) steady_ms=([\d.]+) tts_main_ms=([\d.]+) tts_proc_ms=([\d.]+) iters=(\d+) first_ms=([\d.]+) (\d+)$"
 
 def one(cmd, e):
