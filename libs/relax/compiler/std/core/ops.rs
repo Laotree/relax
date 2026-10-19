@@ -67,16 +67,19 @@ pub trait IndexMut<Idx: ?Sized>: Index<Idx> {
 pub trait FnOnce<Args> {
     #[cfg_attr(not(relax_check), lang = "fn_once_output")]
     type Output;
+    #[unstable(feature = "fn_traits", issue = "29625")]
     extern "rust-call" fn call_once(self, args: Args) -> Self::Output;
 }
 #[cfg_attr(not(relax_check), lang = "fn_mut")]
 #[fundamental]
 pub trait FnMut<Args>: FnOnce<Args> {
+    #[unstable(feature = "fn_traits", issue = "29625")]
     extern "rust-call" fn call_mut(&mut self, args: Args) -> Self::Output;
 }
 #[cfg_attr(not(relax_check), lang = "fn")]
 #[fundamental]
 pub trait Fn<Args>: FnMut<Args> {
+    #[unstable(feature = "fn_traits", issue = "29625")]
     extern "rust-call" fn call(&self, args: Args) -> Self::Output;
 }
 

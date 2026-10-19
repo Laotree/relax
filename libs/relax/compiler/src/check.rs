@@ -203,6 +203,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, retry: false };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let body = tcx.typeck(prog, d);
+            // library stability (E0658) of what the body names
+            let gates = relax_types::feature_gate::check_stability(prog, &body);
+            let inner = || {
             if !body.errors.is_empty() {
                 return (body.errors.to_vec(), Vec::new());
             }
@@ -233,6 +236,10 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             let args: Vec<_> = if owner.kind == crate::borrowck::body::BodyKind::Function && !generic { Vec::new() } else { body.args.to_vec() };
             let diags = crate::borrowck::lazy::report_checked(prog, 0, tcx.collect_epoch.load(std::sync::atomic::Ordering::SeqCst), d, &args, v.errors, crate::borrowck::event::Origin::Check).iter().map(|e| e.error.to_diagnostic()).collect();
             (Vec::new(), diags)
+            };
+            let (mut errs, diags) = inner();
+            errs.extend(gates);
+            (errs, diags)
         }));
         match r {
             Ok((errs, diags)) => {

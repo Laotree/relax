@@ -31,6 +31,7 @@ pub fn check_crate(prog: &Program, krate: u32) -> Vec<String> {
     let root_file = prog.mods[info.root_mod as usize].file;
     let mut w = Gates::new(prog, krate, root_file, feats);
     w.crate_features();
+    w.cfg_scan();
     w.root_attrs();
     let pf = &prog.files[root_file as usize];
     let items: Vec<ItemId> = pf.ast.root_items.iter().copied().collect();
@@ -63,8 +64,12 @@ impl<'a> Gates<'a> {
         Gates::new(self.prog, self.krate, file, self.feats)
     }
 
+    /// Tokens the crate's author wrote: the file's text, fragments substituted from it, and the
+    /// body of a `macro_rules!` defined in this crate (rustc judges those spans). What a
+    /// built-in macro or another crate's macro produced is not (it may carry
+    /// `allow_internal_unstable`).
     fn is_source(&self, pos: u32) -> bool {
-        pos < self.pf.src_len
+        matches!(self.pf.expansion_kind(pos), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules)
     }
 
     fn tok_pos(&self, i: usize) -> u32 {
@@ -165,6 +170,61 @@ impl<'a> Gates<'a> {
     /// rustc_attr_parsing cfg.rs `try_gate_cfg` over the predicate in tokens [lo, hi): a gated
     /// name (`cfg(version)`, `cfg(ub_checks)`, ..) and the compact `target(..)` form.
     fn cfg_gates(&mut self, lo: usize, hi: usize) {
+        // (what the file's text wrote is gated by `cfg_scan`, which also sees the items the
+        // parser removed for their `cfg`)
+        if lo < hi && self.pf.expansion_kind(self.tok_pos(lo)) == crate::parser::ExpnKind::Root { return; }
+        self.cfg_gates_in(lo, hi);
+    }
+
+    /// Every `#[cfg(..)]`, `#[cfg_attr(..)]` and `cfg!(..)` the file's text writes, outside
+    /// `macro_rules!` bodies: rustc evaluates the `cfg` of every node it configures, including
+    /// the ones it then strips, which the parser has already removed from the tree here.
+    /// (A `cfg` nested in a stripped item is gated too, where rustc never evaluates it.)
+    fn cfg_scan(&mut self) {
+        let mut skip: Vec<(u32, u32)> = self.ast.items.iter().filter_map(|it| match it.kind {
+            ItemKind::MacroRules(r) => Some((r.lo, r.hi)),
+            _ => None,
+        }).collect();
+        skip.sort();
+        let n = self.pf.toks.len();
+        let mut i = 1;
+        while i + 2 < n {
+            let t = self.src.tok(i);
+            if t.lo >= self.pf.src_len { break; }
+            let name = if t.kind == T::Ident { cfg::tok_str(self.src, i) } else { &[][..] };
+            let (is_cfg, is_attr) = (name == b"cfg", name == b"cfg_attr");
+            if (is_cfg || is_attr) && !skip.iter().any(|&(lo, hi)| (i as u32) >= lo && (i as u32) < hi) {
+                let after = self.src.tok(i + 1).kind;
+                let before = self.src.tok(i - 1).kind;
+                let attr = before == T::OpenBracket && after == T::OpenParen;
+                let mac = is_cfg && after == T::Not && self.src.tok(i + 2).kind == T::OpenParen;
+                if attr || mac {
+                    let open = if attr { i + 1 } else { i + 2 };
+                    let mut depth = 0i32;
+                    let mut j = open;
+                    let mut end = n;
+                    while j < n {
+                        match self.src.tok(j).kind {
+                            T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
+                            T::CloseParen | T::CloseBracket | T::CloseBrace => {
+                                depth -= 1;
+                                if depth == 0 { end = j; break; }
+                            }
+                            T::Comma if depth == 1 && is_attr => { end = j; break; }
+                            _ => {}
+                        }
+                        j += 1;
+                    }
+                    self.cfg_gates_in(open + 1, end);
+                    i = end.max(i + 1);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    fn cfg_gates_in(&mut self, lo: usize, hi: usize) {
         let mut i = lo;
         while i < hi {
             let t = self.src.tok(i);
@@ -191,6 +251,15 @@ impl<'a> Gates<'a> {
         let wrapped = self.tok_is(lo, b"unsafe") && hi > lo + 1 && self.src.tok(lo + 1).kind == T::OpenParen;
         let first = if wrapped { lo + 2 } else { lo };
         if first >= hi || !matches!(self.src.tok(first).kind, T::Ident | T::KwBox | T::KwTry) { return; }
+        // the attribute's path
+        let mut path = String::new();
+        let mut j = first;
+        while j < hi && matches!(self.src.tok(j).kind, T::Ident | T::KwBox | T::KwTry | T::PathSep | T::KwCrate | T::KwSuper | T::KwSelfValue) {
+            path.push_str(&String::from_utf8_lossy(cfg::tok_str(self.src, j)));
+            j += 1;
+        }
+        let pos = self.tok_pos(lo);
+        self.unstable_macro_attr(a, &path, pos);
         // a single-segment name: `name`, `name(..)` or `name = ..`
         if first + 1 < hi && self.src.tok(first + 1).kind == T::PathSep { return; }
         let name = String::from_utf8_lossy(cfg::tok_str(self.src, first)).into_owned();
@@ -206,9 +275,47 @@ impl<'a> Gates<'a> {
                     self.coded("E0734", pos, "stability attributes may not be used outside of the standard library");
                 }
             }
+            "crate_type" if hi > first + 2 && cfg::tok_str(self.src, first + 2) == b"\"sdylib\"" => {
+                self.gate("export_stable", pos, "`sdylib` crate type is unstable");
+            }
+            "link" => {
+                for (i, _) in self.list_items(first + 1, hi) {
+                    if self.tok_is(i, b"cfg") { self.gate("link_cfg", pos, "link cfg is unstable"); }
+                }
+            }
             "doc" => self.doc_gates(first + 1, hi, pos),
             "used" => self.used_gates(first + 1, hi, pos),
             _ => {}
+        }
+    }
+
+    /// Attribute macros of core that are `#[unstable]` (library/core/src/macros/mod.rs,
+    /// library/core/src/contracts.rs), and inner attributes naming a macro
+    /// (rustc_resolve/src/macros.rs: `custom_inner_attributes`).
+    fn unstable_macro_attr(&mut self, a: &Attr, path: &str, pos: u32) {
+        const UNSTABLE: &[(&str, &str, &str)] = &[
+            ("bench", "test", "`bench` is a part of custom test frameworks which are unstable"),
+            ("test_case", "custom_test_frameworks", "custom test frameworks are an unstable feature"),
+            ("derive_const", "derive_const", ""),
+            ("cfg_accessible", "cfg_accessible", "`cfg_accessible` is not fully implemented"),
+            ("eii", "extern_item_impls", ""),
+            ("unsafe_eii", "extern_item_impls", ""),
+            ("alloc_error_handler", "alloc_error_handler", ""),
+        ];
+        // (the prelude's macros, or the same through `core::prelude::v1` / `std::prelude::v1`)
+        let last = path.rsplit("::").next().unwrap_or("");
+        let in_prelude = !path.contains("::") || matches!(path.strip_suffix(last), Some("core::prelude::v1::" | "std::prelude::v1::" | "core::prelude::rust_2021::" | "std::prelude::rust_2021::"));
+        if in_prelude {
+            if let Some(&(_, feature, reason)) = UNSTABLE.iter().find(|(n, _, _)| *n == last) {
+                let msg = if reason.is_empty() { format!("use of unstable library feature `{}`", feature) } else { format!("use of unstable library feature `{}`: {}", feature, reason) };
+                self.gate(feature, pos, &msg);
+            }
+            if a.inner && matches!(last, "test" | "bench" | "test_case" | "derive" | "global_allocator" | "cfg_accessible" | "cfg_eval" | "derive_const" | "alloc_error_handler") {
+                self.gate("custom_inner_attributes", pos, "inner macro attributes are unstable");
+            }
+        }
+        if matches!(path, "core::contracts::requires" | "core::contracts::ensures" | "std::contracts::requires" | "std::contracts::ensures") {
+            self.gate("contracts", pos, "use of unstable library feature `contracts`");
         }
     }
 
@@ -249,6 +356,10 @@ impl<'a> Gates<'a> {
                 "masked" => ("doc_masked", "experimental"),
                 "notable_trait" => ("doc_notable_trait", "experimental"),
                 "attribute" | "keyword" | "fake_variadic" | "search_unbox" => ("rustdoc_internals", "meant for internal use only"),
+                "rust_logo" => {
+                    self.gate("rustdoc_internals", pos, "the `#[doc(rust_logo)]` attribute is used for Rust branding");
+                    continue;
+                }
                 _ => continue,
             };
             self.gate(feature, pos, &format!("`#[doc({})]` is {}", name, how));
@@ -285,7 +396,8 @@ impl<'a> Gates<'a> {
         let ast = self.ast;
         let pos = item.lo;
         match item.kind {
-            ItemKind::Use(_) | ItemKind::ExternCrate(_) | ItemKind::MacroRules(_) | ItemKind::Mac(_) => {}
+            ItemKind::Use(_) | ItemKind::ExternCrate(_) | ItemKind::Mac(_) => {}
+            ItemKind::MacroRules(r) => self.metavar_exprs(r),
             ItemKind::Fn(sig, _, _) => {
                 let sig = *ast.fn_sig(sig);
                 if sig.variadic && ctx != Ctx::Foreign {
@@ -303,6 +415,9 @@ impl<'a> Gates<'a> {
             ItemKind::Union(r) => {
                 let u = *ast.row(r);
                 self.repr_simd(attrs);
+                if self.has_repr(attrs, b"transparent") {
+                    self.gate("transparent_unions", pos, "transparent unions are unstable");
+                }
                 self.generics(&u.generics);
                 self.fields(u.fields);
             }
@@ -357,6 +472,15 @@ impl<'a> Gates<'a> {
             ItemKind::Impl(r) => {
                 let im = *ast.row(r);
                 if im.negative { self.gate("negative_impls", pos, "negative impls are experimental"); }
+                if im.trait_.is_none() {
+                    // type_of.rs check_feature_inherent_assoc_ty: `impl Ty { type A = ..; }`
+                    for &i in ast.list(im.items) {
+                        let c = ast.item(i);
+                        if matches!(c.kind, ItemKind::TypeAlias(_)) && self.prog.item_defs.get(&(self.file, i.0)).is_some() {
+                            self.gate("inherent_associated_types", c.lo, "inherent associated types are unstable");
+                        }
+                    }
+                }
                 self.generics(&im.generics);
                 if let Some(p) = im.trait_ { self.path(&p); }
                 self.ty(im.self_ty);
@@ -374,6 +498,7 @@ impl<'a> Gates<'a> {
                 let file = self.prog.mods[def.sub as usize].file;
                 if file == self.file { return; }
                 let mut sub = self.in_file(file);
+                sub.cfg_scan();
                 sub.root_attrs();
                 let items: Vec<ItemId> = sub.ast.root_items.iter().copied().collect();
                 sub.items(&items, Ctx::Free);
@@ -384,6 +509,34 @@ impl<'a> Gates<'a> {
                 let items = ast.list(f.items).to_vec();
                 self.items(&items, Ctx::Foreign);
             }
+        }
+    }
+
+    fn has_repr(&self, attrs: &[Attr], word: &[u8]) -> bool {
+        attrs.iter().any(|a| {
+            if !self.attr_is(a, b"repr") { return false; }
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            self.list_items(lo + 1, hi).iter().any(|&(i, _)| self.tok_is(i, word))
+        })
+    }
+
+    /// rustc_expand/src/mbe/quoted.rs: `${..}` meta-variable expressions (and `$$`) in a
+    /// `macro_rules!` definition, `${concat(..)}` additionally.
+    fn metavar_exprs(&mut self, r: TokRange) {
+        let mut i = r.lo as usize;
+        while i + 1 < r.hi as usize {
+            if self.src.tok(i).kind == T::Dollar {
+                let next = self.src.tok(i + 1).kind;
+                if next == T::OpenBrace || next == T::Dollar {
+                    let pos = self.tok_pos(i);
+                    self.gate("macro_metavar_expr", pos, "meta-variable expressions are unstable");
+                    if next == T::OpenBrace && i + 2 < r.hi as usize && self.tok_is(i + 2, b"concat") {
+                        self.gate("macro_metavar_expr_concat", pos, "the `concat` meta-variable expression is unstable");
+                    }
+                    if next == T::Dollar { i += 1; }
+                }
+            }
+            i += 1;
         }
     }
 
@@ -757,7 +910,15 @@ impl<'a> Gates<'a> {
             }
             ExprKind::Break(_, v) => if let Some(x) = v.get() { self.expr(x) },
             ExprKind::Return(v) | ExprKind::Yield(v) => if let Some(x) = v.get() { self.expr(x) },
-            ExprKind::Continue(_) | ExprKind::Underscore | ExprKind::Mac(_) => {}
+            ExprKind::Mac(r) => {
+                let m = *ast.row(r);
+                // `cfg!(pred)`: the predicate's cfg gates
+                let segs = ast.segs(m.path.segs);
+                if segs.len() == 1 && self.pf.text(segs[0].name) == "cfg" {
+                    self.cfg_gates(m.toks.lo as usize, m.toks.hi as usize);
+                }
+            }
+            ExprKind::Continue(_) | ExprKind::Underscore => {}
             ExprKind::Closure(r) => {
                 let c = *ast.row(r);
                 for p in ast.list(c.params).to_vec() {
@@ -803,4 +964,58 @@ pub fn check_bodies(prog: &Program, krate: u32) -> Vec<String> {
         out.append(&mut w.errors);
     }
     out
+}
+
+/// rustc_passes/src/stability.rs `check_path` / `check_method_call`: a std item marked
+/// `#[unstable(feature = "..")]` that a checked body names (a path or a method call written in
+/// the crate's source) without enabling the feature. Relax's std marks the items its tests
+/// reach (`fn_traits`): the table of rustc's library is not mirrored.
+pub fn check_stability(prog: &Program, body: &crate::typeck::Body) -> Vec<String> {
+    let krate = prog.def(body.def).krate;
+    let feats = prog.crates[krate as usize].features(prog);
+    let pf = &*prog.files[body.file as usize];
+    let mut out = Vec::new();
+    let mut visit = |e: u32, d: crate::program::DefId| {
+        let def = prog.def(d);
+        if def.krate == krate { return; }
+        let Some((feature, reason)) = unstable_of(prog, d) else { return };
+        let ex = *pf.ast.expr(ExprId(e));
+        if feats.has(&feature) || !matches!(pf.expansion_kind(ex.lo), crate::parser::ExpnKind::Root | crate::parser::ExpnKind::LocalRules) { return; }
+        let msg = match reason { Some(r) => format!("E0658: use of unstable library feature `{}`: {}", feature, r), None => format!("E0658: use of unstable library feature `{}`", feature) };
+        out.push(prog.record_error(body.file, ex.lo, "typeck", msg));
+    };
+    for (&e, r) in body.res.iter() {
+        if let crate::typeck::Res::Def(d) = *r { visit(e, d); }
+    }
+    for (&e, m) in body.methods.iter() { visit(e, m.def); }
+    out
+}
+
+/// `#[unstable(feature = "name", reason = "..")]` on a definition's item: (feature, reason).
+fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
+    let def = prog.def(d);
+    let pf = &*prog.files[def.file as usize];
+    let src = prog.src(def.file);
+    let item = pf.ast.item(def.item);
+    for a in pf.ast.list(item.attrs) {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        if hi <= lo + 3 || cfg::tok_str(src, lo) != b"unstable" { continue; }
+        let (mut feature, mut reason) = (None, None);
+        let mut i = lo + 2;
+        while i + 2 < hi {
+            if src.tok(i + 1).kind == T::Eq && src.tok(i + 2).kind == T::Str {
+                let v = String::from_utf8_lossy(cfg::tok_str(src, i + 2)).trim_matches('"').to_string();
+                match cfg::tok_str(src, i) {
+                    b"feature" => feature = Some(v),
+                    b"reason" => reason = Some(v),
+                    _ => {}
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        return feature.map(|f| (f, reason));
+    }
+    None
 }
