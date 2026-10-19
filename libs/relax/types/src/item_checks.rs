@@ -2,6 +2,7 @@
 //! rustc_resolve build_reduced_graph / report_conflict) and recursive types without
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
+use crate::ast;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -203,6 +204,84 @@ pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
     Some(prog.record_error(def.file, pos, "typeck", format!(
         "E0072: recursive type{} {} {} infinite size -- help: insert some indirection (e.g., a `Box`, `Rc`, or `&`) to break the cycle",
         if items.len() == 1 { "" } else { "s" }, list, if items.len() == 1 { "has" } else { "have" })))
+}
+
+/// E0391 for a trait's supertrait bounds (rustc_hir_analysis collect/predicates_of.rs
+/// super_predicates_of): a trait that is its own supertrait, directly or through others, and a
+/// bound that names an associated type through `Self` (`trait T: Iterator<Item = Self::Item>`),
+/// which asks for the super traits that define it while they are being computed.
+pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
+    let def = prog.def(td);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(ast::TraitItem { supers, .. }) = ast.as_trait(&ast.item(def.item).kind) else { return Vec::new() };
+    let mut out = Vec::new();
+    // a cycle through the super bounds: reported once, at its lowest member
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = tcx.trait_supers(prog, td);
+    let mut cyclic = false;
+    let mut members = vec![td];
+    while let Some(t) = stack.pop() {
+        if t == td { cyclic = true; continue; }
+        if !seen.insert(t) { continue; }
+        members.push(t);
+        stack.extend(tcx.trait_supers(prog, t));
+    }
+    if cyclic {
+        // members that are on the cycle: those that reach `td` again
+        let on_cycle = |m: DefId| -> bool {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = tcx.trait_supers(prog, m);
+            while let Some(t) = stack.pop() {
+                if t == m { return true; }
+                if !seen.insert(t) { continue; }
+                stack.extend(tcx.trait_supers(prog, t));
+            }
+            false
+        };
+        if members.iter().copied().filter(|m| on_cycle(*m)).all(|m| m.0 >= td.0) {
+            out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+                format!("E0391: cycle detected when computing the super predicates of `{}`", prog.def_path(td))));
+        }
+    }
+    let mut self_assoc = false;
+    for b in ast.list(*supers) {
+        if let ast::Bound::Trait { path, .. } = b {
+            for seg in ast.segs(path.segs) {
+                match ast.gargs(seg.args()) {
+                    Some(ast::GenericArgs::Angle(v)) => for g in ast.list(*v) {
+                        match g {
+                            ast::GenericArg::Type(t) | ast::GenericArg::Binding(_, _, t) => self_assoc |= names_self_assoc(ast, *t, 0),
+                            _ => {}
+                        }
+                    },
+                    _ => {}
+                }
+            }
+        }
+    }
+    if self_assoc {
+        out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+            format!("E0391: cycle detected when computing the super traits of `{}` with an associated type name", prog.def_path(td))));
+    }
+    out
+}
+
+/// Does the type name an associated type through `Self` (`Self::Item`)?
+fn names_self_assoc(ast: &ast::Ast, t: ast::TyId, depth: u32) -> bool {
+    if depth > 16 { return false; }
+    match ast.ty(t) {
+        ast::Ty::Path(p) => {
+            let segs = ast.segs(p.segs);
+            if segs.len() >= 2 && p.no_qself() && segs[0].kind() == ast::SegKind::SelfType { return true; }
+            segs.iter().any(|s| match ast.gargs(s.args()) {
+                Some(ast::GenericArgs::Angle(v)) => ast.list(*v).iter().any(|g| matches!(g, ast::GenericArg::Type(x) | ast::GenericArg::Binding(_, _, x) if names_self_assoc(ast, *x, depth + 1))),
+                _ => false,
+            })
+        }
+        ast::Ty::Ref(_, _, x) | ast::Ty::Ptr(_, x) | ast::Ty::Slice(x) | ast::Ty::Array(x, _) | ast::Ty::Paren(x) => names_self_assoc(ast, *x, depth + 1),
+        ast::Ty::Tuple(v) => ast.list(*v).iter().any(|x| names_self_assoc(ast, *x, depth + 1)),
+        _ => false,
+    }
 }
 
 /// rustc_hir_analysis wfcheck.rs check_impl: a trait impl's trait reference is well formed --
