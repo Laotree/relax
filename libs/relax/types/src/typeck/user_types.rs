@@ -56,8 +56,45 @@ impl Fcx<'_> {
         let can_contain = args.iter().any(|&arg| self.arg_can_contain_user_lifetime_bounds(arg))
             || user_self_ty.is_some_and(|s| self.can_contain_user_lifetime_bounds(self.tcx.tys.flags(s.self_ty)));
         if !can_contain { return; }
+        // The overwhelmingly common path -- every argument a distinct fresh variable -- is the
+        // identity annotation by construction (canonical variables number in first-occurrence
+        // order); decide that without canonicalizing.
+        if user_self_ty.is_none() && self.args_are_distinct_fresh_vars(args) { return; }
         let user = UserType::new(UserTypeKind::TypeOf(def, UserArgs { args: args.to_vec(), user_self_ty }));
         self.write_user_type_annotation(UserTypeKey::of_node(node), user);
+    }
+
+    /// Whether `args` are unresolved inference variables, all different (after unification):
+    /// then `CanonicalUserType::is_identity` holds for them. Anything else answers false.
+    fn args_are_distinct_fresh_vars(&mut self, args: &[GenericArg]) -> bool {
+        let tys = &self.tcx.tys;
+        let mut seen: Vec<(u8, u32)> = Vec::with_capacity(args.len());
+        for &arg in args {
+            let key = match arg {
+                GenericArg::Type(ty) => {
+                    let ty = self.infcx.shallow_resolve(ty);
+                    match *tys.kind(ty) {
+                        TyKind::Infer(vid) => (0, self.infcx.inner.borrow_mut().type_variables().root_var(vid)),
+                        _ => return false,
+                    }
+                }
+                GenericArg::Lifetime(r) => match tys.region_kind(r) {
+                    crate::types::RegionKind::ReVar(vid) => (1, vid),
+                    _ => return false,
+                },
+                GenericArg::Const(ct) => {
+                    let ct = self.infcx.shallow_resolve_const(ct);
+                    match tys.const_kind(ct) {
+                        crate::consts::ConstKind::Infer(crate::consts::InferConst::Var(vid)) =>
+                            (2, self.infcx.inner.borrow_mut().const_unification_table().find(vid.0)),
+                        _ => return false,
+                    }
+                }
+            };
+            if seen.contains(&key) { return false; }
+            seen.push(key);
+        }
+        true
     }
 
     /// fn_ctxt/_impl.rs:556-565 + check_struct_path (checks.rs:790-815): a struct literal or
