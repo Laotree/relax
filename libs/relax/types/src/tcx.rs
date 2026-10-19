@@ -2830,6 +2830,19 @@ impl Tcx {
             }
             return prog.lookup_in_scope(module, segs[0].1, true);
         }
+        if segs.len() == 1 {
+            // `::Name`: 2015 names an item of the crate root (extern crates are root items), 2018
+            // an extern-prelude crate
+            let krate = prog.mods[module as usize].krate;
+            let (kind, name) = segs[0];
+            if kind != SegKind::Ident { return None; }
+            let from_extern = || prog.extern_crate(module, name).map(|c| prog.mods[prog.crates[c as usize].root_mod as usize].def);
+            if prog.crates[krate as usize].edition < 2018 {
+                let root = prog.mods[prog.crates[krate as usize].root_mod as usize].def;
+                return prog.lookup_in_container(root, name, true).or_else(from_extern);
+            }
+            return from_extern();
+        }
         let parent = prog.resolve_mod_path(module, p.global(), &segs[..segs.len() - 1], false, false)?;
         prog.lookup_in_container(parent, segs[segs.len() - 1].1, true)
     }
