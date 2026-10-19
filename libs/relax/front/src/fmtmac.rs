@@ -283,8 +283,10 @@ impl<'a> Parser<'a> {
                 g.p(if eq { "!(*__relax_l == *__relax_r)" } else { "*__relax_l == *__relax_r" });
                 g.p(&format!(" {{ {}::panicking::panic_at(", CORE));
                 let op = if eq { "==" } else { "!=" };
-                let l = Src::Ref("__relax_l".to_string());
-                let r = Src::Ref("__relax_r".to_string());
+                // rustc's assert_failed formats `&left` (a `&&T`, `T: ?Sized`): `&T: Debug`
+                // keeps unsized operands (`dyn Tr`, `[T]`) out of the Sized-bounded Argument::new_debug
+                let l = Src::Val("__relax_l".to_string());
+                let r = Src::Val("__relax_r".to_string());
                 let dbg = || default_spec("new_debug");
                 let mut pieces = vec![Piece::Lit(format!("assertion `left {} right` failed", op))];
                 let mut srcs = Vec::new();

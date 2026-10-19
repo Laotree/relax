@@ -1173,91 +1173,23 @@ impl<'a> Fcx<'a> {
         Some(ty)
     }
 
-    /// Trait object upcasting (stable since 1.86): a pointer to `dyn Sub` as a pointer to
-    /// `dyn Super` where Super is a supertrait of Sub (transitively); pointer shapes as for
-    /// `dyn_coercion`. Generic supertraits other than the Fn family are not upcast here.
+    /// Trait object upcasting (stable since 1.86), `dyn Tr + Auto` -> `dyn Tr`, `dyn Tr` -> `dyn Auto`:
+    /// the pointee pair is unsized by the solver's `dyn A: Unsize<dyn B>` candidates (rustc
+    /// consider_builtin_dyn_upcast_candidates); pointer shapes as for `dyn_coercion`.
     fn dyn_upcast(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
-        let (a, d) = match (ka, kx) {
-            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
-            (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
-                let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
-                let i = (0..xs.len()).find(|&i| {
-                    let (x, y) = (self.shallow(xs[i]), self.shallow(ys[i]));
-                    matches!(self.tcx.tys.kind(x), TyKind::Dyn(..)) && matches!(self.tcx.tys.kind(y), TyKind::Dyn(..)) && x != y
-                })?;
-                for j in 0..xs.len() {
-                    if j != i && !self.eq(xs[j], ys[j]) {
-                        return None;
-                    }
-                }
-                (xs[i], ys[i])
-            }
-            _ => return None,
-        };
+        let (a, d) = self.unsize_pointee_pair(ka, kx, true)?;
         let (a, d) = (self.shallow(a), self.shallow(d));
-        let (sd, sargs, sautos) = match self.tcx.tys.kind(a).clone() {
-            TyKind::Dyn(t, v, _, _, _, _, autos) => (t, v, autos),
-            _ => return None,
-        };
-        let (td, targs, tautos) = match self.tcx.tys.kind(d).clone() {
-            TyKind::Dyn(t, v, _, _, _, _, autos) => (t, v, autos),
-            _ => return None,
-        };
-        if !self.tcx.tys.list(tautos).iter().all(|t| self.tcx.tys.list(sautos).contains(t)) { return None; }
-        if sd == td {
-            let TyKind::Dyn(td, args, bindings, rs, region, bound, _) = *self.tcx.tys.kind(a) else { unreachable!() };
-            let erased = self.tcx.tys.intern(TyKind::Dyn(td, args, bindings, rs, region, bound, tautos));
-            return if self.eq(erased, d) { Some((a, d)) } else { None };
-        }
-        // Fn -> FnMut -> FnOnce: the same call entry
-        if self.is_fn_trait(sd) && self.is_fn_trait(td) {
-            if let (Some(x), Some(y)) = (self.tcx.tys.list(sargs).first(), self.tcx.tys.list(targs).first()) {
-                if self.eq(*x, *y) {
-                    return Some((a, d));
-                }
-            }
-            return None;
-        }
-        // the supertrait instantiations of `sd<sargs>` (rustc: upcasting to a supertrait trait
-        // ref; `dyn Foo<bool>` -> `dyn Bar<bool>` where `Foo<T>: Bar<i32> + Bar<T>`)
-        let sargs: Vec<TyId> = self.tcx.tys.list(sargs).iter().map(|x| self.infcx.deeply_resolve_ignoring_regions(*x)).collect();
-        let targs = self.tcx.tys.list(targs);
-        let mut todo = vec![(sd, sargs)];
-        let mut seen: Vec<(DefId, Vec<TyId>)> = Vec::new();
-        let mut hits: Vec<Vec<TyId>> = Vec::new();
-        while let Some(t) = todo.pop() {
-            if seen.contains(&t) {
-                continue;
-            }
-            seen.push(t.clone());
-            for (sup, supargs) in self.tcx.trait_super_refs(&self.cx.with_infcx(&self.infcx), self.prog, t.0, &t.1) {
-                if sup == td && !hits.contains(&supargs) {
-                    hits.push(supargs.clone());
-                }
-                todo.push((sup, supargs));
-            }
-        }
-        // the one instantiation the target's args can be
-        let mut fit = Vec::new();
-        for h in hits {
-            let snap = self.start_snapshot();
-            let ok = h.len() == targs.len() && (0..h.len()).all(|i| self.eq(h[i], targs[i]));
-            self.rollback_to(snap);
-            if ok {
-                fit.push(h);
-            }
-        }
-        if fit.len() == 1 {
-            let h = fit.pop().unwrap();
-            for i in 0..h.len() {
-                self.eq(h[i], targs[i]);
-            }
-            return Some((a, d));
-        }
-        None
+        if a == d || !matches!(self.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
+        let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
+        self.select_trait(unsize, a, &[d]).ok()?;
+        Some((a, d))
     }
 
-    fn dyn_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
+    /// The pointee pair a pointer coercion unsizes: `&A` / `*A` / `P<..A..>` against `&B` / `*B` /
+    /// `P<..B..>`, then down a struct tail (`S<A>` against `S<B>`, rustc coerce_unsized: `S<T>:
+    /// Unsize<S<U>>` when the last field's type does) to the types that become / are trait objects.
+    /// `upcast`: the source pointee is itself a trait object (dyn -> dyn).
+    fn unsize_pointee_pair(&mut self, ka: &TyKind, kx: &TyKind, upcast: bool) -> Option<(TyId, TyId)> {
         let (src, dy) = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
@@ -1270,7 +1202,7 @@ impl<'a> Fcx<'a> {
                     // numeric impl, or the literal fallback's
                     let open = match self.tcx.tys.kind(x) {
                         TyKind::Infer(_) => true,
-                        TyKind::Dyn(..) => true,
+                        TyKind::Dyn(..) => !upcast,
                         _ => false,
                     };
                     if x != y && self.has_dyn(y) && !open {
@@ -1316,6 +1248,11 @@ impl<'a> Fcx<'a> {
                     }
                 }
         };
+        Some((src, dy))
+    }
+
+    fn dyn_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
+        let (src, dy) = self.unsize_pointee_pair(ka, kx, false)?;
         let src = self.shallow(src);
         let dy = self.shallow(dy);
         // An unresolved pointee may itself become `dyn Tr` (for example the `_`
