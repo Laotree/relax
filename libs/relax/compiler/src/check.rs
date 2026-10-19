@@ -306,6 +306,9 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an
     // E0080 (the unit notes it, reported below with the builds' other notes)
     eval_items(up, &own);
+    // rustc_monomorphize: a program's `main` and what it reaches, instantiated -- the constants
+    // generic code evaluates there (post-monomorphization E0080) -- in a check of a program
+    if options.const_fuel && !compile { mono_check(up, &own, root); }
     let t_front = t_check.elapsed();
     // the type/borrow check's freed memory goes back before the compile starts (Stage: 4.6 GB
     // of malloc free pages held after it)
@@ -666,5 +669,50 @@ fn eval_items(up: *mut Unit, own: &[bool]) {
         while i < u.errors.len() {
             if u.errors[i].starts_with("compile error in ") && u.errors[i].contains("not found in the loaded libraries") { u.errors.remove(i); } else { i += 1; }
         }
+    }
+}
+
+/// rustc's collect_and_partition_mono_items for a binary, reduced to its constants: every
+/// instance of the checked crates' fns reachable from `main` is lowered (not compiled), which
+/// evaluates the constants it names with its type arguments; a failing one is reported
+/// (E0080) as rustc's codegen reports it. Library code is not entered: its constants are not
+/// the program's diagnostics.
+fn mono_check(up: *mut Unit, own: &[bool], root: u32) {
+    let u = unsafe { &mut *up };
+    let main = (0..u.prog.defs.len()).map(|i| crate::program::DefId(i as u32)).find(|&d| {
+        let def = u.prog.def(d);
+        def.kind == DefKind::Fn && def.krate == root && u.prog.name(d) == "main"
+            && def.parent == u.prog.mods[u.prog.crates[root as usize].root_mod as usize].def
+    });
+    let Some(main) = main else { return };
+    let _job = jit::compile_job();
+    let mut work: Vec<u32> = vec![crate::owner::call(crate::owner::Class::App, || unsafe { (&mut *up).fn_id(FnKey::Inst(main, Vec::new())) })];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = work.pop() {
+        if !seen.insert(id) { continue; }
+        let callees = crate::owner::call(crate::owner::Class::App, || unsafe {
+            let u = &*up;
+            let mine = match &u.fns[id as usize].key {
+                FnKey::Inst(d, _) => own[u.prog.def(*d).krate as usize],
+                FnKey::Closure(file, _, _) => u.prog.file_crate.get(*file as usize).is_some_and(|&k| own[k as usize]),
+                _ => false,
+            };
+            if !mine { return Vec::new(); }
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| jit::build_rir(up, id)));
+            if !matches!(built, Ok(Ok(()))) { return Vec::new(); }
+            let mut out = Vec::new();
+            if let Some(f) = &(&*up).fns[id as usize].rir {
+                for b in &f.blocks {
+                    for i in &b.insts {
+                        match i {
+                            crate::rir::Inst::Call(crate::rir::Callee::Fn(c) | crate::rir::Callee::CFn(c, _), _, _) | crate::rir::Inst::FnAddr(_, c) => out.push(*c),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            out
+        });
+        work.extend(callees);
     }
 }
