@@ -71,6 +71,8 @@ struct State {
     lin: Vec<(u32, u32, i64, u8)>,
     /// x cond y known true (from branch edges)
     rel: Vec<(Cond, bool, u32, Opnd)>,
+    /// d <= x (signed?, d, x): d is a select of two values and a compare of them, `min(x, y)`
+    le: Vec<(bool, u32, u32)>,
 }
 
 impl State {
@@ -79,6 +81,7 @@ impl State {
         self.cmp.retain(|(d, _, _, x, y)| *d != v && *x != v && *y != Opnd::V(v));
         self.lin.retain(|(d, x, _, _)| *d != v && *x != v);
         self.rel.retain(|(_, _, x, y)| *x != v && *y != Opnd::V(v));
+        self.le.retain(|(_, d, x)| *d != v && *x != v);
     }
     fn get(&self, v: u32) -> Option<R> {
         self.rng.get(&v).copied()
@@ -107,6 +110,7 @@ impl State {
             cmp: self.cmp.iter().filter(|x| o.cmp.contains(x)).copied().collect(),
             lin: self.lin.iter().filter(|x| o.lin.contains(x)).copied().collect(),
             rel: self.rel.iter().filter(|x| o.rel.contains(x)).copied().collect(),
+            le: self.le.iter().filter(|x| o.le.contains(x)).copied().collect(),
         }
     }
     /// only facts on vregs outside `defd` (a loop's header: the facts its body cannot change)
@@ -120,6 +124,7 @@ impl State {
         self.cmp.retain(|(d, _, _, x, y)| out(*d) && out(*x) && opo(y));
         self.lin.retain(|(d, x, _, _)| out(*d) && out(*x));
         self.rel.retain(|(_, _, x, y)| out(*x) && opo(y));
+        self.le.retain(|(_, d, x)| out(*d) && out(*x));
     }
 }
 
@@ -409,6 +414,34 @@ fn same_as(st: &State, v: u32) -> Vec<u32> {
     out
 }
 
+/// `d` and the values it is known to be at most (through chains of selects of minima)
+fn above(st: &State, signed: bool, d: u32) -> Vec<u32> {
+    let mut out = vec![d];
+    let mut k = 0;
+    while k < out.len() && out.len() < 12 {
+        let w = out[k];
+        k += 1;
+        for &(ls, ld, lx) in &st.le {
+            if ls == signed && ld == w && !out.contains(&lx) {
+                out.push(lx);
+            }
+        }
+    }
+    out
+}
+
+/// the comparison that holds exactly when `c` does not, for the orders only (`x < y` against
+/// `x >= y`): decide_rel reads a derived `x < y` as the negation of `y <= x` and so on
+fn flip(c: Cond) -> Option<Cond> {
+    // c false <=> (c's negation) true, and the negation of Lt is Ge, of Le is Gt: the derivations
+    // above only prove Lt / Le, so a Ge / Gt query is false exactly when Lt / Le is implied
+    match c {
+        Cond::Ge => Some(Cond::Lt),
+        Cond::Gt => Some(Cond::Le),
+        _ => None,
+    }
+}
+
 fn decide_rel(st: &State, c: Cond, signed: bool, x: u32, y: Opnd) -> Option<bool> {
     let xs = same_as(st, x);
     let ys: Vec<Opnd> = match y {
@@ -426,6 +459,29 @@ fn decide_rel(st: &State, c: Cond, signed: bool, x: u32, y: Opnd) -> Option<bool
         }
     }
     let Opnd::V(yv) = y else { return None };
+    // x < d (or <=) and d <= y: d = min(y, ..) after `n = a.len().min(b.len())` and `i < n`
+    {
+        let ys = same_as(st, yv);
+        let implied = |c: Cond| -> bool {
+            if !matches!(c, Cond::Lt | Cond::Le) {
+                return false;
+            }
+            st.rel.iter().any(|&(rc, rs, rx, ry)| {
+                rs == signed
+                    && xs.contains(&rx)
+                    && (rc == Cond::Lt || (rc == Cond::Le && c == Cond::Le))
+                    && matches!(ry, Opnd::V(d) if above(st, signed, d).iter().any(|u| ys.contains(u)))
+            })
+        };
+        if implied(c) {
+            return Some(true);
+        }
+        if let Some(nc) = flip(c) {
+            if implied(nc) {
+                return Some(false);
+            }
+        }
+    }
     // y = x + k or x = y + k, the sum not wrapping over x's (y's) interval
     for &(d, s, k, b) in &st.lin {
         let (lhs_is_x, base) = if d == yv && s == x {
@@ -760,6 +816,17 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                 Inst::ICmp(c, s, d, x, y) if d != x && d != y => Some((d.0, *c, *s, x.0, Opnd::V(y.0))),
                 _ => None,
             };
+            // d = c ? x : y with c = (x < y): d = min(x, y), d <= x and d <= y
+            let sel_min = match &*i {
+                Inst::Sel(d, c, a, b2) if d != a && d != b2 => st.cmp.iter().find(|f| f.0 == c.0).and_then(|&(_, cond, sg, x, y)| {
+                    if matches!(cond, Cond::Lt | Cond::Le) && x == a.0 && y == Opnd::V(b2.0) {
+                        Some((sg, a.0, b2.0))
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
             let linf = match &*i {
                 // exact as u64 intervals only for 64-bit or unsigned types (a narrow signed
                 // value is sign-extended)
@@ -803,6 +870,10 @@ fn run(f: &mut Func, lv: &HashMap<(u32, u32), u8>, spec: bool, res: &mut Vec<((u
                 push_capped(&mut st.rel, c);
             }
             if let [d] = ds[..] {
+                if let Some(l) = sel_min {
+                    push_capped(&mut st.le, (l.0, d, l.1));
+                    push_capped(&mut st.le, (l.0, d, l.2));
+                }
                 let r = match &*i {
                     Inst::Iconst(_, k) => Some(konst(*k)),
                     _ => r,

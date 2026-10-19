@@ -196,6 +196,20 @@ fn diff_lanes_ref(a: &[f32], b: &[f32], limit: f32) -> (f32, f32) {
     (acc[0] + acc[1] + acc[2] + acc[3], rounds)
 }
 
+/// the index bounded by `min` of two lengths: no slicing first
+#[inline(never)]
+fn idx_sq(out: &mut [f32], a: &[f32]) {
+    for i in 0..out.len().min(a.len()) {
+        out[i] = a[i] * a[i];
+    }
+}
+#[inline(never)]
+fn idx_sq_ref(out: &mut [f32], a: &[f32]) {
+    for i in 0..out.len().min(a.len()) {
+        out[i] = black_box(a[i] * a[i]);
+    }
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -226,6 +240,18 @@ fn vectorized_maps() {
                 mix_i32(&mut a1[lo..hi], &isrc[lo..hi], black_box(ki));
                 mix_i32_ref(&mut a2[lo..hi], &isrc[lo..hi], ki);
                 fails += (a1 != a2) as u32;
+            }
+            for lo in 0..3usize {
+                let mut y1 = vec![3.0f32; 64];
+                let mut y2 = vec![3.0f32; 64];
+                idx_sq(&mut y1[lo..], &src[..n]);
+                idx_sq_ref(&mut y2[lo..], &src[..n]);
+                fails += (bits(&y1) != bits(&y2)) as u32;
+                let mut y1 = vec![3.0f32; 64];
+                let mut y2 = vec![3.0f32; 64];
+                idx_sq(&mut y1[..n], &src[lo..]);
+                idx_sq_ref(&mut y2[..n], &src[lo..]);
+                fails += (bits(&y1) != bits(&y2)) as u32;
             }
             for lo in 0..3usize {
                 let hi = (lo + n).min(64);
