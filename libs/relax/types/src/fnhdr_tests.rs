@@ -86,7 +86,7 @@ fn check(source: &str, reject: bool) {
     let state = EvalState::new();
     let cx = EvalCx::new(&prog, &tcx, TypingEnv::fully_monomorphized(&prog), &state);
     let body = crate::typeck::instantiate_body(&cx, &prog, &tcx, named(&prog, "probe"), &[]);
-    assert_eq!(!body.errors.is_empty(), reject, "{:?}", body.errors);
+    assert_eq!(!body.errors.is_empty(), reject, "{source}: {:?}", body.errors);
     if reject {
         assert!(body.errors.iter().any(|e| e.contains("mismatched types") || e.contains("E0061") || e.contains("E0605")), "{:?}", body.errors);
     }

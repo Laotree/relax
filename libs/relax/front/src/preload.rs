@@ -124,6 +124,8 @@ struct PoolState {
     scans: std::collections::BTreeMap<ScanPriority, ScanKey>,
     scan_seq: u64,
     seen: HashSet<ScanKey>,
+    /// the scan that found each scanned module file (a `mod` cycle ends at a file already on its chain)
+    found_by: HashMap<ScanKey, ScanKey>,
     /// per crate: scans queued or running
     scan_left: Vec<usize>,
     scanned: Vec<HashMap<ScanKey, Option<Scanned>>>,
@@ -300,7 +302,14 @@ impl Pool {
         if let Some(s) = &r {
             for (p, d, m) in &s.children {
                 let k = (key.0, p.clone(), d.clone(), m.clone());
+                // rustc_expand: a file that includes itself through `mod` items is an error the
+                // loader reports; the prescan stops at the repeat
+                let mut on_chain = key.1 == *p;
+                let mut up = st.found_by.get(&key);
+                while let (false, Some(parent)) = (on_chain, up) { on_chain = parent.1 == *p; up = st.found_by.get(parent); }
+                if on_chain { continue; }
                 if st.seen.insert(k.clone()) {
+                    st.found_by.insert(k.clone(), key.clone());
                     st.scan_seq += 1;
                     let seq = st.scan_seq;
                     st.scans.insert((key.0, seq), k);
@@ -924,10 +933,10 @@ fn scan_text_mode(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16,
     if declarations_only && !cfg.session.options.rs_lazy {
         toks = lazy::demand::active_tokens(&src, &toks, cfg);
     }
-    scan_tokens(path, dir, mpath, krate, cfg, src_len, src, toks, context, macro_surface)
+    scan_tokens(path, dir, mpath, krate, edition, cfg, src_len, src, toks, context, macro_surface)
 }
 
-fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, cfg: &CfgSet, src_len: usize,
+fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, edition: u16, cfg: &CfgSet, src_len: usize,
     src: ScanBytes, toks: Vec<Tok>, context: &crate::source_context::Context, macro_surface: bool,
 ) -> Option<Scanned> {
     let mut defs = Vec::new();
@@ -1138,7 +1147,7 @@ fn scan_tokens(path: &str, dir: &str, mpath: &str, krate: &str, cfg: &CfgSet, sr
                         .iter()
                         .map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo })
                         .collect();
-                    if let Ok(mut def) = crate::macros::parse_def(&name, krate, &mt) {
+                    if let Ok(mut def) = crate::macros::parse_def(&name, krate, edition, &mt) {
                         def.exported = attrs.exported;
                         if attrs.local_inner {
                             crate::macros::local_inner_macros(&mut def);
@@ -1238,6 +1247,7 @@ fn start_with_contexts_plan(sess: &std::sync::Arc<crate::Session>, crates: Vec<P
         scans: Default::default(),
         scan_seq: 0,
         seen: HashSet::default(),
+        found_by: HashMap::default(),
         scan_left: vec![1; n],
         scanned: (0..n).map(|_| HashMap::default()).collect(),
         publishing: false,
