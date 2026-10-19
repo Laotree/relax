@@ -1074,8 +1074,11 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
-            // Const generic parameters (`Const::Ty(Param)`) are ascribed TypeOf(param) by
-            // nightly; Relax MIR has no const-parameter operand form (they are TyIds).
+            // 1.97.1 (mod.rs:1761-1766): a `Const::Ty` that is an unevaluated const is ascribed
+            // TypeOf(def, args); a const parameter gets nothing. Relax MIR has no `Const::Ty` yet:
+            // with S1's `Const::Ty` and `Unevaluated.ty` the constant's type is `const_.ty()` (as
+            // rustc uses everywhere), and the promoted equality below stops comparing the promoted
+            // type with itself.
             if let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() {
                 self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions), locations);
                 for t in self.tcx.tys.list(args).iter().copied() {
