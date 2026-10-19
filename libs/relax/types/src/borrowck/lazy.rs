@@ -726,7 +726,7 @@ pub fn check_before_run(prog: &Program, tcx: &Tcx, src: &Arc<dyn FrontSource>, d
 }
 
 pub struct Growth<'a> {
-    pub changed_insts: &'a [(DefId, Vec<TyId>)], pub before: &'a [Vec<super::fv::Summary>], pub visible_crates: &'a [bool],
+    pub changed_insts: &'a [(DefId, Vec<TyId>)], pub before: &'a [Vec<super::field_views::Summary>], pub visible_crates: &'a [bool],
 }
 pub struct CheckRequest<'a> {
     pub changed: &'a [DefId], pub instances: &'a [(DefId, Vec<TyId>)],
@@ -736,7 +736,7 @@ pub struct CheckRequest<'a> {
     pub growth: Option<Growth<'a>>, pub origin: Origin, pub epoch: u64,
     /// A live edit's summary context: callee summaries computed once for the whole edit
     /// (the summaries before it, the changed bodies' checks, the summaries after it).
-    pub fv: Option<&'a std::rc::Rc<super::fv::SummaryCx>>,
+    pub fv: Option<&'a std::rc::Rc<super::field_views::SummaryCx>>,
 }
 pub struct GateResult { pub events: Vec<GandalfEvent>, pub withheld: usize }
 impl GateResult { pub fn refuses(&self) -> bool { !self.events.is_empty() } }
@@ -794,7 +794,7 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
         let d = DefId(i as u32);
         let def = prog.def(d);
         if !growth.visible_crates[def.krate as usize] { continue; }
-        if !matches!(def.kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) || !super::fv::relaxed(prog, d) { continue; }
+        if !matches!(def.kind, crate::program::DefKind::Fn | crate::program::DefKind::AssocFn) || !super::field_views::relaxed(prog, d) { continue; }
         let it = prog.files[def.file as usize].ast.item(def.item);
         let text = String::from_utf8_lossy(&prog.files[def.file as usize].src[it.lo as usize..(it.hi as usize).min(prog.files[def.file as usize].src.len())]);
         if !grown.iter().any(|(g, _, _)| *g != d && text.contains(&format!("{}(", prog.name(*g)))) { continue; }
@@ -825,8 +825,8 @@ pub fn check_now(prog: &Program, tcx: &Tcx, req: &CheckRequest<'_>) -> GateResul
     }
     out
 }
-fn grew(b: &super::fv::Summary, a: &super::fv::Summary) -> bool {
-    use super::fv::Summary;
+fn grew(b: &super::field_views::Summary, a: &super::field_views::Summary) -> bool {
+    use super::field_views::Summary;
     match (b, a) {
         (Summary::Whole, _) => false,
         (Summary::Parts(_), Summary::Whole) => true,
