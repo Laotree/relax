@@ -887,11 +887,8 @@ fn unparen(ast: &Ast, mut e: ExprId) -> ExprId {
 
 impl<'a> Visitor<'a> for Late<'a> {
     fn ast(&self) -> &'a Ast { self.ast }
-    fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
-    fn leave_attrs(&mut self, attrs: List<Attr>) {
-        let n = self.ast.list(attrs).len();
-        self.stack.truncate(self.stack.len() - n);
-    }
+    fn enter_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::push_attrs(&mut self.stack, self.ast, attrs); }
+    fn leave_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 
     fn expr(&mut self, e: ExprId) {
         self.check_expr(e);
@@ -1106,11 +1103,8 @@ impl<'a> Kp<'a> {
     }
     fn is_never(&self, e: ExprId) -> bool { matches!(self.ty_of(e), Some(TyKind::Never)) }
 
-    fn enter(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
-    fn leave(&mut self, attrs: List<Attr>) {
-        let n = self.ast.list(attrs).len();
-        self.stack.truncate(self.stack.len() - n);
-    }
+    fn enter(&mut self, attrs: List<Attr>) { crate::ast_visit::push_attrs(&mut self.stack, self.ast, attrs); }
+    fn leave(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 
     fn block(&mut self, b: BlockId) -> V {
         let blk = *self.ast.block(b);

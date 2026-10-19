@@ -154,10 +154,7 @@ impl<'a, 'e> Visitor<'a> for Walk<'a, 'e> {
         }
         self.stack.extend(list);
     }
-    fn leave_attrs(&mut self, attrs: List<Attr>) {
-        let n = self.ast.list(attrs).len();
-        self.stack.truncate(self.stack.len() - n);
-    }
+    fn leave_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 }
 
 /// One attribute list at a node of `def` (`before`: the attributes of the nodes around it inside

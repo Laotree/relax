@@ -606,11 +606,8 @@ impl<'a> BodyRefs<'a> {
 impl<'a> Visitor<'a> for BodyRefs<'a> {
     fn ast(&self) -> &'a Ast { self.ast }
 
-    fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
-    fn leave_attrs(&mut self, attrs: List<Attr>) {
-        let n = self.ast.list(attrs).len();
-        self.stack.truncate(self.stack.len() - n);
-    }
+    fn enter_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::push_attrs(&mut self.stack, self.ast, attrs); }
+    fn leave_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 
     fn block(&mut self, b: BlockId) {
         let saved = self.tw.module;

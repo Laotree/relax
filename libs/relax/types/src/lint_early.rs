@@ -484,12 +484,8 @@ impl<'a> W<'a> {
         crate::lint_early2::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
     }
 
-    fn enter(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
-    fn leave(&mut self, attrs: List<Attr>) {
-        let n = self.ast.list(attrs).len();
-        let len = self.stack.len();
-        self.stack.truncate(len - n);
-    }
+    fn enter(&mut self, attrs: List<Attr>) { crate::ast_visit::push_attrs(&mut self.stack, self.ast, attrs); }
+    fn leave(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 
     /// `Span::from_expansion` of the node starting at `pos`.
     fn from_exp(&self, pos: u32) -> bool { self.pf.expansion_kind(pos) != ExpnKind::Root }
