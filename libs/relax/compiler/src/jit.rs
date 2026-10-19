@@ -334,8 +334,9 @@ pub struct Unit {
     pub provided: Vec<(u32, crate::provided::ProvidedCrate)>,
     /// their opaque types: drop shim address (0: no drop)
     pub provided_types: HashMap<DefId, u64>,
-    /// types whose values cross the provided-crate boundary (provided::crossing_types)
-    pub provided_shared: std::collections::HashSet<TyId>,
+    /// types whose values cross the provided-crate boundary (provided::crossing_types): worked out
+    /// on the first query (`provided_shared`), which only a provided-crate misuse makes
+    provided_shared: std::sync::OnceLock<std::collections::HashSet<TyId>>,
     pub lay: crate::layout::Layouts,
     /// slots: created on any thread (fn_id from lowering), build state changed on the owner thread
     pub fns: crate::conc::AppendVec<FnEntry>,
@@ -2263,22 +2264,6 @@ impl Unit {
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
         let (provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
-        let provided_shared = {
-            let ks: Vec<u32> = provided.iter().map(|(k, _)| *k).collect();
-            if ks.is_empty() {
-                Default::default()
-            } else {
-                let pt = &provided_types;
-                crate::provided::crossing_types(&prog, &tcx, &ks, &|d| {
-                    let k = prog.def(d).krate;
-                    crate::provided::unbound_reason(&prog, &tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
-                        let key = crate::provided::key(&prog, &tcx, d);
-                        provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
-                    }
-                })
-            }
-        };
-        let provided_shared = crate::zone_alloc::kept_clone(&provided_shared);
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
                 Box::new(crate::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
@@ -2300,7 +2285,7 @@ impl Unit {
         let unit = Unit {
             prog,
             tcx,
-            provided_shared,
+            provided_shared: std::sync::OnceLock::new(),
             provided,
             provided_types,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
@@ -2529,6 +2514,35 @@ impl Unit {
         ensure_altstack();
         os::fault::install();
         u
+    }
+
+    /// The types of the provided crates `ks` whose values cross the boundary (provided::crossing_types).
+    fn crossing_of(&self, ks: &[u32]) -> std::collections::HashSet<TyId> {
+        let pt = &self.provided_types;
+        let provided = &self.provided;
+        crate::provided::crossing_types(&self.prog, &self.tcx, ks, &|d| {
+            let k = self.prog.def(d).krate;
+            crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
+                let key = crate::provided::key(&self.prog, &self.tcx, d);
+                provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
+            }
+        })
+    }
+
+    /// The worked-out set of crossing types, if a query made it (the zone scan reads it).
+    pub(crate) fn provided_shared_set(&self) -> Option<&std::collections::HashSet<TyId>> {
+        self.provided_shared.get()
+    }
+
+    /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
+    /// crate on the first call: boot needs it for nothing (a misuse of a provided type asks).
+    pub(crate) fn provided_shared_contains(&self, t: TyId) -> bool {
+        self.provided_shared.get_or_init(|| {
+            let ks: Vec<u32> = self.provided.iter().map(|(k, _)| *k).collect();
+            if ks.is_empty() { return Default::default(); }
+            let shared = self.crossing_of(&ks);
+            crate::zone_alloc::kept_clone(&shared)
+        }).contains(&t)
     }
 
     /// Whether `code` would link anywhere in the code area (O3 checks before installing).
@@ -14401,18 +14415,12 @@ impl Unit {
                 crate::zone_alloc::kept_with(|| self.provided_types.insert(d, 0));
             }
         }
-        let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
-        let shared = {
-            let pt = &self.provided_types;
-            let provided = &self.provided;
-            crate::provided::crossing_types(&self.prog, &self.tcx, &ks, &|d| {
-                let k = self.prog.def(d).krate;
-                crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
-                    let key = crate::provided::key(&self.prog, &self.tcx, d);
-                    provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
-                }
-            })
-        };
-        crate::zone_alloc::kept_with(|| self.provided_shared.extend(shared));
+        // a set worked out already also covers the added crates; one not yet worked out will
+        if let Some(mut set) = self.provided_shared.take() {
+            let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
+            let shared = self.crossing_of(&ks);
+            crate::zone_alloc::kept_with(|| set.extend(shared));
+            let _ = self.provided_shared.set(set);
+        }
     }
 }
