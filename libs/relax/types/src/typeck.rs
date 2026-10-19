@@ -3362,7 +3362,8 @@ impl<'a> Fcx<'a> {
         let mut candidates = Vec::new();
         for (td, args) in self.param_bounds(t) {
             for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                if self.prog.def(item).name == name {
+                // value namespace: an associated type of the same name is another item
+                if self.prog.def(item).name == name && matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) {
                     let c = (item, args.clone());
                     if !candidates.contains(&c) { candidates.push(c); }
                 }
@@ -3371,7 +3372,7 @@ impl<'a> Fcx<'a> {
         if candidates.is_empty() {
             for td in self.traits_in_scope() {
                 for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                    if self.prog.def(item).name != name { continue; }
+                    if self.prog.def(item).name != name || !matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) { continue; }
                     let save = self.start_snapshot();
                     let mut args = Vec::new();
                     for i in 1..=self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh_arg(td, i as usize)); }

@@ -2852,6 +2852,13 @@ impl Tcx {
                         GenericArg::Const(e) => {
                             let ct = if let Some((d, declaration)) = &declaration {
                                 if let Some(&(_, cfile, ty)) = declaration.consts.iter().find(|c| c.0 as usize == index) {
+                                    // `trait Foo<const N: Bar<2>>` with `trait Bar<const M: Foo<2>>`: the type of a
+                                    // const parameter names itself through the other (E0391)
+                                    let Ok(_cycle) = crate::cycle::enter(crate::cycle::Kind::ConstParamType, d.0, index as u32) else {
+                                        self.err(cx, prog, file, p.lo, format!("E0391: cycle detected when computing type of the const parameter {} of `{}`", index, prog.def_path(*d)));
+                                        out.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                        continue;
+                                    };
                                     let expected = self.lower_ty(cx, prog, cfile, prog.def(*d).scope, declaration, ty);
                                     if is_infer_len(ast, *e) { cx.infcx.map_or_else(|| self.tys.intern_const(crate::consts::ConstKind::Error), |infcx| infcx.next_const_var()) }
                                     else { self.lower_const_arg(prog, file, env, *e, expected) }
@@ -3176,6 +3183,17 @@ impl Tcx {
                 GenericParamKind::Lifetime(_) => continue,
             };
             if k >= out.len() {
+                // `trait Foo<X = Box<dyn Foo>>`: the default names the trait whose defaults it is
+                // part of (E0391, cycle detected when computing the type of `Foo::X`)
+                let _cycle = match crate::cycle::enter(crate::cycle::Kind::TraitDefault, td.0, k as u32) {
+                    Ok(g) => g,
+                    Err(()) => {
+                        self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
+                        out.push(self.tys.error);
+                        k += 1;
+                        continue;
+                    }
+                };
                 let t = if tdef.is_some() || cdef.is_some() {
                     let mut env = GenEnv::default();
                     env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
