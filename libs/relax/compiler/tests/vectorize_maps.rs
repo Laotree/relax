@@ -121,6 +121,20 @@ fn carry_up_ref(v: &mut [i32]) {
     }
 }
 
+/// the PNG "up" defilter: three zipped byte streams
+#[inline(never)]
+fn up_defilter(prev_row: &[u8], raw: &[u8], current: &mut [u8]) {
+    for ((filt, recon), up) in raw.iter().zip(current).zip(prev_row) {
+        *recon = (*filt).wrapping_add(*up)
+    }
+}
+#[inline(never)]
+fn up_defilter_ref(prev_row: &[u8], raw: &[u8], current: &mut [u8]) {
+    for i in 0..prev_row.len().min(raw.len()).min(current.len()) {
+        current[i] = black_box(raw[i].wrapping_add(prev_row[i]));
+    }
+}
+
 fn bits(v: &[f32]) -> Vec<u32> {
     v.iter().map(|x| x.to_bits()).collect()
 }
@@ -174,6 +188,15 @@ fn vectorized_maps() {
                 carry_up(&mut a1[lo..hi]);
                 carry_up_ref(&mut a2[lo..hi]);
                 fails += (a1 != a2) as u32;
+            }
+            {
+                let a: Vec<u8> = (0..64u32).map(|i| (i * 37 + rep) as u8).collect();
+                let b: Vec<u8> = (0..64u32).map(|i| (i * 11 + 5) as u8).collect();
+                let mut o1 = vec![7u8; 64];
+                let mut o2 = vec![7u8; 64];
+                up_defilter(&a[..n], &b[1..n.max(1)], &mut o1[2..]);
+                up_defilter_ref(&a[..n], &b[1..n.max(1)], &mut o2[2..]);
+                fails += (o1 != o2) as u32;
             }
             // overlapping streams inside one buffer
             for shift in -9i32..=9 {
