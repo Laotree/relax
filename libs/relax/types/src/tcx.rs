@@ -1599,7 +1599,6 @@ impl Tcx {
         if def.kind == DefKind::Impl {
             if errors.is_empty() { errors.extend(self.check_impl_params_constrained(prog, did)); }
             errors.extend(self.check_impl_items_against_trait(prog, did));
-            errors.extend(crate::item_checks::impl_trait_wf(prog, self, did));
             errors.extend(crate::item_checks::copy_impl(prog, self, did));
         }
         errors
@@ -1627,6 +1626,15 @@ impl Tcx {
                     if let Some(value) = default { self.lower_const_arg(prog, def.file, &env, value, ty); }
                 }
                 _ => {}
+            }
+        }
+        // a type alias's right-hand side is lowered where it is written (rustc type_of of the alias),
+        // used or not
+        if def.kind == DefKind::TypeAlias {
+            if let Some(TypeAliasItem { ty: Some(t), .. }) = ast.as_alias(&ast.item(def.item).kind) {
+                let mut env = self.item_env(prog, d);
+                env.regions.enabled = true;
+                self.lower_ty(&cx, prog, def.file, self.item_module(prog, d), &env, *t);
             }
         }
         // the types the where clauses bound name existing types (rustc resolves them whether or
@@ -2484,8 +2492,13 @@ impl Tcx {
             let bound = predicate_bound;
             for b in &mut binds { b.2 = bound; }
             binds.sort_by_key(|b| b.0 .0);
-            if let Some(why) = self.dyn_incompatible(prog, td) {
-                self.err(cx, prog, file, lo, format!("E0038: the trait `{}` is not dyn compatible: {}", prog.name(td), why));
+            // rustc dyn_trait.rs: the value of every associated type must be given, in the
+            // object type or by a supertrait bound
+            let missing = self.missing_dyn_assoc_types(prog, td, &binds);
+            if !missing.is_empty() {
+                let names: Vec<String> = missing.iter().map(|&m| format!("`{}`", prog.name(m))).collect();
+                let list = match names.len() { 1 => names[0].clone(), n => format!("{} and {}", names[..n - 1].join(", "), names[n - 1]) };
+                self.err(cx, prog, file, lo, format!("E0191: the value of the associated type{} {} in `{}` must be specified", if names.len() > 1 { "s" } else { "" }, list, prog.name(td)));
                 return self.tys.error;
             }
             // omitted trait args take their defaults (`dyn Trait` with `trait Trait<const N: u8 =
@@ -3467,54 +3480,58 @@ impl Tcx {
         false
     }
 
-    /// Why trait `td` is not dyn compatible (rustc E0038), for the cases checked here: a
-    /// `Sized` supertrait (`Clone`, `Copy`), or an associated fn without a `self` receiver and
-    /// without `where Self: Sized` (`trait B { fn f(a: A) -> A; }`) -- in it or a supertrait.
-    pub fn dyn_incompatible(&self, prog: &Program, td: DefId) -> Option<String> {
-        let core = self.core_crate(prog);
-        let mut seen: Vec<DefId> = vec![td];
+    /// dyn_trait.rs: the associated types of the principal and its supertraits that a trait
+    /// object type leaves unspecified. A binding of the object type or of a supertrait bound
+    /// (`trait Sub: Super<Item = u8>`) specifies one; so does `where Self: Sized` on the item.
+    fn missing_dyn_assoc_types(&self, prog: &Program, td: DefId, binds: &[(DefId, TyId, u32)]) -> Vec<DefId> {
+        let mut closure: Vec<DefId> = vec![td];
         let mut i = 0;
-        while i < seen.len() && i < 64 {
-            let cur = seen[i];
-            for &it in &prog.traits[prog.def(cur).sub as usize] {
-                let d = prog.def(it);
-                if d.kind != DefKind::AssocFn {
-                    continue;
-                }
-                let f = &prog.files[d.file as usize];
-                if let ItemKind::Fn(sig, _, _) = &f.ast.item(d.item).kind {
-                    let sig = f.ast.fn_sig(*sig);
-                    if sig.self_param.is_some() {
-                        continue;
-                    }
-                    // (`where Self: Sized`, or a bound on Self whose trait entails it:
-                    // `where Self: Tr1<..>` with `trait Tr1: Sized`)
-                    let self_sized = f.ast.list(sig.generics.where_).iter().any(|w| match w {
-                        ast::WherePred::Bound { ty, bounds, .. } => {
-                            matches!(f.ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && f.ast.segs(p.segs)[0].kind() == SegKind::SelfType)
-                                && f.ast.list(*bounds).iter().any(|b| match b {
-                                    ast::Bound::Trait { path, maybe: false, .. } => self.resolve_type_path_def(prog, d.file, d.scope, path).map_or(false, |bd| prog.def(bd).kind == DefKind::Trait && self.trait_entails_sized(prog, bd)),
-                                    _ => false,
-                                })
-                        }
-                        _ => false,
-                    });
-                    if !self_sized {
-                        return Some(format!("its associated fn `{}` has no `self` receiver (add `where Self: Sized` to it)", prog.syms.str(d.name)));
-                    }
-                }
-            }
-            for s in self.trait_supers(prog, cur) {
-                if prog.name(s) == "Sized" && prog.def(s).krate == core {
-                    return Some("it requires `Self: Sized`".to_string());
-                }
-                if !seen.contains(&s) {
-                    seen.push(s);
-                }
-            }
+        while i < closure.len() && i < 64 {
+            for s in self.trait_supers(prog, closure[i]) { if !closure.contains(&s) { closure.push(s); } }
             i += 1;
         }
-        None
+        // bindings written on supertrait bounds, by name
+        let mut bound_names: Vec<Sym> = Vec::new();
+        for &t in &closure {
+            let d = prog.def(t);
+            let ast = &prog.files[d.file as usize].ast;
+            let Some(tr) = ast.as_trait(&ast.item(d.item).kind) else { continue };
+            let mut lists = vec![tr.supers];
+            for w in ast.list(ast.kind_generics(&ast.item(d.item).kind).map(|g| g.where_).unwrap_or_default()) {
+                if let ast::WherePred::Bound { bounds, .. } = w { lists.push(*bounds); }
+            }
+            for l in lists {
+                for b in ast.list(l) {
+                    let ast::Bound::Trait { path, .. } = b else { continue };
+                    let Some(last) = ast.segs(path.segs).last() else { continue };
+                    // `trait Sub: Fn(A) -> R` binds `FnOnce::Output`
+                    if let Some(GenericArgs::Paren(..)) = ast.gargs(last.args()) {
+                        if let Some(sym) = prog.syms.get("Output") { bound_names.push(sym); }
+                    }
+                    if let Some(GenericArgs::Angle(v)) = ast.gargs(last.args()) {
+                        for g in ast.list(*v) {
+                            if let GenericArg::Binding(n, _, bt) = g {
+                                // a bound whose value mentions `Self` cannot stand for the object's
+                                // value (dyn_trait.rs: `references_self`): it must be written out
+                                if ty_mentions_self(ast, *bt) { continue; }
+                                if let Some(sym) = prog.syms.get(prog.files[d.file as usize].text(*n)) { bound_names.push(sym); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut missing = Vec::new();
+        for &t in &closure {
+            for &it in &prog.traits[prog.def(t).sub as usize] {
+                let d = prog.def(it);
+                if d.kind != DefKind::AssocTy || prog.impl_trait_in_trait_data.contains_key(&it) { continue; }
+                if binds.iter().any(|b| b.0 == it) || bound_names.contains(&d.name) { continue; }
+                if self.generics_require_sized_self(prog, it) { continue; }
+                missing.push(it);
+            }
+        }
+        missing
     }
 
     pub fn trait_supers(&self, prog: &Program, td: DefId) -> Vec<DefId> {
@@ -3952,5 +3969,18 @@ pub(crate) fn def_kind_descr(k: DefKind) -> &'static str {
         DefKind::AssocConst => "associated constant", DefKind::Static => "static", DefKind::Mod => "module",
         DefKind::Variant => "variant", DefKind::MacroRules => "macro", DefKind::ForeignFn => "foreign function",
         DefKind::ForeignStatic => "foreign static", DefKind::Field => "field", _ => "item",
+    }
+}
+
+/// Whether a written type names `Self` (also as the qualified-path self type).
+fn ty_mentions_self(ast: &ast::Ast, t: ast::TyId) -> bool {
+    match ast.ty(t) {
+        ast::Ty::Path(p) => {
+            if let Some(q) = ast.qself(p) { if ty_mentions_self(ast, q.ty) { return true; } }
+            ast.segs(p.segs).first().is_some_and(|s| s.kind() == SegKind::SelfType)
+        }
+        ast::Ty::Ref(_, _, i) | ast::Ty::Ptr(_, i) | ast::Ty::Slice(i) | ast::Ty::Array(i, _) | ast::Ty::Paren(i) => ty_mentions_self(ast, *i),
+        ast::Ty::Tuple(l) => ast.list(*l).iter().any(|&i| ty_mentions_self(ast, i)),
+        _ => false,
     }
 }

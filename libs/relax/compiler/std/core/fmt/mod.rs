@@ -174,6 +174,10 @@ pub struct Arguments<'a> {
     args: &'a [rt::Argument<'a>],
 }
 
+// library/core/src/fmt/mod.rs:904-906
+impl !Send for Arguments<'_> {}
+impl !Sync for Arguments<'_> {}
+
 impl<'a> Arguments<'a> {
     pub const fn new_const(pieces: &'a [&'static str]) -> Arguments<'a> {
         Arguments { pieces, fmt: None, args: &[] }

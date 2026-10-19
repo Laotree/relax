@@ -130,6 +130,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(u.prog.import_privacy_errors(&own));
     errors.extend(u.prog.attribute_errors(&own));
     errors.extend(u.prog.ast_validation_errors(&own));
+    // item well-formedness (rustc wfcheck): after the signatures, and only when they are sound -- an
+    // item with an unresolved or ill-counted type has no well-formedness to speak of
+    if errors.is_empty() {
+        let defs: Vec<crate::program::DefId> = (0..u.prog.defs.len()).filter(|&i| own[u.prog.defs[i].krate as usize]).map(|i| crate::program::DefId(i as u32)).collect();
+        let (prog, tcx) = (&u.prog, &u.tcx);
+        for e in par_map(&defs, |&d| std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| relax_types::item_wf::check_def(prog, tcx, d)))
+            .unwrap_or_else(|_| vec![format!("internal compiler error while checking the well-formedness of {} -- makepad run bug, report it", prog.def_path(d))])) {
+            errors.extend(e);
+        }
+        if errors.is_empty() {
+            if let Some(main) = crate::run::find_main(&u.prog, root) {
+                if relax_types::item_wf::is_entry_main(&u.prog, main) { errors.extend(relax_types::item_wf::check_main(&u.prog, &u.tcx, main)); }
+            }
+        }
+    }
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {

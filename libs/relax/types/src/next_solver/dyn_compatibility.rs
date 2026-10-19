@@ -147,7 +147,7 @@ fn contains_illegal_self_type_reference(tcx: &Tcx, prog: &Program, td: DefId, ty
 fn erase_args(tys: &Types, args: &mut [GenericArg]) {
     for a in args { match a { GenericArg::Lifetime(r) => *r = crate::types::RegionId::ERASED, GenericArg::Type(t) => *t = tys.erase_regions(*t), GenericArg::Const(_) => {} } }
 }
-pub(super) fn liberate_late_bound_regions(tcx: &Tcx, owner: DefId, ty: TyId) -> TyId {
+pub(crate) fn liberate_late_bound_regions(tcx: &Tcx, owner: DefId, ty: TyId) -> TyId {
     let mut replacer = crate::types::fold::BoundVarReplacer::new(|var: crate::types::BoundVar| tcx.tys.intern_region(RegionKind::ReLateParam(RegionScope::Item(owner), LateParamKind::Anon(var.0))), |_| panic!("non-lifetime binder"));
     replacer.fold_ty(&tcx.tys, ty, 0)
 }

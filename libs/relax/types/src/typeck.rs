@@ -446,6 +446,9 @@ pub struct Fcx<'a> {
     deferred_sized_obligations: Vec<(TyId, u32)>,
     checked_opaque_types_storage_entries: Option<crate::infer::opaque_types::OpaqueTypeStorageEntries>,
     expected_closure_kinds: HashMap<u32, crate::upvar::ClosureKind>,
+    /// the expectation of the expression checked next is a mere hint (the other branch's type),
+    /// not a coercion target (rustc Expectation::ExpectHasType vs. an if/match's derived hint)
+    soft: bool,
     /// position of the expression checked last (patterns have no spans of their own)
     last_lo: u32,
     /// traits of the body's generic bounds (and its trait), with supertraits: in scope for
@@ -689,6 +692,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         deferred_sized_obligations: Vec::new(),
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
+        soft: false,
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),
@@ -755,6 +759,11 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         }
         _ => return fcx.into_body(),
     };
+    // rustc_hir_typeck check_fn / gather_locals: every parameter's type is Sized (SizedArgumentType),
+    // unless `unsized_fn_params`; checked by `makepad check` only (the run never pays for it)
+    if crate::lint::enabled() && !prog.crates[d.krate as usize].unsized_fn_params(prog) {
+        for &p in &params { fcx.require_type_is_sized_deferred(p, ast.item(d.item).lo); }
+    }
     let mut pi = 0;
     if fsig.self_param.is_some() {
         let mutable = matches!(fsig.self_param, Some(SelfParam::Value(true)) | Some(SelfParam::Typed(true, _)));
@@ -1431,11 +1440,12 @@ impl<'a> Fcx<'a> {
         }
     }
 
-    /// `&&u8` -> `u8` when the referent is a primitive number/bool/char; other types unchanged.
+    /// `&u8` -> `u8` when the referent is a primitive number/bool/char; other types unchanged
+    /// (core implements the operators for `T` and `&T` operands, not for `&&T`).
     fn peel_prim_refs(&mut self, t: TyId) -> TyId {
         let mut cur = self.shallow(t);
         let mut n = 0;
-        while let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(cur).clone() {
+        if let TyKind::Ref(_, inner, _) = self.tcx.tys.kind(cur).clone() {
             cur = self.shallow(inner);
             n += 1;
         }
@@ -1478,6 +1488,39 @@ impl<'a> Fcx<'a> {
     fn ty_str(&mut self, t: TyId) -> String {
         let t = self.infcx.deeply_resolve_ignoring_regions(t);
         ty_to_string(false, self.prog, self.tcx, t)
+    }
+
+    /// rustc_hir_typeck demand_eqtype / demand_suptype: the types are the same, or E0308.
+    fn demand_eq(&mut self, expected: TyId, actual: TyId, pos: u32) -> bool {
+        if self.eq(expected, actual) { return true; }
+        let (x, a) = (self.infcx.deeply_resolve_ignoring_regions(expected), self.infcx.deeply_resolve_ignoring_regions(actual));
+        if self.tcx.tys.has_error(x) || self.tcx.tys.has_error(a) { return false; }
+        let (sx, sa) = (ty_to_string(false, self.prog, self.tcx, x), ty_to_string(false, self.prog, self.tcx, a));
+        let (sx, sa) = if sx == sa { (ty_to_string_paths(self.prog, self.tcx, x), ty_to_string_paths(self.prog, self.tcx, a)) } else { (sx, sa) };
+        self.err(pos, format!("E0308: mismatched types: expected `{}`, found `{}`", sx, sa));
+        false
+    }
+
+    /// A `&`/`&mut` pattern against a scrutinee of another shape: E0308.
+    fn demand_pat_eq(&mut self, scrutinee: TyId, m: bool, inner: TyId) {
+        let x = self.infcx.deeply_resolve_ignoring_regions(scrutinee);
+        let sx = ty_to_string(false, self.prog, self.tcx, x);
+        let _ = inner;
+        self.err(self.last_lo, format!("E0308: mismatched types: expected `{}`, found `&{}_`", sx, if m { "mut " } else { "" }));
+    }
+
+    /// rustc_hir_typeck check_block_no_value: a loop body's block has type `()` (or diverges).
+    fn check_block_no_value(&mut self, b: BlockId) {
+        let unit = self.tcx.tys.unit;
+        let t = self.check_block(b, Some(unit));
+        let s = self.shallow(t);
+        if s == self.tcx.tys.never { return; }
+        let blk = self.ast().block(b);
+        let pos = match self.ast().list(blk.stmts).last() {
+            Some(Stmt::Expr(e, false)) => self.ast().expr(*e).lo,
+            _ => blk.hi,
+        };
+        self.demand_eq(unit, t, pos);
     }
 
     /// rustc_hir_typeck/src/demand.rs:230-270: report only after the coercion
@@ -2307,18 +2350,38 @@ impl<'a> Fcx<'a> {
                             x.push(self.fresh(0));
                         }
                         let tt = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&x)));
-                        self.eq(tt, et);
+                        // rustc pat.rs check_pat_tuple: with a `..` the scrutinee's type must be known
+                        // (structurally_resolve_type), and it must be a tuple (demand_eqtype_pat)
+                        let has_rest = self.ast().list(*v).iter().any(|&q| is_rest_pat(self.ast(), q));
+                        if has_rest && matches!(self.tcx.tys.kind(et), TyKind::Infer(_)) {
+                            self.err(self.last_lo, "E0282: type annotations needed".to_string());
+                        } else if !self.eq(tt, et) && !matches!(self.tcx.tys.kind(et), TyKind::Error) {
+                            let shown = self.ty_str(et);
+                            self.err(self.last_lo, format!("E0308: mismatched types: expected `{}`, found a tuple", shown));
+                        }
                         x
                     }
                 };
                 self.check_seq_pats(self.ast().list(*v), &elems);
             }
             Pat::Paren(x) => self.check_pat(*x, expected),
-            Pat::Ref(_, x) => {
+            Pat::Ref(m, x) => {
+                // rustc pat.rs check_pat_ref: the scrutinee is a reference of the same mutability
+                // (an open type variable becomes one)
                 let et = self.shallow(expected);
                 let inner = match self.tcx.tys.kind(et).clone() {
-                    TyKind::Ref(_, i, _) => i,
-                    _ => self.tcx.tys.error,
+                    TyKind::Ref(em, i, _) => {
+                        if em != *m { self.demand_pat_eq(expected, *m, i); }
+                        i
+                    }
+                    TyKind::Infer(_) => {
+                        let i = self.fresh(0);
+                        let r = self.tcx.tys.intern(TyKind::Ref(*m, i, crate::types::RegionId::ERASED));
+                        self.eq(et, r);
+                        i
+                    }
+                    TyKind::Error => self.tcx.tys.error,
+                    _ => { self.demand_pat_eq(expected, *m, self.tcx.tys.error); self.tcx.tys.error }
                 };
                 self.check_pat(*x, inner);
             }
@@ -2697,6 +2760,13 @@ impl<'a> Fcx<'a> {
         let prog = self.prog;
         if let Some(t) = self.assoc_struct_path(path) {
             return t;
+        }
+        // `Self { .. }` is the impl's self type itself (not a fresh instance of the same ADT)
+        if path.segs.len() == 1 && !path.has_qself() && self.ast().segs(path.segs)[0].kind() == SegKind::SelfType {
+            if let Some(st) = self.env.self_ty {
+                let st = self.shallow(st);
+                if matches!(self.tcx.tys.kind(st), TyKind::Adt(d, _, _) if matches!(self.prog.def(*d).kind, DefKind::Struct | DefKind::Union)) { return st; }
+            }
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         if segs.len() == 1 {
@@ -4101,7 +4171,10 @@ impl<'a> Fcx<'a> {
                 }
                 let (lt, errors) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), ||
                     self.tcx.type_or_const_arg(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, *t));
+                let clean = errors.is_empty();
                 for error in errors { if !self.b.errors.contains(&error) { self.b.errors.push(error); } }
+                // FnCtxt::lower_ty: every explicit type argument is well formed
+                if crate::lint::enabled() && clean && !matches!(self.tcx.tys.kind(lt), TyKind::Const(_)) && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
                 // hir_ty_lowering/generics.rs:21-136,244-310: kind mismatch
                 // recovery keeps the parameter's kind, including unresolved args.
                 let declaration = self.tcx.declaration_env(prog, def);
@@ -4142,12 +4215,15 @@ impl<'a> Fcx<'a> {
         // (errors of the annotation itself belong to this body: `let m: HashMap<..>` without the
         // import is E0412 here, not a later "type not fully known")
         let (lt, errs) = self.tcx.with_errors(&self.cx.with_infcx(&self.infcx), || self.tcx.lower_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, t));
+        let lowered_clean = errs.is_empty();
         for e in errs {
             if !self.b.errors.contains(&e) {
                 self.b.errors.push(e);
             }
         }
         type_dependencies(self.tcx, lt, &mut self.b.dependencies);
+        // rustc_hir_typeck/src/fn_ctxt/mod.rs lower_ty: every written type must be well formed
+        if crate::lint::enabled() && lowered_clean && !self.tcx.tys.has_error(lt) { self.register_wf(lt, self.last_lo); }
         lt
     }
 
@@ -4267,6 +4343,11 @@ impl<'a> Fcx<'a> {
     }
 
     fn check_block(&mut self, b: BlockId, expected: Option<TyId>) -> TyId {
+        self.check_block_soft(b, expected, false)
+    }
+
+    /// `soft`: the expectation is a hint only (the tail is not required to coerce to it).
+    fn check_block_soft(&mut self, b: BlockId, expected: Option<TyId>, soft: bool) -> TyId {
         let ast = self.ast();
         let blk = ast.block(b);
         let saved_scope = self.scopes.len();
@@ -4318,7 +4399,14 @@ impl<'a> Fcx<'a> {
                     }
                     if let Some(eb) = else_ {
                         let save = self.diverges;
-                        self.check_block(*eb, None);
+                        self.diverges = false;
+                        let et = self.check_block(*eb, None);
+                        // rustc check_decl_local: the `else` block must have type `!`
+                        let es = self.shallow(et);
+                        if es != self.tcx.tys.never && !matches!(self.tcx.tys.kind(es), TyKind::Infer(_) | TyKind::Error) {
+                            let pos = match self.ast().stmts(*eb).last() { Some(Stmt::Expr(e, false)) => self.ast().expr(*e).lo, _ => self.ast().block(*eb).hi };
+                            self.err(pos, "E0308: `else` clause of `let...else` does not diverge".to_string());
+                        }
                         self.diverges = save;
                     }
                     self.check_pat(*pat, t);
@@ -4349,6 +4437,12 @@ impl<'a> Fcx<'a> {
                                 // consumer (let, return, CoerceMany) decides
                                 if self.try_coerce(t, x, Some(*e)) {
                                     result = x;
+                                } else if !soft {
+                                    // rustc check_block_with_expected: under ExpectHasType the tail is
+                                    // coerced to the block's expected type, or E0308
+                                    let pos = self.ast().expr(*e).lo;
+                                    self.coerce_or_unify(t, x, Some(*e), pos);
+                                    result = x;
                                 }
                             }
                         }
@@ -4357,7 +4451,8 @@ impl<'a> Fcx<'a> {
                         let st = self.shallow(t);
                         if st != self.tcx.tys.unit && st != self.tcx.tys.never {
                             let unit = self.tcx.tys.unit;
-                            self.eq(st, unit);
+                            let pos = self.ast().expr(*e).lo;
+                            self.demand_eq(unit, st, pos);
                         }
                     }
                 }
@@ -4409,6 +4504,7 @@ impl<'a> Fcx<'a> {
         self.last_lo = lo;
         let unit = self.tcx.tys.unit;
         let error = self.tcx.tys.error;
+        let soft = std::mem::take(&mut self.soft);
         match &ex.kind {
             ExprKind::Lit(k) => self.check_lit(e, *k, expected),
             ExprKind::Path(path) => {
@@ -4570,7 +4666,7 @@ impl<'a> Fcx<'a> {
                 if label.is_some() {
                     let l = label.map(|x| self.sym_lifetime(x));
                     self.loops.push(Loop { label: l, break_ty: expected, is_loop: true });
-                    let t = self.check_block(*b, expected);
+                    let t = self.check_block_soft(*b, expected, soft);
                     let lp = self.loops.pop().unwrap();
                     if let Some(bt) = lp.break_ty {
                         // a body that diverges (`'b: { break 'b v; }`) has the breaks' type
@@ -4583,9 +4679,9 @@ impl<'a> Fcx<'a> {
                     self.diverges = false;
                     return t;
                 }
-                self.check_block(*b, expected)
+                self.check_block_soft(*b, expected, soft)
             }
-            ExprKind::Unsafe(b) => self.check_block(*b, expected),
+            ExprKind::Unsafe(b) => self.check_block_soft(*b, expected, soft),
             ExprKind::ConstBlock(b) => {
                 let t = self.check_block(*b, expected);
                 self.b.inline_const_types.insert(e.0, t);
@@ -4597,7 +4693,7 @@ impl<'a> Fcx<'a> {
                 let saved = self.scopes.len();
                 let ct = self.check_expr(*c, Some(bool_));
                 self.coerce_or_unify(ct, bool_, None, lo);
-                let tt = self.check_block(*then, expected);
+                let tt = self.check_block_soft(*then, expected, soft);
                 let then_div = self.diverges;
                 self.scopes.truncate(saved);
                 self.diverges = false;
@@ -4607,7 +4703,8 @@ impl<'a> Fcx<'a> {
                         if !then_div {
                             let s = self.shallow(tt);
                             if s != unit && s != self.tcx.tys.never {
-                                self.eq(s, unit);
+                                let pos = match self.ast().stmts(*then).last() { Some(crate::ast::Stmt::Expr(t2, false)) => self.ast().expr(*t2).lo, _ => lo };
+                                self.demand_eq(unit, s, pos);
                             }
                         }
                         unit
@@ -4618,6 +4715,7 @@ impl<'a> Fcx<'a> {
                         // (a fn item / closure type is no hint: branches meet at a fn pointer)
                         let fnish = matches!(self.tcx.tys.kind(stt), TyKind::FnDef(..) | TyKind::Closure(..));
                         let hint = if stt == self.tcx.tys.never || fnish { expected } else { expected.or(Some(tt)) };
+                        self.soft = soft || expected.is_none();
                         let et = self.check_expr(*x, hint);
                         let else_div = self.diverges;
                         self.diverges = then_div && else_div;
@@ -4687,6 +4785,7 @@ impl<'a> Fcx<'a> {
                         }
                         None => None,
                     };
+                    self.soft = soft || expected.is_none();
                     let bt = self.check_expr(arm.body, expected.or(rhint));
                     let div = self.diverges;
                     all_div = all_div && div;
@@ -4720,7 +4819,9 @@ impl<'a> Fcx<'a> {
                 // rustc_ast_lowering puts both the condition and body in the loop scope.
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: false });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, true);
-                self.check_expr(*c, Some(bool_));
+                let ct = self.check_expr(*c, Some(bool_));
+                let cpos = self.ast().expr(*c).lo;
+                self.coerce_or_unify(ct, bool_, Some(*c), cpos);
                 self.in_loop_condition = false;
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
                 self.check_block_no_value(*b);
@@ -5012,9 +5113,10 @@ impl<'a> Fcx<'a> {
                 // is fixed by the indexing selected below, not assumed usize up front (rustc
                 // lookup_indexing: `T: Index<?I>`)
                 let open_index = !lit_index && matches!(self.tcx.tys.kind(tis), TyKind::Infer(_));
+                let mut idx_mismatch = false;
                 if !idx_is_range && !lit_index && !open_index {
                     let usize_ = self.tcx.tys.usize_;
-                    self.eq(tis, usize_);
+                    idx_mismatch = !self.eq(tis, usize_) && !matches!(self.tcx.tys.kind(tis), TyKind::Error);
                 }
                 loop {
                     match self.tcx.tys.kind(cur).clone() {
@@ -5046,6 +5148,12 @@ impl<'a> Fcx<'a> {
                                         }
                                     }
                                 }
+                            }
+                            if idx_mismatch {
+                                // rustc lookup_indexing: no `Index<I>` impl for the slice
+                                let (sa, si) = (self.ty_str(self.tcx.tys.intern(TyKind::Slice(el))), self.ty_str(tis));
+                                self.err(lo, format!("E0277: the type `{}` cannot be indexed by `{}`", sa, si));
+                                return el;
                             }
                             if idx_is_range {
                                 return self.tcx.tys.intern(TyKind::Slice(el));
@@ -5455,10 +5563,12 @@ impl<'a> Fcx<'a> {
                 if let Some(x) = expected {
                     let s = self.shallow(x);
                     let ok = match self.tcx.tys.kind(s) {
+                        // rustc_hir_typeck check_lit: an unsuffixed integer literal takes an integer
+                        // expectation only, a float literal a float one
                         TyKind::Int(_) => !want_float,
-                        TyKind::Float(_) => true,
+                        TyKind::Float(_) => want_float,
                         TyKind::IntVar(_) => !want_float,
-                        TyKind::FloatVar(_) => true,
+                        TyKind::FloatVar(_) => want_float,
                         _ => false,
                     };
                     if ok {
@@ -5631,6 +5741,21 @@ impl<'a> Fcx<'a> {
                     // on_unimplemented message for the operator)
                     self.err(lo, format!("E0308: mismatched types: expected `{}`, found `{}`", x, y));
                     self.err(lo, format!("E0277: {}", binop_unimplemented(op, &x, &y)));
+                } else {
+                    // rustc op.rs is_builtin_binop: arithmetic is built in for numbers, bit operators for
+                    // integers and bool; any other primitive has no operator trait impl (E0369)
+                    let k = self.tcx.tys.kind(sa).clone();
+                    let arith = matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem);
+                    let bad = match k {
+                        TyKind::Bool => arith,
+                        TyKind::Float(_) | TyKind::FloatVar(_) => !arith,
+                        TyKind::Char | TyKind::Str | TyKind::Ptr(..) | TyKind::FnPtr(..) => true,
+                        _ => false,
+                    };
+                    if bad {
+                        let x = self.ty_str(sa);
+                        self.err(lo, format!("E0369: {}", binop_unimplemented(op, &x, &x)));
+                    }
                 }
                 ta
             }
@@ -6687,33 +6812,16 @@ impl<'a> Fcx<'a> {
             // rustc's wording (rustc_trait_selection report_selection_error and core's
             // #[rustc_on_unimplemented] messages) for an unmet trait bound
             if let PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(p)) = &predicate.kind {
-                let mut args = Vec::new();
-                for arg in &p.trait_ref.args {
-                    args.push(match arg { crate::consts::GenericArg::Type(t) => self.ty_str(*t), crate::consts::GenericArg::Const(c) => self.tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
-                }
-                let td = p.trait_ref.def_id;
-                let name = self.prog.name(td).to_string();
-                let core = Some(self.prog.def(td).krate) == self.prog.prelude_crate || matches!(self.prog.syms.str(self.prog.crates[self.prog.def(td).krate as usize].name), "core" | "alloc" | "std");
-                let self_ty = args.first().cloned().unwrap_or_default();
-                let tr = if args.len() > 1 { format!("{}<{}>", name, args[1..].join(", ")) } else { name.clone() };
-                let msg = match code {
-                    "E0277" if self.tcx.lang_items.get(crate::lang_items::LangItem::Sized) == Some(td) => format!("the size for values of type `{}` cannot be known at compilation time", self_ty),
-                    "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
-                    "E0277" if core && name == "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
-                    "E0277" if core && name == "Iterator" => format!("`{}` is not an iterator", self_ty),
-                    "E0277" => format!("the trait bound `{}: {}` is not satisfied", self_ty, tr),
-                    "E0283" => format!("type annotations needed: cannot satisfy `{}: {}`", self_ty, tr),
-                    _ => format!("overflow evaluating the requirement `{}: {}`", self_ty, tr),
-                };
+                let (prog, tcx) = (self.prog, self.tcx);
+                let msg = trait_error_message(prog, tcx, code, p, &mut |t| self.ty_str(t));
                 self.err(obligation.cause.span, format!("{code}: {msg}"));
                 continue;
             }
-            let detail = match &predicate.kind {
-                PredicateKind::Clause(crate::next_solver::ClauseKind::Projection(crate::next_solver::ProjectionClause { projection_term: crate::next_solver::AliasTerm::Ty(a), term: crate::next_solver::Term::Ty(t) })) => {
-                    format!("`{}` == `{}`", self.ty_str(*a), self.ty_str(*t))
-                }
-                _ => format!("{predicate:?}"),
-            };
+            if let Some(msg) = crate::item_wf::fulfillment_message(&self.infcx, self.prog, code, &obligation.goal) {
+                self.err(obligation.cause.span, msg);
+                continue;
+            }
+            let detail = format!("{predicate:?}");
             self.err(obligation.cause.span, format!("{code}: unsatisfied obligation {detail}"));
         }
     }
@@ -6849,6 +6957,29 @@ impl<'a> Fcx<'a> {
 
 /// Like ty_to_string with ADTs as full definition paths plus their crate and def id
 /// (disambiguates "expected `LiveId`, found `LiveId`").
+/// rustc's wording (rustc_trait_selection report_selection_error and core's
+/// #[rustc_on_unimplemented] messages) for an unmet or ambiguous trait bound.
+pub(crate) fn trait_error_message(prog: &Program, tcx: &Tcx, code: &str, p: &crate::next_solver::TraitClause, ty_str: &mut dyn FnMut(TyId) -> String) -> String {
+    let mut args = Vec::new();
+    for arg in &p.trait_ref.args {
+        args.push(match arg { crate::consts::GenericArg::Type(t) => ty_str(*t), crate::consts::GenericArg::Const(c) => tcx.tys.const_to_string(*c), crate::consts::GenericArg::Lifetime(r) => format!("{r:?}") });
+    }
+    let td = p.trait_ref.def_id;
+    let name = prog.name(td).to_string();
+    let core = Some(prog.def(td).krate) == prog.prelude_crate || matches!(prog.syms.str(prog.crates[prog.def(td).krate as usize].name), "core" | "alloc" | "std");
+    let self_ty = args.first().cloned().unwrap_or_default();
+    let tr = if args.len() > 1 { format!("{}<{}>", name, args[1..].join(", ")) } else { name.clone() };
+    match code {
+        "E0277" if tcx.lang_items.get(crate::lang_items::LangItem::Sized) == Some(td) => format!("the size for values of type `{}` cannot be known at compilation time", self_ty),
+        "E0277" if core && name == "Send" => format!("`{}` cannot be sent between threads safely", self_ty),
+        "E0277" if core && name == "Sync" => format!("`{}` cannot be shared between threads safely", self_ty),
+        "E0277" if core && name == "Iterator" => format!("`{}` is not an iterator", self_ty),
+        "E0277" => format!("the trait bound `{}: {}` is not satisfied", self_ty, tr),
+        "E0283" => format!("type annotations needed: cannot satisfy `{}: {}`", self_ty, tr),
+        _ => format!("overflow evaluating the requirement `{}: {}`", self_ty, tr),
+    }
+}
+
 pub fn ty_to_string_paths(prog: &Program, tcx: &Tcx, t: TyId) -> String {
     match tcx.tys.kind(t) {
         TyKind::Adt(d, args, _) => {

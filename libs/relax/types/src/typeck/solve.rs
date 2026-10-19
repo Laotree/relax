@@ -112,6 +112,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
         extra_arg: None,
+        soft: false,
         last_lo: 0,
         known_method_args: None,
         value_path_lifetimes: Vec::new(),

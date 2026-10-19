@@ -53,6 +53,7 @@ pub mod item_checks;
 pub mod feature_gate;
 pub mod transmute;
 pub mod wfcheck;
+pub mod item_wf;
 pub mod unsafety;
 pub mod pattern_analysis;
 pub mod stable;

@@ -35,6 +35,7 @@ impl Fcx<'_> {
 
     // fn_ctxt/checks.rs:229-235: each call input must be well formed.
     pub(super) fn register_wf(&mut self, ty: TyId, lo: u32) {
+        if !crate::item_wf::arity_ok(self.tcx, self.prog, ty) { return; }
         self.register_goal(Goal { param_env: self.param_env, predicate: Predicate::dummy(
             PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(ty)))) }, lo);
     }
