@@ -157,13 +157,13 @@ impl<'a> Parser<'a> {
 
     #[inline]
     fn kind(&self) -> T {
-        self.toks.at(self.pos).kind
+        self.toks.kind_at(self.pos)
     }
     #[inline]
     fn nth(&self, n: usize) -> T {
         let i = self.pos + n;
         if i < self.toks.len() {
-            self.toks.at(i).kind
+            self.toks.kind_at(i)
         } else {
             T::Eof
         }
@@ -240,7 +240,7 @@ impl<'a> Parser<'a> {
     #[inline]
     fn is_word(&self, n: usize, w: &[u8]) -> bool {
         let i = self.pos + n;
-        i < self.toks.len() && self.toks.at(i).kind == T::Ident && self.text_of(self.toks.at(i)) == w
+        i < self.toks.len() && self.toks.kind_at(i) == T::Ident && self.text_of(self.toks.at(i)) == w
     }
     /// rustc_span symbol.rs: the reserved-for-future-use keywords are no identifiers (a raw
     /// identifier is); `_` names nothing but a pattern, a const or a rename.
@@ -463,7 +463,7 @@ impl<'a> Parser<'a> {
         let mut mismatched = None;
         let mut i = self.pos + 1;
         while i < self.toks.len() {
-            let k = self.toks.at(i).kind;
+            let k = self.toks.kind_at(i);
             match k {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => stack.push(k),
                 T::CloseParen | T::CloseBracket | T::CloseBrace => {
@@ -481,15 +481,15 @@ impl<'a> Parser<'a> {
                     }
                 }
                 T::KwFn | T::KwImpl | T::KwStruct | T::KwEnum | T::KwTrait | T::KwMod | T::KwUse | T::KwStatic | T::KwExtern | T::KwType | T::Interp | T::Pound if k != T::Pound || self.toks.get(i + 1).map(|t| t.kind) == Some(T::Not) => return BodyOutline::Eager(if k == T::Interp { 5 } else { 2 }),
-                T::KwConst if i + 2 < self.toks.len() && matches!(self.toks.at(i + 1).kind, T::Ident | T::RawIdent) && self.toks.at(i + 2).kind == T::Colon => return BodyOutline::Eager(2),
-                T::Not if i > 0 && matches!(self.toks.at(i - 1).kind, T::Ident | T::RawIdent) && i + 1 < self.toks.len() && matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) => {
+                T::KwConst if i + 2 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::Ident | T::RawIdent) && self.toks.kind_at(i + 2) == T::Colon => return BodyOutline::Eager(2),
+                T::Not if i > 0 && matches!(self.toks.kind_at(i - 1), T::Ident | T::RawIdent) && i + 1 < self.toks.len() && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) => {
                     let t = self.toks.at(i - 1);
                     let name = std::str::from_utf8(self.bytes(t.lo, t.hi)).unwrap_or("").trim_start_matches("r#");
                     // `std::x!` / `core::x!` / `alloc::x!` or a plain name
-                    if i >= 2 && self.toks.at(i - 2).kind == T::PathSep {
+                    if i >= 2 && self.toks.kind_at(i - 2) == T::PathSep {
                         let q = if i >= 3 { self.toks.at(i - 3) } else { return BodyOutline::Eager(6) };
                         let qn = self.bytes(q.lo, q.hi);
-                        if !(matches!(qn, b"std" | b"core" | b"alloc") && (i < 4 || self.toks.at(i - 4).kind != T::PathSep)) {
+                        if !(matches!(qn, b"std" | b"core" | b"alloc") && (i < 4 || self.toks.kind_at(i - 4) != T::PathSep)) {
                             return BodyOutline::Eager(6);
                         }
                     }
@@ -783,7 +783,7 @@ impl<'a> Parser<'a> {
 
     fn check_attr_shape(&self, toks: TokRange) -> PResult<()> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
-        if hi <= lo || hi > self.toks.len() || self.toks.at(lo).kind != T::Ident {
+        if hi <= lo || hi > self.toks.len() || self.toks.kind_at(lo) != T::Ident {
             return Ok(());
         }
         let name = self.tok_text(self.toks.at(lo));
@@ -796,12 +796,12 @@ impl<'a> Parser<'a> {
         let bad = |this: &Self, at: usize, what: &str| -> PResult<()> {
             Err(PErr { pos: this.toks.at(at.min(hi - 1)).lo, msg: format!("E0539: malformed `{}` attribute input -- {}", String::from_utf8_lossy(this.tok_text(this.toks.at(lo))), what) })
         };
-        let kind = |i: usize| if i < hi { self.toks.at(i).kind } else { T::Eof };
+        let kind = |i: usize| if i < hi { self.toks.kind_at(i) } else { T::Eof };
         if kind(lo + 1) != T::OpenParen {
             return bad(self, lo, "expected this to be a list");
         }
         let close = hi - 1;
-        if self.toks.at(close).kind != T::CloseParen {
+        if self.toks.kind_at(close) != T::CloseParen {
             return Ok(());
         }
         if which == 2 {
@@ -847,7 +847,7 @@ impl<'a> Parser<'a> {
 
     /// One cfg predicate at `*i` (bounded by `end`); Err is the note.
     fn cfg_entry(&self, i: &mut usize, end: usize) -> Result<(), String> {
-        let k = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+        let k = if *i < end { self.toks.kind_at(*i) } else { T::Eof };
         match k {
             T::KwTrue | T::KwFalse => {
                 *i += 1;
@@ -856,12 +856,12 @@ impl<'a> Parser<'a> {
             T::Ident | T::RawIdent => {
                 let name = self.tok_text(self.toks.at(*i)).to_vec();
                 *i += 1;
-                let next = if *i < end { self.toks.at(*i).kind } else { T::Eof };
+                let next = if *i < end { self.toks.kind_at(*i) } else { T::Eof };
                 match next {
                     T::PathSep => Err("expected a valid identifier here".into()),
                     T::Eq => {
                         *i += 1;
-                        if *i < end && matches!(self.toks.at(*i).kind, T::Str | T::RawStr) {
+                        if *i < end && matches!(self.toks.kind_at(*i), T::Str | T::RawStr) {
                             *i += 1;
                             Ok(())
                         } else {
@@ -871,16 +871,16 @@ impl<'a> Parser<'a> {
                     T::OpenParen if matches!(name.as_slice(), b"all" | b"any" | b"not") => {
                         *i += 1;
                         let mut n = 0;
-                        while *i < end && self.toks.at(*i).kind != T::CloseParen {
+                        while *i < end && self.toks.kind_at(*i) != T::CloseParen {
                             self.cfg_entry(i, end)?;
                             n += 1;
-                            if *i < end && self.toks.at(*i).kind == T::Comma {
+                            if *i < end && self.toks.kind_at(*i) == T::Comma {
                                 *i += 1;
                             } else {
                                 break;
                             }
                         }
-                        if *i >= end || self.toks.at(*i).kind != T::CloseParen {
+                        if *i >= end || self.toks.kind_at(*i) != T::CloseParen {
                             return Err("expected `)`".into());
                         }
                         *i += 1;
@@ -901,7 +901,7 @@ impl<'a> Parser<'a> {
     /// `#[repr(C, packed)]`): every reader compares attribute names by text.
     fn unraw_attr(&mut self, toks: TokRange) {
         for i in toks.lo as usize..(toks.hi as usize).min(self.toks.len()) {
-            if self.toks.at(i).kind == T::RawIdent && self.tok_text(self.toks.at(i)).starts_with(b"r#") {
+            if self.toks.kind_at(i) == T::RawIdent && self.tok_text(self.toks.at(i)).starts_with(b"r#") {
                 self.toks.edit(i, |t| { t.kind = T::Ident; t.lo += 2; });
             }
         }
@@ -1118,7 +1118,7 @@ impl<'a> Parser<'a> {
         let mut depth = 0i32;
         let mut s = lo;
         for i in lo..hi {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::OpenParen | T::OpenBracket | T::OpenBrace => depth += 1,
                 T::CloseParen | T::CloseBracket | T::CloseBrace => depth -= 1,
                 T::Comma if depth == 0 => {
@@ -1136,21 +1136,21 @@ impl<'a> Parser<'a> {
         for (a, z) in args {
             // `path ! (..)`: idents and `::` up to the `!`, then one delimited group to the end
             let mut i = a;
-            while i < z && matches!(self.toks.at(i).kind, T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
+            while i < z && matches!(self.toks.kind_at(i), T::Ident | T::PathSep | T::KwCrate | T::Dollar) {
                 i += 1;
             }
-            let call = i > a && i + 2 < z + 1 && self.toks.at(i).kind == T::Not && matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(self.toks.at(z - 1).kind, T::CloseParen | T::CloseBracket | T::CloseBrace);
+            let call = i > a && i + 2 < z + 1 && self.toks.kind_at(i) == T::Not && matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace) && matches!(self.toks.kind_at(z - 1), T::CloseParen | T::CloseBracket | T::CloseBrace);
             let def = if call {
                 let name = String::from_utf8_lossy(self.tok_text(self.toks.at(i - 1))).trim_start_matches("r#").to_string();
                 let first = String::from_utf8_lossy(self.tok_text(self.toks.at(a))).into_owned();
                 let _ = first;
                 // the path's module part (idents, `crate`, `$crate` spelt `__relax_crate_x`)
                 let mut mpath: Vec<String> = Vec::new();
-                if self.toks.at(a).kind == T::PathSep {
+                if self.toks.kind_at(a) == T::PathSep {
                     mpath.push(String::new());
                 }
                 for k in a..i.saturating_sub(1) {
-                    if matches!(self.toks.at(k).kind, T::Ident | T::KwCrate) {
+                    if matches!(self.toks.kind_at(k), T::Ident | T::KwCrate) {
                         mpath.push(String::from_utf8_lossy(self.tok_text(self.toks.at(k))).trim_start_matches("r#").to_string());
                     }
                 }
@@ -1417,7 +1417,7 @@ impl<'a> Parser<'a> {
         })?;
         match r {
             Some(mut v) => {
-                let had_semi = self.pos > 0 && self.toks.at(self.pos - 1).kind == T::Semi;
+                let had_semi = self.pos > 0 && self.toks.kind_at(self.pos - 1) == T::Semi;
                 if had_semi {
                     if let Some(Stmt::Expr(_, semi)) = v.last_mut() {
                         *semi = true;
@@ -1491,7 +1491,7 @@ impl<'a> Parser<'a> {
             if self.kind() == T::Semi {
                 // `m! { .. };` : a macro item in braces may be followed by its `;`
                 let after_mac = items.last().map_or(false, |id: &ItemId| matches!(self.ast.item(*id).kind, ItemKind::Mac(_) | ItemKind::MacroRules(_)))
-                    && self.pos > 0 && self.toks.at(self.pos - 1).kind == T::CloseBrace;
+                    && self.pos > 0 && self.toks.kind_at(self.pos - 1) == T::CloseBrace;
                 // (generated text -- derive output -- is not held to the syntax of written code)
                 if !after_mac && (self.tok().lo as usize) < self.src.len() {
                     return self.err("expected item, found `;`");
@@ -2018,18 +2018,18 @@ impl<'a> Parser<'a> {
     /// path `!` delimiter (item- or statement-level macro call)
     fn mac_ahead(&self) -> bool {
         let mut i = self.pos;
-        if self.toks.at(i).kind == T::PathSep {
+        if self.toks.kind_at(i) == T::PathSep {
             i += 1;
         }
         loop {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::Ident | T::RawIdent | T::KwSelfValue | T::KwSuper | T::KwCrate => i += 1,
                 _ => return false,
             }
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::PathSep => i += 1,
                 T::Not => {
-                    return matches!(self.toks.at(i + 1).kind, T::OpenParen | T::OpenBracket | T::OpenBrace);
+                    return matches!(self.toks.kind_at(i + 1), T::OpenParen | T::OpenBracket | T::OpenBrace);
                 }
                 _ => return false,
             }
@@ -2765,7 +2765,7 @@ impl<'a> Parser<'a> {
         let mut i = self.pos + 1 + usize::from(self.nth(1) == T::PathSep);
         let mut depth = 0i32;
         loop {
-            match self.toks.at(i).kind {
+            match self.toks.kind_at(i) {
                 T::Lt => depth += 1,
                 T::Shl => depth += 2,
                 T::Gt => depth -= 1,
@@ -2777,7 +2777,7 @@ impl<'a> Parser<'a> {
                 T::OpenBrace => {
                     let mut braces = 0i32;
                     loop {
-                        match self.toks.at(i).kind {
+                        match self.toks.kind_at(i) {
                             T::OpenBrace => braces += 1,
                             T::CloseBrace => braces -= 1,
                             T::Eof => return false,
@@ -2794,7 +2794,7 @@ impl<'a> Parser<'a> {
                 return false;
             }
             if depth == 0 {
-                return matches!(self.toks.at(i).kind, T::Eq | T::Colon);
+                return matches!(self.toks.kind_at(i), T::Eq | T::Colon);
             }
         }
     }
