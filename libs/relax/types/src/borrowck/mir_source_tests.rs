@@ -94,3 +94,16 @@ fn zz_probe_closure_kind() {
     let sess = &std::sync::Arc::new(crate::Session::default());
     let _ = sess;
 }
+
+#[test]
+fn a_struct_with_a_reference_field_implies_its_inferred_outlives() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct Image<T> { pixels: Vec<T>, w: usize }
+        impl<T> core::ops::Index<usize> for Image<T> { type Output = T; fn index(&self, i: usize) -> &T { &self.pixels[i] } }
+        #[derive(Clone, Copy)]
+        pub struct Subimage<'a, T> { image: &'a Image<T>, off: usize }
+        impl<'a, T> Subimage<'a, T> { pub fn first(&self) -> &T { &self.image[self.off] } }
+        impl<'a, T> core::ops::Index<usize> for Subimage<'a, T> { type Output = T; fn index(&self, i: usize) -> &T { &self.image[self.off + i] } }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
