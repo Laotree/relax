@@ -37,7 +37,7 @@ const IMPLEMENTED: &[&str] = &[
     "dangling_pointers_from_locals", "dangling_pointers_from_temporaries", "const_item_mutation", "unconditional_recursion", "array_into_iter",
     "boxed_slice_into_iter", "if_let_rescope", "unused_comparisons", "invalid_nan_comparisons", "ambiguous_wide_pointer_comparisons",
     "unpredictable_function_pointer_comparisons", "useless_ptr_null_checks", "invalid_null_arguments", "closure_returning_async_block",
-    "unnecessary_transmutes", "integer_to_ptr_transmutes", "ptr_to_integer_transmute_in_consts", "unsafe_code", "invalid_value", "internal_eq_trait_method_impls", "non_local_definitions",
+    "unnecessary_transmutes", "integer_to_ptr_transmutes", "ptr_to_integer_transmute_in_consts", "unsafe_code", "invalid_value", "internal_eq_trait_method_impls", "non_local_definitions", "const_item_interior_mutations",
 ];
 
 /// A recorded `#[expect(name)]`.

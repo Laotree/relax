@@ -486,6 +486,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_transmutes(e);
         self.lint_unsafe_block(e);
         self.lint_invalid_value(e);
+        self.lint_interior_mutable_consts(e);
         self.lint_closure_returning_async_block(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
@@ -649,6 +650,19 @@ impl<'a> L2<'a> {
         let name = self.prog.syms.str(self.prog.def(item).name);
         if !matches!(name, "try_into" | "try_from" | "from_iter") { return; }
         if self.in_std(item) { return; }
+        // `from_iter`: only when the type may implement `FromIterator`
+        if name == "from_iter" {
+            let fi = self.prog.defs.iter().position(|d| d.kind == DefKind::Trait && self.prog.syms.str(d.name) == "FromIterator").map(|i| DefId(i as u32)).filter(|&t| diag_name(self.prog, t).as_deref() == Some("FromIterator"));
+            if let Some(tr) = fi {
+                let self_ty = self.body.res_args.get(&e.0).and_then(|l| self.tcx.tys.list(*l).first().copied());
+                if let Some(st) = self_ty {
+                    let infcx = crate::infer::InferCtxt::new(self.tcx, self.env.mode, self.env.limit);
+                    let var = infcx.next_ty_var();
+                    let r = infcx.type_implements_trait(self.prog, self.env.param_env, crate::next_solver::TraitRef { def_id: tr, args: vec![crate::consts::GenericArg::Type(self.tcx.tys.erase_regions(st)), crate::consts::GenericArg::Type(var)] });
+                    if !r.may_apply() { return; }
+                }
+            }
+        }
         self.emit(&RUST_2021_PRELUDE_COLLISIONS, self.ast.expr(e).lo, &format!("trait-associated function `{}` will become ambiguous in Rust 2021", name));
     }
 }
@@ -1604,5 +1618,38 @@ impl<'a> L2<'a> {
             };
             self.emit(&INVALID_VALUE, self.ast.expr(e).lo, &msg);
         }
+    }
+}
+
+// ---------------------------------------------------------------- const_item_interior_mutations (rustc_lint interior_mutable_consts.rs)
+
+pub const CONST_ITEM_INTERIOR_MUTATIONS: Lint = lint::lint("const_item_interior_mutations", Level::Warn, &[]);
+
+impl<'a> L2<'a> {
+    fn lint_interior_mutable_consts(&self, e: ExprId) {
+        let ast = self.ast;
+        let (method, receiver) = match ast.expr(e).kind {
+            ExprKind::MethodCall(r, _) => (self.body.methods.get(&e.0).map(|m| m.def), r),
+            ExprKind::Call(f, args) => {
+                let a = ast.list(args);
+                let Some(&first) = a.first() else { return };
+                let ExprKind::AddrOf(_, _, recv) = ast.expr(unparen(ast, first)).kind else { return };
+                if !matches!(ast.expr(unparen(ast, f)).kind, ExprKind::Path(_)) { return; }
+                (self.call_def(f), recv)
+            }
+            _ => return,
+        };
+        let Some(method) = method else { return };
+        let recv = unparen(ast, receiver);
+        if !matches!(ast.expr(recv).kind, ExprKind::Path(_)) { return; }
+        let Some(Res::Def(c)) = self.body.res.get(&recv.0).copied() else { return };
+        if !matches!(self.prog.def(c).kind, DefKind::Const | DefKind::AssocConst) { return; }
+        // derefs among the receiver's adjustments are arbitrary code
+        if let ExprKind::MethodCall(..) = ast.expr(e).kind {
+            if self.body.methods.get(&e.0).is_some_and(|m| m.derefs > 0) { return; }
+        }
+        if !has_def_attr(self.prog, method, "rustc_should_not_be_called_on_const_items") { return; }
+        let name = self.prog.syms.str(self.prog.def(method).name);
+        self.emit(&CONST_ITEM_INTERIOR_MUTATIONS, ast.expr(e).lo, &format!("mutation of an interior mutable `const` item with call to `{}`", name));
     }
 }
