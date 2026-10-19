@@ -94,7 +94,7 @@ impl LifetimeResolver<'_> {
     fn declare(&mut self, binder: BinderId, name: Option<ast::Ident>, span: u32) -> LifetimeId {
         let id = LifetimeId { owner: self.owner, local: self.resolution.declarations.len() as u32 };
         self.resolution.declarations.push(LifetimeDecl {
-            id, binder, name: name.map(|n| self.prog.files[self.file as usize].text(n).to_owned()), span,
+            id, binder, name: name.map(|n| self.prog.files[self.file as usize].lifetime_text(n).into_owned()), span,
         });
         self.resolution.binders.entry(binder).or_default().push(id);
         id
@@ -108,7 +108,8 @@ impl LifetimeResolver<'_> {
     }
 
     fn resolve_lifetime(&mut self, key: LifetimeKey, name: Option<ast::Ident>, span: u32, in_path: bool) {
-        let text = name.map(|n| self.prog.files[self.file as usize].text(n));
+        let text = name.map(|n| self.prog.files[self.file as usize].lifetime_text(n));
+        let text = text.as_deref();
         if text == Some("'static") { self.record_lifetime_use(key, LifetimeRes::Static); return; }
         if text.is_none() || text == Some("'_") {
             self.resolve_anonymous_lifetime(key, span, in_path && name.is_none());
@@ -173,7 +174,7 @@ impl LifetimeResolver<'_> {
         let mut bindings = Vec::new();
         for p in self.prog.files[self.file as usize].ast.list(params) {
             if !matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
-            let name = self.prog.files[self.file as usize].text(p.name).to_owned();
+            let name = self.prog.files[self.file as usize].lifetime_text(p.name).into_owned();
             if name == "'static" || name == "'_" { self.error(p.name.lo, &format!("E0262: invalid lifetime parameter name: `{}`", name)); }
             if bindings.iter().any(|(n, _)| *n == name) { self.error(p.name.lo, &format!("E0403: the name `{}` is already used for a generic parameter in this item's generic parameters", name)); }
             if self.ribs.iter().any(|r| r.bindings.iter().any(|(n, _)| *n == name)) {

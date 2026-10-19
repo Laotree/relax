@@ -180,6 +180,9 @@ pub struct GenEnv {
     pub consts: Vec<(u32, u32, ast::TyId)>,
     /// lowering this fn's return type: `impl Trait` there is its opaque type
     pub opaque_owner: Option<DefId>,
+    /// the item whose generics these are (rustc ribs: items of the owner's body blocks are
+    /// innermost, so they shadow its type parameters)
+    pub owner: Option<DefId>,
 }
 
 /// Expression id of an async fn's body coroutine: ASYNC_FN_BODY | the body block's id.
@@ -1145,6 +1148,7 @@ impl Tcx {
             }
         }
         env.parent_bounds = env.bounds.len();
+        env.owner = Some(d);
         let ast = &prog.files[def.file as usize].ast;
         let it = ast.item(def.item);
         match &it.kind {
@@ -1184,6 +1188,17 @@ impl Tcx {
                 env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
             ItemKind::TypeAlias(r) => push_generics(prog, def.file, &ast.row(*r).generics, &mut env),
+            ItemKind::Trait(_) => {
+                // generics_of a trait: `Self` first, then its parameters (so a default can name an
+                // earlier parameter: `trait Tr<const N: u8 = 1, const M: u8 = N>`)
+                if let Some(TraitItem { generics, .. }) = ast.as_trait(&it.kind) {
+                    env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
+                    env.regions.next_param += 1;
+                    push_generics(prog, def.file, generics, &mut env);
+                    env.self_ty = Some(self.tys.intern(TyKind::Param(0)));
+                    env.trait_def = Some(d);
+                }
+            }
             ItemKind::Impl(r) => {
                 // collect/generics_of.rs: impl parameters are available while
                 // lowering the impl header, before its self type is collected.
@@ -2479,6 +2494,11 @@ impl Tcx {
                 if let Some(t) = self.assoc_projection(prog, trait_ref, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t);
                 }
+                // an associated type of a bound the item's where clauses put on `Self`
+                // (`where Self: TryInto<T>` makes `Self::Error`; Self is param 0 of a trait)
+                if let Some(t) = self.param_assoc(cx, prog, module, env, 0, name) {
+                    return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t);
+                }
             }
         }
         // `T::Name` on a generic param: the associated type of one of its bounds
@@ -2500,7 +2520,9 @@ impl Tcx {
             }
             let name = f.text(seg.name);
             if let Some(s) = prog.syms.get(name) {
-                for (i, n) in env.names.iter().enumerate() {
+                // an item of the owner's body blocks shadows its type parameters (late.rs ribs)
+                let shadowed = env.owner.is_some_and(|o| prog.lookup_in_body_blocks(module, o, s, true).is_some());
+                for (i, n) in env.names.iter().enumerate().filter(|_| !shadowed) {
                     if *n == s {
                         return self.tys.intern(TyKind::Param(i as u32));
                     }
@@ -2812,6 +2834,19 @@ impl Tcx {
                 return prog.resolve_mod_path(module, false, &segs, false, false);
             }
             return prog.lookup_in_scope(module, segs[0].1, true);
+        }
+        if segs.len() == 1 {
+            // `::Name`: 2015 names an item of the crate root (extern crates are root items), 2018
+            // an extern-prelude crate
+            let krate = prog.mods[module as usize].krate;
+            let (kind, name) = segs[0];
+            if kind != SegKind::Ident { return None; }
+            let from_extern = || prog.extern_crate(module, name).map(|c| prog.mods[prog.crates[c as usize].root_mod as usize].def);
+            if prog.crates[krate as usize].edition < 2018 {
+                let root = prog.mods[prog.crates[krate as usize].root_mod as usize].def;
+                return prog.lookup_in_container(root, name, true).or_else(from_extern);
+            }
+            return from_extern();
         }
         let parent = prog.resolve_mod_path(module, p.global(), &segs[..segs.len() - 1], false, false)?;
         prog.lookup_in_container(parent, segs[segs.len() - 1].1, true)

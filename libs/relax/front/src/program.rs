@@ -3468,9 +3468,15 @@ impl Program {
         let edition = self.crates[self.mods[module as usize].krate as usize].edition;
         let my_crate = self.mods[module as usize].krate;
         if glob {
-            let target = match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
-                Some(t) => t,
-                None => return false,
+            // `use *;` / `use ::*;` (2015): the path is just the `{{root}}` segment, the crate root
+            // (rustc_resolve build_reduced_graph: an empty prefix imports the crate root)
+            let target = if segs.is_empty() && edition < 2018 {
+                self.mods[self.crates[my_crate as usize].root_mod as usize].def
+            } else {
+                match self.resolve_mod_path(module, global, &segs, edition < 2018, true) {
+                    Some(t) => t,
+                    None => return false,
+                }
             };
             // a proc-macro crate exports only macros: a glob over it brings in no items
             let tk = self.def(target).krate;
@@ -4266,6 +4272,20 @@ impl Program {
                 None => break,
             }
         }
+    }
+
+    /// `name` among the items of the body blocks of `owner` that `module` sits in (the anonymous
+    /// modules from `module` up to where the owner's body starts): what rustc's innermost Item
+    /// ribs hold, ahead of the owner's generic parameters.
+    pub fn lookup_in_body_blocks(&self, module: u32, owner: DefId, name: Sym, ns_type: bool) -> Option<DefId> {
+        let mut m = module;
+        while self.block_owner.get(&m) == Some(&owner) {
+            if let Some(d) = self.lookup_in_module(m, name, ns_type, &mut Vec::new()) {
+                return Some(d);
+            }
+            m = self.mods[m as usize].lexical_parent?;
+        }
+        None
     }
 
     fn lookup_in_scope_uncached(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {

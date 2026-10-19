@@ -414,6 +414,9 @@ pub struct Fcx<'a> {
     param_env: crate::next_solver::ParamEnvId,
     loops: Vec<Loop>,
     in_loop_condition: bool,
+    /// the item-holding block modules being checked, with how many locals were in scope when each
+    /// began: its items sit inside those locals' ribs and outside the later ones
+    item_blocks: Vec<(u32, usize)>,
     diverges: bool,
     ret_stack: Vec<TyId>,
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
@@ -662,6 +665,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         param_env: Default::default(),
         loops: Vec::new(),
         in_loop_condition: false,
+        item_blocks: Vec::new(),
         diverges: false,
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
@@ -1851,6 +1855,11 @@ impl<'a> Fcx<'a> {
         while i > 0 {
             i -= 1;
             if self.scopes[i].0 == s {
+                // a local declared before an item-holding block began is outside that block's
+                // item rib: the block's item of that name shadows it (late.rs ribs)
+                if self.item_blocks.iter().any(|&(m, entry)| entry > i && self.prog.lookup_in_module(m, s, false, &mut Vec::new()).is_some()) {
+                    return None;
+                }
                 let li = self.scopes[i].1;
                 let (bc, bpos) = match self.local_hyg.get(li as usize) {
                     Some(x) => x,
@@ -3077,6 +3086,20 @@ impl<'a> Fcx<'a> {
                         let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
                         return (Res::Def(d), t);
                     }
+                } else if let Some(imp) = self.env.owner.and_then(|o| outer_impl(prog, o)) {
+                    // Res::SelfCtor of an enclosing impl, reached from a nested item (rustc never
+                    // validates it in resolve; hir_typeck fn_ctxt/_impl.rs: an error when the
+                    // impl's self type has parameters, else the self_constructor_from_outer_item lint)
+                    if let Some(&st) = self.tcx.impl_self.get(&imp) {
+                        if self.tcx.has_param(st) {
+                            self.err(path.lo, "E0401: can't reference `Self` constructor from outer item".to_string());
+                            return (Res::Err, error);
+                        }
+                        if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
+                            let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
+                            return (Res::Def(d), t);
+                        }
+                    }
                 }
             }
             if let Some(d) = prog.lookup_in_scope(self.module, s, false) {
@@ -3376,7 +3399,9 @@ impl<'a> Fcx<'a> {
     /// (ambiguity is a match). A rigid opaque or param self type is proven through its
     /// alias bounds / where-clauses by the solver like any other type.
     fn extension_candidates(&mut self, t: TyId, name: Sym, kind: DefKind) -> Vec<(DefId, DefId)> {
-        if matches!(self.tcx.tys.kind(t), TyKind::Infer(_) | TyKind::Error) { return Vec::new(); }
+        // (Mode::Path probes an unresolved self type too -- `<_>::try_from(x)`: probe_op has no
+        // bad-type check there, every trait in scope with the item may apply)
+        if matches!(self.tcx.tys.kind(t), TyKind::Error) { return Vec::new(); }
         let mut traits = self.traits_in_scope();
         traits.extend(self.param_bound_traits(t));
         traits.sort_by_key(|d| d.0);
@@ -3901,8 +3926,10 @@ impl<'a> Fcx<'a> {
         let blk = ast.block(b);
         let saved_scope = self.scopes.len();
         let saved_module = self.module;
+        let saved_blocks = self.item_blocks.len();
         if let Some(&m) = self.prog.block_mods.get(&(self.file, b.0)) {
             self.module = m;
+            self.item_blocks.push((m, saved_scope));
         }
         let mut result = self.tcx.tys.unit;
         let n = blk.stmts.len();
@@ -4005,6 +4032,7 @@ impl<'a> Fcx<'a> {
         }
         self.scopes.truncate(saved_scope);
         self.module = saved_module;
+        self.item_blocks.truncate(saved_blocks);
         if diverged {
             self.diverges = true;
             let tail_is_expr = n > 0 && matches!(self.ast().list(blk.stmts)[n - 1], Stmt::Expr(_, false));
@@ -6596,6 +6624,20 @@ fn dyn_trait_names(d: DefId, autos: &[DefId], path: impl Fn(DefId) -> String) ->
     names.sort();
     let head = if auto_only { names.remove(0) } else { path(d) };
     (head, names)
+}
+
+/// The impl whose body (through nested fn bodies) declares `owner`: the impl `Self` constructors
+/// of nested items refer to.
+fn outer_impl(prog: &Program, owner: DefId) -> Option<DefId> {
+    let mut d = owner;
+    loop {
+        let o = *prog.block_owner.get(&prog.def(d).scope)?;
+        let parent = prog.def(o).parent;
+        if parent != crate::program::NO_DEF && prog.def(parent).kind == DefKind::Impl {
+            return Some(parent);
+        }
+        d = o;
+    }
 }
 
 /// An item's path as rustc's type_name prints it: an item in a fn body is under that fn
