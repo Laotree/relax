@@ -103,7 +103,7 @@ impl PlaceBuilder {
     }
     /// as_place.rs:`to_place`.
     pub fn to_place(&self, cx: &Builder<'_>) -> Place {
-        self.try_to_place(cx).expect("upvar place not covered by a capture")
+        self.try_to_place(cx).unwrap_or_else(|| panic!("upvar place not covered by a capture: {:?} + {:?}; captures: {:?}", self.base, self.projection, cx.upvars.iter().map(|c| (c.var, &c.projection)).collect::<Vec<_>>()))
     }
 }
 

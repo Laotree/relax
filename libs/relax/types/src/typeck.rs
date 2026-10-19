@@ -435,6 +435,9 @@ pub struct Fcx<'a> {
     cur_binop: u32,
     /// resolve without defaulting `{integer}`/`{float}` (mid-check normalisation)
     keep_literal_vars: bool,
+    /// Decided once per body, before any work: user-written types are saved only for crates that
+    /// will be borrow-checked (event::user_types_wanted) -- they cost canonicalization otherwise.
+    keep_user_types: bool,
     /// default binding mode while checking a pattern: 0 move, 1 ref, 2 ref mut
     bind_mode: u8,
     /// a path pattern's resolution, made before its adjust mode is chosen (rustc pat.rs
@@ -679,6 +682,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         await_count: 0,
         cur_binop: 0,
         keep_literal_vars: true,
+        keep_user_types: crate::borrowck::event::user_types_wanted(prog, prog.def(def).krate),
         diverging: Vec::new(),
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),

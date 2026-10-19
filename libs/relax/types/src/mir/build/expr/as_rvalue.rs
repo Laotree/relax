@@ -41,7 +41,13 @@ impl Builder<'_> {
                 } else {
                     let BlockAnd(b, value_operand) = self.as_operand(block, scope, value, LocalInfo::Boring, false)?;
                     block = b;
-                    Ok(block.and(Rvalue::Repeat(value_operand, Const::Ty(tcx.tys.usize_, count))))
+                    // The count as a scalar when it is known (the checker's array-length reader takes values and
+                    // unevaluated constants); a generic count stays a type-level constant.
+                    let count = match self.const_usize(count) {
+                        Some(n) => Const::Val(ConstValue::Scalar(Scalar::Int { bits: n, size: 8 }), tcx.tys.usize_),
+                        None => Const::Ty(tcx.tys.usize_, count),
+                    };
+                    Ok(block.and(Rvalue::Repeat(value_operand, count)))
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
@@ -84,6 +90,19 @@ impl Builder<'_> {
                     let BlockAnd(b, source) = self.as_operand(block, scope, source, LocalInfo::Boring, false)?;
                     block = b;
                     (source, source_ty)
+                };
+                // A fn item or capture-free closure cast to a pointer or integer is reified to its fn
+                // pointer first (rustc cast.rs: the source is coerced to a fn pointer, then cast).
+                let (source, ty) = match tcx.tys.kind(ty) {
+                    TyKind::FnDef(..) | TyKind::Closure(..) => {
+                        let fn_ptr = self.fn_ptr_of(ty, expr_span)?;
+                        let safety = match tcx.tys.kind(fn_ptr) { TyKind::FnPtr(_, _, header, _) => header.safety, _ => crate::types::Safety::Safe };
+                        let cast = if matches!(tcx.tys.kind(ty), TyKind::Closure(..)) { crate::mir::PointerCoercion::ClosureFnPointer(safety) } else { crate::mir::PointerCoercion::ReifyFnPointer(safety) };
+                        let temp = self.temp(fn_ptr, expr_span);
+                        self.cfg.push_assign(block, source_info, temp.clone(), Rvalue::Cast(CastKind::PointerCoercion(cast, CoercionSource::AsCast), source, fn_ptr));
+                        (Operand::Move(temp), fn_ptr)
+                    }
+                    _ => (source, ty),
                 };
                 let cast_kind = self.mir_cast_kind(ty, expr_ty, expr_span)?;
                 Ok(block.and(Rvalue::Cast(cast_kind, source, expr_ty)))
@@ -265,7 +284,18 @@ impl Builder<'_> {
                 // the equivalent unsigned type and do the same comparison: a negative value is *at
                 // least* 128 after the cast (that's i8::MIN), an overflowing amount for every type.
                 let lhs_size = self.int_size(ty, span)?;
-                let rhs_ty = self.operand_ty(&rhs);
+                let mut rhs = rhs;
+                let mut rhs_ty = self.operand_ty(&rhs);
+                // `1 << &n`: the by-reference impls (`Shl<&T> for T`) read the amount through the reference.
+                // rustc keeps an overloaded call; here the amount is copied out of the reference.
+                if let (TyKind::Ref(_, inner, _), Operand::Copy(p) | Operand::Move(p)) = (tcx.tys.kind(rhs_ty).clone(), &rhs) {
+                    let mut q = p.clone();
+                    q.projection.push(PlaceElem::Deref);
+                    let amount = self.temp(inner, span);
+                    self.cfg.push_assign(block, source_info, amount.clone(), Rvalue::Use(Operand::Copy(q)));
+                    rhs = Operand::Move(amount);
+                    rhs_ty = inner;
+                }
                 let rhs_prim = match tcx.tys.kind(rhs_ty) {
                     TyKind::Int(p) => *p,
                     _ => return Err(self.error(span, UnsupportedReason::UnresolvedFact("shift by a non-integer"))),
@@ -448,6 +478,22 @@ impl Builder<'_> {
         self.int_literal(span, ty, 1u128 << (size * 8 - 1))
     }
 
+    /// The fn pointer type of a fn item / capture-free closure (typeck `fn_ptr_of`).
+    fn fn_ptr_of(&self, t: TyId, span: Span) -> BuildResult<TyId> {
+        let tcx = self.root.cx.tcx;
+        let prog = self.root.cx.prog;
+        match tcx.tys.kind(t).clone() {
+            TyKind::FnDef(d, args, regions) => {
+                let Some(sig) = tcx.fn_item_sig(prog, d).cloned() else { return Err(self.error(span, UnsupportedReason::UnresolvedFact("fn item without a signature"))) };
+                let poly = tcx.tys.intern(TyKind::FnPtr(tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
+                let args = tcx.complete_args(prog, d, tcx.tys.list(args), regions);
+                Ok(tcx.instantiate_ty(prog, d, &args, poly))
+            }
+            TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) => Ok(sig),
+            _ => Err(self.error(span, UnsupportedReason::UnresolvedFact("not a fn item"))),
+        }
+    }
+
     /// ty/cast.rs:`mir_cast_kind`.
     fn mir_cast_kind(&self, from_ty: TyId, cast_ty: TyId, span: Span) -> BuildResult<CastKind> {
         #[derive(PartialEq)]
@@ -470,6 +516,10 @@ impl Builder<'_> {
             (Some(Ct::Int), Some(Ct::Float)) => CastKind::IntToFloat,
             (Some(Ct::Float), Some(Ct::Float)) => CastKind::FloatToFloat,
             (Some(Ct::Ptr), Some(Ct::Ptr)) => CastKind::PtrToPtr,
+            // Neither side is a primitive cast type: the cast is the unsizing coercion typeck found
+            // (`Box::new(x) as Box<dyn Tr>`) whose recorded target differs from the written one only
+            // in erased regions, so the THIR builder did not take it for a plain coercion.
+            (None, None) => CastKind::PointerCoercion(crate::mir::PointerCoercion::Unsize, CoercionSource::AsCast),
             _ => return Err(self.error(span, UnsupportedReason::UnresolvedFact("cast between non-castable types"))),
         })
     }

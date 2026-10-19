@@ -98,6 +98,7 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
         await_count: 0,
         cur_binop: 0,
         keep_literal_vars: true,
+        keep_user_types: true,
         diverging: Vec::new(),
         deferred_dyn: Vec::new(),
         deferred_casts: Vec::new(),

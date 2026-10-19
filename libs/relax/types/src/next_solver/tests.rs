@@ -1579,3 +1579,70 @@ fn s6_shared_reference_to_a_projection_is_copy_in_a_generic_body() {
     cx.prove_trait_ref(&mut out, crate::lang_items::LangItem::Copy, &[GenericArg::Type(reference)], Locations::Single(at), Cat::CopyBound);
     assert!(!cx.tainted_by_errors.get());
 }
+
+// ---- S12: solver region obligations in constraint conversion ----
+fn s12_setup<'a>(p: &'a Program, t: &'a Tcx, body: &'a crate::mir::Body, extra: usize)
+    -> (crate::borrowck::infer_ctxt::BorrowckInferCtxt<'a>, crate::borrowck::universal_regions::UniversalRegions, Vec<crate::types::RegionId>) {
+    use crate::borrowck::{region_infer::NllRegionVariableOrigin as Origin, renumber::RegionCtxt, universal_regions::{UniversalRegions, RegionClassification}};
+    let cx = crate::borrowck::infer_ctxt::BorrowckInferCtxt::new(t, p, body.source.owner, body.source.owner, &[t.tys.intern(TyKind::Param(0))]);
+    let fr_static = cx.next_nll_region_var(Origin::FreeRegion, || RegionCtxt::Unknown);
+    let mut regions = vec![fr_static];
+    for _ in 0..extra { regions.push(cx.next_nll_region_var(Origin::FreeRegion, || RegionCtxt::Unknown)); }
+    let vids: Vec<_> = regions.iter().enumerate().map(|(i, &r)| (s6_vid(t, r), if i == 0 { RegionClassification::Global } else { RegionClassification::Local })).collect();
+    let mut universals = UniversalRegions::new(vids[0].0, Some(vids[vids.len() - 1].0), vids);
+    universals.indices.push((t.tys.intern_region(RegionKind::ReStatic), s6_vid(t, fr_static)));
+    (cx, universals, regions)
+}
+
+#[test]
+fn s12_alias_outlives_uses_the_environment_bound_as_a_verify() {
+    use crate::borrowck::type_check::{Locations, MirTypeckRegionConstraints, constraint_conversion::ConstraintConversion};
+    use crate::borrowck::{constraints::ConstraintCategory, region_infer::VerifyBound};
+    use crate::next_solver::type_op::{QueryRegionConstraint, QueryRegionConstraints, RegionConstraint};
+    use crate::tcx::outlives::OutlivesPredicate;
+    // generic1 of projection-implied-bounds.rs: `<T as Iterator>::Item: 'x` with `Item: 'r` known from the signature's WF
+    let (p, t) = round19_program("trait It { type Item; } fn seam_generic<T: It>() {}", "s12_env");
+    let mut body = round19_body(&t, &p); body.source.owner = named(&p, "seam_generic");
+    let (cx, universals, regions) = s12_setup(&p, &t, &body, 2);
+    let (r, x) = (regions[1], regions[2]);
+    let item = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Item") }, &[GenericArg::Type(t.tys.intern(TyKind::Param(0)))]);
+    let mut out = MirTypeckRegionConstraints::new(2);
+    let span = crate::mir::Span { file: 0, lo: 1, hi: 2 };
+    // the implied bounds are normalized: the pair holds the rigid form of the alias
+    let rigid = type_op::TypeOp::fully_perform(type_op::ParamEnvAnd { param_env: cx.param_env_id(), value: type_op::Normalize { value: item } }, &cx.infcx, &p).unwrap().output;
+    let bound_pairs = [(rigid, r)];
+    let data = QueryRegionConstraints { constraints: vec![QueryRegionConstraint { constraint: RegionConstraint::Outlives(OutlivesPredicate::Type(item, x)),
+        category: ConstraintCategory::Boring, visible_for_leak_check: false }] };
+    ConstraintConversion::new(&cx, &universals, &bound_pairs, &[], Locations::All(span), span, ConstraintCategory::Boring, &mut out).convert_all(&data);
+    assert_eq!(out.type_tests.len(), 1, "an alias with an environment bound is verified, not decomposed: {:?}", out.outlives_constraints.outlives);
+    assert!(out.outlives_constraints.outlives.is_empty());
+    let test = &out.type_tests[0];
+    assert_eq!(test.lower_bound, s6_vid(&t, x));
+    fn mentions(b: &VerifyBound, vid: usize) -> bool { match b {
+        VerifyBound::OutlivedBy(v) => *v == vid,
+        VerifyBound::AnyBound(bs) | VerifyBound::AllBounds(bs) => bs.iter().any(|b| mentions(b, vid)),
+        _ => false } }
+    assert!(mentions(&test.verify_bound, s6_vid(&t, r)), "{:?} for {:?} (item {:?}) param={:?} vids r={} x={}", test.verify_bound, test.generic_kind, item, t.tys.intern(TyKind::Param(0)), s6_vid(&t, r), s6_vid(&t, x));
+}
+
+#[test]
+fn s12_type_outlives_obligations_are_normalized_before_decomposition() {
+    use crate::borrowck::type_check::{Locations, MirTypeckRegionConstraints, constraint_conversion::ConstraintConversion};
+    use crate::borrowck::constraints::ConstraintCategory;
+    use crate::next_solver::type_op::{QueryRegionConstraint, QueryRegionConstraints, RegionConstraint};
+    use crate::tcx::outlives::OutlivesPredicate;
+    let (p, t) = round19_program("trait Get { type Out; } impl<'a> Get for &'a u32 { type Out = &'a u8; } fn seam_generic<T>() {}", "s12_norm");
+    let mut body = round19_body(&t, &p); body.source.owner = named(&p, "seam_generic");
+    let (cx, universals, regions) = s12_setup(&p, &t, &body, 2);
+    let (a, c) = (regions[1], regions[2]);
+    // `<&'a u32 as Get>::Out: 'c` normalizes to `&'a u8: 'c`, which is `'a: 'c`
+    let input = t.tys.intern(TyKind::Ref(false, t.tys.u32_, a));
+    let projection = t.alias_ty_with_args(AliasTyKind::Projection { def_id: named(&p, "Out") }, &[GenericArg::Type(input)]);
+    let mut out = MirTypeckRegionConstraints::new(2);
+    let span = crate::mir::Span { file: 0, lo: 1, hi: 2 };
+    let data = QueryRegionConstraints { constraints: vec![QueryRegionConstraint { constraint: RegionConstraint::Outlives(OutlivesPredicate::Type(projection, c)),
+        category: ConstraintCategory::Boring, visible_for_leak_check: false }] };
+    ConstraintConversion::new(&cx, &universals, &[], &[], Locations::All(span), span, ConstraintCategory::Boring, &mut out).convert_all(&data);
+    assert!(out.type_tests.is_empty(), "{:?}", out.type_tests);
+    assert!(out.outlives_constraints.outlives.iter().any(|e| e.sup == s6_vid(&t, a) && e.sub == s6_vid(&t, c)), "{:?}", out.outlives_constraints.outlives);
+}

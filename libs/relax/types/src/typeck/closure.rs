@@ -178,8 +178,10 @@ impl Fcx<'_> {
         let sig = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&ps), ret, FnHeader::RUST, bound));
         // rustc_hir_typeck/src/closure.rs:944: retain the supplied signature before it is
         // normalized and before the expected signature constrains it.
-        let canonical = crate::next_solver::canonical::user_type::canonicalize_user_signature(&self.infcx, sig);
-        self.b.user_provided_sigs.insert(e.0, std::sync::Arc::new(canonical));
+        if self.keep_user_types {
+            let canonical = crate::next_solver::canonical::user_type::canonicalize_user_signature(&self.infcx, sig);
+            self.b.user_provided_sigs.insert(e.0, std::sync::Arc::new(canonical));
+        }
         self.normalize_signature(sig)
     }
 
