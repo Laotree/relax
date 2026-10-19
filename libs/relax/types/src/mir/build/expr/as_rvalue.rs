@@ -551,7 +551,7 @@ mod tests {
     }
     fn builder(fx: Fx) -> (Builder<'static>, &'static Tcx) {
         let (_, tcx, root, owner) = fx.builder_parts;
-        let thir: &'static ThirBody = Box::leak(Box::new(ThirBody { thir: fx.thir, params: Vec::new(), expr: ExprId(0) }));
+        let thir: &'static ThirBody = Box::leak(Box::new(ThirBody::for_test(fx.thir, Vec::new(), ExprId(0), tcx.tys.unit)));
         let mut scopes = Scopes::default();
         scopes.scopes.push(Scope::new(SourceScope(0), ScopeId(0)));
         let b = Builder {

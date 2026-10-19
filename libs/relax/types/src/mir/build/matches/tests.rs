@@ -31,7 +31,7 @@ fn run<R>(source: &str, name: &str, f: impl FnOnce(&mut Builder<'_>, &[Pat], &ty
     // expression 0: a stand-in guard
     let mut arenas = Thir::default();
     arenas.alloc_expr(crate::mir::build::thir::Expr { kind: ExprKind::Tuple { fields: Box::new([]) }, ty: unit, temp_scope: None, span: Span::default() });
-    let thir = ThirBody { thir: arenas, params: Vec::new(), expr: ExprId(0) };
+    let thir = ThirBody::for_test(arenas, Vec::new(), ExprId(0), tcx.tys.unit);
     let mut builder = Builder {
         root: &root,
         thir: &thir,

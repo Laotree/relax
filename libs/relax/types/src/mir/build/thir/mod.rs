@@ -24,8 +24,41 @@ thir_ids!(ArmId, BlockId, ExprId, StmtId, ParamId);
 #[derive(Debug, Clone)]
 pub struct ThirBody {
     pub thir: Thir,
+    /// The parameters in order. For a closure/coroutine body the first is the environment (`_1`: the closure
+    /// type, `&closure` or `&mut closure` with an erased region, no pattern), followed by the declared
+    /// arguments (coroutines: the resume argument).
     pub params: Vec<ParamId>,
     pub expr: ExprId,
+    pub body_ty: BodyTy,
+    /// rustc `hir_span_with_body`: the whole item, signature through body.
+    pub span: Span,
+    /// Span of the declared return type (the span of the return place).
+    pub ret_span: Span,
+    pub coroutine: Option<CoroutineThir>,
+    /// The `CallSite` and `Arguments` region scopes of a fn-like body (None for constants).
+    pub fn_scopes: Option<(ScopeId, ScopeId)>,
+}
+impl ThirBody {
+    /// A constant-shaped body around `thir` for unit tests that drive individual lowering functions.
+    #[cfg(test)]
+    pub fn for_test(thir: Thir, params: Vec<ParamId>, expr: ExprId, ty: TyId) -> Self {
+        ThirBody { thir, params, expr, body_ty: BodyTy::Const(ty), span: Span::default(), ret_span: Span::default(), coroutine: None, fn_scopes: None }
+    }
+}
+/// rustc `BodyTy`.
+#[derive(Debug, Clone)]
+pub enum BodyTy {
+    Const(TyId),
+    /// `output` is the (liberated, normalized) return type; `rust_call` for `extern "rust-call"` fns
+    /// (closures never are).
+    Fn { output: TyId, rust_call: bool },
+}
+/// What a coroutine body adds (rustc `CoroutineInfo::initial`).
+#[derive(Debug, Clone)]
+pub struct CoroutineThir {
+    pub kind: crate::mir::CoroutineKind,
+    pub yield_ty: TyId,
+    pub resume_ty: TyId,
 }
 
 /// rustc `Thir`: the arenas of one body.
