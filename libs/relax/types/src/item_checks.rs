@@ -339,6 +339,21 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            // (declarations of an extern block, plain or unsafe)
+            for &it in ast.list(fm.items) {
+                if let ItemKind::Fn(sig, _, _) = ast.item(it).kind {
+                    let sig = ast.fn_sig(sig);
+                    if let Some(g) = ast.list(sig.generics.params).iter().find(|g| !matches!(g.kind, crate::ast::GenericParamKind::Lifetime(_))) {
+                        let what = if matches!(g.kind, crate::ast::GenericParamKind::Const(..)) { "const" } else { "type" };
+                        errors.push(prog.record_error(file, g.name.lo, "typeck", format!("E0044: foreign items may not have {} parameters", what)));
+                    }
+                    for prm in ast.list(sig.params) {
+                        if !matches!(ast.pat(prm.pat), crate::ast::Pat::Wild | crate::ast::Pat::Ident { by_ref: false, mutbl: false, sub: None, .. }) {
+                            errors.push(prog.record_error(file, ast.item(it).lo, "typeck", "E0130: patterns aren't allowed in foreign function declarations".to_string()));
+                        }
+                    }
+                }
+            }
             if fm.unsafe_ != 0 {
                 crate::lint::emit_in(prog, def, &attrs, &crate::lint::UNSAFE_CODE, file, item.lo, "usage of an `unsafe extern` block");
                 continue;
