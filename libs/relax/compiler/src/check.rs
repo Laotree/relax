@@ -204,7 +204,17 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
             errs
         }));
         match r {
-            Ok(e) => errors.extend(e),
+            Ok(e) => {
+                // rustc evaluates every array length / const argument written in a signature (used
+                // or not): one that fails is reported there (E0080)
+                if e.is_empty() && u.tcx.generic_indices_of(&u.prog, anon).types_consts.is_empty() && u.prog.def(u.prog.def(anon).parent).kind != DefKind::Trait {
+                    let env = crate::tcx::TypingEnv::fully_monomorphized(&u.prog);
+                    let before = u.tcx.dcx.err_count();
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.const_eval_resolve(&u.prog, env, anon, &[])));
+                    let _ = before;
+                }
+                errors.extend(e)
+            }
             Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(anon))),
         }
     }
