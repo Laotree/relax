@@ -327,7 +327,7 @@ impl Cx<'_> {
                 }
             }
             A::Index(lhs, index) => {
-                if let Some(&(def, args)) = tb.mutable_index.get(&e.0).or_else(|| tb.ov_index.get(&e.0)) {
+                if let Some(&(def, args)) = tb.mutable_index.get(&e.0).or_else(|| tb.ov_index.get(&e.0)).or_else(|| tb.std_index.get(&e.0)) {
                     // `*Index::index(&lhs, index)`
                     let base = self.mirror_expr(lhs)?;
                     let base = self.apply_operand_adjustments_id(e, base)?;

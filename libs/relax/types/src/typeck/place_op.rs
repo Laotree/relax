@@ -177,7 +177,7 @@ impl Fcx<'_> {
     /// give `IndexMut<Idx>` for the same `Self`.
     fn convert_index_to_mutable(&mut self, expr: ExprId) {
         if self.b.mutable_index.contains_key(&expr.0) { return; }
-        let Some(&(_, args)) = self.b.ov_index.get(&expr.0) else { return };
+        let Some(&(_, args)) = self.b.ov_index.get(&expr.0).or_else(|| self.b.std_index.get(&expr.0)) else { return };
         let args = self.tcx.tys.list(args).to_vec();
         let Some(td) = self.tcx.lang_items.get(LangItem::IndexMut) else { return };
         let goal = self.trait_goal(td, args[0], &args[1..]);

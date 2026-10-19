@@ -65,6 +65,7 @@ pub(super) fn try_normalize_body(prog: &Program, tcx: &Tcx, env: crate::tcx::Typ
     b.user_provided_sigs = SideTable::new();
     for (_, args) in b.ov_index.values_mut() { sl(args, &mut s)?; }
     for (_, args) in b.mutable_index.values_mut() { sl(args, &mut s)?; }
+    for (_, args) in b.std_index.values_mut() { sl(args, &mut s)?; }
     for (_, args) in b.for_next.values_mut() { sl(args, &mut s)?; }
     for (_, args, ty) in b.for_into.values_mut() { sl(args, &mut s)?; *ty = s(*ty)?; }
     for (_, args, ty) in b.try_branch.values_mut() { sl(args, &mut s)?; *ty = s(*ty)?; }

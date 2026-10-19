@@ -152,6 +152,10 @@ pub struct Body {
     /// `IndexMut::index_mut` with [Self, Idx] for an overloaded index used as a mutable place
     /// (place_op.rs): rustc replaces the type-dependent def; `ov_index` keeps naming `Index::index`.
     pub mutable_index: SideTable<u32, (DefId, crate::types::TyList)>,
+    /// `a[range]` on an array, slice or `str`: the std `Index` impl typeck leaves to the builtin
+    /// slicing (codegen lowers it natively, so `ov_index` does not name it); THIR reads it as the
+    /// overloaded place rustc has.
+    pub std_index: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> `Iterator::next` with [Iter].
     pub for_next: SideTable<u32, (DefId, crate::types::TyList)>,
     /// Every checked `for` head -> (`IntoIterator::into_iter`, [Self], iterator type).
@@ -234,6 +238,7 @@ impl Body {
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
+            std_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
             call_traits: SideTable::new(),
@@ -312,7 +317,7 @@ impl Body {
     pub fn freeze(&mut self) {
         macro_rules! shrink { ($($f:ident),*) => { $( self.$f.shrink_to_fit(); )* } }
         shrink!(res, res_args, pat_res, pat_local, methods, binops, adjustments, user_provided_types, user_provided_sigs, min_captures, hidden_types,
-            field_idx, ov_index, mutable_index, for_next, for_into, call_traits, legacy_args,
+            field_idx, ov_index, mutable_index, std_index, for_next, for_into, call_traits, legacy_args,
             pat_derefs, pat_bind_ref, pat_discriminant_reads, try_branch, try_from_residual, fmt_named, closure_locals,
             closure_expected_kinds, closure_sigs, inline_const_types, struct_defaults,
             args, expr_ty, expr_typed, pat_ty, pat_typed, field_uses, dependencies, locals, param_pats, closures, errors);
@@ -380,7 +385,7 @@ impl Body {
         add("pat_ty", self.pat_ty.len(), t(&self.pat_ty));
         add("pat_typed", self.pat_typed.len(), self.pat_typed.heap_bytes());
         macro_rules! maps { ($($f:ident),*) => { $( add(stringify!($f), self.$f.len(), m(&self.$f)); )* } }
-        maps!(res, res_args, methods, binops, ov_index, mutable_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, hidden_types, field_idx, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
+        maps!(res, res_args, methods, binops, ov_index, mutable_index, std_index, for_next, for_into, try_branch, try_from_residual, pat_res, pat_local, hidden_types, field_idx, call_traits, pat_derefs, pat_bind_ref, pat_discriminant_reads, fmt_named, closure_expected_kinds, closure_sigs, inline_const_types);
         add("adjustments", self.adjustments.len(), m(&self.adjustments) + self.adjustments.values().map(|a| a.heap_bytes()).sum::<usize>());
         add("user_provided_types", self.user_provided_types.len(), m(&self.user_provided_types) + self.user_provided_types.values().map(|user| {
             std::mem::size_of_val(&**user) + user.var_kinds.capacity() * std::mem::size_of::<crate::next_solver::canonical::CanonicalVarKind>()
@@ -650,6 +655,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             dependencies: ThinVec::new(),
             ov_index: SideTable::new(),
             mutable_index: SideTable::new(),
+            std_index: SideTable::new(),
             for_next: SideTable::new(),
             for_into: SideTable::new(),
             call_traits: SideTable::new(),
@@ -2462,6 +2468,20 @@ impl<'a> Fcx<'a> {
             }
         }
         self.set_ty(a, t);
+    }
+
+    /// Records the std `Index` impl of a range index of an array, slice or `str` in `std_index`.
+    fn record_std_index(&mut self, node: u32, base: TyId, index: TyId) {
+        let Some(td) = self.lang_item(&["ops", "Index"]) else { return };
+        let (base, index) = (self.infcx.deeply_resolve_ignoring_regions(base), self.infcx.deeply_resolve_ignoring_regions(index));
+        // an array indexes through its slice impl
+        let slice = match self.tcx.tys.kind(base).clone() {
+            TyKind::Array(el, _) => self.tcx.tys.intern(TyKind::Slice(el)),
+            _ => base,
+        };
+        let Some(m) = self.trait_fn(td, "index") else { return };
+        let self_ty = if matches!(self.tcx.tys.kind(base), TyKind::Array(..)) { base } else { slice };
+        self.b.std_index.insert(node, (m, self.tcx.tys.mk_list(&[self_ty, index])));
     }
 
     fn check_seq_pats(&mut self, v: &[PatId], elems: &[TyId]) {
@@ -4826,13 +4846,12 @@ impl<'a> Fcx<'a> {
                             // (a generic index of a polymorphic body -- `I: SliceIndex<[T]>` --
                             // goes through std's `impl<T, I: SliceIndex<[T]>> Index<I> for [T]`:
                             // the result is `<I as SliceIndex<[T]>>::Output`)
-                            // only a `usize` index is builtin; every other index (std ranges
-                            // included) is the overloaded `Index` of the std impls
-                            let builtin = match self.tcx.tys.kind(tis) {
-                                TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) => false,
+                            let std_range = match self.tcx.tys.kind(tis) {
+                                TyKind::Adt(d, _, _) => matches!(self.prog.name(*d), "Range" | "RangeFrom" | "RangeTo" | "RangeFull" | "RangeInclusive" | "RangeToInclusive"),
+                                TyKind::Param(_) | TyKind::Alias(_, AliasTy { kind: AliasTyKind::Projection { .. }, .. }) => false,
                                 _ => true,
                             };
-                            if !builtin {
+                            if !std_range {
                                 if let Some(td) = self.lang_item(&["ops", "Index"]) {
                                     let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
                                     let slice = self.tcx.tys.intern(TyKind::Slice(el));
@@ -4849,6 +4868,7 @@ impl<'a> Fcx<'a> {
                                 }
                             }
                             if idx_is_range {
+                                self.record_std_index(e.0, cur, ti);
                                 return self.tcx.tys.intern(TyKind::Slice(el));
                             }
                             if lit_index || open_index {
@@ -4859,17 +4879,7 @@ impl<'a> Fcx<'a> {
                         }
                         TyKind::Str if idx_is_range => {
                             self.set_operand_derefs(e.0, derefs);
-                            if let Some(td) = self.lang_item(&["ops", "Index"]) {
-                                let ti2 = self.infcx.deeply_resolve_ignoring_regions(ti);
-                                let ds = self.infcx.deeply_resolve_ignoring_regions(cur);
-                                if !matches!(self.select_trait(td, ds, &[ti2]), Err(_)) {
-                                    let m = self.trait_fn(td, "index").unwrap();
-                                    self.b.ov_index.insert(e.0, (m, self.tcx.tys.mk_list(&[ds, ti2])));
-                                    let out = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Output").unwrap()).unwrap();
-                                    let r = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: out }, args: self.tcx.tys.mk_list(&[ds, ti2]), regions: crate::types::RegionArgsId::EMPTY }));
-                                    return self.norm_keep(r);
-                                }
-                            }
+                            self.record_std_index(e.0, cur, ti);
                             return self.tcx.tys.str_;
                         }
                         TyKind::Ref(_, x, _) | TyKind::Ptr(_, x) => {
