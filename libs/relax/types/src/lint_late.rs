@@ -934,8 +934,11 @@ impl<'a> Visitor<'a> for Late<'a> {
     fn stmt(&mut self, s: &Stmt, _b: BlockId) {
         match *s {
             Stmt::Expr(e, true) => {
+                let attrs = self.ast.stmt_attrs(e);
+                self.enter_attrs(attrs);
                 self.check_path_statement(e);
                 self.check_unused_results(self.ast.expr(e).lo, e);
+                self.leave_attrs(attrs);
             }
             Stmt::Let(r) => {
                 let l = *self.ast.row(r);
@@ -1155,7 +1158,13 @@ impl<'a> Kp<'a> {
                     }
                     self.leave(l.attrs);
                 }
-                Stmt::Expr(e, semi) => { let v = self.eval(e); if !semi { last = v; } }
+                Stmt::Expr(e, semi) => {
+                    let attrs = self.ast.stmt_attrs(e);
+                    self.enter(attrs);
+                    let v = self.eval(e);
+                    self.leave(attrs);
+                    if !semi { last = v; }
+                }
                 Stmt::Attrs(r) => {
                     let a = *self.ast.row(r);
                     self.enter(a.attrs);
