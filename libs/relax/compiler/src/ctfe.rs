@@ -1279,7 +1279,7 @@ impl<'a> Ctx<'a> {
         // `depth` alone does not bound this recursion
         // (and nesting is bounded: each nested evaluation has a Ctx of its own, so `depth` alone does not
         // stop `C<T>` reading `C<Option<T>>` reading ...)
-        if CONSTS_READING.try_with(|c| c.borrow().len() as u32 >= CALL_DEPTH || c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)).unwrap_or(false) {
+        if CONSTS_READING.try_with(|c| c.borrow().len() >= 128 || c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)).unwrap_or(false) {
             return None;
         }
         struct Pop;

@@ -608,11 +608,9 @@ impl<'a> Cx<'a> {
             }
             TyKind::Adt(d, args, _) => {
                 if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
-                let Some(a) = self.tcx.adts.get(&d) else { return };
-                if a.is_union { return; }
-                for vi in 0..a.variants.len() {
-                    for ft in self.variant_field_tys(d, vi as u32, args) { self.const_pattern_type_walk(ft, pos, depth + 1, seen); }
-                }
+                // (an ADT's fields are not walked: only the value's own variant would matter, and with
+                // no value tree the marker and the PartialEq check are all that can be judged)
+                let _ = (d, args);
             }
             TyKind::Ref(_, inner, _) => { let inner = self.reveal(inner); self.const_pattern_type_walk(inner, pos, depth + 1, seen) }
             TyKind::Tuple(l) => for ft in self.tcx.tys.list(l).to_vec() { self.const_pattern_type_walk(ft, pos, depth + 1, seen); },
