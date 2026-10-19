@@ -107,3 +107,26 @@ fn a_struct_with_a_reference_field_implies_its_inferred_outlives() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn promoted_constants_are_checked_with_their_own_locations() {
+    // `&[..]` and `&5` are promoted: their statements are numbered in the promoted body, not the parent.
+    let (errors, unchecked) = borrowck_source("
+        pub fn f(x: u32) -> (&'static [u32], &'static u32) { let a: &'static [u32] = &[1, 2, 3, 4, 5, 6]; if x > 1 { (a, &7) } else { (&[9], &8) } }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn closure_shapes_map_their_external_regions_to_the_creator() {
+    for (name, src) in [
+        ("late-bound parameter", "pub fn f(v: &[&str]) -> usize { v.iter().map(|s| s.len()).sum() }"),
+        ("captured reference returned", "pub fn f<'a>(x: &'a str) -> impl Fn() -> &'a str { move || x }"),
+        ("annotated parameter", "pub fn f() -> usize { let g = |s: &str| s.len(); g(\"a\") + g(\"bc\") }"),
+        ("nested", "pub fn f(v: &[&str]) -> usize { v.iter().map(|s| { let h = |t: &str| t.len(); h(s) }).sum() }"),
+    ] {
+        let (errors, unchecked) = borrowck_source(src);
+        assert!(unchecked.is_empty(), "{name}: {unchecked:?}");
+        assert!(errors.is_empty(), "{name}: {errors:?}");
+    }
+}
