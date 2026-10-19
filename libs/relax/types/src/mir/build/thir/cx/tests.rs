@@ -258,3 +258,15 @@ fn async_closure_is_a_coroutine_closure_creating_its_coroutine() {
     let k = core_kinds("pub fn thir_cx_probe(a: u8) { let _c = async |x: u8| { x + a }; }", "thir_cx_probe");
     has(&k, &["Closure"]);
 }
+
+/// `buf[..2].fill(0)` on `&mut [u8]`: the range index is a mutable place, so typeck records
+/// `IndexMut::index_mut` for it (and the std `Index` impl in `std_index`).
+#[test]
+fn range_index_in_a_mutable_place_is_index_mut() {
+    crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
+    let (prog, tcx) = core_program("pub fn thir_cx_probe(buf: &mut [u8]) { buf[..2].fill(0); }");
+    let body = tcx.typeck(&prog, named(&prog, "thir_cx_probe"));
+    assert!(body.errors.is_empty(), "{:?}", body.errors);
+    assert_eq!(body.std_index.len(), 1);
+    assert_eq!(body.mutable_index.len(), 1, "std_index: {:?}", body.std_index);
+}
