@@ -746,10 +746,12 @@ impl Names {
             "result", "option", "boxed", "string", "vec", "ffi::CStr", "cell::UnsafeCell", "hint", "intrinsics", "mem", "ptr", "slice", "str"] {
             out.extend(self.resolve(ci, "core", &path.split("::").map(str::to_owned).collect::<Vec<_>>()));
         }
-        if let Some(prelude) = self.bindings.id("core::prelude") {
-            for (_, &id) in self.bindings.modules.get(&prelude).into_iter().flatten() {
-                let binding = &self.bindings.values[id];
-                out.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
+        for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
+            if let Some(prelude) = self.bindings.id(&format!("core::prelude::{edition}")) {
+                for (_, &id) in self.bindings.modules.get(&prelude).into_iter().flatten() {
+                    let binding = &self.bindings.values[id];
+                    out.extend(binding.targets.iter().chain(binding.via.iter()).map(|id| self.bindings.spelling(id).to_string()));
+                }
             }
         }
         // Operators, comparisons, formatting, iteration, conversions, hashing

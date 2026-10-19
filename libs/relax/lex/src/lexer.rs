@@ -443,6 +443,23 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
         while !RX && j < n && (src[j] == b' ' || src[j] == b'\t') {
             j += 1;
         }
+        // rustc strip_shebang: `#!` starts an inner attribute when the next token after
+        // whitespace and plain comments is `[`
+        if !RX {
+            loop {
+                while j < n && matches!(src[j], b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c) { j += 1; }
+                if src[j..].starts_with(b"//") && !((src[j..].starts_with(b"///") && !src[j..].starts_with(b"////")) || src[j..].starts_with(b"//!")) {
+                    while j < n && src[j] != b'\n' { j += 1; }
+                } else if src[j..].starts_with(b"/*") && !((src[j..].starts_with(b"/**") && !src[j..].starts_with(b"/***") && !src[j..].starts_with(b"/**/")) || src[j..].starts_with(b"/*!")) {
+                    let mut depth = 0usize;
+                    while j < n {
+                        if src[j..].starts_with(b"/*") { depth += 1; j += 2; } else if src[j..].starts_with(b"*/") { depth -= 1; j += 2; if depth == 0 { break; } } else { j += 1; }
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
         if j >= n || src[j] != b'[' {
             let lo = i;
             while i < n && src[i] != b'\n' {

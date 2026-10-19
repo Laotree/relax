@@ -208,23 +208,41 @@ pub mod isize {
     pub const MAX: isize = 9223372036854775807;
 }
 
-/// The prelude Relax puts in scope in every crate: Rust 2021's std prelude (a superset of
-/// core's; harmless for no_std crates since user items shadow it).
+/// The std prelude (core/src/prelude/mod.rs): one module per edition, `rust_20xx`; a crate gets its
+/// own edition's. `v1` is the 2015/2018 set; 2021 adds TryFrom / TryInto / FromIterator and 2024
+/// adds Future / IntoFuture.
 pub mod prelude {
-    pub use crate::borrow::ToOwned;
-    pub use crate::boxed::Box;
-    pub use crate::clone::Clone;
-    pub use crate::cmp::{Eq, Ord, PartialEq, PartialOrd};
-    pub use crate::convert::{AsMut, AsRef, From, Into, TryFrom, TryInto};
-    pub use crate::default::Default;
-    pub use crate::iter::{DoubleEndedIterator, ExactSizeIterator, Extend, FromIterator, IntoIterator, Iterator};
-    pub use crate::marker::{Copy, Send, Sized, Sync, Unpin};
-    pub use crate::mem::drop;
-    pub use crate::ops::{AsyncFn, AsyncFnMut, AsyncFnOnce, Drop, Fn, FnMut, FnOnce};
-    pub use crate::option::Option::{self, None, Some};
-    pub use crate::result::Result::{self, Err, Ok};
-    pub use crate::string::{String, ToString};
-    pub use crate::vec::Vec;
+    pub mod v1 {
+        pub use crate::borrow::ToOwned;
+        pub use crate::boxed::Box;
+        pub use crate::clone::Clone;
+        pub use crate::cmp::{Eq, Ord, PartialEq, PartialOrd};
+        pub use crate::convert::{AsMut, AsRef, From, Into};
+        pub use crate::default::Default;
+        pub use crate::iter::{DoubleEndedIterator, ExactSizeIterator, Extend, IntoIterator, Iterator};
+        pub use crate::marker::{Copy, Send, Sized, Sync, Unpin};
+        pub use crate::mem::drop;
+        pub use crate::ops::{AsyncFn, AsyncFnMut, AsyncFnOnce, Drop, Fn, FnMut, FnOnce};
+        pub use crate::option::Option::{self, None, Some};
+        pub use crate::result::Result::{self, Err, Ok};
+        pub use crate::string::{String, ToString};
+        pub use crate::vec::Vec;
+    }
+    pub mod rust_2015 {
+        pub use super::v1::*;
+    }
+    pub mod rust_2018 {
+        pub use super::v1::*;
+    }
+    pub mod rust_2021 {
+        pub use super::v1::*;
+        pub use crate::convert::{TryFrom, TryInto};
+        pub use crate::iter::FromIterator;
+    }
+    pub mod rust_2024 {
+        pub use super::rust_2021::*;
+        pub use crate::future::{Future, IntoFuture};
+    }
 }
 
 /// `ptr::addr_of!(place)` / `ptr::addr_of_mut!(place)` (core/src/ptr/mod.rs: raw borrows).

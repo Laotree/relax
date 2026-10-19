@@ -1439,6 +1439,10 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             default_ = true;
         }
+        // `safe static X: T;` in an `unsafe extern` block (the unsafety check reads the keyword)
+        if self.is_word(0, b"safe") && self.nth(1) == T::KwStatic {
+            self.pos += 1;
+        }
         let kind = match self.kind() {
             T::KwUse => {
                 let use_lo = self.lo();
@@ -2217,11 +2221,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `+`, or the `+` of a `+=` (`<T: Clone += ()>`: a trailing bound `+` before a default's `=`).
+    fn eat_plus(&mut self) -> bool {
+        match self.kind() {
+            T::Plus => {
+                self.pos += 1;
+                true
+            }
+            T::PlusEq => {
+                self.tok_undo.push((self.pos as u32, self.toks.at(self.pos)));
+                self.toks.edit(self.pos, |t| { t.kind = T::Eq; t.lo += 1; });
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn bounds(&mut self) -> PResult<List<Bound>> {
         let mut v = Vec::new();
         while self.at_bound_start() {
             v.push(self.bound()?);
-            if !self.eat(T::Plus) {
+            if !self.eat_plus() {
                 break;
             }
         }
@@ -2390,7 +2410,23 @@ impl<'a> Parser<'a> {
                 T::Shl => depth += 2,
                 T::Gt => depth -= 1,
                 T::Shr => depth -= 2,
-                T::Eof | T::Semi | T::OpenBrace => return false,
+                // `Item<'a>=T`: the `>=` closes the arguments and is the binding's `=`
+                T::Ge if depth == 1 => return true,
+                T::Eof | T::Semi => return false,
+                // a const argument block `{ .. }`: skip to its end
+                T::OpenBrace => {
+                    let mut braces = 0i32;
+                    loop {
+                        match self.toks.at(i).kind {
+                            T::OpenBrace => braces += 1,
+                            T::CloseBrace => braces -= 1,
+                            T::Eof => return false,
+                            _ => {}
+                        }
+                        if braces == 0 { break; }
+                        i += 1;
+                    }
+                }
                 _ => {}
             }
             i += 1;
@@ -2602,6 +2638,10 @@ impl<'a> Parser<'a> {
                 variadic = true;
                 break;
             }
+            // `mut self` (parsed as a parameter, rejected later)
+            if self.kind() == T::KwMut && self.nth(1) == T::KwSelfValue {
+                self.pos += 1;
+            }
             // optional name: `x: T` or `_: T`
             if matches!(self.kind(), T::Ident | T::RawIdent) && self.nth(1) == T::Colon {
                 self.pos += 2;
@@ -2682,7 +2722,13 @@ impl<'a> Parser<'a> {
             }
             T::DotDot => {
                 self.pos += 1;
-                Pat::Rest
+                // `..X` / `..-7` / `..'a'`: a half-open range pattern (exclusive end) when an end follows
+                if self.pat_range_end_start() {
+                    let end = self.pat_range_end()?;
+                    Pat::Range(None, Some(end), false)
+                } else {
+                    Pat::Rest
+                }
             }
             T::DotDotEq => {
                 self.pos += 1;
@@ -3013,14 +3059,7 @@ impl<'a> Parser<'a> {
         if self.kind() == T::Pound {
             let _ = self.outer_attrs()?;
         }
-        // prefix range
-        let lhs = if matches!(self.kind(), T::DotDot | T::DotDotEq) {
-            let incl = self.bump().kind == T::DotDotEq;
-            let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
-            self.mk_expr(ExprKind::Range(OptExprId::NONE, OptExprId::from(rhs), incl), lo)
-        } else {
-            self.unary(r)?
-        };
+        let lhs = self.unary(r)?;
         self.expr_continue(lhs, min, r, lo)
     }
 
@@ -3123,6 +3162,13 @@ impl<'a> Parser<'a> {
                 let e = self.unary(r)?;
                 Ok(self.mk_expr(ExprKind::Box(e), lo))
             }
+            // a prefix range is an operand wherever one can begin (rustc parse_expr_bottom:
+            // `&..0`, `-..`), its end an expression above the range precedence
+            T::DotDot | T::DotDotEq => {
+                let incl = self.bump().kind == T::DotDotEq;
+                let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
+                Ok(self.mk_expr(ExprKind::Range(OptExprId::NONE, OptExprId::from(rhs), incl), lo))
+            }
             _ => {
                 let e = self.primary(r)?;
                 self.postfix(e, lo)
@@ -3181,6 +3227,11 @@ impl<'a> Parser<'a> {
                             e = self.mk_expr(ExprKind::TupleField(e, a), lo);
                             if dot + 1 < s.len() {
                                 let b = parse_index(&s[dot + 1..]);
+                                e = self.mk_expr(ExprKind::TupleField(e, b), lo);
+                            } else if self.kind() == T::Int {
+                                // `x.0. 0`: the float `0.` ends in the access's dot, the next token is the field
+                                let t = self.bump();
+                                let b = parse_index(self.text_of(t));
                                 e = self.mk_expr(ExprKind::TupleField(e, b), lo);
                             }
                         }

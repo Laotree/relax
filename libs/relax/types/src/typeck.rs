@@ -440,6 +440,8 @@ pub struct Fcx<'a> {
     pending_captures: Vec<crate::upvar::PendingCapture>,
     deferred_call_resolutions: Vec<call::DeferredCallResolution>,
     deferred_sized_obligations: Vec<(TyId, u32)>,
+    /// checking the pattern of a `let` without `else` (rustc PatInfo.decl_origin = LocalDecl { els: None })
+    pat_decl_irrefutable: bool,
     checked_opaque_types_storage_entries: Option<crate::infer::opaque_types::OpaqueTypeStorageEntries>,
     expected_closure_kinds: HashMap<u32, crate::upvar::ClosureKind>,
     /// position of the expression checked last (patterns have no spans of their own)
@@ -676,6 +678,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         pending_captures: Vec::new(),
         deferred_call_resolutions: Vec::new(),
         deferred_sized_obligations: Vec::new(),
+        pat_decl_irrefutable: false,
         checked_opaque_types_storage_entries: None,
         expected_closure_kinds: HashMap::default(),
         last_lo: 0,
@@ -2050,10 +2053,19 @@ impl<'a> Fcx<'a> {
                 self.check_seq_pats(self.ast().list(*v), &elems);
             }
             Pat::Paren(x) => self.check_pat(*x, expected),
-            Pat::Ref(_, x) => {
+            Pat::Ref(mutbl, x) => {
+                let expected = self.deeply_resolve_ignoring_regions_with_obligations(expected);
                 let et = self.shallow(expected);
                 let inner = match self.tcx.tys.kind(et).clone() {
                     TyKind::Ref(_, i, _) => i,
+                    // pat.rs check_pat_ref: an open expected type becomes `&?inner`
+                    TyKind::Infer(_) => {
+                        let inner = self.fresh(0);
+                        let r = self.fresh_region();
+                        let rt = self.tcx.tys.intern(TyKind::Ref(*mutbl, inner, r));
+                        self.eq(expected, rt);
+                        inner
+                    }
                     _ => self.tcx.tys.error,
                 };
                 self.check_pat(*x, inner);
@@ -2083,6 +2095,15 @@ impl<'a> Fcx<'a> {
                 }
             }
             Pat::Slice(v) => {
+                // pat.rs check_pat_slice: resolve with pending obligations; an irrefutable pattern
+                // against a still-open variable fixes it to an array of the pattern's length
+                // (rustc try_resolve_slice_ty_to_array_ty, issue #76342)
+                let expected = self.deeply_resolve_ignoring_regions_with_obligations(expected);
+                if self.pat_decl_irrefutable && matches!(self.tcx.tys.kind(self.shallow(expected)), TyKind::Infer(_)) && !self.ast().list(*v).iter().any(|x| is_rest_pat(ast, *x)) {
+                    let inner = self.fresh(0);
+                    let arr = self.tcx.tys.intern(TyKind::Array(inner, self.tcx.tys.const_usize(self.ast().list(*v).len() as u64)));
+                    self.eq(expected, arr);
+                }
                 let et = self.shallow(expected);
                 let (elem, n) = match self.tcx.tys.kind(et).clone() {
                     TyKind::Array(e, n) => (e, n.try_to_target_usize(&self.tcx.tys)),
@@ -2143,7 +2164,7 @@ impl<'a> Fcx<'a> {
                 if let Res::Def(dd) = d {
                     let (adt_ty, vi) = self.adt_of_ctor(dd);
                     let adt_ty = self.instantiate_adt(adt_ty);
-                    let adt_ty = if self.prog.def(dd).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
+                    let adt_ty = if self.prog.def(dd).kind == DefKind::Variant { self.variant_path_ty(path, dd, adt_ty) } else { self.struct_path_ty(path, adt_ty) };
                     self.coerce_or_unify(adt_ty, expected, None, path.lo);
                     let et = self.shallow(expected);
                     let mut mentioned: Vec<u32> = Vec::new();
@@ -2392,6 +2413,19 @@ impl<'a> Fcx<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `Enum::<A>::Variant { .. }` / `Enum::Variant::<A> { .. }`: the enum's generic arguments written
+    /// on the enum segment or on the variant segment (rustc: the variant path's generic args).
+    fn variant_path_ty(&mut self, path: &Path, variant: DefId, fresh_adt: TyId) -> TyId {
+        let TyKind::Adt(d, fa, regions) = self.tcx.tys.kind(fresh_adt).clone() else { return fresh_adt };
+        let n = path.segs.len();
+        let written = if n >= 2 { self.seg_args(path, n - 2, d, 0) } else { None };
+        let Some(a) = written.or_else(|| self.explicit_args(path, variant, 0)) else { return fresh_adt };
+        if a.is_empty() || a.len() > self.tcx.tys.list(fa).len() { return fresh_adt; }
+        let mut args = a;
+        args.extend_from_slice(&self.tcx.tys.list(fa)[args.len()..]);
+        self.tcx.tys.intern(TyKind::Adt(d, self.tcx.tys.mk_list(&args), regions))
     }
 
     fn struct_path_ty(&mut self, path: &Path, fresh_adt: TyId) -> TyId {
@@ -3898,7 +3932,9 @@ impl<'a> Fcx<'a> {
                         self.check_block(*eb, None);
                         self.diverges = save;
                     }
+                    let saved = std::mem::replace(&mut self.pat_decl_irrefutable, else_.is_none());
                     self.check_pat(*pat, t);
+                    self.pat_decl_irrefutable = saved;
                 }
                 // stripped at load (program::strip_cfg_stmts)
                 Stmt::Item(_) | Stmt::Attrs(..) => {}
@@ -4225,12 +4261,25 @@ impl<'a> Fcx<'a> {
                 let mut any_value = false;
                 let mut all_div = !arms.is_empty();
                 let mut seen: Vec<ExprId> = Vec::new();
+                // _match.rs check_match: every arm's pattern is checked against the scrutinee
+                // before any guard or body (a later arm's pattern types an earlier guard's binding)
+                let mut arm_bindings: Vec<Vec<(Sym, u32)>> = Vec::new();
                 for arm in self.ast().list(*arms) {
                     if !self.active(arm.attrs) {
+                        arm_bindings.push(Vec::new());
                         continue;
                     }
                     let saved = self.scopes.len();
                     self.check_pat(arm.pat, st);
+                    arm_bindings.push(self.scopes[saved..].to_vec());
+                    self.scopes.truncate(saved);
+                }
+                for (arm_index, arm) in self.ast().list(*arms).iter().enumerate() {
+                    if !self.active(arm.attrs) {
+                        continue;
+                    }
+                    let saved = self.scopes.len();
+                    self.scopes.extend(arm_bindings[arm_index].iter().copied());
                     if let Some(g) = arm.guard {
                         let bool_ = self.tcx.tys.bool_;
                         self.check_expr(g, Some(bool_));
@@ -4727,7 +4776,7 @@ impl<'a> Fcx<'a> {
                 };
                 let (adt_ty, vi) = self.adt_of_ctor(d);
                 let adt_ty = self.instantiate_adt(adt_ty);
-                let adt_ty = if self.prog.def(d).kind == DefKind::Variant { adt_ty } else { self.struct_path_ty(path, adt_ty) };
+                let adt_ty = if self.prog.def(d).kind == DefKind::Variant { self.variant_path_ty(path, d, adt_ty) } else { self.struct_path_ty(path, adt_ty) };
                 // N:rustc_hir_typeck/src/expr.rs:1823 and fn_ctxt/_impl.rs:1293-1301:
                 // obligations belong to the instantiated path, including explicit args.
                 self.register_wf(adt_ty, lo);

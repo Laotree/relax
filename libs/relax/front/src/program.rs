@@ -3336,17 +3336,7 @@ impl Program {
         let invalid = graph.glob_closure(changed);
         // Scope/trait-scope also read the implicit prelude. A changed prelude
         // therefore invalidates those scopes even without an explicit glob edge.
-        let prelude_changed = self
-            .prelude_crate
-            .and_then(|pc| {
-                let root = self.crates[pc as usize].root_mod;
-                self.syms
-                    .get("prelude")
-                    .and_then(|n| self.mods[root as usize].types.get(&n))
-                    .map(|d| self.def(*d))
-                    .filter(|d| d.kind == DefKind::Mod)
-            })
-            .is_some_and(|d| invalid.contains(&d.sub));
+        let prelude_changed = [2015, 2018, 2021, 2024].into_iter().any(|e| self.prelude_mod_for_edition(e).is_some_and(|p| invalid.contains(&p)));
         let files: crate::fxhash::HashSet<u32> = invalid.iter().map(|&m| self.mods[m as usize].file).collect();
         let scope = retain_load_memos(&mut self.scope_cache, |(m, _, _), v| !prelude_changed && !invalid.contains(m) && v.is_some());
         let glob = retain_load_memos(&mut self.glob_cache, |(m, _, _), v| !invalid.contains(m) && v.is_some());
@@ -4112,16 +4102,8 @@ impl Program {
                 None => break,
             }
         }
-        if let Some(pc) = self.prelude_crate {
-            let root = self.crates[pc as usize].root_mod;
-            if let Some(pn) = self.syms.get("prelude") {
-                if let Some(pm) = self.mods[root as usize].types.get(&pn) {
-                    let pmd = self.def(*pm);
-                    if pmd.kind == DefKind::Mod {
-                        self.module_traits(pmd.sub, &mut set, &mut visiting);
-                    }
-                }
-            }
+        if let Some(pm) = self.prelude_mod(module) {
+            self.module_traits(pm, &mut set, &mut visiting);
         }
         let a = std::sync::Arc::new(set);
         self.trait_scope.insert(module, a.clone());
@@ -4278,6 +4260,26 @@ impl Program {
         r
     }
 
+    /// The std prelude module a crate gets: its edition's `core::prelude::rust_20xx`.
+    pub fn prelude_mod(&self, module: u32) -> Option<u32> {
+        self.prelude_mod_for_edition(self.crates[self.mods[module as usize].krate as usize].edition)
+    }
+
+    fn prelude_mod_for_edition(&self, edition: u16) -> Option<u32> {
+        let pc = self.prelude_crate?;
+        let root = self.crates[pc as usize].root_mod;
+        let pm = self.def(*self.mods[root as usize].types.get(&self.syms.get("prelude")?)?);
+        if pm.kind != DefKind::Mod { return None; }
+        let name = match edition {
+            ..=2015 => "rust_2015",
+            2018 => "rust_2018",
+            2021 => "rust_2021",
+            _ => "rust_2024",
+        };
+        let em = self.def(*self.mods[pm.sub as usize].types.get(&self.syms.get(name)?)?);
+        (em.kind == DefKind::Mod).then_some(em.sub)
+    }
+
     /// The extern prelude, std prelude and primitive types (lookup_in_scope after the
     /// lexical modules).
     fn lookup_in_scope_outside(&self, module: u32, name: Sym, ns_type: bool) -> Option<DefId> {
@@ -4286,17 +4288,9 @@ impl Program {
                 return Some(self.mods[self.crates[c as usize].root_mod as usize].def);
             }
         }
-        if let Some(pc) = self.prelude_crate {
-            let root = self.crates[pc as usize].root_mod;
-            if let Some(pn) = self.syms.get("prelude") {
-                if let Some(pm) = self.mods[root as usize].types.get(&pn) {
-                    let pmd = self.def(*pm);
-                    if pmd.kind == DefKind::Mod {
-                        if let Some(d) = self.lookup_in_module(pmd.sub, name, ns_type, &mut Vec::new()) {
-                            return Some(d);
-                        }
-                    }
-                }
+        if let Some(pm) = self.prelude_mod(module) {
+            if let Some(d) = self.lookup_in_module(pm, name, ns_type, &mut Vec::new()) {
+                return Some(d);
             }
         }
         if ns_type {
