@@ -364,7 +364,7 @@ pub mod obligations {
         /// (unless `trivial_bounds`); the clauses are elaborated, WellFormed ones left out.
         fn check_false_global_bounds(&mut self) {
             let d = self.prog.def(self.def);
-            if self.prog.crates[d.krate as usize].feature_enabled(self.prog, "trivial_bounds") { return; }
+            if self.prog.crates[d.krate as usize].features(self.prog).has("trivial_bounds") { return; }
             // type aliases bounds are ignored
             if d.kind == DefKind::TypeAlias { return; }
             let pos = self.prog.files[d.file as usize].ast.item(d.item).lo;

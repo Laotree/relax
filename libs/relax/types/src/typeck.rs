@@ -761,7 +761,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
     };
     // rustc_hir_typeck check_fn / gather_locals: every parameter's type is Sized (SizedArgumentType),
     // unless `unsized_fn_params`; checked by `makepad check` only (the run never pays for it)
-    if tcx.validates(prog, file) && !prog.crates[d.krate as usize].unsized_fn_params(prog) {
+    if tcx.validates(prog, file) && !prog.crates[d.krate as usize].features(prog).has("unsized_fn_params") {
         for &p in &params { fcx.require_type_is_sized_deferred(p, ast.item(d.item).lo); }
     }
     let mut pi = 0;
