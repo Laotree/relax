@@ -247,12 +247,18 @@ pub(crate) fn resolve_package(
     }?;
     let t_load = Instant::now();
     let mut g = unitgraph::load(&units, check_only)?;
-    // The graph is enough to choose the host. Open its window before build scripts, parsing,
-    // source validation or JIT work; the process main thread is already serving the HAL.
-    if boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal") {
-        (MAIN_HOST.get().expect("run host").open)(package, &g.pkg[g.root].0)?;
-        HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
-    }
+    let t_loaded = Instant::now();
+    // The graph is enough to choose the host. Its window opens now, beside the rest of the
+    // resolve (the watch inputs, the substitutions, the hash and the build scripts); the process
+    // main thread is already serving the HAL. The resolve ends when the window is open.
+    let window = (boot && HOSTED_RUN.load(Ordering::Acquire) && g.crates.iter().any(|c| c.name == "makepad_hal")).then(|| {
+        let (package, dir) = (package.to_string(), g.pkg[g.root].0.clone());
+        let _k = crate::zone_alloc::kept();
+        std::thread::Builder::new().name("run-open-window".into()).spawn(move || {
+            let _z = crate::zone_alloc::compiler_thread();
+            (MAIN_HOST.get().expect("run host").open)(&package, &dir)
+        })
+    });
     // provided crates bind only to their own source (before substitution rewrites deps)
     let pkgs: Vec<crate::srchash::SrcPkg> = g
         .crates
@@ -261,9 +267,12 @@ pub(crate) fn resolve_package(
         .map(|(c, (dir, name, ver))| crate::srchash::SrcPkg { name: name.clone(), version: ver.clone(), dir: dir.clone(), features: c.features.clone(), deps: c.deps.iter().map(|d| d.0).collect(), proc_macro: c.proc_macro })
         .collect();
     let watches = boot || matches!(who, ResolveFor::Domain(id) if app_domain() == Some(id));
+    let t_inputs = Instant::now();
     let live_inputs = (watches && options.live).then(|| crate::reload::Inputs::collect(&g, std_dir, workspace));
+    let t_subst = Instant::now();
     // Validate native macros before any overlapping provided-crate identity error.
     crate::crates::apply_substitutes(sess, &mut g.crates, std_dir, !boot).map_err(|e| format!("crate substitution: {e}"))?;
+    let t_subst_done = Instant::now();
     {
         // The loader's provided crates are host code built for the machine: their shims bind
         // only where the program is read for the machine too. A program read for another target
@@ -311,7 +320,8 @@ pub(crate) fn resolve_package(
         scripts?;
     }
     if crate::preload::trace() {
-        eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
+        eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms (load {:.1}, watch inputs {:.1}, substitutes {:.1})", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3,
+            (t_loaded - t_load).as_secs_f64() * 1e3, (t_subst - t_inputs).as_secs_f64() * 1e3, t_subst_done.duration_since(t_subst).as_secs_f64() * 1e3);
     }
     checkpoint("loading crates")?;
     if boot {
@@ -333,6 +343,13 @@ pub(crate) fn resolve_package(
             cs.set.push(x.replace('"', ""));
         }
         cfgs.push(cs);
+    }
+    if let Some(window) = window {
+        let t_window = Instant::now();
+        let opened = window.map_err(|e| format!("opening the host window: {e}"))?.join().map_err(|_| "opening the host window: the thread panicked".to_string())?;
+        opened?;
+        if crate::preload::trace() { eprintln!("boot-trace: host window open, waited {:.1} ms for it at the end of the resolve", t_window.elapsed().as_secs_f64() * 1e3); }
+        HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
     }
     Ok(Resolved { units, g, order, cfgs, live_inputs })
 }
