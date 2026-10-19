@@ -775,8 +775,10 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.scopes.push((s, li));
         pi = 1;
     }
-    let param_pats: Vec<PatId> = ast.list(fsig.params).iter().map(|p| p.pat).collect();
-    fcx.check_param_names(&param_pats);
+    if fcx.tcx.validates(prog, fcx.file) {
+        let param_pats: Vec<PatId> = ast.list(fsig.params).iter().map(|p| p.pat).collect();
+        fcx.check_param_names(&param_pats);
+    }
     for p in ast.list(fsig.params) {
         let t = if pi < params.len() { params[pi] } else { fcx.tcx.tys.error };
         fcx.check_pat(p.pat, t);
@@ -2005,7 +2007,7 @@ impl<'a> Fcx<'a> {
     }
 
     fn check_pat_nested(&mut self, p: PatId, expected: TyId) {
-        if self.pat_depth == 0 {
+        if self.pat_depth == 0 && self.tcx.validates(self.prog, self.file) {
             self.pat_bindings(p, true);
         }
         self.pat_depth += 1;
@@ -2220,15 +2222,13 @@ impl<'a> Fcx<'a> {
                 // rustc_resolve late.rs try_resolve_as_non_binding: a binding may not shadow a
                 // static, a tuple struct / variant constructor, or (written `ref x` / `mut x` /
                 // `x @ ..`, so not a path pattern) a unit struct / variant / const
-                if !self.scopes.iter().any(|(sy, _)| *sy == s) {
+                // (statics, constants and unit structs / variants are reported below)
+                if self.tcx.validates(self.prog, self.file) && !self.scopes.iter().any(|(sy, _)| *sy == s) {
                     if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
                         let simple = sub.is_none() && !*by_ref && !*mutbl;
                         let what = match self.prog.def(d).kind {
-                            DefKind::Static => Some("statics"),
-                            DefKind::Const | DefKind::AssocConst if !simple => Some("constants"),
                             DefKind::Struct | DefKind::Variant => match self.value_ctor_shape(d) {
                                 Some(1) => Some(if self.prog.def(d).kind == DefKind::Struct { "tuple structs" } else { "tuple variants" }),
-                                Some(0) if !simple => Some(if self.prog.def(d).kind == DefKind::Struct { "unit structs" } else { "unit variants" }),
                                 _ => None,
                             },
                             _ => None,
@@ -3285,6 +3285,7 @@ impl<'a> Fcx<'a> {
     /// A tuple struct's constructor is as private as its most private field (rustc_resolve
     /// build_reduced_graph: ctor visibility; a path to it is E0603, a call E0423).
     fn check_ctor_privacy(&mut self, d: DefId, pos: u32) {
+        if !self.tcx.validates(self.prog, self.file) { return; }
         if pos >= self.prog.files[self.file as usize].src_len { return; }
         if self.prog.def(d).kind != DefKind::Struct || self.value_ctor_shape(d) != Some(1) {
             return;
@@ -3312,7 +3313,7 @@ impl<'a> Fcx<'a> {
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
-        if segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) {
+        if self.tcx.validates(prog, self.file) && segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) && !self.env.names.contains(&segs[0].1) {
             if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
                 self.err(path.lo, prog.privacy_message(&e));
             }
@@ -3452,7 +3453,7 @@ impl<'a> Fcx<'a> {
                 return (Res::Def(d), t);
             }
         }
-        if path.no_qself() {
+        if self.tcx.validates(prog, self.file) && path.no_qself() {
             if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false).filter(|_| path.lo < prog.files[self.file as usize].src_len) {
                 self.err(path.lo, prog.privacy_message(&e));
             }
@@ -5818,6 +5819,7 @@ impl<'a> Fcx<'a> {
 
     /// E0624: an item of an inherent impl is private to the impl's module.
     fn check_assoc_privacy(&mut self, item: DefId, pos: u32) {
+        if !self.tcx.validates(self.prog, self.file) { return; }
         if pos >= self.prog.files[self.file as usize].src_len { return; }
         let def = self.prog.def(item);
         if self.prog.def(def.parent).kind != DefKind::Impl || !self.prog.own_crates.get(def.krate as usize).copied().unwrap_or(false) {
@@ -5839,6 +5841,7 @@ impl<'a> Fcx<'a> {
 
     /// E0451: a field named in a struct expression or pattern must be visible here.
     fn check_field_privacy(&mut self, adt_ty: TyId, vi: u32, fi: u32, pos: u32) {
+        if !self.tcx.validates(self.prog, self.file) { return; }
         // (macro output is held to the macro's own privacy, not the call site's)
         if pos >= self.prog.files[self.file as usize].src_len { return; }
         let st = self.shallow(adt_ty);
@@ -6198,8 +6201,10 @@ impl<'a> Fcx<'a> {
         self.closure_depth.push((e.0, saved));
         let save_async = std::mem::take(&mut self.async_depth);
         let save_awaits = std::mem::take(&mut self.await_count);
-        let closure_pats: Vec<PatId> = params.iter().map(|p| p.pat).collect();
-        self.check_param_names(&closure_pats);
+        if self.tcx.validates(self.prog, self.file) {
+            let closure_pats: Vec<PatId> = params.iter().map(|p| p.pat).collect();
+            self.check_param_names(&closure_pats);
+        }
         for (p, t) in params.iter().zip(self.tcx.tys.list(ps).iter().copied()) {
             self.check_pat(p.pat, t);
         }

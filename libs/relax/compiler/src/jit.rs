@@ -7959,8 +7959,6 @@ unsafe fn load_modules(up: *mut Unit, mods: &[u32], why: &str) {
                 Err(e) => {
                     bindings_changed = true; // collection may have published part of the file
                     eprintln!("makepad: loading a deferred module failed: {}", e);
-                    // (a missing module file is rustc's E0583; the check fails on it)
-                    u.prog.errors.push(if e.contains("module file not found") { format!("E0583: file not found for module -- {}", e) } else { e.to_string() });
                 }
             }
         }

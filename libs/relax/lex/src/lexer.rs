@@ -433,16 +433,17 @@ pub fn validate_file(src: &[u8], toks: &[Tok], edition: u16) -> Result<(), LexEr
     crate::validate::validate(src, toks, edition).map_err(|(pos, msg)| LexError { pos, msg })
 }
 
+pub fn validation_enabled() -> bool {
+    crate::validate::enabled()
+}
+
 /// Turns the diagnostic validation of literals and identifiers on (`makepad check`).
 pub fn set_validation(on: bool) {
     crate::validate::set_enabled(on);
 }
 
 pub fn lex(src: &[u8], edition: u16, out: &mut Vec<Tok>) -> Result<(), LexError> {
-    let start = out.len();
-    scan::<false, false, true, LexError>(src, "", edition, out)?;
-    let _ = start;
-    Ok(())
+    scan::<false, false, true, LexError>(src, "", edition, out)
 }
 
 fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(

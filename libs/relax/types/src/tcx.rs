@@ -1642,15 +1642,16 @@ impl Tcx {
         let mut found = state.errors.replace(Some(Vec::new())).unwrap_or_default();
         if matches!(def.kind, DefKind::Fn | DefKind::Impl) {
             for w in ast.list(generics.where_) {
+                // a bound on a plain name (`where Missing: Trait`); a path through `Self` or a
+                // projection waits for the item's own bounds
                 if let ast::WherePred::Bound { ty, .. } = w {
-                    self.lower_ty(&cx, prog, def.file, def.scope, &env, *ty);
+                    if matches!(ast.ty(*ty), ast::Ty::Path(p) if p.segs.len() == 1 && p.no_qself() && !p.global()) {
+                        self.lower_ty(&cx, prog, def.file, def.scope, &env, *ty);
+                    }
                 }
             }
         }
-        // (a plain name that resolves to nothing; paths through `Self` and projections wait for the item's bounds)
-        found.extend(state.errors.take().unwrap_or_default().into_iter().filter(|e| {
-            e.contains("E0412: cannot find type `") && e.split('`').nth(1).map_or(false, |n| !n.contains("::"))
-        }));
+        found.extend(state.errors.take().unwrap_or_default());
         found
     }
 
@@ -2647,14 +2648,14 @@ impl Tcx {
                 return self.tys.error;
             }
         };
-        if p.segs.len() == 1 && p.no_qself() && !p.global() {
+        if self.validates(prog, file) && p.segs.len() == 1 && p.no_qself() && !p.global() {
             if let Some(s) = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)) {
                 if let Some(e) = prog.name_ambiguity(module, s, true, false) {
                     self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
                 }
             }
         }
-        if p.segs.len() >= 2 && p.no_qself() {
+        if self.validates(prog, file) && p.segs.len() >= 2 && p.no_qself() {
             let segs = crate::program::path_segs(prog, file, p);
             if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false).filter(|_| p.lo < prog.files[file as usize].src_len) {
                 self.err(cx, prog, file, p.lo, prog.privacy_message(&e));

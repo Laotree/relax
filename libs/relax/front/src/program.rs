@@ -2602,6 +2602,10 @@ impl Program {
                                 }
                             }
                             if !loaded {
+                                // (rustc E0583; the check fails on it)
+                                let pos = self.files[file as usize].ast.item(iid).lo;
+                                let e = self.record_error(file, pos, "resolve", format!("E0583: file not found for module `{}`", sname));
+                                self.errors.push(e);
                                 return Err(format!("module file not found: {}", cands[0]));
                             }
                         }
@@ -3643,7 +3647,7 @@ impl Program {
                 }
                 Some(old) => {
                     // the name is bound twice (rustc_resolve diagnostics.rs `report_conflict`)
-                    if self.imports[i].bound & clash == 0 && !injected {
+                    if self.imports[i].bound & (clash | bit) == 0 && !injected {
                         let old_flags = m.import_pub.get(&(bind, ns_type)).copied();
                         self.imports[i].bound |= clash;
                         self.report_name_clash(bind, ns_type, old, old_flags, (ext, ipos, ifile));
