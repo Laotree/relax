@@ -1496,6 +1496,26 @@ fn raise_with(kind: &str, message: String, site: u64, fault: u64, rbp: u64, ret:
     }
 }
 
+/// Loop iterations one constant's evaluation may run before rustc's `long_running_const_eval`
+/// error (rustc_const_eval machine.rs LINT_TERMINATOR_LIMIT counts MIR terminators: each
+/// iteration has at least one, so a loop within the interpreter's limit is within this one).
+const LINT_TERMINATOR_LIMIT: u64 = 2_000_000;
+pub(crate) const LONG_RUNNING_CONST_EVAL: &str = "constant evaluation is taking a long time";
+
+thread_local! {
+    static CONST_FUEL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// A loop head of the checked program ran: while a constant is evaluated, the evaluation ends
+/// as `long_running_const_eval` after LINT_TERMINATOR_LIMIT of them.
+pub(crate) fn const_fuel_tick() {
+    if !in_const_eval() { return; }
+    let n = CONST_FUEL.with(|c| { c.set(c.get() + 1); c.get() });
+    if n == LINT_TERMINATOR_LIMIT {
+        leave_thread("panic", LONG_RUNNING_CONST_EVAL.to_string());
+    }
+}
+
 /// A constant's initializer is being evaluated on this thread (run_init_code).
 pub(crate) fn in_const_eval() -> bool {
     CONST_EVAL_DEPTH.with(|g| g.get()) > 0 && unsafe { *ctx_ptr() } != 0
@@ -4163,6 +4183,7 @@ impl Unit {
             self.exec_note(id, crate::exec_profile::CALL);
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
+            if CONST_EVAL_DEPTH.with(|g| g.get()) == 0 { CONST_FUEL.with(|c| c.set(0)); }
             CONST_EVAL_DEPTH.with(|g| g.set(g.get() + 1));
             r = unsafe { call_jit(self as *mut Unit, entry, buf) };
             CONST_EVAL_DEPTH.with(|g| g.set(g.get().saturating_sub(1)));
@@ -4190,7 +4211,9 @@ impl Unit {
             // already, and rustc reports no evaluation error for it
             Err(p) if p.message.starts_with("compile error in ") => None,
             Err(p) => {
-                let m = format!("{}: E0080: {} [in {}]", self.ctfe_error_location(d, id, &p), ctfe_error_message(&p.message), self.prog.def_path(d));
+                // the deny-by-default lint, not an evaluation error: no code
+                let code = if p.message == LONG_RUNNING_CONST_EVAL { "" } else { "E0080: " };
+                let m = format!("{}: {}{} [in {}]", self.ctfe_error_location(d, id, &p), code, ctfe_error_message(&p.message), self.prog.def_path(d));
                 // rustc rejects a program whose constant or static cannot be evaluated (E0080);
                 // `makepad run` ends here instead of running on with a zeroed or null value
                 // (`makepad test` / `live` keep it recoverable, as for compile errors)
@@ -14465,6 +14488,7 @@ pub(crate) fn realtime_drain() {
 /// compiler inserts keep their text (overflow, bounds, division); a panic of the program is
 /// "evaluation panicked: <message>".
 fn ctfe_error_message(m: &str) -> String {
+    if m == LONG_RUNNING_CONST_EVAL { return m.to_string(); }
     let builtin = ["attempt to ", "index out of bounds", "divide by zero", "remainder by zero", "misaligned pointer", "null pointer"];
     // (core's runtime text says `len`; the evaluator's says `length`)
     if builtin.iter().any(|b| m.starts_with(b)) { m.replacen("the len is", "the length is", 1) } else { format!("evaluation panicked: {}", m) }

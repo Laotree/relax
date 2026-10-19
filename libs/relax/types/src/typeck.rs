@@ -1376,6 +1376,13 @@ impl<'a> Fcx<'a> {
                     Some(a) if !a.is_enum && !a.is_union => a.variants.first().and_then(|v| v.fields.last()).map(|f| f.ty),
                     _ => None,
                 };
+                // `struct Foo<T: A>(T::Assoc)` with `type Assoc = Foo<()>`: the tail is the struct
+                // itself -- the layout query cycle (E0391)
+                let Ok(_cycle) = crate::cycle::enter(crate::cycle::Kind::UnsizedTail, t.0, 1) else {
+                    let ts = self.ty_str(t);
+                    self.err(self.last_lo, format!("E0391: cycle detected when computing layout of `{}`", ts));
+                    return false;
+                };
                 match last {
                     Some(ft) => {
                         let ft = self.tcx.tys.subst(ft, self.tcx.tys.list(args));

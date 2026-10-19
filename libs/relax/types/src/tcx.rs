@@ -2432,9 +2432,17 @@ impl Tcx {
                             },
                             GenericArg::Const(e) => {
                                 let declaration = self.declaration_env(prog, td);
+                                // (the type of a const parameter naming its own trait: E0391)
+                                let cycle = crate::cycle::enter(crate::cycle::Kind::ConstParamType, td.0, args.len() as u32 + 1);
+                                if cycle.is_err() {
+                                    self.err(cx, prog, file, lo, format!("E0391: cycle detected when computing type of the const parameter {} of `{}`", args.len() + 1, prog.def_path(td)));
+                                    args.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                    continue;
+                                }
                                 let expected = declaration.consts.iter().find(|c| c.0 as usize == args.len() + 1)
                                     .map(|&(_, cf, ct)| self.lower_ty(cx, prog, cf, prog.def(td).scope, &declaration, ct))
                                     .unwrap_or(self.tys.error);
+                                drop(cycle);
                                 args.push(self.tys.intern(TyKind::Const(self.lower_const_arg(prog, file, env, *e, expected))));
                             },
                             GenericArg::Binding(n, _, t) => {

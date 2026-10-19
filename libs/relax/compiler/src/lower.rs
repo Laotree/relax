@@ -2985,6 +2985,7 @@ impl<'a> Lcx<'a> {
         let exit = self.f.block();
         self.goto(head);
         self.switch(head);
+        self.const_fuel_tick();
         let self_t = self.u.tcx.tys.intern(TyKind::Ref(true, iter_t, crate::types::RegionId::ERASED));
         let r = self.emit_instance(instance, vec![(Val::L(vec![iter_addr]), self_t)], opt_t);
         let rpl = self.val_to_place(r);
@@ -6047,6 +6048,7 @@ impl<'a> Lcx<'a> {
                 let exit = self.f.block();
                 self.goto(head);
                 self.switch(head);
+                self.const_fuel_tick();
                 let outer = self.scopes.len();
                 self.push_scope();
                 let mark = self.stmt_temps.len();
@@ -6082,6 +6084,7 @@ impl<'a> Lcx<'a> {
                 let res = self.result_place(t);
                 self.goto(head);
                 self.switch(head);
+                self.const_fuel_tick();
 
                 let l = label.map(|x| self.lifetime_sym(x));
                 self.loops.push(LoopCx { label: l, brk: exit, cont: head, result: Some((res.clone(), t)), scope_depth: self.scopes.len(), temps_depth: self.stmt_temps.len() });
@@ -8743,6 +8746,14 @@ impl<'a> Lcx<'a> {
             return self.unit();
         }
         self.read_place(&res, t)
+    }
+
+    /// A loop head in a checked program counts one iteration of the constant being evaluated
+    /// (see Options::const_fuel).
+    fn const_fuel_tick(&mut self) {
+        if !self.u.prog.session.options.const_fuel { return; }
+        let rt = self.u.syms.intern(crate::syms::SymKind::Rt("const_fuel"), const_fuel_addr());
+        self.emit(Inst::Call(Callee::Host(rt), Vec::new(), Vec::new()));
     }
 
     fn lower_for(&mut self, p: PatId, it: ExprId, b: BlockId, label: Option<Ident>) {
@@ -13658,6 +13669,18 @@ fn rt_cannot_unwind() {
     eprintln!("panic in a function that cannot unwind");
     std::process::abort();
 }
+}
+
+rt_fn! {
+/// A loop head of a checked program (Options::const_fuel).
+fn rt_const_fuel() {
+    crate::jit::const_fuel_tick();
+}
+}
+
+pub fn const_fuel_addr() -> u64 {
+    let f: rt_fn_ty!(fn()) = rt_const_fuel;
+    f as usize as u64
 }
 
 pub fn cannot_unwind_addr() -> u64 {

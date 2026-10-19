@@ -503,6 +503,8 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
         a.extend(cargo_flags_in);
         a
     };
+    // a check runs code only to evaluate constants: their loops count iterations (long_running_const_eval)
+    driver_options.const_fuel = check;
     // kept: the settle swap (jit zone_swap) destroys the compiler arena; the session outlives it
     let frozen = crate::zone_alloc::kept_with(|| std::sync::Arc::new(crate::Session { options: driver_options.clone(), runtime: sess.runtime.clone() }));
     let sess = &frozen;
