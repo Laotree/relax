@@ -2446,7 +2446,7 @@ impl<'a> Fcx<'a> {
             Pat::TupleStruct(path, v) => {
                 let (r, _) = self.resolve_value_path(path, p.0 | PAT_KEY, true);
                 self.b.pat_res.insert(p.0, r);
-                let fields = self.ctor_fields_with(r, expected, path.lo, Some(p.0 | PAT_KEY));
+                let fields = self.ctor_fields_with(r, expected, path.lo, Some(p.0 | PAT_KEY), None);
                 // check_pat_tuple_struct: the sub-patterns cover the fields exactly, or a `..`
                 // stands for the rest (E0023)
                 if let Res::Def(cd) = r {
@@ -2602,7 +2602,7 @@ impl<'a> Fcx<'a> {
                 self.b.res.insert(a.0, r);
                 // the constructor path is pattern syntax: region analysis reads its resolution
                 self.b.res.insert(f.0, r);
-                let ftys = self.ctor_fields_with(r, t, path.lo, Some(a.0 | PAT_KEY));
+                let ftys = self.ctor_fields_with(r, t, path.lo, Some(a.0 | PAT_KEY), Some(a.0));
                 let n = args.len();
                 let rest = self.ast().list(args).iter().position(|x| is_rest(*x));
                 let nf = ftys.len();
@@ -2961,7 +2961,7 @@ impl<'a> Fcx<'a> {
 
     /// Field types of a tuple-struct / tuple-variant pattern or constructor, with the path's generic args (`let Foo::<i32>(a, b) = ..`: the
     /// resolution recorded them under `key`).
-    fn ctor_fields_with(&mut self, r: Res, expected: TyId, pos: u32, key: Option<u32>) -> Vec<TyId> {
+    fn ctor_fields_with(&mut self, r: Res, expected: TyId, pos: u32, key: Option<u32>, user_node: Option<u32>) -> Vec<TyId> {
         if let Res::Def(d) = r {
             let (adt_ty, vi) = self.adt_of_ctor(d);
             let given = key.and_then(|k| self.b.res_args.get(&k).cloned());
@@ -2970,6 +2970,8 @@ impl<'a> Fcx<'a> {
                 (TyKind::Adt(ad, gen, regions), Some(a)) if self.tcx.tys.list(a).len() == self.tcx.tys.list(gen).len() => self.tcx.tys.intern(TyKind::Adt(ad, a, regions)),
                 _ => adt_ty,
             };
+            // the annotation of the constructor path (an assignee `T::<u8>(a, ..) = t`)
+            if let Some(node) = user_node { self.write_adt_user_type(node, adt_ty); }
             self.coerce_or_unify(adt_ty, expected, None, pos);
             let t = self.shallow(adt_ty);
             if let TyKind::Adt(ad, args, regions) = self.tcx.tys.kind(t).clone() {
