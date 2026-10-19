@@ -12,12 +12,14 @@ pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
     let core = prog.syms.intern("core");
     let alloc = prog.load_crate("alloc", &format!("{std_dir}/alloc/lib.rs"), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0)]).unwrap();
     let alloc_name = prog.syms.intern("alloc");
+    let std = prog.load_crate("std", &format!("{std_dir}/std/lib.rs"), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc)]).unwrap();
+    let std_name = prog.syms.intern("std");
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!("relax-mirsrc-{}-{}", std::process::id(), N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("lib.rs");
     std::fs::write(&path, source).unwrap();
-    let user = prog.load_crate("repro", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc)]).unwrap();
+    let user = prog.load_crate("repro", path.to_str().unwrap(), 2021, crate::cfg::CfgSet::host(sess, &[]), vec![(core, 0), (alloc_name, alloc), (std_name, std)]).unwrap();
     std::fs::remove_file(&path).unwrap(); std::fs::remove_dir(&dir).unwrap();
     prog.prelude_crate = Some(0);
     prog.resolve_imports();
@@ -90,12 +92,6 @@ fn a_pointer_cast_may_change_the_lifetime_arguments_of_its_pointee() {
 }
 
 #[test]
-fn zz_probe_closure_kind() {
-    let sess = &std::sync::Arc::new(crate::Session::default());
-    let _ = sess;
-}
-
-#[test]
 fn a_struct_with_a_reference_field_implies_its_inferred_outlives() {
     let (errors, unchecked) = borrowck_source("
         pub struct Image<T> { pixels: Vec<T>, w: usize }
@@ -129,4 +125,114 @@ fn closure_shapes_map_their_external_regions_to_the_creator() {
         assert!(unchecked.is_empty(), "{name}: {unchecked:?}");
         assert!(errors.is_empty(), "{name}: {errors:?}");
     }
+}
+
+#[test]
+#[ignore = "builder: `const _: () = assert!(..)` in a fn body calls a `!` fn with a target (611 MIR bugs on counter); routed to lane B"]
+fn a_provided_trait_method_calls_another_through_self() {
+    let (errors, unchecked) = borrowck_source("
+        pub trait ByteOrder: Sized {
+            fn read_u32_into(src: &[u8], dst: &mut [u32]);
+            fn read_f32_into(src: &[u8], dst: &mut [f32]) {
+                let dst = unsafe {
+                    const _: () = assert!(core::mem::align_of::<u32>() <= core::mem::align_of::<f32>());
+                    core::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut u32, dst.len())
+                };
+                Self::read_u32_into(src, dst);
+            }
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_closure_returning_a_slice_of_a_captured_parameter() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct R { rules: Vec<String> }
+        impl R {
+            pub fn f(&mut self, path: &str) -> usize {
+                let mut bases = vec![\"\"];
+                bases.extend(path.match_indices('/').map(|(i, _)| &path[..i]));
+                bases.len() + self.rules.len()
+            }
+        }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn ignored_repo_from_makepad_git() {
+    let src = r####"
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        pub struct IgnoreError;
+        pub struct Rule { pub negative: bool }
+        impl Rule { pub fn matches(&self, _p: &str, _d: bool) -> bool { true } }
+        pub fn read_rules(_p: &Path) -> Result<Vec<Rule>, IgnoreError> { Ok(Vec::new()) }
+        pub struct S { directories: HashMap<String, bool>, excludes: Vec<Rule>, rules: HashMap<String, Vec<Rule>>, root: PathBuf }
+        impl S {
+    fn ignored_repo(&mut self, path: &str, directory: bool) -> Result<bool, IgnoreError> {
+        if directory {
+            if let Some(&ignored) = self.directories.get(path) {
+                return Ok(ignored);
+            }
+        }
+        let parent = path.rsplit_once('/').map_or("", |(d, _)| d);
+        let mut ignored = !parent.is_empty() && self.ignored_repo(parent, true)?;
+        if !ignored {
+            for rule in &self.excludes {
+                if rule.matches(path, directory) {
+                    ignored = !rule.negative;
+                }
+            }
+            let mut bases = vec![""];
+            bases.extend(path.match_indices('/').map(|(i, _)| &path[..i]));
+            for base in bases {
+                if !self.rules.contains_key(base) {
+                    self.rules.insert(
+                        base.to_owned(),
+                        read_rules(&self.root.join(base).join(".gitignore"))?,
+                    );
+                }
+                let relative = if base.is_empty() {
+                    path
+                } else {
+                    &path[base.len() + 1..]
+                };
+                for rule in &self.rules[base] {
+                    if rule.matches(relative, directory) {
+                        ignored = !rule.negative;
+                    }
+                }
+            }
+        }
+        if directory {
+            self.directories.insert(path.to_owned(), ignored);
+        }
+        Ok(ignored)
+    }
+        }
+    "####;
+    let (errors, unchecked) = borrowck_source(src);
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_closure_that_returns_its_argument_reference() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn f(path: &str) -> &str { path.rsplit_once('/').map_or(\"\", |(d, _)| d) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_method_closure_with_an_erased_signature_region_maps_it_to_the_creators_variable() {
+    // The closure's signature mentions a region typeck erased: it is an external region of the closure,
+    // found at the same position in the creator's instantiation of the closure type.
+    let (errors, unchecked) = borrowck_source("
+        pub struct S;
+        impl S { pub fn f(&mut self, path: &str) -> usize { let parent = path.rsplit_once('/').map_or(\"\", |(d, _)| d); parent.len() } }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
 }

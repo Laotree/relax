@@ -249,8 +249,16 @@ impl BorrowCheckRootCtxt<'_> {
                 .unwrap_or_else(|| panic!("external region {vid} of a nested body has no identity"));
             if tys.region_kind(identity) == RegionKind::ReStatic { return universals.fr_static; }
             if let Some(&(_, parent_vid)) = universals.indices.iter().find(|(r, _)| *r == identity) { return parent_vid; }
+            // A region erased in the closure's signature stands for the signature's k-th erased region
+            // (`replace_erased_regions_with_placeholders` numbers them in order); the creator's closure type
+            // has a variable at that position.
+            let erased_slot = match tys.region_kind(identity) {
+                RegionKind::RePlaceholder { var, .. } => child.closure_slots.iter().enumerate().filter(|(_, r)| **r == RegionId::ERASED).nth(var.0 as usize).map(|(i, _)| i),
+                _ => None,
+            };
+            if let Some(slot) = erased_slot { return instantiated[slot]; }
             let slot = child.closure_slots.iter().position(|r| *r == identity)
-                .unwrap_or_else(|| panic!("external region {identity:?} of a nested body is neither the parent's nor in its closure type"));
+                .unwrap_or_else(|| panic!("external region {identity:?} = {:?} of a nested body is neither the parent's nor in its closure type (parent regions {:?}, closure slots {:?})", tys.region_kind(identity), universals.indices.iter().map(|(r, _)| tys.region_kind(*r)).collect::<Vec<_>>(), child.closure_slots.iter().map(|r| tys.region_kind(*r)).collect::<Vec<_>>()));
             instantiated[slot]
         }).collect()
     }
