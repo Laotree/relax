@@ -128,7 +128,6 @@ fn closure_shapes_map_their_external_regions_to_the_creator() {
 }
 
 #[test]
-#[ignore = "builder: `const _: () = assert!(..)` in a fn body calls a `!` fn with a target (611 MIR bugs on counter); routed to lane B"]
 fn a_provided_trait_method_calls_another_through_self() {
     let (errors, unchecked) = borrowck_source("
         pub trait ByteOrder: Sized {

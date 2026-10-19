@@ -171,7 +171,9 @@ impl Builder<'_> {
                     args: operands,
                     unwind: UnwindAction::Continue,
                     destination,
-                    target: Some(success),
+                    // rustc: a call whose type is uninhabited has no target (the type check then expects an
+                    // uninhabited signature output instead of relating it to the destination).
+                    target: if tcx.tys.kind(expr_ty) == &crate::types::TyKind::Never { None } else { Some(success) },
                     call_source: if from_hir_call { crate::mir::CallSource::Normal } else { crate::mir::CallSource::OverloadedOperator },
                     fn_span,
                     arg_spans,
