@@ -1085,7 +1085,13 @@ impl<'a> Fcx<'a> {
                 let sig = self.tcx.fn_item_sig(self.prog, d).cloned()?;
                 // coercion.rs:1259-1264: intrinsics have no addressable body.
                 if sig.header.abi == Abi::RelaxIntrinsic { return None; }
-                let poly = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, sig.header, sig.bound_regions));
+                // coercion.rs:1270-1282 sig_for_fn_def_coercion: a safe #[target_feature] fn is a safe
+                // signature where the body has its features
+                let mut header = sig.header;
+                if sig.safe_target_features && self.tcx.adjust_target_feature_sig(self.prog, d, self.b.def) {
+                    header.safety = Safety::Safe;
+                }
+                let poly = self.tcx.tys.intern(TyKind::FnPtr(self.tcx.tys.mk_list(&sig.params), sig.ret, header, sig.bound_regions));
                 let args = self.tcx.complete_args(self.prog, d, self.tcx.tys.list(args), regions);
                 Some(self.tcx.instantiate_ty(self.prog, d, &args, poly))
             }
@@ -4677,7 +4683,7 @@ impl<'a> Fcx<'a> {
                             cur = self.shallow(x);
                             derefs += 1;
                         }
-                        TyKind::Adt(..) => {
+                        TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) | TyKind::Dyn(..) => {
                             // `Index<Idx>` impl on the type, else autoderef through Deref
                             if let Some(td) = self.lang_item(&["ops", "Index"]) {
                                 let dc = self.infcx.deeply_resolve_ignoring_regions(cur);
