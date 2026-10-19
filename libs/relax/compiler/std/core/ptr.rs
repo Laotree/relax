@@ -112,6 +112,7 @@ pub fn from_mut<T: crate::marker::PointeeSized>(r: &mut T) -> *mut T {
 /// A non-null `*mut T` (gives `Option<NonNull<T>>` the null niche).
 #[repr(transparent)]
 #[rustc_layout_scalar_valid_range_start(1)]
+#[rustc_nonnull_optimization_guaranteed]
 #[cfg_attr(not(relax_check), lang = "non_null")]
 pub struct NonNull<T: crate::marker::PointeeSized> {
     pointer: *const T,
