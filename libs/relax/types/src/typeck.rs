@@ -767,6 +767,12 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         let t = if pi < params.len() { params[pi] } else { fcx.tcx.tys.error };
         fcx.check_pat(p.pat, t);
         fcx.b.param_pats.push(p.pat);
+        // fn_ctxt check_fn: every parameter is Sized (unless unsized_fn_params), judged for the
+        // crates whose errors are reported
+        if tcx.validates(prog, file) && !prog.crates[d.krate as usize].features(prog).has("unsized_fn_params") {
+            let lo = ast.item(d.item).lo;
+            fcx.require_type_is_sized_deferred(t, lo);
+        }
         pi += 1;
     }
     if let (Some(bid), true) = (body, fsig.asyncness) {

@@ -265,7 +265,7 @@ impl Tcx {
         };
         let Some(sig) = self.fn_sig(prog, m) else { return Vec::new() };
         let Some(&recv) = sig.params.first() else { return Vec::new() };
-        let (recv, self_ty) = (self.tys.erase_regions(recv), self.tys.erase_regions(self_ty));
+        let (recv, self_ty) = (self.tys.erase_all_regions(recv), self.tys.erase_all_regions(self_ty));
         for t in [recv, self_ty] {
             if self.tys.has_error(t) || self.tys.has_assoc(t) || self.tys.has_opaque(t) || self.tys.has_infer(t) { return Vec::new(); }
         }
@@ -284,17 +284,20 @@ impl Tcx {
                 if generic_param(cur) { return Err(true); }
                 if same(self_ty, cur) { return Ok(()); }
                 if level == 0 {
+                    // (a trait object implements no `LegacyReceiver`; asking would need the dyn
+                    // compatibility of a trait whose own signature is being checked)
+                    if matches!(self.tys.kind(cur), TyKind::Dyn(..)) { break; }
                     let goal = Goal { param_env: env.clone(), predicate: collect::trait_predicate(legacy, vec![GenericArg::Type(cur)]) };
                     if !infcx.evaluate_obligation(prog, goal).must_apply_modulo_regions() { break; }
                 }
                 let next = match self.tys.kind(cur) {
                     TyKind::Ref(_, t, _) => Some(*t),
                     TyKind::Ptr(_, t) if level == 2 => Some(*t),
-                    TyKind::Ptr(..) | TyKind::Error | TyKind::Infer(_) => None,
+                    TyKind::Ptr(..) | TyKind::Error | TyKind::Infer(_) | TyKind::Dyn(..) => None,
                     _ => crate::typeck::probe::overloaded_deref_ty(&infcx, prog, &env, cur),
                 };
                 let Some(next) = next else { break };
-                cur = self.tys.erase_regions(next);
+                cur = self.tys.erase_all_regions(next);
             }
             Err(false)
         };
