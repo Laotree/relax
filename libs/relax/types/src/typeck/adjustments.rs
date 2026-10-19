@@ -57,6 +57,10 @@ pub enum Adjust {
 pub struct Adjustment {
     pub kind: Adjust,
     pub target: TyId,
+    /// rustc `OverloadedDeref.mutbl`, for `Deref(Some)`: the step is `DerefMut::deref_mut`
+    /// (place_op.rs convert_place_derefs_to_mutable). The recorded `(def, args)` stay the
+    /// shared `Deref::deref`; `Tcx::mutable_place_op` names the mutable method.
+    pub mutbl: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -129,10 +133,11 @@ impl Body {
     }
 
     /// rustc `TypeckResults::type_dependent_def`: the method an expression calls without
-    /// naming it -- a method call, an overloaded operator or index, or an overloaded unary `*`.
+    /// naming it -- a method call, an overloaded operator or index (`IndexMut::index_mut` when
+    /// the place is used mutably), or an overloaded unary `*`.
     pub fn type_dependent_def(&self, node: u32) -> Option<(DefId, TyList)> {
         if let Some(m) = self.methods.get(&node).or_else(|| self.binops.get(&node)) { return Some((m.def, m.args)); }
-        if let Some(ov) = self.ov_index.get(&node) { return Some(*ov); }
+        if let Some(ov) = self.mutable_index.get(&node).or_else(|| self.ov_index.get(&node)) { return Some(*ov); }
         self.ov_deref(node, 0)
     }
 
@@ -140,6 +145,16 @@ impl Body {
     /// arguments, the coercion payload types and the targets.
     pub fn adjust_payloads_mut(&mut self) -> impl Iterator<Item = &mut Adjustment> {
         self.adjustments.values_mut().flat_map(|a| a.operand.iter_mut().chain(a.value.iter_mut()))
+    }
+}
+
+impl crate::tcx::Tcx {
+    /// `DerefMut::deref_mut` for `Deref::deref` (rustc `OverloadedDeref::method_call` with `mutbl`).
+    pub fn mutable_place_op(&self, prog: &Program, shared: DefId) -> Option<DefId> {
+        let (item, name) = match prog.syms.str(prog.def(shared).name) { "deref" => (crate::lang_items::LangItem::DerefMut, "deref_mut"), _ => return None };
+        let td = self.lang_items.get(item)?;
+        let sym = prog.syms.get(name)?;
+        prog.traits[prog.def(td).sub as usize].iter().copied().find(|&it| prog.def(it).name == sym)
     }
 }
 
@@ -163,7 +178,7 @@ impl Fcx<'_> {
         debug_assert!(!matches!(coerce, Coerce::DerefRef(_)));
         let value = &mut self.adj_mut(node).value;
         value.retain(|a| !matches!(a.kind, Adjust::Coerce(_)));
-        value.push(Adjustment { kind: Adjust::Coerce(coerce), target });
+        value.push(Adjustment { kind: Adjust::Coerce(coerce), target, mutbl: false });
     }
 
     /// The autoderef steps (`(overloaded call, type after the step)`) then a borrow of
@@ -173,14 +188,14 @@ impl Fcx<'_> {
         let value = &mut self.adj_mut(node).value;
         let old = value.iter().find_map(|a| match a.kind { Adjust::Borrow(m) => Some((m, a.target)), _ => None });
         value.clear();
-        for (d, target) in derefs { value.push(Adjustment { kind: Adjust::Deref(d), target }); }
-        if let Some((m, target)) = mutable.or(old) { value.push(Adjustment { kind: Adjust::Borrow(m), target }); }
+        for (d, target) in derefs { value.push(Adjustment { kind: Adjust::Deref(d), target, mutbl: false }); }
+        if let Some((m, target)) = mutable.or(old) { value.push(Adjustment { kind: Adjust::Borrow(m), target, mutbl: false }); }
     }
 
     /// Reborrow the value of `node` as `target` (kept in front of a pointer coercion).
     pub(super) fn set_reborrow(&mut self, node: u32, mutable: bool, target: TyId) {
         let value = &mut self.adj_mut(node).value;
-        let step = Adjustment { kind: Adjust::Borrow(mutable), target };
+        let step = Adjustment { kind: Adjust::Borrow(mutable), target, mutbl: false };
         match value.iter_mut().find(|a| matches!(a.kind, Adjust::Borrow(_))) {
             Some(a) => *a = step,
             None => {
@@ -218,8 +233,8 @@ impl Fcx<'_> {
     pub(super) fn set_operand_deref(&mut self, node: u32, step: usize, deref: Option<OverloadedDeref>, target: TyId) {
         let placeholder = self.tcx.tys.error;
         let operand = &mut self.adj_mut(node).operand;
-        while operand.len() <= step { operand.push(Adjustment { kind: Adjust::Deref(None), target: placeholder }); }
-        operand[step] = Adjustment { kind: Adjust::Deref(deref), target };
+        while operand.len() <= step { operand.push(Adjustment { kind: Adjust::Deref(None), target: placeholder, mutbl: false }); }
+        operand[step] = Adjustment { kind: Adjust::Deref(deref), target, mutbl: false };
     }
 
     /// The operand autoderef of `node` has exactly `n` steps (all recorded already).
