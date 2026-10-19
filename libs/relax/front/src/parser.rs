@@ -4160,6 +4160,36 @@ impl ParsedFile {
         ExpnKind::Root
     }
 
+    /// Where rustc reports a lint about the token at `pos`: a token written in the body of a
+    /// `macro_rules!` defined in this file stays at its place in the definition, a substituted
+    /// fragment is at the call's argument, anything else maps to the call site as in
+    /// `diagnostic_pos`.
+    pub fn lint_pos(&self, mut pos: u32) -> u32 {
+        for _ in 0..64 {
+            if pos < self.src_len { return pos; }
+            let (to, em) = self.tables(pos);
+            if let Some(o) = origin_of(to, pos) {
+                pos = o;
+                continue;
+            }
+            let part = self.part_at(pos);
+            let (rules, bodies) = part.map_or((&self.rules_exp, &self.body_origin), |p| (&p.rules_exp, &p.body_origin));
+            if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+                if pos < r.1 {
+                    if let Some(d) = origin_of(bodies, pos) {
+                        pos = d;
+                        continue;
+                    }
+                }
+            }
+            match region_of(em, pos) {
+                Some(c) if c != pos => pos = c,
+                _ => break,
+            }
+        }
+        pos.min(self.src_len)
+    }
+
     /// The definition position of mark `m`'s macro (u32::MAX: another file).
     pub fn hyg_def_pos(&self, m: u32) -> u32 {
         self.rules_exp.get(m as usize).or_else(|| self.parts().find_map(|p| p.rules_exp.get(m.wrapping_sub(p.rules_base) as usize))).map_or(u32::MAX, |r| r.2)

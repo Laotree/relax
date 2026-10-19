@@ -149,18 +149,18 @@ fn item_lints(prog: &Program, d: DefId) {
                 if let Some(i) = pa.as_impl(&pa.item(parent.item).kind) { requires |= pa.list(i.generics.params).iter().any(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))); }
             }
             if requires && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &NO_MANGLE_GENERIC_ITEMS, def.file, item.lo, "functions generic over types or consts must be mangled");
+                crate::lint_early2::emit(prog, d, &NO_MANGLE_GENERIC_ITEMS, def.file, item.lo, "functions generic over types or consts must be mangled");
             }
         }
         DefKind::Const => {
             if attrs.iter().any(|a| attr_name(prog, def.file, a) == b"no_mangle") && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &NO_MANGLE_CONST_ITEMS, def.file, item.lo, "const items should never be `#[no_mangle]`");
+                crate::lint_early2::emit(prog, d, &NO_MANGLE_CONST_ITEMS, def.file, item.lo, "const items should never be `#[no_mangle]`");
             }
             // `pub const _: () = ..;`: the visibility has no effect
             if pf.text(item.name) == "_" && !matches!(item.vis, Vis::Private)
                 && pf.hyg_ctxt(item.name.lo) == pf.hyg_ctxt(item.lo)
                 && !lint::external(prog, def.file, item.lo) {
-                lint::emit(prog, d, &UNUSED_VISIBILITIES, def.file, item.lo, "visibility qualifiers have no effect on `const _` declarations");
+                crate::lint_early2::emit(prog, d, &UNUSED_VISIBILITIES, def.file, item.lo, "visibility qualifiers have no effect on `const _` declarations");
             }
         }
         _ => {}
@@ -202,7 +202,7 @@ fn attr_lints(prog: &Program, d: DefId) {
         let name = lint::attr_path(prog, file, &a);
         let pos = attr_pos(pf, &a);
         let emit = |msg: &str| {
-            if !lint::external(prog, file, pos) { lint::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
+            if !lint::external(prog, file, pos) { crate::lint_early2::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
         };
         if !is_root && CRATE_LEVEL.contains(&&name[..]) {
             let n = String::from_utf8_lossy(&name).into_owned();
@@ -246,7 +246,7 @@ fn special_module_name(prog: &Program, krate: u32) {
             "main" => "found module declaration for main.rs",
             _ => continue,
         };
-        lint::emit(prog, root, &SPECIAL_MODULE_NAME, m.file, item.lo, msg);
+        crate::lint_early2::emit(prog, root, &SPECIAL_MODULE_NAME, m.file, item.lo, msg);
     }
 }
 
@@ -302,10 +302,10 @@ fn token_lints(prog: &Program, own: &[bool]) {
                         }
                         if let (Some((l, ed)), false) = (kw, after_dollar) {
                             let kwname = String::from_utf8_lossy(name);
-                            lint::emit(prog, def, l, f as u32, t.lo, &format!("`{}{}` is a keyword in the {} edition", prefix, kwname, ed));
+                            crate::lint_early2::emit(prog, def, l, f as u32, t.lo, &format!("`{}{}` is a keyword in the {} edition", prefix, kwname, ed));
                         }
                         if non_ascii && seen_non_ascii.insert((krate, raw.to_vec())) {
-                            lint::emit(prog, rt, &NON_ASCII_IDENTS, f as u32, t.lo, "identifier contains non-ASCII characters");
+                            crate::lint_early2::emit(prog, rt, &NON_ASCII_IDENTS, f as u32, t.lo, "identifier contains non-ASCII characters");
                         }
                     }
                 }
@@ -468,7 +468,7 @@ impl<'a> W<'a> {
         // the lifetime analysis walks the same trees: the other lints are not its business
         if self.lt.is_some() { return; }
         if lint::external(self.prog, self.file, pos) { return; }
-        lint::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
+        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, l, self.file, pos, msg);
     }
 
     fn enter(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
@@ -1522,12 +1522,12 @@ impl<'a> W<'a> {
                 0 => {
                     // a parameter written by a macro cannot be removed: no report
                     if self.pf.expansion_kind(p.pos) == ExpnKind::Root {
-                        lint::emit_in(self.prog, self.def, &self.stack, &UNUSED_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` never used", name));
+                        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, &UNUSED_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` never used", name));
                     }
                 }
                 1 => {
                     if !lint::external(self.prog, self.file, p.pos) {
-                        lint::emit_in(self.prog, self.def, &self.stack, &SINGLE_USE_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` only used once", name));
+                        crate::lint_early2::emit_in(self.prog, self.def, &self.stack, &SINGLE_USE_LIFETIMES, self.file, p.pos, &format!("lifetime parameter `{}` only used once", name));
                     }
                 }
                 _ => {}

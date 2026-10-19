@@ -16,6 +16,16 @@ pub const ELIDED_LIFETIMES_IN_PATHS: Lint = lint::lint("elided_lifetimes_in_path
 /// The lifetime resolution of a definition's signature and body.
 pub(crate) fn names(prog: &Program, tcx: &Tcx, d: DefId) -> Arc<LifetimeResolution> { tcx.resolve_lifetime_names(prog, d) }
 
+/// Reports `lint` at the token at `pos`, where rustc puts the lint: a token of a `macro_rules!`
+/// body defined in the same file at its place in the definition.
+pub(crate) fn emit(prog: &Program, d: DefId, lint: &Lint, file: u32, pos: u32, msg: &str) {
+    emit_in(prog, d, &[], lint, file, pos, msg)
+}
+
+pub(crate) fn emit_in(prog: &Program, d: DefId, inner: &[Attr], lint: &Lint, file: u32, pos: u32, msg: &str) {
+    lint::emit_in(prog, d, inner, lint, file, prog.files[file as usize].lint_pos(pos), msg)
+}
+
 // ---------------------------------------------------------------- mismatched_lifetime_syntaxes
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -227,7 +237,7 @@ fn mismatched_lifetime_syntaxes(prog: &Program, tcx: &Tcx, d: DefId) {
             [Cat::Hidden, Cat::Elided].iter().find_map(|c| side.iter().find(|i| i.cat == *c).map(|i| i.pos))
         }).unwrap_or(item.lo);
         if lint::external(prog, def.file, pos) { continue; }
-        lint::emit(prog, d, &MISMATCHED_LIFETIME_SYNTAXES, def.file, pos, msg);
+        emit(prog, d, &MISMATCHED_LIFETIME_SYNTAXES, def.file, pos, msg);
     }
 }
 
@@ -235,8 +245,10 @@ fn mismatched_lifetime_syntaxes(prog: &Program, tcx: &Tcx, d: DefId) {
 
 /// The definition-level passes of this file over one definition.
 pub fn check_def_item(prog: &Program, tcx: &Tcx, d: DefId) {
-    if matches!(prog.def(d).kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn) {
-        mismatched_lifetime_syntaxes(prog, tcx, d);
+    match prog.def(d).kind {
+        DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => mismatched_lifetime_syntaxes(prog, tcx, d),
+        DefKind::Struct | DefKind::Union | DefKind::Enum => explicit_outlives_requirements(prog, d),
+        _ => {}
     }
 }
 
@@ -433,7 +445,7 @@ pub(crate) fn attr_checks(prog: &Program, n: &AttrNode) {
         let metas = parse_meta_items(pf, lo, hi);
         let Some(Meta::Item { path, args, .. }) = metas.first() else { continue };
         let emit = |lint: &Lint, pos: u32, msg: &str| {
-            if !lint::external(prog, file, pos) { lint::emit_in(prog, d, n.inner, lint, file, pos, msg); }
+            if !lint::external(prog, file, pos) { emit_in(prog, d, n.inner, lint, file, pos, msg); }
         };
         let word = if path.len() == 1 { Some(String::from_utf8_lossy(&path[0]).into_owned()) } else { None };
         let full = joined(path);
@@ -640,4 +652,241 @@ pub fn check_module_items(prog: &Program, own: &[bool]) {
             attr_checks(prog, &AttrNode { d, inner: &own_attrs, attrs: &attrs, is_crate: false, macro_use_target: matches!(item.kind, ItemKind::ExternCrate(_)) });
         }
     }
+}
+
+// ---------------------------------------------------------------- explicit_outlives_requirements
+
+pub const EXPLICIT_OUTLIVES_REQUIREMENTS: Lint = lint::lint("explicit_outlives_requirements", Level::Allow, &["rust_2018_idioms"]);
+
+/// A subject of an inferred `X: 'a`: a type parameter or a lifetime parameter, by name.
+#[derive(Clone, PartialEq, Eq)]
+enum Subject { Type(String), Region(String) }
+
+struct Inference<'a> {
+    pf: &'a crate::parser::ParsedFile,
+    lifetimes: Vec<String>,
+    types: Vec<String>,
+    /// the inferred `subject: 'outlived` pairs, in order
+    required: Vec<(Subject, String)>,
+}
+
+impl Inference<'_> {
+    fn is_free(&self, lt: &str) -> bool { lt != "'static" && self.lifetimes.iter().any(|l| l == lt) }
+
+    /// rustc `insert_outlives_predicate` for the components of the type `t` outliving `outlived`.
+    fn outlived_by(&mut self, ast: &Ast, t: TyId, outlived: &str) -> Option<()> {
+        if !self.is_free(outlived) { return Some(()); }
+        let mut comps: Vec<Subject> = Vec::new();
+        self.components(ast, t, &mut comps)?;
+        for c in comps {
+            let pair = (c.clone(), outlived.to_string());
+            match &c {
+                Subject::Region(r) if !self.is_free(r) => continue,
+                _ => {}
+            }
+            if !self.required.contains(&pair) { self.required.push(pair); }
+        }
+        Some(())
+    }
+
+    /// rustc `push_outlives_components`: the regions and parameters of a type.
+    fn components(&self, ast: &Ast, t: TyId, out: &mut Vec<Subject>) -> Option<()> {
+        match *ast.ty(t) {
+            Ty::Ref(Some(l), _, inner) => {
+                let name = self.pf.text(l).to_string();
+                if name != "'static" && !self.lifetimes.contains(&name) { return None; }
+                let s = Subject::Region(name);
+                if !out.contains(&s) { out.push(s); }
+                self.components(ast, inner, out)
+            }
+            Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => self.components(ast, x, out),
+            Ty::Tuple(l) => { for &x in ast.list(l) { self.components(ast, x, out)?; } Some(()) }
+            Ty::Never => Some(()),
+            Ty::Path(p) => match self.leaf(ast, &p)? {
+                Some(name) => { let s = Subject::Type(name); if !out.contains(&s) { out.push(s); } Some(()) }
+                None => Some(()),
+            },
+            _ => None,
+        }
+    }
+
+    /// A path that is a type parameter (Some(name)) or a primitive type (None); anything else
+    /// is a type whose predicates this analysis does not model.
+    fn leaf(&self, ast: &Ast, p: &Path) -> Option<Option<String>> {
+        if p.has_qself() || p.global() { return None; }
+        let segs = ast.segs(p.segs);
+        let [seg] = segs else { return None };
+        if ast.gargs(seg.args()).is_some() || seg.kind() != SegKind::Ident { return None; }
+        let name = self.pf.text(seg.name).to_string();
+        if self.types.contains(&name) { return Some(Some(name)); }
+        const PRIMS: &[&str] = &["bool", "char", "str", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64"];
+        if PRIMS.contains(&name.as_str()) { return Some(None); }
+        None
+    }
+
+    /// rustc `insert_required_predicates_to_be_wf` over one field type: every reference in it.
+    fn field(&mut self, ast: &Ast, t: TyId) -> Option<()> {
+        match *ast.ty(t) {
+            Ty::Ref(lt, _, inner) => {
+                let name = self.pf.text(lt?).to_string();
+                self.outlived_by(ast, inner, &name)?;
+                self.field(ast, inner)
+            }
+            Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => self.field(ast, x),
+            Ty::Tuple(l) => { for &x in ast.list(l) { self.field(ast, x)?; } Some(()) }
+            Ty::Never => Some(()),
+            Ty::Path(p) => { self.leaf(ast, &p)?; Some(()) }
+            _ => None,
+        }
+    }
+}
+
+struct OutPred {
+    in_where: bool,
+    subject: Subject,
+    /// the lifetime bounds' identifiers by bound index (None: a trait bound)
+    bounds: Vec<Option<Ident>>,
+    /// the first position of each bound
+    bound_lo: Vec<u32>,
+    start: u32,
+}
+
+/// rustc_lint `ExplicitOutlivesRequirements::check_item`.
+fn explicit_outlives_requirements(prog: &Program, d: DefId) {
+    let def = prog.def(d);
+    let pf = &prog.files[def.file as usize];
+    let ast = &pf.ast;
+    let item = *ast.item(def.item);
+    let (generics, fields): (Generics, Vec<FieldDef>) = match item.kind {
+        ItemKind::Struct(r) => {
+            let s = *ast.row(r);
+            (s.generics, match s.data { VariantData::Unit => Vec::new(), VariantData::Tuple(l) | VariantData::Struct(l) => ast.list(l).to_vec() })
+        }
+        ItemKind::Union(r) => { let u = *ast.row(r); (u.generics, ast.list(u.fields).to_vec()) }
+        ItemKind::Enum(r) => {
+            let e = *ast.row(r);
+            let mut f = Vec::new();
+            for v in ast.list(e.variants) { if let VariantData::Tuple(l) | VariantData::Struct(l) = v.data { f.extend_from_slice(ast.list(l)); } }
+            (e.generics, f)
+        }
+        _ => return,
+    };
+    let mut inf = Inference { pf, lifetimes: Vec::new(), types: Vec::new(), required: Vec::new() };
+    for p in ast.list(generics.params) {
+        match p.kind {
+            GenericParamKind::Lifetime(_) => inf.lifetimes.push(pf.text(p.name).to_string()),
+            GenericParamKind::Type(..) => inf.types.push(pf.text(p.name).to_string()),
+            GenericParamKind::Const(..) => {}
+        }
+    }
+    if inf.lifetimes.is_empty() { return; }
+    // fields of a type this analysis does not model: nothing is concluded
+    for f in &fields { if inf.field(ast, f.ty).is_none() { return; } }
+    if inf.required.is_empty() { return; }
+    // the predicates of the generics, in rustc's HIR order: parameter bounds, then where clauses
+    let mut preds: Vec<OutPred> = Vec::new();
+    for p in ast.list(generics.params) {
+        match p.kind {
+            GenericParamKind::Lifetime(bs) if !ast.list(bs).is_empty() => {
+                let bounds: Vec<Option<Ident>> = ast.list(bs).iter().map(|b| Some(*b)).collect();
+                preds.push(OutPred { in_where: false, subject: Subject::Region(pf.text(p.name).to_string()), bound_lo: bounds.iter().map(|b| b.unwrap().lo).collect(), bounds, start: p.name.lo });
+            }
+            GenericParamKind::Type(bs, _) if !ast.list(bs).is_empty() => {
+                let (bounds, bound_lo) = bound_info(ast, bs);
+                preds.push(OutPred { in_where: false, subject: Subject::Type(pf.text(p.name).to_string()), bounds, bound_lo, start: p.name.lo });
+            }
+            _ => {}
+        }
+    }
+    let first_where = preds.len();
+    for w in ast.list(generics.where_) {
+        match *w {
+            WherePred::Lifetime(lt, bs) => {
+                let bounds: Vec<Option<Ident>> = ast.list(bs).iter().map(|b| Some(*b)).collect();
+                preds.push(OutPred { in_where: true, subject: Subject::Region(pf.text(lt).to_string()), bound_lo: bounds.iter().map(|b| b.unwrap().lo).collect(), bounds, start: lt.lo });
+            }
+            WherePred::Bound { ty, bounds: bs, .. } => {
+                let (bounds, bound_lo) = bound_info(ast, bs);
+                let start = type_start(pf, ast, ty);
+                let subject = match *ast.ty(ty) {
+                    Ty::Path(p) => match inf.leaf(ast, &p) { Some(Some(name)) => Subject::Type(name), _ => Subject::Region(String::new()) },
+                    _ => Subject::Region(String::new()),
+                };
+                preds.push(OutPred { in_where: true, subject, bounds, bound_lo, start });
+            }
+        }
+    }
+    let _ = first_where;
+    let num_where = preds.iter().filter(|p| p.in_where).count();
+    let mut dropped_where = 0;
+    let mut anchors: Vec<u32> = Vec::new();
+    let mut where_anchors: Vec<u32> = Vec::new();
+    for p in &preds {
+        // `where` predicates that are no parameter bound are not looked at
+        if let Subject::Region(r) = &p.subject { if r.is_empty() { continue; } }
+        let relevant: Vec<&String> = inf.required.iter().filter(|(s, _)| *s == p.subject).map(|(_, o)| o).collect();
+        if relevant.is_empty() { continue; }
+        // a lifetime subject must be a declared parameter
+        if let Subject::Region(r) = &p.subject { if !inf.lifetimes.contains(r) { continue; } }
+        let inferred: Vec<usize> = p.bounds.iter().enumerate().filter_map(|(i, b)| {
+            let name = pf.text((*b)?);
+            (inf.lifetimes.iter().any(|l| l == name) && relevant.iter().any(|r| r.as_str() == name)).then_some(i)
+        }).collect();
+        // bounds written by an external macro are not touched
+        let inferred: Vec<usize> = inferred.into_iter().filter(|&i| !lint::external(prog, def.file, p.bound_lo[i])).collect();
+        let drop_predicate = inferred.len() == p.bounds.len();
+        if drop_predicate && p.in_where { dropped_where += 1; }
+        if inferred.is_empty() { continue; }
+        if drop_predicate {
+            if p.in_where { where_anchors.push(p.start); } else { anchors.push(p.start); }
+        } else {
+            // the first inferable bound starts its span; a later one follows its predecessor
+            let i = inferred[0];
+            let at = if i == 0 { p.bound_lo[0] } else { p.bound_lo[i] };
+            where_anchors.push(at);
+        }
+    }
+    if !generics.where_.is_empty() && dropped_where == num_where && num_where > 0 {
+        let first = preds.iter().find(|p| p.in_where).map(|p| p.start).unwrap_or(item.lo);
+        let kw = back_kw_pos(pf, first, "where");
+        let tuple = matches!(item.kind, ItemKind::Struct(r) if matches!(ast.row(r).data, VariantData::Tuple(_)));
+        let full = if tuple { kw } else { skip_ws_back_pos(pf, kw) };
+        anchors.push(full);
+    } else {
+        anchors.extend(where_anchors);
+    }
+    let Some(pos) = anchors.iter().copied().min() else { return };
+    if lint::external(prog, def.file, pos) { return; }
+    emit(prog, d, &EXPLICIT_OUTLIVES_REQUIREMENTS, def.file, pos, "outlives requirements can be inferred");
+}
+
+/// The bounds of a bound list: the lifetime ones by identifier, and each bound's start.
+fn bound_info(ast: &Ast, bs: List<Bound>) -> (Vec<Option<Ident>>, Vec<u32>) {
+    let mut bounds = Vec::new();
+    let mut lo = Vec::new();
+    for b in ast.list(bs) {
+        match *b {
+            Bound::Lifetime(l) => { bounds.push(Some(l)); lo.push(l.lo); }
+            Bound::Trait { path, .. } => { bounds.push(None); lo.push(path.lo); }
+            Bound::Use(_) => { bounds.push(None); lo.push(0); }
+        }
+    }
+    (bounds, lo)
+}
+
+fn type_start(pf: &crate::parser::ParsedFile, ast: &Ast, t: TyId) -> u32 {
+    match *ast.ty(t) { Ty::Path(p) => p.lo, _ => { let _ = pf; 0 } }
+}
+
+/// The end of the token before `at` (whitespace and comments skipped).
+fn skip_ws_back_pos(pf: &crate::parser::ParsedFile, at: u32) -> u32 {
+    let i = pf.toks.partition_point(|t| t.lo < at);
+    if i == 0 { return at; }
+    pf.toks.get(i - 1).map_or(at, |t| t.hi)
+}
+
+fn back_kw_pos(pf: &crate::parser::ParsedFile, at: u32, kw: &str) -> u32 {
+    let j = skip_ws_back_pos(pf, at);
+    let n = kw.len() as u32;
+    if j >= n && pf.bytes(j - n, j) == kw.as_bytes() { j - n } else { at }
 }
