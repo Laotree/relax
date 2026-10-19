@@ -1766,7 +1766,9 @@ impl<'a> Fcx<'a> {
                 (self.tcx.tys.kind(sx).clone(), self.tcx.tys.kind(st).clone()) {
                 let mut array_cast = false;
                 if source_mut || !target_mut {
-                    if let TyKind::Array(element, _) = self.tcx.tys.kind(inner).clone() {
+                    // cast.rs check_ref_cast: the referent is structurally resolved (an alias of an array)
+                    let inner = self.norm(inner);
+                    if let TyKind::Array(element, _) = self.tcx.tys.kind(self.shallow(inner)).clone() {
                         let snapshot = self.start_snapshot();
                         if self.eq(element, pointee) {
                             self.commit_from(snapshot);
