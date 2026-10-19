@@ -142,7 +142,8 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                     }
                     panics += 1;
                     let msg = p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_else(|| "panic".into());
-                    panicked.note(msg, format!("{at}{loc}"));
+                    let (key, detail) = match msg.split_once(": ") { Some((k, v)) => (k.to_string(), format!(" [{v}]")), None => (msg.clone(), String::new()) };
+                    panicked.note(key, format!("{at}{loc}{detail}"));
                 }
             }
         }
