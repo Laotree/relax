@@ -1246,6 +1246,7 @@ impl Program {
             let no_std = f.ast.root_attrs.iter().any(|a| a.inner && a.toks.hi > a.toks.lo && f.tok_text(a.toks.lo) == "no_std");
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root_mod as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root_mod && i.bind == Some(inj));
+            if bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) { self.report_injected_clash(root_mod, inj); }
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
                 self.imports.push(Import { module: root_mod, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: BOUND_INJECTED });
             }
@@ -2170,6 +2171,7 @@ impl Program {
             let no_std = pf.ast.root_attrs.iter().any(|a| a.inner && a.toks.hi > a.toks.lo && pf.tok_text(a.toks.lo) == "no_std");
             let inj = self.syms.intern(if no_std { "core" } else { "std" });
             let bound = self.mods[root as usize].types.contains_key(&inj) || self.imports.iter().any(|i| i.module == root && i.bind == Some(inj));
+            if bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) { self.report_injected_clash(root, inj); }
             if !bound && self.crates[krate as usize].deps.iter().any(|x| x.0 == inj) {
                 self.imports.push(Import { module: root, global: true, segs: vec![(SegKind::Ident, inj)], bind: Some(inj), glob: false, is_pub: false, done: false, file, pos: 0, ext: true, bound: BOUND_INJECTED });
             }
@@ -3729,6 +3731,29 @@ impl Program {
             }
         }
         true
+    }
+
+    /// The injected `extern crate std;` (`core` under `#![no_std]`) of an edition 2015 root against
+    /// a binding of the same name written in the crate: E0259 (an `extern crate`), E0254 (a `use`),
+    /// E0260 (an item), reported on the written one.
+    fn report_injected_clash(&mut self, root: u32, name: Sym) {
+        let n = self.syms.str(name).to_string();
+        let found = self.imports.iter().find(|i| i.module == root && i.bind == Some(name) && i.bound & BOUND_INJECTED == 0).map(|i| (i.ext, i.pos, i.file));
+        let (code, file, pos) = match found {
+            Some((true, pos, file)) => ("E0259", file, pos),
+            Some((false, pos, file)) => ("E0254", file, pos),
+            None => {
+                let Some(&d) = self.mods[root as usize].types.get(&name) else { return };
+                let od = self.def(d);
+                if od.item.0 == u32::MAX { return; }
+                let (f, item) = (od.file, od.item);
+                let Some(it) = self.files.get(f as usize).and_then(|pf| pf.ast.items.get(item.0 as usize)) else { return };
+                ("E0260", f, it.lo)
+            }
+        };
+        let msg = format!("{code}: the name `{n}` is defined multiple times -- note: `{n}` must be defined only once in the type namespace of this module");
+        let e = self.record_error(file, pos, "resolve", msg);
+        self.errors.push(e);
     }
 
     /// E0252/E0254/E0255/E0259/E0260 (rustc_resolve diagnostics.rs `report_conflict`): the import
