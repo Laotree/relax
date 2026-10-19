@@ -650,7 +650,7 @@ impl<'a> Build<'a> {
         let t = self.b.ty(x);
         let ast = self.ast;
         let any_mut = arms.iter().any(|a| self.pat_binds_mut_ref(a.pat));
-        let place = if self.is_place_expr(x) && !self.b.coerce.contains_key(&x.0) {
+        let place = if self.is_place_expr(x) && !self.b.coerce(x.0).is_some() {
             self.as_place(x, any_mut)
         } else {
             let tmp = self.temp_for(t, Some(strip_paren(ast, x)));

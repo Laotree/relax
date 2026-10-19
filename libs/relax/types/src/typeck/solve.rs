@@ -121,8 +121,9 @@ fn context<'a>(prog: &'a Program, tcx: &'a Tcx, state: &'a crate::tcx::EvalState
     }
 }
 
-fn program(source: &str) -> (Program, Tcx) {
-    let dir = std::env::temp_dir().join(format!("relax-native-fcx-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+pub(super) fn program(source: &str) -> (Program, Tcx) {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = std::env::temp_dir().join(format!("relax-native-fcx-{}-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
     std::fs::create_dir(&dir).unwrap();
     let path = dir.join("lib.rs"); std::fs::write(&path, source).unwrap();
     let mut prog = Program::new(&std::sync::Arc::new(crate::Session::default()));

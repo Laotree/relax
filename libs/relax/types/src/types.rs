@@ -23,9 +23,9 @@ mod flags;
 pub use flags::TypeFlags;
 #[path = "types/closure.rs"]
 pub mod closure;
-pub use closure::ClosureArgs;
 #[path = "types/user_type.rs"]
 pub mod user_type;
+pub use closure::ClosureArgs;
 #[path = "types/list.rs"]
 mod list;
 pub use list::{List, ListElem, TyList};

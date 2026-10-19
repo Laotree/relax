@@ -13491,8 +13491,8 @@ pub(crate) fn body_callees(prog: &Program, tcx: &Tcx, b: &Body, warm_only: bool)
     for (k, m) in b.methods.iter().chain(b.binops.iter()) {
         add(*k, m.def, tcx.tys.list(m.args));
     }
-    for ((k, _), (d, a)) in &b.ov_derefs {
-        add(*k, *d, tcx.tys.list(*a));
+    for (k, _, (d, a)) in b.overloaded_derefs() {
+        add(k, d, tcx.tys.list(a));
     }
     for (k, (d, a)) in b.ov_index.iter().chain(b.for_next.iter()) {
         add(*k, *d, tcx.tys.list(*a));
