@@ -168,7 +168,21 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let t_owners = t_check.elapsed();
     // typeck-audit 1.27: anonymous constants outside bodies are body owners of their own
     for anon in crates.iter().flat_map(|&k| crate::borrowck::body::signature_anon_consts(&u.prog, &u.tcx, k)).collect::<Vec<_>>() {
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| u.tcx.typeck(&u.prog, anon).errors.clone()));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let body = u.tcx.typeck(&u.prog, anon);
+            let mut errs = body.errors.to_vec();
+            // rustc check_consts: an anonymous constant is a const context of its own
+            if errs.is_empty() && crate::borrowck::enabled(options) {
+                if let Some((_, relax_front::def_collector::NodeId::AnonConst(expr))) = u.prog.def_id_to_node_id.get(&anon) {
+                    let state = crate::tcx::EvalState::new();
+                    let cx = crate::tcx::EvalCx::new(&u.prog, &u.tcx, crate::tcx::TypingEnv::fully_monomorphized(&u.prog), &state);
+                    for e in crate::borrowck::check_anon_const(&cx, &u.prog, &u.tcx, &body, *expr) {
+                        errs.push(e.render());
+                    }
+                }
+            }
+            errs
+        }));
         match r {
             Ok(e) => errors.extend(e),
             Err(_) => errors.push(format!("internal compiler error while checking {}", u.prog.def_path(anon))),

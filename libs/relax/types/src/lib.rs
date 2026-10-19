@@ -46,6 +46,7 @@ pub mod type_queries;
 pub mod typeck;
 pub mod layout;
 pub mod const_fold;
+pub mod cycle;
 pub mod borrowck;
 pub mod lint;
 pub mod item_checks;

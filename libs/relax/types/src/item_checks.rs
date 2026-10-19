@@ -2,6 +2,7 @@
 //! rustc_resolve build_reduced_graph / report_conflict) and recursive types without
 //! indirection (E0072, rustc_ty_utils representability.rs).
 
+use crate::ast;
 use crate::program::{DefId, DefKind, Program, NO_DEF};
 use crate::tcx::Tcx;
 use crate::types::{TyId, TyKind};
@@ -205,6 +206,91 @@ pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
         if items.len() == 1 { "" } else { "s" }, list, if items.len() == 1 { "has" } else { "have" })))
 }
 
+/// E0391 for a trait's supertrait bounds (rustc_hir_analysis collect/predicates_of.rs
+/// super_predicates_of): a trait that is its own supertrait, directly or through others, and a
+/// bound that names an associated type through `Self` (`trait T: Iterator<Item = Self::Item>`),
+/// which asks for the super traits that define it while they are being computed.
+pub fn supertrait_cycles(prog: &Program, tcx: &Tcx, td: DefId) -> Vec<String> {
+    let def = prog.def(td);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(ast::TraitItem { supers, .. }) = ast.as_trait(&ast.item(def.item).kind) else { return Vec::new() };
+    let mut out = Vec::new();
+    // a cycle through the super bounds: reported once, at its lowest member
+    let mut seen = std::collections::HashSet::new();
+    let mut stack = tcx.trait_supers(prog, td);
+    let mut cyclic = false;
+    let mut members = vec![td];
+    while let Some(t) = stack.pop() {
+        if t == td { cyclic = true; continue; }
+        if !seen.insert(t) { continue; }
+        members.push(t);
+        stack.extend(tcx.trait_supers(prog, t));
+    }
+    if cyclic {
+        // members that are on the cycle: those that reach `td` again
+        let on_cycle = |m: DefId| -> bool {
+            let mut seen = std::collections::HashSet::new();
+            let mut stack = tcx.trait_supers(prog, m);
+            while let Some(t) = stack.pop() {
+                if t == m { return true; }
+                if !seen.insert(t) { continue; }
+                stack.extend(tcx.trait_supers(prog, t));
+            }
+            false
+        };
+        if members.iter().copied().filter(|m| on_cycle(*m)).all(|m| m.0 >= td.0) {
+            out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+                format!("E0391: cycle detected when computing the super predicates of `{}`", prog.def_path(td))));
+        }
+    }
+    // `Self::X` in the arguments of a super bound whose trait (or its supertraits) defines an
+    // associated type X: resolving it asks for exactly the bounds being lowered
+    let mut self_assoc = false;
+    for b in ast.list(*supers) {
+        if let ast::Bound::Trait { path, .. } = b {
+            let Some(bt) = tcx.resolve_type_path_def(prog, def.file, def.scope, path) else { continue };
+            let mut names = Vec::new();
+            for seg in ast.segs(path.segs) {
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(t) | ast::GenericArg::Binding(_, _, t) = g { self_assoc_names(ast, *t, 0, &mut names); }
+                    }
+                }
+            }
+            for n in names {
+                let sym = prog.syms.get(prog.files[def.file as usize].text(n)).unwrap_or(u32::MAX);
+                if tcx.trait_assoc(prog, bt, sym).is_some() { self_assoc = true; }
+            }
+        }
+    }
+    if self_assoc {
+        out.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck",
+            format!("E0391: cycle detected when computing the super traits of `{}` with an associated type name", prog.def_path(td))));
+    }
+    out
+}
+
+/// The names of the associated types the type reaches through `Self` (`Self::Item`).
+fn self_assoc_names(ast: &ast::Ast, t: ast::TyId, depth: u32, out: &mut Vec<ast::Ident>) {
+    if depth > 16 { return; }
+    match ast.ty(t) {
+        ast::Ty::Path(p) => {
+            let segs = ast.segs(p.segs);
+            if segs.len() >= 2 && p.no_qself() && segs[0].kind() == ast::SegKind::SelfType { out.push(segs[1].name); }
+            for s in segs {
+                if let Some(ast::GenericArgs::Angle(v)) = ast.gargs(s.args()) {
+                    for g in ast.list(*v) {
+                        if let ast::GenericArg::Type(x) | ast::GenericArg::Binding(_, _, x) = g { self_assoc_names(ast, *x, depth + 1, out); }
+                    }
+                }
+            }
+        }
+        ast::Ty::Ref(_, _, x) | ast::Ty::Ptr(_, x) | ast::Ty::Slice(x) | ast::Ty::Array(x, _) | ast::Ty::Paren(x) => self_assoc_names(ast, *x, depth + 1, out),
+        ast::Ty::Tuple(v) => for x in ast.list(*v) { self_assoc_names(ast, *x, depth + 1, out); },
+        _ => {}
+    }
+}
+
 /// rustc_hir_analysis wfcheck.rs check_impl: a trait impl's trait reference is well formed --
 /// the trait's own where-clauses and supertraits hold for it, in the impl's environment
 /// (`trait Foo: Send {}` + `impl Foo for Rc<i8> {}`: E0277 "`Rc<i8>` cannot be sent between
@@ -348,6 +434,13 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                 ItemKind::Mod(Some(l)) => stack.extend(ast.list(l).iter().copied()),
                 _ => {}
             }
+        }
+        // and the non-empty blocks inside fn bodies that survive cfg stripping: their items have
+        // definitions (the arena also holds those of cfg'd-out code, which do not)
+        for item in ast.items.iter() {
+            let ItemKind::ForeignMod(r) = item.kind else { continue };
+            if blocks.iter().any(|b| b.lo == item.lo) { continue; }
+            if ast.list(ast.row(r).items).iter().any(|it| prog.item_defs.contains_key(&(file, it.0))) { blocks.push(item); }
         }
         blocks.sort_by_key(|i| i.lo);
         for item in blocks {

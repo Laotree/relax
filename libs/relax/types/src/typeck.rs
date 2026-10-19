@@ -1335,6 +1335,13 @@ impl<'a> Fcx<'a> {
                     Some(a) if !a.is_enum && !a.is_union => a.variants.first().and_then(|v| v.fields.last()).map(|f| f.ty),
                     _ => None,
                 };
+                // `struct Foo<T: A>(T::Assoc)` with `type Assoc = Foo<()>`: the tail is the struct
+                // itself -- the layout query cycle (E0391)
+                let Ok(_cycle) = crate::cycle::enter(crate::cycle::Kind::UnsizedTail, t.0, 1) else {
+                    let ts = self.ty_str(t);
+                    self.err(self.last_lo, format!("E0391: cycle detected when computing layout of `{}`", ts));
+                    return false;
+                };
                 match last {
                     Some(ft) => {
                         let ft = self.tcx.tys.subst(ft, self.tcx.tys.list(args));
@@ -2888,8 +2895,19 @@ impl<'a> Fcx<'a> {
                     None => return self.tcx.tys.error,
                 };
                 let mut args = Vec::new();
+                let mut regions = Vec::new();
+                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
+                let regions = self.tcx.tys.intern_region_args(&regions);
                 match explicit {
-                    Some(v) => args = v,
+                    Some(v) => {
+                        args = v;
+                        // hir_ty_lowering/generics.rs: parameters left out of explicit arguments take
+                        // their defaults (`Uwu::<N>` for `Uwu<const N: u32 = 1, const M: u32 = N>`)
+                        if args.len() < adt.n_generics as usize {
+                            let cx = self.cx.with_infcx(&self.infcx);
+                            self.tcx.fill_type_defaults(&cx, self.prog, adt_def, &mut args, Some(regions));
+                        }
+                    }
                     None => {
                         for _ in 0..adt.n_generics {
                             args.push(self.fresh_arg(d, args.len()));
@@ -2897,9 +2915,6 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
-                let mut regions = Vec::new();
-                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
-                let regions = self.tcx.tys.intern_region_args(&regions);
                 let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
                 self.apply_fn_bounds(adt_def, &full, self.last_lo);
                 let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), regions));
@@ -3384,7 +3399,8 @@ impl<'a> Fcx<'a> {
         let mut candidates = Vec::new();
         for (td, args) in self.param_bounds(t) {
             for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                if self.prog.def(item).name == name {
+                // value namespace: an associated type of the same name is another item
+                if self.prog.def(item).name == name && matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) {
                     let c = (item, args.clone());
                     if !candidates.contains(&c) { candidates.push(c); }
                 }
@@ -3393,7 +3409,7 @@ impl<'a> Fcx<'a> {
         if candidates.is_empty() {
             for td in self.traits_in_scope() {
                 for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                    if self.prog.def(item).name != name { continue; }
+                    if self.prog.def(item).name != name || !matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) { continue; }
                     let save = self.start_snapshot();
                     let mut args = Vec::new();
                     for i in 1..=self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh_arg(td, i as usize)); }
@@ -4045,6 +4061,19 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ blocks
 
+    /// rustc_hir_typeck check_block_no_value: a loop body has type `()` (a `!` body coerces to it);
+    /// the tail expression is a coercion site for the unit expectation.
+    fn check_block_no_value(&mut self, b: BlockId) {
+        let unit = self.tcx.tys.unit;
+        let ty = self.check_block(b, Some(unit));
+        let st = self.shallow(ty);
+        if matches!(self.tcx.tys.kind(st), TyKind::Never) { return; }
+        let blk = self.ast().block(b);
+        let tail = match self.ast().list(blk.stmts).last() { Some(Stmt::Expr(e, false)) => Some(*e), _ => None };
+        let pos = match tail { Some(e) => self.ast().expr(e).lo, None => blk.lo };
+        self.coerce_or_unify(ty, unit, tail, pos);
+    }
+
     fn check_block(&mut self, b: BlockId, expected: Option<TyId>) -> TyId {
         let ast = self.ast();
         let blk = ast.block(b);
@@ -4531,11 +4560,7 @@ impl<'a> Fcx<'a> {
                 self.check_expr(*c, Some(bool_));
                 self.in_loop_condition = false;
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);
@@ -4547,11 +4572,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: true });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 let lp = self.loops.pop().unwrap();
                 self.in_loop_condition = was_in_condition;
                 match lp.break_ty {
@@ -4580,11 +4601,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: false });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);

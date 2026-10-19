@@ -1197,9 +1197,9 @@ impl Tcx {
                 env.self_ty = Some(self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&indices.identity_types_consts(&self.tys)), self.tys.intern_region_args(&regions))));
             }
             ItemKind::TypeAlias(r) => push_generics(prog, def.file, &ast.row(*r).generics, &mut env),
+            // a trait's own parameters (defaults of `trait Tr<const N: u8 = 1, const M: u8 = N>`
+            // name earlier ones): `Self` is param 0, as for the trait's items
             ItemKind::Trait(_) => {
-                // generics_of a trait: `Self` first, then its parameters (so a default can name an
-                // earlier parameter: `trait Tr<const N: u8 = 1, const M: u8 = N>`)
                 if let Some(TraitItem { generics, .. }) = ast.as_trait(&it.kind) {
                     env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
                     env.regions.next_param += 1;
@@ -1568,6 +1568,23 @@ impl Tcx {
                 }
             }
         }
+        if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
+            let ast = &prog.files[def.file as usize].ast;
+            if let crate::ast::ItemKind::Fn(sig, _, _) = &ast.item(def.item).kind {
+                if ast.fn_sig(*sig).konst {
+                    let parent = prog.def(def.parent);
+                    let which = match parent.kind {
+                        DefKind::Trait => Some("traits"),
+                        DefKind::Impl if self.impl_trait.contains_key(&def.parent) => Some("trait impls"),
+                        _ => None,
+                    };
+                    if let Some(which) = which {
+                        errors.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0379: functions in {} cannot be declared const", which)));
+                    }
+                }
+            }
+        }
         if def.kind == DefKind::Enum {
             errors.extend(self.adts[&did].check_discriminants(self, prog));
         }
@@ -1579,6 +1596,9 @@ impl Tcx {
         }
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
+        }
+        if def.kind == DefKind::Trait && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
         }
         if def.kind == DefKind::Impl {
             if errors.is_empty() { errors.extend(self.check_impl_params_constrained(prog, did)); }
@@ -2419,9 +2439,17 @@ impl Tcx {
                             },
                             GenericArg::Const(e) => {
                                 let declaration = self.declaration_env(prog, td);
+                                // (the type of a const parameter naming its own trait: E0391)
+                                let cycle = crate::cycle::enter(crate::cycle::Kind::ConstParamType, td.0, args.len() as u32 + 1);
+                                if cycle.is_err() {
+                                    self.err(cx, prog, file, lo, format!("E0391: cycle detected when computing type of the const parameter {} of `{}`", args.len() + 1, prog.def_path(td)));
+                                    args.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                    continue;
+                                }
                                 let expected = declaration.consts.iter().find(|c| c.0 as usize == args.len() + 1)
                                     .map(|&(_, cf, ct)| self.lower_ty(cx, prog, cf, prog.def(td).scope, &declaration, ct))
                                     .unwrap_or(self.tys.error);
+                                drop(cycle);
                                 args.push(self.tys.intern(TyKind::Const(self.lower_const_arg(prog, file, env, *e, expected))));
                             },
                             GenericArg::Binding(n, _, t) => {
@@ -2555,7 +2583,8 @@ impl Tcx {
                 // an item of the owner's body blocks shadows its type parameters (late.rs ribs)
                 let shadowed = env.owner.is_some_and(|o| prog.lookup_in_body_blocks(module, o, s, true).is_some());
                 for (i, n) in env.names.iter().enumerate().filter(|_| !shadowed) {
-                    if *n == s {
+                    // a const parameter lives in the value namespace: a type path never names it
+                    if *n == s && !env.consts.iter().any(|c| c.0 as usize == i) {
                         // a type parameter takes no generic arguments (E0109), no constraints (E0229)
                         if source_ty.is_some() && self.prohibit_args_on(cx, prog, file, seg, "type parameter", name) { return self.tys.error; }
                         return self.tys.intern(TyKind::Param(i as u32));
@@ -2815,6 +2844,9 @@ impl Tcx {
                     let index = out.len() + usize::from(declaration.as_ref().is_some_and(|(d, _)| prog.def(*d).kind == DefKind::Trait));
                     match g {
                         GenericArg::Type(t) => {
+                            // `Foo<(_)>`: parentheses do not change what the argument is
+                            let mut t = t;
+                            while let ast::Ty::Paren(inner) = ast.ty(*t) { t = inner; }
                             if matches!(ast.ty(*t), ast::Ty::Infer) {
                                 if let (Some(infcx), Some((_, declaration))) = (cx.infcx, &declaration) {
                                     let ty = if declaration.consts.iter().any(|c| c.0 as usize == index) {
@@ -2823,11 +2855,35 @@ impl Tcx {
                                     out.push(ty); continue;
                                 }
                             }
-                            out.push(self.type_or_const_arg(cx, prog, file, module, env, *t));
+                            let arg = self.type_or_const_arg(cx, prog, file, module, env, *t);
+                            // rustc hir_ty_lowering generic_arg_mismatch_err (E0747): an argument of
+                            // the other kind than its parameter is an error, recovered as an error value
+                            if let Some((_, declaration)) = &declaration {
+                                let wants_const = declaration.consts.iter().any(|c| c.0 as usize == index);
+                                let is_const = matches!(self.tys.kind(arg), TyKind::Const(_));
+                                if wants_const && !is_const && index < declaration.names.len() {
+                                    self.err(cx, prog, file, p.lo, "E0747: type provided when a constant was expected".into());
+                                    out.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                    continue;
+                                }
+                                if !wants_const && is_const && index < declaration.names.len() {
+                                    self.err(cx, prog, file, p.lo, "E0747: constant provided when a type was expected".into());
+                                    out.push(self.tys.error);
+                                    continue;
+                                }
+                            }
+                            out.push(arg);
                         }
                         GenericArg::Const(e) => {
                             let ct = if let Some((d, declaration)) = &declaration {
                                 if let Some(&(_, cfile, ty)) = declaration.consts.iter().find(|c| c.0 as usize == index) {
+                                    // `trait Foo<const N: Bar<2>>` with `trait Bar<const M: Foo<2>>`: the type of a
+                                    // const parameter names itself through the other (E0391)
+                                    let Ok(_cycle) = crate::cycle::enter(crate::cycle::Kind::ConstParamType, d.0, index as u32) else {
+                                        self.err(cx, prog, file, p.lo, format!("E0391: cycle detected when computing type of the const parameter {} of `{}`", index, prog.def_path(*d)));
+                                        out.push(self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))));
+                                        continue;
+                                    };
                                     let expected = self.lower_ty(cx, prog, cfile, prog.def(*d).scope, declaration, ty);
                                     if is_infer_len(ast, *e) { cx.infcx.map_or_else(|| self.tys.intern_const(crate::consts::ConstKind::Error), |infcx| infcx.next_const_var()) }
                                     else { self.lower_const_arg(prog, file, env, *e, expected) }
@@ -3165,6 +3221,17 @@ impl Tcx {
                 GenericParamKind::Lifetime(_) => continue,
             };
             if k >= out.len() {
+                // `trait Foo<X = Box<dyn Foo>>`: the default names the trait whose defaults it is
+                // part of (E0391, cycle detected when computing the type of `Foo::X`)
+                let _cycle = match crate::cycle::enter(crate::cycle::Kind::TraitDefault, td.0, k as u32) {
+                    Ok(g) => g,
+                    Err(()) => {
+                        self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
+                        out.push(self.tys.error);
+                        k += 1;
+                        continue;
+                    }
+                };
                 let t = if tdef.is_some() || cdef.is_some() {
                     let mut env = GenEnv::default();
                     env.names.push(prog.syms.get("Self").unwrap_or(u32::MAX));
