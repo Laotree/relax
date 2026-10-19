@@ -104,6 +104,32 @@ pub fn check_body_in(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, bod
     result
 }
 
+/// An anonymous constant that is a body owner of its own (typeck-audit 1.27) is const-checked
+/// alone: rustc_const_eval check_consts on its MIR.
+pub fn check_anon_const(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &Body, expr: crate::ast::ExprId) -> Vec<event::BorrowError> {
+    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(prog, body.def), param_env: body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::borrowck(tcx, prog, body.def) };
+    let tx = tyx::Tx::new(prog, tcx, env, cx.state);
+    if body.args.iter().any(|a| matches!(tcx.tys.kind(*a), crate::types::TyKind::Param(_))) {
+        tx.set_generic_env(body.def, body.args.len());
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut b = build::Build::new(&tx, body, prog.def_path(body.def));
+        b.build_anon_const_root(expr);
+        let query_store = qualifs::Store::default();
+        let queries = qualifs::Provider::new(&tx, body, &query_store);
+        check_consts::check(&tx, &queries, std::slice::from_ref(&b.out))
+            .map(|ds| ds.iter().map(|d| diag::to_error(prog, body.file, body.def, d)).collect::<Vec<_>>())
+    }));
+    match result {
+        Ok(Ok(errors)) => errors,
+        Ok(Err(_)) => Vec::new(),
+        Err(p) => {
+            if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
+            Vec::new()
+        }
+    }
+}
+
 fn check_body_with(prog: &Program, tcx: &Tcx, tx: &tyx::Tx, rty: &rty::Rty, body: &Body) -> Verdict {
     let options = &prog.session.clone().options;
     tx.obligation_owner.set(body.def);

@@ -1553,6 +1553,23 @@ impl Tcx {
                 }
             }
         }
+        if def.kind == DefKind::AssocFn && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            // rustc_ast_passes ast_validation check_trait_fn_not_const (E0379)
+            let ast = &prog.files[def.file as usize].ast;
+            if let crate::ast::ItemKind::Fn(sig, _, _) = &ast.item(def.item).kind {
+                if ast.fn_sig(*sig).konst {
+                    let parent = prog.def(def.parent);
+                    let which = match parent.kind {
+                        DefKind::Trait => Some("traits"),
+                        DefKind::Impl if self.impl_trait.contains_key(&def.parent) => Some("trait impls"),
+                        _ => None,
+                    };
+                    if let Some(which) = which {
+                        errors.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0379: functions in {} cannot be declared const", which)));
+                    }
+                }
+            }
+        }
         if def.kind == DefKind::Enum {
             errors.extend(self.adts[&did].check_discriminants(self, prog));
         }

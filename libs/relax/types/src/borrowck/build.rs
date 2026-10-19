@@ -459,6 +459,15 @@ impl<'a> Build<'a> {
         }
     }
 
+    /// An anonymous constant outside every body (array length, const argument, enum
+    /// discriminant in a signature): a typeck root and body owner of its own.
+    pub fn build_anon_const_root(&mut self, e: ExprId) {
+        self.out.checked_body = Some(super::body::CheckedBody { owner: self.b.def, kind: super::body::BodyKind::AnonConst(e) });
+        self.out.args = self.b.args.to_vec();
+        let ret = self.b.ty(e);
+        self.build_const_expr(e, ret);
+    }
+
     /// rustc_mir_build::builder::construct_const: zero arguments, typed return
     /// place, independent CFG and the ordinary lexical drop scopes.
     fn build_const_expr(&mut self, init: ExprId, ret: TyId) {

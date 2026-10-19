@@ -1137,6 +1137,12 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
     let u = &*UNIT;
     let tname = os::thread::name(os::thread::current());
     let at = owner::call(owner::Class::Job, || info.frames.first().and_then(|f| u.pc_to_src(*f)).map(|(id, loc)| format!("{} ({})", u.fns[id as usize].name, loc)).unwrap_or_else(|| format!("{:#x}", info.frames.first().copied().unwrap_or(0))));
+    // a fault while a constant is evaluated (a null or dangling dereference, a stack overflow
+    // from unbounded recursion, an abort): the evaluation fails, which rustc reports as E0080
+    // (the interpreter rejects the same accesses); the initializer's caller reports it
+    if CONST_EVAL_DEPTH.with(|g| g.get()) > 0 {
+        return false;
+    }
     // a guarded run-time module call (std::relax::guard): the fault is contained to the call
     // and reported; the caller marks the module failed
     if GUARD_DEPTH.with(|g| g.get()) > 0 {
@@ -3914,7 +3920,19 @@ impl Unit {
             self.put_const(d, args, a);
             return Some(a);
         }
-        match self.eval_init(d, args.clone(), false) {
+        // a constant whose initializer needs its own value (directly or through other constants):
+        // rustc's E0391 (the query cycle of const evaluation), not unbounded recursion
+        if CONST_STACK.with(|s| s.borrow().iter().any(|(sd, sa)| *sd == d && *sa == args)) {
+            let def = self.prog.def(d);
+            let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
+            self.note_error(format!("{}: E0391: cycle detected when evaluating the initializer of `{}`", at, self.prog.def_path(d)));
+            self.const_failed.insert((d, args));
+            return None;
+        }
+        CONST_STACK.with(|s| s.borrow_mut().push((d, args.clone())));
+        let evaluated = self.eval_init(d, args.clone(), false);
+        CONST_STACK.with(|s| { s.borrow_mut().pop(); });
+        match evaluated {
             Some(a) => {
                 if let Some(mut cache) = self.cache.take() {
                     cache.record_const(self, d, &args, a);
@@ -4128,7 +4146,9 @@ impl Unit {
             self.exec_note(id, crate::exec_profile::CALL);
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
+            CONST_EVAL_DEPTH.with(|g| g.set(g.get() + 1));
             r = unsafe { call_jit(self as *mut Unit, entry, buf) };
+            CONST_EVAL_DEPTH.with(|g| g.set(g.get().saturating_sub(1)));
             compile_watch(None);
             // a compile the code reached was cancelled (a nested request blocked by an earlier
             // one): no value and no error -- the request is cancelled here, in Rust frames
@@ -12043,6 +12063,10 @@ fn loader_symbol(name: &[u8]) -> Option<usize> {
 }
 
 thread_local! {
+    /// the constants (and their arguments) whose initializers this thread is evaluating, outermost first
+    static CONST_STACK: std::cell::RefCell<Vec<(DefId, Vec<TyId>)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// const/static initializers this thread is evaluating (run_init_code)
+    static CONST_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     /// guarded run-time module calls this thread is inside (std::relax::guard)
     static GUARD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
