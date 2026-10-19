@@ -572,6 +572,12 @@ fn no_main_error(prog: &Program, root: u32, file: u32) -> String {
 /// = "main"]` or a foreign `main` declaration) clashes with the entry symbol.
 pub fn entry_symbol_conflict(prog: &Program, own: &[bool], root: u32) -> Vec<String> {
     let Some(main) = entry_main(prog, root) else { return Vec::new() };
+    // (`#![no_main]`: the program supplies the entry symbol itself)
+    {
+        let m = &prog.mods[prog.crates[root as usize].root_mod as usize];
+        let pf = &prog.files[m.file as usize];
+        if pf.ast.root_attrs.iter().any(|a| a.toks.hi > a.toks.lo && pf.tok_text(a.toks.lo) == "no_main") { return Vec::new(); }
+    }
     let mut clash = false;
     for (i, def) in prog.defs.iter().enumerate() {
         if def.krate != root || !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
