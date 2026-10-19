@@ -3,7 +3,7 @@
 use super::Cx;
 use crate::borrowck::body::{BodyKind, CheckedBody};
 use crate::mir::build::pattern::tests::{named, program};
-use crate::mir::build::thir::ThirBody;
+use crate::mir::build::thir::{ExprKind, ThirBody};
 use crate::mir::build::{BuildCx, BuildResult, BuildRoot};
 use crate::tcx::{EvalCx, EvalState, TypingEnv};
 
@@ -222,4 +222,39 @@ fn await_polls_in_a_loop_and_yields() {
     for n in ["Yield", "Loop", "Match", "Break", "Call"] {
         assert!(k.iter().any(|x| x == n), "missing {n}");
     }
+}
+
+#[test]
+fn async_fn_is_a_wrapper_building_its_body_coroutine() {
+    core_thir("pub async fn thir_cx_probe(x: u8, y: u8) -> u8 { let z = x + y; z }", "thir_cx_probe", |_, _| BodyKind::Function, |r| {
+        let t = r.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(t.params.len(), 2);
+        let ExprKind::Closure(c) = &t.thir.exprs[t.expr.0 as usize].kind else { panic!("{:?}", t.thir.exprs[t.expr.0 as usize].kind) };
+        assert_eq!(c.upvars.len(), 2);
+        assert!(t.coroutine.is_none());
+    });
+}
+
+#[test]
+fn async_fn_body_is_the_coroutine() {
+    core_thir(
+        "pub async fn thir_cx_probe(x: u8, y: u8) -> u8 { let z = x + y; z }",
+        "thir_cx_probe",
+        |body, _| BodyKind::Closure(crate::ast::ExprId(crate::tcx::ASYNC_FN_BODY | body.body.unwrap().0)),
+        |r| {
+            let t = r.unwrap_or_else(|e| panic!("{e:?}"));
+            assert_eq!(t.params.len(), 2);
+            let c = t.coroutine.expect("coroutine");
+            assert!(matches!(c.kind, crate::mir::CoroutineKind::Desugared(crate::mir::CoroutineDesugaring::Async, crate::mir::CoroutineSource::Fn)));
+            // the parameters are upvars, `z` is a local
+            assert!(t.thir.exprs.iter().any(|e| matches!(e.kind, ExprKind::UpvarRef { .. })));
+            assert!(t.thir.exprs.iter().any(|e| matches!(e.kind, ExprKind::VarRef { .. })));
+        },
+    );
+}
+
+#[test]
+fn async_closure_is_a_coroutine_closure_creating_its_coroutine() {
+    let k = core_kinds("pub fn thir_cx_probe(a: u8) { let _c = async |x: u8| { x + a }; }", "thir_cx_probe");
+    has(&k, &["Closure"]);
 }

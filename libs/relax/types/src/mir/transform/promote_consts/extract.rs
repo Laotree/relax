@@ -214,6 +214,15 @@ impl MutVisitor for Promoter<'_> {
         }
     }
 
+    /// The promoted body has no user type annotations of its own: a constant carrying one (an
+    /// annotated path of the original) is copied without it.
+    fn visit_operand(&mut self, op: &mut Operand, at: Location) {
+        if let Operand::Constant(c) = op {
+            c.user_ty = None;
+        }
+        self.super_operand(op, at);
+    }
+
     /// A constant moved into the promoted keeps the allocations it names, copied into the promoted's
     /// own table.
     fn visit_alloc_id(&mut self, alloc: &mut AllocId) {
