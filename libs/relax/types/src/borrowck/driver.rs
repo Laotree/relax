@@ -23,7 +23,8 @@ use super::universal_regions::{Identity, SignatureRegions};
 use super::{event, Verdict};
 use crate::mir::build::{build_mir, BuildCx, BuildRoot};
 use crate::mir::move_paths::MoveData;
-use crate::mir::transform::{mir_promoted, qualifs::ConstQualifsProvider, qualifs::{Blocked, ConstQualifs}};
+use crate::mir::build::driver::{closure_children, BuildProvider};
+use crate::mir::transform::{mir_promoted, qualifs::Blocked};
 use crate::mir::{Body, BodyKind, ClosureId, Span};
 // has_loans: rustc passes `borrow_set.len() != 0`, built from the renumbered body; type_check_body renumbers
 // inside, so the driver passes `true` (always compute liveness for loans) -- a perf difference, not a verdict one.
@@ -45,29 +46,19 @@ struct Prepared<'a> {
     typeck: Option<MirTypeck>,
 }
 
-/// `mir_const_qualif` of the constants a body names, for promotion and const checking. A constant is
-/// qualified by building and checking its own MIR (cycle-checked); until the builder can do that
-/// every constant is an unanswerable query, which blocks (unchecks) the bodies that need one.
-struct ConstProvider;
-impl ConstQualifsProvider for ConstProvider {
-    fn mir_const_qualif(&self, _def: DefId) -> Result<ConstQualifs, Blocked> {
-        Err(Blocked("mir_const_qualif of a named constant (needs the constant's MIR)"))
-    }
-}
-
-/// The typeck-root closures in the order nested bodies must be checked: inner before outer.
-fn closures_inner_first(prog: &Program, body: &typeck::Body) -> Vec<u32> {
+/// The closure-like children of a typeck root (closures, async blocks), inner before outer.
+fn closures_inner_first(prog: &Program, tcx: &Tcx, body: &typeck::Body) -> Vec<u32> {
     let ast = &prog.files[body.file as usize].ast;
-    let mut closures: Vec<u32> = body.closure_sigs.keys().copied().collect();
+    let mut closures: Vec<u32> = closure_children(prog, tcx, body).into_iter().filter_map(|c| match c.kind { OwnerKind::Closure(e) => Some(e.0), _ => None }).collect();
     closures.sort_by_key(|&c| { let e = ast.expr(crate::ast::ExprId(c)); (e.hi - e.lo, c) });
     closures
 }
 
-/// The enclosing closure of closure `c` (the smallest other closure whose extent contains it).
-fn enclosing_closure(prog: &Program, body: &typeck::Body, c: u32) -> Option<u32> {
+/// The enclosing closure of closure `c` (the smallest other closure of `all` whose extent contains it).
+fn enclosing_closure(prog: &Program, body: &typeck::Body, all: &[u32], c: u32) -> Option<u32> {
     let ast = &prog.files[body.file as usize].ast;
     let e = ast.expr(crate::ast::ExprId(c));
-    body.closure_sigs.keys().copied().filter(|&o| o != c).filter(|&o| {
+    all.iter().copied().filter(|&o| o != c).filter(|&o| {
         let x = ast.expr(crate::ast::ExprId(o));
         x.lo <= e.lo && e.hi <= x.hi
     }).min_by_key(|&o| { let x = ast.expr(crate::ast::ExprId(o)); x.hi - x.lo })
@@ -88,9 +79,11 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         Err(why) => { v.unchecked.push(format!("{name}: {why}")); return v; }
     };
 
-    // owners: the item body, its closures (inner first), its const children
+    // The item body with its closures (inner first), then each array-length constant as an
+    // independent root of its own (rustc: an anon const is its own typeck root and `mir_borrowck`).
     let mut owners: Vec<CheckedBody> = Vec::new();
-    for c in closures_inner_first(prog, typeck) {
+    let closure_order = closures_inner_first(prog, tcx, typeck);
+    for &c in &closure_order {
         owners.push(CheckedBody { owner: typeck.def, kind: OwnerKind::Closure(crate::ast::ExprId(c)) });
     }
     let Some(item) = CheckedBody::item(prog, typeck.def) else {
@@ -98,24 +91,50 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         return v;
     };
     owners.push(item);
-    let children = body::const_children(prog, tcx, typeck);
+    let g = Group { cx, prog, tcx, typeck, env, eval: &eval, root: &root, name: &name, fv_cache, closure_order: &closure_order };
+    check_group(&g, &owners, false, &mut v);
+    for child in body::const_children(prog, tcx, typeck) {
+        check_group(&g, &[child], true, &mut v);
+    }
+    v
+}
+
+/// What the bodies of one typeck root share.
+struct Group<'a, 'b> {
+    cx: &'a EvalCx<'a>,
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    typeck: &'a typeck::Body,
+    env: TypingEnv,
+    eval: &'b EvalCx<'b>,
+    root: &'b BuildRoot<'b>,
+    name: &'a str,
+    fv_cache: Option<&'a Rc<SummaryCx>>,
+    closure_order: &'a [u32],
+}
+
+/// Borrow-check a group of bodies together (one inference context each, nested bodies first):
+/// the item with its closures, or one anonymous constant.
+fn check_group(g: &Group<'_, '_>, owners: &[CheckedBody], anon_const: bool, v: &mut Verdict) {
+    let Group { cx, prog, tcx, typeck, env, eval, root, name, fv_cache, closure_order } = *g;
+    let env = env;
+    let provider = BuildProvider { prog, tcx, memo: Default::default() };
 
     // S3/S4 build, S5 promote. Any stop unchecks the root (see the module doc).
     let mut built: Vec<(CheckedBody, Box<Body>)> = Vec::new();
-    for &owner in owners.iter().chain(children.iter()) {
+    for &owner in owners.iter() {
         crate::preempt::point();
         let mir = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build_mir(&root, owner))) {
             Ok(Ok(mir)) => mir,
-            Ok(Err(e)) => { v.unchecked.push(format!("{name}: {}", describe_build_error(&e.reason))); return v; }
+            Ok(Err(e)) => { v.unchecked.push(format!("{name}: {}", describe_build_error(&e.reason))); return; }
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
                 v.unchecked.push(format!("{name}: internal error in the MIR builder: {}", super::lazy::panic_message(&p)));
-                return v;
+                return;
             }
         };
         built.push((owner, Box::new(mir)));
     }
-    let provider = ConstProvider;
     for (owner, mir) in &mut built {
         match mir_promoted(prog, tcx, env, &provider, &mut **mir) {
             Ok(pre) => {
@@ -125,35 +144,37 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
                     v.errors.push(diagnostics::capture(prog, typeck.def, &d));
                 }
             }
-            Err(Blocked(why)) => { v.unchecked.push(format!("{name}: {why}")); let _ = owner; return v; }
+            Err(Blocked(why)) => { v.unchecked.push(format!("{name}: {why}")); let _ = owner; return; }
         }
     }
-    // Children are const-checked only (their region constraints belong to the item's inference
-    // context, which this driver does not share with them yet).
-    let n_checked = built.len() - children.len();
-    built.truncate(n_checked);
 
     // MoveData, signature regions, inference contexts, MIR type check.
     let mut prepared: Vec<Prepared<'_>> = Vec::new();
-    let mut parents: Vec<(u32, SignatureRegions)> = Vec::new();
-    let item_sig = match SignatureRegions::function(tcx, prog, typeck.def) {
-        Some(s) => s,
-        None => { v.unchecked.push(format!("{name}: no universal regions for the signature")); return v; }
+    let item_sig = if anon_const { Some(SignatureRegions::anon_const(tcx, prog, typeck.def)) } else { SignatureRegions::function(tcx, prog, typeck.def) };
+    let Some(item_sig) = item_sig else {
+        v.unchecked.push(format!("{name}: no universal regions for the signature"));
+        return;
     };
+    // Signatures outer-first: a closure's regions are built on its enclosing closure's (nested bodies
+    // run inner-first, so this is a pass of its own over the built bodies).
+    let mut closure_sigs: crate::fxhash::HashMap<u32, SignatureRegions> = Default::default();
+    for &c in closure_order.iter().rev() {
+        let Some((_, mir)) = built.iter().find(|(o, _)| matches!(o.kind, OwnerKind::Closure(e) if e.0 == c)) else { continue };
+        let Some(sigs) = typeck.closure_sigs.get(&c) else { v.unchecked.push(format!("{name}: closure without a signature")); return; };
+        let parent = match enclosing_closure(prog, typeck, closure_order, c).and_then(|p| closure_sigs.get(&p)) {
+            Some(p) => p.clone(),
+            None => item_sig.clone(),
+        };
+        let env_ty = mir.local_decls.get(1).map_or(tcx.tys.unit, |d| d.ty);
+        let Some(sig) = SignatureRegions::closure_in(tcx, prog, typeck.def, c, sigs, parent) else {
+            v.unchecked.push(format!("{name}: closure signature is not a function pointer")); return;
+        };
+        closure_sigs.insert(c, sig.with_closure_env(tcx, typeck.def, c, env_ty));
+    }
     for (owner, mut mir) in built {
         let (sig, key, nested) = match owner.kind {
             OwnerKind::Closure(e) => {
-                let Some(sigs) = typeck.closure_sigs.get(&e.0) else { v.unchecked.push(format!("{name}: closure without a signature")); return v; };
-                let parent = match enclosing_closure(prog, typeck, e.0).and_then(|p| parents.iter().find(|(x, _)| *x == p)) {
-                    Some((_, p)) => p.clone(),
-                    None => item_sig.clone(),
-                };
-                let env_ty = mir.local_decls.get(1).map_or(tcx.tys.unit, |d| d.ty);
-                let Some(sig) = SignatureRegions::closure_in(tcx, prog, typeck.def, e.0, sigs, parent) else {
-                    v.unchecked.push(format!("{name}: closure signature is not a function pointer")); return v;
-                };
-                let sig = sig.with_closure_env(tcx, typeck.def, e.0, env_ty);
-                parents.push((e.0, sig.clone()));
+                let Some(sig) = closure_sigs.get(&e.0).cloned() else { v.unchecked.push(format!("{name}: closure without a signature")); return; };
                 let id = ClosureId { file: typeck.file, expr: e.0 };
                 let key = if mir.coroutine.is_some() { ClauseOwner::Coroutine(id) } else { ClauseOwner::Closure(id) };
                 (sig, key, true)
@@ -168,7 +189,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
                 v.unchecked.push(format!("{name}: internal error in the MIR type check: {}", super::lazy::panic_message(&p)));
-                return v;
+                return;
             }
         };
         prepared.push(Prepared { owner, key, nested, mir, moves, sig, infcx, typeck: Some(tc) });
@@ -197,7 +218,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
     let bodies_of = MirBodies { prog, tcx };
     let relaxed = field_views::relaxed(prog, typeck.def);
     let closure_fv: crate::fxhash::HashMap<u32, Vec<field_views::Summary>> = {
-        let fenv = field_views::FvEnv { prog, tcx, cx: &eval, cache: fv_cache, bodies: &bodies_of };
+        let fenv = field_views::FvEnv { prog, tcx, cx: eval, cache: fv_cache, bodies: &bodies_of };
         prepared.iter().filter_map(|p| match p.owner.kind {
             OwnerKind::Closure(e) => Some((e.0, field_views::closure_captures(&fenv, &p.mir))),
             _ => None,
@@ -217,7 +238,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
                 v.unchecked.push(format!("{name}: internal error in the borrow checker: {}", super::lazy::panic_message(&p)));
-                return v;
+                return;
             }
         }
     };
@@ -233,14 +254,13 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
         let names = universal_names(tcx, prog, p);
         let mut dcx = DiagCx::new(tcx, prog, p.owner.owner, &p.mir, &p.moves, &checked.regions, &borrows, &names);
         dcx.coroutine_kinds = checked.coroutine_kinds.clone();
-        if crate::lint::enabled() && checked.result.accepted() && matches!(p.owner.kind, OwnerKind::Function) {
+        if crate::lint::enabled() && checked.result.accepted() && matches!(p.owner.kind, OwnerKind::Function | OwnerKind::Closure(_)) {
             lint_unused_mut(prog, typeck.def, &p.mir, &checked.result.used_mut);
         }
         v.errors.extend(diagnostics::render_errors(&dcx, &checked.result));
         v.fv_only.extend(diagnostics::render_fv_only(&dcx, &checked.result));
         v.fv_records.extend(checked.result.fv_records.iter().cloned());
     }
-    v
 }
 
 fn describe_build_error(reason: &crate::mir::build::UnsupportedReason) -> String {
@@ -316,7 +336,7 @@ impl FvBodies for MirBodies<'_> {
         let root = BuildRoot::new(BuildCx { prog, tcx, env, eval: &eval }, &body).ok()?;
         let owner = CheckedBody::item(prog, d)?;
         let mut mir = build_mir(&root, owner).ok()?;
-        mir_promoted(prog, tcx, env, &ConstProvider, &mut mir).ok()?;
+        mir_promoted(prog, tcx, env, &BuildProvider { prog, tcx, memo: Default::default() }, &mut mir).ok()?;
         Some(FvBody { body: mir, env })
     }
 }
@@ -335,7 +355,7 @@ pub fn check_anon_const(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, body: &typec
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let root = BuildRoot::new(BuildCx { prog, tcx, env, eval: &eval }, body).ok()?;
         let mut mir = build_mir(&root, CheckedBody { owner: body.def, kind: OwnerKind::AnonConst(expr) }).ok()?;
-        let pre = mir_promoted(prog, tcx, env, &ConstProvider, &mut mir).ok()?;
+        let pre = mir_promoted(prog, tcx, env, &BuildProvider { prog, tcx, memo: Default::default() }, &mut mir).ok()?;
         Some(pre.const_errors.into_iter().map(|e| {
             let mut d = diagnostics::Diag::new(e.code, e.span, e.message);
             d.labels.push((e.span, String::new(), true));

@@ -201,7 +201,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }))
     }
     fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg], locations: Locations, category: ConstraintCategory) {
-        let def = self.tcx.lang_items.get(trait_).unwrap_or_else(|| panic!("required trait lang item `{}` is not defined", trait_.name()));
+        let def = self.tcx.lang_items.get(trait_).unwrap_or_else(|| panic!("required trait lang item: {trait_:?}"));
         let op = ProvePredicate { predicate: crate::next_solver::collect::trait_predicate(def, args.to_vec()) };
         let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
     }
@@ -385,6 +385,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             Rvalue::BinaryOp(mir::BinOp::Cmp, _) => self.nominal_ty(match self.require_lang_item(LangItem::OrderingEnum) { Some(def) => def, None => return tys.error }, &[]),
             Rvalue::Repeat(op, count) => {
                 let ct = match count {
+                    mir::Const::Ty(_, ct) => *ct,
                     mir::Const::Val(mir::ConstValue::Scalar(mir::Scalar::Int { bits, .. }), _) => tys.const_usize(u64::try_from(*bits).expect("usize length")),
                     mir::Const::Unevaluated { def, args, promoted, .. } => {
                         assert!(promoted.is_none(), "array length cannot be a promoted reference");
@@ -398,7 +399,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                         };
                         tys.intern_const(ConstKind::Alias(IsRigid::No, AliasConst { kind, args: args.clone().into() }))
                     },
-                    other => panic!("array length is not a scalar: {other:?}"),
+                    _ => panic!("array length is not a scalar"),
                 };
                 tys.mk_array(self.operand_ty(body, op), ct)
             }
