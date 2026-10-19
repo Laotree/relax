@@ -3421,7 +3421,7 @@ impl Tcx {
                     Ok(g) => g,
                     Err(()) => {
                         self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
-                        out.push(self.tys.error);
+                        out.push(if cdef.is_some() { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
                         k += 1;
                         continue;
                     }

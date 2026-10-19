@@ -753,7 +753,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.b.ret = ct;
         fcx.ret_stack.push(ct);
         fcx.in_const = true;
-        fcx.in_anon_const = true;
+        fcx.in_anon_const = !prog.repeat_expr_counts.contains(&def);
         let t = fcx.check_expr(init, Some(ct));
         fcx.coerce_or_unify(t, ct, Some(init), ast.expr(init).lo);
         fcx.finish();
