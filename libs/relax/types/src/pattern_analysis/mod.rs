@@ -553,8 +553,11 @@ impl<'a> Cx<'a> {
                         None => Some(self.opaque(t, pos)),
                     }
                 }
-                // (no value tree to walk: nothing is judged)
-                None => Some(self.opaque(t, pos)),
+                // (no value tree to walk: only the type is judged)
+                None => {
+                    self.const_type_structural(t, pos, 0);
+                    Some(self.opaque(t, pos))
+                }
             },
             _ => None,
         }
@@ -583,6 +586,33 @@ impl<'a> Cx<'a> {
                 let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };
                 if !infcx.evaluate_obligation(self.prog, goal).may_apply() { self.not_structural(t, pos); }
             }
+        }
+    }
+
+    /// A constant whose type has no value tree here (it holds raw pointers, as `String` and `Vec`
+    /// do): the walk of const_to_pat's valtree_to_pat over the type alone. An ADT of the type
+    /// that is not structural is the error, a fn pointer is a `PointerPattern`.
+    fn const_type_structural(&mut self, t: TyId, pos: Option<u32>, depth: u32) {
+        if depth > 8 { return; }
+        match self.kind(t) {
+            TyKind::Adt(d, args, _) => {
+                if !self.type_marked_structural(t) { self.not_structural(t, pos); return; }
+                let Some(a) = self.tcx.adts.get(&d) else { return };
+                if a.is_union { return; }
+                // (the variant of an enum value is unknown here: only a struct's fields are judged)
+                if a.variants.len() == 1 && !a.is_enum {
+                    for ft in self.variant_field_tys(d, 0, args) { self.const_type_structural(ft, pos, depth + 1); }
+                }
+            }
+            TyKind::Ref(_, i, _) => { let i = self.reveal(i); self.const_type_structural(i, pos, depth + 1) }
+            TyKind::Array(e, _) | TyKind::Slice(e) => self.const_type_structural(e, pos, depth + 1),
+            TyKind::Tuple(l) => { for x in self.tcx.tys.list(l).to_vec() { self.const_type_structural(x, pos, depth + 1); } }
+            TyKind::FnPtr(..) => {
+                let Some(lo) = pos else { return };
+                let e = self.prog.record_uncoded_error(self.body.file, lo, "typeck", "function pointers and raw pointers not derived from integers in patterns behave unpredictably and should not be relied upon".to_string());
+                self.const_errors.push(e);
+            }
+            _ => {}
         }
     }
 
