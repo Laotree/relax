@@ -110,9 +110,13 @@ pub fn parse_level_attr(prog: &Program, file: u32, a: &Attr) -> Option<LevelAttr
     let mut reason = false;
     let mut i = lo + 2;
     let mut skip_value = false;
+    let mut depth = 0u32;
     while i < hi {
         let t = crate::cfg::tok_str(p, i);
         match t {
+            b"(" | b"[" | b"{" => { depth += 1; cur.clear(); skip_value = true; }
+            b")" | b"]" | b"}" if depth > 0 => depth -= 1,
+            b"," if depth > 0 => {}
             b")" | b"," => {
                 if !cur.is_empty() && !skip_value { names.push((std::mem::take(&mut cur), start)); }
                 cur.clear();
@@ -128,6 +132,8 @@ pub fn parse_level_attr(prog: &Program, file: u32, a: &Attr) -> Option<LevelAttr
             b"::" => cur.push_str("::"),
             _ => {
                 if cur.is_empty() { start = p.tok(i).lo; }
+                // a literal is no lint name (E0452, reported by lint_levels)
+                if cur.is_empty() && !t.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') { skip_value = true; }
                 if !skip_value { cur.push_str(&String::from_utf8_lossy(t)); }
             }
         }

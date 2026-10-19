@@ -157,10 +157,84 @@ impl<'a, 'e> Visitor<'a> for Walk<'a, 'e> {
     fn leave_attrs(&mut self, attrs: List<Attr>) { crate::ast_visit::pop_attrs(&mut self.stack, self.ast, attrs); }
 }
 
+/// rustc_lint levels.rs `visit_attrs`: the shapes a lint attribute may not have. A bare or
+/// name-value `deny` is a malformed attribute; inside the list every item must be a lint path
+/// (E0452 otherwise, `reason = "string"` excepted) and a scoped path must name a known tool
+/// (E0710).
+fn malformed(prog: &Program, file: u32, a: &Attr, errors: &mut Vec<String>) {
+    let p = prog.src(file);
+    let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+    if hi <= lo { return; }
+    let head = crate::cfg::tok_str(p, lo);
+    let Some(word) = LEVEL_WORDS.iter().find(|w| w.as_bytes() == head) else { return };
+    let at = |i: usize| p.tok(i).lo;
+    if lint::external(prog, file, at(lo)) { return; }
+    if hi < lo + 2 || crate::cfg::tok_str(p, lo + 1) != b"(" {
+        errors.push(prog.record_uncoded_error(file, at(lo), "typeck", format!("malformed `{}` attribute input", word)));
+        return;
+    }
+    // items at the top level of the list, split at commas
+    let mut i = lo + 2;
+    let mut depth = 0i32;
+    let mut item = i;
+    let check = |from: usize, to: usize, errors: &mut Vec<String>| {
+        if from >= to { return; }
+        let toks: Vec<&[u8]> = (from..to).map(|k| crate::cfg::tok_str(p, k)).collect();
+        let is_ident = |t: &[u8]| t.first().is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_');
+        let mut bad = None;
+        if toks[0] == b"reason" && toks.len() >= 2 && toks[1] == b"=" {
+            if !(toks.len() == 3 && (toks[2].first() == Some(&b'"') || toks[2].starts_with(b"r\"") || toks[2].starts_with(b"r#"))) { bad = Some(if toks.len() == 3 { "reason must be a string literal" } else { "bad attribute argument" }); }
+        } else if toks.iter().any(|t| *t == b"=" || *t == b"(") || !is_ident(toks[0]) {
+            bad = Some("bad attribute argument");
+        } else {
+            // a lint path: `name` or `tool::name`
+            let ok = toks.iter().enumerate().all(|(k, t)| if k % 2 == 0 { is_ident(t) } else { *t == b"::" }) && toks.len() % 2 == 1;
+            if !ok { bad = Some("bad attribute argument"); }
+            else if toks.len() == 3 {
+                let tool = String::from_utf8_lossy(toks[0]).into_owned();
+                if !["clippy", "rustfmt", "rustdoc", "miri", "rustc"].contains(&tool.as_str()) && !registered_tool(prog, file, &tool) {
+                    errors.push(prog.record_error(file, at(from), "typeck", format!("E0710: unknown tool name `{}` found in scoped lint: `{}::{}`", tool, tool, String::from_utf8_lossy(toks[2]))));
+                }
+            }
+        }
+        if let Some(_why) = bad {
+            errors.push(prog.record_error(file, at(from), "typeck", "E0452: malformed lint attribute input".to_string()));
+        }
+    };
+    while i < hi {
+        let t = crate::cfg::tok_str(p, i);
+        if t == b"(" || t == b"[" || t == b"{" { depth += 1; }
+        else if t == b")" || t == b"]" || t == b"}" {
+            if depth == 0 { check(item, i, errors); break; }
+            depth -= 1;
+        } else if t == b"," && depth == 0 {
+            check(item, i, errors);
+            item = i + 1;
+        }
+        i += 1;
+    }
+}
+
+/// `#![register_tool(name)]` at the root of the crate of `file`.
+fn registered_tool(prog: &Program, file: u32, tool: &str) -> bool {
+    let k = prog.file_crate.get(file as usize).copied().unwrap_or(u32::MAX);
+    let Some(c) = prog.crates.get(k as usize) else { return false };
+    let root = prog.mods[c.root_mod as usize].file;
+    let ast = &prog.files[root as usize].ast;
+    let p = prog.src(root);
+    ast.root_attrs.iter().any(|a| {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        crate::cfg::tok_str(p, lo) == b"register_tool" && (lo..hi).any(|i| crate::cfg::tok_str(p, i) == tool.as_bytes())
+    })
+}
+
+const LEVEL_WORDS: &[&str] = &["allow", "warn", "deny", "forbid", "expect"];
+
 /// One attribute list at a node of `def` (`before`: the attributes of the nodes around it inside
 /// the definition).
 fn check_list(prog: &Program, def: DefId, before: &[Attr], list: &[Attr], file: u32, errors: &mut Vec<String>) {
     for (ai, a) in list.iter().enumerate() {
+        malformed(prog, file, a, errors);
         let Some(la) = lint::parse_level_attr(prog, file, a) else { continue };
         // the attributes in force when this one is read
         let mut inner: Vec<Attr> = before.to_vec();
