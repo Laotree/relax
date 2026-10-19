@@ -73,7 +73,7 @@ fn body(f: &Fx, locals: Vec<(TyId, Option<&str>, Span)>, arg_count: u32, blocks:
     }).collect();
     Body { phase: MirPhase::Analysis(AnalysisPhase::Initial), source: MirSource { owner: f.def("f"), kind: BodyKind::Fn },
         basic_blocks: blocks, local_decls, source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }],
-        user_type_annotations: vec![], var_debug_info, arg_count, spread_arg: None, promoted: vec![], coroutine: None }
+        span: Span::default(), user_type_annotations: vec![], upvars: vec![], allocs: Default::default(), var_debug_info, arg_count, spread_arg: None, promoted: vec![], coroutine: None }
 }
 
 /// Free regions: 0 is 'static; `locals` are the further local free regions (1..); the existential

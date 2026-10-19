@@ -309,6 +309,7 @@ fn later_use_kind(cx: &DiagCx<'_>, borrow: &BorrowInfo, span: Span, location: Lo
     let function_span = |func: &Operand| -> Span {
         match func {
             Operand::Constant(c) => c.span,
+            Operand::RuntimeChecks(_) => span,
             Operand::Copy(place) | Operand::Move(place) => {
                 if place.projection.is_empty() && cx.local_name(place.local).is_none() { body.local_decls[place.local.0 as usize].source_info.span } else { span }
             }

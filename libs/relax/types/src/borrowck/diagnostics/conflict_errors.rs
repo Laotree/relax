@@ -49,7 +49,7 @@ pub fn report_use_of_moved_or_uninitialized(cx: &DiagCx<'_>, error: &BorrowckErr
             // explain_captures, reduced to its labels.
             let place_name = cx.describe_place(moved);
             if is_move_msg {
-                let kind = if matches!(move_spans, UseSpans::ClosureUse { is_coroutine: true, .. }) { "coroutine" } else { "closure" };
+                let kind = cx.closure_noun(move_spans);
                 err.span_label(move_span, format!("value {}moved into {kind} here", if is_partial_move { "partially " } else { "" }));
                 let _ = &place_name;
             } else if is_loop_message {
@@ -498,7 +498,7 @@ fn try_report_cannot_return_reference_to_local(cx: &DiagCx<'_>, borrow: &BorrowI
 fn report_escaping_closure_capture(cx: &DiagCx<'_>, use_span: UseSpans, var_span: Span, fr_name: &RegionName, category: ConstraintCategory,
     constraint_span: Span, captured_var: &str, scope: &str) -> Diag {
     let args_span = use_span.args_or_use();
-    let kind = if use_span.for_coroutine() { "coroutine" } else { "closure" };
+    let kind = cx.closure_noun(use_span);
     let mut err = Diag::new("E0373", args_span, format!("{kind} may outlive the current {scope}, but it borrows {captured_var}, which is owned by the current {scope}"));
     err.span_label(var_span, format!("{captured_var} is borrowed here"));
     err.span_label(args_span, format!("may outlive borrowed value {captured_var}"));
@@ -536,10 +536,7 @@ fn report_escaping_data(cx: &DiagCx<'_>, borrow_span: Span, name: &Option<String
 pub fn report_borrow_across_yield(cx: &DiagCx<'_>, error: &BorrowckError) -> Diag {
     let Detail::BorrowAcrossYield { borrow, yield_location } = &error.detail else { unreachable!() };
     let borrow_span = cx.retrieve_borrow_spans(borrow).args_or_use();
-    let kind = match cx.body.coroutine.as_ref().map(|c| c.kind) {
-        Some(CoroutineKind::Async) => "async block", Some(CoroutineKind::Gen) => "gen block",
-        Some(CoroutineKind::AsyncGen) => "async gen block", _ => "coroutine",
-    };
+    let kind = cx.body.coroutine.as_ref().map_or("coroutine", |c| super::coroutine_noun(c.kind));
     let mut err = Diag::new("E0626", borrow_span, format!("borrow may still be in use when {kind} yields"));
     err.span_label(cx.body.source_scopes.first().map_or(borrow_span, |s| s.span), format!("within this {kind}"));
     err.span_label(cx.span_at(*yield_location), "possible yield occurs here");

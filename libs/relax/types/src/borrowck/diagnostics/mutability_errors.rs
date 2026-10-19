@@ -39,7 +39,7 @@ pub fn report_mutability_error(cx: &DiagCx<'_>, error: &BorrowckError) -> Diag {
                 reason = format!(", as `{}` is an immutable static item", cx.prog.name(def_id));
             }
         }
-        ([PlaceElem::Deref], _) if matches!(cx.body.local_decls[the_place_err.local.0 as usize].local_info, LocalInfo::GuardBinding(_)) => {
+        ([PlaceElem::Deref], _) if matches!(cx.body.local_decls[the_place_err.local.0 as usize].local_info, LocalInfo::User(BindingForm::RefForGuard(_))) => {
             item_msg = access_place_desc;
             reason = ", as it is immutable for the pattern guard".to_string();
         }
@@ -97,7 +97,7 @@ fn report_illegal_reassignment(cx: &DiagCx<'_>, place: &Place, span: Span, err_p
     // If the root local is initialized immediately (everything apart from `let PATTERN;`) the
     // error refers to that local, rather than the place being assigned later.
     let (place_description, assigned_span) = match local.map(|l| &cx.body.local_decls[l.0 as usize]) {
-        Some(decl) if matches!(decl.local_info, LocalInfo::User { match_place: Some(_), .. }) =>
+        Some(decl) if matches!(&decl.local_info, LocalInfo::User(BindingForm::Var(VarBindingForm { opt_match_place: Some(_), .. }))) =>
             (cx.describe_any_place(err_place), decl.source_info.span),
         _ => (cx.describe_any_place(place), assigned_span),
     };

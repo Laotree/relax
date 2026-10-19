@@ -68,7 +68,7 @@ fn ret() -> Terminator { Terminator { kind: TerminatorKind::Return, source_info:
 fn body(f: &Fx, owner: &str, tys: &[(TyId, LocalKind)], arg_count: u32, blocks: Vec<BasicBlockData>) -> Body {
     Body { phase: MirPhase::Analysis(AnalysisPhase::Initial), source: MirSource { owner: f.def(owner), kind: BodyKind::Fn }, basic_blocks: blocks,
         local_decls: tys.iter().map(|&(ty, kind)| LocalDecl { ty, mutability: Mutability::Mut, source_info: SourceInfo::default(), user_ty: vec![], local_info: LocalInfo::Boring, kind }).collect(),
-        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], user_type_annotations: vec![], var_debug_info: vec![],
+        source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }], span: Span::default(), user_type_annotations: vec![], upvars: vec![], allocs: Default::default(), var_debug_info: vec![],
         arg_count, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn blk(stmts: Vec<Statement>, term: Terminator) -> BasicBlockData { BasicBlockData { statements: stmts, terminator: Some(term), is_cleanup: false } }

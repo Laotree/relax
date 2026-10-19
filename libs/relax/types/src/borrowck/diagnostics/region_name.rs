@@ -44,16 +44,12 @@ pub struct OutputInfo {
     pub description: &'static str,
 }
 
-#[derive(Clone, Debug)]
-pub struct UpvarInfo { pub name: String, pub ty: TyId, pub span: Span }
-
 /// What a body's universal regions are called. Built by the type checker from the signature.
 #[derive(Clone, Debug, Default)]
 pub struct UniversalNames {
     pub regions: Vec<(RegionVid, ExternalName)>,
     pub inputs: Vec<InputInfo>,
     pub output: Option<OutputInfo>,
-    pub upvars: Vec<UpvarInfo>,
     /// "function", "closure", "constant", ... (tcx.def_descr of the body owner).
     pub def_descr: &'static str,
     pub is_fn_def: bool,
@@ -194,8 +190,8 @@ fn give_name_if_anonymous_region_appears_in_arguments(cx: &DiagCx<'_>, fr: Regio
 }
 
 fn give_name_if_anonymous_region_appears_in_upvars(cx: &DiagCx<'_>, fr: RegionVid) -> Option<RegionName> {
-    let upvar = cx.names.upvars.iter().find(|u| ty_mentions(cx, u.ty, fr))?;
-    Some(RegionName { name: synthesize_region_name(cx), source: RegionNameSource::AnonRegionFromUpvar(upvar.span, upvar.name.clone()) })
+    let upvar = cx.body.upvars.iter().find(|u| ty_mentions(cx, u.ty, fr))?;
+    Some(RegionName { name: synthesize_region_name(cx), source: RegionNameSource::AnonRegionFromUpvar(upvar.path_span, upvar.name.clone()) })
 }
 
 fn give_name_if_anonymous_region_appears_in_output(cx: &DiagCx<'_>, fr: RegionVid) -> Option<RegionName> {
@@ -216,6 +212,6 @@ pub fn get_var_name_and_span_for_region(cx: &DiagCx<'_>, fr: RegionVid) -> Optio
             return Some((cx.local_name(local).map(str::to_string), span));
         }
     }
-    cx.names.upvars.iter().find(|u| ty_mentions(cx, u.ty, fr)).map(|u| (Some(u.name.clone()), u.span))
+    cx.body.upvars.iter().find(|u| ty_mentions(cx, u.ty, fr)).map(|u| (Some(u.name.clone()), u.path_span))
 }
 use crate::mir::Local;

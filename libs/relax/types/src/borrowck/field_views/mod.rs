@@ -459,11 +459,11 @@ fn scan(env: &FvEnv<'_>, body: &Body, depth: u32, init: Vec<Summary>, root: &dyn
                     Rvalue::RawPtr(_, p) => {
                         if let Some((ai, _)) = root(p) { if ai < out.len() { out[ai] = Summary::Whole; } }
                     }
-                    Rvalue::Use(o) | Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _) | Rvalue::UnaryOp(_, o) | Rvalue::ShallowInitBox(o, _) => op_note(&note, &mut out, o),
+                    Rvalue::Use(o) | Rvalue::Cast(_, o, _) | Rvalue::Repeat(o, _) | Rvalue::UnaryOp(_, o) => op_note(&note, &mut out, o),
                     Rvalue::Aggregate(_, ops) => for o in ops { op_note(&note, &mut out, o); },
                     Rvalue::BinaryOp(_, ops) => { op_note(&note, &mut out, &ops.0); op_note(&note, &mut out, &ops.1); }
-                    Rvalue::Discriminant(p) | Rvalue::Len(p) | Rvalue::CopyForDeref(p) => note(&mut out, p, false),
-                    Rvalue::ThreadLocalRef(_) | Rvalue::NullaryOp(..) => {}
+                    Rvalue::Discriminant(p) | Rvalue::CopyForDeref(p) => note(&mut out, p, false),
+                    Rvalue::ThreadLocalRef(_) => {}
                 }
             }
         }
@@ -507,7 +507,7 @@ fn op_note(note: &dyn Fn(&mut Vec<Summary>, &Place, bool), out: &mut Vec<Summary
     match o {
         Operand::Copy(p) => note(out, p, false),
         Operand::Move(p) => note(out, p, true),
-        Operand::Constant(_) => {}
+        Operand::Constant(_) | Operand::RuntimeChecks(_) => {}
     }
 }
 

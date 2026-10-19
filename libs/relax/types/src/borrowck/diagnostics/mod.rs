@@ -67,11 +67,14 @@ pub struct DiagCx<'a> {
     /// region_name.rs give_region_a_name: cache and the `'1`, `'2` counter, per body.
     pub region_names: std::cell::RefCell<std::collections::HashMap<usize, region_name::RegionName>>,
     pub region_counter: std::cell::Cell<usize>,
+    /// What the closure-like bodies of this body were written as (by closure expr), when the
+    /// driver knows them from the nested bodies' `CoroutineInfo` (E0373 wording).
+    pub coroutine_kinds: Vec<(u32, CoroutineKind)>,
 }
 impl<'a> DiagCx<'a> {
     pub fn new(tcx: &'a Tcx, prog: &'a Program, owner: DefId, body: &'a Body, moves: &'a MoveData, regions: &'a MirRegionResult,
         borrows: &'a BorrowSet, names: &'a region_name::UniversalNames) -> Self {
-        Self { tcx, prog, owner, body, moves, regions, borrows, names, region_names: Default::default(), region_counter: std::cell::Cell::new(1) }
+        Self { tcx, prog, owner, body, moves, regions, borrows, names, region_names: Default::default(), region_counter: std::cell::Cell::new(1), coroutine_kinds: Vec::new() }
     }
 }
 
@@ -79,7 +82,7 @@ impl<'a> DiagCx<'a> {
 /// closure/coroutine capture, and any other use. (FnSelfUse's receiver notes are not kept.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UseSpans {
-    ClosureUse { is_coroutine: bool, args_span: Span, capture_kind_span: Span, path_span: Span },
+    ClosureUse { is_coroutine: bool, expr: u32, args_span: Span, capture_kind_span: Span, path_span: Span },
     OtherUse(Span),
 }
 impl UseSpans {
@@ -216,6 +219,15 @@ fn snapshot(prog: &Program, span: Span, text: String, primary: bool) -> Label {
 
 impl<'a> DiagCx<'a> {
     pub fn is_box(&self, ty: TyId) -> bool { matches!(self.tcx.tys.kind(ty), TyKind::Adt(d, ..) if self.tcx.adts[d].is_box()) }
+    /// "closure", "coroutine", "async block", "async closure", "gen block", ...: the
+    /// noun for a closure-like aggregate (rustc report_escaping_closure_capture).
+    pub fn closure_noun(&self, spans: UseSpans) -> &'static str {
+        let UseSpans::ClosureUse { is_coroutine, expr, .. } = spans else { return "closure" };
+        match self.coroutine_kinds.iter().find(|(e, _)| *e == expr).map(|(_, k)| *k) {
+            Some(kind) => coroutine_noun(kind),
+            None => if is_coroutine { "coroutine" } else { "closure" },
+        }
+    }
     pub fn ty_string(&self, ty: TyId) -> String { crate::typeck::ty_to_string(false, self.prog, self.tcx, ty) }
 
     pub fn place_ty(&self, place: &Place) -> TyId {
@@ -277,13 +289,13 @@ impl<'a> DiagCx<'a> {
     pub fn move_spans(&self, moved_place: &Place, at: Location) -> UseSpans {
         let block = &self.body.basic_blocks[at.block.0 as usize];
         if let Some(Statement { kind: StatementKind::Assign(_, Rvalue::Aggregate(kind, operands)), source_info }) = block.statements.get(at.statement_index) {
-            let is_coroutine = match **kind { AggregateKind::Closure(..) => Some(false), AggregateKind::Coroutine(..) => Some(true), _ => None };
-            if let Some(is_coroutine) = is_coroutine {
+            let is_coroutine = match &**kind { AggregateKind::Closure(id, _) | AggregateKind::CoroutineClosure(id, _) => Some((false, id.expr)), AggregateKind::Coroutine(id, _) => Some((true, id.expr)), _ => None };
+            if let Some((is_coroutine, expr)) = is_coroutine {
                 let captured = operands.iter().any(|op| matches!(op, Operand::Move(p) | Operand::Copy(p)
                     if p.local == moved_place.local && (p.projection.starts_with(&moved_place.projection) || moved_place.projection.starts_with(&p.projection))));
                 if captured {
                     let s = source_info.span;
-                    return UseSpans::ClosureUse { is_coroutine, args_span: s, capture_kind_span: s, path_span: s };
+                    return UseSpans::ClosureUse { is_coroutine, expr, args_span: s, capture_kind_span: s, path_span: s };
                 }
             }
         }
@@ -301,10 +313,10 @@ impl<'a> DiagCx<'a> {
         if self.body.local_decls[target.0 as usize].kind != LocalKind::Temp { return UseSpans::OtherUse(use_span); }
         for stmt in block.statements.iter().skip(at.statement_index + 1) {
             if let StatementKind::Assign(_, Rvalue::Aggregate(kind, operands)) = &stmt.kind {
-                let is_coroutine = match **kind { AggregateKind::Closure(..) => Some(false), AggregateKind::Coroutine(..) => Some(true), _ => None };
-                if let Some(is_coroutine) = is_coroutine {
+                let is_coroutine = match &**kind { AggregateKind::Closure(id, _) | AggregateKind::CoroutineClosure(id, _) => Some((false, id.expr)), AggregateKind::Coroutine(id, _) => Some((true, id.expr)), _ => None };
+                if let Some((is_coroutine, expr)) = is_coroutine {
                     if operands.iter().any(|op| matches!(op, Operand::Move(p) | Operand::Copy(p) if p.local == target)) {
-                        return UseSpans::ClosureUse { is_coroutine, args_span: stmt.source_info.span, capture_kind_span: use_span, path_span: use_span };
+                        return UseSpans::ClosureUse { is_coroutine, expr, args_span: stmt.source_info.span, capture_kind_span: use_span, path_span: use_span };
                     }
                 }
             }
@@ -322,5 +334,20 @@ impl<'a> DiagCx<'a> {
         let block = &self.body.basic_blocks[at.block.0 as usize];
         block.statements.get(at.statement_index)
             .map_or_else(|| block.terminator.as_ref().unwrap().source_info.span, |s| s.source_info.span)
+    }
+}
+
+/// hir CoroutineKind descr: `async block`, `gen closure`, `async gen block`, `coroutine`.
+pub fn coroutine_noun(kind: CoroutineKind) -> &'static str {
+    use CoroutineDesugaring::*;
+    use CoroutineSource::*;
+    match kind {
+        CoroutineKind::Desugared(Gen, Block | Fn) => "gen block",
+        CoroutineKind::Desugared(Gen, Closure) => "gen closure",
+        CoroutineKind::Desugared(AsyncGen, Block | Fn) => "async gen block",
+        CoroutineKind::Desugared(AsyncGen, Closure) => "async gen closure",
+        CoroutineKind::Desugared(Async, Block | Fn) => "async block",
+        CoroutineKind::Desugared(Async, Closure) => "async closure",
+        CoroutineKind::Coroutine(_) => "coroutine",
     }
 }
