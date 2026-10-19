@@ -242,7 +242,15 @@ impl<'a> Parser<'a> {
                     Some(b) => b,
                     None => return Err(PErr { pos: it.name.lo, msg: "derive(Default) on an enum needs one `#[default]` unit variant".to_string() }),
                 },
-                "Hash" => gen_hash(&name, is_enum, &shapes),
+                "Hash" => {
+                    // the method's hasher parameter must not shadow a generic of the type
+                    // (rustc's derive names it hygienically)
+                    let mut h = "__H".to_string();
+                    while gparams.iter().any(|g| g.1 == h) {
+                        h.push('_');
+                    }
+                    gen_hash(&name, is_enum, &shapes, &h)
+                }
                 "PartialOrd" => gen_ord(&name, is_enum, &shapes, true, &disc_ty),
                 _ => gen_ord(&name, is_enum, &shapes, false, &disc_ty),
             };
@@ -610,7 +618,7 @@ fn gen_default(ty: &str, is_enum: bool, shapes: &[Shape]) -> Option<String> {
     Some(format!("fn default() -> Self {{ {} }}", e))
 }
 
-fn gen_hash(_ty: &str, is_enum: bool, shapes: &[Shape]) -> String {
+fn gen_hash(_ty: &str, is_enum: bool, shapes: &[Shape], h: &str) -> String {
     let mut arms = String::new();
     for (vi, s) in shapes.iter().enumerate() {
         let mut body = String::new();
@@ -623,7 +631,7 @@ fn gen_hash(_ty: &str, is_enum: bool, shapes: &[Shape]) -> String {
         arms.push_str(&format!("{} => {{ {} }} ", pat("Self", s, "__s"), body));
     }
     let m = if is_enum && shapes.is_empty() { "match *self {}".to_string() } else { format!("match self {{ {} }}", arms) };
-    format!("fn hash<__H: {c}::hash::Hasher>(&self, state: &mut __H) {{ {m} }}", c = CORE, m = m)
+    format!("fn hash<{h}: {c}::hash::Hasher>(&self, state: &mut {h}) {{ {m} }}", c = CORE, m = m, h = h)
 }
 
 /// PartialOrd::partial_cmp (`partial`) or Ord::cmp: lexicographic over variants then fields.
