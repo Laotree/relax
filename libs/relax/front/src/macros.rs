@@ -2444,12 +2444,16 @@ impl<'a> Parser<'a> {
     fn transcribe(&self, nodes: &[TNode], binds: &HashMap<String, Bind>, idx: &mut Vec<usize>, krate_path: &str, out: &mut Transcript) -> Result<(), String> {
         for (ni, n) in nodes.iter().enumerate() {
             match n {
-                TNode::Tok(t) => out.push(&t.text, None, t.pos),
-                TNode::Crate => out.push(krate_path, None, u32::MAX),
+                TNode::Tok(t) => out.push(t.kind, &t.text, None, t.pos),
+                // `crate`, or `::__relax_crate_<name>` (two adjacent tokens)
+                TNode::Crate => match krate_path.strip_prefix("::") {
+                    Some(name) => out.push_run(krate_path, &[(T::PathSep, 2), (T::Ident, name.len())]),
+                    None => out.push(T::KwCrate, krate_path, None, u32::MAX),
+                },
                 TNode::Group(o, c, inner) => {
-                    out.push(&o.text, None, o.pos);
+                    out.push(o.kind, &o.text, None, o.pos);
                     self.transcribe(inner, binds, idx, krate_path, out)?;
-                    out.push(&c.text, None, c.pos);
+                    out.push(c.kind, &c.text, None, c.pos);
                 }
                 TNode::Var(v) => match Self::lookup_bind(binds, v, idx) {
                     Some(Bind::One(lo, hi, f, taken, bare)) => {
@@ -2460,15 +2464,16 @@ impl<'a> Parser<'a> {
                         let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
                         let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
                         if wrap {
-                            out.push("(", None, u32::MAX);
+                            out.push(T::OpenParen, "(", None, u32::MAX);
                         }
                         let group_start = out.s.len() + 1;
                         for k in *lo..*hi {
                             let t = self.toks.at(k);
-                            out.push(&String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
+                            out.push(t.kind, &String::from_utf8_lossy(self.tok_text(t)), Some(t.lo), u32::MAX);
                         }
                         if let Some((a, b)) = *taken {
-                            out.push(&String::from_utf8_lossy(self.bytes(a, b)), Some(a), u32::MAX);
+                            let part = self.bytes(a, b);
+                            out.push(part.first().map_or(T::OtherPunct, |&c| punct_kind(c)), &String::from_utf8_lossy(part), Some(a), u32::MAX);
                         }
                         // a fragment of one of these kinds stays one token tree where the
                         // expansion is matched again (`$i:item` forwarded to `$t:tt`)
@@ -2477,14 +2482,14 @@ impl<'a> Parser<'a> {
                             out.groups.push((group_start as u32, out.s.len() as u32));
                         }
                         if wrap {
-                            out.push(")", None, u32::MAX);
+                            out.push(T::CloseParen, ")", None, u32::MAX);
                         }
                     }
                     Some(Bind::Seq(_)) => return Err(format!("`${}` is still repeating here -- use it inside `$( .. )*`", v)),
                     // not a macro variable: `$x` literally (rare; keeps the text)
                     None => {
-                        out.push("$", None, u32::MAX);
-                        out.push(v, None, u32::MAX);
+                        out.push(T::Dollar, "$", None, u32::MAX);
+                        out.push(crate::lexer::keyword(v.as_bytes(), self.edition).unwrap_or(T::Ident), v, None, u32::MAX);
                     }
                 },
                 TNode::Rep(inner, sep, _) => {
@@ -2504,7 +2509,7 @@ impl<'a> Parser<'a> {
                     for k in 0..count {
                         if k > 0 {
                             if let Some(s) = sep {
-                                out.push(&s.text, None, s.pos);
+                                out.push(s.kind, &s.text, None, s.pos);
                             }
                         }
                         idx.push(k);
@@ -2592,33 +2597,58 @@ impl<'a> Parser<'a> {
                 let mut out = Transcript::default();
                 self.transcribe(body, &binds, &mut Vec::new(), &krate_path, &mut out)?;
                 out.s.push(' ');
-                return Ok((out.s, out.origins, out.bodies, out.groups));
+                return Ok((out.s, out.toks, out.origins, out.bodies, out.groups));
             }
         }
         Err(format!("no rule of `{}!` matches these arguments -- check the macro's patterns", def.name))
     }
 }
 
-/// A transcription being written: the text (each token preceded by a space), per token
-/// substituted from a fragment (offset, its position), per token of the definition body
-/// (offset, its position in the definition).
+/// A transcription being written: the text (each token preceded by a space) with the tokens
+/// over it (kind and position as the definition's and the call's tokens have them, no lexing),
+/// per token substituted from a fragment (offset, its position), per token of the definition
+/// body (offset, its position in the definition).
 #[derive(Default)]
-struct Transcript {
+pub struct Transcript {
     s: String,
+    toks: Vec<Tok>,
     origins: Vec<(u32, u32, u32)>,
     bodies: Vec<(u32, u32, u32)>,
     groups: Vec<(u32, u32)>,
 }
 
 impl Transcript {
-    fn push(&mut self, t: &str, origin: Option<u32>, bp: u32) {
+    fn push(&mut self, kind: T, t: &str, origin: Option<u32>, bp: u32) {
         self.s.push(' ');
+        let at = self.s.len() as u32;
         if let Some(o) = origin {
-            self.origins.push((self.s.len() as u32, o, t.len() as u32));
+            self.origins.push((at, o, t.len() as u32));
         } else if bp != u32::MAX {
-            self.bodies.push((self.s.len() as u32, bp, t.len() as u32));
+            self.bodies.push((at, bp, t.len() as u32));
         }
         self.s.push_str(t);
+        self.toks.push(Tok { kind, lo: at, hi: at + t.len() as u32 });
+    }
+    /// One run of text (one leading space) that is several adjacent tokens: (kind, byte length).
+    fn push_run(&mut self, text: &str, pieces: &[(T, usize)]) {
+        self.s.push(' ');
+        let mut at = self.s.len() as u32;
+        self.s.push_str(text);
+        for &(kind, n) in pieces {
+            self.toks.push(Tok { kind, lo: at, hi: at + n as u32 });
+            at += n as u32;
+        }
+    }
+}
+
+/// The kind of a one-character punctuation token (the part of a split `>>`, `&&`... a fragment took).
+fn punct_kind(c: u8) -> T {
+    match c {
+        b'>' => T::Gt, b'<' => T::Lt, b'&' => T::And, b'|' => T::Or, b'=' => T::Eq, b'-' => T::Minus,
+        b'+' => T::Plus, b'*' => T::Star, b'/' => T::Slash, b'%' => T::Percent, b'^' => T::Caret,
+        b'!' => T::Not, b'.' => T::Dot, b':' => T::Colon, b';' => T::Semi, b',' => T::Comma,
+        b'#' => T::Pound, b'$' => T::Dollar, b'?' => T::Question, b'@' => T::At, b'~' => T::Tilde,
+        _ => T::OtherPunct,
     }
 }
 

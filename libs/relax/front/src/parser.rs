@@ -32,6 +32,27 @@ enum BodyOutline {
     Mismatched(u32),
 }
 
+/// Text with the tokens over it, built piece by piece (no lexing).
+#[derive(Default)]
+struct TokText {
+    s: String,
+    toks: Vec<Tok>,
+}
+
+impl TokText {
+    fn word(&mut self, kind: T, text: &str) {
+        let lo = self.s.len() as u32;
+        self.s.push_str(text);
+        self.toks.push(Tok { kind, lo, hi: lo + text.len() as u32 });
+    }
+    /// `text` with its tokens (positions relative to it).
+    fn append(&mut self, text: &str, toks: &[Tok]) {
+        let base = self.s.len() as u32;
+        self.s.push_str(text);
+        self.toks.extend(toks.iter().filter(|t| t.kind != T::Eof).map(|t| Tok { kind: t.kind, lo: t.lo + base, hi: t.hi + base }));
+    }
+}
+
 pub struct Parser<'a> {
     pub session: &'a std::sync::Arc<crate::Session>,
     pub src: &'a [u8],
@@ -1111,7 +1132,7 @@ impl<'a> Parser<'a> {
     /// ...) with every argument that is a `macro_rules!` call replaced by its expansion text,
     /// or None when no argument is one (the built-in then reads the arguments as they are).
     /// rustc expands such arguments eagerly (rustc_builtin_macros `expr_to_spanned_string`).
-    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<String>> {
+    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<(String, Vec<Tok>)>> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
         // top-level arguments
         let mut args = Vec::new();
@@ -1132,7 +1153,7 @@ impl<'a> Parser<'a> {
             args.push((s, hi));
         }
         let mut any = false;
-        let mut out = Vec::new();
+        let mut out: Vec<(String, Vec<Tok>)> = Vec::new();
         for (a, z) in args {
             // `path ! (..)`: idents and `::` up to the `!`, then one delimited group to the end
             let mut i = a;
@@ -1173,9 +1194,19 @@ impl<'a> Parser<'a> {
             };
             match def {
                 Some(d) => {
-                    let (text, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
+                    let (text, rtoks, _, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
                     // its own output may hold more calls: concat! re-expands it as an argument
-                    out.push(if name == "concat" { text } else { format!("concat!({text})") });
+                    if name == "concat" {
+                        out.push((text, rtoks));
+                    } else {
+                        let mut w = TokText::default();
+                        w.word(T::Ident, "concat");
+                        w.word(T::Not, "!");
+                        w.word(T::OpenParen, "(");
+                        w.append(&text, &rtoks);
+                        w.word(T::CloseParen, ")");
+                        out.push((w.s, w.toks));
+                    }
                     any = true;
                 }
                 None if nested.is_some() => {
@@ -1183,13 +1214,29 @@ impl<'a> Parser<'a> {
                     any = true;
                 }
                 None => {
-                    let lo = self.toks.at(a).lo as usize;
-                    let hi = self.toks.at(z - 1).hi as usize;
-                    out.push(String::from_utf8_lossy(self.bytes(lo as u32, hi as u32)).into_owned());
+                    let lo = self.toks.at(a).lo;
+                    let hi = self.toks.at(z - 1).hi;
+                    let toks: Vec<Tok> = (a..z).map(|k| { let t = self.toks.at(k); Tok { kind: t.kind, lo: t.lo - lo, hi: t.hi - lo } }).collect();
+                    out.push((String::from_utf8_lossy(self.bytes(lo, hi)).into_owned(), toks));
                 }
             }
         }
-        Ok(if any { Some(format!("{name}!({})", out.join(", "))) } else { None })
+        if !any {
+            return Ok(None);
+        }
+        let mut w = TokText::default();
+        w.word(T::Ident, name);
+        w.word(T::Not, "!");
+        w.word(T::OpenParen, "(");
+        for (k, (text, toks)) in out.iter().enumerate() {
+            if k > 0 {
+                w.word(T::Comma, ",");
+                w.s.push(' ');
+            }
+            w.append(text, toks);
+        }
+        w.word(T::CloseParen, ")");
+        Ok(Some((w.s, w.toks)))
     }
 
     /// Expands a call: appends the expansion's tokens (ending in Eof) and returns their start.
@@ -1206,8 +1253,8 @@ impl<'a> Parser<'a> {
         if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
             // the arguments are expanded first (rustc expands macro calls among them
             // eagerly: `concat!("{", asset_ref!("x"), "}")` with a user macro_rules)
-            if let Some(text) = self.builtin_with_rules_expanded(&def.name, toks)? {
-                return self.expand_text(&def.name, &text, call_lo);
+            if let Some((text, rtoks)) = self.builtin_with_rules_expanded(&def.name, toks)? {
+                return Ok(self.expand_toks(&text, &rtoks, call_lo));
             }
         }
         if def.builtin != 0 {
@@ -1234,7 +1281,7 @@ impl<'a> Parser<'a> {
         }
         let _profile = crate::load_profile::span(self.session.runtime.profile, "macro-rules-output", &def.name);
         let key = crate::parse_work::rules_key(self, def, call_lo, self.toks.at(toks.hi as usize).hi);
-        let (text, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
+        let (text, rtoks, origins, bodies, groups) = if let Some(x) = crate::parse_work::get_rules(&key).filter(|_| !crate::macros::uses::recording()) { x } else {
             let x = crate::preload::timed_named(2, &def.name, || self.expand_rules(def, toks.lo as usize, toks.hi as usize)).map_err(|m| PErr { pos: call_lo, msg: m })?;
             crate::parse_work::put_rules(key, &x);
             x
@@ -1260,7 +1307,7 @@ impl<'a> Parser<'a> {
                 self.body_origin.push((base + off, bp, n));
             }
         }
-        self.expand_text(&def.name, &text, call_lo)
+        Ok(self.expand_toks(&text, &rtoks, call_lo))
     }
 
     /// Appends an expansion given as tokens over `text` (positions relative to it; a proc
@@ -1276,26 +1323,6 @@ impl<'a> Parser<'a> {
         self.toks.push(Tok { kind: T::Eof, lo: e, hi: e });
         self.exp_map.push((base, e, call_lo));
         start
-    }
-
-    /// Appends expansion text (lexed; ends in Eof) and returns the index of its first token.
-    pub fn expand_text(&mut self, name: &str, text: &str, call_lo: u32) -> PResult<usize> {
-        let base = (self.src.len() + self.ext.len()) as u32;
-        self.ext.extend_from_slice(text.as_bytes());
-        let mut nt = Vec::new();
-        crate::lexer::lex(text.as_bytes(), self.edition, &mut nt).map_err(|e| PErr { pos: call_lo, msg: format!("`{}!` expands to text that does not lex: {}", name, e.msg) })?;
-        let start = self.toks.len();
-        for mut t in nt {
-            t.lo += base;
-            t.hi += base;
-            self.toks.push(t);
-        }
-        if self.toks.last().map_or(true, |t| t.kind != T::Eof) {
-            let e = base + text.len() as u32;
-            self.toks.push(Tok { kind: T::Eof, lo: e, hi: e });
-        }
-        self.exp_map.push((base, base + text.len() as u32, call_lo));
-        Ok(start)
     }
 
     /// Parses an expansion that starts at token `start`; it must consume it all.
