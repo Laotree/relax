@@ -21,6 +21,11 @@ pub const DROPPING_COPY_TYPES: Lint = lint::lint("dropping_copy_types", Level::W
 pub const FORGETTING_COPY_TYPES: Lint = lint::lint("forgetting_copy_types", Level::Warn, &[]);
 pub const UNDROPPED_MANUALLY_DROPS: Lint = lint::lint("undropped_manually_drops", Level::Deny, &[]);
 pub const INVALID_ATOMIC_ORDERING: Lint = lint::lint("invalid_atomic_ordering", Level::Deny, &[]);
+pub const LET_UNDERSCORE_DROP: Lint = lint::lint("let_underscore_drop", Level::Allow, &[]);
+pub const LET_UNDERSCORE_LOCK: Lint = lint::lint("let_underscore_lock", Level::Deny, &[]);
+pub const FOR_LOOPS_OVER_FALLIBLES: Lint = lint::lint("for_loops_over_fallibles", Level::Warn, &[]);
+pub const MAP_UNIT_FN: Lint = lint::lint("map_unit_fn", Level::Warn, &["unused"]);
+pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr", Level::Deny, &[]);
 pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts", Level::Allow, &[]);
 pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts", Level::Allow, &[]);
 
@@ -30,7 +35,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
-    let mut w = Late { prog, tcx, body, ast, stack: Vec::new(), pcx: pattern_analysis::body_cx(prog, tcx, body), arm_body: None };
+    let mut w = Late { prog, tcx, body, ast, stack: Vec::new(), pcx: pattern_analysis::body_cx(prog, tcx, body), arm_body: None, raw_operand: None };
     match ast.item(d.item).kind {
         ItemKind::Fn(s, _, _) => {
             let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
@@ -57,6 +62,8 @@ struct Late<'a> {
     pcx: PCx<'a>,
     /// the body of the match arm being visited (`is_single_call_in_arm`)
     arm_body: Option<ExprId>,
+    /// the operand of the enclosing `&raw` borrow, when it is one (`&raw *NULL` is fine)
+    raw_operand: Option<ExprId>,
 }
 
 // ---------------------------------------------------------------- must_use machinery
@@ -420,10 +427,18 @@ impl<'a> Late<'a> {
                 self.check_memory_fence(f, args);
             }
             ExprKind::MethodCall(..) => {
+                self.check_map_unit_fn(e);
                 self.check_atomic_load_store(e);
                 self.check_atomic_compare_exchange(e);
             }
             ExprKind::Cast(x, _) => self.check_trivial_cast(e, x),
+            ExprKind::AddrOf(true, _, x) => self.raw_operand = Some(x),
+            ExprKind::Unary(UnOp::Deref, x) => self.check_deref_nullptr(e, x),
+            ExprKind::For(row) => self.check_for_loop_fallible(*self.ast.row(row)),
+            ExprKind::Assign(l, r) => {
+                // `_ = value;` is a non-binding let (LocalSource::AssignDesugar)
+                if matches!(self.ast.expr(l).kind, ExprKind::Underscore) { self.check_non_binding(None, Some(r), ex.lo); }
+            }
             _ => {}
         }
     }
@@ -517,6 +532,140 @@ impl<'a> Late<'a> {
         }
     }
 
+    // ---- let_underscore.rs
+    /// `check_local`: the `_` patterns of a `let` (or of `_ = value;`) whose value is dropped
+    /// at once. `local_lo`: the statement's position, `init`: its initializer.
+    fn check_non_binding(&self, pat: Option<PatId>, init: Option<ExprId>, local_lo: u32) {
+        let mut wilds: Vec<(Option<PatId>, bool)> = Vec::new();
+        match pat {
+            Some(p) => self.collect_wilds(p, true, &mut wilds),
+            None => wilds.push((None, true)),
+        }
+        for (p, top) in wilds {
+            let ty = match p {
+                Some(p) => {
+                    let i = self.body.pat_ix(p);
+                    if i >= self.body.pat_ty.len() || !self.body.pat_typed.get(i) { continue; }
+                    self.body.pat_ty[i]
+                }
+                None => match init.and_then(|x| self.expr_ty(x)) { Some(t) => t, None => continue },
+            };
+            if !self.tcx.needs_drop(self.prog, self.pcx.typing_env(), ty) { continue; }
+            // `mutex.lock()` returns a `Result<MutexGuard, _>` as well
+            let potential = match self.kind(ty) {
+                TyKind::Adt(d, args, _) if Some(d) == self.lang_parent(LangItem::ResultOk) => self.tcx.tys.list(args)[0],
+                _ => ty,
+            };
+            let is_sync_lock = match self.kind(potential) {
+                TyKind::Adt(d, _, _) => matches!(self.diag_item(d).as_deref(), Some("MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard")),
+                _ => false,
+            };
+            let can_use_init = top && init.is_some();
+            if is_sync_lock {
+                self.emit(&LET_UNDERSCORE_LOCK, local_lo, "non-binding let on a synchronization lock");
+            } else if can_use_init {
+                self.emit(&LET_UNDERSCORE_DROP, local_lo, "non-binding let on a type that has a destructor");
+            }
+        }
+    }
+
+    fn collect_wilds(&self, p: PatId, top: bool, out: &mut Vec<(Option<PatId>, bool)>) {
+        let ast = self.ast;
+        match *ast.pat(p) {
+            Pat::Wild => out.push((Some(p), top)),
+            Pat::Ident { sub: Some(s), .. } => self.collect_wilds(s, false, out),
+            Pat::TupleStruct(_, ps) | Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) => {
+                for &q in ast.list(ps) { self.collect_wilds(q, false, out); }
+            }
+            Pat::Struct(_, fs, _) => { for f in ast.list(fs) { self.collect_wilds(f.pat, false, out); } }
+            Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.collect_wilds(x, false, out),
+            _ => {}
+        }
+    }
+
+    // ---- for_loops_over_fallibles.rs
+    fn check_for_loop_fallible(&self, f: ForRow) {
+        let Some(ty) = self.expr_ty(f.iter) else { return };
+        let (adt, by_ref) = match self.kind(ty) {
+            TyKind::Adt(d, ..) => (d, false),
+            TyKind::Ref(_, t, _) => match self.kind(t) { TyKind::Adt(d, ..) => (d, true), _ => return },
+            _ => return,
+        };
+        let (article, name) = if Some(adt) == self.lang_parent(LangItem::OptionSome) {
+            (if by_ref { "a" } else { "an" }, "Option")
+        } else if Some(adt) == self.lang_parent(LangItem::ResultOk) {
+            ("a", "Result")
+        } else { return };
+        let pos = self.ast.expr(f.iter).lo;
+        self.emit(&FOR_LOOPS_OVER_FALLIBLES, pos, &format!("for loop over {article} `{name}`. This is more readably written as an `if let` statement"));
+    }
+
+    // ---- map_unit_fn.rs
+    fn check_map_unit_fn(&self, e: ExprId) {
+        let ExprKind::MethodCall(recv, row) = self.ast.expr(e).kind else { return };
+        let m = *self.ast.row(row);
+        let args = self.ast.list(m.args);
+        if args.len() != 1 { return; }
+        let pf = &self.prog.files[self.body.file as usize];
+        if pf.text(m.name) != "map" { return; }
+        let pos = m.name.lo;
+        if lint::external(self.prog, self.body.file, pos) { return; }
+        // the receiver's method is an inherent slice method (`.iter()`)
+        let Some(rm) = self.body.methods.get(&unparen(self.ast, recv).0) else { return };
+        let ip = self.prog.def(rm.def).parent;
+        if ip == crate::program::NO_DEF || self.prog.def(ip).kind != DefKind::Impl { return; }
+        if !self.tcx.impl_self.get(&ip).is_some_and(|&st| matches!(self.kind(st), TyKind::Slice(_))) { return; }
+        let Some(mm) = self.body.methods.get(&e.0) else { return };
+        if self.diag_item(mm.def).as_deref() != Some("IteratorMap") { return; }
+        let Some(at) = self.expr_ty(args[0]) else { return };
+        let ret = match self.kind(at) {
+            TyKind::Closure(_, _, ca) => match self.kind(ca.closure_sig_as_fn_ptr_ty) { TyKind::FnPtr(_, r, _, _) => r, _ => return },
+            TyKind::FnDef(d, ..) => match self.tcx.fn_item_sig(self.prog, d) { Some(sig) => sig.ret, None => return },
+            _ => return,
+        };
+        let unit = matches!(self.kind(ret), TyKind::Tuple(l) if self.tcx.tys.list(l).is_empty());
+        if !(unit || matches!(self.kind(ret), TyKind::Never)) { return; }
+        self.emit(&MAP_UNIT_FN, pos, "`Iterator::map` call that discard the iterator's values");
+    }
+
+    // ---- builtin.rs DerefNullPtr
+    fn is_null_ptr(&self, e: ExprId) -> bool {
+        let e = unparen(self.ast, e);
+        let Some(t) = self.expr_ty(e) else { return false };
+        let TyKind::Ptr(_, pointee) = self.kind(t) else { return false };
+        let f = self.tcx.tys.flags(pointee);
+        if !f.intersects(crate::types::TypeFlags::HAS_PARAM | crate::types::TypeFlags::HAS_INFER | crate::types::TypeFlags::HAS_ALIAS) {
+            let lcx = crate::layout::LayoutCx::new(self.prog);
+            let lay = crate::layout::Layouts::new();
+            if !lay.is_unsized(&lcx, self.tcx, pointee) && lay.of(&lcx, self.tcx, pointee).size == 0 { return false; }
+        }
+        match self.ast.expr(e).kind {
+            ExprKind::Cast(x, ty) => {
+                if matches!(self.ast.ty(ty), Ty::Ptr(..)) {
+                    let x = unparen(self.ast, x);
+                    let zero = matches!(self.ast.expr(x).kind, ExprKind::Lit(LitKind::Int))
+                        && crate::const_fold::parse_int_lit(std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(self.ast.expr(x).lo, self.ast.expr(x).hi)).unwrap_or("")) == Some(0);
+                    return zero || self.is_null_ptr(x);
+                }
+                false
+            }
+            ExprKind::Call(f, _) => match self.path_def(f) {
+                Some(d) => matches!(self.diag_item(d).as_deref(), Some("ptr_null" | "ptr_null_mut")),
+                None => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn check_deref_nullptr(&mut self, e: ExprId, x: ExprId) {
+        if self.expr_ty(x).is_some_and(|t| matches!(self.kind(t), TyKind::Ptr(..))) && self.is_null_ptr(x) {
+            // `&raw *NULL` is ok
+            if self.raw_operand != Some(e) {
+                self.emit(&DEREF_NULLPTR, self.ast.expr(e).lo, "dereferencing a null pointer");
+            }
+        }
+    }
+
     // ---- rustc_hir_typeck cast.rs trivial_cast_lint
     fn check_trivial_cast(&self, e: ExprId, x: ExprId) {
         if self.body.coercion_casts.get(&x.0).is_none() { return; }
@@ -557,6 +706,12 @@ impl<'a> Visitor<'a> for Late<'a> {
             Stmt::Expr(e, true) => {
                 self.check_path_statement(e);
                 self.check_unused_results(self.ast.expr(e).lo, e);
+            }
+            Stmt::Let(r) => {
+                let l = *self.ast.row(r);
+                self.enter_attrs(l.attrs);
+                if let Some(x) = l.init { self.check_non_binding(Some(l.pat), Some(x), self.ast.expr(x).lo); }
+                self.leave_attrs(l.attrs);
             }
             Stmt::Attrs(r) => {
                 let a = *self.ast.row(r);

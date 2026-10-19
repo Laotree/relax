@@ -4,10 +4,12 @@
 use crate::intrinsics_mem as im;
 
 #[rustc_promotable]
+#[rustc_diagnostic_item = "ptr_null"]
 pub const fn null<T>() -> *const T {
     0 as *const T
 }
 #[rustc_promotable]
+#[rustc_diagnostic_item = "ptr_null_mut"]
 pub const fn null_mut<T>() -> *mut T {
     0 as *mut T
 }

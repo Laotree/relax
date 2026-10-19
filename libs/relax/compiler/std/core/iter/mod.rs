@@ -94,6 +94,7 @@ pub trait Iterator {
         Zip::new(self, other.into_iter())
     }
 
+    #[rustc_diagnostic_item = "IteratorMap"]
     fn map<B, F: FnMut(Self::Item) -> B>(self, f: F) -> Map<Self, F>
     where
         Self: Sized,
