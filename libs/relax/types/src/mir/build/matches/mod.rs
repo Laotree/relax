@@ -97,16 +97,6 @@ pub enum ScheduleDrops {
     No,
 }
 
-/// The fallible `into_block`: the block control continues in.
-trait IntoBlock {
-    fn into_block(self) -> BasicBlock;
-}
-impl IntoBlock for BlockAnd<()> {
-    fn into_block(self) -> BasicBlock {
-        self.0
-    }
-}
-
 impl<'a> Builder<'a> {
     /// Lowers a condition in a way that ensures that variables bound in any let expressions are
     /// definitely initialized in the if body.
