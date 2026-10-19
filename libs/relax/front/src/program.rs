@@ -4154,6 +4154,22 @@ impl Program {
         unreachable!()
     }
 
+    /// Every name trait `d` has in module `g`'s own type namespace is bound to something else in
+    /// module `m`.
+    fn glob_trait_shadowed(&self, m: u32, g: u32, d: DefId) -> bool {
+        let (md, gm) = (&self.mods[m as usize], &self.mods[g as usize]);
+        let mut named = false;
+        for (n, x) in gm.types.iter() {
+            if *x != d { continue; }
+            named = true;
+            match md.types.get(n) {
+                Some(y) if *y != d => {}
+                _ => return false,
+            }
+        }
+        named
+    }
+
     fn module_trait_bindings_pass(&self, m: u32, q: &mut TraitQuery) -> std::sync::Arc<Vec<(DefId, BindVis)>> {
         if q.open.contains(&m) {
             let given = q.prev.get(&m).cloned().unwrap_or_default();
@@ -4189,6 +4205,12 @@ impl Program {
             let gv = if gpub { None } else { Some(md.normal) };
             let inner = self.module_trait_bindings_pass(gd.sub, q);
             for &(d, v) in inner.iter() {
+                // an item or import of module `m` with the glob binding's name shadows it: the
+                // trait's methods are not in scope through it (rustc traits_in_scope reads the
+                // module's resolutions, where explicit bindings win over glob imports)
+                if self.glob_trait_shadowed(m, gd.sub, d) {
+                    continue;
+                }
                 if self.vis_visible(v, m) {
                     let v = self.vis_min(gv, v);
                     // one entry per trait, the most visible binding
