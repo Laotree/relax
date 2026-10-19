@@ -56,6 +56,7 @@ impl<T> Box<T> {
 }
 
 impl<T: ?Sized> Box<T> {
+    #[must_use = "call `drop(Box::from_raw(ptr))` if you intend to drop the `Box`"]
     pub unsafe fn from_raw(raw: *mut T) -> Box<T> {
         Box { ptr: unsafe { crate::ptr::NonNull::new_unchecked(raw) } }
     }

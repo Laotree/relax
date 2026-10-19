@@ -139,7 +139,10 @@ impl<'a> Late<'a> {
                 let found = self.tcx.item_bounds(self.prog, def).iter().find_map(|p| {
                     let crate::next_solver::PredicateKind::Clause(crate::next_solver::ClauseKind::Trait(c)) = &p.kind else { return None };
                     // only the self bounds of the impl-trait
-                    if c.trait_ref.args.first() != Some(&crate::consts::GenericArg::Type(ty)) { return None; }
+                    match c.trait_ref.args.first() {
+                        Some(&crate::consts::GenericArg::Type(s)) if matches!(self.kind(s), TyKind::Alias(_, sa) if sa.kind.def_id() == def) => {}
+                        _ => return None,
+                    }
                     self.is_def_must_use(c.trait_ref.def_id, pos)
                 });
                 match found {
@@ -269,8 +272,28 @@ impl<'a> Late<'a> {
             }
         }
         if let ExprKind::Return(_) = self.ast.expr(expr).kind { return; }
-        let Some(ty) = self.expr_ty(expr) else { return };
         let pos = self.ast.expr(expr).lo;
+        // `foo().await;` on the future of an `async fn` marked `#[must_use]`
+        if let ExprKind::Await(f) = self.ast.expr(expr).kind {
+            let callee = match self.ast.expr(unparen(self.ast, f)).kind {
+                ExprKind::Call(c, _) => match self.body.res.get(&unparen(self.ast, c).0) { Some(Res::Def(d)) => Some(*d), _ => None },
+                ExprKind::MethodCall(..) => self.body.methods.get(&unparen(self.ast, f).0).map(|m| m.def),
+                _ => None,
+            };
+            if let Some(d) = callee {
+                let def = self.prog.def(d);
+                let fa = &self.prog.files[def.file as usize].ast;
+                let is_async = matches!(def.kind, DefKind::Fn | DefKind::AssocFn)
+                    && matches!(fa.item(def.item).kind, ItemKind::Fn(sig, _, _) if fa.fn_sig(sig).asyncness);
+                if is_async {
+                    if let Some(p) = self.is_def_must_use(d, pos) {
+                        self.emit_must_use(&p, "output of future returned by ", "", 1);
+                        return;
+                    }
+                }
+            }
+        }
+        let Some(ty) = self.expr_ty(expr) else { return };
         let must_use_result = self.is_ty_must_use(ty, expr, pos);
         let type_lint_emitted_or_trivial = match must_use_result {
             IsTyMustUse::Yes(path) => { self.emit_must_use(&path, "", "", 1); true }

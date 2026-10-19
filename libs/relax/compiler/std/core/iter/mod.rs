@@ -20,6 +20,7 @@ use crate::cmp::Ordering;
 use crate::ops::{Add, Mul};
 
 #[cfg_attr(not(relax_check), lang = "iterator")]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
 pub trait Iterator {
     type Item;
 
