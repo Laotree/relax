@@ -20,6 +20,7 @@ use crate::typeck::Body;
 use std::collections::HashMap;
 
 pub const UNUSED_IMPORT_BRACES: Lint = lint::lint("unused_import_braces");
+pub const BREAK_WITH_LABEL_AND_LOOP: Lint = lint::lint("break_with_label_and_loop");
 pub const UNUSED_PARENS: Lint = lint::lint("unused_parens");
 pub const UNUSED_BRACES: Lint = lint::lint("unused_braces");
 pub const WHILE_TRUE: Lint = lint::lint("while_true");
@@ -993,7 +994,24 @@ impl<'a> W<'a> {
             }
             ExprKind::Break(l, x) => {
                 self.use_label(l);
-                if let Some(x) = x.get() { self.expr(x); }
+                if let Some(x) = x.get() {
+                    // rustc_parse: `break 'l loop {..}` reads as an unlabeled break of a labeled value
+                    if !l.is_none() {
+                        let bare = match self.kind(x) {
+                            ExprKind::While(r) => ast.row(r).label.is_none(),
+                            ExprKind::For(r) => ast.row(r).label.is_none(),
+                            ExprKind::Loop(_, lb) => lb.is_none(),
+                            ExprKind::Block(_, lb) => lb.is_none(),
+                            _ => false,
+                        };
+                        if bare && !lint::external(self.prog, self.file, ex.lo) {
+                            let krate = self.prog.def(self.def).krate;
+                            let root = crate_root_def(self.prog, krate);
+                            emit(self.prog, root, &BREAK_WITH_LABEL_AND_LOOP, self.file, ex.lo, "this labeled break expression is easy to confuse with an unlabeled break with a labeled value expression");
+                        }
+                    }
+                    self.expr(x);
+                }
             }
             ExprKind::Return(x) | ExprKind::Yield(x) => if let Some(x) = x.get() { self.expr(x); },
             ExprKind::Closure(row) => {
