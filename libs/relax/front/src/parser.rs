@@ -3578,6 +3578,12 @@ impl<'a> Parser<'a> {
     fn expr_ns(&mut self) -> PResult<ExprId> {
         self.expr_bp(0, NO_STRUCT)
     }
+    /// A match guard (rustc parse_match_guard_condition: chains always allowed)
+    fn guard_expr(&mut self) -> PResult<ExprId> {
+        let g = self.expr_bp(0, ALLOW_LET)?;
+        self.cond_check(g, false)?;
+        Ok(g)
+    }
     /// An `if`/`while` condition (rustc parse_expr_cond)
     fn expr_cond(&mut self) -> PResult<ExprId> {
         self.expr_bp(0, NO_STRUCT | ALLOW_LET)
@@ -3646,10 +3652,6 @@ impl<'a> Parser<'a> {
             if prec < min {
                 break;
             }
-            // a `let` in a condition chains with `&&` only
-            if prec == P_OROR && self.has_let_chain(lhs) {
-                return self.err("`||` operators are not supported in let chain conditions");
-            }
             self.pos += 1;
             if prec == P_ASSIGN {
                 let rhs = self.expr_bp(P_ASSIGN, r)?;
@@ -3680,11 +3682,58 @@ impl<'a> Parser<'a> {
         Ok(lhs)
     }
 
-    fn has_let_chain(&self, e: ExprId) -> bool {
-        match self.ast.expr(e).kind {
-            ExprKind::Let(..) => true,
-            ExprKind::Binary(BinOp::And, a, b) => self.has_let_chain(a) || self.has_let_chain(b),
-            _ => false,
+    /// rustc_parse `CondChecker`: after an `if`/`while` condition (edition-dependent chains) or a
+    /// match guard (chains always allowed), a `let` reachable only through `&&` is a chain; one
+    /// below any other operator is forbidden.
+    fn cond_check(&self, e: ExprId, edition_dependent: bool) -> PResult<()> {
+        // cheap exit: the condition holds no `let` operator position at all
+        if !matches!(self.ast.expr(e).kind, ExprKind::Let(..) | ExprKind::Binary(..) | ExprKind::Paren(..) | ExprKind::Unary(..) | ExprKind::AddrOf(..)
+            | ExprKind::Range(..) | ExprKind::Cast(..) | ExprKind::Assign(..) | ExprKind::AssignOp(..) | ExprKind::Field(..) | ExprKind::TupleField(..)
+            | ExprKind::Try(..) | ExprKind::Await(..) | ExprKind::Index(..) | ExprKind::Call(..) | ExprKind::MethodCall(..) | ExprKind::Tuple(..))
+        {
+            return Ok(());
+        }
+        self.cond_visit(e, 0, 1, edition_dependent)
+    }
+
+    // forbid: 0 none, 1 `||`, 2 parentheses, 3 anything else
+    fn cond_visit(&self, e: ExprId, forbid: u8, depth: u32, ed: bool) -> PResult<()> {
+        let x = *self.ast.expr(e);
+        let walk = |s: &Self, f: u8, kids: &[ExprId]| -> PResult<()> {
+            for &k in kids {
+                s.cond_visit(k, f, depth + 1, ed)?;
+            }
+            Ok(())
+        };
+        match x.kind {
+            ExprKind::Let(..) => {
+                if forbid == 1 {
+                    return Err(PErr { pos: x.lo, msg: "`||` operators are not supported in let chain conditions".into() });
+                }
+                if forbid != 0 {
+                    return Err(PErr { pos: x.lo, msg: "expected expression, found `let` statement".into() });
+                }
+                // the edition of the code concerned; text a macro expanded has none known here
+                if depth > 1 && ed && self.edition < 2024 && (x.lo as usize) < self.src.len() {
+                    return Err(PErr { pos: x.lo, msg: "let chains are only allowed in Rust 2024 or later".into() });
+                }
+                Ok(())
+            }
+            ExprKind::Binary(BinOp::And, a, b) => walk(self, forbid, &[a, b]),
+            ExprKind::Binary(BinOp::Or, a, b) if forbid == 0 || forbid == 1 => walk(self, 1, &[a, b]),
+            ExprKind::Paren(a) if forbid == 0 || forbid == 2 => walk(self, 2, &[a]),
+            ExprKind::Assign(a, b) | ExprKind::AssignOp(_, a, b) | ExprKind::Binary(_, a, b) | ExprKind::Index(a, b) => walk(self, 3, &[a, b]),
+            ExprKind::Unary(_, a) | ExprKind::Await(a) | ExprKind::Try(a) | ExprKind::AddrOf(_, _, a) | ExprKind::Field(a, _)
+            | ExprKind::TupleField(a, _) | ExprKind::Paren(a) | ExprKind::Cast(a, _) | ExprKind::MethodCall(a, _) | ExprKind::Call(a, _) => walk(self, 3, &[a]),
+            ExprKind::Range(a, b, _) => {
+                let kids: Vec<ExprId> = a.get().into_iter().chain(b.get()).collect();
+                walk(self, 3, &kids)
+            }
+            ExprKind::Tuple(l) => {
+                let kids: Vec<ExprId> = self.ast.list(l).to_vec();
+                walk(self, 3, &kids)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -3983,7 +4032,7 @@ impl<'a> Parser<'a> {
                 while self.kind() != T::CloseBrace {
                     let attrs = self.outer_attrs()?;
                     let pat = self.pat_top()?;
-                    let guard = if self.eat(T::KwIf) { Some(self.expr_bp(0, ALLOW_LET)?) } else { None };
+                    let guard = if self.eat(T::KwIf) { Some(self.guard_expr()?) } else { None };
                     self.expect(T::FatArrow)?;
                     let blo = self.lo();
                     let body;
@@ -4209,6 +4258,7 @@ impl<'a> Parser<'a> {
     fn if_expr(&mut self, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwIf)?;
         let cond = self.expr_cond()?;
+        self.cond_check(cond, true)?;
         let then = self.block()?;
         let els = if self.eat(T::KwElse) {
             let elo = self.lo();
@@ -4241,6 +4291,7 @@ impl<'a> Parser<'a> {
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
         let c = self.expr_cond()?;
+        self.cond_check(c, true)?;
         let b = self.block()?;
         self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
