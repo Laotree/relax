@@ -27,7 +27,7 @@ impl Category {
             | ExprKind::ThreadLocalRef(_) => Some(Category::Place),
             ExprKind::If { .. } | ExprKind::Match { .. } | ExprKind::NeverToAny { .. } | ExprKind::Let { .. } | ExprKind::Block { .. }
             | ExprKind::Assign { .. } | ExprKind::AssignOp { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. }
-            | ExprKind::Return { .. } | ExprKind::Loop { .. } | ExprKind::Call { .. } | ExprKind::Yield { .. }
+            | ExprKind::Return { .. } | ExprKind::Loop { .. } | ExprKind::Call { .. } | ExprKind::Yield { .. } | ExprKind::Unreachable
             | ExprKind::Adt(..) => Some(Category::Rvalue(RvalueFunc::Into)),
             ExprKind::Literal { .. } | ExprKind::NonHirLiteral { .. } | ExprKind::ZstLiteral { .. } | ExprKind::ConstParam { .. }
             | ExprKind::ConstBlock { .. } | ExprKind::NamedConst { .. } => Some(Category::Constant),

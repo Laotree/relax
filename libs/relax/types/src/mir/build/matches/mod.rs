@@ -40,7 +40,6 @@ macro_rules! unpack {
 // helper functions, broken out by category:
 mod buckets;
 mod match_pair;
-mod misc;
 mod test;
 mod user_ty;
 mod util;

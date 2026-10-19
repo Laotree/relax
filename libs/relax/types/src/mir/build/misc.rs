@@ -1,6 +1,4 @@
-//! rustc_mir_build/src/builder/misc.rs and the `len_of_slice_or_array` helper of expr/as_place.rs, as
-//! far as match lowering needs them. Provisional: lane B owns these files (S3); when its `misc.rs` and
-//! `as_place.rs` land, delete this file and keep B's versions (same names and shapes).
+//! rustc_mir_build/src/builder/misc.rs (and the `len_of_slice_or_array` helper of expr/as_place.rs).
 use crate::mir::build::{Builder, BuildResult, UnsupportedReason};
 use crate::mir::{
     BasicBlock, Const, ConstOperand, ConstValue, FakeReadCause, Operand, Place, PlaceElem, PlaceTy, RawPtrKind, Rvalue, Scalar,
@@ -10,7 +8,7 @@ use crate::program::Prim;
 use crate::types::{RegionId, TyId, TyKind, Types};
 
 /// rustc `Ty::is_trivially_pure_clone_copy`.
-pub(super) fn is_trivially_pure_clone_copy(tys: &Types, ty: TyId) -> bool {
+pub(in crate::mir::build) fn is_trivially_pure_clone_copy(tys: &Types, ty: TyId) -> bool {
     match *tys.kind(ty) {
         TyKind::Bool | TyKind::Char | TyKind::Never | TyKind::IntVar(_) | TyKind::FloatVar(_) | TyKind::Int(_) | TyKind::Float(_) | TyKind::FnDef(..) => true,
         TyKind::Array(e, _) => is_trivially_pure_clone_copy(tys, e),
@@ -24,17 +22,17 @@ pub(super) fn is_trivially_pure_clone_copy(tys: &Types, ty: TyId) -> bool {
 }
 
 impl Builder<'_> {
-    pub(super) fn literal_operand(&self, span: Span, const_: Const) -> Operand {
+    pub(in crate::mir::build) fn literal_operand(&self, span: Span, const_: Const) -> Operand {
         Operand::Constant(Box::new(ConstOperand { span, user_ty: None, const_ }))
     }
 
     /// An integer-like scalar constant (`Const::from_bits`).
-    pub(super) fn scalar_const(&self, bits: u128, size: u8, ty: TyId) -> Const {
+    pub(in crate::mir::build) fn scalar_const(&self, bits: u128, size: u8, ty: TyId) -> Const {
         Const::Val(ConstValue::Scalar(Scalar::Int { bits, size }), ty)
     }
 
     /// misc.rs:`push_usize`.
-    pub(super) fn push_usize(&mut self, block: BasicBlock, source_info: SourceInfo, value: u64) -> Place {
+    pub(in crate::mir::build) fn push_usize(&mut self, block: BasicBlock, source_info: SourceInfo, value: u64) -> Place {
         let usize_ty = self.root.cx.tcx.tys.prim(Prim::Usize);
         let temp = self.temp(usize_ty, source_info.span);
         let const_ = self.scalar_const(value as u128, 8, usize_ty);
@@ -57,7 +55,7 @@ impl Builder<'_> {
     }
 
     /// misc.rs:`consume_by_copy_or_move`.
-    pub(super) fn consume_by_copy_or_move(&self, place: Place) -> BuildResult<Operand> {
+    pub(in crate::mir::build) fn consume_by_copy_or_move(&self, place: Place) -> BuildResult<Operand> {
         let ty = self.place_ty(&place)?.ty;
         let cx = &self.root.cx;
         if cx.tcx.type_is_copy_modulo_regions(cx.prog, cx.eval, self.owner.owner, ty) {
@@ -98,12 +96,12 @@ impl Builder<'_> {
     }
 
     /// `Pin<T>`'s `T` (pinned bindings and `&pin` patterns are unstable: never produced).
-    pub(super) fn pinned_ty(&self, _ty: TyId) -> Option<TyId> {
+    pub(in crate::mir::build) fn pinned_ty(&self, _ty: TyId) -> Option<TyId> {
         None
     }
 
     /// A reference type `&ty` / `&mut ty` with an erased region.
-    pub(super) fn ref_ty(&self, mutable: bool, ty: TyId) -> TyId {
+    pub(in crate::mir::build) fn ref_ty(&self, mutable: bool, ty: TyId) -> TyId {
         self.root.cx.tcx.tys.intern(TyKind::Ref(mutable, ty, RegionId::ERASED))
     }
 }

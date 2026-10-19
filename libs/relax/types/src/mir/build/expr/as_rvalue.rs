@@ -198,6 +198,7 @@ impl Builder<'_> {
             }
 
             ExprKind::Yield { .. }
+            | ExprKind::Unreachable
             | ExprKind::Block { .. }
             | ExprKind::Match { .. }
             | ExprKind::If { .. }

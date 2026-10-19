@@ -159,6 +159,7 @@ impl Builder<'_> {
             | ExprKind::ConstBlock { .. }
             | ExprKind::StaticRef { .. }
             | ExprKind::Yield { .. }
+            | ExprKind::Unreachable
             | ExprKind::ThreadLocalRef(_)
             | ExprKind::Call { .. }
             | ExprKind::ByUse { .. } => {
