@@ -4074,10 +4074,6 @@ impl<'a> Fcx<'a> {
             let declared = self.tcx.generic_indices_of(self.prog, def).types_consts.len();
             for g in self.ast().list(*v) {
                 if offset + out.len() >= declared && !matches!(g, GenericArg::Lifetime(_) | GenericArg::Binding(..) | GenericArg::Constraint(..)) {
-                    let written = self.ast().list(*v).iter().filter(|g| matches!(g, GenericArg::Type(_) | GenericArg::Const(_))).count();
-                    let own = declared.saturating_sub(offset);
-                    let what = if matches!(self.prog.def(def).kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn) { "function" } else { "item" };
-                    self.err(self.last_lo, format!("E0107: {} takes {} generic argument{} but {} generic argument{} {} supplied", what, own, if own == 1 { "" } else { "s" }, written, if written == 1 { "" } else { "s" }, if written == 1 { "was" } else { "were" }));
                     break;
                 }
                 if let Some(lt) = self.generic_arg(g, def, offset + out.len()) {

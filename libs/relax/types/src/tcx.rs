@@ -2654,12 +2654,6 @@ impl Tcx {
         let regions = self.lower_region_args(cx.infcx, prog, file, module, env, p);
         let mut args = self.lower_generic_args(cx, prog, file, module, env, p);
         let def = prog.def(d);
-        if let Some((_, count)) = self.own_param_counts(prog, d) {
-            let written = self.written_lifetimes(cx.infcx, prog, file, env, p).len();
-            if written > count {
-                self.err(cx, prog, file, p.lo, format!("E0107: {} takes {} lifetime argument{} but {} lifetime argument{} {} supplied", def_kind_descr(def.kind), count, if count == 1 { "" } else { "s" }, written, if written == 1 { "" } else { "s" }, if written == 1 { "was" } else { "were" }));
-            }
-        }
         // a module named like a primitive (`use std::str;`, globs re-exporting std's modules)
         // does not hide the primitive type
         if def.kind == DefKind::Mod && p.segs.len() == 1 && p.no_qself() {
@@ -2688,16 +2682,14 @@ impl Tcx {
             DefKind::ForeignTy => self.tys.intern(TyKind::Foreign(d)),
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 // `HashMap<K, V>` with `S = RandomState` defaulted
-                if self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions)) {
-                    self.err(cx, prog, file, p.lo, format!("E0107: missing generics for {} `{}`", def_kind_descr(def.kind), prog.name(d)));
-                }
+                // (a missing parameter is E0107 in check_generic_arg_count; the argument is the error type)
+                let _ = self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions));
                 self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&args), regions))
             }
             DefKind::TypeAlias => {
                 let a = self.alias_ty(cx, prog, d);
-                if self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions)) {
-                    self.err(cx, prog, file, p.lo, format!("E0107: missing generics for {} `{}`", def_kind_descr(def.kind), prog.name(d)));
-                }
+                // (a missing parameter is E0107 in check_generic_arg_count; the argument is the error type)
+                let _ = self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions));
                 let rs = regions;
                 let aenv = self.item_env(prog, d);
                 let a = self.subst_decl_regions(a, &aenv, rs);
@@ -3028,10 +3020,6 @@ impl Tcx {
         // parameters are not lowered (E0107 reports them); the lowered list never exceeds the
         // declaration.
         if let Some((count, _)) = declaration.as_ref().and_then(|(d, _)| self.own_param_counts(prog, *d)) {
-            if out.len() > count {
-                let (d, _) = declaration.as_ref().unwrap();
-                self.err(cx, prog, file, p.lo, format!("E0107: {} takes {} generic argument{} but {} generic argument{} {} supplied", def_kind_descr(prog.def(*d).kind), count, if count == 1 { "" } else { "s" }, out.len(), if out.len() == 1 { "" } else { "s" }, if out.len() == 1 { "was" } else { "were" }));
-            }
             out.truncate(count);
         }
         out
