@@ -8480,13 +8480,26 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
 fn lower_checked_body(u: &Unit, id: u32, key: &FnKey, body: &Body) -> Result<(crate::rir::Func, bool), String> {
     let name = u.fns[id as usize].name.to_string();
     trace("lower", &name);
-    let mut lcx = Lcx::new(u, body, name, id);
+    let mut lcx = Lcx::new(u, body, name.clone(), id);
     match key {
         FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
         FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
         FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
     }
     lcx.finish();
+    // A branch on a known constant was folded (check only) on the strength of registers written
+    // once so far; registers are not SSA, so a later write (a loop assigning the variable) voids
+    // the proof: the body is lowered again as written.
+    if lcx.fold && lcx.fold_regs.borrow().iter().any(|v| crate::lower::rir_writes(&lcx.f, &[], *v) != 1) {
+        lcx = Lcx::new(u, body, name, id);
+        lcx.fold = false;
+        match key {
+            FnKey::Inst(d, _) => lcx.lower_fn_body(*d),
+            FnKey::Closure(_, ce, _) => lcx.lower_closure_body(*ce),
+            FnKey::Shim(_) | FnKey::Glue(..) | FnKey::Sandbox(_) => {}
+        }
+        lcx.finish();
+    }
     // a body that cannot unwind (C-family ABIs without `-unwind`): a panic aborts
     // at its edge (rustc AbortUnwindingCalls)
     if let FnKey::Inst(d, _) = key {
