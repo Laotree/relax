@@ -373,6 +373,12 @@ pub struct Unit {
     pub syms: crate::syms::Syms,
     /// the disk cache of compiled code (cache.rs; MAKEPAD_RUN_CACHE)
     pub cache: Option<Box<crate::cache::CacheCell>>,
+    /// The main thread's installs before the first present, whose cache entries are encoded
+    /// after it (Cache::defer_record), in install order; `pending_cache_cursor` is the next
+    /// one to encode. Whatever reads or replaces the cache's entries, or changes the sources
+    /// the keys come from, drains them first (flush_cache_records).
+    pending_cache_records: Vec<Option<crate::cache::PendingRecord>>,
+    pending_cache_cursor: usize,
     /// slots installed in the first seconds after main, in order (the disk cache's startup
     /// manifest for the next run)
     pub start_order: Vec<u32>,
@@ -2306,6 +2312,8 @@ impl Unit {
             rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
+            pending_cache_records: Vec::new(),
+            pending_cache_cursor: 0,
             start_order: Vec::new(),
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
             bodies: Default::default(),
@@ -5152,6 +5160,33 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     })
 }
 
+impl Unit {
+    /// Encodes every deferred cache record (owner thread).
+    pub(crate) fn flush_cache_records(&mut self) {
+        self.record_cache_batch(usize::MAX);
+    }
+
+    /// Encodes up to `count` deferred cache records, in install order (owner thread). True: more are left.
+    fn record_cache_batch(&mut self, count: usize) -> bool {
+        if self.pending_cache_records.is_empty() { return false; }
+        let Some(mut cache) = self.cache.take() else { return false };
+        let end = self.pending_cache_cursor.saturating_add(count).min(self.pending_cache_records.len());
+        while self.pending_cache_cursor < end {
+            let record = self.pending_cache_records[self.pending_cache_cursor].take().unwrap();
+            self.pending_cache_cursor += 1;
+            cache.record_pending(self, &record);
+        }
+        self.cache = Some(cache);
+        if self.pending_cache_cursor == self.pending_cache_records.len() {
+            self.pending_cache_records = Vec::new();
+            self.pending_cache_cursor = 0;
+            false
+        } else {
+            true
+        }
+    }
+}
+
 /// Installs a slot's compiled code (on the owner thread): perf map, O3 counter, and the
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
@@ -5183,8 +5218,16 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             let u = &mut *up;
             if record {
                 if let Some(mut c) = u.cache.take() {
-                    c.record(u, id, code, relocs, &map);
+                    // before the first present the main thread waits for this install: its
+                    // entry (slot keys, dependency certificate) is encoded after the present
+                    let deferred = if startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
+                        c.defer_record(u, id, code, relocs, &map)
+                    } else {
+                        c.record(u, id, code, relocs, &map);
+                        None
+                    };
                     u.cache = Some(c);
+                    if let Some(p) = deferred { u.pending_cache_records.push(Some(p)); }
                 }
             }
             let u = &mut *up;
@@ -9203,6 +9246,7 @@ impl Drop for Unit {
 pub unsafe fn retire_unit(up: *mut Unit) {
     pause_compile_jobs(false);
     owner::call(owner::Class::App, || {
+        (&mut *up).flush_cache_records();
         (&mut *up).retired = true;
         if SPEC_UNIT.load(Ordering::Acquire) == up {
             SPEC_UNIT.store(std::ptr::null_mut(), Ordering::Release);
@@ -11006,6 +11050,17 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
         STARTUP_PHASE.store(2, Ordering::Release);
         SPEC_WAKE.notify_all();
         set_worker();
+        // the cache entries of the installs made before the present, in batches that give way
+        // to the program's own requests (Background); nothing of the unit is kept in between
+        loop {
+            let _job = compile_job();
+            let more = owner::call(owner::Class::Background, || {
+                let up = SPEC_UNIT.load(Ordering::Acquire);
+                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(256) }
+            });
+            if !more { break; }
+            std::thread::yield_now();
+        }
         let roots = std::mem::take(&mut *STARTUP_ROOTS.lock().unwrap());
         let cached = std::mem::take(&mut *STARTUP_CACHED.lock().unwrap());
         for (unit, id, depth) in roots {
