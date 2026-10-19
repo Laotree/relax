@@ -335,7 +335,22 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
     for (&file, &def) in &scope {
         let pf = &prog.files[file as usize];
         let ast = &pf.ast;
-        for item in ast.items.iter() {
+        // the blocks of the module tree that survive cfg stripping (the item arena also holds the
+        // items of cfg'd-out code, which have no definitions)
+        let mut stack: Vec<crate::ast::ItemId> = ast.root_items.iter().copied().collect();
+        let mut blocks: Vec<&crate::ast::Item> = Vec::new();
+        while let Some(id) = stack.pop() {
+            let item = ast.item(id);
+            let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
+            if !prog.active(file, &attrs) { continue; }
+            match item.kind {
+                ItemKind::ForeignMod(_) => blocks.push(item),
+                ItemKind::Mod(Some(l)) => stack.extend(ast.list(l).iter().copied()),
+                _ => {}
+            }
+        }
+        blocks.sort_by_key(|i| i.lo);
+        for item in blocks {
             let ItemKind::ForeignMod(r) = item.kind else { continue };
             let fm = ast.row(r);
             let attrs: Vec<crate::ast::Attr> = ast.list(item.attrs).to_vec();
@@ -346,19 +361,21 @@ pub fn foreign_blocks(prog: &Program, own: &[bool]) -> Vec<String> {
                     let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
                     if hi < lo + 3 || crate::cfg::tok_str(sp, lo) != b"link" || crate::cfg::tok_str(sp, lo + 1) != b"(" { continue; }
                     let pos = sp.tok(lo).lo;
-                    let (mut name, mut kind_bad) = (None::<&[u8]>, false);
+                    let (mut name, mut kind_bad, mut wasm_module) = (None::<&[u8]>, false, false);
                     let mut i = lo + 2;
                     while i + 2 < hi {
                         let key = crate::cfg::tok_str(sp, i);
                         if crate::cfg::tok_str(sp, i + 1) == b"=" {
                             let val = crate::cfg::tok_str(sp, i + 2);
                             if key == b"name" { name = Some(val); }
+                            if key == b"wasm_import_module" { wasm_module = true; }
                             if key == b"kind" && !matches!(val, b"\"static\"" | b"\"dylib\"" | b"\"framework\"" | b"\"raw-dylib\"" | b"\"link-arg\"") { kind_bad = true; }
                             i += 3;
                         } else { i += 1; }
                     }
                     if kind_bad { errors.push(prog.record_error(file, pos, "typeck", "E0539: malformed `link` attribute input".to_string())); }
                     match name {
+                        None if wasm_module => {}
                         None => errors.push(prog.record_error(file, pos, "typeck", "E0459: `#[link]` attribute requires a `name = \"string\"` argument".to_string())),
                         Some(b"\"\"") => errors.push(prog.record_error(file, pos, "typeck", "E0454: link name must not be empty".to_string())),
                         _ => {}
