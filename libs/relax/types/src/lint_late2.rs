@@ -482,6 +482,8 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_shadowed_into_iter(e);
         self.lint_if_let_rescope(e);
         self.lint_comparisons(e);
+        self.lint_ptr_nulls(e);
+        self.lint_closure_returning_async_block(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
             ExprKind::Call(f, args) => {
@@ -1060,5 +1062,162 @@ impl<'a> L2<'a> {
             if !is_fn(a0) || !is_fn(b0) { return; }
         } else { return; }
         self.emit(&UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS, self.ast.expr(e).lo, "function pointer comparisons do not produce meaningful results since their addresses are not guaranteed to be unique");
+    }
+}
+
+// ---------------------------------------------------------------- closure_returning_async_block
+
+pub const CLOSURE_RETURNING_ASYNC_BLOCK: Lint = lint::lint("closure_returning_async_block", Level::Allow, &[]);
+
+impl<'a> L2<'a> {
+    /// `AsyncClosureUsage::check_expr` (rustc_lint async_closures.rs).
+    fn lint_closure_returning_async_block(&self, e: ExprId) {
+        let ExprKind::Closure(row) = self.ast.expr(e).kind else { return };
+        let c = *self.ast.row(row);
+        if c.is_async { return; }
+        let mut body = c.body;
+        // only blocks without statements are peeled
+        loop {
+            match self.ast.expr(body).kind {
+                ExprKind::Paren(x) => body = x,
+                ExprKind::Block(b, l) if l.get().is_none() && self.ast.stmts(b).len() == 1 && block_tail(self.ast, b).is_some() => body = block_tail(self.ast, b).unwrap(),
+                _ => break,
+            }
+        }
+        if matches!(self.ast.expr(body).kind, ExprKind::Async(..)) {
+            self.emit(&CLOSURE_RETURNING_ASYNC_BLOCK, self.ast.expr(e).lo, "closure returning async block can be made into an async closure");
+        }
+    }
+}
+
+// ---------------------------------------------------------------- ptr_nulls (rustc_lint ptr_nulls.rs)
+
+pub const USELESS_PTR_NULL_CHECKS: Lint = lint::lint("useless_ptr_null_checks", Level::Warn, &[]);
+pub const INVALID_NULL_ARGUMENTS: Lint = lint::lint("invalid_null_arguments", Level::Deny, &[]);
+
+impl<'a> L2<'a> {
+    fn call_def(&self, f: ExprId) -> Option<DefId> {
+        let f = unparen(self.ast, f);
+        if !matches!(self.ast.expr(f).kind, ExprKind::Path(_)) { return None; }
+        match self.body.res.get(&f.0).copied() { Some(Res::Def(d)) => Some(d), _ => None }
+    }
+
+    /// `useless_check`: the message when `e` is a pointer made from something never null.
+    fn useless_null_check(&self, e: ExprId) -> Option<String> {
+        let ast = self.ast;
+        let mut e = e;
+        let mut cast = false;
+        loop {
+            e = peel_blocks(ast, e);
+            match ast.expr(e).kind {
+                ExprKind::MethodCall(_, row) if ast.list(ast.row(row).args).is_empty() => {
+                    if let Some(m) = self.body.methods.get(&e.0) {
+                        if has_def_attr(self.prog, m.def, "rustc_never_returns_null_ptr") {
+                            let n = self.prog.syms.str(self.prog.def(m.def).name);
+                            return Some(format!("returned pointer of `{}` call is never null, so checking it for null will always return false", n));
+                        }
+                    }
+                }
+                ExprKind::Call(f, _) => {
+                    if let Some(d) = self.call_def(f) {
+                        if has_def_attr(self.prog, d, "rustc_never_returns_null_ptr") {
+                            let n = self.prog.syms.str(self.prog.def(d).name);
+                            return Some(format!("returned pointer of `{}` call is never null, so checking it for null will always return false", n));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            let next = match ast.expr(e).kind {
+                ExprKind::Cast(x, t) if matches!(ast.ty(t), Ty::Ptr(..)) => Some(x),
+                ExprKind::MethodCall(x, row) if ast.list(ast.row(row).args).is_empty()
+                    && self.body.methods.get(&e.0).and_then(|m| diag_name(self.prog, m.def)).is_some_and(|n| n == "ptr_cast" || n == "ptr_cast_mut" || n == "const_ptr_cast") => Some(x),
+                _ => None,
+            };
+            match next {
+                Some(x) => { cast = true; e = x; }
+                None => {
+                    if !cast { return None; }
+                    let t = self.expr_ty(e)?;
+                    return match self.kind(t) {
+                        TyKind::FnDef(..) | TyKind::FnPtr(..) => Some("function pointers are not nullable, so checking them for null will always return false".into()),
+                        TyKind::Ref(..) => Some("references are not nullable, so checking them for null will always return false".into()),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    }
+
+    /// `is_null_ptr`: a null pointer constant behind casts and bindings.
+    fn is_null_ptr_arg(&self, e: ExprId) -> bool {
+        let e = self.peel_casts(e);
+        match self.ast.expr(e).kind {
+            ExprKind::Call(f, args) if self.ast.list(args).is_empty() =>
+                self.call_def(f).and_then(|d| diag_name(self.prog, d)).is_some_and(|n| n == "ptr_null" || n == "ptr_null_mut"),
+            ExprKind::Lit(LitKind::Int) => {
+                let x = self.ast.expr(e);
+                let t = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(x.lo, x.hi)).unwrap_or("");
+                crate::const_fold::parse_int_lit(t) == Some(0)
+            }
+            _ => false,
+        }
+    }
+
+    fn lint_ptr_nulls(&self, e: ExprId) {
+        let ast = self.ast;
+        let pos = ast.expr(e).lo;
+        let is_null_fn = |d: DefId| matches!(diag_name(self.prog, d).as_deref(), Some("ptr_const_is_null" | "ptr_is_null"));
+        match ast.expr(e).kind {
+            ExprKind::Call(f, args) => {
+                let Some(d) = self.call_def(f) else { return };
+                let a = ast.list(args);
+                if a.len() == 1 && is_null_fn(d) {
+                    if let Some(msg) = self.useless_null_check(a[0]) { self.emit(&USELESS_PTR_NULL_CHECKS, pos, &msg); return; }
+                }
+                let Some(name) = diag_name(self.prog, d) else { return };
+                let (idx, zsts): (&[usize], bool) = match name.as_str() {
+                    "ptr_read" | "ptr_read_unaligned" | "ptr_replace" | "ptr_write" | "ptr_write_bytes" | "ptr_write_unaligned" => (&[0], true),
+                    "slice_from_raw_parts" | "slice_from_raw_parts_mut" => (&[0], false),
+                    "ptr_copy" | "ptr_copy_nonoverlapping" | "ptr_swap" | "ptr_swap_nonoverlapping" => (&[0, 1], true),
+                    _ => return,
+                };
+                for &i in idx {
+                    let Some(&arg) = a.get(i) else { continue };
+                    if !self.is_null_ptr_arg(arg) { continue; }
+                    let Some(t) = self.expr_ty(arg) else { continue };
+                    let TyKind::Ptr(_, pointee) = self.kind(t) else { continue };
+                    if zsts && self.layout_1zst(pointee, 0) == Some(true) { break; }
+                    self.emit(&INVALID_NULL_ARGUMENTS, pos, "calling this function with a null pointer is undefined behavior, even if the result of the function is unused");
+                }
+            }
+            ExprKind::MethodCall(r, _) => {
+                let Some(m) = self.body.methods.get(&e.0) else { return };
+                if is_null_fn(m.def) {
+                    if let Some(msg) = self.useless_null_check(r) { self.emit(&USELESS_PTR_NULL_CHECKS, pos, &msg); }
+                }
+            }
+            ExprKind::Binary(BinOp::Eq, l, r) => {
+                let (to_check, msg) = if let Some(m) = self.useless_null_check(l) { (r, m) } else if let Some(m) = self.useless_null_check(r) { (l, m) } else { return };
+                let tc = peel_blocks(ast, to_check);
+                match ast.expr(tc).kind {
+                    ExprKind::Cast(x, _) => {
+                        let x = unparen(ast, x);
+                        if let ExprKind::Lit(LitKind::Int) = ast.expr(x).kind {
+                            let xe = ast.expr(x);
+                            let t = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(xe.lo, xe.hi)).unwrap_or("");
+                            if crate::const_fold::parse_int_lit(t) == Some(0) { self.emit(&USELESS_PTR_NULL_CHECKS, pos, &msg); }
+                        }
+                    }
+                    ExprKind::Call(f, args) if ast.list(args).is_empty() => {
+                        if self.call_def(f).and_then(|d| diag_name(self.prog, d)).is_some_and(|n| n == "ptr_null" || n == "ptr_null_mut") {
+                            self.emit(&USELESS_PTR_NULL_CHECKS, pos, &msg);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 }

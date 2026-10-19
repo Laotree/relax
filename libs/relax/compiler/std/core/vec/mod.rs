@@ -227,11 +227,13 @@ impl<T> Vec<T> {
     }
 
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }
 
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self.ptr.as_ptr()
     }

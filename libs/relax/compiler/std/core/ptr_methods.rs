@@ -8,6 +8,7 @@ use crate::intrinsics_mem as im;
 
 #[cfg(not(relax_check))]
 impl<T: crate::marker::PointeeSized> *const T {
+    #[rustc_diagnostic_item = "ptr_const_is_null"]
     pub const fn is_null(self) -> bool {
         (self as *const u8 as usize) == 0
     }
@@ -138,6 +139,7 @@ impl<T> *const [T] {
 
 #[cfg(not(relax_check))]
 impl<T: crate::marker::PointeeSized> *mut T {
+    #[rustc_diagnostic_item = "ptr_is_null"]
     pub const fn is_null(self) -> bool {
         (self as *const u8 as usize) == 0
     }

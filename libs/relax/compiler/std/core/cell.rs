@@ -23,6 +23,7 @@ impl<T> UnsafeCell<T> {
 
 impl<T: ?Sized> UnsafeCell<T> {
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn get(&self) -> *mut T {
         &self.value as *const T as *mut T
     }
@@ -102,6 +103,7 @@ impl<T: Copy> Cell<T> {
 
 impl<T: ?Sized> Cell<T> {
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *mut T {
         self.value.get()
     }
@@ -282,6 +284,7 @@ impl<T: ?Sized> RefCell<T> {
             Ok(RefMut { value: unsafe { &mut *self.value.get() }, borrow: &self.borrow })
         }
     }
+    #[rustc_never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *mut T {
         self.value.get()
     }

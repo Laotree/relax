@@ -240,6 +240,7 @@ impl<T: Clone> Rc<T> {
 }
 
 impl<T: ?Sized> Rc<T> {
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(this: &Rc<T>) -> *const T {
         this.ptr.as_ptr() as *const T
     }
@@ -561,6 +562,7 @@ impl<T: ?Sized> Weak<T> {
         self.ptr.as_ptr() as *const u8 == other.ptr.as_ptr() as *const u8
     }
 
+    #[rustc_never_returns_null_ptr]
     pub fn as_ptr(&self) -> *const T {
         self.ptr.as_ptr() as *const T
     }

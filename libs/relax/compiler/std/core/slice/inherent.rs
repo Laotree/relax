@@ -130,10 +130,12 @@ impl<T> [T] {
         &mut *index.get_unchecked_mut(self)
     }
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_ptr(&self) -> *const T {
         self as *const [T] as *const T
     }
     #[rustc_as_ptr]
+    #[rustc_never_returns_null_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut [T] as *mut T
     }
