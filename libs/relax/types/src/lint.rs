@@ -637,3 +637,27 @@ pub fn generated(prog: &Program, d: DefId) -> bool {
     }
     false
 }
+
+/// `#[rustc_diagnostic_item = "name"]` of a definition.
+pub fn diagnostic_item(prog: &Program, d: DefId) -> Option<String> {
+    let def = prog.def(d);
+    if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Fn | DefKind::AssocFn | DefKind::TypeAlias) { return None; }
+    let ast = &prog.files[def.file as usize].ast;
+    let p = prog.src(def.file);
+    for a in ast.list(ast.item(def.item).attrs) {
+        if attr_path(prog, def.file, a) != b"rustc_diagnostic_item" { continue; }
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        let mut i = lo;
+        while i < hi && crate::cfg::tok_str(p, i) != b"=" { i += 1; }
+        if i + 1 < hi {
+            let t = crate::cfg::tok_str(p, i + 1);
+            return Some(String::from_utf8_lossy(t).trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Whether `d` is the standard library item with diagnostic name `name` (`Box`, `PhantomData`).
+pub fn is_diagnostic_item(prog: &Program, d: DefId, name: &str) -> bool {
+    prog.name(d) == name && diagnostic_item(prog, d).as_deref() == Some(name)
+}

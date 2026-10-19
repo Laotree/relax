@@ -477,7 +477,7 @@ impl<'a> BodyRefs<'a> {
         for _ in 0..derefs {
             match *self.tcx.tys.kind(t) {
                 TyKind::Ref(_, x, _) => t = x,
-                TyKind::Adt(d, args, _) if self.prog.name(d) == "Box" => t = *self.tcx.tys.list(args).first()?,
+                TyKind::Adt(d, args, _) if lint::is_diagnostic_item(self.prog, d, "Box") => t = *self.tcx.tys.list(args).first()?,
                 _ => return None,
             }
         }
@@ -1345,7 +1345,7 @@ impl<'a, 'b> Reporter<'a, 'b> {
             TyKind::Tuple(l) => tcx.tys.list(l).iter().all(|&x| self.is_zst(x, depth + 1)),
             TyKind::Array(x, _) => self.is_zst(x, depth + 1),
             TyKind::Adt(d, args, _) => {
-                if self.s.prog.name(d) == "PhantomData" { return true; }
+                if lint::is_diagnostic_item(self.s.prog, d, "PhantomData") { return true; }
                 let Some(a) = tcx.adts.get(&d) else { return false };
                 if a.is_enum || a.is_union || a.variants.len() != 1 { return false; }
                 let args: Vec<_> = tcx.tys.list(args).to_vec();
@@ -1363,7 +1363,7 @@ impl<'a, 'b> Reporter<'a, 'b> {
         let Some(a) = self.s.tcx.adts.get(&adt) else { return false };
         let f = &a.variants[vi as usize].fields[i as usize];
         // PhantomData fields; positional zero-sized fields
-        if let TyKind::Adt(d, ..) = *self.s.tcx.tys.kind(f.ty) { if self.s.prog.name(d) == "PhantomData" { return false; } }
+        if let TyKind::Adt(d, ..) = *self.s.tcx.tys.kind(f.ty) { if lint::is_diagnostic_item(self.s.prog, d, "PhantomData") { return false; } }
         let positional = a.variants[vi as usize].shape == 1;
         if positional && self.is_zst(f.ty, 0) { return false; }
         true

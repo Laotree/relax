@@ -373,24 +373,7 @@ impl<'a> Late<'a> {
 // ---------------------------------------------------------------- expression passes
 
 impl<'a> Late<'a> {
-    /// `#[rustc_diagnostic_item = "name"]` of a definition.
-    fn diag_item(&self, d: DefId) -> Option<String> {
-        let def = self.prog.def(d);
-        if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Fn | DefKind::AssocFn | DefKind::TypeAlias) { return None; }
-        let ast = &self.prog.files[def.file as usize].ast;
-        let p = self.prog.src(def.file);
-        for a in ast.list(ast.item(def.item).attrs) {
-            if lint::attr_path(self.prog, def.file, a) != b"rustc_diagnostic_item" { continue; }
-            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            let mut i = lo;
-            while i < hi && crate::cfg::tok_str(p, i) != b"=" { i += 1; }
-            if i + 1 < hi {
-                let t = crate::cfg::tok_str(p, i + 1);
-                return Some(String::from_utf8_lossy(t).trim_matches('"').to_string());
-            }
-        }
-        None
-    }
+    fn diag_item(&self, d: DefId) -> Option<String> { lint::diagnostic_item(self.prog, d) }
 
     /// The definition a path expression resolves to.
     fn path_def(&self, e: ExprId) -> Option<DefId> {
