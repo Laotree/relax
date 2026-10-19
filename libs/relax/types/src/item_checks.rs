@@ -758,18 +758,18 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
 /// rustc_resolve late.rs: an associated constant of an impl whose header names an anonymous
 /// lifetime (`impl Foo<'_>`) with an elided `&` in its type -- the elided lifetime means
 /// `'static` there (lint `elided_lifetimes_in_associated_constant`).
-pub fn assoc_const_elision(prog: &Program, d: DefId) {
+pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
     use crate::ast::{GenericArg, GenericArgs, ItemKind, Ty};
-    if !crate::lint::enabled() { return; }
+    if !crate::lint::enabled() { return Vec::new(); }
     let def = prog.def(d);
-    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return; }
+    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return Vec::new(); }
     let ast = &prog.files[def.file as usize].ast;
     let pf = &prog.files[def.file as usize];
-    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return };
-    let Some(ty) = oty.get() else { return };
+    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return Vec::new() };
+    let Some(ty) = oty.get() else { return Vec::new() };
     let imp = prog.def(def.parent);
     let iast = &prog.files[imp.file as usize].ast;
-    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return };
+    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return Vec::new() };
     // an anonymous lifetime written in a type
     fn anon<'t>(ast: &crate::ast::Ast, text: &dyn Fn(crate::ast::Ident) -> &'t str, t: crate::ast::TyId, refs_too: bool, depth: u32) -> bool {
         if depth > 16 { return false; }
@@ -800,7 +800,12 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) {
         }));
     if header && anon(ast, &ctext, ty, true, 0) {
         crate::lint::emit(prog, d, &crate::lint::ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT, def.file, ast.item(def.item).lo, "`&` without an explicit lifetime name cannot be used here");
+        // the elided lifetime is a parameter of the impl's constant, which the trait's does not have
+        if im.trait_.is_some() {
+            return vec![prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0195: lifetime parameters or bounds on associated constant `{}` do not match the trait declaration", prog.name(d)))];
+        }
     }
+    Vec::new()
 }
 
 /// rustc_attr_parsing `AllowedTargets::AllowList`: the targets a builtin attribute may be written

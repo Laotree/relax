@@ -1555,7 +1555,7 @@ impl Tcx {
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
             errors.extend(crate::item_checks::repr_checks(prog, self, did));
-            crate::item_checks::assoc_const_elision(prog, did);
+            errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
