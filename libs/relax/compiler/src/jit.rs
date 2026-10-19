@@ -7585,6 +7585,9 @@ fn baseline_rir(options: &crate::options::Options, func: &mut crate::rir::Func, 
 fn tier0_codegen_rir<'a>(options: &crate::options::Options, rir: &'a crate::rir::Func, fold: bool, rotate: bool) -> std::borrow::Cow<'a, crate::rir::Func> {
     if rir.baseline { return std::borrow::Cow::Borrowed(rir); }
     let mut cg = rir.clone();
+    // field promotion belongs to the code made from the RIR, not to the RIR callers inline: it
+    // makes a function bigger, and the inliner reads sizes
+    if fold && !crate::opt::opt_off(options, "-promote") { crate::opt::promote_loop_memory(&mut cg); }
     if fold { crate::opt::addr_modes(&mut cg); }
     if rotate && layout_for(options, &cg.name) { crate::opt::rotate_loops(&mut cg); }
     std::borrow::Cow::Owned(cg)
@@ -7685,7 +7688,7 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 verify_pass(func, "simplify");
             }
             let t = crate::opt::pass_clock();
-            let l = cfg.licm && (crate::opt::licm(func) | (!crate::opt::opt_off(options, "-promote") && crate::opt::promote_loop_memory(func)));
+            let l = cfg.licm && crate::opt::licm(func);
             crate::opt::pass_time(10, t);
             verify_pass(func, "licm");
             if l {
@@ -7703,7 +7706,7 @@ fn opt_pipeline_inner(options: &crate::options::Options, func: &mut crate::rir::
                 crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
             }
-            if cfg.licm && (crate::opt::licm(func) | (!crate::opt::opt_off(options, "-promote") && crate::opt::promote_loop_memory(func))) {
+            if cfg.licm && crate::opt::licm(func) {
                 verify_pass(func, "licm");
                 crate::opt::simplify(options, func, ro, cfg.imm, cfg.cse);
                 verify_pass(func, "simplify");
@@ -8697,6 +8700,9 @@ fn tier1_optimize(options: &crate::options::Options, func: &mut crate::rir::Func
         verify_pass(func, "vector slot cleanup");
     }
     crate::opt::compact_slots(func);
+    if cfg.licm && !crate::opt::opt_off(options, "-promote") && crate::opt::promote_loop_memory(func) {
+        verify_pass(func, "promote_loop_memory");
+    }
     if cfg.layout && layout_for(options, name) {
         crate::opt::rotate_loops(func);
     }

@@ -6948,6 +6948,10 @@ pub fn licm(f: &mut Func) -> bool {
 /// * the field is dereferenceable in the preheader (`Func::deref`), so loading it there is safe
 ///   even if the loop runs no iteration; the write-back on a path that never stored writes the
 ///   value it loaded, which no one can observe through a unique pointer.
+/// Most fields promoted in one loop, and most exit write-back stores (exit targets x stored fields).
+const PROMOTE_MAX_FIELDS: usize = 4;
+const PROMOTE_MAX_WRITEBACKS: usize = 8;
+
 pub fn promote_loop_memory(f: &mut Func) -> bool {
     if forward_only(f) || f.noalias.is_empty() {
         return false;
@@ -7063,7 +7067,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             continue;
         }
         // the accesses through p in the loop, and whether anything else based on p is used there
-        let mut fields: Vec<(i32, Mem, bool, bool)> = Vec::new(); // offset, type, loaded, stored
+        let mut fields: Vec<(i32, Mem, bool, bool, u32)> = Vec::new(); // offset, type, loaded, stored, accesses
         let mut bad = false;
         for bi in 0..n {
             if !body[bi] {
@@ -7073,14 +7077,20 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                 match i {
                     Inst::Load(m, _, base, off) if *base == p => {
                         match fields.iter_mut().find(|x| x.0 == *off && x.1 == *m) {
-                            Some(x) => x.2 = true,
-                            None => fields.push((*off, *m, true, false)),
+                            Some(x) => {
+                                x.2 = true;
+                                x.4 += 1;
+                            }
+                            None => fields.push((*off, *m, true, false, 1)),
                         }
                     }
                     Inst::Store(m, base, off, _) if *base == p => {
                         match fields.iter_mut().find(|x| x.0 == *off && x.1 == *m) {
-                            Some(x) => x.3 = true,
-                            None => fields.push((*off, *m, false, true)),
+                            Some(x) => {
+                                x.3 = true;
+                                x.4 += 1;
+                            }
+                            None => fields.push((*off, *m, false, true, 1)),
                         }
                     }
                     Inst::Call(_, args, _) => bad |= args.iter().any(|a| based[a.0 as usize]),
@@ -7096,7 +7106,7 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
         }
         // a field is promoted when nothing else in the loop overlaps its bytes
         let size = |m: Mem| mem_size(m);
-        let mut take: Vec<(i32, Mem, bool, bool)> = Vec::new();
+        let mut take: Vec<(i32, Mem, bool, bool, u32)> = Vec::new();
         for x in &fields {
             let clash = fields.iter().any(|y| !(y.0 == x.0 && y.1 == x.1) && y.0 < x.0 + size(x.1) && x.0 < y.0 + size(y.1));
             if clash || (x.3 && has_call) {
@@ -7108,6 +7118,35 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
             }
             take.push(*x);
         }
+        // profitability: a loop is worth it for a field it both loads and stores (the carried state:
+        // a cursor index, a bit buffer); load-only fields come along, write-only ones are left
+        if !take.iter().any(|x| x.2 && x.3) {
+            continue;
+        }
+        take.retain(|x| x.2);
+        // the busiest few fields only (every promoted field is a register held across
+        // the loop), and stored fields only when the write-backs on the loop's exits stay few
+        take.sort_by(|a, b| b.4.cmp(&a.4));
+        take.truncate(PROMOTE_MAX_FIELDS);
+        let mut exit_targets: Vec<u32> = Vec::new();
+        for bi in 0..n {
+            if body[bi] {
+                for t in f.blocks[bi].term.succs() {
+                    if !body[t as usize] && !exit_targets.contains(&t) {
+                        exit_targets.push(t);
+                    }
+                }
+            }
+        }
+        let mut stored_n = 0;
+        take.retain(|x| {
+            if x.3 {
+                stored_n += 1;
+                exit_targets.len() * stored_n <= PROMOTE_MAX_WRITEBACKS
+            } else {
+                true
+            }
+        });
         if take.is_empty() {
             continue;
         }
@@ -7154,27 +7193,20 @@ fn promote_in_loop(f: &mut Func, preds: &[Vec<u32>], h: u32, body: &[bool]) -> b
                 }
             }
         }
-        // write-back of the stored fields on every edge out of the loop
+        // write-back of the stored fields on every edge out of the loop: one block per distinct
+        // target (LoopSimplify's dedicated exits), the loop's edges to it redirected
         let stored: Vec<usize> = (0..take.len()).filter(|t| take[*t].3).collect();
         if !stored.is_empty() {
-            for bi in 0..n {
-                if !body[bi] {
-                    continue;
-                }
-                let succs: Vec<u32> = f.blocks[bi].term.succs().collect();
-                for t in succs {
-                    if body[t as usize] {
-                        continue;
+            for &t in &exit_targets {
+                let x = f.blocks.len() as u32;
+                let tp = f.blocks.iter().enumerate().find(|(bi, b)| body[*bi] && b.term.succs().any(|s| s == t)).map(|(_, b)| b.term_pos).unwrap_or(0);
+                let ins: Vec<Inst> = stored.iter().map(|&k| Inst::Store(take[k].1, p, take[k].0, regs[k])).collect();
+                let np = ins.len();
+                f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp });
+                for bi in 0..n {
+                    if body[bi] {
+                        retarget(&mut f.blocks[bi].term, t, x);
                     }
-                    let x = f.blocks.len() as u32;
-                    let tp = f.blocks[bi].term_pos;
-                    let mut ins = Vec::new();
-                    for &k in &stored {
-                        ins.push(Inst::Store(take[k].1, p, take[k].0, regs[k]));
-                    }
-                    let np = ins.len();
-                    f.blocks.push(Block { insts: ins, pos: vec![tp; np], term: Term::Jump(t), term_pos: tp });
-                    retarget(&mut f.blocks[bi].term, t, x);
                 }
             }
         }
