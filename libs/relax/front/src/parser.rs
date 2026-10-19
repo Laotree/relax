@@ -77,6 +77,8 @@ pub struct Parser<'a> {
     /// opaque macro fragments a transcription forwarded (start of the first token -> end of the
     /// last): a `$t:tt` matches one whole (rustc's interpolated nonterminal tokens)
     pub frag_groups: crate::fxhash::HashMap<u32, u32>,
+    /// starts of the `$t:ty` substitutions of expansion text (not a trait where a bound is expected)
+    ty_frags: crate::fxhash::HashSet<u32>,
     /// file context for built-in macros (file!, module_path!, env!, cfg of derive inputs)
     pub bctx: Option<std::rc::Rc<crate::builtins::FileCtx>>,
     /// names of the inline `mod x { }` blocks being parsed (module_path!)
@@ -140,6 +142,7 @@ impl<'a> Parser<'a> {
             body_origin: Default::default(),
             tok_undo: Vec::new(),
             frag_groups: Default::default(),
+            ty_frags: Default::default(),
             bctx: None,
             mod_stack: Vec::new(),
             interp: Default::default(),
@@ -849,6 +852,18 @@ impl<'a> Parser<'a> {
     fn cfg_entry(&self, i: &mut usize, end: usize) -> Result<(), String> {
         let k = if *i < end { self.toks.at(*i).kind } else { T::Eof };
         match k {
+            // an `$e:expr` fragment is substituted in parentheses (an interpolated expression is one
+            // meta item to rustc); such a paren pair only exists in macro expansion text
+            T::OpenParen if (self.toks.at(*i).lo as usize) >= self.src.len() => {
+                *i += 1;
+                self.cfg_entry(i, end)?;
+                if *i < end && self.toks.at(*i).kind == T::CloseParen {
+                    *i += 1;
+                    Ok(())
+                } else {
+                    Err("expected `)`".into())
+                }
+            }
             T::KwTrue | T::KwFalse => {
                 *i += 1;
                 Ok(())
@@ -1247,7 +1262,10 @@ impl<'a> Parser<'a> {
             self.tok_origin.push((base + off, o, n));
         }
         for (a, b) in groups {
-            self.frag_groups.insert(base + a, base + b);
+            if b & crate::macros::TY_FRAG != 0 {
+                self.ty_frags.insert(base + a);
+            }
+            self.frag_groups.insert(base + a, base + (b & !crate::macros::TY_FRAG));
         }
         let here = self.bctx.as_ref().map(|c| c.path.as_str()).unwrap_or("");
         let same_file = !def.def_file.is_empty() && def.def_file == here;
@@ -1419,8 +1437,12 @@ impl<'a> Parser<'a> {
             Some(mut v) => {
                 let had_semi = self.pos > 0 && self.toks.at(self.pos - 1).kind == T::Semi;
                 if had_semi {
-                    if let Some(Stmt::Expr(_, semi)) = v.last_mut() {
-                        *semi = true;
+                    match v.last_mut() {
+                        Some(Stmt::Expr(_, semi)) => *semi = true,
+                        // rustc_expand `flat_map_stmt`: a call with a trailing `;` that expands to
+                        // nothing leaves an empty statement (a block's tail stays what it was)
+                        None => v.push(Stmt::Empty),
+                        _ => {}
                     }
                 }
                 stmts.extend(v);
@@ -2622,6 +2644,9 @@ impl<'a> Parser<'a> {
         let async_ = self.eat(T::KwAsync);
         let maybe = self.eat(T::Question);
         let hrtb = self.hrtb()?;
+        if !self.ty_frags.is_empty() && self.ty_frags.contains(&{ self.tok().lo }) {
+            return self.err("expected a trait, found type");
+        }
         let path = self.path(false)?;
         if paren {
             self.expect(T::CloseParen)?;
