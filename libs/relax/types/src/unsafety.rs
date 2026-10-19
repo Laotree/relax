@@ -331,7 +331,18 @@ impl V<'_> {
                     while let TyKind::Ref(_, p, _) = self.tcx.tys.kind(t) { t = *p; }
                     self.call_hi = self.ast.expr(e).hi;
                     match *self.tcx.tys.kind(t) {
-                        TyKind::FnDef(d, _, _) => self.call_def(lo, d),
+                        TyKind::FnDef(d, args, _) => {
+                            self.call_def(lo, d);
+                            // intrinsicck: both sides of a transmute have one size
+                            if crate::transmute::is_transmute(self.prog, d) {
+                                if let [from, to] = self.tcx.tys.list(args) {
+                                    let env = crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(self.prog, self.body.def), param_env: self.body.param_env.unwrap_or_default(), mode: crate::tcx::TypingMode::PostAnalysis };
+                                    if let Some(msg) = crate::transmute::check_transmute(self.prog, self.tcx, env, *from, *to) {
+                                        self.errors.push(self.prog.record_error(self.body.file, lo, "typeck", msg));
+                                    }
+                                }
+                            }
+                        }
                         TyKind::FnPtr(_, _, h, _) if h.safety == Safety::Unsafe => self.requires_unsafe(lo, Op::CallToUnsafeFunction(None)),
                         _ => {}
                     }
