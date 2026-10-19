@@ -1201,6 +1201,8 @@ impl<'a> Fcx<'a> {
         let (a, d) = self.unsize_pointee_pair(ka, kx, true)?;
         let (a, d) = (self.shallow(a), self.shallow(d));
         if a == d || !matches!(self.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
+        // the same object type up to lifetimes is subtyping, not an upcast
+        if self.tcx.tys.erase_regions(a) == self.tcx.tys.erase_regions(d) { return None; }
         let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
         self.select_trait(unsize, a, &[d]).ok()?;
         Some((a, d))
