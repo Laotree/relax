@@ -24,7 +24,7 @@ enum Op {
     AscribeSkipWf(TyId, TyId, Span),
     Opaque(TyId, V, TyId),
 }
-struct Fake<'t> {
+pub(crate) struct Fake<'t> {
     tcx: &'t Tcx,
     universe: UniverseIndex,
     /// Region vids 0..first_var are the renumbered body's; later ones are allocated here.
@@ -46,11 +46,15 @@ struct Fake<'t> {
     /// The declared field types of whatever ADT/closure is projected or aggregated.
     fields: Vec<TyId>,
     installed: Option<(UniversalRegions, Vec<(TyId, RegionId)>)>,
+    /// The opaque type storage of the body's inference context, and what the producer would answer.
+    opaques: Vec<(crate::infer::opaque_types::OpaqueTypeKey, crate::infer::opaque_types::ProvisionalHiddenType)>,
+    non_defining: Vec<crate::infer::opaque_types::OpaqueTypeKey>,
+    equated: Vec<(TyId, TyId)>,
 }
 impl<'t> Fake<'t> {
-    fn new(tcx: &'t Tcx, first_var: usize) -> Self {
+    pub(crate) fn new(tcx: &'t Tcx, first_var: usize) -> Self {
         Self { tcx, universe: UniverseIndex::ROOT, regions: vec![(Origin::Existential, UniverseIndex::ROOT); first_var],
-            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), fields: vec![], installed: None }
+            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![], implied: Default::default(), fields: vec![], installed: None, opaques: vec![], non_defining: vec![], equated: vec![] }
     }
 }
 impl liveness::LivenessOps for Fake<'_> {
@@ -64,6 +68,18 @@ impl liveness::LivenessOps for Fake<'_> {
     fn push_region_constraints(&mut self, _: &mut MirTypeckRegionConstraints, l: Locations, _: Cat, _: &crate::next_solver::type_op::QueryRegionConstraints) {
         self.pushed.push(l);
     }
+}
+impl super::region_infer::opaque_types::OpaqueOps for Fake<'_> {
+    fn has_opaque_types_in_storage(&mut self) -> bool { !self.opaques.is_empty() }
+    fn opaque_storage_entries(&mut self) -> crate::infer::opaque_types::OpaqueTypeStorageEntries { Default::default() }
+    fn clone_opaque_types(&mut self) -> Vec<(crate::infer::opaque_types::OpaqueTypeKey, crate::infer::opaque_types::ProvisionalHiddenType)> { self.opaques.clone() }
+    fn opaque_types_added_since(&mut self, _: crate::infer::opaque_types::OpaqueTypeStorageEntries) -> Vec<(crate::infer::opaque_types::OpaqueTypeKey, crate::infer::opaque_types::ProvisionalHiddenType)> { vec![] }
+    fn resolve_vars_if_possible(&mut self, ty: TyId) -> TyId { ty }
+    fn opaque_type_has_defining_use_args(&mut self, key: &crate::infer::opaque_types::OpaqueTypeKey) -> Result<(), super::region_infer::opaque_types::NonDefiningUseReason> {
+        if self.non_defining.contains(key) { Err(super::region_infer::opaque_types::NonDefiningUseReason::NotAParam { opaque_type_key: key.clone(), param_index: 0 }) } else { Ok(()) }
+    }
+    fn remap_generic_params_to_declaration_params(&mut self, _: &crate::infer::opaque_types::OpaqueTypeKey, ty: TyId) -> TyId { ty }
+    fn equate_hidden_types(&mut self, _: &mut MirTypeckRegionConstraints, actual: TyId, expected: TyId) -> Result<(), ()> { self.equated.push((actual, expected)); Ok(()) }
 }
 impl super::mir_nll::RegionDriverOps for Fake<'_> {
     fn num_region_vars(&self) -> usize { self.regions.len() }
