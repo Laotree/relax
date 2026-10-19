@@ -14,7 +14,7 @@ pub enum Node {
     Synthetic(u32, Synthetic),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, WhileElse, WhileElseBlock, WhileBreak, WhileBreakExpr, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
+pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, TryFromResidual, WhileElse, WhileElseBlock, WhileBreak, WhileBreakExpr, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeData { Node, CallSite, Arguments, Destruction, IfThen, IfThenRescope, MatchGuard, Remainder(u32) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -271,6 +271,9 @@ impl Resolve<'_> {
                 let cx = self.cx;
                 self.node(Node::Synthetic(e.0, Synthetic::TryBranch), false);
                 self.expr(x, false);
+                self.cx = cx;
+                // `return FromResidual::from_residual(residual)` of the break arm
+                self.node(Node::Synthetic(e.0, Synthetic::TryFromResidual), false);
                 self.cx = cx;
             }
             ExprKind::Call(f, args) => { self.expr(f, false); for x in ast.list(args) { self.expr(*x, false); } }

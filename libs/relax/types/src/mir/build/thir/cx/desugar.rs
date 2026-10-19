@@ -242,6 +242,8 @@ impl Cx<'_> {
         let from_ret = self.method_output(from_def, tcx.tys.list(from_args), span)?;
         let from_fun = self.push(self.mk(e, ExprKind::ZstLiteral { user_ty: None }, from_ty));
         let from_call = self.push(self.mk(e, ExprKind::Call { ty: from_ty, fun: from_fun, args: Box::new([residual]), from_hir_call: true, fn_span: span }, from_ret));
+        let from_scope = self.synthetic_scope(e, Synthetic::TryFromResidual, ScopeData::Node, span)?;
+        let from_call = self.scope_wrap(e, from_scope, from_call);
         let ret = self.push(self.mk(e, ExprKind::Return { value: Some(from_call) }, never));
         let ret_any = self.push(self.mk(e, ExprKind::NeverToAny { source: ret }, expr_ty));
         let break_arm = self.thir.alloc_arm(Arm { pattern: Box::new(break_pat), guard: None, body: ret_any, node: e.0, scope, span });
