@@ -48,6 +48,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
             w.block(block);
             known_panics(prog, tcx, body, Some(block), None, &params);
             crate::lint_late2::check_body(prog, tcx, body, Some(block), None);
+            crate::lint_recursion::check(prog, tcx, body, block);
         }
         ItemKind::Const(..) | ItemKind::Static(..) => {
             let Ok(Some(e)) = prog.const_body(body.file, d.item) else { return };

@@ -61,6 +61,7 @@ pub mod lint_dead;
 pub mod lint_imports;
 pub mod lint_late;
 pub mod lint_late2;
+pub mod lint_recursion;
 pub mod item_checks;
 pub mod feature_gate;
 pub mod transmute;
