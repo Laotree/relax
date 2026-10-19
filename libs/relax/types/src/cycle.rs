@@ -32,11 +32,15 @@ impl Drop for Guard {
 
 /// Enters the computation; Err when it is already in progress on this thread (a cycle).
 pub fn enter(kind: Kind, a: u32, b: u32) -> Result<Guard, ()> {
-    ACTIVE.with(|v| {
+    // (a thread being torn down compiles with its TLS gone: no guard then)
+    match ACTIVE.try_with(|v| {
         let mut v = v.borrow_mut();
         let key = (kind as u8, a, b);
         if v.contains(&key) { return Err(()); }
         v.push(key);
         Ok(Guard { kind: key.0, a, b })
-    })
+    }) {
+        Ok(r) => r,
+        Err(_) => Ok(Guard { kind: 0, a: 0, b: 0 }),
+    }
 }

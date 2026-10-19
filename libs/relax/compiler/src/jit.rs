@@ -1140,7 +1140,7 @@ pub(crate) unsafe fn fault_policy(label: &str, info: &PanicInfo) -> bool {
     // a fault while a constant is evaluated (a null or dangling dereference, a stack overflow
     // from unbounded recursion, an abort): the evaluation fails, which rustc reports as E0080
     // (the interpreter rejects the same accesses); the initializer's caller reports it
-    if CONST_EVAL_DEPTH.with(|g| g.get()) > 0 {
+    if CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) > 0 {
         return false;
     }
     // a guarded run-time module call (std::relax::guard): the fault is contained to the call
@@ -1510,7 +1510,7 @@ thread_local! {
 /// as `long_running_const_eval` after LINT_TERMINATOR_LIMIT of them.
 pub(crate) fn const_fuel_tick() {
     if !in_const_eval() { return; }
-    let n = CONST_FUEL.with(|c| { c.set(c.get() + 1); c.get() });
+    let Ok(n) = CONST_FUEL.try_with(|c| { c.set(c.get() + 1); c.get() }) else { return };
     if n == LINT_TERMINATOR_LIMIT {
         leave_thread("panic", LONG_RUNNING_CONST_EVAL.to_string());
     }
@@ -1518,7 +1518,7 @@ pub(crate) fn const_fuel_tick() {
 
 /// A constant's initializer is being evaluated on this thread (run_init_code).
 pub(crate) fn in_const_eval() -> bool {
-    CONST_EVAL_DEPTH.with(|g| g.get()) > 0 && unsafe { *ctx_ptr() } != 0
+    CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) > 0 && unsafe { *ctx_ptr() } != 0
 }
 
 /// Ends the run of the calling thread's `call_jit_in` with the panic recorded for it already
@@ -3959,7 +3959,7 @@ impl Unit {
         }
         // a constant whose initializer needs its own value (directly or through other constants):
         // rustc's E0391 (the query cycle of const evaluation), not unbounded recursion
-        if CONST_STACK.with(|s| s.borrow().iter().any(|(sd, sa)| *sd == d && *sa == args)) {
+        if CONST_STACK.try_with(|s| s.borrow().iter().any(|(sd, sa)| *sd == d && *sa == args)).unwrap_or(false) {
             let def = self.prog.def(d);
             let at = self.pos_str(def.file, self.prog.files[def.file as usize].ast.item(def.item).lo);
             self.note_error(format!("{}: E0391: cycle detected when evaluating the initializer of `{}`", at, self.prog.def_path(d)));
@@ -3968,8 +3968,8 @@ impl Unit {
         }
         // (popped also when the evaluation unwinds: a cancelled request is retried)
         struct Pop;
-        impl Drop for Pop { fn drop(&mut self) { CONST_STACK.with(|s| { s.borrow_mut().pop(); }); } }
-        CONST_STACK.with(|s| s.borrow_mut().push((d, args.clone())));
+        impl Drop for Pop { fn drop(&mut self) { let _ = CONST_STACK.try_with(|s| { s.borrow_mut().pop(); }); } }
+        let _ = CONST_STACK.try_with(|s| s.borrow_mut().push((d, args.clone())));
         let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
         match evaluated {
             Some(a) => {
@@ -4185,10 +4185,10 @@ impl Unit {
             self.exec_note(id, crate::exec_profile::CALL);
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
-            if CONST_EVAL_DEPTH.with(|g| g.get()) == 0 { CONST_FUEL.with(|c| c.set(0)); }
+            if CONST_EVAL_DEPTH.try_with(|g| g.get()).unwrap_or(0) == 0 { let _ = CONST_FUEL.try_with(|c| c.set(0)); }
             struct Depth;
-            impl Drop for Depth { fn drop(&mut self) { CONST_EVAL_DEPTH.with(|g| g.set(g.get().saturating_sub(1))); } }
-            CONST_EVAL_DEPTH.with(|g| g.set(g.get() + 1));
+            impl Drop for Depth { fn drop(&mut self) { let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get().saturating_sub(1))); } }
+            let _ = CONST_EVAL_DEPTH.try_with(|g| g.set(g.get() + 1));
             r = { let _d = Depth; unsafe { call_jit(self as *mut Unit, entry, buf) } };
             compile_watch(None);
             // a compile the code reached was cancelled (a nested request blocked by an earlier

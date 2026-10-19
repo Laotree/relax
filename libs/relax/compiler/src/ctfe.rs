@@ -1233,12 +1233,12 @@ impl<'a> Ctx<'a> {
         // a constant that reads itself, directly or through others, is outside the subset (the
         // code path reports the cycle); each nested evaluation has a Ctx of its own, so
         // `depth` alone does not bound this recursion
-        if CONSTS_READING.with(|c| c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)) {
+        if CONSTS_READING.try_with(|c| c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)).unwrap_or(false) {
             return None;
         }
         struct Pop;
-        impl Drop for Pop { fn drop(&mut self) { CONSTS_READING.with(|c| { c.borrow_mut().pop(); }); } }
-        CONSTS_READING.with(|c| c.borrow_mut().push((d, args.clone())));
+        impl Drop for Pop { fn drop(&mut self) { let _ = CONSTS_READING.try_with(|c| { c.borrow_mut().pop(); }); } }
+        let _ = CONSTS_READING.try_with(|c| c.borrow_mut().push((d, args.clone())));
         self.depth += 1;
         let ok = { let _pop = Pop; eval_into(self.u, d, &args, buf) };
         self.depth -= 1;
