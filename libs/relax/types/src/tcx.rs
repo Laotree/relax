@@ -568,7 +568,7 @@ impl Tcx {
         let abi = match abi {
             None => Abi::Rust,
             Some(None) => Abi::C,
-            Some(Some(a)) => match Abi::from_name(prog.files[file as usize].text(a).trim_matches('"')) {
+            Some(Some(a)) => match Abi::from_name(&crate::lit::unescape_str(prog.files[file as usize].text(a))) {
                 Some(abi) => {
                     let target = &prog.session.options.target;
                     let arch = if target.is_empty() { std::env::consts::ARCH } else { target.split('-').next().unwrap() };
@@ -1489,7 +1489,7 @@ impl Tcx {
         Some(match file.ast.fn_sig(*sig).abi {
             None => Abi::Rust,
             Some(None) => Abi::C,
-            Some(Some(a)) => Abi::from_name(file.text(a).trim_matches('"')).unwrap_or(Abi::Rust),
+            Some(Some(a)) => Abi::from_name(&crate::lit::unescape_str(file.text(a))).unwrap_or(Abi::Rust),
         })
     }
 

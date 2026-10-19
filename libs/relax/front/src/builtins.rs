@@ -295,6 +295,7 @@ pub enum Builtin {
     OptionEnv,
     Stringify,
     Concat,
+    OffsetOf,
     IncludeStr,
     IncludeBytes,
     Include,
@@ -313,6 +314,7 @@ const TABLE: &[(&str, Builtin)] = &[
     ("option_env", Builtin::OptionEnv),
     ("stringify", Builtin::Stringify),
     ("concat", Builtin::Concat),
+    ("offset_of", Builtin::OffsetOf),
     ("include_str", Builtin::IncludeStr),
     ("include_bytes", Builtin::IncludeBytes),
     ("include", Builtin::Include),
@@ -776,6 +778,37 @@ fn include_input(p: &crate::parser::Parser, lo: usize, hi: usize, call_lo: u32) 
     Ok((path, data))
 }
 
+/// `offset_of!(Type, field.path)` (rustc_parse `parse_expr_offset_of`): the container type, then
+/// fields that are identifiers or integers written as `a.b` / `0.1` (a float token such as
+/// `0.1` is the two fields `0` and `1`: `parse_floating_field_access`; spacing is immaterial).
+/// The offset is that of a raw borrow of the field of an uninitialized value, in an inline const.
+fn offset_of_text(p: &crate::parser::Parser, lo: usize, hi: usize) -> Result<String, String> {
+    // the field path has no commas, the type may (`Foo<A, B>`): split at the last comma that
+    // is followed by the path
+    let parts = split_commas(&p.toks, lo, hi);
+    let Some(&(fa, fz)) = parts.last() else { return Err("offset_of! takes a type and a field path -- offset_of!(Type, field)".to_string()) };
+    if fa <= lo + 1 { return Err("offset_of! takes a type and a field path -- offset_of!(Type, field)".to_string()); }
+    let (ta, tz) = (lo, fa - 1);
+    let text = |i: usize| String::from_utf8_lossy(p.tok_text(p.toks.at(i))).into_owned();
+    let ty: Vec<String> = (ta..tz).map(text).collect();
+    let mut path = String::new();
+    for i in fa..fz {
+        match p.toks.at(i).kind {
+            T::Ident | T::RawIdent | T::Int | T::Float | T::Dot => path.push_str(&text(i)),
+            _ => return Err(format!("expected a field name, found `{}`", text(i))),
+        }
+    }
+    let fields: Vec<&str> = path.split('.').collect();
+    if fields.iter().any(|f| f.is_empty() || !(f.bytes().all(|c| c.is_ascii_digit()) || !f.bytes().next().unwrap().is_ascii_digit())) {
+        return Err(format!("`{path}` is not a field path -- write fields as `a.b` or `0.1`"));
+    }
+    Ok(format!(
+        "const {{ let u = ::core::mem::MaybeUninit::<{}>::uninit(); let base = u.as_ptr(); #[allow(unused_unsafe)] let f = unsafe {{ &raw const (*base).{} }}; f as *const u8 as usize - base as *const u8 as usize }}",
+        ty.join(" "),
+        fields.join("."),
+    ))
+}
+
 fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo: u32, call_hi: u32) -> Result<String, String> {
     let b = from_u8(id);
     let buf = Buf { src: p.src, ext: p.ext.view() };
@@ -838,6 +871,7 @@ fn expand_text(p: &crate::parser::Parser, id: u8, lo: usize, hi: usize, call_lo:
                 }
             };
         }
+        Builtin::OffsetOf => return offset_of_text(p, lo, hi),
         Builtin::Concat => {
             let parts = concat_args(p, lo, hi)?;
             return Ok(str_lit(&parts.concat()));
@@ -2199,7 +2233,7 @@ fn prescan_rules(tb: &[u8], krate: &str, cfg: &CfgSet) -> Vec<crate::macros::Mac
             let exported = attrs.iter().find(|a| a.toks.hi > a.toks.lo && tx(a.toks.lo as usize) == b"macro_export");
             let mt: Vec<crate::macros::MTok> =
                 t2[open + 1..close.min(t2.len())].iter().map(|t| crate::macros::MTok { kind: t.kind, text: String::from_utf8_lossy(&tb[t.lo as usize..t.hi as usize]).into_owned(), pos: u32::MAX }).collect();
-            if let Ok(mut def) = crate::macros::parse_def(&mname, krate, &mt) {
+            if let Ok(mut def) = crate::macros::parse_def(&mname, krate, 2021, &mt) {
                 def.exported = exported.is_some();
                 if exported.is_some_and(|a| (a.toks.lo..a.toks.hi).any(|k| tx(k as usize) == b"local_inner_macros")) {
                     crate::macros::local_inner_macros(&mut def);

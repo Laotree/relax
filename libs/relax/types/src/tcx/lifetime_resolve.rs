@@ -450,7 +450,12 @@ impl LifetimeResolver<'_> {
                             self.ribs.pop();
                             self.visit_ty(ty);
                         }
-                        GenericArg::Constraint(_, bounds) => self.visit_bounds(bounds),
+                        GenericArg::Constraint(_, args, bounds) => {
+                            self.push(LifetimeRibKind::AnonymousReportError);
+                            self.visit_generic_args(args);
+                            self.ribs.pop();
+                            self.visit_bounds(bounds);
+                        }
                     }
                 }
             }
@@ -719,7 +724,7 @@ fn argument_types(ast: &ast::Ast, args: ast::GenericArgsId, out: &mut Vec<ast::T
             match *arg {
                 GenericArg::Type(ty) => out.push(ty),
                 GenericArg::Binding(_, args, ty) => { argument_types(ast, args, out); out.push(ty); }
-                GenericArg::Constraint(_, bounds) => bound_types(ast, bounds, out),
+                GenericArg::Constraint(_, _, bounds) => bound_types(ast, bounds, out),
                 _ => {}
             }
         },

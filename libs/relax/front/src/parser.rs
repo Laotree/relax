@@ -725,7 +725,7 @@ impl<'a> Parser<'a> {
         let n = String::from_utf8_lossy(self.bytes(name.lo, name.hi)).trim_start_matches("r#").to_string();
         let mt = crate::macros::mtoks(self, &self.toks.range(toks.lo as usize, toks.hi as usize));
         let file = self.bctx.as_ref().map_or("", |c| c.path.as_str());
-        self.macros.as_mut().unwrap().define_tokens(&n, &self.krate, file, name.lo, exported, local_inner, &mt)
+        self.macros.as_mut().unwrap().define_tokens(&n, &self.krate, self.edition, file, name.lo, exported, local_inner, &mt)
             .map_err(|msg| PErr { pos: name.lo, msg })
     }
 
@@ -860,9 +860,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `concat!(args)` with every argument that is a `macro_rules!` call replaced by its expansion
-    /// text, or None when no argument is one (the built-in then reads the arguments as they are).
-    fn concat_with_rules_expanded(&mut self, toks: TokRange) -> PResult<Option<String>> {
+    /// `name!(args)` of a built-in that takes literal arguments (`concat!`, `include!`, `env!`,
+    /// ...) with every argument that is a `macro_rules!` call replaced by its expansion text,
+    /// or None when no argument is one (the built-in then reads the arguments as they are).
+    /// rustc expands such arguments eagerly (rustc_builtin_macros `expr_to_spanned_string`).
+    fn builtin_with_rules_expanded(&mut self, name: &str, toks: TokRange) -> PResult<Option<String>> {
         let (lo, hi) = (toks.lo as usize, toks.hi as usize);
         // top-level arguments
         let mut args = Vec::new();
@@ -918,7 +920,7 @@ impl<'a> Parser<'a> {
             };
             // a nested `concat!(..)` with macro_rules calls inside: the same, recursively
             let nested = if call && def.is_none() && self.tok_text(self.toks.at(i - 1)) == b"concat" {
-                self.concat_with_rules_expanded(TokRange { lo: (i + 2) as u32, hi: (z - 1) as u32 })?
+                self.builtin_with_rules_expanded("concat", TokRange { lo: (i + 2) as u32, hi: (z - 1) as u32 })?
             } else {
                 None
             };
@@ -926,7 +928,7 @@ impl<'a> Parser<'a> {
                 Some(d) => {
                     let (text, _, _) = self.expand_rules(&d, i + 2, z - 1).map_err(|m| PErr { pos: self.toks.at(a).lo, msg: m })?;
                     // its own output may hold more calls: concat! re-expands it as an argument
-                    out.push(text);
+                    out.push(if name == "concat" { text } else { format!("concat!({text})") });
                     any = true;
                 }
                 None if nested.is_some() => {
@@ -940,7 +942,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(if any { Some(format!("concat!({})", out.join(", "))) } else { None })
+        Ok(if any { Some(format!("{name}!({})", out.join(", "))) } else { None })
     }
 
     /// Expands a call: appends the expansion's tokens (ending in Eof) and returns their start.
@@ -953,11 +955,12 @@ impl<'a> Parser<'a> {
             return Err(PErr { pos: call_lo, msg: format!("`{}!` expands more than 256 levels deep -- add a base case", def.name) });
         }
         let trace = crate::preload::relax_trace().map_or(false, |t| t.split(',').any(|p| p.strip_prefix("expand:").map_or(false, |n| def.name.contains(n))));
-        if def.builtin == crate::builtins::Builtin::Concat as u8 {
-            // concat!'s arguments are expanded first (rustc expands macro calls among them
+        use crate::builtins::Builtin as B;
+        if def.builtin < crate::builtins::HOSTED && matches!(crate::builtins::from_u8(def.builtin), B::Concat | B::Env | B::OptionEnv | B::Include | B::IncludeStr | B::IncludeBytes) {
+            // the arguments are expanded first (rustc expands macro calls among them
             // eagerly: `concat!("{", asset_ref!("x"), "}")` with a user macro_rules)
-            if let Some(text) = self.concat_with_rules_expanded(toks)? {
-                return self.expand_text("concat", &text, call_lo);
+            if let Some(text) = self.builtin_with_rules_expanded(&def.name, toks)? {
+                return self.expand_text(&def.name, &text, call_lo);
             }
         }
         if def.builtin != 0 {
@@ -1066,7 +1069,7 @@ impl<'a> Parser<'a> {
 
     /// At an item / statement start: a `macro_rules!` call (`path!(..)` / `path! { .. }` ending
     /// the item or statement) expanded and parsed with `f`.
-    fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self) -> PResult<X>) -> PResult<Option<X>> {
+    fn try_expand_rules<X>(&mut self, f: impl FnOnce(&mut Self, bool) -> PResult<X>) -> PResult<Option<X>> {
         if self.macros.is_none() || !self.mac_ahead() {
             return Ok(None);
         }
@@ -1089,7 +1092,15 @@ impl<'a> Parser<'a> {
         }
         self.eat(T::Semi);
         let start = self.expand_call(&def, toks, lo)?;
-        Ok(Some(self.in_expansion(start, f)?))
+        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
+        Ok(Some(self.in_expansion(start, |p| f(p, include))?))
+    }
+
+    /// Moves to the end of the current macro expansion's tokens.
+    fn skip_to_eof(&mut self) {
+        while self.kind() != T::Eof {
+            self.pos += 1;
+        }
     }
 
     /// One statement of a block, or all statements of a statement-position macro call.
@@ -1139,8 +1150,15 @@ impl<'a> Parser<'a> {
     /// block (a `;` after the call ends a tail expression). False (cursor unspecified) when it
     /// is not one.
     fn stmt_macro(&mut self, stmts: &mut Vec<Stmt>) -> PResult<bool> {
-        let r = self.try_expand_rules(|p| {
+        let r = self.try_expand_rules(|p, include| {
             let mut v = Vec::new();
+            // `include!` in statement position is an expression: its first one, the rest of the
+            // file is ignored (rustc_expand base.rs `ExpandInclude::make_expr`, lint incomplete_include)
+            if include {
+                let e = p.expr()?;
+                p.skip_to_eof();
+                return Ok(vec![Stmt::Expr(e, false)]);
+            }
             while p.kind() != T::Eof {
                 // statements of the expansion may be macro calls themselves
                 p.block_stmts_step(&mut v)?;
@@ -1231,7 +1249,7 @@ impl<'a> Parser<'a> {
                 self.parse_cfg_out(attrs)?;
                 continue;
             }
-            if let Some(v) = self.try_expand_rules(|p| p.items_until(T::Eof))? {
+            if let Some(v) = self.try_expand_rules(|p, _| p.items_until(T::Eof))? {
                 items.extend(v);
                 continue;
             }
@@ -1301,11 +1319,20 @@ impl<'a> Parser<'a> {
     /// A cfg'd-out item: parsed for its syntax only (no macro expansion, no derives, no
     /// macro_rules definitions, no generated items), then removed from the tree.
     fn parse_cfg_out(&mut self, attrs: Vec<Attr>) -> PResult<()> {
+        match self.parse_stripped(|p| p.item(attrs))? {
+            Some(_) => Ok(()),
+            None => self.err("expected item"),
+        }
+    }
+
+    /// Runs `parse` as a cfg-stripped construct: no macro expansion, and everything it adds
+    /// to the tree is removed again.
+    fn parse_stripped<R>(&mut self, parse: impl FnOnce(&mut Self) -> PResult<R>) -> PResult<R> {
         let lens = (self.ast.exprs.len(), self.ast.pats.len(), self.ast.tys.len(), self.ast.items.len(), self.ast.blocks.len(), self.ast.mac_args.len(), self.extra_items.len());
         let ends = self.ast.ends();
         let macros = self.macros.take();
         self.cfg_out += 1;
-        let r = self.item(attrs);
+        let r = parse(self);
         self.cfg_out -= 1;
         self.macros = macros;
         self.ast.exprs.truncate(lens.0);
@@ -1340,10 +1367,7 @@ impl<'a> Parser<'a> {
         // let_stmts / attrs_stmts stay: the statement lists (never truncated here) keep the
         // cfg'd-out bodies' statements, which point at them
         self.extra_items.truncate(lens.6);
-        match r? {
-            Some(_) => Ok(()),
-            None => self.err("expected item"),
-        }
+        r
     }
 
     // ------------------------------------------------------------ visibility
@@ -1405,6 +1429,7 @@ impl<'a> Parser<'a> {
             T::Ident => {
                 (self.is_word(0, b"union") && matches!(self.nth(1), T::Ident | T::RawIdent))
                     || (self.is_word(0, b"macro_rules") && self.nth(1) == T::Not)
+                    || (self.is_word(0, b"macro") && matches!(self.nth(1), T::Ident | T::RawIdent))
                     || (self.is_word(0, b"auto") && self.nth(1) == T::KwTrait)
             }
             _ => false,
@@ -1649,6 +1674,18 @@ impl<'a> Parser<'a> {
                 self.define_rules(name, toks, exported, local_inner)?;
                 ItemKind::MacroRules(toks)
             }
+            // rustc_parse `parse_item_decl_macro`: `macro name(args) { body }` or
+            // `macro name { rules }`. Macros 2.0 are unstable (decl_macro): the syntax parses
+            // and only a cfg-stripped item is accepted.
+            T::Ident if self.is_word(0, b"macro") && matches!(self.nth(1), T::Ident | T::RawIdent) && self.cfg_out > 0 => {
+                self.pos += 1;
+                name = self.ident_tok()?;
+                if self.kind() == T::OpenParen {
+                    self.delim_tt()?;
+                }
+                let (_, toks) = self.delim_tt()?;
+                ItemKind::MacroRules(toks)
+            }
             T::Ident | T::PathSep | T::KwSelfValue | T::KwSuper | T::KwCrate
                 if self.mac_ahead() =>
             {
@@ -1856,16 +1893,18 @@ impl<'a> Parser<'a> {
                 }
             }
             first = false;
+            // `...` is last in a C-variadic function: rustc_ast_passes reports it elsewhere
+            // only after cfg stripping, so a cfg-stripped function may continue after it
             if self.eat(T::DotDotDot) {
                 variadic = true;
-                self.eat(T::Comma);
+                if self.eat(T::Comma) && self.cfg_out > 0 { continue; }
                 break;
             }
             // `name: ...` variadic
             if self.is_ident() && self.nth(1) == T::Colon && self.nth(2) == T::DotDotDot {
                 self.pos += 3;
                 variadic = true;
-                self.eat(T::Comma);
+                if self.eat(T::Comma) && self.cfg_out > 0 { continue; }
                 break;
             }
             let save = (self.pos,);
@@ -2377,13 +2416,21 @@ impl<'a> Parser<'a> {
                 T::Ident | T::RawIdent if self.nth(1) == T::Colon => {
                     let name = self.ident_tok()?;
                     self.pos += 1;
-                    GenericArg::Constraint(name, self.bounds()?)
+                    GenericArg::Constraint(name, GenericArgsId::NONE, self.bounds()?)
                 }
-                T::Ident | T::RawIdent if self.nth(1) == T::Lt && self.gat_binding_ahead() => {
+                // `Item<'a> = T` / `Item<'a>: Bound`; a path segment's `::<` form too
+                // (rustc parse_angle_arg reads a type, then reinterprets a one-segment path
+                // before `=` / `:` as the associated item with its generic arguments)
+                T::Ident | T::RawIdent if (self.nth(1) == T::Lt || (self.nth(1) == T::PathSep && self.nth(2) == T::Lt)) && self.gat_binding_ahead() => {
                     let name = self.ident_tok()?;
+                    self.eat(T::PathSep);
                     let ga = self.generic_args_angle()?;
-                    self.expect(T::Eq)?;
-                    GenericArg::Binding(name, ga, self.ty_plus()?)
+                    if self.eat(T::Colon) {
+                        GenericArg::Constraint(name, ga, self.bounds()?)
+                    } else {
+                        self.expect(T::Eq)?;
+                        GenericArg::Binding(name, ga, self.ty_plus()?)
+                    }
                 }
                 T::OpenBrace | T::Int | T::Float | T::Str | T::Char | T::Byte | T::KwTrue | T::KwFalse | T::Minus => {
                     GenericArg::Const(self.const_arg()?)
@@ -2401,8 +2448,8 @@ impl<'a> Parser<'a> {
     }
 
     fn gat_binding_ahead(&self) -> bool {
-        // Ident < ... > =
-        let mut i = self.pos + 1;
+        // Ident < ... > = or Ident < ... > :  (also `Ident :: < ... >`)
+        let mut i = self.pos + 1 + usize::from(self.nth(1) == T::PathSep);
         let mut depth = 0i32;
         loop {
             match self.toks.at(i).kind {
@@ -2434,7 +2481,7 @@ impl<'a> Parser<'a> {
                 return false;
             }
             if depth == 0 {
-                return self.toks.at(i).kind == T::Eq;
+                return matches!(self.toks.at(i).kind, T::Eq | T::Colon);
             }
         }
     }
@@ -2574,7 +2621,8 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ty::DynTrait(self.bounds()?, true)
             }
-            T::Ident if self.edition < 2018 && self.is_word(0, b"dyn") && matches!(self.nth(1), T::Ident | T::PathSep | T::KwFor | T::Question | T::Lifetime | T::OpenParen) => {
+            T::Ident if self.edition < 2018 && self.is_word(0, b"dyn") && matches!(self.nth(1), T::Ident | T::RawIdent | T::KwCrate | T::KwSelfValue | T::KwSelfType | T::KwSuper | T::KwFor | T::Question | T::Lifetime | T::OpenParen) => {
+                // rustc_parse can_begin_dyn_bound_in_edition_2015: a path start except `::`, `<`, `<<`
                 self.pos += 1;
                 Ty::DynTrait(self.bounds()?, true)
             }
@@ -2643,7 +2691,7 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
             }
             // optional name: `x: T` or `_: T`
-            if matches!(self.kind(), T::Ident | T::RawIdent) && self.nth(1) == T::Colon {
+            if matches!(self.kind(), T::Ident | T::RawIdent | T::KwSelfValue) && self.nth(1) == T::Colon {
                 self.pos += 2;
             }
             params.push(self.ty_plus()?);
@@ -2927,6 +2975,12 @@ impl<'a> Parser<'a> {
         let attrs = self.outer_attrs()?;
         if self.at_item_start() && !attrs.is_empty() && !self.cfg_active(&attrs) {
             self.parse_cfg_out(attrs)?;
+            return Ok(Stmt::Empty);
+        }
+        // `#[cfg(false)] try { .. }`: try blocks (unstable, `try_blocks`) parse only where cfg
+        // stripping removes them (rustc_parse `parse_try_block`)
+        if self.kind() == T::KwTry && self.nth(1) == T::OpenBrace && !attrs.is_empty() && !self.cfg_active(&attrs) {
+            self.parse_stripped(|p| p.stmt_after_attrs(attrs))?;
             return Ok(Stmt::Empty);
         }
         let s = self.stmt_after_attrs(attrs.clone())?;
@@ -3367,6 +3421,11 @@ impl<'a> Parser<'a> {
                 let b = self.block()?;
                 Ok(self.mk_expr(ExprKind::ConstBlock(b), lo))
             }
+            T::KwTry if self.nth(1) == T::OpenBrace && self.cfg_out > 0 => {
+                self.pos += 1;
+                let b = self.block()?;
+                Ok(self.mk_expr(ExprKind::Block(b, OptIdent::NONE), lo))
+            }
             T::Lifetime => {
                 let label = self.label();
                 if label.is_none() {
@@ -3493,9 +3552,11 @@ impl<'a> Parser<'a> {
                     let (delim, toks) = self.delim_tt()?;
                     if let Some(def) = self.rules_macro(&path) {
                         let start = self.expand_call(&def, toks, lo)?;
+                        let include = def.builtin < crate::builtins::HOSTED && crate::builtins::from_u8(def.builtin) == crate::builtins::Builtin::Include;
                         return self.in_expansion(start, |p| {
                             let e = p.expr()?;
                             p.eat(T::Semi);
+                            if include { p.skip_to_eof(); }
                             Ok(e)
                         });
                     }

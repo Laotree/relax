@@ -608,7 +608,7 @@ impl Names {
             kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo,
         }).collect::<Vec<_>>();
         let c = &self.crates[ci];
-        let Ok(def) = crate::macros::parse_def(&name, &c.name, &mtoks) else { return None; };
+        let Ok(def) = crate::macros::parse_def(&name, &c.name, c.edition, &mtoks) else { return None; };
         fn names_only(nodes: &[crate::macros::MNode]) -> bool {
             use crate::macros::{Frag, MNode};
             nodes.iter().all(|n| match n {

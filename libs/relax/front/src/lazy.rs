@@ -378,7 +378,7 @@ impl Plan {
                             if !surface.used.uses.is_empty() { Arc::make_mut(&mut table).add_exp_uses(&c.name, surface.used.uses); }
                             let dir = directories.get(path).cloned().unwrap_or_else(|| crate::program::dir_of(path).into());
                             let _profile = crate::load_profile::span(profile, "rust-demand-outline-scan", path);
-                            if let Some(expanded) = scan_tokens(path, &dir, module, &c.name, &c.cfg, scan.src_len,
+                            if let Some(expanded) = scan_tokens(path, &dir, module, &c.name, c.edition, &c.cfg, scan.src_len,
                                 expanded_src, surface.toks, &contexts[*ci], false) { *scan = expanded; }
                         }
                         for (child, dir, child_module) in &scan.children {

@@ -747,7 +747,7 @@ impl Parser<'_> {
                 match arg {
                     GenericArg::Type(t) => self.find_type_parameters(t, names, bound, out),
                     GenericArg::Binding(_, args, t) => { self.find_args_type_parameters(args, names, bound, out); self.find_type_parameters(t, names, bound, out); }
-                    GenericArg::Constraint(_, bs) => self.find_bounds_type_parameters(bs, names, bound, out),
+                    GenericArg::Constraint(_, args, bs) => { self.find_args_type_parameters(args, names, bound, out); self.find_bounds_type_parameters(bs, names, bound, out); },
                     _ => {}
                 }
             },

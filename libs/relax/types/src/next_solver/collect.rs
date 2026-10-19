@@ -366,7 +366,7 @@ impl Tcx {
                 for arg in ast.list(*bindings) {
                     let (name, own_args) = match *arg {
                         ast::GenericArg::Binding(name, args, _) => (name, args),
-                        ast::GenericArg::Constraint(name, _) => (name, ast::GenericArgsId::NONE),
+                        ast::GenericArg::Constraint(name, args, _) => (name, args),
                         _ => continue,
                     };
                     let name = prog.syms.get(prog.files[def.file as usize].text(name)).unwrap();
@@ -402,7 +402,7 @@ impl Tcx {
                             let value = self.lower_ty(cx, prog, def.file, def.scope, &env, value);
                             out.push(Predicate { kind: PredicateKind::Clause(ClauseKind::Projection(ProjectionClause { projection_term: AliasTerm::Ty(alias), term: Term::Ty(value) })), bound_vars: vars.clone() });
                         }
-                        ast::GenericArg::Constraint(_, bounds) => {
+                        ast::GenericArg::Constraint(_, _, bounds) => {
                             if matches!(filter, PredicateFilter::All) { self.lower_bounds(cx, owner, &env, alias, bounds, false, filter, out); }
                         }
                         _ => unreachable!(),

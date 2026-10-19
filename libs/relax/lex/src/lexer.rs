@@ -376,6 +376,27 @@ fn is_ident_cont(c: u8) -> bool {
     IDENT_BYTES[c as usize] & 2 != 0
 }
 
+/// Byte length of the non-ASCII Pattern_White_Space character at `src[i]` (U+0085, U+200E,
+/// U+200F, U+2028, U+2029: rustc_lexer `is_whitespace`), else 0.
+#[inline]
+fn pattern_whitespace_len(src: &[u8], i: usize) -> usize {
+    match src[i] {
+        0xC2 if src.get(i + 1) == Some(&0x85) => 2,
+        0xE2 if src.get(i + 1) == Some(&0x80) && matches!(src.get(i + 2), Some(0x8E | 0x8F | 0xA8 | 0xA9)) => 3,
+        _ => 0,
+    }
+}
+
+/// End of the identifier-continue run starting at `j`: non-ASCII bytes continue it except
+/// Pattern_White_Space characters.
+#[inline]
+fn ident_run_end(src: &[u8], mut j: usize) -> usize {
+    while j < src.len() && is_ident_cont(src[j]) && (src[j] < 0x80 || pattern_whitespace_len(src, j) == 0) {
+        j += 1;
+    }
+    j
+}
+
 pub fn keyword(s: &[u8], edition: u16) -> Option<T> {
     let k = match s {
         b"as" => T::KwAs,
@@ -479,6 +500,10 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
             continue;
         }
         let kind = match c {
+            _ if c >= 0x80 && !RX && pattern_whitespace_len(src, i) > 0 => {
+                i += pattern_whitespace_len(src, i);
+                continue;
+            }
             b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => {
                 i += 1;
                 // Indentation and other whitespace runs need no token dispatch
@@ -562,9 +587,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                         if j + 2 < n && src[j] == b'r' && src[j + 1] == b'#' && is_ident_start(src[j + 2]) {
                             j += 2;
                         }
-                        while j < n && is_ident_cont(src[j]) {
-                            j += 1;
-                        }
+                        j = ident_run_end(src, j);
                         i = j;
                         T::Lifetime
                     } else {
@@ -783,7 +806,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     i = lex_quoted_mode::<RX>(src, i + 2, b'\'').ok_or_else(|| err(lo, "bad byte"))?;
                     if !RX { i = lex_suffix(src, i); }
                     T::Byte
-                } else if (c == b'b' || c == b'c') && i + 1 < n && src[i + 1] == b'"' {
+                } else if (c == b'b' || (c == b'c' && edition >= 2021)) && i + 1 < n && src[i + 1] == b'"' {
                     i = lex_quoted_mode::<RX>(src, i + 2, b'"').ok_or_else(|| err(lo, "bad string"))?;
                     if !RX { i = lex_suffix(src, i); }
                     if c == b'b' {
@@ -791,7 +814,7 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     } else {
                         T::CStr
                     }
-                } else if let Some(j) = raw_string_start(src, i) {
+                } else if let Some(j) = raw_string_start(src, i).filter(|_| c != b'c' || edition >= 2021) {
                     i = lex_raw_string(src, j).ok_or_else(|| err(lo, "unterminated raw string"))?;
                     if !RX { i = lex_suffix(src, i); }
                     // br".." is a raw byte string, cr".." a raw C string
@@ -810,17 +833,11 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
                     i = rx_suffix(source, i);
                     if raw { T::RawIdent } else { keyword(&src[lo..i], edition).unwrap_or(T::Ident) }
                 } else if c == b'r' && i + 2 < n && src[i + 1] == b'#' && is_ident_start(src[i + 2]) {
-                    let mut j = i + 2;
-                    while j < n && is_ident_cont(src[j]) {
-                        j += 1;
-                    }
+                    let j = ident_run_end(src, i + 2);
                     i = j;
                     T::RawIdent
                 } else {
-                    let mut j = i + 1;
-                    while j < n && is_ident_cont(src[j]) {
-                        j += 1;
-                    }
+                    let j = ident_run_end(src, i + 1);
                     let k = keyword(&src[i..j], edition).unwrap_or(T::Ident);
                     if k == T::Ident && is_raw_body(&src[i..j]) {
                         // `name! {` of a registered raw-body macro: hand the body over untokenised
