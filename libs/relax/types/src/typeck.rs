@@ -973,7 +973,7 @@ impl<'a> Fcx<'a> {
     fn unsize_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> bool {
         let save = self.start_snapshot();
         let ok = match (ka, kx) {
-            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d),
+            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d) || self.struct_unsize_goal(*a, *d),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
                 let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 let mut found = None;
@@ -996,6 +996,16 @@ impl<'a> Fcx<'a> {
         };
         if !ok { self.rollback_to(save); } else { self.commit_from(save); }
         ok
+    }
+
+    /// A struct to the same struct with other arguments (`Foo<i32, Count<N>>` -> `Foo<u32, ()>`): the
+    /// solver's `S<..>: Unsize<S<..>>` (the last-field rule, rustc coerce_unsized).
+    fn struct_unsize_goal(&mut self, a: TyId, d: TyId) -> bool {
+        let (a, d) = (self.shallow(a), self.shallow(d));
+        let (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) = (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) else { return false };
+        if d1 != d2 || a == d || self.prog.def(d1).kind != DefKind::Struct || self.tcx.tys.list(xs).is_empty() || self.tcx.tys.list(xs).len() != self.tcx.tys.list(ys).len() { return false; }
+        let Some(unsize) = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize) else { return false };
+        matches!(self.select_trait(unsize, a, &[d]), Ok(Some(_)))
     }
 
     /// `[T; N]` -> `[T]`, also as the tail of a struct (`Holder<[T; N]>` -> `Holder<[T]>`, rustc
