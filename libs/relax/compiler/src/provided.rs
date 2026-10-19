@@ -123,6 +123,39 @@ pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     Ok(())
 }
 
+/// The boot's source check, running beside the load (`check_sources_later`).
+static PENDING: Mutex<Option<std::thread::JoinHandle<Result<(), String>>>> = Mutex::new(None);
+
+/// `check_sources`, on a thread of its own. The boot starts it as early as `check_sources` could
+/// run and goes on loading; nothing may bind a provided crate before `finish_sources` has
+/// returned Ok (`take_for`, `take_for_crates` and the boot's own join before the unit is built
+/// call it). The hashes, the manifests and the error are those of `check_sources`.
+pub fn check_sources_later(pkgs: std::sync::Arc<Vec<crate::srchash::SrcPkg>>) {
+    let _k = crate::zone_alloc::kept();
+    let spawned = std::thread::Builder::new().name("run-provided-sources".into()).spawn(move || {
+        let _z = crate::zone_alloc::compiler_thread();
+        check_sources(&pkgs)
+    });
+    match spawned {
+        Ok(h) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(h),
+        Err(e) => *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::thread::spawn(move || Err(format!("provided source check: {e}")))),
+    }
+}
+
+/// The verdict of the check `check_sources_later` started, once it has ended.
+static VERDICT: Mutex<Option<Result<(), String>>> = Mutex::new(None);
+
+/// Waits for the check `check_sources_later` started, if one is running: its verdict (every
+/// caller gets it, the proc-macro world's unit as well as the program's). Ok when none started.
+pub fn finish_sources() -> Result<(), String> {
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = pending.take() {
+        let verdict = h.join().unwrap_or_else(|_| Err("provided source check: the thread panicked".into()));
+        *VERDICT.lock().unwrap_or_else(|e| e.into_inner()) = Some(crate::zone_alloc::kept_clone(&verdict));
+    }
+    VERDICT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Ok(()))
+}
+
 /// Reads what `check_sources` reads, for the identity of every registered crate in the program,
 /// and nothing else. A check for another target binds nothing, but the run on that target
 /// (the phone) compares these identities: `pack-src` records the files this reads so its archive
@@ -139,6 +172,8 @@ pub fn read_identity_files(pkgs: &[crate::srchash::SrcPkg]) {
 /// The registered crates as (crate index in `prog`, entry) whose source matched (check_sources);
 /// crates not in the program are left out. Taken once per unit (Unit::new).
 pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
+    // nothing binds before the source check has passed (a failed one binds nothing)
+    if finish_sources().is_err() { return Vec::new(); }
     let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for p in REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter() {
@@ -155,6 +190,7 @@ pub fn take_for(prog: &Program) -> Vec<(u32, ProvidedCrate)> {
 /// As [`take_for`], for the crates of `prog` named by `only` (indices a run-time load added) that
 /// are not bound yet.
 pub fn take_for_crates(prog: &Program, only: &[u32]) -> Vec<(u32, ProvidedCrate)> {
+    if finish_sources().is_err() { return Vec::new(); }
     let matched = MATCHED.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for p in REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter() {

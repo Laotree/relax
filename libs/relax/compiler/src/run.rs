@@ -276,14 +276,21 @@ pub(crate) fn resolve_package(
         // JIT-compiled code reaches past the bound ops.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
         let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested());
-        if !bind { crate::provided::read_identity_files(&pkgs); }
-        // The sources are hashed while the build scripts run: they share nothing (the hash reads
-        // the provided packages, the scripts write the graph's cfgs and env).
+        // The sources are hashed while the build scripts run (and, for a run's boot, while the
+        // program loads): they share nothing (the hash reads the provided packages, the scripts
+        // write the graph's cfgs and env).
         if boot { phase("unit graph", t); }
         checkpoint("build scripts")?;
         let t_scripts = Instant::now();
+        // The boot of a run does not wait for the hash at all: the load goes on and the unit is not
+        // built before the hash has passed (`finish_sources` below). A check, a domain's own
+        // resolve and a failing hash all end here.
+        let later = bind && boot && !check_only;
+        let pkgs = std::sync::Arc::new(pkgs);
+        if !bind { crate::provided::read_identity_files(&pkgs); }
+        if later { crate::provided::check_sources_later(pkgs.clone()); }
         let (sources, scripts, scripts_ms, wait_ms) = std::thread::scope(|scope| {
-            let sources = bind.then(|| scope.spawn(|| {
+            let sources = (bind && !later).then(|| scope.spawn(|| {
                 let _z = crate::zone_alloc::compiler_thread();
                 let t = Instant::now();
                 (crate::provided::check_sources(&pkgs), t.elapsed())
@@ -295,7 +302,7 @@ pub(crate) fn resolve_package(
         });
         if boot {
             phase_ms(&format!("build scripts ({})", g.build_scripts.len()), scripts_ms);
-            phase_ms("provided sources", wait_ms);
+            if !later { phase_ms("provided sources", wait_ms); }
         }
         if crate::preload::trace() {
             if let Some((_, took)) = &sources { eprintln!("boot-trace: provided sources hashed in {:.1} ms (beside the build scripts)", took.as_secs_f64() * 1e3); }
@@ -1129,6 +1136,16 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     // before anything is laid out (app structs take the live layout, layout.rs live_editable)
     if options.live {
         crate::layout::LIVE_SESSION.store(true, Ordering::Relaxed);
+    }
+    // The provided crates bind in Unit::new: their source check has passed before it.
+    {
+        let t = Instant::now();
+        if let Err(e) = crate::provided::finish_sources() {
+            if crate::run_state::observed() { crate::run_state::diagnostic(None, crate::diag::from_legacy(&e, "resolve")); }
+            eprintln!("makepad-run: {e}");
+            return 1;
+        }
+        phase("provided sources", t);
     }
     let mut u = Unit::new(prog, tcx, core);
     // the program's unit names itself for the diagnostics that have no unit at hand (an
