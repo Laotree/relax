@@ -100,6 +100,16 @@ fn scopes(prog: &Program, def: DefId) -> Vec<(u32, Vec<Attr>)> {
             }
         } else if !matches!(dd.kind, DefKind::AnonConst | DefKind::Closure | DefKind::OpaqueTy | DefKind::Prim(_)) {
             out.push((dd.file, ast.list(ast.item(dd.item).attrs).to_vec()));
+            // an item declared in a block: the attributes of the statements around it
+            if dd.parent != NO_DEF {
+                let p = prog.def(dd.parent);
+                if p.kind == DefKind::Mod {
+                    if let Some(&owner) = prog.block_owner.get(&p.sub) {
+                        let a = stmt_attrs_around(prog, owner, dd.file, dd.item);
+                        if !a.is_empty() { out.push((dd.file, a)); }
+                    }
+                }
+            }
         }
         d = dd.parent;
     }
@@ -326,3 +336,41 @@ pub const NON_UPPER_CASE_GLOBALS: Lint = lint("non_upper_case_globals", Level::W
 pub const UNREACHABLE_CODE: Lint = lint("unreachable_code", Level::Warn, &["unused"]);
 pub const UNUSED_VARIABLES: Lint = lint("unused_variables", Level::Warn, &["unused"]);
 pub const UNUSED_ASSIGNMENTS: Lint = lint("unused_assignments", Level::Warn, &["unused"]);
+
+/// The attributes of the statements, arms and blocks around the item `item` declared in the body
+/// of `owner` (outermost first), as rustc's lint level builder sees them.
+fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::ItemId) -> Vec<Attr> {
+    use crate::ast::*;
+    use crate::ast_visit::{self, Visitor};
+    struct Find<'a> { ast: &'a Ast, item: ItemId, stack: Vec<Attr>, found: Option<Vec<Attr>> }
+    impl<'a> Visitor<'a> for Find<'a> {
+        fn ast(&self) -> &'a Ast { self.ast }
+        fn enter_attrs(&mut self, attrs: List<Attr>) { self.stack.extend_from_slice(self.ast.list(attrs)); }
+        fn leave_attrs(&mut self, attrs: List<Attr>) {
+            let n = self.ast.list(attrs).len();
+            self.stack.truncate(self.stack.len() - n);
+        }
+        fn stmt(&mut self, s: &Stmt, _b: BlockId) {
+            if self.found.is_some() { return; }
+            if let Stmt::Item(i) = *s {
+                if i == self.item { self.found = Some(self.stack.clone()); }
+                return;
+            }
+            ast_visit::walk_stmt(self, s);
+        }
+    }
+    let od = prog.def(owner);
+    let ast = &prog.files[od.file as usize].ast;
+    if od.file != file { return Vec::new(); }
+    let mut f = Find { ast, item, stack: Vec::new(), found: None };
+    match ast.item(od.item).kind {
+        ItemKind::Fn(..) => {
+            if let Ok(Some(b)) = prog.fn_body(od.file, od.item) { f.block(b); }
+        }
+        ItemKind::Const(..) | ItemKind::Static(..) => {
+            if let Ok(Some(e)) = prog.const_body(od.file, od.item) { f.expr(e); }
+        }
+        _ => {}
+    }
+    f.found.unwrap_or_default()
+}
