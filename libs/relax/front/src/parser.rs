@@ -2995,6 +2995,13 @@ impl<'a> Parser<'a> {
         let mut variadic = false;
         while self.kind() != T::CloseParen {
             let _ = self.outer_attrs()?;
+            if params.is_empty() && self.self_param()?.is_some() {
+                // `fn(self)`, `fn(&mut self)`, `fn(self: T)`: accepted by the parser (rejected later)
+                if !self.eat(T::Comma) {
+                    break;
+                }
+                continue;
+            }
             if self.eat(T::DotDotDot) {
                 variadic = true;
                 break;
@@ -3527,22 +3534,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// The operand of a prefix operator: a unary expression or a prefix range (`&..0`, `-..`;
+    /// rustc `parse_expr_prefix_common`).
+    fn operand(&mut self, r: u8) -> PResult<ExprId> {
+        if matches!(self.kind(), T::DotDot | T::DotDotEq) {
+            let lo = self.lo();
+            let incl = self.bump().kind == T::DotDotEq;
+            let rhs = if self.can_begin_expr(r) { Some(self.expr_bp(P_RANGE + 1, r)?) } else { None };
+            return Ok(self.mk_expr(ExprKind::Range(OptExprId::NONE, OptExprId::from(rhs), incl), lo));
+        }
+        self.unary(r)
+    }
+
     fn unary(&mut self, r: u8) -> PResult<ExprId> {
         let lo = self.lo();
         match self.kind() {
             T::Minus => {
                 self.pos += 1;
-                let e = self.unary(r)?;
+                let e = self.operand(r)?;
                 Ok(self.mk_expr(ExprKind::Unary(UnOp::Neg, e), lo))
             }
             T::Not => {
                 self.pos += 1;
-                let e = self.unary(r)?;
+                let e = self.operand(r)?;
                 Ok(self.mk_expr(ExprKind::Unary(UnOp::Not, e), lo))
             }
             T::Star => {
                 self.pos += 1;
-                let e = self.unary(r)?;
+                let e = self.operand(r)?;
                 Ok(self.mk_expr(ExprKind::Unary(UnOp::Deref, e), lo))
             }
             T::And | T::AndAnd => {
@@ -3556,12 +3575,12 @@ impl<'a> Parser<'a> {
                 } else {
                     m = self.eat(T::KwMut);
                 }
-                let e = self.unary(r)?;
+                let e = self.operand(r)?;
                 Ok(self.mk_expr(ExprKind::AddrOf(raw, m, e), lo))
             }
             T::KwBox => {
                 self.pos += 1;
-                let e = self.unary(r)?;
+                let e = self.operand(r)?;
                 Ok(self.mk_expr(ExprKind::Box(e), lo))
             }
             // a prefix range is an operand wherever one can begin (rustc parse_expr_bottom:
@@ -4045,15 +4064,25 @@ impl<'a> Parser<'a> {
         Ok(self.mk_expr(ExprKind::If(cond, then, OptExprId::from(els)), lo))
     }
 
+    /// rustc parse_expr_loop: a loop takes no `else`.
+    fn no_loop_else(&mut self, what: &str) -> PResult<()> {
+        if self.kind() == T::KwElse {
+            return self.err(&format!("`{}...else` loops are not supported", what));
+        }
+        Ok(())
+    }
+
     fn loop_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwLoop)?;
         let b = self.block()?;
+        self.no_loop_else("loop")?;
         Ok(self.mk_expr(ExprKind::Loop(b, OptIdent::from(label)), lo))
     }
     fn while_expr(&mut self, label: Option<Ident>, lo: u32) -> PResult<ExprId> {
         self.expect(T::KwWhile)?;
         let c = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("while")?;
         let row = self.ast.push_row(WhileRow { cond: c, body: b, label });
         Ok(self.mk_expr(ExprKind::While(row), lo))
     }
@@ -4063,6 +4092,7 @@ impl<'a> Parser<'a> {
         self.expect(T::KwIn)?;
         let it = self.expr_ns()?;
         let b = self.block()?;
+        self.no_loop_else("for")?;
         let row = self.ast.push_row(ForRow { pat: p, iter: it, body: b, label });
         Ok(self.mk_expr(ExprKind::For(row), lo))
     }

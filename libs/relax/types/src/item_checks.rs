@@ -652,6 +652,11 @@ pub fn attribute_safety(prog: &Program, d: DefId) -> Vec<String> {
             }
             continue;
         }
+        if from_source {
+            if let Some(what) = attribute_target_error(prog, d, &name) {
+                errors.push(prog.record_uncoded_error(def.file, pos, "typeck", format!("`#[{}]` attribute cannot be used on {}", String::from_utf8_lossy(&name), what)));
+            }
+        }
         let AttrSafety::Unsafe { since_2024 } = attr_safety(&String::from_utf8_lossy(&name)) else { continue };
         if !since_2024 || pf.edition >= 2024 {
             if from_source { errors.push(prog.record_uncoded_error(def.file, pos, "typeck", "unsafe attribute used without unsafe".to_string())); }
@@ -830,4 +835,96 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
         }
     }
     errors
+}
+
+/// rustc_resolve late.rs: an associated constant of an impl whose header names an anonymous
+/// lifetime (`impl Foo<'_>`) with an elided `&` in its type -- the elided lifetime means
+/// `'static` there (lint `elided_lifetimes_in_associated_constant`).
+pub fn assoc_const_elision(prog: &Program, d: DefId) {
+    use crate::ast::{GenericArg, GenericArgs, ItemKind, Ty};
+    if !crate::lint::enabled() { return; }
+    let def = prog.def(d);
+    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return; }
+    let ast = &prog.files[def.file as usize].ast;
+    let pf = &prog.files[def.file as usize];
+    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return };
+    let Some(ty) = oty.get() else { return };
+    let imp = prog.def(def.parent);
+    let iast = &prog.files[imp.file as usize].ast;
+    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return };
+    // an anonymous lifetime written in a type
+    fn anon<'t>(ast: &crate::ast::Ast, text: &dyn Fn(crate::ast::Ident) -> &'t str, t: crate::ast::TyId, refs_too: bool, depth: u32) -> bool {
+        if depth > 16 { return false; }
+        let args = |gs: crate::ast::GenericArgsId, depth: u32| -> bool {
+            match ast.gargs(gs) {
+                Some(GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| match a {
+                    GenericArg::Lifetime(l) => text(*l) == "'_",
+                    GenericArg::Type(x) => anon(ast, text, *x, refs_too, depth + 1),
+                    _ => false,
+                }),
+                _ => false,
+            }
+        };
+        match ast.ty(t) {
+            Ty::Ref(lt, _, x) => (match lt { None => refs_too, Some(l) => text(*l) == "'_" }) || anon(ast, text, *x, refs_too, depth + 1),
+            Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => anon(ast, text, *x, refs_too, depth + 1),
+            Ty::Tuple(l) => ast.list(*l).iter().any(|x| anon(ast, text, *x, refs_too, depth + 1)),
+            Ty::Path(p) => ast.segs(p.segs).iter().any(|s| args(s.args(), depth)),
+            _ => false,
+        }
+    }
+    let itext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(prog.files[imp.file as usize].bytes(i.lo, i.hi)).unwrap_or("") };
+    let ctext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(pf.bytes(i.lo, i.hi)).unwrap_or("") };
+    let header = anon(iast, &itext, im.self_ty, false, 0)
+        || im.trait_.as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
+            Some(GenericArgs::Angle(v)) => iast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(l) if itext(*l) == "'_")),
+            _ => false,
+        }));
+    if header && anon(ast, &ctext, ty, true, 0) {
+        crate::lint::emit(prog, d, &crate::lint::ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT, def.file, ast.item(def.item).lo, "`&` without an explicit lifetime name cannot be used here");
+    }
+}
+
+/// rustc_attr_parsing `AllowedTargets::AllowList`: the targets a builtin attribute may be written
+/// on (a `Warn` target is only the `unused_attributes` lint and is accepted here). Returns the
+/// plural target name when the attribute is not allowed on definition `d`.
+fn attribute_target_error(prog: &Program, d: DefId, name: &[u8]) -> Option<&'static str> {
+    use crate::program::DefKind as K;
+    use crate::ast::ItemKind;
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    // (plural name, is a fn-like target with/without body, is static-like ...)
+    let (what, fn_like, trait_fn_no_body, static_like): (&'static str, bool, bool, bool) = match def.kind {
+        K::Fn | K::AssocFn => {
+            let body = matches!(item.kind, ItemKind::Fn(_, Some(_), _));
+            let in_trait = def.kind == K::AssocFn && prog.def(def.parent).kind == K::Trait;
+            ("functions", true, in_trait && !body, false)
+        }
+        K::ForeignFn => ("foreign functions", true, false, false),
+        K::Static => ("statics", false, false, true),
+        K::ForeignStatic => ("foreign statics", false, false, true),
+        K::Struct => ("structs", false, false, false),
+        K::Enum => ("enums", false, false, false),
+        K::Union => ("unions", false, false, false),
+        K::Const => ("constants", false, false, false),
+        K::AssocConst => ("associated constants", false, false, false),
+        K::Trait => ("traits", false, false, false),
+        K::Impl => ("implementation blocks", false, false, false),
+        K::TypeAlias => ("type aliases", false, false, false),
+        K::AssocTy => ("associated types", false, false, false),
+        K::Mod => ("modules", false, false, false),
+        _ => return None,
+    };
+    let ok = match name {
+        // Fn, Method, Closure, Delegation (+ Warn: trait fn without body, foreign fn, assoc const, ...)
+        b"inline" => fn_like || def.kind == K::AssocConst,
+        b"track_caller" => fn_like,
+        b"target_feature" => fn_like && def.kind != K::ForeignFn && !trait_fn_no_body,
+        b"used" => def.kind == K::Static,
+        b"export_name" => static_like && def.kind == K::Static || (fn_like && def.kind != K::ForeignFn && !trait_fn_no_body),
+        b"debugger_visualizer" => def.kind == K::Mod,
+        _ => return None,
+    };
+    if ok { None } else { Some(what) }
 }
