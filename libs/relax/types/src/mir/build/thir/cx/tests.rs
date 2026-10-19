@@ -98,3 +98,26 @@ fn const_body_has_no_fn_scopes() {
         assert!(t.fn_scopes.is_none());
     });
 }
+
+#[test]
+fn destructuring_assignment() {
+    let k = kinds(
+        "pub struct S { a: u8, b: u8 } pub struct T(u8, u8) ; pub enum E { V(u8, u8) } pub fn f(s: S, t: T, mut a: u8, mut b: u8, mut arr: [u8; 3]) { (a, b) = (b, a); S { a, b } = s; T(a, ..) = t; (a, _) = (1, 2); [a, .., b] = arr; (a, (b, _)) = (1, (2, 3)); let _ = E::V(1, 2); }",
+        "f",
+    );
+    has(&k, &["Block", "Assign", "VarRef", "Tuple"]);
+}
+
+#[test]
+fn destructuring_assignment_binds_in_a_remainder_scope() {
+    build("pub fn f(mut a: u8, mut b: u8) { (a, b) = (b, a); }", "f", |r| {
+        let t = r.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(t.thir.var_scopes.len(), 2);
+    });
+}
+
+#[test]
+fn default_field_values() {
+    let k = kinds("pub struct S { a: u8 = 7, c: u8 } pub fn f() -> S { S { c: 1, .. } }", "f");
+    has(&k, &["Adt", "NamedConst"]);
+}

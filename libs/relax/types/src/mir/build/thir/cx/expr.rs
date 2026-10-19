@@ -220,7 +220,7 @@ impl Cx<'_> {
             A::Unsafe(b) => ExprKind::Block { block: self.mirror_block_with(b, super::BlockSafety::ExplicitUnsafe(b.0), false)? },
             A::Assign(lhs, rhs) => {
                 if crate::lit::is_assignee_pattern(ast, lhs) {
-                    return self.not_built(span, "destructuring assignment");
+                    return self.destructuring_assign(e, lhs, rhs, expr_ty);
                 }
                 ExprKind::Assign { lhs: self.mirror_expr(lhs)?, rhs: self.mirror_expr(rhs)? }
             }
@@ -672,13 +672,27 @@ impl Cx<'_> {
             Some(Res::Def(d)) if prog.def(d).kind == DefKind::Variant => VariantIdx(prog.def(d).sub),
             _ => VariantIdx(0),
         };
-        if row.rest {
-            return self.not_built(span, "default field values");
-        }
         let mut fields = Vec::new();
         for f in ast.list(row.fields) {
             let Some(idx) = self.field_index(adt_def, variant_index.0, f.name) else { return self.unresolved(span, "unknown field") };
             fields.push(FieldExpr { name: FieldIdx(idx), expr: self.mirror_expr(f.expr)? });
+        }
+        // `S { a, .. }`: each omitted field takes the const holding its declared default
+        // (rustc builds `AdtExprBase::DefaultFields`, whose operands are exactly these consts)
+        if row.rest {
+            let field_args = tcx.tys.list(match *tcx.tys.kind(expr_ty) {
+                TyKind::Adt(_, a, _) => a,
+                _ => unreachable!(),
+            });
+            for &(index, def) in tb.struct_defaults.get(&e.0).map(|v| v.as_slice()).unwrap_or(&[]) {
+                if fields.iter().any(|f: &FieldExpr| f.name.0 == index) {
+                    continue;
+                }
+                let ty = tcx.field_ty(prog, self.root.cx.env, adt_def, variant_index.0, index, field_args);
+                let args = self.full_args(def, &[], span)?;
+                let expr = self.push(self.mk(e, ExprKind::NamedConst { def, args, user_ty: None }, ty));
+                fields.push(FieldExpr { name: FieldIdx(index), expr });
+            }
         }
         let base = match row.base.get() {
             Some(base) => {

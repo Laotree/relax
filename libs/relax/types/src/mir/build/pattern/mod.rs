@@ -118,7 +118,7 @@ impl<'a> Cx<'a> {
         pats.iter().map(|&p| self.lower_pattern(p)).collect::<BuildResult<Vec<_>>>().map(Vec::into_boxed_slice)
     }
 
-    fn adt_variant_fields(&self, adt: DefId, variant: u32) -> usize {
+    pub(crate) fn adt_variant_fields(&self, adt: DefId, variant: u32) -> usize {
         self.root.cx.tcx.adts.get(&adt).and_then(|a| a.variants.get(variant as usize)).map_or(0, |v| v.fields.len())
     }
 
@@ -158,7 +158,7 @@ impl<'a> Cx<'a> {
     }
 
     /// pattern/mod.rs:`lower_variant_or_leaf`: a variant (or struct) constructor pattern of the ADT `ty`.
-    fn lower_variant_or_leaf(&self, key: UserTypeKey, ty: TyId, res: Option<DefId>, subpatterns: Vec<FieldPat>, span: Span) -> BuildResult<Pat> {
+    pub(crate) fn lower_variant_or_leaf(&self, key: UserTypeKey, ty: TyId, res: Option<DefId>, subpatterns: Vec<FieldPat>, span: Span) -> BuildResult<Pat> {
         let (prog, tcx) = (self.root.cx.prog, self.root.cx.tcx);
         let TyKind::Adt(adt, args, _) = *tcx.tys.kind(ty) else { return self.pat_unresolved(span, "constructor pattern of a non-ADT type") };
         let Some(a) = tcx.adts.get(&adt) else { return self.pat_unresolved(span, "constructor pattern of an unknown ADT") };

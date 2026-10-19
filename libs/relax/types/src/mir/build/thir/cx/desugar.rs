@@ -10,6 +10,7 @@ use crate::mir::build::BuildResult;
 use crate::mir::{BorrowKind, FieldIdx, MutBorrowKind, Span, VariantIdx};
 use crate::program::{DefId, DefKind};
 use crate::region_scope::{Node, ScopeData, ScopeId, Synthetic};
+use crate::typeck::Res;
 use crate::types::{TyId, TyKind};
 
 impl Cx<'_> {
@@ -218,6 +219,156 @@ impl Cx<'_> {
         let break_arm = self.thir.alloc_arm(Arm { pattern: Box::new(break_pat), guard: None, body: ret_any, node: e.0, scope, span });
 
         Ok(self.mk(e, ExprKind::Match { scrutinee, arms: Box::new([continue_arm, break_arm]), match_source: MatchSource::TryDesugar }, expr_ty))
+    }
+
+    // ---------------------------------------------------------------- destructuring assignment
+
+    /// `(a, b) = rhs` (rustc_ast_lowering lower_expr_assign):
+    /// `{ let (lhs0, lhs1) = rhs; a = lhs0; b = lhs1; }`
+    pub(super) fn destructuring_assign(&mut self, e: ast::ExprId, lhs: ast::ExprId, rhs: ast::ExprId, expr_ty: TyId) -> BuildResult<Expr> {
+        let span = self.espan(e);
+        let unit = self.unit_ty();
+        let block_scope = self.synthetic_scope(e, Synthetic::AssignBlock, ScopeData::Node, span)?;
+        let remainder_scope = self.synthetic_scope(e, Synthetic::AssignBlock, ScopeData::Remainder(0), span)?;
+        let init_scope = self.synthetic_scope(e, Synthetic::AssignLet, ScopeData::Node, span)?;
+        let rhs_ty = self.ety_adjusted(rhs)?;
+        let initializer = self.mirror_expr(rhs)?;
+        let mut leaves = Vec::new();
+        let pattern = self.assignee_pat(lhs, rhs_ty, remainder_scope, &mut leaves)?;
+        let mut stmts = vec![self.thir.alloc_stmt(Stmt {
+            kind: StmtKind::Let { remainder_scope, init_scope, pattern: Box::new(pattern), initializer: Some(initializer), else_block: None, node: e.0, span },
+        })];
+        for (leaf, var, ty) in leaves {
+            let leaf_span = self.espan(leaf);
+            let scope = self.synthetic_scope(leaf, Synthetic::Assignment, ScopeData::Node, leaf_span)?;
+            let target = self.mirror_expr(leaf)?;
+            let value = self.push(self.mk_at(leaf, leaf_span, ExprKind::VarRef { id: var }, ty));
+            let assign = self.push(self.mk_at(leaf, leaf_span, ExprKind::Assign { lhs: target, rhs: value }, unit));
+            stmts.push(self.thir.alloc_stmt(Stmt { kind: StmtKind::Expr { scope, expr: assign } }));
+        }
+        let block = self.thir.alloc_block(Block { targeted_by_break: false, region_scope: block_scope, span, stmts: stmts.into_boxed_slice(), expr: None, safety_mode: BlockSafety::Safe });
+        Ok(self.mk(e, ExprKind::Block { block }, expr_ty))
+    }
+
+    fn is_rest_assignee(&self, x: ast::ExprId) -> bool {
+        let ast = self.ast();
+        let x = super::strip_paren(ast, x);
+        matches!(ast.expr(x).kind, A::Range(ast::OptExprId::NONE, ast::OptExprId::NONE, false))
+    }
+
+    /// The pattern the assignee `a` of type `ty` destructures with; each plain assignee becomes a
+    /// fresh by-value binding recorded in `leaves`.
+    fn assignee_pat(&mut self, a: ast::ExprId, ty: TyId, scope: ScopeId, leaves: &mut Vec<(ast::ExprId, LocalVarId, TyId)>) -> BuildResult<Pat> {
+        let (ast, tcx, prog) = (self.ast(), self.tcx(), self.prog());
+        let span = self.espan(a);
+        let node = |kind| Pat { ty, span, extra: None, kind };
+        match ast.expr(a).kind {
+            A::Paren(x) => self.assignee_pat(x, ty, scope, leaves),
+            A::Underscore => Ok(node(PatKind::Wild)),
+            A::Tuple(elems) => {
+                let TyKind::Tuple(l) = *tcx.tys.kind(ty) else { return self.unresolved(span, "tuple assignee of a non-tuple type") };
+                let tys = tcx.tys.list(l).to_vec();
+                let xs = ast.list(elems);
+                let rest = xs.iter().position(|&x| self.is_rest_assignee(x));
+                let mut subpatterns = Vec::new();
+                for (i, &x) in xs.iter().enumerate() {
+                    if Some(i) == rest {
+                        continue;
+                    }
+                    let fi = match rest {
+                        Some(r) if i > r => tys.len() - (xs.len() - i),
+                        _ => i,
+                    };
+                    let Some(&ft) = tys.get(fi) else { return self.unresolved(span, "tuple assignee arity") };
+                    let pattern = self.assignee_pat(x, ft, scope, leaves)?;
+                    subpatterns.push(FieldPat { field: FieldIdx(fi as u32), pattern });
+                }
+                Ok(node(PatKind::Leaf { subpatterns }))
+            }
+            A::Array(elems) => {
+                let (elem, array_len) = match *tcx.tys.kind(ty) {
+                    TyKind::Slice(e) => (e, None),
+                    TyKind::Array(e, len) => match len.try_to_target_usize(&tcx.tys) {
+                        Some(len) => (e, Some(len)),
+                        None => return self.unresolved(span, "array length of an assignee"),
+                    },
+                    _ => return self.unresolved(span, "array assignee of a non-sequence type"),
+                };
+                let xs = ast.list(elems);
+                let rest = xs.iter().position(|&x| self.is_rest_assignee(x));
+                let (before, after) = match rest {
+                    Some(r) => (&xs[..r], &xs[r + 1..]),
+                    None => (xs, &xs[..0]),
+                };
+                let mut prefix = Vec::new();
+                for &x in before {
+                    prefix.push(self.assignee_pat(x, elem, scope, leaves)?);
+                }
+                let mut suffix = Vec::new();
+                for &x in after {
+                    suffix.push(self.assignee_pat(x, elem, scope, leaves)?);
+                }
+                let slice = rest.map(|r| {
+                    let fixed = (before.len() + after.len()) as u64;
+                    let sub_ty = match array_len {
+                        Some(n) => tcx.tys.intern(TyKind::Array(elem, tcx.tys.const_usize(n.saturating_sub(fixed)))),
+                        None => tcx.tys.intern(TyKind::Slice(elem)),
+                    };
+                    Box::new(Pat { ty: sub_ty, span: self.espan(xs[r]), extra: None, kind: PatKind::Wild })
+                });
+                let (prefix, suffix) = (prefix.into_boxed_slice(), suffix.into_boxed_slice());
+                Ok(node(match array_len {
+                    None => PatKind::Slice { prefix, slice, suffix },
+                    Some(_) => PatKind::Array { prefix, slice, suffix },
+                }))
+            }
+            A::Call(f, args) => {
+                let Some(Res::Def(d)) = self.tb().res.get(&a.0).copied() else { return self.unresolved(span, "constructor assignee") };
+                let _ = f;
+                let TyKind::Adt(adt, gargs, _) = *tcx.tys.kind(ty) else { return self.unresolved(span, "constructor assignee of a non-ADT type") };
+                let variant = if prog.def(d).kind == DefKind::Variant { prog.def(d).sub } else { 0 };
+                let nf = self.adt_variant_fields(adt, variant);
+                let xs = ast.list(args);
+                let rest = xs.iter().position(|&x| self.is_rest_assignee(x));
+                let mut subpatterns = Vec::new();
+                for (i, &x) in xs.iter().enumerate() {
+                    if Some(i) == rest {
+                        continue;
+                    }
+                    let fi = match rest {
+                        Some(r) if i > r => nf - (xs.len() - i),
+                        _ => i,
+                    };
+                    let ft = self.field_type(adt, variant, fi as u32, gargs);
+                    let pattern = self.assignee_pat(x, ft, scope, leaves)?;
+                    subpatterns.push(FieldPat { field: FieldIdx(fi as u32), pattern });
+                }
+                self.lower_variant_or_leaf(crate::typeck::user_types::UserTypeKey::Expr(a.0), ty, Some(d), subpatterns, span)
+            }
+            A::Struct(row) => {
+                let Some(Res::Def(d)) = self.tb().res.get(&a.0).copied() else { return self.unresolved(span, "struct assignee") };
+                let TyKind::Adt(adt, gargs, _) = *tcx.tys.kind(ty) else { return self.unresolved(span, "struct assignee of a non-ADT type") };
+                let variant = if prog.def(d).kind == DefKind::Variant { prog.def(d).sub } else { 0 };
+                let mut subpatterns = Vec::new();
+                for f in ast.list(ast.row(row).fields) {
+                    let Some(fi) = self.field_index(adt, variant, f.name) else { return self.unresolved(span, "unknown field in a struct assignee") };
+                    let ft = self.field_type(adt, variant, fi, gargs);
+                    let pattern = self.assignee_pat(f.expr, ft, scope, leaves)?;
+                    subpatterns.push(FieldPat { field: FieldIdx(fi), pattern });
+                }
+                self.lower_variant_or_leaf(crate::typeck::user_types::UserTypeKey::Expr(a.0), ty, Some(d), subpatterns, span)
+            }
+            _ => {
+                let var = self.synthetic_binding(scope);
+                leaves.push((a, var, ty));
+                Ok(self.binding_pat(var, "lhs", ty, false, span))
+            }
+        }
+    }
+
+    fn field_type(&self, adt: DefId, variant: u32, field: u32, gargs: crate::types::TyList) -> TyId {
+        let tcx = self.tcx();
+        self.normalize(tcx.field_ty(self.prog(), self.root.cx.env, adt, variant, field, tcx.tys.list(gargs)))
     }
 
     // ---------------------------------------------------------------- builtin macros

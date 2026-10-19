@@ -13,8 +13,7 @@
 //!   scopes of `region_scope.rs`' synthetic nodes; their bindings (`iter`, `val`, `residual`) are
 //!   synthetic locals with ids from `Body.locals.len()` up and a drop scope in `Thir::var_scopes`.
 //!
-//! Not built (`BuildError`): async fn / blocks / closures, `.await`, `yield`, destructuring assignment,
-//! `box`, default field values, asm. They match what the BIR checker leaves unchecked.
+//! Not built (`BuildError`): async fn / blocks / closures, `.await`, `yield`, `box`, asm. They match what the BIR checker leaves unchecked.
 use super::{
     Arm, ArmId, Block, BlockId, BlockSafety, ClosureExpr, ClosureExprKind, Expr, ExprId, ExprKind, LocalVarId, Param, ParamId, Pat, PatKind, Stmt, StmtId, StmtKind,
     Thir, ThirBody, BodyTy,
