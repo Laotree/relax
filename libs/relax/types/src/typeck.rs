@@ -3431,6 +3431,10 @@ impl<'a> Fcx<'a> {
                 self.err(path.lo, prog.privacy_message(&e));
             }
         }
+        {
+            let cx = self.cx.with_infcx(&self.infcx);
+            if self.tcx.prohibit_module_args(&cx, prog, self.file, self.module, path) { return (Res::Err, error); }
+        }
         if let Some(q) = self.ast().qself(path) {
             // `<T as Trait>::item`
             let self_t = self.lower_ty(q.ty);
@@ -3509,6 +3513,10 @@ impl<'a> Fcx<'a> {
             if k == SegKind::SelfValue || k == SegKind::Ident {
                 if !is_pat {
                     if let Some(li) = self.lookup_local(s, self.ast().segs(path.segs)[0].name.lo) {
+                        // prohibit_generic_args: a local variable takes no arguments (E0109)
+                        let seg = &self.ast().segs(path.segs)[0];
+                        let cx = self.cx.with_infcx(&self.infcx);
+                        if self.tcx.prohibit_args_on(&cx, prog, self.file, seg, "local variable", self.text(seg.name)) { return (Res::Err, error); }
                         self.note_capture(li, key);
                         let t = self.b.locals[li as usize].ty;
                         return (Res::Local(li), t);
@@ -3536,6 +3544,9 @@ impl<'a> Fcx<'a> {
                 // `Self` as a unit/tuple struct ctor
                 if let Some(st) = self.env.self_ty {
                     if let TyKind::Adt(d, args, _) = self.tcx.tys.kind(st).clone() {
+                        let seg = &self.ast().segs(path.segs)[0];
+                        let cx = self.cx.with_infcx(&self.infcx);
+                        if self.tcx.prohibit_args_on(&cx, prog, self.file, seg, "self constructor", "Self") { return (Res::Err, error); }
                         let t = self.value_def_ty(d, Some(self.tcx.tys.list(args).to_vec()), key);
                         return (Res::Def(d), t);
                     }
@@ -5101,7 +5112,10 @@ impl<'a> Fcx<'a> {
                         self.coerce_or_unify(t, rt, Some(*v), lo);
                     }
                     None => {
-                        self.eq(rt, unit);
+                        // coerce_forced_unit: `return;` where the return type is not `()`
+                        if !self.eq(rt, unit) && !self.tcx.tys.has_error(rt) {
+                            self.err(lo, "E0069: `return;` in a function whose return type is not `()`".to_string());
+                        }
                     }
                 }
                 self.tcx.tys.never
@@ -5473,6 +5487,10 @@ impl<'a> Fcx<'a> {
                     let fx = fe.expr;
                     match self.field_ty(adt_ty, vi, fname) {
                         Some((fi, ft)) => {
+                            // rustc check_expr_struct_fields: E0062 for a field given twice
+                            if given.contains(&fi) {
+                                self.err(fe.name.lo, format!("E0062: field `{}` specified more than once", self.text(fe.name)));
+                            }
                             given.push(fi);
                             self.check_field_privacy(adt_ty, vi, fi, fe.name.lo);
                             let t = self.check_expr(fx, Some(ft));

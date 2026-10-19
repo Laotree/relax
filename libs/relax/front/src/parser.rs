@@ -3803,6 +3803,63 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// rustc `parse_dot_suffix_expr`: the token after `expr.`; the flag says a float ended in
+    /// the next access's dot (`foo.1.`), so another suffix follows at once.
+    fn dot_suffix(&mut self, mut e: ExprId, lo: u32) -> PResult<(ExprId, bool)> {
+        match self.kind() {
+            T::KwAwait => {
+                self.pos += 1;
+                e = self.mk_expr(ExprKind::Await(e), lo);
+            }
+            T::Ident | T::RawIdent => {
+                let name = self.ident_tok()?;
+                let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
+                    self.pos += 1;
+                    self.generic_args_angle()?
+                } else {
+                    GenericArgsId::NONE
+                };
+                if self.kind() == T::OpenParen {
+                    let args = self.call_args()?;
+                    let args = self.ast.push_list(args);
+                    let row = self.ast.push_row(MethodCallRow { name, turbofish, args });
+                    e = self.mk_expr(ExprKind::MethodCall(e, row), lo);
+                } else {
+                    e = self.mk_expr(ExprKind::Field(e, name), lo);
+                }
+            }
+            T::Int => {
+                let t = self.bump();
+                let n = parse_index(self.text_of(t));
+                e = self.mk_expr(ExprKind::TupleField(e, n), lo);
+            }
+            T::Float => {
+                // break_up_float: `1e2` | `1.` | `1.2` | `1.2e3`
+                let t = self.bump();
+                let s = self.text_of(t).to_vec();
+                let dot = s.iter().position(|&c| c == b'.');
+                match dot {
+                    None => {
+                        let n = parse_index(&s);
+                        e = self.mk_expr(ExprKind::TupleField(e, n), lo);
+                    }
+                    Some(d) => {
+                        let a = parse_index(&s[..d]);
+                        e = self.mk_expr(ExprKind::TupleField(e, a), lo);
+                        if d + 1 < s.len() {
+                            let b = parse_index(&s[d + 1..]);
+                            e = self.mk_expr(ExprKind::TupleField(e, b), lo);
+                        } else {
+                            return Ok((e, true));
+                        }
+                    }
+                }
+            }
+            _ => return self.err("expected field or method"),
+        }
+        Ok((e, false))
+    }
+
     fn postfix(&mut self, mut e: ExprId, lo: u32) -> PResult<ExprId> {
         loop {
             match self.kind() {
@@ -3812,57 +3869,13 @@ impl<'a> Parser<'a> {
                 }
                 T::Dot => {
                     self.pos += 1;
-                    match self.kind() {
-                        T::KwAwait => {
-                            self.pos += 1;
-                            e = self.mk_expr(ExprKind::Await(e), lo);
+                    // `foo.1.` leaves the access's own dot behind: the next token is the next field
+                    loop {
+                        let (ne, trailing) = self.dot_suffix(e, lo)?;
+                        e = ne;
+                        if !trailing {
+                            break;
                         }
-                        T::Ident | T::RawIdent => {
-                            let name = self.ident_tok()?;
-                            let turbofish = if self.kind() == T::PathSep && matches!(self.nth(1), T::Lt | T::Shl | T::LArrow) {
-                                self.pos += 1;
-                                self.generic_args_angle()?
-                            } else {
-                                GenericArgsId::NONE
-                            };
-                            if self.kind() == T::OpenParen {
-                                let args = self.call_args()?;
-                                let args = self.ast.push_list(args);
-                                let row = self.ast.push_row(MethodCallRow { name, turbofish, args });
-                                e = self.mk_expr(ExprKind::MethodCall(e, row), lo);
-                            } else {
-                                e = self.mk_expr(ExprKind::Field(e, name), lo);
-                            }
-                        }
-                        T::Int => {
-                            let t = self.bump();
-                            let n = parse_index(self.text_of(t));
-                            e = self.mk_expr(ExprKind::TupleField(e, n), lo);
-                        }
-                        T::Float => {
-                            // `x.0.1`
-                            let t = self.bump();
-                            let s = self.text_of(t).to_vec();
-                            let mut dot = s.len();
-                            for i in 0..s.len() {
-                                if s[i] == b'.' {
-                                    dot = i;
-                                    break;
-                                }
-                            }
-                            let a = parse_index(&s[..dot]);
-                            e = self.mk_expr(ExprKind::TupleField(e, a), lo);
-                            if dot + 1 < s.len() {
-                                let b = parse_index(&s[dot + 1..]);
-                                e = self.mk_expr(ExprKind::TupleField(e, b), lo);
-                            } else if self.kind() == T::Int {
-                                // `x.0. 0`: the float `0.` ends in the access's dot, the next token is the field
-                                let t = self.bump();
-                                let b = parse_index(self.text_of(t));
-                                e = self.mk_expr(ExprKind::TupleField(e, b), lo);
-                            }
-                        }
-                        _ => return self.err("expected field or method"),
                     }
                 }
                 T::OpenParen => {

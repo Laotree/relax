@@ -2741,9 +2741,14 @@ impl Tcx {
                 self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
             }
         }
+        if source_ty.is_some() && self.prohibit_module_args(cx, prog, file, module, p) { return self.tys.error; }
         let regions = self.lower_region_args(cx.infcx, prog, file, module, env, p);
         let mut args = self.lower_generic_args(cx, prog, file, module, env, p);
         let def = prog.def(d);
+        if source_ty.is_some() && matches!(def.kind, DefKind::Prim(_)) && p.segs.len() == 1 && p.no_qself() {
+            let seg = &prog.files[file as usize].ast.segs(p.segs)[0];
+            if self.prohibit_args_on(cx, prog, file, seg, "builtin type", f.text(seg.name)) { return self.tys.error; }
+        }
         // a module named like a primitive (`use std::str;`, globs re-exporting std's modules)
         // does not hide the primitive type
         if def.kind == DefKind::Mod && p.segs.len() == 1 && p.no_qself() {
@@ -3184,6 +3189,7 @@ impl Tcx {
             }
             return None;
         };
+        if self.prohibit_module_args(cx, prog, file, module, p) { return None; }
         let k = prog.def(td).kind;
         if matches!(k, DefKind::Trait) { return Some(td); }
         // (a name another namespace or a misresolved module holds is left alone)
@@ -3195,7 +3201,7 @@ impl Tcx {
 
     /// prohibit_generic_args on a segment that names no generic definition (a type parameter,
     /// `Self`): arguments are E0109, associated item constraints E0229.
-    fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
+    pub(crate) fn prohibit_args_on(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, seg: &ast::PathSeg, what: &str, name: &str) -> bool {
         if !self.validates(prog, file) { return false; }
         let ast = &prog.files[file as usize].ast;
         if let Some(GenericArgs::Angle(v)) = ast.gargs(seg.args()) {
@@ -3207,6 +3213,27 @@ impl Tcx {
             }
         }
         self.prohibit_constraints(cx, prog, file, seg.args())
+    }
+
+    /// prohibit_generic_args on the segments of a path that name modules (`Mod::<i32>::Item`):
+    /// E0109. Only a segment with written arguments is resolved.
+    pub fn prohibit_module_args(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, module: u32, p: &ast::Path) -> bool {
+        if p.segs.len() < 2 || !p.no_qself() { return false; }
+        let ast = &prog.files[file as usize].ast;
+        let written = |seg: &ast::PathSeg| matches!(ast.gargs(seg.args()), Some(GenericArgs::Angle(v)) if ast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(_) | GenericArg::Type(_) | GenericArg::Const(_))));
+        let segs = ast.segs(p.segs);
+        if !segs[..segs.len() - 1].iter().any(written) || !self.validates(prog, file) { return false; }
+        let resolved = crate::program::path_segs(prog, file, p);
+        for (i, seg) in segs[..segs.len() - 1].iter().enumerate() {
+            if !written(seg) { continue; }
+            if let Some(m) = prog.resolve_mod_path(module, p.global(), &resolved[..=i], false, false) {
+                if prog.def(m).kind == DefKind::Mod {
+                    let name = prog.name(m).to_string();
+                    return self.prohibit_args_on(cx, prog, file, seg, "module", &name);
+                }
+            }
+        }
+        false
     }
 
     /// prohibit_assoc_item_constraint: `Foo<Item = T>` where no trait is named (E0229).
