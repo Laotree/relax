@@ -1597,6 +1597,9 @@ impl Tcx {
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.check_type_alias(prog, did) { if !errors.contains(&e) { errors.push(e); } }
         }
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::bound_assoc_cycles(prog, self, did));
+        }
         if def.kind == DefKind::Trait && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::supertrait_cycles(prog, self, did));
         }
