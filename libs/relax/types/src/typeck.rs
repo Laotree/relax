@@ -493,11 +493,16 @@ pub struct Fcx<'a> {
 /// as rustc_codegen_ssa::mir::FunctionCx::monomorphize does. Analysis consumers
 /// requesting fully normalized tables use instantiate_body instead.
 pub fn codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> std::sync::Arc<Body> {
+    try_codegen_body(prog, tcx, def, args).expect("failed to normalize body for codegen")
+}
+
+/// codegen_body for a caller that has a fallback: an instance whose types do not normalize
+/// (an ill-formed program, e.g. `bop::<dyn Bop>` with a `Self: Sized` associated type) is None.
+pub fn try_codegen_body(prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Option<std::sync::Arc<Body>> {
     let _cost_typeck = crate::fncost::phase(1);
     let _mem = crate::memstat::tag(crate::memstat::Tag::Typeck);
     let body = tcx.typeck(prog, def);
-    instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args)
-        .expect("failed to normalize body for codegen")
+    instantiate::try_instantiate_mir_and_normalize_erasing_regions(prog, tcx, body, args).ok()
 }
 
 pub fn instantiate_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: DefId, args: &[TyId]) -> Body {
@@ -973,7 +978,7 @@ impl<'a> Fcx<'a> {
     fn unsize_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> bool {
         let save = self.start_snapshot();
         let ok = match (ka, kx) {
-            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d),
+            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => self.array_to_slice(*a, *d) || self.struct_unsize_goal(*a, *d),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
                 let (xs, ys) = (self.tcx.tys.list(*xs), self.tcx.tys.list(*ys));
                 let mut found = None;
@@ -996,6 +1001,21 @@ impl<'a> Fcx<'a> {
         };
         if !ok { self.rollback_to(save); } else { self.commit_from(save); }
         ok
+    }
+
+    /// A struct to the same struct with other arguments (`Foo<i32, Count<N>>` -> `Foo<u32, ()>`): the
+    /// solver's `S<..>: Unsize<S<..>>` (the last-field rule, rustc coerce_unsized).
+    fn struct_unsize_goal(&mut self, a: TyId, d: TyId) -> bool {
+        let (a, d) = (self.shallow(a), self.shallow(d));
+        let (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) = (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) else { return false };
+        if d1 != d2 || a == d || self.prog.def(d1).kind != DefKind::Struct || self.tcx.tys.list(xs).is_empty() || self.tcx.tys.list(xs).len() != self.tcx.tys.list(ys).len() { return false; }
+        let Some(unsize) = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize) else { return false };
+        // types that can be equal are related, not unsized (`W<?x>` -> `W<T>`)
+        let probe = self.start_snapshot();
+        let same = self.eq(a, d);
+        self.rollback_to(probe);
+        if same { return false; }
+        matches!(self.select_trait(unsize, a, &[d]), Ok(Some(_)))
     }
 
     /// `[T; N]` -> `[T]`, also as the tail of a struct (`Holder<[T; N]>` -> `Holder<[T]>`, rustc
@@ -2279,13 +2299,11 @@ impl<'a> Fcx<'a> {
                 self.coerce_or_unify(t, expected, Some(*e), ast.expr(*e).lo);
             }
             Pat::Range(a, b, _) => {
-                if let Some(a) = a {
-                    let t = self.check_expr(*a, Some(expected));
-                    self.eq(t, expected);
-                }
-                if let Some(b) = b {
-                    let t = self.check_expr(*b, Some(expected));
-                    self.eq(t, expected);
+                // rustc pat.rs check_pat_range: each end has the scrutinee's type (demand_eqtype_pat)
+                for end in [a, b].into_iter().flatten() {
+                    let t = self.check_expr(*end, Some(expected));
+                    let pos = self.ast().expr(*end).lo;
+                    self.demand_eq(expected, t, pos);
                 }
             }
             Pat::Tuple(v) => {
@@ -2531,7 +2549,7 @@ impl<'a> Fcx<'a> {
                         }
                         let v: Vec<TyId> = self.ast().list(elems).iter().map(|_| self.fresh(0)).collect();
                         let tt = self.tcx.tys.intern(TyKind::Tuple(self.tcx.tys.mk_list(&v)));
-                        self.eq(st, tt);
+                        self.demand_eq(st, tt, lo);
                         v
                     }
                 };
@@ -3004,6 +3022,23 @@ impl<'a> Fcx<'a> {
                 return Res::Def(*ad);
             }
         }
+        // `Alias::Variant { .. }`: the variant of the enum a type alias names (rustc resolves the
+        // alias path as a type, then the variant type-relatively)
+        if path.segs.len() == 2 && !path.has_qself() {
+            let segs = crate::program::path_segs(prog, self.file, path);
+            if segs[0].0 == SegKind::Ident {
+                if let Some(alias) = prog.lookup_in_scope(self.module, segs[0].1, true).filter(|a| prog.def(*a).kind == DefKind::TypeAlias) {
+                    let at = self.tcx.alias_ty(&self.cx.with_infcx(&self.infcx), prog, alias);
+                    if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(at) {
+                        if prog.def(*ad).kind == DefKind::Enum {
+                            if let Some(v) = prog.lookup_in_container(*ad, segs[1].1, false).filter(|v| prog.def(*v).kind == DefKind::Variant) {
+                                return Res::Def(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let (r, _) = self.resolve_value_path(path, u32::MAX, false);
         // rustc_resolve E0574: only a struct, variant or union names a struct literal / pattern
         if let Res::Def(d) = r {
@@ -3153,6 +3188,18 @@ impl<'a> Fcx<'a> {
     fn resolve_qself_no_trait(&mut self, self_t: TyId, name: Sym, key: u32, lo: u32, path: &Path) -> (Res, TyId) {
         let error = self.tcx.tys.error;
         let st = self.shallow(self_t);
+        // `<Self>::Variant(..)`, `Alias::Variant`: an enum's variant (rustc
+        // resolve_fully_qualified_call looks up enum variants before probing: they win over inherent items)
+        if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(st).clone() {
+            if self.prog.def(ad).kind == DefKind::Enum {
+                if let Some(v) = self.prog.lookup_in_container(ad, name, false) {
+                    if self.prog.def(v).kind == DefKind::Variant {
+                        let t = self.value_def_ty(v, Some(self.tcx.tys.list(aargs).to_vec()), key);
+                        return (Res::Def(v), t);
+                    }
+                }
+            }
+        }
         if let TyKind::Dyn(td, targs, _, _, _, _, _) = self.tcx.tys.kind(st).clone() {
             let item = match self.dyn_method(td, name, lo) {
                 Ok(item) => item,
@@ -3204,18 +3251,6 @@ impl<'a> Fcx<'a> {
             let args = self.trait_call_args(item, imp, st, &given);
             let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
-        }
-        // `<Self>::Variant(..)`, `Alias::Variant`: an enum's variant (rustc
-        // resolve_fully_qualified_call looks up enum variants before probing)
-        if let TyKind::Adt(ad, aargs, _) = self.tcx.tys.kind(st).clone() {
-            if self.prog.def(ad).kind == DefKind::Enum {
-                if let Some(v) = self.prog.lookup_in_container(ad, name, false) {
-                    if self.prog.def(v).kind == DefKind::Variant {
-                        let t = self.value_def_ty(v, Some(self.tcx.tys.list(aargs).to_vec()), key);
-                        return (Res::Def(v), t);
-                    }
-                }
-            }
         }
         // a rigid projection or param of a generic body (`<A as Alloc<T>>::Mem::default()`):
         // through its bounds
@@ -3890,8 +3925,22 @@ impl<'a> Fcx<'a> {
             return None;
         }
         let t = self.shallow(t);
+        // a variable that is an opaque's hidden type in its defining scope derefs through the
+        // opaque's item bounds (autoderef.rs overloaded_deref_ty on a pending `?h: Deref`)
+        let hidden_of_opaque = matches!(self.tcx.tys.kind(t), TyKind::Infer(v) if self.infcx.has_opaques_with_sub_unified_hidden_type(*v));
         match self.tcx.tys.kind(t).clone() {
             TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => Some(self.shallow(i)),
+            TyKind::Infer(_) if hidden_of_opaque => {
+                let td = self.tcx.lang_items.get(crate::lang_items::LangItem::Deref)?;
+                let dt = self.infcx.deeply_resolve_ignoring_regions(t);
+                self.select_trait(td, dt, &[]).ok()?;
+                let target = self.tcx.trait_assoc(self.prog, td, self.prog.syms.get("Target")?)?;
+                let proj = self.tcx.tys.intern(TyKind::Alias(crate::consts::IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: target }, args: self.tcx.tys.mk_list(&[dt]), regions: crate::types::RegionArgsId::EMPTY }));
+                let r = self.norm(proj);
+                let m = self.trait_fn(td, "deref")?;
+                self.b.ov_derefs.insert((e, step), (m, self.tcx.tys.mk_list(&[dt])));
+                Some(r)
+            }
             // (a param / rigid projection with a Deref bound derefs to its `Target` binding,
             // `D: DerefMut<Target = DrawVars>`)
             // (an opaque type derefs through its item bounds: `impl Deref<Target = Path>`,
@@ -4574,6 +4623,8 @@ impl<'a> Fcx<'a> {
                     return unit;
                 }
                 let ta = self.check_expr(*a, None);
+                // rustc check_expr_assign: the assigned place is Sized (AssignmentLhsSized)
+                if self.tcx.validates(self.prog, self.file) { let apos = self.ast().expr(*a).lo; self.require_type_is_sized_deferred(ta, apos); }
                 let tb = self.check_expr(*b, Some(ta));
                 self.coerce_or_unify(tb, ta, Some(*b), lo);
                 unit
@@ -4935,7 +4986,9 @@ impl<'a> Fcx<'a> {
                     if self.loops[i].is_loop {
                         match self.loops[i].break_ty {
                             Some(prev) => {
-                                self.eq(prev, bt);
+                                // rustc check_expr_break: every `break` coerces to the loop's type
+                                let bpos = match x.get() { Some(v) => self.ast().expr(v).lo, None => lo };
+                                self.demand_eq(prev, bt, bpos);
                             }
                             None => self.loops[i].break_ty = Some(bt),
                         }
