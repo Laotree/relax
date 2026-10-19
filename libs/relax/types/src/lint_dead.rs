@@ -72,7 +72,7 @@ struct TypeWalker<'a> {
 }
 
 impl<'a> TypeWalker<'a> {
-    fn new(prog: &'a Program, d: DefId) -> TypeWalker<'a> {
+    pub(crate) fn new(prog: &'a Program, d: DefId) -> TypeWalker<'a> {
         let def = prog.def(d);
         let mut w = TypeWalker { prog, file: def.file, ast: &prog.files[def.file as usize].ast, module: def.scope, params: HashSet::new(), self_def: None, out: Vec::new() };
         // generic parameters of the definition and the impl / trait around it
@@ -264,7 +264,7 @@ impl<'a> TypeWalker<'a> {
         }
     }
 
-    fn resolve_path_def(&self, p: &Path, ty_ns: bool) -> Option<DefId> {
+    pub(crate) fn resolve_path_def(&self, p: &Path, ty_ns: bool) -> Option<DefId> {
         let segs = crate::program::path_segs(self.prog, self.file, p);
         let first = *segs.first()?;
         if segs.len() == 1 && first.0 == SegKind::Ident && !p.global() {
@@ -310,6 +310,12 @@ fn item_refs(prog: &Program, d: DefId) -> Vec<Ref> {
 }
 
 /// `pub_only`: only what the item exposes (the `pub` fields of a struct).
+/// The trait definition a bound path of an item resolves to.
+pub(crate) fn resolve_trait_path(prog: &Program, d: DefId, p: &Path) -> Option<DefId> {
+    let w = TypeWalker::new(prog, d);
+    w.resolve_path_def(p, true)
+}
+
 fn item_refs_in(prog: &Program, d: DefId, pub_only: bool) -> Vec<Ref> {
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
