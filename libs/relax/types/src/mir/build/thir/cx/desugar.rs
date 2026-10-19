@@ -75,15 +75,20 @@ impl Cx<'_> {
             };
             let cond = self.mirror_expr(row.cond)?;
             let then = self.block_expr(e, row.body, unit)?;
-            // `else { break; }`
+            // `else { break; }` as rustc's THIR has it: the `!` block and the statement's `break` are
+            // each coerced to `()`
             let never = self.tcx().tys.never;
             let else_scope = self.synthetic_scope(e, Synthetic::WhileElse, ScopeData::Node, span)?;
             let else_block_scope = self.synthetic_scope(e, Synthetic::WhileElseBlock, ScopeData::Node, span)?;
-            let break_scope = self.synthetic_scope(e, Synthetic::WhileBreak, ScopeData::Node, span)?;
+            let break_stmt_scope = self.synthetic_scope(e, Synthetic::WhileBreak, ScopeData::Node, span)?;
+            let break_scope = self.synthetic_scope(e, Synthetic::WhileBreakExpr, ScopeData::Node, span)?;
             let brk = self.push(Expr { kind: ExprKind::Break { label: loop_scope, value: None }, ty: never, temp_scope: Some(break_scope), span });
-            let stmt = self.thir.alloc_stmt(Stmt { kind: StmtKind::Expr { scope: break_scope, expr: brk } });
+            let brk = self.push(Expr { kind: ExprKind::NeverToAny { source: brk }, ty: unit, temp_scope: Some(break_scope), span });
+            let brk = self.scope_wrap(e, break_scope, brk);
+            let stmt = self.thir.alloc_stmt(Stmt { kind: StmtKind::Expr { scope: break_stmt_scope, expr: brk } });
             let else_block = self.thir.alloc_block(Block { targeted_by_break: false, region_scope: else_block_scope, span, stmts: Box::new([stmt]), expr: None, safety_mode: BlockSafety::Safe });
-            let else_expr = self.push(Expr { kind: ExprKind::Block { block: else_block }, ty: unit, temp_scope: Some(else_scope), span });
+            let else_expr = self.push(Expr { kind: ExprKind::Block { block: else_block }, ty: never, temp_scope: Some(else_scope), span });
+            let else_expr = self.push(Expr { kind: ExprKind::NeverToAny { source: else_expr }, ty: unit, temp_scope: Some(else_scope), span });
             let else_opt = Some(self.scope_wrap(e, else_scope, else_expr));
             let if_expr = self.mk(e, ExprKind::If { if_then_scope, cond, then, else_opt }, unit);
             let if_id = self.push(if_expr);
@@ -241,7 +246,7 @@ impl Cx<'_> {
         let ret_any = self.push(self.mk(e, ExprKind::NeverToAny { source: ret }, expr_ty));
         let break_arm = self.thir.alloc_arm(Arm { pattern: Box::new(break_pat), guard: None, body: ret_any, node: e.0, scope, span });
 
-        Ok(self.mk(e, ExprKind::Match { scrutinee, arms: Box::new([continue_arm, break_arm]), match_source: MatchSource::TryDesugar }, expr_ty))
+        Ok(self.mk(e, ExprKind::Match { scrutinee, arms: Box::new([break_arm, continue_arm]), match_source: MatchSource::TryDesugar }, expr_ty))
     }
 
     // ---------------------------------------------------------------- destructuring assignment

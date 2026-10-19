@@ -14,7 +14,7 @@ pub enum Node {
     Synthetic(u32, Synthetic),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, WhileElse, WhileElseBlock, WhileBreak, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
+pub enum Synthetic { Iteration, ForMatch, ForArm, ForBody, ForIntoIter, ForNext, TryBranch, WhileElse, WhileElseBlock, WhileBreak, WhileBreakExpr, AwaitIntoFuture, AwaitPollCall, AwaitNewUnchecked, AwaitGetContext, AwaitArm, AwaitLoop, AwaitBody, AwaitPoll, AwaitReady, AwaitPending, AwaitYield, MacroArm, MacroBranch, MacroStatement, DebugBranch, AssignBlock, AssignLet, Assignment }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ScopeData { Node, CallSite, Arguments, Destruction, IfThen, IfThenRescope, MatchGuard, Remainder(u32) }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -293,6 +293,7 @@ impl Resolve<'_> {
                 self.node(Node::Synthetic(e.0, Synthetic::WhileElse), true);
                 self.node(Node::Synthetic(e.0, Synthetic::WhileElseBlock), false);
                 self.node(Node::Synthetic(e.0, Synthetic::WhileBreak), true);
+                self.node(Node::Synthetic(e.0, Synthetic::WhileBreakExpr), false);
             }
             ExprKind::Loop(b, _) => self.block(b, true),
             ExprKind::For(row) => {

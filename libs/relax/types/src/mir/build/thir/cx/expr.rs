@@ -930,7 +930,7 @@ impl Cx<'_> {
                 mirrored = self.push(self.mk(e, ExprKind::PointerCoercion { cast, source: mirrored, is_from_as_cast: true }, fn_ptr));
             }
         }
-        let kind = if adjusted == expr_ty {
+        let kind = if adjusted == expr_ty || tcx.tys.erase_regions(adjusted) == tcx.tys.erase_regions(expr_ty) {
             // a coercion cast (or a no-op): the value converted by the coercion
             ExprKind::Use { source: mirrored }
         } else if matches!(tcx.tys.kind(source_ty), TyKind::Ref(..)) {
