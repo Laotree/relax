@@ -16,6 +16,9 @@ use super::borrowck_errors::{BorrowckError, ErrorKind};
 use super::constraints::{AnnotationSource, ConstraintCategory, OutlivesConstraint, OutlivesConstraintSet,
     RegionVid, ReturnConstraint};
 use super::mir_nll::LocationMap;
+use super::polonius::PoloniusContext;
+use super::universal_regions::UniversalRegions;
+use crate::mir::move_paths::MoveData;
 use super::region_infer::{NllRegionVariableOrigin, TypeTest};
 use super::region_infer::values::{LivenessValues, PlaceholderIndices};
 use crate::lang_items::LangItem;
@@ -67,7 +70,7 @@ pub struct MirBug { pub span: Span, pub message: String }
 /// through `fully_perform_op`, whose region constraints are converted into `out` by
 /// N:type_check/constraint_conversion.rs at the given locations and category), and the
 /// typed queries of rustc_middle that need region-preserving native answers.
-pub trait BorrowckTypeOps {
+pub trait BorrowckTypeOps: liveness::LivenessOps {
     fn universe(&self) -> UniverseIndex;
     fn create_next_universe(&mut self) -> UniverseIndex;
     /// `next_nll_region_var_in_universe`; the result is a `ReVar` region.
@@ -191,16 +194,29 @@ impl MirTypeckRegionConstraints {
 pub struct MirTypeckResults {
     pub constraints: MirTypeckRegionConstraints,
     pub deferred_closure_requirements: Vec<DeferredClosureRequirement>,
+    /// Live-region variances and the deferred (NLL-boring, Polonius-relevant) locals of liveness.
+    pub polonius: PoloniusContext,
+    /// Overflows while adding drop-check rules (E0320), reported by the caller.
+    pub dropck_overflows: Vec<liveness::DropckOverflow>,
     pub errors: Vec<BorrowckError>,
     pub mir_bugs: Vec<MirBug>,
     pub tainted_by_errors: bool,
 }
 
-/// `type_check` (mod.rs:97): `normalized_inputs_and_output` and the universal
-/// yield/resume types come from N01's `free_region_relations::create`. Liveness
-/// (`liveness::generate`) runs on the region input the caller assembles from the result.
-pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, body: &Body, normalized_inputs_and_output: &[TyId],
-    universal_yield_resume: Option<(TyId, TyId)>) -> MirTypeckResults {
+/// What `type_check` takes besides the body: the signature normalized by
+/// `free_region_relations::create` (inputs, then output), the universal yield/resume types
+/// of a coroutine, the universal regions, and the body's move data (for drop liveness).
+pub struct TypeckInputs<'a> {
+    pub normalized_inputs_and_output: &'a [TyId],
+    pub universal_yield_resume: Option<(TyId, TyId)>,
+    pub universals: &'a UniversalRegions,
+    pub moves: &'a MoveData,
+    /// `borrow_set.len() != 0`.
+    pub has_loans: bool,
+}
+
+/// `type_check` (mod.rs:97).
+pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, body: &Body, inputs: &TypeckInputs<'_>) -> MirTypeckResults {
     let location_map = LocationMap::new(body);
     let mut typeck = TypeChecker {
         tcx, prog, infcx, last_span: Span::default(), body, promoted: &body.promoted, defining: body.source.clone(),
@@ -210,8 +226,13 @@ pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, bo
     };
     typeck.check_user_type_annotations();
     typeck.visit_body(body);
-    typeck.equate_inputs_and_outputs(normalized_inputs_and_output, universal_yield_resume);
+    typeck.equate_inputs_and_outputs(inputs.normalized_inputs_and_output, inputs.universal_yield_resume);
     typeck.check_signature_annotation();
+    let mut polonius = PoloniusContext::default();
+    let mut dropck_overflows = vec![];
+    liveness::generate(liveness::LivenessCx { tcx, prog, infcx: &mut *typeck.infcx, body, moves: inputs.moves, universals: inputs.universals,
+        locations: &location_map, has_loans: inputs.has_loans, constraints: &mut typeck.constraints, polonius: &mut polonius,
+        overflows: &mut dropck_overflows });
     let mut tainted_by_errors = typeck.tainted_by_errors || !typeck.mir_bugs.is_empty() || !typeck.errors.is_empty();
     // A region error from type check clears the constraints that would only repeat it.
     if typeck.infcx.encountered_re_error() {
@@ -220,7 +241,7 @@ pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, bo
         tainted_by_errors = true;
     }
     MirTypeckResults { constraints: typeck.constraints, deferred_closure_requirements: typeck.deferred_closure_requirements,
-        errors: typeck.errors, mir_bugs: typeck.mir_bugs, tainted_by_errors }
+        polonius, dropck_overflows, errors: typeck.errors, mir_bugs: typeck.mir_bugs, tainted_by_errors }
 }
 
 /// The MIR type checker (mod.rs:224).

@@ -4,6 +4,8 @@
 use super::constraints::{AnnotationSource, ConstraintCategory as Cat, OutlivesConstraint, ReturnConstraint};
 use super::region_infer::NllRegionVariableOrigin as Origin;
 use super::type_check::*;
+use super::universal_regions::{RegionClassification, UniversalRegions};
+use crate::mir::move_paths::MoveData;
 use crate::lang_items::LangItem;
 use crate::consts::GenericArg;
 use crate::mir::*;
@@ -35,11 +37,26 @@ struct Fake<'t> {
     /// `is_inline_const` and `unevaluated_const_ty` answers for the operand-order test.
     inline_const: bool,
     const_ty: Option<TyId>,
+    /// `dropck_outlives` answers by dropped type; the locations the query constraints were pushed at.
+    dropck: std::collections::HashMap<TyId, liveness::DropckData>,
+    pushed: Vec<Locations>,
 }
 impl<'t> Fake<'t> {
     fn new(tcx: &'t Tcx, first_var: usize) -> Self {
         Self { tcx, universe: UniverseIndex::ROOT, regions: vec![(Origin::Existential, UniverseIndex::ROOT); first_var],
-            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None }
+            ops: vec![], fn_sig: None, annotations: vec![], closure_sig: None, query_ty: None, inline_const: false, const_ty: None, dropck: Default::default(), pushed: vec![] }
+    }
+}
+impl liveness::LivenessOps for Fake<'_> {
+    fn dropck_outlives(&mut self, ty: TyId, _: Span) -> liveness::DropckData { self.dropck.get(&ty).cloned().unwrap_or_default() }
+    fn free_regions_for_liveness(&mut self, value: GenericArg) -> Vec<RegionId> {
+        let found = std::cell::RefCell::new(vec![]);
+        let ty = match value { GenericArg::Lifetime(r) => return vec![r], GenericArg::Type(t) => t, GenericArg::Const(_) => return vec![] };
+        self.tcx.tys.map_regions(ty, &|r, _| { if !matches!(self.tcx.tys.region_kind(r), RegionKind::ReBound(..)) { found.borrow_mut().push(r); } r }, 0);
+        found.into_inner()
+    }
+    fn push_region_constraints(&mut self, _: &mut MirTypeckRegionConstraints, l: Locations, _: Cat, _: &crate::next_solver::type_op::QueryRegionConstraints) {
+        self.pushed.push(l);
     }
 }
 impl BorrowckTypeOps for Fake<'_> {
@@ -119,7 +136,14 @@ fn check<'t>(tcx: &'t Tcx, fake: &mut Fake<'t>, b: &Body) -> MirTypeckResults {
 /// (variances_of), which read the program that declared them.
 fn check_in<'t>(tcx: &'t Tcx, prog: &Program, fake: &mut Fake<'t>, b: &Body) -> MirTypeckResults {
     let io: Vec<TyId> = (1..=b.arg_count as usize).chain([0]).map(|l| b.local_decls[l].ty).collect();
-    type_check(tcx, prog, fake, b, &io, None)
+    run(tcx, prog, fake, b, &io, None)
+}
+/// `type_check` with the trivial universal regions (only 'static) and the body's move data.
+fn run<'t>(tcx: &'t Tcx, prog: &Program, fake: &mut Fake<'t>, b: &Body, io: &[TyId], yield_resume: Option<(TyId, TyId)>) -> MirTypeckResults {
+    let universals = UniversalRegions::new(0, None, vec![(0, RegionClassification::Global)]);
+    let moves = MoveData::gather_moves(b, prog, tcx, crate::tcx::TypingEnv::fully_monomorphized(prog), &|_| true);
+    type_check(tcx, prog, fake, b, &TypeckInputs { normalized_inputs_and_output: io, universal_yield_resume: yield_resume,
+        universals: &universals, moves: &moves, has_loans: false })
 }
 /// (sup, sub, point, category) of the constraints, without the I/O equalities
 /// (Locations::All with BoringNoLocation).
@@ -194,7 +218,7 @@ fn call_arguments_destination_and_late_bound_regions() {
         vec![block(vec![], call(CallSource::Normal)), block(vec![], TerminatorKind::Return)]);
     let mut fake = Fake::new(&tcx, 3);
     fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    let r = type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None); clean(&r);
+    let r = run(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None); clean(&r);
     // The late-bound region becomes vid 3, live at the call (point 0).
     assert_eq!(fake.regions[3], (Origin::Existential, UniverseIndex::ROOT));
     assert!(r.constraints.liveness_constraints.point_liveness(3).is_some_and(|l| l.contains(0)));
@@ -205,12 +229,12 @@ fn call_arguments_destination_and_late_bound_regions() {
     // Calls not written by the user blame no argument.
     b.basic_blocks[0].terminator.as_mut().unwrap().kind = call(CallSource::OverloadedOperator);
     let mut fake = Fake::new(&tcx, 3); fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    assert_eq!(edges(&type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None))[1].3, Cat::Boring);
+    assert_eq!(edges(&run(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None))[1].3, Cat::Boring);
     // Wrong arity is ill-typed MIR.
     b.basic_blocks[0].terminator.as_mut().unwrap().kind = TerminatorKind::Call { func: val(f), args: vec![], destination: p(3), target: Some(BasicBlock(1)),
         unwind: UnwindAction::Continue, call_source: CallSource::Normal, fn_span: span(80), arg_spans: vec![] };
     let mut fake = Fake::new(&tcx, 3); fake.fn_sig = Some(PolyFnSig { sig: FnSig { inputs: vec![late], output: late, header: FnHeader::RUST }, bound_regions: 1 });
-    let r = type_check(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None);
+    let r = run(&tcx, &prog, &mut fake, &b, &[t, tcx.tys.unit], None);
     assert!(r.tainted_by_errors && r.mir_bugs[0].message.contains("wrong # of args"));
 }
 
@@ -223,7 +247,7 @@ fn return_and_yield_categories() {
     b.coroutine = Some(CoroutineInfo { yield_ty: rf(&tcx, re(&tcx, 3), t, false), resume_ty: rf(&tcx, re(&tcx, 4), t, false), kind: CoroutineKind::Coroutine });
     let mut fake = Fake::new(&tcx, 7);
     let io = [r1, r0];
-    let r = type_check(&tcx, &test_prog(), &mut fake, &b, &io, Some((rf(&tcx, re(&tcx, 5), t, false), rf(&tcx, re(&tcx, 6), t, false)))); clean(&r);
+    let r = run(&tcx, &test_prog(), &mut fake, &b, &io, Some((rf(&tcx, re(&tcx, 5), t, false), rf(&tcx, re(&tcx, 6), t, false)))); clean(&r);
     assert_eq!(edges(&r), [(1, 0, Some(0), Cat::Return(ReturnConstraint::Normal)), (1, 3, Some(1), Cat::Yield), (4, 2, Some(1), Cat::Yield)]);
     // Universal yield/resume types are equated with the body's everywhere.
     let all: Vec<_> = r.constraints.outlives_constraints.outlives.iter().filter(|c| c.category == Cat::BoringNoLocation).map(|c| (c.sup, c.sub, c.location)).collect();
@@ -468,7 +492,7 @@ fn closure_signature_annotations_skip_wf() {
     let mut fake = Fake::new(&tcx, 1);
     fake.closure_sig = Some(FnSig { inputs: vec![t, t], output: t, header: FnHeader::RUST });
     let io = [tcx.tys.unit, t, t, t];
-    let r = type_check(&tcx, &test_prog(), &mut fake, &b, &io, None); clean(&r);
+    let r = run(&tcx, &test_prog(), &mut fake, &b, &io, None); clean(&r);
     let skip: Vec<_> = fake.ops.iter().filter_map(|o| if let Op::AscribeSkipWf(_, _, s) = o { Some(*s) } else { None }).collect();
     // The implicit `self` (_1) is skipped; arguments _2, _3 then the return place.
     assert_eq!(skip, [span(52), span(53), span(50)]);
