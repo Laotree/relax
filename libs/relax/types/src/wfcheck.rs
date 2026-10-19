@@ -264,10 +264,13 @@ pub mod obligations {
         ocx: ObligationCtxt<'a, 'tcx>,
         env: ParamEnvId,
         def: DefId,
+        /// only dyn-compatibility goals are kept (a trait definition: its environment is not built)
+        only_dyn: bool,
     }
 
     impl<'a, 'tcx> Wfcx<'a, 'tcx> {
         fn register(&mut self, goal: Goal, pos: u32) {
+            if self.only_dyn && !matches!(goal.predicate.kind, PredicateKind::DynCompatible(_)) { return; }
             self.ocx.engine.register_predicate_obligation(self.infcx, PredicateObligation { goal, recursion_depth: 0, cause: ObligationCause { span: pos, body_id: self.def } });
         }
 
@@ -312,7 +315,8 @@ pub mod obligations {
         /// wf.rs clause_obligations: what makes one where-clause well formed.
         fn clause_obligations(&mut self, p: &Predicate, pos: u32) {
             let tys = &self.tcx.tys;
-            let escaping = |t: TyId| tys.has_vars_bound_at_or_above(t, 0);
+            // (bound regions do not matter to well-formedness; bound types and consts do)
+        let escaping = |t: TyId| { let f = tys.flags(t); f.contains(crate::types::TypeFlags::HAS_TY_BOUND) || f.contains(crate::types::TypeFlags::HAS_CT_BOUND) };
             match &p.kind {
                 PredicateKind::Clause(ClauseKind::Trait(t)) => {
                     if t.polarity == ClausePolarity::Negative { return; }
@@ -342,7 +346,8 @@ pub mod obligations {
                     if let AliasTerm::Ty(a) = &pc.projection_term { if !escaping(*a) { self.register_wf(*a, pos); } }
                     if let Term::Ty(t) = pc.term { if !escaping(t) { self.register_wf(t, pos); } }
                 }
-                PredicateKind::Clause(ClauseKind::ConstArgHasType(_, t)) => { if !escaping(*t) { self.register_wf(*t, pos); } }
+                PredicateKind::Clause(ClauseKind::WellFormed(Term::Ty(t))) => { if !escaping(*t) { self.register_wf(*t, pos); } }
+            PredicateKind::Clause(ClauseKind::ConstArgHasType(_, t)) => { if !escaping(*t) { self.register_wf(*t, pos); } }
                 _ => {}
             }
         }
@@ -439,7 +444,7 @@ pub mod obligations {
     fn with_wfcx(prog: &Program, tcx: &Tcx, def: DefId, f: impl FnOnce(&mut Wfcx<'_, '_>)) -> Vec<String> {
         let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), def);
         let env = tcx.param_env_id(prog, def);
-        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def };
+        let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env, def, only_dyn: false };
         w.check_false_global_bounds();
         f(&mut w);
         w.finish(prog.def(def).file)
@@ -462,7 +467,13 @@ pub mod obligations {
             }
             // (a trait's own environment is not built here: `param_env_id` of `trait Qux: Foo + AsRef<Self::Bar>` never
             // returns -- solver, crash lane)
-            DefKind::Trait => Vec::new(),
+            DefKind::Trait => {
+                // dyn-compatibility of the `dyn` types its bounds mention needs no environment
+                let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), did);
+                let mut w = Wfcx { prog, tcx, infcx: &infcx, ocx: ObligationCtxt::new(&infcx, prog), env: ParamEnvId::EMPTY, def: did, only_dyn: true };
+                w.check_where_clauses(item.lo);
+                w.finish(def.file)
+            }
             DefKind::Static => with_wfcx(prog, tcx, did, |w| check_static(w, ast, item)),
             DefKind::AssocConst => with_wfcx(prog, tcx, did, |w| check_assoc_const(w, ast, item)),
             DefKind::AssocTy => with_wfcx(prog, tcx, did, |w| check_assoc_ty(w, ast, item)),
