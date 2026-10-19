@@ -175,7 +175,7 @@ impl Builder<'_> {
             StatementKind::SetDiscriminant { .. } => panic!("SetDiscriminant must not exist during move gathering"),
             StatementKind::StorageLive(_) | StatementKind::PlaceMention(_)
             | StatementKind::AscribeUserType(..) | StatementKind::Intrinsic(_)
-            | StatementKind::ConstEvalCounter | StatementKind::Nop => (),
+            | StatementKind::ConstEvalCounter | StatementKind::Nop | StatementKind::BackwardIncompatibleDropHint { .. } => (),
         }
     }
     fn operand(&mut self, operand: &Operand) {

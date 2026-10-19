@@ -89,6 +89,9 @@ impl Checker<'_> {
                 next = parent.parent_scope;
             }
         }
+        if !self.body.upvars.is_empty() && !matches!(self.body.source.kind, BodyKind::Closure(_)) {
+            self.fail("upvars outside a closure body");
+        }
         // Promoted bodies have independent local/block/scope indices.
         self.super_body(self.body);
     }
@@ -98,10 +101,7 @@ impl Checker<'_> {
     fn operand_ty(&self, op: &Operand) -> Option<TyId> {
         match op {
             Operand::Copy(place) | Operand::Move(place) => self.place_ty(place),
-            Operand::Constant(c) => match c.const_ {
-                Const::Val(_, ty) => Some(ty),
-                Const::Unevaluated { .. } => None,
-            },
+            Operand::Constant(c) => Some(c.const_.ty(&self.tcx.tys)),
         }
     }
     fn rvalue_ty(&self, rv: &Rvalue) -> Option<TyId> {
@@ -164,6 +164,11 @@ impl Visitor for Checker<'_> {
     fn visit_source_scope(&mut self, scope: &SourceScope) {
         if scope.0 as usize >= self.body.source_scopes.len() {
             self.fail("source scope is out of range");
+        }
+    }
+    fn visit_alloc_id(&mut self, alloc: &AllocId) {
+        if alloc.0 as usize >= self.body.allocs.entries.len() {
+            self.fail("allocation is out of range");
         }
     }
     fn visit_user_type_index(&mut self, user: &UserTypeAnnotationIndex) {

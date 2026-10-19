@@ -40,7 +40,7 @@ pub struct PolyFnSig { pub sig: FnSig, pub bound_regions: u32 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UserType {
     /// A canonical annotation of the body, instantiated by N01's `instantiate_canonical`.
-    Annotation(UserTypeId),
+    Annotation(UserTypeAnnotationIndex),
     /// `UserTypeKind::TypeOf(def, UserArgs { args, user_self_ty: None })`.
     TypeOf(DefId, Vec<GenericArg>),
 }
@@ -97,8 +97,6 @@ pub trait BorrowckTypeOps {
     fn struct_tail(&mut self, out: &mut MirTypeckRegionConstraints, ty: TyId, location: Location) -> TyId;
     fn ascribe_user_type(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: UserType, span: Span);
     fn ascribe_user_type_skip_wf(&mut self, out: &mut MirTypeckRegionConstraints, inferred: TyId, user: TyId, span: Span);
-    /// `CanonicalUserTypeAnnotation { span, inferred_ty }` of an annotation.
-    fn user_type_annotation(&self, id: UserTypeId) -> (Span, TyId);
     /// `closure_user_provided_sig` of a closure-like body, canonical vars and binder
     /// instantiated with fresh variables (input_output.rs:48-56); None for other bodies.
     fn closure_user_provided_sig(&mut self, body: &Body) -> Option<FnSig>;
@@ -264,9 +262,8 @@ impl<'a> TypeChecker<'a> {
     /// Equate the inferred type and the annotated type for user type annotations.
     fn check_user_type_annotations(&mut self) {
         let body = self.body;
-        for &id in &body.user_type_annotations {
-            let (span, inferred_ty) = self.infcx.user_type_annotation(id);
-            self.infcx.ascribe_user_type(&mut self.constraints, inferred_ty, UserType::Annotation(id), span);
+        for (i, annotation) in body.user_type_annotations.iter().enumerate() {
+            self.infcx.ascribe_user_type(&mut self.constraints, annotation.inferred_ty, UserType::Annotation(UserTypeAnnotationIndex(i as u32)), annotation.span);
         }
     }
 
@@ -281,16 +278,25 @@ impl<'a> TypeChecker<'a> {
 
     fn relate_type_and_user_type(&mut self, a: TyId, v: V, user_ty: &UserTypeProjection, locations: Locations,
         category: ConstraintCategory) -> Result<(), NoSolution> {
-        let id = self.body.user_type_annotations[user_ty.base.0 as usize];
-        let (_, annotated_type) = self.infcx.user_type_annotation(id);
+        let annotated_type = self.body.user_type_annotations[user_ty.base.0 as usize].inferred_ty;
         let mut curr_projected_ty = PlaceTy::from_ty(annotated_type);
         for proj in &user_ty.projection {
-            curr_projected_ty = match proj {
-                PlaceElem::Field(field, _) => {
-                    let Some(ty) = self.infcx.field_ty(curr_projected_ty, *field) else { return Err(NoSolution) };
+            // The dummy local and types of a ProjectionKind are never read by projection_ty.
+            curr_projected_ty = match *proj {
+                UserTypeProjectionElem::Field(field) => {
+                    let Some(ty) = self.infcx.field_ty(curr_projected_ty, field) else { return Err(NoSolution) };
                     PlaceTy::from_ty(self.infcx.normalize(&mut self.constraints, ty, locations))
                 }
-                elem => curr_projected_ty.projection_ty(self.tcx, elem).ok_or(NoSolution)?,
+                UserTypeProjectionElem::Deref => curr_projected_ty.projection_ty(self.tcx, &PlaceElem::Deref).ok_or(NoSolution)?,
+                UserTypeProjectionElem::Index => curr_projected_ty.projection_ty(self.tcx, &PlaceElem::Index(Local(0))).ok_or(NoSolution)?,
+                UserTypeProjectionElem::ConstantIndex { offset, min_length, from_end } =>
+                    curr_projected_ty.projection_ty(self.tcx, &PlaceElem::ConstantIndex { offset, min_length, from_end }).ok_or(NoSolution)?,
+                UserTypeProjectionElem::Subslice { from, to, from_end } =>
+                    curr_projected_ty.projection_ty(self.tcx, &PlaceElem::Subslice { from, to, from_end }).ok_or(NoSolution)?,
+                UserTypeProjectionElem::Downcast(name, variant) =>
+                    curr_projected_ty.projection_ty(self.tcx, &PlaceElem::Downcast(name, variant)).ok_or(NoSolution)?,
+                // rustc: unreachable in a user type projection.
+                UserTypeProjectionElem::OpaqueCast | UserTypeProjectionElem::Subtype => return Err(NoSolution),
             };
         }
         let ty = curr_projected_ty.ty;
@@ -342,9 +348,9 @@ impl<'a> TypeChecker<'a> {
     }
     fn const_ty(&self, c: &ConstOperand) -> TyId {
         match &c.const_ {
-            Const::Val(_, ty) => *ty,
+            Const::Val(_, ty) | Const::Ty(ty, _) => *ty,
             Const::Unevaluated { promoted: Some(p), .. } => self.promoted[p.0 as usize].local_decls[0].ty,
-            Const::Unevaluated { def, args, promoted: None } => self.infcx.unevaluated_const_ty(*def, args),
+            Const::Unevaluated { def, args, promoted: None, .. } => self.infcx.unevaluated_const_ty(*def, args),
         }
     }
     fn place_ty(&self, place: &Place) -> PlaceTy {
@@ -584,7 +590,7 @@ impl<'a> TypeChecker<'a> {
             AggregateKind::Adt(def, _, args, _, _) => (ClauseOwner::Def(*def), args.clone()),
             // Closures carry requirements on the free regions of their creator, like where
             // clauses on the closure struct; they are checked here where it is instantiated.
-            AggregateKind::Closure(id, args) => (ClauseOwner::Closure(*id), self.prove_closure_bounds(ClauseOwner::Closure(*id), args, location)),
+            AggregateKind::Closure(id, args) | AggregateKind::CoroutineClosure(id, args) => (ClauseOwner::Closure(*id), self.prove_closure_bounds(ClauseOwner::Closure(*id), args, location)),
             AggregateKind::Coroutine(id, args) => (ClauseOwner::Coroutine(*id), self.prove_closure_bounds(ClauseOwner::Coroutine(*id), args, location)),
             AggregateKind::Array(_) | AggregateKind::Tuple | AggregateKind::RawPtr(..) => return,
         };
@@ -610,7 +616,7 @@ impl<'a> TypeChecker<'a> {
         let locations = to_locations(location);
         let ty_from = self.operand_ty(op);
         match cast_kind {
-            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer, source) => {
+            CastKind::PointerCoercion(PointerCoercion::ReifyFnPointer(_), source) => {
                 let implicit = source == CoercionSource::Implicit;
                 let Some(mut src_sig) = self.fn_sig(ty_from) else { return self.mirbug(format!("reify of non-function {ty_from:?}")) };
                 // Target safety: a safe fn item may be reified to an unsafe fn pointer.
@@ -647,7 +653,7 @@ impl<'a> TypeChecker<'a> {
                     self.mirbug(format!("equating {src_ty:?} with {ty:?} yields {terr:?}"));
                 }
             }
-            CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer, source) => {
+            CastKind::PointerCoercion(PointerCoercion::ClosureFnPointer(_), source) => {
                 // Relax closure types carry their un-tupled signature as a FnPtr.
                 let TyKind::Closure(_, _, crate::types::ClosureArgs { closure_sig_as_fn_ptr_ty: sig, .. }) = *tys.kind(ty_from) else { return self.mirbug(format!("closure cast of {ty_from:?}")) };
                 let TyKind::FnPtr(inputs, output, header, n) = tys.kind(sig).clone() else { return self.mirbug(format!("closure signature {sig:?}")) };
@@ -831,7 +837,8 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(..)) | StatementKind::FakeRead(..) | StatementKind::StorageLive(..)
-            | StatementKind::StorageDead(..) | StatementKind::ConstEvalCounter | StatementKind::PlaceMention(..) | StatementKind::Nop => {}
+            | StatementKind::StorageDead(..) | StatementKind::ConstEvalCounter | StatementKind::PlaceMention(..) | StatementKind::Nop
+            | StatementKind::BackwardIncompatibleDropHint { .. } => {}
             StatementKind::Intrinsic(NonDivergingIntrinsic::CopyNonOverlapping { .. }) | StatementKind::SetDiscriminant { .. } => {
                 self.mirbug("Statement not allowed in this MIR phase".into());
             }
@@ -924,9 +931,8 @@ impl<'a> TypeChecker<'a> {
     fn check_local_decl(&mut self, local: Local, decl: &LocalDecl) {
         self.visit_local_decl(decl);
         for user_ty in &decl.user_ty {
-            let id = self.body.user_type_annotations[user_ty.base.0 as usize];
-            let (span, _) = self.infcx.user_type_annotation(id);
-            let ty = if matches!(decl.local_info, LocalInfo::User { is_ref_binding: false, .. }) {
+            let span = self.body.user_type_annotations[user_ty.base.0 as usize].span;
+            let ty = if !matches!(decl.local_info, LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: BindingMode(ByRef::Yes(_), _), .. }))) {
                 decl.ty
             } else if let TyKind::Ref(_, rty, _) = *self.tcx.tys.kind(decl.ty) {
                 // `let ref x: T = ..`: the annotation is on the referent.
@@ -999,7 +1005,7 @@ impl<'a> TypeChecker<'a> {
         // mod.rs:1707: super_operand visits the constant (visit_const_operand) before the
         // inline-const bounds are proven.
         self.check_const_operand(constant, location);
-        if let Const::Unevaluated { def, args, promoted: None } = &constant.const_ {
+        if let Const::Unevaluated { def, args, promoted: None, .. } = &constant.const_ {
             // Inline consts are closures of their parent: prove their bounds here.
             if self.infcx.is_inline_const(*def) {
                 let args = self.prove_closure_bounds(ClauseOwner::Def(*def), args, location);
@@ -1034,10 +1040,12 @@ impl<'a> TypeChecker<'a> {
                         self.mirbug(format!("bad promoted type ({ty:?}: {promoted_ty:?}): {terr:?}"));
                     }
                 }
-                Const::Unevaluated { def, args, promoted: None } => {
+                Const::Unevaluated { def, args, promoted: None, .. } => {
                     let span = locations.span(self.body);
                     self.infcx.ascribe_user_type(&mut self.constraints, ty, UserType::TypeOf(*def, args.clone()), span);
                 }
+                // Const generic parameters are ascribed below.
+                Const::Ty(..) => {}
                 Const::Val(..) => {
                     if let Some(static_def) = self.infcx.static_ptr(constant) {
                         let normalized_ty = self.infcx.static_ty(&mut self.constraints, static_def, locations);
@@ -1052,7 +1060,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             // Const generic parameters (`Const::Ty(Param)`) are ascribed TypeOf(param) by
-            // nightly; Relax MIR has no const-parameter operand form (they are TyIds).
+            // nightly (S7: the `Const::Ty` arm above must do this once the builder emits them).
             if let TyKind::FnDef(def, args, regions) = self.tcx.tys.kind(ty).clone() {
                 self.infcx.normalize_and_prove_instantiated_clauses(&mut self.constraints, ClauseOwner::Def(def), &self.tcx.complete_args(self.prog, def, self.tcx.tys.list(args), regions), locations);
                 for t in self.tcx.tys.list(args).iter().copied() {
@@ -1135,7 +1143,7 @@ impl<'a> Visitor for TypeChecker<'a> {
 fn ambient_variance(context: PlaceContext) -> V {
     match context {
         PlaceContext::MutatingUse(_) => V::Inv,
-        PlaceContext::NonUse(NonUseContext::StorageDead | NonUseContext::StorageLive | NonUseContext::VarDebugInfo) => V::Inv,
+        PlaceContext::NonUse(NonUseContext::StorageDead | NonUseContext::StorageLive | NonUseContext::VarDebugInfo | NonUseContext::BackwardIncompatibleDropHint) => V::Inv,
         PlaceContext::NonMutatingUse(_) => V::Co,
         PlaceContext::NonUse(NonUseContext::AscribeUserTy(variance)) => mir_variance(variance),
     }
@@ -1149,7 +1157,7 @@ fn from_hir_call(source: CallSource) -> bool { matches!(source, CallSource::Norm
 fn try_to_target_usize(c: &Const) -> Option<u64> {
     match c {
         Const::Val(ConstValue::Scalar(Scalar::Int { bits, .. }), _) => u64::try_from(*bits).ok(),
-        Const::Val(..) | Const::Unevaluated { .. } => None,
+        Const::Val(..) | Const::Ty(..) | Const::Unevaluated { .. } => None,
     }
 }
 fn mk_fn_ptr(tcx: &Tcx, sig: &FnSig, bound_regions: u32) -> TyId {

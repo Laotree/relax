@@ -665,7 +665,7 @@ fn round19_body(t: &Tcx, p: &Program) -> crate::mir::Body {
         basic_blocks: vec![BasicBlockData { statements: vec![Statement { kind: StatementKind::Nop, source_info }],
             terminator: Some(Terminator { kind: TerminatorKind::Return, source_info }), is_cleanup: false }],
         local_decls: vec![LocalDecl { ty: t.tys.unit, mutability: Mutability::Mut, source_info, user_ty: vec![], local_info: LocalInfo::Boring, kind: LocalKind::Return }],
-        source_scopes: vec![SourceScopeData { span: source_info.span, parent_scope: None }], user_type_annotations: vec![],
+        source_scopes: vec![SourceScopeData { span: source_info.span, parent_scope: None }], user_type_annotations: vec![], upvars: Vec::new(), allocs: AllocMap::default(),
         var_debug_info: vec![], arg_count: 0, spread_arg: None, promoted: vec![], coroutine: None }
 }
 fn round19_owner<'a>(p: &'a Program, t: &'a Tcx, body: &'a crate::mir::Body) -> crate::borrowck::infer_ctxt::BorrowckInferCtxt<'a> {

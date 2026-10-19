@@ -421,7 +421,7 @@ impl MirBorrowckCtxt<'_> {
     // immutable binding joins the first error, whose primary span becomes the binding.
     fn report_mutable_borrow_error(&mut self, the_place_err: &Place, span: Span) {
         let decl = &self.body.local_decls[the_place_err.local.0 as usize];
-        let can_be_made_mutable = matches!(decl.local_info, LocalInfo::User { can_be_made_mutable: true, .. });
+        let can_be_made_mutable = decl.can_be_made_mutable();
         if !the_place_err.projection.is_empty() || !can_be_made_mutable {
             self.result.errors.push(BorrowckError { kind: BorrowImmutable, span });
             return;
@@ -631,7 +631,7 @@ fn report_move_errors(body: &Body, moves: Option<&MoveData>, errors: Vec<MoveErr
         let stmt = block.statements.get(location.statement_index);
         if let Some(Statement { kind: StatementKind::Assign(place, Rvalue::Use(Operand::Move(move_from))), source_info }) = stmt {
             if place.projection.is_empty() {
-                if let LocalInfo::User { match_place: Some((opt_match_place, match_span)), .. } = &body.local_decls[place.local.0 as usize].local_info {
+                if let LocalInfo::User(BindingForm::Var(VarBindingForm { opt_match_place: Some((opt_match_place, match_span)), .. })) = &body.local_decls[place.local.0 as usize].local_info {
                     let moves = moves.expect("promoted MIR has no user bindings");
                     append_binding_error(&mut grouped, moves, kind, move_from, opt_match_place.as_ref(), *match_span, source_info.span);
                     continue;

@@ -67,11 +67,28 @@ pub struct ConstOperand {
     pub user_ty: Option<UserTypeAnnotationIndex>,
     pub const_: Const,
 }
-/// rustc_middle/src/mir/consts.rs:211. Unevaluated types are resolved from def + args by consumers.
+/// rustc_middle/src/mir/consts.rs:211-237. Every constant carries its MIR type, including
+/// unevaluated/promoted ones, whose regions are renumbered independently of the declaration
+/// (or the promoted body's return type).
 #[derive(Clone, Debug)]
 pub enum Const {
+    /// A type-system constant (const generic parameter or valtree) used as an operand
+    /// (consts.rs:219-221).
+    Ty(TyId, crate::consts::Const),
     Val(ConstValue, TyId),
-    Unevaluated { def: DefId, args: Vec<crate::consts::GenericArg>, promoted: Option<PromotedId> },
+    Unevaluated { def: DefId, args: Vec<crate::consts::GenericArg>, promoted: Option<PromotedId>, ty: TyId },
+}
+impl Const {
+    /// rustc_middle/src/mir/consts.rs:258-273. A valtree's inner type wins over the outer one.
+    pub fn ty(&self, tys: &crate::types::Types) -> TyId {
+        match *self {
+            Const::Ty(ty, ct) => match tys.const_kind(ct) {
+                crate::consts::ConstKind::Value(value) => value.ty,
+                _ => ty,
+            },
+            Const::Val(_, ty) | Const::Unevaluated { ty, .. } => ty,
+        }
+    }
 }
 /// rustc_middle/src/mir/consts.rs:34; allocation identity preserves provenance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,9 +130,11 @@ pub enum RawPtrKind {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerCoercion {
-    ReifyFnPointer,
+    /// rustc_middle/src/ty/adjustment.rs:14: a fn item to a fn pointer of the given safety.
+    ReifyFnPointer(crate::types::Safety),
     UnsafeFnPointer,
-    ClosureFnPointer,
+    /// adjustment.rs:21: a non-capturing closure to a fn pointer of the given safety.
+    ClosureFnPointer(crate::types::Safety),
     MutToConstPointer,
     ArrayToPointer,
     Unsize,
@@ -211,8 +230,11 @@ pub enum AggregateKind {
     Array(TyId),
     Tuple,
     Adt(DefId, VariantIdx, Vec<crate::consts::GenericArg>, Option<UserTypeAnnotationIndex>, Option<FieldIdx>),
+    /// The closure-like aggregates carry their full generic arguments in the layout of
+    /// `closure_args` (rustc: GenericArgsRef with the synthetic tail).
     Closure(ClosureId, Vec<crate::consts::GenericArg>),
     Coroutine(ClosureId, Vec<crate::consts::GenericArg>),
+    CoroutineClosure(ClosureId, Vec<crate::consts::GenericArg>),
     RawPtr(TyId, Mutability),
 }
 
@@ -234,6 +256,13 @@ pub enum StatementKind {
     Intrinsic(NonDivergingIntrinsic),
     ConstEvalCounter,
     Nop,
+    /// rustc_middle/src/mir/syntax.rs:450: marks where `place` would be dropped under the
+    /// Edition 2024 temporary rules; a lint-only no-op.
+    BackwardIncompatibleDropHint { place: Place, reason: BackwardIncompatibleDropReason },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackwardIncompatibleDropReason {
+    Edition2024,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeReadCause {

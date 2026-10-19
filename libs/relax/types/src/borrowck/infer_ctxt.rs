@@ -84,7 +84,7 @@ impl<'tcx> std::ops::Deref for BorrowckInferCtxt<'tcx> {
 use super::type_check::{BorrowckTypeOps, ClauseOwner, FnSig, PolyFnSig, Locations, MirTypeckRegionConstraints, UserType};
 use super::constraints::ConstraintCategory;
 use crate::consts::GenericArg;
-use crate::mir::{self, Location, Span, Body, Place, PlaceTy, FieldIdx, UserTypeId, AggregateKind, Rvalue, ConstOperand};
+use crate::mir::{self, Location, Span, Body, Place, PlaceTy, FieldIdx, AggregateKind, Rvalue, ConstOperand};
 use crate::lang_items::LangItem;
 use crate::types::{UniverseIndex, AliasTyKind};
 use crate::types::variance::V;
@@ -166,7 +166,7 @@ impl<'tcx> BorrowckInferCtxt<'tcx> {
         match operand {
             mir::Operand::Copy(p) | mir::Operand::Move(p) => p.ty(body, self.tcx).expect("typed MIR place").ty,
             mir::Operand::Constant(c) => match &c.const_ {
-                mir::Const::Val(_, ty) => *ty,
+                mir::Const::Val(_, ty) | mir::Const::Ty(ty, _) => *ty,
                 mir::Const::Unevaluated { def, args, .. } => BorrowckTypeOps::unevaluated_const_ty(self, *def, args),
             },
         }
@@ -254,7 +254,6 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             let user = ocx.normalize_ty(&env, user); ocx.eq(&env, user, inferred)
         }));
     }
-    fn user_type_annotation(&self, _: UserTypeId) -> (Span, TyId) { panic!("M2b: canonical user-type annotations on MIR Body") }
     fn closure_user_provided_sig(&mut self, _: &Body) -> Option<FnSig> { panic!("M2b: canonical closure user-provided signatures") }
     fn fn_def_sig(&self, def: DefId, args: &[TyId], regions: crate::types::RegionArgsId) -> PolyFnSig {
         let args = self.tcx.complete_args(self.prog, def, args, regions);
@@ -285,7 +284,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                 let ty = self.tcx.instantiate_ty(self.prog, *def, args, field.ty);
                 Ok(BorrowckTypeOps::normalize(self, out, ty, Locations::Single(at)))
             }
-            AggregateKind::Closure(id, args) | AggregateKind::Coroutine(id, args) => {
+            AggregateKind::Closure(id, args) | AggregateKind::Coroutine(id, args) | AggregateKind::CoroutineClosure(id, args) => {
                 let ty = self.closure_ty(*id, args);
                 let TyKind::Closure(_, _, args) = self.tcx.tys.kind(ty) else { unreachable!() };
                 let TyKind::Tuple(ts) = self.tcx.tys.kind(args.tupled_upvars_ty) else { panic!("resolved upvars") };
@@ -309,7 +308,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             },
             Rvalue::Aggregate(kind, _) => match &**kind {
                 AggregateKind::Adt(def, _, args, ..) => self.nominal_ty(*def, args),
-                AggregateKind::Closure(id, args) | AggregateKind::Coroutine(id, args) => self.closure_ty(*id, args),
+                AggregateKind::Closure(id, args) | AggregateKind::Coroutine(id, args) | AggregateKind::CoroutineClosure(id, args) => self.closure_ty(*id, args),
                 _ => unreachable!("structural aggregate does not require a query"),
             },
             Rvalue::Discriminant(place) => {
@@ -365,7 +364,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
             Rvalue::Repeat(op, count) => {
                 let ct = match count {
                     mir::Const::Val(mir::ConstValue::Scalar(mir::Scalar::Int { bits, .. }), _) => tys.const_usize(u64::try_from(*bits).expect("usize length")),
-                    mir::Const::Unevaluated { def, args, promoted } => {
+                    mir::Const::Unevaluated { def, args, promoted, .. } => {
                         assert!(promoted.is_none(), "array length cannot be a promoted reference");
                         use crate::consts::{ConstKind, AliasConst, AliasConstKind, IsRigid};
                         let kind = match self.prog.def(*def).kind {

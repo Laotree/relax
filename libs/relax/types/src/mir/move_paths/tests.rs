@@ -25,7 +25,7 @@ fn body(types: &[TyId], args: u32, blocks: Vec<BasicBlockData>) -> Body {
     }
     Body { phase: MirPhase::Built, source: MirSource { owner: DefId(0), kind: BodyKind::Fn }, basic_blocks: blocks, local_decls,
         source_scopes: vec![SourceScopeData { span: Span::default(), parent_scope: None }],
-        user_type_annotations: Vec::new(), var_debug_info: Vec::new(), arg_count: args,
+        user_type_annotations: Vec::new(), upvars: Vec::new(), allocs: AllocMap::default(), var_debug_info: Vec::new(), arg_count: args,
         spread_arg: None, promoted: Vec::new(), coroutine: None }
 }
 fn goto(i: u32) -> TerminatorKind { TerminatorKind::Goto { target: BasicBlock(i) } }

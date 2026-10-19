@@ -236,7 +236,7 @@ fn regular_generic_args_are_invariant_and_drop_variance_uses_the_whole_type() {
     let tcx = Tcx::new();
     let b = body(&[tcx.tys.unit, tcx.tys.i32_, rty(&tcx, 1)], vec![block(vec![assign(2,
         Operand::Constant(Box::new(ConstOperand { span: Span::default(), user_ty: None,
-            const_: Const::Unevaluated { def: DefId(100), args: vec![crate::consts::GenericArg::Type(rty(&tcx, 1))], promoted: None } })))], TerminatorKind::Return)]);
+            const_: Const::Unevaluated { def: DefId(100), args: vec![crate::consts::GenericArg::Type(rty(&tcx, 1))], promoted: None, ty: tcx.tys.i32_ } })))], TerminatorKind::Return)]);
     let mut i = input(&b, &[vec![]]); let moves = gather(&tcx, &b);
     generate(&tcx, &b, &moves, &mut i, &[vec![], vec![], vec![]]);
     assert_eq!(i.polonius.live_region_variances[1], Some(D::Bidirectional));
