@@ -503,6 +503,7 @@ impl<'a> Cx<'a> {
     /// rustc `type_marked_structural` (`Ty::is_structural_eq_shallow`): an ADT has an impl of
     /// `StructuralPartialEq` (the PartialEq derive's, with its bounds).
     fn type_marked_structural(&self, t: TyId) -> bool {
+        let t = self.tcx.tys.erase_all_regions(t);
         let Some(td) = self.tcx.lang_items.get(crate::lang_items::LangItem::StructuralPeq) else { return true };
         let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
         let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(td, vec![crate::consts::GenericArg::Type(t)]) };
@@ -519,6 +520,7 @@ impl<'a> Cx<'a> {
         }
         // the whole constant needs a `PartialEq` impl (type_has_partial_eq_impl)
         if self.const_errors.len() == before && matches!(self.kind(t), TyKind::Adt(..)) {
+            let t = self.tcx.tys.erase_all_regions(t);
             if let Some(pe) = self.tcx.lang_items.get(crate::lang_items::LangItem::PartialEq) {
                 let infcx = crate::infer::InferCtxt::new(self.tcx, crate::tcx::TypingMode::non_body_analysis(), self.env.limit);
                 let goal = crate::next_solver::Goal { param_env: self.env.param_env, predicate: crate::next_solver::collect::trait_predicate(pe, vec![crate::consts::GenericArg::Type(t), crate::consts::GenericArg::Type(t)]) };

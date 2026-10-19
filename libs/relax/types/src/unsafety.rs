@@ -150,7 +150,14 @@ impl V<'_> {
                 lint::emit(self.prog, self.body.def, &lint::UNSAFE_OP_IN_UNSAFE_FN, self.body.file, pos, &msg);
             }
             Ctx::Safe => {
-                if self.deprecated_safe(op) { return; }
+                if self.deprecated_safe(op) {
+                    // emit_deprecated_safe_fn_call: the lint (allow by default, 2024 compatibility)
+                    if let Op::CallToUnsafeFunction(Some(d)) = op {
+                        let msg = format!("call to deprecated safe function `{}` is unsafe and requires unsafe block", self.prog.def_path(d));
+                        lint::emit(self.prog, self.body.def, &lint::DEPRECATED_SAFE_2024, self.body.file, pos, &msg);
+                    }
+                    return;
+                }
                 let tail = if self.op_in_unsafe_fn_allowed && !matches!(op, Op::CallToFunctionWith(_)) { "function or block" } else { "block" };
                 let msg = format!("E0133: {} is unsafe and requires unsafe {}", self.what(op), tail);
                 self.errors.push(self.prog.record_error(self.body.file, pos, "typeck", msg));

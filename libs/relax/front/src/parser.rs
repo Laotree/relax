@@ -655,9 +655,51 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
+            self.check_attr_safety(toks)?;
             v.push(Attr { inner: false, toks });
         }
         Ok(self.expand_cfg_attrs(v))
+    }
+
+    /// rustc_attr_parsing `check_attribute_safety`: an unsafe builtin attribute (`no_mangle`,
+    /// `export_name`, `link_section`; later editions only for the first three) is written
+    /// `unsafe(..)`; a builtin attribute that is not unsafe is not.
+    fn check_attr_safety(&mut self, toks: TokRange) -> PResult<()> {
+        const UNSAFE_ATTRS: &[&str] = &["no_mangle", "export_name", "link_section", "force_target_feature", "ffi_const", "ffi_pure", "naked"];
+        // (`unsafe_since: Some(2024)` for the first three, any edition for the others)
+        const UNSAFE_ALWAYS: &[&str] = &["force_target_feature", "ffi_const", "ffi_pure", "naked"];
+        const NORMAL_ATTRS: &[&str] = &["cfg", "cfg_attr", "test", "ignore", "should_panic", "bench", "macro_use", "macro_export", "repr", "derive", "inline",
+            "doc", "allow", "warn", "deny", "forbid", "expect", "must_use", "deprecated", "path", "automatically_derived", "cold", "track_caller", "target_feature",
+            "non_exhaustive", "diagnostic::on_unimplemented", "diagnostic::do_not_recommend", "link", "link_name", "used", "global_allocator", "panic_handler",
+            "proc_macro", "proc_macro_derive", "proc_macro_attribute", "no_std", "no_implicit_prelude", "recursion_limit", "type_length_limit", "no_main",
+            "crate_type", "crate_name", "windows_subsystem", "feature", "macro_escape", "no_link", "export_stable", "thread_local", "unstable", "stable", "coverage", "optimize", "instruction_set", "debugger_visualizer", "collapse_debuginfo", "rustc_builtin_macro", "cfi_encoding"];
+        let (lo, hi) = (toks.lo as usize, toks.hi as usize);
+        if hi <= lo { return Ok(()); }
+        let text = |p: &Self, i: usize| String::from_utf8_lossy(p.tok_text(p.toks.at(i))).into_owned();
+        // the attribute's path: tokens up to `(`, `=`, `)` or the end
+        let path_of = |p: &Self, from: usize, to: usize| -> String {
+            let mut s = String::new();
+            let mut i = from;
+            while i < to {
+                let k = p.toks.at(i).kind;
+                if matches!(k, T::OpenParen | T::Eq | T::CloseParen | T::Comma) { break; }
+                s.push_str(&text(p, i));
+                i += 1;
+            }
+            s
+        };
+        if text(self, lo) == "unsafe" && hi > lo + 1 && self.toks.at(lo + 1).kind == T::OpenParen {
+            let name = path_of(self, lo + 2, hi);
+            if !name.is_empty() && NORMAL_ATTRS.contains(&name.as_str()) {
+                return Err(PErr { pos: self.toks.at(lo).lo, msg: format!("`{}` is not an unsafe attribute", name) });
+            }
+            return Ok(());
+        }
+        let name = path_of(self, lo, hi);
+        if UNSAFE_ATTRS.contains(&name.as_str()) && (self.edition >= 2024 || UNSAFE_ALWAYS.contains(&name.as_str())) {
+            return Err(PErr { pos: self.toks.at(lo).lo, msg: "unsafe attribute used without unsafe".to_string() });
+        }
+        Ok(())
     }
 
     /// Raw identifiers in an attribute are its plain names (`#[r#repr(r#C, r#packed)]` is
@@ -675,6 +717,7 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             let (_, toks) = self.delim_tt()?;
             self.unraw_attr(toks);
+            self.check_attr_safety(toks)?;
             new.push(Attr { inner: true, toks });
         }
         v.extend(self.expand_cfg_attrs(new));
@@ -1738,21 +1781,44 @@ impl<'a> Parser<'a> {
         let mut asyncness = false;
         let mut unsafe_ = false;
         let mut abi = None;
+        // rustc parse_fn_front_matter: `const`? `async`? (`unsafe` | `safe`)? (`extern` ABI?)? `fn`,
+        // in that order; `stage` is the last qualifier read (1 const, 2 async, 3 safety, 4 extern)
+        let mut stage = 0;
         loop {
-            match self.kind() {
-                T::KwConst => konst = true,
-                T::KwAsync => asyncness = true,
-                T::KwUnsafe => unsafe_ = true,
-                T::Ident if self.is_word(0, b"safe") => {}
-                T::KwExtern => {
+            let this = match self.kind() {
+                T::KwConst => 1,
+                T::KwAsync => 2,
+                T::KwUnsafe => 3,
+                T::Ident if self.is_word(0, b"safe") => 3,
+                T::KwExtern => 4,
+                T::KwFn => break,
+                _ => return self.err("expected fn"),
+            };
+            if this <= stage {
+                let found = match this { 1 => "const", 2 => "async", 3 => if self.kind() == T::KwUnsafe { "unsafe" } else { "safe" }, _ => "extern" };
+                let expected: &str = match stage {
+                    1 => "one of `async`, `extern`, `fn`, `safe`, or `unsafe`",
+                    2 => "one of `extern`, `fn`, `safe`, or `unsafe`",
+                    3 => "one of `extern` or `fn`",
+                    _ => "`fn`",
+                };
+                return self.err(&format!("expected {}, found keyword `{}`", expected, found));
+            }
+            stage = this;
+            match this {
+                1 => konst = true,
+                2 => asyncness = true,
+                3 => if self.kind() == T::KwUnsafe { unsafe_ = true },
+                _ => {
                     self.pos += 1;
                     abi = Some(self.abi());
                     continue;
                 }
-                T::KwFn => break,
-                _ => return self.err("expected fn"),
             }
             self.pos += 1;
+        }
+        if konst && asyncness {
+            return self.err("functions cannot be both `const` and `async`");
         }
         self.expect(T::KwFn)?;
         let name = self.ident_tok()?;

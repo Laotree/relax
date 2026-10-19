@@ -1529,7 +1529,10 @@ impl Tcx {
             errors.extend(self.check_item_type_defaults(prog, did));
         }
         errors.extend_from_slice(self.signature_errors(prog, did));
-        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) { errors.extend(crate::item_checks::duplicate_generic_params(prog, did)); }
+        if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
+            errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
+            crate::lint::check_unsafe_attrs(prog, did);
+        }
         // predicates_of: the bounds and where-clauses of every item are lowered, used or not
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             for e in self.own_clauses_errors(prog, did) {

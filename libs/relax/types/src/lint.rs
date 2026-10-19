@@ -33,6 +33,27 @@ pub const STATIC_MUT_REFS: Lint = Lint { name: "static_mut_refs", default: Level
 pub const UNREACHABLE_PATTERNS: Lint = Lint { name: "unreachable_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &["unused"] };
 pub const IRREFUTABLE_LET_PATTERNS: Lint = Lint { name: "irrefutable_let_patterns", default: Level::Warn, default_2024: Level::Warn, groups: &[] };
 
+pub const DEPRECATED_SAFE_2024: Lint = Lint { name: "deprecated_safe_2024", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
+pub const UNSAFE_ATTR_OUTSIDE_UNSAFE: Lint = Lint { name: "unsafe_attr_outside_unsafe", default: Level::Allow, default_2024: Level::Allow, groups: &["rust_2024_compatibility"] };
+
+/// rustc_attr_parsing `check_attribute_safety`, before edition 2024: `#[no_mangle]`,
+/// `#[export_name]` and `#[link_section]` without `unsafe(..)` is only this (allow-by-default) lint.
+pub fn check_unsafe_attrs(prog: &Program, def: DefId) {
+    if !enabled() { return; }
+    let d = prog.def(def);
+    let pf = &prog.files[d.file as usize];
+    if pf.edition >= 2024 { return; }
+    let ast = &pf.ast;
+    let p = prog.src(d.file);
+    for a in ast.list(ast.item(d.item).attrs) {
+        let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+        if hi <= lo { continue; }
+        if matches!(crate::cfg::tok_str(p, lo), b"no_mangle" | b"export_name" | b"link_section") {
+            emit(prog, def, &UNSAFE_ATTR_OUTSIDE_UNSAFE, d.file, p.tok(lo).lo, "unsafe attribute used without unsafe");
+        }
+    }
+}
+
 const LEVEL_ATTRS: &[(&[u8], Level)] = &[
     (b"allow", Level::Allow), (b"expect", Level::Allow), (b"warn", Level::Warn),
     (b"deny", Level::Deny), (b"forbid", Level::Forbid),

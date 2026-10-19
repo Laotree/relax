@@ -122,6 +122,7 @@ impl<T: Default> Default for ManuallyDrop<T> {
         ManuallyDrop::new(T::default())
     }
 }
+impl<T: ?Sized> crate::marker::StructuralPartialEq for ManuallyDrop<T> {}
 impl<T: PartialEq> PartialEq for ManuallyDrop<T> {
     fn eq(&self, other: &ManuallyDrop<T>) -> bool {
         unsafe { self.value == other.value }
