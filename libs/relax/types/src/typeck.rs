@@ -1509,20 +1509,6 @@ impl<'a> Fcx<'a> {
         self.err(self.last_lo, format!("E0308: mismatched types: expected `{}`, found `&{}_`", sx, if m { "mut " } else { "" }));
     }
 
-    /// rustc_hir_typeck check_block_no_value: a loop body's block has type `()` (or diverges).
-    fn check_block_no_value(&mut self, b: BlockId) {
-        let unit = self.tcx.tys.unit;
-        let t = self.check_block(b, Some(unit));
-        let s = self.shallow(t);
-        if s == self.tcx.tys.never { return; }
-        let blk = self.ast().block(b);
-        let pos = match self.ast().list(blk.stmts).last() {
-            Some(Stmt::Expr(e, false)) => self.ast().expr(*e).lo,
-            _ => blk.hi,
-        };
-        self.demand_eq(unit, t, pos);
-    }
-
     /// rustc_hir_typeck/src/demand.rs:230-270: report only after the coercion
     /// is required and failed; speculative coercions never emit and retract errors.
     fn coerce_or_unify(&mut self, actual: TyId, expected: TyId, e: Option<ExprId>, pos: u32) -> bool {
