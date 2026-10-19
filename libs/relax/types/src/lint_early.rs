@@ -56,6 +56,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     for (k, o) in own.iter().enumerate() {
         if *o { special_module_name(prog, k as u32); }
     }
+    crate::lint_early2::check_module_items(prog, own);
     token_lints(prog, own);
 }
 
@@ -167,7 +168,7 @@ fn item_lints(prog: &Program, d: DefId) {
 }
 
 /// The position of the `#` of an attribute (its tokens are the ones inside `#[` ... `]`).
-fn attr_pos(pf: &ParsedFile, a: &Attr) -> u32 {
+pub(crate) fn attr_pos(pf: &ParsedFile, a: &Attr) -> u32 {
     let back = if a.inner { 3 } else { 2 };
     let i = (a.toks.lo as usize).saturating_sub(back);
     pf.tok(i as u32).lo
@@ -181,51 +182,43 @@ fn attr_lints(prog: &Program, d: DefId) {
     const CRATE_LEVEL: &[&[u8]] = &[b"crate_name", b"crate_type", b"recursion_limit", b"type_length_limit", b"move_size_limit",
         b"pattern_complexity_limit", b"no_std", b"no_core", b"no_main", b"no_builtins", b"windows_subsystem", b"feature", b"register_tool"];
     let def = prog.def(d);
+    let is_root = def.kind == DefKind::Mod && def.parent == crate::program::NO_DEF;
     let named_mod = def.kind == DefKind::Mod && def.parent != crate::program::NO_DEF && prog.block_owner.get(&def.sub).is_none();
-    if !(named_mod || matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
+    if !(is_root || named_mod || matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
         | DefKind::Enum | DefKind::TypeAlias | DefKind::AssocTy | DefKind::ForeignTy | DefKind::Trait | DefKind::Impl
         | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic | DefKind::MacroRules)) { return; }
     let pf = &prog.files[def.file as usize];
     let ast = &pf.ast;
-    let item = *ast.item(def.item);
-    let p = prog.src(def.file);
-    let mut lists: Vec<Vec<Attr>> = vec![ast.list(item.attrs).to_vec()];
-    // the inner attributes of an out-of-line module are its file's
-    if named_mod {
+    // the node's attributes: the item's outer ones, then the inner ones of an out-of-line module's file
+    let mut all: Vec<(u32, Attr)> = Vec::new();
+    if !is_root { all.extend(ast.list(ast.item(def.item).attrs).iter().map(|a| (def.file, *a))); }
+    if is_root || named_mod {
         let m = &prog.mods[def.sub as usize];
-        if m.file != def.file { lists.push(prog.files[m.file as usize].ast.root_attrs.iter().copied().collect()); }
+        if is_root || m.file != def.file { all.extend(prog.files[m.file as usize].ast.root_attrs.iter().map(|a| (m.file, *a))); }
     }
-    for (li, attrs) in lists.iter().enumerate() {
-        let file = if li == 0 { def.file } else { prog.mods[def.sub as usize].file };
+    let item = if is_root { None } else { Some(*ast.item(def.item)) };
+    for &(file, a) in &all {
         let pf = &prog.files[file as usize];
-        for a in attrs {
-            let name = lint::attr_path(prog, file, a);
-            let pos = attr_pos(pf, a);
-            let emit = |msg: &str| {
-                if !lint::external(prog, file, pos) { lint::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
-            };
-            if CRATE_LEVEL.contains(&&name[..]) {
-                let n = String::from_utf8_lossy(&name).into_owned();
-                if a.inner { emit(&format!("the `#![{}]` attribute can only be used at the crate root", n)); }
-                else { emit(&format!("crate-level attribute should be an inner attribute: add an exclamation mark: `#![{}]`", n)); }
-                continue;
-            }
-            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
-            // `#[allow(reason = "..")]`: no lint named
-            if matches!(&name[..], b"allow" | b"warn" | b"deny" | b"forbid" | b"expect")
-                && (hi == lo + 6 || hi == lo + 7)
-                && crate::cfg::tok_str(p, lo + 1) == b"(" && crate::cfg::tok_str(p, lo + 2) == b"reason" && crate::cfg::tok_str(p, lo + 3) == b"=" {
-                emit("unused attribute");
-                continue;
-            }
-            if name == b"inline" {
-                let bodiless_trait_method = def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait
-                    && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
-                if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
-                else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
-            }
+        let name = lint::attr_path(prog, file, &a);
+        let pos = attr_pos(pf, &a);
+        let emit = |msg: &str| {
+            if !lint::external(prog, file, pos) { lint::emit(prog, d, &UNUSED_ATTRIBUTES, file, pos, msg); }
+        };
+        if !is_root && CRATE_LEVEL.contains(&&name[..]) {
+            let n = String::from_utf8_lossy(&name).into_owned();
+            if a.inner { emit(&format!("the `#![{}]` attribute can only be used at the crate root", n)); }
+            else { emit(&format!("crate-level attribute should be an inner attribute: add an exclamation mark: `#![{}]`", n)); }
+            continue;
+        }
+        if name == b"inline" {
+            let Some(item) = item else { continue };
+            let bodiless_trait_method = def.kind == DefKind::AssocFn && prog.def(def.parent).kind == DefKind::Trait
+                && matches!(item.kind, ItemKind::Fn(sig, None, _) if ast.fn_sig(sig).lazy_body.is_none());
+            if bodiless_trait_method { emit("`#[inline]` attribute cannot be used on required trait methods"); }
+            else if def.kind == DefKind::ForeignFn { emit("`#[inline]` attribute cannot be used on foreign functions"); }
         }
     }
+    crate::lint_early2::attr_checks(prog, &crate::lint_early2::AttrNode { d, inner: &[], attrs: &all, is_crate: is_root, macro_use_target: is_root || named_mod });
 }
 
 fn ty_has_impl_trait(ast: &Ast, t: TyId) -> bool {
