@@ -389,9 +389,34 @@ fn def_range(st: &State, i: &Inst) -> Option<R> {
 }
 
 /// Is `x c y` (x, y vregs) fixed by a relation fact or by `y = x + k` without wrap?
+/// The vregs holding the same value as `v` right now (copies of it, copies of those, ...).
+fn same_as(st: &State, v: u32) -> Vec<u32> {
+    let mut out = vec![v];
+    let mut k = 0;
+    while k < out.len() && out.len() < 16 {
+        let w = out[k];
+        k += 1;
+        for &(d, s, off, b) in &st.lin {
+            if off != 0 || b < 64 {
+                continue;
+            }
+            let o = if d == w { s } else if s == w { d } else { continue };
+            if !out.contains(&o) {
+                out.push(o);
+            }
+        }
+    }
+    out
+}
+
 fn decide_rel(st: &State, c: Cond, signed: bool, x: u32, y: Opnd) -> Option<bool> {
+    let xs = same_as(st, x);
+    let ys: Vec<Opnd> = match y {
+        Opnd::V(v) => same_as(st, v).into_iter().map(Opnd::V).collect(),
+        k => vec![k],
+    };
     for &(rc, rs, rx, ry) in &st.rel {
-        if rs == signed && rx == x && ry == y {
+        if rs == signed && xs.contains(&rx) && ys.contains(&ry) {
             if rc == c {
                 return Some(true);
             }

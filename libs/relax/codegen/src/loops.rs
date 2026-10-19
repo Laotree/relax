@@ -280,12 +280,61 @@ fn vectorize_on(options: &relax_session::Options) -> bool {
     !options.no_vectorize
 }
 
-/// Widen straight-line byte maps over pointer/count iterators. The scalar loop remains
-/// the tail and fallback, including its exact short-circuit iterator exhaustion behavior.
-/// A vector iteration is admitted only when every scalar guard succeeds sixteen times;
-/// runtime distance checks exclude dependencies within a vector (equal pointers are OK).
-fn vectorize_byte_maps(f: &mut Func) -> bool {
-    if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Store(Mem::Int(1, false), ..)))) {
+/// What a value of a stream loop is, per vreg, while the body is read symbolically.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Sv {
+    /// not a stream-loop value
+    No,
+    /// `root + off`: the entry value of a loop input plus a constant (pointers and counters)
+    Addr(VReg, i64),
+    /// a 32-bit constant (its low 32 bits)
+    K(u32),
+    /// the vector value computed by operation `k` of the widened body
+    Lane(usize),
+}
+
+/// The element type of a stream loop: what its loads and stores move and its operations compute.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Lane {
+    /// u8, wrapping integer operations
+    Byte,
+    /// f32
+    F32,
+    /// 32-bit integers (wrapping operations)
+    I32,
+}
+
+impl Lane {
+    fn bytes(self) -> i64 {
+        if self == Lane::Byte { 1 } else { 4 }
+    }
+}
+
+/// One operation of a widened body.
+#[derive(Clone, Copy)]
+enum WOp {
+    /// a vector load of the pointer root
+    Load(VReg),
+    Bin(VOp, usize, usize),
+    Int(VX, usize, usize),
+    Un(VUn, usize),
+    /// a loop-invariant scalar (the root vreg) in every lane
+    Splat(VReg),
+    /// a 32-bit constant in every lane
+    Const(u32),
+}
+
+/// Widen straight-line element maps over pointer/count streams: a loop whose iteration loads
+/// elements (u8, f32 or 32-bit integers) at the current position of one or more streams,
+/// computes on them with lane-wise operations and loop-invariant scalars, and stores one result
+/// element at the current position of a stream. Streams advance by one element per iteration; the
+/// loop's exits are guards on a down-counting length (`n != 0`), a pointer reaching an end pointer
+/// (`p == end`) or a pointer being null (an iterator's niche test). The scalar loop remains the tail
+/// and fallback, including its exact short-circuit exhaustion behavior. A vector iteration (one
+/// 16-byte vector per stream) is admitted only when every scalar guard succeeds for all of its
+/// elements; runtime distance checks exclude dependencies within a vector (equal pointers are OK).
+fn vectorize_stream_maps(f: &mut Func) -> bool {
+    if !f.blocks.iter().any(|b| b.insts.iter().any(|i| matches!(i, Inst::Store(Mem::Int(1, false) | Mem::Int(4, _) | Mem::F32, ..)))) {
         return false;
     }
     let reach = crate::regalloc::reachable(f);
@@ -334,106 +383,267 @@ fn vectorize_byte_maps(f: &mut Func) -> bool {
         }
         if definitions.iter().any(|n| *n > 1) { continue; }
         let roots: Vec<_> = (0..nv).filter(|v| inputs[*v]).map(|v| VReg(v as u32)).collect();
-        // Symbolically execute pointer arithmetic. Every address must be the current
-        // element of a +1 recurrence; every length guard a -1 recurrence.
-        let mut addr = vec![None; nv];
-        for &v in &roots { addr[v.0 as usize] = Some((v, 0i64)); }
-        let mut guard = Vec::new();
-        let mut loads = Vec::new();
-        let mut ops = Vec::new();
-        let mut store = None;
-        let mut bytes = vec![false; nv];
+        // Symbolically execute the body. Every address must be the current element of a
+        // one-element-per-iteration recurrence; every length guard a -1 recurrence.
+        let mut sv = vec![Sv::No; nv];
+        for &v in &roots {
+            sv[v.0 as usize] = Sv::Addr(v, 0);
+        }
+        let mut kind: Option<Lane> = None;
+        // zero tests (a counter reaching zero, a pointer being null): (root, offset from its entry value)
+        let mut zero_guards: Vec<(VReg, i64)> = Vec::new();
+        // equality tests of two inputs: (a, offset, b, offset)
+        let mut end_guards: Vec<(VReg, i64, VReg, i64)> = Vec::new();
+        let mut loads: Vec<(VReg, VReg, usize)> = Vec::new(); // (value, pointer root, op index)
+        let mut wops: Vec<WOp> = Vec::new();
+        let mut store: Option<(VReg, usize)> = None;
+        // the operand of a lane operation: a computed vector or a loop-invariant scalar
+        macro_rules! operand {
+            ($v:expr, $k:expr) => {{
+                match sv[$v.0 as usize] {
+                    Sv::Lane(k) => k,
+                    Sv::Addr(r, 0) if roots.contains(&r) && matches!(($k, f.vregs[r.0 as usize]), (Lane::I32, Cls::I) | (Lane::F32, Cls::F32)) => {
+                        wops.push(WOp::Splat(r));
+                        wops.len() - 1
+                    }
+                    Sv::K(c) if $k != Lane::Byte => {
+                        wops.push(WOp::Const(c));
+                        wops.len() - 1
+                    }
+                    _ => continue 'candidate,
+                }
+            }};
+        }
         for &b in &chain {
             let block = &f.blocks[b as usize];
             if let Term::Branch(c, ..) = block.term {
-                if !matches!(block.insts.last(), Some(Inst::ICmpI(Cond::Eq | Cond::Ne, false, d, _, 0)) if *d == c) {
+                if !matches!(block.insts.last(), Some(Inst::ICmpI(Cond::Eq | Cond::Ne, false, d, _, 0) | Inst::ICmp(Cond::Eq | Cond::Ne, false, d, _, _)) if *d == c) {
                     continue 'candidate;
                 }
             }
             for i in &block.insts {
                 match *i {
-                    Inst::Mov(d, s) if addr[s.0 as usize].is_some() => addr[d.0 as usize] = addr[s.0 as usize],
+                    Inst::Mov(d, s) => match sv[s.0 as usize] {
+                        Sv::No => continue 'candidate,
+                        x => {
+                            if f.vregs[d.0 as usize] != f.vregs[s.0 as usize] { continue 'candidate; }
+                            sv[d.0 as usize] = x;
+                        }
+                    },
                     Inst::IBinI(op @ (IOp::Add | IOp::Sub), it, d, s, k) if it == U64_TY => {
-                        let Some((r, off)) = addr[s.0 as usize] else { continue 'candidate };
+                        let Sv::Addr(r, off) = sv[s.0 as usize] else { continue 'candidate };
                         let Some(off) = (if op == IOp::Add { off.checked_add(k) } else { off.checked_sub(k) }) else { continue 'candidate };
-                        addr[d.0 as usize] = Some((r, off));
+                        sv[d.0 as usize] = Sv::Addr(r, off);
                     }
                     Inst::ICmpI(c @ (Cond::Eq | Cond::Ne), false, d, s, 0) => {
                         let Term::Branch(cv, t, e) = block.term else { continue 'candidate };
                         if cv != d || (if c == Cond::Ne { !members[t as usize] || members[e as usize] } else { members[t as usize] || !members[e as usize] }) {
                             continue 'candidate;
                         }
-                        let Some((r, 0)) = addr[s.0 as usize] else { continue 'candidate };
-                        guard.push(r);
+                        let Sv::Addr(r, o) = sv[s.0 as usize] else { continue 'candidate };
+                        if !roots.contains(&r) { continue 'candidate; }
+                        zero_guards.push((r, o));
                     }
-                    Inst::Load(Mem::Int(1, false), d, p, off) if store.is_none() => {
-                        let Some((r, o)) = addr[p.0 as usize] else { continue 'candidate };
-                        if o.checked_add(off as i64) != Some(0) { continue 'candidate; }
-                        loads.push((d, r));
-                        bytes[d.0 as usize] = true;
+                    Inst::ICmp(c @ (Cond::Eq | Cond::Ne), false, d, a, b2) => {
+                        let Term::Branch(cv, t, e) = block.term else { continue 'candidate };
+                        if cv != d || (if c == Cond::Ne { !members[t as usize] || members[e as usize] } else { members[t as usize] || !members[e as usize] }) {
+                            continue 'candidate;
+                        }
+                        let (Sv::Addr(ra, oa), Sv::Addr(rb, ob)) = (sv[a.0 as usize], sv[b2.0 as usize]) else { continue 'candidate };
+                        if !roots.contains(&ra) || !roots.contains(&rb) { continue 'candidate; }
+                        end_guards.push((ra, oa, rb, ob));
                     }
-                    Inst::IBin(op @ (IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor), it, d, a, b) if it.bits == 8 && bytes[a.0 as usize] && bytes[b.0 as usize] && store.is_none() => {
-                        ops.push((op, d, a, b));
-                        bytes[d.0 as usize] = true;
+                    Inst::Iconst(d, k) if store.is_none() => sv[d.0 as usize] = Sv::K(k as u32),
+                    Inst::Fconst(d, bits, false) if store.is_none() => sv[d.0 as usize] = Sv::K(bits as u32),
+                    // a re-extension of a 32-bit value keeps its low 32 bits
+                    Inst::Conv(Conv::IntToInt(it), d, s) if store.is_none() && it.bits == 32 && matches!(sv[s.0 as usize], Sv::Lane(_)) && kind == Some(Lane::I32) => sv[d.0 as usize] = sv[s.0 as usize],
+                    Inst::Load(m, d, p, off) if store.is_none() => {
+                        let k = match m { Mem::Int(1, false) => Lane::Byte, Mem::F32 => Lane::F32, Mem::Int(4, _) => Lane::I32, _ => continue 'candidate };
+                        if kind.is_some_and(|o| o != k) { continue 'candidate; }
+                        kind = Some(k);
+                        let Sv::Addr(r, o) = sv[p.0 as usize] else { continue 'candidate };
+                        if o.checked_add(off as i64) != Some(0) || !roots.contains(&r) { continue 'candidate; }
+                        wops.push(WOp::Load(r));
+                        loads.push((d, r, wops.len() - 1));
+                        sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
                     }
-                    Inst::Store(Mem::Int(1, false), p, off, s) if store.is_none() && bytes[s.0 as usize] => {
-                        let Some((r, o)) = addr[p.0 as usize] else { continue 'candidate };
-                        if o.checked_add(off as i64) != Some(0) { continue 'candidate; }
-                        store = Some((r, s));
+                    Inst::IBin(op @ (IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul), it, d, a, b2) if store.is_none() && matches!(kind, Some(Lane::Byte | Lane::I32)) && it.bits as i64 == 8 * kind.unwrap().bytes() => {
+                        let k = kind.unwrap();
+                        if k == Lane::Byte && op == IOp::Mul { continue 'candidate; }
+                        let (x, y) = (operand!(a, k), operand!(b2, k));
+                        let w = if k == Lane::Byte { VW::B } else { VW::S };
+                        let o = match op { IOp::Add => VX::Add(w), IOp::Sub => VX::Sub(w), IOp::Mul => VX::MulLo(w), IOp::And => VX::And, IOp::Or => VX::Or, _ => VX::Xor };
+                        wops.push(WOp::Int(o, x, y));
+                        sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
+                    }
+                    Inst::IBinI(op @ (IOp::Add | IOp::Sub | IOp::And | IOp::Or | IOp::Xor | IOp::Mul), it, d, a, k) if store.is_none() && kind == Some(Lane::I32) && it.bits == 32 => {
+                        let x = operand!(a, Lane::I32);
+                        wops.push(WOp::Const(k as u32));
+                        let c = wops.len() - 1;
+                        let o = match op { IOp::Add => VX::Add(VW::S), IOp::Sub => VX::Sub(VW::S), IOp::Mul => VX::MulLo(VW::S), IOp::And => VX::And, IOp::Or => VX::Or, _ => VX::Xor };
+                        wops.push(WOp::Int(o, x, c));
+                        sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
+                    }
+                    Inst::FBin(op, false, d, a, b2) if store.is_none() && kind == Some(Lane::F32) => {
+                        let o = match op { FOp::Add => VOp::FAdd, FOp::Sub => VOp::FSub, FOp::Mul => VOp::FMul, FOp::Div => VOp::FDiv, FOp::MinLt => VOp::FMinLt, FOp::MaxGt => VOp::FMaxGt, _ => continue 'candidate };
+                        let (x, y) = (operand!(a, Lane::F32), operand!(b2, Lane::F32));
+                        wops.push(WOp::Bin(o, x, y));
+                        sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
+                    }
+                    Inst::FUnary(op, false, d, a) if store.is_none() && kind == Some(Lane::F32) => {
+                        let o = match op { FUn::Neg => VUn::FNeg, FUn::Abs => VUn::FAbs, FUn::Sqrt => VUn::FSqrt, _ => continue 'candidate };
+                        let x = operand!(a, Lane::F32);
+                        wops.push(WOp::Un(o, x));
+                        sv[d.0 as usize] = Sv::Lane(wops.len() - 1);
+                    }
+                    Inst::Store(m, p, off, s) if store.is_none() => {
+                        let k = match m { Mem::Int(1, false) => Lane::Byte, Mem::F32 => Lane::F32, Mem::Int(4, _) => Lane::I32, _ => continue 'candidate };
+                        if kind != Some(k) { continue 'candidate; }
+                        let Sv::Addr(r, o) = sv[p.0 as usize] else { continue 'candidate };
+                        let Sv::Lane(w) = sv[s.0 as usize] else { continue 'candidate };
+                        if o.checked_add(off as i64) != Some(0) || !roots.contains(&r) { continue 'candidate; }
+                        store = Some((r, w));
                     }
                     _ => continue 'candidate,
                 }
             }
-            if store.is_some() && !matches!(block.term, Term::Jump(t) if t == head) { continue 'candidate; }
+            // the store ends the body: only its block's own exit test follows (`p == end` of the
+            // next element), and the sole back edge leaves that block
+            if store.is_some() && b != *chain.last().unwrap() { continue 'candidate; }
         }
-        let Some((dst, value)) = store else { continue };
+        let (Some((dst, value)), Some(kind)) = (store, kind) else { continue };
         if loads.is_empty() { continue; }
-        let mut pointers: Vec<_> = loads.iter().map(|x| x.1).collect();
+        let sz = kind.bytes();
+        let lanes = 16 / sz;
+        // The loop inputs: pointers that step one element per iteration, counters that step -1,
+        // loop-invariant values (end pointers, scalars the body computes with).
+        let mut pointers: Vec<VReg> = loads.iter().map(|x| x.1).collect();
         pointers.push(dst);
         pointers.sort_unstable_by_key(|v| v.0);
         pointers.dedup();
-        let mut counts = Vec::new();
+        for g in end_guards.iter_mut() {
+            let walks = |v: VReg| matches!(sv[v.0 as usize], Sv::Addr(r, s) if r == v && s == sz);
+            if walks(g.2) && !walks(g.0) {
+                *g = (g.2, g.3, g.0, g.1);
+            }
+        }
+        let mut counts: Vec<VReg> = Vec::new();
+        let mut walkers: Vec<VReg> = Vec::new();
         for &v in &roots {
-            match addr[v.0 as usize] {
-                Some((r, 1)) if r == v && pointers.contains(&v) => {}
-                Some((r, -1)) if r == v && guard.contains(&v) && !pointers.contains(&v) => counts.push(v),
+            let fin = sv[v.0 as usize];
+            match fin {
+                Sv::Addr(r, step) if r == v && step == sz && (pointers.contains(&v) || end_guards.iter().any(|g| g.0 == v) || zero_guards.iter().any(|g| g.0 == v)) && f.vregs[v.0 as usize] == Cls::I => walkers.push(v),
+                Sv::Addr(r, -1) if r == v && zero_guards.iter().any(|g| g.0 == v) && !pointers.contains(&v) && f.vregs[v.0 as usize] == Cls::I => counts.push(v),
+                // invariant: never defined in the loop
+                Sv::Addr(r, 0) if r == v && definitions[v.0 as usize] == 0 && !pointers.contains(&v) => {}
                 _ => continue 'candidate,
             }
         }
-        if counts.is_empty() || guard.iter().any(|v| !roots.contains(v)) { continue; }
+        if pointers.iter().any(|p| !walkers.contains(p)) { continue; }
+        // a zero test of a counter or a pointer: fine; of an invariant it is a loop that never ends
+        // or exits at once. Offsets: a counter is tested after its steps (<= 0), a pointer ahead
+        for &(r, o) in &zero_guards {
+            if !(counts.contains(&r) && o <= 0 || walkers.contains(&r) && o >= 0) { continue 'candidate; }
+        }
+        // every end guard compares a walking pointer (ahead of its entry value, whole elements)
+        // with an invariant
+        for &(a, oa, b2, ob) in &end_guards {
+            if !(walkers.contains(&a) && !walkers.contains(&b2) && !counts.contains(&b2) && ob == 0 && oa >= 0 && oa % sz == 0) { continue 'candidate; }
+        }
+        if counts.is_empty() && end_guards.is_empty() { continue; }
         // The scalar temporaries are not produced by the widened body. All observable
         // loop-carried values must be precisely the pointer and length recurrences.
         for (b, block) in f.blocks.iter().enumerate() {
             if b < members.len() && members[b] { continue; }
+            // a loop temporary read here before this block defines it again
             let mut bad = false;
+            let mut redefined = vec![false; nv];
             for i in &block.insts {
-                for_uses(i, |v| bad |= (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize]);
+                for_uses(i, |v| bad |= (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize] && !redefined[v.0 as usize]);
+                for_defs(i, |v| if (v.0 as usize) < nv { redefined[v.0 as usize] = true });
             }
             let mut uses = Vec::new();
             crate::regalloc::term_uses(&block.term, &mut uses);
-            bad |= uses.iter().any(|v| (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize]);
+            bad |= uses.iter().any(|v| (v.0 as usize) < nv && defined[v.0 as usize] && !inputs[v.0 as usize] && !redefined[v.0 as usize]);
             if bad { continue 'candidate; }
         }
+        let shift = sz.trailing_zeros() as i64;
         let entry = f.blocks.len() as u32;
         let body = entry + 1;
         let pos = f.blocks[head as usize].term_pos;
         let trip = f.vreg(Cls::I);
-        let mut init = vec![Inst::Mov(trip, counts[0])];
-        for &c in &counts[1..] {
+        let mut init = vec![Inst::Iconst(trip, -1)];
+        let min_into = |f: &mut Func, init: &mut Vec<Inst>, trip: VReg, c: VReg| {
             let less = f.vreg(Cls::I);
             init.push(Inst::ICmp(Cond::Lt, false, less, c, trip));
             init.push(Inst::Sel(trip, less, c, trip));
+        };
+        let ok = f.vreg(Cls::I);
+        init.push(Inst::Iconst(ok, 1));
+        // a counter tested after `-o` steps must have them to give
+        for &(c, o) in &zero_guards {
+            if !counts.contains(&c) { continue; }
+            if o < 0 {
+                let (enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                init.push(Inst::ICmpI(Cond::Ge, false, enough, c, -o));
+                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                init.push(Inst::IBinI(IOp::Add, U64_TY, left, c, o));
+                min_into(f, &mut init, trip, left);
+            } else {
+                min_into(f, &mut init, trip, c);
+            }
+        }
+        // a pointer that reaches its end pointer in whole elements (the scalar guard is `==`),
+        // `oa` bytes ahead of its entry value
+        for &(p, oa, e, _) in &end_guards {
+            let (diff, cnt, ord, rem, aligned, enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
+            init.push(Inst::IBin(IOp::Sub, U64_TY, diff, e, p));
+            init.push(Inst::ICmp(Cond::Le, false, ord, p, e));
+            init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, ord));
+            if sz > 1 {
+                init.push(Inst::IBinI(IOp::And, U64_TY, rem, diff, sz - 1));
+                init.push(Inst::ICmpI(Cond::Eq, false, aligned, rem, 0));
+                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, aligned));
+                init.push(Inst::IBinI(IOp::Shr, U64_TY, cnt, diff, shift));
+            } else {
+                init.push(Inst::Mov(cnt, diff));
+            }
+            let ahead = oa / sz;
+            if ahead > 0 {
+                init.push(Inst::ICmpI(Cond::Ge, false, enough, cnt, ahead));
+                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                init.push(Inst::IBinI(IOp::Sub, U64_TY, left, cnt, ahead));
+                min_into(f, &mut init, trip, left);
+            } else {
+                min_into(f, &mut init, trip, cnt);
+            }
         }
         // A pointer guard may stop at zero. Cap the fast run before any pointer
-        // wraps, even for RIR not originating from Rust's in-bounds pointer add.
-        for &p in &pointers {
-            let (until_zero, less) = (f.vreg(Cls::I), f.vreg(Cls::I));
+        // wraps, even for RIR not originating from Rust's in-bounds pointer add (also a pointer
+        // tested `o` bytes ahead of its entry value).
+        for &p in &walkers {
+            let ahead = zero_guards.iter().filter(|g| g.0 == p).map(|g| g.1).max().unwrap_or(0);
+            let (until_zero, elems) = (f.vreg(Cls::I), f.vreg(Cls::I));
             init.push(Inst::INeg(U64_TY, until_zero, p));
-            init.push(Inst::ICmp(Cond::Lt, false, less, until_zero, trip));
-            init.push(Inst::Sel(trip, less, until_zero, trip));
+            let from = if ahead > 0 {
+                let (enough, left) = (f.vreg(Cls::I), f.vreg(Cls::I));
+                init.push(Inst::ICmpI(Cond::Ge, false, enough, until_zero, ahead));
+                init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
+                init.push(Inst::IBinI(IOp::Sub, U64_TY, left, until_zero, ahead));
+                left
+            } else {
+                until_zero
+            };
+            if sz > 1 {
+                init.push(Inst::IBinI(IOp::Shr, U64_TY, elems, from, shift));
+            } else {
+                init.push(Inst::Mov(elems, from));
+            }
+            min_into(f, &mut init, trip, elems);
         }
-        let ok = f.vreg(Cls::I);
-        init.push(Inst::ICmpI(Cond::Ge, false, ok, trip, 16));
+        let enough = f.vreg(Cls::I);
+        init.push(Inst::ICmpI(Cond::Ge, false, enough, trip, lanes));
+        init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, enough));
         for &src in &pointers {
             if src == dst { continue; }
             let (distance, far, same, safe) = (f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I), f.vreg(Cls::I));
@@ -445,25 +655,27 @@ fn vectorize_byte_maps(f: &mut Func) -> bool {
             init.push(Inst::IBin(IOp::Or, U64_TY, safe, far, same));
             init.push(Inst::IBin(IOp::And, U64_TY, ok, ok, safe));
         }
+        // the invariant scalars in every lane (once per entry)
+        let mut vectors: Vec<VReg> = Vec::new();
         let mut wide = Vec::new();
-        let mut vectors = vec![VReg(u32::MAX); nv];
-        for &(d, p) in &loads {
+        for w in &wops {
             let v = f.vreg(Cls::V128);
-            vectors[d.0 as usize] = v;
-            wide.push(Inst::VLoad(v, p, 0));
+            vectors.push(v);
+            match *w {
+                WOp::Splat(r) => init.push(Inst::VSplat(v, r)),
+                WOp::Const(c) => init.push(Inst::VConst(v, c)),
+                WOp::Load(p) => wide.push(Inst::VLoad(v, p, 0)),
+                WOp::Bin(o, a, b2) => wide.push(Inst::VBin(o, v, vectors[a], vectors[b2])),
+                WOp::Int(o, a, b2) => wide.push(Inst::VX(o, v, vectors[a], vectors[b2])),
+                WOp::Un(o, a) => wide.push(Inst::VUn(o, v, vectors[a])),
+            }
         }
-        for &(op, d, a, b) in &ops {
-            let v = f.vreg(Cls::V128);
-            let op = match op { IOp::Add => VX::Add(VW::B), IOp::Sub => VX::Sub(VW::B), IOp::And => VX::And, IOp::Or => VX::Or, IOp::Xor => VX::Xor, _ => unreachable!() };
-            wide.push(Inst::VX(op, v, vectors[a.0 as usize], vectors[b.0 as usize]));
-            vectors[d.0 as usize] = v;
-        }
-        wide.push(Inst::VStore(dst, 0, vectors[value.0 as usize]));
-        for &p in &pointers { wide.push(Inst::IBinI(IOp::Add, U64_TY, p, p, 16)); }
-        for &c in &counts { wide.push(Inst::IBinI(IOp::Sub, U64_TY, c, c, 16)); }
-        wide.push(Inst::IBinI(IOp::Sub, U64_TY, trip, trip, 16));
+        wide.push(Inst::VStore(dst, 0, vectors[value]));
+        for &p in &walkers { wide.push(Inst::IBinI(IOp::Add, U64_TY, p, p, 16)); }
+        for &c in &counts { wide.push(Inst::IBinI(IOp::Sub, U64_TY, c, c, lanes)); }
+        wide.push(Inst::IBinI(IOp::Sub, U64_TY, trip, trip, lanes));
         let again = f.vreg(Cls::I);
-        wide.push(Inst::ICmpI(Cond::Ge, false, again, trip, 16));
+        wide.push(Inst::ICmpI(Cond::Ge, false, again, trip, lanes));
         for (bi, block) in f.blocks.iter_mut().enumerate() {
             if bi >= members.len() || !members[bi] {
                 block.term.map_succs(|s| if s == head { entry } else { s });
@@ -496,7 +708,7 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
     if !vectorize_on(options) {
         return false;
     }
-    let mut changed = vectorize_byte_maps(f);
+    let mut changed = vectorize_stream_maps(f);
     let nb0 = f.blocks.len();
     let mut ndef = vec![0u32; f.vregs.len()];
     let mut nuse = vec![0u32; f.vregs.len()];
