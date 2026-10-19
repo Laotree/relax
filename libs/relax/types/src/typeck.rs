@@ -2760,7 +2760,8 @@ impl<'a> Fcx<'a> {
             }
             _ => self.tcx.tys.error,
         };
-        self.defer_fn_item_sized_obligations(ty, self.last_lo);
+        // rustc check_expr_path only: a constructor named in a pattern has no Sized inputs
+        if key & PAT_KEY == 0 { self.defer_fn_item_sized_obligations(ty, self.last_lo); }
         ty
     }
 
@@ -3873,6 +3874,13 @@ impl<'a> Fcx<'a> {
                                 Some(d) => {
                                     self.coerce_or_unify(it, d, Some(*e), ast.expr(*e).lo);
                                     d
+                                }
+                                // rustc check_decl_initializer coerces the initializer to the local's
+                                // fresh variable: a diverging one leaves it open (diverging fallback)
+                                None if matches!(self.tcx.tys.kind(self.shallow(it)), TyKind::Never) => {
+                                    let v = self.fresh(0);
+                                    self.coerce_or_unify(it, v, Some(*e), ast.expr(*e).lo);
+                                    v
                                 }
                                 None => it,
                             }

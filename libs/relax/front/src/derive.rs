@@ -572,15 +572,16 @@ fn gen_debug(ty: &str, is_enum: bool, shapes: &[Shape]) -> String {
             0 => format!("f.write_str({:?})", shown),
             1 => {
                 let mut x = format!("f.debug_tuple({:?})", shown);
+                // rustc's derive(Debug) passes the last field as `&&self.f` (it may be unsized)
                 for i in 0..s.fields.len() {
-                    x.push_str(&format!(".field(__s{})", i));
+                    x.push_str(&format!(".field({}__s{})", if i + 1 == s.fields.len() { "&" } else { "" }, i));
                 }
                 x + ".finish()"
             }
             _ => {
                 let mut x = format!("f.debug_struct({:?})", shown);
                 for (i, n) in s.fields.iter().enumerate() {
-                    x.push_str(&format!(".field({:?}, __s{})", field_name(n), i));
+                    x.push_str(&format!(".field({:?}, {}__s{})", field_name(n), if i + 1 == s.fields.len() { "&" } else { "" }, i));
                 }
                 x + ".finish()"
             }
