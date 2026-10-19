@@ -8440,6 +8440,9 @@ unsafe fn build_rir_lowered(up: *mut Unit, id: u32) -> Result<crate::rir::Func, 
             }
         }
     }
+    // (a check evaluates a constant where the lowering reaches its use: one named only in a branch
+    // that is never taken is not collected, as in rustc's monomorphization)
+    if (&*up).prog.session.options.const_fuel { const_uses.clear(); }
     for (d, args, kind) in const_uses {
         // a const used inside its own initializer is an error rustc already reports
         if let FnKey::Inst(me, _) = &key {

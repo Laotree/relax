@@ -8369,6 +8369,38 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// The way the `Branch` that ends block `b` (to `tb` / `eb`) goes when its condition is a
+    /// constant computed in that block from constants (a const parameter's value, comparisons,
+    /// negation); None when it is not known.
+    fn known_branch(&self, b: u32, tb: u32, eb: u32) -> Option<bool> {
+        let blk = self.f.blocks.get(b as usize)?;
+        let Term::Branch(c, t, e) = blk.term else { return None };
+        if (t, e) != (tb, eb) { return None; }
+        fn value(insts: &[&Inst], v: VReg, depth: u32) -> Option<i128> {
+            if depth > 8 { return None; }
+            let def = insts.iter().rev().copied().find(|i| matches!(i, Inst::Iconst(d, _) | Inst::Mov(d, _) | Inst::ICmpI(_, _, d, _, _) | Inst::ICmp(_, _, d, _, _) if *d == v))?;
+            match def {
+                Inst::Iconst(_, k) => Some(*k as i128),
+                Inst::Mov(_, a) => value(insts, *a, depth + 1),
+                Inst::ICmpI(cond, signed, _, a, k) => {
+                    let (x, k) = (value(insts, *a, depth + 1)?, *k as i128);
+                    Some(cmp(*cond, *signed, x, k) as i128)
+                }
+                Inst::ICmp(cond, signed, _, a, b) => {
+                    let (x, y) = (value(insts, *a, depth + 1)?, value(insts, *b, depth + 1)?);
+                    Some(cmp(*cond, *signed, x, y) as i128)
+                }
+                _ => None,
+            }
+        }
+        fn cmp(c: Cond, signed: bool, x: i128, y: i128) -> bool {
+            let (x, y) = if signed { (x as i64 as i128, y as i64 as i128) } else { (x as u64 as i128, y as u64 as i128) };
+            match c { Cond::Eq => x == y, Cond::Ne => x != y, Cond::Lt => x < y, Cond::Le => x <= y, Cond::Gt => x > y, Cond::Ge => x >= y }
+        }
+        let all: Vec<&Inst> = self.f.blocks.iter().flat_map(|b| b.insts.iter()).chain(self.entry_inits.iter()).collect();
+        value(&all, c, 0).map(|k| k != 0)
+    }
+
     fn lower_if(&mut self, c: ExprId, then: BlockId, els: Option<ExprId>, t: TyId) -> Val {
         let tb = self.f.block();
         let eb = self.f.block();
@@ -8392,13 +8424,23 @@ impl<'a> Lcx<'a> {
         }
         self.lower_cond(c, tb, eb);
         self.cond_rescope = saved_rescope;
+        // rustc_mir_transform SimplifyConstCondition: a branch on a constant (`if N != 0` once the
+        // const parameter has its value) is taken one way, and its dead successor is not
+        // lowered -- what it names (a constant that cannot be evaluated, a closure) is never
+        // instantiated, as rustc's monomorphization collector never sees it
+        let known = if let_scope { None } else { self.known_branch(self.cur, tb, eb) };
         self.switch(tb);
         // the body of an `if` and its `else` block are temporary scopes (Reference
         // destructors.scope.temporary: "The body of an if ... expression", "The else block")
         let mark = self.stmt_temps.len();
-        let v = self.lower_block(then);
-        if !self.is_never(t) {
-            self.write_place(&res, t, v);
+        if known == Some(false) {
+            self.term(Term::Unreachable);
+            self.dead();
+        } else {
+            let v = self.lower_block(then);
+            if !self.is_never(t) {
+                self.write_place(&res, t, v);
+            }
         }
         self.drop_stmt_temps_from(mark);
         if let_scope {
@@ -8417,7 +8459,10 @@ impl<'a> Lcx<'a> {
             self.scope_marks.truncate(depth);
             self.tail_marks.truncate(depth);
         }
-        if let Some(x) = els {
+        if known == Some(true) {
+            self.term(Term::Unreachable);
+            self.dead();
+        } else if let Some(x) = els {
             let mark = self.stmt_temps.len();
             let v = self.lower_expr_coerced(x, t);
             if !self.is_never(t) {
