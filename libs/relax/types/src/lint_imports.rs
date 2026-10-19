@@ -171,11 +171,7 @@ struct Leaf {
     span: (u32, u32),
     /// the leaf's path as segments (for resolving the target)
     segs: Vec<PathSeg>,
-    rename: Option<Ident2>,
 }
-
-#[derive(Clone, Copy)]
-struct Ident2 { lo: u32, hi: u32 }
 
 fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi: u32, prefix: &mut Vec<PathSeg>, out: &mut Vec<Leaf>) {
     let pf = &prog.files[file as usize];
@@ -190,7 +186,7 @@ fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi
                     if seg.kind() == SegKind::SelfValue { prefix.last().map(|s| pf.text(s.name).to_string()) } else { Some(pf.text(seg.name).to_string()) }
                 }
             };
-            out.push(Leaf { name, glob: false, empty: false, span: (start, end), segs, rename: rename.map(|r| Ident2 { lo: r.lo, hi: r.hi }) });
+            out.push(Leaf { name, glob: false, empty: false, span: (start, end), segs });
         }
         UseTree::Path(seg, child) => {
             prefix.push(seg);
@@ -201,12 +197,12 @@ fn leaves(prog: &Program, file: u32, ast: &Ast, t: &UseTree, start: u32, item_hi
         UseTree::Glob => {
             // `*` has no segment of its own: ends at the last segment's end + `::*`
             let end = prefix.last().map_or(start, |s| s.name.hi);
-            out.push(Leaf { name: None, glob: true, empty: false, span: (start, end + 3), segs: prefix.clone(), rename: None });
+            out.push(Leaf { name: None, glob: true, empty: false, span: (start, end + 3) , segs: prefix.clone() });
         }
         UseTree::Group(l) => {
             if ast.list(l).is_empty() {
                 // `use a::{};` imports nothing: unused, as a whole
-                out.push(Leaf { name: None, glob: false, empty: true, span: (start, item_hi), segs: prefix.clone(), rename: None });
+                out.push(Leaf { name: None, glob: false, empty: true, span: (start, item_hi) , segs: prefix.clone() });
             }
             for c in ast.list(l) {
                 // a nested tree starts at its own first segment
@@ -346,7 +342,7 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
         if !own.get(md.krate as usize).copied().unwrap_or(false) { continue; }
         for &(t, _) in &md.globs { globbed_by.entry(t).or_default().push(g as u32); }
     }
-    let scope_of_module: HashMap<u32, usize> = scopes.iter().enumerate().filter(|(_, s)| prog.block_owner.is_empty() || true).map(|(i, s)| (s.module, i)).collect();
+    let scope_of_module: HashMap<u32, usize> = scopes.iter().enumerate().map(|(i, s)| (s.module, i)).collect();
     for (si, sc) in scopes.iter().enumerate() {
         let toks = &tokens[&sc.file];
         let names = &written[si];
@@ -360,7 +356,7 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             let mut ls = Vec::new();
             let start = first_pos(sc.ast, &u.tree).unwrap_or(item.lo);
             leaves(prog, sc.file, sc.ast, &u.tree, start, item.hi, &mut Vec::new(), &mut ls);
-            let ctx = Ctx { prog, sc, toks, names, traits: &traits, by_name: &by_name, resolved: &resolved, globbed_by: &globbed_by, scopes: &scopes, written: &written, scope_of_module: &scope_of_module, module_used, private: matches!(item.vis, Vis::Private) || sc.block, item: (item.lo, item.hi) };
+            let ctx = Ctx { prog, sc, toks, names, traits: &traits, by_name: &by_name, resolved: &resolved, globbed_by: &globbed_by, written: &written, scope_of_module: &scope_of_module, module_used, item: (item.lo, item.hi) };
             let mut unused: Vec<(u32, u32)> = Vec::new();
             // `pub use` that leaves the crate cannot be judged (a glob of nothing exports nothing)
             let exported = matches!(item.vis, Vis::Pub) && reach.defs.contains(&sc.def);
@@ -444,12 +440,9 @@ struct Ctx<'a, 'b> {
     by_name: &'b HashSet<(String, String)>,
     resolved: &'b Vec<(u32, String, u32)>,
     globbed_by: &'b HashMap<DefId, Vec<u32>>,
-    scopes: &'b [Scope<'a>],
     written: &'b [HashSet<String>],
     scope_of_module: &'b HashMap<u32, usize>,
     module_used: &'b HashMap<u32, HashSet<DefId>>,
-    /// a plain `use` is visible in its own module only
-    private: bool,
     /// the byte range of the `use` item being judged
     item: (u32, u32),
 }

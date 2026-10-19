@@ -113,7 +113,7 @@ pub fn check(prog: &Program, own: &[bool]) -> Vec<String> {
 /// The attribute lists of fields, variants, parameters and generic parameters of an item.
 fn item_part_attrs(ast: &Ast, item: &Item) -> Vec<Vec<Attr>> {
     let mut out: Vec<Vec<Attr>> = Vec::new();
-    let mut fields = |l: List<FieldDef>, out: &mut Vec<Vec<Attr>>| { for f in ast.list(l) { out.push(ast.list(f.attrs).to_vec()); } };
+    let fields = |l: List<FieldDef>, out: &mut Vec<Vec<Attr>>| { for f in ast.list(l) { out.push(ast.list(f.attrs).to_vec()); } };
     match item.kind {
         ItemKind::Struct(r) => if let VariantData::Struct(l) | VariantData::Tuple(l) = ast.row(r).data { fields(l, &mut out) },
         ItemKind::Union(r) => fields(ast.row(r).fields, &mut out),

@@ -31,8 +31,6 @@ type FieldKey = (DefId, u32, u32);
 enum Ref {
     /// `check_def_id`: the definition is live and explored
     Use(DefId),
-    /// `insert_def_id`: live, not explored
-    Live(DefId),
     /// a field that is read
     Field(FieldKey),
 }
@@ -97,8 +95,6 @@ impl<'a> TypeWalker<'a> {
         }
         w
     }
-
-    fn text(&self, id: Ident) -> &str { self.prog.files[self.file as usize].text(id) }
 
     fn use_def(&mut self, d: DefId) {
         // naming a variant uses its enum too
@@ -989,16 +985,10 @@ impl<'a> Dead<'a> {
         if !own { self.live.insert(d); }
     }
 
-    fn insert_def(&mut self, d: DefId) {
-        if !self.local(d) { return; }
-        if !self.own_allow(d) { self.live.insert(d); }
-    }
-
     fn apply(&mut self, refs: &[Ref]) {
         for r in refs {
             match *r {
                 Ref::Use(d) => self.check_def(d),
-                Ref::Live(d) => self.insert_def(d),
                 Ref::Field(k) => {
                     // read in the scope of an allowed / expected item: a field that is allowed too
                     // is not made live by it
@@ -1028,7 +1018,7 @@ impl<'a> Dead<'a> {
                 let repr_live = attrs.iter().any(|a| lint::attr_path(self.prog, def.file, a) == b"repr" && lint::attr_args(self.prog, def.file, a).iter().any(|w| w == "C" || w == "transparent"));
                 let simd = attrs.iter().any(|a| lint::attr_path(self.prog, def.file, a) == b"repr" && lint::attr_args(self.prog, def.file, a).iter().any(|w| w == "simd"));
                 if let Some(adt) = self.tcx.adts.get(&id) {
-                    for (i, f) in adt.variants[0].fields.iter().enumerate() {
+                    for i in 0..adt.variants[0].fields.len() {
                         let positional = adt.variants[0].shape == 1;
                         if repr_live || (positional && simd) { self.live_fields.insert((id, 0, i as u32)); }
                     }
@@ -1233,7 +1223,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
         let mut guard = 0;
         loop {
             let set = module_used.entry(m).or_default();
-            for r in &refs { if let Ref::Use(x) | Ref::Live(x) = r { set.insert(*x); } }
+            for r in &refs { if let Ref::Use(x) = r { set.insert(*x); } }
             guard += 1;
             match prog.mods.get(m as usize).and_then(|md| md.lexical_parent) { Some(p) if guard < 64 => m = p, _ => break }
         }
@@ -1295,15 +1285,6 @@ impl<'a, 'b> Reporter<'a, 'b> {
             DefKind::Trait => "trait",
             _ => "item",
         }
-    }
-
-    fn ident_pos(&self, d: DefId) -> u32 {
-        let def = self.s.prog.def(d);
-        let ast = &self.s.prog.files[def.file as usize].ast;
-        if def.kind == DefKind::Variant {
-            if let ItemKind::Enum(r) = ast.item(def.item).kind { return ast.list(ast.row(r).variants)[def.sub as usize].name.lo; }
-        }
-        ast.item(def.item).name.lo
     }
 
     fn emit(&self, lint: &Lint, items: &[&DeadItem], participle: &str, parent: Option<DefId>, tuple_fields: bool) {

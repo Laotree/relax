@@ -1289,9 +1289,8 @@ impl<'a> Kp<'a> {
                 if self.dead { return V::Unknown; }
                 let take_then = !matches!(cv, V::Bool(false));
                 let take_else = !matches!(cv, V::Bool(true));
-                let mut d1 = false;
-                let mut d2 = false;
-                if take_then { d1 = self.branch(|s| { s.block(then); }); } else { d1 = true; }
+                let d1 = if take_then { self.branch(|s| { s.block(then); }) } else { true };
+                let d2;
                 match els.get() {
                     Some(x) => { if take_else { d2 = self.branch(|s| { s.eval(x); }); } else { d2 = true; } }
                     None => { d2 = !take_else; }
@@ -1774,7 +1773,7 @@ enum FnPos { Arg, Ret }
 enum Ffi {
     Safe,
     Phantom(TyId),
-    Unsafe { ty: TyId, reason: &'static str, help: Option<&'static str> },
+    Unsafe { ty: TyId, reason: &'static str },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2003,7 +2002,7 @@ impl<'a> Ffic<'a> {
         if boxed {
             if state.in_defined_function() || (state.in_fnptr() && self.base_mode == CItemKind::Definition) {
                 if self.is_sized(inner) { return Ffi::Safe; }
-                return Ffi::Unsafe { ty, reason: "box cannot be represented as a single pointer", help: None };
+                return Ffi::Unsafe { ty, reason: "box cannot be represented as a single pointer" };
             }
             if let TyKind::Adt(d, args, _) = self.kind(ty) { return self.visit_struct_or_union(state, ty, d, args); }
             return Ffi::Safe;
@@ -2043,7 +2042,7 @@ impl<'a> Ffic<'a> {
             };
         }
         if all_phantom { Ffi::Phantom(ty) }
-        else if transparent_with_all_zst { Ffi::Unsafe { ty, reason: "this struct contains only zero-sized fields", help: None } }
+        else if transparent_with_all_zst { Ffi::Unsafe { ty, reason: "this struct contains only zero-sized fields" } }
         else { Ffi::Safe }
     }
 
@@ -2054,16 +2053,16 @@ impl<'a> Ffic<'a> {
         let transparent = self.repr_transparent(d);
         if !a.repr_c && !transparent {
             return if a.is_struct() {
-                Ffi::Unsafe { ty, reason: "this struct has unspecified layout", help: Some("consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct") }
+                Ffi::Unsafe { ty, reason: "this struct has unspecified layout" }
             } else {
-                Ffi::Unsafe { ty, reason: "this union has unspecified layout", help: Some("consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this union") }
+                Ffi::Unsafe { ty, reason: "this union has unspecified layout" }
             };
         }
         if a.variants.first().is_none_or(|v| v.fields.is_empty()) {
             return if a.is_struct() {
-                Ffi::Unsafe { ty, reason: "this struct has no fields", help: Some("consider adding a member to this struct") }
+                Ffi::Unsafe { ty, reason: "this struct has no fields" }
             } else {
-                Ffi::Unsafe { ty, reason: "this union has no fields", help: Some("consider adding a member to this union") }
+                Ffi::Unsafe { ty, reason: "this union has no fields" }
             };
         }
         self.visit_variant_fields(state, ty, d, 0, args)
@@ -2079,13 +2078,13 @@ impl<'a> Ffic<'a> {
                 let k = self.kind(ty);
                 return self.visit_type(state.next(&k), inner);
             }
-            return Ffi::Unsafe { ty, reason: "enum has no representation hint", help: Some("consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum") };
+            return Ffi::Unsafe { ty, reason: "enum has no representation hint" };
         }
         let non_exhaustive = a.is_variant_list_non_exhaustive() && self.prog.def(d).krate != self.krate;
         for vi in 0..a.variants.len() {
             // check_non_exhaustive_variant
             if non_exhaustive && a.variants[vi].shape != 0 {
-                return Ffi::Unsafe { ty, reason: "this enum is non-exhaustive", help: None };
+                return Ffi::Unsafe { ty, reason: "this enum is non-exhaustive" };
             }
             match self.visit_variant_fields(state, ty, d, vi, args) {
                 Ffi::Safe => {}
@@ -2108,21 +2107,21 @@ impl<'a> Ffic<'a> {
                 if a.is_phantom_data() { return Ffi::Phantom(ty); }
                 if a.is_enum() { return self.visit_enum(state, ty, d, args); }
                 if matches!(self.diag_item(d).as_deref(), Some("cstring_type" | "cstr_type")) && !matches!(self.kind(self.base_ty), TyKind::Ptr(true, _)) {
-                    return Ffi::Unsafe { ty, reason: "`CStr`/`CString` do not have a guaranteed layout", help: Some("consider passing a `*const std::ffi::c_char` instead, and use `CStr::as_ptr()`") };
+                    return Ffi::Unsafe { ty, reason: "`CStr`/`CString` do not have a guaranteed layout" };
                 }
                 self.visit_struct_or_union(state, ty, d, args)
             }
             TyKind::Int(p) if crate::types::Types::int_info(p).0 != 0 => Ffi::Safe,
             TyKind::Float(_) | TyKind::Bool => Ffi::Safe,
-            TyKind::Char => Ffi::Unsafe { ty, reason: "the `char` type has no C equivalent", help: Some("consider using `u32` or `libc::wchar_t` instead") },
-            TyKind::Slice(_) => Ffi::Unsafe { ty, reason: "slices have no C equivalent", help: Some("consider using a raw pointer instead") },
-            TyKind::Dyn(..) => Ffi::Unsafe { ty, reason: "trait objects have no C equivalent", help: None },
-            TyKind::Str => Ffi::Unsafe { ty, reason: "string slices have no C equivalent", help: Some("consider using `*const u8` and a length instead") },
+            TyKind::Char => Ffi::Unsafe { ty, reason: "the `char` type has no C equivalent" },
+            TyKind::Slice(_) => Ffi::Unsafe { ty, reason: "slices have no C equivalent" },
+            TyKind::Dyn(..) => Ffi::Unsafe { ty, reason: "trait objects have no C equivalent" },
+            TyKind::Str => Ffi::Unsafe { ty, reason: "string slices have no C equivalent" },
             TyKind::Tuple(l) => {
                 if self.tcx.tys.list(l).is_empty() && state.in_function_return() && matches!(state.outer, Outer::None | Outer::NoneThroughFnPtr) {
                     Ffi::Safe
                 } else {
-                    Ffi::Unsafe { ty, reason: "tuples have unspecified layout", help: Some("consider using a struct instead") }
+                    Ffi::Unsafe { ty, reason: "tuples have unspecified layout" }
                 }
             }
             TyKind::Ptr(_, inner) if self.is_unit(inner) => Ffi::Safe,
@@ -2130,14 +2129,14 @@ impl<'a> Ffic<'a> {
             TyKind::Ref(_, inner, _) => self.visit_indirection(state, ty, inner, false),
             TyKind::Array(inner, _) => {
                 if state.in_function() && state.outer == Outer::None {
-                    Ffi::Unsafe { ty, reason: "passing raw arrays by value is not FFI-safe", help: Some("consider passing a pointer to the array") }
+                    Ffi::Unsafe { ty, reason: "passing raw arrays by value is not FFI-safe" }
                 } else {
                     self.visit_type(state.next(&k), inner)
                 }
             }
             TyKind::FnPtr(params, ret, header, _) => {
                 if is_rustic_abi(header.abi) {
-                    return Ffi::Unsafe { ty, reason: "this function pointer has Rust-specific calling convention", help: Some("consider using an `extern fn(...) -> ...` function pointer instead") };
+                    return Ffi::Unsafe { ty, reason: "this function pointer has Rust-specific calling convention" };
                 }
                 for &arg in self.tcx.tys.list(params) {
                     match self.visit_type(state.next_in_fnptr(FnPos::Arg), arg) {
@@ -2148,7 +2147,7 @@ impl<'a> Ffic<'a> {
                 self.visit_type(state.next_in_fnptr(FnPos::Ret), ret)
             }
             TyKind::Foreign(_) | TyKind::Never => Ffi::Safe,
-            TyKind::Alias(_, a) if matches!(a.kind, AliasTyKind::Opaque { .. }) => Ffi::Unsafe { ty, reason: "opaque types have no C equivalent", help: None },
+            TyKind::Alias(_, a) if matches!(a.kind, AliasTyKind::Opaque { .. }) => Ffi::Unsafe { ty, reason: "opaque types have no C equivalent" },
             TyKind::Param(_) | TyKind::Alias(..) if state.can_expect_ty_params() => Ffi::Safe,
             _ => Ffi::Safe,
         }
@@ -2164,7 +2163,7 @@ impl<'a> Ffic<'a> {
     fn check_type(&mut self, state: VState, ty: TyId) -> Ffi {
         let ty = self.norm(ty);
         if let Some(o) = self.find_opaque(ty, 0) {
-            return Ffi::Unsafe { ty: o, reason: "opaque types have no C equivalent", help: None };
+            return Ffi::Unsafe { ty: o, reason: "opaque types have no C equivalent" };
         }
         self.visit_type(state, ty)
     }

@@ -27,12 +27,6 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
 
 // ---------------------------------------------------------------- nonstandard_style
 
-/// `char::is_titlecase` (Unicode category Lt: the digraph capitals and the Greek capitals with
-/// ypogegrammeni).
-fn is_titlecase(c: char) -> bool {
-    matches!(c as u32, 0x1C5 | 0x1C8 | 0x1CB | 0x1F2 | 0x1F88..=0x1F8F | 0x1F98..=0x1F9F | 0x1FA8..=0x1FAF | 0x1FBC | 0x1FCC | 0x1FFC)
-}
-
 /// `char::to_titlecase`: the uppercase mapping except for the digraphs (Unicode SpecialCasing
 /// keeps the Greek iota-subscript letters in their Lt form).
 fn to_titlecase(c: char) -> Vec<char> {
@@ -77,68 +71,6 @@ fn is_upper_camel_case(name: &str) -> bool {
     let name = name.trim_matches('_');
     let Some(first) = name.chars().next() else { return true };
     !(changes_when_titlecased(first) || not_camel_case(name))
-}
-
-fn to_upper_camel_case(s: &str) -> String {
-    s.trim_matches('_')
-        .split('_')
-        .filter(|component| !component.is_empty())
-        .map(|component| {
-            let mut out = String::new();
-            let mut new_word = true;
-            let mut prev_is_lower_case = true;
-            let mut prev_is_lowercased_sigma = false;
-            for c in component.chars() {
-                if prev_is_lower_case && (c.is_uppercase() | is_titlecase(c)) { new_word = true; }
-                if new_word { out.extend(to_titlecase(c)); } else { out.extend(c.to_lowercase()); }
-                prev_is_lower_case = c.is_lowercase() || is_titlecase(c);
-                prev_is_lowercased_sigma = !new_word && c == '\u{3a3}';
-                new_word = false;
-            }
-            if prev_is_lowercased_sigma {
-                out.pop();
-                out.push('\u{3c2}');
-            }
-            out
-        })
-        .fold((String::new(), None), |(acc, prev): (String, Option<String>), next| {
-            let join = if let Some(prev) = prev {
-                let l = prev.chars().last().unwrap();
-                let f = next.chars().next().unwrap();
-                !char_has_case(l) && !char_has_case(f)
-            } else {
-                false
-            };
-            (acc + if join { "_" } else { "" } + &next, Some(next))
-        })
-        .0
-}
-
-fn to_snake_case(mut name: &str) -> String {
-    let mut words = vec![];
-    name = name.trim_start_matches(|c: char| {
-        if c == '_' {
-            words.push(String::new());
-            true
-        } else {
-            false
-        }
-    });
-    for s in name.split('_') {
-        let mut last_upper = false;
-        let mut buf = String::new();
-        if s.is_empty() { continue; }
-        for ch in s.chars() {
-            if !buf.is_empty() && buf != "'" && (ch.is_uppercase() || is_titlecase(ch)) && !last_upper {
-                words.push(buf.to_lowercase());
-                buf = String::new();
-            }
-            last_upper = ch.is_uppercase() || is_titlecase(ch);
-            buf.push(ch);
-        }
-        words.push(buf.to_lowercase());
-    }
-    words.join("_")
 }
 
 fn is_snake_case(ident: &str) -> bool {
@@ -325,7 +257,7 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];
     let ast = &pf.ast;
-    let mut w = Late { prog, tcx, body, ast, stack: Vec::new() };
+    let mut w = Late { prog, body, ast, stack: Vec::new() };
     match ast.item(d.item).kind {
         ItemKind::Fn(s, _, _) => {
             let Ok(Some(block)) = prog.fn_body(body.file, d.item) else { return };
@@ -351,7 +283,6 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
 
 struct Late<'a> {
     prog: &'a Program,
-    tcx: &'a Tcx,
     body: &'a Body,
     ast: &'a Ast,
     /// the attributes of the enclosing statements, arms, ..., outermost first
@@ -359,10 +290,6 @@ struct Late<'a> {
 }
 
 impl<'a> Late<'a> {
-    fn emit(&self, lint: &Lint, pos: u32, msg: &str) {
-        if lint::external(self.prog, self.body.file, pos) { return; }
-        lint::emit_in(self.prog, self.body.def, &self.stack, lint, self.body.file, pos, msg);
-    }
     fn site(&self) -> Site<'_> {
         Site { prog: self.prog, def: self.body.def, file: self.body.file, inner: &self.stack }
     }
@@ -424,9 +351,6 @@ mod tests {
         assert!(is_snake_case("'a"));
         assert!(!is_snake_case("fooBar"));
         assert!(!is_snake_case("foo__bar"));
-        assert_eq!(to_snake_case("FooBar"), "foo_bar");
-        assert_eq!(to_snake_case("_FooBar"), "_foo_bar");
-        assert_eq!(to_snake_case("HTTPServer"), "httpserver");
     }
 
     #[test]
@@ -436,7 +360,5 @@ mod tests {
         assert!(is_upper_camel_case("X86_64"));
         assert!(!is_upper_camel_case("foo_bar"));
         assert!(!is_upper_camel_case("Foo__Bar"));
-        assert_eq!(to_upper_camel_case("foo_bar"), "FooBar");
-        assert_eq!(to_upper_camel_case("_foo_bar_"), "FooBar");
     }
 }

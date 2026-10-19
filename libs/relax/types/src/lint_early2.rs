@@ -264,13 +264,9 @@ enum Meta {
 #[derive(Debug)]
 enum Args {
     None,
-    List { pos: u32, items: Vec<Meta> },
+    List { items: Vec<Meta> },
     /// `= value`: the value's first token
     Value { pos: u32, tok: Vec<u8> },
-}
-
-impl Meta {
-    fn pos(&self) -> u32 { match self { Meta::Lit { pos, .. } | Meta::Item { pos, .. } => *pos } }
 }
 
 fn is_literal_token(t: &[u8]) -> bool {
@@ -310,7 +306,7 @@ fn parse_meta_items(pf: &crate::parser::ParsedFile, lo: usize, hi: usize) -> Vec
                 }
                 let items = parse_meta_items(pf, open + 1, i.min(hi));
                 i += 1;
-                Args::List { pos: tok(open).lo, items }
+                Args::List { items }
             } else if i < hi && text(i) == b"=" {
                 let vpos = if i + 1 < hi { tok(i + 1).lo } else { tok(i).lo };
                 let v = if i + 1 < hi { text(i + 1) } else { Vec::new() };
@@ -1009,7 +1005,6 @@ pub(crate) fn absolute_use_paths(prog: &Program, d: DefId, file: u32, item: &Ite
         i += 1;
         if i > pf.toks.partition_point(|t| t.lo < item.lo) + 12 { break; }
     }
-    struct Leaf { module: Vec<Ident>, ident: Option<Ident>, glob: bool }
     fn collect(ast: &Ast, tree: UseTree, prefix: &mut Vec<(Ident, SegKind)>, out: &mut Vec<(Vec<(Ident, SegKind)>, Option<(Ident, SegKind)>, bool)>) {
         match tree {
             UseTree::Path(seg, rest) => {
@@ -1043,7 +1038,6 @@ pub(crate) fn absolute_use_paths(prog: &Program, d: DefId, file: u32, item: &Ite
         // the first segment of the full path: a keyword segment is not made absolute
         let first = module.first().map(|m| m.1).or(ident.map(|i| i.1));
         if !u.global && !matches!(first, Some(SegKind::Ident)) { continue; }
-        let _ = Leaf { module: Vec::new(), ident: None, glob: false };
         let count = if let Some(second) = module.first() {
             // `use a::b::c`: the path resolved up to its module part, once
             let n = pf.text(second.0);
