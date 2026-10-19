@@ -4244,13 +4244,17 @@ impl<'a> Fcx<'a> {
                 let saved = self.scopes.len();
                 let ct = self.check_expr(*c, Some(bool_));
                 self.coerce_or_unify(ct, bool_, None, lo);
+                // rustc_hir_typeck _match.rs check_then_else: the condition's divergence holds for
+                // the whole `if`; the branches start from `Maybe`
+                let cond_div = self.diverges;
+                self.diverges = false;
                 let tt = self.check_block(*then, expected);
                 let then_div = self.diverges;
                 self.scopes.truncate(saved);
                 self.diverges = false;
                 match &els.get() {
                     None => {
-                        self.diverges = false;
+                        self.diverges = cond_div;
                         if !then_div {
                             let s = self.shallow(tt);
                             if s != unit && s != self.tcx.tys.never {
@@ -4267,7 +4271,7 @@ impl<'a> Fcx<'a> {
                         let hint = if stt == self.tcx.tys.never || fnish { expected } else { expected.or(Some(tt)) };
                         let et = self.check_expr(*x, hint);
                         let else_div = self.diverges;
-                        self.diverges = then_div && else_div;
+                        self.diverges = cond_div || (then_div && else_div);
                         let ts = self.shallow(tt);
                         let es = self.shallow(et);
                         if ts == self.tcx.tys.never {

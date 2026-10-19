@@ -608,7 +608,7 @@ impl Names {
             kind: t.kind, text: String::from_utf8_lossy(&src[t.lo as usize..t.hi as usize]).into_owned(), pos: t.lo,
         }).collect::<Vec<_>>();
         let c = &self.crates[ci];
-        let Ok(def) = crate::macros::parse_def(&name, &c.name, &mtoks) else { return None; };
+        let Ok(def) = crate::macros::parse_def(&name, &c.name, c.edition, &mtoks) else { return None; };
         fn names_only(nodes: &[crate::macros::MNode]) -> bool {
             use crate::macros::{Frag, MNode};
             nodes.iter().all(|n| match n {
@@ -620,7 +620,7 @@ impl Names {
         if !def.arms.iter().all(|(matcher, _)| names_only(matcher)) { return None; }
         let mut parser = crate::parser::Parser::new(&c.cfg.session, src, toks, c.edition);
         parser.krate = c.name.clone();
-        let Ok((expanded, _, _)) = parser.expand_rules(&def, open + 1, end) else { return None; };
+        let Ok((expanded, _, _, _)) = parser.expand_rules(&def, open + 1, end) else { return None; };
         let mut tokens = Vec::new();
         if crate::lexer::lex(expanded.as_bytes(), c.edition, &mut tokens).is_err() { return None; }
         let bytes = expanded.as_bytes();
