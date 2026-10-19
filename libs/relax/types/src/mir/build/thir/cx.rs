@@ -14,19 +14,17 @@ pub struct Cx<'a> {
     pub thir: Thir,
     /// AST expressions already mirrored (the tree is a DAG only through shared sub-expressions).
     pub memo: HashMap<ast::ExprId, ExprId>,
+    /// Where a pattern with no leaf of its own (`_`, `..`) is placed (lane C: derived pattern spans,
+    /// `pattern/span.rs`): the callers set it to the start of the enclosing construct.
+    pub pat_hint: u32,
 }
 
 impl<'a> Cx<'a> {
     pub fn new(root: &'a BuildRoot<'a>, owner: CheckedBody) -> Self {
-        Self { root, owner, thir: Thir::default(), memo: HashMap::default() }
+        Self { root, owner, thir: Thir::default(), memo: HashMap::default(), pat_hint: 0 }
     }
     pub fn error(&self, span: Span, reason: UnsupportedReason) -> BuildError {
         BuildError::new(self.owner, span, reason)
-    }
-    /// AST patterns carry no span of their own (only identifiers and literals do); lane C derives
-    /// pattern spans from those leaves, this is the fallback.
-    pub fn pat_span(&self, _pat: ast::PatId) -> Span {
-        Span { file: self.root.typeck.file, lo: 0, hi: 0 }
     }
     /// rustc `thir_body`.
     pub fn thir_body(self) -> BuildResult<ThirBody> {

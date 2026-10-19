@@ -10,7 +10,6 @@ use crate::types::TyId;
 use std::sync::Arc;
 
 pub mod cx;
-pub mod pattern;
 pub use cx::Cx;
 
 macro_rules! thir_ids {
@@ -283,13 +282,13 @@ pub enum DerefPatBorrowMode {
     Borrow(Mutability),
     Box,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PatRangeBoundary {
     Finite(crate::consts::ValTree),
     NegInfinity,
     PosInfinity,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PatRange {
     pub lo: PatRangeBoundary,
     pub hi: PatRangeBoundary,
