@@ -22,7 +22,7 @@ pub const UNFULFILLED_LINT_EXPECTATIONS: Lint = lint::lint("unfulfilled_lint_exp
 /// unfulfilled. (Lints the check reports only in part are left out: it would call fulfilled
 /// expectations unfulfilled.)
 const IMPLEMENTED: &[&str] = &[
-    "arithmetic_overflow", "bare_trait_objects", "bindings_with_variant_name", "dead_code", "deprecated_safe_2024",
+    "arithmetic_overflow", "bare_trait_objects", "bindings_with_variant_name", "deprecated_safe_2024",
     "deref_nullptr", "dropping_copy_types", "dropping_references", "ellipsis_inclusive_range_patterns", "for_loops_over_fallibles",
     "forgetting_copy_types", "forgetting_references", "invalid_atomic_ordering", "irrefutable_let_patterns", "keyword_idents_2018",
     "keyword_idents_2024", "let_underscore_drop", "let_underscore_lock", "map_unit_fn", "missing_unsafe_on_extern",
@@ -30,9 +30,9 @@ const IMPLEMENTED: &[&str] = &[
     "noop_method_call", "overflowing_literals", "path_statements", "redundant_semicolons", "single_use_lifetimes",
     "static_mut_refs", "suspicious_double_ref_op", "trivial_casts", "trivial_numeric_casts", "unconditional_panic",
     "undropped_manually_drops", "unreachable_code", "unreachable_patterns", "unsafe_attr_outside_unsafe", "unsafe_op_in_unsafe_fn",
-    "unused_allocation", "unused_assignments", "unused_braces", "unused_imports", "unused_labels", "unused_lifetimes",
+    "unused_allocation", "unused_assignments", "unused_braces", "unused_labels", "unused_lifetimes",
     "unused_must_use", "unused_mut", "unused_parens", "unused_results", "unused_unsafe", "unused_variables", "while_true",
-    "mismatched_lifetime_syntaxes", "elided_lifetimes_in_paths", "explicit_outlives_requirements", "unused_macros", "unused_macro_rules",
+    "mismatched_lifetime_syntaxes", "elided_lifetimes_in_paths", "explicit_outlives_requirements", 
     "absolute_paths_not_starting_with_crate", "unknown_diagnostic_attributes",
 ];
 
