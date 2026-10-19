@@ -2473,7 +2473,7 @@ impl<'a> Parser<'a> {
                         }
                         if let Some((a, b)) = *taken {
                             let part = self.bytes(a, b);
-                            out.push(part.first().map_or(T::OtherPunct, |&c| punct_kind(c)), &String::from_utf8_lossy(part), Some(a), u32::MAX);
+                            out.push(lexed_kind(part), &String::from_utf8_lossy(part), Some(a), u32::MAX);
                         }
                         // a fragment of one of these kinds stays one token tree where the
                         // expansion is matched again (`$i:item` forwarded to `$t:tt`)
@@ -2648,14 +2648,13 @@ impl Transcript {
     }
 }
 
-/// The kind of a one-character punctuation token (the part of a split `>>`, `&&`... a fragment took).
-fn punct_kind(c: u8) -> T {
-    match c {
-        b'>' => T::Gt, b'<' => T::Lt, b'&' => T::And, b'|' => T::Or, b'=' => T::Eq, b'-' => T::Minus,
-        b'+' => T::Plus, b'*' => T::Star, b'/' => T::Slash, b'%' => T::Percent, b'^' => T::Caret,
-        b'!' => T::Not, b'.' => T::Dot, b':' => T::Colon, b';' => T::Semi, b',' => T::Comma,
-        b'#' => T::Pound, b'$' => T::Dollar, b'?' => T::Question, b'@' => T::At, b'~' => T::Tilde,
-        _ => T::OtherPunct,
+/// The kind of the text of a fragment's split token (a `>>` or `>>=` the fragment broke and took
+/// part of): what lexing that text gives.
+fn lexed_kind(part: &[u8]) -> T {
+    let mut v = Vec::new();
+    match crate::lexer::lex(part, 2021, &mut v) {
+        Ok(()) => v.first().map_or(T::OtherPunct, |t| t.kind),
+        Err(_) => T::OtherPunct,
     }
 }
 
