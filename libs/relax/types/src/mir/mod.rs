@@ -4,6 +4,7 @@
 pub mod dataflow;
 pub mod drop_flag_effects;
 pub mod move_paths;
+pub mod build;
 pub mod transform;
 pub mod shim;
 mod place_ty;
