@@ -141,15 +141,13 @@ impl Fcx<'_> {
         ty
     }
 
-    /// gather_locals.rs:136-152: the annotation of a `let`, before it is normalized or related to
-    /// the initializer. rustc saves it unconditionally; a type that cannot carry a lifetime
-    /// constraint relates trivially, so it is skipped. `impl Trait` bounds in bindings
+    /// gather_locals.rs:136-152 `declare`: the annotation of a `let`, saved UNCONDITIONALLY (rustc
+    /// does not apply `can_contain_user_lifetime_bounds` here, unlike casts), before it is
+    /// normalized or related to the initializer. `impl Trait` bounds in bindings
     /// (`collect_impl_trait_clauses_from_hir_ty`) do not exist in Relax.
     pub(super) fn lower_let_ty_saving_user_provided_ty(&mut self, syntax: crate::ast::TyId) -> TyId {
         let ty = self.lower_ty(syntax);
-        if self.can_contain_user_lifetime_bounds(self.tcx.tys.flags(ty)) {
-            self.write_user_type_annotation(UserTypeKey::Type(syntax.0), UserType::new(UserTypeKind::Ty(ty)));
-        }
+        self.write_user_type_annotation(UserTypeKey::Type(syntax.0), UserType::new(UserTypeKind::Ty(ty)));
         ty
     }
 }
@@ -199,9 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn plain_let_annotation_is_not_saved() {
+    fn plain_let_annotation_is_saved_like_rustc() {
+        // gather_locals saves every let annotation: `let mut v: Vec<usize>` must reach MIR as an AscribeUserType
         let (_, _, body) = body_of("#![no_std]\nfn f() { let _x: u32 = 1; }", "f");
-        assert!(annotations(&body).is_empty());
+        let all = annotations(&body);
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].1.var_kinds.is_empty());
     }
 
     #[test]
