@@ -2632,7 +2632,7 @@ impl Tcx {
         }
         if p.segs.len() >= 2 && p.no_qself() {
             let segs = crate::program::path_segs(prog, file, p);
-            if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false) {
+            if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false).filter(|_| p.lo < prog.files[file as usize].src_len) {
                 self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
             }
         }

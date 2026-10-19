@@ -3204,6 +3204,7 @@ impl<'a> Fcx<'a> {
     /// A tuple struct's constructor is as private as its most private field (rustc_resolve
     /// build_reduced_graph: ctor visibility; a path to it is E0603, a call E0423).
     fn check_ctor_privacy(&mut self, d: DefId, pos: u32) {
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
         if self.prog.def(d).kind != DefKind::Struct || self.value_ctor_shape(d) != Some(1) {
             return;
         }
@@ -3371,7 +3372,7 @@ impl<'a> Fcx<'a> {
             }
         }
         if path.no_qself() {
-            if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false) {
+            if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false).filter(|_| path.lo < prog.files[self.file as usize].src_len) {
                 self.err(path.lo, prog.privacy_message(&e));
             }
         }
@@ -5661,6 +5662,7 @@ impl<'a> Fcx<'a> {
 
     /// E0624: an item of an inherent impl is private to the impl's module.
     fn check_assoc_privacy(&mut self, item: DefId, pos: u32) {
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
         let def = self.prog.def(item);
         if self.prog.def(def.parent).kind != DefKind::Impl || !self.prog.own_crates.get(def.krate as usize).copied().unwrap_or(false) {
             return;
@@ -5681,6 +5683,8 @@ impl<'a> Fcx<'a> {
 
     /// E0451: a field named in a struct expression or pattern must be visible here.
     fn check_field_privacy(&mut self, adt_ty: TyId, vi: u32, fi: u32, pos: u32) {
+        // (macro output is held to the macro's own privacy, not the call site's)
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
         let st = self.shallow(adt_ty);
         let TyKind::Adt(d, _, _) = self.tcx.tys.kind(st).clone() else { return };
         let Some(adt) = self.tcx.adts.get(&d) else { return };

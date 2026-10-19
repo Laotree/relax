@@ -146,7 +146,7 @@ impl Program {
                     }
                 }
                 // `#[name = value]`: the value is a literal (a macro call only where it expands)
-                if f.tok(i).kind == T::Eq {
+                if f.tok(i).kind == T::Eq && f.tok(i).lo < f.src_len {
                     if let Some(m) = attr_value_error(f, i + 1, if first_i != lo { hi - 1 } else { hi }, ai < n_root && matches!(segs[0], "crate_name" | "crate_type")) {
                         out.push(self.record_error(fi as u32, f.tok(i + 1).lo, "parse", m));
                     }
