@@ -10884,7 +10884,10 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
     }
     let shown = crate::builtins::file_macro_path(path);
     let path = shown.as_str();
-    let fa = u.lit_data(path.as_bytes());
+    // `file_bytes_with_nul` (rustc Location::file_as_c_str): the name plus its terminating nul
+    let mut file_bytes = path.as_bytes().to_vec();
+    file_bytes.push(0);
+    let fa = u.lit_data(&file_bytes);
     let mut blob = vec![0u8; lay.size as usize];
     let put = |blob: &mut Vec<u8>, off: u32, b: &[u8]| {
         let o = off as usize;
@@ -10893,7 +10896,7 @@ fn location_addr(u: &Unit, path: &str, line: u32, col: u32) -> u64 {
         }
     };
     put(&mut blob, lay.fields[0], &fa.to_le_bytes());
-    put(&mut blob, lay.fields[0] + 8, &(path.len() as u64).to_le_bytes());
+    put(&mut blob, lay.fields[0] + 8, &(file_bytes.len() as u64).to_le_bytes());
     put(&mut blob, lay.fields[1], &line.to_le_bytes());
     put(&mut blob, lay.fields[2], &col.to_le_bytes());
     // pointer words: the file name's bytes; the rest integers

@@ -122,7 +122,7 @@ impl CStr {
     pub const fn as_ptr(&self) -> *const c_char {
         self.inner.as_ptr()
     }
-    pub fn count_bytes(&self) -> usize {
+    pub const fn count_bytes(&self) -> usize {
         self.inner.len() - 1
     }
     pub fn is_empty(&self) -> bool {

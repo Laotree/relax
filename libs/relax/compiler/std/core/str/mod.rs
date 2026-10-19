@@ -108,7 +108,7 @@ pub fn from_utf8_mut(v: &mut [u8]) -> Result<&mut str, Utf8Error> {
     }
 }
 
-pub unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
+pub const unsafe fn from_utf8_unchecked(v: &[u8]) -> &str {
     crate::intrinsics_mem::str_from_raw(crate::intrinsics_mem::slice_ptr(v), v.len())
 }
 
