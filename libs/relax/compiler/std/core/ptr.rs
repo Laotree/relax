@@ -100,6 +100,7 @@ pub fn hash<T: crate::marker::PointeeSized, S: crate::hash::Hasher>(hashee: *con
     use crate::hash::Hash;
     (hashee as *const u8 as usize).hash(into);
 }
+#[rustc_diagnostic_item = "ptr_from_ref"]
 pub const fn from_ref<T: crate::marker::PointeeSized>(r: &T) -> *const T {
     r
 }

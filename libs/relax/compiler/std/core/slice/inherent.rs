@@ -129,9 +129,11 @@ impl<T> [T] {
     pub const unsafe fn get_unchecked_mut<I: SliceIndex<[T]>>(&mut self, index: I) -> &mut I::Output {
         &mut *index.get_unchecked_mut(self)
     }
+    #[rustc_as_ptr]
     pub const fn as_ptr(&self) -> *const T {
         self as *const [T] as *const T
     }
+    #[rustc_as_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut [T] as *mut T
     }

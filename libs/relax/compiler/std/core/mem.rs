@@ -54,6 +54,7 @@ pub unsafe fn uninitialized<T>() -> T {
 pub const unsafe fn zeroed<T>() -> T {
     im::zeroed::<T>()
 }
+#[rustc_diagnostic_item = "transmute"]
 pub const unsafe fn transmute<T, U>(e: T) -> U {
     im::transmute::<T, U>(e)
 }
@@ -194,9 +195,11 @@ impl<T> MaybeUninit<T> {
             &mut *self.as_mut_ptr()
         }
     }
+    #[rustc_as_ptr]
     pub const fn as_ptr(&self) -> *const T {
         self as *const MaybeUninit<T> as *const T
     }
+    #[rustc_as_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut T {
         self as *mut MaybeUninit<T> as *mut T
     }

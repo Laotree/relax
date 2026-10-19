@@ -28,9 +28,11 @@ impl str {
     pub const unsafe fn as_bytes_mut(&mut self) -> &mut [u8] {
         as_bytes_mut(self)
     }
+    #[rustc_as_ptr]
     pub const fn as_ptr(&self) -> *const u8 {
         unsafe { crate::intrinsics_mem::slice_ptr(crate::intrinsics_mem::str_as_bytes(self)) }
     }
+    #[rustc_as_ptr]
     pub const fn as_mut_ptr(&mut self) -> *mut u8 {
         self.as_ptr() as *mut u8
     }

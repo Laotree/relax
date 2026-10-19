@@ -47,11 +47,13 @@ pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
             let params: Vec<PatId> = ast.list(ast.fn_sig(s).params).iter().map(|p| p.pat).collect();
             w.block(block);
             known_panics(prog, tcx, body, Some(block), None, &params);
+            crate::lint_late2::check_body(prog, tcx, body, Some(block), None);
         }
         ItemKind::Const(..) | ItemKind::Static(..) => {
             let Ok(Some(e)) = prog.const_body(body.file, d.item) else { return };
             w.expr(e);
             known_panics(prog, tcx, body, None, Some(e), &[]);
+            crate::lint_late2::check_body(prog, tcx, body, None, Some(e));
         }
         _ => {}
     }

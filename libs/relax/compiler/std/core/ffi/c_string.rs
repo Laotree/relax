@@ -12,6 +12,7 @@ use super::{c_char, CStr};
 
 /// `inner` holds the bytes plus the trailing nul, no interior nul.
 #[derive(PartialEq, PartialOrd, Eq, Ord, Hash, Clone)]
+#[rustc_diagnostic_item = "cstring_type"]
 pub struct CString {
     inner: Box<[u8]>,
 }

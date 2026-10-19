@@ -22,12 +22,14 @@ impl<T> UnsafeCell<T> {
 }
 
 impl<T: ?Sized> UnsafeCell<T> {
+    #[rustc_as_ptr]
     pub const fn get(&self) -> *mut T {
         &self.value as *const T as *mut T
     }
     pub const fn get_mut(&mut self) -> &mut T {
         &mut self.value
     }
+    #[rustc_diagnostic_item = "unsafe_cell_raw_get"]
     pub const fn raw_get(this: *const UnsafeCell<T>) -> *mut T {
         this as *const T as *mut T
     }
@@ -52,6 +54,7 @@ impl<T> From<T> for UnsafeCell<T> {
 // ---------------------------------------------------------------- Cell
 
 #[repr(transparent)]
+#[rustc_diagnostic_item = "Cell"]
 pub struct Cell<T: ?Sized> {
     value: UnsafeCell<T>,
 }
@@ -98,6 +101,7 @@ impl<T: Copy> Cell<T> {
 }
 
 impl<T: ?Sized> Cell<T> {
+    #[rustc_as_ptr]
     pub const fn as_ptr(&self) -> *mut T {
         self.value.get()
     }
