@@ -431,6 +431,143 @@ pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
     errors
 }
 
+/// rustc_ast_passes ast_validation validate_generic_param_order and the default rules: lifetime
+/// parameters come before type and const parameters; defaults of type and const parameters are
+/// trailing (structs, enums, unions, aliases, traits) and absent on fns and impls.
+pub fn generic_param_rules(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::{GenericParamKind, ItemKind};
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    let Some(g) = ast.kind_generics(&item.kind) else { return Vec::new() };
+    let params = ast.list(g.params);
+    let mut errors = Vec::new();
+    let mut seen_non_lifetime = false;
+    let mut order_reported = false;
+    for p in params {
+        match p.kind {
+            GenericParamKind::Lifetime(_) => {
+                if seen_non_lifetime && !order_reported {
+                    errors.push(prog.record_error(def.file, p.name.lo, "parse", "lifetime parameters must be declared prior to type and const parameters".to_string()));
+                    order_reported = true;
+                }
+            }
+            _ => seen_non_lifetime = true,
+        }
+    }
+    // a const parameter's type is an integer, bool or char (adt_const_params lifts the rule)
+    if let ItemKind::Fn(s, _, _) = item.kind {
+        let sig = ast.fn_sig(s);
+        if sig.konst && sig.asyncness {
+            errors.push(prog.record_error(def.file, item.lo, "parse", "functions cannot be both `const` and `async`".to_string()));
+        }
+    }
+    let krate = &prog.crates[def.krate as usize];
+    if !krate.features(prog).has("adt_const_params") && !krate.features(prog).has("unsized_const_params") {
+        let f = &prog.files[def.file as usize];
+        for p in params {
+            let GenericParamKind::Const(ty, _) = p.kind else { continue };
+            let forbidden = match ast.ty(ty) {
+                ast::Ty::Path(path) if path.no_qself() && path.segs.len() == 1 => {
+                    let n = f.text(ast.segs(path.segs)[0].name);
+                    match n {
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "bool" | "char" => false,
+                        "f32" | "f64" | "str" => true,
+                        _ => {
+                            let sym = prog.syms.get(n).unwrap_or(u32::MAX);
+                            !params.iter().any(|q| f.text(q.name) == n)
+                                && prog.lookup_in_scope(prog.mods[def.scope as usize].normal, sym, true).is_some_and(|t| matches!(prog.def(t).kind, DefKind::Struct | DefKind::Enum | DefKind::Union))
+                        }
+                    }
+                }
+                ast::Ty::Ref(..) | ast::Ty::Tuple(_) | ast::Ty::Slice(_) | ast::Ty::Array(..) => true,
+                _ => false,
+            };
+            if forbidden {
+                let n = match ast.ty(ty) { ast::Ty::Path(path) => f.text(ast.segs(path.segs)[0].name).to_string(), _ => "this type".to_string() };
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", format!("`{}` is forbidden as the type of a const generic parameter", n)));
+            }
+        }
+    }
+    let has_default = |p: &crate::ast::GenericParam| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)));
+    if matches!(item.kind, ItemKind::Fn(..) | ItemKind::Impl(..)) {
+        for p in params {
+            if has_default(p) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "defaults for generic parameters are not allowed here".to_string()));
+            }
+        }
+    } else {
+        let mut trailing_from = params.len();
+        for (i, p) in params.iter().enumerate().rev() {
+            if matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
+            if has_default(p) { trailing_from = i; } else { break; }
+        }
+        let mut reported = false;
+        for (i, p) in params.iter().enumerate() {
+            if has_default(p) && i < trailing_from && !reported && params[i + 1..].iter().any(|q| !matches!(q.kind, GenericParamKind::Lifetime(_)) && !has_default(q)) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string()));
+                reported = true;
+            }
+        }
+    }
+    errors
+}
+
+/// rustc_hir_analysis `check_for_entry_fn` for a binary crate: `main` exists in the crate root
+/// (E0601), is not `async` (E0752), has the type `fn()` (E0580), no generic parameters (E0131)
+/// and no where clause (E0646). A crate declaring itself `#![no_main]` or a non-binary
+/// `#![crate_type]` has no entry point to check.
+pub fn entry_point(prog: &Program, root: u32) -> Vec<String> {
+    use crate::ast::ItemKind;
+    let c = &prog.crates[root as usize];
+    let m = &prog.mods[c.root_mod as usize];
+    let pf = &prog.files[m.file as usize];
+    for a in pf.ast.root_attrs.iter() {
+        let t = a.toks;
+        if t.hi <= t.lo { continue; }
+        match pf.tok_text(t.lo) {
+            "no_main" | "no_core" => return Vec::new(),
+            "crate_type" if t.hi == t.lo + 3 && pf.tok_text(t.lo + 2).trim_matches('"') != "bin" => return Vec::new(),
+            _ => {}
+        }
+    }
+    let Some(sym) = prog.syms.get("main") else { return vec![no_main_error(prog, root, m.file)] };
+    let main = match prog.lookup_in_module(c.root_mod, sym, false, &mut Vec::new()) {
+        Some(d) if prog.def(d).kind == DefKind::Fn => d,
+        _ => return vec![no_main_error(prog, root, m.file)],
+    };
+    let def = prog.def(main);
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    let ItemKind::Fn(sig, _, _) = item.kind else { return Vec::new() };
+    let sig = ast.fn_sig(sig);
+    let at = item.name.lo;
+    let err = |msg: &str| vec![prog.record_error(def.file, at, "typeck", msg.to_string())];
+    if sig.asyncness {
+        return err("E0752: `main` function is not allowed to be `async`");
+    }
+    let rust_abi = match sig.abi {
+        None => true,
+        Some(None) => false,
+        Some(Some(name)) => prog.files[def.file as usize].text(name) == "\"Rust\"",
+    };
+    if !sig.params.is_empty() || sig.self_param.is_some() || sig.variadic || sig.unsafe_ || !rust_abi {
+        return err("E0580: `main` function has wrong type");
+    }
+    if !sig.generics.params.is_empty() {
+        return err("E0131: `main` function is not allowed to have generic parameters");
+    }
+    if !sig.generics.where_.is_empty() {
+        return err("E0646: `main` function is not allowed to have a `where` clause");
+    }
+    Vec::new()
+}
+
+fn no_main_error(prog: &Program, root: u32, file: u32) -> String {
+    let name = prog.syms.str(prog.crates[root as usize].name);
+    prog.record_error(file, 0, "typeck", format!("E0601: `main` function not found in crate `{}`", name))
+}
+
 /// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
 /// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
 /// 2024), and a safety qualifier on an item of a plain block.
@@ -758,18 +895,18 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
 /// rustc_resolve late.rs: an associated constant of an impl whose header names an anonymous
 /// lifetime (`impl Foo<'_>`) with an elided `&` in its type -- the elided lifetime means
 /// `'static` there (lint `elided_lifetimes_in_associated_constant`).
-pub fn assoc_const_elision(prog: &Program, d: DefId) {
+pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
     use crate::ast::{GenericArg, GenericArgs, ItemKind, Ty};
-    if !crate::lint::enabled() { return; }
+    if !crate::lint::enabled() { return Vec::new(); }
     let def = prog.def(d);
-    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return; }
+    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return Vec::new(); }
     let ast = &prog.files[def.file as usize].ast;
     let pf = &prog.files[def.file as usize];
-    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return };
-    let Some(ty) = oty.get() else { return };
+    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return Vec::new() };
+    let Some(ty) = oty.get() else { return Vec::new() };
     let imp = prog.def(def.parent);
     let iast = &prog.files[imp.file as usize].ast;
-    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return };
+    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return Vec::new() };
     // an anonymous lifetime written in a type
     fn anon<'t>(ast: &crate::ast::Ast, text: &dyn Fn(crate::ast::Ident) -> &'t str, t: crate::ast::TyId, refs_too: bool, depth: u32) -> bool {
         if depth > 16 { return false; }
@@ -800,7 +937,12 @@ pub fn assoc_const_elision(prog: &Program, d: DefId) {
         }));
     if header && anon(ast, &ctext, ty, true, 0) {
         crate::lint::emit(prog, d, &crate::lint::ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT, def.file, ast.item(def.item).lo, "`&` without an explicit lifetime name cannot be used here");
+        // the elided lifetime is a parameter of the impl's constant, which the trait's does not have
+        if im.trait_.is_some() {
+            return vec![prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0195: lifetime parameters or bounds on associated constant `{}` do not match the trait declaration", prog.name(d)))];
+        }
     }
+    Vec::new()
 }
 
 /// rustc_attr_parsing `AllowedTargets::AllowList`: the targets a builtin attribute may be written
