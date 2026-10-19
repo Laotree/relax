@@ -2714,7 +2714,58 @@ impl Unit {
         let k = if missing { crate::syms::SymKind::Missing(name) } else { crate::syms::SymKind::Foreign(name) };
         let s = self.syms.intern(k, a);
         crate::zone_alloc::kept_with(|| { self.syms.foreign_defs.lock().unwrap_or_else(|e| e.into_inner()).entry(s.id).or_insert(d); });
+        if !missing {
+            self.note_sincos(&self.link_name(d));
+        }
         Some(s)
+    }
+
+    /// On a target whose libm has a combined `sincos` routine (Darwin arm64), registers it with the
+    /// optimiser once the program names both `sinf` and `cosf` (or `sin` and `cos`): rustc's LLVM
+    /// calls it for a sin and a cos of the same value in one block (opt::fuse_sincos).
+    fn note_sincos(&self, name: &str) {
+        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+            return;
+        }
+        let (sin, cos, both, wide) = match name {
+            "sinf" | "cosf" => ("sinf", "cosf", "__sincosf_stret", false),
+            "sin" | "cos" => ("sin", "cos", "__sincos_stret", true),
+            _ => return,
+        };
+        let (Some(sn), Some(cs)) = (self.syms.find_foreign(sin), self.syms.find_foreign(cos)) else { return };
+        let p = unsafe { os::proc::find(format!("{}\0", both).as_ptr()) };
+        if p.is_null() {
+            return;
+        }
+        crate::opt::set_sincos(wide, sn, cs, self.syms.intern(crate::syms::SymKind::Foreign(both.to_string()), p as u64));
+    }
+
+    /// Whether `func` calls std's `sin` and `cos` methods (before inlining): such a function is
+    /// optimised from its first compile, because only the optimiser pairs the calls like rustc's
+    /// LLVM, and a baseline version would compute other bits than the optimised one.
+    fn pairs_sincos(&self, func: &crate::rir::Func) -> bool {
+        if !cfg!(all(target_vendor = "apple", target_arch = "aarch64")) {
+            return false;
+        }
+        let (mut sin, mut cos) = (false, false);
+        for b in &func.blocks {
+            for i in &b.insts {
+                let crate::rir::Inst::Call(crate::rir::Callee::Fn(c), a, r) = i else { continue };
+                if a.len() != 1 || r.len() != 1 {
+                    continue;
+                }
+                let FnKey::Inst(d, _) = &self.fns[*c as usize].key else { continue };
+                if self.prog.def(*d).krate != self.core_crate {
+                    continue;
+                }
+                match self.prog.name(*d) {
+                    "sin" => sin = true,
+                    "cos" => cos = true,
+                    _ => {}
+                }
+            }
+        }
+        sin && cos
     }
 
     /// The slot whose thunk is at `addr`.
@@ -6968,6 +7019,7 @@ unsafe fn prepare_rir_from(up: *mut Unit, id: u32, defer: bool, lowered: Option<
         }
     }
     let u = &mut *up;
+    let baseline = baseline && !u.pairs_sincos(&func);
     func.baseline = baseline;
     // O2: a `#[relax(O2)]` fn built by the O2 worker (o2_thread) compiles as O1 does without
     // O3; its on-demand builds on the program's threads stay O1

@@ -2350,14 +2350,116 @@ pub fn simplify(options: &relax_session::Options, f: &mut Func, ro: Option<RoRea
     if branch_on_compare(f) {
         dce(f);
     }
-
+    fuse_sincos(f);
 }
 
-/// A block ending `d = !c; branch d, t, e` (d = `c == 0`, `c ^ 1`; `c != 0` is c itself) where c is
-/// a compare result (every definition of c an `ICmp` / `ICmpI` / `FCmp`, so 0 or 1) and d has no
-/// other use branches on c with the targets swapped. This is the only exact form for floats: `!(a <= b)`
-/// is not `a > b` on NaN, but the backends branch on a fused float compare with its unordered
-/// case handled, so the compare stays one compare + one jcc / b.cond (rustc's `if !(s <= z)`).
+/// Per width (f32, f64): libm's `sin` and `cos` symbol ids and the combined `sincos` routine. The
+/// embedder registers them only for targets whose rustc build combines the pair: LLVM's
+/// SelectionDAG turns an FSIN and an FCOS of the same value into one call of Darwin's
+/// `__sincosf_stret` / `__sincos_stret` (a two-float HFA on arm64), and its results are not always
+/// those of separate `sinf`/`cosf` calls (1 ulp in 127 of 4000 arguments), so a program's floats
+/// only match a rustc build's if we combine them too.
+static SINCOS: std::sync::Mutex<[Option<(u32, u32, Sym)>; 2]> = std::sync::Mutex::new([None, None]);
+
+pub fn set_sincos(wide: bool, sin: Sym, cos: Sym, both: Sym) {
+    SINCOS.lock().unwrap_or_else(|e| e.into_inner())[wide as usize] = Some((sin.id, cos.id, both));
+}
+
+/// `sin(x)` and `cos(x)` of the same value in one block become one combined call, as LLVM's
+/// legalizer does (LegalizeDAG: `useSinCos` / `ExpandSinCosLibCall`: an FSIN and an FCOS with the
+/// same operand in one DAG, i.e. one basic block). Runs at the end of `simplify`, when inlining has
+/// exposed the libm calls and the block splits of bounds checks and invokes are gone, as they are
+/// by the time LLVM selects instructions. The call goes where the earlier of the two was; the
+/// later's result is defined there too, so it must be neither read nor written in between (RIR
+/// vregs are mutable).
+pub fn fuse_sincos(f: &mut Func) -> bool {
+    let tab = *SINCOS.lock().unwrap_or_else(|e| e.into_inner());
+    if tab.iter().all(|t| t.is_none()) {
+        return false;
+    }
+    let kind = |i: &Inst| -> Option<(usize, bool, VReg, VReg)> {
+        let Inst::Call(Callee::CHost(s, _), args, rets) = i else { return None };
+        if args.len() != 1 || rets.len() != 1 {
+            return None;
+        }
+        (0..2).find_map(|w| {
+            let (sn, cs, _) = tab[w]?;
+            if s.id == sn { Some((w, true, args[0], rets[0])) } else if s.id == cs { Some((w, false, args[0], rets[0])) } else { None }
+        })
+    };
+    // the value an operand holds at instruction `at`: followed back through `Mov` copies within
+    // the block to (vreg, index of its defining instruction or none for a value live into the block)
+    let ident = |insts: &[Inst], at: usize, v: VReg| -> (VReg, Option<usize>) {
+        let (mut v, mut at) = (v, at);
+        loop {
+            let def = (0..at).rev().find(|&k| {
+                let mut hit = false;
+                for_defs(&insts[k], |d| hit |= d == v);
+                hit
+            });
+            match def {
+                Some(k) => match insts[k] {
+                    Inst::Mov(_, y) => {
+                        v = y;
+                        at = k;
+                    }
+                    _ => return (v, Some(k)),
+                },
+                None => return (v, None),
+            }
+        }
+    };
+    let mut changed = false;
+    for bi in 0..f.blocks.len() {
+        let mut n = 0;
+        while n < f.blocks[bi].insts.len() {
+            let found = (|| {
+                let insts = &f.blocks[bi].insts;
+                let (w, is_sin, x, r1) = kind(&insts[n])?;
+                let both = tab[w]?.2;
+                let id1 = ident(insts, n, x);
+                for m in n + 1..insts.len() {
+                    if let Some((w2, s2, x2, r2)) = kind(&insts[m]) {
+                        if w2 == w && s2 != is_sin && ident(insts, m, x2) == id1 {
+                            let touched = |v: VReg| {
+                                insts[n + 1..m].iter().any(|i| {
+                                    let mut t = false;
+                                    for_uses(i, |u| t |= u == v);
+                                    for_defs(i, |d| t |= d == v);
+                                    t
+                                })
+                            };
+                            let (rs, rc) = if is_sin { (r1, r2) } else { (r2, r1) };
+                            if rs == rc {
+                                return None;
+                            }
+                            // at the earlier call (reading its operand) or at the later one
+                            if !touched(r2) {
+                                return Some((m, n, rs, rc, both, x));
+                            }
+                            if !touched(r1) {
+                                return Some((m, m, rs, rc, both, x2));
+                            }
+                            return None;
+                        }
+                    }
+                }
+                None
+            })();
+            if let Some((m, at, rs, rc, both, x)) = found {
+                let b = &mut f.blocks[bi];
+                b.insts[at] = Inst::Call(Callee::Host(both), vec![x], vec![rs, rc]);
+                let drop = if at == n { m } else { n };
+                b.insts.remove(drop);
+                b.pos.remove(drop);
+                changed = true;
+            }
+            n += 1;
+        }
+    }
+    changed
+}
+
 fn branch_on_compare(f: &mut Func) -> bool {
     let nv = f.vregs.len();
     let mut cmp_only = vec![true; nv];
