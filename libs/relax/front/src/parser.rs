@@ -2526,6 +2526,11 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         let mut preds = self.ast.list(g.where_).to_vec();
+        // rustc choose_generics_over_qpath: `where<T>` generics are reserved for future use
+        if self.kind() == T::Lt && (matches!(self.nth(1), T::Gt | T::Lifetime)
+            || (matches!(self.nth(1), T::Ident) && matches!(self.nth(2), T::Gt | T::Comma | T::Colon | T::Eq))) {
+            return self.err("generic parameters on `where` clauses are reserved for future use");
+        }
         loop {
             match self.kind() {
                 T::OpenBrace | T::Semi | T::Eq | T::Eof => break,
