@@ -58,7 +58,10 @@ impl crate::mir::transform::qualifs::ConstQualifsProvider for BuildProvider<'_> 
         // In progress: a cycle blocks.
         self.memo.borrow_mut().insert(def, Err(Blocked("constant qualification cycle")));
         let result = (|| {
-            let owner = CheckedBody::item(self.prog, def).ok_or(Blocked("not a body owner"))?;
+            let owner = CheckedBody::item(self.prog, def).ok_or_else(|| {
+                if std::env::var_os("MAKEPAD_RUN_NOSOLUTION_TRACE").is_some() { eprintln!("NOTOWNER {} kind {:?}", self.prog.def_path(def), self.prog.def(def).kind); }
+                Blocked("not a body owner")
+            })?;
             let typeck_body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.tcx.typeck(self.prog, def))).map_err(|_| Blocked("typeck panicked"))?;
             if !typeck_body.errors.is_empty() {
                 return Err(Blocked("typeck errors"));
