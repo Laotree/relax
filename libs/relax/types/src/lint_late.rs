@@ -1679,6 +1679,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
     if !lint::enabled() { return; }
     text_direction(prog, own);
     improper_ctypes(prog, tcx, own);
+    crate::lint_nonlocal::check(prog, tcx, own);
 }
 
 /// rustc_ast::util::unicode TEXT_FLOW_CONTROL_CHARS.

@@ -114,6 +114,7 @@ pub const fn from_mut<T: crate::marker::PointeeSized>(r: &mut T) -> *mut T {
 #[repr(transparent)]
 #[rustc_layout_scalar_valid_range_start(1)]
 #[rustc_nonnull_optimization_guaranteed]
+#[rustc_diagnostic_item = "NonNull"]
 #[cfg_attr(not(relax_check), lang = "non_null")]
 pub struct NonNull<T: crate::marker::PointeeSized> {
     pointer: *const T,

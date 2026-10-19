@@ -180,7 +180,7 @@ fn peel_blocks(ast: &Ast, mut e: ExprId) -> ExprId {
 /// `#[rustc_diagnostic_item = "name"]` of a definition.
 fn diag_name(prog: &Program, d: DefId) -> Option<String> {
     let def = prog.def(d);
-    if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Fn | DefKind::AssocFn | DefKind::TypeAlias) { return None; }
+    if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::Fn | DefKind::AssocFn | DefKind::TypeAlias | DefKind::Const | DefKind::AssocConst) { return None; }
     let ast = &prog.files[def.file as usize].ast;
     let p = prog.src(def.file);
     for a in ast.list(ast.item(def.item).attrs) {
@@ -481,6 +481,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_prelude_dot_call(e);
         self.lint_shadowed_into_iter(e);
         self.lint_if_let_rescope(e);
+        self.lint_comparisons(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
             ExprKind::Call(f, args) => {
@@ -881,5 +882,183 @@ impl<'a> L2<'a> {
         if let Some(pos) = first {
             self.emit(&IF_LET_RESCOPE, pos, "`if let` assigns a shorter lifetime since Edition 2024");
         }
+    }
+}
+
+// ---------------------------------------------------------------- comparison lints (rustc_lint types.rs)
+
+pub const UNUSED_COMPARISONS: Lint = lint::lint("unused_comparisons", Level::Warn, &[]);
+pub const INVALID_NAN_COMPARISONS: Lint = lint::lint("invalid_nan_comparisons", Level::Warn, &[]);
+pub const AMBIGUOUS_WIDE_POINTER_COMPARISONS: Lint = lint::lint("ambiguous_wide_pointer_comparisons", Level::Warn, &[]);
+pub const UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS: Lint = lint::lint("unpredictable_function_pointer_comparisons", Level::Warn, &[]);
+
+#[derive(Clone, Copy, PartialEq)]
+enum CmpOp { Bin(BinOp), Other }
+
+fn is_comparison(op: BinOp) -> bool {
+    matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge)
+}
+
+impl<'a> L2<'a> {
+    /// `Expr::peel_borrows`.
+    fn peel_borrows(&self, mut e: ExprId) -> ExprId {
+        loop {
+            e = unparen(self.ast, e);
+            match self.ast.expr(e).kind {
+                ExprKind::AddrOf(false, _, x) => e = x,
+                _ => return e,
+            }
+        }
+    }
+
+    fn is_sized(&self, t: TyId) -> bool {
+        match self.kind(t) {
+            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) | TyKind::Foreign(_) => false,
+            TyKind::Adt(..) | TyKind::Param(_) | TyKind::Alias(..) => match self.lang(LangItem::Sized) {
+                Some(s) => self.tcx.type_implements_trait(self.prog, self.env, crate::next_solver::TraitRef { def_id: s, args: vec![crate::consts::GenericArg::Type(t)] }).must_apply_modulo_regions(),
+                None => true,
+            },
+            _ => true,
+        }
+    }
+
+    /// `check_limits`: false when the comparison with a literal is decided by the type's range.
+    fn check_limits(&self, op: BinOp, l: ExprId, r: ExprId) -> bool {
+        let ast = self.ast;
+        let (l, r) = (unparen(ast, l), unparen(ast, r));
+        let (lit, expr, swap) = match (&ast.expr(l).kind, &ast.expr(r).kind) {
+            (ExprKind::Lit(_), _) => (l, r, true),
+            (_, ExprKind::Lit(_)) => (r, l, false),
+            _ => return true,
+        };
+        // normalise so that the literal is on the right
+        let norm = if swap { match op { BinOp::Lt => BinOp::Gt, BinOp::Le => BinOp::Ge, BinOp::Gt => BinOp::Lt, BinOp::Ge => BinOp::Le, o => o } } else { op };
+        let ExprKind::Lit(LitKind::Int) = ast.expr(lit).kind else { return true };
+        let text = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(ast.expr(lit).lo, ast.expr(lit).hi)).unwrap_or("");
+        let Some(v) = crate::const_fold::parse_int_lit(text) else { return true };
+        let Some(et) = self.expr_ty(expr) else { return true };
+        let TyKind::Int(p) = self.kind(et) else { return true };
+        let (bytes, signed) = crate::types::Types::int_info(p);
+        if bytes == 0 { return true; }
+        let is_valid = |v: i128, min: i128, max: i128| match norm {
+            BinOp::Lt => v > min && v <= max,
+            BinOp::Le => v >= min && v < max,
+            BinOp::Gt => v >= min && v < max,
+            BinOp::Ge => v > min && v <= max,
+            _ => v >= min && v <= max,
+        };
+        if signed {
+            // an unsigned suffix cannot type check against a signed operand
+            let suffix = text.trim_start_matches(|c: char| c.is_ascii_hexdigit() || c == '_' || c == 'x' || c == 'o' || c == 'b');
+            if suffix.starts_with('u') { return true; }
+            let bits = bytes * 8;
+            let (min, max) = if bits == 128 { (i128::MIN, i128::MAX) } else { (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1) };
+            if v > i128::MAX as u128 { return true; }
+            is_valid(v as i128, min, max)
+        } else {
+            let bits = bytes * 8;
+            let max: u128 = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
+            // u128 values compare through i128 only below 2^127
+            match norm {
+                BinOp::Lt => v > 0 && v <= max,
+                BinOp::Le => v < max,
+                BinOp::Gt => v < max,
+                BinOp::Ge => v > 0 && v <= max,
+                _ => v <= max,
+            }
+        }
+    }
+
+    fn cmp_op_of(&self, name: &str) -> Option<CmpOp> {
+        Some(match name {
+            "cmp_ord_max" | "cmp_ord_min" | "ord_cmp_method" | "cmp_partialord_cmp" => CmpOp::Other,
+            "cmp_partialeq_eq" => CmpOp::Bin(BinOp::Eq),
+            "cmp_partialeq_ne" => CmpOp::Bin(BinOp::Ne),
+            "cmp_partialord_ge" => CmpOp::Bin(BinOp::Ge),
+            "cmp_partialord_gt" => CmpOp::Bin(BinOp::Gt),
+            "cmp_partialord_le" => CmpOp::Bin(BinOp::Le),
+            "cmp_partialord_lt" => CmpOp::Bin(BinOp::Lt),
+            _ => return None,
+        })
+    }
+
+    /// `TypeLimits::check_expr` for comparisons and comparison calls.
+    fn lint_comparisons(&self, e: ExprId) {
+        let ast = self.ast;
+        let pos = ast.expr(e).lo;
+        match ast.expr(e).kind {
+            ExprKind::Binary(op, l, r) if is_comparison(op) => {
+                if !self.check_limits(op, l, r) {
+                    self.emit(&UNUSED_COMPARISONS, pos, "comparison is useless due to type limits");
+                } else {
+                    self.lint_nan(e, op, l, r);
+                    self.lint_wide_pointer(e, l, r);
+                    self.lint_fn_pointer(e, CmpOp::Bin(op), l, r);
+                }
+            }
+            ExprKind::Call(f, args) if ast.list(args).len() == 2 => {
+                let f = unparen(ast, f);
+                if !matches!(ast.expr(f).kind, ExprKind::Path(_)) { return; }
+                let Some(Res::Def(d)) = self.body.res.get(&f.0).copied() else { return };
+                let Some(op) = diag_name(self.prog, d).and_then(|n| self.cmp_op_of(&n)) else { return };
+                let a = ast.list(args);
+                self.lint_wide_pointer(e, a[0], a[1]);
+                self.lint_fn_pointer(e, op, a[0], a[1]);
+            }
+            ExprKind::MethodCall(l, row) if ast.list(ast.row(row).args).len() == 1 => {
+                let Some(m) = self.body.methods.get(&e.0) else { return };
+                let Some(op) = diag_name(self.prog, m.def).and_then(|n| self.cmp_op_of(&n)) else { return };
+                self.lint_wide_pointer(e, l, ast.list(ast.row(row).args)[0]);
+                self.lint_fn_pointer(e, op, l, ast.list(ast.row(row).args)[0]);
+            }
+            _ => {}
+        }
+    }
+
+    fn lint_nan(&self, e: ExprId, op: BinOp, l: ExprId, r: ExprId) {
+        let is_nan = |x: ExprId| -> bool {
+            let x = self.peel_borrows(peel_blocks(self.ast, x));
+            if !matches!(self.ast.expr(x).kind, ExprKind::Path(_)) { return false; }
+            let Some(Res::Def(d)) = self.body.res.get(&x.0).copied() else { return false };
+            matches!(diag_name(self.prog, d).as_deref(), Some("f16_nan" | "f32_nan" | "f64_nan" | "f128_nan"))
+        };
+        let pos = self.ast.expr(e).lo;
+        match op {
+            BinOp::Eq | BinOp::Ne if is_nan(l) || is_nan(r) => self.emit(&INVALID_NAN_COMPARISONS, pos, "incorrect NaN comparison, NaN cannot be directly compared to itself"),
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge if is_nan(l) || is_nan(r) => self.emit(&INVALID_NAN_COMPARISONS, pos, "incorrect NaN comparison, NaN is not orderable"),
+            _ => {}
+        }
+    }
+
+    fn lint_wide_pointer(&self, e: ExprId, l: ExprId, r: ExprId) {
+        let ptr_unsized = |mut ty: TyId| -> bool {
+            while let TyKind::Ref(_, i, _) = self.kind(ty) { ty = i; }
+            let inner = match self.kind(ty) {
+                TyKind::Ptr(_, i) => i,
+                TyKind::Adt(d, args, _) if diag_name(self.prog, d).as_deref() == Some("NonNull") => match self.tcx.tys.list(args).first() { Some(&i) => i, None => return false },
+                _ => return false,
+            };
+            !self.is_sized(inner)
+        };
+        let (l, r) = (self.peel_borrows(l), self.peel_borrows(r));
+        let (Some(lt), Some(rt)) = (self.expr_ty(l), self.expr_ty(r)) else { return };
+        if !ptr_unsized(lt) || !ptr_unsized(rt) { return; }
+        self.emit(&AMBIGUOUS_WIDE_POINTER_COMPARISONS, self.ast.expr(e).lo, "ambiguous wide pointer comparison, the comparison includes metadata which may not be expected");
+    }
+
+    fn lint_fn_pointer(&self, e: ExprId, _op: CmpOp, l: ExprId, r: ExprId) {
+        let peel = |mut ty: TyId| -> TyId { while let TyKind::Ref(_, i, _) = self.kind(ty) { ty = i; } ty };
+        let (l, r) = (self.peel_borrows(l), self.peel_borrows(r));
+        let (Some(lt), Some(rt)) = (self.expr_ty(l), self.expr_ty(r)) else { return };
+        let (lt, rt) = (peel(lt), peel(rt));
+        let is_fn = |t: TyId| matches!(self.kind(t), TyKind::FnDef(..) | TyKind::FnPtr(..));
+        if is_fn(lt) && is_fn(rt) {
+        } else if let (TyKind::Adt(ld, la, _), TyKind::Adt(rd, ra, _)) = (self.kind(lt), self.kind(rt)) {
+            let opt = self.lang(LangItem::Option);
+            if Some(ld) != opt || Some(rd) != opt { return; }
+            let (Some(&a0), Some(&b0)) = (self.tcx.tys.list(la).first(), self.tcx.tys.list(ra).first()) else { return };
+            if !is_fn(a0) || !is_fn(b0) { return; }
+        } else { return; }
+        self.emit(&UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS, self.ast.expr(e).lo, "function pointer comparisons do not produce meaningful results since their addresses are not guaranteed to be unique");
     }
 }
