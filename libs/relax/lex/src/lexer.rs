@@ -502,7 +502,9 @@ fn scan<const RX: bool, const TRIVIA: bool, const VALIDATE: bool, E: ScanError>(
         }
         if j >= n || src[j] != b'[' {
             let lo = i;
-            i = end.min(n);
+            while i < n && src[i] != b'\n' {
+                i += 1;
+            }
             if TRIVIA {
                 out.push(Tok { kind: T::Comment, lo: lo as u32, hi: i as u32 });
             }
