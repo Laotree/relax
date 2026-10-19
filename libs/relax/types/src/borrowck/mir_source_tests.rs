@@ -411,3 +411,13 @@ fn a_promoted_fn_item_keeps_its_turbofish_annotation() {
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
 }
+
+#[test]
+fn a_tuple_constructor_item_is_invariant_in_its_arguments() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct S<T>(T);
+        pub fn bad() { let c = 66; let f = S::<&'static u32>; f(&c); }
+        pub fn ok() { let c = 66; let f = S::<&u32>; f(&c); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.len() == 1 && errors[0].starts_with("E0597"), "{errors:?}");
+}
