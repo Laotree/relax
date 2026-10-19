@@ -986,6 +986,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     // entry path registers active loaders so the swap waits for their compile state.
     let _job = crate::jit::compile_job();
     let _z = crate::zone_alloc::compiler_thread();
+    if crate::preload::trace() { eprintln!("boot-trace: domain {id} start_prepared at t={:.1} ms", crate::clock::ms_since_start()); }
     let _loading = Loading(id);
     let t0 = std::time::Instant::now();
     if cancelled(id) { return Ok(id); }
@@ -996,6 +997,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let std_dir = crate::std_dir();
     // the app's first start takes the boot's resolved package (same process, same instant)
     let boot_resolved = if crate::run::app_domain() == Some(id) { crate::run::take_boot_resolved() } else { None };
+    let from_boot = boot_resolved.is_some();
     let resolved = match boot_resolved {
         Some(r) => r,
         None => match crate::run::resolve_package(&sess, &workspace, &spec.package, &spec.cargo_flags, &spec.units_json, &target_dir, &std_dir, crate::run::ResolveFor::Domain(id), false) {
@@ -1004,19 +1006,21 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         },
     };
     let resolve_ms = t0.elapsed().as_secs_f64() * 1e3;
+    if crate::preload::trace() { eprintln!("boot-trace: domain {id} resolved at t={:.1} ms ({resolve_ms:.1} ms)", crate::clock::ms_since_start()); }
     if compile_phase(id, "loading crates").is_err() { return Ok(id); }
     let crate::run::Resolved { g, order, cfgs, live_inputs, .. } = resolved;
     let idents = identities(&g, &cfgs, &order);
     let t1 = std::time::Instant::now();
     let upn = up as usize;
     // the owner thread: the program's tables change there
-    let loaded = crate::owner::call(crate::owner::Class::App, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id) });
+    let loaded = crate::owner::call(crate::owner::Class::App, || unsafe { load_graph(upn as *mut Unit, &g, &order, &cfgs, &idents, id, !from_boot) });
     let (root, n_reused, new_names, first_file) = match loaded {
         Ok(x) => x,
         Err(e) => return fail(id, e),
     };
     crate::run_state::emit(crate::run_state::Event::Warm { domain: Some(id), warm: new_names.is_empty() });
     let load_ms = t1.elapsed().as_secs_f64() * 1e3;
+    if crate::preload::trace() { eprintln!("boot-trace: domain {id} loaded ({load_ms:.1} ms) at t={:.1} ms", crate::clock::ms_since_start()); }
     if compile_phase(id, "link").is_err() { return Ok(id); }
     let t2 = std::time::Instant::now();
     // the libraries the new crates link
@@ -1039,6 +1043,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         let (target, arg) = crate::run::main_call(u, main_def, entry)?;
         Ok::<_, String>((target, arg, create(u)))
     });
+    if crate::preload::trace() { eprintln!("boot-trace: domain {id} main prepared at t={:.1} ms", crate::clock::ms_since_start()); }
     let (target, arg, base) = match prepared {
         Ok(x) => x,
         Err(e) => return fail(id, vec![e]),
@@ -1068,6 +1073,7 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
         crate::reload::domain_loaded(live_inputs);
     }
     // the domain's main thread (its name, its handle) outlives any compiler generation
+    if crate::preload::trace() { eprintln!("boot-trace: domain {id} launching at t={:.1} ms", crate::clock::ms_since_start()); }
     let launched = crate::zone_alloc::kept_with(|| launch_main(upn, id, base, target, arg, &spec.package, spec.around.clone()));
     if let Err(e) = launched {
         return fail(id, vec![e]);
@@ -1191,7 +1197,7 @@ pub fn start_in_run(spec: AppSpec) -> Result<DomainId, Vec<String>> {
 
 /// On the owner thread: gets the crates of `g` into the program (shared ones are reused) and
 /// returns (root crate, crates reused, names of the crates loaded, first file index of the load).
-unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
+unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize], cfgs: &[crate::cfg::CfgSet], idents: &[u64], id: DomainId, reread: bool) -> Result<(u32, usize, Vec<String>, usize), Vec<String>> {
     use crate::modules::{Dep, NewCrate};
     let u = &mut *up;
     let std_count = crate::std_pre_crates(&u.prog.session.clone()).len();
@@ -1205,21 +1211,27 @@ unsafe fn load_graph(up: *mut Unit, g: &crate::unitgraph::Graph, order: &[usize]
     // A layout/signature edit cannot reuse the old compiled crate just because its package
     // identity stayed the same. Keep unchanged code shared; load changed crates and their
     // dependants as a new revision. Other domains can still finish using their old revision.
-    let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
-    let mut current = std::collections::BTreeMap::new();
-    for module in &u.prog.mods {
-        let file = module.file as usize;
-        let Some(&krate) = u.prog.file_crate.get(file) else { continue };
-        if candidates.contains(&krate) {
-            if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
-        }
-    }
+    // A domain that resolved its own package compares every loaded file of a shared crate with the
+    // disk. The app's first start takes the boot's graph, whose files this process read a moment
+    // ago: nothing to compare (a save after that is the live watcher's, which stamped them before
+    // the load).
     let mut changed = HashSet::new();
-    for ((krate, path), file) in current {
-        if path.is_empty() || changed.contains(&krate) { continue; }
-        let pf = &u.prog.files[file];
-        if !crate::vfs::read(path).is_ok_and(|src| src.as_slice() == &pf.src[..pf.src_len as usize]) {
-            changed.insert(krate);
+    if reread {
+        let candidates: HashSet<_> = idents.iter().filter_map(|i| lookup_loaded(*i)).collect();
+        let mut current = std::collections::BTreeMap::new();
+        for module in &u.prog.mods {
+            let file = module.file as usize;
+            let Some(&krate) = u.prog.file_crate.get(file) else { continue };
+            if candidates.contains(&krate) {
+                if let Some(path) = u.prog.file_paths.get(file) { current.insert((krate, path), file); }
+            }
+        }
+        for ((krate, path), file) in current {
+            if path.is_empty() || changed.contains(&krate) { continue; }
+            let pf = &u.prog.files[file];
+            if !crate::vfs::read(path).is_ok_and(|src| src.as_slice() == &pf.src[..pf.src_len as usize]) {
+                changed.insert(krate);
+            }
         }
     }
     for &ci in order {
