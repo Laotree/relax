@@ -2183,6 +2183,11 @@ impl<'a> Fcx<'a> {
                         };
                         if let Some(what) = what {
                             self.err(name.lo, format!("E0530: bindings cannot shadow {what}"));
+                        } else if simple {
+                            // an identifier pattern naming something ambiguous is an error, not a fresh binding
+                            if let Some(e) = self.prog.name_ambiguity(self.module, s, false, false) {
+                                self.err(name.lo, self.prog.privacy_message(&e));
+                            }
                         }
                     }
                 }
@@ -3184,6 +3189,11 @@ impl<'a> Fcx<'a> {
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
+        if segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) {
+            if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
+                self.err(path.lo, prog.privacy_message(&e));
+            }
+        }
         if let Some(q) = self.ast().qself(path) {
             // `<T as Trait>::item`
             let self_t = self.lower_ty(q.ty);

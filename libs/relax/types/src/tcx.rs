@@ -2608,6 +2608,13 @@ impl Tcx {
                 return self.tys.error;
             }
         };
+        if p.segs.len() == 1 && p.no_qself() && !p.global() {
+            if let Some(s) = prog.syms.get(prog.files[file as usize].text(prog.files[file as usize].ast.segs(p.segs)[0].name)) {
+                if let Some(e) = prog.name_ambiguity(module, s, true, false) {
+                    self.err(cx, prog, file, p.lo, prog.privacy_message(&e));
+                }
+            }
+        }
         if p.segs.len() >= 2 && p.no_qself() {
             let segs = crate::program::path_segs(prog, file, p);
             if let Some(e) = prog.path_privacy(module, p.global(), &segs, Some(true), false, false) {

@@ -1,0 +1,112 @@
+//! AST validation of the own crates' items (rustc_ast_passes ast_validation.rs): visibility
+//! qualifiers where none are allowed (E0449), duplicate fields (E0124), items without a body.
+use super::*;
+
+impl Program {
+    pub fn ast_validation_errors(&self, own: &[bool]) -> Vec<String> {
+        let mut out = Vec::new();
+        for i in 0..self.defs.len() {
+            let d = DefId(i as u32);
+            let def = self.def(d);
+            if !own.get(def.krate as usize).copied().unwrap_or(false) || def.item.0 == u32::MAX {
+                continue;
+            }
+            if self.item_defs.get(&(def.file, def.item.0)) != Some(&d) {
+                continue;
+            }
+            let f = &self.files[def.file as usize];
+            if f.token_input {
+                continue;
+            }
+            let ast = &f.ast;
+            let it = ast.item(def.item);
+            let mut err = |pos: u32, msg: String| out.push(self.record_error(def.file, pos, "parse", msg));
+            let not_permitted = |vis: &Vis| !matches!(vis, Vis::Private);
+            match def.kind {
+                DefKind::Impl => {
+                    let Some(imp) = ast.as_impl(&it.kind) else { continue };
+                    if not_permitted(&it.vis) {
+                        err(it.lo, "E0449: visibility qualifiers are not permitted here -- note: place qualifiers on individual impl items instead".into());
+                    }
+                    for &c in ast.list(imp.items) {
+                        let ci = ast.item(c);
+                        if imp.trait_.is_some() && not_permitted(&ci.vis) {
+                            err(ci.lo, "E0449: visibility qualifiers are not permitted here -- note: trait items always share the visibility of their trait".into());
+                        }
+                        self.body_required(ast, &mut err, ci, Some("`impl`"));
+                    }
+                }
+                DefKind::Trait => {
+                    let Some(tr) = ast.as_trait(&it.kind) else { continue };
+                    for &c in ast.list(tr.items) {
+                        let ci = ast.item(c);
+                        if not_permitted(&ci.vis) {
+                            err(ci.lo, "E0449: visibility qualifiers are not permitted here -- note: trait items always share the visibility of their trait".into());
+                        }
+                    }
+                }
+                DefKind::Struct => {
+                    if let Some(s) = ast.as_struct(&it.kind) {
+                        self.duplicate_fields(&mut err, ast, f, s.data);
+                    }
+                }
+                DefKind::Union => {
+                    if let Some(u) = ast.as_union(&it.kind) {
+                        self.duplicate_fields(&mut err, ast, f, VariantData::Struct(u.fields));
+                    }
+                }
+                DefKind::Enum => {
+                    let Some(e) = ast.as_enum(&it.kind) else { continue };
+                    for v in ast.list(e.variants) {
+                        if let VariantData::Tuple(fs) | VariantData::Struct(fs) = v.data {
+                            for fd in ast.list(fs) {
+                                if not_permitted(&fd.vis) {
+                                    err(fd.ty_span.0, "E0449: visibility qualifiers are not permitted here -- note: enum variants and their fields always share the visibility of the enum".into());
+                                }
+                            }
+                        }
+                        self.duplicate_fields(&mut err, ast, f, v.data);
+                    }
+                }
+                DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::TypeAlias => {
+                    self.body_required(ast, &mut err, it, None);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    fn duplicate_fields(&self, err: &mut impl FnMut(u32, String), ast: &Ast, f: &ParsedFile, data: VariantData) {
+        let (VariantData::Struct(fs) | VariantData::Tuple(fs)) = data else { return };
+        let mut seen: Vec<&str> = Vec::new();
+        for fd in ast.list(fs) {
+            let Some(n) = fd.name else { continue };
+            let name = f.text(n);
+            if seen.contains(&name) {
+                err(n.lo, format!("E0124: field `{name}` is already declared"));
+            } else {
+                seen.push(name);
+            }
+        }
+    }
+
+    /// A free item / an impl item must have its body (`fn f();`, `const C: u8;`, `type T;`).
+    fn body_required(&self, ast: &Ast, err: &mut impl FnMut(u32, String), it: &Item, assoc_in: Option<&str>) {
+        let (what, free_what, missing) = match it.kind {
+            ItemKind::Fn(sig, None, _) => ("function", "function", ast.fn_sig(sig).lazy_body.is_none()),
+            ItemKind::Const(_, e) => ("constant", "constant item", e.get().is_none()),
+            ItemKind::Static(_, _, e) => ("static", "static item", e.get().is_none()),
+            ItemKind::TypeAlias(r) => ("type", "type alias", ast.row(r).ty.is_none()),
+            _ => return,
+        };
+        if !missing {
+            return;
+        }
+        match assoc_in {
+            Some(owner) => err(it.lo, format!("associated {what} in {owner} without body")),
+            None if what == "function" => err(it.lo, "free function without a body".to_string()),
+            None => err(it.lo, format!("free {free_what} without body")),
+        }
+    }
+}

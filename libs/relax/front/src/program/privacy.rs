@@ -9,6 +9,8 @@ pub struct PrivacyError {
     pub def: DefId,
     pub import: bool,
     pub ext: bool,
+    /// not private but ambiguous (E0659): two glob imports bring different items
+    pub ambiguous: bool,
 }
 
 impl Program {
@@ -69,15 +71,77 @@ impl Program {
                     hidden = Some((fd, ns));
                 }
             }
+            if visible {
+                for &ns in nss {
+                    if self.glob_ambiguous(m, name, ns, from, false) {
+                        return Some(PrivacyError { name, def: next.unwrap_or(cur), import: true, ext: false, ambiguous: true });
+                    }
+                }
+            }
             if !visible {
                 if let Some((fd, ns)) = hidden {
                     let flags = self.mods[m as usize].import_pub.get(&(name, ns)).copied();
-                    return Some(PrivacyError { name, def: fd, import: flags.is_some(), ext: flags.map_or(false, |f| f & IMPORT_EXTERN != 0) });
+                    return Some(PrivacyError { name, def: fd, import: flags.is_some(), ext: flags.map_or(false, |f| f & IMPORT_EXTERN != 0), ambiguous: false });
                 }
             }
             cur = next?;
         }
         None
+    }
+
+    /// Whether `name` is found in module `m` only through glob imports that bring different
+    /// items (rustc_resolve: a glob binding that conflicts with another glob's is ambiguous
+    /// when used; E0659). `from`: the module the name is used from.
+    pub fn glob_ambiguous(&self, m: u32, name: Sym, ns_type: bool, from: u32, skip_direct: bool) -> bool {
+        let md = &self.mods[m as usize];
+        if md.globs.len() < 2 || (!skip_direct && (if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) })) {
+            return false;
+        }
+        let mut found: Option<DefId> = None;
+        for &(g, _) in &md.globs {
+            let gd = self.def(g);
+            let r = match gd.kind {
+                DefKind::Mod => {
+                    let mut q = GlobQuery { precise: true, ..Default::default() };
+                    self.lookup_in_module_vis(gd.sub, name, ns_type, &mut q)
+                }
+                DefKind::Enum => self.lookup_in_container(g, name, false).map(|d| (d, None)),
+                _ => None,
+            };
+            if let Some((d, v)) = r {
+                if !self.vis_visible(v, from) || !self.vis_visible(v, m) {
+                    continue;
+                }
+                match found {
+                    None => found = Some(d),
+                    Some(f) if f != d => return true,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// A name used on its own: ambiguous when the scope it is found in binds it through globs only.
+    pub fn name_ambiguity(&self, from: u32, name: Sym, ns_type: bool, skip_direct: bool) -> Option<PrivacyError> {
+        if !self.own_crates.get(self.mods[from as usize].krate as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let mut m = from;
+        loop {
+            let md = &self.mods[m as usize];
+            if !skip_direct && if ns_type { md.types.contains_key(&name) } else { md.values.contains_key(&name) } {
+                return None;
+            }
+            if self.glob_ambiguous(m, name, ns_type, from, skip_direct) {
+                let def = self.lookup_in_module(m, name, ns_type, &mut Vec::new())?;
+                return Some(PrivacyError { name, def, import: true, ext: false, ambiguous: true });
+            }
+            match md.lexical_parent {
+                Some(p) => m = p,
+                None => return None,
+            }
+        }
     }
 
     /// rustc's `Res::descr` of what a path names.
@@ -101,7 +165,9 @@ impl Program {
     /// "E0603: function `f` is private" / "module import `n` is private".
     pub fn privacy_message(&self, e: &PrivacyError) -> String {
         let n = self.syms.str(e.name);
-        if e.ext {
+        if e.ambiguous {
+            format!("E0659: `{n}` is ambiguous")
+        } else if e.ext {
             format!("E0603: crate import `{n}` is private")
         } else if e.import {
             format!("E0603: {} import `{n}` is private", self.def_descr(e.def))
@@ -125,7 +191,14 @@ impl Program {
                 segs = &segs[..segs.len() - 1];
                 ns = Some(true);
             }
-            if let Some(e) = self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true) {
+            let single = if segs.len() == 1 && segs[0].0 == SegKind::Ident && !im.global && im.bind.is_some() {
+                // `use V;`: the name in this module's scope (the crate root before 2018)
+                let m = if edition < 2018 { self.crates[krate as usize].root_mod } else { im.module };
+                [true, false].into_iter().find_map(|t| self.name_ambiguity(m, segs[0].1, t, true))
+            } else {
+                None
+            };
+            if let Some(e) = single.or_else(|| self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true)) {
                 out.push(self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e)));
             } else if !im.glob && im.is_pub && !im.ext {
                 if let Some(msg) = self.cannot_reexport(im, segs, edition) {

@@ -11,6 +11,7 @@ use crate::fxhash::HashMap;
 mod collected;
 mod privacy;
 mod attrs;
+mod validate;
 
 pub type Sym = u32;
 
