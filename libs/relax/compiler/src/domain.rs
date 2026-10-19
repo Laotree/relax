@@ -989,14 +989,16 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     if crate::preload::trace() { eprintln!("boot-trace: domain {id} start_prepared at t={:.1} ms", crate::clock::ms_since_start()); }
     let _loading = Loading(id);
     let t0 = std::time::Instant::now();
+    // The app's first start takes the boot's resolved package (same process, same instant). Taken
+    // before anything can end this start: the slot never outlives it (its memory is the compiler
+    // generation's, which the settle swap destroys), so a relaunch always resolves its own.
+    let boot_resolved = if crate::run::app_domain() == Some(id) { crate::run::take_boot_resolved() } else { None };
     if cancelled(id) { return Ok(id); }
     set_state(id, DomainState::Compiling("package graph".into()));
     let sess = unsafe { (*std::ptr::addr_of!((*up).prog.session)).clone() };
     let workspace = crate::run::workspace_dir();
     let target_dir = crate::dirs::relax_dir().display().to_string();
     let std_dir = crate::std_dir();
-    // the app's first start takes the boot's resolved package (same process, same instant)
-    let boot_resolved = if crate::run::app_domain() == Some(id) { crate::run::take_boot_resolved() } else { None };
     let from_boot = boot_resolved.is_some();
     let resolved = match boot_resolved {
         Some(r) => r,
