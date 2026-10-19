@@ -760,7 +760,7 @@ impl<'a> Gates<'a> {
                             self.generic_args(ga);
                             self.ty(t);
                         }
-                        GenericArg::Constraint(_, b) => self.bounds(b),
+                        GenericArg::Constraint(_, _, b) => self.bounds(b),
                     }
                 }
             }
