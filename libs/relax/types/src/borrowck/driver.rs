@@ -109,7 +109,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             Ok(Err(e)) => { v.unchecked.push(format!("{name}: {}", describe_build_error(&e.reason))); return v; }
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
-                v.unchecked.push(format!("{name}: internal error in the MIR builder"));
+                v.unchecked.push(format!("{name}: internal error in the MIR builder: {}", super::lazy::panic_message(&p)));
                 return v;
             }
         };
@@ -167,7 +167,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             Ok(tc) => tc,
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
-                v.unchecked.push(format!("{name}: internal error in the MIR type check"));
+                v.unchecked.push(format!("{name}: internal error in the MIR type check: {}", super::lazy::panic_message(&p)));
                 return v;
             }
         };
@@ -216,7 +216,7 @@ pub fn check_root(cx: &EvalCx<'_>, prog: &Program, tcx: &Tcx, typeck: &typeck::B
             Ok(r) => r,
             Err(p) => {
                 if crate::preempt::is_cancelled(&*p) { std::panic::resume_unwind(p); }
-                v.unchecked.push(format!("{name}: internal error in the borrow checker"));
+                v.unchecked.push(format!("{name}: internal error in the borrow checker: {}", super::lazy::panic_message(&p)));
                 return v;
             }
         }

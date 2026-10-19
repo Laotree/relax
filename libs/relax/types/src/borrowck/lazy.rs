@@ -462,7 +462,7 @@ fn settle_finished_check() {
     for tx in requests { let _ = tx.send(0); }
 }
 
-fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
+pub(crate) fn panic_message(e: &Box<dyn std::any::Any + Send>) -> String {
     e.downcast_ref::<String>().cloned().or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()
 }
 fn finish_verdict(prog: &Program, src: usize, epoch: u64, def: DefId, args: &[TyId], result: Result<Option<super::Verdict>, String>, origin: Origin) -> Vec<GandalfEvent> {

@@ -201,7 +201,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
         }))
     }
     fn prove_trait_ref(&mut self, out: &mut MirTypeckRegionConstraints, trait_: LangItem, args: &[GenericArg], locations: Locations, category: ConstraintCategory) {
-        let def = self.tcx.lang_items.get(trait_).expect("required trait lang item");
+        let def = self.tcx.lang_items.get(trait_).unwrap_or_else(|| panic!("required trait lang item `{}` is not defined", trait_.name()));
         let op = ProvePredicate { predicate: crate::next_solver::collect::trait_predicate(def, args.to_vec()) };
         let _ = self.fully_perform_op(out, locations, category, ParamEnvAnd { param_env: self.param_env_id(), value: op });
     }
@@ -398,7 +398,7 @@ impl BorrowckTypeOps for BorrowckInferCtxt<'_> {
                         };
                         tys.intern_const(ConstKind::Alias(IsRigid::No, AliasConst { kind, args: args.clone().into() }))
                     },
-                    _ => panic!("array length is not a scalar"),
+                    other => panic!("array length is not a scalar: {other:?}"),
                 };
                 tys.mk_array(self.operand_ty(body, op), ct)
             }
