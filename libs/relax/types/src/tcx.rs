@@ -2654,6 +2654,12 @@ impl Tcx {
         let regions = self.lower_region_args(cx.infcx, prog, file, module, env, p);
         let mut args = self.lower_generic_args(cx, prog, file, module, env, p);
         let def = prog.def(d);
+        if let Some((_, count)) = self.own_param_counts(prog, d) {
+            let written = self.written_lifetimes(cx.infcx, prog, file, env, p).len();
+            if written > count {
+                self.err(cx, prog, file, p.lo, format!("E0107: {} takes {} lifetime argument{} but {} lifetime argument{} {} supplied", def_kind_descr(def.kind), count, if count == 1 { "" } else { "s" }, written, if written == 1 { "" } else { "s" }, if written == 1 { "was" } else { "were" }));
+            }
+        }
         // a module named like a primitive (`use std::str;`, globs re-exporting std's modules)
         // does not hide the primitive type
         if def.kind == DefKind::Mod && p.segs.len() == 1 && p.no_qself() {
@@ -2682,12 +2688,16 @@ impl Tcx {
             DefKind::ForeignTy => self.tys.intern(TyKind::Foreign(d)),
             DefKind::Struct | DefKind::Enum | DefKind::Union => {
                 // `HashMap<K, V>` with `S = RandomState` defaulted
-                self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions));
+                if self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions)) {
+                    self.err(cx, prog, file, p.lo, format!("E0107: missing generics for {} `{}`", def_kind_descr(def.kind), prog.name(d)));
+                }
                 self.tys.intern(TyKind::Adt(d, self.tys.mk_list(&args), regions))
             }
             DefKind::TypeAlias => {
                 let a = self.alias_ty(cx, prog, d);
-                self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions));
+                if self.fill_type_defaults(cx, prog, d, &mut args, env.regions.enabled.then_some(regions)) {
+                    self.err(cx, prog, file, p.lo, format!("E0107: missing generics for {} `{}`", def_kind_descr(def.kind), prog.name(d)));
+                }
                 let rs = regions;
                 let aenv = self.item_env(prog, d);
                 let a = self.subst_decl_regions(a, &aenv, rs);
@@ -2718,24 +2728,25 @@ impl Tcx {
     /// Appends the defaults of type params left out of `args` (`struct HashMap<K, V, S =
     /// RandomState>` written `HashMap<u32, u64>`). Only when some args were given: `HashMap`
     /// alone in an expression path gets inference variables instead.
-    pub fn fill_type_defaults(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId, args: &mut Vec<TyId>, regions: Option<RegionArgsId>) {
+    pub fn fill_type_defaults(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, d: DefId, args: &mut Vec<TyId>, regions: Option<RegionArgsId>) -> bool {
+        let mut missing = false;
         let def = prog.def(d);
         let ast = &prog.files[def.file as usize].ast;
         let g = match &ast.item(def.item).kind {
             // `type Result<T, E = Error> = ..` written `Result<()>` (rustc: alias params default
             // like any other generic params)
             k @ (ItemKind::Struct(_) | ItemKind::Enum(_) | ItemKind::Union(_) | ItemKind::TypeAlias(_)) => *ast.kind_generics(k).unwrap(),
-            _ => return,
+            _ => return false,
         };
         let params: Vec<&ast::GenericParam> = ast.list(g.params).iter().filter(|p| !matches!(p.kind, GenericParamKind::Lifetime(_))).collect();
         if args.len() >= params.len() {
-            return;
+            return false;
         }
         // no args at all: in a type, `Foo` with `struct Foo<A = (isize, char)>` is
         // `Foo<(isize, char)>` when every param has a default (else the args are inferred)
         // (item signatures have nothing to infer from: a missing list is E0107 there, error arguments)
         if args.is_empty() && cx.infcx.is_some() && !params.iter().all(|p| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)))) {
-            return;
+            return false;
         }
         let mut env = self.item_env(prog, d);
         env.regions.enabled = regions.is_some();
@@ -2759,11 +2770,12 @@ impl Tcx {
                     let lt = self.tys.intern(TyKind::Const(self.lower_const_arg(prog, def.file, &env, *de, expected)));
                     self.tys.subst(lt, args)
                 }
-                _ => self.tys.error,
+                _ => { missing = true; self.tys.error }
             };
             cx.state.default_inprog.borrow_mut().pop();
             args.push(t);
         }
+        missing
     }
 
     /// `<Param(pi) as Bound>::name` for the unique bound of param `pi` (or a supertrait)
@@ -2900,6 +2912,10 @@ impl Tcx {
     pub(crate) fn arg_of_param_kind(&self, cx: &crate::tcx::EvalCx<'_>, prog: &Program, file: u32, lo: u32, expected_const: bool, arg: TyId) -> TyId {
         let is_const = matches!(self.tys.kind(arg), TyKind::Const(_));
         if is_const == expected_const { return arg; }
+        // a parenthesized `_` is an inference variable of the parameter's kind
+        if expected_const && matches!(self.tys.kind(arg), TyKind::Infer(_)) {
+            if let Some(infcx) = cx.infcx { return self.tys.intern(TyKind::Const(infcx.next_const_var())); }
+        }
         let message = match (expected_const, self.tys.has_error(arg)) {
             (true, true) => "E0747: unresolved item provided when a constant was expected",
             (true, false) => "E0747: type provided when a constant was expected",
@@ -3011,7 +3027,13 @@ impl Tcx {
         // hir_ty_lowering/mod.rs lower_generic_args_of_path: arguments beyond the declared
         // parameters are not lowered (E0107 reports them); the lowered list never exceeds the
         // declaration.
-        if let Some((count, _)) = declaration.as_ref().and_then(|(d, _)| self.own_param_counts(prog, *d)) { out.truncate(count); }
+        if let Some((count, _)) = declaration.as_ref().and_then(|(d, _)| self.own_param_counts(prog, *d)) {
+            if out.len() > count {
+                let (d, _) = declaration.as_ref().unwrap();
+                self.err(cx, prog, file, p.lo, format!("E0107: {} takes {} generic argument{} but {} generic argument{} {} supplied", def_kind_descr(prog.def(*d).kind), count, if count == 1 { "" } else { "s" }, out.len(), if out.len() == 1 { "" } else { "s" }, if out.len() == 1 { "was" } else { "were" }));
+            }
+            out.truncate(count);
+        }
         out
     }
 
