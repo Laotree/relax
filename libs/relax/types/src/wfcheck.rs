@@ -581,7 +581,11 @@ pub mod obligations {
         let item = ast.item(def.item);
         match def.kind {
             DefKind::Struct | DefKind::Enum | DefKind::Union => with_wfcx(prog, tcx, did, |w| { check_type_defn(w, ast, item); check_defaults(w, ast, item); }),
-            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item)),
+            DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn => {
+                let mut errors = with_wfcx(prog, tcx, did, |w| check_fn(w, ast, item));
+                if def.kind != DefKind::ForeignFn { errors.extend(check_opaque_cycles(prog, tcx, did, item.lo)); }
+                errors
+            }
             DefKind::Impl => {
                 let mut errors = check_drop_impl(prog, tcx, did, ast, item);
                 errors.extend(with_wfcx(prog, tcx, did, |w| check_impl(w, ast, item)));
@@ -1014,6 +1018,54 @@ pub mod obligations {
             return vec![prog.record_error(file, item.lo, "typeck", msg("an outlives bound".to_string()))];
         }
         Vec::new()
+    }
+
+    /// rustc_hir_analysis/src/check/check.rs check_opaque_for_cycles + rustc_middle/src/ty/util.rs
+    /// OpaqueTypeExpander: expanding the hidden type of an opaque the fn defines must not reach the
+    /// opaque again (E0720).
+    fn check_opaque_cycles(prog: &Program, tcx: &Tcx, owner: DefId, pos: u32) -> Vec<String> {
+        use crate::types::fold::{TypeFolder, super_fold_ty};
+        use crate::types::{AliasTyKind, Types};
+        struct Expander<'a> { prog: &'a Program, tcx: &'a Tcx, seen: Vec<DefId>, primary: DefId, found_recursion: bool, found_any: bool }
+        impl TypeFolder for Expander<'_> {
+            fn fold_ty(&mut self, tys: &Types, t: TyId, depth: u32) -> TyId {
+                if self.found_any { return t; }
+                if let TyKind::Alias(_, a) = tys.kind(t) {
+                    if let AliasTyKind::Opaque { def_id } = a.kind {
+                        if self.seen.contains(&def_id) {
+                            self.found_any = true;
+                            self.found_recursion = def_id == self.primary;
+                            return t;
+                        }
+                        let Ok(hidden) = self.tcx.type_of(self.prog, def_id) else { return t };
+                        let mut targs = Vec::new();
+                        for &x in tys.list(a.args) { targs.push(self.fold_ty(tys, x, depth)); }
+                        if self.found_any { return t; }
+                        let args = self.tcx.complete_args(self.prog, def_id, &targs, a.regions);
+                        let concrete = self.tcx.instantiate_ty(self.prog, def_id, &args, hidden);
+                        self.seen.push(def_id);
+                        let expanded = self.fold_ty(tys, concrete, 0);
+                        self.seen.pop();
+                        return expanded;
+                    }
+                }
+                if !tys.flags(t).contains(crate::types::TypeFlags::HAS_TY_OPAQUE) { return t; }
+                super_fold_ty(tys, t, self, depth)
+            }
+        }
+        let id = tcx.opaque_types_defined_by(prog, owner);
+        let mut errors = Vec::new();
+        for &o in tcx.defining_opaques(id) {
+            if tcx.typeck(prog, owner).errors.len() > 0 { break; }
+            let indices = tcx.generic_indices_of(prog, o);
+            let tys = &tcx.tys;
+            let regions = tys.intern_region_args(&vec![crate::types::RegionId::ERASED; indices.lifetimes.len()]);
+            let opaque = tys.intern(TyKind::Alias(crate::consts::IsRigid::No, crate::types::AliasTy { kind: AliasTyKind::Opaque { def_id: o }, args: tys.mk_list(&indices.identity_types_consts(tys)), regions }));
+            let mut e = Expander { prog, tcx, seen: Vec::new(), primary: o, found_recursion: false, found_any: false };
+            e.fold_ty(tys, opaque, 0);
+            if e.found_recursion { errors.push(prog.record_error(prog.def(owner).file, pos, "typeck", "E0720: cannot resolve opaque type".to_string())); }
+        }
+        errors
     }
 
     /// Whether every ADT / fn item / alias in `ty` carries as many arguments as its definition has
