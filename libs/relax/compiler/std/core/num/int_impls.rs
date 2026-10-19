@@ -35,6 +35,8 @@ impl u8 {
     pub const fn overflowing_neg(self) -> (u8, bool) { ((0 as u8) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: u8) -> (u8, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: u8) -> (u8, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: u8) -> (u8, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: u8) -> (u8, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (u8, bool) { (((self as u8) << (rhs & 7)) as u8, rhs >= 8) }
     pub const fn overflowing_shr(self, rhs: u32) -> (u8, bool) { (self >> (rhs & 7), rhs >= 8) }
     pub const fn overflowing_pow(self, exp: u32) -> (u8, bool) {
@@ -143,6 +145,8 @@ impl u16 {
     pub const fn overflowing_neg(self) -> (u16, bool) { ((0 as u16) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: u16) -> (u16, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: u16) -> (u16, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: u16) -> (u16, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: u16) -> (u16, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (u16, bool) { (((self as u16) << (rhs & 15)) as u16, rhs >= 16) }
     pub const fn overflowing_shr(self, rhs: u32) -> (u16, bool) { (self >> (rhs & 15), rhs >= 16) }
     pub const fn overflowing_pow(self, exp: u32) -> (u16, bool) {
@@ -251,6 +255,8 @@ impl u32 {
     pub const fn overflowing_neg(self) -> (u32, bool) { ((0 as u32) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: u32) -> (u32, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: u32) -> (u32, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: u32) -> (u32, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: u32) -> (u32, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (u32, bool) { (((self as u32) << (rhs & 31)) as u32, rhs >= 32) }
     pub const fn overflowing_shr(self, rhs: u32) -> (u32, bool) { (self >> (rhs & 31), rhs >= 32) }
     pub const fn overflowing_pow(self, exp: u32) -> (u32, bool) {
@@ -359,6 +365,8 @@ impl u64 {
     pub const fn overflowing_neg(self) -> (u64, bool) { ((0 as u64) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: u64) -> (u64, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: u64) -> (u64, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: u64) -> (u64, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: u64) -> (u64, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (u64, bool) { (((self as u64) << (rhs & 63)) as u64, rhs >= 64) }
     pub const fn overflowing_shr(self, rhs: u32) -> (u64, bool) { (self >> (rhs & 63), rhs >= 64) }
     pub const fn overflowing_pow(self, exp: u32) -> (u64, bool) {
@@ -481,6 +489,8 @@ impl u128 {
     pub const fn overflowing_neg(self) -> (u128, bool) { ((0 as u128) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: u128) -> (u128, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: u128) -> (u128, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: u128) -> (u128, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: u128) -> (u128, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (u128, bool) { (((self as u128) << (rhs & 127)) as u128, rhs >= 128) }
     pub const fn overflowing_shr(self, rhs: u32) -> (u128, bool) { (self >> (rhs & 127), rhs >= 128) }
     pub const fn overflowing_pow(self, exp: u32) -> (u128, bool) {
@@ -589,6 +599,8 @@ impl usize {
     pub const fn overflowing_neg(self) -> (usize, bool) { ((0 as usize) - self, self != 0) }
     pub const fn overflowing_div(self, rhs: usize) -> (usize, bool) { (self / rhs, false) }
     pub const fn overflowing_rem(self, rhs: usize) -> (usize, bool) { (self % rhs, false) }
+    pub const fn overflowing_div_euclid(self, rhs: usize) -> (usize, bool) { (self / rhs, false) }
+    pub const fn overflowing_rem_euclid(self, rhs: usize) -> (usize, bool) { (self % rhs, false) }
     pub const fn overflowing_shl(self, rhs: u32) -> (usize, bool) { (((self as usize) << (rhs & 63)) as usize, rhs >= 64) }
     pub const fn overflowing_shr(self, rhs: u32) -> (usize, bool) { (self >> (rhs & 63), rhs >= 64) }
     pub const fn overflowing_pow(self, exp: u32) -> (usize, bool) {
@@ -698,6 +710,8 @@ impl i8 {
     pub const fn overflowing_div(self, rhs: i8) -> (i8, bool) { if self == i8::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: i8) -> (i8, bool) { if rhs == -1 { (0, self == i8::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (i8, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: i8) -> (i8, bool) { if self == i8::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: i8) -> (i8, bool) { if rhs == -1 { (0, self == i8::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (i8, bool) { (((self as u8) << (rhs & 7)) as i8, rhs >= 8) }
     pub const fn overflowing_shr(self, rhs: u32) -> (i8, bool) { (self >> (rhs & 7), rhs >= 8) }
     pub const fn overflowing_pow(self, exp: u32) -> (i8, bool) {
@@ -807,6 +821,8 @@ impl i16 {
     pub const fn overflowing_div(self, rhs: i16) -> (i16, bool) { if self == i16::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: i16) -> (i16, bool) { if rhs == -1 { (0, self == i16::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (i16, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: i16) -> (i16, bool) { if self == i16::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: i16) -> (i16, bool) { if rhs == -1 { (0, self == i16::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (i16, bool) { (((self as u16) << (rhs & 15)) as i16, rhs >= 16) }
     pub const fn overflowing_shr(self, rhs: u32) -> (i16, bool) { (self >> (rhs & 15), rhs >= 16) }
     pub const fn overflowing_pow(self, exp: u32) -> (i16, bool) {
@@ -916,6 +932,8 @@ impl i32 {
     pub const fn overflowing_div(self, rhs: i32) -> (i32, bool) { if self == i32::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: i32) -> (i32, bool) { if rhs == -1 { (0, self == i32::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (i32, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: i32) -> (i32, bool) { if self == i32::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: i32) -> (i32, bool) { if rhs == -1 { (0, self == i32::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (i32, bool) { (((self as u32) << (rhs & 31)) as i32, rhs >= 32) }
     pub const fn overflowing_shr(self, rhs: u32) -> (i32, bool) { (self >> (rhs & 31), rhs >= 32) }
     pub const fn overflowing_pow(self, exp: u32) -> (i32, bool) {
@@ -1028,6 +1046,8 @@ impl i64 {
     pub const fn overflowing_div(self, rhs: i64) -> (i64, bool) { if self == i64::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: i64) -> (i64, bool) { if rhs == -1 { (0, self == i64::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (i64, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: i64) -> (i64, bool) { if self == i64::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: i64) -> (i64, bool) { if rhs == -1 { (0, self == i64::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (i64, bool) { (((self as u64) << (rhs & 63)) as i64, rhs >= 64) }
     pub const fn overflowing_shr(self, rhs: u32) -> (i64, bool) { (self >> (rhs & 63), rhs >= 64) }
     pub const fn overflowing_pow(self, exp: u32) -> (i64, bool) {
@@ -1146,6 +1166,8 @@ impl i128 {
     pub const fn overflowing_div(self, rhs: i128) -> (i128, bool) { if self == i128::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: i128) -> (i128, bool) { if rhs == -1 { (0, self == i128::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (i128, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: i128) -> (i128, bool) { if self == i128::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: i128) -> (i128, bool) { if rhs == -1 { (0, self == i128::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (i128, bool) { (((self as u128) << (rhs & 127)) as i128, rhs >= 128) }
     pub const fn overflowing_shr(self, rhs: u32) -> (i128, bool) { (self >> (rhs & 127), rhs >= 128) }
     pub const fn overflowing_pow(self, exp: u32) -> (i128, bool) {
@@ -1258,6 +1280,8 @@ impl isize {
     pub const fn overflowing_div(self, rhs: isize) -> (isize, bool) { if self == isize::MIN && rhs == -1 { (self, true) } else { (self / rhs, false) } }
     pub const fn overflowing_rem(self, rhs: isize) -> (isize, bool) { if rhs == -1 { (0, self == isize::MIN) } else { (self % rhs, false) } }
     pub const fn overflowing_abs(self) -> (isize, bool) { if self < 0 { self.overflowing_neg() } else { (self, false) } }
+    pub const fn overflowing_div_euclid(self, rhs: isize) -> (isize, bool) { if self == isize::MIN && rhs == -1 { (self, true) } else { (self.div_euclid(rhs), false) } }
+    pub const fn overflowing_rem_euclid(self, rhs: isize) -> (isize, bool) { if rhs == -1 { (0, self == isize::MIN) } else { (self.rem_euclid(rhs), false) } }
     pub const fn overflowing_shl(self, rhs: u32) -> (isize, bool) { (((self as usize) << (rhs & 63)) as isize, rhs >= 64) }
     pub const fn overflowing_shr(self, rhs: u32) -> (isize, bool) { (self >> (rhs & 63), rhs >= 64) }
     pub const fn overflowing_pow(self, exp: u32) -> (isize, bool) {
