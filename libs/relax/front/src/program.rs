@@ -416,6 +416,11 @@ impl CrateInfo {
     /// this feature changes sizedness checking inside core/alloc as well as
     /// user crates; it cannot be discarded with the feature-gate diagnostics.
     pub fn unsized_fn_params(&self, prog: &Program) -> bool {
+        self.feature_enabled(prog, "unsized_fn_params")
+    }
+
+    /// Is `#![feature(name)]` among the crate's root attributes?
+    pub fn feature_enabled(&self, prog: &Program, name: &str) -> bool {
         let root_file = prog.mods[self.root_mod as usize].file;
         let file = &prog.files[root_file as usize];
         let attrs = crate::cfg::expand_cfg_attr_list(prog.src(root_file), &file.ast.root_attrs, &self.cfg);
@@ -424,7 +429,7 @@ impl CrateInfo {
             let hi = attr.toks.hi;
             if !attr.inner || hi < lo + 4 || file.tok_text(lo) != "feature" || file.tok_text(lo + 1) != "(" || file.tok_text(hi - 1) != ")" { continue; }
             for tok in (lo + 2..hi - 1).step_by(2) {
-                if file.tok_text(tok) == "unsized_fn_params" { return true; }
+                if file.tok_text(tok) == name { return true; }
             }
         }
         false

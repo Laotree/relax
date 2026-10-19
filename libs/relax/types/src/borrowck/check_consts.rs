@@ -41,8 +41,9 @@ fn const_context(tx: &Tx, bir: &Bir) -> Option<ConstContext> {
     let cb = bir.checked_body?;
     if bir.closure_kind.is_some() { return None; }
     // `#[rust(expr)]` field initial values are generated consts holding arbitrary run-time
-    // expressions (front derive.rs default_consts): not constants of the program
-    if prog_name_is_generated_default(tx, cb.owner) { return None; }
+    // expressions (front derive.rs default_consts, marked `#[relax_live_default]`): not
+    // constants of the program
+    if is_live_default(tx, cb.owner) { return None; }
     match cb.kind {
         BodyKind::Const | BodyKind::AssocConst | BodyKind::InlineConst(_) | BodyKind::AnonConst(_) => Some(ConstContext::Const),
         BodyKind::Static => {
@@ -66,6 +67,10 @@ struct Checker<'a, 'tcx, Q> {
     body: &'a Bir,
     queries: &'a Q,
     kind: ConstContext,
+    /// `feature(const_trait_impl)`: trait calls may be const
+    const_traits: bool,
+    /// `feature(const_destruct)` / `const_precise_live_drops`: drops may be const
+    const_drops: bool,
     needs_drop: Vec<Option<State>>,
     has_mut_interior: Vec<Option<State>>,
     transient: Option<Vec<bool>>,
@@ -84,7 +89,10 @@ pub fn check<Q: Queries>(tx: &Tx, queries: &Q, bodies: &[Bir]) -> Result<Vec<Dia
         let Some(kind) = const_context(tx, bir) else { continue };
         let needs_drop = entry_states(tx, bir, queries, Qualif::NeedsDrop)?;
         let has_mut_interior = entry_states(tx, bir, queries, Qualif::HasMutInterior)?;
-        let mut c = Checker { tx, body: bir, queries, kind, needs_drop, has_mut_interior, transient: None, primary: Vec::new(), secondary: Vec::new() };
+        let krate = &tx.prog.crates[tx.prog.def(bir.checked_body.map_or(crate::program::NO_DEF, |b| b.owner)).krate as usize];
+        let const_traits = krate.feature_enabled(tx.prog, "const_trait_impl");
+        let const_drops = krate.feature_enabled(tx.prog, "const_destruct") || krate.feature_enabled(tx.prog, "const_precise_live_drops");
+        let mut c = Checker { tx, body: bir, queries, kind, const_traits, const_drops, needs_drop, has_mut_interior, transient: None, primary: Vec::new(), secondary: Vec::new() };
         c.run()?;
         if c.primary.is_empty() { out.extend(c.secondary); } else { out.extend(c.primary); }
     }
@@ -222,7 +230,7 @@ impl<Q: Queries> Checker<'_, '_, Q> {
                     self.error("", "pointers cannot be reliably compared during const eval".to_string(), span);
                 }
             }
-            Rvalue::Op(Operation::TraitComparison(_), _) => {
+            Rvalue::Op(Operation::TraitComparison(_), _) if !self.const_traits => {
                 // a call of PartialEq / PartialOrd: trait methods are never const on stable
                 self.error("E0015", format!("cannot call non-const operator in {}", self.kind.plural()), span);
             }
@@ -241,7 +249,7 @@ impl<Q: Queries> Checker<'_, '_, Q> {
                 } else {
                     self.queries.type_qualif(Qualif::NeedsDrop, ty)?
                 };
-                if needs_drop {
+                if needs_drop && !self.const_drops {
                     // the span of the dropped local's declaration, like rustc
                     let span = if place.proj.is_empty() { self.body.locals[place.local as usize].span } else { t.span };
                     self.error("E0493", format!("destructor of `{}` cannot be evaluated at compile-time", self.tx.ty_str(ty)), span);
@@ -274,7 +282,7 @@ impl<Q: Queries> Checker<'_, '_, Q> {
                     _ => false,
                 } || matches!(callee, Callee::Virtual(..));
                 let non_const = if through_trait {
-                    true
+                    !self.const_traits
                 } else if tx.is_std_def(*d) {
                     false
                 } else {
@@ -291,6 +299,9 @@ impl<Q: Queries> Checker<'_, '_, Q> {
     }
 }
 
-fn prog_name_is_generated_default(tx: &Tx, d: crate::program::DefId) -> bool {
-    tx.prog.name(d).starts_with("__relax_default_")
+fn is_live_default(tx: &Tx, d: crate::program::DefId) -> bool {
+    let def = tx.prog.def(d);
+    let ast = &tx.prog.files[def.file as usize].ast;
+    let src = tx.prog.src(def.file);
+    ast.list(ast.item(def.item).attrs).iter().any(|a| crate::cfg::tok_str(src, a.toks.lo as usize) == b"relax_live_default")
 }
