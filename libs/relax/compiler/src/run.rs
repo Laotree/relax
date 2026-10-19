@@ -207,6 +207,14 @@ pub(crate) struct Resolved {
     pub live_inputs: Option<crate::reload::Inputs>,
 }
 
+/// The boot's resolved package, handed to the app domain it starts (once: a relaunch resolves
+/// again, so an edited source or manifest is read).
+static HANDOFF: relax_session::sync::Mutex<Option<Resolved>> = relax_session::sync::Mutex::new(None);
+
+pub(crate) fn take_boot_resolved() -> Option<Resolved> {
+    HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 pub(crate) fn resolve_package(
     sess: &std::sync::Arc<crate::Session>,
     workspace: &str,
@@ -1273,8 +1281,11 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     if ahead {
         start_ahead(up, fn_defs);
     }
+    let mut domain_inputs = None;
     // a live session: hot reload of the program's own sources (reload.rs); none for store sources
     if crate::layout::LIVE_SESSION.load(Ordering::Relaxed) {
+        // the app domain this boot starts takes the same inputs (handoff below)
+        domain_inputs = if HAL_RUN.load(Ordering::Acquire) { live_inputs.as_ref().map(crate::zone_alloc::kept_clone) } else { None };
         crate::reload::start_watcher(up, live_inputs.unwrap_or_default());
     }
     jit::start_completion(up, runtime);
@@ -1381,6 +1392,9 @@ fn cmd_run_inner(sess: &std::sync::Arc<crate::Session>, args: &[String], session
     let main_def = main_def.expect("a run without --exports has main");
     if HAL_RUN.load(Ordering::Acquire) {
         unsafe { jit::set_runtime_unit(up) };
+        // The app domain is this very graph, resolved, verified and built a moment ago in this
+        // process: it takes it instead of resolving the package again (domain.rs start_prepared).
+        *HANDOFF.lock().unwrap() = Some(Resolved { units, g, order, cfgs, live_inputs: domain_inputs });
         let spec = crate::domain::AppSpec { package, cargo_flags, units_json, argv: Some(prog_args), ..Default::default() };
         let result = (MAIN_HOST.get().expect("run host").start)(spec);
         if result.is_ok() && !domain_packages.is_empty() { crate::domain::run_vehicle(up, domain_packages); }

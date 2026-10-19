@@ -994,9 +994,14 @@ fn start_prepared(up: *mut Unit, spec: AppSpec, id: DomainId) -> Result<DomainId
     let workspace = crate::run::workspace_dir();
     let target_dir = crate::dirs::relax_dir().display().to_string();
     let std_dir = crate::std_dir();
-    let resolved = match crate::run::resolve_package(&sess, &workspace, &spec.package, &spec.cargo_flags, &spec.units_json, &target_dir, &std_dir, crate::run::ResolveFor::Domain(id), false) {
-        Ok(r) => r,
-        Err(e) => return fail(id, vec![e]),
+    // the app's first start takes the boot's resolved package (same process, same instant)
+    let boot_resolved = if crate::run::app_domain() == Some(id) { crate::run::take_boot_resolved() } else { None };
+    let resolved = match boot_resolved {
+        Some(r) => r,
+        None => match crate::run::resolve_package(&sess, &workspace, &spec.package, &spec.cargo_flags, &spec.units_json, &target_dir, &std_dir, crate::run::ResolveFor::Domain(id), false) {
+            Ok(r) => r,
+            Err(e) => return fail(id, vec![e]),
+        },
     };
     let resolve_ms = t0.elapsed().as_secs_f64() * 1e3;
     if compile_phase(id, "loading crates").is_err() { return Ok(id); }
