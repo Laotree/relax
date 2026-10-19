@@ -325,3 +325,44 @@ fn a_turbofish_on_a_tuple_struct_constructor_is_a_user_type_annotation() {
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].starts_with("E0597"), "{errors:?}");
 }
+
+/// Probe: `UI_FILES=a.rs:b.rs cargo test zz_probe_files -- --nocapture` prints what the pipeline says about each.
+#[test]
+fn zz_probe_files() {
+    let Some(files) = std::env::var_os("UI_FILES") else { return };
+    for f in files.to_string_lossy().split(':') {
+        let src = std::fs::read_to_string(f).unwrap();
+        let r = std::panic::catch_unwind(|| borrowck_source(&src));
+        match r { Ok((e, u)) => eprintln!("PROBE {f}: errors {} {:?} unchecked {:?}", e.len(), e.iter().map(|x| x.chars().take(60).collect::<String>()).collect::<Vec<_>>(), u),
+                  Err(_) => eprintln!("PROBE {f}: harness panic (typeck/front errors?)") }
+    }
+}
+
+#[test]
+fn a_higher_ranked_where_clause_on_an_associated_type_is_a_verify_bound() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn csv<V>(value: &V) -> Result<String, &str>
+        where V: 'static, for<'a> &'a V: IntoIterator, for<'a> <&'a V as IntoIterator>::Item: ToString + 'static,
+        { let s: String = value.into_iter().map(|e| e.to_string()).collect::<String>(); Ok(s) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_move_out_of_a_promoted_array_element_is_e0508() {
+    let (errors, unchecked) = borrowck_source("
+        #[derive(Clone)] struct S1(S2);
+        #[derive(Clone)] struct S2;
+        pub fn f() { const C: [S2; 1] = [S2]; let _ = S1(C[0]).clone(); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("E0508"), "{errors:?}");
+}
+
+#[test]
+fn closures_in_a_promoted_constant_use_the_parents_user_type_annotations() {
+    let (errors, unchecked) = borrowck_source("
+        pub fn f<'a, T: 'a>(x: &'a T) -> usize { let g = |y: &'a T| -> usize { let _z: &'a T = y; 1 }; g(x) }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert!(errors.is_empty(), "{errors:?}");
+}

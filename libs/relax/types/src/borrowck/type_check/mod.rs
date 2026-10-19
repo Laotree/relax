@@ -226,7 +226,7 @@ pub struct TypeckInputs<'a> {
 pub fn type_check(tcx: &Tcx, prog: &Program, infcx: &mut dyn BorrowckTypeOps, body: &Body, inputs: TypeckInputs<'_>) -> MirTypeckResults {
     let location_map = LocationMap::new(body);
     let mut typeck = TypeChecker {
-        tcx, prog, infcx, last_span: Span::default(), body, promoted: &body.promoted, defining: body.source.clone(),
+        tcx, prog, infcx, last_span: Span::default(), body, promoted: &body.promoted, annotations: &body.user_type_annotations, defining: body.source.clone(),
         location_map: location_map.clone(), reported_errors: vec![],
         constraints: inputs.constraints,
         deferred_closure_requirements: vec![], errors: vec![], mir_bugs: vec![], tainted_by_errors: false,
@@ -260,6 +260,8 @@ pub struct TypeChecker<'a> {
     body: &'a Body,
     /// The root's promoted bodies (user type annotations are shared with them).
     promoted: &'a [Body],
+    /// User type annotations are shared between the main MIR and the MIR of all of its promoted bodies.
+    annotations: &'a [CanonicalUserTypeAnnotation],
     /// The defining body (the root, also while a promoted is checked).
     defining: MirSource,
     location_map: LocationMap,
@@ -309,7 +311,7 @@ impl<'a> TypeChecker<'a> {
 
     fn relate_type_and_user_type(&mut self, a: TyId, v: V, user_ty: &UserTypeProjection, locations: Locations,
         category: ConstraintCategory) -> Result<(), NoSolution> {
-        let annotated_type = self.body.user_type_annotations[user_ty.base.0 as usize].inferred_ty;
+        let annotated_type = self.annotations[user_ty.base.0 as usize].inferred_ty;
         let mut curr_projected_ty = PlaceTy::from_ty(annotated_type);
         for proj in &user_ty.projection {
             // The dummy local and types of a ProjectionKind are never read by projection_ty.
@@ -958,7 +960,7 @@ impl<'a> TypeChecker<'a> {
     fn check_local_decl(&mut self, local: Local, decl: &LocalDecl) {
         self.visit_local_decl(decl);
         for user_ty in &decl.user_ty {
-            let span = self.body.user_type_annotations[user_ty.base.0 as usize].span;
+            let span = self.annotations[user_ty.base.0 as usize].span;
             let ty = if !matches!(decl.local_info, LocalInfo::User(BindingForm::Var(VarBindingForm { binding_mode: BindingMode(ByRef::Yes(_), _), .. }))) {
                 decl.ty
             } else if let TyKind::Ref(_, rty, _) = *self.tcx.tys.kind(decl.ty) {
