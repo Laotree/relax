@@ -1472,3 +1472,703 @@ fn known_panics(prog: &Program, tcx: &Tcx, body: &Body, block: Option<BlockId>, 
     if let Some(b) = block { kp.block(b); }
     if let Some(e) = expr { kp.eval(e); }
 }
+
+// ---------------------------------------------------------------- item-level passes
+
+pub const TEXT_DIRECTION_CODEPOINT_IN_COMMENT: Lint = lint::lint("text_direction_codepoint_in_comment", Level::Deny, &[]);
+pub const TEXT_DIRECTION_CODEPOINT_IN_LITERAL: Lint = lint::lint("text_direction_codepoint_in_literal", Level::Deny, &[]);
+
+/// Item-level passes over the definitions of the checked crates marked in `own`.
+pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    if !lint::enabled() { return; }
+    text_direction(prog, own);
+    improper_ctypes(prog, tcx, own);
+}
+
+/// rustc_ast::util::unicode TEXT_FLOW_CONTROL_CHARS.
+fn is_text_flow_control(c: char) -> bool {
+    matches!(c, '\u{202A}' | '\u{202B}' | '\u{202D}' | '\u{202E}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{202C}' | '\u{2069}')
+}
+
+/// rustc_parse lexer `lint_unicode_text_flow` / `lint_literal_unicode_text_flow`: comments,
+/// doc comments and string / char literals containing characters that change the visible
+/// direction of text. Reported while lexing, at the crate root's lint level.
+fn text_direction(prog: &Program, own: &[bool]) {
+    use crate::lexer::{LexOptions, Mode, T};
+    let mut seen = std::collections::HashSet::new();
+    for m in &prog.mods {
+        if !own.get(m.krate as usize).copied().unwrap_or(false) { continue; }
+        let def = prog.def(m.def);
+        // block modules have no file of their own
+        if prog.block_owner.get(&def.sub).is_some() { continue; }
+        if !seen.insert(m.file) { continue; }
+        let pf = &prog.files[m.file as usize];
+        let len = pf.src_len;
+        if len == 0 { continue; }
+        let src = pf.bytes(0, len);
+        if !std::str::from_utf8(src).map_or(false, |s| s.chars().any(is_text_flow_control)) { continue; }
+        let root = prog.mods[prog.crates[m.krate as usize].root_mod as usize].def;
+        let mut toks = Vec::new();
+        let opts = LexOptions { edition: pf.edition, mode: Mode::Rust, trivia: true };
+        if crate::lexer::lex_with(src, &opts, &mut toks).is_err() { continue; }
+        for t in &toks {
+            let flow = |s: &[u8]| std::str::from_utf8(s).map_or(false, |s| s.chars().any(is_text_flow_control));
+            let text = &src[t.lo as usize..t.hi as usize];
+            match t.kind {
+                T::Comment => {
+                    if flow(text.get(2..).unwrap_or(&[])) {
+                        lint::emit(prog, root, &TEXT_DIRECTION_CODEPOINT_IN_COMMENT, m.file, t.lo,
+                            "unicode codepoint changing visible direction of text present in comment");
+                    }
+                }
+                T::DocComment => {
+                    if flow(text) {
+                        lint::emit(prog, root, &TEXT_DIRECTION_CODEPOINT_IN_LITERAL, m.file, t.lo,
+                            "unicode codepoint changing visible direction of text present in doc comment");
+                    }
+                }
+                T::Str | T::RawStr | T::Char | T::CStr => {
+                    if flow(text) {
+                        lint::emit(prog, root, &TEXT_DIRECTION_CODEPOINT_IN_LITERAL, m.file, t.lo,
+                            "unicode codepoint changing visible direction of text present in literal");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- improper_ctypes
+//
+// rustc_lint types/improper_ctypes.rs: the FFI-safety of the types in `extern` blocks
+// (`improper_ctypes`) and of `extern "C" fn` definitions (`improper_ctypes_definitions`), and of
+// the extern fn pointer types anywhere else.
+
+pub const IMPROPER_CTYPES: Lint = lint::lint("improper_ctypes", Level::Warn, &[]);
+pub const IMPROPER_CTYPES_DEFINITIONS: Lint = lint::lint("improper_ctypes_definitions", Level::Warn, &[]);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CItemKind { Declaration, Definition }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FnPos { Arg, Ret }
+
+enum Ffi {
+    Safe,
+    Phantom(TyId),
+    Unsafe { ty: TyId, reason: &'static str, help: Option<&'static str> },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outer { None, NoneThroughFnPtr, Other }
+
+const R_STATIC: u8 = 1;
+const R_FUNC: u8 = 2;
+const R_FN_RETURN: u8 = 4;
+const R_DEFINED: u8 = 8;
+const R_THEORETICAL: u8 = 16;
+
+#[derive(Clone, Copy)]
+struct VState { flags: u8, outer: Outer }
+
+impl VState {
+    fn next(self, ty_kind: &TyKind) -> Self {
+        VState { flags: self.flags, outer: if matches!(ty_kind, TyKind::FnPtr(..)) { Outer::NoneThroughFnPtr } else { Outer::Other } }
+    }
+    fn next_in_fnptr(self, pos: FnPos) -> Self {
+        VState { flags: match pos { FnPos::Ret => R_FUNC | R_THEORETICAL | R_FN_RETURN, FnPos::Arg => R_FUNC | R_THEORETICAL }, outer: Outer::NoneThroughFnPtr }
+    }
+    fn fn_entry(mode: CItemKind, pos: FnPos) -> Self {
+        let flags = match (mode, pos) {
+            (CItemKind::Definition, FnPos::Ret) => R_FUNC | R_FN_RETURN | R_DEFINED,
+            (CItemKind::Declaration, FnPos::Ret) => R_FUNC | R_FN_RETURN,
+            (CItemKind::Definition, FnPos::Arg) => R_FUNC | R_DEFINED,
+            (CItemKind::Declaration, FnPos::Arg) => R_FUNC,
+        };
+        VState { flags, outer: Outer::None }
+    }
+    fn static_entry() -> Self { VState { flags: R_STATIC, outer: Outer::None } }
+    fn in_function(self) -> bool { self.flags & R_FUNC != 0 }
+    fn in_function_return(self) -> bool { self.flags & R_FN_RETURN != 0 }
+    fn in_defined_function(self) -> bool { self.flags & R_DEFINED != 0 && self.in_function() }
+    fn in_fnptr(self) -> bool { self.flags & R_THEORETICAL != 0 && self.in_function() }
+    fn can_expect_ty_params(self) -> bool { self.flags & R_THEORETICAL != 0 || self.in_defined_function() }
+}
+
+fn is_rustic_abi(a: crate::types::Abi) -> bool {
+    matches!(a, crate::types::Abi::Rust | crate::types::Abi::RustCall | crate::types::Abi::RelaxIntrinsic)
+}
+
+struct Ffic<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+    env: crate::tcx::TypingEnv,
+    krate: u32,
+    cache: std::collections::HashSet<TyId>,
+    base_ty: TyId,
+    base_mode: CItemKind,
+    /// the environment of the ADT whose fields are being judged
+    adt_env: std::cell::Cell<Option<crate::tcx::TypingEnv>>,
+}
+
+impl<'a> Ffic<'a> {
+    fn kind(&self, t: TyId) -> TyKind { *self.tcx.tys.kind(t) }
+    fn norm(&self, t: TyId) -> TyId { self.tcx.try_normalize_erasing_regions(self.prog, self.env, t).unwrap_or(t) }
+
+    fn lang(&self, i: LangItem) -> Option<DefId> { self.tcx.lang_items.get(i) }
+
+    /// A field type normalized in its ADT's environment (`layout_of` of the field type there).
+    fn norm_in_adt(&self, t: TyId) -> TyId {
+        match self.adt_env.get() {
+            Some(env) => self.tcx.try_normalize_erasing_regions(self.prog, env, t).unwrap_or(t),
+            None => t,
+        }
+    }
+
+    fn diag_item(&self, d: DefId) -> Option<String> {
+        let def = self.prog.def(d);
+        if !matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) { return None; }
+        let ast = &self.prog.files[def.file as usize].ast;
+        let p = self.prog.src(def.file);
+        for a in ast.list(ast.item(def.item).attrs) {
+            if lint::attr_path(self.prog, def.file, a) != b"rustc_diagnostic_item" { continue; }
+            let (lo, hi) = (a.toks.lo as usize, a.toks.hi as usize);
+            let mut i = lo;
+            while i < hi && crate::cfg::tok_str(p, i) != b"=" { i += 1; }
+            if i + 1 < hi { return Some(String::from_utf8_lossy(crate::cfg::tok_str(p, i + 1)).trim_matches('"').to_string()); }
+        }
+        None
+    }
+
+    fn repr_transparent(&self, d: DefId) -> bool {
+        let def = self.prog.def(d);
+        let ast = &self.prog.files[def.file as usize].ast;
+        ast.list(ast.item(def.item).attrs).iter().any(|a| lint::attr_path(self.prog, def.file, a) == b"repr" && lint::attr_args(self.prog, def.file, a).iter().any(|w| w == "transparent"))
+    }
+
+    fn is_sized(&self, t: TyId) -> bool {
+        match self.kind(t) {
+            TyKind::Str | TyKind::Slice(_) | TyKind::Dyn(..) | TyKind::Foreign(_) => false,
+            _ => match self.lang(LangItem::Sized) {
+                Some(s) => self.tcx.type_implements_trait(self.prog, self.env, crate::next_solver::TraitRef { def_id: s, args: vec![crate::consts::GenericArg::Type(t)] }).must_apply_modulo_regions(),
+                None => true,
+            },
+        }
+    }
+
+    /// A 1-ZST (size 0, alignment 1), judged structurally (layouts of generic types do not exist).
+    fn is_1zst(&self, t: TyId, depth: u32) -> bool {
+        if depth > 16 { return false; }
+        let t = self.norm_in_adt(t);
+        match self.kind(t) {
+            TyKind::Tuple(l) => self.tcx.tys.list(l).iter().all(|&x| self.is_1zst(x, depth + 1)),
+            TyKind::Adt(d, args, _) => {
+                let Some(a) = self.tcx.adts.get(&d) else { return false };
+                if a.is_phantom_data() { return true; }
+                if a.is_union || a.repr_align > 1 { return false; }
+                if a.is_enum {
+                    return a.variants.is_empty() || (a.variants.len() == 1 && a.variants[0].fields.iter().all(|f| self.is_1zst(self.tcx.tys.subst(f.ty, self.tcx.tys.list(args)), depth + 1)) && a.repr_int.is_none());
+                }
+                a.variants[0].fields.iter().all(|f| self.is_1zst(self.tcx.tys.subst(f.ty, self.tcx.tys.list(args)), depth + 1))
+            }
+            _ => false,
+        }
+    }
+
+    /// `transparent_newtype_field`: the variant's field that is not a 1-ZST.
+    fn transparent_field(&self, d: DefId, vi: usize, identity_args: &[TyId]) -> Option<usize> {
+        let a = self.tcx.adts.get(&d)?;
+        let _ = identity_args;
+        let saved = self.adt_env.replace(Some(crate::tcx::TypingEnv { limit: self.env.limit, param_env: self.tcx.param_env_id(self.prog, d), mode: crate::tcx::TypingMode::non_body_analysis() }));
+        let r = a.variants[vi].fields.iter().position(|f| !self.is_1zst(f.ty, 0));
+        self.adt_env.set(saved);
+        r
+    }
+
+    fn field_ty(&self, d: DefId, vi: usize, fi: usize, args: crate::types::TyList) -> TyId {
+        let a = &self.tcx.adts[&d];
+        self.norm(self.tcx.tys.subst(a.variants[vi].fields[fi].ty, self.tcx.tys.list(args)))
+    }
+
+    fn ty_str(&self, t: TyId) -> String { crate::typeck::ty_to_string(false, self.prog, self.tcx, t) }
+
+    // ---- types.rs: ty_is_known_nonnull / get_nullable_type / repr_nullable_ptr
+    fn known_nonnull(&self, ty: TyId) -> bool {
+        let ty = self.norm(ty);
+        match self.kind(ty) {
+            TyKind::FnPtr(..) | TyKind::Ref(..) => true,
+            TyKind::Adt(d, args, _) => {
+                let Some(a) = self.tcx.adts.get(&d) else { return false };
+                if a.is_box() { return true; }
+                if self.repr_transparent(d) && !a.is_union {
+                    // `#[rustc_nonnull_optimization_guaranteed]`
+                    let def = self.prog.def(d);
+                    let ast = &self.prog.files[def.file as usize].ast;
+                    if lint::has_attr(self.prog, def.file, ast.list(ast.item(def.item).attrs), "rustc_nonnull_optimization_guaranteed") { return true; }
+                    if a.is_unsafe_cell() || a.is_unsafe_pinned() { return false; }
+                    return (0..a.variants.len()).filter_map(|vi| self.transparent_field(d, vi, &[]).map(|fi| (vi, fi)))
+                        .any(|(vi, fi)| self.known_nonnull(self.field_ty(d, vi, fi, args)));
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    fn nullable_type(&self, ty: TyId) -> Option<TyId> {
+        let ty = self.norm(ty);
+        match self.kind(ty) {
+            TyKind::Adt(d, args, _) => {
+                let a = self.tcx.adts.get(&d)?;
+                let (vi, fi) = (0..a.variants.len()).rev().find_map(|vi| self.transparent_field(d, vi, &[]).map(|fi| (vi, fi)))?;
+                self.nullable_type(self.field_ty(d, vi, fi, args))
+            }
+            TyKind::Int(_) | TyKind::Ptr(..) | TyKind::FnPtr(..) => Some(ty),
+            TyKind::Ref(_, inner, _) => Some(self.tcx.tys.intern(TyKind::Ptr(false, inner))).map(|p| {
+                if let TyKind::Ref(m, i, _) = self.kind(ty) { self.tcx.tys.intern(TyKind::Ptr(m, i)) } else { p }
+            }),
+            _ => None,
+        }
+    }
+
+    fn niche_candidate(&self, ty: TyId) -> bool {
+        match self.kind(ty) {
+            TyKind::Adt(d, _, _) => {
+                let Some(a) = self.tcx.adts.get(&d) else { return false };
+                if !self.is_1zst(ty, 0) { return false; }
+                let empty = (a.is_struct() && a.variants[0].fields.is_empty()) || (a.is_enum() && a.variants.is_empty());
+                !a.is_variant_list_non_exhaustive() && empty
+            }
+            TyKind::Tuple(l) => self.tcx.tys.list(l).is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Whether the known-nonnull type is a single scalar (a thin pointer); a wide one has no
+    /// scalar layout.
+    fn is_scalar(&self, ty: TyId) -> bool {
+        match self.kind(self.norm(ty)) {
+            TyKind::FnPtr(..) | TyKind::Int(_) => true,
+            TyKind::Ref(_, p, _) | TyKind::Ptr(_, p) => self.is_sized(p),
+            TyKind::Adt(d, args, _) => {
+                let Some(a) = self.tcx.adts.get(&d) else { return false };
+                if a.is_box() { return args_first_sized(self, args); }
+                (0..a.variants.len()).filter_map(|vi| self.transparent_field(d, vi, &[]).map(|fi| (vi, fi))).last()
+                    .is_some_and(|(vi, fi)| self.is_scalar(self.field_ty(d, vi, fi, args)))
+            }
+            _ => false,
+        }
+    }
+
+    fn repr_nullable_ptr(&self, ty: TyId) -> Option<TyId> {
+        let TyKind::Adt(d, args, _) = self.kind(ty) else { return None };
+        let a = self.tcx.adts.get(&d)?;
+        if a.variants.len() != 2 { return None; }
+        let (v1, v2) = (&a.variants[0], &a.variants[1]);
+        let sub = |f: &crate::tcx::FieldT| self.norm(self.tcx.tys.subst(f.ty, self.tcx.tys.list(args)));
+        let field_ty = match (v1.fields.len(), v2.fields.len()) {
+            (0, 1) => sub(&v2.fields[0]),
+            (1, 0) => sub(&v1.fields[0]),
+            (1, 1) => {
+                let (t1, t2) = (sub(&v1.fields[0]), sub(&v2.fields[0]));
+                if self.niche_candidate(t1) { t2 } else if self.niche_candidate(t2) { t1 } else { return None }
+            }
+            _ => return None,
+        };
+        if !self.known_nonnull(field_ty) { return None; }
+        if !self.is_scalar(field_ty) { return None; }
+        self.nullable_type(field_ty)
+    }
+
+    // ---- the visitor
+    fn visit_indirection(&mut self, state: VState, ty: TyId, inner: TyId, boxed: bool) -> Ffi {
+        if boxed {
+            if state.in_defined_function() || (state.in_fnptr() && self.base_mode == CItemKind::Definition) {
+                if self.is_sized(inner) { return Ffi::Safe; }
+                return Ffi::Unsafe { ty, reason: "box cannot be represented as a single pointer", help: None };
+            }
+            if let TyKind::Adt(d, args, _) = self.kind(ty) { return self.visit_struct_or_union(state, ty, d, args); }
+            return Ffi::Safe;
+        }
+        if (state.in_defined_function() || state.in_fnptr()) && self.is_sized(inner) {
+            Ffi::Safe
+        } else {
+            let k = self.kind(ty);
+            self.visit_type(state.next(&k), inner)
+        }
+    }
+
+    fn visit_variant_fields(&mut self, state: VState, ty: TyId, d: DefId, vi: usize, args: crate::types::TyList) -> Ffi {
+        let a = self.tcx.adts[&d].clone();
+        let tk = self.kind(ty);
+        let mut transparent_with_all_zst = false;
+        if self.repr_transparent(d) {
+            if let Some(fi) = self.transparent_field(d, vi, &[]) {
+                let fty = self.field_ty(d, vi, fi, args);
+                match self.visit_type(state.next(&tk), fty) {
+                    Ffi::Unsafe { ty, .. } if self.is_unit(ty) => {}
+                    r => return r,
+                }
+            } else {
+                transparent_with_all_zst = true;
+            }
+        }
+        let n = a.variants[vi].fields.len();
+        let mut all_phantom = n > 0;
+        for fi in 0..n {
+            let fty = self.field_ty(d, vi, fi, args);
+            all_phantom &= match self.visit_type(state.next(&tk), fty) {
+                Ffi::Safe => false,
+                Ffi::Unsafe { ty, .. } if self.is_unit(ty) => false,
+                Ffi::Phantom(_) => true,
+                r @ Ffi::Unsafe { .. } => return r,
+            };
+        }
+        if all_phantom { Ffi::Phantom(ty) }
+        else if transparent_with_all_zst { Ffi::Unsafe { ty, reason: "this struct contains only zero-sized fields", help: None } }
+        else { Ffi::Safe }
+    }
+
+    fn is_unit(&self, t: TyId) -> bool { matches!(self.kind(t), TyKind::Tuple(l) if self.tcx.tys.list(l).is_empty()) }
+
+    fn visit_struct_or_union(&mut self, state: VState, ty: TyId, d: DefId, args: crate::types::TyList) -> Ffi {
+        let a = self.tcx.adts[&d].clone();
+        let transparent = self.repr_transparent(d);
+        if !a.repr_c && !transparent {
+            return if a.is_struct() {
+                Ffi::Unsafe { ty, reason: "this struct has unspecified layout", help: Some("consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this struct") }
+            } else {
+                Ffi::Unsafe { ty, reason: "this union has unspecified layout", help: Some("consider adding a `#[repr(C)]` or `#[repr(transparent)]` attribute to this union") }
+            };
+        }
+        if a.variants.first().is_none_or(|v| v.fields.is_empty()) {
+            return if a.is_struct() {
+                Ffi::Unsafe { ty, reason: "this struct has no fields", help: Some("consider adding a member to this struct") }
+            } else {
+                Ffi::Unsafe { ty, reason: "this union has no fields", help: Some("consider adding a member to this union") }
+            };
+        }
+        self.visit_variant_fields(state, ty, d, 0, args)
+    }
+
+    fn visit_enum(&mut self, state: VState, ty: TyId, d: DefId, args: crate::types::TyList) -> Ffi {
+        let a = self.tcx.adts[&d].clone();
+        if a.variants.is_empty() { return Ffi::Safe; }
+        let transparent = self.repr_transparent(d);
+        if !a.repr_c && !transparent && a.repr_int.is_none() {
+            // `Option<extern fn()>`, `Result<extern fn(), ()>`
+            if let Some(inner) = self.repr_nullable_ptr(ty) {
+                let k = self.kind(ty);
+                return self.visit_type(state.next(&k), inner);
+            }
+            return Ffi::Unsafe { ty, reason: "enum has no representation hint", help: Some("consider adding a `#[repr(C)]`, `#[repr(transparent)]`, or integer `#[repr(...)]` attribute to this enum") };
+        }
+        let non_exhaustive = a.is_variant_list_non_exhaustive() && self.prog.def(d).krate != self.krate;
+        for vi in 0..a.variants.len() {
+            // check_non_exhaustive_variant
+            if non_exhaustive && a.variants[vi].shape != 0 {
+                return Ffi::Unsafe { ty, reason: "this enum is non-exhaustive", help: None };
+            }
+            match self.visit_variant_fields(state, ty, d, vi, args) {
+                Ffi::Safe => {}
+                r => return r,
+            }
+        }
+        Ffi::Safe
+    }
+
+    fn visit_type(&mut self, state: VState, ty: TyId) -> Ffi {
+        if !self.cache.insert(ty) { return Ffi::Safe; }
+        let k = self.kind(ty);
+        match k {
+            TyKind::Adt(d, args, _) => {
+                let Some(a) = self.tcx.adts.get(&d) else { return Ffi::Safe };
+                if a.is_box() {
+                    let inner = self.tcx.tys.list(args)[0];
+                    return self.visit_indirection(state, ty, inner, true);
+                }
+                if a.is_phantom_data() { return Ffi::Phantom(ty); }
+                if a.is_enum() { return self.visit_enum(state, ty, d, args); }
+                if matches!(self.diag_item(d).as_deref(), Some("cstring_type" | "cstr_type")) && !matches!(self.kind(self.base_ty), TyKind::Ptr(true, _)) {
+                    return Ffi::Unsafe { ty, reason: "`CStr`/`CString` do not have a guaranteed layout", help: Some("consider passing a `*const std::ffi::c_char` instead, and use `CStr::as_ptr()`") };
+                }
+                self.visit_struct_or_union(state, ty, d, args)
+            }
+            TyKind::Int(p) if crate::types::Types::int_info(p).0 != 0 => Ffi::Safe,
+            TyKind::Float(_) | TyKind::Bool => Ffi::Safe,
+            TyKind::Char => Ffi::Unsafe { ty, reason: "the `char` type has no C equivalent", help: Some("consider using `u32` or `libc::wchar_t` instead") },
+            TyKind::Slice(_) => Ffi::Unsafe { ty, reason: "slices have no C equivalent", help: Some("consider using a raw pointer instead") },
+            TyKind::Dyn(..) => Ffi::Unsafe { ty, reason: "trait objects have no C equivalent", help: None },
+            TyKind::Str => Ffi::Unsafe { ty, reason: "string slices have no C equivalent", help: Some("consider using `*const u8` and a length instead") },
+            TyKind::Tuple(l) => {
+                if self.tcx.tys.list(l).is_empty() && state.in_function_return() && matches!(state.outer, Outer::None | Outer::NoneThroughFnPtr) {
+                    Ffi::Safe
+                } else {
+                    Ffi::Unsafe { ty, reason: "tuples have unspecified layout", help: Some("consider using a struct instead") }
+                }
+            }
+            TyKind::Ptr(_, inner) if self.is_unit(inner) => Ffi::Safe,
+            TyKind::Ptr(_, inner) => self.visit_indirection(state, ty, inner, false),
+            TyKind::Ref(_, inner, _) => self.visit_indirection(state, ty, inner, false),
+            TyKind::Array(inner, _) => {
+                if state.in_function() && state.outer == Outer::None {
+                    Ffi::Unsafe { ty, reason: "passing raw arrays by value is not FFI-safe", help: Some("consider passing a pointer to the array") }
+                } else {
+                    self.visit_type(state.next(&k), inner)
+                }
+            }
+            TyKind::FnPtr(params, ret, header, _) => {
+                if is_rustic_abi(header.abi) {
+                    return Ffi::Unsafe { ty, reason: "this function pointer has Rust-specific calling convention", help: Some("consider using an `extern fn(...) -> ...` function pointer instead") };
+                }
+                for &arg in self.tcx.tys.list(params) {
+                    match self.visit_type(state.next_in_fnptr(FnPos::Arg), arg) {
+                        Ffi::Safe => {}
+                        r => return r,
+                    }
+                }
+                self.visit_type(state.next_in_fnptr(FnPos::Ret), ret)
+            }
+            TyKind::Foreign(_) | TyKind::Never => Ffi::Safe,
+            TyKind::Alias(_, a) if matches!(a.kind, AliasTyKind::Opaque { .. }) => Ffi::Unsafe { ty, reason: "opaque types have no C equivalent", help: None },
+            TyKind::Param(_) | TyKind::Alias(..) if state.can_expect_ty_params() => Ffi::Safe,
+            _ => Ffi::Safe,
+        }
+    }
+
+    /// `visit_for_opaque_ty`: an opaque type anywhere inside the type.
+    fn find_opaque(&self, ty: TyId, depth: u32) -> Option<TyId> {
+        if depth > 32 || !self.tcx.tys.has_opaque(ty) { return None; }
+        if let TyKind::Alias(_, a) = self.kind(ty) { if matches!(a.kind, AliasTyKind::Opaque { .. }) { return Some(ty); } }
+        ty_children(self.tcx, ty).into_iter().find_map(|c| self.find_opaque(c, depth + 1))
+    }
+
+    fn check_type(&mut self, state: VState, ty: TyId) -> Ffi {
+        let ty = self.norm(ty);
+        if let Some(o) = self.find_opaque(ty, 0) {
+            return Ffi::Unsafe { ty: o, reason: "opaque types have no C equivalent", help: None };
+        }
+        self.visit_type(state, ty)
+    }
+}
+
+fn args_first_sized(f: &Ffic, args: crate::types::TyList) -> bool {
+    f.tcx.tys.list(args).first().is_some_and(|&t| f.is_sized(t))
+}
+
+/// The types inside a type, in the order of rustc's `super_visit_with`.
+fn ty_children(tcx: &Tcx, ty: TyId) -> Vec<TyId> {
+    match *tcx.tys.kind(ty) {
+        TyKind::Tuple(l) => tcx.tys.list(l).to_vec(),
+        TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Ref(_, e, _) | TyKind::Ptr(_, e) => vec![e],
+        TyKind::Adt(_, args, _) => tcx.tys.list(args).to_vec(),
+        TyKind::FnPtr(params, ret, _, _) => { let mut v = tcx.tys.list(params).to_vec(); v.push(ret); v }
+        TyKind::Alias(_, a) => tcx.tys.list(a.args).to_vec(),
+        TyKind::Dyn(_, args, bindings, ..) => { let mut v = tcx.tys.list(args).to_vec(); v.extend(tcx.tys.list(bindings).iter().map(|b| b.1)); v }
+        _ => Vec::new(),
+    }
+}
+
+/// Position of a syntax type (the first path or nested element), when it has one.
+fn ast_ty_pos(ast: &Ast, t: crate::ast::TyId) -> Option<u32> {
+    match *ast.ty(t) {
+        Ty::Path(p) => Some(p.lo),
+        Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => ast_ty_pos(ast, x),
+        Ty::Tuple(l) => ast.list(l).iter().find_map(|&x| ast_ty_pos(ast, x)),
+        Ty::Fn(f) => { let f = *ast.fn_ptr(f); ast.list(f.params).iter().find_map(|&x| ast_ty_pos(ast, x)).or_else(|| f.ret.and_then(|r| ast_ty_pos(ast, r))) }
+        _ => None,
+    }
+}
+
+/// The extern fn-pointer types written in a syntax type, pre-order (the HIR walk): their positions.
+fn ast_extern_fnptrs(pf: &crate::parser::ParsedFile, t: crate::ast::TyId, out: &mut Vec<Option<u32>>) {
+    let ast = &pf.ast;
+    match *ast.ty(t) {
+        Ty::Fn(f) => {
+            let fp = *ast.fn_ptr(f);
+            // `extern fn` (the C ABI) or `extern "abi" fn`; `extern "Rust" fn` is the Rust ABI
+            let external = match fp.abi { None => false, Some(None) => true, Some(Some(a)) => pf.text(a).trim_matches('"') != "Rust" };
+            if external { out.push(ast_ty_pos(ast, t)); }
+            for &p in ast.list(fp.params) { ast_extern_fnptrs(pf, p, out); }
+            if let Some(r) = fp.ret { ast_extern_fnptrs(pf, r, out); }
+        }
+        Ty::Ref(_, _, x) | Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => ast_extern_fnptrs(pf, x, out),
+        Ty::Tuple(l) => { for &x in ast.list(l) { ast_extern_fnptrs(pf, x, out); } }
+        Ty::Path(p) => {
+            for seg in ast.segs(p.segs) {
+                if let Some(GenericArgs::Angle(l)) = ast.gargs(seg.args()) {
+                    for a in ast.list(*l) { if let GenericArg::Type(x) = *a { ast_extern_fnptrs(pf, x, out); } }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The extern fn-pointer types inside a semantic type, pre-order.
+fn sem_extern_fnptrs(tcx: &Tcx, ty: TyId, out: &mut Vec<TyId>) {
+    if let TyKind::FnPtr(_, _, h, _) = *tcx.tys.kind(ty) { if !is_rustic_abi(h.abi) { out.push(ty); } }
+    for c in ty_children(tcx, ty) { sem_extern_fnptrs(tcx, c, out); }
+}
+
+struct Improper<'a> {
+    prog: &'a Program,
+    tcx: &'a Tcx,
+}
+
+impl<'a> Improper<'a> {
+    fn env(&self, d: DefId) -> crate::tcx::TypingEnv {
+        crate::tcx::TypingEnv { limit: crate::tcx::RecursionLimit::for_item(self.prog, d), param_env: self.tcx.param_env_id(self.prog, d), mode: crate::tcx::TypingMode::non_body_analysis() }
+    }
+
+    fn emit(&self, d: DefId, ffic: &Ffic, pos: u32, res: Ffi, mode: CItemKind) {
+        let (ty, note) = match res {
+            Ffi::Safe => return,
+            Ffi::Phantom(ty) => (ty, "composed only of `PhantomData`"),
+            Ffi::Unsafe { ty, reason, .. } => (ty, reason),
+        };
+        let (lint, desc) = match mode {
+            CItemKind::Declaration => (&IMPROPER_CTYPES, "block"),
+            CItemKind::Definition => (&IMPROPER_CTYPES_DEFINITIONS, "fn"),
+        };
+        if lint::external(self.prog, self.prog.def(d).file, pos) { return; }
+        lint::emit(self.prog, d, lint, self.prog.def(d).file, pos,
+            &format!("`extern` {desc} uses type `{}`, which is not FFI-safe -- {note}", ffic.ty_str(ty)));
+    }
+
+    /// `check_foreign_fn`: the parameter and return types of an extern fn declaration or definition.
+    fn check_foreign_fn(&self, d: DefId, mode: CItemKind) {
+        let Some(sig) = self.tcx.fn_item_sig(self.prog, d) else { return };
+        let def = self.prog.def(d);
+        let ast = &self.prog.files[def.file as usize].ast;
+        let item = ast.item(def.item);
+        let ItemKind::Fn(fsig, _, _) = item.kind else { return };
+        let fsig = *ast.fn_sig(fsig);
+        let params = ast.list(fsig.params);
+        for (i, &pt) in sig.params.iter().enumerate() {
+            let pos = params.get(i).and_then(|p| ast_ty_pos(ast, p.ty).or_else(|| match *ast.pat(p.pat) { Pat::Ident { name, .. } => Some(name.lo), _ => None })).unwrap_or(item.name.lo);
+            let mut f = Ffic { prog: self.prog, tcx: self.tcx, env: self.env(d), krate: def.krate, cache: Default::default(), base_ty: pt, base_mode: mode, adt_env: Default::default() };
+            f.base_ty = f.norm(pt);
+            let res = f.check_type(VState::fn_entry(mode, FnPos::Arg), pt);
+            self.emit(d, &f, pos, res, mode);
+        }
+        if let Some(rt) = fsig.ret {
+            let pos = ast_ty_pos(ast, rt).unwrap_or(item.name.lo);
+            let mut f = Ffic { prog: self.prog, tcx: self.tcx, env: self.env(d), krate: def.krate, cache: Default::default(), base_ty: sig.ret, base_mode: mode, adt_env: Default::default() };
+            f.base_ty = f.norm(sig.ret);
+            let res = f.check_type(VState::fn_entry(mode, FnPos::Ret), sig.ret);
+            self.emit(d, &f, pos, res, mode);
+        }
+    }
+
+    /// `check_type_for_external_abi_fnptr` over the extern fn pointers of one declared type.
+    fn check_fnptrs(&self, d: DefId, ast_ty: crate::ast::TyId, ty: TyId, state: VState, mode: CItemKind) {
+        let def = self.prog.def(d);
+        let pf = &self.prog.files[def.file as usize];
+        let mut sem = Vec::new();
+        sem_extern_fnptrs(self.tcx, ty, &mut sem);
+        let mut syn = Vec::new();
+        ast_extern_fnptrs(pf, ast_ty, &mut syn);
+        for (fty, pos) in sem.into_iter().zip(syn) {
+            let mut f = Ffic { prog: self.prog, tcx: self.tcx, env: self.env(d), krate: def.krate, cache: Default::default(), base_ty: fty, base_mode: mode, adt_env: Default::default() };
+            f.base_ty = f.norm(fty);
+            let res = f.check_type(state, fty);
+            self.emit(d, &f, pos.unwrap_or(pf.ast.item(def.item).name.lo), res, mode);
+        }
+    }
+
+    /// `check_fn_for_external_abi_fnptr`: the extern fn pointers in a Rust-ABI fn's signature.
+    fn check_fn_fnptrs(&self, d: DefId, mode: CItemKind) {
+        let Some(sig) = self.tcx.fn_item_sig(self.prog, d) else { return };
+        let def = self.prog.def(d);
+        let ast = &self.prog.files[def.file as usize].ast;
+        let ItemKind::Fn(fsig, _, _) = ast.item(def.item).kind else { return };
+        let fsig = *ast.fn_sig(fsig);
+        for (i, p) in ast.list(fsig.params).iter().enumerate() {
+            if let Some(&pt) = sig.params.get(i) { self.check_fnptrs(d, p.ty, pt, VState::fn_entry(mode, FnPos::Arg), mode); }
+        }
+        if let Some(rt) = fsig.ret { self.check_fnptrs(d, rt, sig.ret, VState::fn_entry(mode, FnPos::Ret), mode); }
+    }
+}
+
+/// The improper_ctypes passes over the definitions of the checked crates.
+fn improper_ctypes(prog: &Program, tcx: &Tcx, own: &[bool]) {
+    let ip = Improper { prog, tcx };
+    // the ABI of each foreign block's items
+    let mut foreign_abi: std::collections::HashMap<(u32, u32), Option<crate::ast::Ident>> = std::collections::HashMap::new();
+    for (fi, pf) in prog.files.iter().enumerate() {
+        if !prog.file_crate.get(fi).is_some_and(|&k| own.get(k as usize).copied().unwrap_or(false)) { continue; }
+        for (ii, it) in pf.ast.items.iter().enumerate() {
+            if let ItemKind::ForeignMod(r) = it.kind {
+                let fm = *pf.ast.row(r);
+                for &c in pf.ast.list(fm.items) { foreign_abi.insert((fi as u32, c.0), fm.abi); }
+            }
+            let _ = ii;
+        }
+    }
+    for i in 0..prog.defs.len() {
+        let def = prog.defs[i];
+        if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        let d = DefId(i as u32);
+        let file = &prog.files[def.file as usize];
+        let ast = &file.ast;
+        match def.kind {
+            DefKind::ForeignFn => {
+                let abi = foreign_abi.get(&(def.file, def.item.0)).copied().flatten();
+                let rust = abi.is_some_and(|a| file.text(a).trim_matches('"') == "Rust");
+                if !rust { ip.check_foreign_fn(d, CItemKind::Declaration); } else { ip.check_fn_fnptrs(d, CItemKind::Declaration); }
+            }
+            DefKind::ForeignStatic => {
+                let abi = foreign_abi.get(&(def.file, def.item.0)).copied().flatten();
+                let rust = abi.is_some_and(|a| file.text(a).trim_matches('"') == "Rust");
+                if rust { continue; }
+                if let ItemKind::Static(_, ty, _) = ast.item(def.item).kind {
+                    if let Some(t) = tcx.const_ty(prog, d) {
+                        let mut f = Ffic { prog, tcx, env: ip.env(d), krate: def.krate, cache: Default::default(), base_ty: t, base_mode: CItemKind::Declaration, adt_env: Default::default() };
+                        f.base_ty = f.norm(t);
+                        let res = f.check_type(VState::static_entry(), t);
+                        ip.emit(d, &f, ast_ty_pos(ast, ty).unwrap_or(ast.item(def.item).name.lo), res, CItemKind::Declaration);
+                    }
+                }
+            }
+            DefKind::Fn | DefKind::AssocFn => {
+                let ItemKind::Fn(fsig, body, _) = ast.item(def.item).kind else { continue };
+                let fsig = *ast.fn_sig(fsig);
+                // required trait methods have no body and are not visited (`check_fn`)
+                if body.is_none() && fsig.lazy_body.is_none() { continue; }
+                let rust = match fsig.abi { None => true, Some(None) => false, Some(Some(a)) => file.text(a).trim_matches('"') == "Rust" };
+                if !rust { ip.check_foreign_fn(d, CItemKind::Definition); } else { ip.check_fn_fnptrs(d, CItemKind::Definition); }
+            }
+            DefKind::Struct | DefKind::Union | DefKind::Enum => {
+                // `check_field_def`: extern fn pointers in the fields
+                let Some(a) = tcx.adts.get(&d) else { continue };
+                let groups: Vec<List<FieldDef>> = match ast.item(def.item).kind {
+                    ItemKind::Struct(r) => match ast.row(r).data { VariantData::Struct(l) | VariantData::Tuple(l) => vec![l], VariantData::Unit => vec![] },
+                    ItemKind::Union(r) => vec![ast.row(r).fields],
+                    ItemKind::Enum(r) => ast.list(ast.row(r).variants).iter().filter_map(|v| match v.data { VariantData::Struct(l) | VariantData::Tuple(l) => Some(l), VariantData::Unit => None }).collect(),
+                    _ => vec![],
+                };
+                let mut vi = 0;
+                let mut vars = a.variants.iter().filter(|v| !v.fields.is_empty());
+                let _ = &mut vi;
+                for l in groups {
+                    let Some(v) = vars.next() else { break };
+                    for (fd, ft) in ast.list(l).iter().zip(v.fields.iter()) {
+                        ip.check_fnptrs(d, fd.ty, ft.ty, VState::static_entry(), CItemKind::Definition);
+                    }
+                }
+            }
+            DefKind::Static | DefKind::Const | DefKind::TypeAlias => {
+                let ty_id = match ast.item(def.item).kind {
+                    ItemKind::Static(_, ty, _) => Some(ty),
+                    ItemKind::Const(ty, _) => ty.get(),
+                    ItemKind::TypeAlias(r) => ast.row(r).ty,
+                    _ => None,
+                };
+                if let (Some(ty_id), Some(t)) = (ty_id, if def.kind == DefKind::TypeAlias { tcx.type_of(prog, d).ok() } else { tcx.const_ty(prog, d) }) { ip.check_fnptrs(d, ty_id, t, VState::static_entry(), CItemKind::Definition); }
+            }
+            _ => {}
+        }
+    }
+}
