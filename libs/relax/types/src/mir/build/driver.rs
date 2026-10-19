@@ -32,6 +32,11 @@ pub fn closure_children(prog: &Program, tcx: &Tcx, body: &typeck::Body) -> Vec<C
     out
 }
 
+fn line_of(prog: &Program, file: u32, pos: u32) -> usize {
+    let src = prog.src(file).src;
+    1 + src[..(pos as usize).min(src.len())].iter().filter(|&&c| c == b'\n').count()
+}
+
 #[derive(Default)]
 struct Histogram {
     counts: BTreeMap<String, usize>,
@@ -107,9 +112,8 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
             let slot = by_kind.entry(kind).or_insert((0, 0));
             slot.0 += 1;
             let at = if let BodyKind::Closure(e) = b.kind {
-                let pf = &prog.files[typeck_body.file as usize];
-                let lo = pf.ast.expr(e).lo;
-                let line = 1 + pf.bytes(0, lo).iter().filter(|&&c| c == b'\n').count();
+                let lo = prog.files[typeck_body.file as usize].ast.expr(e).lo;
+                let line = line_of(prog, typeck_body.file, lo);
                 format!("{path}::{{closure#{}}} ({}:{line})", e.0, prog.file_paths[typeck_body.file as usize])
             } else {
                 path.clone()
@@ -127,7 +131,10 @@ pub fn build_all(prog: &Program, tcx: &Tcx, with_std: bool) -> usize {
                         invalid.note(format!("{} (bb{:?} stmt{:?})", first.message, first.bb.map(|b| b.0), first.statement_index), at);
                     }
                 }
-                Ok(Err(err)) => unbuilt.note(reason_key(&err.reason), at),
+                Ok(Err(err)) => {
+                    let line = line_of(prog, err.span.file, err.span.lo);
+                    unbuilt.note(reason_key(&err.reason), format!("{at} @ {}:{line}", prog.file_paths[err.span.file as usize]))
+                }
                 Err(p) => {
                     if crate::preempt::is_cancelled(&*p) {
                         std::panic::resume_unwind(p);
