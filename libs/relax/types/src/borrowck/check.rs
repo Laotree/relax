@@ -1,6 +1,6 @@
 // ported from N:rustc_borrowck/src/lib.rs @8d1a764 (MirBorrowckCtxt)
 use super::borrow_set::{BorrowData, BorrowSet, LocalsStateAtExit};
-use super::borrowck_errors::{BorrowckError, ErrorKind};
+use super::borrowck_errors::{AccessKind, BorrowInfo, BorrowckError, Detail, ErrorKind, InitAction, MoveSite};
 use super::dataflow::{Borrowck, BorrowckDomain};
 use super::mir_nll::MirRegionResult;
 use super::path_utils::{each_borrow_involving_path, is_active};
@@ -157,6 +157,22 @@ enum WriteKind { MutableBorrow(BorrowKind), Mutate, Move, StorageDeadOrDrop, Rep
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ReadOrWrite { Read(ReadKind), Write(WriteKind), Reservation(WriteKind), Activation(WriteKind, usize) }
 use ReadOrWrite::*;
+impl WriteKind {
+    fn access_kind(self) -> AccessKind {
+        match self {
+            WriteKind::MutableBorrow(k) => AccessKind::MutableBorrow(k), WriteKind::Mutate => AccessKind::Mutate,
+            WriteKind::Move => AccessKind::Move, WriteKind::StorageDeadOrDrop => AccessKind::StorageDeadOrDrop, WriteKind::Replace => AccessKind::Replace,
+        }
+    }
+}
+impl ReadOrWrite {
+    fn access_kind(self) -> AccessKind {
+        match self {
+            Read(ReadKind::Copy) => AccessKind::Copy, Read(ReadKind::Borrow(k)) => AccessKind::Borrow(k),
+            Write(k) | Reservation(k) | Activation(k, _) => k.access_kind(),
+        }
+    }
+}
 
 struct MirBorrowckCtxt<'a> {
     tcx: &'a Tcx, body: &'a Body, moves: &'a MoveData, borrows: &'a BorrowSet,
@@ -171,8 +187,8 @@ struct MirBorrowckCtxt<'a> {
     buffered_mut_errors: Vec<(Span, usize, usize)>,
 }
 impl MirBorrowckCtxt<'_> {
-    fn error(&mut self, kind: ErrorKind, span: Span) {
-        let error = BorrowckError { kind, span };
+    fn error_with(&mut self, kind: ErrorKind, span: Span, detail: Detail) {
+        let error = BorrowckError::with(kind, span, detail);
         if !self.result.errors.contains(&error) { self.result.errors.push(error); }
     }
     fn span_at(&self, at: Location) -> Span {
@@ -191,7 +207,7 @@ impl MirBorrowckCtxt<'_> {
                 self.consume_rvalue(value, at, span, state);
                 self.mutate_place(place, Shallow(None), at, span, state);
             }
-            StatementKind::FakeRead(_, place) => self.check_if_path_or_subpath_is_moved(place, at, span, state),
+            StatementKind::FakeRead(_, place) => self.check_if_path_or_subpath_is_moved(place, InitAction::Use, at, span, state),
             StatementKind::StorageDead(local) => self.access_place(&Place::local(*local), Shallow(None),
                 Write(WriteKind::StorageDeadOrDrop), true, at, span, state),
             StatementKind::Intrinsic(NonDivergingIntrinsic::Assume(op)) => self.consume_operand(op, at, span, state),
@@ -231,10 +247,10 @@ impl MirBorrowckCtxt<'_> {
             _ => {}
         }
     }
-    fn visit_after_primary_terminator_effect(&mut self, term: &Terminator, _: Location, state: BorrowckDomain<'_>) {
+    fn visit_after_primary_terminator_effect(&mut self, term: &Terminator, at: Location, state: BorrowckDomain<'_>) {
         if matches!(term.kind, TerminatorKind::Return | TerminatorKind::UnwindResume | TerminatorKind::TailCall { .. } | TerminatorKind::CoroutineDrop)
             && matches!(self.borrows.locals_state_at_exit(), LocalsStateAtExit::AllAreInvalidated) {
-            for i in state.borrows.iter() { self.check_for_invalidation_at_exit(&self.borrows[i], term.source_info.span); }
+            for i in state.borrows.iter() { self.check_for_invalidation_at_exit(&self.borrows[i], at, term.source_info.span); }
         }
         // STOP: movable-coroutine Yield checking requires arch's movability metadata.
     }
@@ -248,7 +264,8 @@ impl MirBorrowckCtxt<'_> {
                     BorrowKind::Mut { .. } => (Deep, Write(WriteKind::MutableBorrow(*kind))),
                 };
                 self.access_place(place, depth, access, false, at, span, state);
-                self.check_if_path_or_subpath_is_moved(place, at, span, state);
+                let action = if *kind == BorrowKind::Fake(FakeBorrowKind::Shallow) { InitAction::MatchOn } else { InitAction::Borrow };
+                self.check_if_path_or_subpath_is_moved(place, action, at, span, state);
             }
             Rvalue::RawPtr(kind, place) => {
                 let (depth, access) = match kind {
@@ -257,7 +274,7 @@ impl MirBorrowckCtxt<'_> {
                     RawPtrKind::FakeForPtrMetadata => (Shallow(Some(ArtificialField::ArrayLength)), Read(ReadKind::Copy)),
                 };
                 self.access_place(place, depth, access, false, at, span, state);
-                self.check_if_path_or_subpath_is_moved(place, at, span, state);
+                self.check_if_path_or_subpath_is_moved(place, InitAction::Borrow, at, span, state);
             }
             Rvalue::Use(op) | Rvalue::Repeat(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => self.consume_operand(op, at, span, state),
             Rvalue::BinaryOp(_, ops) => {
@@ -265,7 +282,7 @@ impl MirBorrowckCtxt<'_> {
             }
             Rvalue::Discriminant(place) => {
                 self.access_place(place, Shallow(None), Read(ReadKind::Copy), false, at, span, state);
-                self.check_if_path_or_subpath_is_moved(place, at, span, state);
+                self.check_if_path_or_subpath_is_moved(place, InitAction::Use, at, span, state);
             }
             Rvalue::Aggregate(_, ops) => for op in ops { self.consume_operand(op, at, span, state); },
             Rvalue::ThreadLocalRef(_) => {}
@@ -279,7 +296,7 @@ impl MirBorrowckCtxt<'_> {
             Operand::Move(place) => { self.check_movable_place(place, at); (place, Write(WriteKind::Move), true) }
         };
         self.access_place(place, Deep, access, allow, at, span, state);
-        self.check_if_path_or_subpath_is_moved(place, at, span, state);
+        self.check_if_path_or_subpath_is_moved(place, InitAction::Use, at, span, state);
     }
     fn mutate_place(&mut self, place: &Place, depth: AccessDepth, at: Location, span: Span, state: BorrowckDomain<'_>) {
         self.check_if_assigned_path_is_moved(place, at, span, state);
@@ -293,7 +310,7 @@ impl MirBorrowckCtxt<'_> {
             }
             return;
         }
-        let permission = self.check_access_permissions(place, access, allow, span, state);
+        let permission = self.check_access_permissions(place, access, allow, at, span, state);
         let conflict = self.check_access_for_conflict(place, depth, access, at, span, state);
         if permission || conflict { self.access_errors.push((place.clone(), span)); }
     }
@@ -325,11 +342,12 @@ impl MirBorrowckCtxt<'_> {
                 WriteKind::MutableBorrow(kind) => self.conflicting_borrow_kind(kind, borrow),
                 WriteKind::Move => { span = self.span_at(at); MoveWhileBorrowed }
                 WriteKind::Mutate | WriteKind::Replace => if matches!(borrow.kind, BorrowKind::Fake(_)) && self.immutable_section(&borrow.assigned_place) { MutateInGuard } else { AssignWhileBorrowed },
-                WriteKind::StorageDeadOrDrop => { self.lifetime_error(borrow, place, span); return true; }
+                WriteKind::StorageDeadOrDrop => { self.lifetime_error(borrow, place, at, span); return true; }
             },
         };
         if matches!(access, Reservation(_)) { self.reservation_errors.push(place.clone()); }
-        self.error(kind, span);
+        let detail = Detail::Conflict { place: place.clone(), access: access.access_kind(), location: at, borrow: BorrowInfo::from(borrow) };
+        self.error_with(kind, span, detail);
         true
     }
     fn immutable_section(&self, place: &Place) -> bool {
@@ -368,7 +386,7 @@ impl MirBorrowckCtxt<'_> {
             self.access_place(&borrow.borrowed_place, Deep, Activation(WriteKind::MutableBorrow(borrow.kind), index), false, at, span, state);
         }
     }
-    fn lifetime_error(&mut self, borrow: &BorrowData, dropped: &Place, _drop_span: Span) {
+    fn lifetime_error(&mut self, borrow: &BorrowData, dropped: &Place, at: Location, _drop_span: Span) {
         let borrow_span = self.span_at(borrow.reserve_location);
         let key = (Place::local(borrow.borrowed_place.local),borrow_span);
         if self.access_errors.contains(&key) { return; }
@@ -378,14 +396,14 @@ impl MirBorrowckCtxt<'_> {
             else if !dropped.projection.starts_with(&borrow.borrowed_place.projection) && self.has_destructor_prefix(&borrow.borrowed_place) { BorrowAcrossDestructor }
             else if decl.kind == LocalKind::Temp { TemporaryDropped } else { DoesNotLiveLongEnough };
         let span = if kind == TemporaryDropped { decl.source_info.span } else { self.span_at(borrow.reserve_location) };
-        self.error(kind, span);
+        self.error_with(kind, span, Detail::Lifetime { borrow: BorrowInfo::from(borrow), dropped_place: dropped.clone(), location: at });
     }
-    fn check_for_invalidation_at_exit(&mut self, borrow: &BorrowData, span: Span) {
+    fn check_for_invalidation_at_exit(&mut self, borrow: &BorrowData, at: Location, span: Span) {
         let mut root = Place::local(borrow.borrowed_place.local);
         let thread_local = matches!(self.body.local_decls[root.local.0 as usize].local_info, LocalInfo::StaticRef { is_thread_local: true, .. });
         if thread_local { root.projection.push(PlaceElem::Deref); }
         if borrow_conflicts_with_place(self.tcx, self.body, &borrow.borrowed_place, borrow.kind, &root,
-            if thread_local { Deep } else { Shallow(None) }, PlaceConflictBias::Overlap) { self.lifetime_error(borrow, &root, span); }
+            if thread_local { Deep } else { Shallow(None) }, PlaceConflictBias::Overlap) { self.lifetime_error(borrow, &root, at, span); }
     }
     fn first_reaching_init(&self, local: Local, state: BorrowckDomain<'_>) -> Option<usize> {
         let path = self.moves.rev_lookup.find_local(local)?;
@@ -397,7 +415,7 @@ impl MirBorrowckCtxt<'_> {
         }
         // Upvar roots are stopped before checking, until MIR owns capture metadata.
     }
-    fn check_access_permissions(&mut self, place: &Place, access: ReadOrWrite, allow: bool, span: Span, state: BorrowckDomain<'_>) -> bool {
+    fn check_access_permissions(&mut self, place: &Place, access: ReadOrWrite, allow: bool, at: Location, span: Span, state: BorrowckDomain<'_>) -> bool {
         let (borrow, allow) = match access {
             Write(WriteKind::MutableBorrow(BorrowKind::Mut { kind })) | Reservation(WriteKind::MutableBorrow(BorrowKind::Mut { kind })) =>
                 (true, allow || kind == MutBorrowKind::ClosureCapture),
@@ -408,21 +426,22 @@ impl MirBorrowckCtxt<'_> {
             Ok((root, allow)) => { self.add_used_mut(&root, allow, state); return false; }
             Err(the_place_err) => the_place_err,
         };
-        if self.first_reaching_init(place.local, state).is_none() { return false; }
+        let Some(init) = self.first_reaching_init(place.local, state) else { return false; };
+        let detail = Detail::Mutability { place: place.clone(), the_place_err: the_place_err.clone(), access: access.access_kind(), location: at, init: Some(init) };
         if !borrow {
-            self.error(if place.projection.is_empty() { Reassigned } else { AssignImmutable }, span);
+            self.error_with(if place.projection.is_empty() { Reassigned } else { AssignImmutable }, span, detail);
         } else {
-            self.report_mutable_borrow_error(&the_place_err, span);
+            self.report_mutable_borrow_error(&the_place_err, span, detail);
         }
         true
     }
     // diagnostics/mutability_errors.rs:226-250,659: a second mutable borrow of the same
     // immutable binding joins the first error, whose primary span becomes the binding.
-    fn report_mutable_borrow_error(&mut self, the_place_err: &Place, span: Span) {
+    fn report_mutable_borrow_error(&mut self, the_place_err: &Place, span: Span, detail: Detail) {
         let decl = &self.body.local_decls[the_place_err.local.0 as usize];
         let can_be_made_mutable = decl.can_be_made_mutable();
         if !the_place_err.projection.is_empty() || !can_be_made_mutable {
-            self.result.errors.push(BorrowckError { kind: BorrowImmutable, span });
+            self.result.errors.push(BorrowckError::with(BorrowImmutable, span, detail));
             return;
         }
         let binding_span = decl.source_info.span;
@@ -432,7 +451,7 @@ impl MirBorrowckCtxt<'_> {
             return;
         }
         self.buffered_mut_errors.push((binding_span, self.result.errors.len(), 1));
-        self.result.errors.push(BorrowckError { kind: BorrowImmutable, span });
+        self.result.errors.push(BorrowckError::with(BorrowImmutable, span, detail));
     }
     /// lib.rs:2567: Ok(root place, its mutation mode) or Err(the place that is not mutable).
     fn is_mutable(&self, place: &Place, allow: bool) -> Result<(Place, bool), Place> {
@@ -457,18 +476,21 @@ impl MirBorrowckCtxt<'_> {
     fn exact_path(&self, place: &Place) -> Option<usize> {
         match self.moves.rev_lookup.find(place) { LookupResult::Exact(i) => Some(i), LookupResult::Parent(_) => None }
     }
-    fn check_if_full_path_is_moved(&mut self, place: &Place, at: Location, span: Span, state: BorrowckDomain<'_>) {
+    fn check_if_full_path_is_moved(&mut self, place: &Place, action: InitAction, at: Location, span: Span, state: BorrowckDomain<'_>) {
         let path = match self.moves.rev_lookup.find(place) {
             LookupResult::Exact(i) | LookupResult::Parent(Some(i)) => i,
             LookupResult::Parent(None) => panic!("missing move path for MIR local"),
         };
-        if state.uninits.contains(path) { self.report_use_of_moved_or_uninitialized(place, path, at, span); }
+        if state.uninits.contains(path) {
+            let prefix = self.moves.move_paths[path].place.clone();
+            self.report_use_of_moved_or_uninitialized(&prefix, place, path, action, at, span);
+        }
     }
     fn uninit_descendant(&self, path: usize, state: BorrowckDomain<'_>) -> Option<usize> {
         find_in_move_path_or_its_descendants(self.moves, path, |i| state.uninits.contains(i))
     }
-    fn check_if_path_or_subpath_is_moved(&mut self, place: &Place, at: Location, span: Span, state: BorrowckDomain<'_>) {
-        self.check_if_full_path_is_moved(place, at, span, state);
+    fn check_if_path_or_subpath_is_moved(&mut self, place: &Place, action: InitAction, at: Location, span: Span, state: BorrowckDomain<'_>) {
+        self.check_if_full_path_is_moved(place, action, at, span, state);
         if let Some((PlaceElem::Subslice { from, to, from_end: false }, base)) = last_projection(place) {
             if matches!(self.tcx.tys.kind(self.ty(&base)), TyKind::Array(..)) {
                 if let Some(path) = self.exact_path(&base) {
@@ -476,7 +498,7 @@ impl MirBorrowckCtxt<'_> {
                     while let Some(i) = child {
                         if let Some(PlaceElem::ConstantIndex { offset, from_end: false, .. }) = self.moves.move_paths[i].place.projection.last() {
                             if (from..to).contains(offset) {
-                                if let Some(i) = self.uninit_descendant(i, state) { self.report_use_of_moved_or_uninitialized(&base, i, at, span); return; }
+                                if let Some(i) = self.uninit_descendant(i, state) { self.report_use_of_moved_or_uninitialized(&base, &base, i, action, at, span); return; }
                             }
                         }
                         child = self.moves.move_paths[i].next_sibling;
@@ -486,19 +508,19 @@ impl MirBorrowckCtxt<'_> {
             }
         }
         if let Some(path) = self.exact_path(place) {
-            if let Some(i) = self.uninit_descendant(path, state) { self.report_use_of_moved_or_uninitialized(place, i, at, span); }
+            if let Some(i) = self.uninit_descendant(path, state) { self.report_use_of_moved_or_uninitialized(place, place, i, action, at, span); }
         }
     }
     fn check_if_assigned_path_is_moved(&mut self, place: &Place, at: Location, span: Span, state: BorrowckDomain<'_>) {
         for i in (0..place.projection.len()).rev() {
             let base = Place { local: place.local, projection: place.projection[..i].to_vec() };
             match place.projection[i] {
-                PlaceElem::Deref => { self.check_if_full_path_is_moved(&base, at, span, state); break; }
+                PlaceElem::Deref => { self.check_if_full_path_is_moved(&base, InitAction::Use, at, span, state); break; }
                 PlaceElem::Subslice { .. } => panic!("assignment to MIR subslice"),
                 PlaceElem::Field(..) => {
                     let ty = self.tcx.tys.kind(self.ty(&base));
                     if matches!(ty, TyKind::Adt(def, ..) if self.tcx.adt_destructor(*def).is_some()) {
-                        self.check_if_path_or_subpath_is_moved(&base, at, span, state); break;
+                        self.check_if_path_or_subpath_is_moved(&base, InitAction::Assignment, at, span, state); break;
                     }
                     if matches!(ty, TyKind::Adt(..) | TyKind::Tuple(_)) {
                         let mut shortest = None;
@@ -508,7 +530,8 @@ impl MirBorrowckCtxt<'_> {
                         if let Some(path) = shortest {
                             if matches!(ty, TyKind::Adt(def, ..) if self.tcx.adts[def].is_union())
                                 && self.moves.path_map[path].iter().any(|&i| self.cfg.is_predecessor(self.body, self.moves.moves[i].source, at)) { continue; }
-                            self.report_use_of_moved_or_uninitialized(&base, path, at, span);
+                            let prefix = self.moves.move_paths[path].place.clone();
+                            self.report_use_of_moved_or_uninitialized(&prefix, &base, path, InitAction::PartialAssignment, at, span);
                             self.result.used_mut.insert(base.local.0 as usize);
                         }
                     }
@@ -522,15 +545,17 @@ impl MirBorrowckCtxt<'_> {
     // is reported once per root local; E0382 once per set of move-outs, where a use of a
     // prefix of the place already reported for that set is suppressed and any other use
     // replaces the buffered error (buffer_move_error's IndexMap insert).
-    fn report_use_of_moved_or_uninitialized(&mut self, used_place: &Place, mpi: usize, at: Location, span: Span) {
-        let move_out_indices = self.get_moved_indexes(at, mpi);
+    fn report_use_of_moved_or_uninitialized(&mut self, moved_place: &Place, used_place: &Place, mpi: usize, action: InitAction, at: Location, span: Span) {
+        let sites = self.get_moved_indexes(at, mpi);
+        let move_out_indices: Vec<usize> = sites.iter().map(|s| s.moi).collect();
+        let detail = Detail::Moved { action, moved_place: moved_place.clone(), used_place: used_place.clone(), location: at, mpi, moves: sites };
         if move_out_indices.is_empty() {
             if self.uninitialized_errors.insert(used_place.local.0 as usize) {
-                self.error(Uninitialized, span);
+                self.error_with(Uninitialized, span, detail);
             }
             return;
         }
-        let error = BorrowckError { kind: Moved, span };
+        let error = BorrowckError::with(Moved, span, detail);
         if let Some(entry) = self.buffered_move_errors.iter_mut().find(|(key, ..)| *key == move_out_indices) {
             if is_prefix_of(used_place, &entry.1) { return; }
             entry.1 = used_place.clone();
@@ -544,7 +569,7 @@ impl MirBorrowckCtxt<'_> {
     // that stops at moves and (re)initializations; backedges (moves in a later loop
     // iteration) are only searched when the path is definitely initialized on entry.
     // The reinitialization list feeds labels only.
-    fn get_moved_indexes(&self, at: Location, mpi: usize) -> Vec<usize> {
+    fn get_moved_indexes(&self, at: Location, mpi: usize) -> Vec<MoveSite> {
         let mut mpis = vec![mpi];
         while let Some(parent) = self.moves.move_paths[*mpis.last().unwrap()].parent { mpis.push(parent); }
         let mut stack = vec![];
@@ -559,14 +584,14 @@ impl MirBorrowckCtxt<'_> {
         });
         let mut visited = vec![];
         let mut result = vec![];
-        let mut dfs_iter = |result: &mut Vec<usize>, location: Location| -> bool {
+        let mut dfs_iter = |result: &mut Vec<MoveSite>, location: Location, traversed_back_edge: bool| -> bool {
             if visited.contains(&location) { return true; }
             visited.push(location);
             let data = &self.body.basic_blocks[location.block.0 as usize];
             // Only moves written by the user count: not the move-outs of StorageDead.
             if !matches!(data.statements.get(location.statement_index).map(|s| &s.kind), Some(StatementKind::StorageDead(_))) {
                 for &moi in &self.moves.loc_map[location] {
-                    if mpis.contains(&self.moves.moves[moi].path) { result.push(moi); return true; }
+                    if mpis.contains(&self.moves.moves[moi].path) { result.push(MoveSite { moi, traversed_back_edge }); return true; }
                 }
             }
             self.moves.init_loc_map[location].iter().any(|&ii| {
@@ -578,7 +603,7 @@ impl MirBorrowckCtxt<'_> {
             })
         };
         while let Some(location) = stack.pop() {
-            if dfs_iter(&mut result, location) { continue; }
+            if dfs_iter(&mut result, location, false) { continue; }
             let predecessors = self.cfg.predecessor_locations(self.body, location);
             if predecessors.is_empty() { reached_start = true; }
             for predecessor in predecessors {
@@ -587,7 +612,7 @@ impl MirBorrowckCtxt<'_> {
         }
         if (is_argument || !reached_start) && result.is_empty() {
             while let Some(location) = back_edge_stack.pop() {
-                if dfs_iter(&mut result, location) { continue; }
+                if dfs_iter(&mut result, location, true) { continue; }
                 back_edge_stack.extend(self.cfg.predecessor_locations(self.body, location));
             }
         }
@@ -614,9 +639,9 @@ fn is_prefix_of(prefix: &Place, place: &Place) -> bool {
 /// diagnostics/move_errors.rs:42 MoveError, with the error code of its IllegalMoveOriginKind.
 struct MoveError { place: Place, location: Location, kind: ErrorKind }
 enum GroupedMoveError {
-    MovesFromPlace { span: Span, kind: ErrorKind },
-    MovesFromValue { span: Span, move_from: usize, kind: ErrorKind },
-    OtherIllegalMove { span: Span, kind: ErrorKind },
+    MovesFromPlace { span: Span, kind: ErrorKind, original: (Place, Location) },
+    MovesFromValue { span: Span, move_from: usize, kind: ErrorKind, original: (Place, Location) },
+    OtherIllegalMove { span: Span, kind: ErrorKind, original: (Place, Location) },
 }
 // ported from N:rustc_borrowck/src/diagnostics/move_errors.rs @8d1a764
 // report_move_errors/group_move_errors/append_to_grouped_errors/append_binding_error:103-232.
@@ -625,31 +650,32 @@ enum GroupedMoveError {
 // `moves` is None for promoted bodies, whose locals are never user bindings.
 fn report_move_errors(body: &Body, moves: Option<&MoveData>, errors: Vec<MoveError>, out: &mut Vec<BorrowckError>) {
     let mut grouped: Vec<GroupedMoveError> = vec![];
-    for MoveError { place: _original_path, location, kind } in errors {
+    for MoveError { place: original_path, location, kind } in errors {
+        let original = (original_path.clone(), location);
         let block = &body.basic_blocks[location.block.0 as usize];
         let stmt = block.statements.get(location.statement_index);
         if let Some(Statement { kind: StatementKind::Assign(place, Rvalue::Use(Operand::Move(move_from))), source_info }) = stmt {
             if place.projection.is_empty() {
                 if let LocalInfo::User(BindingForm::Var(VarBindingForm { opt_match_place: Some((opt_match_place, match_span)), .. })) = &body.local_decls[place.local.0 as usize].local_info {
                     let moves = moves.expect("promoted MIR has no user bindings");
-                    append_binding_error(&mut grouped, moves, kind, move_from, opt_match_place.as_ref(), *match_span, source_info.span);
+                    append_binding_error(&mut grouped, moves, kind, move_from, opt_match_place.as_ref(), *match_span, source_info.span, original);
                     continue;
                 }
             }
         }
         // move_spans: the statement or terminator span (closure captures are stopped).
         let span = stmt.map_or_else(|| block.terminator.as_ref().unwrap().source_info.span, |s| s.source_info.span);
-        grouped.push(GroupedMoveError::OtherIllegalMove { span, kind });
+        grouped.push(GroupedMoveError::OtherIllegalMove { span, kind, original });
     }
     for error in grouped {
-        let (GroupedMoveError::MovesFromPlace { span, kind } | GroupedMoveError::MovesFromValue { span, kind, .. }
-            | GroupedMoveError::OtherIllegalMove { span, kind }) = error;
-        let error = BorrowckError { kind, span };
+        let (GroupedMoveError::MovesFromPlace { span, kind, original } | GroupedMoveError::MovesFromValue { span, kind, original, .. }
+            | GroupedMoveError::OtherIllegalMove { span, kind, original }) = error;
+        let error = BorrowckError::with(kind, span, Detail::IllegalMove { place: original.0, location: original.1 });
         if !out.contains(&error) { out.push(error); }
     }
 }
 fn append_binding_error(grouped: &mut Vec<GroupedMoveError>, moves: &MoveData, kind: ErrorKind, move_from: &Place,
-    match_place: Option<&Place>, match_span: Span, statement_span: Span) {
+    match_place: Option<&Place>, match_span: Span, statement_span: Span, original: (Place, Location)) {
     let from_simple_let = match_place.is_none();
     let match_place = match_place.unwrap_or(move_from);
     match moves.rev_lookup.find(match_place) {
@@ -658,7 +684,7 @@ fn append_binding_error(grouped: &mut Vec<GroupedMoveError>, moves: &MoveData, k
             if grouped.iter().any(|ge| matches!(ge, GroupedMoveError::MovesFromPlace { span, .. } if *span == match_span)) { return; }
             // Don't need to point to x in let x = ... .
             let span = if from_simple_let { statement_span } else { match_span };
-            grouped.push(GroupedMoveError::MovesFromPlace { span, kind });
+            grouped.push(GroupedMoveError::MovesFromPlace { span, kind, original });
         }
         // Error with the pattern.
         LookupResult::Exact(_) => {
@@ -668,7 +694,7 @@ fn append_binding_error(grouped: &mut Vec<GroupedMoveError>, moves: &MoveData, k
             if grouped.iter().any(|ge| matches!(ge, GroupedMoveError::MovesFromValue { span, move_from, .. } if *span == match_span && *move_from == mpi)) {
                 return;
             }
-            grouped.push(GroupedMoveError::MovesFromValue { span: match_span, move_from: mpi, kind });
+            grouped.push(GroupedMoveError::MovesFromValue { span: match_span, move_from: mpi, kind, original });
         }
     }
 }

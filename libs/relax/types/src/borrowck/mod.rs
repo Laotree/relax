@@ -5,6 +5,7 @@ pub mod bir;
 pub mod borrowck_errors;
 pub mod check;
 pub mod check_consts;
+pub mod diagnostics;
 pub mod mir_nll;
 pub mod polonius;
 pub mod root_cx;
