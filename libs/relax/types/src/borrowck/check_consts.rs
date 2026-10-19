@@ -90,8 +90,8 @@ pub fn check<Q: Queries>(tx: &Tx, queries: &Q, bodies: &[Bir]) -> Result<Vec<Dia
         let needs_drop = entry_states(tx, bir, queries, Qualif::NeedsDrop)?;
         let has_mut_interior = entry_states(tx, bir, queries, Qualif::HasMutInterior)?;
         let krate = &tx.prog.crates[tx.prog.def(bir.checked_body.map_or(crate::program::NO_DEF, |b| b.owner)).krate as usize];
-        let const_traits = krate.feature_enabled(tx.prog, "const_trait_impl");
-        let const_drops = krate.feature_enabled(tx.prog, "const_destruct") || krate.feature_enabled(tx.prog, "const_precise_live_drops");
+        let const_traits = krate.features(tx.prog).has("const_trait_impl");
+        let const_drops = krate.features(tx.prog).has("const_destruct") || krate.features(tx.prog).has("const_precise_live_drops");
         let mut c = Checker { tx, body: bir, queries, kind, const_traits, const_drops, needs_drop, has_mut_interior, transient: None, primary: Vec::new(), secondary: Vec::new() };
         c.run()?;
         if c.primary.is_empty() { out.extend(c.secondary); } else { out.extend(c.primary); }

@@ -829,6 +829,8 @@ pub enum Bound {
         hrtb: List<GenericParam>,
         maybe: bool,
         konst: bool,
+        /// `async Fn()` (async_trait_bounds)
+        async_: bool,
         path: Path,
     },
     /// `use<'a, T>` precise capture
@@ -1097,6 +1099,8 @@ pub struct ForRow {
 pub struct ClosureRow {
     pub is_move: bool,
     pub is_async: bool,
+    /// `static || ..` (coroutine syntax)
+    pub is_static: bool,
     pub params: List<ClosureParam>,
     pub ret: Option<TyId>,
     pub body: ExprId,

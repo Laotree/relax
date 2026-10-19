@@ -23,7 +23,7 @@ impl fmt::Debug for Location<'_> {
 impl<'a> Location<'a> {
     /// The location of the caller (through any chain of #[track_caller] fns).
     #[track_caller]
-    pub fn caller() -> &'static Location<'static> {
+    pub const fn caller() -> &'static Location<'static> {
         unsafe { crate::intrinsics_rt::caller_location() }
     }
     /// Built by Relax's lowering for panics and `Location::caller()`.

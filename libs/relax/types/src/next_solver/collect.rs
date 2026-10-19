@@ -393,6 +393,7 @@ impl Tcx {
                         GenericArg::Type(t) => args.push(t), GenericArg::Const(c) => args.push(self.tys.intern(TyKind::Const(c))), GenericArg::Lifetime(r) => rs.push(r),
                     } }
                     let vars = supertrait.bound_vars;
+                    let (parent_args, parent_regions) = (args.len(), rs.len());
                     if let Some(GenericArgs::Angle(own)) = ast.gargs(own_args) {
                         for arg in ast.list(*own) {
                             match *arg {
@@ -410,6 +411,9 @@ impl Tcx {
                             }
                         }
                     }
+                    let (mut own_args, mut own_regions) = (args.split_off(parent_args), rs.split_off(parent_regions));
+                    self.fit_assoc_own_args(prog, ad, &mut own_args, &mut own_regions);
+                    args.extend(own_args); rs.extend(own_regions);
                     let alias = self.tys.intern(TyKind::Alias(IsRigid::No, AliasTy { kind: AliasTyKind::Projection { def_id: ad }, args: self.tys.mk_list(&args), regions: self.tys.intern_region_args(&rs) }));
                     match *arg {
                         ast::GenericArg::Binding(_, _, value) => {

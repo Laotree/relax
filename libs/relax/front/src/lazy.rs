@@ -335,6 +335,9 @@ impl Plan {
                         if let Some(scan) = scan { for (path, dir, _) in &scan.children { directories.insert(path.clone(), dir.clone()); } }
                     }
                     let mut seen = scans.iter().map(|(path, module, ..)| (path.clone(), module.clone())).collect::<BTreeSet<_>>();
+                    // the module files each scanned file was reached through (rustc_expand: a file
+                    // that includes itself through `mod` items is the loader's circular-modules error)
+                    let mut chains: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
                     let mut pending = std::collections::VecDeque::from(std::mem::take(scans));
                     while let Some(mut entry) = pending.pop_front() {
                         let (path, module, _, scan, parameters, _) = &mut entry;
@@ -381,9 +384,13 @@ impl Plan {
                             if let Some(expanded) = scan_tokens(path, &dir, module, &c.name, c.edition, &c.cfg, scan.src_len,
                                 expanded_src, surface.toks, &contexts[*ci], false) { *scan = expanded; }
                         }
+                        let mut chain = chains.get(&(path.clone(), module.clone())).cloned().unwrap_or_default();
+                        chain.push(path.clone());
                         for (child, dir, child_module) in &scan.children {
                             directories.insert(child.clone(), dir.clone());
+                            if chain.contains(child) { continue; }
                             if !seen.insert((child.clone(), child_module.clone())) { continue; }
+                            chains.insert((child.clone(), child_module.clone()), chain.clone());
                             let source = contexts[*ci].read_source(child).ok();
                             let hash = source.as_ref().map(|s| crate::crate_image::file_hash(child, &s.src));
                             let child_scan = source.and_then(|s| scan_text_mode(child, dir, child_module, &c.name, c.edition, &c.cfg, (&s.src).into(), &contexts[*ci], true)).map(Arc::new);
