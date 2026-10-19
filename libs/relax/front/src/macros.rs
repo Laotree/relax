@@ -2136,7 +2136,7 @@ impl<'a> Parser<'a> {
                         taken = Some((t.lo, self.toks.at(e).lo));
                     }
                 }
-                if ok { Some((e, taken, bare || (f == Frag::Expr && self.is_macro_call(i, e)))) } else { None }
+                if ok { Some((e, taken, bare)) } else { None }
             }
         }
     }
@@ -2232,7 +2232,7 @@ impl<'a> Parser<'a> {
     }
 
     fn transcribe(&self, nodes: &[TNode], binds: &HashMap<String, Bind>, idx: &mut Vec<usize>, krate_path: &str, out: &mut Transcript) -> Result<(), String> {
-        for n in nodes {
+        for (ni, n) in nodes.iter().enumerate() {
             match n {
                 TNode::Tok(t) => out.push(&t.text, None, t.pos),
                 TNode::Crate => out.push(krate_path, None, u32::MAX),
@@ -2243,7 +2243,12 @@ impl<'a> Parser<'a> {
                 }
                 TNode::Var(v) => match Self::lookup_bind(binds, v, idx) {
                     Some(Bind::One(lo, hi, f, taken, bare)) => {
-                        let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare;
+                        // a macro-call expression stays unparenthesised only where it ends the
+                        // statement-like position (`$e;` / last): `m!{..} * 2` would otherwise parse as
+                        // a statement macro followed by `*2` (the fragment is one opaque expression)
+                        let ends = nodes.get(ni + 1).map_or(true, |n| matches!(n, TNode::Tok(t) if t.text == ";"));
+                        let bare_macro = *f == Frag::Expr && taken.is_none() && ends && self.is_macro_call(*lo, *hi);
+                        let wrap = *f == Frag::Expr && hi - lo + usize::from(taken.is_some()) > 1 && !*bare && !bare_macro;
                         if wrap {
                             out.push("(", None, u32::MAX);
                         }

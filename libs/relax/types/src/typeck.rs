@@ -1198,12 +1198,16 @@ impl<'a> Fcx<'a> {
     /// the pointee pair is unsized by the solver's `dyn A: Unsize<dyn B>` candidates (rustc
     /// consider_builtin_dyn_upcast_candidates); pointer shapes as for `dyn_coercion`.
     fn dyn_upcast(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
-        let (a, d) = self.unsize_pointee_pair(ka, kx, true)?;
+        let (a, d, outer_a, outer_d) = self.unsize_pointee_pair(ka, kx, true)?;
         let (a, d) = (self.shallow(a), self.shallow(d));
         if a == d || !matches!(self.tcx.tys.kind(a), TyKind::Dyn(..)) || !matches!(self.tcx.tys.kind(d), TyKind::Dyn(..)) { return None; }
         // the same object type up to lifetimes is subtyping, not an upcast
         if self.tcx.tys.erase_regions(a) == self.tcx.tys.erase_regions(d) { return None; }
         let unsize = self.tcx.lang_items.get(crate::lang_items::LangItem::Unsize)?;
+        // through a struct tail the whole pointee pair must unsize (rustc: `S<dyn A>: Unsize<S<dyn B>>`,
+        // the last-field rule), not just the trait objects at its end
+        let (oa, od) = (self.shallow(outer_a), self.shallow(outer_d));
+        if oa != a { self.select_trait(unsize, oa, &[od]).ok()?; }
         self.select_trait(unsize, a, &[d]).ok()?;
         Some((a, d))
     }
@@ -1212,7 +1216,7 @@ impl<'a> Fcx<'a> {
     /// `P<..B..>`, then down a struct tail (`S<A>` against `S<B>`, rustc coerce_unsized: `S<T>:
     /// Unsize<S<U>>` when the last field's type does) to the types that become / are trait objects.
     /// `upcast`: the source pointee is itself a trait object (dyn -> dyn).
-    fn unsize_pointee_pair(&mut self, ka: &TyKind, kx: &TyKind, upcast: bool) -> Option<(TyId, TyId)> {
+    fn unsize_pointee_pair(&mut self, ka: &TyKind, kx: &TyKind, upcast: bool) -> Option<(TyId, TyId, TyId, TyId)> {
         let (src, dy) = match (ka, kx) {
             (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
             (TyKind::Adt(d1, xs, _), TyKind::Adt(d2, ys, _)) if d1 == d2 && self.prog.def(*d1).kind == DefKind::Struct && self.tcx.tys.list(*xs).len() == self.tcx.tys.list(*ys).len() => {
@@ -1245,6 +1249,7 @@ impl<'a> Fcx<'a> {
         // `P<S<..T..>>` -> `P<S<..dyn Tr..>>` (also `&S<T>` -> `&S<dyn Tr>`): struct tail
         // unsizing (rustc coerce_unsized: `S<T>: Unsize<S<U>>` when the last field's type does),
         // down to the type that becomes the trait object
+        let (outer_src, outer_dy) = (src, dy);
         let (src, dy) = {
                 let (mut x, mut y) = (self.shallow(src), self.shallow(dy));
                 loop {
@@ -1271,11 +1276,11 @@ impl<'a> Fcx<'a> {
                     }
                 }
         };
-        Some((src, dy))
+        Some((src, dy, outer_src, outer_dy))
     }
 
     fn dyn_coercion(&mut self, ka: &TyKind, kx: &TyKind) -> Option<(TyId, TyId)> {
-        let (src, dy) = self.unsize_pointee_pair(ka, kx, false)?;
+        let (src, dy, _, _) = self.unsize_pointee_pair(ka, kx, false)?;
         let src = self.shallow(src);
         let dy = self.shallow(dy);
         // An unresolved pointee may itself become `dyn Tr` (for example the `_`

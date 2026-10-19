@@ -233,6 +233,9 @@ impl Fcx<'_> {
     fn obligations_for_self_ty(&mut self, vid: u32) -> Vec<Predicate> {
         let mut out = Vec::new();
         for obligation in self.fulfillment_cx.pending_obligations() {
+            // a goal that mentions no variable of `vid`'s class cannot be stalled on it (nor can
+            // anything nested in it; skipping the proof-tree walk keeps this cheap)
+            if !self.predicate_mentions_var_class(&obligation.goal.predicate, vid) { continue; }
             self.nested_obligations_for_self_ty(obligation.goal.clone(), 0, vid, &mut out);
         }
         let flags = crate::types::TypeFlags::HAS_PLACEHOLDER.bits();
@@ -241,6 +244,28 @@ impl Fcx<'_> {
             let p = crate::next_solver::fold::fold_predicate(&self.tcx.tys, &p, &mut resolver);
             (p.flags(&self.tcx.tys) & flags == 0).then_some(p)
         }).collect()
+    }
+
+    fn predicate_mentions_var_class(&self, predicate: &Predicate, vid: u32) -> bool {
+        let mut resolver = crate::infer::resolve::DeepResolverIgnoringRegions::new(&self.infcx);
+        let p = crate::next_solver::fold::fold_predicate(&self.tcx.tys, predicate, &mut resolver);
+        if p.flags(&self.tcx.tys) & crate::types::TypeFlags::HAS_TY_INFER.bits() == 0 { return false; }
+        struct Finder<'a> { fcx: &'a Fcx<'a>, vid: u32, found: bool }
+        impl crate::types::fold::TypeFolder for Finder<'_> {
+            fn fold_ty(&mut self, tys: &crate::types::Types, t: TyId, depth: u32) -> TyId {
+                if self.found { return t; }
+                if let TyKind::Infer(v) = tys.kind(t) {
+                    let mut inner = self.fcx.infcx.inner.borrow_mut();
+                    let mut table = inner.type_variables();
+                    if table.root_var(*v) == table.root_var(self.vid) { self.found = true; }
+                    return t;
+                }
+                crate::types::fold::super_fold_ty(tys, t, self, depth)
+            }
+        }
+        let mut f = Finder { fcx: self, vid, found: false };
+        crate::next_solver::fold::fold_predicate(&self.tcx.tys, &p, &mut f);
+        f.found
     }
 
     /// inspect_obligations.rs:155-200 NestedObligationsForSelfTy::visit_goal.
