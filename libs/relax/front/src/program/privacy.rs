@@ -127,8 +127,76 @@ impl Program {
             }
             if let Some(e) = self.path_privacy(im.module, im.global, segs, ns, edition < 2018, true) {
                 out.push(self.record_error(im.file, im.pos, "resolve", self.privacy_message(&e)));
+            } else if !im.glob && im.is_pub && !im.ext {
+                if let Some(msg) = self.cannot_reexport(im, segs, edition) {
+                    out.push(self.record_error(im.file, im.pos, "resolve", msg));
+                }
             }
         }
         out
+    }
+
+    /// The visibility of an item definition as written (None: `pub`).
+    fn def_item_vis(&self, d: DefId) -> BindVis {
+        let def = self.def(d);
+        if def.item.0 != u32::MAX {
+            if let Some(it) = self.files.get(def.file as usize).and_then(|f| f.ast.items.get(def.item.0 as usize)) {
+                return self.vis_module(def.file, def.scope, &it.vis);
+            }
+        }
+        if def.is_pub { None } else { Some(self.mods[def.scope as usize].normal) }
+    }
+
+    /// E0364 / E0365 (rustc_resolve imports.rs finalize_import): a `pub use` whose every
+    /// resolved binding is less visible than the import itself.
+    fn cannot_reexport(&self, im: &Import, segs: &[(SegKind, Sym)], edition: u16) -> Option<String> {
+        let (_, name) = *segs.last()?;
+        if segs.is_empty() || im.segs.last().map_or(false, |s| s.0 != SegKind::Ident) {
+            return None;
+        }
+        let parent = if segs.len() == 1 {
+            // `pub use foo as bar;`: an item of this module (of the crate root before 2018)
+            let m = if edition < 2018 { self.crates[self.mods[im.module as usize].krate as usize].root_mod } else { im.module };
+            self.mods[m as usize].def
+        } else {
+            self.resolve_mod_path(im.module, im.global, &segs[..segs.len() - 1], edition < 2018, true)?
+        };
+        // the import's nominal visibility: the `use` item's
+        let f = self.files.get(im.file as usize)?;
+        let item = f.ast.items.iter().find(|it| it.lo == im.pos && matches!(it.kind, ItemKind::Use(_)))?;
+        let import_vis = self.vis_module(im.file, im.module, &item.vis);
+        let pd = self.def(parent);
+        let mut any_ok = false;
+        let mut failed: Option<(bool, BindVis)> = None;
+        for ns in [true, false] {
+            let found = match pd.kind {
+                DefKind::Mod => {
+                    let mut q = GlobQuery { precise: true, ..Default::default() };
+                    self.lookup_in_module_vis(pd.sub, name, ns, &mut q)
+                }
+                // a variant is as visible as its enum
+                DefKind::Enum => self.lookup_in_container(parent, name, ns).map(|d| (d, self.def_item_vis(parent))),
+                _ => None,
+            };
+            let Some((_, v)) = found else { continue };
+            if self.vis_wider(import_vis, v) {
+                failed = Some((ns, v));
+            } else {
+                any_ok = true;
+            }
+        }
+        if any_ok {
+            return None;
+        }
+        let (ns_type, bv) = failed?;
+        let n = self.syms.str(name);
+        let krate_root = self.crates[self.mods[im.module as usize].krate as usize].root_mod;
+        let crate_private = bv == Some(self.mods[krate_root as usize].normal);
+        let code = if ns_type { "E0365" } else { "E0364" };
+        Some(if crate_private {
+            format!("{code}: `{n}` is only public within the crate, and cannot be re-exported outside")
+        } else {
+            format!("{code}: `{n}` is private, and cannot be re-exported")
+        })
     }
 }

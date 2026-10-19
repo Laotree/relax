@@ -429,6 +429,8 @@ pub struct Fcx<'a> {
     keep_literal_vars: bool,
     /// default binding mode while checking a pattern: 0 move, 1 ref, 2 ref mut
     bind_mode: u8,
+    /// nesting of check_pat (0: a pattern's root, where its bindings are checked as a set)
+    pat_depth: u32,
     /// a path pattern's resolution, made before its adjust mode is chosen (rustc pat.rs
     /// resolve_pat_path / calc_adjust_mode): (the resolution, its type)
     pat_path_pre: Option<(Res, TyId)>,
@@ -679,6 +681,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         cast_checks: Vec::new(),
         pat_nest: 0,
         bind_mode: 0,
+        pat_depth: 0,
         pat_path_pre: None,
         extra_arg: None,
         pending_captures: Vec::new(),
@@ -763,6 +766,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.scopes.push((s, li));
         pi = 1;
     }
+    let param_pats: Vec<PatId> = ast.list(fsig.params).iter().map(|p| p.pat).collect();
+    fcx.check_param_names(&param_pats);
     for p in ast.list(fsig.params) {
         let t = if pi < params.len() { params[pi] } else { fcx.tcx.tys.error };
         fcx.check_pat(p.pat, t);
@@ -1960,6 +1965,10 @@ impl<'a> Fcx<'a> {
     }
 
     fn check_pat_nested(&mut self, p: PatId, expected: TyId) {
+        if self.pat_depth == 0 {
+            self.pat_bindings(p, true);
+        }
+        self.pat_depth += 1;
         let ast = self.ast();
         // the pattern's type is the matched value's (lowering peels pat_derefs itself)
         let pi = self.b.pat_ix(p);
@@ -2037,6 +2046,96 @@ impl<'a> Fcx<'a> {
             }
         }
         self.bind_mode = saved_mode;
+        self.pat_depth -= 1;
+    }
+
+    /// The names a pattern binds (rustc_resolve late.rs `resolve_pattern_top` / `check_consistent_bindings`):
+    /// E0416 when one alternative binds a name twice, E0408 when the alternatives of an
+    /// or-pattern bind different names. An identifier naming a unit struct / variant / const is
+    /// not a binding.
+    fn pat_bindings(&mut self, p: PatId, report: bool) -> Vec<(Sym, u32)> {
+        let ast = self.ast();
+        let mut out: Vec<(Sym, u32)> = Vec::new();
+        let mut add = |this: &mut Self, out: &mut Vec<(Sym, u32)>, more: Vec<(Sym, u32)>| {
+            for (n, pos) in more {
+                if out.iter().any(|(m, _)| *m == n) {
+                    if report {
+                        this.err(pos, format!("E0416: identifier `{}` is bound more than once in the same pattern", this.prog.syms.str(n)));
+                    }
+                } else {
+                    out.push((n, pos));
+                }
+            }
+        };
+        match ast.pat(p) {
+            Pat::Ident { name, sub, .. } => {
+                if !(sub.is_none() && self.ident_pat_is_path(p)) {
+                    out.push((self.sym(*name), name.lo));
+                }
+                if let Some(sp) = sub {
+                    let more = self.pat_bindings(*sp, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::TupleStruct(_, l) | Pat::Tuple(l) | Pat::Slice(l) => {
+                for &c in ast.list(*l) {
+                    let more = self.pat_bindings(c, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::Struct(_, fields, _) => {
+                for fp in ast.list(*fields) {
+                    let more = self.pat_bindings(fp.pat, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::Ref(_, c) | Pat::Paren(c) | Pat::Box(c) => out = self.pat_bindings(*c, report),
+            Pat::Or(alts) => {
+                let sets: Vec<Vec<(Sym, u32)>> = ast.list(*alts).iter().map(|&a| self.pat_bindings(a, report)).collect();
+                for (i, set) in sets.iter().enumerate() {
+                    for &(n, pos) in set {
+                        if !out.iter().any(|(m, _)| *m == n) {
+                            if report {
+                                if let Some((j, _)) = sets.iter().enumerate().find(|(j, other)| *j != i && !other.iter().any(|(m, _)| *m == n)) {
+                                    // reported at the alternative that lacks it, like rustc (the
+                                    // binding's own span is the label)
+                                    let _ = j;
+                                    self.err(pos, format!("E0408: variable `{}` is not bound in all patterns", self.prog.syms.str(n)));
+                                }
+                            }
+                            out.push((n, pos));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// E0415: a parameter name bound more than once in one parameter list.
+    pub(crate) fn check_param_names(&mut self, pats: &[PatId]) {
+        let mut seen: Vec<Sym> = Vec::new();
+        for &p in pats {
+            for (n, pos) in self.pat_bindings(p, false) {
+                if seen.contains(&n) {
+                    self.err(pos, format!("E0415: identifier `{}` is bound more than once in this parameter list", self.prog.syms.str(n)));
+                } else {
+                    seen.push(n);
+                }
+            }
+        }
+    }
+
+    /// 0 unit, 1 tuple, 2 struct: the shape of a struct or variant's constructor.
+    fn value_ctor_shape(&self, d: DefId) -> Option<u8> {
+        let def = self.prog.def(d);
+        let (adt, vi) = match def.kind {
+            DefKind::Struct => (d, 0),
+            DefKind::Variant => (def.parent, def.sub as usize),
+            _ => return None,
+        };
+        self.tcx.adts.get(&adt)?.variants.get(vi).map(|v| v.shape)
     }
 
     fn ident_pat_is_const(&self, p: PatId) -> bool {
@@ -2066,6 +2165,27 @@ impl<'a> Fcx<'a> {
             Pat::Wild | Pat::Rest => {}
             Pat::Ident { by_ref, mutbl, name, sub } => {
                 let s = self.sym(*name);
+                // rustc_resolve late.rs try_resolve_as_non_binding: a binding may not shadow a
+                // static, a tuple struct / variant constructor, or (written `ref x` / `mut x` /
+                // `x @ ..`, so not a path pattern) a unit struct / variant / const
+                if !self.scopes.iter().any(|(sy, _)| *sy == s) {
+                    if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
+                        let simple = sub.is_none() && !*by_ref && !*mutbl;
+                        let what = match self.prog.def(d).kind {
+                            DefKind::Static => Some("statics"),
+                            DefKind::Const | DefKind::AssocConst if !simple => Some("constants"),
+                            DefKind::Struct | DefKind::Variant => match self.value_ctor_shape(d) {
+                                Some(1) => Some(if self.prog.def(d).kind == DefKind::Struct { "tuple structs" } else { "tuple variants" }),
+                                Some(0) if !simple => Some(if self.prog.def(d).kind == DefKind::Struct { "unit structs" } else { "unit variants" }),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(what) = what {
+                            self.err(name.lo, format!("E0530: bindings cannot shadow {what}"));
+                        }
+                    }
+                }
                 // a unit struct / unit variant / const in scope is a path pattern, not a binding
                 if sub.is_none() && !*by_ref && !*mutbl {
                     if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
@@ -5810,6 +5930,8 @@ impl<'a> Fcx<'a> {
         self.closure_depth.push((e.0, saved));
         let save_async = std::mem::take(&mut self.async_depth);
         let save_awaits = std::mem::take(&mut self.await_count);
+        let closure_pats: Vec<PatId> = params.iter().map(|p| p.pat).collect();
+        self.check_param_names(&closure_pats);
         for (p, t) in params.iter().zip(self.tcx.tys.list(ps).iter().copied()) {
             self.check_pat(p.pat, t);
         }

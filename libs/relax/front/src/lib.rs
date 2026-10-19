@@ -52,6 +52,7 @@ fn zone_reset_fresh_process() {
 }
 
 pub mod lit;
+pub mod builtin_attrs;
 pub mod parser;
 pub mod program;
 pub mod def_collector;
