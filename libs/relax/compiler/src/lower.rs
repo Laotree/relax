@@ -470,7 +470,7 @@ impl<'a> Lcx<'a> {
     }
 
     fn relax_only_instance(&self, t: TyId) -> bool {
-        !self.u.provided_shared.contains(&t)
+        !self.u.provided_shared_contains(t)
     }
 
     /// An opaque provided enum (provided.rs; rustc's layout, no tag known to Relax) cannot be

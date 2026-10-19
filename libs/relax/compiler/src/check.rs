@@ -108,6 +108,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     let mut own = vec![false; u.prog.crates.len()];
     for &k in crates {
         own[k as usize] = true;
+        u.prog.crates[k as usize].validate = true;
     }
     // every checked definition's signature, on MAKEPAD_RUN_JOBS threads (queries over the shared
     // context); errors in definition order
@@ -124,6 +125,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         }
     }
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
+    errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
@@ -520,7 +522,8 @@ fn is_internal(u: &Unit, own: &[bool], e: &str) -> bool {
         return true;
     }
     let rest = rest.trim_start();
-    let coded = rest.len() > 5 && rest.starts_with('E') && rest[1..5].bytes().all(|b| b.is_ascii_digit());
+    // (an error rustc words without a code: Program::record_uncoded_error)
+    let coded = rest.starts_with(relax_front::diagnostics::UNCODED_PREFIX) || (rest.len() > 5 && rest.starts_with('E') && rest[1..5].bytes().all(|b| b.is_ascii_digit()));
     if !coded {
         return true;
     }

@@ -318,6 +318,41 @@ impl std::ops::DerefMut for CacheCell {
     fn deref_mut(&mut self) -> &mut Cache { unsafe { &mut *self.get() } }
 }
 
+/// The install-time inputs of a code entry that cannot be recovered later (`Cache::defer_record`).
+pub(crate) struct PendingRecord {
+    id: u32,
+    code: Vec<u8>,
+    relocs: Vec<RelocAt>,
+    pc_map: Vec<(u32, u64)>,
+    nounwind: Vec<(u32, bool)>,
+    baseline: bool,
+    deps: Vec<u32>,
+    /// jit::patch_epoch() at the install: a record is encoded only against the sources it was built from
+    epoch: u64,
+}
+
+/// Is a deferred record still describing the sources its code was built from?
+fn pending_current(u: &Unit, p: &PendingRecord) -> bool {
+    let f = &u.fns[p.id as usize];
+    p.epoch == crate::jit::patch_epoch() && f.patch_gen == 0 && !u.prog.is_edit_version(f.file)
+}
+
+/// The slots whose RIR the code of `id` took in (`Unit::body_deps` from `id` and `extra`,
+/// transitively), without `id` itself.
+fn record_deps(u: &Unit, id: u32, extra: &[u32]) -> Vec<u32> {
+    let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&id).into_iter().flatten().copied()).collect();
+    let mut deps = Vec::new();
+    if stack.is_empty() { return deps; }
+    let mut seen = HashSet::new();
+    seen.insert(id);
+    while let Some(c) = stack.pop() {
+        if !seen.insert(c) || c as usize >= u.fns.len() { continue; }
+        if let Some(v) = u.body_deps.get(&c) { stack.extend(v.iter().copied()); }
+        deps.push(c);
+    }
+    deps
+}
+
 pub struct Cache {
     pub mode: Mode,
     verbose: bool,
@@ -365,6 +400,9 @@ pub struct Cache {
     /// payload bytes in `pending` (spill_take: written out during the run past a threshold)
     pending_bytes: usize,
     pending_keys: HashSet<u128>,
+    /// Exit refuses new key queries (slot_key); a deferred record's keys are still wanted while
+    /// the exit drains them (record_pending sets this for its own encoding)
+    recording_pending: bool,
     /// front images (crate, key) reserved this run: an image is local to its crate's store
     front_reserved: HashSet<(u32, u128)>,
     /// link name -> canonical foreign declaration (canon_foreign; built on first use)
@@ -625,6 +663,7 @@ impl Cache {
             pending: Vec::new(),
             pending_bytes: 0,
             pending_keys: HashSet::new(),
+            recording_pending: false,
             front_reserved: HashSet::new(),
             foreign_canon: None,
             def_maps: HashMap::new(),
@@ -1687,7 +1726,7 @@ impl Cache {
         // The exit manifest uses only identities already encoded by a lookup/record.
         // enc_fnkey -> enc_ty -> capture_query can type-check a closure's owner and
         // lazily parse/lower its body, after the exiting thread's TLS is gone.
-        if crate::preempt::is_stopped() { return None; }
+        if crate::preempt::is_stopped() && !self.recording_pending { return None; }
         let key = u.fns[id as usize].key.clone();
         let mut e = E::default();
         let mut cr = Vec::new();
@@ -1721,7 +1760,7 @@ impl Cache {
         }
         // build_image also comes here: no capture queries or body digests at exit.
         // Leave an unknown key for the next run's ordinary lookup / mid-run write.
-        if crate::preempt::is_stopped() { return None; }
+        if crate::preempt::is_stopped() && !self.recording_pending { return None; }
         let outer = std::mem::replace(&mut self.key_waits, false);
         let k = self.slot_key_uncached(u, id);
         if !self.key_waits {
@@ -2094,7 +2133,41 @@ impl Cache {
     /// Records slot `id`'s freshly compiled O1 code (on the owner thread).
     /// `code` is the backend's output (relocated fields zeroed), `relocs` its relocations.
     pub fn record(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) {
-        self.record_entry(u, id, code, relocs, pc_map, None, false)
+        self.record_entry(u, id, code, relocs, pc_map, None, false, None)
+    }
+
+    /// What the install of slot `id` leaves for its entry's encoding later (the main thread's
+    /// installs before the first present: key and certificate encoding is the cost). The code is
+    /// the backend's unrelocated output, which installing patches in place; the nounwind inputs,
+    /// the tier and the dependency slots can change or be reclaimed before the encoding runs.
+    /// None: `record` would store nothing.
+    pub(crate) fn defer_record(&self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)]) -> Option<PendingRecord> {
+        if self.mode == Mode::ReadOnly || u.fns[id as usize].patch_gen != 0 || self.linked.contains(&id) {
+            return None;
+        }
+        let rir = u.fns[id as usize].rir.as_ref();
+        Some(PendingRecord {
+            id,
+            code: code.to_vec(),
+            relocs: relocs.to_vec(),
+            pc_map: pc_map.to_vec(),
+            nounwind: rir.map_or_else(Vec::new, |r| r.nounwind_inputs.clone()),
+            baseline: rir.is_some_and(|r| r.baseline),
+            deps: record_deps(u, id, &[]),
+            epoch: crate::jit::patch_epoch(),
+        })
+    }
+
+    /// Encodes a deferred record: `record`, from the install-time inputs.
+    pub(crate) fn record_pending(&mut self, u: &Unit, p: &PendingRecord) {
+        if !pending_current(u, p) {
+            // a source changed (or the slot was patched) since the install: its key would name
+            // the new text for old code. A lost entry is harmless; a stale one is not.
+            return;
+        }
+        let previous = std::mem::replace(&mut self.recording_pending, true);
+        self.record_entry(u, p.id, &p.code, &p.relocs, &p.pc_map, None, false, Some(p));
+        self.recording_pending = previous;
     }
 
     /// Records the O2 code of slot `id` (the O2 worker's full build: a `#[relax(O2)]` slot, or a
@@ -2105,7 +2178,7 @@ impl Cache {
         // The O2 worker can finish after O3 installed (or linked from the cache). Never
         // downgrade its entry, even when that O3 build itself was too large to cache.
         if u.fns[id as usize].o3.load(std::sync::atomic::Ordering::Relaxed) { return; }
-        self.record_entry(u, id, code, relocs, pc_map, None, true)
+        self.record_entry(u, id, code, relocs, pc_map, None, true, None)
     }
 
     /// Records installed O3 code (marked or hot) as the slot's ordinary entry (its O1 key,
@@ -2114,11 +2187,11 @@ impl Cache {
     /// from the first call (jit.rs keeps it out). Like O2, it rewrites the startup image and
     /// buffers the entry for the monitor's spill / exit flush; no store write on this thread.
     pub fn record_o3(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], inlined: &[u32], nounwind: &[(u32, bool)]) {
-        self.record_entry(u, id, code, relocs, pc_map, Some((inlined, nounwind)), false)
+        self.record_entry(u, id, code, relocs, pc_map, Some((inlined, nounwind)), false, None)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool) {
+    fn record_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool, pending: Option<&PendingRecord>) {
         let _mem = crate::memstat::tag(crate::memstat::Tag::CacheStore);
         // O3 and O2 code replace the slot's entry; O1 code is recorded once
         let replace = o3.is_some() || o2;
@@ -2148,7 +2221,7 @@ impl Cache {
             trace_lookup(u, id, "norecord:exists");
             return;
         }
-        let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, o2) else {
+        let Some(payload) = self.encode_entry(u, id, code, relocs, pc_map, o3, o2, pending) else {
             let w = self.last_why;
             trace_lookup(u, id, &format!("norecord:encode:{}", w));
             if o3.is_none() {
@@ -2189,34 +2262,25 @@ impl Cache {
         Some(e.0)
     }
 
-    /// The dependency certificate of slot `id`'s code: every slot whose RIR it took in
-    /// (Unit::body_deps from `id` and `extra`, transitively), by its key encoding with its key
+    /// The dependency certificate of a code: every slot of `deps` (`record_deps`: the slots whose
+    /// RIR it took in), by its key encoding with its key
     /// now. The entry links only while each still has that key (its body, position and
     /// interface unchanged). None: one has no key (the entry cannot be stored).
-    fn cert_bytes(&mut self, u: &Unit, id: u32, extra: &[u32]) -> Option<Vec<u8>> {
+    fn cert_bytes(&mut self, u: &Unit, deps: &[u32]) -> Option<Vec<u8>> {
         let t0 = crate::jit::cpu_ns();
-        let r = self.cert_bytes_inner(u, id, extra);
+        let r = self.cert_bytes_inner(u, deps);
         self.stats.cert_write_ns += crate::jit::cpu_ns() - t0;
         r
     }
 
-    fn cert_bytes_inner(&mut self, u: &Unit, id: u32, extra: &[u32]) -> Option<Vec<u8>> {
-        let mut seen: HashSet<u32> = HashSet::new();
-        seen.insert(id);
-        let mut stack: Vec<u32> = extra.iter().copied().chain(u.body_deps.get(&id).into_iter().flatten().copied()).collect();
+    fn cert_bytes_inner(&mut self, u: &Unit, deps: &[u32]) -> Option<Vec<u8>> {
         let mut items: Vec<(Vec<u8>, u128)> = Vec::new();
         let mut crates: Vec<u32> = Vec::new();
-        while let Some(c) = stack.pop() {
-            if !seen.insert(c) || c as usize >= u.fns.len() {
-                continue;
-            }
+        for &c in deps {
             // A new caller can inline an edited body without itself being a patch. Its
             // cached/memoized key must not certify code built from that live file version.
             let f = &u.fns[c as usize];
             if f.patch_gen != 0 || u.prog.is_edit_version(f.file) { return None; }
-            if let Some(v) = u.body_deps.get(&c) {
-                stack.extend(v.iter().copied());
-            }
             let b = self.slot_bytes(u, c)?;
             let k = self.slot_key(u, c)?;
             crates.extend(self.slot_crates.get(&c).into_iter().flatten().copied());
@@ -2258,7 +2322,7 @@ impl Cache {
     /// The payload of a code entry (O1, or O3 with its inlined slots);
     /// None: it cannot be stored (`last_why` says why).
     #[allow(clippy::too_many_arguments)]
-    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool) -> Option<Vec<u8>> {
+    fn encode_entry(&mut self, u: &Unit, id: u32, code: &[u8], relocs: &[RelocAt], pc_map: &[(u32, u64)], o3: Option<(&[u32], &[(u32, bool)])>, o2: bool, pending: Option<&PendingRecord>) -> Option<Vec<u8>> {
         // unlinked code only: a pool word must still be zero (linked code holds this run's values)
         for rl in relocs {
             let o = rl.at as usize;
@@ -2286,7 +2350,10 @@ impl Cache {
         e.u32(ENTRY_VERSION);
         e.str(&u.fns[id as usize].name);
         // the code's level (TIER_O1 / TIER_O3 / TIER_O2 / TIER_BASE); O3: the inlined slots (by key)
-        let base = o3.is_none() && !o2 && u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline);
+        let base = o3.is_none() && !o2 && match pending {
+            Some(p) => p.baseline,
+            None => u.fns[id as usize].rir.as_ref().is_some_and(|r| r.baseline),
+        };
         e.u8(if o3.is_some() { TIER_O3 } else if o2 { TIER_O2 } else if base { TIER_BASE } else { TIER_O1 });
         let inl = o3.map_or(&[][..], |t| t.0);
         e.u32(inl.len() as u32);
@@ -2302,9 +2369,10 @@ impl Cache {
         }
         // its nounwind inputs: stable keys replace session slots; false answers are included
         // so absence/recursion cannot become an implicit input
-        let facts = match o3 {
-            Some(t) => t.1,
-            None => u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice()),
+        let facts = match (pending, o3) {
+            (Some(p), _) => p.nounwind.as_slice(),
+            (_, Some(t)) => t.1,
+            _ => u.fns[id as usize].rir.as_ref().map_or(&[][..], |r| r.nounwind_inputs.as_slice()),
         };
         e.0.extend_from_slice(&self.nounwind_bytes(u, facts)?);
         // the slots whose RIR this code took in, with their keys (link_entry checks them)
@@ -2313,7 +2381,15 @@ impl Cache {
             None => Vec::new(),
         };
         // the slots whose RIR this code took in, with their keys (link_entry checks them)
-        let Some(cert) = self.cert_bytes(u, id, &extra) else {
+        let deps;
+        let deps = match pending {
+            Some(p) => &p.deps,
+            None => {
+                deps = record_deps(u, id, &extra);
+                &deps
+            }
+        };
+        let Some(cert) = self.cert_bytes(u, deps) else {
             self.stats.unencodable += 1;
             self.why("dependency key");
             return None;

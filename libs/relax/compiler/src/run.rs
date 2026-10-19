@@ -1844,6 +1844,7 @@ fn try_settle(compiled: u64, drops: &mut jit::SettleDrops, trim: bool) -> bool {
         drops.rir += completed.rir;
         drops.typeck += completed.typeck;
         let drops = std::mem::take(drops);
+        unsafe { (&mut *up).flush_cache_records() };
         let retired = unsafe { jit::retire_type_side(up) };
         let u = unsafe { &mut *up };
         jit::zone_scan::settle_check(u);
@@ -2544,6 +2545,7 @@ fn mid_flush(quiet: bool, wait: bool) -> Option<(usize, usize)> {
     let held = Instant::now();
     let spill = {
         let u = unsafe { &mut *up };
+        u.flush_cache_records();
         // the startup manifest, once its window has closed (first present + 5 s after main):
         // what the exit recorded before, so a killed or force-quit app starts warm too; the exit
         // writes it again only if O2 code replaced startup code since (record_manifest)
@@ -2719,6 +2721,7 @@ fn summary_inner(why: &str) {
         // the disk cache: this run's new entries become a pack (on the owner thread: no compiles)
         if why != "stats" {
             let u = unsafe { &mut *up };
+            u.flush_cache_records();
             let (order, present) = jit::manifest_order(std::mem::take(&mut u.start_order), jit::ORDER_PRESENT_LEN.load(Ordering::Relaxed));
             let mut cache = u.cache.take();
             if let Some(c) = cache.as_mut() {

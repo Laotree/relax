@@ -103,9 +103,10 @@ static MATCHED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 pub fn check_sources(pkgs: &[crate::srchash::SrcPkg]) -> Result<(), String> {
     let reg: Vec<_> = REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|p| (p.name.clone(), p.source, p.manifest)).collect();
     let mut verified = Vec::new();
+    let mut files = std::collections::HashMap::new();
     for (name, source, manifest) in &reg {
         for (root, _) in pkgs.iter().enumerate().filter(|(_, k)| k.name.replace('-', "_") == *name) {
-            let current = crate::srchash::closure_manifest(pkgs, root);
+            let current = crate::srchash::closure_manifest_with(pkgs, root, &mut files);
             if crate::srchash::manifest_hash(&current) != *source {
                 let built = crate::srchash::decode_manifest(manifest)?;
                 return Err(crate::srchash::diff_message(name, &built, &current));

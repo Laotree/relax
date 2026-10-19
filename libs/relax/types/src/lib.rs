@@ -49,6 +49,8 @@ pub mod const_fold;
 pub mod borrowck;
 pub mod lint;
 pub mod item_checks;
+pub mod transmute;
+pub mod wfcheck;
 pub mod unsafety;
 pub mod pattern_analysis;
 pub mod stable;

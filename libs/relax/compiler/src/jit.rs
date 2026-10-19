@@ -334,8 +334,9 @@ pub struct Unit {
     pub provided: Vec<(u32, crate::provided::ProvidedCrate)>,
     /// their opaque types: drop shim address (0: no drop)
     pub provided_types: HashMap<DefId, u64>,
-    /// types whose values cross the provided-crate boundary (provided::crossing_types)
-    pub provided_shared: std::collections::HashSet<TyId>,
+    /// types whose values cross the provided-crate boundary (provided::crossing_types): worked out
+    /// on the first query (`provided_shared`), which only a provided-crate misuse makes
+    provided_shared: std::sync::OnceLock<std::collections::HashSet<TyId>>,
     pub lay: crate::layout::Layouts,
     /// slots: created on any thread (fn_id from lowering), build state changed on the owner thread
     pub fns: crate::conc::AppendVec<FnEntry>,
@@ -372,6 +373,12 @@ pub struct Unit {
     pub syms: crate::syms::Syms,
     /// the disk cache of compiled code (cache.rs; MAKEPAD_RUN_CACHE)
     pub cache: Option<Box<crate::cache::CacheCell>>,
+    /// The main thread's installs before the first present, whose cache entries are encoded
+    /// after it (Cache::defer_record), in install order; `pending_cache_cursor` is the next
+    /// one to encode. Whatever reads or replaces the cache's entries, or changes the sources
+    /// the keys come from, drains them first (flush_cache_records).
+    pending_cache_records: Vec<Option<crate::cache::PendingRecord>>,
+    pending_cache_cursor: usize,
     /// slots installed in the first seconds after main, in order (the disk cache's startup
     /// manifest for the next run)
     pub start_order: Vec<u32>,
@@ -2263,22 +2270,6 @@ impl Unit {
         let provided = crate::zone_alloc::kept_with(|| crate::provided::take_for(&prog));
         let (provided_types, opaque_layouts, check_layouts) = provided_type_tables(&prog, &provided);
         let provided_types = crate::zone_alloc::kept_clone(&provided_types);
-        let provided_shared = {
-            let ks: Vec<u32> = provided.iter().map(|(k, _)| *k).collect();
-            if ks.is_empty() {
-                Default::default()
-            } else {
-                let pt = &provided_types;
-                crate::provided::crossing_types(&prog, &tcx, &ks, &|d| {
-                    let k = prog.def(d).krate;
-                    crate::provided::unbound_reason(&prog, &tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
-                        let key = crate::provided::key(&prog, &tcx, d);
-                        provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
-                    }
-                })
-            }
-        };
-        let provided_shared = crate::zone_alloc::kept_clone(&provided_shared);
         let slots = crate::zone_alloc::kept_with(|| {
             if no_codegen {
                 Box::new(crate::rir::SlotTable::new(NC_STRIDE as u64, NC_STRIDE as u64, 8, TIER_REC as u64))
@@ -2300,7 +2291,7 @@ impl Unit {
         let unit = Unit {
             prog,
             tcx,
-            provided_shared,
+            provided_shared: std::sync::OnceLock::new(),
             provided,
             provided_types,
             lay: { let mut l = crate::layout::Layouts::new(); l.opaque = opaque_layouts; l },
@@ -2321,6 +2312,8 @@ impl Unit {
             rs: RtSyms { fmt_str: crate::rir::Sym::new(0), fmt_int: crate::rir::Sym::new(0), fmt_float: crate::rir::Sym::new(0), fmt_print: crate::rir::Sym::new(0), panic_site: crate::rir::Sym::new(0), panic_bounds: crate::rir::Sym::new(0), str_eq: crate::rir::Sym::new(0), fmod: crate::rir::Sym::new(0), fmodf: crate::rir::Sym::new(0), panic_impl: crate::rir::Sym::new(0), thread_run: crate::rir::Sym::new(0), catch_panic: crate::rir::Sym::new(0), args: crate::rir::Sym::new(0), memcpy: crate::rir::Sym::new(0), memmove: crate::rir::Sym::new(0), memset: crate::rir::Sym::new(0), fmt_push: crate::rir::Sym::new(0), fmt_pop: crate::rir::Sym::new(0), resume: crate::rir::Sym::new(0), land: crate::rir::Sym::new(0), panicking: crate::rir::Sym::new(0), rethrow: crate::rir::Sym::new(0) },
             syms: crate::syms::Syms::new(syms_base, rw_base),
             cache: None,
+            pending_cache_records: Vec::new(),
+            pending_cache_cursor: 0,
             start_order: Vec::new(),
             rt: Rt { fmt_str: 0, fmt_int: 0, fmt_float: 0, fmt_print: 0, panic_site: 0, panic_bounds: 0, str_eq: 0, fmod: 0, fmodf: 0, panic_impl: 0, thread_run: 0, catch_panic: 0, args: 0, memcpy: 0, memmove: 0, memset: 0, fmt_push: 0, fmt_pop: 0, resume: 0, land: 0, panicking: 0, rethrow: 0 },
             bodies: Default::default(),
@@ -2529,6 +2522,35 @@ impl Unit {
         ensure_altstack();
         os::fault::install();
         u
+    }
+
+    /// The types of the provided crates `ks` whose values cross the boundary (provided::crossing_types).
+    fn crossing_of(&self, ks: &[u32]) -> std::collections::HashSet<TyId> {
+        let pt = &self.provided_types;
+        let provided = &self.provided;
+        crate::provided::crossing_types(&self.prog, &self.tcx, ks, &|d| {
+            let k = self.prog.def(d).krate;
+            crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
+                let key = crate::provided::key(&self.prog, &self.tcx, d);
+                provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
+            }
+        })
+    }
+
+    /// The worked-out set of crossing types, if a query made it (the zone scan reads it).
+    pub(crate) fn provided_shared_set(&self) -> Option<&std::collections::HashSet<TyId>> {
+        self.provided_shared.get()
+    }
+
+    /// Does a value of type `t` cross the provided-crate boundary? Worked out for every provided
+    /// crate on the first call: boot needs it for nothing (a misuse of a provided type asks).
+    pub(crate) fn provided_shared_contains(&self, t: TyId) -> bool {
+        self.provided_shared.get_or_init(|| {
+            let ks: Vec<u32> = self.provided.iter().map(|(k, _)| *k).collect();
+            if ks.is_empty() { return Default::default(); }
+            let shared = self.crossing_of(&ks);
+            crate::zone_alloc::kept_clone(&shared)
+        }).contains(&t)
     }
 
     /// Whether `code` would link anywhere in the code area (O3 checks before installing).
@@ -5138,6 +5160,33 @@ unsafe fn compile_slot_locked(up: *mut Unit, id: u32, outer: bool) -> Compiled {
     })
 }
 
+impl Unit {
+    /// Encodes every deferred cache record (owner thread).
+    pub(crate) fn flush_cache_records(&mut self) {
+        self.record_cache_batch(usize::MAX);
+    }
+
+    /// Encodes up to `count` deferred cache records, in install order (owner thread). True: more are left.
+    fn record_cache_batch(&mut self, count: usize) -> bool {
+        if self.pending_cache_records.is_empty() { return false; }
+        let Some(mut cache) = self.cache.take() else { return false };
+        let end = self.pending_cache_cursor.saturating_add(count).min(self.pending_cache_records.len());
+        while self.pending_cache_cursor < end {
+            let record = self.pending_cache_records[self.pending_cache_cursor].take().unwrap();
+            self.pending_cache_cursor += 1;
+            cache.record_pending(self, &record);
+        }
+        self.cache = Some(cache);
+        if self.pending_cache_cursor == self.pending_cache_records.len() {
+            self.pending_cache_records = Vec::new();
+            self.pending_cache_cursor = 0;
+            false
+        } else {
+            true
+        }
+    }
+}
+
 /// Installs a slot's compiled code (on the owner thread): perf map, O3 counter, and the
 /// speculative builds of its callees.
 /// Links and installs a slot's code (`relocs` are the code's own; `record`: the disk cache
@@ -5169,8 +5218,16 @@ unsafe fn install_compiled(up: *mut Unit, id: u32, code: &[u8], map: Vec<(u32, u
             let u = &mut *up;
             if record {
                 if let Some(mut c) = u.cache.take() {
-                    c.record(u, id, code, relocs, &map);
+                    // before the first present the main thread waits for this install: its
+                    // entry (slot keys, dependency certificate) is encoded after the present
+                    let deferred = if startup_phase() && !FIRST_PRESENT.load(Ordering::Acquire) && owner::for_main() {
+                        c.defer_record(u, id, code, relocs, &map)
+                    } else {
+                        c.record(u, id, code, relocs, &map);
+                        None
+                    };
                     u.cache = Some(c);
+                    if let Some(p) = deferred { u.pending_cache_records.push(Some(p)); }
                 }
             }
             let u = &mut *up;
@@ -9189,6 +9246,7 @@ impl Drop for Unit {
 pub unsafe fn retire_unit(up: *mut Unit) {
     pause_compile_jobs(false);
     owner::call(owner::Class::App, || {
+        (&mut *up).flush_cache_records();
         (&mut *up).retired = true;
         if SPEC_UNIT.load(Ordering::Acquire) == up {
             SPEC_UNIT.store(std::ptr::null_mut(), Ordering::Release);
@@ -10992,6 +11050,17 @@ pub fn startup_main(runtime: &crate::options::RuntimeOptions) {
         STARTUP_PHASE.store(2, Ordering::Release);
         SPEC_WAKE.notify_all();
         set_worker();
+        // the cache entries of the installs made before the present, in batches that give way
+        // to the program's own requests (Background); nothing of the unit is kept in between
+        loop {
+            let _job = compile_job();
+            let more = owner::call(owner::Class::Background, || {
+                let up = SPEC_UNIT.load(Ordering::Acquire);
+                !SPEC_STOP.load(Ordering::SeqCst) && !up.is_null() && unsafe { (&mut *up).record_cache_batch(256) }
+            });
+            if !more { break; }
+            std::thread::yield_now();
+        }
         let roots = std::mem::take(&mut *STARTUP_ROOTS.lock().unwrap());
         let cached = std::mem::take(&mut *STARTUP_CACHED.lock().unwrap());
         for (unit, id, depth) in roots {
@@ -11080,6 +11149,11 @@ pub fn close_patch() {
     if PATCH_OPEN.swap(false, Ordering::SeqCst) {
         bump_patch_epoch();
     }
+}
+
+/// The patch epoch: moves on every live edit, rollback and reload (a source text changed).
+pub(crate) fn patch_epoch() -> u64 {
+    PATCH_EPOCH.load(Ordering::SeqCst)
 }
 
 pub fn bump_patch_epoch() {
@@ -14401,18 +14475,12 @@ impl Unit {
                 crate::zone_alloc::kept_with(|| self.provided_types.insert(d, 0));
             }
         }
-        let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
-        let shared = {
-            let pt = &self.provided_types;
-            let provided = &self.provided;
-            crate::provided::crossing_types(&self.prog, &self.tcx, &ks, &|d| {
-                let k = self.prog.def(d).krate;
-                crate::provided::unbound_reason(&self.prog, &self.tcx, k, d, &|a| pt.contains_key(&a)).is_none() && {
-                    let key = crate::provided::key(&self.prog, &self.tcx, d);
-                    provided.iter().any(|(pk, pc)| *pk == k && pc.shims.contains_key(key.as_str()))
-                }
-            })
-        };
-        crate::zone_alloc::kept_with(|| self.provided_shared.extend(shared));
+        // a set worked out already also covers the added crates; one not yet worked out will
+        if let Some(mut set) = self.provided_shared.take() {
+            let ks: Vec<u32> = added.iter().map(|(k, _)| *k).collect();
+            let shared = self.crossing_of(&ks);
+            crate::zone_alloc::kept_with(|| set.extend(shared));
+            let _ = self.provided_shared.set(set);
+        }
     }
 }

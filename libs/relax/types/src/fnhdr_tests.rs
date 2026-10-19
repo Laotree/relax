@@ -86,7 +86,7 @@ fn check(source: &str, reject: bool) {
     let body = crate::typeck::instantiate_body(&cx, &prog, &tcx, named(&prog, "probe"), &[]);
     assert_eq!(!body.errors.is_empty(), reject, "{:?}", body.errors);
     if reject {
-        assert!(body.errors.iter().any(|e| e.contains("mismatched types") || e.contains("E0061")), "{:?}", body.errors);
+        assert!(body.errors.iter().any(|e| e.contains("mismatched types") || e.contains("E0061") || e.contains("E0605")), "{:?}", body.errors);
     }
 }
 

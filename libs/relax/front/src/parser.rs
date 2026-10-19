@@ -1515,13 +1515,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let abi = self.abi()?;
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items, unsafe_: 0 }))
             }
             T::KwUnsafe if self.nth(1) == T::KwExtern && (self.nth(2) == T::OpenBrace || (is_str(self.nth(2)) && self.nth(3) == T::OpenBrace)) => {
                 self.pos += 2;
                 let abi = self.abi()?;
                 let items = self.foreign_items(abi)?;
-                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items }))
+                ItemKind::ForeignMod(self.ast.push_row(ForeignModItem { abi, items, unsafe_: 1 }))
             }
             T::KwFn | T::KwConst | T::KwAsync | T::KwUnsafe | T::KwExtern
                 if self.fn_ahead() =>
@@ -1805,19 +1805,39 @@ impl<'a> Parser<'a> {
         let mut asyncness = false;
         let mut unsafe_ = false;
         let mut abi = None;
+        // rustc parse_fn_front_matter: `const`? `async`? (`unsafe` | `safe`)? (`extern` ABI?)? `fn`,
+        // in that order; `stage` is the last qualifier read (1 const, 2 async, 3 safety, 4 extern)
+        let mut stage = 0;
         loop {
-            match self.kind() {
-                T::KwConst => konst = true,
-                T::KwAsync => asyncness = true,
-                T::KwUnsafe => unsafe_ = true,
-                T::Ident if self.is_word(0, b"safe") => {}
-                T::KwExtern => {
+            let this = match self.kind() {
+                T::KwConst => 1,
+                T::KwAsync => 2,
+                T::KwUnsafe => 3,
+                T::Ident if self.is_word(0, b"safe") => 3,
+                T::KwExtern => 4,
+                T::KwFn => break,
+                _ => return self.err("expected fn"),
+            };
+            if this <= stage {
+                let found = match this { 1 => "const", 2 => "async", 3 => if self.kind() == T::KwUnsafe { "unsafe" } else { "safe" }, _ => "extern" };
+                let expected: &str = match stage {
+                    1 => "one of `async`, `extern`, `fn`, `safe`, or `unsafe`",
+                    2 => "one of `extern`, `fn`, `safe`, or `unsafe`",
+                    3 => "one of `extern` or `fn`",
+                    _ => "`fn`",
+                };
+                return self.err(&format!("expected {}, found keyword `{}`", expected, found));
+            }
+            stage = this;
+            match this {
+                1 => konst = true,
+                2 => asyncness = true,
+                3 => if self.kind() == T::KwUnsafe { unsafe_ = true },
+                _ => {
                     self.pos += 1;
                     abi = Some(self.abi()?);
                     continue;
                 }
-                T::KwFn => break,
-                _ => return self.err("expected fn"),
             }
             self.pos += 1;
         }

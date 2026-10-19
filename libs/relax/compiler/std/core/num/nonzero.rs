@@ -82,6 +82,7 @@ impl<T: ZeroablePrimitive> NonZero<T> {
     }
 }
 
+impl<T> crate::marker::StructuralPartialEq for NonZero<T> where T: ZeroablePrimitive + crate::marker::StructuralPartialEq {}
 impl<T: ZeroablePrimitive> PartialEq for NonZero<T> {
     fn eq(&self, other: &NonZero<T>) -> bool {
         self.0 == other.0
