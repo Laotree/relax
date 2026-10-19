@@ -1789,6 +1789,9 @@ impl<'a> Fcx<'a> {
         for pending in std::mem::take(&mut self.pending_captures) {
             crate::upvar::analyze(&self.cx.with_infcx(&self.infcx), self.prog, self.tcx, &mut self.b, &pending);
             let ce = pending.closure;
+            // rustc check_closure: a kind deduced from the expected bound IS the closure's kind (its
+            // `closure_kind_ty` is that type, not an inference variable); upvar analysis only infers it otherwise.
+            if let (Some(kind), Some(result)) = (self.expected_closure_kinds.get(&ce).copied(), self.b.min_captures.get_mut(&ce)) { if result.errors.is_empty() { result.kind = kind; } }
             let result = &self.b.min_captures[&ce];
             if !result.errors.is_empty() {
                 let errors = result.errors.clone();
