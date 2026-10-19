@@ -503,6 +503,19 @@ impl Layouts {
             }
             return &e.layout;
         }
+        // a type whose layout needs itself (`struct Foo<T: A>(T::Assoc)` with `Assoc = Foo<()>`): rustc's
+        // layout query cycle, E0391, not unbounded recursion
+        let _cycle = match crate::cycle::enter(crate::cycle::Kind::Layout, t.0, 2) {
+            Ok(g) => g,
+            Err(()) => {
+                if let TyKind::Adt(d, ..) = tcx.tys.kind(t) {
+                    let def = lcx.prog.def(*d);
+                    tcx.dcx.report(crate::next_solver::fulfill::ObligationCause { body_id: *d, span: lcx.prog.files[def.file as usize].ast.item(def.item).lo },
+                        format!("E0391: cycle detected when computing layout of `{}`", lcx.prog.def_path(*d)));
+                }
+                return Box::leak(Box::new(plain(0, 1, None)));
+            }
+        };
         let saved = lcx.overflowed.get();
         lcx.overflowed.set(false);
         let m0 = lcx.missing.borrow().len();
