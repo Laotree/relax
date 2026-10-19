@@ -50,7 +50,10 @@ static REPORT_PATH: relax_session::sync::Mutex<String> = relax_session::sync::Mu
 static ROOT_DIR: relax_session::sync::Mutex<String> = relax_session::sync::Mutex::new(String::new());
 
 fn phase(name: &str, t: Instant) {
-    let ms = t.elapsed().as_secs_f64() * 1e3;
+    phase_ms(name, t.elapsed().as_secs_f64() * 1e3);
+}
+
+fn phase_ms(name: &str, ms: f64) {
     if !SILENT.load(Ordering::Relaxed) {
         verbose!("makepad-run: {:<28} {:>9.1} ms   (t={:.0} ms)", name, ms, crate::clock::ms_since_start());
     }
@@ -251,7 +254,6 @@ pub(crate) fn resolve_package(
         HAL_RUN.store(!MAIN_HOST.get().expect("run host").domain_zero, Ordering::Release);
     }
     // provided crates bind only to their own source (before substitution rewrites deps)
-    let ts = Instant::now();
     let pkgs: Vec<crate::srchash::SrcPkg> = g
         .crates
         .iter()
@@ -273,25 +275,39 @@ pub(crate) fn resolve_package(
         // The boundary audit (`check --boundary`) binds as a run does: what it reports is what
         // JIT-compiled code reaches past the bound ops.
         let machine = crate::cfg::CfgSet::machine(sess, &[]).triple();
-        if crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested()) {
-            crate::provided::check_sources(&pkgs)?;
-        } else {
-            crate::provided::read_identity_files(&pkgs);
+        let bind = crate::cfg::CfgSet::host(sess, &[]).triple() == machine && (!check_only || crate::boundary::requested());
+        if !bind { crate::provided::read_identity_files(&pkgs); }
+        // The sources are hashed while the build scripts run: they share nothing (the hash reads
+        // the provided packages, the scripts write the graph's cfgs and env).
+        if boot { phase("unit graph", t); }
+        checkpoint("build scripts")?;
+        let t_scripts = Instant::now();
+        let (sources, scripts, scripts_ms, wait_ms) = std::thread::scope(|scope| {
+            let sources = bind.then(|| scope.spawn(|| {
+                let _z = crate::zone_alloc::compiler_thread();
+                let t = Instant::now();
+                (crate::provided::check_sources(&pkgs), t.elapsed())
+            }));
+            let scripts = unitgraph::run_build_scripts(sess, &mut g, target_dir);
+            let scripts_ms = t_scripts.elapsed().as_secs_f64() * 1e3;
+            let t_wait = Instant::now();
+            (sources.map(|h| h.join().expect("provided source check")), scripts, scripts_ms, t_wait.elapsed().as_secs_f64() * 1e3)
+        });
+        if boot {
+            phase_ms(&format!("build scripts ({})", g.build_scripts.len()), scripts_ms);
+            phase_ms("provided sources", wait_ms);
         }
-        if boot { phase("provided sources", ts); }
+        if crate::preload::trace() {
+            if let Some((_, took)) = &sources { eprintln!("boot-trace: provided sources hashed in {:.1} ms (beside the build scripts)", took.as_secs_f64() * 1e3); }
+        }
+        if let Some((checked, _)) = sources { checked?; }
+        scripts?;
     }
     if crate::preload::trace() {
         eprintln!("boot-trace: unit graph (resolve) {:.1} ms, graph {:.1} ms", (t_load - t).as_secs_f64() * 1e3, t_load.elapsed().as_secs_f64() * 1e3);
     }
-    if boot {
-        phase("unit graph", t);
-    }
-    let t = Instant::now();
-    checkpoint("build scripts")?;
-    unitgraph::run_build_scripts(sess, &mut g, target_dir)?;
     checkpoint("loading crates")?;
     if boot {
-        phase(&format!("build scripts ({})", g.build_scripts.len()), t);
         // the scripts that still run (as Relax programs) that the source is to lose (unitgraph::script_role)
         let mut l = unitgraph::TO_REMOVE.lock().unwrap().clone();
         if !l.is_empty() && !SILENT.load(Ordering::Relaxed) {
