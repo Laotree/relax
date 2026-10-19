@@ -86,7 +86,7 @@ def relax_env(n):
     return e
 def prepare(n, p, w):
     renv = relax_env(n)
-    cmd = prefix + [p, "run", "--quiet", "relax-rwbench", "--", w]
+    cmd = prefix + [p, "run", "--quiet", "--verbose", "relax-rwbench", "--", w]
     if profiled:
         profile = profile_dir / (n + "-" + w + ".t1")
         renv["MAKEPAD_RUN_O3_PROFILE"] = str(profile)
@@ -123,7 +123,7 @@ for r in range(rounds):
             renv = prepare(n, p, w)
             if profiled:
                 Path(renv["MAKEPAD_RUN_O3_PROFILE"] + ".replay").unlink(missing_ok=True)
-            b, eb = one(prefix + [p, "run", "--quiet", "relax-rwbench", "--", w], renv)
+            b, eb = one(prefix + [p, "run", "--quiet", "--verbose", "relax-rwbench", "--", w], renv)
             runs[w][n].append(b)
             if eb: errs[(w, n)] = eb
     print("# round %d/%d done (order %s)" % (r + 1, rounds, ",".join(n for n, _ in order)), file=sys.stderr, flush=True)
