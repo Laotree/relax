@@ -1554,8 +1554,9 @@ impl Tcx {
         errors.extend_from_slice(self.signature_errors(prog, did));
         if prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::duplicate_generic_params(prog, did));
-            if self.validates(prog, def.file) { errors.extend(crate::item_checks::generic_param_order(prog, did)); }
+            if self.validates(prog, def.file) { errors.extend(crate::item_checks::generic_param_rules(prog, did)); }
             errors.extend(crate::item_checks::repr_checks(prog, self, did));
+            errors.extend(crate::item_checks::assoc_const_elision(prog, did));
             errors.extend(crate::item_checks::attribute_safety(prog, did));
             if def.kind == DefKind::AssocFn && self.validates(prog, def.file) && errors.is_empty() {
                 errors.extend(self.check_method_receiver(prog, did));
@@ -2301,9 +2302,11 @@ impl Tcx {
         for b in bs {
             let path = match b {
                 ast::Bound::Trait { path, maybe: false, .. } => path,
+                // (a relaxed bound names a trait too: unknown ones are E0405)
+                ast::Bound::Trait { path, maybe: true, .. } => { if self.validates(prog, file) { self.resolve_trait_path(cx, prog, file, module, env, path); } continue; }
                 _ => continue,
             };
-            let td = match self.resolve_type_path_def(prog, file, module, path) {
+            let td = match self.resolve_trait_path(cx, prog, file, module, env, path) {
                 Some(d) if prog.def(d).kind == DefKind::Trait => d,
                 _ => continue,
             };
@@ -2412,6 +2415,12 @@ impl Tcx {
         // hir_ty_lowering/dyn_trait.rs: at most one non-auto trait (E0225)
         let mut principals = 0;
         for b in bounds {
+            if let ast::Bound::Trait { path, maybe: true, .. } = b {
+                if self.validates(prog, file) {
+                    self.resolve_trait_path(cx, prog, file, module, env, path);
+                    self.err(cx, prog, file, path.lo, format!("{}relaxed bounds are not permitted in trait object types", relax_front::diagnostics::UNCODED_PREFIX));
+                }
+            }
             if let ast::Bound::Trait { path, maybe: false, .. } = b {
                 let Some(td) = self.resolve_trait_path(cx, prog, file, module, env, path) else { continue };
                 if autos.contains(&td) { continue; }
@@ -3165,7 +3174,7 @@ impl Tcx {
         let k = prog.def(td).kind;
         if matches!(k, DefKind::Trait) { return Some(td); }
         // (a name another namespace or a misresolved module holds is left alone)
-        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::Prim(_) | DefKind::Mod) {
+        if matches!(k, DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::TypeAlias | DefKind::AssocTy | DefKind::AssocFn | DefKind::AssocConst | DefKind::Fn | DefKind::Const | DefKind::Static | DefKind::Prim(_) | DefKind::Mod) {
             self.err(cx, prog, file, p.lo, format!("E0404: expected trait, found {} `{}`", def_kind_descr(k), path_str(prog, file, p)));
         }
         None
@@ -3421,7 +3430,7 @@ impl Tcx {
                     Ok(g) => g,
                     Err(()) => {
                         self.err(cx, prog, pd.file, ast.item(pd.item).lo, format!("E0391: cycle detected when computing type of `{}::{}`", prog.def_path(td), prog.files[pd.file as usize].text(g.name)));
-                        out.push(self.tys.error);
+                        out.push(if cdef.is_some() { self.tys.intern(TyKind::Const(self.tys.intern_const(crate::consts::ConstKind::Error))) } else { self.tys.error });
                         k += 1;
                         continue;
                     }

@@ -163,6 +163,8 @@ pub struct Body {
     pub pat_discriminant_reads: SideTable<u32, ()>,
     /// casts that are coercions (rustc `set_coercion_cast`); recorded only while the lint sink is on
     pub coercion_casts: SideTable<u32, ()>,
+    /// type-relative value paths (`Ty::item`, `<Ty>::item`) that resolved to an item of a trait, not an inherent one; recorded only while the lint sink is on (prelude collision lints)
+    pub trait_item_paths: SideTable<u32, DefId>,
     /// The two lang-item calls of the `?` desugaring, with their inferred types.
     pub try_branch: SideTable<u32, (DefId, crate::types::TyList, TyId)>,
     pub try_from_residual: SideTable<u32, (DefId, crate::types::TyList)>,
@@ -236,6 +238,7 @@ impl Body {
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             try_branch: SideTable::new(),
             try_from_residual: SideTable::new(),
             locals: ThinVec::new(),
@@ -425,6 +428,10 @@ pub struct Fcx<'a> {
     diverges: bool,
     ret_stack: Vec<TyId>,
     closure_depth: Vec<(u32, usize)>, // (closure expr, scope depth at entry)
+    /// checking a const / static initializer or an anonymous constant (no `return` outside a closure)
+    in_const: bool,
+    /// checking an anonymous constant that is a typeck root of its own (array length, const argument)
+    in_anon_const: bool,
     /// > 0 inside an async block or async fn body (where `.await` is allowed); a closure
     /// inside resets it
     async_depth: u32,
@@ -663,6 +670,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             pat_bind_ref: SideTable::new(),
             pat_discriminant_reads: SideTable::new(),
             coercion_casts: SideTable::new(),
+            trait_item_paths: SideTable::new(),
             locals: ThinVec::new(),
             param_pats: ThinVec::new(),
             ret: error,
@@ -689,6 +697,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         diverges: false,
         ret_stack: Vec::new(),
         closure_depth: Vec::new(),
+        in_const: false,
+        in_anon_const: false,
         async_depth: 0,
         await_count: 0,
         cur_binop: 0,
@@ -751,6 +761,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         }
         fcx.b.ret = ct;
         fcx.ret_stack.push(ct);
+        fcx.in_const = true;
+        fcx.in_anon_const = !prog.repeat_expr_counts.contains(&def);
         let t = fcx.check_expr(init, Some(ct));
         fcx.coerce_or_unify(t, ct, Some(init), ast.expr(init).lo);
         fcx.finish();
@@ -768,6 +780,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
             fcx.register_wf(ct, ast.expr(*init).lo);
             fcx.b.ret = ct;
             fcx.ret_stack.push(ct);
+            fcx.in_const = true;
             let t = fcx.check_expr(*init, Some(ct));
             fcx.coerce_or_unify(t, ct, Some(*init), ast.expr(*init).lo);
             fcx.finish();
@@ -3248,6 +3261,7 @@ impl<'a> Fcx<'a> {
             let imp = if ambiguous { crate::program::NO_DEF } else { imp };
             let offset = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_parent_generics) as usize;
             let given = self.explicit_args(path, item, offset).unwrap_or_default();
+            if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
             let args = self.trait_call_args(item, imp, st, &given);
             let t = self.value_def_ty(item, Some(args), key);
             return (Res::Def(item), t);
@@ -3353,6 +3367,19 @@ impl<'a> Fcx<'a> {
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
+        // an anonymous constant cannot name a generic `Self`
+        if self.in_anon_const && self.tcx.validates(prog, self.file) && segs.first().is_some_and(|s| s.0 == SegKind::SelfType) {
+            if let Some(st) = self.env.self_ty {
+                let generic = match self.tcx.tys.kind(st) {
+                    TyKind::Adt(_, args, regions) => !self.tcx.tys.list(*args).is_empty() || !self.tcx.tys.region_args(*regions).is_empty(),
+                    _ => self.tcx.tys.flags(st).contains(crate::types::TypeFlags::HAS_TY_PARAM),
+                };
+                if generic {
+                    self.err(path.lo, "generic `Self` types are currently not permitted in anonymous constants".to_string());
+                    return (Res::Err, error);
+                }
+            }
+        }
         if self.tcx.validates(prog, self.file) && segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) && !self.env.names.contains(&segs[0].1) {
             if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
                 self.err(path.lo, prog.privacy_message(&e));
@@ -3373,6 +3400,8 @@ impl<'a> Fcx<'a> {
                 let sub = Path { segs: path.segs.prefix(path.segs.len() - 1), lo: path.lo };
                 let env = self.env.clone();
                 let t = self.tcx.lower_path_ty(&self.cx.with_infcx(&self.infcx), prog, self.file, self.module, &env, &sub, None);
+                // (a written qualified self type must be well formed, like any written type)
+                if self.tcx.validates(self.prog, self.file) && !self.tcx.tys.has_error(t) { self.register_wf(t, path.lo); }
                 let t = self.norm(t);
                 if matches!(self.tcx.tys.kind(t), TyKind::Error) {
                     return (Res::Err, error);
@@ -3610,6 +3639,7 @@ impl<'a> Fcx<'a> {
                 for i in 0..own as usize {
                     args.push(if i < la.len() { la[i] } else { self.fresh_arg(item, args.len()) });
                 }
+                if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                 let t = self.value_def_ty(item, Some(args), key);
                 return (Res::Def(item), t);
             }
@@ -3646,6 +3676,7 @@ impl<'a> Fcx<'a> {
                     // Box..): leave the trait args open; the impl is chosen once they are known
                     let ambiguous = cands.iter().filter(|c| c.0 == item).count() > 1;
                     let imp = if ambiguous { crate::program::NO_DEF } else { imp };
+                    if crate::lint::enabled() { self.b.trait_item_paths.insert(key, item); }
                     let args = self.trait_call_args(item, imp, self_ty, &la);
                     let t = self.value_def_ty(item, Some(args), key);
                     return (Res::Def(item), t);
@@ -3917,7 +3948,7 @@ impl<'a> Fcx<'a> {
     /// `Deref` for other types. Records overloaded steps under (expr, step).
     fn deref_step(&mut self, e: u32, step: usize, t: TyId) -> Option<TyId> {
         // rustc autoderef.rs: the recursion limit ends the walk with E0055
-        if step >= 128 && e != u32::MAX - 1 {
+        if step >= self.infcx.recursion_limit(self.prog) && e != u32::MAX - 1 {
             let ts = self.ty_str(t);
             self.err(self.last_lo, format!("E0055: reached the recursion limit while auto-dereferencing `{}`", ts));
             return None;
@@ -5012,6 +5043,9 @@ impl<'a> Fcx<'a> {
                 self.tcx.tys.never
             }
             ExprKind::Return(x) => {
+                if self.in_const && self.closure_depth.is_empty() {
+                    self.err(lo, "E0572: return statement outside of function body".to_string());
+                }
                 let rt = *self.ret_stack.last().unwrap();
                 match &x.get() {
                     Some(v) => {

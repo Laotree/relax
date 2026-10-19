@@ -431,35 +431,84 @@ pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
     errors
 }
 
-/// rustc_ast_passes ast_validation: lifetime parameters come before type and const parameters
-/// (`validate_generic_param_order`), and a parameter with a default is followed only by defaulted
-/// ones (`GenericDefaultTrailing`).
-pub fn generic_param_order(prog: &Program, d: DefId) -> Vec<String> {
-    use crate::ast::GenericParamKind;
+/// rustc_ast_passes ast_validation validate_generic_param_order and the default rules: lifetime
+/// parameters come before type and const parameters; defaults of type and const parameters are
+/// trailing (structs, enums, unions, aliases, traits) and absent on fns and impls.
+pub fn generic_param_rules(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::{GenericParamKind, ItemKind};
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
-    let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return Vec::new() };
+    let item = ast.item(def.item);
+    let Some(g) = ast.kind_generics(&item.kind) else { return Vec::new() };
+    let params = ast.list(g.params);
     let mut errors = Vec::new();
-    let (mut seen_other, mut misplaced) = (false, None);
-    let mut default_before = false;
-    let mut trailing_reported = false;
-    for p in ast.list(g.params) {
+    let mut seen_non_lifetime = false;
+    let mut order_reported = false;
+    for p in params {
         match p.kind {
-            GenericParamKind::Lifetime(_) => if seen_other && misplaced.is_none() { misplaced = Some(p.name.lo); },
-            GenericParamKind::Type(_, default) => {
-                seen_other = true;
-                if default.is_some() { default_before = true; }
-                else if default_before && !trailing_reported { trailing_reported = true; errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string())); }
+            GenericParamKind::Lifetime(_) => {
+                if seen_non_lifetime && !order_reported {
+                    errors.push(prog.record_error(def.file, p.name.lo, "parse", "lifetime parameters must be declared prior to type and const parameters".to_string()));
+                    order_reported = true;
+                }
             }
-            GenericParamKind::Const(_, default) => {
-                seen_other = true;
-                if default.is_some() { default_before = true; }
-                else if default_before && !trailing_reported { trailing_reported = true; errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string())); }
+            _ => seen_non_lifetime = true,
+        }
+    }
+    // a const parameter's type is an integer, bool or char (adt_const_params lifts the rule)
+    if let ItemKind::Fn(s, _, _) = item.kind {
+        let sig = ast.fn_sig(s);
+        if sig.konst && sig.asyncness {
+            errors.push(prog.record_error(def.file, item.lo, "parse", "functions cannot be both `const` and `async`".to_string()));
+        }
+    }
+    let krate = &prog.crates[def.krate as usize];
+    if !krate.features(prog).has("adt_const_params") && !krate.features(prog).has("unsized_const_params") {
+        let f = &prog.files[def.file as usize];
+        for p in params {
+            let GenericParamKind::Const(ty, _) = p.kind else { continue };
+            let forbidden = match ast.ty(ty) {
+                ast::Ty::Path(path) if path.no_qself() && path.segs.len() == 1 => {
+                    let n = f.text(ast.segs(path.segs)[0].name);
+                    match n {
+                        "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize" | "bool" | "char" => false,
+                        "f32" | "f64" | "str" => true,
+                        _ => {
+                            let sym = prog.syms.get(n).unwrap_or(u32::MAX);
+                            !params.iter().any(|q| f.text(q.name) == n)
+                                && prog.lookup_in_scope(prog.mods[def.scope as usize].normal, sym, true).is_some_and(|t| matches!(prog.def(t).kind, DefKind::Struct | DefKind::Enum | DefKind::Union))
+                        }
+                    }
+                }
+                ast::Ty::Ref(..) | ast::Ty::Tuple(_) | ast::Ty::Slice(_) | ast::Ty::Array(..) => true,
+                _ => false,
+            };
+            if forbidden {
+                let n = match ast.ty(ty) { ast::Ty::Path(path) => f.text(ast.segs(path.segs)[0].name).to_string(), _ => "this type".to_string() };
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", format!("`{}` is forbidden as the type of a const generic parameter", n)));
             }
         }
     }
-    if let Some(lo) = misplaced {
-        errors.push(prog.record_error(def.file, lo, "parse", "lifetime parameters must be declared prior to type and const parameters".to_string()));
+    let has_default = |p: &crate::ast::GenericParam| matches!(p.kind, GenericParamKind::Type(_, Some(_)) | GenericParamKind::Const(_, Some(_)));
+    if matches!(item.kind, ItemKind::Fn(..) | ItemKind::Impl(..)) {
+        for p in params {
+            if has_default(p) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "defaults for generic parameters are not allowed here".to_string()));
+            }
+        }
+    } else {
+        let mut trailing_from = params.len();
+        for (i, p) in params.iter().enumerate().rev() {
+            if matches!(p.kind, GenericParamKind::Lifetime(_)) { continue; }
+            if has_default(p) { trailing_from = i; } else { break; }
+        }
+        let mut reported = false;
+        for (i, p) in params.iter().enumerate() {
+            if has_default(p) && i < trailing_from && !reported && params[i + 1..].iter().any(|q| !matches!(q.kind, GenericParamKind::Lifetime(_)) && !has_default(q)) {
+                errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string()));
+                reported = true;
+            }
+        }
     }
     errors
 }
@@ -841,6 +890,59 @@ pub fn repr_checks(prog: &Program, tcx: &Tcx, d: DefId) -> Vec<String> {
         }
     }
     errors
+}
+
+/// rustc_resolve late.rs: an associated constant of an impl whose header names an anonymous
+/// lifetime (`impl Foo<'_>`) with an elided `&` in its type -- the elided lifetime means
+/// `'static` there (lint `elided_lifetimes_in_associated_constant`).
+pub fn assoc_const_elision(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::{GenericArg, GenericArgs, ItemKind, Ty};
+    if !crate::lint::enabled() { return Vec::new(); }
+    let def = prog.def(d);
+    if def.kind != DefKind::AssocConst || def.parent == NO_DEF || prog.def(def.parent).kind != DefKind::Impl { return Vec::new(); }
+    let ast = &prog.files[def.file as usize].ast;
+    let pf = &prog.files[def.file as usize];
+    let ItemKind::Const(oty, _) = ast.item(def.item).kind else { return Vec::new() };
+    let Some(ty) = oty.get() else { return Vec::new() };
+    let imp = prog.def(def.parent);
+    let iast = &prog.files[imp.file as usize].ast;
+    let Some(im) = iast.as_impl(&iast.item(imp.item).kind) else { return Vec::new() };
+    // an anonymous lifetime written in a type
+    fn anon<'t>(ast: &crate::ast::Ast, text: &dyn Fn(crate::ast::Ident) -> &'t str, t: crate::ast::TyId, refs_too: bool, depth: u32) -> bool {
+        if depth > 16 { return false; }
+        let args = |gs: crate::ast::GenericArgsId, depth: u32| -> bool {
+            match ast.gargs(gs) {
+                Some(GenericArgs::Angle(v)) => ast.list(*v).iter().any(|a| match a {
+                    GenericArg::Lifetime(l) => text(*l) == "'_",
+                    GenericArg::Type(x) => anon(ast, text, *x, refs_too, depth + 1),
+                    _ => false,
+                }),
+                _ => false,
+            }
+        };
+        match ast.ty(t) {
+            Ty::Ref(lt, _, x) => (match lt { None => refs_too, Some(l) => text(*l) == "'_" }) || anon(ast, text, *x, refs_too, depth + 1),
+            Ty::Ptr(_, x) | Ty::Slice(x) | Ty::Array(x, _) | Ty::Paren(x) => anon(ast, text, *x, refs_too, depth + 1),
+            Ty::Tuple(l) => ast.list(*l).iter().any(|x| anon(ast, text, *x, refs_too, depth + 1)),
+            Ty::Path(p) => ast.segs(p.segs).iter().any(|s| args(s.args(), depth)),
+            _ => false,
+        }
+    }
+    let itext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(prog.files[imp.file as usize].bytes(i.lo, i.hi)).unwrap_or("") };
+    let ctext = |i: crate::ast::Ident| -> &str { std::str::from_utf8(pf.bytes(i.lo, i.hi)).unwrap_or("") };
+    let header = anon(iast, &itext, im.self_ty, false, 0)
+        || im.trait_.as_ref().is_some_and(|p| iast.segs(p.segs).iter().any(|s| match iast.gargs(s.args()) {
+            Some(GenericArgs::Angle(v)) => iast.list(*v).iter().any(|a| matches!(a, GenericArg::Lifetime(l) if itext(*l) == "'_")),
+            _ => false,
+        }));
+    if header && anon(ast, &ctext, ty, true, 0) {
+        crate::lint::emit(prog, d, &crate::lint::ELIDED_LIFETIMES_IN_ASSOCIATED_CONSTANT, def.file, ast.item(def.item).lo, "`&` without an explicit lifetime name cannot be used here");
+        // the elided lifetime is a parameter of the impl's constant, which the trait's does not have
+        if im.trait_.is_some() {
+            return vec![prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0195: lifetime parameters or bounds on associated constant `{}` do not match the trait declaration", prog.name(d)))];
+        }
+    }
+    Vec::new()
 }
 
 /// rustc_attr_parsing `AllowedTargets::AllowList`: the targets a builtin attribute may be written
