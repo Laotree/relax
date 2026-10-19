@@ -127,6 +127,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
     errors.extend(relax_types::item_checks::duplicate_items(&u.prog, &own));
     errors.extend(relax_types::item_checks::foreign_blocks(&u.prog, &own));
     relax_types::lint_pass::check_items(&u.prog, &u.tcx, &own);
+    relax_types::lint_dead::reset();
     let options = &u.prog.session.clone().options;
     crate::borrowck::lazy::disable_gandalf();
     if options.borrowck_all != crate::options::BorrowckAll::Default {
@@ -290,6 +291,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         if let Some(d) = o.seed { seeds.push(d); }
     }
     let checked = seeds.len();
+    relax_types::lint_dead::finish(&u.prog, &u.tcx, &own, root);
     // rustc_hir_analysis check_crate: every static and every non-generic, non-associated const
     // item of the checked crates is evaluated, used or not; one that cannot be evaluated is an
     // E0080 (the unit notes it, reported below with the builds' other notes)

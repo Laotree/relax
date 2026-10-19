@@ -44,7 +44,12 @@ pub fn walk_stmt<'a, V: Visitor<'a>>(v: &mut V, s: &Stmt) {
             if let Some(e) = l.else_ { v.block(e); }
             v.leave_attrs(l.attrs);
         }
-        Stmt::Expr(e, _) => v.expr(e),
+        Stmt::Expr(e, _) => {
+            let attrs = ast.stmt_attrs(e);
+            v.enter_attrs(attrs);
+            v.expr(e);
+            v.leave_attrs(attrs);
+        }
         Stmt::Attrs(r) => {
             let a = *ast.row(r);
             v.enter_attrs(a.attrs);

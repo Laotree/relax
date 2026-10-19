@@ -120,9 +120,7 @@ pub fn check(prog: &Program, tcx: &Tcx, body: &Body, params: &[(PatId, List<Attr
     let mut owner = def.parent;
     while owner != crate::program::NO_DEF && matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst) { owner = prog.def(owner).parent; }
     if owner != crate::program::NO_DEF && prog.def(owner).kind == DefKind::Impl {
-        let od = prog.def(owner);
-        let oa = &prog.files[od.file as usize].ast;
-        if lint::has_attr(prog, od.file, oa.list(oa.item(od.item).attrs), "automatically_derived") { return; }
+        if lint::is_automatically_derived(prog, owner) { return; }
     }
     let ast = &prog.files[body.file as usize].ast;
     let mut fmt_named: HashMap<u32, Vec<u32>> = HashMap::new();
@@ -314,7 +312,12 @@ impl<'c, 'a> Unit<'c, 'a> {
         let ast = self.cx.ast;
         match *s {
             Stmt::Item(_) | Stmt::Empty => {}
-            Stmt::Expr(e, _) => self.expr(e),
+            Stmt::Expr(e, _) => {
+                let attrs = ast.stmt_attrs(e);
+                self.enter(attrs);
+                self.expr(e);
+                self.leave();
+            }
             Stmt::Attrs(r) => {
                 let a = *ast.row(r);
                 self.enter(a.attrs);

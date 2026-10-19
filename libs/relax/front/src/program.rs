@@ -4860,12 +4860,17 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
         return;
     }
     let mut out = Vec::with_capacity(blk.stmts.len());
+    let mut kept_attrs = Vec::new();
     for s in ast.list(blk.stmts) {
         match s {
             Stmt::Attrs(r) => {
-                let AttrsStmt { attrs, expr, semi } = ast.row(*r);
-                if crate::cfg::active(src, ast.list(*attrs), cfg) {
-                    out.push(Stmt::Expr(*expr, *semi));
+                let AttrsStmt { attrs, expr, semi } = *ast.row(*r);
+                if crate::cfg::active(src, ast.list(attrs), cfg) {
+                    out.push(Stmt::Expr(expr, semi));
+                    // lint levels written on the statement are kept for the lint passes
+                    if ast.list(attrs).iter().any(|a| matches!(crate::cfg::tok_str(src, a.toks.lo as usize), b"allow" | b"warn" | b"deny" | b"forbid" | b"expect")) {
+                        kept_attrs.push((expr, attrs));
+                    }
                 }
             }
             Stmt::Let(r) if { let attrs = ast.row(*r).attrs; !attrs.is_empty() && !crate::cfg::active(src, ast.list(attrs), cfg) } => {}
@@ -4874,6 +4879,7 @@ fn strip_cfg_stmts(ast: &mut Ast, src: Src, cfg: &CfgSet, b: BlockId) {
     }
     let l = ast.push_list(out);
     ast.block_mut(b).stmts = l;
+    ast.stmt_attrs.extend(kept_attrs);
 }
 
 /// Closures in an owner's expression ranges, including its lazily materialized body.

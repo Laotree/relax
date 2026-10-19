@@ -122,7 +122,12 @@ impl<'a> Cx<'a> {
                 self.div = self.div.max(old);
                 self.leave(l.attrs);
             }
-            Stmt::Expr(e, _) => self.expr_stmt(e),
+            Stmt::Expr(e, _) => {
+                let attrs = ast.stmt_attrs(e);
+                self.enter(attrs);
+                self.expr_stmt(e);
+                self.leave(attrs);
+            }
             Stmt::Attrs(r) => {
                 let a = *ast.row(r);
                 self.enter(a.attrs);

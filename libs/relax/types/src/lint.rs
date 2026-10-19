@@ -100,14 +100,16 @@ fn scopes(prog: &Program, def: DefId) -> Vec<(u32, Vec<Attr>)> {
             }
         } else if !matches!(dd.kind, DefKind::AnonConst | DefKind::Closure | DefKind::OpaqueTy | DefKind::Prim(_)) {
             out.push((dd.file, ast.list(ast.item(dd.item).attrs).to_vec()));
-            // an item declared in a block: the attributes of the statements around it
+            // an item declared in a body: the attributes of the statements around it
             if dd.parent != NO_DEF {
-                let p = prog.def(dd.parent);
-                if p.kind == DefKind::Mod {
-                    if let Some(&owner) = prog.block_owner.get(&p.sub) {
-                        let a = stmt_attrs_around(prog, owner, dd.file, dd.item);
-                        if !a.is_empty() { out.push((dd.file, a)); }
-                    }
+                let mut owner = dd.parent;
+                if prog.def(owner).kind == DefKind::Mod {
+                    owner = prog.block_owner.get(&prog.def(owner).sub).copied().unwrap_or(NO_DEF);
+                }
+                while owner != NO_DEF && matches!(prog.def(owner).kind, DefKind::Closure | DefKind::AnonConst) { owner = prog.def(owner).parent; }
+                if owner != NO_DEF && matches!(prog.def(owner).kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst) {
+                    let a = stmt_attrs_around(prog, owner, dd.file, dd.item);
+                    if !a.is_empty() { out.push((dd.file, a)); }
                 }
             }
         }
@@ -119,6 +121,11 @@ fn scopes(prog: &Program, def: DefId) -> Vec<(u32, Vec<Attr>)> {
 /// The level of `lint` at `def`.
 pub fn level(prog: &Program, def: DefId, lint: &Lint) -> Level {
     level_in(prog, def, &[], lint)
+}
+
+/// The level of `lint` at `def` under the attributes `inner` of a node inside it.
+pub fn level_with(prog: &Program, def: DefId, inner: &[Attr], lint: &Lint) -> Level {
+    level_in(prog, def, inner, lint)
 }
 
 /// The level of `lint` inside `def` under `inner`, the attributes of a node of its body (a
@@ -306,6 +313,12 @@ pub fn attr_path(prog: &Program, file: u32, a: &Attr) -> Vec<u8> {
     name
 }
 
+/// An attribute's tokens joined by spaces (`crate_type = "lib"`).
+pub fn attr_text(prog: &Program, file: u32, a: &Attr) -> String {
+    let p = prog.src(file);
+    (a.toks.lo as usize..a.toks.hi as usize).map(|i| String::from_utf8_lossy(crate::cfg::tok_str(p, i)).into_owned()).collect::<Vec<_>>().join(" ")
+}
+
 /// Whether one of `attrs` is the attribute `name` (a plain path).
 pub fn has_attr(prog: &Program, file: u32, attrs: &[Attr], name: &str) -> bool {
     attrs.iter().any(|a| attr_path(prog, file, a) == name.as_bytes())
@@ -373,4 +386,15 @@ fn stmt_attrs_around(prog: &Program, owner: DefId, file: u32, item: crate::ast::
         _ => {}
     }
     f.found.unwrap_or_default()
+}
+
+/// Whether impl `d` is the output of `#[derive]` (`#[automatically_derived]`; Relax expands
+/// derives as built-in macro output).
+pub fn is_automatically_derived(prog: &Program, d: DefId) -> bool {
+    let def = prog.def(d);
+    if def.kind != DefKind::Impl { return false; }
+    let ast = &prog.files[def.file as usize].ast;
+    let item = ast.item(def.item);
+    has_attr(prog, def.file, ast.list(item.attrs), "automatically_derived")
+        || prog.files[def.file as usize].expansion_kind(item.lo) == crate::parser::ExpnKind::Builtin
 }

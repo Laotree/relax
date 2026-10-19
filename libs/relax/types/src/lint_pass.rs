@@ -312,6 +312,7 @@ fn snake_pat_idents(site: &Site, ast: &Ast, p: PatId) {
 /// Runs the body passes over one typed body owner.
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
+    crate::lint_dead::collect_body(prog, tcx, body);
     crate::lint_early::check_body(prog, tcx, body);
     crate::lint_late::check_body(prog, tcx, body);
     let d = prog.def(body.def);

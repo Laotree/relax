@@ -53,6 +53,7 @@ pub mod lint_pass;
 pub mod lint_unreachable;
 pub mod lint_liveness;
 pub mod lint_early;
+pub mod lint_dead;
 pub mod lint_late;
 pub mod item_checks;
 pub mod transmute;
