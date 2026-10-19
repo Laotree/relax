@@ -469,6 +469,19 @@ impl<'a> Lcx<'a> {
         }
     }
 
+    /// `x <cond> k` as a flag vreg: an immediate where the back ends encode `k` (a signed 32-bit
+    /// immediate), else against a constant register.
+    fn dt_cmp(&mut self, cond: Cond, signed: bool, x: VReg, k: i64) -> VReg {
+        let c = self.f.vreg(Cls::I);
+        if k as i32 as i64 == k {
+            self.emit(Inst::ICmpI(cond, signed, c, x, k));
+        } else {
+            let kr = self.iconst(k);
+            self.emit(Inst::ICmp(cond, signed, c, x, kr));
+        }
+        c
+    }
+
     /// The row without its atom on `key`, if it has one (and the atom).
     fn dt_take(row: &DRow, key: &PKey) -> (DRow, Option<Atom>) {
         let mut r = row.clone();
@@ -544,25 +557,20 @@ impl<'a> Lcx<'a> {
         for (i, &(lo, hi, to)) in tests.iter().enumerate() {
             let next = if i + 1 == tests.len() { default } else { self.f.block() };
             if lo == hi {
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmpI(Cond::Eq, false, c, v, kc(lo)));
+                let c = self.dt_cmp(Cond::Eq, false, v, kc(lo));
                 self.term(Term::Branch(c, to, next));
             } else if lo == dmin {
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmpI(Cond::Le, signed, c, v, kc(hi)));
+                let c = self.dt_cmp(Cond::Le, signed, v, kc(hi));
                 self.term(Term::Branch(c, to, next));
             } else if hi == dmax {
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmpI(Cond::Ge, signed, c, v, kc(lo)));
+                let c = self.dt_cmp(Cond::Ge, signed, v, kc(lo));
                 self.term(Term::Branch(c, to, next));
             } else {
                 let mid = self.f.block();
-                let c = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmpI(Cond::Ge, signed, c, v, kc(lo)));
+                let c = self.dt_cmp(Cond::Ge, signed, v, kc(lo));
                 self.term(Term::Branch(c, mid, next));
                 self.switch(mid);
-                let c2 = self.f.vreg(Cls::I);
-                self.emit(Inst::ICmpI(Cond::Le, signed, c2, v, kc(hi)));
+                let c2 = self.dt_cmp(Cond::Le, signed, v, kc(hi));
                 self.term(Term::Branch(c2, to, next));
             }
             if next != default {
@@ -650,8 +658,7 @@ impl<'a> Lcx<'a> {
                 return;
             };
             let next = if i + 1 == tests.len() { default } else { self.f.block() };
-            let c = self.f.vreg(Cls::I);
-            self.emit(Inst::ICmpI(Cond::Eq, true, c, tag[0], discr.signed_value() as i64));
+            let c = self.dt_cmp(Cond::Eq, true, tag[0], discr.signed_value() as i64);
             self.term(Term::Branch(c, to, next));
             if next != default {
                 self.switch(next);

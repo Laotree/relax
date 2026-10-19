@@ -318,3 +318,49 @@ fn mixed(x: u32, s: &str, v: &[u8]) -> u32 {
     assert_eq!(mixed(9, "q", &[5, 8]), 9);
     assert_eq!(mixed(8, "q", &[5, 8]), 10);
 }
+
+// constants the back ends cannot encode as 32-bit immediates: ids (hashes with the top bit set),
+// values around the 32-bit limits, negative ones
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Id(u64);
+fn ids(id: Id) -> u32 {
+    match id {
+        Id(0x8d3c_7a11_9f00_0001) => 1,
+        Id(0x0000_133f_1995_ee71) => 2,
+        Id(0xffff_ffff) => 3,
+        Id(0x1_0000_0000..=0x1_0000_00ff) => 4,
+        Id(0x7fff_ffff) | Id(0x8000_0000) => 5,
+        Id(u64::MAX) => 6,
+        Id(0xffff_ffff_0000_0000..=0xffff_ffff_0000_000f) => 7,
+        _ => 8,
+    }
+}
+#[test] fn wide_constants() {
+    for (v, w) in [
+        (0x8d3c_7a11_9f00_0001u64, 1), (0x0000_133f_1995_ee71, 2), (0xffff_ffff, 3), (0x1_0000_0000, 4), (0x1_0000_00ff, 4), (0x1_0000_0100, 8),
+        (0x7fff_ffff, 5), (0x8000_0000, 5), (0x8000_0001, 8), (u64::MAX, 6), (u64::MAX - 1, 8), (0xffff_ffff_0000_0000, 7), (0xffff_ffff_0000_000f, 7),
+        (0xffff_ffff_0000_0010, 8), (0, 8), (0xfffe_ffff, 8),
+    ] {
+        assert_eq!(ids(Id(v)), w, "{v:#x}");
+    }
+}
+fn signed_wide(x: i64) -> u32 {
+    match x {
+        i64::MIN => 1,
+        -0x8000_0001 => 2,
+        -0x8000_0000..=-1 => 3,
+        0 => 4,
+        1..=0x7fff_ffff => 5,
+        0x8000_0000 | 0x1_0000_0000 => 6,
+        0x8000_0001..=i64::MAX => 7,
+        _ => 8,
+    }
+}
+#[test] fn wide_signed_constants() {
+    for (v, w) in [
+        (i64::MIN, 1), (-0x8000_0001, 2), (-0x8000_0000, 3), (-1, 3), (0, 4), (1, 5), (0x7fff_ffff, 5), (0x8000_0000, 6), (0x1_0000_0000, 6),
+        (0x8000_0001, 7), (i64::MAX, 7), (i64::MIN + 1, 8), (-0x8000_0002, 8),
+    ] {
+        assert_eq!(signed_wide(v), w, "{v:#x}");
+    }
+}
