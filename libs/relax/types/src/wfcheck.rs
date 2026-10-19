@@ -948,12 +948,72 @@ pub mod obligations {
         let def = prog.def(imp);
         match tcx.tys.kind(self_ty) {
             TyKind::Error => Vec::new(),
-            TyKind::Adt(d, _, _) if prog.def(*d).krate == def.krate => Vec::new(),
+            TyKind::Adt(d, args, regions) if prog.def(*d).krate == def.krate => always_applicable(prog, tcx, imp, item, def.file, *d, *args, *regions),
             _ => {
                 let pos = ast.as_impl(&item.kind).and_then(|i| ty_pos(ast, i.self_ty)).unwrap_or(item.lo);
                 vec![prog.record_error(def.file, pos, "typeck", "E0120: the `Drop` trait may only be implemented for local structs, enums, and unions".to_string())]
             }
         }
+    }
+
+    /// rustc_hir_analysis/src/check/always_applicable.rs check_drop_impl: the generic arguments of the
+    /// impl's self type are the impl's own distinct parameters (E0366), and every predicate of the impl
+    /// holds in the environment of the type's definition (E0367).
+    fn always_applicable(prog: &Program, tcx: &Tcx, imp: DefId, item: &ast::Item, file: u32, adt: DefId, args: crate::types::TyList, regions: crate::types::RegionArgsId) -> Vec<String> {
+        use crate::types::RegionKind;
+        let tys = &tcx.tys;
+        // uses_unique_generic_params(adt_to_impl_args, CheckRegions::OnlyParam)
+        let mut seen_tys = Vec::new();
+        let mut unique = true;
+        for &a in tys.list(args) {
+            let ok = match tys.kind(a) {
+                TyKind::Param(..) => true,
+                TyKind::Const(c) => matches!(tys.const_kind(*c), crate::consts::ConstKind::Param(..)),
+                _ => false,
+            };
+            if !ok || seen_tys.contains(&a) { unique = false; }
+            seen_tys.push(a);
+        }
+        let mut seen_regions = Vec::new();
+        for &r in tys.region_args(regions).iter() {
+            if !matches!(tys.region_kind(r), RegionKind::ReEarlyParam(_)) || seen_regions.contains(&r) { unique = false; }
+            seen_regions.push(r);
+        }
+        let trait_name = "Drop";
+        if !unique {
+            return vec![prog.record_error(file, item.lo, "typeck", format!("E0366: `{}` impls cannot be specialized", trait_name))];
+        }
+        if tys.list(args).iter().any(|&t| tys.has_error(t)) { return Vec::new(); }
+        // the predicates of the type, at the impl's arguments
+        let adt_args = tcx.complete_args(prog, adt, tys.list(args), regions);
+        let adt_env = tcx.param_env_id(prog, adt);
+        let clauses: Vec<_> = tcx.param_env_by_id(adt_env).clauses.iter().map(|p| tcx.instantiate_predicate(prog, adt, &adt_args, p)).collect();
+        let env = tcx.intern_param_env(crate::next_solver::ParamEnv { clauses: clauses.into() });
+        let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
+        let mut ocx = ObligationCtxt::new(&infcx, prog);
+        // the impl's parameters are inference variables, bound by equating its self type with the
+        // type at the impl's own arguments
+        let fresh = infcx.fresh_args_for_item(prog, imp);
+        let fresh_self = tcx.instantiate_ty(prog, imp, &fresh, tcx.impl_self[&imp]);
+        let mut goals = match infcx.at(prog, env.clone()).eq(tcx.impl_self[&imp], fresh_self) {
+            Ok(goals) => goals,
+            Err(_) => return Vec::new(),
+        };
+        for p in tcx.own_clauses_of(prog, imp) {
+            let p = &tcx.instantiate_predicate(prog, imp, &fresh, p);
+            let predicate = ocx.normalize_predicate(&env, p);
+            goals.push(Goal { param_env: env.clone(), predicate });
+        }
+        ocx.register_obligations(goals);
+        let errors = ocx.engine.evaluate_obligations_error_on_ambiguity(&infcx, prog);
+        let msg = |what: String| format!("E0367: `{}` impl requires `{}` but the {} it is implemented for does not", trait_name, what, match prog.def(adt).kind { DefKind::Enum => "enum", DefKind::Union => "union", _ => "struct" });
+        if !errors.is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("a predicate".to_string()))];
+        }
+        if !infcx.resolve_regions(prog, env, &[]).is_empty() {
+            return vec![prog.record_error(file, item.lo, "typeck", msg("an outlives bound".to_string()))];
+        }
+        Vec::new()
     }
 
     /// Whether every ADT / fn item / alias in `ty` carries as many arguments as its definition has
