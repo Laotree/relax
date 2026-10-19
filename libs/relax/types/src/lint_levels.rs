@@ -79,6 +79,7 @@ pub fn check(prog: &Program, own: &[bool]) -> Vec<String> {
         let d = DefId(i as u32);
         if matches!(def.kind, DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Prim(_) | DefKind::Field | DefKind::Variant | DefKind::MacroRules) { continue; }
         if def.kind == DefKind::Mod && def.parent == NO_DEF { continue; }
+        if lint::generated(prog, d) { continue; }
         let ast = &prog.files[def.file as usize].ast;
         let item = *ast.item(def.item);
         // a position inside a macro expansion is not the user's attribute

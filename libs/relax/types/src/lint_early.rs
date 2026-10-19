@@ -41,6 +41,7 @@ pub fn check_items(prog: &Program, _tcx: &Tcx, own: &[bool]) {
     for i in 0..prog.defs.len() {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
+        if lint::generated(prog, DefId(i as u32)) { continue; }
         attr_lints(prog, DefId(i as u32));
         if matches!(def.kind, DefKind::Fn | DefKind::ForeignFn | DefKind::Impl | DefKind::Trait | DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::TypeAlias | DefKind::Const | DefKind::Static) { lifetime_lints(prog, DefId(i as u32)); }
         if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::ForeignFn | DefKind::Struct | DefKind::Union
@@ -63,7 +64,7 @@ pub fn check_body(prog: &Program, _tcx: &Tcx, body: &Body) { check_def(prog, bod
 /// The syntax-level passes over the body of one fn / const / static definition (they need no
 /// types, so they also apply to a body whose type check failed).
 pub fn check_def(prog: &Program, def: DefId) {
-    if !lint::enabled() { return; }
+    if !lint::enabled() || lint::generated(prog, def) { return; }
     let d = prog.def(def);
     let ast = &prog.files[d.file as usize].ast;
     let mut w = W::new(prog, d.file, def);
@@ -1119,7 +1120,8 @@ impl<'a> W<'a> {
                 let rec = self.recover_attrs(ast.expr(e).lo);
                 let n = rec.len();
                 self.stack.extend(rec);
-                if !semi { self.both(e, Ctx::BlockRetValue, false); }
+                // (`#[cfg(..)]` stays on the node in rustc: a value with attributes is not linted)
+                if !semi && n == 0 { self.both(e, Ctx::BlockRetValue, false); }
                 self.expr(e);
                 let len = self.stack.len();
                 self.stack.truncate(len - n);

@@ -278,6 +278,13 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
         let Ok(Some(b)) = prog.fn_body(def.file, def.item) else { continue };
         collect_block_scopes(prog, DefId(i as u32), def.file, ast, b, &mut scopes);
     }
+    // token sites are call-site positions; so are the ranges (code a macro wrote has its text in the
+    // file's expansion area)
+    for sc in scopes.iter_mut() {
+        let pf = &prog.files[sc.file as usize];
+        let mapped: Vec<(u32, u32)> = sc.ranges.iter().map(|&(lo, hi)| (pf.diagnostic_pos(lo), pf.diagnostic_pos(hi.saturating_sub(1)).saturating_add(1))).filter(|&(lo, hi)| hi > lo).collect();
+        sc.ranges.extend(mapped);
+    }
     let mut tokens: HashMap<u32, FileTokens> = HashMap::new();
     for sc in &scopes { tokens.entry(sc.file).or_insert_with(|| scan_tokens(prog, sc.file)); }
     // the names written in each scope; the paths written anywhere in the crate
@@ -347,6 +354,8 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             let item = sc.ast.item(it);
             let ItemKind::Use(row) = item.kind else { continue };
             if lint::external(prog, sc.file, item.lo) { continue; }
+            // a declaration a macro wrote: its scope's names cannot be located
+            if item.lo >= prog.files[sc.file as usize].src_len { continue; }
             let u = *sc.ast.row(row);
             let mut ls = Vec::new();
             let start = first_pos(sc.ast, &u.tree).unwrap_or(item.lo);
@@ -374,7 +383,9 @@ pub fn check(prog: &Program, tcx: &Tcx, own: &[bool], reach: &crate::lint_dead::
             for l in &ls {
                 if dup_glob(l) { continue; }
                 if exported && !(l.glob && ctx.glob_imports_nothing(l)) && !l.empty { continue; }
-                if !ctx.leaf_used(l, item.lo) { unused.push(l.span); }
+                if !ctx.leaf_used(l, item.lo) {
+                    unused.push(l.span);
+                }
             }
             let _ = tcx;
             if unused.is_empty() { continue; }

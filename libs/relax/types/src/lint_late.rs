@@ -2328,6 +2328,7 @@ fn improper_ctypes(prog: &Program, tcx: &Tcx, own: &[bool]) {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         let d = DefId(i as u32);
+        if lint::generated(prog, d) { continue; }
         let file = &prog.files[def.file as usize];
         let ast = &file.ast;
         match def.kind {

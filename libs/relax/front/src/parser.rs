@@ -4160,6 +4160,20 @@ impl ParsedFile {
         ExpnKind::Root
     }
 
+    /// Which kind of expansion's text holds position `pos` (not following the origin of a token
+    /// substituted from the call site): the file's own text, the output of a `macro_rules!`
+    /// (this file's or another's), or the output of a derive / attribute / built-in macro.
+    pub fn expansion_region_kind(&self, pos: u32) -> ExpnKind {
+        if pos < self.src_len { return ExpnKind::Root; }
+        let rules = self.part_at(pos).map_or(&self.rules_exp, |p| &p.rules_exp);
+        if let Some((_, r)) = OSegRef::from(rules).floor(pos) {
+            if pos < r.1 {
+                return if r.2 != u32::MAX { ExpnKind::LocalRules } else { ExpnKind::ExternalRules };
+            }
+        }
+        ExpnKind::Builtin
+    }
+
     /// The definition position of mark `m`'s macro (u32::MAX: another file).
     pub fn hyg_def_pos(&self, m: u32) -> u32 {
         self.rules_exp.get(m as usize).or_else(|| self.parts().find_map(|p| p.rules_exp.get(m.wrapping_sub(p.rules_base) as usize))).map_or(u32::MAX, |r| r.2)

@@ -20,6 +20,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
         let def = prog.defs[i];
         if !own.get(def.krate as usize).copied().unwrap_or(false) { continue; }
         let d = DefId(i as u32);
+        if lint::generated(prog, d) { continue; }
         nonstandard_style_item(prog, d);
     }
 }
@@ -241,6 +242,8 @@ fn nonstandard_style_item(prog: &Program, d: DefId) {
             if !has_repr_c { site.camel("trait", item.name); }
         }
         DefKind::AssocTy => {
+            // (the associated type a `fn f() -> impl Trait` of a trait stands for has the fn's item)
+            if !matches!(item.kind, ItemKind::TypeAlias(_)) { return; }
             if parent_kind == DefKind::Trait || (parent_kind == DefKind::Impl && impl_trait(def.parent) == Some(false)) {
                 site.camel("associated type", item.name);
             }
@@ -316,6 +319,8 @@ fn snake_pat_idents(site: &Site, ast: &Ast, p: PatId) {
 pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) {
     if !lint::enabled() { return; }
     crate::lint_dead::collect_body(prog, tcx, body);
+    // the output of derive and attribute macros is not judged
+    if lint::generated(prog, body.def) { return; }
     crate::lint_late::check_body(prog, tcx, body);
     let d = prog.def(body.def);
     let pf = &prog.files[body.file as usize];

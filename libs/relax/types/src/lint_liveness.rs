@@ -58,6 +58,9 @@ struct Access {
     at_entry: bool,
     direct: bool,
     scope: usize,
+    /// the value a binding is initialised with (removed from the assignments of a variable that
+    /// is never used at all: it is the unused variable)
+    init: bool,
 }
 
 struct Report {
@@ -86,6 +89,8 @@ pub struct Cx<'a> {
     scopes: Vec<Vec<Attr>>,
     reports: Vec<Report>,
     closure_memo: HashMap<u32, Vec<(u32, bool)>>,
+    /// the pattern analysis context (inhabitedness of call results), made on first use
+    pcx: Option<crate::pattern_analysis::Cx<'a>>,
 }
 
 struct Unit<'c, 'a> {
@@ -131,7 +136,7 @@ pub fn check(prog: &Program, tcx: &Tcx, body: &Body, params: &[(PatId, List<Attr
     for (i, l) in body.locals.iter().enumerate() {
         locals_by_name.entry(prog.syms.str(l.name).to_string()).or_default().push(i as u32);
     }
-    let mut cx = Cx { prog, tcx, body, ast, fmt_named, locals_by_name, scopes: vec![Vec::new()], reports: Vec::new(), closure_memo: HashMap::new() };
+    let mut cx = Cx { prog, tcx, body, ast, fmt_named, locals_by_name, scopes: vec![Vec::new()], reports: Vec::new(), closure_memo: HashMap::new(), pcx: None };
     {
         let mut u = Unit::new(&mut cx, None);
         for &(p, attrs) in params {
@@ -254,13 +259,28 @@ impl<'c, 'a> Unit<'c, 'a> {
                         self.vars[v as usize].intro.push(name.lo);
                         let sc = self.cur_scope;
                         self.decl_scopes.entry(v).or_insert(sc);
-                        if define { self.step(Vec::new(), v); }
+                        if define {
+                            if let Some(n) = self.step(Vec::new(), v) {
+                                self.accesses.push(Access { var: v, kind: AccessKind::Assign, key: (name.lo, name.hi), node: n, at_entry: false, direct: true, scope: self.cur_scope, init: true });
+                            }
+                        }
                     }
                 }
                 if let Some(s) = sub { self.bind_pat(s, define); }
             }
             Pat::Lit(_) | Pat::Range(..) | Pat::Path(_) | Pat::Wild | Pat::Rest | Pat::Mac(_) => {}
-            Pat::TupleStruct(_, ps) | Pat::Tuple(ps) | Pat::Slice(ps) | Pat::Or(ps) => {
+            Pat::Or(ps) => {
+                // each alternative is a path of its own to the join
+                let join = self.new_node();
+                let start = self.cur;
+                for &x in ast.list(ps) {
+                    self.cur = start;
+                    self.bind_pat(x, define);
+                    if let Some(c) = self.cur { self.link(c, join); }
+                }
+                self.cur = if self.nodes[join as usize].has_pred { Some(join) } else { None };
+            }
+            Pat::TupleStruct(_, ps) | Pat::Tuple(ps) | Pat::Slice(ps) => {
                 for &x in ast.list(ps) { self.bind_pat(x, define); }
             }
             Pat::Struct(_, fs, _) => {
@@ -289,7 +309,7 @@ impl<'c, 'a> Unit<'c, 'a> {
                     let sc = self.cur_scope;
                     self.decl_scopes.entry(v).or_insert(sc);
                     if let Some(n) = self.step(Vec::new(), v) {
-                        self.accesses.push(Access { var: v, kind: AccessKind::Param, key: (name.lo, name.hi), node: n, at_entry: false, direct: true, scope: self.cur_scope });
+                        self.accesses.push(Access { var: v, kind: AccessKind::Param, key: (name.lo, name.hi), node: n, at_entry: false, direct: true, scope: self.cur_scope, init: true });
                     }
                     return;
                 }
@@ -525,9 +545,19 @@ impl<'c, 'a> Unit<'c, 'a> {
         }
     }
 
-    /// A call that never returns ends the flow.
+    /// A call that never returns (its result is `!`, or a type without values) ends the flow.
     fn after_call(&mut self, e: ExprId) {
-        if self.is_never(e) { self.cur = None; }
+        if self.is_never(e) || self.uninhabited(e) { self.cur = None; }
+    }
+
+    fn uninhabited(&mut self, e: ExprId) -> bool {
+        let b = self.cx.body;
+        let i = b.expr_ix(e);
+        if i >= b.expr_ty.len() || !b.expr_typed.get(i) { return false; }
+        let ty = b.expr_ty[i];
+        if !matches!(self.cx.tcx.tys.kind(ty), TyKind::Adt(..)) { return false; }
+        let cx = self.cx.pcx.get_or_insert_with(|| crate::pattern_analysis::body_cx(self.cx.prog, self.cx.tcx, self.cx.body));
+        cx.is_uninhabited(ty)
     }
 
     fn find_loop(&self, label: Option<Ident>) -> Option<usize> {
@@ -615,7 +645,7 @@ impl<'c, 'a> Unit<'c, 'a> {
     // ------------------------------------------------------------ assignments
 
     fn record(&mut self, var: u32, key: (u32, u32), node: u32, direct: bool) {
-        self.accesses.push(Access { var, kind: AccessKind::Assign, key, node, at_entry: false, direct, scope: self.cur_scope });
+        self.accesses.push(Access { var, kind: AccessKind::Assign, key, node, at_entry: false, direct, scope: self.cur_scope, init: false });
     }
 
     fn peel(&self, mut e: ExprId) -> ExprId {
@@ -912,14 +942,14 @@ impl<'c, 'a> Unit<'c, 'a> {
             }
         }
         // the accesses, merged per variable and source span
-        struct Merged { kind: AccessKind, key: (u32, u32), live: bool, direct: bool, scope: usize }
+        struct Merged { kind: AccessKind, key: (u32, u32), live: bool, direct: bool, scope: usize, init: bool }
         let mut per_var: Vec<Vec<Merged>> = (0..nv).map(|_| Vec::new()).collect();
         for a in &self.accesses {
             if !reach[a.node as usize] { continue; }
             let live = if a.at_entry { bit(&live_in[self.entry as usize * w..self.entry as usize * w + w], a.var) } else { bit(&live_out(&self, a.node), a.var) };
             match per_var[a.var as usize].iter_mut().find(|m| m.key == a.key) {
-                Some(m) => { m.live |= live; m.direct &= a.direct; }
-                None => per_var[a.var as usize].push(Merged { kind: a.kind, key: a.key, live, direct: a.direct, scope: a.scope }),
+                Some(m) => { m.live |= live; m.direct &= a.direct; m.init |= a.init; }
+                None => per_var[a.var as usize].push(Merged { kind: a.kind, key: a.key, live, direct: a.direct, scope: a.scope, init: a.init }),
             }
         }
         // captured by value: an access at entry
@@ -928,7 +958,7 @@ impl<'c, 'a> Unit<'c, 'a> {
             if var.own || var.by_ref || Self::ignored(&var.name) { continue; }
             if self.closure.is_some() {
                 let live = bit(&live_in[self.entry as usize * w..self.entry as usize * w + w], v as u32);
-                per_var[v].push(Merged { kind: AccessKind::Capture, key: (0, 0), live, direct: true, scope: self.cur_scope });
+                per_var[v].push(Merged { kind: AccessKind::Capture, key: (0, 0), live, direct: true, scope: self.cur_scope, init: false });
             }
         }
         // does the variable appear in reachable code
@@ -952,7 +982,7 @@ impl<'c, 'a> Unit<'c, 'a> {
                     && self.cx.tcx.needs_drop(prog, env, ty)
             };
             let def_pos = var.intro.first().copied().unwrap_or(0);
-            let mut statements: Vec<&Merged> = per_var[v].iter().filter(|m| m.kind == AccessKind::Assign).collect();
+            let mut statements: Vec<&Merged> = per_var[v].iter().filter(|m| m.kind == AccessKind::Assign && !m.init).collect();
             if var.own && !ever[v] {
                 if !self.scope_of_decl_ok(def_pos) { continue; }
                 if statements.is_empty() {
@@ -972,6 +1002,8 @@ impl<'c, 'a> Unit<'c, 'a> {
             // dead assignments
             let guard = drop_guard();
             for m in &per_var[v] {
+                // the initialisation of an unused variable is the unused variable itself
+                if m.init && var.own && !ever[v] { continue; }
                 let should = !m.live && (m.direct || !guard);
                 if !should { continue; }
                 match m.kind {

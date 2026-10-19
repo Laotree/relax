@@ -663,7 +663,8 @@ impl<'a> Visitor<'a> for BodyRefs<'a> {
                 }
             }
             Pat::Ident { name, .. } => {
-                if self.body.pat_local.get(&p.0).is_some() && self.body.pat_res.get(&p.0).is_none() {
+                // (a binding a macro made has no place of its own: it maps to the call)
+                if self.body.pat_local.get(&p.0).is_some() && self.body.pat_res.get(&p.0).is_none() && name.lo < self.prog.files[self.body.file as usize].src_len {
                     let site = self.prog.files[self.body.file as usize].diagnostic_pos(name.lo);
                     BINDING_SITES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert((self.body.file, site));
                 }
@@ -1013,7 +1014,6 @@ impl<'a> Dead<'a> {
     fn explore(&mut self, w: Work) {
         let mut id = w.id;
         self.propagated = w.propagated;
-        if std::env::var_os("LINTDBG").is_some() && self.local(id) { eprintln!("explore {} {:?} own={} prop={}", self.prog.def_path(id), self.prog.def(id).kind, w.own, w.propagated); }
         if !w.own { self.live.insert(id); }
         if !self.scanned.insert((id, w.propagated)) { return; }
         let def = *self.prog.def(id);
@@ -1421,7 +1421,6 @@ impl<'a, 'b> Reporter<'a, 'b> {
                 }
             }
             if def.kind == DefKind::Impl { continue; }
-            if std::env::var_os("LINTDBG").is_some() { eprintln!("dead? {} kind {:?} parent {} {:?} live {}", prog.name(d), def.kind, if def.parent != NO_DEF { prog.name(def.parent) } else { "-" }, if def.parent != NO_DEF { Some(prog.def(def.parent).kind) } else { None }, live.contains(&d)); }
             if !live.contains(&d) {
                 if !candidates(d) { continue; }
                 // closures and anonymous constants are live with the item around them

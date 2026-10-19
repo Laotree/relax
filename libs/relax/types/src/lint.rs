@@ -572,3 +572,23 @@ mod tests {
         assert!(crate::lint_table::GROUPS.contains(&"nonstandard_style"));
     }
 }
+
+/// Whether `d` (or an item around it) was written by a derive, attribute or built-in macro:
+/// rustc reports no lints inside their output (the spans are `in_external_macro`). A
+/// `macro_rules!` expansion is the user's code and is judged.
+pub fn generated(prog: &Program, d: DefId) -> bool {
+    let mut cur = d;
+    let mut guard = 0;
+    while cur != NO_DEF && guard < 64 {
+        guard += 1;
+        let def = prog.def(cur);
+        if matches!(def.kind, DefKind::Prim(_)) { return false; }
+        if !matches!(def.kind, DefKind::Mod | DefKind::Closure | DefKind::AnonConst | DefKind::OpaqueTy | DefKind::Variant | DefKind::Field | DefKind::MacroRules) {
+            let pf = &prog.files[def.file as usize];
+            let it = pf.ast.item(def.item);
+            if it.lo >= pf.src_len && matches!(pf.expansion_region_kind(it.lo), crate::parser::ExpnKind::Builtin | crate::parser::ExpnKind::ExternalRules) { return true; }
+        }
+        cur = def.parent;
+    }
+    false
+}
