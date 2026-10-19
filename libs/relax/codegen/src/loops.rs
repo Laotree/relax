@@ -1171,6 +1171,62 @@ pub fn vectorize_reductions(options: &relax_session::Options, f: &mut Func) -> b
     changed
 }
 
+/// Chains of constant steps flattened: in a block, `t1 = x + a; t2 = t1 + b` (single-definition
+/// temporaries, 64-bit) becomes `t2 = x + (a + b)` while `x` is not redefined in between, so the
+/// steps of an unrolled copy (`s += 8` repeated, each address read from the one before) all hang off
+/// the first value and address modes fold their offsets as displacements instead of every copy
+/// waiting for the previous one's add. Returns whether anything changed.
+pub fn flatten_step_chains(f: &mut Func) -> bool {
+    let nv = f.vregs.len();
+    let mut ndef = vec![0u32; nv];
+    for p in &f.params {
+        ndef[p.0 as usize] += 1;
+    }
+    for b in &f.blocks {
+        for i in &b.insts {
+            for_defs(i, |d| ndef[d.0 as usize] += 1);
+        }
+    }
+    let mut changed = false;
+    // (temporary, root, offset from the root) for the block being read
+    let mut known: Vec<(VReg, VReg, i64)> = Vec::new();
+    for b in f.blocks.iter_mut() {
+        known.clear();
+        for i in b.insts.iter_mut() {
+            if let Inst::IBinI(op @ (IOp::Add | IOp::Sub), it, d, x, k) = *i {
+                if it.bits == 64 && ndef[d.0 as usize] == 1 && d != x {
+                    let k = if op == IOp::Add { Some(k) } else { k.checked_neg() };
+                    if let Some(k) = k {
+                        let (root, base) = match known.iter().find(|e| e.0 == x) {
+                            Some(e) => (e.1, e.2),
+                            None => (x, 0),
+                        };
+                        if let Some(off) = base.checked_add(k) {
+                            if off != k && off.abs() < 1 << 30 && root != d {
+                                *i = if off >= 0 { Inst::IBinI(IOp::Add, it, d, root, off) } else { Inst::IBinI(IOp::Sub, it, d, root, -off) };
+                                changed = true;
+                            }
+                            if off.abs() < 1 << 30 && root != d {
+                                // d changes now; every entry resting on d is stale
+                                known.retain(|e| e.0 != d && e.1 != d);
+                                known.push((d, root, off));
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // anything else that defines a vreg ends the entries resting on it
+            let mut ds: Vec<VReg> = Vec::new();
+            for_defs(i, |d| ds.push(d));
+            for d in ds {
+                known.retain(|e| e.0 != d && e.1 != d);
+            }
+        }
+    }
+    changed
+}
+
 fn merge_stores_on(options: &relax_session::Options) -> bool {
     !options.no_store_merge
 }
