@@ -25,6 +25,7 @@ pub const LET_UNDERSCORE_DROP: Lint = lint::lint("let_underscore_drop", Level::A
 pub const LET_UNDERSCORE_LOCK: Lint = lint::lint("let_underscore_lock", Level::Deny, &[]);
 pub const FOR_LOOPS_OVER_FALLIBLES: Lint = lint::lint("for_loops_over_fallibles", Level::Warn, &[]);
 pub const MAP_UNIT_FN: Lint = lint::lint("map_unit_fn", Level::Warn, &["unused"]);
+pub const UNUSED_ALLOCATION: Lint = lint::lint("unused_allocation", Level::Warn, &["unused"]);
 pub const DEREF_NULLPTR: Lint = lint::lint("deref_nullptr", Level::Deny, &[]);
 pub const TRIVIAL_CASTS: Lint = lint::lint("trivial_casts", Level::Allow, &[]);
 pub const TRIVIAL_NUMERIC_CASTS: Lint = lint::lint("trivial_numeric_casts", Level::Allow, &[]);
@@ -428,17 +429,15 @@ impl<'a> Late<'a> {
             }
             ExprKind::MethodCall(..) => {
                 self.check_map_unit_fn(e);
+                self.check_unused_allocation(e);
                 self.check_atomic_load_store(e);
                 self.check_atomic_compare_exchange(e);
             }
             ExprKind::Cast(x, _) => self.check_trivial_cast(e, x),
-            ExprKind::AddrOf(true, _, x) => self.raw_operand = Some(x),
+            ExprKind::AddrOf(true, _, x) => self.raw_operand = Some(unparen(self.ast, x)),
             ExprKind::Unary(UnOp::Deref, x) => self.check_deref_nullptr(e, x),
             ExprKind::For(row) => self.check_for_loop_fallible(*self.ast.row(row)),
-            ExprKind::Assign(l, r) => {
-                // `_ = value;` is a non-binding let (LocalSource::AssignDesugar)
-                if matches!(self.ast.expr(l).kind, ExprKind::Underscore) { self.check_non_binding(None, Some(r), ex.lo); }
-            }
+            ExprKind::Assign(l, r) => self.check_assign_desugar(l, r, ex.lo),
             _ => {}
         }
     }
@@ -581,6 +580,60 @@ impl<'a> Late<'a> {
             Pat::Ref(_, x) | Pat::Paren(x) | Pat::Box(x) => self.collect_wilds(x, false, out),
             _ => {}
         }
+    }
+
+    /// A destructuring assignment `(_, a) = value;` / `_ = value;` is a `let` with the `_`
+    /// patterns of the left side (LocalSource::AssignDesugar).
+    fn check_assign_desugar(&self, l: ExprId, r: ExprId, lo: u32) {
+        let mut wilds = Vec::new();
+        self.assign_wilds(l, &mut wilds);
+        for u in wilds {
+            let top = unparen(self.ast, l) == u;
+            let Some(ty) = (if top { self.expr_ty(r) } else { self.expr_ty(u) }) else { continue };
+            if !self.tcx.needs_drop(self.prog, self.pcx.typing_env(), ty) { continue; }
+            let potential = match self.kind(ty) {
+                TyKind::Adt(d, args, _) if Some(d) == self.lang_parent(LangItem::ResultOk) => self.tcx.tys.list(args)[0],
+                _ => ty,
+            };
+            let is_sync_lock = match self.kind(potential) {
+                TyKind::Adt(d, _, _) => matches!(self.diag_item(d).as_deref(), Some("MutexGuard" | "RwLockReadGuard" | "RwLockWriteGuard")),
+                _ => false,
+            };
+            if is_sync_lock {
+                self.emit(&LET_UNDERSCORE_LOCK, self.ast.expr(u).lo, "non-binding let on a synchronization lock");
+            } else if top {
+                self.emit(&LET_UNDERSCORE_DROP, lo, "non-binding let on a type that has a destructor");
+            }
+        }
+    }
+
+    fn assign_wilds(&self, e: ExprId, out: &mut Vec<ExprId>) {
+        let ast = self.ast;
+        match ast.expr(e).kind {
+            ExprKind::Underscore => out.push(e),
+            ExprKind::Paren(x) => self.assign_wilds(x, out),
+            ExprKind::Tuple(xs) | ExprKind::Array(xs) => { for &x in ast.list(xs) { self.assign_wilds(x, out); } }
+            ExprKind::Call(f, xs) if self.path_def(f).is_some_and(|d| matches!(self.prog.def(d).kind, DefKind::Struct | DefKind::Variant)) => {
+                for &x in ast.list(xs) { self.assign_wilds(x, out); }
+            }
+            ExprKind::Struct(row) => { for f in ast.list(ast.row(row).fields) { self.assign_wilds(f.expr, out); } }
+            _ => {}
+        }
+    }
+
+    // ---- unused.rs UnusedAllocation
+    fn check_unused_allocation(&self, e: ExprId) {
+        let ExprKind::MethodCall(recv, _) = self.ast.expr(e).kind else { return };
+        let recv = unparen(self.ast, recv);
+        let ExprKind::Call(f, args) = self.ast.expr(recv).kind else { return };
+        if self.ast.list(args).len() != 1 { return; }
+        let Some(d) = self.path_def(f) else { return };
+        if self.diag_item(d).as_deref() != Some("box_new") { return; }
+        let Some(m) = self.body.methods.get(&e.0) else { return };
+        // the receiver's adjustments: derefs, then a borrow; a borrow of the box itself is needed
+        if m.autoref == 0 || m.derefs == 0 { return; }
+        let msg = if m.autoref == 1 { "unnecessary allocation, use `&` instead" } else { "unnecessary allocation, use `&mut` instead" };
+        self.emit(&UNUSED_ALLOCATION, self.ast.expr(recv).lo, msg);
     }
 
     // ---- for_loops_over_fallibles.rs
@@ -979,6 +1032,15 @@ impl<'a> Kp<'a> {
             ExprKind::Lit(_) | ExprKind::Underscore | ExprKind::Continue(_) => V::Unknown,
             ExprKind::Paren(x) => self.eval(x),
             ExprKind::Path(_) => self.eval_path(e),
+            ExprKind::Unary(UnOp::Neg, x) if matches!(self.ast.expr(unparen(self.ast, x)).kind, ExprKind::Lit(LitKind::Int)) && self.int_of(x).is_some() => {
+                // a negated literal is one constant (THIR: the literal is negated, `-128i8` is fine)
+                let (bytes, signed) = self.int_of(x).unwrap();
+                if !signed { return V::Unknown; }
+                match self.eval_lit_wide(unparen(self.ast, x)) {
+                    Some(v) => V::Int(signed_of((v as i128).wrapping_neg() as u128 & mask(bytes), bytes) as u128),
+                    None => V::Unknown,
+                }
+            }
             ExprKind::Unary(op, x) => {
                 let v = self.eval(x);
                 if self.body.binops.get(&e.0).is_some() { return V::Unknown; }
@@ -1169,6 +1231,13 @@ impl<'a> Kp<'a> {
                 V::Unknown
             }
         }
+    }
+
+    /// The unsigned value of an integer literal (before the type's range is applied).
+    fn eval_lit_wide(&self, e: ExprId) -> Option<u128> {
+        let ex = self.ast.expr(e);
+        let text = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(ex.lo, ex.hi)).unwrap_or("");
+        crate::const_fold::parse_int_lit(text)
     }
 
     fn eval_path(&mut self, e: ExprId) -> V {
