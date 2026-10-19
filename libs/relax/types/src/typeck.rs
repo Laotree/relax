@@ -432,6 +432,8 @@ pub struct Fcx<'a> {
     keep_literal_vars: bool,
     /// default binding mode while checking a pattern: 0 move, 1 ref, 2 ref mut
     bind_mode: u8,
+    /// nesting of check_pat (0: a pattern's root, where its bindings are checked as a set)
+    pat_depth: u32,
     /// a path pattern's resolution, made before its adjust mode is chosen (rustc pat.rs
     /// resolve_pat_path / calc_adjust_mode): (the resolution, its type)
     pat_path_pre: Option<(Res, TyId)>,
@@ -683,6 +685,7 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         cast_checks: Vec::new(),
         pat_nest: 0,
         bind_mode: 0,
+        pat_depth: 0,
         pat_path_pre: None,
         extra_arg: None,
         pending_captures: Vec::new(),
@@ -767,6 +770,8 @@ fn check_fn_body(cx: &crate::tcx::EvalCx<'_>, prog: &Program, tcx: &Tcx, def: De
         fcx.scopes.push((s, li));
         pi = 1;
     }
+    let param_pats: Vec<PatId> = ast.list(fsig.params).iter().map(|p| p.pat).collect();
+    fcx.check_param_names(&param_pats);
     for p in ast.list(fsig.params) {
         let t = if pi < params.len() { params[pi] } else { fcx.tcx.tys.error };
         fcx.check_pat(p.pat, t);
@@ -1380,6 +1385,13 @@ impl<'a> Fcx<'a> {
                     Some(a) if !a.is_enum && !a.is_union => a.variants.first().and_then(|v| v.fields.last()).map(|f| f.ty),
                     _ => None,
                 };
+                // `struct Foo<T: A>(T::Assoc)` with `type Assoc = Foo<()>`: the tail is the struct
+                // itself -- the layout query cycle (E0391)
+                let Ok(_cycle) = crate::cycle::enter(crate::cycle::Kind::UnsizedTail, t.0, 1) else {
+                    let ts = self.ty_str(t);
+                    self.err(self.last_lo, format!("E0391: cycle detected when computing layout of `{}`", ts));
+                    return false;
+                };
                 match last {
                     Some(ft) => {
                         let ft = self.tcx.tys.subst(ft, self.tcx.tys.list(args));
@@ -1957,6 +1969,10 @@ impl<'a> Fcx<'a> {
     }
 
     fn check_pat_nested(&mut self, p: PatId, expected: TyId) {
+        if self.pat_depth == 0 {
+            self.pat_bindings(p, true);
+        }
+        self.pat_depth += 1;
         let ast = self.ast();
         // the pattern's type is the matched value's (lowering peels pat_derefs itself)
         let pi = self.b.pat_ix(p);
@@ -2034,6 +2050,108 @@ impl<'a> Fcx<'a> {
             }
         }
         self.bind_mode = saved_mode;
+        self.pat_depth -= 1;
+    }
+
+    /// The names a pattern binds (rustc_resolve late.rs `resolve_pattern_top` / `check_consistent_bindings`):
+    /// E0416 when one alternative binds a name twice, E0408 when the alternatives of an
+    /// or-pattern bind different names. An identifier naming a unit struct / variant / const is
+    /// not a binding.
+    fn pat_bindings(&mut self, p: PatId, report: bool) -> Vec<(Sym, u32)> {
+        let ast = self.ast();
+        let mut out: Vec<(Sym, u32)> = Vec::new();
+        // (names written by different macro expansions are different bindings)
+        let same = |this: &Self, a: (Sym, u32), b: (Sym, u32)| a.0 == b.0 && {
+            let pf = &this.prog.files[this.file as usize];
+            pf.hyg_ctxt(a.1) == pf.hyg_ctxt(b.1)
+        };
+        let add = |this: &mut Self, out: &mut Vec<(Sym, u32)>, more: Vec<(Sym, u32)>| {
+            for (n, pos) in more {
+                if out.iter().any(|m| same(this, *m, (n, pos))) {
+                    if report {
+                        this.err(pos, format!("E0416: identifier `{}` is bound more than once in the same pattern", this.prog.syms.str(n)));
+                    }
+                } else {
+                    out.push((n, pos));
+                }
+            }
+        };
+        match ast.pat(p) {
+            Pat::Ident { name, sub, .. } => {
+                if !(sub.is_none() && self.ident_pat_is_path(p)) {
+                    out.push((self.sym(*name), name.lo));
+                }
+                if let Some(sp) = sub {
+                    let more = self.pat_bindings(*sp, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::TupleStruct(_, l) | Pat::Tuple(l) | Pat::Slice(l) => {
+                // `..` may appear once (rustc_ast_passes check_pat)
+                let rests = ast.list(*l).iter().filter(|c| match ast.pat(**c) {
+                    Pat::Rest => true,
+                    Pat::Ident { sub: Some(s), .. } => matches!(ast.pat(*s), Pat::Rest),
+                    _ => false,
+                }).count();
+                if report && rests > 1 {
+                    let what = match ast.pat(p) { Pat::Tuple(_) => "tuple", Pat::Slice(_) => "slice", _ => "tuple struct" };
+                    let lo = ast.list(*l).iter().find_map(|c| if let Pat::Ident { name, .. } = ast.pat(*c) { Some(name.lo) } else { None }).unwrap_or(0);
+                    self.err(lo, format!("`..` can only be used once per {what} pattern"));
+                }
+                for &c in ast.list(*l) {
+                    let more = self.pat_bindings(c, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::Struct(_, fields, _) => {
+                for fp in ast.list(*fields) {
+                    let more = self.pat_bindings(fp.pat, report);
+                    add(self, &mut out, more);
+                }
+            }
+            Pat::Ref(_, c) | Pat::Paren(c) | Pat::Box(c) => out = self.pat_bindings(*c, report),
+            Pat::Or(alts) => {
+                let sets: Vec<Vec<(Sym, u32)>> = ast.list(*alts).iter().map(|&a| self.pat_bindings(a, report)).collect();
+                for (i, set) in sets.iter().enumerate() {
+                    for &(n, pos) in set {
+                        if !out.iter().any(|m| same(self, *m, (n, pos))) {
+                            if report && sets.iter().enumerate().any(|(j, other)| j != i && !other.iter().any(|m| same(self, *m, (n, pos)))) {
+                                self.err(pos, format!("E0408: variable `{}` is not bound in all patterns", self.prog.syms.str(n)));
+                            }
+                            out.push((n, pos));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// E0415: a parameter name bound more than once in one parameter list.
+    pub(crate) fn check_param_names(&mut self, pats: &[PatId]) {
+        let mut seen: Vec<(Sym, u32)> = Vec::new();
+        for &p in pats {
+            for (n, pos) in self.pat_bindings(p, false) {
+                let pf = &self.prog.files[self.file as usize];
+                if seen.iter().any(|(m, mp)| *m == n && pf.hyg_ctxt(*mp) == pf.hyg_ctxt(pos)) {
+                    self.err(pos, format!("E0415: identifier `{}` is bound more than once in this parameter list", self.prog.syms.str(n)));
+                } else {
+                    seen.push((n, pos));
+                }
+            }
+        }
+    }
+
+    /// 0 unit, 1 tuple, 2 struct: the shape of a struct or variant's constructor.
+    fn value_ctor_shape(&self, d: DefId) -> Option<u8> {
+        let def = self.prog.def(d);
+        let (adt, vi) = match def.kind {
+            DefKind::Struct => (d, 0),
+            DefKind::Variant => (def.parent, def.sub as usize),
+            _ => return None,
+        };
+        self.tcx.adts.get(&adt)?.variants.get(vi).map(|v| v.shape)
     }
 
     fn ident_pat_is_const(&self, p: PatId) -> bool {
@@ -2063,6 +2181,32 @@ impl<'a> Fcx<'a> {
             Pat::Wild | Pat::Rest => {}
             Pat::Ident { by_ref, mutbl, name, sub } => {
                 let s = self.sym(*name);
+                // rustc_resolve late.rs try_resolve_as_non_binding: a binding may not shadow a
+                // static, a tuple struct / variant constructor, or (written `ref x` / `mut x` /
+                // `x @ ..`, so not a path pattern) a unit struct / variant / const
+                if !self.scopes.iter().any(|(sy, _)| *sy == s) {
+                    if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
+                        let simple = sub.is_none() && !*by_ref && !*mutbl;
+                        let what = match self.prog.def(d).kind {
+                            DefKind::Static => Some("statics"),
+                            DefKind::Const | DefKind::AssocConst if !simple => Some("constants"),
+                            DefKind::Struct | DefKind::Variant => match self.value_ctor_shape(d) {
+                                Some(1) => Some(if self.prog.def(d).kind == DefKind::Struct { "tuple structs" } else { "tuple variants" }),
+                                Some(0) if !simple => Some(if self.prog.def(d).kind == DefKind::Struct { "unit structs" } else { "unit variants" }),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(what) = what {
+                            self.err(name.lo, format!("E0530: bindings cannot shadow {what}"));
+                        } else if simple {
+                            // an identifier pattern naming something ambiguous is an error, not a fresh binding
+                            if let Some(e) = self.prog.name_ambiguity(self.module, s, false, false) {
+                                self.err(name.lo, self.prog.privacy_message(&e));
+                            }
+                        }
+                    }
+                }
                 // a unit struct / unit variant / const in scope is a path pattern, not a binding
                 if sub.is_none() && !*by_ref && !*mutbl {
                     if let Some(d) = self.prog.lookup_in_scope(self.module, s, false) {
@@ -2306,6 +2450,7 @@ impl<'a> Fcx<'a> {
                                     self.err(fp.name.lo, format!("E0025: field `{}` bound multiple times in the pattern", self.text(fp.name)));
                                 }
                                 mentioned.push(fi);
+                                self.check_field_privacy(adt_ty, vi, fi, fp.name.lo);
                                 self.check_pat(fp.pat, t)
                             }
                             None => {
@@ -2749,6 +2894,12 @@ impl<'a> Fcx<'a> {
             return Res::Err;
         }
         if segs.len() == 1 {
+            // a generic parameter shadows an item of the same name
+            if segs[0].0 == SegKind::Ident && !path.global() && self.env.names.iter().take(self.b.args.len()).any(|n| *n == segs[0].1) {
+                let msg = format!("E0574: expected struct, variant or union type, found type parameter `{}`", prog.syms.str(segs[0].1));
+                self.err(path.lo, msg);
+                return Res::Err;
+            }
             if let Some(d) = prog.lookup_in_scope(self.module, segs[0].1, true) {
                 if matches!(prog.def(d).kind, DefKind::Struct | DefKind::Union) {
                     return Res::Def(d);
@@ -2877,8 +3028,19 @@ impl<'a> Fcx<'a> {
                     None => return self.tcx.tys.error,
                 };
                 let mut args = Vec::new();
+                let mut regions = Vec::new();
+                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
+                let regions = self.tcx.tys.intern_region_args(&regions);
                 match explicit {
-                    Some(v) => args = v,
+                    Some(v) => {
+                        args = v;
+                        // hir_ty_lowering/generics.rs: parameters left out of explicit arguments take
+                        // their defaults (`Uwu::<N>` for `Uwu<const N: u32 = 1, const M: u32 = N>`)
+                        if args.len() < adt.n_generics as usize {
+                            let cx = self.cx.with_infcx(&self.infcx);
+                            self.tcx.fill_type_defaults(&cx, self.prog, adt_def, &mut args, Some(regions));
+                        }
+                    }
                     None => {
                         for _ in 0..adt.n_generics {
                             args.push(self.fresh_arg(d, args.len()));
@@ -2886,9 +3048,6 @@ impl<'a> Fcx<'a> {
                     }
                 }
                 self.b.res_args.insert(key, self.tcx.tys.mk_list(&args));
-                let mut regions = Vec::new();
-                for _ in &adt.generic_indices.lifetimes { regions.push(self.fresh_region()); }
-                let regions = self.tcx.tys.intern_region_args(&regions);
                 let full = self.tcx.complete_args(self.prog, adt_def, &args, regions);
                 self.apply_fn_bounds(adt_def, &full, self.last_lo);
                 let inst = self.tcx.tys.intern(TyKind::Adt(adt_def, self.tcx.tys.mk_list(&args), regions));
@@ -3039,6 +3198,29 @@ impl<'a> Fcx<'a> {
 
     /// Resolves a value path. `key`: expr or pat id for recording generic args.
     fn resolve_value_path(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
+        let r = self.resolve_value_path_inner(path, key, is_pat);
+        if let Res::Def(d) = r.0 {
+            self.check_ctor_privacy(d, path.lo);
+        }
+        r
+    }
+
+    /// A tuple struct's constructor is as private as its most private field (rustc_resolve
+    /// build_reduced_graph: ctor visibility; a path to it is E0603, a call E0423).
+    fn check_ctor_privacy(&mut self, d: DefId, pos: u32) {
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
+        if self.prog.def(d).kind != DefKind::Struct || self.value_ctor_shape(d) != Some(1) {
+            return;
+        }
+        let Some(adt) = self.tcx.adts.get(&d) else { return };
+        let hidden = adt.variants.first().map_or(false, |v| v.fields.iter().any(|f| !self.field_visible(d, f)));
+        if hidden {
+            let msg = format!("E0603: tuple struct constructor `{}` is private", self.prog.name(d));
+            self.err(pos, msg);
+        }
+    }
+
+    fn resolve_value_path_inner(&mut self, path: &Path, key: u32, is_pat: bool) -> (Res, TyId) {
         let prog = self.prog;
         // hir_ty_lowering/generics.rs lower_generic_args: the item's own written
         // lifetime arguments (last segment).
@@ -3053,6 +3235,11 @@ impl<'a> Fcx<'a> {
         }
         let segs = crate::program::path_segs(prog, self.file, path);
         let error = self.tcx.tys.error;
+        if segs.len() == 1 && path.no_qself() && !path.global() && segs[0].0 == SegKind::Ident && !self.scopes.iter().any(|(sy, _)| *sy == segs[0].1) {
+            if let Some(e) = prog.name_ambiguity(self.module, segs[0].1, false, false) {
+                self.err(path.lo, prog.privacy_message(&e));
+            }
+        }
         if let Some(q) = self.ast().qself(path) {
             // `<T as Trait>::item`
             let self_t = self.lower_ty(q.ty);
@@ -3188,6 +3375,11 @@ impl<'a> Fcx<'a> {
                 return (Res::Def(d), t);
             }
         }
+        if path.no_qself() {
+            if let Some(e) = prog.path_privacy(self.module, path.global(), &segs, Some(false), false, false).filter(|_| path.lo < prog.files[self.file as usize].src_len) {
+                self.err(path.lo, prog.privacy_message(&e));
+            }
+        }
         // container path (module / enum / trait)
         let parent = if segs[0].0 == SegKind::SelfType && n == 2 {
             None
@@ -3292,6 +3484,7 @@ impl<'a> Fcx<'a> {
         }
         match self.assemble_inherent_impl_probe(self_ty, name) {
             Some((item, imp)) => {
+                self.check_assoc_privacy(item, path.lo);
                 // impl generic args from matching the impl self type against self_ty
                 let impl_args = self.impl_args_for_value_path(imp, self_ty);
                 let own = self.tcx.fn_sig(self.prog, item).map_or(0, |s| s.n_generics - s.n_parent_generics);
@@ -3358,7 +3551,8 @@ impl<'a> Fcx<'a> {
         let mut candidates = Vec::new();
         for (td, args) in self.param_bounds(t) {
             for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                if self.prog.def(item).name == name {
+                // value namespace: an associated type of the same name is another item
+                if self.prog.def(item).name == name && matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) {
                     let c = (item, args.clone());
                     if !candidates.contains(&c) { candidates.push(c); }
                 }
@@ -3367,7 +3561,7 @@ impl<'a> Fcx<'a> {
         if candidates.is_empty() {
             for td in self.traits_in_scope() {
                 for &item in &self.prog.traits[self.prog.def(td).sub as usize] {
-                    if self.prog.def(item).name != name { continue; }
+                    if self.prog.def(item).name != name || !matches!(self.prog.def(item).kind, DefKind::AssocFn | DefKind::AssocConst) { continue; }
                     let save = self.start_snapshot();
                     let mut args = Vec::new();
                     for i in 1..=self.tcx.trait_generic_count(self.prog, td) { args.push(self.fresh_arg(td, i as usize)); }
@@ -4017,6 +4211,19 @@ impl<'a> Fcx<'a> {
 
     // ------------------------------------------------------------ blocks
 
+    /// rustc_hir_typeck check_block_no_value: a loop body has type `()` (a `!` body coerces to it);
+    /// the tail expression is a coercion site for the unit expectation.
+    fn check_block_no_value(&mut self, b: BlockId) {
+        let unit = self.tcx.tys.unit;
+        let ty = self.check_block(b, Some(unit));
+        let st = self.shallow(ty);
+        if matches!(self.tcx.tys.kind(st), TyKind::Never) { return; }
+        let blk = self.ast().block(b);
+        let tail = match self.ast().list(blk.stmts).last() { Some(Stmt::Expr(e, false)) => Some(*e), _ => None };
+        let pos = match tail { Some(e) => self.ast().expr(e).lo, None => blk.lo };
+        self.coerce_or_unify(ty, unit, tail, pos);
+    }
+
     fn check_block(&mut self, b: BlockId, expected: Option<TyId>) -> TyId {
         let ast = self.ast();
         let blk = ast.block(b);
@@ -4474,11 +4681,7 @@ impl<'a> Fcx<'a> {
                 self.check_expr(*c, Some(bool_));
                 self.in_loop_condition = false;
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);
@@ -4490,11 +4693,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: true });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 let lp = self.loops.pop().unwrap();
                 self.in_loop_condition = was_in_condition;
                 match lp.break_ty {
@@ -4523,11 +4722,7 @@ impl<'a> Fcx<'a> {
                 self.loops.push(Loop { label: l, break_ty: None, is_loop: false });
                 let was_in_condition = std::mem::replace(&mut self.in_loop_condition, false);
                 // a loop body has type `()`: an open tail type is unit (`for _ in r { zeroed() }`)
-                let bt = self.check_block(*b, Some(unit));
-                let sb = self.shallow(bt);
-                if matches!(self.tcx.tys.kind(sb), TyKind::Infer(_)) {
-                    self.eq(sb, unit);
-                }
+                self.check_block_no_value(*b);
                 self.loops.pop();
                 self.in_loop_condition = was_in_condition;
                 self.scopes.truncate(saved);
@@ -4564,6 +4759,8 @@ impl<'a> Fcx<'a> {
                             None => self.loops[i].break_ty = Some(bt),
                         }
                     }
+                } else if let Some((_, _)) = l {
+                    self.err(lo, format!("E0426: use of undeclared label `{}`", self.text(label.get().unwrap())));
                 } else {
                     self.err(lo, "E0268: `break` outside of a loop or labeled block".to_string());
                 }
@@ -4572,6 +4769,13 @@ impl<'a> Fcx<'a> {
             ExprKind::Continue(label) => {
                 if self.in_loop_condition && label.is_none() {
                     self.err(lo, "E0590: `break` or `continue` with no label in the condition of a `while` loop".to_string());
+                }
+                let l = label.map(|x| self.sym_lifetime(x));
+                if self.loop_index(l).is_none() {
+                    match label.get() {
+                        Some(x) => self.err(lo, format!("E0426: use of undeclared label `{}`", self.text(x))),
+                        None => self.err(lo, "E0268: `continue` outside of a loop".to_string()),
+                    }
                 }
                 self.tcx.tys.never
             }
@@ -4945,6 +5149,7 @@ impl<'a> Fcx<'a> {
                     match self.field_ty(adt_ty, vi, fname) {
                         Some((fi, ft)) => {
                             given.push(fi);
+                            self.check_field_privacy(adt_ty, vi, fi, fe.name.lo);
                             let t = self.check_expr(fx, Some(ft));
                             self.coerce_or_unify(t, ft, Some(fx), fe.name.lo);
                         }
@@ -4958,6 +5163,17 @@ impl<'a> Fcx<'a> {
                 if let Some(bx) = base {
                     let t = self.check_expr(bx, Some(adt_ty));
                     self.eq(t, adt_ty);
+                    // the fields taken from the base must be visible too (rustc_hir_typeck
+                    // check_expr_struct_fields: private fields of a functional update)
+                    if let TyKind::Adt(ad, _, _) = self.tcx.tys.kind(self.shallow(adt_ty)).clone() {
+                        if let Some(n) = self.tcx.adts.get(&ad).and_then(|a| a.variants.get(vi as usize)).map(|v| v.fields.len()) {
+                            for fi in 0..n as u32 {
+                                if !given.contains(&fi) {
+                                    self.check_field_privacy(adt_ty, vi, fi, lo);
+                                }
+                            }
+                        }
+                    }
                 }
                 if *rest {
                     self.struct_defaults(e, d, adt_ty, vi, &given, lo);
@@ -5448,6 +5664,44 @@ impl<'a> Fcx<'a> {
         self.tcx.tys.error
     }
 
+    /// E0624: an item of an inherent impl is private to the impl's module.
+    fn check_assoc_privacy(&mut self, item: DefId, pos: u32) {
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
+        let def = self.prog.def(item);
+        if self.prog.def(def.parent).kind != DefKind::Impl || !self.prog.own_crates.get(def.krate as usize).copied().unwrap_or(false) {
+            return;
+        }
+        let vis = self.prog.def_item_vis(item);
+        if self.prog.vis_visible(vis, self.module) {
+            return;
+        }
+        let what = match def.kind {
+            DefKind::AssocFn if self.tcx.fn_sig(self.prog, item).map_or(false, |s| s.self_kind != 0) => "method",
+            DefKind::AssocFn => "associated function",
+            DefKind::AssocConst => "associated constant",
+            _ => "associated item",
+        };
+        let msg = format!("E0624: {} `{}` is private", what, self.prog.syms.str(def.name));
+        self.err(pos, msg);
+    }
+
+    /// E0451: a field named in a struct expression or pattern must be visible here.
+    fn check_field_privacy(&mut self, adt_ty: TyId, vi: u32, fi: u32, pos: u32) {
+        // (macro output is held to the macro's own privacy, not the call site's)
+        if pos >= self.prog.files[self.file as usize].src_len { return; }
+        let st = self.shallow(adt_ty);
+        let TyKind::Adt(d, _, _) = self.tcx.tys.kind(st).clone() else { return };
+        let Some(adt) = self.tcx.adts.get(&d) else { return };
+        let Some(f) = adt.variants.get(vi as usize).and_then(|v| v.fields.get(fi as usize)) else { return };
+        if adt.is_enum || self.field_visible(d, f) {
+            return;
+        }
+        let what = match self.prog.def(d).kind { DefKind::Union => "union", _ => "struct" };
+        let fname = if f.name & 0x8000_0000 != 0 { (f.name & 0x7fff_ffff).to_string() } else { self.prog.syms.str(f.name).to_string() };
+        let msg = format!("E0451: field `{}` of {} `{}` is private", fname, what, self.prog.name(d));
+        self.err(pos, msg);
+    }
+
     /// Is a field of ADT `d` visible here: `pub`, or we are inside the ADT's module (or below it).
     fn field_visible(&self, d: DefId, f: &crate::tcx::FieldT) -> bool {
         // (`pub` / `pub(in path)`: inside that module only)
@@ -5792,6 +6046,8 @@ impl<'a> Fcx<'a> {
         self.closure_depth.push((e.0, saved));
         let save_async = std::mem::take(&mut self.async_depth);
         let save_awaits = std::mem::take(&mut self.await_count);
+        let closure_pats: Vec<PatId> = params.iter().map(|p| p.pat).collect();
+        self.check_param_names(&closure_pats);
         for (p, t) in params.iter().zip(self.tcx.tys.list(ps).iter().copied()) {
             self.check_pat(p.pat, t);
         }
