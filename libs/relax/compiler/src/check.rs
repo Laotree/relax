@@ -192,7 +192,7 @@ fn check_crate_impl(u: &mut Unit, root: u32, crates: &[u32], mut errors: Vec<Str
         let mut out = Outcome { errors: Vec::new(), diags: Vec::new(), seed: None, retry: false };
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // the syntax-level lints do not wait for the types (rustc runs them before analysis)
-            relax_types::lint_early::check_def(prog, d);
+            relax_types::lint_early::check_def(prog, tcx, d);
             let body = tcx.typeck(prog, d);
             if !body.errors.is_empty() {
                 return (body.errors.to_vec(), Vec::new());

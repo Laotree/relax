@@ -49,6 +49,7 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
             | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::ForeignStatic) { continue; }
         let d = DefId(i as u32);
         let mut w = W::new(prog, def.file, d);
+        w.names = Some(crate::lint_early2::names(prog, tcx, d));
         w.item(def.item, def.kind);
         item_lints(prog, d);
     }
@@ -59,15 +60,16 @@ pub fn check_items(prog: &Program, tcx: &Tcx, own: &[bool]) {
 }
 
 /// Body-level passes over one typed body owner.
-pub fn check_body(prog: &Program, _tcx: &Tcx, body: &Body) { check_def(prog, body.def) }
+pub fn check_body(prog: &Program, tcx: &Tcx, body: &Body) { check_def(prog, tcx, body.def) }
 
 /// The syntax-level passes over the body of one fn / const / static definition (they need no
 /// types, so they also apply to a body whose type check failed).
-pub fn check_def(prog: &Program, def: DefId) {
+pub fn check_def(prog: &Program, tcx: &Tcx, def: DefId) {
     if !lint::enabled() { return; }
     let d = prog.def(def);
     let ast = &prog.files[d.file as usize].ast;
     let mut w = W::new(prog, d.file, def);
+    w.names = Some(crate::lint_early2::names(prog, tcx, def));
     match ast.item(d.item).kind {
         ItemKind::Fn(..) => {
             let Ok(Some(block)) = prog.fn_body(d.file, d.item) else { return };
@@ -457,6 +459,8 @@ pub(crate) struct W<'a> {
     ellipsis_off: bool,
     /// the lifetime use analysis (unused_lifetimes / single_use_lifetimes), when it runs
     lt: Option<LtCx>,
+    /// the lifetime resolution of the definition (hidden lifetimes of paths)
+    names: Option<std::sync::Arc<crate::tcx::lifetime_resolve::LifetimeResolution>>,
 }
 
 fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
@@ -464,7 +468,7 @@ fn is_lazy(op: BinOp) -> bool { matches!(op, BinOp::And | BinOp::Or) }
 impl<'a> W<'a> {
     pub(crate) fn new(prog: &'a Program, file: u32, def: DefId) -> W<'a> {
         let pf: &'a ParsedFile = &prog.files[file as usize];
-        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None }
+        W { prog, pf, ast: &pf.ast, file, def, stack: Vec::new(), cast_lt: Vec::new(), nb: HashMap::new(), self_ty_parens: false, labels: Vec::new(), cur: 0, ellipsis_off: false, lt: None, names: None }
     }
 
     fn emit(&self, l: &Lint, pos: u32, msg: &str) {
@@ -479,35 +483,6 @@ impl<'a> W<'a> {
         let n = self.ast.list(attrs).len();
         let len = self.stack.len();
         self.stack.truncate(len - n);
-    }
-
-    /// The outer attributes written right before the statement at `pos` (token ranges of the
-    /// file's own source): Program loading turns `Stmt::Attrs` into plain statements, so the
-    /// lint levels they set are read back from the tokens.
-    fn recover_attrs(&self, pos: u32) -> Vec<Attr> {
-        let pf = self.pf;
-        let mut out = Vec::new();
-        if pos >= pf.src_len { return out; }
-        let src = pf.src_view();
-        let mut end = pf.toks.partition_point(|t| t.lo < pos);
-        while end > 0 && crate::cfg::tok_str(src, end - 1) == b"]" {
-            let (mut depth, mut k, mut open) = (0i32, end - 1, None);
-            loop {
-                match crate::cfg::tok_str(src, k) {
-                    b"]" => depth += 1,
-                    b"[" => { depth -= 1; if depth == 0 { open = Some(k); break; } }
-                    _ => {}
-                }
-                if k == 0 { break; }
-                k -= 1;
-            }
-            let Some(o) = open else { break };
-            if o == 0 || crate::cfg::tok_str(src, o - 1) != b"#" { break; }
-            out.push(Attr { inner: false, toks: TokRange { lo: o as u32 + 1, hi: end as u32 - 1 } });
-            end = o - 1;
-        }
-        out.reverse();
-        out
     }
 
     /// `Span::from_expansion` of the node starting at `pos`.
@@ -1116,14 +1091,12 @@ impl<'a> W<'a> {
                 self.leave(l.attrs);
             }
             Stmt::Expr(e, semi) => {
-                // the loader dropped the attributes of expression statements: read them back
-                let rec = self.recover_attrs(ast.expr(e).lo);
-                let n = rec.len();
-                self.stack.extend(rec);
+                // the lint attributes of an expression statement survive cfg stripping
+                let attrs = ast.stmt_attrs(e);
+                self.enter(attrs);
                 if !semi { self.both(e, Ctx::BlockRetValue, false); }
                 self.expr(e);
-                let len = self.stack.len();
-                self.stack.truncate(len - n);
+                self.leave(attrs);
             }
             Stmt::Attrs(r) => {
                 let a = *ast.row(r);
@@ -1412,6 +1385,31 @@ impl<'a> W<'a> {
             }
         }
         for seg in ast.segs(p.segs) { self.generic_args(seg.args()); }
+        self.hidden_lifetimes(p);
+    }
+
+    /// rustc_resolve `resolve_elided_lifetimes_in_path`: `elided_lifetimes_in_paths` for each
+    /// segment of a type path that names a type with lifetime parameters and gives none (the
+    /// paths of expressions and patterns infer them).
+    fn hidden_lifetimes(&self, p: &Path) {
+        use crate::tcx::lifetime_resolve::LifetimeRes;
+        let Some(names) = &self.names else { return };
+        let ast = self.ast;
+        for (i, seg) in ast.segs(p.segs).iter().enumerate() {
+            match names.path(p.segs.lo + i as u32, 0) {
+                None | Some(LifetimeRes::Infer) | Some(LifetimeRes::Error) => continue,
+                Some(_) => {}
+            }
+            // with generic arguments written (`Foo<>`, `Foo<u8>`) the opening `<`, else the name
+            let mut pos = seg.name.lo;
+            if ast.gargs(seg.args()).is_some() {
+                let mut at = seg.name.hi;
+                let n = self.pf.src_len;
+                while at < n && self.pf.bytes(at, at + 1) != b"<" { at += 1; }
+                if at < n { pos = at; }
+            }
+            self.emit(&crate::lint_early2::ELIDED_LIFETIMES_IN_PATHS, pos, "hidden lifetime parameters in types are deprecated");
+        }
     }
 
     fn generic_args(&mut self, id: GenericArgsId) {
