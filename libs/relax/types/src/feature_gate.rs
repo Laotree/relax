@@ -304,8 +304,16 @@ impl<'a> Gates<'a> {
         ];
         // (the prelude's macros, or the same through `core::prelude::v1` / `std::prelude::v1`)
         let last = path.rsplit("::").next().unwrap_or("");
-        let in_prelude = !path.contains("::") || matches!(path.strip_suffix(last), Some("core::prelude::v1::" | "std::prelude::v1::" | "core::prelude::rust_2021::" | "std::prelude::rust_2021::"));
-        if in_prelude {
+        let in_prelude = !path.contains("::") || {
+            let head = path.strip_suffix(last).unwrap_or("");
+            ["core", "std"].iter().any(|c| head.strip_prefix(*c).and_then(|r| r.strip_prefix("::prelude::")).is_some_and(|r| {
+                matches!(r.trim_end_matches("::"), "v1" | "rust_2015" | "rust_2018" | "rust_2021" | "rust_2024")
+            }))
+        };
+        // a macro of the program with that name (a user `macro_rules!`, a proc-macro crate's
+        // attribute) is what the attribute names, not core's
+        let shadowed = !path.contains("::") && (crate::macro_reg::has_attr(last) || self.prog.macros.defs.contains_key(last));
+        if in_prelude && !shadowed {
             if let Some(&(_, feature, reason)) = UNSTABLE.iter().find(|(n, _, _)| *n == last) {
                 let msg = if reason.is_empty() { format!("use of unstable library feature `{}`", feature) } else { format!("use of unstable library feature `{}`: {}", feature, reason) };
                 self.gate(feature, pos, &msg);
@@ -727,7 +735,10 @@ impl<'a> Gates<'a> {
     fn path(&mut self, p: &Path) {
         if let Some(q) = self.ast.qself(p).copied() {
             self.ty(q.ty);
-            if let Some(tp) = q.trait_path { self.path(&tp); }
+            if let Some(tp) = q.trait_path {
+                self.trait_path_sugar(&tp);
+                self.path(&tp);
+            }
         }
         for seg in self.ast.segs(p.segs).to_vec() {
             self.generic_args(seg.args());
@@ -1028,6 +1039,8 @@ pub fn check_stability(prog: &Program, body: &crate::typeck::Body) -> Vec<String
 /// `#[unstable(feature = "name", reason = "..")]` on a definition's item: (feature, reason).
 fn unstable_of(prog: &Program, d: crate::program::DefId) -> Option<(String, Option<String>)> {
     let def = prog.def(d);
+    // (the other definitions -- primitives, modules, locals -- have no item of their own)
+    if !matches!(def.kind, DefKind::Fn | DefKind::AssocFn | DefKind::Const | DefKind::Static | DefKind::AssocConst | DefKind::Struct | DefKind::Enum | DefKind::Union | DefKind::Trait | DefKind::TypeAlias | DefKind::AssocTy) { return None; }
     let pf = &*prog.files[def.file as usize];
     let src = prog.src(def.file);
     let item = pf.ast.item(def.item);

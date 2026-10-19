@@ -378,6 +378,13 @@ pub struct Import {
     pub pos: u32,
 }
 
+/// Module indexes of the std prelude (Program::prelude_ids).
+struct PreludeIds {
+    base: u32,
+    /// rust_2015, rust_2018, rust_2021, rust_2024 (the base module where one is missing)
+    editions: [u32; 4],
+}
+
 pub struct CrateInfo {
     pub name: Sym,
     pub root_mod: u32,
@@ -414,29 +421,6 @@ fn recursion_limit(file: &ParsedFile) -> usize {
 }
 
 impl CrateInfo {
-    /// rustc_expand/src/config.rs:47 and rustc_hir_typeck/src/expr.rs:660:
-    /// this feature changes sizedness checking inside core/alloc as well as
-    /// user crates; it cannot be discarded with the feature-gate diagnostics.
-    pub fn unsized_fn_params(&self, prog: &Program) -> bool {
-        self.feature_enabled(prog, "unsized_fn_params")
-    }
-
-    /// Is `#![feature(name)]` among the crate's root attributes?
-    pub fn feature_enabled(&self, prog: &Program, name: &str) -> bool {
-        let root_file = prog.mods[self.root_mod as usize].file;
-        let file = &prog.files[root_file as usize];
-        let attrs = crate::cfg::expand_cfg_attr_list(prog.src(root_file), &file.ast.root_attrs, &self.cfg);
-        for attr in &attrs {
-            let lo = attr.toks.lo;
-            let hi = attr.toks.hi;
-            if !attr.inner || hi < lo + 4 || file.tok_text(lo) != "feature" || file.tok_text(lo + 1) != "(" || file.tok_text(hi - 1) != ")" { continue; }
-            for tok in (lo + 2..hi - 1).step_by(2) {
-                if file.tok_text(tok) == name { return true; }
-            }
-        }
-        false
-    }
-
     /// The crate's `#![feature(..)]` declarations.
     pub fn features(&self, prog: &Program) -> &crate::features::Features {
         self.features.get_or_init(|| crate::features::Features::read(prog, prog.mods[self.root_mod as usize].file, &self.cfg))
@@ -677,6 +661,8 @@ pub struct Program {
     pub prim_defs: Vec<DefId>,
     /// index of the crate whose `prelude` module supplies the std prelude
     pub prelude_crate: Option<u32>,
+    /// the std prelude's module and its four edition modules, found once (`prelude_ids`)
+    prelude_ids: std::sync::OnceLock<PreludeIds>,
     /// per module: the traits in scope for method calls (computed on first use)
     trait_scope: crate::conc::MemoMap<u32, std::sync::Arc<crate::fxhash::HashSet<DefId>>>,
     pub errors: Vec<String>,
@@ -801,6 +787,7 @@ impl Program {
             collected_recollect: Vec::new(),
             prim_defs: Vec::new(),
             prelude_crate: None,
+            prelude_ids: Default::default(),
             trait_scope: Default::default(),
             errors: Vec::new(),
             macros: Default::default(),
@@ -4279,31 +4266,38 @@ impl Program {
     }
 
     /// The std prelude module (`prelude` of the prelude crate) and its per-edition modules
-    /// (`rust_2015` .. `rust_2024`).
-    fn prelude_modules(&self) -> Vec<u32> {
-        let Some(pc) = self.prelude_crate else { return Vec::new() };
+    /// (`rust_2015` .. `rust_2024`), found on the first lookup that sees them all.
+    fn prelude_ids(&self) -> Option<&PreludeIds> {
+        if let Some(p) = self.prelude_ids.get() { return Some(p); }
+        let pc = self.prelude_crate?;
         let root = self.crates[pc as usize].root_mod;
-        let Some(pm) = self.syms.get("prelude").and_then(|n| self.mods[root as usize].types.get(&n)) else { return Vec::new() };
+        let pm = self.syms.get("prelude").and_then(|n| self.mods[root as usize].types.get(&n))?;
         let pmd = self.def(*pm);
-        if pmd.kind != DefKind::Mod { return Vec::new(); }
-        let mut out = vec![pmd.sub];
-        for ed in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
+        if pmd.kind != DefKind::Mod { return None; }
+        let mut editions = [pmd.sub; 4];
+        for (i, ed) in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"].into_iter().enumerate() {
             if let Some(d) = self.syms.get(ed).and_then(|n| self.mods[pmd.sub as usize].types.get(&n)) {
-                if self.def(*d).kind == DefKind::Mod { out.push(self.def(*d).sub); }
+                if self.def(*d).kind == DefKind::Mod { editions[i] = self.def(*d).sub; }
             }
         }
-        out
+        Some(self.prelude_ids.get_or_init(|| PreludeIds { base: pmd.sub, editions }))
+    }
+
+    fn prelude_modules(&self) -> Vec<u32> {
+        self.prelude_ids().map_or_else(Vec::new, |p| std::iter::once(p.base).chain(p.editions).collect())
     }
 
     /// The prelude the edition of `module`'s crate injects (rustc: `std::prelude::rust_20NN`);
-    /// the plain `prelude` module when the prelude crate has none for that edition.
+    /// the plain `prelude` module for an edition the prelude crate has no module for.
     fn edition_prelude(&self, module: u32) -> Option<u32> {
-        let all = self.prelude_modules();
-        let base = *all.first()?;
-        let edition = self.crates[self.mods[module as usize].krate as usize].edition;
-        let name = format!("rust_{}", edition);
-        let sub = self.syms.get(&name).and_then(|n| self.mods[base as usize].types.get(&n)).map(|d| self.def(*d)).filter(|d| d.kind == DefKind::Mod).map(|d| d.sub);
-        Some(sub.unwrap_or(base))
+        let p = self.prelude_ids()?;
+        Some(match self.crates[self.mods[module as usize].krate as usize].edition {
+            2015 => p.editions[0],
+            2018 => p.editions[1],
+            2021 => p.editions[2],
+            2024 => p.editions[3],
+            _ => p.base,
+        })
     }
 
     /// The extern prelude, std prelude and primitive types (lookup_in_scope after the
