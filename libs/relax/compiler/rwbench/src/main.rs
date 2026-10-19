@@ -120,6 +120,21 @@ fn run(name: &str, setup: fn() -> Box<dyn FnMut() -> u64>, t0: Instant, proc_ms_
     let mut starts: Vec<f64> = Vec::new(); // ms since main start, at each iteration's start
     let mut times: Vec<f64> = Vec::new();
     let mut checksum = 0u64;
+    // RW_O3_PROGRESS=<file> (Relax side; the JIT's MAKEPAD_RUN_O3_PROGRESS file `pending installs`): the
+    // timed window starts at the first of QUIET_ITERS consecutive iterations that ran with no O3 build
+    // queued or running and no install since the previous one; the run goes on until 10 iterations
+    // after it (at most RW_MAX_MS). Without the file (rustc) the window starts RW_STEADY_AFTER_MS in.
+    const QUIET_ITERS: usize = 5;
+    let progress = std::env::var("RW_O3_PROGRESS").ok();
+    let max_ms: f64 = std::env::var("RW_MAX_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(120000.0);
+    let read_progress = |path: &str| -> Option<(u64, u64)> {
+        let t = std::fs::read_to_string(path).ok()?;
+        let mut it = t.split_whitespace();
+        Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+    };
+    let mut quiet = 0usize;
+    let mut last_installs = u64::MAX;
+    let mut steady_from: Option<usize> = None;
     loop {
         let s = Instant::now();
         starts.push(s.duration_since(t0).as_secs_f64() * 1000.0);
@@ -130,17 +145,48 @@ fn run(name: &str, setup: fn() -> Box<dyn FnMut() -> u64>, t0: Instant, proc_ms_
         } else {
             assert_eq!(c, checksum, "{}: checksum differs between iterations", name);
         }
-        if times.len() >= min_iters && begin.elapsed().as_secs_f64() * 1000.0 >= budget_ms {
-            break;
+        if let (Some(path), None) = (&progress, steady_from) {
+            match read_progress(path) {
+                Some((0, installs)) if installs == last_installs => {
+                    quiet += 1;
+                    if quiet >= QUIET_ITERS {
+                        steady_from = Some(times.len() - QUIET_ITERS);
+                    }
+                }
+                Some((_, installs)) => {
+                    quiet = 0;
+                    last_installs = installs;
+                }
+                None => quiet = 0,
+            }
+        }
+        let elapsed = begin.elapsed().as_secs_f64() * 1000.0;
+        if times.len() >= min_iters && elapsed >= budget_ms {
+            match (&progress, steady_from) {
+                (None, _) => break,
+                (Some(_), Some(f)) if times.len() >= f + 10 => break,
+                _ if elapsed >= max_ms => break,
+                _ => {}
+            }
         }
     }
     let n = times.len();
     // steady = the median of the last iterations that start after RW_STEADY_AFTER_MS (default 5000)
     // from main: Relax installs its optimised code about 2 s in, so earlier iterations are not steady
     let after: f64 = std::env::var("RW_STEADY_AFTER_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(5000.0);
-    let eligible = starts.iter().filter(|s| **s >= after).count();
+    let eligible = match steady_from {
+        Some(f) => n - f,
+        None => starts.iter().filter(|s| **s >= after).count(),
+    };
     let last = eligible.min(10).max(3).min(n);
     let steady = median(&times[n - last..]);
+    // o3_ms: when the optimised code settled (ms since main; -1: no progress file, 0 in the field
+    // `o3=` means it never settled within RW_MAX_MS and the old rule was used)
+    let o3_ms = match (&progress, steady_from) {
+        (None, _) => -1.0,
+        (Some(_), Some(f)) => starts[f],
+        (Some(_), None) => 0.0,
+    };
     // settled: first i whose 3-iteration median is within 10% of steady
     let mut settled = n - 1;
     for i in 0..n {
@@ -155,7 +201,7 @@ fn run(name: &str, setup: fn() -> Box<dyn FnMut() -> u64>, t0: Instant, proc_ms_
         Some(p) => p + tts_main,
         None => tts_main,
     };
-    println!("| {} steady_ms={:.3} tts_main_ms={:.1} tts_proc_ms={:.1} iters={} first_ms={:.3} {}", name, steady, tts_main, tts_proc, n, times[0], checksum);
+    println!("| {} steady_ms={:.3} tts_main_ms={:.1} tts_proc_ms={:.1} iters={} first_ms={:.3} o3_ms={:.0} {}", name, steady, tts_main, tts_proc, n, times[0], o3_ms, checksum);
 }
 
 pub fn fold(h: u64, v: u64) -> u64 {

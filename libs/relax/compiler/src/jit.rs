@@ -9056,6 +9056,25 @@ fn profile_write() {
     }
 }
 
+/// MAKEPAD_RUN_O3_PROGRESS=<path>: the O3 state as one line `pending installs` rewritten every 100 ms,
+/// for a benchmark that times only once the optimised code has settled: `pending` = builds queued or
+/// running, plus one while the startup phase holds the workers; `installs` = O3 installs so far.
+/// The file exists from the first write on; a program that never reads it pays nothing.
+fn o3_progress_write(last: &mut std::time::Instant) {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| crate::zone_alloc::kept_with(|| std::env::var("MAKEPAD_RUN_O3_PROGRESS").ok().filter(|s| !s.is_empty()))) else { return };
+    if last.elapsed() < std::time::Duration::from_millis(100) {
+        return;
+    }
+    *last = std::time::Instant::now();
+    let pending = TIER_QUEUE.lock().map_or(0, |q| q.len()) + TIER_ACTIVE.lock().map_or(0, |a| a.len()) + usize::from(startup_holds_tier1());
+    let line = format!("{} {}\n", pending, TIER1_INSTALLS.load(Ordering::Relaxed));
+    let tmp = format!("{}.tmp", path);
+    if std::fs::write(&tmp, line).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 fn sampler_thread() {
     // macOS coalesces the timers of background-QoS threads (a process started from a
     // daemon or a script): a 2 ms sleep then lasts tens of ms and loops never get enough
@@ -9068,6 +9087,7 @@ fn sampler_thread() {
     let mut selfs: Vec<os::sample::Sample> = Vec::with_capacity(1024);
     let mut last = std::time::Instant::now();
     let mut last_write = std::time::Instant::now();
+    let mut last_progress = std::time::Instant::now();
     let periods = sample_periods();
     let mut period_index = 0;
     loop {
@@ -9078,6 +9098,7 @@ fn sampler_thread() {
         let sleep_ms = if cfg!(target_os = "linux") && periods.len() > 1 { period.min(32) } else { period };
         wait.sleep(sleep_ms);
         if TIER_STOP.load(Ordering::SeqCst) { break; }
+        o3_progress_write(&mut last_progress);
         // Direct-PC samplers use the time since the previous wake. Linux's ring
         // supplies each observation's own period instead. A sleep the OS stretched
         // (timer coalescing of low-QoS / nice'd processes: 2 ms became ~18 ms on the bench
