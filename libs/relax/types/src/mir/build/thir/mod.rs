@@ -69,6 +69,10 @@ pub struct Thir {
     pub exprs: Vec<Expr>,
     pub stmts: Vec<Stmt>,
     pub params: Vec<Param>,
+    /// The drop scope of each synthetic binding (`for`'s iterator, `?`'s residual: bindings of
+    /// desugarings, with ids from `typeck::Body::locals.len()` up). User bindings are in
+    /// `ScopeTree::var_scope`.
+    pub var_scopes: crate::fxhash::HashMap<u32, ScopeId>,
 }
 impl Thir {
     pub fn alloc_arm(&mut self, v: Arm) -> ArmId { self.arms.push(v); ArmId(self.arms.len() as u32 - 1) }
@@ -276,6 +280,9 @@ pub enum ExprKind {
     StaticRef { def: DefId, ty: TyId },
     ThreadLocalRef(DefId),
     Yield { value: ExprId },
+    /// Control never continues here (the end of a `panic!`-family macro: Relax's builtin macros have
+    /// no callee to call). Lowered as an `Unreachable` terminator.
+    Unreachable,
 }
 
 /// rustc `Pat`.

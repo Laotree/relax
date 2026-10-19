@@ -661,6 +661,14 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// The scope a binding's drop is scheduled in: a desugaring's synthetic binding, or a user variable.
+    fn var_scope(&self, var: LocalVarId) -> Option<ScopeId> {
+        match self.thir.thir.var_scopes.get(&var.0) {
+            Some(&scope) => Some(scope),
+            None => self.root.scope_tree.var_scope(var.0),
+        }
+    }
+
     /// Emits a [`StatementKind::StorageLive`] for the given var, and also schedules a drop if
     /// requested (and possible).
     pub fn storage_live_binding(
@@ -677,7 +685,7 @@ impl<'a> Builder<'a> {
         self.cfg.push(block, Statement { source_info, kind: StatementKind::StorageLive(local_id) });
         // Although there is almost always scope for given variable in corner cases like #92893 we
         // might get variable with no scope.
-        if let Some(region_scope) = self.root.scope_tree.var_scope(var.0) {
+        if let Some(region_scope) = self.var_scope(var) {
             if matches!(schedule_drop, ScheduleDrops::Yes) {
                 self.schedule_drop(span, region_scope, local_id, DropKind::Storage)?;
             }
@@ -690,7 +698,7 @@ impl<'a> Builder<'a> {
 
     pub fn schedule_drop_for_binding(&mut self, var: LocalVarId, span: Span, for_guard: ForGuard) -> BuildResult<()> {
         let local_id = self.var_local_id(var, for_guard);
-        if let Some(region_scope) = self.root.scope_tree.var_scope(var.0) {
+        if let Some(region_scope) = self.var_scope(var) {
             self.schedule_drop(span, region_scope, local_id, DropKind::Value)?;
         }
         Ok(())
