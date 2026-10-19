@@ -235,9 +235,24 @@ impl SignatureRegions {
             contract:parent.contract.clone(),parent:Some(parent) }.build())
     }
     /// The closure body's implicit first argument (the environment, `&'env C`, `&'env mut C`
-    /// or `C` for FnOnce): `closure_env_ty` with the `'env` universal region inserted as the
-    /// last local region, ahead of the body region.
+    /// or `C` for FnOnce), with the `'env` universal region inserted as the last local region,
+    /// ahead of the body region. The free regions of the closure type `C` (its signature and
+    /// captured places) are external regions, as for rustc's `DefiningTy::Closure` whose
+    /// arguments they are; a nested use maps them to its own instantiation by position.
     pub fn with_closure_env(mut self, tcx: &Tcx, owner: DefId, expr: u32, env: TyId) -> Self {
+        let closure_ty = match tcx.tys.kind(env) { TyKind::Ref(_, ct, _) => *ct, _ => env };
+        let mut external = vec![];
+        for r in crate::borrowck::mir_nll::free_regions_in_order(tcx, closure_ty) {
+            if matches!(tcx.tys.region_kind(r), RegionKind::ReErased | RegionKind::ReError | RegionKind::ReStatic) { continue; }
+            let known = |u: &UniversalRegion| matches!(u.identity, Identity::Region(_, x) if x == r);
+            if self.regions.iter().any(known) || external.iter().any(known) { continue; }
+            let scope = match tcx.tys.region_kind(r) { RegionKind::ReLateParam(s, _) => s, _ => RegionScope::Item(owner) };
+            external.push(UniversalRegion { identity: Identity::Region(scope, r), class: RegionClassification::External, name: "'_".into() });
+        }
+        // Global and external regions precede the local ones.
+        let at = self.regions.iter().take_while(|u| matches!(u.class, RegionClassification::Global | RegionClassification::External)).count();
+        self.fr_fn_body += external.len();
+        self.regions.splice(at..at, external);
         if let TyKind::Ref(m, ct, _) = tcx.tys.kind(env) {
             let scope = RegionScope::Closure { owner, expr };
             let r = tcx.tys.intern_region(RegionKind::ReLateParam(scope, LateParamKind::ClosureEnv));

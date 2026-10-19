@@ -831,7 +831,7 @@ mod driver {
     use super::*;
     use crate::borrowck::check::mir_borrowck;
     use crate::borrowck::mir_nll::{compute_regions, type_check_body, MirNllInput};
-    use crate::borrowck::universal_regions::SignatureRegions;
+    use crate::borrowck::universal_regions::{Identity, SignatureRegions};
 
     /// `fn f<'a, 'b>(x: &'a i32, y: &'b i32) -> &'a i32`, returning local `ret` (1 = x, 2 = y).
     /// Every region in the body is erased, as the builder emits it.
@@ -899,6 +899,41 @@ mod driver {
         // fn(&'static i32) <: for<'x> fn(&'x i32): the placeholder must outlive 'static -- a leak.
         let r = higher_ranked("fn f(x: fn(&'static i32)) -> for<'x> fn(&'x i32) { x }", false);
         assert!(matches!(r.region_errors[..], [crate::borrowck::region_infer::RegionErrorKind::PlaceholderOutlivesIllegalRegion { longer_fr: 3, illegally_outlived_r: 0 }]), "{r:?}");
+    }
+
+    /// A closure inside `fn f<'a>(x: &'a i32)` whose environment captures `&'7 i32` ('7 a region of
+    /// typeck's own, in the closure type) and whose signature is `fn(&'a i32)`.
+    #[test]
+    fn closure_universals_are_the_parents_plus_the_regions_of_the_closure_type() {
+        use crate::typeck::ClosureSignatures;
+        let (prog, tcx) = collect("fn f<'a>(x: &'a i32) {}");
+        let f = named(&prog, "f");
+        let parent = SignatureRegions::function(&tcx, &prog, f).unwrap();
+        let parent_regions = parent.regions.len();
+        let t = tcx.tys.i32_;
+        let a = parent.inputs[0];
+        let TyKind::Ref(_, _, a_region) = *tcx.tys.kind(a) else { panic!() };
+        let sig = fn_ptr(&tcx, vec![a], tcx.tys.unit, 0);
+        let capture = rf(&tcx, tcx.tys.intern_region(RegionKind::ReEarlyParam(7)), t, false);
+        let closure = tcx.tys.intern(TyKind::Closure(7, 1, crate::types::ClosureArgs { parent_args: tcx.tys.unit, closure_kind_ty: tcx.tys.prim(crate::program::Prim::I8),
+            closure_sig_as_fn_ptr_ty: sig, tupled_upvars_ty: tcx.tys.intern(TyKind::Tuple(tcx.tys.mk_list(&[capture]))) }));
+        let env = rf(&tcx, tcx.tys.intern_region(RegionKind::ReErased), closure, false);
+        let closure_sig = ClosureSignatures { bound: sig, liberated: sig, annotation_eq: None };
+        let u = SignatureRegions::closure_in(&tcx, &prog, f, 1, &closure_sig, parent).unwrap().with_closure_env(&tcx, f, 1, env);
+        // Everything of the parent is external; the captured region is one more external region; 'env and
+        // the body region are the only locals.
+        let classes: Vec<_> = u.regions.iter().map(|r| r.class).collect();
+        // (the parent's regions are static, 'a and its body region)
+        assert_eq!(classes.iter().filter(|c| **c == RegionClassification::External).count(), parent_regions - 2 + 1);
+        assert_eq!(&classes[classes.len() - 2..], [RegionClassification::Local, RegionClassification::Local]);
+        assert!(u.regions.iter().any(|r| matches!(r.identity, Identity::Region(_, x) if x == tcx.tys.intern_region(RegionKind::ReEarlyParam(7))) && r.class == RegionClassification::External));
+        assert!(u.regions.iter().any(|r| matches!(r.identity, Identity::Region(_, x) if x == a_region) && r.class == RegionClassification::External));
+        assert_eq!(u.fr_fn_body, u.regions.len() - 1);
+        assert!(matches!(tcx.tys.kind(u.implicit_input.unwrap()), TyKind::Ref(false, c, _) if *c == closure));
+        // Vids follow that order: universals first, then everything the type checker allocates.
+        let universals = UniversalRegions::from_signature(&tcx, &u, { let mut next = 0; move || { next += 1; next - 1 } });
+        assert_eq!(universals.num_global_and_external_regions(), parent_regions - 1 + 1);
+        assert_eq!(universals.fr_fn_body, Some(u.regions.len() - 1));
     }
 
     #[test]
