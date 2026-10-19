@@ -1236,11 +1236,12 @@ impl<'a> Ctx<'a> {
         if CONSTS_READING.with(|c| c.borrow().iter().any(|(cd, ca)| *cd == d && *ca == args)) {
             return None;
         }
+        struct Pop;
+        impl Drop for Pop { fn drop(&mut self) { CONSTS_READING.with(|c| { c.borrow_mut().pop(); }); } }
         CONSTS_READING.with(|c| c.borrow_mut().push((d, args.clone())));
         self.depth += 1;
-        let ok = eval_into(self.u, d, &args, buf);
+        let ok = { let _pop = Pop; eval_into(self.u, d, &args, buf) };
         self.depth -= 1;
-        CONSTS_READING.with(|c| { c.borrow_mut().pop(); });
         if !ok {
             return None;
         }

@@ -3966,9 +3966,11 @@ impl Unit {
             self.const_failed.insert((d, args));
             return None;
         }
+        // (popped also when the evaluation unwinds: a cancelled request is retried)
+        struct Pop;
+        impl Drop for Pop { fn drop(&mut self) { CONST_STACK.with(|s| { s.borrow_mut().pop(); }); } }
         CONST_STACK.with(|s| s.borrow_mut().push((d, args.clone())));
-        let evaluated = self.eval_init(d, args.clone(), false);
-        CONST_STACK.with(|s| { s.borrow_mut().pop(); });
+        let evaluated = { let _pop = Pop; self.eval_init(d, args.clone(), false) };
         match evaluated {
             Some(a) => {
                 if let Some(mut cache) = self.cache.take() {
@@ -4184,9 +4186,10 @@ impl Unit {
             self.exec_event(id, "call");
             compile_watch(Some((&format!("running initializer {}", self.prog.def_path(d)), 0)));
             if CONST_EVAL_DEPTH.with(|g| g.get()) == 0 { CONST_FUEL.with(|c| c.set(0)); }
+            struct Depth;
+            impl Drop for Depth { fn drop(&mut self) { CONST_EVAL_DEPTH.with(|g| g.set(g.get().saturating_sub(1))); } }
             CONST_EVAL_DEPTH.with(|g| g.set(g.get() + 1));
-            r = unsafe { call_jit(self as *mut Unit, entry, buf) };
-            CONST_EVAL_DEPTH.with(|g| g.set(g.get().saturating_sub(1)));
+            r = { let _d = Depth; unsafe { call_jit(self as *mut Unit, entry, buf) } };
             compile_watch(None);
             // a compile the code reached was cancelled (a nested request blocked by an earlier
             // one): no value and no error -- the request is cancelled here, in Rust frames
