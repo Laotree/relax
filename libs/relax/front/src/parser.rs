@@ -2750,6 +2750,13 @@ impl<'a> Parser<'a> {
                 }
                 _ => GenericArg::Type(self.ty_plus()?),
             };
+            // rustc_ast_passes: generic arguments come before the first constraint
+            if crate::lexer::validation_enabled()
+                && !matches!(arg, GenericArg::Binding(..) | GenericArg::Constraint(..))
+                && v.iter().any(|a| matches!(a, GenericArg::Binding(..) | GenericArg::Constraint(..)))
+            {
+                return self.err("generic arguments must come before the first constraint");
+            }
             v.push(arg);
             if !self.eat(T::Comma) {
                 self.expect_gt()?;

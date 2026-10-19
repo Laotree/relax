@@ -431,6 +431,39 @@ pub fn duplicate_generic_params(prog: &Program, d: DefId) -> Vec<String> {
     errors
 }
 
+/// rustc_ast_passes ast_validation: lifetime parameters come before type and const parameters
+/// (`validate_generic_param_order`), and a parameter with a default is followed only by defaulted
+/// ones (`GenericDefaultTrailing`).
+pub fn generic_param_order(prog: &Program, d: DefId) -> Vec<String> {
+    use crate::ast::GenericParamKind;
+    let def = prog.def(d);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(g) = ast.kind_generics(&ast.item(def.item).kind) else { return Vec::new() };
+    let mut errors = Vec::new();
+    let (mut seen_other, mut misplaced) = (false, None);
+    let mut default_before = false;
+    let mut trailing_reported = false;
+    for p in ast.list(g.params) {
+        match p.kind {
+            GenericParamKind::Lifetime(_) => if seen_other && misplaced.is_none() { misplaced = Some(p.name.lo); },
+            GenericParamKind::Type(_, default) => {
+                seen_other = true;
+                if default.is_some() { default_before = true; }
+                else if default_before && !trailing_reported { trailing_reported = true; errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string())); }
+            }
+            GenericParamKind::Const(_, default) => {
+                seen_other = true;
+                if default.is_some() { default_before = true; }
+                else if default_before && !trailing_reported { trailing_reported = true; errors.push(prog.record_error(def.file, p.name.lo, "parse", "generic parameters with a default must be trailing".to_string())); }
+            }
+        }
+    }
+    if let Some(lo) = misplaced {
+        errors.push(prog.record_error(def.file, lo, "parse", "lifetime parameters must be declared prior to type and const parameters".to_string()));
+    }
+    errors
+}
+
 /// rustc_ast_passes `extern` block validation and the lints on them: `unsafe extern` blocks
 /// (`unsafe_code`), plain `extern` blocks (`missing_unsafe_on_extern`, an error from edition
 /// 2024), and a safety qualifier on an item of a plain block.
