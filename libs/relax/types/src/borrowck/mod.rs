@@ -560,6 +560,8 @@ mod settle_tests {
 mod implied_bounds_tests;
 #[cfg(test)]
 mod type_check_tests;
+#[cfg(test)]
+mod root_cx_tests;
 
 /// rustc_borrowck lib.rs lint_unused_mut: a user binding (or argument) declared `mut` that no
 /// write or mutable borrow needed -- `unused_mut`. Bindings named `_..` are left out, and so is

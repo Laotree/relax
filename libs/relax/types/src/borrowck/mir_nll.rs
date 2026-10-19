@@ -164,9 +164,9 @@ impl MirTypeck {
             summary: MirTypeckSummary { errors: vec![], mir_bugs: vec![], dropck_overflows: vec![], deferred_closure_requirements: vec![] },
             closure_slots: vec![] }
     }
-    pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
-        let n = infcx.num_region_vars();
-        let definitions = (0..n).map(|vid| {
+    /// The definition of every region variable that exists now.
+    pub fn definitions(&self, infcx: &dyn RegionDriverOps) -> Vec<RegionDefinition> {
+        (0..infcx.num_region_vars()).map(|vid| {
             let (origin, universe) = infcx.region_var_info(vid);
             let external_name = match origin {
                 NllRegionVariableOrigin::FreeRegion => self.universals.indices.iter().find(|(_, v)| *v == vid).map(|x| x.0),
@@ -174,9 +174,16 @@ impl MirTypeck {
                 NllRegionVariableOrigin::Existential => None,
             };
             RegionDefinition { origin, universe, external_name }
-        }).collect::<Vec<_>>();
+        }).collect()
+    }
+    /// The relations known between the universal regions, for `num_regions` variables.
+    pub fn relations(&self, num_regions: usize) -> super::type_check::free_region_relations::UniversalRegionRelations {
+        super::type_check::free_region_relations::UniversalRegionRelations::create(self.universals.clone(), num_regions, &self.known)
+    }
+    pub fn into_region_input(self, infcx: &dyn RegionDriverOps) -> RegionInput {
+        let definitions = self.definitions(infcx);
+        let relations = self.relations(definitions.len());
         let MirTypeckRegionConstraints { outlives_constraints, liveness_constraints, type_tests, .. } = self.constraints;
-        let relations = super::type_check::free_region_relations::UniversalRegionRelations::create(self.universals, n, &self.known);
         RegionInput { polonius: self.polonius, tainted_by_errors: self.tainted_by_errors, definitions, outlives: outlives_constraints,
             relations, liveness: liveness_constraints, type_tests }
     }

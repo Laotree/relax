@@ -46,7 +46,8 @@ pub trait LivenessOps {
     fn free_regions_for_liveness(&mut self, value: GenericArg) -> Vec<RegionId>;
     /// `TypeChecker::push_region_constraints`: converts the retained query constraints
     /// into `out` at `locations`.
-    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations,
+    /// `span` is where they are blamed: the location's, or that of a nested body's requirement.
+    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations, span: Span,
         category: ConstraintCategory, data: &QueryRegionConstraints);
 }
 
@@ -257,7 +258,8 @@ fn compute_for_local(cx: &mut LivenessCx<'_>, comp: &mut LivenessComputation<'_>
     // The destructor's own outlives requirements hold at every drop.
     if let Some(constraints) = &data.region_constraint_data {
         for &p in &live.drop_locations {
-            cx.infcx.push_region_constraints(cx.constraints, Locations::Single(comp.locations.location(p)), ConstraintCategory::Boring, constraints);
+            let at = comp.locations.location(p);
+            cx.infcx.push_region_constraints(cx.constraints, Locations::Single(at), super::source_info(cx.body, at).span, ConstraintCategory::Boring, constraints);
         }
     }
     report_overflows(cx, &data, drop_span, local_ty);
@@ -402,9 +404,8 @@ impl LivenessOps for crate::borrowck::infer_ctxt::BorrowckInferCtxt<'_> {
         tys.map_regions(ty, &|r, _| { visit(r); r }, 0);
         found.into_inner()
     }
-    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations, category: ConstraintCategory,
+    fn push_region_constraints(&mut self, out: &mut MirTypeckRegionConstraints, locations: Locations, span: Span, category: ConstraintCategory,
         data: &QueryRegionConstraints) {
-        let span = locations.span(self.mir_body.expect("MIR type ops require configure_mir"));
         let universals = self.universal_regions.as_ref().expect("MIR type ops require universal regions");
         super::constraint_conversion::ConstraintConversion::new(self, universals, &self.region_bound_pairs, &self.param_env.clauses,
             locations, span, category, out).convert_all(data);

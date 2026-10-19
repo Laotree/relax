@@ -16,7 +16,7 @@ use crate::types::variance::V;
 use crate::types::{BoundVar, FnHeader, RegionArgsId, RegionId, RegionKind, Safety, TyId, TyKind, UniverseIndex};
 
 #[derive(Debug, PartialEq)]
-enum Op {
+pub(crate) enum Op {
     Prove(LangItem, Vec<GenericArg>, Locations, Cat),
     Wf(TyId, Locations, Cat),
     Clauses(ClauseOwner, Vec<GenericArg>, Locations),
@@ -25,31 +25,31 @@ enum Op {
     Opaque(TyId, V, TyId),
 }
 pub(crate) struct Fake<'t> {
-    tcx: &'t Tcx,
-    universe: UniverseIndex,
+    pub(crate) tcx: &'t Tcx,
+    pub(crate) universe: UniverseIndex,
     /// Region vids 0..first_var are the renumbered body's; later ones are allocated here.
-    regions: Vec<(Origin, UniverseIndex)>,
-    ops: Vec<Op>,
-    fn_sig: Option<PolyFnSig>,
-    annotations: Vec<(Span, TyId)>,
-    closure_sig: Option<FnSig>,
+    pub(crate) regions: Vec<(Origin, UniverseIndex)>,
+    pub(crate) ops: Vec<Op>,
+    pub(crate) fn_sig: Option<PolyFnSig>,
+    pub(crate) annotations: Vec<(Span, TyId)>,
+    pub(crate) closure_sig: Option<FnSig>,
     /// The M2b answer of `rvalue_query_ty` (e.g. a closure aggregate's type).
-    query_ty: Option<TyId>,
+    pub(crate) query_ty: Option<TyId>,
     /// `is_inline_const` and `unevaluated_const_ty` answers for the operand-order test.
-    inline_const: bool,
-    const_ty: Option<TyId>,
+    pub(crate) inline_const: bool,
+    pub(crate) const_ty: Option<TyId>,
     /// `dropck_outlives` answers by dropped type; the locations the query constraints were pushed at.
-    dropck: std::collections::HashMap<TyId, liveness::DropckData>,
-    pushed: Vec<Locations>,
+    pub(crate) dropck: std::collections::HashMap<TyId, liveness::DropckData>,
+    pub(crate) pushed: Vec<Locations>,
     /// The declaration's implied bounds (`RegionDriverOps::implied_bounds`) and what was installed.
-    implied: super::implied_bounds::ImpliedBounds,
+    pub(crate) implied: super::implied_bounds::ImpliedBounds,
     /// The declared field types of whatever ADT/closure is projected or aggregated.
-    fields: Vec<TyId>,
-    installed: Option<(UniversalRegions, Vec<(TyId, RegionId)>)>,
+    pub(crate) fields: Vec<TyId>,
+    pub(crate) installed: Option<(UniversalRegions, Vec<(TyId, RegionId)>)>,
     /// The opaque type storage of the body's inference context, and what the producer would answer.
-    opaques: Vec<(crate::infer::opaque_types::OpaqueTypeKey, crate::infer::opaque_types::ProvisionalHiddenType)>,
-    non_defining: Vec<crate::infer::opaque_types::OpaqueTypeKey>,
-    equated: Vec<(TyId, TyId)>,
+    pub(crate) opaques: Vec<(crate::infer::opaque_types::OpaqueTypeKey, crate::infer::opaque_types::ProvisionalHiddenType)>,
+    pub(crate) non_defining: Vec<crate::infer::opaque_types::OpaqueTypeKey>,
+    pub(crate) equated: Vec<(TyId, TyId)>,
 }
 impl<'t> Fake<'t> {
     pub(crate) fn new(tcx: &'t Tcx, first_var: usize) -> Self {
@@ -65,7 +65,7 @@ impl liveness::LivenessOps for Fake<'_> {
         self.tcx.tys.map_regions(ty, &|r, _| { if !matches!(self.tcx.tys.region_kind(r), RegionKind::ReBound(..)) { found.borrow_mut().push(r); } r }, 0);
         found.into_inner()
     }
-    fn push_region_constraints(&mut self, _: &mut MirTypeckRegionConstraints, l: Locations, _: Cat, _: &crate::next_solver::type_op::QueryRegionConstraints) {
+    fn push_region_constraints(&mut self, _: &mut MirTypeckRegionConstraints, l: Locations, _: Span, _: Cat, _: &crate::next_solver::type_op::QueryRegionConstraints) {
         self.pushed.push(l);
     }
 }

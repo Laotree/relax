@@ -307,30 +307,8 @@ fn external_input(b: &Body) -> RegionInput {
         liveness:LivenessValues::new(3,LocationMap::new(b).num_points()),type_tests:vec![] }
 }
 #[test]
-fn root_propagates_nested_requirements_before_solving_parent() {
-    use super::root_cx::*;
-    let tcx=Tcx::new();
-    let mut b=body(&[tcx.tys.unit],vec![block(vec![],TerminatorKind::Return)]); b.arg_count=0;
-    let moves=gather(&tcx,&b); let mut child=external_input(&b);
-    child.outlives.push(OutlivesConstraint {sup:1,sub:2,location:Some(0),span:Span {file:7,lo:13,hi:14},category:ConstraintCategory::Return(super::constraints::ReturnConstraint::Normal),from_closure:false});
-    let checked=BorrowCheckRootCtxt {tcx:&tcx, prog:&test_prog()}.do_mir_borrowck(vec![
-        BodyInput {body:&b,moves:&moves,regions:child,nested:vec![],has_opaque_types:false},
-        BodyInput {body:&b,moves:&moves,regions:external_input(&b),nested:vec![NestedBodyUse {body:0,external_regions:vec![0,2,1],location:at(0,0)}],has_opaque_types:false},
-    ]);
-    assert!(checked[0].result.errors.is_empty() && checked[0].result.region_errors.is_empty());
-    assert!(checked[0].result.tainted_by_errors && !checked[0].result.accepted());
-    assert!(!checked[1].result.accepted());
-    assert!(checked[1].result.region_errors.iter().any(|e| matches!(e,super::region_infer::RegionErrorKind::RegionError {longer_fr:2,shorter_fr:1,..})));
-    let blame=checked[1].regions.regioncx.best_blame_constraint(&tcx,2,1).unwrap();
-    assert_eq!(blame.span.lo,13); assert_eq!(blame.category,ConstraintCategory::Return(super::constraints::ReturnConstraint::Normal)); assert_eq!(blame.span.file,7); assert_eq!(blame.location,Some(0));
-}
-#[test]
-fn opaque_root_and_yield_are_explicit_stops() {
-    use super::root_cx::*;
+fn movable_coroutine_yield_is_an_explicit_stop() {
     let tcx=Tcx::new(); let mut b=body(&[tcx.tys.unit],vec![block(vec![],TerminatorKind::Return)]); b.arg_count=0;
-    let moves=gather(&tcx,&b);
-    let checked=BorrowCheckRootCtxt {tcx:&tcx, prog:&test_prog()}.do_mir_borrowck(vec![BodyInput {body:&b,moves:&moves,regions:input(&b,&[]),nested:vec![],has_opaque_types:true}]);
-    assert!(!checked[0].result.accepted()); assert!(checked[0].result.unsupported[0].contains("opaque"));
     b.basic_blocks[0].terminator.as_mut().unwrap().kind=TerminatorKind::Yield {value:val(tcx.tys.unit),resume:BasicBlock(1),resume_arg:p(0),drop:None};
     b.basic_blocks.push(block(vec![],TerminatorKind::Return));
     let result=check(&tcx,&b,&[]); assert!(!result.accepted()); assert!(result.unsupported[0].contains("movability"));
@@ -362,23 +340,6 @@ fn used_mut_temporary_propagates_to_moved_user_local() {
     b.local_decls[2].kind = LocalKind::Temp;
     let moves = gather(&tcx, &b); let mut used = crate::mir::dataflow::BitSet::new_empty(3); used.insert(2);
     super::used_muts::gather_used_muts(&b, &moves, &mut used); assert!(used.contains(1));
-}
-#[test]
-fn nested_type_requirement_stops_at_conversion_boundary() {
-    use super::root_cx::*;
-    use super::region_infer::{TypeTest, VerifyBound};
-    let tcx = Tcx::new(); let mut b = body(&[tcx.tys.unit], vec![block(vec![], TerminatorKind::Return)]); b.arg_count = 0;
-    let moves = gather(&tcx, &b); let mut child = external_input(&b);
-    child.type_tests.push(TypeTest { generic_kind:tcx.tys.intern(TyKind::Param(0)),lower_bound:1,
-        span:super::constraints::Span {lo:4,hi:5},verify_bound:VerifyBound::AnyBound(vec![]) });
-    let checked = BorrowCheckRootCtxt {tcx:&tcx, prog:&test_prog()}.do_mir_borrowck(vec![
-        BodyInput {body:&b,moves:&moves,regions:child,nested:vec![],has_opaque_types:false},
-        BodyInput {body:&b,moves:&moves,regions:external_input(&b),nested:vec![NestedBodyUse {body:0,external_regions:vec![0,1,2],location:at(0,0)}],has_opaque_types:false},
-    ]);
-    assert!(checked[0].result.errors.is_empty() && checked[0].result.region_errors.is_empty());
-    assert!(checked[0].result.tainted_by_errors && !checked[0].result.accepted());
-    assert!(!checked[0].regions.regioncx.propagated_type_requirements.is_empty());
-    assert!(!checked[1].result.accepted()); assert!(checked[1].result.unsupported[0].contains("type-outlives"));
 }
 #[test]
 fn destructor_prefix_borrow_and_illegal_field_move() {
@@ -430,8 +391,7 @@ fn cnll4_used_mut_propagates_all_non_user_locals_and_excludes_arguments() {
 }
 
 #[test]
-fn cnll4_typecheck_taint_survives_region_solve_and_finalizes_the_entire_root() {
-    use super::root_cx::{BodyInput,BorrowCheckRootCtxt};
+fn cnll4_typecheck_taint_survives_region_solve() {
     let tcx = Tcx::new();
     let b = body(&[tcx.tys.unit,tcx.tys.i32_],vec![block(vec![],TerminatorKind::Return)]);
     let moves = gather(&tcx,&b);
@@ -440,12 +400,6 @@ fn cnll4_typecheck_taint_survives_region_solve_and_finalizes_the_entire_root() {
     let result = mir_borrowck(&tcx, &test_prog(), &b,&mut solved,&moves);
     assert!(result.errors.is_empty() && result.region_errors.is_empty());
     assert!(!result.accepted());
-    let mut failed = input(&b,&[]); failed.tainted_by_errors = true;
-    let checked = BorrowCheckRootCtxt {tcx:&tcx, prog:&test_prog()}.do_mir_borrowck(vec![
-        BodyInput {body:&b,moves:&moves,regions:input(&b,&[]),nested:vec![],has_opaque_types:false},
-        BodyInput {body:&b,moves:&moves,regions:failed,nested:vec![],has_opaque_types:false},
-    ]);
-    assert!(checked.iter().all(|c| c.result.tainted_by_errors && !c.result.accepted()));
 }
 
 #[test]

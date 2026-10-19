@@ -36,7 +36,7 @@ impl crate::borrowck::type_check::liveness::LivenessOps for DropOps<'_> {
         self.tcx.tys.map_regions(ty, &|r, _| { found.borrow_mut().push(r); r }, 0);
         found.into_inner()
     }
-    fn push_region_constraints(&mut self, _: &mut crate::borrowck::type_check::MirTypeckRegionConstraints, _: crate::borrowck::type_check::Locations,
+    fn push_region_constraints(&mut self, _: &mut crate::borrowck::type_check::MirTypeckRegionConstraints, _: crate::borrowck::type_check::Locations, _: Span,
         _: ConstraintCategory, _: &crate::next_solver::type_op::QueryRegionConstraints) { unreachable!("no dropck constraints in these fixtures") }
 }
 fn generate(tcx: &Tcx, b: &Body, moves: &MoveData, i: &mut RegionInput, drops: &[Vec<usize>]) {
