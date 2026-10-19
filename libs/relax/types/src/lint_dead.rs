@@ -1213,27 +1213,7 @@ pub fn finish(prog: &Program, tcx: &Tcx, own: &[bool], root: u32) {
     let rep = Reporter { s: &s, reach: &reach };
     if executable { rep.run(&DEAD_CODE_PUB_IN_BINARY, &pre_live, true, &all); }
     rep.run(&DEAD_CODE, &s.live, false, &all);
-    // what each module's items and bodies mention (an import used through a macro expansion
-    // is seen here by what typeck resolved)
-    let mut module_used: HashMap<u32, HashSet<DefId>> = HashMap::new();
-    for i in 0..prog.defs.len() {
-        let d = DefId(i as u32);
-        if !s.local(d) { continue; }
-        let def = prog.def(d);
-        if matches!(def.kind, DefKind::Field | DefKind::Prim(_) | DefKind::MacroRules) { continue; }
-        let mut refs = item_refs(prog, d);
-        if let Some(b) = s.refs.get(&d) { refs.extend_from_slice(&b.refs); }
-        if refs.is_empty() { continue; }
-        let mut m = def.scope;
-        let mut guard = 0;
-        loop {
-            let set = module_used.entry(m).or_default();
-            for r in &refs { if let Ref::Use(x) = r { set.insert(*x); } }
-            guard += 1;
-            match prog.mods.get(m as usize).and_then(|md| md.lexical_parent) { Some(p) if guard < 64 => m = p, _ => break }
-        }
-    }
-    crate::lint_imports::check(prog, tcx, own, &reach, &module_used);
+    crate::lint_imports::check(prog, tcx, own, &reach);
 }
 
 fn is_executable(prog: &Program, root: u32) -> bool {
