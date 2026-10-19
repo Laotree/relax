@@ -229,9 +229,10 @@ pub fn active() -> bool {
 // to another thread.
 struct Owned {
     free: usize,
-    bump: usize,
+    // read by diagnostics on other threads (relaxed atomics: plain loads and stores for the owner)
+    bump: AtomicUsize,
     stride: usize,
-    live: usize,
+    live: AtomicUsize,
 }
 /// Compiler arena: a chunk is attached to at most one thread, the one that has it as its current
 /// chunk for the class (`remote != NONE` while attached). That thread allocates and frees its own
@@ -480,8 +481,13 @@ mod os {
 
 /// A reserved heap with independent ownership tables. Runtime domains use the same allocator
 /// as the compiler; their tables and address reservation disappear together after the last thread.
+/// Ids of domain arenas: never reused, so a thread's stale `DOMAIN_ARENA` cannot match a new arena
+/// allocated at the address of a dropped one.
+static NEXT_ARENA_ID: AtomicUsize = AtomicUsize::new(1);
+
 pub struct Arena {
     dynamic: bool,
+    id: usize,
     base: AtomicUsize,
     init: Mutex<bool>,
     committed: AtomicUsize,
@@ -496,6 +502,7 @@ impl Arena {
     const fn new() -> Self {
         Self {
             dynamic: false,
+            id: 0,
             base: AtomicUsize::new(0),
             init: Mutex::new(false),
             committed: AtomicUsize::new(0),
@@ -511,7 +518,7 @@ impl Arena {
             headers: [const {
                 Chunk {
                     account: AtomicUsize::new(0),
-                    owned: UnsafeCell::new(Owned { free: 0, bump: 0, stride: 0, live: 0 }),
+                    owned: UnsafeCell::new(Owned { free: 0, bump: AtomicUsize::new(0), stride: 0, live: AtomicUsize::new(0) }),
                     _line: [0; 3],
                     remote: AtomicUsize::new(NONE),
                     remote_bytes: AtomicUsize::new(0),
@@ -556,6 +563,7 @@ impl Arena {
             }
             let a = &mut *p;
             a.dynamic = true;
+            a.id = NEXT_ARENA_ID.fetch_add(1, Ordering::Relaxed);
             for h in &a.headers {
                 h.remote.store(NONE, Ordering::Relaxed);
                 (*h.state.value.get()).released = true;
@@ -582,7 +590,8 @@ impl Arena {
         let r = if self.dynamic { DOMAIN_CURRENT.try_with(f) } else { CURRENT.try_with(f) };
         match r {
             Ok(r) => r,
-            Err(_) => unsafe { std::hint::unreachable_unchecked() },
+            // a const, destructor-free TLS cannot fail; if it somehow does, stop rather than guess
+            Err(_) => std::process::abort(),
         }
     }
     fn try_current<R>(&self, f: impl FnOnce(&Cell<[Current; CLASSES]>) -> R) -> Result<R, std::thread::AccessError> {
@@ -609,14 +618,14 @@ impl Arena {
         self.alloc_inner(l, requested)
     }
     pub fn enter_thread(&self) {
-        DOMAIN_ARENA.with(|c| c.set(self as *const Self as usize));
+        DOMAIN_ARENA.with(|c| c.set(self.id));
     }
     /// May this thread use its per-class chunk cache of this arena? A domain arena only for the
     /// threads that entered it (the cache holds the chunks of the arena they are in); the compiler
     /// arena for every thread (a thread without chunks has empty slots).
     #[inline(always)]
     fn cache_fast(&self) -> bool {
-        !self.dynamic || DOMAIN_ARENA.try_with(|c| c.get() == self as *const Self as usize).unwrap_or(false)
+        !self.dynamic || DOMAIN_ARENA.try_with(|c| c.get() == self.id).unwrap_or(false)
     }
     /// `cache_fast`, and the thread is not past its TLS destructors (it would never hand a new chunk back).
     fn cache_here(&self) -> bool {
@@ -633,7 +642,7 @@ impl Arena {
     /// Makes the chunk the calling thread's: its free list, bump and live count move to `owned`
     /// and the remote list opens. Called with the chunk's lock held.
     unsafe fn attach(&self, h: &Chunk, s: &State) {
-        *h.owned.get() = Owned { free: s.free, bump: s.bump, stride: s.stride, live: h.live.load(Ordering::Relaxed) };
+        *h.owned.get() = Owned { free: s.free, bump: AtomicUsize::new(s.bump), stride: s.stride, live: AtomicUsize::new(h.live.load(Ordering::Relaxed)) };
         h.remote.store(0, Ordering::Release);
     }
     /// Takes the blocks other threads freed into the owner's free list.
@@ -641,7 +650,7 @@ impl Arena {
         let o = &mut *h.owned.get();
         while p != 0 {
             let next = *(p as *const usize);
-            o.live -= 1;
+            o.live.store(o.live.load(Ordering::Relaxed) - 1, Ordering::Relaxed);
             *(p as *mut usize) = o.free;
             o.free = p;
             p = next;
@@ -653,10 +662,10 @@ impl Arena {
         self.drain(h, h.remote.swap(NONE, Ordering::AcqRel));
         let o = &*h.owned.get();
         s.free = o.free;
-        s.bump = o.bump;
-        h.live.store(o.live, Ordering::Relaxed);
+        s.bump = o.bump.load(Ordering::Relaxed);
+        h.live.store(o.live.load(Ordering::Relaxed), Ordering::Relaxed);
         s.attached = false;
-        if o.live == 0 {
+        if o.live.load(Ordering::Relaxed) == 0 {
             self.release_empty(index, s);
         } else if (s.free != 0 || s.bump + s.stride <= CHUNK) && (!self.gen_on() || s.epoch == EPOCH.load(Ordering::Relaxed)) {
             self.partial_push(index, s.class);
@@ -756,8 +765,8 @@ impl Arena {
                 // the owner thread updates these without the lock: a racy, approximate read
                 let o = h.owned.get();
                 unsafe {
-                    touched += std::ptr::read_volatile(&(*o).bump).min(CHUNK);
-                    slots += std::ptr::read_volatile(&(*o).live) * s.stride;
+                    touched += (*o).bump.load(Ordering::Relaxed).min(CHUNK);
+                    slots += (*o).live.load(Ordering::Relaxed) * s.stride;
                 }
             } else {
                 touched += s.bump.min(CHUNK);
@@ -862,9 +871,10 @@ impl Arena {
             }
             if p != 0 {
                 o.free = *(p as *const usize);
-            } else if o.bump + o.stride <= CHUNK {
-                p = self.base.load(Ordering::Relaxed) + c.index * CHUNK + o.bump;
-                o.bump += o.stride;
+            } else if o.bump.load(Ordering::Relaxed) + o.stride <= CHUNK {
+                let b = o.bump.load(Ordering::Relaxed);
+                p = self.base.load(Ordering::Relaxed) + c.index * CHUNK + b;
+                o.bump.store(b + o.stride, Ordering::Relaxed);
             } else {
                 // full: the thread moves on, later frees into this chunk make it listable
                 let mut s = lock(&h.state);
@@ -873,7 +883,7 @@ impl Arena {
                 self.set_current(class, NO_CURRENT);
                 return null_mut();
             }
-            o.live += 1;
+            o.live.store(o.live.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
             h.account.store(h.account.load(Ordering::Relaxed).wrapping_add(accounted), Ordering::Relaxed);
             return p as *mut u8;
         }
@@ -1142,11 +1152,12 @@ impl Arena {
                 let o = &mut *h.owned.get();
                 *(p as *mut usize) = o.free;
                 o.free = p as usize;
-                o.live -= 1;
+                let live = o.live.load(Ordering::Relaxed) - 1;
+                o.live.store(live, Ordering::Relaxed);
                 h.account.store(h.account.load(Ordering::Relaxed).wrapping_sub(requested), Ordering::Relaxed);
                 // An emptied chunk that has been carved far goes back at once (its pages are
                 // released as before); a lightly used one stays the thread's, ready for its next block.
-                if o.live == 0 && o.bump > WARM_TOUCHED_MAX {
+                if live == 0 && o.bump.load(Ordering::Relaxed) > WARM_TOUCHED_MAX {
                     self.release_emptied(index, self.class_idx(need, l.align()));
                 }
                 return;
@@ -1398,7 +1409,7 @@ impl Arena {
         }
         let off = p - (base + index * CHUNK);
         // an attached chunk's carve point is its owner's (a racy read; the diagnostic scan runs quiesced)
-        let bump = if COMPILER && s.attached { unsafe { std::ptr::read_volatile(&(*self.headers[index].owned.get()).bump) } } else { s.bump };
+        let bump = if COMPILER && s.attached { unsafe { (*self.headers[index].owned.get()).bump.load(Ordering::Relaxed) } } else { s.bump };
         if s.stride == 0 { off < s.committed } else { off < bump.min(CHUNK) }
     }
     fn destroy_generation(&self, g: u64) -> (usize, usize) {
