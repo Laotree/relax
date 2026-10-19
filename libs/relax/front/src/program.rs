@@ -2485,6 +2485,8 @@ impl Program {
                     let li = self.variants.len() as u32;
                     self.variants.push(vars);
                     self.defs[d.0 as usize].sub = li;
+                    // items declared in a discriminant expression's block
+                    self.collect_body_items(file, iid, module, Some(d))?;
                 }
                 Tag::Const | Tag::Static => {
                     let k = if kind == Tag::Const { DefKind::Const } else { DefKind::Static };
