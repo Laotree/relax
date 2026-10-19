@@ -483,6 +483,7 @@ impl<'a> Visitor<'a> for L2<'a> {
         self.lint_if_let_rescope(e);
         self.lint_comparisons(e);
         self.lint_ptr_nulls(e);
+        self.lint_transmutes(e);
         self.lint_closure_returning_async_block(e);
         if matches!(ast.expr(e).kind, ExprKind::Path(_)) { self.lint_prelude_path(e); }
         match ast.expr(e).kind {
@@ -1218,6 +1219,74 @@ impl<'a> L2<'a> {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------- transmute.rs
+
+pub const PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS: Lint = lint::lint("ptr_to_integer_transmute_in_consts", Level::Warn, &[]);
+pub const UNNECESSARY_TRANSMUTES: Lint = lint::lint("unnecessary_transmutes", Level::Warn, &[]);
+pub const INTEGER_TO_PTR_TRANSMUTES: Lint = lint::lint("integer_to_ptr_transmutes", Level::Warn, &[]);
+
+impl<'a> L2<'a> {
+    /// `CheckTransmutes::check_expr` (rustc_lint transmute.rs).
+    fn lint_transmutes(&self, e: ExprId) {
+        let ast = self.ast;
+        let ExprKind::Call(callee, args) = ast.expr(e).kind else { return };
+        let a = ast.list(args);
+        if a.len() != 1 { return; }
+        let Some(d) = self.call_def(callee) else { return };
+        if self.prog.def(d).kind != DefKind::Fn || diag_name(self.prog, d).as_deref() != Some("transmute") { return; }
+        let callee = unparen(ast, callee);
+        let targs = self.body.res_args.get(&callee.0).map(|l| self.tcx.tys.list(*l).to_vec()).unwrap_or_default();
+        let (mut src, mut dst) = (targs.first().copied(), targs.get(1).copied());
+        let bad = |t: Option<TyId>| t.is_none_or(|t| self.tcx.tys.has_infer(t));
+        if bad(src) { src = self.expr_ty(a[0]); }
+        if bad(dst) { dst = self.expr_ty(e); }
+        let (Some(src), Some(dst)) = (src, dst) else { return };
+        let pos = ast.expr(e).lo;
+        let owner = self.prog.def(self.body.def);
+        // the body is a const fn or an associated constant
+        let const_fn = owner.kind == DefKind::AssocFn || owner.kind == DefKind::Fn;
+        let is_const_fn = const_fn && matches!(ast.item(owner.item).kind, ItemKind::Fn(s, _, _) if ast.fn_sig(s).konst);
+        let const_ctx = is_const_fn || matches!(owner.kind, DefKind::Const | DefKind::AssocConst | DefKind::Static);
+        // ptr -> integer in const fns and associated constants
+        if (is_const_fn || owner.kind == DefKind::AssocConst) && matches!(self.kind(src), TyKind::Ptr(..)) && matches!(self.kind(dst), TyKind::Int(_)) {
+            self.emit(&PTR_TO_INTEGER_TRANSMUTE_IN_CONSTS, pos, "pointers cannot be transmuted to integers during const eval");
+        }
+        // unnecessary transmutes
+        let u8_array = |t: TyId| matches!(self.kind(t), TyKind::Array(el, _) if matches!(self.kind(el), TyKind::Int(crate::program::Prim::U8)));
+        let (sk, dk) = (self.kind(src), self.kind(dst));
+        let is_int = |k: &TyKind| matches!(k, TyKind::Int(_));
+        let prim = |k: &TyKind| matches!(k, TyKind::Int(_) | TyKind::Float(_));
+        let unsigned = |k: &TyKind| matches!(k, TyKind::Int(p) if !crate::types::Types::int_info(*p).1);
+        let signed = |k: &TyKind| matches!(k, TyKind::Int(p) if crate::types::Types::int_info(*p).1);
+        let is_u32 = |k: &TyKind| matches!(k, TyKind::Int(crate::program::Prim::U32));
+        let is_i32 = |k: &TyKind| matches!(k, TyKind::Int(crate::program::Prim::I32));
+        let size = |k: &TyKind| matches!(k, TyKind::Int(crate::program::Prim::Usize | crate::program::Prim::Isize));
+        let unnecessary = (u8_array(src) && prim(&dk))
+            || (prim(&sk) && u8_array(dst))
+            || (matches!(sk, TyKind::Char) && (is_u32(&dk) || is_i32(&dk)))
+            || ((is_u32(&sk) || is_i32(&sk)) && matches!(dk, TyKind::Char))
+            || (unsigned(&sk) && signed(&dk)) || (signed(&sk) && unsigned(&dk))
+            || (matches!(sk, TyKind::Float(_)) && is_int(&dk))
+            || (is_int(&sk) && matches!(dk, TyKind::Float(_)))
+            || (matches!(sk, TyKind::Bool) && is_int(&dk));
+        let _ = (size, const_ctx);
+        if unnecessary {
+            self.emit(&UNNECESSARY_TRANSMUTES, pos, "unnecessary transmute");
+        }
+        // integer -> pointer
+        if is_int(&sk) {
+            let inner = match dk { TyKind::Ref(_, i, _) | TyKind::Ptr(_, i) => i, _ => return };
+            if let ExprKind::Lit(LitKind::Int) = ast.expr(unparen(ast, a[0])).kind {
+                let x = ast.expr(unparen(ast, a[0]));
+                let t = std::str::from_utf8(self.prog.files[self.body.file as usize].bytes(x.lo, x.hi)).unwrap_or("");
+                if crate::const_fold::parse_int_lit(t) == Some(0) { return; }
+            }
+            if self.layout_1zst(inner, 0) != Some(false) { return; }
+            self.emit(&INTEGER_TO_PTR_TRANSMUTES, pos, "transmuting an integer to a pointer creates a pointer without provenance");
         }
     }
 }
