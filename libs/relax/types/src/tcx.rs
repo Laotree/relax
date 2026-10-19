@@ -1550,15 +1550,17 @@ impl Tcx {
         }
         if matches!(def.kind, DefKind::Struct | DefKind::Enum | DefKind::Union) && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
             errors.extend(crate::item_checks::representability(prog, self, did));
-            errors.extend(self.check_type_defn_variances(prog, did));
+            // (a definition with errors has no meaningful variances)
+            if errors.is_empty() { errors.extend(self.check_type_defn_variances(prog, did)); }
         }
         if def.kind == DefKind::TypeAlias && prog.item_defs.get(&(def.file, def.item.0)) == Some(&did) {
-            errors.extend(self.check_type_alias_params_used(prog, did));
+            if errors.is_empty() { errors.extend(self.check_type_alias_params_used(prog, did)); }
         }
         if def.kind == DefKind::Impl {
-            errors.extend(self.check_impl_params_constrained(prog, did));
+            if errors.is_empty() { errors.extend(self.check_impl_params_constrained(prog, did)); }
             errors.extend(self.check_impl_items_against_trait(prog, did));
             errors.extend(crate::item_checks::impl_trait_wf(prog, self, did));
+            errors.extend(crate::item_checks::copy_impl(prog, self, did));
         }
         errors
     }
@@ -2332,6 +2334,19 @@ impl Tcx {
         }
         autos.sort_by_key(|d| d.0);
         autos.dedup();
+        // hir_ty_lowering/dyn_trait.rs: at most one non-auto trait (E0225)
+        let mut principals = 0;
+        for b in bounds {
+            if let ast::Bound::Trait { path, maybe: false, .. } = b {
+                let Some(td) = self.resolve_trait_path(cx, prog, file, module, path) else { continue };
+                if autos.contains(&td) { continue; }
+                principals += 1;
+                if principals == 2 {
+                    self.err(cx, prog, file, path.lo, "E0225: only auto traits can be used as additional traits in a trait object".to_string());
+                    return self.tys.error;
+                }
+            }
+        }
         for b in bounds {
             let (path, hrtb) = match b {
                 ast::Bound::Trait { path, hrtb, .. } => (path, *hrtb),
@@ -2390,6 +2405,9 @@ impl Tcx {
                                 if let Some(ad) = self.trait_assoc(prog, td, sym) {
                                     let bt = self.lower_ty(cx, prog, file, module, env, *t);
                                     binds.push((ad, bt, 0));
+                                } else {
+                                    self.err(cx, prog, file, n.lo, format!("E0220: associated type `{}` not found for `{}`", f.text(*n), prog.name(td)));
+                                    return self.tys.error;
                                 }
                             }
                             _ => {}
@@ -2493,7 +2511,7 @@ impl Tcx {
                 if let Some(t) = self.param_assoc(cx, prog, module, env, pi as u32, name) {
                     return self.lower_generic_args_of_assoc_item(cx, prog, file, module, env, p, t, source_ty);
                 }
-                self.err(cx, prog, file, p.lo, format!("no bound of `{}` has an associated type `{}` -- add the bound (T: Trait)", f.text(prog.files[file as usize].ast.segs(p.segs)[0].name), f.text(prog.files[file as usize].ast.segs(p.segs)[1].name)));
+                self.err(cx, prog, file, p.lo, format!("E0220: associated type `{}` not found for `{}`", f.text(prog.files[file as usize].ast.segs(p.segs)[1].name), f.text(prog.files[file as usize].ast.segs(p.segs)[0].name)));
                 return self.tys.error;
             }
         }
@@ -3132,7 +3150,9 @@ impl Tcx {
                     return Some(self.alias_ty_with_args(AliasTyKind::Projection { def_id: item }, &tr.trait_ref.args));
                 }
             }
-            for bound in self.explicit_super_predicates_of(prog, tr.trait_ref.def_id) {
+            // (only the supertraits that may define the item are lowered: the full list would
+            // lower `trait T: AsRef<Self::Bar>` through this very lookup)
+            for bound in self.explicit_supertraits_containing_assoc_item(prog, tr.trait_ref.def_id, name) {
                 stack.push(self.instantiate_supertrait(prog, &bound, &predicate));
             }
         }

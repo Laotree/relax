@@ -66,51 +66,143 @@ pub fn duplicate_items(prog: &Program, own: &[bool]) -> Vec<String> {
     errors
 }
 
-/// E0072: ADT `d` contains itself by value (through fields, tuples and arrays, generic
-/// arguments substituted), so it has no finite size. References, raw pointers, fn pointers,
-/// slices and trait objects end the walk (rustc_ty_utils representability.rs).
-pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
-    let adt = tcx.adts.get(&d)?;
-    let mut stack: Vec<DefId> = vec![d];
-    let mut found = false;
-    for v in &adt.variants {
-        for f in &v.fields {
-            if contains(tcx, d, f.ty, &mut stack, 0) { found = true; }
+/// A query of rustc_ty_utils/src/representability.rs, the nodes of its cycle detection.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ReprKey {
+    /// `check_representability(adt)`
+    Adt(DefId),
+    /// `check_representability(field)`: the ADT, variant and field index
+    Field(DefId, usize, usize),
+    /// `check_representability_adt_ty(ty)`
+    AdtTy(TyId),
+}
+
+struct Representability<'a> {
+    tcx: &'a Tcx,
+    /// the queries being computed, innermost last
+    active: Vec<ReprKey>,
+    done: crate::fxhash::HashSet<ReprKey>,
+    /// the first cycle met: its queries, outermost first
+    cycle: Option<Vec<ReprKey>>,
+}
+
+impl Representability<'_> {
+    fn enter(&mut self, key: &ReprKey) -> bool {
+        if self.cycle.is_some() || self.done.contains(key) { return false; }
+        if let Some(at) = self.active.iter().position(|k| k == key) {
+            self.cycle = Some(self.active[at..].to_vec());
+            return false;
+        }
+        self.active.push(key.clone());
+        true
+    }
+
+    fn leave(&mut self, key: ReprKey) {
+        self.active.pop();
+        if self.cycle.is_none() { self.done.insert(key); }
+    }
+
+    fn check_adt(&mut self, d: DefId) {
+        let key = ReprKey::Adt(d);
+        if !self.enter(&key) { return; }
+        if let Some(adt) = self.tcx.adts.get(&d) {
+            for (vi, v) in adt.variants.iter().enumerate() {
+                for fi in 0..v.fields.len() { self.check_field(d, vi, fi); }
+            }
+        }
+        self.leave(key);
+    }
+
+    fn check_field(&mut self, d: DefId, vi: usize, fi: usize) {
+        let key = ReprKey::Field(d, vi, fi);
+        if !self.enter(&key) { return; }
+        let ty = self.tcx.adts[&d].variants[vi].fields[fi].ty;
+        self.check_ty(ty);
+        self.leave(key);
+    }
+
+    fn check_ty(&mut self, t: TyId) {
+        match self.tcx.tys.kind(t).clone() {
+            TyKind::Adt(..) => self.check_adt_ty(t),
+            TyKind::Array(e, _) => self.check_ty(e),
+            TyKind::Tuple(ts) => for x in self.tcx.tys.list(ts).to_vec() { self.check_ty(x); },
+            _ => {}
         }
     }
-    if !found { return None; }
+
+    fn check_adt_ty(&mut self, t: TyId) {
+        let key = ReprKey::AdtTy(t);
+        if !self.enter(&key) { return; }
+        let TyKind::Adt(d, args, _) = self.tcx.tys.kind(t).clone() else { unreachable!() };
+        // the item itself is representable; its parameters may still cycle through a type argument
+        self.check_adt(d);
+        if self.cycle.is_none() {
+            let used = self.params_in_repr(d, &mut Vec::new());
+            for (i, a) in self.tcx.tys.list(args).to_vec().into_iter().enumerate() {
+                if used.contains(&(i as u32)) { self.check_ty(a); }
+            }
+        }
+        self.leave(key);
+    }
+
+    /// `params_in_repr`: the type parameters (by compact index) an ADT's fields hold by value.
+    fn params_in_repr(&self, d: DefId, visiting: &mut Vec<DefId>) -> crate::fxhash::HashSet<u32> {
+        let mut out = crate::fxhash::HashSet::default();
+        if visiting.contains(&d) { return out; }
+        visiting.push(d);
+        if let Some(adt) = self.tcx.adts.get(&d) {
+            for v in &adt.variants {
+                for f in &v.fields { self.params_in_repr_ty(f.ty, &mut out, visiting); }
+            }
+        }
+        visiting.pop();
+        out
+    }
+
+    fn params_in_repr_ty(&self, t: TyId, out: &mut crate::fxhash::HashSet<u32>, visiting: &mut Vec<DefId>) {
+        match self.tcx.tys.kind(t).clone() {
+            TyKind::Adt(d, args, _) => {
+                let inner = self.params_in_repr(d, visiting);
+                for (i, a) in self.tcx.tys.list(args).to_vec().into_iter().enumerate() {
+                    if inner.contains(&(i as u32)) { self.params_in_repr_ty(a, out, visiting); }
+                }
+            }
+            TyKind::Array(e, _) => self.params_in_repr_ty(e, out, visiting),
+            TyKind::Tuple(ts) => for x in self.tcx.tys.list(ts).to_vec() { self.params_in_repr_ty(x, out, visiting); },
+            TyKind::Param(i) => { out.insert(i); }
+            _ => {}
+        }
+    }
+}
+
+/// E0072: an ADT that contains itself by value (through fields, tuples, arrays and the
+/// parameters other ADTs hold by value) has no finite size (rustc_ty_utils
+/// representability.rs: a cycle among its queries; rustc_middle values.rs reports the ADTs of
+/// the cycle once, at the first). The cycle is reported by the first of its ADTs.
+pub fn representability(prog: &Program, tcx: &Tcx, d: DefId) -> Option<String> {
+    let mut r = Representability { tcx, active: Vec::new(), done: Default::default(), cycle: None };
+    r.check_adt(d);
+    let cycle = r.cycle?;
+    let mut items: Vec<DefId> = Vec::new();
+    for k in &cycle {
+        if let ReprKey::Field(a, _, _) = k { if !items.contains(a) { items.push(*a); } }
+    }
+    // reported once: by the first ADT of the cycle
+    if items.first().is_none() || items.iter().min_by_key(|x| x.0) != Some(&d) || !items.contains(&d) { return None; }
+    let at = items.iter().position(|x| *x == d).unwrap();
+    items.rotate_left(at);
+    let names: Vec<String> = items.iter().map(|x| format!("`{}`", prog.syms.str(prog.def(*x).name))).collect();
+    let list = match names.len() {
+        1 => names[0].clone(),
+        2 => format!("{} and {}", names[0], names[1]),
+        _ => format!("{} and {}", names[..names.len() - 1].join(", "), names[names.len() - 1]),
+    };
     let def = prog.def(d);
     let ast = &prog.files[def.file as usize].ast;
     let pos = ast.item(def.item).name.lo;
     Some(prog.record_error(def.file, pos, "typeck", format!(
-        "E0072: recursive type `{}` has infinite size -- help: insert some indirection (e.g., a `Box`, `Rc`, or `&`) to break the cycle",
-        prog.syms.str(def.name))))
-}
-
-fn contains(tcx: &Tcx, root: DefId, t: TyId, stack: &mut Vec<DefId>, depth: u32) -> bool {
-    if depth > 64 { return false; }
-    match tcx.tys.kind(t).clone() {
-        TyKind::Adt(d, args, _) => {
-            if d == root { return true; }
-            // a cycle that does not pass through `root` is reported at its own ADTs
-            if stack.contains(&d) { return false; }
-            let Some(adt) = tcx.adts.get(&d) else { return false };
-            let args = tcx.tys.list(args).to_vec();
-            stack.push(d);
-            let mut hit = false;
-            'outer: for v in &adt.variants {
-                for f in &v.fields {
-                    let ft = tcx.tys.subst(f.ty, &args);
-                    if contains(tcx, root, ft, stack, depth + 1) { hit = true; break 'outer; }
-                }
-            }
-            stack.pop();
-            hit
-        }
-        TyKind::Tuple(ts) => tcx.tys.list(ts).to_vec().into_iter().any(|x| contains(tcx, root, x, stack, depth + 1)),
-        TyKind::Array(e, _) => contains(tcx, root, e, stack, depth + 1),
-        _ => false,
-    }
+        "E0072: recursive type{} {} {} infinite size -- help: insert some indirection (e.g., a `Box`, `Rc`, or `&`) to break the cycle",
+        if items.len() == 1 { "" } else { "s" }, list, if items.len() == 1 { "has" } else { "have" })))
 }
 
 /// rustc_hir_analysis wfcheck.rs check_impl: a trait impl's trait reference is well formed --
@@ -155,4 +247,45 @@ pub fn impl_trait_wf(prog: &Program, tcx: &Tcx, imp: DefId) -> Vec<String> {
         errors.push(prog.record_error(def.file, ast.item(def.item).lo, "typeck", format!("E0277: {}", msg)));
     }
     errors
+}
+
+/// rustc_hir_analysis coherence/builtin.rs `visit_implementation_of_copy`: `impl Copy for T`
+/// needs an ADT (E0206) whose every field is `Copy` (E0204) and that has no destructor (E0184).
+pub fn copy_impl(prog: &Program, tcx: &Tcx, imp: DefId) -> Vec<String> {
+    use crate::consts::GenericArg;
+    use crate::next_solver::Goal;
+    let Some(&td) = tcx.impl_trait.get(&imp) else { return Vec::new() };
+    if tcx.copy_trait != Some(td) { return Vec::new(); }
+    let def = prog.def(imp);
+    let ast = &prog.files[def.file as usize].ast;
+    let Some(item) = ast.as_impl(&ast.item(def.item).kind) else { return Vec::new() };
+    if item.negative { return Vec::new(); }
+    let indices = tcx.generic_indices_of(prog, imp);
+    let trait_ref = tcx.impl_trait_ref(prog, imp, &indices.identity_args(&tcx.tys));
+    let Some(GenericArg::Type(self_ty)) = trait_ref.args.first().copied() else { return Vec::new() };
+    if tcx.tys.has_error(self_ty) { return Vec::new(); }
+    let pos = ast.item(def.item).lo;
+    let report = |code: &str, msg: &str| prog.record_error(def.file, pos, "typeck", format!("{}: {}", code, msg));
+    let (adt, args) = match tcx.tys.kind(self_ty).clone() {
+        TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool | TyKind::Char | TyKind::Ptr(..) | TyKind::Never | TyKind::Ref(false, _, _) | TyKind::Array(..) => return Vec::new(),
+        TyKind::Adt(d, args, _) => (d, tcx.tys.list(args).to_vec()),
+        _ => return vec![report("E0206", "the trait `Copy` cannot be implemented for this type; type is not a structure or enumeration")],
+    };
+    let Some(def_adt) = tcx.adts.get(&adt) else { return Vec::new() };
+    let env = tcx.param_env_id(prog, imp);
+    let infcx = crate::infer::InferCtxt::for_item(tcx, prog, crate::tcx::TypingMode::non_body_analysis(), imp);
+    for v in &def_adt.variants {
+        for f in &v.fields {
+            let ft = tcx.tys.subst(f.ty, &args);
+            if tcx.tys.has_error(ft) { continue; }
+            let predicate = crate::next_solver::collect::trait_predicate(td, vec![GenericArg::Type(ft)]);
+            if !infcx.evaluate_obligation(prog, Goal { param_env: env, predicate }).may_apply() {
+                return vec![report("E0204", "the trait `Copy` cannot be implemented for this type")];
+            }
+        }
+    }
+    if tcx.adt_destructor(adt).is_some() {
+        return vec![report("E0184", "the trait `Copy` cannot be implemented for this type; the type has a destructor")];
+    }
+    Vec::new()
 }

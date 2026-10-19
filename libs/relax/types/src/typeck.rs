@@ -4155,7 +4155,24 @@ impl<'a> Fcx<'a> {
                 let deferred_before = self.deferred_casts.len();
                 let target = self.lower_ty(*t);
                 let st = self.shallow(target);
-                let xt = self.check_expr(*x, None);
+                // ExpectCastableToType: an unsuffixed integer literal takes the cast's integer
+                // type, `u8` for `char`, `usize` for pointers and fn pointers (check_lit)
+                let mut inner = *x;
+                loop {
+                    match self.ast().expr(inner).kind {
+                        ExprKind::Paren(i) | ExprKind::Unary(UnOp::Neg, i) => inner = i,
+                        _ => break,
+                    }
+                }
+                let hint = if matches!(self.ast().expr(inner).kind, ExprKind::Lit(LitKind::Int)) {
+                    match self.tcx.tys.kind(st).clone() {
+                        TyKind::Int(_) => Some(st),
+                        TyKind::Char => Some(self.tcx.tys.u8_),
+                        TyKind::Ptr(..) | TyKind::FnDef(..) | TyKind::FnPtr(..) => Some(self.tcx.tys.usize_),
+                        _ => None,
+                    }
+                } else { None };
+                let xt = self.check_expr(*x, hint);
                 self.cast_checks.push((*x, xt, target, lo));
                 // `b as Box<dyn Tr>` / `&x as &dyn Tr`: an unsizing coercion
                 let sx = self.shallow(xt);

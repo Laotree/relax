@@ -55,7 +55,9 @@ impl Fcx<'_> {
             TyKind::Bool => CastTy::Int(IntKind::Bool),
             TyKind::Char => CastTy::Int(IntKind::Char),
             // a C-like enum: no variant has fields (rustc `is_payloadfree`)
-            TyKind::Adt(d, _, _) if self.tcx.adts.get(&d).is_some_and(|a| a.is_enum && !a.variants.is_empty() && a.variants.iter().all(|v| v.fields.is_empty())) => CastTy::Int(IntKind::CEnum),
+            TyKind::Adt(d, _, _) if self.tcx.adts.get(&d).is_some_and(|a| a.is_enum
+                && !a.variants.iter().any(|v| matches!(v.discr, crate::tcx::VariantDiscr::Explicit(_)) && v.shape != 0)
+                && a.variants.iter().all(|v| v.fields.is_empty())) => CastTy::Int(IntKind::CEnum),
             TyKind::Ptr(m, p) => CastTy::Ptr(m, p),
             TyKind::FnPtr(..) => CastTy::FnPtr,
             _ => return None,
@@ -109,12 +111,30 @@ impl Fcx<'_> {
         let n_dd = self.deferred_dyn.len();
         let old = self.b.coerce.get(&e.0).copied();
         let old_reborrow = self.b.reborrows.get(&e.0).copied();
-        let ok = self.coerce(from, to, Some(e), self.last_lo, false).is_some();
+        let mut ok = self.coerce(from, to, Some(e), self.last_lo, false).is_some();
+        if !ok {
+            // the object and unsizing coercions the `Cast` arm applies on its own
+            let (sf, st) = (self.shallow(from), self.shallow(to));
+            let (kf, kt) = (self.tcx.tys.kind(sf).clone(), self.tcx.tys.kind(st).clone());
+            ok = self.dyn_coercion(&kf, &kt).is_some() || self.dyn_upcast(&kf, &kt).is_some() || self.unsize_coercion(&kf, &kt) || self.drops_principal(&kf, &kt);
+        }
         self.rollback_to(snap);
         self.deferred_dyn.truncate(n_dd);
         match old_reborrow { Some(v) => { self.b.reborrows.insert(e.0, v); } None => { self.b.reborrows.remove(&e.0); } }
         match old { Some(c) => { self.b.coerce.insert(e.0, c); } None => { self.b.coerce.remove(&e.0); } }
         ok
+    }
+
+    /// `dyn Trait + Send` unsizes to `dyn Send`: the principal may be dropped, the auto traits
+    /// may only shrink (a pointer or reference to either).
+    fn drops_principal(&mut self, from: &TyKind, to: &TyKind) -> bool {
+        let (a, d) = match (from, to) {
+            (TyKind::Ref(m1, a, _), TyKind::Ref(m2, d, _)) | (TyKind::Ptr(m1, a), TyKind::Ptr(m2, d)) | (TyKind::Ref(m1, a, _), TyKind::Ptr(m2, d)) if *m1 || !*m2 => (*a, *d),
+            _ => return false,
+        };
+        let (a, d) = (self.shallow(a), self.shallow(d));
+        let (TyKind::Dyn(_, _, _, _, _, _, sautos), TyKind::Dyn(td, _, _, _, _, _, tautos)) = (self.tcx.tys.kind(a).clone(), self.tcx.tys.kind(d).clone()) else { return false };
+        crate::next_solver::eval_ctxt::trait_is_auto(self.prog, td) && self.tcx.tys.list(tautos).iter().all(|t| self.tcx.tys.list(sautos).contains(t))
     }
 
     fn can_eq(&mut self, a: TyId, b: TyId) -> bool {
