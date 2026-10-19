@@ -18,6 +18,16 @@ use crate::typeck;
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// `unpack!(block = expr)`: run a fallible block-threading step, binding the new block.
+macro_rules! unpack {
+    ($x:ident = $c:expr) => {{
+        let $crate::mir::build::BlockAnd(b, v) = $c?;
+        $x = b;
+        v
+    }};
+}
+
+pub mod block;
 pub mod builder;
 pub mod cfg;
 pub mod expr;
