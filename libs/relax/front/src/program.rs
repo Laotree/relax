@@ -579,6 +579,8 @@ pub struct Program {
     load_graph: Option<LoadGraph>,
     /// module path of the file being loaded (`module_path!()`)
     pub cur_mod_path: String,
+    /// the module files being loaded, outermost first (rustc_expand circular module check)
+    pub module_load_stack: Vec<String>,
     /// `macro_rules!` definitions seen so far (files parse in load order)
     pub macros: crate::collected::Deferred<std::sync::Arc<crate::macros::MacroTable>>,
     /// per crate root: what the preload found (macro definitions, files; preload.rs)
@@ -839,6 +841,7 @@ impl Program {
             import_settle: false,
             load_graph: None,
             cur_mod_path: String::new(),
+            module_load_stack: Vec::new(),
         };
         for kw in ["Self", "self", "super", "crate", "prelude", "core", "std"] {
             p.syms.intern(kw);
@@ -2561,6 +2564,17 @@ impl Program {
                                         loaded = true;
                                         break;
                                     }
+                                    // rustc_expand module.rs: a file that includes itself through `mod` items
+                                    let root = self.crates[krate as usize].root_path().to_string();
+                                    if *c == root || self.module_load_stack.contains(c) {
+                                        let mut chain = vec![root];
+                                        chain.extend(self.module_load_stack.iter().cloned());
+                                        chain.push(c.clone());
+                                        let lo = self.files[file as usize].ast.item(iid).lo;
+                                        self.errors.push(self.record_error(file, lo, "collect", format!("circular modules: {}", chain.join(" -> "))));
+                                        loaded = true;
+                                        break;
+                                    }
                                     let edition = self.crates[krate as usize].edition;
                                     self.cur_mod_path = self.def_path(d);
                                     let f = self.load_file(c, edition, krate)?;
@@ -2568,7 +2582,10 @@ impl Program {
                                     let is_mod_rs = child_mod_rs || c.ends_with("/mod.rs");
                                     let cdir = if is_mod_rs { dir_of(c).to_string() } else { format!("{}/{}", dir_of(c), stem_of(c)) };
                                     let items = self.files[f as usize].ast.root_items.clone();
-                                    self.collect_items(f, &items, m, &cdir, is_mod_rs)?;
+                                    self.module_load_stack.push(c.clone());
+                                    let collected = self.collect_items(f, &items, m, &cdir, is_mod_rs);
+                                    self.module_load_stack.pop();
+                                    collected?;
                                     loaded = true;
                                     break;
                                 }

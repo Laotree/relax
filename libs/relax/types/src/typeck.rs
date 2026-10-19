@@ -1254,7 +1254,19 @@ impl<'a> Fcx<'a> {
         let mut fit = Vec::new();
         for h in hits {
             let snap = self.start_snapshot();
-            let ok = h.len() == targs.len() && (0..h.len()).all(|i| self.eq(h[i], targs[i]));
+            // an alias argument that cannot equal the target's is no candidate (rustc's upcast
+            // candidates are solver goals: an alias-relate that fails rejects the candidate)
+            let ok = h.len() == targs.len() && {
+                let mut engine = crate::next_solver::fulfill::FulfillmentCtxt::new(&self.infcx);
+                let mut related = true;
+                for i in 0..h.len() {
+                    match self.infcx.at(self.prog, self.param_env.clone()).eq(h[i], targs[i]) {
+                        Ok(goals) => for goal in goals { engine.register_predicate_obligation(&self.infcx, crate::next_solver::fulfill::PredicateObligation { goal, recursion_depth: 0, cause: crate::next_solver::fulfill::ObligationCause { span: self.last_lo, body_id: self.b.def } }); },
+                        Err(_) => { related = false; break; }
+                    }
+                }
+                related && engine.try_evaluate_obligations(&self.infcx, self.prog).is_empty()
+            };
             self.rollback_to(snap);
             if ok {
                 fit.push(h);
