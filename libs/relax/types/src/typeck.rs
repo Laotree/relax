@@ -5611,7 +5611,20 @@ impl<'a> Fcx<'a> {
                     continue;
                 }
                 if variadic && i >= params.len() {
-                    self.check_expr(*a, None);
+                    let t = self.check_expr(*a, None);
+                    // check_argument_types: C promotes these before the call (E0617)
+                    if self.tcx.validates(self.prog, self.file) {
+                        let t = self.shallow(t);
+                        let lo = self.ast().expr(*a).lo;
+                        let small = |p: Prim| matches!(p, Prim::I8 | Prim::I16 | Prim::U8 | Prim::U16);
+                        match self.tcx.tys.kind(t).clone() {
+                            TyKind::Float(Prim::F32) => self.err(lo, "E0617: can't pass `f32` to variadic function".to_string()),
+                            TyKind::Int(p) if small(p) => self.err(lo, format!("E0617: can't pass `{}` to variadic function", crate::typeck::ty_to_string(false, self.prog, self.tcx, t))),
+                            TyKind::Bool => self.err(lo, "E0617: can't pass `bool` to variadic function".to_string()),
+                            TyKind::FnDef(..) => self.err(lo, "E0617: can't pass a function item to a variadic function".to_string()),
+                            _ => {}
+                        }
+                    }
                     continue;
                 }
                 let pt = if i < params.len() { self.normalize_signature(params[i]) } else { error };
