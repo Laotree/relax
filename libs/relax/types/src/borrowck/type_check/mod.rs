@@ -846,7 +846,7 @@ impl<'a> TypeChecker<'a> {
                 if let Err(terr) = self.sub_types(rv_ty, place_ty, to_locations(location), category) {
                     self.mirbug(format!("bad assignment ({place_ty:?} = {rv_ty:?}): {terr:?}"));
                 }
-                if let Some(index) = self.rvalue_user_ty(rv) {
+                        if let Some(index) = self.rvalue_user_ty(rv) {
                     if let Err(terr) = self.relate_type_and_user_type(rv_ty, V::Inv, &UserTypeProjection { base: index, projection: vec![] },
                         to_locations(location), ConstraintCategory::TypeAnnotation(AnnotationSource::GenericArg)) {
                         self.mirbug(format!("bad user type on rvalue ({index:?} = {rv_ty:?}): {terr:?}"));

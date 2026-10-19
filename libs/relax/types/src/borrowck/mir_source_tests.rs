@@ -5,6 +5,7 @@ use crate::tcx::{EvalCx, EvalState, Tcx, TypingEnv};
 
 /// Error codes (or messages) and unchecked reasons of every fn of `source`.
 pub(super) fn borrowck_source(source: &str) -> (Vec<String>, Vec<String>) {
+    crate::borrowck::event::FORCE_USER_TYPES.with(|f| f.set(Some(true)));
     let sess = &std::sync::Arc::new(crate::Session::default());
     let mut prog = Program::new(sess);
     let std_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../compiler/std");
@@ -312,4 +313,15 @@ fn a_static_array_of_inline_const_atomics() {
         pub fn f(i: usize) -> usize { FRAMES[i].load(Ordering::Relaxed) }");
     assert!(unchecked.is_empty(), "{unchecked:?}");
     assert!(errors.is_empty(), "{errors:?}");
+}
+
+#[test]
+fn a_turbofish_on_a_tuple_struct_constructor_is_a_user_type_annotation() {
+    let (errors, unchecked) = borrowck_source("
+        pub struct SomeStruct<T>(pub T);
+        pub fn bad() { let c = 66; SomeStruct::<&'static u32>(&c); }
+        pub fn ok() { let c = 66; SomeStruct::<&u32>(&c); }");
+    assert!(unchecked.is_empty(), "{unchecked:?}");
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(errors[0].starts_with("E0597"), "{errors:?}");
 }
